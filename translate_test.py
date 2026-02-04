@@ -1,47 +1,40 @@
 import sys
-import os
-from gnitz.storage import writer, shard, errors
+from rpython.rtyper.lltypesystem import rffi, lltype
+from gnitz.storage import layout, errors, arena
 
 def entry_point(argv):
-    print "--- Phase 1: Storage Core Final Validation ---"
+    print "--- Step 2.1: Arena Checks ---"
     
-    filename = "final_test.db"
-    sw = writer.ShardWriter()
-    sw.add_entry("id:001", "Alice", 1)
-    sw.add_entry("id:002", "Bob", 1)
-    
+    # Allocate a small 1KB arena
+    mem = arena.Arena(1024)
     try:
-        print "[1/3] Writing Shard..."
-        sw.finalize(filename)
+        print "Allocating blocks..."
+        ptr1 = mem.alloc(10)
+        ptr2 = mem.alloc(20)
         
-        print "[2/3] Opening ShardView..."
-        view = shard.ShardView(filename)
+        # Verify we can write to the allocated memory
+        ptr1[0] = 'A'
+        ptr2[0] = 'B'
         
-        if view.count != 2:
-            print "Error: Count mismatch"
+        if ptr1[0] != 'A' or ptr2[0] != 'B':
+            print "Error: Memory write/read failed"
             return 1
             
-        print "[3/3] Verifying Data..."
-        w1 = view.get_weight(0)
-        k1 = view.materialize_key(0)
-        v1 = view.materialize_value(0)
+        print "Arena allocation and access successful."
         
-        print "Entry 0: Key=%s, Val=%s, Weight=%d" % (k1, v1, w1)
-        
-        if k1 != "id:001" or v1 != "Alice" or w1 != 1:
-            print "Error: Data corruption"
+        # Test reset
+        mem.reset()
+        if mem.offset != 0:
+            print "Error: Reset failed"
             return 1
             
-        view.close()
-        print "Validation Successful."
-        
-    except Exception as e:
-        print "Unexpected error during validation"
+    except errors.StorageError:
+        print "Error: Unexpected Arena exhaustion"
         return 1
     finally:
-        if os.path.exists(filename):
-            os.unlink(filename)
-            
+        mem.free()
+        
+    print "Step 2.1 Validation Complete."
     return 0
 
 def target(driver, args):
