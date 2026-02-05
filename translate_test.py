@@ -1,39 +1,56 @@
 import sys
 import os
-from gnitz.storage import spine, writer
+from gnitz.storage import memtable, spine, engine, writer
 
 def entry_point(argv):
-    print "--- Step 3.1: Shard Handles ---"
-    fn = "spine_test.db"
+    print "--- Step 3.4: The Global Engine ---"
+    
+    fn = "engine_final.db"
     sw = writer.ShardWriter()
-    sw.add_entry("key1", "val1", 1)
+    # Create a shard with a range: "a" to "c"
+    # This ensures "b" falls inside the range
+    sw.add_entry("a", "val_a", 10)
+    sw.add_entry("c", "val_c", 10)
     sw.finalize(fn)
     
+    mem_mgr = memtable.MemTableManager(1024 * 1024)
+    s = spine.Spine([spine.ShardHandle(fn)])
+    db = engine.Engine(mem_mgr, s)
+    
     try:
-        print "Opening ShardHandle..."
-        handle = spine.ShardHandle(fn)
-        print "Handle Min Key: %s" % handle.min_key
-        print "Handle Max Key: %s" % handle.max_key
+        print "[1/3] Testing Spine Lookup (Range Check)..."
+        # "b" is not in the shard, but is in the range ["a", "c"]
+        # So lookup_candidate_index should return 0, 
+        # but find_key_index should return -1.
+        if db.get_weight("b") != 0:
+            print "Error: 'b' should have weight 0 (not in shard)"
+            return 1
+            
+        if db.get_weight("a") != 10:
+            print "Error: 'a' should have weight 10"
+            return 1
+
+        print "[2/3] Testing DBSP Summation (Annihilation)..."
+        # Spine has a=10. We put a=-10 in MemTable.
+        db.mem_manager.put("a", "val_a", -10)
         
-        if handle.min_key != "key1":
-            print "Error: MinKey mismatch"
+        res = db.get_weight("a")
+        print "Weight of 'a' after retraction: %d" % res
+        if res != 0:
+            print "Error: Annihilation failed"
             return 1
             
-        val = handle.materialize_value(0)
-        print "Value: %s" % val
-        if val != "val1":
-            print "Error: Value mismatch"
+        print "[3/3] Testing MemTable Only Lookup..."
+        db.mem_manager.put("z", "val_z", 42)
+        if db.get_weight("z") != 42:
+            print "Error: MemTable lookup failed"
             return 1
             
-        handle.close()
-    except Exception as e:
-        print "Exception in Step 3.1"
-        return 1
     finally:
-        if os.path.exists(fn):
-            os.unlink(fn)
+        db.close()
+        if os.path.exists(fn): os.unlink(fn)
             
-    print "Step 3.1 Validation Complete."
+    print "Step 3.4 Validation Complete."
     return 0
 
 def target(driver, args):
