@@ -1,47 +1,39 @@
 import sys
 import os
-from gnitz.storage import memtable, shard
+from gnitz.storage import spine, writer
 
 def entry_point(argv):
-    print "--- Phase 2: MemTable and Management ---"
-    
-    mgr = memtable.MemTableManager(1024 * 1024)
-    filename = "manager_test.db"
+    print "--- Step 3.1: Shard Handles ---"
+    fn = "spine_test.db"
+    sw = writer.ShardWriter()
+    sw.add_entry("key1", "val1", 1)
+    sw.finalize(fn)
     
     try:
-        print "[1/3] Writing via Manager..."
-        mgr.put("sensor:001", "23.5", 1)
-        mgr.put("sensor:002", "19.1", 1)
-        mgr.put("sensor:001", "23.5", 1) # Coalesce to 2
+        print "Opening ShardHandle..."
+        handle = spine.ShardHandle(fn)
+        print "Handle Min Key: %s" % handle.min_key
+        print "Handle Max Key: %s" % handle.max_key
         
-        print "Current Usage: %d bytes" % mgr.active_table.get_usage()
-
-        print "[2/3] Rotating and Flushing..."
-        mgr.flush_and_rotate(filename)
-        
-        print "[3/3] Verifying Shard..."
-        view = shard.ShardView(filename)
-        print "Shard Count: %d" % view.count
-        
-        if view.count != 2:
-            print "Error: Manager failed to flush all entries"
+        if handle.min_key != "key1":
+            print "Error: MinKey mismatch"
             return 1
             
-        if view.get_weight(0) != 2:
-            print "Error: Coalescing failed in flushed shard"
+        val = handle.materialize_value(0)
+        print "Value: %s" % val
+        if val != "val1":
+            print "Error: Value mismatch"
             return 1
             
-        view.close()
-        print "Validation Successful."
-        
+        handle.close()
     except Exception as e:
-        print "Manager test failed"
+        print "Exception in Step 3.1"
         return 1
     finally:
-        mgr.close()
-        if os.path.exists(filename):
-            os.unlink(filename)
+        if os.path.exists(fn):
+            os.unlink(fn)
             
+    print "Step 3.1 Validation Complete."
     return 0
 
 def target(driver, args):
