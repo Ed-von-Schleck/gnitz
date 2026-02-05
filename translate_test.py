@@ -1,56 +1,47 @@
 import sys
 import os
-from gnitz.storage import memtable, spine, engine, writer
+from rpython.rtyper.lltypesystem import rffi, lltype
+from gnitz.storage import memtable, spine, engine, writer_ecs, layout, shard_ecs
+from gnitz.core import types, strings
 
 def entry_point(argv):
-    print "--- Step 3.4: The Global Engine ---"
+    print "--- GnitzDB ECS Integration Test ---"
     
-    fn = "engine_final.db"
-    sw = writer.ShardWriter()
-    # Create a shard with a range: "a" to "c"
-    # This ensures "b" falls inside the range
-    sw.add_entry("a", "val_a", 10)
-    sw.add_entry("c", "val_c", 10)
-    sw.finalize(fn)
-    
-    mem_mgr = memtable.MemTableManager(1024 * 1024)
-    s = spine.Spine([spine.ShardHandle(fn)])
-    db = engine.Engine(mem_mgr, s)
+    layout_obj = types.ComponentLayout([types.TYPE_I64, types.TYPE_STRING])
+    fn = "ecs_engine_test.db"
+    if os.path.exists(fn): os.unlink(fn)
     
     try:
-        print "[1/3] Testing Spine Lookup (Range Check)..."
-        # "b" is not in the shard, but is in the range ["a", "c"]
-        # So lookup_candidate_index should return 0, 
-        # but find_key_index should return -1.
-        if db.get_weight("b") != 0:
-            print "Error: 'b' should have weight 0 (not in shard)"
-            return 1
-            
-        if db.get_weight("a") != 10:
-            print "Error: 'a' should have weight 10"
-            return 1
-
-        print "[2/3] Testing DBSP Summation (Annihilation)..."
-        # Spine has a=10. We put a=-10 in MemTable.
-        db.mem_manager.put("a", "val_a", -10)
+        mgr = memtable.MemTableManager(layout_obj, 1024 * 1024)
+        sp = spine.Spine([]) 
+        db = engine.Engine(mgr, sp)
         
-        res = db.get_weight("a")
-        print "Weight of 'a' after retraction: %d" % res
-        if res != 0:
-            print "Error: Annihilation failed"
-            return 1
+        print "[1/5] MemTable Upsert..."
+        db.mem_manager.put(1, 1, 100, "mem_only")
+        
+        if db.get_effective_weight(1) != 1: return 1
+        if db.read_component_i64(1, 0) != 100: return 1
             
-        print "[3/3] Testing MemTable Only Lookup..."
-        db.mem_manager.put("z", "val_z", 42)
-        if db.get_weight("z") != 42:
-            print "Error: MemTable lookup failed"
-            return 1
+        print "[2/5] Flushing to Disk..."
+        db.mem_manager.flush_and_rotate(fn)
+        
+        sp.close_all()
+        handle = spine.ShardHandle(fn, layout_obj)
+        sp = spine.Spine([handle])
+        db = engine.Engine(mgr, sp)
+        
+        print "[3/5] Spine Read..."
+        if db.get_effective_weight(1) != 1: return 1
+        if db.read_component_i64(1, 0) != 100: return 1
+
+        print "[4/5] Annihilation Test..."
+        db.mem_manager.put(1, -1, 100, "mem_only") 
+        if db.get_effective_weight(1) != 0: return 1
             
+        print "Full ECS Engine Validation Complete."
     finally:
-        db.close()
         if os.path.exists(fn): os.unlink(fn)
-            
-    print "Step 3.4 Validation Complete."
+
     return 0
 
 def target(driver, args):

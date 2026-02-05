@@ -1,71 +1,80 @@
 from rpython.rlib import jit
-from gnitz.storage.shard import ShardView
+from rpython.rtyper.lltypesystem import rffi, lltype
+from gnitz.storage import shard_ecs
 
 class ShardHandle(object):
-    _immutable_fields_ = ['view', 'min_key', 'max_key', 'count']
+    _immutable_fields_ = ['view', 'min_eid', 'max_eid', 'count']
 
-    def __init__(self, filename):
-        self.view = ShardView(filename)
+    def __init__(self, filename, layout):
+        self.view = shard_ecs.ECSShardView(filename, layout)
         self.count = self.view.count
         if self.count > 0:
-            self.min_key = self.view.materialize_key(0)
-            self.max_key = self.view.materialize_key(self.count - 1)
+            self.min_eid = self.view.get_entity_id(0)
+            self.max_eid = self.view.get_entity_id(self.count - 1)
         else:
-            self.min_key = ""
-            self.max_key = ""
+            self.min_eid = 0
+            self.max_eid = 0
 
-    def get_weight(self, idx):
-        return self.view.get_weight(idx)
+    def get_entity_id(self, idx):
+        return self.view.get_entity_id(idx)
+    
+    def find_entity_index(self, entity_id):
+        return self.view.find_entity_index(entity_id)
 
-    def materialize_key(self, idx):
-        return self.view.materialize_key(idx)
+    def read_field_i64(self, idx, field_idx):
+        return self.view.read_field_i64(idx, field_idx)
 
-    def materialize_value(self, idx):
-        return self.view.materialize_value(idx)
+    def string_field_equals(self, idx, field_idx, val):
+        return self.view.string_field_equals(idx, field_idx, val)
 
     def close(self):
         self.view.close()
 
 class Spine(object):
-    _immutable_fields_ = ['handles[*]', 'min_keys[*]', 'max_keys[*]', 'shard_count']
+    _immutable_fields_ = ['handles[*]', 'min_eids[*]', 'max_eids[*]', 'shard_count']
 
     def __init__(self, handles):
         self.handles = handles
         self.shard_count = len(handles)
-        self.min_keys = [h.min_key for h in handles]
-        self.max_keys = [h.max_key for h in handles]
+        self.min_eids = [h.min_eid for h in handles]
+        self.max_eids = [h.max_eid for h in handles]
 
     @jit.elidable
-    def lookup_candidate_index(self, key):
-        """Finds the index of the shard that could contain 'key'."""
+    def lookup_candidate_index(self, entity_id):
+        """
+        Binary search the spine metadata to find a shard that *might* contain the entity.
+        Returns the index of the shard in self.handles, or -1.
+        """
         low = 0
         high = self.shard_count - 1
         ans = -1
         while low <= high:
             mid = (low + high) // 2
-            if self.min_keys[mid] <= key:
+            if self.min_eids[mid] <= entity_id:
                 ans = mid
                 low = mid + 1
             else:
                 high = mid - 1
         
         if ans != -1:
-            if key <= self.max_keys[ans]:
+            if entity_id <= self.max_eids[ans]:
                 return ans
         return -1
 
-    def get_weight_for_key(self, key):
-        """Returns weight from the Spine for a specific key."""
-        idx = self.lookup_candidate_index(key)
+    def find_shard_and_index(self, entity_id):
+        """
+        Returns (shard_handle, row_index) or (None, -1).
+        """
+        idx = self.lookup_candidate_index(entity_id)
         if idx == -1:
-            return 0
+            return None, -1
         
         shard = self.handles[idx]
-        key_idx = shard.view.find_key_index(key)
-        if key_idx == -1:
-            return 0
+        row_idx = shard.find_entity_index(entity_id)
+        if row_idx == -1:
+            return None, -1
             
-        return shard.get_weight(key_idx)
+        return shard, row_idx
 
     def close_all(self):
         for h in self.handles:
