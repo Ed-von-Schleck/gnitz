@@ -41,7 +41,7 @@ class TestLayout(unittest.TestCase):
         
         for offset in offsets:
             # Each offset + 8 bytes (u64 size) must fit in header
-            self.assertLess(offset + 8, layout.HEADER_SIZE)
+            self.assertLessEqual(offset + 8, layout.HEADER_SIZE)
     
     def test_no_overlapping_offsets(self):
         """Test that header field offsets don't overlap."""
