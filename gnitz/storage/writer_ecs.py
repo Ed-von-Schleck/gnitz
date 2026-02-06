@@ -7,9 +7,10 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.jit import unrolling_iterable
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
 from gnitz.storage import layout, mmap_posix
-from gnitz.core import types, strings as string_logic
+from gnitz.core import types, strings as string_logic, checksum
+from rpython.rlib.rarithmetic import r_uint64
 
-# --- External C Function Definitions ---
+
 eci = ExternalCompilationInfo(includes=['string.h'])
 memmove = rffi.llexternal('memmove', 
                          [rffi.CCHARP, rffi.CCHARP, rffi.SIZE_T], 
@@ -20,21 +21,15 @@ MAX_FIELDS = 64
 FIELD_INDICES = unrolling_iterable(range(MAX_FIELDS))
 
 class ECSShardWriter(object):
-    """
-    Standardized shard writer using raw memory buffers.
-    Supports both direct packed row copies and scalar field packing.
-    """
     def __init__(self, component_layout, initial_capacity=1024):
         self.layout = component_layout
         self.capacity = initial_capacity
         self.count = 0
         
-        # Raw buffers for fixed-size regions
         self.entities_ptr = lltype.malloc(rffi.LONGLONGP.TO, self.capacity, flavor='raw')
         self.weights_ptr = lltype.malloc(rffi.LONGLONGP.TO, self.capacity, flavor='raw')
         self.c_data_ptr = lltype.malloc(rffi.CCHARP.TO, self.capacity * self.layout.stride, flavor='raw')
         
-        # Raw buffer for variable-size blob heap
         self.blob_capacity = initial_capacity * 32
         self.blob_ptr = lltype.malloc(rffi.CCHARP.TO, self.blob_capacity, flavor='raw')
         self.blob_offset = 0
@@ -77,9 +72,6 @@ class ECSShardWriter(object):
         self._add_entity_weighted(entity_id, 1, *field_values)
 
     def _add_entity_weighted(self, entity_id, weight, *field_values):
-        """
-        Packs scalar Python objects into the raw columnar regions.
-        """
         self._ensure_capacity()
         
         idx = self.count
@@ -89,7 +81,6 @@ class ECSShardWriter(object):
         stride = self.layout.stride
         dest_row_ptr = rffi.ptradd(self.c_data_ptr, idx * stride)
         
-        # Zero-initialize the stride for safety
         for k in range(stride): dest_row_ptr[k] = '\x00'
         
         for i in FIELD_INDICES:
@@ -120,9 +111,6 @@ class ECSShardWriter(object):
         self.count += 1
 
     def add_packed_row(self, entity_id, weight, source_row_ptr, source_heap_ptr):
-        """
-        Efficiently copies a pre-packed row from memory (MemTable/Compactor).
-        """
         self._ensure_capacity()
         
         idx = self.count
@@ -133,7 +121,6 @@ class ECSShardWriter(object):
         dest_row_ptr = rffi.ptradd(self.c_data_ptr, idx * stride)
         memmove(dest_row_ptr, source_row_ptr, rffi.cast(rffi.SIZE_T, stride))
         
-        # Relocate German Strings
         for i in FIELD_INDICES:
             if i >= len(self.layout.field_types): break
             if self.layout.field_types[i] == types.TYPE_STRING:
@@ -178,8 +165,14 @@ class ECSShardWriter(object):
 
             self._write_padding(fd, layout.HEADER_SIZE)
             mmap_posix.write_c(fd, rffi.cast(rffi.CCHARP, self.entities_ptr), rffi.cast(rffi.SIZE_T, size_e))
+            
+            checksum_e = checksum.compute_checksum(rffi.cast(rffi.CCHARP, self.entities_ptr), size_e)
+            
             self._write_padding(fd, off_w - (off_e + size_e))
             mmap_posix.write_c(fd, rffi.cast(rffi.CCHARP, self.weights_ptr), rffi.cast(rffi.SIZE_T, size_w))
+            
+            checksum_w = checksum.compute_checksum(rffi.cast(rffi.CCHARP, self.weights_ptr), size_w)
+            
             self._write_padding(fd, off_c - (off_w + size_w))
             mmap_posix.write_c(fd, self.c_data_ptr, rffi.cast(rffi.SIZE_T, size_c))
             self._write_padding(fd, off_b - (off_c + size_c))
@@ -192,6 +185,10 @@ class ECSShardWriter(object):
             
             rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_MAGIC))[0] = rffi.cast(rffi.LONGLONG, layout.MAGIC_NUMBER)
             rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_COUNT))[0] = rffi.cast(rffi.LONGLONG, self.count)
+            
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_CHECKSUM_E))[0] = rffi.cast(rffi.ULONGLONG, checksum_e)
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_CHECKSUM_W))[0] = rffi.cast(rffi.ULONGLONG, checksum_w)
+            
             rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_REG_E_ECS))[0] = rffi.cast(rffi.LONGLONG, off_e)
             rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_REG_W_ECS))[0] = rffi.cast(rffi.LONGLONG, off_w)
             rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_REG_C_ECS))[0] = rffi.cast(rffi.LONGLONG, off_c)

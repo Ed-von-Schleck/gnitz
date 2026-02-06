@@ -1,20 +1,12 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
 
-# ============================================================================
-# POSIX Constants
-# ============================================================================
-
 PROT_READ       = 0x1
 PROT_WRITE      = 0x2
 MAP_SHARED      = 0x01
 MAP_PRIVATE     = 0x02
 
 eci = ExternalCompilationInfo(includes=['sys/mman.h', 'unistd.h'])
-
-# ============================================================================
-# External C Functions
-# ============================================================================
 
 mmap_c = rffi.llexternal(
     "mmap",
@@ -30,17 +22,12 @@ munmap_c = rffi.llexternal(
     compilation_info=eci
 )
 
-# ssize_t write(int fd, const void *buf, size_t count);
 write_c = rffi.llexternal(
     "write",
     [rffi.INT, rffi.CCHARP, rffi.SIZE_T],
     rffi.SSIZE_T,
     compilation_info=eci
 )
-
-# ============================================================================
-# High-Level RPython Wrappers
-# ============================================================================
 
 class MMapError(Exception):
     pass

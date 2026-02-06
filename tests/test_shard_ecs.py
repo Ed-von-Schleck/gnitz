@@ -4,7 +4,8 @@ tests/test_shard_ecs.py
 import unittest
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import types, strings
+from rpython.rlib.rarithmetic import r_uint64
+from gnitz.core import types, strings, checksum
 from gnitz.storage import layout, shard_ecs
 
 def create_test_shard(filename, component_layout, entities, components_data, weights=None):
@@ -26,56 +27,68 @@ def create_test_shard(filename, component_layout, entities, components_data, wei
     
     off_b = off_c + size_c
     
-    with open(filename, "wb") as f:
-        # 1. Write Header
-        header = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor='raw')
-        try:
-            for i in range(layout.HEADER_SIZE): header[i] = '\x00'
-            
-            rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_MAGIC))[0] = rffi.cast(rffi.LONGLONG, layout.MAGIC_NUMBER)
-            rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_COUNT))[0] = rffi.cast(rffi.LONGLONG, count)
-            rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_REG_E_ECS))[0] = rffi.cast(rffi.LONGLONG, off_e)
-            rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_REG_W_ECS))[0] = rffi.cast(rffi.LONGLONG, off_w)
-            rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_REG_C_ECS))[0] = rffi.cast(rffi.LONGLONG, off_c)
-            rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_REG_B_ECS))[0] = rffi.cast(rffi.LONGLONG, off_b)
-            
-            f.write(rffi.charpsize2str(header, layout.HEADER_SIZE))
-        finally:
-            lltype.free(header, flavor='raw')
+    # Allocate buffers for regions (we'll compute checksums from these)
+    e_buf = lltype.malloc(rffi.CCHARP.TO, size_e, flavor='raw')
+    w_buf = lltype.malloc(rffi.CCHARP.TO, size_w, flavor='raw')
+    c_buf = lltype.malloc(rffi.CCHARP.TO, size_c, flavor='raw')
+    
+    try:
+        # 1. Build Region E (Entities)
+        e_ptr = rffi.cast(rffi.LONGLONGP, e_buf)
+        for i, eid in enumerate(entities):
+            e_ptr[i] = rffi.cast(rffi.LONGLONG, eid)
         
-        # 2. Write Region E (Entities)
-        e_buf = lltype.malloc(rffi.CCHARP.TO, size_e, flavor='raw')
-        try:
-            e_ptr = rffi.cast(rffi.LONGLONGP, e_buf)
-            for i, eid in enumerate(entities):
-                e_ptr[i] = rffi.cast(rffi.LONGLONG, eid)
+        # 2. Build Region W (Weights)
+        w_ptr = rffi.cast(rffi.LONGLONGP, w_buf)
+        for i, w in enumerate(weights):
+            w_ptr[i] = rffi.cast(rffi.LONGLONG, w)
+        
+        # 3. Build Region C (Components)
+        for i in range(size_c): c_buf[i] = '\x00'
+        for i, data in enumerate(components_data):
+            dest_ptr = rffi.ptradd(c_buf, i * stride)
+            for j in range(len(data)):
+                dest_ptr[j] = data[j]
+        
+        # 4. Compute checksums
+        checksum_e = checksum.compute_checksum(e_buf, size_e)
+        checksum_w = checksum.compute_checksum(w_buf, size_w)
+        
+        # 5. Write to file
+        with open(filename, "wb") as f:
+            # Write Header with checksums
+            header = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor='raw')
+            try:
+                for i in range(layout.HEADER_SIZE): header[i] = '\x00'
+                
+                rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_MAGIC))[0] = rffi.cast(rffi.LONGLONG, layout.MAGIC_NUMBER)
+                rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_COUNT))[0] = rffi.cast(rffi.LONGLONG, count)
+                rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_REG_E_ECS))[0] = rffi.cast(rffi.LONGLONG, off_e)
+                rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_REG_W_ECS))[0] = rffi.cast(rffi.LONGLONG, off_w)
+                rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_REG_C_ECS))[0] = rffi.cast(rffi.LONGLONG, off_c)
+                rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, layout.OFF_REG_B_ECS))[0] = rffi.cast(rffi.LONGLONG, off_b)
+                
+                # Write checksums as ULONGLONG (unsigned)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_CHECKSUM_E))[0] = rffi.cast(rffi.ULONGLONG, checksum_e)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_CHECKSUM_W))[0] = rffi.cast(rffi.ULONGLONG, checksum_w)
+                
+                f.write(rffi.charpsize2str(header, layout.HEADER_SIZE))
+            finally:
+                lltype.free(header, flavor='raw')
+            
+            # Write Region E
             f.write(rffi.charpsize2str(e_buf, size_e))
-        finally:
-            lltype.free(e_buf, flavor='raw')
-        
-        # 3. Write Region W (Weights)
-        w_buf = lltype.malloc(rffi.CCHARP.TO, size_w, flavor='raw')
-        try:
-            w_ptr = rffi.cast(rffi.LONGLONGP, w_buf)
-            for i, w in enumerate(weights):
-                w_ptr[i] = rffi.cast(rffi.LONGLONG, w)
-            f.write(rffi.charpsize2str(w_buf, size_w))
-        finally:
-            lltype.free(w_buf, flavor='raw')
-        
-        # 4. Write Region C (Components)
-        c_buf = lltype.malloc(rffi.CCHARP.TO, size_c, flavor='raw')
-        try:
-            # Zero initialize to prevent garbage
-            for i in range(size_c): c_buf[i] = '\x00'
             
-            for i, data in enumerate(components_data):
-                dest_ptr = rffi.ptradd(c_buf, i * stride)
-                for j in range(len(data)):
-                    dest_ptr[j] = data[j]
+            # Write Region W
+            f.write(rffi.charpsize2str(w_buf, size_w))
+            
+            # Write Region C
             f.write(rffi.charpsize2str(c_buf, size_c))
-        finally:
-            lltype.free(c_buf, flavor='raw')
+            
+    finally:
+        lltype.free(e_buf, flavor='raw')
+        lltype.free(w_buf, flavor='raw')
+        lltype.free(c_buf, flavor='raw')
 
 class TestECSShardView(unittest.TestCase):
     def setUp(self):
@@ -100,7 +113,7 @@ class TestECSShardView(unittest.TestCase):
         components.append(rffi.charpsize2str(c2_buf, self.layout.stride))
         lltype.free(c2_buf, flavor='raw')
 
-        # Component 3 (Entity 30) - WAS MISSING in original test
+        # Component 3 (Entity 30)
         c3_buf = lltype.malloc(rffi.CCHARP.TO, self.layout.stride, flavor='raw')
         for i in range(self.layout.stride): c3_buf[i] = '\x00'
         rffi.cast(rffi.LONGLONGP, c3_buf)[0] = rffi.cast(rffi.LONGLONG, 300)
@@ -108,9 +121,11 @@ class TestECSShardView(unittest.TestCase):
         components.append(rffi.charpsize2str(c3_buf, self.layout.stride))
         lltype.free(c3_buf, flavor='raw')
 
-        # Create shard with explicit weights
+        # Create shard with explicit weights and checksums
         weights = [1, -1, 1]
         create_test_shard(self.fn, self.layout, self.entities, components, weights)
+        
+        # Now validation will work!
         self.view = shard_ecs.ECSShardView(self.fn, self.layout)
 
     def tearDown(self):

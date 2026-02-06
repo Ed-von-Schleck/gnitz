@@ -14,7 +14,6 @@ class MappedBuffer(object):
             raise errors.BoundsError()
 
     def get_raw_ptr(self, offset):
-        """Returns raw pointer after bounds check. Used for JIT optimization."""
         self._check_bounds(offset, 1)
         return rffi.ptradd(self.ptr, offset)
 

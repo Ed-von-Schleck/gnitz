@@ -4,8 +4,9 @@ gnitz/storage/shard_ecs.py
 import os
 from rpython.rlib import jit, rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import r_uint64
 from gnitz.storage import buffer, layout, mmap_posix, errors
-from gnitz.core import strings as string_logic
+from gnitz.core import strings as string_logic, checksum
 
 class ECSShardView(object):
     _immutable_fields_ = [
@@ -13,7 +14,7 @@ class ECSShardView(object):
         'buf_e', 'buf_c', 'buf_b', 'buf_w'
     ]
 
-    def __init__(self, filename, component_layout):
+    def __init__(self, filename, component_layout, validate_checksums=True):
         self.layout = component_layout
         
         fd = rposix.open(filename, os.O_RDONLY, 0)
@@ -41,6 +42,43 @@ class ECSShardView(object):
         self.buf_w = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_w), off_c - off_w)
         self.buf_c = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_c), off_b - off_c)
         self.buf_b = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_b), self.size - off_b)
+        
+        # Validate checksums if requested
+        if validate_checksums:
+            self.validate_region_e()
+            self.validate_region_w()
+    
+    def validate_region_e(self):
+        """Validate Region E checksum."""
+        # Read stored checksum as ULONGLONG (unsigned) and convert to r_uint64
+        expected = r_uint64(rffi.cast(
+            rffi.ULONGLONGP, 
+            rffi.ptradd(self.ptr, layout.OFF_CHECKSUM_E)
+        )[0])
+        
+        # Calculate actual checksum
+        region_e_size = self.count * 8
+        actual = checksum.compute_checksum(self.buf_e.ptr, region_e_size)
+        
+        # Compare (both are r_uint64 now)
+        if actual != expected:
+            raise errors.CorruptShardError("Region E checksum mismatch")
+    
+    def validate_region_w(self):
+        """Validate Region W checksum."""
+        # Read stored checksum as ULONGLONG (unsigned) and convert to r_uint64
+        expected = r_uint64(rffi.cast(
+            rffi.ULONGLONGP,
+            rffi.ptradd(self.ptr, layout.OFF_CHECKSUM_W)
+        )[0])
+        
+        # Calculate actual checksum
+        region_w_size = self.count * 8
+        actual = checksum.compute_checksum(self.buf_w.ptr, region_w_size)
+        
+        # Compare (both are r_uint64 now)
+        if actual != expected:
+            raise errors.CorruptShardError("Region W checksum mismatch")
 
     def get_entity_id(self, index):
         return self.buf_e.read_i64(index * 8)
