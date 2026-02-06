@@ -6,7 +6,6 @@ from gnitz.storage import shard_ecs, writer_ecs, tournament_tree, compaction_log
 
 def compact_shards(input_files, input_lsns, output_file, layout):
     """
-    (Existing logic from Step 1.9)
     Performs a vertical merge of multiple shards into a single consolidated shard.
     """
     views = []
@@ -60,6 +59,20 @@ class CompactionPolicy(object):
         for the component into one 'Guard' shard.
         """
         return self.registry.get_shards_for_component(component_id)
+
+def finalize_compaction(old_shard_filenames, ref_counter):
+    """
+    Marks old shards for deletion and attempts cleanup.
+    
+    Args:
+        old_shard_filenames: List of filenames to remove
+        ref_counter: RefCounter instance
+    """
+    for fn in old_shard_filenames:
+        ref_counter.mark_for_deletion(fn)
+    
+    # Try to delete immediately (will succeed if no active readers)
+    ref_counter.try_cleanup()
 
 def execute_compaction(component_id, policy, manifest_manager, ref_counter, layout, output_dir="."):
     """
@@ -120,14 +133,18 @@ def execute_compaction(component_id, policy, manifest_manager, ref_counter, layo
     manifest_manager.publish_new_version(new_entries)
 
     # 6. Lifecycle Management
-    # Update Registry
+    # Update Registry and mark old files for deletion
+    old_filenames = []
     for meta in shard_metas:
         policy.registry.unregister_shard(meta.filename)
-        ref_counter.mark_for_deletion(meta.filename)
+        old_filenames.append(meta.filename)
     
     from gnitz.storage.shard_registry import ShardMetadata
     new_meta = ShardMetadata(new_filename, component_id, min_eid, max_eid, min_lsn, max_lsn)
     policy.registry.register_shard(new_meta)
     policy.registry.clear_compaction_flag(component_id)
+
+    # Finalize: Mark for deletion and try cleanup
+    finalize_compaction(old_filenames, ref_counter)
 
     return new_filename

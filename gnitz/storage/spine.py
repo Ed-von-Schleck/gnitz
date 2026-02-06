@@ -6,9 +6,10 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import shard_ecs, manifest
 
 class ShardHandle(object):
-    _immutable_fields_ = ['view', 'min_eid', 'max_eid', 'count']
+    _immutable_fields_ = ['view', 'min_eid', 'max_eid', 'count', 'filename']
 
     def __init__(self, filename, layout):
+        self.filename = filename
         self.view = shard_ecs.ECSShardView(filename, layout)
         self.count = self.view.count
         if self.count > 0:
@@ -37,16 +38,22 @@ class ShardHandle(object):
         self.view.close()
 
 class Spine(object):
-    _immutable_fields_ = ['handles[*]', 'min_eids[*]', 'max_eids[*]', 'shard_count']
+    _immutable_fields_ = ['handles[*]', 'min_eids[*]', 'max_eids[*]', 'shard_count', 'ref_counter']
 
-    def __init__(self, handles):
+    def __init__(self, handles, ref_counter=None):
         self.handles = handles
         self.shard_count = len(handles)
         self.min_eids = [h.min_eid for h in handles]
         self.max_eids = [h.max_eid for h in handles]
+        self.ref_counter = ref_counter
+        self.closed = False
+        
+        if self.ref_counter:
+            for h in self.handles:
+                self.ref_counter.acquire(h.filename)
 
     @staticmethod
-    def from_manifest(manifest_filename, component_id, layout):
+    def from_manifest(manifest_filename, component_id, layout, ref_counter=None):
         reader = manifest.ManifestReader(manifest_filename)
         try:
             handles = []
@@ -54,13 +61,12 @@ class Spine(object):
                 if entry.component_id == component_id:
                     handle = ShardHandle(entry.shard_filename, layout)
                     handles.append(handle)
-            return Spine(handles)
+            return Spine(handles, ref_counter)
         finally:
             reader.close()
 
     @jit.elidable
     def lookup_candidate_index(self, entity_id):
-        # Legacy single-shard lookup (kept for non-overlapping optimizations if needed)
         low = 0
         high = self.shard_count - 1
         ans = -1
@@ -78,7 +84,6 @@ class Spine(object):
         return -1
 
     def find_shard_and_index(self, entity_id):
-        # Legacy single-shard lookup
         idx = self.lookup_candidate_index(entity_id)
         if idx == -1:
             return None, -1
@@ -91,16 +96,7 @@ class Spine(object):
         return shard, row_idx
 
     def find_all_shards_and_indices(self, entity_id):
-        """
-        Finds ALL shards that contain the given entity_id.
-        Necessary for correct algebraic summation in overlapping (L0) shards.
-        
-        Returns:
-            List of (ShardHandle, row_index) tuples.
-        """
         results = []
-        # Linear scan is acceptable here because shard_count is typically small (L0)
-        # or managed by Compaction. For a large number of shards, an Interval Tree is needed.
         for i in range(self.shard_count):
             if self.min_eids[i] <= entity_id <= self.max_eids[i]:
                 handle = self.handles[i]
@@ -110,5 +106,15 @@ class Spine(object):
         return results
 
     def close_all(self):
+        if self.closed:
+            return
+        
         for h in self.handles:
             h.close()
+            if self.ref_counter:
+                self.ref_counter.release(h.filename)
+        
+        if self.ref_counter:
+            self.ref_counter.try_cleanup()
+            
+        self.closed = True

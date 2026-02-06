@@ -22,6 +22,9 @@ def entry_point(argv):
         if os.path.exists(f): os.unlink(f)
     
     try:
+        # Create RefCounter at start
+        rc = refcount.RefCounter()
+
         # === PHASE 1: Integrated Ingestion & Persistence ===
         print "[Phase 1] Ingesting with integrated flush..."
         
@@ -29,7 +32,8 @@ def entry_point(argv):
         mgr = memtable.MemTableManager(layout_obj, 1024 * 1024)
         m_mgr = manifest.ManifestManager(db_manifest)
         reg = shard_registry.ShardRegistry()
-        sp = spine.Spine([])
+        # Initialize Spine with the RefCounter (empty initially)
+        sp = spine.Spine([], rc)
         
         # Create Engine with integrated manifest and registry
         db = engine.Engine(mgr, sp, m_mgr, reg, component_id=1, current_lsn=1)
@@ -77,9 +81,13 @@ def entry_point(argv):
         # Verify registry was updated automatically
         if len(reg.shards) != 3: return 1  # Should have 3 shards registered
         
-        # Reload spine from manifest and verify algebraic summation
-        sp = spine.Spine.from_manifest(db_manifest, 1, layout_obj)
+        # Reload spine from manifest WITH RefCounter
+        sp = spine.Spine.from_manifest(db_manifest, 1, layout_obj, ref_counter=rc)
         db_engine = engine.Engine(mgr, sp, m_mgr, reg)
+        
+        # Verify references are acquired for A, B, C
+        if rc.get_refcount(shard_a) != 1: return 1
+        if rc.get_refcount(shard_b) != 1: return 1
         
         # Entity 100 exists in two shards (1+1=2). Latest value is "version_2"
         if db_engine.get_effective_weight(100) != 2: return 1
@@ -96,11 +104,12 @@ def entry_point(argv):
         # === PHASE 3: Automated Compaction Execution ===
         print "[Phase 3] Executing automated compaction..."
         
-        rc = refcount.RefCounter()
-        reg.mark_for_compaction(1) # Simulate heuristic trigger
+        # Trigger compaction
+        reg.mark_for_compaction(1)
         policy = compactor.CompactionPolicy(reg)
         
         # Merge shards A, B, and C into one consolidated shard
+        # Pass the SAME rc instance that the Spine is using
         new_shard = compactor.execute_compaction(1, policy, m_mgr, rc, layout_obj)
         if new_shard is None: return 1
         test_files.append(new_shard)
@@ -111,30 +120,35 @@ def entry_point(argv):
         reader.close()
         
         # Verify physical pruning: Entity 200 should be PHYSICALLY GONE
-        # Entity 100 should have a single record with weight 2
         vout = shard_ecs.ECSShardView(new_shard, layout_obj)
         if vout.count != 1: return 1
         if vout.get_entity_id(0) != 100: return 1
         if vout.get_weight(0) != 2: return 1
         vout.close()
         
+        # KEY CHECK: Old shards A, B, C should STILL EXIST physically
+        # because db_engine.spine is still open and holding references.
+        # finalize_compaction called try_cleanup(), but it should have been blocked.
+        if not os.path.exists(shard_a): return 1
+        if not os.path.exists(shard_b): return 1
+        if not os.path.exists(shard_c): return 1
+        
         print "  [OK] Compaction physically realized the Ghost Property"
+        print "  [OK] Old shards deferred deletion confirmed"
 
         # === PHASE 4: Reference Counting & Cleanup ===
         print "[Phase 4] Verifying reference-tracked deletion..."
         
-        # Old shards were marked for deletion by the compactor
-        # try_cleanup should physically unlink them now as their refcounts are 0
-        deleted = rc.try_cleanup()
-        if len(deleted) != 3: return 1 # A, B, and C
+        # Now close the engine (and spine). This releases refs and triggers try_cleanup.
+        db_engine.close()
         
+        # Now the files should be gone.
         if os.path.exists(shard_a): return 1
         if os.path.exists(shard_b): return 1
         if os.path.exists(shard_c): return 1
         
-        print "  [OK] Obsolete shards physically deleted"
+        print "  [OK] Obsolete shards physically deleted after release"
         
-        db_engine.close()
         print ""
         print "=== All Translation Tests Passed ==="
         
