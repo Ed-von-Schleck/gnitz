@@ -9,6 +9,115 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import wal_format, mmap_posix, errors
 
 
+class WALReader(object):
+    """
+    Sequential reader for Write-Ahead Log blocks.
+    Validates checksums and provides iteration over Z-Set deltas.
+    """
+    def __init__(self, filename, layout):
+        """
+        Opens a WAL file for sequential reading.
+        
+        Args:
+            filename: Path to the WAL file
+            layout: ComponentLayout for decoding records
+        """
+        self.filename = filename
+        self.layout = layout
+        self.fd = -1
+        self.closed = False
+        
+        # Open file in read-only mode
+        self.fd = rposix.open(filename, os.O_RDONLY, 0)
+    
+    def read_next_block(self):
+        """
+        Reads the next block from the WAL sequentially.
+        
+        Automatically validates the block's checksum. If validation fails,
+        raises CorruptShardError to signal data corruption.
+        
+        Returns:
+            Tuple of (lsn, component_id, records) or None if EOF reached
+        
+        Raises:
+            CorruptShardError: If checksum validation fails or block is malformed
+        """
+        if self.closed:
+            return None
+        
+        # Read header first to determine block size
+        header_buf = lltype.malloc(rffi.CCHARP.TO, wal_format.WAL_BLOCK_HEADER_SIZE, flavor='raw')
+        try:
+            # Read header bytes
+            header_read = os.read(self.fd, wal_format.WAL_BLOCK_HEADER_SIZE)
+            
+            # Check for EOF
+            if len(header_read) == 0:
+                return None
+            
+            # Partial header is corruption
+            if len(header_read) < wal_format.WAL_BLOCK_HEADER_SIZE:
+                raise errors.CorruptShardError("Truncated WAL block header")
+            
+            # Copy to buffer for parsing
+            for i in range(wal_format.WAL_BLOCK_HEADER_SIZE):
+                header_buf[i] = header_read[i]
+            
+            # Parse entry count to determine body size
+            entry_count = rffi.cast(
+                lltype.Signed,
+                rffi.cast(rffi.UINTP, rffi.ptradd(header_buf, wal_format.OFF_ENTRY_COUNT))[0]
+            )
+        finally:
+            lltype.free(header_buf, flavor='raw')
+        
+        # Calculate body size
+        stride = self.layout.stride
+        record_size = 8 + 8 + stride  # entity_id + weight + component_data
+        body_size = entry_count * record_size
+        
+        # Read body
+        body_read = os.read(self.fd, body_size)
+        
+        # Check for truncated body
+        if len(body_read) < body_size:
+            raise errors.CorruptShardError("Truncated WAL block body")
+        
+        # Reconstruct complete block for decoding
+        complete_block = header_read + body_read
+        
+        # Decode and validate (decode_wal_block validates checksum internally)
+        lsn, component_id, records = wal_format.decode_wal_block(complete_block, self.layout)
+        
+        return lsn, component_id, records
+    
+    def iterate_blocks(self):
+        """
+        Generator that yields all blocks from the WAL in sequence.
+        
+        Yields:
+            Tuples of (lsn, component_id, records)
+        
+        Raises:
+            CorruptShardError: If any block fails checksum validation
+        """
+        while True:
+            result = self.read_next_block()
+            if result is None:
+                break
+            yield result
+    
+    def close(self):
+        """Closes the WAL file."""
+        if self.closed:
+            return
+        
+        rposix.close(self.fd)
+        self.fd = -1
+        self.closed = True
+
+
 class WALWriter(object):
     """
     Append-only Write-Ahead Log writer.
