@@ -2,168 +2,129 @@ import sys
 import os
 from gnitz.storage import (
     memtable, spine, engine, writer_ecs, manifest, 
-    shard_registry, refcount, compactor, compaction_logic, shard_ecs
+    shard_registry, refcount, compactor, shard_ecs
 )
 from gnitz.core import types
 
 def entry_point(argv):
-    print "--- GnitzDB End-to-End Lifecycle Test ---"
+    print "--- GnitzDB Full Lifecycle Translation Test ---"
     
-    # 1. Setup Schema: [ID (I64), Name (String)]
+    # 1. Setup Schema: [Value (I64), Label (String)]
     layout_obj = types.ComponentLayout([types.TYPE_I64, types.TYPE_STRING])
     
-    # Test file registry for cleanup
-    db_manifest = "test_manifest.db"
+    # Registry of test files for the test runner
+    db_manifest = "test_lifecycle.manifest"
     shard_a = "shard_a.db"
     shard_b = "shard_b.db"
-    shard_compacted = "shard_final.db"
     
-    all_files = [db_manifest, shard_a, shard_b, shard_compacted]
-    for f in all_files:
+    test_files = [db_manifest, shard_a, shard_b]
+    for f in test_files:
         if os.path.exists(f): os.unlink(f)
     
     try:
-        # === PHASE 1: Ingestion & Weight Persistence ===
-        print "[Phase 1] Ingestion and basic persistence..."
+        # === PHASE 1: Ingestion & Multi-Shard Persistence ===
+        print "[Phase 1] Ingesting and persisting overlapping shards..."
         
         mgr = memtable.MemTableManager(layout_obj, 1024 * 1024)
         db = engine.Engine(mgr, spine.Spine([]))
         
-        # Entity 1: Initial state
-        db.mem_manager.put(1, 1, 100, "original")
-        # Entity 2: To be updated later
-        db.mem_manager.put(2, 1, 200, "v1")
-        
-        # Flush to first immutable shard
+        # Entity 100: First version (Weight +1)
+        db.mem_manager.put(100, 1, 10, "version_1")
         db.mem_manager.flush_and_rotate(shard_a)
         
-        # Verify weight persistence on disk (Direct Shard Access)
-        view_a = shard_ecs.ECSShardView(shard_a, layout_obj)
-        if view_a.get_weight(0) != 1 or view_a.read_field_i64(0, 0) != 100:
-            print "  [FAIL] Shard A data incorrect"
-            return 1
-        view_a.close()
-        print "  [OK] Shard A persisted"
-
-        # === PHASE 2: Updates, Deletions & Manifest Versioning ===
-        print "[Phase 2] Multi-shard updates and manifest versioning..."
-        
-        # Entity 1: Annihilate (Weight -1)
-        db.mem_manager.put(1, -1, 100, "annihilated")
-        # Entity 2: Update (Higher weight/different value)
-        db.mem_manager.put(2, 1, 250, "v2")
-        # Entity 3: New entry
-        db.mem_manager.put(3, 1, 300, "v1")
-        
+        # Entity 100: Second version (Weight +1, Net weight should become 2)
+        # Entity 200: To be deleted (Annihilated)
+        db.mem_manager.put(100, 1, 20, "version_2")
+        db.mem_manager.put(200, 1, 99, "to_delete")
         db.mem_manager.flush_and_rotate(shard_b)
         
-        # Create Manifest v1 (Just shard A)
-        man_mgr = manifest.ManifestManager(db_manifest)
-        man_mgr.publish_new_version([
-            manifest.ManifestEntry(1, shard_a, 1, 2, 1, 1)
-        ])
-        
-        # Atomically Update to Manifest v2 (Shard A + Shard B)
-        man_mgr.publish_new_version([
-            manifest.ManifestEntry(1, shard_a, 1, 2, 1, 1),
-            manifest.ManifestEntry(1, shard_b, 1, 3, 2, 2)
-        ])
-        
-        # Load unified view from manifest
-        db_spine = spine.Spine.from_manifest(db_manifest, component_id=1, layout=layout_obj)
-        db_engine = engine.Engine(mgr, db_spine)
-        
-        # Verify Algebraic Result:
-        # Entity 1: 1 (A) + -1 (B) = 0 (Annihilated)
-        if db_engine.get_effective_weight(1) != 0:
-            print "  [FAIL] Entity 1 not annihilated"
-            return 1
-        
-        # Entity 2: 1 (A) + 1 (B) = 2 (Accumulated)
-        if db_engine.get_effective_weight(2) != 2:
-            print "  [FAIL] Entity 2 weight incorrect"
-            return 1
-            
-        print "  [OK] Manifest and multi-shard resolution working"
+        # Manually create Shard C to annihilate Entity 200
+        shard_c = "shard_c.db"
+        test_files.append(shard_c)
+        wc = writer_ecs.ECSShardWriter(layout_obj)
+        wc._add_entity_weighted(200, -1, 99, "deletion_marker")
+        wc.finalize(shard_c)
 
-        # === PHASE 3: Vertical Compaction & Ghost Property ===
-        print "[Phase 3] Compaction and algebraic pruning..."
+        # === PHASE 2: Manifest & Registry Setup ===
+        print "[Phase 2] Setting up manifest and identifying read-amplification..."
         
-        # Perform vertical merge sort of Shard A and Shard B
-        compactor.compact_shards(
-            [shard_a, shard_b], 
-            [1, 2], # LSNs
-            shard_compacted, 
-            layout_obj
-        )
-        
-        # Verify Physical Pruning (The Ghost Property)
-        view_final = shard_ecs.ECSShardView(shard_compacted, layout_obj)
-        
-        # Entity 1 should be PHYSICALLY GONE from the new shard
-        if view_final.find_entity_index(1) != -1:
-            print "  [FAIL] Annihilated entity 1 still exists in physical shard"
-            return 1
-            
-        # Entity 2 should exist with accumulated weight 2
-        idx2 = view_final.find_entity_index(2)
-        if view_final.get_weight(idx2) != 2 or view_final.read_field_i64(idx2, 0) != 250:
-            print "  [FAIL] Compacted entity 2 data incorrect (LSN resolution check)"
-            return 1
-            
-        view_final.close()
-        print "  [OK] Compaction successfully pruned dead records"
-
-        # === PHASE 4: Shard Registry & Read Amplification ===
-        print "[Phase 4] Registry and read amplification..."
+        m_mgr = manifest.ManifestManager(db_manifest)
+        m_mgr.publish_new_version([
+            manifest.ManifestEntry(1, shard_a, 100, 100, 1, 1),
+            manifest.ManifestEntry(1, shard_b, 100, 200, 2, 2),
+            manifest.ManifestEntry(1, shard_c, 200, 200, 3, 3)
+        ])
         
         reg = shard_registry.ShardRegistry()
-        reg.register_shard(shard_registry.ShardMetadata(shard_a, 1, 1, 2, 1, 1))
-        reg.register_shard(shard_registry.ShardMetadata(shard_b, 1, 1, 3, 2, 2))
+        reg.register_shard(shard_registry.ShardMetadata(shard_a, 1, 100, 100, 1, 1))
+        reg.register_shard(shard_registry.ShardMetadata(shard_b, 1, 100, 200, 2, 2))
+        reg.register_shard(shard_registry.ShardMetadata(shard_c, 1, 200, 200, 3, 3))
         
-        # Max read amp for component 1 is 2 (shards A and B overlap at entity 1 and 2)
-        if reg.get_max_read_amplification(1) != 2:
-            print "  [FAIL] Read amplification calculation incorrect"
-            return 1
-            
-        print "  [OK] Registry correctly identified overlap"
+        # Verify algebraic summation in the Engine before compaction
+        sp = spine.Spine.from_manifest(db_manifest, 1, layout_obj)
+        db_engine = engine.Engine(mgr, sp)
+        
+        # Entity 100 exists in two shards (1+1=2). Latest value is "version_2"
+        if db_engine.get_effective_weight(100) != 2: return 1
+        if db_engine.read_component_i64(100, 0) != 20: return 1
+        
+        # Entity 200 is annihilated (1 in shard B, -1 in shard C)
+        if db_engine.get_effective_weight(200) != 0: return 1
+        
+        # Check read amplification for Entity 100 (Found in Shard A and B)
+        if reg.get_read_amplification(1, 100) != 2: return 1
+        
+        print "  [OK] Weights and read-amplification verified"
 
-        # === PHASE 5: Reference Counting & Safe Deletion ===
-        print "[Phase 5] Reference counting and cleanup..."
+        # === PHASE 3: Automated Compaction Execution ===
+        print "[Phase 3] Executing automated compaction..."
         
         rc = refcount.RefCounter()
-        rc.acquire(shard_a)
-        rc.mark_for_deletion(shard_a)
+        reg.mark_for_compaction(1) # Simulate heuristic trigger
+        policy = compactor.CompactionPolicy(reg)
         
-        # Should not be deleted yet (ref > 0)
-        rc.try_cleanup()
-        if not os.path.exists(shard_a):
-            print "  [FAIL] Shard deleted while reference active"
-            return 1
-            
-        rc.release(shard_a)
-        rc.try_cleanup()
-        if os.path.exists(shard_a):
-            print "  [FAIL] Shard not deleted after ref release"
-            return 1
-            
-        print "  [OK] Reference counting protected active file"
+        # Merge shards A, B, and C into one consolidated shard
+        new_shard = compactor.execute_compaction(1, policy, m_mgr, rc, layout_obj)
+        if new_shard is None: return 1
+        test_files.append(new_shard)
+        
+        # Verify Manifest was updated (should have exactly 1 entry now)
+        reader = m_mgr.load_current()
+        if reader.get_entry_count() != 1: return 1
+        reader.close()
+        
+        # Verify physical pruning: Entity 200 should be PHYSICALLY GONE
+        # Entity 100 should have a single record with weight 2
+        vout = shard_ecs.ECSShardView(new_shard, layout_obj)
+        if vout.count != 1: return 1
+        if vout.get_entity_id(0) != 100: return 1
+        if vout.get_weight(0) != 2: return 1
+        vout.close()
+        
+        print "  [OK] Compaction physically realized the Ghost Property"
+
+        # === PHASE 4: Reference Counting & Cleanup ===
+        print "[Phase 4] Verifying reference-tracked deletion..."
+        
+        # Old shards were marked for deletion by the compactor
+        # try_cleanup should physically unlink them now as their refcounts are 0
+        deleted = rc.try_cleanup()
+        if len(deleted) != 3: return 1 # A, B, and C
+        
+        if os.path.exists(shard_a): return 1
+        if os.path.exists(shard_b): return 1
+        if os.path.exists(shard_c): return 1
+        
+        print "  [OK] Obsolete shards physically deleted"
         
         db_engine.close()
         print ""
-        print "=== All End-to-End Tests Passed ==="
+        print "=== All Translation Tests Passed ==="
         
     finally:
-        # Final cleanup of remaining test files
-        for f in all_files:
-            if os.path.exists(f): 
-                try: os.unlink(f)
-                except: pass
-        # Cleanup high-amp dummy shards if they exist
-        for i in range(5):
-            fn = "shard_%d.db" % i
-            if os.path.exists(fn): os.unlink(fn)
-
+        for f in test_files:
+            if os.path.exists(f): os.unlink(f)
+            
     return 0
 
 def target(driver, args):

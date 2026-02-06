@@ -1,37 +1,27 @@
 """
 gnitz/storage/compactor.py
 """
+import os
 from gnitz.storage import shard_ecs, writer_ecs, tournament_tree, compaction_logic
 
 def compact_shards(input_files, input_lsns, output_file, layout):
     """
+    (Existing logic from Step 1.9)
     Performs a vertical merge of multiple shards into a single consolidated shard.
-    
-    Args:
-        input_files: List of paths to input shard files.
-        input_lsns: List of LSNs corresponding to the input files.
-        output_file: Path to the resulting compacted shard.
-        layout: ComponentLayout for these shards.
     """
     views = []
     cursors = []
-    
     try:
-        # 1. Initialize cursors for all input shards
         for filename in input_files:
             view = shard_ecs.ECSShardView(filename, layout)
             views.append(view)
             cursors.append(tournament_tree.StreamCursor(view))
         
-        # 2. Build the Tournament Tree for N-way merge
         tree = tournament_tree.TournamentTree(cursors)
         writer = writer_ecs.ECSShardWriter(layout)
         
-        # 3. Process entities in sorted order
         while not tree.is_exhausted():
             min_eid = tree.get_min_entity_id()
-            
-            # Find which cursors/shards contribute to this Entity ID
             indices = tree.get_all_cursors_at_min()
             
             active_cursors = []
@@ -40,22 +30,104 @@ def compact_shards(input_files, input_lsns, output_file, layout):
                 active_cursors.append(cursors[idx])
                 active_lsns.append(input_lsns[idx])
             
-            # 4. Algebraic merge (Weight Summation + LSN Resolution)
             res = compaction_logic.merge_entity_contributions(active_cursors, active_lsns)
             weight, payload_ptr, blob_ptr = res
             
-            # 5. Annihilation Check (Ghost Property)
             if weight != 0:
-                # Write to the new shard (packed to avoid re-serialization)
                 writer.add_packed_row(min_eid, weight, payload_ptr, blob_ptr)
             
-            # 6. Advance all processed cursors
             tree.advance_min_cursors()
-            
-        # 7. Finalize the new shard
         writer.finalize(output_file)
-        
     finally:
-        # Ensure all mapped views are closed
         for view in views:
             view.close()
+
+class CompactionPolicy(object):
+    """
+    Logic for deciding when and what to compact.
+    """
+    def __init__(self, registry):
+        self.registry = registry
+
+    def should_compact(self, component_id):
+        """Checks if a component has exceeded read amplification thresholds."""
+        return self.registry.needs_compaction(component_id)
+
+    def select_shards_to_compact(self, component_id):
+        """
+        Selects the set of shards to merge.
+        For now, we use a simple 'Full L0' strategy: merge all shards 
+        for the component into one 'Guard' shard.
+        """
+        return self.registry.get_shards_for_component(component_id)
+
+def execute_compaction(component_id, policy, manifest_manager, ref_counter, layout, output_dir="."):
+    """
+    Orchestrates the full compaction lifecycle.
+    """
+    # 1. Identify shards to compact
+    shard_metas = policy.select_shards_to_compact(component_id)
+    if len(shard_metas) < 2:
+        return None # Nothing to merge
+
+    input_files = []
+    input_lsns = []
+    min_lsn = -1
+    max_lsn = -1
+    min_eid = -1
+    max_eid = -1
+
+    for meta in shard_metas:
+        input_files.append(meta.filename)
+        input_lsns.append(meta.max_lsn) # Use max_lsn for resolution
+        
+        # Track ranges for the new shard metadata
+        if min_lsn == -1 or meta.min_lsn < min_lsn: min_lsn = meta.min_lsn
+        if meta.max_lsn > max_lsn: max_lsn = meta.max_lsn
+        if min_eid == -1 or meta.min_entity_id < min_eid: min_eid = meta.min_entity_id
+        if meta.max_entity_id > max_eid: max_eid = meta.max_entity_id
+
+    # 2. Generate new shard filename
+    # In a real system, we'd use a UUID or LSN-based name
+    new_filename = os.path.join(output_dir, "comp_c%d_lsn%d.db" % (component_id, max_lsn))
+
+    # 3. Run the physical merge
+    compact_shards(input_files, input_lsns, new_filename, layout)
+
+    # 4. Prepare new Manifest entries
+    # We load the current manifest and swap out the old files for the new one
+    current_reader = manifest_manager.load_current()
+    new_entries = []
+    
+    # Keep entries for other components, skip the ones we just compacted
+    for entry in current_reader.iterate_entries():
+        is_compacted = False
+        for old_file in input_files:
+            if entry.shard_filename == old_file:
+                is_compacted = True
+                break
+        
+        if not is_compacted:
+            new_entries.append(entry)
+    current_reader.close()
+
+    # Add the newly created shard to the manifest
+    # We re-verify the eid range from the file if needed, but here we trust the aggregate
+    from gnitz.storage.manifest import ManifestEntry
+    new_entries.append(ManifestEntry(component_id, new_filename, min_eid, max_eid, min_lsn, max_lsn))
+
+    # 5. Atomic Manifest Update
+    manifest_manager.publish_new_version(new_entries)
+
+    # 6. Lifecycle Management
+    # Update Registry
+    for meta in shard_metas:
+        policy.registry.unregister_shard(meta.filename)
+        ref_counter.mark_for_deletion(meta.filename)
+    
+    from gnitz.storage.shard_registry import ShardMetadata
+    new_meta = ShardMetadata(new_filename, component_id, min_eid, max_eid, min_lsn, max_lsn)
+    policy.registry.register_shard(new_meta)
+    policy.registry.clear_compaction_flag(component_id)
+
+    return new_filename
