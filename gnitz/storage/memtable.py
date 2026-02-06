@@ -84,7 +84,7 @@ class MemTable(object):
                     heap_off = rffi.cast(lltype.Signed, blob_ptr) - rffi.cast(lltype.Signed, self.blob_arena.base_ptr)
                     for j in range(l_val): blob_ptr[j] = s_val[j]
                 string_logic.pack_string(dest, s_val, heap_off)
-            elif isinstance(val, int) or isinstance(val, long):
+            elif isinstance(val, int):
                 rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val)
             elif isinstance(val, float):
                 rffi.cast(rffi.DOUBLEP, dest)[0] = rffi.cast(rffi.DOUBLE, val)

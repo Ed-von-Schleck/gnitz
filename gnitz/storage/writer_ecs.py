@@ -40,7 +40,7 @@ class ECSShardWriter(object):
                         for char in s_val: self.blob_heap.append(char)
                         self.current_blob_offset += l_val
                     string_logic.pack_string(dest, s_val, heap_off)
-                elif isinstance(val, int) or isinstance(val, long):
+                elif isinstance(val, int):
                     rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val)
                 elif isinstance(val, float):
                     rffi.cast(rffi.DOUBLEP, dest)[0] = rffi.cast(rffi.DOUBLE, val)

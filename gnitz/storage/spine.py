@@ -1,6 +1,6 @@
 from rpython.rlib import jit
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.storage import shard_ecs
+from gnitz.storage import shard_ecs, manifest
 
 class ShardHandle(object):
     _immutable_fields_ = ['view', 'min_eid', 'max_eid', 'count']
@@ -38,6 +38,35 @@ class Spine(object):
         self.shard_count = len(handles)
         self.min_eids = [h.min_eid for h in handles]
         self.max_eids = [h.max_eid for h in handles]
+
+    @staticmethod
+    def from_manifest(manifest_filename, component_id, layout):
+        """
+        Constructs a Spine by loading shard references from a manifest file.
+        Only loads shards that match the given component_id.
+        
+        Args:
+            manifest_filename: Path to the manifest file
+            component_id: Component type ID to filter by
+            layout: ComponentLayout for the shards
+        
+        Returns:
+            Spine object with handles to all matching shards
+        """
+        reader = manifest.ManifestReader(manifest_filename)
+        try:
+            handles = []
+            
+            # Iterate through all entries and filter by component_id
+            for entry in reader.iterate_entries():
+                if entry.component_id == component_id:
+                    # Create a ShardHandle for this shard file
+                    handle = ShardHandle(entry.shard_filename, layout)
+                    handles.append(handle)
+            
+            return Spine(handles)
+        finally:
+            reader.close()
 
     @jit.elidable
     def lookup_candidate_index(self, entity_id):
