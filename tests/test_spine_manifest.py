@@ -190,7 +190,7 @@ class TestSpineManifest(unittest.TestCase):
         sp2.close_all()
     
     def test_overlapping_shards(self):
-        """Test loading Spine with overlapping entity ranges."""
+        """Test loading Spine with overlapping entity ranges (basic lookup)."""
         # Create shards with overlapping ranges
         shard1 = "shard_overlap_1.db"
         self._create_shard(shard1, [
@@ -225,6 +225,37 @@ class TestSpineManifest(unittest.TestCase):
         shard, idx = sp.find_shard_and_index(25)
         self.assertIsNotNone(shard)
         self.assertEqual(shard.read_field_i64(idx, 0), 250)
+        
+        sp.close_all()
+
+    def test_find_all_shards_and_indices(self):
+        """Test finding all shards containing an entity (for algebraic summation)."""
+        shard1 = "shard_overlap_1.db"
+        self._create_shard(shard1, [(10, 100, "val1")])
+        
+        shard2 = "shard_overlap_2.db"
+        self._create_shard(shard2, [(10, 200, "val2")])
+        
+        writer = manifest.ManifestWriter(self.manifest_file)
+        writer.add_entry(1, shard1, 10, 10, 0, 1)
+        writer.add_entry(1, shard2, 10, 10, 1, 2)
+        writer.finalize()
+        
+        sp = spine.Spine.from_manifest(self.manifest_file, component_id=1, layout=self.layout)
+        
+        results = sp.find_all_shards_and_indices(10)
+        self.assertEqual(len(results), 2)
+        
+        # Check that we got handles to both
+        handle1, idx1 = results[0]
+        handle2, idx2 = results[1]
+        
+        val1 = handle1.read_field_i64(idx1, 0)
+        val2 = handle2.read_field_i64(idx2, 0)
+        
+        # Order depends on manifest iteration order usually
+        values = sorted([val1, val2])
+        self.assertEqual(values, [100, 200])
         
         sp.close_all()
     
