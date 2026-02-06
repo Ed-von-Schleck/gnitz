@@ -1,3 +1,6 @@
+"""
+gnitz/storage/shard_ecs.py
+"""
 import os
 from rpython.rlib import jit, rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
@@ -7,7 +10,7 @@ from gnitz.core import strings as string_logic
 class ECSShardView(object):
     _immutable_fields_ = [
         'count', 'layout', 'ptr', 'size',
-        'buf_e', 'buf_c', 'buf_b'
+        'buf_e', 'buf_c', 'buf_b', 'buf_w'
     ]
 
     def __init__(self, filename, component_layout):
@@ -32,13 +35,18 @@ class ECSShardView(object):
         off_e = rffi.cast(lltype.Signed, header.read_i64(layout.OFF_REG_E_ECS))
         off_c = rffi.cast(lltype.Signed, header.read_i64(layout.OFF_REG_C_ECS))
         off_b = rffi.cast(lltype.Signed, header.read_i64(layout.OFF_REG_B_ECS))
+        off_w = rffi.cast(lltype.Signed, header.read_i64(layout.OFF_REG_W_ECS)) # NEW
 
-        self.buf_e = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_e), off_c - off_e)
+        self.buf_e = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_e), off_w - off_e)
+        self.buf_w = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_w), off_c - off_w) # NEW
         self.buf_c = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_c), off_b - off_c)
         self.buf_b = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_b), self.size - off_b)
 
     def get_entity_id(self, index):
         return self.buf_e.read_i64(index * 8)
+
+    def get_weight(self, index): # NEW
+        return self.buf_w.read_i64(index * 8)
 
     @jit.look_inside_iff(lambda self, index: jit.isconstant(self.layout))
     def get_data_ptr(self, index):
@@ -70,7 +78,6 @@ class ECSShardView(object):
         field_off = self.layout.get_field_offset(field_idx)
         struct_ptr = rffi.ptradd(ptr, field_off)
         heap_base_ptr = self.buf_b.ptr
-        
         return string_logic.string_equals(struct_ptr, heap_base_ptr, search_str)
 
     def close(self):

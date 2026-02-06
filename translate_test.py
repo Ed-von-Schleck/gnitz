@@ -1,8 +1,11 @@
+"""
+translate_test.py
+"""
 import sys
 import os
 from rpython.rlib import rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.storage import memtable, spine, engine, writer_ecs, layout, shard_ecs, manifest, shard_registry, refcount, tournament_tree
+from gnitz.storage import memtable, spine, engine, writer_ecs, layout, shard_ecs, manifest, shard_registry, refcount, tournament_tree, compaction_logic
 from gnitz.core import types, strings
 
 def entry_point(argv):
@@ -21,7 +24,12 @@ def entry_point(argv):
         "test_refcount2.db",
         "test_tt1.db",
         "test_tt2.db",
-        "test_tt3.db"
+        "test_tt3.db",
+        "test_weight.db",
+        "test_alg_A.db",
+        "test_alg_B.db",
+        "test_alg_C.db",
+        "test_alg_D.db"
     ]
     
     # Cleanup
@@ -56,6 +64,23 @@ def entry_point(argv):
         if db.get_effective_weight(1) != 0: return 1
         
         sp.close_all()
+        
+        # Test Weight Persistence (Explicit Weights)
+        writer_w = writer_ecs.ECSShardWriter(layout_obj)
+        writer_w._add_entity_weighted(99, 5, 500, "weight_test")
+        writer_w.finalize("test_weight.db")
+        
+        handle_w = spine.ShardHandle("test_weight.db", layout_obj)
+        sp_w = spine.Spine([handle_w])
+        db_w = engine.Engine(mgr, sp_w)
+        
+        # Should read weight 5 from disk
+        if db_w.get_effective_weight(99) != 5: 
+            print "Weight persistence failed"
+            return 1
+            
+        sp_w.close_all()
+        
         print "  [OK] Core engine working"
         
         # === PHASE 1.1-1.4: Manifest System ===
@@ -286,6 +311,67 @@ def entry_point(argv):
         if os.path.exists("test_overlap2.db"): os.unlink("test_overlap2.db")
         
         print "  [OK] Tournament tree working"
+
+        # === PHASE 1.8: Algebraic Logic ===
+        print "[Phase 1.8] Testing Algebraic Compaction Logic..."
+        
+        # Case 1: Annihilation (Weight +1 and -1)
+        wA = writer_ecs.ECSShardWriter(layout_obj)
+        wA._add_entity_weighted(100, 1, 10, "A")
+        wA.finalize("test_alg_A.db")
+        
+        wB = writer_ecs.ECSShardWriter(layout_obj)
+        wB._add_entity_weighted(100, -1, 10, "B")
+        wB.finalize("test_alg_B.db")
+        
+        vA = shard_ecs.ECSShardView("test_alg_A.db", layout_obj)
+        vB = shard_ecs.ECSShardView("test_alg_B.db", layout_obj)
+        
+        cA = tournament_tree.StreamCursor(vA)
+        cB = tournament_tree.StreamCursor(vB)
+        
+        # +1 and -1 should result in annihilation (weight = 0)
+        res = compaction_logic.merge_entity_contributions([cA, cB], [0, 1])
+        w_res, _, _ = res
+        if w_res != 0: 
+            print "Annihilation failed: net weight is not 0"
+            vA.close(); vB.close()
+            return 1
+            
+        vA.close()
+        vB.close()
+        
+        # Case 2: Accumulation & LSN Resolution
+        # Shard C: E2, W=1, LSN=1
+        wC = writer_ecs.ECSShardWriter(layout_obj)
+        wC._add_entity_weighted(200, 1, 20, "Old")
+        wC.finalize("test_alg_C.db")
+        
+        # Shard D: E2, W=1, LSN=2 (Update)
+        wD = writer_ecs.ECSShardWriter(layout_obj)
+        wD._add_entity_weighted(200, 1, 30, "New")
+        wD.finalize("test_alg_D.db")
+        
+        vC = shard_ecs.ECSShardView("test_alg_C.db", layout_obj)
+        vD = shard_ecs.ECSShardView("test_alg_D.db", layout_obj)
+        
+        cC = tournament_tree.StreamCursor(vC)
+        cD = tournament_tree.StreamCursor(vD)
+        
+        # Test Accumulation + LSN Resolution
+        # Weights should sum to 2. Payload should come from LSN 2.
+        res = compaction_logic.merge_entity_contributions([cC, cD], [1, 2])
+        weight, payload_ptr, _ = res
+        
+        if weight != 2: 
+            print "Weight accumulation failed"
+            vC.close(); vD.close()
+            return 1
+        
+        vC.close()
+        vD.close()
+        
+        print "  [OK] Algebraic logic working"
         
         print ""
         print "=== All Translation Tests Passed ==="
@@ -293,6 +379,12 @@ def entry_point(argv):
     finally:
         for f in test_files:
             if os.path.exists(f): os.unlink(f)
+        
+        # Cleanup extra files created during loop
+        for i in range(5):
+            fn = "shard_%d.db" % i
+            if os.path.exists(fn): os.unlink(fn)
+        if os.path.exists("comp2.db"): os.unlink("comp2.db")
     
     return 0
 

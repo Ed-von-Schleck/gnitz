@@ -140,7 +140,8 @@ class MemTable(object):
             if w != 0:
                 eid = node_get_entity_id(base, curr_off)
                 payload_ptr = node_get_payload_ptr(base, curr_off)
-                sw.add_packed_row(eid, payload_ptr, blob_base)
+                # Pass weight to writer (NEW)
+                sw.add_packed_row(eid, w, payload_ptr, blob_base)
             curr_off = node_get_next_off(base, curr_off, 0)
         sw.finalize(filename)
 

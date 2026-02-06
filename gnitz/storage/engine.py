@@ -27,9 +27,9 @@ class Engine(object):
             mem_weight = node_get_weight(base, next_off)
 
         spine_weight = 0
-        shard, _ = self.spine.find_shard_and_index(entity_id)
+        shard, row_idx = self.spine.find_shard_and_index(entity_id)
         if shard is not None:
-            spine_weight = 1
+            spine_weight = shard.get_weight(row_idx) # NEW: Use explicit weight
 
         return mem_weight + spine_weight
 

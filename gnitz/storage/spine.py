@@ -17,6 +17,9 @@ class ShardHandle(object):
 
     def get_entity_id(self, idx):
         return self.view.get_entity_id(idx)
+        
+    def get_weight(self, idx): # NEW
+        return self.view.get_weight(idx)
     
     def find_entity_index(self, entity_id):
         return self.view.find_entity_index(entity_id)
