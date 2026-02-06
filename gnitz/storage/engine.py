@@ -1,6 +1,3 @@
-"""
-gnitz/storage/engine.py
-"""
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage.memtable import (
     node_get_weight, node_get_entity_id, node_get_next_off, 
@@ -8,6 +5,10 @@ from gnitz.storage.memtable import (
 )
 
 class Engine(object):
+    # This hint tells the JIT that these fields are constant after initialization,
+    # which is crucial for optimizing calls that depend on them (e.g., using layout.stride).
+    _immutable_fields_ = ['mem_manager', 'spine', 'layout', 'manifest_manager', 'registry', 'component_id', 'current_lsn']
+
     def __init__(self, mem_manager, spine, manifest_manager=None, registry=None, component_id=1, current_lsn=1):
         self.mem_manager = mem_manager
         self.spine = spine
@@ -15,7 +16,7 @@ class Engine(object):
         self.manifest_manager = manifest_manager
         self.registry = registry
         self.component_id = component_id
-        self.current_lsn = current_lsn # This acts as the LSN for the current MemTable
+        self.current_lsn = current_lsn
 
     def get_effective_weight(self, entity_id):
         base = self.mem_manager.active_table.arena.base_ptr
@@ -36,10 +37,10 @@ class Engine(object):
 
     def read_component_i64(self, entity_id, field_idx):
         """
-        Reads component field with Last-Write-Wins (LWW) resolution across
-        the MemTable and all overlapping shards in the Spine.
+        Reads a component field with Last-Write-Wins (LWW) resolution.
+        This function is designed to be traced by the RPython JIT.
         """
-        # 1. Check MemTable (The current MemTable always has the highest LSN)
+        # 1. Check MemTable (always has highest LSN)
         base = self.mem_manager.active_table.arena.base_ptr
         head = self.mem_manager.active_table.head_off
         
@@ -55,14 +56,22 @@ class Engine(object):
         results = self.spine.find_all_shards_and_indices(entity_id)
         
         max_lsn = -1
-        latest_val = 0
+        latest_val = rffi.cast(rffi.LONGLONG, 0) # Initialize as a raw integer
         
-        for shard, row_idx in results:
-            if shard.lsn > max_lsn:
-                max_lsn = shard.lsn
-                latest_val = shard.read_field_i64(row_idx, field_idx)
+        # Use a simple C-style loop. The JIT is excellent at optimizing this pattern,
+        # especially since the number of overlapping shards (`len(results)`) is
+        # usually a small, constant number for any given trace.
+        for i in range(len(results)):
+            shard_handle, row_idx = results[i]
+            
+            # The JIT will trace into shard_handle.read_field_i64 and see the
+            # underlying pointer arithmetic (index * stride), enabling the
+            # "Stride Specialization" from the design spec.
+            if shard_handle.lsn > max_lsn:
+                max_lsn = shard_handle.lsn
+                latest_val = shard_handle.read_field_i64(row_idx, field_idx)
         
-        return latest_val
+        return rffi.cast(lltype.Signed, latest_val)
 
     def flush_and_rotate(self, filename):
         min_eid, max_eid = self.mem_manager.flush_and_rotate(filename)

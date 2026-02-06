@@ -1,6 +1,3 @@
-"""
-gnitz/storage/shard_ecs.py
-"""
 import os
 from rpython.rlib import jit, rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
@@ -43,40 +40,27 @@ class ECSShardView(object):
         self.buf_c = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_c), off_b - off_c)
         self.buf_b = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_b), self.size - off_b)
         
-        # Validate checksums if requested
         if validate_checksums:
             self.validate_region_e()
             self.validate_region_w()
     
     def validate_region_e(self):
-        """Validate Region E checksum."""
-        # Read stored checksum as ULONGLONG (unsigned) and convert to r_uint64
         expected = r_uint64(rffi.cast(
             rffi.ULONGLONGP, 
             rffi.ptradd(self.ptr, layout.OFF_CHECKSUM_E)
         )[0])
-        
-        # Calculate actual checksum
         region_e_size = self.count * 8
         actual = checksum.compute_checksum(self.buf_e.ptr, region_e_size)
-        
-        # Compare (both are r_uint64 now)
         if actual != expected:
             raise errors.CorruptShardError("Region E checksum mismatch")
     
     def validate_region_w(self):
-        """Validate Region W checksum."""
-        # Read stored checksum as ULONGLONG (unsigned) and convert to r_uint64
         expected = r_uint64(rffi.cast(
             rffi.ULONGLONGP,
             rffi.ptradd(self.ptr, layout.OFF_CHECKSUM_W)
         )[0])
-        
-        # Calculate actual checksum
         region_w_size = self.count * 8
         actual = checksum.compute_checksum(self.buf_w.ptr, region_w_size)
-        
-        # Compare (both are r_uint64 now)
         if actual != expected:
             raise errors.CorruptShardError("Region W checksum mismatch")
 
@@ -86,12 +70,10 @@ class ECSShardView(object):
     def get_weight(self, index):
         return self.buf_w.read_i64(index * 8)
 
-    @jit.look_inside_iff(lambda self, index: jit.isconstant(self.layout))
     def get_data_ptr(self, index):
         offset = index * self.layout.stride
         return self.buf_c.get_raw_ptr(offset)
-    
-    @jit.elidable
+
     def find_entity_index(self, entity_id):
         low = 0
         high = self.count - 1
@@ -117,7 +99,6 @@ class ECSShardView(object):
         struct_ptr = rffi.ptradd(ptr, field_off)
         heap_base_ptr = self.buf_b.ptr
         
-        # Precompute metadata for the optimized check
         search_len = len(search_str)
         search_prefix = string_logic.compute_prefix(search_str)
         

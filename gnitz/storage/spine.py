@@ -1,13 +1,6 @@
-"""
-gnitz/storage/spine.py
-"""
 from rpython.rlib import jit
 
 class ShardHandle(object):
-    """
-    Lightweight wrapper for a memory-mapped ECS shard.
-    Includes LSN for Last-Write-Wins resolution.
-    """
     _immutable_fields_ = ['view', 'min_eid', 'max_eid', 'lsn', 'filename']
 
     def __init__(self, filename, layout, lsn):
@@ -56,14 +49,12 @@ class Spine(object):
             handles = []
             for entry in reader.iterate_entries():
                 if entry.component_id == component_id:
-                    # Capture max_lsn from manifest entry
                     handle = ShardHandle(entry.shard_filename, layout, entry.max_lsn)
                     handles.append(handle)
             return Spine(handles, ref_counter)
         finally:
             reader.close()
 
-    @jit.elidable
     def _find_upper_bound(self, entity_id):
         low = 0
         high = self.count - 1

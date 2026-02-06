@@ -47,9 +47,6 @@ def skip_list_find(base_ptr, head_off, entity_id, update_offsets=None):
     """
     Standardizes SkipList traversal. Returns the offset of the node 
     immediately preceding the target entity_id at level 0.
-    
-    If update_offsets is provided, it populates the array with the 
-    predecessor at every level (required for insertion).
     """
     curr_off = head_off
     for i in range(MAX_HEIGHT - 1, -1, -1):
@@ -70,11 +67,13 @@ class MemTable(object):
     _immutable_fields_ = ['arena', 'blob_arena', 'layout', 'head_off', 'threshold_bytes']
 
     def __init__(self, layout, arena_size):
+        from gnitz.storage import errors
         self.layout = layout
         self.arena = arena.Arena(arena_size)
         self.blob_arena = arena.Arena(arena_size)
         self.arena_size = arena_size
-        self.threshold_bytes = (arena_size * 90) / 100
+        # Configurable capacity threshold (90%)
+        self.threshold_bytes = (arena_size * 90) / 100 
         self.rng = Random(1234)
         self._update_offsets = [0] * MAX_HEIGHT
         
@@ -132,10 +131,11 @@ class MemTable(object):
 
         # 2. Insert new node
         h = 1
-        while h < MAX_HEIGHT and (self.rng.genrand32() & 1): h += 1
+        while h < MAX_HEIGHT and (self.rng.genrand32() & 1):
+            h += 1
         
         node_sz = self.node_base_size + (h * 4)
-        new_ptr = self.arena.alloc(node_sz)
+        new_ptr = self.arena.alloc(node_sz) # Allocation can fail and raise StorageError
         new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
         
         node_set_weight(base, new_off, weight)
@@ -184,6 +184,14 @@ class MemTableManager(object):
         self.active_table = MemTable(self.layout, self.capacity)
 
     def put(self, entity_id, weight, *field_values):
+        from gnitz.storage import errors
+        
+        # SAFETY VALVE: Check against the threshold first. 
+        # The `upsert` call itself might raise StorageError if the allocation is too big,
+        # but this check prevents the systematic exhaustion due to transaction size.
+        if self.active_table.arena.offset > self.active_table.threshold_bytes:
+            raise errors.MemTableFullError() 
+            
         self.active_table.upsert(entity_id, weight, field_values)
 
     def flush_and_rotate(self, filename):

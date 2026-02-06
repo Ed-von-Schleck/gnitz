@@ -17,3 +17,7 @@ class BoundsError(StorageError):
 class LayoutError(StorageError):
     """Raised when data violates physical alignment rules."""
     pass
+    
+class MemTableFullError(StorageError):
+    """Raised when the MemTable's Arena capacity is exceeded."""
+    pass

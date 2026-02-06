@@ -34,7 +34,6 @@ def _memcmp(p1, p2, length):
             return False
     return True
 
-@jit.elidable
 def string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_prefix):
     u32_struct_ptr = rffi.cast(rffi.UINTP, struct_ptr)
     
