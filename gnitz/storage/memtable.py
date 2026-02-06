@@ -1,12 +1,17 @@
+"""
+gnitz/storage/memtable.py
+"""
 from rpython.rlib.rrandom import Random
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.jit import unrolling_iterable
+from rpython.rlib.jit import unrolling_iterable, unroll_safe
 from gnitz.storage import arena, writer_ecs, errors
 from gnitz.core import types, strings as string_logic
 
 MAX_HEIGHT = 16
 MAX_FIELDS = 64
 FIELD_INDICES = unrolling_iterable(range(MAX_FIELDS))
+
+# --- Low-level Node Accessors ---
 
 def node_get_next_off(base_ptr, node_off, level):
     ptr = rffi.ptradd(base_ptr, node_off + 12)
@@ -35,6 +40,32 @@ def node_get_payload_ptr(base_ptr, node_off):
     height = ord(base_ptr[node_off + 8])
     return rffi.ptradd(base_ptr, node_off + 12 + (height * 4) + 8)
 
+# --- Unified SkipList Navigation ---
+
+@unroll_safe
+def skip_list_find(base_ptr, head_off, entity_id, update_offsets=None):
+    """
+    Standardizes SkipList traversal. Returns the offset of the node 
+    immediately preceding the target entity_id at level 0.
+    
+    If update_offsets is provided, it populates the array with the 
+    predecessor at every level (required for insertion).
+    """
+    curr_off = head_off
+    for i in range(MAX_HEIGHT - 1, -1, -1):
+        next_off = node_get_next_off(base_ptr, curr_off, i)
+        while next_off != 0:
+            if node_get_entity_id(base_ptr, next_off) < entity_id:
+                curr_off = next_off
+                next_off = node_get_next_off(base_ptr, curr_off, i)
+            else:
+                break
+        if update_offsets is not None:
+            update_offsets[i] = curr_off
+    return curr_off
+
+# --- MemTable Implementation ---
+
 class MemTable(object):
     _immutable_fields_ = ['arena', 'blob_arena', 'layout', 'head_off', 'threshold_bytes']
 
@@ -48,7 +79,6 @@ class MemTable(object):
         self._update_offsets = [0] * MAX_HEIGHT
         
         self.arena.alloc(8) 
-        
         self.node_base_size = 12 + 8 + self.layout.stride
         
         h_sz = self.node_base_size + (MAX_HEIGHT * 4)
@@ -65,9 +95,7 @@ class MemTable(object):
 
     def _pack_values(self, dest_ptr, values):
         for i in FIELD_INDICES:
-            if i >= len(values):
-                break
-            if i >= len(self.layout.field_types):
+            if i >= len(values) or i >= len(self.layout.field_types):
                 break
             
             val = values[i]
@@ -75,8 +103,8 @@ class MemTable(object):
             f_off = self.layout.field_offsets[i]
             dest = rffi.ptradd(dest_ptr, f_off)
             
-            if isinstance(val, str):
-                s_val = val
+            if f_type == types.TYPE_STRING:
+                s_val = str(val)
                 l_val = len(s_val)
                 heap_off = 0
                 if l_val > string_logic.SHORT_STRING_THRESHOLD:
@@ -91,24 +119,18 @@ class MemTable(object):
 
     def upsert(self, entity_id, weight, field_values):
         base = self.arena.base_ptr
-        curr_off = self.head_off
         
-        for i in range(MAX_HEIGHT - 1, -1, -1):
-            next_off = node_get_next_off(base, curr_off, i)
-            while next_off != 0:
-                if node_get_entity_id(base, next_off) < entity_id:
-                    curr_off = next_off
-                    next_off = node_get_next_off(base, curr_off, i)
-                else:
-                    break
-            self._update_offsets[i] = curr_off
-
-        next_off = node_get_next_off(base, curr_off, 0)
+        # Unified search
+        pred_off = skip_list_find(base, self.head_off, entity_id, self._update_offsets)
+        next_off = node_get_next_off(base, pred_off, 0)
+        
+        # 1. Update existing node
         if next_off != 0 and node_get_entity_id(base, next_off) == entity_id:
             node_set_weight(base, next_off, node_get_weight(base, next_off) + weight)
             self._pack_values(node_get_payload_ptr(base, next_off), field_values)
             return
 
+        # 2. Insert new node
         h = 1
         while h < MAX_HEIGHT and (self.rng.genrand32() & 1): h += 1
         
@@ -125,18 +147,11 @@ class MemTable(object):
         self._pack_values(rffi.ptradd(eid_ptr, 8), field_values)
 
         for i in range(h):
-            pred_off = self._update_offsets[i]
-            node_set_next_off(base, new_off, i, node_get_next_off(base, pred_off, i))
-            node_set_next_off(base, pred_off, i, new_off)
+            p_off = self._update_offsets[i]
+            node_set_next_off(base, new_off, i, node_get_next_off(base, p_off, i))
+            node_set_next_off(base, p_off, i, new_off)
 
     def flush(self, filename):
-        """
-        Flushes the MemTable to disk and returns shard metadata.
-        
-        Returns:
-            Tuple (min_eid, max_eid) - Entity ID range of the flushed shard.
-            Returns (-1, -1) if no entities were written.
-        """
         sw = writer_ecs.ECSShardWriter(self.layout)
         base = self.arena.base_ptr
         blob_base = self.blob_arena.base_ptr
@@ -152,15 +167,10 @@ class MemTable(object):
                 payload_ptr = node_get_payload_ptr(base, curr_off)
                 sw.add_packed_row(eid, w, payload_ptr, blob_base)
                 
-                # Track min/max entity IDs
-                if min_eid == -1 or eid < min_eid:
-                    min_eid = eid
-                if eid > max_eid:
-                    max_eid = eid
+                if min_eid == -1 or eid < min_eid: min_eid = eid
+                if eid > max_eid: max_eid = eid
             curr_off = node_get_next_off(base, curr_off, 0)
         sw.finalize(filename)
-        
-        # Return shard metadata
         return min_eid, max_eid
 
     def free(self):
@@ -177,12 +187,6 @@ class MemTableManager(object):
         self.active_table.upsert(entity_id, weight, field_values)
 
     def flush_and_rotate(self, filename):
-        """
-        Flushes the active table and rotates to a new one.
-        
-        Returns:
-            Tuple (min_eid, max_eid) from the flush operation.
-        """
         min_eid, max_eid = self.active_table.flush(filename)
         self.active_table.free()
         self.active_table = MemTable(self.layout, self.capacity)
