@@ -1,29 +1,29 @@
 ## 1. Introduction and Theoretical Foundation
 
-### 1.1. Theoretical Framework: DBSP
-GnitzDB is built on **Database Stream Processing (DBSP)**, a mathematical framework that treats both batch and streaming computations as operations over an **Abelian Group** $(G, +, 0)$. 
-*   **Data Representation:** Datasets are modeled as **Z-Sets** (Generalized Multisets) mapping records to integer weights $w \in \mathbb{Z}$. In this system, records are represented as **Entity-Component** pairs.
-*   **Incremental View Maintenance (IVM):** The engine executes lifted circuits $Q^\circ$. By utilizing the linearity of DBSP operators, the engine computes output deltas ($\Delta O$) directly from input component deltas ($\Delta I$):
+### 1.1. Theoretical Framework: DBSP and Universal Z-Sets
+GnitzDB is built on **Database Stream Processing (DBSP)**, a mathematical framework that treats all computations as operations over an **Abelian Group** $(G, +, 0)$. 
+*   **Unified Data Representation:** The system utilizes **Z-Sets** (Generalized Multisets) as the universal primitive for all data in transit and at rest. A Z-Set maps records—represented as Entity-Component pairs—to integer weights $w \in \mathbb{Z}$.
+*   **Algebraic Homomorphism:** Every state transition, persistent log entry, and distribution delta is expressed as a Z-Set. By utilizing the linearity of DBSP operators, the engine maintains global consistency through the identity:
     $$ Q(\sum \Delta I) = \sum Q(\Delta I) $$
-    Non-linear operations such as Joins on Entity IDs utilize the chain rule of DBSP calculus to maintain exact incremental state.
+*   **The Unified Log:** The Write-Ahead Log (WAL), Operator Traces, and Synchronization streams are mathematically equivalent. This algebraic uniformity allows the engine to treat ingestion, maintenance, and distribution as a single, continuous Z-Set transformation pipeline.
 
 ### 1.2. The Reactive ECS Data Model
-The system replaces traditional relational tables with an **Entity Component System (ECS)** architecture, optimizing for high-velocity state changes and reactive simulations.
-*   **Entities:** Represented as unique 64-bit unsigned integers (`u64`). Entities serve as the primary join key across all component streams.
-*   **Components:** User-defined data structures (bundles of primitives) associated with entities. Each component type is treated as a distinct Z-Set stream.
-*   **Systems:** Materialized views implemented as persistent DBSP circuits. Systems consume deltas from one or more component streams and produce new component deltas or side effects.
+The system replaces relational tables with an **Entity Component System (ECS)** architecture, optimizing for high-velocity state changes and reactive simulations.
+*   **Entities:** Unique 64-bit unsigned integers serving as the primary join key across all Z-Set streams.
+*   **Components:** User-defined structures associated with entities. Each component type is a distinct Z-Set stream $(\Delta E, \Delta C, \Delta W)$.
+*   **Systems:** Materialized views implemented as persistent DBSP circuits. Systems consume deltas from input Z-Sets and produce new output Z-Sets, which can be fed back into the ingestion layer or another GnitzDB instance.
 
-### 1.3. Objective: The Reactive Sync Engine
-The engine is designed for the incremental maintenance and distribution of complex, high-bandwidth state.
-*   **Vertical Decomposition:** Unlike row-oriented databases, GnitzDB decomposes entity state into independent component columns. This allows DBSP circuits to process only the specific attributes (components) that have changed.
-*   **Delta Distribution:** Clients subscribe to component views. The server pushes incremental Z-Set updates, enabling remote mirrors (e.g., in SQLite or game engines) to remain synchronized with the server's state via additive delta application.
-*   **Snapshot Synchronization:** The engine resolves point-in-time snapshots by aggregating persistent columnar shards, providing a consistent baseline for new subscribers before transitioning to live delta streaming.
+### 1.3. Objective: The Unified Z-Set Engine
+The engine is designed for the incremental maintenance and distribution of complex state via a single source of truth.
+*   **WAL-Centric Distribution:** The traditional "View Log" is deprecated. The **Z-Set WAL** serves as the unified stream for both local crash recovery and remote client synchronization. Clients subscribe to component views by tailing and filtering the WAL.
+*   **Idempotent Synchronization:** Remote mirrors maintain state by additively applying Z-Set deltas. The algebraic nature of the stream ensures that any prefix of the WAL can be replayed to reach a consistent state baseline.
+*   **Snapshot-to-Stream Continuity:** Point-in-time snapshots are resolved by algebraically summing persistent columnar shards, providing a $w_{net}$ baseline before transitioning to live WAL tailing.
 
-### 1.4. Performance Mandate: JIT and German Strings
-Implementation in **RPython** enables the use of a **Meta-Tracing Virtual Machine** to specialize execution at runtime.
-*   **Dynamic Layout Promotion:** The engine utilizes a **ComponentLayout** registry that calculates physical byte offsets for user-defined structs. The RPython JIT promotes these layouts to constants, specializing the assembly for specific component strides.
-*   **The Ghost Property:** The system decouples algebraic weights from component payloads. Records with a net weight of zero (annihilated) are bypassed during DRAM fetches, preventing irrelevant data from entering the CPU cache.
-*   **German String Optimization:** String data is stored as 16-byte inline structures containing the length, a 4-byte prefix, and either the remaining data (Short) or a 64-bit offset to a blob heap (Long). This allows for $O(1)$ equality failures and elides heap access for the majority of comparisons.
+### 1.4. Performance Mandate: JIT and the Ghost Property
+Implementation in **RPython** enables a **Meta-Tracing Virtual Machine** to specialize execution at runtime based on the Z-Set structure.
+*   **Dynamic Layout Promotion:** The `ComponentLayout` registry calculates physical strides and offsets. The RPython JIT promotes these to constants, specializing the assembly for specific component structures.
+*   **The Ghost Property:** Algebraic weights are decoupled from component payloads. Records with a net weight of zero (annihilated) are bypassed during DRAM fetches and I/O, ensuring that only records with $w_{net} \neq 0$ consume CPU cycles.
+*   **German String Optimization:** String data uses a 16-byte inline structure (Length, Prefix, Payload/Offset). This enables $O(1)$ equality failures and elides heap access for the majority of Z-Set comparisons, maximizing cache-line efficiency during vertical joins.
 
 ## 2. System Architecture Overview
 
@@ -54,341 +54,374 @@ The distribution layer synchronizes remote client state with the server's compon
 ## 3. Memory Subsystem and Physical Layout
 
 ### 3.1. Monotonic Arena Allocation
-Memory for ingestion and intermediate state is managed via **Monotonic Arenas** to bypass garbage collection overhead.
+Memory for ingestion and intermediate state is managed via **Monotonic Arenas** to bypass garbage collection overhead and ensure deterministic memory locality.
 *   **Bump-Pointer Mechanics:** Allocation is $O(1)$ via a pointer increment within pre-allocated contiguous blocks.
-*   **Alignment Enforcement:** The allocator enforces 8-byte alignment to support direct casting of raw pointers to primitive types (`int64`, `double`), preventing unaligned access faults during vectorized summation.
+*   **Alignment Enforcement:** The allocator enforces 8-byte alignment to support direct casting of raw pointers to primitive types (`int64`, `double`), preventing unaligned access faults during vectorized summation and JIT-optimized fetches.
 
 ### 3.2. Physical Shard Layout
-Each ECS Shard is a memory-mapped file organized into three contiguous regions, aligned to 64-byte boundaries for AVX-512 compatibility.
-*   **Region E (Entities):** A sorted, contiguous vector of 64-bit unsigned Entity IDs.
-*   **Region C (Components):** A contiguous vector of fixed-stride component data. The stride is determined by the **ComponentLayout** from the registry. This region contains inline primitives and 16-byte German String structs.
-*   **Region B (Blob Heap):** A variable-length heap storing data that exceeds the inline capacity of Region C (e.g., long strings).
+Each ECS Shard is a memory-mapped file organized into five contiguous regions (**Penta-Partition**), aligned to 64-byte boundaries for AVX-512 compatibility and cache-line isolation.
+*   **Region E (Entities):** A sorted vector of 64-bit unsigned Entity IDs.
+*   **Region W (Weights):** A vector of 64-bit signed integers representing algebraic Z-Set weights.
+*   **Region C (Components):** A vector of fixed-stride component data, containing inline primitives and 16-byte German String structs.
+*   **Region B (Blob Heap):** A variable-length heap storing overflow data for German Strings (length > 12 bytes).
 
 ### 3.3. JIT-Compiled Stride Access
-The engine leverages the RPython Meta-Tracing JIT to optimize variable-stride access patterns.
-*   **Constant Promotion:** The `ComponentLayout` for a shard is treated as an immutable constant during trace compilation.
-*   **Stride Specialization:** The JIT compiles the generic offset calculation `base + (index * stride)` into specific machine instructions with immediate constants (e.g., `LEA rax, [rbx + rdi*16]`), eliminating dynamic arithmetic overhead for column scans.
+The engine leverages the RPython Meta-Tracing JIT to optimize variable-stride access patterns within Region C.
+*   **Constant Promotion:** The `ComponentLayout` (stride and field offsets) for a shard is promoted to an immutable constant during trace compilation.
+*   **Stride Specialization:** The JIT specializes the offset arithmetic `base + (index * stride)` into machine instructions with immediate constants, eliminating dynamic arithmetic overhead during columnar scans.
 
 ### 3.4. German String Optimization
-String fields utilize a hybrid storage model to maximize cache efficiency and maintain the **Ghost Property**.
-*   **16-Byte Struct:** All strings in Region C occupy exactly 16 bytes:
-    *   `Bytes 0-3`: Length (`u32`).
-    *   `Bytes 4-7`: Prefix (`char[4]`).
-    *   `Bytes 8-15`: Payload (Union).
-*   **Short Strings (<= 12 bytes):** The payload contains the suffix bytes. The string is entirely inline, requiring no heap access.
-*   **Long Strings (> 12 bytes):** The payload contains a 64-bit offset into Region B.
-*   **Prefix-First Equality:** Comparisons check length and the 4-byte prefix before chasing the heap pointer. This ensures that the majority of string comparisons fail fast using only inline data, preventing pipeline stalls.
+String fields utilize a hybrid 16-byte inline structure to maximize cache efficiency and maintain the **Ghost Property**.
+*   **Structure:** `Bytes 0-3`: Length (`u32`); `Bytes 4-7`: Prefix (`char[4]`); `Bytes 8-15`: Payload (Union of 8-byte suffix or 64-bit heap offset).
+*   **Equality Logic:** $O(1)$ equality failure is achieved via length and prefix checks before triggering Region B heap access.
+*   **Ghost Property Integration:** Records with a net weight of zero are identified via Region W before German String comparison, preventing unnecessary heap pointer chasing for annihilated records.
 
 ### 3.5. Transmutation and Relocation
-The transition from MemTable to Shard involves pointer relocation for heap-allocated data.
-*   **Unzipping:** The row-oriented MemTable payload is iterated and split into separate writers for each component type.
-*   **Heap Compaction:** String data stored in the temporary MemTable Blob Arena is copied to the persistent Region B of the new shard.
-*   **Pointer Swizzling:** The offset in the German String struct is updated from the MemTable arena offset to the new relative offset within Region B, ensuring the persisted shard is self-contained.
+The transition from MemTable to Shard involves an "Unzipping" pipeline that transforms row-oriented buffers into columnar regions.
+*   **Weight Serialization:** Algebraic weights accumulated in the MemTable SkipList are serialized directly into Region W.
+*   **Pointer Swizzling:** During transmutation, offsets for "Long" German Strings are recalculated from MemTable arena-relative offsets to Shard-relative Region B offsets, ensuring shard immutability and self-containment.
 
 ## 4. Storage Architecture: Fragmented LSM (FLSM)
 
-### 4.1. The Manifest and Component Spine
-The storage state is anchored by the **Manifest**, a durable log recording the active set of **ECS Shards** and their metadata.
-*   **Component-Centric Organization:** Unlike table-based LSM trees, the FLSM is partitioned by Component ID. Each component type has its own independent Spine, tracking the shards relevant to that specific attribute.
-*   **Spine Metadata:** The Spine maintains in-memory vectors for `min_entity_id`, `max_entity_id`, and `shard_handles` for each component. This enables $O(\log N)$ binary search to identify candidate shards for a specific Entity ID without disk access.
-*   **Versioned Snapshots:** Updates to the Manifest produce immutable Spine versions, providing snapshot isolation for long-running synchronization tasks.
+### 4.1. The Binary Manifest
+The storage state is anchored by a versioned binary **Manifest** (`MANIFNGT`).
+*   **Atomic Updates:** Manifest updates utilize a temporary swap-file and atomic `rename()` mechanics to provide consistent, point-in-time snapshots of the active shard set.
+*   **Metadata Tracking:** For every shard, the manifest records the Component ID, Entity ID range (`min`, `max`), and Log Sequence Number range (`min_lsn`, `max_lsn`).
 
-### 4.2. Vertical Decomposition Strategy
-Data is physically stored in a **Decomposed Columnar** format, replacing the traditional row-based or hybrid formats.
-*   **Typed Shards:** Each physical file contains data for exactly one component type. This isolation ensures that a query accessing `Position` does not pollute the CPU cache with `Velocity` or `Inventory` data.
-*   **Entity Alignment:** All shards are strictly sorted by Entity ID. This allows the runtime engine to perform "Vertical Joins" (reconstructing entities from components) using highly efficient, vectorized Zip-Join algorithms rather than expensive Hash Joins.
+### 4.2. Vertical Decomposition and Sorted Alignment
+Data is physically partitioned by Component ID into independent columnar shards.
+*   **Entity Sorting:** All shards are strictly sorted by Entity ID to enable $O(\log N)$ binary search lookups and linear-time Vertical Joins.
+*   **Component Isolation:** Querying a specific attribute only triggers I/O for relevant component shards, maximizing memory bandwidth efficiency.
 
-### 4.3. Multi-Layer Resolution
-The engine resolves the current state of a component by querying the memory and storage layers in a strict hierarchy.
-*   **Layer 1: MemTable:** The active in-memory buffer is checked first. It utilizes a SkipList index to provide $O(\log N)$ lookups for recent updates.
-*   **Layer 2: The Spine:** If the entity is not found in memory, the engine queries the persistent Spine. Since persistent shards are immutable and sorted, lookups are performed via binary search on the `Region E` (Entity ID) vector.
-*   **Algebraic Summation:** For complete Z-Set semantics, the engine sums the weights across all layers. An entity exists if and only if its net weight is non-zero.
+### 4.3. Multi-Layer Resolution and Algebraic Summation
+The engine resolves the effective state of an entity by aggregating weights across the memory and storage hierarchy.
+*   **Weight Summation:** The net weight is the sum of weights from the active MemTable and all overlapping shards identified by the Spine.
+*   **LSN-Based Value Resolution:** When multiple shards provide conflicting component values for the same Entity ID, the engine resolves the conflict using **Last-Write-Wins (LWW)** logic, selecting the value from the shard with the highest `max_lsn`.
 
 ### 4.4. Compaction: The Vertical Merge
-Compaction manages the lifecycle of shards to reduce read amplification and reclaim space.
-*   **Merge Sort:** The compactor performs a multi-way merge sort on several overlapping shards of the same component type.
-*   **Algebraic Pruning:** Entities with a net weight of zero (annihilated) are dropped during the merge, preventing "Ghost" records from persisting into the new Guard Shard.
-*   **Re-Partitioning:** The resulting data is written into new, larger ECS Shards with optimized 64-byte alignment, updating the Manifest to point to the new generation of files.
+Compaction reduces read amplification by merging overlapping shards into a consolidated "Guard" shard.
+*   **Tournament Tree Merge:** An N-way merge sort processes input shards by Entity ID.
+*   **MergeAccumulator Logic:** For each Entity ID, a `MergeAccumulator` calculates the net algebraic weight and tracks the payload pointer associated with the highest LSN.
+*   **Algebraic Pruning:** If the net weight sums to zero, the record is discarded (Annihilation). This physically realizes the Ghost Property by reclaiming space from deleted or balanced state.
 
-### 4.5. LSN-Aware Transmutation
-The transition from mutable memory to immutable disk involves a layout transformation.
-*   **Row-to-Column Transmutation:** The **Staging MemTable** stores components as "Bundles" (rows). During flush, the Transmutation Pipeline "unzips" these bundles, separating each component into its own writer stream.
-*   **Heap Relocation:** Variable-length data (e.g., Long German Strings) stored in the MemTable's temporary arena is compacted and copied into the persistent `Region B` (Blob Heap) of the destination shard, with pointer offsets updated to reflect the new location.
+### 4.5. Read Amplification and Triggers
+The **ShardRegistry** monitors the structural health of the FLSM.
+*   **Metrics:** Read Amplification is defined as the number of overlapping shards covering a specific Entity ID.
+*   **Heuristic Trigger:** When Read Amplification exceeds a configured threshold (default: 4), the component is flagged for automated compaction to restore $O(\log N)$ lookup performance.
 
 ## 5. Physical Encoding and Serialization
 
 ### 5.1. ECS Shard Header Specification
-Each ECS Shard begins with a fixed 64-byte header containing metadata and region offsets. Integers are stored in **Little Endian** format.
+Each ECS Shard begins with a fixed 64-byte header. All multi-byte integers are encoded in **Little Endian** format.
 
 | Byte Offset | Field Name | Type | Description |
 | :--- | :--- | :--- | :--- |
 | 00 - 07 | Magic Number | `u64` | Constant: `0x31305F5A54494E47` |
 | 08 - 15 | Entry Count | `u64` | Total number of entities in this shard |
-| 16 - 31 | Reserved | `u8[16]` | Reserved for LSN/Version metadata |
+| 16 - 31 | Reserved | `u8[16]` | Reserved for versioning and alignment |
 | 32 - 39 | Offset E | `u64` | Byte offset to Region E (Entity IDs) |
 | 40 - 47 | Offset C | `u64` | Byte offset to Region C (Component Data) |
 | 48 - 55 | Offset B | `u64` | Byte offset to Region B (Blob Heap) |
+| 56 - 63 | Offset W | `u64` | Byte offset to Region W (Algebraic Weights) |
 
 ### 5.2. Region Alignment and Padding
-To maximize hardware efficiency, the physical layout enforces strict alignment rules.
-*   **64-Byte Region Boundaries:** The start of every region (E, C, B) is aligned to a 64-byte boundary via null-byte padding. This prevents false sharing and ensures AVX-512 operations start on cache line boundaries.
-*   **Field Alignment:** Within `Region C`, component fields are naturally aligned (e.g., `f64` on 8-byte boundaries) by the **ComponentLayout** logic, allowing for direct memory casting without undefined behavior.
+The physical layout enforces 64-byte alignment for all region boundaries to optimize AVX-512 utilization and prevent cache-line splits.
+*   **Region Transitions:** Padding bytes (`0x00`) are inserted between Regions E, W, C, and B. Each region start must satisfy `(offset % 64 == 0)`.
+*   **Checksum Placement:** A 64-bit checksum is appended to the end of the Header and each individual Region (E, W, C, B). Checksums are themselves aligned to 8-byte boundaries within the 64-byte padding block.
 
 ### 5.3. Region E: Entity ID Vector
-The Entity Region contains a dense, sorted sequence of 64-bit unsigned integers.
-*   **Dense Packing:** Entity IDs are stored contiguously without separators or length prefixes.
-*   **Vectorization:** This layout enables the JIT to emit SIMD instructions for operations like "Find all Entities > X" or intersection logic.
+Region E contains a dense, sorted sequence of 64-bit unsigned integers.
+*   **Vectorization:** Ascending order enables $O(\log N)$ binary search and vectorized SIMD intersection logic during joins.
+*   **Integrity:** Validated by a trailing **XXH3** checksum.
 
-### 5.4. Region C: Component Data Vector
-The Component Region stores fixed-stride data records.
-*   **Stride Calculation:** The stride is determined at runtime by the Schema Registry but promoted to a constant during execution.
-*   **Inline Primitives:** Numeric types (`u64`, `f64`, `i32`, etc.) are stored inline.
-*   **German Strings:** String fields occupy a fixed 16-byte slot consisting of:
-    *   `u32` Length
-    *   `u8[4]` Prefix
-    *   `u64` Payload (Inline Suffix or Heap Offset)
-    This structure ensures that the stride remains constant regardless of string content length.
+### 5.4. Region W: Weight Vector
+Region W contains a dense sequence of 64-bit signed integers representing algebraic Z-Set weights.
+*   **Mapping:** Weights are mapped 1-to-1 by index to Entity IDs in Region E.
+*   **Partial Validation:** The separation of W from C allows the engine to verify entity existence and net weight without reading component payloads.
 
-### 5.5. Region B: The Blob Heap
-The Blob Region acts as an unstructured overflow heap for variable-length data.
-*   **Offset-Based Access:** Data in Region B is addressed solely via relative offsets stored in `Region C` German String structs.
-*   **Compaction:** During the Transmutation and Compaction phases, the heap is rewritten sequentially, effectively garbage collecting any unused blobs referenced by annihilated records.
+### 5.5. Region C: Component Data Vector
+Region C stores fixed-stride component records defined by the **ComponentLayout**.
+*   **Inline Primitives:** Numeric types are stored at offsets calculated during schema registration.
+*   **German Strings:** String fields occupy 16-byte slots containing length, a 4-byte prefix, and either an 8-byte inline suffix (for length $\le 12$) or a 64-bit relative offset into Region B.
+
+### 5.6. Region B: The Blob Heap
+Region B provides unstructured overflow storage for variable-length string data.
+*   **Compaction:** During transmutation, only blobs referenced by records with non-zero net weights are copied, effectively performing garbage collection of annihilated string state.
+*   **Addressing:** Accessed exclusively via offsets stored in Region C.
+
+### 5.7. Z-Set Write-Ahead Log (WAL) Format
+The WAL is a sequence of append-only blocks, each representing a Z-Set batch associated with a specific **Log Sequence Number (LSN)**.
+*   **Block Header:**
+    *   `u64` LSN
+    *   `u32` Component ID
+    *   `u32` Batch Entry Count
+    *   `u64` Block Checksum (XXH3)
+*   **Block Body:** A contiguous stream of Z-Set records. Each record consists of a 64-bit Entity ID, a 64-bit signed Weight, and the packed Component payload (including German Strings and required inline blobs).
+*   **Unified Streaming:** The WAL serves as the primary distribution log; clients synchronize state by tailing the WAL and filtering for specific Component IDs.
+
+### 5.8. Data Integrity and Trailing Checksums
+To support the **Ghost Property** at the integrity layer, GnitzDB utilizes **Trailing Region Checksums**.
+*   **Partial Validation:** Readers validate the integrity of specific regions (e.g., E and W) independently. If an entity is annihilated ($w_{net} = 0$), the engine avoids I/O and checksum validation for Region C and B.
+*   **Algorithm:** **XXH3-64** is used for all regions to maximize performance on modern CPUs while ensuring high collision resistance.
+*   **Header Integrity:** The 64-byte header includes its own checksum at bytes 24-31 (using the reserved block) or as a trailing trailer before Region E.
     
-## 6. The MemTable: High-Velocity Ingestion Buffer
+## 6. The MemTable: High-Velocity Z-Set Ingestion
 
-### 6.1. The Ingestion Pipeline
-The MemTable is the mutable, in-memory write-head of the engine, optimized for rapid, row-oriented (Array of Structs) updates. Ingestion follows a strict pipeline:
-1.  **Schema Enforcement**: Incoming bundles are validated against the **Component Registry** to ensure type and layout compatibility.
-2.  **LSN Assignment**: Each batch is assigned a unique, monotonic **Log Sequence Number (LSN)**.
-3.  **WAL Serialization**: The batch is serialized to the durable Write-Ahead Log before being applied to the in-memory MemTable.
+### 6.1. The Ingestion Pipeline and Unified Log
+The MemTable is the mutable, in-memory write-head of the engine, optimized for the rapid absorption of row-oriented Z-Set deltas. Ingestion follows a strict, durable pipeline:
+1.  **Schema Enforcement:** Incoming deltas are validated against the **Component Registry** to ensure physical layout compatibility.
+2.  **LSN Assignment:** Each ingestion batch is assigned a unique, monotonic **Log Sequence Number (LSN)**.
+3.  **Z-Set WAL Serialization:** Before application to memory, the delta is serialized to the **Z-Set Write-Ahead Log**. This log stores the triple ($\Delta E, \Delta C, \Delta W$), serving as the source of truth for both crash recovery and live distribution.
 
 ### 6.2. AoS SkipList for Algebraic Coalescing
-The MemTable utilizes a SkipList indexed by Entity ID to perform in-place algebraic summation of weights at ingestion time.
-*   **Entity ID Lookup**: The SkipList performs an $O(\log N)$ search to locate existing entities.
-*   **Weight Summation**: If an entity exists, the incoming weight is added to the node's 64-bit weight field. This immediate coalescing reduces the data volume passed to the persistence layer.
-*   **Value Overwrite**: The component bundle associated with the entity is overwritten with the latest version, ensuring last-write-wins semantics for updates within the same ingestion epoch.
+The MemTable utilizes a SkipList indexed by Entity ID to perform immediate, in-place algebraic summation of weights at ingestion time.
+*   **Algebraic Accumulation:** The SkipList performs an $O(\log N)$ search to locate existing nodes. If found, the incoming weight is added to the node's 64-bit weight field.
+*   **Value Resolution (LWW):** Within a single ingestion epoch, the component bundle associated with the entity is overwritten with the latest version, enforcing Last-Write-Wins semantics before the data reaches the persistence layer.
+*   **In-Memory Annihilation:** If high-frequency updates within the MemTable result in a net weight of zero, the entity is marked as annihilated.
 
 ### 6.3. Physical Node Layout
-Nodes are laid out as contiguous byte sequences within a Monotonic Arena to minimize allocation overhead.
-*   `[00-07]` **Weight**: 64-bit signed integer.
+Nodes are laid out as contiguous byte sequences within a **Monotonic Arena** to minimize allocation overhead and ensure cache locality.
+*   `[00-07]` **Weight**: 64-bit signed integer ($w \in \mathbb{Z}$).
 *   `[08-08]` **Height**: 8-bit unsigned integer (SkipList tower height).
 *   `[09-11]` **Padding**: Ensures 4-byte alignment for the pointer array.
 *   `[12-XX]` **Next-Pointer Array**: Height-indexed array of 32-bit Arena offsets.
 *   `[XX-YY]` **Entity ID**: 64-bit unsigned integer key.
 *   `[YY-ZZ]` **Component Bundle**: Fixed-stride raw byte payload matching the `ComponentLayout`.
 
-### 6.4. Sealing and Transmutation Trigger
-The transition from mutable memory to immutable persistence is triggered by Arena occupancy or time-based policies.
-*   **Atomic Rotation**: When the Arena is full, the active `MemTable` is marked as "Sealed" (read-only), and a new, empty `MemTable` instance is created for subsequent writes.
-*   **Transmutation Pipeline**: The Sealed MemTable is handed off to a background process for transmutation into columnar ECS Shards.
+### 6.4. Sealing and Transmutation (Unzipping)
+The transition from mutable memory to immutable persistence is triggered by Arena occupancy or LSN commit policies.
+*   **Atomic Rotation:** The active MemTable is marked as "Sealed" (read-only), and a new, empty SkipList/Arena pair is instantiated.
+*   **Columnar Demultiplexing:** The Transmutation Pipeline performs a linear scan of the Sealed SkipList. It "unzips" the row-oriented (AoS) nodes, separating the Entity IDs, Weights, and Component fields into the distinct regions (E, W, C, B) of a new **ECS Shard**.
 
-### 6.5. The Transmutation Process (Unzipping)
-The pipeline transforms the row-oriented MemTable into the column-oriented shard format.
-*   **Row Iteration**: The pipeline performs a linear scan of the Sealed MemTable's SkipList.
-*   **Annihilation Pruning**: Nodes with a net weight of zero are discarded and are not processed further, preventing annihilated records from reaching disk.
-*   **Columnar Demultiplexing**: For each surviving entity, the component bundle is "unzipped." Each field is written to its corresponding `ECSShardWriter`, effectively demultiplexing one row-oriented stream into multiple column-oriented streams.
-*   **String Relocation**: For "Long" German Strings, the payload is read from the MemTable's Blob Arena and copied into the destination shard's Blob Heap. The offset within the 16-byte string struct is updated (swizzled) to point to the new location.
+### 6.5. Survivor Blob Compaction
+The transmutation process utilizes algebraic weights to minimize physical storage footprint and I/O.
+*   **Annihilation Pruning:** Nodes with $w_{net} = 0$ are discarded. The pipeline elides all I/O for these records, preventing "Ghost" data from reaching the disk.
+*   **Blob Relocation:** For surviving records with "Long" German Strings, the payload is read from the MemTable's Blob Arena and copied into the shard's **Region B**.
+*   **Offset Swizzling:** The 64-bit offset within the German String struct is updated from the temporary Arena offset to the persistent Shard-relative offset. This ensures that Region B contains a compacted, sequential heap of only relevant string data.
+
+### 6.6. Reactive Feedback Integration
+The MemTable ingestion layer is designed to accept Z-Set deltas produced by the DBSP VM (Section 8).
+*   **Recursive Ingestion:** View deltas generated by internal circuits are fed back into the MemTable as new ingestion batches.
+*   **LSN Consistency:** Feedback deltas are processed with the same algebraic guarantees as external updates, allowing for complex, multi-stage state transformations within a unified LSN sequence.
 
 ## 7. Compaction: The JIT-Compiled Merge Loop
 
 ### 7.1. Component-Scoped Compaction
-Compaction is a per-component process, operating independently on the shards of a single component type to maintain read performance.
-*   **Trigger Heuristic**: Compaction is triggered for a component when its **Read Amplification** metric (the number of overlapping shards for a given Entity ID range) exceeds a configured threshold.
-*   **Goal**: To merge multiple small, overlapping "Dirty" shards into a single, large, non-overlapping "Guard" shard.
+Compaction operates independently on the shards of a single component type to maintain read performance and reclaim physical storage.
+*   **Trigger Heuristic:** Compaction is triggered for a component when the `ShardRegistry` detects that its Read Amplification—the number of overlapping shards for a given Entity ID range—exceeds a configured threshold.
+*   **Goal:** To merge multiple overlapping, heterogeneous shards into a single, large, non-overlapping "Guard" shard.
 
 ### 7.2. The Tournament Tree Merge
-The core compaction logic uses a **Tournament Tree** (priority queue) to perform an N-way merge sort of shards, keyed by Entity ID.
-*   **Shard Head Management**: The tree maintains the next available entity from each input shard.
-*   **Entity ID Consolidation**: In each step, the iterator processes all entries for the globally minimal Entity ID across all shards.
+The core compaction logic employs a **Tournament Tree** (a priority queue) to execute an N-way merge sort of shards, keyed by Entity ID.
+*   **Cursor Management:** Each shard is accessed via a `StreamCursor` that maintains a pointer to the current Entity ID in Region E.
+*   **Minimal ID Extraction:** The tournament tree yields the globally minimal Entity ID across all input shards in each iteration, allowing the engine to align all contributions for that entity.
 
 ### 7.3. Algebraic Consolidation and Pruning
-For each Entity ID, the engine performs an algebraic summation of its weights from all contributing input shards.
-*   **The Ghost Property**: If the net weight $\sum w_i$ sums to zero, the entity is identified as annihilated. The engine discards the record and advances the iterators of all contributing shards without materializing the component data from disk.
-*   **Space Reclamation**: This process is the primary mechanism for garbage collecting annihilated data and reclaiming physical storage.
+For each unique Entity ID, the engine aggregates contributions using a `MergeAccumulator`.
+*   **Net Weight Summation:** The engine performs an algebraic summation of all weights ($w \in \mathbb{Z}$) from the contributing shards for the given Entity ID.
+*   **Annihilation (The Ghost Property):** If the net weight $\sum w_i$ sums to zero, the entity is identified as annihilated. The record is discarded, and no payload data is materialized from Region C or Region B.
+*   **LSN-Aware Value Resolution:** For non-annihilated entities, the engine selects the component payload from the shard with the highest Log Sequence Number (LSN), ensuring Last-Write-Wins semantics.
 
-### 7.4. Value Resolution via LSN
-In cases of conflicting component values for the same entity (i.e., updates), the engine resolves the conflict by selecting the value from the shard with the highest **Log Sequence Number (LSN)**, ensuring "last write wins" semantics.
+### 7.4. JIT-Compiled Specialized Merge
+The RPython Meta-Tracing JIT optimizes the merge loop to maximize throughput.
+*   **Trace Specialization:** The JIT specializes the merge logic for the specific component stride and field offsets of the shard layout.
+*   **Materialization Barrier:** The JIT is prevented from hoisting component data fetches above the weight summation check. This ensures that payload data is only read from disk or mapped memory for entities that possess a non-zero net weight, physically realizing the Ghost Property at the I/O level.
 
-### 7.5. JIT Specialization of the Merge Loop
-The RPython Meta-Tracing JIT heavily optimizes the compaction process.
-*   **Trace Unrolling**: The merge logic is unrolled and specialized for the specific number of input shards, eliminating dynamic dispatch overhead.
-*   **Materialization Barrier**: The JIT is prevented from hoisting component data fetches above the weight summation check. This ensures that payload data is only read from disk for entities that have a non-zero net weight, physically realizing the Ghost Property at the I/O level.
-
-### 7.6. Columnar Re-Partitioning
+### 7.5. Columnar Re-Partitioning
 Surviving entities ($W_{net} \neq 0$) are streamed into a new `ECSShardWriter`.
-*   **Sequential Writes**: The consolidated entities, component data, and relocated strings are written sequentially into new E, C, and B regions, respectively.
-*   **Atomic Manifest Update**: Upon successful finalization of the new Guard Shard, the engine atomically updates the Spine Manifest to replace the input shards with the new, compacted shard.
+*   **Sequential Writes:** The consolidated entities, weights, component data, and relocated strings are written sequentially into new E, W, C, and B regions, respectively.
+*   **Atomic Manifest Update:** Upon successful finalization of the new Guard Shard, the engine updates the Manifest and Registry atomically, replacing the input shards with the new generation.
     
 ## 8. Execution Model: Persistent DBSP Virtual Machine
 
-### 8.1. Systems as Persistent Circuits
-The execution engine treats **Systems** as persistent, long-running **DBSP Circuits**. Unlike traditional query engines, these circuits are resident in memory and maintain the algebraic state necessary for incremental computation over component streams.
-*   **System Registration:** A "System" is a materialized view definition compiled into bytecode. The VM instantiates the circuit, allocating registers for component Z-Set streams.
-*   **LSN-Driven Execution:** The VM operates on a reactive trigger model. As new LSN batches are committed, the **Circuit Scheduler** identifies dependent systems and feeds the corresponding component deltas into their input registers.
+### 8.1. Register-Based Z-Set VM
+The engine executes reactive circuits via a register-based Virtual Machine optimized for high-velocity Z-Set manipulation. Registers in this ISA hold references to multiset buffers containing aligned Entity, Weight, and Component regions.
+*   **Delta Registers ($R_\Delta$):** Transient registers holding incremental Z-Set deltas for the current LSN epoch. 
+*   **Trace Registers ($R_T$):** Persistent registers holding the indexed Z-Set state (Traces) required for non-linear operations. Traces are physically stored as immutable Penta-Partition shards in the FLSM.
 
-### 8.2. The Vertical Join Operator
-The fundamental operation for reconstructing entity state is the **Vertical Join** on Entity ID. This DBSP operator combines two or more component streams into a unified Z-Set.
-*   **Zip-Join Algorithm:** Because all component shards are sorted by Entity ID, the join is implemented as a highly efficient, cache-friendly merge-sort (or "zip") operation that linearly advances pointers through the input `Region E` vectors.
-*   **JIT Specialization:** The RPython Meta-Tracing JIT unrolls the zip-join loop and specializes the trace for the specific component layouts involved. It generates vectorized machine code that operates directly on the primitive arrays in `Region C`, eliding deserialization overhead.
+### 8.2. Operational Primitives and Join Lowering
+The ISA implements the core operators of DBSP calculus, treating every input and output as an algebraic Z-Set.
+*   **Linear Operators:** `FILTER`, `MAP`, and `UNION` operate via algebraic addition. These require no historical state and process deltas in isolation.
+*   **Non-Linear Operators:** `JOIN_V` (Vertical Join) and `JOIN_T` (Trace Join) correlate deltas with Traces.
+*   **Sequential Join Topology:** Complex multi-component joins (e.g., $A \Join B \Join C$) are lowered by the compiler into a sequence of binary `JOIN_V` operations. The intermediate Z-Sets are materialized in transient registers before being joined with subsequent components.
+*   **Temporal Operators:** `INTEGRATE` ($I$) and `DIFFERENTIATE` ($D$) manage the transformation between Z-Set streams and snapshots.
 
-### 8.3. Operator Trace Management
-Stateful DBSP operators (e.g., joins, aggregations) require internal state—referred to as **Traces**—to incrementally process new deltas.
-*   **Trace Storage:** Traces are maintained as in-memory Z-Sets within Monotonic Arenas, using the same row-oriented (AoS) format as the MemTable for rapid updates.
-*   **State Checkpointing:** To ensure fault tolerance, the VM periodically snapshots operator traces to the FLSM as dedicated ECS Shards. These checkpoints are tagged with the LSN of the last processed batch, allowing for rapid recovery by replaying only subsequent WAL entries.
+### 8.3. Vectorized Vertical Zip-Join
+Entity reconstruction is performed via the **Vertical Zip-Join**. Because input shards and Traces are strictly sorted by Entity ID, the join is implemented as a cache-localized, vectorized merge-scan.
+*   **Algorithm:** The VM advances dual pointers across input Region E vectors. Intersection at a specific Entity ID triggers the multiplication of weights ($w_l \times w_r$) and the materialization of the joined Component payload.
+*   **Optimization:** The $O(N+M)$ complexity ensures predictable performance even during massive state updates.
 
-### 8.4. Output Serialization
-The terminal node of a system is an `EMIT` operator that serializes the output deltas for distribution or feedback into the storage layer.
-*   **Component Deltas:** The output of a system is typically a Z-Set of a specific component type (e.g., a `Velocity` system producing `Position` deltas).
-*   **View Log:** These output deltas are written sequentially to a dedicated, append-only **View Log** using the Cap'n Proto wire format. This log serves as the input stream for the Distribution Layer.
+### 8.4. Persistent Trace Management
+Stateful operators utilize Traces to store the necessary history for incremental computation. 
+*   **Trace Maintenance:** The `TRACE_ADD` instruction appends the current $R_\Delta$ to a persistent Trace. This triggers a background merge-sort within the FLSM, identical to the shard compaction process.
+*   **Z-Set Uniformity:** Traces are stored in the Penta-Partition format, allowing them to be queried or compacted using the same logic as base component shards.
+
+### 8.5. Reactive Circuit Scheduling
+Execution is driven by an event-driven **Circuit Scheduler** triggered by LSN commits in the WAL.
+*   **Reactive Trigger Graph:** Systems are organized in a Directed Acyclic Graph (DAG) based on Component ID subscriptions. 
+*   **Topological Dispatch:** Upon an LSN commit, the scheduler identifies all dependent systems and executes them in topological order, ensuring all Z-Sets are resolved within the same LSN epoch.
+
+### 8.6. Materialization Barriers and the Ghost Property
+The VM enforces the **Ghost Property** through materialization barriers that guard payload access.
+*   **Weight-Gated Execution:** The VM inspects the algebraic weight in Region W before processing scalar logic. 
+*   **Annihilation Bypass:** If an entity's net weight is zero, the VM elides all fetches for Region C and Region B. This prevents pipeline stalls and ensures that irrelevant data never occupies CPU cache lines or consumes memory bandwidth.
+
+### 8.7. Unified Output Serialization and Feedback
+The terminal `EMIT` instruction handles the propagation of circuit results. 
+*   **Unified Z-Set WAL:** There are no dedicated "View Logs." The `EMIT` opcode appends the finalized Z-Set deltas to the unified WAL. 
+*   **Feedback Loops:** Circuit outputs can be fed back into the MemTable ingestion layer or transmitted to another GnitzDB instance. This allows for inter-instance Z-Set propagation, where the output delta of one system serves as the input delta for another, maintaining global algebraic consistency across distributed nodes.
 
 ## 9. Distribution and Concurrency Model
 
 ### 9.1. Multi-Process Architecture
-The system isolates I/O-intensive and CPU-intensive tasks into separate processes to bypass the Global Interpreter Lock (GIL) and maximize throughput.
-*   **The Executor Process**: The primary process responsible for ingestion, owning the `MemTableManager` and the DBSP VM. It is the exclusive writer for the WAL, View Logs, and new ECS Shards.
-*   **The Sync Server Process**: A dedicated process that manages client connections and streams component deltas. It operates as a concurrent reader of View Logs and FLSM shards.
-*   **The Compactor Process**: An independent background worker that merges shards for each component type. It reads older shards and produces new "Guard" shards.
+The system employs strict process isolation to maximize I/O parallelism and bypass the Global Interpreter Lock (GIL).
+*   **The Executor Process:** Owns the `MemTableManager` and DBSP VM. It is the exclusive writer for the Z-Set WAL, finalized ECS Shards, and the active Manifest.
+*   **The Sync Server Process:** A concurrent reader process that manages remote client sessions. It tails the unified Z-Set WAL and performs snapshot merges from persistent shards.
+*   **The Compactor Process:** A background worker that merges overlapping shards of a specific component type, producing consolidated Guard Shards and updating the Manifest.
 
-### 9.2. Single-Writer/Multi-Reader Concurrency
-Consistency across processes is maintained via a single-writer, multi-reader (SWMR) pattern anchored by the filesystem.
-*   **Immutable Shards**: Once an ECS Shard is written by the Executor or Compactor, it is never modified. This allows reader processes to safely `mmap` the file without locks.
-*   **Versioned Manifest**: The **Spine Manifest** provides a consistent, point-in-time view of the active shards. Readers load the latest complete version of the manifest and operate on that snapshot, while the Executor prepares the next version. Atomic file renames are used to publish manifest updates.
+### 9.2. Single-Writer/Multi-Reader (SWMR) Consistency
+Concurrency is anchored by the filesystem and the immutability of the Penta-Partition shard format.
+*   **Manifest Authority:** The **Manifest** is the authoritative source of truth for the active shard set. Updates are performed via an atomic `rename()` of a temporary manifest file, providing consistent point-in-time views to reader processes.
+*   **Immutable Shards:** Once a shard is finalized and its XXH3 checksums are written, it is never modified. Readers safely `mmap` shards without coordination locks.
 
-### 9.3. Client Session and Subscription Management
-The Sync Server manages the state of all client subscriptions to ensure reliable delivery of component deltas.
-*   **Component Subscription**: A client session is defined by a subscription to one or more component types.
-*   **LSN Cursor**: Each subscription is associated with an LSN cursor tracking the last successfully acknowledged change. The Sync Server uses this cursor to stream from the correct offset in the component's View Log.
-*   **Backpressure Handling**: If a client's LSN cursor falls behind the configured retention window of the View Log, the server signals the client to perform a full resynchronization from the latest Spine snapshot.
+### 9.3. Distributed Reference Counting and Deferred Deletion
+Physical file reclamation is managed via a distributed `RefCounter` to ensure reader safety.
+*   **SIGBUS Protection:** Processes increment a reference count upon mapping a shard. If the Compactor supersedes a shard, it marks the file for deletion in the `RefCounter`.
+*   **Physical Unlink:** The actual `unlink()` syscall is deferred until the global reference count reaches zero. The `Spine.close_all()` routine ensures handles are released exactly once, triggering the final cleanup of obsolete Penta-Partition files.
 
-### 9.4. Distributed Reference Counting and Reclamation
-Physical file deletion is managed by a **Distributed Reference Counter** (implemented in shared memory or via IPC) to prevent `SIGBUS` errors.
-*   **Handle Acquisition**: Before a process maps a shard, it increments the global reference counter for that file.
-*   **Deferred Deletion**: When the Compactor replaces old shards with a new one, it marks the old files for deletion. The `unlink()` syscall is invoked only after the resource's reference count drops to zero, ensuring that no process is actively reading the file when it is removed.
-
-### 9.5. Inter-Process Communication (IPC)
-Low-latency IPC channels are used to coordinate state transitions between processes.
-*   **Manifest Propagation**: When the Executor or Compactor updates the Spine, it broadcasts a signal. The Sync Server listens for this signal to update its local view of available shards for new client snapshot requests.
-*   **LSN High-Water Mark**: IPC is used to signal the highest LSN committed to the WAL, triggering the DBSP VM to process new batches and, subsequently, the Sync Server to read new entries from the View Logs.
+### 9.4. WAL-Based Inter-Process Communication
+The **Z-Set WAL** serves as the primary data conduit between the Executor and the Sync Server.
+*   **Tailing Semantics:** The Sync Server tails the append-only WAL, treating it as a unified Z-Set stream. This eliminates the need for dedicated "View Logs" and ensures that ingestion and distribution are chronologically and algebraically aligned.
 
 ## 10. Client Synchronization Protocol
 
-### 10.1. Handshake and Schema Negotiation
-The synchronization session begins with a handshake to establish compatibility and ensure structural alignment for the requested components.
-*   **Version Verification**: The client provides the protocol version and a list of requested Component IDs.
-*   **Schema Hash Validation**: The server validates the client's local schema against the persistent **Component Registry**. The exchange of a cryptographic hash of the component **ComponentLayout** is mandatory. If hashes mismatch, the session is terminated, preventing local data corruption due to incompatible memory structures.
-*   **LSN Alignment**: The client submits its `Last_ACK_LSN`. A `NULL_LSN` (0) initiates a full snapshot bootstrap.
+### 10.1. Handshake and Schema Validation
+The session begins with a structural handshake to ensure binary compatibility between the server's layout and the client's local state.
+*   **Schema Hash Validation:** Clients and servers exchange cryptographic hashes of the `ComponentLayout`. Mismatched hashes terminate the session to prevent memory corruption during raw Z-Set application.
+*   **LSN Anchor:** The client submits its `Last_ACK_LSN`. A value of zero initiates a full state bootstrap.
 
 ### 10.2. Mode 1: Snapshot Bootstrap
-If the client requires a full state image, the server enters **Snapshot Mode**.
-*   **Point-in-Time Spine Resolution**: The server resolves the **Spine Manifest** at the highest available LSN, providing a consistent view across all component streams.
-*   **Vertical Reconstruction**: The server performs an N-way merge-scan across all required component shards (E, C, and B regions). This is an algebraic aggregation, ensuring only records with a net weight of $+1$ are included.
-*   **Z-Set Streaming**: The complete, reconstructed set of entities and their components are streamed to the client, serialized in a high-bandwidth Cap'n Proto format.
-*   **Atomic Finalization**: The stream concludes with a `SNAPSHOT_END` signal containing the final LSN of the snapshot, which serves as the starting anchor for live delta synchronization.
+The server generates a baseline state image by algebraically resolving the persistent FLSM layer.
+*   **Penta-Partition Merge-Scan:** The server performs an N-way merge-scan across all shards associated with the requested Component ID. 
+*   **Algebraic Pruning:** The `MergeAccumulator` sums weights across shards. Only records with a net weight of $+1$ are serialized and streamed to the client.
+*   **LSN Transition:** The stream terminates with a `SNAPSHOT_END` signal containing the snapshot's LSN, which serves as the starting cursor for live tailing.
 
-### 10.3. Mode 2: Live Delta Streaming
-Once the client is aligned, the server transitions to **Live Mode**, providing real-time incremental updates.
-*   **View Log Tailing**: The Sync Server tails the **View Log** corresponding to the client's subscription, starting immediately after the client's last acknowledged LSN.
-*   **Component Delta Push**: The server pushes atomic Cap'n Proto messages. Each message contains a batch of component deltas ($\Delta \text{EntityID}, \Delta \text{ComponentValue}, \Delta \text{Weight}$).
-*   **LSN Acknowledgement**: Clients periodically transmit an `ACK_LSN`. The Sync Server uses these acknowledgements to manage log retention and backpressure.
-
-### 10.4. Fault Tolerance and Reconnection
-The protocol is designed for idempotent resumption after network failures.
-*   **Idempotent Resumption**: Upon reconnection, the client re-submits its latest `ACK_LSN`. The server resumes streaming from the subsequent log offset. The additive nature of DBSP deltas ensures that the client's local state remains consistent even if it re-applies a few previously acknowledged deltas.
-*   **Purge Notification**: If a client falls outside the log retention window, the server issues a `RESYNC_REQUIRED` error, forcing the client to re-initiate a full Snapshot Bootstrap.
+### 10.3. Mode 2: Live Z-Set Tailing
+Incremental updates are pushed as they appear in the unified Z-Set WAL.
+*   **Filtering and Propagation:** The Sync Server tails the WAL, filtering Z-Set deltas $(\Delta E, \Delta C, \Delta W)$ by the client's subscribed Component IDs.
+*   **Idempotent Additive Application:** Because GnitzDB protocol is based on additive Z-Set deltas, synchronization is natively idempotent. Clients can re-apply previously received deltas without violating state consistency, simplifying fault-tolerant recovery and network retransmissions.
+*   **Backpressure and Purge:** If a client's LSN cursor falls behind the WAL's retention window, the server issues a `RESYNC_REQUIRED` signal, forcing the client to re-initiate a Snapshot Bootstrap.
 
 ## 11. The SQL Frontend and Compiler Interface
 
-### 11.1. Schema Registry and DDL Parsing
-The frontend acts as the interface for defining the data model, utilizing **Apache Calcite** for DDL parsing.
-*   **Component Definitions**: `CREATE COMPONENT` or equivalent DDL is translated into the canonical **ComponentLayout**. The compiler maps logical SQL types (e.g., `VARCHAR(N)`, `BIGINT`) to the specific **FieldType** primitives, including the fixed 16-byte structure for German Strings.
-*   **Materialized View Definitions**: `CREATE SYSTEM` (or `CREATE MATERIALIZED VIEW`) statements define persistent DBSP circuits. The compiler verifies that source components are registered and that the target component definition is valid.
-*   **Component Hashing**: A unique cryptographic hash is generated for every logical and physical component definition. This hash is embedded in the schema registry and used for client-server handshake validation.
+### 11.1. Schema Registry and DDL Translation
+The frontend serves as the entry point for defining the reactive data model, utilizing **Apache Calcite** for DDL validation and relational algebra construction.
+*   **Component Physicalization:** `CREATE COMPONENT` statements are translated into canonical **ComponentLayout** descriptors. The compiler calculates the strides for the Penta-Partition shard format, enforces field alignment, and maps logical types to the 16-byte German String structure.
+*   **Schema Hashing:** A unique cryptographic hash is generated for every `ComponentLayout`. This hash is persisted in the **Manifest**-backed registry and serves as the mandatory validation token during client-server structural negotiation.
+*   **System Registration:** `CREATE SYSTEM` (Materialized View) definitions are parsed into logical plans. The compiler identifies source Component IDs and prepares the reactive dependencies for the **Circuit Scheduler**.
 
-### 11.2. Relational-to-DBSP Algebraic Translation
-The compiler transforms a logical Relational Algebra tree into a lifted DBSP dataflow graph designed to operate over component streams.
-*   **Vertical Join Mapping**: A logical `JOIN` operation is mapped onto the highly efficient **Vertical Join** operator, specializing the join key to the 64-bit Entity ID.
-*   **Incremental Lifting**: The compiler applies the DBSP transformation to ensure the circuit computes only the $\Delta$ change to the output Z-Set.
-*   **Type Promotion**: During translation, the component access logic is specialized to use the statically calculated `field_offsets` from the **ComponentLayout**, allowing the RPython JIT to generate efficient, deserialization-free pointer arithmetic.
+### 11.2. Incremental DBSP Lifting and Join Lowering
+The compiler transforms logical relational algebra into incremental DBSP circuits designed for Z-Set delta processing.
+*   **Lifting Identity:** Logical operators $Q$ are lifted into incremental circuits $Q^\circ$ via the transformation $Q_\Delta = D \circ \uparrow Q \circ I$. This ensures the circuit computes only the minimal Z-Set change required to maintain the view.
+*   **Sequential Join Planning:** Multi-component joins are lowered into a sequence of binary `JOIN_V` (Vertical Zip-Join) operations. The compiler organizes these into left-deep or bushy trees where intermediate results are materialized in transient **Delta Registers** ($R_\Delta$).
+*   **Stateful Operator Allocation:** Operators requiring history (Joins, Aggregates) are lowered into instructions that utilize persistent **Trace Registers** ($R_T$) backed by Penta-Partition shards in the FLSM.
 
-### 11.3. Bytecode Emission and Physical Constants
-The optimized DBSP graph is serialized into the engine's custom Instruction Set Architecture (ISA) for the RPython VM.
-*   **Register Allocation**: VM registers are assigned to intermediate component Z-Set deltas.
-*   **Stride Constant Injection**: The fixed `stride` and `field_offsets` for all components accessed in the circuit are injected directly into the bytecode as immediate constants. This enforces the JIT's specialization mandate, allowing the final machine code to operate at maximum efficiency.
-*   **Scalar Micro-Interpreter**: Logic within `WHERE` or `SELECT` clauses is compiled into stack-based bytecode, but access to component data is protected by materialization barriers and utilizes the specialized German String comparison logic.
+### 11.3. Register Allocation and JIT Specialization
+The incremental plan is serialized into the engine's register-based bytecode ISA.
+*   **Register Management:** The compiler performs register allocation, distinguishing between **Delta Registers** ($R_\Delta$) for LSN-local intermediate Z-Sets and **Trace Registers** ($R_T$) for operator state persistence.
+*   **Immediate Constant Injection:** Physical constants, including component strides, field offsets, and checksum offsets, are injected directly into the bytecode. The RPython JIT promotes these to constants, enabling the emission of specialized assembly for specific memory layouts.
+*   **Materialization Barriers:** The compiler inserts weight-gated barriers before any scalar logic (`MAP`, `FILTER`). These instructions inspect **Region W** and elide data materialization if $w_{net} = 0$, enforcing the Ghost Property at the VM level.
 
-### 11.4. Dependency Graph and Trigger Logic
-The frontend maintains a global **Dependency Graph** linking component streams to the **Systems** that consume them.
-*   **Trigger Mapping**: When an LSN batch is committed for a source component (e.g., `Velocity`), the graph identifies all dependent downstream systems. The compiler generates the specific trigger logic for the **Circuit Scheduler**.
-*   **Pipeline Coordination**: The compiler ensures that systems with complex dependencies (view-on-view) are scheduled for execution in the correct topological order within a single LSN epoch, maintaining global algebraic consistency.
+### 11.4. Trigger Graph and Unified WAL Integration
+The compiler constructs a global **Reactive Trigger Graph** to coordinate execution within a unified LSN epoch.
+*   **Subscription Mapping:** Each `LOAD_DELTA` instruction creates a directed dependency from a source Component ID to the System ID.
+*   **LSN Dispatch:** Upon a WAL commit, the scheduler performs a topological sort of the graph and executes dependent systems. 
+*   **Unified EMIT Opcode:** Circuits terminate with an `EMIT` instruction. Instead of writing to isolated view logs, `EMIT` appends the resulting Z-Set deltas back into the unified **Z-Set WAL**.
+*   **Feedback Loops:** This unified logging allows the output of one system to be consumed as the input of another—either within the same instance or across distributed GnitzDB nodes—while maintaining a single, algebraically consistent log sequence.
 
 ## 12. Implementation Plan
 
-### Phase 0: Physical Foundation [COMPLETED]
-*   **Zero-Allocation Memory Management**: Implemented `Arena` bump-pointer allocators and `MappedBuffer` view abstractions for GC-independent memory access.
-*   **Dynamic Type System**: Developed the `FieldType` and `ComponentLayout` registry to calculate physical offsets and strides for user-defined components at runtime.
-*   **German String Logic**: Implemented the 16-byte inline string format with efficient prefix-based equality checks and heap fallback logic.
-*   **ECS Shard Storage**: Created `ECSShardWriter` and `ECSShardView` to persist and read decomposed columnar data (Regions E, C, and B).
-*   **Transmutation Bridge**: Refactored `MemTable` to store row-oriented component bundles and "unzip" them into columnar shards during flush, including pointer relocation for German Strings.
-*   **Integrated ECS Engine**: Unified the `Spine` and `Engine` to perform Entity-Component lookups across memory and disk.
+### Phase 0: Core Foundation and Storage Engine [COMPLETED]
+*   **Zero-Allocation Memory Management:** Implemented `Arena` bump-pointer allocators and `MappedBuffer` view abstractions for GC-independent memory access.
+*   **Dynamic Type System:** Developed the `FieldType` and `ComponentLayout` registry to calculate physical offsets and strides for user-defined components at runtime.
+*   **German String Optimization:** Implemented the 16-byte inline string format with prefix-based equality checks and heap fallback logic.
+*   **Penta-Partition Shard Storage:** Created `ECSShardWriter` and `ECSShardView` to persist and read decomposed columnar data across Regions E, W, C, and B.
+*   **Algebraic MemTable Ingestion:** Implemented a row-oriented SkipList in memory to perform immediate algebraic weight summation and LSN-based value overwrites.
+*   **Transmutation Pipeline:** Developed the "Unzipping" logic to transform row-oriented MemTable nodes into column-oriented physical shards, including string relocation and pointer swizzling.
+*   **Binary Manifest System:** Implemented the `ManifestManager` and `ManifestReader/Writer` to track active shards via an atomic, versioned binary format with crash-safe swap mechanics.
+*   **Shard Registry:** Developed the `ShardRegistry` to monitor Read Amplification metrics and manage component-level metadata for range queries.
+*   **Compaction Engine:** Built the vertical merge infrastructure utilizing a `TournamentTree` for N-way sorting and a `MergeAccumulator` to realize the Ghost Property (algebraic pruning) and LSN resolution.
+*   **Lifecycle and Reference Counting:** Implemented the `RefCounter` and integrated it with the `Spine` handle management to support deferred physical deletion of obsolete shards.
 
-### Phase 1: Storage Lifecycle and Compaction [PENDING]
-*   **Manifest Management**: Implement the durable `Manifest` file to track active shards and their LSN ranges. Add atomic swap logic for versioned snapshots.
-*   **Compactor Process**: Develop the background worker that performs the **Vertical Merge** of overlapping shards.
-    *   Implement the `TournamentTree` iterator for N-way merging of sorted Entity IDs.
-    *   Apply algebraic annihilation (pruning records with net weight 0).
-    *   Garbage collect unused blobs from Region B during compaction.
-*   **Reference Counting**: Implement the distributed reference counting mechanism to safely unlink superseded shards while readers are active.
+### Phase 1: Ingestion, Durability, and Integrity [PENDING]
+*   **Unified Z-Set Write-Ahead Log:** Implement the append-only WAL storing LSN-prefixed Z-Set batches ($\Delta E, \Delta C, \Delta W$). Use Cap'n Proto for efficient serialization of component deltas within the log blocks, serving as the source of truth for both recovery and distribution.
+*   **Trailing Region Checksums:** Integrate **XXH3-64** checksums into the `ECSShardWriter` and `ECSShardView`. Implement trailing checksums for each of the five regions (E, W, C, B, and Header) to support partial integrity validation and ensure the Ghost Property at the I/O layer.
+*   **MemTable-WAL Interlock:** Update the `MemTableManager` to enforce a strict write-before-apply protocol. Ensure every ingestion batch is committed to the Z-Set WAL before it is algebraically coalesced into the in-memory SkipList.
+*   **Survivor-Aware Transmutation:** Refine the "Unzipping" pipeline to perform **Blob Compaction**. Ensure that German String relocation into Region B only occurs for entities with a non-zero net weight, physically reclaiming heap space during the transition from mutable memory to immutable shards.
+*   **Recovery and Replay Logic:** Develop the crash-recovery routine to scan the Z-Set WAL and replay batches into the MemTable. The routine must align with the last finalized LSN in the Manifest to ensure absolute algebraic consistency after an unclean shutdown.
+*   **Integrity-Gated Ingestion:** Implement validation logic that utilizes trailing checksums to verify WAL block integrity during replay, preventing the propagation of partial or corrupt ingestion batches into the storage layer.
 
-### Phase 2: Ingestion and Durability [PENDING]
-*   **Write-Ahead Log (WAL)**: Implement the durable, LSN-prefixed WAL using Cap'n Proto for ingestion recovery.
-*   **Server Frontend**: Create the network listener (TCP/Unix Socket) that accepts client connections.
-*   **Bundle Deserialization**: Implement the logic to parse incoming Cap'n Proto "Bundles" from clients and feed them into the `MemTableManager`.
-*   **Crash Recovery**: Develop the startup routine to replay the WAL from the last checkpoint recorded in the Manifest.
+### Phase 2: The DBSP Runtime [PENDING]
+*   **Register-Based Z-Set VM:** Implement the execution core supporting transient Delta Registers ($R_\Delta$) and persistent Trace Registers ($R_T$). Registers must natively manage Penta-Partition buffers (E, W, C, B) to maintain algebraic consistency across all intermediate computations.
+*   **Linear Z-Set Operator Suite:** Develop the `FILTER`, `MAP`, and `UNION` opcodes. Incorporate JIT-specialized **Weight-Gated Barriers** that inspect Region W to elide Region C and Region B materialization for annihilated records ($w_{net} = 0$), enforcing the Ghost Property at the instruction level.
+*   **Vertical Join Infrastructure:** Implement the `JOIN_V` (Vertical Zip-Join) operator for $O(N+M)$ entity reconstruction. Support sequential join lowering by materializing intermediate Z-Set results in $R_\Delta$ for multi-component pipelines.
+*   **Persistent Trace Management:** Develop the `TRACE_ADD` and `JOIN_T` opcodes. Integrate Trace maintenance with the FLSM compaction pipeline to merge incremental Z-Sets into persistent Penta-Partition history shards, enabling incremental non-linear operations.
+*   **Algebraic Temporal Operators:** Implement the `INTEGRATE` ($I$) and `DIFFERENTIATE` ($D$) operators. These manage the calculus of Z-Set streams, facilitating exact incremental state maintenance and the transition between deltas and snapshots.
+*   **Reactive Trigger Scheduler:** Build the event-driven `CircuitScheduler` based on a topological Directed Acyclic Graph (DAG). Execution must be triggered by LSN commits in the Z-Set WAL, ensuring that all dependent systems resolve their algebraic state within a single LSN epoch.
+*   **Feedback Loop Implementation:** Enable internal Z-Set feedback by allowing `EMIT` operations to inject deltas back into the MemTable ingestion layer. Ensure the scheduler handles recursive triggers while maintaining global LSN order and algebraic convergence.
 
-### Phase 3: The DBSP Runtime [PENDING]
-*   **Circuit Infrastructure**: Implement the `Circuit` and `Scheduler` classes to manage persistent dataflow graphs.
-*   **Vertical Join Operator**: Develop the high-performance, JIT-friendly Zip-Join operator for combining multiple `ECSShardView` streams by Entity ID.
-*   **Filter/Map Operators**: Implement linear operators that accept `ComponentLayout`-aware bytecode for predicate evaluation and projection.
-*   **System Registration**: Add the API to register new Circuits (Systems) and link them to component inputs.
+### Phase 3: Distribution and Synchronization [PENDING]
+*   **Structural Handshake and Hash Validation:** Develop the synchronization handshake protocol to enforce binary compatibility. Exchange cryptographic Schema Hashes of the `ComponentLayout` to ensure the client's local Penta-Partition mirrors are structurally aligned with the server's region offsets and German String logic.
+*   **Algebraic Snapshot Resolution:** Implement the FLSM merge-scan logic to bootstrap new clients. Resolve the state by performing an N-way algebraic summation of persistent shards at a specific LSN cursor. Serialize only records with a net weight of $+1$ into a baseline Z-Set stream, ensuring clients receive a consistent starting state.
+*   **Unified WAL Z-Set Tailing:** Build the "Live Mode" propagation engine by tailing the unified Z-Set WAL. Implement high-performance filtering to extract only the component-specific Z-Set deltas ($\Delta E, \Delta C, \Delta W$) required for active client subscriptions, bypassing the need for dedicated View Log files.
+*   **Idempotent Z-Set Propagation:** Utilize the additive properties of DBSP to ensure fault-tolerant synchronization. Design the protocol such that clients apply Z-Set deltas additively to their local state. This ensures that network retransmissions or LSN overlaps are naturally resolved through algebraic summation, providing idempotent state consistency.
+*   **Integrity-Aware Sync:** Leverage trailing region checksums during distribution. Allow the Sync Server to validate the integrity of WAL blocks and persistent regions before transmission, ensuring that only verified Z-Set state is propagated to remote mirrors.
+*   **Inter-Instance Feedback Plumbing:** Implement the network-layer support for inter-instance feedback loops. Develop the mechanism to allow the output of a remote GnitzDB instance’s WAL tail to be consumed directly as an ingestion batch for a local `MemTable`, facilitating distributed, multi-stage DBSP computation.
+*   **LSN Cursor Management:** Implement server-side cursor tracking for all client subscriptions. Manage WAL retention and backpressure logic to ensure clients can resume synchronization from their last acknowledged LSN, with automated triggers for Snapshot Bootstrap if a client falls outside the log retention window.
 
-### Phase 4: Distribution and Sync [PENDING]
-*   **View Log**: Implement the append-only log for circuit outputs (Deltas).
-*   **Sync Protocol**: Develop the client-server handshake, including Schema Hash validation.
-*   **Snapshot Bootstrap**: Implement the logic to merge-scan the Spine and stream the net state of a component to new clients.
-*   **Live Delta Pushing**: Implement the mechanism to tail the View Log and push incremental updates to subscribed clients.
-
-### Phase 5: SQL Compiler and Tooling [PENDING]
-*   **SQL Parser Integration**: Integrate Apache Calcite to parse `CREATE COMPONENT` and `CREATE SYSTEM` statements.
-*   **Algebraic Translator**: Implement the logic to convert Relational Algebra trees into the engine's internal DBSP circuit topology.
-*   **Bytecode Generator**: Develop the compiler pass that emits RPython bytecode with embedded `ComponentLayout` constants (strides/offsets).
-*   **CLI Tool**: Build a command-line interface for managing the registry, querying system status, and manually triggering compaction.
+### Phase 4: SQL Frontend and Tooling [PENDING]
+*   **SQL DDL and Component Compilation:** Integrate **Apache Calcite** to parse and validate `CREATE COMPONENT` and `CREATE SYSTEM` statements. Implement the compiler pass that translates logical schema definitions into physical **ComponentLayout** descriptors, calculating the strides and field offsets required for the Penta-Partition shard format.
+*   **Incremental Plan Lifting:** Develop the algebraic translator to transform logical relational algebra into incremental DBSP circuits. Implement the $Q_\Delta = D \circ \uparrow Q \circ I$ transformation logic, ensuring the generated circuits compute minimal Z-Set deltas over component streams.
+*   **Sequential Join Lowering:** Implement the join optimizer to decompose multi-way relational joins into optimized trees of binary `JOIN_V` (Vertical Zip-Join) operations. Orchestrate the materialization of intermediate Z-Set results in transient registers to minimize memory overhead during complex entity reconstruction.
+*   **JIT-Specialized Bytecode Generation:** Build the backend that serializes incremental plans into the register-based VM ISA. Perform register allocation for $R_\Delta$ and $R_T$ buffers and inject immediate physical constants—strides, field offsets, and cryptographic Schema Hashes—directly into the bytecode to enable RPython JIT specialization.
+*   **Reactive Dependency Graph Construction:** Implement the generator for the global **Reactive Trigger Graph**. Map Component ID subscriptions from the bytecode `LOAD_DELTA` instructions to reactive system nodes, enabling the **Circuit Scheduler** to perform topological dispatch upon LSN commits in the Z-Set WAL.
+*   **System Integrity and Barrier Injection:** Orchestrate the insertion of **Weight-Gated Barriers** into the generated bytecode. Ensure the compiler automatically protects all scalar logic with Region W inspections, enforcing the Ghost Property by eliding payload materialization for annihilated records in every generated system.
+*   **CLI and Observability Tooling:** Develop a unified command-line interface for database administration. Implement tools to inspect binary **Manifest** versions, monitor **ShardRegistry** read-amplification metrics, and perform point-in-time Z-Set debugging by tailing the unified WAL for specific LSN ranges.
+*   **Inter-Instance Integration Hooks:** Build the DDL and plumbing to support inter-instance Z-Set feedback. Allow SQL definitions to specify remote GnitzDB WALs as source streams, facilitating the construction of distributed, multi-node DBSP pipelines with global algebraic convergence.
     
 ## 13. Future Work and Edge Cases
 
 ### 13.1. Dynamic View Projection
-The current synchronization protocol assumes clients subscribe to an entire materialized view. Future iterations will implement **Dynamic View Projection**, allowing clients to submit a predicate (e.g., `WHERE region_id = 42`) during the handshake.
-*   **Server-Side Filtering**: The Sync Server applies the predicate to the View Log deltas before transmission.
-*   **Algebraic Integrity**: Since filters are linear operators in DBSP, the server-side projection maintains algebraic consistency, ensuring the client receives exactly the subset of $+1/-1$ deltas required to maintain a partial local replica.
+The engine will implement **Dynamic View Projection** to allow clients to subscribe to partial Z-Set deltas based on server-side predicates.
+*   **Linear Filtering:** Since filters are linear operators in DBSP, the Sync Server can apply predicates directly to the Z-Set WAL during tailing.
+*   **Algebraic Consistency:** The server-side projection produces a sub-stream of deltas that maintains algebraic integrity, ensuring the client receives the exact set of $+1/-1$ updates required to maintain a partial local replica.
 
 ### 13.2. Distributed Z-Set Partitioning
-To support horizontal scaling, the engine will implement **Key-Range Partitioning** across multiple physical nodes.
-*   **Partitioned View Logs**: The global LSN sequence remains unified, but the View Log is sharded based on a hash or range of the record key.
-*   **Exchange Operators**: The VM ISA will be extended with an `EXCHANGE` instruction to facilitate cross-node data shuffles during join operations, maintaining the Z-Set algebraic invariants across a distributed network.
+Horizontal scaling will be achieved via **Key-Range Partitioning** of the unified Z-Set WAL.
+*   **Sharded WALs:** The global LSN sequence remains unified, but the WAL is partitioned based on Entity ID ranges.
+*   **Cross-Node Exchange:** The VM ISA will be extended with an `EXCHANGE` instruction to facilitate cross-node data shuffles during binary join operations, allowing for distributed entity reconstruction while maintaining global Z-Set invariants.
 
-### 13.3. Portable Delta Application (WASM)
-To facilitate integration with browser-based environments and mobile applications, a **Portable Delta Application** library will be developed in WebAssembly (WASM).
-*   **Standardized Logic**: This library provides a hardened implementation of the delta-to-SQL translation logic, allowing any client with a WASM runtime to apply Cap'n Proto View Logs to a local SQLite or DuckDB instance with minimal integration overhead.
-*   **Zero-Copy Handover**: The WASM runtime will utilize shared memory buffers to read Cap'n Proto segments directly from the network stack, minimizing CPU cycles spent on the client-side synchronization hot path.
+### 13.3. Portable Z-Set Application (WASM)
+To facilitate integration with browser-based and mobile environments, a **Portable Z-Set Application** library will be developed in WebAssembly (WASM).
+*   **Idempotent Application:** The library will provide a hardened implementation of the additive delta-to-SQL logic, allowing any client with a WASM runtime to apply WAL Z-Sets to local storage (e.g., SQLite, DuckDB) with minimal integration overhead.
+*   **Zero-Copy Handover:** The library will utilize shared memory buffers to apply Cap'n Proto Z-Set segments directly from the network stack to the local mirror.
 
-### 13.4. Metadata-Only DDL Transitions
-The Quad-Partition format’s reliance on opaque heaps enables **Lazy Schema Evolution** for certain structural changes.
-*   **Non-Breaking Changes**: Operations such as adding a nullable column or renaming a field are handled via the Schema Registry without rewriting physical shards.
-*   **Background Re-Transmutation**: For breaking changes (e.g., type conversions), the engine initiates a background maintenance task. This task reads existing shards, applies the transformation during a specialized compaction loop, and atomically updates the Spine Manifest once the transition is complete.
+### 13.4. Fixed-Point Iteration and Feedback Bounding
+Future iterations will formalize the **Inter-Instance Feedback** mechanism to support recursive DBSP circuits.
+*   **Stratification:** The compiler will implement stratification logic to detect and manage recursive dependencies in the Reactive Trigger Graph.
+*   **Convergence Monitoring:** For recursive circuits, the engine will implement fixed-point iteration logic, executing the circuit until the output delta $R_\Delta$ reaches zero (algebraic convergence) within a single LSN epoch.
 
-### 13.5. Tiered Storage Compaction Heuristics
-While the current FLSM uses a basic read-amplification trigger, future work will introduce **Tiered Compaction Heuristics** optimized for different workload profiles.
-*   **Write-Heavy Tiers**: Minimizes write stalls by allowing higher overlap depth in the upper levels of the FLSM.
-*   **Read-Optimized Guard Shards**: Prioritizes the consolidation of shards into large, non-overlapping blocks to minimize the number of `mmap` handles and binary search steps required for snapshot generation.
+### 13.5. Metadata as Z-Sets
+System metadata, including the Shard Registry and active subscription lists, will be transitioned to internal **Metadata Z-Sets**.
+*   **Unified Infrastructure:** This allows the system to manage its own state using the same FLSM, WAL, and compaction infrastructure as user data.
+*   **Streaming Metadata:** Changes to the database topology (e.g., new shards, dropped systems) will be propagated via the WAL as LSN-sequenced metadata deltas.
 
-### 13.6. Differential Privacy Integration
-As a reactive engine, GnitzDB is uniquely positioned to implement **Differential Privacy** at the circuit level. By injecting controlled noise into the DBSP aggregation operators, the engine can produce View Logs that satisfy formal privacy guarantees, enabling the synchronization of sensitive datasets to lower-trust client environments without exposing individual-level record data.
+### 13.6. Algebraic Differential Privacy
+GnitzDB is uniquely positioned to implement **Differential Privacy** at the circuit level by manipulating multiset weights.
+*   **Noise Injection:** By injecting controlled noise into the weight summation of DBSP aggregation operators, the engine can produce WAL deltas that satisfy formal privacy guarantees.
+*   **Reactive Privacy:** Privacy-preserving views remain reactive, pushing updated, noisy deltas as the underlying source components change.
+
+### 13.7. Tiered Compaction Heuristics
+The FLSM will be extended with **Tiered Compaction Heuristics** optimized for diverse workload profiles.
+*   **Write-Heavy Tiers:** Minimizes ingestion stalls by allowing higher overlap depth in upper FLSM levels.
+*   **Penta-Partition Guard Shards:** Prioritizes the consolidation of shards into large, non-overlapping Penta-Partition blocks to minimize the number of binary search steps and `mmap` handles required for snapshot resolution.
