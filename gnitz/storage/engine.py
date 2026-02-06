@@ -15,21 +15,18 @@ class Engine(object):
         self.manifest_manager = manifest_manager
         self.registry = registry
         self.component_id = component_id
-        self.current_lsn = current_lsn
+        self.current_lsn = current_lsn # This acts as the LSN for the current MemTable
 
     def get_effective_weight(self, entity_id):
-        # 1. MemTable Lookup (Unified navigation)
         base = self.mem_manager.active_table.arena.base_ptr
         head = self.mem_manager.active_table.head_off
         
         mem_weight = 0
         pred_off = skip_list_find(base, head, entity_id)
         next_off = node_get_next_off(base, pred_off, 0)
-        
         if next_off != 0 and node_get_entity_id(base, next_off) == entity_id:
             mem_weight = node_get_weight(base, next_off)
 
-        # 2. Spine Lookup (Aggregation)
         spine_weight = 0
         results = self.spine.find_all_shards_and_indices(entity_id)
         for shard, row_idx in results:
@@ -38,7 +35,11 @@ class Engine(object):
         return mem_weight + spine_weight
 
     def read_component_i64(self, entity_id, field_idx):
-        # 1. MemTable Lookup (Unified navigation)
+        """
+        Reads component field with Last-Write-Wins (LWW) resolution across
+        the MemTable and all overlapping shards in the Spine.
+        """
+        # 1. Check MemTable (The current MemTable always has the highest LSN)
         base = self.mem_manager.active_table.arena.base_ptr
         head = self.mem_manager.active_table.head_off
         
@@ -50,20 +51,22 @@ class Engine(object):
             f_off = self.layout.get_field_offset(field_idx)
             return rffi.cast(rffi.LONGLONGP, rffi.ptradd(payload_ptr, f_off))[0]
 
-        # 2. Spine Lookup
+        # 2. Check Spine with LSN-based resolution
         results = self.spine.find_all_shards_and_indices(entity_id)
         
-        val = 0
-        # Last-Write-Wins: results are sorted by the Spine naturally if the shards were registered in order
-        if len(results) > 0:
-             for shard, row_idx in results:
-                 val = shard.read_field_i64(row_idx, field_idx)
-        return val
+        max_lsn = -1
+        latest_val = 0
+        
+        for shard, row_idx in results:
+            if shard.lsn > max_lsn:
+                max_lsn = shard.lsn
+                latest_val = shard.read_field_i64(row_idx, field_idx)
+        
+        return latest_val
 
     def flush_and_rotate(self, filename):
         min_eid, max_eid = self.mem_manager.flush_and_rotate(filename)
-        if min_eid == -1:
-            return False
+        if min_eid == -1: return False
         
         if self.registry is not None:
             from gnitz.storage.shard_registry import ShardMetadata
@@ -72,23 +75,18 @@ class Engine(object):
         
         if self.manifest_manager is not None:
             from gnitz.storage.manifest import ManifestEntry
-            existing_entries = []
+            entries = []
             if self.manifest_manager.exists():
                 reader = self.manifest_manager.load_current()
-                for e in reader.iterate_entries(): existing_entries.append(e)
+                for e in reader.iterate_entries(): entries.append(e)
                 reader.close()
-            
-            new_entry = ManifestEntry(self.component_id, filename, min_eid, max_eid, self.current_lsn, self.current_lsn)
-            existing_entries.append(new_entry)
-            self.manifest_manager.publish_new_version(existing_entries)
+            entries.append(ManifestEntry(self.component_id, filename, min_eid, max_eid, self.current_lsn, self.current_lsn))
+            self.manifest_manager.publish_new_version(entries)
         
         self.current_lsn += 1
-        compaction_triggered = False
         if self.registry is not None:
-            if self.registry.mark_for_compaction(self.component_id):
-                compaction_triggered = True
-        
-        return compaction_triggered
+            return self.registry.mark_for_compaction(self.component_id)
+        return False
 
     def close(self):
         self.mem_manager.close()

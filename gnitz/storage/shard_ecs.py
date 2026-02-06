@@ -35,17 +35,17 @@ class ECSShardView(object):
         off_e = rffi.cast(lltype.Signed, header.read_i64(layout.OFF_REG_E_ECS))
         off_c = rffi.cast(lltype.Signed, header.read_i64(layout.OFF_REG_C_ECS))
         off_b = rffi.cast(lltype.Signed, header.read_i64(layout.OFF_REG_B_ECS))
-        off_w = rffi.cast(lltype.Signed, header.read_i64(layout.OFF_REG_W_ECS)) # NEW
+        off_w = rffi.cast(lltype.Signed, header.read_i64(layout.OFF_REG_W_ECS))
 
         self.buf_e = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_e), off_w - off_e)
-        self.buf_w = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_w), off_c - off_w) # NEW
+        self.buf_w = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_w), off_c - off_w)
         self.buf_c = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_c), off_b - off_c)
         self.buf_b = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_b), self.size - off_b)
 
     def get_entity_id(self, index):
         return self.buf_e.read_i64(index * 8)
 
-    def get_weight(self, index): # NEW
+    def get_weight(self, index):
         return self.buf_w.read_i64(index * 8)
 
     @jit.look_inside_iff(lambda self, index: jit.isconstant(self.layout))
@@ -78,7 +78,12 @@ class ECSShardView(object):
         field_off = self.layout.get_field_offset(field_idx)
         struct_ptr = rffi.ptradd(ptr, field_off)
         heap_base_ptr = self.buf_b.ptr
-        return string_logic.string_equals(struct_ptr, heap_base_ptr, search_str)
+        
+        # Precompute metadata for the optimized check
+        search_len = len(search_str)
+        search_prefix = string_logic.compute_prefix(search_str)
+        
+        return string_logic.string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_prefix)
 
     def close(self):
         mmap_posix.munmap_file(self.ptr, self.size)

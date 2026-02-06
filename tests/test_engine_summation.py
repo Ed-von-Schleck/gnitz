@@ -21,42 +21,32 @@ class TestEngineSummation(unittest.TestCase):
         w.finalize(filename)
 
     def test_overlapping_weight_summation(self):
-        """Test that Engine sums weights across multiple overlapping shards."""
-        # Create two shards both having Entity 1 with W=1
         self._create_shard("s1.db", 1, 1, 100)
         self._create_shard("s2.db", 1, 1, 200)
         
-        # Load spine with both shards
-        h1 = spine.ShardHandle("s1.db", self.layout)
-        h2 = spine.ShardHandle("s2.db", self.layout)
+        # Pass LSNs (1 and 2) explicitly
+        h1 = spine.ShardHandle("s1.db", self.layout, 1)
+        h2 = spine.ShardHandle("s2.db", self.layout, 2)
         sp = spine.Spine([h1, h2])
         
         mgr = memtable.MemTableManager(self.layout, 1024)
         db = engine.Engine(mgr, sp)
         
-        # Weight should be 1 + 1 = 2
         self.assertEqual(db.get_effective_weight(1), 2)
-        
-        # Value resolution: Last one wins strategy (assuming s2 is latest)
-        self.assertEqual(db.read_component_i64(1, 0), 200)
+        self.assertEqual(db.read_component_i64(1, 0), 200) # LSN 2 wins
         
         db.close()
 
     def test_memtable_shard_annihilation(self):
-        """Test that MemTable updates annihilate persistent shard records."""
-        # Shard has W=1
         self._create_shard("s1.db", 1, 1, 100)
         
-        h1 = spine.ShardHandle("s1.db", self.layout)
+        h1 = spine.ShardHandle("s1.db", self.layout, 1)
         sp = spine.Spine([h1])
         
         mgr = memtable.MemTableManager(self.layout, 1024)
         db = engine.Engine(mgr, sp)
         
-        # MemTable has W=-1
         db.mem_manager.put(1, -1, 100)
-        
-        # Net weight should be 1 + (-1) = 0
         self.assertEqual(db.get_effective_weight(1), 0)
         
         db.close()
