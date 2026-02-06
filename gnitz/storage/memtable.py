@@ -130,9 +130,19 @@ class MemTable(object):
             node_set_next_off(base, pred_off, i, new_off)
 
     def flush(self, filename):
+        """
+        Flushes the MemTable to disk and returns shard metadata.
+        
+        Returns:
+            Tuple (min_eid, max_eid) - Entity ID range of the flushed shard.
+            Returns (-1, -1) if no entities were written.
+        """
         sw = writer_ecs.ECSShardWriter(self.layout)
         base = self.arena.base_ptr
         blob_base = self.blob_arena.base_ptr
+        
+        min_eid = -1
+        max_eid = -1
         
         curr_off = node_get_next_off(base, self.head_off, 0)
         while curr_off != 0:
@@ -140,10 +150,18 @@ class MemTable(object):
             if w != 0:
                 eid = node_get_entity_id(base, curr_off)
                 payload_ptr = node_get_payload_ptr(base, curr_off)
-                # Pass weight to writer (NEW)
                 sw.add_packed_row(eid, w, payload_ptr, blob_base)
+                
+                # Track min/max entity IDs
+                if min_eid == -1 or eid < min_eid:
+                    min_eid = eid
+                if eid > max_eid:
+                    max_eid = eid
             curr_off = node_get_next_off(base, curr_off, 0)
         sw.finalize(filename)
+        
+        # Return shard metadata
+        return min_eid, max_eid
 
     def free(self):
         self.arena.free()
@@ -159,9 +177,16 @@ class MemTableManager(object):
         self.active_table.upsert(entity_id, weight, field_values)
 
     def flush_and_rotate(self, filename):
-        self.active_table.flush(filename)
+        """
+        Flushes the active table and rotates to a new one.
+        
+        Returns:
+            Tuple (min_eid, max_eid) from the flush operation.
+        """
+        min_eid, max_eid = self.active_table.flush(filename)
         self.active_table.free()
         self.active_table = MemTable(self.layout, self.capacity)
+        return min_eid, max_eid
 
     def close(self):
         if self.active_table:

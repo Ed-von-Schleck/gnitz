@@ -22,47 +22,64 @@ def entry_point(argv):
         if os.path.exists(f): os.unlink(f)
     
     try:
-        # === PHASE 1: Ingestion & Multi-Shard Persistence ===
-        print "[Phase 1] Ingesting and persisting overlapping shards..."
+        # === PHASE 1: Integrated Ingestion & Persistence ===
+        print "[Phase 1] Ingesting with integrated flush..."
         
+        # Setup integrated components
         mgr = memtable.MemTableManager(layout_obj, 1024 * 1024)
-        db = engine.Engine(mgr, spine.Spine([]))
+        m_mgr = manifest.ManifestManager(db_manifest)
+        reg = shard_registry.ShardRegistry()
+        sp = spine.Spine([])
+        
+        # Create Engine with integrated manifest and registry
+        db = engine.Engine(mgr, sp, m_mgr, reg, component_id=1, current_lsn=1)
         
         # Entity 100: First version (Weight +1)
         db.mem_manager.put(100, 1, 10, "version_1")
-        db.mem_manager.flush_and_rotate(shard_a)
+        db.flush_and_rotate(shard_a)  # Uses integrated flush
         
         # Entity 100: Second version (Weight +1, Net weight should become 2)
         # Entity 200: To be deleted (Annihilated)
         db.mem_manager.put(100, 1, 20, "version_2")
         db.mem_manager.put(200, 1, 99, "to_delete")
-        db.mem_manager.flush_and_rotate(shard_b)
+        db.flush_and_rotate(shard_b)  # Uses integrated flush
         
         # Manually create Shard C to annihilate Entity 200
+        # (This is outside the normal flow, so we do it manually)
         shard_c = "shard_c.db"
         test_files.append(shard_c)
         wc = writer_ecs.ECSShardWriter(layout_obj)
         wc._add_entity_weighted(200, -1, 99, "deletion_marker")
         wc.finalize(shard_c)
-
-        # === PHASE 2: Manifest & Registry Setup ===
-        print "[Phase 2] Setting up manifest and identifying read-amplification..."
         
-        m_mgr = manifest.ManifestManager(db_manifest)
-        m_mgr.publish_new_version([
-            manifest.ManifestEntry(1, shard_a, 100, 100, 1, 1),
-            manifest.ManifestEntry(1, shard_b, 100, 200, 2, 2),
-            manifest.ManifestEntry(1, shard_c, 200, 200, 3, 3)
-        ])
-        
-        reg = shard_registry.ShardRegistry()
-        reg.register_shard(shard_registry.ShardMetadata(shard_a, 1, 100, 100, 1, 1))
-        reg.register_shard(shard_registry.ShardMetadata(shard_b, 1, 100, 200, 2, 2))
+        # Manually register shard C (since it was created outside Engine)
         reg.register_shard(shard_registry.ShardMetadata(shard_c, 1, 200, 200, 3, 3))
         
-        # Verify algebraic summation in the Engine before compaction
+        # Manually add to manifest
+        # RPython Fix: Manual loop instead of list(generator)
+        reader = m_mgr.load_current()
+        entries = []
+        for entry in reader.iterate_entries():
+            entries.append(entry)
+        reader.close()
+        
+        entries.append(manifest.ManifestEntry(1, shard_c, 200, 200, 3, 3))
+        m_mgr.publish_new_version(entries)
+
+        # === PHASE 2: Verify Integrated State ===
+        print "[Phase 2] Verifying integrated state..."
+        
+        # Verify manifest was updated automatically
+        reader = m_mgr.load_current()
+        if reader.get_entry_count() != 3: return 1  # Should have 3 entries (A, B, C)
+        reader.close()
+        
+        # Verify registry was updated automatically
+        if len(reg.shards) != 3: return 1  # Should have 3 shards registered
+        
+        # Reload spine from manifest and verify algebraic summation
         sp = spine.Spine.from_manifest(db_manifest, 1, layout_obj)
-        db_engine = engine.Engine(mgr, sp)
+        db_engine = engine.Engine(mgr, sp, m_mgr, reg)
         
         # Entity 100 exists in two shards (1+1=2). Latest value is "version_2"
         if db_engine.get_effective_weight(100) != 2: return 1
@@ -74,7 +91,7 @@ def entry_point(argv):
         # Check read amplification for Entity 100 (Found in Shard A and B)
         if reg.get_read_amplification(1, 100) != 2: return 1
         
-        print "  [OK] Weights and read-amplification verified"
+        print "  [OK] Integrated state verified"
 
         # === PHASE 3: Automated Compaction Execution ===
         print "[Phase 3] Executing automated compaction..."
