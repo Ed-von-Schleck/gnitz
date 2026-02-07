@@ -1,7 +1,7 @@
 """
-gnitz/storage/memtable.py (Step 6: WAL Integration)
+gnitz/storage/memtable.py (Step 7: Recovery Support)
 
-MemTable with WAL-backed durability.
+MemTable with WAL-backed durability and Recovery Support.
 """
 from rpython.rlib.rrandom import Random
 from rpython.rtyper.lltypesystem import rffi, lltype
@@ -140,6 +140,49 @@ class MemTable(object):
             node_set_next_off(base, new_off, i, node_get_next_off(base, p_off, i))
             node_set_next_off(base, p_off, i, new_off)
 
+    def upsert_raw(self, entity_id, weight, raw_data):
+        """
+        Upserts data using raw component bytes (from WAL replay).
+        Does NOT support Blob relocation (Long Strings must be handled carefully).
+        """
+        base = self.arena.base_ptr
+        pred_off = skip_list_find(base, self.head_off, entity_id, self._update_offsets)
+        next_off = node_get_next_off(base, pred_off, 0)
+        
+        stride = self.layout.stride
+        target_ptr = lltype.nullptr(rffi.CCHARP.TO)
+
+        if next_off != 0 and node_get_entity_id(base, next_off) == entity_id:
+            # Update existing
+            node_set_weight(base, next_off, node_get_weight(base, next_off) + weight)
+            target_ptr = node_get_payload_ptr(base, next_off)
+        else:
+            # Create new
+            h = 1
+            while h < MAX_HEIGHT and (self.rng.genrand32() & 1):
+                h += 1
+            
+            node_sz = self.node_base_size + (h * 4)
+            new_ptr = self.arena.alloc(node_sz)
+            new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
+            
+            node_set_weight(base, new_off, weight)
+            new_ptr[8] = chr(h)
+            
+            eid_ptr = rffi.ptradd(new_ptr, 12 + (h * 4))
+            rffi.cast(rffi.LONGLONGP, eid_ptr)[0] = rffi.cast(rffi.LONGLONG, entity_id)
+            target_ptr = rffi.ptradd(eid_ptr, 8)
+
+            for i in range(h):
+                p_off = self._update_offsets[i]
+                node_set_next_off(base, new_off, i, node_get_next_off(base, p_off, i))
+                node_set_next_off(base, p_off, i, new_off)
+        
+        # Copy raw bytes
+        if len(raw_data) <= stride:
+            for i in range(len(raw_data)):
+                target_ptr[i] = raw_data[i]
+
     def flush(self, filename):
         sw = writer_ecs.ECSShardWriter(self.layout)
         base = self.arena.base_ptr
@@ -169,15 +212,6 @@ class MemTable(object):
 
 class MemTableManager(object):
     def __init__(self, layout, capacity, wal_writer=None, component_id=1):
-        """
-        Initializes MemTable with optional WAL integration.
-        
-        Args:
-            layout: ComponentLayout
-            capacity: Arena size in bytes
-            wal_writer: Optional WALWriter for durability
-            component_id: Component type ID for WAL blocks
-        """
         self.layout = layout
         self.capacity = capacity
         self.active_table = MemTable(self.layout, self.capacity)
@@ -186,7 +220,6 @@ class MemTableManager(object):
         self.current_lsn = 1
 
     def _pack_component_for_wal(self, field_values):
-        """Packs field values for WAL (inline strings only)."""
         stride = self.layout.stride
         buf = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
         try:
@@ -215,13 +248,6 @@ class MemTableManager(object):
             lltype.free(buf, flavor='raw')
 
     def put(self, entity_id, weight, *field_values):
-        """
-        Inserts data with WAL-backed durability.
-        
-        CRITICAL: WAL is written BEFORE MemTable update.
-        This ensures crash safety: if the system crashes after WAL write
-        but before MemTable flush, recovery can replay the WAL.
-        """
         # 1. Write to WAL FIRST (durability)
         if self.wal_writer is not None:
             component_data = self._pack_component_for_wal(field_values)
@@ -235,6 +261,16 @@ class MemTableManager(object):
         
         # 3. Update memory (after WAL)
         self.active_table.upsert(entity_id, weight, field_values)
+
+    def put_from_recovery(self, entity_id, weight, raw_component_data):
+        """
+        Inserts data during recovery (bypasses WAL).
+        """
+        # Capacity check
+        if self.active_table.arena.offset > self.active_table.threshold_bytes:
+            raise errors.MemTableFullError()
+            
+        self.active_table.upsert_raw(entity_id, weight, raw_component_data)
 
     def flush_and_rotate(self, filename):
         min_eid, max_eid = self.active_table.flush(filename)

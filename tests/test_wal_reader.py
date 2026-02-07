@@ -56,10 +56,10 @@ class TestWALReader(unittest.TestCase):
         
         # Read from it
         reader = wal.WALReader(self.test_wal, self.layout)
-        result = reader.read_next_block()
+        is_valid, _, _, _ = reader.read_next_block()
         
-        # Should get None (EOF)
-        self.assertIsNone(result)
+        # Should get False (EOF)
+        self.assertFalse(is_valid)
         reader.close()
     
     def test_read_single_block(self):
@@ -68,11 +68,10 @@ class TestWALReader(unittest.TestCase):
         
         # Read it back
         reader = wal.WALReader(self.test_wal, self.layout)
-        result = reader.read_next_block()
+        is_valid, lsn, component_id, records = reader.read_next_block()
         
         # Should get the block
-        self.assertIsNotNone(result)
-        lsn, component_id, records = result
+        self.assertTrue(is_valid)
         
         self.assertEqual(lsn, 1)
         self.assertEqual(component_id, 1)
@@ -81,8 +80,8 @@ class TestWALReader(unittest.TestCase):
         self.assertEqual(records[0][1], 1)   # weight
         
         # Next read should be EOF
-        result = reader.read_next_block()
-        self.assertIsNone(result)
+        is_valid, _, _, _ = reader.read_next_block()
+        self.assertFalse(is_valid)
         
         reader.close()
     
@@ -93,23 +92,26 @@ class TestWALReader(unittest.TestCase):
         reader = wal.WALReader(self.test_wal, self.layout)
         
         # Read block 1
-        lsn1, comp_id1, records1 = reader.read_next_block()
+        is_valid1, lsn1, comp_id1, records1 = reader.read_next_block()
+        self.assertTrue(is_valid1)
         self.assertEqual(lsn1, 1)
         self.assertEqual(records1[0][0], 100) # entity_id
         
         # Read block 2
-        lsn2, comp_id2, records2 = reader.read_next_block()
+        is_valid2, lsn2, comp_id2, records2 = reader.read_next_block()
+        self.assertTrue(is_valid2)
         self.assertEqual(lsn2, 2)
         self.assertEqual(records2[0][0], 200) # entity_id
         
         # Read block 3
-        lsn3, comp_id3, records3 = reader.read_next_block()
+        is_valid3, lsn3, comp_id3, records3 = reader.read_next_block()
+        self.assertTrue(is_valid3)
         self.assertEqual(lsn3, 3)
         self.assertEqual(records3[0][0], 300) # entity_id
         
         # EOF
-        result = reader.read_next_block()
-        self.assertIsNone(result)
+        is_valid_eof, _, _, _ = reader.read_next_block()
+        self.assertFalse(is_valid_eof)
         
         reader.close()
     
@@ -130,10 +132,9 @@ class TestWALReader(unittest.TestCase):
         read_lsns = []
         
         while True:
-            result = reader.read_next_block()
-            if result is None:
+            is_valid, lsn, _, _ = reader.read_next_block()
+            if not is_valid:
                 break
-            lsn, _, _ = result
             read_lsns.append(lsn)
         
         self.assertEqual(read_lsns, lsn_sequence)
@@ -146,7 +147,10 @@ class TestWALReader(unittest.TestCase):
         # Read all blocks - should not raise
         reader = wal.WALReader(self.test_wal, self.layout)
         count = 0
-        while reader.read_next_block() is not None:
+        while True:
+            is_valid, _, _, _ = reader.read_next_block()
+            if not is_valid:
+                break
             count += 1
         
         self.assertEqual(count, 5)
@@ -221,6 +225,7 @@ class TestWALReader(unittest.TestCase):
         reader = wal.WALReader(self.test_wal, self.layout)
         
         # Collect all blocks via generator
+        # The generator handles the is_valid logic internally, yielding 3-tuples
         blocks = []
         for lsn, component_id, records in reader.iterate_blocks():
             blocks.append((lsn, component_id, records))
@@ -275,18 +280,21 @@ class TestWALReader(unittest.TestCase):
         reader = wal.WALReader(self.test_wal, self.layout)
         
         # Block 1: 1 record
-        lsn1, _, records1 = reader.read_next_block()
+        is_valid1, lsn1, _, records1 = reader.read_next_block()
+        self.assertTrue(is_valid1)
         self.assertEqual(lsn1, 1)
         self.assertEqual(len(records1), 1)
         
         # Block 2: 3 records
-        lsn2, _, records2 = reader.read_next_block()
+        is_valid2, lsn2, _, records2 = reader.read_next_block()
+        self.assertTrue(is_valid2)
         self.assertEqual(lsn2, 2)
         self.assertEqual(len(records2), 3)
         self.assertEqual(records2[1][1], -1)  # Verify negative weight
         
         # Block 3: 5 records
-        lsn3, _, records3 = reader.read_next_block()
+        is_valid3, lsn3, _, records3 = reader.read_next_block()
+        self.assertTrue(is_valid3)
         self.assertEqual(lsn3, 3)
         self.assertEqual(len(records3), 5)
         
@@ -306,7 +314,8 @@ class TestWALReader(unittest.TestCase):
         
         # Read back and verify component data
         reader = wal.WALReader(self.test_wal, self.layout)
-        lsn, comp_id, records = reader.read_next_block()
+        is_valid, lsn, comp_id, records = reader.read_next_block()
+        self.assertTrue(is_valid)
         
         # Extract component data
         rec = records[0]
@@ -329,17 +338,18 @@ class TestWALReader(unittest.TestCase):
         
         reader.close()
     
-    def test_read_after_close_returns_none(self):
-        """Test that reading after close returns None."""
+    def test_read_after_close_returns_eof(self):
+        """Test that reading after close returns False (EOF)."""
         self._write_test_wal(1)
         
         reader = wal.WALReader(self.test_wal, self.layout)
         reader.close()
         
-        # Should return None (not raise)
-        result = reader.read_next_block()
-        self.assertIsNone(result)
+        # Should return (False, 0, 0, [])
+        is_valid, _, _, _ = reader.read_next_block()
+        self.assertFalse(is_valid)
 
 
 if __name__ == '__main__':
     unittest.main()
+

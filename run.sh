@@ -9,5 +9,7 @@ export PYTHONPATH=.:$PYPY_PATH
 pypy2 -m unittest discover tests
 
 # 3. Run RPython Translation Check (Types)
-#echo "Running RPython Translation Check..."
-#pypy2 $PYPY_PATH/rpython/bin/rpython --opt=0 --no-compile translate_test.py
+echo "Running RPython Translation Check..."
+pypy2 $PYPY_PATH/rpython/bin/rpython --opt=0 --no-compile translate_test.py
+pypy2 $PYPY_PATH/rpython/bin/rpython --opt=2 translate_test.py
+./translate_test-c

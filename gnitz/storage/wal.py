@@ -8,7 +8,6 @@ from rpython.rlib import rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import wal_format, mmap_posix, errors
 
-
 class WALReader(object):
     """
     Sequential reader for Write-Ahead Log blocks.
@@ -38,13 +37,15 @@ class WALReader(object):
         raises CorruptShardError to signal data corruption.
         
         Returns:
-            Tuple of (lsn, component_id, records) or None if EOF reached
+            Tuple of (is_valid, lsn, component_id, records).
+            is_valid is False if EOF reached.
+            records is a list of tuples (entity_id, weight, component_data).
         
         Raises:
             CorruptShardError: If checksum validation fails or block is malformed
         """
         if self.closed:
-            return None
+            return (False, 0, 0, [])
         
         # Read header first to determine block size
         header_buf = lltype.malloc(rffi.CCHARP.TO, wal_format.WAL_BLOCK_HEADER_SIZE, flavor='raw')
@@ -54,7 +55,7 @@ class WALReader(object):
             
             # Check for EOF
             if len(header_read) == 0:
-                return None
+                return (False, 0, 0, [])
             
             # Partial header is corruption
             if len(header_read) < wal_format.WAL_BLOCK_HEADER_SIZE:
@@ -90,7 +91,7 @@ class WALReader(object):
         # Decode and validate (decode_wal_block validates checksum internally)
         lsn, component_id, records = wal_format.decode_wal_block(complete_block, self.layout)
         
-        return lsn, component_id, records
+        return (True, lsn, component_id, records)
     
     def iterate_blocks(self):
         """
@@ -103,10 +104,13 @@ class WALReader(object):
             CorruptShardError: If any block fails checksum validation
         """
         while True:
-            result = self.read_next_block()
-            if result is None:
+            # Unpack the valid flag and data
+            is_valid, lsn, component_id, records = self.read_next_block()
+            
+            if not is_valid:
                 break
-            yield result
+                
+            yield (lsn, component_id, records)
     
     def close(self):
         """Closes the WAL file."""
@@ -206,3 +210,4 @@ class WALWriter(object):
         rposix.close(self.fd)
         self.fd = -1
         self.closed = True
+

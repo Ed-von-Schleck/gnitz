@@ -28,22 +28,14 @@ OFF_RESERVED = 24
 # ============================================================================
 # WAL Record Representation
 # ============================================================================
-# Records are represented as tuples: (entity_id, weight, component_data)
-# This avoids Python object allocation in hot loops (GC-efficient).
 
 def WALRecord(entity_id, weight, component_data):
     """
     Creates a WAL record tuple.
-    
-    This is a function, not a class. It returns a tuple to avoid
-    Python object allocation overhead in hot paths while maintaining
-    backward compatibility with existing calling conventions.
-    
     Args:
         entity_id: 64-bit Entity ID
         weight: 64-bit signed weight (algebraic Z-Set weight)
         component_data: Raw byte string containing packed component payload
-    
     Returns:
         Tuple of (entity_id, weight, component_data)
     """
@@ -53,15 +45,6 @@ def WALRecord(entity_id, weight, component_data):
 def encode_wal_block(lsn, component_id, records, layout):
     """
     Encodes a Z-Set batch into a binary WAL block.
-    
-    Args:
-        lsn: Log Sequence Number (u64)
-        component_id: Component type ID (u32)
-        records: List of record tuples (entity_id, weight, component_data)
-        layout: ComponentLayout for stride calculation
-    
-    Returns:
-        Python string containing the complete encoded block (header + body)
     """
     entry_count = len(records)
     stride = layout.stride
@@ -75,7 +58,6 @@ def encode_wal_block(lsn, component_id, records, layout):
     try:
         # Encode each record into the body
         for i in range(entry_count):
-            # Records are always tuples: (entity_id, weight, component_data)
             entity_id, weight, component_data = records[i]
             record_offset = i * record_size
             
@@ -132,17 +114,6 @@ def encode_wal_block(lsn, component_id, records, layout):
 def decode_wal_block(raw_bytes, layout):
     """
     Decodes a binary WAL block into its components.
-    
-    Args:
-        raw_bytes: Python string containing the complete block
-        layout: ComponentLayout for stride calculation
-    
-    Returns:
-        Tuple of (lsn, component_id, records) where records is a list of tuples
-        Each record tuple is (entity_id, weight, component_data)
-    
-    Raises:
-        CorruptShardError: If checksum validation fails or format is invalid
     """
     if len(raw_bytes) < WAL_BLOCK_HEADER_SIZE:
         raise errors.CorruptShardError("WAL block too short for header")
@@ -167,17 +138,30 @@ def decode_wal_block(raw_bytes, layout):
     finally:
         lltype.free(header_buf, flavor='raw')
     
+    # Validate Entry Count to ensure non-negative body size (Annotator safety)
+    if entry_count < 0:
+        raise errors.CorruptShardError("Invalid negative entry count in WAL block")
+    
     # Calculate expected body size
     stride = layout.stride
     record_size = 8 + 8 + stride
     body_size = entry_count * record_size
     
+    # Further validation (though entry_count >= 0 and stride > 0 implies body_size >= 0)
+    if body_size < 0:
+         raise errors.CorruptShardError("Invalid body size calculation")
+
     if len(raw_bytes) < WAL_BLOCK_HEADER_SIZE + body_size:
         raise errors.CorruptShardError("WAL block body truncated")
     
     # Extract body
     body_start = WAL_BLOCK_HEADER_SIZE
     body_end = body_start + body_size
+    
+    # RPython Annotator check: Ensure body_end is strictly non-negative
+    if body_end < 0:
+        raise errors.CorruptShardError("Invalid block dimensions")
+
     body_bytes = raw_bytes[body_start:body_end]
     
     # Validate checksum
