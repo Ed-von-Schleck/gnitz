@@ -24,6 +24,9 @@ OFF_MAX_LSN = 32
 OFF_FILENAME = 40
 FILENAME_MAX_LEN = 128
 
+OFF_ENTRY_COUNT = 16
+OFF_GLOBAL_MAX_LSN = 24  # Use reserved bytes 24-31 (Item 6)
+
 class ManifestEntry(object):
     """
     Represents a single shard reference in the manifest.
@@ -36,7 +39,7 @@ class ManifestEntry(object):
         self.min_lsn = min_lsn
         self.max_lsn = max_lsn
 
-def _write_manifest_header(fd, entry_count):
+def _write_manifest_header(fd, entry_count, global_max_lsn=0):
     """
     Writes the manifest header to a file descriptor.
     
@@ -58,6 +61,9 @@ def _write_manifest_header(fd, entry_count):
         
         # Write entry count
         rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, OFF_ENTRY_COUNT))[0] = rffi.cast(rffi.LONGLONG, entry_count)
+            
+        # Store global max LSN (Item 6)
+        rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, OFF_GLOBAL_MAX_LSN))[0] = rffi.cast(rffi.LONGLONG, global_max_lsn)
         
         # Write to file
         header_str = rffi.charpsize2str(header, HEADER_SIZE)
@@ -102,7 +108,10 @@ def _read_manifest_header(fd):
         # Read entry count
         entry_count = rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, OFF_ENTRY_COUNT))[0])
         
-        return version, entry_count
+        # Read global max LSN (Item 6)
+        global_max_lsn = rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, rffi.ptradd(header, OFF_GLOBAL_MAX_LSN))[0])
+        
+        return version, entry_count, global_max_lsn
     finally:
         lltype.free(header, flavor='raw')
 
@@ -211,9 +220,10 @@ class ManifestWriter(object):
     High-level interface for creating manifest files.
     Accumulates entries and writes them atomically on finalize.
     """
-    def __init__(self, filename):
+    def __init__(self, filename, global_max_lsn=0):
         self.filename = filename
         self.entries = []
+        self.global_max_lsn = global_max_lsn
         self.finalized = False
     
     def add_entry(self, component_id, shard_filename, min_eid, max_eid, min_lsn, max_lsn):
@@ -245,7 +255,7 @@ class ManifestWriter(object):
         fd = rposix.open(self.filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
             # Write header with entry count
-            _write_manifest_header(fd, len(self.entries))
+            _write_manifest_header(fd, len(self.entries), self.global_max_lsn)
             
             # Write all entries
             for entry in self.entries:
@@ -269,7 +279,7 @@ class ManifestReader(object):
         
         # Open and read header
         self.fd = rposix.open(filename, os.O_RDONLY, 0)
-        self.version, self.entry_count = _read_manifest_header(self.fd)
+        self.version, self.entry_count, self.global_max_lsn = _read_manifest_header(self.fd)
     
     def get_entry_count(self):
         """Returns the total number of entries in the manifest."""
@@ -355,7 +365,7 @@ class ManifestManager(object):
         """
         return ManifestReader(self.manifest_path)
     
-    def publish_new_version(self, entries):
+    def publish_new_version(self, entries, global_max_lsn=0):
         """
         Atomically publishes a new version of the manifest.
         
@@ -366,7 +376,7 @@ class ManifestManager(object):
             entries: List of ManifestEntry objects
         """
         # Write to temporary file
-        writer = ManifestWriter(self.temp_path)
+        writer = ManifestWriter(self.temp_path, global_max_lsn)
         for entry in entries:
             writer.add_entry(
                 entry.component_id,

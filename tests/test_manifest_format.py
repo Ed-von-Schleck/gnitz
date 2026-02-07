@@ -23,7 +23,7 @@ class TestManifestFormat(unittest.TestCase):
         # Read header back
         fd = rposix.open(self.test_file, os.O_RDONLY, 0)
         try:
-            version, entry_count = manifest._read_manifest_header(fd)
+            version, entry_count, max_lsn = manifest._read_manifest_header(fd)
             self.assertEqual(version, manifest.VERSION)
             self.assertEqual(entry_count, 42)
         finally:
@@ -120,7 +120,7 @@ class TestManifestFormat(unittest.TestCase):
         # Read back
         fd = rposix.open(self.test_file, os.O_RDONLY, 0)
         try:
-            version, entry_count = manifest._read_manifest_header(fd)
+            version, entry_count, max_lsn = manifest._read_manifest_header(fd)
             self.assertEqual(entry_count, 0)
             
             # Try to read entry - should get None (EOF)

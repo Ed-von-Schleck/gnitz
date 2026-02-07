@@ -9,6 +9,8 @@ from rpython.rlib.rarithmetic import r_uint64
 from gnitz.storage import errors
 from gnitz.core import checksum, strings as string_logic, types
 
+MAX_WAL_BLOCK_SIZE = 32 * 1024 * 1024 
+
 # WAL Block Header Layout (32 bytes)
 # [00-07] LSN (u64)
 # [08-11] Component ID (u32)
@@ -150,6 +152,9 @@ def decode_wal_block(raw_bytes, layout):
     # Further validation (though entry_count >= 0 and stride > 0 implies body_size >= 0)
     if body_size < 0:
          raise errors.CorruptShardError("Invalid body size calculation")
+         
+    if body_size > MAX_WAL_BLOCK_SIZE:
+        raise errors.CorruptShardError("WAL block exceeds safety limit")
 
     if len(raw_bytes) < WAL_BLOCK_HEADER_SIZE + body_size:
         raise errors.CorruptShardError("WAL block body truncated")

@@ -192,6 +192,29 @@ class WALWriter(object):
         result = mmap_posix.fsync_c(self.fd)
         if rffi.cast(lltype.Signed, result) != 0:
             raise errors.StorageError()
+            
+    def truncate_before_lsn(self, target_lsn):
+        """
+        Removes all WAL blocks older than target_lsn.
+        Rewrites the log to a temporary file and renames.
+        """
+        temp_filename = self.filename + ".trunc"
+        new_writer = WALWriter(temp_filename, self.layout)
+        
+        reader = WALReader(self.filename, self.layout)
+        try:
+            for lsn, comp_id, records in reader.iterate_blocks():
+                if lsn >= target_lsn:
+                    new_writer.append_block(lsn, comp_id, records)
+        finally:
+            reader.close()
+            new_writer.close()
+        
+        # Atomically replace old log
+        os.rename(temp_filename, self.filename)
+        # Re-open the file descriptor for the current writer
+        rposix.close(self.fd)
+        self.fd = rposix.open(self.filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     
     def close(self):
         """

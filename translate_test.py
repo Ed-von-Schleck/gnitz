@@ -37,7 +37,7 @@ def entry_point(argv):
         reg = shard_registry.ShardRegistry()
         sp = spine.Spine([], rc)
         
-        db = engine.Engine(mgr, sp, m_mgr, reg, component_id=1, current_lsn=1)
+        db = engine.Engine(mgr, sp, m_mgr, reg, component_id=1)
         
         # Entity 100: First version (Weight +1)
         db.mem_manager.put(100, 1, 10, "version_1")

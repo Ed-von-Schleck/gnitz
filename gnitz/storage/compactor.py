@@ -3,6 +3,7 @@ gnitz/storage/compactor.py
 """
 import os
 from gnitz.storage import shard_ecs, writer_ecs, tournament_tree, compaction_logic
+from gnitz.storage.manifest import ManifestEntry
 
 def compact_shards(input_files, input_lsns, output_file, layout):
     """
@@ -112,6 +113,9 @@ def execute_compaction(component_id, policy, manifest_manager, ref_counter, layo
     current_reader = manifest_manager.load_current()
     new_entries = []
     
+    # Track the global max from the existing manifest header
+    global_max = current_reader.global_max_lsn
+    
     # Keep entries for other components, skip the ones we just compacted
     for entry in current_reader.iterate_entries():
         is_compacted = False
@@ -123,14 +127,17 @@ def execute_compaction(component_id, policy, manifest_manager, ref_counter, layo
         if not is_compacted:
             new_entries.append(entry)
     current_reader.close()
+    
+    if max_lsn > global_max:
+        global_max = max_lsn
 
     # Add the newly created shard to the manifest
     # We re-verify the eid range from the file if needed, but here we trust the aggregate
-    from gnitz.storage.manifest import ManifestEntry
+
     new_entries.append(ManifestEntry(component_id, new_filename, min_eid, max_eid, min_lsn, max_lsn))
 
     # 5. Atomic Manifest Update
-    manifest_manager.publish_new_version(new_entries)
+    manifest_manager.publish_new_version(new_entries, global_max)
 
     # 6. Lifecycle Management
     # Update Registry and mark old files for deletion

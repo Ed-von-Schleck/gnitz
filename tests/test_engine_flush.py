@@ -60,7 +60,7 @@ class TestEngineFlush(unittest.TestCase):
         m_mgr = manifest.ManifestManager(self.manifest_fn)
         reg = shard_registry.ShardRegistry()
         
-        db = engine.Engine(mgr, sp, m_mgr, reg, component_id=1, current_lsn=1)
+        db = engine.Engine(mgr, sp, m_mgr, reg, component_id=1)
         
         # Add entities
         db.mem_manager.put(100, 1, 42, "first")
@@ -128,7 +128,7 @@ class TestEngineFlush(unittest.TestCase):
         sp = spine.Spine([])
         m_mgr = manifest.ManifestManager(self.manifest_fn)
         
-        db = engine.Engine(mgr, sp, m_mgr, current_lsn=1)
+        db = engine.Engine(mgr, sp, m_mgr, reg, component_id=1)
         
         # First flush
         db.mem_manager.put(100, 1, 10, "first")
