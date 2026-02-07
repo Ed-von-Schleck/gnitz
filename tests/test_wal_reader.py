@@ -77,8 +77,8 @@ class TestWALReader(unittest.TestCase):
         self.assertEqual(lsn, 1)
         self.assertEqual(component_id, 1)
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0].entity_id, 100)
-        self.assertEqual(records[0].weight, 1)
+        self.assertEqual(records[0][0], 100) # entity_id
+        self.assertEqual(records[0][1], 1)   # weight
         
         # Next read should be EOF
         result = reader.read_next_block()
@@ -95,17 +95,17 @@ class TestWALReader(unittest.TestCase):
         # Read block 1
         lsn1, comp_id1, records1 = reader.read_next_block()
         self.assertEqual(lsn1, 1)
-        self.assertEqual(records1[0].entity_id, 100)
+        self.assertEqual(records1[0][0], 100) # entity_id
         
         # Read block 2
         lsn2, comp_id2, records2 = reader.read_next_block()
         self.assertEqual(lsn2, 2)
-        self.assertEqual(records2[0].entity_id, 200)
+        self.assertEqual(records2[0][0], 200) # entity_id
         
         # Read block 3
         lsn3, comp_id3, records3 = reader.read_next_block()
         self.assertEqual(lsn3, 3)
-        self.assertEqual(records3[0].entity_id, 300)
+        self.assertEqual(records3[0][0], 300) # entity_id
         
         # EOF
         result = reader.read_next_block()
@@ -283,7 +283,7 @@ class TestWALReader(unittest.TestCase):
         lsn2, _, records2 = reader.read_next_block()
         self.assertEqual(lsn2, 2)
         self.assertEqual(len(records2), 3)
-        self.assertEqual(records2[1].weight, -1)  # Verify negative weight
+        self.assertEqual(records2[1][1], -1)  # Verify negative weight
         
         # Block 3: 5 records
         lsn3, _, records3 = reader.read_next_block()
@@ -312,8 +312,9 @@ class TestWALReader(unittest.TestCase):
         rec = records[0]
         buf = lltype.malloc(rffi.CCHARP.TO, self.layout.stride, flavor='raw')
         try:
+            # rec[2] is component_data
             for i in range(self.layout.stride):
-                buf[i] = rec.component_data[i]
+                buf[i] = rec[2][i]
             
             # Read value
             value = rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, buf)[0])

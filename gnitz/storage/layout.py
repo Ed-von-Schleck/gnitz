@@ -1,24 +1,33 @@
 """
 gnitz/storage/layout.py
 
-Physical layout constants for ECS shard files.
+Physical layout constants for ECS shards.
 """
 
-# File format identification
-MAGIC_NUMBER = 0x31305F5A54494E47  # "GNITZ_01" in ASCII
-
-# Alignment and sizing
+MAGIC_NUMBER = 0x31305F5A54494E47
 ALIGNMENT = 64
 HEADER_SIZE = 64
 
-# Header field offsets (all fields are 8 bytes / u64)
-OFF_MAGIC       = 0   # Magic number for format validation
-OFF_COUNT       = 8   # Number of entities in shard
-OFF_CHECKSUM_E  = 16  # Checksum for Region E (Entity IDs)
-OFF_CHECKSUM_W  = 24  # Checksum for Region W (Weights)
+# ECS Shard Header Offsets (64-byte header)
+OFF_MAGIC = 0        # u64: Magic number
+OFF_COUNT = 8        # u64: Entity count
 
-# Region pointer offsets (point to start of each region)
-OFF_REG_E_ECS   = 32  # Region E: Entity IDs (u64 array)
-OFF_REG_C_ECS   = 40  # Region C: Component Data (fixed-stride array)
-OFF_REG_B_ECS   = 48  # Region B: Blob Heap (variable-length data)
-OFF_REG_W_ECS   = 56  # Region W: Weights (i64 array)
+# Checksums (DJB2 algorithm)
+OFF_CHECKSUM_E = 16  # u64: Checksum of Region E (Entity IDs)
+OFF_CHECKSUM_W = 24  # u64: Checksum of Region W (Weights)
+
+# Region pointers
+OFF_REG_E_ECS = 32   # u64: Offset to Region E (Entity IDs)
+OFF_REG_C_ECS = 40   # u64: Offset to Region C (Component Data)
+OFF_REG_B_ECS = 48   # u64: Offset to Region B (Blob Heap)
+OFF_REG_W_ECS = 56   # u64: Offset to Region W (Weights)
+
+# Legacy offsets (for backward compatibility, deprecated)
+OFF_REG_W = 16
+OFF_REG_O = 24
+OFF_REG_K = 32
+OFF_REG_V = 40
+OFF_PADDING = 48
+
+STRIDE_W = 8
+STRIDE_O = 8

@@ -88,17 +88,18 @@ class TestWALFormat(unittest.TestCase):
         self.assertEqual(component_id, 3)
         self.assertEqual(len(decoded_records), 1)
         
-        # Verify record
+        # Verify record - Accessed as TUPLE
         rec = decoded_records[0]
-        self.assertEqual(rec.entity_id, 50)
-        self.assertEqual(rec.weight, -1)
-        self.assertEqual(len(rec.component_data), self.layout.stride)
+        self.assertEqual(rec[0], 50)  # entity_id
+        self.assertEqual(rec[1], -1)  # weight
+        self.assertEqual(len(rec[2]), self.layout.stride) # component_data
         
         # Verify component data (extract value)
         buf = lltype.malloc(rffi.CCHARP.TO, self.layout.stride, flavor='raw')
         try:
+            # rec[2] is component_data
             for i in range(self.layout.stride):
-                buf[i] = rec.component_data[i]
+                buf[i] = rec[2][i]
             
             value = rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, buf)[0])
             self.assertEqual(value, 999)
@@ -126,8 +127,8 @@ class TestWALFormat(unittest.TestCase):
         # Verify all records
         for i in range(10):
             rec = decoded_records[i]
-            self.assertEqual(rec.entity_id, 1000 + i)
-            self.assertEqual(rec.weight, 1 if i % 2 == 0 else -1)
+            self.assertEqual(rec[0], 1000 + i) # entity_id
+            self.assertEqual(rec[1], 1 if i % 2 == 0 else -1) # weight
     
     def test_checksum_validation_pass(self):
         """Test that valid blocks pass checksum validation."""
@@ -185,7 +186,7 @@ class TestWALFormat(unittest.TestCase):
         block = wal_format.encode_wal_block(100, 1, records, self.layout)
         lsn, component_id, decoded_records = wal_format.decode_wal_block(block, self.layout)
         
-        self.assertEqual(decoded_records[0].weight, -5)
+        self.assertEqual(decoded_records[0][1], -5) # weight
     
     def test_zero_weight(self):
         """Test encoding/decoding zero weights (ghost records)."""
@@ -195,7 +196,7 @@ class TestWALFormat(unittest.TestCase):
         block = wal_format.encode_wal_block(100, 1, records, self.layout)
         lsn, component_id, decoded_records = wal_format.decode_wal_block(block, self.layout)
         
-        self.assertEqual(decoded_records[0].weight, 0)
+        self.assertEqual(decoded_records[0][1], 0) # weight
     
     def test_large_lsn(self):
         """Test encoding/decoding large LSN values."""
@@ -223,7 +224,7 @@ class TestWALFormat(unittest.TestCase):
         lsn, component_id, decoded_records = wal_format.decode_wal_block(block, self.layout)
         
         self.assertEqual(len(decoded_records), 1)
-        self.assertEqual(decoded_records[0].entity_id, 200)
+        self.assertEqual(decoded_records[0][0], 200) # entity_id
 
 if __name__ == '__main__':
     unittest.main()

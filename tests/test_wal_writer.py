@@ -160,7 +160,7 @@ class TestWALWriter(unittest.TestCase):
         self.assertEqual(lsn1, 1)
         self.assertEqual(comp_id1, 1)
         self.assertEqual(len(records1), 1)
-        self.assertEqual(records1[0].entity_id, 10)
+        self.assertEqual(records1[0][0], 10) # entity_id
         
         # Decode second block
         block2_data = data[block_size:block_size * 2]
@@ -169,7 +169,7 @@ class TestWALWriter(unittest.TestCase):
         self.assertEqual(lsn2, 2)
         self.assertEqual(comp_id2, 2)
         self.assertEqual(len(records2), 1)
-        self.assertEqual(records2[0].entity_id, 20)
+        self.assertEqual(records2[0][0], 20) # entity_id
     
     def test_checksums_written_correctly(self):
         """Test that checksums in written blocks are valid."""

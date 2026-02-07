@@ -1,3 +1,9 @@
+"""
+gnitz/storage/errors.py
+
+Exception hierarchy for GnitzDB storage subsystem.
+"""
+
 class GnitzError(Exception):
     """Base class for all GnitzDB exceptions."""
     pass
@@ -17,7 +23,7 @@ class BoundsError(StorageError):
 class LayoutError(StorageError):
     """Raised when data violates physical alignment rules."""
     pass
-    
+
 class MemTableFullError(StorageError):
-    """Raised when the MemTable's Arena capacity is exceeded."""
+    """Raised when MemTable arena is exhausted."""
     pass

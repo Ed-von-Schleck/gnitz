@@ -51,9 +51,17 @@ class TestShardChecksums(unittest.TestCase):
         writer.finalize(self.fn)
         
         with open(self.fn, 'r+b') as f:
-            f.seek(layout.HEADER_SIZE)
+            # Read Region E offset from Header
+            f.seek(layout.OFF_REG_E_ECS)
+            off_e_bytes = f.read(8)
+            off_e = 0
+            for i in range(8):
+                off_e |= ord(off_e_bytes[i]) << (i * 8)
+
+            # Corrupt first byte of Region E
+            f.seek(off_e)
             byte_val = ord(f.read(1))
-            f.seek(layout.HEADER_SIZE)
+            f.seek(off_e)
             f.write(chr(byte_val ^ 0xFF))
         
         with self.assertRaises(errors.CorruptShardError):
@@ -65,15 +73,14 @@ class TestShardChecksums(unittest.TestCase):
         writer.finalize(self.fn)
         
         with open(self.fn, 'r+b') as f:
-            f.seek(0, 2)
-            file_size = f.tell()
+            # Read Region W offset from Header
+            f.seek(layout.OFF_REG_W_ECS)
+            off_w_bytes = f.read(8)
+            off_w = 0
+            for i in range(8):
+                off_w |= ord(off_w_bytes[i]) << (i * 8)
             
-            f.seek(layout.HEADER_SIZE)
-            off_e = layout.HEADER_SIZE
-            
-            size_e = 8
-            off_w = (off_e + size_e + 63) & ~63
-            
+            # Corrupt first byte of Region W
             f.seek(off_w)
             byte_val = ord(f.read(1))
             f.seek(off_w)
@@ -88,9 +95,16 @@ class TestShardChecksums(unittest.TestCase):
         writer.finalize(self.fn)
         
         with open(self.fn, 'r+b') as f:
-            f.seek(layout.HEADER_SIZE)
+            # Read Region E offset from Header
+            f.seek(layout.OFF_REG_E_ECS)
+            off_e_bytes = f.read(8)
+            off_e = 0
+            for i in range(8):
+                off_e |= ord(off_e_bytes[i]) << (i * 8)
+
+            f.seek(off_e)
             byte_val = ord(f.read(1))
-            f.seek(layout.HEADER_SIZE)
+            f.seek(off_e)
             f.write(chr(byte_val ^ 0xFF))
         
         view = shard_ecs.ECSShardView(self.fn, self.layout, validate_checksums=False)

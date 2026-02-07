@@ -1,18 +1,19 @@
 """
-gnitz/storage/memtable.py
+gnitz/storage/memtable.py (Step 6: WAL Integration)
+
+MemTable with WAL-backed durability.
 """
 from rpython.rlib.rrandom import Random
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.jit import unrolling_iterable, unroll_safe
-from gnitz.storage import arena, writer_ecs, errors
+from gnitz.storage import arena, writer_ecs, errors, wal_format
 from gnitz.core import types, strings as string_logic
 
 MAX_HEIGHT = 16
 MAX_FIELDS = 64
 FIELD_INDICES = unrolling_iterable(range(MAX_FIELDS))
 
-# --- Low-level Node Accessors ---
-
+# Node accessor functions (unchanged)
 def node_get_next_off(base_ptr, node_off, level):
     ptr = rffi.ptradd(base_ptr, node_off + 12)
     next_ptr = rffi.cast(rffi.UINTP, ptr)
@@ -40,14 +41,9 @@ def node_get_payload_ptr(base_ptr, node_off):
     height = ord(base_ptr[node_off + 8])
     return rffi.ptradd(base_ptr, node_off + 12 + (height * 4) + 8)
 
-# --- Unified SkipList Navigation ---
-
 @unroll_safe
 def skip_list_find(base_ptr, head_off, entity_id, update_offsets=None):
-    """
-    Standardizes SkipList traversal. Returns the offset of the node 
-    immediately preceding the target entity_id at level 0.
-    """
+    """Standardizes SkipList traversal."""
     curr_off = head_off
     for i in range(MAX_HEIGHT - 1, -1, -1):
         next_off = node_get_next_off(base_ptr, curr_off, i)
@@ -61,23 +57,20 @@ def skip_list_find(base_ptr, head_off, entity_id, update_offsets=None):
             update_offsets[i] = curr_off
     return curr_off
 
-# --- MemTable Implementation ---
 
 class MemTable(object):
     _immutable_fields_ = ['arena', 'blob_arena', 'layout', 'head_off', 'threshold_bytes']
 
     def __init__(self, layout, arena_size):
-        from gnitz.storage import errors
         self.layout = layout
         self.arena = arena.Arena(arena_size)
         self.blob_arena = arena.Arena(arena_size)
         self.arena_size = arena_size
-        # Configurable capacity threshold (90%)
-        self.threshold_bytes = (arena_size * 90) / 100 
+        self.threshold_bytes = (arena_size * 90) / 100
         self.rng = Random(1234)
         self._update_offsets = [0] * MAX_HEIGHT
         
-        self.arena.alloc(8) 
+        self.arena.alloc(8)
         self.node_base_size = 12 + 8 + self.layout.stride
         
         h_sz = self.node_base_size + (MAX_HEIGHT * 4)
@@ -118,24 +111,20 @@ class MemTable(object):
 
     def upsert(self, entity_id, weight, field_values):
         base = self.arena.base_ptr
-        
-        # Unified search
         pred_off = skip_list_find(base, self.head_off, entity_id, self._update_offsets)
         next_off = node_get_next_off(base, pred_off, 0)
         
-        # 1. Update existing node
         if next_off != 0 and node_get_entity_id(base, next_off) == entity_id:
             node_set_weight(base, next_off, node_get_weight(base, next_off) + weight)
             self._pack_values(node_get_payload_ptr(base, next_off), field_values)
             return
 
-        # 2. Insert new node
         h = 1
         while h < MAX_HEIGHT and (self.rng.genrand32() & 1):
             h += 1
         
         node_sz = self.node_base_size + (h * 4)
-        new_ptr = self.arena.alloc(node_sz) # Allocation can fail and raise StorageError
+        new_ptr = self.arena.alloc(node_sz)
         new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
         
         node_set_weight(base, new_off, weight)
@@ -177,21 +166,74 @@ class MemTable(object):
         self.arena.free()
         self.blob_arena.free()
 
+
 class MemTableManager(object):
-    def __init__(self, layout, capacity):
+    def __init__(self, layout, capacity, wal_writer=None, component_id=1):
+        """
+        Initializes MemTable with optional WAL integration.
+        
+        Args:
+            layout: ComponentLayout
+            capacity: Arena size in bytes
+            wal_writer: Optional WALWriter for durability
+            component_id: Component type ID for WAL blocks
+        """
         self.layout = layout
         self.capacity = capacity
         self.active_table = MemTable(self.layout, self.capacity)
+        self.wal_writer = wal_writer
+        self.component_id = component_id
+        self.current_lsn = 1
+
+    def _pack_component_for_wal(self, field_values):
+        """Packs field values for WAL (inline strings only)."""
+        stride = self.layout.stride
+        buf = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
+        try:
+            for i in range(stride):
+                buf[i] = '\x00'
+            
+            for i in FIELD_INDICES:
+                if i >= len(field_values) or i >= len(self.layout.field_types):
+                    break
+                
+                val = field_values[i]
+                f_type = self.layout.field_types[i]
+                f_off = self.layout.field_offsets[i]
+                dest = rffi.ptradd(buf, f_off)
+                
+                if f_type == types.TYPE_STRING:
+                    s_val = str(val)
+                    string_logic.pack_string(dest, s_val, 0)  # WAL: no heap
+                elif isinstance(val, int):
+                    rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val)
+                elif isinstance(val, float):
+                    rffi.cast(rffi.DOUBLEP, dest)[0] = rffi.cast(rffi.DOUBLE, val)
+            
+            return rffi.charpsize2str(buf, stride)
+        finally:
+            lltype.free(buf, flavor='raw')
 
     def put(self, entity_id, weight, *field_values):
-        from gnitz.storage import errors
+        """
+        Inserts data with WAL-backed durability.
         
-        # SAFETY VALVE: Check against the threshold first. 
-        # The `upsert` call itself might raise StorageError if the allocation is too big,
-        # but this check prevents the systematic exhaustion due to transaction size.
+        CRITICAL: WAL is written BEFORE MemTable update.
+        This ensures crash safety: if the system crashes after WAL write
+        but before MemTable flush, recovery can replay the WAL.
+        """
+        # 1. Write to WAL FIRST (durability)
+        if self.wal_writer is not None:
+            component_data = self._pack_component_for_wal(field_values)
+            records = [(entity_id, weight, component_data)]
+            self.wal_writer.append_block(self.current_lsn, self.component_id, records)
+            self.current_lsn += 1
+        
+        # 2. Check capacity
         if self.active_table.arena.offset > self.active_table.threshold_bytes:
-            raise errors.MemTableFullError() 
-            
+            raise errors.MemTableFullError()
+        
+        # 3. Update memory (after WAL)
         self.active_table.upsert(entity_id, weight, field_values)
 
     def flush_and_rotate(self, filename):

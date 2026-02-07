@@ -25,20 +25,29 @@ OFF_ENTRY_COUNT = 12
 OFF_CHECKSUM = 16
 OFF_RESERVED = 24
 
+# ============================================================================
+# WAL Record Representation
+# ============================================================================
+# Records are represented as tuples: (entity_id, weight, component_data)
+# This avoids Python object allocation in hot loops (GC-efficient).
 
-class WALRecord(object):
+def WALRecord(entity_id, weight, component_data):
     """
-    Represents a single Z-Set record within a WAL block.
+    Creates a WAL record tuple.
     
-    Attributes:
+    This is a function, not a class. It returns a tuple to avoid
+    Python object allocation overhead in hot paths while maintaining
+    backward compatibility with existing calling conventions.
+    
+    Args:
         entity_id: 64-bit Entity ID
         weight: 64-bit signed weight (algebraic Z-Set weight)
         component_data: Raw byte string containing packed component payload
+    
+    Returns:
+        Tuple of (entity_id, weight, component_data)
     """
-    def __init__(self, entity_id, weight, component_data):
-        self.entity_id = entity_id
-        self.weight = weight
-        self.component_data = component_data
+    return (entity_id, weight, component_data)
 
 
 def encode_wal_block(lsn, component_id, records, layout):
@@ -48,7 +57,7 @@ def encode_wal_block(lsn, component_id, records, layout):
     Args:
         lsn: Log Sequence Number (u64)
         component_id: Component type ID (u32)
-        records: List of WALRecord objects
+        records: List of record tuples (entity_id, weight, component_data)
         layout: ComponentLayout for stride calculation
     
     Returns:
@@ -66,22 +75,23 @@ def encode_wal_block(lsn, component_id, records, layout):
     try:
         # Encode each record into the body
         for i in range(entry_count):
-            record = records[i]
+            # Records are always tuples: (entity_id, weight, component_data)
+            entity_id, weight, component_data = records[i]
             record_offset = i * record_size
             
             # Write Entity ID (8 bytes)
             eid_ptr = rffi.ptradd(body_buf, record_offset)
-            rffi.cast(rffi.LONGLONGP, eid_ptr)[0] = rffi.cast(rffi.LONGLONG, record.entity_id)
+            rffi.cast(rffi.LONGLONGP, eid_ptr)[0] = rffi.cast(rffi.LONGLONG, entity_id)
             
             # Write Weight (8 bytes)
             weight_ptr = rffi.ptradd(body_buf, record_offset + 8)
-            rffi.cast(rffi.LONGLONGP, weight_ptr)[0] = rffi.cast(rffi.LONGLONG, record.weight)
+            rffi.cast(rffi.LONGLONGP, weight_ptr)[0] = rffi.cast(rffi.LONGLONG, weight)
             
             # Write Component Data (stride bytes)
             component_ptr = rffi.ptradd(body_buf, record_offset + 16)
-            for j in range(len(record.component_data)):
+            for j in range(len(component_data)):
                 if j < stride:
-                    component_ptr[j] = record.component_data[j]
+                    component_ptr[j] = component_data[j]
         
         # Compute checksum of body
         body_checksum = checksum.compute_checksum(body_buf, body_size)
@@ -128,7 +138,8 @@ def decode_wal_block(raw_bytes, layout):
         layout: ComponentLayout for stride calculation
     
     Returns:
-        Tuple of (lsn, component_id, records) where records is a list of WALRecord
+        Tuple of (lsn, component_id, records) where records is a list of tuples
+        Each record tuple is (entity_id, weight, component_data)
     
     Raises:
         CorruptShardError: If checksum validation fails or format is invalid
@@ -179,7 +190,7 @@ def decode_wal_block(raw_bytes, layout):
         if actual_checksum != expected_checksum:
             raise errors.CorruptShardError("WAL block checksum mismatch")
         
-        # Decode records
+        # Decode records - use tuples instead of objects (GC-efficient)
         records = []
         for i in range(entry_count):
             record_offset = i * record_size
@@ -196,7 +207,8 @@ def decode_wal_block(raw_bytes, layout):
             component_ptr = rffi.ptradd(body_buf, record_offset + 16)
             component_data = rffi.charpsize2str(component_ptr, stride)
             
-            records.append(WALRecord(entity_id, weight, component_data))
+            # Append as tuple (no object allocation)
+            records.append((entity_id, weight, component_data))
     finally:
         lltype.free(body_buf, flavor='raw')
     
