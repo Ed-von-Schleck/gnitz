@@ -52,18 +52,16 @@ class TestMemTableWALInterlock(unittest.TestCase):
         reader = wal.WALReader(self.test_wal, self.layout)
         
         # Should have 2 blocks (one per put)
-        block1 = reader.read_next_block()
-        self.assertIsNotNone(block1)
-        lsn1, comp_id1, records1 = block1
+        is_valid1, lsn1, comp_id1, records1 = reader.read_next_block()
+        self.assertTrue(is_valid1)
         self.assertEqual(comp_id1, 1)
         self.assertEqual(len(records1), 1)
         entity_id1, weight1, _ = records1[0]
         self.assertEqual(entity_id1, 10)
         self.assertEqual(weight1, 1)
         
-        block2 = reader.read_next_block()
-        self.assertIsNotNone(block2)
-        lsn2, comp_id2, records2 = block2
+        is_valid2, lsn2, comp_id2, records2 = reader.read_next_block()
+        self.assertTrue(is_valid2)
         self.assertEqual(comp_id2, 1)
         entity_id2, weight2, _ = records2[0]
         self.assertEqual(entity_id2, 20)
@@ -107,6 +105,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
         # Read WAL and verify weights
         reader = wal.WALReader(self.test_wal, self.layout)
         
+        # iterate_blocks yields (lsn, component_id, records) - 3 elements
         blocks = list(reader.iterate_blocks())
         self.assertEqual(len(blocks), 3)
         
@@ -194,7 +193,8 @@ class TestMemTableWALInterlock(unittest.TestCase):
         
         # Verify component_id in WAL
         reader = wal.WALReader(self.test_wal, self.layout)
-        lsn, component_id, records = reader.read_next_block()
+        is_valid, lsn, component_id, records = reader.read_next_block()
+        self.assertTrue(is_valid)
         
         self.assertEqual(component_id, 42)
         reader.close()
