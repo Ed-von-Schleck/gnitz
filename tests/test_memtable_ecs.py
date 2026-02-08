@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 from gnitz.storage import memtable, shard_ecs
 
 class TestMemTableECS(unittest.TestCase):
@@ -13,14 +13,18 @@ class TestMemTableECS(unittest.TestCase):
         self.mgr.close()
         if os.path.exists(self.fn): os.unlink(self.fn)
 
+    def _put(self, eid, w, *vals):
+        wrapped = [db_values.wrap(v) for v in vals]
+        self.mgr.put(eid, w, wrapped)
+
     def test_upsert_and_flush(self):
-        # Insert 3 entities
-        self.mgr.put(10, 1, 100, "short")
-        self.mgr.put(20, 1, 200, "this is a very long string that should be in the heap")
-        self.mgr.put(30, 1, 300, "another")
+        # Use _put helper to ensure values are wrapped in a list
+        self._put(10, 1, 100, "short")
+        self._put(20, 1, 200, "this is a very long string that should be in the heap")
+        self._put(30, 1, 300, "another")
         
         # Test algebraic coalescing (annihilation)
-        self.mgr.put(30, -1, 300, "another") # Weight of 30 becomes 0
+        self._put(30, -1, 300, "another") # Weight of 30 becomes 0
         
         self.mgr.flush_and_rotate(self.fn)
         

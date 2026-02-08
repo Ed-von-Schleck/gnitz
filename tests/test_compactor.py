@@ -22,26 +22,19 @@ class TestCompactor(unittest.TestCase):
         w1._add_entity_weighted(2, 1, 20)
         w1.finalize("in1.db")
         
-        # Shard 2: E2(W=1, V=200, LSN higher), E3(W=1, V=30)
+        # Shard 2: E2(W=1, V=200), E3(W=1, V=30)
         w2 = writer_ecs.ECSShardWriter(self.layout)
         w2._add_entity_weighted(2, 1, 200)
         w2._add_entity_weighted(3, 1, 30)
         w2.finalize("in2.db")
         
-        # Compact: E1 should be W=1, E2 should be W=2 (V=200), E3 should be W=1
-        compactor.compact_shards(["in1.db", "in2.db"], [10, 20], "out.db", self.layout)
+        # Compact: Updated signature (no lsns)
+        compactor.compact_shards(["in1.db", "in2.db"], "out.db", self.layout)
         
         res = shard_ecs.ECSShardView("out.db", self.layout)
-        self.assertEqual(res.count, 3)
-        
-        # E1
-        self.assertEqual(res.get_entity_id(0), 1)
-        self.assertEqual(res.get_weight(0), 1)
-        
-        # E2 (Accumulated weight, Resolved value)
-        self.assertEqual(res.get_entity_id(1), 2)
-        self.assertEqual(res.get_weight(1), 2)
-        self.assertEqual(res.read_field_i64(1, 0), 200)
+        # Expected: E1(10), E2(20), E2(200), E3(30) -> 4 records
+        # Because E2(20) and E2(200) are distinct elements in Z-Set.
+        self.assertEqual(res.count, 4)
         
         res.close()
 
@@ -56,7 +49,7 @@ class TestCompactor(unittest.TestCase):
         w2._add_entity_weighted(1, -1, 10)
         w2.finalize("in2.db")
         
-        compactor.compact_shards(["in1.db", "in2.db"], [10, 20], "out.db", self.layout)
+        compactor.compact_shards(["in1.db", "in2.db"], "out.db", self.layout)
         
         res = shard_ecs.ECSShardView("out.db", self.layout)
         self.assertEqual(res.count, 0) # Ghost property: annihilated
@@ -74,7 +67,7 @@ class TestCompactor(unittest.TestCase):
         w2._add_entity_weighted(1, -1, 10)
         w2.finalize("in2.db")
         
-        compactor.compact_shards(["in1.db", "in2.db"], [10, 20], "out.db", self.layout)
+        compactor.compact_shards(["in1.db", "in2.db"], "out.db", self.layout)
         
         res = shard_ecs.ECSShardView("out.db", self.layout)
         self.assertEqual(res.count, 1)

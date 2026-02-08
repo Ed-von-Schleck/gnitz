@@ -1,7 +1,7 @@
 import unittest
 import os
 from gnitz.storage import memtable, shard_ecs
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 
 class TestSurvivorBlobCompaction(unittest.TestCase):
     def setUp(self):
@@ -14,6 +14,10 @@ class TestSurvivorBlobCompaction(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.filename):
             os.unlink(self.filename)
+
+    def _put(self, mgr, eid, w, *vals):
+        wrapped = [db_values.wrap(v) for v in vals]
+        mgr.put(eid, w, wrapped)
 
     def test_annihilated_blobs_are_pruned(self):
         """
@@ -29,15 +33,15 @@ class TestSurvivorBlobCompaction(unittest.TestCase):
         
         # 2. Insert Entity 1 (To be annihilated)
         # In MemTable, this allocates 20 bytes in blob_arena
-        mgr.put(1, 1, long_str_annihilated)
+        self._put(mgr, 1, 1, long_str_annihilated)
         
         # 3. Annihilate Entity 1
         # Net weight becomes 0. The MemTable node remains but w=0.
-        mgr.put(1, -1, long_str_annihilated) 
+        self._put(mgr, 1, -1, long_str_annihilated)
         
         # 4. Insert Entity 2 (Survivor)
         # Allocates another 20 bytes in blob_arena
-        mgr.put(2, 1, long_str_survivor)
+        self._put(mgr, 2, 1, long_str_survivor)
         
         # At this point, MemTable blob_arena holds BOTH strings (~40 bytes + overhead).
         # We assume the MemTable holds the raw data until flush.

@@ -168,7 +168,8 @@ class ECSShardWriter(object):
         stride = self.layout.stride
         
         # Ensure space in C buffer
-        self.c_buf.ensure_capacity(1) # 1 item of size 'stride'
+        # c_buf has item_size=stride. ensure_capacity(1) ensures 1 stride-sized slot.
+        self.c_buf.ensure_capacity(1)
         
         # Get pointer to destination in C buffer
         dest_c_ptr = self.c_buf.get_ptr_at(self.c_buf.count)

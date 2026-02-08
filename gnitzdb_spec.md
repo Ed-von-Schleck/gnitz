@@ -93,18 +93,13 @@ Data is physically partitioned by Component ID into independent columnar shards.
 *   **Entity Sorting:** All shards are strictly sorted by Entity ID to enable $O(\log N)$ binary search lookups and linear-time Vertical Joins.
 *   **Component Isolation:** Querying a specific attribute only triggers I/O for relevant component shards, maximizing memory bandwidth efficiency.
 
-### 4.3. Multi-Layer Resolution and Algebraic Summation
-The engine resolves the effective state of an entity by aggregating weights across the memory and storage hierarchy.
-*   **Weight Summation:** The net weight is the sum of weights from the active MemTable and all overlapping shards identified by the Spine.
-*   **LSN-Based Value Resolution:** When multiple shards provide conflicting component values for the same Entity ID, the engine resolves the conflict using **Last-Write-Wins (LWW)** logic, selecting the value from the shard with the highest `max_lsn`.
-
-### 4.4. Compaction: The Vertical Merge
+### 4.3. Compaction: The Vertical Merge
 Compaction reduces read amplification by merging overlapping shards into a consolidated "Guard" shard.
 *   **Tournament Tree Merge:** An N-way merge sort processes input shards by Entity ID.
 *   **MergeAccumulator Logic:** For each Entity ID, a `MergeAccumulator` calculates the net algebraic weight and tracks the payload pointer associated with the highest LSN.
 *   **Algebraic Pruning:** If the net weight sums to zero, the record is discarded (Annihilation). This physically realizes the Ghost Property by reclaiming space from deleted or balanced state.
 
-### 4.5. Read Amplification and Triggers
+### 4.4 . Read Amplification and Triggers
 The **ShardRegistry** monitors the structural health of the FLSM.
 *   **Metrics:** Read Amplification is defined as the number of overlapping shards covering a specific Entity ID.
 *   **Heuristic Trigger:** When Read Amplification exceeds a configured threshold (default: 4), the component is flagged for automated compaction to restore $O(\log N)$ lookup performance.
@@ -176,7 +171,6 @@ The MemTable is the mutable, in-memory write-head of the engine, optimized for t
 ### 6.2. AoS SkipList for Algebraic Coalescing
 The MemTable utilizes a SkipList indexed by Entity ID to perform immediate, in-place algebraic summation of weights at ingestion time.
 *   **Algebraic Accumulation:** The SkipList performs an $O(\log N)$ search to locate existing nodes. If found, the incoming weight is added to the node's 64-bit weight field.
-*   **Value Resolution (LWW):** Within a single ingestion epoch, the component bundle associated with the entity is overwritten with the latest version, enforcing Last-Write-Wins semantics before the data reaches the persistence layer.
 *   **In-Memory Annihilation:** If high-frequency updates within the MemTable result in a net weight of zero, the entity is marked as annihilated.
 
 ### 6.3. Physical Node Layout

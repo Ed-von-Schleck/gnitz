@@ -1,3 +1,6 @@
+"""
+gnitz/storage/shard_ecs.py
+"""
 import os
 from rpython.rlib import jit, rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
@@ -75,24 +78,27 @@ class ECSShardView(object):
         return self.buf_c.get_raw_ptr(offset)
 
     def find_entity_index(self, entity_id):
+        # Finds LOWER bound (first occurrence)
         low = 0
         high = self.count - 1
+        ans = -1
         while low <= high:
             mid = (low + high) / 2
             eid_at_mid = self.get_entity_id(mid)
             if eid_at_mid == entity_id:
-                return mid
-            if eid_at_mid < entity_id:
+                ans = mid
+                high = mid - 1 # Continue searching left
+            elif eid_at_mid < entity_id:
                 low = mid + 1
             else:
                 high = mid - 1
-        return -1
+        return ans
 
     def read_field_i64(self, index, field_idx):
         ptr = self.get_data_ptr(index)
         field_off = self.layout.get_field_offset(field_idx)
         return rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr, field_off))[0]
-
+    
     def string_field_equals(self, index, field_idx, search_str):
         ptr = self.get_data_ptr(index)
         field_off = self.layout.get_field_offset(field_idx)

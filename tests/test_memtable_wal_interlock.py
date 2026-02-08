@@ -1,7 +1,7 @@
 import unittest
 import os
 from gnitz.storage import memtable, wal, wal_format
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 
 
 class TestMemTableWALInterlock(unittest.TestCase):
@@ -18,14 +18,18 @@ class TestMemTableWALInterlock(unittest.TestCase):
         # Clean up test file
         if os.path.exists(self.test_wal):
             os.unlink(self.test_wal)
+            
+    def _put(self, mgr, eid, w, *vals):
+        wrapped = [db_values.wrap(v) for v in vals]
+        mgr.put(eid, w, wrapped)
     
     def test_memtable_without_wal(self):
         """Test that MemTable works without WAL (backward compatibility)."""
         mgr = memtable.MemTableManager(self.layout, 1024 * 1024)
         
         # Should work without WAL writer
-        mgr.put(1, 1, 100, "test")
-        mgr.put(2, 1, 200, "another")
+        self._put(mgr, 1, 1, 100, "test")
+        self._put(mgr, 2, 1, 200, "another")
         
         mgr.close()
     
@@ -38,8 +42,8 @@ class TestMemTableWALInterlock(unittest.TestCase):
         mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, component_id=1)
         
         # Insert data - should write to WAL first
-        mgr.put(10, 1, 100, "first")
-        mgr.put(20, 1, 200, "second")
+        self._put(mgr, 10, 1, 100, "first")
+        self._put(mgr, 20, 1, 200, "second")
         
         # Close to flush WAL
         mgr.close()
@@ -75,7 +79,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
         mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, component_id=1)
         
         # Insert one record
-        mgr.put(100, 1, 999, "durable")
+        self._put(mgr, 100, 1, 999, "durable")
         
         # WAL should have content immediately (before close)
         # This simulates crash - MemTable in memory, but WAL on disk
@@ -91,13 +95,13 @@ class TestMemTableWALInterlock(unittest.TestCase):
         mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, component_id=1)
         
         # Insert with weight +1
-        mgr.put(50, 1, 500, "add")
+        self._put(mgr, 50, 1, 500, "add")
         
         # Insert with weight -1 (deletion)
-        mgr.put(60, -1, 600, "delete")
+        self._put(mgr, 60, -1, 600, "delete")
         
         # Insert with weight +2
-        mgr.put(70, 2, 700, "double")
+        self._put(mgr, 70, 2, 700, "double")
         
         mgr.close()
         wal_writer.close()
@@ -130,8 +134,8 @@ class TestMemTableWALInterlock(unittest.TestCase):
         wal_writer = wal.WALWriter(self.test_wal, self.layout)
         mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, component_id=1)
         
-        mgr.put(1, 1, 111, "pre_crash")
-        mgr.put(2, 1, 222, "also_pre_crash")
+        self._put(mgr, 1, 1, 111, "pre_crash")
+        self._put(mgr, 2, 1, 222, "also_pre_crash")
         
         # Simulate crash: close WAL but don't flush MemTable
         wal_writer.close()
@@ -161,9 +165,9 @@ class TestMemTableWALInterlock(unittest.TestCase):
         mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, component_id=1)
         
         # Put same entity 3 times with different weights
-        mgr.put(100, 1, 10, "v1")
-        mgr.put(100, 1, 20, "v2")
-        mgr.put(100, -1, 30, "v3")
+        self._put(mgr, 100, 1, 10, "v1")
+        self._put(mgr, 100, 1, 20, "v2")
+        self._put(mgr, 100, -1, 30, "v3")
         
         mgr.close()
         wal_writer.close()
@@ -187,7 +191,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
         # Create MemTable with specific component_id
         mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, component_id=42)
         
-        mgr.put(1, 1, 100, "test")
+        self._put(mgr, 1, 1, 100, "test")
         mgr.close()
         wal_writer.close()
         
@@ -206,7 +210,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
         
         # Multiple puts
         for i in range(5):
-            mgr.put(i, 1, i * 10, "rec_%d" % i)
+            self._put(mgr, i, 1, i * 10, "rec_%d" % i)
         
         mgr.close()
         wal_writer.close()

@@ -1,32 +1,50 @@
+"""
+gnitz/storage/compaction_logic.py
+"""
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import jit
+from gnitz.storage import memtable
 
-# The number of cursors (input shards) during a merge is typically small (4-10) and 
-# constant for the duration of the merge function. Unrolling this removes loop 
-# overhead in the hot path.
 @jit.unroll_safe
-def merge_entity_contributions(cursors, cursor_lsns):
+def merge_entity_contributions(cursors, layout):
     """
-    Algebraically merges weights and resolves values via LWW for a single Entity ID.
+    Groups inputs by Payload and sums weights for each unique (EntityID, Payload).
+    Returns a list of tuples: (weight, payload_ptr, blob_ptr)
     """
-    net_weight = 0
-    max_lsn = -1
-    best_payload = lltype.nullptr(rffi.CCHARP.TO)
-    best_blob = lltype.nullptr(rffi.CCHARP.TO)
-
-    for i in range(len(cursors)):
-        cursor = cursors[i]
-        lsn = cursor_lsns[i]
-        view = cursor.view
+    # Simple algorithm: Collect all, then group.
+    # Since N is small (num shards), simple linear scan is fine.
+    
+    candidates = [] # List of (view, index)
+    
+    for cursor in cursors:
         idx = cursor.get_current_index()
+        candidates.append((cursor.view, idx))
+    
+    results = []
+    
+    # Process candidates until all are handled
+    while len(candidates) > 0:
+        base_view, base_idx = candidates[0]
+        base_payload = base_view.get_data_ptr(base_idx)
+        base_blob = base_view.buf_b.ptr
+        
+        total_weight = 0
+        
+        remaining = []
+        
+        for view, idx in candidates:
+            payload = view.get_data_ptr(idx)
+            blob = view.buf_b.ptr
+            
+            # Check strict equality
+            if memtable.compare_payloads(layout, base_payload, base_blob, payload, blob) == 0:
+                total_weight += view.get_weight(idx)
+            else:
+                remaining.append((view, idx))
+        
+        if total_weight != 0:
+            results.append((total_weight, base_payload, base_blob))
+            
+        candidates = remaining
 
-        # 1. Algebraic Summation
-        net_weight += view.get_weight(idx)
-
-        # 2. Last-Write-Wins (LWW) resolution
-        if lsn > max_lsn:
-            max_lsn = lsn
-            best_payload = view.get_data_ptr(idx)
-            best_blob = view.buf_b.ptr
-
-    return net_weight, best_payload, best_blob
+    return results
