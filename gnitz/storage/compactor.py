@@ -6,15 +6,21 @@ from gnitz.storage.manifest import ManifestEntry
 def compact_shards(input_files, output_file, layout):
     views = []
     cursors = []
+    tree = None
+    writer = None
+    
     try:
+        # 1. Open Shard Views
         for filename in input_files:
             view = shard_ecs.ECSShardView(filename, layout)
             views.append(view)
             cursors.append(tournament_tree.StreamCursor(view))
         
+        # 2. Initialize Compaction Structures
         tree = tournament_tree.TournamentTree(cursors)
         writer = writer_ecs.ECSShardWriter(layout)
         
+        # 3. Execution Loop
         while not tree.is_exhausted():
             min_eid = tree.get_min_entity_id()
             indices = tree.get_all_cursors_at_min()
@@ -29,10 +35,17 @@ def compact_shards(input_files, output_file, layout):
                 writer.add_packed_row(min_eid, weight, payload_ptr, blob_ptr)
             
             tree.advance_min_cursors()
+            
         writer.finalize(output_file)
-        tree.close()
+        
     finally:
-        for view in views: view.close()
+        # 4. Strict Resource Cleanup
+        if tree:
+            tree.close()
+        if writer:
+            writer.close()
+        for view in views: 
+            view.close()
 
 class CompactionPolicy(object):
     def __init__(self, registry):

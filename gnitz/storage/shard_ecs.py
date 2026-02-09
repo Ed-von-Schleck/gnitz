@@ -12,39 +12,51 @@ class ECSShardView(object):
     def __init__(self, filename, component_layout, validate_checksums=True):
         self.layout = component_layout
         fd = rposix.open(filename, os.O_RDONLY, 0)
+        self.ptr = lltype.nullptr(rffi.CCHARP.TO) # Initialize to null for safety
         try:
             st = os.fstat(fd)
             self.size = st.st_size
             if self.size < (layout.HEADER_SIZE + layout.FOOTER_SIZE): 
                 raise errors.CorruptShardError("File too small")
+            
+            # Map the file
             self.ptr = mmap_posix.mmap_file(fd, self.size, mmap_posix.PROT_READ, mmap_posix.MAP_SHARED)
-        finally: rposix.close(fd)
-        
-        header = buffer.MappedBuffer(self.ptr, layout.HEADER_SIZE)
-        if header.read_u64(layout.OFF_MAGIC) != layout.MAGIC_NUMBER: 
-            raise errors.CorruptShardError("Magic mismatch")
-        
-        self.count = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_COUNT))
-        off_e = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_E_ECS))
-        off_c = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_C_ECS))
-        off_b = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_B_ECS))
-        off_w = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_W_ECS))
-        
-        self.buf_e = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_e), off_w - off_e)
-        self.buf_w = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_w), off_c - off_w)
-        self.buf_c = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_c), off_b - off_c)
-        self.buf_b = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_b), self.size - off_b - layout.FOOTER_SIZE)
-        
-        footer_ptr = rffi.ptradd(self.ptr, self.size - layout.FOOTER_SIZE)
-        self.cs_c = r_uint64(rffi.cast(rffi.ULONGLONGP, footer_ptr)[0])
-        self.cs_b = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(footer_ptr, 8))[0])
+            
+            # Initialization logic wrapped in try-except to ensure unmap on failure
+            try:
+                header = buffer.MappedBuffer(self.ptr, layout.HEADER_SIZE)
+                if header.read_u64(layout.OFF_MAGIC) != layout.MAGIC_NUMBER: 
+                    raise errors.CorruptShardError("Magic mismatch")
+                
+                self.count = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_COUNT))
+                off_e = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_E_ECS))
+                off_c = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_C_ECS))
+                off_b = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_B_ECS))
+                off_w = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_W_ECS))
+                
+                self.buf_e = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_e), off_w - off_e)
+                self.buf_w = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_w), off_c - off_w)
+                self.buf_c = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_c), off_b - off_c)
+                self.buf_b = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_b), self.size - off_b - layout.FOOTER_SIZE)
+                
+                footer_ptr = rffi.ptradd(self.ptr, self.size - layout.FOOTER_SIZE)
+                self.cs_c = r_uint64(rffi.cast(rffi.ULONGLONGP, footer_ptr)[0])
+                self.cs_b = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(footer_ptr, 8))[0])
 
-        self._c_validated = False
-        self._b_validated = False
+                self._c_validated = False
+                self._b_validated = False
 
-        if validate_checksums:
-            self.validate_region_e()
-            self.validate_region_w()
+                if validate_checksums:
+                    self.validate_region_e()
+                    self.validate_region_w()
+            except Exception:
+                # If any validation fails, we must unmap the memory to prevent leaks
+                if self.ptr:
+                    mmap_posix.munmap_file(self.ptr, self.size)
+                    self.ptr = lltype.nullptr(rffi.CCHARP.TO)
+                raise
+        finally:
+            rposix.close(fd)
     
     def validate_region_e(self):
         expected = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_CHECKSUM_E))[0])
@@ -101,4 +113,7 @@ class ECSShardView(object):
         search_prefix = string_logic.compute_prefix(search_str)
         return string_logic.string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_prefix)
     
-    def close(self): mmap_posix.munmap_file(self.ptr, self.size)
+    def close(self):
+        if self.ptr:
+            mmap_posix.munmap_file(self.ptr, self.size)
+            self.ptr = lltype.nullptr(rffi.CCHARP.TO)

@@ -157,17 +157,21 @@ class MemTable(object):
 
     def flush(self, filename):
         sw = writer_ecs.ECSShardWriter(self.layout); base = self.arena.base_ptr; blob_base = self.blob_arena.base_ptr
-        min_eid = r_uint64(0); max_eid = r_uint64(0); first = True
-        curr_off = node_get_next_off(base, self.head_off, 0)
-        while curr_off != 0:
-            w = node_get_weight(base, curr_off)
-            if w != 0:
-                eid = node_get_entity_id(base, curr_off); sw.add_packed_row(eid, w, node_get_payload_ptr(base, curr_off), blob_base)
-                if first or eid < min_eid: min_eid = eid
-                if first or eid > max_eid: max_eid = eid
-                first = False
-            curr_off = node_get_next_off(base, curr_off, 0)
-        sw.finalize(filename); return min_eid, max_eid
+        try:
+            min_eid = r_uint64(0); max_eid = r_uint64(0); first = True
+            curr_off = node_get_next_off(base, self.head_off, 0)
+            while curr_off != 0:
+                w = node_get_weight(base, curr_off)
+                if w != 0:
+                    eid = node_get_entity_id(base, curr_off); sw.add_packed_row(eid, w, node_get_payload_ptr(base, curr_off), blob_base)
+                    if first or eid < min_eid: min_eid = eid
+                    if first or eid > max_eid: max_eid = eid
+                    first = False
+                curr_off = node_get_next_off(base, curr_off, 0)
+            sw.finalize(filename); return min_eid, max_eid
+        finally:
+            # Ensure buffers in the shard writer are freed even if an exception occurs
+            sw.close()
 
     def free(self): self.arena.free(); self.blob_arena.free()
 

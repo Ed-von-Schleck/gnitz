@@ -189,6 +189,7 @@ class TournamentTree(object):
         return self.heap_size == 0
 
     def close(self):
+        # Made idempotent to support safe usage in try-finally blocks
         if self.heap:
             lltype.free(self.heap, flavor='raw')
             self.heap = lltype.nullptr(rffi.CArray(HEAP_NODE_PTR.TO))

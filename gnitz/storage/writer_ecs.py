@@ -51,6 +51,7 @@ class RawBuffer(object):
         self.count += length
 
     def free(self):
+        # Idempotent free
         if self.ptr:
             lltype.free(self.ptr, flavor='raw')
             self.ptr = lltype.nullptr(rffi.CCHARP.TO)
@@ -154,6 +155,16 @@ class ECSShardWriter(object):
         
         self.c_buf.count += 1
 
+    def close(self):
+        """Releases all raw buffers. Idempotent."""
+        self.e_buf.free()
+        self.w_buf.free()
+        self.c_buf.free()
+        self.b_buf.free()
+        if self.scratch_row:
+            lltype.free(self.scratch_row, flavor='raw')
+            self.scratch_row = lltype.nullptr(rffi.CCHARP.TO)
+
     def finalize(self, filename):
         tmp_filename = filename + ".tmp"
         fd = rposix.open(tmp_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -207,8 +218,8 @@ class ECSShardWriter(object):
             mmap_posix.fsync_c(fd)
         finally:
             rposix.close(fd)
-            self.e_buf.free(); self.w_buf.free(); self.c_buf.free(); self.b_buf.free()
-            if self.scratch_row: lltype.free(self.scratch_row, flavor='raw')
+            # Delegate cleanup to close() to avoid code duplication and ensure safety
+            self.close()
 
         os.rename(tmp_filename, filename)
         mmap_posix.fsync_dir(filename)
