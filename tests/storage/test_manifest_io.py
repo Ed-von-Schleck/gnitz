@@ -39,7 +39,8 @@ class TestManifestIO(unittest.TestCase):
         reader = manifest.ManifestReader(self.test_file)
         try:
             self.assertEqual(reader.get_entry_count(), 1)
-            entry = reader.read_entry(0)
+            entries = list(reader.iterate_entries())
+            entry = entries[0]
             self.assertEqual(entry.component_id, 1)
             self.assertEqual(entry.shard_filename, "test_shard.db")
             self.assertEqual(entry.min_entity_id, 100)
@@ -64,17 +65,17 @@ class TestManifestIO(unittest.TestCase):
         reader = manifest.ManifestReader(self.test_file)
         try:
             self.assertEqual(reader.get_entry_count(), 3)
+            entries = list(reader.iterate_entries())
             
-            # Read by index
-            entry0 = reader.read_entry(0)
+            entry0 = entries[0]
             self.assertEqual(entry0.component_id, 1)
             self.assertEqual(entry0.shard_filename, "shard_001.db")
             
-            entry1 = reader.read_entry(1)
+            entry1 = entries[1]
             self.assertEqual(entry1.component_id, 2)
             self.assertEqual(entry1.shard_filename, "shard_002.db")
             
-            entry2 = reader.read_entry(2)
+            entry2 = entries[2]
             self.assertEqual(entry2.component_id, 1)
             self.assertEqual(entry2.shard_filename, "shard_003.db")
         finally:
@@ -112,30 +113,6 @@ class TestManifestIO(unittest.TestCase):
         finally:
             reader.close()
     
-    def test_reader_out_of_bounds(self):
-        """Test that reading out of bounds raises error."""
-        writer = manifest.ManifestWriter(self.test_file)
-        writer.add_entry(1, "test.db", 0, 100, 0, 1)
-        writer.finalize()
-        
-        reader = manifest.ManifestReader(self.test_file)
-        try:
-            # Valid index
-            entry = reader.read_entry(0)
-            self.assertIsNotNone(entry)
-            
-            # Invalid indices
-            with self.assertRaises(errors.StorageError):
-                reader.read_entry(-1)
-            
-            with self.assertRaises(errors.StorageError):
-                reader.read_entry(1)
-            
-            with self.assertRaises(errors.StorageError):
-                reader.read_entry(999)
-        finally:
-            reader.close()
-    
     def test_writer_cannot_add_after_finalize(self):
         """Test that adding entries after finalize raises error."""
         writer = manifest.ManifestWriter(self.test_file)
@@ -159,33 +136,6 @@ class TestManifestIO(unittest.TestCase):
         
         with self.assertRaises(errors.CorruptShardError):
             manifest.ManifestReader(self.test_file)
-    
-    def test_random_access_pattern(self):
-        """Test reading entries in random order."""
-        writer = manifest.ManifestWriter(self.test_file)
-        for i in range(10):
-            writer.add_entry(
-                component_id=i % 3,
-                shard_filename="shard_%03d.db" % i,
-                min_eid=i * 100,
-                max_eid=(i + 1) * 100 - 1,
-                min_lsn=i,
-                max_lsn=i + 1
-            )
-        writer.finalize()
-        
-        reader = manifest.ManifestReader(self.test_file)
-        try:
-            self.assertEqual(reader.get_entry_count(), 10)
-            
-            # Read in random order
-            indices = [7, 2, 9, 0, 5, 3]
-            for idx in indices:
-                entry = reader.read_entry(idx)
-                self.assertEqual(entry.shard_filename, "shard_%03d.db" % idx)
-                self.assertEqual(entry.min_entity_id, idx * 100)
-        finally:
-            reader.close()
 
 if __name__ == '__main__':
     unittest.main()

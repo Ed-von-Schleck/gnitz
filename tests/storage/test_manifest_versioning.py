@@ -34,8 +34,8 @@ class TestManifestVersioning(unittest.TestCase):
         reader = self.manager.load_current()
         try:
             self.assertEqual(reader.get_entry_count(), 1)
-            entry = reader.read_entry(0)
-            self.assertEqual(entry.shard_filename, "shard_001.db")
+            entries = list(reader.iterate_entries())
+            self.assertEqual(entries[0].shard_filename, "shard_001.db")
         finally:
             reader.close()
     
@@ -63,10 +63,9 @@ class TestManifestVersioning(unittest.TestCase):
         reader = self.manager.load_current()
         try:
             self.assertEqual(reader.get_entry_count(), 2)
-            entry0 = reader.read_entry(0)
-            entry1 = reader.read_entry(1)
-            self.assertEqual(entry0.shard_filename, "shard_001.db")
-            self.assertEqual(entry1.shard_filename, "shard_002.db")
+            entries = list(reader.iterate_entries())
+            self.assertEqual(entries[0].shard_filename, "shard_001.db")
+            self.assertEqual(entries[1].shard_filename, "shard_002.db")
         finally:
             reader.close()
     
@@ -94,10 +93,9 @@ class TestManifestVersioning(unittest.TestCase):
         reader = self.manager.load_current()
         try:
             self.assertEqual(reader.get_entry_count(), 2)
-            entry0 = reader.read_entry(0)
-            entry1 = reader.read_entry(1)
-            self.assertEqual(entry0.shard_filename, "shard_001.db")
-            self.assertEqual(entry1.shard_filename, "shard_003.db")
+            entries = list(reader.iterate_entries())
+            self.assertEqual(entries[0].shard_filename, "shard_001.db")
+            self.assertEqual(entries[1].shard_filename, "shard_003.db")
         finally:
             reader.close()
     
@@ -149,8 +147,8 @@ class TestManifestVersioning(unittest.TestCase):
         self.manager.publish_new_version(new_entries)
         
         # Old reader should still work (reading old file descriptor)
-        entry = reader1.read_entry(0)
-        self.assertEqual(entry.shard_filename, "shard_001.db")
+        entries = list(reader1.iterate_entries())
+        self.assertEqual(entries[0].shard_filename, "shard_001.db")
         reader1.close()
         
         # New reader should see new version
@@ -174,8 +172,8 @@ class TestManifestVersioning(unittest.TestCase):
         reader = self.manager.load_current()
         try:
             self.assertEqual(reader.get_entry_count(), 1)
-            entry = reader.read_entry(0)
-            self.assertEqual(entry.shard_filename, "shard_001.db")
+            entries = list(reader.iterate_entries())
+            self.assertEqual(entries[0].shard_filename, "shard_001.db")
         finally:
             reader.close()
     

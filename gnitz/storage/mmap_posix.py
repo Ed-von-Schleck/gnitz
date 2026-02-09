@@ -13,7 +13,6 @@ MAP_SHARED      = 0x01
 MAP_PRIVATE     = 0x02
 
 # flock constants
-LOCK_SH = 1  # shared lock
 LOCK_EX = 2  # exclusive lock
 LOCK_NB = 4  # non-blocking
 LOCK_UN = 8  # unlock

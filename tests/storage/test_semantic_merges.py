@@ -76,7 +76,9 @@ class TestSemanticMerges(unittest.TestCase):
         # Verification of zero entries
         reader = self.db.manifest_manager.load_current()
         self.assertEqual(reader.get_entry_count(), 1)
-        entry = reader.read_entry(0)
+        entries = list(reader.iterate_entries())
+        entry = entries[0]
+        
         # Entry range should still exist, but we check if the file has 0 records
         from gnitz.storage import shard_ecs
         view = shard_ecs.ECSShardView(entry.shard_filename, self.layout)

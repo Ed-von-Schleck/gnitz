@@ -116,12 +116,6 @@ class ManifestReader(object):
 
     def get_entry_count(self): return self.entry_count
 
-    def read_entry(self, index):
-        if index < 0 or index >= self.entry_count:
-            raise errors.StorageError()
-        rposix.lseek(self.fd, HEADER_SIZE + (index * ENTRY_SIZE), 0)
-        return _read_manifest_entry(self.fd)
-
     def iterate_entries(self):
         rposix.lseek(self.fd, HEADER_SIZE, 0)
         for _ in range(self.entry_count):

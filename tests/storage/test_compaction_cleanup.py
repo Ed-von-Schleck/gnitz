@@ -31,13 +31,16 @@ class TestCompactionCleanup(unittest.TestCase):
         h2 = spine.ShardHandle(self.shard2, self.layout, 0)
         self.spine = spine.Spine([h1, h2], self.rc)
         
-        self.assertEqual(self.rc.get_refcount(self.shard1), 1)
+        # Verify shard is locked (cannot be deleted)
+        self.assertFalse(self.rc.can_delete(self.shard1))
         
         old_shards = [self.shard1, self.shard2]
         compactor.finalize_compaction(old_shards, self.rc)
         
+        # File should still exist because Spine holds a reference
         self.assertTrue(os.path.exists(self.shard1))
         
+        # Closing spine releases references and triggers cleanup
         self.spine.close_all()
         self.assertFalse(os.path.exists(self.shard1))
 

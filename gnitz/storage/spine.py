@@ -22,9 +22,6 @@ class ShardHandle(object):
     def find_entity_index(self, entity_id):
         return self.view.find_entity_index(entity_id)
 
-    def read_field_i64(self, idx, field_idx):
-        return self.view.read_field_i64(idx, field_idx)
-
     def close(self):
         self.view.close()
 

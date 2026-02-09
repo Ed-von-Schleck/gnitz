@@ -31,10 +31,6 @@ class Arena(object):
         self.offset = aligned_start + nbytes
         return ptr
 
-    def reset(self):
-        """Resets the bump pointer to reuse the memory."""
-        self.offset = 0
-
     def free(self):
         """Releases the entire block back to the OS."""
         if self.base_ptr:

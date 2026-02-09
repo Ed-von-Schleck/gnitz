@@ -2,8 +2,7 @@ import os
 from rpython.rlib import rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.jit import unrolling_iterable
-from rpython.rlib.rarithmetic import r_uint64
-from gnitz.storage import layout, mmap_posix, errors
+from gnitz.storage import layout, mmap_posix
 from gnitz.core import types, strings as string_logic, checksum
 
 FIELD_INDICES = unrolling_iterable(range(64))
@@ -50,14 +49,6 @@ class RawBuffer(object):
         self.ensure_capacity(length)
         _copy_memory(rffi.ptradd(self.ptr, self.count * self.item_size), source_ptr, length * self.item_size)
         self.count += length
-
-    def append_from_string(self, s):
-        # Kept for compatibility if needed, though usually replaced by append_bytes with str2charp
-        l = len(s)
-        self.ensure_capacity(l)
-        dest = rffi.ptradd(self.ptr, self.count)
-        for i in range(l): dest[i] = s[i]
-        self.count += l
 
     def free(self):
         if self.ptr:

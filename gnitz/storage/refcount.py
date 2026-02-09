@@ -100,24 +100,3 @@ class RefCounter(object):
         
         self.pending_deletion = remaining
         return deleted
-    
-    def get_refcount(self, filename):
-        """
-        Returns the current reference count for a file.
-        
-        Args:
-            filename: Path to the file
-        
-        Returns:
-            Reference count (0 if not tracked)
-        """
-        if filename not in self.counts:
-            return 0
-        return self.counts[filename]
-    
-    def clear_pending(self):
-        """
-        Clears all pending deletion entries without deleting files.
-        Useful for testing or recovery scenarios.
-        """
-        self.pending_deletion = []

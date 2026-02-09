@@ -27,7 +27,7 @@ class TestSpineManifest(unittest.TestCase):
         writer = manifest.ManifestWriter(self.manifest_file)
         writer.finalize()
         sp = spine.Spine.from_manifest(self.manifest_file, component_id=1, layout=self.layout)
-        self.assertEqual(sp.count, 0)  # Fixed: shard_count -> count
+        self.assertEqual(sp.count, 0)
         self.assertEqual(len(sp.handles), 0)
         sp.close_all()
     
@@ -41,14 +41,15 @@ class TestSpineManifest(unittest.TestCase):
         
         sp = spine.Spine.from_manifest(self.manifest_file, component_id=1, layout=self.layout)
         
-        self.assertEqual(sp.count, 1) # Fixed: shard_count -> count
+        self.assertEqual(sp.count, 1)
         self.assertEqual(sp.handles[0].min_eid, 10)
         self.assertEqual(sp.handles[0].max_eid, 30)
         
-        results = sp.find_all_shards_and_indices(20) # Updated API usage
+        results = sp.find_all_shards_and_indices(20)
         self.assertEqual(len(results), 1)
         shard, idx = results[0]
-        self.assertEqual(shard.read_field_i64(idx, 0), 200)
+        # Accessed via shard.view instead of shard.read_field_i64
+        self.assertEqual(shard.view.read_field_i64(idx, 0), 200)
         
         sp.close_all()
     
@@ -67,16 +68,16 @@ class TestSpineManifest(unittest.TestCase):
         writer.finalize()
         
         sp = spine.Spine.from_manifest(self.manifest_file, component_id=1, layout=self.layout)
-        self.assertEqual(sp.count, 3) # Fixed
+        self.assertEqual(sp.count, 3)
         
         self.assertEqual(sp.handles[0].min_eid, 10)
         self.assertEqual(sp.handles[0].max_eid, 20)
         
         results = sp.find_all_shards_and_indices(10)
-        self.assertEqual(results[0][0].read_field_i64(results[0][1], 0), 100)
+        self.assertEqual(results[0][0].view.read_field_i64(results[0][1], 0), 100)
 
         results = sp.find_all_shards_and_indices(40)
-        self.assertEqual(results[0][0].read_field_i64(results[0][1], 0), 400)
+        self.assertEqual(results[0][0].view.read_field_i64(results[0][1], 0), 400)
         
         sp.close_all()
     
@@ -98,7 +99,7 @@ class TestSpineManifest(unittest.TestCase):
         writer.finalize()
         
         sp = spine.Spine.from_manifest(self.manifest_file, component_id=1, layout=self.layout)
-        self.assertEqual(sp.count, 2) # Fixed
+        self.assertEqual(sp.count, 2)
         
         self.assertEqual(len(sp.find_all_shards_and_indices(10)), 1)
         self.assertEqual(len(sp.find_all_shards_and_indices(30)), 0)
@@ -127,12 +128,12 @@ class TestSpineManifest(unittest.TestCase):
         # Entity 20 is only in shard1
         res = sp.find_all_shards_and_indices(20)
         self.assertEqual(len(res), 1)
-        self.assertEqual(res[0][0].read_field_i64(res[0][1], 0), 200)
+        self.assertEqual(res[0][0].view.read_field_i64(res[0][1], 0), 200)
         
         # Entity 25 is only in shard2 (despite overlap range)
         res = sp.find_all_shards_and_indices(25)
         self.assertEqual(len(res), 1)
-        self.assertEqual(res[0][0].read_field_i64(res[0][1], 0), 250)
+        self.assertEqual(res[0][0].view.read_field_i64(res[0][1], 0), 250)
         
         sp.close_all()
 
@@ -154,8 +155,8 @@ class TestSpineManifest(unittest.TestCase):
         handle1, idx1 = results[0]
         handle2, idx2 = results[1]
         
-        val1 = handle1.read_field_i64(idx1, 0)
-        val2 = handle2.read_field_i64(idx2, 0)
+        val1 = handle1.view.read_field_i64(idx1, 0)
+        val2 = handle2.view.read_field_i64(idx2, 0)
         values = sorted([val1, val2])
         self.assertEqual(values, [100, 200])
         sp.close_all()
