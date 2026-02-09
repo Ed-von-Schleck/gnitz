@@ -1,4 +1,5 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import r_uint64
 from gnitz.storage.memtable import (
     node_get_weight, node_get_entity_id, node_get_next_off, 
     node_get_payload_ptr, skip_list_find_exact, compare_payloads
@@ -95,7 +96,8 @@ class Engine(object):
 
     def flush_and_rotate(self, filename):
         if not self.mem_manager.active_table.has_active_data():
-            return -1, -1, False
+            # Fix: Use r_uint64(-1) to match the return type of self.mem_manager.flush_and_rotate
+            return r_uint64(-1), r_uint64(-1), False
 
         lsn_min = self.mem_manager.starting_lsn
         lsn_max = self.mem_manager.current_lsn - 1

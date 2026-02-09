@@ -1,4 +1,5 @@
 import os
+from rpython.rlib.rarithmetic import r_uint64
 from gnitz.storage import shard_ecs, writer_ecs, tournament_tree, compaction_logic
 from gnitz.storage.manifest import ManifestEntry
 
@@ -42,20 +43,27 @@ class CompactionPolicy(object):
 def finalize_compaction(old_shards, ref_counter):
     for fn in old_shards: ref_counter.mark_for_deletion(fn)
     ref_counter.try_cleanup()
-
+    
 def execute_compaction(cid, policy, manifest_manager, ref_counter, layout, output_dir="."):
     shard_metas = policy.select_shards_to_compact(cid)
     if len(shard_metas) < 2: return None
 
     input_files = []
-    min_lsn = -1; max_lsn = -1; min_eid = -1; max_eid = -1
+    min_lsn = -1; max_lsn = -1
+    # Fix: Unsigned bounds initialization
+    min_eid = r_uint64(-1) 
+    max_eid = r_uint64(0)
+    first_shard = True
 
     for meta in shard_metas:
         input_files.append(meta.filename)
         if min_lsn == -1 or meta.min_lsn < min_lsn: min_lsn = meta.min_lsn
         if meta.max_lsn > max_lsn: max_lsn = meta.max_lsn
-        if min_eid == -1 or meta.min_entity_id < min_eid: min_eid = meta.min_entity_id
-        if meta.max_entity_id > max_eid: max_eid = meta.max_entity_id
+        
+        # Fix: Flag-based unsigned comparison
+        if first_shard or meta.min_entity_id < min_eid: min_eid = meta.min_entity_id
+        if first_shard or meta.max_entity_id > max_eid: max_eid = meta.max_entity_id
+        first_shard = False
 
     new_fn = os.path.join(output_dir, "comp_c%d_lsn%d.db" % (cid, max_lsn))
     compact_shards(input_files, new_fn, layout)

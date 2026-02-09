@@ -1,4 +1,5 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import r_uint64
 from gnitz.storage import errors
 
 # CHANGE: entity_id must be ULONGLONG to match the rest of the engine
@@ -23,7 +24,8 @@ class StreamCursor(object):
 
     def peek_entity_id(self):
         if self.exhausted:
-            return rffi.cast(rffi.ULONGLONG, 0xFFFFFFFFFFFFFFFF)
+            # Fix: r_uint64(-1) avoids prebuilt long error
+            return r_uint64(-1)
         return self.view.get_entity_id(self.position)
     
     def advance(self):
@@ -87,7 +89,8 @@ class TournamentTree(object):
 
     def get_min_entity_id(self):
         if self.heap_size == 0:
-            return rffi.cast(rffi.ULONGLONG, 0xFFFFFFFFFFFFFFFF)
+            # Fix: r_uint64(-1) avoids prebuilt long error
+            return r_uint64(-1)
         return self.heap[0].entity_id
     
     def get_all_cursors_at_min(self):

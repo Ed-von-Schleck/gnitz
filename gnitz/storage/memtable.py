@@ -1,5 +1,6 @@
 from rpython.rlib.rrandom import Random
 from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.jit import unrolling_iterable, unroll_safe
 from gnitz.storage import arena, writer_ecs, errors, wal_format
 from gnitz.core import types, strings as string_logic, values as db_values
@@ -63,7 +64,6 @@ def compare_payloads(layout, ptr1, heap1, ptr2, heap2):
 @unroll_safe
 def skip_list_find_exact(base_ptr, head_off, entity_id, layout, encoded_payload_ptr, heap_ptr, update_offsets=None):
     curr_off = head_off
-    # entity_id is treated as unsigned for comparison
     for i in range(MAX_HEIGHT - 1, -1, -1):
         next_off = node_get_next_off(base_ptr, curr_off, i)
         while next_off != 0:
@@ -174,34 +174,50 @@ class MemTable(object):
         finally: lltype.free(tmp_buf, flavor='raw')
 
     def upsert_raw(self, entity_id, weight, raw_data):
+        """Standardizes search to only use Pointers, resolving UnionError."""
         base = self.arena.base_ptr
         blob_base = self.blob_arena.base_ptr
-        # entity_id is u64
-        pred_off = skip_list_find_exact(base, self.head_off, entity_id, self.layout, raw_data, blob_base, self._update_offsets)
-        h = 1
-        while h < MAX_HEIGHT and (self.rng.genrand32() & 1): h += 1
-        node_sz = self.node_base_size + (h * 4)
-        new_ptr = self.arena.alloc(node_sz)
-        new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
-        node_set_weight(base, new_off, weight)
-        new_ptr[8] = chr(h)
-        eid_ptr = rffi.ptradd(new_ptr, 12 + (h * 4))
-        rffi.cast(rffi.ULONGLONGP, eid_ptr)[0] = rffi.cast(rffi.ULONGLONG, entity_id)
-        payload_dest = rffi.ptradd(eid_ptr, 8)
-        for i in range(self.layout.stride): payload_dest[i] = raw_data[i]
-        for i in range(h):
-            p_off = self._update_offsets[i]
-            node_set_next_off(base, new_off, i, node_get_next_off(base, p_off, i))
-            node_set_next_off(base, p_off, i, new_off)
+        # Fix: Create raw buffer so skip_list_find_exact sees consistent Ptr type
+        tmp_buf = lltype.malloc(rffi.CCHARP.TO, self.layout.stride, flavor='raw')
+        try:
+            for i in range(self.layout.stride): tmp_buf[i] = raw_data[i]
+            pred_off = skip_list_find_exact(base, self.head_off, entity_id, self.layout, tmp_buf, blob_base, self._update_offsets)
+            
+            next_off = node_get_next_off(base, pred_off, 0)
+            match_found = False
+            if next_off != 0:
+                if node_get_entity_id(base, next_off) == entity_id:
+                    if compare_payloads(self.layout, node_get_payload_ptr(base, next_off), blob_base, tmp_buf, blob_base) == 0:
+                        match_found = True
+            if match_found:
+                node_set_weight(base, next_off, node_get_weight(base, next_off) + weight)
+                return
+            h = 1
+            while h < MAX_HEIGHT and (self.rng.genrand32() & 1): h += 1
+            node_sz = self.node_base_size + (h * 4)
+            new_ptr = self.arena.alloc(node_sz)
+            new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
+            node_set_weight(base, new_off, weight)
+            new_ptr[8] = chr(h)
+            eid_ptr = rffi.ptradd(new_ptr, 12 + (h * 4))
+            rffi.cast(rffi.ULONGLONGP, eid_ptr)[0] = rffi.cast(rffi.ULONGLONG, entity_id)
+            payload_dest = rffi.ptradd(eid_ptr, 8)
+            for i in range(self.layout.stride): payload_dest[i] = tmp_buf[i]
+            for i in range(h):
+                p_off = self._update_offsets[i]
+                node_set_next_off(base, new_off, i, node_get_next_off(base, p_off, i))
+                node_set_next_off(base, p_off, i, new_off)
+        finally: lltype.free(tmp_buf, flavor='raw')
 
     def flush(self, filename):
         sw = writer_ecs.ECSShardWriter(self.layout)
         base = self.arena.base_ptr
         blob_base = self.blob_arena.base_ptr
         
-        # CHANGE: Using -1 is safer for all-bits-set in rffi tests
-        min_eid = rffi.cast(rffi.ULONGLONG, -1) 
-        max_eid = rffi.cast(rffi.ULONGLONG, 0)
+        # Fix: Unsigned bounds initialization
+        min_eid = r_uint64(-1) 
+        max_eid = r_uint64(0)
+        first = True
         
         curr_off = node_get_next_off(base, self.head_off, 0)
         while curr_off != 0:
@@ -209,8 +225,10 @@ class MemTable(object):
             if w != 0:
                 eid = node_get_entity_id(base, curr_off)
                 sw.add_packed_row(eid, w, node_get_payload_ptr(base, curr_off), blob_base)
-                if eid < min_eid: min_eid = eid
-                if eid > max_eid: max_eid = eid
+                # Fix: Flag-based unsigned comparison
+                if first or eid < min_eid: min_eid = eid
+                if first or eid > max_eid: max_eid = eid
+                first = False
             curr_off = node_get_next_off(base, curr_off, 0)
         sw.finalize(filename)
         return min_eid, max_eid

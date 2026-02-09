@@ -10,7 +10,9 @@ class PersistentZSet(object):
         self.layout = layout
         self.component_id = component_id
         
-        if not os.path.exists(directory): os.makedirs(directory)
+        # Fix: Use mkdir to avoid internal calls to os.path.split (slicing error)
+        if not os.path.exists(directory): 
+            os.mkdir(directory)
             
         self.manifest_path = os.path.join(directory, "%s.manifest" % name)
         self.wal_path = os.path.join(directory, "%s.wal" % name)
@@ -32,7 +34,6 @@ class PersistentZSet(object):
         
         self._query_scratch = lltype.malloc(rffi.CCHARP.TO, self.layout.stride, flavor='raw')
 
-    # CHANGE: Accepts a List of DBValue objects directly to satisfy the Annotator
     def insert(self, entity_id, db_values_list):
         self.engine.mem_manager.put(entity_id, 1, db_values_list)
 
