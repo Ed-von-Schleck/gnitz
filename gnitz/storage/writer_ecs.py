@@ -34,6 +34,11 @@ class RawBuffer(object):
         rffi.cast(rffi.LONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(rffi.LONGLONG, value)
         self.count += 1
 
+    def append_u64(self, value):
+        self.ensure_capacity(1)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(rffi.ULONGLONG, value)
+        self.count += 1
+
     def append_bytes(self, source_ptr, length):
         self.ensure_capacity(length)
         _copy_memory(rffi.ptradd(self.ptr, self.count * self.item_size), source_ptr, length * self.item_size)
@@ -65,23 +70,17 @@ class ECSShardWriter(object):
         self._add_entity_weighted(entity_id, 1, *field_values)
     
     def _add_entity_weighted(self, entity_id, weight, *field_values):
-        # Ghost Property: Immediate Exit
         if weight == 0: return
-        
         self.count += 1
-        self.e_buf.append_i64(entity_id)
+        self.e_buf.append_u64(entity_id) # Unsigned EID
         self.w_buf.append_i64(weight)
-        
         stride = self.layout.stride
         for k in range(stride): self.scratch_row[k] = '\x00'
-            
         for i in FIELD_INDICES:
             if i >= len(field_values) or i >= len(self.layout.field_types): break
             val = field_values[i]
             ft = self.layout.field_types[i]
-            fo = self.layout.field_offsets[i]
-            dest = rffi.ptradd(self.scratch_row, fo)
-            
+            dest = rffi.ptradd(self.scratch_row, self.layout.field_offsets[i])
             if ft == types.TYPE_STRING:
                 s_val = str(val)
                 ho = 0
@@ -93,22 +92,17 @@ class ECSShardWriter(object):
                 rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val)
             elif isinstance(val, float):
                 rffi.cast(rffi.DOUBLEP, dest)[0] = rffi.cast(rffi.DOUBLE, val)
-        
         self.c_buf.append_bytes(self.scratch_row, 1)
 
     def add_packed_row(self, entity_id, weight, source_row_ptr, source_heap_ptr):
-        # Ghost Property: Immediate Exit
         if weight == 0: return
-        
         self.count += 1
-        self.e_buf.append_i64(entity_id)
+        self.e_buf.append_u64(entity_id) # Unsigned EID
         self.w_buf.append_i64(weight)
-        
         stride = self.layout.stride
         self.c_buf.ensure_capacity(1)
         dest_c = rffi.ptradd(self.c_buf.ptr, (self.c_buf.count) * stride)
         _copy_memory(dest_c, source_row_ptr, stride)
-        
         for i in FIELD_INDICES:
             if i >= len(self.layout.field_types): break
             if self.layout.field_types[i] == types.TYPE_STRING:
@@ -133,10 +127,8 @@ class ECSShardWriter(object):
             size_c = self.count * self.layout.stride
             off_b = _align_64(off_c + size_c)
             size_b = self.b_buf.count
-            
             cs_e = checksum.compute_checksum(self.e_buf.ptr, size_e)
             cs_w = checksum.compute_checksum(self.w_buf.ptr, size_w)
-            
             h = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor='raw')
             try:
                 for i in range(layout.HEADER_SIZE): h[i] = '\x00'
@@ -150,7 +142,6 @@ class ECSShardWriter(object):
                 rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_REG_B_ECS))[0] = rffi.cast(rffi.LONGLONG, off_b)
                 mmap_posix.write_c(fd, h, rffi.cast(rffi.SIZE_T, layout.HEADER_SIZE))
             finally: lltype.free(h, flavor='raw')
-            
             if size_e > 0: mmap_posix.write_c(fd, self.e_buf.ptr, rffi.cast(rffi.SIZE_T, size_e))
             self._write_padding(fd, off_w - (off_e + size_e))
             if size_w > 0: mmap_posix.write_c(fd, self.w_buf.ptr, rffi.cast(rffi.SIZE_T, size_w))

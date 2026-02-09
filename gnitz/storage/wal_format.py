@@ -29,7 +29,8 @@ def write_wal_block(fd, lsn, component_id, records, layout):
         for i in range(entry_count):
             entity_id, weight, component_data = records[i]
             off = i * record_size
-            rffi.cast(rffi.LONGLONGP, rffi.ptradd(body_buf, off))[0] = rffi.cast(rffi.LONGLONG, entity_id)
+            # Entity ID: ULONGLONG, Weight: LONGLONG
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(body_buf, off))[0] = rffi.cast(rffi.ULONGLONG, entity_id)
             rffi.cast(rffi.LONGLONGP, rffi.ptradd(body_buf, off + 8))[0] = rffi.cast(rffi.LONGLONG, weight)
             dest_data = rffi.ptradd(body_buf, off + 16)
             for j in range(stride):
@@ -71,8 +72,6 @@ def decode_wal_block(raw_bytes, layout):
         
     record_size = 16 + layout.stride
     body_size = entry_count * record_size
-    
-    # Annotator Proof: Prove stop index is non-negative and valid
     stop = WAL_BLOCK_HEADER_SIZE + body_size
     if stop < WAL_BLOCK_HEADER_SIZE:
         raise errors.CorruptShardError("Invalid body size")
@@ -80,7 +79,6 @@ def decode_wal_block(raw_bytes, layout):
     if len(raw_bytes) < stop:
         raise errors.CorruptShardError("Truncated body")
 
-    # The slice is now proven safe to the Annotator
     body_bytes = raw_bytes[WAL_BLOCK_HEADER_SIZE : stop]
     body_buf = lltype.malloc(rffi.CCHARP.TO, body_size, flavor='raw')
     try:
@@ -91,7 +89,8 @@ def decode_wal_block(raw_bytes, layout):
         records = []
         for i in range(entry_count):
             off = i * record_size
-            eid = rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, rffi.ptradd(body_buf, off))[0])
+            # Read Entity ID as ULONGLONG
+            eid = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(body_buf, off))[0]
             weight = rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, rffi.ptradd(body_buf, off + 8))[0])
             data = rffi.charpsize2str(rffi.ptradd(body_buf, off + 16), layout.stride)
             records.append((eid, weight, data))

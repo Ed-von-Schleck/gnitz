@@ -22,6 +22,11 @@ class MappedBuffer(object):
         val_ptr = rffi.cast(rffi.LONGLONGP, rffi.ptradd(self.ptr, offset))
         return val_ptr[0]
 
+    def read_u64(self, offset):
+        self._check_bounds(offset, 8)
+        val_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, offset))
+        return val_ptr[0]
+
     def read_i32(self, offset):
         self._check_bounds(offset, 4)
         val_ptr = rffi.cast(rffi.INTP, rffi.ptradd(self.ptr, offset))

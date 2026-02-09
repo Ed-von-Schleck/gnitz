@@ -1,8 +1,9 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import errors
 
+# CHANGE: entity_id must be ULONGLONG to match the rest of the engine
 HEAP_NODE_PTR = lltype.Ptr(lltype.Struct("HeapNode", 
-    ("entity_id", rffi.LONGLONG),
+    ("entity_id", rffi.ULONGLONG),
     ("cursor_idx", rffi.INT)
 ))
 
@@ -11,7 +12,6 @@ class StreamCursor(object):
         self.view = shard_view
         self.position = 0
         self.exhausted = False
-        # Ghost Property: Skip initial zero weights
         self._skip_ghosts()
     
     def _skip_ghosts(self):
@@ -23,12 +23,11 @@ class StreamCursor(object):
 
     def peek_entity_id(self):
         if self.exhausted:
-            return rffi.cast(rffi.LONGLONG, -1)
+            return rffi.cast(rffi.ULONGLONG, 0xFFFFFFFFFFFFFFFF)
         return self.view.get_entity_id(self.position)
     
     def advance(self):
-        if self.exhausted:
-            return
+        if self.exhausted: return
         self.position += 1
         self._skip_ghosts()
     
@@ -66,8 +65,7 @@ class TournamentTree(object):
                 self.heap[parent].entity_id = eid
                 self.heap[parent].cursor_idx = c_idx
                 idx = parent
-            else:
-                break
+            else: break
 
     def _sift_down(self, idx):
         while True:
@@ -85,12 +83,11 @@ class TournamentTree(object):
                 self.heap[smallest].entity_id = eid
                 self.heap[smallest].cursor_idx = c_idx
                 idx = smallest
-            else:
-                break
+            else: break
 
     def get_min_entity_id(self):
         if self.heap_size == 0:
-            return rffi.cast(rffi.LONGLONG, -1)
+            return rffi.cast(rffi.ULONGLONG, 0xFFFFFFFFFFFFFFFF)
         return self.heap[0].entity_id
     
     def get_all_cursors_at_min(self):

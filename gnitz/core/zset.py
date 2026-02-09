@@ -30,24 +30,18 @@ class PersistentZSet(object):
         self.engine = engine.Engine(self.mem_manager, self.spine, self.manifest_manager, self.registry, component_id=component_id, recover_wal_filename=self.wal_path)
         self.compaction_policy = compactor.CompactionPolicy(self.registry)
         
-        # Permanent scratch buffer for zero-boxing queries
         self._query_scratch = lltype.malloc(rffi.CCHARP.TO, self.layout.stride, flavor='raw')
 
-    def insert(self, entity_id, *values):
-        wrapped = [db_values.wrap(v) for v in values]
-        self.engine.mem_manager.put(entity_id, 1, wrapped)
+    # CHANGE: Accepts a List of DBValue objects directly to satisfy the Annotator
+    def insert(self, entity_id, db_values_list):
+        self.engine.mem_manager.put(entity_id, 1, db_values_list)
 
-    def remove(self, entity_id, *values):
-        wrapped = [db_values.wrap(v) for v in values]
-        self.engine.mem_manager.put(entity_id, -1, wrapped)
+    def remove(self, entity_id, db_values_list):
+        self.engine.mem_manager.put(entity_id, -1, db_values_list)
 
-    def get_weight(self, entity_id, *values):
-        wrapped = [db_values.wrap(v) for v in values]
-        # Pack into scratch buffer using the memtable logic
+    def get_weight(self, entity_id, db_values_list):
         for i in range(self.layout.stride): self._query_scratch[i] = '\x00'
-        self.mem_manager.active_table._pack_values_to_buf(self._query_scratch, wrapped)
-        
-        # Use blob_arena.base_ptr because the scratch packing might have allocated strings
+        self.mem_manager.active_table._pack_values_to_buf(self._query_scratch, db_values_list)
         blob_base = self.mem_manager.active_table.blob_arena.base_ptr
         return self.engine.get_effective_weight_raw(entity_id, self._query_scratch, blob_base)
 
