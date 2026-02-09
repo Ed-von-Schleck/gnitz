@@ -6,7 +6,6 @@ from gnitz.core import types, strings as string_logic, checksum
 
 FIELD_INDICES = unrolling_iterable(range(64))
 
-# CHANGE: entity_id must be ULONGLONG to match the rest of the engine
 HEAP_NODE_PTR = lltype.Ptr(lltype.Struct("HeapNode", 
     ("entity_id", rffi.ULONGLONG),
     ("cursor_idx", rffi.INT)
@@ -55,7 +54,6 @@ class StreamCursor(object):
 
     def peek_entity_id(self):
         if self.exhausted:
-            # Fix: r_uint64(-1) avoids prebuilt long error
             return r_uint64(-1)
         return self.view.get_entity_id(self.position)
     
@@ -121,38 +119,71 @@ class TournamentTree(object):
 
     def get_min_entity_id(self):
         if self.heap_size == 0:
-            # Fix: r_uint64(-1) avoids prebuilt long error
             return r_uint64(-1)
         return self.heap[0].entity_id
     
     def get_all_cursors_at_min(self):
+        """
+        Efficiently retrieves all cursor indices that share the minimum Entity ID.
+        Optimization: Uses a pruned traversal starting from the root instead of 
+        scanning the entire array. Since it is a min-heap, any node > min_eid
+        implies all its children are also > min_eid.
+        """
         if self.heap_size == 0: return []
+        
         min_eid = self.heap[0].entity_id
         res = []
-        for i in range(self.heap_size):
-            if self.heap[i].entity_id == min_eid:
-                res.append(rffi.cast(lltype.Signed, self.heap[i].cursor_idx))
+        stack = [0]
+        
+        while len(stack) > 0:
+            idx = stack.pop()
+            
+            # If current node matches min, add it and check children
+            if self.heap[idx].entity_id == min_eid:
+                res.append(rffi.cast(lltype.Signed, self.heap[idx].cursor_idx))
+                
+                right = 2 * idx + 2
+                if right < self.heap_size:
+                    stack.append(right)
+                
+                left = 2 * idx + 1
+                if left < self.heap_size:
+                    stack.append(left)
+            # If heap[idx] > min_eid, we prune this branch
+        
         return res
     
     def advance_min_cursors(self):
+        """
+        Advances all cursors that are currently at the minimum Entity ID.
+        Optimization: Repeatedly processes the root while it matches min_eid.
+        This avoids a linear scan of the heap array.
+        """
         if self.heap_size == 0: return
-        min_eid = self.heap[0].entity_id
-        to_advance = []
-        i = 0
-        while i < self.heap_size:
-            if self.heap[i].entity_id == min_eid:
-                to_advance.append(rffi.cast(lltype.Signed, self.heap[i].cursor_idx))
-                self.heap_size -= 1
-                if i < self.heap_size:
-                    self.heap[i].entity_id = self.heap[self.heap_size].entity_id
-                    self.heap[i].cursor_idx = self.heap[self.heap_size].cursor_idx
-                    self._sift_down(i)
-                    continue
-            i += 1
-        for c_idx in to_advance:
+        
+        target_eid = self.heap[0].entity_id
+        
+        # Keep processing the root as long as it matches the target ID.
+        # As we update and sift down, other matching nodes (if any) will 
+        # bubble up to the root.
+        while self.heap_size > 0 and self.heap[0].entity_id == target_eid:
+            c_idx = rffi.cast(lltype.Signed, self.heap[0].cursor_idx)
+            
+            # Advance the underlying cursor
             self.cursors[c_idx].advance()
-            if not self.cursors[c_idx].is_exhausted():
-                self._heap_push(self.cursors[c_idx].peek_entity_id(), c_idx)
+            
+            if self.cursors[c_idx].is_exhausted():
+                # Remove from heap: replace root with last element
+                last_idx = self.heap_size - 1
+                self.heap_size -= 1
+                if self.heap_size > 0:
+                    self.heap[0].entity_id = self.heap[last_idx].entity_id
+                    self.heap[0].cursor_idx = self.heap[last_idx].cursor_idx
+                    self._sift_down(0)
+            else:
+                # Update root with new value from cursor
+                self.heap[0].entity_id = self.cursors[c_idx].peek_entity_id()
+                self._sift_down(0)
 
     def is_exhausted(self):
         return self.heap_size == 0
