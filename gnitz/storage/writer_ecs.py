@@ -13,6 +13,11 @@ def _align_64(val): return (val + 63) & ~63
 def _copy_memory(dest_ptr, src_ptr, size):
     for i in range(size): dest_ptr[i] = src_ptr[i]
 
+def _compare_memory(p1, p2, size):
+    for i in range(size):
+        if p1[i] != p2[i]: return False
+    return True
+
 class RawBuffer(object):
     def __init__(self, item_size, initial_capacity=4096):
         self.item_size = item_size
@@ -31,22 +36,23 @@ class RawBuffer(object):
             self.ptr = new_ptr
             self.capacity = new_cap
 
-    def append_i64(self, value):
-        self.ensure_capacity(1)
-        rffi.cast(rffi.LONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(rffi.LONGLONG, value)
-        self.count += 1
-
     def append_u64(self, value):
         self.ensure_capacity(1)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(rffi.ULONGLONG, value)
+        self.count += 1
+
+    def append_i64(self, value):
+        self.ensure_capacity(1)
+        rffi.cast(rffi.LONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(rffi.LONGLONG, value)
         self.count += 1
 
     def append_bytes(self, source_ptr, length):
         self.ensure_capacity(length)
         _copy_memory(rffi.ptradd(self.ptr, self.count * self.item_size), source_ptr, length * self.item_size)
         self.count += length
-        
+
     def append_from_string(self, s):
+        # Kept for compatibility if needed, though usually replaced by append_bytes with str2charp
         l = len(s)
         self.ensure_capacity(l)
         dest = rffi.ptradd(self.ptr, self.count)
@@ -66,29 +72,57 @@ class ECSShardWriter(object):
         self.w_buf = RawBuffer(8)
         self.c_buf = RawBuffer(self.layout.stride)
         self.b_buf = RawBuffer(1)
+        # Deduplication Cache: (Hash, Length) -> Offset in b_buf
+        self.blob_cache = {} 
         self.scratch_row = lltype.malloc(rffi.CCHARP.TO, self.layout.stride, flavor='raw')
+
+    def _get_or_append_blob(self, src_ptr, length):
+        """Internal deduplicator. Returns offset in Region B."""
+        if length == 0: return 0
+        h = checksum.compute_checksum(src_ptr, length)
+        
+        # Check cache (Hash + Length for safety)
+        cache_key = (h, length)
+        if cache_key in self.blob_cache:
+            existing_offset = self.blob_cache[cache_key]
+            # Database-grade safety: Verify actual bytes to prevent hash collisions
+            # Note: b_buf.ptr might have moved due to realloc, but offset is valid relative to current ptr
+            existing_ptr = rffi.ptradd(self.b_buf.ptr, existing_offset)
+            if _compare_memory(src_ptr, existing_ptr, length):
+                return existing_offset
+        
+        # Not found or collision: Append new
+        new_offset = self.b_buf.count
+        self.b_buf.append_bytes(src_ptr, length)
+        self.blob_cache[cache_key] = new_offset
+        return new_offset
 
     def add_entity(self, entity_id, *field_values):
         self._add_entity_weighted(entity_id, 1, *field_values)
-    
+
     def _add_entity_weighted(self, entity_id, weight, *field_values):
         if weight == 0: return
         self.count += 1
         self.e_buf.append_u64(entity_id)
         self.w_buf.append_i64(weight)
-        stride = self.layout.stride
-        for k in range(stride): self.scratch_row[k] = '\x00'
+        
+        for k in range(self.layout.stride): self.scratch_row[k] = '\x00'
         for i in FIELD_INDICES:
             if i >= len(field_values) or i >= len(self.layout.field_types): break
             val = field_values[i]
             ft = self.layout.field_types[i]
             dest = rffi.ptradd(self.scratch_row, self.layout.field_offsets[i])
+            
             if ft == types.TYPE_STRING:
                 s_val = str(val)
                 ho = 0
                 if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
-                    ho = self.b_buf.count
-                    self.b_buf.append_from_string(s_val)
+                    # Convert string to temporary raw buffer for hashing
+                    tmp_str_ptr = rffi.str2charp(s_val)
+                    try:
+                        ho = self._get_or_append_blob(tmp_str_ptr, len(s_val))
+                    finally:
+                        rffi.free_charp(tmp_str_ptr)
                 string_logic.pack_string(dest, s_val, ho)
             elif isinstance(val, (int, long)):
                 rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val)
@@ -97,10 +131,7 @@ class ECSShardWriter(object):
         self.c_buf.append_bytes(self.scratch_row, 1)
 
     def add_packed_row(self, entity_id, weight, source_row_ptr, source_heap_ptr):
-        """
-        Copies a row from an existing shard into the new one.
-        Handles relocation of German Strings (swizzling pointers).
-        """
+        """Moves data with pointer swizzling and blob deduplication."""
         if weight == 0: return
         self.count += 1
         self.e_buf.append_u64(entity_id)
@@ -110,10 +141,10 @@ class ECSShardWriter(object):
         self.c_buf.ensure_capacity(1)
         dest_c = rffi.ptradd(self.c_buf.ptr, (self.c_buf.count) * stride)
         
-        # 1. Bulk copy source data (primitives + inline strings)
-        for i in range(stride): dest_c[i] = source_row_ptr[i]
+        # 1. Bulk copy primitives and inlined strings
+        _copy_memory(dest_c, source_row_ptr, stride)
         
-        # 2. Update pointers for "Long" strings
+        # 2. Process Long strings via deduplicator
         for i in FIELD_INDICES:
             if i >= len(self.layout.field_types): break
             if self.layout.field_types[i] == types.TYPE_STRING:
@@ -121,15 +152,13 @@ class ECSShardWriter(object):
                 length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, s_ptr)[0])
                 
                 if length > string_logic.SHORT_STRING_THRESHOLD:
-                    # Resolve old offset from the source shard's C region
+                    # Get old offset from source shard
                     u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(s_ptr, 8))
                     old_off = rffi.cast(lltype.Signed, u64_view[0])
                     
-                    # Allocate in the new shard's B region
-                    new_off = self.b_buf.count
-                    self.b_buf.append_bytes(rffi.ptradd(source_heap_ptr, old_off), length)
-                    
-                    # Overwrite C region with the new relative offset
+                    # Deduplicate and swizzle to new offset
+                    # We pass pointer to raw data in old shard's heap
+                    new_off = self._get_or_append_blob(rffi.ptradd(source_heap_ptr, old_off), length)
                     u64_view[0] = rffi.cast(rffi.ULONGLONG, new_off)
         
         self.c_buf.count += 1
@@ -147,25 +176,27 @@ class ECSShardWriter(object):
             off_b = _align_64(off_c + size_c)
             size_b = self.b_buf.count
 
+            # Current checksum implementation
             cs_e = checksum.compute_checksum(self.e_buf.ptr, size_e)
             cs_w = checksum.compute_checksum(self.w_buf.ptr, size_w)
             cs_c = checksum.compute_checksum(self.c_buf.ptr, size_c)
             cs_b = checksum.compute_checksum(self.b_buf.ptr, size_b)
             
-            h = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor='raw')
+            header = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor='raw')
             try:
-                for i in range(layout.HEADER_SIZE): h[i] = '\x00'
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_MAGIC))[0] = rffi.cast(rffi.ULONGLONG, layout.MAGIC_NUMBER)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_COUNT))[0] = rffi.cast(rffi.ULONGLONG, self.count)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_CHECKSUM_E))[0] = rffi.cast(rffi.ULONGLONG, cs_e)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_CHECKSUM_W))[0] = rffi.cast(rffi.ULONGLONG, cs_w)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_REG_E_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_e)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_REG_W_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_w)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_REG_C_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_c)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_REG_B_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_b)
-                mmap_posix.write_c(fd, h, rffi.cast(rffi.SIZE_T, layout.HEADER_SIZE))
-            finally: lltype.free(h, flavor='raw')
+                for i in range(layout.HEADER_SIZE): header[i] = '\x00'
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_MAGIC))[0] = rffi.cast(rffi.ULONGLONG, layout.MAGIC_NUMBER)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_COUNT))[0] = rffi.cast(rffi.ULONGLONG, self.count)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_CHECKSUM_E))[0] = rffi.cast(rffi.ULONGLONG, cs_e)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_CHECKSUM_W))[0] = rffi.cast(rffi.ULONGLONG, cs_w)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_REG_E_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_e)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_REG_W_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_w)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_REG_C_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_c)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_REG_B_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_b)
+                mmap_posix.write_c(fd, header, rffi.cast(rffi.SIZE_T, layout.HEADER_SIZE))
+            finally: lltype.free(header, flavor='raw')
             
+            # Regional Writes
             if size_e > 0: mmap_posix.write_c(fd, self.e_buf.ptr, rffi.cast(rffi.SIZE_T, size_e))
             self._write_padding(fd, off_w - (off_e + size_e))
             if size_w > 0: mmap_posix.write_c(fd, self.w_buf.ptr, rffi.cast(rffi.SIZE_T, size_w))
@@ -174,20 +205,18 @@ class ECSShardWriter(object):
             self._write_padding(fd, off_b - (off_c + size_c))
             if size_b > 0: mmap_posix.write_c(fd, self.b_buf.ptr, rffi.cast(rffi.SIZE_T, size_b))
             
-            f = lltype.malloc(rffi.CCHARP.TO, layout.FOOTER_SIZE, flavor='raw')
+            # Footer with trailing checksums
+            footer = lltype.malloc(rffi.CCHARP.TO, layout.FOOTER_SIZE, flavor='raw')
             try:
-                rffi.cast(rffi.ULONGLONGP, f)[0] = rffi.cast(rffi.ULONGLONG, cs_c)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(f, 8))[0] = rffi.cast(rffi.ULONGLONG, cs_b)
-                mmap_posix.write_c(fd, f, rffi.cast(rffi.SIZE_T, layout.FOOTER_SIZE))
-            finally: lltype.free(f, flavor='raw')
+                rffi.cast(rffi.ULONGLONGP, footer)[0] = rffi.cast(rffi.ULONGLONG, cs_c)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(footer, 8))[0] = rffi.cast(rffi.ULONGLONG, cs_b)
+                mmap_posix.write_c(fd, footer, rffi.cast(rffi.SIZE_T, layout.FOOTER_SIZE))
+            finally: lltype.free(footer, flavor='raw')
 
             mmap_posix.fsync_c(fd)
         finally:
             rposix.close(fd)
-            self.e_buf.free()
-            self.w_buf.free()
-            self.c_buf.free()
-            self.b_buf.free()
+            self.e_buf.free(); self.w_buf.free(); self.c_buf.free(); self.b_buf.free()
             if self.scratch_row: lltype.free(self.scratch_row, flavor='raw')
 
         os.rename(tmp_filename, filename)

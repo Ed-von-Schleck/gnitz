@@ -1,6 +1,10 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
+from rpython.rlib.jit import unrolling_iterable
 from gnitz.storage import errors
+from gnitz.core import types, strings as string_logic, checksum
+
+FIELD_INDICES = unrolling_iterable(range(64))
 
 # CHANGE: entity_id must be ULONGLONG to match the rest of the engine
 HEAP_NODE_PTR = lltype.Ptr(lltype.Struct("HeapNode", 
@@ -13,6 +17,8 @@ class StreamCursor(object):
         self.view = shard_view
         self.position = 0
         self.exhausted = False
+        self.current_hashes = [] 
+        self.hashes_ready = False
         self._skip_ghosts()
     
     def _skip_ghosts(self):
@@ -21,6 +27,31 @@ class StreamCursor(object):
                 return
             self.position += 1
         self.exhausted = True
+
+    def get_current_payload_hashes(self, layout):
+        """Lazily computes hashes for long strings in the current record."""
+        if self.hashes_ready:
+            return self.current_hashes
+        
+        self.current_hashes = []
+        payload_ptr = self.view.get_data_ptr(self.position)
+        blob_base = self.view.buf_b.ptr
+        
+        for i in FIELD_INDICES:
+            if i >= len(layout.field_types): break
+            if layout.field_types[i] == types.TYPE_STRING:
+                s_ptr = rffi.ptradd(payload_ptr, layout.field_offsets[i])
+                length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, s_ptr)[0])
+                
+                if length > string_logic.SHORT_STRING_THRESHOLD:
+                    u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(s_ptr, 8))
+                    offset = rffi.cast(lltype.Signed, u64_view[0])
+                    # Compute hash of the actual string content
+                    h = checksum.compute_checksum(rffi.ptradd(blob_base, offset), length)
+                    self.current_hashes.append(h)
+        
+        self.hashes_ready = True
+        return self.current_hashes
 
     def peek_entity_id(self):
         if self.exhausted:
@@ -31,6 +62,7 @@ class StreamCursor(object):
     def advance(self):
         if self.exhausted: return
         self.position += 1
+        self.hashes_ready = False # Invalidate hash cache
         self._skip_ghosts()
     
     def is_exhausted(self):

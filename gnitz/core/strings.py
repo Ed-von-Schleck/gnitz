@@ -6,8 +6,8 @@ SHORT_STRING_THRESHOLD = 12
 
 def compute_prefix(s):
     length = len(s)
-    # Perform bit-shifts on the native machine word (r_uint)
     prefix = r_uint(0)
+    # We always use up to 4 bytes for the prefix if available
     max_prefix_len = 4 if length > 4 else length
     for i in range(max_prefix_len):
         prefix |= r_uint(ord(s[i])) << (i * 8)
@@ -16,16 +16,24 @@ def compute_prefix(s):
 def pack_string(target_ptr, string_data, heap_offset_if_long):
     length = len(string_data)
     u32_ptr = rffi.cast(rffi.UINTP, target_ptr)
+    
+    # Bytes 0-3: Length
     u32_ptr[0] = rffi.cast(rffi.UINT, length)
     
+    # Bytes 4-7: Prefix (ALWAYS pack this for consistent comparison)
+    u32_ptr[1] = compute_prefix(string_data)
+    
     if length <= SHORT_STRING_THRESHOLD:
-        payload_ptr = rffi.ptradd(target_ptr, 4)
-        for i in range(length):
-            payload_ptr[i] = string_data[i]
-        for i in range(length, SHORT_STRING_THRESHOLD):
+        # Bytes 8-15: Inline Suffix
+        payload_ptr = rffi.ptradd(target_ptr, 8)
+        # We only copy from index 4 onwards because the first 4 bytes are in the prefix
+        for i in range(length - 4 if length > 4 else 0):
+            payload_ptr[i] = string_data[i + 4]
+        # Zero out remaining inline bytes
+        for i in range(length - 4 if length > 4 else 0, 8):
             payload_ptr[i] = '\x00'
     else:
-        u32_ptr[1] = compute_prefix(string_data)
+        # Bytes 8-15: 64-bit Heap Offset
         u64_payload_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target_ptr, 8))
         u64_payload_ptr[0] = rffi.cast(rffi.ULONGLONG, heap_offset_if_long)
 
@@ -41,14 +49,14 @@ def string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_pref
         return False
     if search_len == 0:
         return True
-    # FIX: Cast to lltype.Signed to promote the 32-bit UINT to machine word size.
-    # This prevents TyperError during translation and TypeError during testing.
-    s_pref = rffi.cast(lltype.Signed, u32_struct_ptr[1])
-    q_pref = rffi.cast(lltype.Signed, search_prefix)
-    if s_pref != q_pref:
+    
+    # Check Prefix (Bytes 4-7)
+    if rffi.cast(lltype.Signed, u32_struct_ptr[1]) != rffi.cast(lltype.Signed, search_prefix):
         return False
+    
     if search_len <= 4:
         return True
+        
     if search_len <= SHORT_STRING_THRESHOLD:
         suffix_ptr_struct = rffi.ptradd(struct_ptr, 8)
         for i in range(search_len - 4):
@@ -56,8 +64,8 @@ def string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_pref
                 return False
         return True
     else:
-        u64_struct_ptr = rffi.cast(rffi.ULONGLONGP, struct_ptr)
-        offset = rffi.cast(lltype.Signed, u64_struct_ptr[1])
+        u64_struct_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(struct_ptr, 8))
+        offset = rffi.cast(lltype.Signed, u64_struct_ptr[0])
         heap_ptr = rffi.ptradd(heap_base_ptr, offset)
         return _memcmp(heap_ptr, search_str, search_len)
 
@@ -68,11 +76,13 @@ def string_equals_dual(ptr1, heap1, ptr2, heap2):
     len2 = rffi.cast(lltype.Signed, u32_p2[0])
     if len1 != len2: return False
     if len1 == 0: return True
-    # FIX: Cast to lltype.Signed to promote the 32-bit UINT to machine word size.
-    p1_pref = rffi.cast(lltype.Signed, u32_p1[1])
-    p2_pref = rffi.cast(lltype.Signed, u32_p2[1])
-    if p1_pref != p2_pref: return False
+    
+    # Check Prefix
+    if rffi.cast(lltype.Signed, u32_p1[1]) != rffi.cast(lltype.Signed, u32_p2[1]): 
+        return False
+        
     if len1 <= 4: return True
+    
     if len1 <= SHORT_STRING_THRESHOLD:
         p1_char = rffi.ptradd(ptr1, 8)
         p2_char = rffi.ptradd(ptr2, 8)
@@ -96,6 +106,7 @@ def string_compare(ptr1, heap1, ptr2, heap2):
     len2 = rffi.cast(lltype.Signed, u32_p2[0])
     min_len = len1 if len1 < len2 else len2
 
+    # Compare Prefix bytes directly
     pref_p1 = rffi.ptradd(ptr1, 4)
     pref_p2 = rffi.ptradd(ptr2, 4)
     pref_limit = 4 if min_len > 4 else min_len
@@ -108,9 +119,10 @@ def string_compare(ptr1, heap1, ptr2, heap2):
         if len1 > len2: return 1
         return 0
 
+    # Locate Suffix/Heap data
     if len1 <= SHORT_STRING_THRESHOLD:
         data1 = rffi.ptradd(ptr1, 8)
-        offset1 = -4
+        offset1 = -4 # Adjust for loop starting at 4
     else:
         u64_1 = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr1, 8))[0]
         data1 = rffi.ptradd(heap1, rffi.cast(lltype.Signed, u64_1))
