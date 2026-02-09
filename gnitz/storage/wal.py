@@ -32,7 +32,9 @@ class WALReader(object):
         b15 = ord(header_str[15])
         entry_count = b12 | (b13 << 8) | (b14 << 16) | (b15 << 24)
         
-        body_size = entry_count * (16 + self.layout.stride)
+        # Fix: Use aligned record size to calculate body read length
+        record_size = wal_format.get_record_size(self.layout)
+        body_size = entry_count * record_size
         
         # 2. Read Body
         body_str = ""

@@ -12,13 +12,21 @@ OFF_ENTRY_COUNT = 12
 OFF_CHECKSUM = 16
 OFF_RESERVED = 24
 
+def _align_8(val):
+    return (val + 7) & ~7
+
+def get_record_size(layout):
+    # Header per record (8 byte EID + 8 byte Weight) + component stride, 
+    # aligned to 8 bytes to ensure the next record starts on a word boundary.
+    return _align_8(16 + layout.stride)
+
 def WALRecord(entity_id, weight, component_data):
     return (entity_id, weight, component_data)
 
 def write_wal_block(fd, lsn, component_id, records, layout):
     entry_count = len(records)
     stride = layout.stride
-    record_size = 16 + stride
+    record_size = get_record_size(layout)
     body_size = entry_count * record_size
     
     if body_size > MAX_WAL_BLOCK_SIZE:
@@ -26,15 +34,24 @@ def write_wal_block(fd, lsn, component_id, records, layout):
 
     body_buf = lltype.malloc(rffi.CCHARP.TO, body_size, flavor='raw')
     try:
+        # Initialize buffer to zero to ensure padding bytes are clean
+        for i in range(body_size): body_buf[i] = '\x00'
+        
         for i in range(entry_count):
             entity_id, weight, component_data = records[i]
             off = i * record_size
+            
+            # Entity ID (8 bytes)
             rffi.cast(rffi.ULONGLONGP, rffi.ptradd(body_buf, off))[0] = rffi.cast(rffi.ULONGLONG, entity_id)
+            
+            # Weight (8 bytes)
             rffi.cast(rffi.LONGLONGP, rffi.ptradd(body_buf, off + 8))[0] = rffi.cast(rffi.LONGLONG, weight)
+            
+            # Component Payload (stride bytes)
             dest_data = rffi.ptradd(body_buf, off + 16)
             for j in range(stride):
-                if j < len(component_data): dest_data[j] = component_data[j]
-                else: dest_data[j] = '\x00'
+                if j < len(component_data): 
+                    dest_data[j] = component_data[j]
         
         body_checksum = checksum.compute_checksum(body_buf, body_size)
         header_buf = lltype.malloc(rffi.CCHARP.TO, WAL_BLOCK_HEADER_SIZE, flavor='raw')
@@ -47,6 +64,7 @@ def write_wal_block(fd, lsn, component_id, records, layout):
             mmap_posix.write_c(fd, header_buf, rffi.cast(rffi.SIZE_T, WAL_BLOCK_HEADER_SIZE))
         finally:
             lltype.free(header_buf, flavor='raw')
+            
         if body_size > 0:
             mmap_posix.write_c(fd, body_buf, rffi.cast(rffi.SIZE_T, body_size))
     finally:
@@ -55,12 +73,12 @@ def write_wal_block(fd, lsn, component_id, records, layout):
 def decode_wal_block(block_ptr, block_len, layout):
     """
     Decodes a WAL block from a raw memory pointer.
-    Optimized for ll2ctypes performance by using array-indexing on casts.
+    Respects 8-byte record alignment.
     """
     if block_len < WAL_BLOCK_HEADER_SIZE:
         raise errors.CorruptShardError("Truncated header")
     
-    # 1. Decode Header (Offsets 0, 8, 12, 16)
+    # 1. Decode Header
     lsn = rffi.cast(rffi.ULONGLONGP, block_ptr)[0]
     
     cid_ptr = rffi.cast(rffi.UINTP, rffi.ptradd(block_ptr, OFF_COMPONENT_ID))
@@ -75,7 +93,7 @@ def decode_wal_block(block_ptr, block_len, layout):
     if entry_count < 0:
         raise errors.CorruptShardError("Negative entry count")
     
-    record_size = 16 + layout.stride
+    record_size = get_record_size(layout)
     body_size = entry_count * record_size
     if block_len < WAL_BLOCK_HEADER_SIZE + body_size:
         raise errors.CorruptShardError("Truncated body")
@@ -89,12 +107,18 @@ def decode_wal_block(block_ptr, block_len, layout):
     records = []
     current_rec_ptr = body_ptr
     for i in range(entry_count):
+        # Entity ID (Start of record, 8-byte aligned)
         eid = rffi.cast(rffi.ULONGLONGP, current_rec_ptr)[0]
-        weight = rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, rffi.ptradd(current_rec_ptr, 8))[0])
+        
+        # Weight (8 bytes after EID, 8-byte aligned)
+        weight_val = rffi.cast(rffi.LONGLONGP, rffi.ptradd(current_rec_ptr, 8))[0]
+        weight = rffi.cast(lltype.Signed, weight_val)
+        
         # Extract component payload
         data = rffi.charpsize2str(rffi.ptradd(current_rec_ptr, 16), layout.stride)
         records.append((eid, weight, data))
-        # Advance pointer to next record
+        
+        # Advance pointer to next record (using aligned record_size)
         current_rec_ptr = rffi.ptradd(current_rec_ptr, record_size)
         
     return lsn, component_id, records
