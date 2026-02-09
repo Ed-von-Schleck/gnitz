@@ -40,6 +40,7 @@ class Engine(object):
         except OSError:
             return
 
+        # RPython fix: Ensure all LSN trackers are unsigned
         max_lsn_finalized = self.current_lsn - r_uint64(1)
         max_lsn_seen = max_lsn_finalized
         first_lsn_seen = r_uint64(0)

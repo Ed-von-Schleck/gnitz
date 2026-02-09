@@ -49,20 +49,26 @@ def execute_compaction(cid, policy, manifest_manager, ref_counter, layout, outpu
     if len(shard_metas) < 2: return None
 
     input_files = []
-    min_lsn = -1; max_lsn = -1
-    # Fix: Unsigned bounds initialization
-    min_eid = r_uint64(-1) 
+    # RPython fix: Initialize with unsigned 0 to match meta types
+    min_lsn = r_uint64(0)
+    max_lsn = r_uint64(0)
+    min_eid = r_uint64(0) 
     max_eid = r_uint64(0)
     first_shard = True
 
     for meta in shard_metas:
         input_files.append(meta.filename)
-        if min_lsn == -1 or meta.min_lsn < min_lsn: min_lsn = meta.min_lsn
-        if meta.max_lsn > max_lsn: max_lsn = meta.max_lsn
         
-        # Fix: Flag-based unsigned comparison
-        if first_shard or meta.min_entity_id < min_eid: min_eid = meta.min_entity_id
-        if first_shard or meta.max_entity_id > max_eid: max_eid = meta.max_entity_id
+        if first_shard or meta.min_lsn < min_lsn: 
+            min_lsn = meta.min_lsn
+        if first_shard or meta.max_lsn > max_lsn: 
+            max_lsn = meta.max_lsn
+        
+        if first_shard or meta.min_entity_id < min_eid: 
+            min_eid = meta.min_entity_id
+        if first_shard or meta.max_entity_id > max_eid: 
+            max_eid = meta.max_entity_id
+            
         first_shard = False
 
     new_fn = os.path.join(output_dir, "comp_c%d_lsn%d.db" % (cid, max_lsn))
