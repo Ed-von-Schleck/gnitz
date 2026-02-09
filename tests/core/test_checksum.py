@@ -56,7 +56,9 @@ class TestChecksum(unittest.TestCase):
             lltype.free(buf, flavor='raw')
 
     def test_large_buffer(self):
-        size = 1024 * 1024
+        # Reduced from 1MB to 64KB to accommodate slow ll2ctypes overhead 
+        # in untranslated tests while still verifying loop logic.
+        size = 64 * 1024 
         buf = lltype.malloc(rffi.CCHARP.TO, size, flavor='raw')
         try:
             for i in range(size):
@@ -64,6 +66,7 @@ class TestChecksum(unittest.TestCase):
             
             c = checksum.compute_checksum(buf, size)
             self.assertIsInstance(c, (int, long))
+            self.assertNotEqual(c, 0)
         finally:
             lltype.free(buf, flavor='raw')
 

@@ -4,37 +4,24 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import wal, wal_format, errors
 from gnitz.core import types, strings as string_logic
 
-
 class TestWALWriter(unittest.TestCase):
     def setUp(self):
-        # Simple layout: [Value (I64), Label (String)]
         self.layout = types.ComponentLayout([types.TYPE_I64, types.TYPE_STRING])
         self.test_wal = "test_wal.log"
-        
-        # Clean up any existing test file
         if os.path.exists(self.test_wal):
             os.unlink(self.test_wal)
     
     def tearDown(self):
-        # Clean up test file
         if os.path.exists(self.test_wal):
             os.unlink(self.test_wal)
     
     def _create_packed_component(self, value, label):
-        """Helper to create packed component data."""
         stride = self.layout.stride
         buf = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
         try:
-            for i in range(stride):
-                buf[i] = '\x00'
-            
-            # Pack value (i64)
+            for i in range(stride): buf[i] = '\x00'
             rffi.cast(rffi.LONGLONGP, buf)[0] = rffi.cast(rffi.LONGLONG, value)
-            
-            # Pack string
-            string_ptr = rffi.ptradd(buf, 8)
-            string_logic.pack_string(string_ptr, label, 0)
-            
+            string_logic.pack_string(rffi.ptradd(buf, 8), label, 0)
             return rffi.charpsize2str(buf, stride)
         finally:
             lltype.free(buf, flavor='raw')
@@ -139,59 +126,58 @@ class TestWALWriter(unittest.TestCase):
     def test_read_back_written_blocks(self):
         """Test that written blocks can be read back correctly."""
         writer = wal.WALWriter(self.test_wal, self.layout)
-        
-        # Write 2 blocks
         for lsn in range(1, 3):
             component_data = self._create_packed_component(lsn * 100, "lsn_%d" % lsn)
             records = [wal_format.WALRecord(lsn * 10, 1, component_data)]
             writer.append_block(lsn, lsn, records)
-        
         writer.close()
         
-        # Read file back
         with open(self.test_wal, 'rb') as f:
             data = f.read()
         
-        # Decode first block
         block_size = wal_format.WAL_BLOCK_HEADER_SIZE + (16 + self.layout.stride)
+        
+        # Block 1
         block1_data = data[:block_size]
-        lsn1, comp_id1, records1 = wal_format.decode_wal_block(block1_data, self.layout)
+        p1 = rffi.str2charp(block1_data)
+        try:
+            lsn1, comp_id1, records1 = wal_format.decode_wal_block(p1, len(block1_data), self.layout)
+            self.assertEqual(lsn1, 1)
+            self.assertEqual(comp_id1, 1)
+            self.assertEqual(records1[0][0], 10)
+        finally:
+            rffi.free_charp(p1)
         
-        self.assertEqual(lsn1, 1)
-        self.assertEqual(comp_id1, 1)
-        self.assertEqual(len(records1), 1)
-        self.assertEqual(records1[0][0], 10) # entity_id
-        
-        # Decode second block
+        # Block 2
         block2_data = data[block_size:block_size * 2]
-        lsn2, comp_id2, records2 = wal_format.decode_wal_block(block2_data, self.layout)
-        
-        self.assertEqual(lsn2, 2)
-        self.assertEqual(comp_id2, 2)
-        self.assertEqual(len(records2), 1)
-        self.assertEqual(records2[0][0], 20) # entity_id
-    
+        p2 = rffi.str2charp(block2_data)
+        try:
+            lsn2, comp_id2, records2 = wal_format.decode_wal_block(p2, len(block2_data), self.layout)
+            self.assertEqual(lsn2, 2)
+            self.assertEqual(comp_id2, 2)
+            self.assertEqual(records2[0][0], 20)
+        finally:
+            rffi.free_charp(p2)
+
     def test_checksums_written_correctly(self):
         """Test that checksums in written blocks are valid."""
         writer = wal.WALWriter(self.test_wal, self.layout)
-        
-        # Write block with multiple records
         records = []
         for i in range(5):
             component_data = self._create_packed_component(i, "rec_%d" % i)
             records.append(wal_format.WALRecord(100 + i, 1, component_data))
-        
         writer.append_block(10, 5, records)
         writer.close()
         
-        # Read and decode - should not raise checksum error
         with open(self.test_wal, 'rb') as f:
             data = f.read()
         
-        # This will validate the checksum internally
-        lsn, comp_id, decoded_records = wal_format.decode_wal_block(data, self.layout)
-        
-        self.assertEqual(len(decoded_records), 5)
+        p = rffi.str2charp(data)
+        try:
+            lsn, comp_id, decoded_records = wal_format.decode_wal_block(p, len(data), self.layout)
+            self.assertEqual(len(decoded_records), 5)
+        finally:
+            rffi.free_charp(p)
     
     def test_append_mode_preservation(self):
         """Test that O_APPEND mode preserves existing data."""

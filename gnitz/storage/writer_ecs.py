@@ -2,6 +2,7 @@ import os
 from rpython.rlib import rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.jit import unrolling_iterable
+from rpython.rlib.rarithmetic import r_uint64
 from gnitz.storage import layout, mmap_posix, errors
 from gnitz.core import types, strings as string_logic, checksum
 
@@ -72,7 +73,7 @@ class ECSShardWriter(object):
     def _add_entity_weighted(self, entity_id, weight, *field_values):
         if weight == 0: return
         self.count += 1
-        self.e_buf.append_u64(entity_id) # Unsigned EID
+        self.e_buf.append_u64(entity_id)
         self.w_buf.append_i64(weight)
         stride = self.layout.stride
         for k in range(stride): self.scratch_row[k] = '\x00'
@@ -97,23 +98,32 @@ class ECSShardWriter(object):
     def add_packed_row(self, entity_id, weight, source_row_ptr, source_heap_ptr):
         if weight == 0: return
         self.count += 1
-        self.e_buf.append_u64(entity_id) # Unsigned EID
+        self.e_buf.append_u64(entity_id)
         self.w_buf.append_i64(weight)
+        
         stride = self.layout.stride
         self.c_buf.ensure_capacity(1)
         dest_c = rffi.ptradd(self.c_buf.ptr, (self.c_buf.count) * stride)
-        _copy_memory(dest_c, source_row_ptr, stride)
+        
+        # Bulk copy the fixed-width data
+        for i in range(stride): dest_c[i] = source_row_ptr[i]
+        
+        # Single-pass update for strings to avoid nested rffi overhead
         for i in FIELD_INDICES:
             if i >= len(self.layout.field_types): break
             if self.layout.field_types[i] == types.TYPE_STRING:
                 s_ptr = rffi.ptradd(dest_c, self.layout.field_offsets[i])
                 length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, s_ptr)[0])
+                
                 if length > string_logic.SHORT_STRING_THRESHOLD:
-                    u64_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(s_ptr, 8))
-                    old_off = rffi.cast(lltype.Signed, u64_ptr[0])
+                    # Relocate long string to shard blob heap
+                    u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(s_ptr, 8))
+                    old_off = rffi.cast(lltype.Signed, u64_view[0])
                     new_off = self.b_buf.count
+                    
                     self.b_buf.append_bytes(rffi.ptradd(source_heap_ptr, old_off), length)
-                    u64_ptr[0] = rffi.cast(rffi.ULONGLONG, new_off)
+                    u64_view[0] = rffi.cast(rffi.ULONGLONG, new_off)
+        
         self.c_buf.count += 1
 
     def finalize(self, filename):
@@ -132,14 +142,14 @@ class ECSShardWriter(object):
             h = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor='raw')
             try:
                 for i in range(layout.HEADER_SIZE): h[i] = '\x00'
-                rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_MAGIC))[0] = rffi.cast(rffi.LONGLONG, layout.MAGIC_NUMBER)
-                rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_COUNT))[0] = rffi.cast(rffi.LONGLONG, self.count)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_MAGIC))[0] = rffi.cast(rffi.ULONGLONG, layout.MAGIC_NUMBER)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_COUNT))[0] = rffi.cast(rffi.ULONGLONG, self.count)
                 rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_CHECKSUM_E))[0] = rffi.cast(rffi.ULONGLONG, cs_e)
                 rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_CHECKSUM_W))[0] = rffi.cast(rffi.ULONGLONG, cs_w)
-                rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_REG_E_ECS))[0] = rffi.cast(rffi.LONGLONG, off_e)
-                rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_REG_W_ECS))[0] = rffi.cast(rffi.LONGLONG, off_w)
-                rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_REG_C_ECS))[0] = rffi.cast(rffi.LONGLONG, off_c)
-                rffi.cast(rffi.LONGLONGP, rffi.ptradd(h, layout.OFF_REG_B_ECS))[0] = rffi.cast(rffi.LONGLONG, off_b)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_REG_E_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_e)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_REG_W_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_w)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_REG_C_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_c)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_REG_B_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_b)
                 mmap_posix.write_c(fd, h, rffi.cast(rffi.SIZE_T, layout.HEADER_SIZE))
             finally: lltype.free(h, flavor='raw')
             if size_e > 0: mmap_posix.write_c(fd, self.e_buf.ptr, rffi.cast(rffi.SIZE_T, size_e))

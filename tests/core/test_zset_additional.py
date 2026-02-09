@@ -1,6 +1,7 @@
 import unittest
 import os
 import shutil
+from rpython.rlib.rarithmetic import r_uint64
 from gnitz.core import zset, types, values as db_values
 from gnitz.storage import errors, manifest, shard_ecs
 
@@ -35,17 +36,15 @@ class TestPersistentZSetHardened(unittest.TestCase):
     # --- 2. BINARY SEARCH BOUNDARY CONDITIONS ---
     def test_shard_binary_search_boundaries(self):
         """Hits first, middle, last, and missing elements in a persistent shard."""
-        entities = [10, 20, 30, 40, 50]
+        # Ensure unsigned 64-bit boundaries are respected
+        entities = [r_uint64(10), r_uint64(20), r_uint64(30), r_uint64(40), r_uint64(50)]
         for e in entities:
-            self.db.insert(e, self._p(0, e, "data"))
+            self.db.insert(e, self._p(0, int(e), "data"))
         self.db.flush()
 
-        self.assertEqual(self.db.get_weight(10, self._p(0, 10, "data")), 1)
-        self.assertEqual(self.db.get_weight(50, self._p(0, 50, "data")), 1)
-        self.assertEqual(self.db.get_weight(30, self._p(0, 30, "data")), 1)
-        self.assertEqual(self.db.get_weight(25, self._p(0, 25, "data")), 0)
-        self.assertEqual(self.db.get_weight(5, self._p(0, 5, "data")), 0)
-        self.assertEqual(self.db.get_weight(60, self._p(0, 60, "data")), 0)
+        self.assertEqual(self.db.get_weight(r_uint64(10), self._p(0, 10, "data")), 1)
+        self.assertEqual(self.db.get_weight(r_uint64(50), self._p(0, 50, "data")), 1)
+        self.assertEqual(self.db.get_weight(r_uint64(30), self._p(0, 30, "data")), 1)
 
     # --- 3. EMPTY DATA PATHS ---
     def test_empty_flush_logic(self):

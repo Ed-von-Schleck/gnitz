@@ -9,29 +9,27 @@ MAX_HEIGHT = 16
 MAX_FIELDS = 64
 FIELD_INDICES = unrolling_iterable(range(MAX_FIELDS))
 
+# Optimized accessors: Perform cast once and index
 def node_get_next_off(base_ptr, node_off, level):
-    ptr = rffi.ptradd(base_ptr, node_off + 12)
-    next_ptr = rffi.cast(rffi.UINTP, ptr)
+    # node_off + 12 is the start of the next-pointer array (U32 offsets)
+    next_ptr = rffi.cast(rffi.UINTP, rffi.ptradd(base_ptr, node_off + 12))
     return rffi.cast(lltype.Signed, next_ptr[level])
 
 def node_set_next_off(base_ptr, node_off, level, target_off):
-    ptr = rffi.ptradd(base_ptr, node_off + 12)
-    next_ptr = rffi.cast(rffi.UINTP, ptr)
+    next_ptr = rffi.cast(rffi.UINTP, rffi.ptradd(base_ptr, node_off + 12))
     next_ptr[level] = rffi.cast(rffi.UINT, target_off)
 
 def node_get_weight(base_ptr, node_off):
-    ptr = rffi.ptradd(base_ptr, node_off)
-    return rffi.cast(rffi.LONGLONGP, ptr)[0]
+    return rffi.cast(rffi.LONGLONGP, rffi.ptradd(base_ptr, node_off))[0]
 
 def node_set_weight(base_ptr, node_off, weight):
-    ptr = rffi.ptradd(base_ptr, node_off)
-    rffi.cast(rffi.LONGLONGP, ptr)[0] = rffi.cast(rffi.LONGLONG, weight)
+    rffi.cast(rffi.LONGLONGP, rffi.ptradd(base_ptr, node_off))[0] = rffi.cast(rffi.LONGLONG, weight)
 
 def node_get_entity_id(base_ptr, node_off):
     height = ord(base_ptr[node_off + 8])
-    ptr = rffi.ptradd(base_ptr, node_off + 12 + (height * 4))
-    # Return as unsigned 64-bit
-    return rffi.cast(rffi.ULONGLONGP, ptr)[0]
+    # ID is after the weight(8), height(1), padding(3), and next-pointer array (height*4)
+    off = node_off + 12 + (height * 4)
+    return rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base_ptr, off))[0]
 
 def node_get_payload_ptr(base_ptr, node_off):
     height = ord(base_ptr[node_off + 8])
@@ -39,24 +37,27 @@ def node_get_payload_ptr(base_ptr, node_off):
 
 @unroll_safe
 def compare_payloads(layout, ptr1, heap1, ptr2, heap2):
+    """Optimized comparison to minimize pointer view creation."""
     for i in FIELD_INDICES:
         if i >= len(layout.field_types): break
         ftype = layout.field_types[i]
         foff = layout.field_offsets[i]
-        p1 = rffi.ptradd(ptr1, foff)
-        p2 = rffi.ptradd(ptr2, foff)
+        
+        # Access memory directly via cast+offset
         if ftype == types.TYPE_I64:
-            v1 = rffi.cast(rffi.LONGLONGP, p1)[0]
-            v2 = rffi.cast(rffi.LONGLONGP, p2)[0]
+            v1 = rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr1, foff))[0]
+            v2 = rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr2, foff))[0]
             if v1 < v2: return -1
             if v1 > v2: return 1
         elif ftype == types.TYPE_STRING:
+            p1 = rffi.ptradd(ptr1, foff)
+            p2 = rffi.ptradd(ptr2, foff)
             if not string_logic.string_equals_dual(p1, heap1, p2, heap2):
                 res = string_logic.string_compare(p1, heap1, p2, heap2)
                 if res != 0: return res
         elif ftype == types.TYPE_U64:
-            v1 = rffi.cast(rffi.ULONGLONGP, p1)[0]
-            v2 = rffi.cast(rffi.ULONGLONGP, p2)[0]
+            v1 = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr1, foff))[0]
+            v2 = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr2, foff))[0]
             if v1 < v2: return -1
             if v1 > v2: return 1
     return 0
@@ -65,20 +66,24 @@ def compare_payloads(layout, ptr1, heap1, ptr2, heap2):
 def skip_list_find_exact(base_ptr, head_off, entity_id, layout, encoded_payload_ptr, heap_ptr, update_offsets=None):
     curr_off = head_off
     for i in range(MAX_HEIGHT - 1, -1, -1):
-        next_off = node_get_next_off(base_ptr, curr_off, i)
-        while next_off != 0:
+        # We index the next array directly inside the while loop
+        while True:
+            next_off = node_get_next_off(base_ptr, curr_off, i)
+            if next_off == 0:
+                break
+            
             next_eid = node_get_entity_id(base_ptr, next_off)
             if next_eid < entity_id:
                 curr_off = next_off
-                next_off = node_get_next_off(base_ptr, curr_off, i)
             elif next_eid == entity_id:
                 next_payload = node_get_payload_ptr(base_ptr, next_off)
                 cmp = compare_payloads(layout, next_payload, heap_ptr, encoded_payload_ptr, heap_ptr)
                 if cmp < 0:
                     curr_off = next_off
-                    next_off = node_get_next_off(base_ptr, curr_off, i)
-                else: break
-            else: break
+                else:
+                    break
+            else:
+                break
         if update_offsets is not None:
             update_offsets[i] = curr_off
     return curr_off

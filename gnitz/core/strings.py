@@ -88,8 +88,6 @@ def string_compare(ptr1, heap1, ptr2, heap2):
     len2 = rffi.cast(lltype.Signed, u32_p2[0])
     min_len = len1 if len1 < len2 else len2
 
-    # 1. Compare first 4 bytes (Prefix)
-    # Treat as bytes to avoid endianness confusion in lexicographical order
     pref_p1 = rffi.ptradd(ptr1, 4)
     pref_p2 = rffi.ptradd(ptr2, 4)
     pref_limit = 4 if min_len > 4 else min_len
@@ -102,9 +100,6 @@ def string_compare(ptr1, heap1, ptr2, heap2):
         if len1 > len2: return 1
         return 0
 
-    # 2. Resolve data sources for character sequence 4..min_len
-    # Short strings store index 4 at bytes 8..15 (offset -4)
-    # Long strings store index 0 at heap+offset (offset 0)
     if len1 <= SHORT_STRING_THRESHOLD:
         data1 = rffi.ptradd(ptr1, 8)
         offset1 = -4
@@ -121,7 +116,6 @@ def string_compare(ptr1, heap1, ptr2, heap2):
         data2 = rffi.ptradd(heap2, rffi.cast(lltype.Signed, u64_2))
         offset2 = 0
 
-    # 3. Efficient linear comparison loop
     for i in range(4, min_len):
         c1 = data1[i + offset1]
         c2 = data2[i + offset2]

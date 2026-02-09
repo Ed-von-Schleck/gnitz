@@ -23,10 +23,10 @@ class Engine(object):
         
         if manifest_manager and manifest_manager.exists():
             reader = manifest_manager.load_current()
-            self.current_lsn = reader.global_max_lsn + 1
+            self.current_lsn = reader.global_max_lsn + r_uint64(1)
             reader.close()
         else:
-            self.current_lsn = 1
+            self.current_lsn = r_uint64(1)
 
         if recover_wal_filename:
             self.recover_from_wal(recover_wal_filename)
@@ -40,28 +40,32 @@ class Engine(object):
         except OSError:
             return
 
-        max_lsn_finalized = self.current_lsn - 1
+        max_lsn_finalized = self.current_lsn - r_uint64(1)
         max_lsn_seen = max_lsn_finalized
-        first_lsn_seen = -1
+        first_lsn_seen = r_uint64(0)
+        has_seen = False
 
         for lsn, comp_id, records in reader.iterate_blocks():
             if comp_id != self.component_id:
                 continue
             if lsn <= max_lsn_finalized:
                 continue
-            if first_lsn_seen == -1: first_lsn_seen = lsn
-            if lsn > max_lsn_seen: max_lsn_seen = lsn
+            if not has_seen:
+                first_lsn_seen = lsn
+                has_seen = True
+            if lsn > max_lsn_seen:
+                max_lsn_seen = lsn
             
             for eid, weight, c_data in records:
                 self.mem_manager.put_from_recovery(eid, weight, c_data)
         
-        self.current_lsn = max_lsn_seen + 1
+        self.current_lsn = max_lsn_seen + r_uint64(1)
         self.mem_manager.current_lsn = self.current_lsn
-        if first_lsn_seen != -1: self.mem_manager.starting_lsn = first_lsn_seen
+        if has_seen:
+            self.mem_manager.starting_lsn = first_lsn_seen
         reader.close()
 
     def get_effective_weight_raw(self, entity_id, packed_payload_ptr, payload_heap_ptr):
-        """Zero-boxing query path using raw pointers."""
         mem_weight = 0
         base = self.mem_manager.active_table.arena.base_ptr
         blob_base = self.mem_manager.active_table.blob_arena.base_ptr
@@ -96,19 +100,20 @@ class Engine(object):
 
     def flush_and_rotate(self, filename):
         if not self.mem_manager.active_table.has_active_data():
-            # Fix: Use r_uint64(-1) to match the return type of self.mem_manager.flush_and_rotate
-            return r_uint64(-1), r_uint64(-1), False
+            return r_uint64(0), r_uint64(0), False
 
         lsn_min = self.mem_manager.starting_lsn
-        lsn_max = self.mem_manager.current_lsn - 1
+        lsn_max = self.mem_manager.current_lsn - r_uint64(1)
         min_eid, max_eid = self.mem_manager.flush_and_rotate(filename)
         
         entries = []
         new_global_max = lsn_max
         if self.manifest_manager and self.manifest_manager.exists():
             reader = self.manifest_manager.load_current()
-            for e in reader.iterate_entries(): entries.append(e)
-            if reader.global_max_lsn > new_global_max: new_global_max = reader.global_max_lsn
+            for e in reader.iterate_entries():
+                entries.append(e)
+            if reader.global_max_lsn > new_global_max:
+                new_global_max = reader.global_max_lsn
             reader.close()
         
         if self.registry is not None:

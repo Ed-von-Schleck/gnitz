@@ -1,4 +1,5 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import r_uint
 from gnitz.storage import errors
 from rpython.rlib import jit
 
@@ -31,6 +32,11 @@ class MappedBuffer(object):
         self._check_bounds(offset, 4)
         val_ptr = rffi.cast(rffi.INTP, rffi.ptradd(self.ptr, offset))
         return rffi.cast(lltype.Signed, val_ptr[0])
+
+    def read_u32(self, offset):
+        self._check_bounds(offset, 4)
+        val_ptr = rffi.cast(rffi.UINTP, rffi.ptradd(self.ptr, offset))
+        return rffi.cast(r_uint, val_ptr[0])
 
     def read_u8(self, offset):
         self._check_bounds(offset, 1)

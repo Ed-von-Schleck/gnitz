@@ -34,12 +34,17 @@ class TestWALFormat(unittest.TestCase):
         
         with open(self.tmp, 'rb') as f:
             data = f.read()
-            
-        lsn, cid, decoded = wal_format.decode_wal_block(data, self.layout)
-        self.assertEqual(lsn, 100)
-        self.assertEqual(len(decoded), 2)
-        self.assertEqual(decoded[0][0], 10)
-        self.assertEqual(decoded[1][1], -1)
+        
+        # Convert string to pointer for the new decoder signature
+        block_ptr = rffi.str2charp(data)
+        try:
+            lsn, cid, decoded = wal_format.decode_wal_block(block_ptr, len(data), self.layout)
+            self.assertEqual(lsn, 100)
+            self.assertEqual(len(decoded), 2)
+            self.assertEqual(decoded[0][0], 10)
+            self.assertEqual(decoded[1][1], -1)
+        finally:
+            rffi.free_charp(block_ptr)
 
 if __name__ == '__main__':
     unittest.main()

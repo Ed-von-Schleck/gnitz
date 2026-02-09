@@ -1,13 +1,13 @@
 import unittest
 import os
 import shutil
+from rpython.rlib.rarithmetic import r_uint64
 from gnitz.core import zset, types, values as db_values
 from gnitz.storage import errors, manifest
 
 class TestPersistentZSetMassive(unittest.TestCase):
     def setUp(self):
         self.test_dir = "test_zset_massive_env"
-        # Layout: [Integer, String, Integer]
         self.layout = types.ComponentLayout([
             types.TYPE_I64, 
             types.TYPE_STRING, 
@@ -203,8 +203,9 @@ class TestPersistentZSetMassive(unittest.TestCase):
 
     def test_large_entity_id_range(self):
         """Tests EntityIDs at the boundaries of u64."""
-        min_eid = 0
-        max_eid = 0xFFFFFFFFFFFFFFFF
+        min_eid = r_uint64(0)
+        # Fix: use r_uint64(-1) to safely represent MAX_UINT64 in RPython emulator
+        max_eid = r_uint64(-1)
         
         p1 = [db_values.IntValue(0), db_values.StringValue("min"), db_values.IntValue(0)]
         p2 = [db_values.IntValue(1), db_values.StringValue("max"), db_values.IntValue(1)]
