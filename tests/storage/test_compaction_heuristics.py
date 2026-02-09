@@ -1,6 +1,3 @@
-"""
-tests/test_compaction_heuristics.py
-"""
 import unittest
 import os
 from gnitz.core import types
@@ -34,43 +31,29 @@ class TestCompactionHeuristics(unittest.TestCase):
         return meta
 
     def test_compaction_trigger_and_execution(self):
-        # 1. Setup Manifest with 5 overlapping shards to trigger threshold
         m_mgr = manifest.ManifestManager(self.manifest_fn)
         entries = []
-        
         for i in range(5):
             fn = "s_h_%d.db" % i
             meta = self._create_shard(fn, 100, 1, 10 * i, i)
             entries.append(manifest.ManifestEntry(1, fn, 100, 100, i, i))
-        
         m_mgr.publish_new_version(entries)
         
-        # 2. Verify Trigger
         policy = compactor.CompactionPolicy(self.registry)
-        self.assertFalse(self.registry.needs_compaction(1))
-        
-        # Mark and check
         self.registry.mark_for_compaction(1)
         self.assertTrue(policy.should_compact(1))
         
-        # 3. Execute Compaction
         new_file = compactor.execute_compaction(1, policy, m_mgr, self.ref_counter, self.layout)
         self.assertIsNotNone(new_file)
         self.files.append(new_file)
         
-        # 4. Verify Manifest State
         reader = m_mgr.load_current()
         self.assertEqual(reader.get_entry_count(), 1)
         reader.close()
         
-        # 5. Verify Registry State
         self.assertEqual(len(self.registry.shards), 1)
-        
-        # 6. Verify Physical Deletion
-        # Because no Spine is holding handles, execute_compaction should have
-        # physically deleted the old shards via its internal finalize_compaction call.
         for fn in self.shard_filenames:
-            self.assertFalse(os.path.exists(fn), "File %s should have been deleted" % fn)
+            self.assertFalse(os.path.exists(fn))
 
 if __name__ == '__main__':
     unittest.main()

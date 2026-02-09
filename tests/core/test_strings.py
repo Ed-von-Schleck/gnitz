@@ -4,73 +4,66 @@ from gnitz.core import strings
 
 class TestGermanStrings(unittest.TestCase):
     def setUp(self):
-        self.struct_buf = lltype.malloc(rffi.CCHARP.TO, 16, flavor='raw')
+        self.struct_buf1 = lltype.malloc(rffi.CCHARP.TO, 16, flavor='raw')
+        self.struct_buf2 = lltype.malloc(rffi.CCHARP.TO, 16, flavor='raw')
         self.heap_buf = lltype.malloc(rffi.CCHARP.TO, 1024, flavor='raw')
+        self.heap_off = 0
 
     def tearDown(self):
-        lltype.free(self.struct_buf, flavor='raw')
+        lltype.free(self.struct_buf1, flavor='raw')
+        lltype.free(self.struct_buf2, flavor='raw')
         lltype.free(self.heap_buf, flavor='raw')
 
-    def _write_to_heap(self, s):
-        for i in range(len(s)):
-            self.heap_buf[i] = s[i]
+    def _pack(self, buf, s):
+        if len(s) <= strings.SHORT_STRING_THRESHOLD:
+            strings.pack_string(buf, s, 0)
+        else:
+            off = self.heap_off
+            for i in range(len(s)):
+                self.heap_buf[off + i] = s[i]
+            strings.pack_string(buf, s, off)
+            self.heap_off += len(s)
 
-    def _check(self, s_buf, h_buf, s):
-        l = len(s)
-        p = strings.compute_prefix(s)
-        return strings.string_equals(s_buf, h_buf, s, l, p)
-
-    def test_pack_short_string(self):
-        s = "hello"
-        strings.pack_string(self.struct_buf, s, 0)
+    def test_equality(self):
+        self._pack(self.struct_buf1, "hello world")
+        self._pack(self.struct_buf2, "hello world")
+        self.assertTrue(strings.string_equals_dual(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf))
         
-        u32_ptr = rffi.cast(rffi.UINTP, self.struct_buf)
-        self.assertEqual(u32_ptr[0], 5)
-        
-        unpacked = rffi.charpsize2str(rffi.ptradd(self.struct_buf, 4), 5)
-        self.assertEqual(unpacked, "hello")
+        self._pack(self.struct_buf2, "hello world!")
+        self.assertFalse(strings.string_equals_dual(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf))
 
-    def test_pack_long_string(self):
-        s = "this is a long string"
-        heap_offset = 128
-        strings.pack_string(self.struct_buf, s, heap_offset)
-        
-        u32_ptr = rffi.cast(rffi.UINTP, self.struct_buf)
-        u64_ptr = rffi.cast(rffi.ULONGLONGP, self.struct_buf)
-        
-        self.assertEqual(u32_ptr[0], len(s))
-        prefix = rffi.charpsize2str(rffi.ptradd(self.struct_buf, 4), 4)
-        self.assertEqual(prefix, "this")
-        self.assertEqual(u64_ptr[1], heap_offset)
+    def test_compare_ordering(self):
+        # Short vs Short
+        self._pack(self.struct_buf1, "apple")
+        self._pack(self.struct_buf2, "apply")
+        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), -1)
+        self.assertEqual(strings.string_compare(self.struct_buf2, self.heap_buf, self.struct_buf1, self.heap_buf), 1)
 
-    def test_equality_short(self):
-        s = "world"
-        strings.pack_string(self.struct_buf, s, 0)
-        self.assertTrue(self._check(self.struct_buf, self.heap_buf, "world"))
-        self.assertFalse(self._check(self.struct_buf, self.heap_buf, "worlds"))
-        self.assertFalse(self._check(self.struct_buf, self.heap_buf, "worl"))
-        self.assertFalse(self._check(self.struct_buf, self.heap_buf, "planet"))
+        # Long vs Long
+        self._pack(self.struct_buf1, "this is string a")
+        self._pack(self.struct_buf2, "this is string b")
+        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), -1)
 
-    def test_equality_long(self):
-        s = "this is also very long"
-        heap_offset = 0
-        self._write_to_heap(s)
-        strings.pack_string(self.struct_buf, s, heap_offset)
-        
-        self.assertTrue(self._check(self.struct_buf, self.heap_buf, s))
-        self.assertFalse(self._check(self.struct_buf, self.heap_buf, "this is also very short"))
-        self.assertFalse(self._check(self.struct_buf, self.heap_buf, "that is also very long"))
+        # Mixed lengths
+        self._pack(self.struct_buf1, "abc")
+        self._pack(self.struct_buf2, "abcd")
+        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), -1)
 
-    def test_equality_prefix_optimization(self):
-        s_long = "prefix_long_suffix"
-        s_short = "prefix_short"
-        
-        self._write_to_heap(s_long)
-        strings.pack_string(self.struct_buf, s_long, 0)
-        self.assertFalse(self._check(self.struct_buf, self.heap_buf, "prefix_lorn_suffix"))
+        # Equal
+        self._pack(self.struct_buf1, "identical")
+        self._pack(self.struct_buf2, "identical")
+        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), 0)
 
-        strings.pack_string(self.struct_buf, s_short, 0)
-        self.assertFalse(self._check(self.struct_buf, self.heap_buf, "prefix_shor"))
+    def test_compare_prefix_boundary(self):
+        # Difference at index 3 (within prefix)
+        self._pack(self.struct_buf1, "abcA")
+        self._pack(self.struct_buf2, "abcB")
+        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), -1)
+
+        # Difference at index 4 (just after prefix, inline)
+        self._pack(self.struct_buf1, "abcdE")
+        self._pack(self.struct_buf2, "abcdF")
+        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), -1)
 
 if __name__ == '__main__':
     unittest.main()

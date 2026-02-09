@@ -11,9 +11,16 @@ class StreamCursor(object):
         self.view = shard_view
         self.position = 0
         self.exhausted = False
-        if self.view.count == 0:
-            self.exhausted = True
+        # Ghost Property: Skip initial zero weights
+        self._skip_ghosts()
     
+    def _skip_ghosts(self):
+        while self.position < self.view.count:
+            if self.view.get_weight(self.position) != 0:
+                return
+            self.position += 1
+        self.exhausted = True
+
     def peek_entity_id(self):
         if self.exhausted:
             return rffi.cast(rffi.LONGLONG, -1)
@@ -23,8 +30,7 @@ class StreamCursor(object):
         if self.exhausted:
             return
         self.position += 1
-        if self.position >= self.view.count:
-            self.exhausted = True
+        self._skip_ghosts()
     
     def is_exhausted(self):
         return self.exhausted
@@ -37,8 +43,6 @@ class TournamentTree(object):
         self.cursors = cursors
         self.num_cursors = len(cursors)
         self.heap_size = 0
-        
-        # Raw heap allocation
         self.heap = lltype.malloc(rffi.CArray(HEAP_NODE_PTR.TO), self.num_cursors, flavor='raw')
         
         for i in range(self.num_cursors):
@@ -90,11 +94,9 @@ class TournamentTree(object):
         return self.heap[0].entity_id
     
     def get_all_cursors_at_min(self):
-        # Result list of cursor indices (integers)
         if self.heap_size == 0: return []
         min_eid = self.heap[0].entity_id
         res = []
-        # Linear scan of heap for matches is fine for small N (num shards)
         for i in range(self.heap_size):
             if self.heap[i].entity_id == min_eid:
                 res.append(rffi.cast(lltype.Signed, self.heap[i].cursor_idx))
@@ -103,24 +105,18 @@ class TournamentTree(object):
     def advance_min_cursors(self):
         if self.heap_size == 0: return
         min_eid = self.heap[0].entity_id
-        
-        # Identify cursors to advance
         to_advance = []
         i = 0
         while i < self.heap_size:
             if self.heap[i].entity_id == min_eid:
                 to_advance.append(rffi.cast(lltype.Signed, self.heap[i].cursor_idx))
-                # Swap with last element to remove
                 self.heap_size -= 1
                 if i < self.heap_size:
                     self.heap[i].entity_id = self.heap[self.heap_size].entity_id
                     self.heap[i].cursor_idx = self.heap[self.heap_size].cursor_idx
-                    # Re-heapify from this position
                     self._sift_down(i)
-                    continue # Re-check current index
+                    continue
             i += 1
-            
-        # Push advanced cursors back
         for c_idx in to_advance:
             self.cursors[c_idx].advance()
             if not self.cursors[c_idx].is_exhausted():

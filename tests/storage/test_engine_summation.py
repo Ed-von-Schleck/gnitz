@@ -36,11 +36,7 @@ class TestEngineSummation(unittest.TestCase):
         try:
             for i in range(self.layout.stride): scratch[i] = '\x00'
             rffi.cast(rffi.LONGLONGP, scratch)[0] = 100
-            
-            # Should see both shards
             self.assertEqual(db.get_effective_weight_raw(1, scratch, lltype.nullptr(rffi.CCHARP.TO)), 2)
-            
-            # Add negative weight to memtable
             db.mem_manager.put(1, -1, [db_values.IntValue(100)])
             self.assertEqual(db.get_effective_weight_raw(1, scratch, lltype.nullptr(rffi.CCHARP.TO)), 1)
         finally:

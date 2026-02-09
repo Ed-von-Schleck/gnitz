@@ -27,7 +27,6 @@ class TestCompactionCleanup(unittest.TestCase):
         w.finalize(filename)
 
     def test_deferred_cleanup(self):
-        # Pass dummy LSN=0
         h1 = spine.ShardHandle(self.shard1, self.layout, 0)
         h2 = spine.ShardHandle(self.shard2, self.layout, 0)
         self.spine = spine.Spine([h1, h2], self.rc)

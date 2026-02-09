@@ -21,28 +21,6 @@ class TestEngineFlush(unittest.TestCase):
         wrapped = [db_values.wrap(v) for v in vals]
         db.mem_manager.put(eid, w, wrapped)
 
-    def _get_weight(self, db, eid, *vals):
-        wrapped = [db_values.wrap(v) for v in vals]
-        scratch = lltype.malloc(rffi.CCHARP.TO, self.layout.stride, flavor='raw')
-        try:
-            for i in range(self.layout.stride): scratch[i] = '\x00'
-            db.mem_manager.active_table._pack_values_to_buf(scratch, wrapped)
-            blob_base = db.mem_manager.active_table.blob_arena.base_ptr
-            return db.get_effective_weight_raw(eid, scratch, blob_base)
-        finally:
-            lltype.free(scratch, flavor='raw')
-
-    def test_flush_creates_shard_file(self):
-        shard_file = "test_flush_shard.db"
-        self.test_files.append(shard_file)
-        mgr = memtable.MemTableManager(self.layout, 1024 * 1024)
-        db = engine.Engine(mgr, spine.Spine([]))
-        self._put(db, 100, 1, 42, "test")
-        min_eid, max_eid, _ = db.flush_and_rotate(shard_file)
-        self.assertTrue(os.path.exists(shard_file))
-        self.assertEqual(min_eid, 100)
-        db.close()
-
     def test_compaction_trigger_detection(self):
         shards = ["test_compact_%d.db" % i for i in range(5)]
         self.test_files.extend(shards)

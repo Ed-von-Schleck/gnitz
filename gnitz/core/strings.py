@@ -15,7 +15,6 @@ def compute_prefix(s):
 def pack_string(target_ptr, string_data, heap_offset_if_long):
     length = len(string_data)
     u32_ptr = rffi.cast(rffi.UINTP, target_ptr)
-    
     u32_ptr[0] = rffi.cast(rffi.UINT, length)
     
     if length <= SHORT_STRING_THRESHOLD:
@@ -37,20 +36,14 @@ def _memcmp(p1, p2, length):
 
 def string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_prefix):
     u32_struct_ptr = rffi.cast(rffi.UINTP, struct_ptr)
-    
     if rffi.cast(lltype.Signed, u32_struct_ptr[0]) != search_len:
         return False
-        
     if search_len == 0:
         return True
-    
-    # Use r_uint for safe comparison of UINT types in RPython
     if r_uint(u32_struct_ptr[1]) != r_uint(search_prefix):
         return False
-        
     if search_len <= 4:
         return True
-        
     if search_len <= SHORT_STRING_THRESHOLD:
         suffix_ptr_struct = rffi.ptradd(struct_ptr, 8)
         for i in range(search_len - 4):
@@ -64,95 +57,77 @@ def string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_pref
         return _memcmp(heap_ptr, search_str, search_len)
 
 def string_equals_dual(ptr1, heap1, ptr2, heap2):
-    """
-    Compares two German Strings stored in memory.
-    Used for Compaction and SkipList equality checks.
-    """
     u32_p1 = rffi.cast(rffi.UINTP, ptr1)
     u32_p2 = rffi.cast(rffi.UINTP, ptr2)
-    
     len1 = rffi.cast(lltype.Signed, u32_p1[0])
     len2 = rffi.cast(lltype.Signed, u32_p2[0])
-    
     if len1 != len2: return False
     if len1 == 0: return True
-    
-    # Compare Prefix (bytes 4-7, encoded in u32[1])
-    # Use r_uint for safe comparison
     if r_uint(u32_p1[1]) != r_uint(u32_p2[1]): return False
-    
     if len1 <= 4: return True
-
     if len1 <= SHORT_STRING_THRESHOLD:
-        # Inline comparison for bytes 8-15
         p1_char = rffi.ptradd(ptr1, 8)
         p2_char = rffi.ptradd(ptr2, 8)
         for i in range(len1 - 4):
             if p1_char[i] != p2_char[i]: return False
         return True
     else:
-        # Heap comparison
         u64_p1 = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr1, 8))
         u64_p2 = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr2, 8))
-        
-        off1 = rffi.cast(lltype.Signed, u64_p1[0])
-        off2 = rffi.cast(lltype.Signed, u64_p2[0])
-        
-        h1_ptr = rffi.ptradd(heap1, off1)
-        h2_ptr = rffi.ptradd(heap2, off2)
-        
-        # Check full string (could optimize starting at 4, but memcmp is fast)
+        h1_ptr = rffi.ptradd(heap1, rffi.cast(lltype.Signed, u64_p1[0]))
+        h2_ptr = rffi.ptradd(heap2, rffi.cast(lltype.Signed, u64_p2[0]))
         for i in range(len1):
             if h1_ptr[i] != h2_ptr[i]: return False
         return True
 
+@jit.unroll_safe
 def string_compare(ptr1, heap1, ptr2, heap2):
-    """
-    Lexicographical comparison of two German Strings.
-    Returns -1 if s1 < s2, 1 if s1 > s2, 0 if equal.
-    """
     u32_p1 = rffi.cast(rffi.UINTP, ptr1)
     u32_p2 = rffi.cast(rffi.UINTP, ptr2)
-    
     len1 = rffi.cast(lltype.Signed, u32_p1[0])
     len2 = rffi.cast(lltype.Signed, u32_p2[0])
-    
     min_len = len1 if len1 < len2 else len2
+
+    # 1. Compare first 4 bytes (Prefix)
+    # Treat as bytes to avoid endianness confusion in lexicographical order
+    pref_p1 = rffi.ptradd(ptr1, 4)
+    pref_p2 = rffi.ptradd(ptr2, 4)
+    pref_limit = 4 if min_len > 4 else min_len
+    for i in range(pref_limit):
+        if pref_p1[i] < pref_p2[i]: return -1
+        if pref_p1[i] > pref_p2[i]: return 1
     
-    # Prefix comparison (valid for first 4 bytes due to LE packing)
-    if min_len > 0:
-        pref1 = r_uint(u32_p1[1])
-        pref2 = r_uint(u32_p2[1])
-        if pref1 != pref2:
-            if pref1 < pref2: return -1
-            return 1
-            
-    # Iterate remaining characters
-    idx = 4
-    while idx < min_len:
-        c1 = '\x00'
-        c2 = '\x00'
-        
-        # Get c1
-        if len1 <= SHORT_STRING_THRESHOLD:
-            c1 = rffi.ptradd(ptr1, 8 + (idx - 4))[0]
-        else:
-             u64 = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr1, 8))[0]
-             off = rffi.cast(lltype.Signed, u64)
-             c1 = rffi.ptradd(heap1, off)[idx]
+    if min_len <= 4:
+        if len1 < len2: return -1
+        if len1 > len2: return 1
+        return 0
 
-        # Get c2
-        if len2 <= SHORT_STRING_THRESHOLD:
-            c2 = rffi.ptradd(ptr2, 8 + (idx - 4))[0]
-        else:
-             u64 = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr2, 8))[0]
-             off = rffi.cast(lltype.Signed, u64)
-             c2 = rffi.ptradd(heap2, off)[idx]
+    # 2. Resolve data sources for character sequence 4..min_len
+    # Short strings store index 4 at bytes 8..15 (offset -4)
+    # Long strings store index 0 at heap+offset (offset 0)
+    if len1 <= SHORT_STRING_THRESHOLD:
+        data1 = rffi.ptradd(ptr1, 8)
+        offset1 = -4
+    else:
+        u64_1 = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr1, 8))[0]
+        data1 = rffi.ptradd(heap1, rffi.cast(lltype.Signed, u64_1))
+        offset1 = 0
 
+    if len2 <= SHORT_STRING_THRESHOLD:
+        data2 = rffi.ptradd(ptr2, 8)
+        offset2 = -4
+    else:
+        u64_2 = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr2, 8))[0]
+        data2 = rffi.ptradd(heap2, rffi.cast(lltype.Signed, u64_2))
+        offset2 = 0
+
+    # 3. Efficient linear comparison loop
+    for i in range(4, min_len):
+        c1 = data1[i + offset1]
+        c2 = data2[i + offset2]
         if c1 < c2: return -1
         if c1 > c2: return 1
-        idx += 1
-        
+
     if len1 < len2: return -1
     if len1 > len2: return 1
     return 0
