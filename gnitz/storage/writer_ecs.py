@@ -104,30 +104,24 @@ class ECSShardWriter(object):
         stride = self.layout.stride
         self.c_buf.ensure_capacity(1)
         dest_c = rffi.ptradd(self.c_buf.ptr, (self.c_buf.count) * stride)
-        
-        # Bulk copy the fixed-width data
         for i in range(stride): dest_c[i] = source_row_ptr[i]
         
-        # Single-pass update for strings to avoid nested rffi overhead
         for i in FIELD_INDICES:
             if i >= len(self.layout.field_types): break
             if self.layout.field_types[i] == types.TYPE_STRING:
                 s_ptr = rffi.ptradd(dest_c, self.layout.field_offsets[i])
                 length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, s_ptr)[0])
-                
                 if length > string_logic.SHORT_STRING_THRESHOLD:
-                    # Relocate long string to shard blob heap
                     u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(s_ptr, 8))
                     old_off = rffi.cast(lltype.Signed, u64_view[0])
                     new_off = self.b_buf.count
-                    
                     self.b_buf.append_bytes(rffi.ptradd(source_heap_ptr, old_off), length)
                     u64_view[0] = rffi.cast(rffi.ULONGLONG, new_off)
-        
         self.c_buf.count += 1
 
     def finalize(self, filename):
-        fd = rposix.open(filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        tmp_filename = filename + ".tmp"
+        fd = rposix.open(tmp_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
             off_e = layout.HEADER_SIZE
             size_e = self.count * 8
@@ -139,6 +133,7 @@ class ECSShardWriter(object):
             size_b = self.b_buf.count
             cs_e = checksum.compute_checksum(self.e_buf.ptr, size_e)
             cs_w = checksum.compute_checksum(self.w_buf.ptr, size_w)
+            
             h = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor='raw')
             try:
                 for i in range(layout.HEADER_SIZE): h[i] = '\x00'
@@ -152,6 +147,7 @@ class ECSShardWriter(object):
                 rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h, layout.OFF_REG_B_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_b)
                 mmap_posix.write_c(fd, h, rffi.cast(rffi.SIZE_T, layout.HEADER_SIZE))
             finally: lltype.free(h, flavor='raw')
+            
             if size_e > 0: mmap_posix.write_c(fd, self.e_buf.ptr, rffi.cast(rffi.SIZE_T, size_e))
             self._write_padding(fd, off_w - (off_e + size_e))
             if size_w > 0: mmap_posix.write_c(fd, self.w_buf.ptr, rffi.cast(rffi.SIZE_T, size_w))
@@ -159,6 +155,8 @@ class ECSShardWriter(object):
             if size_c > 0: mmap_posix.write_c(fd, self.c_buf.ptr, rffi.cast(rffi.SIZE_T, size_c))
             self._write_padding(fd, off_b - (off_c + size_c))
             if size_b > 0: mmap_posix.write_c(fd, self.b_buf.ptr, rffi.cast(rffi.SIZE_T, size_b))
+            
+            mmap_posix.fsync_c(fd)
         finally:
             rposix.close(fd)
             self.e_buf.free()
@@ -166,6 +164,9 @@ class ECSShardWriter(object):
             self.c_buf.free()
             self.b_buf.free()
             if self.scratch_row: lltype.free(self.scratch_row, flavor='raw')
+
+        os.rename(tmp_filename, filename)
+        mmap_posix.fsync_dir(filename)
 
     def _write_padding(self, fd, count):
         if count <= 0: return

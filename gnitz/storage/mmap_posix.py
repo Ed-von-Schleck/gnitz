@@ -1,5 +1,7 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
+from rpython.rlib import rposix
+import os
 
 # ============================================================================
 # POSIX Constants
@@ -30,7 +32,6 @@ munmap_c = rffi.llexternal(
     compilation_info=eci
 )
 
-# ssize_t write(int fd, const void *buf, size_t count);
 write_c = rffi.llexternal(
     "write",
     [rffi.INT, rffi.CCHARP, rffi.SIZE_T],
@@ -38,7 +39,6 @@ write_c = rffi.llexternal(
     compilation_info=eci
 )
 
-# int fsync(int fd);
 fsync_c = rffi.llexternal(
     "fsync",
     [rffi.INT],
@@ -68,3 +68,22 @@ def munmap_file(ptr, length):
     res = munmap_c(ptr, rffi.cast(rffi.SIZE_T, length))
     if rffi.cast(lltype.Signed, res) == -1:
         raise MMapError()
+
+def fsync_dir(filepath):
+    """
+    Opens the parent directory of filepath and calls fsync on it.
+    Crucial for ensuring the rename() is durable.
+    """
+    # Manual directory extraction to avoid rposix/os.path slicing issues in RPython
+    last_slash = filepath.rfind('/')
+    if last_slash <= 0:
+        dirname = "."
+    else:
+        dirname = filepath[:last_slash]
+    
+    try:
+        fd = rposix.open(dirname, os.O_RDONLY, 0)
+        fsync_c(fd)
+        rposix.close(fd)
+    except OSError:
+        pass # Some filesystems don't support dir fsync
