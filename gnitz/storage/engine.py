@@ -40,20 +40,38 @@ class Engine(object):
         except OSError:
             return
 
-        # RPython fix: Ensure all LSN trackers are unsigned
         max_lsn_finalized = self.current_lsn - r_uint64(1)
         max_lsn_seen = max_lsn_finalized
         first_lsn_seen = r_uint64(0)
         has_seen = False
+        
+        expected_lsn = r_uint64(0)
+        lsn_init = False
 
         for lsn, comp_id, records in reader.iterate_blocks():
+            if not lsn_init:
+                lsn_init = True
+                expected_lsn = lsn
+            
+            if lsn != expected_lsn:
+                reader.close()
+                raise errors.CorruptShardError("LSN gap detected in WAL")
+            
+            expected_lsn = lsn + r_uint64(1)
+
             if comp_id != self.component_id:
                 continue
             if lsn <= max_lsn_finalized:
                 continue
+            
+            if not has_seen and lsn > (max_lsn_finalized + r_uint64(1)):
+                reader.close()
+                raise errors.CorruptShardError("Gap between Manifest LSN and WAL LSN")
+
             if not has_seen:
                 first_lsn_seen = lsn
                 has_seen = True
+            
             if lsn > max_lsn_seen:
                 max_lsn_seen = lsn
             

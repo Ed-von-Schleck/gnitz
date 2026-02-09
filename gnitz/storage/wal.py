@@ -13,37 +13,33 @@ class WALReader(object):
     def read_next_block(self):
         if self.closed: return (False, 0, 0, [])
         
-        # 1. Read Fixed Header
         header_str = os.read(self.fd, wal_format.WAL_BLOCK_HEADER_SIZE)
         
-        # Clean EOF: No bytes read
         if not header_str or len(header_str) == 0:
             return (False, 0, 0, [])
             
-        # Partial Header: Crash during header write
         if len(header_str) < wal_format.WAL_BLOCK_HEADER_SIZE:
             raise errors.CorruptShardError("Truncated WAL header")
             
-        # Parse entry count from raw string bytes to determine body size
-        # bytes [12-15] = entry count (U32 Little Endian)
+        # Reconstruct entry count using standard machine-word integers.
+        # This avoids TyperErrors associated with shifting small UINT types.
         b12 = ord(header_str[12])
         b13 = ord(header_str[13])
         b14 = ord(header_str[14])
         b15 = ord(header_str[15])
-        entry_count = b12 | (b13 << 8) | (b14 << 16) | (b15 << 24)
         
-        # Fix: Use aligned record size to calculate body read length
+        entry_count_val = b12 | (b13 << 8) | (b14 << 16) | (b15 << 24)
+        entry_count = rffi.cast(lltype.Signed, entry_count_val)
+        
         record_size = wal_format.get_record_size(self.layout)
         body_size = entry_count * record_size
         
-        # 2. Read Body
         body_str = ""
         if body_size > 0:
             body_str = os.read(self.fd, body_size)
             if len(body_str) < body_size: 
                 raise errors.CorruptShardError("Truncated WAL body")
         
-        # 3. Convert to low-level buffer for optimized decoding
         full_block_str = header_str + body_str
         block_len = len(full_block_str)
         block_ptr = rffi.str2charp(full_block_str)

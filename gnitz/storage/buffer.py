@@ -1,5 +1,5 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint
+from rpython.rlib.rarithmetic import r_uint32, r_uint64, r_int64
 from gnitz.storage import errors
 from rpython.rlib import jit
 
@@ -12,7 +12,7 @@ class MappedBuffer(object):
 
     def _check_bounds(self, offset, length):
         if offset < 0 or (offset + length) > self.size:
-            raise errors.BoundsError()
+            raise errors.BoundsError(offset, length, self.size)
 
     def get_raw_ptr(self, offset):
         self._check_bounds(offset, 1)
@@ -21,12 +21,12 @@ class MappedBuffer(object):
     def read_i64(self, offset):
         self._check_bounds(offset, 8)
         val_ptr = rffi.cast(rffi.LONGLONGP, rffi.ptradd(self.ptr, offset))
-        return val_ptr[0]
+        return r_int64(val_ptr[0])
 
     def read_u64(self, offset):
         self._check_bounds(offset, 8)
         val_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, offset))
-        return val_ptr[0]
+        return r_uint64(val_ptr[0])
 
     def read_i32(self, offset):
         self._check_bounds(offset, 4)
@@ -36,7 +36,7 @@ class MappedBuffer(object):
     def read_u32(self, offset):
         self._check_bounds(offset, 4)
         val_ptr = rffi.cast(rffi.UINTP, rffi.ptradd(self.ptr, offset))
-        return rffi.cast(r_uint, val_ptr[0])
+        return r_uint32(val_ptr[0])
 
     def read_u8(self, offset):
         self._check_bounds(offset, 1)

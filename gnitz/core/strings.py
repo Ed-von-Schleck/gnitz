@@ -1,15 +1,16 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_uint
+from rpython.rlib.rarithmetic import r_uint, r_uint32
 
 SHORT_STRING_THRESHOLD = 12
 
 def compute_prefix(s):
     length = len(s)
-    prefix = 0
+    # Perform bit-shifts on the native machine word (r_uint)
+    prefix = r_uint(0)
     max_prefix_len = 4 if length > 4 else length
     for i in range(max_prefix_len):
-        prefix |= ord(s[i]) << (i * 8)
+        prefix |= r_uint(ord(s[i])) << (i * 8)
     return rffi.cast(rffi.UINT, prefix)
 
 def pack_string(target_ptr, string_data, heap_offset_if_long):
@@ -40,7 +41,11 @@ def string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_pref
         return False
     if search_len == 0:
         return True
-    if r_uint(u32_struct_ptr[1]) != r_uint(search_prefix):
+    # FIX: Cast to lltype.Signed to promote the 32-bit UINT to machine word size.
+    # This prevents TyperError during translation and TypeError during testing.
+    s_pref = rffi.cast(lltype.Signed, u32_struct_ptr[1])
+    q_pref = rffi.cast(lltype.Signed, search_prefix)
+    if s_pref != q_pref:
         return False
     if search_len <= 4:
         return True
@@ -63,7 +68,10 @@ def string_equals_dual(ptr1, heap1, ptr2, heap2):
     len2 = rffi.cast(lltype.Signed, u32_p2[0])
     if len1 != len2: return False
     if len1 == 0: return True
-    if r_uint(u32_p1[1]) != r_uint(u32_p2[1]): return False
+    # FIX: Cast to lltype.Signed to promote the 32-bit UINT to machine word size.
+    p1_pref = rffi.cast(lltype.Signed, u32_p1[1])
+    p2_pref = rffi.cast(lltype.Signed, u32_p2[1])
+    if p1_pref != p2_pref: return False
     if len1 <= 4: return True
     if len1 <= SHORT_STRING_THRESHOLD:
         p1_char = rffi.ptradd(ptr1, 8)

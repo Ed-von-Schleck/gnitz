@@ -14,11 +14,18 @@ class StorageError(GnitzError):
 
 class CorruptShardError(StorageError):
     """Raised when magic numbers mismatch or checksums fail."""
-    pass
+    def __init__(self, msg=""):
+        self.msg = msg
 
 class BoundsError(StorageError):
     """Raised when accessing memory outside defined region bounds."""
-    pass
+    _immutable_fields_ = ['offset', 'length', 'limit']
+    
+    def __init__(self, offset=0, length=0, limit=0):
+        # Optional arguments satisfy test_errors.py and RPython translation
+        self.offset = offset
+        self.length = length
+        self.limit = limit
 
 class LayoutError(StorageError):
     """Raised when data violates physical alignment rules."""

@@ -4,7 +4,7 @@ from rpython.rlib.rarithmetic import r_uint64
 from gnitz.storage import errors
 import os
 
-MAGIC_NUMBER = 0x4D414E49464E5447 
+MAGIC_NUMBER = r_uint64(0x4D414E49464E5447)
 VERSION = 1
 HEADER_SIZE = 64
 ENTRY_SIZE = 168
@@ -35,6 +35,7 @@ def _write_manifest_header(fd, entry_count, global_max_lsn=r_uint64(0)):
     header = lltype.malloc(rffi.CCHARP.TO, HEADER_SIZE, flavor='raw')
     try:
         for i in range(HEADER_SIZE): header[i] = '\x00'
+        # Explicitly cast to rffi.ULONGLONG to prevent signedness ambiguity
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_MAGIC))[0] = rffi.cast(rffi.ULONGLONG, MAGIC_NUMBER)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_VERSION))[0] = rffi.cast(rffi.ULONGLONG, VERSION)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_ENTRY_COUNT))[0] = rffi.cast(rffi.ULONGLONG, entry_count)
@@ -48,7 +49,12 @@ def _read_manifest_header(fd):
         read_bytes = os.read(fd, HEADER_SIZE)
         if len(read_bytes) != HEADER_SIZE: raise errors.CorruptShardError("Manifest header too short")
         for i in range(HEADER_SIZE): header[i] = read_bytes[i]
-        if rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_MAGIC))[0] != MAGIC_NUMBER: raise errors.CorruptShardError("Magic mismatch")
+        
+        # Ensure comparison is performed on raw unsigned 64-bit values
+        magic_val = rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_MAGIC))[0])
+        if magic_val != rffi.cast(rffi.ULONGLONG, MAGIC_NUMBER): 
+            raise errors.CorruptShardError("Magic mismatch")
+            
         version = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_VERSION))[0])
         entry_count = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_ENTRY_COUNT))[0])
         global_max_lsn = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_GLOBAL_MAX_LSN))[0])
@@ -78,8 +84,8 @@ def _read_manifest_entry(fd):
         if len(read_bytes) < ENTRY_SIZE: return None
         for i in range(ENTRY_SIZE): entry_buf[i] = read_bytes[i]
         component_id = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_COMPONENT_ID))[0])
-        min_eid = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MIN_ENTITY_ID))[0]
-        max_eid = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_ENTITY_ID))[0]
+        min_eid = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MIN_ENTITY_ID))[0])
+        max_eid = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_ENTITY_ID))[0])
         min_lsn = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MIN_LSN))[0])
         max_lsn = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_LSN))[0])
         filename_chars = []
