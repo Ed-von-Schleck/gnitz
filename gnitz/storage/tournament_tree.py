@@ -16,6 +16,8 @@ class StreamCursor(object):
         self.view = shard_view
         self.position = 0
         self.exhausted = False
+        # Optimization: Reuse this list object to avoid allocation churn in hot loops.
+        # The JIT will optimize the underlying storage to an array of u64.
         self.current_hashes = [] 
         self.hashes_ready = False
         self._skip_ghosts()
@@ -32,7 +34,8 @@ class StreamCursor(object):
         if self.hashes_ready:
             return self.current_hashes
         
-        self.current_hashes = []
+        del self.current_hashes[:]
+        
         payload_ptr = self.view.get_data_ptr(self.position)
         blob_base = self.view.buf_b.ptr
         
@@ -189,7 +192,6 @@ class TournamentTree(object):
         return self.heap_size == 0
 
     def close(self):
-        # Made idempotent to support safe usage in try-finally blocks
         if self.heap:
             lltype.free(self.heap, flavor='raw')
             self.heap = lltype.nullptr(rffi.CArray(HEAP_NODE_PTR.TO))
