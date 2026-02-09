@@ -1,7 +1,7 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import r_uint64
-from gnitz.storage import errors
+from gnitz.storage import errors, mmap_posix
 import os
 
 MAGIC_NUMBER = r_uint64(0x4D414E49464E5447)
@@ -23,6 +23,7 @@ OFF_FILENAME = 40
 FILENAME_MAX_LEN = 128
 
 class ManifestEntry(object):
+    _immutable_fields_ = ['component_id', 'shard_filename', 'min_entity_id', 'max_entity_id', 'min_lsn', 'max_lsn']
     def __init__(self, component_id, shard_filename, min_eid, max_eid, min_lsn, max_lsn):
         self.component_id = component_id
         self.shard_filename = shard_filename
@@ -35,7 +36,6 @@ def _write_manifest_header(fd, entry_count, global_max_lsn=r_uint64(0)):
     header = lltype.malloc(rffi.CCHARP.TO, HEADER_SIZE, flavor='raw')
     try:
         for i in range(HEADER_SIZE): header[i] = '\x00'
-        # Explicitly cast to rffi.ULONGLONG to prevent signedness ambiguity
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_MAGIC))[0] = rffi.cast(rffi.ULONGLONG, MAGIC_NUMBER)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_VERSION))[0] = rffi.cast(rffi.ULONGLONG, VERSION)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_ENTRY_COUNT))[0] = rffi.cast(rffi.ULONGLONG, entry_count)
@@ -49,12 +49,9 @@ def _read_manifest_header(fd):
         read_bytes = os.read(fd, HEADER_SIZE)
         if len(read_bytes) != HEADER_SIZE: raise errors.CorruptShardError("Manifest header too short")
         for i in range(HEADER_SIZE): header[i] = read_bytes[i]
-        
-        # Ensure comparison is performed on raw unsigned 64-bit values
         magic_val = rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_MAGIC))[0])
         if magic_val != rffi.cast(rffi.ULONGLONG, MAGIC_NUMBER): 
             raise errors.CorruptShardError("Magic mismatch")
-            
         version = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_VERSION))[0])
         entry_count = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_ENTRY_COUNT))[0])
         global_max_lsn = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_GLOBAL_MAX_LSN))[0])
@@ -70,9 +67,10 @@ def _write_manifest_entry(fd, entry):
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_ENTITY_ID))[0] = rffi.cast(rffi.ULONGLONG, entry.max_entity_id)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MIN_LSN))[0] = rffi.cast(rffi.ULONGLONG, entry.min_lsn)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_LSN))[0] = rffi.cast(rffi.ULONGLONG, entry.max_lsn)
-        filename_len = len(entry.shard_filename)
-        if filename_len > FILENAME_MAX_LEN - 1: filename_len = FILENAME_MAX_LEN - 1
-        for i in range(filename_len): entry_buf[OFF_FILENAME + i] = entry.shard_filename[i]
+        fn = entry.shard_filename
+        fn_len = len(fn)
+        if fn_len > FILENAME_MAX_LEN - 1: fn_len = FILENAME_MAX_LEN - 1
+        for i in range(fn_len): entry_buf[OFF_FILENAME + i] = fn[i]
         os.write(fd, rffi.charpsize2str(entry_buf, ENTRY_SIZE))
     finally: lltype.free(entry_buf, flavor='raw')
 
@@ -80,30 +78,47 @@ def _read_manifest_entry(fd):
     entry_buf = lltype.malloc(rffi.CCHARP.TO, ENTRY_SIZE, flavor='raw')
     try:
         read_bytes = os.read(fd, ENTRY_SIZE)
-        if not read_bytes: return None
         if len(read_bytes) < ENTRY_SIZE: return None
         for i in range(ENTRY_SIZE): entry_buf[i] = read_bytes[i]
-        component_id = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_COMPONENT_ID))[0])
-        min_eid = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MIN_ENTITY_ID))[0])
-        max_eid = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_ENTITY_ID))[0])
-        min_lsn = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MIN_LSN))[0])
-        max_lsn = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_LSN))[0])
-        filename_chars = []
+        cid = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_COMPONENT_ID))[0])
+        min_e = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MIN_ENTITY_ID))[0])
+        max_e = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_ENTITY_ID))[0])
+        min_l = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MIN_LSN))[0])
+        max_l = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_LSN))[0])
+        fn_chars = []
         for i in range(FILENAME_MAX_LEN):
             if entry_buf[OFF_FILENAME + i] == '\x00': break
-            filename_chars.append(entry_buf[OFF_FILENAME + i])
-        return ManifestEntry(component_id, "".join(filename_chars), min_eid, max_eid, min_lsn, max_lsn)
+            fn_chars.append(entry_buf[OFF_FILENAME + i])
+        return ManifestEntry(cid, "".join(fn_chars), min_e, max_e, min_l, max_l)
     finally: lltype.free(entry_buf, flavor='raw')
 
 class ManifestReader(object):
     def __init__(self, filename):
+        self.filename = filename
         self.fd = rposix.open(filename, os.O_RDONLY, 0)
         self.version, self.entry_count, self.global_max_lsn = _read_manifest_header(self.fd)
+        st = os.fstat(self.fd)
+        self.last_mtime = st.st_mtime
+
+    def has_changed(self):
+        try:
+            st = os.stat(self.filename)
+            return st.st_mtime > self.last_mtime
+        except OSError:
+            return False
+
+    def reload(self):
+        rposix.close(self.fd)
+        self.fd = rposix.open(self.filename, os.O_RDONLY, 0)
+        self.version, self.entry_count, self.global_max_lsn = _read_manifest_header(self.fd)
+        st = os.fstat(self.fd)
+        self.last_mtime = st.st_mtime
 
     def get_entry_count(self): return self.entry_count
 
     def read_entry(self, index):
-        if index < 0 or index >= self.entry_count: raise errors.StorageError()
+        if index < 0 or index >= self.entry_count:
+            raise errors.StorageError()
         rposix.lseek(self.fd, HEADER_SIZE + (index * ENTRY_SIZE), 0)
         return _read_manifest_entry(self.fd)
 
@@ -141,3 +156,4 @@ class ManifestManager(object):
         for e in entries: writer.add_entry(e.component_id, e.shard_filename, e.min_entity_id, e.max_entity_id, e.min_lsn, e.max_lsn)
         writer.finalize()
         os.rename(self.temp_path, self.manifest_path)
+        mmap_posix.fsync_dir(self.manifest_path)

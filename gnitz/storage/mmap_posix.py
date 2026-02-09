@@ -12,7 +12,13 @@ PROT_WRITE      = 0x2
 MAP_SHARED      = 0x01
 MAP_PRIVATE     = 0x02
 
-eci = ExternalCompilationInfo(includes=['sys/mman.h', 'unistd.h'])
+# flock constants
+LOCK_SH = 1  # shared lock
+LOCK_EX = 2  # exclusive lock
+LOCK_NB = 4  # non-blocking
+LOCK_UN = 8  # unlock
+
+eci = ExternalCompilationInfo(includes=['sys/mman.h', 'unistd.h', 'sys/file.h'])
 
 # ============================================================================
 # External C Functions
@@ -46,6 +52,13 @@ fsync_c = rffi.llexternal(
     compilation_info=eci
 )
 
+flock_c = rffi.llexternal(
+    "flock",
+    [rffi.INT, rffi.INT],
+    rffi.INT,
+    compilation_info=eci
+)
+
 # ============================================================================
 # High-Level RPython Wrappers
 # ============================================================================
@@ -70,20 +83,20 @@ def munmap_file(ptr, length):
         raise MMapError()
 
 def fsync_dir(filepath):
-    """
-    Opens the parent directory of filepath and calls fsync on it.
-    Crucial for ensuring the rename() is durable.
-    """
-    # Manual directory extraction to avoid rposix/os.path slicing issues in RPython
     last_slash = filepath.rfind('/')
-    if last_slash <= 0:
-        dirname = "."
-    else:
-        dirname = filepath[:last_slash]
-    
+    dirname = "." if last_slash <= 0 else filepath[:last_slash]
     try:
         fd = rposix.open(dirname, os.O_RDONLY, 0)
         fsync_c(fd)
         rposix.close(fd)
     except OSError:
-        pass # Some filesystems don't support dir fsync
+        pass
+
+def try_lock_exclusive(fd):
+    """Attempts to acquire an exclusive non-blocking lock."""
+    # LOCK_EX | LOCK_NB
+    res = flock_c(fd, LOCK_EX | LOCK_NB)
+    return rffi.cast(lltype.Signed, res) == 0
+
+def unlock_file(fd):
+    flock_c(fd, LOCK_UN)

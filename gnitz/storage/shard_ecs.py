@@ -6,7 +6,8 @@ from gnitz.storage import buffer, layout, mmap_posix, errors
 from gnitz.core import strings as string_logic, checksum
 
 class ECSShardView(object):
-    _immutable_fields_ = ['count', 'layout', 'ptr', 'size', 'buf_e', 'buf_c', 'buf_b', 'buf_w']
+    # _c_validated and _b_validated MUST NOT be in _immutable_fields_
+    _immutable_fields_ = ['count', 'layout', 'ptr', 'size', 'buf_e', 'buf_c', 'buf_b', 'buf_w', 'cs_c', 'cs_b']
 
     def __init__(self, filename, component_layout, validate_checksums=True):
         self.layout = component_layout
@@ -14,22 +15,36 @@ class ECSShardView(object):
         try:
             st = os.fstat(fd)
             self.size = st.st_size
-            if self.size < layout.HEADER_SIZE: raise errors.CorruptShardError("File too small")
+            if self.size < (layout.HEADER_SIZE + layout.FOOTER_SIZE): 
+                raise errors.CorruptShardError("File too small")
             self.ptr = mmap_posix.mmap_file(fd, self.size, mmap_posix.PROT_READ, mmap_posix.MAP_SHARED)
         finally: rposix.close(fd)
+        
         header = buffer.MappedBuffer(self.ptr, layout.HEADER_SIZE)
-        if header.read_u64(layout.OFF_MAGIC) != layout.MAGIC_NUMBER: raise errors.CorruptShardError("Magic mismatch")
+        if header.read_u64(layout.OFF_MAGIC) != layout.MAGIC_NUMBER: 
+            raise errors.CorruptShardError("Magic mismatch")
+        
         self.count = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_COUNT))
         off_e = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_E_ECS))
         off_c = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_C_ECS))
         off_b = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_B_ECS))
         off_w = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_W_ECS))
+        
         self.buf_e = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_e), off_w - off_e)
         self.buf_w = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_w), off_c - off_w)
         self.buf_c = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_c), off_b - off_c)
-        self.buf_b = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_b), self.size - off_b)
+        self.buf_b = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_b), self.size - off_b - layout.FOOTER_SIZE)
+        
+        footer_ptr = rffi.ptradd(self.ptr, self.size - layout.FOOTER_SIZE)
+        self.cs_c = r_uint64(rffi.cast(rffi.ULONGLONGP, footer_ptr)[0])
+        self.cs_b = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(footer_ptr, 8))[0])
+
+        self._c_validated = False
+        self._b_validated = False
+
         if validate_checksums:
-            self.validate_region_e(); self.validate_region_w()
+            self.validate_region_e()
+            self.validate_region_w()
     
     def validate_region_e(self):
         expected = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_CHECKSUM_E))[0])
@@ -41,9 +56,24 @@ class ECSShardView(object):
         if checksum.compute_checksum(self.buf_w.ptr, self.count * 8) != expected:
             raise errors.CorruptShardError("Region W checksum mismatch")
 
+    def validate_region_c(self):
+        if not self._c_validated:
+            if checksum.compute_checksum(self.buf_c.ptr, self.count * self.layout.stride) != self.cs_c:
+                raise errors.CorruptShardError("Region C checksum mismatch")
+            self._c_validated = True
+
+    def validate_region_b(self):
+        if not self._b_validated:
+            if checksum.compute_checksum(self.buf_b.ptr, self.buf_b.size) != self.cs_b:
+                raise errors.CorruptShardError("Region B checksum mismatch")
+            self._b_validated = True
+
     def get_entity_id(self, index): return self.buf_e.read_u64(index * 8)
     def get_weight(self, index): return self.buf_w.read_i64(index * 8)
-    def get_data_ptr(self, index): return self.buf_c.get_raw_ptr(index * self.layout.stride)
+    
+    def get_data_ptr(self, index): 
+        self.validate_region_c()
+        return self.buf_c.get_raw_ptr(index * self.layout.stride)
 
     def find_entity_index(self, entity_id):
         low = 0; high = self.count - 1; ans = -1
@@ -61,6 +91,8 @@ class ECSShardView(object):
         return rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr, field_off))[0]
 
     def string_field_equals(self, index, field_idx, search_str):
+        if len(search_str) > string_logic.SHORT_STRING_THRESHOLD:
+            self.validate_region_b()
         ptr = self.get_data_ptr(index)
         field_off = self.layout.get_field_offset(field_idx)
         struct_ptr = rffi.ptradd(ptr, field_off)

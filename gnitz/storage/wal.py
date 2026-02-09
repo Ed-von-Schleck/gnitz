@@ -13,27 +13,23 @@ class WALReader(object):
     def read_next_block(self):
         if self.closed: return (False, 0, 0, [])
         
+        # os.read returns a string. 
         header_str = os.read(self.fd, wal_format.WAL_BLOCK_HEADER_SIZE)
         
+        # 0 bytes means clean EOF
         if not header_str or len(header_str) == 0:
             return (False, 0, 0, [])
             
+        # > 0 but < HEADER_SIZE means the WAL was truncated mid-write
         if len(header_str) < wal_format.WAL_BLOCK_HEADER_SIZE:
             raise errors.CorruptShardError("Truncated WAL header")
             
-        # Reconstruct entry count using standard machine-word integers.
-        # This avoids TyperErrors associated with shifting small UINT types.
-        b12 = ord(header_str[12])
-        b13 = ord(header_str[13])
-        b14 = ord(header_str[14])
-        b15 = ord(header_str[15])
-        
-        entry_count_val = b12 | (b13 << 8) | (b14 << 16) | (b15 << 24)
-        entry_count = rffi.cast(lltype.Signed, entry_count_val)
+        b12, b13, b14, b15 = ord(header_str[12]), ord(header_str[13]), ord(header_str[14]), ord(header_str[15])
+        cnt_val = b12 | (b13 << 8) | (b14 << 16) | (b15 << 24)
+        entry_count = rffi.cast(lltype.Signed, cnt_val)
         
         record_size = wal_format.get_record_size(self.layout)
         body_size = entry_count * record_size
-        
         body_str = ""
         if body_size > 0:
             body_str = os.read(self.fd, body_size)
@@ -51,9 +47,9 @@ class WALReader(object):
     
     def iterate_blocks(self):
         while True:
-            is_valid, lsn, component_id, records = self.read_next_block()
-            if not is_valid: break
-            yield (lsn, component_id, records)
+            valid, lsn, cid, records = self.read_next_block()
+            if not valid: break
+            yield (lsn, cid, records)
     
     def close(self):
         if not self.closed:
@@ -61,11 +57,17 @@ class WALReader(object):
             self.closed = True
 
 class WALWriter(object):
-    def __init__(self, filename, layout):
+    def __init__(self, filename, layout, is_temporary=False):
         self.filename = filename
         self.layout = layout
         self.closed = False
+        self.is_temporary = is_temporary
         self.fd = rposix.open(filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        
+        if not self.is_temporary:
+            if not mmap_posix.try_lock_exclusive(self.fd):
+                rposix.close(self.fd)
+                raise errors.StorageError("Could not acquire WAL lock: another process is writing.")
     
     def append_block(self, lsn, component_id, records):
         if self.closed: raise errors.StorageError()
@@ -74,7 +76,7 @@ class WALWriter(object):
             
     def truncate_before_lsn(self, target_lsn):
         temp_fn = self.filename + ".trunc"
-        new_w = WALWriter(temp_fn, self.layout)
+        new_w = WALWriter(temp_fn, self.layout, is_temporary=True)
         reader = WALReader(self.filename, self.layout)
         try:
             for lsn, comp_id, records in reader.iterate_blocks():
@@ -83,12 +85,24 @@ class WALWriter(object):
         finally:
             reader.close()
             new_w.close()
+            
+        old_fd = self.fd
         os.rename(temp_fn, self.filename)
-        rposix.close(self.fd)
-        self.fd = rposix.open(self.filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        
+        # We must reopen the new file and lock it before releasing the old one
+        self.fd = rposix.open(self.filename, os.O_WRONLY | os.O_APPEND, 0o644)
+        if not mmap_posix.try_lock_exclusive(self.fd):
+            rposix.close(self.fd)
+            self.fd = old_fd
+            raise errors.StorageError("Failed to re-acquire lock after truncation")
+            
+        mmap_posix.unlock_file(old_fd)
+        rposix.close(old_fd)
     
     def close(self):
         if not self.closed:
             mmap_posix.fsync_c(self.fd)
+            if not self.is_temporary:
+                mmap_posix.unlock_file(self.fd)
             rposix.close(self.fd)
             self.closed = True

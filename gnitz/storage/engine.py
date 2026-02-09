@@ -59,10 +59,8 @@ class Engine(object):
             
             expected_lsn = lsn + r_uint64(1)
 
-            if comp_id != self.component_id:
-                continue
-            if lsn <= max_lsn_finalized:
-                continue
+            if comp_id != self.component_id: continue
+            if lsn <= max_lsn_finalized: continue
             
             if not has_seen and lsn > (max_lsn_finalized + r_uint64(1)):
                 reader.close()
@@ -72,16 +70,14 @@ class Engine(object):
                 first_lsn_seen = lsn
                 has_seen = True
             
-            if lsn > max_lsn_seen:
-                max_lsn_seen = lsn
+            if lsn > max_lsn_seen: max_lsn_seen = lsn
             
             for eid, weight, c_data in records:
                 self.mem_manager.put_from_recovery(eid, weight, c_data)
         
         self.current_lsn = max_lsn_seen + r_uint64(1)
         self.mem_manager.current_lsn = self.current_lsn
-        if has_seen:
-            self.mem_manager.starting_lsn = first_lsn_seen
+        if has_seen: self.mem_manager.starting_lsn = first_lsn_seen
         reader.close()
 
     def get_effective_weight_raw(self, entity_id, packed_payload_ptr, payload_heap_ptr):
@@ -90,14 +86,11 @@ class Engine(object):
         blob_base = self.mem_manager.active_table.blob_arena.base_ptr
         head = self.mem_manager.active_table.head_off
         
-        pred_off = skip_list_find_exact(
-            base, head, entity_id, self.layout, packed_payload_ptr, payload_heap_ptr
-        )
+        pred_off = skip_list_find_exact(base, head, entity_id, self.layout, packed_payload_ptr, payload_heap_ptr)
         curr_off = node_get_next_off(base, pred_off, 0)
         
         while curr_off != 0:
-            if node_get_entity_id(base, curr_off) != entity_id:
-                break
+            if node_get_entity_id(base, curr_off) != entity_id: break
             payload = node_get_payload_ptr(base, curr_off)
             if compare_payloads(self.layout, payload, blob_base, packed_payload_ptr, payload_heap_ptr) == 0:
                 mem_weight += node_get_weight(base, curr_off)
@@ -108,8 +101,7 @@ class Engine(object):
         for shard_handle, start_idx in results:
             idx = start_idx
             while idx < shard_handle.view.count:
-                if shard_handle.view.get_entity_id(idx) != entity_id:
-                    break
+                if shard_handle.view.get_entity_id(idx) != entity_id: break
                 s_payload = shard_handle.view.get_data_ptr(idx)
                 s_blob = shard_handle.view.buf_b.ptr
                 if compare_payloads(self.layout, s_payload, s_blob, packed_payload_ptr, payload_heap_ptr) == 0:
@@ -129,10 +121,8 @@ class Engine(object):
         new_global_max = lsn_max
         if self.manifest_manager and self.manifest_manager.exists():
             reader = self.manifest_manager.load_current()
-            for e in reader.iterate_entries():
-                entries.append(e)
-            if reader.global_max_lsn > new_global_max:
-                new_global_max = reader.global_max_lsn
+            for e in reader.iterate_entries(): entries.append(e)
+            if reader.global_max_lsn > new_global_max: new_global_max = reader.global_max_lsn
             reader.close()
         
         if self.registry is not None:
@@ -149,8 +139,7 @@ class Engine(object):
         self.spine = spine.Spine(self.spine.handles + [new_handle], self.spine.ref_counter)
         
         needs_compaction = False
-        if self.registry is not None:
-            needs_compaction = self.registry.mark_for_compaction(self.component_id)
+        if self.registry is not None: needs_compaction = self.registry.mark_for_compaction(self.component_id)
         return min_eid, max_eid, needs_compaction
 
     def close(self):

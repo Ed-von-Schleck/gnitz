@@ -9,6 +9,7 @@ from gnitz.core import types, strings as string_logic, checksum
 FIELD_INDICES = unrolling_iterable(range(64))
 
 def _align_64(val): return (val + 63) & ~63
+
 def _copy_memory(dest_ptr, src_ptr, size):
     for i in range(size): dest_ptr[i] = src_ptr[i]
 
@@ -96,6 +97,10 @@ class ECSShardWriter(object):
         self.c_buf.append_bytes(self.scratch_row, 1)
 
     def add_packed_row(self, entity_id, weight, source_row_ptr, source_heap_ptr):
+        """
+        Copies a row from an existing shard into the new one.
+        Handles relocation of German Strings (swizzling pointers).
+        """
         if weight == 0: return
         self.count += 1
         self.e_buf.append_u64(entity_id)
@@ -104,19 +109,29 @@ class ECSShardWriter(object):
         stride = self.layout.stride
         self.c_buf.ensure_capacity(1)
         dest_c = rffi.ptradd(self.c_buf.ptr, (self.c_buf.count) * stride)
+        
+        # 1. Bulk copy source data (primitives + inline strings)
         for i in range(stride): dest_c[i] = source_row_ptr[i]
         
+        # 2. Update pointers for "Long" strings
         for i in FIELD_INDICES:
             if i >= len(self.layout.field_types): break
             if self.layout.field_types[i] == types.TYPE_STRING:
                 s_ptr = rffi.ptradd(dest_c, self.layout.field_offsets[i])
                 length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, s_ptr)[0])
+                
                 if length > string_logic.SHORT_STRING_THRESHOLD:
+                    # Resolve old offset from the source shard's C region
                     u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(s_ptr, 8))
                     old_off = rffi.cast(lltype.Signed, u64_view[0])
+                    
+                    # Allocate in the new shard's B region
                     new_off = self.b_buf.count
                     self.b_buf.append_bytes(rffi.ptradd(source_heap_ptr, old_off), length)
+                    
+                    # Overwrite C region with the new relative offset
                     u64_view[0] = rffi.cast(rffi.ULONGLONG, new_off)
+        
         self.c_buf.count += 1
 
     def finalize(self, filename):
@@ -131,8 +146,11 @@ class ECSShardWriter(object):
             size_c = self.count * self.layout.stride
             off_b = _align_64(off_c + size_c)
             size_b = self.b_buf.count
+
             cs_e = checksum.compute_checksum(self.e_buf.ptr, size_e)
             cs_w = checksum.compute_checksum(self.w_buf.ptr, size_w)
+            cs_c = checksum.compute_checksum(self.c_buf.ptr, size_c)
+            cs_b = checksum.compute_checksum(self.b_buf.ptr, size_b)
             
             h = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor='raw')
             try:
@@ -156,6 +174,13 @@ class ECSShardWriter(object):
             self._write_padding(fd, off_b - (off_c + size_c))
             if size_b > 0: mmap_posix.write_c(fd, self.b_buf.ptr, rffi.cast(rffi.SIZE_T, size_b))
             
+            f = lltype.malloc(rffi.CCHARP.TO, layout.FOOTER_SIZE, flavor='raw')
+            try:
+                rffi.cast(rffi.ULONGLONGP, f)[0] = rffi.cast(rffi.ULONGLONG, cs_c)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(f, 8))[0] = rffi.cast(rffi.ULONGLONG, cs_b)
+                mmap_posix.write_c(fd, f, rffi.cast(rffi.SIZE_T, layout.FOOTER_SIZE))
+            finally: lltype.free(f, flavor='raw')
+
             mmap_posix.fsync_c(fd)
         finally:
             rposix.close(fd)
