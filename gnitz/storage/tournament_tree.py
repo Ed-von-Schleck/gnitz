@@ -1,207 +1,135 @@
+from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import errors
 
+HEAP_NODE_PTR = lltype.Ptr(lltype.Struct("HeapNode", 
+    ("entity_id", rffi.LONGLONG),
+    ("cursor_idx", rffi.INT)
+))
+
 class StreamCursor(object):
-    """
-    Wraps an ECSShardView and tracks current position.
-    Provides iterator interface over entities in a shard.
-    """
     def __init__(self, shard_view):
         self.view = shard_view
         self.position = 0
         self.exhausted = False
-        
         if self.view.count == 0:
             self.exhausted = True
     
     def peek_entity_id(self):
-        """
-        Returns the next entity ID without advancing the cursor.
-        
-        Returns:
-            Entity ID (i64) or -1 if exhausted
-        """
         if self.exhausted:
-            return -1
-        
+            return rffi.cast(rffi.LONGLONG, -1)
         return self.view.get_entity_id(self.position)
     
     def advance(self):
-        """
-        Advances the cursor to the next entity.
-        Marks cursor as exhausted if no more entities.
-        """
         if self.exhausted:
             return
-        
         self.position += 1
-        
         if self.position >= self.view.count:
             self.exhausted = True
     
     def is_exhausted(self):
-        """Returns True if cursor has no more entities."""
         return self.exhausted
     
     def get_current_index(self):
-        """Returns the current position index."""
         return self.position
 
-
 class TournamentTree(object):
-    """
-    Maintains a tournament tree (min-heap) for N-way merge of sorted streams.
-    Each stream is represented by a StreamCursor.
-    """
     def __init__(self, cursors):
-        """
-        Initializes tournament tree with the given cursors.
-        
-        Args:
-            cursors: List of StreamCursor objects
-        """
         self.cursors = cursors
         self.num_cursors = len(cursors)
+        self.heap_size = 0
         
-        # Heap of (entity_id, cursor_index)
-        # We maintain this manually as a binary heap
-        self.heap = []
+        # Raw heap allocation
+        self.heap = lltype.malloc(rffi.CArray(HEAP_NODE_PTR.TO), self.num_cursors, flavor='raw')
         
-        # Build initial heap from all non-exhausted cursors
         for i in range(self.num_cursors):
             if not cursors[i].is_exhausted():
-                entity_id = cursors[i].peek_entity_id()
-                self._heap_insert(entity_id, i)
-    
-    def _heap_insert(self, entity_id, cursor_idx):
-        """Inserts (entity_id, cursor_idx) into the min-heap."""
-        self.heap.append((entity_id, cursor_idx))
-        self._sift_up(len(self.heap) - 1)
-    
+                self._heap_push(cursors[i].peek_entity_id(), i)
+
+    def _heap_push(self, eid, c_idx):
+        idx = self.heap_size
+        self.heap_size += 1
+        self.heap[idx].entity_id = eid
+        self.heap[idx].cursor_idx = rffi.cast(rffi.INT, c_idx)
+        self._sift_up(idx)
+
     def _sift_up(self, idx):
-        """Sifts element at idx up to maintain heap property."""
         while idx > 0:
             parent = (idx - 1) // 2
-            if self.heap[idx][0] < self.heap[parent][0]:
-                # Swap with parent
-                temp = self.heap[idx]
-                self.heap[idx] = self.heap[parent]
-                self.heap[parent] = temp
+            if self.heap[idx].entity_id < self.heap[parent].entity_id:
+                eid, c_idx = self.heap[idx].entity_id, self.heap[idx].cursor_idx
+                self.heap[idx].entity_id = self.heap[parent].entity_id
+                self.heap[idx].cursor_idx = self.heap[parent].cursor_idx
+                self.heap[parent].entity_id = eid
+                self.heap[parent].cursor_idx = c_idx
                 idx = parent
             else:
                 break
-    
+
     def _sift_down(self, idx):
-        """Sifts element at idx down to maintain heap property."""
         while True:
             smallest = idx
             left = 2 * idx + 1
             right = 2 * idx + 2
-            
-            if left < len(self.heap) and self.heap[left][0] < self.heap[smallest][0]:
+            if left < self.heap_size and self.heap[left].entity_id < self.heap[smallest].entity_id:
                 smallest = left
-            
-            if right < len(self.heap) and self.heap[right][0] < self.heap[smallest][0]:
+            if right < self.heap_size and self.heap[right].entity_id < self.heap[smallest].entity_id:
                 smallest = right
-            
             if smallest != idx:
-                # Swap
-                temp = self.heap[idx]
-                self.heap[idx] = self.heap[smallest]
-                self.heap[smallest] = temp
+                eid, c_idx = self.heap[idx].entity_id, self.heap[idx].cursor_idx
+                self.heap[idx].entity_id = self.heap[smallest].entity_id
+                self.heap[idx].cursor_idx = self.heap[smallest].cursor_idx
+                self.heap[smallest].entity_id = eid
+                self.heap[smallest].cursor_idx = c_idx
                 idx = smallest
             else:
                 break
-    
-    def _extract_min(self):
-        """
-        Extracts the minimum (entity_id, cursor_idx) from heap.
-        
-        Returns:
-            Tuple of (entity_id, cursor_idx) or None if heap is empty
-        """
-        if len(self.heap) == 0:
-            return None
-        
-        if len(self.heap) == 1:
-            return self.heap.pop()
-        
-        # Replace root with last element and sift down
-        min_elem = self.heap[0]
-        self.heap[0] = self.heap.pop()
-        self._sift_down(0)
-        
-        return min_elem
-    
+
     def get_min_entity_id(self):
-        """
-        Returns the smallest entity ID across all streams.
-        
-        Returns:
-            Entity ID (i64) or -1 if all streams exhausted
-        """
-        if len(self.heap) == 0:
-            return -1
-        
-        return self.heap[0][0]
+        if self.heap_size == 0:
+            return rffi.cast(rffi.LONGLONG, -1)
+        return self.heap[0].entity_id
     
     def get_all_cursors_at_min(self):
-        """
-        Returns all cursor indices that are currently at the minimum entity ID.
-        This handles the case where the same entity appears in multiple shards.
-        
-        Returns:
-            List of cursor indices
-        """
-        if len(self.heap) == 0:
-            return []
-        
-        min_entity_id = self.heap[0][0]
-        result = []
-        
-        # Collect all cursors at min entity ID
-        # We need to check the entire heap since multiple cursors might have same entity
-        for entity_id, cursor_idx in self.heap:
-            if entity_id == min_entity_id:
-                result.append(cursor_idx)
-        
-        return result
+        # Result list of cursor indices (integers)
+        if self.heap_size == 0: return []
+        min_eid = self.heap[0].entity_id
+        res = []
+        # Linear scan of heap for matches is fine for small N (num shards)
+        for i in range(self.heap_size):
+            if self.heap[i].entity_id == min_eid:
+                res.append(rffi.cast(lltype.Signed, self.heap[i].cursor_idx))
+        return res
     
     def advance_min_cursors(self):
-        """
-        Advances all cursors that are at the minimum entity ID and rebuilds heap.
-        This is called after processing the current minimum entity.
-        """
-        if len(self.heap) == 0:
-            return
+        if self.heap_size == 0: return
+        min_eid = self.heap[0].entity_id
         
-        min_entity_id = self.heap[0][0]
-        
-        # Find all cursors at min and advance them
-        cursors_to_advance = []
-        for entity_id, cursor_idx in self.heap:
-            if entity_id == min_entity_id:
-                cursors_to_advance.append(cursor_idx)
-        
-        # Remove these cursors from heap
-        new_heap = []
-        for entity_id, cursor_idx in self.heap:
-            if entity_id != min_entity_id:
-                new_heap.append((entity_id, cursor_idx))
-        
-        self.heap = new_heap
-        
-        # Rebuild heap property (simple approach: re-heapify)
-        for i in range(len(self.heap) // 2 - 1, -1, -1):
-            self._sift_down(i)
-        
-        # Advance cursors and re-insert if not exhausted
-        for cursor_idx in cursors_to_advance:
-            self.cursors[cursor_idx].advance()
+        # Identify cursors to advance
+        to_advance = []
+        i = 0
+        while i < self.heap_size:
+            if self.heap[i].entity_id == min_eid:
+                to_advance.append(rffi.cast(lltype.Signed, self.heap[i].cursor_idx))
+                # Swap with last element to remove
+                self.heap_size -= 1
+                if i < self.heap_size:
+                    self.heap[i].entity_id = self.heap[self.heap_size].entity_id
+                    self.heap[i].cursor_idx = self.heap[self.heap_size].cursor_idx
+                    # Re-heapify from this position
+                    self._sift_down(i)
+                    continue # Re-check current index
+            i += 1
             
-            if not self.cursors[cursor_idx].is_exhausted():
-                new_entity_id = self.cursors[cursor_idx].peek_entity_id()
-                self._heap_insert(new_entity_id, cursor_idx)
-    
+        # Push advanced cursors back
+        for c_idx in to_advance:
+            self.cursors[c_idx].advance()
+            if not self.cursors[c_idx].is_exhausted():
+                self._heap_push(self.cursors[c_idx].peek_entity_id(), c_idx)
+
     def is_exhausted(self):
-        """Returns True if all streams are exhausted."""
-        return len(self.heap) == 0
+        return self.heap_size == 0
+
+    def close(self):
+        if self.heap:
+            lltype.free(self.heap, flavor='raw')
+            self.heap = lltype.nullptr(rffi.CArray(HEAP_NODE_PTR.TO))

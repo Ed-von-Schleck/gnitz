@@ -1,18 +1,29 @@
 import sys
 import os
+from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import (
     memtable, spine, engine, writer_ecs, manifest, 
     shard_registry, refcount, compactor, shard_ecs, wal
 )
 from gnitz.core import types, values as db_values
 
+def get_weight_helper(engine_inst, eid, vals):
+    """Helper to query engine without boxing overhead in the storage layer."""
+    layout = engine_inst.layout
+    scratch = lltype.malloc(rffi.CCHARP.TO, layout.stride, flavor='raw')
+    try:
+        for i in range(layout.stride): scratch[i] = '\x00'
+        engine_inst.mem_manager.active_table._pack_values_to_buf(scratch, vals)
+        blob_base = engine_inst.mem_manager.active_table.blob_arena.base_ptr
+        return engine_inst.get_effective_weight_raw(eid, scratch, blob_base)
+    finally:
+        lltype.free(scratch, flavor='raw')
+
 def entry_point(argv):
     print "--- GnitzDB Full Lifecycle Translation Test ---"
     
-    # 1. Setup Schema: [Value (I64), Label (String)]
     layout_obj = types.ComponentLayout([types.TYPE_I64, types.TYPE_STRING])
     
-    # Registry of test files
     db_manifest = "test_lifecycle.manifest"
     db_wal = "test_lifecycle.wal"
     shard_a = "shard_a.db"
@@ -25,7 +36,6 @@ def entry_point(argv):
         if os.path.exists(f): os.unlink(f)
     
     try:
-        # Create RefCounter at start
         rc = refcount.RefCounter()
 
         # === PHASE 1: Integrated Ingestion & Persistence ===
@@ -39,17 +49,13 @@ def entry_point(argv):
         
         db = engine.Engine(mgr, sp, m_mgr, reg, component_id=1)
         
-        # Entity 100: First version (Weight +1)
-        # Use explicit instantiation to avoid RPython annotation union errors
         vals1 = [db_values.IntValue(10), db_values.StringValue("version_1")]
         db.mem_manager.put(100, 1, vals1)
         db.flush_and_rotate(shard_a)
         
-        # Entity 100: Second version (Weight +1, Net weight should become 2)
         vals2 = [db_values.IntValue(20), db_values.StringValue("version_2")]
         db.mem_manager.put(100, 1, vals2)
         
-        # Entity 200: To be deleted (Annihilated)
         vals3 = [db_values.IntValue(99), db_values.StringValue("to_delete")]
         db.mem_manager.put(200, 1, vals3)
         db.flush_and_rotate(shard_b)
@@ -60,7 +66,6 @@ def entry_point(argv):
         db.mem_manager.put(300, 1, vals4)
         db.close() 
         
-        # --- RESTART ---
         print "  Restarting Engine with WAL Recovery..."
         wal_writer_rec = wal.WALWriter(db_wal, layout_obj)
         mgr_rec = memtable.MemTableManager(layout_obj, 1024 * 1024, wal_writer=wal_writer_rec)
@@ -70,28 +75,27 @@ def entry_point(argv):
         db_rec = engine.Engine(mgr_rec, sp_rec, m_mgr_rec, reg_rec, component_id=1, recover_wal_filename=db_wal)
         
         vals_chk = [db_values.IntValue(300), db_values.StringValue("recovery_check")]
-        if db_rec.get_effective_weight(300, vals_chk) != 1: return 1
+        if get_weight_helper(db_rec, 300, vals_chk) != 1: return 1
         print "  [OK] WAL Recovery successful."
 
         # === PHASE 2: Verify Integrated State ===
         print "[Phase 2] Verifying integrated state..."
         
-        # 100 has two records: 10, "version_1" and 20, "version_2". Distinct payloads.
         vals_100_v1 = [db_values.IntValue(10), db_values.StringValue("version_1")]
         vals_100_v2 = [db_values.IntValue(20), db_values.StringValue("version_2")]
         
-        if db_rec.get_effective_weight(100, vals_100_v1) != 1: return 1
-        if db_rec.get_effective_weight(100, vals_100_v2) != 1: return 1
+        if get_weight_helper(db_rec, 100, vals_100_v1) != 1: return 1
+        if get_weight_helper(db_rec, 100, vals_100_v2) != 1: return 1
         
         vals_200 = [db_values.IntValue(99), db_values.StringValue("to_delete")]
-        if db_rec.get_effective_weight(200, vals_200) != 1: return 1
+        if get_weight_helper(db_rec, 200, vals_200) != 1: return 1
         print "  [OK] Integrated state verified"
 
         # === PHASE 3: Automated Compaction Execution ===
         print "[Phase 3] Executing automated compaction..."
         reg_rec.mark_for_compaction(1)
         policy = compactor.CompactionPolicy(reg_rec)
-        db_rec.flush_and_rotate(shard_c) # Flush the recovered memtable
+        db_rec.flush_and_rotate(shard_c)
         
         new_shard = compactor.execute_compaction(1, policy, m_mgr_rec, rc, layout_obj)
         if new_shard is None: return 1
@@ -101,43 +105,25 @@ def entry_point(argv):
         # === PHASE 4: Survivor-Aware Blob Compaction Verification ===
         print "[Phase 4] Verifying Survivor-Aware Blob Compaction..."
         
-        # Insert Entity 400 (Survivor) with Long String
-        long_str_survivor = "SURVIVOR_" * 5 # 45 bytes
+        long_str_survivor = "SURVIVOR_" * 5 
         vals_surv = [db_values.IntValue(400), db_values.StringValue(long_str_survivor)]
         db_rec.mem_manager.put(400, 1, vals_surv)
         
-        # Insert Entity 500 (Annihilated) with Long String
-        long_str_dead = "DEAD_____" * 5 # 45 bytes
+        long_str_dead = "DEAD_____" * 5 
         vals_dead = [db_values.IntValue(500), db_values.StringValue(long_str_dead)]
         db_rec.mem_manager.put(500, 1, vals_dead)
+        db_rec.mem_manager.put(500, -1, vals_dead)
         
-        vals_dead_del = [db_values.IntValue(500), db_values.StringValue(long_str_dead)]
-        db_rec.mem_manager.put(500, -1, vals_dead_del)
-        
-        # Flush to shard_blob
         db_rec.flush_and_rotate(shard_blob)
         
-        # Inspect shard_blob
         view = shard_ecs.ECSShardView(shard_blob, layout_obj)
-        
-        # Expect 1 entity (400)
-        if view.count != 1: 
-            print "FAILURE: Expected 1 entity in blob shard, got %d" % view.count
-            return 1
+        if view.count != 1: return 1
         if view.get_entity_id(0) != 400: return 1
-        
-        # Check Blob Region Size
-        # Should be exactly 45 bytes (len of long_str_survivor)
-        if view.buf_b.size != 45:
-            print "FAILURE: Blob region size mismatch. Expected 45, got %d" % view.buf_b.size
-            return 1
+        if view.buf_b.size != 45: return 1
             
         view.close()
         print "  [OK] Ghost Property verified: Annihilated blobs pruned."
-
         db_rec.close()
-        
-        print ""
         print "=== All Translation Tests Passed ==="
         
     finally:
