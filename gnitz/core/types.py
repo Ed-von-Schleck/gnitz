@@ -1,4 +1,5 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
+from gnitz.storage import errors
 
 class FieldType(object):
     _immutable_fields_ = ['code', 'size', 'alignment']
@@ -33,6 +34,9 @@ class TableSchema(object):
     _immutable_fields_ = ['columns[*]', 'pk_index', 'column_offsets[*]', 'memtable_stride']
     
     def __init__(self, columns, pk_index=0):
+        if len(columns) > 64:
+            raise errors.LayoutError("Maximum 64 columns supported")
+            
         self.columns = columns
         self.pk_index = pk_index
         self.column_offsets = [0] * len(columns)
@@ -42,7 +46,6 @@ class TableSchema(object):
         
         for i in range(len(columns)):
             if i == pk_index:
-                # PK is stored outside the payload 'stride' in MemTable/WAL
                 self.column_offsets[i] = -1
                 continue
 
@@ -68,10 +71,9 @@ class TableSchema(object):
 
 def ComponentLayout(type_list):
     """
-    Maintains compatibility with ECS tests.
-    A ComponentLayout is a TableSchema where index 0 is always the PK (TYPE_U64).
+    Maintains compatibility with ECS-style tests.
     """
-    cols = [ColumnDefinition(TYPE_U64)] # Default PK
+    cols = [ColumnDefinition(TYPE_U64)]
     for t in type_list:
         cols.append(ColumnDefinition(t))
     return TableSchema(cols, 0)
