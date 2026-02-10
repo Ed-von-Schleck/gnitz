@@ -2,118 +2,162 @@ import os
 from rpython.rlib import jit, rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
+try:
+    from rpython.rlib.rarithmetic import r_uint128
+except ImportError:
+    r_uint128 = long
 from gnitz.storage import buffer, layout, mmap_posix, errors
-from gnitz.core import strings as string_logic, checksum
+from gnitz.core import strings as string_logic, types, checksum
 
-class ECSShardView(object):
-    # _c_validated and _b_validated MUST NOT be in _immutable_fields_
-    _immutable_fields_ = ['count', 'layout', 'ptr', 'size', 'buf_e', 'buf_c', 'buf_b', 'buf_w', 'cs_c', 'cs_b']
+class TableShardView(object):
+    _immutable_fields_ = ['count', 'schema', 'ptr', 'size', 'pk_buf', 'w_buf', 'col_bufs[*]', 'blob_buf', 'dir_off', 'dir_checksums[*]']
 
-    def __init__(self, filename, component_layout, validate_checksums=True):
-        self.layout = component_layout
+    def __init__(self, filename, schema, validate_checksums=True):
+        self.schema = schema
         fd = rposix.open(filename, os.O_RDONLY, 0)
-        self.ptr = lltype.nullptr(rffi.CCHARP.TO) # Initialize to null for safety
+        self.ptr = lltype.nullptr(rffi.CCHARP.TO)
+        self.validate_on_access = validate_checksums
+        
         try:
             st = os.fstat(fd)
             self.size = st.st_size
-            if self.size < (layout.HEADER_SIZE + layout.FOOTER_SIZE): 
-                raise errors.CorruptShardError("File too small")
-            
-            # Map the file
+            if self.size < layout.HEADER_SIZE:
+                raise errors.CorruptShardError("File too small for header")
+
             self.ptr = mmap_posix.mmap_file(fd, self.size, mmap_posix.PROT_READ, mmap_posix.MAP_SHARED)
             
-            # Initialization logic wrapped in try-except to ensure unmap on failure
-            try:
-                header = buffer.MappedBuffer(self.ptr, layout.HEADER_SIZE)
-                if header.read_u64(layout.OFF_MAGIC) != layout.MAGIC_NUMBER: 
-                    raise errors.CorruptShardError("Magic mismatch")
-                
-                self.count = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_COUNT))
-                off_e = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_E_ECS))
-                off_c = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_C_ECS))
-                off_b = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_B_ECS))
-                off_w = rffi.cast(lltype.Signed, header.read_u64(layout.OFF_REG_W_ECS))
-                
-                self.buf_e = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_e), off_w - off_e)
-                self.buf_w = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_w), off_c - off_w)
-                self.buf_c = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_c), off_b - off_c)
-                self.buf_b = buffer.MappedBuffer(rffi.ptradd(self.ptr, off_b), self.size - off_b - layout.FOOTER_SIZE)
-                
-                footer_ptr = rffi.ptradd(self.ptr, self.size - layout.FOOTER_SIZE)
-                self.cs_c = r_uint64(rffi.cast(rffi.ULONGLONGP, footer_ptr)[0])
-                self.cs_b = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(footer_ptr, 8))[0])
+            if rffi.cast(rffi.ULONGLONGP, self.ptr)[0] != layout.MAGIC_NUMBER:
+                raise errors.CorruptShardError("Magic mismatch")
+            
+            self.count = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_ROW_COUNT))[0])
+            self.dir_off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_DIR_OFFSET))[0])
+            
+            num_regions = 2 + (len(schema.columns) - 1) + 1 # PK, W, N-1 Cols, B
+            self.dir_checksums = [r_uint64(0)] * num_regions
+            self.region_validated = [False] * num_regions
 
-                self._c_validated = False
-                self._b_validated = False
+            def init_region(idx):
+                base = rffi.ptradd(self.ptr, self.dir_off + (idx * layout.DIR_ENTRY_SIZE))
+                off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, base)[0])
+                sz = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0])
+                cs = rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0])
+                
+                if off + sz > self.size:
+                    raise errors.CorruptShardError("Region metadata points outside file")
 
-                if validate_checksums:
-                    self.validate_region_e()
-                    self.validate_region_w()
-            except Exception:
-                # If any validation fails, we must unmap the memory to prevent leaks
-                if self.ptr:
-                    mmap_posix.munmap_file(self.ptr, self.size)
-                    self.ptr = lltype.nullptr(rffi.CCHARP.TO)
-                raise
+                self.dir_checksums[idx] = r_uint64(cs)
+                buf_ptr = rffi.ptradd(self.ptr, off)
+                
+                # Eagerly validate PK and W for structural integrity if requested
+                if validate_checksums and idx < 2 and sz > 0:
+                    if checksum.compute_checksum(buf_ptr, sz) != cs:
+                        raise errors.CorruptShardError("Checksum mismatch in region %d" % idx)
+                    self.region_validated[idx] = True
+                    
+                return buffer.MappedBuffer(buf_ptr, sz)
+
+            self.pk_buf = init_region(0)
+            self.w_buf = init_region(1)
+            
+            self.col_bufs = [None] * len(schema.columns)
+            reg_idx = 2
+            for i in range(len(schema.columns)):
+                if i == schema.pk_index: continue
+                self.col_bufs[i] = init_region(reg_idx)
+                reg_idx += 1
+            
+            self.blob_buf = init_region(reg_idx)
+            self.blob_reg_idx = reg_idx
+            self.buf_b = self.blob_buf 
+            
         finally:
             rposix.close(fd)
-    
-    def validate_region_e(self):
-        expected = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_CHECKSUM_E))[0])
-        if checksum.compute_checksum(self.buf_e.ptr, self.count * 8) != expected:
-            raise errors.CorruptShardError("Region E checksum mismatch")
-    
-    def validate_region_w(self):
-        expected = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_CHECKSUM_W))[0])
-        if checksum.compute_checksum(self.buf_w.ptr, self.count * 8) != expected:
-            raise errors.CorruptShardError("Region W checksum mismatch")
 
-    def validate_region_c(self):
-        if not self._c_validated:
-            if checksum.compute_checksum(self.buf_c.ptr, self.count * self.layout.stride) != self.cs_c:
-                raise errors.CorruptShardError("Region C checksum mismatch")
-            self._c_validated = True
+    def _check_region(self, buf, idx):
+        if self.validate_on_access and not self.region_validated[idx]:
+            if buf.size > 0:
+                actual = checksum.compute_checksum(buf.ptr, buf.size)
+                if actual != self.dir_checksums[idx]:
+                    raise errors.CorruptShardError("Checksum mismatch in region %d" % idx)
+            self.region_validated[idx] = True
 
-    def validate_region_b(self):
-        if not self._b_validated:
-            if checksum.compute_checksum(self.buf_b.ptr, self.buf_b.size) != self.cs_b:
-                raise errors.CorruptShardError("Region B checksum mismatch")
-            self._b_validated = True
+    def get_region_offset(self, idx):
+        base = rffi.ptradd(self.ptr, self.dir_off + (idx * layout.DIR_ENTRY_SIZE))
+        return rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, base)[0])
 
-    def get_entity_id(self, index): return self.buf_e.read_u64(index * 8)
-    def get_weight(self, index): return self.buf_w.read_i64(index * 8)
-    
-    def get_data_ptr(self, index): 
-        self.validate_region_c()
-        return self.buf_c.get_raw_ptr(index * self.layout.stride)
+    def get_pk_u64(self, index):
+        if self.count == 0 or index >= self.count: return r_uint64(0)
+        self._check_region(self.pk_buf, 0)
+        stride = self.schema.get_pk_column().field_type.size
+        return self.pk_buf.read_u64(index * stride)
 
-    def find_entity_index(self, entity_id):
-        low = 0; high = self.count - 1; ans = -1
+    def get_pk_u128(self, index):
+        if self.count == 0 or index >= self.count: return r_uint128(0)
+        self._check_region(self.pk_buf, 0)
+        stride = self.schema.get_pk_column().field_type.size
+        ptr = rffi.ptradd(self.pk_buf.ptr, index * stride)
+        low = rffi.cast(rffi.ULONGLONGP, ptr)[0]
+        high = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
+        return (r_uint128(high) << 64) | r_uint128(low)
+
+    def get_entity_id(self, index): 
+        if self.schema.get_pk_column().field_type.size == 16:
+            return rffi.cast(lltype.Signed, self.get_pk_u128(index) & r_uint128(0xFFFFFFFFFFFFFFFF))
+        return rffi.cast(lltype.Signed, self.get_pk_u64(index))
+
+    def get_weight(self, index):
+        if self.count == 0 or index >= self.count: return 0
+        self._check_region(self.w_buf, 1)
+        return self.w_buf.read_i64(index * 8)
+
+    def get_col_ptr(self, row_idx, col_idx):
+        if col_idx == self.schema.pk_index:
+             return rffi.ptradd(self.pk_buf.ptr, row_idx * self.schema.get_pk_column().field_type.size)
+        buf = self.col_bufs[col_idx]
+        if not buf: return lltype.nullptr(rffi.CCHARP.TO)
+        
+        # Calculate region index for column buffers (starts at 2, skips PK)
+        actual_reg_idx = 2
+        for i in range(col_idx):
+            if i != self.schema.pk_index: actual_reg_idx += 1
+        self._check_region(buf, actual_reg_idx)
+        
+        stride = self.schema.columns[col_idx].field_type.size
+        return rffi.ptradd(buf.ptr, row_idx * stride)
+
+    def read_field_i64(self, row_idx, col_idx):
+        ptr = self.get_col_ptr(row_idx, col_idx)
+        if not ptr: return 0
+        return rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, ptr)[0])
+
+    def string_field_equals(self, row_idx, col_idx, search_str):
+        ptr = self.get_col_ptr(row_idx, col_idx)
+        if not ptr: return False
+        self._check_region(self.blob_buf, self.blob_reg_idx)
+        from gnitz.core.strings import compute_prefix, string_equals
+        prefix = compute_prefix(search_str)
+        return string_equals(ptr, self.blob_buf.ptr, search_str, len(search_str), prefix)
+
+    def find_row_index(self, key):
+        low = 0
+        high = self.count - 1
+        res = -1
+        is_u128 = self.schema.get_pk_column().field_type.size == 16
         while low <= high:
-            mid = (low + high) / 2
-            eid_at_mid = self.get_entity_id(mid)
-            if eid_at_mid == entity_id: ans = mid; high = mid - 1
-            elif eid_at_mid < entity_id: low = mid + 1
-            else: high = mid - 1
-        return ans
+            mid = (low + high) // 2
+            mid_key = self.get_pk_u128(mid) if is_u128 else r_uint128(self.get_pk_u64(mid))
+            if mid_key == key:
+                res = mid
+                high = mid - 1
+            elif mid_key < key:
+                low = mid + 1
+            else:
+                high = mid - 1
+        return res
 
-    def read_field_i64(self, index, field_idx):
-        ptr = self.get_data_ptr(index)
-        field_off = self.layout.get_field_offset(field_idx)
-        return rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr, field_off))[0]
-
-    def string_field_equals(self, index, field_idx, search_str):
-        if len(search_str) > string_logic.SHORT_STRING_THRESHOLD:
-            self.validate_region_b()
-        ptr = self.get_data_ptr(index)
-        field_off = self.layout.get_field_offset(field_idx)
-        struct_ptr = rffi.ptradd(ptr, field_off)
-        heap_base_ptr = self.buf_b.ptr
-        search_len = len(search_str)
-        search_prefix = string_logic.compute_prefix(search_str)
-        return string_logic.string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_prefix)
-    
     def close(self):
         if self.ptr:
             mmap_posix.munmap_file(self.ptr, self.size)
             self.ptr = lltype.nullptr(rffi.CCHARP.TO)
+
+ECSShardView = TableShardView

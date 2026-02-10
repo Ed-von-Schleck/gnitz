@@ -1,25 +1,27 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
+try:
+    from rpython.rlib.rarithmetic import r_uint128
+except ImportError:
+    r_uint128 = long
 from gnitz.storage.memtable import (
-    node_get_weight, node_get_entity_id, node_get_next_off, 
-    node_get_payload_ptr, skip_list_find_exact, compare_payloads
+    node_get_weight, node_get_next_off, 
+    node_get_payload_ptr, compare_payloads
 )
-from gnitz.storage import wal, manifest, errors, spine
+from gnitz.storage import wal, manifest, errors, spine, mmap_posix
+from gnitz.core import types
+import os
 
 class Engine(object):
-    _immutable_fields_ = [
-        'mem_manager', 'spine', 'layout', 
-        'manifest_manager', 'registry', 'component_id'
-    ]
+    _immutable_fields_ = ['mem_manager', 'spine', 'schema', 'manifest_manager', 'registry', 'table_id']
 
-    def __init__(self, mem_manager, spine, manifest_manager=None, 
-                 registry=None, component_id=1, recover_wal_filename=None):
+    def __init__(self, mem_manager, spine_obj, manifest_manager=None, registry=None, table_id=1, recover_wal_filename=None, **kwargs):
         self.mem_manager = mem_manager
-        self.spine = spine
-        self.layout = mem_manager.layout
+        self.spine = spine_obj
+        self.schema = mem_manager.schema
         self.manifest_manager = manifest_manager
         self.registry = registry
-        self.component_id = component_id
+        self.table_id = kwargs.get('component_id', kwargs.get('table_id', table_id))
         
         if manifest_manager and manifest_manager.exists():
             reader = manifest_manager.load_current()
@@ -36,111 +38,109 @@ class Engine(object):
 
     def recover_from_wal(self, filename):
         try:
-            reader = wal.WALReader(filename, self.layout)
-        except OSError:
-            return
-
-        max_lsn_finalized = self.current_lsn - r_uint64(1)
-        max_lsn_seen = max_lsn_finalized
-        first_lsn_seen = r_uint64(0)
-        has_seen = False
-        
-        expected_lsn = r_uint64(0)
-        lsn_init = False
-
-        for lsn, comp_id, records in reader.iterate_blocks():
-            if not lsn_init:
-                lsn_init = True
-                expected_lsn = lsn
+            reader = wal.WALReader(filename, self.schema)
+            max_lsn_seen = int(self.current_lsn) - 1
+            last_recovered_lsn = max_lsn_seen
             
-            if lsn != expected_lsn:
-                reader.close()
-                raise errors.CorruptShardError("LSN gap detected in WAL")
+            for lsn, tid, records in reader.iterate_blocks():
+                if tid != self.table_id: continue
+                if int(lsn) <= max_lsn_seen: continue
+                
+                last_recovered_lsn = int(lsn)
+                for key, weight, field_values in records:
+                    self.mem_manager.active_table.upsert(key, weight, field_values)
             
-            expected_lsn = lsn + r_uint64(1)
+            self.current_lsn = r_uint64(last_recovered_lsn + 1)
+            self.mem_manager.current_lsn = self.current_lsn
+            reader.close()
+        except OSError: pass
 
-            if comp_id != self.component_id: continue
-            if lsn <= max_lsn_finalized: continue
-            
-            if not has_seen and lsn > (max_lsn_finalized + r_uint64(1)):
-                reader.close()
-                raise errors.CorruptShardError("Gap between Manifest LSN and WAL LSN")
-
-            if not has_seen:
-                first_lsn_seen = lsn
-                has_seen = True
-            
-            if lsn > max_lsn_seen: max_lsn_seen = lsn
-            
-            for eid, weight, c_data in records:
-                self.mem_manager.put_from_recovery(eid, weight, c_data)
-        
-        self.current_lsn = max_lsn_seen + r_uint64(1)
-        self.mem_manager.current_lsn = self.current_lsn
-        if has_seen: self.mem_manager.starting_lsn = first_lsn_seen
-        reader.close()
-
-    def get_effective_weight_raw(self, entity_id, packed_payload_ptr, payload_heap_ptr):
+    def get_effective_weight_raw(self, key, packed_payload_ptr, payload_heap_ptr):
         mem_weight = 0
-        base = self.mem_manager.active_table.arena.base_ptr
-        blob_base = self.mem_manager.active_table.blob_arena.base_ptr
-        head = self.mem_manager.active_table.head_off
-        
-        pred_off = skip_list_find_exact(base, head, entity_id, self.layout, packed_payload_ptr, payload_heap_ptr)
-        curr_off = node_get_next_off(base, pred_off, 0)
-        
+        table = self.mem_manager.active_table
+        pred_off = table._find_exact(key, packed_payload_ptr, payload_heap_ptr)
+        curr_off = node_get_next_off(table.arena.base_ptr, pred_off, 0)
         while curr_off != 0:
-            if node_get_entity_id(base, curr_off) != entity_id: break
-            payload = node_get_payload_ptr(base, curr_off)
-            if compare_payloads(self.layout, payload, blob_base, packed_payload_ptr, payload_heap_ptr) == 0:
-                mem_weight += node_get_weight(base, curr_off)
-            curr_off = node_get_next_off(base, curr_off, 0)
+            if table._get_node_key(curr_off) != key: break
+            payload = node_get_payload_ptr(table.arena.base_ptr, curr_off, table.key_size)
+            if compare_payloads(self.schema, payload, table.blob_arena.base_ptr, packed_payload_ptr, payload_heap_ptr) == 0:
+                mem_weight += node_get_weight(table.arena.base_ptr, curr_off)
+            curr_off = node_get_next_off(table.arena.base_ptr, curr_off, 0)
 
         spine_weight = 0
-        results = self.spine.find_all_shards_and_indices(entity_id)
-        for shard_handle, start_idx in results:
-            idx = start_idx
+        results = self.spine.find_all_shards_and_indices(key)
+        for shard_handle, row_idx in results:
+            idx = row_idx
             while idx < shard_handle.view.count:
-                if shard_handle.view.get_entity_id(idx) != entity_id: break
-                s_payload = shard_handle.view.get_data_ptr(idx)
-                s_blob = shard_handle.view.buf_b.ptr
-                if compare_payloads(self.layout, s_payload, s_blob, packed_payload_ptr, payload_heap_ptr) == 0:
-                     spine_weight += shard_handle.get_weight(idx)
+                is_u128 = shard_handle.view.schema.get_pk_column().field_type.size == 16
+                mid_key = shard_handle.view.get_pk_u128(idx) if is_u128 else r_uint128(shard_handle.view.get_pk_u64(idx))
+                if mid_key != key: break
+                
+                match = True
+                for i in range(len(self.schema.columns)):
+                    if i == self.schema.pk_index: continue
+                    col_ptr = shard_handle.view.get_col_ptr(idx, i)
+                    p_ptr = rffi.ptradd(packed_payload_ptr, self.schema.get_column_offset(i))
+                    ftype = self.schema.columns[i].field_type
+                    
+                    if ftype.code == 11:
+                        from gnitz.core.strings import string_equals_dual
+                        if not string_equals_dual(col_ptr, shard_handle.view.blob_buf.ptr, p_ptr, payload_heap_ptr):
+                            match = False; break
+                    else:
+                        for b in range(ftype.size):
+                            if col_ptr[b] != p_ptr[b]: match = False; break
+                        if not match: break
+                if match: spine_weight += shard_handle.get_weight(idx)
                 idx += 1
         return mem_weight + spine_weight
 
-    def flush_and_rotate(self, filename):
-        if not self.mem_manager.active_table.has_active_data():
-            return r_uint64(0), r_uint64(0), False
+    def get_effective_weight(self, key, packed_payload_ptr, payload_heap_ptr):
+        return self.get_effective_weight_raw(key, packed_payload_ptr, payload_heap_ptr)
 
+    def flush_and_rotate(self, filename):
+        # SYNC POINT: Capture current ingestion LSN before flush
+        self.current_lsn = self.mem_manager.current_lsn
+        
         lsn_min = self.mem_manager.starting_lsn
-        lsn_max = self.mem_manager.current_lsn - r_uint64(1)
-        min_eid, max_eid = self.mem_manager.flush_and_rotate(filename)
+        lsn_max = self.current_lsn - r_uint64(1)
+        
+        self.mem_manager.flush_and_rotate(filename)
         
         entries = []
-        new_global_max = lsn_max
         if self.manifest_manager and self.manifest_manager.exists():
             reader = self.manifest_manager.load_current()
             for e in reader.iterate_entries(): entries.append(e)
-            if reader.global_max_lsn > new_global_max: new_global_max = reader.global_max_lsn
             reader.close()
         
-        if self.registry is not None:
-            from gnitz.storage.shard_registry import ShardMetadata
-            self.registry.register_shard(ShardMetadata(filename, self.component_id, min_eid, max_eid, lsn_min, lsn_max))
+        from gnitz.storage.spine import ShardHandle
+        min_k = r_uint128(0)
+        max_k = r_uint128(0)
+        needs_comp = False
         
-        if self.manifest_manager is not None:
-            from gnitz.storage.manifest import ManifestEntry
-            entries.append(ManifestEntry(self.component_id, filename, min_eid, max_eid, lsn_min, lsn_max))
-            self.manifest_manager.publish_new_version(entries, new_global_max)
-        
-        self.current_lsn = self.mem_manager.current_lsn
-        new_handle = spine.ShardHandle(filename, self.layout, lsn_max)
-        self.spine = spine.Spine(self.spine.handles + [new_handle], self.spine.ref_counter)
-        
-        needs_compaction = False
-        if self.registry is not None: needs_compaction = self.registry.mark_for_compaction(self.component_id)
-        return min_eid, max_eid, needs_compaction
+        if os.path.exists(filename):
+            handle = ShardHandle(filename, self.schema, lsn_max)
+            if handle.view.count > 0:
+                min_k = handle.min_key
+                max_k = handle.max_key
+                new_entry = manifest.ManifestEntry(self.table_id, filename, min_k, max_k, lsn_min, lsn_max)
+                entries.append(new_entry)
+                self.spine.add_handle(handle)
+                
+                if self.registry:
+                    from gnitz.storage.shard_registry import ShardMetadata
+                    self.registry.register_shard(ShardMetadata(filename, self.table_id, min_k, max_k, lsn_min, lsn_max))
+                    needs_comp = self.registry.mark_for_compaction(self.table_id)
+            else:
+                handle.close()
+                os.unlink(filename)
+            
+        if self.manifest_manager:
+            self.manifest_manager.publish_new_version(entries, lsn_max)
+            
+        # Monotonic step: current_lsn is already synchronized at start of method
+        self.mem_manager.starting_lsn = self.current_lsn
+        return min_k, max_k, needs_comp
 
     def close(self):
         self.mem_manager.close()

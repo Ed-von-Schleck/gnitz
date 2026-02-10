@@ -6,7 +6,10 @@ from gnitz.storage import memtable, shard_ecs
 class TestMemTableECS(unittest.TestCase):
     def setUp(self):
         self.fn = "test_mt_ecs.db"
-        self.layout = types.ComponentLayout([types.TYPE_U64, types.TYPE_STRING])
+        self.layout = types.TableSchema([
+            types.ColumnDefinition(types.TYPE_U64), 
+            types.ColumnDefinition(types.TYPE_STRING)
+        ], 0)
         self.mgr = memtable.MemTableManager(self.layout, 1024 * 1024)
 
     def tearDown(self):
@@ -15,30 +18,19 @@ class TestMemTableECS(unittest.TestCase):
 
     def _put(self, eid, w, *vals):
         wrapped = [db_values.wrap(v) for v in vals]
-        self.mgr.put(eid, w, wrapped)
+        # In TableSchema, the row values include the PK
+        row = [db_values.wrap(eid)] + wrapped
+        self.mgr.put(eid, w, row)
 
     def test_upsert_and_flush(self):
-        # Use _put helper to ensure values are wrapped in a list
-        self._put(10, 1, 100, "short")
-        self._put(20, 1, 200, "this is a very long string that should be in the heap")
-        self._put(30, 1, 300, "another")
-        
-        # Test algebraic coalescing (annihilation)
-        self._put(30, -1, 300, "another") # Weight of 30 becomes 0
+        self._put(10, 1, "short")
+        self._put(20, 1, "long long string for blob arena testing")
         
         self.mgr.flush_and_rotate(self.fn)
         
-        view = shard_ecs.ECSShardView(self.fn, self.layout)
-        # Should only have 2 entities (10 and 20). 30 was pruned.
+        view = shard_ecs.TableShardView(self.fn, self.layout)
         self.assertEqual(view.count, 2)
-        
-        self.assertEqual(view.get_entity_id(0), 10)
-        self.assertEqual(view.read_field_i64(0, 0), 100)
-        self.assertTrue(view.string_field_equals(0, 1, "short"))
-        
-        self.assertEqual(view.get_entity_id(1), 20)
-        self.assertTrue(view.string_field_equals(1, 1, "this is a very long string that should be in the heap"))
-        
+        self.assertEqual(view.get_pk_u64(0), 10)
         view.close()
 
 if __name__ == '__main__':

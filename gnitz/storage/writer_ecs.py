@@ -2,16 +2,19 @@ import os
 from rpython.rlib import rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.jit import unrolling_iterable
+try:
+    from rpython.rlib.rarithmetic import r_uint128
+except ImportError:
+    r_uint128 = long
 from gnitz.storage import layout, mmap_posix
-from gnitz.core import types, strings as string_logic, checksum
+from gnitz.core import checksum
+from gnitz.core import types, strings as string_logic
 
 FIELD_INDICES = unrolling_iterable(range(64))
 
 def _align_64(val): return (val + 63) & ~63
-
 def _copy_memory(dest_ptr, src_ptr, size):
     for i in range(size): dest_ptr[i] = src_ptr[i]
-
 def _compare_memory(p1, p2, size):
     for i in range(size):
         if p1[i] != p2[i]: return False
@@ -35,6 +38,14 @@ class RawBuffer(object):
             self.ptr = new_ptr
             self.capacity = new_cap
 
+    def append_u128(self, value):
+        self.ensure_capacity(1)
+        target = rffi.cast(rffi.CCHARP, rffi.ptradd(self.ptr, self.count * 16))
+        mask = r_uint128(0xFFFFFFFFFFFFFFFF)
+        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, value & mask)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, (value >> 64) & mask)
+        self.count += 1
+
     def append_u64(self, value):
         self.ensure_capacity(1)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(rffi.ULONGLONG, value)
@@ -45,189 +56,223 @@ class RawBuffer(object):
         rffi.cast(rffi.LONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(rffi.LONGLONG, value)
         self.count += 1
 
-    def append_bytes(self, source_ptr, length):
-        self.ensure_capacity(length)
-        _copy_memory(rffi.ptradd(self.ptr, self.count * self.item_size), source_ptr, length * self.item_size)
-        self.count += length
+    def append_bytes(self, source_ptr, length_in_items):
+        self.ensure_capacity(length_in_items)
+        if source_ptr:
+            _copy_memory(rffi.ptradd(self.ptr, self.count * self.item_size), source_ptr, length_in_items * self.item_size)
+        else:
+            dest = rffi.ptradd(self.ptr, self.count * self.item_size)
+            for i in range(length_in_items * self.item_size): dest[i] = '\x00'
+        self.count += length_in_items
 
     def free(self):
-        # Idempotent free
         if self.ptr:
             lltype.free(self.ptr, flavor='raw')
             self.ptr = lltype.nullptr(rffi.CCHARP.TO)
 
-class ECSShardWriter(object):
-    def __init__(self, component_layout):
-        self.layout = component_layout
+class TableShardWriter(object):
+    def __init__(self, schema, table_id=0):
+        self.schema = schema
+        self.table_id = table_id
         self.count = 0
-        self.e_buf = RawBuffer(8)
+        pk_col = schema.get_pk_column()
+        self.pk_buf = RawBuffer(pk_col.field_type.size)
         self.w_buf = RawBuffer(8)
-        self.c_buf = RawBuffer(self.layout.stride)
+        self.col_bufs = []
+        for i in range(len(schema.columns)):
+            if i == schema.pk_index: 
+                self.col_bufs.append(None)
+            else: 
+                self.col_bufs.append(RawBuffer(schema.columns[i].field_type.size))
         self.b_buf = RawBuffer(1)
-        # Deduplication Cache: (Hash, Length) -> Offset in b_buf
-        self.blob_cache = {} 
-        self.scratch_row = lltype.malloc(rffi.CCHARP.TO, self.layout.stride, flavor='raw')
+        self.blob_cache = {}
 
     def _get_or_append_blob(self, src_ptr, length):
-        """Internal deduplicator. Returns offset in Region B."""
-        if length == 0: return 0
+        if length <= 0 or not src_ptr: return 0
         h = checksum.compute_checksum(src_ptr, length)
-        
-        # Check cache (Hash + Length for safety)
         cache_key = (h, length)
         if cache_key in self.blob_cache:
             existing_offset = self.blob_cache[cache_key]
-            # Database-grade safety: Verify actual bytes to prevent hash collisions
-            # Note: b_buf.ptr might have moved due to realloc, but offset is valid relative to current ptr
             existing_ptr = rffi.ptradd(self.b_buf.ptr, existing_offset)
-            if _compare_memory(src_ptr, existing_ptr, length):
-                return existing_offset
-        
-        # Not found or collision: Append new
+            if _compare_memory(src_ptr, existing_ptr, length): return existing_offset
         new_offset = self.b_buf.count
         self.b_buf.append_bytes(src_ptr, length)
         self.blob_cache[cache_key] = new_offset
         return new_offset
 
-    def add_entity(self, entity_id, *field_values):
-        self._add_entity_weighted(entity_id, 1, *field_values)
-
-    def _add_entity_weighted(self, entity_id, weight, *field_values):
+    def add_row(self, key, weight, packed_row_ptr, source_heap_ptr):
         if weight == 0: return
         self.count += 1
-        self.e_buf.append_u64(entity_id)
+        if self.schema.get_pk_column().field_type.size == 16: 
+            self.pk_buf.append_u128(key)
+        else: 
+            self.pk_buf.append_u64(rffi.cast(rffi.ULONGLONG, key))
         self.w_buf.append_i64(weight)
         
-        for k in range(self.layout.stride): self.scratch_row[k] = '\x00'
         for i in FIELD_INDICES:
-            if i >= len(field_values) or i >= len(self.layout.field_types): break
-            val = field_values[i]
-            ft = self.layout.field_types[i]
-            dest = rffi.ptradd(self.scratch_row, self.layout.field_offsets[i])
+            if i >= len(self.schema.columns): break
+            if i == self.schema.pk_index: continue
             
-            if ft == types.TYPE_STRING:
-                s_val = str(val)
-                ho = 0
-                if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
-                    # Convert string to temporary raw buffer for hashing
-                    tmp_str_ptr = rffi.str2charp(s_val)
-                    try:
-                        ho = self._get_or_append_blob(tmp_str_ptr, len(s_val))
-                    finally:
-                        rffi.free_charp(tmp_str_ptr)
-                string_logic.pack_string(dest, s_val, ho)
-            elif isinstance(val, (int, long)):
-                rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val)
-            elif isinstance(val, float):
-                rffi.cast(rffi.DOUBLEP, dest)[0] = rffi.cast(rffi.DOUBLE, val)
-        self.c_buf.append_bytes(self.scratch_row, 1)
+            col_def = self.schema.columns[i]
+            col_off = self.schema.get_column_offset(i)
+            buf = self.col_bufs[i]
+            
+            val_ptr = lltype.nullptr(rffi.CCHARP.TO)
+            if packed_row_ptr:
+                val_ptr = rffi.ptradd(packed_row_ptr, col_off)
 
-    def add_packed_row(self, entity_id, weight, source_row_ptr, source_heap_ptr):
-        """Moves data with pointer swizzling and blob deduplication."""
-        if weight == 0: return
-        self.count += 1
-        self.e_buf.append_u64(entity_id)
-        self.w_buf.append_i64(weight)
-        
-        stride = self.layout.stride
-        self.c_buf.ensure_capacity(1)
-        dest_c = rffi.ptradd(self.c_buf.ptr, (self.c_buf.count) * stride)
-        
-        # 1. Bulk copy primitives and inlined strings
-        _copy_memory(dest_c, source_row_ptr, stride)
-        
-        # 2. Process Long strings via deduplicator
-        for i in FIELD_INDICES:
-            if i >= len(self.layout.field_types): break
-            if self.layout.field_types[i] == types.TYPE_STRING:
-                s_ptr = rffi.ptradd(dest_c, self.layout.field_offsets[i])
-                length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, s_ptr)[0])
+            if col_def.field_type == types.TYPE_STRING:
+                if val_ptr:
+                    length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, val_ptr)[0])
+                    if length > string_logic.SHORT_STRING_THRESHOLD:
+                        u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(val_ptr, 8))
+                        old_off = rffi.cast(lltype.Signed, u64_view[0])
+                        # Fix: Check for NULL source_heap_ptr when dealing with long strings
+                        if not source_heap_ptr:
+                            raise errors.StorageError("Long string relocation requires source heap")
+                        new_off = self._get_or_append_blob(rffi.ptradd(source_heap_ptr, old_off), length)
+                        tmp_str = lltype.malloc(rffi.CCHARP.TO, 16, flavor='raw')
+                        try:
+                            _copy_memory(tmp_str, val_ptr, 16)
+                            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(tmp_str, 8))[0] = rffi.cast(rffi.ULONGLONG, new_off)
+                            buf.append_bytes(tmp_str, 1)
+                        finally: lltype.free(tmp_str, flavor='raw')
+                    else: buf.append_bytes(val_ptr, 1)
+                else: buf.append_bytes(None, 1)
+            else:
+                buf.append_bytes(val_ptr, 1)
+
+    def add_entity(self, eid, *args):
+        stride = self.schema.memtable_stride
+        tmp = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
+        blob_tmp = lltype.nullptr(rffi.CCHARP.TO)
+        try:
+            for i in range(stride): tmp[i] = '\x00'
+            arg_idx = 0
+            for i in range(len(self.schema.columns)):
+                if i == self.schema.pk_index: continue
+                if arg_idx >= len(args): break
                 
-                if length > string_logic.SHORT_STRING_THRESHOLD:
-                    # Get old offset from source shard
-                    u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(s_ptr, 8))
-                    old_off = rffi.cast(lltype.Signed, u64_view[0])
-                    
-                    # Deduplicate and swizzle to new offset
-                    # We pass pointer to raw data in old shard's heap
-                    new_off = self._get_or_append_blob(rffi.ptradd(source_heap_ptr, old_off), length)
-                    u64_view[0] = rffi.cast(rffi.ULONGLONG, new_off)
-        
-        self.c_buf.count += 1
+                val = args[arg_idx]
+                arg_idx += 1
+                off = self.schema.get_column_offset(i)
+                ftype = self.schema.columns[i].field_type
+                target = rffi.ptradd(tmp, off)
+                
+                if ftype == types.TYPE_STRING:
+                    s_val = str(val)
+                    if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
+                        if blob_tmp: lltype.free(blob_tmp, flavor='raw')
+                        blob_tmp = rffi.str2charp(s_val)
+                        string_logic.pack_string(target, s_val, 0)
+                    else:
+                        string_logic.pack_string(target, s_val, 0)
+                else:
+                    ival = int(val)
+                    if ftype.size == 8: rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, ival)
+                    elif ftype.size == 4: rffi.cast(rffi.UINTP, target)[0] = rffi.cast(rffi.UINT, ival)
+            
+            self.add_row(r_uint128(eid), 1, tmp, blob_tmp)
+        finally: 
+            lltype.free(tmp, flavor='raw')
+            if blob_tmp: rffi.free_charp(blob_tmp)
+
+    def _add_entity_weighted(self, eid, weight, *args):
+        stride = self.schema.memtable_stride
+        tmp = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
+        blob_tmp = lltype.nullptr(rffi.CCHARP.TO)
+        try:
+            for i in range(stride): tmp[i] = '\x00'
+            arg_idx = 0
+            for i in range(len(self.schema.columns)):
+                if i == self.schema.pk_index: continue
+                if arg_idx >= len(args): break
+                val = args[arg_idx]
+                arg_idx += 1
+                off = self.schema.get_column_offset(i)
+                ftype = self.schema.columns[i].field_type
+                target = rffi.ptradd(tmp, off)
+                if ftype == types.TYPE_STRING:
+                    s_val = str(val)
+                    if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
+                        if blob_tmp: lltype.free(blob_tmp, flavor='raw')
+                        blob_tmp = rffi.str2charp(s_val)
+                    string_logic.pack_string(target, s_val, 0)
+                else:
+                    ival = int(val)
+                    if ftype.size == 8: rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, ival)
+            self.add_row(r_uint128(eid), weight, tmp, blob_tmp)
+        finally: 
+            lltype.free(tmp, flavor='raw')
+            if blob_tmp: rffi.free_charp(blob_tmp)
 
     def close(self):
-        """Releases all raw buffers. Idempotent."""
-        self.e_buf.free()
+        self.pk_buf.free()
         self.w_buf.free()
-        self.c_buf.free()
+        for b in self.col_bufs:
+            if b: b.free()
         self.b_buf.free()
-        if self.scratch_row:
-            lltype.free(self.scratch_row, flavor='raw')
-            self.scratch_row = lltype.nullptr(rffi.CCHARP.TO)
 
     def finalize(self, filename):
         tmp_filename = filename + ".tmp"
         fd = rposix.open(tmp_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
-            off_e = layout.HEADER_SIZE
-            size_e = self.count * 8
-            off_w = _align_64(off_e + size_e)
-            size_w = self.count * 8
-            off_c = _align_64(off_w + size_w)
-            size_c = self.count * self.layout.stride
-            off_b = _align_64(off_c + size_c)
-            size_b = self.b_buf.count
+            region_list = []
+            region_list.append((self.pk_buf.ptr, 0, self.pk_buf.count * self.pk_buf.item_size))
+            region_list.append((self.w_buf.ptr, 0, self.w_buf.count * 8))
+            for b in self.col_bufs:
+                if b: region_list.append((b.ptr, 0, self.count * b.item_size))
+            region_list.append((self.b_buf.ptr, 0, self.b_buf.count))
 
-            # Current checksum implementation
-            cs_e = checksum.compute_checksum(self.e_buf.ptr, size_e)
-            cs_w = checksum.compute_checksum(self.w_buf.ptr, size_w)
-            cs_c = checksum.compute_checksum(self.c_buf.ptr, size_c)
-            cs_b = checksum.compute_checksum(self.b_buf.ptr, size_b)
-            
+            num_regions = len(region_list)
+            dir_size = num_regions * layout.DIR_ENTRY_SIZE
+            dir_offset = layout.HEADER_SIZE
+            current_pos = _align_64(dir_offset + dir_size)
+            final_regions = []
+            for buf_ptr, _, sz in region_list:
+                final_regions.append((buf_ptr, current_pos, sz))
+                current_pos = _align_64(current_pos + sz)
+
             header = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor='raw')
             try:
                 for i in range(layout.HEADER_SIZE): header[i] = '\x00'
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_MAGIC))[0] = rffi.cast(rffi.ULONGLONG, layout.MAGIC_NUMBER)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_COUNT))[0] = rffi.cast(rffi.ULONGLONG, self.count)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_CHECKSUM_E))[0] = rffi.cast(rffi.ULONGLONG, cs_e)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_CHECKSUM_W))[0] = rffi.cast(rffi.ULONGLONG, cs_w)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_REG_E_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_e)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_REG_W_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_w)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_REG_C_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_c)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_REG_B_ECS))[0] = rffi.cast(rffi.ULONGLONG, off_b)
+                rffi.cast(rffi.ULONGLONGP, header)[0] = layout.MAGIC_NUMBER
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_VERSION))[0] = rffi.cast(rffi.ULONGLONG, layout.VERSION)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_ROW_COUNT))[0] = rffi.cast(rffi.ULONGLONG, self.count)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_DIR_OFFSET))[0] = rffi.cast(rffi.ULONGLONG, dir_offset)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_TABLE_ID))[0] = rffi.cast(rffi.ULONGLONG, self.table_id)
                 mmap_posix.write_c(fd, header, rffi.cast(rffi.SIZE_T, layout.HEADER_SIZE))
             finally: lltype.free(header, flavor='raw')
-            
-            # Regional Writes
-            if size_e > 0: mmap_posix.write_c(fd, self.e_buf.ptr, rffi.cast(rffi.SIZE_T, size_e))
-            self._write_padding(fd, off_w - (off_e + size_e))
-            if size_w > 0: mmap_posix.write_c(fd, self.w_buf.ptr, rffi.cast(rffi.SIZE_T, size_w))
-            self._write_padding(fd, off_c - (off_w + size_w))
-            if size_c > 0: mmap_posix.write_c(fd, self.c_buf.ptr, rffi.cast(rffi.SIZE_T, size_c))
-            self._write_padding(fd, off_b - (off_c + size_c))
-            if size_b > 0: mmap_posix.write_c(fd, self.b_buf.ptr, rffi.cast(rffi.SIZE_T, size_b))
-            
-            # Footer with trailing checksums
-            footer = lltype.malloc(rffi.CCHARP.TO, layout.FOOTER_SIZE, flavor='raw')
-            try:
-                rffi.cast(rffi.ULONGLONGP, footer)[0] = rffi.cast(rffi.ULONGLONG, cs_c)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(footer, 8))[0] = rffi.cast(rffi.ULONGLONG, cs_b)
-                mmap_posix.write_c(fd, footer, rffi.cast(rffi.SIZE_T, layout.FOOTER_SIZE))
-            finally: lltype.free(footer, flavor='raw')
 
+            dir_buf = lltype.malloc(rffi.CCHARP.TO, dir_size, flavor='raw')
+            try:
+                for i in range(num_regions):
+                    buf_ptr, off, sz = final_regions[i]
+                    cs = checksum.compute_checksum(buf_ptr, sz)
+                    base = rffi.ptradd(dir_buf, i * layout.DIR_ENTRY_SIZE)
+                    rffi.cast(rffi.ULONGLONGP, base)[0] = rffi.cast(rffi.ULONGLONG, off)
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0] = rffi.cast(rffi.ULONGLONG, sz)
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0] = rffi.cast(rffi.ULONGLONG, cs)
+                mmap_posix.write_c(fd, dir_buf, rffi.cast(rffi.SIZE_T, dir_size))
+            finally: lltype.free(dir_buf, flavor='raw')
+
+            last_written_pos = dir_offset + dir_size
+            for buf_ptr, off, sz in final_regions:
+                padding = off - last_written_pos
+                if padding > 0:
+                    pad_buf = lltype.malloc(rffi.CCHARP.TO, padding, flavor='raw')
+                    for i in range(padding): pad_buf[i] = '\x00'
+                    mmap_posix.write_c(fd, pad_buf, rffi.cast(rffi.SIZE_T, padding))
+                    lltype.free(pad_buf, flavor='raw')
+                if sz > 0:
+                    mmap_posix.write_c(fd, buf_ptr, rffi.cast(rffi.SIZE_T, sz))
+                last_written_pos = off + sz
+                
             mmap_posix.fsync_c(fd)
         finally:
             rposix.close(fd)
-            # Delegate cleanup to close() to avoid code duplication and ensure safety
             self.close()
-
         os.rename(tmp_filename, filename)
         mmap_posix.fsync_dir(filename)
 
-    def _write_padding(self, fd, count):
-        if count <= 0: return
-        p = lltype.malloc(rffi.CCHARP.TO, count, flavor='raw')
-        try:
-            for i in range(count): p[i] = '\x00'
-            mmap_posix.write_c(fd, p, rffi.cast(rffi.SIZE_T, count))
-        finally: lltype.free(p, flavor='raw')
+ECSShardWriter = TableShardWriter

@@ -1,25 +1,21 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
+try:
+    from rpython.rlib.rarithmetic import r_uint128
+except ImportError:
+    r_uint128 = long
 from rpython.rlib.jit import unrolling_iterable
-from gnitz.storage import errors
-from gnitz.core import types, strings as string_logic, checksum
-
-FIELD_INDICES = unrolling_iterable(range(64))
-
-HEAP_NODE_PTR = lltype.Ptr(lltype.Struct("HeapNode", 
-    ("entity_id", rffi.ULONGLONG),
-    ("cursor_idx", rffi.INT)
-))
+from gnitz.core import types
 
 class StreamCursor(object):
+    _immutable_fields_ = ['view', 'schema', 'is_u128']
+
     def __init__(self, shard_view):
         self.view = shard_view
+        self.schema = shard_view.schema
+        self.is_u128 = self.schema.get_pk_column().field_type == types.TYPE_U128
         self.position = 0
         self.exhausted = False
-        # Optimization: Reuse this list object to avoid allocation churn in hot loops.
-        # The JIT will optimize the underlying storage to an array of u64.
-        self.current_hashes = [] 
-        self.hashes_ready = False
         self._skip_ghosts()
     
     def _skip_ghosts(self):
@@ -29,76 +25,56 @@ class StreamCursor(object):
             self.position += 1
         self.exhausted = True
 
-    def get_current_payload_hashes(self, layout):
-        """Lazily computes hashes for long strings in the current record."""
-        if self.hashes_ready:
-            return self.current_hashes
-        
-        del self.current_hashes[:]
-        
-        payload_ptr = self.view.get_data_ptr(self.position)
-        blob_base = self.view.buf_b.ptr
-        
-        for i in FIELD_INDICES:
-            if i >= len(layout.field_types): break
-            if layout.field_types[i] == types.TYPE_STRING:
-                s_ptr = rffi.ptradd(payload_ptr, layout.field_offsets[i])
-                length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, s_ptr)[0])
-                
-                if length > string_logic.SHORT_STRING_THRESHOLD:
-                    u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(s_ptr, 8))
-                    offset = rffi.cast(lltype.Signed, u64_view[0])
-                    # Compute hash of the actual string content
-                    h = checksum.compute_checksum(rffi.ptradd(blob_base, offset), length)
-                    self.current_hashes.append(h)
-        
-        self.hashes_ready = True
-        return self.current_hashes
-
-    def peek_entity_id(self):
+    def peek_key(self):
         if self.exhausted:
-            return r_uint64(-1)
-        return self.view.get_entity_id(self.position)
+            return r_uint128(-1)
+        if self.is_u128:
+            return self.view.get_pk_u128(self.position)
+        return r_uint128(self.view.get_pk_u64(self.position))
     
     def advance(self):
         if self.exhausted: return
         self.position += 1
-        self.hashes_ready = False # Invalidate hash cache
         self._skip_ghosts()
     
     def is_exhausted(self):
         return self.exhausted
-    
-    def get_current_index(self):
-        return self.position
+
+HEAP_NODE = lltype.Struct("HeapNode", 
+    ("key_low", rffi.ULONGLONG),
+    ("key_high", rffi.ULONGLONG),
+    ("cursor_idx", rffi.INT)
+)
 
 class TournamentTree(object):
     def __init__(self, cursors):
         self.cursors = cursors
         self.num_cursors = len(cursors)
         self.heap_size = 0
-        self.heap = lltype.malloc(rffi.CArray(HEAP_NODE_PTR.TO), self.num_cursors, flavor='raw')
+        self.heap = lltype.malloc(rffi.CArray(HEAP_NODE), self.num_cursors, flavor='raw')
         
         for i in range(self.num_cursors):
             if not cursors[i].is_exhausted():
-                self._heap_push(cursors[i].peek_entity_id(), i)
+                self._heap_push(cursors[i].peek_key(), i)
 
-    def _heap_push(self, eid, c_idx):
+    def _heap_push(self, key, c_idx):
         idx = self.heap_size
         self.heap_size += 1
-        self.heap[idx].entity_id = eid
+        self.heap[idx].key_low = rffi.cast(rffi.ULONGLONG, key & 0xFFFFFFFFFFFFFFFF)
+        self.heap[idx].key_high = rffi.cast(rffi.ULONGLONG, key >> 64)
         self.heap[idx].cursor_idx = rffi.cast(rffi.INT, c_idx)
         self._sift_up(idx)
+
+    def _get_key(self, idx):
+        low = r_uint128(self.heap[idx].key_low)
+        high = r_uint128(self.heap[idx].key_high)
+        return (high << 64) | low
 
     def _sift_up(self, idx):
         while idx > 0:
             parent = (idx - 1) // 2
-            if self.heap[idx].entity_id < self.heap[parent].entity_id:
-                eid, c_idx = self.heap[idx].entity_id, self.heap[idx].cursor_idx
-                self.heap[idx].entity_id = self.heap[parent].entity_id
-                self.heap[idx].cursor_idx = self.heap[parent].cursor_idx
-                self.heap[parent].entity_id = eid
-                self.heap[parent].cursor_idx = c_idx
+            if self._get_key(idx) < self._get_key(parent):
+                self._swap(idx, parent)
                 idx = parent
             else: break
 
@@ -107,91 +83,63 @@ class TournamentTree(object):
             smallest = idx
             left = 2 * idx + 1
             right = 2 * idx + 2
-            if left < self.heap_size and self.heap[left].entity_id < self.heap[smallest].entity_id:
+            if left < self.heap_size and self._get_key(left) < self._get_key(smallest):
                 smallest = left
-            if right < self.heap_size and self.heap[right].entity_id < self.heap[smallest].entity_id:
+            if right < self.heap_size and self._get_key(right) < self._get_key(smallest):
                 smallest = right
             if smallest != idx:
-                eid, c_idx = self.heap[idx].entity_id, self.heap[idx].cursor_idx
-                self.heap[idx].entity_id = self.heap[smallest].entity_id
-                self.heap[idx].cursor_idx = self.heap[smallest].cursor_idx
-                self.heap[smallest].entity_id = eid
-                self.heap[smallest].cursor_idx = c_idx
+                self._swap(idx, smallest)
                 idx = smallest
             else: break
 
+    def _swap(self, i, j):
+        l, h, c = self.heap[i].key_low, self.heap[i].key_high, self.heap[i].cursor_idx
+        self.heap[i].key_low = self.heap[j].key_low
+        self.heap[i].key_high = self.heap[j].key_high
+        self.heap[i].cursor_idx = self.heap[j].cursor_idx
+        self.heap[j].key_low = l
+        self.heap[j].key_high = h
+        self.heap[j].cursor_idx = c
+
+    def get_min_key(self):
+        if self.heap_size == 0: return r_uint128(-1)
+        return self._get_key(0)
+
+    # Backward compatibility for tests
     def get_min_entity_id(self):
-        if self.heap_size == 0:
-            return r_uint64(-1)
-        return self.heap[0].entity_id
-    
+        return self.get_min_key()
+
     def get_all_cursors_at_min(self):
-        """
-        Efficiently retrieves all cursor indices that share the minimum Entity ID.
-        Optimization: Uses a pruned traversal starting from the root instead of 
-        scanning the entire array. Since it is a min-heap, any node > min_eid
-        implies all its children are also > min_eid.
-        """
-        if self.heap_size == 0: return []
-        
-        min_eid = self.heap[0].entity_id
-        res = []
-        stack = [0]
-        
-        while len(stack) > 0:
-            idx = stack.pop()
-            
-            # If current node matches min, add it and check children
-            if self.heap[idx].entity_id == min_eid:
-                res.append(rffi.cast(lltype.Signed, self.heap[idx].cursor_idx))
-                
-                right = 2 * idx + 2
-                if right < self.heap_size:
-                    stack.append(right)
-                
-                left = 2 * idx + 1
-                if left < self.heap_size:
-                    stack.append(left)
-            # If heap[idx] > min_eid, we prune this branch
-        
-        return res
+        """ Returns all cursors that point to the current minimum key. """
+        results = []
+        if self.heap_size == 0: return results
+        target = self.get_min_key()
+        # In a min-heap, we have to check multiple nodes if keys are equal
+        for i in range(self.num_cursors):
+            if not self.cursors[i].is_exhausted() and self.cursors[i].peek_key() == target:
+                results.append(self.cursors[i])
+        return results
     
-    def advance_min_cursors(self):
-        """
-        Advances all cursors that are currently at the minimum Entity ID.
-        Optimization: Repeatedly processes the root while it matches min_eid.
-        This avoids a linear scan of the heap array.
-        """
-        if self.heap_size == 0: return
-        
-        target_eid = self.heap[0].entity_id
-        
-        # Keep processing the root as long as it matches the target ID.
-        # As we update and sift down, other matching nodes (if any) will 
-        # bubble up to the root.
-        while self.heap_size > 0 and self.heap[0].entity_id == target_eid:
+    def advance_min_cursors(self, target_key=None):
+        if target_key is None: target_key = self.get_min_key()
+        while self.heap_size > 0 and self._get_key(0) == target_key:
             c_idx = rffi.cast(lltype.Signed, self.heap[0].cursor_idx)
-            
-            # Advance the underlying cursor
             self.cursors[c_idx].advance()
             
             if self.cursors[c_idx].is_exhausted():
-                # Remove from heap: replace root with last element
-                last_idx = self.heap_size - 1
+                last = self.heap_size - 1
+                self.heap[0].key_low = self.heap[last].key_low
+                self.heap[0].key_high = self.heap[last].key_high
+                self.heap[0].cursor_idx = self.heap[last].cursor_idx
                 self.heap_size -= 1
-                if self.heap_size > 0:
-                    self.heap[0].entity_id = self.heap[last_idx].entity_id
-                    self.heap[0].cursor_idx = self.heap[last_idx].cursor_idx
-                    self._sift_down(0)
+                if self.heap_size > 0: self._sift_down(0)
             else:
-                # Update root with new value from cursor
-                self.heap[0].entity_id = self.cursors[c_idx].peek_entity_id()
+                nk = self.cursors[c_idx].peek_key()
+                self.heap[0].key_low = rffi.cast(rffi.ULONGLONG, nk & 0xFFFFFFFFFFFFFFFF)
+                self.heap[0].key_high = rffi.cast(rffi.ULONGLONG, nk >> 64)
                 self._sift_down(0)
 
-    def is_exhausted(self):
-        return self.heap_size == 0
-
+    def is_exhausted(self): return self.heap_size == 0
     def close(self):
         if self.heap:
             lltype.free(self.heap, flavor='raw')
-            self.heap = lltype.nullptr(rffi.CArray(HEAP_NODE_PTR.TO))

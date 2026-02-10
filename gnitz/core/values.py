@@ -1,28 +1,31 @@
-"""
-gnitz/core/values.py
-Wrapper classes for Z-Set values to ensure strict typing in RPython.
-"""
+from rpython.rlib.rarithmetic import r_uint, r_uint64
+try:
+    from rpython.rlib.rarithmetic import r_uint128
+except ImportError:
+    r_uint128 = long 
 
 class DBValue(object):
-    """Base class for database values."""
     pass
 
 class IntValue(DBValue):
-    """Wraps a 64-bit integer."""
     def __init__(self, v):
-        self.v = int(v)
+        self.v = r_uint64(v)
 
 class StringValue(DBValue):
-    """Wraps a string."""
     def __init__(self, v):
         self.v = str(v)
 
+class U128Value(DBValue):
+    def __init__(self, v):
+        self.v = r_uint128(v)
+
 def wrap(val):
-    """Helper to wrap raw python types."""
-    if isinstance(val, int):
+    if isinstance(val, (int, long)):
         return IntValue(val)
     if isinstance(val, str):
         return StringValue(val)
+    if isinstance(val, r_uint128):
+        return U128Value(val)
     if isinstance(val, DBValue):
         return val
     raise TypeError("Unsupported type for DBValue")

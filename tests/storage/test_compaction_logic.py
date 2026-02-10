@@ -27,7 +27,8 @@ class TestCompactionLogic(unittest.TestCase):
         v2 = shard_ecs.ECSShardView(self.files[1], self.layout)
         cursors = [tournament_tree.StreamCursor(v1), tournament_tree.StreamCursor(v2)]
         
-        result = compaction_logic.merge_entity_contributions(cursors, self.layout)
+        # Fixed: Updated to match pivot function name
+        result = compaction_logic.merge_row_contributions(cursors, self.layout)
         self.assertEqual(len(result), 0)
         
         v1.close()

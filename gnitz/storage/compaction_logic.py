@@ -1,87 +1,59 @@
 from rpython.rlib import jit
-from gnitz.storage import memtable
+from rpython.rtyper.lltypesystem import rffi, lltype
+from gnitz.core import types, strings as string_logic
+
+FIELD_INDICES = jit.unrolling_iterable(range(64))
 
 @jit.unroll_safe
-def merge_entity_contributions(cursors, layout):
-    """
-    Groups inputs by Semantic Payload and sums weights.
-    """
-    n = len(cursors)
+def rows_equal(schema, cursor1, cursor2):
+    """Checks if the data columns of two rows (across different shards) are identical."""
+    idx1 = cursor1.position
+    idx2 = cursor2.position
     
-    # --- Fast Path: Single Participant ---
-    # If the entity only exists in one shard, no grouping is required.
-    if n == 1:
-        cursor = cursors[0]
-        idx = cursor.get_current_index()
-        weight = cursor.view.get_weight(idx)
-        # The Ghost Property: Annihilated records (w=0) are not yielded.
-        if weight == 0:
-            return []
-        return [(weight, cursor.view.get_data_ptr(idx), cursor.view.buf_b.ptr)]
+    for i in FIELD_INDICES:
+        if i >= len(schema.columns): break
+        if i == schema.pk_index: continue
+        
+        col_def = schema.columns[i]
+        ptr1 = cursor1.view.get_col_ptr(idx1, i)
+        ptr2 = cursor2.view.get_col_ptr(idx2, i)
+        
+        if col_def.field_type == types.TYPE_STRING:
+            h1 = cursor1.view.blob_buf.ptr
+            h2 = cursor2.view.blob_buf.ptr
+            if not string_logic.string_equals_dual(ptr1, h1, ptr2, h2):
+                return False
+        else:
+            # Primitive comparison
+            for b in range(col_def.field_type.size):
+                if ptr1[b] != ptr2[b]: return False
+    return True
 
-    # --- Multi-cursor Grouping Logic ---
+def merge_row_contributions(active_cursors, schema):
+    """
+    Groups inputs by Semantic Row Payload and sums weights.
+    Only returns non-zero net weights.
+    """
+    n = len(active_cursors)
     results = []
-    
-    # Use an integer as a bitmask.
-    # This avoids allocating a list object on the heap for every Entity ID.
-    # For N <= 64, this fits entirely in a CPU register.
     processed_mask = 0
     
     for i in range(n):
-        # Check bit at position i
-        if (processed_mask >> i) & 1:
-            continue
-            
-        base_cursor = cursors[i]
-        base_view = base_cursor.view
-        base_idx = base_cursor.get_current_index()
-        base_payload = base_view.get_data_ptr(base_idx)
-        base_blob = base_view.buf_b.ptr
+        if (processed_mask >> i) & 1: continue
         
-        # Mark i as processed
+        base_cursor = active_cursors[i]
+        total_weight = base_cursor.view.get_weight(base_cursor.position)
         processed_mask |= (1 << i)
         
-        total_weight = base_view.get_weight(base_idx)
-        
-        # Cache hashes for the base payload to accelerate inner matching
-        base_hashes = base_cursor.get_current_payload_hashes(layout)
-        
-        # Inner loop: find all matching payloads in other shards
         for j in range(i + 1, n):
-            # Check bit at position j
-            if (processed_mask >> j) & 1:
-                continue
-                
-            other_cursor = cursors[j]
-            other_view = other_cursor.view
-            other_idx = other_cursor.get_current_index()
+            if (processed_mask >> j) & 1: continue
             
-            # 1. Cheap Hash Check
-            other_hashes = other_cursor.get_current_payload_hashes(layout)
-            match = True
-            if len(base_hashes) == len(other_hashes):
-                for h_idx in range(len(base_hashes)):
-                    if base_hashes[h_idx] != other_hashes[h_idx]:
-                        match = False
-                        break
-            else:
-                match = False
-            
-            # 2. Semantic Comparison (Field-by-field and German String Heap)
-            if match:
-                other_payload = other_view.get_data_ptr(other_idx)
-                other_blob = other_view.buf_b.ptr
-                
-                # If payloads are semantically identical, coalesce weights
-                if memtable.compare_payloads(layout, base_payload, base_blob, 
-                                             other_payload, other_blob) == 0:
-                    total_weight += other_view.get_weight(other_idx)
-                    # Mark j as processed
-                    processed_mask |= (1 << j)
+            other_cursor = active_cursors[j]
+            if rows_equal(schema, base_cursor, other_cursor):
+                total_weight += other_cursor.view.get_weight(other_cursor.position)
+                processed_mask |= (1 << j)
         
-        # Only materialize this payload group if the net algebraic weight is non-zero.
-        # This physically reclaims storage for annihilated state.
         if total_weight != 0:
-            results.append((total_weight, base_payload, base_blob))
-
+            results.append((total_weight, i)) # Weight and index of the 'exemplar' cursor
+            
     return results
