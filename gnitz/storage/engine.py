@@ -6,11 +6,12 @@ try:
     from rpython.rlib.rarithmetic import r_uint128
 except ImportError:
     r_uint128 = long
+
 from gnitz.storage.memtable import (
     node_get_weight, node_get_next_off, 
-    node_get_payload_ptr, compare_payloads
+    node_get_payload_ptr
 )
-from gnitz.storage import wal, manifest, errors, spine, mmap_posix
+from gnitz.storage import wal, manifest, errors, spine, mmap_posix, comparator
 from gnitz.core import types
 
 class Engine(object):
@@ -22,7 +23,7 @@ class Engine(object):
         self.schema = mem_manager.schema
         self.manifest_manager = manifest_manager
         self.registry = registry
-        self.table_id = kwargs.get('table_id', kwargs.get('table_id', table_id))
+        self.table_id = kwargs.get('table_id', table_id)
         
         if manifest_manager and manifest_manager.exists():
             reader = manifest_manager.load_current()
@@ -55,48 +56,38 @@ class Engine(object):
             self.mem_manager.current_lsn = self.current_lsn
             reader.close()
         except OSError as e:
-            # Only ignore the error if the WAL file simply doesn't exist yet.
             if e.errno != errno.ENOENT:
                 raise e
 
     def get_effective_weight_raw(self, key, packed_payload_ptr, payload_heap_ptr):
+        """
+        Calculates net weight by reconciling MemTable (AoS) and Shards (SoA).
+        Uses centralized comparator to ensure semantic consistency.
+        """
+        # 1. Check MemTable (AoS vs AoS)
         mem_weight = 0
         table = self.mem_manager.active_table
         pred_off = table._find_exact(key, packed_payload_ptr, payload_heap_ptr)
         curr_off = node_get_next_off(table.arena.base_ptr, pred_off, 0)
+        
         while curr_off != 0:
-            if table._get_node_key(curr_off) != key: break
+            if table._get_node_key(curr_off) != key: 
+                break
+            
             payload = node_get_payload_ptr(table.arena.base_ptr, curr_off, table.key_size)
-            if compare_payloads(self.schema, payload, table.blob_arena.base_ptr, packed_payload_ptr, payload_heap_ptr) == 0:
+            if comparator.compare_payloads(self.schema, payload, table.blob_arena.base_ptr, 
+                                           packed_payload_ptr, payload_heap_ptr) == 0:
                 mem_weight += node_get_weight(table.arena.base_ptr, curr_off)
             curr_off = node_get_next_off(table.arena.base_ptr, curr_off, 0)
 
+        # 2. Check Persistent Shards (SoA vs AoS)
         spine_weight = 0
         results = self.spine.find_all_shards_and_indices(key)
         for shard_handle, row_idx in results:
-            idx = row_idx
-            while idx < shard_handle.view.count:
-                is_u128 = shard_handle.view.schema.get_pk_column().field_type.size == 16
-                mid_key = shard_handle.view.get_pk_u128(idx) if is_u128 else r_uint128(shard_handle.view.get_pk_u64(idx))
-                if mid_key != key: break
+            if comparator.compare_soa_to_packed(self.schema, shard_handle.view, row_idx, 
+                                               packed_payload_ptr, payload_heap_ptr) == 0:
+                spine_weight += shard_handle.get_weight(row_idx)
                 
-                match = True
-                for i in range(len(self.schema.columns)):
-                    if i == self.schema.pk_index: continue
-                    col_ptr = shard_handle.view.get_col_ptr(idx, i)
-                    p_ptr = rffi.ptradd(packed_payload_ptr, self.schema.get_column_offset(i))
-                    ftype = self.schema.columns[i].field_type
-                    
-                    if ftype.code == 11:
-                        from gnitz.core.strings import string_equals_dual
-                        if not string_equals_dual(col_ptr, shard_handle.view.blob_buf.ptr, p_ptr, payload_heap_ptr):
-                            match = False; break
-                    else:
-                        for b in range(ftype.size):
-                            if col_ptr[b] != p_ptr[b]: match = False; break
-                        if not match: break
-                if match: spine_weight += shard_handle.get_weight(idx)
-                idx += 1
         return mem_weight + spine_weight
 
     def get_effective_weight(self, key, packed_payload_ptr, payload_heap_ptr):
@@ -121,7 +112,6 @@ class Engine(object):
         needs_comp = False
         
         if os.path.exists(filename):
-            # Pass through the validation flag from the engine/registry settings
             validate = getattr(self, 'validate_checksums', False)
             handle = ShardHandle(filename, self.schema, lsn_max, validate_checksums=validate)
             if handle.view.count > 0:

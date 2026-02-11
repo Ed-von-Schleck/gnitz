@@ -15,11 +15,11 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.jit import unrolling_iterable
 from gnitz.storage import arena, writer_table, errors
 from gnitz.core import types, values, strings as string_logic
+from gnitz.storage.comparator import compare_payloads
 
 MAX_HEIGHT = 16
 MAX_FIELDS = 64
 FIELD_INDICES = unrolling_iterable(range(MAX_FIELDS))
-
 
 # ============================================================================
 # SkipList Node Access Helpers
@@ -52,9 +52,7 @@ def node_set_weight(base_ptr, node_off, weight):
 
 
 def node_get_key(base_ptr, node_off, key_size):
-    """
-    Get the primary key of a node.
-    """
+    """Get the primary key of a node (u64 or u128)."""
     height = ord(base_ptr[node_off + 8])
     ptr = rffi.ptradd(base_ptr, node_off + 12 + (height * 4))
     
@@ -73,37 +71,8 @@ def node_get_payload_ptr(base_ptr, node_off, key_size):
     return rffi.ptradd(base_ptr, node_off + 12 + (height * 4) + key_size)
 
 
-def compare_payloads(schema, ptr1, heap1, ptr2, heap2):
-    """
-    Compare two payload buffers for exact equality (0 = Equal).
-    """
-    for i in FIELD_INDICES:
-        if i >= len(schema.columns):
-            break
-        if i == schema.pk_index:
-            continue
-        
-        f_type = schema.columns[i].field_type
-        f_off = schema.get_column_offset(i)
-        
-        p1 = rffi.ptradd(ptr1, f_off)
-        p2 = rffi.ptradd(ptr2, f_off)
-        
-        if f_type == types.TYPE_STRING:
-            res = string_logic.string_compare(p1, heap1, p2, heap2)
-            if res != 0:
-                return res
-        else:
-            for j in range(f_type.size):
-                if p1[j] != p2[j]:
-                    return 1
-    return 0
-
 def unpack_payload_to_values(memtable_inst, node_off):
-    """
-    Decodes a raw payload pointer back into DBValue objects.
-    """
-    from gnitz.core import values, strings as string_logic
+    """Decodes a raw payload pointer back into DBValue objects."""
     base = memtable_inst.arena.base_ptr
     blob_base = memtable_inst.blob_arena.base_ptr
     ptr = node_get_payload_ptr(base, node_off, memtable_inst.key_size)
@@ -117,10 +86,10 @@ def unpack_payload_to_values(memtable_inst, node_off):
         f_ptr = rffi.ptradd(ptr, off)
         
         if col_def.field_type == types.TYPE_STRING:
-            # ... string unpacking remains same ...
             u32_ptr = rffi.cast(rffi.UINTP, f_ptr)
             length = rffi.cast(lltype.Signed, u32_ptr[0])
-            if length == 0: res.append(values.StringValue(""))
+            if length == 0: 
+                res.append(values.StringValue(""))
             elif length <= string_logic.SHORT_STRING_THRESHOLD:
                 res.append(values.StringValue(rffi.charpsize2str(rffi.ptradd(f_ptr, 4), length)))
             else:
@@ -129,7 +98,7 @@ def unpack_payload_to_values(memtable_inst, node_off):
         elif col_def.field_type == types.TYPE_F64:
             val = rffi.cast(rffi.DOUBLEP, f_ptr)[0]
             res.append(values.FloatValue(float(val)))
-        elif col_def.field_type == types.TYPE_I64:
+        else:
             val = rffi.cast(rffi.LONGLONGP, f_ptr)[0]
             res.append(values.IntValue(val))
     return res
@@ -178,14 +147,7 @@ class MemTable(object):
             rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = max_u64
 
     def ensure_capacity(self, field_values):
-        """
-        Conservative check to see if a record can fit in current arenas.
-        Assumes worst-case tower height for the SkipList node.
-        """
-        # Worst-case node size (MAX_HEIGHT tower)
         node_sz = self.node_base_size + (MAX_HEIGHT * 4)
-
-        # Calculate exact string overflow requirements
         blob_sz = 0
         arg_idx = 0
         for i in range(len(self.schema.columns)):
@@ -194,15 +156,11 @@ class MemTable(object):
             
             val_obj = field_values[arg_idx]
             if self.schema.columns[i].field_type == types.TYPE_STRING:
-                if isinstance(val_obj, values.StringValue): s = val_obj.v
-                elif isinstance(val_obj, str): s = val_obj
-                else: s = str(val_obj)
-                
+                s = str(val_obj.v) if hasattr(val_obj, 'v') else str(val_obj)
                 if len(s) > string_logic.SHORT_STRING_THRESHOLD:
                     blob_sz += len(s)
             arg_idx += 1
 
-        # Alignment overhead buffer (conservatively add 16 bytes per allocation)
         if (self.arena.offset + node_sz + 16 > self.arena.size or
             self.blob_arena.offset + blob_sz + 16 > self.blob_arena.size):
             raise errors.MemTableFullError()
@@ -212,7 +170,6 @@ class MemTable(object):
         for i in FIELD_INDICES:
             if i >= len(self.schema.columns): break
             if i == self.schema.pk_index: continue
-            
             if payload_idx >= len(values_list): break
                 
             val_obj = values_list[payload_idx]
@@ -221,11 +178,7 @@ class MemTable(object):
             dest = rffi.ptradd(dest_ptr, f_off)
             
             if f_type == types.TYPE_STRING:
-                # ... string logic remains same ...
-                s_val = ""
-                if isinstance(val_obj, values.StringValue): s_val = val_obj.v
-                elif isinstance(val_obj, str): s_val = val_obj
-                else: s_val = str(val_obj)
+                s_val = val_obj.v if hasattr(val_obj, 'v') else str(val_obj)
                 l_val = len(s_val)
                 heap_off = 0
                 if l_val > string_logic.SHORT_STRING_THRESHOLD:
@@ -235,15 +188,11 @@ class MemTable(object):
                     for j in range(l_val): blob_ptr[j] = s_val[j]
                 string_logic.pack_string(dest, s_val, heap_off)
             elif f_type == types.TYPE_F64:
-                val = 0.0
-                if isinstance(val_obj, values.FloatValue): val = val_obj.v
-                elif isinstance(val_obj, float): val = val_obj
+                val = float(val_obj.v) if hasattr(val_obj, 'v') else float(val_obj)
                 rffi.cast(rffi.DOUBLEP, dest)[0] = rffi.cast(rffi.DOUBLE, val)
-            elif isinstance(val_obj, values.IntValue):
-                rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val_obj.v)
-            elif isinstance(val_obj, (int, long)):
-                 rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val)
-            
+            else:
+                val = int(val_obj.v) if hasattr(val_obj, 'v') else int(val_obj)
+                rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val)
             payload_idx += 1
 
     def _pack_to_buf(self, dest_ptr, values):
@@ -262,6 +211,14 @@ class MemTable(object):
                 if next_key < key:
                     curr_off = next_off
                     next_off = node_get_next_off(base, curr_off, i)
+                elif next_key == key:
+                    next_payload = node_get_payload_ptr(base, next_off, self.key_size)
+                    if compare_payloads(self.schema, packed_payload_ptr, payload_heap_ptr,
+                                        next_payload, self.blob_arena.base_ptr) > 0:
+                        curr_off = next_off
+                        next_off = node_get_next_off(base, curr_off, i)
+                    else:
+                        break
                 else:
                     break
         return curr_off
@@ -281,26 +238,6 @@ class MemTable(object):
                     break
         return node_get_next_off(base, curr_off, 0)
 
-    def _compare_payloads_ordering(self, ptr1, ptr2):
-        for i in FIELD_INDICES:
-            if i >= len(self.schema.columns): break
-            if i == self.schema.pk_index: continue
-            
-            f_off = self.schema.get_column_offset(i)
-            p1 = rffi.ptradd(ptr1, f_off)
-            p2 = rffi.ptradd(ptr2, f_off)
-            f_type = self.schema.columns[i].field_type
-            
-            if f_type == types.TYPE_STRING:
-                res = string_logic.string_compare(p1, self.blob_arena.base_ptr, 
-                                                 p2, self.blob_arena.base_ptr)
-                if res != 0: return res
-            else:
-                for b in range(f_type.size):
-                    if p1[b] < p2[b]: return -1
-                    if p1[b] > p2[b]: return 1
-        return 0
-
     def upsert(self, key, weight, field_values):
         scratch_ptr = lltype.malloc(rffi.CCHARP.TO, self.schema.stride, flavor='raw')
         try:
@@ -319,8 +256,9 @@ class MemTable(object):
                         next_off = node_get_next_off(base, curr_off, i)
                     elif next_key == key:
                         next_payload = node_get_payload_ptr(base, next_off, self.key_size)
-                        cmp_res = self._compare_payloads_ordering(scratch_ptr, next_payload)
-                        if cmp_res > 0:
+                        # Use Centralized Comparator for SkipList stability
+                        if compare_payloads(self.schema, scratch_ptr, self.blob_arena.base_ptr, 
+                                            next_payload, self.blob_arena.base_ptr) > 0:
                             curr_off = next_off
                             next_off = node_get_next_off(base, curr_off, i)
                         else:
@@ -335,7 +273,8 @@ class MemTable(object):
                 existing_key = node_get_key(base, next_off, self.key_size)
                 if existing_key == key:
                     existing_payload = node_get_payload_ptr(base, next_off, self.key_size)
-                    if self._compare_payloads_ordering(scratch_ptr, existing_payload) == 0:
+                    if compare_payloads(self.schema, scratch_ptr, self.blob_arena.base_ptr, 
+                                        existing_payload, self.blob_arena.base_ptr) == 0:
                         is_match = True
 
             if is_match:
@@ -355,23 +294,21 @@ class MemTable(object):
             while h < MAX_HEIGHT and (self.rng.genrand32() & 1):
                 h += 1
             
-            node_sz = self.node_base_size + (h * 4)
-            # Allocation is guaranteed by pre-check in MemTableManager.put
-            new_ptr = self.arena.alloc(node_sz)
+            new_ptr = self.arena.alloc(self.node_base_size + (h * 4))
             new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
             
             node_set_weight(base, new_off, weight)
             new_ptr[8] = chr(h)
             key_ptr = rffi.ptradd(new_ptr, 12 + (h * 4))
+            
+            mask = r_uint128(0xFFFFFFFFFFFFFFFF)
             if self.key_size == 16:
-                # Wrap bit-manipulated Python longs in r_uint64 to satisfy RPython cast checks
-                mask = r_uint128(0xFFFFFFFFFFFFFFFF)
                 lo = r_uint64(key & mask)
-                hi = r_uint64(key >> 64)
+                hi = r_uint64((key >> 64) & mask)
                 rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, lo)
                 rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = rffi.cast(rffi.ULONGLONG, hi)
             else:
-                rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(key))
+                rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(key & mask))
             
             payload_ptr = rffi.ptradd(key_ptr, self.key_size)
             for i in range(self.schema.stride):
@@ -388,7 +325,6 @@ class MemTable(object):
         sw = writer_table.TableShardWriter(self.schema)
         base = self.arena.base_ptr
         blob_base = self.blob_arena.base_ptr
-        
         curr_off = node_get_next_off(base, self.head_off, 0)
         while curr_off != 0:
             w = node_get_weight(base, curr_off)
@@ -397,21 +333,14 @@ class MemTable(object):
                 payload_ptr = node_get_payload_ptr(base, curr_off, self.key_size)
                 sw.add_row(key, w, payload_ptr, blob_base)
             curr_off = node_get_next_off(base, curr_off, 0)
-        
         sw.finalize(filename)
 
     def free(self):
         self.arena.free()
         self.blob_arena.free()
 
-
-# ============================================================================
-# MemTableManager
-# ============================================================================
-
 class MemTableManager(object):
     _immutable_fields_ = ['schema', 'capacity', 'table_id']
-    
     def __init__(self, schema, capacity, wal_writer=None, table_id=None):
         self.schema = schema
         self.table_id = table_id
@@ -422,25 +351,11 @@ class MemTableManager(object):
         self.starting_lsn = r_uint64(1)
 
     def put(self, key, weight, field_values):
-        """
-        Transactional Z-Set Ingestion:
-        1. Pre-check memory capacity.
-        2. Assign Log Sequence Number.
-        3. Write to durable WAL.
-        4. Update in-memory state.
-        """
-        # Phase 1: Capacity validation (Preventive)
         self.active_table.ensure_capacity(field_values)
-        
-        # Phase 2: Sequencing
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
-        
-        # Phase 3: Durability (Must precede visibility)
         if self.wal_writer:
             self.wal_writer.append_block(lsn, self.table_id, [(key, weight, field_values)])
-        
-        # Phase 4: Visibility
         self.active_table.upsert(r_uint128(key), weight, field_values)
 
     def flush_and_rotate(self, filename):
