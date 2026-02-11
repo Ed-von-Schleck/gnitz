@@ -7,27 +7,70 @@ class WALReader(object):
     def __init__(self, filename, schema):
         self.filename = filename
         self.schema = schema
-        self.fd = rposix.open(filename, os.O_RDONLY, 0)
+        self.fd = -1
+        self.last_inode = rffi.cast(rffi.LONGLONG, -1)
         self.closed = False
+        self._open_file()
     
+    def _open_file(self):
+        """
+        Opens the WAL file and records its inode. 
+        If a file was already open, it is closed first.
+        """
+        if self.fd != -1:
+            rposix.close(self.fd)
+        
+        self.fd = rposix.open(self.filename, os.O_RDONLY, 0)
+        # Use standard os.fstat; RPython replaces this with a safe version
+        st = os.fstat(self.fd)
+        self.last_inode = rffi.cast(rffi.LONGLONG, st.st_ino)
+
+    def _has_rotated(self):
+        """
+        Checks if the file at self.filename has a different inode 
+        than the one currently open.
+        """
+        try:
+            st = os.stat(self.filename)
+            return rffi.cast(rffi.LONGLONG, st.st_ino) != self.last_inode
+        except OSError:
+            # If the file is temporarily missing (during rename), 
+            # we assume it hasn't rotated yet.
+            return False
+
     def read_next_block(self):
         if self.closed: return (False, 0, 0, [])
         
+        # Try to read the fixed-size header
         header_str = os.read(self.fd, wal_format.WAL_BLOCK_HEADER_SIZE)
-        if not header_str: return (False, 0, 0, [])
         
+        # EOF or partial read encountered
         if len(header_str) < wal_format.WAL_BLOCK_HEADER_SIZE:
-            raise errors.CorruptShardError("Truncated WAL header")
+            if self._has_rotated():
+                # The WAL was rotated/truncated. Re-open and try again.
+                self._open_file()
+                header_str = os.read(self.fd, wal_format.WAL_BLOCK_HEADER_SIZE)
+                # If still short, the new file is either empty or incomplete.
+                if len(header_str) < wal_format.WAL_BLOCK_HEADER_SIZE:
+                    return (False, 0, 0, [])
+            else:
+                # Actual end of the current WAL stream
+                return (False, 0, 0, [])
             
         header_ptr = rffi.str2charp(header_str)
         try:
-            # Read total block size from header offset 16 (added in previous fix)
-            total_size = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, rffi.ptradd(header_ptr, 16))[0])
+            # Total block size is at offset 16 (stored as u32 in wal_format)
+            total_size_ptr = rffi.cast(rffi.UINTP, rffi.ptradd(header_ptr, 16))
+            total_size = rffi.cast(lltype.Signed, total_size_ptr[0])
             body_size = total_size - wal_format.WAL_BLOCK_HEADER_SIZE
             
+            if body_size < 0:
+                raise errors.CorruptShardError("Invalid WAL block size in header")
+
             body_str = os.read(self.fd, body_size)
             if len(body_str) < body_size: 
-                raise errors.CorruptShardError("Truncated WAL body")
+                # Block is incomplete on disk.
+                return (False, 0, 0, [])
             
             full_data = header_str + body_str
             full_ptr = rffi.str2charp(full_data)
@@ -47,7 +90,8 @@ class WALReader(object):
     
     def close(self):
         if not self.closed:
-            rposix.close(self.fd)
+            if self.fd != -1:
+                rposix.close(self.fd)
             self.closed = True
 
 class WALWriter(object):
@@ -68,12 +112,11 @@ class WALWriter(object):
     def truncate_before_lsn(self, target_lsn):
         """
         Prunes the WAL by keeping only blocks with LSN >= target_lsn.
-        Uses atomic rename for crash safety.
+        Uses atomic rename to ensure readers detect rotation via inode change.
         """
         if self.closed: return
         
         tmp_name = self.filename + ".trunc"
-        # 1. Read existing and filter
         reader = WALReader(self.filename, self.schema)
         try:
             out_fd = rposix.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -87,13 +130,14 @@ class WALWriter(object):
         finally:
             reader.close()
         
-        # 2. Atomic swap
+        # Unlock and close current WAL before renaming
         mmap_posix.unlock_file(self.fd)
         rposix.close(self.fd)
         
+        # Atomic rename changes the inode at self.filename
         os.rename(tmp_name, self.filename)
         
-        # 3. Re-open and re-lock
+        # Re-open the new WAL file and re-acquire exclusive lock
         self.fd = rposix.open(self.filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         if not mmap_posix.try_lock_exclusive(self.fd):
              raise errors.StorageError("Failed to re-lock WAL after truncation")
