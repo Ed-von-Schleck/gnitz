@@ -1,3 +1,5 @@
+import os
+import errno
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import r_uint64
@@ -6,7 +8,6 @@ try:
 except ImportError:
     r_uint128 = long
 from gnitz.storage import errors, mmap_posix
-import os
 
 MAGIC_NUMBER = r_uint64(0x4D414E49464E5447)
 VERSION = 2
@@ -130,7 +131,11 @@ class ManifestReader(object):
             st = os.stat(self.filename)
             if st.st_ino != self.last_inode or st.st_mtime != self.last_mtime:
                 return True
-        except OSError: pass
+        except OSError as e:
+            # If the manifest is missing during a swap, we must assume it's changed.
+            if e.errno == errno.ENOENT:
+                return True
+            raise e
         return False
 
     def reload(self):

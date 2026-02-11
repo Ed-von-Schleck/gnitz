@@ -1,7 +1,8 @@
+import os
+import errno
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
 from rpython.rlib import rposix
-import os
 
 # ============================================================================
 # POSIX Constants
@@ -12,11 +13,10 @@ PROT_WRITE      = 0x2
 MAP_SHARED      = 0x01
 MAP_PRIVATE     = 0x02
 
-# flock constants
-LOCK_SH = 1  # shared lock
-LOCK_EX = 2  # exclusive lock
-LOCK_NB = 4  # non-blocking
-LOCK_UN = 8  # unlock
+LOCK_SH = 1
+LOCK_EX = 2
+LOCK_NB = 4
+LOCK_UN = 8
 
 eci = ExternalCompilationInfo(includes=['sys/mman.h', 'unistd.h', 'sys/file.h'])
 
@@ -87,18 +87,20 @@ def fsync_dir(filepath):
     dirname = "." if last_slash <= 0 else filepath[:last_slash]
     try:
         fd = rposix.open(dirname, os.O_RDONLY, 0)
-        fsync_c(fd)
-        rposix.close(fd)
-    except OSError:
-        pass
+        try:
+            fsync_c(fd)
+        finally:
+            rposix.close(fd)
+    except OSError as e:
+        # Ignore only if the directory itself is gone.
+        if e.errno != errno.ENOENT:
+            raise e
 
 def try_lock_exclusive(fd):
-    """Attempts to acquire an exclusive non-blocking lock."""
     res = flock_c(fd, LOCK_EX | LOCK_NB)
     return rffi.cast(lltype.Signed, res) == 0
 
 def lock_shared(fd):
-    """Acquires a shared blocking lock."""
     flock_c(fd, LOCK_SH)
 
 def unlock_file(fd):

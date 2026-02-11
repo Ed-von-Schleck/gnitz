@@ -1,3 +1,5 @@
+import os
+import errno
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 try:
@@ -10,7 +12,6 @@ from gnitz.storage.memtable import (
 )
 from gnitz.storage import wal, manifest, errors, spine, mmap_posix
 from gnitz.core import types
-import os
 
 class Engine(object):
     _immutable_fields_ = ['mem_manager', 'spine', 'schema', 'manifest_manager', 'registry', 'table_id']
@@ -53,7 +54,10 @@ class Engine(object):
             self.current_lsn = r_uint64(last_recovered_lsn + 1)
             self.mem_manager.current_lsn = self.current_lsn
             reader.close()
-        except OSError: pass
+        except OSError as e:
+            # Only ignore the error if the WAL file simply doesn't exist yet.
+            if e.errno != errno.ENOENT:
+                raise e
 
     def get_effective_weight_raw(self, key, packed_payload_ptr, payload_heap_ptr):
         mem_weight = 0
@@ -99,9 +103,7 @@ class Engine(object):
         return self.get_effective_weight_raw(key, packed_payload_ptr, payload_heap_ptr)
 
     def flush_and_rotate(self, filename):
-        # SYNC POINT: Capture current ingestion LSN before flush
         self.current_lsn = self.mem_manager.current_lsn
-        
         lsn_min = self.mem_manager.starting_lsn
         lsn_max = self.current_lsn - r_uint64(1)
         
@@ -138,7 +140,6 @@ class Engine(object):
         if self.manifest_manager:
             self.manifest_manager.publish_new_version(entries, lsn_max)
             
-        # Monotonic step: current_lsn is already synchronized at start of method
         self.mem_manager.starting_lsn = self.current_lsn
         return min_k, max_k, needs_comp
 
