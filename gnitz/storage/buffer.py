@@ -11,7 +11,20 @@ class MappedBuffer(object):
         self.size = size
 
     def _check_bounds(self, offset, length):
-        if offset < 0 or (offset + length) > self.size:
+        """
+        Safe bounds check using subtraction to prevent integer overflow.
+        Ensures [offset, offset + length) is within [0, self.size).
+        """
+        if offset < 0 or length < 0:
+            raise errors.BoundsError(offset, length, self.size)
+        
+        # Check if length alone is bigger than buffer
+        if length > self.size:
+            raise errors.BoundsError(offset, length, self.size)
+            
+        # Check if offset is beyond the remaining space
+        # (Equivalent to offset + length > self.size, but overflow-safe)
+        if offset > self.size - length:
             raise errors.BoundsError(offset, length, self.size)
 
     def get_raw_ptr(self, offset):
