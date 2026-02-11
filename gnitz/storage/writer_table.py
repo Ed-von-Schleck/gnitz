@@ -6,7 +6,7 @@ try:
     from rpython.rlib.rarithmetic import r_uint128
 except ImportError:
     r_uint128 = long
-from gnitz.storage import layout, mmap_posix
+from gnitz.storage import layout, mmap_posix, errors
 from gnitz.core import checksum
 from gnitz.core import types, strings as string_logic
 
@@ -127,7 +127,6 @@ class TableShardWriter(object):
                     if length > string_logic.SHORT_STRING_THRESHOLD:
                         u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(val_ptr, 8))
                         old_off = rffi.cast(lltype.Signed, u64_view[0])
-                        # Fix: Check for NULL source_heap_ptr when dealing with long strings
                         if not source_heap_ptr:
                             raise errors.StorageError("Long string relocation requires source heap")
                         new_off = self._get_or_append_blob(rffi.ptradd(source_heap_ptr, old_off), length)
@@ -142,12 +141,39 @@ class TableShardWriter(object):
             else:
                 buf.append_bytes(val_ptr, 1)
 
-    def add_row_values(self, pk, *args):
+    def _add_row_from_args(self, pk, weight, args):
+        """
+        Consolidated helper to pack a row from variadic arguments safely.
+        Handles multiple long strings by creating a single temporary row-local heap.
+        """
         stride = self.schema.memtable_stride
-        tmp = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
-        blob_tmp = lltype.nullptr(rffi.CCHARP.TO)
+        tmp_row_buf = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
+        row_blob_heap = lltype.nullptr(rffi.CCHARP.TO)
+        
         try:
-            for i in range(stride): tmp[i] = '\x00'
+            # Initialize row buffer
+            for i in range(stride): tmp_row_buf[i] = '\x00'
+            
+            # Pass 1: Calculate total size needed for all long strings in this row
+            total_blob_size = 0
+            arg_idx = 0
+            for i in range(len(self.schema.columns)):
+                if i == self.schema.pk_index: continue
+                if arg_idx >= len(args): break
+                
+                ftype = self.schema.columns[i].field_type
+                if ftype == types.TYPE_STRING:
+                    s_val = str(args[arg_idx])
+                    if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
+                        total_blob_size += len(s_val)
+                arg_idx += 1
+
+            # Allocate row-local heap if needed
+            if total_blob_size > 0:
+                row_blob_heap = lltype.malloc(rffi.CCHARP.TO, total_blob_size, flavor='raw')
+
+            # Pass 2: Pack data and copy long strings into the row-local heap
+            current_blob_offset = 0
             arg_idx = 0
             for i in range(len(self.schema.columns)):
                 if i == self.schema.pk_index: continue
@@ -157,54 +183,39 @@ class TableShardWriter(object):
                 arg_idx += 1
                 off = self.schema.get_column_offset(i)
                 ftype = self.schema.columns[i].field_type
-                target = rffi.ptradd(tmp, off)
+                target = rffi.ptradd(tmp_row_buf, off)
                 
                 if ftype == types.TYPE_STRING:
                     s_val = str(val)
                     if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
-                        if blob_tmp: lltype.free(blob_tmp, flavor='raw')
-                        blob_tmp = rffi.str2charp(s_val)
-                        string_logic.pack_string(target, s_val, 0)
+                        # Copy string data to the local heap
+                        for j in range(len(s_val)):
+                            row_blob_heap[current_blob_offset + j] = s_val[j]
+                        # Pack string structure with offset relative to row_blob_heap
+                        string_logic.pack_string(target, s_val, current_blob_offset)
+                        current_blob_offset += len(s_val)
                     else:
                         string_logic.pack_string(target, s_val, 0)
                 else:
                     ival = int(val)
-                    if ftype.size == 8: rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, ival)
-                    elif ftype.size == 4: rffi.cast(rffi.UINTP, target)[0] = rffi.cast(rffi.UINT, ival)
+                    if ftype.size == 8: 
+                        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, ival)
+                    elif ftype.size == 4: 
+                        rffi.cast(rffi.UINTP, target)[0] = rffi.cast(rffi.UINT, ival)
             
-            self.add_row(r_uint128(pk), 1, tmp, blob_tmp)
+            # Transfer from temporary AoS buffers to Shard Buffers
+            self.add_row(r_uint128(pk), weight, tmp_row_buf, row_blob_heap)
+            
         finally: 
-            lltype.free(tmp, flavor='raw')
-            if blob_tmp: rffi.free_charp(blob_tmp)
+            lltype.free(tmp_row_buf, flavor='raw')
+            if row_blob_heap:
+                lltype.free(row_blob_heap, flavor='raw')
+
+    def add_row_values(self, pk, *args):
+        self._add_row_from_args(pk, 1, args)
 
     def _add_row_weighted(self, pk, weight, *args):
-        stride = self.schema.memtable_stride
-        tmp = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
-        blob_tmp = lltype.nullptr(rffi.CCHARP.TO)
-        try:
-            for i in range(stride): tmp[i] = '\x00'
-            arg_idx = 0
-            for i in range(len(self.schema.columns)):
-                if i == self.schema.pk_index: continue
-                if arg_idx >= len(args): break
-                val = args[arg_idx]
-                arg_idx += 1
-                off = self.schema.get_column_offset(i)
-                ftype = self.schema.columns[i].field_type
-                target = rffi.ptradd(tmp, off)
-                if ftype == types.TYPE_STRING:
-                    s_val = str(val)
-                    if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
-                        if blob_tmp: lltype.free(blob_tmp, flavor='raw')
-                        blob_tmp = rffi.str2charp(s_val)
-                    string_logic.pack_string(target, s_val, 0)
-                else:
-                    ival = int(val)
-                    if ftype.size == 8: rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, ival)
-            self.add_row(r_uint128(pk), weight, tmp, blob_tmp)
-        finally: 
-            lltype.free(tmp, flavor='raw')
-            if blob_tmp: rffi.free_charp(blob_tmp)
+        self._add_row_from_args(pk, weight, args)
 
     def close(self):
         self.pk_buf.free()
@@ -274,4 +285,3 @@ class TableShardWriter(object):
             self.close()
         os.rename(tmp_filename, filename)
         mmap_posix.fsync_dir(filename)
-
