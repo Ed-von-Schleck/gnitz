@@ -62,15 +62,29 @@ class PersistentTable(object):
         return self.engine.get_effective_weight(r_uint128(key), self._query_scratch, blob_base)
 
     def flush(self):
+        """
+        Flushes MemTable to disk, updates manifest, and prunes the WAL.
+        """
         filename = os.path.join(self.directory, "%s_shard_%d.db" % (self.name, int(self.engine.mem_manager.starting_lsn)))
         min_key, max_key, needs_compaction = self.engine.flush_and_rotate(filename)
+        
+        # After a successful flush, data is durable in a Shard.
+        # We can now prune the WAL up to the last persisted LSN.
+        self.checkpoint()
+        
         return filename
 
     def checkpoint(self):
+        """
+        Prunes the WAL by removing all entries that have been successfully
+        persisted into immutable Shards, as recorded in the Manifest.
+        """
         if not self.read_only and self.manifest_manager.exists():
             reader = self.manifest_manager.load_current()
+            # The manifest tracks the global max LSN that is now in shards
             lsn = reader.global_max_lsn
             reader.close()
+            # Truncate everything before the next expected LSN
             self.wal_writer.truncate_before_lsn(lsn + r_uint64(1))
 
     def _trigger_compaction(self):
@@ -96,19 +110,15 @@ class ZSet(object):
     """
     def __init__(self, schema):
         self.schema = schema
-        # In-memory only, no WAL
         self.mem_manager = memtable.MemTableManager(schema, 10 * 1024 * 1024) 
 
     def upsert(self, key, weight, payload):
-        """Add weight to a specific (Key, Payload) pair."""
         self.mem_manager.put(r_uint128(key), weight, payload)
 
     def get_weight(self, key):
-        """Sum weights for all payloads associated with this Primary Key."""
         table = self.mem_manager.active_table
         base = table.arena.base_ptr
         total = 0
-        # Find first node with Key >= target
         curr = table._find_first_key(r_uint128(key))
         while curr != 0:
             k = table._get_node_key(curr)
@@ -119,11 +129,6 @@ class ZSet(object):
         return int(total)
 
     def get_payload(self, key):
-        """
-        Returns the payload associated with the Primary Key.
-        In a multiset where multiple payloads may exist, this returns the payload
-        of the most recently added node with a non-zero weight.
-        """
         table = self.mem_manager.active_table
         base = table.arena.base_ptr
         curr = table._find_first_key(r_uint128(key))
@@ -141,7 +146,6 @@ class ZSet(object):
         return None
 
     def iter_nonzero(self):
-        """Iterate over all (Key, Weight, Payload) triples with Weight != 0."""
         table = self.mem_manager.active_table
         base = table.arena.base_ptr
         curr = memtable.node_get_next_off(base, table.head_off, 0)
@@ -149,14 +153,12 @@ class ZSet(object):
             w = memtable.node_get_weight(base, curr)
             if w != 0:
                 k = table._get_node_key(curr)
-                # Cast for test compatibility (u64 -> int)
                 k_val = int(k) if self.schema.get_pk_column().field_type.size == 8 else k
                 p = memtable.unpack_payload_to_values(table, curr)
                 yield (k_val, int(w), p)
             curr = memtable.node_get_next_off(base, curr, 0)
 
     def iter_positive(self):
-        """Iterate over all (Key, Weight, Payload) triples with Weight > 0."""
         for k, w, p in self.iter_nonzero():
             if w > 0:
                 yield (k, w, p)
