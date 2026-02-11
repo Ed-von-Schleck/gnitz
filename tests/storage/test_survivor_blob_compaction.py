@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.storage import memtable, shard_ecs
+from gnitz.storage import memtable, shard_table
 from gnitz.core import types, values as db_values
 
 class TestSurvivorBlobCompaction(unittest.TestCase):
@@ -15,9 +15,9 @@ class TestSurvivorBlobCompaction(unittest.TestCase):
         if os.path.exists(self.filename):
             os.unlink(self.filename)
 
-    def _put(self, mgr, eid, w, *vals):
+    def _put(self, mgr, pk, w, *vals):
         wrapped = [db_values.wrap(v) for v in vals]
-        mgr.put(eid, w, wrapped)
+        mgr.put(pk, w, wrapped)
 
     def test_annihilated_blobs_are_pruned(self):
         """
@@ -52,11 +52,11 @@ class TestSurvivorBlobCompaction(unittest.TestCase):
         mgr.close()
         
         # 6. Verify Shard Structure
-        view = shard_ecs.ECSShardView(self.filename, self.layout)
+        view = shard_table.TableShardView(self.filename, self.layout)
         try:
             # Check Entity Count
             self.assertEqual(view.count, 1)
-            # Fixed: use get_pk_u64 instead of get_entity_id
+            # Fixed: use get_pk_u64 instead of get_primary_key
             self.assertEqual(view.get_pk_u64(0), 2)
             
             # Check Region B Size

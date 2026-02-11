@@ -80,8 +80,8 @@ class TestSemanticMerges(unittest.TestCase):
         entry = entries[0]
         
         # Entry range should still exist, but we check if the file has 0 records
-        from gnitz.storage import shard_ecs
-        view = shard_ecs.ECSShardView(entry.shard_filename, self.layout)
+        from gnitz.storage import shard_table
+        view = shard_table.TableShardView(entry.shard_filename, self.layout)
         self.assertEqual(view.count, 0)
         view.close()
         reader.close()

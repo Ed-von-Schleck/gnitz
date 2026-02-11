@@ -19,9 +19,9 @@ class TestMemTableWALInterlock(unittest.TestCase):
         if os.path.exists(self.test_wal):
             os.unlink(self.test_wal)
             
-    def _put(self, mgr, eid, w, *vals):
+    def _put(self, mgr, pk, w, *vals):
         wrapped = [db_values.wrap(v) for v in vals]
-        mgr.put(eid, w, wrapped)
+        mgr.put(pk, w, wrapped)
     
     def test_memtable_without_wal(self):
         """Test that MemTable works without WAL (backward compatibility)."""
@@ -60,15 +60,15 @@ class TestMemTableWALInterlock(unittest.TestCase):
         self.assertTrue(is_valid1)
         self.assertEqual(comp_id1, 1)
         self.assertEqual(len(records1), 1)
-        entity_id1, weight1, _ = records1[0]
-        self.assertEqual(entity_id1, 10)
+        primary_key1, weight1, _ = records1[0]
+        self.assertEqual(primary_key1, 10)
         self.assertEqual(weight1, 1)
         
         is_valid2, lsn2, comp_id2, records2 = reader.read_next_block()
         self.assertTrue(is_valid2)
         self.assertEqual(comp_id2, 1)
-        entity_id2, weight2, _ = records2[0]
-        self.assertEqual(entity_id2, 20)
+        primary_key2, weight2, _ = records2[0]
+        self.assertEqual(primary_key2, 20)
         self.assertEqual(weight2, 1)
         
         reader.close()
@@ -150,12 +150,12 @@ class TestMemTableWALInterlock(unittest.TestCase):
         
         # Both records should be in WAL
         _, _, records1 = blocks[0]
-        entity_id1, _, _ = records1[0]
-        self.assertEqual(entity_id1, 1)
+        primary_key1, _, _ = records1[0]
+        self.assertEqual(primary_key1, 1)
         
         _, _, records2 = blocks[1]
-        entity_id2, _, _ = records2[0]
-        self.assertEqual(entity_id2, 2)
+        primary_key2, _, _ = records2[0]
+        self.assertEqual(primary_key2, 2)
         
         reader.close()
     
@@ -177,10 +177,10 @@ class TestMemTableWALInterlock(unittest.TestCase):
         blocks = list(reader.iterate_blocks())
         self.assertEqual(len(blocks), 3)
         
-        # All should have entity_id 100
+        # All should have primary_key 100
         for _, _, records in blocks:
-            entity_id, _, _ = records[0]
-            self.assertEqual(entity_id, 100)
+            primary_key, _, _ = records[0]
+            self.assertEqual(primary_key, 100)
         
         reader.close()
     

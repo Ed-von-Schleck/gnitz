@@ -1,7 +1,7 @@
 import unittest
 import os
 import shutil
-from gnitz.storage import manifest, writer_ecs
+from gnitz.storage import manifest, writer_table
 from gnitz.core import types
 from rpython.rlib.rarithmetic import r_uint64
 

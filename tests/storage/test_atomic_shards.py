@@ -1,7 +1,7 @@
 import unittest
 import os
 import shutil
-from gnitz.storage import writer_ecs, shard_ecs
+from gnitz.storage import writer_table, shard_table
 from gnitz.core import types
 
 class TestAtomicShards(unittest.TestCase):
@@ -18,33 +18,33 @@ class TestAtomicShards(unittest.TestCase):
             shutil.rmtree(self.test_dir)
 
     def test_atomic_swap_mechanics(self):
-        writer = writer_ecs.ECSShardWriter(self.layout)
-        writer.add_entity(123, 456)
+        writer = writer_table.TableShardWriter(self.layout)
+        writer.add_row_values(123, 456)
         writer.finalize(self.shard_path)
         
         self.assertTrue(os.path.exists(self.shard_path))
         self.assertFalse(os.path.exists(self.shard_path + ".tmp"))
         
-        view = shard_ecs.ECSShardView(self.shard_path, self.layout)
+        view = shard_table.TableShardView(self.shard_path, self.layout)
         self.assertEqual(view.count, 1)
-        # Fixed: use get_pk_u64 instead of get_entity_id
+        # Fixed: use get_pk_u64 instead of get_primary_key
         self.assertEqual(view.get_pk_u64(0), 123)
         # Column 1 is the payload I64
         self.assertEqual(view.read_field_i64(0, 1), 456)
         view.close()
 
     def test_overwriting_is_atomic(self):
-        w1 = writer_ecs.ECSShardWriter(self.layout)
-        w1.add_entity(1, 100)
+        w1 = writer_table.TableShardWriter(self.layout)
+        w1.add_row_values(1, 100)
         w1.finalize(self.shard_path)
         
-        w2 = writer_ecs.ECSShardWriter(self.layout)
-        w2.add_entity(2, 200)
+        w2 = writer_table.TableShardWriter(self.layout)
+        w2.add_row_values(2, 200)
         w2.finalize(self.shard_path)
         
-        view = shard_ecs.ECSShardView(self.shard_path, self.layout)
+        view = shard_table.TableShardView(self.shard_path, self.layout)
         self.assertEqual(view.count, 1)
-        # Fixed: use get_pk_u64 instead of get_entity_id
+        # Fixed: use get_pk_u64 instead of get_primary_key
         self.assertEqual(view.get_pk_u64(0), 2)
         view.close()
 

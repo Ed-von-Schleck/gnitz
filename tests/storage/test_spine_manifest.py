@@ -1,7 +1,7 @@
 import unittest
 import os
 from gnitz.core import types
-from gnitz.storage import writer_ecs, manifest, spine
+from gnitz.storage import writer_table, manifest, spine
 
 class TestSpineManifest(unittest.TestCase):
     def setUp(self):
@@ -17,9 +17,9 @@ class TestSpineManifest(unittest.TestCase):
                 os.unlink(fn)
     
     def _create_shard(self, filename, entities_and_values):
-        writer = writer_ecs.ECSShardWriter(self.layout)
-        for eid, i64_val, str_val in entities_and_values:
-            writer.add_entity(eid, i64_val, str_val)
+        writer = writer_table.TableShardWriter(self.layout)
+        for pk, i64_val, str_val in entities_and_values:
+            writer.add_row_values(pk, i64_val, str_val)
         writer.finalize(filename)
         self.shard_files.append(filename)
     

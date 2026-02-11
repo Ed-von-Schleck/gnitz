@@ -4,7 +4,7 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import types, values as db_values
 from gnitz.storage import (
     memtable, engine, manifest, 
-    shard_registry, spine, shard_ecs
+    shard_registry, spine, shard_table
 )
 
 class TestEngineFlush(unittest.TestCase):
@@ -17,9 +17,9 @@ class TestEngineFlush(unittest.TestCase):
         for f in self.test_files:
             if os.path.exists(f): os.unlink(f)
     
-    def _put(self, db, eid, w, *vals):
+    def _put(self, db, pk, w, *vals):
         wrapped = [db_values.wrap(v) for v in vals]
-        db.mem_manager.put(eid, w, wrapped)
+        db.mem_manager.put(pk, w, wrapped)
 
     def test_compaction_trigger_detection(self):
         shards = ["test_compact_%d.db" % i for i in range(5)]

@@ -7,13 +7,13 @@ except ImportError:
 class ShardHandle(object):
     _immutable_fields_ = ['filename', 'lsn', 'view', 'min_key', 'max_key']
     def __init__(self, filename, schema, lsn):
-        from gnitz.storage import shard_ecs
+        from gnitz.storage import shard_table
         from gnitz.core import types 
         self.filename = filename
         self.lsn = lsn
         # Checksums are expensive for every handle open in query loops; 
         # normally validated once at publish time.
-        self.view = shard_ecs.TableShardView(filename, schema, validate_checksums=False)
+        self.view = shard_table.TableShardView(filename, schema, validate_checksums=False)
         
         if self.view.count > 0:
             is_u128 = schema.get_pk_column().field_type == types.TYPE_U128

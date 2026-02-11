@@ -1,7 +1,7 @@
 import unittest
 import os
 from gnitz.core import types
-from gnitz.storage import writer_ecs, shard_ecs, compactor
+from gnitz.storage import writer_table, shard_table, compactor
 
 class TestCompactor(unittest.TestCase):
     def setUp(self):
@@ -13,17 +13,17 @@ class TestCompactor(unittest.TestCase):
             if os.path.exists(f): os.unlink(f)
 
     def test_compaction_annihilation(self):
-        w1 = writer_ecs.ECSShardWriter(self.layout)
-        w1._add_entity_weighted(1, 1, 10)
+        w1 = writer_table.TableShardWriter(self.layout)
+        w1._add_row_weighted(1, 1, 10)
         w1.finalize("in1.db")
         
-        w2 = writer_ecs.ECSShardWriter(self.layout)
-        w2._add_entity_weighted(1, -1, 10)
+        w2 = writer_table.TableShardWriter(self.layout)
+        w2._add_row_weighted(1, -1, 10)
         w2.finalize("in2.db")
         
         compactor.compact_shards(["in1.db", "in2.db"], "out.db", self.layout)
         
-        res = shard_ecs.ECSShardView("out.db", self.layout)
+        res = shard_table.TableShardView("out.db", self.layout)
         self.assertEqual(res.count, 0)
         res.close()
 

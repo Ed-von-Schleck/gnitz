@@ -1,7 +1,7 @@
 import unittest
 import os
 from rpython.rlib.rarithmetic import r_uint64
-from gnitz.storage import manifest, shard_ecs, writer_ecs
+from gnitz.storage import manifest, shard_table, writer_table
 from gnitz.core import types
 
 class TestTypeConsistency(unittest.TestCase):
@@ -24,11 +24,11 @@ class TestTypeConsistency(unittest.TestCase):
         m_reader.close()
 
     def test_shard_header_consistency(self):
-        writer = writer_ecs.ECSShardWriter(self.layout)
-        writer.add_entity(1, 100)
+        writer = writer_table.TableShardWriter(self.layout)
+        writer.add_row_values(1, 100)
         writer.finalize(self.s_fn)
-        view = shard_ecs.ECSShardView(self.s_fn, self.layout)
+        view = shard_table.TableShardView(self.s_fn, self.layout)
         self.assertEqual(view.count, 1)
-        # Fixed: use get_pk_u64 instead of get_entity_id
+        # Fixed: use get_pk_u64 instead of get_primary_key
         self.assertEqual(view.get_pk_u64(0), 1)
         view.close()

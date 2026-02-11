@@ -163,4 +163,3 @@ class TableShardView(object):
             mmap_posix.munmap_file(self.ptr, self.size)
             self.ptr = lltype.nullptr(rffi.CCHARP.TO)
 
-ECSShardView = TableShardView

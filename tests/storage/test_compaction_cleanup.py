@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.storage import refcount, compactor, spine, writer_ecs
+from gnitz.storage import refcount, compactor, spine, writer_table
 from gnitz.core import types
 from rpython.rtyper.lltypesystem import rffi, lltype
 
@@ -22,7 +22,7 @@ class TestCompactionCleanup(unittest.TestCase):
             if os.path.exists(f): os.unlink(f)
 
     def _create_shard(self, filename, entities, weights):
-        w = writer_ecs.TableShardWriter(self.layout)
+        w = writer_table.TableShardWriter(self.layout)
         for e, wt in zip(entities, weights):
             w.add_row(e, wt, lltype.nullptr(rffi.CCHARP.TO), lltype.nullptr(rffi.CCHARP.TO))
         w.finalize(filename)

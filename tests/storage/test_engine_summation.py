@@ -1,7 +1,7 @@
 import unittest
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.storage import memtable, spine, engine, writer_ecs
+from gnitz.storage import memtable, spine, engine, writer_table
 from gnitz.core import types, values as db_values
 
 class TestEngineSummation(unittest.TestCase):
@@ -15,14 +15,14 @@ class TestEngineSummation(unittest.TestCase):
 
     def test_raw_weight_summation(self):
         fn1 = "test_sum_1.db"
-        w1 = writer_ecs.ECSShardWriter(self.layout)
-        w1._add_entity_weighted(1, 1, 100)
+        w1 = writer_table.TableShardWriter(self.layout)
+        w1._add_row_weighted(1, 1, 100)
         w1.finalize(fn1)
         self.files.append(fn1)
         
         fn2 = "test_sum_2.db"
-        w2 = writer_ecs.ECSShardWriter(self.layout)
-        w2._add_entity_weighted(1, 1, 100)
+        w2 = writer_table.TableShardWriter(self.layout)
+        w2._add_row_weighted(1, 1, 100)
         w2.finalize(fn2)
         self.files.append(fn2)
         

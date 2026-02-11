@@ -3,13 +3,13 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import engine, memtable, spine, wal, manifest, shard_registry
 from gnitz.core import types, values as db_values
 
-def get_weight_helper(engine_inst, eid, vals):
+def get_weight_helper(engine_inst, pk, vals):
     layout = engine_inst.layout
     scratch = lltype.malloc(rffi.CCHARP.TO, layout.stride, flavor='raw')
     try:
         for i in range(layout.stride): scratch[i] = '\x00'
         engine_inst.mem_manager.active_table._pack_values_to_buf(scratch, vals)
-        return engine_inst.get_effective_weight_raw(eid, scratch, engine_inst.mem_manager.active_table.blob_arena.base_ptr)
+        return engine_inst.get_effective_weight_raw(pk, scratch, engine_inst.mem_manager.active_table.blob_arena.base_ptr)
     finally:
         lltype.free(scratch, flavor='raw')
 

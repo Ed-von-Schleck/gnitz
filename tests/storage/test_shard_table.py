@@ -1,20 +1,20 @@
 import unittest
 import os
 from gnitz.core import types
-from gnitz.storage import writer_ecs, shard_ecs
+from gnitz.storage import writer_table, shard_table
 
 class TestECSShardIntegration(unittest.TestCase):
     def setUp(self):
         self.fn = "test_ecs_shard.db"
         self.layout = types.ComponentLayout([types.TYPE_I64, types.TYPE_STRING])
         
-        writer = writer_ecs.ECSShardWriter(self.layout)
-        writer._add_entity_weighted(10, 1, 100, "alpha")
-        writer._add_entity_weighted(20, -1, 200, "beta")
-        writer._add_entity_weighted(30, 1, 300, "gamma")
+        writer = writer_table.TableShardWriter(self.layout)
+        writer._add_row_weighted(10, 1, 100, "alpha")
+        writer._add_row_weighted(20, -1, 200, "beta")
+        writer._add_row_weighted(30, 1, 300, "gamma")
         writer.finalize(self.fn)
         
-        self.view = shard_ecs.ECSShardView(self.fn, self.layout)
+        self.view = shard_table.TableShardView(self.fn, self.layout)
 
     def tearDown(self):
         self.view.close()

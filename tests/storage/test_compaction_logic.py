@@ -1,7 +1,7 @@
 import unittest
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.storage import writer_ecs, shard_ecs, compaction_logic
+from gnitz.storage import writer_table, shard_table, compaction_logic
 from gnitz.core import types
 from gnitz.storage import tournament_tree
 
@@ -15,16 +15,16 @@ class TestCompactionLogic(unittest.TestCase):
             if os.path.exists(f): os.unlink(f)
 
     def test_merge_annihilation(self):
-        w1 = writer_ecs.ECSShardWriter(self.layout)
-        w1._add_entity_weighted(1, 1, 100)
+        w1 = writer_table.TableShardWriter(self.layout)
+        w1._add_row_weighted(1, 1, 100)
         w1.finalize(self.files[0])
         
-        w2 = writer_ecs.ECSShardWriter(self.layout)
-        w2._add_entity_weighted(1, -1, 100)
+        w2 = writer_table.TableShardWriter(self.layout)
+        w2._add_row_weighted(1, -1, 100)
         w2.finalize(self.files[1])
         
-        v1 = shard_ecs.ECSShardView(self.files[0], self.layout)
-        v2 = shard_ecs.ECSShardView(self.files[1], self.layout)
+        v1 = shard_table.TableShardView(self.files[0], self.layout)
+        v2 = shard_table.TableShardView(self.files[1], self.layout)
         cursors = [tournament_tree.StreamCursor(v1), tournament_tree.StreamCursor(v2)]
         
         # Fixed: Updated to match pivot function name

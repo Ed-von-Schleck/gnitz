@@ -106,7 +106,7 @@ class TournamentTree(object):
         return self._get_key(0)
 
     # Backward compatibility for tests
-    def get_min_entity_id(self):
+    def get_min_primary_key(self):
         return self.get_min_key()
 
     def get_all_cursors_at_min(self):

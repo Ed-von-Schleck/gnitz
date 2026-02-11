@@ -13,7 +13,7 @@ except ImportError:
     r_uint128 = long
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.jit import unrolling_iterable
-from gnitz.storage import arena, writer_ecs, errors
+from gnitz.storage import arena, writer_table, errors
 from gnitz.core import types, values, strings as string_logic
 
 MAX_HEIGHT = 16
@@ -372,7 +372,7 @@ class MemTable(object):
             lltype.free(scratch_ptr, flavor='raw')
 
     def flush(self, filename):
-        sw = writer_ecs.TableShardWriter(self.schema)
+        sw = writer_table.TableShardWriter(self.schema)
         base = self.arena.base_ptr
         blob_base = self.blob_arena.base_ptr
         

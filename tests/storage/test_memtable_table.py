@@ -1,7 +1,7 @@
 import unittest
 import os
 from gnitz.core import types, values as db_values
-from gnitz.storage import memtable, shard_ecs
+from gnitz.storage import memtable, shard_table
 
 class TestMemTableECS(unittest.TestCase):
     def setUp(self):
@@ -16,11 +16,11 @@ class TestMemTableECS(unittest.TestCase):
         self.mgr.close()
         if os.path.exists(self.fn): os.unlink(self.fn)
 
-    def _put(self, eid, w, *vals):
+    def _put(self, pk, w, *vals):
         wrapped = [db_values.wrap(v) for v in vals]
         # FIX: upsert expects Payload Only (excluding PK).
         # We pass only the non-PK columns.
-        self.mgr.put(eid, w, wrapped)
+        self.mgr.put(pk, w, wrapped)
 
     def test_upsert_and_flush(self):
         self._put(10, 1, "short")
@@ -28,7 +28,7 @@ class TestMemTableECS(unittest.TestCase):
         
         self.mgr.flush_and_rotate(self.fn)
         
-        view = shard_ecs.TableShardView(self.fn, self.layout)
+        view = shard_table.TableShardView(self.fn, self.layout)
         self.assertEqual(view.count, 2)
         self.assertEqual(view.get_pk_u64(0), 10)
         view.close()

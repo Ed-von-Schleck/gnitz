@@ -2,7 +2,7 @@ import unittest
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import types
-from gnitz.storage import writer_ecs, shard_ecs, layout, errors
+from gnitz.storage import writer_table, shard_table, layout, errors
 
 class TestShardChecksums(unittest.TestCase):
     def setUp(self):
@@ -17,21 +17,21 @@ class TestShardChecksums(unittest.TestCase):
             os.unlink(self.fn)
 
     def test_write_and_validate_checksums(self):
-        writer = writer_ecs.ECSShardWriter(self.layout)
-        writer.add_entity(10, 100, "test")
-        writer.add_entity(20, 200, "data")
+        writer = writer_table.TableShardWriter(self.layout)
+        writer.add_row_values(10, 100, "test")
+        writer.add_row_values(20, 200, "data")
         writer.finalize(self.fn)
         
-        view = shard_ecs.ECSShardView(self.fn, self.layout, validate_checksums=True)
+        view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=True)
         self.assertEqual(view.count, 2)
         view.close()
 
     def test_corrupt_region_e_detection(self):
-        writer = writer_ecs.ECSShardWriter(self.layout)
-        writer.add_entity(10, 100, "test")
+        writer = writer_table.TableShardWriter(self.layout)
+        writer.add_row_values(10, 100, "test")
         writer.finalize(self.fn)
         
-        view = shard_ecs.ECSShardView(self.fn, self.layout, validate_checksums=False)
+        view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=False)
         off_e = view.get_region_offset(0) # Region 0 is PK (Entity)
         view.close()
         
@@ -42,14 +42,14 @@ class TestShardChecksums(unittest.TestCase):
             f.write(chr(byte_val ^ 0xFF))
         
         with self.assertRaises(errors.CorruptShardError):
-            view = shard_ecs.ECSShardView(self.fn, self.layout, validate_checksums=True)
+            view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=True)
 
     def test_corrupt_region_w_detection(self):
-        writer = writer_ecs.ECSShardWriter(self.layout)
-        writer.add_entity(10, 100, "test")
+        writer = writer_table.TableShardWriter(self.layout)
+        writer.add_row_values(10, 100, "test")
         writer.finalize(self.fn)
         
-        view = shard_ecs.ECSShardView(self.fn, self.layout, validate_checksums=False)
+        view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=False)
         off_w = view.get_region_offset(1) # Region 1 is Weights
         view.close()
         
@@ -60,14 +60,14 @@ class TestShardChecksums(unittest.TestCase):
             f.write(chr(byte_val ^ 0xFF))
         
         with self.assertRaises(errors.CorruptShardError):
-            view = shard_ecs.ECSShardView(self.fn, self.layout, validate_checksums=True)
+            view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=True)
 
     def test_skip_validation_option(self):
-        writer = writer_ecs.ECSShardWriter(self.layout)
-        writer.add_entity(10, 100, "test")
+        writer = writer_table.TableShardWriter(self.layout)
+        writer.add_row_values(10, 100, "test")
         writer.finalize(self.fn)
         
-        view = shard_ecs.ECSShardView(self.fn, self.layout, validate_checksums=False)
+        view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=False)
         off_e = view.get_region_offset(0)
         view.close()
         
@@ -77,7 +77,7 @@ class TestShardChecksums(unittest.TestCase):
             f.seek(off_e)
             f.write(chr(byte_val ^ 0xFF))
         
-        view = shard_ecs.ECSShardView(self.fn, self.layout, validate_checksums=False)
+        view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=False)
         self.assertEqual(view.count, 1)
         view.close()
 

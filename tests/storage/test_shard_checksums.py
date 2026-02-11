@@ -1,7 +1,7 @@
 import unittest
 import os
 from gnitz.core import types
-from gnitz.storage import writer_ecs, shard_ecs, layout, errors
+from gnitz.storage import writer_table, shard_table, layout, errors
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 class TestShardChecksums(unittest.TestCase):
@@ -17,12 +17,12 @@ class TestShardChecksums(unittest.TestCase):
             os.unlink(self.fn)
 
     def test_write_and_validate_checksums(self):
-        writer = writer_ecs.TableShardWriter(self.layout)
+        writer = writer_table.TableShardWriter(self.layout)
         # For simplicity, we create empty payloads for the string col in this test
         writer.add_row(10, 1, lltype.nullptr(rffi.CCHARP.TO), lltype.nullptr(rffi.CCHARP.TO))
         writer.finalize(self.fn)
         
-        view = shard_ecs.TableShardView(self.fn, self.layout, validate_checksums=True)
+        view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=True)
         self.assertEqual(view.count, 1)
         view.close()
 

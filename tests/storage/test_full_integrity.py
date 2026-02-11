@@ -2,7 +2,7 @@ import unittest
 import os
 import shutil
 import struct
-from gnitz.storage import writer_ecs, shard_ecs, errors, layout
+from gnitz.storage import writer_table, shard_table, errors, layout
 from gnitz.core import types
 
 class TestFullIntegrity(unittest.TestCase):
@@ -18,12 +18,12 @@ class TestFullIntegrity(unittest.TestCase):
 
     def test_deferred_blob_corruption(self):
         long_string = "this_is_a_very_long_string_that_will_be_in_region_b"
-        writer = writer_ecs.ECSShardWriter(self.layout)
-        writer.add_entity(1, long_string)
+        writer = writer_table.TableShardWriter(self.layout)
+        writer.add_row_values(1, long_string)
         writer.finalize(self.shard_path)
 
         # Open shard to find dynamic region offset
-        view = shard_ecs.ECSShardView(self.shard_path, self.layout)
+        view = shard_table.TableShardView(self.shard_path, self.layout)
         # Region 0: PK, 1: W, 2: Col1, 3: Blobs
         b_offset = view.get_region_offset(3)
         view.close()
@@ -34,8 +34,8 @@ class TestFullIntegrity(unittest.TestCase):
             f.write(b'\xFF\xFF\xFF')
 
         # Fixed: Explicitly enable checksums to test integrity validation
-        view = shard_ecs.ECSShardView(self.shard_path, self.layout, validate_checksums=True)
-        # Fixed: use get_pk_u64 instead of get_entity_id
+        view = shard_table.TableShardView(self.shard_path, self.layout, validate_checksums=True)
+        # Fixed: use get_pk_u64 instead of get_primary_key
         self.assertEqual(view.get_pk_u64(0), 1)
 
         # Triggers lazy Region B validation

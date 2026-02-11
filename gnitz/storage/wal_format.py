@@ -9,7 +9,7 @@ from gnitz.storage import errors, mmap_posix
 from gnitz.core import checksum, types, strings as string_logic, values as db_values
 
 WAL_BLOCK_HEADER_SIZE = 32
-WALRecord = namedtuple('WALRecord', ['entity_id', 'weight', 'component_data'])
+WALRecord = namedtuple('WALRecord', ['primary_key', 'weight', 'component_data'])
 
 def write_wal_block(fd, lsn, table_id, records, schema):
     is_u128 = schema.get_pk_column().field_type == types.TYPE_U128

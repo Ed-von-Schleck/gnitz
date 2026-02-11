@@ -3,7 +3,7 @@ import os
 import shutil
 from rpython.rlib.rarithmetic import r_uint64
 from gnitz.core import zset, types, values as db_values
-from gnitz.storage import errors, manifest, shard_ecs
+from gnitz.storage import errors, manifest, shard_table
 
 class TestPersistentZSetHardened(unittest.TestCase):
     def setUp(self):

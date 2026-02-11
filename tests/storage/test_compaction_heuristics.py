@@ -2,7 +2,7 @@ import unittest
 import os
 from gnitz.core import types
 from gnitz.storage import (
-    writer_ecs, shard_registry, manifest, 
+    writer_table, shard_registry, manifest, 
     refcount, compactor
 )
 
@@ -19,14 +19,14 @@ class TestCompactionHeuristics(unittest.TestCase):
         for f in self.files:
             if os.path.exists(f): os.unlink(f)
 
-    def _create_shard(self, filename, eid, weight, val, lsn):
-        w = writer_ecs.ECSShardWriter(self.layout)
-        w._add_entity_weighted(eid, weight, val)
+    def _create_shard(self, filename, pk, weight, val, lsn):
+        w = writer_table.TableShardWriter(self.layout)
+        w._add_row_weighted(pk, weight, val)
         w.finalize(filename)
         self.files.append(filename)
         self.shard_filenames.append(filename)
         
-        meta = shard_registry.ShardMetadata(filename, 1, eid, eid, lsn, lsn)
+        meta = shard_registry.ShardMetadata(filename, 1, pk, pk, lsn, lsn)
         self.registry.register_shard(meta)
         return meta
 

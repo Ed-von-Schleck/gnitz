@@ -4,7 +4,7 @@ try:
     from rpython.rlib.rarithmetic import r_uint128
 except ImportError:
     r_uint128 = long
-from gnitz.storage import shard_ecs, writer_ecs, tournament_tree, compaction_logic
+from gnitz.storage import shard_table, writer_table, tournament_tree, compaction_logic
 
 class CompactionPolicy(object):
     def __init__(self, registry):
@@ -20,12 +20,12 @@ def compact_shards(input_files, output_file, schema, table_id=0):
     
     try:
         for filename in input_files:
-            view = shard_ecs.TableShardView(filename, schema, validate_checksums=False)
+            view = shard_table.TableShardView(filename, schema, validate_checksums=False)
             views.append(view)
             cursors.append(tournament_tree.StreamCursor(view))
         
         tree = tournament_tree.TournamentTree(cursors)
-        writer = writer_ecs.TableShardWriter(schema, table_id)
+        writer = writer_table.TableShardWriter(schema, table_id)
         
         stride = schema.memtable_stride
         tmp_row = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
@@ -76,7 +76,7 @@ def execute_compaction(table_id, policy, manifest_mgr, ref_counter, schema, outp
             if keep: new_entries.append(entry)
         reader.close()
         
-        from gnitz.storage.shard_ecs import TableShardView
+        from gnitz.storage.shard_table import TableShardView
         v = TableShardView(out_filename, schema, validate_checksums=False)
         try:
             is_u128 = schema.get_pk_column().field_type.size == 16

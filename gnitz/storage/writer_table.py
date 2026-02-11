@@ -142,7 +142,7 @@ class TableShardWriter(object):
             else:
                 buf.append_bytes(val_ptr, 1)
 
-    def add_entity(self, eid, *args):
+    def add_row_values(self, pk, *args):
         stride = self.schema.memtable_stride
         tmp = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
         blob_tmp = lltype.nullptr(rffi.CCHARP.TO)
@@ -172,12 +172,12 @@ class TableShardWriter(object):
                     if ftype.size == 8: rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, ival)
                     elif ftype.size == 4: rffi.cast(rffi.UINTP, target)[0] = rffi.cast(rffi.UINT, ival)
             
-            self.add_row(r_uint128(eid), 1, tmp, blob_tmp)
+            self.add_row(r_uint128(pk), 1, tmp, blob_tmp)
         finally: 
             lltype.free(tmp, flavor='raw')
             if blob_tmp: rffi.free_charp(blob_tmp)
 
-    def _add_entity_weighted(self, eid, weight, *args):
+    def _add_row_weighted(self, pk, weight, *args):
         stride = self.schema.memtable_stride
         tmp = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
         blob_tmp = lltype.nullptr(rffi.CCHARP.TO)
@@ -201,7 +201,7 @@ class TableShardWriter(object):
                 else:
                     ival = int(val)
                     if ftype.size == 8: rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, ival)
-            self.add_row(r_uint128(eid), weight, tmp, blob_tmp)
+            self.add_row(r_uint128(pk), weight, tmp, blob_tmp)
         finally: 
             lltype.free(tmp, flavor='raw')
             if blob_tmp: rffi.free_charp(blob_tmp)
@@ -275,4 +275,3 @@ class TableShardWriter(object):
         os.rename(tmp_filename, filename)
         mmap_posix.fsync_dir(filename)
 
-ECSShardWriter = TableShardWriter
