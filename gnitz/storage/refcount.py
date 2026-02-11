@@ -3,6 +3,9 @@ from rpython.rlib import rposix
 import os
 
 class FileLockHandle(object):
+    """
+    Holds the file descriptor and the lock for an active shard reference.
+    """
     _immutable_fields_ = ['fd']
     def __init__(self, fd):
         self.fd = fd
@@ -10,44 +13,56 @@ class FileLockHandle(object):
 
 class RefCounter(object):
     """
-    Process-safe reference counter using flock on sidecar lock files.
-    Ensures readers (LOCK_SH) prevent deletion (LOCK_EX).
+    Hardened Process-safe reference counter.
+    Uses flock directly on data files to coordinate between Compactor (Writer) 
+    and Readers.
     """
     def __init__(self):
         # Maps filename -> FileLockHandle
         self.handles = {}
-        # List of filenames marked for deletion
+        # List of filenames marked for deletion by the compactor
         self.pending_deletion = []
     
-    def _get_lock_path(self, filename):
-        return filename + ".lock"
-    
     def can_delete(self, filename):
-        """
-        Returns True if the current process holds no active references.
-        Global safety is guaranteed by try_cleanup probing other processes.
-        """
+        """Returns True if this process has no active handles for the file."""
         return filename not in self.handles
 
     def acquire(self, filename):
         """
-        Acquires a shared lock (LOCK_SH) on the file's lock-file.
+        Acquires a shared lock on the data file.
+        Verifies the file is still linked in the filesystem.
         """
         if filename in self.handles:
             self.handles[filename].ref_count += 1
             return
 
-        lock_path = self._get_lock_path(filename)
+        fd = -1
         try:
-            fd = rposix.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+            # Open the actual data file for locking
+            fd = rposix.open(filename, os.O_RDONLY, 0)
+            
+            # Shared lock: blocks if a compactor is unlinking this file
             mmap_posix.lock_shared(fd)
+            
+            # Critical Check: Verify the file wasn't unlinked before we got the lock.
+            # If st_nlink == 0, the file exists as an open FD but has been 
+            # removed from the directory structure.
+            st = os.fstat(fd)
+            if st.st_nlink == 0:
+                mmap_posix.unlock_file(fd)
+                rposix.close(fd)
+                raise errors.StorageError("Shard was unlinked before lock acquisition: " + filename)
+                
             self.handles[filename] = FileLockHandle(fd)
         except OSError:
-            raise errors.StorageError("Failed to acquire lock for: " + filename)
+            if fd != -1:
+                rposix.close(fd)
+            raise errors.StorageError("Failed to acquire shard reference: " + filename)
     
     def release(self, filename):
         """
-        Decrements local reference. Releases flock if count reaches zero.
+        Decrements local reference count. Releases the flock and closes the FD
+        when the count reaches zero.
         """
         if filename not in self.handles:
             raise errors.StorageError("Attempted to release unacquired file: " + filename)
@@ -61,50 +76,51 @@ class RefCounter(object):
             del self.handles[filename]
             
     def mark_for_deletion(self, filename):
-        """Schedules a file for eventual unlinking."""
+        """Schedules a shard for unlinking."""
         for f in self.pending_deletion:
             if f == filename: return
         self.pending_deletion.append(filename)
     
     def try_cleanup(self):
         """
-        Attempts to delete marked files. Safety check:
-        1. No local references held (must not be in self.handles).
-        2. No other process references held (must acquire LOCK_EX | LOCK_NB).
+        Attempts to delete marked shards.
+        Safe Cleanup Protocol:
+        1. Ensure no local references are held.
+        2. Attempt LOCK_EX | LOCK_NB on the data file.
+        3. If lock is acquired, no other process is reading; unlink the file.
         """
         deleted = []
         remaining = []
         
         for filename in self.pending_deletion:
+            # Skip if we are still using it locally
             if not self.can_delete(filename):
                 remaining.append(filename)
                 continue
-                
-            lock_path = self._get_lock_path(filename)
-            lock_fd = -1
-            try:
-                if not os.path.exists(lock_path):
-                    if os.path.exists(filename):
-                        os.unlink(filename)
-                    deleted.append(filename)
-                    continue
+            
+            if not os.path.exists(filename):
+                deleted.append(filename)
+                continue
 
-                lock_fd = rposix.open(lock_path, os.O_RDWR, 0o666)
-                if mmap_posix.try_lock_exclusive(lock_fd):
-                    # Successfully proved no other process holds a shared lock
-                    if os.path.exists(filename):
-                        os.unlink(filename)
-                    if os.path.exists(lock_path):
-                        os.unlink(lock_path)
-                    
+            fd = -1
+            try:
+                # Open for exclusive lock probing
+                fd = rposix.open(filename, os.O_RDONLY, 0)
+                
+                if mmap_posix.try_lock_exclusive(fd):
+                    # No other process holds LOCK_SH. 
+                    # We can safely unlink while holding LOCK_EX.
+                    os.unlink(filename)
                     deleted.append(filename)
-                    rposix.close(lock_fd)
+                    # Implicitly unlocks on close
+                    rposix.close(fd)
                 else:
-                    # File is currently in use by another process
-                    rposix.close(lock_fd)
+                    # Shard is still being used by a reader process
+                    rposix.close(fd)
                     remaining.append(filename)
             except OSError:
-                if lock_fd != -1: rposix.close(lock_fd)
+                if fd != -1:
+                    rposix.close(fd)
                 remaining.append(filename)
         
         self.pending_deletion = remaining

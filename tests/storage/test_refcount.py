@@ -12,17 +12,22 @@ class TestRefCounter(unittest.TestCase):
         # Clean up any test files that still exist
         for fn in self.test_files:
             if os.path.exists(fn):
-                os.unlink(fn)
+                try:
+                    os.unlink(fn)
+                except OSError:
+                    pass
     
     def _create_test_file(self, filename):
         """Helper to create a temporary test file."""
         with open(filename, 'w') as f:
             f.write("test")
-        self.test_files.append(filename)
+        if filename not in self.test_files:
+            self.test_files.append(filename)
     
     def test_acquire_release_single(self):
         """Test basic acquire and release."""
         filename = "test_ref_single.db"
+        self._create_test_file(filename)
         
         # Initial state - can delete
         self.assertTrue(self.refcount.can_delete(filename))
@@ -38,6 +43,7 @@ class TestRefCounter(unittest.TestCase):
     def test_multiple_acquires(self):
         """Test multiple acquires of the same file."""
         filename = "test_ref_multiple.db"
+        self._create_test_file(filename)
         
         # Acquire 3 times
         self.refcount.acquire(filename)
@@ -61,6 +67,7 @@ class TestRefCounter(unittest.TestCase):
     def test_can_delete_with_active_references(self):
         """Test that files with active references cannot be deleted."""
         filename = "test_ref_active.db"
+        self._create_test_file(filename)
         
         self.refcount.acquire(filename)
         self.refcount.acquire(filename)
@@ -70,8 +77,9 @@ class TestRefCounter(unittest.TestCase):
     def test_can_delete_with_zero_references(self):
         """Test that files with zero references can be deleted."""
         filename = "test_ref_zero.db"
+        self._create_test_file(filename)
         
-        # Never acquired - should be deletable
+        # Release once to establish state
         self.assertTrue(self.refcount.can_delete(filename))
         
         # Acquire and release - should be deletable again
@@ -157,6 +165,7 @@ class TestRefCounter(unittest.TestCase):
     def test_release_without_acquire_raises_error(self):
         """Test that releasing a file without acquiring raises error."""
         filename = "test_ref_invalid.db"
+        # No need to create file here as we are testing the internal handles map
         
         with self.assertRaises(errors.StorageError):
             self.refcount.release(filename)
@@ -164,6 +173,7 @@ class TestRefCounter(unittest.TestCase):
     def test_release_too_many_times_raises_error(self):
         """Test that releasing more times than acquired raises error."""
         filename = "test_ref_overrelease.db"
+        self._create_test_file(filename)
         
         self.refcount.acquire(filename)
         self.refcount.release(filename)
