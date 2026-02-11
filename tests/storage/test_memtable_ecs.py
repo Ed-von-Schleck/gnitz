@@ -18,9 +18,9 @@ class TestMemTableECS(unittest.TestCase):
 
     def _put(self, eid, w, *vals):
         wrapped = [db_values.wrap(v) for v in vals]
-        # In TableSchema, the row values include the PK
-        row = [db_values.wrap(eid)] + wrapped
-        self.mgr.put(eid, w, row)
+        # FIX: upsert expects Payload Only (excluding PK).
+        # We pass only the non-PK columns.
+        self.mgr.put(eid, w, wrapped)
 
     def test_upsert_and_flush(self):
         self._put(10, 1, "short")

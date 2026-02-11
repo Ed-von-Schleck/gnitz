@@ -10,14 +10,20 @@ class DBValue(object):
 class IntValue(DBValue):
     def __init__(self, v):
         self.v = r_uint64(v)
+    def get_int(self):
+        return int(self.v)
 
 class StringValue(DBValue):
     def __init__(self, v):
         self.v = str(v)
+    def get_string(self):
+        return self.v
 
 class U128Value(DBValue):
     def __init__(self, v):
         self.v = r_uint128(v)
+    def get_u128(self):
+        return self.v
 
 def wrap(val):
     if isinstance(val, (int, long)):

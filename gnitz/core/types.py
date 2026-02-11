@@ -37,19 +37,27 @@ class TableSchema(object):
         if len(columns) > 64:
             raise errors.LayoutError("Maximum 64 columns supported")
             
-        self.columns = columns
+        self.columns = []
+        for c in columns:
+            if isinstance(c, ColumnDefinition):
+                self.columns.append(c)
+            elif isinstance(c, FieldType):
+                self.columns.append(ColumnDefinition(c))
+            else:
+                raise errors.LayoutError("Invalid column definition")
+
         self.pk_index = pk_index
-        self.column_offsets = [0] * len(columns)
+        self.column_offsets = [0] * len(self.columns)
         
         current_offset = 0
         max_alignment = 1
         
-        for i in range(len(columns)):
+        for i in range(len(self.columns)):
             if i == pk_index:
                 self.column_offsets[i] = -1
                 continue
 
-            field_type = columns[i].field_type
+            field_type = self.columns[i].field_type
             current_offset = _align(current_offset, field_type.alignment)
             self.column_offsets[i] = current_offset
             current_offset += field_type.size
