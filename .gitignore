@@ -173,3 +173,4 @@ Desktop.ini
 $RECYCLE.BIN/
 debug*
 test_results.txt
+*.lock

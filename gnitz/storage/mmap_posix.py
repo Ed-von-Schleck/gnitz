@@ -13,6 +13,7 @@ MAP_SHARED      = 0x01
 MAP_PRIVATE     = 0x02
 
 # flock constants
+LOCK_SH = 1  # shared lock
 LOCK_EX = 2  # exclusive lock
 LOCK_NB = 4  # non-blocking
 LOCK_UN = 8  # unlock
@@ -93,9 +94,12 @@ def fsync_dir(filepath):
 
 def try_lock_exclusive(fd):
     """Attempts to acquire an exclusive non-blocking lock."""
-    # LOCK_EX | LOCK_NB
     res = flock_c(fd, LOCK_EX | LOCK_NB)
     return rffi.cast(lltype.Signed, res) == 0
+
+def lock_shared(fd):
+    """Acquires a shared blocking lock."""
+    flock_c(fd, LOCK_SH)
 
 def unlock_file(fd):
     flock_c(fd, LOCK_UN)
