@@ -41,11 +41,11 @@ class PersistentTable(object):
         self.mem_manager = memtable.MemTableManager(schema, cache_size, wal_writer=self.wal_writer, table_id=self.table_id)
         
         if self.manifest_manager.exists():
-            self.spine = spine.Spine.from_manifest(self.manifest_path, self.table_id, schema, ref_counter=self.ref_counter)
+            self.spine = spine.Spine.from_manifest(self.manifest_path, self.table_id, schema, ref_counter=self.ref_counter, **kwargs)
         else:
             self.spine = spine.Spine([], self.ref_counter)
             
-        self.engine = engine.Engine(self.mem_manager, self.spine, self.manifest_manager, self.registry, table_id=self.table_id, recover_wal_filename=self.wal_path)
+        self.engine = engine.Engine(self.mem_manager, self.spine, self.manifest_manager, self.registry, table_id=self.table_id, recover_wal_filename=self.wal_path, **kwargs)
         self.compaction_policy = compactor.CompactionPolicy(self.registry)
         self._query_scratch = lltype.malloc(rffi.CCHARP.TO, self.schema.memtable_stride, flavor='raw')
 
@@ -62,29 +62,17 @@ class PersistentTable(object):
         return self.engine.get_effective_weight(r_uint128(key), self._query_scratch, blob_base)
 
     def flush(self):
-        """
-        Flushes MemTable to disk, updates manifest, and prunes the WAL.
-        """
         filename = os.path.join(self.directory, "%s_shard_%d.db" % (self.name, int(self.engine.mem_manager.starting_lsn)))
         min_key, max_key, needs_compaction = self.engine.flush_and_rotate(filename)
-        
-        # After a successful flush, data is durable in a Shard.
-        # We can now prune the WAL up to the last persisted LSN.
         self.checkpoint()
-        
         return filename
 
     def checkpoint(self):
-        """
-        Prunes the WAL by removing all entries that have been successfully
-        persisted into immutable Shards, as recorded in the Manifest.
-        """
         if not self.read_only and self.manifest_manager.exists():
             reader = self.manifest_manager.load_current()
-            # The manifest tracks the global max LSN that is now in shards
             lsn = reader.global_max_lsn
             reader.close()
-            # Truncate everything before the next expected LSN
+            # Prune WAL up to the global max LSN recorded in the shards
             self.wal_writer.truncate_before_lsn(lsn + r_uint64(1))
 
     def _trigger_compaction(self):
@@ -95,19 +83,13 @@ class PersistentTable(object):
         if self._query_scratch:
             lltype.free(self._query_scratch, flavor='raw')
             self._query_scratch = lltype.nullptr(rffi.CCHARP.TO)
-        
         self.engine.close()
-        if self.wal_writer:
-            self.wal_writer.close()
+        if self.wal_writer: self.wal_writer.close()
         self.is_closed = True
 
 PersistentZSet = PersistentTable
 
 class ZSet(object):
-    """
-    In-memory Z-Set (Multiset).
-    Used for DBSP transient state and unit testing.
-    """
     def __init__(self, schema):
         self.schema = schema
         self.mem_manager = memtable.MemTableManager(schema, 10 * 1024 * 1024) 
@@ -122,8 +104,7 @@ class ZSet(object):
         curr = table._find_first_key(r_uint128(key))
         while curr != 0:
             k = table._get_node_key(curr)
-            if k != r_uint128(key):
-                break
+            if k != r_uint128(key): break
             total += memtable.node_get_weight(base, curr)
             curr = memtable.node_get_next_off(base, curr, 0)
         return int(total)
@@ -135,14 +116,10 @@ class ZSet(object):
         last_valid_node = 0
         while curr != 0:
             k = table._get_node_key(curr)
-            if k != r_uint128(key):
-                break
-            if memtable.node_get_weight(base, curr) != 0:
-                last_valid_node = curr
+            if k != r_uint128(key): break
+            if memtable.node_get_weight(base, curr) != 0: last_valid_node = curr
             curr = memtable.node_get_next_off(base, curr, 0)
-            
-        if last_valid_node != 0:
-            return memtable.unpack_payload_to_values(table, last_valid_node)
+        if last_valid_node != 0: return memtable.unpack_payload_to_values(table, last_valid_node)
         return None
 
     def iter_nonzero(self):
@@ -160,5 +137,4 @@ class ZSet(object):
 
     def iter_positive(self):
         for k, w, p in self.iter_nonzero():
-            if w > 0:
-                yield (k, w, p)
+            if w > 0: yield (k, w, p)

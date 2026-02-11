@@ -111,26 +111,24 @@ def unpack_payload_to_values(memtable_inst, node_off):
     res = []
     
     for i in range(len(schema.columns)):
-        if i == schema.pk_index:
-            continue
+        if i == schema.pk_index: continue
         col_def = schema.columns[i]
         off = schema.get_column_offset(i)
         f_ptr = rffi.ptradd(ptr, off)
         
         if col_def.field_type == types.TYPE_STRING:
+            # ... string unpacking remains same ...
             u32_ptr = rffi.cast(rffi.UINTP, f_ptr)
             length = rffi.cast(lltype.Signed, u32_ptr[0])
-            if length == 0:
-                res.append(values.StringValue(""))
+            if length == 0: res.append(values.StringValue(""))
             elif length <= string_logic.SHORT_STRING_THRESHOLD:
-                s_bytes = rffi.charpsize2str(rffi.ptradd(f_ptr, 4), length)
-                res.append(values.StringValue(s_bytes))
+                res.append(values.StringValue(rffi.charpsize2str(rffi.ptradd(f_ptr, 4), length)))
             else:
-                u64_payload = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(f_ptr, 8))
-                blob_off = rffi.cast(lltype.Signed, u64_payload[0])
-                blob_ptr = rffi.ptradd(blob_base, blob_off)
-                s_bytes = rffi.charpsize2str(blob_ptr, length)
-                res.append(values.StringValue(s_bytes))
+                blob_off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(f_ptr, 8))[0])
+                res.append(values.StringValue(rffi.charpsize2str(rffi.ptradd(blob_base, blob_off), length)))
+        elif col_def.field_type == types.TYPE_F64:
+            val = rffi.cast(rffi.DOUBLEP, f_ptr)[0]
+            res.append(values.FloatValue(float(val)))
         elif col_def.field_type == types.TYPE_I64:
             val = rffi.cast(rffi.LONGLONGP, f_ptr)[0]
             res.append(values.IntValue(val))
@@ -223,26 +221,28 @@ class MemTable(object):
             dest = rffi.ptradd(dest_ptr, f_off)
             
             if f_type == types.TYPE_STRING:
-                if isinstance(val_obj, values.StringValue):
-                    s_val = val_obj.v
-                elif isinstance(val_obj, str):
-                    s_val = val_obj
-                else:
-                    s_val = str(val_obj)
-                    
+                # ... string logic remains same ...
+                s_val = ""
+                if isinstance(val_obj, values.StringValue): s_val = val_obj.v
+                elif isinstance(val_obj, str): s_val = val_obj
+                else: s_val = str(val_obj)
                 l_val = len(s_val)
                 heap_off = 0
                 if l_val > string_logic.SHORT_STRING_THRESHOLD:
                     blob_ptr = self.blob_arena.alloc(l_val)
                     heap_off = rffi.cast(lltype.Signed, blob_ptr) - \
                                rffi.cast(lltype.Signed, self.blob_arena.base_ptr)
-                    for j in range(l_val):
-                        blob_ptr[j] = s_val[j]
+                    for j in range(l_val): blob_ptr[j] = s_val[j]
                 string_logic.pack_string(dest, s_val, heap_off)
+            elif f_type == types.TYPE_F64:
+                val = 0.0
+                if isinstance(val_obj, values.FloatValue): val = val_obj.v
+                elif isinstance(val_obj, float): val = val_obj
+                rffi.cast(rffi.DOUBLEP, dest)[0] = rffi.cast(rffi.DOUBLE, val)
             elif isinstance(val_obj, values.IntValue):
                 rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val_obj.v)
             elif isinstance(val_obj, (int, long)):
-                 rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val_obj)
+                 rffi.cast(rffi.LONGLONGP, dest)[0] = rffi.cast(rffi.LONGLONG, val)
             
             payload_idx += 1
 
@@ -362,15 +362,16 @@ class MemTable(object):
             
             node_set_weight(base, new_off, weight)
             new_ptr[8] = chr(h)
-            
             key_ptr = rffi.ptradd(new_ptr, 12 + (h * 4))
             if self.key_size == 16:
-                lo = rffi.cast(rffi.ULONGLONG, key & r_uint128(0xFFFFFFFFFFFFFFFF))
-                hi = rffi.cast(rffi.ULONGLONG, key >> 64)
-                rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = lo
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = hi
+                # Wrap bit-manipulated Python longs in r_uint64 to satisfy RPython cast checks
+                mask = r_uint128(0xFFFFFFFFFFFFFFFF)
+                lo = r_uint64(key & mask)
+                hi = r_uint64(key >> 64)
+                rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, lo)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = rffi.cast(rffi.ULONGLONG, hi)
             else:
-                rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, key)
+                rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(key))
             
             payload_ptr = rffi.ptradd(key_ptr, self.key_size)
             for i in range(self.schema.stride):

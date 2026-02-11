@@ -133,6 +133,11 @@ class TableShardView(object):
         ptr = self.get_col_ptr(row_idx, col_idx)
         if not ptr: return 0
         return rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, ptr)[0])
+      
+    def read_field_f64(self, row_idx, col_idx):
+        ptr = self.get_col_ptr(row_idx, col_idx)
+        if not ptr: return 0.0
+        return float(rffi.cast(rffi.DOUBLEP, ptr)[0])
 
     def string_field_equals(self, row_idx, col_idx, search_str):
         ptr = self.get_col_ptr(row_idx, col_idx)

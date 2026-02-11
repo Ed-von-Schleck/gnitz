@@ -2,6 +2,7 @@ import os
 from rpython.rlib import rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.jit import unrolling_iterable
+from rpython.rlib.rarithmetic import r_uint64
 try:
     from rpython.rlib.rarithmetic import r_uint128
 except ImportError:
@@ -42,13 +43,14 @@ class RawBuffer(object):
         self.ensure_capacity(1)
         target = rffi.cast(rffi.CCHARP, rffi.ptradd(self.ptr, self.count * 16))
         mask = r_uint128(0xFFFFFFFFFFFFFFFF)
-        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, value & mask)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, (value >> 64) & mask)
+        # Wrap components in r_uint64 to ensure they are within signed 64-bit boundaries during RPython simulation
+        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(value & mask))
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64((value >> 64) & mask))
         self.count += 1
 
     def append_u64(self, value):
         self.ensure_capacity(1)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(rffi.ULONGLONG, value)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(value))
         self.count += 1
 
     def append_i64(self, value):
@@ -133,7 +135,7 @@ class TableShardWriter(object):
                         tmp_str = lltype.malloc(rffi.CCHARP.TO, 16, flavor='raw')
                         try:
                             _copy_memory(tmp_str, val_ptr, 16)
-                            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(tmp_str, 8))[0] = rffi.cast(rffi.ULONGLONG, new_off)
+                            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(tmp_str, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(new_off))
                             buf.append_bytes(tmp_str, 1)
                         finally: lltype.free(tmp_str, flavor='raw')
                     else: buf.append_bytes(val_ptr, 1)
@@ -142,25 +144,17 @@ class TableShardWriter(object):
                 buf.append_bytes(val_ptr, 1)
 
     def _add_row_from_args(self, pk, weight, args):
-        """
-        Consolidated helper to pack a row from variadic arguments safely.
-        Handles multiple long strings by creating a single temporary row-local heap.
-        """
         stride = self.schema.memtable_stride
         tmp_row_buf = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
         row_blob_heap = lltype.nullptr(rffi.CCHARP.TO)
         
         try:
-            # Initialize row buffer
             for i in range(stride): tmp_row_buf[i] = '\x00'
-            
-            # Pass 1: Calculate total size needed for all long strings in this row
             total_blob_size = 0
             arg_idx = 0
             for i in range(len(self.schema.columns)):
                 if i == self.schema.pk_index: continue
                 if arg_idx >= len(args): break
-                
                 ftype = self.schema.columns[i].field_type
                 if ftype == types.TYPE_STRING:
                     s_val = str(args[arg_idx])
@@ -168,11 +162,9 @@ class TableShardWriter(object):
                         total_blob_size += len(s_val)
                 arg_idx += 1
 
-            # Allocate row-local heap if needed
             if total_blob_size > 0:
                 row_blob_heap = lltype.malloc(rffi.CCHARP.TO, total_blob_size, flavor='raw')
 
-            # Pass 2: Pack data and copy long strings into the row-local heap
             current_blob_offset = 0
             arg_idx = 0
             for i in range(len(self.schema.columns)):
@@ -188,22 +180,19 @@ class TableShardWriter(object):
                 if ftype == types.TYPE_STRING:
                     s_val = str(val)
                     if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
-                        # Copy string data to the local heap
-                        for j in range(len(s_val)):
-                            row_blob_heap[current_blob_offset + j] = s_val[j]
-                        # Pack string structure with offset relative to row_blob_heap
+                        for j in range(len(s_val)): row_blob_heap[current_blob_offset + j] = s_val[j]
                         string_logic.pack_string(target, s_val, current_blob_offset)
                         current_blob_offset += len(s_val)
-                    else:
-                        string_logic.pack_string(target, s_val, 0)
+                    else: string_logic.pack_string(target, s_val, 0)
+                elif ftype == types.TYPE_F64:
+                    rffi.cast(rffi.DOUBLEP, target)[0] = rffi.cast(rffi.DOUBLE, float(val))
                 else:
                     ival = int(val)
                     if ftype.size == 8: 
-                        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, ival)
+                        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(ival))
                     elif ftype.size == 4: 
                         rffi.cast(rffi.UINTP, target)[0] = rffi.cast(rffi.UINT, ival)
             
-            # Transfer from temporary AoS buffers to Shard Buffers
             self.add_row(r_uint128(pk), weight, tmp_row_buf, row_blob_heap)
             
         finally: 

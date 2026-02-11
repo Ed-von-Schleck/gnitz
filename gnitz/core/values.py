@@ -13,6 +13,12 @@ class IntValue(DBValue):
     def get_int(self):
         return int(self.v)
 
+class FloatValue(DBValue):
+    def __init__(self, v):
+        self.v = float(v)
+    def get_float(self):
+        return self.v
+
 class StringValue(DBValue):
     def __init__(self, v):
         self.v = str(v)
@@ -26,6 +32,8 @@ class U128Value(DBValue):
         return self.v
 
 def wrap(val):
+    if isinstance(val, float):
+        return FloatValue(val)
     if isinstance(val, (int, long)):
         return IntValue(val)
     if isinstance(val, str):
@@ -34,4 +42,4 @@ def wrap(val):
         return U128Value(val)
     if isinstance(val, DBValue):
         return val
-    raise TypeError("Unsupported type for DBValue")
+    raise TypeError("Unsupported type for DBValue: %s" % type(val))

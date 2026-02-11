@@ -37,10 +37,11 @@ def write_wal_block(fd, lsn, table_id, records, schema):
         for key, weight, values in records:
             # Key & Weight
             if is_u128:
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, curr_off))[0] = rffi.cast(rffi.ULONGLONG, key & mask)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, curr_off + 8))[0] = rffi.cast(rffi.ULONGLONG, (key >> 64) & mask)
+                # Wrap in r_uint64 to ensure value is within unsigned 64-bit range for RPython cast
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, curr_off))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(key & mask))
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, curr_off + 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64((key >> 64) & mask))
             else:
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, curr_off))[0] = rffi.cast(rffi.ULONGLONG, key & mask)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, curr_off))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(key & mask))
             curr_off += key_size
             rffi.cast(rffi.LONGLONGP, rffi.ptradd(buf, curr_off))[0] = rffi.cast(rffi.LONGLONG, weight)
             curr_off += 8
@@ -62,14 +63,16 @@ def write_wal_block(fd, lsn, table_id, records, schema):
                     string_logic.pack_string(target, s_val, 0)
                     if len(s_val) > 12:
                         for j in range(len(s_val)): buf[curr_off + j] = s_val[j]
-                        # Relative to block start
                         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, WAL_BLOCK_HEADER_SIZE + curr_off)
                         curr_off += len(s_val)
+                elif ftype == types.TYPE_F64:
+                    f_val = val_obj.v if isinstance(val_obj, db_values.FloatValue) else 0.0
+                    rffi.cast(rffi.DOUBLEP, target)[0] = rffi.cast(rffi.DOUBLE, f_val)
                 else:
                     val = val_obj.v if isinstance(val_obj, db_values.IntValue) else 0
                     rffi.cast(rffi.LONGLONGP, target)[0] = rffi.cast(rffi.LONGLONG, val)
 
-        # 2. Header: [LSN(8)|Tid(4)|Cnt(4)|Size(4)|CS(8)|Pad(4)]
+        # 2. Header
         header = lltype.malloc(rffi.CCHARP.TO, WAL_BLOCK_HEADER_SIZE, flavor='raw')
         try:
             for i in range(WAL_BLOCK_HEADER_SIZE): header[i] = '\x00'
@@ -124,8 +127,7 @@ def decode_wal_block(block_ptr, block_len, schema):
             if col_def.field_type == types.TYPE_STRING:
                 length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, fptr)[0])
                 if length <= 12:
-                    # Extract inline string from payload
-                    s_bytes = rffi.charpsize2str(rffi.ptradd(fptr, 4), 4) # Prefix
+                    s_bytes = rffi.charpsize2str(rffi.ptradd(fptr, 4), 4)
                     if length > 4:
                         s_bytes += rffi.charpsize2str(rffi.ptradd(fptr, 8), length - 4)
                     field_values.append(db_values.StringValue(s_bytes))
@@ -133,6 +135,8 @@ def decode_wal_block(block_ptr, block_len, schema):
                     wal_off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(fptr, 8))[0])
                     field_values.append(db_values.StringValue(rffi.charpsize2str(rffi.ptradd(block_ptr, wal_off), length)))
                     ptr = rffi.ptradd(ptr, length)
+            elif col_def.field_type == types.TYPE_F64:
+                field_values.append(db_values.FloatValue(float(rffi.cast(rffi.DOUBLEP, fptr)[0])))
             else:
                 field_values.append(db_values.IntValue(rffi.cast(rffi.LONGLONGP, fptr)[0]))
         records.append((key, weight, field_values))

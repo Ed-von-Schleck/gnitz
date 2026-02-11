@@ -6,14 +6,13 @@ except ImportError:
 
 class ShardHandle(object):
     _immutable_fields_ = ['filename', 'lsn', 'view', 'min_key', 'max_key']
-    def __init__(self, filename, schema, lsn):
+    def __init__(self, filename, schema, lsn, validate_checksums=False):
         from gnitz.storage import shard_table
         from gnitz.core import types 
         self.filename = filename
         self.lsn = lsn
-        # Checksums are expensive for every handle open in query loops; 
-        # normally validated once at publish time.
-        self.view = shard_table.TableShardView(filename, schema, validate_checksums=False)
+        # Propagate the validation flag to the View
+        self.view = shard_table.TableShardView(filename, schema, validate_checksums=validate_checksums)
         
         if self.view.count > 0:
             is_u128 = schema.get_pk_column().field_type == types.TYPE_U128
@@ -39,7 +38,6 @@ class Spine(object):
             for h in self.handles: self.ref_counter.acquire(h.filename)
 
     def _sort_handles(self):
-        """ Maintains binary search invariant sorted by min_key. """
         for i in range(1, len(self.handles)):
             h = self.handles[i]
             j = i - 1
@@ -50,15 +48,17 @@ class Spine(object):
 
     @staticmethod
     def from_manifest(manifest_filename, table_id=1, schema=None, ref_counter=None, **kwargs):
-        tid = kwargs.get('table_id', kwargs.get('table_id', table_id))
+        tid = kwargs.get('table_id', table_id)
         sch = kwargs.get('layout', schema)
+        validate = kwargs.get('validate_checksums', False)
+        
         from gnitz.storage import manifest
         reader = manifest.ManifestReader(manifest_filename)
         try:
             handles = []
             for entry in reader.iterate_entries():
                 if entry.table_id == tid:
-                    handle = ShardHandle(entry.shard_filename, sch, entry.max_lsn)
+                    handle = ShardHandle(entry.shard_filename, sch, entry.max_lsn, validate_checksums=validate)
                     handles.append(handle)
             return Spine(handles, ref_counter)
         finally:
@@ -71,7 +71,6 @@ class Spine(object):
         self._sort_handles()
 
     def replace_handles(self, old_filenames, new_handle):
-        """ Used after compaction to atomically swap shards in the spine. """
         new_list = []
         for h in self.handles:
             found = False
@@ -106,7 +105,6 @@ class Spine(object):
         results = []
         upper = self._find_upper_bound(key)
         if upper == -1: return results
-        # Scan backwards from upper bound to find all potentially overlapping shards
         for i in range(upper, -1, -1):
             h = self.handles[i]
             if key <= h.max_key:

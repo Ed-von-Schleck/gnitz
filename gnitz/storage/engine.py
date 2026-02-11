@@ -121,7 +121,9 @@ class Engine(object):
         needs_comp = False
         
         if os.path.exists(filename):
-            handle = ShardHandle(filename, self.schema, lsn_max)
+            # Pass through the validation flag from the engine/registry settings
+            validate = getattr(self, 'validate_checksums', False)
+            handle = ShardHandle(filename, self.schema, lsn_max, validate_checksums=validate)
             if handle.view.count > 0:
                 min_k = handle.min_key
                 max_k = handle.max_key
