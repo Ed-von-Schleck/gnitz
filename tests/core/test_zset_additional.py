@@ -46,13 +46,13 @@ class TestPersistentZSetHardened(unittest.TestCase):
         shard_path = self.db.flush()
         self.assertFalse(os.path.exists(shard_path))
 
-    def test_component_id_isolation(self):
+    def test_table_id_isolation(self):
         p = self._p(1, 1, "comp1")
         self.db.insert(100, p)
         self.db.flush()
 
         # Here we simulate a second process reading the first.
-        db2 = zset.PersistentZSet(self.test_dir, self.db_name, self.layout, component_id=2, read_only=True)
+        db2 = zset.PersistentZSet(self.test_dir, self.db_name, self.layout, table_id=2, read_only=True)
         try:
             self.assertEqual(self.db.get_weight(100, p), 1)
             self.assertEqual(db2.get_weight(100, p), 0) # Comp 2 shouldn't see Comp 1 data

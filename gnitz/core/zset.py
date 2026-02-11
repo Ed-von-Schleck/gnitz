@@ -18,7 +18,7 @@ class PersistentTable(object):
         self.directory = directory
         self.name = name
         self.schema = schema
-        self.table_id = kwargs.get('component_id', table_id)
+        self.table_id = kwargs.get('table_id', table_id)
         self.read_only = read_only
         self.is_closed = False
         
@@ -38,7 +38,7 @@ class PersistentTable(object):
         else:
             self.wal_writer = wal.WALWriter(self.wal_path, schema)
         
-        self.mem_manager = memtable.MemTableManager(schema, cache_size, wal_writer=self.wal_writer, component_id=self.table_id)
+        self.mem_manager = memtable.MemTableManager(schema, cache_size, wal_writer=self.wal_writer, table_id=self.table_id)
         
         if self.manifest_manager.exists():
             self.spine = spine.Spine.from_manifest(self.manifest_path, self.table_id, schema, ref_counter=self.ref_counter)

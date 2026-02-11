@@ -31,7 +31,7 @@ class TestSpineManifest(unittest.TestCase):
         writer.add_entry(1, shard_fn, 10, 20, 0, 1)
         writer.finalize()
         
-        sp = spine.Spine.from_manifest(self.manifest_file, component_id=1, layout=self.layout)
+        sp = spine.Spine.from_manifest(self.manifest_file, table_id=1, layout=self.layout)
         
         # Fixed: Updated min_eid to min_key
         self.assertEqual(sp.handles[0].min_key, 10)

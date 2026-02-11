@@ -26,7 +26,7 @@ class TestEngineFlush(unittest.TestCase):
         self.test_files.extend(shards)
         mgr = memtable.MemTableManager(self.layout, 1024 * 1024)
         reg = shard_registry.ShardRegistry()
-        db = engine.Engine(mgr, spine.Spine([]), registry=reg, component_id=1)
+        db = engine.Engine(mgr, spine.Spine([]), registry=reg, table_id=1)
         
         compaction_triggered = False
         for i, shard_file in enumerate(shards):

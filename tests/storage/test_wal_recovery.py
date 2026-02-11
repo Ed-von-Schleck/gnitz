@@ -28,7 +28,7 @@ def test_wal_recovery():
         writer.close()
         
         mgr = memtable.MemTableManager(layout, 1024 * 1024)
-        db = engine.Engine(mgr, spine.Spine([]), manifest.ManifestManager(m_fn), shard_registry.ShardRegistry(), component_id=1)
+        db = engine.Engine(mgr, spine.Spine([]), manifest.ManifestManager(m_fn), shard_registry.ShardRegistry(), table_id=1)
         db.recover_from_wal(wal_fn)
         
         # Verify Entity 1 has weight 2

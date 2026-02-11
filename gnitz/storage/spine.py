@@ -50,7 +50,7 @@ class Spine(object):
 
     @staticmethod
     def from_manifest(manifest_filename, table_id=1, schema=None, ref_counter=None, **kwargs):
-        tid = kwargs.get('component_id', kwargs.get('table_id', table_id))
+        tid = kwargs.get('table_id', kwargs.get('table_id', table_id))
         sch = kwargs.get('layout', schema)
         from gnitz.storage import manifest
         reader = manifest.ManifestReader(manifest_filename)

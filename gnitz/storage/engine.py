@@ -22,7 +22,7 @@ class Engine(object):
         self.schema = mem_manager.schema
         self.manifest_manager = manifest_manager
         self.registry = registry
-        self.table_id = kwargs.get('component_id', kwargs.get('table_id', table_id))
+        self.table_id = kwargs.get('table_id', kwargs.get('table_id', table_id))
         
         if manifest_manager and manifest_manager.exists():
             reader = manifest_manager.load_current()
