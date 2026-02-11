@@ -21,7 +21,8 @@ class TestECSShardWriter(unittest.TestCase):
         
         view = shard_ecs.ECSShardView(self.fn, self.layout)
         self.assertEqual(view.count, 1)
-        self.assertEqual(view.get_entity_id(0), 2)
+        # Fixed: use get_pk_u64 instead of get_entity_id
+        self.assertEqual(view.get_pk_u64(0), 2)
         view.close()
 
 if __name__ == '__main__':

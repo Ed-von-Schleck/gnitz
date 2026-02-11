@@ -56,7 +56,8 @@ class TestSurvivorBlobCompaction(unittest.TestCase):
         try:
             # Check Entity Count
             self.assertEqual(view.count, 1)
-            self.assertEqual(view.get_entity_id(0), 2)
+            # Fixed: use get_pk_u64 instead of get_entity_id
+            self.assertEqual(view.get_pk_u64(0), 2)
             
             # Check Region B Size
             # Region B should strictly contain only the survivor string.

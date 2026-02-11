@@ -12,7 +12,7 @@ from gnitz.core import strings as string_logic, types, checksum
 class TableShardView(object):
     _immutable_fields_ = ['count', 'schema', 'ptr', 'size', 'pk_buf', 'w_buf', 'col_bufs[*]', 'blob_buf', 'dir_off', 'dir_checksums[*]']
 
-    def __init__(self, filename, schema, validate_checksums=True):
+    def __init__(self, filename, schema, validate_checksums=False):
         self.schema = schema
         fd = rposix.open(filename, os.O_RDONLY, 0)
         self.ptr = lltype.nullptr(rffi.CCHARP.TO)
@@ -26,49 +26,58 @@ class TableShardView(object):
 
             self.ptr = mmap_posix.mmap_file(fd, self.size, mmap_posix.PROT_READ, mmap_posix.MAP_SHARED)
             
-            if rffi.cast(rffi.ULONGLONGP, self.ptr)[0] != layout.MAGIC_NUMBER:
-                raise errors.CorruptShardError("Magic mismatch")
-            
-            self.count = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_ROW_COUNT))[0])
-            self.dir_off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_DIR_OFFSET))[0])
-            
-            num_regions = 2 + (len(schema.columns) - 1) + 1 # PK, W, N-1 Cols, B
-            self.dir_checksums = [r_uint64(0)] * num_regions
-            self.region_validated = [False] * num_regions
-
-            def init_region(idx):
-                base = rffi.ptradd(self.ptr, self.dir_off + (idx * layout.DIR_ENTRY_SIZE))
-                off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, base)[0])
-                sz = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0])
-                cs = rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0])
+            # Wrap initialization in try-block to ensure munmap on failure (Resource Leak Fix)
+            try:
+                if rffi.cast(rffi.ULONGLONGP, self.ptr)[0] != layout.MAGIC_NUMBER:
+                    raise errors.CorruptShardError("Magic mismatch")
                 
-                if off + sz > self.size:
-                    raise errors.CorruptShardError("Region metadata points outside file")
-
-                self.dir_checksums[idx] = r_uint64(cs)
-                buf_ptr = rffi.ptradd(self.ptr, off)
+                self.count = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_ROW_COUNT))[0])
+                self.dir_off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_DIR_OFFSET))[0])
                 
-                # Eagerly validate PK and W for structural integrity if requested
-                if validate_checksums and idx < 2 and sz > 0:
-                    if checksum.compute_checksum(buf_ptr, sz) != cs:
-                        raise errors.CorruptShardError("Checksum mismatch in region %d" % idx)
-                    self.region_validated[idx] = True
+                num_regions = 2 + (len(schema.columns) - 1) + 1 # PK, W, N-1 Cols, B
+                self.dir_checksums = [r_uint64(0)] * num_regions
+                self.region_validated = [False] * num_regions
+
+                def init_region(idx):
+                    base = rffi.ptradd(self.ptr, self.dir_off + (idx * layout.DIR_ENTRY_SIZE))
+                    off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, base)[0])
+                    sz = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0])
+                    cs = rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0])
                     
-                return buffer.MappedBuffer(buf_ptr, sz)
+                    if off + sz > self.size:
+                        raise errors.CorruptShardError("Region metadata points outside file")
 
-            self.pk_buf = init_region(0)
-            self.w_buf = init_region(1)
-            
-            self.col_bufs = [None] * len(schema.columns)
-            reg_idx = 2
-            for i in range(len(schema.columns)):
-                if i == schema.pk_index: continue
-                self.col_bufs[i] = init_region(reg_idx)
-                reg_idx += 1
-            
-            self.blob_buf = init_region(reg_idx)
-            self.blob_reg_idx = reg_idx
-            self.buf_b = self.blob_buf 
+                    self.dir_checksums[idx] = r_uint64(cs)
+                    buf_ptr = rffi.ptradd(self.ptr, off)
+                    
+                    # [PERF] Eagerly validate PK and W for structural integrity ONLY if requested
+                    # This prevents "Stop-the-World" on file open
+                    if self.validate_on_access and idx < 2 and sz > 0:
+                        if checksum.compute_checksum(buf_ptr, sz) != cs:
+                            raise errors.CorruptShardError("Checksum mismatch in region %d" % idx)
+                        self.region_validated[idx] = True
+                        
+                    return buffer.MappedBuffer(buf_ptr, sz)
+
+                self.pk_buf = init_region(0)
+                self.w_buf = init_region(1)
+                
+                self.col_bufs = [None] * len(schema.columns)
+                reg_idx = 2
+                for i in range(len(schema.columns)):
+                    if i == schema.pk_index: continue
+                    self.col_bufs[i] = init_region(reg_idx)
+                    reg_idx += 1
+                
+                self.blob_buf = init_region(reg_idx)
+                self.blob_reg_idx = reg_idx
+                self.buf_b = self.blob_buf 
+
+            except Exception:
+                # Critical: Unmap memory if header/region validation fails
+                mmap_posix.munmap_file(self.ptr, self.size)
+                self.ptr = lltype.nullptr(rffi.CCHARP.TO)
+                raise
             
         finally:
             rposix.close(fd)
@@ -100,11 +109,6 @@ class TableShardView(object):
         high = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
         return (r_uint128(high) << 64) | r_uint128(low)
 
-    def get_entity_id(self, index): 
-        if self.schema.get_pk_column().field_type.size == 16:
-            return rffi.cast(lltype.Signed, self.get_pk_u128(index) & r_uint128(0xFFFFFFFFFFFFFFFF))
-        return rffi.cast(lltype.Signed, self.get_pk_u64(index))
-
     def get_weight(self, index):
         if self.count == 0 or index >= self.count: return 0
         self._check_region(self.w_buf, 1)
@@ -134,9 +138,8 @@ class TableShardView(object):
         ptr = self.get_col_ptr(row_idx, col_idx)
         if not ptr: return False
         self._check_region(self.blob_buf, self.blob_reg_idx)
-        from gnitz.core.strings import compute_prefix, string_equals
-        prefix = compute_prefix(search_str)
-        return string_equals(ptr, self.blob_buf.ptr, search_str, len(search_str), prefix)
+        prefix = string_logic.compute_prefix(search_str)
+        return string_logic.string_equals(ptr, self.blob_buf.ptr, search_str, len(search_str), prefix)
 
     def find_row_index(self, key):
         low = 0

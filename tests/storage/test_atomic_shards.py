@@ -27,7 +27,8 @@ class TestAtomicShards(unittest.TestCase):
         
         view = shard_ecs.ECSShardView(self.shard_path, self.layout)
         self.assertEqual(view.count, 1)
-        self.assertEqual(view.get_entity_id(0), 123)
+        # Fixed: use get_pk_u64 instead of get_entity_id
+        self.assertEqual(view.get_pk_u64(0), 123)
         # Column 1 is the payload I64
         self.assertEqual(view.read_field_i64(0, 1), 456)
         view.close()
@@ -43,7 +44,8 @@ class TestAtomicShards(unittest.TestCase):
         
         view = shard_ecs.ECSShardView(self.shard_path, self.layout)
         self.assertEqual(view.count, 1)
-        self.assertEqual(view.get_entity_id(0), 2)
+        # Fixed: use get_pk_u64 instead of get_entity_id
+        self.assertEqual(view.get_pk_u64(0), 2)
         view.close()
 
 if __name__ == '__main__':

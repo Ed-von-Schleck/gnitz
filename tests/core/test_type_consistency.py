@@ -29,5 +29,6 @@ class TestTypeConsistency(unittest.TestCase):
         writer.finalize(self.s_fn)
         view = shard_ecs.ECSShardView(self.s_fn, self.layout)
         self.assertEqual(view.count, 1)
-        self.assertEqual(view.get_entity_id(0), 1)
+        # Fixed: use get_pk_u64 instead of get_entity_id
+        self.assertEqual(view.get_pk_u64(0), 1)
         view.close()

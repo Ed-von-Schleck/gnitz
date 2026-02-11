@@ -33,8 +33,10 @@ class TestFullIntegrity(unittest.TestCase):
             f.seek(b_offset)
             f.write(b'\xFF\xFF\xFF')
 
-        view = shard_ecs.ECSShardView(self.shard_path, self.layout)
-        self.assertEqual(view.get_entity_id(0), 1)
+        # Fixed: Explicitly enable checksums to test integrity validation
+        view = shard_ecs.ECSShardView(self.shard_path, self.layout, validate_checksums=True)
+        # Fixed: use get_pk_u64 instead of get_entity_id
+        self.assertEqual(view.get_pk_u64(0), 1)
 
         # Triggers lazy Region B validation
         with self.assertRaises(errors.CorruptShardError):
