@@ -54,25 +54,15 @@ def node_set_weight(base_ptr, node_off, weight):
 def node_get_key(base_ptr, node_off, key_size):
     """
     Get the primary key of a node.
-    
-    Args:
-        base_ptr: Arena base pointer
-        node_off: Offset to node in arena
-        key_size: Size of key (8 for u64, 16 for u128)
-        
-    Returns:
-        r_uint128 key (even for u64, zero-extended)
     """
     height = ord(base_ptr[node_off + 8])
     ptr = rffi.ptradd(base_ptr, node_off + 12 + (height * 4))
     
     if key_size == 16:
-        # u128 key: read both halves
         lo = rffi.cast(rffi.ULONGLONGP, ptr)[0]
         hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
         return (r_uint128(hi) << 64) | r_uint128(lo)
     else:
-        # u64 key: zero-extend to u128
         key64 = rffi.cast(rffi.ULONGLONGP, ptr)[0]
         return r_uint128(key64)
 
@@ -91,7 +81,7 @@ def compare_payloads(schema, ptr1, heap1, ptr2, heap2):
         if i >= len(schema.columns):
             break
         if i == schema.pk_index:
-            continue  # Skip PK column
+            continue
         
         f_type = schema.columns[i].field_type
         f_off = schema.get_column_offset(i)
@@ -112,7 +102,6 @@ def compare_payloads(schema, ptr1, heap1, ptr2, heap2):
 def unpack_payload_to_values(memtable_inst, node_off):
     """
     Decodes a raw payload pointer back into DBValue objects.
-    Used for ZSet inspection and distribution.
     """
     from gnitz.core import values, strings as string_logic
     base = memtable_inst.arena.base_ptr
@@ -121,7 +110,6 @@ def unpack_payload_to_values(memtable_inst, node_off):
     schema = memtable_inst.schema
     res = []
     
-    # Iterate through schema columns, skipping PK
     for i in range(len(schema.columns)):
         if i == schema.pk_index:
             continue
@@ -135,11 +123,9 @@ def unpack_payload_to_values(memtable_inst, node_off):
             if length == 0:
                 res.append(values.StringValue(""))
             elif length <= string_logic.SHORT_STRING_THRESHOLD:
-                # Inline strings start at offset 4 (Prefix included in data)
                 s_bytes = rffi.charpsize2str(rffi.ptradd(f_ptr, 4), length)
                 res.append(values.StringValue(s_bytes))
             else:
-                # Long strings follow the heap offset at Bytes 8-15
                 u64_payload = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(f_ptr, 8))
                 blob_off = rffi.cast(lltype.Signed, u64_payload[0])
                 blob_ptr = rffi.ptradd(blob_base, blob_off)
@@ -148,7 +134,6 @@ def unpack_payload_to_values(memtable_inst, node_off):
         elif col_def.field_type == types.TYPE_I64:
             val = rffi.cast(rffi.LONGLONGP, f_ptr)[0]
             res.append(values.IntValue(val))
-        # Add other type handling as needed
     return res
 
 
@@ -193,6 +178,36 @@ class MemTable(object):
             rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = max_u64
         else:
             rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = max_u64
+
+    def ensure_capacity(self, field_values):
+        """
+        Conservative check to see if a record can fit in current arenas.
+        Assumes worst-case tower height for the SkipList node.
+        """
+        # Worst-case node size (MAX_HEIGHT tower)
+        node_sz = self.node_base_size + (MAX_HEIGHT * 4)
+
+        # Calculate exact string overflow requirements
+        blob_sz = 0
+        arg_idx = 0
+        for i in range(len(self.schema.columns)):
+            if i == self.schema.pk_index: continue
+            if arg_idx >= len(field_values): break
+            
+            val_obj = field_values[arg_idx]
+            if self.schema.columns[i].field_type == types.TYPE_STRING:
+                if isinstance(val_obj, values.StringValue): s = val_obj.v
+                elif isinstance(val_obj, str): s = val_obj
+                else: s = str(val_obj)
+                
+                if len(s) > string_logic.SHORT_STRING_THRESHOLD:
+                    blob_sz += len(s)
+            arg_idx += 1
+
+        # Alignment overhead buffer (conservatively add 16 bytes per allocation)
+        if (self.arena.offset + node_sz + 16 > self.arena.size or
+            self.blob_arena.offset + blob_sz + 16 > self.blob_arena.size):
+            raise errors.MemTableFullError()
 
     def _pack_values(self, dest_ptr, values_list):
         payload_idx = 0
@@ -281,7 +296,6 @@ class MemTable(object):
                                                  p2, self.blob_arena.base_ptr)
                 if res != 0: return res
             else:
-                # Byte-wise comparison for now
                 for b in range(f_type.size):
                     if p1[b] < p2[b]: return -1
                     if p1[b] > p2[b]: return 1
@@ -342,9 +356,7 @@ class MemTable(object):
                 h += 1
             
             node_sz = self.node_base_size + (h * 4)
-            if self.arena.offset + node_sz > self.arena.size:
-                raise errors.MemTableFullError()
-            
+            # Allocation is guaranteed by pre-check in MemTableManager.put
             new_ptr = self.arena.alloc(node_sz)
             new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
             
@@ -409,16 +421,26 @@ class MemTableManager(object):
         self.starting_lsn = r_uint64(1)
 
     def put(self, key, weight, field_values):
-        try:
-            self.active_table.upsert(r_uint128(key), weight, field_values)
-        except errors.MemTableFullError:
-            raise
+        """
+        Transactional Z-Set Ingestion:
+        1. Pre-check memory capacity.
+        2. Assign Log Sequence Number.
+        3. Write to durable WAL.
+        4. Update in-memory state.
+        """
+        # Phase 1: Capacity validation (Preventive)
+        self.active_table.ensure_capacity(field_values)
         
+        # Phase 2: Sequencing
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
         
+        # Phase 3: Durability (Must precede visibility)
         if self.wal_writer:
             self.wal_writer.append_block(lsn, self.component_id, [(key, weight, field_values)])
+        
+        # Phase 4: Visibility
+        self.active_table.upsert(r_uint128(key), weight, field_values)
 
     def flush_and_rotate(self, filename):
         self.active_table.flush(filename)
