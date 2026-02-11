@@ -14,25 +14,27 @@ class TableShardView(object):
 
     def __init__(self, filename, schema, validate_checksums=False):
         self.schema = schema
-        fd = rposix.open(filename, os.O_RDONLY, 0)
-        self.ptr = lltype.nullptr(rffi.CCHARP.TO)
         self.validate_on_access = validate_checksums
+        self.ptr = lltype.nullptr(rffi.CCHARP.TO)
+        self.size = 0
         
+        fd = rposix.open(filename, os.O_RDONLY, 0)
         try:
             st = os.fstat(fd)
             self.size = st.st_size
             if self.size < layout.HEADER_SIZE:
                 raise errors.CorruptShardError("File too small for header")
 
-            self.ptr = mmap_posix.mmap_file(fd, self.size, mmap_posix.PROT_READ, mmap_posix.MAP_SHARED)
-            
-            # Wrap initialization in try-block to ensure munmap on failure (Resource Leak Fix)
+            # Mmap the file
+            ptr = mmap_posix.mmap_file(fd, self.size, mmap_posix.PROT_READ, mmap_posix.MAP_SHARED)
             try:
-                if rffi.cast(rffi.ULONGLONGP, self.ptr)[0] != layout.MAGIC_NUMBER:
+                # Validation Barrier
+                if rffi.cast(rffi.ULONGLONGP, ptr)[0] != layout.MAGIC_NUMBER:
                     raise errors.CorruptShardError("Magic mismatch")
                 
-                self.count = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_ROW_COUNT))[0])
-                self.dir_off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, layout.OFF_DIR_OFFSET))[0])
+                self.ptr = ptr
+                self.count = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, layout.OFF_ROW_COUNT))[0])
+                self.dir_off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, layout.OFF_DIR_OFFSET))[0])
                 
                 num_regions = 2 + (len(schema.columns) - 1) + 1 # PK, W, N-1 Cols, B
                 self.dir_checksums = [r_uint64(0)] * num_regions
@@ -50,8 +52,6 @@ class TableShardView(object):
                     self.dir_checksums[idx] = r_uint64(cs)
                     buf_ptr = rffi.ptradd(self.ptr, off)
                     
-                    # [PERF] Eagerly validate PK and W for structural integrity ONLY if requested
-                    # This prevents "Stop-the-World" on file open
                     if self.validate_on_access and idx < 2 and sz > 0:
                         if checksum.compute_checksum(buf_ptr, sz) != cs:
                             raise errors.CorruptShardError("Checksum mismatch in region %d" % idx)
@@ -74,11 +74,8 @@ class TableShardView(object):
                 self.buf_b = self.blob_buf 
 
             except Exception:
-                # Critical: Unmap memory if header/region validation fails
-                mmap_posix.munmap_file(self.ptr, self.size)
-                self.ptr = lltype.nullptr(rffi.CCHARP.TO)
+                mmap_posix.munmap_file(ptr, self.size)
                 raise
-            
         finally:
             rposix.close(fd)
 
@@ -120,7 +117,6 @@ class TableShardView(object):
         buf = self.col_bufs[col_idx]
         if not buf: return lltype.nullptr(rffi.CCHARP.TO)
         
-        # Calculate region index for column buffers (starts at 2, skips PK)
         actual_reg_idx = 2
         for i in range(col_idx):
             if i != self.schema.pk_index: actual_reg_idx += 1
@@ -167,4 +163,3 @@ class TableShardView(object):
         if self.ptr:
             mmap_posix.munmap_file(self.ptr, self.size)
             self.ptr = lltype.nullptr(rffi.CCHARP.TO)
-

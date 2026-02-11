@@ -14,20 +14,26 @@ class WALReader(object):
         self._open_file()
     
     def _open_file(self):
-        if self.fd != -1:
-            rposix.close(self.fd)
-        
-        self.fd = rposix.open(self.filename, os.O_RDONLY, 0)
-        st = os.fstat(self.fd)
-        self.last_inode = rffi.cast(rffi.LONGLONG, st.st_ino)
+        # Open to a local variable first to prevent leaks on validation failure
+        fd = rposix.open(self.filename, os.O_RDONLY, 0)
+        try:
+            st = os.fstat(fd)
+            
+            # If we were already open (rotation), close the old one now
+            if self.fd != -1:
+                rposix.close(self.fd)
+                
+            self.fd = fd
+            self.last_inode = rffi.cast(rffi.LONGLONG, st.st_ino)
+        except Exception:
+            rposix.close(fd)
+            raise
 
     def _has_rotated(self):
         try:
             st = os.stat(self.filename)
             return rffi.cast(rffi.LONGLONG, st.st_ino) != self.last_inode
         except OSError as e:
-            # If the file is missing during a rotation/rename race,
-            # we assume the rotation hasn't completed yet.
             if e.errno == errno.ENOENT:
                 return False
             raise e
@@ -79,6 +85,7 @@ class WALReader(object):
         if not self.closed:
             if self.fd != -1:
                 rposix.close(self.fd)
+                self.fd = -1
             self.closed = True
 
 class WALWriter(object):
@@ -86,10 +93,15 @@ class WALWriter(object):
         self.filename = filename
         self.schema = schema
         self.closed = False
-        self.fd = rposix.open(filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        if not mmap_posix.try_lock_exclusive(self.fd):
-            rposix.close(self.fd)
-            raise errors.StorageError("WAL locked by another process")
+        
+        fd = rposix.open(filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            if not mmap_posix.try_lock_exclusive(fd):
+                raise errors.StorageError("WAL locked by another process")
+            self.fd = fd
+        except Exception:
+            rposix.close(fd)
+            raise
     
     def append_block(self, lsn, table_id, records):
         if self.closed: raise errors.StorageError("WAL writer closed")
@@ -117,13 +129,20 @@ class WALWriter(object):
         rposix.close(self.fd)
         os.rename(tmp_name, self.filename)
         
-        self.fd = rposix.open(self.filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        if not mmap_posix.try_lock_exclusive(self.fd):
-             raise errors.StorageError("Failed to re-lock WAL after truncation")
+        # Re-open and lock
+        fd = rposix.open(self.filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            if not mmap_posix.try_lock_exclusive(fd):
+                 raise errors.StorageError("Failed to re-lock WAL after truncation")
+            self.fd = fd
+        except Exception:
+            rposix.close(fd)
+            raise
 
     def close(self):
         if not self.closed:
             mmap_posix.fsync_c(self.fd)
             mmap_posix.unlock_file(self.fd)
             rposix.close(self.fd)
+            self.fd = -1
             self.closed = True

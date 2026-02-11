@@ -45,17 +45,21 @@ def _write_manifest_header(fd, entry_count, global_max_lsn=r_uint64(0)):
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_VERSION))[0] = rffi.cast(rffi.ULONGLONG, VERSION)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_ENTRY_COUNT))[0] = rffi.cast(rffi.ULONGLONG, entry_count)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_GLOBAL_MAX_LSN))[0] = rffi.cast(rffi.ULONGLONG, global_max_lsn)
-        os.write(fd, rffi.charpsize2str(header, HEADER_SIZE))
+        # Using rposix for consistency
+        mmap_posix.write_c(fd, header, rffi.cast(rffi.SIZE_T, HEADER_SIZE))
     finally: lltype.free(header, flavor='raw')
 
 def _read_manifest_header(fd):
     header = lltype.malloc(rffi.CCHARP.TO, HEADER_SIZE, flavor='raw')
     try:
-        read_bytes = os.read(fd, HEADER_SIZE)
-        if len(read_bytes) != HEADER_SIZE: raise errors.CorruptShardError("Manifest header too short")
-        for i in range(HEADER_SIZE): header[i] = read_bytes[i]
+        # Use low-level read to avoid buffer issues in RPython
+        res = rposix.read(fd, HEADER_SIZE)
+        if len(res) != HEADER_SIZE: raise errors.CorruptShardError("Manifest header too short")
+        for i in range(HEADER_SIZE): header[i] = res[i]
+        
         magic_val = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_MAGIC))[0]
         if magic_val != MAGIC_NUMBER: raise errors.CorruptShardError("Magic mismatch")
+        
         version = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_VERSION))[0])
         entry_count = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_ENTRY_COUNT))[0])
         global_max_lsn = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_GLOBAL_MAX_LSN))[0]
@@ -86,15 +90,16 @@ def _write_manifest_entry(fd, entry):
         fn_len = len(fn)
         if fn_len > FILENAME_MAX_LEN - 1: fn_len = FILENAME_MAX_LEN - 1
         for i in range(fn_len): entry_buf[OFF_FILENAME + i] = fn[i]
-        os.write(fd, rffi.charpsize2str(entry_buf, ENTRY_SIZE))
+        mmap_posix.write_c(fd, entry_buf, rffi.cast(rffi.SIZE_T, ENTRY_SIZE))
     finally: lltype.free(entry_buf, flavor='raw')
 
 def _read_manifest_entry(fd):
     entry_buf = lltype.malloc(rffi.CCHARP.TO, ENTRY_SIZE, flavor='raw')
     try:
-        read_bytes = os.read(fd, ENTRY_SIZE)
-        if len(read_bytes) < ENTRY_SIZE: return None
-        for i in range(ENTRY_SIZE): entry_buf[i] = read_bytes[i]
+        res = rposix.read(fd, ENTRY_SIZE)
+        if len(res) < ENTRY_SIZE: return None
+        for i in range(ENTRY_SIZE): entry_buf[i] = res[i]
+        
         tid = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_TABLE_ID))[0])
         
         min_ptr = rffi.ptradd(entry_buf, OFF_MIN_KEY)
@@ -120,11 +125,21 @@ def _read_manifest_entry(fd):
 class ManifestReader(object):
     def __init__(self, filename):
         self.filename = filename
-        self.fd = rposix.open(filename, os.O_RDONLY, 0)
-        st = os.fstat(self.fd)
-        self.last_inode = st.st_ino
-        self.last_mtime = st.st_mtime
-        self.version, self.entry_count, self.global_max_lsn = _read_manifest_header(self.fd)
+        fd = rposix.open(filename, os.O_RDONLY, 0)
+        try:
+            st = os.fstat(fd)
+            # Validation barrier
+            version, entry_count, global_max_lsn = _read_manifest_header(fd)
+            
+            self.fd = fd
+            self.last_inode = st.st_ino
+            self.last_mtime = st.st_mtime
+            self.version = version
+            self.entry_count = entry_count
+            self.global_max_lsn = global_max_lsn
+        except Exception:
+            rposix.close(fd)
+            raise
 
     def has_changed(self):
         try:
@@ -132,27 +147,42 @@ class ManifestReader(object):
             if st.st_ino != self.last_inode or st.st_mtime != self.last_mtime:
                 return True
         except OSError as e:
-            # If the manifest is missing during a swap, we must assume it's changed.
             if e.errno == errno.ENOENT:
                 return True
             raise e
         return False
 
     def reload(self):
-        rposix.close(self.fd)
-        self.fd = rposix.open(self.filename, os.O_RDONLY, 0)
-        st = os.fstat(self.fd)
-        self.last_inode = st.st_ino
-        self.last_mtime = st.st_mtime
-        self.version, self.entry_count, self.global_max_lsn = _read_manifest_header(self.fd)
+        fd = rposix.open(self.filename, os.O_RDONLY, 0)
+        try:
+            st = os.fstat(fd)
+            version, entry_count, global_max_lsn = _read_manifest_header(fd)
+            
+            # Close old
+            rposix.close(self.fd)
+            
+            self.fd = fd
+            self.last_inode = st.st_ino
+            self.last_mtime = st.st_mtime
+            self.version = version
+            self.entry_count = entry_count
+            self.global_max_lsn = global_max_lsn
+        except Exception:
+            rposix.close(fd)
+            raise
 
     def get_entry_count(self): return self.entry_count
+    
     def iterate_entries(self):
         rposix.lseek(self.fd, HEADER_SIZE, 0)
         for _ in range(self.entry_count):
             entry = _read_manifest_entry(self.fd)
             if entry: yield entry
-    def close(self): rposix.close(self.fd)
+            
+    def close(self):
+        if self.fd != -1:
+            rposix.close(self.fd)
+            self.fd = -1
 
 class ManifestWriter(object):
     def __init__(self, filename, global_max_lsn=r_uint64(0)):
@@ -175,7 +205,9 @@ class ManifestWriter(object):
         try:
             _write_manifest_header(fd, len(self.entries), self.global_max_lsn)
             for e in self.entries: _write_manifest_entry(fd, e)
-        finally: rposix.close(fd)
+            mmap_posix.fsync_c(fd)
+        finally:
+            rposix.close(fd)
         self.finalized = True
 
 class ManifestManager(object):
