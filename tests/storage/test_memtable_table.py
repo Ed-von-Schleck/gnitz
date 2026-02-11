@@ -1,7 +1,7 @@
 import unittest
 import os
 from gnitz.core import types, values as db_values
-from gnitz.storage import memtable, shard_table
+from gnitz.storage import memtable_manager, shard_table
 
 class TestMemTableECS(unittest.TestCase):
     def setUp(self):
@@ -10,7 +10,7 @@ class TestMemTableECS(unittest.TestCase):
             types.ColumnDefinition(types.TYPE_U64), 
             types.ColumnDefinition(types.TYPE_STRING)
         ], 0)
-        self.mgr = memtable.MemTableManager(self.layout, 1024 * 1024)
+        self.mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024)
 
     def tearDown(self):
         self.mgr.close()

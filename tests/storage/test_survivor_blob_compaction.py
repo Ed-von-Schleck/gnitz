@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.storage import memtable, shard_table
+from gnitz.storage import memtable_manager, shard_table
 from gnitz.core import types, values as db_values
 
 class TestSurvivorBlobCompaction(unittest.TestCase):
@@ -25,7 +25,7 @@ class TestSurvivorBlobCompaction(unittest.TestCase):
         are NOT copied to the persistent shard's Blob Region.
         """
         # 1. Setup MemTable
-        mgr = memtable.MemTableManager(self.layout, 1024 * 1024)
+        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024)
         
         # Create strings larger than 12 bytes to force Blob Heap usage
         long_str_annihilated = "DEAD" * 5  # 20 bytes

@@ -7,10 +7,7 @@ try:
 except ImportError:
     r_uint128 = long
 
-from gnitz.storage.memtable import (
-    node_get_weight, node_get_next_off, 
-    node_get_payload_ptr
-)
+from gnitz.storage.memtable_node import node_get_weight
 from gnitz.storage import wal, manifest, errors, spine, mmap_posix, comparator
 from gnitz.core import types
 
@@ -59,39 +56,26 @@ class Engine(object):
             if e.errno != errno.ENOENT:
                 raise e
 
-    def get_effective_weight_raw(self, key, packed_payload_ptr, payload_heap_ptr):
+    def get_effective_weight_raw(self, key, field_values):
         """
-        Calculates net weight by reconciling MemTable (AoS) and Shards (SoA).
-        Uses centralized comparator to ensure semantic consistency.
+        Calculates net weight for a specific key and payload across the 
+        hierarchy using DBValue comparisons.
         """
-        # 1. Check MemTable (AoS vs AoS)
+        # 1. Check MemTable
         mem_weight = 0
         table = self.mem_manager.active_table
-        pred_off = table._find_exact(key, packed_payload_ptr, payload_heap_ptr)
-        curr_off = node_get_next_off(table.arena.base_ptr, pred_off, 0)
-        
-        while curr_off != 0:
-            if table._get_node_key(curr_off) != key: 
-                break
-            
-            payload = node_get_payload_ptr(table.arena.base_ptr, curr_off, table.key_size)
-            if comparator.compare_payloads(self.schema, payload, table.blob_arena.base_ptr, 
-                                           packed_payload_ptr, payload_heap_ptr) == 0:
-                mem_weight += node_get_weight(table.arena.base_ptr, curr_off)
-            curr_off = node_get_next_off(table.arena.base_ptr, curr_off, 0)
+        match_off = table._find_exact_values(key, field_values)
+        if match_off != 0:
+            mem_weight = node_get_weight(table.arena.base_ptr, match_off)
 
-        # 2. Check Persistent Shards (SoA vs AoS)
+        # 2. Check Persistent Shards
         spine_weight = 0
         results = self.spine.find_all_shards_and_indices(key)
         for shard_handle, row_idx in results:
-            if comparator.compare_soa_to_packed(self.schema, shard_handle.view, row_idx, 
-                                               packed_payload_ptr, payload_heap_ptr) == 0:
+            if comparator.compare_soa_to_values(self.schema, shard_handle.view, row_idx, field_values) == 0:
                 spine_weight += shard_handle.get_weight(row_idx)
                 
         return mem_weight + spine_weight
-
-    def get_effective_weight(self, key, packed_payload_ptr, payload_heap_ptr):
-        return self.get_effective_weight_raw(key, packed_payload_ptr, payload_heap_ptr)
 
     def flush_and_rotate(self, filename):
         self.current_lsn = self.mem_manager.current_lsn

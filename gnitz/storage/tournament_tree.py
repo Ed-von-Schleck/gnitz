@@ -4,7 +4,7 @@ try:
     from rpython.rlib.rarithmetic import r_uint128
 except ImportError:
     r_uint128 = long
-from rpython.rlib.jit import unrolling_iterable
+from rpython.rlib import jit
 from gnitz.core import types
 
 class StreamCursor(object):
@@ -110,15 +110,31 @@ class TournamentTree(object):
         return self.get_min_key()
 
     def get_all_cursors_at_min(self):
-        """ Returns all cursors that point to the current minimum key. """
+        """ 
+        Returns all cursors that point to the current minimum key.
+        Optimized O(K log N) traversal where K is the number of matching keys.
+        """
         results = []
-        if self.heap_size == 0: return results
+        if self.heap_size == 0: 
+            return results
+        
         target = self.get_min_key()
-        # In a min-heap, we have to check multiple nodes if keys are equal
-        for i in range(self.num_cursors):
-            if not self.cursors[i].is_exhausted() and self.cursors[i].peek_key() == target:
-                results.append(self.cursors[i])
+        self._collect_equal_keys(0, target, results)
         return results
+
+    @jit.unroll_safe
+    def _collect_equal_keys(self, idx, target, results):
+        """ Recursively collects cursors from the heap that match the target key. """
+        if idx >= self.heap_size:
+            return
+        
+        if self._get_key(idx) == target:
+            c_idx = rffi.cast(lltype.Signed, self.heap[idx].cursor_idx)
+            results.append(self.cursors[c_idx])
+            
+            # Check children
+            self._collect_equal_keys(2 * idx + 1, target, results)
+            self._collect_equal_keys(2 * idx + 2, target, results)
     
     def advance_min_cursors(self, target_key=None):
         if target_key is None: target_key = self.get_min_key()

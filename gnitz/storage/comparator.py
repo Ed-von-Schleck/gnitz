@@ -1,21 +1,47 @@
 from rpython.rlib import jit
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import types, strings as string_logic
+from gnitz.core import types, strings as string_logic, values as db_values
 
 _MAX_COLUMNS = 64
 _COLUMN_ITERABLE = jit.unrolling_iterable(range(_MAX_COLUMNS))
 
 @jit.unroll_safe
-def compare_payloads(schema, ptr1, heap1, ptr2, heap2):
-    """Compare two packed (AoS) rows."""
+def compare_values_to_packed(schema, values, packed_ptr, heap_ptr):
+    """Dry-run comparison: DBValue list vs Packed Node payload."""
+    val_idx = 0
     for i in _COLUMN_ITERABLE:
         if i >= len(schema.columns): break
         if i == schema.pk_index: continue
         
+        val_obj = values[val_idx]
+        val_idx += 1
+        
         f_type = schema.columns[i].field_type
         f_off = schema.get_column_offset(i)
-        p1, p2 = rffi.ptradd(ptr1, f_off), rffi.ptradd(ptr2, f_off)
+        p_node = rffi.ptradd(packed_ptr, f_off)
         
+        if f_type == types.TYPE_STRING:
+            res = string_logic.compare_db_value_to_german(val_obj, p_node, heap_ptr)
+            if res != 0: return res
+        elif f_type == types.TYPE_F64:
+            v_obj = val_obj.v if isinstance(val_obj, db_values.FloatValue) else 0.0
+            v_node = float(rffi.cast(rffi.DOUBLEP, p_node)[0])
+            if v_node < v_obj: return 1
+            if v_node > v_obj: return -1
+        else:
+            v_obj = int(val_obj.v) if isinstance(val_obj, db_values.IntValue) else 0
+            v_node = int(rffi.cast(rffi.LONGLONGP, p_node)[0])
+            if v_node < v_obj: return 1
+            if v_node > v_obj: return -1
+    return 0
+
+@jit.unroll_safe
+def compare_payloads(schema, ptr1, heap1, ptr2, heap2):
+    for i in _COLUMN_ITERABLE:
+        if i >= len(schema.columns): break
+        if i == schema.pk_index: continue
+        f_type, f_off = schema.columns[i].field_type, schema.get_column_offset(i)
+        p1, p2 = rffi.ptradd(ptr1, f_off), rffi.ptradd(ptr2, f_off)
         if f_type == types.TYPE_STRING:
             res = string_logic.string_compare(p1, heap1, p2, heap2)
             if res != 0: return res
@@ -27,44 +53,43 @@ def compare_payloads(schema, ptr1, heap1, ptr2, heap2):
 
 @jit.unroll_safe
 def compare_soa_rows(schema, view1, idx1, view2, idx2):
-    """Compare two rows residing in SoA Shards."""
     for i in _COLUMN_ITERABLE:
         if i >= len(schema.columns): break
         if i == schema.pk_index: continue
-        
-        p1 = view1.get_col_ptr(idx1, i)
-        p2 = view2.get_col_ptr(idx2, i)
+        p1, p2 = view1.get_col_ptr(idx1, i), view2.get_col_ptr(idx2, i)
         h1, h2 = view1.blob_buf.ptr, view2.blob_buf.ptr
-        
-        f_type = schema.columns[i].field_type
-        if f_type == types.TYPE_STRING:
+        if schema.columns[i].field_type == types.TYPE_STRING:
             res = string_logic.string_compare(p1, h1, p2, h2)
             if res != 0: return res
         else:
-            for j in range(f_type.size):
+            for j in range(schema.columns[i].field_type.size):
                 if p1[j] < p2[j]: return -1
                 if p1[j] > p2[j]: return 1
     return 0
 
 @jit.unroll_safe
-def compare_soa_to_packed(schema, view, idx, packed_ptr, packed_heap):
-    """Compare a Shard row (SoA) against a packed (AoS) row."""
+def compare_soa_to_values(schema, view, idx, values):
+    p_node = view.get_col_ptr(idx, 0) # This is dummy, logic below uses specific col pointers
+    # Reuse values-to-packed logic by wrapping shard access
+    val_idx = 0
     for i in _COLUMN_ITERABLE:
         if i >= len(schema.columns): break
         if i == schema.pk_index: continue
-        
-        p1 = view.get_col_ptr(idx, i)
-        h1 = view.blob_buf.ptr
-        
-        f_off = schema.get_column_offset(i)
-        p2 = rffi.ptradd(packed_ptr, f_off)
-        
+        val_obj = values[val_idx]
+        val_idx += 1
         f_type = schema.columns[i].field_type
+        p_shard = view.get_col_ptr(idx, i)
         if f_type == types.TYPE_STRING:
-            res = string_logic.string_compare(p1, h1, p2, packed_heap)
+            res = string_logic.compare_db_value_to_german(val_obj, p_shard, view.blob_buf.ptr)
             if res != 0: return res
+        elif f_type == types.TYPE_F64:
+            v_obj = val_obj.v if isinstance(val_obj, db_values.FloatValue) else 0.0
+            v_shard = float(rffi.cast(rffi.DOUBLEP, p_shard)[0])
+            if v_shard < v_obj: return 1
+            if v_shard > v_obj: return -1
         else:
-            for j in range(f_type.size):
-                if p1[j] < p2[j]: return -1
-                if p1[j] > p2[j]: return 1
+            v_obj = int(val_obj.v) if isinstance(val_obj, db_values.IntValue) else 0
+            v_shard = int(rffi.cast(rffi.LONGLONGP, p_shard)[0])
+            if v_shard < v_obj: return 1
+            if v_shard > v_obj: return -1
     return 0

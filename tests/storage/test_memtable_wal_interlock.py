@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.storage import memtable, wal, wal_format
+from gnitz.storage import memtable_manager, wal, wal_format
 from gnitz.core import types, values as db_values
 
 
@@ -25,7 +25,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
     
     def test_memtable_without_wal(self):
         """Test that MemTable works without WAL (backward compatibility)."""
-        mgr = memtable.MemTableManager(self.layout, 1024 * 1024)
+        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024)
         
         # Should work without WAL writer
         self._put(mgr, 1, 1, 100, "test")
@@ -39,7 +39,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
         wal_writer = wal.WALWriter(self.test_wal, self.layout)
         
         # Create MemTable with WAL
-        mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
+        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
         
         # Insert data - should write to WAL first
         self._put(mgr, 10, 1, 100, "first")
@@ -76,7 +76,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
     def test_wal_write_before_memory_update(self):
         """Test that WAL is written BEFORE MemTable is updated."""
         wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
+        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
         
         # Insert one record
         self._put(mgr, 100, 1, 999, "durable")
@@ -92,7 +92,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
     def test_algebraic_consistency(self):
         """Test that WAL weights match MemTable weights."""
         wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
+        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
         
         # Insert with weight +1
         self._put(mgr, 50, 1, 500, "add")
@@ -132,7 +132,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
         """Test crash scenario: WAL exists but MemTable was not flushed."""
         # Phase 1: Write to WAL (simulating crash before flush)
         wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
+        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
         
         self._put(mgr, 1, 1, 111, "pre_crash")
         self._put(mgr, 2, 1, 222, "also_pre_crash")
@@ -162,7 +162,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
     def test_multiple_puts_single_entity(self):
         """Test multiple puts to same entity (algebraic accumulation)."""
         wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
+        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
         
         # Put same entity 3 times with different weights
         self._put(mgr, 100, 1, 10, "v1")
@@ -189,7 +189,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
         wal_writer = wal.WALWriter(self.test_wal, self.layout)
         
         # Create MemTable with specific table_id
-        mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=42)
+        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=42)
         
         self._put(mgr, 1, 1, 100, "test")
         mgr.close()
@@ -206,7 +206,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
     def test_lsn_increments(self):
         """Test that LSN increments with each put."""
         wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        mgr = memtable.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
+        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
         
         # Multiple puts
         for i in range(5):
