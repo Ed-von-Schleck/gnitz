@@ -1,4 +1,5 @@
 from rpython.rlib import jit
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import types, strings as string_logic, values as db_values
 

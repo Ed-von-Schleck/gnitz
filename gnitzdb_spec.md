@@ -726,10 +726,6 @@ Split APIs:
 * High-level layer: object-based.
 * Low-level core: primitive types and raw buffers.
 
-**11.1 Immutable List Initialization**
-When a list is designated as an immutable field (e.g., `columns[*]`), avoid populating it via `.append()` inside `__init__`. The RPython annotator may "freeze" the list's size and type before the loop completes, leading to `ListChangeUnallowed`. 
-*   **Preferred:** Use list comprehensions or pre-allocate with a fixed size: `self.items = [None] * size`.
-
 ## 12. Designing for the Meta-Tracing JIT
 
 The RPython JIT traces interpreter loops.

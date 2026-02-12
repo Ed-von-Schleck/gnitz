@@ -4,88 +4,13 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage import layout, mmap_posix, errors
+from gnitz.storage.raw_buffer import RawBuffer, copy_memory, compare_memory, align_64
 from gnitz.core import checksum
 from gnitz.core import types, strings as string_logic, values as db_values
 
 # Unrolling for JIT performance across schema columns
 FIELD_INDICES = jit.unrolling_iterable(range(64))
-
-def _align_64(val):
-    return (val + 63) & ~63
-
-
-def _copy_memory(dest_ptr, src_ptr, size):
-    for i in range(size):
-        dest_ptr[i] = src_ptr[i]
-
-
-def _compare_memory(p1, p2, size):
-    for i in range(size):
-        if p1[i] != p2[i]:
-            return False
-    return True
-
-
-class RawBuffer(object):
-    """Raw byte buffer for columnar regions."""
-
-    def __init__(self, item_size, initial_capacity=4096):
-        self.item_size = item_size
-        self.count = 0
-        self.capacity = initial_capacity
-        self.ptr = lltype.malloc(
-            rffi.CCHARP.TO, self.capacity * self.item_size, flavor="raw"
-        )
-
-    def ensure_capacity(self, needed_slots):
-        new_count = self.count + needed_slots
-        if new_count > self.capacity:
-            new_cap = max(self.capacity * 2, new_count)
-            new_ptr = lltype.malloc(rffi.CCHARP.TO, new_cap * self.item_size, flavor="raw")
-            if self.ptr:
-                _copy_memory(new_ptr, self.ptr, self.count * self.item_size)
-                lltype.free(self.ptr, flavor="raw")
-            self.ptr = new_ptr
-            self.capacity = new_cap
-
-    def append_u128(self, value):
-        self.ensure_capacity(1)
-        target = rffi.cast(rffi.CCHARP, rffi.ptradd(self.ptr, self.count * 16))
-        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(value))
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(
-            rffi.ULONGLONG, r_uint64(value >> 64)
-        )
-        self.count += 1
-
-    def append_u64(self, value):
-        self.ensure_capacity(1)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(
-            rffi.ULONGLONG, r_uint64(value)
-        )
-        self.count += 1
-
-    def append_i64(self, value):
-        self.ensure_capacity(1)
-        rffi.cast(rffi.LONGLONGP, rffi.ptradd(self.ptr, self.count * 8))[0] = rffi.cast(
-            rffi.LONGLONG, value
-        )
-        self.count += 1
-
-    def append_bytes(self, source_ptr, length_in_items):
-        self.ensure_capacity(length_in_items)
-        dest = rffi.ptradd(self.ptr, self.count * self.item_size)
-        if source_ptr:
-            _copy_memory(dest, source_ptr, length_in_items * self.item_size)
-        else:
-            for i in range(length_in_items * self.item_size):
-                dest[i] = "\x00"
-        self.count += length_in_items
-
-    def free(self):
-        if self.ptr:
-            lltype.free(self.ptr, flavor="raw")
-            self.ptr = lltype.nullptr(rffi.CCHARP.TO)
-
+NULL_CHARP = lltype.nullptr(rffi.CCHARP.TO)
 
 class TableShardWriter(object):
     def __init__(self, schema, table_id=0):
@@ -116,7 +41,7 @@ class TableShardWriter(object):
         if cache_key in self.blob_cache:
             existing_offset = self.blob_cache[cache_key]
             existing_ptr = rffi.ptradd(self.b_buf.ptr, existing_offset)
-            if _compare_memory(src_ptr, existing_ptr, length):
+            if compare_memory(src_ptr, existing_ptr, length):
                 return existing_offset
         new_offset = self.b_buf.count
         self.b_buf.append_bytes(src_ptr, length)
@@ -129,7 +54,8 @@ class TableShardWriter(object):
         col_def = self.schema.columns[col_idx]
 
         if not val_ptr and string_data is None:
-            buf.append_bytes(None, 1)
+            # FIX: Pass explicit nullptr instead of None for RPython safety
+            buf.append_bytes(NULL_CHARP, 1)
             return
 
         if col_def.field_type == types.TYPE_STRING:
@@ -155,7 +81,7 @@ class TableShardWriter(object):
                     new_off = self._get_or_append_blob(blob_src, length)
 
                     # Copy existing metadata (Length, Prefix) and update offset
-                    _copy_memory(self.scratch_val_buf, val_ptr, 16)
+                    copy_memory(self.scratch_val_buf, val_ptr, 16)
                     u64_payload = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.scratch_val_buf, 8))
                     u64_payload[0] = rffi.cast(rffi.ULONGLONG, new_off)
                 else:
@@ -197,7 +123,8 @@ class TableShardWriter(object):
                 continue
 
             col_off = self.schema.get_column_offset(i)
-            val_ptr = rffi.ptradd(packed_row_ptr, col_off) if packed_row_ptr else None
+            # FIX: Use explicit NULL_CHARP for falsy pointer branch
+            val_ptr = rffi.ptradd(packed_row_ptr, col_off) if packed_row_ptr else NULL_CHARP
             self._append_value(i, val_ptr, source_heap_ptr)
 
     @jit.unroll_safe
@@ -222,7 +149,8 @@ class TableShardWriter(object):
                 continue
 
             if val_idx >= len(values_list):
-                self._append_value(i, None, None)
+                # FIX: Explicit NULL_CHARP instead of None
+                self._append_value(i, NULL_CHARP, NULL_CHARP)
                 continue
 
             val_obj = values_list[val_idx]
@@ -230,17 +158,20 @@ class TableShardWriter(object):
             ftype = self.schema.columns[i].field_type
 
             if ftype == types.TYPE_STRING:
-                self._append_value(i, None, None, string_data=val_obj.get_string())
+                # FIX: Explicit NULL_CHARP instead of None
+                self._append_value(i, NULL_CHARP, NULL_CHARP, string_data=val_obj.get_string())
             elif ftype == types.TYPE_F64:
                 rffi.cast(rffi.DOUBLEP, self.scratch_val_buf)[0] = rffi.cast(
                     rffi.DOUBLE, val_obj.get_float()
                 )
-                self._append_value(i, self.scratch_val_buf, None)
+                # FIX: Explicit NULL_CHARP for source_heap_ptr
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
             else:
                 rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)[0] = rffi.cast(
                     rffi.ULONGLONG, val_obj.get_int()
                 )
-                self._append_value(i, self.scratch_val_buf, None)
+                # FIX: Explicit NULL_CHARP for source_heap_ptr
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
 
     def close(self):
         self.pk_buf.free()
@@ -261,9 +192,14 @@ class TableShardWriter(object):
         tmp_filename = filename + ".tmp"
         fd = rposix.open(tmp_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
+            # Dummy tuple for initialization to satisfy RPython annotator (List homogeneity)
+            # Tuple structure: (buffer_ptr, offset, size)
+            dummy_region = (lltype.nullptr(rffi.CCHARP.TO), 0, 0)
+
             # Build region metadata
             num_cols_with_pk_w = 2 + (len(self.col_bufs) - 1)
-            region_list = [None] * (num_cols_with_pk_w + 1)
+            # Use dummy tuple instead of None to prevent UnionError
+            region_list = [dummy_region] * (num_cols_with_pk_w + 1)
 
             region_list[0] = (self.pk_buf.ptr, 0, self.pk_buf.count * self.pk_buf.item_size)
             region_list[1] = (self.w_buf.ptr, 0, self.w_buf.count * 8)
@@ -279,13 +215,13 @@ class TableShardWriter(object):
             num_regions = len(region_list)
             dir_size = num_regions * layout.DIR_ENTRY_SIZE
             dir_offset = layout.HEADER_SIZE
-            current_pos = _align_64(dir_offset + dir_size)
+            current_pos = align_64(dir_offset + dir_size)
 
-            final_regions = [None] * num_regions
+            final_regions = [dummy_region] * num_regions
             for i in range(num_regions):
                 buf_ptr, _, sz = region_list[i]
                 final_regions[i] = (buf_ptr, current_pos, sz)
-                current_pos = _align_64(current_pos + sz)
+                current_pos = align_64(current_pos + sz)
 
             # 1. Write Header
             header = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor="raw")
