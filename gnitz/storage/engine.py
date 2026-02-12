@@ -2,10 +2,7 @@ import os
 import errno
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.storage.memtable_node import node_get_weight
 from gnitz.storage import wal, manifest, errors, spine, mmap_posix, comparator
@@ -47,8 +44,8 @@ class Engine(object):
                 if int(lsn) <= max_lsn_seen: continue
                 
                 last_recovered_lsn = int(lsn)
-                for key, weight, field_values in records:
-                    self.mem_manager.active_table.upsert(key, weight, field_values)
+                for rec in records:
+                    self.mem_manager.active_table.upsert(rec.primary_key, rec.weight, rec.component_data)
             
             self.current_lsn = r_uint64(last_recovered_lsn + 1)
             self.mem_manager.current_lsn = self.current_lsn

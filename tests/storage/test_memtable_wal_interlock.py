@@ -60,16 +60,18 @@ class TestMemTableWALInterlock(unittest.TestCase):
         self.assertTrue(is_valid1)
         self.assertEqual(comp_id1, 1)
         self.assertEqual(len(records1), 1)
-        primary_key1, weight1, _ = records1[0]
-        self.assertEqual(primary_key1, 10)
-        self.assertEqual(weight1, 1)
+        rec1 = records1[0]
+        # Use attribute access
+        self.assertEqual(rec1.primary_key, 10)
+        self.assertEqual(rec1.weight, 1)
         
         is_valid2, lsn2, comp_id2, records2 = reader.read_next_block()
         self.assertTrue(is_valid2)
         self.assertEqual(comp_id2, 1)
-        primary_key2, weight2, _ = records2[0]
-        self.assertEqual(primary_key2, 20)
-        self.assertEqual(weight2, 1)
+        rec2 = records2[0]
+        # Use attribute access
+        self.assertEqual(rec2.primary_key, 20)
+        self.assertEqual(rec2.weight, 1)
         
         reader.close()
     
@@ -113,18 +115,15 @@ class TestMemTableWALInterlock(unittest.TestCase):
         blocks = list(reader.iterate_blocks())
         self.assertEqual(len(blocks), 3)
         
-        # Verify weights in WAL
+        # Verify weights in WAL via attribute access
         _, _, records1 = blocks[0]
-        _, weight1, _ = records1[0]
-        self.assertEqual(weight1, 1)
+        self.assertEqual(records1[0].weight, 1)
         
         _, _, records2 = blocks[1]
-        _, weight2, _ = records2[0]
-        self.assertEqual(weight2, -1)
+        self.assertEqual(records2[0].weight, -1)
         
         _, _, records3 = blocks[2]
-        _, weight3, _ = records3[0]
-        self.assertEqual(weight3, 2)
+        self.assertEqual(records3[0].weight, 2)
         
         reader.close()
     
@@ -150,12 +149,10 @@ class TestMemTableWALInterlock(unittest.TestCase):
         
         # Both records should be in WAL
         _, _, records1 = blocks[0]
-        primary_key1, _, _ = records1[0]
-        self.assertEqual(primary_key1, 1)
+        self.assertEqual(records1[0].primary_key, 1)
         
         _, _, records2 = blocks[1]
-        primary_key2, _, _ = records2[0]
-        self.assertEqual(primary_key2, 2)
+        self.assertEqual(records2[0].primary_key, 2)
         
         reader.close()
     
@@ -179,8 +176,7 @@ class TestMemTableWALInterlock(unittest.TestCase):
         
         # All should have primary_key 100
         for _, _, records in blocks:
-            primary_key, _, _ = records[0]
-            self.assertEqual(primary_key, 100)
+            self.assertEqual(records[0].primary_key, 100)
         
         reader.close()
     

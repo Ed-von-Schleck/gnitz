@@ -1,9 +1,7 @@
 from rpython.rlib.rarithmetic import r_uint64
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage.memtable import MemTable
+from gnitz.storage.wal_format import WALRecord
 
 class MemTableManager(object):
     _immutable_fields_ = ['schema', 'capacity', 'table_id']
@@ -20,7 +18,7 @@ class MemTableManager(object):
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
         if self.wal_writer:
-            self.wal_writer.append_block(lsn, self.table_id, [(key, weight, field_values)])
+            self.wal_writer.append_block(lsn, self.table_id, [WALRecord(key, weight, field_values)])
         self.active_table.upsert(r_uint128(key), weight, field_values)
 
     def flush_and_rotate(self, filename):

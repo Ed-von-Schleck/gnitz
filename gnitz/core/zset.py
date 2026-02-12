@@ -1,10 +1,7 @@
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.storage import memtable_node, spine, engine, manifest, shard_registry, refcount, wal, compactor, memtable_manager
 from gnitz.core import values as db_values, types

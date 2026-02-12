@@ -1,9 +1,6 @@
 from rpython.rlib.rrandom import Random
 from rpython.rlib.rarithmetic import r_uint64
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import arena, writer_table, errors
 from gnitz.storage.memtable_node import (

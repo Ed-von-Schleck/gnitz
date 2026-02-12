@@ -21,8 +21,8 @@ class BoundsError(StorageError):
     """Raised when accessing memory outside defined region bounds."""
     _immutable_fields_ = ['offset', 'length', 'limit']
     
-    def __init__(self, offset=0, length=0, limit=0):
-        # Optional arguments satisfy test_errors.py and RPython translation
+    def __init__(self, offset, length, limit):
+        # RPython requires strict signatures; defaults removed.
         self.offset = offset
         self.length = length
         self.limit = limit

@@ -695,6 +695,12 @@ For:
 
 Do not rely on Python arbitrary precision semantics.
 
+**9.3 128-bit Integers and Frozen Type Constructors**
+
+*   **Naming:** RPython does not provide a standard alias named `r_uint128`. 128-bit integers are natively supported as `r_ulonglonglong` (unsigned) and `r_longlonglong` (signed).
+*   **The Constructor Trap:** Built-in Python type descriptors (like `int`, `long`, `float`, `str`) are "frozen" in RPython. You **cannot** call them as functions (e.g., `x = long(y)`). This results in a `FrozenDesc` error.
+*   **Correct Conversion:** Use RPython's specialized casting functions or the `@specialize.argtype` pattern to convert between primitive types.
+
 # 10. Object Model Discipline
 
 * Define all classes at import time.
@@ -719,6 +725,10 @@ Split APIs:
 
 * High-level layer: object-based.
 * Low-level core: primitive types and raw buffers.
+
+**11.1 Immutable List Initialization**
+When a list is designated as an immutable field (e.g., `columns[*]`), avoid populating it via `.append()` inside `__init__`. The RPython annotator may "freeze" the list's size and type before the loop completes, leading to `ListChangeUnallowed`. 
+*   **Preferred:** Use list comprehensions or pre-allocate with a fixed size: `self.items = [None] * size`.
 
 # 12. Designing for the Meta-Tracing JIT
 
@@ -819,6 +829,8 @@ RPython is Python 2–based.
 * Type narrowing across control flow.
 * Hidden object allocations in loops.
 * Missing JIT hints for fixed small loops.
+* Calling `long()` or `int()` as a function (use RLib arithmetic or specialized helpers instead).
+* Calling `.append()` on a list attribute after it has been hinted as immutable.
 
 # 17. Recommended Design Patterns
 

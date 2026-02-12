@@ -2,6 +2,7 @@ import unittest
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import wal, wal_format, errors, memtable
+from gnitz.storage.wal_format import WALRecord
 from gnitz.core import types, strings as string_logic, values as db_values
 
 class TestWALReader(unittest.TestCase):
@@ -17,7 +18,8 @@ class TestWALReader(unittest.TestCase):
         writer = wal.WALWriter(self.test_wal, self.layout)
         for lsn in range(1, num_blocks + 1):
             vals = [db_values.IntValue(lsn * 10), db_values.StringValue("block_%d" % lsn)]
-            writer.append_block(lsn, 1, [(lsn * 100, 1, vals)])
+            # Wrap data in WALRecord
+            writer.append_block(lsn, 1, [WALRecord(lsn * 100, 1, vals)])
         writer.close()
     
     def test_component_data_integrity(self):
@@ -25,18 +27,19 @@ class TestWALReader(unittest.TestCase):
         test_value = 12345
         test_label = "integrity"
         vals = [db_values.IntValue(test_value), db_values.StringValue(test_label)]
-        writer.append_block(1, 1, [(999, 1, vals)])
+        # Wrap data in WALRecord
+        writer.append_block(1, 1, [WALRecord(999, 1, vals)])
         writer.close()
         
         reader = wal.WALReader(self.test_wal, self.layout)
         is_valid, lsn, comp_id, records = reader.read_next_block()
         self.assertTrue(is_valid)
         
-        # rec is (key, weight, field_values_list)
         rec = records[0]
-        self.assertEqual(rec[0], 999)
-        self.assertEqual(rec[2][0].v, test_value)
-        self.assertEqual(rec[2][1].v, test_label)
+        # Use attribute access
+        self.assertEqual(rec.primary_key, 999)
+        self.assertEqual(rec.component_data[0].v, test_value)
+        self.assertEqual(rec.component_data[1].v, test_label)
         reader.close()
 
     def test_checksum_validation_fail(self):

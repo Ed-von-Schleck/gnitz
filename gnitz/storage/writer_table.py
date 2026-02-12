@@ -2,10 +2,7 @@ import os
 from rpython.rlib import rposix, jit
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage import layout, mmap_posix, errors
 from gnitz.core import checksum
 from gnitz.core import types, strings as string_logic, values as db_values
@@ -80,12 +77,14 @@ class TableShardWriter(object):
         pk_col = schema.get_pk_column()
         self.pk_buf = RawBuffer(pk_col.field_type.size)
         self.w_buf = RawBuffer(8)
-        self.col_bufs = []
-        for i in range(len(schema.columns)):
-            if i == schema.pk_index: 
-                self.col_bufs.append(None)
-            else: 
-                self.col_bufs.append(RawBuffer(schema.columns[i].field_type.size))
+        
+        # Pre-allocate fixed-size list to avoid resize_allowed=False issues
+        num_cols = len(schema.columns)
+        self.col_bufs = [None] * num_cols
+        for i in range(num_cols):
+            if i != schema.pk_index:
+                self.col_bufs[i] = RawBuffer(schema.columns[i].field_type.size)
+                
         self.b_buf = RawBuffer(1)
         self.blob_cache = {}
         # Pre-allocate scratch buffer to avoid mallocs during ingestion
@@ -230,20 +229,30 @@ class TableShardWriter(object):
         tmp_filename = filename + ".tmp"
         fd = rposix.open(tmp_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
-            region_list = []
-            region_list.append((self.pk_buf.ptr, 0, self.pk_buf.count * self.pk_buf.item_size))
-            region_list.append((self.w_buf.ptr, 0, self.w_buf.count * 8))
+            # Build region list without append()
+            num_cols_with_pk_w = 2 + (len(self.col_bufs) - 1)
+            region_list = [None] * (num_cols_with_pk_w + 1)
+            
+            region_list[0] = (self.pk_buf.ptr, 0, self.pk_buf.count * self.pk_buf.item_size)
+            region_list[1] = (self.w_buf.ptr, 0, self.w_buf.count * 8)
+            
+            reg_idx = 2
             for b in self.col_bufs:
-                if b: region_list.append((b.ptr, 0, self.count * b.item_size))
-            region_list.append((self.b_buf.ptr, 0, self.b_buf.count))
+                if b is not None:
+                    region_list[reg_idx] = (b.ptr, 0, self.count * b.item_size)
+                    reg_idx += 1
+            
+            region_list[reg_idx] = (self.b_buf.ptr, 0, self.b_buf.count)
 
             num_regions = len(region_list)
             dir_size = num_regions * layout.DIR_ENTRY_SIZE
             dir_offset = layout.HEADER_SIZE
             current_pos = _align_64(dir_offset + dir_size)
-            final_regions = []
-            for buf_ptr, _, sz in region_list:
-                final_regions.append((buf_ptr, current_pos, sz))
+            
+            final_regions = [None] * num_regions
+            for i in range(num_regions):
+                buf_ptr, _, sz = region_list[i]
+                final_regions[i] = (buf_ptr, current_pos, sz)
                 current_pos = _align_64(current_pos + sz)
 
             header = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor='raw')
@@ -270,11 +279,12 @@ class TableShardWriter(object):
             finally: lltype.free(dir_buf, flavor='raw')
 
             last_written_pos = dir_offset + dir_size
-            for buf_ptr, off, sz in final_regions:
+            for i in range(num_regions):
+                buf_ptr, off, sz = final_regions[i]
                 padding = off - last_written_pos
                 if padding > 0:
                     pad_buf = lltype.malloc(rffi.CCHARP.TO, padding, flavor='raw')
-                    for i in range(padding): pad_buf[i] = '\x00'
+                    for j in range(padding): pad_buf[j] = '\x00'
                     mmap_posix.write_c(fd, pad_buf, rffi.cast(rffi.SIZE_T, padding))
                     lltype.free(pad_buf, flavor='raw')
                 if sz > 0:

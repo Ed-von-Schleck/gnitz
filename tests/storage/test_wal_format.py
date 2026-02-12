@@ -2,6 +2,7 @@ import unittest
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import wal_format, errors
+from gnitz.storage.wal_format import WALRecord
 from gnitz.core import types, strings as string_logic
 
 class TestWALFormat(unittest.TestCase):
@@ -25,8 +26,8 @@ class TestWALFormat(unittest.TestCase):
 
     def test_write_and_decode_roundtrip(self):
         recs = [
-            (10, 1, self._create_packed(42, "one")),
-            (20, -1, self._create_packed(99, "two"))
+            WALRecord(10, 1, self._create_packed(42, "one")),
+            WALRecord(20, -1, self._create_packed(99, "two"))
         ]
         fd = os.open(self.tmp, os.O_WRONLY | os.O_CREAT, 0o644)
         wal_format.write_wal_block(fd, 100, 1, recs, self.layout)
@@ -41,8 +42,9 @@ class TestWALFormat(unittest.TestCase):
             lsn, cid, decoded = wal_format.decode_wal_block(block_ptr, len(data), self.layout)
             self.assertEqual(lsn, 100)
             self.assertEqual(len(decoded), 2)
-            self.assertEqual(decoded[0][0], 10)
-            self.assertEqual(decoded[1][1], -1)
+            # Use attribute access instead of indexing
+            self.assertEqual(decoded[0].primary_key, 10)
+            self.assertEqual(decoded[1].weight, -1)
         finally:
             rffi.free_charp(block_ptr)
 

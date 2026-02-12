@@ -3,10 +3,7 @@ import errno
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import r_uint64
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage import errors, mmap_posix
 
 MAGIC_NUMBER = r_uint64(0x4D414E49464E5447)

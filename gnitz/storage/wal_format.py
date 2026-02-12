@@ -1,15 +1,18 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, r_uint32
-from collections import namedtuple
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage import errors, mmap_posix
 from gnitz.core import checksum, types, strings as string_logic, values as db_values
 
 WAL_BLOCK_HEADER_SIZE = 32
-WALRecord = namedtuple('WALRecord', ['primary_key', 'weight', 'component_data'])
+
+class WALRecord(object):
+    _immutable_fields_ = ['primary_key', 'weight', 'component_data']
+    
+    def __init__(self, primary_key, weight, component_data):
+        self.primary_key = primary_key
+        self.weight = weight
+        self.component_data = component_data
 
 def write_wal_block(fd, lsn, table_id, records, schema):
     is_u128 = schema.get_pk_column().field_type == types.TYPE_U128
@@ -18,7 +21,8 @@ def write_wal_block(fd, lsn, table_id, records, schema):
     
     # 1. Calculate variable body size
     total_body_size = 0
-    for _, _, values in records:
+    for rec in records:
+        values = rec.component_data
         total_body_size += (key_size + 8 + stride)
         if not isinstance(values, str):
             arg_idx = 0
@@ -34,7 +38,11 @@ def write_wal_block(fd, lsn, table_id, records, schema):
     try:
         curr_off = 0
         mask = r_uint128(0xFFFFFFFFFFFFFFFF)
-        for key, weight, values in records:
+        for rec in records:
+            key = rec.primary_key
+            weight = rec.weight
+            values = rec.component_data
+            
             # Key & Weight
             if is_u128:
                 # Wrap in r_uint64 to ensure value is within unsigned 64-bit range for RPython cast
@@ -139,5 +147,5 @@ def decode_wal_block(block_ptr, block_len, schema):
                 field_values.append(db_values.FloatValue(float(rffi.cast(rffi.DOUBLEP, fptr)[0])))
             else:
                 field_values.append(db_values.IntValue(rffi.cast(rffi.LONGLONGP, fptr)[0]))
-        records.append((key, weight, field_values))
+        records.append(WALRecord(key, weight, field_values))
     return lsn, tid, records

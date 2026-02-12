@@ -8,7 +8,8 @@ class TestErrors(unittest.TestCase):
 
     def test_raise_catch(self):
         try:
-            raise BoundsError()
+            # RPython compat: Must provide explicit arguments now
+            raise BoundsError(0, 0, 0)
         except StorageError:
             pass
         except:

@@ -54,12 +54,14 @@ def rotl64(x, r):
     return (x << r) | (x >> (64 - r))
 
 def swap32(x):
-    # Promote to native word size (r_uint) to support bitwise shifts in RTyper
-    val = r_uint(x)
-    res = ((val << 24) & 0xff000000) | \
-          ((val <<  8) & 0x00ff0000) | \
-          ((val >>  8) & 0x0000ff00) | \
-          ((val >> 24) & 0x000000ff)
+    # Fix: Ensure strict 32-bit width by casting before operation.
+    # r_uint32(x) truncates upper bits if x was 64-bit.
+    # r_uint(...) promotes to native word for efficient shifting/masking.
+    val = r_uint(r_uint32(x))
+    res = ((val << 24) & r_uint(0xff000000)) | \
+          ((val <<  8) & r_uint(0x00ff0000)) | \
+          ((val >>  8) & r_uint(0x0000ff00)) | \
+          ((val >> 24) & r_uint(0x000000ff))
     return r_uint32(res)
 
 def swap64(x):

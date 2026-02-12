@@ -1,7 +1,4 @@
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 class ShardMetadata(object):
     def __init__(self, filename, table_id, min_key, max_key, min_lsn, max_lsn):

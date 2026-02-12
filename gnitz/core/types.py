@@ -30,6 +30,13 @@ class ColumnDefinition(object):
 def _align(offset, alignment):
     return (offset + alignment - 1) & ~(alignment - 1)
 
+def _to_col_def(c):
+    if isinstance(c, ColumnDefinition):
+        return c
+    if isinstance(c, FieldType):
+        return ColumnDefinition(c)
+    raise errors.LayoutError("Invalid column definition")
+
 class TableSchema(object):
     _immutable_fields_ = ['columns[*]', 'pk_index', 'column_offsets[*]', 'memtable_stride']
     
@@ -37,34 +44,30 @@ class TableSchema(object):
         if len(columns) > 64:
             raise errors.LayoutError("Maximum 64 columns supported")
             
-        self.columns = []
-        for c in columns:
-            if isinstance(c, ColumnDefinition):
-                self.columns.append(c)
-            elif isinstance(c, FieldType):
-                self.columns.append(ColumnDefinition(c))
-            else:
-                raise errors.LayoutError("Invalid column definition")
-
+        # Use list comprehension to avoid resize_allowed=False issues
+        self.columns = [_to_col_def(c) for c in columns]
         self.pk_index = pk_index
-        self.column_offsets = [0] * len(self.columns)
+        
+        num_cols = len(self.columns)
+        temp_offsets = [0] * num_cols
         
         current_offset = 0
         max_alignment = 1
         
-        for i in range(len(self.columns)):
+        for i in range(num_cols):
             if i == pk_index:
-                self.column_offsets[i] = -1
+                temp_offsets[i] = -1
                 continue
 
             field_type = self.columns[i].field_type
             current_offset = _align(current_offset, field_type.alignment)
-            self.column_offsets[i] = current_offset
+            temp_offsets[i] = current_offset
             current_offset += field_type.size
             
             if field_type.alignment > max_alignment:
                 max_alignment = field_type.alignment
             
+        self.column_offsets = temp_offsets
         self.memtable_stride = _align(current_offset, max_alignment)
 
     @property
@@ -81,7 +84,6 @@ def ComponentLayout(type_list):
     """
     Maintains compatibility with ECS-style tests.
     """
-    cols = [ColumnDefinition(TYPE_U64)]
-    for t in type_list:
-        cols.append(ColumnDefinition(t))
+    # Create fixed-size list without append()
+    cols = [ColumnDefinition(TYPE_U64)] + [ColumnDefinition(t) for t in type_list]
     return TableSchema(cols, 0)

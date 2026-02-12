@@ -1,9 +1,6 @@
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage import shard_table, writer_table, tournament_tree, compaction_logic
 
 class CompactionPolicy(object):
@@ -13,16 +10,18 @@ class CompactionPolicy(object):
         return self.registry.mark_for_compaction(table_id)
 
 def compact_shards(input_files, output_file, schema, table_id=0, validate_checksums=False):
-    views = []
-    cursors = []
+    num_inputs = len(input_files)
+    views = [None] * num_inputs
+    cursors = [None] * num_inputs
     tree = None
     writer = None
     
     try:
-        for filename in input_files:
+        for i in range(num_inputs):
+            filename = input_files[i]
             view = shard_table.TableShardView(filename, schema, validate_checksums=validate_checksums)
-            views.append(view)
-            cursors.append(tournament_tree.StreamCursor(view))
+            views[i] = view
+            cursors[i] = tournament_tree.StreamCursor(view)
         
         tree = tournament_tree.TournamentTree(cursors)
         writer = writer_table.TableShardWriter(schema, table_id)
@@ -53,7 +52,8 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
         lltype.free(tmp_row, flavor='raw')
     finally:
         if tree: tree.close()
-        for view in views: view.close()
+        for v in views:
+            if v: v.close()
 
 def execute_compaction(table_id, policy, manifest_mgr, ref_counter, schema, output_dir=".", spine_obj=None, validate_checksums=False):
     shards = policy.registry.get_shards_for_table(table_id)
@@ -67,14 +67,19 @@ def execute_compaction(table_id, policy, manifest_mgr, ref_counter, schema, outp
         compact_shards(input_files, out_filename, schema, table_id, validate_checksums=validate_checksums)
         
         reader = manifest_mgr.load_current()
-        new_entries = []
+        # Manifest entries might need to be resizable, but for now we try to filter carefully
+        old_entries = []
         for entry in reader.iterate_entries():
+            old_entries.append(entry)
+        reader.close()
+        
+        new_entries = []
+        for entry in old_entries:
             keep = True
             for old in input_files:
                 if entry.shard_filename == old:
                     keep = False; break
             if keep: new_entries.append(entry)
-        reader.close()
         
         from gnitz.storage.shard_table import TableShardView
         v = TableShardView(out_filename, schema, validate_checksums=validate_checksums)

@@ -2,10 +2,7 @@ import unittest
 import os
 import shutil
 from rpython.rlib.rarithmetic import r_uint64
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.core import zset, types, values as db_values
 from gnitz.storage import errors, shard_table, buffer

@@ -144,7 +144,8 @@ class TestWALWriter(unittest.TestCase):
             lsn1, comp_id1, records1 = wal_format.decode_wal_block(p1, len(block1_data), self.layout)
             self.assertEqual(lsn1, 1)
             self.assertEqual(comp_id1, 1)
-            self.assertEqual(records1[0][0], 10)
+            # Use attribute access
+            self.assertEqual(records1[0].primary_key, 10)
         finally:
             rffi.free_charp(p1)
         
@@ -155,7 +156,8 @@ class TestWALWriter(unittest.TestCase):
             lsn2, comp_id2, records2 = wal_format.decode_wal_block(p2, len(block2_data), self.layout)
             self.assertEqual(lsn2, 2)
             self.assertEqual(comp_id2, 2)
-            self.assertEqual(records2[0][0], 20)
+            # Use attribute access
+            self.assertEqual(records2[0].primary_key, 20)
         finally:
             rffi.free_charp(p2)
 

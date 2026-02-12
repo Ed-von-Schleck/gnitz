@@ -1,8 +1,5 @@
 from rpython.rlib import jit
-try:
-    from rpython.rlib.rarithmetic import r_uint128
-except ImportError:
-    r_uint128 = long
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 class ShardHandle(object):
     _immutable_fields_ = ['filename', 'lsn', 'view', 'min_key', 'max_key']
