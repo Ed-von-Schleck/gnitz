@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 from gnitz.storage import writer_table, shard_table
 
 class TestECSShardIntegration(unittest.TestCase):
@@ -9,9 +9,9 @@ class TestECSShardIntegration(unittest.TestCase):
         self.layout = types.ComponentLayout([types.TYPE_I64, types.TYPE_STRING])
         
         writer = writer_table.TableShardWriter(self.layout)
-        writer._add_row_weighted(10, 1, 100, "alpha")
-        writer._add_row_weighted(20, -1, 200, "beta")
-        writer._add_row_weighted(30, 1, 300, "gamma")
+        writer.add_row_from_values(10, 1, [db_values.wrap(x) for x in [100, "alpha"]])
+        writer.add_row_from_values(20, -1, [db_values.wrap(x) for x in [200, "beta"]])
+        writer.add_row_from_values(30, 1, [db_values.wrap(x) for x in [300, "gamma"]])
         writer.finalize(self.fn)
         
         self.view = shard_table.TableShardView(self.fn, self.layout)

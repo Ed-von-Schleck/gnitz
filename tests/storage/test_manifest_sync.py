@@ -2,7 +2,7 @@ import unittest
 import os
 import shutil
 from gnitz.storage import manifest, writer_table
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 from rpython.rlib.rarithmetic import r_uint64
 
 class TestManifestSync(unittest.TestCase):

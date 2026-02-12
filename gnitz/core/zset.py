@@ -17,12 +17,13 @@ class PersistentTable(object):
     Querying now uses "dry-run" comparison, bypassing the need for 
     intermediate payload serialization buffers.
     """
-    def __init__(self, directory, name, schema, table_id=1, cache_size=1048576, read_only=False, **kwargs):
+    def __init__(self, directory, name, schema, table_id=1, cache_size=1048576, read_only=False, validate_checksums=False):
         self.directory = directory
         self.name = name
         self.schema = schema
-        self.table_id = kwargs.get('table_id', table_id)
+        self.table_id = table_id
         self.read_only = read_only
+        self.validate_checksums = validate_checksums
         self.is_closed = False
         
         if not os.path.exists(directory): 
@@ -47,15 +48,23 @@ class PersistentTable(object):
         
         if self.manifest_manager.exists():
             self.spine = spine.Spine.from_manifest(
-                self.manifest_path, self.table_id, schema, ref_counter=self.ref_counter, **kwargs
+                self.manifest_path, 
+                table_id=self.table_id, 
+                schema=self.schema,
+                ref_counter=self.ref_counter,
+                validate_checksums=self.validate_checksums
             )
         else:
             self.spine = spine.Spine([], self.ref_counter)
             
         self.engine = engine.Engine(
-            self.mem_manager, self.spine, self.manifest_manager, 
-            self.registry, table_id=self.table_id, 
-            recover_wal_filename=self.wal_path, **kwargs
+            self.mem_manager, 
+            self.spine, 
+            manifest_manager=self.manifest_manager, 
+            registry=self.registry, 
+            table_id=self.table_id, 
+            recover_wal_filename=self.wal_path,
+            validate_checksums=self.validate_checksums
         )
         self.compaction_policy = compactor.CompactionPolicy(self.registry)
 
@@ -90,9 +99,14 @@ class PersistentTable(object):
 
     def _trigger_compaction(self):
         compactor.execute_compaction(
-            self.table_id, self.compaction_policy, self.manifest_manager, 
-            self.ref_counter, self.schema, output_dir=self.directory, 
-            spine_obj=self.spine
+            self.table_id, 
+            self.compaction_policy, 
+            self.manifest_manager, 
+            self.ref_counter, 
+            self.schema, 
+            output_dir=self.directory, 
+            spine_obj=self.spine,
+            validate_checksums=self.validate_checksums
         )
 
     def close(self):

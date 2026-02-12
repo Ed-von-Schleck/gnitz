@@ -2,7 +2,7 @@ import unittest
 import os
 from rpython.rlib.rarithmetic import r_uint64
 from gnitz.storage import manifest, shard_table, writer_table
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 
 class TestTypeConsistency(unittest.TestCase):
     def setUp(self):
@@ -25,7 +25,7 @@ class TestTypeConsistency(unittest.TestCase):
 
     def test_shard_header_consistency(self):
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_values(1, 100)
+        writer.add_row_from_values(1, 1, [db_values.wrap(x) for x in [100]])
         writer.finalize(self.s_fn)
         view = shard_table.TableShardView(self.s_fn, self.layout)
         self.assertEqual(view.count, 1)

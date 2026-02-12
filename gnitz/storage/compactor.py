@@ -12,7 +12,7 @@ class CompactionPolicy(object):
     def should_compact(self, table_id):
         return self.registry.mark_for_compaction(table_id)
 
-def compact_shards(input_files, output_file, schema, table_id=0):
+def compact_shards(input_files, output_file, schema, table_id=0, validate_checksums=False):
     views = []
     cursors = []
     tree = None
@@ -20,7 +20,7 @@ def compact_shards(input_files, output_file, schema, table_id=0):
     
     try:
         for filename in input_files:
-            view = shard_table.TableShardView(filename, schema, validate_checksums=False)
+            view = shard_table.TableShardView(filename, schema, validate_checksums=validate_checksums)
             views.append(view)
             cursors.append(tournament_tree.StreamCursor(view))
         
@@ -55,7 +55,7 @@ def compact_shards(input_files, output_file, schema, table_id=0):
         if tree: tree.close()
         for view in views: view.close()
 
-def execute_compaction(table_id, policy, manifest_mgr, ref_counter, schema, output_dir=".", spine_obj=None):
+def execute_compaction(table_id, policy, manifest_mgr, ref_counter, schema, output_dir=".", spine_obj=None, validate_checksums=False):
     shards = policy.registry.get_shards_for_table(table_id)
     if not shards: return None
     
@@ -64,7 +64,7 @@ def execute_compaction(table_id, policy, manifest_mgr, ref_counter, schema, outp
     
     for f in input_files: ref_counter.acquire(f)
     try:
-        compact_shards(input_files, out_filename, schema, table_id)
+        compact_shards(input_files, out_filename, schema, table_id, validate_checksums=validate_checksums)
         
         reader = manifest_mgr.load_current()
         new_entries = []
@@ -77,7 +77,7 @@ def execute_compaction(table_id, policy, manifest_mgr, ref_counter, schema, outp
         reader.close()
         
         from gnitz.storage.shard_table import TableShardView
-        v = TableShardView(out_filename, schema, validate_checksums=False)
+        v = TableShardView(out_filename, schema, validate_checksums=validate_checksums)
         try:
             is_u128 = schema.get_pk_column().field_type.size == 16
             if v.count > 0:
@@ -94,7 +94,7 @@ def execute_compaction(table_id, policy, manifest_mgr, ref_counter, schema, outp
             
             if spine_obj:
                 from gnitz.storage.spine import ShardHandle
-                new_handle = ShardHandle(out_filename, schema, shards[-1].max_lsn)
+                new_handle = ShardHandle(out_filename, schema, shards[-1].max_lsn, validate_checksums=validate_checksums)
                 spine_obj.replace_handles(input_files, new_handle)
             
             for f in input_files:

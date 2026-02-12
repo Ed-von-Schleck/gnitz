@@ -22,7 +22,7 @@ class TestManifestIO(unittest.TestCase):
     
     def test_writer_single_entry(self):
         writer = manifest.ManifestWriter(self.test_file)
-        writer.add_entry(manifest.ManifestEntry(1, "shard.db", 100, 200, 5, 10))
+        writer.add_entry_obj(manifest.ManifestEntry(1, "shard.db", 100, 200, 5, 10))
         writer.finalize()
         
         reader = manifest.ManifestReader(self.test_file)

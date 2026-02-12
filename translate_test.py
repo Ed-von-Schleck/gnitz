@@ -13,7 +13,15 @@ def entry_point(argv):
         types.ColumnDefinition(types.TYPE_I64), 
         types.ColumnDefinition(types.TYPE_STRING)
     ], 0)
-    db = zset.PersistentTable(db_dir, "test", layout)
+    db = zset.PersistentTable(
+        db_dir, 
+        "test", 
+        layout,
+        table_id=1,
+        cache_size=1048576,
+        read_only=False,
+        validate_checksums=False
+    )
     
     try:
         def mk_payload(i, s): return [db_values.IntValue(i), db_values.StringValue(s)]

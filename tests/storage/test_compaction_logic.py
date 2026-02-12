@@ -2,7 +2,7 @@ import unittest
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import writer_table, shard_table, compaction_logic
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 from gnitz.storage import tournament_tree
 
 class TestCompactionLogic(unittest.TestCase):
@@ -16,11 +16,11 @@ class TestCompactionLogic(unittest.TestCase):
 
     def test_merge_annihilation(self):
         w1 = writer_table.TableShardWriter(self.layout)
-        w1._add_row_weighted(1, 1, 100)
+        w1.add_row_from_values(1, 1, [db_values.wrap(x) for x in [100]])
         w1.finalize(self.files[0])
         
         w2 = writer_table.TableShardWriter(self.layout)
-        w2._add_row_weighted(1, -1, 100)
+        w2.add_row_from_values(1, -1, [db_values.wrap(x) for x in [100]])
         w2.finalize(self.files[1])
         
         v1 = shard_table.TableShardView(self.files[0], self.layout)

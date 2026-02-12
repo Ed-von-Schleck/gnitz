@@ -28,8 +28,8 @@ class TestCompactionCleanup(unittest.TestCase):
         w.finalize(filename)
 
     def test_deferred_cleanup(self):
-        h1 = spine.ShardHandle(self.shard1, self.layout, 0)
-        h2 = spine.ShardHandle(self.shard2, self.layout, 0)
+        h1 = spine.ShardHandle(self.shard1, self.layout, 0, validate_checksums=False)
+        h2 = spine.ShardHandle(self.shard2, self.layout, 0, validate_checksums=False)
         self.spine_obj = spine.Spine([h1, h2], self.rc)
         
         self.assertFalse(self.rc.can_delete(self.shard1))

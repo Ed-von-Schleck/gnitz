@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 from gnitz.storage import writer_table, shard_table
 
 class TestTableShardWriter(unittest.TestCase):
@@ -14,9 +14,9 @@ class TestTableShardWriter(unittest.TestCase):
     def test_ghost_barrier_in_writer(self):
         writer = writer_table.TableShardWriter(self.layout)
         # Should be ignored (weight 0)
-        writer._add_row_weighted(1, 0, 100, "ghost")
+        writer.add_row_from_values(1, 0, [db_values.wrap(x) for x in [100, "ghost"]])
         # Should be written
-        writer._add_row_weighted(2, 1, 200, "alive")
+        writer.add_row_from_values(2, 1, [db_values.wrap(x) for x in [200, "alive"]])
         writer.finalize(self.fn)
         
         view = shard_table.TableShardView(self.fn, self.layout)

@@ -7,8 +7,12 @@ except ImportError:
 class ShardHandle(object):
     _immutable_fields_ = ['filename', 'lsn', 'view', 'min_key', 'max_key']
     def __init__(self, filename, schema, lsn, validate_checksums=False):
-        from gnitz.storage import shard_table
-        from gnitz.core import types 
+        from gnitz.storage import shard_table, errors
+        from gnitz.core import types
+        
+        if schema is None:
+            raise errors.LayoutError("ShardHandle requires a valid schema")
+            
         self.filename = filename
         self.lsn = lsn
         # Propagate the validation flag to the View
@@ -47,18 +51,18 @@ class Spine(object):
             self.handles[j+1] = h
 
     @staticmethod
-    def from_manifest(manifest_filename, table_id=1, schema=None, ref_counter=None, **kwargs):
-        tid = kwargs.get('table_id', table_id)
-        sch = kwargs.get('layout', schema)
-        validate = kwargs.get('validate_checksums', False)
+    def from_manifest(manifest_filename, table_id, schema, ref_counter=None, validate_checksums=False):
+        from gnitz.storage import manifest, errors
         
-        from gnitz.storage import manifest
+        if schema is None:
+            raise errors.LayoutError("Spine.from_manifest requires a valid schema")
+        
         reader = manifest.ManifestReader(manifest_filename)
         try:
             handles = []
             for entry in reader.iterate_entries():
-                if entry.table_id == tid:
-                    handle = ShardHandle(entry.shard_filename, sch, entry.max_lsn, validate_checksums=validate)
+                if entry.table_id == table_id:
+                    handle = ShardHandle(entry.shard_filename, schema, entry.max_lsn, validate_checksums=validate_checksums)
                     handles.append(handle)
             return Spine(handles, ref_counter)
         finally:

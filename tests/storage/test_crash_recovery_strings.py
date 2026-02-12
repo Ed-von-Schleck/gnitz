@@ -13,7 +13,15 @@ class TestCrashRecoveryStrings(unittest.TestCase):
         ])
         
     def test_long_string_recovery(self):
-        db = zset.PersistentZSet(self.test_dir, "crashdb", self.layout)
+        db = zset.PersistentZSet(
+            self.test_dir, 
+            "crashdb", 
+            self.layout,
+            table_id=1,
+            cache_size=1048576,
+            read_only=False,
+            validate_checksums=False
+        )
         long_str = "this is a very long string that will be moved to the blob arena"
         p = [db_values.StringValue(long_str)]
         
@@ -22,7 +30,15 @@ class TestCrashRecoveryStrings(unittest.TestCase):
         db.close() # WAL is flushed, memory is gone
         
         # 2. Re-open
-        db_new = zset.PersistentZSet(self.test_dir, "crashdb", self.layout)
+        db_new = zset.PersistentZSet(
+            self.test_dir, 
+            "crashdb", 
+            self.layout,
+            table_id=1,
+            cache_size=1048576,
+            read_only=False,
+            validate_checksums=False
+        )
         
         # 3. Verify recovery
         weight = db_new.get_weight(1, p)

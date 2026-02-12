@@ -431,3 +431,440 @@ GnitzDB is uniquely positioned to implement **Differential Privacy** at the circ
 The FLSM will be extended with **Tiered Compaction Heuristics** optimized for diverse columnar workload profiles.
 *   **Write-Heavy Tiers:** Minimizes ingestion stalls by allowing higher overlap depth in upper FLSM levels while maintaining row-oriented WAL segments.
 *   **Read-Heavy Guard Shards:** Prioritizes the consolidation of shards into large, non-overlapping N-Partition columnar blocks to maximize binary search performance and minimize the number of `mmap` handles required for snapshot resolution.
+
+## Appendix A: RPython Implementation Patterns and Best Practices
+
+# RPython Engineering Reference
+
+**Designing Code for the RPython Translation Toolchain**
+
+This document is a technical reference for experienced systems developers writing code intended for translation with the RPython toolchain (e.g., for interpreters, VMs, or low-level runtimes). It assumes familiarity with static typing, compiler toolchains, tracing JITs, and low-level runtime design.
+
+RPython is a **statically analyzable subset of Python 2**, designed for whole-program translation to C and optional meta-tracing JIT generation. Code must be predictable under global type inference.
+
+# 1. Architectural Model
+
+## 1.1 Whole-Program Static Analysis
+
+The RPython translator:
+
+* Performs **global type inference** (annotation phase).
+* Assigns a single static type to every variable and container.
+* Specializes code paths based on inferred types.
+* Rejects constructs that prevent inference.
+
+All reachable code is analyzed. Dead code elimination happens *after* annotation, not before.
+
+### Implications
+
+* No runtime type polymorphism beyond what can be statically inferred.
+* No dynamic structural changes to objects.
+* No dynamic code generation.
+* No runtime metaprogramming.
+
+If the annotator cannot prove a property statically, translation fails.
+
+# 2. Entry Point and Translation Contract
+
+RPython programs are not executed via `__main__`. The toolchain requires a **target function**:
+
+```python
+def entry_point(argv):
+    # Must return int
+    return 0
+
+def target(driver, args):
+    return entry_point, None
+```
+
+Constraints:
+
+* Entry function must accept a list of strings (`argv`).
+* Must return an integer exit code.
+* No side effects at import time that depend on runtime state.
+
+The `target()` function defines the translation root.
+
+# 3. Language Subset Constraints
+
+RPython is Python 2 syntax with strict semantic restrictions.
+
+## 3.1 Disallowed or Severely Restricted
+
+* `eval`, `exec`
+* Dynamic class creation
+* Dynamic function creation
+* `**kwargs` (not supported)
+* Dynamic attribute injection
+* Rebinding globals
+* Mutating prebuilt global containers
+* `set`
+* Most of `inspect`, `threading`, `multiprocessing`
+* Most of the Python stdlib
+
+## 3.2 Allowed but Constrained
+
+* `*args` allowed in definitions, but avoid unless tuple type is statically known.
+* Generators: limited support, avoid complex yield flows.
+* Recursion: allowed but avoid deep recursion in hot paths.
+* Default arguments: supported.
+* Exceptions: supported, but heavy use may impact JIT performance.
+
+# 4. Static Typing Model
+
+## 4.1 Monomorphic Variables
+
+Each variable has a single static type per control-flow merge point.
+
+This fails:
+
+```python
+if cond:
+    x = 1
+else:
+    x = "a"     # incompatible types
+```
+
+This succeeds:
+
+```python
+if cond:
+    x = 1
+else:
+    x = 2
+```
+
+Or:
+
+```python
+class Base(object): pass
+class A(Base): pass
+class B(Base): pass
+
+if cond:
+    x = A()
+else:
+    x = B()
+```
+
+Common base type required.
+
+# 5. Containers
+
+## 5.1 Homogeneous Lists
+
+Lists are statically typed arrays.
+
+Illegal:
+
+```python
+lst = [1, "a"]
+```
+
+Legal:
+
+```python
+lst = [1, 2, 3]
+```
+
+or:
+
+```python
+class Value(object): pass
+class IntValue(Value): ...
+class StrValue(Value): ...
+
+lst = [IntValue(1), StrValue("a")]
+```
+
+Use wrapper objects for heterogeneous logical data.
+
+## 5.2 Dicts
+
+* Keys and values must be statically typed.
+* Use `rpython.rlib.objectmodel.r_dict` for custom equality/hash behavior.
+* No `set` type — emulate via dict or list.
+
+# 6. Function Signatures
+
+Avoid dynamic signatures.
+
+Preferred:
+
+```python
+def f(a, b, c=0):
+    ...
+```
+
+Avoid:
+
+```python
+def f(*args): ...
+def f(**kwargs): ...
+```
+
+If variable-length input is required, use a list with known element type:
+
+```python
+def f(args):  # args is List[int]
+    ...
+```
+
+# 7. Global State
+
+Globals are treated as **constants**.
+
+You cannot:
+
+* Rebind global variables.
+* Mutate prebuilt global containers.
+
+Allowed pattern:
+
+```python
+class State(object):
+    def __init__(self):
+        self.counter = 0
+
+state = State()
+```
+
+Mutate attributes of prebuilt objects, not the binding itself.
+
+# 8. Standard Library and Runtime Environment
+
+Only a small subset of stdlib is usable.
+
+### Generally Safe
+
+* `math`
+* basic `os`
+* `sys`
+* simple string operations
+* list/dict operations
+
+### Preferred
+
+Use RPython libraries:
+
+* `rpython.rlib.rarithmetic`
+* `rpython.rlib.rbigint`
+* `rpython.rlib.objectmodel`
+* `rpython.rlib.jit`
+* `rpython.rlib.rposix`
+* `rpython.rlib.streamio`
+
+Do not assume arbitrary stdlib availability.
+
+# 9. Integer Semantics and Arithmetic
+
+Python `int` behaves differently pre- and post-translation.
+
+## 9.1 Signed Integers
+
+RPython `int`:
+
+* Before translation: arbitrary precision (Python long)
+* After translation: C `long` with wraparound
+
+Use:
+
+```python
+from rpython.rlib.rarithmetic import ovfcheck, intmask
+```
+
+* `ovfcheck(x + y)` forces overflow detection.
+* `intmask(x)` truncates to machine word.
+
+## 9.2 Unsigned and Fixed-Width Types
+
+Use:
+
+```python
+from rpython.rlib.rarithmetic import r_uint
+```
+
+For:
+
+* Bit manipulation
+* Binary serialization
+* Checksums
+* Protocol parsing
+
+`r_uint` maps to native unsigned type.
+
+Do not rely on Python arbitrary precision semantics.
+
+# 10. Object Model Discipline
+
+* Define all classes at import time.
+* No monkey-patching.
+* No dynamic method injection.
+* Class attributes must be statically inferable.
+* Avoid `__getattr__`, dynamic descriptors.
+
+Keep class hierarchies simple.
+
+# 11. Memory and Allocation Discipline
+
+Every allocation is visible to the annotator.
+
+Avoid:
+
+* Excess object churn in hot loops.
+* Creating temporary objects inside tracing loops.
+* Boxing/unboxing primitives in tight paths.
+
+Split APIs:
+
+* High-level layer: object-based.
+* Low-level core: primitive types and raw buffers.
+
+# 12. Designing for the Meta-Tracing JIT
+
+The RPython JIT traces interpreter loops.
+
+## 12.1 Write Trace-Friendly Code
+
+Prefer:
+
+* Simple `while` / `for` loops
+* Scalar variables
+* Explicit indexing
+
+Avoid:
+
+* Complex iterators
+* Deep call chains in hot paths
+* Excessive exception-driven control flow
+* Complex comprehensions
+
+## 12.2 JIT Hints
+
+From `rpython.rlib.jit`:
+
+* `@jit.unroll_safe`
+* `jit.unrolling_iterable`
+* `jit.promote(x)`
+* `@jit.elidable`
+
+Use when:
+
+* Loop bounds are small and fixed.
+* Values are loop-invariant.
+* Pure functions should be cached.
+
+Example:
+
+```python
+from rpython.rlib import jit
+
+@jit.unroll_safe
+def dispatch(opcode):
+    ...
+```
+
+These hints are not optional in serious performance work.
+
+## 12.3 Hot Loop Structure
+
+The JIT works best when:
+
+* There is a clear interpreter loop.
+* Loop state is explicit.
+* State variables are primitive types.
+
+Avoid hiding the dispatch loop inside abstractions.
+
+# 13. Error Handling
+
+Exceptions are supported but:
+
+* Costly in hot paths.
+* Increase trace complexity.
+
+Prefer:
+
+* Error codes in tight loops.
+* Exceptions at API boundaries.
+
+# 14. Testing Strategy
+
+* Unit tests may run under CPython.
+* Always test translation regularly.
+* Many constructs pass CPython but fail annotation.
+
+Typical workflow:
+
+1. Run tests under CPython.
+2. Attempt translation.
+3. Fix annotation errors.
+4. Repeat.
+
+# 15. Python Version Constraints
+
+RPython is Python 2–based.
+
+* Use Python 2.7-compatible syntax.
+* Avoid Python 3 features.
+* If needed, use `from __future__ import print_function`.
+
+# 16. Common Failure Modes
+
+* Variable inferred as incompatible types.
+* List element type instability.
+* Globals mutated incorrectly.
+* Unsupported stdlib import.
+* Dynamic attribute creation.
+* Type narrowing across control flow.
+* Hidden object allocations in loops.
+* Missing JIT hints for fixed small loops.
+
+# 17. Recommended Design Patterns
+
+## 17.1 Value Object Pattern
+
+For heterogeneous logical data:
+
+* Define base class.
+* Subclass per concrete type.
+* Store homogeneous list of base type.
+
+## 17.2 Explicit State Object
+
+Avoid global mutation; use a singleton state object.
+
+## 17.3 Layered API
+
+* Public API: object-oriented, safe.
+* Internal engine: flat, primitive-heavy.
+
+## 17.4 Table-Driven Dispatch
+
+Use fixed arrays or tuples of callables.
+
+If iterating over small fixed collections:
+
+```python
+for field in jit.unrolling_iterable(FIELDS):
+    ...
+```
+
+# Summary
+
+When writing RPython:
+
+* Think statically.
+* Think monomorphically.
+* Think in fixed-width integers.
+* Think in homogeneous containers.
+* Think in explicit control flow.
+* Think in interpreter loops.
+* Guide the JIT intentionally.
+* Avoid dynamic Python idioms.
+
+## Appendix B: Coding practices
+
+* Code should be formatted how the tool `black` would do it. If you change a file with bad formatting, fix the formatting carefully.
+* Attributes, methods and functions starting with underscore (`_`) are considered private. They should not be used by code outside the class/module, not even by tests. If you encounter a test using a private method, fix it by either making it use a public attribute/method/function, or remove it entirely.
+* When fixing a problem, don't leave code comments like `# FIXED: ...`. Code comments are not for documenting change, git commit messages are.

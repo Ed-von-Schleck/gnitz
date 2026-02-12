@@ -14,13 +14,14 @@ from gnitz.core import types
 class Engine(object):
     _immutable_fields_ = ['mem_manager', 'spine', 'schema', 'manifest_manager', 'registry', 'table_id']
 
-    def __init__(self, mem_manager, spine_obj, manifest_manager=None, registry=None, table_id=1, recover_wal_filename=None, **kwargs):
+    def __init__(self, mem_manager, spine_obj, manifest_manager=None, registry=None, table_id=1, recover_wal_filename=None, validate_checksums=False):
         self.mem_manager = mem_manager
         self.spine = spine_obj
         self.schema = mem_manager.schema
         self.manifest_manager = manifest_manager
         self.registry = registry
-        self.table_id = kwargs.get('table_id', table_id)
+        self.table_id = table_id
+        self.validate_checksums = validate_checksums
         
         if manifest_manager and manifest_manager.exists():
             reader = manifest_manager.load_current()
@@ -96,8 +97,7 @@ class Engine(object):
         needs_comp = False
         
         if os.path.exists(filename):
-            validate = getattr(self, 'validate_checksums', False)
-            handle = ShardHandle(filename, self.schema, lsn_max, validate_checksums=validate)
+            handle = ShardHandle(filename, self.schema, lsn_max, validate_checksums=self.validate_checksums)
             if handle.view.count > 0:
                 min_k = handle.min_key
                 max_k = handle.max_key

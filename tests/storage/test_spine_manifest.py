@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 from gnitz.storage import writer_table, manifest, spine
 
 class TestSpineManifest(unittest.TestCase):
@@ -19,7 +19,10 @@ class TestSpineManifest(unittest.TestCase):
     def _create_shard(self, filename, entities_and_values):
         writer = writer_table.TableShardWriter(self.layout)
         for pk, i64_val, str_val in entities_and_values:
-            writer.add_row_values(pk, i64_val, str_val)
+            writer.add_row_from_values(pk, 1, [
+                db_values.wrap(i64_val),
+                db_values.wrap(str_val)
+            ])
         writer.finalize(filename)
         self.shard_files.append(filename)
     
@@ -28,17 +31,21 @@ class TestSpineManifest(unittest.TestCase):
         self._create_shard(shard_fn, [(10, 100, "alpha"), (20, 200, "beta")])
         
         writer = manifest.ManifestWriter(self.manifest_file)
-        writer.add_entry(1, shard_fn, 10, 20, 0, 1)
+        writer.add_entry_values(1, shard_fn, 10, 20, 0, 1)
         writer.finalize()
         
-        sp = spine.Spine.from_manifest(self.manifest_file, table_id=1, layout=self.layout)
+        sp = spine.Spine.from_manifest(
+            self.manifest_file, 
+            table_id=1, 
+            schema=self.layout,
+            ref_counter=None,
+            validate_checksums=False
+        )
         
-        # Fixed: Updated min_eid to min_key
         self.assertEqual(sp.handles[0].min_key, 10)
         
         results = sp.find_all_shards_and_indices(20)
         shard, idx = results[0]
-        # Fixed: Read index 1 because index 0 is PK
         self.assertEqual(shard.view.read_field_i64(idx, 1), 200)
         
         sp.close_all()

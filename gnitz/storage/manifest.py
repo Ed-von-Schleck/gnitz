@@ -45,14 +45,12 @@ def _write_manifest_header(fd, entry_count, global_max_lsn=r_uint64(0)):
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_VERSION))[0] = rffi.cast(rffi.ULONGLONG, VERSION)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_ENTRY_COUNT))[0] = rffi.cast(rffi.ULONGLONG, entry_count)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, OFF_GLOBAL_MAX_LSN))[0] = rffi.cast(rffi.ULONGLONG, global_max_lsn)
-        # Using rposix for consistency
         mmap_posix.write_c(fd, header, rffi.cast(rffi.SIZE_T, HEADER_SIZE))
     finally: lltype.free(header, flavor='raw')
 
 def _read_manifest_header(fd):
     header = lltype.malloc(rffi.CCHARP.TO, HEADER_SIZE, flavor='raw')
     try:
-        # Use low-level read to avoid buffer issues in RPython
         res = rposix.read(fd, HEADER_SIZE)
         if len(res) != HEADER_SIZE: raise errors.CorruptShardError("Manifest header too short")
         for i in range(HEADER_SIZE): header[i] = res[i]
@@ -128,7 +126,6 @@ class ManifestReader(object):
         fd = rposix.open(filename, os.O_RDONLY, 0)
         try:
             st = os.fstat(fd)
-            # Validation barrier
             version, entry_count, global_max_lsn = _read_manifest_header(fd)
             
             self.fd = fd
@@ -158,7 +155,6 @@ class ManifestReader(object):
             st = os.fstat(fd)
             version, entry_count, global_max_lsn = _read_manifest_header(fd)
             
-            # Close old
             rposix.close(self.fd)
             
             self.fd = fd
@@ -191,20 +187,22 @@ class ManifestWriter(object):
         self.global_max_lsn = r_uint64(global_max_lsn)
         self.finalized = False
     
-    def add_entry(self, *args):
+    def add_entry_obj(self, entry):
         if self.finalized: raise errors.StorageError("Manifest already finalized")
-        if len(args) == 1 and isinstance(args[0], ManifestEntry):
-            self.entries.append(args[0])
-        elif len(args) == 6:
-            self.entries.append(ManifestEntry(args[0], args[1], args[2], args[3], args[4], args[5]))
-        else:
-            raise TypeError("ManifestWriter.add_entry: Expected 1 or 6 arguments")
+        self.entries.append(entry)
+
+    def add_entry_values(self, table_id, shard_filename, min_key, max_key, min_lsn, max_lsn):
+        if self.finalized: raise errors.StorageError("Manifest already finalized")
+        entry = ManifestEntry(table_id, shard_filename, min_key, max_key, min_lsn, max_lsn)
+        self.entries.append(entry)
 
     def finalize(self):
+        if self.finalized: raise errors.StorageError("Manifest already finalized")
         fd = rposix.open(self.filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
             _write_manifest_header(fd, len(self.entries), self.global_max_lsn)
-            for e in self.entries: _write_manifest_entry(fd, e)
+            for e in self.entries:
+                _write_manifest_entry(fd, e)
             mmap_posix.fsync_c(fd)
         finally:
             rposix.close(fd)
@@ -216,9 +214,11 @@ class ManifestManager(object):
         self.temp_path = manifest_path + ".tmp"
     def exists(self): return os.path.exists(self.manifest_path)
     def load_current(self): return ManifestReader(self.manifest_path)
+    
     def publish_new_version(self, entries, global_max_lsn=r_uint64(0)):
         writer = ManifestWriter(self.temp_path, global_max_lsn)
-        for e in entries: writer.add_entry(e)
+        for e in entries:
+            writer.add_entry_obj(e)
         writer.finalize()
         os.rename(self.temp_path, self.manifest_path)
         mmap_posix.fsync_dir(self.manifest_path)

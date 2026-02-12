@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 from gnitz.storage import writer_table, shard_table, compactor
 
 class TestCompactor(unittest.TestCase):
@@ -14,16 +14,18 @@ class TestCompactor(unittest.TestCase):
 
     def test_compaction_annihilation(self):
         w1 = writer_table.TableShardWriter(self.layout)
-        w1._add_row_weighted(1, 1, 10)
+        # PK=1, Weight=1, ColumnValue=10
+        w1.add_row_from_values(1, 1, [db_values.wrap(10)])
         w1.finalize("in1.db")
         
         w2 = writer_table.TableShardWriter(self.layout)
-        w2._add_row_weighted(1, -1, 10)
+        # PK=1, Weight=-1, ColumnValue=10
+        w2.add_row_from_values(1, -1, [db_values.wrap(10)])
         w2.finalize("in2.db")
         
-        compactor.compact_shards(["in1.db", "in2.db"], "out.db", self.layout)
+        compactor.compact_shards(["in1.db", "in2.db"], "out.db", self.layout, validate_checksums=False)
         
-        res = shard_table.TableShardView("out.db", self.layout)
+        res = shard_table.TableShardView("out.db", self.layout, validate_checksums=False)
         self.assertEqual(res.count, 0)
         res.close()
 

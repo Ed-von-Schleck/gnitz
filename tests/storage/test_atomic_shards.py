@@ -2,7 +2,7 @@ import unittest
 import os
 import shutil
 from gnitz.storage import writer_table, shard_table
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 
 class TestAtomicShards(unittest.TestCase):
     def setUp(self):
@@ -19,7 +19,7 @@ class TestAtomicShards(unittest.TestCase):
 
     def test_atomic_swap_mechanics(self):
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_values(123, 456)
+        writer.add_row_from_values(123, 1, [db_values.wrap(x) for x in [456]])
         writer.finalize(self.shard_path)
         
         self.assertTrue(os.path.exists(self.shard_path))
@@ -35,11 +35,11 @@ class TestAtomicShards(unittest.TestCase):
 
     def test_overwriting_is_atomic(self):
         w1 = writer_table.TableShardWriter(self.layout)
-        w1.add_row_values(1, 100)
+        w1.add_row_from_values(1, 1, [db_values.wrap(x) for x in [100]])
         w1.finalize(self.shard_path)
         
         w2 = writer_table.TableShardWriter(self.layout)
-        w2.add_row_values(2, 200)
+        w2.add_row_from_values(2, 1, [db_values.wrap(x) for x in [200]])
         w2.finalize(self.shard_path)
         
         view = shard_table.TableShardView(self.shard_path, self.layout)

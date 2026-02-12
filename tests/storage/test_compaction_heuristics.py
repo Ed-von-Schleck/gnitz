@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 from gnitz.storage import (
     writer_table, shard_registry, manifest, 
     refcount, compactor
@@ -21,7 +21,7 @@ class TestCompactionHeuristics(unittest.TestCase):
 
     def _create_shard(self, filename, pk, weight, val, lsn):
         w = writer_table.TableShardWriter(self.layout)
-        w._add_row_weighted(pk, weight, val)
+        w.add_row_from_values(pk, weight, [db_values.wrap(x) for x in [val]])
         w.finalize(filename)
         self.files.append(filename)
         self.shard_filenames.append(filename)

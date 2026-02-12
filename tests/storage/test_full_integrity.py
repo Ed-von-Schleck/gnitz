@@ -3,7 +3,7 @@ import os
 import shutil
 import struct
 from gnitz.storage import writer_table, shard_table, errors, layout
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 
 class TestFullIntegrity(unittest.TestCase):
     def setUp(self):
@@ -19,7 +19,7 @@ class TestFullIntegrity(unittest.TestCase):
     def test_deferred_blob_corruption(self):
         long_string = "this_is_a_very_long_string_that_will_be_in_region_b"
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_values(1, long_string)
+        writer.add_row_from_values(1, 1, [db_values.wrap(x) for x in [long_string]])
         writer.finalize(self.shard_path)
 
         # Open shard to find dynamic region offset

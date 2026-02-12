@@ -22,7 +22,15 @@ class TestZSetPersistence(unittest.TestCase):
             types.ColumnDefinition(types.TYPE_STRING),
             types.ColumnDefinition(types.TYPE_F64)
         ], 0)
-        self.db = zset.PersistentTable(self.test_dir, "test", self.layout)
+        self.db = zset.PersistentTable(
+            self.test_dir, 
+            "test", 
+            self.layout,
+            table_id=1,
+            cache_size=1048576,
+            read_only=False,
+            validate_checksums=False
+        )
 
     def tearDown(self):
         if hasattr(self, 'db') and not self.db.is_closed:
@@ -60,7 +68,7 @@ class TestZSetPersistence(unittest.TestCase):
         self.db.close()
         
         # Locate the Weight Region (index 1) to corrupt it
-        view = shard_table.TableShardView(shard_path, self.layout)
+        view = shard_table.TableShardView(shard_path, self.layout, validate_checksums=False)
         w_offset = view.get_region_offset(1)
         view.close()
         
@@ -71,7 +79,13 @@ class TestZSetPersistence(unittest.TestCase):
         # Error is raised on instantiation because PK/Weight regions are validated eagerly
         with self.assertRaises(errors.CorruptShardError):
             self.db = zset.PersistentTable(
-                self.test_dir, "test", self.layout, validate_checksums=True
+                self.test_dir, 
+                "test", 
+                self.layout, 
+                table_id=1,
+                cache_size=1048576,
+                read_only=False,
+                validate_checksums=True
             )
 
     def test_memory_bounds_safety(self):
@@ -99,9 +113,10 @@ class TestZSetPersistence(unittest.TestCase):
         self.db.remove(100, p_ghost)
         
         shard_path = self.db.flush()
-        view = shard_table.TableShardView(shard_path, self.layout)
+        view = shard_table.TableShardView(shard_path, self.layout, validate_checksums=False)
         try:
             self.assertLess(view.blob_buf.size, len(long_s) * 2)
+            from rpython.rtyper.lltypesystem import rffi
             found_ghost = False
             for i in range(view.blob_buf.size - len(ghost_s)):
                 if rffi.charpsize2str(rffi.ptradd(view.blob_buf.ptr, i), len(ghost_s)) == ghost_s:

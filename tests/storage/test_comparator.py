@@ -1,7 +1,8 @@
 import os
 import unittest
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import types, values, strings
+# FIX: Imported values as db_values to match usage in test_soa_to_soa_equality
+from gnitz.core import types, values as db_values, strings
 from gnitz.storage import comparator, arena, writer_table, shard_table
 
 class TestComparator(unittest.TestCase):
@@ -56,7 +57,8 @@ class TestComparator(unittest.TestCase):
         fn1, fn2 = "c1.db", "c2.db"
         for fn in [fn1, fn2]:
             w = writer_table.TableShardWriter(self.schema)
-            w._add_row_weighted(10, 1, "test", 1.5)
+            # Usage of db_values.wrap now valid
+            w.add_row_from_values(10, 1, [db_values.wrap(x) for x in ["test", 1.5]])
             w.finalize(fn)
         
         v1 = shard_table.TableShardView(fn1, self.schema)

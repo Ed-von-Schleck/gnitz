@@ -1,6 +1,6 @@
 import unittest
 import os
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 from gnitz.storage import writer_table, shard_table, tournament_tree
 
 class TestTournamentTree(unittest.TestCase):
@@ -15,7 +15,7 @@ class TestTournamentTree(unittest.TestCase):
     def _create_shard(self, filename, entities_and_values):
         writer = writer_table.TableShardWriter(self.layout)
         for pk, i64_val, str_val in entities_and_values:
-            writer.add_row_values(pk, i64_val, str_val)
+            writer.add_row_from_values(pk, 1, [db_values.wrap(x) for x in [i64_val, str_val]])
         writer.finalize(filename)
         self.test_files.append(filename)
     

@@ -1,7 +1,7 @@
 import unittest
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import types
+from gnitz.core import types, values as db_values
 from gnitz.storage import writer_table, shard_table, layout, errors
 
 class TestShardChecksums(unittest.TestCase):
@@ -18,8 +18,8 @@ class TestShardChecksums(unittest.TestCase):
 
     def test_write_and_validate_checksums(self):
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_values(10, 100, "test")
-        writer.add_row_values(20, 200, "data")
+        writer.add_row_from_values(10, 1, [db_values.wrap(x) for x in [100, "test"]])
+        writer.add_row_from_values(20, 1, [db_values.wrap(x) for x in [200, "data"]])
         writer.finalize(self.fn)
         
         view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=True)
@@ -28,7 +28,7 @@ class TestShardChecksums(unittest.TestCase):
 
     def test_corrupt_region_e_detection(self):
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_values(10, 100, "test")
+        writer.add_row_from_values(10, 1, [db_values.wrap(x) for x in [100, "test"]])
         writer.finalize(self.fn)
         
         view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=False)
@@ -46,7 +46,7 @@ class TestShardChecksums(unittest.TestCase):
 
     def test_corrupt_region_w_detection(self):
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_values(10, 100, "test")
+        writer.add_row_from_values(10, 1, [db_values.wrap(x) for x in [100, "test"]])
         writer.finalize(self.fn)
         
         view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=False)
@@ -64,7 +64,7 @@ class TestShardChecksums(unittest.TestCase):
 
     def test_skip_validation_option(self):
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_values(10, 100, "test")
+        writer.add_row_from_values(10, 1, [db_values.wrap(x) for x in [100, "test"]])
         writer.finalize(self.fn)
         
         view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=False)
