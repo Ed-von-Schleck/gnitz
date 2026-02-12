@@ -804,20 +804,12 @@ Prefer:
 * Always test translation regularly.
 * Many constructs pass CPython but fail annotation.
 
-Typical workflow:
-
-1. Run tests under CPython.
-2. Attempt translation.
-3. Fix annotation errors.
-4. Repeat.
-
 ## 15. Python Version Constraints
 
 RPython is Python 2–based.
 
 * Use Python 2.7-compatible syntax.
 * Avoid Python 3 features.
-* If needed, use `from __future__ import print_function`.
 
 ## 16. Common Failure Modes
 
@@ -828,11 +820,16 @@ RPython is Python 2–based.
 * Dynamic attribute creation.
 * Type narrowing across control flow.
 * Hidden object allocations in loops.
+* Closures can't be traced by RPython.
 * Missing JIT hints for fixed small loops.
 * Calling `long()` or `int()` as a function (use RLib arithmetic or specialized helpers instead).
 * Calling `.append()` on a list attribute after it has been hinted as immutable.
 * String Nullability Mismatch: Passing a string inferred as `SomeString(can_be_None=True)` (e.g., from `os.read` or a global) to a function expecting `SomeString(can_be_None=False)` (like `rffi.str2charp`). Use `rposix.read` or an explicit `assert x is not None` to narrow the type.
 * EBADF (Bad File Descriptor): Double-closing a file descriptor in a `try...except` block where the error-raising path already performed a cleanup.
+* String Nullability Mismatch Passing a string inferred as `SomeString(can_be_None=True)` (e.g., from `os.read` or a global) to a function expecting `SomeString(can_be_None=False)` (like `rffi.str2charp`). Use `rposix.read` or an explicit `assert x is not None` to narrow the type.
+* Calling `long()` or `int()` as a function: Use RLib arithmetic or specialized helpers instead.
+* EBADF (Bad File Descriptor): Double-closing a file descriptor in a `try...except` block where the error-raising path already performed a cleanup.
+* Calling `.append()` on a list attribute after it has been hinted as immutable.
 
 ## 17. Recommended Design Patterns
 
@@ -894,6 +891,18 @@ def __init__(self, filename):
 
 ### 18.3 Inode and Size Consistency
 Always cast `st_ino` and `st_size` to fixed-width types (e.g., `rffi.ULONGLONG`) immediately after a `stat` call if they are to be stored for comparison or cross-process synchronization. This prevents annotation errors where one code path treats an inode as a Python `int` and another as a C `long`.
+
+### 18.4 Scoped FFI Pointers (RAII)
+Avoid manual `rffi.str2charp` and `rffi.free_charp` pairs. They are prone to leaks in error paths. Use the RPython context manager:
+
+```python
+from rpython.rtyper.lltypesystem import rffi
+ 
+with rffi.scoped_str2charp(my_string) as ptr:
+    # ptr is guaranteed non-null and valid only in this block
+    do_c_call(ptr)
+# ptr is automatically freed here, even if an exception occurs
+```
 
 # Summary
 
