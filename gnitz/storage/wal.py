@@ -1,6 +1,6 @@
 import os
 import errno
-from rpython.rlib import rposix
+from rpython.rlib import rposix, rposix_stat
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import wal_format, mmap_posix, errors
 
@@ -9,44 +9,47 @@ class WALReader(object):
         self.filename = filename
         self.schema = schema
         self.fd = -1
-        self.last_inode = rffi.cast(rffi.LONGLONG, -1)
+        self.last_inode = rffi.cast(rffi.ULONGLONG, 0)
         self.closed = False
         self._open_file()
     
     def _open_file(self):
-        # Open to a local variable first to prevent leaks on validation failure
-        fd = rposix.open(self.filename, os.O_RDONLY, 0)
+        # Local variable pattern to prevent double-close/leaks
+        new_fd = rposix.open(self.filename, os.O_RDONLY, 0)
         try:
-            st = os.fstat(fd)
+            st = rposix_stat.fstat(new_fd)
             
-            # If we were already open (rotation), close the old one now
+            # Close existing fd if we are rotating/re-opening
             if self.fd != -1:
                 rposix.close(self.fd)
                 
-            self.fd = fd
-            self.last_inode = rffi.cast(rffi.LONGLONG, st.st_ino)
+            self.fd = new_fd
+            self.last_inode = rffi.cast(rffi.ULONGLONG, st.st_ino)
         except Exception:
-            rposix.close(fd)
+            if new_fd != -1:
+                rposix.close(new_fd)
             raise
 
     def _has_rotated(self):
         try:
-            st = os.stat(self.filename)
-            return rffi.cast(rffi.LONGLONG, st.st_ino) != self.last_inode
+            st = rposix_stat.stat(self.filename)
+            return rffi.cast(rffi.ULONGLONG, st.st_ino) != self.last_inode
         except OSError as e:
             if e.errno == errno.ENOENT:
                 return False
             raise e
 
     def read_next_block(self):
-        if self.closed: return (False, 0, 0, [])
+        if self.closed: 
+            return (False, 0, 0, [])
         
-        header_str = os.read(self.fd, wal_format.WAL_BLOCK_HEADER_SIZE)
+        # rposix.read returns non-nullable SomeString
+        header_str = rposix.read(self.fd, wal_format.WAL_BLOCK_HEADER_SIZE)
         
         if len(header_str) < wal_format.WAL_BLOCK_HEADER_SIZE:
             if self._has_rotated():
                 self._open_file()
-                header_str = os.read(self.fd, wal_format.WAL_BLOCK_HEADER_SIZE)
+                header_str = rposix.read(self.fd, wal_format.WAL_BLOCK_HEADER_SIZE)
                 if len(header_str) < wal_format.WAL_BLOCK_HEADER_SIZE:
                     return (False, 0, 0, [])
             else:
@@ -61,7 +64,7 @@ class WALReader(object):
             if body_size < 0:
                 raise errors.CorruptShardError("Invalid WAL block size in header")
 
-            body_str = os.read(self.fd, body_size)
+            body_str = rposix.read(self.fd, body_size)
             if len(body_str) < body_size: 
                 return (False, 0, 0, [])
             
@@ -78,7 +81,8 @@ class WALReader(object):
     def iterate_blocks(self):
         while True:
             valid, lsn, tid, records = self.read_next_block()
-            if not valid: break
+            if not valid: 
+                break
             yield (lsn, tid, records)
     
     def close(self):
@@ -93,6 +97,7 @@ class WALWriter(object):
         self.filename = filename
         self.schema = schema
         self.closed = False
+        self.fd = -1
         
         fd = rposix.open(filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
@@ -100,16 +105,19 @@ class WALWriter(object):
                 raise errors.StorageError("WAL locked by another process")
             self.fd = fd
         except Exception:
-            rposix.close(fd)
+            if fd != -1:
+                rposix.close(fd)
             raise
     
     def append_block(self, lsn, table_id, records):
-        if self.closed: raise errors.StorageError("WAL writer closed")
+        if self.closed: 
+            raise errors.StorageError("WAL writer closed")
         wal_format.write_wal_block(self.fd, lsn, table_id, records, self.schema)
         mmap_posix.fsync_c(self.fd)
 
     def truncate_before_lsn(self, target_lsn):
-        if self.closed: return
+        if self.closed: 
+            return
         
         tmp_name = self.filename + ".trunc"
         reader = WALReader(self.filename, self.schema)
@@ -117,7 +125,6 @@ class WALWriter(object):
             out_fd = rposix.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             try:
                 for lsn, tid, records in reader.iterate_blocks():
-                    # Fixed: Compare r_uint64 directly without casting to signed int
                     if lsn >= target_lsn:
                         wal_format.write_wal_block(out_fd, lsn, tid, records, self.schema)
                 mmap_posix.fsync_c(out_fd)
@@ -126,24 +133,29 @@ class WALWriter(object):
         finally:
             reader.close()
         
+        # Cleanup old FD before replacement
         mmap_posix.unlock_file(self.fd)
         rposix.close(self.fd)
+        self.fd = -1
+        
         os.rename(tmp_name, self.filename)
         
-        # Re-open and lock
-        fd = rposix.open(self.filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        # Re-open using Atomic Resource pattern
+        new_fd = rposix.open(self.filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
-            if not mmap_posix.try_lock_exclusive(fd):
+            if not mmap_posix.try_lock_exclusive(new_fd):
                  raise errors.StorageError("Failed to re-lock WAL after truncation")
-            self.fd = fd
+            self.fd = new_fd
         except Exception:
-            rposix.close(fd)
+            if new_fd != -1:
+                rposix.close(new_fd)
             raise
 
     def close(self):
         if not self.closed:
-            mmap_posix.fsync_c(self.fd)
-            mmap_posix.unlock_file(self.fd)
-            rposix.close(self.fd)
-            self.fd = -1
+            if self.fd != -1:
+                mmap_posix.fsync_c(self.fd)
+                mmap_posix.unlock_file(self.fd)
+                rposix.close(self.fd)
+                self.fd = -1
             self.closed = True

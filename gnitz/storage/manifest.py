@@ -67,14 +67,14 @@ def _write_manifest_entry(fd, entry):
         for i in range(ENTRY_SIZE): entry_buf[i] = '\x00'
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_TABLE_ID))[0] = rffi.cast(rffi.ULONGLONG, entry.table_id)
         
-        mask = r_uint128(0xFFFFFFFFFFFFFFFF)
-        min_lo = r_uint64(entry.min_key & mask)
-        min_hi = r_uint64((entry.min_key >> 64) & mask)
+        # RPython: casting r_uint128 to r_uint64 truncates to lower 64 bits.
+        min_lo = r_uint64(entry.min_key)
+        min_hi = r_uint64(entry.min_key >> 64)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MIN_KEY))[0] = rffi.cast(rffi.ULONGLONG, min_lo)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MIN_KEY + 8))[0] = rffi.cast(rffi.ULONGLONG, min_hi)
         
-        max_lo = r_uint64(entry.max_key & mask)
-        max_hi = r_uint64((entry.max_key >> 64) & mask)
+        max_lo = r_uint64(entry.max_key)
+        max_hi = r_uint64(entry.max_key >> 64)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_KEY))[0] = rffi.cast(rffi.ULONGLONG, max_lo)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, OFF_MAX_KEY + 8))[0] = rffi.cast(rffi.ULONGLONG, max_hi)
         

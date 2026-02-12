@@ -40,9 +40,9 @@ class RawBuffer(object):
     def append_u128(self, value):
         self.ensure_capacity(1)
         target = rffi.cast(rffi.CCHARP, rffi.ptradd(self.ptr, self.count * 16))
-        mask = r_uint128(0xFFFFFFFFFFFFFFFF)
-        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(value & mask))
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64((value >> 64) & mask))
+        # Casting r_uint128 to r_uint64 is an explicit truncation in RPython
+        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(value))
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(value >> 64))
         self.count += 1
 
     def append_u64(self, value):

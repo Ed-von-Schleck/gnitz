@@ -432,9 +432,9 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
 *   **Write-Heavy Tiers:** Minimizes ingestion stalls by allowing higher overlap depth in upper FLSM levels while maintaining row-oriented WAL segments.
 *   **Read-Heavy Guard Shards:** Prioritizes the consolidation of shards into large, non-overlapping N-Partition columnar blocks to maximize binary search performance and minimize the number of `mmap` handles required for snapshot resolution.
 
-## Appendix A: RPython Implementation Patterns and Best Practices
+# Appendix A: RPython Implementation Patterns and Best Practices
 
-# RPython Engineering Reference
+## RPython Engineering Reference
 
 **Designing Code for the RPython Translation Toolchain**
 
@@ -442,9 +442,9 @@ This document is a technical reference for experienced systems developers writin
 
 RPython is a **statically analyzable subset of Python 2**, designed for whole-program translation to C and optional meta-tracing JIT generation. Code must be predictable under global type inference.
 
-# 1. Architectural Model
+## 1. Architectural Model
 
-## 1.1 Whole-Program Static Analysis
+### 1.1 Whole-Program Static Analysis
 
 The RPython translator:
 
@@ -455,7 +455,7 @@ The RPython translator:
 
 All reachable code is analyzed. Dead code elimination happens *after* annotation, not before.
 
-### Implications
+#### Implications
 
 * No runtime type polymorphism beyond what can be statically inferred.
 * No dynamic structural changes to objects.
@@ -464,7 +464,7 @@ All reachable code is analyzed. Dead code elimination happens *after* annotation
 
 If the annotator cannot prove a property statically, translation fails.
 
-# 2. Entry Point and Translation Contract
+## 2. Entry Point and Translation Contract
 
 RPython programs are not executed via `__main__`. The toolchain requires a **target function**:
 
@@ -485,11 +485,11 @@ Constraints:
 
 The `target()` function defines the translation root.
 
-# 3. Language Subset Constraints
+## 3. Language Subset Constraints
 
 RPython is Python 2 syntax with strict semantic restrictions.
 
-## 3.1 Disallowed or Severely Restricted
+### 3.1 Disallowed or Severely Restricted
 
 * `eval`, `exec`
 * Dynamic class creation
@@ -502,7 +502,7 @@ RPython is Python 2 syntax with strict semantic restrictions.
 * Most of `inspect`, `threading`, `multiprocessing`
 * Most of the Python stdlib
 
-## 3.2 Allowed but Constrained
+### 3.2 Allowed but Constrained
 
 * `*args` allowed in definitions, but avoid unless tuple type is statically known.
 * Generators: limited support, avoid complex yield flows.
@@ -510,9 +510,9 @@ RPython is Python 2 syntax with strict semantic restrictions.
 * Default arguments: supported.
 * Exceptions: supported, but heavy use may impact JIT performance.
 
-# 4. Static Typing Model
+## 4. Static Typing Model
 
-## 4.1 Monomorphic Variables
+### 4.1 Monomorphic Variables
 
 Each variable has a single static type per control-flow merge point.
 
@@ -549,9 +549,9 @@ else:
 
 Common base type required.
 
-# 5. Containers
+## 5. Containers
 
-## 5.1 Homogeneous Lists
+### 5.1 Homogeneous Lists
 
 Lists are statically typed arrays.
 
@@ -579,13 +579,13 @@ lst = [IntValue(1), StrValue("a")]
 
 Use wrapper objects for heterogeneous logical data.
 
-## 5.2 Dicts
+### 5.2 Dicts
 
 * Keys and values must be statically typed.
 * Use `rpython.rlib.objectmodel.r_dict` for custom equality/hash behavior.
 * No `set` type — emulate via dict or list.
 
-# 6. Function Signatures
+## 6. Function Signatures
 
 Avoid dynamic signatures.
 
@@ -610,7 +610,7 @@ def f(args):  # args is List[int]
     ...
 ```
 
-# 7. Global State
+## 7. Global State
 
 Globals are treated as **constants**.
 
@@ -631,7 +631,7 @@ state = State()
 
 Mutate attributes of prebuilt objects, not the binding itself.
 
-# 8. Standard Library and Runtime Environment
+## 8. Standard Library and Runtime Environment
 
 Only a small subset of stdlib is usable.
 
@@ -656,11 +656,11 @@ Use RPython libraries:
 
 Do not assume arbitrary stdlib availability.
 
-# 9. Integer Semantics and Arithmetic
+## 9. Integer Semantics and Arithmetic
 
 Python `int` behaves differently pre- and post-translation.
 
-## 9.1 Signed Integers
+### 9.1 Signed Integers
 
 RPython `int`:
 
@@ -676,7 +676,7 @@ from rpython.rlib.rarithmetic import ovfcheck, intmask
 * `ovfcheck(x + y)` forces overflow detection.
 * `intmask(x)` truncates to machine word.
 
-## 9.2 Unsigned and Fixed-Width Types
+### 9.2 Unsigned and Fixed-Width Types
 
 Use:
 
@@ -701,7 +701,7 @@ Do not rely on Python arbitrary precision semantics.
 *   **The Constructor Trap:** Built-in Python type descriptors (like `int`, `long`, `float`, `str`) are "frozen" in RPython. You **cannot** call them as functions (e.g., `x = long(y)`). This results in a `FrozenDesc` error.
 *   **Correct Conversion:** Use RPython's specialized casting functions or the `@specialize.argtype` pattern to convert between primitive types.
 
-# 10. Object Model Discipline
+## 10. Object Model Discipline
 
 * Define all classes at import time.
 * No monkey-patching.
@@ -711,7 +711,7 @@ Do not rely on Python arbitrary precision semantics.
 
 Keep class hierarchies simple.
 
-# 11. Memory and Allocation Discipline
+## 11. Memory and Allocation Discipline
 
 Every allocation is visible to the annotator.
 
@@ -730,11 +730,11 @@ Split APIs:
 When a list is designated as an immutable field (e.g., `columns[*]`), avoid populating it via `.append()` inside `__init__`. The RPython annotator may "freeze" the list's size and type before the loop completes, leading to `ListChangeUnallowed`. 
 *   **Preferred:** Use list comprehensions or pre-allocate with a fixed size: `self.items = [None] * size`.
 
-# 12. Designing for the Meta-Tracing JIT
+## 12. Designing for the Meta-Tracing JIT
 
 The RPython JIT traces interpreter loops.
 
-## 12.1 Write Trace-Friendly Code
+### 12.1 Write Trace-Friendly Code
 
 Prefer:
 
@@ -749,7 +749,7 @@ Avoid:
 * Excessive exception-driven control flow
 * Complex comprehensions
 
-## 12.2 JIT Hints
+### 12.2 JIT Hints
 
 From `rpython.rlib.jit`:
 
@@ -776,7 +776,7 @@ def dispatch(opcode):
 
 These hints are not optional in serious performance work.
 
-## 12.3 Hot Loop Structure
+### 12.3 Hot Loop Structure
 
 The JIT works best when:
 
@@ -786,7 +786,7 @@ The JIT works best when:
 
 Avoid hiding the dispatch loop inside abstractions.
 
-# 13. Error Handling
+## 13. Error Handling
 
 Exceptions are supported but:
 
@@ -798,7 +798,7 @@ Prefer:
 * Error codes in tight loops.
 * Exceptions at API boundaries.
 
-# 14. Testing Strategy
+## 14. Testing Strategy
 
 * Unit tests may run under CPython.
 * Always test translation regularly.
@@ -811,7 +811,7 @@ Typical workflow:
 3. Fix annotation errors.
 4. Repeat.
 
-# 15. Python Version Constraints
+## 15. Python Version Constraints
 
 RPython is Python 2–based.
 
@@ -819,7 +819,7 @@ RPython is Python 2–based.
 * Avoid Python 3 features.
 * If needed, use `from __future__ import print_function`.
 
-# 16. Common Failure Modes
+## 16. Common Failure Modes
 
 * Variable inferred as incompatible types.
 * List element type instability.
@@ -831,10 +831,12 @@ RPython is Python 2–based.
 * Missing JIT hints for fixed small loops.
 * Calling `long()` or `int()` as a function (use RLib arithmetic or specialized helpers instead).
 * Calling `.append()` on a list attribute after it has been hinted as immutable.
+* String Nullability Mismatch: Passing a string inferred as `SomeString(can_be_None=True)` (e.g., from `os.read` or a global) to a function expecting `SomeString(can_be_None=False)` (like `rffi.str2charp`). Use `rposix.read` or an explicit `assert x is not None` to narrow the type.
+* EBADF (Bad File Descriptor): Double-closing a file descriptor in a `try...except` block where the error-raising path already performed a cleanup.
 
-# 17. Recommended Design Patterns
+## 17. Recommended Design Patterns
 
-## 17.1 Value Object Pattern
+### 17.1 Value Object Pattern
 
 For heterogeneous logical data:
 
@@ -842,16 +844,16 @@ For heterogeneous logical data:
 * Subclass per concrete type.
 * Store homogeneous list of base type.
 
-## 17.2 Explicit State Object
+### 17.2 Explicit State Object
 
 Avoid global mutation; use a singleton state object.
 
-## 17.3 Layered API
+### 17.3 Layered API
 
 * Public API: object-oriented, safe.
 * Internal engine: flat, primitive-heavy.
 
-## 17.4 Table-Driven Dispatch
+### 17.4 Table-Driven Dispatch
 
 Use fixed arrays or tuples of callables.
 
@@ -861,6 +863,37 @@ If iterating over small fixed collections:
 for field in jit.unrolling_iterable(FIELDS):
     ...
 ```
+
+## 18. Advanced RPython I/O and Type Safety
+
+18.1 Use `rposix` over `os` for I/O**
+Standard `os.read` and `os.write` are often wrapped by the annotator in a way that introduces nullability. For low-level memory operations:
+*   Use `rpython.rlib.rposix.read(fd, count)`: It is guaranteed to return a non-nullable string.
+*   Use `rpython.rlib.rposix_stat.stat(path)` and `fstat(fd)`: These return a `stat_result` with strictly typed fields (e.g., `st_ino` as a fixed-width integer), avoiding C-level signed/unsigned comparison warnings.
+
+### 18.2 The Atomic Resource Initialization Pattern
+When initializing objects that own a file descriptor, follow a "Local-to-Self" handover to prevent leaks and double-closes during initialization failure:
+
+```python
+def __init__(self, filename):
+    self.fd = -1
+    # 1. Open to a local variable
+    fd = rposix.open(filename, os.O_RDONLY, 0)
+    try:
+        # 2. Perform operations that might fail (locking, stat)
+        if not try_lock(fd):
+            raise OSError("Locked")
+        # 3. Only assign to self once the resource is fully ready
+        self.fd = fd
+    except Exception:
+        # 4. If we haven't assigned to self yet, close the local fd
+        if fd != -1:
+            rposix.close(fd)
+        raise
+```
+
+### 18.3 Inode and Size Consistency
+Always cast `st_ino` and `st_size` to fixed-width types (e.g., `rffi.ULONGLONG`) immediately after a `stat` call if they are to be stored for comparison or cross-process synchronization. This prevents annotation errors where one code path treats an inode as a Python `int` and another as a C `long`.
 
 # Summary
 

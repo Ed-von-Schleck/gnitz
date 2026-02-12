@@ -57,8 +57,9 @@ class TournamentTree(object):
     def _heap_push(self, key, c_idx):
         idx = self.heap_size
         self.heap_size += 1
-        self.heap[idx].key_low = rffi.cast(rffi.ULONGLONG, key & 0xFFFFFFFFFFFFFFFF)
-        self.heap[idx].key_high = rffi.cast(rffi.ULONGLONG, key >> 64)
+        # Truncation via r_uint64() cast to avoid prebuilt long literals
+        self.heap[idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(key))
+        self.heap[idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(key >> 64))
         self.heap[idx].cursor_idx = rffi.cast(rffi.INT, c_idx)
         self._sift_up(idx)
 
@@ -148,8 +149,9 @@ class TournamentTree(object):
                 if self.heap_size > 0: self._sift_down(0)
             else:
                 nk = self.cursors[c_idx].peek_key()
-                self.heap[0].key_low = rffi.cast(rffi.ULONGLONG, nk & 0xFFFFFFFFFFFFFFFF)
-                self.heap[0].key_high = rffi.cast(rffi.ULONGLONG, nk >> 64)
+                # Truncation via r_uint64() cast
+                self.heap[0].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(nk))
+                self.heap[0].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(nk >> 64))
                 self._sift_down(0)
 
     def is_exhausted(self): return self.heap_size == 0

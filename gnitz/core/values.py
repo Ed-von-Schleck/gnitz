@@ -55,8 +55,9 @@ def wrap(val):
     if isinstance(val, float):
         return FloatValue(val)
     if isinstance(val, (int, long)):
-        # Check if it might be 128-bit
-        if val > 0xFFFFFFFFFFFFFFFF:
+        # Check if it might be 128-bit.
+        # RPython: comparing a Python long against a machine constant works.
+        if val > r_uint64(-1):
             return U128Value(val)
         return IntValue(val)
     if isinstance(val, str):
