@@ -25,19 +25,19 @@ def compare_values_to_packed(schema, values, packed_ptr, heap_ptr):
             res = string_logic.compare_db_value_to_german(val_obj, p_node, heap_ptr)
             if res != 0: return res
         elif f_type == types.TYPE_F64:
-            v_obj = val_obj.get_float() # Fixed: Use method
+            v_obj = val_obj.get_float()
             v_node = float(rffi.cast(rffi.DOUBLEP, p_node)[0])
             if v_node < v_obj: return 1
             if v_node > v_obj: return -1
         elif f_type == types.TYPE_U128:
-            v_obj = val_obj.get_u128() # Fixed: Use method
+            v_obj = val_obj.get_u128()
             lo = rffi.cast(rffi.ULONGLONGP, p_node)[0]
             hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(p_node, 8))[0]
             v_node = (r_uint128(hi) << 64) | r_uint128(lo)
             if v_node < v_obj: return 1
             if v_node > v_obj: return -1
         else:
-            v_obj = val_obj.get_int() # Fixed: Use method
+            v_obj = val_obj.get_int()
             v_node = rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, p_node)[0])
             if v_node < v_obj: return 1
             if v_node > v_obj: return -1
@@ -77,8 +77,6 @@ def compare_soa_rows(schema, view1, idx1, view2, idx2):
 
 @jit.unroll_safe
 def compare_soa_to_values(schema, view, idx, values):
-    p_node = view.get_col_ptr(idx, 0) # This is dummy, logic below uses specific col pointers
-    # Reuse values-to-packed logic by wrapping shard access
     val_idx = 0
     for i in _COLUMN_ITERABLE:
         if i >= len(schema.columns): break
@@ -91,13 +89,20 @@ def compare_soa_to_values(schema, view, idx, values):
             res = string_logic.compare_db_value_to_german(val_obj, p_shard, view.blob_buf.ptr)
             if res != 0: return res
         elif f_type == types.TYPE_F64:
-            v_obj = val_obj.v if isinstance(val_obj, db_values.FloatValue) else 0.0
+            v_obj = val_obj.get_float()
             v_shard = float(rffi.cast(rffi.DOUBLEP, p_shard)[0])
             if v_shard < v_obj: return 1
             if v_shard > v_obj: return -1
+        elif f_type == types.TYPE_U128:
+            v_obj = val_obj.get_u128()
+            lo = rffi.cast(rffi.ULONGLONGP, p_shard)[0]
+            hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(p_shard, 8))[0]
+            v_shard = (r_uint128(hi) << 64) | r_uint128(lo)
+            if v_shard < v_obj: return 1
+            if v_shard > v_obj: return -1
         else:
-            v_obj = int(val_obj.v) if isinstance(val_obj, db_values.IntValue) else 0
-            v_shard = int(rffi.cast(rffi.LONGLONGP, p_shard)[0])
+            v_obj = val_obj.get_int()
+            v_shard = rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, p_shard)[0])
             if v_shard < v_obj: return 1
             if v_shard > v_obj: return -1
     return 0
