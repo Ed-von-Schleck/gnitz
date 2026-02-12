@@ -36,18 +36,19 @@ class Engine(object):
     def recover_from_wal(self, filename):
         try:
             reader = wal.WALReader(filename, self.schema)
-            max_lsn_seen = int(self.current_lsn) - 1
+            # Use r_uint64 for LSN arithmetic and comparisons to satisfy RPython annotator
+            max_lsn_seen = self.current_lsn - r_uint64(1)
             last_recovered_lsn = max_lsn_seen
             
             for lsn, tid, records in reader.iterate_blocks():
                 if tid != self.table_id: continue
-                if int(lsn) <= max_lsn_seen: continue
+                if lsn <= max_lsn_seen: continue
                 
-                last_recovered_lsn = int(lsn)
+                last_recovered_lsn = lsn
                 for rec in records:
                     self.mem_manager.active_table.upsert(rec.primary_key, rec.weight, rec.component_data)
             
-            self.current_lsn = r_uint64(last_recovered_lsn + 1)
+            self.current_lsn = last_recovered_lsn + r_uint64(1)
             self.mem_manager.current_lsn = self.current_lsn
             reader.close()
         except OSError as e:

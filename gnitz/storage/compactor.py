@@ -1,6 +1,6 @@
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, intmask
 from gnitz.storage import shard_table, writer_table, tournament_tree, compaction_logic
 
 class CompactionPolicy(object):
@@ -60,7 +60,9 @@ def execute_compaction(table_id, policy, manifest_mgr, ref_counter, schema, outp
     if not shards: return None
     
     input_files = [s.filename for s in shards]
-    out_filename = os.path.join(output_dir, "compacted_%d_%d.db" % (table_id, int(shards[0].min_lsn)))
+    # Fixed: Use intmask for string formatting to satisfy RPython annotator
+    lsn_val = intmask(shards[0].min_lsn)
+    out_filename = os.path.join(output_dir, "compacted_%d_%d.db" % (table_id, lsn_val))
     
     for f in input_files: ref_counter.acquire(f)
     try:

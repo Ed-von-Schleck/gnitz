@@ -1,6 +1,6 @@
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint64
+from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.storage import memtable_node, spine, engine, manifest, shard_registry, refcount, wal, compactor, memtable_manager
@@ -79,8 +79,10 @@ class PersistentTable(object):
         return self.engine.get_effective_weight_raw(r_uint128(key), db_values_list)
 
     def flush(self):
+        # Fixed: Use intmask for string formatting to satisfy RPython annotator
+        lsn_val = intmask(self.mem_manager.starting_lsn)
         filename = os.path.join(self.directory, "%s_shard_%d.db" % (
-            self.name, int(self.mem_manager.starting_lsn))
+            self.name, lsn_val)
         )
         min_key, max_key, needs_compaction = self.engine.flush_and_rotate(filename)
         self.checkpoint()
@@ -91,7 +93,7 @@ class PersistentTable(object):
             reader = self.manifest_manager.load_current()
             lsn = reader.global_max_lsn
             reader.close()
-            # Prune WAL up to the global max LSN recorded in the shards
+            # Fixed: Remove forbidden int() cast; WALWriter accepts r_uint64
             self.wal_writer.truncate_before_lsn(lsn + r_uint64(1))
 
     def _trigger_compaction(self):
@@ -175,8 +177,8 @@ class ZSet(object):
             w = memtable_node.node_get_weight(base, curr)
             if w != 0:
                 k = memtable_node.node_get_key(base, curr, table.key_size)
-                # Downcast to int for u64 keys to simplify standard tests
-                k_val = int(k) if table.key_size == 8 else k
+                # Fixed: Use intmask instead of int() to satisfy RPython annotator
+                k_val = intmask(k) if table.key_size == 8 else k
                 p = memtable_node.unpack_payload_to_values(table, curr)
                 yield (k_val, int(w), p)
             curr = memtable_node.node_get_next_off(base, curr, 0)

@@ -117,7 +117,8 @@ class WALWriter(object):
             out_fd = rposix.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             try:
                 for lsn, tid, records in reader.iterate_blocks():
-                    if int(lsn) >= int(target_lsn):
+                    # Fixed: Compare r_uint64 directly without casting to signed int
+                    if lsn >= target_lsn:
                         wal_format.write_wal_block(out_fd, lsn, tid, records, self.schema)
                 mmap_posix.fsync_c(out_fd)
             finally:
