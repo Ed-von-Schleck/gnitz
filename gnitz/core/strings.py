@@ -120,7 +120,7 @@ def compare_db_value_to_german(val_obj, german_ptr, heap_ptr):
     Returns: -1 if structure < value, 1 if structure > value, 0 if equal.
     Used for SkipList/Engine lookups without allocating arena space.
     """
-    s2 = val_obj.v
+    s2 = val_obj.get_string()
     len2 = len(s2)
     u32_ptr = rffi.cast(rffi.UINTP, german_ptr)
     len1 = rffi.cast(lltype.Signed, u32_ptr[0])

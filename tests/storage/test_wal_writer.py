@@ -1,8 +1,8 @@
 import unittest
 import os
-from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rtyper.lltypesystem import rffi
 from gnitz.storage import wal, wal_format, errors
-from gnitz.core import types, strings as string_logic
+from gnitz.core import types, values as db_values
 
 class TestWALWriter(unittest.TestCase):
     def setUp(self):
@@ -14,17 +14,6 @@ class TestWALWriter(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.test_wal):
             os.unlink(self.test_wal)
-    
-    def _create_packed_component(self, value, label):
-        stride = self.layout.stride
-        buf = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
-        try:
-            for i in range(stride): buf[i] = '\x00'
-            rffi.cast(rffi.LONGLONGP, buf)[0] = rffi.cast(rffi.LONGLONG, value)
-            string_logic.pack_string(rffi.ptradd(buf, 8), label, 0)
-            return rffi.charpsize2str(buf, stride)
-        finally:
-            lltype.free(buf, flavor='raw')
     
     def test_create_wal_file(self):
         """Test that WAL file is created on initialization."""
@@ -53,9 +42,8 @@ class TestWALWriter(unittest.TestCase):
         """Test writing a single block with records."""
         writer = wal.WALWriter(self.test_wal, self.layout)
         
-        # Create records
-        component_data = self._create_packed_component(42, "test")
-        records = [wal_format.WALRecord(10, 1, component_data)]
+        # Use DBValue objects as required by wal_format
+        records = [wal_format.WALRecord(10, 1, [db_values.IntValue(42), db_values.StringValue("test")])]
         
         # Write block
         writer.append_block(1, 1, records)
@@ -63,7 +51,7 @@ class TestWALWriter(unittest.TestCase):
         
         # Verify file size
         file_size = os.path.getsize(self.test_wal)
-        expected_size = wal_format.WAL_BLOCK_HEADER_SIZE + (16 + self.layout.stride)
+        expected_size = wal_format.WAL_BLOCK_HEADER_SIZE + (8 + 8 + self.layout.stride)
         self.assertEqual(file_size, expected_size)
     
     def test_write_multiple_blocks(self):
@@ -72,15 +60,15 @@ class TestWALWriter(unittest.TestCase):
         
         # Write 3 blocks
         for lsn in range(1, 4):
-            component_data = self._create_packed_component(lsn * 10, "block_%d" % lsn)
-            records = [wal_format.WALRecord(lsn, 1, component_data)]
+            recs = [db_values.IntValue(lsn * 10), db_values.StringValue("block_%d" % lsn)]
+            records = [wal_format.WALRecord(lsn, 1, recs)]
             writer.append_block(lsn, 1, records)
         
         writer.close()
         
         # Verify file size (3 blocks, each with 1 record)
         file_size = os.path.getsize(self.test_wal)
-        block_size = wal_format.WAL_BLOCK_HEADER_SIZE + (16 + self.layout.stride)
+        block_size = wal_format.WAL_BLOCK_HEADER_SIZE + (8 + 8 + self.layout.stride)
         expected_size = block_size * 3
         self.assertEqual(file_size, expected_size)
     
@@ -89,20 +77,20 @@ class TestWALWriter(unittest.TestCase):
         writer = wal.WALWriter(self.test_wal, self.layout)
         
         # Write first block
-        component_data = self._create_packed_component(1, "first")
-        records = [wal_format.WALRecord(1, 1, component_data)]
+        recs1 = [db_values.IntValue(1), db_values.StringValue("first")]
+        records = [wal_format.WALRecord(1, 1, recs1)]
         writer.append_block(1, 1, records)
         
         size_after_first = os.path.getsize(self.test_wal)
         
         # Write second block
-        component_data = self._create_packed_component(2, "second")
-        records = [wal_format.WALRecord(2, 1, component_data)]
+        recs2 = [db_values.IntValue(2), db_values.StringValue("second")]
+        records = [wal_format.WALRecord(2, 1, recs2)]
         writer.append_block(2, 1, records)
         
         size_after_second = os.path.getsize(self.test_wal)
         
-        # Second size should be exactly double the first
+        # Second size should be exactly double the first (fixed-stride payload used)
         self.assertEqual(size_after_second, size_after_first * 2)
         
         writer.close()
@@ -111,8 +99,8 @@ class TestWALWriter(unittest.TestCase):
         """Test that data is synced to disk (file exists after write)."""
         writer = wal.WALWriter(self.test_wal, self.layout)
         
-        component_data = self._create_packed_component(999, "durable")
-        records = [wal_format.WALRecord(100, 1, component_data)]
+        recs = [db_values.IntValue(999), db_values.StringValue("durable")]
+        records = [wal_format.WALRecord(100, 1, recs)]
         
         # Write block (should fsync)
         writer.append_block(1, 1, records)
@@ -127,15 +115,15 @@ class TestWALWriter(unittest.TestCase):
         """Test that written blocks can be read back correctly."""
         writer = wal.WALWriter(self.test_wal, self.layout)
         for lsn in range(1, 3):
-            component_data = self._create_packed_component(lsn * 100, "lsn_%d" % lsn)
-            records = [wal_format.WALRecord(lsn * 10, 1, component_data)]
+            recs = [db_values.IntValue(lsn * 100), db_values.StringValue("lsn_%d" % lsn)]
+            records = [wal_format.WALRecord(lsn * 10, 1, recs)]
             writer.append_block(lsn, lsn, records)
         writer.close()
         
         with open(self.test_wal, 'rb') as f:
             data = f.read()
         
-        block_size = wal_format.WAL_BLOCK_HEADER_SIZE + (16 + self.layout.stride)
+        block_size = wal_format.WAL_BLOCK_HEADER_SIZE + (8 + 8 + self.layout.stride)
         
         # Block 1
         block1_data = data[:block_size]
@@ -144,8 +132,8 @@ class TestWALWriter(unittest.TestCase):
             lsn1, comp_id1, records1 = wal_format.decode_wal_block(p1, len(block1_data), self.layout)
             self.assertEqual(lsn1, 1)
             self.assertEqual(comp_id1, 1)
-            # Use attribute access
             self.assertEqual(records1[0].primary_key, 10)
+            self.assertEqual(records1[0].component_data[0].get_int(), 100)
         finally:
             rffi.free_charp(p1)
         
@@ -156,8 +144,8 @@ class TestWALWriter(unittest.TestCase):
             lsn2, comp_id2, records2 = wal_format.decode_wal_block(p2, len(block2_data), self.layout)
             self.assertEqual(lsn2, 2)
             self.assertEqual(comp_id2, 2)
-            # Use attribute access
             self.assertEqual(records2[0].primary_key, 20)
+            self.assertEqual(records2[0].component_data[0].get_int(), 200)
         finally:
             rffi.free_charp(p2)
 
@@ -166,8 +154,8 @@ class TestWALWriter(unittest.TestCase):
         writer = wal.WALWriter(self.test_wal, self.layout)
         records = []
         for i in range(5):
-            component_data = self._create_packed_component(i, "rec_%d" % i)
-            records.append(wal_format.WALRecord(100 + i, 1, component_data))
+            recs = [db_values.IntValue(i), db_values.StringValue("rec_%d" % i)]
+            records.append(wal_format.WALRecord(100 + i, 1, recs))
         writer.append_block(10, 5, records)
         writer.close()
         
@@ -185,8 +173,8 @@ class TestWALWriter(unittest.TestCase):
         """Test that O_APPEND mode preserves existing data."""
         # Write initial block
         writer1 = wal.WALWriter(self.test_wal, self.layout)
-        component_data = self._create_packed_component(1, "first")
-        records = [wal_format.WALRecord(1, 1, component_data)]
+        recs1 = [db_values.IntValue(1), db_values.StringValue("first")]
+        records = [wal_format.WALRecord(1, 1, recs1)]
         writer1.append_block(1, 1, records)
         writer1.close()
         
@@ -194,8 +182,8 @@ class TestWALWriter(unittest.TestCase):
         
         # Open again and append
         writer2 = wal.WALWriter(self.test_wal, self.layout)
-        component_data = self._create_packed_component(2, "second")
-        records = [wal_format.WALRecord(2, 1, component_data)]
+        recs2 = [db_values.IntValue(2), db_values.StringValue("second")]
+        records = [wal_format.WALRecord(2, 1, recs2)]
         writer2.append_block(2, 1, records)
         writer2.close()
         
@@ -209,8 +197,8 @@ class TestWALWriter(unittest.TestCase):
         writer = wal.WALWriter(self.test_wal, self.layout)
         writer.close()
         
-        component_data = self._create_packed_component(1, "fail")
-        records = [wal_format.WALRecord(1, 1, component_data)]
+        recs = [db_values.IntValue(1), db_values.StringValue("fail")]
+        records = [wal_format.WALRecord(1, 1, recs)]
         
         # Should raise StorageError
         with self.assertRaises(errors.StorageError):
@@ -221,21 +209,22 @@ class TestWALWriter(unittest.TestCase):
         writer = wal.WALWriter(self.test_wal, self.layout)
         
         # Block 1: 1 record
-        records = [wal_format.WALRecord(1, 1, self._create_packed_component(1, "one"))]
+        records = [wal_format.WALRecord(1, 1, [db_values.IntValue(1), db_values.StringValue("one")])]
         writer.append_block(1, 1, records)
         
         # Block 2: 3 records
         records = [
-            wal_format.WALRecord(2, 1, self._create_packed_component(2, "two")),
-            wal_format.WALRecord(3, 1, self._create_packed_component(3, "three")),
-            wal_format.WALRecord(4, 1, self._create_packed_component(4, "four"))
+            wal_format.WALRecord(2, 1, [db_values.IntValue(2), db_values.StringValue("two")]),
+            wal_format.WALRecord(3, 1, [db_values.IntValue(3), db_values.StringValue("three")]),
+            wal_format.WALRecord(4, 1, [db_values.IntValue(4), db_values.StringValue("four")])
         ]
         writer.append_block(2, 1, records)
         
         # Block 3: 5 records
         records = []
         for i in range(5):
-            records.append(wal_format.WALRecord(10 + i, 1, self._create_packed_component(i, "r%d" % i)))
+            recs = [db_values.IntValue(i), db_values.StringValue("r%d" % i)]
+            records.append(wal_format.WALRecord(10 + i, 1, recs))
         writer.append_block(3, 1, records)
         
         writer.close()
