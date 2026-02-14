@@ -47,7 +47,7 @@ class TestSemanticMerges(unittest.TestCase):
         # 7. Check physical entry count (Should be 2 entries: Entity 50 and Entity 100)
         reader = self.db.manifest_manager.load_current()
         # Should have 1 shard entry in manifest after compaction
-        self.assertEqual(reader.get_entry_count(), 1)
+        self.assertEqual(reader.get_entry_count, 1)
         reader.close()
 
     def test_ghost_purging_in_compaction(self):
@@ -75,7 +75,7 @@ class TestSemanticMerges(unittest.TestCase):
         
         # Verification of zero entries
         reader = self.db.manifest_manager.load_current()
-        self.assertEqual(reader.get_entry_count(), 1)
+        self.assertEqual(reader.get_entry_count, 1)
         entries = list(reader.iterate_entries())
         entry = entries[0]
         

@@ -189,8 +189,9 @@ class MemTable(object):
             else:
                 rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, val_obj.get_int())
 
-    def flush(self, filename):
-        sw = writer_table.TableShardWriter(self.schema)
+    def flush(self, filename, table_id=0):
+        # FIXED: Accept table_id to ensure shard headers match Manifest
+        sw = writer_table.TableShardWriter(self.schema, table_id)
         base, curr_off = self.arena.base_ptr, node_get_next_off(self.arena.base_ptr, self.head_off, 0)
         while curr_off != 0:
             w = node_get_weight(base, curr_off)

@@ -96,6 +96,9 @@ class Spine(object):
     def add_handle(self, handle):
         self.handles.append(handle)
         self._sort_handles()
+        # FIXED: Acquire reference count for dynamically added handles
+        if self.ref_counter:
+            self.ref_counter.acquire(handle.filename)
 
     def replace_handles(self, old_filenames, new_handle):
         new_list = []

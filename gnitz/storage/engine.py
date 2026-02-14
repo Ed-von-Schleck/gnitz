@@ -83,9 +83,32 @@ class Engine(object):
         # 2. Check Persistent Shards
         spine_weight = 0
         results = self.spine.find_all_shards_and_indices(key)
-        for shard_handle, row_idx in results:
-            if comparator.compare_soa_to_values(self.schema, shard_handle.view, row_idx, field_values) == 0:
-                spine_weight += shard_handle.get_weight(row_idx)
+        
+        is_u128 = self.schema.get_pk_column().field_type.size == 16
+        
+        for shard_handle, start_idx in results:
+            # FIXED: Iterate forward while PK matches to find matching payload.
+            # Shards may contain multiple payloads for the same PK.
+            curr_idx = start_idx
+            view = shard_handle.view
+            
+            while curr_idx < view.count:
+                # 2a. Verify PK matches
+                if is_u128:
+                    k = view.get_pk_u128(curr_idx)
+                else:
+                    k = r_uint128(view.get_pk_u64(curr_idx))
+                
+                if k != key:
+                    break 
+                
+                # 2b. Check semantic payload equality
+                if comparator.compare_soa_to_values(self.schema, view, curr_idx, field_values) == 0:
+                    spine_weight += shard_handle.get_weight(curr_idx)
+                    # Optimization: Since MemTable coalesces, we expect only one match per shard per PK
+                    break 
+                
+                curr_idx += 1
                 
         return mem_weight + spine_weight
 
