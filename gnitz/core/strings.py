@@ -48,7 +48,7 @@ def _memcmp(p1, p2, length):
             return False
     return True
 
-@jit.unroll_safe
+#@jit.unroll_safe
 def string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_prefix):
     """Compares a packed German String structure against a Python string."""
     u32_ptr = rffi.cast(rffi.UINTP, struct_ptr)
@@ -113,7 +113,7 @@ def string_equals_dual(ptr1, heap1, ptr2, heap2):
         h2_ptr = rffi.ptradd(heap2, rffi.cast(lltype.Signed, u64_p2[0]))
         return _memcmp(h1_ptr, h2_ptr, len1)
 
-@jit.unroll_safe
+#@jit.unroll_safe
 def compare_db_value_to_german(val_obj, german_ptr, heap_ptr):
     """
     Dry-run comparison: Compare a StringValue object against a packed structure.

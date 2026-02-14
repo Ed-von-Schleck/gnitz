@@ -7,10 +7,6 @@ from gnitz.core import types, values as db_values
 
 class TestWALFormat(unittest.TestCase):
     def setUp(self):
-        # ComponentLayout([I64, STRING]) results in a schema with:
-        # Col 0: PK (U64)
-        # Col 1: I64
-        # Col 2: STRING
         self.layout = types.ComponentLayout([types.TYPE_I64, types.TYPE_STRING])
         self.tmp = "test_wal_format.bin"
 
@@ -23,10 +19,10 @@ class TestWALFormat(unittest.TestCase):
         Verifies that WAL records containing mixed types (int, string)
         can be serialized and reconstructed with algebraic weight preservation.
         """
-        # component_data must match the non-PK columns in the schema
+        # FIXED: Use the from_key factory for more robust test setup
         recs = [
-            WALRecord(10, 1, [db_values.IntValue(42), db_values.StringValue("one")]),
-            WALRecord(20, -1, [db_values.IntValue(99), db_values.StringValue("two")])
+            WALRecord.from_key(10, 1, [db_values.IntValue(42), db_values.StringValue("one")]),
+            WALRecord.from_key(20, -1, [db_values.IntValue(99), db_values.StringValue("two")])
         ]
         
         # Write block to disk
@@ -43,7 +39,9 @@ class TestWALFormat(unittest.TestCase):
         # Convert string to raw C pointer for the decoder
         block_ptr = rffi.str2charp(data)
         try:
-            lsn, cid, decoded = wal_format.decode_wal_block(block_ptr, len(data), self.layout)
+            # FIXED: decode_wal_block returns an object, not a tuple
+            block = wal_format.decode_wal_block(block_ptr, len(data), self.layout)
+            lsn, cid, decoded = block.lsn, block.tid, block.records
             
             # Verify Metadata
             self.assertEqual(lsn, 100)
@@ -51,13 +49,14 @@ class TestWALFormat(unittest.TestCase):
             self.assertEqual(len(decoded), 2)
             
             # Verify Record 1
-            self.assertEqual(decoded[0].primary_key, 10)
+            # FIXED: Access key via get_key() to support the 128-bit split architecture
+            self.assertEqual(decoded[0].get_key(), 10)
             self.assertEqual(decoded[0].weight, 1)
             self.assertEqual(decoded[0].component_data[0].get_int(), 42)
             self.assertEqual(decoded[0].component_data[1].get_string(), "one")
             
             # Verify Record 2 (Negative Weight / Annihilation delta)
-            self.assertEqual(decoded[1].primary_key, 20)
+            self.assertEqual(decoded[1].get_key(), 20)
             self.assertEqual(decoded[1].weight, -1)
             self.assertEqual(decoded[1].component_data[0].get_int(), 99)
             self.assertEqual(decoded[1].component_data[1].get_string(), "two")
@@ -67,7 +66,7 @@ class TestWALFormat(unittest.TestCase):
 
     def test_corrupt_checksum_detection(self):
         """Ensures the decoder rejects blocks with tampered body data."""
-        recs = [WALRecord(1, 1, [db_values.IntValue(123), db_values.StringValue("test")])]
+        recs = [WALRecord.from_key(1, 1, [db_values.IntValue(123), db_values.StringValue("test")])]
         
         fd = os.open(self.tmp, os.O_WRONLY | os.O_CREAT, 0o644)
         wal_format.write_wal_block(fd, 1, 1, recs, self.layout)

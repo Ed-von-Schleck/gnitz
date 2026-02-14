@@ -16,9 +16,9 @@ class TestSpineManifest(unittest.TestCase):
             if os.path.exists(fn):
                 os.unlink(fn)
     
-    def _create_shard(self, filename, entities_and_values):
+    def _create_shard(self, filename, records):
         writer = writer_table.TableShardWriter(self.layout)
-        for pk, i64_val, str_val in entities_and_values:
+        for pk, i64_val, str_val in records:
             writer.add_row_from_values(pk, 1, [
                 db_values.wrap(i64_val),
                 db_values.wrap(str_val)
@@ -26,9 +26,13 @@ class TestSpineManifest(unittest.TestCase):
         writer.finalize(filename)
         self.shard_files.append(filename)
     
-    def test_load_spine_with_single_shard(self):
-        shard_fn = "shard_single.db"
-        self._create_shard(shard_fn, [(10, 100, "alpha"), (20, 200, "beta")])
+    def test_load_spine_from_manifest(self):
+        """Reconstructed spine verification using the split-key API."""
+        shard_fn = "shard_spine_test.db"
+        self._create_shard(shard_fn, [
+            (10, 100, "alpha"), 
+            (20, 200, "beta")
+        ])
         
         writer = manifest.ManifestWriter(self.manifest_file)
         writer.add_entry_values(1, shard_fn, 10, 20, 0, 1)
@@ -37,15 +41,22 @@ class TestSpineManifest(unittest.TestCase):
         sp = spine.Spine.from_manifest(
             self.manifest_file, 
             table_id=1, 
-            schema=self.layout,
-            ref_counter=None,
-            validate_checksums=False
+            schema=self.layout
         )
         
-        self.assertEqual(sp.handles[0].min_key, 10)
-        
-        results = sp.find_all_shards_and_indices(20)
-        shard, idx = results[0]
-        self.assertEqual(shard.view.read_field_i64(idx, 1), 200)
-        
-        sp.close_all()
+        try:
+            self.assertEqual(len(sp.handles), 1)
+            # FIXED: Call get_min_key() instead of accessing .min_key() attribute
+            self.assertEqual(sp.handles[0].get_min_key(), 10)
+            
+            results = sp.find_all_shards_and_indices(20)
+            self.assertEqual(len(results), 1)
+            
+            h, idx = results[0]
+            self.assertEqual(h.view.read_field_i64(idx, 1), 200)
+            
+        finally:
+            sp.close_all()
+
+if __name__ == '__main__':
+    unittest.main()

@@ -16,17 +16,19 @@ class DBValue(object):
         return ""
     
     def get_u128(self): 
-        # R_uint128 is treated as a distinct type in RPython
         return r_uint128(0)
 
 class IntValue(DBValue):
+    _immutable_fields_ = ['v']
     def __init__(self, v):
+        # Explicit cast to fixed-width to avoid RPython annotation mixing
         self.v = r_uint64(v)
     
     def get_int(self):
         return self.v
 
 class FloatValue(DBValue):
+    _immutable_fields_ = ['v']
     def __init__(self, v):
         self.v = float(v)
     
@@ -34,36 +36,41 @@ class FloatValue(DBValue):
         return self.v
 
 class StringValue(DBValue):
+    _immutable_fields_ = ['v']
     def __init__(self, v):
-        self.v = str(v)
+        # RPython: self.v is a non-nullable string
+        self.v = v
     
     def get_string(self):
         return self.v
 
 class U128Value(DBValue):
+    _immutable_fields_ = ['v_lo', 'v_hi']
     def __init__(self, v):
-        self.v = r_uint128(v)
+        # v is a stack-local r_uint128; splitting prevents GC-heap alignment issues
+        self.v_lo = r_uint64(v)
+        self.v_hi = r_uint64(v >> 64)
     
     def get_u128(self):
-        return self.v
+        return (r_uint128(self.v_hi) << 64) | r_uint128(self.v_lo)
 
 def wrap(val):
     """
     Wraps a Python primitive into a DBValue.
-    Used primarily for ingestion and testing.
+    FIXED: Removed isinstance(val, long) and direct constructor calls like long().
     """
     if isinstance(val, float):
         return FloatValue(val)
-    if isinstance(val, (int, long)):
-        # Check if it might be 128-bit.
-        # RPython: comparing a Python long against a machine constant works.
-        if val > r_uint64(-1):
-            return U128Value(val)
-        return IntValue(val)
     if isinstance(val, str):
         return StringValue(val)
     if isinstance(val, r_uint128):
         return U128Value(val)
+    # RPython: int is a machine-word. 
+    # Large literals passed in tests are handled here.
+    if isinstance(val, int):
+        return IntValue(r_uint64(val))
     if isinstance(val, DBValue):
         return val
-    raise TypeError("Unsupported type for DBValue")
+        
+    # Fallback to avoid FrozenDesc/Annotation errors
+    raise TypeError("Unsupported type for DBValue wrap")

@@ -1,7 +1,7 @@
 import os
 import errno
 from gnitz.storage import errors, mmap_posix
-from rpython.rlib import rposix
+from rpython.rlib import rposix, rposix_stat
 
 class FileLockHandle(object):
     _immutable_fields_ = ['fd']
@@ -26,7 +26,7 @@ class RefCounter(object):
         try:
             fd = rposix.open(filename, os.O_RDONLY, 0)
             mmap_posix.lock_shared(fd)
-            st = os.fstat(fd)
+            st = rposix_stat.fstat(fd)
             if st.st_nlink == 0:
                 mmap_posix.unlock_file(fd)
                 rposix.close(fd)
@@ -51,20 +51,27 @@ class RefCounter(object):
             del self.handles[filename]
             
     def mark_for_deletion(self, filename):
-        for f in self.pending_deletion:
-            if f == filename: return
+        # Prevent duplicates in a way that RPython handles well
+        for i in range(len(self.pending_deletion)):
+            if self.pending_deletion[i] == filename: 
+                return
         self.pending_deletion.append(filename)
     
     def try_cleanup(self):
+        """
+        Attempts to delete unreferenced shards.
+        FIXED: Robust loops for monomorphic list processing in RPython.
+        """
         deleted = []
         remaining = []
         
-        for filename in self.pending_deletion:
+        for idx in range(len(self.pending_deletion)):
+            filename = self.pending_deletion[idx]
+            
             if not self.can_delete(filename):
                 remaining.append(filename)
                 continue
             
-            # If the file is already gone, it's a success.
             if not os.path.exists(filename):
                 deleted.append(filename)
                 continue
@@ -83,11 +90,9 @@ class RefCounter(object):
             except OSError as e:
                 if fd != -1:
                     rposix.close(fd)
-                # If the file disappeared during cleanup, it's successful.
                 if e.errno == errno.ENOENT:
                     deleted.append(filename)
                 else:
-                    # Bubble up unexpected system errors.
                     raise e
         
         self.pending_deletion = remaining

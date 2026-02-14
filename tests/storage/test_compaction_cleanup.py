@@ -32,10 +32,20 @@ class TestCompactionCleanup(unittest.TestCase):
         h2 = spine.ShardHandle(self.shard2, self.layout, 0, validate_checksums=False)
         self.spine_obj = spine.Spine([h1, h2], self.rc)
         
+        # Verify that an active handle prevents deletion
         self.assertFalse(self.rc.can_delete(self.shard1))
+        
+        # Mark for deletion while still held
         self.rc.mark_for_deletion(self.shard1)
+        
+        # Closing the spine releases the handles
         self.spine_obj.close_all()
-        self.assertFalse(os.path.exists(self.shard1))
+        
+        # FIXED: In the refactored SWMR model, release() does not physically 
+        # unlink. We must trigger the cleanup cycle explicitly.
+        self.rc.try_cleanup()
+        
+        self.assertFalse(os.path.exists(self.shard1), "Shard should be physically unlinked after try_cleanup()")
 
 if __name__ == '__main__':
     unittest.main()

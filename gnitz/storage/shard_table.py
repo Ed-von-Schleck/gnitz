@@ -1,10 +1,12 @@
 import os
-from rpython.rlib import jit, rposix
+from rpython.rlib import jit, rposix, rposix_stat
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage import buffer, layout, mmap_posix, errors
 from gnitz.core import strings as string_logic, types, checksum
+
+DUMMY_BUF = buffer.MappedBuffer(lltype.nullptr(rffi.CCHARP.TO), 0)
 
 class TableShardView(object):
     """
@@ -24,7 +26,7 @@ class TableShardView(object):
         
         fd = rposix.open(filename, os.O_RDONLY, 0)
         try:
-            st = os.fstat(fd)
+            st = rposix_stat.fstat(fd)
             self.size = st.st_size
             if self.size < layout.HEADER_SIZE:
                 raise errors.CorruptShardError("File too small for header")
@@ -40,7 +42,8 @@ class TableShardView(object):
                 self.count = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, layout.OFF_ROW_COUNT))[0])
                 self.dir_off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, layout.OFF_DIR_OFFSET))[0])
                 
-                num_regions = 2 + (len(schema.columns) - 1) + 1 # PK + W + (N-1) Columns + Blob Heap
+                num_cols = len(schema.columns)
+                num_regions = 2 + (num_cols - 1) + 1 # PK + W + (N-1) Columns + Blob Heap
                 self.dir_checksums = [r_uint64(0)] * num_regions
                 self.region_validated = [False] * num_regions
 
@@ -49,13 +52,16 @@ class TableShardView(object):
                 self.w_buf = self._init_region(1)
                 
                 # Initialize column-specific regions
-                self.col_bufs = [None] * len(schema.columns)
+                self.col_bufs = [DUMMY_BUF] * num_cols
                 reg_idx = 2
-                for i in range(len(schema.columns)):
-                    if i == schema.pk_index: 
+                i = 0
+                while i < num_cols:
+                    if i == schema.pk_index:
+                        i += 1
                         continue
                     self.col_bufs[i] = self._init_region(reg_idx)
                     reg_idx += 1
+                    i += 1
                 
                 # Initialize shared blob heap
                 self.blob_buf = self._init_region(reg_idx)
@@ -71,7 +77,6 @@ class TableShardView(object):
     def _init_region(self, idx):
         """
         Maps a region from the Column Directory.
-        Refactored into a method to prevent RPython closure errors.
         """
         base = rffi.ptradd(self.ptr, self.dir_off + (idx * layout.DIR_ENTRY_SIZE))
         off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, base)[0])
@@ -137,9 +142,11 @@ class TableShardView(object):
             return lltype.nullptr(rffi.CCHARP.TO)
         
         actual_reg_idx = 2
-        for i in range(col_idx):
-            if i != self.schema.pk_index: 
+        i = 0
+        while i < col_idx:
+            if i != self.schema.pk_index:
                 actual_reg_idx += 1
+            i += 1
         
         self._check_region(buf, actual_reg_idx)
         

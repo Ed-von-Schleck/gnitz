@@ -239,7 +239,7 @@ def mult32to64_add64(lhs, rhs, acc):
     # Standard promotion to 64-bit before multiplication
     return (r_uint64(lhs) * r_uint64(rhs)) + acc
 
-@unroll_safe
+#@unroll_safe
 def xxh3_accumulate_512_scalar(acc, input_ptr, secret_off):
     for i in range(8):
         data_val = read_le64(rffi.ptradd(input_ptr, i * 8))
@@ -249,7 +249,7 @@ def xxh3_accumulate_512_scalar(acc, input_ptr, secret_off):
                                   r_uint32(data_key >> 32), 
                                   acc[i])
 
-@unroll_safe
+#@unroll_safe
 def xxh3_scramble_acc_scalar(acc, secret_off):
     for i in range(8):
         key64 = read_secret_le64(secret_off + i * 8)

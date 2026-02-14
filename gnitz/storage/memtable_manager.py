@@ -18,7 +18,12 @@ class MemTableManager(object):
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
         if self.wal_writer:
-            self.wal_writer.append_block(lsn, self.table_id, [WALRecord(key, weight, field_values)])
+            # FIXED: Use the factory method to handle 128-bit key splitting safely
+            self.wal_writer.append_block(
+                lsn, 
+                self.table_id, 
+                [WALRecord.from_key(key, weight, field_values)]
+            )
         self.active_table.upsert(r_uint128(key), weight, field_values)
 
     def flush_and_rotate(self, filename):

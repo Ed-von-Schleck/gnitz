@@ -695,11 +695,22 @@ For:
 
 Do not rely on Python arbitrary precision semantics.
 
-**9.3 128-bit Integers and Frozen Type Constructors**
+### 9.3 128-bit Integers and Frozen Type Constructors**
 
-*   **Naming:** RPython does not provide a standard alias named `r_uint128`. 128-bit integers are natively supported as `r_ulonglonglong` (unsigned) and `r_longlonglong` (signed).
+* **Naming:** RPython does not provide a standard alias named `r_uint128`. 128-bit integers are natively supported as `r_ulonglonglong` (unsigned) and `r_longlonglong` (signed).
 *   **The Constructor Trap:** Built-in Python type descriptors (like `int`, `long`, `float`, `str`) are "frozen" in RPython. You **cannot** call them as functions (e.g., `x = long(y)`). This results in a `FrozenDesc` error.
 *   **Correct Conversion:** Use RPython's specialized casting functions or the `@specialize.argtype` pattern to convert between primitive types.
+
+### 9.4 The Prebuilt Long Trap**
+
+RPython cannot "freeze" Python `long` objects into the translated binary. If you use an integer literal that exceeds the target machine's signed word size (e.g., `0xFFFFFFFFFFFFFFFF` on a 64-bit system), Python 2.7 interprets this as a `long` object. 
+
+**Symptoms:** Translation fails with `ValueError: seeing a prebuilt long`.
+ 
+**Correction:** 
+*   Do not use large literals directly. 
+*   Instead, use bitwise manipulation or signed-to-unsigned casting of smaller, safe constants.
+*   *Example:* Use `r_uint64(-1)` to generate `0xFFFFFFFFFFFFFFFF` natively, or `(r_uint128(hi) << 64) | lo`.
 
 ## 10. Object Model Discipline
 
@@ -745,34 +756,7 @@ Avoid:
 * Excessive exception-driven control flow
 * Complex comprehensions
 
-### 12.2 JIT Hints
-
-From `rpython.rlib.jit`:
-
-* `@jit.unroll_safe`
-* `jit.unrolling_iterable`
-* `jit.promote(x)`
-* `@jit.elidable`
-
-Use when:
-
-* Loop bounds are small and fixed.
-* Values are loop-invariant.
-* Pure functions should be cached.
-
-Example:
-
-```python
-from rpython.rlib import jit
-
-@jit.unroll_safe
-def dispatch(opcode):
-    ...
-```
-
-These hints are not optional in serious performance work.
-
-### 12.3 Hot Loop Structure
+### 12.2 Hot Loop Structure
 
 The JIT works best when:
 
@@ -826,6 +810,7 @@ RPython is Python 2–based.
 * Calling `long()` or `int()` as a function: Use RLib arithmetic or specialized helpers instead.
 * EBADF (Bad File Descriptor): Double-closing a file descriptor in a `try...except` block where the error-raising path already performed a cleanup.
 * Calling `.append()` on a list attribute after it has been hinted as immutable.
+* `for i in range(x)` loops can lead to excessive loop unrolling, which can lead to compilation errors. `i = 0; while i < len(x); ...; i += 1`-style loops don't blow up.
 
 ## 17. Recommended Design Patterns
 
@@ -850,7 +835,7 @@ Avoid global mutation; use a singleton state object.
 
 Use fixed arrays or tuples of callables.
 
-If iterating over small fixed collections:
+If iterating over *small fixed* collections:
 
 ```python
 for field in jit.unrolling_iterable(FIELDS):
@@ -864,26 +849,13 @@ Standard `os.read` and `os.write` are often wrapped by the annotator in a way th
 *   Use `rpython.rlib.rposix.read(fd, count)`: It is guaranteed to return a non-nullable string.
 *   Use `rpython.rlib.rposix_stat.stat(path)` and `fstat(fd)`: These return a `stat_result` with strictly typed fields (e.g., `st_ino` as a fixed-width integer), avoiding C-level signed/unsigned comparison warnings.
 
-### 18.2 The Atomic Resource Initialization Pattern
-When initializing objects that own a file descriptor, follow a "Local-to-Self" handover to prevent leaks and double-closes during initialization failure:
-
-```python
-def __init__(self, filename):
-    self.fd = -1
-    # 1. Open to a local variable
-    fd = rposix.open(filename, os.O_RDONLY, 0)
-    try:
-        # 2. Perform operations that might fail (locking, stat)
-        if not try_lock(fd):
-            raise OSError("Locked")
-        # 3. Only assign to self once the resource is fully ready
-        self.fd = fd
-    except Exception:
-        # 4. If we haven't assigned to self yet, close the local fd
-        if fd != -1:
-            rposix.close(fd)
-        raise
-```
+#### 18.2 The Atomic Resource Initialization Pattern
+To prevent runtime segfaults and resource leaks during initialization failures:
+1.  Initialize the object attribute (e.g., `self.fd`) to a "safe" null value (`-1`).
+2.  Open the resource to a **local variable** first.
+3.  Perform all potentially failing operations (stat, header validation).
+4.  Assign the local variable to `self.fd` only as the final step.
+5.  In the `except` block, close the **local variable** if it's valid.
 
 ### 18.3 Inode and Size Consistency
 Always cast `st_ino` and `st_size` to fixed-width types (e.g., `rffi.ULONGLONG`) immediately after a `stat` call if they are to be stored for comparison or cross-process synchronization. This prevents annotation errors where one code path treats an inode as a Python `int` and another as a C `long`.
@@ -899,6 +871,12 @@ with rffi.scoped_str2charp(my_string) as ptr:
     do_c_call(ptr)
 # ptr is automatically freed here, even if an exception occurs
 ```
+
+#### 18.5 Union Type Avoidance (The Null Object Pattern)
+Avoid `List[Optional[T]]`. RPython's C-generator may segfault trying to resolve the union types in unrolled loops. Instead of using `None`, define a `NULL_INSTANCE` of your class that implements the same interface with empty methods. This keeps the list homogeneous and simplifies the translator's flow graph.
+
+#### 18.6 Pointer Sanity
+Never pass an unvalidated file descriptor to an `rffi` function. Always check `if fd < 0`. When checking `mmap` results, cast the pointer to `rffi.SIZE_T` to compare against `-1` safely across different RPython integer representations.X
 
 # Summary
 

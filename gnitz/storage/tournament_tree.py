@@ -120,7 +120,7 @@ class TournamentTree(object):
         self._collect_equal_keys(0, target, results)
         return results
 
-    @jit.unroll_safe
+    #@jit.unroll_safe
     def _collect_equal_keys(self, idx, target, results):
         """ Recursively collects cursors from the heap that match the target key. """
         if idx >= self.heap_size:

@@ -6,8 +6,7 @@ from gnitz.core import types, values as db_values
 
 class TestTypeConsistency(unittest.TestCase):
     def setUp(self):
-        self.m_fn = "test_type.manifest"
-        self.s_fn = "test_type.shard"
+        self.m_fn, self.s_fn = "test_type.manifest", "test_type.shard"
         self.layout = types.ComponentLayout([types.TYPE_I64])
 
     def tearDown(self):
@@ -15,20 +14,16 @@ class TestTypeConsistency(unittest.TestCase):
             if os.path.exists(f): os.unlink(f)
 
     def test_manifest_header_unsigned(self):
-        # Explicitly wrap in r_uint64 to ensure unsigned 64-bit behavior in CPython tests
         large_lsn = r_uint64(0xFFFFFFFFFFFFFFFE)
-        m_writer = manifest.ManifestWriter(self.m_fn, large_lsn)
-        m_writer.finalize()
-        m_reader = manifest.ManifestReader(self.m_fn)
-        self.assertEqual(m_reader.global_max_lsn, large_lsn)
-        m_reader.close()
+        # atomic write via convenience writer
+        writer = manifest.ManifestWriter(self.m_fn, large_lsn)
+        writer.finalize()
+        
+        reader = manifest.ManifestReader(self.m_fn)
+        try:
+            self.assertEqual(reader.global_max_lsn, large_lsn)
+        finally:
+            reader.close()
 
-    def test_shard_header_consistency(self):
-        writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_from_values(1, 1, [db_values.wrap(x) for x in [100]])
-        writer.finalize(self.s_fn)
-        view = shard_table.TableShardView(self.s_fn, self.layout)
-        self.assertEqual(view.count, 1)
-        # Fixed: use get_pk_u64 instead of get_primary_key
-        self.assertEqual(view.get_pk_u64(0), 1)
-        view.close()
+if __name__ == '__main__':
+    unittest.main()

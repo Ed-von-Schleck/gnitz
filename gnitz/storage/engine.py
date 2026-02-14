@@ -36,17 +36,24 @@ class Engine(object):
     def recover_from_wal(self, filename):
         try:
             reader = wal.WALReader(filename, self.schema)
-            # Use r_uint64 for LSN arithmetic and comparisons to satisfy RPython annotator
             max_lsn_seen = self.current_lsn - r_uint64(1)
             last_recovered_lsn = max_lsn_seen
             
-            for lsn, tid, records in reader.iterate_blocks():
-                if tid != self.table_id: continue
-                if lsn <= max_lsn_seen: continue
+            while True:
+                # Explicit call to the State-based reader
+                block = reader.read_next_block()
+                if block is None: 
+                    break
                 
-                last_recovered_lsn = lsn
-                for rec in records:
-                    self.mem_manager.active_table.upsert(rec.primary_key, rec.weight, rec.component_data)
+                if block.tid != self.table_id: 
+                    continue
+                if block.lsn <= max_lsn_seen: 
+                    continue
+                
+                last_recovered_lsn = block.lsn
+                for rec in block.records:
+                    # FIXED: Use rec.get_key() instead of rec.primary_key
+                    self.mem_manager.active_table.upsert(rec.get_key(), rec.weight, rec.component_data)
             
             self.current_lsn = last_recovered_lsn + r_uint64(1)
             self.mem_manager.current_lsn = self.current_lsn
@@ -54,6 +61,12 @@ class Engine(object):
         except OSError as e:
             if e.errno != errno.ENOENT:
                 raise e
+        except Exception as e:
+            # Final Hardening: Catch and print any unexpected error 
+            # before the RPython runtime SIGABRTs.
+            import os
+            os.write(2, "FATAL ERROR during WAL recovery: " + str(e) + "\n")
+            raise e
 
     def get_effective_weight_raw(self, key, field_values):
         """
@@ -86,7 +99,14 @@ class Engine(object):
         entries = []
         if self.manifest_manager and self.manifest_manager.exists():
             reader = self.manifest_manager.load_current()
-            for e in reader.iterate_entries(): entries.append(e)
+            # HARDENING: Use manual iteration for generators in RPython
+            it = reader.iterate_entries()
+            while True:
+                try:
+                    e = it.next()
+                    entries.append(e)
+                except StopIteration:
+                    break
             reader.close()
         
         from gnitz.storage.spine import ShardHandle
@@ -97,8 +117,9 @@ class Engine(object):
         if os.path.exists(filename):
             handle = ShardHandle(filename, self.schema, lsn_max, validate_checksums=self.validate_checksums)
             if handle.view.count > 0:
-                min_k = handle.min_key
-                max_k = handle.max_key
+                # FIXED: Use handle.get_min_key() and get_max_key()
+                min_k = handle.get_min_key()
+                max_k = handle.get_max_key()
                 new_entry = manifest.ManifestEntry(self.table_id, filename, min_k, max_k, lsn_min, lsn_max)
                 entries.append(new_entry)
                 self.spine.add_handle(handle)

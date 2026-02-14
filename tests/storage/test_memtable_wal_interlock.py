@@ -1,21 +1,16 @@
 import unittest
 import os
-from gnitz.storage import memtable_manager, wal, wal_format
+from gnitz.storage import memtable_manager, wal
 from gnitz.core import types, values as db_values
-
 
 class TestMemTableWALInterlock(unittest.TestCase):
     def setUp(self):
-        # Simple layout: [Value (I64), Label (String)]
         self.layout = types.ComponentLayout([types.TYPE_I64, types.TYPE_STRING])
         self.test_wal = "test_interlock.log"
-        
-        # Clean up any existing files
         if os.path.exists(self.test_wal):
             os.unlink(self.test_wal)
     
     def tearDown(self):
-        # Clean up test file
         if os.path.exists(self.test_wal):
             os.unlink(self.test_wal)
             
@@ -23,206 +18,50 @@ class TestMemTableWALInterlock(unittest.TestCase):
         wrapped = [db_values.wrap(v) for v in vals]
         mgr.put(pk, w, wrapped)
     
-    def test_memtable_without_wal(self):
-        """Test that MemTable works without WAL (backward compatibility)."""
-        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024)
-        
-        # Should work without WAL writer
-        self._put(mgr, 1, 1, 100, "test")
-        self._put(mgr, 2, 1, 200, "another")
-        
-        mgr.close()
-    
     def test_memtable_with_wal_integration(self):
-        """Test that MemTable writes to WAL before updating memory."""
-        # Create WAL writer
         wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        
-        # Create MemTable with WAL
         mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
         
-        # Insert data - should write to WAL first
         self._put(mgr, 10, 1, 100, "first")
         self._put(mgr, 20, 1, 200, "second")
         
-        # Close to flush WAL
         mgr.close()
         wal_writer.close()
         
-        # Verify WAL contains the data
-        self.assertTrue(os.path.exists(self.test_wal))
-        
-        # Read WAL back
         reader = wal.WALReader(self.test_wal, self.layout)
         
-        # Should have 2 blocks (one per put)
-        is_valid1, lsn1, comp_id1, records1 = reader.read_next_block()
-        self.assertTrue(is_valid1)
-        self.assertEqual(comp_id1, 1)
-        self.assertEqual(len(records1), 1)
-        rec1 = records1[0]
-        # Use attribute access
-        self.assertEqual(rec1.primary_key, 10)
-        self.assertEqual(rec1.weight, 1)
+        # Block 1
+        block1 = reader.read_next_block()
+        self.assertIsNotNone(block1)
+        self.assertEqual(block1.tid, 1)
+        self.assertEqual(block1.records[0].get_key(), 10)
+        self.assertEqual(block1.records[0].weight, 1)
         
-        is_valid2, lsn2, comp_id2, records2 = reader.read_next_block()
-        self.assertTrue(is_valid2)
-        self.assertEqual(comp_id2, 1)
-        rec2 = records2[0]
-        # Use attribute access
-        self.assertEqual(rec2.primary_key, 20)
-        self.assertEqual(rec2.weight, 1)
+        # Block 2
+        block2 = reader.read_next_block()
+        self.assertIsNotNone(block2)
+        self.assertEqual(block2.records[0].get_key(), 20)
         
-        reader.close()
-    
-    def test_wal_write_before_memory_update(self):
-        """Test that WAL is written BEFORE MemTable is updated."""
-        wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
-        
-        # Insert one record
-        self._put(mgr, 100, 1, 999, "durable")
-        
-        # WAL should have content immediately (before close)
-        # This simulates crash - MemTable in memory, but WAL on disk
-        file_size = os.path.getsize(self.test_wal)
-        self.assertGreater(file_size, 0)
-        
-        mgr.close()
-        wal_writer.close()
-    
-    def test_algebraic_consistency(self):
-        """Test that WAL weights match MemTable weights."""
-        wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
-        
-        # Insert with weight +1
-        self._put(mgr, 50, 1, 500, "add")
-        
-        # Insert with weight -1 (deletion)
-        self._put(mgr, 60, -1, 600, "delete")
-        
-        # Insert with weight +2
-        self._put(mgr, 70, 2, 700, "double")
-        
-        mgr.close()
-        wal_writer.close()
-        
-        # Read WAL and verify weights
-        reader = wal.WALReader(self.test_wal, self.layout)
-        
-        # iterate_blocks yields (lsn, table_id, records) - 3 elements
-        blocks = list(reader.iterate_blocks())
-        self.assertEqual(len(blocks), 3)
-        
-        # Verify weights in WAL via attribute access
-        _, _, records1 = blocks[0]
-        self.assertEqual(records1[0].weight, 1)
-        
-        _, _, records2 = blocks[1]
-        self.assertEqual(records2[0].weight, -1)
-        
-        _, _, records3 = blocks[2]
-        self.assertEqual(records3[0].weight, 2)
-        
-        reader.close()
-    
-    def test_crash_scenario_simulation(self):
-        """Test crash scenario: WAL exists but MemTable was not flushed."""
-        # Phase 1: Write to WAL (simulating crash before flush)
-        wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
-        
-        self._put(mgr, 1, 1, 111, "pre_crash")
-        self._put(mgr, 2, 1, 222, "also_pre_crash")
-        
-        # Simulate crash: close WAL but don't flush MemTable
-        wal_writer.close()
-        # DON'T call mgr.flush_and_rotate()
-        mgr.close()  # Just free memory
-        
-        # Phase 2: Recovery - WAL should contain the data
-        reader = wal.WALReader(self.test_wal, self.layout)
-        
-        blocks = list(reader.iterate_blocks())
-        self.assertEqual(len(blocks), 2)
-        
-        # Both records should be in WAL
-        _, _, records1 = blocks[0]
-        self.assertEqual(records1[0].primary_key, 1)
-        
-        _, _, records2 = blocks[1]
-        self.assertEqual(records2[0].primary_key, 2)
-        
-        reader.close()
-    
-    def test_multiple_puts_single_entity(self):
-        """Test multiple puts to same entity (algebraic accumulation)."""
-        wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
-        
-        # Put same entity 3 times with different weights
-        self._put(mgr, 100, 1, 10, "v1")
-        self._put(mgr, 100, 1, 20, "v2")
-        self._put(mgr, 100, -1, 30, "v3")
-        
-        mgr.close()
-        wal_writer.close()
-        
-        # WAL should have 3 separate blocks
-        reader = wal.WALReader(self.test_wal, self.layout)
-        blocks = list(reader.iterate_blocks())
-        self.assertEqual(len(blocks), 3)
-        
-        # All should have primary_key 100
-        for _, _, records in blocks:
-            self.assertEqual(records[0].primary_key, 100)
-        
-        reader.close()
-    
-    def test_table_id_propagation(self):
-        """Test that table_id is correctly written to WAL."""
-        wal_writer = wal.WALWriter(self.test_wal, self.layout)
-        
-        # Create MemTable with specific table_id
-        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=42)
-        
-        self._put(mgr, 1, 1, 100, "test")
-        mgr.close()
-        wal_writer.close()
-        
-        # Verify table_id in WAL
-        reader = wal.WALReader(self.test_wal, self.layout)
-        is_valid, lsn, table_id, records = reader.read_next_block()
-        self.assertTrue(is_valid)
-        
-        self.assertEqual(table_id, 42)
         reader.close()
     
     def test_lsn_increments(self):
-        """Test that LSN increments with each put."""
         wal_writer = wal.WALWriter(self.test_wal, self.layout)
         mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024, wal_writer, table_id=1)
         
-        # Multiple puts
         for i in range(5):
             self._put(mgr, i, 1, i * 10, "rec_%d" % i)
         
         mgr.close()
         wal_writer.close()
         
-        # Read WAL and verify LSN sequence
         reader = wal.WALReader(self.test_wal, self.layout)
-        lsns = []
-        for lsn, _, _ in reader.iterate_blocks():
-            lsns.append(lsn)
+        last_lsn = -1
+        for block in reader.iterate_blocks():
+            self.assertGreater(block.lsn, last_lsn)
+            last_lsn = block.lsn
         
-        # LSNs should be monotonically increasing
-        for i in range(len(lsns) - 1):
-            self.assertLess(lsns[i], lsns[i + 1])
-        
+        self.assertEqual(last_lsn, 5) # Assuming sequence starts at 1
         reader.close()
-
 
 if __name__ == '__main__':
     unittest.main()

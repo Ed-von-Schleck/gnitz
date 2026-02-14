@@ -74,18 +74,23 @@ _flock = rffi.llexternal(
 class MMapError(Exception):
     pass
 
+
+@jit.dont_look_inside
+def is_invalid_ptr(ptr):
+    # -1 (MAP_FAILED) cast to unsigned is the max value.
+    return rffi.cast(rffi.SIZE_T, ptr) == rffi.cast(rffi.SIZE_T, -1)
+
 @jit.dont_look_inside
 def mmap_file(fd, length, prot=PROT_READ, flags=MAP_SHARED):
-    """
-    Wraps mmap. All integer arguments are cast to match the C signature.
-    """
+    if fd < 0:
+        raise MMapError()
     res = _mmap(lltype.nullptr(rffi.CCHARP.TO), 
                 rffi.cast(rffi.SIZE_T, length),
                 rffi.cast(rffi.INT, prot),
                 rffi.cast(rffi.INT, flags),
                 rffi.cast(rffi.INT, fd),
                 rffi.cast(rffi.LONGLONG, 0))
-    if res == MAP_FAILED:
+    if is_invalid_ptr(res):
         raise MMapError()
     return res
 

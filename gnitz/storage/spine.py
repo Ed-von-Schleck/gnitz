@@ -1,122 +1,128 @@
-from rpython.rlib import jit
+from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
+from gnitz.storage import manifest
 
 class ShardHandle(object):
-    _immutable_fields_ = ['filename', 'lsn', 'view', 'min_key', 'max_key']
+    """
+    Reader handle for a shard with safe metadata storage.
+    """
+    _immutable_fields_ = [
+        'filename', 'lsn', 'view', 'pk_min_lo', 'pk_min_hi', 
+        'pk_max_lo', 'pk_max_hi'
+    ]
+
     def __init__(self, filename, schema, lsn, validate_checksums=False):
-        from gnitz.storage import shard_table, errors
+        from gnitz.storage import shard_table
         from gnitz.core import types
-        
-        if schema is None:
-            raise errors.LayoutError("ShardHandle requires a valid schema")
-            
         self.filename = filename
         self.lsn = lsn
-        # Propagate the validation flag to the View
         self.view = shard_table.TableShardView(filename, schema, validate_checksums=validate_checksums)
         
         if self.view.count > 0:
             is_u128 = schema.get_pk_column().field_type == types.TYPE_U128
-            self.min_key = self.view.get_pk_u128(0) if is_u128 else r_uint128(self.view.get_pk_u64(0))
-            self.max_key = self.view.get_pk_u128(self.view.count - 1) if is_u128 else r_uint128(self.view.get_pk_u64(self.view.count - 1))
+            # TableShardView returns stack-based u128s
+            k_min = self.view.get_pk_u128(0) if is_u128 else r_uint128(self.view.get_pk_u64(0))
+            k_max = self.view.get_pk_u128(self.view.count - 1) if is_u128 else r_uint128(self.view.get_pk_u64(self.view.count - 1))
+            self.pk_min_lo = r_uint64(k_min)
+            self.pk_min_hi = r_uint64(k_min >> 64)
+            self.pk_max_lo = r_uint64(k_max)
+            self.pk_max_hi = r_uint64(k_max >> 64)
         else:
-            self.min_key = r_uint128(0)
-            self.max_key = r_uint128(0)
+            self.pk_min_lo = self.pk_min_hi = self.pk_max_lo = self.pk_max_hi = r_uint64(0)
 
-    def get_weight(self, idx): return self.view.get_weight(idx)
-    def find_row_index(self, key): return self.view.find_row_index(key)
-    def close(self): self.view.close()
+    def get_min_key(self):
+        return (r_uint128(self.pk_min_hi) << 64) | r_uint128(self.pk_min_lo)
+
+    def get_max_key(self):
+        return (r_uint128(self.pk_max_hi) << 64) | r_uint128(self.pk_max_lo)
+
+    def find_row_index(self, key):
+        return self.view.find_row_index(key)
+
+    def get_weight(self, row_idx):
+        return self.view.get_weight(row_idx)
+
+    def close(self):
+        self.view.close()
 
 class Spine(object):
-    _immutable_fields_ = ['ref_counter']
-
+    """In-memory index tracking active shards for a table."""
     def __init__(self, handles, ref_counter=None):
         self.handles = handles
         self.ref_counter = ref_counter
-        self.closed = False
         self._sort_handles()
         if self.ref_counter:
-            for h in self.handles: self.ref_counter.acquire(h.filename)
+            for h in self.handles:
+                self.ref_counter.acquire(h.filename)
+
+    @classmethod
+    def from_manifest(cls, manifest_path, table_id, schema, ref_counter=None, validate_checksums=False):
+        reader = manifest.ManifestReader(manifest_path)
+        handles = []
+        try:
+            for entry in reader.iterate_entries():
+                if entry.table_id == table_id:
+                    handle = ShardHandle(
+                        entry.shard_filename, 
+                        schema, 
+                        entry.max_lsn, 
+                        validate_checksums=validate_checksums
+                    )
+                    handles.append(handle)
+        finally:
+            reader.close()
+        return cls(handles, ref_counter)
 
     def _sort_handles(self):
+        """Standardizes sorting using the get_min_key() API."""
         for i in range(1, len(self.handles)):
             h = self.handles[i]
+            target_min_k = h.get_min_key()
             j = i - 1
-            while j >= 0 and self.handles[j].min_key > h.min_key:
+            while j >= 0 and self.handles[j].get_min_key() > target_min_k:
                 self.handles[j+1] = self.handles[j]
                 j -= 1
             self.handles[j+1] = h
 
-    @staticmethod
-    def from_manifest(manifest_filename, table_id, schema, ref_counter=None, validate_checksums=False):
-        from gnitz.storage import manifest, errors
-        
-        if schema is None:
-            raise errors.LayoutError("Spine.from_manifest requires a valid schema")
-        
-        reader = manifest.ManifestReader(manifest_filename)
-        try:
-            handles = []
-            for entry in reader.iterate_entries():
-                if entry.table_id == table_id:
-                    handle = ShardHandle(entry.shard_filename, schema, entry.max_lsn, validate_checksums=validate_checksums)
-                    handles.append(handle)
-            return Spine(handles, ref_counter)
-        finally:
-            reader.close()
+    def find_all_shards_and_indices(self, key):
+        results = []
+        for h in self.handles:
+            if h.get_min_key() <= key <= h.get_max_key():
+                row_idx = h.find_row_index(key)
+                if row_idx != -1:
+                    results.append((h, row_idx))
+        return results
 
     def add_handle(self, handle):
         self.handles.append(handle)
-        if self.ref_counter:
-            self.ref_counter.acquire(handle.filename)
         self._sort_handles()
 
     def replace_handles(self, old_filenames, new_handle):
         new_list = []
         for h in self.handles:
-            found = False
-            for old in old_filenames:
-                if h.filename == old:
-                    found = True; break
-            if found:
+            is_superseded = False
+            for old_fn in old_filenames:
+                if h.filename == old_fn:
+                    is_superseded = True
+                    break
+            
+            if is_superseded:
                 h.close()
-                if self.ref_counter: self.ref_counter.release(h.filename)
+                if self.ref_counter:
+                    self.ref_counter.release(h.filename)
             else:
                 new_list.append(h)
         
         new_list.append(new_handle)
-        if self.ref_counter: self.ref_counter.acquire(new_handle.filename)
+        if self.ref_counter:
+            self.ref_counter.acquire(new_handle.filename)
+            
         self.handles = new_list
         self._sort_handles()
 
-    def _find_upper_bound(self, key):
-        low = 0
-        high = len(self.handles) - 1
-        ans = -1
-        while low <= high:
-            mid = (low + high) // 2
-            if self.handles[mid].min_key <= key:
-                ans = mid
-                low = mid + 1
-            else:
-                high = mid - 1
-        return ans
-
-    def find_all_shards_and_indices(self, key):
-        results = []
-        upper = self._find_upper_bound(key)
-        if upper == -1: return results
-        for i in range(upper, -1, -1):
-            h = self.handles[i]
-            if key <= h.max_key:
-                row_idx = h.find_row_index(key)
-                if row_idx != -1: results.append((h, row_idx))
-        return results
-
     def close_all(self):
-        if self.closed: return
         for h in self.handles:
             h.close()
-            if self.ref_counter: self.ref_counter.release(h.filename)
-        if self.ref_counter: self.ref_counter.try_cleanup()
-        self.closed = True
+            if self.ref_counter:
+                self.ref_counter.release(h.filename)
+        self.handles = []

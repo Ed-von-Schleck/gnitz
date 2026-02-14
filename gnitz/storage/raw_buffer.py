@@ -1,18 +1,26 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, r_int64
 
+
 def align_64(val):
     return (val + 63) & ~63
 
+
 def copy_memory(dest_ptr, src_ptr, size):
-    for i in range(size):
+    i = 0
+    while i < size:
         dest_ptr[i] = src_ptr[i]
+        i += 1
+
 
 def compare_memory(p1, p2, size):
-    for i in range(size):
+    i = 0
+    while i < size:
         if p1[i] != p2[i]:
             return False
+        i += 1
     return True
+
 
 class RawBuffer(object):
     """Raw byte buffer for columnar regions."""
@@ -62,11 +70,14 @@ class RawBuffer(object):
     def append_bytes(self, source_ptr, length_in_items):
         self.ensure_capacity(length_in_items)
         dest = rffi.ptradd(self.ptr, self.count * self.item_size)
+        total_bytes = length_in_items * self.item_size
         if source_ptr:
-            copy_memory(dest, source_ptr, length_in_items * self.item_size)
+            copy_memory(dest, source_ptr, total_bytes)
         else:
-            for i in range(length_in_items * self.item_size):
+            i = 0
+            while i < total_bytes:
                 dest[i] = "\x00"
+                i += 1
         self.count += length_in_items
 
     def free(self):
