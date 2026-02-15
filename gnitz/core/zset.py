@@ -76,7 +76,6 @@ class PersistentTable(object):
     def flush(self):
         """
         Commits current MemTable to a new Shard.
-        FIXED: Updated to receive only 'needs_compaction' from the engine.
         """
         lsn_val = intmask(self.mem_manager.starting_lsn)
         filename = os.path.join(self.directory, "%s_shard_%d.db" % (
@@ -110,59 +109,3 @@ class PersistentTable(object):
         self.engine.close()
         if self.wal_writer: self.wal_writer.close()
         self.is_closed = True
-
-class ZSet(object):
-    def __init__(self, schema):
-        self.schema = schema
-        self.mem_manager = memtable_manager.MemTableManager(schema, 64 * 1024 * 1024) 
-
-    def upsert(self, key, weight, payload):
-        self.mem_manager.put(r_uint128(key), weight, payload)
-
-    def get_weight(self, key, payload=None):
-        table = self.mem_manager.active_table
-        base = table.arena.base_ptr
-        total = 0
-        curr = table._find_first_key(r_uint128(key))
-        while curr != 0:
-            k = memtable_node.node_get_key(base, curr, table.key_size)
-            if k != r_uint128(key): break
-            node_w = memtable_node.node_get_weight(base, curr)
-            if payload is not None:
-                from gnitz.storage.comparator import compare_values_to_packed
-                p_ptr = memtable_node.node_get_payload_ptr(base, curr, table.key_size)
-                if compare_values_to_packed(self.schema, payload, p_ptr, table.blob_arena.base_ptr) == 0:
-                    return int(node_w)
-            else:
-                total += node_w
-            curr = memtable_node.node_get_next_off(base, curr, 0)
-        return int(total)
-
-    def get_payload(self, key):
-        table = self.mem_manager.active_table
-        base = table.arena.base_ptr
-        curr = table._find_first_key(r_uint128(key))
-        while curr != 0:
-            k = memtable_node.node_get_key(base, curr, table.key_size)
-            if k != r_uint128(key): break
-            if memtable_node.node_get_weight(base, curr) != 0: 
-                return memtable_node.unpack_payload_to_values(table, curr)
-            curr = memtable_node.node_get_next_off(base, curr, 0)
-        return None
-
-    def iter_nonzero(self):
-        table = self.mem_manager.active_table
-        base = table.arena.base_ptr
-        curr = memtable_node.node_get_next_off(base, table.head_off, 0)
-        while curr != 0:
-            w = memtable_node.node_get_weight(base, curr)
-            if w != 0:
-                k = memtable_node.node_get_key(base, curr, table.key_size)
-                k_val = intmask(k) if table.key_size == 8 else k
-                p = memtable_node.unpack_payload_to_values(table, curr)
-                yield (k_val, int(w), p)
-            curr = memtable_node.node_get_next_off(base, curr, 0)
-
-    def iter_positive(self):
-        for k, w, p in self.iter_nonzero():
-            if w > 0: yield (k, w, p)

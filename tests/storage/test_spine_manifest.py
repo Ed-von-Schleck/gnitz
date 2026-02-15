@@ -44,7 +44,7 @@ class TestSpineManifest(unittest.TestCase):
         writer.add_entry_values(1, shard_fn, 10, 20, 0, 1)
         writer.finalize()
         
-        sp = spine.Spine.from_manifest(
+        sp = spine.spine_from_manifest(
             self.manifest_file, 
             table_id=1, 
             schema=self.layout

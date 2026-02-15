@@ -878,7 +878,7 @@ Avoid `List[Optional[T]]`. RPython's C-generator may segfault trying to resolve 
 #### 18.6 Pointer Sanity
 Never pass an unvalidated file descriptor to an `rffi` function. Always check `if fd < 0`. When checking `mmap` results, cast the pointer to `rffi.SIZE_T` to compare against `-1` safely across different RPython integer representations.X
 
-# Summary
+### Summary
 
 When writing RPython:
 
@@ -896,3 +896,4 @@ When writing RPython:
 * Code should be formatted how the tool `black` would do it. If you change a file with bad formatting, fix the formatting carefully.
 * Attributes, methods and functions starting with underscore (`_`) are considered private. They should not be used by code outside the class/module, not even by tests. If you encounter a test using a private method, fix it by either making it use a public attribute/method/function, or remove it entirely.
 * When fixing a problem, don't leave code comments like `# FIXED: ...`. Code comments are not for documenting change, git commit messages are.
+* Prefer module-level functions to staticmethods
