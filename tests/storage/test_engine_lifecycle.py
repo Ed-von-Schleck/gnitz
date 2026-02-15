@@ -1,7 +1,7 @@
 import os
 import shutil
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.storage import engine, memtable, spine, wal, manifest, shard_registry
+from gnitz.storage import engine, memtable, wal, manifest, index, refcount
 from gnitz.core import types, values as db_values
 
 def test_engine_recovery_cycle():
@@ -17,7 +17,16 @@ def test_engine_recovery_cycle():
     # 1. Simulate active state
     w_writer = wal.WALWriter(w_path, layout)
     m_mgr = manifest.ManifestManager(m_path)
-    db = engine.Engine(memtable.MemTableManager(layout, 1024, wal_writer=w_writer), spine.Spine([]), m_mgr)
+    
+    # Create the unified index with a refcounter
+    rc = refcount.RefCounter()
+    shard_idx = index.ShardIndex(1, layout, rc)
+    
+    db = engine.Engine(
+        memtable.MemTableManager(layout, 1024, wal_writer=w_writer), 
+        shard_idx, 
+        m_mgr
+    )
     
     db.mem_manager.put(1, 1, [db_values.IntValue(100)]) # LSN 1
     db.mem_manager.put(2, 1, [db_values.IntValue(200)]) # LSN 2
@@ -31,11 +40,18 @@ def test_engine_recovery_cycle():
     db.close()
     
     # 4. Restart: Recovery should load Shard 1 AND replay WAL Block LSN 3
-    new_spine = spine.spine_from_manifest(m_path, 1, layout)
-    db_new = engine.Engine(memtable.MemTableManager(layout, 1024), new_spine, manifest.ManifestManager(m_path), recover_wal_filename=w_path)
+    rc_new = refcount.RefCounter()
+    new_idx = index.index_from_manifest(m_path, 1, layout, rc_new)
     
-    # Logic verification: Total LSN should be 4
-    if db_new.current_lsn != 4: raise ValueError("LSN monotonicity failure")
+    db_new = engine.Engine(
+        memtable.MemTableManager(layout, 1024), 
+        new_idx, 
+        manifest.ManifestManager(m_path), 
+        recover_wal_filename=w_path
+    )
+    
+    # Logic verification: Total LSN should be 4 (next available)
+    if db_new.current_lsn != 4: raise ValueError("LSN monotonicity failure: expected 4, got %d" % db_new.current_lsn)
     
     db_new.close()
     shutil.rmtree(test_dir)

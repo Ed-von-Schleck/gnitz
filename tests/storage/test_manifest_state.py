@@ -1,7 +1,7 @@
 import unittest
 import os
 import shutil
-from gnitz.storage import manifest, refcount, errors, spine
+from gnitz.storage import manifest, refcount, errors, index, writer_table
 from gnitz.core import types
 from rpython.rlib.rarithmetic import r_uint64
 
@@ -49,24 +49,29 @@ class TestManifestState(unittest.TestCase):
         self.rc.try_cleanup()
         self.assertFalse(os.path.exists(fn))
 
-    def test_deferred_spine_cleanup(self):
-        """Tests interaction between ShardHandles in a Spine and the RefCounter."""
+    def test_deferred_index_cleanup(self):
+        """Tests interaction between ShardHandles in an Index and the RefCounter."""
         # Setup dummy shard
         layout = types.TableSchema([types.ColumnDefinition(types.TYPE_I64)], 0)
-        fn = os.path.join(self.test_dir, "spine_ref.db")
-        from gnitz.storage import writer_table
+        fn = os.path.join(self.test_dir, "index_ref.db")
+        
+        # Create a valid shard file
         w = writer_table.TableShardWriter(layout)
         w.add_row_from_values(1, 1, [])
         w.finalize(fn)
 
-        h = spine.ShardHandle(fn, layout, 0)
-        sp = spine.Spine([h], self.rc)
+        # Initialize Handle (min_lsn=0, max_lsn=1)
+        h = index.ShardHandle(fn, layout, 0, 1)
+        
+        # Initialize Index and add handle (should auto-acquire ref)
+        idx = index.ShardIndex(1, layout, self.rc)
+        idx.add_handle(h)
         
         self.assertFalse(self.rc.can_delete(fn))
         self.rc.mark_for_deletion(fn)
         
-        # Closing the spine must release the handles and allow physical deletion
-        sp.close_all()
+        # Closing the index must release the handles and allow physical deletion
+        idx.close_all()
         self.rc.try_cleanup()
         self.assertFalse(os.path.exists(fn))
 
