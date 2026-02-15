@@ -1,8 +1,8 @@
 import unittest
 import mmap
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.storage.arena import Arena
-from gnitz.storage.buffer import MappedBuffer
+#from gnitz.storage.arena import Arena
+from gnitz.storage.buffer import MappedBuffer, Buffer
 from gnitz.storage import mmap_posix, errors
 
 class TestStorageLowLevel(unittest.TestCase):
@@ -12,7 +12,7 @@ class TestStorageLowLevel(unittest.TestCase):
         return rffi.cast(lltype.Signed, ptr) - rffi.cast(lltype.Signed, arena.base_ptr)
 
     def test_arena_alignment_logic(self):
-        arena = Arena(1024)
+        arena = Buffer(1024, growable=False)
         try:
             # Check first allocation (should be at offset 0)
             p1 = arena.alloc(5, alignment=1)
@@ -29,7 +29,7 @@ class TestStorageLowLevel(unittest.TestCase):
             arena.free()
 
     def test_arena_overflow(self):
-        arena = Arena(10)
+        arena = Buffer(10, growable=False)
         try:
             arena.alloc(5)
             with self.assertRaises(errors.MemTableFullError):
@@ -38,7 +38,7 @@ class TestStorageLowLevel(unittest.TestCase):
             arena.free()
 
     def test_arena_lifecycle(self):
-        arena = Arena(1024)
+        arena = Buffer(1024, growable=False)
         ptr = arena.alloc(100)
         self.assertNotEqual(rffi.cast(lltype.Signed, ptr), 0)
         arena.free()

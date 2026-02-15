@@ -2,7 +2,7 @@ from rpython.rlib.rrandom import Random
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.storage import arena, writer_table, errors
+from gnitz.storage import buffer, writer_table, errors
 from gnitz.storage.memtable_node import (
     node_get_next_off, node_set_next_off, node_get_weight, node_set_weight,
     node_get_key, node_get_payload_ptr, get_key_offset
@@ -17,8 +17,8 @@ class MemTable(object):
 
     def __init__(self, schema, arena_size):
         self.schema = schema
-        self.arena = arena.Arena(arena_size)
-        self.blob_arena = arena.Arena(arena_size)
+        self.arena = buffer.Buffer(arena_size, growable=False)
+        self.blob_arena = buffer.Buffer(arena_size, growable=False)
         self.rng = Random(1234)
         self._update_offsets = [0] * MAX_HEIGHT
         self.key_size = schema.get_pk_column().field_type.size

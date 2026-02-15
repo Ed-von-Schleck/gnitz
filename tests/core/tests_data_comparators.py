@@ -2,7 +2,7 @@ import os
 import unittest
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import types, values as db_values, strings, strings as string_logic
-from gnitz.storage import arena, writer_table, shard_table, comparator
+from gnitz.storage import buffer, writer_table, shard_table, comparator
 
 class TestDataComparators(unittest.TestCase):
     def setUp(self):
@@ -11,7 +11,7 @@ class TestDataComparators(unittest.TestCase):
             types.ColumnDefinition(types.TYPE_STRING), # Payload 1
             types.ColumnDefinition(types.TYPE_F64)     # Payload 2
         ], 0)
-        self.arena = arena.Arena(1024)
+        self.arena = buffer.Buffer(1024)
         self.struct_buf1 = lltype.malloc(rffi.CCHARP.TO, 16, flavor='raw')
         self.struct_buf2 = lltype.malloc(rffi.CCHARP.TO, 16, flavor='raw')
         self.heap_buf = lltype.malloc(rffi.CCHARP.TO, 1024, flavor='raw')
