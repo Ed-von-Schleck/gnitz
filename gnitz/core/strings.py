@@ -48,7 +48,7 @@ def _memcmp(p1, p2, length):
             return False
     return True
 
-#@jit.unroll_safe
+@jit.unroll_safe
 def string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_prefix):
     """Compares a packed German String structure against a Python string."""
     u32_ptr = rffi.cast(rffi.UINTP, struct_ptr)
@@ -113,42 +113,57 @@ def string_equals_dual(ptr1, heap1, ptr2, heap2):
         h2_ptr = rffi.ptradd(heap2, rffi.cast(lltype.Signed, u64_p2[0]))
         return _memcmp(h1_ptr, h2_ptr, len1)
 
-#@jit.unroll_safe
+@jit.unroll_safe
 def compare_db_value_to_german(val_obj, german_ptr, heap_ptr):
     """
     Dry-run comparison: Compare a StringValue object against a packed structure.
     Returns: -1 if structure < value, 1 if structure > value, 0 if equal.
-    Used for SkipList/Engine lookups without allocating arena space.
     """
     s2 = val_obj.get_string()
     len2 = len(s2)
     u32_ptr = rffi.cast(rffi.UINTP, german_ptr)
     len1 = rffi.cast(lltype.Signed, u32_ptr[0])
+    min_len = len1 if len1 < len2 else len2
+
+    # 1. Compare prefix bytes (first 4 bytes of the string)
+    pref_ptr = rffi.ptradd(german_ptr, 4)
+    i = 0
+    limit = 4 if min_len > 4 else min_len
+    while i < limit:
+        c1 = ord(pref_ptr[i])
+        c2 = ord(s2[i])
+        if c1 < c2: return -1
+        if c1 > c2: return 1
+        i += 1
     
+    # 2. Compare remaining bytes if lengths match beyond the prefix
+    if min_len > 4:
+        if len1 <= SHORT_STRING_THRESHOLD:
+            # Short string data is in the 8-byte suffix (indices 4 to 11)
+            data1_ptr = rffi.ptradd(german_ptr, 8)
+            i = 4
+            while i < min_len:
+                c1 = ord(data1_ptr[i - 4])
+                c2 = ord(s2[i])
+                if c1 < c2: return -1
+                if c1 > c2: return 1
+                i += 1
+        else:
+            # Long string data is in the heap (entire string)
+            off_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(german_ptr, 8))
+            off1 = rffi.cast(lltype.Signed, off_ptr[0])
+            h_ptr = rffi.ptradd(heap_ptr, off1)
+            i = 4
+            while i < min_len:
+                c1 = ord(h_ptr[i])
+                c2 = ord(s2[i])
+                if c1 < c2: return -1
+                if c1 > c2: return 1
+                i += 1
+
+    # 3. All bytes match up to min_len, the shorter string is lexicographically smaller
     if len1 < len2: return -1
     if len1 > len2: return 1
-    if len1 == 0: return 0
-    
-    # Compare Prefix
-    prefix1 = rffi.cast(lltype.Signed, u32_ptr[1])
-    prefix2 = rffi.cast(lltype.Signed, compute_prefix(s2))
-    if prefix1 < prefix2: return -1
-    if prefix1 > prefix2: return 1
-    
-    if len1 <= 4: return 0
-    
-    # Compare Suffix/Content
-    if len1 <= SHORT_STRING_THRESHOLD:
-        suffix_ptr = rffi.ptradd(german_ptr, 8)
-        for i in range(len1 - 4):
-            if suffix_ptr[i] < s2[i + 4]: return -1
-            if suffix_ptr[i] > s2[i + 4]: return 1
-    else:
-        off1 = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(german_ptr, 8))[0])
-        h_ptr = rffi.ptradd(heap_ptr, off1)
-        for i in range(len1):
-            if h_ptr[i] < s2[i]: return -1
-            if h_ptr[i] > s2[i]: return 1
     return 0
 
 @jit.unroll_safe
@@ -160,12 +175,13 @@ def string_compare(ptr1, heap1, ptr2, heap2):
     len2 = rffi.cast(lltype.Signed, u32_p2[0])
     min_len = len1 if len1 < len2 else len2
 
-    # Compare Prefix bytes directly (Little Endian)
+    # Compare Prefix bytes directly
     pref_p1 = rffi.ptradd(ptr1, 4)
     pref_p2 = rffi.ptradd(ptr2, 4)
     for i in range(4 if min_len > 4 else min_len):
-        if pref_p1[i] < pref_p2[i]: return -1
-        if pref_p1[i] > pref_p2[i]: return 1
+        c1, c2 = ord(pref_p1[i]), ord(pref_p2[i])
+        if c1 < c2: return -1
+        if c1 > c2: return 1
     
     if min_len <= 4:
         if len1 < len2: return -1
@@ -186,7 +202,7 @@ def string_compare(ptr1, heap1, ptr2, heap2):
         data2, offset2 = rffi.ptradd(heap2, rffi.cast(lltype.Signed, u64_2)), 0
 
     for i in range(4, min_len):
-        c1, c2 = data1[i + offset1], data2[i + offset2]
+        c1, c2 = ord(data1[i + offset1]), ord(data2[i + offset2])
         if c1 < c2: return -1
         if c1 > c2: return 1
 
