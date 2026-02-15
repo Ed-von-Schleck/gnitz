@@ -13,7 +13,7 @@ class TestCrashRecoveryStrings(unittest.TestCase):
         ])
         
     def test_long_string_recovery(self):
-        db = zset.PersistentZSet(
+        db = zset.PersistentTable(
             self.test_dir, 
             "crashdb", 
             self.layout,
@@ -30,7 +30,7 @@ class TestCrashRecoveryStrings(unittest.TestCase):
         db.close() # WAL is flushed, memory is gone
         
         # 2. Re-open
-        db_new = zset.PersistentZSet(
+        db_new = zset.PersistentTable(
             self.test_dir, 
             "crashdb", 
             self.layout,

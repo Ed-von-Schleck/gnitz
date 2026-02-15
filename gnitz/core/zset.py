@@ -114,8 +114,6 @@ class PersistentTable(object):
         if self.wal_writer: self.wal_writer.close()
         self.is_closed = True
 
-PersistentZSet = PersistentTable
-
 class ZSet(object):
     """
     In-memory Z-Set multiset logic. 
