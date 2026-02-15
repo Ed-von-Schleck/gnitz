@@ -19,7 +19,7 @@ def test_wal_recovery():
     if os.path.exists(wal_fn): os.unlink(wal_fn)
     if os.path.exists(m_fn): os.unlink(m_fn)
 
-    layout = types.ComponentLayout([types.TYPE_I64, types.TYPE_I64])
+    layout = types.TableSchema([types.ColumnDefinition(types.TYPE_I64), types.ColumnDefinition(types.TYPE_I64)], 0)
     try:
         writer = wal.WALWriter(wal_fn, layout)
         writer.append_block(100, 1, [(1, 1, _pack_simple(layout, [10, 20]))])

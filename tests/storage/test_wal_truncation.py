@@ -14,7 +14,7 @@ def get_weight_helper(engine_inst, pk, vals):
         lltype.free(scratch, flavor='raw')
 
 def test_truncation_lifecycle():
-    layout = types.ComponentLayout([types.TYPE_I64])
+    layout = types.TableSchema([types.ColumnDefinition(types.TYPE_I64)], 0)
     m_name, w_name, s_name = "trunc.manifest", "trunc.wal", "trunc_shard.db"
     for f in [m_name, w_name, s_name]:
         if os.path.exists(f): os.unlink(f)

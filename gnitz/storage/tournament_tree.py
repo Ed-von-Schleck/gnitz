@@ -1,10 +1,10 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from rpython.rlib import jit
 from gnitz.core import types
 
 class StreamCursor(object):
+    """Iterative pointer into a TableShardView, skipping annihilated ghosts."""
     _immutable_fields_ = ['view', 'schema', 'is_u128']
 
     def __init__(self, shard_view):
@@ -37,6 +37,8 @@ class StreamCursor(object):
     def is_exhausted(self):
         return self.exhausted
 
+# Use a struct for the heap nodes to ensure 8-byte alignment for u64 parts
+# and avoid GC-heap allocation of r_uint128 objects.
 HEAP_NODE = lltype.Struct("HeapNode", 
     ("key_low", rffi.ULONGLONG),
     ("key_high", rffi.ULONGLONG),
@@ -44,6 +46,7 @@ HEAP_NODE = lltype.Struct("HeapNode",
 )
 
 class TournamentTree(object):
+    """N-way merge heap specialized for 64-bit and 128-bit Primary Keys."""
     def __init__(self, cursors):
         self.cursors = cursors
         self.num_cursors = len(cursors)
@@ -57,7 +60,6 @@ class TournamentTree(object):
     def _heap_push(self, key, c_idx):
         idx = self.heap_size
         self.heap_size += 1
-        # Truncation via r_uint64() cast to avoid prebuilt long literals
         self.heap[idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(key))
         self.heap[idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(key >> 64))
         self.heap[idx].cursor_idx = rffi.cast(rffi.INT, c_idx)
@@ -103,15 +105,8 @@ class TournamentTree(object):
         if self.heap_size == 0: return r_uint128(-1)
         return self._get_key(0)
 
-    # Backward compatibility for tests
-    def get_min_primary_key(self):
-        return self.get_min_key()
-
     def get_all_cursors_at_min(self):
-        """ 
-        Returns all cursors that point to the current minimum key.
-        Optimized O(K log N) traversal where K is the number of matching keys.
-        """
+        """Collects all cursors sharing the current minimum Primary Key."""
         results = []
         if self.heap_size == 0: 
             return results
@@ -120,17 +115,12 @@ class TournamentTree(object):
         self._collect_equal_keys(0, target, results)
         return results
 
-    #@jit.unroll_safe
     def _collect_equal_keys(self, idx, target, results):
-        """ Recursively collects cursors from the heap that match the target key. """
         if idx >= self.heap_size:
             return
-        
         if self._get_key(idx) == target:
             c_idx = rffi.cast(lltype.Signed, self.heap[idx].cursor_idx)
             results.append(self.cursors[c_idx])
-            
-            # Check children
             self._collect_equal_keys(2 * idx + 1, target, results)
             self._collect_equal_keys(2 * idx + 2, target, results)
     
@@ -149,7 +139,6 @@ class TournamentTree(object):
                 if self.heap_size > 0: self._sift_down(0)
             else:
                 nk = self.cursors[c_idx].peek_key()
-                # Truncation via r_uint64() cast
                 self.heap[0].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(nk))
                 self.heap[0].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(nk >> 64))
                 self._sift_down(0)

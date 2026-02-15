@@ -5,7 +5,12 @@ from gnitz.storage import writer_table, shard_table, tournament_tree
 
 class TestTournamentTree(unittest.TestCase):
     def setUp(self):
-        self.layout = types.ComponentLayout([types.TYPE_I64, types.TYPE_STRING])
+        # Schema: PK(0), I64(1), String(2)
+        self.layout = types.TableSchema([
+            types.ColumnDefinition(types.TYPE_U64),
+            types.ColumnDefinition(types.TYPE_I64), 
+            types.ColumnDefinition(types.TYPE_STRING)
+        ], 0)
         self.test_files = []
     
     def tearDown(self):
@@ -31,7 +36,7 @@ class TestTournamentTree(unittest.TestCase):
         
         res = []
         while not tree.is_exhausted():
-            res.append(int(tree.get_min_primary_key()))
+            res.append(int(tree.get_min_key()))
             tree.advance_min_cursors()
         
         self.assertEqual(res, [10, 20, 30, 40])
@@ -49,12 +54,16 @@ class TestTournamentTree(unittest.TestCase):
         
         tree = tournament_tree.TournamentTree([tournament_tree.StreamCursor(v1), tournament_tree.StreamCursor(v2)])
         
-        self.assertEqual(tree.get_min_primary_key(), 5)
+        self.assertEqual(tree.get_min_key(), 5)
+        # Verify that both cursors contribute to the same min key
         self.assertEqual(len(tree.get_all_cursors_at_min()), 2)
         
         tree.advance_min_cursors()
-        self.assertEqual(tree.get_min_primary_key(), 10)
+        self.assertEqual(tree.get_min_key(), 10)
         
         tree.close()
         v1.close()
         v2.close()
+
+if __name__ == '__main__':
+    unittest.main()

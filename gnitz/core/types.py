@@ -79,11 +79,3 @@ class TableSchema(object):
 
     def get_pk_column(self):
         return self.columns[self.pk_index]
-
-def ComponentLayout(type_list):
-    """
-    Maintains compatibility with ECS-style tests.
-    """
-    # Create fixed-size list without append()
-    cols = [ColumnDefinition(TYPE_U64)] + [ColumnDefinition(t) for t in type_list]
-    return TableSchema(cols, 0)
