@@ -110,11 +110,6 @@ class WALWriter(object):
         mmap_posix.fsync_c(self.fd)
 
     def truncate_before_lsn(self, lsn):
-        """
-        FIXED: Retires the WAL following a successful shard checkpoint.
-        In the integrated single-file WAL model, we physically truncate 
-        the file to zero bytes, effectively acknowledging the checkpoint.
-        """
         if self.closed or self.fd == -1:
             return
         

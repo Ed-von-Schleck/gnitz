@@ -18,7 +18,6 @@ class MemTableManager(object):
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
         if self.wal_writer:
-            # FIXED: Use the factory method to handle 128-bit key splitting safely
             self.wal_writer.append_block(
                 lsn, 
                 self.table_id, 
@@ -27,7 +26,6 @@ class MemTableManager(object):
         self.active_table.upsert(r_uint128(key), weight, field_values)
 
     def flush_and_rotate(self, filename):
-        # FIXED: Pass table_id to flush so shard header is correct
         self.active_table.flush(filename, self.table_id)
         self.active_table.free()
         self.active_table = MemTable(self.schema, self.capacity)

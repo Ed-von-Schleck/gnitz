@@ -57,7 +57,6 @@ class U128Value(DBValue):
 def wrap(val):
     """
     Wraps a Python primitive into a DBValue.
-    FIXED: Removed isinstance(val, long) and direct constructor calls like long().
     """
     if isinstance(val, float):
         return FloatValue(val)

@@ -60,7 +60,6 @@ class RefCounter(object):
     def try_cleanup(self):
         """
         Attempts to delete unreferenced shards.
-        FIXED: Robust loops for monomorphic list processing in RPython.
         """
         deleted = []
         remaining = []

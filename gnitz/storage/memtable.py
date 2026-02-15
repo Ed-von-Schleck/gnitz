@@ -38,7 +38,6 @@ class MemTable(object):
         head_key_off = get_key_offset(MAX_HEIGHT)
         h_sz = head_key_off + self.key_size + self.schema.memtable_stride
         
-        # FIXED: Explicit 16-byte alignment for SkipList nodes
         ptr = self.arena.alloc(h_sz, alignment=16)
         self.head_off = rffi.cast(lltype.Signed, ptr) - rffi.cast(lltype.Signed, self.arena.base_ptr)
         
@@ -144,7 +143,6 @@ class MemTable(object):
         node_full_sz = key_off + self.key_size + self.schema.memtable_stride
         self._ensure_capacity(node_full_sz, field_values)
         
-        # FIXED: Enforce 16-byte alignment for all nodes in the SkipList
         new_ptr = self.arena.alloc(node_full_sz, alignment=16)
         new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
         
@@ -210,7 +208,6 @@ class MemTable(object):
                 rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, val_obj.get_int())
 
     def flush(self, filename, table_id=0):
-        # FIXED: Accept table_id to ensure shard headers match Manifest
         sw = writer_table.TableShardWriter(self.schema, table_id)
         base, curr_off = self.arena.base_ptr, node_get_next_off(self.arena.base_ptr, self.head_off, 0)
         while curr_off != 0:
