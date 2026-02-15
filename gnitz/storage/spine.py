@@ -20,11 +20,9 @@ class ShardHandle(object):
         
         if self.view.count > 0:
             is_u128 = schema.get_pk_column().field_type == types.TYPE_U128
-            # Retrieve u128s from the view (view handles u64/u128 internally)
             k_min = self.view.get_pk_u128(0) if is_u128 else r_uint128(self.view.get_pk_u64(0))
             k_max = self.view.get_pk_u128(self.view.count - 1) if is_u128 else r_uint128(self.view.get_pk_u64(self.view.count - 1))
             
-            # Store split for RPython stability
             self.pk_min_lo = r_uint64(k_min)
             self.pk_min_hi = r_uint64(k_min >> 64)
             self.pk_max_lo = r_uint64(k_max)
@@ -57,26 +55,7 @@ class Spine(object):
             for h in self.handles:
                 self.ref_counter.acquire(h.filename)
 
-    @classmethod
-    def from_manifest(cls, manifest_path, table_id, schema, ref_counter=None, validate_checksums=False):
-        reader = manifest.ManifestReader(manifest_path)
-        handles = []
-        try:
-            for entry in reader.iterate_entries():
-                if entry.table_id == table_id:
-                    handle = ShardHandle(
-                        entry.shard_filename, 
-                        schema, 
-                        entry.max_lsn, 
-                        validate_checksums=validate_checksums
-                    )
-                    handles.append(handle)
-        finally:
-            reader.close()
-        return cls(handles, ref_counter)
-
     def _sort_handles(self):
-        """Sorts shards by MinPK to enable efficient range pruning."""
         for i in range(1, len(self.handles)):
             h = self.handles[i]
             target_min_k = h.get_min_key()
@@ -87,10 +66,8 @@ class Spine(object):
             self.handles[j+1] = h
 
     def find_all_shards_and_indices(self, key):
-        """Returns all (handle, row_index) pairs containing the Primary Key."""
         results = []
         for h in self.handles:
-            # Range pruning
             if h.get_min_key() <= key <= h.get_max_key():
                 row_idx = h.find_row_index(key)
                 if row_idx != -1:
@@ -104,7 +81,6 @@ class Spine(object):
             self.ref_counter.acquire(handle.filename)
 
     def replace_handles(self, old_filenames, new_handle):
-        """Atomically replaces a set of shards (e.g., after compaction)."""
         new_list = []
         for h in self.handles:
             is_superseded = False
@@ -133,3 +109,24 @@ class Spine(object):
             if self.ref_counter:
                 self.ref_counter.release(h.filename)
         self.handles = []
+
+def spine_from_manifest(manifest_path, table_id, schema, ref_counter=None, validate_checksums=False):
+    """
+    Standalone function for Spine initialization.
+    Avoids @classmethod binding issues in RPython.
+    """
+    reader = manifest.ManifestReader(manifest_path)
+    handles = []
+    try:
+        for entry in reader.iterate_entries():
+            if entry.table_id == table_id:
+                handle = ShardHandle(
+                    entry.shard_filename, 
+                    schema, 
+                    entry.max_lsn, 
+                    validate_checksums
+                )
+                handles.append(handle)
+    finally:
+        reader.close()
+    return Spine(handles, ref_counter)

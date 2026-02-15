@@ -1,3 +1,5 @@
+# gnitz/core/zset.py
+
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, intmask
@@ -10,9 +12,6 @@ class PersistentTable(object):
     """
     Persistent Z-Set Table.
     Integrates MemTable, WAL, and Columnar Shards.
-    
-    Querying now uses "dry-run" comparison, bypassing the need for 
-    intermediate payload serialization buffers.
     """
     def __init__(self, directory, name, schema, table_id=1, cache_size=1048576, read_only=False, validate_checksums=False):
         self.directory = directory
@@ -44,12 +43,12 @@ class PersistentTable(object):
         )
         
         if self.manifest_manager.exists():
-            self.spine = spine.Spine.from_manifest(
+            self.spine = spine.spine_from_manifest(
                 self.manifest_path, 
-                table_id=self.table_id, 
-                schema=self.schema,
-                ref_counter=self.ref_counter,
-                validate_checksums=self.validate_checksums
+                self.table_id, 
+                self.schema,
+                self.ref_counter,
+                self.validate_checksums
             )
         else:
             self.spine = spine.Spine([], self.ref_counter)
@@ -72,19 +71,18 @@ class PersistentTable(object):
         self.mem_manager.put(r_uint128(key), -1, db_values_list)
 
     def get_weight(self, key, db_values_list):
-        """
-        Calculates net weight for a specific key and payload across the 
-        entire storage hierarchy. Uses dry-run comparison.
-        """
         return self.engine.get_effective_weight_raw(r_uint128(key), db_values_list)
 
     def flush(self):
-        # Fixed: Use intmask for string formatting to satisfy RPython annotator
+        """
+        Commits current MemTable to a new Shard.
+        FIXED: Updated to receive only 'needs_compaction' from the engine.
+        """
         lsn_val = intmask(self.mem_manager.starting_lsn)
         filename = os.path.join(self.directory, "%s_shard_%d.db" % (
             self.name, lsn_val)
         )
-        min_key, max_key, needs_compaction = self.engine.flush_and_rotate(filename)
+        needs_compaction = self.engine.flush_and_rotate(filename)
         self.checkpoint()
         return filename
 
@@ -93,7 +91,6 @@ class PersistentTable(object):
             reader = self.manifest_manager.load_current()
             lsn = reader.global_max_lsn
             reader.close()
-            # Fixed: Remove forbidden int() cast; WALWriter accepts r_uint64
             self.wal_writer.truncate_before_lsn(lsn + r_uint64(1))
 
     def _trigger_compaction(self):
@@ -103,9 +100,9 @@ class PersistentTable(object):
             self.manifest_manager, 
             self.ref_counter, 
             self.schema, 
-            output_dir=self.directory, 
-            spine_obj=self.spine,
-            validate_checksums=self.validate_checksums
+            self.directory, 
+            self.spine,
+            self.validate_checksums
         )
 
     def close(self):
@@ -115,23 +112,14 @@ class PersistentTable(object):
         self.is_closed = True
 
 class ZSet(object):
-    """
-    In-memory Z-Set multiset logic. 
-    Updated to use public memtable_node helpers.
-    """
     def __init__(self, schema):
         self.schema = schema
-        # Large capacity for in-memory only usage
         self.mem_manager = memtable_manager.MemTableManager(schema, 64 * 1024 * 1024) 
 
     def upsert(self, key, weight, payload):
         self.mem_manager.put(r_uint128(key), weight, payload)
 
     def get_weight(self, key, payload=None):
-        """
-        If payload is provided: returns weight of the specific record.
-        If payload is None: returns the sum of weights for the key.
-        """
         table = self.mem_manager.active_table
         base = table.arena.base_ptr
         total = 0
@@ -139,9 +127,7 @@ class ZSet(object):
         while curr != 0:
             k = memtable_node.node_get_key(base, curr, table.key_size)
             if k != r_uint128(key): break
-            
             node_w = memtable_node.node_get_weight(base, curr)
-            
             if payload is not None:
                 from gnitz.storage.comparator import compare_values_to_packed
                 p_ptr = memtable_node.node_get_payload_ptr(base, curr, table.key_size)
@@ -149,12 +135,10 @@ class ZSet(object):
                     return int(node_w)
             else:
                 total += node_w
-                
             curr = memtable_node.node_get_next_off(base, curr, 0)
         return int(total)
 
     def get_payload(self, key):
-        """Returns the payload of the first record with a non-zero weight."""
         table = self.mem_manager.active_table
         base = table.arena.base_ptr
         curr = table._find_first_key(r_uint128(key))
@@ -167,7 +151,6 @@ class ZSet(object):
         return None
 
     def iter_nonzero(self):
-        """Iterates over all key-weight-payload triples where weight != 0."""
         table = self.mem_manager.active_table
         base = table.arena.base_ptr
         curr = memtable_node.node_get_next_off(base, table.head_off, 0)
@@ -175,7 +158,6 @@ class ZSet(object):
             w = memtable_node.node_get_weight(base, curr)
             if w != 0:
                 k = memtable_node.node_get_key(base, curr, table.key_size)
-                # Fixed: Use intmask instead of int() to satisfy RPython annotator
                 k_val = intmask(k) if table.key_size == 8 else k
                 p = memtable_node.unpack_payload_to_values(table, curr)
                 yield (k_val, int(w), p)

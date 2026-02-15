@@ -1,3 +1,5 @@
+# gnitz/storage/engine.py
+
 import os
 import errno
 from rpython.rtyper.lltypesystem import rffi, lltype
@@ -40,7 +42,6 @@ class Engine(object):
             last_recovered_lsn = max_lsn_seen
             
             while True:
-                # Explicit call to the State-based reader
                 block = reader.read_next_block()
                 if block is None: 
                     break
@@ -52,7 +53,6 @@ class Engine(object):
                 
                 last_recovered_lsn = block.lsn
                 for rec in block.records:
-                    # FIXED: Use rec.get_key() instead of rec.primary_key
                     self.mem_manager.active_table.upsert(rec.get_key(), rec.weight, rec.component_data)
             
             self.current_lsn = last_recovered_lsn + r_uint64(1)
@@ -62,38 +62,27 @@ class Engine(object):
             if e.errno != errno.ENOENT:
                 raise e
         except Exception as e:
-            # Final Hardening: Catch and print any unexpected error 
-            # before the RPython runtime SIGABRTs.
             import os
             os.write(2, "FATAL ERROR during WAL recovery: " + str(e) + "\n")
             raise e
 
     def get_effective_weight_raw(self, key, field_values):
-        """
-        Calculates net weight for a specific key and payload across the 
-        hierarchy using DBValue comparisons.
-        """
-        # 1. Check MemTable
         mem_weight = 0
         table = self.mem_manager.active_table
         match_off = table._find_exact_values(key, field_values)
         if match_off != 0:
             mem_weight = node_get_weight(table.arena.base_ptr, match_off)
 
-        # 2. Check Persistent Shards
         spine_weight = 0
         results = self.spine.find_all_shards_and_indices(key)
         
         is_u128 = self.schema.get_pk_column().field_type.size == 16
         
         for shard_handle, start_idx in results:
-            # FIXED: Iterate forward while PK matches to find matching payload.
-            # Shards may contain multiple payloads for the same PK.
             curr_idx = start_idx
             view = shard_handle.view
             
             while curr_idx < view.count:
-                # 2a. Verify PK matches
                 if is_u128:
                     k = view.get_pk_u128(curr_idx)
                 else:
@@ -102,10 +91,8 @@ class Engine(object):
                 if k != key:
                     break 
                 
-                # 2b. Check semantic payload equality
                 if comparator.compare_soa_to_values(self.schema, view, curr_idx, field_values) == 0:
                     spine_weight += shard_handle.get_weight(curr_idx)
-                    # Optimization: Since MemTable coalesces, we expect only one match per shard per PK
                     break 
                 
                 curr_idx += 1
@@ -113,6 +100,10 @@ class Engine(object):
         return mem_weight + spine_weight
 
     def flush_and_rotate(self, filename):
+        """
+        Flushes MemTable to disk and rotates state.
+        FIXED: Returns only 'needs_comp' to avoid unaligned 128-bit tuple field segfaults.
+        """
         self.current_lsn = self.mem_manager.current_lsn
         lsn_min = self.mem_manager.starting_lsn
         lsn_max = self.current_lsn - r_uint64(1)
@@ -122,7 +113,6 @@ class Engine(object):
         entries = []
         if self.manifest_manager and self.manifest_manager.exists():
             reader = self.manifest_manager.load_current()
-            # HARDENING: Use manual iteration for generators in RPython
             it = reader.iterate_entries()
             while True:
                 try:
@@ -133,14 +123,11 @@ class Engine(object):
             reader.close()
         
         from gnitz.storage.spine import ShardHandle
-        min_k = r_uint128(0)
-        max_k = r_uint128(0)
         needs_comp = False
         
         if os.path.exists(filename):
             handle = ShardHandle(filename, self.schema, lsn_max, validate_checksums=self.validate_checksums)
             if handle.view.count > 0:
-                # FIXED: Use handle.get_min_key() and get_max_key()
                 min_k = handle.get_min_key()
                 max_k = handle.get_max_key()
                 new_entry = manifest.ManifestEntry(self.table_id, filename, min_k, max_k, lsn_min, lsn_max)
@@ -159,7 +146,7 @@ class Engine(object):
             self.manifest_manager.publish_new_version(entries, lsn_max)
             
         self.mem_manager.starting_lsn = self.current_lsn
-        return min_k, max_k, needs_comp
+        return needs_comp
 
     def close(self):
         self.mem_manager.close()
