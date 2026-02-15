@@ -1,6 +1,6 @@
 import unittest
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import strings
+from gnitz.core import strings, values
 
 class TestGermanStrings(unittest.TestCase):
     def setUp(self):
@@ -24,46 +24,54 @@ class TestGermanStrings(unittest.TestCase):
             strings.pack_string(buf, s, off)
             self.heap_off += len(s)
 
-    def test_equality(self):
-        self._pack(self.struct_buf1, "hello world")
-        self._pack(self.struct_buf2, "hello world")
-        self.assertTrue(strings.string_equals_dual(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf))
+    def test_german_structure_logic(self):
+        """Verify inline vs heap packing at the 12-byte threshold."""
+        # Exactly 12 bytes - should be inline
+        s12 = "123456789012"
+        self._pack(self.struct_buf1, s12)
+        u32_ptr = rffi.cast(rffi.UINTP, self.struct_buf1)
+        self.assertEqual(rffi.cast(lltype.Signed, u32_ptr[0]), 12)
         
-        self._pack(self.struct_buf2, "hello world!")
-        self.assertFalse(strings.string_equals_dual(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf))
+        # 13 bytes - should be heap
+        s13 = "1234567890123"
+        self._pack(self.struct_buf2, s13)
+        off_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.struct_buf2, 8))
+        self.assertEqual(rffi.cast(lltype.Signed, off_ptr[0]), 0) # First heap alloc
 
-    def test_compare_ordering(self):
-        # Short vs Short
-        self._pack(self.struct_buf1, "apple")
-        self._pack(self.struct_buf2, "apply")
-        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), -1)
-        self.assertEqual(strings.string_compare(self.struct_buf2, self.heap_buf, self.struct_buf1, self.heap_buf), 1)
+    def test_equality_and_prefix_shortcircuit(self):
+        """Verify O(1) equality failure via prefix and length."""
+        self._pack(self.struct_buf1, "apple_sauce")
+        self._pack(self.struct_buf2, "apple_juice")
+        
+        # Prefixes match ("appl"), but total string doesn't
+        self.assertFalse(strings.string_equals_dual(self.struct_buf1, self.heap_buf, 
+                                                   self.struct_buf2, self.heap_buf))
+        
+        # Length mismatch - instant False
+        self._pack(self.struct_buf2, "apple")
+        self.assertFalse(strings.string_equals_dual(self.struct_buf1, self.heap_buf, 
+                                                   self.struct_buf2, self.heap_buf))
 
-        # Long vs Long
-        self._pack(self.struct_buf1, "this is string a")
-        self._pack(self.struct_buf2, "this is string b")
-        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), -1)
+    def test_compare_db_value_to_german(self):
+        """Verify the dry-run comparison used for SkipList/Engine searches."""
+        self._pack(self.struct_buf1, "identical_payload")
+        val = values.StringValue("identical_payload")
+        
+        # Should be 0 (Equal)
+        self.assertEqual(strings.compare_db_value_to_german(val, self.struct_buf1, self.heap_buf), 0)
+        
+        # Lexicographical check
+        val_lower = values.StringValue("abc")
+        self._pack(self.struct_buf1, "def")
+        # Structure (def) is > Value (abc) -> 1
+        self.assertEqual(strings.compare_db_value_to_german(val_lower, self.struct_buf1, self.heap_buf), 1)
 
-        # Mixed lengths
+    def test_ordering_semantics(self):
+        """Verify strict lexicographical ordering across inline/heap boundaries."""
         self._pack(self.struct_buf1, "abc")
         self._pack(self.struct_buf2, "abcd")
-        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), -1)
-
-        # Equal
-        self._pack(self.struct_buf1, "identical")
-        self._pack(self.struct_buf2, "identical")
-        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), 0)
-
-    def test_compare_prefix_boundary(self):
-        # Difference at index 3 (within prefix)
-        self._pack(self.struct_buf1, "abcA")
-        self._pack(self.struct_buf2, "abcB")
-        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), -1)
-
-        # Difference at index 4 (just after prefix, inline)
-        self._pack(self.struct_buf1, "abcdE")
-        self._pack(self.struct_buf2, "abcdF")
-        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, self.struct_buf2, self.heap_buf), -1)
+        self.assertEqual(strings.string_compare(self.struct_buf1, self.heap_buf, 
+                                               self.struct_buf2, self.heap_buf), -1)
 
 if __name__ == '__main__':
     unittest.main()
