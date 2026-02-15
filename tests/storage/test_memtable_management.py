@@ -1,36 +1,53 @@
 import unittest
 import os
-from gnitz.core import types, values as db_values
-from gnitz.storage import memtable_manager, shard_table, memtable
+import shutil
+from gnitz.core import types, values as db_values, zset
+from gnitz.storage import shard_table, memtable
 
 class TestMemTableManagement(unittest.TestCase):
     def setUp(self):
-        self.fn = "test_mt_mgmt.db"
+        self.db_dir = "test_engine_db"
+        if os.path.exists(self.db_dir):
+            shutil.rmtree(self.db_dir)
+        os.mkdir(self.db_dir)
+        
+        self.fn = "test_survivor.db"
         self.layout = types.TableSchema([
             types.ColumnDefinition(types.TYPE_U64), 
             types.ColumnDefinition(types.TYPE_STRING)
         ], 0)
 
     def tearDown(self):
-        if os.path.exists(self.fn): os.unlink(self.fn)
+        if os.path.exists(self.db_dir):
+            shutil.rmtree(self.db_dir)
+        if os.path.exists(self.fn): 
+            os.unlink(self.fn)
 
-    def test_transmutation_roundtrip(self):
-        mgr = memtable_manager.MemTableManager(self.layout, 1024 * 1024)
+    def test_transmutation_roundtrip_via_engine(self):
+        # Use the high-level PersistentTable, which uses the Engine internally
+        db = zset.PersistentTable(self.db_dir, "test_table", self.layout)
         try:
-            mgr.put(10, 1, [db_values.StringValue("short")])
-            mgr.put(20, 1, [db_values.StringValue("long_blob_payload_relocation_test")])
-            mgr.flush_and_rotate(self.fn)
+            db.insert(10, [db_values.StringValue("short")])
+            db.insert(20, [db_values.StringValue("long_blob_payload_relocation_test")])
             
-            view = shard_table.TableShardView(self.fn, self.layout)
+            # This triggers engine.flush_and_rotate()
+            shard_filename = db.flush()
+            
+            self.assertTrue(os.path.exists(shard_filename))
+            
+            view = shard_table.TableShardView(shard_filename, self.layout)
             self.assertEqual(view.count, 2)
             self.assertEqual(view.get_pk_u64(0), 10)
             self.assertTrue(view.string_field_equals(1, 1, "long_blob_payload_relocation_test"))
             view.close()
         finally:
-            mgr.close()
+            db.close()
 
     def test_survivor_blob_pruning(self):
-        """Verifies that blobs for annihilated records are not written to shards."""
+        """
+        Verifies that blobs for annihilated records are not written to shards.
+        This is a direct unit test of MemTable's flush logic.
+        """
         table = memtable.MemTable(self.layout, 1024 * 1024)
         try:
             dead_str = "ANNIHILATE" * 10

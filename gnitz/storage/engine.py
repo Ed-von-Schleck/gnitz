@@ -5,7 +5,9 @@ import errno
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
+from gnitz.storage.memtable import MemTable
 from gnitz.storage.memtable_node import node_get_weight
+from gnitz.storage.wal_format import WALRecord
 from gnitz.storage import wal, manifest, index, mmap_posix, comparator
 from gnitz.core import types
 
@@ -13,21 +15,33 @@ class Engine(object):
     """
     The DBSP Execution Engine.
     Coordinates the Write-Head (MemTable) and the Persistent Tail (ShardIndex).
+    
+    Acts as the single authoritative manager for:
+    1. Mutable State (MemTable + WAL)
+    2. Immutable State (ShardIndex + Manifest)
+    3. The transition between them (Flush/Rotate)
     """
     _immutable_fields_ = [
-        'mem_manager', 'index', 'schema', 
-        'manifest_manager', 'table_id'
+        'index', 'schema', 'manifest_manager', 'table_id', 
+        'memtable_capacity', 'wal_writer'
     ]
 
-    def __init__(self, mem_manager, shard_index, manifest_manager=None, table_id=1, recover_wal_filename=None, validate_checksums=False):
-        self.mem_manager = mem_manager
-        self.index = shard_index  # Unified ShardIndex replaces Spine and Registry
-        self.schema = mem_manager.schema
+    def __init__(self, schema, shard_index, memtable_capacity, wal_writer=None, 
+                 manifest_manager=None, table_id=1, recover_wal_filename=None, 
+                 validate_checksums=False):
+        
+        self.schema = schema
+        self.index = shard_index
+        self.memtable_capacity = memtable_capacity
+        self.wal_writer = wal_writer
         self.manifest_manager = manifest_manager
         self.table_id = table_id
         self.validate_checksums = validate_checksums
         
-        # Initialize LSN from Manifest authority
+        # Initialize the mutable write buffer
+        self.active_table = MemTable(self.schema, self.memtable_capacity)
+
+        # Initialize LSN from Manifest authority (Persistent High-Water Mark)
         if manifest_manager and manifest_manager.exists():
             reader = manifest_manager.load_current()
             self.current_lsn = reader.global_max_lsn + r_uint64(1)
@@ -35,17 +49,41 @@ class Engine(object):
         else:
             self.current_lsn = r_uint64(1)
 
-        # Recover uncommitted state from WAL
+        # The LSN where the current MemTable began (used for Shard Metadata)
+        self.starting_lsn = self.current_lsn
+
+        # Recover uncommitted state from WAL (Volatile High-Water Mark)
         if recover_wal_filename:
             self.recover_from_wal(recover_wal_filename)
         
-        self.mem_manager.current_lsn = self.current_lsn
-        self.mem_manager.starting_lsn = self.current_lsn
+        # After recovery, ensure starting_lsn aligns with the next write
+        # Note: If we recovered data, starting_lsn remains what it was 
+        # (effectively the start of the log), or strictly follows manifest if log was empty.
+        
+    def ingest(self, key, weight, field_values):
+        """
+        Ingests a Z-Set delta into the system.
+        1. Assigns LSN.
+        2. Persists to WAL (Durability).
+        3. Applies to MemTable (Visibility).
+        """
+        lsn = self.current_lsn
+        self.current_lsn += r_uint64(1)
+        
+        # 1. Write-Ahead Log
+        if self.wal_writer:
+            # Create a WAL record (Key, Weight, Payload)
+            rec = WALRecord.from_key(key, weight, field_values)
+            self.wal_writer.append_block(lsn, self.table_id, [rec])
+            
+        # 2. Update In-Memory State
+        self.active_table.upsert(r_uint128(key), weight, field_values)
 
     def recover_from_wal(self, filename):
         """Reconstructs MemTable state by replaying Z-Set deltas from the WAL."""
         try:
             reader = wal.WALReader(filename, self.schema)
+            # We ignore any WAL entries covered by the Manifest (snapshot)
             max_lsn_seen = self.current_lsn - r_uint64(1)
             last_recovered_lsn = max_lsn_seen
             
@@ -54,6 +92,7 @@ class Engine(object):
                 if block is None: 
                     break
                 
+                # Filter by Table ID and LSN > Manifest.MaxLSN
                 if block.tid != self.table_id: 
                     continue
                 if block.lsn <= max_lsn_seen: 
@@ -61,10 +100,10 @@ class Engine(object):
                 
                 last_recovered_lsn = block.lsn
                 for rec in block.records:
-                    self.mem_manager.active_table.upsert(rec.get_key(), rec.weight, rec.component_data)
+                    self.active_table.upsert(rec.get_key(), rec.weight, rec.component_data)
             
+            # Advance the global clock to the next available LSN
             self.current_lsn = last_recovered_lsn + r_uint64(1)
-            self.mem_manager.current_lsn = self.current_lsn
             reader.close()
         except OSError as e:
             if e.errno != errno.ENOENT:
@@ -77,8 +116,8 @@ class Engine(object):
         """
         # 1. Check mutable layer (MemTable)
         mem_weight = 0
-        table = self.mem_manager.active_table
-        # MemTable's _find_exact_values now uses the unified comparator internally
+        table = self.active_table
+        # Check specific payload in MemTable
         match_off = table._find_exact_values(key, field_values)
         if match_off != 0:
             mem_weight = node_get_weight(table.arena.base_ptr, match_off)
@@ -125,14 +164,16 @@ class Engine(object):
     def flush_and_rotate(self, filename):
         """
         Transitions MemTable to an immutable Shard.
-        Updates the index and the Manifest atomically.
+        1. Writes MemTable to N-Partition file.
+        2. Updates Index and Manifest atomically.
+        3. Frees old MemTable memory and allocates a new one.
         """
-        # Capture LSN range before rotation
-        lsn_max = self.mem_manager.current_lsn - r_uint64(1)
-        lsn_min = self.mem_manager.starting_lsn
+        # Capture LSN range for this epoch
+        lsn_max = self.current_lsn - r_uint64(1)
+        lsn_min = self.starting_lsn
         
         # 1. Materialize MemTable to columnar file
-        self.mem_manager.flush_and_rotate(filename)
+        self.active_table.flush(filename, self.table_id)
         
         # 2. Register the new shard with the Unified Index
         if os.path.exists(filename):
@@ -169,14 +210,20 @@ class Engine(object):
             
             self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
             
-        # 4. Prepare next epoch
-        self.current_lsn = self.mem_manager.current_lsn
-        self.mem_manager.starting_lsn = self.current_lsn
+        # 4. Rotate Memory: Free old, allocate new
+        self.active_table.free()
+        self.active_table = MemTable(self.schema, self.memtable_capacity)
+        
+        # 5. Advance Epoch Tracking
+        self.starting_lsn = self.current_lsn
         
         # Return health status to trigger potential background compaction
         return self.index.needs_compaction
 
     def close(self):
         """Graceful shutdown of memory and handles."""
-        self.mem_manager.close()
+        if self.active_table:
+            self.active_table.free()
+            self.active_table = None
+            
         self.index.close_all()
