@@ -175,3 +175,4 @@ debug*
 test_results.txt
 *.lock
 translate_test_db
+*.db
