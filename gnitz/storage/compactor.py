@@ -10,11 +10,15 @@ from gnitz.core import types
 def merge_row_contributions(active_cursors, schema):
     """
     Groups inputs by Semantic Row Payload and sums weights.
-    Implementation of the Z-Set identity: Q(A + B) = Q(A) + Q(B).
+    Uses the unified RowAccessor interface for comparison.
     """
     n = len(active_cursors)
     results = []
     processed = [False] * n
+    
+    # Create reusable accessors to avoid allocation in the loop
+    acc_left = comparator.SoAAccessor(schema)
+    acc_right = comparator.SoAAccessor(schema)
     
     for i in range(n):
         if processed[i]: 
@@ -24,14 +28,19 @@ def merge_row_contributions(active_cursors, schema):
         total_weight = base_cursor.view.get_weight(base_cursor.position)
         processed[i] = True
         
+        # Set the left accessor once for the outer loop iteration
+        acc_left.set_row(base_cursor.view, base_cursor.position)
+        
         for j in range(i + 1, n):
             if processed[j]: 
                 continue
             
             other_cursor = active_cursors[j]
-            # Compare current row in Shard A to current row in Shard B
-            if comparator.compare_soa_rows(schema, base_cursor.view, base_cursor.position, 
-                                           other_cursor.view, other_cursor.position) == 0:
+            # Set the right accessor for the inner loop iteration
+            acc_right.set_row(other_cursor.view, other_cursor.position)
+            
+            # Use the new unified comparison function
+            if comparator.compare_rows(schema, acc_left, acc_right) == 0:
                 total_weight += other_cursor.view.get_weight(other_cursor.position)
                 processed[j] = True
         

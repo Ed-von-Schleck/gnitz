@@ -1,3 +1,5 @@
+# gnitz/storage/engine.py
+
 import os
 import errno
 from rpython.rlib.rarithmetic import r_uint64
@@ -76,6 +78,7 @@ class Engine(object):
         # 1. Check mutable layer (MemTable)
         mem_weight = 0
         table = self.mem_manager.active_table
+        # MemTable's _find_exact_values now uses the unified comparator internally
         match_off = table._find_exact_values(key, field_values)
         if match_off != 0:
             mem_weight = node_get_weight(table.arena.base_ptr, match_off)
@@ -85,14 +88,19 @@ class Engine(object):
         # The index prunes shards by Min/Max PK before doing binary search
         results = self.index.find_all_shards_and_indices(key)
         
+        # Create reusable accessors for the shard scan loop
+        soa_accessor = comparator.SoAAccessor(self.schema)
+        value_accessor = comparator.ValueAccessor(self.schema)
+        value_accessor.set_row(field_values) # Set once for the target values
+
         is_u128 = self.schema.get_pk_column().field_type.size == 16
         
         for shard_handle, start_idx in results:
             curr_idx = start_idx
             view = shard_handle.view
             
-            # Shards may contain multiple payloads per PK (Z-Set multiset semantics).
-            # We must scan consecutive entries matching the PK.
+            # Shards may contain multiple payloads per PK.
+            # Scan consecutive entries matching the PK.
             while curr_idx < view.count:
                 if is_u128:
                     k = view.get_pk_u128(curr_idx)
@@ -102,8 +110,11 @@ class Engine(object):
                 if k != key:
                     break 
                 
-                # Perform full-row semantic equality check
-                if comparator.compare_soa_to_values(self.schema, view, curr_idx, field_values) == 0:
+                # Set the SoA accessor for the current row in the shard
+                soa_accessor.set_row(view, curr_idx)
+                
+                # Use the unified comparator for full-row semantic equality check
+                if comparator.compare_rows(self.schema, soa_accessor, value_accessor) == 0:
                     spine_weight += shard_handle.view.get_weight(curr_idx)
                     break # PK+Payload is unique within a single Shard
                 

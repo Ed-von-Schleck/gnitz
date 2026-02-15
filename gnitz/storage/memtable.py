@@ -1,19 +1,23 @@
+# gnitz/storage/memtable.py
+
 from rpython.rlib.rrandom import Random
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.storage import buffer, writer_table, errors
+from gnitz.storage import buffer, writer_table, errors, comparator
 from gnitz.storage.memtable_node import (
     node_get_next_off, node_set_next_off, node_get_weight, node_set_weight,
     node_get_key, node_get_payload_ptr, get_key_offset
 )
-from gnitz.storage.comparator import compare_values_to_packed
 from gnitz.core import types, strings as string_logic
 
 MAX_HEIGHT = 16
 
 class MemTable(object):
-    _immutable_fields_ = ['arena', 'blob_arena', 'schema', 'head_off', 'key_size']
+    _immutable_fields_ = [
+        'arena', 'blob_arena', 'schema', 'head_off', 'key_size',
+        'node_accessor', 'value_accessor'
+    ]
 
     def __init__(self, schema, arena_size):
         self.schema = schema
@@ -23,6 +27,10 @@ class MemTable(object):
         self._update_offsets = [0] * MAX_HEIGHT
         self.key_size = schema.get_pk_column().field_type.size
         
+        # Initialize reusable accessors for comparison
+        self.node_accessor = comparator.PackedNodeAccessor(schema, self.blob_arena.base_ptr)
+        self.value_accessor = comparator.ValueAccessor(schema)
+
         # Reserved NULL sentinel at offset 0
         self.arena.alloc(8, alignment=8) 
         
@@ -73,31 +81,43 @@ class MemTable(object):
     def _find_exact_values(self, key, field_values):
         """
         Locates the specific node matching both the Primary Key AND the payload.
-        Used for point algebraic updates.
+        Uses the new unified comparator and reusable RowAccessors.
         """
         base = self.arena.base_ptr
-        blob_base = self.blob_arena.base_ptr
         curr_off = self.head_off
+
+        # Set the value accessor once per search operation
+        self.value_accessor.set_row(field_values)
+
         for i in range(MAX_HEIGHT - 1, -1, -1):
             next_off = node_get_next_off(base, curr_off, i)
             while next_off != 0:
                 next_key = node_get_key(base, next_off, self.key_size)
+                
+                # Primary Key check
                 if next_key < key:
                     curr_off = next_off
+                # PK matches, now compare payload lexicographically
                 elif next_key == key:
-                    next_payload = node_get_payload_ptr(base, next_off, self.key_size)
-                    if compare_values_to_packed(self.schema, field_values, next_payload, blob_base) > 0:
+                    self.node_accessor.set_row(base, next_off)
+                    # Advance if the current node's payload is smaller than the target
+                    if comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) < 0:
                         curr_off = next_off
-                    else: break
-                else: break
+                    else:
+                        break # Found position or overshot
+                # Overshot PK
+                else:
+                    break
+                
                 next_off = node_get_next_off(base, curr_off, i)
             self._update_offsets[i] = curr_off
         
         match_off = node_get_next_off(base, curr_off, 0)
         if match_off != 0:
             if node_get_key(base, match_off, self.key_size) == key:
-                payload = node_get_payload_ptr(base, match_off, self.key_size)
-                if compare_values_to_packed(self.schema, field_values, payload, blob_base) == 0:
+                self.node_accessor.set_row(base, match_off)
+                # Final check for exact payload match
+                if comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) == 0:
                     return match_off
         return 0
 
