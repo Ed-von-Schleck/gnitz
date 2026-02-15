@@ -1,34 +1,20 @@
+# gnitz/storage/compactor.py
+
 import os
 from rpython.rlib import jit
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask
-from gnitz.storage import shard_table, writer_table, tournament_tree, comparator
-from gnitz.storage.shard_table import TableShardView
-from gnitz.storage import manifest
-from gnitz.storage.spine import ShardHandle
-from gnitz.storage.shard_registry import ShardMetadata
-
-class CompactionPolicy(object):
-    def __init__(self, registry):
-        self.registry = registry
-
-    def should_compact(self, table_id):
-        return self.registry.mark_for_compaction(table_id)
-
+from gnitz.storage import shard_table, writer_table, tournament_tree, comparator, manifest, index
+from gnitz.core import types
 
 def merge_row_contributions(active_cursors, schema):
     """
     Groups inputs by Semantic Row Payload and sums weights.
-    
-    In DBSP, compaction is a pure Z-Set merge: 
-    Q(A + B) = Q(A) + Q(B).
+    Implementation of the Z-Set identity: Q(A + B) = Q(A) + Q(B).
     """
     n = len(active_cursors)
     results = []
-    
-    processed = []
-    for _ in range(n):
-        processed.append(False)
+    processed = [False] * n
     
     for i in range(n):
         if processed[i]: 
@@ -43,23 +29,21 @@ def merge_row_contributions(active_cursors, schema):
                 continue
             
             other_cursor = active_cursors[j]
-            
+            # Compare current row in Shard A to current row in Shard B
             if comparator.compare_soa_rows(schema, base_cursor.view, base_cursor.position, 
                                            other_cursor.view, other_cursor.position) == 0:
                 total_weight += other_cursor.view.get_weight(other_cursor.position)
                 processed[j] = True
         
+        # Only preserve records with a non-zero net weight (Ghost Property)
         if total_weight != 0:
             results.append((total_weight, i)) 
             
     return results
 
-
 def compact_shards(input_files, output_file, schema, table_id=0, validate_checksums=False):
     """
     Executes an N-way merge compaction of overlapping shards.
-    Utilizes a tournament tree for Primary Key alignment and 
-    Semantic Row Payload grouping for Z-Set algebraic summation.
     """
     num_inputs = len(input_files)
     views = []
@@ -69,6 +53,7 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
     writer = None
     
     try:
+        # 1. Initialize cursors for all overlapping shards
         i = 0
         while i < num_inputs:
             filename = input_files[i]
@@ -77,16 +62,19 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
             cursors.append(tournament_tree.StreamCursor(view))
             i += 1
         
+        # 2. Setup N-way merge via Tournament Tree
         tree = tournament_tree.TournamentTree(cursors)
         writer = writer_table.TableShardWriter(schema, table_id)
         
         stride = schema.memtable_stride
         tmp_row = lltype.malloc(rffi.CCHARP.TO, stride, flavor='raw')
         
+        # 3. Process records in PK order
         while not tree.is_exhausted():
             min_key = tree.get_min_key()
             active_cursors = tree.get_all_cursors_at_min()
             
+            # Coalesce weights for all payloads matching this PK
             merged = merge_row_contributions(active_cursors, schema)
             
             m_idx = 0
@@ -96,21 +84,19 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
                 exemplar_cursor = active_cursors[exemplar_idx]
                 row_idx = exemplar_cursor.position
                 
-                for k in range(stride):
-                    tmp_row[k] = '\x00'
+                # Materialize columnar row into temporary AoS buffer for writing
+                for k in range(stride): tmp_row[k] = '\x00'
                 
                 num_cols = len(schema.columns)
                 for col_idx in range(num_cols):
-                    if col_idx == schema.pk_index: 
-                        continue
+                    if col_idx == schema.pk_index: continue
                     
                     col_ptr = exemplar_cursor.view.get_col_ptr(row_idx, col_idx)
                     dest_off = schema.get_column_offset(col_idx)
                     dest_ptr = rffi.ptradd(tmp_row, dest_off)
                     
                     sz = schema.columns[col_idx].field_type.size
-                    for b in range(sz):
-                        dest_ptr[b] = col_ptr[b]
+                    for b in range(sz): dest_ptr[b] = col_ptr[b]
                 
                 writer.add_row(min_key, weight, tmp_row, exemplar_cursor.view.blob_buf.ptr)
                 m_idx += 1
@@ -120,91 +106,61 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
         writer.finalize(output_file)
         lltype.free(tmp_row, flavor='raw')
     finally:
-        if tree: 
-            tree.close()
-        
+        if tree: tree.close()
         for v in views:
             if v: v.close()
 
-
-def execute_compaction(table_id, policy, manifest_mgr, ref_counter, schema, output_dir=".", spine_obj=None, validate_checksums=False):
+def execute_compaction(shard_index, manifest_mgr, output_dir=".", validate_checksums=False):
     """
-    High-level orchestrator for table-scoped compaction.
+    High-level orchestrator for table-scoped compaction using the unified ShardIndex.
     """
-    shards = policy.registry.get_shards_for_table(table_id)
-    if not shards: 
-        return None
+    handles = shard_index.handles
+    if not handles: return None
     
+    table_id = shard_index.table_id
+    schema = shard_index.schema
     input_files = []
     
-    true_min_lsn = shards[0].min_lsn
-    true_max_lsn = shards[0].max_lsn
+    # Track the aggregate LSN range for the new Guard Shard
+    true_min_lsn = handles[0].min_lsn
+    true_max_lsn = handles[0].lsn
     
-    for s in shards:
-        input_files.append(s.filename)
-        if s.min_lsn < true_min_lsn: true_min_lsn = s.min_lsn
-        if s.max_lsn > true_max_lsn: true_max_lsn = s.max_lsn
+    for h in handles:
+        input_files.append(h.filename)
+        if h.min_lsn < true_min_lsn: true_min_lsn = h.min_lsn
+        if h.lsn > true_max_lsn: true_max_lsn = h.lsn
     
     lsn_tag = intmask(true_max_lsn)
     out_filename = os.path.join(output_dir, "compacted_%d_%d.db" % (table_id, lsn_tag))
     
-    for fn in input_files:
-        ref_counter.acquire(fn)
-        
     try:
+        # 1. Perform physical merge
         compact_shards(input_files, out_filename, schema, table_id, validate_checksums=validate_checksums)
         
-        reader = manifest_mgr.load_current()
-        new_entries = []
-        for entry in reader.iterate_entries():
-            keep = True
-            for in_fn in input_files:
-                if entry.shard_filename == in_fn:
-                    keep = False
-                    break
-            if keep: 
-                new_entries.append(entry)
-        reader.close()
+        # 2. Create new handle for the resulting Guard Shard
+        new_handle = index.ShardHandle(out_filename, schema, true_min_lsn, true_max_lsn, validate_checksums=validate_checksums)
         
-        v = TableShardView(out_filename, schema, validate_checksums=validate_checksums)
-        try:
-            is_u128 = schema.get_pk_column().field_type.size == 16
-            if v.count > 0:
-                min_k = v.get_pk_u128(0) if is_u128 else r_uint128(v.get_pk_u64(0))
-                max_k = v.get_pk_u128(v.count-1) if is_u128 else r_uint128(v.get_pk_u64(v.count-1))
-            else:
-                min_k = shards[0].get_min_key()
-                max_k = shards[len(shards)-1].get_max_key()
-
-            new_entry = manifest.ManifestEntry(
-                table_id, out_filename, min_k, max_k, 
-                true_min_lsn, true_max_lsn
-            )
-            new_entries.append(new_entry)
-            manifest_mgr.publish_new_version(new_entries, true_max_lsn)
-            
-            if spine_obj:
-                new_handle = ShardHandle(out_filename, schema, true_max_lsn, validate_checksums=validate_checksums)
-                spine_obj.replace_handles(input_files, new_handle)
-            
-            for f_path in input_files:
-                policy.registry.unregister_shard(f_path)
-                ref_counter.mark_for_deletion(f_path)
-            
-            policy.registry.register_shard(
-                ShardMetadata(out_filename, table_id, min_k, max_k, true_min_lsn, true_max_lsn)
-            )
-            policy.registry.clear_compaction_flag(table_id)
-        finally: 
-            v.close()
+        # 3. Update the Index (Atomically replaces handles, closes mmaps, releases locks)
+        shard_index.replace_handles(input_files, new_handle)
+        
+        # 4. Update the Manifest Authority
+        meta_list = shard_index.get_metadata_list()
+        manifest_entries = []
+        for meta in meta_list:
+            manifest_entries.append(manifest.ManifestEntry(
+                meta.table_id, meta.filename, meta.get_min_key(), meta.get_max_key(),
+                meta.min_lsn, meta.max_lsn
+            ))
+        manifest_mgr.publish_new_version(manifest_entries, true_max_lsn)
+        
+        # 5. Cleanup physical files
+        for f_path in input_files:
+            shard_index.ref_counter.mark_for_deletion(f_path)
+        shard_index.ref_counter.try_cleanup()
             
     except Exception as e:
         if os.path.exists(out_filename):
             os.unlink(out_filename)
         raise e
-    finally:
-        for fn in input_files:
-            ref_counter.release(fn)
-        ref_counter.try_cleanup()
     
     return out_filename

@@ -1,27 +1,31 @@
-# gnitz/storage/engine.py
-
 import os
 import errno
-from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.storage.memtable_node import node_get_weight
-from gnitz.storage import wal, manifest, errors, spine, mmap_posix, comparator
+from gnitz.storage import wal, manifest, index, mmap_posix, comparator
 from gnitz.core import types
 
 class Engine(object):
-    _immutable_fields_ = ['mem_manager', 'spine', 'schema', 'manifest_manager', 'registry', 'table_id']
+    """
+    The DBSP Execution Engine.
+    Coordinates the Write-Head (MemTable) and the Persistent Tail (ShardIndex).
+    """
+    _immutable_fields_ = [
+        'mem_manager', 'index', 'schema', 
+        'manifest_manager', 'table_id'
+    ]
 
-    def __init__(self, mem_manager, spine_obj, manifest_manager=None, registry=None, table_id=1, recover_wal_filename=None, validate_checksums=False):
+    def __init__(self, mem_manager, shard_index, manifest_manager=None, table_id=1, recover_wal_filename=None, validate_checksums=False):
         self.mem_manager = mem_manager
-        self.spine = spine_obj
+        self.index = shard_index  # Unified ShardIndex replaces Spine and Registry
         self.schema = mem_manager.schema
         self.manifest_manager = manifest_manager
-        self.registry = registry
         self.table_id = table_id
         self.validate_checksums = validate_checksums
         
+        # Initialize LSN from Manifest authority
         if manifest_manager and manifest_manager.exists():
             reader = manifest_manager.load_current()
             self.current_lsn = reader.global_max_lsn + r_uint64(1)
@@ -29,6 +33,7 @@ class Engine(object):
         else:
             self.current_lsn = r_uint64(1)
 
+        # Recover uncommitted state from WAL
         if recover_wal_filename:
             self.recover_from_wal(recover_wal_filename)
         
@@ -36,6 +41,7 @@ class Engine(object):
         self.mem_manager.starting_lsn = self.current_lsn
 
     def recover_from_wal(self, filename):
+        """Reconstructs MemTable state by replaying Z-Set deltas from the WAL."""
         try:
             reader = wal.WALReader(filename, self.schema)
             max_lsn_seen = self.current_lsn - r_uint64(1)
@@ -61,20 +67,23 @@ class Engine(object):
         except OSError as e:
             if e.errno != errno.ENOENT:
                 raise e
-        except Exception as e:
-            import os
-            os.write(2, "FATAL ERROR during WAL recovery: " + str(e) + "\n")
-            raise e
 
     def get_effective_weight_raw(self, key, field_values):
+        """
+        Calculates the net algebraic weight of a record across all layers.
+        Identity: W_net = W_mem + sum(W_shards)
+        """
+        # 1. Check mutable layer (MemTable)
         mem_weight = 0
         table = self.mem_manager.active_table
         match_off = table._find_exact_values(key, field_values)
         if match_off != 0:
             mem_weight = node_get_weight(table.arena.base_ptr, match_off)
 
+        # 2. Check persistent layer (ShardIndex)
         spine_weight = 0
-        results = self.spine.find_all_shards_and_indices(key)
+        # The index prunes shards by Min/Max PK before doing binary search
+        results = self.index.find_all_shards_and_indices(key)
         
         is_u128 = self.schema.get_pk_column().field_type.size == 16
         
@@ -82,6 +91,8 @@ class Engine(object):
             curr_idx = start_idx
             view = shard_handle.view
             
+            # Shards may contain multiple payloads per PK (Z-Set multiset semantics).
+            # We must scan consecutive entries matching the PK.
             while curr_idx < view.count:
                 if is_u128:
                     k = view.get_pk_u128(curr_idx)
@@ -91,9 +102,10 @@ class Engine(object):
                 if k != key:
                     break 
                 
+                # Perform full-row semantic equality check
                 if comparator.compare_soa_to_values(self.schema, view, curr_idx, field_values) == 0:
-                    spine_weight += shard_handle.get_weight(curr_idx)
-                    break 
+                    spine_weight += shard_handle.view.get_weight(curr_idx)
+                    break # PK+Payload is unique within a single Shard
                 
                 curr_idx += 1
                 
@@ -101,53 +113,59 @@ class Engine(object):
 
     def flush_and_rotate(self, filename):
         """
-        Flushes MemTable to disk and rotates state.
-        FIXED: Returns only 'needs_comp' to avoid unaligned 128-bit tuple field segfaults.
+        Transitions MemTable to an immutable Shard.
+        Updates the index and the Manifest atomically.
         """
-        self.current_lsn = self.mem_manager.current_lsn
+        # Capture LSN range before rotation
+        lsn_max = self.mem_manager.current_lsn - r_uint64(1)
         lsn_min = self.mem_manager.starting_lsn
-        lsn_max = self.current_lsn - r_uint64(1)
         
+        # 1. Materialize MemTable to columnar file
         self.mem_manager.flush_and_rotate(filename)
         
-        entries = []
-        if self.manifest_manager and self.manifest_manager.exists():
-            reader = self.manifest_manager.load_current()
-            it = reader.iterate_entries()
-            while True:
-                try:
-                    e = it.next()
-                    entries.append(e)
-                except StopIteration:
-                    break
-            reader.close()
-        
-        from gnitz.storage.spine import ShardHandle
-        needs_comp = False
-        
+        # 2. Register the new shard with the Unified Index
         if os.path.exists(filename):
-            handle = ShardHandle(filename, self.schema, lsn_max, validate_checksums=self.validate_checksums)
-            if handle.view.count > 0:
-                min_k = handle.get_min_key()
-                max_k = handle.get_max_key()
-                new_entry = manifest.ManifestEntry(self.table_id, filename, min_k, max_k, lsn_min, lsn_max)
-                entries.append(new_entry)
-                self.spine.add_handle(handle)
-                
-                if self.registry:
-                    from gnitz.storage.shard_registry import ShardMetadata
-                    self.registry.register_shard(ShardMetadata(filename, self.table_id, min_k, max_k, lsn_min, lsn_max))
-                    needs_comp = self.registry.mark_for_compaction(self.table_id)
+            new_handle = index.ShardHandle(
+                filename, 
+                self.schema, 
+                lsn_min,   # Capture start of MemTable epoch
+                lsn_max,   # Capture end of MemTable epoch
+                validate_checksums=self.validate_checksums
+            )
+            # Only index if shard contains data
+            if new_handle.view.count > 0:
+                self.index.add_handle(new_handle)
             else:
-                handle.close()
+                new_handle.close()
                 os.unlink(filename)
             
+        # 3. Synchronize Manifest with the updated Index state
         if self.manifest_manager:
-            self.manifest_manager.publish_new_version(entries, lsn_max)
+            # We generate the new manifest entries directly from the index handles
+            metadata_entries = self.index.get_metadata_list()
             
+            # Map index-metadata back to ManifestEntry objects for serialization
+            manifest_entries = []
+            for meta in metadata_entries:
+                manifest_entries.append(manifest.ManifestEntry(
+                    meta.table_id,
+                    meta.filename,
+                    meta.get_min_key(),
+                    meta.get_max_key(),
+                    meta.min_lsn,
+                    meta.max_lsn
+                ))
+            
+            self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
+            
+        # 4. Prepare next epoch
+        self.current_lsn = self.mem_manager.current_lsn
         self.mem_manager.starting_lsn = self.current_lsn
-        return needs_comp
+        
+        # Return health status to trigger potential background compaction
+        return self.index.needs_compaction
 
     def close(self):
+        """Graceful shutdown of memory and handles."""
         self.mem_manager.close()
-        self.spine.close_all()
+        self.index.close_all()
