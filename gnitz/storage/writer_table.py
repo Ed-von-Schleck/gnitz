@@ -12,11 +12,28 @@ from gnitz.core import types, strings as string_logic, values as db_values
 
 NULL_CHARP = lltype.nullptr(rffi.CCHARP.TO)
 
+class ShardWriterBlobAllocator(string_logic.BlobAllocator):
+    """
+    Allocator strategy for TableShardWriter string tails.
+    Wraps the shard's deduplication and blob heap logic.
+    """
+    def __init__(self, writer):
+        self.writer = writer
+
+    def allocate(self, string_data):
+        length = len(string_data)
+        # Use scoped_str2charp to safely pass Python string to C-level deduplication
+        with rffi.scoped_str2charp(string_data) as blob_src:
+            off = self.writer._get_or_append_blob(blob_src, length)
+            return r_uint64(off)
+
 class TableShardWriter(object):
     """
     Handles the creation of N-Partition columnar shards.
-    Refactored to accept TaggedValue lists for ingestion.
+    Refactored to use centralized German String serialization.
     """
+    _immutable_fields_ = ['schema', 'table_id', 'blob_allocator']
+
     def __init__(self, schema, table_id=0):
         self.schema = schema
         self.table_id = table_id
@@ -38,8 +55,12 @@ class TableShardWriter(object):
         self.blob_cache = {}
         # Pre-allocate scratch buffer to avoid mallocs in loop
         self.scratch_val_buf = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
+        self.blob_allocator = ShardWriterBlobAllocator(self)
 
     def _get_or_append_blob(self, src_ptr, length):
+        """
+        Deduplicates and appends long string data to the shard-wide blob heap.
+        """
         if length <= 0 or not src_ptr:
             return 0
         h = checksum.compute_checksum(src_ptr, length)
@@ -48,7 +69,7 @@ class TableShardWriter(object):
             existing_offset = self.blob_cache[cache_key]
             existing_ptr = rffi.ptradd(self.b_buf.ptr, existing_offset)
             
-            # Binary comparison to ensure deduplication safety
+            # Binary comparison to ensure deduplication safety (collisions)
             match = True
             for i in range(length):
                 if src_ptr[i] != existing_ptr[i]:
@@ -72,41 +93,35 @@ class TableShardWriter(object):
             return
 
         if col_def.field_type == types.TYPE_STRING:
-            length = 0
             if val_ptr:
+                # PATH: Relocation (Raw Pointer)
                 length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, val_ptr)[0])
-            elif string_data is not None:
-                length = len(string_data)
-
-            if length > string_logic.SHORT_STRING_THRESHOLD:
-                # Relocate long string to shard blob heap
-                if val_ptr:
+                if length > string_logic.SHORT_STRING_THRESHOLD:
                     u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(val_ptr, 8))
                     old_off = rffi.cast(lltype.Signed, u64_view[0])
                     if not source_heap_ptr:
                         raise errors.StorageError("Long string relocation requires source heap")
+                    
                     blob_src = rffi.ptradd(source_heap_ptr, old_off)
                     new_off = self._get_or_append_blob(blob_src, length)
 
-                    # Copy to scratch and swizzle offset
+                    # Copy the 16-byte struct and swizzle the offset
                     for b in range(16): self.scratch_val_buf[b] = val_ptr[b]
                     u64_payload = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.scratch_val_buf, 8))
-                    u64_payload[0] = rffi.cast(rffi.ULONGLONG, new_off)
-                else:
-                    # String data provided directly as Python string
-                    assert string_data is not None
-                    with rffi.scoped_str2charp(string_data) as blob_src:
-                        new_off = self._get_or_append_blob(blob_src, length)
-                    string_logic.pack_string(self.scratch_val_buf, string_data, new_off)
-                
-                buf.put_bytes(self.scratch_val_buf, 16)
-            else:
-                if val_ptr:
-                    buf.put_bytes(val_ptr, 16)
-                else:
-                    assert string_data is not None
-                    string_logic.pack_string(self.scratch_val_buf, string_data, 0)
+                    u64_payload[0] = r_uint64(new_off)
                     buf.put_bytes(self.scratch_val_buf, 16)
+                else:
+                    # Inline string: copy as-is
+                    buf.put_bytes(val_ptr, 16)
+            else:
+                # PATH: Ingestion (Python String)
+                assert string_data is not None
+                string_logic.pack_and_write_blob(
+                    self.scratch_val_buf, 
+                    string_data, 
+                    self.blob_allocator
+                )
+                buf.put_bytes(self.scratch_val_buf, 16)
         else:
             buf.put_bytes(val_ptr, col_def.field_type.size)
 
@@ -143,8 +158,6 @@ class TableShardWriter(object):
             return
         self.count += 1
 
-        # Handle Primary Key (u64 or u128)
-        # Note: 'pk' is expected to be int or r_uint128
         if self.schema.get_pk_column().field_type.size == 16:
             self.pk_buf.put_u128(r_uint128(pk))
         else:
@@ -160,7 +173,6 @@ class TableShardWriter(object):
                 continue
 
             if val_idx >= len(values_list):
-                # Fallback for missing columns
                 self._append_value(i, NULL_CHARP, NULL_CHARP)
                 i += 1
                 continue
@@ -181,7 +193,6 @@ class TableShardWriter(object):
                 self._append_value(i, self.scratch_val_buf, NULL_CHARP)
                 
             elif ftype == types.TYPE_U128:
-                # Store u128 using the lo bits from i64
                 assert val_obj.tag == db_values.TAG_INT
                 u64_ptr = rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)
                 u64_ptr[0] = rffi.cast(rffi.ULONGLONG, val_obj.i64)
@@ -189,7 +200,6 @@ class TableShardWriter(object):
                 self._append_value(i, self.scratch_val_buf, NULL_CHARP)
                 
             else:
-                # Standard Integers
                 assert val_obj.tag == db_values.TAG_INT
                 rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)[0] = rffi.cast(
                     rffi.ULONGLONG, val_obj.i64

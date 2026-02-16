@@ -13,6 +13,27 @@ from gnitz.core import types, values, strings as string_logic
 
 MAX_HEIGHT = 16
 
+class MemTableBlobAllocator(string_logic.BlobAllocator):
+    """
+    Allocator strategy for MemTable string tails.
+    Persists long strings into the MemTable's Blob Arena.
+    """
+    def __init__(self, arena):
+        self.arena = arena
+
+    def allocate(self, string_data):
+        length = len(string_data)
+        # Strings in the blob arena use 8-byte alignment for 64-bit access
+        b_ptr = self.arena.alloc(length, alignment=8)
+        
+        # Copy string data to the arena
+        for j in range(length):
+            b_ptr[j] = string_data[j]
+            
+        # Return the offset relative to the start of the blob arena as r_uint64
+        off = rffi.cast(lltype.Signed, b_ptr) - rffi.cast(lltype.Signed, self.arena.base_ptr)
+        return r_uint64(off)
+
 class MemTable(object):
     _immutable_fields_ = [
         'arena', 'blob_arena', 'schema', 'head_off', 'key_size',
@@ -198,6 +219,7 @@ class MemTable(object):
         Args:
             field_values: List[values.TaggedValue]
         """
+        allocator = MemTableBlobAllocator(self.blob_arena)
         v_idx = 0
         for i in range(len(self.schema.columns)):
             if i == self.schema.pk_index: continue
@@ -211,14 +233,7 @@ class MemTable(object):
             
             if f_type == types.TYPE_STRING:
                 assert val_obj.tag == values.TAG_STRING
-                s_val = val_obj.str_val
-                h_off = 0
-                if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
-                    # Strings use 8-byte alignment for blob payloads
-                    b_ptr = self.blob_arena.alloc(len(s_val), alignment=8)
-                    h_off = rffi.cast(lltype.Signed, b_ptr) - rffi.cast(lltype.Signed, self.blob_arena.base_ptr)
-                    for j in range(len(s_val)): b_ptr[j] = s_val[j]
-                string_logic.pack_string(target, s_val, h_off)
+                string_logic.pack_and_write_blob(target, val_obj.str_val, allocator)
                 
             elif f_type == types.TYPE_F64:
                 assert val_obj.tag == values.TAG_FLOAT
@@ -226,8 +241,6 @@ class MemTable(object):
                 
             elif f_type == types.TYPE_U128:
                 # U128 non-PK columns are stored as TaggedValue.i64 (lo) 
-                # Note: If high precision is needed for non-PK U128, TaggedValue 
-                # would need a second i64 field. Current spec prioritizes PK for U128.
                 assert val_obj.tag == values.TAG_INT
                 u128_val = r_uint128(val_obj.i64)
                 rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(u128_val))

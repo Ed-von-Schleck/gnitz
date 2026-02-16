@@ -2,12 +2,25 @@
 
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_uint, r_uint32
+from rpython.rlib.rarithmetic import r_uint, r_uint32, r_uint64
 
 # German String Constants:
 # 16-byte total: 4 (len) | 4 (prefix) | 8 (suffix OR heap offset)
 SHORT_STRING_THRESHOLD = 12
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
+
+class BlobAllocator(object):
+    """
+    Abstract strategy for allocating long string blobs.
+    Used during serialization to decouple the German String structure
+    from specific storage backends (MemTable, WAL, Shards).
+    """
+    def allocate(self, string_data):
+        """
+        Allocates space for the string data in the backing store,
+        copies the data, and returns the 64-bit offset to be stored in the struct.
+        """
+        raise NotImplementedError
 
 def compute_prefix(s):
     """Computes a 4-byte prefix from a string for O(1) equality failure."""
@@ -20,7 +33,10 @@ def compute_prefix(s):
     return rffi.cast(rffi.UINT, prefix)
 
 def pack_string(target_ptr, string_data, heap_offset_if_long):
-    """Packs a string into the 16-byte German String structure."""
+    """
+    Low-level primitive to pack a string into the 16-byte German String structure.
+    If length > SHORT_STRING_THRESHOLD, the provided heap_offset_if_long is stored.
+    """
     length = len(string_data)
     u32_ptr = rffi.cast(rffi.UINTP, target_ptr)
     
@@ -44,6 +60,23 @@ def pack_string(target_ptr, string_data, heap_offset_if_long):
         u64_payload_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target_ptr, 8))
         u64_payload_ptr[0] = rffi.cast(rffi.ULONGLONG, heap_offset_if_long)
 
+def pack_and_write_blob(target_ptr, string_data, allocator):
+    """
+    Centralized logic for serializing a German String.
+    - If Short: Packs inline payload.
+    - If Long: Delegates to the provided allocator to persist the blob, 
+      then packs the resulting heap offset into the struct.
+    """
+    length = len(string_data)
+    
+    if length <= SHORT_STRING_THRESHOLD:
+        # Short String: Offset is unused (0), content is inlined.
+        pack_string(target_ptr, string_data, 0)
+    else:
+        # Long String: Use the provided allocator strategy to store the tail.
+        heap_offset = allocator.allocate(string_data)
+        pack_string(target_ptr, string_data, heap_offset)
+
 @jit.unroll_safe
 def compare_structures(len1, pref1, ptr1, heap1, str1,
                        len2, pref2, ptr2, heap2, str2):
@@ -51,24 +84,14 @@ def compare_structures(len1, pref1, ptr1, heap1, str1,
     Unified comparison kernel for German Strings.
     Handles (Struct vs Struct), (Struct vs String), (String vs String).
     Returns -1 if LHS < RHS, 1 if LHS > RHS, 0 if Equal.
-    
-    ptr1/ptr2: rffi.CCHARP to 16-byte struct (or nullptr if string)
-    heap1/heap2: rffi.CCHARP to blob heap (or nullptr if string)
-    str1/str2: python string (or None if struct)
     """
-    # 1. Prefix Check for Optimization (Equality only)
-    # If prefixes differ, we MUST iterate to find the lexicographical order
-    # because integer comparison of Little Endian packed prefixes 
-    # does not match lexicographical byte order.
-    
     prefixes_equal = (pref1 == pref2)
     
     min_len = len1 if len1 < len2 else len2
     limit_prefix = 4 if min_len > 4 else min_len
 
-    # 2. Iterate Prefix (0..3) if needed
+    # 1. Prefix Check for Optimization (Equality only)
     if not prefixes_equal:
-        # Determine source types for unrolling
         s1_is_str = (str1 is not None)
         s2_is_str = (str2 is not None)
         
@@ -77,17 +100,14 @@ def compare_structures(len1, pref1, ptr1, heap1, str1,
             c2 = ord(str2[i]) if s2_is_str else ord(ptr2[4 + i])
             if c1 != c2:
                 return -1 if c1 < c2 else 1
-        
-        # Note: If loop finishes without return, prefixes match up to min_len.
-        # This implies min_len < 4.
 
-    # 3. Short String Termination
+    # 2. Short String Termination
     if min_len <= 4:
         if len1 < len2: return -1
         if len1 > len2: return 1
         return 0
 
-    # 4. Suffix / Heap Comparison (Bytes 4..min_len)
+    # 3. Suffix / Heap Comparison (Bytes 4..min_len)
     
     # Resolve Cursor 1
     cursor1 = NULL_PTR
@@ -96,12 +116,9 @@ def compare_structures(len1, pref1, ptr1, heap1, str1,
     
     if not s1_is_str:
         if len1 <= SHORT_STRING_THRESHOLD:
-            # Inline suffix starts at struct offset 8
-            # Logical index 4 maps to physical offset 0 relative to (ptr+8)
             cursor1 = rffi.ptradd(ptr1, 8)
             offset1 = -4 
         else:
-            # Heap
             u64_1 = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr1, 8))[0]
             cursor1 = rffi.ptradd(heap1, rffi.cast(lltype.Signed, u64_1))
             offset1 = 0
@@ -127,7 +144,7 @@ def compare_structures(len1, pref1, ptr1, heap1, str1,
         if c1 != c2:
             return -1 if c1 < c2 else 1
 
-    # 5. Length Tie-breaker
+    # 4. Length Tie-breaker
     if len1 < len2: return -1
     if len1 > len2: return 1
     return 0
@@ -168,16 +185,12 @@ def compare_db_value_to_german(val_obj, german_ptr, heap_ptr):
     """
     s_val = val_obj.get_string()
     len_v = len(s_val)
-    # Calculate prefix for the python string for optimization
     pref_v = rffi.cast(lltype.Signed, compute_prefix(s_val))
     
     u32_ptr = rffi.cast(rffi.UINTP, german_ptr)
     len_g = rffi.cast(lltype.Signed, u32_ptr[0])
     pref_g = rffi.cast(lltype.Signed, u32_ptr[1])
     
-    # compare_structures returns -1 if LHS < RHS.
-    # We want -1 if German < Value.
-    # LHS = German, RHS = Value.
     return compare_structures(
         len_g, pref_g, german_ptr, heap_ptr, None,
         len_v, pref_v, NULL_PTR, NULL_PTR, s_val

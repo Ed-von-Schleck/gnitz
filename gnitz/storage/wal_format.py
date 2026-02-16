@@ -11,10 +11,33 @@ WAL_BLOCK_HEADER_SIZE = 32
 def align_8(val):
     return (val + 7) & ~7
 
+class WALBlobAllocator(string_logic.BlobAllocator):
+    """
+    Allocator strategy for WAL block serialization.
+    Writes long string payloads into the trailing overflow area of the WAL block.
+    """
+    def __init__(self, buf, cursor_ref):
+        self.buf = buf
+        # cursor_ref is a List[int] containing the current byte offset in the buffer
+        self.cursor_ref = cursor_ref
+
+    def allocate(self, string_data):
+        length = len(string_data)
+        start_pos = self.cursor_ref[0]
+        
+        # Copy string data into the overflow area of the buffer
+        for i in range(length):
+            self.buf[start_pos + i] = string_data[i]
+            
+        # Advance the shared cursor
+        self.cursor_ref[0] += length
+        
+        # Return the absolute offset (Header + Body Offset)
+        return r_uint64(WAL_BLOCK_HEADER_SIZE + start_pos)
+
 class WALRecord(object):
     """
     In-memory representation of a WAL log entry.
-    Refactored to store TaggedValue payload.
     """
     _immutable_fields_ = ["pk_lo", "pk_hi", "weight", "component_data[*]"]
     
@@ -22,7 +45,7 @@ class WALRecord(object):
         self.pk_lo = r_uint64(pk_lo)
         self.pk_hi = r_uint64(pk_hi)
         self.weight = weight
-        # component_data is now List[db_values.TaggedValue]
+        # component_data is List[db_values.TaggedValue]
         self.component_data = component_data
 
     @staticmethod
@@ -43,14 +66,14 @@ class DecodedBlock(object):
 def write_wal_block(fd, lsn, table_id, records, schema):
     """
     Serializes a batch of Z-Set deltas into the WAL binary format.
-    Accesses TaggedValue fields directly for JIT optimization.
+    Uses centralized German String serialization with WALBlobAllocator.
     """
     is_u128 = schema.get_pk_column().field_type == types.TYPE_U128
     key_size = 16 if is_u128 else 8
     stride = schema.memtable_stride
     num_cols = len(schema.columns)
 
-    # 1. Calculate required body size
+    # 1. Calculate required body size (AoS + Long String Overflows)
     total_body_size = 0
     rec_idx = 0
     num_records = len(records)
@@ -64,7 +87,6 @@ def write_wal_block(fd, lsn, table_id, records, schema):
             if i != schema.pk_index:
                 val_obj = rec.component_data[arg_idx]
                 arg_idx += 1
-                # If TaggedValue is a long string, account for the overflow data
                 if schema.columns[i].field_type == types.TYPE_STRING:
                     assert val_obj.tag == db_values.TAG_STRING
                     s_len = len(val_obj.str_val)
@@ -80,26 +102,37 @@ def write_wal_block(fd, lsn, table_id, records, schema):
         for k in range(total_body_size): buf[k] = "\x00"
         
         curr_off = 0
+        # Reference used by the WALBlobAllocator to advance the overflow cursor
+        cursor_ref = [0]
+        
         rec_idx = 0
         while rec_idx < num_records:
             rec = records[rec_idx]
             
+            # Use local cursor for fixed AoS part
+            record_base = curr_off
+            
             # Pack Primary Key
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, curr_off))[0] = rffi.cast(rffi.ULONGLONG, rec.pk_lo)
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, record_base))[0] = r_uint64(rec.pk_lo)
             if is_u128:
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, curr_off + 8))[0] = rffi.cast(rffi.ULONGLONG, rec.pk_hi)
-            curr_off += key_size
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, record_base + 8))[0] = r_uint64(rec.pk_hi)
+            record_base += key_size
 
             # Pack Weight
-            rffi.cast(rffi.LONGLONGP, rffi.ptradd(buf, curr_off))[0] = rffi.cast(rffi.LONGLONG, rec.weight)
-            curr_off += 8
+            rffi.cast(rffi.LONGLONGP, rffi.ptradd(buf, record_base))[0] = rffi.cast(rffi.LONGLONG, rec.weight)
+            record_base += 8
 
-            p_start = curr_off
-            curr_off += stride
+            # Payload start
+            p_start = record_base
+            # The next available overflow slot starts after all AoS records in this batch, 
+            # but for simplicity, we keep them intermingled per-record as in previous spec.
+            # Advance overflow cursor to start after current AoS record fixed stride.
+            cursor_ref[0] = record_base + stride
             
             # Pack Columnar Payload
             arg_idx = 0
             i = 0
+            allocator = WALBlobAllocator(buf, cursor_ref)
             while i < num_cols:
                 if i != schema.pk_index:
                     val_obj = rec.component_data[arg_idx]
@@ -109,14 +142,7 @@ def write_wal_block(fd, lsn, table_id, records, schema):
                     
                     if col_type == types.TYPE_STRING:
                         assert val_obj.tag == db_values.TAG_STRING
-                        s_val = val_obj.str_val
-                        if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
-                            # Long string: pack offset to the tail of the block
-                            string_logic.pack_string(target, s_val, WAL_BLOCK_HEADER_SIZE + curr_off)
-                            for j in range(len(s_val)): buf[curr_off + j] = s_val[j]
-                            curr_off += len(s_val)
-                        else:
-                            string_logic.pack_string(target, s_val, 0)
+                        string_logic.pack_and_write_blob(target, val_obj.str_val, allocator)
                             
                     elif col_type == types.TYPE_F64:
                         assert val_obj.tag == db_values.TAG_FLOAT
@@ -125,21 +151,23 @@ def write_wal_block(fd, lsn, table_id, records, schema):
                     elif col_type == types.TYPE_U128:
                         assert val_obj.tag == db_values.TAG_INT
                         uv = r_uint128(val_obj.i64)
-                        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(uv))
-                        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(uv >> 64))
+                        rffi.cast(rffi.ULONGLONGP, target)[0] = r_uint64(uv)
+                        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = r_uint64(uv >> 64)
                         
                     else:
                         assert val_obj.tag == db_values.TAG_INT
-                        rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, val_obj.i64)
+                        rffi.cast(rffi.ULONGLONGP, target)[0] = r_uint64(val_obj.i64)
                 i += 1
-            curr_off = align_8(curr_off)
+            
+            # Align next record to 8 bytes relative to the block start
+            curr_off = align_8(cursor_ref[0])
             rec_idx += 1
 
         # 3. Write Header with Checksum
         h_buf = lltype.malloc(rffi.CCHARP.TO, WAL_BLOCK_HEADER_SIZE, flavor="raw")
         try:
             for k in range(WAL_BLOCK_HEADER_SIZE): h_buf[k] = "\x00"
-            rffi.cast(rffi.ULONGLONGP, h_buf)[0] = rffi.cast(rffi.ULONGLONG, lsn)
+            rffi.cast(rffi.ULONGLONGP, h_buf)[0] = r_uint64(lsn)
             rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 8))[0] = rffi.cast(rffi.UINT, table_id)
             rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 12))[0] = rffi.cast(rffi.UINT, num_records)
             rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 16))[0] = rffi.cast(rffi.UINT, WAL_BLOCK_HEADER_SIZE + total_body_size)
@@ -209,6 +237,7 @@ def decode_wal_block(block_ptr, block_len, schema):
                         if length > 4: s += rffi.charpsize2str(rffi.ptradd(fptr, 8), length - 4)
                         val = db_values.TaggedValue.make_string(s)
                     else:
+                        # Long string: read from the overflow cursor
                         val = db_values.TaggedValue.make_string(rffi.charpsize2str(curr_ptr, length))
                         curr_ptr = rffi.ptradd(curr_ptr, length)
                         
@@ -229,6 +258,7 @@ def decode_wal_block(block_ptr, block_len, schema):
                 val_idx += 1
             i += 1
         
+        # Align cursor to the next record start
         cons = rffi.cast(lltype.Signed, curr_ptr) - rffi.cast(lltype.Signed, body_ptr)
         curr_ptr = rffi.ptradd(body_ptr, align_8(cons))
         
