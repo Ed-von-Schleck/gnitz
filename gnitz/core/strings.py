@@ -160,58 +160,6 @@ def string_equals(struct_ptr, heap_base_ptr, search_str, search_len, search_pref
         len1, pref1, struct_ptr, heap_base_ptr, None,
         search_len, rffi.cast(lltype.Signed, search_prefix), NULL_PTR, NULL_PTR, search_str
     ) == 0
-
-@jit.unroll_safe
-def string_equals_dual(ptr1, heap1, ptr2, heap2):
-    """Compares two packed German String structures for equality."""
-    u32_p1 = rffi.cast(rffi.UINTP, ptr1)
-    len1 = rffi.cast(lltype.Signed, u32_p1[0])
-    pref1 = rffi.cast(lltype.Signed, u32_p1[1])
-
-    u32_p2 = rffi.cast(rffi.UINTP, ptr2)
-    len2 = rffi.cast(lltype.Signed, u32_p2[0])
-    pref2 = rffi.cast(lltype.Signed, u32_p2[1])
-
-    return compare_structures(
-        len1, pref1, ptr1, heap1, None,
-        len2, pref2, ptr2, heap2, None
-    ) == 0
-
-@jit.unroll_safe
-def compare_db_value_to_german(val_obj, german_ptr, heap_ptr):
-    """
-    Comparison: TaggedValue vs Packed Structure.
-    Returns: -1 if Value < Structure, 1 if Value > Structure, 0 if Equal.
-    """
-    s_val = val_obj.str_val
-    len_v = len(s_val)
-    pref_v = rffi.cast(lltype.Signed, compute_prefix(s_val))
-    
-    u32_ptr = rffi.cast(rffi.UINTP, german_ptr)
-    len_g = rffi.cast(lltype.Signed, u32_ptr[0])
-    pref_g = rffi.cast(lltype.Signed, u32_ptr[1])
-    
-    # Fixed: Passing Value as LHS (1) and Structure as RHS (2)
-    return compare_structures(
-        len_v, pref_v, NULL_PTR, NULL_PTR, s_val,   # LHS (Value)
-        len_g, pref_g, german_ptr, heap_ptr, None   # RHS (Structure)
-    )
-
-@jit.unroll_safe
-def string_compare(ptr1, heap1, ptr2, heap2):
-    """Lexicographical comparison of two packed German Strings."""
-    u32_p1 = rffi.cast(rffi.UINTP, ptr1)
-    len1 = rffi.cast(lltype.Signed, u32_p1[0])
-    pref1 = rffi.cast(lltype.Signed, u32_p1[1])
-
-    u32_p2 = rffi.cast(rffi.UINTP, ptr2)
-    len2 = rffi.cast(lltype.Signed, u32_p2[0])
-    pref2 = rffi.cast(lltype.Signed, u32_p2[1])
-
-    return compare_structures(
-        len1, pref1, ptr1, heap1, None,
-        len2, pref2, ptr2, heap2, None
-    )
     
 @jit.unroll_safe
 def unpack_string(struct_ptr, heap_base_ptr):

@@ -316,31 +316,6 @@ class TestDataComparators(unittest.TestCase):
         # Test for inequality (value > packed)
         self.assertEqual(comparator.compare_rows(self.schema_i64, acc_val, acc_packed), 1)
 
-    def test_direct_value_to_german_comparison_kernel(self):
-        """Verify direct TaggedValue.make_string vs packed German string comparison."""
-        s_short_val = "hello"
-        s_long_val = "this is a longer string for direct comparison"
-        s_mismatch_val = "world"
-
-        # Pack German strings
-        off_short = self._alloc_heap_blob(s_short_val) # not used for short strings, but for consistency
-        string_logic.pack_string(self.struct_buf1, s_short_val, off_short)
-
-        off_long = self._alloc_heap_blob(s_long_val)
-        string_logic.pack_string(self.struct_buf2, s_long_val, off_long)
-
-        # Compare short (packed) vs short (TaggedValue)
-        val_obj_short = db_values.TaggedValue.make_string(s_short_val)
-        self.assertEqual(string_logic.compare_db_value_to_german(val_obj_short, self.struct_buf1, self.heap_buf), 0)
-        
-        # Compare long (packed) vs long (TaggedValue)
-        val_obj_long = db_values.TaggedValue.make_string(s_long_val)
-        self.assertEqual(string_logic.compare_db_value_to_german(val_obj_long, self.struct_buf2, self.heap_buf), 0)
-        
-        # Compare mismatch (packed) vs (TaggedValue)
-        val_obj_mismatch = db_values.TaggedValue.make_string(s_mismatch_val)
-        self.assertEqual(string_logic.compare_db_value_to_german(val_obj_mismatch, self.struct_buf1, self.heap_buf), 1) # 'hello' < 'world' -> val_obj > packed -> result 1
-
     def test_u128_lexicographical_ordering(self):
         """Verify 128-bit integer comparison across accessors."""
         u128_1 = r_uint128(100)
