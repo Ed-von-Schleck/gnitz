@@ -180,10 +180,10 @@ def string_equals_dual(ptr1, heap1, ptr2, heap2):
 @jit.unroll_safe
 def compare_db_value_to_german(val_obj, german_ptr, heap_ptr):
     """
-    Comparison: StringValue vs Packed Structure.
-    Returns: -1 if Structure < Value, 1 if Structure > Value, 0 if Equal.
+    Comparison: TaggedValue vs Packed Structure.
+    Returns: -1 if Value < Structure, 1 if Value > Structure, 0 if Equal.
     """
-    s_val = val_obj.get_string()
+    s_val = val_obj.str_val
     len_v = len(s_val)
     pref_v = rffi.cast(lltype.Signed, compute_prefix(s_val))
     
@@ -191,9 +191,10 @@ def compare_db_value_to_german(val_obj, german_ptr, heap_ptr):
     len_g = rffi.cast(lltype.Signed, u32_ptr[0])
     pref_g = rffi.cast(lltype.Signed, u32_ptr[1])
     
+    # Fixed: Passing Value as LHS (1) and Structure as RHS (2)
     return compare_structures(
-        len_g, pref_g, german_ptr, heap_ptr, None,
-        len_v, pref_v, NULL_PTR, NULL_PTR, s_val
+        len_v, pref_v, NULL_PTR, NULL_PTR, s_val,   # LHS (Value)
+        len_g, pref_g, german_ptr, heap_ptr, None   # RHS (Structure)
     )
 
 @jit.unroll_safe
@@ -211,3 +212,32 @@ def string_compare(ptr1, heap1, ptr2, heap2):
         len1, pref1, ptr1, heap1, None,
         len2, pref2, ptr2, heap2, None
     )
+    
+@jit.unroll_safe
+def unpack_string(struct_ptr, heap_base_ptr):
+    """
+    Reverse of pack_string. Extracts a Python string from a 16-byte German String.
+    - struct_ptr: Pointer to the 16-byte structure.
+    - heap_base_ptr: Pointer to the start of the blob heap (Region B or WAL tail).
+    """
+    u32_ptr = rffi.cast(rffi.UINTP, struct_ptr)
+    length = rffi.cast(lltype.Signed, u32_ptr[0])
+    
+    if length == 0:
+        return ""
+        
+    if length <= SHORT_STRING_THRESHOLD:
+        # Reconstruct from Prefix (4 bytes) and Suffix (8 bytes)
+        # Logical Bytes 0-3 are in the prefix slot (offset 4)
+        # Logical Bytes 4-11 are in the suffix slot (offset 8)
+        take_prefix = 4 if length > 4 else length
+        res = rffi.charpsize2str(rffi.ptradd(struct_ptr, 4), take_prefix)
+        if length > 4:
+            res += rffi.charpsize2str(rffi.ptradd(struct_ptr, 8), length - 4)
+        return res
+    else:
+        # Extract from Heap
+        u64_payload_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(struct_ptr, 8))
+        offset = rffi.cast(lltype.Signed, u64_payload_ptr[0])
+        blob_ptr = rffi.ptradd(heap_base_ptr, offset)
+        return rffi.charpsize2str(blob_ptr, length)

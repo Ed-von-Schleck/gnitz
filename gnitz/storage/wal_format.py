@@ -230,16 +230,11 @@ def decode_wal_block(block_ptr, block_len, schema):
                 val = None
                 
                 if col_def.field_type == types.TYPE_STRING:
-                    length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, fptr)[0])
-                    if length <= string_logic.SHORT_STRING_THRESHOLD:
-                        take = 4 if length > 4 else length
-                        s = rffi.charpsize2str(rffi.ptradd(fptr, 4), take)
-                        if length > 4: s += rffi.charpsize2str(rffi.ptradd(fptr, 8), length - 4)
-                        val = db_values.TaggedValue.make_string(s)
-                    else:
-                        # Long string: read from the overflow cursor
-                        val = db_values.TaggedValue.make_string(rffi.charpsize2str(curr_ptr, length))
-                        curr_ptr = rffi.ptradd(curr_ptr, length)
+                    # In the WAL, the 'heap_base_ptr' is the start of the current BLOCK.
+                    # The offsets stored in the struct are absolute from block start.
+                    val = db_values.TaggedValue.make_string(
+                        string_logic.unpack_string(fptr, block_ptr)
+                    )
                         
                 elif col_def.field_type == types.TYPE_F64:
                     f_val = float(rffi.cast(rffi.DOUBLEP, fptr)[0])
