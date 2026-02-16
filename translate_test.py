@@ -6,7 +6,6 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.core import zset, types, values as db_values
 
 def mk_payload(s):
-    # FIXED: Use the TaggedValue factory instead of the deleted StringValue class
     return [db_values.TaggedValue.make_string(s)]
 
 def entry_point(argv):

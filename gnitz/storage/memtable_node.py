@@ -11,7 +11,6 @@ def get_key_offset(height):
     # Fixed header: 8 (weight) + 1 (height) + 3 (padding) = 12
     # Pointer array: height * 4
     raw_size = 12 + (height * 4)
-    # FIXED: Ensured bitwise alignment logic uses machine-word compatible operations
     return (raw_size + 15) & ~15
 
 def node_get_next_off(base_ptr, node_off, level):
