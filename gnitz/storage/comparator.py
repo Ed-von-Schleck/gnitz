@@ -10,8 +10,8 @@ NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
 class RowAccessor(object):
     """
-    Abstract interface for accessing column data from any storage format
-    (MemTable Node, SoA Shard View, or Python DBValue List).
+    Abstract interface for accessing column data from any storage format.
+    Refactored to support direct access from TaggedValue.
     """
     def set_row(self, source, index_or_offset):
         """Resets the accessor to point to a specific row."""
@@ -38,7 +38,7 @@ class RowAccessor(object):
 
 class PackedNodeAccessor(RowAccessor):
     """
-    Accesses data from a row-oriented (AoS) MemTable node.
+    Accesses data from a row-oriented (AoS) MemTable node in raw memory.
     """
     def __init__(self, schema, blob_base_ptr):
         self.schema = schema
@@ -47,7 +47,6 @@ class PackedNodeAccessor(RowAccessor):
         self.payload_ptr = NULL_PTR
 
     def set_row(self, base_ptr, node_off):
-        # Calculate the absolute pointer to the start of the row payload
         self.payload_ptr = node_get_payload_ptr(base_ptr, node_off, self.key_size)
 
     def _get_ptr(self, col_idx):
@@ -56,7 +55,6 @@ class PackedNodeAccessor(RowAccessor):
 
     def get_int(self, col_idx):
         ptr = self._get_ptr(col_idx)
-        # Read as i64, cast to u64 to match DBValue semantics
         return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
 
     def get_float(self, col_idx):
@@ -78,7 +76,7 @@ class PackedNodeAccessor(RowAccessor):
 
 class SoAAccessor(RowAccessor):
     """
-    Accesses data from a column-oriented (SoA) Table Shard View.
+    Accesses data from a column-oriented (SoA) Table Shard View in raw memory.
     """
     def __init__(self, schema):
         self.schema = schema
@@ -115,8 +113,8 @@ class SoAAccessor(RowAccessor):
 
 class ValueAccessor(RowAccessor):
     """
-    Accesses data from a list of Python DBValue objects.
-    Used during ingestion to compare new rows against existing state.
+    Accesses data from a List[TaggedValue].
+    Now uses direct field access instead of polymorphic calls.
     """
     def __init__(self, schema):
         self.schema = schema
@@ -132,16 +130,25 @@ class ValueAccessor(RowAccessor):
         return self.values[idx]
 
     def get_int(self, col_idx):
-        return self._get_val(col_idx).get_int()
+        val = self._get_val(col_idx)
+        assert val.tag == db_values.TAG_INT
+        return rffi.cast(rffi.ULONGLONG, val.i64)
 
     def get_float(self, col_idx):
-        return self._get_val(col_idx).get_float()
+        val = self._get_val(col_idx)
+        assert val.tag == db_values.TAG_FLOAT
+        return val.f64
 
     def get_u128(self, col_idx):
-        return self._get_val(col_idx).get_u128()
+        # U128 non-PK columns are stored in TaggedValue.i64 
+        val = self._get_val(col_idx)
+        assert val.tag == db_values.TAG_INT
+        return r_uint128(val.i64)
 
     def get_str_struct(self, col_idx):
-        s = self._get_val(col_idx).get_string()
+        val = self._get_val(col_idx)
+        assert val.tag == db_values.TAG_STRING
+        s = val.str_val
         length = len(s)
         prefix = rffi.cast(lltype.Signed, string_logic.compute_prefix(s))
         return (length, prefix, NULL_PTR, NULL_PTR, s)
@@ -151,10 +158,7 @@ class ValueAccessor(RowAccessor):
 def compare_rows(schema, left, right):
     """
     Unified lexicographical comparison of two rows using RowAccessors.
-    Returns:
-        -1 if left < right
-         1 if left > right
-         0 if left == right
+    The JIT specializes this loop based on the schema and accessor types.
     """
     num_cols = len(schema.columns)
     for i in range(num_cols):

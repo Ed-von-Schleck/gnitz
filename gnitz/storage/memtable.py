@@ -9,7 +9,7 @@ from gnitz.storage.memtable_node import (
     node_get_next_off, node_set_next_off, node_get_weight, node_set_weight,
     node_get_key, node_get_payload_ptr, get_key_offset
 )
-from gnitz.core import types, strings as string_logic
+from gnitz.core import types, values, strings as string_logic
 
 MAX_HEIGHT = 16
 
@@ -45,7 +45,7 @@ class MemTable(object):
         for i in range(MAX_HEIGHT): 
             node_set_next_off(self.arena.base_ptr, self.head_off, i, 0)
         
-        # FIXED: Used r_uint64(-1) to generate 0xFF...FF without prebuilt long trap
+        # Use r_uint64(-1) to generate 0xFF...FF without prebuilt long trap
         key_ptr = rffi.ptradd(ptr, head_key_off)
         all_ones = r_uint64(-1)
         if self.key_size == 16:
@@ -55,10 +55,7 @@ class MemTable(object):
             rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, all_ones)
 
     def _find_first_key(self, key):
-        """
-        Locates the first node in the SkipList matching the Primary Key.
-        Used by the Z-Set layer to iterate over multiple payloads for one PK.
-        """
+        """Locates the first node in the SkipList matching the Primary Key."""
         base = self.arena.base_ptr
         curr_off = self.head_off
         for i in range(MAX_HEIGHT - 1, -1, -1):
@@ -80,7 +77,8 @@ class MemTable(object):
     def _find_exact_values(self, key, field_values):
         """
         Locates the specific node matching both the Primary Key AND the payload.
-        Uses the new unified comparator and reusable RowAccessors.
+        Args:
+            field_values: List[values.TaggedValue]
         """
         base = self.arena.base_ptr
         curr_off = self.head_off
@@ -121,6 +119,11 @@ class MemTable(object):
         return 0
 
     def upsert(self, key, weight, field_values):
+        """
+        Upserts a row into the MemTable.
+        Args:
+            field_values: List[values.TaggedValue]
+        """
         base = self.arena.base_ptr
         match_off = self._find_exact_values(key, field_values)
         
@@ -165,13 +168,22 @@ class MemTable(object):
             node_set_next_off(base, new_off, i, node_get_next_off(base, pred, i))
             node_set_next_off(base, pred, i, new_off)
 
-    def _ensure_capacity(self, node_sz, values):
+    def _ensure_capacity(self, node_sz, field_values):
+        """
+        Checks if arenas have enough space for the new node and its blobs.
+        Args:
+            field_values: List[values.TaggedValue]
+        """
         blob_sz = 0
         v_idx = 0
         for i in range(len(self.schema.columns)):
             if i == self.schema.pk_index: continue
+            
+            # Use TaggedValue fields directly
+            val = field_values[v_idx]
             if self.schema.columns[i].field_type == types.TYPE_STRING:
-                s = values[v_idx].get_string() 
+                assert val.tag == values.TAG_STRING
+                s = val.str_val
                 if len(s) > string_logic.SHORT_STRING_THRESHOLD: 
                     blob_sz += len(s)
             v_idx += 1
@@ -180,17 +192,26 @@ class MemTable(object):
            self.blob_arena.offset + blob_sz > self.blob_arena.size:
             raise errors.MemTableFullError()
 
-    def _pack_into_node(self, dest_ptr, values):
+    def _pack_into_node(self, dest_ptr, field_values):
+        """
+        Serializes TaggedValues into the packed row format in the Arena.
+        Args:
+            field_values: List[values.TaggedValue]
+        """
         v_idx = 0
         for i in range(len(self.schema.columns)):
             if i == self.schema.pk_index: continue
-            val_obj, f_type = values[v_idx], self.schema.columns[i].field_type
+            
+            val_obj = field_values[v_idx]
+            f_type = self.schema.columns[i].field_type
             v_idx += 1
+            
             off = self.schema.get_column_offset(i)
             target = rffi.ptradd(dest_ptr, off)
             
             if f_type == types.TYPE_STRING:
-                s_val = val_obj.get_string()
+                assert val_obj.tag == values.TAG_STRING
+                s_val = val_obj.str_val
                 h_off = 0
                 if len(s_val) > string_logic.SHORT_STRING_THRESHOLD:
                     # Strings use 8-byte alignment for blob payloads
@@ -198,14 +219,24 @@ class MemTable(object):
                     h_off = rffi.cast(lltype.Signed, b_ptr) - rffi.cast(lltype.Signed, self.blob_arena.base_ptr)
                     for j in range(len(s_val)): b_ptr[j] = s_val[j]
                 string_logic.pack_string(target, s_val, h_off)
+                
             elif f_type == types.TYPE_F64:
-                rffi.cast(rffi.DOUBLEP, target)[0] = rffi.cast(rffi.DOUBLE, val_obj.get_float())
+                assert val_obj.tag == values.TAG_FLOAT
+                rffi.cast(rffi.DOUBLEP, target)[0] = rffi.cast(rffi.DOUBLE, val_obj.f64)
+                
             elif f_type == types.TYPE_U128:
-                u128_val = val_obj.get_u128()
+                # U128 non-PK columns are stored as TaggedValue.i64 (lo) 
+                # Note: If high precision is needed for non-PK U128, TaggedValue 
+                # would need a second i64 field. Current spec prioritizes PK for U128.
+                assert val_obj.tag == values.TAG_INT
+                u128_val = r_uint128(val_obj.i64)
                 rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(u128_val))
                 rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(u128_val >> 64))
+                
             else:
-                rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, val_obj.get_int())
+                # Standard integers (i8...u64)
+                assert val_obj.tag == values.TAG_INT
+                rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, val_obj.i64)
 
     def flush(self, filename, table_id=0):
         sw = writer_table.TableShardWriter(self.schema, table_id)

@@ -116,7 +116,7 @@ class TestDataComparators(unittest.TestCase):
         fn1, fn2 = "comp_soa1.db", "comp_soa2.db"
         for fn in [fn1, fn2]:
             w = writer_table.TableShardWriter(self.schema)
-            w.add_row_from_values(10, 1, [db_values.wrap("test_long_string_in_soa"), db_values.wrap(1.5)])
+            w.add_row_from_values(10, 1, [db_values.TaggedValue.make_string("test_long_string_in_soa"), db_values.TaggedValue.make_float(1.5)])
             w.finalize(fn)
         
         v1 = shard_table.TableShardView(fn1, self.schema)
@@ -139,8 +139,8 @@ class TestDataComparators(unittest.TestCase):
         f_target = 42.123
         
         packed_row = self._pack_aos_with_heap(s_target, f_target, self.heap_buf)
-        values_eq = [db_values.wrap(s_target), db_values.wrap(f_target)]
-        values_lt = [db_values.wrap("abc"), db_values.wrap(f_target)]
+        values_eq = [db_values.TaggedValue.make_string(s_target), db_values.TaggedValue.make_float(f_target)]
+        values_lt = [db_values.TaggedValue.make_string("abc"), db_values.TaggedValue.make_float(f_target)]
 
         acc_packed = self.packed_accessor_shim(self.schema, self.heap_buf)
         acc_val = comparator.ValueAccessor(self.schema)

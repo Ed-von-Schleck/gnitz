@@ -22,7 +22,7 @@ class TestZSetHighLevel(unittest.TestCase):
         """Exercises the full stack with 128-bit keys and German Strings."""
         key = (r_uint128(0xAAAA) << 64) | r_uint128(0xBBBB)
         long_str = "this_is_a_long_string_that_must_survive_crash_recovery"
-        p = [db_values.StringValue(long_str)]
+        p = [db_values.TaggedValue.make_string(long_str)]
         
         # 1. Ingest and Crash (Close without flush)
         self.db.insert(key, p)
@@ -34,7 +34,7 @@ class TestZSetHighLevel(unittest.TestCase):
 
     def test_cross_shard_summation(self):
         """Verifies Z-Set algebraic identity across persistent layers."""
-        p = [db_values.StringValue("common")]
+        p = [db_values.TaggedValue.make_string("common")]
         # Shard 1
         self.db.insert(10, p)
         self.db.flush()

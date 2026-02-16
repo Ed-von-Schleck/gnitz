@@ -8,22 +8,22 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage.memtable import MemTable
 from gnitz.storage.memtable_node import node_get_weight
 from gnitz.storage.wal_format import WALRecord
-from gnitz.storage import wal, manifest, index, mmap_posix, comparator
-from gnitz.core import types
+from gnitz.storage import wal, manifest, index, comparator
+from gnitz.core import types, values
 
 class Engine(object):
     """
     The DBSP Execution Engine.
-    Coordinates the Write-Head (MemTable) and the Persistent Tail (ShardIndex).
     
-    Acts as the single authoritative manager for:
-    1. Mutable State (MemTable + WAL)
-    2. Immutable State (ShardIndex + Manifest)
-    3. The transition between them (Flush/Rotate)
+    Acts as the central authority for:
+    1. Mutable State: Ingestion via MemTable and WAL.
+    2. Immutable State: Reading via ShardIndex.
+    3. Persistence: Managing the Flush/Rotate lifecycle and Manifest updates.
     """
     _immutable_fields_ = [
         'index', 'schema', 'manifest_manager', 'table_id', 
-        'memtable_capacity', 'wal_writer'
+        'memtable_capacity', 'wal_writer', 
+        'value_accessor', 'soa_accessor'
     ]
 
     def __init__(self, schema, shard_index, memtable_capacity, wal_writer=None, 
@@ -38,6 +38,10 @@ class Engine(object):
         self.table_id = table_id
         self.validate_checksums = validate_checksums
         
+        # Pre-allocate accessors to avoid allocation in hot read/merge loops
+        self.value_accessor = comparator.ValueAccessor(self.schema)
+        self.soa_accessor = comparator.SoAAccessor(self.schema)
+        
         # Initialize the mutable write buffer
         self.active_table = MemTable(self.schema, self.memtable_capacity)
 
@@ -49,34 +53,34 @@ class Engine(object):
         else:
             self.current_lsn = r_uint64(1)
 
-        # The LSN where the current MemTable began (used for Shard Metadata)
+        # The LSN where the current MemTable began.
+        # This defines the lower bound [MinLSN, MaxLSN] for the next shard.
         self.starting_lsn = self.current_lsn
 
         # Recover uncommitted state from WAL (Volatile High-Water Mark)
         if recover_wal_filename:
             self.recover_from_wal(recover_wal_filename)
         
-        # After recovery, ensure starting_lsn aligns with the next write
-        # Note: If we recovered data, starting_lsn remains what it was 
-        # (effectively the start of the log), or strictly follows manifest if log was empty.
-        
     def ingest(self, key, weight, field_values):
         """
         Ingests a Z-Set delta into the system.
-        1. Assigns LSN.
-        2. Persists to WAL (Durability).
-        3. Applies to MemTable (Visibility).
+        
+        Args:
+            key: The Primary Key (u64 or u128).
+            weight: The algebraic weight (int64).
+            field_values: List[values.TaggedValue] representing the row payload.
         """
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
         
-        # 1. Write-Ahead Log
+        # 1. Write-Ahead Log (Durability)
         if self.wal_writer:
-            # Create a WAL record (Key, Weight, Payload)
+            # Note: WALRecord logic will be updated in next steps to handle TaggedValue
             rec = WALRecord.from_key(key, weight, field_values)
             self.wal_writer.append_block(lsn, self.table_id, [rec])
             
-        # 2. Update In-Memory State
+        # 2. Update In-Memory State (Visibility)
+        # MemTable.upsert signature updated to accept List[TaggedValue]
         self.active_table.upsert(r_uint128(key), weight, field_values)
 
     def recover_from_wal(self, filename):
@@ -100,6 +104,8 @@ class Engine(object):
                 
                 last_recovered_lsn = block.lsn
                 for rec in block.records:
+                    # Records recovered from WAL already contain List[TaggedValue]
+                    # after the wal_format logic is updated.
                     self.active_table.upsert(rec.get_key(), rec.weight, rec.component_data)
             
             # Advance the global clock to the next available LSN
@@ -113,11 +119,15 @@ class Engine(object):
         """
         Calculates the net algebraic weight of a record across all layers.
         Identity: W_net = W_mem + sum(W_shards)
+        
+        Args:
+            field_values: List[values.TaggedValue]
         """
         # 1. Check mutable layer (MemTable)
         mem_weight = 0
         table = self.active_table
-        # Check specific payload in MemTable
+        
+        # MemTable accessor optimized for SkipList nodes
         match_off = table._find_exact_values(key, field_values)
         if match_off != 0:
             mem_weight = node_get_weight(table.arena.base_ptr, match_off)
@@ -127,11 +137,8 @@ class Engine(object):
         # The index prunes shards by Min/Max PK before doing binary search
         results = self.index.find_all_shards_and_indices(key)
         
-        # Create reusable accessors for the shard scan loop
-        soa_accessor = comparator.SoAAccessor(self.schema)
-        value_accessor = comparator.ValueAccessor(self.schema)
-        value_accessor.set_row(field_values) # Set once for the target values
-
+        # Setup reusable accessors for comparison
+        self.value_accessor.set_row(field_values)
         is_u128 = self.schema.get_pk_column().field_type.size == 16
         
         for shard_handle, start_idx in results:
@@ -150,10 +157,12 @@ class Engine(object):
                     break 
                 
                 # Set the SoA accessor for the current row in the shard
-                soa_accessor.set_row(view, curr_idx)
+                self.soa_accessor.set_row(view, curr_idx)
                 
-                # Use the unified comparator for full-row semantic equality check
-                if comparator.compare_rows(self.schema, soa_accessor, value_accessor) == 0:
+                # Use the unified comparator for full-row semantic equality check.
+                # compare_rows handles both TaggedValue (via ValueAccessor) 
+                # and Columnar data (via SoAAccessor).
+                if comparator.compare_rows(self.schema, self.soa_accessor, self.value_accessor) == 0:
                     spine_weight += shard_handle.view.get_weight(curr_idx)
                     break # PK+Payload is unique within a single Shard
                 
@@ -164,11 +173,15 @@ class Engine(object):
     def flush_and_rotate(self, filename):
         """
         Transitions MemTable to an immutable Shard.
-        1. Writes MemTable to N-Partition file.
+        1. Writes MemTable to N-Partition file (if not empty).
         2. Updates Index and Manifest atomically.
         3. Frees old MemTable memory and allocates a new one.
         """
-        # Capture LSN range for this epoch
+        if self.current_lsn == self.starting_lsn:
+            self.active_table.free()
+            self.active_table = MemTable(self.schema, self.memtable_capacity)
+            return self.index.needs_compaction
+
         lsn_max = self.current_lsn - r_uint64(1)
         lsn_min = self.starting_lsn
         
@@ -180,44 +193,50 @@ class Engine(object):
             new_handle = index.ShardHandle(
                 filename, 
                 self.schema, 
-                lsn_min,   # Capture start of MemTable epoch
-                lsn_max,   # Capture end of MemTable epoch
+                lsn_min,
+                lsn_max,
                 validate_checksums=self.validate_checksums
             )
-            # Only index if shard contains data
+            
             if new_handle.view.count > 0:
                 self.index.add_handle(new_handle)
+                
+                # 3. Synchronize Manifest with the updated Index state
+                if self.manifest_manager:
+                    metadata_entries = self.index.get_metadata_list()
+                    
+                    manifest_entries = []
+                    for meta in metadata_entries:
+                        manifest_entries.append(manifest.ManifestEntry(
+                            meta.table_id,
+                            meta.filename,
+                            meta.get_min_key(),
+                            meta.get_max_key(),
+                            meta.min_lsn,
+                            meta.max_lsn
+                        ))
+                    
+                    self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
             else:
                 new_handle.close()
                 os.unlink(filename)
-            
-        # 3. Synchronize Manifest with the updated Index state
-        if self.manifest_manager:
-            # We generate the new manifest entries directly from the index handles
-            metadata_entries = self.index.get_metadata_list()
-            
-            # Map index-metadata back to ManifestEntry objects for serialization
-            manifest_entries = []
-            for meta in metadata_entries:
-                manifest_entries.append(manifest.ManifestEntry(
-                    meta.table_id,
-                    meta.filename,
-                    meta.get_min_key(),
-                    meta.get_max_key(),
-                    meta.min_lsn,
-                    meta.max_lsn
-                ))
-            
-            self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
-            
-        # 4. Rotate Memory: Free old, allocate new
+                if self.manifest_manager:
+                    metadata_entries = self.index.get_metadata_list()
+                    manifest_entries = []
+                    for meta in metadata_entries:
+                        manifest_entries.append(manifest.ManifestEntry(
+                            meta.table_id, meta.filename, meta.get_min_key(), meta.get_max_key(),
+                            meta.min_lsn, meta.max_lsn
+                        ))
+                    self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
+
+        # 4. Rotate Memory
         self.active_table.free()
         self.active_table = MemTable(self.schema, self.memtable_capacity)
         
         # 5. Advance Epoch Tracking
         self.starting_lsn = self.current_lsn
         
-        # Return health status to trigger potential background compaction
         return self.index.needs_compaction
 
     def close(self):

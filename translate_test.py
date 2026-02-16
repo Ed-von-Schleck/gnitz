@@ -1,31 +1,31 @@
+# translate_test.py
+
 import sys
 import os
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.core import zset, types, values as db_values
 
 def mk_payload(s):
-    return [db_values.StringValue(s)]
+    # FIXED: Use the TaggedValue factory instead of the deleted StringValue class
+    return [db_values.TaggedValue.make_string(s)]
 
 def entry_point(argv):
     print "--- GnitzDB Integrated Lifecycle Test ---"
     
-    # 1. Wrap the ENTIRE logic in a try/except block to catch RPython exceptions
     try:
         db_dir = "translate_test_db"
 
         if not os.path.exists(db_dir):
             os.mkdir(db_dir)
         else:
-            # OPTIONAL: For testing, you might want to clean the directory 
-            # to ensure a fresh start and avoid recovery errors.
             print "[INFO] DB Directory exists. Appending to existing state."
 
+        # Schema: PK(0)=i64, Column(1)=String
         layout = types.TableSchema(
             [types.ColumnDefinition(types.TYPE_I64), types.ColumnDefinition(types.TYPE_STRING)],
             0,
         )
 
-        # 2. Move PersistentTable instantiation INSIDE the try block
         print "[Step 0] Initializing Engine..."
         db = zset.PersistentTable(
             db_dir,
@@ -49,7 +49,8 @@ def entry_point(argv):
             print "[Step 3] Verifying Algebraic Summation..."
             w_100 = db.get_weight(100, mk_payload("base_state"))
             if w_100 != 3:
-                print "ERR: Entity 100 weight mismatch. Expected 3, got %d" % w_100
+                # We use intmask/r_int64 for weights, but print works normally
+                print "ERR: Entity 100 weight mismatch. Expected 3, got %d" % int(w_100)
                 return 1
 
             print "  [OK] Integrated lifecycle verified."
@@ -59,8 +60,6 @@ def entry_point(argv):
             db.close()
 
     except Exception as e:
-        # 3. Catch, Print, and Return Error Code
-        # We write to stderr (file descriptor 2) to ensure visibility
         os.write(2, "FATAL ERROR in entry_point: " + str(e) + "\n")
         return 1
 

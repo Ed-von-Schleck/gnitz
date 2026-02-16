@@ -22,7 +22,7 @@ class TestShardColumnar(unittest.TestCase):
     def test_columnar_pointer_access(self):
         """Verifies that directory offsets correctly point to columnar regions."""
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_from_values(10, 1, [db_values.wrap(100), db_values.wrap("alpha")])
+        writer.add_row_from_values(10, 1, [db_values.TaggedValue.make_int(100), db_values.TaggedValue.make_string("alpha")])
         writer.finalize(self.fn)
 
         view = shard_table.TableShardView(self.fn, self.layout)
@@ -37,7 +37,7 @@ class TestShardColumnar(unittest.TestCase):
         """Verifies the Ghost Property: Column checksums are only checked on access."""
         long_str = "payload_that_lives_in_blob_region_b"
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_from_values(99, 1, [db_values.wrap(999), db_values.wrap(long_str)])
+        writer.add_row_from_values(99, 1, [db_values.TaggedValue.make_int(999), db_values.TaggedValue.make_string(long_str)])
         writer.finalize(self.fn)
 
         view = shard_table.TableShardView(self.fn, self.layout)

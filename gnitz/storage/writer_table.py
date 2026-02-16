@@ -1,3 +1,5 @@
+# gnitz/storage/writer_table.py
+
 import os
 from rpython.rlib import rposix, jit
 from rpython.rtyper.lltypesystem import rffi, lltype
@@ -11,16 +13,19 @@ from gnitz.core import types, strings as string_logic, values as db_values
 NULL_CHARP = lltype.nullptr(rffi.CCHARP.TO)
 
 class TableShardWriter(object):
+    """
+    Handles the creation of N-Partition columnar shards.
+    Refactored to accept TaggedValue lists for ingestion.
+    """
     def __init__(self, schema, table_id=0):
         self.schema = schema
         self.table_id = table_id
         self.count = 0
         pk_col = schema.get_pk_column()
-        # Using unified Buffer class
+        
         self.pk_buf = buffer.Buffer(pk_col.field_type.size * 1024, growable=True)
         self.w_buf = buffer.Buffer(8 * 1024, growable=True)
 
-        # Pre-allocate fixed-size list
         num_cols = len(schema.columns)
         self.col_bufs = [None] * num_cols
         i = 0
@@ -31,7 +36,7 @@ class TableShardWriter(object):
 
         self.b_buf = buffer.Buffer(4096, growable=True)
         self.blob_cache = {}
-        # Pre-allocate scratch buffer to avoid mallocs during ingestion
+        # Pre-allocate scratch buffer to avoid mallocs in loop
         self.scratch_val_buf = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
 
     def _get_or_append_blob(self, src_ptr, length):
@@ -43,7 +48,7 @@ class TableShardWriter(object):
             existing_offset = self.blob_cache[cache_key]
             existing_ptr = rffi.ptradd(self.b_buf.ptr, existing_offset)
             
-            # Content comparison
+            # Binary comparison to ensure deduplication safety
             match = True
             for i in range(length):
                 if src_ptr[i] != existing_ptr[i]:
@@ -130,11 +135,16 @@ class TableShardWriter(object):
             i += 1
 
     def add_row_from_values(self, pk, weight, values_list):
-        """Entry point for DBValue-based ingestion."""
+        """
+        Ingests data from a List[values.TaggedValue].
+        Used by the test suite and high-level ingestion API.
+        """
         if weight == 0:
             return
         self.count += 1
 
+        # Handle Primary Key (u64 or u128)
+        # Note: 'pk' is expected to be int or r_uint128
         if self.schema.get_pk_column().field_type.size == 16:
             self.pk_buf.put_u128(r_uint128(pk))
         else:
@@ -150,6 +160,7 @@ class TableShardWriter(object):
                 continue
 
             if val_idx >= len(values_list):
+                # Fallback for missing columns
                 self._append_value(i, NULL_CHARP, NULL_CHARP)
                 i += 1
                 continue
@@ -159,15 +170,29 @@ class TableShardWriter(object):
             ftype = self.schema.columns[i].field_type
 
             if ftype == types.TYPE_STRING:
-                self._append_value(i, NULL_CHARP, NULL_CHARP, string_data=val_obj.get_string())
+                assert val_obj.tag == db_values.TAG_STRING
+                self._append_value(i, NULL_CHARP, NULL_CHARP, string_data=val_obj.str_val)
+                
             elif ftype == types.TYPE_F64:
+                assert val_obj.tag == db_values.TAG_FLOAT
                 rffi.cast(rffi.DOUBLEP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.DOUBLE, val_obj.get_float()
+                    rffi.DOUBLE, val_obj.f64
                 )
                 self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+                
+            elif ftype == types.TYPE_U128:
+                # Store u128 using the lo bits from i64
+                assert val_obj.tag == db_values.TAG_INT
+                u64_ptr = rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)
+                u64_ptr[0] = rffi.cast(rffi.ULONGLONG, val_obj.i64)
+                u64_ptr[1] = rffi.cast(rffi.ULONGLONG, 0)
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+                
             else:
+                # Standard Integers
+                assert val_obj.tag == db_values.TAG_INT
                 rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.ULONGLONG, val_obj.get_int()
+                    rffi.ULONGLONG, val_obj.i64
                 )
                 self._append_value(i, self.scratch_val_buf, NULL_CHARP)
             i += 1
@@ -249,7 +274,8 @@ class TableShardWriter(object):
                 lltype.free(header, flavor="raw")
 
             # 2. Write Directory
-            dir_buf = lltype.malloc(rffi.CCHARP.TO, dir_size, flavor="raw")
+            dir_size_bytes = dir_size
+            dir_buf = lltype.malloc(rffi.CCHARP.TO, dir_size_bytes, flavor="raw")
             try:
                 i = 0
                 while i < num_regions:
@@ -264,7 +290,7 @@ class TableShardWriter(object):
                         rffi.ULONGLONG, cs
                     )
                     i += 1
-                mmap_posix.write_c(fd, dir_buf, rffi.cast(rffi.SIZE_T, dir_size))
+                mmap_posix.write_c(fd, dir_buf, rffi.cast(rffi.SIZE_T, dir_size_bytes))
             finally:
                 lltype.free(dir_buf, flavor="raw")
 

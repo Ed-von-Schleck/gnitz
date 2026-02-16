@@ -25,7 +25,7 @@ class TestMemTableSkipList(unittest.TestCase):
         mt = memtable.MemTable(self.schema_u128, 1024 * 1024)
         try:
             key = (r_uint128(0xAAAA) << 64) | r_uint128(0xBBBB)
-            mt.upsert(key, 1, [db_values.IntValue(42)])
+            mt.upsert(key, 1, [db_values.TaggedValue.make_int(42)])
             
             node_off = mt._find_first_key(key)
             self.assertNotEqual(node_off, 0)
@@ -44,7 +44,7 @@ class TestMemTableSkipList(unittest.TestCase):
         """Verifies that records summing to zero are removed from SkipList traversal."""
         mt = memtable.MemTable(self.schema_u128, 1024 * 1024)
         try:
-            p = [db_values.IntValue(100)]
+            p = [db_values.TaggedValue.make_int(100)]
             key = r_uint128(1)
             
             mt.upsert(key, 1, p)

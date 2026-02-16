@@ -35,7 +35,11 @@ class TestZSetPersistence(unittest.TestCase):
         if os.path.exists(self.test_dir): shutil.rmtree(self.test_dir)
 
     def _p(self, i8, s, f64):
-        return [db_values.wrap(i8), db_values.StringValue(s), db_values.wrap(f64)]
+        return [
+            db_values.TaggedValue.make_int(i8), 
+            db_values.TaggedValue.make_string(s), 
+            db_values.TaggedValue.make_float(f64)
+        ]
 
     def test_u128_key_alignment_and_persistence(self):
         """Verify 128-bit key alignment and retrieval through Shards."""

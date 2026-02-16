@@ -21,7 +21,7 @@ class TestWALStorage(unittest.TestCase):
     def test_wal_binary_roundtrip(self):
         """Verifies binary block serialization and checksum validation."""
         writer = wal.WALWriter(self.wal_path, self.layout)
-        recs = [wal_format.WALRecord.from_key(10, 1, [db_values.wrap("block1")])]
+        recs = [wal_format.WALRecord.from_key(10, 1, [db_values.TaggedValue.make_string("block1")])]
         writer.append_block(1, 1, recs) # LSN 1, TID 1
         writer.close()
 
@@ -42,7 +42,7 @@ class TestWALStorage(unittest.TestCase):
     def test_physical_truncation(self):
         """Verifies that truncation resets the file for checkpointing."""
         writer = wal.WALWriter(self.wal_path, self.layout)
-        writer.append_block(1, 1, [wal_format.WALRecord.from_key(1, 1, [db_values.wrap("x")])])
+        writer.append_block(1, 1, [wal_format.WALRecord.from_key(1, 1, [db_values.TaggedValue.make_string("x")])])
         self.assertGreater(os.path.getsize(self.wal_path), 0)
         
         writer.truncate_before_lsn(2) 

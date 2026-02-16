@@ -27,8 +27,8 @@ class TestMemTableManagement(unittest.TestCase):
         # Use the high-level PersistentTable, which uses the Engine internally
         db = zset.PersistentTable(self.db_dir, "test_table", self.layout)
         try:
-            db.insert(10, [db_values.StringValue("short")])
-            db.insert(20, [db_values.StringValue("long_blob_payload_relocation_test")])
+            db.insert(10, [db_values.TaggedValue.make_string("short")])
+            db.insert(20, [db_values.TaggedValue.make_string("long_blob_payload_relocation_test")])
             
             # This triggers engine.flush_and_rotate()
             shard_filename = db.flush()
@@ -54,11 +54,11 @@ class TestMemTableManagement(unittest.TestCase):
             live_str = "SURVIVE" * 10
             
             # PK 1: Sums to zero
-            table.upsert(1, 1, [db_values.StringValue(dead_str)])
-            table.upsert(1, -1, [db_values.StringValue(dead_str)])
+            table.upsert(1, 1, [db_values.TaggedValue.make_string(dead_str)])
+            table.upsert(1, -1, [db_values.TaggedValue.make_string(dead_str)])
             
             # PK 2: Survives
-            table.upsert(2, 1, [db_values.StringValue(live_str)])
+            table.upsert(2, 1, [db_values.TaggedValue.make_string(live_str)])
             
             table.flush(self.fn, table_id=1)
             
