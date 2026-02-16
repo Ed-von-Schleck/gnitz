@@ -54,14 +54,14 @@ class TestManifestBinary(unittest.TestCase):
 
     def test_empty_manifest_io(self):
         """Ensures readers handle valid manifests with zero entries."""
-        writer = manifest.ManifestWriter(self.test_file)
-        writer.finalize()
+        mgr = manifest.ManifestManager(self.test_file)
+        mgr.publish_new_version([], r_uint64(0))
         
         reader = manifest.ManifestReader(self.test_file)
         try:
             self.assertEqual(reader.entry_count, 0)
-            with self.assertRaises(StopIteration):
-                next(reader.iterate_entries())
+            entries = list(reader.iterate_entries())
+            self.assertEqual(len(entries), 0)
         finally:
             reader.close()
 

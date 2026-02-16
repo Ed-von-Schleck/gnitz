@@ -175,21 +175,3 @@ class ManifestManager(object):
             mmap_posix.fsync_c(fd)
         finally: rposix.close(fd)
         os.rename(tmp, self.path)
-
-class ManifestWriter(object):
-    def __init__(self, filename, global_max_lsn=r_uint64(0)):
-        self.filename = filename
-        self.global_max_lsn = global_max_lsn
-        self.entries = []
-
-    def add_entry(self, tid, fn, min_k, max_k, min_l, max_l):
-        self.entries.append(ManifestEntry(tid, fn, min_k, max_k, min_l, max_l))
-
-    def add_entry_obj(self, entry):
-        self.entries.append(entry)
-
-    def add_entry_values(self, tid, fn, min_k, max_k, min_l, max_l):
-        self.add_entry(tid, fn, min_k, max_k, min_l, max_l)
-
-    def finalize(self):
-        ManifestManager(self.filename).publish_new_version(self.entries, self.global_max_lsn)

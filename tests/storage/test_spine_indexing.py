@@ -22,10 +22,18 @@ class TestShardIndexing(unittest.TestCase):
         writer.add_row_from_values(10, 1, [])
         writer.finalize(shard_fn)
         
-        m_writer = manifest.ManifestWriter(self.manifest_file)
-        # Entry: tid=1, file, min_k=10, max_k=10, min_lsn=0, max_lsn=1
-        m_writer.add_entry_values(1, shard_fn, 10, 10, 0, 1)
-        m_writer.finalize()
+        # Create a manifest entry and publish it
+        entry = manifest.ManifestEntry(
+            table_id=1,
+            shard_filename=shard_fn,
+            min_key=10,
+            max_key=10,
+            min_lsn=0,
+            max_lsn=1
+        )
+        
+        mgr = manifest.ManifestManager(self.manifest_file)
+        mgr.publish_new_version([entry], global_max_lsn=1)
         
         rc = refcount.RefCounter()
         idx = index.index_from_manifest(self.manifest_file, table_id=1, schema=self.layout, ref_counter=rc)

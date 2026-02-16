@@ -50,21 +50,3 @@ class TaggedValue(object):
             return self.str_val
         else:
             return "NULL"
-
-def wrap(val):
-    """
-    Wraps a Python primitive into a TaggedValue.
-    """
-    if isinstance(val, float):
-        return TaggedValue.make_float(val)
-    if isinstance(val, str):
-        return TaggedValue.make_string(val)
-    if isinstance(val, r_uint128):
-        # Explicitly use intmask for the u128 -> i64 conversion
-        return TaggedValue.make_int(intmask(val))
-    if isinstance(val, int):
-        return TaggedValue.make_int(intmask(val))
-    if isinstance(val, TaggedValue):
-        return val
-        
-    raise TypeError("Unsupported type for TaggedValue wrap")
