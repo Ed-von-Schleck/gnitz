@@ -67,13 +67,7 @@ def materialize_row(accessor, schema):
             
         elif type_code == types.TYPE_U128.code:
              # U128 in payload is currently stored as int64 for TaggedValue simplicity
-             # or we might need a make_u128. For now, assuming only PK is U128 
-             # or we cast.
-             # Note: TaggedValue doesn't explicitly support u128 yet in spec phase 1.
-             # We map it to int for now.
              val_u128 = accessor.get_u128(i)
-             # WARNING: Truncation if not handled. 
-             # Assuming purely opaque passthrough or u64 payloads for now.
              result.append(values.TaggedValue.make_int(r_int64(val_u128)))
              
         else:
@@ -109,9 +103,6 @@ def op_filter(reg_in, reg_out, func):
 def op_map(reg_in, reg_out, func):
     """
     Implements: Out = { (k, func(v), w) | (k, v, w) in In }
-    Note: MAP in DBSP usually preserves the Key. 
-    If Key modification is needed, a specific Re-Key operator is used.
-    Here we assume Key is preserved.
     """
     input_batch = reg_in.batch
     output_batch = reg_out.batch
@@ -167,14 +158,32 @@ def op_union(reg_in_a, reg_in_b, reg_out):
             batch_a.payloads[i]
         )
         
-    # Copy B
-    batch_b = reg_in_b.batch
-    count_b = batch_b.row_count()
-    for i in range(count_b):
+    # Copy B if present (reg_in_b can be None for single-operand moves)
+    if reg_in_b is not None:
+        batch_b = reg_in_b.batch
+        count_b = batch_b.row_count()
+        for i in range(count_b):
+            output_batch.append(
+                batch_b.keys[i],
+                batch_b.weights[i],
+                batch_b.payloads[i]
+            )
+
+def op_delay(reg_in, reg_out):
+    """
+    Moves content from reg_in to reg_out.
+    Used for z^-1 or simple data movement.
+    """
+    input_batch = reg_in.batch
+    output_batch = reg_out.batch
+    output_batch.clear()
+    
+    count = input_batch.row_count()
+    for i in range(count):
         output_batch.append(
-            batch_b.keys[i],
-            batch_b.weights[i],
-            batch_b.payloads[i]
+            input_batch.keys[i],
+            input_batch.weights[i],
+            input_batch.payloads[i]
         )
 
 # -----------------------------------------------------------------------------
@@ -320,7 +329,6 @@ def op_integrate(reg_in, table_id, engine):
         payload = batch.payloads[i]
         
         # Engine expects (key, weight, payload)
-        # Note: The Engine will serialize this to MemTable/WAL
         engine.ingest(key, weight, payload)
 
 def op_distinct(reg_in, reg_out):
@@ -345,7 +353,3 @@ def op_distinct(reg_in, reg_out):
                 1, # Force weight to 1
                 input_batch.payloads[i]
             )
-        # What about w < 0? 
-        # In DBSP DISTINCT usually means (w > 0 -> 1, w <= 0 -> 0) 
-        # effectively filtering retractions unless implementing specialized distinct.
-        # Simple set projection: if it exists, it's 1.
