@@ -232,9 +232,8 @@ def op_join_delta_trace(reg_delta, reg_trace, reg_out):
             final_weight = d_weight * t_weight
             
             if final_weight != 0:
-                # Materialize Trace payload
-                # Note: trace_cursor implements BaseRowAccessor
-                t_payload = materialize_row(trace_cursor, reg_trace.vm_schema.table_schema)
+                accessor = trace_cursor.get_accessor()
+                t_payload = materialize_row(accessor, reg_trace.vm_schema.table_schema)
                 
                 # Concatenate Payloads: [Delta Cols] + [Trace Cols]
                 d_payload = delta_batch.payloads[i]
@@ -242,7 +241,7 @@ def op_join_delta_trace(reg_delta, reg_trace, reg_out):
                 
                 output_batch.append(d_key, final_weight, final_payload)
             
-            trace_cursor.next()
+            trace_cursor.advance()
 
 def op_join_delta_delta(reg_a, reg_b, reg_out):
     """
