@@ -250,31 +250,48 @@ Coalesced rows are streamed into a `TableShardWriter` to generate the new column
 ## 8. Execution Model: Persistent DBSP Virtual Machine
 
 ### 8.1. Register-Based Z-Set VM
-The engine executes reactive circuits via a register-based Virtual Machine. Registers hold references to multiset buffers containing aligned Primary Key (PK), Weight (W), and multiple Column ($C_1 \dots C_n$) regions.
-*   **Delta Registers ($R_\Delta$):** Transient registers holding incremental Z-Set deltas $(\Delta PK, \Delta Row, \Delta W)$ for the current LSN epoch.
-*   **Trace Registers ($R_T$):** Persistent registers holding indexed Z-Set state required for non-linear operations (e.g., joins, reductions). Traces are physically stored as immutable N-Partition shards in the FLSM, partitioned by Table ID.
+The engine executes reactive circuits via a register-based Virtual Machine designed for the incremental maintenance of relational views.
+*   **Register File:** A collection of specialized registers indexed by the VM ISA. The Register File maintains a monomorphic interface to facilitate RPython JIT tracing.
+*   **Delta Registers ($R_\Delta$):** Transient registers holding a `ZSetBatch`. These contain column-oriented, in-memory Z-Set deltas $(\Delta PK, \Delta Row, \Delta W)$ for the current LSN epoch.
+*   **Trace Registers ($R_T$):** Persistent registers holding a `UnifiedCursor`. These provide a seekable, merged view across the persistent FLSM shards and the active MemTable, serving as the historical state ($S$) required for non-linear operations.
 
-### 8.2. Operational Primitives and Join Semantics
-The ISA implements the core operators of DBSP calculus. Because GnitzDB is a pure Z-Set engine, all operators handle multiple payloads per Primary Key to maintain multiset integrity.
-*   **Linear Operators:** `FILTER`, `MAP`, and `UNION` operate via algebraic addition. These process deltas in isolation and maintain weight-payload pairings.
-*   **Multiset Vertical Join (`JOIN_V`):** Since a single Primary Key may have $N$ distinct row payloads in Z-Set $A$ and $M$ payloads in Z-Set $B$, the join operator performs an $N \times M$ cross-product for matching PKs. The resulting weight is the product of the input weights ($w_{out} = w_A \times w_B$).
-*   **Semantic Grouping:** Operators requiring deduplication or coalescing (e.g., `REDUCE`) utilize full-row semantic equality. The VM follows German String offsets into Region B to ensure content-based grouping rather than binary-offset grouping for string columns.
+### 8.2. Operational Primitives (DBSP-Complete ISA)
+The ISA implements the core operators of the DBSP calculus. All operators handle multiple payloads per Primary Key to maintain multiset integrity.
+*   **Linear Operators:** 
+    *   `FILTER` / `MAP`: Apply user-defined `ScalarFunction` logic to deltas.
+    *   `UNION`: Performs algebraic addition of two Z-Set streams.
+    *   `NEGATE`: Multiplies weights by $-1$, enabling the calculation of retractions ($f(x_{old})$).
+*   **Bilinear Operators (Join):**
+    *   `JOIN_DELTA_TRACE`: Implements the incremental join rule $\Delta(A \times B) = \Delta A \times B$. Joins a transient batch against a persistent trace.
+    *   `JOIN_DELTA_DELTA`: Joins two transient batches to compute the "delta-delta" term in the bilinear expansion.
+*   **Non-Linear Operators:**
+    *   `REDUCE`: Performs non-linear aggregation (e.g., `SUM`, `COUNT`, `MIN`, `MAX`) by iterating over a `TraceRegister`.
+    *   `DISTINCT`: Normalizes weights to set semantics ($w > 0 \to 1$).
+*   **Temporal and Integral Operators:**
+    *   `DELAY` ($z^{-1}$): Moves a Z-Set from $R_\Delta$ at tick $T$ to a register available at tick $T+1$, enabling recursive CTEs and fixed-point iteration.
+    *   `INTEGRATE`: The terminal sink that flushes a `ZSetBatch` into a `PersistentTable`, updating the global state.
 
-### 8.3. Vectorized Vertical Zip-Join
-Primary Key reconstruction and joining are performed via a vectorized merge-scan. Because input shards and Traces are strictly sorted by Primary Key ($u64$ or $u128$), the VM advances dual pointers across Region PK. Intersection triggers the multiset cross-product of all row payloads associated with that specific Primary Key. The VM leverages 16-byte alignment of $u128$ keys to use native SIMD comparisons where applicable.
+### 8.3. Incremental Join Semantics
+Relational joins are lowered into `JOIN_DELTA_TRACE` instructions. Because the engine supports multisets, the join performs an $N \times M$ cross-product for matching Primary Keys ($u64$ or $u128$).
+*   **Weight Multiplication:** The resulting weight is the product of input weights ($w_{out} = w_\Delta \times w_T$).
+*   **Key-Type Specialization:** The VM selects specialized kernels for 64-bit or 128-bit keys to utilize native CPU comparison instructions.
+*   **Indexed Seek:** The operator leverages the `seek()` capability of the `UnifiedCursor` to perform Index-Nested-Loop Joins (INLJ), preventing full table scans for sparse deltas.
 
-### 8.4. Materialization Barriers and the Ghost Property
+### 8.4. Aggregation and Group-By (`REDUCE`)
+Aggregations utilize **Full-Row Semantic Equality**.
+*   **Coalescing:** The operator advances the `UnifiedCursor` across the Trace, grouping records by Primary Key and the equality of all specified Group-By columns.
+*   **German String Contentment:** The VM follows German String offsets into Region B to ensure content-based grouping rather than binary-offset grouping for variable-length data.
+
+### 8.5. Materialization Barriers and the Ghost Property
 The VM enforces the **Ghost Property** via materialization barriers that guard access to non-PK columns.
 *   **Weight-Gated Execution:** The VM inspects the algebraic weight in Region W before executing scalar logic, row comparisons, or column fetches.
-*   **Annihilation Bypass:** If a record's net weight is zero for a specific row payload group, the VM elides all fetches for column regions ($C_i$) and the shared blob heap (Region B). This prevents pipeline stalls and ensures that annihilated data never occupies CPU cache lines.
+*   **Annihilation Bypass:** If a record's net weight is zero, the VM elides all fetches for column regions ($C_i$) and the shared blob heap (Region B). This ensures that annihilated "Ghost" data never occupies CPU cache lines or triggers unnecessary I/O.
 
-### 8.5. Unified Output Serialization
-The terminal `EMIT` instruction handles result propagation. Finalized Z-Set deltas are appended directly to the **Unified Z-Set WAL**. Circuit outputs can be fed back into the MemTable ingestion layer, where they are treated as new ingestion batches. This enables recursive DBSP transformations and fixed-point iteration within a single LSN epoch.
-
-### 8.6. JIT-Specialized VM Instructions
-The RPython JIT specializes VM instructions based on the `TableSchema` associated with the registers.
-*   **Stride Specialization:** The JIT promotes column offsets from the **Column Directory** to constants, specializing the address arithmetic for `MAP` and `FILTER` operations.
-*   **Key-Type Specialization:** Instructions are specialized for $u64$ or $u128$ Primary Keys to utilize the most efficient native comparison instructions for the underlying hardware.
+### 8.6. JIT Specialization via VMSchema Registry
+The RPython Meta-Tracing JIT optimizes the circuit execution based on the `VMSchema` associated with each register.
+*   **Metadata Promotion:** The `VMSchema` registry freezes column offsets, strides, and types as JIT-immutable constants. This allows the JIT to fold address arithmetic into immediate machine instructions.
+*   **Scalar Inlining:** User-defined `ScalarFunction` implementations are inlined directly into the trace. The JIT specializes the map/filter logic for the physical layout of the input `ZSetBatch`, eliminating the overhead of dynamic field lookups.
+*   **Loop Unrolling:** For small, fixed-width schemas, the JIT unrolls the columnar iteration, enabling vectorized loads and SIMD-optimized comparison kernels.
 
 ## 9. Distribution and Concurrency Model
 
@@ -432,466 +449,63 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
 *   **Write-Heavy Tiers:** Minimizes ingestion stalls by allowing higher overlap depth in upper FLSM levels while maintaining row-oriented WAL segments.
 *   **Read-Heavy Guard Shards:** Prioritizes the consolidation of shards into large, non-overlapping N-Partition columnar blocks to maximize binary search performance and minimize the number of `mmap` handles required for snapshot resolution.
 
-# Appendix A: RPython Implementation Patterns and Best Practices
-
-## RPython Engineering Reference
-
-**Designing Code for the RPython Translation Toolchain**
-
-This document is a technical reference for experienced systems developers writing code intended for translation with the RPython toolchain (e.g., for interpreters, VMs, or low-level runtimes). It assumes familiarity with static typing, compiler toolchains, tracing JITs, and low-level runtime design.
-
-RPython is a **statically analyzable subset of Python 2**, designed for whole-program translation to C and optional meta-tracing JIT generation. Code must be predictable under global type inference.
-
-## 1. Architectural Model
-
-### 1.1 Whole-Program Static Analysis
-
-The RPython translator:
-
-* Performs **global type inference** (annotation phase).
-* Assigns a single static type to every variable and container.
-* Specializes code paths based on inferred types.
-* Rejects constructs that prevent inference.
-
-All reachable code is analyzed. Dead code elimination happens *after* annotation, not before.
-
-#### Implications
-
-* No runtime type polymorphism beyond what can be statically inferred.
-* No dynamic structural changes to objects.
-* No dynamic code generation.
-* No runtime metaprogramming.
-
-If the annotator cannot prove a property statically, translation fails.
-
-## 2. Entry Point and Translation Contract
-
-RPython programs are not executed via `__main__`. The toolchain requires a **target function**:
-
-```python
-def entry_point(argv):
-    # Must return int
-    return 0
-
-def target(driver, args):
-    return entry_point, None
-```
-
-Constraints:
-
-* Entry function must accept a list of strings (`argv`).
-* Must return an integer exit code.
-* No side effects at import time that depend on runtime state.
-
-The `target()` function defines the translation root.
-
-## 3. Language Subset Constraints
-
-RPython is Python 2 syntax with strict semantic restrictions.
-
-### 3.1 Disallowed or Severely Restricted
-
-* `eval`, `exec`
-* Dynamic class creation
-* Dynamic function creation
-* `**kwargs` (not supported)
-* Dynamic attribute injection
-* Rebinding globals
-* Mutating prebuilt global containers
-* `set`
-* Most of `inspect`, `threading`, `multiprocessing`
-* Most of the Python stdlib
-
-### 3.2 Allowed but Constrained
-
-* `*args` allowed in definitions, but avoid unless tuple type is statically known.
-* Generators: limited support, avoid complex yield flows.
-* Recursion: allowed but avoid deep recursion in hot paths.
-* Default arguments: supported.
-* Exceptions: supported, but heavy use may impact JIT performance.
-
-## 4. Static Typing Model
-
-### 4.1 Monomorphic Variables
-
-Each variable has a single static type per control-flow merge point.
-
-This fails:
-
-```python
-if cond:
-    x = 1
-else:
-    x = "a"     # incompatible types
-```
-
-This succeeds:
-
-```python
-if cond:
-    x = 1
-else:
-    x = 2
-```
-
-Or:
-
-```python
-class Base(object): pass
-class A(Base): pass
-class B(Base): pass
-
-if cond:
-    x = A()
-else:
-    x = B()
-```
-
-Common base type required.
-
-## 5. Containers
-
-### 5.1 Homogeneous Lists
-
-Lists are statically typed arrays.
-
-Illegal:
-
-```python
-lst = [1, "a"]
-```
-
-Legal:
-
-```python
-lst = [1, 2, 3]
-```
-
-or:
-
-```python
-class Value(object): pass
-class IntValue(Value): ...
-class StrValue(Value): ...
-
-lst = [IntValue(1), StrValue("a")]
-```
-
-Use wrapper objects for heterogeneous logical data.
-
-### 5.2 Dicts
-
-* Keys and values must be statically typed.
-* Use `rpython.rlib.objectmodel.r_dict` for custom equality/hash behavior.
-* No `set` type — emulate via dict or list.
-
-## 6. Function Signatures
-
-Avoid dynamic signatures.
-
-Preferred:
-
-```python
-def f(a, b, c=0):
-    ...
-```
-
-Avoid:
-
-```python
-def f(*args): ...
-def f(**kwargs): ...
-```
-
-If variable-length input is required, use a list with known element type:
-
-```python
-def f(args):  # args is List[int]
-    ...
-```
-
-## 7. Global State
-
-Globals are treated as **constants**.
-
-You cannot:
-
-* Rebind global variables.
-* Mutate prebuilt global containers.
-
-Allowed pattern:
-
-```python
-class State(object):
-    def __init__(self):
-        self.counter = 0
-
-state = State()
-```
-
-Mutate attributes of prebuilt objects, not the binding itself.
-
-## 8. Standard Library and Runtime Environment
-
-Only a small subset of stdlib is usable.
-
-### Generally Safe
-
-* `math`
-* basic `os`
-* `sys`
-* simple string operations
-* list/dict operations
-
-### Preferred
-
-Use RPython libraries:
-
-* `rpython.rlib.rarithmetic`
-* `rpython.rlib.rbigint`
-* `rpython.rlib.objectmodel`
-* `rpython.rlib.jit`
-* `rpython.rlib.rposix`
-* `rpython.rlib.streamio`
-
-Do not assume arbitrary stdlib availability.
-
-## 9. Integer Semantics and Arithmetic
-
-Python `int` behaves differently pre- and post-translation.
-
-### 9.1 Signed Integers
-
-RPython `int`:
-
-* Before translation: arbitrary precision (Python long)
-* After translation: C `long` with wraparound
-
-Use:
-
-```python
-from rpython.rlib.rarithmetic import ovfcheck, intmask
-```
-
-* `ovfcheck(x + y)` forces overflow detection.
-* `intmask(x)` truncates to machine word.
-
-### 9.2 Unsigned and Fixed-Width Types
-
-Use:
-
-```python
-from rpython.rlib.rarithmetic import r_uint
-```
-
-For:
-
-* Bit manipulation
-* Binary serialization
-* Checksums
-* Protocol parsing
-
-`r_uint` maps to native unsigned type.
-
-Do not rely on Python arbitrary precision semantics.
-
-### 9.3 128-bit Integers and Frozen Type Constructors**
-
-* **Naming:** RPython does not provide a standard alias named `r_uint128`. 128-bit integers are natively supported as `r_ulonglonglong` (unsigned) and `r_longlonglong` (signed).
-*   **The Constructor Trap:** Built-in Python type descriptors (like `int`, `long`, `float`, `str`) are "frozen" in RPython. You **cannot** call them as functions (e.g., `x = long(y)`). This results in a `FrozenDesc` error.
-*   **Correct Conversion:** Use RPython's specialized casting functions or the `@specialize.argtype` pattern to convert between primitive types.
-
-### 9.4 The Prebuilt Long Trap**
-
-RPython cannot "freeze" Python `long` objects into the translated binary. If you use an integer literal that exceeds the target machine's signed word size (e.g., `0xFFFFFFFFFFFFFFFF` on a 64-bit system), Python 2.7 interprets this as a `long` object. 
-
-**Symptoms:** Translation fails with `ValueError: seeing a prebuilt long`.
- 
-**Correction:** 
-*   Do not use large literals directly. 
-*   Instead, use bitwise manipulation or signed-to-unsigned casting of smaller, safe constants.
-*   *Example:* Use `r_uint64(-1)` to generate `0xFFFFFFFFFFFFFFFF` natively, or `(r_uint128(hi) << 64) | lo`.
-
-## 10. Object Model Discipline
-
-* Define all classes at import time.
-* No monkey-patching.
-* No dynamic method injection.
-* Class attributes must be statically inferable.
-* Avoid `__getattr__`, dynamic descriptors.
-
-Keep class hierarchies simple.
-
-## 11. Memory and Allocation Discipline
-
-Every allocation is visible to the annotator.
-
-Avoid:
-
-* Excess object churn in hot loops.
-* Creating temporary objects inside tracing loops.
-* Boxing/unboxing primitives in tight paths.
-
-Split APIs:
-
-* High-level layer: object-based.
-* Low-level core: primitive types and raw buffers.
-
-## 12. Designing for the Meta-Tracing JIT
-
-The RPython JIT traces interpreter loops.
-
-### 12.1 Write Trace-Friendly Code
-
-Prefer:
-
-* Simple `while` / `for` loops
-* Scalar variables
-* Explicit indexing
-
-Avoid:
-
-* Complex iterators
-* Deep call chains in hot paths
-* Excessive exception-driven control flow
-* Complex comprehensions
-
-### 12.2 Hot Loop Structure
-
-The JIT works best when:
-
-* There is a clear interpreter loop.
-* Loop state is explicit.
-* State variables are primitive types.
-
-Avoid hiding the dispatch loop inside abstractions.
-
-## 13. Error Handling
-
-Exceptions are supported but:
-
-* Costly in hot paths.
-* Increase trace complexity.
-
-Prefer:
-
-* Error codes in tight loops.
-* Exceptions at API boundaries.
-
-## 14. Testing Strategy
-
-* Unit tests may run under CPython.
-* Always test translation regularly.
-* Many constructs pass CPython but fail annotation.
-
-## 15. Python Version Constraints
-
-RPython is Python 2–based.
-
-* Use Python 2.7-compatible syntax.
-* Avoid Python 3 features.
-
-## 16. Common Failure Modes
-
-* Variable inferred as incompatible types.
-* List element type instability.
-* Globals mutated incorrectly.
-* Unsupported stdlib import.
-* Dynamic attribute creation.
-* Type narrowing across control flow.
-* Hidden object allocations in loops.
-* Closures can't be traced by RPython.
-* Missing JIT hints for fixed small loops.
-* Calling `long()` or `int()` as a function (use RLib arithmetic or specialized helpers instead).
-* Calling `.append()` on a list attribute after it has been hinted as immutable.
-* String Nullability Mismatch: Passing a string inferred as `SomeString(can_be_None=True)` (e.g., from `os.read` or a global) to a function expecting `SomeString(can_be_None=False)` (like `rffi.str2charp`). Use `rposix.read` or an explicit `assert x is not None` to narrow the type.
-* EBADF (Bad File Descriptor): Double-closing a file descriptor in a `try...except` block where the error-raising path already performed a cleanup.
-* String Nullability Mismatch Passing a string inferred as `SomeString(can_be_None=True)` (e.g., from `os.read` or a global) to a function expecting `SomeString(can_be_None=False)` (like `rffi.str2charp`). Use `rposix.read` or an explicit `assert x is not None` to narrow the type.
-* Calling `long()` or `int()` as a function: Use RLib arithmetic or specialized helpers instead.
-* EBADF (Bad File Descriptor): Double-closing a file descriptor in a `try...except` block where the error-raising path already performed a cleanup.
-* Calling `.append()` on a list attribute after it has been hinted as immutable.
-* `for i in range(x)` loops can lead to excessive loop unrolling, which can lead to compilation errors. `i = 0; while i < len(x); ...; i += 1`-style loops don't blow up.
-
-## 17. Recommended Design Patterns
-
-### 17.1 Value Object Pattern
-
-For heterogeneous logical data:
-
-* Define base class.
-* Subclass per concrete type.
-* Store homogeneous list of base type.
-
-### 17.2 Explicit State Object
-
-Avoid global mutation; use a singleton state object.
-
-### 17.3 Layered API
-
-* Public API: object-oriented, safe.
-* Internal engine: flat, primitive-heavy.
-
-### 17.4 Table-Driven Dispatch
-
-Use fixed arrays or tuples of callables.
-
-If iterating over *small fixed* collections:
-
-```python
-for field in jit.unrolling_iterable(FIELDS):
-    ...
-```
-
-## 18. Advanced RPython I/O and Type Safety
-
-18.1 Use `rposix` over `os` for I/O**
-Standard `os.read` and `os.write` are often wrapped by the annotator in a way that introduces nullability. For low-level memory operations:
-*   Use `rpython.rlib.rposix.read(fd, count)`: It is guaranteed to return a non-nullable string.
-*   Use `rpython.rlib.rposix_stat.stat(path)` and `fstat(fd)`: These return a `stat_result` with strictly typed fields (e.g., `st_ino` as a fixed-width integer), avoiding C-level signed/unsigned comparison warnings.
-
-#### 18.2 The Atomic Resource Initialization Pattern
-To prevent runtime segfaults and resource leaks during initialization failures:
-1.  Initialize the object attribute (e.g., `self.fd`) to a "safe" null value (`-1`).
-2.  Open the resource to a **local variable** first.
-3.  Perform all potentially failing operations (stat, header validation).
-4.  Assign the local variable to `self.fd` only as the final step.
-5.  In the `except` block, close the **local variable** if it's valid.
-
-### 18.3 Inode and Size Consistency
-Always cast `st_ino` and `st_size` to fixed-width types (e.g., `rffi.ULONGLONG`) immediately after a `stat` call if they are to be stored for comparison or cross-process synchronization. This prevents annotation errors where one code path treats an inode as a Python `int` and another as a C `long`.
-
-### 18.4 Scoped FFI Pointers (RAII)
-Avoid manual `rffi.str2charp` and `rffi.free_charp` pairs. They are prone to leaks in error paths. Use the RPython context manager:
-
-```python
-from rpython.rtyper.lltypesystem import rffi
- 
-with rffi.scoped_str2charp(my_string) as ptr:
-    # ptr is guaranteed non-null and valid only in this block
-    do_c_call(ptr)
-# ptr is automatically freed here, even if an exception occurs
-```
-
-#### 18.5 Union Type Avoidance (The Null Object Pattern)
-Avoid `List[Optional[T]]`. RPython's C-generator may segfault trying to resolve the union types in unrolled loops. Instead of using `None`, define a `NULL_INSTANCE` of your class that implements the same interface with empty methods. This keeps the list homogeneous and simplifies the translator's flow graph.
-
-#### 18.6 Pointer Sanity
-Never pass an unvalidated file descriptor to an `rffi` function. Always check `if fd < 0`. When checking `mmap` results, cast the pointer to `rffi.SIZE_T` to compare against `-1` safely across different RPython integer representations.X
-
-### Summary
-
-When writing RPython:
-
-* Think statically.
-* Think monomorphically.
-* Think in fixed-width integers.
-* Think in homogeneous containers.
-* Think in explicit control flow.
-* Think in interpreter loops.
-* Guide the JIT intentionally.
-* Avoid dynamic Python idioms.
-
-## Appendix B: Coding practices
+# Appendix A: RPython Implementation Reference
+
+**Target:** Systems developers.
+**Context:** RPython is a statically analyzable subset of Python 2.7 that translates to C with a Meta-Tracing JIT.
+
+## 1. The Translation Contract
+*   **Global Type Inference:** The annotator analyzes all reachable code. Every variable must have a single, static type (Monomorphism) per control-flow merge point.
+*   **Entry Point:** Do not use `__main__`. Define a target function:
+    ```python
+    def entry_point(argv): return 0 # Must return int
+    def target(driver, args): return entry_point, None
+    ```
+*   **Dead Code:** Elimination occurs *after* annotation. Unreachable code that violates type constraints will still cause translation failure.
+
+## 2. Language Subset & Restrictions
+*   **Banned:** `eval`, `exec`, dynamic class/function creation, runtime metaprogramming, `**kwargs`, `set` (use `dict` keys), multiple inheritance (mostly), re-binding globals.
+*   **Restricted:** Generators (simple iteration only), Recursion (avoid in hot paths), Exceptions (expensive in JIT).
+*   **Globals:** Treated as immutable `const` after initialization. Do not mutate global module state; use a Singleton `State` class instance passed via `entry_point`.
+
+## 3. Type System & Containers
+*   **Lists:** Strictly homogeneous. `[1, "a"]` is illegal. Use a base class wrapper for heterogeneous data.
+*   **Dicts:** Keys and values must be statically typed.
+*   **Signatures:** Avoid `*args` unless the tuple layout is static. Prefer `List[T]` for variable arguments.
+*   **None/Null:** Variables can be `Optional[T]`. However, mixing `T` and `None` in a list can confuse the annotator (Union types). Prefer the Null Object pattern over `None` in containers.
+
+## 4. Integer Semantics (Critical)
+*   **Semantics:** Python `int`/`long` translate to C `long` (machine word).
+*   **Overflow:** Standard math uses C semantics (wraps or overflows).
+    *   Use `rpython.rlib.rarithmetic.ovfcheck(x+y)` to catch overflow.
+    *   Use `intmask(x)` to force truncation to machine word.
+*   **Unsigned:** Use `r_uint` for bitwise ops/checksums.
+*   **128-bit:** Natively supported via `r_ulonglonglong`. **Warning:** RPython types (`int`, `long`) are "frozen" descriptors. **Never** cast via `long(x)`; use specialized casting helpers.
+*   **Prebuilt Long Trap:** Do not use literals > `sys.maxint` (e.g., `0xFFFFFF...`). Python 2 creates a `long` object, which cannot be frozen into the binary. Use `r_uint(-1)` or bit-shifts.
+
+## 5. Memory & FFI
+*   **Allocations:** Visible to the annotator. Avoid object churn in loops.
+*   **FFI:** Use `rpython.rtyper.lltypesystem.rffi`.
+    *   **RAII:** Use `with rffi.scoped_str2charp(s) as ptr:` to prevent leaks.
+    *   **Pointers:** Always validate `fd < 0` or `ptr` nullability.
+*   **I/O:** Avoid `os.read`/`write`. They introduce nullability ambiguity (`SomeString(can_be_None=True)`).
+    *   Use `rpython.rlib.rposix.read`: Returns non-nullable string.
+    *   Use `rposix_stat`: Returns strictly typed structs (fixed-width `st_ino`/`st_size`), preventing C-signedness warnings.
+
+## 6. JIT Optimization Guidelines
+*   **Control Flow:** Keep hot loops simple (`while/for`). The JIT traces the interpreter loop; obscure control flow breaks the trace.
+*   **Virtualizables:** Use `jit.promote()` on values that are effectively constant within a specific trace (e.g., Schema strides) to compile them as immediates.
+*   **Unrolling:** Use `jit.unrolling_iterable` for loops over small, fixed lists (e.g., column schemas).
+*   **Immutable Hinting:** Mark arrays/lists as immutable if they don't change after initialization to allow JIT constant folding.
+
+## 7. Common Failure Modes
+1.  **Monomorphism Violation:** `x = 1` then `x = "a"`.
+2.  **FrozenDesc:** Calling `int()` or `long()` as functions on RPython primitives.
+3.  **Prebuilt Long:** Using large integer literals directly.
+4.  **Nullability Mismatch:** Passing a potentially `None` string (from `os`) to a function expecting strict `str` (like `rffi`).
+5.  **List Mutation:** Calling `.append()` on a list previously hinted as immutable.
+
+# Appendix B: Coding practices
 
 * Code should be formatted how the tool `black` would do it. If you change a file with bad formatting, fix the formatting carefully.
 * Attributes, methods and functions starting with underscore (`_`) are considered private. They should not be used by code outside the class/module, not even by tests. If you encounter a test using a private method, fix it by either making it use a public attribute/method/function, or remove it entirely.
