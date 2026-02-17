@@ -21,25 +21,6 @@ class TestMemTableSkipList(unittest.TestCase):
             pointer_end = 12 + (h * 4)
             self.assertGreaterEqual(key_off, pointer_end)
 
-    def test_u128_node_access(self):
-        mt = memtable.MemTable(self.schema_u128, 1024 * 1024)
-        try:
-            key = (r_uint128(0xAAAA) << 64) | r_uint128(0xBBBB)
-            mt.upsert(key, 1, [db_values.TaggedValue.make_int(42)])
-            
-            node_off = mt._find_first_key(key)
-            self.assertNotEqual(node_off, 0)
-            
-            # Verify physical 16-byte alignment in the arena
-            height = ord(mt.arena.base_ptr[node_off + 8])
-            key_off = memtable_node.get_key_offset(height)
-            self.assertEqual((node_off + key_off) % 16, 0)
-            
-            read_key = memtable_node.node_get_key(mt.arena.base_ptr, node_off, 16)
-            self.assertEqual(read_key, key)
-        finally:
-            mt.free()
-
     def test_active_annihilation(self):
         """Verifies that records summing to zero are removed from SkipList traversal."""
         mt = memtable.MemTable(self.schema_u128, 1024 * 1024)

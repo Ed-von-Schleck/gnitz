@@ -1,6 +1,6 @@
 # gnitz/core/row_logic.py
 
-from gnitz.storage.comparator import compare_rows, RowAccessor
+from gnitz.storage import comparator
 
 """
 Row Logic API: The Storage-VM Boundary.
@@ -26,10 +26,10 @@ Arenas), the VM should use the interfaces defined here.
 #   - -1 if left < right
 #   -  0 if left == right
 #   -  1 if left > right
-compare_records = compare_rows
+compare_records = comparator.compare_rows
 
 
-class BaseRowAccessor(RowAccessor):
+class BaseRowAccessor(comparator.RowAccessor):
     """
     The Abstract Data Accessor.
     
