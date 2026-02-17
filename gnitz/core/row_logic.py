@@ -6,13 +6,36 @@ from gnitz.storage import comparator
 Row Logic API: The Storage-VM Boundary.
 
 This module provides the abstract interfaces and comparison kernels required 
-to implement the DBSP algebra. In DBSP, records with the same Primary Key 
-are further grouped or joined based on the equality of their 'Row Payload' 
-(all non-PK columns).
+to implement the DBSP algebra. 
 
-To maintain the isolation of the VM from storage internals (SkipLists, Shards, 
-Arenas), the VM should use the interfaces defined here.
-"""
+-------------------------------------------------------------------------------
+THE DBSP CURSOR PROTOCOL
+-------------------------------------------------------------------------------
+To participate in VM operations (Joins, Reductions), a Trace Reader must 
+implement the following protocol. This allows the VM to remain decoupled 
+from specific storage layouts (MemTable vs. Shards).
+
+1. Navigation:
+   - seek(key): Positions the cursor at the first record where PK >= key.
+   - advance(): Moves to the next record in the sorted sequence.
+   - is_valid(): Returns True if the cursor is positioned on a valid record.
+
+2. Metadata:
+   - key(): Returns the current 128-bit Primary Key (r_uint128).
+   - weight(): Returns the current algebraic weight (r_int64).
+
+3. Data Extraction:
+   - get_accessor(): Returns an object implementing BaseRowAccessor to 
+     retrieve non-PK column data for the current record.
+
+Example VM Usage:
+    cursor.seek(target_key)
+    if cursor.is_valid() and cursor.key() == target_key:
+        weight = cursor.weight()
+        accessor = cursor.get_accessor()
+        val = accessor.get_int(column_idx)
+-------------------------------------------------------------------------------
+""" 
 
 # Alias for the JIT-optimized comparison function.
 # This function performs a lexicographical comparison of all non-PK columns.
@@ -33,12 +56,8 @@ class BaseRowAccessor(comparator.RowAccessor):
     """
     The Abstract Data Accessor.
     
-    To compare a custom VM structure (like a ZSetBatch) against persistent 
-    storage, the VM must implement a subclass of BaseRowAccessor. 
-    
     The comparison kernel calls these methods to extract primitive values 
     for comparison without needing to know the underlying memory layout 
-    (Row-oriented, Column-oriented, or TaggedValue-list).
     """
 
     def set_row(self, source, index_or_offset):

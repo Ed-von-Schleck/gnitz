@@ -223,16 +223,10 @@ def op_join_delta_trace(reg_delta, reg_trace, reg_out):
         
         # 4. Scan matching keys in Trace
         while trace_cursor.is_valid():
-            t_key = trace_cursor.get_key()
-            
-            # Since both are sorted (locally for cursor), 
-            # if t_key > d_key, we are done with this delta key.
-            # But UnifiedCursor logic might vary. 
-            # Assuming strictly sorted seek:
+            t_key = trace_cursor.key() # Changed from get_key()
             if t_key != d_key:
                 break
-                
-            t_weight = trace_cursor.get_weight()
+            t_weight = trace_cursor.weight() # Changed from get_weight()
             
             # Algebraic Weight Product
             final_weight = d_weight * t_weight
