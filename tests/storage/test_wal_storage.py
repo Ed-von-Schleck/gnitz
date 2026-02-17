@@ -48,3 +48,41 @@ class TestWALStorage(unittest.TestCase):
         writer.truncate_before_lsn(2) 
         self.assertEqual(os.path.getsize(self.wal_path), 0)
         writer.close()
+
+    def test_wal_multi_record_blob_alignment(self):
+        """
+        CRITICAL BUG REPRODUCTION:
+        Writes a block with 2 records. The first has a long string (blob).
+        The decoder must correctly skip the blob to find the second record.
+        """
+        writer = wal.WALWriter(self.wal_path, self.layout)
+        
+        # 1. Long string to force Blob allocation
+        long_str = "A" * 50 
+        rec1 = wal_format.WALRecord.from_key(1, 1, [db_values.TaggedValue.make_string(long_str)])
+        
+        # 2. Short string (Inline)
+        rec2 = wal_format.WALRecord.from_key(2, 1, [db_values.TaggedValue.make_string("short")])
+        
+        # Write both in a single block
+        writer.append_block(100, 1, [rec1, rec2])
+        writer.close()
+
+        # Read back
+        reader = wal.WALReader(self.wal_path, self.layout)
+        blocks = list(reader.iterate_blocks())
+        reader.close()
+        
+        self.assertEqual(len(blocks), 1)
+        decoded_recs = blocks[0].records
+        self.assertEqual(len(decoded_recs), 2)
+        
+        # Verify Record 1
+        self.assertEqual(decoded_recs[0].get_key(), 1)
+        val1 = decoded_recs[0].component_data[0]
+        self.assertEqual(val1.str_val, long_str)
+        
+        # Verify Record 2 (This fails if the decoder offsets are wrong)
+        self.assertEqual(decoded_recs[1].get_key(), 2)
+        val2 = decoded_recs[1].component_data[0]
+        self.assertEqual(val2.str_val, "short")

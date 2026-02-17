@@ -208,6 +208,10 @@ def decode_wal_block(block_ptr, block_len, schema):
     
     rec_idx = 0
     while rec_idx < cnt:
+        # Keep track of the furthest byte used by this record (fixed + blobs)
+        # Initialize to the end of the fixed AoS data.
+        current_rec_max_ptr = rffi.ptradd(curr_ptr, key_size + 8 + stride)
+        
         pk_lo = rffi.cast(rffi.ULONGLONGP, curr_ptr)[0]
         pk_hi = r_uint64(0)
         if is_u128:
@@ -218,7 +222,7 @@ def decode_wal_block(block_ptr, block_len, schema):
         curr_ptr = rffi.ptradd(curr_ptr, 8)
 
         p_ptr = curr_ptr
-        curr_ptr = rffi.ptradd(curr_ptr, stride)
+        # Do not advance curr_ptr immediately by stride; we use p_ptr for column access.
         
         field_values = [None] * num_payload_fields
         val_idx = 0
@@ -232,10 +236,23 @@ def decode_wal_block(block_ptr, block_len, schema):
                 if col_def.field_type == types.TYPE_STRING:
                     # In the WAL, the 'heap_base_ptr' is the start of the current BLOCK.
                     # The offsets stored in the struct are absolute from block start.
-                    val = db_values.TaggedValue.make_string(
-                        string_logic.unpack_string(fptr, block_ptr)
-                    )
+                    s_val = string_logic.unpack_string(fptr, block_ptr)
+                    val = db_values.TaggedValue.make_string(s_val)
+                    
+                    # FIX: Track overflow data for next record alignment
+                    # Unpack struct to check for blob offset
+                    u32_ptr = rffi.cast(rffi.UINTP, fptr)
+                    length = rffi.cast(lltype.Signed, u32_ptr[0])
+                    if length > string_logic.SHORT_STRING_THRESHOLD:
+                        u64_payload_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(fptr, 8))
+                        offset = rffi.cast(lltype.Signed, u64_payload_ptr[0])
+                        # offset is absolute from block_ptr
+                        blob_end_ptr = rffi.ptradd(block_ptr, offset + length)
                         
+                        # Note: We compare pointers cast to Signed to handle address arithmetic
+                        if rffi.cast(lltype.Signed, blob_end_ptr) > rffi.cast(lltype.Signed, current_rec_max_ptr):
+                            current_rec_max_ptr = blob_end_ptr
+
                 elif col_def.field_type == types.TYPE_F64:
                     f_val = float(rffi.cast(rffi.DOUBLEP, fptr)[0])
                     val = db_values.TaggedValue.make_float(f_val)
@@ -253,9 +270,14 @@ def decode_wal_block(block_ptr, block_len, schema):
                 val_idx += 1
             i += 1
         
-        # Align cursor to the next record start
-        cons = rffi.cast(lltype.Signed, curr_ptr) - rffi.cast(lltype.Signed, body_ptr)
-        curr_ptr = rffi.ptradd(body_ptr, align_8(cons))
+        # Calculate the consumed bytes relative to the body start
+        consumed_bytes = rffi.cast(lltype.Signed, current_rec_max_ptr) - rffi.cast(lltype.Signed, body_ptr)
+        
+        # Align to 8 bytes (matching writer logic)
+        aligned_bytes = align_8(consumed_bytes)
+        
+        # Set curr_ptr for the next record
+        curr_ptr = rffi.ptradd(body_ptr, aligned_bytes)
         
         records[rec_idx] = WALRecord(pk_lo, pk_hi, weight, field_values)
         rec_idx += 1
