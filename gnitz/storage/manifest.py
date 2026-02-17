@@ -4,35 +4,12 @@ from rpython.rlib import rposix, rposix_stat
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage import errors, mmap_posix, layout
+from gnitz.storage.metadata import ManifestEntry
 
 MAGIC_NUMBER = r_uint64(0x4D414E49464E5447)
 VERSION = 2
 HEADER_SIZE = 64
 ENTRY_SIZE = 184 
-
-class ManifestEntry(object):
-    """Authoritative shard metadata record."""
-    _immutable_fields_ = [
-        'table_id', 'shard_filename', 'pk_min_lo', 'pk_min_hi', 
-        'pk_max_lo', 'pk_max_hi', 'min_lsn', 'max_lsn'
-    ]
-    def __init__(self, table_id, shard_filename, min_key, max_key, min_lsn, max_lsn):
-        self.table_id = table_id
-        self.shard_filename = shard_filename
-        mk = r_uint128(min_key)
-        xk = r_uint128(max_key)
-        self.pk_min_lo = r_uint64(mk)
-        self.pk_min_hi = r_uint64(mk >> 64)
-        self.pk_max_lo = r_uint64(xk)
-        self.pk_max_hi = r_uint64(xk >> 64)
-        self.min_lsn = r_uint64(min_lsn)
-        self.max_lsn = r_uint64(max_lsn)
-
-    def get_min_key(self):
-        return (r_uint128(self.pk_min_hi) << 64) | r_uint128(self.pk_min_lo)
-    
-    def get_max_key(self):
-        return (r_uint128(self.pk_max_hi) << 64) | r_uint128(self.pk_max_lo)
 
 def _write_manifest_header(fd, count, max_lsn):
     """Writes the 64-byte Manifest authority header."""
@@ -175,3 +152,21 @@ class ManifestManager(object):
             mmap_posix.fsync_c(fd)
         finally: rposix.close(fd)
         os.rename(tmp, self.path)
+
+class ManifestWriter(object):
+    def __init__(self, filename, global_max_lsn=r_uint64(0)):
+        self.filename = filename
+        self.global_max_lsn = global_max_lsn
+        self.entries = []
+
+    def add_entry(self, tid, fn, min_k, max_k, min_l, max_l):
+        self.entries.append(ManifestEntry(tid, fn, min_k, max_k, min_l, max_l))
+
+    def add_entry_obj(self, entry):
+        self.entries.append(entry)
+
+    def add_entry_values(self, tid, fn, min_k, max_k, min_l, max_l):
+        self.add_entry(tid, fn, min_k, max_k, min_l, max_l)
+
+    def finalize(self):
+        ManifestManager(self.filename).publish_new_version(self.entries, self.global_max_lsn)

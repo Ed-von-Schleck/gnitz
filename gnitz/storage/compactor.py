@@ -4,7 +4,7 @@ import os
 from rpython.rlib import jit
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask
-from gnitz.storage import shard_table, writer_table, tournament_tree, comparator, manifest, index
+from gnitz.storage import shard_table, writer_table, tournament_tree, comparator, index
 from gnitz.core import types
 
 def merge_row_contributions(active_cursors, schema):
@@ -152,15 +152,9 @@ def execute_compaction(shard_index, manifest_mgr, output_dir=".", validate_check
         # 3. Update the Index (Atomically replaces handles, closes mmaps, releases locks)
         shard_index.replace_handles(input_files, new_handle)
         
-        # 4. Update the Manifest Authority
-        meta_list = shard_index.get_metadata_list()
-        manifest_entries = []
-        for meta in meta_list:
-            manifest_entries.append(manifest.ManifestEntry(
-                meta.table_id, meta.filename, meta.get_min_key(), meta.get_max_key(),
-                meta.min_lsn, meta.max_lsn
-            ))
-        manifest_mgr.publish_new_version(manifest_entries, true_max_lsn)
+        # 4. Update the Manifest Authority.
+        # get_metadata_list() now returns ManifestEntry objects directly.
+        manifest_mgr.publish_new_version(shard_index.get_metadata_list(), true_max_lsn)
         
         # 5. Cleanup physical files
         for f_path in input_files:

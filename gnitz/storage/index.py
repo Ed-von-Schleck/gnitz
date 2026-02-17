@@ -1,32 +1,8 @@
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from gnitz.storage import shard_table, manifest, errors
-
-class ShardMetadata(object):
-    """AUTHORITATIVE DESCRIPTOR: Physical bounds and identity of a shard."""
-    _immutable_fields_ = [
-        'filename', 'table_id', 'min_key_lo', 'min_key_hi', 
-        'max_key_lo', 'max_key_hi', 'min_lsn', 'max_lsn'
-    ]
-    
-    def __init__(self, filename, table_id, min_key, max_key, min_lsn, max_lsn):
-        self.filename = filename
-        self.table_id = table_id
-        mk = r_uint128(min_key)
-        xk = r_uint128(max_key)
-        self.min_key_lo = r_uint64(mk)
-        self.min_key_hi = r_uint64(mk >> 64)
-        self.max_key_lo = r_uint64(xk)
-        self.max_key_hi = r_uint64(xk >> 64)
-        self.min_lsn = min_lsn
-        self.max_lsn = max_lsn
-
-    def get_min_key(self):
-        return (r_uint128(self.min_key_hi) << 64) | r_uint128(self.min_key_lo)
-
-    def get_max_key(self):
-        return (r_uint128(self.max_key_hi) << 64) | r_uint128(self.max_key_lo)
+from gnitz.storage import shard_table, errors
+from gnitz.storage.metadata import ManifestEntry
 
 
 class ShardHandle(object):
@@ -134,13 +110,18 @@ class ShardIndex(object):
             self.needs_compaction = False
 
     def get_metadata_list(self):
-        """Produces a list of Metadata objects for Manifest/Compactor use."""
+        """Produces a list of ManifestEntry objects for Manifest/Compactor use."""
         meta_list = []
         for h in self.handles:
-            # Reconstruct metadata from the active handle state
-            meta_list.append(ShardMetadata(
-                h.filename, self.table_id, h.get_min_key(), h.get_max_key(), 
-                h.min_lsn, h.lsn
+            # Note: ManifestEntry takes (table_id, shard_filename, ...) 
+            # whereas the old ShardMetadata took (filename, table_id, ...)
+            meta_list.append(ManifestEntry(
+                self.table_id,
+                h.filename, 
+                h.get_min_key(), 
+                h.get_max_key(), 
+                h.min_lsn, 
+                h.lsn
             ))
         return meta_list
 
@@ -154,6 +135,8 @@ class ShardIndex(object):
 
 def index_from_manifest(manifest_path, table_id, schema, ref_counter, validate_checksums=False):
     """Factory to initialize an Index from a Manifest file."""
+    from gnitz.storage import manifest
+    
     idx = ShardIndex(table_id, schema, ref_counter)
     reader = manifest.ManifestReader(manifest_path)
     try:

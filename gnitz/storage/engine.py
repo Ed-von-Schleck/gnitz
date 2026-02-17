@@ -8,7 +8,7 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage.memtable import MemTable
 from gnitz.storage.memtable_node import node_get_weight
 from gnitz.storage.wal_format import WALRecord
-from gnitz.storage import wal, manifest, index, comparator
+from gnitz.storage import wal, index, comparator
 from gnitz.core import types, values
 
 class Engine(object):
@@ -75,19 +75,16 @@ class Engine(object):
         
         # 1. Write-Ahead Log (Durability)
         if self.wal_writer:
-            # Note: WALRecord logic will be updated in next steps to handle TaggedValue
             rec = WALRecord.from_key(key, weight, field_values)
             self.wal_writer.append_block(lsn, self.table_id, [rec])
             
         # 2. Update In-Memory State (Visibility)
-        # MemTable.upsert signature updated to accept List[TaggedValue]
         self.active_table.upsert(r_uint128(key), weight, field_values)
 
     def recover_from_wal(self, filename):
         """Reconstructs MemTable state by replaying Z-Set deltas from the WAL."""
         try:
             reader = wal.WALReader(filename, self.schema)
-            # We ignore any WAL entries covered by the Manifest (snapshot)
             max_lsn_seen = self.current_lsn - r_uint64(1)
             last_recovered_lsn = max_lsn_seen
             
@@ -96,7 +93,6 @@ class Engine(object):
                 if block is None: 
                     break
                 
-                # Filter by Table ID and LSN > Manifest.MaxLSN
                 if block.tid != self.table_id: 
                     continue
                 if block.lsn <= max_lsn_seen: 
@@ -104,11 +100,8 @@ class Engine(object):
                 
                 last_recovered_lsn = block.lsn
                 for rec in block.records:
-                    # Records recovered from WAL already contain List[TaggedValue]
-                    # after the wal_format logic is updated.
                     self.active_table.upsert(rec.get_key(), rec.weight, rec.component_data)
             
-            # Advance the global clock to the next available LSN
             self.current_lsn = last_recovered_lsn + r_uint64(1)
             reader.close()
         except OSError as e:
@@ -127,17 +120,14 @@ class Engine(object):
         mem_weight = 0
         table = self.active_table
         
-        # MemTable accessor optimized for SkipList nodes
         match_off = table._find_exact_values(key, field_values)
         if match_off != 0:
             mem_weight = node_get_weight(table.arena.base_ptr, match_off)
 
         # 2. Check persistent layer (ShardIndex)
         spine_weight = 0
-        # The index prunes shards by Min/Max PK before doing binary search
         results = self.index.find_all_shards_and_indices(key)
         
-        # Setup reusable accessors for comparison
         self.value_accessor.set_row(field_values)
         is_u128 = self.schema.get_pk_column().field_type.size == 16
         
@@ -145,8 +135,6 @@ class Engine(object):
             curr_idx = start_idx
             view = shard_handle.view
             
-            # Shards may contain multiple payloads per PK.
-            # Scan consecutive entries matching the PK.
             while curr_idx < view.count:
                 if is_u128:
                     k = view.get_pk_u128(curr_idx)
@@ -156,15 +144,11 @@ class Engine(object):
                 if k != key:
                     break 
                 
-                # Set the SoA accessor for the current row in the shard
                 self.soa_accessor.set_row(view, curr_idx)
                 
-                # Use the unified comparator for full-row semantic equality check.
-                # compare_rows handles both TaggedValue (via ValueAccessor) 
-                # and Columnar data (via SoAAccessor).
                 if comparator.compare_rows(self.schema, self.soa_accessor, self.value_accessor) == 0:
                     spine_weight += shard_handle.view.get_weight(curr_idx)
-                    break # PK+Payload is unique within a single Shard
+                    break
                 
                 curr_idx += 1
                 
@@ -201,33 +185,16 @@ class Engine(object):
             if new_handle.view.count > 0:
                 self.index.add_handle(new_handle)
                 
-                # 3. Synchronize Manifest with the updated Index state
+                # 3. Synchronize Manifest with the updated Index state.
+                # get_metadata_list() now returns ManifestEntry objects directly.
                 if self.manifest_manager:
-                    metadata_entries = self.index.get_metadata_list()
-                    
-                    manifest_entries = []
-                    for meta in metadata_entries:
-                        manifest_entries.append(manifest.ManifestEntry(
-                            meta.table_id,
-                            meta.filename,
-                            meta.get_min_key(),
-                            meta.get_max_key(),
-                            meta.min_lsn,
-                            meta.max_lsn
-                        ))
-                    
+                    manifest_entries = self.index.get_metadata_list()
                     self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
             else:
                 new_handle.close()
                 os.unlink(filename)
                 if self.manifest_manager:
-                    metadata_entries = self.index.get_metadata_list()
-                    manifest_entries = []
-                    for meta in metadata_entries:
-                        manifest_entries.append(manifest.ManifestEntry(
-                            meta.table_id, meta.filename, meta.get_min_key(), meta.get_max_key(),
-                            meta.min_lsn, meta.max_lsn
-                        ))
+                    manifest_entries = self.index.get_metadata_list()
                     self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
 
         # 4. Rotate Memory
