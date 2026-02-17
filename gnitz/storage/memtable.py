@@ -75,26 +75,6 @@ class MemTable(object):
         else:
             rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, all_ones)
 
-    def _find_first_key(self, key):
-        """Locates the first node in the SkipList matching the Primary Key."""
-        base = self.arena.base_ptr
-        curr_off = self.head_off
-        for i in range(MAX_HEIGHT - 1, -1, -1):
-            next_off = node_get_next_off(base, curr_off, i)
-            while next_off != 0:
-                next_key = node_get_key(base, next_off, self.key_size)
-                if next_key < key:
-                    curr_off = next_off
-                else:
-                    break
-                next_off = node_get_next_off(base, curr_off, i)
-        
-        match_off = node_get_next_off(base, curr_off, 0)
-        if match_off != 0:
-            if node_get_key(base, match_off, self.key_size) == key:
-                return match_off
-        return 0
-
     def _find_exact_values(self, key, field_values):
         """
         Locates the specific node matching both the Primary Key AND the payload.

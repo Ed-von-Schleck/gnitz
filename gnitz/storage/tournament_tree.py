@@ -4,8 +4,6 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
-# REMOVED: from gnitz.storage.cursor import ShardCursor
-
 HEAP_NODE = lltype.Struct("HeapNode", 
     ("key_low", rffi.ULONGLONG),
     ("key_high", rffi.ULONGLONG),

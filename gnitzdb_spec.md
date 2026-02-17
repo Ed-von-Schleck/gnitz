@@ -895,5 +895,5 @@ When writing RPython:
 
 * Code should be formatted how the tool `black` would do it. If you change a file with bad formatting, fix the formatting carefully.
 * Attributes, methods and functions starting with underscore (`_`) are considered private. They should not be used by code outside the class/module, not even by tests. If you encounter a test using a private method, fix it by either making it use a public attribute/method/function, or remove it entirely.
-* When fixing a problem, don't leave code comments like `# FIXED: ...`. Code comments are not for documenting change, git commit messages are.
-* Prefer module-level functions to staticmethods
+* When fixing a problem, don't leave code comments like `# FIXED: ...` or `# REMOVED: ...` or similar. Code comments are not for documenting change.
+* Prefer module-level functions to staticmethods.
