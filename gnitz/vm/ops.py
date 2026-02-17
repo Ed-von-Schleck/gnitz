@@ -1,5 +1,7 @@
+# gnitz/vm/ops.py
+
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, r_uint64
+from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask # Added intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, values, row_logic, strings
@@ -13,20 +15,8 @@ from gnitz.vm import batch
 def materialize_row(accessor, schema):
     """
     Extracts a full row from a RowAccessor and boxes it into a list of TaggedValues.
-    Used when moving data from a Cursor (Storage) to a Batch (VM).
-    
-    Args:
-        accessor: row_logic.BaseRowAccessor (Cursor or BatchAccessor)
-        schema: TableSchema
-    
-    Returns:
-        List[TaggedValue] containing non-PK columns.
     """
     result = []
-    # Columns in accessor are indexed physically.
-    # We must skip the PK column if it's stored in the payload part, 
-    # but BaseRowAccessor usually abstracts purely based on column index.
-    # The TableSchema defines the columns.
     
     for i in range(len(schema.columns)):
         if i == schema.pk_index:
@@ -44,7 +34,7 @@ def materialize_row(accessor, schema):
            type_code == types.TYPE_I8.code or \
            type_code == types.TYPE_U8.code:
             val = accessor.get_int(i)
-            result.append(values.TaggedValue.make_int(r_int64(val)))
+            result.append(values.TaggedValue.make_int(intmask(val)))
             
         elif type_code == types.TYPE_F64.code or \
              type_code == types.TYPE_F32.code:
@@ -52,26 +42,18 @@ def materialize_row(accessor, schema):
             result.append(values.TaggedValue.make_float(val))
             
         elif type_code == types.TYPE_STRING.code:
-            # get_str_struct returns (len, prefix, struct_ptr, heap_ptr, py_str)
-            # We need to extract the actual string content.
             meta = accessor.get_str_struct(i)
-            # meta[4] is the python string if available (from Batch)
-            # meta[2] is struct_ptr, meta[3] is heap_ptr (from Storage)
-            
             s_val = meta[4]
             if s_val is None:
-                # Reconstruct from raw pointers
                 s_val = strings.unpack_string(meta[2], meta[3])
-            
             result.append(values.TaggedValue.make_string(s_val))
             
         elif type_code == types.TYPE_U128.code:
-             # U128 in payload is currently stored as int64 for TaggedValue simplicity
              val_u128 = accessor.get_u128(i)
-             result.append(values.TaggedValue.make_int(r_int64(val_u128)))
+             # FIX: Use intmask instead of r_int64 to satisfy RPython cast rules
+             result.append(values.TaggedValue.make_int(intmask(val_u128)))
              
         else:
-            # Fallback / Null
             result.append(values.TaggedValue.make_null())
             
     return result
