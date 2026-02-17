@@ -2,7 +2,7 @@
 import unittest
 import os
 from gnitz.core import types, values as db_values
-from gnitz.storage import writer_table, shard_table, tournament_tree
+from gnitz.storage import writer_table, shard_table, tournament_tree, cursor
 
 class TestCompactionMerge(unittest.TestCase):
     def setUp(self):
@@ -32,8 +32,8 @@ class TestCompactionMerge(unittest.TestCase):
         v1 = shard_table.TableShardView(s1, self.layout)
         v2 = shard_table.TableShardView(s2, self.layout)
         tree = tournament_tree.TournamentTree([
-            tournament_tree.StreamCursor(v1), 
-            tournament_tree.StreamCursor(v2)
+            cursor.ShardCursor(v1), 
+            cursor.ShardCursor(v2)
         ])
         self.assertEqual(tree.get_min_key(), 10)
         tree.advance_min_cursors()
@@ -49,8 +49,8 @@ class TestCompactionMerge(unittest.TestCase):
         v1 = shard_table.TableShardView(s1, self.layout)
         v2 = shard_table.TableShardView(s2, self.layout)
         tree = tournament_tree.TournamentTree([
-            tournament_tree.StreamCursor(v1), 
-            tournament_tree.StreamCursor(v2)
+            cursor.ShardCursor(v1), 
+            cursor.ShardCursor(v2)
         ])
         self.assertEqual(len(tree.get_all_cursors_at_min()), 2)
         tree.close()

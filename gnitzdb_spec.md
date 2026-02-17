@@ -363,7 +363,7 @@ The execution plan is serialized into the VM ISA, with physical constants inject
 *   **Durability Interlock:** Implementation of the strict write-ahead protocol and LSN-based crash recovery to reconstruct MemTable state.
 *   **Binary Manifest System:** Authoritative root-of-truth tracking shard sets, `MinPK/MaxPK` ranges, and `global_max_lsn` with atomic swap mechanics.
 
-### Phase 1.5: Relational Columnar Pivot [COMPLETED / FINALIZING]
+### Phase 1.5: Relational Columnar Pivot [COMPLETED]
 *   **128-bit Key Support:** Integration of `r_uint128` for native Primary Key processing, including 16-byte alignment in Arenas and specialized Tournament Tree comparators.
 *   **N-Partition Shard Format:** Transition from Penta-Partition to a directory-based columnar format. Implementation of the **Column Directory** and variable region mapping.
 *   **Transmutation Pipeline (Unzipping):** Implementation of the AoS-to-SoA converter that demultiplexes MemTable rows into discrete columnar regions ($PK, W, C_1 \dots C_n$).

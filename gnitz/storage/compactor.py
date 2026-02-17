@@ -4,7 +4,7 @@ import os
 from rpython.rlib import jit
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask
-from gnitz.storage import shard_table, writer_table, tournament_tree, comparator, index
+from gnitz.storage import shard_table, writer_table, tournament_tree, comparator, index, cursor
 from gnitz.core import types
 
 def merge_row_contributions(active_cursors, schema):
@@ -68,7 +68,8 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
             filename = input_files[i]
             view = shard_table.TableShardView(filename, schema, validate_checksums=validate_checksums)
             views.append(view)
-            cursors.append(tournament_tree.StreamCursor(view))
+            # Use the new ShardCursor
+            cursors.append(cursor.ShardCursor(view))
             i += 1
         
         # 2. Setup N-way merge via Tournament Tree

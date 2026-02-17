@@ -175,22 +175,35 @@ class TableShardView(object):
         return string_logic.string_equals(ptr, self.blob_buf.ptr, search_str, len(search_str), prefix)
 
     def find_row_index(self, key):
-        """Binary search for a primary key."""
+        """Binary search for the FIRST occurrence of an exact primary key."""
+        idx = self.find_lower_bound(key)
+        if idx < self.count:
+            mid_key = self.get_pk_u128(idx) if self.schema.get_pk_column().field_type.size == 16 else r_uint128(self.get_pk_u64(idx))
+            if mid_key == key:
+                return idx
+        return -1
+
+    def find_lower_bound(self, key):
+        """
+        Binary search for the first row index where ShardKey >= key.
+        Returns self.count if no such key exists.
+        """
         low = 0
         high = self.count - 1
-        res = -1
+        res = self.count
         is_u128 = self.schema.get_pk_column().field_type.size == 16
+
         while low <= high:
             mid = (low + high) // 2
             mid_key = self.get_pk_u128(mid) if is_u128 else r_uint128(self.get_pk_u64(mid))
-            if mid_key == key:
+            
+            if mid_key >= key:
                 res = mid
                 high = mid - 1
-            elif mid_key < key:
-                low = mid + 1
             else:
-                high = mid - 1
+                low = mid + 1
         return res
+
 
     def close(self):
         if self.ptr:

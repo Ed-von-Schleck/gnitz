@@ -1,41 +1,9 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from gnitz.core import types
+from gnitz.storage.cursor import ShardCursor # New Import
 
-class StreamCursor(object):
-    """Iterative pointer into a TableShardView, skipping annihilated ghosts."""
-    _immutable_fields_ = ['view', 'schema', 'is_u128']
-
-    def __init__(self, shard_view):
-        self.view = shard_view
-        self.schema = shard_view.schema
-        self.is_u128 = self.schema.get_pk_column().field_type == types.TYPE_U128
-        self.position = 0
-        self.exhausted = False
-        self._skip_ghosts()
-    
-    def _skip_ghosts(self):
-        while self.position < self.view.count:
-            if self.view.get_weight(self.position) != 0:
-                return
-            self.position += 1
-        self.exhausted = True
-
-    def peek_key(self):
-        if self.exhausted:
-            return r_uint128(-1)
-        if self.is_u128:
-            return self.view.get_pk_u128(self.position)
-        return r_uint128(self.view.get_pk_u64(self.position))
-    
-    def advance(self):
-        if self.exhausted: return
-        self.position += 1
-        self._skip_ghosts()
-    
-    def is_exhausted(self):
-        return self.exhausted
+# StreamCursor class removed from here
 
 # Use a struct for the heap nodes to ensure 8-byte alignment for u64 parts
 # and avoid GC-heap allocation of r_uint128 objects.

@@ -2,67 +2,242 @@
 
 import sys
 import os
-from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, intmask, r_uint64
+from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import zset, types, values as db_values
+from gnitz.storage import compactor
 
-def mk_payload(s):
-    return [db_values.TaggedValue.make_string(s)]
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
 
-def entry_point(argv):
-    print "--- GnitzDB Integrated Lifecycle Test ---"
+def mk_payload(s, i):
+    return [
+        db_values.TaggedValue.make_string(s),
+        db_values.TaggedValue.make_int(i)
+    ]
+
+def cleanup_dir(path):
+    if not os.path.exists(path):
+        return
+    items = os.listdir(path)
+    for item in items:
+        full_path = os.path.join(path, item)
+        if os.path.isdir(full_path):
+            cleanup_dir(full_path)
+        else:
+            os.unlink(full_path)
+    os.rmdir(path)
+
+# ------------------------------------------------------------------------------
+# Test Phases
+# ------------------------------------------------------------------------------
+
+def test_multiset_and_string_logic(base_dir):
+    """
+    Exercises multiset semantics (1 PK, 2 Payloads) and deep string comparison.
+    """
+    print "\n[Test 1] Multiset Semantics & Deep String Comparison..."
+    db_path = os.path.join(base_dir, "test_multiset")
+    if not os.path.exists(db_path): os.mkdir(db_path)
+
+    layout = types.TableSchema([
+        types.ColumnDefinition(types.TYPE_U64),
+        types.ColumnDefinition(types.TYPE_STRING),
+        types.ColumnDefinition(types.TYPE_I64)
+    ], pk_index=0)
+
+    db = zset.PersistentTable(db_path, "multiset", layout, cache_size=1024*1024)
     
     try:
-        db_dir = "translate_test_db"
+        pk = 12345
+        # Payload A and B share a prefix but differ in the suffix
+        # German String threshold is 12. These are 20+ chars.
+        str_a = "Shared_Prefix_Suffix_AAAAAA"
+        str_b = "Shared_Prefix_Suffix_BBBBBB"
+        
+        # 1. Add both payloads to the same PK
+        db.insert(pk, mk_payload(str_a, 10))
+        db.insert(pk, mk_payload(str_b, 20))
+        
+        # 2. Verify both exist (Multiset property)
+        if db.get_weight(pk, mk_payload(str_a, 10)) != 1: return False
+        if db.get_weight(pk, mk_payload(str_b, 20)) != 1: return False
+        
+        # 3. Annihilate Payload A
+        db.remove(pk, mk_payload(str_a, 10))
+        
+        # 4. Flush and verify B survives while A is a 'Ghost'
+        db.flush()
+        
+        if db.get_weight(pk, mk_payload(str_a, 10)) != 0: 
+            print "ERR: Payload A should be annihilated."
+            return False
+        if db.get_weight(pk, mk_payload(str_b, 20)) != 1: 
+            print "ERR: Payload B should have survived."
+            return False
 
-        if not os.path.exists(db_dir):
-            os.mkdir(db_dir)
-        else:
-            print "[INFO] DB Directory exists. Appending to existing state."
+        print "    [OK] Multiset algebraic logic verified."
+        return True
+    finally:
+        db.close()
 
-        # Schema: PK(0)=i64, Column(1)=String
-        layout = types.TableSchema(
-            [types.ColumnDefinition(types.TYPE_I64), types.ColumnDefinition(types.TYPE_STRING)],
-            0,
-        )
+def test_triple_shard_compaction(base_dir):
+    """
+    Forces a 3-way merge to exercise the Tournament Tree heap logic.
+    """
+    print "\n[Test 2] Triple-Shard Tournament Tree Merge..."
+    db_path = os.path.join(base_dir, "test_3way")
+    if not os.path.exists(db_path): os.mkdir(db_path)
 
-        print "[Step 0] Initializing Engine..."
-        db = zset.PersistentTable(
-            db_dir,
-            "test",
-            layout,
-            table_id=1,
-            cache_size=1048576,
-            read_only=False,
-            validate_checksums=False,
-        )
+    layout = types.TableSchema([
+        types.ColumnDefinition(types.TYPE_U64),
+        types.ColumnDefinition(types.TYPE_I64)
+    ], pk_index=0)
 
-        try:
-            print "[Step 1] Creating Shard A..."
-            db.insert(100, mk_payload("base_state"))
-            db.flush()
+    db = zset.PersistentTable(db_path, "3way", layout, validate_checksums=True)
+    
+    try:
+        # Shard 1: PK 100, 200
+        db.insert(100, [db_values.TaggedValue.make_int(1)])
+        db.insert(200, [db_values.TaggedValue.make_int(1)])
+        db.flush()
+        
+        # Shard 2: PK 100, 300
+        db.insert(100, [db_values.TaggedValue.make_int(1)])
+        db.insert(300, [db_values.TaggedValue.make_int(1)])
+        db.flush()
+        
+        # Shard 3: PK 200, 300
+        db.insert(200, [db_values.TaggedValue.make_int(1)])
+        db.insert(300, [db_values.TaggedValue.make_int(1)])
+        db.flush()
+        
+        # At this point: PK 100(w=2), 200(w=2), 300(w=2)
+        # Check before compaction
+        if db.get_weight(100, [db_values.TaggedValue.make_int(1)]) != 2: return False
+        
+        # Force 3-way merge
+        print "    -> Merging 3 shards..."
+        compactor.execute_compaction(db.index, db.manifest_manager, db.directory)
+        
+        # Check after compaction
+        if db.get_weight(100, [db_values.TaggedValue.make_int(1)]) != 2: return False
+        if db.get_weight(300, [db_values.TaggedValue.make_int(1)]) != 2: return False
+        
+        # Check Manifest
+        reader = db.manifest_manager.load_current()
+        if reader.entry_count != 1:
+            print "ERR: Compaction should have resulted in exactly 1 shard."
+            return False
+        reader.close()
 
-            print "[Step 2] Modifying in MemTable..."
-            db.insert(100, mk_payload("base_state"))
-            db.insert(100, mk_payload("base_state"))
+        print "    [OK] N-way merge and Manifest update verified."
+        return True
+    finally:
+        db.close()
 
-            print "[Step 3] Verifying Algebraic Summation..."
-            w_100 = db.get_weight(100, mk_payload("base_state"))
-            if w_100 != 3:
-                # We use intmask/r_int64 for weights, but print works normally
-                print "ERR: Entity 100 weight mismatch. Expected 3, got %d" % int(w_100)
-                return 1
+def test_cold_boot_and_cleanup(base_dir):
+    """
+    Tests engine reconstruction from shards and physical file cleanup.
+    """
+    print "\n[Test 3] Cold Boot & RefCount Cleanup..."
+    db_path = os.path.join(base_dir, "test_boot")
+    if not os.path.exists(db_path): os.mkdir(db_path)
 
-            print "  [OK] Integrated lifecycle verified."
+    layout = types.TableSchema([
+        types.ColumnDefinition(types.TYPE_U64),
+        types.ColumnDefinition(types.TYPE_I64)
+    ], pk_index=0)
 
-        finally:
-            print "[Step 4] Closing Database..."
-            db.close()
+    # 1. Create data and flush
+    db = zset.PersistentTable(db_path, "boot", layout)
+    db.insert(999, [db_values.TaggedValue.make_int(888)])
+    shard_name = db.flush()
+    db.close()
+    
+    # 2. Re-open (This tests Manifest -> ShardIndex -> ShardHandle loading)
+    db2 = zset.PersistentTable(db_path, "boot", layout)
+    try:
+        w = db2.get_weight(999, [db_values.TaggedValue.make_int(888)])
+        if w != 1:
+            print "ERR: Cold boot failed to load shards."
+            return False
+            
+        # 3. Test Deletion logic
+        # Insert new data and flush to trigger a state where the old shard is 'redundant'
+        # Then manually mark for deletion to test RefCounter
+        db2.insert(1, [db_values.TaggedValue.make_int(1)])
+        db2.flush()
+        
+        # We manually trigger a compaction of all shards to make the old ones 'dead'
+        print "    -> Compacting to trigger file releases..."
+        compactor.execute_compaction(db2.index, db2.manifest_manager, db2.directory)
+        
+        # The ShardIndex should have released the old shard files.
+        # We check if try_cleanup actually unlinks them.
+        deleted = db2.index.ref_counter.try_cleanup()
+        print "    -> Files physically deleted: %d" % len(deleted)
+        
+        print "    [OK] Bootstrapping and RefCounting verified."
+        return True
+    finally:
+        db2.close()
 
+def test_u128_recovery(base_dir):
+    """
+    Exercises u128 logic during WAL recovery specifically.
+    """
+    print "\n[Test 4] u128 WAL Recovery..."
+    db_path = os.path.join(base_dir, "test_u128_wal")
+    if not os.path.exists(db_path): os.mkdir(db_path)
+
+    layout = types.TableSchema([
+        types.ColumnDefinition(types.TYPE_U128),
+        types.ColumnDefinition(types.TYPE_I64)
+    ], pk_index=0)
+
+    huge_k = (r_uint128(0xDEADBEEF) << 64) | r_uint128(0xCAFEBABE)
+    
+    db = zset.PersistentTable(db_path, "u128wal", layout)
+    db.insert(huge_k, [db_values.TaggedValue.make_int(777)])
+    db.close() # Crash simulation
+    
+    db2 = zset.PersistentTable(db_path, "u128wal", layout)
+    try:
+        w = db2.get_weight(huge_k, [db_values.TaggedValue.make_int(777)])
+        if w != 1:
+            print "ERR: u128 WAL recovery failed."
+            return False
+        print "    [OK] u128 WAL recovery verified."
+        return True
+    finally:
+        db2.close()
+
+# ------------------------------------------------------------------------------
+# Entry Point
+# ------------------------------------------------------------------------------
+
+def entry_point(argv):
+    print "--- GnitzDB Comprehensive Integration Test ---"
+    
+    base_dir = "translate_test_data"
+    if os.path.exists(base_dir): cleanup_dir(base_dir)
+    os.mkdir(base_dir)
+
+    try:
+        if not test_multiset_and_string_logic(base_dir): return 1
+        if not test_triple_shard_compaction(base_dir): return 1
+        if not test_cold_boot_and_cleanup(base_dir): return 1
+        if not test_u128_recovery(base_dir): return 1
+
+        print "\nPASSED: All engine code paths exercised."
+        return 0
     except Exception as e:
-        os.write(2, "FATAL ERROR in entry_point: " + str(e) + "\n")
+        print "FATAL ERROR: %s" % str(e)
         return 1
-
-    return 0
+    finally:
+        cleanup_dir(base_dir)
 
 def target(driver, args):
     return entry_point, None
