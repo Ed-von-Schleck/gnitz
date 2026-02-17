@@ -138,6 +138,28 @@ class MemTable(object):
                 if comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) == 0:
                     return match_off
         return 0
+        
+    def _lower_bound_node(self, key):
+        """
+        Returns the offset of the first node where node_key >= key.
+        Returns 0 if no such node exists.
+        """
+        base = self.arena.base_ptr
+        curr_off = self.head_off
+        
+        # Standard SkipList search logic
+        for i in range(MAX_HEIGHT - 1, -1, -1):
+            next_off = node_get_next_off(base, curr_off, i)
+            while next_off != 0:
+                next_key = node_get_key(base, next_off, self.key_size)
+                if next_key < key:
+                    curr_off = next_off
+                else:
+                    break
+                next_off = node_get_next_off(base, curr_off, i)
+        
+        # Level 0 contains the full sequence
+        return node_get_next_off(base, curr_off, 0)
 
     def upsert(self, key, weight, field_values):
         """

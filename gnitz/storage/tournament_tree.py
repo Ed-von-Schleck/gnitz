@@ -1,12 +1,11 @@
+# gnitz/storage/tournament_tree.py
+
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from gnitz.storage.cursor import ShardCursor # New Import
 
-# StreamCursor class removed from here
+# REMOVED: from gnitz.storage.cursor import ShardCursor
 
-# Use a struct for the heap nodes to ensure 8-byte alignment for u64 parts
-# and avoid GC-heap allocation of r_uint128 objects.
 HEAP_NODE = lltype.Struct("HeapNode", 
     ("key_low", rffi.ULONGLONG),
     ("key_high", rffi.ULONGLONG),
@@ -16,6 +15,7 @@ HEAP_NODE = lltype.Struct("HeapNode",
 class TournamentTree(object):
     """N-way merge heap specialized for 64-bit and 128-bit Primary Keys."""
     def __init__(self, cursors):
+        # cursors: List[BaseCursor]
         self.cursors = cursors
         self.num_cursors = len(cursors)
         self.heap_size = 0
@@ -111,7 +111,38 @@ class TournamentTree(object):
                 self.heap[0].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(nk >> 64))
                 self._sift_down(0)
 
-    def is_exhausted(self): return self.heap_size == 0
+    def advance_cursor_by_index(self, cursor_idx):
+        heap_idx = -1
+        for i in range(self.heap_size):
+            if rffi.cast(lltype.Signed, self.heap[i].cursor_idx) == cursor_idx:
+                heap_idx = i
+                break
+        
+        if heap_idx == -1: return
+
+        self.cursors[cursor_idx].advance()
+        
+        if self.cursors[cursor_idx].is_exhausted():
+            last = self.heap_size - 1
+            if heap_idx != last:
+                self.heap[heap_idx].key_low = self.heap[last].key_low
+                self.heap[heap_idx].key_high = self.heap[last].key_high
+                self.heap[heap_idx].cursor_idx = self.heap[last].cursor_idx
+                self.heap_size -= 1
+                self._sift_down(heap_idx)
+                self._sift_up(heap_idx)
+            else:
+                self.heap_size -= 1
+        else:
+            nk = self.cursors[cursor_idx].peek_key()
+            self.heap[heap_idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(nk))
+            self.heap[heap_idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(nk >> 64))
+            self._sift_down(heap_idx)
+            self._sift_up(heap_idx)
+
+    def is_exhausted(self):
+        return self.heap_size == 0
+        
     def close(self):
         if self.heap:
             lltype.free(self.heap, flavor='raw')

@@ -206,6 +206,25 @@ class Engine(object):
         
         return self.index.needs_compaction
 
+    def open_trace_cursor(self):
+        """
+        Returns a UnifiedCursor representing the current net state 
+        of the table (MemTable + Shards).
+        """
+        from gnitz.storage.cursor import MemTableCursor, ShardCursor, UnifiedCursor, BaseCursor
+        
+        # We must cast all cursors to BaseCursor to create a homogeneous list for RPython
+        cs = [] # List[BaseCursor]
+        
+        mem_c = MemTableCursor(self.active_table)
+        cs.append(mem_c)
+        
+        for h in self.index.handles:
+            shard_c = ShardCursor(h.view)
+            cs.append(shard_c)
+            
+        return UnifiedCursor(self.schema, cs)
+
     def close(self):
         """Graceful shutdown of memory and handles."""
         if self.active_table:
