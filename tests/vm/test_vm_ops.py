@@ -189,8 +189,9 @@ class TestVMOps(unittest.TestCase):
             reg_in = runtime.DeltaRegister(0, self.vm_schema)
             reg_in.batch.append(444, 1, self._mk_payload("Sinked", 42))
             
-            # Execute integration
-            ops.op_integrate(reg_in, 1, db.engine)
+            # FIXED: Removed the '1' (table_id) argument. 
+            # The operator now only needs the register and the engine instance.
+            ops.op_integrate(reg_in, db.engine)
             
             # Verify weight via storage engine logic
             self.assertEqual(db.get_weight(444, self._mk_payload("Sinked", 42)), 1)

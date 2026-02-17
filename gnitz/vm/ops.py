@@ -304,15 +304,14 @@ def op_join_delta_delta(reg_a, reg_b, reg_out):
 # Integral / Misc Operators
 # -----------------------------------------------------------------------------
 
-def op_integrate(reg_in, table_id, engine):
+def op_integrate(reg_in, target_engine):
     """
-    Dumps the batch into the storage engine.
-    Effectively: PersistentTable += DeltaBatch
+    Dumps the batch into a specific storage engine.
+    Effectively: target_engine += DeltaBatch
     """
     batch = reg_in.batch
     count = batch.row_count()
     
-    # We must iterate and insert individually
     for i in range(count):
         weight = batch.weights[i]
         if weight == 0:
@@ -321,8 +320,8 @@ def op_integrate(reg_in, table_id, engine):
         key = batch.keys[i]
         payload = batch.payloads[i]
         
-        # Engine expects (key, weight, payload)
-        engine.ingest(key, weight, payload)
+        # Call ingest on the target engine specific to this sink
+        target_engine.ingest(key, weight, payload)
 
 def op_distinct(reg_in, reg_out):
     """

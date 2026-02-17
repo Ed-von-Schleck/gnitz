@@ -67,12 +67,12 @@ class JoinDeltaDeltaOp(Instruction):
         self.reg_out = reg_out
 
 class IntegrateOp(Instruction):
-    """Sinks a ZSetBatch into a persistent table."""
-    _immutable_fields_ = ['reg_in', 'table_id']
-    def __init__(self, reg_in, table_id):
+    """Sinks a ZSetBatch into a specific persistent table engine."""
+    _immutable_fields_ = ['reg_in', 'target_engine']
+    def __init__(self, reg_in, target_engine):
         Instruction.__init__(self, self.INTEGRATE)
         self.reg_in = reg_in
-        self.table_id = table_id
+        self.target_engine = target_engine
 
 class HaltOp(Instruction):
     def __init__(self):

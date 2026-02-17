@@ -106,7 +106,7 @@ class DBSPInterpreter(object):
                 
             elif opcode == instructions.Instruction.INTEGRATE:
                 assert isinstance(instr, instructions.IntegrateOp)
-                ops.op_integrate(instr.reg_in, instr.table_id, engine)
+                ops.op_integrate(instr.reg_in, instr.target_engine)
 
             elif opcode == instructions.Instruction.DELAY:
                 assert isinstance(instr, instructions.DelayOp)

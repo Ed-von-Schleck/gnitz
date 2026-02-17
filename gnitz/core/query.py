@@ -245,3 +245,19 @@ class QueryBuilder(object):
         
         # 4. Return View
         return View(interp, 0, self.current_reg_idx, self.cursors)
+
+    def sink(self, table):
+        """
+        Terminal operation that sinks the current delta stream into a table.
+        """
+        prev_reg = self.registers[self.current_reg_idx]
+        if not prev_reg.is_delta():
+            raise QueryError("Sink input must be a Delta stream")
+
+        # Create instruction pointing to the table's engine
+        op = instructions.IntegrateOp(prev_reg, table.engine)
+        self.program.append(op)
+        
+        # This is a terminal side-effect, but we allow further chaining 
+        # on the same register if desired.
+        return self
