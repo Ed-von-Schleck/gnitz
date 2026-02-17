@@ -8,26 +8,34 @@ from gnitz.core import types, values, strings, row_logic
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
+
 class BatchAccessor(row_logic.BaseRowAccessor):
     """
     Concrete accessor for ZSetBatch.
-    Allows the row_logic comparison kernel to inspect rows stored
-    as lists of TaggedValues.
     """
     def __init__(self, schema):
         self.schema = schema
-        self.payloads = None # List[List[TaggedValue]]
+        # In RPython, initialize to None but use asserts to prove type/presence
+        self.payloads = None 
         self.row_idx = -1
-        self.pk_index = schema.pk_index
 
     def set_row(self, payloads, index):
         self.payloads = payloads
         self.row_idx = index
 
     def _get_val(self, col_idx):
-        # Map schema column index to the payload list index (which excludes PK)
-        idx = col_idx if col_idx < self.pk_index else col_idx - 1
-        return self.payloads[self.row_idx][idx]
+        # 1. Prove to Annotator that payloads is not None
+        payloads = self.payloads
+        assert payloads is not None
+        
+        # 2. Fix pk_index reference and prove index is non-negative
+        pk_idx = self.schema.pk_index
+        idx = col_idx if col_idx < pk_idx else col_idx - 1
+        
+        # RPython hint: Prove idx is within valid range for non-PK payload
+        assert idx >= 0
+        
+        return payloads[self.row_idx][idx]
 
     def get_int(self, col_idx):
         val = self._get_val(col_idx)

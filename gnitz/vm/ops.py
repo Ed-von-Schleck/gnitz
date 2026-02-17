@@ -25,19 +25,19 @@ def materialize_row(accessor, schema):
         col_def = schema.columns[i]
         type_code = col_def.field_type.code
         
-        if type_code == types.TYPE_I64.code or \
-           type_code == types.TYPE_U64.code or \
-           type_code == types.TYPE_I32.code or \
-           type_code == types.TYPE_U32.code or \
-           type_code == types.TYPE_I16.code or \
-           type_code == types.TYPE_U16.code or \
-           type_code == types.TYPE_I8.code or \
-           type_code == types.TYPE_U8.code:
+        if (type_code == types.TYPE_I64.code or 
+            type_code == types.TYPE_U64.code or 
+            type_code == types.TYPE_I32.code or 
+            type_code == types.TYPE_U32.code or 
+            type_code == types.TYPE_I16.code or 
+            type_code == types.TYPE_U16.code or 
+            type_code == types.TYPE_I8.code or 
+            type_code == types.TYPE_U8.code):
             val = accessor.get_int(i)
+            # Use intmask to coerce any unsigned bit-patterns to signed words
             result.append(values.TaggedValue.make_int(intmask(val)))
             
-        elif type_code == types.TYPE_F64.code or \
-             type_code == types.TYPE_F32.code:
+        elif type_code == types.TYPE_F64.code or type_code == types.TYPE_F32.code:
             val = accessor.get_float(i)
             result.append(values.TaggedValue.make_float(val))
             
@@ -50,7 +50,7 @@ def materialize_row(accessor, schema):
             
         elif type_code == types.TYPE_U128.code:
              val_u128 = accessor.get_u128(i)
-             # FIX: Use intmask instead of r_int64 to satisfy RPython cast rules
+             # Cast 128-bit to 64-bit signed via intmask
              result.append(values.TaggedValue.make_int(intmask(val_u128)))
              
         else:

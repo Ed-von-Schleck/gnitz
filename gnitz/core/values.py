@@ -2,12 +2,19 @@
 
 from rpython.rlib.rarithmetic import r_int64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128 
+from rpython.rlib.jit import specialize
 
 # Constants for value types
 TAG_INT = 0
 TAG_FLOAT = 1
 TAG_STRING = 2
 TAG_NULL = 3
+
+@specialize.argtype(0)
+def _make_int_impl(val):
+    # intmask() truncates and forces the result to a signed machine word.
+    # r_int64() ensures the storage in TaggedValue is a consistent 64-bit signed int.
+    return TaggedValue(TAG_INT, r_int64(intmask(val)), 0.0, "")
 
 class TaggedValue(object):
     """
@@ -24,7 +31,7 @@ class TaggedValue(object):
 
     @staticmethod
     def make_int(val):
-        return TaggedValue(TAG_INT, intmask(val), 0.0, "")
+        return _make_int_impl(val)
 
     @staticmethod
     def make_float(val):

@@ -211,17 +211,16 @@ class Engine(object):
         Returns a UnifiedCursor representing the current net state 
         of the table (MemTable + Shards).
         """
-        from gnitz.storage.cursor import MemTableCursor, ShardCursor, UnifiedCursor, BaseCursor
+        from gnitz.storage.cursor import MemTableCursor, ShardCursor, UnifiedCursor
         
-        # We must cast all cursors to BaseCursor to create a homogeneous list for RPython
-        cs = [] # List[BaseCursor]
+        num_shards = len(self.index.handles)
+        # Create a fixed-size list to satisfy UnifiedCursor._immutable_fields_ ['cursors[*]']
+        cs = [None] * (num_shards + 1)
         
-        mem_c = MemTableCursor(self.active_table)
-        cs.append(mem_c)
-        
-        for h in self.index.handles:
-            shard_c = ShardCursor(h.view)
-            cs.append(shard_c)
+        cs[0] = MemTableCursor(self.active_table)
+        for i in range(num_shards):
+            h = self.index.handles[i]
+            cs[i + 1] = ShardCursor(h.view)
             
         return UnifiedCursor(self.schema, cs)
 
