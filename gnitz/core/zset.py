@@ -10,10 +10,16 @@ from gnitz.core import values, types
 class PersistentTable(object):
     """
     Persistent Z-Set Table.
+    
     The primary user-facing interface for GnitzDB. It integrates the 
     ingestion pipeline (WAL/MemTable) with the persistent storage layer (ShardIndex)
     via the Engine.
+    
+    This class serves as the boundary between the Persistent Storage 
+    and the Virtual Machine.
     """
+    _immutable_fields_ = ['schema', 'table_id', 'directory', 'name']
+
     def __init__(self, directory, name, schema, table_id=1, cache_size=1048576, 
                  read_only=False, validate_checksums=False):
         self.directory = directory
@@ -54,7 +60,6 @@ class PersistentTable(object):
             self.index = index.ShardIndex(self.table_id, self.schema, self.ref_counter)
             
         # 4. Initialize Execution Engine
-        # The Engine now owns the MemTable logic directly.
         self.engine = engine.Engine(
             self.schema,
             self.index,
@@ -65,6 +70,44 @@ class PersistentTable(object):
             recover_wal_filename=self.wal_path,
             validate_checksums=self.validate_checksums
         )
+
+    # -------------------------------------------------------------------------
+    # DBSP Virtual Machine Hooks
+    # -------------------------------------------------------------------------
+
+    def create_cursor(self):
+        """
+        [VM Hook] Returns a seekable UnifiedCursor (Trace Reader).
+        The VM uses this as a 'Trace Register' (R_T) for Joins and Reductions.
+        """
+        return self.engine.open_trace_cursor()
+
+    def apply_delta_batch(self, zset_batch):
+        """
+        [VM Hook] Integrates an entire ZSetBatch into the table in one go.
+        This implements the DBSP 'Integrate' operator: S <- S + Delta.
+        
+        Note: zset_batch is expected to be a gnitz.vm.batch.ZSetBatch 
+        """
+        if self.read_only:
+            return
+            
+        count = zset_batch.count()
+        for i in range(count):
+            # Ingest individual deltas into the MemTable/WAL
+            self.engine.ingest(
+                zset_batch.get_key(i),
+                zset_batch.get_weight(i),
+                zset_batch.get_row_tagged_values(i)
+            )
+
+    def get_schema(self):
+        """[VM Hook] Returns the TableSchema to determine column offsets."""
+        return self.schema
+
+    # -------------------------------------------------------------------------
+    # Standard Relational API
+    # -------------------------------------------------------------------------
 
     def insert(self, key, db_values_list):
         """Appends a positive Z-Set delta (addition)."""
@@ -92,14 +135,9 @@ class PersistentTable(object):
             self.name, lsn_val)
         )
         
-        # Engine handles shard writing, indexing, and manifest updates.
-        # It returns True if the Index health warrants a compaction.
         needs_compaction = self.engine.flush_and_rotate(filename)
-        
-        # Clear the WAL up to the point we just persisted
         self.checkpoint()
         
-        # If the ShardIndex detects high read-amplification, trigger merge
         if needs_compaction:
             self._trigger_compaction()
             
@@ -111,7 +149,6 @@ class PersistentTable(object):
             reader = self.manifest_manager.load_current()
             lsn = reader.global_max_lsn
             reader.close()
-            # Truncate WAL to the next LSN after the global high-water mark
             self.wal_writer.truncate_before_lsn(lsn + r_uint64(1))
 
     def _trigger_compaction(self):
