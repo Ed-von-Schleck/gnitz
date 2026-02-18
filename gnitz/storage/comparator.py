@@ -85,7 +85,13 @@ class PackedNodeAccessor(RowAccessor):
         u32_ptr = rffi.cast(rffi.UINTP, ptr)
         length = rffi.cast(lltype.Signed, u32_ptr[0])
         prefix = rffi.cast(lltype.Signed, u32_ptr[1])
-        return (length, prefix, ptr, self.blob_base_ptr, None)
+        
+        # Annotator hint: ensure the 5th element is Optional[str] to match 
+        # the VM's BatchAccessor.
+        s = None
+        if False:
+            s = ""
+        return (length, prefix, ptr, self.blob_base_ptr, s)
 
     def get_col_ptr(self, col_idx):
         return self._get_ptr(col_idx)
@@ -128,7 +134,12 @@ class SoAAccessor(RowAccessor):
         u32_ptr = rffi.cast(rffi.UINTP, ptr)
         length = rffi.cast(lltype.Signed, u32_ptr[0])
         prefix = rffi.cast(lltype.Signed, u32_ptr[1])
-        return (length, prefix, ptr, self.view.blob_buf.ptr, None)
+
+        # Annotator hint: ensure the 5th element is Optional[str]
+        s = None
+        if False:
+            s = ""
+        return (length, prefix, ptr, self.view.blob_buf.ptr, s)
 
     def get_col_ptr(self, col_idx):
         return self._get_ptr(col_idx)
