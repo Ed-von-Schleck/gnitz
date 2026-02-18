@@ -5,6 +5,7 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, values, row_logic, strings
+from gnitz.vm.batch import make_payload_row
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -14,34 +15,40 @@ from gnitz.core import types, values, row_logic, strings
 def materialize_row(accessor, schema):
     """
     Extracts a full row from a RowAccessor and boxes it into a list of TaggedValues.
+
+    Uses make_payload_row instead of [] so that the result list is never marked
+    'must not resize' (mr).  A zero-element literal [] is treated as a
+    fixed-size-0 allocation by RPython and can acquire the mr flag; any list
+    that flows into ZSetBatch.payloads must be resizable or the shared element
+    listdef becomes mr, causing ListChangeUnallowed at every append site.
     """
-    result = []
-    
+    n_payload_cols = len(schema.columns) - 1
+    result = make_payload_row(n_payload_cols)
+
     for i in range(len(schema.columns)):
         if i == schema.pk_index:
             continue
-            
+
         col_def = schema.columns[i]
         type_code = col_def.field_type.code
-        
+
         # 1. Handle Integer types (i8 through u64)
-        if (type_code == types.TYPE_I64.code or 
-            type_code == types.TYPE_U64.code or 
-            type_code == types.TYPE_I32.code or 
-            type_code == types.TYPE_U32.code or 
-            type_code == types.TYPE_I16.code or 
-            type_code == types.TYPE_U16.code or 
-            type_code == types.TYPE_I8.code or 
+        if (type_code == types.TYPE_I64.code or
+            type_code == types.TYPE_U64.code or
+            type_code == types.TYPE_I32.code or
+            type_code == types.TYPE_U32.code or
+            type_code == types.TYPE_I16.code or
+            type_code == types.TYPE_U16.code or
+            type_code == types.TYPE_I8.code or
             type_code == types.TYPE_U8.code):
             val = accessor.get_int(i)
-            # Explicitly cast to LONGLONG (r_int64) to match TaggedValue.i64 storage
             result.append(values.TaggedValue.make_int(rffi.cast(rffi.LONGLONG, val)))
-            
+
         # 2. Handle Floating Point
         elif type_code == types.TYPE_F64.code or type_code == types.TYPE_F32.code:
             val = accessor.get_float(i)
             result.append(values.TaggedValue.make_float(val))
-            
+
         # 3. Handle German Strings
         elif type_code == types.TYPE_STRING.code:
             meta = accessor.get_str_struct(i)
@@ -50,18 +57,38 @@ def materialize_row(accessor, schema):
                 # If the accessor is memory-backed (SoA/AoS), unpack the raw bytes
                 s_val = strings.unpack_string(meta[2], meta[3])
             result.append(values.TaggedValue.make_string(s_val))
-            
+
         # 4. Handle 128-bit Integers (UUIDs/Keys)
         elif type_code == types.TYPE_U128.code:
-             val_u128 = accessor.get_u128(i)
-             # Truncate to lower 64-bits for TaggedValue.i64 storage using rffi.cast
-             # for better RPython compatibility than intmask() on u128.
-             result.append(values.TaggedValue.make_int(rffi.cast(rffi.LONGLONG, val_u128)))
-             
+            val_u128 = accessor.get_u128(i)
+            result.append(values.TaggedValue.make_int(rffi.cast(rffi.LONGLONG, val_u128)))
+
         else:
             result.append(values.TaggedValue.make_null())
-            
+
     return result
+
+
+def _concat_payloads(left, right):
+    """
+    Concatenates two payload rows into a fresh resizable list.
+
+    MUST NOT use list + list.  In RPython, 'a + b' where both operands have
+    statically known lengths produces a new list whose size is determined at
+    construction — RPython marks it mr (must not resize).  That mr flag then
+    propagates into ZSetBatch's shared element listdef, poisoning every
+    subsequent append site with ListChangeUnallowed.
+
+    Using make_payload_row + explicit appends keeps the result resizable.
+    """
+    n = len(left) + len(right)
+    result = make_payload_row(n)
+    for k in range(len(left)):
+        result.append(left[k])
+    for k in range(len(right)):
+        result.append(right[k])
+    return result
+
 
 # -----------------------------------------------------------------------------
 # Linear Operators
@@ -74,17 +101,17 @@ def op_filter(reg_in, reg_out, func):
     input_batch = reg_in.batch
     output_batch = reg_out.batch
     output_batch.clear()
-    
+
     count = input_batch.row_count()
     accessor = input_batch.left_acc
-    
+
     for i in range(count):
         accessor.set_row(input_batch.payloads, i)
         if func.evaluate_predicate(accessor):
             output_batch.append(
                 input_batch.keys[i],
                 input_batch.weights[i],
-                input_batch.payloads[i] # Reference copy
+                input_batch.payloads[i]  # Reference copy
             )
 
 def op_map(reg_in, reg_out, func):
@@ -94,17 +121,22 @@ def op_map(reg_in, reg_out, func):
     input_batch = reg_in.batch
     output_batch = reg_out.batch
     output_batch.clear()
-    
+
     count = input_batch.row_count()
     accessor = input_batch.left_acc
-    
+
+    # Pre-compute output payload column count once outside the loop.
+    n_out_cols = len(reg_out.batch.schema.columns) - 1
+
     for i in range(count):
         accessor.set_row(input_batch.payloads, i)
-        
-        # New payload list generated by user-defined mapper
-        new_payload = []
+
+        # Allocate a resizable payload row for the mapper to fill.
+        # Must use make_payload_row, not [], to avoid mr contamination of the
+        # shared ZSetBatch.payloads element listdef.
+        new_payload = make_payload_row(n_out_cols)
         func.evaluate_map(accessor, new_payload)
-        
+
         output_batch.append(
             input_batch.keys[i],
             input_batch.weights[i],
@@ -118,7 +150,7 @@ def op_negate(reg_in, reg_out):
     input_batch = reg_in.batch
     output_batch = reg_out.batch
     output_batch.clear()
-    
+
     count = input_batch.row_count()
     for i in range(count):
         output_batch.append(
@@ -133,7 +165,7 @@ def op_union(reg_in_a, reg_in_b, reg_out):
     """
     output_batch = reg_out.batch
     output_batch.clear()
-    
+
     batch_a = reg_in_a.batch
     count_a = batch_a.row_count()
     for i in range(count_a):
@@ -142,7 +174,7 @@ def op_union(reg_in_a, reg_in_b, reg_out):
             batch_a.weights[i],
             batch_a.payloads[i]
         )
-        
+
     if reg_in_b is not None:
         batch_b = reg_in_b.batch
         count_b = batch_b.row_count()
@@ -160,7 +192,7 @@ def op_delay(reg_in, reg_out):
     input_batch = reg_in.batch
     output_batch = reg_out.batch
     output_batch.clear()
-    
+
     count = input_batch.row_count()
     for i in range(count):
         output_batch.append(
@@ -181,39 +213,42 @@ def op_join_delta_trace(reg_delta, reg_trace, reg_out):
     trace_cursor = reg_trace.cursor
     output_batch = reg_out.batch
     output_batch.clear()
-    
+
     delta_batch.sort()
-    
+
     count = delta_batch.row_count()
     if count == 0:
         return
-        
+
     for i in range(count):
         d_key = delta_batch.keys[i]
         d_weight = delta_batch.weights[i]
-        
+
         if d_weight == 0:
             continue
-            
+
         trace_cursor.seek(d_key)
-        
+
         while trace_cursor.is_valid():
             t_key = trace_cursor.key()
             if t_key != d_key:
                 break
             t_weight = trace_cursor.weight()
-            
+
             final_weight = d_weight * t_weight
-            
+
             if final_weight != 0:
                 accessor = trace_cursor.get_accessor()
                 t_payload = materialize_row(accessor, reg_trace.vm_schema.table_schema)
-                
+
                 d_payload = delta_batch.payloads[i]
-                final_payload = d_payload + t_payload
-                
+                # Use _concat_payloads instead of d_payload + t_payload.
+                # list + list produces a statically-sized new list which RPython
+                # marks mr, poisoning the shared ZSetBatch.payloads listdef.
+                final_payload = _concat_payloads(d_payload, t_payload)
+
                 output_batch.append(d_key, final_weight, final_payload)
-            
+
             trace_cursor.advance()
 
 def op_join_delta_delta(reg_a, reg_b, reg_out):
@@ -224,47 +259,51 @@ def op_join_delta_delta(reg_a, reg_b, reg_out):
     batch_b = reg_b.batch
     output_batch = reg_out.batch
     output_batch.clear()
-    
+
     batch_a.sort()
     batch_b.sort()
-    
+
     count_a = batch_a.row_count()
     count_b = batch_b.row_count()
-    
+
     idx_a = 0
     idx_b = 0
-    
+
     while idx_a < count_a and idx_b < count_b:
         key_a = batch_a.keys[idx_a]
         key_b = batch_b.keys[idx_b]
-        
+
         if key_a < key_b:
             idx_a += 1
         elif key_b < key_a:
             idx_b += 1
         else:
             match_key = key_a
-            
+
             start_a = idx_a
             while idx_a < count_a and batch_a.keys[idx_a] == match_key:
                 idx_a += 1
             end_a = idx_a
-            
+
             start_b = idx_b
             while idx_b < count_b and batch_b.keys[idx_b] == match_key:
                 idx_b += 1
             end_b = idx_b
-            
+
             for i in range(start_a, end_a):
                 w_a = batch_a.weights[i]
                 if w_a == 0: continue
-                
+
                 for j in range(start_b, end_b):
                     w_b = batch_b.weights[j]
                     final_weight = w_a * w_b
-                    
+
                     if final_weight != 0:
-                        final_payload = batch_a.payloads[i] + batch_b.payloads[j]
+                        # Use _concat_payloads instead of list + list for the
+                        # same mr-avoidance reason as op_join_delta_trace.
+                        final_payload = _concat_payloads(
+                            batch_a.payloads[i], batch_b.payloads[j]
+                        )
                         output_batch.append(match_key, final_weight, final_payload)
 
 # -----------------------------------------------------------------------------
@@ -277,15 +316,15 @@ def op_integrate(reg_in, target_engine):
     """
     input_batch = reg_in.batch
     count = input_batch.row_count()
-    
+
     for i in range(count):
         weight = input_batch.weights[i]
         if weight == 0:
             continue
-            
+
         key = input_batch.keys[i]
         payload = input_batch.payloads[i]
-        
+
         target_engine.ingest(key, weight, payload)
 
 def op_distinct(reg_in, reg_out):
@@ -295,10 +334,10 @@ def op_distinct(reg_in, reg_out):
     input_batch = reg_in.batch
     output_batch = reg_out.batch
     output_batch.clear()
-    
+
     input_batch.sort()
     input_batch.consolidate()
-    
+
     count = input_batch.row_count()
     for i in range(count):
         w = input_batch.weights[i]

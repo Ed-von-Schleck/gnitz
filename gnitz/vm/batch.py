@@ -2,6 +2,7 @@
 
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
+from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, values, strings, row_logic
@@ -9,54 +10,93 @@ from gnitz.core import types, values, strings, row_logic
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
 
+def make_payload_row(n_payload_cols):
+    """
+    Canonical constructor for a payload row (List[TaggedValue]).
+
+    Every site in the codebase that constructs a fresh List[TaggedValue]
+    MUST call this function instead of writing a literal.
+    """
+    return newlist_hint(n_payload_cols)
+
+
+@jit.unroll_safe
+def _compare_payload_rows(schema, left_row, right_row):
+    """
+    Compares two rows stored as List[TaggedValue] using pure value comparisons.
+    Bypasses compare_rows/compare_structures so BatchAccessor objects never
+    enter the type-union for those functions' parameters.
+    """
+    pk_idx = schema.pk_index
+    payload_idx = 0
+    for i in range(len(schema.columns)):
+        if i == pk_idx:
+            continue
+        col_type = schema.columns[i].field_type
+        l_val = left_row[payload_idx]
+        r_val = right_row[payload_idx]
+        payload_idx += 1
+
+        if col_type == types.TYPE_STRING:
+            if l_val.str_val < r_val.str_val:
+                return -1
+            if l_val.str_val > r_val.str_val:
+                return 1
+        elif col_type == types.TYPE_F64:
+            if l_val.f64 < r_val.f64:
+                return -1
+            if l_val.f64 > r_val.f64:
+                return 1
+        else:
+            if l_val.i64 < r_val.i64:
+                return -1
+            if l_val.i64 > r_val.i64:
+                return 1
+    return 0
+
+
 class BatchAccessor(row_logic.BaseRowAccessor):
     """
-    Concrete accessor for ZSetBatch.
-    Extracts data from List[TaggedValue] stored in the batch.
+    Concrete accessor for ZSetBatch rows.
+    Used by ops.py (op_filter / op_map) to expose rows to ScalarFunctions.
+    Never passed to compare_rows / compare_structures.
     """
 
     _immutable_fields_ = ["schema", "dummy_ptr"]
 
     def __init__(self, schema):
         self.schema = schema
-        # Hint the nested List[List[TaggedValue]] structure to the annotator
-        self.payloads = [[values.TaggedValue.make_null()]]
+        # Type hint: teach the annotator that payloads is List[List[TaggedValue]]
+        # where the inner list is resizable.  newlist_hint ensures the inner
+        # list's listdef is NOT mr.
+        _inner = make_payload_row(1)
+        self.payloads = [_inner]
         self.payloads.pop()
         self.row_idx = 0
-        
-        # Allocate a safe dummy pointer.
-        # This is required because we hint that get_str_struct can return None for the string,
-        # forcing the annotator to analyze the pointer-based comparison path in compare_structures.
-        # If we passed NULL, the annotator would detect a crash and mark the result as Impossible.
-        self.dummy_ptr = lltype.malloc(rffi.CCHARP.TO, 16, flavor='raw')
-        # Zero initialize to be safe
+        # Zeroed 16-byte buffer returned as (ptr, heap) in get_str_struct.
+        # Keeps the annotator off a null-dereference path in compare_structures
+        # without using a fixed-literal that would mark the struct mr.
+        self.dummy_ptr = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
         for i in range(16):
-            self.dummy_ptr[i] = '\x00'
+            self.dummy_ptr[i] = "\x00"
 
     def set_row(self, payloads, index):
-        """
-        Points the accessor to a specific row within the payloads list.
-        """
         self.payloads = payloads
         self.row_idx = index
 
     def _get_val(self, col_idx):
         pk_idx = self.schema.pk_index
-        # Map schema column index to payload list index (skipping PK)
         idx = col_idx if col_idx < pk_idx else col_idx - 1
         return self.payloads[self.row_idx][idx]
 
     def get_int(self, col_idx):
-        val = self._get_val(col_idx)
-        return rffi.cast(rffi.ULONGLONG, val.i64)
+        return rffi.cast(rffi.ULONGLONG, self._get_val(col_idx).i64)
 
     def get_float(self, col_idx):
-        val = self._get_val(col_idx)
-        return val.f64
+        return self._get_val(col_idx).f64
 
     def get_u128(self, col_idx):
-        val = self._get_val(col_idx)
-        return r_uint128(rffi.cast(rffi.ULONGLONG, val.i64))
+        return r_uint128(rffi.cast(rffi.ULONGLONG, self._get_val(col_idx).i64))
 
     def get_str_struct(self, col_idx):
         val = self._get_val(col_idx)
@@ -64,60 +104,28 @@ class BatchAccessor(row_logic.BaseRowAccessor):
         s = val.str_val
         length = len(s)
         prefix = rffi.cast(lltype.Signed, strings.compute_prefix(s))
-        
-        # Explicitly optional string to match storage accessor signatures.
-        res = s
-        if False:
-            res = None
-            
-        # Return dummy_ptr instead of NULL_PTR.
-        # This ensures that if the annotator explores the 'res is None' branch
-        # in the consumer code, it sees valid memory access, not a segfault.
-        return (length, prefix, self.dummy_ptr, self.dummy_ptr, res)
+        return (length, prefix, self.dummy_ptr, self.dummy_ptr, s)
 
     def get_col_ptr(self, col_idx):
-        """BatchAccessor operates on TaggedValues, not raw pointers."""
         return NULL_PTR
-
-
-class SortItem(object):
-    """
-    Helper object for sorting ZSetBatch.
-    Delegates comparison back to the batch to simplify annotation.
-    """
-    _immutable_fields_ = ['index', 'batch']
-
-    def __init__(self, index, batch):
-        self.index = index
-        self.batch = batch
-
-    def __lt__(self, other):
-        # Explicit type check ensures the annotator can resolve 'other.batch'
-        if not isinstance(other, SortItem):
-            return False
-        return self.batch._compare_indices(self.index, other.index)
 
 
 class ZSetBatch(object):
     """
-    A transient collection of Z-Set updates.
-    The fundamental 'Batch' primitive for DBSP operators.
+    A transient collection of Z-Set deltas (key, weight, payload) triples.
+    The fundamental Batch primitive for DBSP operators.
     """
 
-    _immutable_fields_ = ["schema", "left_acc", "right_acc"]
+    _immutable_fields_ = ["schema", "left_acc"]
 
     def __init__(self, schema):
         self.schema = schema
-        self.keys = []  # List[r_uint128]
-        self.weights = []  # List[r_int64]
-        self.payloads = []  # List[List[TaggedValue]]
-
-        # Reusable accessors for internal comparison/sorting
+        self.keys = []
+        self.weights = []
+        self.payloads = []
         self.left_acc = BatchAccessor(schema)
-        self.right_acc = BatchAccessor(schema)
 
     def append(self, key, weight, payload):
-        """Adds a delta to the batch."""
         self.keys.append(r_uint128(key))
         self.weights.append(r_int64(weight))
         self.payloads.append(payload)
@@ -126,67 +134,53 @@ class ZSetBatch(object):
         return len(self.keys)
 
     def clear(self):
-        """Zero-allocation reset for batch reuse."""
         del self.keys[:]
         del self.weights[:]
         del self.payloads[:]
 
     def _compare_indices(self, i1, i2):
-        """
-        Internal comparison kernel used by SortItem.
-        """
-        # 1. Primary Key Comparison
+        """Returns True if record i1 is strictly less than record i2."""
         k1 = self.keys[i1]
         k2 = self.keys[i2]
         if k1 < k2:
             return True
         if k1 > k2:
             return False
-
-        # 2. Row Payload Comparison (Lexicographical)
-        self.left_acc.set_row(self.payloads, i1)
-        self.right_acc.set_row(self.payloads, i2)
-
-        res = row_logic.compare_records(
-            self.schema, self.left_acc, self.right_acc
+        return (
+            _compare_payload_rows(self.schema, self.payloads[i1], self.payloads[i2])
+            < 0
         )
-        return res < 0
 
     def sort(self):
-        """Sorts deltas by Key then Payload to prepare for consolidation."""
+        """
+        Sorts deltas by (key, payload) ready for consolidation.
+        """
         count = self.row_count()
         if count <= 1:
             return
 
-        # Use append loop to build items list to ensure consistent list strategy
-        items = []
-        for i in range(count):
-            items.append(SortItem(i, self))
+        for i in range(1, count):
+            j = i
+            while j > 0 and self._compare_indices(j, j - 1):
+                tmp_key = self.keys[j - 1]
+                self.keys[j - 1] = self.keys[j]
+                self.keys[j] = tmp_key
 
-        items.sort()
+                tmp_weight = self.weights[j - 1]
+                self.weights[j - 1] = self.weights[j]
+                self.weights[j] = tmp_weight
 
-        # Reconstruct sorted arrays using append loops.
-        # This prevents the list from being marked as non-resizable (fixed-size).
-        new_keys = []
-        new_weights = []
-        new_payloads = []
+                tmp_payload = self.payloads[j - 1]
+                self.payloads[j - 1] = self.payloads[j]
+                self.payloads[j] = tmp_payload
 
-        for i in range(count):
-            idx = items[i].index
-            new_keys.append(self.keys[idx])
-            new_weights.append(self.weights[idx])
-            new_payloads.append(self.payloads[idx])
-
-        self.keys = new_keys
-        self.weights = new_weights
-        self.payloads = new_payloads
+                j -= 1
 
     @jit.unroll_safe
     def consolidate(self):
         """
-        Algebraic Consolidation (The Ghost Property).
-        Sums weights of identical records and removes those with net weight 0.
-        Expects batch to be sorted.
+        Algebraic consolidation: sum weights of identical records, drop zeros.
+        Batch must be sorted first.
         """
         count = self.row_count()
         if count == 0:
@@ -198,27 +192,23 @@ class ZSetBatch(object):
         while current_idx < count:
             run_start = current_idx
             total_weight = self.weights[run_start]
-
-            # Find all identical (Key, Payload) pairs
             next_idx = current_idx + 1
+
             while next_idx < count:
                 if self.keys[next_idx] != self.keys[run_start]:
                     break
-
-                self.left_acc.set_row(self.payloads, run_start)
-                self.right_acc.set_row(self.payloads, next_idx)
                 if (
-                    row_logic.compare_records(
-                        self.schema, self.left_acc, self.right_acc
+                    _compare_payload_rows(
+                        self.schema,
+                        self.payloads[run_start],
+                        self.payloads[next_idx],
                     )
                     != 0
                 ):
                     break
-
                 total_weight += self.weights[next_idx]
                 next_idx += 1
 
-            # Annihilation Logic: Only keep if net weight != 0
             if total_weight != 0:
                 self.keys[write_idx] = self.keys[run_start]
                 self.weights[write_idx] = total_weight
@@ -227,7 +217,6 @@ class ZSetBatch(object):
 
             current_idx = next_idx
 
-        # Truncate lists to consolidated size
         del self.keys[write_idx:]
         del self.weights[write_idx:]
         del self.payloads[write_idx:]
