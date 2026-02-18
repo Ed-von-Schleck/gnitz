@@ -5,11 +5,12 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, values, row_logic, strings
-from gnitz.vm.batch import make_payload_row
+from gnitz.core.row_logic import make_payload_row
 
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+
 
 @jit.unroll_safe
 def materialize_row(accessor, schema):
@@ -21,6 +22,11 @@ def materialize_row(accessor, schema):
     fixed-size-0 allocation by RPython and can acquire the mr flag; any list
     that flows into ZSetBatch.payloads must be resizable or the shared element
     listdef becomes mr, causing ListChangeUnallowed at every append site.
+
+    All calls to values.TaggedValue.make_int must pass r_uint64 — never a
+    signed int from rffi.cast(rffi.LONGLONG, ...).  All List[TaggedValue]
+    call sites share a single global listdef via @specialize.argtype; mixing
+    signed and unsigned arguments creates a UnionError during annotation.
     """
     n_payload_cols = len(schema.columns) - 1
     result = make_payload_row(n_payload_cols)
@@ -33,16 +39,23 @@ def materialize_row(accessor, schema):
         type_code = col_def.field_type.code
 
         # 1. Handle Integer types (i8 through u64)
-        if (type_code == types.TYPE_I64.code or
-            type_code == types.TYPE_U64.code or
-            type_code == types.TYPE_I32.code or
-            type_code == types.TYPE_U32.code or
-            type_code == types.TYPE_I16.code or
-            type_code == types.TYPE_U16.code or
-            type_code == types.TYPE_I8.code or
-            type_code == types.TYPE_U8.code):
+        if (
+            type_code == types.TYPE_I64.code
+            or type_code == types.TYPE_U64.code
+            or type_code == types.TYPE_I32.code
+            or type_code == types.TYPE_U32.code
+            or type_code == types.TYPE_I16.code
+            or type_code == types.TYPE_U16.code
+            or type_code == types.TYPE_I8.code
+            or type_code == types.TYPE_U8.code
+        ):
+            # get_int() returns r_uint64 (unsigned). Pass it directly to
+            # make_int so that all make_int call sites use a uniform type.
+            # Casting to rffi.LONGLONG first produces a signed 'int' which
+            # conflicts with r_uint64 call sites elsewhere and causes a
+            # UnionError during RPython annotation.
             val = accessor.get_int(i)
-            result.append(values.TaggedValue.make_int(rffi.cast(rffi.LONGLONG, val)))
+            result.append(values.TaggedValue.make_int(val))
 
         # 2. Handle Floating Point
         elif type_code == types.TYPE_F64.code or type_code == types.TYPE_F32.code:
@@ -60,8 +73,11 @@ def materialize_row(accessor, schema):
 
         # 4. Handle 128-bit Integers (UUIDs/Keys)
         elif type_code == types.TYPE_U128.code:
+            # Truncate to the low 64 bits for TaggedValue storage.
+            # Use r_uint64(...) not rffi.cast(rffi.LONGLONG, ...) so the
+            # argument type stays unsigned and consistent with other sites.
             val_u128 = accessor.get_u128(i)
-            result.append(values.TaggedValue.make_int(rffi.cast(rffi.LONGLONG, val_u128)))
+            result.append(values.TaggedValue.make_int(r_uint64(val_u128)))
 
         else:
             result.append(values.TaggedValue.make_null())
@@ -94,6 +110,7 @@ def _concat_payloads(left, right):
 # Linear Operators
 # -----------------------------------------------------------------------------
 
+
 def op_filter(reg_in, reg_out, func):
     """
     Implements: Out = { (k, v, w) | (k, v, w) in In AND func(v) }
@@ -111,8 +128,9 @@ def op_filter(reg_in, reg_out, func):
             output_batch.append(
                 input_batch.keys[i],
                 input_batch.weights[i],
-                input_batch.payloads[i]  # Reference copy
+                input_batch.payloads[i],  # Reference copy
             )
+
 
 def op_map(reg_in, reg_out, func):
     """
@@ -140,8 +158,9 @@ def op_map(reg_in, reg_out, func):
         output_batch.append(
             input_batch.keys[i],
             input_batch.weights[i],
-            new_payload
+            new_payload,
         )
+
 
 def op_negate(reg_in, reg_out):
     """
@@ -156,8 +175,9 @@ def op_negate(reg_in, reg_out):
         output_batch.append(
             input_batch.keys[i],
             -input_batch.weights[i],
-            input_batch.payloads[i]
+            input_batch.payloads[i],
         )
+
 
 def op_union(reg_in_a, reg_in_b, reg_out):
     """
@@ -172,7 +192,7 @@ def op_union(reg_in_a, reg_in_b, reg_out):
         output_batch.append(
             batch_a.keys[i],
             batch_a.weights[i],
-            batch_a.payloads[i]
+            batch_a.payloads[i],
         )
 
     if reg_in_b is not None:
@@ -182,8 +202,9 @@ def op_union(reg_in_a, reg_in_b, reg_out):
             output_batch.append(
                 batch_b.keys[i],
                 batch_b.weights[i],
-                batch_b.payloads[i]
+                batch_b.payloads[i],
             )
+
 
 def op_delay(reg_in, reg_out):
     """
@@ -198,12 +219,14 @@ def op_delay(reg_in, reg_out):
         output_batch.append(
             input_batch.keys[i],
             input_batch.weights[i],
-            input_batch.payloads[i]
+            input_batch.payloads[i],
         )
+
 
 # -----------------------------------------------------------------------------
 # Bilinear Operators (Joins)
 # -----------------------------------------------------------------------------
+
 
 def op_join_delta_trace(reg_delta, reg_trace, reg_out):
     """
@@ -251,6 +274,7 @@ def op_join_delta_trace(reg_delta, reg_trace, reg_out):
 
             trace_cursor.advance()
 
+
 def op_join_delta_delta(reg_a, reg_b, reg_out):
     """
     Sort-Merge Join: DeltaBatchA (x) DeltaBatchB
@@ -292,7 +316,8 @@ def op_join_delta_delta(reg_a, reg_b, reg_out):
 
             for i in range(start_a, end_a):
                 w_a = batch_a.weights[i]
-                if w_a == 0: continue
+                if w_a == 0:
+                    continue
 
                 for j in range(start_b, end_b):
                     w_b = batch_b.weights[j]
@@ -306,9 +331,11 @@ def op_join_delta_delta(reg_a, reg_b, reg_out):
                         )
                         output_batch.append(match_key, final_weight, final_payload)
 
+
 # -----------------------------------------------------------------------------
 # Integral / Sink Operators
 # -----------------------------------------------------------------------------
+
 
 def op_integrate(reg_in, target_engine):
     """
@@ -326,6 +353,7 @@ def op_integrate(reg_in, target_engine):
         payload = input_batch.payloads[i]
 
         target_engine.ingest(key, weight, payload)
+
 
 def op_distinct(reg_in, reg_out):
     """
@@ -345,5 +373,5 @@ def op_distinct(reg_in, reg_out):
             output_batch.append(
                 input_batch.keys[i],
                 r_int64(1),
-                input_batch.payloads[i]
+                input_batch.payloads[i],
             )

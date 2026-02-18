@@ -6,19 +6,9 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, values, strings, row_logic
+from gnitz.core.row_logic import make_payload_row
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
-
-
-def make_payload_row(n_payload_cols):
-    """
-    Canonical constructor for a payload row (List[TaggedValue]).
-
-    Every site in the codebase that constructs a fresh List[TaggedValue]
-    MUST call this function instead of writing a literal.
-    """
-    return newlist_hint(n_payload_cols)
-
 
 @jit.unroll_safe
 def _compare_payload_rows(schema, left_row, right_row):
