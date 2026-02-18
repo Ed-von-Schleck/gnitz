@@ -199,8 +199,8 @@ class UnifiedCursor(object):
             min_key = self.tree.get_min_key()
             candidates = self.tree.get_all_cursors_at_min()
 
+            # 1. Find the lexicographical minimum payload among all cursors at min_key
             best_cursor = candidates[0]
-            # Use virtual getter instead of direct attribute access
             best_acc = best_cursor.get_row_accessor()
             
             idx = 1
@@ -208,53 +208,40 @@ class UnifiedCursor(object):
             while idx < num_candidates:
                 curr = candidates[idx]
                 curr_acc = curr.get_row_accessor()
-                if (
-                    comparator.compare_rows(
-                        self.schema, curr_acc, best_acc
-                    )
-                    < 0
-                ):
+                if comparator.compare_rows(self.schema, curr_acc, best_acc) < 0:
                     best_cursor = curr
                     best_acc = curr_acc
                 idx += 1
 
+            # 2. Identify all cursors belonging to this specific payload group
+            # and calculate their net algebraic weight.
             net_weight = r_int64(0)
+            to_advance_indices = []
+            
             idx = 0
             while idx < num_candidates:
                 curr = candidates[idx]
                 curr_acc = curr.get_row_accessor()
-                if (
-                    comparator.compare_rows(
-                        self.schema, curr_acc, best_acc
-                    )
-                    == 0
-                ):
+                if comparator.compare_rows(self.schema, curr_acc, best_acc) == 0:
                     net_weight += curr.weight()
+                    # Store the index in the original cursors list
+                    to_advance_indices.append(self._get_cursor_index(curr))
                 idx += 1
 
+            # 3. Decision Logic
             if net_weight != 0:
+                # Found the next non-annihilated row. 
+                # We DO NOT advance yet; the cursor stays here until user calls advance().
                 self._current_key = min_key
                 self._current_weight = net_weight
-                # Store the accessor, implicitly unified to RowAccessor base
                 self._current_accessor = best_acc
                 self._valid = True
                 return
             else:
-                # Annihilated (Ghost). Advance all matching cursors.
-                idx = 0
-                while idx < num_candidates:
-                    curr = candidates[idx]
-                    curr_acc = curr.get_row_accessor()
-                    if (
-                        comparator.compare_rows(
-                            self.schema, curr_acc, best_acc
-                        )
-                        == 0
-                    ):
-                        self.tree.advance_cursor_by_index(
-                            self._get_cursor_index(curr)
-                        )
-                    idx += 1
+                # Annihilated (Ghost). Advance the entire group and repeat.
+                for c_idx in to_advance_indices:
+                    self.tree.advance_cursor_by_index(c_idx)
+        
         self._valid = False
 
     def _get_cursor_index(self, target):
@@ -274,16 +261,22 @@ class UnifiedCursor(object):
     def advance(self):
         if not self._valid:
             return
+            
+        # 1. Identify all cursors contributing to the CURRENT row.
+        # target_accessor is stable because we haven't called advance() yet.
         target_accessor = self._current_accessor
         candidates = self.tree.get_all_cursors_at_min()
+        
+        to_advance_indices = []
         for c in candidates:
-            # Use virtual getter
-            c_acc = c.get_row_accessor()
-            if (
-                comparator.compare_rows(self.schema, c_acc, target_accessor)
-                == 0
-            ):
-                self.tree.advance_cursor_by_index(self._get_cursor_index(c))
+            if comparator.compare_rows(self.schema, c.get_row_accessor(), target_accessor) == 0:
+                to_advance_indices.append(self._get_cursor_index(c))
+        
+        # 2. Advance them all simultaneously.
+        for c_idx in to_advance_indices:
+            self.tree.advance_cursor_by_index(c_idx)
+            
+        # 3. Search for the next group.
         self._find_next_non_ghost()
 
     def key(self):

@@ -128,13 +128,9 @@ def write_wal_block(fd, lsn, table_id, records, schema):
             record_base = curr_off
 
             # Pack Primary Key
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, record_base))[0] = r_uint64(
-                rec.pk_lo
-            )
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, record_base))[0] = r_uint64(rec.pk_lo)
             if is_u128:
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, record_base + 8))[
-                    0
-                ] = r_uint64(rec.pk_hi)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, record_base + 8))[0] = r_uint64(rec.pk_hi)
             record_base += key_size
 
             # Pack Weight
@@ -145,8 +141,6 @@ def write_wal_block(fd, lsn, table_id, records, schema):
 
             # Payload start
             p_start = record_base
-            # The next available overflow slot starts after all AoS records in this batch,
-            # but for simplicity, we keep them intermingled per-record as in previous spec.
             # Advance overflow cursor to start after current AoS record fixed stride.
             cursor_ref[0] = record_base + stride
 
@@ -163,23 +157,20 @@ def write_wal_block(fd, lsn, table_id, records, schema):
 
                     if col_type == types.TYPE_STRING:
                         assert val_obj.tag == db_values.TAG_STRING
-                        string_logic.pack_and_write_blob(
-                            target, val_obj.str_val, allocator
-                        )
+                        string_logic.pack_and_write_blob(target, val_obj.str_val, allocator)
 
                     elif col_type == types.TYPE_F64:
                         assert val_obj.tag == db_values.TAG_FLOAT
-                        rffi.cast(rffi.DOUBLEP, target)[0] = rffi.cast(
-                            rffi.DOUBLE, val_obj.f64
-                        )
+                        rffi.cast(rffi.DOUBLEP, target)[0] = rffi.cast(rffi.DOUBLE, val_obj.f64)
 
                     elif col_type == types.TYPE_U128:
-                        assert val_obj.tag == db_values.TAG_INT
-                        uv = r_uint128(val_obj.i64)
+                        # TYPE_U128 non-PK columns carry TAG_U128 with lo in i64 and hi in u128_hi.
+                        assert val_obj.tag == db_values.TAG_U128
+                        lo = r_uint128(r_uint64(val_obj.i64))
+                        hi = r_uint128(val_obj.u128_hi)
+                        uv = (hi << 64) | lo
                         rffi.cast(rffi.ULONGLONGP, target)[0] = r_uint64(uv)
-                        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = r_uint64(
-                            uv >> 64
-                        )
+                        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = r_uint64(uv >> 64)
 
                     else:
                         assert val_obj.tag == db_values.TAG_INT
@@ -196,18 +187,14 @@ def write_wal_block(fd, lsn, table_id, records, schema):
             for k in range(WAL_BLOCK_HEADER_SIZE):
                 h_buf[k] = "\x00"
             rffi.cast(rffi.ULONGLONGP, h_buf)[0] = r_uint64(lsn)
-            rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 8))[0] = rffi.cast(
-                rffi.UINT, table_id
-            )
-            rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 12))[0] = rffi.cast(
-                rffi.UINT, num_records
-            )
+            rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 8))[0] = rffi.cast(rffi.UINT, table_id)
+            rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 12))[0] = rffi.cast(rffi.UINT, num_records)
             rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 16))[0] = rffi.cast(
                 rffi.UINT, WAL_BLOCK_HEADER_SIZE + total_body_size
             )
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h_buf, 24))[
-                0
-            ] = checksum.compute_checksum(buf, total_body_size)
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h_buf, 24))[0] = checksum.compute_checksum(
+                buf, total_body_size
+            )
 
             if (
                 mmap_posix.write_c(fd, h_buf, rffi.cast(rffi.SIZE_T, WAL_BLOCK_HEADER_SIZE))
@@ -285,9 +272,7 @@ def decode_wal_block(block_ptr, block_len, schema):
                     u32_ptr = rffi.cast(rffi.UINTP, fptr)
                     length = rffi.cast(lltype.Signed, u32_ptr[0])
                     if length > string_logic.SHORT_STRING_THRESHOLD:
-                        u64_payload_ptr = rffi.cast(
-                            rffi.ULONGLONGP, rffi.ptradd(fptr, 8)
-                        )
+                        u64_payload_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(fptr, 8))
                         offset = rffi.cast(lltype.Signed, u64_payload_ptr[0])
                         blob_end_ptr = rffi.ptradd(block_ptr, offset + length)
 
@@ -301,8 +286,10 @@ def decode_wal_block(block_ptr, block_len, schema):
                     val = db_values.TaggedValue.make_float(f_val)
 
                 elif col_def.field_type == types.TYPE_U128:
-                    l = rffi.cast(rffi.ULONGLONGP, fptr)[0]
-                    val = db_values.TaggedValue.make_int(l)
+                    # Read both halves — high word was previously discarded (bug fix).
+                    lo = r_uint64(rffi.cast(rffi.ULONGLONGP, fptr)[0])
+                    hi = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(fptr, 8))[0])
+                    val = db_values.TaggedValue.make_u128(lo, hi)
 
                 else:
                     i_val = rffi.cast(rffi.ULONGLONGP, fptr)[0]

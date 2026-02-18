@@ -12,11 +12,13 @@ from gnitz.core import types, strings as string_logic, values as db_values
 
 NULL_CHARP = lltype.nullptr(rffi.CCHARP.TO)
 
+
 class ShardWriterBlobAllocator(string_logic.BlobAllocator):
     """
     Allocator strategy for TableShardWriter string tails.
     Wraps the shard's deduplication and blob heap logic.
     """
+
     def __init__(self, writer):
         self.writer = writer
 
@@ -27,11 +29,13 @@ class ShardWriterBlobAllocator(string_logic.BlobAllocator):
             off = self.writer._get_or_append_blob(blob_src, length)
             return r_uint64(off)
 
+
 class TableShardWriter(object):
     """
     Handles the creation of N-Partition columnar shards.
     Refactored to use centralized German String serialization.
     """
+
     _immutable_fields_ = ['schema', 'table_id', 'blob_allocator']
 
     def __init__(self, schema, table_id=0):
@@ -39,7 +43,7 @@ class TableShardWriter(object):
         self.table_id = table_id
         self.count = 0
         pk_col = schema.get_pk_column()
-        
+
         self.pk_buf = buffer.Buffer(pk_col.field_type.size * 1024, growable=True)
         self.w_buf = buffer.Buffer(8 * 1024, growable=True)
 
@@ -68,7 +72,7 @@ class TableShardWriter(object):
         if cache_key in self.blob_cache:
             existing_offset = self.blob_cache[cache_key]
             existing_ptr = rffi.ptradd(self.b_buf.ptr, existing_offset)
-            
+
             # Binary comparison to ensure deduplication safety (collisions)
             match = True
             for i in range(length):
@@ -77,7 +81,7 @@ class TableShardWriter(object):
                     break
             if match:
                 return existing_offset
-        
+
         new_offset = self.b_buf.offset
         self.b_buf.put_bytes(src_ptr, length)
         self.blob_cache[cache_key] = new_offset
@@ -101,12 +105,13 @@ class TableShardWriter(object):
                     old_off = rffi.cast(lltype.Signed, u64_view[0])
                     if not source_heap_ptr:
                         raise errors.StorageError("Long string relocation requires source heap")
-                    
+
                     blob_src = rffi.ptradd(source_heap_ptr, old_off)
                     new_off = self._get_or_append_blob(blob_src, length)
 
                     # Copy the 16-byte struct and swizzle the offset
-                    for b in range(16): self.scratch_val_buf[b] = val_ptr[b]
+                    for b in range(16):
+                        self.scratch_val_buf[b] = val_ptr[b]
                     u64_payload = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.scratch_val_buf, 8))
                     u64_payload[0] = r_uint64(new_off)
                     buf.put_bytes(self.scratch_val_buf, 16)
@@ -117,9 +122,9 @@ class TableShardWriter(object):
                 # PATH: Ingestion (Python String)
                 assert string_data is not None
                 string_logic.pack_and_write_blob(
-                    self.scratch_val_buf, 
-                    string_data, 
-                    self.blob_allocator
+                    self.scratch_val_buf,
+                    string_data,
+                    self.blob_allocator,
                 )
                 buf.put_bytes(self.scratch_val_buf, 16)
         else:
@@ -184,21 +189,22 @@ class TableShardWriter(object):
             if ftype == types.TYPE_STRING:
                 assert val_obj.tag == db_values.TAG_STRING
                 self._append_value(i, NULL_CHARP, NULL_CHARP, string_data=val_obj.str_val)
-                
+
             elif ftype == types.TYPE_F64:
                 assert val_obj.tag == db_values.TAG_FLOAT
                 rffi.cast(rffi.DOUBLEP, self.scratch_val_buf)[0] = rffi.cast(
                     rffi.DOUBLE, val_obj.f64
                 )
                 self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-                
+
             elif ftype == types.TYPE_U128:
-                assert val_obj.tag == db_values.TAG_INT
+                # TYPE_U128 non-PK columns carry TAG_U128 with lo in i64 and hi in u128_hi.
+                assert val_obj.tag == db_values.TAG_U128
                 u64_ptr = rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)
-                u64_ptr[0] = rffi.cast(rffi.ULONGLONG, val_obj.i64)
-                u64_ptr[1] = rffi.cast(rffi.ULONGLONG, 0)
+                u64_ptr[0] = rffi.cast(rffi.ULONGLONG, r_uint64(val_obj.i64))  # lo
+                u64_ptr[1] = rffi.cast(rffi.ULONGLONG, val_obj.u128_hi)         # hi
                 self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-                
+
             else:
                 assert val_obj.tag == db_values.TAG_INT
                 rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)[0] = rffi.cast(
@@ -267,18 +273,18 @@ class TableShardWriter(object):
                     header[i] = "\x00"
                     i += 1
                 rffi.cast(rffi.ULONGLONGP, header)[0] = layout.MAGIC_NUMBER
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_VERSION))[0] = (
-                    rffi.cast(rffi.ULONGLONG, layout.VERSION)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_VERSION))[0] = rffi.cast(
+                    rffi.ULONGLONG, layout.VERSION
                 )
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_ROW_COUNT))[
-                    0
-                ] = rffi.cast(rffi.ULONGLONG, self.count)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_DIR_OFFSET))[
-                    0
-                ] = rffi.cast(rffi.ULONGLONG, dir_offset)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_TABLE_ID))[
-                    0
-                ] = rffi.cast(rffi.ULONGLONG, self.table_id)
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_ROW_COUNT))[0] = rffi.cast(
+                    rffi.ULONGLONG, self.count
+                )
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_DIR_OFFSET))[0] = rffi.cast(
+                    rffi.ULONGLONG, dir_offset
+                )
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_TABLE_ID))[0] = rffi.cast(
+                    rffi.ULONGLONG, self.table_id
+                )
                 mmap_posix.write_c(fd, header, rffi.cast(rffi.SIZE_T, layout.HEADER_SIZE))
             finally:
                 lltype.free(header, flavor="raw")
@@ -293,12 +299,8 @@ class TableShardWriter(object):
                     cs = checksum.compute_checksum(buf_ptr, sz)
                     base = rffi.ptradd(dir_buf, i * layout.DIR_ENTRY_SIZE)
                     rffi.cast(rffi.ULONGLONGP, base)[0] = rffi.cast(rffi.ULONGLONG, off)
-                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0] = rffi.cast(
-                        rffi.ULONGLONG, sz
-                    )
-                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0] = rffi.cast(
-                        rffi.ULONGLONG, cs
-                    )
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0] = rffi.cast(rffi.ULONGLONG, sz)
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0] = rffi.cast(rffi.ULONGLONG, cs)
                     i += 1
                 mmap_posix.write_c(fd, dir_buf, rffi.cast(rffi.SIZE_T, dir_size_bytes))
             finally:
@@ -329,6 +331,6 @@ class TableShardWriter(object):
         finally:
             rposix.close(fd)
             self.close()
-        
+
         os.rename(tmp_filename, filename)
         mmap_posix.fsync_dir(filename)

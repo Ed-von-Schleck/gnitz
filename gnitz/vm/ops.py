@@ -53,7 +53,9 @@ def materialize_row(accessor, schema):
 
         elif type_code == types.TYPE_U128.code:
             val_u128 = accessor.get_u128(i)
-            result.append(values.TaggedValue.make_int(r_uint64(val_u128)))
+            lo = r_uint64(val_u128)
+            hi = r_uint64(val_u128 >> 64)
+            result.append(values.TaggedValue.make_u128(lo, hi))
 
         else:
             result.append(values.TaggedValue.make_null())
@@ -307,4 +309,3 @@ def op_distinct(reg_in, reg_out):
                 r_int64(1),
                 input_batch.get_payload(i),
             )
-

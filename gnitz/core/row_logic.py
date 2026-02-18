@@ -90,3 +90,48 @@ class BaseRowAccessor(comparator.RowAccessor):
     def get_col_ptr(self, col_idx):
         """Returns a raw pointer to column data (if available)."""
         raise NotImplementedError
+
+
+class PayloadRowComparator(object):
+    """
+    Pre-allocated comparator for two List[TaggedValue] payload rows.
+
+    This is the canonical comparison entry point for the VM layer
+    (gnitz/vm). Code in gnitz/vm must never import gnitz/storage/comparator
+    directly; instead it imports and uses this class, which acts as an API
+    proxy that delegates to the storage comparator.
+
+    Holds a reusable pair of ValueAccessor instances so that ZSetBatch
+    sort() and consolidate() can compare rows without per-call allocation.
+    Handles all column types correctly, including TAG_U128 columns (which
+    carry both i64 and u128_hi fields) and unsigned integer types whose
+    ordering must be unsigned-correct.
+
+    Usage:
+        cmp = PayloadRowComparator(schema)
+        result = cmp.compare(left_list, right_list)  # returns -1, 0, or 1
+    """
+
+    _immutable_fields_ = ["_schema"]
+
+    def __init__(self, schema):
+        self._schema = schema
+        self._left = comparator.ValueAccessor(schema)
+        self._right = comparator.ValueAccessor(schema)
+
+    def compare(self, left_values, right_values):
+        """
+        Compares two List[TaggedValue] rows using the canonical storage
+        comparator (comparator.compare_rows). Handles all column types
+        including TAG_U128 correctly.
+
+        Args:
+            left_values:  List[TaggedValue] — non-PK payload for the left row.
+            right_values: List[TaggedValue] — non-PK payload for the right row.
+
+        Returns:
+            -1 if left < right, 0 if equal, 1 if left > right.
+        """
+        self._left.set_row(left_values)
+        self._right.set_row(right_values)
+        return comparator.compare_rows(self._schema, self._left, self._right)

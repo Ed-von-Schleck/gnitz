@@ -6,42 +6,9 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, values, strings, row_logic
-from gnitz.core.row_logic import make_payload_row
+from gnitz.core.row_logic import make_payload_row, PayloadRowComparator
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
-
-
-@jit.unroll_safe
-def _compare_payload_rows(schema, left_row, right_row):
-    """
-    Compares two rows stored as List[TaggedValue] using pure value comparisons.
-    """
-    pk_idx = schema.pk_index
-    payload_idx = 0
-    for i in range(len(schema.columns)):
-        if i == pk_idx:
-            continue
-        col_type = schema.columns[i].field_type
-        l_val = left_row[payload_idx]
-        r_val = right_row[payload_idx]
-        payload_idx += 1
-
-        if col_type == types.TYPE_STRING:
-            if l_val.str_val < r_val.str_val:
-                return -1
-            if l_val.str_val > r_val.str_val:
-                return 1
-        elif col_type == types.TYPE_F64:
-            if l_val.f64 < r_val.f64:
-                return -1
-            if l_val.f64 > r_val.f64:
-                return 1
-        else:
-            if l_val.i64 < r_val.i64:
-                return -1
-            if l_val.i64 > r_val.i64:
-                return 1
-    return 0
 
 
 class BatchAccessor(row_logic.BaseRowAccessor):
@@ -73,7 +40,11 @@ class BatchAccessor(row_logic.BaseRowAccessor):
         return self._get_val(col_idx).f64
 
     def get_u128(self, col_idx):
-        return r_uint128(rffi.cast(rffi.ULONGLONG, self._get_val(col_idx).i64))
+        val = self._get_val(col_idx)
+        assert val.tag == values.TAG_U128
+        lo = r_uint128(r_uint64(val.i64))
+        hi = r_uint128(val.u128_hi)
+        return (hi << 64) | lo
 
     def get_str_struct(self, col_idx):
         val = self._get_val(col_idx)
@@ -94,7 +65,7 @@ class ZSetBatch(object):
     to ensure compatibility with RPython resizable list tracing.
     """
 
-    _immutable_fields_ = ["schema", "left_acc"]
+    _immutable_fields_ = ["schema", "left_acc", "_row_cmp"]
 
     def __init__(self, schema):
         self.schema = schema
@@ -103,6 +74,7 @@ class ZSetBatch(object):
         self.weights = newlist_hint(0)
         self.payloads = newlist_hint(0)
         self.left_acc = BatchAccessor(schema)
+        self._row_cmp = PayloadRowComparator(schema)
 
     def append(self, key, weight, payload):
         k = r_uint128(key)
@@ -136,9 +108,7 @@ class ZSetBatch(object):
         if lo1 > lo2:
             return False
 
-        return (
-            _compare_payload_rows(self.schema, self.payloads[i1], self.payloads[i2]) < 0
-        )
+        return self._row_cmp.compare(self.payloads[i1], self.payloads[i2]) < 0
 
     def sort(self):
         """Sorts deltas by (key, payload) ready for consolidation."""
@@ -192,14 +162,7 @@ class ZSetBatch(object):
                     or self.keys_lo[next_idx] != self.keys_lo[run_start]
                 ):
                     break
-                if (
-                    _compare_payload_rows(
-                        self.schema,
-                        self.payloads[run_start],
-                        self.payloads[next_idx],
-                    )
-                    != 0
-                ):
+                if self._row_cmp.compare(self.payloads[run_start], self.payloads[next_idx]) != 0:
                     break
                 total_weight += self.weights[next_idx]
                 next_idx += 1

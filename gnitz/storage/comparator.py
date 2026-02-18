@@ -85,8 +85,8 @@ class PackedNodeAccessor(RowAccessor):
         u32_ptr = rffi.cast(rffi.UINTP, ptr)
         length = rffi.cast(lltype.Signed, u32_ptr[0])
         prefix = rffi.cast(lltype.Signed, u32_ptr[1])
-        
-        # Annotator hint: ensure the 5th element is Optional[str] to match 
+
+        # Annotator hint: ensure the 5th element is Optional[str] to match
         # the VM's BatchAccessor.
         s = None
         if False:
@@ -165,6 +165,9 @@ class ValueAccessor(RowAccessor):
 
     def get_int(self, col_idx):
         val = self._get_val(col_idx)
+        # TAG_INT covers all column types from TYPE_I8 through TYPE_U64.
+        # TYPE_U128 columns carry TAG_U128 and are routed through get_u128(),
+        # never through this method.
         assert val.tag == db_values.TAG_INT
         return rffi.cast(rffi.ULONGLONG, val.i64)
 
@@ -175,8 +178,10 @@ class ValueAccessor(RowAccessor):
 
     def get_u128(self, col_idx):
         val = self._get_val(col_idx)
-        assert val.tag == db_values.TAG_INT
-        return r_uint128(val.i64)
+        assert val.tag == db_values.TAG_U128
+        lo = r_uint128(r_uint64(val.i64))   # undo the r_int64 bitcast
+        hi = r_uint128(val.u128_hi)
+        return (hi << 64) | lo
 
     def get_str_struct(self, col_idx):
         val = self._get_val(col_idx)
@@ -224,7 +229,7 @@ def compare_rows(schema, left, right):
             if res != 0:
                 return res
 
-        # 2. Handle 128-bit Integers (UUIDs/Keys)
+        # 2. Handle 128-bit Integers (UUIDs/non-PK foreign keys)
         elif col_type == types.TYPE_U128:
             l_val = left.get_u128(i)
             r_val = right.get_u128(i)
