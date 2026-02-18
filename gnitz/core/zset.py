@@ -14,9 +14,6 @@ class PersistentTable(object):
     The primary user-facing interface for GnitzDB. It integrates the 
     ingestion pipeline (WAL/MemTable) with the persistent storage layer (ShardIndex)
     via the Engine.
-    
-    This class serves as the boundary between the Persistent Storage 
-    and the Virtual Machine.
     """
     _immutable_fields_ = ['schema', 'table_id', 'directory', 'name']
 
@@ -78,7 +75,6 @@ class PersistentTable(object):
     def create_cursor(self):
         """
         [VM Hook] Returns a seekable UnifiedCursor (Trace Reader).
-        The VM uses this as a 'Trace Register' (R_T) for Joins and Reductions.
         """
         return self.engine.open_trace_cursor()
 
@@ -86,23 +82,21 @@ class PersistentTable(object):
         """
         [VM Hook] Integrates an entire ZSetBatch into the table in one go.
         This implements the DBSP 'Integrate' operator: S <- S + Delta.
-        
-        Note: zset_batch is expected to be a gnitz.vm.batch.ZSetBatch 
         """
         if self.read_only:
             return
             
-        count = zset_batch.count()
+        count = zset_batch.row_count()
         for i in range(count):
             # Ingest individual deltas into the MemTable/WAL
             self.engine.ingest(
                 zset_batch.get_key(i),
                 zset_batch.get_weight(i),
-                zset_batch.get_row_tagged_values(i)
+                zset_batch.get_payload(i)
             )
 
     def get_schema(self):
-        """[VM Hook] Returns the TableSchema to determine column offsets."""
+        """[VM Hook] Returns the TableSchema."""
         return self.schema
 
     # -------------------------------------------------------------------------
@@ -124,12 +118,10 @@ class PersistentTable(object):
     def flush(self):
         """
         Materializes current MemTable to an immutable Shard.
-        Triggers checkpointing and potential compaction.
         """
         if self.read_only:
             return ""
 
-        # Construct a filename based on the starting LSN of this epoch
         lsn_val = intmask(self.engine.starting_lsn)
         filename = os.path.join(self.directory, "%s_shard_%d.db" % (
             self.name, lsn_val)
@@ -152,7 +144,7 @@ class PersistentTable(object):
             self.wal_writer.truncate_before_lsn(lsn + r_uint64(1))
 
     def _trigger_compaction(self):
-        """Orchestrates an N-way merge of overlapping shards."""
+        """Orchestrates compaction."""
         if self.read_only:
             return
             
@@ -164,7 +156,7 @@ class PersistentTable(object):
         )
 
     def close(self):
-        """Gracefully closes all mmaps, locks, and files."""
+        """Gracefully closes resources."""
         if self.is_closed: return
         self.engine.close()
         if self.wal_writer: self.wal_writer.close()
