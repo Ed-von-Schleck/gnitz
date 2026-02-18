@@ -172,7 +172,15 @@ class UnifiedCursor(object):
     The TRACE READER.
     """
 
-    _immutable_fields_ = ["schema", "cursors[*]"]
+    # NOTE: "cursors" is intentionally NOT listed as "cursors[*]".
+    # The [*] suffix would mark the List[BaseCursor] as mr (must not resize)
+    # in RPython's listdef system. Because RPython's type inference is global
+    # and retroactive, the mr constraint propagates backwards to every append
+    # site that fed the same listdef — including the append calls in
+    # Engine.open_trace_cursor that build the list before passing it here.
+    # This causes ListChangeUnallowed at those append sites even though the
+    # appends precede the assignment. Removing [*] keeps the listdef resizable.
+    _immutable_fields_ = ["schema"]
 
     def __init__(self, schema, cursors):
         self.schema = schema

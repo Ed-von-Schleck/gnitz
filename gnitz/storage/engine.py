@@ -213,14 +213,22 @@ class Engine(object):
         """
         from gnitz.storage.cursor import MemTableCursor, ShardCursor, UnifiedCursor
         
-        num_shards = len(self.index.handles)
-        # Create a fixed-size list to satisfy UnifiedCursor._immutable_fields_ ['cursors[*]']
-        cs = [None] * (num_shards + 1)
-        
-        cs[0] = MemTableCursor(self.active_table)
-        for i in range(num_shards):
-            h = self.index.handles[i]
-            cs[i + 1] = ShardCursor(h.view)
+        # Build the cursor list using append, never [None] * n.
+        #
+        # [None] * (n + 1) initializes a List[None] that widens to
+        # List[None | BaseCursor] when cursor objects are assigned into it.
+        # UnifiedCursor._immutable_fields_ = ["cursors[*]"] tells RPython to
+        # store cursors as a raw C array with direct non-nullable pointer loads.
+        # The Optional element type conflicts with that expectation: the C code
+        # reads each slot as a BaseCursor* but gets a nullable representation,
+        # causing a SIGSEGV when the first virtual dispatch is attempted.
+        #
+        # Using append on an empty list keeps the element type as List[BaseCursor]
+        # (non-nullable) throughout, which matches the [*] array contract.
+        cs = []
+        cs.append(MemTableCursor(self.active_table))
+        for i in range(len(self.index.handles)):
+            cs.append(ShardCursor(self.index.handles[i].view))
             
         return UnifiedCursor(self.schema, cs)
 

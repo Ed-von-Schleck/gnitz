@@ -170,6 +170,23 @@ class QueryBuilder(object):
         self.current_reg_idx = idx
         return self
 
+    def delay(self):
+        """
+        Implements the z^-1 (unit delay) operator.
+        The content of the current register at tick T becomes available at tick T+1.
+        Essential for recursive circuits and fixed-point iteration.
+        """
+        prev_reg = self.registers[self.current_reg_idx]
+        if not prev_reg.is_delta():
+            raise QueryError("Delay input must be a Delta stream")
+
+        idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
+        op = instructions.DelayOp(prev_reg, new_reg)
+        self.program.append(op)
+
+        self.current_reg_idx = idx
+        return self
+
     def join_persistent(self, table):
         prev_reg = self.registers[self.current_reg_idx]
         if not prev_reg.is_delta():
@@ -187,6 +204,23 @@ class QueryBuilder(object):
 
         out_idx, out_reg = self._add_register(out_schema)
         op = instructions.JoinDeltaTraceOp(prev_reg, trace_reg, out_reg)
+        self.program.append(op)
+
+        self.current_reg_idx = out_idx
+        return self
+
+    def join_delta(self, other_delta_reg, output_schema):
+        """
+        Joins the current delta stream with another delta register
+        (JOIN_DELTA_DELTA). Used for bilinear join expansion when both
+        inputs are transient batches rather than a batch and a persistent trace.
+        """
+        prev_reg = self.registers[self.current_reg_idx]
+        if not prev_reg.is_delta():
+            raise QueryError("JoinDeltaDelta left input must be a Delta stream")
+
+        out_idx, out_reg = self._add_register(output_schema)
+        op = instructions.JoinDeltaDeltaOp(prev_reg, other_delta_reg, out_reg)
         self.program.append(op)
 
         self.current_reg_idx = out_idx

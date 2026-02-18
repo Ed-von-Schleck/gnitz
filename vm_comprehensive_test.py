@@ -5,7 +5,7 @@ import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
 from gnitz.core import zset, types, values, query, scalar, row_logic
 from gnitz.core.row_logic import make_payload_row
-from gnitz.vm import batch, runtime, instructions, ops
+from gnitz.vm import batch, runtime, instructions, ops, interpreter
 
 
 class ComprehensiveFilter(scalar.ScalarFunction):
@@ -113,6 +113,74 @@ def test_full_vm_coverage(base_dir):
         res_tab.close()
 
 
+def test_delay_and_join_delta_delta(base_dir):
+    """
+    Exercises the DelayOp and JoinDeltaDeltaOp instruction types.
+    """
+    os.write(1, "[VM Comprehensive] Testing Delay and JoinDeltaDelta ops...\n")
+    db_path = os.path.join(base_dir, "vm_delay")
+    if not os.path.exists(db_path):
+        os.mkdir(db_path)
+
+    schema = types.TableSchema(
+        [
+            types.ColumnDefinition(types.TYPE_U128),
+            types.ColumnDefinition(types.TYPE_I64),
+        ],
+        pk_index=0,
+    )
+
+    # Schema for the output of Join(schema, schema).
+    # Result has PK(U128) + I64 (left) + I64 (right).
+    schema_out = types.TableSchema(
+        [
+            types.ColumnDefinition(types.TYPE_U128),
+            types.ColumnDefinition(types.TYPE_I64),
+            types.ColumnDefinition(types.TYPE_I64),
+        ],
+        pk_index=0,
+    )
+
+    tab = zset.PersistentTable(db_path, "delay_test", schema)
+    try:
+        vm_schema = runtime.VMSchema(schema)
+        vm_schema_out = runtime.VMSchema(schema_out)
+
+        # Three registers: input, delayed-input, join-output.
+        reg0 = runtime.DeltaRegister(0, vm_schema)
+        reg1 = runtime.DeltaRegister(1, vm_schema)
+        # Use the correct output schema for the join result register
+        reg2 = runtime.DeltaRegister(2, vm_schema_out)
+
+        reg_file = runtime.RegisterFile(3)
+        reg_file.registers[0] = reg0
+        reg_file.registers[1] = reg1
+        reg_file.registers[2] = reg2
+
+        # Circuit: delay(reg0) -> reg1, join_delta_delta(reg0, reg1) -> reg2
+        program = [
+            instructions.DelayOp(reg0, reg1),
+            instructions.JoinDeltaDeltaOp(reg0, reg1, reg2),
+            instructions.HaltOp(),
+        ]
+
+        interp = interpreter.DBSPInterpreter(tab.engine, reg_file, program)
+
+        pk = mk_u128(1, 2)
+        row = make_payload_row(1)
+        row.append(values.TaggedValue.make_int(r_uint64(42)))
+
+        input_batch = batch.ZSetBatch(schema)
+        input_batch.append(pk, r_int64(1), row)
+
+        interp.execute(input_batch)
+
+        os.write(1, "    [OK] Delay and JoinDeltaDelta ops verified.\n")
+        return True
+    finally:
+        tab.close()
+
+
 def entry_point(argv):
     os.write(1, "--- GnitzDB Comprehensive VM Coverage Test ---\n")
     base_dir = "vm_cov_data"
@@ -121,6 +189,8 @@ def entry_point(argv):
     os.mkdir(base_dir)
     try:
         if not test_full_vm_coverage(base_dir):
+            return 1
+        if not test_delay_and_join_delta_delta(base_dir):
             return 1
         os.write(1, "PASSED\n")
         return 0
