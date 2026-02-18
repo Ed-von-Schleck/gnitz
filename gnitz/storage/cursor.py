@@ -3,6 +3,7 @@
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import types
 from gnitz.storage import comparator, tournament_tree
 from gnitz.storage.memtable_node import node_get_key, node_get_weight, node_get_next_off
@@ -14,8 +15,6 @@ class BaseCursor(object):
     """Base class to allow homogeneous lists in RPython."""
 
     def __init__(self):
-        # FIXED: Removed self.accessor = None to prevent annotator from creating
-        # a unified slot on the base class that owns all subclass accessors.
         pass
 
     def seek(self, target_key):
@@ -40,10 +39,6 @@ class BaseCursor(object):
         raise NotImplementedError
 
     def get_row_accessor(self):
-        """
-        Virtual getter for the underlying RowAccessor.
-        Used by UnifiedCursor/Compactor to perform comparisons.
-        """
         raise NotImplementedError
 
 
@@ -159,34 +154,28 @@ class ShardCursor(BaseCursor):
 
 
 def _copy_cursors(cursors):
-    """
-    Returns a plain resizable copy of a cursor list using list comprehension.
-    This avoids introducing None into the list (which happens with [None]*n),
-    keeping the RPython type bounds tight.
-    """
     return [c for c in cursors]
 
 
 class UnifiedCursor(object):
     """
     The TRACE READER.
+    Unified view over multiple shards and memtables. 
+    Optimized for in-place tree reconstruction to eliminate malloc-churn.
     """
 
-    # NOTE: "cursors" is intentionally NOT listed as "cursors[*]".
-    # The [*] suffix would mark the List[BaseCursor] as mr (must not resize)
-    # in RPython's listdef system. Because RPython's type inference is global
-    # and retroactive, the mr constraint propagates backwards to every append
-    # site that fed the same listdef — including the append calls in
-    # Engine.open_trace_cursor that build the list before passing it here.
-    # This causes ListChangeUnallowed at those append sites even though the
-    # appends precede the assignment. Removing [*] keeps the listdef resizable.
-    _immutable_fields_ = ["schema"]
+    _immutable_fields_ = ["schema", "is_single_source"]
 
     def __init__(self, schema, cursors):
         self.schema = schema
-        # cursors must be a List[BaseCursor]
         self.cursors = cursors
-        self.tree = tournament_tree.TournamentTree(_copy_cursors(self.cursors))
+        self.num_cursors = len(cursors)
+        self.is_single_source = self.num_cursors == 1
+
+        if not self.is_single_source:
+            self.tree = tournament_tree.TournamentTree(_copy_cursors(self.cursors))
+        else:
+            self.tree = None
 
         self._current_key = r_uint128(0)
         self._current_weight = r_int64(0)
@@ -195,14 +184,25 @@ class UnifiedCursor(object):
         self._find_next_non_ghost()
 
     def _find_next_non_ghost(self):
+        if self.is_single_source:
+            cursor = self.cursors[0]
+            if cursor.is_valid():
+                self._current_key = cursor.key()
+                self._current_weight = cursor.weight()
+                self._current_accessor = cursor.get_row_accessor()
+                self._valid = True
+            else:
+                self._valid = False
+            return
+
         while not self.tree.is_exhausted():
             min_key = self.tree.get_min_key()
             candidates = self.tree.get_all_cursors_at_min()
 
-            # 1. Find the lexicographical minimum payload among all cursors at min_key
+            # 1. Find lexicographical minimum payload in group
             best_cursor = candidates[0]
             best_acc = best_cursor.get_row_accessor()
-            
+
             idx = 1
             num_candidates = len(candidates)
             while idx < num_candidates:
@@ -213,70 +213,68 @@ class UnifiedCursor(object):
                     best_acc = curr_acc
                 idx += 1
 
-            # 2. Identify all cursors belonging to this specific payload group
-            # and calculate their net algebraic weight.
+            # 2. Sum weight for this payload group
             net_weight = r_int64(0)
-            to_advance_indices = []
-            
+            to_advance_indices = newlist_hint(num_candidates)
+
             idx = 0
             while idx < num_candidates:
                 curr = candidates[idx]
                 curr_acc = curr.get_row_accessor()
                 if comparator.compare_rows(self.schema, curr_acc, best_acc) == 0:
                     net_weight += curr.weight()
-                    # Store the index in the original cursors list
                     to_advance_indices.append(self._get_cursor_index(curr))
                 idx += 1
 
-            # 3. Decision Logic
             if net_weight != 0:
-                # Found the next non-annihilated row. 
-                # We DO NOT advance yet; the cursor stays here until user calls advance().
                 self._current_key = min_key
                 self._current_weight = net_weight
                 self._current_accessor = best_acc
                 self._valid = True
                 return
             else:
-                # Annihilated (Ghost). Advance the entire group and repeat.
                 for c_idx in to_advance_indices:
                     self.tree.advance_cursor_by_index(c_idx)
-        
+
         self._valid = False
 
     def _get_cursor_index(self, target):
-        for i in range(len(self.cursors)):
+        """Helper to map a cursor instance back to its original index."""
+        for i in range(self.num_cursors):
             if self.cursors[i] is target:
                 return i
         return -1
 
     def seek(self, target_key):
+        """Monotonic seek across all sources using in-place heap rebuild."""
         for c in self.cursors:
             c.seek(target_key)
-        if self.tree:
-            self.tree.close()
-        self.tree = tournament_tree.TournamentTree(_copy_cursors(self.cursors))
+
+        if not self.is_single_source:
+            self.tree.rebuild()
+
         self._find_next_non_ghost()
 
     def advance(self):
         if not self._valid:
             return
-            
-        # 1. Identify all cursors contributing to the CURRENT row.
-        # target_accessor is stable because we haven't called advance() yet.
+
+        if self.is_single_source:
+            self.cursors[0].advance()
+            self._find_next_non_ghost()
+            return
+
         target_accessor = self._current_accessor
         candidates = self.tree.get_all_cursors_at_min()
-        
-        to_advance_indices = []
+
+        to_advance_indices = newlist_hint(len(candidates))
         for c in candidates:
             if comparator.compare_rows(self.schema, c.get_row_accessor(), target_accessor) == 0:
                 to_advance_indices.append(self._get_cursor_index(c))
-        
-        # 2. Advance them all simultaneously.
+
         for c_idx in to_advance_indices:
             self.tree.advance_cursor_by_index(c_idx)
-            
-        # 3. Search for the next group.
+
         self._find_next_non_ghost()
 
     def key(self):

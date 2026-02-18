@@ -3,33 +3,54 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
+from rpython.rlib.objectmodel import newlist_hint
 
-HEAP_NODE = lltype.Struct("HeapNode", 
+HEAP_NODE = lltype.Struct(
+    "HeapNode",
     ("key_low", rffi.ULONGLONG),
     ("key_high", rffi.ULONGLONG),
-    ("cursor_idx", rffi.INT)
+    ("cursor_idx", rffi.INT),
 )
 
+
 class TournamentTree(object):
-    """N-way merge heap specialized for 64-bit and 128-bit Primary Keys."""
+    """
+    N-way merge heap specialized for 64-bit and 128-bit Primary Keys.
+    Optimized for in-place reuse to eliminate malloc-churn during seek()
+    and O(log K) cursor advancement via position mapping.
+    """
+
     def __init__(self, cursors):
-        # cursors: List[BaseCursor]
         self.cursors = cursors
         self.num_cursors = len(cursors)
         self.heap_size = 0
-        self.heap = lltype.malloc(rffi.CArray(HEAP_NODE), self.num_cursors, flavor='raw')
-        
-        for i in range(self.num_cursors):
-            if not cursors[i].is_exhausted():
-                self._heap_push(cursors[i].peek_key(), i)
+        self.heap = lltype.malloc(rffi.CArray(HEAP_NODE), self.num_cursors, flavor="raw")
 
-    def _heap_push(self, key, c_idx):
-        idx = self.heap_size
-        self.heap_size += 1
-        self.heap[idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(key))
-        self.heap[idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(key >> 64))
-        self.heap[idx].cursor_idx = rffi.cast(rffi.INT, c_idx)
-        self._sift_up(idx)
+        self.pos_map = newlist_hint(self.num_cursors)
+        for _ in range(self.num_cursors):
+            self.pos_map.append(-1)
+
+        self.rebuild()
+
+    def rebuild(self):
+        """Floyd's Build-Heap: O(K) complexity. Re-initializes in-place."""
+        self.heap_size = 0
+        for i in range(self.num_cursors):
+            cursor = self.cursors[i]
+            if not cursor.is_exhausted():
+                idx = self.heap_size
+                self.heap_size += 1
+                key = cursor.peek_key()
+                self.heap[idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(key))
+                self.heap[idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(key >> 64))
+                self.heap[idx].cursor_idx = rffi.cast(rffi.INT, i)
+                self.pos_map[i] = idx
+            else:
+                self.pos_map[i] = -1
+
+        if self.heap_size > 1:
+            for i in range((self.heap_size // 2) - 1, -1, -1):
+                self._sift_down(i)
 
     def _get_key(self, idx):
         low = r_uint128(self.heap[idx].key_low)
@@ -42,7 +63,8 @@ class TournamentTree(object):
             if self._get_key(idx) < self._get_key(parent):
                 self._swap(idx, parent)
                 idx = parent
-            else: break
+            else:
+                break
 
     def _sift_down(self, idx):
         while True:
@@ -56,7 +78,8 @@ class TournamentTree(object):
             if smallest != idx:
                 self._swap(idx, smallest)
                 idx = smallest
-            else: break
+            else:
+                break
 
     def _swap(self, i, j):
         l, h, c = self.heap[i].key_low, self.heap[i].key_high, self.heap[i].cursor_idx
@@ -67,16 +90,20 @@ class TournamentTree(object):
         self.heap[j].key_high = h
         self.heap[j].cursor_idx = c
 
+        idx_i = rffi.cast(lltype.Signed, self.heap[i].cursor_idx)
+        idx_j = rffi.cast(lltype.Signed, self.heap[j].cursor_idx)
+        self.pos_map[idx_i] = i
+        self.pos_map[idx_j] = j
+
     def get_min_key(self):
-        if self.heap_size == 0: return r_uint128(-1)
+        if self.heap_size == 0:
+            return r_uint128(-1)
         return self._get_key(0)
 
     def get_all_cursors_at_min(self):
-        """Collects all cursors sharing the current minimum Primary Key."""
         results = []
-        if self.heap_size == 0: 
+        if self.heap_size == 0:
             return results
-        
         target = self.get_min_key()
         self._collect_equal_keys(0, target, results)
         return results
@@ -89,50 +116,37 @@ class TournamentTree(object):
             results.append(self.cursors[c_idx])
             self._collect_equal_keys(2 * idx + 1, target, results)
             self._collect_equal_keys(2 * idx + 2, target, results)
-    
+
     def advance_min_cursors(self, target_key=None):
-        if target_key is None: target_key = self.get_min_key()
+        """Restored method: Advances all cursors currently at min_key."""
+        if target_key is None:
+            target_key = self.get_min_key()
         while self.heap_size > 0 and self._get_key(0) == target_key:
             c_idx = rffi.cast(lltype.Signed, self.heap[0].cursor_idx)
-            self.cursors[c_idx].advance()
-            
-            if self.cursors[c_idx].is_exhausted():
-                last = self.heap_size - 1
-                self.heap[0].key_low = self.heap[last].key_low
-                self.heap[0].key_high = self.heap[last].key_high
-                self.heap[0].cursor_idx = self.heap[last].cursor_idx
-                self.heap_size -= 1
-                if self.heap_size > 0: self._sift_down(0)
-            else:
-                nk = self.cursors[c_idx].peek_key()
-                self.heap[0].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(nk))
-                self.heap[0].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(nk >> 64))
-                self._sift_down(0)
+            self.advance_cursor_by_index(c_idx)
 
     def advance_cursor_by_index(self, cursor_idx):
-        heap_idx = -1
-        for i in range(self.heap_size):
-            if rffi.cast(lltype.Signed, self.heap[i].cursor_idx) == cursor_idx:
-                heap_idx = i
-                break
-        
-        if heap_idx == -1: return
-
-        self.cursors[cursor_idx].advance()
-        
-        if self.cursors[cursor_idx].is_exhausted():
+        heap_idx = self.pos_map[cursor_idx]
+        if heap_idx == -1:
+            return
+        cursor = self.cursors[cursor_idx]
+        cursor.advance()
+        if cursor.is_exhausted():
+            self.pos_map[cursor_idx] = -1
             last = self.heap_size - 1
             if heap_idx != last:
+                last_c_idx = rffi.cast(lltype.Signed, self.heap[last].cursor_idx)
                 self.heap[heap_idx].key_low = self.heap[last].key_low
                 self.heap[heap_idx].key_high = self.heap[last].key_high
                 self.heap[heap_idx].cursor_idx = self.heap[last].cursor_idx
+                self.pos_map[last_c_idx] = heap_idx
                 self.heap_size -= 1
                 self._sift_down(heap_idx)
                 self._sift_up(heap_idx)
             else:
                 self.heap_size -= 1
         else:
-            nk = self.cursors[cursor_idx].peek_key()
+            nk = cursor.peek_key()
             self.heap[heap_idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(nk))
             self.heap[heap_idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(nk >> 64))
             self._sift_down(heap_idx)
@@ -140,7 +154,8 @@ class TournamentTree(object):
 
     def is_exhausted(self):
         return self.heap_size == 0
-        
+
     def close(self):
         if self.heap:
-            lltype.free(self.heap, flavor='raw')
+            lltype.free(self.heap, flavor="raw")
+            self.heap = lltype.nullptr(rffi.CArray(HEAP_NODE))
