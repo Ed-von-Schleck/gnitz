@@ -59,15 +59,12 @@ def _compare_accessors(acc_a, acc_b, schema):
                 s_a = meta_a[4]
                 s_b = meta_b[4]
                 
-                # If both are in-memory Python strings (Batch vs Batch)
                 if s_a is not None and s_b is not None:
                     if s_a != s_b: return -1
                 else:
-                    # Shard/Memory vs Batch comparison
-                    # We fallback to unpacking only when lengths and prefixes match
-                    # to minimize string object creation.
-                    val_a = s_a if s_a is not None else strings.unpack_string(meta_a[2], meta_a[0])
-                    val_b = s_b if s_b is not None else strings.unpack_string(meta_b[2], meta_b[0])
+                    # FIX: Change index 0 (length) to index 3 (heap pointer)
+                    val_a = s_a if s_a is not None else strings.unpack_string(meta_a[2], meta_a[3])
+                    val_b = s_b if s_b is not None else strings.unpack_string(meta_b[2], meta_b[3])
                     if val_a != val_b:
                         return -1
         else:
@@ -109,7 +106,8 @@ def materialize_row(accessor, schema):
             meta = accessor.get_str_struct(i)
             s_val = meta[4]
             if s_val is None:
-                s_val = strings.unpack_string(meta[2], meta[0])
+                # FIX: Change index 0 (length) to index 3 (heap pointer)
+                s_val = strings.unpack_string(meta[2], meta[3])
             result.append(values.TaggedValue.make_string(s_val))
 
         elif type_code == types.TYPE_U128.code:
@@ -265,51 +263,48 @@ def op_join_delta_delta(reg_a, reg_b, reg_out):
 # -----------------------------------------------------------------------------
 
 def op_distinct(reg_in, reg_history, reg_out):
-    input_batch = reg_in.batch
-    output_batch = reg_out.batch
-    output_batch.clear()
+    """
+    Incremental Distinct operator.
+    δ(Distinct(I)) = sign(T + d) - sign(T)
+    where T is current weight and d is incoming delta weight.
+    """
+    delta_batch = reg_in.batch
+    history = reg_history
+    out_batch = reg_out.batch
 
-    input_batch.sort()
-    input_batch.consolidate()
+    for i in range(delta_batch.row_count()):
+        key = delta_batch.get_key(i)
+        d_weight = delta_batch.get_weight(i)
+        payload = delta_batch.get_payload(i)
 
-    count = input_batch.row_count()
-    if count == 0: return
+        # 1. Get current accumulated weight from history using Key + Payload
+        t_weight = history.get_weight(key, payload)
+        new_weight = t_weight + d_weight
 
-    cursor = reg_history.cursor
-    schema = reg_history.vm_schema.table_schema
-    batch_acc = input_batch.left_acc
-
-    for i in range(count):
-        k = input_batch.get_key(i)
-        w_delta = input_batch.get_weight(i)
-        v_delta = input_batch.get_payload(i)
+        # 2. sign(x) is 1 if x > 0 else 0
+        old_sign = 1 if t_weight > 0 else 0
+        new_sign = 1 if new_weight > 0 else 0
         
-        batch_acc.set_row(input_batch, i)
+        out_weight = new_sign - old_sign
 
-        # Optimization: Check history for this specific record without materializing
-        w_old = r_int64(0)
-        cursor.seek(k)
-        while cursor.is_valid():
-            if cursor.key() != k: break
-            
-            # FAST PATH: Compare trace accessor directly against batch accessor
-            trace_acc = cursor.get_accessor()
-            if _compare_accessors(batch_acc, trace_acc, schema) == 0:
-                w_old = cursor.weight()
-                break
-            cursor.advance()
+        if out_weight != 0:
+            out_batch.append(key, out_weight, payload)
+        
+        # 3. Update history for the next record or epoch
+        history.update_weight(key, d_weight, payload)
 
-        w_new = w_old + w_delta
-        w_out = r_int64(0)
-
-        # DBSP Incremental Distinct Logic
-        if w_old <= 0 and w_new > 0:
-            w_out = r_int64(1)
-        elif w_old > 0 and w_new <= 0:
-            w_out = r_int64(-1)
-
-        if w_out != 0:
-            output_batch.append(k, w_out, v_delta)
+def op_distinct_stateless(reg_in, reg_out):
+    """
+    Non-incremental version for simple batch processing.
+    Simply squashes all positive weights to 1.
+    """
+    delta_batch = reg_in.batch
+    out_batch = reg_out.batch
+    for i in range(delta_batch.row_count()):
+        key = delta_batch.get_key(i)
+        w = delta_batch.get_weight(i)
+        if w > 0:
+            out_batch.append(key, 1, delta_batch.get_payload(i))
 
 # -----------------------------------------------------------------------------
 # Sinks
@@ -321,14 +316,3 @@ def op_integrate(reg_in, target_engine):
         w = input_batch.get_weight(i)
         if w != 0:
             target_engine.ingest(input_batch.get_key(i), w, input_batch.get_payload(i))
-
-def op_distinct_stateless(reg_in, reg_out):
-    """Fallback for non-incremental set normalization."""
-    input_batch = reg_in.batch
-    output_batch = reg_out.batch
-    output_batch.clear()
-    input_batch.sort()
-    input_batch.consolidate()
-    for i in range(input_batch.row_count()):
-        if input_batch.get_weight(i) > 0:
-            output_batch.append(input_batch.get_key(i), r_int64(1), input_batch.get_payload(i))

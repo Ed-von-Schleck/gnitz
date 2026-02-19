@@ -169,18 +169,28 @@ class TestVMOps(unittest.TestCase):
         reg_in = runtime.DeltaRegister(0, self.vm_schema)
         reg_out = runtime.DeltaRegister(1, self.vm_schema)
         
-        pk = r_uint128(1)
-        payload = self._mk_payload("Same", 10)
-        
-        # Add duplicate entries to be consolidated
-        reg_in.batch.append(pk, 2, payload)
-        reg_in.batch.append(pk, 3, payload)
-        
-        ops.op_distinct(reg_in, reg_out)
-        
-        # Result should be exactly 1 row with weight 1
-        self.assertEqual(reg_out.batch.row_count(), 1)
-        self.assertEqual(reg_out.batch.get_weight(0), r_int64(1))
+        db = zset.PersistentTable(self.test_dir, "dist_history", self.schema)
+        try:
+            cursor = db.create_cursor()
+            # Pass db as the table reference for state lookups
+            reg_hist = runtime.TraceRegister(2, self.vm_schema, cursor, db)
+            
+            pk = r_uint128(1)
+            payload = self._mk_payload("Same", 10)
+            
+            # Record doesn't exist (T=0). Add +5.
+            # sign(0+5) - sign(0) = 1.
+            reg_in.batch.append(pk, 5, payload)
+            
+            ops.op_distinct(reg_in, reg_hist, reg_out)
+            
+            self.assertEqual(reg_out.batch.row_count(), 1)
+            self.assertEqual(reg_out.batch.get_weight(0), r_int64(1))
+            
+            # Verify state was updated in history table
+            self.assertEqual(db.get_weight(pk, payload), 5)
+        finally:
+            db.close()
 
     def test_integrate_op(self):
         """Verify OP_INTEGRATE correctly flushes data into the storage engine."""

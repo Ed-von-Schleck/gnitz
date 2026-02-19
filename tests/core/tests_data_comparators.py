@@ -328,8 +328,14 @@ class TestDataComparators(unittest.TestCase):
 
         # Create a shard with u128 PK and a u128 column
         w = writer_table.TableShardWriter(self.schema_u128)
-        w.add_row_from_values(u128_1, 1, [db_values.TaggedValue.make_string("valA"), db_values.TaggedValue.make_int(u128_max)])
-        w.add_row_from_values(u128_2, 1, [db_values.TaggedValue.make_string("valB"), db_values.TaggedValue.make_int(u128_2)])
+        w.add_row_from_values(u128_1, 1, [
+            db_values.TaggedValue.make_string("valA"), 
+            db_values.TaggedValue.make_u128(r_uint64(u128_max), r_uint64(u128_max >> 64))
+        ])
+        w.add_row_from_values(u128_2, 1, [
+            db_values.TaggedValue.make_string("valB"), 
+            db_values.TaggedValue.make_u128(r_uint64(u128_2), r_uint64(u128_2 >> 64))
+        ])
         w.finalize(fn)
 
         v = shard_table.TableShardView(fn, self.schema_u128)
@@ -338,7 +344,10 @@ class TestDataComparators(unittest.TestCase):
 
         # Compare SoA row 0 (PK: 100, Col2: MAX_U128) vs Value (PK: not used, Col2: 150)
         acc_soa.set_row(v, 0)
-        acc_val.set_row([db_values.TaggedValue.make_string("valA"), db_values.TaggedValue.make_int(u128_3)])
+        acc_val.set_row([
+            db_values.TaggedValue.make_string("valA"), 
+            db_values.TaggedValue.make_u128(r_uint64(u128_3), r_uint64(u128_3 >> 64))
+        ])
         # The string "valA" will match. Comparison moves to u128 column.
         # MAX_U128 > 150, so SoA > Value -> result 1
         self.assertEqual(comparator.compare_rows(self.schema_u128, acc_soa, acc_val), 1)

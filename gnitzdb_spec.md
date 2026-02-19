@@ -151,22 +151,80 @@ Validation is performed via the corresponding checksum in the Column Directory.
 Contains a dense sequence of 64-bit signed integers mapping 1-to-1 by index to the keys in Region PK. This region is always required to support Z-Set algebraic summation.
 
 ### 5.6. Column Regions ($C_1 \dots C_n$)
-Each column in the `TableSchema` (excluding the Primary Key) is assigned its own discrete region.
-*   **Fixed-Stride Primitives:** Numeric types ($i8 \dots f64$) are stored as dense arrays.
-*   **German Strings:** Stored as 16-byte structs. Long strings contain a 64-bit offset into the **Shared Blob Heap (Region B)**.
+Each column in the `TableSchema` (excluding the Primary Key) is assigned its
+own discrete region.
+
+*   **Fixed-Stride Integer Primitives:** Integer types (`i8`, `i16`, `i32`,
+    `i64`, `u8`, `u16`, `u32`, `u64`) are stored as dense arrays with element
+    size equal to the column's declared byte width.
+
+*   **Fixed-Stride Floating-Point Primitives:** `f32` and `f64` are stored as
+    dense arrays of IEEE 754 single- or double-precision values.
+
+*   **TYPE_U128 (Non-PK Columns):** Stored as pairs of contiguous 64-bit
+    unsigned integers in little-endian order — the low 64 bits at the base
+    column offset, the high 64 bits at offset + 8 — giving a total of 16 bytes
+    per element. This physical layout is identical to the Primary Key region
+    layout for `u128` PKs, which allows the same raw-memory read path
+    (`SoAAccessor`, `PackedNodeAccessor`) to serve both cases.
+
+    **Distinction from TYPE_U128 Primary Keys.** Only one column per table may
+    be designated the Primary Key. Primary Key values of type `u128` flow
+    through the engine as native `r_uint128` throughout the ingestion pipeline,
+    SkipList nodes, cursor reads, and shard format, and never enter the
+    `TaggedValue` union. Non-PK columns of TYPE_U128 — typically UUID foreign
+    keys referencing another table — must transit the `TaggedValue` union
+    between the ingestion API and physical storage (see §8.7). The 16-byte
+    on-disk representation is identical for both cases; only the in-memory
+    handling differs.
+
+*   **German Strings (TYPE_STRING):** Stored as 16-byte structs. The structure
+    encodes a 4-byte length, a 4-byte prefix for O(1) equality rejection, and
+    an 8-byte payload that is either an inline suffix (strings ≤ 12 bytes) or
+    a 64-bit offset into the **Shared Blob Heap (Region B)**.
 
 ### 5.7. Region B: Shared Blob Heap
 A consolidated overflow region for variable-length string data. It is accessed via the 64-bit offsets stored within any string-type column region. All long string payloads are deduplicated within this region during shard finalization.
 
 ### 5.8. Z-Set Write-Ahead Log (WAL) Format
-The WAL is an append-only sequence of LSN-prefixed blocks. Unlike shards, the WAL uses a row-oriented (AoS) format for high-velocity durability.
+The WAL is an append-only sequence of LSN-prefixed blocks. Unlike shards, the
+WAL uses a row-oriented (AoS) format for high-velocity durability.
 
 **WAL Block Header (32 bytes):**
+
 *   `[00-07]` **LSN**: 64-bit monotonic Log Sequence Number.
 *   `[08-11]` **Table ID**: 32-bit unsigned integer identifying the table.
-*   `[12-15]` **Entry Count**: 32-bit unsigned integer (number of records in block).
-*   `[16-23]` **Block Checksum**: XXH3-64 hash of the block body.
-*   `[24-31]` **Reserved**: 64-bit padding.
+*   `[12-15]` **Entry Count**: 32-bit unsigned integer (number of records in
+    block).
+*   `[16-23]` **Block Size**: 32-bit unsigned integer (total byte length of
+    header + body). *(Bytes 20-23 reserved, padded with `0x00`.)*
+*   `[24-31]` **Block Checksum**: XXH3-64 hash of the block body.
+
+**WAL Block Body:**
+
+A stream of records, each formatted as:
+
+```
+[ Key (8 or 16 bytes) | Weight (8 bytes) | Packed Row Payload (Stride bytes) ]
+```
+
+*   **Key:** 8 bytes for `u64` PKs, 16 bytes for `u128` PKs. The key size is
+    determined by the `TableSchema`.
+*   **Weight:** 64-bit signed integer (`r_int64`).
+*   **Packed Row Payload:** AoS representation of all non-PK columns at their
+    schema-declared offsets. Column types are serialized as follows:
+
+    | Column Type | WAL Representation |
+    | :--- | :--- |
+    | Integer (`i8`…`u64`) | Native-width little-endian integer |
+    | `f64` / `f32` | IEEE 754 double / single |
+    | `TYPE_STRING` | 16-byte German String struct; long-string bodies appended inline after the fixed stride, with the struct's 8-byte payload field holding the absolute byte offset within the WAL block |
+    | `TYPE_U128` (non-PK) | Two contiguous 64-bit words: low word at the column's schema offset, high word at offset + 8 |
+
+Long German String overflow bodies are appended immediately after the fixed
+stride of each record. The allocated block size accounts for these overflows.
+The `WALBlobAllocator` manages the overflow cursor so that each string's
+absolute position within the block is stored in its German String struct.
 
 **WAL Block Body:**
 A stream of records formatted as: `[Key (8/16 bytes) | Weight (8 bytes) | Packed Row Payload (Stride bytes)]`. 
@@ -194,15 +252,38 @@ The MemTable utilizes a SkipList indexed by a composite key consisting of the **
 *   **In-Memory Annihilation:** If updates result in a net weight of zero for a specific payload, the record is marked as an annihilated "Ghost." These nodes are bypassed during the transmutation process to reclaim memory.
 
 ### 6.3. Physical Node Layout
-Nodes are allocated within a **Dual-Arena** system (Staging Arena and Blob Arena). To ensure native CPU register performance, the Primary Key field is 16-byte aligned.
+Nodes are allocated within the **Dual-Arena** system (Staging Arena and Blob
+Arena). To ensure native CPU register performance, the Primary Key field is
+16-byte aligned.
 
 **Node Structure:**
-*   `[00-07]` **Weight**: 64-bit signed integer ($w \in \mathbb{Z}$).
-*   `[08-08]` **Height**: 8-bit unsigned integer (SkipList tower height).
-*   `[09-11]` **Padding**: Ensures 4-byte alignment for pointers.
-*   `[12-XX]` **Next-Pointer Array**: Height-indexed array of 32-bit Arena offsets.
-*   `[XX-YY]` **Primary Key**: 64-bit or 128-bit unsigned integer.
-*   `[YY-ZZ]` **Packed Row Payload**: Fixed-stride payload containing inline primitives and 16-byte German String structs.
+
+*   `[00-07]` **Weight**: 64-bit signed integer (`w ∈ ℤ`).
+*   `[08-08]` **Height**: 8-bit unsigned integer (SkipList tower height `h`).
+*   `[09-11]` **Padding**: Three bytes ensuring 4-byte alignment for the
+    pointer array.
+*   `[12 … 12+(h×4)-1]` **Next-Pointer Array**: Height-indexed array of `h`
+    32-bit arena offsets, one per SkipList level.
+*   `[aligned to 16]` **Primary Key**: 8-byte (`u64`) or 16-byte (`u128`)
+    unsigned integer, stored at the first 16-byte-aligned offset after the
+    pointer array.
+*   `[PK end … PK end + Stride - 1]` **Packed Row Payload**: Fixed-stride
+    block containing the serialized values of all non-PK columns at their
+    `TableSchema`-declared offsets. Each column is stored as:
+
+    | Column Type | Node Representation |
+    | :--- | :--- |
+    | Integer (`i8`…`u64`) | Native-width value, bitcast from `r_int64` for TAG_INT |
+    | `f64` / `f32` | IEEE 754 double / single |
+    | `TYPE_U128` (non-PK) | Two contiguous 64-bit words: low word at the schema offset, high word at offset + 8, sourced from a TAG_U128 `TaggedValue` (see §8.7) |
+    | `TYPE_STRING` | 16-byte German String struct; long-string tails stored in the Blob Arena and referenced by their 64-bit blob-arena offset |
+
+When a MemTable node is flushed to a columnar shard, the
+`TableShardWriter` reads the `TYPE_U128` payload from raw memory via
+`PackedNodeAccessor.get_u128`, which reconstructs the full 128-bit value from
+the two 64-bit words. The `TaggedValue` union is not involved in the raw-memory
+flush path; it is only used during ingestion (WAL decode, VM operator output)
+when column values arrive as `List[TaggedValue]`.
 
 ### 6.4. Sealing and Transmutation (Unzipping)
 The transition from mutable row-oriented memory to immutable columnar persistence is triggered by Arena occupancy.
@@ -292,6 +373,89 @@ The RPython Meta-Tracing JIT optimizes the circuit execution based on the `VMSch
 *   **Metadata Promotion:** The `VMSchema` registry freezes column offsets, strides, and types as JIT-immutable constants. This allows the JIT to fold address arithmetic into immediate machine instructions.
 *   **Scalar Inlining:** User-defined `ScalarFunction` implementations are inlined directly into the trace. The JIT specializes the map/filter logic for the physical layout of the input `ZSetBatch`, eliminating the overhead of dynamic field lookups.
 *   **Loop Unrolling:** For small, fixed-width schemas, the JIT unrolls the columnar iteration, enabling vectorized loads and SIMD-optimized comparison kernels.
+
+### 8.7 In-Memory Value Representation: The TaggedValue Union
+
+The ingestion layer and VM pass non-PK column values through the `TaggedValue`
+union type (defined in `gnitz/core/values.py`). Because RPython requires every
+variable to have a single static type, a tagged-union pattern represents
+heterogeneous column values within homogeneous `List[TaggedValue]` payload
+rows.
+
+#### 8.7.1  Tag Table
+
+| Tag | Constant | Active Fields | Column Types Covered |
+| :---: | :--- | :--- | :--- |
+| 0 | `TAG_INT` | `i64` | `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` |
+| 1 | `TAG_FLOAT` | `f64` | `f32`, `f64` |
+| 2 | `TAG_STRING` | `str_val` | `TYPE_STRING` |
+| 3 | `TAG_NULL` | — | NULL marker |
+| 4 | `TAG_U128` | `i64` (lo word), `u128_hi` (hi word) | `TYPE_U128` non-PK columns |
+
+#### 8.7.2  Fields
+
+*   `i64: r_int64` — For `TAG_INT`: holds the column value, bitcast from
+    unsigned to signed where necessary (callers retrieve unsigned semantics via
+    `r_uint64(val.i64)`). For `TAG_U128`: holds the **low 64 bits** of the
+    128-bit value via the same `r_int64` bitcast.
+*   `u128_hi: r_uint64` — For `TAG_U128`: holds the **high 64 bits** of the
+    128-bit value. Set to `r_uint64(0)` for all other tags.
+*   `f64: float` — For `TAG_FLOAT`.
+*   `str_val: str` — For `TAG_STRING`.
+
+#### 8.7.3  Factory Methods
+
+| Factory | Tag Produced | Notes |
+| :--- | :--- | :--- |
+| `TaggedValue.make_int(val)` | `TAG_INT` | `intmask` truncates to machine word; `u128_hi = 0` |
+| `TaggedValue.make_float(val)` | `TAG_FLOAT` | `u128_hi = 0` |
+| `TaggedValue.make_string(val)` | `TAG_STRING` | `u128_hi = 0` |
+| `TaggedValue.make_null()` | `TAG_NULL` | `u128_hi = 0` |
+| `TaggedValue.make_u128(lo, hi)` | `TAG_U128` | `lo` and `hi` are `r_uint64`; `lo` stored as `r_int64(lo)` bitcast |
+
+#### 8.7.4  Reconstruction Identity for TAG_U128
+
+```python
+r_uint128_value = (r_uint128(val.u128_hi) << 64) | r_uint128(r_uint64(val.i64))
+```
+
+The `r_uint64(val.i64)` cast undoes the `r_int64` bitcast applied at
+construction time. This identity is used identically in `ValueAccessor.get_u128`
+(comparator layer), `BatchAccessor.get_u128` (VM batch layer), and every
+serialisation site that writes TAG_U128 values to raw memory.
+
+#### 8.7.5  Primary Key Boundary
+
+`TYPE_U128` Primary Keys **never** enter the `TaggedValue` union. They are
+handled as native `r_uint128` throughout:
+
+*   Ingestion API (`PersistentTable.insert` / `remove`)
+*   SkipList node key storage (`memtable_node.py`)
+*   Shard PK region reads (`TableShardView.get_pk_u128`)
+*   Cursor key comparison (`TournamentTree`, `UnifiedCursor`)
+
+The `TaggedValue` path applies exclusively to `TYPE_U128` columns that are
+**not** the designated Primary Key — for example, UUID foreign keys that
+reference another table's PK space.
+
+#### 8.7.6  Payload Row Comparison
+
+Within the VM layer, `List[TaggedValue]` payload rows are compared using
+`PayloadRowComparator` (defined in `gnitz/core/row_logic.py`). This class holds
+a pair of pre-allocated `ValueAccessor` instances and delegates to
+`comparator.compare_rows`, which dispatches on column type and enforces
+unsigned comparison semantics for all integer types, including TAG_U128 (via
+`ValueAccessor.get_u128`).
+
+Code in `gnitz/vm` must **never** import `gnitz/storage/comparator` directly.
+`PayloadRowComparator` is the designated API proxy that enforces the
+`vm` → `core` → `storage` dependency boundary.
+
+`ZSetBatch` holds a `_row_cmp: PayloadRowComparator` instance in its
+`_immutable_fields_` list and uses it in both `sort()` and `consolidate()`.
+This ensures that batch ordering is always consistent with the storage
+comparator, preventing incorrect join results or missed consolidations for rows
+whose TYPE_U128 payload columns differ only in the high word.
 
 ## 9. Distribution and Concurrency Model
 

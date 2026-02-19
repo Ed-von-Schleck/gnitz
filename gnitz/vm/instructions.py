@@ -1,7 +1,6 @@
 from rpython.rlib import jit
 
 class Instruction(object):
-    """Base class for all VM instructions."""
     _immutable_fields_ = ['opcode']
     
     HALT             = 0
@@ -11,10 +10,10 @@ class Instruction(object):
     UNION            = 4
     JOIN_DELTA_TRACE = 5
     JOIN_DELTA_DELTA = 6
-    INTEGRATE        = 7  # Terminal Sink
-    DELAY            = 8  # z^-1 (Feedback/Recursion)
-    REDUCE           = 9  # Aggregation (SUM, MIN, MAX)
-    DISTINCT         = 10 # Set-semantics normalization
+    INTEGRATE        = 7
+    DELAY            = 8
+    REDUCE           = 9
+    DISTINCT         = 10
 
     def __init__(self, opcode):
         self.opcode = opcode
@@ -50,66 +49,44 @@ class UnionOp(Instruction):
         self.reg_in_b = reg_in_b
         self.reg_out = reg_out
 
+class DistinctOp(Instruction):
+    _immutable_fields_ = ['reg_in', 'reg_history', 'reg_out']
+    def __init__(self, reg_in, reg_history, reg_out):
+        Instruction.__init__(self, self.DISTINCT)
+        self.reg_in = reg_in
+        self.reg_history = reg_history
+        self.reg_out = reg_out
+
 class JoinDeltaTraceOp(Instruction):
     _immutable_fields_ = ['reg_delta', 'reg_trace', 'reg_out']
     def __init__(self, reg_delta, reg_trace, reg_out):
         Instruction.__init__(self, self.JOIN_DELTA_TRACE)
-        self.reg_delta = reg_delta    # Delta Register (Batch)
-        self.reg_trace = reg_trace    # Trace Register (Cursor)
-        self.reg_out = reg_out
-
-class JoinDeltaDeltaOp(Instruction):
-    _immutable_fields_ = ['reg_delta_a', 'reg_delta_b', 'reg_out']
-    def __init__(self, reg_delta_a, reg_delta_b, reg_out):
-        Instruction.__init__(self, self.JOIN_DELTA_DELTA)
-        self.reg_delta_a = reg_delta_a
-        self.reg_delta_b = reg_delta_b
+        self.reg_delta = reg_delta
+        self.reg_trace = reg_trace
         self.reg_out = reg_out
 
 class IntegrateOp(Instruction):
-    """Sinks a ZSetBatch into a specific persistent table engine."""
     _immutable_fields_ = ['reg_in', 'target_engine']
     def __init__(self, reg_in, target_engine):
         Instruction.__init__(self, self.INTEGRATE)
         self.reg_in = reg_in
         self.target_engine = target_engine
 
-class HaltOp(Instruction):
-    def __init__(self):
-        Instruction.__init__(self, self.HALT)
-
 class DelayOp(Instruction):
-    """
-    Implements y = z^-1(x).
-    Moves the content of reg_in (t) to reg_out (t+1).
-    Essential for recursive circuits and Fixed-Point iteration.
-    """
     _immutable_fields_ = ['reg_in', 'reg_out']
     def __init__(self, reg_in, reg_out):
         Instruction.__init__(self, self.DELAY)
         self.reg_in = reg_in
         self.reg_out = reg_out
 
-class ReduceOp(Instruction):
-    """
-    Implements non-linear aggregation.
-    Iterates over a Trace (full state) or Batch to produce 
-    aggregated Z-Set (e.g., SUM(salary) GROUP BY dept).
-    """
-    _immutable_fields_ = ['reg_trace', 'reg_out', 'agg_func']
-    def __init__(self, reg_trace, reg_out, agg_func):
-        Instruction.__init__(self, self.REDUCE)
-        self.reg_trace = reg_trace
-        self.reg_out = reg_out
-        self.agg_func = agg_func # A ScalarFunction implementation
+class HaltOp(Instruction):
+    def __init__(self):
+        Instruction.__init__(self, self.HALT)
 
-class DistinctOp(Instruction):
-    """
-    Normalizes weights for set semantics. 
-    In DBSP, this ensures all records have weight 1.
-    """
-    _immutable_fields_ = ['reg_in', 'reg_out']
-    def __init__(self, reg_in, reg_out):
-        Instruction.__init__(self, self.DISTINCT)
-        self.reg_in = reg_in
+class JoinDeltaDeltaOp(Instruction):
+    _immutable_fields_ = ['reg_a', 'reg_b', 'reg_out']
+    def __init__(self, reg_a, reg_b, reg_out):
+        Instruction.__init__(self, self.JOIN_DELTA_DELTA)
+        self.reg_a = reg_a
+        self.reg_b = reg_b
         self.reg_out = reg_out
