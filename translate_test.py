@@ -4,7 +4,8 @@ import sys
 import os
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, intmask, r_uint64
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import zset, types, values as db_values
+from gnitz.core import types, values as db_values
+from gnitz.storage.table import PersistentTable
 from gnitz.core.row_logic import make_payload_row
 from gnitz.storage import compactor
 
@@ -62,7 +63,7 @@ def test_multiset_and_string_logic(base_dir):
         pk_index=0,
     )
 
-    db = zset.PersistentTable(db_path, "multiset", layout, cache_size=1024 * 1024)
+    db = PersistentTable(db_path, "multiset", layout, cache_size=1024 * 1024)
 
     try:
         pk = 12345
@@ -117,7 +118,7 @@ def test_triple_shard_compaction(base_dir):
         pk_index=0,
     )
 
-    db = zset.PersistentTable(db_path, "3way", layout, validate_checksums=True)
+    db = PersistentTable(db_path, "3way", layout, validate_checksums=True)
 
     try:
         # Shard 1: PK 100, 200
@@ -179,13 +180,13 @@ def test_cold_boot_and_cleanup(base_dir):
     )
 
     # 1. Create data and flush
-    db = zset.PersistentTable(db_path, "boot", layout)
+    db = PersistentTable(db_path, "boot", layout)
     db.insert(999, mk_int_payload(888))
     shard_name = db.flush()
     db.close()
 
     # 2. Re-open (This tests Manifest -> ShardIndex -> ShardHandle loading)
-    db2 = zset.PersistentTable(db_path, "boot", layout)
+    db2 = PersistentTable(db_path, "boot", layout)
     try:
         w = db2.get_weight(999, mk_int_payload(888))
         if w != 1:
@@ -227,11 +228,11 @@ def test_u128_recovery(base_dir):
 
     huge_k = (r_uint128(0xDEADBEEF) << 64) | r_uint128(0xCAFEBABE)
 
-    db = zset.PersistentTable(db_path, "u128wal", layout)
+    db = PersistentTable(db_path, "u128wal", layout)
     db.insert(huge_k, mk_int_payload(777))
     db.close()  # Crash simulation
 
-    db2 = zset.PersistentTable(db_path, "u128wal", layout)
+    db2 = PersistentTable(db_path, "u128wal", layout)
     try:
         w = db2.get_weight(huge_k, mk_int_payload(777))
         if w != 1:

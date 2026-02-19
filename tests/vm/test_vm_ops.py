@@ -4,7 +4,8 @@ import unittest
 import os
 import shutil
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_int64
-from gnitz.core import types, values, zset, scalar
+from gnitz.core import types, values, scalar
+from gnitz.storage.table import PersistentTable
 from gnitz.vm import batch, ops, runtime
 
 # ------------------------------------------------------------------------------
@@ -128,7 +129,7 @@ class TestVMOps(unittest.TestCase):
 
     def test_join_delta_trace(self):
         """Verify INLJ join between a batch and a PersistentTable cursor."""
-        db = zset.PersistentTable(self.test_dir, "join_table", self.schema)
+        db = PersistentTable(self.test_dir, "join_table", self.schema)
         try:
             # 1. Prepare Persistent State (Trace)
             db.insert(123, self._mk_payload("Persistent", 999))
@@ -169,7 +170,7 @@ class TestVMOps(unittest.TestCase):
         reg_in = runtime.DeltaRegister(0, self.vm_schema)
         reg_out = runtime.DeltaRegister(1, self.vm_schema)
         
-        db = zset.PersistentTable(self.test_dir, "dist_history", self.schema)
+        db = PersistentTable(self.test_dir, "dist_history", self.schema)
         try:
             cursor = db.create_cursor()
             # Pass db as the table reference for state lookups
@@ -194,7 +195,7 @@ class TestVMOps(unittest.TestCase):
 
     def test_integrate_op(self):
         """Verify OP_INTEGRATE correctly flushes data into the storage engine."""
-        db = zset.PersistentTable(self.test_dir, "sink_table", self.schema)
+        db = PersistentTable(self.test_dir, "sink_table", self.schema)
         try:
             reg_in = runtime.DeltaRegister(0, self.vm_schema)
             reg_in.batch.append(444, 1, self._mk_payload("Sinked", 42))

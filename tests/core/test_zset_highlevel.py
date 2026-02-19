@@ -2,7 +2,8 @@ import unittest
 import os
 import shutil
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from gnitz.core import zset, types, values as db_values
+from gnitz.core import types, values as db_values
+from gnitz.storage.table import PersistentTable
 
 class TestZSetHighLevel(unittest.TestCase):
     def setUp(self):
@@ -12,7 +13,7 @@ class TestZSetHighLevel(unittest.TestCase):
             types.ColumnDefinition(types.TYPE_U128), 
             types.ColumnDefinition(types.TYPE_STRING)
         ], 0)
-        self.db = zset.PersistentTable(self.test_dir, "test", self.layout)
+        self.db = PersistentTable(self.test_dir, "test", self.layout)
 
     def tearDown(self):
         if not self.db.is_closed: self.db.close()
@@ -29,7 +30,7 @@ class TestZSetHighLevel(unittest.TestCase):
         self.db.close()
         
         # 2. Recovery
-        self.db = zset.PersistentTable(self.test_dir, "test", self.layout)
+        self.db = PersistentTable(self.test_dir, "test", self.layout)
         self.assertEqual(self.db.get_weight(key, p), 1)
 
     def test_cross_shard_summation(self):

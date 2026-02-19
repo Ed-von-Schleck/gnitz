@@ -1,7 +1,8 @@
 import unittest
 import os
 import shutil
-from gnitz.core import types, values as db_values, zset
+from gnitz.core import types, values as db_values
+from gnitz.storage.table import PersistentTable
 from gnitz.storage import shard_table, memtable
 
 class TestMemTableManagement(unittest.TestCase):
@@ -25,7 +26,7 @@ class TestMemTableManagement(unittest.TestCase):
 
     def test_transmutation_roundtrip_via_engine(self):
         # Use the high-level PersistentTable, which uses the Engine internally
-        db = zset.PersistentTable(self.db_dir, "test_table", self.layout)
+        db = PersistentTable(self.db_dir, "test_table", self.layout)
         try:
             db.insert(10, [db_values.TaggedValue.make_string("short")])
             db.insert(20, [db_values.TaggedValue.make_string("long_blob_payload_relocation_test")])

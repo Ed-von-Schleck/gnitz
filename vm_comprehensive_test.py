@@ -3,7 +3,8 @@
 import sys
 import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
-from gnitz.core import zset, types, values, query, scalar, row_logic
+from gnitz.core import types, values, query, scalar, row_logic
+from gnitz.storage.table import PersistentTable
 from gnitz.core.row_logic import make_payload_row
 from gnitz.vm import batch, runtime, instructions, ops, interpreter
 
@@ -68,9 +69,9 @@ def test_full_vm_coverage(base_dir):
         pk_index=0,
     )
 
-    tab_a = zset.PersistentTable(db_path, "table_a", schema_a)
-    tab_b = zset.PersistentTable(db_path, "table_b", schema_b)
-    res_tab = zset.PersistentTable(db_path, "table_res", schema_a)	
+    tab_a = PersistentTable(db_path, "table_a", schema_a)
+    tab_b = PersistentTable(db_path, "table_b", schema_b)
+    res_tab = PersistentTable(db_path, "table_res", schema_a)	
 
     try:
         pk_x = mk_u128(0xAAAA, 0xBBBB)
@@ -142,7 +143,7 @@ def test_delay_and_join_delta_delta(base_dir):
         pk_index=0,
     )
 
-    tab = zset.PersistentTable(db_path, "delay_test", schema)
+    tab = PersistentTable(db_path, "delay_test", schema)
     try:
         vm_schema = runtime.VMSchema(schema)
         vm_schema_out = runtime.VMSchema(schema_out)

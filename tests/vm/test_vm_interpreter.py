@@ -4,8 +4,9 @@ import unittest
 import os
 import shutil
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_int64
-from gnitz.core import types, values, zset, scalar, query
-from gnitz.vm import batch, runtime
+from gnitz.core import types, values, scalar 
+from gnitz.storage.table import PersistentTable
+from gnitz.vm import batch, runtime, query
 
 # ------------------------------------------------------------------------------
 # Concrete ScalarFunctions for Testing
@@ -46,7 +47,7 @@ class TestVMInterpreter(unittest.TestCase):
         ], pk_index=0)
         
         # Helper DB for engine/context
-        self.db = zset.PersistentTable(self.test_dir, "ctx_db", self.schema)
+        self.db = PersistentTable(self.test_dir, "ctx_db", self.schema)
 
     def tearDown(self):
         self.db.close()
@@ -131,7 +132,7 @@ class TestVMInterpreter(unittest.TestCase):
 
     def test_integrate_feedback_loop(self):
         """Verify circuit can sink data back into a PersistentTable."""
-        sink_db = zset.PersistentTable(self.test_dir, "sink_db", self.schema)
+        sink_db = PersistentTable(self.test_dir, "sink_db", self.schema)
         
         # Use the new fluent API
         qb = query.QueryBuilder(self.db, self.schema)
@@ -160,7 +161,7 @@ class TestVMInterpreter(unittest.TestCase):
         Tests that as the persistent table (Trace) changes, the circuit behaves reactively.
         """
         # Persistent Table (B)
-        table_b = zset.PersistentTable(self.test_dir, "table_b", self.schema)
+        table_b = PersistentTable(self.test_dir, "table_b", self.schema)
         table_b.insert(100, self._mk_payload("Metadata_100", 0))
         table_b.flush()
 

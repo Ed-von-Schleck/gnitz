@@ -24,7 +24,7 @@ from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128
 
 from gnitz.core import types, values
 from gnitz.core.row_logic import make_payload_row
-from gnitz.core import zset
+from gnitz.storage.table import PersistentTable
 
 
 def _make_schema():
@@ -67,7 +67,7 @@ class TestU128NonPKRoundTrip(unittest.TestCase):
 
     def test_memtable_basic(self):
         """In-memory path: insert with non-zero high word, get_weight must return 1."""
-        db = zset.PersistentTable(self.db_path, "t", self.schema)
+        db = PersistentTable(self.db_path, "t", self.schema)
         try:
             pk = 1
             uuid_lo = 0xCAFEBABEDEADBEEF
@@ -85,7 +85,7 @@ class TestU128NonPKRoundTrip(unittest.TestCase):
         be treated as distinct records (separate multiset entries).
         Pre-fix both would truncate to the same lo-word and be merged.
         """
-        db = zset.PersistentTable(self.db_path, "t", self.schema)
+        db = PersistentTable(self.db_path, "t", self.schema)
         try:
             pk = 2
             row_a = _uuid_row(0xDEAD, 0xBEEF, "a")
@@ -101,7 +101,7 @@ class TestU128NonPKRoundTrip(unittest.TestCase):
 
     def test_flush_and_shard_read(self):
         """Flush to columnar shard, then verify weight is correct post-flush."""
-        db = zset.PersistentTable(self.db_path, "t", self.schema)
+        db = PersistentTable(self.db_path, "t", self.schema)
         try:
             pk = 3
             uuid_lo = 0xCAFEBABEDEADBEEF
@@ -131,11 +131,11 @@ class TestU128NonPKRoundTrip(unittest.TestCase):
         uuid_hi = 0x0123456789ABCDEF
         row = _uuid_row(uuid_lo, uuid_hi, "recover")
 
-        db = zset.PersistentTable(db_path, "t", schema)
+        db = PersistentTable(db_path, "t", schema)
         db.insert(pk, row)
         db.close()  # Close without flush — WAL is the only record
 
-        db2 = zset.PersistentTable(db_path, "t", schema)
+        db2 = PersistentTable(db_path, "t", schema)
         try:
             self.assertEqual(db2.get_weight(pk, row), 1)
             # A row with the same lo but zero hi must NOT match
@@ -146,7 +146,7 @@ class TestU128NonPKRoundTrip(unittest.TestCase):
 
     def test_annihilation_with_u128_payload(self):
         """Insert then remove: net weight must reach 0 and stay 0 after flush."""
-        db = zset.PersistentTable(self.db_path, "t", self.schema)
+        db = PersistentTable(self.db_path, "t", self.schema)
         try:
             pk = 5
             row = _uuid_row(0xABCDEF0123456789, 0xFEDCBA9876543210, "ghost")

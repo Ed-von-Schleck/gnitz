@@ -4,7 +4,8 @@ import unittest
 import os
 import shutil
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_int64
-from gnitz.core import zset, types, values
+from gnitz.core import types, values
+from gnitz.storage.table import PersistentTable
 
 class TestVMCursors(unittest.TestCase):
     def setUp(self):
@@ -19,7 +20,7 @@ class TestVMCursors(unittest.TestCase):
             types.ColumnDefinition(types.TYPE_I64)
         ], pk_index=0)
         
-        self.db = zset.PersistentTable(self.test_dir, "test_trace", self.schema)
+        self.db = PersistentTable(self.test_dir, "test_trace", self.schema)
 
     def tearDown(self):
         if not self.db.is_closed:

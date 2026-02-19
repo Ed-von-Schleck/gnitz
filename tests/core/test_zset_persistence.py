@@ -4,7 +4,8 @@ import shutil
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
-from gnitz.core import zset, types, values as db_values
+from gnitz.core import types, values as db_values
+from gnitz.storage.table import PersistentTable
 from gnitz.storage import errors, shard_table, buffer
 
 class TestZSetPersistence(unittest.TestCase):
@@ -19,7 +20,7 @@ class TestZSetPersistence(unittest.TestCase):
             types.ColumnDefinition(types.TYPE_STRING),
             types.ColumnDefinition(types.TYPE_F64)
         ], 0)
-        self.db = zset.PersistentTable(
+        self.db = PersistentTable(
             self.test_dir, 
             "test", 
             self.layout,
@@ -79,7 +80,7 @@ class TestZSetPersistence(unittest.TestCase):
             
         # Error is raised on instantiation because PK/Weight regions are validated eagerly
         with self.assertRaises(errors.CorruptShardError):
-            self.db = zset.PersistentTable(
+            self.db = PersistentTable(
                 self.test_dir, 
                 "test", 
                 self.layout, 
