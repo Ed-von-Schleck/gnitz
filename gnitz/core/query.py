@@ -8,37 +8,10 @@ class QueryError(Exception):
     pass
 
 
-def merge_schemas_for_join(schema_left, schema_right):
-    """
-    Constructs the resulting schema for a Join operation.
-    Output Schema = [PK] + [Left Non-PK Columns] + [Right Non-PK Columns].
-    """
-    pk_left = schema_left.get_pk_column()
-    pk_right = schema_right.get_pk_column()
-
-    if pk_left.field_type.code != pk_right.field_type.code:
-        raise QueryError(
-            "Join PK Type Mismatch: Left=%d Right=%d"
-            % (pk_left.field_type.code, pk_right.field_type.code)
-        )
-
-    new_columns = []
-    new_columns.append(pk_left)
-
-    for i in range(len(schema_left.columns)):
-        if i == schema_left.pk_index:
-            continue
-        new_columns.append(schema_left.columns[i])
-
-    for i in range(len(schema_right.columns)):
-        if i == schema_right.pk_index:
-            continue
-        new_columns.append(schema_right.columns[i])
-
-    return types.TableSchema(new_columns, pk_index=0)
-
-
 class View(object):
+    """
+    A compiled execution handle for a DBSP circuit.
+    """
     def __init__(self, interp, input_reg_id, output_reg_id, cursors):
         self.interpreter = interp
         self.input_reg_id = input_reg_id
@@ -46,6 +19,7 @@ class View(object):
         self.cursors = cursors
 
     def process(self, delta_batch):
+        """Processes a single batch of updates through the circuit."""
         self.interpreter.execute(delta_batch)
         out_reg = self.interpreter.register_file.get_register(self.output_reg_id)
         if not out_reg.is_delta():
@@ -55,15 +29,22 @@ class View(object):
         return out_reg.batch
 
     def close(self):
-        pass
+        """Closes all persistent cursors associated with the view."""
+        for cursor in self.cursors:
+            cursor.close()
 
 
 class QueryBuilder(object):
-    def __init__(self, engine, source_schema):
-        self.engine = engine
-        self.program = []
+    """
+    Fluent API for constructing incremental DBSP circuits.
+    """
+    def __init__(self, source_table, source_schema):
+        self.engine = source_table.engine
+        self.directory = source_table.directory # Store directory for internal ops
+        self.instructions = []
         self.registers = []  # List[BaseRegister]
-        self.cursors = []  # List[UnifiedCursor]
+        self.cursors = []    # List[UnifiedCursor]
+        self._built = False
 
         vm_schema_0 = runtime.VMSchema(source_schema)
         reg_0 = runtime.DeltaRegister(0, vm_schema_0)
@@ -76,7 +57,6 @@ class QueryBuilder(object):
         vm_schema = runtime.VMSchema(table_schema)
 
         if is_trace:
-            # Pass the table reference to the TraceRegister
             reg = runtime.TraceRegister(idx, vm_schema, cursor, table)
         else:
             reg = runtime.DeltaRegister(idx, vm_schema)
@@ -85,31 +65,25 @@ class QueryBuilder(object):
         return idx, reg
 
     def filter(self, predicate):
-        if not isinstance(predicate, scalar.ScalarFunction):
-            raise QueryError("Predicate must be a ScalarFunction")
-
         prev_reg = self.registers[self.current_reg_idx]
         if not prev_reg.is_delta():
             raise QueryError("Filter input must be a Delta stream")
 
         idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
         op = instructions.FilterOp(prev_reg, new_reg, predicate)
-        self.program.append(op)
+        self.instructions.append(op)
 
         self.current_reg_idx = idx
         return self
 
     def map(self, mapper, output_schema):
-        if not isinstance(mapper, scalar.ScalarFunction):
-            raise QueryError("Mapper must be a ScalarFunction")
-
         prev_reg = self.registers[self.current_reg_idx]
         if not prev_reg.is_delta():
             raise QueryError("Map input must be a Delta stream")
 
         idx, new_reg = self._add_register(output_schema)
         op = instructions.MapOp(prev_reg, new_reg, mapper)
-        self.program.append(op)
+        self.instructions.append(op)
 
         self.current_reg_idx = idx
         return self
@@ -121,106 +95,125 @@ class QueryBuilder(object):
 
         idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
         op = instructions.NegateOp(prev_reg, new_reg)
-        self.program.append(op)
+        self.instructions.append(op)
 
         self.current_reg_idx = idx
         return self
 
     def distinct(self):
         prev_reg = self.registers[self.current_reg_idx]
-        if not prev_reg.is_delta():
-            raise QueryError("Distinct input must be a Delta stream")
-
         schema = prev_reg.vm_schema.table_schema
-        table_name = "_internal_distinct_%d" % len(self.program)
-        history_table = zset.PersistentTable("vm_internal_state", table_name, schema)
         
+        # Allocate internal state for Distinct
+        table_name = "_internal_distinct_%d" % len(self.instructions)
+        # Use self.directory instead of self.engine.directory
+        history_table = zset.PersistentTable(self.directory, table_name, schema)
         cursor = history_table.create_cursor()
         self.cursors.append(cursor)
         
-        # Pass history_table into _add_register
         trace_idx, trace_reg = self._add_register(schema, is_trace=True, cursor=cursor, table=history_table)
         out_idx, out_reg = self._add_register(schema)
         
         op = instructions.DistinctOp(prev_reg, trace_reg, out_reg)
-        self.program.append(op)
+        self.instructions.append(op)
 
         self.current_reg_idx = out_idx
         return self
 
-    def delay(self):
+    def reduce(self, group_by_cols, agg_func, reg_trace_in_idx=-1):
+        """
+        Groups the stream and applies an aggregate function.
+        
+        Args:
+            group_by_cols: List of column indices to group by.
+            agg_func: An AggregateFunction instance.
+            reg_trace_in_idx: (Optional) Register index for input trace. 
+                              Required for non-linear aggs (MIN/MAX).
+        """
         prev_reg = self.registers[self.current_reg_idx]
-        if not prev_reg.is_delta():
-            raise QueryError("Delay input must be a Delta stream")
+        input_schema = prev_reg.vm_schema.table_schema
+        
+        if not agg_func.is_linear() and reg_trace_in_idx == -1:
+            raise QueryError("Non-linear aggregate requires reg_trace_in (input history)")
 
-        idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
-        op = instructions.DelayOp(prev_reg, new_reg)
-        self.program.append(op)
+        # 1. Define Output Schema
+        out_schema = types._build_reduce_output_schema(input_schema, group_by_cols, agg_func)
+        
+        # 2. Allocate Output Delta Register
+        out_idx, reg_out = self._add_register(out_schema)
+        
+        # 3. Allocate Output Trace (stores the current aggregates for retractions)
+        trace_name = "_internal_reduce_trace_%d" % len(self.instructions)
+        # Use self.directory instead of self.engine.directory
+        trace_table = zset.PersistentTable(self.directory, trace_name, out_schema)
+        cursor = trace_table.create_cursor()
+        self.cursors.append(cursor)
+        
+        tr_out_idx, reg_tr_out = self._add_register(out_schema, is_trace=True, cursor=cursor, table=trace_table)
+        
+        # 4. Resolve Input Trace (if provided)
+        reg_trace_in = None
+        if reg_trace_in_idx != -1:
+            reg_trace_in = self.registers[reg_trace_in_idx]
+            if not reg_trace_in.is_trace():
+                raise QueryError("reg_trace_in must be a Trace register")
 
-        self.current_reg_idx = idx
+        # 5. Emit Reduce Instruction
+        op = instructions.ReduceOp(prev_reg, reg_trace_in, reg_tr_out, reg_out, group_by_cols, agg_func)
+        self.instructions.append(op)
+        
+        # 6. Emit Integration (Crucial: update the trace for the next step)
+        # S_out = S_out + delta_out
+        sink_op = instructions.IntegrateOp(reg_out, trace_table.engine)
+        self.instructions.append(sink_op)
+
+        self.current_reg_idx = out_idx
         return self
 
     def join_persistent(self, table):
         prev_reg = self.registers[self.current_reg_idx]
-        if not prev_reg.is_delta():
-            raise QueryError("Join input must be a Delta stream")
-
         cursor = table.create_cursor()
         self.cursors.append(cursor)
-        trace_idx, trace_reg = self._add_register(
-            table.schema, is_trace=True, cursor=cursor
-        )
+        trace_idx, trace_reg = self._add_register(table.schema, is_trace=True, cursor=cursor)
 
-        out_schema = merge_schemas_for_join(
-            prev_reg.vm_schema.table_schema, table.schema
-        )
-
+        out_schema = types.merge_schemas_for_join(prev_reg.vm_schema.table_schema, table.schema)
         out_idx, out_reg = self._add_register(out_schema)
+        
         op = instructions.JoinDeltaTraceOp(prev_reg, trace_reg, out_reg)
-        self.program.append(op)
+        self.instructions.append(op)
 
         self.current_reg_idx = out_idx
         return self
-        
-    def union(self, other_builder=None):
-        """
-        Algebraically sums two Z-Set streams.
-        If other_builder is None, it acts as a pass-through to the next operator.
-        """
-        prev_reg = self.registers[self.current_reg_idx]
-        if not prev_reg.is_delta():
-            raise QueryError("Union primary input must be a Delta stream")
 
+    def union(self, other_builder=None):
+        prev_reg = self.registers[self.current_reg_idx]
         other_reg = None
         if other_builder is not None:
-            if not isinstance(other_builder, QueryBuilder):
-                raise QueryError("Union argument must be a QueryBuilder instance")
-            
             other_reg = other_builder.registers[other_builder.current_reg_idx]
-            if not other_reg.is_delta():
-                raise QueryError("Union secondary input must be a Delta stream")
-            
-            # Structural Integrity: In DBSP, Union requires identical schemas.
-            # We verify the memory layout (stride) matches before building the op.
-            if prev_reg.vm_schema.table_schema.stride != other_reg.vm_schema.table_schema.stride:
-                raise QueryError("Union schema mismatch: physical strides do not align")
-
-        # Create output register inheriting the primary input's schema
-        idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
         
+        idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
         op = instructions.UnionOp(prev_reg, other_reg, new_reg)
-        self.program.append(op)
+        self.instructions.append(op)
 
         self.current_reg_idx = idx
         return self
 
-    def build(self):
-        self.program.append(instructions.HaltOp())
+    def sink(self, table):
+        prev_reg = self.registers[self.current_reg_idx]
+        op = instructions.IntegrateOp(prev_reg, table.engine)
+        self.instructions.append(op)
+        return self
 
-        num_ops = len(self.program)
-        final_program = [None] * num_ops
-        for i in range(num_ops):
-            final_program[i] = self.program[i]
+    def build(self):
+        """Finalizes the instruction sequence and returns a View."""
+        if not self._built:
+            self.instructions.append(instructions.HaltOp())
+            self._built = True
+
+        # Copy instructions to a fixed-size list for RPython
+        final_program = [None] * len(self.instructions)
+        for i in range(len(self.instructions)):
+            final_program[i] = self.instructions[i]
 
         reg_file = runtime.RegisterFile(len(self.registers))
         for i in range(len(self.registers)):
@@ -228,13 +221,3 @@ class QueryBuilder(object):
 
         interp = interpreter.DBSPInterpreter(self.engine, reg_file, final_program)
         return View(interp, 0, self.current_reg_idx, self.cursors)
-
-    def sink(self, table):
-        prev_reg = self.registers[self.current_reg_idx]
-        if not prev_reg.is_delta():
-            raise QueryError("Sink input must be a Delta stream")
-
-        op = instructions.IntegrateOp(prev_reg, table.engine)
-        self.program.append(op)
-
-        return self

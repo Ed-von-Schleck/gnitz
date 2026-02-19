@@ -52,7 +52,7 @@ class TestManifestState(unittest.TestCase):
     def test_deferred_index_cleanup(self):
         """Tests interaction between ShardHandles in an Index and the RefCounter."""
         # Setup dummy shard
-        layout = types.TableSchema([types.ColumnDefinition(types.TYPE_I64)], 0)
+        layout = types.TableSchema([types.ColumnDefinition(types.TYPE_U64)], 0)
         fn = os.path.join(self.test_dir, "index_ref.db")
         
         # Create a valid shard file

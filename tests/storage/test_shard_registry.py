@@ -9,7 +9,7 @@ class TestShardChecksums(unittest.TestCase):
         self.fn = "test_shard_checksums.db"
         # Schema: PK (0), String (1)
         self.layout = types.TableSchema([
-            types.ColumnDefinition(types.TYPE_I64), 
+            types.ColumnDefinition(types.TYPE_U64), # Changed from I64 to U64
             types.ColumnDefinition(types.TYPE_STRING)
         ], 0)
 

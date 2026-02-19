@@ -70,18 +70,19 @@ def test_full_vm_coverage(base_dir):
 
     tab_a = zset.PersistentTable(db_path, "table_a", schema_a)
     tab_b = zset.PersistentTable(db_path, "table_b", schema_b)
-    res_tab = zset.PersistentTable(db_path, "table_res", schema_a)
+    res_tab = zset.PersistentTable(db_path, "table_res", schema_a)	
 
     try:
         pk_x = mk_u128(0xAAAA, 0xBBBB)
 
-        # Build tab_b payload without list literals.
+        # Build tab_b payload...
         tab_b_row = make_payload_row(1)
         tab_b_row.append(values.TaggedValue.make_string("Dept_Alpha"))
         tab_b.insert(pk_x, tab_b_row)
         tab_b.flush()
 
-        qb = query.QueryBuilder(tab_a.engine, schema_a)
+        # FIX: Pass tab_a directly to the QueryBuilder
+        qb = query.QueryBuilder(tab_a, schema_a)
         view = (
             qb.filter(ComprehensiveFilter())
             .map(LongStringMapper(), schema_a)

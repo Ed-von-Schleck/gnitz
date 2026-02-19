@@ -16,9 +16,9 @@ MOCK_NODE_BASE_SIZE = get_key_offset(MOCK_NODE_HEIGHT) # Size up to key offset
 class TestDataComparators(unittest.TestCase):
     def setUp(self):
         self.schema_i64 = types.TableSchema([
-            types.ColumnDefinition(types.TYPE_I64),    # PK
-            types.ColumnDefinition(types.TYPE_STRING), # Payload 1
-            types.ColumnDefinition(types.TYPE_F64)     # Payload 2
+            types.ColumnDefinition(types.TYPE_U64),    # Changed from I64 to U64
+            types.ColumnDefinition(types.TYPE_STRING), 
+            types.ColumnDefinition(types.TYPE_F64)     
         ], 0)
         
         self.schema_u128 = types.TableSchema([
