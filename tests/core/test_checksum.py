@@ -1,6 +1,6 @@
 import unittest
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import checksum
+from gnitz.core import xxh as checksum
 
 class TestChecksum(unittest.TestCase):
     def test_determinism_and_stability(self):

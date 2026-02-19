@@ -158,13 +158,27 @@ class QueryBuilder(object):
         self.current_reg_idx = idx
         return self
 
-    def distinct(self):
+    def distinct(self, history_table):
+        """
+        Incremental set-semantics normalization.
+        Requires a history_table (PersistentTable) to track prior state.
+        """
         prev_reg = self.registers[self.current_reg_idx]
         if not prev_reg.is_delta():
             raise QueryError("Distinct input must be a Delta stream")
 
+        # 1. Open a cursor to the history and register it as a Trace
+        cursor = history_table.create_cursor()
+        self.cursors.append(cursor)
+        trace_idx, trace_reg = self._add_register(
+            history_table.schema, is_trace=True, cursor=cursor
+        )
+
+        # 2. Add output Delta register (schema remains identical)
         idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
-        op = instructions.DistinctOp(prev_reg, new_reg)
+        
+        # 3. Emit instruction
+        op = instructions.DistinctOp(prev_reg, trace_reg, new_reg)
         self.program.append(op)
 
         self.current_reg_idx = idx

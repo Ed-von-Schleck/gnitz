@@ -1,95 +1,119 @@
-# gnitz/vm/interpreter.py
+# gnitz/vm/instructions.py
 
 from rpython.rlib import jit
-from gnitz.vm import instructions, ops
-from gnitz.vm.runtime import DeltaRegister
 
-# -----------------------------------------------------------------------------
-# JIT Driver Configuration
-# -----------------------------------------------------------------------------
-
-def get_location(pc, program, engine):
-    """JIT Debug Helper: Returns string representation of current op."""
-    if pc < 0 or pc >= len(program):
-        return "HALT"
-    instr = program[pc]
-    return "PC %d OP %d" % (pc, instr.opcode)
-
-jitdriver = jit.JitDriver(
-    greens=['pc', 'program', 'engine'],
-    reds=['self'],
-    get_printable_location=get_location
-)
-
-class DBSPInterpreter(object):
-    """
-    The Virtual Machine Execution Loop.
-    Executes a reactive circuit defined by 'program' over the 'register_file'.
-    """
-    _immutable_fields_ = ['program[*]', 'register_file', 'engine']
+class Instruction(object):
+    """Base class for all VM instructions."""
+    _immutable_fields_ = ['opcode']
     
-    def __init__(self, engine, register_file, program):
-        self.engine = engine
-        self.register_file = register_file
-        self.program = program 
-        
-    def execute(self, input_batch):
-        """Loads input_batch into Register 0 and executes circuit."""
-        r0 = self.register_file.get_register(0)
-        assert isinstance(r0, DeltaRegister)
-        
-        r0.batch.clear()
-        count = input_batch.row_count()
-        for i in range(count):
-            r0.batch.append(
-                input_batch.get_key(i),
-                input_batch.get_weight(i),
-                input_batch.get_payload(i)
-            )
-            
-        self._execute_loop()
-        
-    def _execute_loop(self):
-        pc = 0
-        program = self.program
-        engine = self.engine
-        
-        while pc < len(program):
-            jitdriver.jit_merge_point(
-                pc=pc, program=program, engine=engine, self=self
-            )
-            
-            instr = program[pc]
-            opcode = instr.opcode
-            
-            if opcode == instructions.Instruction.HALT:
-                break
-            elif opcode == instructions.Instruction.FILTER:
-                assert isinstance(instr, instructions.FilterOp)
-                ops.op_filter(instr.reg_in, instr.reg_out, instr.func)
-            elif opcode == instructions.Instruction.MAP:
-                assert isinstance(instr, instructions.MapOp)
-                ops.op_map(instr.reg_in, instr.reg_out, instr.func)
-            elif opcode == instructions.Instruction.NEGATE:
-                assert isinstance(instr, instructions.NegateOp)
-                ops.op_negate(instr.reg_in, instr.reg_out)
-            elif opcode == instructions.Instruction.UNION:
-                assert isinstance(instr, instructions.UnionOp)
-                ops.op_union(instr.reg_in_a, instr.reg_in_b, instr.reg_out)
-            elif opcode == instructions.Instruction.JOIN_DELTA_TRACE:
-                assert isinstance(instr, instructions.JoinDeltaTraceOp)
-                ops.op_join_delta_trace(instr.reg_delta, instr.reg_trace, instr.reg_out)
-            elif opcode == instructions.Instruction.JOIN_DELTA_DELTA:
-                assert isinstance(instr, instructions.JoinDeltaDeltaOp)
-                ops.op_join_delta_delta(instr.reg_delta_a, instr.reg_delta_b, instr.reg_out)
-            elif opcode == instructions.Instruction.INTEGRATE:
-                assert isinstance(instr, instructions.IntegrateOp)
-                ops.op_integrate(instr.reg_in, instr.target_engine)
-            elif opcode == instructions.Instruction.DELAY:
-                assert isinstance(instr, instructions.DelayOp)
-                ops.op_delay(instr.reg_in, instr.reg_out)
-            elif opcode == instructions.Instruction.DISTINCT:
-                assert isinstance(instr, instructions.DistinctOp)
-                ops.op_distinct(instr.reg_in, instr.reg_out)
-            pc += 1
+    HALT             = 0
+    FILTER           = 1
+    MAP              = 2
+    NEGATE           = 3
+    UNION            = 4
+    JOIN_DELTA_TRACE = 5
+    JOIN_DELTA_DELTA = 6
+    INTEGRATE        = 7  # Terminal Sink
+    DELAY            = 8  # z^-1 (Feedback/Recursion)
+    REDUCE           = 9  # Aggregation (SUM, MIN, MAX)
+    DISTINCT         = 10 # Set-semantics normalization
 
+    def __init__(self, opcode):
+        self.opcode = opcode
+
+class FilterOp(Instruction):
+    _immutable_fields_ = ['reg_in', 'reg_out', 'func']
+    def __init__(self, reg_in, reg_out, func):
+        Instruction.__init__(self, self.FILTER)
+        self.reg_in = reg_in
+        self.reg_out = reg_out
+        self.func = func
+
+class MapOp(Instruction):
+    _immutable_fields_ = ['reg_in', 'reg_out', 'func']
+    def __init__(self, reg_in, reg_out, func):
+        Instruction.__init__(self, self.MAP)
+        self.reg_in = reg_in
+        self.reg_out = reg_out
+        self.func = func
+
+class NegateOp(Instruction):
+    _immutable_fields_ = ['reg_in', 'reg_out']
+    def __init__(self, reg_in, reg_out):
+        Instruction.__init__(self, self.NEGATE)
+        self.reg_in = reg_in
+        self.reg_out = reg_out
+
+class UnionOp(Instruction):
+    _immutable_fields_ = ['reg_in_a', 'reg_in_b', 'reg_out']
+    def __init__(self, reg_in_a, reg_in_b, reg_out):
+        Instruction.__init__(self, self.UNION)
+        self.reg_in_a = reg_in_a
+        self.reg_in_b = reg_in_b
+        self.reg_out = reg_out
+
+class JoinDeltaTraceOp(Instruction):
+    _immutable_fields_ = ['reg_delta', 'reg_trace', 'reg_out']
+    def __init__(self, reg_delta, reg_trace, reg_out):
+        Instruction.__init__(self, self.JOIN_DELTA_TRACE)
+        self.reg_delta = reg_delta    # Delta Register (Batch)
+        self.reg_trace = reg_trace    # Trace Register (Cursor)
+        self.reg_out = reg_out
+
+class JoinDeltaDeltaOp(Instruction):
+    _immutable_fields_ = ['reg_delta_a', 'reg_delta_b', 'reg_out']
+    def __init__(self, reg_delta_a, reg_delta_b, reg_out):
+        Instruction.__init__(self, self.JOIN_DELTA_DELTA)
+        self.reg_delta_a = reg_delta_a
+        self.reg_delta_b = reg_delta_b
+        self.reg_out = reg_out
+
+class IntegrateOp(Instruction):
+    """Sinks a ZSetBatch into a specific persistent table engine."""
+    _immutable_fields_ = ['reg_in', 'target_engine']
+    def __init__(self, reg_in, target_engine):
+        Instruction.__init__(self, self.INTEGRATE)
+        self.reg_in = reg_in
+        self.target_engine = target_engine
+
+class HaltOp(Instruction):
+    def __init__(self):
+        Instruction.__init__(self, self.HALT)
+
+class DelayOp(Instruction):
+    """
+    Implements y = z^-1(x).
+    Moves the content of reg_in (t) to reg_out (t+1).
+    Essential for recursive circuits and Fixed-Point iteration.
+    """
+    _immutable_fields_ = ['reg_in', 'reg_out']
+    def __init__(self, reg_in, reg_out):
+        Instruction.__init__(self, self.DELAY)
+        self.reg_in = reg_in
+        self.reg_out = reg_out
+
+class ReduceOp(Instruction):
+    """
+    Implements non-linear aggregation.
+    Iterates over a Trace (full state) or Batch to produce 
+    aggregated Z-Set (e.g., SUM(salary) GROUP BY dept).
+    """
+    _immutable_fields_ = ['reg_trace', 'reg_out', 'agg_func']
+    def __init__(self, reg_trace, reg_out, agg_func):
+        Instruction.__init__(self, self.REDUCE)
+        self.reg_trace = reg_trace
+        self.reg_out = reg_out
+        self.agg_func = agg_func
+
+class DistinctOp(Instruction):
+    """
+    Incremental Set-semantics normalization.
+    Compares incoming deltas (reg_in) against the historical state (reg_history)
+    to compute the change in distinct set membership.
+    """
+    _immutable_fields_ = ['reg_in', 'reg_history', 'reg_out']
+    def __init__(self, reg_in, reg_history, reg_out):
+        Instruction.__init__(self, self.DISTINCT)
+        self.reg_in = reg_in           # DeltaRegister (Incoming Batch)
+        self.reg_history = reg_history # TraceRegister (Historical State)
+        self.reg_out = reg_out         # DeltaRegister (Incremental result)

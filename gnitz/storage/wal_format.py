@@ -4,7 +4,7 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, r_uint32
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage import errors, mmap_posix
-from gnitz.core import checksum, types, strings as string_logic, values as db_values
+from gnitz.core import xxh as checksum, types, strings as string_logic, values as db_values
 from gnitz.core.row_logic import make_payload_row
 
 WAL_BLOCK_HEADER_SIZE = 32
