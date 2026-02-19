@@ -6,7 +6,8 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.core import types, values as db_values
 from gnitz.storage.table import PersistentTable
-from gnitz.storage import errors, shard_table, buffer
+from gnitz.core import errors
+from gnitz.storage import shard_table, buffer
 
 class TestZSetPersistence(unittest.TestCase):
     def setUp(self):

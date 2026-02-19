@@ -5,7 +5,8 @@ from rpython.rlib import rposix, jit
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from gnitz.storage import layout, mmap_posix, errors, buffer
+from gnitz.core import errors
+from gnitz.storage import layout, mmap_posix, buffer
 from gnitz.storage.buffer import align_64
 from gnitz.core import types, strings as string_logic, values as db_values, xxh as checksum
 

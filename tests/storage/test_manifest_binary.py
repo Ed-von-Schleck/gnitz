@@ -2,7 +2,8 @@ import unittest
 import os
 from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import r_uint64
-from gnitz.storage import manifest, errors
+from gnitz.core import errors
+from gnitz.storage import manifest
 
 class TestManifestBinary(unittest.TestCase):
     def setUp(self):

@@ -1,6 +1,7 @@
 import os
 import errno
-from gnitz.storage import errors, mmap_posix
+from gnitz.core import errors
+from gnitz.storage import mmap_posix
 from rpython.rlib import rposix, rposix_stat
 
 class FileLockHandle(object):

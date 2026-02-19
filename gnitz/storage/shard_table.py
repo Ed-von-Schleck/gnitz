@@ -3,7 +3,8 @@ from rpython.rlib import jit, rposix, rposix_stat
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from gnitz.storage import buffer, layout, mmap_posix, errors
+from gnitz.core import errors
+from gnitz.storage import buffer, layout, mmap_posix
 from gnitz.core import strings as string_logic, types, xxh as checksum
 
 DUMMY_BUF = buffer.MappedBuffer(lltype.nullptr(rffi.CCHARP.TO), 0)

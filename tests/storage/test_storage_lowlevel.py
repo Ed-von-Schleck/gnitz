@@ -3,7 +3,8 @@ import mmap
 from rpython.rtyper.lltypesystem import rffi, lltype
 #from gnitz.storage.arena import Arena
 from gnitz.storage.buffer import MappedBuffer, Buffer
-from gnitz.storage import mmap_posix, errors
+from gnitz.core import errors
+from gnitz.storage import mmap_posix
 
 class TestStorageLowLevel(unittest.TestCase):
     # --- Arena Tests ---

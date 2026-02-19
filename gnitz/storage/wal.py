@@ -2,7 +2,8 @@ import os
 import errno
 from rpython.rlib import rposix, rposix_stat
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.storage import wal_format, mmap_posix, errors
+from gnitz.core import errors
+from gnitz.storage import wal_format, mmap_posix
 
 class WALReader(object):
     def __init__(self, filename, schema):

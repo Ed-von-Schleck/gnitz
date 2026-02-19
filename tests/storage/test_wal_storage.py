@@ -2,7 +2,8 @@ import unittest
 import os
 import shutil
 from gnitz.core import types, values as db_values
-from gnitz.storage import wal, wal_format, errors
+from gnitz.core import errors
+from gnitz.storage import wal, wal_format
 
 class TestWALStorage(unittest.TestCase):
     def setUp(self):

@@ -3,7 +3,8 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import rposix, rposix_stat
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from gnitz.storage import errors, mmap_posix, layout
+from gnitz.core import errors
+from gnitz.storage import mmap_posix, layout
 from gnitz.storage.metadata import ManifestEntry
 
 MAGIC_NUMBER = r_uint64(0x4D414E49464E5447)

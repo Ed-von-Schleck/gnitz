@@ -2,7 +2,8 @@
 import unittest
 import os
 from gnitz.core import types, values as db_values
-from gnitz.storage import writer_table, shard_table, layout, errors
+from gnitz.core import errors
+from gnitz.storage import writer_table, shard_table, layout
 
 class TestShardChecksums(unittest.TestCase):
     def setUp(self):

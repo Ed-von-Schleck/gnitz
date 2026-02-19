@@ -1,7 +1,7 @@
 import unittest
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import xxh as checksum
-from gnitz.storage.errors import GnitzError, StorageError, BoundsError
+from gnitz.core.errors import GnitzError, StorageError, BoundsError
 
 class TestIntegrityPrimitives(unittest.TestCase):
     # --- Hashing Tests ---

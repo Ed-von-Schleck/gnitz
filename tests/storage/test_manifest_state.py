@@ -1,7 +1,8 @@
 import unittest
 import os
 import shutil
-from gnitz.storage import manifest, refcount, errors, index, writer_table
+from gnitz.core import errors
+from gnitz.storage import manifest, refcount, index, writer_table
 from gnitz.core import types
 from rpython.rlib.rarithmetic import r_uint64
 

@@ -1,7 +1,7 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint32, r_uint64, r_int64
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
-from gnitz.storage import errors
+from gnitz.core import errors
 from rpython.rlib import jit
 
 # Correctly define the compilation info to include the C string header

@@ -1,5 +1,5 @@
 """
-gnitz/storage/errors.py
+gnitz/core/errors.py
 
 Exception hierarchy for GnitzDB storage subsystem.
 """

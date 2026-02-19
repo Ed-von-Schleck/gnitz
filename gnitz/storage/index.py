@@ -1,7 +1,8 @@
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from gnitz.storage import shard_table, errors
+from gnitz.core import errors
+from gnitz.storage import shard_table
 from gnitz.storage.metadata import ManifestEntry
 
 
