@@ -1,8 +1,9 @@
 # gnitz/vm/functions.py
 
-from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64
+from rpython.rlib.rarithmetic import r_int64, r_uint64
+from rpython.rtyper.lltypesystem import rffi
 from gnitz.core import values, types
+
 
 class ScalarFunction(object):
     """
@@ -75,10 +76,10 @@ class CountAggregateFunction(AggregateFunction):
     """COUNT(*) — sums the Z-weights of all rows in the group."""
 
     def create_accumulator(self):
-        return values.TaggedValue.make_int(0)
+        return values.TaggedValue(values.TAG_INT, r_int64(0), r_uint64(0), 0.0, "")
 
     def step(self, acc, row, weight):
-        return values.TaggedValue.make_int(acc.i64 + weight)
+        return values.TaggedValue(values.TAG_INT, acc.i64 + weight, r_uint64(0), 0.0, "")
 
     def is_linear(self):
         return True
@@ -99,11 +100,11 @@ class SumI64AggregateFunction(AggregateFunction):
         self.col_idx = col_idx
 
     def create_accumulator(self):
-        return values.TaggedValue.make_int(0)
+        return values.TaggedValue(values.TAG_INT, r_int64(0), r_uint64(0), 0.0, "")
 
     def step(self, acc, row, weight):
-        val = row.get_int(self.col_idx)
-        return values.TaggedValue.make_int(acc.i64 + val * weight)
+        val = rffi.cast(rffi.LONGLONG, row.get_int(self.col_idx))
+        return values.TaggedValue(values.TAG_INT, acc.i64 + val * weight, r_uint64(0), 0.0, "")
 
     def is_linear(self):
         return True
@@ -126,13 +127,12 @@ class MinI64AggregateFunction(AggregateFunction):
         self.col_idx = col_idx
 
     def create_accumulator(self):
-        return values.TaggedValue.make_int(self._SENTINEL)
+        return values.TaggedValue(values.TAG_INT, r_int64(self._SENTINEL), r_uint64(0), 0.0, "")
 
     def step(self, acc, row, weight):
-        # op_reduce only calls step() on non-linear aggs during full-group scans
-        val = row.get_int(self.col_idx)
+        val = rffi.cast(rffi.LONGLONG, row.get_int(self.col_idx))
         if val < acc.i64:
-            return values.TaggedValue.make_int(val)
+            return values.TaggedValue(values.TAG_INT, val, r_uint64(0), 0.0, "")
         return acc
 
     def is_linear(self):
@@ -156,12 +156,12 @@ class MaxI64AggregateFunction(AggregateFunction):
         self.col_idx = col_idx
 
     def create_accumulator(self):
-        return values.TaggedValue.make_int(self._SENTINEL)
+        return values.TaggedValue(values.TAG_INT, r_int64(self._SENTINEL), r_uint64(0), 0.0, "")
 
     def step(self, acc, row, weight):
-        val = row.get_int(self.col_idx)
+        val = rffi.cast(rffi.LONGLONG, row.get_int(self.col_idx))
         if val > acc.i64:
-            return values.TaggedValue.make_int(val)
+            return values.TaggedValue(values.TAG_INT, val, r_uint64(0), 0.0, "")
         return acc
 
     def is_linear(self):

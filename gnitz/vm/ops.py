@@ -165,8 +165,12 @@ def op_reduce(op):
             has_old = True
             acc_out = trace_out.get_accessor()
             agg_col_in_trace = len(op.output_schema.columns) - 1
-            old_val_tv = values.TaggedValue.make_int(acc_out.get_int(agg_col_in_trace))
-            
+            # rffi.cast(rffi.LONGLONG, ...) reinterprets r_uint64 -> r_int64 without
+            # going through intmask, which annotates as r_uint and conflicts with the
+            # int-annotated sum produced in the linear accumulation below.
+            old_i64 = rffi.cast(rffi.LONGLONG, acc_out.get_int(agg_col_in_trace))
+            old_val_tv = values.TaggedValue(values.TAG_INT, old_i64, r_uint64(0), 0.0, "")
+
             if not agg_func.is_accumulator_zero(old_val_tv):
                 delta_in.left_acc.set_row(delta_in, sorted_indices[group_start])
                 retract_row = materialize_row(delta_in.left_acc, op.output_schema)
@@ -176,7 +180,16 @@ def op_reduce(op):
         # 5. Compute New Aggregate
         if agg_func.is_linear():
             if has_old:
-                new_acc = values.TaggedValue.make_int(old_val_tv.i64 + delta_acc.i64)
+                # Direct construction keeps r_int64 + r_int64 in the r_int64 domain.
+                # Routing through make_int would call intmask on the sum, producing
+                # an int annotation that conflicts with the r_uint from call site A.
+                new_acc = values.TaggedValue(
+                    values.TAG_INT,
+                    old_val_tv.i64 + delta_acc.i64,
+                    r_uint64(0),
+                    0.0,
+                    "",
+                )
             else:
                 new_acc = delta_acc
         else:

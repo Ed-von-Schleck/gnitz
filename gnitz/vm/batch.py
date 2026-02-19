@@ -65,7 +65,7 @@ class ZSetBatch(object):
     to ensure compatibility with RPython resizable list tracing.
     """
 
-    _immutable_fields_ = ["schema", "left_acc", "_row_cmp"]
+    _immutable_fields_ = ["schema", "left_acc", "right_acc", "_row_cmp"]
 
     def __init__(self, schema):
         self.schema = schema
@@ -74,6 +74,7 @@ class ZSetBatch(object):
         self.weights = newlist_hint(0)
         self.payloads = newlist_hint(0)
         self.left_acc = BatchAccessor(schema)
+        self.right_acc = BatchAccessor(schema)
         self._row_cmp = PayloadRowComparator(schema)
 
     def append(self, key, weight, payload):
