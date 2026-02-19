@@ -158,12 +158,6 @@ def _copy_cursors(cursors):
 
 
 class UnifiedCursor(object):
-    """
-    The TRACE READER.
-    Unified view over multiple shards and memtables. 
-    Optimized for in-place tree reconstruction to eliminate malloc-churn.
-    """
-
     _immutable_fields_ = ["schema", "is_single_source"]
 
     def __init__(self, schema, cursors):
@@ -173,6 +167,7 @@ class UnifiedCursor(object):
         self.is_single_source = self.num_cursors == 1
 
         if not self.is_single_source:
+            # Tree cursors are a copy, but indices remain stable relative to self.cursors
             self.tree = tournament_tree.TournamentTree(_copy_cursors(self.cursors))
         else:
             self.tree = None
@@ -197,16 +192,18 @@ class UnifiedCursor(object):
 
         while not self.tree.is_exhausted():
             min_key = self.tree.get_min_key()
-            candidates = self.tree.get_all_cursors_at_min()
+            # Returns stable original indices
+            indices = self.tree.get_all_indices_at_min()
 
             # 1. Find lexicographical minimum payload in group
-            best_cursor = candidates[0]
+            best_idx = indices[0]
+            best_cursor = self.cursors[best_idx]
             best_acc = best_cursor.get_row_accessor()
 
             idx = 1
-            num_candidates = len(candidates)
+            num_candidates = len(indices)
             while idx < num_candidates:
-                curr = candidates[idx]
+                curr = self.cursors[indices[idx]]
                 curr_acc = curr.get_row_accessor()
                 if comparator.compare_rows(self.schema, curr_acc, best_acc) < 0:
                     best_cursor = curr
@@ -215,15 +212,16 @@ class UnifiedCursor(object):
 
             # 2. Sum weight for this payload group
             net_weight = r_int64(0)
-            to_advance_indices = newlist_hint(num_candidates)
+            to_advance = newlist_hint(num_candidates)
 
             idx = 0
             while idx < num_candidates:
-                curr = candidates[idx]
+                c_idx = indices[idx]
+                curr = self.cursors[c_idx]
                 curr_acc = curr.get_row_accessor()
                 if comparator.compare_rows(self.schema, curr_acc, best_acc) == 0:
                     net_weight += curr.weight()
-                    to_advance_indices.append(self._get_cursor_index(curr))
+                    to_advance.append(c_idx)
                 idx += 1
 
             if net_weight != 0:
@@ -233,20 +231,12 @@ class UnifiedCursor(object):
                 self._valid = True
                 return
             else:
-                for c_idx in to_advance_indices:
+                for c_idx in to_advance:
                     self.tree.advance_cursor_by_index(c_idx)
 
         self._valid = False
 
-    def _get_cursor_index(self, target):
-        """Helper to map a cursor instance back to its original index."""
-        for i in range(self.num_cursors):
-            if self.cursors[i] is target:
-                return i
-        return -1
-
     def seek(self, target_key):
-        """Monotonic seek across all sources using in-place heap rebuild."""
         for c in self.cursors:
             c.seek(target_key)
 
@@ -265,14 +255,15 @@ class UnifiedCursor(object):
             return
 
         target_accessor = self._current_accessor
-        candidates = self.tree.get_all_cursors_at_min()
+        indices = self.tree.get_all_indices_at_min()
 
-        to_advance_indices = newlist_hint(len(candidates))
-        for c in candidates:
-            if comparator.compare_rows(self.schema, c.get_row_accessor(), target_accessor) == 0:
-                to_advance_indices.append(self._get_cursor_index(c))
+        to_advance = newlist_hint(len(indices))
+        for c_idx in indices:
+            cursor = self.cursors[c_idx]
+            if comparator.compare_rows(self.schema, cursor.get_row_accessor(), target_accessor) == 0:
+                to_advance.append(c_idx)
 
-        for c_idx in to_advance_indices:
+        for c_idx in to_advance:
             self.tree.advance_cursor_by_index(c_idx)
 
         self._find_next_non_ghost()

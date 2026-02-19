@@ -135,11 +135,14 @@ class SoAAccessor(RowAccessor):
         length = rffi.cast(lltype.Signed, u32_ptr[0])
         prefix = rffi.cast(lltype.Signed, u32_ptr[1])
 
-        # Annotator hint: ensure the 5th element is Optional[str]
+        blob_ptr = NULL_PTR
+        if self.view.blob_buf:
+            blob_ptr = self.view.blob_buf.ptr
+
         s = None
         if False:
             s = ""
-        return (length, prefix, ptr, self.view.blob_buf.ptr, s)
+        return (length, prefix, ptr, blob_ptr, s)
 
     def get_col_ptr(self, col_idx):
         return self._get_ptr(col_idx)
