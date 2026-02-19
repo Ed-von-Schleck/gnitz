@@ -4,7 +4,8 @@ import unittest
 import os
 import shutil
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_int64
-from gnitz.core import types, values, scalar 
+from gnitz.core import types, values 
+from gnitz.vm import functions
 from gnitz.storage.table import PersistentTable
 from gnitz.vm import batch, runtime, query
 
@@ -12,12 +13,12 @@ from gnitz.vm import batch, runtime, query
 # Concrete ScalarFunctions for Testing
 # ------------------------------------------------------------------------------
 
-class AgeFilter(scalar.ScalarFunction):
+class AgeFilter(functions.ScalarFunction):
     """Filters rows where Age (Col 2) >= 30."""
     def evaluate_predicate(self, row_accessor):
         return row_accessor.get_int(2) >= 30
 
-class AgeDoubler(scalar.ScalarFunction):
+class AgeDoubler(functions.ScalarFunction):
     """Maps (Name, Age) -> (Name, Age * 2)."""
     def evaluate_map(self, row_accessor, output_row_list):
         # Col 1: Name

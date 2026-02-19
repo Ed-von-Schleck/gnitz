@@ -3,19 +3,20 @@
 import sys
 import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
-from gnitz.core import types, values, query, scalar, row_logic
+from gnitz.core import types, values, query, row_logic
+from gnitz.vm import functions
 from gnitz.storage.table import PersistentTable
 from gnitz.core.row_logic import make_payload_row
 from gnitz.vm import batch, runtime, instructions, ops, interpreter
 
 
-class ComprehensiveFilter(scalar.ScalarFunction):
+class ComprehensiveFilter(functions.ScalarFunction):
     def evaluate_predicate(self, row_accessor):
         f_val = row_accessor.get_float(0)
         return f_val > 0.5
 
 
-class LongStringMapper(scalar.ScalarFunction):
+class LongStringMapper(functions.ScalarFunction):
     def evaluate_map(self, row_accessor, output_row_list):
         meta = row_accessor.get_str_struct(1)
         orig_str = meta[4]
