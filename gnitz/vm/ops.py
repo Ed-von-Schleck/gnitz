@@ -7,6 +7,7 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, values, row_logic, strings, xxh
 from gnitz.core.row_logic import make_payload_row
+from gnitz.vm import instructions, runtime 
 
 
 # -----------------------------------------------------------------------------
@@ -103,14 +104,27 @@ def _extract_group_key_u128(batch, row_idx, col_indices):
 # Core Operators
 # -----------------------------------------------------------------------------
 
-def op_reduce(op, reg_file):
+def op_reduce(op):
     """
     Incremental Group-By and Aggregate.
     δout = Agg(I + δin) - Agg(I)
     """
-    delta_in = reg_file.get_register(op.reg_in).batch
-    trace_out = reg_file.get_register(op.reg_trace_out).cursor
-    out_batch = reg_file.get_register(op.reg_out).batch
+    # 0. Assert op type for the annotator
+    assert isinstance(op, instructions.ReduceOp)
+    
+    # 1. Access registers directly from the op object
+    reg_in = op.reg_in
+    assert isinstance(reg_in, runtime.DeltaRegister)
+    delta_in = reg_in.batch
+    
+    reg_trace_out = op.reg_trace_out
+    assert isinstance(reg_trace_out, runtime.TraceRegister)
+    trace_out = reg_trace_out.cursor
+    
+    reg_out = op.reg_out
+    assert isinstance(reg_out, runtime.DeltaRegister)
+    out_batch = reg_out.batch
+    
     out_batch.clear()
 
     n = delta_in.row_count()
@@ -120,10 +134,10 @@ def op_reduce(op, reg_file):
     agg_func = op.agg_func
     group_cols = op.group_by_cols
     
-    # 1. Sort the incoming delta so groups are contiguous
+    # 2. Sort the incoming delta so groups are contiguous
     sorted_indices = _argsort_by_cols(delta_in, group_cols)
 
-    # 2. Iterate through delta groups
+    # 3. Iterate through delta groups
     idx = 0
     while idx < n:
         group_start = idx
@@ -142,56 +156,48 @@ def op_reduce(op, reg_file):
                 delta_acc = agg_func.step(delta_acc, delta_in.left_acc, w)
             idx += 1
         
-        # 3. Retraction Logic: Look up old value in trace_out
+        # 4. Retraction Logic: Look up old value in trace_out
         trace_out.seek(group_key_u128)
         old_val_tv = values.TaggedValue.make_int(0)
         has_old = False
         
         if trace_out.is_valid() and trace_out.key() == group_key_u128:
-            # Existing group found. Emit retraction (-1)
             has_old = True
             acc_out = trace_out.get_accessor()
-            # The agg value is the last column in the trace schema (len - 1)
             agg_col_in_trace = len(op.output_schema.columns) - 1
             old_val_tv = values.TaggedValue.make_int(acc_out.get_int(agg_col_in_trace))
             
             if not agg_func.is_accumulator_zero(old_val_tv):
-                # Emit retraction of the old value
-                payload = make_payload_row(len(op.output_schema.columns) - 1)
-                # Fill group columns + old agg value
-                # (Simplified: we use the row from delta_in as a template)
                 delta_in.left_acc.set_row(delta_in, sorted_indices[group_start])
                 retract_row = materialize_row(delta_in.left_acc, op.output_schema)
-                # Replace the last column with the old value
                 retract_row[len(retract_row)-1] = old_val_tv
                 out_batch.append(group_key_u128, -1, retract_row)
 
-        # 4. Compute New Aggregate
+        # 5. Compute New Aggregate
         if agg_func.is_linear():
-            # Linear optimization: new = old + delta
             if has_old:
-                new_acc = agg_func.step(old_val_tv, delta_in.left_acc, 0) # setup
                 new_acc = values.TaggedValue.make_int(old_val_tv.i64 + delta_acc.i64)
             else:
                 new_acc = delta_acc
         else:
             # Non-linear (MIN/MAX): Must scan trace_in
-            trace_in = reg_file.get_register(op.reg_trace_in).cursor
-            # Note: For Phase 2, we assume group_cols matches trace_in PK
+            reg_trace_in = op.reg_trace_in
+            assert isinstance(reg_trace_in, runtime.TraceRegister)
+            trace_in = reg_trace_in.cursor
+            
             trace_in.seek(group_key_u128)
             new_acc = agg_func.create_accumulator()
             while trace_in.is_valid() and trace_in.key() == group_key_u128:
                 new_acc = agg_func.step(new_acc, trace_in.get_accessor(), trace_in.weight())
                 trace_in.advance()
 
-        # 5. Emit New Value
+        # 6. Emit New Value
         if not agg_func.is_accumulator_zero(new_acc):
             delta_in.left_acc.set_row(delta_in, sorted_indices[group_start])
             insert_row = materialize_row(delta_in.left_acc, op.output_schema)
             insert_row[len(insert_row)-1] = new_acc
             out_batch.append(group_key_u128, 1, insert_row)
 
-    # Output MUST be sorted and consolidated for the subsequent INTEGRATE
     out_batch.sort()
     out_batch.consolidate()
 
@@ -334,12 +340,12 @@ def op_distinct(reg_in, reg_history, reg_out):
             out_batch.append(key, out_weight, payload)
         history.update_weight(key, d_weight, payload)
 
-def op_integrate(reg_in, target_engine):
+def op_integrate(reg_in, target_table):
     input_batch = reg_in.batch
     for i in range(input_batch.row_count()):
         w = input_batch.get_weight(i)
         if w != 0:
-            target_engine.ingest(input_batch.get_key(i), w, input_batch.get_payload(i))
+            target_table.ingest(input_batch.get_key(i), w, input_batch.get_payload(i))
 
 def _concat_payloads(left, right):
     n = len(left) + len(right)

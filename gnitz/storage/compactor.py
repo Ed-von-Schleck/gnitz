@@ -5,7 +5,8 @@ from rpython.rlib import jit
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask
 from gnitz.storage import shard_table, writer_table, tournament_tree, comparator, index, cursor
-from gnitz.core import types
+from gnitz.core import types, comparator as core_comparator
+
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
@@ -37,7 +38,7 @@ def merge_row_contributions(active_cursors, schema):
             acc_right = other_cursor.get_row_accessor()
 
             # Lexicographical comparison of non-PK columns
-            if comparator.compare_rows(schema, acc_left, acc_right) == 0:
+            if core_comparator.compare_rows(schema, acc_left, acc_right) == 0:
                 total_weight += other_cursor.weight()
                 processed[j] = True
 

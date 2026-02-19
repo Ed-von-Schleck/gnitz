@@ -14,10 +14,9 @@ jitdriver = jit.JitDriver(
 )
 
 class DBSPInterpreter(object):
-    _immutable_fields_ = ['engine', 'register_file', 'program[*]']
+    _immutable_fields_ = ['register_file', 'program[*]']
 
-    def __init__(self, engine, register_file, program):
-        self.engine = engine
+    def __init__(self, register_file, program):
         self.register_file = register_file
         self.program = program
 
@@ -71,9 +70,9 @@ class DBSPInterpreter(object):
                 ops.op_delay(instr.reg_in, instr.reg_out)
             elif opcode == instructions.Instruction.INTEGRATE:
                 assert isinstance(instr, instructions.IntegrateOp)
-                ops.op_integrate(instr.reg_in, instr.target_engine)
+                ops.op_integrate(instr.reg_in, instr.target_table)
             elif opcode == instructions.Instruction.REDUCE:
                 assert isinstance(instr, instructions.ReduceOp)
-                ops.op_reduce(instr, reg_file)
+                ops.op_reduce(instr)
             
             pc += 1

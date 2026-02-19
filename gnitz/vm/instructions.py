@@ -66,11 +66,11 @@ class JoinDeltaTraceOp(Instruction):
         self.reg_out = reg_out
 
 class IntegrateOp(Instruction):
-    _immutable_fields_ = ['reg_in', 'target_engine']
-    def __init__(self, reg_in, target_engine):
+    _immutable_fields_ = ['reg_in', 'target_table']
+    def __init__(self, reg_in, target_table):
         Instruction.__init__(self, self.INTEGRATE)
         self.reg_in = reg_in
-        self.target_engine = target_engine
+        self.target_table = target_table
 
 class DelayOp(Instruction):
     _immutable_fields_ = ['reg_in', 'reg_out']

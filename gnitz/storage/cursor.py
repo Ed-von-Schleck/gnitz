@@ -6,7 +6,9 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import types
 from gnitz.storage import comparator, tournament_tree
+from gnitz.core import comparator as core_comparator
 from gnitz.storage.memtable_node import node_get_key, node_get_weight, node_get_next_off
+from gnitz.backend.cursor import AbstractCursor
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
@@ -157,7 +159,7 @@ def _copy_cursors(cursors):
     return [c for c in cursors]
 
 
-class UnifiedCursor(object):
+class UnifiedCursor(AbstractCursor):
     _immutable_fields_ = ["schema", "is_single_source"]
 
     def __init__(self, schema, cursors):
@@ -205,7 +207,7 @@ class UnifiedCursor(object):
             while idx < num_candidates:
                 curr = self.cursors[indices[idx]]
                 curr_acc = curr.get_row_accessor()
-                if comparator.compare_rows(self.schema, curr_acc, best_acc) < 0:
+                if core_comparator.compare_rows(self.schema, curr_acc, best_acc) < 0:
                     best_cursor = curr
                     best_acc = curr_acc
                 idx += 1
@@ -219,7 +221,7 @@ class UnifiedCursor(object):
                 c_idx = indices[idx]
                 curr = self.cursors[c_idx]
                 curr_acc = curr.get_row_accessor()
-                if comparator.compare_rows(self.schema, curr_acc, best_acc) == 0:
+                if core_comparator.compare_rows(self.schema, curr_acc, best_acc) == 0:
                     net_weight += curr.weight()
                     to_advance.append(c_idx)
                 idx += 1
@@ -260,7 +262,7 @@ class UnifiedCursor(object):
         to_advance = newlist_hint(len(indices))
         for c_idx in indices:
             cursor = self.cursors[c_idx]
-            if comparator.compare_rows(self.schema, cursor.get_row_accessor(), target_accessor) == 0:
+            if core_comparator.compare_rows(self.schema, cursor.get_row_accessor(), target_accessor) == 0:
                 to_advance.append(c_idx)
 
         for c_idx in to_advance:

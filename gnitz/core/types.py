@@ -1,7 +1,7 @@
 # gnitz/core/types.py
 
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.storage import errors
+from gnitz.core import errors
 
 
 class FieldType(object):

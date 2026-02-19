@@ -1,7 +1,8 @@
 # gnitz/core/row_logic.py
 
 from rpython.rlib.objectmodel import newlist_hint
-from gnitz.storage import comparator
+from gnitz.core import comparator
+
 
 """
 Row Logic API: The Storage-VM Boundary.

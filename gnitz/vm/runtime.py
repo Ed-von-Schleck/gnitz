@@ -103,7 +103,7 @@ class TraceRegister(BaseRegister):
         if self.table is not None:
             # Performs an immediate in-memory ingestion into the trace's 
             # backing table to maintain consistency for the current batch.
-            self.table.engine.ingest(key, delta, payload)
+            self.table.ingest(key, delta, payload)
 
 
 class RegisterFile(object):
