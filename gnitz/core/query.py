@@ -144,26 +144,33 @@ class QueryBuilder(object):
         
         # 3. Allocate Output Trace (stores the current aggregates for retractions)
         trace_name = "_internal_reduce_trace_%d" % len(self.instructions)
-        # Use self.directory instead of self.engine.directory
+        # Use self.directory to persist transient state
         trace_table = zset.PersistentTable(self.directory, trace_name, out_schema)
         cursor = trace_table.create_cursor()
         self.cursors.append(cursor)
         
         tr_out_idx, reg_tr_out = self._add_register(out_schema, is_trace=True, cursor=cursor, table=trace_table)
         
-        # 4. Resolve Input Trace (if provided)
+        # 4. Resolve Input Trace (if provided, e.g. for MIN/MAX)
         reg_trace_in = None
         if reg_trace_in_idx != -1:
             reg_trace_in = self.registers[reg_trace_in_idx]
             if not reg_trace_in.is_trace():
                 raise QueryError("reg_trace_in must be a Trace register")
 
-        # 5. Emit Reduce Instruction
-        op = instructions.ReduceOp(prev_reg, reg_trace_in, reg_tr_out, reg_out, group_by_cols, agg_func)
+        # 5. Emit Reduce Instruction with all required fields for RPython immutability
+        op = instructions.ReduceOp(
+            prev_reg, 
+            reg_trace_in, 
+            reg_tr_out, 
+            reg_out, 
+            group_by_cols, 
+            agg_func, 
+            out_schema
+        )
         self.instructions.append(op)
         
-        # 6. Emit Integration (Crucial: update the trace for the next step)
-        # S_out = S_out + delta_out
+        # 6. Emit Integration: update the internal trace table with the results of this batch
         sink_op = instructions.IntegrateOp(reg_out, trace_table.engine)
         self.instructions.append(sink_op)
 

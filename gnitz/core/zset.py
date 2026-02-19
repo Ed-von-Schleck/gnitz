@@ -78,23 +78,6 @@ class PersistentTable(object):
         """
         return self.engine.open_trace_cursor()
 
-    def apply_delta_batch(self, zset_batch):
-        """
-        [VM Hook] Integrates an entire ZSetBatch into the table in one go.
-        This implements the DBSP 'Integrate' operator: S <- S + Delta.
-        """
-        if self.read_only:
-            return
-            
-        count = zset_batch.row_count()
-        for i in range(count):
-            # Ingest individual deltas into the MemTable/WAL
-            self.engine.ingest(
-                zset_batch.get_key(i),
-                zset_batch.get_weight(i),
-                zset_batch.get_payload(i)
-            )
-
     def get_schema(self):
         """[VM Hook] Returns the TableSchema."""
         return self.schema

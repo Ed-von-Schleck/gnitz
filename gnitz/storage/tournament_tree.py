@@ -134,14 +134,6 @@ class TournamentTree(object):
             c_idx = rffi.cast(lltype.Signed, self.heap[0].cursor_idx)
             self.advance_cursor_by_index(c_idx)
             
-    def advance_min_cursors(self, target_key=None):
-        """Restored method: Advances all cursors currently at min_key."""
-        if target_key is None:
-            target_key = self.get_min_key()
-        while self.heap_size > 0 and self._get_key(0) == target_key:
-            c_idx = rffi.cast(lltype.Signed, self.heap[0].cursor_idx)
-            self.advance_cursor_by_index(c_idx)
-            
     def get_all_cursors_at_min(self):
         results = []
         if self.heap_size == 0:

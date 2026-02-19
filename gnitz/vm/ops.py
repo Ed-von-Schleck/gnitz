@@ -11,44 +11,7 @@ from gnitz.core.row_logic import make_payload_row
 
 # -----------------------------------------------------------------------------
 # High-Performance Comparison Kernels
-# -----------------------------------------------------------------------------
-
-@jit.unroll_safe
-def _compare_accessors(acc_a, acc_b, schema):
-    """Directly compares two RowAccessors without materializing TaggedValues."""
-    for i in range(len(schema.columns)):
-        if i == schema.pk_index:
-            continue
-
-        col_def = schema.columns[i]
-        t = col_def.field_type.code
-
-        if (t == types.TYPE_I64.code or t == types.TYPE_U64.code or 
-            t == types.TYPE_I32.code or t == types.TYPE_U32.code or
-            t == types.TYPE_I16.code or t == types.TYPE_I16.code or
-            t == types.TYPE_I8.code or t == types.TYPE_U8.code):
-            if acc_a.get_int(i) != acc_b.get_int(i):
-                return -1
-        
-        elif t == types.TYPE_F64.code or t == types.TYPE_F32.code:
-            if acc_a.get_float(i) != acc_b.get_float(i):
-                return -1
-
-        elif t == types.TYPE_U128.code:
-            if acc_a.get_u128(i) != acc_b.get_u128(i):
-                return -1
-
-        elif t == types.TYPE_STRING.code:
-            meta_a = acc_a.get_str_struct(i)
-            meta_b = acc_b.get_str_struct(i)
-            if meta_a[0] != meta_b[0] or meta_a[1] != meta_b[1]:
-                return -1
-            if meta_a[0] > 12:
-                val_a = meta_a[4] if meta_a[4] is not None else strings.unpack_string(meta_a[2], meta_a[3])
-                val_b = meta_b[4] if meta_b[4] is not None else strings.unpack_string(meta_b[2], meta_b[3])
-                if val_a != val_b:
-                    return -1
-    return 0
+# ----------------------------------------------------------------------------- 
 
 @jit.unroll_safe
 def _compare_by_cols(batch, idx_a, idx_b, col_indices):

@@ -71,7 +71,7 @@ class TestVMInterpreter(unittest.TestCase):
 
     def test_basic_pipeline(self):
         """Tests Source -> Filter -> Map -> Result."""
-        qb = query.QueryBuilder(self.db.engine, self.schema)
+        qb = query.QueryBuilder(self.db, self.schema)
         
         # Result Schema: PK | Name | Age*2
         res_schema = types.TableSchema([
@@ -96,7 +96,7 @@ class TestVMInterpreter(unittest.TestCase):
 
     def test_incremental_linearity(self):
         """Verify Q(dA + dB) = Q(dA) + Q(dB)."""
-        qb = query.QueryBuilder(self.db.engine, self.schema)
+        qb = query.QueryBuilder(self.db, self.schema)
         view = qb.filter(AgeFilter()).build()
 
         # Delta A
@@ -134,7 +134,7 @@ class TestVMInterpreter(unittest.TestCase):
         sink_db = zset.PersistentTable(self.test_dir, "sink_db", self.schema)
         
         # Use the new fluent API
-        qb = query.QueryBuilder(self.db.engine, self.schema)
+        qb = query.QueryBuilder(self.db, self.schema)
         view = qb.filter(AgeFilter()).sink(sink_db).build()
 
         in_batch = batch.ZSetBatch(self.schema)
@@ -165,7 +165,7 @@ class TestVMInterpreter(unittest.TestCase):
         table_b.flush()
 
         # Circuit: Delta(A) JOIN Trace(B)
-        qb = query.QueryBuilder(self.db.engine, self.schema)
+        qb = query.QueryBuilder(self.db, self.schema)
         view = qb.join_persistent(table_b).build()
 
         # 1. Delta A arrives for PK 100
@@ -199,7 +199,7 @@ class TestVMInterpreter(unittest.TestCase):
 
     def test_retraction_logic(self):
         """Tests that negative weights (retractions) propagate through the VM correctly."""
-        qb = query.QueryBuilder(self.db.engine, self.schema)
+        qb = query.QueryBuilder(self.db, self.schema)
         # Circuit: Source -> Negate
         view = qb.negate().build()
 

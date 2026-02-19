@@ -72,5 +72,8 @@ class DBSPInterpreter(object):
             elif opcode == instructions.Instruction.INTEGRATE:
                 assert isinstance(instr, instructions.IntegrateOp)
                 ops.op_integrate(instr.reg_in, instr.target_engine)
+            elif opcode == instructions.Instruction.REDUCE:
+                assert isinstance(instr, instructions.ReduceOp)
+                ops.op_reduce(instr, reg_file)
             
             pc += 1

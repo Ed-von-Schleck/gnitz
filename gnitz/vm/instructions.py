@@ -90,3 +90,19 @@ class JoinDeltaDeltaOp(Instruction):
         self.reg_a = reg_a
         self.reg_b = reg_b
         self.reg_out = reg_out
+        
+class ReduceOp(Instruction):
+    _immutable_fields_ = [
+        'reg_in', 'reg_trace_in', 'reg_trace_out', 
+        'reg_out', 'group_by_cols[*]', 'agg_func', 'output_schema'
+    ]
+    def __init__(self, reg_in, reg_trace_in, reg_trace_out, reg_out, group_by_cols, agg_func, output_schema):
+        Instruction.__init__(self, self.REDUCE)
+        self.reg_in = reg_in
+        self.reg_trace_in = reg_trace_in
+        self.reg_trace_out = reg_trace_out
+        self.reg_out = reg_out
+        self.group_by_cols = group_by_cols
+        self.agg_func = agg_func
+        self.output_schema = output_schema
+
