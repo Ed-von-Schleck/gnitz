@@ -4,7 +4,7 @@ import os
 import unittest
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_uint64, r_int64
-from gnitz.core import types, values as db_values, strings as string_logic
+from gnitz.core import types, values as db_values, strings as string_logic, comparator as core_comparator
 from gnitz.storage import buffer, writer_table, shard_table, comparator
 from gnitz.storage.memtable_node import get_key_offset, node_get_payload_ptr
 
@@ -247,11 +247,11 @@ class TestDataComparators(unittest.TestCase):
         # p1 < p2 should be -1
         acc1.set_row(p1_node, 0) # Node is at offset 0 relative to itself
         acc2.set_row(p2_node, 0)
-        self.assertEqual(comparator.compare_rows(self.schema_i64, acc1, acc2), -1)
+        self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc1, acc2), -1)
         
         # p1 == p3 should be 0
         acc2.set_row(p3_node, 0)
-        self.assertEqual(comparator.compare_rows(self.schema_i64, acc1, acc2), 0)
+        self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc1, acc2), 0)
 
     def test_soa_to_soa_comparison_unified(self):
         """Verify row comparison in columnar shards via unified comparator."""
@@ -275,7 +275,7 @@ class TestDataComparators(unittest.TestCase):
         acc2.set_row(v2, 0)
 
         # Should be -1 because "A" < "B"
-        self.assertEqual(comparator.compare_rows(self.schema_i64, acc1, acc2), -1)
+        self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc1, acc2), -1)
         
         v1.close(); v2.close()
 
@@ -300,21 +300,21 @@ class TestDataComparators(unittest.TestCase):
         
         # Test for equality
         acc_val.set_row(values_eq)
-        self.assertEqual(comparator.compare_rows(self.schema_i64, acc_packed, acc_val), 0)
+        self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc_packed, acc_val), 0)
         
         # Test for inequality (packed > value)
         acc_val.set_row(values_lt)
-        self.assertEqual(comparator.compare_rows(self.schema_i64, acc_packed, acc_val), 1)
+        self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc_packed, acc_val), 1)
         
         # Test for inequality (value < packed)
-        self.assertEqual(comparator.compare_rows(self.schema_i64, acc_val, acc_packed), -1)
+        self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc_val, acc_packed), -1)
 
         # Test for inequality (packed < value)
         acc_val.set_row(values_gt)
-        self.assertEqual(comparator.compare_rows(self.schema_i64, acc_packed, acc_val), -1)
+        self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc_packed, acc_val), -1)
         
         # Test for inequality (value > packed)
-        self.assertEqual(comparator.compare_rows(self.schema_i64, acc_val, acc_packed), 1)
+        self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc_val, acc_packed), 1)
 
     def test_u128_lexicographical_ordering(self):
         """Verify 128-bit integer comparison across accessors."""
@@ -350,12 +350,12 @@ class TestDataComparators(unittest.TestCase):
         ])
         # The string "valA" will match. Comparison moves to u128 column.
         # MAX_U128 > 150, so SoA > Value -> result 1
-        self.assertEqual(comparator.compare_rows(self.schema_u128, acc_soa, acc_val), 1)
+        self.assertEqual(core_comparator.compare_rows(self.schema_u128, acc_soa, acc_val), 1)
 
         # Compare SoA row 1 (PK: 200, Col2: 200) vs Value (PK: not used, Col2: 150)
         acc_soa.set_row(v, 1)
         # "valB" > "valA" already, so first column mismatch. SoA > Value -> result 1
-        self.assertEqual(comparator.compare_rows(self.schema_u128, acc_soa, acc_val), 1)
+        self.assertEqual(core_comparator.compare_rows(self.schema_u128, acc_soa, acc_val), 1)
         
         v.close()
 
@@ -392,8 +392,8 @@ class TestDataComparators(unittest.TestCase):
         acc_a.set_row(v_a, 0)
         acc_b.set_row(v_b, 0)
 
-        # The core test: compare_rows should return 0 despite different blob_buf.ptr
-        self.assertEqual(comparator.compare_rows(self.schema_i64, acc_a, acc_b), 0)
+        # The core test: core_comparator.compare_rows should return 0 despite different blob_buf.ptr
+        self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc_a, acc_b), 0)
 
         v_a.close(); v_b.close()
 

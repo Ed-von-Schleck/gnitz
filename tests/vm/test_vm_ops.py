@@ -203,7 +203,7 @@ class TestVMOps(unittest.TestCase):
             
             # FIXED: Removed the '1' (table_id) argument. 
             # The operator now only needs the register and the engine instance.
-            ops.op_integrate(reg_in, db.engine)
+            ops.op_integrate(reg_in, db)
             
             # Verify weight via storage engine logic
             self.assertEqual(db.get_weight(444, self._mk_payload("Sinked", 42)), 1)

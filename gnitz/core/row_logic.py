@@ -54,11 +54,6 @@ def make_payload_row(n_payload_cols):
     return newlist_hint(n_payload_cols)
 
 
-# The comparison kernel for relational records.
-# It performs a type-aware lexicographical comparison of all non-PK columns.
-compare_records = comparator.compare_rows
-
-
 class BaseRowAccessor(comparator.RowAccessor):
     """
     The Abstract Data Accessor interface.

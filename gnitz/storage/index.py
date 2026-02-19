@@ -4,6 +4,7 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.core import errors
 from gnitz.storage import shard_table
 from gnitz.storage.metadata import ManifestEntry
+from gnitz.storage import manifest
 
 
 class ShardHandle(object):
@@ -136,8 +137,6 @@ class ShardIndex(object):
 
 def index_from_manifest(manifest_path, table_id, schema, ref_counter, validate_checksums=False):
     """Factory to initialize an Index from a Manifest file."""
-    from gnitz.storage import manifest
-    
     idx = ShardIndex(table_id, schema, ref_counter)
     reader = manifest.ManifestReader(manifest_path)
     try:

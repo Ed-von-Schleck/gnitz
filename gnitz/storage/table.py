@@ -60,7 +60,7 @@ class PersistentTable(AbstractTable):
             self.index = index.ShardIndex(self.table_id, self.schema, self.ref_counter)
             
         # 4. Initialize Execution Engine
-        self.engine = engine.Engine(
+        self._engine = engine.Engine(
             self.schema,
             self.index,
             memtable_capacity=cache_size,
@@ -80,7 +80,7 @@ class PersistentTable(AbstractTable):
 
     def create_cursor(self):
         # Existing implementation — returns UnifiedCursor
-        return self.engine.open_trace_cursor()
+        return self._engine.open_trace_cursor()
 
     def create_scratch_table(self, name, schema):
         # Creates a sibling PersistentTable in the same directory.
@@ -89,10 +89,10 @@ class PersistentTable(AbstractTable):
 
     def ingest(self, key, weight, payload):
         # Delegates to the engine (existing logic, same signature)
-        self.engine.ingest(key, weight, payload)
+        self._engine.ingest(key, weight, payload)
 
     def get_weight(self, key, payload):
-        return self.engine.get_effective_weight_raw(key, payload)
+        return self._engine.get_effective_weight_raw(key, payload)
 
     # -------------------------------------------------------------------------
     # Standard Relational API
@@ -100,15 +100,15 @@ class PersistentTable(AbstractTable):
 
     def insert(self, key, db_values_list):
         """Appends a positive Z-Set delta (addition)."""
-        self.engine.ingest(r_uint128(key), 1, db_values_list)
+        self._engine.ingest(r_uint128(key), 1, db_values_list)
 
     def remove(self, key, db_values_list):
         """Appends a negative Z-Set delta (removal)."""
-        self.engine.ingest(r_uint128(key), -1, db_values_list)
+        self._engine.ingest(r_uint128(key), -1, db_values_list)
 
     def get_weight(self, key, db_values_list):
         """Retrieves the net algebraic weight of a specific record."""
-        return self.engine.get_effective_weight_raw(r_uint128(key), db_values_list)
+        return self._engine.get_effective_weight_raw(r_uint128(key), db_values_list)
 
     def flush(self):
         """
@@ -117,12 +117,12 @@ class PersistentTable(AbstractTable):
         if self.read_only:
             return ""
 
-        lsn_val = intmask(self.engine.starting_lsn)
+        lsn_val = intmask(self._engine.starting_lsn)
         filename = os.path.join(self.directory, "%s_shard_%d.db" % (
             self.name, lsn_val)
         )
         
-        needs_compaction = self.engine.flush_and_rotate(filename)
+        needs_compaction = self._engine.flush_and_rotate(filename)
         self.checkpoint()
         
         if needs_compaction:
@@ -153,7 +153,7 @@ class PersistentTable(AbstractTable):
     def close(self):
         """Gracefully closes resources."""
         if self.is_closed: return
-        self.engine.close()
+        self._engine.close()
         if self.wal_writer: self.wal_writer.close()
         self.is_closed = True
         

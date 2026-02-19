@@ -5,11 +5,12 @@ import errno
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
+from gnitz.storage.cursor import MemTableCursor, ShardCursor, UnifiedCursor
 from gnitz.storage.memtable import MemTable
 from gnitz.storage.memtable_node import node_get_weight
 from gnitz.storage.wal_format import WALRecord
 from gnitz.storage import wal, index, comparator
-from gnitz.core import types, values
+from gnitz.core import types, values, comparator as core_comparator
 
 class Engine(object):
     """
@@ -146,7 +147,7 @@ class Engine(object):
                 
                 self.soa_accessor.set_row(view, curr_idx)
                 
-                if comparator.compare_rows(self.schema, self.soa_accessor, self.value_accessor) == 0:
+                if core_comparator.compare_rows(self.schema, self.soa_accessor, self.value_accessor) == 0:
                     spine_weight += shard_handle.view.get_weight(curr_idx)
                     break
                 
@@ -211,7 +212,6 @@ class Engine(object):
         Returns a UnifiedCursor representing the current net state 
         of the table (MemTable + Shards).
         """
-        from gnitz.storage.cursor import MemTableCursor, ShardCursor, UnifiedCursor
         
         # Build the cursor list using append, never [None] * n.
         #

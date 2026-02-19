@@ -4,7 +4,7 @@ from rpython.rlib.rrandom import Random
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import errors
+from gnitz.core import errors, comparator as core_comparator
 from gnitz.storage import buffer, writer_table, comparator
 from gnitz.storage.memtable_node import (
     node_get_next_off, node_set_next_off, node_get_weight, node_set_weight,
@@ -101,7 +101,7 @@ class MemTable(object):
                 elif next_key == key:
                     self.node_accessor.set_row(base, next_off)
                     # Advance if the current node's payload is smaller than the target
-                    if comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) < 0:
+                    if core_comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) < 0:
                         curr_off = next_off
                     else:
                         break  # Found position or overshot
@@ -117,7 +117,7 @@ class MemTable(object):
             if node_get_key(base, match_off, self.key_size) == key:
                 self.node_accessor.set_row(base, match_off)
                 # Final check for exact payload match
-                if comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) == 0:
+                if core_comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) == 0:
                     return match_off
         return 0
 

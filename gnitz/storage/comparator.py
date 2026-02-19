@@ -4,8 +4,7 @@ from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import types, strings as string_logic, values as db_values
-from gnitz.core.comparator import RowAccessor, compare_rows, ValueAccessor
-
+from gnitz.core.comparator import RowAccessor, ValueAccessor
 from gnitz.storage.memtable_node import node_get_payload_ptr
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
