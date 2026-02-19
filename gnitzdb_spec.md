@@ -652,6 +652,17 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
     *   Use `intmask(x)` to force truncation to machine word.
 *   **Unsigned:** Use `r_uint` for bitwise ops/checksums.
 *   **128-bit:** Natively supported via `r_ulonglonglong`. **Warning:** RPython types (`int`, `long`) are "frozen" descriptors. **Never** cast via `long(x)`; use specialized casting helpers.
+*   **`make_int` / `intmask` Signedness Conflict:** `TaggedValue.make_int` uses `@specialize.argtype`, but RPython still unifies `TaggedValue.i64` across **all** construction sites globally. If one call site passes an `r_uint64` (e.g. from `get_int()`) and another passes a plain `int`/`r_int64` expression (e.g. `acc.i64 + weight`), `intmask` produces conflicting annotations and translation fails with `UnionError`. Instead of `make_int()`, construct `TaggedValue` directly, using `rffi.cast(rffi.LONGLONG, ...)` to cross the `r_uint64` → `r_int64` boundary:
+    ```python
+    # Wrong:
+    values.TaggedValue.make_int(row.get_int(col))     # r_uint64 through intmask
+    values.TaggedValue.make_int(acc.i64 + weight)     # r_int64 through intmask
+
+    # Correct:
+    val = rffi.cast(rffi.LONGLONG, row.get_int(col))
+    values.TaggedValue(TAG_INT, val, r_uint64(0), 0.0, "")
+    values.TaggedValue(TAG_INT, acc.i64 + weight, r_uint64(0), 0.0, "")
+    ```
 *   **List Tracing Bug:** Storing `r_uint128` primitives directly in resizable lists can lead to alignment issues or SIGSEGV in the translated C code.
 *   **Best Practice:** Split `u128` values into two `u64` lists (`keys_lo`, `keys_hi`) when storing them in resizable containers. Reconstruct the `u128` only at the point of computation/comparison.
 *   **Prebuilt Long Trap:** Do not use literals > `sys.maxint` (e.g., `0xFFFFFF...`). Python 2 creates a `long` object, which cannot be frozen into the binary. Use `r_uint(-1)` or bit-shifts.
@@ -682,6 +693,7 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
 6.  **mr-Poisoning:** Using `[]` for a payload list, causing all future `.append` calls to crash.
 7.  **u128-List Crashes:** Storing raw 128-bit integers in a resizable list instead of splitting into `lo/hi` pairs.
 8.  **Raw-Leak:** Malloc-ing a `dummy_ptr` in an accessor and never freeing it, corrupting the C heap.
+9.  **`make_int` Union Poison:** Calling `TaggedValue.make_int()` from call sites with differing argument signedness causes a global `UnionError` on `TaggedValue.i64`, because it is a single shared field in the annotator's type lattice. Never use `make_int()` where `get_int()` return values or `r_int64` arithmetic results are involved — construct `TaggedValue` directly instead (see Section 4).
 
 # Appendix B: Coding practices
 

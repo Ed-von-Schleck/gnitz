@@ -381,7 +381,8 @@ def materialize_row(accessor, schema):
             type_code == types.TYPE_I32.code or type_code == types.TYPE_U32.code or
             type_code == types.TYPE_I16.code or type_code == types.TYPE_U16.code or
             type_code == types.TYPE_I8.code or type_code == types.TYPE_U8.code):
-            result.append(values.TaggedValue.make_int(accessor.get_int(i)))
+            val = rffi.cast(rffi.LONGLONG, accessor.get_int(i))
+            result.append(values.TaggedValue(values.TAG_INT, val, r_uint64(0), 0.0, ""))
         elif type_code == types.TYPE_F64.code or type_code == types.TYPE_F32.code:
             result.append(values.TaggedValue.make_float(accessor.get_float(i)))
         elif type_code == types.TYPE_STRING.code:

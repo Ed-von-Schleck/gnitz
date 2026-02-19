@@ -293,8 +293,8 @@ def decode_wal_block(block_ptr, block_len, schema):
                     val = db_values.TaggedValue.make_u128(lo, hi)
 
                 else:
-                    i_val = rffi.cast(rffi.ULONGLONGP, fptr)[0]
-                    val = db_values.TaggedValue.make_int(i_val)
+                    i_val = rffi.cast(rffi.LONGLONG, rffi.cast(rffi.ULONGLONGP, fptr)[0])
+                    val = db_values.TaggedValue(db_values.TAG_INT, i_val, r_uint64(0), 0.0, "")
 
                 field_values.append(val)
                 val_idx += 1
