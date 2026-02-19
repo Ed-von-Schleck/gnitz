@@ -31,7 +31,7 @@ class TestVMCursors(unittest.TestCase):
     def _mk_payload(self, name, score):
         return [
             values.TaggedValue.make_string(name),
-            values.TaggedValue.make_int(score)
+            values.TaggedValue.make_i64(score),
         ]
 
     def _extract_name(self, cursor):

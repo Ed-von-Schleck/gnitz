@@ -1,5 +1,6 @@
 # gnitz/core/values.py
 
+from rpython.rtyper.lltypesystem import rffi
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rlib.jit import specialize
@@ -10,14 +11,6 @@ TAG_FLOAT = 1
 TAG_STRING = 2
 TAG_NULL = 3
 TAG_U128 = 4
-
-
-@specialize.argtype(0)
-def _make_int_impl(val):
-    # intmask() truncates and forces the result to a signed machine word.
-    # r_int64() ensures the storage in TaggedValue is a consistent 64-bit signed int.
-    return TaggedValue(TAG_INT, r_int64(intmask(val)), r_uint64(0), 0.0, "")
-
 
 class TaggedValue(object):
     """
@@ -48,8 +41,14 @@ class TaggedValue(object):
         self.str_val = s    # str
 
     @staticmethod
-    def make_int(val):
-        return _make_int_impl(val)
+    def make_i64(val):
+        """For r_int64 values (accumulator arithmetic, weight expressions)."""
+        return TaggedValue(TAG_INT, r_int64(val), r_uint64(0), 0.0, "")
+
+    @staticmethod
+    def make_u64(val):
+        """For r_uint64 values (get_int() results, raw rffi reads)."""
+        return TaggedValue(TAG_INT, rffi.cast(rffi.LONGLONG, val), r_uint64(0), 0.0, "")
 
     @staticmethod
     def make_float(val):

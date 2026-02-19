@@ -28,15 +28,15 @@ def test_engine_recovery_cycle():
         m_mgr
     )
     
-    db.mem_manager.put(1, 1, [db_values.TaggedValue.make_int(100)]) # LSN 1
-    db.mem_manager.put(2, 1, [db_values.TaggedValue.make_int(200)]) # LSN 2
+    db.mem_manager.put(1, 1, [db_values.TaggedValue.make_i64(100)]) # LSN 1
+    db.mem_manager.put(2, 1, [db_values.TaggedValue.make_i64(200)]) # LSN 2
     
     # 2. Checkpoint: Flush to shard and truncate WAL
     db.flush_and_rotate(s_path) 
     db.mem_manager.wal_writer.truncate_before_lsn(3)
     
     # 3. Add un-flushed data
-    db.mem_manager.put(3, 1, [db_values.TaggedValue.make_int(300)]) # LSN 3
+    db.mem_manager.put(3, 1, [db_values.TaggedValue.make_i64(300)]) # LSN 3
     db.close()
     
     # 4. Restart: Recovery should load Shard 1 AND replay WAL Block LSN 3

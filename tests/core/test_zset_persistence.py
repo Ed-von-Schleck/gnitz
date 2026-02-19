@@ -38,7 +38,7 @@ class TestZSetPersistence(unittest.TestCase):
 
     def _p(self, i8, s, f64):
         return [
-            db_values.TaggedValue.make_int(i8), 
+            db_values.TaggedValue.make_i64(i8), 
             db_values.TaggedValue.make_string(s), 
             db_values.TaggedValue.make_float(f64)
         ]

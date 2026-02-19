@@ -17,13 +17,13 @@ from gnitz.storage import compactor
 def mk_payload(s, i):
     row = make_payload_row(2)
     row.append(db_values.TaggedValue.make_string(s))
-    row.append(db_values.TaggedValue.make_int(i))
+    row.append(db_values.TaggedValue.make_i64(i)
     return row
 
 
 def mk_int_payload(i):
     row = make_payload_row(1)
-    row.append(db_values.TaggedValue.make_int(i))
+    row.append(db_values.TaggedValue.make_i64(i)
     return row
 
 

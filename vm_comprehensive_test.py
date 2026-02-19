@@ -26,7 +26,7 @@ class LongStringMapper(functions.ScalarFunction):
         # Output matches schema_a: Float, String, Int
         output_row_list.append(values.TaggedValue.make_float(row_accessor.get_float(0)))
         output_row_list.append(values.TaggedValue.make_string(long_str))
-        output_row_list.append(values.TaggedValue.make_int(100))
+        output_row_list.append(values.TaggedValue.make_i64(100))
 
 
 def mk_u128(hi, lo):
@@ -97,7 +97,7 @@ def test_full_vm_coverage(base_dir):
         batch_1_row = make_payload_row(3)
         batch_1_row.append(values.TaggedValue.make_float(0.7))
         batch_1_row.append(values.TaggedValue.make_string("Alice"))
-        batch_1_row.append(values.TaggedValue.make_int(100))
+        batch_1_row.append(values.TaggedValue.make_i64(100))
 
         batch_1 = batch.ZSetBatch(schema_a)
         batch_1.append(pk_x, r_int64(1), batch_1_row)
@@ -143,7 +143,7 @@ def test_reduce_op(base_dir):
         )
 
         row = make_payload_row(1)
-        row.append(values.TaggedValue.make_int(r_uint64(10)))
+        row.append(values.TaggedValue.make_u64(r_uint64(10)))
 
         input_batch = batch.ZSetBatch(schema)
         input_batch.append(r_uint128(1), r_int64(1), row)
@@ -211,7 +211,7 @@ def test_delay_and_join_delta_delta(base_dir):
 
         pk = mk_u128(1, 2)
         row = make_payload_row(1)
-        row.append(values.TaggedValue.make_int(r_uint64(42)))
+        row.append(values.TaggedValue.make_u64(r_uint64(42)))
 
         input_batch = batch.ZSetBatch(schema)
         input_batch.append(pk, r_int64(1), row)

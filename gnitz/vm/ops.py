@@ -158,7 +158,7 @@ def op_reduce(op):
         
         # 4. Retraction Logic: Look up old value in trace_out
         trace_out.seek(group_key_u128)
-        old_val_tv = values.TaggedValue.make_int(0)
+        old_val_tv = values.TaggedValue.make_i64(0)
         has_old = False
         
         if trace_out.is_valid() and trace_out.key() == group_key_u128:

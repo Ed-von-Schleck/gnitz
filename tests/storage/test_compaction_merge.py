@@ -20,8 +20,7 @@ class TestCompactionMerge(unittest.TestCase):
         path = name + ".db"
         w = writer_table.TableShardWriter(self.layout)
         for pk, weight, val in records:
-            # Fix: use TaggedValue.make_int
-            w.add_row_from_values(pk, weight, [db_values.TaggedValue.make_int(val)])
+            w.add_row_from_values(pk, weight, [db_values.TaggedValue.make_i64(val)])
         w.finalize(path)
         self.files.append(path)
         return path

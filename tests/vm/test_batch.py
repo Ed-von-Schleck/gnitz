@@ -18,7 +18,7 @@ class TestZSetBatch(unittest.TestCase):
         """Helper to create the List[TaggedValue] payload (excluding PK)."""
         return [
             db_values.TaggedValue.make_string(s),
-            db_values.TaggedValue.make_int(i)
+            db_values.TaggedValue.make_i64(i),
         ]
 
     def test_batch_append_and_clear(self):

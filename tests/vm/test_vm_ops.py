@@ -27,7 +27,7 @@ class ScoreDoubler(functions.ScalarFunction):
         output_row_list.append(values.TaggedValue.make_string(name))
         # Col 2: Score (Int)
         score = row_accessor.get_int(2)
-        output_row_list.append(values.TaggedValue.make_int(r_int64(score * 2)))
+        output_row_list.append(values.TaggedValue.make_i64(r_int64(score * 2)))
 
 # ------------------------------------------------------------------------------
 # Test Suite
@@ -55,7 +55,7 @@ class TestVMOps(unittest.TestCase):
     def _mk_payload(self, name, score):
         return [
             values.TaggedValue.make_string(name),
-            values.TaggedValue.make_int(score)
+            values.TaggedValue.make_i64(score),
         ]
 
     def test_filter_op(self):

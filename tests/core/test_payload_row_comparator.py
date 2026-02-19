@@ -103,19 +103,19 @@ class TestPayloadRowComparatorUnsignedInt(unittest.TestCase):
         self.cmp = PayloadRowComparator(self.schema)
 
     def test_max_u64_sorts_after_zero(self):
-        max_val = values.TaggedValue.make_int(r_uint64(0xFFFFFFFFFFFFFFFF))
-        zero = values.TaggedValue.make_int(r_uint64(0))
+        max_val = values.TaggedValue.make_u64(r_uint64(0xFFFFFFFFFFFFFFFF))
+        zero = values.TaggedValue.make_u64(r_uint64(0))
         result = self.cmp.compare(_row(max_val), _row(zero))
         self.assertGreater(result, 0)
 
     def test_high_bit_set_sorts_after_zero(self):
-        high_bit = values.TaggedValue.make_int(r_uint64(1) << 63)
-        zero = values.TaggedValue.make_int(r_uint64(0))
+        high_bit = values.TaggedValue.make_u64(r_uint64(1) << 63)
+        zero = values.TaggedValue.make_u64(r_uint64(0))
         result = self.cmp.compare(_row(high_bit), _row(zero))
         self.assertGreater(result, 0)
 
     def test_equal_ints(self):
-        v = values.TaggedValue.make_int(r_uint64(42))
+        v = values.TaggedValue.make_u64(r_uint64(42))
         result = self.cmp.compare(_row(v), _row(v))
         self.assertEqual(result, 0)
 

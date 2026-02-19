@@ -57,7 +57,7 @@ def _u128_row(lo, hi):
 
 def _u64_row(val):
     row = make_payload_row(1)
-    row.append(values.TaggedValue.make_int(r_uint64(val)))
+    row.append(values.TaggedValue.make_u64(r_uint64(val)))
     return row
 
 

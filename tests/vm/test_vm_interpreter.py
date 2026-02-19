@@ -27,7 +27,7 @@ class AgeDoubler(functions.ScalarFunction):
         output_row_list.append(values.TaggedValue.make_string(name))
         # Col 2: Age -> Age * 2
         age = row_accessor.get_int(2)
-        output_row_list.append(values.TaggedValue.make_int(r_int64(age * 2)))
+        output_row_list.append(values.TaggedValue.make_i64(r_int64(age * 2)))
 
 # ------------------------------------------------------------------------------
 # Test Suite
@@ -58,7 +58,7 @@ class TestVMInterpreter(unittest.TestCase):
     def _mk_payload(self, name, age):
         return [
             values.TaggedValue.make_string(name),
-            values.TaggedValue.make_int(age)
+            values.TaggedValue.make_i64(age)
         ]
 
     def _batch_to_dict(self, zbatch):
