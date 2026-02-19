@@ -3,11 +3,11 @@
 import sys
 import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
-from gnitz.core import types, values, query, row_logic
+from gnitz.core import types, values, row_logic
 from gnitz.vm import functions
 from gnitz.storage.table import PersistentTable
 from gnitz.core.row_logic import make_payload_row
-from gnitz.vm import batch, runtime, instructions, ops, interpreter
+from gnitz.vm import batch, runtime, instructions, ops, interpreter, query
 
 
 class ComprehensiveFilter(functions.ScalarFunction):
@@ -72,18 +72,16 @@ def test_full_vm_coverage(base_dir):
 
     tab_a = PersistentTable(db_path, "table_a", schema_a)
     tab_b = PersistentTable(db_path, "table_b", schema_b)
-    res_tab = PersistentTable(db_path, "table_res", schema_a)	
+    res_tab = PersistentTable(db_path, "table_res", schema_a)
 
     try:
         pk_x = mk_u128(0xAAAA, 0xBBBB)
 
-        # Build tab_b payload...
         tab_b_row = make_payload_row(1)
         tab_b_row.append(values.TaggedValue.make_string("Dept_Alpha"))
         tab_b.insert(pk_x, tab_b_row)
         tab_b.flush()
 
-        # FIX: Pass tab_a directly to the QueryBuilder
         qb = query.QueryBuilder(tab_a, schema_a)
         view = (
             qb.filter(ComprehensiveFilter())
@@ -96,7 +94,6 @@ def test_full_vm_coverage(base_dir):
             .build()
         )
 
-        # Build batch_1 payload without list literals.
         batch_1_row = make_payload_row(3)
         batch_1_row.append(values.TaggedValue.make_float(0.7))
         batch_1_row.append(values.TaggedValue.make_string("Alice"))
@@ -114,6 +111,49 @@ def test_full_vm_coverage(base_dir):
         tab_a.close()
         tab_b.close()
         res_tab.close()
+
+
+def test_reduce_op(base_dir):
+    """
+    Exercises the ReduceOp instruction path, ensuring ReduceOp.__init__ is
+    reachable from the entry point so RPython's annotator sees all of its
+    fields (reg_in, reg_trace_in, etc.) and can type-check op_reduce().
+    """
+    os.write(1, "[VM Comprehensive] Testing ReduceOp (COUNT aggregate)...\n")
+    db_path = os.path.join(base_dir, "vm_reduce")
+    if not os.path.exists(db_path):
+        os.mkdir(db_path)
+
+    # Schema: u64 PK, i64 value column
+    schema = types.TableSchema(
+        [
+            types.ColumnDefinition(types.TYPE_U64),
+            types.ColumnDefinition(types.TYPE_I64),
+        ],
+        pk_index=0,
+    )
+
+    tab = PersistentTable(db_path, "reduce_src", schema)
+    try:
+        # GROUP BY col-0 (the PK column), COUNT(*)
+        qb = query.QueryBuilder(tab, schema)
+        view = (
+            qb.reduce([0], functions.CountAggregateFunction())
+            .build()
+        )
+
+        row = make_payload_row(1)
+        row.append(values.TaggedValue.make_int(r_uint64(10)))
+
+        input_batch = batch.ZSetBatch(schema)
+        input_batch.append(r_uint128(1), r_int64(1), row)
+
+        view.process(input_batch)
+
+        os.write(1, "    [OK] ReduceOp annotated and executed.\n")
+        return True
+    finally:
+        tab.close()
 
 
 def test_delay_and_join_delta_delta(base_dir):
@@ -152,7 +192,6 @@ def test_delay_and_join_delta_delta(base_dir):
         # Three registers: input, delayed-input, join-output.
         reg0 = runtime.DeltaRegister(0, vm_schema)
         reg1 = runtime.DeltaRegister(1, vm_schema)
-        # Use the correct output schema for the join result register
         reg2 = runtime.DeltaRegister(2, vm_schema_out)
 
         reg_file = runtime.RegisterFile(3)
@@ -167,7 +206,8 @@ def test_delay_and_join_delta_delta(base_dir):
             instructions.HaltOp(),
         ]
 
-        interp = interpreter.DBSPInterpreter(tab.engine, reg_file, program)
+        # DBSPInterpreter takes (register_file, program) — no engine argument.
+        interp = interpreter.DBSPInterpreter(reg_file, program)
 
         pk = mk_u128(1, 2)
         row = make_payload_row(1)
@@ -192,6 +232,8 @@ def entry_point(argv):
     os.mkdir(base_dir)
     try:
         if not test_full_vm_coverage(base_dir):
+            return 1
+        if not test_reduce_op(base_dir):
             return 1
         if not test_delay_and_join_delta_delta(base_dir):
             return 1
