@@ -36,7 +36,7 @@ WAL_BLOCK_HEADER_SIZE = 32
 # ---------------------------------------------------------------------------
 
 def _read_u8_raw(buf, offset):
-    return r_uint64(ord(buf))
+    return r_uint64(ord(buf[offset]))
 
 
 def _read_i8(buf, offset):
@@ -101,7 +101,8 @@ def _read_u128(buf, offset):
 
 
 def _read_f32(buf, offset):
-    return float(rffi.cast(rffi.FLOATP, rffi.ptradd(buf, offset)))
+    ptr = rffi.cast(rffi.FLOATP, rffi.ptradd(buf, offset))
+    return float(ptr[0])
 
 
 def _read_f64(buf, offset):
@@ -113,18 +114,18 @@ def _read_f64(buf, offset):
 # ---------------------------------------------------------------------------
 
 def _write_u8(buf, offset, val_u64):
-    buf = chr(intmask(val_u64 & r_uint64(0xFF)))
+    buf[offset] = chr(intmask(val_u64 & r_uint64(0xFF)))
 
 
 def _write_i64(buf, offset, val_i64):
     v = r_uint64(intmask(val_i64))
     for k in range(8):
-        buf = chr(intmask((v >> r_uint64(k * 8)) & r_uint64(0xFF)))
+        buf[offset + k] = chr(intmask((v >> r_uint64(k * 8)) & r_uint64(0xFF)))
 
 
 def _write_u64(buf, offset, val_u64):
     for k in range(8):
-        buf = chr(intmask((val_u64 >> r_uint64(k * 8)) & r_uint64(0xFF)))
+        buf[offset + k] = chr(intmask((val_u64 >> r_uint64(k * 8)) & r_uint64(0xFF)))
 
 
 def _write_u128(buf, offset, val_u128):
@@ -133,7 +134,8 @@ def _write_u128(buf, offset, val_u128):
 
 
 def _write_f32(buf, offset, val_f64):
-    rffi.cast(rffi.FLOATP, rffi.ptradd(buf, offset)) = rffi.cast(rffi.FLOAT, val_f64)
+    ptr = rffi.cast(rffi.FLOATP, rffi.ptradd(buf, offset))
+    ptr[0] = rffi.cast(rffi.FLOAT, val_f64)
 
 
 def _write_f64(buf, offset, val_f64):
@@ -143,12 +145,12 @@ def _write_f64(buf, offset, val_f64):
 def _write_u32(buf, offset, val_u64):
     v = val_u64 & r_uint64(0xFFFFFFFF)
     for k in range(4):
-        buf = chr(intmask((v >> r_uint64(k * 8)) & r_uint64(0xFF)))
+        buf[offset + k] = chr(intmask((v >> r_uint64(k * 8)) & r_uint64(0xFF)))
 
 
 def _write_u16(buf, offset, val_u64):
-    buf     = chr(intmask(val_u64 & r_uint64(0xFF)))
-    buf = chr(intmask((val_u64 >> 8) & r_uint64(0xFF)))
+    buf[offset]     = chr(intmask(val_u64 & r_uint64(0xFF)))
+    buf[offset + 1] = chr(intmask((val_u64 >> 8) & r_uint64(0xFF)))
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +161,9 @@ def _unpack_string(buf, col_offset, heap_base):
     blob_off = intmask(_read_u32(buf, col_offset))
     blob_len = intmask(_read_u32(buf, col_offset + 4))
     abs_off  = heap_base + blob_off
-    chars =[]
+    chars = [None] * blob_len
     for k in range(blob_len):
-        chars.append(buf)
+        chars[k] = buf[abs_off + k]
     return "".join(chars)
 
 
@@ -173,7 +175,7 @@ def _pack_string_ref(buf, col_offset, blob_off_rel, blob_len):
 def _write_blob_bytes(buf, heap_base, blob_off_rel, val_str):
     abs_off = heap_base + blob_off_rel
     for k in range(len(val_str)):
-        buf = val_str
+        buf[abs_off + k] = val_str[k]
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +194,8 @@ def decode_wal_record(schema, buf, base, heap_base):
         if i == schema.pk_index:
             continue
 
-        col_type   = schema.columns.field_type
-        col_offset = base + _HDR_PAYLOAD_BASE + schema.column_offsets
+        col_type   = schema.columns[i].field_type
+        col_offset = base + _HDR_PAYLOAD_BASE + schema.column_offsets[i]
 
         if null_word & (r_uint64(1) << payload_col):
             row.append_null(payload_col)
@@ -267,8 +269,8 @@ def write_wal_record(schema, pk, weight, row, buf, base, heap_base):
         if i == schema.pk_index:
             continue
 
-        col_type   = schema.columns.field_type
-        col_offset = base + _HDR_PAYLOAD_BASE + schema.column_offsets
+        col_type   = schema.columns[i].field_type
+        col_offset = base + _HDR_PAYLOAD_BASE + schema.column_offsets[i]
 
         if row.is_null(payload_col):
             if col_type.code == types.TYPE_U128.code:
@@ -347,7 +349,7 @@ def compute_record_size(schema, row):
     for i in range(len(schema.columns)):
         if i == schema.pk_index:
             continue
-        col_type = schema.columns.field_type
+        col_type = schema.columns[i].field_type
         if col_type.code == types.TYPE_STRING.code:
             if not row.is_null(payload_col):
                 heap_size += len(row.get_str(payload_col))
@@ -360,7 +362,7 @@ def write_wal_block(fd, lsn, table_id, records, schema):
     entry_count = len(records)
     total_size = WAL_BLOCK_HEADER_SIZE
     
-    record_sizes =[]
+    record_sizes = []
     for rec in records:
         f_sz, h_sz = compute_record_size(schema, rec.component_data)
         record_sizes.append((f_sz, h_sz))
@@ -375,8 +377,8 @@ def write_wal_block(fd, lsn, table_id, records, schema):
         
         current_offset = WAL_BLOCK_HEADER_SIZE
         for i in range(entry_count):
-            rec = records
-            f_sz, h_sz = record_sizes
+            rec = records[i]
+            f_sz, h_sz = record_sizes[i]
             write_wal_record(
                 schema,
                 rec.get_key(),
@@ -401,6 +403,7 @@ def write_wal_block(fd, lsn, table_id, records, schema):
         while written < total_size:
             ptr = rffi.ptradd(buf, written)
             chunk = rffi.cast(rffi.CCHARP, ptr)
+            # Use charpsize2str for the write syscall wrapper
             n = _os.write(fd, rffi.charpsize2str(chunk, total_size - written))
             if n <= 0:
                 raise IOError("WAL write failed")
@@ -425,7 +428,7 @@ def decode_wal_block(buf, total_size, schema):
             from gnitz.core import errors
             raise errors.CorruptShardError("WAL block checksum mismatch")
             
-    records =[]
+    records = []
     current_offset = WAL_BLOCK_HEADER_SIZE
     for i in range(entry_count):
         f_sz = _HDR_PAYLOAD_BASE + schema.memtable_stride
