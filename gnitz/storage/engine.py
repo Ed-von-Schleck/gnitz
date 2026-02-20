@@ -21,7 +21,17 @@ class Engine(object):
     2. Immutable State: Reading via ShardIndex.
     3. Persistence: Managing the Flush/Rotate lifecycle and Manifest updates.
     """
-    _immutable_fields_ =
+    _immutable_fields_ = [
+        "schema",
+        "index",
+        "memtable_capacity",
+        "wal_writer",
+        "manifest_manager",
+        "table_id",
+        "validate_checksums",
+        "value_accessor",
+        "soa_accessor",
+    ]
 
     def __init__(self, schema, shard_index, memtable_capacity, wal_writer=None, 
                  manifest_manager=None, table_id=1, recover_wal_filename=None, 
@@ -73,7 +83,7 @@ class Engine(object):
         # 1. Write-Ahead Log (Durability)
         if self.wal_writer:
             rec = WALRecord(r_uint128(key), weight, row)
-            self.wal_writer.append_block(lsn, self.table_id,)
+            self.wal_writer.write_record(lsn, self.table_id, rec)
             
         # 2. Update In-Memory State (Visibility)
         self.active_table.upsert(r_uint128(key), weight, row)
@@ -212,19 +222,19 @@ class Engine(object):
         # Build the cursor list using append, never * n.
         #
         # * (n + 1) initializes a List that widens to
-        # List when cursor objects are assigned into it.
-        # UnifiedCursor._immutable_fields_ ="] tells RPython to
+        # List[Optional[BaseCursor]] when cursor objects are assigned into it.
+        # UnifiedCursor._immutable_fields_ = ["cursors[*]"] tells RPython to
         # store cursors as a raw C array with direct non-nullable pointer loads.
         # The Optional element type conflicts with that expectation: the C code
         # reads each slot as a BaseCursor* but gets a nullable representation,
         # causing a SIGSEGV when the first virtual dispatch is attempted.
         #
-        # Using append on an empty list keeps the element type as List
+        # Using append on an empty list keeps the element type as List[BaseCursor]
         # (non-nullable) throughout, which matches the array contract.
-        cs =[]
+        cs = []
         cs.append(MemTableCursor(self.active_table))
         for i in range(len(self.index.handles)):
-            cs.append(ShardCursor(self.index.handles.view))
+            cs.append(ShardCursor(self.index.handles[i].view))
             
         return UnifiedCursor(self.schema, cs)
 
