@@ -1,4 +1,4 @@
-# tests_data_comparators.py
+# tests/core/tests_data_comparators.py
 
 import os
 import unittest
@@ -7,6 +7,7 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_uint64, r_i
 from gnitz.core import types, values as db_values, strings as string_logic, comparator as core_comparator
 from gnitz.storage import buffer, writer_table, shard_table, comparator
 from gnitz.storage.memtable_node import get_key_offset, node_get_payload_ptr
+from tests.row_helpers import create_test_row
 
 # Constants for mocking MemTable node structure
 # Simplified structure for testing: [8:Weight][1:Height][3:Pad][4*MAX_HEIGHT:Pointers][16:PK_Aligned][Payload]
@@ -16,7 +17,7 @@ MOCK_NODE_BASE_SIZE = get_key_offset(MOCK_NODE_HEIGHT) # Size up to key offset
 class TestDataComparators(unittest.TestCase):
     def setUp(self):
         self.schema_i64 = types.TableSchema([
-            types.ColumnDefinition(types.TYPE_U64),    # Changed from I64 to U64
+            types.ColumnDefinition(types.TYPE_U64),
             types.ColumnDefinition(types.TYPE_STRING), 
             types.ColumnDefinition(types.TYPE_F64)     
         ], 0)
@@ -259,11 +260,13 @@ class TestDataComparators(unittest.TestCase):
         self.temp_files.extend([fn1, fn2])
 
         w1 = writer_table.TableShardWriter(self.schema_i64)
-        w1.add_row_from_values(10, 1, [db_values.TaggedValue.make_string("test_long_string_in_soa_A"), db_values.TaggedValue.make_float(1.5)])
+        row1 = create_test_row(self.schema_i64, ["test_long_string_in_soa_A", 1.5])
+        w1.add_row_from_values(10, 1, row1)
         w1.finalize(fn1)
         
         w2 = writer_table.TableShardWriter(self.schema_i64)
-        w2.add_row_from_values(10, 1, [db_values.TaggedValue.make_string("test_long_string_in_soa_B"), db_values.TaggedValue.make_float(1.5)])
+        row2 = create_test_row(self.schema_i64, ["test_long_string_in_soa_B", 1.5])
+        w2.add_row_from_values(10, 1, row2)
         w2.finalize(fn2)
         
         v1 = shard_table.TableShardView(fn1, self.schema_i64)
@@ -288,29 +291,29 @@ class TestDataComparators(unittest.TestCase):
         packed_node, _ = self._pack_aos_row_data(self.schema_i64, s_target, f_target, self.heap_buf)
         self.temp_ptrs.append(packed_node)
 
-        values_eq = [db_values.TaggedValue.make_string(s_target), db_values.TaggedValue.make_float(f_target)]
-        values_lt = [db_values.TaggedValue.make_string("abc"), db_values.TaggedValue.make_float(f_target)]
-        values_gt = [db_values.TaggedValue.make_string("xyz"), db_values.TaggedValue.make_float(f_target)]
+        row_eq = create_test_row(self.schema_i64, [s_target, f_target])
+        row_lt = create_test_row(self.schema_i64, ["abc", f_target])
+        row_gt = create_test_row(self.schema_i64, ["xyz", f_target])
 
         acc_packed = comparator.PackedNodeAccessor(self.schema_i64, self.heap_buf)
-        acc_val = comparator.ValueAccessor(self.schema_i64)
+        acc_val = core_comparator.ValueAccessor(self.schema_i64)
         
         # Set node to 0 offset of itself
         acc_packed.set_row(packed_node, 0) 
         
         # Test for equality
-        acc_val.set_row(values_eq)
+        acc_val.set_row(row_eq)
         self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc_packed, acc_val), 0)
         
         # Test for inequality (packed > value)
-        acc_val.set_row(values_lt)
+        acc_val.set_row(row_lt)
         self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc_packed, acc_val), 1)
         
         # Test for inequality (value < packed)
         self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc_val, acc_packed), -1)
 
         # Test for inequality (packed < value)
-        acc_val.set_row(values_gt)
+        acc_val.set_row(row_gt)
         self.assertEqual(core_comparator.compare_rows(self.schema_i64, acc_packed, acc_val), -1)
         
         # Test for inequality (value > packed)
@@ -328,26 +331,22 @@ class TestDataComparators(unittest.TestCase):
 
         # Create a shard with u128 PK and a u128 column
         w = writer_table.TableShardWriter(self.schema_u128)
-        w.add_row_from_values(u128_1, 1, [
-            db_values.TaggedValue.make_string("valA"), 
-            db_values.TaggedValue.make_u128(r_uint64(u128_max), r_uint64(u128_max >> 64))
-        ])
-        w.add_row_from_values(u128_2, 1, [
-            db_values.TaggedValue.make_string("valB"), 
-            db_values.TaggedValue.make_u128(r_uint64(u128_2), r_uint64(u128_2 >> 64))
-        ])
+        row1 = create_test_row(self.schema_u128, ["valA", (r_uint64(u128_max), r_uint64(u128_max >> 64))])
+        w.add_row_from_values(u128_1, 1, row1)
+        
+        row2 = create_test_row(self.schema_u128, ["valB", (r_uint64(u128_2), r_uint64(u128_2 >> 64))])
+        w.add_row_from_values(u128_2, 1, row2)
         w.finalize(fn)
 
         v = shard_table.TableShardView(fn, self.schema_u128)
         acc_soa = comparator.SoAAccessor(self.schema_u128)
-        acc_val = comparator.ValueAccessor(self.schema_u128)
+        acc_val = core_comparator.ValueAccessor(self.schema_u128)
 
         # Compare SoA row 0 (PK: 100, Col2: MAX_U128) vs Value (PK: not used, Col2: 150)
         acc_soa.set_row(v, 0)
-        acc_val.set_row([
-            db_values.TaggedValue.make_string("valA"), 
-            db_values.TaggedValue.make_u128(r_uint64(u128_3), r_uint64(u128_3 >> 64))
-        ])
+        row_comp = create_test_row(self.schema_u128, ["valA", (r_uint64(u128_3), r_uint64(u128_3 >> 64))])
+        acc_val.set_row(row_comp)
+        
         # The string "valA" will match. Comparison moves to u128 column.
         # MAX_U128 > 150, so SoA > Value -> result 1
         self.assertEqual(core_comparator.compare_rows(self.schema_u128, acc_soa, acc_val), 1)
@@ -371,12 +370,14 @@ class TestDataComparators(unittest.TestCase):
 
         # Writer A
         w_a = writer_table.TableShardWriter(self.schema_i64)
-        w_a.add_row_from_values(1, 1, [db_values.TaggedValue.make_string(shared_long_string), db_values.TaggedValue.make_float(10.0)])
+        row_a = create_test_row(self.schema_i64, [shared_long_string, 10.0])
+        w_a.add_row_from_values(1, 1, row_a)
         w_a.finalize(fn_a)
 
         # Writer B (same string)
         w_b = writer_table.TableShardWriter(self.schema_i64)
-        w_b.add_row_from_values(1, 1, [db_values.TaggedValue.make_string(shared_long_string), db_values.TaggedValue.make_float(10.0)])
+        row_b = create_test_row(self.schema_i64, [shared_long_string, 10.0])
+        w_b.add_row_from_values(1, 1, row_b)
         w_b.finalize(fn_b)
 
         # Load views
