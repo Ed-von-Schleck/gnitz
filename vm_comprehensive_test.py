@@ -17,16 +17,26 @@ class ComprehensiveFilter(functions.ScalarFunction):
 
 
 class LongStringMapper(functions.ScalarFunction):
-    def evaluate_map(self, row_accessor, output_row_list):
-        meta = row_accessor.get_str_struct(1)
-        orig_str = meta[4]
+    def evaluate_map(self, row_accessor, output_row):
+        # row_accessor: Schema A [U128(PK), F64, STRING, I64]
+        # output_row: Schema A
+        # Map: F64 -> F64, STRING -> modified STRING, I64 -> 100
+        
+        # 1. Float
+        output_row.append_float(row_accessor.get_float(0))
+        
+        # 2. String
+        # get_str_struct returns (length, prefix, ptr, heap_ptr, python_string)
+        # We only care about python_string in this high-level test
+        struct = row_accessor.get_str_struct(1)
+        orig_str = struct[4]
         if orig_str is None:
             orig_str = "Unknown"
         long_str = "PREFIX_" + orig_str + "_LONG_SUFFIX_TAIL"
-        # Output matches schema_a: Float, String, Int
-        output_row_list.append(values.TaggedValue.make_float(row_accessor.get_float(0)))
-        output_row_list.append(values.TaggedValue.make_string(long_str))
-        output_row_list.append(values.TaggedValue.make_i64(100))
+        output_row.append_string(long_str)
+        
+        # 3. Int
+        output_row.append_int(r_int64(100))
 
 
 def mk_u128(hi, lo):
@@ -77,8 +87,10 @@ def test_full_vm_coverage(base_dir):
     try:
         pk_x = mk_u128(0xAAAA, 0xBBBB)
 
-        tab_b_row = make_payload_row(1)
-        tab_b_row.append(values.TaggedValue.make_string("Dept_Alpha"))
+        # Tab B Row: [U128(PK), STRING]
+        # Payload: STRING
+        tab_b_row = make_payload_row(schema_b)
+        tab_b_row.append_string("Dept_Alpha")
         tab_b.insert(pk_x, tab_b_row)
         tab_b.flush()
 
@@ -94,10 +106,11 @@ def test_full_vm_coverage(base_dir):
             .build()
         )
 
-        batch_1_row = make_payload_row(3)
-        batch_1_row.append(values.TaggedValue.make_float(0.7))
-        batch_1_row.append(values.TaggedValue.make_string("Alice"))
-        batch_1_row.append(values.TaggedValue.make_i64(100))
+        # Batch 1 Row: [F64, STRING, I64]
+        batch_1_row = make_payload_row(schema_a)
+        batch_1_row.append_float(0.7)
+        batch_1_row.append_string("Alice")
+        batch_1_row.append_int(r_int64(100))
 
         batch_1 = batch.ZSetBatch(schema_a)
         batch_1.append(pk_x, r_int64(1), batch_1_row)
@@ -142,8 +155,8 @@ def test_reduce_op(base_dir):
             .build()
         )
 
-        row = make_payload_row(1)
-        row.append(values.TaggedValue.make_u64(r_uint64(10)))
+        row = make_payload_row(schema)
+        row.append_int(r_int64(10))
 
         input_batch = batch.ZSetBatch(schema)
         input_batch.append(r_uint128(1), r_int64(1), row)
@@ -210,8 +223,8 @@ def test_delay_and_join_delta_delta(base_dir):
         interp = interpreter.DBSPInterpreter(reg_file, program)
 
         pk = mk_u128(1, 2)
-        row = make_payload_row(1)
-        row.append(values.TaggedValue.make_u64(r_uint64(42)))
+        row = make_payload_row(schema)
+        row.append_int(r_int64(42))
 
         input_batch = batch.ZSetBatch(schema)
         input_batch.append(pk, r_int64(1), row)

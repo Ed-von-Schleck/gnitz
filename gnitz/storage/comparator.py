@@ -31,25 +31,37 @@ class PackedNodeAccessor(RowAccessor):
 
     def get_int(self, col_idx):
         ptr = self._get_ptr(col_idx)
-        return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        sz = self.schema.columns.field_type.size
+        if sz == 8:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, ptr))
+        elif sz == 4:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UINTP, ptr))
+        elif sz == 2:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.USHORTP, ptr))
+        elif sz == 1:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr))
+        return rffi.cast(rffi.ULONGLONG, 0)
 
     def get_float(self, col_idx):
         ptr = self._get_ptr(col_idx)
-        return float(rffi.cast(rffi.DOUBLEP, ptr)[0])
+        sz = self.schema.columns.field_type.size
+        if sz == 4:
+            return float(rffi.cast(rffi.FLOATP, ptr))
+        return float(rffi.cast(rffi.DOUBLEP, ptr))
 
     def get_u128(self, col_idx):
         ptr = self._get_ptr(col_idx)
-        lo = rffi.cast(rffi.ULONGLONGP, ptr)[0]
-        hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
+        lo = rffi.cast(rffi.ULONGLONGP, ptr)
+        hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))
         return (r_uint128(hi) << 64) | r_uint128(lo)
 
     def get_str_struct(self, col_idx):
         ptr = self._get_ptr(col_idx)
         u32_ptr = rffi.cast(rffi.UINTP, ptr)
-        length = rffi.cast(lltype.Signed, u32_ptr[0])
-        prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+        length = rffi.cast(lltype.Signed, u32_ptr)
+        prefix = rffi.cast(lltype.Signed, u32_ptr)
 
-        # Annotator hint: ensure the 5th element is Optional[str] to match
+        # Annotator hint: ensure the 5th element is Optional to match
         # the VM's BatchAccessor.
         s = None
         if False:
@@ -80,23 +92,35 @@ class SoAAccessor(RowAccessor):
 
     def get_int(self, col_idx):
         ptr = self._get_ptr(col_idx)
-        return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        sz = self.schema.columns.field_type.size
+        if sz == 8:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, ptr))
+        elif sz == 4:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UINTP, ptr))
+        elif sz == 2:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.USHORTP, ptr))
+        elif sz == 1:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr))
+        return rffi.cast(rffi.ULONGLONG, 0)
 
     def get_float(self, col_idx):
         ptr = self._get_ptr(col_idx)
-        return float(rffi.cast(rffi.DOUBLEP, ptr)[0])
+        sz = self.schema.columns.field_type.size
+        if sz == 4:
+            return float(rffi.cast(rffi.FLOATP, ptr))
+        return float(rffi.cast(rffi.DOUBLEP, ptr))
 
     def get_u128(self, col_idx):
         ptr = self._get_ptr(col_idx)
-        lo = rffi.cast(rffi.ULONGLONGP, ptr)[0]
-        hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
+        lo = rffi.cast(rffi.ULONGLONGP, ptr)
+        hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))
         return (r_uint128(hi) << 64) | r_uint128(lo)
 
     def get_str_struct(self, col_idx):
         ptr = self._get_ptr(col_idx)
         u32_ptr = rffi.cast(rffi.UINTP, ptr)
-        length = rffi.cast(lltype.Signed, u32_ptr[0])
-        prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+        length = rffi.cast(lltype.Signed, u32_ptr)
+        prefix = rffi.cast(lltype.Signed, u32_ptr)
 
         blob_ptr = NULL_PTR
         if self.view.blob_buf:
@@ -109,4 +133,3 @@ class SoAAccessor(RowAccessor):
 
     def get_col_ptr(self, col_idx):
         return self._get_ptr(col_idx)
-

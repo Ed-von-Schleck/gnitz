@@ -158,12 +158,26 @@ class TableShardView(object):
         ptr = self.get_col_ptr(row_idx, col_idx)
         if not ptr: 
             return 0
-        return rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        
+        sz = self.schema.columns[col_idx].field_type.size
+        if sz == 8:
+            return rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        elif sz == 4:
+            return rffi.cast(lltype.Signed, rffi.cast(rffi.INTP, ptr)[0])
+        elif sz == 2:
+            return rffi.cast(lltype.Signed, rffi.cast(rffi.SHORTP, ptr)[0])
+        elif sz == 1:
+            return rffi.cast(lltype.Signed, rffi.cast(rffi.SIGNEDCHARP, ptr)[0])
+        return 0
       
     def read_field_f64(self, row_idx, col_idx):
         ptr = self.get_col_ptr(row_idx, col_idx)
         if not ptr: 
             return 0.0
+        
+        sz = self.schema.columns[col_idx].field_type.size
+        if sz == 4:
+            return float(rffi.cast(rffi.FLOATP, ptr)[0])
         return float(rffi.cast(rffi.DOUBLEP, ptr)[0])
 
     def string_field_equals(self, row_idx, col_idx, search_str):

@@ -160,7 +160,7 @@ def compare_rows(schema, left, right):
             if l_val > r_val:
                 return 1
 
-        elif col_type == types.TYPE_F64:
+        elif col_type == types.TYPE_F64 or col_type == types.TYPE_F32:
             l_val = left.get_float(i)
             r_val = right.get_float(i)
             if l_val < r_val:

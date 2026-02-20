@@ -2,7 +2,7 @@
 
 import sys
 import os
-from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, intmask, r_uint64
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import types, values as db_values
 from gnitz.storage.table import PersistentTable
@@ -14,16 +14,20 @@ from gnitz.storage import compactor
 # ------------------------------------------------------------------------------
 
 
-def mk_payload(s, i):
-    row = make_payload_row(2)
-    row.append(db_values.TaggedValue.make_string(s))
-    row.append(db_values.TaggedValue.make_i64(i)
+def mk_payload(schema, s, i):
+    # Schema assumed: [PK, STRING, I64] (from test_multiset_and_string_logic)
+    # Payload columns: STRING, I64.
+    row = make_payload_row(schema)
+    row.append_string(s)
+    row.append_int(r_int64(i))
     return row
 
 
-def mk_int_payload(i):
-    row = make_payload_row(1)
-    row.append(db_values.TaggedValue.make_i64(i)
+def mk_int_payload(schema, i):
+    # Schema assumed: [PK, I64] (from test_triple_shard_compaction etc)
+    # Payload column: I64.
+    row = make_payload_row(schema)
+    row.append_int(r_int64(i))
     return row
 
 
@@ -73,25 +77,25 @@ def test_multiset_and_string_logic(base_dir):
         str_b = "Shared_Prefix_Suffix_BBBBBB"
 
         # 1. Add both payloads to the same PK
-        db.insert(pk, mk_payload(str_a, 10))
-        db.insert(pk, mk_payload(str_b, 20))
+        db.insert(pk, mk_payload(layout, str_a, 10))
+        db.insert(pk, mk_payload(layout, str_b, 20))
 
         # 2. Verify both exist (Multiset property)
-        if db.get_weight(pk, mk_payload(str_a, 10)) != 1:
+        if db.get_weight(pk, mk_payload(layout, str_a, 10)) != 1:
             return False
-        if db.get_weight(pk, mk_payload(str_b, 20)) != 1:
+        if db.get_weight(pk, mk_payload(layout, str_b, 20)) != 1:
             return False
 
         # 3. Annihilate Payload A
-        db.remove(pk, mk_payload(str_a, 10))
+        db.remove(pk, mk_payload(layout, str_a, 10))
 
         # 4. Flush and verify B survives while A is a 'Ghost'
         db.flush()
 
-        if db.get_weight(pk, mk_payload(str_a, 10)) != 0:
+        if db.get_weight(pk, mk_payload(layout, str_a, 10)) != 0:
             print "ERR: Payload A should be annihilated."
             return False
-        if db.get_weight(pk, mk_payload(str_b, 20)) != 1:
+        if db.get_weight(pk, mk_payload(layout, str_b, 20)) != 1:
             print "ERR: Payload B should have survived."
             return False
 
@@ -122,31 +126,31 @@ def test_triple_shard_compaction(base_dir):
 
     try:
         # Shard 1: PK 100, 200
-        db.insert(100, mk_int_payload(1))
-        db.insert(200, mk_int_payload(1))
+        db.insert(100, mk_int_payload(layout, 1))
+        db.insert(200, mk_int_payload(layout, 1))
         db.flush()
 
         # Shard 2: PK 100, 300
-        db.insert(100, mk_int_payload(1))
-        db.insert(300, mk_int_payload(1))
+        db.insert(100, mk_int_payload(layout, 1))
+        db.insert(300, mk_int_payload(layout, 1))
         db.flush()
 
         # Shard 3: PK 200, 300
-        db.insert(200, mk_int_payload(1))
-        db.insert(300, mk_int_payload(1))
+        db.insert(200, mk_int_payload(layout, 1))
+        db.insert(300, mk_int_payload(layout, 1))
         db.flush()
 
         # At this point: PK 100(w=2), 200(w=2), 300(w=2)
-        if db.get_weight(100, mk_int_payload(1)) != 2:
+        if db.get_weight(100, mk_int_payload(layout, 1)) != 2:
             return False
 
         # Force 3-way merge
         print "    -> Merging 3 shards..."
         compactor.execute_compaction(db.index, db.manifest_manager, db.directory)
 
-        if db.get_weight(100, mk_int_payload(1)) != 2:
+        if db.get_weight(100, mk_int_payload(layout, 1)) != 2:
             return False
-        if db.get_weight(300, mk_int_payload(1)) != 2:
+        if db.get_weight(300, mk_int_payload(layout, 1)) != 2:
             return False
 
         # Check Manifest
@@ -181,20 +185,20 @@ def test_cold_boot_and_cleanup(base_dir):
 
     # 1. Create data and flush
     db = PersistentTable(db_path, "boot", layout)
-    db.insert(999, mk_int_payload(888))
+    db.insert(999, mk_int_payload(layout, 888))
     shard_name = db.flush()
     db.close()
 
     # 2. Re-open (This tests Manifest -> ShardIndex -> ShardHandle loading)
     db2 = PersistentTable(db_path, "boot", layout)
     try:
-        w = db2.get_weight(999, mk_int_payload(888))
+        w = db2.get_weight(999, mk_int_payload(layout, 888))
         if w != 1:
             print "ERR: Cold boot failed to load shards."
             return False
 
         # 3. Insert new data, flush, then compact to exercise RefCounter
-        db2.insert(1, mk_int_payload(1))
+        db2.insert(1, mk_int_payload(layout, 1))
         db2.flush()
 
         print "    -> Compacting to trigger file releases..."
@@ -229,12 +233,12 @@ def test_u128_recovery(base_dir):
     huge_k = (r_uint128(0xDEADBEEF) << 64) | r_uint128(0xCAFEBABE)
 
     db = PersistentTable(db_path, "u128wal", layout)
-    db.insert(huge_k, mk_int_payload(777))
+    db.insert(huge_k, mk_int_payload(layout, 777))
     db.close()  # Crash simulation
 
     db2 = PersistentTable(db_path, "u128wal", layout)
     try:
-        w = db2.get_weight(huge_k, mk_int_payload(777))
+        w = db2.get_weight(huge_k, mk_int_payload(layout, 777))
         if w != 1:
             print "ERR: u128 WAL recovery failed."
             return False
