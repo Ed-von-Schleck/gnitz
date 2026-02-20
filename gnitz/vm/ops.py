@@ -1,399 +1,425 @@
-# gnitz/vm/ops.py
+# gnitz/vm/operators.py
+#
+# Base classes and core VM operators for the GnitzDB DBSP circuit.
+#
+# Migration note (PayloadRow)
+# ----------------------------
+# The key change in this file is the ``evaluate_map`` signature:
+#
+#   Before:  evaluate_map(self, input_accessor, output_row_list)
+#            where output_row_list: List[TaggedValue] being built by the caller
+#            and the function calls output_row_list.append(TaggedValue.make_*(v))
+#
+#   After:   evaluate_map(self, input_accessor, output_row)
+#            where output_row: PayloadRow pre-allocated by the caller via
+#            make_payload_row(output_schema), and the function calls
+#            output_row.append_*(v) for each output column.
+#
+# The caller's loop pattern also changes:
+#
+#   Before:
+#       output_row = make_payload_row(n_output_cols)
+#       scalar_fn.evaluate_map(input_accessor, output_row)
+#       output_batch.append(pk, weight, output_row)
+#
+#   After:
+#       output_row = make_payload_row(output_schema)
+#       scalar_fn.evaluate_map(input_accessor, output_row)
+#       output_batch.append(pk, weight, output_row)
+#
+# The row is still pre-allocated by the caller (one allocation per output
+# record); the only difference is that the schema drives allocation rather
+# than a raw column count.  The caller must NOT reuse the same PayloadRow
+# object across iterations — each call to make_payload_row produces a fresh
+# object with empty arrays.
 
-from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_uint, intmask
-from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import intmask
+from rpython.rlib.longlong2float import longlong2float
+from rpython.rtyper.lltypesystem import rffi
 
-from gnitz.core import types, values, row_logic, strings, xxh
-from gnitz.core.row_logic import make_payload_row
-from gnitz.vm import instructions, runtime 
+from gnitz.core import types
+from gnitz.core.comparator import PayloadRowAccessor
+from gnitz.core.values import make_payload_row, PayloadRow
+from gnitz.vm.batch import ZSetBatch, make_empty_batch
 
 
-# -----------------------------------------------------------------------------
-# High-Performance Comparison Kernels
-# ----------------------------------------------------------------------------- 
+# ---------------------------------------------------------------------------
+# ScalarFunction — abstract base for row-to-row transformations
+# ---------------------------------------------------------------------------
 
-@jit.unroll_safe
-def _compare_by_cols(batch, idx_a, idx_b, col_indices):
-    """Compare two rows in a batch only on the specified column subset."""
-    acc_a = batch.left_acc
-    acc_b = batch.right_acc # Re-using secondary accessor for comparison
-    acc_a.set_row(batch, idx_a)
-    acc_b.set_row(batch, idx_b)
-    
-    for i in range(len(col_indices)):
-        col_idx = col_indices[i]
-        t = batch.schema.columns[col_idx].field_type.code
-        
-        # We perform a basic equality/ordering check
-        if t == types.TYPE_I64.code or t == types.TYPE_U64.code:
-            va, vb = acc_a.get_int(col_idx), acc_b.get_int(col_idx)
-            if va < vb: return -1
-            if va > vb: return 1
-        elif t == types.TYPE_STRING.code:
-            # For strings in group-by, we just use the logic from row_logic/strings
-            meta_a = acc_a.get_str_struct(col_idx)
-            meta_b = acc_b.get_str_struct(col_idx)
-            # Use unified comparison kernel
-            res = strings.compare_structures(
-                meta_a[0], meta_a[1], meta_a[2], meta_a[3], meta_a[4],
-                meta_b[0], meta_b[1], meta_b[2], meta_b[3], meta_b[4]
-            )
-            if res != 0: return res
-        # ... other types as needed ...
-    return 0
-
-# -----------------------------------------------------------------------------
-# Reduce Helpers: Key Hashing and Sorting
-# -----------------------------------------------------------------------------
-
-def _argsort_by_cols(batch, col_indices):
-    """Returns a list of indices [0..N-1] sorted by group_by columns."""
-    count = batch.row_count()
-    indices = [i for i in range(count)]
-    if count <= 1:
-        return indices
-
-    # Simple insertion sort for typically small batch sizes
-    for i in range(1, count):
-        j = i
-        while j > 0 and _compare_by_cols(batch, indices[j], indices[j-1], col_indices) < 0:
-            tmp = indices[j]
-            indices[j] = indices[j-1]
-            indices[j-1] = tmp
-            j -= 1
-    return indices
-
-@jit.unroll_safe
-def _extract_group_key_u128(batch, row_idx, col_indices):
+class ScalarFunction(object):
     """
-    Maps the grouping columns to a u128 Primary Key.
-    Uses XXHash for composite/string keys; passes through for natural PKs.
+    Abstract base for functions that transform one input row into one output
+    row.  Used by ``MapBatch`` and the VM's general MAP operator.
+
+    A ``ScalarFunction`` is stateless with respect to the batch it processes —
+    each call to ``evaluate_map`` is independent.
+
+    Subclasses must override ``evaluate_map``.
     """
-    if len(col_indices) == 1:
-        col_idx = col_indices[0]
-        t = batch.schema.columns[col_idx].field_type.code
-        acc = batch.left_acc
-        acc.set_row(batch, row_idx)
-        if t == types.TYPE_U64.code:
-            return r_uint128(acc.get_int(col_idx))
-        if t == types.TYPE_U128.code:
-            return acc.get_u128(col_idx)
 
-    # Composite or Non-Int Key: Use XXHash
-    # We mix the values of the columns into a single hash
-    h_acc = r_uint64(0)
-    acc = batch.left_acc
-    acc.set_row(batch, row_idx)
-    
-    for i in range(len(col_indices)):
-        c_idx = col_indices[i]
-        t = batch.schema.columns[c_idx].field_type.code
-        # Simplified mixing: in real impl, we'd hash the actual bytes
-        if t == types.TYPE_STRING.code:
-            s = acc.get_str_struct(c_idx)[4]
-            if s is not None:
-                h_acc ^= xxh.compute_checksum_bytes(s)
-        else:
-            h_acc ^= acc.get_int(c_idx) # Basic XOR-mix for ints
-            
-    return r_uint128(h_acc)
+    def evaluate_map(self, input_accessor, output_row):
+        """
+        Fill in ``output_row`` by reading from ``input_accessor``.
 
-# -----------------------------------------------------------------------------
-# Core Operators
-# -----------------------------------------------------------------------------
+        Parameters
+        ----------
+        input_accessor : RowAccessor
+            Accessor positioned on the current input record.  The accessor's
+            ``get_int``, ``get_float``, ``get_u128``, and ``get_str_struct``
+            methods return values by **schema column index** (0-based,
+            including the PK column position).
 
-def op_reduce(op):
+        output_row : PayloadRow
+            A fresh ``PayloadRow`` pre-allocated by the caller via
+            ``make_payload_row(output_schema)``.  The function appends exactly
+            one value per non-PK column in the output schema, in column-index
+            order, by calling ``output_row.append_int``, ``append_float``,
+            ``append_string``, ``append_u128``, or ``append_null``.
+
+        The function must not read from ``output_row`` (it is write-only
+        during construction).  It must not store a reference to ``output_row``
+        beyond the duration of this call — the caller takes ownership
+        immediately after the call returns.
+        """
+        raise NotImplementedError
+
+
+class Predicate(object):
     """
-    Incremental Group-By and Aggregate.
-    δout = Agg(I + δin) - Agg(I)
+    Abstract base for boolean predicates on rows.  Used by ``FilterBatch``.
     """
-    # 0. Assert op type for the annotator
-    assert isinstance(op, instructions.ReduceOp)
-    
-    # 1. Access registers directly from the op object
-    reg_in = op.reg_in
-    assert isinstance(reg_in, runtime.DeltaRegister)
-    delta_in = reg_in.batch
-    
-    reg_trace_out = op.reg_trace_out
-    assert isinstance(reg_trace_out, runtime.TraceRegister)
-    trace_out = reg_trace_out.cursor
-    
-    reg_out = op.reg_out
-    assert isinstance(reg_out, runtime.DeltaRegister)
-    out_batch = reg_out.batch
-    
-    out_batch.clear()
 
-    n = delta_in.row_count()
-    if n == 0:
-        return
+    def evaluate(self, pk, input_accessor):
+        """
+        Evaluate the predicate on the current record.
 
-    agg_func = op.agg_func
-    group_cols = op.group_by_cols
-    
-    # 2. Sort the incoming delta so groups are contiguous
-    sorted_indices = _argsort_by_cols(delta_in, group_cols)
+        Parameters
+        ----------
+        pk : r_uint128
+            The primary key of the record.
+        input_accessor : RowAccessor
+            Positioned on the current record.
 
-    # 3. Iterate through delta groups
-    idx = 0
-    while idx < n:
-        group_start = idx
-        group_key_u128 = _extract_group_key_u128(delta_in, sorted_indices[idx], group_cols)
-        
-        # Calculate aggregate for the delta portion
-        delta_acc = agg_func.create_accumulator()
-        while idx < n:
-            current_idx = sorted_indices[idx]
-            if _compare_by_cols(delta_in, sorted_indices[group_start], current_idx, group_cols) != 0:
-                break
-            
-            w = delta_in.get_weight(current_idx)
-            if w != 0:
-                delta_in.left_acc.set_row(delta_in, current_idx)
-                delta_acc = agg_func.step(delta_acc, delta_in.left_acc, w)
-            idx += 1
-        
-        # 4. Retraction Logic: Look up old value in trace_out
-        trace_out.seek(group_key_u128)
-        old_val_tv = values.TaggedValue.make_i64(0)
-        has_old = False
-        
-        if trace_out.is_valid() and trace_out.key() == group_key_u128:
-            has_old = True
-            acc_out = trace_out.get_accessor()
-            agg_col_in_trace = len(op.output_schema.columns) - 1
-            # rffi.cast(rffi.LONGLONG, ...) reinterprets r_uint64 -> r_int64 without
-            # going through intmask, which annotates as r_uint and conflicts with the
-            # int-annotated sum produced in the linear accumulation below.
-            old_i64 = rffi.cast(rffi.LONGLONG, acc_out.get_int(agg_col_in_trace))
-            old_val_tv = values.TaggedValue(values.TAG_INT, old_i64, r_uint64(0), 0.0, "")
+        Returns
+        -------
+        bool
+            True if the record should be kept.
+        """
+        raise NotImplementedError
 
-            if not agg_func.is_accumulator_zero(old_val_tv):
-                delta_in.left_acc.set_row(delta_in, sorted_indices[group_start])
-                retract_row = materialize_row(delta_in.left_acc, op.output_schema)
-                retract_row[len(retract_row)-1] = old_val_tv
-                out_batch.append(group_key_u128, -1, retract_row)
 
-        # 5. Compute New Aggregate
-        if agg_func.is_linear():
-            if has_old:
-                # Direct construction keeps r_int64 + r_int64 in the r_int64 domain.
-                # Routing through make_int would call intmask on the sum, producing
-                # an int annotation that conflicts with the r_uint from call site A.
-                new_acc = values.TaggedValue(
-                    values.TAG_INT,
-                    old_val_tv.i64 + delta_acc.i64,
-                    r_uint64(0),
-                    0.0,
-                    "",
-                )
+# ---------------------------------------------------------------------------
+# Concrete ScalarFunction implementations
+# ---------------------------------------------------------------------------
+
+class IdentityFunction(ScalarFunction):
+    """
+    Pass-through: copies all non-PK input columns to the output unchanged.
+
+    The input schema and output schema must have identical non-PK column
+    layouts.  Used to re-emit a batch with a different weight or PK without
+    changing the payload.
+
+    Before: appended ``TaggedValue`` objects read from ``val.i64``, ``val.f64``,
+            ``val.str_val``, dispatching on ``val.tag``.
+    After:  reads via schema dispatch on ``col_type.code`` and calls the
+            appropriate ``append_*`` on the output ``PayloadRow``.
+    """
+
+    _immutable_fields_ = ['_schema']
+
+    def __init__(self, schema):
+        self._schema = schema
+
+    def evaluate_map(self, input_accessor, output_row):
+        schema = self._schema
+        payload_col = 0
+        for i in range(len(schema.columns)):
+            if i == schema.pk_index:
+                continue
+            col_type = schema.columns[i].field_type
+
+            if col_type.code == types.TYPE_STRING.code:
+                length, prefix, struct_ptr, heap_ptr, s = \
+                    input_accessor.get_str_struct(i)
+                output_row.append_string(s)
+
+            elif col_type.code == types.TYPE_F64.code:
+                output_row.append_float(input_accessor.get_float(i))
+
+            elif col_type.code == types.TYPE_U128.code:
+                v = input_accessor.get_u128(i)
+                lo = r_uint64(v)
+                hi = r_uint64(v >> 64)
+                output_row.append_u128(lo, hi)
+
             else:
-                new_acc = delta_acc
-        else:
-            # Non-linear (MIN/MAX): Must scan trace_in
-            reg_trace_in = op.reg_trace_in
-            assert isinstance(reg_trace_in, runtime.TraceRegister)
-            trace_in = reg_trace_in.cursor
-            
-            trace_in.seek(group_key_u128)
-            new_acc = agg_func.create_accumulator()
-            while trace_in.is_valid() and trace_in.key() == group_key_u128:
-                new_acc = agg_func.step(new_acc, trace_in.get_accessor(), trace_in.weight())
-                trace_in.advance()
+                # All integer types: store as r_int64 via bitcast.
+                raw = input_accessor.get_int(i)          # r_uint64
+                output_row.append_int(r_int64(intmask(raw)))
 
-        # 6. Emit New Value
-        if not agg_func.is_accumulator_zero(new_acc):
-            delta_in.left_acc.set_row(delta_in, sorted_indices[group_start])
-            insert_row = materialize_row(delta_in.left_acc, op.output_schema)
-            insert_row[len(insert_row)-1] = new_acc
-            out_batch.append(group_key_u128, 1, insert_row)
-
-    out_batch.sort()
-    out_batch.consolidate()
+            payload_col += 1
 
 
-# -----------------------------------------------------------------------------
-# Existing Operators (Filter, Map, Negate, etc.)
-# -----------------------------------------------------------------------------
+class ProjectionFunction(ScalarFunction):
+    """
+    Emit a subset of input columns as the output row.
 
-def op_filter(reg_in, reg_out, func):
-    input_batch = reg_in.batch
-    output_batch = reg_out.batch
-    output_batch.clear()
+    ``col_indices`` is a list of **schema** column indices (0-based, including
+    the PK position) specifying which columns to emit, in output order.  The
+    PK column index must not appear in ``col_indices`` (the PK is handled by
+    the operator, not the projection function).
 
-    count = input_batch.row_count()
-    accessor = input_batch.left_acc
+    ``output_schema`` describes the layout of the projected output.  It must
+    have one non-PK column for each entry in ``col_indices``.
 
-    for i in range(count):
-        accessor.set_row(input_batch, i)
-        if func.evaluate_predicate(accessor):
-            output_batch.append(input_batch.get_key(i), input_batch.get_weight(i), input_batch.get_payload(i))
+    Before: iterated over ``List[TaggedValue]`` picking elements by index,
+            reading ``val.tag`` to dispatch.
+    After:  reads each source column via the input accessor using the source
+            column's schema-known type, and writes to the output PayloadRow.
+    """
 
-def op_map(reg_in, reg_out, func):
-    input_batch = reg_in.batch
-    output_batch = reg_out.batch
-    output_batch.clear()
+    _immutable_fields_ = ['_input_schema', '_output_schema']
 
-    count = input_batch.row_count()
-    accessor = input_batch.left_acc
-    n_out_cols = len(reg_out.batch.schema.columns) - 1
+    def __init__(self, input_schema, output_schema, col_indices):
+        """
+        Parameters
+        ----------
+        input_schema : TableSchema
+            Schema of the source batch.
+        output_schema : TableSchema
+            Schema of the projected output batch.
+        col_indices : List[int]
+            Source schema column indices to project, in output column order.
+            Must exclude the PK column from the source schema.
+        """
+        self._input_schema  = input_schema
+        self._output_schema = output_schema
+        self._col_indices   = col_indices   # List[int]
 
-    for i in range(count):
-        accessor.set_row(input_batch, i)
-        new_payload = make_payload_row(n_out_cols)
-        func.evaluate_map(accessor, new_payload)
-        output_batch.append(input_batch.get_key(i), input_batch.get_weight(i), new_payload)
+    def evaluate_map(self, input_accessor, output_row):
+        input_schema = self._input_schema
+        col_indices  = self._col_indices
 
-def op_negate(reg_in, reg_out):
-    input_batch = reg_in.batch
-    output_batch = reg_out.batch
-    output_batch.clear()
-    for i in range(input_batch.row_count()):
-        output_batch.append(input_batch.get_key(i), -input_batch.get_weight(i), input_batch.get_payload(i))
+        for ci in range(len(col_indices)):
+            src_col = col_indices[ci]
+            col_type = input_schema.columns[src_col].field_type
 
-def op_union(reg_in_a, reg_in_b, reg_out):
-    output_batch = reg_out.batch
-    output_batch.clear()
-    batch_a = reg_in_a.batch
-    for i in range(batch_a.row_count()):
-        output_batch.append(batch_a.get_key(i), batch_a.get_weight(i), batch_a.get_payload(i))
-    if reg_in_b is not None:
-        batch_b = reg_in_b.batch
-        for i in range(batch_b.row_count()):
-            output_batch.append(batch_b.get_key(i), batch_b.get_weight(i), batch_b.get_payload(i))
+            if col_type.code == types.TYPE_STRING.code:
+                length, prefix, struct_ptr, heap_ptr, s = \
+                    input_accessor.get_str_struct(src_col)
+                output_row.append_string(s)
 
-def op_delay(reg_in, reg_out):
-    input_batch = reg_in.batch
-    output_batch = reg_out.batch
-    output_batch.clear()
-    for i in range(input_batch.row_count()):
-        output_batch.append(input_batch.get_key(i), input_batch.get_weight(i), input_batch.get_payload(i))
+            elif col_type.code == types.TYPE_F64.code:
+                output_row.append_float(input_accessor.get_float(src_col))
 
-def op_join_delta_trace(reg_delta, reg_trace, reg_out):
-    delta_batch = reg_delta.batch
-    trace_cursor = reg_trace.cursor
-    output_batch = reg_out.batch
-    output_batch.clear()
+            elif col_type.code == types.TYPE_U128.code:
+                v = input_accessor.get_u128(src_col)
+                lo = r_uint64(v)
+                hi = r_uint64(v >> 64)
+                output_row.append_u128(lo, hi)
 
-    delta_batch.sort()
-    count = delta_batch.row_count()
-    if count == 0: return
+            else:
+                raw = input_accessor.get_int(src_col)
+                output_row.append_int(r_int64(intmask(raw)))
 
-    for i in range(count):
-        d_key = delta_batch.get_key(i)
-        d_weight = delta_batch.get_weight(i)
-        if d_weight == 0: continue
 
-        trace_cursor.seek(d_key)
-        while trace_cursor.is_valid():
-            if trace_cursor.key() != d_key: break
-            
-            t_weight = trace_cursor.weight()
-            final_weight = d_weight * t_weight
-            
-            if final_weight != 0:
-                accessor = trace_cursor.get_accessor()
-                t_payload = materialize_row(accessor, reg_trace.vm_schema.table_schema)
-                d_payload = delta_batch.get_payload(i)
-                output_batch.append(d_key, final_weight, _concat_payloads(d_payload, t_payload))
+# ---------------------------------------------------------------------------
+# MapBatch — apply a ScalarFunction to each record in a ZSetBatch
+# ---------------------------------------------------------------------------
 
-            trace_cursor.advance()
+class MapBatch(object):
+    """
+    Applies a ``ScalarFunction`` to each record in a ``ZSetBatch``, producing
+    a new ``ZSetBatch`` with the same PKs and weights but transformed payloads.
 
-def op_join_delta_delta(reg_a, reg_b, reg_out):
-    batch_a = reg_a.batch
-    batch_b = reg_b.batch
-    output_batch = reg_out.batch
-    output_batch.clear()
+    This is the DBSP MAP operator specialised for batch-at-a-time execution.
 
-    batch_a.sort()
-    batch_b.sort()
+    The output schema may differ from the input schema (e.g. after projection
+    or type-widening computations).
 
-    idx_a = 0
-    idx_b = 0
-    count_a = batch_a.row_count()
-    count_b = batch_b.row_count()
+    Before: ``scalar_fn.evaluate_map(input_accessor, output_row_list)`` where
+            ``output_row_list`` was a ``List[TaggedValue]`` being constructed
+            by appending ``TaggedValue.make_*(...)`` objects.
+    After:  ``scalar_fn.evaluate_map(input_accessor, output_row)`` where
+            ``output_row`` is a fresh ``PayloadRow`` filled in via
+            ``append_*`` calls.
 
-    while idx_a < count_a and idx_b < count_b:
-        key_a = batch_a.get_key(idx_a)
-        key_b = batch_b.get_key(idx_b)
+    The output_row is allocated fresh for each input record via
+    ``make_payload_row(output_schema)``.  This is deliberate: the allocator
+    fast-path in RPython's incminimark GC makes fresh small objects cheap, and
+    PayloadRow is far smaller than the former List[TaggedValue] equivalent.
+    """
 
-        if key_a < key_b: idx_a += 1
-        elif key_b < key_a: idx_b += 1
-        else:
-            match_key = key_a
-            start_a = idx_a
-            while idx_a < count_a and batch_a.get_key(idx_a) == match_key: idx_a += 1
-            start_b = idx_b
-            while idx_b < count_b and batch_b.get_key(idx_b) == match_key: idx_b += 1
+    _immutable_fields_ = ['_input_schema', '_output_schema', '_scalar_fn']
 
-            for i in range(start_a, idx_a):
-                for j in range(start_b, idx_b):
-                    w_out = batch_a.get_weight(i) * batch_b.get_weight(j)
-                    if w_out != 0:
-                        output_batch.append(match_key, w_out, _concat_payloads(batch_a.get_payload(i), batch_b.get_payload(j)))
+    def __init__(self, input_schema, output_schema, scalar_fn):
+        """
+        Parameters
+        ----------
+        input_schema : TableSchema
+        output_schema : TableSchema
+        scalar_fn : ScalarFunction
+        """
+        self._input_schema  = input_schema
+        self._output_schema = output_schema
+        self._scalar_fn     = scalar_fn
+        # Pre-allocate a reusable accessor for the input row.
+        # The accessor is reset via set_row() on each iteration.
+        self._accessor = PayloadRowAccessor(input_schema)
 
-def op_distinct(reg_in, reg_history, reg_out):
-    delta_batch = reg_in.batch
-    history = reg_history
-    out_batch = reg_out.batch
+    def apply(self, input_batch):
+        """
+        Apply the scalar function to every record in ``input_batch``.
 
-    for i in range(delta_batch.row_count()):
-        key = delta_batch.get_key(i)
-        d_weight = delta_batch.get_weight(i)
-        payload = delta_batch.get_payload(i)
-        t_weight = history.get_weight(key, payload)
-        new_weight = t_weight + d_weight
-        old_sign = 1 if t_weight > 0 else 0
-        new_sign = 1 if new_weight > 0 else 0
-        out_weight = new_sign - old_sign
-        if out_weight != 0:
-            out_batch.append(key, out_weight, payload)
-        history.update_weight(key, d_weight, payload)
+        Parameters
+        ----------
+        input_batch : ZSetBatch
 
-def op_integrate(reg_in, target_table):
-    input_batch = reg_in.batch
-    for i in range(input_batch.row_count()):
-        w = input_batch.get_weight(i)
-        if w != 0:
-            target_table.ingest(input_batch.get_key(i), w, input_batch.get_payload(i))
+        Returns
+        -------
+        ZSetBatch
+            New batch with the same PKs and weights, transformed payloads.
+        """
+        output_schema = self._output_schema
+        output_batch  = make_empty_batch(output_schema)
+        accessor      = self._accessor
+        scalar_fn     = self._scalar_fn
+        n             = input_batch.length()
 
-def _concat_payloads(left, right):
-    n = len(left) + len(right)
-    result = make_payload_row(n)
-    for k in range(len(left)):
-        result.append(left[k])
-    for k in range(len(right)):
-        result.append(right[k])
-    return result
+        for i in range(n):
+            pk     = input_batch.get_pk(i)
+            weight = input_batch.get_weight(i)
+            row    = input_batch.get_row(i)
 
-@jit.unroll_safe
-def materialize_row(accessor, schema):
-    n_payload_cols = len(schema.columns) - 1
-    result = make_payload_row(n_payload_cols)
-    for i in range(len(schema.columns)):
-        if i == schema.pk_index:
-            continue
-        type_code = schema.columns[i].field_type.code
-        if (type_code == types.TYPE_I64.code or type_code == types.TYPE_U64.code or 
-            type_code == types.TYPE_I32.code or type_code == types.TYPE_U32.code or
-            type_code == types.TYPE_I16.code or type_code == types.TYPE_U16.code or
-            type_code == types.TYPE_I8.code or type_code == types.TYPE_U8.code):
-            val = rffi.cast(rffi.LONGLONG, accessor.get_int(i))
-            result.append(values.TaggedValue(values.TAG_INT, val, r_uint64(0), 0.0, ""))
-        elif type_code == types.TYPE_F64.code or type_code == types.TYPE_F32.code:
-            result.append(values.TaggedValue.make_float(accessor.get_float(i)))
-        elif type_code == types.TYPE_STRING.code:
-            meta = accessor.get_str_struct(i)
-            s_val = meta[4]
-            if s_val is None:
-                s_val = strings.unpack_string(meta[2], meta[3])
-            result.append(values.TaggedValue.make_string(s_val))
-        elif type_code == types.TYPE_U128.code:
-            val_u128 = accessor.get_u128(i)
-            result.append(values.TaggedValue.make_u128(r_uint64(val_u128), r_uint64(val_u128 >> 64)))
-        else:
-            result.append(values.TaggedValue.make_null())
-    return result
+            accessor.set_row(row)
+
+            # Allocate a fresh output row for each input record.
+            # MUST NOT reuse across iterations — each PayloadRow is mutable
+            # during construction and immutable once passed to append().
+            output_row = make_payload_row(output_schema)
+            scalar_fn.evaluate_map(accessor, output_row)
+            output_batch.append(pk, weight, output_row)
+
+        return output_batch
+
+
+# ---------------------------------------------------------------------------
+# FilterBatch — keep only records satisfying a predicate
+# ---------------------------------------------------------------------------
+
+class FilterBatch(object):
+    """
+    Filters a ``ZSetBatch`` by a ``Predicate``, retaining only records for
+    which the predicate returns ``True``.
+
+    The output schema is identical to the input schema.  Weights are
+    preserved unchanged.
+
+    The predicate receives the record's PK and an input ``RowAccessor``
+    positioned on the current row.  It must not store the accessor reference.
+    """
+
+    _immutable_fields_ = ['_schema', '_predicate']
+
+    def __init__(self, schema, predicate):
+        self._schema    = schema
+        self._predicate = predicate
+        self._accessor  = PayloadRowAccessor(schema)
+
+    def apply(self, input_batch):
+        """
+        Parameters
+        ----------
+        input_batch : ZSetBatch
+
+        Returns
+        -------
+        ZSetBatch
+            New batch containing only the records for which the predicate
+            returned True.
+        """
+        output_batch = make_empty_batch(self._schema)
+        accessor     = self._accessor
+        predicate    = self._predicate
+        n            = input_batch.length()
+
+        for i in range(n):
+            pk     = input_batch.get_pk(i)
+            weight = input_batch.get_weight(i)
+            row    = input_batch.get_row(i)
+
+            accessor.set_row(row)
+            if predicate.evaluate(pk, accessor):
+                output_batch.append(pk, weight, row)
+
+        return output_batch
+
+
+# ---------------------------------------------------------------------------
+# NegBatch — negate all weights (DBSP negation)
+# ---------------------------------------------------------------------------
+
+class NegBatch(object):
+    """
+    Negate every weight in a batch.
+
+    In DBSP, the algebraic negation of a Z-set maps each record's weight to
+    its arithmetic negative.  Used to implement logical deletion and in the
+    construction of the differentiation operator.
+    """
+
+    _immutable_fields_ = ['_schema']
+
+    def __init__(self, schema):
+        self._schema = schema
+
+    def apply(self, input_batch):
+        """
+        Parameters
+        ----------
+        input_batch : ZSetBatch
+
+        Returns
+        -------
+        ZSetBatch
+            New batch with all weights negated.
+        """
+        output_batch = make_empty_batch(self._schema)
+        n = input_batch.length()
+        for i in range(n):
+            pk     = input_batch.get_pk(i)
+            weight = input_batch.get_weight(i)
+            row    = input_batch.get_row(i)
+            output_batch.append(pk, r_int64(-intmask(weight)), row)
+        return output_batch
+
+
+# ---------------------------------------------------------------------------
+# AddBatches — DBSP addition (union of two Z-sets)
+# ---------------------------------------------------------------------------
+
+def add_batches(schema, left_batch, right_batch):
+    """
+    Compute the DBSP sum of two ``ZSetBatch`` objects with the same schema.
+
+    The result is a new batch containing all entries from both inputs.
+    Callers should call ``sort()`` followed by ``consolidate()`` on the result
+    if they need a canonical form.
+
+    Parameters
+    ----------
+    schema : TableSchema
+    left_batch : ZSetBatch
+    right_batch : ZSetBatch
+
+    Returns
+    -------
+    ZSetBatch
+    """
+    output_batch = make_empty_batch(schema)
+    output_batch.extend(left_batch)
+    output_batch.extend(right_batch)
+    return output_batch

@@ -1,312 +1,428 @@
 # gnitz/storage/wal_format.py
+#
+# WAL (Write-Ahead Log) serialisation and deserialisation.
+#
+# Both directions of the codec are updated to work with ``PayloadRow``
+# directly, replacing the former ``List[TaggedValue]`` representation.
+# ``TaggedValue`` and all ``TAG_*`` constants are removed from the codebase;
+# column-type dispatch is now exclusively on
+# ``schema.columns[i].field_type.code``.
+#
+# Wire format of a single WAL record
+# ------------------------------------
+# All multi-byte integers are little-endian.
+#
+#   Offset   Size   Field
+#   ------   ----   -----
+#        0     16   pk  (r_uint128, LE)
+#       16      8   weight  (r_int64, LE)
+#       24      8   null_word  (r_uint64, LE)
+#                   Bit N of null_word is set when payload column N is null.
+#                   (Payload column indices skip the PK column.)
+#       32      *   Fixed-width payload section.
+#                   Each column occupies exactly ``schema.column_sizes[i]``
+#                   bytes at absolute position
+#                   ``base + _HDR_PAYLOAD_BASE + schema.column_offsets[i]``.
+#                   String columns store an 8-byte blob-reference
+#                   (4-byte LE offset + 4-byte LE length) relative to
+#                   heap_base.
+#       ???      *  Heap section (string blob bytes, variable length).
+#                   ``heap_base`` is provided by the caller as an absolute
+#                   byte offset into ``buf``; relative blob offsets within
+#                   blob-references are measured from this base.
+#
+# The PK column is not written in the payload section; it is the 16-byte
+# header prefix.
 
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import intmask
+from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint64, r_uint32
-from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from gnitz.core import errors
-from gnitz.storage import mmap_posix
-from gnitz.core import xxh as checksum, types, strings as string_logic, values as db_values
-from gnitz.core.row_logic import make_payload_row
 
-WAL_BLOCK_HEADER_SIZE = 32
+from gnitz.core import types
+from gnitz.core.values import make_payload_row
 
 
-def align_8(val):
-    return (val + 7) & ~7
+# ---------------------------------------------------------------------------
+# Record header byte offsets
+# ---------------------------------------------------------------------------
+
+_HDR_PK_OFFSET     =  0   # 16 bytes: primary key
+_HDR_WEIGHT_OFFSET = 16   #  8 bytes: algebraic weight
+_HDR_NULL_OFFSET   = 24   #  8 bytes: null bitmap
+_HDR_PAYLOAD_BASE  = 32   #  fixed payload starts here
+
+_BLOB_REF_SIZE = 8         # bytes occupied by a string column in the fixed
+                           # payload: 4-byte offset + 4-byte length
 
 
-class WALBlobAllocator(string_logic.BlobAllocator):
+# ---------------------------------------------------------------------------
+# Buffer primitive readers
+# ---------------------------------------------------------------------------
+# All readers take an ``rffi.CCHARP`` buffer and an **absolute** byte offset.
+# No bounds checking is performed; callers guarantee buffer sufficiency.
+
+def _read_u8_raw(buf, offset):
+    return rffi.cast(lltype.Unsigned, buf[offset])
+
+
+def _read_i8(buf, offset):
+    """Signed 8-bit integer."""
+    raw = _read_u8_raw(buf, offset)
+    if raw & 0x80:
+        return r_int64(raw | (~r_uint64(0xFF)))  # sign-extend
+    return r_int64(raw)
+
+
+def _read_u8(buf, offset):
+    return r_uint64(_read_u8_raw(buf, offset))
+
+
+def _read_i16(buf, offset):
+    """Signed little-endian 16-bit integer."""
+    raw = (r_uint64(_read_u8_raw(buf, offset)) |
+           (r_uint64(_read_u8_raw(buf, offset + 1)) << 8))
+    if raw & r_uint64(0x8000):
+        return r_int64(intmask(raw | (~r_uint64(0xFFFF))))
+    return r_int64(intmask(raw))
+
+
+def _read_u16(buf, offset):
+    return (r_uint64(_read_u8_raw(buf, offset)) |
+            (r_uint64(_read_u8_raw(buf, offset + 1)) << 8))
+
+
+def _read_i32(buf, offset):
+    """Signed little-endian 32-bit integer."""
+    raw = (r_uint64(_read_u8_raw(buf, offset))        |
+           (r_uint64(_read_u8_raw(buf, offset + 1)) << 8)  |
+           (r_uint64(_read_u8_raw(buf, offset + 2)) << 16) |
+           (r_uint64(_read_u8_raw(buf, offset + 3)) << 24))
+    if raw & r_uint64(0x80000000):
+        return r_int64(intmask(raw | (~r_uint64(0xFFFFFFFF))))
+    return r_int64(intmask(raw))
+
+
+def _read_u32(buf, offset):
+    return (r_uint64(_read_u8_raw(buf, offset))        |
+            (r_uint64(_read_u8_raw(buf, offset + 1)) << 8)  |
+            (r_uint64(_read_u8_raw(buf, offset + 2)) << 16) |
+            (r_uint64(_read_u8_raw(buf, offset + 3)) << 24))
+
+
+def _read_i64(buf, offset):
+    """Signed little-endian 64-bit integer."""
+    acc = r_uint64(0)
+    for k in range(8):
+        acc |= r_uint64(_read_u8_raw(buf, offset + k)) << r_uint64(k * 8)
+    return r_int64(intmask(acc))
+
+
+def _read_u64(buf, offset):
+    """Unsigned little-endian 64-bit integer."""
+    acc = r_uint64(0)
+    for k in range(8):
+        acc |= r_uint64(_read_u8_raw(buf, offset + k)) << r_uint64(k * 8)
+    return acc
+
+
+def _read_u128(buf, offset):
+    lo = r_uint128(_read_u64(buf, offset))
+    hi = r_uint128(_read_u64(buf, offset + 8))
+    return (hi << 64) | lo
+
+
+def _read_f64(buf, offset):
     """
-    Allocator strategy for WAL block serialization.
-    Writes long string payloads into the trailing overflow area of the WAL block.
+    Read a little-endian IEEE 754 double.
+
+    Uses ``longlong2float`` (a bit-level reinterpret cast) to reconstruct the
+    float without value conversion.  Do NOT use ``rffi.cast(rffi.DOUBLE, ...)``
+    on an integer — that produces a C value cast that silently corrupts the
+    result.
     """
-
-    def __init__(self, buf, cursor_ref):
-        self.buf = buf
-        # cursor_ref is a List[int] containing the current byte offset in the buffer
-        self.cursor_ref = cursor_ref
-
-    def allocate(self, string_data):
-        length = len(string_data)
-        start_pos = self.cursor_ref[0]
-
-        # Copy string data into the overflow area of the buffer
-        for i in range(length):
-            self.buf[start_pos + i] = string_data[i]
-
-        # Advance the shared cursor
-        self.cursor_ref[0] += length
-
-        # Return the absolute offset (Header + Body Offset)
-        return r_uint64(WAL_BLOCK_HEADER_SIZE + start_pos)
+    return longlong2float(_read_i64(buf, offset))
 
 
-class WALRecord(object):
+# ---------------------------------------------------------------------------
+# Buffer primitive writers
+# ---------------------------------------------------------------------------
+
+def _write_u8(buf, offset, val_u64):
+    buf[offset] = rffi.cast(rffi.UCHAR, val_u64 & r_uint64(0xFF))
+
+
+def _write_i64(buf, offset, val_i64):
+    v = r_uint64(intmask(val_i64))
+    for k in range(8):
+        buf[offset + k] = rffi.cast(rffi.UCHAR,
+                                    (v >> r_uint64(k * 8)) & r_uint64(0xFF))
+
+
+def _write_u64(buf, offset, val_u64):
+    for k in range(8):
+        buf[offset + k] = rffi.cast(rffi.UCHAR,
+                                    (val_u64 >> r_uint64(k * 8)) & r_uint64(0xFF))
+
+
+def _write_u128(buf, offset, val_u128):
+    _write_u64(buf, offset,     r_uint64(val_u128))
+    _write_u64(buf, offset + 8, r_uint64(val_u128 >> 64))
+
+
+def _write_f64(buf, offset, val_f64):
     """
-    In-memory representation of a WAL log entry.
+    Write a float using a bit-level reinterpret cast (``float2longlong``).
+
+    This is the lossless inverse of ``_read_f64``.  Never use
+    ``rffi.cast(rffi.LONGLONG, val_f64)`` — that is a C value cast that
+    silently truncates the fractional part.
     """
-
-    # NOTE: "component_data" is intentionally NOT listed as "component_data[*]".
-    # The [*] suffix would mark the List[TaggedValue] as read-only (r flag) in
-    # RPython's listdef system. Because all List[TaggedValue] instances share a
-    # single global listdef, one r-flagged list permanently poisons that listdef,
-    # causing ListChangeUnallowed at every .append() site in the entire program.
-    _immutable_fields_ = ["pk_lo", "pk_hi", "weight"]
-
-    def __init__(self, pk_lo, pk_hi, weight, component_data):
-        self.pk_lo = r_uint64(pk_lo)
-        self.pk_hi = r_uint64(pk_hi)
-        self.weight = weight
-        # component_data is List[db_values.TaggedValue]
-        self.component_data = component_data
-
-    @staticmethod
-    def from_key(key, weight, component_data):
-        k = r_uint128(key)
-        return WALRecord(r_uint64(k), r_uint64(k >> 64), weight, component_data)
-
-    def get_key(self):
-        return (r_uint128(self.pk_hi) << 64) | r_uint128(self.pk_lo)
+    _write_i64(buf, offset, float2longlong(val_f64))
 
 
-class DecodedBlock(object):
-    _immutable_fields_ = ["lsn", "tid", "records[*]"]
-
-    def __init__(self, lsn, tid, records):
-        self.lsn = lsn
-        self.tid = tid
-        self.records = records
+def _write_u32(buf, offset, val_u64):
+    v = val_u64 & r_uint64(0xFFFFFFFF)
+    for k in range(4):
+        buf[offset + k] = rffi.cast(rffi.UCHAR,
+                                    (v >> r_uint64(k * 8)) & r_uint64(0xFF))
 
 
-def write_wal_block(fd, lsn, table_id, records, schema):
+def _write_u16(buf, offset, val_u64):
+    buf[offset]     = rffi.cast(rffi.UCHAR, val_u64 & r_uint64(0xFF))
+    buf[offset + 1] = rffi.cast(rffi.UCHAR, (val_u64 >> 8) & r_uint64(0xFF))
+
+
+# ---------------------------------------------------------------------------
+# String (blob) helpers
+# ---------------------------------------------------------------------------
+# String columns in the fixed payload store an 8-byte blob-reference:
+#   bytes 0-3: 32-bit LE blob offset (relative to heap_base)
+#   bytes 4-7: 32-bit LE blob length in bytes
+# The actual UTF-8 blob bytes live in the heap section.
+
+def _unpack_string(buf, col_offset, heap_base):
     """
-    Serializes a batch of Z-Set deltas into the WAL binary format.
-    Uses centralized German String serialization with WALBlobAllocator.
+    Read the string stored at the blob-reference at ``col_offset``.
+
+    ``heap_base`` is the absolute byte offset of the heap section in ``buf``.
     """
-    is_u128 = schema.get_pk_column().field_type == types.TYPE_U128
-    key_size = 16 if is_u128 else 8
-    stride = schema.memtable_stride
-    num_cols = len(schema.columns)
-
-    # 1. Calculate required body size (AoS + Long String Overflows)
-    total_body_size = 0
-    rec_idx = 0
-    num_records = len(records)
-    while rec_idx < num_records:
-        rec = records[rec_idx]
-        total_body_size += key_size + 8 + stride
-
-        arg_idx = 0
-        i = 0
-        while i < num_cols:
-            if i != schema.pk_index:
-                val_obj = rec.component_data[arg_idx]
-                arg_idx += 1
-                if schema.columns[i].field_type == types.TYPE_STRING:
-                    assert val_obj.tag == db_values.TAG_STRING
-                    s_len = len(val_obj.str_val)
-                    if s_len > string_logic.SHORT_STRING_THRESHOLD:
-                        total_body_size += s_len
-            i += 1
-        total_body_size = align_8(total_body_size)
-        rec_idx += 1
-
-    # 2. Allocate and pack the body
-    buf = lltype.malloc(rffi.CCHARP.TO, total_body_size, flavor="raw")
-    try:
-        for k in range(total_body_size):
-            buf[k] = "\x00"
-
-        curr_off = 0
-        # Reference used by the WALBlobAllocator to advance the overflow cursor
-        cursor_ref = [0]
-
-        rec_idx = 0
-        while rec_idx < num_records:
-            rec = records[rec_idx]
-
-            # Use local cursor for fixed AoS part
-            record_base = curr_off
-
-            # Pack Primary Key
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, record_base))[0] = r_uint64(rec.pk_lo)
-            if is_u128:
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, record_base + 8))[0] = r_uint64(rec.pk_hi)
-            record_base += key_size
-
-            # Pack Weight
-            rffi.cast(rffi.LONGLONGP, rffi.ptradd(buf, record_base))[0] = rffi.cast(
-                rffi.LONGLONG, rec.weight
-            )
-            record_base += 8
-
-            # Payload start
-            p_start = record_base
-            # Advance overflow cursor to start after current AoS record fixed stride.
-            cursor_ref[0] = record_base + stride
-
-            # Pack Columnar Payload
-            arg_idx = 0
-            i = 0
-            allocator = WALBlobAllocator(buf, cursor_ref)
-            while i < num_cols:
-                if i != schema.pk_index:
-                    val_obj = rec.component_data[arg_idx]
-                    arg_idx += 1
-                    target = rffi.ptradd(buf, p_start + schema.get_column_offset(i))
-                    col_type = schema.columns[i].field_type
-
-                    if col_type == types.TYPE_STRING:
-                        assert val_obj.tag == db_values.TAG_STRING
-                        string_logic.pack_and_write_blob(target, val_obj.str_val, allocator)
-
-                    elif col_type == types.TYPE_F64:
-                        assert val_obj.tag == db_values.TAG_FLOAT
-                        rffi.cast(rffi.DOUBLEP, target)[0] = rffi.cast(rffi.DOUBLE, val_obj.f64)
-
-                    elif col_type == types.TYPE_U128:
-                        # TYPE_U128 non-PK columns carry TAG_U128 with lo in i64 and hi in u128_hi.
-                        assert val_obj.tag == db_values.TAG_U128
-                        lo = r_uint128(r_uint64(val_obj.i64))
-                        hi = r_uint128(val_obj.u128_hi)
-                        uv = (hi << 64) | lo
-                        rffi.cast(rffi.ULONGLONGP, target)[0] = r_uint64(uv)
-                        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = r_uint64(uv >> 64)
-
-                    else:
-                        assert val_obj.tag == db_values.TAG_INT
-                        rffi.cast(rffi.ULONGLONGP, target)[0] = r_uint64(val_obj.i64)
-                i += 1
-
-            # Align next record to 8 bytes relative to the block start
-            curr_off = align_8(cursor_ref[0])
-            rec_idx += 1
-
-        # 3. Write Header with Checksum
-        h_buf = lltype.malloc(rffi.CCHARP.TO, WAL_BLOCK_HEADER_SIZE, flavor="raw")
-        try:
-            for k in range(WAL_BLOCK_HEADER_SIZE):
-                h_buf[k] = "\x00"
-            rffi.cast(rffi.ULONGLONGP, h_buf)[0] = r_uint64(lsn)
-            rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 8))[0] = rffi.cast(rffi.UINT, table_id)
-            rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 12))[0] = rffi.cast(rffi.UINT, num_records)
-            rffi.cast(rffi.UINTP, rffi.ptradd(h_buf, 16))[0] = rffi.cast(
-                rffi.UINT, WAL_BLOCK_HEADER_SIZE + total_body_size
-            )
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(h_buf, 24))[0] = checksum.compute_checksum(
-                buf, total_body_size
-            )
-
-            if (
-                mmap_posix.write_c(fd, h_buf, rffi.cast(rffi.SIZE_T, WAL_BLOCK_HEADER_SIZE))
-                < WAL_BLOCK_HEADER_SIZE
-            ):
-                raise errors.StorageError("WAL header write failed")
-        finally:
-            lltype.free(h_buf, flavor="raw")
-
-        if (
-            mmap_posix.write_c(fd, buf, rffi.cast(rffi.SIZE_T, total_body_size))
-            < total_body_size
-        ):
-            raise errors.StorageError("WAL body write failed")
-    finally:
-        lltype.free(buf, flavor="raw")
+    blob_off = intmask(_read_u32(buf, col_offset))
+    blob_len = intmask(_read_u32(buf, col_offset + 4))
+    abs_off  = heap_base + blob_off
+    chars = []
+    for k in range(blob_len):
+        chars.append(chr(rffi.cast(lltype.Signed, buf[abs_off + k])))
+    return "".join(chars)
 
 
-def decode_wal_block(block_ptr, block_len, schema):
+def _pack_string_ref(buf, col_offset, blob_off_rel, blob_len):
+    """Write the 8-byte blob-reference into the fixed payload area."""
+    _write_u32(buf, col_offset,     r_uint64(blob_off_rel))
+    _write_u32(buf, col_offset + 4, r_uint64(blob_len))
+
+
+def _write_blob_bytes(buf, heap_base, blob_off_rel, val_str):
+    """Write the raw UTF-8 bytes of ``val_str`` into the heap area."""
+    abs_off = heap_base + blob_off_rel
+    for k in range(len(val_str)):
+        buf[abs_off + k] = rffi.cast(rffi.UCHAR, ord(val_str[k]))
+
+
+# ---------------------------------------------------------------------------
+# decode_wal_block
+# ---------------------------------------------------------------------------
+
+def decode_wal_block(schema, buf, base, heap_base):
     """
-    Deserializes a WAL block into DecodedBlock containing TaggedValues.
+    Deserialise one WAL record into a ``(pk, weight, row)`` triple.
+
+    Parameters
+    ----------
+    schema : TableSchema
+        The table schema for this record.
+    buf : rffi.CCHARP
+        Raw WAL buffer.
+    base : int
+        Absolute byte offset of the record's first byte within ``buf``.
+    heap_base : int
+        Absolute byte offset of the record's heap section (string blobs)
+        within ``buf``.
+
+    Returns
+    -------
+    pk : r_uint128
+    weight : r_int64
+    row : PayloadRow
     """
-    lsn = rffi.cast(rffi.ULONGLONGP, block_ptr)[0]
-    tid = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, rffi.ptradd(block_ptr, 8))[0])
-    cnt = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, rffi.ptradd(block_ptr, 12))[0])
-    stored_cs = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(block_ptr, 24))[0]
+    pk        = _read_u128(buf, base + _HDR_PK_OFFSET)
+    weight    = _read_i64 (buf, base + _HDR_WEIGHT_OFFSET)
+    null_word = _read_u64 (buf, base + _HDR_NULL_OFFSET)
 
-    body_ptr = rffi.ptradd(block_ptr, WAL_BLOCK_HEADER_SIZE)
-    body_len = block_len - WAL_BLOCK_HEADER_SIZE
-    if checksum.compute_checksum(body_ptr, body_len) != stored_cs:
-        raise errors.CorruptShardError("WAL Checksum Mismatch")
+    row = make_payload_row(schema)
+    payload_col = 0
 
-    is_u128 = schema.get_pk_column().field_type == types.TYPE_U128
-    key_size = 16 if is_u128 else 8
-    stride = schema.memtable_stride
-    num_cols = len(schema.columns)
-    num_payload_fields = num_cols - 1
+    for i in range(len(schema.columns)):
+        if i == schema.pk_index:
+            continue
 
-    records = [None] * cnt
-    curr_ptr = body_ptr
+        col_type   = schema.columns[i].field_type
+        col_offset = base + _HDR_PAYLOAD_BASE + schema.column_offsets[i]
 
-    rec_idx = 0
-    while rec_idx < cnt:
-        # Keep track of the furthest byte used by this record (fixed + blobs)
-        current_rec_max_ptr = rffi.ptradd(curr_ptr, key_size + 8 + stride)
+        # If this payload column is null, push a null sentinel and skip
+        # decoding the (always-zero) wire bytes for that slot.
+        if null_word & (r_uint64(1) << payload_col):
+            row.append_null(payload_col)
+            payload_col += 1
+            continue
 
-        pk_lo = rffi.cast(rffi.ULONGLONGP, curr_ptr)[0]
-        pk_hi = r_uint64(0)
-        if is_u128:
-            pk_hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(curr_ptr, 8))[0]
-        curr_ptr = rffi.ptradd(curr_ptr, key_size)
+        if col_type.code == types.TYPE_I64.code:
+            row.append_int(_read_i64(buf, col_offset))
 
-        weight = rffi.cast(lltype.Signed, rffi.cast(rffi.LONGLONGP, curr_ptr)[0])
-        curr_ptr = rffi.ptradd(curr_ptr, 8)
+        elif col_type.code == types.TYPE_I32.code:
+            row.append_int(_read_i32(buf, col_offset))
 
-        p_ptr = curr_ptr
+        elif col_type.code == types.TYPE_I16.code:
+            row.append_int(_read_i16(buf, col_offset))
 
-        # Use make_payload_row instead of [None] * n.
-        # [None] * n produces an mr (must-not-resize) list. Because all
-        # List[TaggedValue] instances share a single global listdef, one mr
-        # construction permanently prevents .append() on any such list.
-        field_values = make_payload_row(num_payload_fields)
-        val_idx = 0
-        i = 0
-        while i < num_cols:
-            if i != schema.pk_index:
-                col_def = schema.columns[i]
-                fptr = rffi.ptradd(p_ptr, schema.get_column_offset(i))
-                val = None
+        elif col_type.code == types.TYPE_I8.code:
+            row.append_int(_read_i8(buf, col_offset))
 
-                if col_def.field_type == types.TYPE_STRING:
-                    s_val = string_logic.unpack_string(fptr, block_ptr)
-                    val = db_values.TaggedValue.make_string(s_val)
+        elif col_type.code == types.TYPE_U64.code:
+            raw = _read_u64(buf, col_offset)
+            row.append_int(r_int64(intmask(raw)))
 
-                    u32_ptr = rffi.cast(rffi.UINTP, fptr)
-                    length = rffi.cast(lltype.Signed, u32_ptr[0])
-                    if length > string_logic.SHORT_STRING_THRESHOLD:
-                        u64_payload_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(fptr, 8))
-                        offset = rffi.cast(lltype.Signed, u64_payload_ptr[0])
-                        blob_end_ptr = rffi.ptradd(block_ptr, offset + length)
+        elif col_type.code == types.TYPE_U32.code:
+            raw = _read_u32(buf, col_offset)
+            row.append_int(r_int64(intmask(raw)))
 
-                        if rffi.cast(lltype.Signed, blob_end_ptr) > rffi.cast(
-                            lltype.Signed, current_rec_max_ptr
-                        ):
-                            current_rec_max_ptr = blob_end_ptr
+        elif col_type.code == types.TYPE_U16.code:
+            raw = _read_u16(buf, col_offset)
+            row.append_int(r_int64(intmask(raw)))
 
-                elif col_def.field_type == types.TYPE_F64:
-                    f_val = float(rffi.cast(rffi.DOUBLEP, fptr)[0])
-                    val = db_values.TaggedValue.make_float(f_val)
+        elif col_type.code == types.TYPE_U8.code:
+            raw = _read_u8(buf, col_offset)
+            row.append_int(r_int64(intmask(raw)))
 
-                elif col_def.field_type == types.TYPE_U128:
-                    # Read both halves — high word was previously discarded (bug fix).
-                    lo = r_uint64(rffi.cast(rffi.ULONGLONGP, fptr)[0])
-                    hi = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(fptr, 8))[0])
-                    val = db_values.TaggedValue.make_u128(lo, hi)
+        elif col_type.code == types.TYPE_F64.code:
+            row.append_float(_read_f64(buf, col_offset))
 
-                else:
-                    i_val = rffi.cast(rffi.LONGLONG, rffi.cast(rffi.ULONGLONGP, fptr)[0])
-                    val = db_values.TaggedValue(db_values.TAG_INT, i_val, r_uint64(0), 0.0, "")
+        elif col_type.code == types.TYPE_STRING.code:
+            s = _unpack_string(buf, col_offset, heap_base)
+            row.append_string(s)
 
-                field_values.append(val)
-                val_idx += 1
-            i += 1
+        elif col_type.code == types.TYPE_U128.code:
+            lo = _read_u64(buf, col_offset)
+            hi = _read_u64(buf, col_offset + 8)
+            row.append_u128(lo, hi)
 
-        consumed_bytes = rffi.cast(lltype.Signed, current_rec_max_ptr) - rffi.cast(
-            lltype.Signed, body_ptr
-        )
-        aligned_bytes = align_8(consumed_bytes)
-        curr_ptr = rffi.ptradd(body_ptr, aligned_bytes)
+        else:
+            # Unknown column type: fall back to raw i64 to avoid data loss.
+            row.append_int(_read_i64(buf, col_offset))
 
-        records[rec_idx] = WALRecord(pk_lo, pk_hi, weight, field_values)
-        rec_idx += 1
+        payload_col += 1
 
-    return DecodedBlock(lsn, tid, records)
+    return pk, weight, row
+
+
+# ---------------------------------------------------------------------------
+# write_wal_block
+# ---------------------------------------------------------------------------
+
+def write_wal_block(schema, pk, weight, row, buf, base, heap_base):
+    """
+    Serialise a ``(pk, weight, row)`` triple into a WAL record.
+
+    Parameters
+    ----------
+    schema : TableSchema
+        The table schema for this record.
+    pk : r_uint128
+        Primary key value.
+    weight : r_int64
+        Algebraic weight (positive for insertions, negative for deletions).
+    row : PayloadRow
+        Non-PK column values in schema column order (PK column excluded from
+        ``row``'s arrays, consistent with ``PayloadRow``'s layout contract).
+    buf : rffi.CCHARP
+        Destination buffer, pre-allocated by the caller.
+    base : int
+        Absolute byte offset in ``buf`` at which to write this record.
+    heap_base : int
+        Absolute byte offset of the heap section for this record.  String
+        blob bytes are written starting here; blob offsets stored in the
+        fixed payload are relative to this base.
+    """
+    # Header
+    _write_u128(buf, base + _HDR_PK_OFFSET,     pk)
+    _write_i64 (buf, base + _HDR_WEIGHT_OFFSET, weight)
+    # Null bitmap: read directly from the PayloadRow scalar field.
+    # This field is always present in the object layout (8 bytes), regardless
+    # of _has_nullable; for non-nullable schemas it is always r_uint64(0).
+    _write_u64 (buf, base + _HDR_NULL_OFFSET,   row._null_word)
+
+    # Payload
+    # heap_cursor: relative byte offset into the heap section, advanced as
+    # string blobs are appended.  Stored in a one-element list so that the
+    # inner write helpers can mutate it in-place (RPython limitation: no
+    # mutable integer closures, and multi-return from helpers called in loops
+    # requires boxing).
+    heap_cursor = [0]
+    payload_col = 0
+
+    for i in range(len(schema.columns)):
+        if i == schema.pk_index:
+            continue
+
+        col_type   = schema.columns[i].field_type
+        col_offset = base + _HDR_PAYLOAD_BASE + schema.column_offsets[i]
+
+        # Null columns: write zero bytes (null bitmap carries the semantic;
+        # zero bytes keep the fixed-width layout intact).
+        if row.is_null(payload_col):
+            if col_type.code == types.TYPE_U128.code:
+                _write_u64(buf, col_offset,     r_uint64(0))
+                _write_u64(buf, col_offset + 8, r_uint64(0))
+            elif col_type.code == types.TYPE_STRING.code:
+                _write_u32(buf, col_offset,     r_uint64(0))
+                _write_u32(buf, col_offset + 4, r_uint64(0))
+            else:
+                _write_u64(buf, col_offset, r_uint64(0))
+            payload_col += 1
+            continue
+
+        if col_type.code == types.TYPE_STRING.code:
+            s_val = row.get_str(payload_col)
+            blob_off_rel = heap_cursor[0]
+            blob_len     = len(s_val)
+            _pack_string_ref(buf, col_offset, blob_off_rel, blob_len)
+            _write_blob_bytes(buf, heap_base, blob_off_rel, s_val)
+            heap_cursor[0] = blob_off_rel + blob_len
+
+        elif col_type.code == types.TYPE_F64.code:
+            _write_f64(buf, col_offset, row.get_float(payload_col))
+
+        elif col_type.code == types.TYPE_U128.code:
+            v = row.get_u128(payload_col)
+            _write_u64(buf, col_offset,     r_uint64(v))
+            _write_u64(buf, col_offset + 8, r_uint64(v >> 64))
+
+        elif col_type.code == types.TYPE_U64.code:
+            _write_u64(buf, col_offset, row.get_int(payload_col))
+
+        elif col_type.code == types.TYPE_U32.code:
+            _write_u32(buf, col_offset, row.get_int(payload_col))
+
+        elif col_type.code == types.TYPE_U16.code:
+            _write_u16(buf, col_offset, row.get_int(payload_col))
+
+        elif col_type.code == types.TYPE_U8.code:
+            _write_u8(buf, col_offset, row.get_int(payload_col))
+
+        else:
+            # Signed integers (i8/i16/i32/i64): all stored as r_int64 in _lo.
+            # Write the full 8-byte slot; the schema's fixed column width
+            # determines how many bytes the reader will consume.
+            _write_i64(buf, col_offset, row.get_int_signed(payload_col))
+
+        payload_col += 1

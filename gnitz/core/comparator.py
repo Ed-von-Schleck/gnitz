@@ -1,7 +1,9 @@
+# gnitz/core/comparator.py
+
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
-from gnitz.core import types, strings as string_logic, values as db_values
 from rpython.rtyper.lltypesystem import rffi, lltype
+from gnitz.core import types, strings as string_logic
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
@@ -10,15 +12,16 @@ class RowAccessor(object):
     """
     Abstract interface for accessing column data from any storage format.
 
-    Note: set_row is NOT defined here because its signature varies significantly
-    between storage backends (e.g., offsets vs indexes vs list pointers).
-    Subclasses define their own set_row methods for private initialization.
-    This prevents RPython's annotator from forcing a unified signature that
-    conflicts across different implementations.
+    Note: ``set_row`` is NOT defined here because its signature varies
+    significantly between storage backends (e.g. offsets vs indexes vs
+    ``PayloadRow`` objects). Subclasses define their own ``set_row`` methods
+    for private initialization. This prevents RPython's annotator from
+    forcing a unified signature that conflicts across different
+    implementations.
     """
 
     def get_int(self, col_idx):
-        """Returns the integer value (casted to u64 for comparison)."""
+        """Returns the integer value cast to ``r_uint64`` for comparison."""
         raise NotImplementedError
 
     def get_float(self, col_idx):
@@ -26,80 +29,102 @@ class RowAccessor(object):
         raise NotImplementedError
 
     def get_u128(self, col_idx):
-        """Returns the 128-bit integer value."""
+        """Returns the 128-bit integer value as ``r_uint128``."""
         raise NotImplementedError
 
     def get_str_struct(self, col_idx):
         """
-        Returns a 5-tuple compatible with strings.compare_structures:
-        (length, prefix, struct_ptr, heap_ptr, python_string)
+        Returns a 5-tuple compatible with ``strings.compare_structures``:
+        ``(length, prefix, struct_ptr, heap_ptr, python_string)``
         """
         raise NotImplementedError
 
     def get_col_ptr(self, col_idx):
         """
         Returns a raw pointer to the column data for the current row.
-        Used by the compactor for physical row materialization.
+        Used by the compactor for physical row materialisation.
         """
         raise NotImplementedError
-        
-class ValueAccessor(RowAccessor):
+
+
+class PayloadRowAccessor(RowAccessor):
     """
-    Accesses data from a List[TaggedValue].
+    Adapts a ``PayloadRow`` to the ``RowAccessor`` interface consumed by
+    ``compare_rows`` and ``PayloadRowComparator``.
+
+    The schema is held in ``_immutable_fields_`` so the JIT promotes it to a
+    compile-time constant. All column-type dispatch in ``compare_rows`` is
+    therefore resolved at trace-compile time — no runtime branching on column
+    types.
+
+    ``col_idx`` passed to all ``get_*`` methods is a **schema** column index
+    (0-based, includes the PK position). The accessor maps it to the
+    corresponding payload array index before delegating to ``PayloadRow``.
     """
+
+    _immutable_fields_ = ["_schema", "_pk_index"]
 
     def __init__(self, schema):
-        self.schema = schema
-        self.values = None
-        self.pk_index = schema.pk_index
+        self._schema = schema
+        self._pk_index = schema.pk_index
+        self._row = None  # PayloadRow
 
-    def set_row(self, values_list):
-        """Value specific: uses a List[TaggedValue]."""
-        self.values = values_list
+    def set_row(self, payload_row):
+        self._row = payload_row
 
-    def _get_val(self, col_idx):
-        idx = col_idx if col_idx < self.pk_index else col_idx - 1
-        return self.values[idx]
+    def _payload_idx(self, col_idx):
+        """Map schema column index → payload array index (PK excluded)."""
+        return col_idx if col_idx < self._pk_index else col_idx - 1
 
     def get_int(self, col_idx):
-        val = self._get_val(col_idx)
-        # TAG_INT covers all column types from TYPE_I8 through TYPE_U64.
-        # TYPE_U128 columns carry TAG_U128 and are routed through get_u128(),
-        # never through this method.
-        assert val.tag == db_values.TAG_INT
-        return rffi.cast(rffi.ULONGLONG, val.i64)
+        return self._row.get_int(self._payload_idx(col_idx))
 
     def get_float(self, col_idx):
-        val = self._get_val(col_idx)
-        assert val.tag == db_values.TAG_FLOAT
-        return val.f64
+        return self._row.get_float(self._payload_idx(col_idx))
 
     def get_u128(self, col_idx):
-        val = self._get_val(col_idx)
-        assert val.tag == db_values.TAG_U128
-        lo = r_uint128(r_uint64(val.i64))   # undo the r_int64 bitcast
-        hi = r_uint128(val.u128_hi)
-        return (hi << 64) | lo
+        return self._row.get_u128(self._payload_idx(col_idx))
 
     def get_str_struct(self, col_idx):
-        val = self._get_val(col_idx)
-        assert val.tag == db_values.TAG_STRING
-        s = val.str_val
+        """
+        Returns the 5-tuple expected by ``compare_structures``.
+
+        ``NULL_PTR`` for the struct and heap pointers is correct and safe:
+        ``compare_structures`` inspects whether the fifth element
+        (``python_string``) is ``None`` before deciding to follow raw memory
+        pointers. Because ``PayloadRow`` strings are always Python ``str``
+        objects, the raw-pointer path is never taken.
+        """
+        s = self._row.get_str(self._payload_idx(col_idx))
         length = len(s)
         prefix = rffi.cast(lltype.Signed, string_logic.compute_prefix(s))
         return (length, prefix, NULL_PTR, NULL_PTR, s)
 
     def get_col_ptr(self, col_idx):
-        """TaggedValues are not memory-backed in a way that allows raw pointers."""
+        """
+        Returns ``NULL_PTR``. This is intentional: the compactor, which is
+        the only caller of ``get_col_ptr`` for raw memory copy, exclusively
+        operates on ``ShardCursor`` and ``MemTableCursor`` instances, never
+        on ``PayloadRow``. ``PayloadRow`` lives only in the VM layer
+        (``ZSetBatch``). The VM serialises to raw C-buffers via
+        ``engine.ingest`` before any storage cursor sees the data.
+        """
         return NULL_PTR
 
-        
+
+# Backward-compatibility alias for storage-layer code that imports
+# ``ValueAccessor`` by name (``gnitz/storage/comparator.py``,
+# ``gnitz/storage/engine.py``, ``gnitz/storage/memtable.py``).
+# Both names refer to the same class; the annotator sees a single type.
+ValueAccessor = PayloadRowAccessor
+
 
 @jit.unroll_safe
 def compare_rows(schema, left, right):
     """
-    Unified lexicographical comparison of two rows using RowAccessors.
-    The JIT specializes this loop based on the schema and accessor types.
+    Unified lexicographical comparison of two rows using ``RowAccessor``
+    objects. The JIT specialises this loop based on the schema and accessor
+    types.
     """
     num_cols = len(schema.columns)
     for i in range(num_cols):
@@ -108,7 +133,6 @@ def compare_rows(schema, left, right):
 
         col_type = schema.columns[i].field_type
 
-        # 1. Handle German Strings
         if col_type == types.TYPE_STRING:
             l_len, l_pref, l_ptr, l_heap, l_str = left.get_str_struct(i)
             r_len, r_pref, r_ptr, r_heap, r_str = right.get_str_struct(i)
@@ -128,7 +152,6 @@ def compare_rows(schema, left, right):
             if res != 0:
                 return res
 
-        # 2. Handle 128-bit Integers (UUIDs/non-PK foreign keys)
         elif col_type == types.TYPE_U128:
             l_val = left.get_u128(i)
             r_val = right.get_u128(i)
@@ -137,7 +160,6 @@ def compare_rows(schema, left, right):
             if l_val > r_val:
                 return 1
 
-        # 3. Handle Floating Point
         elif col_type == types.TYPE_F64:
             l_val = left.get_float(i)
             r_val = right.get_float(i)
@@ -146,7 +168,6 @@ def compare_rows(schema, left, right):
             if l_val > r_val:
                 return 1
 
-        # 4. Handle Standard Integers (i8..u64)
         else:
             l_val = left.get_int(i)
             r_val = right.get_int(i)
