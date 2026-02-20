@@ -21,11 +21,7 @@ class Engine(object):
     2. Immutable State: Reading via ShardIndex.
     3. Persistence: Managing the Flush/Rotate lifecycle and Manifest updates.
     """
-    _immutable_fields_ = [
-        'index', 'schema', 'manifest_manager', 'table_id', 
-        'memtable_capacity', 'wal_writer', 
-        'value_accessor', 'soa_accessor'
-    ]
+    _immutable_fields_ =
 
     def __init__(self, schema, shard_index, memtable_capacity, wal_writer=None, 
                  manifest_manager=None, table_id=1, recover_wal_filename=None, 
@@ -55,32 +51,32 @@ class Engine(object):
             self.current_lsn = r_uint64(1)
 
         # The LSN where the current MemTable began.
-        # This defines the lower bound [MinLSN, MaxLSN] for the next shard.
+        # This defines the lower bound for the next shard.
         self.starting_lsn = self.current_lsn
 
         # Recover uncommitted state from WAL (Volatile High-Water Mark)
         if recover_wal_filename:
             self.recover_from_wal(recover_wal_filename)
         
-    def ingest(self, key, weight, field_values):
+    def ingest(self, key, weight, row):
         """
         Ingests a Z-Set delta into the system.
         
         Args:
             key: The Primary Key (u64 or u128).
             weight: The algebraic weight (int64).
-            field_values: List[values.TaggedValue] representing the row payload.
+            row: PayloadRow representing the row payload.
         """
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
         
         # 1. Write-Ahead Log (Durability)
         if self.wal_writer:
-            rec = WALRecord.from_key(key, weight, field_values)
-            self.wal_writer.append_block(lsn, self.table_id, [rec])
+            rec = WALRecord(r_uint128(key), weight, row)
+            self.wal_writer.append_block(lsn, self.table_id,)
             
         # 2. Update In-Memory State (Visibility)
-        self.active_table.upsert(r_uint128(key), weight, field_values)
+        self.active_table.upsert(r_uint128(key), weight, row)
 
     def recover_from_wal(self, filename):
         """Reconstructs MemTable state by replaying Z-Set deltas from the WAL."""
@@ -109,19 +105,19 @@ class Engine(object):
             if e.errno != errno.ENOENT:
                 raise e
 
-    def get_effective_weight_raw(self, key, field_values):
+    def get_effective_weight_raw(self, key, row):
         """
         Calculates the net algebraic weight of a record across all layers.
         Identity: W_net = W_mem + sum(W_shards)
         
         Args:
-            field_values: List[values.TaggedValue]
+            row: PayloadRow
         """
         # 1. Check mutable layer (MemTable)
         mem_weight = 0
         table = self.active_table
         
-        match_off = table._find_exact_values(key, field_values)
+        match_off = table._find_exact_values(key, row)
         if match_off != 0:
             mem_weight = node_get_weight(table.arena.base_ptr, match_off)
 
@@ -129,7 +125,7 @@ class Engine(object):
         spine_weight = 0
         results = self.index.find_all_shards_and_indices(key)
         
-        self.value_accessor.set_row(field_values)
+        self.value_accessor.set_row(row)
         is_u128 = self.schema.get_pk_column().field_type.size == 16
         
         for shard_handle, start_idx in results:
@@ -213,22 +209,22 @@ class Engine(object):
         of the table (MemTable + Shards).
         """
         
-        # Build the cursor list using append, never [None] * n.
+        # Build the cursor list using append, never * n.
         #
-        # [None] * (n + 1) initializes a List[None] that widens to
-        # List[None | BaseCursor] when cursor objects are assigned into it.
-        # UnifiedCursor._immutable_fields_ = ["cursors[*]"] tells RPython to
+        # * (n + 1) initializes a List that widens to
+        # List when cursor objects are assigned into it.
+        # UnifiedCursor._immutable_fields_ ="] tells RPython to
         # store cursors as a raw C array with direct non-nullable pointer loads.
         # The Optional element type conflicts with that expectation: the C code
         # reads each slot as a BaseCursor* but gets a nullable representation,
         # causing a SIGSEGV when the first virtual dispatch is attempted.
         #
-        # Using append on an empty list keeps the element type as List[BaseCursor]
-        # (non-nullable) throughout, which matches the [*] array contract.
-        cs = []
+        # Using append on an empty list keeps the element type as List
+        # (non-nullable) throughout, which matches the array contract.
+        cs =[]
         cs.append(MemTableCursor(self.active_table))
         for i in range(len(self.index.handles)):
-            cs.append(ShardCursor(self.index.handles[i].view))
+            cs.append(ShardCursor(self.index.handles.view))
             
         return UnifiedCursor(self.schema, cs)
 
