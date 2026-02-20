@@ -1,14 +1,16 @@
+# tests/storage/test_memtable_skiplist.py
 import unittest
-from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage import memtable, memtable_node
-from gnitz.core import types, values as db_values
+from gnitz.core import types
+from tests.row_helpers import create_test_row
 
 class TestMemTableSkipList(unittest.TestCase):
     def setUp(self):
+        # Schema: PK (u128), Column 1 (i64)
         self.schema_u128 = types.TableSchema([
-            types.ColumnDefinition(types.TYPE_U128), # PK
-            types.ColumnDefinition(types.TYPE_I64)   # Col 1
+            types.ColumnDefinition(types.TYPE_U128), # PK (Index 0)
+            types.ColumnDefinition(types.TYPE_I64)   # Payload Col 0
         ], 0)
 
     def test_key_alignment_geometry(self):
@@ -25,16 +27,20 @@ class TestMemTableSkipList(unittest.TestCase):
         """Verifies that records summing to zero are removed from SkipList traversal."""
         mt = memtable.MemTable(self.schema_u128, 1024 * 1024)
         try:
-            p = [db_values.TaggedValue.make_i64(100)]
+            # Create a PayloadRow instead of a list of TaggedValues
+            row = create_test_row(self.schema_u128, [100])
             key = r_uint128(1)
             
-            mt.upsert(key, 1, p)
+            # Initial insertion: weight 1
+            mt.upsert(key, 1, row)
+            # Verify head pointer level 0 is not null (points to the new node)
             self.assertNotEqual(memtable_node.node_get_next_off(mt.arena.base_ptr, mt.head_off, 0), 0)
             
             # Algebraic annihilation: 1 + (-1) = 0
-            mt.upsert(key, -1, p)
+            # The MemTable should physically unlink the node when weight hits 0
+            mt.upsert(key, -1, row)
             
-            # Head pointer for level 0 should now point to NULL (sentinel 0)
+            # Head pointer for level 0 should now point back to NULL (sentinel 0)
             self.assertEqual(memtable_node.node_get_next_off(mt.arena.base_ptr, mt.head_off, 0), 0)
         finally:
             mt.free()

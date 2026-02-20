@@ -2,26 +2,33 @@
 import unittest
 import os
 import shutil
-from gnitz.core import types, values as db_values
+from gnitz.core import types
 from gnitz.storage import writer_table, shard_table, compactor
+from tests.row_helpers import create_test_row
 
 class TestCompactionAlgebra(unittest.TestCase):
     def setUp(self):
         self.test_dir = "test_algebra_env"
-        if not os.path.exists(self.test_dir): os.makedirs(self.test_dir)
+        if not os.path.exists(self.test_dir): 
+            os.makedirs(self.test_dir)
+        # Schema: PK (U64) at index 0, String Column at index 1
         self.layout = types.TableSchema([
             types.ColumnDefinition(types.TYPE_U64),
             types.ColumnDefinition(types.TYPE_STRING)
         ], 0)
 
     def tearDown(self):
-        if os.path.exists(self.test_dir): shutil.rmtree(self.test_dir)
+        if os.path.exists(self.test_dir): 
+            shutil.rmtree(self.test_dir)
 
     def _create_shard(self, name, pk, weight, val):
         path = os.path.join(self.test_dir, name)
         w = writer_table.TableShardWriter(self.layout)
-        # Fix: use TaggedValue.make_string
-        w.add_row_from_values(pk, weight, [db_values.TaggedValue.make_string(val)])
+        
+        # Use helper to create a PayloadRow for the non-PK columns
+        row = create_test_row(self.layout, [val])
+        
+        w.add_row_from_values(pk, weight, row)
         w.finalize(path)
         return path
 

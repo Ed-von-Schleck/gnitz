@@ -1,9 +1,12 @@
+# tests/storage/test_memtable_management.py
+
 import unittest
 import os
 import shutil
-from gnitz.core import types, values as db_values
+from gnitz.core import types
 from gnitz.storage.table import PersistentTable
 from gnitz.storage import shard_table, memtable
+from tests.row_helpers import create_test_row
 
 class TestMemTableManagement(unittest.TestCase):
     def setUp(self):
@@ -28,8 +31,12 @@ class TestMemTableManagement(unittest.TestCase):
         # Use the high-level PersistentTable, which uses the Engine internally
         db = PersistentTable(self.db_dir, "test_table", self.layout)
         try:
-            db.insert(10, [db_values.TaggedValue.make_string("short")])
-            db.insert(20, [db_values.TaggedValue.make_string("long_blob_payload_relocation_test")])
+            # Create PayloadRows using helper
+            row1 = create_test_row(self.layout, ["short"])
+            db.insert(10, row1)
+            
+            row2 = create_test_row(self.layout, ["long_blob_payload_relocation_test"])
+            db.insert(20, row2)
             
             # This triggers engine.flush_and_rotate()
             shard_filename = db.flush()
@@ -54,12 +61,15 @@ class TestMemTableManagement(unittest.TestCase):
             dead_str = "ANNIHILATE" * 10
             live_str = "SURVIVE" * 10
             
+            dead_row = create_test_row(self.layout, [dead_str])
+            live_row = create_test_row(self.layout, [live_str])
+            
             # PK 1: Sums to zero
-            table.upsert(1, 1, [db_values.TaggedValue.make_string(dead_str)])
-            table.upsert(1, -1, [db_values.TaggedValue.make_string(dead_str)])
+            table.upsert(1, 1, dead_row)
+            table.upsert(1, -1, dead_row)
             
             # PK 2: Survives
-            table.upsert(2, 1, [db_values.TaggedValue.make_string(live_str)])
+            table.upsert(2, 1, live_row)
             
             table.flush(self.fn, table_id=1)
             

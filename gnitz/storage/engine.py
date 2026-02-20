@@ -9,7 +9,7 @@ from gnitz.storage.cursor import MemTableCursor, ShardCursor, UnifiedCursor
 from gnitz.storage.memtable import MemTable
 from gnitz.storage.memtable_node import node_get_weight
 from gnitz.storage.wal_format import WALRecord
-from gnitz.storage import wal, index, comparator
+from gnitz.storage import wal, index, comparator as storage_comparator
 from gnitz.core import types, values, comparator as core_comparator
 
 class Engine(object):
@@ -45,9 +45,12 @@ class Engine(object):
         self.table_id = table_id
         self.validate_checksums = validate_checksums
         
-        # Pre-allocate accessors to avoid allocation in hot read/merge loops
-        self.value_accessor = comparator.ValueAccessor(self.schema)
-        self.soa_accessor = comparator.SoAAccessor(self.schema)
+        # Pre-allocate accessors to avoid allocation in hot read/merge loops.
+        # Fixed: value_accessor now correctly uses core_comparator.ValueAccessor
+        # (which is the PayloadRowAccessor) to bridge PayloadRow objects.
+        self.value_accessor = core_comparator.ValueAccessor(self.schema)
+        # soa_accessor is used for reading from ShardView (SoA format).
+        self.soa_accessor = storage_comparator.SoAAccessor(self.schema)
         
         # Initialize the mutable write buffer
         self.active_table = MemTable(self.schema, self.memtable_capacity)
@@ -82,16 +85,19 @@ class Engine(object):
         
         # 1. Write-Ahead Log (Durability)
         if self.wal_writer:
+            # WALRecord handles PayloadRow serialization in wal_format
             rec = WALRecord(r_uint128(key), weight, row)
             self.wal_writer.write_record(lsn, self.table_id, rec)
             
         # 2. Update In-Memory State (Visibility)
+        # MemTable.upsert is schema-aware and handles PayloadRow appending.
         self.active_table.upsert(r_uint128(key), weight, row)
 
     def recover_from_wal(self, filename):
         """Reconstructs MemTable state by replaying Z-Set deltas from the WAL."""
         try:
             reader = wal.WALReader(filename, self.schema)
+            # Volatile state starts after what is already persisted in Shards
             max_lsn_seen = self.current_lsn - r_uint64(1)
             last_recovered_lsn = max_lsn_seen
             
@@ -107,6 +113,7 @@ class Engine(object):
                 
                 last_recovered_lsn = block.lsn
                 for rec in block.records:
+                    # WALReader.read_next_block returns WALRecord with PayloadRow
                     self.active_table.upsert(rec.get_key(), rec.weight, rec.component_data)
             
             self.current_lsn = last_recovered_lsn + r_uint64(1)
@@ -121,20 +128,25 @@ class Engine(object):
         Identity: W_net = W_mem + sum(W_shards)
         
         Args:
+            key: Primary Key
             row: PayloadRow
         """
+        r_key = r_uint128(key)
+        
         # 1. Check mutable layer (MemTable)
         mem_weight = 0
         table = self.active_table
         
-        match_off = table._find_exact_values(key, row)
+        # Exact match logic in MemTable handles PayloadRow comparison
+        match_off = table._find_exact_values(r_key, row)
         if match_off != 0:
             mem_weight = node_get_weight(table.arena.base_ptr, match_off)
 
         # 2. Check persistent layer (ShardIndex)
         spine_weight = 0
-        results = self.index.find_all_shards_and_indices(key)
+        results = self.index.find_all_shards_and_indices(r_key)
         
+        # Setup accessors for semantic payload comparison
         self.value_accessor.set_row(row)
         is_u128 = self.schema.get_pk_column().field_type.size == 16
         
@@ -148,11 +160,12 @@ class Engine(object):
                 else:
                     k = r_uint128(view.get_pk_u64(curr_idx))
                 
-                if k != key:
+                if k != r_key:
                     break 
                 
                 self.soa_accessor.set_row(view, curr_idx)
                 
+                # Full row semantic comparison
                 if core_comparator.compare_rows(self.schema, self.soa_accessor, self.value_accessor) == 0:
                     spine_weight += shard_handle.view.get_weight(curr_idx)
                     break
@@ -169,6 +182,7 @@ class Engine(object):
         3. Frees old MemTable memory and allocates a new one.
         """
         if self.current_lsn == self.starting_lsn:
+            # MemTable is empty
             self.active_table.free()
             self.active_table = MemTable(self.schema, self.memtable_capacity)
             return self.index.needs_compaction
@@ -176,7 +190,7 @@ class Engine(object):
         lsn_max = self.current_lsn - r_uint64(1)
         lsn_min = self.starting_lsn
         
-        # 1. Materialize MemTable to columnar file
+        # 1. Materialize MemTable to columnar file (AoS to SoA transmutation)
         self.active_table.flush(filename, self.table_id)
         
         # 2. Register the new shard with the Unified Index
@@ -193,13 +207,16 @@ class Engine(object):
                 self.index.add_handle(new_handle)
                 
                 # 3. Synchronize Manifest with the updated Index state.
-                # get_metadata_list() now returns ManifestEntry objects directly.
                 if self.manifest_manager:
                     manifest_entries = self.index.get_metadata_list()
                     self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
             else:
+                # Ghost-only shard, discard
                 new_handle.close()
-                os.unlink(filename)
+                try:
+                    os.unlink(filename)
+                except OSError:
+                    pass
                 if self.manifest_manager:
                     manifest_entries = self.index.get_metadata_list()
                     self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
@@ -218,19 +235,8 @@ class Engine(object):
         Returns a UnifiedCursor representing the current net state 
         of the table (MemTable + Shards).
         """
-        
-        # Build the cursor list using append, never * n.
-        #
-        # * (n + 1) initializes a List that widens to
-        # List[Optional[BaseCursor]] when cursor objects are assigned into it.
-        # UnifiedCursor._immutable_fields_ = ["cursors[*]"] tells RPython to
-        # store cursors as a raw C array with direct non-nullable pointer loads.
-        # The Optional element type conflicts with that expectation: the C code
-        # reads each slot as a BaseCursor* but gets a nullable representation,
-        # causing a SIGSEGV when the first virtual dispatch is attempted.
-        #
-        # Using append on an empty list keeps the element type as List[BaseCursor]
-        # (non-nullable) throughout, which matches the array contract.
+        # We must use list.append to avoid Type Unification errors in the RPython 
+        # annotator between BaseCursor and Optional[BaseCursor].
         cs = []
         cs.append(MemTableCursor(self.active_table))
         for i in range(len(self.index.handles)):

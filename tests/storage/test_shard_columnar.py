@@ -1,9 +1,10 @@
 import unittest
 import os
 import shutil
-from gnitz.core import types, values as db_values
+from gnitz.core import types
 from gnitz.core import errors
 from gnitz.storage import writer_table, shard_table
+from tests.row_helpers import create_test_row
 
 class TestShardColumnar(unittest.TestCase):
     def setUp(self):
@@ -23,7 +24,9 @@ class TestShardColumnar(unittest.TestCase):
     def test_columnar_pointer_access(self):
         """Verifies that directory offsets correctly point to columnar regions."""
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_from_values(10, 1, [db_values.TaggedValue.make_i64(100), db_values.TaggedValue.make_string("alpha")])
+        # PK=10, Weight=1, Columns=[100, "alpha"]
+        row = create_test_row(self.layout, [100, "alpha"])
+        writer.add_row_from_values(10, 1, row)
         writer.finalize(self.fn)
 
         view = shard_table.TableShardView(self.fn, self.layout)
@@ -38,15 +41,21 @@ class TestShardColumnar(unittest.TestCase):
         """Verifies the Ghost Property: Column checksums are only checked on access."""
         long_str = "payload_that_lives_in_blob_region_b"
         writer = writer_table.TableShardWriter(self.layout)
-        writer.add_row_from_values(99, 1, [db_values.TaggedValue.make_i64(999), db_values.TaggedValue.make_string(long_str)])
+        # PK=99, Weight=1, Columns=[999, long_str]
+        row = create_test_row(self.layout, [999, long_str])
+        writer.add_row_from_values(99, 1, row)
         writer.finalize(self.fn)
 
         view = shard_table.TableShardView(self.fn, self.layout)
-        blob_off = view.get_region_offset(3) # Region 3 = Blob Heap
+        # In N-Partition format for this schema:
+        # 0:PK, 1:W, 2:I64, 3:StringStructs, 4:BlobHeap
+        blob_off = view.get_region_offset(4) 
         view.close()
 
+        # Corrupt the blob region physically
         with open(self.fn, "r+b") as f:
-            f.seek(blob_off); f.write(b"\xFF\xFF")
+            f.seek(blob_off)
+            f.write(b"\xFF\xFF")
 
         view = shard_table.TableShardView(self.fn, self.layout, validate_checksums=True)
         # PK/Weight are eagerly validated (and uncorrupted), so this passes:
