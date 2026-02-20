@@ -3,7 +3,7 @@
 import os
 from rpython.rlib import rposix, jit
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint64
+from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.core import errors
 from gnitz.storage import layout, mmap_posix, buffer
@@ -36,7 +36,7 @@ class TableShardWriter(object):
     Refactored to use centralized German String serialization.
     """
 
-    _immutable_fields_ = ['schema', 'table_id', 'blob_allocator']
+    _immutable_fields_ =
 
     def __init__(self, schema, table_id=0):
         self.schema = schema
@@ -48,11 +48,11 @@ class TableShardWriter(object):
         self.w_buf = buffer.Buffer(8 * 1024, growable=True)
 
         num_cols = len(schema.columns)
-        self.col_bufs = [None] * num_cols
+        self.col_bufs = * num_cols
         i = 0
         while i < num_cols:
             if i != schema.pk_index:
-                self.col_bufs[i] = buffer.Buffer(schema.columns[i].field_type.size * 1024, growable=True)
+                self.col_bufs = buffer.Buffer(schema.columns.field_type.size * 1024, growable=True)
             i += 1
 
         self.b_buf = buffer.Buffer(4096, growable=True)
@@ -70,13 +70,13 @@ class TableShardWriter(object):
         h = checksum.compute_checksum(src_ptr, length)
         cache_key = (h, length)
         if cache_key in self.blob_cache:
-            existing_offset = self.blob_cache[cache_key]
+            existing_offset = self.blob_cache
             existing_ptr = rffi.ptradd(self.b_buf.ptr, existing_offset)
 
             # Binary comparison to ensure deduplication safety (collisions)
             match = True
             for i in range(length):
-                if src_ptr[i] != existing_ptr[i]:
+                if src_ptr != existing_ptr:
                     match = False
                     break
             if match:
@@ -84,13 +84,13 @@ class TableShardWriter(object):
 
         new_offset = self.b_buf.offset
         self.b_buf.put_bytes(src_ptr, length)
-        self.blob_cache[cache_key] = new_offset
+        self.blob_cache = new_offset
         return new_offset
 
     def _append_value(self, col_idx, val_ptr, source_heap_ptr, string_data=None):
         """Internal helper to relocate strings and append to columnar buffers."""
-        buf = self.col_bufs[col_idx]
-        col_def = self.schema.columns[col_idx]
+        buf = self.col_bufs
+        col_def = self.schema.columns
 
         if not val_ptr and string_data is None:
             buf.put_bytes(NULL_CHARP, col_def.field_type.size)
@@ -99,10 +99,10 @@ class TableShardWriter(object):
         if col_def.field_type == types.TYPE_STRING:
             if val_ptr:
                 # PATH: Relocation (Raw Pointer)
-                length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, val_ptr)[0])
+                length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, val_ptr))
                 if length > string_logic.SHORT_STRING_THRESHOLD:
                     u64_view = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(val_ptr, 8))
-                    old_off = rffi.cast(lltype.Signed, u64_view[0])
+                    old_off = rffi.cast(lltype.Signed, u64_view)
                     if not source_heap_ptr:
                         raise errors.StorageError("Long string relocation requires source heap")
 
@@ -111,9 +111,9 @@ class TableShardWriter(object):
 
                     # Copy the 16-byte struct and swizzle the offset
                     for b in range(16):
-                        self.scratch_val_buf[b] = val_ptr[b]
+                        self.scratch_val_buf = val_ptr
                     u64_payload = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.scratch_val_buf, 8))
-                    u64_payload[0] = r_uint64(new_off)
+                    u64_payload = r_uint64(new_off)
                     buf.put_bytes(self.scratch_val_buf, 16)
                 else:
                     # Inline string: copy as-is
@@ -154,9 +154,9 @@ class TableShardWriter(object):
             self._append_value(i, val_ptr, source_heap_ptr)
             i += 1
 
-    def add_row_from_values(self, pk, weight, values_list):
+    def add_row_from_values(self, pk, weight, row):
         """
-        Ingests data from a List[values.TaggedValue].
+        Ingests data from a PayloadRow.
         Used by the test suite and high-level ingestion API.
         """
         if weight == 0:
@@ -169,7 +169,7 @@ class TableShardWriter(object):
             self.pk_buf.put_u64(rffi.cast(rffi.ULONGLONG, pk))
         self.w_buf.put_i64(weight)
 
-        val_idx = 0
+        payload_col = 0
         i = 0
         num_cols = len(self.schema.columns)
         while i < num_cols:
@@ -177,40 +177,88 @@ class TableShardWriter(object):
                 i += 1
                 continue
 
-            if val_idx >= len(values_list):
+            ftype = self.schema.columns.field_type
+
+            if row.is_null(payload_col):
                 self._append_value(i, NULL_CHARP, NULL_CHARP)
+                payload_col += 1
                 i += 1
                 continue
 
-            val_obj = values_list[val_idx]
-            val_idx += 1
-            ftype = self.schema.columns[i].field_type
+            if ftype.code == types.TYPE_STRING.code:
+                s = row.get_str(payload_col)
+                self._append_value(i, NULL_CHARP, NULL_CHARP, string_data=s)
 
-            if ftype == types.TYPE_STRING:
-                assert val_obj.tag == db_values.TAG_STRING
-                self._append_value(i, NULL_CHARP, NULL_CHARP, string_data=val_obj.str_val)
-
-            elif ftype == types.TYPE_F64:
-                assert val_obj.tag == db_values.TAG_FLOAT
-                rffi.cast(rffi.DOUBLEP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.DOUBLE, val_obj.f64
+            elif ftype.code == types.TYPE_F64.code:
+                rffi.cast(rffi.DOUBLEP, self.scratch_val_buf) = rffi.cast(
+                    rffi.DOUBLE, row.get_float(payload_col)
                 )
                 self._append_value(i, self.scratch_val_buf, NULL_CHARP)
 
-            elif ftype == types.TYPE_U128:
-                # TYPE_U128 non-PK columns carry TAG_U128 with lo in i64 and hi in u128_hi.
-                assert val_obj.tag == db_values.TAG_U128
+            elif ftype.code == types.TYPE_F32.code:
+                rffi.cast(rffi.FLOATP, self.scratch_val_buf) = rffi.cast(
+                    rffi.FLOAT, row.get_float(payload_col)
+                )
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+
+            elif ftype.code == types.TYPE_U128.code:
+                u128_val = row.get_u128(payload_col)
                 u64_ptr = rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)
-                u64_ptr[0] = rffi.cast(rffi.ULONGLONG, r_uint64(val_obj.i64))  # lo
-                u64_ptr[1] = rffi.cast(rffi.ULONGLONG, val_obj.u128_hi)         # hi
+                u64_ptr = rffi.cast(rffi.ULONGLONG, r_uint64(u128_val))  # lo
+                u64_ptr = rffi.cast(rffi.ULONGLONG, r_uint64(u128_val >> 64)) # hi
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+
+            elif ftype.code == types.TYPE_U64.code:
+                rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf) = rffi.cast(
+                    rffi.ULONGLONG, row.get_int(payload_col)
+                )
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+
+            elif ftype.code == types.TYPE_U32.code:
+                rffi.cast(rffi.UINTP, self.scratch_val_buf) = rffi.cast(
+                    rffi.UINT, row.get_int(payload_col) & r_uint64(0xFFFFFFFF)
+                )
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+
+            elif ftype.code == types.TYPE_U16.code:
+                u16_val = intmask(row.get_int(payload_col))
+                self.scratch_val_buf = chr(u16_val & 0xFF)
+                self.scratch_val_buf = chr((u16_val >> 8) & 0xFF)
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+
+            elif ftype.code == types.TYPE_U8.code:
+                self.scratch_val_buf = chr(intmask(row.get_int(payload_col)) & 0xFF)
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+
+            elif ftype.code == types.TYPE_I64.code:
+                rffi.cast(rffi.LONGLONGP, self.scratch_val_buf) = rffi.cast(
+                    rffi.LONGLONG, row.get_int_signed(payload_col)
+                )
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+
+            elif ftype.code == types.TYPE_I32.code:
+                rffi.cast(rffi.UINTP, self.scratch_val_buf) = rffi.cast(
+                    rffi.UINT, row.get_int_signed(payload_col) & 0xFFFFFFFF
+                )
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+
+            elif ftype.code == types.TYPE_I16.code:
+                i16_val = intmask(row.get_int_signed(payload_col))
+                self.scratch_val_buf = chr(i16_val & 0xFF)
+                self.scratch_val_buf = chr((i16_val >> 8) & 0xFF)
+                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+
+            elif ftype.code == types.TYPE_I8.code:
+                self.scratch_val_buf = chr(intmask(row.get_int_signed(payload_col)) & 0xFF)
                 self._append_value(i, self.scratch_val_buf, NULL_CHARP)
 
             else:
-                assert val_obj.tag == db_values.TAG_INT
-                rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.ULONGLONG, val_obj.i64
+                rffi.cast(rffi.LONGLONGP, self.scratch_val_buf) = rffi.cast(
+                    rffi.LONGLONG, row.get_int_signed(payload_col)
                 )
                 self._append_value(i, self.scratch_val_buf, NULL_CHARP)
+                
+            payload_col += 1
             i += 1
 
     def close(self):
@@ -219,7 +267,7 @@ class TableShardWriter(object):
         i = 0
         num_bufs = len(self.col_bufs)
         while i < num_bufs:
-            b = self.col_bufs[i]
+            b = self.col_bufs
             if b:
                 b.free()
             i += 1
@@ -235,33 +283,33 @@ class TableShardWriter(object):
             dummy_region = (lltype.nullptr(rffi.CCHARP.TO), 0, 0)
 
             num_cols_with_pk_w = 2 + (len(self.col_bufs) - 1)
-            region_list = [dummy_region] * (num_cols_with_pk_w + 1)
+            region_list = * (num_cols_with_pk_w + 1)
 
-            region_list[0] = (self.pk_buf.ptr, 0, self.pk_buf.offset)
-            region_list[1] = (self.w_buf.ptr, 0, self.w_buf.offset)
+            region_list = (self.pk_buf.ptr, 0, self.pk_buf.offset)
+            region_list = (self.w_buf.ptr, 0, self.w_buf.offset)
 
             reg_idx = 2
             i = 0
             num_bufs = len(self.col_bufs)
             while i < num_bufs:
-                b = self.col_bufs[i]
+                b = self.col_bufs
                 if b is not None:
-                    region_list[reg_idx] = (b.ptr, 0, b.offset)
+                    region_list = (b.ptr, 0, b.offset)
                     reg_idx += 1
                 i += 1
 
-            region_list[reg_idx] = (self.b_buf.ptr, 0, self.b_buf.offset)
+            region_list = (self.b_buf.ptr, 0, self.b_buf.offset)
 
             num_regions = len(region_list)
             dir_size = num_regions * layout.DIR_ENTRY_SIZE
             dir_offset = layout.HEADER_SIZE
             current_pos = align_64(dir_offset + dir_size)
 
-            final_regions = [dummy_region] * num_regions
+            final_regions = * num_regions
             i = 0
             while i < num_regions:
-                buf_ptr, _, sz = region_list[i]
-                final_regions[i] = (buf_ptr, current_pos, sz)
+                buf_ptr, _, sz = region_list
+                final_regions = (buf_ptr, current_pos, sz)
                 current_pos = align_64(current_pos + sz)
                 i += 1
 
@@ -270,19 +318,19 @@ class TableShardWriter(object):
             try:
                 i = 0
                 while i < layout.HEADER_SIZE:
-                    header[i] = "\x00"
+                    header = "\x00"
                     i += 1
-                rffi.cast(rffi.ULONGLONGP, header)[0] = layout.MAGIC_NUMBER
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_VERSION))[0] = rffi.cast(
+                rffi.cast(rffi.ULONGLONGP, header) = layout.MAGIC_NUMBER
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_VERSION)) = rffi.cast(
                     rffi.ULONGLONG, layout.VERSION
                 )
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_ROW_COUNT))[0] = rffi.cast(
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_ROW_COUNT)) = rffi.cast(
                     rffi.ULONGLONG, self.count
                 )
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_DIR_OFFSET))[0] = rffi.cast(
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_DIR_OFFSET)) = rffi.cast(
                     rffi.ULONGLONG, dir_offset
                 )
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_TABLE_ID))[0] = rffi.cast(
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_TABLE_ID)) = rffi.cast(
                     rffi.ULONGLONG, self.table_id
                 )
                 mmap_posix.write_c(fd, header, rffi.cast(rffi.SIZE_T, layout.HEADER_SIZE))
@@ -295,12 +343,12 @@ class TableShardWriter(object):
             try:
                 i = 0
                 while i < num_regions:
-                    buf_ptr, off, sz = final_regions[i]
+                    buf_ptr, off, sz = final_regions
                     cs = checksum.compute_checksum(buf_ptr, sz)
                     base = rffi.ptradd(dir_buf, i * layout.DIR_ENTRY_SIZE)
-                    rffi.cast(rffi.ULONGLONGP, base)[0] = rffi.cast(rffi.ULONGLONG, off)
-                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0] = rffi.cast(rffi.ULONGLONG, sz)
-                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0] = rffi.cast(rffi.ULONGLONG, cs)
+                    rffi.cast(rffi.ULONGLONGP, base) = rffi.cast(rffi.ULONGLONG, off)
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8)) = rffi.cast(rffi.ULONGLONG, sz)
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16)) = rffi.cast(rffi.ULONGLONG, cs)
                     i += 1
                 mmap_posix.write_c(fd, dir_buf, rffi.cast(rffi.SIZE_T, dir_size_bytes))
             finally:
@@ -310,14 +358,14 @@ class TableShardWriter(object):
             last_written_pos = dir_offset + dir_size
             i = 0
             while i < num_regions:
-                buf_ptr, off, sz = final_regions[i]
+                buf_ptr, off, sz = final_regions
                 padding = off - last_written_pos
                 if padding > 0:
                     pad_buf = lltype.malloc(rffi.CCHARP.TO, padding, flavor="raw")
                     try:
                         j = 0
                         while j < padding:
-                            pad_buf[j] = "\x00"
+                            pad_buf = "\x00"
                             j += 1
                         mmap_posix.write_c(fd, pad_buf, rffi.cast(rffi.SIZE_T, padding))
                     finally:

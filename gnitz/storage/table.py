@@ -4,13 +4,13 @@
 #
 # Migration note (PayloadRow)
 # ----------------------------
-# ``PersistentTable.insert`` previously accepted ``List[TaggedValue]`` as its
+# ``PersistentTable.insert`` previously accepted ``List`` as its
 # row parameter.  It now accepts ``PayloadRow`` directly.  There is no
 # conversion layer; ``TaggedValue`` is removed from the codebase.
 #
 # The signature change is:
 #
-#   Before:  insert(self, pk, row)  where  row: List[TaggedValue]
+#   Before:  insert(self, pk, row)  where  row: List
 #   After:   insert(self, pk, row)  where  row: PayloadRow
 #
 # All callers must be updated atomically (see §10.1 of the design plan).
@@ -53,13 +53,13 @@ def _compute_record_size(schema, row):
         ``heap_size`` is the total size of all string blob bytes.
         The total record size is ``fixed_size + heap_size``.
     """
-    fixed_size = wal_format._HDR_PAYLOAD_BASE + schema.payload_size
+    fixed_size = wal_format._HDR_PAYLOAD_BASE + schema.memtable_stride
     heap_size  = 0
     payload_col = 0
     for i in range(len(schema.columns)):
         if i == schema.pk_index:
             continue
-        col_type = schema.columns[i].field_type
+        col_type = schema.columns.field_type
         if col_type.code == types.TYPE_STRING.code:
             if not row.is_null(payload_col):
                 heap_size += len(row.get_str(payload_col))
@@ -79,7 +79,7 @@ class MemTableEntry(object):
     pending write.  Entries are flushed to disk as part of a WAL segment
     and then incorporated into immutable shards during compaction.
     """
-    _immutable_fields_ = ['pk', 'weight']
+    _immutable_fields_ =
 
     def __init__(self, pk, weight, row):
         self.pk     = pk        # r_uint128
@@ -95,14 +95,14 @@ class MemTable(object):
     deduplicated when flushed to a WAL segment and subsequently to an
     immutable shard.  Sorting uses the PK as the primary key.
 
-    This class holds ``List[MemTableEntry]``, not ``List[List[TaggedValue]]``.
+    This class holds ``List``, not ``List[List]``.
     The ``PayloadRow`` reference stored in each entry is the canonical payload
     representation from the VM layer; no conversion is needed.
     """
 
     def __init__(self, schema):
         self._schema  = schema
-        self._entries = []      # List[MemTableEntry], appended in order
+        self._entries = []      # List, appended in order
         self._byte_estimate = 0
 
     def append(self, pk, weight, row):
@@ -126,7 +126,7 @@ class MemTable(object):
 
     def clear(self):
         """Reset the buffer after a successful flush."""
-        self._entries = []
+        self._entries =[]
         self._byte_estimate = 0
 
 
@@ -162,7 +162,7 @@ class WalWriter(object):
         total_size = fixed_size + heap_size
 
         buf = raw_malloc(total_size)
-        wal_format.write_wal_block(
+        wal_format.write_wal_record(
             self._schema,
             pk, weight, row,
             rffi.cast(rffi.CCHARP, buf),
@@ -209,7 +209,7 @@ class PersistentTable(object):
     Schema-level dispatch
     ---------------------
     ``PersistentTable`` never inspects ``TaggedValue.tag``.  All column-type
-    dispatch is on ``schema.columns[i].field_type.code``, consistent with the
+    dispatch is on ``schema.columns.field_type.code``, consistent with the
     rest of the post-migration storage layer.
 
     Thread safety
@@ -217,7 +217,7 @@ class PersistentTable(object):
     Not thread-safe.  External callers must hold a table-level lock.
     """
 
-    _immutable_fields_ = ['_schema']
+    _immutable_fields_ =
 
     def __init__(self, schema, wal_writer=None):
         """
@@ -249,7 +249,7 @@ class PersistentTable(object):
         row : PayloadRow
             Non-PK column values constructed via ``make_payload_row(schema)``
             followed by one ``append_*`` call per non-PK column in schema
-            order.  Passing a ``List[TaggedValue]`` here is a type error;
+            order.  Passing a ``List`` here is a type error;
             ``TaggedValue`` has been removed from the codebase.
         """
         self._insert_weighted(pk, row, r_int64(1))

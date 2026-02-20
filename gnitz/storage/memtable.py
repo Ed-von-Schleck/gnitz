@@ -1,7 +1,7 @@
 # gnitz/storage/memtable.py
 
 from rpython.rlib.rrandom import Random
-from rpython.rlib.rarithmetic import r_uint64
+from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import errors, comparator as core_comparator
@@ -29,7 +29,7 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
 
         # Copy string data to the arena
         for j in range(length):
-            b_ptr[j] = string_data[j]
+            b_ptr = string_data
 
         # Return the offset relative to the start of the blob arena as r_uint64
         off = rffi.cast(lltype.Signed, b_ptr) - rffi.cast(lltype.Signed, self.arena.base_ptr)
@@ -37,17 +37,14 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
 
 
 class MemTable(object):
-    _immutable_fields_ = [
-        'arena', 'blob_arena', 'schema', 'head_off', 'key_size',
-        'node_accessor', 'value_accessor'
-    ]
+    _immutable_fields_ =
 
     def __init__(self, schema, arena_size):
         self.schema = schema
         self.arena = buffer.Buffer(arena_size, growable=False)
         self.blob_arena = buffer.Buffer(arena_size, growable=False)
         self.rng = Random(1234)
-        self._update_offsets = [0] * MAX_HEIGHT
+        self._update_offsets = * MAX_HEIGHT
         self.key_size = schema.get_pk_column().field_type.size
 
         # Initialize reusable accessors for comparison
@@ -64,7 +61,7 @@ class MemTable(object):
         ptr = self.arena.alloc(h_sz, alignment=16)
         self.head_off = rffi.cast(lltype.Signed, ptr) - rffi.cast(lltype.Signed, self.arena.base_ptr)
 
-        ptr[8] = chr(MAX_HEIGHT)
+        ptr = chr(MAX_HEIGHT)
         for i in range(MAX_HEIGHT):
             node_set_next_off(self.arena.base_ptr, self.head_off, i, 0)
 
@@ -72,22 +69,22 @@ class MemTable(object):
         key_ptr = rffi.ptradd(ptr, head_key_off)
         all_ones = r_uint64(-1)
         if self.key_size == 16:
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, all_ones)
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = rffi.cast(rffi.ULONGLONG, all_ones)
+            rffi.cast(rffi.ULONGLONGP, key_ptr) = rffi.cast(rffi.ULONGLONG, all_ones)
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8)) = rffi.cast(rffi.ULONGLONG, all_ones)
         else:
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, all_ones)
+            rffi.cast(rffi.ULONGLONGP, key_ptr) = rffi.cast(rffi.ULONGLONG, all_ones)
 
-    def _find_exact_values(self, key, field_values):
+    def _find_exact_values(self, key, row):
         """
         Locates the specific node matching both the Primary Key AND the payload.
         Args:
-            field_values: List[values.TaggedValue]
+            row: PayloadRow
         """
         base = self.arena.base_ptr
         curr_off = self.head_off
 
         # Set the value accessor once per search operation
-        self.value_accessor.set_row(field_values)
+        self.value_accessor.set_row(row)
 
         for i in range(MAX_HEIGHT - 1, -1, -1):
             next_off = node_get_next_off(base, curr_off, i)
@@ -110,7 +107,7 @@ class MemTable(object):
                     break
 
                 next_off = node_get_next_off(base, curr_off, i)
-            self._update_offsets[i] = curr_off
+            self._update_offsets = curr_off
 
         match_off = node_get_next_off(base, curr_off, 0)
         if match_off != 0:
@@ -143,21 +140,21 @@ class MemTable(object):
         # Level 0 contains the full sequence
         return node_get_next_off(base, curr_off, 0)
 
-    def upsert(self, key, weight, field_values):
+    def upsert(self, key, weight, row):
         """
         Upserts a row into the MemTable.
         Args:
-            field_values: List[values.TaggedValue]
+            row: PayloadRow
         """
         base = self.arena.base_ptr
-        match_off = self._find_exact_values(key, field_values)
+        match_off = self._find_exact_values(key, row)
 
         if match_off != 0:
             new_w = node_get_weight(base, match_off) + weight
             if new_w == 0:
-                h = ord(base[match_off + 8])
+                h = ord(base)
                 for i in range(h):
-                    pred_off = self._update_offsets[i]
+                    pred_off = self._update_offsets
                     node_set_next_off(base, pred_off, i, node_get_next_off(base, match_off, i))
             else:
                 node_set_weight(base, match_off, new_w)
@@ -169,95 +166,142 @@ class MemTable(object):
 
         key_off = get_key_offset(h)
         node_full_sz = key_off + self.key_size + self.schema.memtable_stride
-        self._ensure_capacity(node_full_sz, field_values)
+        self._ensure_capacity(node_full_sz, row)
 
         new_ptr = self.arena.alloc(node_full_sz, alignment=16)
         new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
 
         node_set_weight(base, new_off, weight)
-        new_ptr[8] = chr(h)
+        new_ptr = chr(h)
         key_ptr = rffi.ptradd(new_ptr, key_off)
 
         if self.key_size == 16:
             r_key = r_uint128(key)
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(r_key))
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(r_key >> 64))
+            rffi.cast(rffi.ULONGLONGP, key_ptr) = rffi.cast(rffi.ULONGLONG, r_uint64(r_key))
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8)) = rffi.cast(rffi.ULONGLONG, r_uint64(r_key >> 64))
         else:
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(key))
+            rffi.cast(rffi.ULONGLONGP, key_ptr) = rffi.cast(rffi.ULONGLONG, r_uint64(key))
 
         payload_ptr = rffi.ptradd(key_ptr, self.key_size)
-        self._pack_into_node(payload_ptr, field_values)
+        self._pack_into_node(payload_ptr, row)
 
         for i in range(h):
-            pred = self._update_offsets[i]
+            pred = self._update_offsets
             node_set_next_off(base, new_off, i, node_get_next_off(base, pred, i))
             node_set_next_off(base, pred, i, new_off)
 
-    def _ensure_capacity(self, node_sz, field_values):
+    def _ensure_capacity(self, node_sz, row):
         """
         Checks if arenas have enough space for the new node and its blobs.
         Args:
-            field_values: List[values.TaggedValue]
+            row: PayloadRow
         """
         blob_sz = 0
-        v_idx = 0
+        payload_col = 0
         for i in range(len(self.schema.columns)):
             if i == self.schema.pk_index:
                 continue
 
-            # Use TaggedValue fields directly
-            val = field_values[v_idx]
-            if self.schema.columns[i].field_type == types.TYPE_STRING:
-                assert val.tag == values.TAG_STRING
-                s = val.str_val
-                if len(s) > string_logic.SHORT_STRING_THRESHOLD:
-                    blob_sz += len(s)
-            v_idx += 1
+            if self.schema.columns.field_type.code == types.TYPE_STRING.code:
+                if not row.is_null(payload_col):
+                    s = row.get_str(payload_col)
+                    if len(s) > string_logic.SHORT_STRING_THRESHOLD:
+                        blob_sz += len(s)
+            payload_col += 1
 
         if self.arena.offset + node_sz > self.arena.size or \
            self.blob_arena.offset + blob_sz > self.blob_arena.size:
             raise errors.MemTableFullError()
 
-    def _pack_into_node(self, dest_ptr, field_values):
+    def _pack_into_node(self, dest_ptr, row):
         """
-        Serializes TaggedValues into the packed row format in the Arena.
+        Serializes a PayloadRow into the packed row format in the Arena.
         Args:
-            field_values: List[values.TaggedValue]
+            row: PayloadRow
         """
         allocator = MemTableBlobAllocator(self.blob_arena)
-        v_idx = 0
+        payload_col = 0
         for i in range(len(self.schema.columns)):
             if i == self.schema.pk_index:
                 continue
 
-            val_obj = field_values[v_idx]
-            f_type = self.schema.columns[i].field_type
-            v_idx += 1
-
+            f_type = self.schema.columns.field_type
             off = self.schema.get_column_offset(i)
             target = rffi.ptradd(dest_ptr, off)
 
-            if f_type == types.TYPE_STRING:
-                assert val_obj.tag == values.TAG_STRING
-                string_logic.pack_and_write_blob(target, val_obj.str_val, allocator)
+            if row.is_null(payload_col):
+                if f_type.code == types.TYPE_U128.code:
+                    rffi.cast(rffi.ULONGLONGP, target) = rffi.cast(rffi.ULONGLONG, 0)
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8)) = rffi.cast(rffi.ULONGLONG, 0)
+                elif f_type.code == types.TYPE_STRING.code:
+                    rffi.cast(rffi.UINTP, target) = rffi.cast(rffi.UINT, 0)
+                    rffi.cast(rffi.UINTP, rffi.ptradd(target, 4)) = rffi.cast(rffi.UINT, 0)
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8)) = rffi.cast(rffi.ULONGLONG, 0)
+                elif f_type.size == 8:
+                    rffi.cast(rffi.ULONGLONGP, target) = rffi.cast(rffi.ULONGLONG, 0)
+                elif f_type.size == 4:
+                    rffi.cast(rffi.UINTP, target) = rffi.cast(rffi.UINT, 0)
+                elif f_type.size == 2:
+                    target = '\x00'
+                    target = '\x00'
+                elif f_type.size == 1:
+                    target = '\x00'
+                payload_col += 1
+                continue
 
-            elif f_type == types.TYPE_F64:
-                assert val_obj.tag == values.TAG_FLOAT
-                rffi.cast(rffi.DOUBLEP, target)[0] = rffi.cast(rffi.DOUBLE, val_obj.f64)
+            if f_type.code == types.TYPE_STRING.code:
+                s = row.get_str(payload_col)
+                string_logic.pack_and_write_blob(target, s, allocator)
 
-            elif f_type == types.TYPE_U128:
-                # TYPE_U128 non-PK columns carry TAG_U128 with lo in i64 and hi in u128_hi.
-                assert val_obj.tag == values.TAG_U128
-                lo = r_uint128(r_uint64(val_obj.i64))
-                hi = r_uint128(val_obj.u128_hi)
-                u128_val = (hi << 64) | lo
-                rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(u128_val))
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(u128_val >> 64))
+            elif f_type.code == types.TYPE_F64.code:
+                f_val = row.get_float(payload_col)
+                rffi.cast(rffi.DOUBLEP, target) = rffi.cast(rffi.DOUBLE, f_val)
+                
+            elif f_type.code == types.TYPE_F32.code:
+                f_val = row.get_float(payload_col)
+                rffi.cast(rffi.FLOATP, target) = rffi.cast(rffi.FLOAT, f_val)
+
+            elif f_type.code == types.TYPE_U128.code:
+                u128_val = row.get_u128(payload_col)
+                rffi.cast(rffi.ULONGLONGP, target) = rffi.cast(rffi.ULONGLONG, r_uint64(u128_val))
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8)) = rffi.cast(rffi.ULONGLONG, r_uint64(u128_val >> 64))
+
+            elif f_type.code == types.TYPE_U64.code:
+                rffi.cast(rffi.ULONGLONGP, target) = rffi.cast(rffi.ULONGLONG, row.get_int(payload_col))
+
+            elif f_type.code == types.TYPE_U32.code:
+                u32_ptr = rffi.cast(rffi.UINTP, target)
+                u32_ptr = rffi.cast(rffi.UINT, row.get_int(payload_col) & r_uint64(0xFFFFFFFF))
+
+            elif f_type.code == types.TYPE_U16.code:
+                u16_val = intmask(row.get_int(payload_col))
+                target = chr(u16_val & 0xFF)
+                target = chr((u16_val >> 8) & 0xFF)
+
+            elif f_type.code == types.TYPE_U8.code:
+                target = chr(intmask(row.get_int(payload_col)) & 0xFF)
+
+            elif f_type.code == types.TYPE_I64.code:
+                rffi.cast(rffi.LONGLONGP, target) = rffi.cast(rffi.LONGLONG, row.get_int_signed(payload_col))
+
+            elif f_type.code == types.TYPE_I32.code:
+                i32_val = row.get_int_signed(payload_col)
+                u32_ptr = rffi.cast(rffi.UINTP, target)
+                u32_ptr = rffi.cast(rffi.UINT, i32_val & 0xFFFFFFFF)
+
+            elif f_type.code == types.TYPE_I16.code:
+                i16_val = intmask(row.get_int_signed(payload_col))
+                target = chr(i16_val & 0xFF)
+                target = chr((i16_val >> 8) & 0xFF)
+
+            elif f_type.code == types.TYPE_I8.code:
+                target = chr(intmask(row.get_int_signed(payload_col)) & 0xFF)
 
             else:
-                # Standard integers (i8...u64)
-                assert val_obj.tag == values.TAG_INT
-                rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, val_obj.i64)
+                # Default for other integers
+                rffi.cast(rffi.LONGLONGP, target) = rffi.cast(rffi.LONGLONG, row.get_int_signed(payload_col))
+
+            payload_col += 1
 
     def flush(self, filename, table_id=0):
         sw = writer_table.TableShardWriter(self.schema, table_id)

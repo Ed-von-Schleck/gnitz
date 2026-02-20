@@ -36,7 +36,7 @@ WAL_BLOCK_HEADER_SIZE = 32
 # ---------------------------------------------------------------------------
 
 def _read_u8_raw(buf, offset):
-    return rffi.cast(lltype.Unsigned, buf)
+    return r_uint64(ord(buf))
 
 
 def _read_i8(buf, offset):
@@ -113,20 +113,18 @@ def _read_f64(buf, offset):
 # ---------------------------------------------------------------------------
 
 def _write_u8(buf, offset, val_u64):
-    buf = rffi.cast(rffi.UCHAR, val_u64 & r_uint64(0xFF))
+    buf = chr(intmask(val_u64 & r_uint64(0xFF)))
 
 
 def _write_i64(buf, offset, val_i64):
     v = r_uint64(intmask(val_i64))
     for k in range(8):
-        buf = rffi.cast(rffi.UCHAR,
-                                    (v >> r_uint64(k * 8)) & r_uint64(0xFF))
+        buf = chr(intmask((v >> r_uint64(k * 8)) & r_uint64(0xFF)))
 
 
 def _write_u64(buf, offset, val_u64):
     for k in range(8):
-        buf = rffi.cast(rffi.UCHAR,
-                                    (val_u64 >> r_uint64(k * 8)) & r_uint64(0xFF))
+        buf = chr(intmask((val_u64 >> r_uint64(k * 8)) & r_uint64(0xFF)))
 
 
 def _write_u128(buf, offset, val_u128):
@@ -145,13 +143,12 @@ def _write_f64(buf, offset, val_f64):
 def _write_u32(buf, offset, val_u64):
     v = val_u64 & r_uint64(0xFFFFFFFF)
     for k in range(4):
-        buf = rffi.cast(rffi.UCHAR,
-                                    (v >> r_uint64(k * 8)) & r_uint64(0xFF))
+        buf = chr(intmask((v >> r_uint64(k * 8)) & r_uint64(0xFF)))
 
 
 def _write_u16(buf, offset, val_u64):
-    buf     = rffi.cast(rffi.UCHAR, val_u64 & r_uint64(0xFF))
-    buf = rffi.cast(rffi.UCHAR, (val_u64 >> 8) & r_uint64(0xFF))
+    buf     = chr(intmask(val_u64 & r_uint64(0xFF)))
+    buf = chr(intmask((val_u64 >> 8) & r_uint64(0xFF)))
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +161,7 @@ def _unpack_string(buf, col_offset, heap_base):
     abs_off  = heap_base + blob_off
     chars =[]
     for k in range(blob_len):
-        chars.append(chr(rffi.cast(lltype.Signed, buf)))
+        chars.append(buf)
     return "".join(chars)
 
 
@@ -176,7 +173,7 @@ def _pack_string_ref(buf, col_offset, blob_off_rel, blob_len):
 def _write_blob_bytes(buf, heap_base, blob_off_rel, val_str):
     abs_off = heap_base + blob_off_rel
     for k in range(len(val_str)):
-        buf = rffi.cast(rffi.UCHAR, ord(val_str))
+        buf = val_str
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +260,7 @@ def write_wal_record(schema, pk, weight, row, buf, base, heap_base):
     _write_i64 (buf, base + _HDR_WEIGHT_OFFSET, weight)
     _write_u64 (buf, base + _HDR_NULL_OFFSET,   row._null_word)
 
-    heap_cursor =
+    heap_cursor = 0
     payload_col = 0
 
     for i in range(len(schema.columns)):
