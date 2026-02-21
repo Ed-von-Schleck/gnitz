@@ -143,11 +143,10 @@ def op_reduce(instr):
     agg_func = instr.agg_func
     group_cols = instr.group_by_cols
 
-    # 1. Sort the delta by group columns
+    # 1. Sort the delta by group columns to process in batches
     sorted_indices = _argsort_delta(delta_in, input_schema, group_cols)
     
     acc_in = PayloadRowAccessor(input_schema)
-    acc_trace_out = PayloadRowAccessor(output_schema)
     
     idx = 0
     n = delta_in.length()
@@ -156,7 +155,7 @@ def op_reduce(instr):
         acc_in.set_row(delta_in.get_row(group_start_idx))
         group_key = _extract_group_key(acc_in, input_schema, group_cols)
 
-        # 2. Aggregate the Delta portion for this group
+        # 2. Reset aggregator and fold the Delta portion for this group
         agg_func.reset()
         while idx < n:
             curr_idx = sorted_indices[idx]
@@ -171,59 +170,63 @@ def op_reduce(instr):
             agg_func.step(acc_in, delta_in.get_weight(curr_idx))
             idx += 1
         
-        # 3. Handle Retraction: Emit -Agg(I)
-        # We look up the existing aggregate in the output trace
+        # 3. Handle Retraction: Emit -Agg(I) if history exists
+        # Look up the existing aggregate in the output trace
         instr.reg_trace_out.cursor.seek(group_key)
         has_old = False
         if instr.reg_trace_out.cursor.is_valid() and instr.reg_trace_out.cursor.key() == group_key:
             has_old = True
             old_row_accessor = instr.reg_trace_out.cursor.get_accessor()
             
-            # Emit retraction (-1)
-            # The output row structure for REDUCE is: [PK: GroupKey] + [Group Cols] + [Agg Result]
-            # However, if GroupKey is natural, it's just [PK] + [Agg Result].
+            # Construct retraction row (-1 weight)
             retract_row = make_payload_row(output_schema)
-            # We copy group columns from the input record (it's the same group)
             acc_in.set_row(delta_in.get_row(group_start_idx))
             _copy_group_cols(acc_in, input_schema, retract_row, group_cols)
             
-            # Copy the old aggregate result from the trace accessor
+            # Extract old aggregate result bits from trace
             agg_col_idx = len(output_schema.columns) - 1
-            # Note: Aggregate result is assumed to be numeric or count
-            old_val = r_int64(intmask(old_row_accessor.get_int(agg_col_idx)))
-            retract_row.append_int(old_val)
+            old_val_bits = old_row_accessor.get_int(agg_col_idx)
+            retract_row.append_int(r_int64(intmask(old_val_bits)))
             
             out_batch.append(group_key, r_int64(-1), retract_row)
 
         # 4. Compute New Aggregate: Agg(I + δin)
         if agg_func.is_linear() and has_old:
-            # For linear aggs, we add the delta to the previous total
-            # Load old value back into aggregate function
+            # OPTIMIZATION: For linear aggs, we merge the previous result bits
+            # from the output trace into the current aggregator state.
             old_row_accessor = instr.reg_trace_out.cursor.get_accessor()
-            agg_func.step(old_row_accessor, r_int64(1))
+            agg_col_idx = len(output_schema.columns) - 1
+            old_val_bits = old_row_accessor.get_int(agg_col_idx)
+            
+            # merge_accumulated handles the schema difference (output vs input)
+            agg_func.merge_accumulated(old_val_bits, r_int64(1))
+            
         elif not agg_func.is_linear():
-            # Non-linear (e.g., MIN/MAX): Must rescan historical input trace
+            # NON-LINEAR (MIN/MAX): Must re-scan historical input trace
             agg_func.reset()
             trace_in = instr.reg_trace_in.cursor
             trace_in.seek(group_key)
             while trace_in.is_valid() and trace_in.key() == group_key:
+                # trace_in provides an input-schema accessor, so step() is valid
                 agg_func.step(trace_in.get_accessor(), trace_in.weight())
                 trace_in.advance()
-            # Then apply the delta sum we computed earlier
-            # (Note: This requires agg_func to track the delta sum internally or re-scan delta)
-            # Simplification: we re-apply the delta records here
+                
+            # Then apply the delta records from this batch
             for k in range(group_start_idx, idx):
                 d_idx = sorted_indices[k]
                 acc_in.set_row(delta_in.get_row(d_idx))
                 agg_func.step(acc_in, delta_in.get_weight(d_idx))
 
-        # 5. Emit Insertion (+1)
-        if not agg_func.is_accumulator_zero(): # Check if result is identity/zero
+        # 5. Emit Insertion (+1) of the new aggregate
+        if not agg_func.is_accumulator_zero():
             insert_row = make_payload_row(output_schema)
             acc_in.set_row(delta_in.get_row(group_start_idx))
             _copy_group_cols(acc_in, input_schema, insert_row, group_cols)
+            
+            # Emit appends the aggregator's primitive state to the row
             agg_func.emit(insert_row)
             out_batch.append(group_key, r_int64(1), insert_row)
 
+    # Sort and consolidate before passing to downstream operators
     out_batch.sort()
     out_batch.consolidate()

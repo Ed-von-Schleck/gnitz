@@ -1,85 +1,69 @@
 # gnitz/vm/functions.py
 
-from rpython.rlib.rarithmetic import r_int64, r_uint64
+from rpython.rlib.rarithmetic import r_int64, intmask, r_uint64
 from rpython.rtyper.lltypesystem import rffi
-from gnitz.core import values, types
-
+from gnitz.core import types
 
 class ScalarFunction(object):
-    """
-    Base class for logic executed inside MAP or FILTER.
-    During translation, concrete implementations of this will be created.
-    """
     _immutable_fields_ = []
 
     def evaluate_predicate(self, row_accessor):
-        """Used by OP_FILTER. Returns True to keep row."""
-        return True
+        raise NotImplementedError
 
-    def evaluate_map(self, row_accessor, output_row_list):
-        """Used by OP_MAP. Appends transformed TaggedValues to output_row_list."""
-        pass
+    def evaluate_map(self, row_accessor, output_row):
+        raise NotImplementedError
 
 
 class AggregateFunction(object):
-    """
-    Base class for incremental aggregation functions used by REDUCE.
+    _immutable_fields_ = []
 
-    An AggregateFunction defines how to fold Z-set rows into a single
-    aggregate value per group. It must satisfy the abelian group structure
-    required by DBSP.
-    """
-
-    def create_accumulator(self):
-        # type: () -> values.TaggedValue
-        """Return the identity element (zero) for this aggregate group."""
+    def reset(self):
         raise NotImplementedError
 
-    def step(self, acc, row, weight):
-        # type: (values.TaggedValue, row_logic.BaseRowAccessor, r_int64) -> values.TaggedValue
+    def step(self, row_accessor, weight):
+        raise NotImplementedError
+
+    def merge_accumulated(self, value_bits, weight):
         """
-        Fold one weighted row into the accumulator.
-        Linear aggregates: step(acc, row, w) == step(zero, row, w) + acc.
-        weight may be negative (retraction).
+        Merges a pre-calculated aggregate result (from the trace) into the current state.
+        Used for linear aggregation optimizations (Agg(Old + New) = Agg(Old) + Agg(New)).
+        
+        value_bits: r_uint64 (raw bits from storage)
+        weight: r_int64
         """
         raise NotImplementedError
 
-    def finalize(self, acc):
-        # type: (values.TaggedValue) -> values.TaggedValue
-        """Extract final output value from accumulator. Default is identity."""
-        return acc
+    def emit(self, output_row):
+        raise NotImplementedError
 
     def is_linear(self):
-        # type: () -> bool
-        """
-        Return True if this aggregate is a group homomorphism.
-        Linear aggregates do NOT need trace_in; they compute
-        new_agg = old_agg + agg(delta) directly.
-        """
         raise NotImplementedError
 
     def output_column_type(self):
-        # type: () -> types.FieldType
-        """Return the FieldType for the output column."""
         raise NotImplementedError
 
-    def is_accumulator_zero(self, acc):
-        # type: (values.TaggedValue) -> bool
-        """
-        Return True if the accumulator represents the identity (zero) value.
-        Used to suppress emission of (key, 0) -> +1 rows.
-        """
+    def is_accumulator_zero(self):
         raise NotImplementedError
 
 
 class CountAggregateFunction(AggregateFunction):
-    """COUNT(*) — sums the Z-weights of all rows in the group."""
+    def __init__(self):
+        self._count = r_int64(0)
 
-    def create_accumulator(self):
-        return values.TaggedValue(values.TAG_INT, r_int64(0), r_uint64(0), 0.0, "")
+    def reset(self):
+        self._count = r_int64(0)
 
-    def step(self, acc, row, weight):
-        return values.TaggedValue(values.TAG_INT, acc.i64 + weight, r_uint64(0), 0.0, "")
+    def step(self, row_accessor, weight):
+        self._count = r_int64(intmask(self._count + weight))
+
+    def merge_accumulated(self, value_bits, weight):
+        # value_bits represents the previous count. 
+        # We add (prev_count * weight).
+        prev_cnt = rffi.cast(rffi.LONGLONG, value_bits)
+        self._count = r_int64(intmask(self._count + (prev_cnt * weight)))
+
+    def emit(self, output_row):
+        output_row.append_int(self._count)
 
     def is_linear(self):
         return True
@@ -87,24 +71,37 @@ class CountAggregateFunction(AggregateFunction):
     def output_column_type(self):
         return types.TYPE_I64
 
-    def is_accumulator_zero(self, acc):
-        return acc.i64 == 0
+    def is_accumulator_zero(self):
+        return self._count == 0
 
 
 class SumI64AggregateFunction(AggregateFunction):
-    """SUM(col) for signed 64-bit integer columns."""
-
-    _immutable_fields_ = ['col_idx']
+    _immutable_fields_ = ["col_idx"]
 
     def __init__(self, col_idx):
         self.col_idx = col_idx
+        self._sum = r_int64(0)
 
-    def create_accumulator(self):
-        return values.TaggedValue(values.TAG_INT, r_int64(0), r_uint64(0), 0.0, "")
+    def reset(self):
+        self._sum = r_int64(0)
 
-    def step(self, acc, row, weight):
-        val = rffi.cast(rffi.LONGLONG, row.get_int(self.col_idx))
-        return values.TaggedValue(values.TAG_INT, acc.i64 + val * weight, r_uint64(0), 0.0, "")
+    def step(self, row_accessor, weight):
+        if row_accessor.is_null(self.col_idx):
+            return
+        val_u = row_accessor.get_int(self.col_idx)
+        val = rffi.cast(rffi.LONGLONG, val_u)
+        weighted_val = r_int64(intmask(val * weight))
+        self._sum = r_int64(intmask(self._sum + weighted_val))
+
+    def merge_accumulated(self, value_bits, weight):
+        # value_bits represents the previous sum.
+        prev_sum = rffi.cast(rffi.LONGLONG, value_bits)
+        # We add (prev_sum * weight)
+        weighted_prev = r_int64(intmask(prev_sum * weight))
+        self._sum = r_int64(intmask(self._sum + weighted_prev))
+
+    def emit(self, output_row):
+        output_row.append_int(self._sum)
 
     def is_linear(self):
         return True
@@ -112,28 +109,35 @@ class SumI64AggregateFunction(AggregateFunction):
     def output_column_type(self):
         return types.TYPE_I64
 
-    def is_accumulator_zero(self, acc):
-        return acc.i64 == 0
+    def is_accumulator_zero(self):
+        return self._sum == 0
 
 
 class MinI64AggregateFunction(AggregateFunction):
-    """MIN(col) — non-linear. Requires trace_in."""
-
-    _immutable_fields_ = ['col_idx']
-    # INT64_MAX sentinel
-    _SENTINEL = 9223372036854775807
+    _immutable_fields_ = ["col_idx"]
+    _MAX_I64 = r_int64(9223372036854775807)
 
     def __init__(self, col_idx):
         self.col_idx = col_idx
+        self._val = self._MAX_I64
 
-    def create_accumulator(self):
-        return values.TaggedValue(values.TAG_INT, r_int64(self._SENTINEL), r_uint64(0), 0.0, "")
+    def reset(self):
+        self._val = self._MAX_I64
 
-    def step(self, acc, row, weight):
-        val = rffi.cast(rffi.LONGLONG, row.get_int(self.col_idx))
-        if val < acc.i64:
-            return values.TaggedValue(values.TAG_INT, val, r_uint64(0), 0.0, "")
-        return acc
+    def step(self, row_accessor, weight):
+        if row_accessor.is_null(self.col_idx):
+            return
+        val_u = row_accessor.get_int(self.col_idx)
+        val = rffi.cast(rffi.LONGLONG, val_u)
+        if val < self._val:
+            self._val = val
+
+    def merge_accumulated(self, value_bits, weight):
+        # Not linear; this path is never taken by ReduceOp
+        pass
+
+    def emit(self, output_row):
+        output_row.append_int(self._val)
 
     def is_linear(self):
         return False
@@ -141,28 +145,34 @@ class MinI64AggregateFunction(AggregateFunction):
     def output_column_type(self):
         return types.TYPE_I64
 
-    def is_accumulator_zero(self, acc):
-        return acc.i64 == self._SENTINEL
+    def is_accumulator_zero(self):
+        return self._val == self._MAX_I64
 
 
 class MaxI64AggregateFunction(AggregateFunction):
-    """MAX(col) — non-linear. Requires trace_in."""
-
-    _immutable_fields_ = ['col_idx']
-    # INT64_MIN sentinel
-    _SENTINEL = -9223372036854775808
+    _immutable_fields_ = ["col_idx"]
+    _MIN_I64 = r_int64(-9223372036854775808)
 
     def __init__(self, col_idx):
         self.col_idx = col_idx
+        self._val = self._MIN_I64
 
-    def create_accumulator(self):
-        return values.TaggedValue(values.TAG_INT, r_int64(self._SENTINEL), r_uint64(0), 0.0, "")
+    def reset(self):
+        self._val = self._MIN_I64
 
-    def step(self, acc, row, weight):
-        val = rffi.cast(rffi.LONGLONG, row.get_int(self.col_idx))
-        if val > acc.i64:
-            return values.TaggedValue(values.TAG_INT, val, r_uint64(0), 0.0, "")
-        return acc
+    def step(self, row_accessor, weight):
+        if row_accessor.is_null(self.col_idx):
+            return
+        val_u = row_accessor.get_int(self.col_idx)
+        val = rffi.cast(rffi.LONGLONG, val_u)
+        if val > self._val:
+            self._val = val
+
+    def merge_accumulated(self, value_bits, weight):
+        pass
+
+    def emit(self, output_row):
+        output_row.append_int(self._val)
 
     def is_linear(self):
         return False
@@ -170,5 +180,5 @@ class MaxI64AggregateFunction(AggregateFunction):
     def output_column_type(self):
         return types.TYPE_I64
 
-    def is_accumulator_zero(self, acc):
-        return acc.i64 == self._SENTINEL
+    def is_accumulator_zero(self):
+        return self._val == self._MIN_I64
