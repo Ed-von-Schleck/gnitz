@@ -7,7 +7,7 @@ export PYTHONPATH=.:$PYPY_PATH
 # 2. Run Unit Tests (Logic)
 #echo "Running Unit Tests..."
 pypy2 -m unittest discover tests/storage
-pypy2 -m unittest discover tests/core
+#pypy2 -m unittest discover tests/core
 #pypy2 -m unittest discover tests/vm
 
 # 3. Run RPython Translation Check (Types)

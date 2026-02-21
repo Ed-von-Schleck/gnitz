@@ -93,7 +93,8 @@ def _extract_group_key(accessor, schema, col_indices):
         c_idx = col_indices[i]
         t = schema.columns[c_idx].field_type.code
         if t == types.TYPE_STRING.code:
-            _, _, _, _, s = accessor.get_str_struct(c_idx)
+            res = accessor.get_str_struct(c_idx)
+            s = strings.resolve_string(res[2], res[3], res[4])
             h_lo ^= xxh.compute_checksum_bytes(s)
         else:
             h_lo ^= accessor.get_int(c_idx)
@@ -110,7 +111,8 @@ def _copy_group_cols(input_accessor, input_schema, output_row, col_indices):
         c_idx = col_indices[i]
         t = input_schema.columns[c_idx].field_type.code
         if t == types.TYPE_STRING.code:
-            _, _, _, _, s = input_accessor.get_str_struct(c_idx)
+            res = input_accessor.get_str_struct(c_idx)
+            s = strings.resolve_string(res[2], res[3], res[4])
             output_row.append_string(s)
         elif t == types.TYPE_F64.code or t == types.TYPE_F32.code:
             output_row.append_float(input_accessor.get_float(c_idx))
@@ -147,13 +149,18 @@ def op_reduce(instr):
     sorted_indices = _argsort_delta(delta_in, input_schema, group_cols)
     
     acc_in = PayloadRowAccessor(input_schema)
+    acc_exemplar = PayloadRowAccessor(input_schema)
     
     idx = 0
     n = delta_in.length()
     while idx < n:
-        group_start_idx = sorted_indices[idx]
-        acc_in.set_row(delta_in.get_row(group_start_idx))
-        group_key = _extract_group_key(acc_in, input_schema, group_cols)
+        # Capture the sorted position and batch index of the group start
+        group_start_pos = idx
+        group_start_idx = sorted_indices[group_start_pos]
+        
+        # Set the exemplar accessor to the start of this group
+        acc_exemplar.set_row(delta_in.get_row(group_start_idx))
+        group_key = _extract_group_key(acc_exemplar, input_schema, group_cols)
 
         # 2. Reset aggregator and fold the Delta portion for this group
         agg_func.reset()
@@ -161,29 +168,24 @@ def op_reduce(instr):
             curr_idx = sorted_indices[idx]
             acc_in.set_row(delta_in.get_row(curr_idx))
             
-            # Check for group boundary
-            acc_boundary = PayloadRowAccessor(input_schema)
-            acc_boundary.set_row(delta_in.get_row(group_start_idx))
-            if _compare_by_cols(acc_in, acc_boundary, input_schema, group_cols) != 0:
+            # Check for group boundary by comparing current to group exemplar
+            if _compare_by_cols(acc_in, acc_exemplar, input_schema, group_cols) != 0:
                 break
             
             agg_func.step(acc_in, delta_in.get_weight(curr_idx))
             idx += 1
         
         # 3. Handle Retraction: Emit -Agg(I) if history exists
-        # Look up the existing aggregate in the output trace
         instr.reg_trace_out.cursor.seek(group_key)
         has_old = False
         if instr.reg_trace_out.cursor.is_valid() and instr.reg_trace_out.cursor.key() == group_key:
             has_old = True
             old_row_accessor = instr.reg_trace_out.cursor.get_accessor()
             
-            # Construct retraction row (-1 weight)
             retract_row = make_payload_row(output_schema)
-            acc_in.set_row(delta_in.get_row(group_start_idx))
-            _copy_group_cols(acc_in, input_schema, retract_row, group_cols)
+            # Use exemplar to ensure group columns are copied from the correct record
+            _copy_group_cols(acc_exemplar, input_schema, retract_row, group_cols)
             
-            # Extract old aggregate result bits from trace
             agg_col_idx = len(output_schema.columns) - 1
             old_val_bits = old_row_accessor.get_int(agg_col_idx)
             retract_row.append_int(r_int64(intmask(old_val_bits)))
@@ -192,27 +194,22 @@ def op_reduce(instr):
 
         # 4. Compute New Aggregate: Agg(I + δin)
         if agg_func.is_linear() and has_old:
-            # OPTIMIZATION: For linear aggs, we merge the previous result bits
-            # from the output trace into the current aggregator state.
             old_row_accessor = instr.reg_trace_out.cursor.get_accessor()
             agg_col_idx = len(output_schema.columns) - 1
             old_val_bits = old_row_accessor.get_int(agg_col_idx)
-            
-            # merge_accumulated handles the schema difference (output vs input)
             agg_func.merge_accumulated(old_val_bits, r_int64(1))
             
         elif not agg_func.is_linear():
-            # NON-LINEAR (MIN/MAX): Must re-scan historical input trace
+            # NON-LINEAR (MIN/MAX): Rescan historical trace and apply current delta group
             agg_func.reset()
             trace_in = instr.reg_trace_in.cursor
             trace_in.seek(group_key)
             while trace_in.is_valid() and trace_in.key() == group_key:
-                # trace_in provides an input-schema accessor, so step() is valid
                 agg_func.step(trace_in.get_accessor(), trace_in.weight())
                 trace_in.advance()
                 
-            # Then apply the delta records from this batch
-            for k in range(group_start_idx, idx):
+            # Iterate using sorted positions (group_start_pos to current idx)
+            for k in range(group_start_pos, idx):
                 d_idx = sorted_indices[k]
                 acc_in.set_row(delta_in.get_row(d_idx))
                 agg_func.step(acc_in, delta_in.get_weight(d_idx))
@@ -220,13 +217,10 @@ def op_reduce(instr):
         # 5. Emit Insertion (+1) of the new aggregate
         if not agg_func.is_accumulator_zero():
             insert_row = make_payload_row(output_schema)
-            acc_in.set_row(delta_in.get_row(group_start_idx))
-            _copy_group_cols(acc_in, input_schema, insert_row, group_cols)
+            _copy_group_cols(acc_exemplar, input_schema, insert_row, group_cols)
             
-            # Emit appends the aggregator's primitive state to the row
             agg_func.emit(insert_row)
             out_batch.append(group_key, r_int64(1), insert_row)
 
-    # Sort and consolidate before passing to downstream operators
     out_batch.sort()
     out_batch.consolidate()

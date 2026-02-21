@@ -40,7 +40,7 @@ class PackedNodeAccessor(RowAccessor):
             return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.USHORTP, ptr)[0])
         elif sz == 1:
             return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr)[0])
-        return rffi.cast(rffi.ULONGLONG, 0)
+        return r_uint64(0)
 
     def get_float(self, col_idx):
         ptr = self._get_ptr(col_idx)
@@ -57,6 +57,9 @@ class PackedNodeAccessor(RowAccessor):
 
     def get_str_struct(self, col_idx):
         ptr = self._get_ptr(col_idx)
+        if not ptr:
+            return (0, 0, NULL_PTR, self.blob_base_ptr, None)
+
         u32_ptr = rffi.cast(rffi.UINTP, ptr)
         length = rffi.cast(lltype.Signed, u32_ptr[0])
         prefix = rffi.cast(lltype.Signed, u32_ptr[1])
@@ -101,7 +104,7 @@ class SoAAccessor(RowAccessor):
             return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.USHORTP, ptr)[0])
         elif sz == 1:
             return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr)[0])
-        return rffi.cast(rffi.ULONGLONG, 0)
+        return r_uint64(0)
 
     def get_float(self, col_idx):
         ptr = self._get_ptr(col_idx)
@@ -118,13 +121,16 @@ class SoAAccessor(RowAccessor):
 
     def get_str_struct(self, col_idx):
         ptr = self._get_ptr(col_idx)
-        u32_ptr = rffi.cast(rffi.UINTP, ptr)
-        length = rffi.cast(lltype.Signed, u32_ptr[0])
-        prefix = rffi.cast(lltype.Signed, u32_ptr[1])
-
         blob_ptr = NULL_PTR
         if self.view.blob_buf:
             blob_ptr = self.view.blob_buf.ptr
+
+        if not ptr:
+            return (0, 0, NULL_PTR, blob_ptr, None)
+
+        u32_ptr = rffi.cast(rffi.UINTP, ptr)
+        length = rffi.cast(lltype.Signed, u32_ptr[0])
+        prefix = rffi.cast(lltype.Signed, u32_ptr[1])
 
         s = None
         if False:

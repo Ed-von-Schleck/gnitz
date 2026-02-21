@@ -5,7 +5,7 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi
 
-from gnitz.core import types
+from gnitz.core import types, strings
 from gnitz.core.values import make_payload_row
 from gnitz.core.comparator import PayloadRowAccessor
 from gnitz.vm import runtime
@@ -20,15 +20,16 @@ def _copy_payload_cols(schema, accessor, output_row):
     for i in range(len(schema.columns)):
         if i == schema.pk_index:
             continue
-            
+
         col_type = schema.columns[i].field_type
         code = col_type.code
 
         if code == types.TYPE_STRING.code:
             # RowAccessor.get_str_struct returns (length, prefix, struct_p, heap_p, s)
-            # We only need the Python string 's' to append to a PayloadRow.
             res = accessor.get_str_struct(i)
-            output_row.append_string(res[4])
+            # If s (res[4]) is None, it must be resolved from the German String struct
+            s = strings.resolve_string(res[2], res[3], res[4])
+            output_row.append_string(s)
 
         elif code == types.TYPE_F64.code or code == types.TYPE_F32.code:
             output_row.append_float(accessor.get_float(i))
@@ -73,34 +74,34 @@ def op_join_delta_trace(reg_delta, reg_trace, reg_out):
     for i in range(count):
         key = delta_batch.get_pk(i)
         w_delta = delta_batch.get_weight(i)
-        
+
         # Ghost Property: skip if delta weight is 0
         if w_delta == 0:
             continue
 
         # Seek the historical trace
         trace_cursor.seek(key)
-        
+
         # Match loop (Handles multiset semantics: one key may have N payloads)
         while trace_cursor.is_valid():
             if trace_cursor.key() != key:
                 break
-                
+
             w_trace = trace_cursor.weight()
             w_out = w_delta * w_trace
-            
+
             # Algebraic Annihilation: skip if net product is 0
             if w_out != 0:
                 d_accessor.set_row(delta_batch.get_row(i))
                 t_accessor = trace_cursor.get_accessor()
-                
+
                 # Construct concatenated PayloadRow
                 out_row = make_payload_row(out_schema)
                 _copy_payload_cols(d_schema, d_accessor, out_row)
                 _copy_payload_cols(t_schema, t_accessor, out_row)
-                
+
                 out_batch.append(key, w_out, out_row)
-            
+
             trace_cursor.advance()
 
 
@@ -145,12 +146,12 @@ def op_join_delta_delta(reg_a, reg_b, reg_out):
         else:
             # Key Match: compute Cartesian product of blocks with this key
             match_key = key_a
-            
+
             # Identify block boundaries for Multiset support
             start_a = idx_a
             while idx_a < n_a and batch_a.get_pk(idx_a) == match_key:
                 idx_a += 1
-            
+
             start_b = idx_b
             while idx_b < n_b and batch_b.get_pk(idx_b) == match_key:
                 idx_b += 1
@@ -158,18 +159,19 @@ def op_join_delta_delta(reg_a, reg_b, reg_out):
             # Nested-loop over matching blocks
             for i in range(start_a, idx_a):
                 wa = batch_a.get_weight(i)
-                if wa == 0: continue
-                
+                if wa == 0:
+                    continue
+
                 for j in range(start_b, idx_b):
                     wb = batch_b.get_weight(j)
                     w_out = wa * wb
-                    
+
                     if w_out != 0:
                         acc_a.set_row(batch_a.get_row(i))
                         acc_b.set_row(batch_b.get_row(j))
-                        
+
                         out_row = make_payload_row(out_schema)
                         _copy_payload_cols(schema_a, acc_a, out_row)
                         _copy_payload_cols(schema_b, acc_b, out_row)
-                        
+
                         out_batch.append(match_key, w_out, out_row)
