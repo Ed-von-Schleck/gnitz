@@ -252,6 +252,7 @@ The MemTable utilizes a SkipList indexed by a composite key consisting of the **
 *   **In-Memory Annihilation:** If updates result in a net weight of zero for a specific payload, the record is marked as an annihilated "Ghost." These nodes are bypassed during the transmutation process to reclaim memory.
 
 ### 6.3. Physical Node Layout
+
 Nodes are allocated within the **Dual-Arena** system (Staging Arena and Blob
 Arena). To ensure native CPU register performance, the Primary Key field is
 16-byte aligned.
@@ -273,17 +274,15 @@ Arena). To ensure native CPU register performance, the Primary Key field is
 
     | Column Type | Node Representation |
     | :--- | :--- |
-    | Integer (`i8`…`u64`) | Native-width value, bitcast from `r_int64` for TAG_INT |
+    | Integer (`i8`…`u64`) | Native-width value; the bit pattern is identical for signed and unsigned types, matching the `r_int64` bitcast used in `PayloadRow._lo` |
     | `f64` / `f32` | IEEE 754 double / single |
-    | `TYPE_U128` (non-PK) | Two contiguous 64-bit words: low word at the schema offset, high word at offset + 8, sourced from a TAG_U128 `TaggedValue` (see §8.7) |
+    | `TYPE_U128` (non-PK) | Two contiguous 64-bit words: low word at the schema offset, high word at offset + 8; reconstructed via `PayloadRow.get_u128()`, which recombines the low word stored in `_lo` and the high word stored in `_hi` |
     | `TYPE_STRING` | 16-byte German String struct; long-string tails stored in the Blob Arena and referenced by their 64-bit blob-arena offset |
 
-When a MemTable node is flushed to a columnar shard, the
-`TableShardWriter` reads the `TYPE_U128` payload from raw memory via
-`PackedNodeAccessor.get_u128`, which reconstructs the full 128-bit value from
-the two 64-bit words. The `TaggedValue` union is not involved in the raw-memory
-flush path; it is only used during ingestion (WAL decode, VM operator output)
-when column values arrive as `List[TaggedValue]`.
+When a MemTable node is flushed to a columnar shard, the `TableShardWriter`
+reads the `TYPE_U128` payload from raw memory via `PackedNodeAccessor.get_u128`,
+which reconstructs the full 128-bit value from the two 64-bit words written at
+serialisation time.
 
 ### 6.4. Sealing and Transmutation (Unzipping)
 The transition from mutable row-oriented memory to immutable columnar persistence is triggered by Arena occupancy.
@@ -331,10 +330,26 @@ Coalesced rows are streamed into a `TableShardWriter` to generate the new column
 ## 8. Execution Model: Persistent DBSP Virtual Machine
 
 ### 8.1. Register-Based Z-Set VM
-The engine executes reactive circuits via a register-based Virtual Machine designed for the incremental maintenance of relational views.
-*   **Register File:** A collection of specialized registers indexed by the VM ISA. The Register File maintains a monomorphic interface to facilitate RPython JIT tracing.
-*   **Delta Registers ($R_\Delta$):** Transient registers holding a `ZSetBatch`. These contain column-oriented, in-memory Z-Set deltas $(\Delta PK, \Delta Row, \Delta W)$ for the current LSN epoch.
-*   **Trace Registers ($R_T$):** Persistent registers holding a `UnifiedCursor`. These provide a seekable, merged view across the persistent FLSM shards and the active MemTable, serving as the historical state ($S$) required for non-linear operations.
+
+The engine executes reactive circuits via a register-based Virtual Machine
+designed for the incremental maintenance of relational views.
+
+*   **Register File:** A collection of specialized registers indexed by the VM
+    ISA. The Register File maintains a monomorphic interface to facilitate
+    RPython JIT tracing.
+
+*   **Delta Registers ($R_\Delta$):** Transient registers holding a `ZSetBatch`.
+    Each batch is a set of three parallel arrays — primary keys (`r_uint128`),
+    algebraic weights (`r_int64`), and payload rows (`PayloadRow`) — representing
+    the in-memory Z-Set deltas $(\Delta PK, \Delta W, \Delta Row)$ for the
+    current LSN epoch. The `PayloadRow` type stores all non-PK column values in a
+    struct-of-arrays layout; column types are derived from the `TableSchema` at
+    every access site rather than stored per value.
+
+*   **Trace Registers ($R_T$):** Persistent registers holding a `UnifiedCursor`.
+    These provide a seekable, merged view across the persistent FLSM shards and
+    the active MemTable, serving as the historical state ($S$) required for
+    non-linear operations.
 
 ### 8.2. Operational Primitives (DBSP-Complete ISA)
 The ISA implements the core operators of the DBSP calculus. All operators handle multiple payloads per Primary Key to maintain multiset integrity.
@@ -374,88 +389,115 @@ The RPython Meta-Tracing JIT optimizes the circuit execution based on the `VMSch
 *   **Scalar Inlining:** User-defined `ScalarFunction` implementations are inlined directly into the trace. The JIT specializes the map/filter logic for the physical layout of the input `ZSetBatch`, eliminating the overhead of dynamic field lookups.
 *   **Loop Unrolling:** For small, fixed-width schemas, the JIT unrolls the columnar iteration, enabling vectorized loads and SIMD-optimized comparison kernels.
 
-### 8.7 In-Memory Value Representation: The TaggedValue Union
+### 8.7. In-Memory Value Representation: `PayloadRow`
 
-The ingestion layer and VM pass non-PK column values through the `TaggedValue`
-union type (defined in `gnitz/core/values.py`). Because RPython requires every
-variable to have a single static type, a tagged-union pattern represents
-heterogeneous column values within homogeneous `List[TaggedValue]` payload
-rows.
+The ingestion layer and VM pass non-PK column values through the `PayloadRow`
+type (defined in `gnitz/core/values.py`). `PayloadRow` uses a **struct-of-arrays**
+layout: instead of one heap object per column value, all values for a single
+row are packed into a small, fixed number of parallel arrays whose element types
+are statically known to RPython. Column type dispatch is always performed via
+the `TableSchema`, never via a per-value tag.
 
-#### 8.7.1  Tag Table
+#### 8.7.1. Layout
 
-| Tag | Constant | Active Fields | Column Types Covered |
-| :---: | :--- | :--- | :--- |
-| 0 | `TAG_INT` | `i64` | `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` |
-| 1 | `TAG_FLOAT` | `f64` | `f32`, `f64` |
-| 2 | `TAG_STRING` | `str_val` | `TYPE_STRING` |
-| 3 | `TAG_NULL` | — | NULL marker |
-| 4 | `TAG_U128` | `i64` (lo word), `u128_hi` (hi word) | `TYPE_U128` non-PK columns |
+A `PayloadRow` contains the following fields, all allocated at row-construction
+time:
 
-#### 8.7.2  Fields
+| Field | Type | Always Present | Contents |
+| :--- | :--- | :---: | :--- |
+| `_lo` | `List[r_int64]` | Yes | One entry per non-PK column. Integer types: native value bitcast to `r_int64`. Float types: IEEE 754 bit pattern via `float2longlong` (lossless). `TYPE_U128`: low 64 bits, bitcast `r_uint64 → r_int64`. `TYPE_STRING`: `r_int64(0)` (data lives in `_strs`). NULL: `r_int64(0)`. |
+| `_hi` | `List[r_uint64]` or `None` | Only when schema contains a non-PK `TYPE_U128` column | High 64 bits of `TYPE_U128` values; `r_uint64(0)` for all other column types at the same index. `None` when the schema has no non-PK `TYPE_U128` columns, avoiding a heap allocation. |
+| `_strs` | `List[str]` or `None` | Only when schema contains a `TYPE_STRING` column | Python string value for `TYPE_STRING` columns; `""` for all other column types at the same index. `None` when the schema has no string columns. |
+| `_null_word` | `r_uint64` | Yes | Scalar bitfield (no heap allocation). Bit *N* is set when payload column *N* is null. For schemas with no nullable columns, `_has_nullable` is JIT-promoted to `False` and this field is never read or written. |
 
-*   `i64: r_int64` — For `TAG_INT`: holds the column value, bitcast from
-    unsigned to signed where necessary (callers retrieve unsigned semantics via
-    `r_uint64(val.i64)`). For `TAG_U128`: holds the **low 64 bits** of the
-    128-bit value via the same `r_int64` bitcast.
-*   `u128_hi: r_uint64` — For `TAG_U128`: holds the **high 64 bits** of the
-    128-bit value. Set to `r_uint64(0)` for all other tags.
-*   `f64: float` — For `TAG_FLOAT`.
-*   `str_val: str` — For `TAG_STRING`.
+Three boolean flags — `_has_u128`, `_has_string`, `_has_nullable` — are listed
+in `_immutable_fields_`. The JIT promotes them to compile-time constants per
+trace, resolving all branches on these flags at trace-compile time and
+preventing dead branches from appearing in emitted machine code.
 
-#### 8.7.3  Factory Methods
+#### 8.7.2. Construction
 
-| Factory | Tag Produced | Notes |
+`PayloadRow` instances must be created exclusively via `make_payload_row(schema)`.
+Direct construction is prohibited. `make_payload_row` calls `_analyze_schema` to
+derive the allocation flags, then constructs the row with correctly-sized arrays
+using `newlist_hint` (see Appendix A §4 for the mr-poisoning hazard this
+prevents).
+
+After construction, columns are appended in schema order (skipping the PK
+column) using the typed append methods:
+
+| Method | Use for |
+| :--- | :--- |
+| `append_int(val_i64)` | All integer column types: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` |
+| `append_float(val_f64)` | `TYPE_F32`, `TYPE_F64` (stored via `float2longlong`, not value-cast) |
+| `append_string(val_str)` | `TYPE_STRING` |
+| `append_u128(lo_u64, hi_u64)` | Non-PK `TYPE_U128` columns |
+| `append_null(payload_col_idx)` | Any nullable column; sets the corresponding bit in `_null_word` |
+
+The row is considered immutable once all non-PK columns have been appended. No
+mutation API is exposed after that point.
+
+#### 8.7.3. Access
+
+Columns are read back by payload index (0-based, PK excluded) via the typed
+accessor methods. Column type dispatch is always performed by the caller using
+`schema.columns[i].field_type`, exactly as in the storage-layer comparators:
+
+| Method | Returns | Use for |
 | :--- | :--- | :--- |
-| `TaggedValue.make_int(val)` | `TAG_INT` | `intmask` truncates to machine word; `u128_hi = 0` |
-| `TaggedValue.make_float(val)` | `TAG_FLOAT` | `u128_hi = 0` |
-| `TaggedValue.make_string(val)` | `TAG_STRING` | `u128_hi = 0` |
-| `TaggedValue.make_null()` | `TAG_NULL` | `u128_hi = 0` |
-| `TaggedValue.make_u128(lo, hi)` | `TAG_U128` | `lo` and `hi` are `r_uint64`; `lo` stored as `r_int64(lo)` bitcast |
+| `get_int(payload_col_idx)` | `r_uint64` | All integer types (unsigned semantics) |
+| `get_int_signed(payload_col_idx)` | `r_int64` | All integer types (signed semantics) |
+| `get_float(payload_col_idx)` | `float` | `TYPE_F32`, `TYPE_F64` (bit-level inverse of `float2longlong`) |
+| `get_u128(payload_col_idx)` | `r_uint128` | Non-PK `TYPE_U128` columns |
+| `get_str(payload_col_idx)` | `str` | `TYPE_STRING` |
+| `is_null(payload_col_idx)` | `bool` | Any column; always `False` when `_has_nullable` is `False` |
 
-#### 8.7.4  Reconstruction Identity for TAG_U128
+#### 8.7.4. Reconstruction Identity for Non-PK `TYPE_U128`
+
+The full 128-bit value is reconstructed from the two stored 64-bit words by
+`get_u128`:
 
 ```python
-r_uint128_value = (r_uint128(val.u128_hi) << 64) | r_uint128(r_uint64(val.i64))
+lo = r_uint128(r_uint64(self._lo[payload_col_idx]))   # undo r_int64 bitcast
+hi = r_uint128(self._hi[payload_col_idx])
+return (hi << 64) | lo
 ```
 
-The `r_uint64(val.i64)` cast undoes the `r_int64` bitcast applied at
-construction time. This identity is used identically in `ValueAccessor.get_u128`
-(comparator layer), `BatchAccessor.get_u128` (VM batch layer), and every
-serialisation site that writes TAG_U128 values to raw memory.
+This identity is used identically in `PayloadRowAccessor.get_u128` (comparator
+layer) and every serialisation site that writes non-PK `TYPE_U128` values to
+raw memory.
 
-#### 8.7.5  Primary Key Boundary
+#### 8.7.5. Primary Key Boundary
 
-`TYPE_U128` Primary Keys **never** enter the `TaggedValue` union. They are
-handled as native `r_uint128` throughout:
+`TYPE_U128` Primary Keys **never** enter the `PayloadRow` representation. They
+are handled as native `r_uint128` throughout the entire engine:
 
-*   Ingestion API (`PersistentTable.insert` / `remove`)
+*   Ingestion API (`PersistentTable.insert` / `delete`)
 *   SkipList node key storage (`memtable_node.py`)
 *   Shard PK region reads (`TableShardView.get_pk_u128`)
 *   Cursor key comparison (`TournamentTree`, `UnifiedCursor`)
 
-The `TaggedValue` path applies exclusively to `TYPE_U128` columns that are
-**not** the designated Primary Key — for example, UUID foreign keys that
-reference another table's PK space.
+`PayloadRow` applies exclusively to **non-PK** columns — for example, `TYPE_U128`
+foreign keys that reference another table's PK space.
 
-#### 8.7.6  Payload Row Comparison
+#### 8.7.6. Payload Row Comparison
 
-Within the VM layer, `List[TaggedValue]` payload rows are compared using
+Within the VM layer, `PayloadRow` instances are compared using
 `PayloadRowComparator` (defined in `gnitz/core/row_logic.py`). This class holds
-a pair of pre-allocated `ValueAccessor` instances and delegates to
-`comparator.compare_rows`, which dispatches on column type and enforces
-unsigned comparison semantics for all integer types, including TAG_U128 (via
-`ValueAccessor.get_u128`).
+a pair of pre-allocated `PayloadRowAccessor` instances and delegates to
+`comparator.compare_rows`, which dispatches on column type via the schema and
+enforces correct comparison semantics for all types, including unsigned
+comparison for integer types and content-based comparison for `TYPE_U128` (via
+`get_u128`).
 
 Code in `gnitz/vm` must **never** import `gnitz/storage/comparator` directly.
 `PayloadRowComparator` is the designated API proxy that enforces the
-`vm` → `core` → `storage` dependency boundary.
+`vm → core → storage` dependency boundary.
 
-`ZSetBatch` holds a `_row_cmp: PayloadRowComparator` instance in its
-`_immutable_fields_` list and uses it in both `sort()` and `consolidate()`.
-This ensures that batch ordering is always consistent with the storage
-comparator, preventing incorrect join results or missed consolidations for rows
-whose TYPE_U128 payload columns differ only in the high word.
+`ZSetBatch` uses `PayloadRowComparator` in its `_row_cmp` helper, ensuring that
+batch ordering is always consistent with the storage comparator and preventing
+incorrect join results or missed consolidations for rows whose non-PK `TYPE_U128`
+columns differ only in the high word.
 
 ## 9. Distribution and Concurrency Model
 
@@ -652,17 +694,6 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
     *   Use `intmask(x)` to force truncation to machine word.
 *   **Unsigned:** Use `r_uint` for bitwise ops/checksums.
 *   **128-bit:** Natively supported via `r_ulonglonglong`. **Warning:** RPython types (`int`, `long`) are "frozen" descriptors. **Never** cast via `long(x)`; use specialized casting helpers.
-*   **`make_int` / `intmask` Signedness Conflict:** `TaggedValue.make_int` uses `@specialize.argtype`, but RPython still unifies `TaggedValue.i64` across **all** construction sites globally. If one call site passes an `r_uint64` (e.g. from `get_int()`) and another passes a plain `int`/`r_int64` expression (e.g. `acc.i64 + weight`), `intmask` produces conflicting annotations and translation fails with `UnionError`. Instead of `make_int()`, construct `TaggedValue` directly, using `rffi.cast(rffi.LONGLONG, ...)` to cross the `r_uint64` → `r_int64` boundary:
-    ```python
-    # Wrong:
-    values.TaggedValue.make_int(row.get_int(col))     # r_uint64 through intmask
-    values.TaggedValue.make_int(acc.i64 + weight)     # r_int64 through intmask
-
-    # Correct:
-    val = rffi.cast(rffi.LONGLONG, row.get_int(col))
-    values.TaggedValue(TAG_INT, val, r_uint64(0), 0.0, "")
-    values.TaggedValue(TAG_INT, acc.i64 + weight, r_uint64(0), 0.0, "")
-    ```
 *   **List Tracing Bug:** Storing `r_uint128` primitives directly in resizable lists can lead to alignment issues or SIGSEGV in the translated C code.
 *   **Best Practice:** Split `u128` values into two `u64` lists (`keys_lo`, `keys_hi`) when storing them in resizable containers. Reconstruct the `u128` only at the point of computation/comparison.
 *   **Prebuilt Long Trap:** Do not use literals > `sys.maxint` (e.g., `0xFFFFFF...`). Python 2 creates a `long` object, which cannot be frozen into the binary. Use `r_uint(-1)` or bit-shifts.
@@ -693,7 +724,6 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
 6.  **mr-Poisoning:** Using `[]` for a payload list, causing all future `.append` calls to crash.
 7.  **u128-List Crashes:** Storing raw 128-bit integers in a resizable list instead of splitting into `lo/hi` pairs.
 8.  **Raw-Leak:** Malloc-ing a `dummy_ptr` in an accessor and never freeing it, corrupting the C heap.
-9.  **`make_int` Union Poison:** Calling `TaggedValue.make_int()` from call sites with differing argument signedness causes a global `UnionError` on `TaggedValue.i64`, because it is a single shared field in the annotator's type lattice. Never use `make_int()` where `get_int()` return values or `r_int64` arithmetic results are involved — construct `TaggedValue` directly instead (see Section 4).
 
 # Appendix B: Coding practices
 
