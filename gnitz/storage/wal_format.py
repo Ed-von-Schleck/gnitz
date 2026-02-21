@@ -11,7 +11,7 @@ from rpython.rlib.rarithmetic import intmask
 from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.core import types
+from gnitz.core import types, xxh, strings as string_logic, errors
 from gnitz.core.values import make_payload_row
 from gnitz.storage import mmap_posix
 
@@ -133,8 +133,8 @@ def _write_f64(buf, offset, val_f64):
 # ---------------------------------------------------------------------------
 
 def _unpack_string(buf, col_offset, heap_base):
-    blob_off = intmask(_read_u32(buf, col_offset))
-    blob_len = intmask(_read_u32(buf, col_offset + 4))
+    blob_len = intmask(_read_u32(buf, col_offset))
+    blob_off = intmask(_read_u64(buf, col_offset + 8))
     abs_off  = heap_base + blob_off
     
     chars = [None] * blob_len
@@ -144,8 +144,8 @@ def _unpack_string(buf, col_offset, heap_base):
     return "".join(chars)
 
 def _pack_string_ref(buf, col_offset, blob_off_rel, blob_len):
-    _write_u32(buf, col_offset,     r_uint64(blob_off_rel))
-    _write_u32(buf, col_offset + 4, r_uint64(blob_len))
+    _write_u32(buf, col_offset,     r_uint64(blob_len))
+    _write_u64(buf, col_offset + 8, r_uint64(blob_off_rel))
 
 def _write_blob_bytes(buf, heap_base, blob_off_rel, val_str):
     dest = rffi.cast(rffi.CCHARP, rffi.ptradd(buf, heap_base + blob_off_rel))
@@ -246,6 +246,9 @@ def write_wal_record(schema, pk, weight, row, buf, base, heap_base):
 
         if code == types.TYPE_STRING.code:
             s_val = row.get_str(payload_col)
+            p = rffi.cast(rffi.UINT, string_logic.compute_prefix(s_val))
+            _write_u32(buf, col_offset + 4, r_uint64(p))
+
             _pack_string_ref(buf, col_offset, heap_cursor, len(s_val))
             _write_blob_bytes(buf, heap_base, heap_cursor, s_val)
             heap_cursor += len(s_val)
@@ -354,7 +357,6 @@ def write_wal_block(fd, lsn, table_id, records, schema):
             current_offset += f_sz + h_sz
             
         # Checksum calculation over block body
-        from gnitz.core import xxh
         body_ptr = rffi.ptradd(buf, WAL_BLOCK_HEADER_SIZE)
         body_size = total_size - WAL_BLOCK_HEADER_SIZE
         if body_size > 0:
@@ -379,7 +381,6 @@ def decode_wal_block(buf, total_size, schema):
     entry_count = intmask(_read_u32(buf, 12))
     
     # Verify Integrity
-    from gnitz.core import xxh
     body_ptr = rffi.ptradd(buf, WAL_BLOCK_HEADER_SIZE)
     body_size = total_size - WAL_BLOCK_HEADER_SIZE
     expected_cs = _read_u64(buf, 24)
@@ -387,7 +388,7 @@ def decode_wal_block(buf, total_size, schema):
     if body_size > 0:
         actual_cs = xxh.compute_checksum(body_ptr, body_size)
         if actual_cs != expected_cs:
-            from gnitz.core import errors
+
             raise errors.CorruptShardError("WAL block checksum mismatch")
             
     records = []

@@ -339,7 +339,7 @@ class PersistentTable(AbstractTable):
                 if col_type == types.TYPE_STRING:
                     _, _, p, h, _ = acc.get_str_struct(i)
                     row.append_string(
-                        string_logic.unpack_string_from_struct(p, h)
+                        string_logic.unpack_string(p, h)
                     )
                 elif col_type == types.TYPE_U128:
                     v = acc.get_u128(i)
