@@ -1,4 +1,4 @@
-# gnitz/tests/vm/test_batch.py
+# gnitz/tests/core/test_batch.py
 
 import unittest
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_int64

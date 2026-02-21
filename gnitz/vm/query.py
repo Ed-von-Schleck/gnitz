@@ -1,8 +1,8 @@
 # gnitz/vm/query.py
 
-from gnitz.core import types
+from gnitz.core import types, batch
 from gnitz.backend.table import AbstractTable
-from gnitz.vm import instructions, runtime, interpreter, batch, functions
+from gnitz.vm import instructions, runtime, interpreter, functions
 
 
 class QueryError(Exception):
@@ -104,32 +104,24 @@ class QueryBuilder(object):
 
     def distinct(self):
         """
-        Eliminates duplicate records by maintaining a multiset history.
-        The operator ensures set semantics: net weights in the output 
-        are normalized to the range [-1, 0, 1].
+        Converts multiset semantics to set semantics.
+        Uses a local EphemeralTable to track record counts.
         """
         prev_reg = self.registers[self.current_reg_idx]
-        if not prev_reg.is_delta():
-            raise QueryError("Distinct input must be a Delta stream")
-
         schema = prev_reg.vm_schema.table_schema
 
-        # 1. Allocate internal state for Distinct (Multiset history)
+        # Allocate internal state for Distinct
         table_name = "_internal_distinct_%d" % len(self.instructions)
         history_table = self._source_table.create_scratch_table(table_name, schema)
         cursor = history_table.create_cursor()
         self.cursors.append(cursor)
 
-        # 2. Add TraceRegister to track the history
         trace_idx, trace_reg = self._add_register(
             schema, is_trace=True, cursor=cursor, table=history_table
         )
-
-        # 3. Add DeltaRegister for the set-semantic output
         out_idx, out_reg = self._add_register(schema)
 
-        # 4. Emit Distinct Instruction. Note: history_batch is no longer required 
-        # in the instruction as op_distinct uses the input batch for updates.
+        # history_batch is no longer required as op_distinct reuses reg_in.batch
         op = instructions.DistinctOp(prev_reg, trace_reg, out_reg)
         self.instructions.append(op)
 
@@ -139,17 +131,14 @@ class QueryBuilder(object):
     def reduce(self, group_by_cols, agg_func, reg_trace_in_idx=-1):
         """
         Groups the stream and applies an aggregate function.
-        
+
         Args:
             group_by_cols: List of column indices to group by.
             agg_func: An AggregateFunction instance.
-            reg_trace_in_idx: (Optional) Register index for input trace. 
+            reg_trace_in_idx: (Optional) Register index for input trace.
                               Required for non-linear aggs (MIN/MAX).
         """
         prev_reg = self.registers[self.current_reg_idx]
-        if not prev_reg.is_delta():
-            raise QueryError("Reduce input must be a Delta stream")
-
         input_schema = prev_reg.vm_schema.table_schema
 
         if not agg_func.is_linear() and reg_trace_in_idx == -1:
@@ -194,8 +183,8 @@ class QueryBuilder(object):
         )
         self.instructions.append(op)
 
-        # 6. Emit Integration: update the internal trace table with the results 
-        # of this batch so that the next tick can perform correct retractions.
+        # 6. Emit Integration: update the internal trace table with the results
+        # of this batch so that future retractions are correct.
         sink_op = instructions.IntegrateOp(reg_out, trace_table)
         self.instructions.append(sink_op)
 
@@ -204,17 +193,14 @@ class QueryBuilder(object):
 
     def join_persistent(self, table):
         prev_reg = self.registers[self.current_reg_idx]
-        if not prev_reg.is_delta():
-            raise QueryError("Join input must be a Delta stream")
-
         cursor = table.create_cursor()
         self.cursors.append(cursor)
         trace_idx, trace_reg = self._add_register(
-            table.get_schema(), is_trace=True, cursor=cursor
+            table.schema, is_trace=True, cursor=cursor
         )
 
         out_schema = types.merge_schemas_for_join(
-            prev_reg.vm_schema.table_schema, table.get_schema()
+            prev_reg.vm_schema.table_schema, table.schema
         )
         out_idx, out_reg = self._add_register(out_schema)
 
@@ -226,14 +212,9 @@ class QueryBuilder(object):
 
     def union(self, other_builder=None):
         prev_reg = self.registers[self.current_reg_idx]
-        if not prev_reg.is_delta():
-            raise QueryError("Union input must be a Delta stream")
-
         other_reg = None
         if other_builder is not None:
             other_reg = other_builder.registers[other_builder.current_reg_idx]
-            if not other_reg.is_delta():
-                raise QueryError("Union second input must be a Delta stream")
 
         idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
         op = instructions.UnionOp(prev_reg, other_reg, new_reg)
@@ -243,13 +224,7 @@ class QueryBuilder(object):
         return self
 
     def sink(self, table):
-        """
-        Terminal sink that flushes the stream into persistent storage.
-        """
         prev_reg = self.registers[self.current_reg_idx]
-        if not prev_reg.is_delta():
-            raise QueryError("Sink input must be a Delta stream")
-
         op = instructions.IntegrateOp(prev_reg, table)
         self.instructions.append(op)
         return self
@@ -261,14 +236,12 @@ class QueryBuilder(object):
             self._built = True
 
         # Copy instructions to a fixed-size list for RPython
-        n_instr = len(self.instructions)
-        final_program = [None] * n_instr
-        for i in range(n_instr):
+        final_program = [None] * len(self.instructions)
+        for i in range(len(self.instructions)):
             final_program[i] = self.instructions[i]
 
-        n_regs = len(self.registers)
-        reg_file = runtime.RegisterFile(n_regs)
-        for i in range(n_regs):
+        reg_file = runtime.RegisterFile(len(self.registers))
+        for i in range(len(self.registers)):
             reg_file.registers[i] = self.registers[i]
 
         interp = interpreter.DBSPInterpreter(reg_file, final_program)

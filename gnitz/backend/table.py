@@ -2,6 +2,7 @@
 from gnitz.backend.cursor import AbstractCursor
 from gnitz.core.types import TableSchema
 from gnitz.core.values import PayloadRow
+from gnitz.core.batch import ZSetBatch
 from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
 
 class AbstractTable(object):
@@ -33,19 +34,22 @@ class AbstractTable(object):
         """
         raise NotImplementedError
 
-    def ingest_batch(self, pks, weights, rows):
+    def ingest_batch(self, batch):
         """
         Ingests a batch of records into the table. 
         Implementations should override this to perform optimized batch 
         IO (e.g., single-LSN WAL blocks and group fsync).
         
-        pks: List[r_uint128]
-        weights: List[r_int64]
-        rows: List[PayloadRow]
+        batch: ZSetBatch (from gnitz.core.batch)
         """
         # Default implementation for backends not yet optimized for batching.
-        for i in range(len(pks)):
-            self.ingest(pks[i], weights[i], rows[i])
+        # Iterates over the batch using the public core.batch API.
+        for i in range(batch.length()):
+            self.ingest(
+                batch.get_pk(i), 
+                batch.get_weight(i), 
+                batch.get_row(i)
+            )
 
     def get_weight(self, key, payload):
         """

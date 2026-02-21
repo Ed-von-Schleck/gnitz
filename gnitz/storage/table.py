@@ -5,6 +5,7 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
 
+from gnitz.core.batch import make_singleton_batch
 from gnitz.core import types, errors, comparator as core_comparator, row_logic, strings as string_logic
 from gnitz.storage import (
     wal,
@@ -144,50 +145,43 @@ class PersistentTable(AbstractTable):
 
     def ingest(self, key, weight, payload):
         """
-        Single-record ingestion wrapper. Forwards to ingest_batch for 
-        unified LSN assignment logic.
+        Single-record ingestion. Now wraps the record in a singleton 
+        ZSetBatch to reuse the unified batch logic.
         """
-        pks = newlist_hint(1)
-        pks.append(r_uint128(key))
+        batch = make_singleton_batch(self.schema, r_uint128(key), weight, payload)
+        self.ingest_batch(batch)
 
-        weights = newlist_hint(1)
-        weights.append(weight)
-
-        rows = newlist_hint(1)
-        rows.append(payload)
-
-        self.ingest_batch(pks, weights, rows)
-
-    def ingest_batch(self, pks, weights, rows):
+    def ingest_batch(self, batch):
         """
-        Durable and visible Z-Set batch update.
+        Durable Z-Set batch update.
         Assigns one LSN to the entire batch (DBSP tick semantics).
         """
         if self.is_closed:
             raise errors.StorageError("Table is closed")
 
-        n = len(pks)
+        n = batch.length()
         if n == 0:
             return
 
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
 
-        # 1. Prep WAL records (filtering ghosts for throughput)
+        # 1. Prepare WAL records while updating MemTable
+        # Filtering ghosts (weight=0) is critical for throughput
         wal_records = newlist_hint(n)
         for i in range(n):
-            pk = pks[i]
-            w = weights[i]
-            row = rows[i]
+            pk = batch.get_pk(i)
+            w = batch.get_weight(i)
+            row = batch.get_row(i)
 
-            # Update in-memory state
+            # Update in-memory state (Ghost Property enforced here)
             self.memtable.upsert(pk, w, row)
 
-            # Prepare durability block (only for non-annihilated records)
+            # Prepare for durability (Ghost records are elided from WAL)
             if w != r_int64(0):
                 wal_records.append(wal_format.WALRecord(pk, w, row))
 
-        # 2. Write to WAL with single fsync (Durability)
+        # 2. Commit batch to WAL with a single fsync
         if len(wal_records) > 0:
             self.wal_writer.append_batch(lsn, self.table_id, wal_records)
 

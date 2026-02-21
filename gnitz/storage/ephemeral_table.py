@@ -15,6 +15,7 @@ from gnitz.storage import (
 )
 from gnitz.storage.memtable_node import node_get_weight, node_get_next_off
 from gnitz.backend.table import AbstractTable
+from gnitz.core.batch import make_singleton_batch
 
 
 class EphemeralTable(AbstractTable):
@@ -106,16 +107,15 @@ class EphemeralTable(AbstractTable):
     def ingest(self, key, weight, payload):
         """
         Direct ingestion into the MemTable, bypassing the WAL.
-        Each individual record receives a unique LSN.
+        Wraps single record in a ZSetBatch for unified logic.
         """
         if self.is_closed:
             raise errors.StorageError("EphemeralTable is closed")
 
-        # Advance LSN per record for standard ingestion
-        self.current_lsn += r_uint64(1)
-        self.memtable.upsert(r_uint128(key), weight, payload)
+        b = make_singleton_batch(self.schema, r_uint128(key), weight, payload)
+        self.ingest_batch(b)
 
-    def ingest_batch(self, pks, weights, rows):
+    def ingest_batch(self, batch):
         """
         Optimized batch ingestion for DBSP operators.
         Increments the LSN once for the entire batch (logical tick).
@@ -123,13 +123,18 @@ class EphemeralTable(AbstractTable):
         if self.is_closed:
             raise errors.StorageError("EphemeralTable is closed")
 
+        n = batch.length()
+        if n == 0:
+            return
+
         # Entire batch shares a single logical time increment
         self.current_lsn += r_uint64(1)
 
-        for i in range(len(pks)):
+        for i in range(n):
+            w = batch.get_weight(i)
             # Only ingest non-zero weights (Ghost Property enforcement)
-            if weights[i] != 0:
-                self.memtable.upsert(pks[i], weights[i], rows[i])
+            if w != 0:
+                self.memtable.upsert(batch.get_pk(i), w, batch.get_row(i))
 
     def get_weight(self, key, payload):
         """

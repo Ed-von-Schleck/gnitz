@@ -49,7 +49,7 @@ class DBSPInterpreter(object):
         reg0 = self.register_file.get_register(0)
         assert isinstance(reg0, runtime.DeltaRegister)
 
-        # Move input data into the circuit
+        # Move input data into the circuit. Note: input_batch is a ZSetBatch.
         for i in range(input_batch.length()):
             reg0.batch.append(
                 input_batch.get_pk(i),
@@ -71,6 +71,7 @@ class DBSPInterpreter(object):
 
             # Marshalling logic: Unpack instructions and pass components to ops.
             # This maintains a pure functional boundary for the operator layer.
+            # No operator logic (ops.op_*) ever sees an Instruction object.
 
             if opcode == instructions.Instruction.HALT:
                 break
@@ -93,8 +94,7 @@ class DBSPInterpreter(object):
 
             elif opcode == instructions.Instruction.DISTINCT:
                 assert isinstance(instr, instructions.DistinctOp)
-                # Note: instr.history_batch is no longer used; ops.op_distinct 
-                # now uses reg_in.batch for buffered history updates.
+                # op_distinct signature is now uniform: (reg_in, reg_history, reg_out)
                 ops.op_distinct(instr.reg_in, instr.reg_history, instr.reg_out)
 
             elif opcode == instructions.Instruction.JOIN_DELTA_TRACE:
@@ -111,6 +111,7 @@ class DBSPInterpreter(object):
 
             elif opcode == instructions.Instruction.INTEGRATE:
                 assert isinstance(instr, instructions.IntegrateOp)
+                # Pass both the register (delta source) and the table (persistent sink)
                 ops.op_integrate(instr.reg_in, instr.target_table)
 
             elif opcode == instructions.Instruction.REDUCE:

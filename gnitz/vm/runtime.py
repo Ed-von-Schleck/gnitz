@@ -3,7 +3,7 @@
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64
 from gnitz.core import types
-from gnitz.vm.batch import ZSetBatch
+from gnitz.core.batch import ZSetBatch
 
 class VMSchema(object):
     """
@@ -107,11 +107,11 @@ class TraceRegister(BaseRegister):
 
     def update_batch(self, batch):
         """
-        Updates the stateful trace with an incoming batch of deltas.
+        Updates the stateful trace with an incoming ZSetBatch.
+        Passes the core batch object directly to the storage boundary.
         """
         if self.table is not None:
-            # Unpack the ZSetBatch into the lists expected by AbstractTable
-            self.table.ingest_batch(batch._pks, batch._weights, batch._rows)
+            self.table.ingest_batch(batch)
 
 
 class RegisterFile(object):

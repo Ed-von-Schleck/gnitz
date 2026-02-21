@@ -23,7 +23,7 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 
 from gnitz.core import types
 from gnitz.core.values import make_payload_row
-from gnitz.vm.batch import ZSetBatch
+from gnitz.core.batch import ZSetBatch
 
 
 def _schema_u128_payload():

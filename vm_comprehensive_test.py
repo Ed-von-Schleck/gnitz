@@ -3,11 +3,11 @@
 import sys
 import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
-from gnitz.core import types, values, row_logic
+from gnitz.core import types, values, row_logic, batch
 from gnitz.vm import functions
 from gnitz.storage.table import PersistentTable
 from gnitz.core.row_logic import make_payload_row
-from gnitz.vm import batch, runtime, instructions, ops, interpreter, query
+from gnitz.vm import runtime, instructions, ops, interpreter, query
 
 
 class ComprehensiveFilter(functions.ScalarFunction):

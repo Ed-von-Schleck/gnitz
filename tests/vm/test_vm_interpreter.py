@@ -4,8 +4,8 @@ import unittest
 import os
 import shutil
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_int64
-from gnitz.core import types, values, strings
-from gnitz.vm import functions, batch, runtime, query
+from gnitz.core import types, values, strings, batch
+from gnitz.vm import functions, runtime, query
 from gnitz.storage.table import PersistentTable
 from tests.row_helpers import create_test_row
 

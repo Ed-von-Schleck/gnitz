@@ -15,18 +15,14 @@ def op_distinct(reg_in, reg_history, reg_out):
     delta_out = set_step(history + delta_in) - set_step(history)
 
     Logic:
-    1. Consolidate delta_in. This ensures that if the same record appears
-       multiple times in the input batch, we process the net change as a
-       single atomic update to the set status.
-    2. For each unique record in the consolidated batch:
-       a. Lookup current accumulated weight (W_old) in history.
-       b. S_old = 1 if W_old > 0 else 0
-       c. W_new = W_old + delta_weight
-       d. S_new = 1 if W_new > 0 else 0
-       e. Delta_weight_out = S_new - S_old
-       f. If Delta_weight_out != 0, emit to output.
-    3. Update the multiset history using the consolidated input batch in
-        a single high-throughput operation.
+    1. Consolidate delta_in to ensure each (PK, Payload) is unique per tick.
+    2. For each record in delta_in, lookup its current weight (W_old) in history.
+    3. S_old = 1 if W_old > 0 else 0
+    4. W_new = W_old + delta_weight
+    5. S_new = 1 if W_new > 0 else 0
+    6. Delta_weight_out = S_new - S_old
+    7. If Delta_weight_out != 0, emit the record to output_batch.
+    8. Batch-update history with the consolidated delta_in.
     """
     assert isinstance(reg_in, runtime.DeltaRegister)
     assert isinstance(reg_history, runtime.TraceRegister)
@@ -36,43 +32,45 @@ def op_distinct(reg_in, reg_history, reg_out):
     history = reg_history
     output_batch = reg_out.batch
 
-    # 1. Consolidate input to handle multiple updates per key in a single tick.
-    # This is critical for the set-status calculation logic below.
+    # 1. Algebraic Consolidation
+    # We MUST consolidate the input to ensure that if multiple updates for the
+    # same key/payload exist in one tick, they are summed before we check
+    # against the historical 'set' status.
     if not delta_batch.is_sorted():
         delta_batch.sort()
     delta_batch.consolidate()
 
+    # 2. Preparation
     output_batch.clear()
-
     n = delta_batch.length()
     if n == 0:
         return
 
+    # 3. Delta Computation Loop
     for i in range(n):
         key = delta_batch.get_pk(i)
         w_delta = delta_batch.get_weight(i)
         payload = delta_batch.get_row(i)
 
-        # 2. Retrieve the current accumulated weight from the history trace.
-        # Note: history.get_weight handles the case where table is None.
+        # Retrieve current accumulated weight from the trace/table
         w_old = history.get_weight(key, payload)
 
-        # 3. Calculate set status (signum) before update.
-        # DBSP Set semantics defines presence as weight > 0.
+        # Calculate set status before update (presence: weight > 0)
         s_old = 1 if w_old > r_int64(0) else 0
 
-        # 4. Calculate status after applying the net delta for this tick.
+        # Calculate status after applying the consolidated delta
         w_new = w_old + w_delta
         s_new = 1 if w_new > r_int64(0) else 0
 
-        # 5. Determine the change in set status (-1, 0, or 1).
+        # Determine set status change (-1, 0, or 1)
         out_w_val = s_new - s_old
 
         if out_w_val != 0:
-            # Emit the set-semantic delta to the output register.
+            # Emit set-semantic delta to the output stream
             output_batch.append(key, r_int64(out_w_val), payload)
 
-    # 6. High-throughput history update.
-    # We use the consolidated delta_batch directly. This avoids a separate
-    # scratch buffer and minimizes I/O calls to the EphemeralTable.
+    # 4. State Maintenance
+    # We update the history table using the consolidated input batch.
+    # This is the high-throughput path: EphemeralTable.ingest_batch
+    # will handle the in-memory ingestion as a single atomic operation.
     history.update_batch(delta_batch)
