@@ -2,14 +2,14 @@
 #
 # WAL (Write-Ahead Log) serialisation and deserialisation.
 #
-# This implementation has been refactored to use PayloadRow for non-PK columns.
-# TaggedValue and all TAG_* constants are eliminated. Column type dispatch
-# is performed via TableSchema.
+# This implementation uses a centralized Header View to prevent layout
+# regressions and width mismatches.
 
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_uint32, r_ulonglonglong as r_uint128
 from rpython.rlib.rarithmetic import intmask
 from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib import jit
 
 from gnitz.core import types, xxh, strings as string_logic, errors
 from gnitz.core.values import make_payload_row
@@ -17,15 +17,79 @@ from gnitz.storage import mmap_posix
 
 
 # ---------------------------------------------------------------------------
-# Record header byte offsets
+# WAL Block Header Geometry (Source of Truth)
 # ---------------------------------------------------------------------------
 
-_HDR_PK_OFFSET     =  0   # 16 bytes: primary key (u64 or u128)
-_HDR_WEIGHT_OFFSET = 16   #  8 bytes: algebraic weight
-_HDR_NULL_OFFSET   = 24   #  8 bytes: null bitmap (64 bits)
-_HDR_PAYLOAD_BASE  = 32   #  Fixed-stride payload starts here
-
+WAL_OFF_LSN       = 0   # u64: Log Sequence Number
+WAL_OFF_TID       = 8   # u32: Table ID
+WAL_OFF_COUNT     = 12  # u32: Entry Count
+WAL_OFF_SIZE      = 16  # u32: Total Block Size (header + body)
+WAL_OFF_RESERVED  = 20  # u32: Reserved padding
+WAL_OFF_CHECKSUM  = 24  # u64: XXH3-64 of the body
 WAL_BLOCK_HEADER_SIZE = 32
+
+
+# ---------------------------------------------------------------------------
+# Record header byte offsets (Internal to Block Body)
+# ---------------------------------------------------------------------------
+
+_REC_PK_OFFSET     =  0   # 16 bytes: primary key (u64 or u128)
+_REC_WEIGHT_OFFSET = 16   #  8 bytes: algebraic weight
+_REC_NULL_OFFSET   = 24   #  8 bytes: null bitmap (64 bits)
+_REC_PAYLOAD_BASE  = 32   #  Fixed-stride payload starts here
+
+
+# ---------------------------------------------------------------------------
+# WAL Block Header View
+# ---------------------------------------------------------------------------
+
+class WALBlockHeaderView(object):
+    """
+    Encapsulates WAL header layout. Provides type-safe accessors to prevent
+    the manual offset errors and width mismatches.
+    """
+    _immutable_fields_ = ["ptr"]
+
+    def __init__(self, ptr):
+        self.ptr = ptr
+
+    @jit.elidable
+    def get_lsn(self):
+        return _read_u64(self.ptr, WAL_OFF_LSN)
+
+    def set_lsn(self, lsn):
+        _write_u64(self.ptr, WAL_OFF_LSN, lsn)
+
+    @jit.elidable
+    def get_table_id(self):
+        return intmask(_read_u32(self.ptr, WAL_OFF_TID))
+
+    def set_table_id(self, tid):
+        _write_u32(self.ptr, WAL_OFF_TID, r_uint64(r_uint32(tid)))
+
+    @jit.elidable
+    def get_entry_count(self):
+        return intmask(_read_u32(self.ptr, WAL_OFF_COUNT))
+
+    def set_entry_count(self, count):
+        _write_u32(self.ptr, WAL_OFF_COUNT, r_uint64(r_uint32(count)))
+
+    @jit.elidable
+    def get_total_size(self):
+        return intmask(_read_u32(self.ptr, WAL_OFF_SIZE))
+
+    def set_total_size(self, size):
+        u32_size = r_uint32(size)
+        _write_u32(self.ptr, WAL_OFF_SIZE, r_uint64(u32_size))
+        _write_u32(self.ptr, WAL_OFF_RESERVED, r_uint64(0))
+
+    @jit.elidable
+    def get_checksum(self):
+        return _read_u64(self.ptr, WAL_OFF_CHECKSUM)
+
+    def set_checksum(self, cs):
+        _write_u64(self.ptr, WAL_OFF_CHECKSUM, cs)
+
 
 # ---------------------------------------------------------------------------
 # Buffer primitive readers (Raw Memory Access)
@@ -162,9 +226,9 @@ def decode_wal_record(schema, buf, base, heap_base):
     Decodes a single row-oriented record from the WAL buffer.
     Returns: (pk: r_uint128, weight: r_int64, row: PayloadRow)
     """
-    pk        = _read_u128(buf, base + _HDR_PK_OFFSET)
-    weight    = _read_i64 (buf, base + _HDR_WEIGHT_OFFSET)
-    null_word = _read_u64 (buf, base + _HDR_NULL_OFFSET)
+    pk        = _read_u128(buf, base + _REC_PK_OFFSET)
+    weight    = _read_i64 (buf, base + _REC_WEIGHT_OFFSET)
+    null_word = _read_u64 (buf, base + _REC_NULL_OFFSET)
 
     row = make_payload_row(schema)
     payload_col = 0
@@ -179,7 +243,7 @@ def decode_wal_record(schema, buf, base, heap_base):
             continue
 
         col_type   = schema.columns[i].field_type
-        col_offset = base + _HDR_PAYLOAD_BASE + schema.column_offsets[i]
+        col_offset = base + _REC_PAYLOAD_BASE + schema.column_offsets[i]
 
         code = col_type.code
         if code == types.TYPE_I64.code:
@@ -191,7 +255,6 @@ def decode_wal_record(schema, buf, base, heap_base):
         elif code == types.TYPE_I8.code:
             row.append_int(_read_i8(buf, col_offset))
         elif code == types.TYPE_U64.code:
-            # PayloadRow expects r_int64; bitcast from unsigned read
             row.append_int(rffi.cast(rffi.LONGLONG, _read_u64(buf, col_offset)))
         elif code == types.TYPE_U32.code:
             row.append_int(rffi.cast(rffi.LONGLONG, _read_u32(buf, col_offset)))
@@ -208,7 +271,6 @@ def decode_wal_record(schema, buf, base, heap_base):
         elif code == types.TYPE_U128.code:
             row.append_u128(_read_u64(buf, col_offset), _read_u64(buf, col_offset + 8))
         else:
-            # Default to i64 if type unknown
             row.append_int(_read_i64(buf, col_offset))
 
         payload_col += 1
@@ -225,9 +287,9 @@ def write_wal_record(schema, pk, weight, row, buf, base, heap_base):
     Encodes a PayloadRow into the WAL buffer at 'base'. 
     String bodies are written to 'heap_base'.
     """
-    _write_u128(buf, base + _HDR_PK_OFFSET,     pk)
-    _write_i64 (buf, base + _HDR_WEIGHT_OFFSET, weight)
-    _write_u64 (buf, base + _HDR_NULL_OFFSET,   row._null_word)
+    _write_u128(buf, base + _REC_PK_OFFSET,     pk)
+    _write_i64 (buf, base + _REC_WEIGHT_OFFSET, weight)
+    _write_u64 (buf, base + _REC_NULL_OFFSET,   row._null_word)
 
     heap_cursor = 0
     payload_col = 0
@@ -241,7 +303,7 @@ def write_wal_record(schema, pk, weight, row, buf, base, heap_base):
             continue
 
         col_type   = schema.columns[i].field_type
-        col_offset = base + _HDR_PAYLOAD_BASE + schema.column_offsets[i]
+        col_offset = base + _REC_PAYLOAD_BASE + schema.column_offsets[i]
         code = col_type.code
 
         if code == types.TYPE_STRING.code:
@@ -304,7 +366,7 @@ class WALBlock(object):
 
 def compute_record_size(schema, row):
     """Calculates the total size (fixed + variable) for a record."""
-    fixed_size = _HDR_PAYLOAD_BASE + schema.memtable_stride
+    fixed_size = _REC_PAYLOAD_BASE + schema.memtable_stride
     heap_size = 0
     payload_col = 0
     for i in range(len(schema.columns)):
@@ -326,7 +388,6 @@ def write_wal_block(fd, lsn, table_id, records, schema):
     entry_count = len(records)
     total_size = WAL_BLOCK_HEADER_SIZE
     
-    # Pre-calculate sizes to allocate a single buffer
     record_sizes = []
     for rec in records:
         f_sz, h_sz = compute_record_size(schema, rec.component_data)
@@ -335,11 +396,12 @@ def write_wal_block(fd, lsn, table_id, records, schema):
         
     buf = lltype.malloc(rffi.CCHARP.TO, total_size, flavor='raw')
     try:
-        # Header: LSN(8), TID(4), Count(4), TotalSize(8), Checksum(8)
-        _write_u64(buf, 0, r_uint64(lsn))
-        _write_u32(buf, 8, r_uint64(table_id))
-        _write_u32(buf, 12, r_uint64(entry_count))
-        _write_u64(buf, 16, r_uint64(total_size))
+        # Header Encapsulation
+        header = WALBlockHeaderView(buf)
+        header.set_lsn(r_uint64(lsn))
+        header.set_table_id(table_id)
+        header.set_entry_count(entry_count)
+        header.set_total_size(total_size)
         
         current_offset = WAL_BLOCK_HEADER_SIZE
         for i in range(entry_count):
@@ -361,12 +423,10 @@ def write_wal_block(fd, lsn, table_id, records, schema):
         body_size = total_size - WAL_BLOCK_HEADER_SIZE
         if body_size > 0:
             cs = xxh.compute_checksum(body_ptr, body_size)
-            _write_u64(buf, 24, cs)
+            header.set_checksum(cs)
         else:
-            _write_u64(buf, 24, r_uint64(0))
+            header.set_checksum(r_uint64(0))
             
-        # High-efficiency write using the mmap_posix C wrapper.
-        # This satisfies RPython constraints and eliminates string overhead.
         n = mmap_posix.write_c(fd, buf, rffi.cast(rffi.SIZE_T, total_size))
         if rffi.cast(lltype.Signed, n) < total_size:
             raise IOError("WAL write syscall failed or was incomplete")
@@ -376,32 +436,31 @@ def write_wal_block(fd, lsn, table_id, records, schema):
 
 def decode_wal_block(buf, total_size, schema):
     """Reconstructs a WALBlock from a raw memory buffer."""
-    lsn = _read_u64(buf, 0)
-    tid = intmask(_read_u32(buf, 8))
-    entry_count = intmask(_read_u32(buf, 12))
+    header = WALBlockHeaderView(buf)
+    
+    lsn = header.get_lsn()
+    tid = header.get_table_id()
+    entry_count = header.get_entry_count()
     
     # Verify Integrity
     body_ptr = rffi.ptradd(buf, WAL_BLOCK_HEADER_SIZE)
     body_size = total_size - WAL_BLOCK_HEADER_SIZE
-    expected_cs = _read_u64(buf, 24)
+    expected_cs = header.get_checksum()
     
     if body_size > 0:
         actual_cs = xxh.compute_checksum(body_ptr, body_size)
         if actual_cs != expected_cs:
-
             raise errors.CorruptShardError("WAL block checksum mismatch")
             
     records = []
     current_offset = WAL_BLOCK_HEADER_SIZE
     for i in range(entry_count):
-        # Determine fixed size for pointer math
-        f_sz = _HDR_PAYLOAD_BASE + schema.memtable_stride
+        f_sz = _REC_PAYLOAD_BASE + schema.memtable_stride
         heap_base = current_offset + f_sz
         
         pk, weight, row = decode_wal_record(schema, buf, current_offset, heap_base)
         records.append(WALRecord(pk, weight, row))
         
-        # Advance cursor by the actual serialized size
         _, h_sz = compute_record_size(schema, row)
         current_offset += f_sz + h_sz
         

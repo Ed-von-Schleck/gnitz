@@ -1,6 +1,14 @@
+# gnitz/vm/instructions.py
+
 from rpython.rlib import jit
 
 class Instruction(object):
+    """
+    Base class for VM Bytecode.
+    
+    Instructions are unpacked by the interpreter and passed into the 
+    gnitz.vm.ops layer as individual arguments.
+    """
     _immutable_fields_ = ['opcode']
     
     HALT             = 0
@@ -17,6 +25,10 @@ class Instruction(object):
 
     def __init__(self, opcode):
         self.opcode = opcode
+
+class HaltOp(Instruction):
+    def __init__(self):
+        Instruction.__init__(self, self.HALT)
 
 class FilterOp(Instruction):
     _immutable_fields_ = ['reg_in', 'reg_out', 'func']
@@ -50,6 +62,10 @@ class UnionOp(Instruction):
         self.reg_out = reg_out
 
 class DistinctOp(Instruction):
+    """
+    Identity: delta_out = set_step(history + delta_in) - set_step(history).
+    The history table is updated with the consolidated input batch.
+    """
     _immutable_fields_ = ['reg_in', 'reg_history', 'reg_out']
     def __init__(self, reg_in, reg_history, reg_out):
         Instruction.__init__(self, self.DISTINCT)
@@ -65,24 +81,6 @@ class JoinDeltaTraceOp(Instruction):
         self.reg_trace = reg_trace
         self.reg_out = reg_out
 
-class IntegrateOp(Instruction):
-    _immutable_fields_ = ['reg_in', 'target_table']
-    def __init__(self, reg_in, target_table):
-        Instruction.__init__(self, self.INTEGRATE)
-        self.reg_in = reg_in
-        self.target_table = target_table
-
-class DelayOp(Instruction):
-    _immutable_fields_ = ['reg_in', 'reg_out']
-    def __init__(self, reg_in, reg_out):
-        Instruction.__init__(self, self.DELAY)
-        self.reg_in = reg_in
-        self.reg_out = reg_out
-
-class HaltOp(Instruction):
-    def __init__(self):
-        Instruction.__init__(self, self.HALT)
-
 class JoinDeltaDeltaOp(Instruction):
     _immutable_fields_ = ['reg_a', 'reg_b', 'reg_out']
     def __init__(self, reg_a, reg_b, reg_out):
@@ -90,13 +88,18 @@ class JoinDeltaDeltaOp(Instruction):
         self.reg_a = reg_a
         self.reg_b = reg_b
         self.reg_out = reg_out
-        
+
 class ReduceOp(Instruction):
+    """
+    DBSP Aggregation. Requires both input/output delta registers and 
+    traces for historical state and retractions.
+    """
     _immutable_fields_ = [
         'reg_in', 'reg_trace_in', 'reg_trace_out', 
         'reg_out', 'group_by_cols[*]', 'agg_func', 'output_schema'
     ]
-    def __init__(self, reg_in, reg_trace_in, reg_trace_out, reg_out, group_by_cols, agg_func, output_schema):
+    def __init__(self, reg_in, reg_trace_in, reg_trace_out, reg_out, 
+                 group_by_cols, agg_func, output_schema):
         Instruction.__init__(self, self.REDUCE)
         self.reg_in = reg_in
         self.reg_trace_in = reg_trace_in
@@ -106,3 +109,18 @@ class ReduceOp(Instruction):
         self.agg_func = agg_func
         self.output_schema = output_schema
 
+class IntegrateOp(Instruction):
+    """Terminal sink that persists a delta register to a Table."""
+    _immutable_fields_ = ['reg_in', 'target_table']
+    def __init__(self, reg_in, target_table):
+        Instruction.__init__(self, self.INTEGRATE)
+        self.reg_in = reg_in
+        self.target_table = target_table
+
+class DelayOp(Instruction):
+    """The z^-1 operator for recursive CTEs and temporal state."""
+    _immutable_fields_ = ['reg_in', 'reg_out']
+    def __init__(self, reg_in, reg_out):
+        Instruction.__init__(self, self.DELAY)
+        self.reg_in = reg_in
+        self.reg_out = reg_out

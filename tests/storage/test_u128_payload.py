@@ -129,19 +129,18 @@ class TestU128NonPKRoundTrip(unittest.TestCase):
         self.assertGreater(os.path.getsize(wal_file), 0)
 
     def test_annihilation_with_u128_payload(self):
-        """Insert then delete: verify memtable contains both weighted entries."""
+        """Insert then delete the same row: Ghost Property must annihilate it."""
         db = PersistentTable(self.db_path, "t", self.schema)
         try:
             pk = 5
             row = _uuid_row(self.schema, 0xABCDEF0123456789, 0xFEDCBA9876543210, "ghost")
 
             db.insert(pk, row)
-            db.delete(pk, row) # Updated from 'remove' to 'delete'
+            db.delete(pk, row)
 
-            self.assertEqual(db.memtable_entry_count(), 2)
+            self.assertEqual(db.memtable_entry_count(), 0)
             entries = db.flush_memtable()
-            self.assertEqual(entries[0].weight, 1)
-            self.assertEqual(entries[1].weight, -1)
+            self.assertEqual(len(entries), 0)
         finally:
             db.close()
 

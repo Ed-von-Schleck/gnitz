@@ -7,7 +7,7 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.core import types, values, strings, xxh
 from gnitz.core.values import make_payload_row
 from gnitz.core.comparator import PayloadRowAccessor
-from gnitz.vm import instructions, runtime
+from gnitz.vm import runtime
 
 
 @jit.unroll_safe
@@ -123,30 +123,37 @@ def _copy_group_cols(input_accessor, input_schema, output_row, col_indices):
             output_row.append_int(r_int64(intmask(input_accessor.get_int(c_idx))))
 
 
-def op_reduce(instr):
+def op_reduce(
+    reg_in, reg_trace_in, reg_trace_out, reg_out, 
+    group_by_cols, agg_func, output_schema
+):
     """
     Incremental DBSP REDUCE: δout = Agg(I + δin) - Agg(I).
-    """
-    assert isinstance(instr, instructions.ReduceOp)
     
-    reg_in = instr.reg_in
+    This operator implements the incremental aggregation logic by:
+    1. Grouping incoming deltas by the specified columns.
+    2. Looking up the current aggregate state (retraction).
+    3. Computing the updated aggregate state (insertion).
+    """
     assert isinstance(reg_in, runtime.DeltaRegister)
     delta_in = reg_in.batch
     if delta_in.length() == 0:
         return
 
-    reg_out = instr.reg_out
     assert isinstance(reg_out, runtime.DeltaRegister)
     out_batch = reg_out.batch
     out_batch.clear()
 
-    input_schema = instr.reg_in.vm_schema.table_schema
-    output_schema = instr.output_schema
-    agg_func = instr.agg_func
-    group_cols = instr.group_by_cols
+    input_schema = reg_in.vm_schema.table_schema
+    
+    # 1. First, ensure the input delta is consolidated so we have net 
+    # weights per (PK, Payload) before we group by the aggregate columns.
+    if not delta_in.is_sorted():
+        delta_in.sort()
+    delta_in.consolidate()
 
-    # 1. Sort the delta by group columns to process in batches
-    sorted_indices = _argsort_delta(delta_in, input_schema, group_cols)
+    # 2. Sort the delta by group columns to process group boundaries
+    sorted_indices = _argsort_delta(delta_in, input_schema, group_by_cols)
     
     acc_in = PayloadRowAccessor(input_schema)
     acc_exemplar = PayloadRowAccessor(input_schema)
@@ -160,67 +167,72 @@ def op_reduce(instr):
         
         # Set the exemplar accessor to the start of this group
         acc_exemplar.set_row(delta_in.get_row(group_start_idx))
-        group_key = _extract_group_key(acc_exemplar, input_schema, group_cols)
+        group_key = _extract_group_key(acc_exemplar, input_schema, group_by_cols)
 
-        # 2. Reset aggregator and fold the Delta portion for this group
+        # 3. Reset aggregator and fold the Delta portion for this group
         agg_func.reset()
         while idx < n:
             curr_idx = sorted_indices[idx]
             acc_in.set_row(delta_in.get_row(curr_idx))
             
             # Check for group boundary by comparing current to group exemplar
-            if _compare_by_cols(acc_in, acc_exemplar, input_schema, group_cols) != 0:
+            if _compare_by_cols(acc_in, acc_exemplar, input_schema, group_by_cols) != 0:
                 break
             
             agg_func.step(acc_in, delta_in.get_weight(curr_idx))
             idx += 1
         
-        # 3. Handle Retraction: Emit -Agg(I) if history exists
-        instr.reg_trace_out.cursor.seek(group_key)
+        # 4. Handle Retraction: Emit -Agg(I) if history exists in output trace
+        # reg_trace_out contains the current aggregates.
+        trace_out_cursor = reg_trace_out.cursor
+        trace_out_cursor.seek(group_key)
+        
         has_old = False
-        if instr.reg_trace_out.cursor.is_valid() and instr.reg_trace_out.cursor.key() == group_key:
+        if trace_out_cursor.is_valid() and trace_out_cursor.key() == group_key:
             has_old = True
-            old_row_accessor = instr.reg_trace_out.cursor.get_accessor()
+            old_row_accessor = trace_out_cursor.get_accessor()
             
             retract_row = make_payload_row(output_schema)
-            # Use exemplar to ensure group columns are copied from the correct record
-            _copy_group_cols(acc_exemplar, input_schema, retract_row, group_cols)
+            _copy_group_cols(acc_exemplar, input_schema, retract_row, group_by_cols)
             
+            # Agg result is the last column in the output schema
             agg_col_idx = len(output_schema.columns) - 1
             old_val_bits = old_row_accessor.get_int(agg_col_idx)
             retract_row.append_int(r_int64(intmask(old_val_bits)))
             
             out_batch.append(group_key, r_int64(-1), retract_row)
 
-        # 4. Compute New Aggregate: Agg(I + δin)
+        # 5. Compute New Aggregate: Agg(I + δin)
         if agg_func.is_linear() and has_old:
-            old_row_accessor = instr.reg_trace_out.cursor.get_accessor()
-            agg_col_idx = len(output_schema.columns) - 1
-            old_val_bits = old_row_accessor.get_int(agg_col_idx)
+            # OPTIMIZATION: Agg(Old + Delta) = Agg(Old) + Agg(Delta)
+            # old_val_bits was already fetched in step 4
             agg_func.merge_accumulated(old_val_bits, r_int64(1))
             
         elif not agg_func.is_linear():
-            # NON-LINEAR (MIN/MAX): Rescan historical trace and apply current delta group
+            # NON-LINEAR (e.g., MIN/MAX): Must rescan full history for this key.
+            # reg_trace_in contains the multiset history of the input stream.
             agg_func.reset()
-            trace_in = instr.reg_trace_in.cursor
+            trace_in = reg_trace_in.cursor
             trace_in.seek(group_key)
             while trace_in.is_valid() and trace_in.key() == group_key:
                 agg_func.step(trace_in.get_accessor(), trace_in.weight())
                 trace_in.advance()
                 
-            # Iterate using sorted positions (group_start_pos to current idx)
+            # Now apply the current delta on top of that history
             for k in range(group_start_pos, idx):
                 d_idx = sorted_indices[k]
                 acc_in.set_row(delta_in.get_row(d_idx))
                 agg_func.step(acc_in, delta_in.get_weight(d_idx))
 
-        # 5. Emit Insertion (+1) of the new aggregate
+        # 6. Emit Insertion (+1) of the updated aggregate
         if not agg_func.is_accumulator_zero():
             insert_row = make_payload_row(output_schema)
-            _copy_group_cols(acc_exemplar, input_schema, insert_row, group_cols)
+            _copy_group_cols(acc_exemplar, input_schema, insert_row, group_by_cols)
             
             agg_func.emit(insert_row)
             out_batch.append(group_key, r_int64(1), insert_row)
 
+    # Consolidate the output to remove any internal retractions/insertions 
+    # that might have cancelled each other out.
     out_batch.sort()
     out_batch.consolidate()

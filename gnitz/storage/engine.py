@@ -2,8 +2,9 @@
 
 import os
 import errno
-from rpython.rlib.rarithmetic import r_uint64
+from rpython.rlib.rarithmetic import r_uint64, r_int64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
+from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.storage.cursor import MemTableCursor, ShardCursor, UnifiedCursor
 from gnitz.storage.memtable import MemTable
@@ -62,7 +63,6 @@ class Engine(object):
             self.current_lsn = r_uint64(1)
 
         # The LSN where the current MemTable began.
-        # This defines the lower bound for the next shard.
         self.starting_lsn = self.current_lsn
 
         # Recover uncommitted state from WAL (Volatile High-Water Mark)
@@ -71,26 +71,44 @@ class Engine(object):
         
     def ingest(self, key, weight, row):
         """
-        Ingests a Z-Set delta into the system.
+        Ingests a single Z-Set delta. 
+        Note: For high-velocity ingestion, use ingest_batch.
+        """
+        # Create single-element lists to reuse the optimized batch path
+        keys = [r_uint128(key)]
+        weights = [weight]
+        rows = [row]
+        self.ingest_batch(keys, weights, rows)
+
+    def ingest_batch(self, pks, weights, rows):
+        """
+        Ingests a batch of Z-Set deltas as a single atomic DBSP tick.
         
         Args:
-            key: The Primary Key (u64 or u128).
-            weight: The algebraic weight (int64).
-            row: PayloadRow representing the row payload.
+            pks: List[r_uint128]
+            weights: List[r_int64]
+            rows: List[PayloadRow]
         """
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
-        
+
         # 1. Write-Ahead Log (Durability)
         if self.wal_writer:
-            # WALRecord handles PayloadRow serialization in wal_format
-            rec = WALRecord(r_uint128(key), weight, row)
-            # Use append_block to match WALWriter API and PersistentTable pattern
-            self.wal_writer.append_block(lsn, self.table_id, [rec])
+            count = len(pks)
+            # Use newlist_hint to satisfy RPython resizability constraints
+            wal_records = newlist_hint(count)
+            for i in range(count):
+                w = weights[i]
+                # Only log records that contribute state (Ghost Property)
+                if w != r_int64(0):
+                    wal_records.append(WALRecord(pks[i], w, rows[i]))
+            
+            if len(wal_records) > 0:
+                self.wal_writer.append_batch(lsn, self.table_id, wal_records)
             
         # 2. Update In-Memory State (Visibility)
-        # MemTable.upsert is schema-aware and handles PayloadRow appending.
-        self.active_table.upsert(r_uint128(key), weight, row)
+        for i in range(len(pks)):
+            self.active_table.upsert(pks[i], weights[i], rows[i])
 
     def recover_from_wal(self, filename):
         """Reconstructs MemTable state by replaying Z-Set deltas from the WAL."""
@@ -112,7 +130,6 @@ class Engine(object):
                 
                 last_recovered_lsn = block.lsn
                 for rec in block.records:
-                    # WALReader.read_next_block returns WALRecord with PayloadRow
                     self.active_table.upsert(rec.get_key(), rec.weight, rec.component_data)
             
             self.current_lsn = last_recovered_lsn + r_uint64(1)
@@ -125,27 +142,21 @@ class Engine(object):
         """
         Calculates the net algebraic weight of a record across all layers.
         Identity: W_net = W_mem + sum(W_shards)
-        
-        Args:
-            key: Primary Key
-            row: PayloadRow
         """
         r_key = r_uint128(key)
         
         # 1. Check mutable layer (MemTable)
-        mem_weight = 0
+        mem_weight = r_int64(0)
         table = self.active_table
         
-        # Exact match logic in MemTable handles PayloadRow comparison
         match_off = table._find_exact_values(r_key, row)
         if match_off != 0:
             mem_weight = node_get_weight(table.arena.base_ptr, match_off)
 
         # 2. Check persistent layer (ShardIndex)
-        spine_weight = 0
+        spine_weight = r_int64(0)
         results = self.index.find_all_shards_and_indices(r_key)
         
-        # Setup accessors for semantic payload comparison
         self.value_accessor.set_row(row)
         is_u128 = self.schema.get_pk_column().field_type.size == 16
         
@@ -163,8 +174,6 @@ class Engine(object):
                     break 
                 
                 self.soa_accessor.set_row(view, curr_idx)
-                
-                # Full row semantic comparison
                 if core_comparator.compare_rows(self.schema, self.soa_accessor, self.value_accessor) == 0:
                     spine_weight += shard_handle.view.get_weight(curr_idx)
                     break
@@ -176,12 +185,8 @@ class Engine(object):
     def flush_and_rotate(self, filename):
         """
         Transitions MemTable to an immutable Shard.
-        1. Writes MemTable to N-Partition file (if not empty).
-        2. Updates Index and Manifest atomically.
-        3. Frees old MemTable memory and allocates a new one.
         """
         if self.current_lsn == self.starting_lsn:
-            # MemTable is empty
             self.active_table.free()
             self.active_table = MemTable(self.schema, self.memtable_capacity)
             return self.index.needs_compaction
@@ -189,10 +194,8 @@ class Engine(object):
         lsn_max = self.current_lsn - r_uint64(1)
         lsn_min = self.starting_lsn
         
-        # 1. Materialize MemTable to columnar file (AoS to SoA transmutation)
         self.active_table.flush(filename, self.table_id)
         
-        # 2. Register the new shard with the Unified Index
         if os.path.exists(filename):
             new_handle = index.ShardHandle(
                 filename, 
@@ -204,13 +207,10 @@ class Engine(object):
             
             if new_handle.view.count > 0:
                 self.index.add_handle(new_handle)
-                
-                # 3. Synchronize Manifest with the updated Index state.
                 if self.manifest_manager:
                     manifest_entries = self.index.get_metadata_list()
                     self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
             else:
-                # Ghost-only shard, discard
                 new_handle.close()
                 try:
                     os.unlink(filename)
@@ -220,20 +220,14 @@ class Engine(object):
                     manifest_entries = self.index.get_metadata_list()
                     self.manifest_manager.publish_new_version(manifest_entries, lsn_max)
 
-        # 4. Rotate Memory
         self.active_table.free()
         self.active_table = MemTable(self.schema, self.memtable_capacity)
-        
-        # 5. Advance Epoch Tracking
         self.starting_lsn = self.current_lsn
         
         return self.index.needs_compaction
 
     def open_trace_cursor(self):
-        """
-        Returns a UnifiedCursor representing the current net state 
-        of the table (MemTable + Shards).
-        """
+        """Returns a UnifiedCursor for the current net state."""
         cs = []
         cs.append(MemTableCursor(self.active_table))
         for i in range(len(self.index.handles)):

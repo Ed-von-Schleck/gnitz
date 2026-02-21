@@ -1,29 +1,55 @@
 # gnitz/backend/table.py
 from gnitz.backend.cursor import AbstractCursor
 from gnitz.core.types import TableSchema
+from gnitz.core.values import PayloadRow
+from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
 
 class AbstractTable(object):
     """
     The complete write+read interface the VM requires from any persistent Z-Set.
     """
     def get_schema(self):
-        # → TableSchema
+        """Returns the TableSchema defining the physical layout."""
+        # -> TableSchema
         raise NotImplementedError
 
     def create_cursor(self):
-        # → AbstractCursor
+        """Creates a cursor for reading the current net state of the table."""
+        # -> AbstractCursor
         raise NotImplementedError
 
     def create_scratch_table(self, name, schema):
-        # → AbstractTable
-        # Creates a compatible internal table for VM operator state.
-        # The implementation decides where/how to persist it.
+        """
+        Creates a compatible internal table for VM operator state (Traces).
+        The implementation decides where/how to persist it (e.g. EphemeralTable).
+        """
+        # -> AbstractTable
         raise NotImplementedError
 
     def ingest(self, key, weight, payload):
-        # key: r_uint128, weight: r_int64, payload: List[TaggedValue]
+        """
+        Ingests a single record into the table.
+        key: r_uint128, weight: r_int64, payload: PayloadRow
+        """
         raise NotImplementedError
 
+    def ingest_batch(self, pks, weights, rows):
+        """
+        Ingests a batch of records into the table. 
+        Implementations should override this to perform optimized batch 
+        IO (e.g., single-LSN WAL blocks and group fsync).
+        
+        pks: List[r_uint128]
+        weights: List[r_int64]
+        rows: List[PayloadRow]
+        """
+        # Default implementation for backends not yet optimized for batching.
+        for i in range(len(pks)):
+            self.ingest(pks[i], weights[i], rows[i])
+
     def get_weight(self, key, payload):
-        # → r_int64
+        """
+        Returns the net algebraic weight for a specific record.
+        key: r_uint128, payload: PayloadRow -> r_int64
+        """
         raise NotImplementedError

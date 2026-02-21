@@ -69,7 +69,9 @@ class DBSPInterpreter(object):
             instr = program[pc]
             opcode = instr.opcode
 
-            # Dispatch logic: calls into the gnitz.vm.ops package
+            # Marshalling logic: Unpack instructions and pass components to ops.
+            # This maintains a pure functional boundary for the operator layer.
+
             if opcode == instructions.Instruction.HALT:
                 break
 
@@ -91,6 +93,8 @@ class DBSPInterpreter(object):
 
             elif opcode == instructions.Instruction.DISTINCT:
                 assert isinstance(instr, instructions.DistinctOp)
+                # Note: instr.history_batch is no longer used; ops.op_distinct 
+                # now uses reg_in.batch for buffered history updates.
                 ops.op_distinct(instr.reg_in, instr.reg_history, instr.reg_out)
 
             elif opcode == instructions.Instruction.JOIN_DELTA_TRACE:
@@ -111,6 +115,15 @@ class DBSPInterpreter(object):
 
             elif opcode == instructions.Instruction.REDUCE:
                 assert isinstance(instr, instructions.ReduceOp)
-                ops.op_reduce(instr)
+                # Fully decomposed signature to keep ops.op_reduce uniform.
+                ops.op_reduce(
+                    instr.reg_in,
+                    instr.reg_trace_in,
+                    instr.reg_trace_out,
+                    instr.reg_out,
+                    instr.group_by_cols,
+                    instr.agg_func,
+                    instr.output_schema
+                )
 
             pc += 1

@@ -99,11 +99,19 @@ class TraceRegister(BaseRegister):
         return self.table.get_weight(key, payload)
 
     def update_weight(self, key, delta, payload):
-        """Updates the stateful trace with an incoming delta."""
+        """Updates the stateful trace with an incoming delta (single record)."""
         if self.table is not None:
             # Performs an immediate in-memory ingestion into the trace's 
             # backing table to maintain consistency for the current batch.
             self.table.ingest(key, delta, payload)
+
+    def update_batch(self, batch):
+        """
+        Updates the stateful trace with an incoming batch of deltas.
+        """
+        if self.table is not None:
+            # Unpack the ZSetBatch into the lists expected by AbstractTable
+            self.table.ingest_batch(batch._pks, batch._weights, batch._rows)
 
 
 class RegisterFile(object):
