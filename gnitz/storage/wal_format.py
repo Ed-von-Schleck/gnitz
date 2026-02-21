@@ -13,6 +13,7 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types
 from gnitz.core.values import make_payload_row
+from gnitz.storage import mmap_posix
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +320,6 @@ def compute_record_size(schema, row):
 
 def write_wal_block(fd, lsn, table_id, records, schema):
     """Serialises a list of WALRecords into a block and writes to fd."""
-    import os
     entry_count = len(records)
     total_size = WAL_BLOCK_HEADER_SIZE
     
@@ -363,14 +363,11 @@ def write_wal_block(fd, lsn, table_id, records, schema):
         else:
             _write_u64(buf, 24, r_uint64(0))
             
-        # Manual write syscall loop
-        written = 0
-        while written < total_size:
-            ptr = rffi.ptradd(buf, written)
-            n = os.write(fd, rffi.charpsize2str(ptr, total_size - written))
-            if n <= 0:
-                raise IOError("WAL write syscall failed")
-            written += n
+        # High-efficiency write using the mmap_posix C wrapper.
+        # This satisfies RPython constraints and eliminates string overhead.
+        n = mmap_posix.write_c(fd, buf, rffi.cast(rffi.SIZE_T, total_size))
+        if rffi.cast(lltype.Signed, n) < total_size:
+            raise IOError("WAL write syscall failed or was incomplete")
     finally:
         lltype.free(buf, flavor='raw')
 

@@ -46,8 +46,6 @@ class Engine(object):
         self.validate_checksums = validate_checksums
         
         # Pre-allocate accessors to avoid allocation in hot read/merge loops.
-        # Fixed: value_accessor now correctly uses core_comparator.ValueAccessor
-        # (which is the PayloadRowAccessor) to bridge PayloadRow objects.
         self.value_accessor = core_comparator.ValueAccessor(self.schema)
         # soa_accessor is used for reading from ShardView (SoA format).
         self.soa_accessor = storage_comparator.SoAAccessor(self.schema)
@@ -87,7 +85,8 @@ class Engine(object):
         if self.wal_writer:
             # WALRecord handles PayloadRow serialization in wal_format
             rec = WALRecord(r_uint128(key), weight, row)
-            self.wal_writer.write_record(lsn, self.table_id, rec)
+            # Use append_block to match WALWriter API and PersistentTable pattern
+            self.wal_writer.append_block(lsn, self.table_id, [rec])
             
         # 2. Update In-Memory State (Visibility)
         # MemTable.upsert is schema-aware and handles PayloadRow appending.
@@ -235,8 +234,6 @@ class Engine(object):
         Returns a UnifiedCursor representing the current net state 
         of the table (MemTable + Shards).
         """
-        # We must use list.append to avoid Type Unification errors in the RPython 
-        # annotator between BaseCursor and Optional[BaseCursor].
         cs = []
         cs.append(MemTableCursor(self.active_table))
         for i in range(len(self.index.handles)):
