@@ -44,58 +44,62 @@ class BaseCursor(object):
         raise NotImplementedError
 
 
-class MemTableCursor(BaseCursor):
-    _immutable_fields_ = ["memtable", "schema", "is_u128", "key_size", "accessor"]
+
+class MemTableCursor(AbstractCursor):
+    """
+    SkipList cursor for the MemTable.
+    Implements the AbstractCursor interface for the DBSP VM.
+    """
+    _immutable_fields_ = ["memtable", "schema", "key_size", "accessor"]
 
     def __init__(self, memtable):
-        BaseCursor.__init__(self)
         self.memtable = memtable
         self.schema = memtable.schema
         self.key_size = memtable.key_size
-        self.is_u128 = self.key_size == 16
         self.current_node_off = 0
-        self.exhausted = True
+        # Pre-allocate accessor for zero-allocation iteration
         self.accessor = comparator.PackedNodeAccessor(
             self.schema, memtable.blob_arena.base_ptr
         )
 
-    def get_row_accessor(self):
-        return self.accessor
-
     def seek(self, target_key):
-        self.current_node_off = self.memtable._lower_bound_node(target_key)
-        self.exhausted = self.current_node_off == 0
-        if not self.exhausted:
-            self.accessor.set_row(self.memtable.arena.base_ptr, self.current_node_off)
+        """Finds the first SkipList node >= target_key."""
+        # Fixed: Using the public API restored in Step 6
+        self.current_node_off = self.memtable.lower_bound_node(target_key)
 
     def advance(self):
+        """Moves to the next node in the SkipList."""
         if self.current_node_off != 0:
             base = self.memtable.arena.base_ptr
             self.current_node_off = node_get_next_off(base, self.current_node_off, 0)
-        self.exhausted = self.current_node_off == 0
-        if not self.exhausted:
-            self.accessor.set_row(self.memtable.arena.base_ptr, self.current_node_off)
+
+    def is_valid(self):
+        """Returns True if the cursor is pointing at a valid node."""
+        return self.current_node_off != 0
 
     def key(self):
-        if self.exhausted:
-            return r_uint128(-1)
+        """Returns the Primary Key of the current node or MAX_UINT128 if invalid."""
+        if self.current_node_off == 0:
+            return r_uint128(-1)  # Sentinel for Tournament Tree merges
         return node_get_key(
             self.memtable.arena.base_ptr, self.current_node_off, self.key_size
         )
 
     def weight(self):
-        if self.exhausted:
+        """Returns the algebraic weight of the current node."""
+        if self.current_node_off == 0:
             return r_int64(0)
         return node_get_weight(self.memtable.arena.base_ptr, self.current_node_off)
 
-    def is_valid(self):
-        return not self.exhausted
+    def get_accessor(self):
+        """Sets the state of the pre-allocated accessor and returns it."""
+        # We only call this when valid (enforced by VM/TournamentTree)
+        self.accessor.set_row(self.memtable.arena.base_ptr, self.current_node_off)
+        return self.accessor
 
-    def is_exhausted(self):
-        return self.exhausted
-
-    def peek_key(self):
-        return self.key()
+    def close(self):
+        """No-op for in-memory cursors."""
+        pass
 
 
 class ShardCursor(BaseCursor):
@@ -107,7 +111,6 @@ class ShardCursor(BaseCursor):
         self.schema = shard_view.schema
         self.is_u128 = self.schema.get_pk_column().field_type == types.TYPE_U128
         self.position = 0
-        self.exhausted = False
         self.accessor = comparator.SoAAccessor(self.schema)
         self._skip_ghosts()
 
@@ -117,39 +120,38 @@ class ShardCursor(BaseCursor):
     def _skip_ghosts(self):
         while self.position < self.view.count:
             if self.view.get_weight(self.position) != 0:
-                self.exhausted = False
                 self.accessor.set_row(self.view, self.position)
                 return
             self.position += 1
-        self.exhausted = True
 
     def seek(self, target_key):
         self.position = self.view.find_lower_bound(target_key)
         self._skip_ghosts()
 
     def advance(self):
-        if self.exhausted:
+        if not self.is_valid():
             return
         self.position += 1
         self._skip_ghosts()
 
     def key(self):
-        if self.exhausted:
+        if not self.is_valid():
             return r_uint128(-1)
         if self.is_u128:
             return self.view.get_pk_u128(self.position)
         return r_uint128(self.view.get_pk_u64(self.position))
 
     def weight(self):
-        if self.exhausted:
+        if not self.is_valid():
             return r_int64(0)
         return self.view.get_weight(self.position)
 
     def is_valid(self):
-        return not self.exhausted
-
+        return self.position < self.view.count
+    
+    # Optional: Keep the old one as an alias during transition
     def is_exhausted(self):
-        return self.exhausted
+        return not self.is_valid()
 
     def peek_key(self):
         return self.key()

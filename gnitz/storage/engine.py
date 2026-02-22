@@ -74,11 +74,14 @@ class Engine(object):
         Ingests a single Z-Set delta. 
         Note: For high-velocity ingestion, use ingest_batch.
         """
-        # Create single-element lists to reuse the optimized batch path
-        keys = [r_uint128(key)]
-        weights = [weight]
-        rows = [row]
-        self.ingest_batch(keys, weights, rows)
+        # Fix: Avoid mr-poisoning by using newlist_hint instead of literals
+        pks = newlist_hint(1)
+        pks.append(r_uint128(key))
+        weights = newlist_hint(1)
+        weights.append(weight)
+        rows = newlist_hint(1)
+        rows.append(row)
+        self.ingest_batch(pks, weights, rows)
 
     def ingest_batch(self, pks, weights, rows):
         """
@@ -108,14 +111,24 @@ class Engine(object):
             
         # 2. Update In-Memory State (Visibility)
         for i in range(len(pks)):
-            self.active_table.upsert(pks[i], weights[i], rows[i])
+            w = weights[i]
+            # Ghost Property: Algebraic annihilation prevents zero-weight records
+            # from consuming Arena memory or SkipList nodes.
+            if w != r_int64(0):
+                self.active_table.upsert(pks[i], w, rows[i])
 
     def recover_from_wal(self, filename):
-        """Reconstructs MemTable state by replaying Z-Set deltas from the WAL."""
+        """
+        Reconstructs MemTable state by replaying Z-Set deltas from the WAL.
+        Utilizes zero-copy recovery path for high startup performance.
+        """
+        if not os.path.exists(filename):
+            return
+
         try:
             reader = wal.WALReader(filename, self.schema)
             # Volatile state starts after what is already persisted in Shards
-            max_lsn_seen = self.current_lsn - r_uint64(1)
+            max_lsn_seen = self.starting_lsn - r_uint64(1)
             last_recovered_lsn = max_lsn_seen
             
             while True:
@@ -123,16 +136,26 @@ class Engine(object):
                 if block is None: 
                     break
                 
-                if block.tid != self.table_id: 
-                    continue
-                if block.lsn <= max_lsn_seen: 
-                    continue
-                
-                last_recovered_lsn = block.lsn
-                for rec in block.records:
-                    self.active_table.upsert(rec.get_key(), rec.weight, rec.component_data)
+                try:
+                    # Check TID and LSN to determine if this block belongs to us
+                    if block.tid != self.table_id or block.lsn <= max_lsn_seen: 
+                        continue
+                    
+                    if block.lsn > last_recovered_lsn:
+                        last_recovered_lsn = block.lsn
+
+                    for rec in block.records:
+                        # Optimized zero-copy path: moves bytes from WAL buffer directly
+                        # to MemTable node without intermediate PayloadRow objects.
+                        self.active_table.upsert_raw(rec.pk, rec.weight, rec)
+                finally:
+                    # CRITICAL: Free the block's raw buffer after records are ingested
+                    block.free()
             
-            self.current_lsn = last_recovered_lsn + r_uint64(1)
+            # Update high-water mark so subsequent writes use the correct LSN sequence
+            if last_recovered_lsn >= self.current_lsn:
+                self.current_lsn = last_recovered_lsn + r_uint64(1)
+            
             reader.close()
         except OSError as e:
             if e.errno != errno.ENOENT:
@@ -176,7 +199,6 @@ class Engine(object):
                 self.soa_accessor.set_row(view, curr_idx)
                 if core_comparator.compare_rows(self.schema, self.soa_accessor, self.value_accessor) == 0:
                     spine_weight += shard_handle.view.get_weight(curr_idx)
-                    break
                 
                 curr_idx += 1
                 
@@ -187,8 +209,6 @@ class Engine(object):
         Transitions MemTable to an immutable Shard.
         """
         if self.current_lsn == self.starting_lsn:
-            self.active_table.free()
-            self.active_table = MemTable(self.schema, self.memtable_capacity)
             return self.index.needs_compaction
 
         lsn_max = self.current_lsn - r_uint64(1)
@@ -228,9 +248,12 @@ class Engine(object):
 
     def open_trace_cursor(self):
         """Returns a UnifiedCursor for the current net state."""
-        cs = []
+        # Fix: Avoid mr-poisoning by using newlist_hint
+        num_shards = len(self.index.handles)
+        cs = newlist_hint(1 + num_shards)
+        
         cs.append(MemTableCursor(self.active_table))
-        for i in range(len(self.index.handles)):
+        for i in range(num_shards):
             cs.append(ShardCursor(self.index.handles[i].view))
             
         return UnifiedCursor(self.schema, cs)

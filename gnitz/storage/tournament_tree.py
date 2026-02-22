@@ -36,7 +36,7 @@ class TournamentTree(object):
         self.heap_size = 0
         for i in range(self.num_cursors):
             cursor = self.cursors[i]
-            if not cursor.is_exhausted():
+            if cursor.is_valid():
                 idx = self.heap_size
                 self.heap_size += 1
                 key = cursor.peek_key()

@@ -6,7 +6,8 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core.batch import make_singleton_batch
-from gnitz.core import types, errors, comparator as core_comparator, row_logic, strings as string_logic
+from gnitz.core import types, errors, row_logic, strings as string_logic
+from gnitz.core import comparator as core_comparator
 from gnitz.storage import (
     wal,
     index,
@@ -105,15 +106,11 @@ class PersistentTable(AbstractTable):
     # -------------------------------------------------------------------------
 
     def get_schema(self):
-        """Returns the TableSchema defining the physical layout."""
         return self.schema
 
     def create_cursor(self):
-        """
-        Creates a UnifiedCursor that merges the active MemTable and all 
-        on-disk Shards into a single sorted Z-Set stream.
-        """
         num_shards = len(self.index.handles)
+        # Fix: Use newlist_hint to avoid mr-poisoning
         cs = newlist_hint(1 + num_shards)
 
         cs.append(cursor.MemTableCursor(self.memtable))
@@ -124,10 +121,10 @@ class PersistentTable(AbstractTable):
 
     def create_scratch_table(self, name, schema):
         """
-        Allocates an internal EphemeralTable for VM operator state (Traces).
-        Trace tables do not require durability and are deleted on close.
+        Architectural Pivot: Always return an EphemeralTable for trace data.
+        This eliminates per-record fsyncs for DISTINCT/REDUCE operations.
         """
-        scratch_dir = os.path.join(self.directory, name)
+        scratch_dir = os.path.join(self.directory, "scratch_" + name)
 
         tid = 0
         for char in name:
@@ -144,10 +141,6 @@ class PersistentTable(AbstractTable):
         )
 
     def ingest(self, key, weight, payload):
-        """
-        Single-record ingestion. Now wraps the record in a singleton 
-        ZSetBatch to reuse the unified batch logic.
-        """
         batch = make_singleton_batch(self.schema, r_uint128(key), weight, payload)
         self.ingest_batch(batch)
 
@@ -155,6 +148,7 @@ class PersistentTable(AbstractTable):
         """
         Durable Z-Set batch update.
         Assigns one LSN to the entire batch (DBSP tick semantics).
+        Converts N WAL writes/fsyncs into 1 block append.
         """
         if self.is_closed:
             raise errors.StorageError("Table is closed")
@@ -166,27 +160,28 @@ class PersistentTable(AbstractTable):
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
 
-        # 1. Prepare WAL records while updating MemTable
-        # Filtering ghosts (weight=0) is critical for throughput
+        # Fix: Use newlist_hint to avoid mr-poisoning
         wal_records = newlist_hint(n)
         for i in range(n):
-            pk = batch.get_pk(i)
             w = batch.get_weight(i)
+            # Ghost Property: skip records that sum to zero
+            if w == r_int64(0):
+                continue
+
+            pk = batch.get_pk(i)
             row = batch.get_row(i)
 
-            # Update in-memory state (Ghost Property enforced here)
+            # Update in-memory state
             self.memtable.upsert(pk, w, row)
 
-            # Prepare for durability (Ghost records are elided from WAL)
-            if w != r_int64(0):
-                wal_records.append(wal_format.WALRecord(pk, w, row))
+            # Prepare for durability
+            wal_records.append(wal_format.WALRecord(pk, w, row))
 
-        # 2. Commit batch to WAL with a single fsync
+        # Commit batch to WAL with a single block write and fsync
         if len(wal_records) > 0:
             self.wal_writer.append_batch(lsn, self.table_id, wal_records)
 
     def get_weight(self, key, payload):
-        """Sums weights across MemTable and persistent shards for a record."""
         r_key = r_uint128(key)
         total_w = r_int64(0)
 
@@ -228,35 +223,42 @@ class PersistentTable(AbstractTable):
     # -------------------------------------------------------------------------
 
     def recover_from_wal(self, wal_path):
-        """Replays WAL blocks into the MemTable to recover volatile state."""
+        """
+        Replays WAL blocks into the MemTable to recover volatile state.
+        Uses the zero-copy upsert_raw path.
+        """
         if not os.path.exists(wal_path):
             return
 
-        persisted_lsn_boundary = self.current_lsn
+        # Start recovery from the point where the last manifest left off
+        boundary = self.current_lsn
         reader = wal.WALReader(wal_path, self.schema)
         try:
-            for block in reader.iterate_blocks():
-                if block.tid != self.table_id:
-                    continue
-                if block.lsn < persisted_lsn_boundary:
-                    continue
+            while True:
+                block = reader.read_next_block()
+                if block is None:
+                    break
+                
+                try:
+                    if block.tid != self.table_id or block.lsn < boundary:
+                        continue
 
-                for rec in block.records:
-                    self.memtable.upsert(
-                        rec.get_key(), rec.weight, rec.component_data
-                    )
+                    # Zero-Copy Recovery Path: Pass RawWALRecord to upsert_raw
+                    for rec in block.records:
+                        self.memtable.upsert_raw(rec.pk, rec.weight, rec)
 
-                if block.lsn >= self.current_lsn:
-                    self.current_lsn = block.lsn + r_uint64(1)
+                    if block.lsn >= self.current_lsn:
+                        self.current_lsn = block.lsn + r_uint64(1)
+                finally:
+                    # Essential: Release the raw C memory held by the block
+                    block.free()
         finally:
             reader.close()
 
     def insert(self, pk, row):
-        """Sugar for +1 weight ingestion."""
         self.ingest(pk, r_int64(1), row)
 
     def delete(self, pk, row):
-        """Sugar for -1 weight ingestion (retraction)."""
         self.ingest(pk, r_int64(-1), row)
 
     def flush(self):
@@ -302,76 +304,6 @@ class PersistentTable(AbstractTable):
         self.memtable = memtable.MemTable(self.schema, arena_size)
 
         return shard_path
-
-    # --- Test Compatibility API ---
-
-    def memtable_entry_count(self):
-        count = 0
-        base = self.memtable.arena.base_ptr
-        curr_off = node_get_next_off(base, self.memtable.head_off, 0)
-        while curr_off != 0:
-            count += 1
-            curr_off = node_get_next_off(base, curr_off, 0)
-        return count
-
-    def memtable_byte_estimate(self):
-        return self.memtable.arena.offset + self.memtable.blob_arena.offset
-
-    def flush_memtable(self):
-        entries = []
-        base = self.memtable.arena.base_ptr
-        key_size = self.memtable.key_size
-        curr_off = node_get_next_off(base, self.memtable.head_off, 0)
-
-        acc = storage_comparator.PackedNodeAccessor(
-            self.schema, self.memtable.blob_arena.base_ptr
-        )
-
-        while curr_off != 0:
-            pk = node_get_key(base, curr_off, key_size)
-            w = node_get_weight(base, curr_off)
-            acc.set_row(base, curr_off)
-
-            row = row_logic.make_payload_row(self.schema)
-            payload_col = 0
-            for i in range(len(self.schema.columns)):
-                if i == self.schema.pk_index:
-                    continue
-
-                col_type = self.schema.columns[i].field_type
-                if col_type == types.TYPE_STRING:
-                    _, _, p, h, _ = acc.get_str_struct(i)
-                    row.append_string(
-                        string_logic.unpack_string(p, h)
-                    )
-                elif col_type == types.TYPE_U128:
-                    v = acc.get_u128(i)
-                    row.append_u128(r_uint64(v), r_uint64(v >> 64))
-                elif col_type in (types.TYPE_F64, types.TYPE_F32):
-                    row.append_float(acc.get_float(i))
-                else:
-                    row.append_int(
-                        r_int64(rffi.cast(rffi.LONGLONG, acc.get_int(i)))
-                    )
-                payload_col += 1
-
-            entries.append(MemTableEntry(pk, w, row))
-            curr_off = node_get_next_off(base, curr_off, 0)
-
-        sz = self.memtable.arena.size
-        self.memtable.free()
-        self.memtable = memtable.MemTable(self.schema, sz)
-        return entries
-
-    def _forget_shard(self, filename):
-        new_handles = []
-        for h in self.index.handles:
-            if h.filename == filename:
-                h.close()
-                self.ref_counter.release(filename)
-            else:
-                new_handles.append(h)
-        self.index.handles = new_handles
 
     def close(self):
         if self.is_closed:

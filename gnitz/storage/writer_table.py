@@ -5,10 +5,13 @@ from rpython.rlib import rposix, jit
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
+from rpython.rlib.longlong2float import float2longlong
 from gnitz.core import errors
 from gnitz.storage import layout, mmap_posix, buffer
 from gnitz.storage.buffer import align_64
 from gnitz.core import types, strings as string_logic, values as db_values, xxh as checksum
+from gnitz.storage import comparator as storage_comparator
+from gnitz.core import comparator as core_comparator
 
 NULL_CHARP = lltype.nullptr(rffi.CCHARP.TO)
 
@@ -28,12 +31,17 @@ class ShardWriterBlobAllocator(string_logic.BlobAllocator):
         with rffi.scoped_str2charp(string_data) as blob_src:
             off = self.writer._get_or_append_blob(blob_src, length)
             return r_uint64(off)
+    
+    def allocate_from_ptr(self, src_ptr, length):
+        """Zero-copy allocation from raw pointer."""
+        off = self.writer._get_or_append_blob(src_ptr, length)
+        return r_uint64(off)
 
 
 class TableShardWriter(object):
     """
     Handles the creation of N-Partition columnar shards.
-    Refactored to use centralized German String serialization.
+    Uses Unified Accessor API to read from MemTable nodes (Raw) or PayloadRows.
     """
 
     _immutable_fields_ = ["schema", "table_id"]
@@ -62,6 +70,10 @@ class TableShardWriter(object):
         # Pre-allocate scratch buffer to avoid mallocs in loop
         self.scratch_val_buf = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
         self.blob_allocator = ShardWriterBlobAllocator(self)
+        
+        # Unified Accessors for reading input
+        self.raw_accessor = storage_comparator.RawWALAccessor(schema)
+        self.val_accessor = core_comparator.PayloadRowAccessor(schema)
 
     def _get_or_append_blob(self, src_ptr, length):
         """
@@ -89,54 +101,124 @@ class TableShardWriter(object):
         self.blob_cache[cache_key] = new_offset
         return new_offset
 
-    def _append_value(self, col_idx, val_ptr, source_heap_ptr, string_data=None):
-        """Internal helper to relocate strings and append to columnar buffers."""
+    def _write_column(self, col_idx, accessor):
+        """
+        Writes a single column value from the accessor to the column buffer.
+        Acts as the SoA equivalent of serialize.serialize_row.
+        """
         buf = self.col_bufs[col_idx]
         col_def = self.schema.columns[col_idx]
-
-        if not val_ptr and string_data is None:
+        type_code = col_def.field_type.code
+        
+        if accessor.is_null(col_idx):
             buf.put_bytes(NULL_CHARP, col_def.field_type.size)
             return
 
-        if col_def.field_type == types.TYPE_STRING:
-            if val_ptr:
-                # PATH: Relocation (Raw Pointer)
-                length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, val_ptr)[0])
-                if length > string_logic.SHORT_STRING_THRESHOLD:
-                    u64_view = rffi.cast(
-                        rffi.ULONGLONGP, rffi.ptradd(val_ptr, 8)
-                    )
-                    old_off = rffi.cast(lltype.Signed, u64_view[0])
-                    if not source_heap_ptr:
-                        raise errors.StorageError(
-                            "Long string relocation requires source heap"
-                        )
-
-                    blob_src = rffi.ptradd(source_heap_ptr, old_off)
-                    new_off = self._get_or_append_blob(blob_src, length)
-
-                    # Copy the 16-byte struct and swizzle the offset
-                    for b in range(16):
-                        self.scratch_val_buf[b] = val_ptr[b]
-                    u64_payload = rffi.cast(
-                        rffi.ULONGLONGP, rffi.ptradd(self.scratch_val_buf, 8)
-                    )
-                    u64_payload[0] = r_uint64(new_off)
-                    buf.put_bytes(self.scratch_val_buf, 16)
-                else:
-                    # Inline string: copy as-is
-                    buf.put_bytes(val_ptr, 16)
+        if type_code == types.TYPE_STRING.code:
+            length, _, src_struct_ptr, src_heap_ptr, py_string = accessor.get_str_struct(col_idx)
+            
+            # 1. Write Length
+            rffi.cast(rffi.UINTP, self.scratch_val_buf)[0] = rffi.cast(rffi.UINT, length)
+            
+            # 2. Write Prefix
+            prefix_dest = rffi.ptradd(self.scratch_val_buf, 4)
+            if py_string is not None:
+                limit = 4 if length > 4 else length
+                for j in range(limit):
+                    prefix_dest[j] = py_string[j]
             else:
-                # PATH: Ingestion (Python String)
-                assert string_data is not None
-                string_logic.pack_and_write_blob(
-                    self.scratch_val_buf,
-                    string_data,
-                    self.blob_allocator,
-                )
-                buf.put_bytes(self.scratch_val_buf, 16)
+                src_prefix = rffi.ptradd(src_struct_ptr, 4)
+                for j in range(4):
+                    prefix_dest[j] = src_prefix[j]
+            
+            # 3. Write Payload (Inline or Heap Ref)
+            payload_dest = rffi.ptradd(self.scratch_val_buf, 8)
+            
+            if length <= string_logic.SHORT_STRING_THRESHOLD:
+                # Inline String
+                if py_string is not None:
+                    if length > 4:
+                        for j in range(4, length):
+                            payload_dest[j-4] = py_string[j]
+                else:
+                    src_suffix = rffi.ptradd(src_struct_ptr, 8)
+                    for j in range(length - 4):
+                        payload_dest[j] = src_suffix[j]
+            else:
+                # Heap String (Relocation required)
+                new_offset = r_uint64(0)
+                if py_string is not None:
+                    new_offset = self.blob_allocator.allocate(py_string)
+                else:
+                    # Relocate from Raw Pointer (Zero-Copy)
+                    old_offset_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_struct_ptr, 8))
+                    old_offset = old_offset_ptr[0]
+                    src_data_ptr = rffi.ptradd(src_heap_ptr, rffi.cast(lltype.Signed, old_offset))
+                    new_offset = self.blob_allocator.allocate_from_ptr(src_data_ptr, length)
+
+                rffi.cast(rffi.ULONGLONGP, payload_dest)[0] = rffi.cast(rffi.ULONGLONG, new_offset)
+            
+            buf.put_bytes(self.scratch_val_buf, 16)
+        
+        elif type_code == types.TYPE_F64.code:
+            buf.put_i64(rffi.cast(rffi.LONGLONG, float2longlong(accessor.get_float(col_idx))))
+        
+        elif type_code == types.TYPE_F32.code:
+            # Buffer only has put_i64/put_u64, use scratch for 32-bit floats if needed
+            # But buffer.put_bytes is safer for size matching.
+            val = accessor.get_float(col_idx)
+            rffi.cast(rffi.FLOATP, self.scratch_val_buf)[0] = rffi.cast(rffi.FLOAT, val)
+            buf.put_bytes(self.scratch_val_buf, 4)
+
+        elif type_code == types.TYPE_U128.code:
+            buf.put_u128(accessor.get_u128(col_idx))
+
+        elif type_code == types.TYPE_U64.code:
+            buf.put_u64(accessor.get_int(col_idx))
+            
+        elif type_code == types.TYPE_I64.code:
+            buf.put_i64(accessor.get_int(col_idx))
+
+        elif type_code == types.TYPE_U32.code:
+            val = accessor.get_int(col_idx) & 0xFFFFFFFF
+            rffi.cast(rffi.UINTP, self.scratch_val_buf)[0] = rffi.cast(rffi.UINT, val)
+            buf.put_bytes(self.scratch_val_buf, 4)
+
+        elif type_code == types.TYPE_I32.code:
+            val = accessor.get_int(col_idx) & 0xFFFFFFFF
+            rffi.cast(rffi.INTP, self.scratch_val_buf)[0] = rffi.cast(rffi.INT, val)
+            buf.put_bytes(self.scratch_val_buf, 4)
+            
+        elif type_code == types.TYPE_U16.code:
+            val = intmask(accessor.get_int(col_idx))
+            self.scratch_val_buf[0] = chr(val & 0xFF)
+            self.scratch_val_buf[1] = chr((val >> 8) & 0xFF)
+            buf.put_bytes(self.scratch_val_buf, 2)
+            
+        elif type_code == types.TYPE_I16.code:
+            val = intmask(accessor.get_int(col_idx))
+            self.scratch_val_buf[0] = chr(val & 0xFF)
+            self.scratch_val_buf[1] = chr((val >> 8) & 0xFF)
+            buf.put_bytes(self.scratch_val_buf, 2)
+
+        elif type_code == types.TYPE_U8.code or type_code == types.TYPE_I8.code:
+            val = intmask(accessor.get_int(col_idx))
+            self.scratch_val_buf[0] = chr(val & 0xFF)
+            buf.put_bytes(self.scratch_val_buf, 1)
+
         else:
-            buf.put_bytes(val_ptr, col_def.field_type.size)
+            # Fallback for I64 compatible types
+            buf.put_i64(accessor.get_int(col_idx))
+
+    def _append_from_accessor(self, accessor):
+        i = 0
+        num_cols = len(self.schema.columns)
+        while i < num_cols:
+             if i == self.schema.pk_index:
+                 i += 1
+                 continue
+             self._write_column(i, accessor)
+             i += 1
 
     def add_row(self, key, weight, packed_row_ptr, source_heap_ptr):
         """Optimized path for MemTable flush (raw pointers)."""
@@ -150,19 +232,9 @@ class TableShardWriter(object):
             self.pk_buf.put_u64(rffi.cast(rffi.ULONGLONG, key))
         self.w_buf.put_i64(weight)
 
-        i = 0
-        num_cols = len(self.schema.columns)
-        while i < num_cols:
-            if i == self.schema.pk_index:
-                i += 1
-                continue
-
-            col_off = self.schema.get_column_offset(i)
-            val_ptr = (
-                rffi.ptradd(packed_row_ptr, col_off) if packed_row_ptr else NULL_CHARP
-            )
-            self._append_value(i, val_ptr, source_heap_ptr)
-            i += 1
+        # Zero-allocation wrap of raw pointers
+        self.raw_accessor.set_pointers(packed_row_ptr, source_heap_ptr)
+        self._append_from_accessor(self.raw_accessor)
 
     def add_row_from_values(self, pk, weight, row):
         """
@@ -179,99 +251,8 @@ class TableShardWriter(object):
             self.pk_buf.put_u64(rffi.cast(rffi.ULONGLONG, pk))
         self.w_buf.put_i64(weight)
 
-        payload_col = 0
-        i = 0
-        num_cols = len(self.schema.columns)
-        while i < num_cols:
-            if i == self.schema.pk_index:
-                i += 1
-                continue
-
-            ftype = self.schema.columns[i].field_type
-
-            if row.is_null(payload_col):
-                self._append_value(i, NULL_CHARP, NULL_CHARP)
-                payload_col += 1
-                i += 1
-                continue
-
-            if ftype.code == types.TYPE_STRING.code:
-                s = row.get_str(payload_col)
-                self._append_value(i, NULL_CHARP, NULL_CHARP, string_data=s)
-
-            elif ftype.code == types.TYPE_F64.code:
-                rffi.cast(rffi.DOUBLEP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.DOUBLE, row.get_float(payload_col)
-                )
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            elif ftype.code == types.TYPE_F32.code:
-                rffi.cast(rffi.FLOATP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.FLOAT, row.get_float(payload_col)
-                )
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            elif ftype.code == types.TYPE_U128.code:
-                u128_val = row.get_u128(payload_col)
-                u64_ptr = rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)
-                u64_ptr[0] = r_uint64(u128_val)  # lo
-                u64_ptr[1] = r_uint64(u128_val >> 64)  # hi
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            elif ftype.code == types.TYPE_U64.code:
-                rffi.cast(rffi.ULONGLONGP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.ULONGLONG, row.get_int(payload_col)
-                )
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            elif ftype.code == types.TYPE_U32.code:
-                rffi.cast(rffi.UINTP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.UINT, row.get_int(payload_col) & r_uint64(0xFFFFFFFF)
-                )
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            elif ftype.code == types.TYPE_U16.code:
-                u16_val = intmask(row.get_int(payload_col))
-                self.scratch_val_buf[0] = chr(u16_val & 0xFF)
-                self.scratch_val_buf[1] = chr((u16_val >> 8) & 0xFF)
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            elif ftype.code == types.TYPE_U8.code:
-                self.scratch_val_buf[0] = chr(intmask(row.get_int(payload_col)) & 0xFF)
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            elif ftype.code == types.TYPE_I64.code:
-                rffi.cast(rffi.LONGLONGP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.LONGLONG, row.get_int_signed(payload_col)
-                )
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            elif ftype.code == types.TYPE_I32.code:
-                rffi.cast(rffi.INTP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.INT, intmask(row.get_int_signed(payload_col) & 0xFFFFFFFF)
-                )
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            elif ftype.code == types.TYPE_I16.code:
-                i16_val = intmask(row.get_int_signed(payload_col))
-                self.scratch_val_buf[0] = chr(i16_val & 0xFF)
-                self.scratch_val_buf[1] = chr((i16_val >> 8) & 0xFF)
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            elif ftype.code == types.TYPE_I8.code:
-                self.scratch_val_buf[0] = chr(
-                    intmask(row.get_int_signed(payload_col)) & 0xFF
-                )
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            else:
-                rffi.cast(rffi.LONGLONGP, self.scratch_val_buf)[0] = rffi.cast(
-                    rffi.LONGLONG, row.get_int_signed(payload_col)
-                )
-                self._append_value(i, self.scratch_val_buf, NULL_CHARP)
-
-            payload_col += 1
-            i += 1
+        self.val_accessor.set_row(row)
+        self._append_from_accessor(self.val_accessor)
 
     def close(self):
         self.pk_buf.free()

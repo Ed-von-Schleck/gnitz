@@ -139,3 +139,85 @@ class SoAAccessor(RowAccessor):
 
     def get_col_ptr(self, col_idx):
         return self._get_ptr(col_idx)
+
+
+class RawWALAccessor(RowAccessor):
+    """
+    Implementation that reads directly from a RawWALRecord's raw pointers.
+    Enables zero-copy WAL recovery by mapping schema offsets onto the WAL record.
+    Also used by TableShardWriter for zero-copy MemTable flushing.
+    """
+
+    def __init__(self, schema):
+        self.schema = schema
+        self.pk_index = schema.pk_index
+        self.null_word = r_uint64(0)
+        self.payload_ptr = NULL_PTR
+        self.heap_ptr = NULL_PTR
+
+    def _payload_idx(self, col_idx):
+        # Maps absolute schema column index to 0-based payload column index (skipping PK)
+        if col_idx < self.pk_index:
+            return col_idx
+        return col_idx - 1
+
+    def set_record(self, raw_record):
+        """Sets state from a RawWALRecord object."""
+        self.set_pointers(raw_record.payload_ptr, raw_record.heap_ptr, raw_record.null_word)
+
+    def set_pointers(self, payload_ptr, heap_ptr, null_word=r_uint64(0)):
+        """Sets state directly from raw pointers (e.g. MemTable flush)."""
+        self.null_word = null_word
+        self.payload_ptr = payload_ptr
+        self.heap_ptr = heap_ptr
+
+    def is_null(self, col_idx):
+        payload_idx = self._payload_idx(col_idx)
+        return bool(self.null_word & (r_uint64(1) << payload_idx))
+
+    def _get_ptr(self, col_idx):
+        off = self.schema.get_column_offset(col_idx)
+        return rffi.ptradd(self.payload_ptr, off)
+
+    def get_int(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        sz = self.schema.columns[col_idx].field_type.size
+        if sz == 8:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        elif sz == 4:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UINTP, ptr)[0])
+        elif sz == 2:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.USHORTP, ptr)[0])
+        elif sz == 1:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr)[0])
+        return r_uint64(0)
+
+    def get_float(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        sz = self.schema.columns[col_idx].field_type.size
+        if sz == 4:
+            return float(rffi.cast(rffi.FLOATP, ptr)[0])
+        return float(rffi.cast(rffi.DOUBLEP, ptr)[0])
+
+    def get_u128(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        lo = rffi.cast(rffi.ULONGLONGP, ptr)
+        hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))
+        return (r_uint128(hi[0]) << 64) | r_uint128(lo[0])
+
+    def get_str_struct(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        if not ptr:
+            return (0, 0, NULL_PTR, self.heap_ptr, None)
+
+        u32_ptr = rffi.cast(rffi.UINTP, ptr)
+        length = rffi.cast(lltype.Signed, u32_ptr[0])
+        prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+
+        s = None
+        if False:
+            s = ""
+        return (length, prefix, ptr, self.heap_ptr, s)
+
+    def get_col_ptr(self, col_idx):
+        return self._get_ptr(col_idx)

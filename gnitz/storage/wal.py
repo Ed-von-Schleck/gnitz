@@ -2,7 +2,7 @@
 
 import os
 import errno
-from rpython.rlib import rposix, rposix_stat, jit
+from rpython.rlib import rposix, rposix_stat
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import errors
@@ -46,10 +46,14 @@ class WALReader(object):
             raise e
 
     def read_next_block(self):
+        """
+        Reads the next logical block from the WAL.
+        Returns a WALBlock object containing RawWALRecords, or None at EOF.
+        """
         if self.closed:
             return None
 
-        # Read the fixed-size header first using centralized constant
+        # Read the fixed-size header
         h_str = rposix.read(self.fd, wal_format.WAL_BLOCK_HEADER_SIZE)
         if not h_str or len(h_str) < wal_format.WAL_BLOCK_HEADER_SIZE:
             if self._has_rotated():
@@ -62,32 +66,36 @@ class WALReader(object):
 
         total_size = 0
         with rffi.scoped_str2charp(h_str) as h_p:
-            # Use the Header View to extract total_size safely
             header = wal_format.WALBlockHeaderView(h_p)
             total_size = header.get_total_size()
 
         if total_size < wal_format.WAL_BLOCK_HEADER_SIZE:
             raise errors.CorruptShardError("Invalid WAL block size in header")
 
+        # Allocate raw memory for the full block (header + body)
         f_ptr = lltype.malloc(rffi.CCHARP.TO, total_size, flavor="raw")
+        success = False
         try:
-            # Copy header bytes into full block buffer
+            # 1. Restore header into full buffer
             for i in range(wal_format.WAL_BLOCK_HEADER_SIZE):
                 f_ptr[i] = h_str[i]
 
+            # 2. Read and restore body
             body_sz = total_size - wal_format.WAL_BLOCK_HEADER_SIZE
             if body_sz > 0:
-                # Read the remainder of the block (records + blobs)
                 b_str = rposix.read(self.fd, body_sz)
                 if not b_str or len(b_str) < body_sz:
                     return None
                 for i in range(body_sz):
                     f_ptr[wal_format.WAL_BLOCK_HEADER_SIZE + i] = b_str[i]
 
-            # Standardized block decoding
-            return wal_format.decode_wal_block(f_ptr, total_size, self.schema)
+            # 3. Decode records and verify checksums via wal_format kernel
+            res = wal_format.decode_wal_block(f_ptr, total_size, self.schema)
+            success = True
+            return res
         finally:
-            lltype.free(f_ptr, flavor="raw")
+            if not success:
+                lltype.free(f_ptr, flavor="raw")
 
     def iterate_blocks(self):
         while True:
@@ -117,6 +125,7 @@ class WALWriter(object):
         self.schema = schema
         self.closed = False
         self.fd = -1
+        # Open in append mode with exclusive lock
         fd = rposix.open(filename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
             if not mmap_posix.try_lock_exclusive(fd):
@@ -128,24 +137,21 @@ class WALWriter(object):
             raise
 
     def append_block(self, lsn, table_id, records):
-        """Legacy single-block write. For high-volume, use append_batch."""
+        """Legacy compatibility wrapper. Delegates to append_batch."""
         self.append_batch(lsn, table_id, records)
 
     def append_batch(self, lsn, table_id, records):
         """
-        Serializes a list of records into the WAL.
-        Automatically segments the batch into multiple blocks if the 
-        combined size exceeds 32MB to prevent u32 overflow and 
-        excessive raw memory allocation.
+        Serializes a list of WALRecord into the WAL.
+        Segments records into blocks of up to 32MB to prevent integer overflow
+        and memory pressure, then issues a single fsync for the entire batch.
         """
         if self.closed:
             raise errors.StorageError("Attempted to write to a closed WAL")
         if not records:
             return
 
-        # Segmentation threshold: 32MB. 
-        # Prevents block size overflowing r_uint32 and keeps transient
-        # raw memory mallocs within reasonable bounds.
+        # 32MB chunking threshold to keep transient allocations stable
         MAX_BLOCK_PAYLOAD = 32 * 1024 * 1024
 
         num_records = len(records)
@@ -154,40 +160,40 @@ class WALWriter(object):
 
         for i in range(num_records):
             rec = records[i]
-            # Calculate physical record size including German String blobs
+            # Calculate physical bytes required for record and string blobs
             f_sz, h_sz = wal_format.compute_record_size(self.schema, rec.component_data)
             rec_total = f_sz + h_sz
 
-            # If current record would overflow the chunk limit, flush current buffer
+            # If current record exceeds chunk budget, flush chunk to disk
             if current_chunk and (current_chunk_size + rec_total > MAX_BLOCK_PAYLOAD):
                 wal_format.write_wal_block(
                     self.fd, lsn, table_id, current_chunk, self.schema
                 )
-                # Clear for next chunk
                 current_chunk = newlist_hint(num_records - i)
                 current_chunk_size = 0
 
             current_chunk.append(rec)
             current_chunk_size += rec_total
 
-        # Flush final (or only) chunk
+        # Flush final chunk
         if current_chunk:
             wal_format.write_wal_block(
                 self.fd, lsn, table_id, current_chunk, self.schema
             )
 
-        # Durability: Atomic fsync for the entire batch
+        # Batch-durability: Convert N fsyncs into 1
         mmap_posix.fsync_c(self.fd)
 
     def truncate_before_lsn(self, lsn):
+        """
+        Resets the WAL for the given table. 
+        Currently implemented as full truncate.
+        """
         if self.closed or self.fd == -1:
             return
 
         mmap_posix.fsync_c(self.fd)
-        # Safely reset WAL file size to 0. 
-        # Future work will implement segmented WAL files for partial truncation.
         rposix.ftruncate(self.fd, 0)
-        # Move file pointer back to start
         rposix.lseek(self.fd, 0, 0)
 
     def close(self):
