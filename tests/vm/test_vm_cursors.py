@@ -87,7 +87,7 @@ class TestVMCursors(unittest.TestCase):
         # Insert then retract
         self.db.insert(pk, payload)
         self.db.flush() # Force to disk (Shard)
-        self.db.remove(pk, payload) # Exists as retraction in MemTable
+        self.db.delete(pk, payload) # Exists as retraction in MemTable
         
         cursor = self.db.create_cursor()
         cursor.seek(pk)

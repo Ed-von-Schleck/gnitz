@@ -1,8 +1,10 @@
 # gnitz/core/row_logic.py
 
-from gnitz.core import comparator
+from gnitz.core import xxh, types, comparator as core_comparator
 from gnitz.core.values import make_payload_row, PayloadRow
-
+from rpython.rlib.rarithmetic import r_uint64, r_int64
+from rpython.rlib.longlong2float import float2longlong
+from rpython.rtyper.lltypesystem import rffi, lltype
 
 """
 Row Logic API: The Storage-VM Boundary.
@@ -42,27 +44,6 @@ CRITICAL — The newlist_hint Requirement and mr-Poisoning
 ``make_payload_row`` creates ``PayloadRow`` instances whose internal lists
 MUST be initialised with ``newlist_hint``. Never use ``[]``, ``[x, y]``,
 ``[None] * n``, or list concatenation.
-
-RPython's annotator tracks list resizability as part of the list's type
-descriptor (listdef). If any construction site creates a list that the
-annotator considers fixed-size, that list's entire listdef is permanently
-marked must-not-resize (mr). Because the annotator unifies all list instances
-of the same element type globally across the entire program, this mr flag
-poisons every list of that element type everywhere. Every subsequent
-``.append()`` on any list of that type fails with ``ListChangeUnallowed`` at
-annotation time.
-
-Concrete failure modes for ``PayloadRow``:
-
-- ``self._lo = []`` anywhere → all ``List[r_int64]`` poisoned globally.
-- ``self._strs = []`` anywhere → all ``List[str]`` poisoned globally.
-- ``self._hi = []`` anywhere → all ``List[r_uint64]`` poisoned globally.
-
-The fix is uniform and mandatory: ``PayloadRow.__init__`` uses
-``newlist_hint(n)`` for every list. The ``None`` path (``_hi = None``) does
-not involve list construction and is safe. ``make_payload_row(schema)`` is
-the single enforcement point. No other code may construct a ``PayloadRow``
-instance directly.
 """
 
 # Re-export for callers that import from this module.
@@ -74,15 +55,10 @@ class PayloadRowComparator(object):
     """
     Pre-allocated comparator for two ``PayloadRow`` instances.
 
-    This is the canonical comparison entry point for the VM layer
-    (``gnitz/vm``). Code in ``gnitz/vm`` must never import
-    ``gnitz/storage/comparator`` directly; instead import and use this class,
-    which acts as an API proxy that delegates to the storage comparator.
-
-    Holds a reusable pair of ``PayloadRowAccessor`` instances so that
-    ``ZSetBatch.sort()`` and ``ZSetBatch.consolidate()`` can compare rows
-    without per-call allocation. Handles all column types correctly,
-    including TYPE_U128 columns.
+    This is the canonical comparison entry point for the VM layer.
+    Code in ``gnitz/vm`` must never import ``gnitz/storage/comparator``
+    directly; instead import and use this class, which acts as an API
+    proxy that delegates to the storage comparator.
 
     Usage::
 
@@ -94,14 +70,12 @@ class PayloadRowComparator(object):
 
     def __init__(self, schema):
         self._schema = schema
-        self._left = comparator.PayloadRowAccessor(schema)
-        self._right = comparator.PayloadRowAccessor(schema)
+        self._left = core_comparator.PayloadRowAccessor(schema)
+        self._right = core_comparator.PayloadRowAccessor(schema)
 
     def compare(self, left_row, right_row):
         """
-        Compares two ``PayloadRow`` instances using the canonical storage
-        comparator (``comparator.compare_rows``). Handles all column types
-        including TYPE_U128 correctly.
+        Compares two ``PayloadRow`` instances.
 
         Args:
             left_row:  ``PayloadRow`` for the left row.
@@ -112,4 +86,4 @@ class PayloadRowComparator(object):
         """
         self._left.set_row(left_row)
         self._right.set_row(right_row)
-        return comparator.compare_rows(self._schema, self._left, self._right)
+        return core_comparator.compare_rows(self._schema, self._left, self._right)

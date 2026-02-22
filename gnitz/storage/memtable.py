@@ -4,34 +4,26 @@ from rpython.rlib.rrandom import Random
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import errors, comparator as core_comparator
+from rpython.rlib.longlong2float import float2longlong
+from gnitz.core import errors, comparator as core_comparator, xxh
 from gnitz.storage import buffer, writer_table, comparator
 from gnitz.storage.memtable_node import (
     node_get_next_off, node_set_next_off, node_get_weight, node_set_weight,
-    node_get_key, node_get_payload_ptr, get_key_offset
+    node_get_key, node_get_payload_ptr, get_key_offset, node_get_hash, node_set_hash, HASH_SIZE
 )
 from gnitz.core import types, values, strings as string_logic
 
 MAX_HEIGHT = 16
 
 class MemTableBlobAllocator(string_logic.BlobAllocator):
-    """
-    Allocator strategy for MemTable string tails.
-    Persists long strings into the MemTable's Blob Arena.
-    """
     def __init__(self, arena):
         self.arena = arena
 
     def allocate(self, string_data):
         length = len(string_data)
-        # Strings in the blob arena use 8-byte alignment for 64-bit access
         b_ptr = self.arena.alloc(length, alignment=8)
-
-        # Copy string data to the arena
         for j in range(length):
             b_ptr[j] = string_data[j]
-
-        # Return the offset relative to the start of the blob arena as r_uint64
         off = rffi.cast(lltype.Signed, b_ptr) - rffi.cast(lltype.Signed, self.arena.base_ptr)
         return r_uint64(off)
 
@@ -47,26 +39,25 @@ class MemTable(object):
         self._update_offsets = [0] * MAX_HEIGHT
         self.key_size = schema.get_pk_column().field_type.size
 
-        # Initialize reusable accessors for comparison
         self.node_accessor = comparator.PackedNodeAccessor(schema, self.blob_arena.base_ptr)
         self.value_accessor = core_comparator.ValueAccessor(schema)
 
-        # Reserved NULL sentinel at offset 0
+        # Raw memory buffer for fast hashing (avoids object overhead)
+        self.hash_buf_cap = 1024
+        self.hash_buf = lltype.malloc(rffi.CCHARP.TO, self.hash_buf_cap, flavor='raw')
+
         self.arena.alloc(8, alignment=8)
 
-        # Head node allocation
         head_key_off = get_key_offset(MAX_HEIGHT)
-        h_sz = head_key_off + self.key_size + self.schema.memtable_stride
+        h_sz = head_key_off + self.key_size + HASH_SIZE + self.schema.memtable_stride
 
         ptr = self.arena.alloc(h_sz, alignment=16)
         self.head_off = rffi.cast(lltype.Signed, ptr) - rffi.cast(lltype.Signed, self.arena.base_ptr)
 
-        # Set height byte in head node
         ptr[8] = chr(MAX_HEIGHT)
         for i in range(MAX_HEIGHT):
             node_set_next_off(self.arena.base_ptr, self.head_off, i, 0)
 
-        # Use r_uint64(-1) to generate 0xFF...FF without prebuilt long trap
         key_ptr = rffi.ptradd(ptr, head_key_off)
         all_ones = r_uint64(-1)
         if self.key_size == 16:
@@ -75,16 +66,102 @@ class MemTable(object):
         else:
             rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, all_ones)
 
+    def _compute_payload_hash(self, row):
+        schema = self.schema
+        num_cols = len(schema.columns)
+        
+        # 1. Calculate exact required capacity WITH memory alignment protection
+        sz = 0
+        payload_col = 0
+        for i in range(num_cols):
+            if i == schema.pk_index:
+                continue
+            sz += 1 # Null flag byte
+            if not row.is_null(payload_col):
+                ft = schema.columns[i].field_type
+                if ft.code == types.TYPE_STRING.code:
+                    sz = (sz + 3) & ~3 # align 4
+                    sz += 4 + len(row.get_str(payload_col))
+                elif ft.code == types.TYPE_U128.code:
+                    sz = (sz + 7) & ~7 # align 8
+                    sz += 16
+                else:
+                    sz = (sz + 7) & ~7 # align 8
+                    sz += 8
+            payload_col += 1
+            
+        # 2. Ensure capacity (grow if necessary)
+        if sz > self.hash_buf_cap:
+            if self.hash_buf != lltype.nullptr(rffi.CCHARP.TO):
+                lltype.free(self.hash_buf, flavor='raw')
+            new_cap = sz * 2
+            self.hash_buf = lltype.malloc(rffi.CCHARP.TO, new_cap, flavor='raw')
+            self.hash_buf_cap = new_cap
+            
+        # 3. Serialize logically
+        ptr = self.hash_buf
+        offset = 0
+        payload_col = 0
+        for i in range(num_cols):
+            if i == schema.pk_index:
+                continue
+                
+            if row.is_null(payload_col):
+                ptr[offset] = '\x00'
+                offset += 1
+            else:
+                ptr[offset] = '\x01'
+                offset += 1
+                
+                ft = schema.columns[i].field_type
+                
+                if ft.code == types.TYPE_STRING.code:
+                    offset = (offset + 3) & ~3 # enforce 4-byte alignment
+                    target = rffi.ptradd(ptr, offset)
+                    s = row.get_str(payload_col)
+                    length = len(s)
+                    rffi.cast(rffi.UINTP, target)[0] = rffi.cast(rffi.UINT, length)
+                    offset += 4
+                    target_str = rffi.ptradd(ptr, offset)
+                    for j in range(length):
+                        target_str[j] = s[j]
+                    offset += length
+                    
+                elif ft.code == types.TYPE_U128.code:
+                    offset = (offset + 7) & ~7 # enforce 8-byte alignment
+                    target = rffi.ptradd(ptr, offset)
+                    val = row.get_u128(payload_col)
+                    rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(val))
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(val >> 64))
+                    offset += 16
+                    
+                elif ft.code == types.TYPE_F64.code or ft.code == types.TYPE_F32.code:
+                    offset = (offset + 7) & ~7
+                    target = rffi.ptradd(ptr, offset)
+                    bits = float2longlong(row.get_float(payload_col))
+                    rffi.cast(rffi.LONGLONGP, target)[0] = bits
+                    offset += 8
+                    
+                else:
+                    offset = (offset + 7) & ~7
+                    target = rffi.ptradd(ptr, offset)
+                    rffi.cast(rffi.LONGLONGP, target)[0] = row.get_int_signed(payload_col)
+                    offset += 8
+                    
+            payload_col += 1
+            
+        # 4. Compute XXH3 over the exact serialized bytes
+        return xxh.compute_checksum(self.hash_buf, sz)
+
     def _find_exact_values(self, key, row):
-        """
-        Locates the specific node matching both the Primary Key AND the payload.
-        Args:
-            row: PayloadRow
-        """
+        """Backward compatible wrapper for external callers."""
+        target_hash = self._compute_payload_hash(row)
+        return self._find_exact_values_with_hash(key, row, target_hash)
+
+    def _find_exact_values_with_hash(self, key, row, target_hash):
         base = self.arena.base_ptr
         curr_off = self.head_off
 
-        # Set the value accessor once per search operation
         self.value_accessor.set_row(row)
 
         for i in range(MAX_HEIGHT - 1, -1, -1):
@@ -92,18 +169,21 @@ class MemTable(object):
             while next_off != 0:
                 next_key = node_get_key(base, next_off, self.key_size)
 
-                # Primary Key check
                 if next_key < key:
                     curr_off = next_off
-                # PK matches, now compare payload lexicographically
                 elif next_key == key:
-                    self.node_accessor.set_row(base, next_off)
-                    # Advance if the current node's payload is smaller than the target
-                    if core_comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) < 0:
+                    stored_hash = node_get_hash(base, next_off, self.key_size)
+                    
+                    if stored_hash < target_hash:
                         curr_off = next_off
+                    elif stored_hash > target_hash:
+                        break
                     else:
-                        break  # Found position or overshot
-                # Overshot PK
+                        self.node_accessor.set_row(base, next_off)
+                        if core_comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) < 0:
+                            curr_off = next_off
+                        else:
+                            break
                 else:
                     break
 
@@ -113,21 +193,16 @@ class MemTable(object):
         match_off = node_get_next_off(base, curr_off, 0)
         if match_off != 0:
             if node_get_key(base, match_off, self.key_size) == key:
-                self.node_accessor.set_row(base, match_off)
-                # Final check for exact payload match
-                if core_comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) == 0:
-                    return match_off
+                if node_get_hash(base, match_off, self.key_size) == target_hash:
+                    self.node_accessor.set_row(base, match_off)
+                    if core_comparator.compare_rows(self.schema, self.node_accessor, self.value_accessor) == 0:
+                        return match_off
         return 0
 
     def _lower_bound_node(self, key):
-        """
-        Returns the offset of the first node where node_key >= key.
-        Returns 0 if no such node exists.
-        """
         base = self.arena.base_ptr
         curr_off = self.head_off
 
-        # Standard SkipList search logic
         for i in range(MAX_HEIGHT - 1, -1, -1):
             next_off = node_get_next_off(base, curr_off, i)
             while next_off != 0:
@@ -138,17 +213,13 @@ class MemTable(object):
                     break
                 next_off = node_get_next_off(base, curr_off, i)
 
-        # Level 0 contains the full sequence
         return node_get_next_off(base, curr_off, 0)
 
     def upsert(self, key, weight, row):
-        """
-        Upserts a row into the MemTable.
-        Args:
-            row: PayloadRow
-        """
         base = self.arena.base_ptr
-        match_off = self._find_exact_values(key, row)
+        
+        target_hash = self._compute_payload_hash(row)
+        match_off = self._find_exact_values_with_hash(key, row, target_hash)
 
         if match_off != 0:
             new_w = node_get_weight(base, match_off) + weight
@@ -166,7 +237,7 @@ class MemTable(object):
             h += 1
 
         key_off = get_key_offset(h)
-        node_full_sz = key_off + self.key_size + self.schema.memtable_stride
+        node_full_sz = key_off + self.key_size + HASH_SIZE + self.schema.memtable_stride
         self._ensure_capacity(node_full_sz, row)
 
         new_ptr = self.arena.alloc(node_full_sz, alignment=16)
@@ -183,7 +254,9 @@ class MemTable(object):
         else:
             rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(key))
 
-        payload_ptr = rffi.ptradd(key_ptr, self.key_size)
+        node_set_hash(base, new_off, self.key_size, target_hash)
+
+        payload_ptr = node_get_payload_ptr(base, new_off, self.key_size)
         self._pack_into_node(payload_ptr, row)
 
         for i in range(h):
@@ -192,11 +265,6 @@ class MemTable(object):
             node_set_next_off(base, pred, i, new_off)
 
     def _ensure_capacity(self, node_sz, row):
-        """
-        Checks if arenas have enough space for the new node and its blobs.
-        Args:
-            row: PayloadRow
-        """
         blob_sz = 0
         payload_col = 0
         for i in range(len(self.schema.columns)):
@@ -215,11 +283,6 @@ class MemTable(object):
             raise errors.MemTableFullError()
 
     def _pack_into_node(self, dest_ptr, row):
-        """
-        Serializes a PayloadRow into the packed row format in the Arena.
-        Args:
-            row: PayloadRow
-        """
         allocator = MemTableBlobAllocator(self.blob_arena)
         payload_col = 0
         for i in range(len(self.schema.columns)):
@@ -299,7 +362,6 @@ class MemTable(object):
                 target[0] = chr(intmask(row.get_int_signed(payload_col)) & 0xFF)
 
             else:
-                # Default for other integers
                 rffi.cast(rffi.LONGLONGP, target)[0] = rffi.cast(rffi.LONGLONG, row.get_int_signed(payload_col))
 
             payload_col += 1
@@ -318,3 +380,6 @@ class MemTable(object):
     def free(self):
         self.arena.free()
         self.blob_arena.free()
+        if self.hash_buf != lltype.nullptr(rffi.CCHARP.TO):
+            lltype.free(self.hash_buf, flavor='raw')
+            self.hash_buf = lltype.nullptr(rffi.CCHARP.TO)
