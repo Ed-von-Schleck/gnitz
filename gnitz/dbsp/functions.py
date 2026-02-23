@@ -1,4 +1,4 @@
-# gnitz/vm/functions.py
+# gnitz/dbsp/functions.py
 
 from rpython.rlib.rarithmetic import r_int64, intmask, r_uint64
 from rpython.rlib.longlong2float import float2longlong, longlong2float

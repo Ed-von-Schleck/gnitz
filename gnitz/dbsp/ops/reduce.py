@@ -1,4 +1,4 @@
-# gnitz/vm/ops/reduce.py
+# gnitz/dbsp/ops/reduce.py
 
 from rpython.rlib import jit
 from rpython.rlib.longlong2float import longlong2float
@@ -9,50 +9,60 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.core import types, strings, xxh
 from gnitz.core.comparator import RowAccessor, PayloadRowAccessor
-from gnitz.vm import runtime
+
+"""
+Non-linear Reduce Operator for the DBSP algebra.
+
+Implements incremental GROUP BY + aggregation.  The core identity is:
+
+    δ_out = Agg(I(δ_in)) - Agg(z^{-1}(I(δ_in)))
+          = Agg(history + δ_in) - Agg(history)
+
+For linear aggregates (COUNT, SUM) the new aggregate value is computed by
+merging the old stored value with the delta contribution, avoiding a full
+replay of history.
+
+For non-linear aggregates (MIN, MAX) the new value must be recomputed from
+scratch by replaying the full history trace (trace_in_cursor) plus the
+current delta.
+
+State (the current aggregate per group) is maintained by the caller in a
+persistent trace table.  op_reduce reads that state via trace_out_cursor.
+The caller is responsible for updating the trace after this call — the
+QueryBuilder emits a separate IntegrateOp for that purpose.
+"""
 
 
 class ReduceAccessor(RowAccessor):
     """
     Virtual RowAccessor that assembles one output record for the REDUCE operator.
 
-    Why this exists
-    ---------------
-    op_reduce emits results through out_batch.append_from_accessor(), which
-    requires a RowAccessor over the OUTPUT schema.  The output record has two
-    distinct sources:
+    The output schema has two sources per column:
+      - Group-by columns: forwarded from the exemplar (a PayloadRowAccessor
+        over the input schema).
+      - Aggregate result column: taken from agg_func.get_value_bits() for the
+        new value, or from old_val_bits for the retraction of the previous value.
 
-      1. Group-by columns — read from the exemplar (the first input row of the
-         current group), forwarded via self.exemplar (a PayloadRowAccessor over
-         the INPUT schema).
+    The mapping array translates output column indices to input column indices
+    for group-by columns, or to sentinel values:
+      -1  aggregate result column
+      -2  synthetic hash PK (col 0 in the non-natural-PK case; skipped by
+          serialize_row because pk_index == 0, so never reached by get_* calls)
 
-      2. The aggregate result column — read from self.agg_func.get_value_bits()
-         (current tick) or self.old_val_bits (retraction of the previous result).
+    Output schema layout (mirrors _build_reduce_output_schema exactly):
 
-    The mapping array translates OUTPUT column indices to INPUT column indices
-    (for group-by columns) or to sentinel values (-1 for the agg result, -2
-    for the synthetic hash PK which is never read by serialize_row).
+    Natural-PK case (single group-by col of type U64 or U128):
+      col 0 (pk): the group column          mapping → group_indices[0]
+      col 1:      aggregate result           mapping → -1
 
-    Output schema structure (mirrors _build_reduce_output_schema exactly)
-    ---------------------------------------------------------------------
-    Natural-PK case — single group-by column of type U64 or U128:
-      col 0  (pk_index=0): the group column itself          mapping → group_indices[0]
-      col 1:               the aggregate result             mapping → -1
+    Synthetic-PK case (everything else):
+      col 0 (pk): synthetic U128 hash       mapping → -2
+      col 1..N:   group-by columns          mapping → group_indices[0..N-1]
+      col N+1:    aggregate result           mapping → -1
 
-    Synthetic-PK case — everything else:
-      col 0  (pk_index=0): synthetic U128 hash PK          mapping → -2
-      col 1..N:            group-by columns                 mapping → group_indices[0..N-1]
-      col N+1:             the aggregate result             mapping → -1
-
-    Since pk_index is always 0, serialize_row skips col 0 entirely, so mappings
-    for col 0 (-2 or group_indices[0]) are never reached by get_* calls from
-    the serialisation path.  They exist only to keep the mapping array correctly
-    indexed.
-
-    set_context() is called once per group before append_from_accessor().  It
-    is called twice per group when a retraction is needed — first with
-    use_old_val=True (emit the old value to retract it), then with
-    use_old_val=False (emit the new value to insert it).
+    set_context() is called twice per group when a retraction is needed:
+      first with use_old_val=True  (emit the old value with weight -1)
+      then  with use_old_val=False (emit the new value with weight +1)
     """
 
     _immutable_fields_ = [
@@ -68,8 +78,6 @@ class ReduceAccessor(RowAccessor):
         num_out = len(output_schema.columns)
         mapping = [0] * num_out
 
-        # Detect whether the output uses a natural PK (mirrors the condition in
-        # _build_reduce_output_schema so the two are always in sync).
         pk_code = output_schema.columns[0].field_type.code
         use_natural_pk = (
             len(group_indices) == 1
@@ -81,26 +89,23 @@ class ReduceAccessor(RowAccessor):
         )
 
         if use_natural_pk:
-            mapping[0] = group_indices[0]  # skipped by serialize_row (pk)
-            mapping[1] = -1  # agg result
+            mapping[0] = group_indices[0]  # pk col — skipped by serialize_row
+            mapping[1] = -1               # aggregate result
         else:
-            mapping[0] = -2  # synthetic hash PK, skipped by serialize_row
+            mapping[0] = -2               # synthetic hash PK — skipped by serialize_row
             for i in range(len(group_indices)):
                 mapping[i + 1] = group_indices[i]
-            mapping[num_out - 1] = -1  # agg result
+            mapping[num_out - 1] = -1     # aggregate result
 
         self.mapping_to_input = mapping
 
-        # Mutable context, refreshed per group via set_context().
         self.exemplar = None
         self.agg_func = None
         self.old_val_bits = r_uint64(0)
         self.use_old_val = False
 
     def set_context(self, exemplar, agg_func, old_val_bits, use_old_val):
-        """
-        Binds the accessor to a specific group and emission mode.
-        """
+        """Binds the accessor to a specific group and emission mode."""
         self.exemplar = exemplar
         self.agg_func = agg_func
         self.old_val_bits = old_val_bits
@@ -168,10 +173,16 @@ class ReduceAccessor(RowAccessor):
         return self.exemplar.get_col_ptr(src)
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
 @jit.unroll_safe
 def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):
     """
-    Compares two rows on the specified subset of schema columns.
+    Compares two rows on a specified subset of schema columns.
+    Returns negative, zero, or positive in the usual comparison convention.
     """
     for i in range(len(col_indices)):
         col_idx = col_indices[i]
@@ -225,7 +236,14 @@ def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):
 
 def _argsort_delta(batch, schema, col_indices):
     """
-    Returns a permutation of [0, count) sorted by the group-by columns.
+    Returns a permutation of [0, count) sorted by the specified group-by columns.
+
+    Uses insertion sort, which is acceptable because group-by columns are
+    typically low-cardinality and the delta batch is small per tick.
+
+    get_row() is used rather than get_accessor() because comparing two records
+    simultaneously requires two independent accessors; the batch's single shared
+    RawWALAccessor cannot serve both roles at once.
     """
     count = batch.length()
     indices = newlist_hint(count)
@@ -258,6 +276,10 @@ def _argsort_delta(batch, schema, col_indices):
 def _extract_group_key(accessor, schema, col_indices):
     """
     Derives the 128-bit group key from the group-by column values.
+
+    For the natural-PK case (single U64 or U128 group-by column) the key is
+    taken directly.  For all other cases a hash of the group column values is
+    computed and used as a synthetic key.
     """
     if len(col_indices) == 1:
         c_idx = col_indices[0]
@@ -282,34 +304,51 @@ def _extract_group_key(accessor, schema, col_indices):
     return (r_uint128(h_hi) << 64) | r_uint128(h_lo)
 
 
+# ---------------------------------------------------------------------------
+# Reduce operator implementation
+# ---------------------------------------------------------------------------
+
+
 def op_reduce(
-    reg_in,
-    reg_trace_in,
-    reg_trace_out,
-    reg_out,
+    delta_in,
+    input_schema,
+    trace_in_cursor,
+    trace_out_cursor,
+    out_batch,
     group_by_cols,
     agg_func,
     output_schema,
 ):
     """
-    Incremental DBSP REDUCE: δout = Agg(I + δin) - Agg(I).
+    Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
+
+    delta_in:         ArenaZSetBatch   — consolidated input delta for this tick
+    input_schema:     TableSchema      — schema of delta_in
+    trace_in_cursor:  AbstractCursor or None
+                        Seekable cursor over the full input history I(δ_in).
+                        Required (non-None) only for non-linear aggregates
+                        (MIN, MAX) that must recompute from scratch.
+                        Must be None for linear aggregates (COUNT, SUM).
+    trace_out_cursor: AbstractCursor
+                        Seekable cursor over the current aggregate trace, i.e.
+                        the stored result of Agg(history) per group key.
+                        Used to retrieve the old aggregate value for retraction.
+    out_batch:        ArenaZSetBatch   — output destination (caller clears beforehand)
+    group_by_cols:    list[int]        — column indices in input_schema to group by
+    agg_func:         AggregateFunction
+    output_schema:    TableSchema      — schema of out_batch
+
+    The caller (the VM interpreter) is responsible for persisting out_batch into
+    the aggregate trace table after this call returns, typically via a subsequent
+    IntegrateOp instruction.
     """
-    assert isinstance(reg_in, runtime.DeltaRegister)
-    delta_in = reg_in.batch
     if delta_in.length() == 0:
         return
-
-    assert isinstance(reg_out, runtime.DeltaRegister)
-    out_batch = reg_out.batch
-    out_batch.clear()
-
-    input_schema = reg_in.vm_schema.table_schema
 
     if not delta_in.is_sorted():
         delta_in.sort()
     delta_in.consolidate()
 
-    # Capture record count AFTER consolidation.
     n = delta_in.length()
     if n == 0:
         return
@@ -341,6 +380,7 @@ def op_reduce(
         else:
             group_key = _extract_group_key(acc_exemplar, input_schema, group_by_cols)
 
+        # Accumulate the delta contribution for this group.
         agg_func.reset()
         while idx < n:
             curr_idx = sorted_indices[idx]
@@ -354,34 +394,41 @@ def op_reduce(
             agg_func.step(acc_in, delta_in.get_weight(curr_idx))
             idx += 1
 
-        trace_out_cursor = reg_trace_out.cursor
+        # Look up the stored aggregate for this group so we can retract it.
         trace_out_cursor.seek(group_key)
 
         has_old = False
         old_val_bits = r_uint64(0)
         if trace_out_cursor.is_valid() and trace_out_cursor.key() == group_key:
             has_old = True
-            old_row_accessor = trace_out_cursor.get_accessor()
             agg_col_idx = len(output_schema.columns) - 1
-            old_val_bits = old_row_accessor.get_int(agg_col_idx)
+            old_val_bits = trace_out_cursor.get_accessor().get_int(agg_col_idx)
 
+            # Emit the retraction of the previous aggregate value.
             reduce_acc.set_context(acc_exemplar, agg_func, old_val_bits, True)
             out_batch.append_from_accessor(group_key, r_int64(-1), reduce_acc)
 
+        # Compute the new aggregate value.
         if agg_func.is_linear() and has_old:
+            # Linear shortcut: new_agg = old_agg + delta_contribution.
+            # delta_contribution is already in agg_func from the loop above.
             agg_func.merge_accumulated(old_val_bits, r_int64(1))
         elif not agg_func.is_linear():
+            # Non-linear: must replay full history plus the current delta.
+            # trace_in_cursor must be non-None when this branch is reachable.
             agg_func.reset()
-            trace_in = reg_trace_in.cursor
-            trace_in.seek(group_key)
-            while trace_in.is_valid() and trace_in.key() == group_key:
-                agg_func.step(trace_in.get_accessor(), trace_in.weight())
-                trace_in.advance()
+            trace_in_cursor.seek(group_key)
+            while trace_in_cursor.is_valid() and trace_in_cursor.key() == group_key:
+                agg_func.step(trace_in_cursor.get_accessor(), trace_in_cursor.weight())
+                trace_in_cursor.advance()
             for k in range(group_start_pos, idx):
                 d_idx = sorted_indices[k]
                 acc_in.set_row(delta_in.get_row(d_idx))
                 agg_func.step(acc_in, delta_in.get_weight(d_idx))
+        # Linear agg without a stored old value: agg_func already holds the
+        # delta contribution from the accumulation loop above; nothing to merge.
 
+        # Emit the new aggregate value if the accumulator is non-zero.
         if not agg_func.is_accumulator_zero():
             reduce_acc.set_context(acc_exemplar, agg_func, r_uint64(0), False)
             out_batch.append_from_accessor(group_key, r_int64(1), reduce_acc)

@@ -1,7 +1,9 @@
 # gnitz/vm/interpreter.py
 
 from rpython.rlib import jit
-from gnitz.vm import instructions, ops, runtime
+
+from gnitz.dbsp import ops
+from gnitz.vm import instructions, runtime
 
 
 def get_printable_location(pc, program, self):
@@ -24,8 +26,13 @@ class DBSPInterpreter(object):
     """
     Incremental DBSP Execution Engine.
 
-    Executes a static program of Z-Set transformations. Each execution
-    corresponds to one LSN epoch (tick).
+    Executes a static program of Z-Set transformations.  Each call to
+    execute() corresponds to one LSN epoch (tick).
+
+    This class is responsible solely for dispatch: it unpacks each
+    instruction's register references into concrete batches, cursors, tables,
+    and schemas, then delegates to the stateless operator functions in
+    gnitz.dbsp.ops.  No operator logic lives here.
     """
 
     _immutable_fields_ = ["register_file", "program[*]"]
@@ -38,19 +45,15 @@ class DBSPInterpreter(object):
         """
         Executes the circuit for a single batch of input updates.
 
-        1. Clears transient delta registers.
-        2. Ingests raw updates into the circuit entry point (Register 0).
+        1. Clears all transient delta registers for the new epoch.
+        2. Ingests the raw updates into Register 0 (the circuit entry point).
         3. Iterates through the program instructions until HALT.
         """
-        # Reset state for a new epoch
         self.register_file.clear_all_deltas()
 
-        # Entry point: Register 0 must be a DeltaRegister
         reg0 = self.register_file.get_register(0)
         assert isinstance(reg0, runtime.DeltaRegister)
 
-        # Move input data into the circuit. 
-        # Refactor: Use zero-allocation accessor path for ingestion.
         for i in range(input_batch.length()):
             reg0.batch.append_from_accessor(
                 input_batch.get_pk(i),
@@ -70,58 +73,100 @@ class DBSPInterpreter(object):
             instr = program[pc]
             opcode = instr.opcode
 
-            # Marshalling logic: Unpack instructions and pass components to ops.
-            # No operator logic (ops.op_*) ever sees an Instruction object.
-
             if opcode == instructions.Instruction.HALT:
                 break
 
             elif opcode == instructions.Instruction.FILTER:
                 assert isinstance(instr, instructions.FilterOp)
-                ops.op_filter(instr.reg_in, instr.reg_out, instr.func)
+                ops.op_filter(
+                    instr.reg_in.batch,
+                    instr.reg_out.batch,
+                    instr.func,
+                )
 
             elif opcode == instructions.Instruction.MAP:
                 assert isinstance(instr, instructions.MapOp)
-                ops.op_map(instr.reg_in, instr.reg_out, instr.func)
+                ops.op_map(
+                    instr.reg_in.batch,
+                    instr.reg_out.batch,
+                    instr.func,
+                    instr.reg_out.vm_schema.table_schema,
+                )
 
             elif opcode == instructions.Instruction.NEGATE:
                 assert isinstance(instr, instructions.NegateOp)
-                ops.op_negate(instr.reg_in, instr.reg_out)
+                ops.op_negate(
+                    instr.reg_in.batch,
+                    instr.reg_out.batch,
+                )
 
             elif opcode == instructions.Instruction.UNION:
                 assert isinstance(instr, instructions.UnionOp)
-                ops.op_union(instr.reg_in_a, instr.reg_in_b, instr.reg_out)
+                b_batch = None
+                if instr.reg_in_b is not None:
+                    b_batch = instr.reg_in_b.batch
+                ops.op_union(
+                    instr.reg_in_a.batch,
+                    b_batch,
+                    instr.reg_out.batch,
+                )
 
             elif opcode == instructions.Instruction.DISTINCT:
                 assert isinstance(instr, instructions.DistinctOp)
-                ops.op_distinct(instr.reg_in, instr.reg_history, instr.reg_out)
+                ops.op_distinct(
+                    instr.reg_in.batch,
+                    instr.reg_history.table,
+                    instr.reg_out.batch,
+                )
 
             elif opcode == instructions.Instruction.JOIN_DELTA_TRACE:
                 assert isinstance(instr, instructions.JoinDeltaTraceOp)
-                ops.op_join_delta_trace(instr.reg_delta, instr.reg_trace, instr.reg_out)
+                ops.op_join_delta_trace(
+                    instr.reg_delta.batch,
+                    instr.reg_trace.cursor,
+                    instr.reg_out.batch,
+                    instr.reg_delta.vm_schema.table_schema,
+                    instr.reg_trace.vm_schema.table_schema,
+                )
 
             elif opcode == instructions.Instruction.JOIN_DELTA_DELTA:
                 assert isinstance(instr, instructions.JoinDeltaDeltaOp)
-                ops.op_join_delta_delta(instr.reg_a, instr.reg_b, instr.reg_out)
+                ops.op_join_delta_delta(
+                    instr.reg_a.batch,
+                    instr.reg_b.batch,
+                    instr.reg_out.batch,
+                    instr.reg_a.vm_schema.table_schema,
+                    instr.reg_b.vm_schema.table_schema,
+                )
 
             elif opcode == instructions.Instruction.DELAY:
                 assert isinstance(instr, instructions.DelayOp)
-                ops.op_delay(instr.reg_in, instr.reg_out)
+                ops.op_delay(
+                    instr.reg_in.batch,
+                    instr.reg_out.batch,
+                )
 
             elif opcode == instructions.Instruction.INTEGRATE:
                 assert isinstance(instr, instructions.IntegrateOp)
-                ops.op_integrate(instr.reg_in, instr.target_table)
+                ops.op_integrate(
+                    instr.reg_in.batch,
+                    instr.target_table,
+                )
 
             elif opcode == instructions.Instruction.REDUCE:
                 assert isinstance(instr, instructions.ReduceOp)
+                trace_in_cursor = None
+                if instr.reg_trace_in is not None:
+                    trace_in_cursor = instr.reg_trace_in.cursor
                 ops.op_reduce(
-                    instr.reg_in,
-                    instr.reg_trace_in,
-                    instr.reg_trace_out,
-                    instr.reg_out,
+                    instr.reg_in.batch,
+                    instr.reg_in.vm_schema.table_schema,
+                    trace_in_cursor,
+                    instr.reg_trace_out.cursor,
+                    instr.reg_out.batch,
                     instr.group_by_cols,
                     instr.agg_func,
-                    instr.output_schema
+                    instr.output_schema,
                 )
 
             pc += 1
