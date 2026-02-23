@@ -1,8 +1,10 @@
 # gnitz/vm/functions.py
 
 from rpython.rlib.rarithmetic import r_int64, intmask, r_uint64
+from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rtyper.lltypesystem import rffi
 from gnitz.core import types
+
 
 class ScalarFunction(object):
     _immutable_fields_ = []
@@ -25,15 +27,38 @@ class AggregateFunction(object):
 
     def merge_accumulated(self, value_bits, weight):
         """
-        Merges a pre-calculated aggregate result (from the trace) into the current state.
-        Used for linear aggregation optimizations (Agg(Old + New) = Agg(Old) + Agg(New)).
-        
-        value_bits: r_uint64 (raw bits from storage)
-        weight: r_int64
+        Merges a pre-calculated aggregate result from the trace into the
+        current accumulator.  Only called when is_linear() is True.
+
+        value_bits: r_uint64 — raw bit pattern from storage (same encoding
+                    as get_value_bits() returns).
+        weight:     r_int64 — multiplier to apply before merging.
         """
         raise NotImplementedError
 
-    def emit(self, output_row):
+    def get_value_bits(self):
+        """
+        Returns the current accumulator state as a raw r_uint64 bit pattern.
+
+        For integer accumulators the pattern is the two's-complement r_int64
+        value reinterpreted as unsigned.  For float accumulators it is the
+        IEEE 754 double-precision bit pattern produced by float2longlong and
+        reinterpreted as unsigned.
+
+        This is the sole read surface consumed by ReduceAccessor to serialise
+        results through the zero-copy batch path.  It replaces the former
+        emit(output_row) path which was removed after the zero-copy refactor.
+        """
+        raise NotImplementedError
+
+    def output_is_float(self):
+        """
+        Returns True when the accumulator holds a floating-point bit pattern.
+
+        ReduceAccessor uses this flag to route the aggregate column through
+        get_float() — which reconstructs the value via longlong2float — rather
+        than get_int().  Must be consistent with output_column_type().
+        """
         raise NotImplementedError
 
     def is_linear(self):
@@ -46,7 +71,20 @@ class AggregateFunction(object):
         raise NotImplementedError
 
 
+# ---------------------------------------------------------------------------
+# COUNT
+# ---------------------------------------------------------------------------
+
+
 class CountAggregateFunction(AggregateFunction):
+    """
+    Counts the weighted number of records in each group.
+
+    Linear: COUNT(A + B) = COUNT(A) + COUNT(B).
+    is_accumulator_zero() returns True when the weighted count is zero,
+    meaning the group contributes nothing to the Z-Set output.
+    """
+
     def __init__(self):
         self._count = r_int64(0)
 
@@ -57,13 +95,14 @@ class CountAggregateFunction(AggregateFunction):
         self._count = r_int64(intmask(self._count + weight))
 
     def merge_accumulated(self, value_bits, weight):
-        # value_bits represents the previous count. 
-        # We add (prev_count * weight).
         prev_cnt = rffi.cast(rffi.LONGLONG, value_bits)
         self._count = r_int64(intmask(self._count + (prev_cnt * weight)))
 
-    def emit(self, output_row):
-        output_row.append_int(self._count)
+    def get_value_bits(self):
+        return r_uint64(intmask(self._count))
+
+    def output_is_float(self):
+        return False
 
     def is_linear(self):
         return True
@@ -75,110 +114,310 @@ class CountAggregateFunction(AggregateFunction):
         return self._count == 0
 
 
-class SumI64AggregateFunction(AggregateFunction):
-    _immutable_fields_ = ["col_idx"]
+# ---------------------------------------------------------------------------
+# SUM
+# ---------------------------------------------------------------------------
 
-    def __init__(self, col_idx):
+
+class SumAggregateFunction(AggregateFunction):
+    """
+    Computes the weighted algebraic sum of a column.
+
+    Supported column types: all integer types (I8..U64) and float types
+    (F32, F64).  TYPE_STRING and TYPE_U128 are rejected at construction
+    time with an assertion.
+
+    Accumulator (_acc: r_int64):
+      - Integer types: stores two's-complement I64-widened bits.
+        Unsigned column types are reinterpreted as signed via rffi.cast
+        before accumulation — this matches the existing pattern for large U64
+        values and is consistent with the I64 output type.
+      - Float types: stores the IEEE 754 double-precision bit pattern via
+        float2longlong.  Crucially, float2longlong(0.0) == r_int64(0), so the
+        zero initialiser r_int64(0) is shared between integer and float paths
+        with no special casing.
+
+    Output column type:
+      - F32 / F64 input  →  TYPE_F64  (widened to double)
+      - all integer input →  TYPE_I64  (widened to signed 64-bit)
+
+    is_linear() returns True: SUM(A + B) = SUM(A) + SUM(B).
+
+    is_accumulator_zero() checks _acc == r_int64(0).  For float types the
+    -0.0 edge case (bit pattern 0x8000000000000000) would not trigger this
+    check, but -0.0 is unreachable via ordinary weighted summation starting
+    from +0.0, so this is acceptable.
+
+    col_type_code is stored in _immutable_fields_ so the JIT promotes it to
+    a compile-time constant per trace, folding all dispatch branches in step()
+    and producing type-specialised machine code equivalent to a separate class
+    per type.
+    """
+
+    _immutable_fields_ = ["col_idx", "col_type_code"]
+
+    def __init__(self, col_idx, field_type):
+        assert field_type.code != types.TYPE_STRING.code
+        assert field_type.code != types.TYPE_U128.code
         self.col_idx = col_idx
-        self._sum = r_int64(0)
+        self.col_type_code = field_type.code
+        self._acc = r_int64(0)
 
     def reset(self):
-        self._sum = r_int64(0)
+        self._acc = r_int64(0)
 
     def step(self, row_accessor, weight):
         if row_accessor.is_null(self.col_idx):
             return
-        val_u = row_accessor.get_int(self.col_idx)
-        val = rffi.cast(rffi.LONGLONG, val_u)
-        weighted_val = r_int64(intmask(val * weight))
-        self._sum = r_int64(intmask(self._sum + weighted_val))
+        code = self.col_type_code
+        if code == types.TYPE_F64.code or code == types.TYPE_F32.code:
+            val_f = row_accessor.get_float(self.col_idx)
+            w_f = float(intmask(weight))
+            cur_f = longlong2float(self._acc)
+            self._acc = float2longlong(cur_f + val_f * w_f)
+        elif (
+            code == types.TYPE_I8.code
+            or code == types.TYPE_I16.code
+            or code == types.TYPE_I32.code
+            or code == types.TYPE_I64.code
+        ):
+            val = row_accessor.get_int_signed(self.col_idx)
+            weighted = r_int64(intmask(val * weight))
+            self._acc = r_int64(intmask(self._acc + weighted))
+        else:
+            # Unsigned integer types: U8, U16, U32, U64.
+            # Reinterpret unsigned bits as signed for I64-widened accumulation.
+            # Large U64 values (> MAX_I64) will appear negative in the I64
+            # output, consistent with the declared output type.
+            val_u = row_accessor.get_int(self.col_idx)
+            val = rffi.cast(rffi.LONGLONG, val_u)
+            weighted = r_int64(intmask(val * weight))
+            self._acc = r_int64(intmask(self._acc + weighted))
 
     def merge_accumulated(self, value_bits, weight):
-        # value_bits represents the previous sum.
-        prev_sum = rffi.cast(rffi.LONGLONG, value_bits)
-        # We add (prev_sum * weight)
-        weighted_prev = r_int64(intmask(prev_sum * weight))
-        self._sum = r_int64(intmask(self._sum + weighted_prev))
+        code = self.col_type_code
+        if code == types.TYPE_F64.code or code == types.TYPE_F32.code:
+            prev_f = longlong2float(rffi.cast(rffi.LONGLONG, value_bits))
+            w_f = float(intmask(weight))
+            cur_f = longlong2float(self._acc)
+            self._acc = float2longlong(cur_f + prev_f * w_f)
+        else:
+            prev = rffi.cast(rffi.LONGLONG, value_bits)
+            weighted = r_int64(intmask(prev * weight))
+            self._acc = r_int64(intmask(self._acc + weighted))
 
-    def emit(self, output_row):
-        output_row.append_int(self._sum)
+    def get_value_bits(self):
+        return r_uint64(intmask(self._acc))
+
+    def output_is_float(self):
+        return (
+            self.col_type_code == types.TYPE_F64.code
+            or self.col_type_code == types.TYPE_F32.code
+        )
 
     def is_linear(self):
         return True
 
     def output_column_type(self):
+        if (
+            self.col_type_code == types.TYPE_F64.code
+            or self.col_type_code == types.TYPE_F32.code
+        ):
+            return types.TYPE_F64
         return types.TYPE_I64
 
     def is_accumulator_zero(self):
-        return self._sum == 0
+        return self._acc == r_int64(0)
 
 
-class MinI64AggregateFunction(AggregateFunction):
-    _immutable_fields_ = ["col_idx"]
-    _MAX_I64 = r_int64(9223372036854775807)
+# ---------------------------------------------------------------------------
+# MIN / MAX
+# ---------------------------------------------------------------------------
+#
+# Both are non-linear operators.
+#
+# Design notes shared by MinAggregateFunction and MaxAggregateFunction:
+#
+# _has_value flag (bool, not in _immutable_fields_):
+#   Tracks whether step() has ever observed a non-null value.  Using this
+#   flag instead of type-specific sentinels:
+#     (a) avoids float infinity literals, which are not expressible as RPython
+#         prebuilt constants and would require runtime computation,
+#     (b) makes is_accumulator_zero() uniform across all supported types —
+#         it simply returns "not self._has_value", and
+#     (c) keeps the reset() initialiser uniform: _acc = r_int64(0),
+#         _has_value = False.
+#
+# _acc field (r_int64):
+#   Stores the current minimum or maximum as:
+#     - signed int bits (r_int64) for signed integer column types,
+#     - unsigned int bits reinterpreted as signed via rffi.cast(LONGLONG, ...)
+#       for unsigned integer column types (compared as r_uint64 in step()),
+#     - IEEE 754 double-precision bits via float2longlong for float types.
+#
+# weight parameter in step():
+#   Intentionally unused.  The minimum and maximum of a multiset do not
+#   depend on element multiplicities.  Negative weights (deletions) are
+#   handled by the non-linear full-rescan path in op_reduce; step() only
+#   sees values that are actually present in the input batch or trace.
+#
+# merge_accumulated():
+#   No-op.  Non-linear aggregates are never called via the linear
+#   optimisation path in op_reduce.
+#
+# Output column type:
+#   - F32 / F64 input  →  TYPE_F64  (widened to double, matching get_float())
+#   - all integer input →  TYPE_I64  (widened to signed 64-bit)
 
-    def __init__(self, col_idx):
+
+class MinAggregateFunction(AggregateFunction):
+    """
+    Computes the minimum value of a column over the group.
+
+    Supported column types: all integer types (I8..U64) and float types
+    (F32, F64).  TYPE_STRING and TYPE_U128 are rejected at construction
+    time with an assertion.
+    """
+
+    _immutable_fields_ = ["col_idx", "col_type_code"]
+
+    def __init__(self, col_idx, field_type):
+        assert field_type.code != types.TYPE_STRING.code
+        assert field_type.code != types.TYPE_U128.code
         self.col_idx = col_idx
-        self._val = self._MAX_I64
+        self.col_type_code = field_type.code
+        self._acc = r_int64(0)
+        self._has_value = False
 
     def reset(self):
-        self._val = self._MAX_I64
+        self._acc = r_int64(0)
+        self._has_value = False
 
     def step(self, row_accessor, weight):
         if row_accessor.is_null(self.col_idx):
             return
-        val_u = row_accessor.get_int(self.col_idx)
-        val = rffi.cast(rffi.LONGLONG, val_u)
-        if val < self._val:
-            self._val = val
+        code = self.col_type_code
+        if code == types.TYPE_F64.code or code == types.TYPE_F32.code:
+            v = row_accessor.get_float(self.col_idx)
+            if not self._has_value or v < longlong2float(self._acc):
+                self._acc = float2longlong(v)
+                self._has_value = True
+        elif (
+            code == types.TYPE_I8.code
+            or code == types.TYPE_I16.code
+            or code == types.TYPE_I32.code
+            or code == types.TYPE_I64.code
+        ):
+            v = row_accessor.get_int_signed(self.col_idx)
+            if not self._has_value or v < self._acc:
+                self._acc = v
+                self._has_value = True
+        else:
+            # Unsigned: compare as r_uint64, store bits reinterpreted as signed.
+            v_u = row_accessor.get_int(self.col_idx)
+            cur_u = r_uint64(intmask(self._acc))
+            if not self._has_value or v_u < cur_u:
+                self._acc = rffi.cast(rffi.LONGLONG, v_u)
+                self._has_value = True
 
     def merge_accumulated(self, value_bits, weight):
-        # Not linear; this path is never taken by ReduceOp
         pass
 
-    def emit(self, output_row):
-        output_row.append_int(self._val)
+    def get_value_bits(self):
+        return r_uint64(intmask(self._acc))
+
+    def output_is_float(self):
+        return (
+            self.col_type_code == types.TYPE_F64.code
+            or self.col_type_code == types.TYPE_F32.code
+        )
 
     def is_linear(self):
         return False
 
     def output_column_type(self):
+        if (
+            self.col_type_code == types.TYPE_F64.code
+            or self.col_type_code == types.TYPE_F32.code
+        ):
+            return types.TYPE_F64
         return types.TYPE_I64
 
     def is_accumulator_zero(self):
-        return self._val == self._MAX_I64
+        return not self._has_value
 
 
-class MaxI64AggregateFunction(AggregateFunction):
-    _immutable_fields_ = ["col_idx"]
-    _MIN_I64 = r_int64(-9223372036854775808)
+class MaxAggregateFunction(AggregateFunction):
+    """
+    Computes the maximum value of a column over the group.
 
-    def __init__(self, col_idx):
+    Supported column types: all integer types (I8..U64) and float types
+    (F32, F64).  TYPE_STRING and TYPE_U128 are rejected at construction
+    time with an assertion.
+    """
+
+    _immutable_fields_ = ["col_idx", "col_type_code"]
+
+    def __init__(self, col_idx, field_type):
+        assert field_type.code != types.TYPE_STRING.code
+        assert field_type.code != types.TYPE_U128.code
         self.col_idx = col_idx
-        self._val = self._MIN_I64
+        self.col_type_code = field_type.code
+        self._acc = r_int64(0)
+        self._has_value = False
 
     def reset(self):
-        self._val = self._MIN_I64
+        self._acc = r_int64(0)
+        self._has_value = False
 
     def step(self, row_accessor, weight):
         if row_accessor.is_null(self.col_idx):
             return
-        val_u = row_accessor.get_int(self.col_idx)
-        val = rffi.cast(rffi.LONGLONG, val_u)
-        if val > self._val:
-            self._val = val
+        code = self.col_type_code
+        if code == types.TYPE_F64.code or code == types.TYPE_F32.code:
+            v = row_accessor.get_float(self.col_idx)
+            if not self._has_value or v > longlong2float(self._acc):
+                self._acc = float2longlong(v)
+                self._has_value = True
+        elif (
+            code == types.TYPE_I8.code
+            or code == types.TYPE_I16.code
+            or code == types.TYPE_I32.code
+            or code == types.TYPE_I64.code
+        ):
+            v = row_accessor.get_int_signed(self.col_idx)
+            if not self._has_value or v > self._acc:
+                self._acc = v
+                self._has_value = True
+        else:
+            v_u = row_accessor.get_int(self.col_idx)
+            cur_u = r_uint64(intmask(self._acc))
+            if not self._has_value or v_u > cur_u:
+                self._acc = rffi.cast(rffi.LONGLONG, v_u)
+                self._has_value = True
 
     def merge_accumulated(self, value_bits, weight):
         pass
 
-    def emit(self, output_row):
-        output_row.append_int(self._val)
+    def get_value_bits(self):
+        return r_uint64(intmask(self._acc))
+
+    def output_is_float(self):
+        return (
+            self.col_type_code == types.TYPE_F64.code
+            or self.col_type_code == types.TYPE_F32.code
+        )
 
     def is_linear(self):
         return False
 
     def output_column_type(self):
+        if (
+            self.col_type_code == types.TYPE_F64.code
+            or self.col_type_code == types.TYPE_F32.code
+        ):
+            return types.TYPE_F64
         return types.TYPE_I64
 
     def is_accumulator_zero(self):
-        return self._val == self._MIN_I64
+        return not self._has_value

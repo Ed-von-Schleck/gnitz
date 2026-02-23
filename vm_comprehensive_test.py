@@ -180,8 +180,12 @@ def test_reduce_aggregates(base_dir):
         out_batch = view_count.process(in_batch)
         
         # Result Schema: [PK(U64), Agg(I64)]
-        if out_batch.get_weight(0) != 1: return False
-        if out_batch.get_pk(0) != r_uint128(100): return False
+        if out_batch.get_weight(0) != 1: 
+            os.write(2, "ERR: COUNT expected weight 1\n")
+            return False
+        if out_batch.get_pk(0) != r_uint128(100): 
+            os.write(2, "ERR: COUNT expected PK 100\n")
+            return False
 
         # HARDENED: Use the semantic signed accessor to avoid illegal r_int64(r_uint64) cast
         val = out_batch.get_accessor(0).get_int_signed(1)
@@ -222,9 +226,10 @@ def test_temporal_and_smj(base_dir):
     reg_file.registers[2] = r2
 
     # SMJ: r0 (delta) join r1 (delta) -> r2
+    # In a proper tick, the join reads the delayed value before DelayOp overwrites it.
     prog = [
-        instructions.DelayOp(r0, r1),
         instructions.JoinDeltaDeltaOp(r0, r1, r2),
+        instructions.DelayOp(r0, r1),
         instructions.HaltOp()
     ]
     
@@ -235,18 +240,21 @@ def test_temporal_and_smj(base_dir):
     row.append_int(r_int64(7))
     in_batch = batch.make_singleton_batch(schema, pk, r_int64(1), row)
 
-    # Tick 1: Delay moves r0 to r1 (but r1 is cleared at start of execute)
-    # JoinDeltaDelta(r0, r1) where r1 is empty -> Result empty
+    # Tick 1: JoinDeltaDelta(r0, r1) where r1 is empty -> Result empty.
+    # Then DelayOp copies r0 to r1 for the next tick.
     interp.execute(in_batch)
-    if r2.batch.length() != 0: return False
+    if r2.batch.length() != 0:
+        os.write(2, "ERR: r2 should be empty after Tick 1\n")
+        return False
 
-    # In a real DBSP circuit, Delay works across ticks. 
-    # Here we manually simulate the data persistence in r1.
-    r1.batch.append(pk, r_int64(1), row)
+    # In a real DBSP circuit, Delay works across ticks and state is preserved.
+    # Since execute() would clear r1 (because it's a DeltaRegister and the VM 
+    # lacks a proper DelayRegister), we manually simulate the next tick's join 
+    # without calling execute() again. r1 already contains the delayed data.
     ops.op_join_delta_delta(r0, r1, r2)
     
     if r2.batch.length() != 1:
-        os.write(2, "ERR: SMJ failed to find match\n")
+        os.write(2, "ERR: SMJ failed to find match, length=%d\n" % r2.batch.length())
         return False
 
     os.write(1, "    [OK] Temporal and SMJ ops verified.\n")
