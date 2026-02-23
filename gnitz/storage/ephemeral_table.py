@@ -7,7 +7,6 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.core.batch import make_singleton_batch
 from gnitz.core import types, errors, serialize
 from gnitz.core import comparator as core_comparator
 from gnitz.storage import (
@@ -25,9 +24,8 @@ class EphemeralTable(AbstractTable):
     """
     Scratch Z-Set storage for internal VM state (Traces, Materialized Views).
 
-    Bypasses the Write-Ahead Log to maximize throughput. Data is kept in-memory
-    via MemTable and occasionally flushed to temporary shards to manage
-    RAM pressure.
+    Bypasses the Write-Ahead Log to maximize throughput. Operates purely on
+    raw memory buffers and Accessors.
     """
 
     _immutable_fields_ = [
@@ -66,7 +64,7 @@ class EphemeralTable(AbstractTable):
         self.memtable = memtable.MemTable(schema, memtable_arena_size)
 
     # -------------------------------------------------------------------------
-    # AbstractTable Implementation
+    # AbstractTable Implementation (Pure Accessor/Batch Path)
     # -------------------------------------------------------------------------
 
     def get_schema(self):
@@ -100,15 +98,10 @@ class EphemeralTable(AbstractTable):
             memtable_arena_size=self.memtable.arena.size,
         )
 
-    def ingest(self, key, weight, payload):
-        """External API: ingest a single PayloadRow via a singleton batch."""
-        batch = make_singleton_batch(self.schema, r_uint128(key), weight, payload)
-        self.ingest_batch(batch)
-
     def ingest_batch(self, batch):
         """
         Ingests a batch of Z-Set deltas into the MemTable.
-        Bypasses WAL writer for maximum scratch throughput.
+        Zero-copy: bypasses WAL writer and re-serialization.
         """
         if self.is_closed:
             raise errors.StorageError("Table is closed")
@@ -116,25 +109,25 @@ class EphemeralTable(AbstractTable):
         if batch.length() == 0:
             return
 
-        # Visibility: Update MemTable only.
-        # This uses the batch's RowAccessor interface to stay batch-oriented.
+        # Visibility: Update MemTable using the batch's raw memory fast-path.
         self.memtable.upsert_batch(batch)
 
-    def get_weight(self, key, payload):
+    def get_weight(self, key, accessor):
+        """
+        Returns the net algebraic weight for a specific record.
+        Zero-allocation: uses the provided accessor for SkipList search
+        and columnar shard comparisons.
+        """
         r_key = r_uint128(key)
         total_w = r_int64(0)
 
         # 1. Check SkipList MemTable
-        # We must use a RowAccessor to bridge the VM's PayloadRow to storage logic.
-        val_acc = core_comparator.PayloadRowAccessor(self.schema)
-        val_acc.set_row(payload)
-
-        # Calculate hash for SkipList O(1) payload check
+        # Calculate hash for SkipList O(1) payload check directly from accessor
         h_val, _, _ = serialize.compute_hash(
-            self.schema, val_acc, lltype.nullptr(rffi.CCHARP.TO), 0
+            self.schema, accessor, lltype.nullptr(rffi.CCHARP.TO), 0
         )
 
-        node_off = self.memtable._find_exact_values(r_key, h_val, val_acc)
+        node_off = self.memtable._find_exact_values(r_key, h_val, accessor)
         if node_off != 0:
             total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
 
@@ -147,6 +140,7 @@ class EphemeralTable(AbstractTable):
                 view = handle.view
                 idx = row_idx
                 while idx < view.count:
+                    # Check PK Match
                     if self.schema.get_pk_column().field_type.size == 16:
                         if view.get_pk_u128(idx) != r_key:
                             break
@@ -154,8 +148,9 @@ class EphemeralTable(AbstractTable):
                         if r_uint128(view.get_pk_u64(idx)) != r_key:
                             break
 
+                    # Check Payload Semantic Equality
                     soa.set_row(view, idx)
-                    if core_comparator.compare_rows(self.schema, soa, val_acc) == 0:
+                    if core_comparator.compare_rows(self.schema, soa, accessor) == 0:
                         total_w += view.get_weight(idx)
                     idx += 1
 
@@ -164,12 +159,6 @@ class EphemeralTable(AbstractTable):
     # -------------------------------------------------------------------------
     # Maintenance Logic
     # -------------------------------------------------------------------------
-
-    def insert(self, pk, row):
-        self.ingest(pk, r_int64(1), row)
-
-    def delete(self, pk, row):
-        self.ingest(pk, r_int64(-1), row)
 
     def flush(self):
         """Transitions MemTable state to a temporary columnar shard."""

@@ -49,12 +49,13 @@ class DBSPInterpreter(object):
         reg0 = self.register_file.get_register(0)
         assert isinstance(reg0, runtime.DeltaRegister)
 
-        # Move input data into the circuit. Note: input_batch is a ZSetBatch.
+        # Move input data into the circuit. 
+        # Refactor: Use zero-allocation accessor path for ingestion.
         for i in range(input_batch.length()):
-            reg0.batch.append(
+            reg0.batch.append_from_accessor(
                 input_batch.get_pk(i),
                 input_batch.get_weight(i),
-                input_batch.get_row(i),
+                input_batch.get_accessor(i),
             )
 
         program = self.program
@@ -70,7 +71,6 @@ class DBSPInterpreter(object):
             opcode = instr.opcode
 
             # Marshalling logic: Unpack instructions and pass components to ops.
-            # This maintains a pure functional boundary for the operator layer.
             # No operator logic (ops.op_*) ever sees an Instruction object.
 
             if opcode == instructions.Instruction.HALT:
@@ -94,7 +94,6 @@ class DBSPInterpreter(object):
 
             elif opcode == instructions.Instruction.DISTINCT:
                 assert isinstance(instr, instructions.DistinctOp)
-                # op_distinct signature is now uniform: (reg_in, reg_history, reg_out)
                 ops.op_distinct(instr.reg_in, instr.reg_history, instr.reg_out)
 
             elif opcode == instructions.Instruction.JOIN_DELTA_TRACE:
@@ -111,12 +110,10 @@ class DBSPInterpreter(object):
 
             elif opcode == instructions.Instruction.INTEGRATE:
                 assert isinstance(instr, instructions.IntegrateOp)
-                # Pass both the register (delta source) and the table (persistent sink)
                 ops.op_integrate(instr.reg_in, instr.target_table)
 
             elif opcode == instructions.Instruction.REDUCE:
                 assert isinstance(instr, instructions.ReduceOp)
-                # Fully decomposed signature to keep ops.op_reduce uniform.
                 ops.op_reduce(
                     instr.reg_in,
                     instr.reg_trace_in,

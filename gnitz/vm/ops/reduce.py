@@ -4,18 +4,99 @@ from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
-from gnitz.core import types, values, strings, xxh
-from gnitz.core.values import make_payload_row
-from gnitz.core.comparator import PayloadRowAccessor
+from gnitz.core import types, strings, xxh
+from gnitz.core.comparator import RowAccessor, PayloadRowAccessor
 from gnitz.vm import runtime
+
+
+class ReduceAccessor(RowAccessor):
+    """
+    Virtual accessor for reduction results.
+    Maps output schema columns to input group-by columns or aggregate results.
+    """
+    _immutable_fields_ = [
+        "input_schema", "output_schema", 
+        "mapping_to_input[*]", "agg_col_idx"
+    ]
+
+    def __init__(self, input_schema, output_schema, group_indices):
+        self.input_schema = input_schema
+        self.output_schema = output_schema
+        self.agg_col_idx = len(output_schema.columns) - 1
+        
+        # Build mapping: output_col_idx -> input_col_idx (or -1 for agg)
+        num_out = len(output_schema.columns)
+        mapping = [-1] * num_out
+        
+        # Identify group columns in output. 
+        # Output PK is handled by batch.append, so we map payload cols.
+        # Logic matches types._build_reduce_output_schema
+        use_natural_pk = (len(group_indices) == 1 and 
+                         output_schema.pk_index == 0 and
+                         output_schema.columns[0].field_type.code in (types.TYPE_U64.code, types.TYPE_U128.code))
+
+        if use_natural_pk:
+            # Output: [PK(GroupCol), Agg]
+            mapping[0] = group_indices[0]
+            mapping[1] = -1
+        else:
+            # Output: [PK(Hash), GroupCol_0...GroupCol_N, Agg]
+            mapping[0] = -2 # PK is hash, not in input payload
+            for i in range(len(group_indices)):
+                mapping[i + 1] = group_indices[i]
+            mapping[num_out - 1] = -1
+
+        self.mapping_to_input = mapping
+        self.exemplar = None
+        self.agg_func = None
+        self.old_val_bits = r_uint64(0)
+        self.use_old_val = False
+
+    def set_context(self, exemplar, agg_func, old_val_bits=r_uint64(0), use_old_val=False):
+        self.exemplar = exemplar
+        self.agg_func = agg_func
+        self.old_val_bits = old_val_bits
+        self.use_old_val = use_old_val
+
+    @jit.unroll_safe
+    def is_null(self, col_idx):
+        src = self.mapping_to_input[col_idx]
+        if src == -1: return False # Aggregates are not null in this version
+        if src < 0: return False
+        return self.exemplar.is_null(src)
+
+    @jit.unroll_safe
+    def get_int(self, col_idx):
+        src = self.mapping_to_input[col_idx]
+        if src == -1:
+            if self.use_old_val: return self.old_val_bits
+            # Note: agg_func.get_value_bits() returns r_uint64 bit pattern
+            return self.agg_func.get_value_bits()
+        return self.exemplar.get_int(src)
+
+    @jit.unroll_safe
+    def get_float(self, col_idx):
+        src = self.mapping_to_input[col_idx]
+        if src == -1: return 0.0 # Agg functions return ints for now
+        return self.exemplar.get_float(src)
+
+    @jit.unroll_safe
+    def get_u128(self, col_idx):
+        src = self.mapping_to_input[col_idx]
+        if src == -1: return r_uint128(0)
+        if src == -2: return r_uint128(0) # Hash handled by batch.append
+        return self.exemplar.get_u128(src)
+
+    @jit.unroll_safe
+    def get_str_struct(self, col_idx):
+        src = self.mapping_to_input[col_idx]
+        if src < 0:
+            return (0, 0, strings.NULL_PTR, strings.NULL_PTR, None)
+        return self.exemplar.get_str_struct(src)
 
 
 @jit.unroll_safe
 def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):
-    """
-    Compares two records across a specific subset of columns.
-    Used for group-boundary detection in the sorted delta batch.
-    """
     for i in range(len(col_indices)):
         col_idx = col_indices[i]
         col_type = schema.columns[col_idx].field_type.code
@@ -27,8 +108,7 @@ def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):
                 l_len, l_pref, l_ptr, l_heap, l_str,
                 r_len, r_pref, r_ptr, r_heap, r_str
             )
-            if res != 0:
-                return res
+            if res != 0: return res
         elif col_type == types.TYPE_F64.code or col_type == types.TYPE_F32.code:
             va, vb = accessor_a.get_float(col_idx), accessor_b.get_float(col_idx)
             if va < vb: return -1
@@ -38,7 +118,6 @@ def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):
             if va < vb: return -1
             if va > vb: return 1
         else:
-            # All integer types
             va, vb = accessor_a.get_int(col_idx), accessor_b.get_int(col_idx)
             if va < vb: return -1
             if va > vb: return 1
@@ -46,14 +125,9 @@ def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):
 
 
 def _argsort_delta(batch, schema, col_indices):
-    """
-    Returns an index array for the delta batch sorted by grouping columns.
-    Standard insertion sort is used as VM batches are typically small.
-    """
     count = batch.length()
     indices = [i for i in range(count)]
-    if count <= 1:
-        return indices
+    if count <= 1: return indices
 
     acc_a = PayloadRowAccessor(schema)
     acc_b = PayloadRowAccessor(schema)
@@ -73,11 +147,6 @@ def _argsort_delta(batch, schema, col_indices):
 
 @jit.unroll_safe
 def _extract_group_key(accessor, schema, col_indices):
-    """
-    Derives the Primary Key for the aggregate record.
-    If grouping by a single U64/U128, it is used directly.
-    Otherwise, the group columns are hashed to a U128 synthetic PK.
-    """
     if len(col_indices) == 1:
         c_idx = col_indices[0]
         t = schema.columns[c_idx].field_type.code
@@ -86,7 +155,6 @@ def _extract_group_key(accessor, schema, col_indices):
         if t == types.TYPE_U128.code:
             return accessor.get_u128(c_idx)
 
-    # Composite or Non-Integer Key: Mix into 128-bit hash
     h_lo = r_uint64(0)
     h_hi = r_uint64(0)
     for i in range(len(col_indices)):
@@ -98,29 +166,8 @@ def _extract_group_key(accessor, schema, col_indices):
             h_lo ^= xxh.compute_checksum_bytes(s)
         else:
             h_lo ^= accessor.get_int(c_idx)
-        # Simple mixing for hi-word
         h_hi = (h_hi << 1) | (h_lo >> 63)
-    
     return (r_uint128(h_hi) << 64) | r_uint128(h_lo)
-
-
-@jit.unroll_safe
-def _copy_group_cols(input_accessor, input_schema, output_row, col_indices):
-    """Copies grouping values from the input record to the output payload."""
-    for i in range(len(col_indices)):
-        c_idx = col_indices[i]
-        t = input_schema.columns[c_idx].field_type.code
-        if t == types.TYPE_STRING.code:
-            res = input_accessor.get_str_struct(c_idx)
-            s = strings.resolve_string(res[2], res[3], res[4])
-            output_row.append_string(s)
-        elif t == types.TYPE_F64.code or t == types.TYPE_F32.code:
-            output_row.append_float(input_accessor.get_float(c_idx))
-        elif t == types.TYPE_U128.code:
-            v = input_accessor.get_u128(c_idx)
-            output_row.append_u128(r_uint64(v), r_uint64(v >> 64))
-        else:
-            output_row.append_int(r_int64(intmask(input_accessor.get_int(c_idx))))
 
 
 def op_reduce(
@@ -129,16 +176,11 @@ def op_reduce(
 ):
     """
     Incremental DBSP REDUCE: δout = Agg(I + δin) - Agg(I).
-    
-    This operator implements the incremental aggregation logic by:
-    1. Grouping incoming deltas by the specified columns.
-    2. Looking up the current aggregate state (retraction).
-    3. Computing the updated aggregate state (insertion).
+    Zero-copy: uses ReduceAccessor to emit results directly to batch arenas.
     """
     assert isinstance(reg_in, runtime.DeltaRegister)
     delta_in = reg_in.batch
-    if delta_in.length() == 0:
-        return
+    if delta_in.length() == 0: return
 
     assert isinstance(reg_out, runtime.DeltaRegister)
     out_batch = reg_out.batch
@@ -146,93 +188,68 @@ def op_reduce(
 
     input_schema = reg_in.vm_schema.table_schema
     
-    # 1. First, ensure the input delta is consolidated so we have net 
-    # weights per (PK, Payload) before we group by the aggregate columns.
     if not delta_in.is_sorted():
         delta_in.sort()
     delta_in.consolidate()
 
-    # 2. Sort the delta by group columns to process group boundaries
     sorted_indices = _argsort_delta(delta_in, input_schema, group_by_cols)
     
     acc_in = PayloadRowAccessor(input_schema)
     acc_exemplar = PayloadRowAccessor(input_schema)
+    reduce_acc = ReduceAccessor(input_schema, output_schema, group_by_cols)
     
     idx = 0
     n = delta_in.length()
     while idx < n:
-        # Capture the sorted position and batch index of the group start
         group_start_pos = idx
         group_start_idx = sorted_indices[group_start_pos]
         
-        # Set the exemplar accessor to the start of this group
         acc_exemplar.set_row(delta_in.get_row(group_start_idx))
         group_key = _extract_group_key(acc_exemplar, input_schema, group_by_cols)
 
-        # 3. Reset aggregator and fold the Delta portion for this group
         agg_func.reset()
         while idx < n:
             curr_idx = sorted_indices[idx]
             acc_in.set_row(delta_in.get_row(curr_idx))
-            
-            # Check for group boundary by comparing current to group exemplar
             if _compare_by_cols(acc_in, acc_exemplar, input_schema, group_by_cols) != 0:
                 break
-            
             agg_func.step(acc_in, delta_in.get_weight(curr_idx))
             idx += 1
         
-        # 4. Handle Retraction: Emit -Agg(I) if history exists in output trace
-        # reg_trace_out contains the current aggregates.
         trace_out_cursor = reg_trace_out.cursor
         trace_out_cursor.seek(group_key)
         
         has_old = False
+        old_val_bits = r_uint64(0)
         if trace_out_cursor.is_valid() and trace_out_cursor.key() == group_key:
             has_old = True
             old_row_accessor = trace_out_cursor.get_accessor()
-            
-            retract_row = make_payload_row(output_schema)
-            _copy_group_cols(acc_exemplar, input_schema, retract_row, group_by_cols)
-            
-            # Agg result is the last column in the output schema
             agg_col_idx = len(output_schema.columns) - 1
             old_val_bits = old_row_accessor.get_int(agg_col_idx)
-            retract_row.append_int(r_int64(intmask(old_val_bits)))
             
-            out_batch.append(group_key, r_int64(-1), retract_row)
+            # Emit Retraction (-1)
+            reduce_acc.set_context(acc_exemplar, agg_func, old_val_bits, use_old_val=True)
+            out_batch.append_from_accessor(group_key, r_int64(-1), reduce_acc)
 
-        # 5. Compute New Aggregate: Agg(I + δin)
+        # Compute New Aggregate
         if agg_func.is_linear() and has_old:
-            # OPTIMIZATION: Agg(Old + Delta) = Agg(Old) + Agg(Delta)
-            # old_val_bits was already fetched in step 4
             agg_func.merge_accumulated(old_val_bits, r_int64(1))
-            
         elif not agg_func.is_linear():
-            # NON-LINEAR (e.g., MIN/MAX): Must rescan full history for this key.
-            # reg_trace_in contains the multiset history of the input stream.
             agg_func.reset()
             trace_in = reg_trace_in.cursor
             trace_in.seek(group_key)
             while trace_in.is_valid() and trace_in.key() == group_key:
                 agg_func.step(trace_in.get_accessor(), trace_in.weight())
                 trace_in.advance()
-                
-            # Now apply the current delta on top of that history
             for k in range(group_start_pos, idx):
                 d_idx = sorted_indices[k]
                 acc_in.set_row(delta_in.get_row(d_idx))
                 agg_func.step(acc_in, delta_in.get_weight(d_idx))
 
-        # 6. Emit Insertion (+1) of the updated aggregate
+        # Emit Insertion (+1)
         if not agg_func.is_accumulator_zero():
-            insert_row = make_payload_row(output_schema)
-            _copy_group_cols(acc_exemplar, input_schema, insert_row, group_by_cols)
-            
-            agg_func.emit(insert_row)
-            out_batch.append(group_key, r_int64(1), insert_row)
+            reduce_acc.set_context(acc_exemplar, agg_func, use_old_val=False)
+            out_batch.append_from_accessor(group_key, r_int64(1), reduce_acc)
 
-    # Consolidate the output to remove any internal retractions/insertions 
-    # that might have cancelled each other out.
     out_batch.sort()
     out_batch.consolidate()

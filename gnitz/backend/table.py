@@ -1,14 +1,18 @@
 # gnitz/backend/table.py
 from gnitz.backend.cursor import AbstractCursor
 from gnitz.core.types import TableSchema
-from gnitz.core.values import PayloadRow
 from gnitz.core.batch import ZSetBatch
+from gnitz.core.comparator import RowAccessor
 from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
 
 class AbstractTable(object):
     """
     The complete write+read interface the VM requires from any persistent Z-Set.
+    
+    Confinement: This interface is now PayloadRow-free. All data entering
+    or being queried through this interface must use Accessors or Batches.
     """
+
     def get_schema(self):
         """Returns the TableSchema defining the physical layout."""
         # -> TableSchema
@@ -27,33 +31,23 @@ class AbstractTable(object):
         # -> AbstractTable
         raise NotImplementedError
 
-    def ingest(self, key, weight, payload):
-        """
-        Ingests a single record into the table.
-        key: r_uint128, weight: r_int64, payload: PayloadRow
-        """
-        raise NotImplementedError
-
     def ingest_batch(self, batch):
         """
         Ingests a batch of records into the table. 
-        Implementations should override this to perform optimized batch 
-        IO (e.g., single-LSN WAL blocks and group fsync).
+        Implementations should perform optimized batch IO (e.g., WAL 
+        group-fsync and MemTable fast-path ingestion).
         
-        batch: ZSetBatch (from gnitz.core.batch)
+        batch: ArenaZSetBatch (from gnitz.vm.batch)
         """
-        # Default implementation for backends not yet optimized for batching.
-        # Iterates over the batch using the public core.batch API.
-        for i in range(batch.length()):
-            self.ingest(
-                batch.get_pk(i), 
-                batch.get_weight(i), 
-                batch.get_row(i)
-            )
+        raise NotImplementedError
 
-    def get_weight(self, key, payload):
+    def get_weight(self, key, accessor):
         """
         Returns the net algebraic weight for a specific record.
-        key: r_uint128, payload: PayloadRow -> r_int64
+        
+        Zero-allocation: the caller provides a RowAccessor which the 
+        implementation uses for SkipList hashing and record comparison.
+        
+        key: r_uint128, accessor: RowAccessor -> r_int64
         """
         raise NotImplementedError

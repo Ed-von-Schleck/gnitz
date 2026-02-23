@@ -192,11 +192,11 @@ def deserialize_row(schema, src_ptr, src_heap_ptr, null_word=r_uint64(0)):
         payload_col += 1
     return row
 
-# compute_hash remains the same as in Step 6
 @jit.unroll_safe
 def compute_hash(schema, accessor, hash_buf, hash_buf_cap):
     num_cols = len(schema.columns)
     sz = 0
+    # 1. Calculate required size
     for i in range(num_cols):
         if i == schema.pk_index:
             continue
@@ -214,6 +214,7 @@ def compute_hash(schema, accessor, hash_buf, hash_buf_cap):
                 sz = (sz + 7) & ~7
                 sz += 8
 
+    # 2. Ensure capacity and handle reallocation
     if sz > hash_buf_cap:
         if hash_buf != lltype.nullptr(rffi.CCHARP.TO):
             lltype.free(hash_buf, flavor="raw")
@@ -221,6 +222,12 @@ def compute_hash(schema, accessor, hash_buf, hash_buf_cap):
         hash_buf = lltype.malloc(rffi.CCHARP.TO, new_cap, flavor="raw")
         hash_buf_cap = new_cap
 
+    # 3. CRITICAL: Zero out the buffer up to 'sz'
+    # This ensures alignment padding bytes are deterministic for the hash.
+    for i in range(sz):
+        hash_buf[i] = "\x00"
+
+    # 4. Write data into the deterministic buffer
     ptr = hash_buf
     offset = 0
     for i in range(num_cols):

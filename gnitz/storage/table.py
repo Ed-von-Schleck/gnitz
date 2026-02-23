@@ -7,8 +7,7 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.core.batch import make_singleton_batch, ZSetBatch
-from gnitz.core import types, errors, row_logic, serialize
+from gnitz.core import types, errors, serialize
 from gnitz.core import comparator as core_comparator
 from gnitz.storage import (
     wal,
@@ -16,7 +15,6 @@ from gnitz.storage import (
     manifest,
     memtable,
     refcount,
-    shard_table,
     comparator as storage_comparator,
     cursor,
 )
@@ -27,10 +25,10 @@ from gnitz.backend.table import AbstractTable
 
 class PersistentTable(AbstractTable):
     """
-    Coordinator for a single Z-Set table.
+    Coordinator for a single persistent Z-Set table.
 
-    Manages the lifecycle of the SkipList MemTable, the Write-Ahead Log,
-    the columnar ShardIndex, and the atomic Manifest Authority.
+    Operates purely on raw memory buffers and Accessors. All PayloadRow
+    handling is confined to the external API layer.
     """
 
     _immutable_fields_ = [
@@ -94,7 +92,7 @@ class PersistentTable(AbstractTable):
         self.recover_from_wal(wal_path)
 
     # -------------------------------------------------------------------------
-    # AbstractTable Implementation
+    # AbstractTable Implementation (Pure Accessor/Batch Path)
     # -------------------------------------------------------------------------
 
     def get_schema(self):
@@ -127,14 +125,10 @@ class PersistentTable(AbstractTable):
             memtable_arena_size=self.memtable.arena.size,
         )
 
-    def ingest(self, key, weight, payload):
-        """External API entry point for PayloadRow objects."""
-        batch = make_singleton_batch(self.schema, r_uint128(key), weight, payload)
-        self.ingest_batch(batch)
-
     def ingest_batch(self, batch):
         """
-        Durable Z-Set batch update using ArenaZSetBatch.
+        Durable Z-Set batch update. Bypasses all Python object overhead
+        by reading directly from the batch's raw memory arenas.
         """
         if self.is_closed:
             raise errors.StorageError("Table is closed")
@@ -145,32 +139,34 @@ class PersistentTable(AbstractTable):
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
 
-        # 1. Durability: Write to WAL
-        # This is zero-copy as WALWriter reads directly from Batch arenas.
+        # 1. Durability: Write to WAL (Zero-copy)
         self.wal_writer.append_batch(lsn, self.table_id, batch)
 
-        # 2. Visibility: Update MemTable
-        # This is zero-copy as MemTable reads directly from Batch arenas.
+        # 2. Visibility: Update MemTable (Zero-copy)
         self.memtable.upsert_batch(batch)
 
-    def get_weight(self, key, payload):
+    def get_weight(self, key, accessor):
+        """
+        Returns the net algebraic weight for a specific record.
+        Zero-allocation: uses the provided accessor for SkipList search
+        and columnar shard comparisons.
+        """
         r_key = r_uint128(key)
         total_w = r_int64(0)
 
         # 1. Check SkipList MemTable
-        # Use the semantic RowAccessor to perform the SkipList search
-        val_acc = core_comparator.PayloadRowAccessor(self.schema)
-        val_acc.set_row(payload)
-
-        # Calculate hash for SkipList O(1) payload check
-        h_val, _, _ = serialize.compute_hash(
-            self.schema, val_acc, lltype.nullptr(rffi.CCHARP.TO), 0
+        # Calculate hash for SkipList O(1) payload check directly from accessor.
+        # We must capture the scratch buffer (h_buf) to free it, preventing leaks.
+        h_val, h_buf, _ = serialize.compute_hash(
+            self.schema, accessor, lltype.nullptr(rffi.CCHARP.TO), 0
         )
-
-        # _find_exact_values requires an accessor and a hash
-        node_off = self.memtable._find_exact_values(r_key, h_val, val_acc)
-        if node_off != 0:
-            total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
+        try:
+            node_off = self.memtable._find_exact_values(r_key, h_val, accessor)
+            if node_off != 0:
+                total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
+        finally:
+            if h_buf:
+                lltype.free(h_buf, flavor="raw")
 
         # 2. Check Columnar Shards via Index
         shard_matches = self.index.find_all_shards_and_indices(r_key)
@@ -181,6 +177,7 @@ class PersistentTable(AbstractTable):
                 view = handle.view
                 idx = row_idx
                 while idx < view.count:
+                    # Check PK Match
                     if self.schema.get_pk_column().field_type.size == 16:
                         if view.get_pk_u128(idx) != r_key:
                             break
@@ -188,8 +185,9 @@ class PersistentTable(AbstractTable):
                         if r_uint128(view.get_pk_u64(idx)) != r_key:
                             break
 
+                    # Check Payload Semantic Equality
                     soa.set_row(view, idx)
-                    if core_comparator.compare_rows(self.schema, soa, val_acc) == 0:
+                    if core_comparator.compare_rows(self.schema, soa, accessor) == 0:
                         total_w += view.get_weight(idx)
                     idx += 1
 
@@ -201,8 +199,8 @@ class PersistentTable(AbstractTable):
 
     def recover_from_wal(self, wal_path):
         """
-        Replays WAL blocks into the MemTable to recover volatile state.
-        Uses the zero-copy accessor path.
+        Replays WAL blocks into the MemTable.
+        Zero-copy: uses RawWALAccessor to bypass PayloadRow instantiation.
         """
         if not os.path.exists(wal_path):
             return
@@ -225,7 +223,6 @@ class PersistentTable(AbstractTable):
 
                     for rec in block.records:
                         rec_acc.set_record(rec)
-                        # Use the internal accessor-based upsert method
                         self.memtable._upsert_internal(rec.pk, rec.weight, rec_acc)
 
                     if block.lsn >= self.current_lsn:
@@ -235,13 +232,8 @@ class PersistentTable(AbstractTable):
         finally:
             reader.close()
 
-    def insert(self, pk, row):
-        self.ingest(pk, r_int64(1), row)
-
-    def delete(self, pk, row):
-        self.ingest(pk, r_int64(-1), row)
-
     def flush(self):
+        """Transitions MemTable state to a permanent columnar shard."""
         if self.is_closed:
             raise errors.StorageError("Table is closed")
 
