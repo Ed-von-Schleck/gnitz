@@ -5,6 +5,9 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import serialize, xxh, strings as string_logic, errors, types
 from gnitz.storage import mmap_posix, wal_layout
+import gnitz.storage.comparator as storage_comparator
+import gnitz.core.comparator as core_comparator
+import gnitz.storage.buffer as buffer_ops
 from gnitz.storage.wal_layout import (
     WALBlockHeaderView,
     WAL_BLOCK_HEADER_SIZE,
@@ -36,8 +39,6 @@ class WALBlobAllocator(string_logic.BlobAllocator):
         """Zero-copy allocation from raw pointer source."""
         dest = rffi.ptradd(self.buf, self.heap_base_offset + self.cursor)
         if length > 0:
-            import gnitz.storage.buffer as buffer_ops
-
             buffer_ops.c_memmove(
                 rffi.cast(rffi.VOIDP, dest),
                 rffi.cast(rffi.VOIDP, src_ptr),
@@ -98,8 +99,6 @@ def write_wal_record(schema, pk, weight, accessor, buf, base_offset, heap_base_o
 
     # 2. Extract Null Word from Accessor
     null_word = r_uint64(0)
-    import gnitz.storage.comparator as storage_comparator
-    import gnitz.core.comparator as core_comparator
 
     if isinstance(accessor, storage_comparator.RawWALAccessor):
         null_word = accessor.null_word

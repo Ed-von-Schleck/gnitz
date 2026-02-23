@@ -3,7 +3,9 @@
 import unittest
 import os
 import shutil
+from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
 from gnitz.core import types
+from gnitz.core.batch import make_singleton_batch
 from gnitz.storage.table import PersistentTable
 from gnitz.storage import shard_table, memtable
 from tests.row_helpers import create_test_row
@@ -65,11 +67,18 @@ class TestMemTableManagement(unittest.TestCase):
             live_row = create_test_row(self.layout, [live_str])
             
             # PK 1: Sums to zero
-            table.upsert(1, 1, dead_row)
-            table.upsert(1, -1, dead_row)
+            # We must use the batch-oriented API (upsert_batch) even for single rows.
+            table.upsert_batch(
+                make_singleton_batch(self.layout, r_uint128(1), r_int64(1), dead_row)
+            )
+            table.upsert_batch(
+                make_singleton_batch(self.layout, r_uint128(1), r_int64(-1), dead_row)
+            )
             
             # PK 2: Survives
-            table.upsert(2, 1, live_row)
+            table.upsert_batch(
+                make_singleton_batch(self.layout, r_uint128(2), r_int64(1), live_row)
+            )
             
             table.flush(self.fn, table_id=1)
             

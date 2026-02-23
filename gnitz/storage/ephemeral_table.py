@@ -24,9 +24,9 @@ from gnitz.backend.table import AbstractTable
 class EphemeralTable(AbstractTable):
     """
     Scratch Z-Set storage for internal VM state (Traces, Materialized Views).
-    
+
     Bypasses the Write-Ahead Log to maximize throughput. Data is kept in-memory
-    via MemTable and occasionally flushed to temporary shards to manage 
+    via MemTable and occasionally flushed to temporary shards to manage
     RAM pressure.
     """
 
@@ -85,7 +85,7 @@ class EphemeralTable(AbstractTable):
     def create_scratch_table(self, name, schema):
         """Returns another EphemeralTable instance for recursive state."""
         scratch_dir = os.path.join(self.directory, "scratch_" + name)
-        
+
         tid = 0
         for char in name:
             tid = (tid * 31 + ord(char)) & 0x7FFFFFFF
@@ -101,7 +101,7 @@ class EphemeralTable(AbstractTable):
         )
 
     def ingest(self, key, weight, payload):
-        """External API: ingest a single PayloadRow."""
+        """External API: ingest a single PayloadRow via a singleton batch."""
         batch = make_singleton_batch(self.schema, r_uint128(key), weight, payload)
         self.ingest_batch(batch)
 
@@ -117,7 +117,7 @@ class EphemeralTable(AbstractTable):
             return
 
         # Visibility: Update MemTable only.
-        # Zero-copy transfer if source is ArenaZSetBatch.
+        # This uses the batch's RowAccessor interface to stay batch-oriented.
         self.memtable.upsert_batch(batch)
 
     def get_weight(self, key, payload):
@@ -125,11 +125,14 @@ class EphemeralTable(AbstractTable):
         total_w = r_int64(0)
 
         # 1. Check SkipList MemTable
+        # We must use a RowAccessor to bridge the VM's PayloadRow to storage logic.
         val_acc = core_comparator.PayloadRowAccessor(self.schema)
         val_acc.set_row(payload)
-        
+
         # Calculate hash for SkipList O(1) payload check
-        h_val, _, _ = serialize.compute_hash(self.schema, val_acc, lltype.nullptr(rffi.CCHARP.TO), 0)
+        h_val, _, _ = serialize.compute_hash(
+            self.schema, val_acc, lltype.nullptr(rffi.CCHARP.TO), 0
+        )
 
         node_off = self.memtable._find_exact_values(r_key, h_val, val_acc)
         if node_off != 0:
@@ -152,10 +155,7 @@ class EphemeralTable(AbstractTable):
                             break
 
                     soa.set_row(view, idx)
-                    if (
-                        core_comparator.compare_rows(self.schema, soa, val_acc)
-                        == 0
-                    ):
+                    if core_comparator.compare_rows(self.schema, soa, val_acc) == 0:
                         total_w += view.get_weight(idx)
                     idx += 1
 
@@ -177,7 +177,10 @@ class EphemeralTable(AbstractTable):
             raise errors.StorageError("Table is closed")
 
         # Use ephemeral naming scheme
-        shard_name = "eph_shard_%d_%d.db" % (self.table_id, intmask(rffi.cast(rffi.SIZE_T, self.memtable.arena.offset)))
+        shard_name = "eph_shard_%d_%d.db" % (
+            self.table_id,
+            intmask(rffi.cast(rffi.SIZE_T, self.memtable.arena.offset)),
+        )
         shard_path = os.path.join(self.directory, shard_name)
 
         self.memtable.flush(shard_path, self.table_id)

@@ -24,6 +24,7 @@ MAX_HEIGHT = 16
 
 class MemTableBlobAllocator(string_logic.BlobAllocator):
     """Allocates string tails in the MemTable's blob arena."""
+
     def __init__(self, arena):
         self.arena = arena
 
@@ -44,7 +45,7 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
             buffer.c_memmove(
                 rffi.cast(rffi.VOIDP, b_ptr),
                 rffi.cast(rffi.VOIDP, src_ptr),
-                rffi.cast(rffi.SIZE_T, length)
+                rffi.cast(rffi.SIZE_T, length),
             )
         off = rffi.cast(lltype.Signed, b_ptr) - rffi.cast(
             lltype.Signed, self.arena.base_ptr
@@ -54,9 +55,12 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
 
 class MemTable(object):
     """
-    Mutable, in-memory Z-Set storage. 
+    Mutable, in-memory Z-Set storage.
     Optimized for rapid algebraic coalescing via SkipList + Payload Hashing.
+
+    Entry point for mutations is upsert_batch().
     """
+
     _immutable_fields_ = [
         "schema",
         "arena",
@@ -85,7 +89,7 @@ class MemTable(object):
         self.hash_buf = lltype.malloc(rffi.CCHARP.TO, self.hash_buf_cap, flavor="raw")
 
         # SkipList Initialization
-        self.arena.alloc(8, alignment=8) # Padding
+        self.arena.alloc(8, alignment=8)  # Padding
         head_key_off = get_key_offset(MAX_HEIGHT)
         h_sz = head_key_off + self.key_size + HASH_SIZE + self.schema.memtable_stride
 
@@ -176,15 +180,30 @@ class MemTable(object):
                         return match_off
         return 0
 
-    def upsert(self, key, weight, accessor):
+    def upsert_batch(self, batch):
         """
-        Ingests a single record from any RowAccessor.
+        Public entry point for Z-Set batch ingestion.
+        """
+        num_records = batch.length()
+        for i in range(num_records):
+            pk = batch.get_pk(i)
+            w = batch.get_weight(i)
+            acc = batch.get_accessor(i)
+
+            # Note: We rely on the internal upsert logic for correctness.
+            # accessor MUST implement RowAccessor (checked via type annotation).
+            self._upsert_internal(pk, w, acc)
+
+    def _upsert_internal(self, key, weight, accessor):
+        """
+        INTERNAL helper. Ingests a single record from any RowAccessor.
+        Callers must provide a valid RowAccessor implementation (e.g. from Batch).
         """
         base = self.arena.base_ptr
         hash_val, self.hash_buf, self.hash_buf_cap = serialize.compute_hash(
             self.schema, accessor, self.hash_buf, self.hash_buf_cap
         )
-        
+
         match_off = self._find_exact_values(key, hash_val, accessor)
 
         if match_off != 0:
@@ -209,7 +228,7 @@ class MemTable(object):
 
         key_off = get_key_offset(h)
         node_full_sz = key_off + self.key_size + HASH_SIZE + self.schema.memtable_stride
-        
+
         self._ensure_capacity(node_full_sz, accessor)
 
         new_ptr = self.arena.alloc(node_full_sz, alignment=16)
@@ -222,15 +241,19 @@ class MemTable(object):
         # Write PK
         pk_u128 = r_uint128(key)
         if self.key_size == 16:
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(pk_u128))
+            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(
+                rffi.ULONGLONG, r_uint64(pk_u128)
+            )
             rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = rffi.cast(
                 rffi.ULONGLONG, r_uint64(pk_u128 >> 64)
             )
         else:
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(pk_u128))
+            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(
+                rffi.ULONGLONG, r_uint64(pk_u128)
+            )
 
         node_set_hash(base, new_off, self.key_size, hash_val)
-        
+
         # Serialize Payload
         payload_ptr = node_get_payload_ptr(base, new_off, self.key_size)
         serialize.serialize_row(
@@ -242,22 +265,6 @@ class MemTable(object):
             pred = self._update_offsets[i]
             node_set_next_off(base, new_off, i, node_get_next_off(base, pred, i))
             node_set_next_off(base, pred, i, new_off)
-
-    def upsert_batch(self, batch):
-        """
-        Optimized batch ingestion. 
-        When creating new nodes, payloads are moved via vectorized c_memmove
-        if the source is also an ArenaZSetBatch.
-        """
-        num_records = batch.length()
-        for i in range(num_records):
-            pk = batch.get_pk(i)
-            w = batch.get_weight(i)
-            acc = batch.get_accessor(i)
-            
-            # Note: We rely on the unified upsert logic for correctness.
-            # RPython JIT will specialize this loop.
-            self.upsert(pk, w, acc)
 
     def _ensure_capacity(self, node_sz, accessor):
         blob_sz = serialize.get_heap_size(self.schema, accessor)
@@ -271,7 +278,7 @@ class MemTable(object):
         sw = writer_table.TableShardWriter(self.schema, table_id)
         base = self.arena.base_ptr
         curr_off = node_get_next_off(base, self.head_off, 0)
-        
+
         while curr_off != 0:
             w = node_get_weight(base, curr_off)
             if w != 0:

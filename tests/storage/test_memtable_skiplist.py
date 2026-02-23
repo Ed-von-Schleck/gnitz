@@ -3,6 +3,7 @@ import unittest
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.storage import memtable, memtable_node
 from gnitz.core import types
+from gnitz.core.batch import make_singleton_batch
 from tests.row_helpers import create_test_row
 
 class TestMemTableSkipList(unittest.TestCase):
@@ -32,13 +33,17 @@ class TestMemTableSkipList(unittest.TestCase):
             key = r_uint128(1)
             
             # Initial insertion: weight 1
-            mt.upsert(key, 1, row)
+            # We wrap the row in a singleton batch to comply with the batch-oriented API.
+            batch1 = make_singleton_batch(self.schema_u128, key, 1, row)
+            mt.upsert_batch(batch1)
+
             # Verify head pointer level 0 is not null (points to the new node)
             self.assertNotEqual(memtable_node.node_get_next_off(mt.arena.base_ptr, mt.head_off, 0), 0)
             
             # Algebraic annihilation: 1 + (-1) = 0
             # The MemTable should physically unlink the node when weight hits 0
-            mt.upsert(key, -1, row)
+            batch2 = make_singleton_batch(self.schema_u128, key, -1, row)
+            mt.upsert_batch(batch2)
             
             # Head pointer for level 0 should now point back to NULL (sentinel 0)
             self.assertEqual(memtable_node.node_get_next_off(mt.arena.base_ptr, mt.head_off, 0), 0)

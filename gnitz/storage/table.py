@@ -3,12 +3,12 @@
 import os
 import errno
 from rpython.rlib import rposix
-from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core.batch import make_singleton_batch, ZSetBatch
-from gnitz.core import types, errors, row_logic
+from gnitz.core import types, errors, row_logic, serialize
 from gnitz.core import comparator as core_comparator
 from gnitz.storage import (
     wal,
@@ -158,15 +158,16 @@ class PersistentTable(AbstractTable):
         total_w = r_int64(0)
 
         # 1. Check SkipList MemTable
-        # We must use the semantic RowComparator because the MemTable is indexed
-        # by (Key, Payload Hash, Payload Row).
+        # Use the semantic RowAccessor to perform the SkipList search
         val_acc = core_comparator.PayloadRowAccessor(self.schema)
         val_acc.set_row(payload)
-        
-        # We need the hash to perform the SkipList search
-        from gnitz.core import serialize
-        h_val, _, _ = serialize.compute_hash(self.schema, val_acc, lltype.nullptr(rffi.CCHARP.TO), 0)
 
+        # Calculate hash for SkipList O(1) payload check
+        h_val, _, _ = serialize.compute_hash(
+            self.schema, val_acc, lltype.nullptr(rffi.CCHARP.TO), 0
+        )
+
+        # _find_exact_values requires an accessor and a hash
         node_off = self.memtable._find_exact_values(r_key, h_val, val_acc)
         if node_off != 0:
             total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
@@ -188,10 +189,7 @@ class PersistentTable(AbstractTable):
                             break
 
                     soa.set_row(view, idx)
-                    if (
-                        core_comparator.compare_rows(self.schema, soa, val_acc)
-                        == 0
-                    ):
+                    if core_comparator.compare_rows(self.schema, soa, val_acc) == 0:
                         total_w += view.get_weight(idx)
                     idx += 1
 
@@ -211,23 +209,24 @@ class PersistentTable(AbstractTable):
 
         boundary = self.current_lsn
         reader = wal.WALReader(wal_path, self.schema)
-        
+
         # Pre-allocate recovery accessor
         rec_acc = storage_comparator.RawWALAccessor(self.schema)
-        
+
         try:
             while True:
                 block = reader.read_next_block()
                 if block is None:
                     break
-                
+
                 try:
                     if block.tid != self.table_id or block.lsn < boundary:
                         continue
 
                     for rec in block.records:
                         rec_acc.set_record(rec)
-                        self.memtable.upsert(rec.pk, rec.weight, rec_acc)
+                        # Use the internal accessor-based upsert method
+                        self.memtable._upsert_internal(rec.pk, rec.weight, rec_acc)
 
                     if block.lsn >= self.current_lsn:
                         self.current_lsn = block.lsn + r_uint64(1)
