@@ -7,6 +7,7 @@ from rpython.rlib.longlong2float import float2longlong, longlong2float
 from gnitz.core import types, strings as string_logic, xxh
 from gnitz.core.values import make_payload_row
 
+
 @jit.unroll_safe
 def get_heap_size(schema, accessor):
     """
@@ -18,7 +19,7 @@ def get_heap_size(schema, accessor):
     for i in range(num_cols):
         if i == schema.pk_index:
             continue
-        
+
         # Check nullability first to avoid unnecessary fetching
         if accessor.is_null(i):
             continue
@@ -30,10 +31,11 @@ def get_heap_size(schema, accessor):
                 heap_sz += length
     return heap_sz
 
+
 @jit.unroll_safe
 def serialize_row(schema, accessor, dest_ptr, blob_allocator):
     """
-    Unified serialization kernel. 
+    Unified serialization kernel.
     Accepts generic RowAccessor and BlobAllocator.
     Handles both Python objects (PayloadRow) and Raw Pointers (WAL Recovery).
     """
@@ -54,59 +56,16 @@ def serialize_row(schema, accessor, dest_ptr, blob_allocator):
 
         code = f_type.code
         if code == types.TYPE_STRING.code:
-            # Capture all five return values in a single call to avoid redundant
-            # pointer arithmetic or SoA directory lookups.
             length, prefix, src_struct_ptr, src_heap_ptr, py_string = accessor.get_str_struct(i)
-            
-            # 1. Write the fixed-width German String struct (Length + Prefix)
-            rffi.cast(rffi.UINTP, target)[0] = rffi.cast(rffi.UINT, length)
-            
-            # Write Prefix
-            prefix_target = rffi.ptradd(target, 4)
-            if py_string is not None:
-                # Python String source
-                limit = 4 if length > 4 else length
-                for j in range(limit):
-                    prefix_target[j] = py_string[j]
-            else:
-                # Raw Pointer source (Relocate from src_struct_ptr)
-                src_prefix = rffi.ptradd(src_struct_ptr, 4)
-                for j in range(4):
-                    prefix_target[j] = src_prefix[j]
-
-            # 2. Write Payload (Inline or Heap)
-            payload_target = rffi.ptradd(target, 8)
-            
-            if length <= string_logic.SHORT_STRING_THRESHOLD:
-                # Inline String
-                if py_string is not None:
-                    if length > 4:
-                        for j in range(4, length):
-                            payload_target[j-4] = py_string[j]
-                else:
-                    # Relocate inline suffix from src_struct_ptr
-                    src_suffix = rffi.ptradd(src_struct_ptr, 8)
-                    for j in range(length - 4):
-                        payload_target[j] = src_suffix[j]
-            else:
-                # Heap String (Relocation required)
-                new_offset = r_uint64(0)
-                if py_string is not None:
-                    # Allocate from Python String
-                    new_offset = blob_allocator.allocate(py_string)
-                else:
-                    # Allocate from Raw Pointer (Zero-Copy relocate)
-                    # Use existing pointers to find the blob in the source heap
-                    old_offset_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_struct_ptr, 8))
-                    old_offset = old_offset_ptr[0]
-                    
-                    src_data_ptr = rffi.ptradd(src_heap_ptr, rffi.cast(lltype.Signed, old_offset))
-                    
-                    # Delegate to allocator's raw copy method
-                    new_offset = blob_allocator.allocate_from_ptr(src_data_ptr, length)
-
-                # Write the NEW 64-bit offset
-                rffi.cast(rffi.ULONGLONGP, payload_target)[0] = rffi.cast(rffi.ULONGLONG, new_offset)
+            string_logic.relocate_string(
+                target,
+                length,
+                prefix,
+                src_struct_ptr,
+                src_heap_ptr,
+                py_string,
+                blob_allocator,
+            )
 
         elif code == types.TYPE_F64.code:
             rffi.cast(rffi.DOUBLEP, target)[0] = rffi.cast(rffi.DOUBLE, accessor.get_float(i))
@@ -115,7 +74,9 @@ def serialize_row(schema, accessor, dest_ptr, blob_allocator):
         elif code == types.TYPE_U128.code:
             v = accessor.get_u128(i)
             rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(v))
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(v >> 64))
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(
+                rffi.ULONGLONG, r_uint64(v >> 64)
+            )
         elif code == types.TYPE_U64.code:
             rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, accessor.get_int(i))
         elif code == types.TYPE_I64.code:
@@ -138,6 +99,7 @@ def serialize_row(schema, accessor, dest_ptr, blob_allocator):
             target[0] = chr(intmask(accessor.get_int(i)) & 0xFF)
         else:
             rffi.cast(rffi.LONGLONGP, target)[0] = rffi.cast(rffi.LONGLONG, accessor.get_int(i))
+
 
 @jit.unroll_safe
 def deserialize_row(schema, src_ptr, src_heap_ptr, null_word=r_uint64(0)):
@@ -185,6 +147,7 @@ def deserialize_row(schema, src_ptr, src_heap_ptr, null_word=r_uint64(0)):
 
         payload_col += 1
     return row
+
 
 @jit.unroll_safe
 def compute_hash(schema, accessor, hash_buf, hash_buf_cap):
@@ -278,7 +241,7 @@ def compute_hash(schema, accessor, hash_buf, hash_buf_cap):
                 bits = float2longlong(accessor.get_float(i))
             else:
                 bits = rffi.cast(rffi.LONGLONG, accessor.get_int(i))
-            
+
             rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr, offset))[0] = bits
             offset += 8
 

@@ -31,7 +31,7 @@ class ShardWriterBlobAllocator(string_logic.BlobAllocator):
         with rffi.scoped_str2charp(string_data) as blob_src:
             off = self.writer._get_or_append_blob(blob_src, length)
             return r_uint64(off)
-    
+
     def allocate_from_ptr(self, src_ptr, length):
         """Zero-copy allocation from raw pointer."""
         off = self.writer._get_or_append_blob(src_ptr, length)
@@ -67,10 +67,10 @@ class TableShardWriter(object):
 
         self.b_buf = buffer.Buffer(4096, growable=True)
         self.blob_cache = {}
-        # Pre-allocate scratch buffer to avoid mallocs in loop
+        # scratch_val_buf is used for non-string fixed-width types (≤ 8 bytes)
         self.scratch_val_buf = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
         self.blob_allocator = ShardWriterBlobAllocator(self)
-        
+
         # Unified Accessors for reading input
         self.raw_accessor = storage_comparator.RawWALAccessor(schema)
         self.val_accessor = core_comparator.PayloadRowAccessor(schema)
@@ -109,63 +109,34 @@ class TableShardWriter(object):
         buf = self.col_bufs[col_idx]
         col_def = self.schema.columns[col_idx]
         type_code = col_def.field_type.code
-        
+
         if accessor.is_null(col_idx):
             buf.put_bytes(NULL_CHARP, col_def.field_type.size)
             return
 
         if type_code == types.TYPE_STRING.code:
-            length, _, src_struct_ptr, src_heap_ptr, py_string = accessor.get_str_struct(col_idx)
-            
-            # 1. Write Length
-            rffi.cast(rffi.UINTP, self.scratch_val_buf)[0] = rffi.cast(rffi.UINT, length)
-            
-            # 2. Write Prefix
-            prefix_dest = rffi.ptradd(self.scratch_val_buf, 4)
-            if py_string is not None:
-                limit = 4 if length > 4 else length
-                for j in range(limit):
-                    prefix_dest[j] = py_string[j]
-            else:
-                src_prefix = rffi.ptradd(src_struct_ptr, 4)
-                for j in range(4):
-                    prefix_dest[j] = src_prefix[j]
-            
-            # 3. Write Payload (Inline or Heap Ref)
-            payload_dest = rffi.ptradd(self.scratch_val_buf, 8)
-            
-            if length <= string_logic.SHORT_STRING_THRESHOLD:
-                # Inline String
-                if py_string is not None:
-                    if length > 4:
-                        for j in range(4, length):
-                            payload_dest[j-4] = py_string[j]
-                else:
-                    src_suffix = rffi.ptradd(src_struct_ptr, 8)
-                    for j in range(length - 4):
-                        payload_dest[j] = src_suffix[j]
-            else:
-                # Heap String (Relocation required)
-                new_offset = r_uint64(0)
-                if py_string is not None:
-                    new_offset = self.blob_allocator.allocate(py_string)
-                else:
-                    # Relocate from Raw Pointer (Zero-Copy)
-                    old_offset_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_struct_ptr, 8))
-                    old_offset = old_offset_ptr[0]
-                    src_data_ptr = rffi.ptradd(src_heap_ptr, rffi.cast(lltype.Signed, old_offset))
-                    new_offset = self.blob_allocator.allocate_from_ptr(src_data_ptr, length)
+            length, prefix, src_struct_ptr, src_heap_ptr, py_string = accessor.get_str_struct(
+                col_idx
+            )
+            # Allocate the 16-byte slot directly inside the column buffer so
+            # relocate_string can write into it without an intermediate scratch
+            # copy.  8-byte alignment satisfies the u64 offset/payload field
+            # requirement; the full struct is 16 bytes as per the spec.
+            dest = buf.alloc(16, alignment=8)
+            string_logic.relocate_string(
+                dest,
+                length,
+                prefix,
+                src_struct_ptr,
+                src_heap_ptr,
+                py_string,
+                self.blob_allocator,
+            )
 
-                rffi.cast(rffi.ULONGLONGP, payload_dest)[0] = rffi.cast(rffi.ULONGLONG, new_offset)
-            
-            buf.put_bytes(self.scratch_val_buf, 16)
-        
         elif type_code == types.TYPE_F64.code:
             buf.put_i64(rffi.cast(rffi.LONGLONG, float2longlong(accessor.get_float(col_idx))))
-        
+
         elif type_code == types.TYPE_F32.code:
-            # Buffer only has put_i64/put_u64, use scratch for 32-bit floats if needed
-            # But buffer.put_bytes is safer for size matching.
             val = accessor.get_float(col_idx)
             rffi.cast(rffi.FLOATP, self.scratch_val_buf)[0] = rffi.cast(rffi.FLOAT, val)
             buf.put_bytes(self.scratch_val_buf, 4)
@@ -175,7 +146,7 @@ class TableShardWriter(object):
 
         elif type_code == types.TYPE_U64.code:
             buf.put_u64(accessor.get_int(col_idx))
-            
+
         elif type_code == types.TYPE_I64.code:
             buf.put_i64(rffi.cast(rffi.LONGLONG, accessor.get_int(col_idx)))
 
@@ -188,13 +159,13 @@ class TableShardWriter(object):
             val = accessor.get_int(col_idx) & 0xFFFFFFFF
             rffi.cast(rffi.INTP, self.scratch_val_buf)[0] = rffi.cast(rffi.INT, val)
             buf.put_bytes(self.scratch_val_buf, 4)
-            
+
         elif type_code == types.TYPE_U16.code:
             val = intmask(accessor.get_int(col_idx))
             self.scratch_val_buf[0] = chr(val & 0xFF)
             self.scratch_val_buf[1] = chr((val >> 8) & 0xFF)
             buf.put_bytes(self.scratch_val_buf, 2)
-            
+
         elif type_code == types.TYPE_I16.code:
             val = intmask(accessor.get_int(col_idx))
             self.scratch_val_buf[0] = chr(val & 0xFF)
@@ -207,18 +178,18 @@ class TableShardWriter(object):
             buf.put_bytes(self.scratch_val_buf, 1)
 
         else:
-            # Fallback for I64 compatible types
+            # Fallback for I64-compatible types
             buf.put_i64(rffi.cast(rffi.LONGLONG, accessor.get_int(col_idx)))
 
     def _append_from_accessor(self, accessor):
         i = 0
         num_cols = len(self.schema.columns)
         while i < num_cols:
-             if i == self.schema.pk_index:
-                 i += 1
-                 continue
-             self._write_column(i, accessor)
-             i += 1
+            if i == self.schema.pk_index:
+                i += 1
+                continue
+            self._write_column(i, accessor)
+            i += 1
 
     def add_row(self, key, weight, packed_row_ptr, source_heap_ptr):
         """Optimized path for MemTable flush (raw pointers)."""
@@ -229,7 +200,6 @@ class TableShardWriter(object):
         if self.schema.get_pk_column().field_type.size == 16:
             self.pk_buf.put_u128(key)
         else:
-            # FIX: rffi.cast fails on r_uint128; use r_uint64 truncation
             self.pk_buf.put_u64(r_uint64(key))
         self.w_buf.put_i64(weight)
 
@@ -249,7 +219,6 @@ class TableShardWriter(object):
         if self.schema.get_pk_column().field_type.size == 16:
             self.pk_buf.put_u128(r_uint128(pk))
         else:
-            # FIX: Use r_uint64 truncation for PK values
             self.pk_buf.put_u64(r_uint64(pk))
         self.w_buf.put_i64(weight)
 
