@@ -179,11 +179,11 @@ def deserialize_row(schema, src_ptr, src_heap_ptr, null_word=r_uint64(0)):
             lo = rffi.cast(rffi.ULONGLONGP, ptr)[0]
             hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
             row.append_u128(r_uint64(lo), r_uint64(hi))
-        elif code in (
-            types.TYPE_I64.code,
-            types.TYPE_I32.code,
-            types.TYPE_I16.code,
-            types.TYPE_I8.code,
+        elif (
+            code == types.TYPE_I64.code
+            or code == types.TYPE_I32.code
+            or code == types.TYPE_I16.code
+            or code == types.TYPE_I8.code
         ):
             row.append_int(rffi.cast(rffi.LONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0]))
         else:
@@ -273,7 +273,7 @@ def compute_hash(schema, accessor, hash_buf, hash_buf_cap):
             offset += 16
         else:
             offset = (offset + 7) & ~7
-            if ft.code in (types.TYPE_F64.code, types.TYPE_F32.code):
+            if ft.code == types.TYPE_F64.code or ft.code == types.TYPE_F32.code:
                 bits = float2longlong(accessor.get_float(i))
             else:
                 bits = rffi.cast(rffi.LONGLONG, accessor.get_int(i))

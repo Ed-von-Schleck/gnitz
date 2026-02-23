@@ -95,7 +95,6 @@ def compare_rows(schema, acc1, acc2):
     correct signed-integer comparison.
     """
     num_cols = len(schema.columns)
-    signed_ints = (types.TYPE_I64, types.TYPE_I32, types.TYPE_I16, types.TYPE_I8)
 
     for i in range(num_cols):
         if i == schema.pk_index:
@@ -128,14 +127,19 @@ def compare_rows(schema, acc1, acc2):
                 return -1
             if v1 > v2:
                 return 1
-        elif col_type in (types.TYPE_F64, types.TYPE_F32):
+        elif col_type == types.TYPE_F64 or col_type == types.TYPE_F32:
             v1 = acc1.get_float(i)
             v2 = acc2.get_float(i)
             if v1 < v2:
                 return -1
             if v1 > v2:
                 return 1
-        elif col_type in signed_ints:
+        elif (
+            col_type == types.TYPE_I64
+            or col_type == types.TYPE_I32
+            or col_type == types.TYPE_I16
+            or col_type == types.TYPE_I8
+        ):
             # Reinterpret unsigned bit pattern as signed for correct comparison
             v1 = rffi.cast(rffi.LONGLONG, acc1.get_int(i))
             v2 = rffi.cast(rffi.LONGLONG, acc2.get_int(i))

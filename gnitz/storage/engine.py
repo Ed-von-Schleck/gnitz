@@ -74,48 +74,60 @@ class Engine(object):
         Ingests a single Z-Set delta. 
         Note: For high-velocity ingestion, use ingest_batch.
         """
-        # Fix: Avoid mr-poisoning by using newlist_hint instead of literals
-        pks = newlist_hint(1)
-        pks.append(r_uint128(key))
+        pks_lo = newlist_hint(1)
+        pks_hi = newlist_hint(1)
+        
+        k_val = r_uint128(key)
+        pks_lo.append(r_uint64(k_val))
+        pks_hi.append(r_uint64(k_val >> 64))
+
         weights = newlist_hint(1)
         weights.append(weight)
         rows = newlist_hint(1)
         rows.append(row)
-        self.ingest_batch(pks, weights, rows)
+        
+        self.ingest_batch(pks_lo, pks_hi, weights, rows)
 
-    def ingest_batch(self, pks, weights, rows):
+    def ingest_batch(self, pks_lo, pks_hi, weights, rows):
         """
         Ingests a batch of Z-Set deltas as a single atomic DBSP tick.
         
         Args:
-            pks: List[r_uint128]
+            pks_lo: List[r_uint64] (Low 64 bits of the Primary Keys)
+            pks_hi: List[r_uint64] (High 64 bits of the Primary Keys)
             weights: List[r_int64]
             rows: List[PayloadRow]
         """
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
 
+        count = len(pks_lo)
+
         # 1. Write-Ahead Log (Durability)
         if self.wal_writer:
-            count = len(pks)
             # Use newlist_hint to satisfy RPython resizability constraints
             wal_records = newlist_hint(count)
             for i in range(count):
                 w = weights[i]
-                # Only log records that contribute state (Ghost Property)
+                # The Ghost Property: only log records that contribute net state.
                 if w != r_int64(0):
-                    wal_records.append(WALRecord(pks[i], w, rows[i]))
+                    # Reconstruct the 128-bit key for the WAL record object
+                    pk = (r_uint128(pks_hi[i]) << 64) | r_uint128(pks_lo[i])
+                    wal_records.append(WALRecord(pk, w, rows[i]))
             
             if len(wal_records) > 0:
                 self.wal_writer.append_batch(lsn, self.table_id, wal_records)
             
         # 2. Update In-Memory State (Visibility)
-        for i in range(len(pks)):
+        for i in range(count):
             w = weights[i]
             # Ghost Property: Algebraic annihilation prevents zero-weight records
             # from consuming Arena memory or SkipList nodes.
             if w != r_int64(0):
-                self.active_table.upsert(pks[i], w, rows[i])
+                # Reconstruct the 128-bit key for MemTable insertion.
+                # r_uint128 is safe as a local variable or singular argument.
+                pk = (r_uint128(pks_hi[i]) << 64) | r_uint128(pks_lo[i])
+                self.active_table.upsert(pk, w, rows[i])
 
     def recover_from_wal(self, filename):
         """
