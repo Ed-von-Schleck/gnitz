@@ -14,10 +14,20 @@ class RowAccessor(object):
         # Returns r_uint64 (unsigned bit pattern)
         raise NotImplementedError
 
+    def get_int_signed(self, col_idx):
+        """
+        Returns the value as r_int64, reinterpreting bits if necessary.
+        Default implementation performs a 64-bit reinterpret cast.
+        Subclasses handling smaller packed types (i8, i16, i32) must
+        override this to ensure proper sign extension.
+        """
+        return rffi.cast(rffi.LONGLONG, self.get_int(col_idx))
+
     def get_float(self, col_idx):
         raise NotImplementedError
 
     def get_u128(self, col_idx):
+        # Returns (length, prefix, struct_ptr, heap_ptr, py_string)
         raise NotImplementedError
 
     def get_str_struct(self, col_idx):
@@ -57,6 +67,9 @@ class PayloadRowAccessor(RowAccessor):
 
     def get_int(self, col_idx):
         return self._row.get_int(self._payload_idx(col_idx))
+
+    def get_int_signed(self, col_idx):
+        return self._row.get_int_signed(self._payload_idx(col_idx))
 
     def get_float(self, col_idx):
         return self._row.get_float(self._payload_idx(col_idx))
@@ -141,8 +154,8 @@ def compare_rows(schema, acc1, acc2):
             or col_type == types.TYPE_I8
         ):
             # Reinterpret unsigned bit pattern as signed for correct comparison
-            v1 = rffi.cast(rffi.LONGLONG, acc1.get_int(i))
-            v2 = rffi.cast(rffi.LONGLONG, acc2.get_int(i))
+            v1 = acc1.get_int_signed(i)
+            v2 = acc2.get_int_signed(i)
             if v1 < v2:
                 return -1
             if v1 > v2:

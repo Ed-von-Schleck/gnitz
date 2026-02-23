@@ -1,4 +1,4 @@
-# gnitz/vm/batch.py
+# gnitz/core/batch.py
 
 from rpython.rlib import jit
 from rpython.rlib.objectmodel import newlist_hint
@@ -116,6 +116,9 @@ class ArenaZSetBatch(object):
 
     def length(self):
         return self._count
+    
+    def is_sorted(self):
+        return self._sorted
 
     def is_empty(self):
         return self._count == 0

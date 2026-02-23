@@ -89,6 +89,12 @@ class CompositeAccessor(RowAccessor):
         if self.mapping_is_left[col_idx]:
             return self.left_acc.get_str_struct(self.mapping_idx[col_idx])
         return self.right_acc.get_str_struct(self.mapping_idx[col_idx])
+    
+    @jit.unroll_safe    
+    def get_int_signed(self, col_idx):
+        if self.mapping_is_left[col_idx]:
+            return self.left_acc.get_int_signed(self.mapping_idx[col_idx])
+        return self.right_acc.get_int_signed(self.mapping_idx[col_idx])
 
 
 def op_join_delta_trace(reg_delta, reg_trace, reg_out):

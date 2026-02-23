@@ -5,7 +5,7 @@ from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import types
-from gnitz.storage import comparator, tournament_tree
+from gnitz.storage import tournament_tree, comparator
 from gnitz.core import comparator as core_comparator
 from gnitz.storage.memtable_node import node_get_key, node_get_weight, node_get_next_off
 from gnitz.backend.cursor import AbstractCursor
@@ -13,8 +13,11 @@ from gnitz.backend.cursor import AbstractCursor
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
 
-class BaseCursor(object):
-    """Base class to allow homogeneous lists in RPython."""
+class BaseCursor(AbstractCursor):
+    """
+    Common base for all storage-layer cursors to satisfy RPython unification.
+    Inherits from the backend interface to maintain VM compatibility.
+    """
 
     def __init__(self):
         pass
@@ -40,11 +43,17 @@ class BaseCursor(object):
     def peek_key(self):
         raise NotImplementedError
 
+    def get_accessor(self):
+        raise NotImplementedError
+
     def get_row_accessor(self):
         raise NotImplementedError
 
+    def close(self):
+        pass
 
-class MemTableCursor(AbstractCursor):
+
+class MemTableCursor(BaseCursor):
     """
     SkipList cursor for the MemTable.
     Implements the AbstractCursor interface for the DBSP VM.
@@ -53,11 +62,11 @@ class MemTableCursor(AbstractCursor):
     _immutable_fields_ = ["memtable", "schema", "key_size", "accessor"]
 
     def __init__(self, memtable):
+        BaseCursor.__init__(self)
         self.memtable = memtable
         self.schema = memtable.schema
         self.key_size = memtable.key_size
-        # Position at the first real node (level-0 successor of the sentinel
-        # head). Offset 0 is the null sentinel; is_valid() returns False for it.
+        # Position at the first real node (level-0 successor of the sentinel head).
         self.current_node_off = node_get_next_off(
             memtable.arena.base_ptr, memtable.head_off, 0
         )
@@ -102,26 +111,26 @@ class MemTableCursor(AbstractCursor):
 
     def get_accessor(self):
         """Sets the state of the pre-allocated accessor and returns it."""
-        # Only call this when valid (enforced by VM/TournamentTree).
         self.accessor.set_row(self.memtable.arena.base_ptr, self.current_node_off)
         return self.accessor
 
     def get_row_accessor(self):
         return self.get_accessor()
 
-    def close(self):
-        """No-op for in-memory cursors."""
-        pass
-
 
 class ShardCursor(BaseCursor):
+    """
+    Columnar cursor for Persistent Shards.
+    Automatically skips 'Ghost' records (weight == 0).
+    """
+
     _immutable_fields_ = ["view", "schema", "is_u128", "accessor"]
 
     def __init__(self, shard_view):
         BaseCursor.__init__(self)
         self.view = shard_view
         self.schema = shard_view.schema
-        self.is_u128 = self.schema.get_pk_column().field_type == types.TYPE_U128
+        self.is_u128 = self.schema.get_pk_column().field_type.code == types.TYPE_U128.code
         self.position = 0
         self.accessor = comparator.SoAAccessor(self.schema)
         self._skip_ghosts()
@@ -172,10 +181,16 @@ class ShardCursor(BaseCursor):
 
 
 def _copy_cursors(cursors):
+    """Helper for Tournament Tree initialization to satisfy RPython list constraints."""
     return [c for c in cursors]
 
 
 class UnifiedCursor(AbstractCursor):
+    """
+    Authoritative cursor providing a merged view over multiple shards and memtables.
+    Handles algebraic weight summation and payload grouping.
+    """
+
     _immutable_fields_ = ["schema", "is_single_source"]
 
     def __init__(self, schema, cursors):
@@ -185,7 +200,6 @@ class UnifiedCursor(AbstractCursor):
         self.is_single_source = self.num_cursors == 1
 
         if not self.is_single_source:
-            # Tree cursors are a copy, but indices remain stable relative to self.cursors
             self.tree = tournament_tree.TournamentTree(_copy_cursors(self.cursors))
         else:
             self.tree = None
@@ -210,7 +224,6 @@ class UnifiedCursor(AbstractCursor):
 
         while not self.tree.is_exhausted():
             min_key = self.tree.get_min_key()
-            # Returns stable original indices
             indices = self.tree.get_all_indices_at_min()
 
             # 1. Find lexicographical minimum payload in group
@@ -249,6 +262,7 @@ class UnifiedCursor(AbstractCursor):
                 self._valid = True
                 return
             else:
+                # Ghost detected: advance past this specific payload group and continue searching
                 for c_idx in to_advance:
                     self.tree.advance_cursor_by_index(c_idx)
 
@@ -278,7 +292,12 @@ class UnifiedCursor(AbstractCursor):
         to_advance = newlist_hint(len(indices))
         for c_idx in indices:
             cursor = self.cursors[c_idx]
-            if core_comparator.compare_rows(self.schema, cursor.get_accessor(), target_accessor) == 0:
+            if (
+                core_comparator.compare_rows(
+                    self.schema, cursor.get_accessor(), target_accessor
+                )
+                == 0
+            ):
                 to_advance.append(c_idx)
 
         for c_idx in to_advance:
@@ -302,3 +321,5 @@ class UnifiedCursor(AbstractCursor):
         if self.tree:
             self.tree.close()
             self.tree = None
+        for c in self.cursors:
+            c.close()

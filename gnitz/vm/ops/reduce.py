@@ -1,6 +1,7 @@
 # gnitz/vm/ops/reduce.py
 
 from rpython.rlib import jit
+from rpython.rtyper.lltypesystem import rffi
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
@@ -93,7 +94,16 @@ class ReduceAccessor(RowAccessor):
         if src < 0:
             return (0, 0, strings.NULL_PTR, strings.NULL_PTR, None)
         return self.exemplar.get_str_struct(src)
-
+        
+    @jit.unroll_safe
+    def get_int_signed(self, col_idx):
+        src = self.mapping_to_input[col_idx]
+        if src == -1:
+            # Aggregates are always stored as r_int64 bits in this engine
+            if self.use_old_val: 
+                return rffi.cast(rffi.LONGLONG, self.old_val_bits)
+            return rffi.cast(rffi.LONGLONG, self.agg_func.get_value_bits())
+        return self.exemplar.get_int_signed(src)
 
 @jit.unroll_safe
 def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):

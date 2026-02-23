@@ -42,6 +42,19 @@ class PackedNodeAccessor(RowAccessor):
             return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr)[0])
         return r_uint64(0)
 
+    def get_int_signed(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        sz = self.schema.columns[col_idx].field_type.size
+        if sz == 8:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        elif sz == 4:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.INTP, ptr)[0])
+        elif sz == 2:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SHORTP, ptr)[0])
+        elif sz == 1:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SIGNEDCHARP, ptr)[0])
+        return r_int64(0)
+
     def get_float(self, col_idx):
         ptr = self._get_ptr(col_idx)
         sz = self.schema.columns[col_idx].field_type.size
@@ -105,6 +118,19 @@ class SoAAccessor(RowAccessor):
         elif sz == 1:
             return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr)[0])
         return r_uint64(0)
+
+    def get_int_signed(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        sz = self.schema.columns[col_idx].field_type.size
+        if sz == 8:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        elif sz == 4:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.INTP, ptr)[0])
+        elif sz == 2:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SHORTP, ptr)[0])
+        elif sz == 1:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SIGNEDCHARP, ptr)[0])
+        return r_int64(0)
 
     def get_float(self, col_idx):
         ptr = self._get_ptr(col_idx)
@@ -191,6 +217,19 @@ class RawWALAccessor(RowAccessor):
         elif sz == 1:
             return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr)[0])
         return r_uint64(0)
+
+    def get_int_signed(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        sz = self.schema.columns[col_idx].field_type.size
+        if sz == 8:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        elif sz == 4:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.INTP, ptr)[0])
+        elif sz == 2:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SHORTP, ptr)[0])
+        elif sz == 1:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SIGNEDCHARP, ptr)[0])
+        return r_int64(0)
 
     def get_float(self, col_idx):
         ptr = self._get_ptr(col_idx)
