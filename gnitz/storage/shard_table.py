@@ -16,7 +16,8 @@ class TableShardView(object):
     """
     _immutable_fields_ = [
         'count', 'schema', 'ptr', 'size', 'pk_buf', 'w_buf', 
-        'col_bufs[*]', 'blob_buf', 'dir_off', 'dir_checksums[*]'
+        'col_bufs[*]', 'blob_buf', 'dir_off', 'dir_checksums[*]',
+        'col_to_reg_map[*]', 'blob_reg_idx'
     ]
 
     def __init__(self, filename, schema, validate_checksums=False):
@@ -44,9 +45,13 @@ class TableShardView(object):
                 self.dir_off = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, layout.OFF_DIR_OFFSET))[0])
                 
                 num_cols = len(schema.columns)
-                num_regions = 2 + (num_cols - 1) + 1 # PK + W + (N-1) Columns + Blob Heap
+                # Regions: 0=PK, 1=Weight, 2..N+1=Other Columns, N+2=Blob Heap
+                num_regions = 2 + (num_cols - 1) + 1 
                 self.dir_checksums = [r_uint64(0)] * num_regions
                 self.region_validated = [False] * num_regions
+
+                # Pre-calculate column to region mapping to avoid linear scans in get_col_ptr
+                self.col_to_reg_map = [0] * num_cols
 
                 # Initialize fixed metadata regions
                 self.pk_buf = self._init_region(0)
@@ -58,8 +63,11 @@ class TableShardView(object):
                 i = 0
                 while i < num_cols:
                     if i == schema.pk_index:
+                        self.col_to_reg_map[i] = 0
                         i += 1
                         continue
+                    
+                    self.col_to_reg_map[i] = reg_idx
                     self.col_bufs[i] = self._init_region(reg_idx)
                     reg_idx += 1
                     i += 1
@@ -142,13 +150,8 @@ class TableShardView(object):
         if not buf: 
             return lltype.nullptr(rffi.CCHARP.TO)
         
-        actual_reg_idx = 2
-        i = 0
-        while i < col_idx:
-            if i != self.schema.pk_index:
-                actual_reg_idx += 1
-            i += 1
-        
+        # Optimization: lookup pre-calculated physical region index O(1)
+        actual_reg_idx = self.col_to_reg_map[col_idx]
         self._check_region(buf, actual_reg_idx)
         
         stride = self.schema.columns[col_idx].field_type.size
@@ -218,7 +221,6 @@ class TableShardView(object):
             else:
                 low = mid + 1
         return res
-
 
     def close(self):
         if self.ptr:
