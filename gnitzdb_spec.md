@@ -129,113 +129,107 @@ Each Table Shard begins with a fixed 64-byte header. All multi-byte integers are
 | 40 - 63 | Reserved | `u8[24]` | Padded with `0x00` |
 
 ### 5.2. Column Directory (Variable Length)
-The Column Directory is a contiguous array of `ColumnMeta` entries located at the `Directory Offset`. The number of entries is determined by the `TableSchema` (PK region + Weight region + N column regions + Blob region).
+The Column Directory is a contiguous array of `ColumnMeta` entries located at the `Directory Offset`. The number of entries is fixed per shard based on the `TableSchema` and is always `2 + (num_cols − 1) + 1`: one entry for the PK region, one for the Weight region, one for each non-PK column region in schema-declaration order, and one for the Blob Heap region.
 
 **ColumnMeta Entry (24 bytes):**
-*   `[00-07]` **Offset**: Absolute byte offset from file start to the region start.
+*   `[00-07]` **Offset**: Absolute byte offset from file start to the region start. Always a multiple of 64.
 *   `[08-15]` **Size**: Total byte size of the region.
-*   `[16-23]` **Checksum**: XXH3-64 hash of the region's contents.
+*   `[16-23]` **Checksum**: XXH3-64 hash of the region's raw contents.
+
+The region index assigned to each part of the shard is fixed:
+
+| Region Index | Contents |
+| :--- | :--- |
+| 0 | Primary Key vector |
+| 1 | Weight vector |
+| 2 … N | Column regions for each non-PK column, in the order they appear in the `TableSchema` (skipping the PK column) |
+| N+1 | Shared Blob Heap (Region B) |
 
 ### 5.3. Region Alignment and Padding
 To support vectorized memory access and cache-line alignment, the physical layout enforces 64-byte alignment for all region boundaries.
-*   **Region Transitions:** The `TableShardWriter` calculates the necessary padding to ensure `(region_offset % 64 == 0)`.
+*   **Region Transitions:** The `TableShardWriter` calculates the necessary padding before each region using `align_64(offset) = (offset + 63) & ~63`.
 *   **Padding Bytes:** Inter-region gaps are filled with `0x00`.
+*   **Directory Placement:** The Column Directory immediately follows the 64-byte header at offset 64. The first data region begins at the first 64-byte-aligned offset after the end of the directory.
 
 ### 5.4. Region PK: Primary Key Vector
-Contains a dense, sorted sequence of Primary Keys. The entry size is fixed per shard based on the `TableSchema`:
-*   **Type u64:** 8-byte unsigned integers.
-*   **Type u128:** 16-byte unsigned integers (stored as two contiguous 64-bit segments).
-Validation is performed via the corresponding checksum in the Column Directory.
+Contains a dense, sorted sequence of Primary Keys. The element size is fixed per shard based on the `TableSchema`:
+*   **Type u64:** 8-byte unsigned integers. Total region size is `count × 8`.
+*   **Type u128:** 16-byte unsigned integers stored as two contiguous little-endian 64-bit words: the low 64 bits at the base offset, the high 64 bits at offset + 8. Total region size is `count × 16`.
+
+Binary search is supported via `find_lower_bound`, which returns the first index where the stored key is greater than or equal to the target. Validation is performed against the corresponding XXH3-64 checksum in the Column Directory and is applied eagerly at shard open time.
 
 ### 5.5. Region W: Weight Vector
-Contains a dense sequence of 64-bit signed integers mapping 1-to-1 by index to the keys in Region PK. This region is always required to support Z-Set algebraic summation.
+Contains a dense sequence of 64-bit signed integers mapping 1-to-1 by index to the keys in Region PK. Total region size is `count × 8`. This region is always required to support Z-Set algebraic summation and is validated eagerly against its checksum at shard open time, alongside Region PK.
 
 ### 5.6. Column Regions ($C_1 \dots C_n$)
-Each column in the `TableSchema` (excluding the Primary Key) is assigned its
-own discrete region.
+Each non-PK column in the `TableSchema` is assigned its own discrete region in schema-declaration order. Column regions are validated lazily: their checksums are only verified on first access, and only if the record being accessed has a non-zero net weight (see §5.9).
 
-*   **Fixed-Stride Integer Primitives:** Integer types (`i8`, `i16`, `i32`,
-    `i64`, `u8`, `u16`, `u32`, `u64`) are stored as dense arrays with element
-    size equal to the column's declared byte width.
+*   **Fixed-Stride Integer Primitives:** Integer types (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`) are stored as dense arrays with element size equal to the column's declared byte width. Signed and unsigned types of the same width use identical bit patterns on disk; the distinction is imposed at read time by the accessor layer.
 
-*   **Fixed-Stride Floating-Point Primitives:** `f32` and `f64` are stored as
-    dense arrays of IEEE 754 single- or double-precision values.
+*   **Fixed-Stride Floating-Point Primitives:** `f32` and `f64` are stored as dense arrays of IEEE 754 single- or double-precision values with element sizes of 4 and 8 bytes respectively.
 
-*   **TYPE_U128 (Non-PK Columns):** Stored as pairs of contiguous 64-bit
-    unsigned integers in little-endian order — the low 64 bits at the base
-    column offset, the high 64 bits at offset + 8 — giving a total of 16 bytes
-    per element. This physical layout is identical to the Primary Key region
-    layout for `u128` PKs, which allows the same raw-memory read path
-    (`SoAAccessor`, `PackedNodeAccessor`) to serve both cases.
+*   **TYPE_U128 (Non-PK Columns):** Stored as pairs of contiguous 64-bit unsigned integers in little-endian order — the low 64 bits at the base column offset, the high 64 bits at offset + 8 — giving a total of 16 bytes per element. This physical layout is identical to the Primary Key region layout for `u128` PKs, which allows the same raw-memory read path (`SoAAccessor`, `PackedNodeAccessor`) to serve both cases.
 
-    **Distinction from TYPE_U128 Primary Keys.** Only one column per table may
-    be designated the Primary Key. Primary Key values of type `u128` flow
-    through the engine as native `r_uint128` throughout the ingestion pipeline,
-    SkipList nodes, cursor reads, and shard format, and never enter the
-    `TaggedValue` union. Non-PK columns of TYPE_U128 — typically UUID foreign
-    keys referencing another table — must transit the `TaggedValue` union
-    between the ingestion API and physical storage (see §8.7). The 16-byte
-    on-disk representation is identical for both cases; only the in-memory
-    handling differs.
+    **Distinction from TYPE_U128 Primary Keys.** Only one column per table may be designated the Primary Key. Primary Key values of type `u128` flow through the engine as native `r_uint128` throughout the ingestion pipeline, SkipList nodes, cursor reads, and shard format, and never enter the `PayloadRow` representation. Non-PK columns of TYPE_U128 — typically UUID foreign keys referencing another table — are handled via `PayloadRow.append_u128` / `get_u128` between the ingestion API and physical storage (see §8.7). The 16-byte on-disk representation is identical for both cases; only the in-memory handling differs.
 
-*   **German Strings (TYPE_STRING):** Stored as 16-byte structs. The structure
-    encodes a 4-byte length, a 4-byte prefix for O(1) equality rejection, and
-    an 8-byte payload that is either an inline suffix (strings ≤ 12 bytes) or
-    a 64-bit offset into the **Shared Blob Heap (Region B)**.
+*   **German Strings (TYPE_STRING):** Stored as 16-byte structs per element. The structure layout is:
+
+    | Sub-Bytes | Field | Description |
+    | :--- | :--- | :--- |
+    | 0 – 3 | Length | `u32`: character count of the full string |
+    | 4 – 7 | Prefix | `u32`: first up to 4 bytes of the string packed into a little-endian word, zero-padded; enables O(1) equality rejection |
+    | 8 – 15 | Payload | 8-byte union: for strings ≤ 12 bytes, the suffix (bytes 4 through length−1) stored inline, zero-padded; for strings > 12 bytes, a `u64` byte offset into Region B |
+
+    The threshold between inline and heap-resident storage is 12 bytes (`SHORT_STRING_THRESHOLD`). Strings of length 0 through 12 are stored entirely within the struct; strings of length 13 or more have their full body written to Region B and the struct holds the offset.
 
 ### 5.7. Region B: Shared Blob Heap
-A consolidated overflow region for variable-length string data. It is accessed via the 64-bit offsets stored within any string-type column region. All long string payloads are deduplicated within this region during shard finalization.
+A consolidated overflow region for variable-length string data. It is accessed exclusively via the 64-bit offsets stored within string-type column regions for strings longer than 12 bytes. During shard finalization, the `TableShardWriter` deduplicates string payloads within Region B using a content-hash map, so identical strings that appear in multiple rows or multiple string columns share a single physical copy. The 64-bit offset stored in a column struct is relative to the start of Region B within the shard file (i.e., relative to the region's `Offset` in the Column Directory). Region B validation is lazy and is only triggered when a long-string comparison or access is required for a record with non-zero net weight.
 
 ### 5.8. Z-Set Write-Ahead Log (WAL) Format
-The WAL is an append-only sequence of LSN-prefixed blocks. Unlike shards, the
-WAL uses a row-oriented (AoS) format for high-velocity durability.
+The WAL is an append-only sequence of LSN-prefixed blocks. Unlike shards, the WAL uses a row-oriented (AoS) format for high-velocity durability. Large batches are segmented into multiple blocks of up to 32 MB each; all blocks for a single `ingest_batch` call share the same LSN and are covered by a single `fsync`.
 
 **WAL Block Header (32 bytes):**
 
-*   `[00-07]` **LSN**: 64-bit monotonic Log Sequence Number.
-*   `[08-11]` **Table ID**: 32-bit unsigned integer identifying the table.
-*   `[12-15]` **Entry Count**: 32-bit unsigned integer (number of records in
-    block).
-*   `[16-23]` **Block Size**: 32-bit unsigned integer (total byte length of
-    header + body). *(Bytes 20-23 reserved, padded with `0x00`.)*
-*   `[24-31]` **Block Checksum**: XXH3-64 hash of the block body.
+| Byte Offset | Field | Type | Description |
+| :--- | :--- | :--- | :--- |
+| 00 – 07 | LSN | `u64` | Monotonic Log Sequence Number for this block |
+| 08 – 11 | Table ID | `u32` | Identifies the target table schema |
+| 12 – 15 | Entry Count | `u32` | Number of records in this block |
+| 16 – 19 | Block Size | `u32` | Total byte length of header + body |
+| 20 – 23 | Format Version | `u32` | Currently `1`; validated on decode |
+| 24 – 31 | Body Checksum | `u64` | XXH3-64 hash of the block body (all bytes after the header) |
 
-**WAL Block Body:**
+**WAL Record Layout:**
 
-A stream of records, each formatted as:
+Each record in the block body is a fixed-header section followed by a variable-length overflow section. The fixed-header size is always `32 + schema.memtable_stride` bytes, regardless of PK width.
 
-```
-[ Key (8 or 16 bytes) | Weight (8 bytes) | Packed Row Payload (Stride bytes) ]
-```
+| Byte Offset within Record | Field | Type | Description |
+| :--- | :--- | :--- | :--- |
+| 00 – 15 | Primary Key | `u128` | Always stored as 16 bytes (low word at 0, high word at 8); for `u64`-PK schemas the high word is zero |
+| 16 – 23 | Weight | `i64` | Algebraic weight for this record |
+| 24 – 31 | Null Word | `u64` | Bitfield where bit *N* is set when payload column *N* (0-based, PK excluded) is null |
+| 32 … 32+stride−1 | Packed Row Payload | `u8[stride]` | AoS block containing all non-PK column values at their `TableSchema`-declared offsets |
+| 32+stride … | String Overflow | `u8[variable]` | Concatenated bodies of all long strings (length > 12) in this record's payload, in column-declaration order |
 
-*   **Key:** 8 bytes for `u64` PKs, 16 bytes for `u128` PKs. The key size is
-    determined by the `TableSchema`.
-*   **Weight:** 64-bit signed integer (`r_int64`).
-*   **Packed Row Payload:** AoS representation of all non-PK columns at their
-    schema-declared offsets. Column types are serialized as follows:
+Column types within the Packed Row Payload are serialized as follows:
 
-    | Column Type | WAL Representation |
-    | :--- | :--- |
-    | Integer (`i8`…`u64`) | Native-width little-endian integer |
-    | `f64` / `f32` | IEEE 754 double / single |
-    | `TYPE_STRING` | 16-byte German String struct; long-string bodies appended inline after the fixed stride, with the struct's 8-byte payload field holding the absolute byte offset within the WAL block |
-    | `TYPE_U128` (non-PK) | Two contiguous 64-bit words: low word at the column's schema offset, high word at offset + 8 |
+| Column Type | WAL Representation |
+| :--- | :--- |
+| Integer (`i8`…`u64`) | Native-width little-endian integer at the schema-declared offset |
+| `f64` / `f32` | IEEE 754 double (8 bytes) / single (4 bytes) at the schema-declared offset |
+| `TYPE_U128` (non-PK) | Two contiguous 64-bit words: low word at the schema offset, high word at offset + 8 |
+| `TYPE_STRING` ≤ 12 bytes | 16-byte German String struct with inline suffix; overflow section not used |
+| `TYPE_STRING` > 12 bytes | 16-byte German String struct; the 8-byte payload field holds the absolute byte offset of the string body within the WAL block (not relative to the record); the body appears in the record's String Overflow section |
 
-Long German String overflow bodies are appended immediately after the fixed
-stride of each record. The allocated block size accounts for these overflows.
-The `WALBlobAllocator` manages the overflow cursor so that each string's
-absolute position within the block is stored in its German String struct.
-
-**WAL Block Body:**
-A stream of records formatted as: `[Key (8/16 bytes) | Weight (8 bytes) | Packed Row Payload (Stride bytes)]`. 
-*   The Key size is determined by the `TableSchema`.
-*   The Weight is a 64-bit signed integer.
-*   The Packed Row Payload is the AoS representation of all non-PK columns, including 16-byte German String structs.
+The `WALBlobAllocator` tracks the current write position within the block buffer and assigns absolute block-relative offsets as it appends each long string body. During decode, `RawWALAccessor` reconstructs German String access by treating the block's base pointer as the heap base, making all offset arithmetic consistent with the shard and MemTable accessor paths.
 
 ### 5.9. Data Integrity and The Ghost Property
-The storage layer utilizes region-scoped validation to optimize "Ghost" record processing.
-*   **Partial Validation:** Readers (e.g., during query execution) validate the PK and Weight regions first. 
-*   **Deferred Validation:** Checksums for specific column regions ($C_i$) or the Blob Heap (Region B) are only validated if the records being accessed possess a non-zero net weight ($w_{net} \neq 0$), preventing I/O and CPU stalls for annihilated data.
+The storage layer applies validation selectively to avoid stalling on annihilated data.
+
+*   **Eager Validation:** Region PK (index 0) and Region W (index 1) checksums are verified against their XXH3-64 Column Directory entries immediately when a `TableShardView` is opened. A `CorruptShardError` is raised on mismatch before any records are read.
+*   **Lazy Validation:** All other region checksums — column regions ($C_i$) and Region B — are deferred until first access. Each region tracks a `region_validated` flag; the flag is set after the checksum passes and the check is not repeated.
+*   **The Ghost Property:** Accessors and cursor implementations inspect the Weight region before touching any column region. If a record's net weight is zero, no column region or blob heap access is performed. This ensures that annihilated records never occupy CPU cache lines, trigger Region B reads, or cause lazy checksum validation of column regions they inhabit. The compactor enforces the Ghost Property structurally by omitting zero-weight records from output shards entirely.
+*   **WAL Integrity:** Each WAL block carries a single XXH3-64 checksum of its entire body, computed and written by `write_wal_block` and verified by `decode_wal_block` before any record is decoded. A format version field in the block header is also validated; blocks with an unrecognised version raise `CorruptShardError`.
     
 ## 6. The MemTable: High-Velocity Z-Set Ingestion
 
@@ -253,36 +247,38 @@ The MemTable utilizes a SkipList indexed by a composite key consisting of the **
 
 ### 6.3. Physical Node Layout
 
-Nodes are allocated within the **Dual-Arena** system (Staging Arena and Blob
-Arena). To ensure native CPU register performance, the Primary Key field is
-16-byte aligned.
+Nodes are allocated within the **Dual-Arena** system. All nodes share the same fixed prefix structure for weight and SkipList metadata, but their total size varies with the node's randomly assigned tower height and the `TableSchema`'s `memtable_stride`. To ensure native CPU register performance for 128-bit key comparison, the Primary Key field is always placed at a 16-byte-aligned arena offset.
 
 **Node Structure:**
 
-*   `[00-07]` **Weight**: 64-bit signed integer (`w ∈ ℤ`).
-*   `[08-08]` **Height**: 8-bit unsigned integer (SkipList tower height `h`).
-*   `[09-11]` **Padding**: Three bytes ensuring 4-byte alignment for the
-    pointer array.
-*   `[12 … 12+(h×4)-1]` **Next-Pointer Array**: Height-indexed array of `h`
-    32-bit arena offsets, one per SkipList level.
-*   `[aligned to 16]` **Primary Key**: 8-byte (`u64`) or 16-byte (`u128`)
-    unsigned integer, stored at the first 16-byte-aligned offset after the
-    pointer array.
-*   `[PK end … PK end + Stride - 1]` **Packed Row Payload**: Fixed-stride
-    block containing the serialized values of all non-PK columns at their
-    `TableSchema`-declared offsets. Each column is stored as:
+*   `[00-07]` **Weight**: 64-bit signed integer (`r_int64`, `w ∈ ℤ`). Read and written via a single 8-byte aligned store; this field is updated in-place during algebraic coalescing without reallocating the node.
+*   `[08]` **Height**: 8-bit unsigned integer. Records the tower height `h` of this node (1 ≤ h ≤ 16). Required at every field-access site because the Primary Key offset is height-dependent.
+*   `[09-11]` **Padding**: Three zero bytes, ensuring 4-byte alignment for the start of the Next-Pointer Array.
+*   `[12 … 12+(h×4)−1]` **Next-Pointer Array**: Array of `h` 32-bit unsigned arena offsets, one per SkipList level. Each entry holds the arena byte offset of the next node at that level, or zero to indicate the end of the list. The array is indexed from level 0 (the densest, base-list level) to level h−1 (the highest, sparsest tower level).
+*   `[key_off … key_off + key_size − 1]` **Primary Key**: 8-byte (`u64`) or 16-byte (`u128`) unsigned integer. Placed at `key_off`, which is the first 16-byte-aligned offset strictly greater than or equal to `12 + (h × 4)`, computed as `(12 + h×4 + 15) & ~15`. For example, a node of height 1 has `key_off = 16`; heights 2 through 5 have `key_off = 32`; heights 6 through 9 have `key_off = 48`. A `u128` key is stored as two contiguous 64-bit words in little-endian order (low word first).
+*   `[key_off + key_size … key_off + key_size + 7]` **Payload Hash**: 64-bit XXH3-64 hash of the node's canonical serialized row payload. Computed by `serialize.compute_hash` at insertion time using a reusable scratch buffer to avoid per-node allocation. The SkipList search uses this hash as a secondary sort key within a PK group, enabling O(1) rejection of non-matching payloads before performing the full byte-level row comparison. Nodes with the same PK are ordered first by hash, then by full payload content.
+*   `[key_off + key_size + 8 … key_off + key_size + 8 + stride − 1]` **Packed Row Payload**: Fixed-stride block of `schema.memtable_stride` bytes containing the serialized values of all non-PK columns at their `TableSchema`-declared offsets. Each column is stored as:
 
     | Column Type | Node Representation |
     | :--- | :--- |
-    | Integer (`i8`…`u64`) | Native-width value; the bit pattern is identical for signed and unsigned types, matching the `r_int64` bitcast used in `PayloadRow._lo` |
-    | `f64` / `f32` | IEEE 754 double / single |
-    | `TYPE_U128` (non-PK) | Two contiguous 64-bit words: low word at the schema offset, high word at offset + 8; reconstructed via `PayloadRow.get_u128()`, which recombines the low word stored in `_lo` and the high word stored in `_hi` |
-    | `TYPE_STRING` | 16-byte German String struct; long-string tails stored in the Blob Arena and referenced by their 64-bit blob-arena offset |
+    | Integer (`i8`…`u64`) | Native-width little-endian value at the schema-declared offset; the bit pattern is identical for signed and unsigned types |
+    | `f64` | 8-byte IEEE 754 double-precision value at the schema-declared offset |
+    | `f32` | 4-byte IEEE 754 single-precision value at the schema-declared offset |
+    | `TYPE_U128` (non-PK) | Two contiguous 64-bit words: low word at the schema offset, high word at offset + 8; 16 bytes total |
+    | `TYPE_STRING` ≤ 12 bytes | 16-byte German String struct with inline suffix; no blob arena entry |
+    | `TYPE_STRING` > 12 bytes | 16-byte German String struct; the 8-byte payload field holds the 64-bit offset of the string body within the **Blob Arena**, measured from the start of the Blob Arena's base pointer |
+    | NULL (any nullable column) | Zero bytes at the column's native width; nullability is not encoded in the payload itself but is tracked via the WAL null word on flush and re-derived from context during recovery |
 
-When a MemTable node is flushed to a columnar shard, the `TableShardWriter`
-reads the `TYPE_U128` payload from raw memory via `PackedNodeAccessor.get_u128`,
-which reconstructs the full 128-bit value from the two 64-bit words written at
-serialisation time.
+Long German String bodies reside in the **Blob Arena** (the MemTable's second arena). The `MemTableBlobAllocator` appends each body via a bump-pointer and returns its Blob Arena offset, which is then stored in the struct's payload field. During transmutation (flush to shard), string bodies are read from the Blob Arena via these offsets and relocated into the shard's **Region B**, with offsets swizzled to be region-relative.
+
+**Total Node Size:**
+
+```
+total = key_off + key_size + 8 (hash) + schema.memtable_stride
+      = ((12 + h×4 + 15) & ~15) + key_size + 8 + stride
+```
+
+For a u64-PK schema with stride 32 and a height-1 node: `16 + 8 + 8 + 32 = 64` bytes. For a u128-PK schema with the same stride and height-2: `32 + 16 + 8 + 32 = 88` bytes. All node allocations are requested with 16-byte alignment from the Staging Arena's bump-pointer allocator.
 
 ### 6.4. Sealing and Transmutation (Unzipping)
 The transition from mutable row-oriented memory to immutable columnar persistence is triggered by Arena occupancy.
@@ -331,25 +327,18 @@ Coalesced rows are streamed into a `TableShardWriter` to generate the new column
 
 ### 8.1. Register-Based Z-Set VM
 
-The engine executes reactive circuits via a register-based Virtual Machine
-designed for the incremental maintenance of relational views.
+The engine executes reactive circuits via a register-based Virtual Machine designed for the incremental maintenance of relational views.
 
-*   **Register File:** A collection of specialized registers indexed by the VM
-    ISA. The Register File maintains a monomorphic interface to facilitate
-    RPython JIT tracing.
-
-*   **Delta Registers ($R_\Delta$):** Transient registers holding a `ZSetBatch`.
-    Each batch is a set of three parallel arrays — primary keys (`r_uint128`),
-    algebraic weights (`r_int64`), and payload rows (`PayloadRow`) — representing
-    the in-memory Z-Set deltas $(\Delta PK, \Delta W, \Delta Row)$ for the
-    current LSN epoch. The `PayloadRow` type stores all non-PK column values in a
-    struct-of-arrays layout; column types are derived from the `TableSchema` at
-    every access site rather than stored per value.
-
-*   **Trace Registers ($R_T$):** Persistent registers holding a `UnifiedCursor`.
-    These provide a seekable, merged view across the persistent FLSM shards and
-    the active MemTable, serving as the historical state ($S$) required for
-    non-linear operations.
+*   **Register File:** A fixed-size collection of typed registers indexed by position in the VM ISA. The `RegisterFile` maintains a monomorphic `BaseRegister` interface across all register subtypes, which is required for RPython JIT tracing: because the interpreter's dispatch loop accesses all registers through the same base-class reference, all fields that any subtype may expose — including `batch`, `cursor`, and `table` — are declared and initialized at the `BaseRegister` level. At the start of each LSN epoch, `clear_all_deltas()` resets every `DeltaRegister` in the file to an empty state before the input batch is ingested into register 0.
+*   **VMSchema:** Each register carries a `VMSchema` instance that caches the physical metadata of its associated `TableSchema` — column offsets, column type codes, PK index, PK type code, and `memtable_stride` — in fixed-size lists marked `_immutable_fields_`. The JIT promotes these cached values to compile-time constants per trace, folding all column address arithmetic into immediate machine instructions and eliminating dynamic directory lookups in hot loops.
+*   **Delta Registers ($R_\Delta$):** Transient registers that hold an `ArenaZSetBatch` representing the in-flight Z-Set deltas $(\Delta PK, \Delta W, \Delta Row)$ for the current LSN epoch. Unlike a set of parallel Python object arrays, an `ArenaZSetBatch` stores all record data in two raw C memory arenas managed by the RPython allocator:
+    *   The **Primary Arena** holds fixed-size record headers packed contiguously. Each record occupies `32 + schema.memtable_stride` bytes: a 16-byte Primary Key (always `u128`-width; `u64`-PK schemas leave the high word as zero), an 8-byte signed weight, an 8-byte null word bitfield, and then the packed row payload at its schema-declared offsets.
+    *   The **Blob Arena** holds the bodies of long strings (length > 12 bytes). German String structs in the payload section reference these bodies via 64-bit Blob Arena offsets.
+    Records are appended via `append_from_accessor`, which accepts any `RowAccessor` implementation and serializes directly into the arena without creating intermediate Python objects. `PayloadRow` instances are only materialized on demand via `get_row()`, which is used exclusively in the non-hot `_argsort_delta` path of the `REDUCE` operator. All other operator paths — filter, map, join, distinct, negate, union — operate entirely through `RowAccessor` interfaces against the raw arena memory. A `BatchBlobAllocator` delegates string overflow writes into the Blob Arena and returns the corresponding offset for storage in the payload struct. Batches support sorting (via a mergesort over an index permutation array followed by contiguous repacking) and consolidation (grouping identical records and summing weights, discarding zero-weight ghosts).
+*   **Trace Registers ($R_T$):** Persistent registers that hold operator state spanning multiple LSN epochs. A `TraceRegister` carries two references, serving distinct roles in read and write paths:
+    *   **`cursor`** (`AbstractCursor`): A `UnifiedCursor` providing a seekable, sorted, merged view across all FLSM shards and the active MemTable for the trace's backing `AbstractTable`. The `UnifiedCursor` routes seeks to its constituent `MemTableCursor` and `ShardCursor` instances, applies the Ghost Property (skipping zero-weight records), and performs algebraic weight summation across overlapping payload groups. This cursor is used by operators that need to read historical state — `DISTINCT` reads accumulated membership weights, `REDUCE` reads stored aggregate values, and `JOIN_DELTA_TRACE` probes the persistent side of an incremental join.
+    *   **`table`** (`AbstractTable`): A reference to the backing `EphemeralTable` that owns the trace's mutable state. Stateful operators write back to this table — `DISTINCT` calls `ingest_batch` after computing output deltas, and `REDUCE` is followed by an `IntegrateOp` that flushes the new aggregate values. The table reference exposes `get_weight` for zero-allocation point lookups (used by `DISTINCT`) and `ingest_batch` for batch writes. Purely read-through traces — for example, a `JOIN_DELTA_TRACE` against a pre-existing persistent base table — leave `table` as `None`.
+    Trace Registers are not cleared between epochs; their state accumulates monotonically as the operator's running integral $I(\delta_{in})$.
 
 ### 8.2. Operational Primitives (DBSP-Complete ISA)
 The ISA implements the core operators of the DBSP calculus. All operators handle multiple payloads per Primary Key to maintain multiset integrity.
@@ -594,7 +583,7 @@ The execution plan is serialized into the VM ISA, with physical constants inject
 *   **Pure Z-Set Compaction:** N-way merge infrastructure utilizing a type-aware `TournamentTree` and full-row semantic equality grouping for algebraic summation.
 *   **Shard Registry & RefCounting:** Implementation of Read-Amplification monitoring and reference-counted file lifecycle management for multi-process safety.
 
-### Phase 2: Persistent DBSP Virtual Machine [PENDING]
+### Phase 2: Persistent DBSP Virtual Machine [COMPLETED]
 *   **Register-Based Execution Core:** Implementation of the VM supporting $R_\Delta$ (delta) and $R_T$ (persistent trace) registers.
 *   **Multiset Join Logic:** Development of the `JOIN_V` operator to execute $N \times M$ row cross-products with algebraic weight multiplication ($w_A \times w_B$).
 *   **Weight-Gated Materialization Barriers:** JIT-specialized instructions that inspect **Region W** to elide column and blob fetches for annihilated records ($w_{net}=0$).
