@@ -3,12 +3,12 @@
 import os
 import errno
 from rpython.rlib import rposix
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rlib.objectmodel import newlist_hint
 
-from gnitz.core.batch import make_singleton_batch
-from gnitz.core import types, errors, row_logic, strings as string_logic
+from gnitz.core.batch import make_singleton_batch, ZSetBatch
+from gnitz.core import types, errors, row_logic
 from gnitz.core import comparator as core_comparator
 from gnitz.storage import (
     wal,
@@ -16,23 +16,13 @@ from gnitz.storage import (
     manifest,
     memtable,
     refcount,
-    wal_format,
     shard_table,
     comparator as storage_comparator,
     cursor,
 )
-from gnitz.storage.memtable_node import node_get_weight, node_get_next_off, node_get_key
+from gnitz.storage.memtable_node import node_get_weight
 from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.backend.table import AbstractTable
-
-
-class MemTableEntry(object):
-    """Test-compatibility wrapper for SkipList nodes."""
-
-    def __init__(self, pk, weight, row):
-        self.pk = pk
-        self.weight = weight
-        self.row = row
 
 
 class PersistentTable(AbstractTable):
@@ -41,8 +31,6 @@ class PersistentTable(AbstractTable):
 
     Manages the lifecycle of the SkipList MemTable, the Write-Ahead Log,
     the columnar ShardIndex, and the atomic Manifest Authority.
-
-    Implements gnitz.backend.table.AbstractTable to satisfy the VM/Query interface.
     """
 
     _immutable_fields_ = [
@@ -51,7 +39,6 @@ class PersistentTable(AbstractTable):
         "directory",
         "name",
         "ref_counter",
-        "row_cmp",
     ]
 
     def __init__(
@@ -71,7 +58,6 @@ class PersistentTable(AbstractTable):
         self.is_closed = False
 
         self.ref_counter = refcount.RefCounter()
-        self.row_cmp = row_logic.PayloadRowComparator(schema)
 
         try:
             rposix.mkdir(directory, 0o755)
@@ -116,7 +102,6 @@ class PersistentTable(AbstractTable):
 
     def create_cursor(self):
         num_shards = len(self.index.handles)
-        # Fix: Use newlist_hint to avoid mr-poisoning
         cs = newlist_hint(1 + num_shards)
 
         cs.append(cursor.MemTableCursor(self.memtable))
@@ -126,10 +111,6 @@ class PersistentTable(AbstractTable):
         return cursor.UnifiedCursor(self.schema, cs)
 
     def create_scratch_table(self, name, schema):
-        """
-        Architectural Pivot: Always return an EphemeralTable for trace data.
-        This eliminates per-record fsyncs for DISTINCT/REDUCE operations.
-        """
         scratch_dir = os.path.join(self.directory, "scratch_" + name)
 
         tid = 0
@@ -147,52 +128,46 @@ class PersistentTable(AbstractTable):
         )
 
     def ingest(self, key, weight, payload):
+        """External API entry point for PayloadRow objects."""
         batch = make_singleton_batch(self.schema, r_uint128(key), weight, payload)
         self.ingest_batch(batch)
 
     def ingest_batch(self, batch):
         """
-        Durable Z-Set batch update.
-        Assigns one LSN to the entire batch (DBSP tick semantics).
-        Converts N WAL writes/fsyncs into 1 block append.
+        Durable Z-Set batch update using ArenaZSetBatch.
         """
         if self.is_closed:
             raise errors.StorageError("Table is closed")
 
-        n = batch.length()
-        if n == 0:
+        if batch.length() == 0:
             return
 
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
 
-        # Fix: Use newlist_hint to avoid mr-poisoning
-        wal_records = newlist_hint(n)
-        for i in range(n):
-            w = batch.get_weight(i)
-            # Ghost Property: skip records that sum to zero
-            if w == r_int64(0):
-                continue
+        # 1. Durability: Write to WAL
+        # This is zero-copy as WALWriter reads directly from Batch arenas.
+        self.wal_writer.append_batch(lsn, self.table_id, batch)
 
-            pk = batch.get_pk(i)
-            row = batch.get_row(i)
-
-            # Update in-memory state
-            self.memtable.upsert(pk, w, row)
-
-            # Prepare for durability
-            wal_records.append(wal_format.WALRecord(pk, w, row))
-
-        # Commit batch to WAL with a single block write and fsync
-        if len(wal_records) > 0:
-            self.wal_writer.append_batch(lsn, self.table_id, wal_records)
+        # 2. Visibility: Update MemTable
+        # This is zero-copy as MemTable reads directly from Batch arenas.
+        self.memtable.upsert_batch(batch)
 
     def get_weight(self, key, payload):
         r_key = r_uint128(key)
         total_w = r_int64(0)
 
         # 1. Check SkipList MemTable
-        node_off = self.memtable._find_exact_values(r_key, payload)
+        # We must use the semantic RowComparator because the MemTable is indexed
+        # by (Key, Payload Hash, Payload Row).
+        val_acc = core_comparator.PayloadRowAccessor(self.schema)
+        val_acc.set_row(payload)
+        
+        # We need the hash to perform the SkipList search
+        from gnitz.core import serialize
+        h_val, _, _ = serialize.compute_hash(self.schema, val_acc, lltype.nullptr(rffi.CCHARP.TO), 0)
+
+        node_off = self.memtable._find_exact_values(r_key, h_val, val_acc)
         if node_off != 0:
             total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
 
@@ -200,8 +175,6 @@ class PersistentTable(AbstractTable):
         shard_matches = self.index.find_all_shards_and_indices(r_key)
         if shard_matches:
             soa = storage_comparator.SoAAccessor(self.schema)
-            val_acc = core_comparator.ValueAccessor(self.schema)
-            val_acc.set_row(payload)
 
             for handle, row_idx in shard_matches:
                 view = handle.view
@@ -231,14 +204,17 @@ class PersistentTable(AbstractTable):
     def recover_from_wal(self, wal_path):
         """
         Replays WAL blocks into the MemTable to recover volatile state.
-        Uses the zero-copy upsert_raw path.
+        Uses the zero-copy accessor path.
         """
         if not os.path.exists(wal_path):
             return
 
-        # Start recovery from the point where the last manifest left off
         boundary = self.current_lsn
         reader = wal.WALReader(wal_path, self.schema)
+        
+        # Pre-allocate recovery accessor
+        rec_acc = storage_comparator.RawWALAccessor(self.schema)
+        
         try:
             while True:
                 block = reader.read_next_block()
@@ -249,14 +225,13 @@ class PersistentTable(AbstractTable):
                     if block.tid != self.table_id or block.lsn < boundary:
                         continue
 
-                    # Zero-Copy Recovery Path: Pass RawWALRecord to upsert_raw
                     for rec in block.records:
-                        self.memtable.upsert_raw(rec.pk, rec.weight, rec)
+                        rec_acc.set_record(rec)
+                        self.memtable.upsert(rec.pk, rec.weight, rec_acc)
 
                     if block.lsn >= self.current_lsn:
                         self.current_lsn = block.lsn + r_uint64(1)
                 finally:
-                    # Essential: Release the raw C memory held by the block
                     block.free()
         finally:
             reader.close()
@@ -268,7 +243,6 @@ class PersistentTable(AbstractTable):
         self.ingest(pk, r_int64(-1), row)
 
     def flush(self):
-        """Transmutes MemTable to a columnar shard and clears memory."""
         if self.is_closed:
             raise errors.StorageError("Table is closed")
 

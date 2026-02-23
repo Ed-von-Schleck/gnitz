@@ -5,29 +5,29 @@ import errno
 from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.core import types, errors, row_logic, comparator as core_comparator
+from gnitz.core.batch import make_singleton_batch
+from gnitz.core import types, errors, serialize
+from gnitz.core import comparator as core_comparator
 from gnitz.storage import (
     index,
     memtable,
     refcount,
-    shard_table,
     comparator as storage_comparator,
     cursor,
 )
-from gnitz.storage.memtable_node import node_get_weight, node_get_next_off
+from gnitz.storage.memtable_node import node_get_weight
 from gnitz.backend.table import AbstractTable
-from gnitz.core.batch import make_singleton_batch
 
 
 class EphemeralTable(AbstractTable):
     """
-    An Ephemeral Z-Set Table used for DBSP Trace state (DISTINCT, REDUCE).
-
-    This implementation bypasses the Write-Ahead Log and Persistent Manifest.
-    Data is held in memory (MemTable) and spills to temporary columnar shards
-    only when memory pressure triggers a flush. All disk artifacts are
-    deleted upon closing the table.
+    Scratch Z-Set storage for internal VM state (Traces, Materialized Views).
+    
+    Bypasses the Write-Ahead Log to maximize throughput. Data is kept in-memory
+    via MemTable and occasionally flushed to temporary shards to manage 
+    RAM pressure.
     """
 
     _immutable_fields_ = [
@@ -36,7 +36,6 @@ class EphemeralTable(AbstractTable):
         "directory",
         "name",
         "ref_counter",
-        "row_cmp",
     ]
 
     def __init__(
@@ -44,28 +43,27 @@ class EphemeralTable(AbstractTable):
         directory,
         name,
         schema,
-        table_id=1,
+        table_id=0,
         memtable_arena_size=1 * 1024 * 1024,
+        validate_checksums=False,
     ):
         self.directory = directory
         self.name = name
         self.schema = schema
         self.table_id = table_id
+        self.validate_checksums = validate_checksums
         self.is_closed = False
 
         self.ref_counter = refcount.RefCounter()
-        self.row_cmp = row_logic.PayloadRowComparator(schema)
-        self.temp_files = []
-
-        self.current_lsn = r_uint64(1)
-        self.index = index.ShardIndex(table_id, schema, self.ref_counter)
-        self.memtable = memtable.MemTable(schema, memtable_arena_size)
 
         try:
             rposix.mkdir(directory, 0o755)
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
+
+        self.index = index.ShardIndex(table_id, schema, self.ref_counter)
+        self.memtable = memtable.MemTable(schema, memtable_arena_size)
 
     # -------------------------------------------------------------------------
     # AbstractTable Implementation
@@ -75,9 +73,6 @@ class EphemeralTable(AbstractTable):
         return self.schema
 
     def create_cursor(self):
-        """
-        Creates a UnifiedCursor merging the active MemTable and spilled shards.
-        """
         num_shards = len(self.index.handles)
         cs = newlist_hint(1 + num_shards)
 
@@ -88,11 +83,9 @@ class EphemeralTable(AbstractTable):
         return cursor.UnifiedCursor(self.schema, cs)
 
     def create_scratch_table(self, name, schema):
-        """
-        Creates another EphemeralTable for nested operator state.
-        """
-        scratch_dir = os.path.join(self.directory, name)
-
+        """Returns another EphemeralTable instance for recursive state."""
+        scratch_dir = os.path.join(self.directory, "scratch_" + name)
+        
         tid = 0
         for char in name:
             tid = (tid * 31 + ord(char)) & 0x7FFFFFFF
@@ -108,56 +101,44 @@ class EphemeralTable(AbstractTable):
         )
 
     def ingest(self, key, weight, payload):
-        """
-        Direct ingestion into the MemTable, bypassing the WAL.
-        Wraps single record in a ZSetBatch for unified logic.
-        """
-        if self.is_closed:
-            raise errors.StorageError("EphemeralTable is closed")
-
-        b = make_singleton_batch(self.schema, r_uint128(key), weight, payload)
-        self.ingest_batch(b)
+        """External API: ingest a single PayloadRow."""
+        batch = make_singleton_batch(self.schema, r_uint128(key), weight, payload)
+        self.ingest_batch(batch)
 
     def ingest_batch(self, batch):
         """
-        Optimized batch ingestion for DBSP operators.
-        Increments the LSN once for the entire batch (logical tick).
+        Ingests a batch of Z-Set deltas into the MemTable.
+        Bypasses WAL writer for maximum scratch throughput.
         """
         if self.is_closed:
-            raise errors.StorageError("EphemeralTable is closed")
+            raise errors.StorageError("Table is closed")
 
-        n = batch.length()
-        if n == 0:
+        if batch.length() == 0:
             return
 
-        # Entire batch shares a single logical time increment
-        self.current_lsn += r_uint64(1)
-
-        for i in range(n):
-            w = batch.get_weight(i)
-            # Only ingest non-zero weights (Ghost Property enforcement)
-            if w != 0:
-                self.memtable.upsert(batch.get_pk(i), w, batch.get_row(i))
+        # Visibility: Update MemTable only.
+        # Zero-copy transfer if source is ArenaZSetBatch.
+        self.memtable.upsert_batch(batch)
 
     def get_weight(self, key, payload):
-        """
-        Calculates net weight across memory and spilled shards.
-        Used primarily for trace-based lookups in non-linear operators.
-        """
         r_key = r_uint128(key)
         total_w = r_int64(0)
 
         # 1. Check SkipList MemTable
-        node_off = self.memtable._find_exact_values(r_key, payload)
+        val_acc = core_comparator.PayloadRowAccessor(self.schema)
+        val_acc.set_row(payload)
+        
+        # Calculate hash for SkipList O(1) payload check
+        h_val, _, _ = serialize.compute_hash(self.schema, val_acc, lltype.nullptr(rffi.CCHARP.TO), 0)
+
+        node_off = self.memtable._find_exact_values(r_key, h_val, val_acc)
         if node_off != 0:
             total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
 
-        # 2. Check Spilled Columnar Shards
+        # 2. Check Columnar Shards via Index
         shard_matches = self.index.find_all_shards_and_indices(r_key)
         if shard_matches:
             soa = storage_comparator.SoAAccessor(self.schema)
-            val_acc = core_comparator.ValueAccessor(self.schema)
-            val_acc.set_row(payload)
 
             for handle, row_idx in shard_matches:
                 view = handle.view
@@ -177,48 +158,50 @@ class EphemeralTable(AbstractTable):
                     ):
                         total_w += view.get_weight(idx)
                     idx += 1
+
         return total_w
 
     # -------------------------------------------------------------------------
-    # Maintenance and Lifecycle
+    # Maintenance Logic
     # -------------------------------------------------------------------------
 
-    def flush(self):
-        """
-        Spills the current MemTable to a temporary columnar shard.
-        This is triggered by the VM or MemTable pressure.
-        """
-        if self.is_closed:
-            raise errors.StorageError("EphemeralTable is closed")
+    def insert(self, pk, row):
+        self.ingest(pk, r_int64(1), row)
 
-        # Generate a unique temporary shard name
-        shard_name = "temp_trace_%d_%d.db" % (self.table_id, intmask(self.current_lsn))
+    def delete(self, pk, row):
+        self.ingest(pk, r_int64(-1), row)
+
+    def flush(self):
+        """Transitions MemTable state to a temporary columnar shard."""
+        if self.is_closed:
+            raise errors.StorageError("Table is closed")
+
+        # Use ephemeral naming scheme
+        shard_name = "eph_shard_%d_%d.db" % (self.table_id, intmask(rffi.cast(rffi.SIZE_T, self.memtable.arena.offset)))
         shard_path = os.path.join(self.directory, shard_name)
 
-        # AoS -> SoA Transmutation
         self.memtable.flush(shard_path, self.table_id)
 
-        if os.path.exists(shard_path):
-            lsn_max = self.current_lsn
-            h = index.ShardHandle(
-                shard_path,
-                self.schema,
-                r_uint64(0),
-                lsn_max,
-                validate_checksums=False,  # Disable for speed in ephemeral state
-            )
+        if not os.path.exists(shard_path):
+            return ""
 
-            if h.view.count > 0:
-                self.index.add_handle(h)
-                self.temp_files.append(shard_path)
-            else:
-                h.close()
-                try:
-                    os.unlink(shard_path)
-                except OSError:
-                    pass
+        h = index.ShardHandle(
+            shard_path,
+            self.schema,
+            r_uint64(0),
+            r_uint64(0),
+            validate_checksums=self.validate_checksums,
+        )
 
-        # Reset MemTable
+        if h.view.count > 0:
+            self.index.add_handle(h)
+        else:
+            h.close()
+            try:
+                os.unlink(shard_path)
+            except OSError:
+                pass
+
         arena_size = self.memtable.arena.size
         self.memtable.free()
         self.memtable = memtable.MemTable(self.schema, arena_size)
@@ -226,24 +209,10 @@ class EphemeralTable(AbstractTable):
         return shard_path
 
     def close(self):
-        """
-        Releases all memory and physically deletes spilled shard files.
-        """
         if self.is_closed:
             return
-
-        # 1. Close the index (releases mmap and file locks)
-        self.index.close_all()
-
-        # 2. Free arenas
         if self.memtable:
             self.memtable.free()
-
-        # 3. Unlink all temporary shards
-        for path in self.temp_files:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-
+        if self.index:
+            self.index.close_all()
         self.is_closed = True

@@ -18,12 +18,12 @@ from gnitz.storage.memtable_node import (
     node_set_hash,
     HASH_SIZE,
 )
-from gnitz.core.comparator import PayloadRowAccessor
 
 MAX_HEIGHT = 16
 
 
 class MemTableBlobAllocator(string_logic.BlobAllocator):
+    """Allocates string tails in the MemTable's blob arena."""
     def __init__(self, arena):
         self.arena = arena
 
@@ -38,13 +38,14 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
         return r_uint64(off)
 
     def allocate_from_ptr(self, src_ptr, length):
-        """Zero-copy allocation from raw pointer."""
+        """Zero-copy relocation of string data."""
         b_ptr = self.arena.alloc(length, alignment=8)
-        buffer.c_memmove(
-            rffi.cast(rffi.VOIDP, b_ptr),
-            rffi.cast(rffi.VOIDP, src_ptr),
-            rffi.cast(rffi.SIZE_T, length)
-        )
+        if length > 0:
+            buffer.c_memmove(
+                rffi.cast(rffi.VOIDP, b_ptr),
+                rffi.cast(rffi.VOIDP, src_ptr),
+                rffi.cast(rffi.SIZE_T, length)
+            )
         off = rffi.cast(lltype.Signed, b_ptr) - rffi.cast(
             lltype.Signed, self.arena.base_ptr
         )
@@ -52,6 +53,10 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
 
 
 class MemTable(object):
+    """
+    Mutable, in-memory Z-Set storage. 
+    Optimized for rapid algebraic coalescing via SkipList + Payload Hashing.
+    """
     _immutable_fields_ = [
         "schema",
         "arena",
@@ -60,8 +65,6 @@ class MemTable(object):
         "key_size",
         "head_off",
         "node_accessor",
-        "value_accessor",
-        "raw_wal_accessor",
     ]
 
     def __init__(self, schema, arena_size):
@@ -72,17 +75,17 @@ class MemTable(object):
         self._update_offsets = [0] * MAX_HEIGHT
         self.key_size = schema.get_pk_column().field_type.size
 
+        # Node accessor for SkipList traversal comparisons
         self.node_accessor = comparator.PackedNodeAccessor(
             schema, self.blob_arena.base_ptr
         )
-        self.value_accessor = comparator.ValueAccessor(schema)
-        self.raw_wal_accessor = comparator.RawWALAccessor(schema)
 
+        # Reusable hash buffer to minimize mallocs
         self.hash_buf_cap = 1024
         self.hash_buf = lltype.malloc(rffi.CCHARP.TO, self.hash_buf_cap, flavor="raw")
 
-        self.arena.alloc(8, alignment=8)
-
+        # SkipList Initialization
+        self.arena.alloc(8, alignment=8) # Padding
         head_key_off = get_key_offset(MAX_HEIGHT)
         h_sz = head_key_off + self.key_size + HASH_SIZE + self.schema.memtable_stride
 
@@ -95,17 +98,17 @@ class MemTable(object):
         for i in range(MAX_HEIGHT):
             node_set_next_off(self.arena.base_ptr, self.head_off, i, 0)
 
+        # Sentinel Key: Max possible value
         key_ptr = rffi.ptradd(ptr, head_key_off)
         all_ones = r_uint64(-1)
         if self.key_size == 16:
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, all_ones)
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = rffi.cast(
-                rffi.ULONGLONG, all_ones
-            )
+            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = all_ones
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = all_ones
         else:
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, all_ones)
+            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = all_ones
 
     def lower_bound_node(self, key):
+        """Standard SkipList search for first node where node.key >= key."""
         base = self.arena.base_ptr
         curr_off = self.head_off
 
@@ -121,7 +124,11 @@ class MemTable(object):
 
         return node_get_next_off(base, curr_off, 0)
 
-    def _find_exact_values_with_hash(self, key, target_hash, target_accessor):
+    def _find_exact_values(self, key, target_hash, accessor):
+        """
+        Finds the exact SkipList node matching (Key, Hash, Payload).
+        Updates self._update_offsets as a side-effect for subsequent insertions.
+        """
         base = self.arena.base_ptr
         curr_off = self.head_off
 
@@ -139,10 +146,11 @@ class MemTable(object):
                     elif stored_hash > target_hash:
                         break
                     else:
+                        # Hash collision or exact match: perform full byte-level check
                         self.node_accessor.set_row(base, next_off)
                         if (
                             core_comparator.compare_rows(
-                                self.schema, self.node_accessor, target_accessor
+                                self.schema, self.node_accessor, accessor
                             )
                             < 0
                         ):
@@ -161,31 +169,29 @@ class MemTable(object):
                     self.node_accessor.set_row(base, match_off)
                     if (
                         core_comparator.compare_rows(
-                            self.schema, self.node_accessor, target_accessor
+                            self.schema, self.node_accessor, accessor
                         )
                         == 0
                     ):
                         return match_off
         return 0
 
-    def _find_exact_values(self, key, row):
-        self.value_accessor.set_row(row)
-        hash_val, self.hash_buf, self.hash_buf_cap = serialize.compute_hash(
-            self.schema, self.value_accessor, self.hash_buf, self.hash_buf_cap
-        )
-        return self._find_exact_values_with_hash(key, hash_val, self.value_accessor)
-
-    def upsert(self, key, weight, row):
+    def upsert(self, key, weight, accessor):
+        """
+        Ingests a single record from any RowAccessor.
+        """
         base = self.arena.base_ptr
-        self.value_accessor.set_row(row)
         hash_val, self.hash_buf, self.hash_buf_cap = serialize.compute_hash(
-            self.schema, self.value_accessor, self.hash_buf, self.hash_buf_cap
+            self.schema, accessor, self.hash_buf, self.hash_buf_cap
         )
-        match_off = self._find_exact_values_with_hash(key, hash_val, self.value_accessor)
+        
+        match_off = self._find_exact_values(key, hash_val, accessor)
 
         if match_off != 0:
+            # Existing node: additive coalescing
             new_w = node_get_weight(base, match_off) + weight
             if new_w == 0:
+                # Annihilation: unlink node
                 h = ord(base[match_off + 8])
                 for i in range(h):
                     pred_off = self._update_offsets[i]
@@ -196,6 +202,7 @@ class MemTable(object):
                 node_set_weight(base, match_off, new_w)
             return
 
+        # New node creation
         h = 1
         while h < MAX_HEIGHT and (self.rng.genrand32() & 1):
             h += 1
@@ -203,8 +210,7 @@ class MemTable(object):
         key_off = get_key_offset(h)
         node_full_sz = key_off + self.key_size + HASH_SIZE + self.schema.memtable_stride
         
-        # Unified capacity check
-        self._ensure_capacity(node_full_sz, self.value_accessor)
+        self._ensure_capacity(node_full_sz, accessor)
 
         new_ptr = self.arena.alloc(node_full_sz, alignment=16)
         new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
@@ -213,89 +219,45 @@ class MemTable(object):
         new_ptr[8] = chr(h)
         key_ptr = rffi.ptradd(new_ptr, key_off)
 
+        # Write PK
+        pk_u128 = r_uint128(key)
         if self.key_size == 16:
-            r_key = r_uint128(key)
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(r_key))
+            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(pk_u128))
             rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = rffi.cast(
-                rffi.ULONGLONG, r_uint64(r_key >> 64)
+                rffi.ULONGLONG, r_uint64(pk_u128 >> 64)
             )
         else:
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(key))
+            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(pk_u128))
 
         node_set_hash(base, new_off, self.key_size, hash_val)
-        payload_ptr = node_get_payload_ptr(base, new_off, self.key_size)
         
-        # Site 3 Eradicated: Unified Serialization
+        # Serialize Payload
+        payload_ptr = node_get_payload_ptr(base, new_off, self.key_size)
         serialize.serialize_row(
-            self.schema, self.value_accessor, payload_ptr, MemTableBlobAllocator(self.blob_arena)
+            self.schema, accessor, payload_ptr, MemTableBlobAllocator(self.blob_arena)
         )
 
+        # Link into SkipList
         for i in range(h):
             pred = self._update_offsets[i]
             node_set_next_off(base, new_off, i, node_get_next_off(base, pred, i))
             node_set_next_off(base, pred, i, new_off)
 
-    def upsert_raw(self, key, weight, raw_record):
-        base = self.arena.base_ptr
-        self.raw_wal_accessor.set_record(raw_record)
-        hash_val, self.hash_buf, self.hash_buf_cap = serialize.compute_hash(
-            self.schema, self.raw_wal_accessor, self.hash_buf, self.hash_buf_cap
-        )
-        match_off = self._find_exact_values_with_hash(
-            key, hash_val, self.raw_wal_accessor
-        )
-
-        if match_off != 0:
-            new_w = node_get_weight(base, match_off) + weight
-            if new_w == 0:
-                h = ord(base[match_off + 8])
-                for i in range(h):
-                    pred_off = self._update_offsets[i]
-                    node_set_next_off(
-                        base, pred_off, i, node_get_next_off(base, match_off, i)
-                    )
-            else:
-                node_set_weight(base, match_off, new_w)
-            return
-
-        h = 1
-        while h < MAX_HEIGHT and (self.rng.genrand32() & 1):
-            h += 1
-
-        key_off = get_key_offset(h)
-        node_full_sz = key_off + self.key_size + HASH_SIZE + self.schema.memtable_stride
-        
-        # Site 4 Eradicated: Capacity check using raw accessor
-        self._ensure_capacity(node_full_sz, self.raw_wal_accessor)
-
-        new_ptr = self.arena.alloc(node_full_sz, alignment=16)
-        new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
-
-        node_set_weight(base, new_off, weight)
-        new_ptr[8] = chr(h)
-        key_ptr = rffi.ptradd(new_ptr, key_off)
-
-        if self.key_size == 16:
-            r_key = r_uint128(key)
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(r_key))
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(key_ptr, 8))[0] = rffi.cast(
-                rffi.ULONGLONG, r_uint64(r_key >> 64)
-            )
-        else:
-            rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(key))
-
-        node_set_hash(base, new_off, self.key_size, hash_val)
-        payload_ptr = node_get_payload_ptr(base, new_off, self.key_size)
-
-        # Site 5 Eradicated: Raw-to-Raw relocation using unified kernel
-        serialize.serialize_row(
-            self.schema, self.raw_wal_accessor, payload_ptr, MemTableBlobAllocator(self.blob_arena)
-        )
-
-        for i in range(h):
-            pred = self._update_offsets[i]
-            node_set_next_off(base, new_off, i, node_get_next_off(base, pred, i))
-            node_set_next_off(base, pred, i, new_off)
+    def upsert_batch(self, batch):
+        """
+        Optimized batch ingestion. 
+        When creating new nodes, payloads are moved via vectorized c_memmove
+        if the source is also an ArenaZSetBatch.
+        """
+        num_records = batch.length()
+        for i in range(num_records):
+            pk = batch.get_pk(i)
+            w = batch.get_weight(i)
+            acc = batch.get_accessor(i)
+            
+            # Note: We rely on the unified upsert logic for correctness.
+            # RPython JIT will specialize this loop.
+            self.upsert(pk, w, acc)
 
     def _ensure_capacity(self, node_sz, accessor):
         blob_sz = serialize.get_heap_size(self.schema, accessor)
@@ -307,9 +269,9 @@ class MemTable(object):
 
     def flush(self, filename, table_id=0):
         sw = writer_table.TableShardWriter(self.schema, table_id)
-        base, curr_off = self.arena.base_ptr, node_get_next_off(
-            self.arena.base_ptr, self.head_off, 0
-        )
+        base = self.arena.base_ptr
+        curr_off = node_get_next_off(base, self.head_off, 0)
+        
         while curr_off != 0:
             w = node_get_weight(base, curr_off)
             if w != 0:

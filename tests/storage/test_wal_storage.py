@@ -6,7 +6,8 @@ import shutil
 from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
 from gnitz.core import types, serialize
 from gnitz.core import errors
-from gnitz.storage import wal, wal_format
+from gnitz.core.batch import ZSetBatch, make_singleton_batch
+from gnitz.storage import wal
 from tests.row_helpers import create_test_row
 
 
@@ -36,9 +37,10 @@ class TestWALStorage(unittest.TestCase):
         writer = wal.WALWriter(self.wal_path, self.layout)
 
         row = create_test_row(self.layout, ["block1"])
-        recs = [wal_format.WALRecord(r_uint128(10), r_int64(1), row)]
+        # Use the modern singleton batch factory instead of manual WALRecord creation
+        batch = make_singleton_batch(self.layout, r_uint128(10), r_int64(1), row)
 
-        writer.append_block(1, 1, recs)  # LSN 1, TID 1
+        writer.append_batch(1, 1, batch)  # LSN 1, TID 1
         writer.close()
 
         reader = wal.WALReader(self.wal_path, self.layout)
@@ -71,9 +73,9 @@ class TestWALStorage(unittest.TestCase):
         writer = wal.WALWriter(self.wal_path, self.layout)
 
         row = create_test_row(self.layout, ["x"])
-        recs = [wal_format.WALRecord(r_uint128(1), r_int64(1), row)]
+        batch = make_singleton_batch(self.layout, r_uint128(1), r_int64(1), row)
 
-        writer.append_block(1, 1, recs)
+        writer.append_batch(1, 1, batch)
         self.assertGreater(os.path.getsize(self.wal_path), 0)
 
         writer.truncate_before_lsn(2)
@@ -87,18 +89,19 @@ class TestWALStorage(unittest.TestCase):
         The decoder must correctly skip the blob to find the second record.
         """
         writer = wal.WALWriter(self.wal_path, self.layout)
+        batch = ZSetBatch(self.layout)
 
-        # 1. Long string to force Blob allocation
+        # 1. Long string to force Blob allocation in the batch arena
         long_str = "A" * 50
         row1 = create_test_row(self.layout, [long_str])
-        rec1 = wal_format.WALRecord(r_uint128(1), r_int64(1), row1)
+        batch.append(r_uint128(1), r_int64(1), row1)
 
         # 2. Short string (Inline)
         row2 = create_test_row(self.layout, ["short"])
-        rec2 = wal_format.WALRecord(r_uint128(2), r_int64(1), row2)
+        batch.append(r_uint128(2), r_int64(1), row2)
 
-        # Write both in a single block
-        writer.append_block(100, 1, [rec1, rec2])
+        # Write the entire batch as a sequence of WAL blocks
+        writer.append_batch(100, 1, batch)
         writer.close()
 
         # Read back

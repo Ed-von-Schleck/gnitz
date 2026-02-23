@@ -1,71 +1,66 @@
 # gnitz/vm/batch.py
 
+from rpython.rlib import jit
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
+from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core.values import PayloadRow, make_payload_row, _analyze_schema
 from gnitz.core.row_logic import PayloadRowComparator
+from gnitz.core import serialize, strings as string_logic, comparator as core_comparator
+from gnitz.storage import buffer, comparator as storage_comparator
+
+# ---------------------------------------------------------------------------
+# Arena Constants
+# ---------------------------------------------------------------------------
+BATCH_REC_PK_OFFSET = 0
+BATCH_REC_WEIGHT_OFFSET = 16
+BATCH_REC_NULL_OFFSET = 24
+BATCH_REC_PAYLOAD_BASE = 32
+BATCH_HEADER_SIZE = 32
+
+
+class BatchBlobAllocator(string_logic.BlobAllocator):
+    """Strategy for writing variable-length data into the batch's blob arena."""
+
+    def __init__(self, arena):
+        self.arena = arena
+
+    def allocate(self, string_data):
+        length = len(string_data)
+        dest = self.arena.alloc(length, alignment=1)
+        for i in range(length):
+            dest[i] = string_data[i]
+        return r_uint64(
+            rffi.cast(lltype.Signed, dest) - rffi.cast(lltype.Signed, self.arena.base_ptr)
+        )
+
+    def allocate_from_ptr(self, src_ptr, length):
+        dest = self.arena.alloc(length, alignment=1)
+        buffer.c_memmove(
+            rffi.cast(rffi.VOIDP, dest),
+            rffi.cast(rffi.VOIDP, src_ptr),
+            rffi.cast(rffi.SIZE_T, length),
+        )
+        return r_uint64(
+            rffi.cast(lltype.Signed, dest) - rffi.cast(lltype.Signed, self.arena.base_ptr)
+        )
 
 
 # ---------------------------------------------------------------------------
-# Null-row singleton cache
-# ---------------------------------------------------------------------------
-_NULL_ROW_CACHE = {}   # Dict[int, PayloadRow]
-
-
-def get_null_row(schema):
-    """
-    Return a shared all-null ``PayloadRow`` for ``schema``.
-    Used as the identity element for DBSP operators.
-    """
-    sid = id(schema)
-    if sid not in _NULL_ROW_CACHE:
-        n, has_u128, has_string, _ = _analyze_schema(schema)
-        # Force has_nullable=True so _null_word is active.
-        row = PayloadRow(has_u128, has_string, True, n)
-        for i in range(n):
-            row.append_null(i)
-        _NULL_ROW_CACHE[sid] = row
-    return _NULL_ROW_CACHE[sid]
-
-
-# ---------------------------------------------------------------------------
-# Merge-sort helpers (O(n log n) sort of the index array)
+# Mergesort Support (Raw Indices)
 # ---------------------------------------------------------------------------
 
-def _build_index_array(n):
-    indices = newlist_hint(n)
-    for i in range(n):
-        indices.append(i)
-    return indices
-
-
-def _compare_entries(idx_a, idx_b, pks_lo, pks_hi, rows, comparator):
-    """
-    Lexicographical comparison of (PK, Row Payload).
-    Reconstructs u128 keys from 64-bit words to avoid alignment segfaults.
-    """
-    pk_a = (r_uint128(pks_hi[idx_a]) << 64) | r_uint128(pks_lo[idx_a])
-    pk_b = (r_uint128(pks_hi[idx_b]) << 64) | r_uint128(pks_lo[idx_b])
-    
-    if pk_a < pk_b:
-        return -1
-    if pk_a > pk_b:
-        return 1
-    # PKs match, compare row payloads
-    return comparator.compare(rows[idx_a], rows[idx_b])
-
-
-def _mergesort_indices(indices, pks_lo, pks_hi, rows, lo, hi, scratch, comparator):
+def _mergesort_indices(indices, batch, lo, hi, scratch):
     if hi - lo <= 1:
         return
     mid = (lo + hi) >> 1
-    _mergesort_indices(indices, pks_lo, pks_hi, rows, lo, mid, scratch, comparator)
-    _mergesort_indices(indices, pks_lo, pks_hi, rows, mid, hi, scratch, comparator)
-    _merge_indices(indices, pks_lo, pks_hi, rows, lo, mid, hi, scratch, comparator)
+    _mergesort_indices(indices, batch, lo, mid, scratch)
+    _mergesort_indices(indices, batch, mid, hi, scratch)
+    _merge_indices(indices, batch, lo, mid, hi, scratch)
 
 
-def _merge_indices(indices, pks_lo, pks_hi, rows, lo, mid, hi, scratch, comparator):
+def _merge_indices(indices, batch, lo, mid, hi, scratch):
     for k in range(lo, mid):
         scratch[k] = indices[k]
 
@@ -74,7 +69,7 @@ def _merge_indices(indices, pks_lo, pks_hi, rows, lo, mid, hi, scratch, comparat
     k = lo
 
     while i < mid and j < hi:
-        if _compare_entries(scratch[i], indices[j], pks_lo, pks_hi, rows, comparator) <= 0:
+        if batch.compare_indices(scratch[i], indices[j]) <= 0:
             indices[k] = scratch[i]
             i += 1
         else:
@@ -88,193 +83,296 @@ def _merge_indices(indices, pks_lo, pks_hi, rows, lo, mid, hi, scratch, comparat
         k += 1
 
 
-def _permute_arrays(indices, pks_lo, pks_hi, weights, rows, n):
-    new_pks_lo = newlist_hint(n)
-    new_pks_hi = newlist_hint(n)
-    new_weights = newlist_hint(n)
-    new_rows = newlist_hint(n)
-    for i in range(n):
-        idx = indices[i]
-        new_pks_lo.append(pks_lo[idx])
-        new_pks_hi.append(pks_hi[idx])
-        new_weights.append(weights[idx])
-        new_rows.append(rows[idx])
-    return new_pks_lo, new_pks_hi, new_weights, new_rows
-
-
 # ---------------------------------------------------------------------------
-# ZSetBatch
+# ArenaZSetBatch
 # ---------------------------------------------------------------------------
 
-class ZSetBatch(object):
+class ArenaZSetBatch(object):
     """
-    A DBSP Z-set batch: a multiset of (pk, weight, payload) triples.
-    
-    The engine maintains the "Ghost Property": records with net weight zero 
-    are annihilated and removed from the stream during consolidation.
-
-    PHYSICAL LAYOUT: Primary Keys are split into parallel List[r_uint64] 
-    (_pks_lo, _pks_hi) to bypass a known RPython GC alignment bug when 
-    storing r_uint128 in resizable lists.
+    A zero-allocation DBSP Z-Set batch stored in raw memory arenas.
     """
 
-    _immutable_fields_ = ["_schema", "_comparator"]
+    _immutable_fields_ = ["_schema", "record_stride"]
 
-    def __init__(self, schema):
+    def __init__(self, schema, initial_capacity=1024):
         self._schema = schema
-        # Parallel PK arrays used to avoid alignment segfaults
-        self._pks_lo = newlist_hint(0)
-        self._pks_hi = newlist_hint(0)
-        self._weights = newlist_hint(0)
-        self._rows = newlist_hint(0)
-        self._sorted = False
-        # Pre-allocated to avoid GC churn during sorting/consolidation
-        self._comparator = PayloadRowComparator(schema)
+        self.record_stride = BATCH_HEADER_SIZE + schema.memtable_stride
 
-    # ------------------------------------------------------------------
-    # Maintenance
-    # ------------------------------------------------------------------
+        self.primary_arena = buffer.Buffer(initial_capacity * self.record_stride)
+        self.blob_arena = buffer.Buffer(initial_capacity * 64)
+
+        self.allocator = BatchBlobAllocator(self.blob_arena)
+
+        # Pre-allocated accessors for internal use
+        self._raw_accessor = storage_comparator.RawWALAccessor(schema)
+        self._row_accessor = core_comparator.PayloadRowAccessor(schema)
+
+        # Pre-allocated for zero-allocation sorting
+        self._cmp_acc_a = storage_comparator.RawWALAccessor(schema)
+        self._cmp_acc_b = storage_comparator.RawWALAccessor(schema)
+
+        self._count = 0
+        self._sorted = False
+
+    def length(self):
+        return self._count
+
+    def is_empty(self):
+        return self._count == 0
 
     def clear(self):
-        """
-        Resets the batch to empty state for reuse.
-        """
-        del self._pks_lo[:]
-        del self._pks_hi[:]
-        del self._weights[:]
-        del self._rows[:]
+        self.primary_arena.offset = 0
+        self.blob_arena.offset = 0
+        self._count = 0
         self._sorted = False
+
+    def free(self):
+        self.primary_arena.free()
+        self.blob_arena.free()
+
+    def _get_rec_ptr(self, i):
+        return rffi.ptradd(self.primary_arena.base_ptr, i * self.record_stride)
+
+    def get_pk(self, i):
+        ptr = self._get_rec_ptr(i)
+        lo = rffi.cast(rffi.ULONGLONGP, ptr)[0]
+        hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
+        return (r_uint128(hi) << 64) | r_uint128(lo)
+
+    def get_weight(self, i):
+        ptr = self._get_rec_ptr(i)
+        return rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr, BATCH_REC_WEIGHT_OFFSET))[0]
+
+    def get_accessor(self, i):
+        ptr = self._get_rec_ptr(i)
+        null_word = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, BATCH_REC_NULL_OFFSET))[0]
+        payload_ptr = rffi.ptradd(ptr, BATCH_REC_PAYLOAD_BASE)
+        self._raw_accessor.set_pointers(payload_ptr, self.blob_arena.base_ptr, null_word)
+        return self._raw_accessor
+
+    def get_row(self, i):
+        ptr = self._get_rec_ptr(i)
+        null_word = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, BATCH_REC_NULL_OFFSET))[0]
+        payload_ptr = rffi.ptradd(ptr, BATCH_REC_PAYLOAD_BASE)
+        return serialize.deserialize_row(
+            self._schema, payload_ptr, self.blob_arena.base_ptr, null_word
+        )
+
+    # ------------------------------------------------------------------
+    # Ingestion API
+    # ------------------------------------------------------------------
 
     def append(self, pk, weight, row):
-        # PK Split: cast to r_uint64 and shift
-        self._pks_lo.append(r_uint64(pk))
-        self._pks_hi.append(r_uint64(pk >> 64))
-        self._weights.append(weight)
-        self._rows.append(row)
+        self._row_accessor.set_row(row)
+        self.append_from_accessor(pk, weight, self._row_accessor)
+
+    def append_from_accessor(self, pk, weight, accessor):
+        dest = self.primary_arena.alloc(self.record_stride, alignment=16)
+
+        pk_u128 = r_uint128(pk)
+        rffi.cast(rffi.ULONGLONGP, dest)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(pk_u128))
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = rffi.cast(
+            rffi.ULONGLONG, r_uint64(pk_u128 >> 64)
+        )
+
+        rffi.cast(rffi.LONGLONGP, rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight
+
+        null_word = r_uint64(0)
+        # Attempt to fast-path null word if the accessor exposes it directly
+        if isinstance(accessor, storage_comparator.RawWALAccessor):
+            null_word = accessor.null_word
+        elif isinstance(accessor, core_comparator.PayloadRowAccessor):
+            if accessor._row:
+                null_word = accessor._row._null_word
+        else:
+            # Slow path reconstruction (rarely hit in VM)
+            for i in range(len(self._schema.columns)):
+                if i == self._schema.pk_index:
+                    continue
+                if accessor.is_null(i):
+                    payload_idx = i if i < self._schema.pk_index else i - 1
+                    null_word |= r_uint64(1) << payload_idx
+
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, BATCH_REC_NULL_OFFSET))[0] = null_word
+
+        payload_dest = rffi.ptradd(dest, BATCH_REC_PAYLOAD_BASE)
+        serialize.serialize_row(self._schema, accessor, payload_dest, self.allocator)
+
+        self._count += 1
         self._sorted = False
 
     # ------------------------------------------------------------------
-    # Algebraic Operations
+    # Sort & Consolidate
     # ------------------------------------------------------------------
 
+    def compare_indices(self, idx_a, idx_b):
+        """Zero-allocation comparison of two records in the arena."""
+        ptr_a = self._get_rec_ptr(idx_a)
+        ptr_b = self._get_rec_ptr(idx_b)
+
+        # 1. 128-bit PK Comparison
+        ahi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_a, 8))[0]
+        bhi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_b, 8))[0]
+        if ahi < bhi: return -1
+        if ahi > bhi: return 1
+        
+        alo = rffi.cast(rffi.ULONGLONGP, ptr_a)[0]
+        blo = rffi.cast(rffi.ULONGLONGP, ptr_b)[0]
+        if alo < blo: return -1
+        if alo > blo: return 1
+
+        # 2. Payload Comparison
+        na = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_a, BATCH_REC_NULL_OFFSET))[0]
+        nb = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_b, BATCH_REC_NULL_OFFSET))[0]
+
+        self._cmp_acc_a.set_pointers(
+            rffi.ptradd(ptr_a, BATCH_REC_PAYLOAD_BASE), self.blob_arena.base_ptr, na
+        )
+        self._cmp_acc_b.set_pointers(
+            rffi.ptradd(ptr_b, BATCH_REC_PAYLOAD_BASE), self.blob_arena.base_ptr, nb
+        )
+
+        return core_comparator.compare_rows(self._schema, self._cmp_acc_a, self._cmp_acc_b)
+
     def sort(self):
-        """
-        Sorts the batch by (Primary Key, Row Payload).
-        Required before consolidation or sort-merge joins.
-        """
-        n = len(self._pks_lo)
-        if n <= 1:
+        if self._count <= 1 or self._sorted:
             self._sorted = True
             return
 
-        indices = _build_index_array(n)
-        scratch = _build_index_array(n)
+        indices = newlist_hint(self._count)
+        scratch = newlist_hint(self._count)
+        for i in range(self._count):
+            indices.append(i)
+            scratch.append(0)
 
-        _mergesort_indices(
-            indices, self._pks_lo, self._pks_hi, self._rows, 0, n, scratch, self._comparator
-        )
+        _mergesort_indices(indices, self, 0, self._count, scratch)
 
-        new_lo, new_hi, new_weights, new_rows = _permute_arrays(
-            indices, self._pks_lo, self._pks_hi, self._weights, self._rows, n
-        )
-        self._pks_lo = new_lo
-        self._pks_hi = new_hi
-        self._weights = new_weights
-        self._rows = new_rows
+        # Step 4.2.3: Contiguous Re-Packing
+        new_primary = buffer.Buffer(self.primary_arena.capacity)
+        new_blob = buffer.Buffer(self.blob_arena.capacity)
+        new_alloc = BatchBlobAllocator(new_blob)
+
+        for i in range(self._count):
+            old_idx = indices[i]
+            src_ptr = self._get_rec_ptr(old_idx)
+            
+            dest_ptr = new_primary.alloc(self.record_stride, alignment=16)
+            # Binary copy the entire record (PK, W, Nulls, Payload)
+            buffer.c_memmove(
+                rffi.cast(rffi.VOIDP, dest_ptr),
+                rffi.cast(rffi.VOIDP, src_ptr),
+                rffi.cast(rffi.SIZE_T, self.record_stride),
+            )
+            
+            # Swizzle string pointers in the new payload
+            null_word = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, BATCH_REC_NULL_OFFSET))[0]
+            payload_ptr = rffi.ptradd(dest_ptr, BATCH_REC_PAYLOAD_BASE)
+            self._raw_accessor.set_pointers(payload_ptr, self.blob_arena.base_ptr, null_word)
+            
+            # This re-writes the payload while relocating blobs to new_blob
+            serialize.serialize_row(self._schema, self._raw_accessor, payload_ptr, new_alloc)
+
+        self.primary_arena.free()
+        self.blob_arena.free()
+        self.primary_arena = new_primary
+        self.blob_arena = new_blob
+        self.allocator = BatchBlobAllocator(self.blob_arena)
         self._sorted = True
 
     def consolidate(self):
         """
-        Groups entries by (PK, Row Payload) and sums weights.
-        Annihilates "Ghost" records where the net weight is zero.
+        Groups identical records, sums weights, and removes zero-weight 'Ghosts'.
+        Requires that the batch is already sorted.
         """
-        n = len(self._pks_lo)
-        if n == 0:
+        if self._count == 0:
             return
-
         if not self._sorted:
             self.sort()
 
-        new_lo = newlist_hint(n)
-        new_hi = newlist_hint(n)
-        new_weights = newlist_hint(n)
-        new_rows = newlist_hint(n)
+        new_primary = buffer.Buffer(self.primary_arena.capacity)
+        new_blob = buffer.Buffer(self.blob_arena.capacity)
+        new_alloc = BatchBlobAllocator(new_blob)
+        new_count = 0
 
-        cur_pk_lo = self._pks_lo[0]
-        cur_pk_hi = self._pks_hi[0]
-        cur_weight = self._weights[0]
-        cur_row = self._rows[0]
+        # Primary accessors for traversal
+        acc_a = storage_comparator.RawWALAccessor(self._schema)
+        acc_b = storage_comparator.RawWALAccessor(self._schema)
 
-        for i in range(1, n):
-            lo = self._pks_lo[i]
-            hi = self._pks_hi[i]
-            row = self._rows[i]
+        i = 0
+        while i < self._count:
+            ptr_i = self._get_rec_ptr(i)
+            pk_i_lo = rffi.cast(rffi.ULONGLONGP, ptr_i)[0]
+            pk_i_hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_i, 8))[0]
+            weight_acc = rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr_i, BATCH_REC_WEIGHT_OFFSET))[0]
+            null_i = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_i, BATCH_REC_NULL_OFFSET))[0]
             
-            # Semantic equality check for both Key and Row Payload
-            if lo == cur_pk_lo and hi == cur_pk_hi and self._comparator.compare(row, cur_row) == 0:
-                cur_weight = cur_weight + self._weights[i]
-            else:
-                # Flush group if net weight is non-zero (Ghost Property)
-                if cur_weight != r_int64(0):
-                    new_lo.append(cur_pk_lo)
-                    new_hi.append(cur_pk_hi)
-                    new_weights.append(cur_weight)
-                    new_rows.append(cur_row)
-                cur_pk_lo = lo
-                cur_pk_hi = hi
-                cur_weight = self._weights[i]
-                cur_row = row
+            acc_a.set_pointers(rffi.ptradd(ptr_i, BATCH_REC_PAYLOAD_BASE), self.blob_arena.base_ptr, null_i)
 
-        if cur_weight != r_int64(0):
-            new_lo.append(cur_pk_lo)
-            new_hi.append(cur_pk_hi)
-            new_weights.append(cur_weight)
-            new_rows.append(cur_row)
+            j = i + 1
+            while j < self._count:
+                ptr_j = self._get_rec_ptr(j)
+                
+                # PK Equality check
+                if rffi.cast(rffi.ULONGLONGP, ptr_j)[0] != pk_i_lo or \
+                   rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_j, 8))[0] != pk_i_hi:
+                    break
+                
+                null_j = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_j, BATCH_REC_NULL_OFFSET))[0]
+                acc_b.set_pointers(rffi.ptradd(ptr_j, BATCH_REC_PAYLOAD_BASE), self.blob_arena.base_ptr, null_j)
+                
+                if core_comparator.compare_rows(self._schema, acc_a, acc_b) != 0:
+                    break
+                
+                weight_acc += rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr_j, BATCH_REC_WEIGHT_OFFSET))[0]
+                j += 1
 
-        self._pks_lo = new_lo
-        self._pks_hi = new_hi
-        self._weights = new_weights
-        self._rows = new_rows
+            # Ghost Property: Only emit if net weight is non-zero
+            if weight_acc != 0:
+                dest = new_primary.alloc(self.record_stride, alignment=16)
+                rffi.cast(rffi.ULONGLONGP, dest)[0] = pk_i_lo
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = pk_i_hi
+                rffi.cast(rffi.LONGLONGP, rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight_acc
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, BATCH_REC_NULL_OFFSET))[0] = null_i
+                
+                payload_dest = rffi.ptradd(dest, BATCH_REC_PAYLOAD_BASE)
+                # accessor 'acc_a' still points to record 'i'
+                serialize.serialize_row(self._schema, acc_a, payload_dest, new_alloc)
+                new_count += 1
 
-    # ------------------------------------------------------------------
-    # Read accessors
-    # ------------------------------------------------------------------
+            i = j
 
-    def length(self):
-        return len(self._pks_lo)
-
-    def get_pk(self, i):
-        # Reconstruct on-demand
-        return (r_uint128(self._pks_hi[i]) << 64) | r_uint128(self._pks_lo[i])
-
-    def get_weight(self, i):
-        return self._weights[i]
-
-    def get_row(self, i):
-        return self._rows[i]
-
-    def is_empty(self):
-        return len(self._pks_lo) == 0
-
-    def is_sorted(self):
-        return self._sorted
-
-    def extend(self, other):
-        n = other.length()
-        for i in range(n):
-            self.append(other.get_pk(i), other.get_weight(i), other.get_row(i))
+        self.primary_arena.free()
+        self.blob_arena.free()
+        self.primary_arena = new_primary
+        self.blob_arena = new_blob
+        self.allocator = BatchBlobAllocator(self.blob_arena)
+        self._count = new_count
 
 
 # ---------------------------------------------------------------------------
-# Construction helpers
+# Compatibility Aliases & Helpers
 # ---------------------------------------------------------------------------
+
+ZSetBatch = ArenaZSetBatch
 
 def make_empty_batch(schema):
     return ZSetBatch(schema)
-
 
 def make_singleton_batch(schema, pk, weight, row):
     batch = ZSetBatch(schema)
     batch.append(pk, weight, row)
     batch._sorted = True
     return batch
+
+def get_null_row(schema):
+    from gnitz.vm.batch import _NULL_ROW_CACHE
+    sid = id(schema)
+    if sid not in _NULL_ROW_CACHE:
+        n, has_u128, has_string, _ = _analyze_schema(schema)
+        row = PayloadRow(has_u128, has_string, True, n)
+        for i in range(n):
+            row.append_null(i)
+        _NULL_ROW_CACHE[sid] = row
+    return _NULL_ROW_CACHE[sid]
+
+_NULL_ROW_CACHE = {}
