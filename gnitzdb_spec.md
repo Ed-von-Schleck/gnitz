@@ -697,6 +697,8 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
 *   **List Tracing Bug:** Storing `r_uint128` primitives directly in resizable lists can lead to alignment issues or SIGSEGV in the translated C code.
 *   **Best Practice:** Split `u128` values into two `u64` lists (`keys_lo`, `keys_hi`) when storing them in resizable containers. Reconstruct the `u128` only at the point of computation/comparison.
 *   **Prebuilt Long Trap:** Do not use literals > `sys.maxint` (e.g., `0xFFFFFF...`). Python 2 creates a `long` object, which cannot be frozen into the binary. Use `r_uint(-1)` or bit-shifts.
+*   **FFI/Buffer Casting:** The `rffi.cast` utility cannot process `r_uint128` types directly. When writing 128-bit values to buffers or FFI pointers, you must explicitly truncate the value to `r_uint64` (e.g., `r_uint64(val)` or `r_uint64(val >> 64)`) before casting.
+
 
 ## 5. Memory & FFI
 *   **Allocations:** Visible to the annotator. Avoid object churn in loops.
@@ -725,6 +727,10 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
 7.  **u128-List Crashes:** Storing raw 128-bit integers in a resizable list instead of splitting into `lo/hi` pairs.
 8.  **Raw-Leak:** Malloc-ing a `dummy_ptr` in an accessor and never freeing it, corrupting the C heap.
 9.  **`r_int64`-Long Overflow:** Storing a value in `[2**63, 2**64)` via `r_int64(x)` and later reading it back with `rffi.cast(rffi.ULONGLONG, ...)` causes `OverflowError: integer is out of bounds` in test mode. Use `r_uint64(x)` for the read-back and `rffi.cast(rffi.LONGLONG, r_uint64(x))` for the write-in.
+10. **Slicing Proof Failure:** Using `s[:i]` or `s[i:]` where `i` is derived from arithmetic or `rfind`. The annotator fails with `AnnotatorError: slicing: not proven to have non-negative stop` because it cannot statically prove `i >= 0`.
+    *   **Fix:** Avoid `os.path` (which slices internally) in favor of `rpython.rlib.rposix` functions. For manual slicing, use an explicit `assert i >= 0` immediately before the slice to guide the annotator's type inference.
+11. **Signedness UnionError:** Occurs when a single function or method (e.g., `Buffer.put_i64`) is called in different places with both signed (`r_int64`) and unsigned (`r_uint64`) integers. RPython cannot unify these into a single type. **Fix:** Use `rffi.cast(rffi.LONGLONG, ...)` at the call site to ensure all inputs are consistently treated as signed machine words.
+12. **Unsigned Logical Comparison:** Comparing unsigned bit patterns (retrieved via `get_int()`) for columns that are logically signed (`TYPE_I64`, etc.). This causes negative numbers to sort as larger than positive numbers. **Fix:** Always cast to `r_int64` (using 
 
 # Appendix B: Coding practices
 

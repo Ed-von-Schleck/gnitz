@@ -20,7 +20,7 @@ Key invariants under test:
 
 import unittest
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
-
+from rpython.rtyper.lltypesystem import rffi
 from gnitz.core import types
 from gnitz.core.values import make_payload_row
 from gnitz.core.batch import ZSetBatch

@@ -126,15 +126,21 @@ def fsync_dir(filepath):
     Fsyncs the directory containing the given file to ensure metadata durability.
     """
     last_slash = filepath.rfind('/')
-    dirname = "." if last_slash <= 0 else filepath[:last_slash]
+    
+    if last_slash > 0:
+        assert last_slash > 0  # Guarantees to RPython the slice is non-negative
+        dirname = filepath[:last_slash]
+    else:
+        dirname = "."
+        
     try:
         fd = rposix.open(dirname, os.O_RDONLY, 0)
         try:
-            # Call our wrapper to handle casting
             fsync_c(fd)
         finally:
             rposix.close(fd)
     except OSError as e:
+        import errno
         if e.errno != errno.ENOENT:
             raise e
 

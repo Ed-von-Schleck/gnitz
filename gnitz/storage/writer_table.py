@@ -177,7 +177,7 @@ class TableShardWriter(object):
             buf.put_u64(accessor.get_int(col_idx))
             
         elif type_code == types.TYPE_I64.code:
-            buf.put_i64(accessor.get_int(col_idx))
+            buf.put_i64(rffi.cast(rffi.LONGLONG, accessor.get_int(col_idx)))
 
         elif type_code == types.TYPE_U32.code:
             val = accessor.get_int(col_idx) & 0xFFFFFFFF
@@ -208,7 +208,7 @@ class TableShardWriter(object):
 
         else:
             # Fallback for I64 compatible types
-            buf.put_i64(accessor.get_int(col_idx))
+            buf.put_i64(rffi.cast(rffi.LONGLONG, accessor.get_int(col_idx)))
 
     def _append_from_accessor(self, accessor):
         i = 0
@@ -229,7 +229,8 @@ class TableShardWriter(object):
         if self.schema.get_pk_column().field_type.size == 16:
             self.pk_buf.put_u128(key)
         else:
-            self.pk_buf.put_u64(rffi.cast(rffi.ULONGLONG, key))
+            # FIX: rffi.cast fails on r_uint128; use r_uint64 truncation
+            self.pk_buf.put_u64(r_uint64(key))
         self.w_buf.put_i64(weight)
 
         # Zero-allocation wrap of raw pointers
@@ -248,7 +249,8 @@ class TableShardWriter(object):
         if self.schema.get_pk_column().field_type.size == 16:
             self.pk_buf.put_u128(r_uint128(pk))
         else:
-            self.pk_buf.put_u64(rffi.cast(rffi.ULONGLONG, pk))
+            # FIX: Use r_uint64 truncation for PK values
+            self.pk_buf.put_u64(r_uint64(pk))
         self.w_buf.put_i64(weight)
 
         self.val_accessor.set_row(row)

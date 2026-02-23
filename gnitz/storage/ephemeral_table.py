@@ -1,6 +1,8 @@
 # gnitz/storage/ephemeral_table.py
 
 import os
+import errno
+from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rlib.objectmodel import newlist_hint
 
@@ -51,18 +53,19 @@ class EphemeralTable(AbstractTable):
         self.table_id = table_id
         self.is_closed = False
 
-        # Local lifecycle management
         self.ref_counter = refcount.RefCounter()
         self.row_cmp = row_logic.PayloadRowComparator(schema)
         self.temp_files = []
 
-        # Incremental state tracking
         self.current_lsn = r_uint64(1)
         self.index = index.ShardIndex(table_id, schema, self.ref_counter)
         self.memtable = memtable.MemTable(schema, memtable_arena_size)
 
-        if not os.path.exists(directory):
-            os.makedirs(directory)
+        try:
+            rposix.mkdir(directory, 0o755)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
 
     # -------------------------------------------------------------------------
     # AbstractTable Implementation

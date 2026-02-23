@@ -1,6 +1,8 @@
 # gnitz/storage/table.py
 
 import os
+import errno
+from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
@@ -71,8 +73,12 @@ class PersistentTable(AbstractTable):
         self.ref_counter = refcount.RefCounter()
         self.row_cmp = row_logic.PayloadRowComparator(schema)
 
-        if not os.path.exists(directory):
-            os.makedirs(directory)
+        try:
+            rposix.mkdir(directory, 0o755)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+
         manifest_path = os.path.join(directory, "MANIFEST")
         self.manifest_manager = manifest.ManifestManager(manifest_path)
 

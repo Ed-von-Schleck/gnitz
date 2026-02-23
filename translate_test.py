@@ -67,7 +67,7 @@ def test_multiset_and_string_logic(base_dir):
         pk_index=0,
     )
 
-    db = PersistentTable(db_path, "multiset", layout, cache_size=1024 * 1024)
+    db = PersistentTable(db_path, "multiset", layout, memtable_arena_size=1024 * 1024)
 
     try:
         pk = 12345
@@ -87,7 +87,7 @@ def test_multiset_and_string_logic(base_dir):
             return False
 
         # 3. Annihilate Payload A
-        db.remove(pk, mk_payload(layout, str_a, 10))
+        db.delete(pk, mk_payload(layout, str_a, 10))
 
         # 4. Flush and verify B survives while A is a 'Ghost'
         db.flush()
