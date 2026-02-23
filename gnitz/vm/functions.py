@@ -7,14 +7,135 @@ from gnitz.core import types
 
 
 class ScalarFunction(object):
+    """
+    Base class for User Defined Functions (UDFs) and Standard Operators.
+    
+    The VM JIT-compiles these classes directly. For high performance, 
+    specific queries are often compiled into specific subclasses of this 
+    (as seen in vm_comprehensive_test.py), but a standard library is 
+    provided below for general relational algebra.
+    """
     _immutable_fields_ = []
 
     def evaluate_predicate(self, row_accessor):
+        """
+        Evaluates a boolean condition (FILTER).
+        Returns True to keep the row, False to drop it.
+        """
         raise NotImplementedError
 
     def evaluate_map(self, row_accessor, output_row):
+        """
+        Transforms input row to output row (MAP/PROJECT).
+        Must call append_* methods on output_row in schema order.
+        """
         raise NotImplementedError
 
+
+# ---------------------------------------------------------------------------
+# Standard Predicates (Filters)
+# ---------------------------------------------------------------------------
+
+class TruePredicate(ScalarFunction):
+    def evaluate_predicate(self, row_accessor):
+        return True
+
+
+class FloatGt(ScalarFunction):
+    """Filter: col[idx] > constant"""
+    _immutable_fields_ = ['col_idx', 'val']
+
+    def __init__(self, col_idx, val):
+        self.col_idx = col_idx
+        self.val = val
+
+    def evaluate_predicate(self, row_accessor):
+        return row_accessor.get_float(self.col_idx) > self.val
+
+
+class IntEq(ScalarFunction):
+    """Filter: col[idx] == constant"""
+    _immutable_fields_ = ['col_idx', 'val']
+
+    def __init__(self, col_idx, val):
+        self.col_idx = col_idx
+        self.val = val
+
+    def evaluate_predicate(self, row_accessor):
+        # Use signed comparison for standard integers
+        return row_accessor.get_int_signed(self.col_idx) == self.val
+
+
+# ---------------------------------------------------------------------------
+# Standard Mappers (Projections)
+# ---------------------------------------------------------------------------
+
+class IdentityMapper(ScalarFunction):
+    """Selects all columns from input to output (SELECT *)."""
+    _immutable_fields_ = ['schema', 'col_types[*]']
+
+    def __init__(self, schema):
+        self.schema = schema
+        # Cache types to avoid schema lookup in the hot loop
+        self.col_types = [c.field_type.code for c in schema.columns 
+                          if c != schema.get_pk_column()]
+
+    def evaluate_map(self, row_accessor, output_row):
+        # Iterate over payload columns (indices 0..N-1 in accessor)
+        for i in range(len(self.col_types)):
+            t = self.col_types[i]
+            if t == types.TYPE_STRING.code:
+                output_row.append_string(row_accessor.get_str_struct(i)[4])
+            elif t == types.TYPE_F64.code or t == types.TYPE_F32.code:
+                output_row.append_float(row_accessor.get_float(i))
+            elif t == types.TYPE_U128.code:
+                val = row_accessor.get_u128(i)
+                # Split u128 back to u64 parts for appending
+                output_row.append_u128(r_uint64(val), r_uint64(val >> 64))
+            elif row_accessor.is_null(i):
+                output_row.append_null(i)
+            else:
+                # Default integer path
+                output_row.append_int(row_accessor.get_int_signed(i))
+
+
+class ProjectionMapper(ScalarFunction):
+    """
+    Selects specific columns (SELECT col_A, col_B).
+    Defined by a list of source indices and their types.
+    """
+    _immutable_fields_ = ['src_indices[*]', 'src_types[*]']
+
+    def __init__(self, src_indices, src_types):
+        assert len(src_indices) == len(src_types)
+        self.src_indices = src_indices
+        self.src_types = src_types
+
+    def evaluate_map(self, row_accessor, output_row):
+        for i in range(len(self.src_indices)):
+            src_idx = self.src_indices[i]
+            t = self.src_types[i]
+
+            if row_accessor.is_null(src_idx):
+                # Note: MapOutputAccessor.append_null ignores the arg index 
+                # and appends to the current position, which is correct here.
+                output_row.append_null(0)
+                continue
+
+            if t == types.TYPE_STRING.code:
+                output_row.append_string(row_accessor.get_str_struct(src_idx)[4])
+            elif t == types.TYPE_F64.code or t == types.TYPE_F32.code:
+                output_row.append_float(row_accessor.get_float(src_idx))
+            elif t == types.TYPE_U128.code:
+                val = row_accessor.get_u128(src_idx)
+                output_row.append_u128(r_uint64(val), r_uint64(val >> 64))
+            else:
+                output_row.append_int(row_accessor.get_int_signed(src_idx))
+
+
+# ---------------------------------------------------------------------------
+# Aggregates (Existing)
+# ---------------------------------------------------------------------------
 
 class AggregateFunction(object):
     _immutable_fields_ = []
@@ -233,41 +354,6 @@ class SumAggregateFunction(AggregateFunction):
 # ---------------------------------------------------------------------------
 # MIN / MAX
 # ---------------------------------------------------------------------------
-#
-# Both are non-linear operators.
-#
-# Design notes shared by MinAggregateFunction and MaxAggregateFunction:
-#
-# _has_value flag (bool, not in _immutable_fields_):
-#   Tracks whether step() has ever observed a non-null value.  Using this
-#   flag instead of type-specific sentinels:
-#     (a) avoids float infinity literals, which are not expressible as RPython
-#         prebuilt constants and would require runtime computation,
-#     (b) makes is_accumulator_zero() uniform across all supported types —
-#         it simply returns "not self._has_value", and
-#     (c) keeps the reset() initialiser uniform: _acc = r_int64(0),
-#         _has_value = False.
-#
-# _acc field (r_int64):
-#   Stores the current minimum or maximum as:
-#     - signed int bits (r_int64) for signed integer column types,
-#     - unsigned int bits reinterpreted as signed via rffi.cast(LONGLONG, ...)
-#       for unsigned integer column types (compared as r_uint64 in step()),
-#     - IEEE 754 double-precision bits via float2longlong for float types.
-#
-# weight parameter in step():
-#   Intentionally unused.  The minimum and maximum of a multiset do not
-#   depend on element multiplicities.  Negative weights (deletions) are
-#   handled by the non-linear full-rescan path in op_reduce; step() only
-#   sees values that are actually present in the input batch or trace.
-#
-# merge_accumulated():
-#   No-op.  Non-linear aggregates are never called via the linear
-#   optimisation path in op_reduce.
-#
-# Output column type:
-#   - F32 / F64 input  →  TYPE_F64  (widened to double, matching get_float())
-#   - all integer input →  TYPE_I64  (widened to signed 64-bit)
 
 
 class MinAggregateFunction(AggregateFunction):

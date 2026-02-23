@@ -37,7 +37,6 @@ def serialize_row(schema, accessor, dest_ptr, blob_allocator):
     Accepts generic RowAccessor and BlobAllocator.
     Handles both Python objects (PayloadRow) and Raw Pointers (WAL Recovery).
     """
-    payload_col = 0
     num_cols = len(schema.columns)
     for i in range(num_cols):
         if i == schema.pk_index:
@@ -51,14 +50,13 @@ def serialize_row(schema, accessor, dest_ptr, blob_allocator):
             sz = f_type.size
             for b in range(sz):
                 target[b] = "\x00"
-            payload_col += 1
             continue
 
         code = f_type.code
         if code == types.TYPE_STRING.code:
-            # Fetch string metadata.
-            # If py_string is None, we are in Raw-to-Raw mode (Recovery).
-            length, _, _, src_heap_ptr, py_string = accessor.get_str_struct(i)
+            # Capture all five return values in a single call to avoid redundant
+            # pointer arithmetic or SoA directory lookups.
+            length, prefix, src_struct_ptr, src_heap_ptr, py_string = accessor.get_str_struct(i)
             
             # 1. Write the fixed-width German String struct (Length + Prefix)
             rffi.cast(rffi.UINTP, target)[0] = rffi.cast(rffi.UINT, length)
@@ -71,9 +69,7 @@ def serialize_row(schema, accessor, dest_ptr, blob_allocator):
                 for j in range(limit):
                     prefix_target[j] = py_string[j]
             else:
-                # Raw Pointer source (re-read from source struct)
-                # We fetch the struct pointer from the accessor again
-                _, _, src_struct_ptr, _, _ = accessor.get_str_struct(i)
+                # Raw Pointer source (Relocate from src_struct_ptr)
                 src_prefix = rffi.ptradd(src_struct_ptr, 4)
                 for j in range(4):
                     prefix_target[j] = src_prefix[j]
@@ -88,7 +84,7 @@ def serialize_row(schema, accessor, dest_ptr, blob_allocator):
                         for j in range(4, length):
                             payload_target[j-4] = py_string[j]
                 else:
-                    _, _, src_struct_ptr, _, _ = accessor.get_str_struct(i)
+                    # Relocate inline suffix from src_struct_ptr
                     src_suffix = rffi.ptradd(src_struct_ptr, 8)
                     for j in range(length - 4):
                         payload_target[j] = src_suffix[j]
@@ -99,8 +95,8 @@ def serialize_row(schema, accessor, dest_ptr, blob_allocator):
                     # Allocate from Python String
                     new_offset = blob_allocator.allocate(py_string)
                 else:
-                    # Allocate from Raw Pointer (Zero-Copy)
-                    _, _, src_struct_ptr, src_heap_ptr, _ = accessor.get_str_struct(i)
+                    # Allocate from Raw Pointer (Zero-Copy relocate)
+                    # Use existing pointers to find the blob in the source heap
                     old_offset_ptr = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_struct_ptr, 8))
                     old_offset = old_offset_ptr[0]
                     
@@ -142,8 +138,6 @@ def serialize_row(schema, accessor, dest_ptr, blob_allocator):
             target[0] = chr(intmask(accessor.get_int(i)) & 0xFF)
         else:
             rffi.cast(rffi.LONGLONGP, target)[0] = rffi.cast(rffi.LONGLONG, accessor.get_int(i))
-
-        payload_col += 1
 
 @jit.unroll_safe
 def deserialize_row(schema, src_ptr, src_heap_ptr, null_word=r_uint64(0)):

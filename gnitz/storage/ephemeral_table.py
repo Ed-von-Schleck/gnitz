@@ -122,14 +122,19 @@ class EphemeralTable(AbstractTable):
         total_w = r_int64(0)
 
         # 1. Check SkipList MemTable
-        # Calculate hash for SkipList O(1) payload check directly from accessor
-        h_val, _, _ = serialize.compute_hash(
+        # Calculate hash for SkipList O(1) payload check directly from accessor.
+        # We must capture the scratch buffer (h_buf) to free it, preventing leaks.
+        h_val, h_buf, _ = serialize.compute_hash(
             self.schema, accessor, lltype.nullptr(rffi.CCHARP.TO), 0
         )
 
-        node_off = self.memtable._find_exact_values(r_key, h_val, accessor)
-        if node_off != 0:
-            total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
+        try:
+            node_off = self.memtable._find_exact_values(r_key, h_val, accessor)
+            if node_off != 0:
+                total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
+        finally:
+            if h_buf:
+                lltype.free(h_buf, flavor="raw")
 
         # 2. Check Columnar Shards via Index
         shard_matches = self.index.find_all_shards_and_indices(r_key)

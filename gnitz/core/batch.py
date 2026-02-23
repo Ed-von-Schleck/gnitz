@@ -19,6 +19,8 @@ BATCH_REC_NULL_OFFSET = 24
 BATCH_REC_PAYLOAD_BASE = 32
 BATCH_HEADER_SIZE = 32
 
+_NULL_ROW_CACHE = {}
+
 
 class BatchBlobAllocator(string_logic.BlobAllocator):
     """Strategy for writing variable-length data into the batch's blob arena."""
@@ -368,7 +370,6 @@ def make_singleton_batch(schema, pk, weight, row):
     return batch
 
 def get_null_row(schema):
-    from gnitz.vm.batch import _NULL_ROW_CACHE
     sid = id(schema)
     if sid not in _NULL_ROW_CACHE:
         n, has_u128, has_string, _ = _analyze_schema(schema)
@@ -377,5 +378,3 @@ def get_null_row(schema):
             row.append_null(i)
         _NULL_ROW_CACHE[sid] = row
     return _NULL_ROW_CACHE[sid]
-
-_NULL_ROW_CACHE = {}
