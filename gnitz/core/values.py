@@ -219,11 +219,10 @@ class PayloadRow(object):
 
     def get_int(self, payload_col_idx):
         """Returns the value as ``r_uint64`` (unsigned semantics)."""
-        return rffi.cast(rffi.ULONGLONG, self._lo[payload_col_idx])
+        return r_uint64(self._lo[payload_col_idx])
 
     def get_int_signed(self, payload_col_idx):
-        """Returns the value as ``r_int64`` (signed semantics)."""
-        return self._lo[payload_col_idx]
+        return rffi.cast(rffi.LONGLONG, r_uint64(self._lo[payload_col_idx]))
 
     def get_float(self, payload_col_idx):
         """

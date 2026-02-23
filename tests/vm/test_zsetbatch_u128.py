@@ -56,9 +56,8 @@ def _u128_row(schema, lo, hi):
 
 
 def _u64_row(schema, val):
-    # PK is at index 0, so payload index 0 is the U64 column.
     row = make_payload_row(schema)
-    row.append_int(r_int64(val))
+    row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(val)))
     return row
 
 

@@ -62,12 +62,12 @@ class PayloadRowAccessor(RowAccessor):
 
     def get_str_struct(self, col_idx):
         s = self._row.get_str(self._payload_idx(col_idx))
-        # Return dummy pointers for string struct to satisfy interface
         from rpython.rtyper.lltypesystem import rffi, lltype
 
+        prefix = rffi.cast(lltype.Signed, string_logic.compute_prefix(s))
         return (
             len(s),
-            0,
+            prefix,
             lltype.nullptr(rffi.CCHARP.TO),
             lltype.nullptr(rffi.CCHARP.TO),
             s,

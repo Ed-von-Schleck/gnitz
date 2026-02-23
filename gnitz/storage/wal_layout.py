@@ -1,6 +1,6 @@
 # gnitz/storage/wal_layout.py
 
-from rpython.rlib.rarithmetic import r_uint64, r_uint32, intmask, r_int64
+from rpython.rlib.rarithmetic import r_uint64, r_uint32, intmask, r_int64, r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import jit
 
@@ -81,7 +81,7 @@ def write_u128(buf, offset, val):
 
 def read_u128(buf, offset):
     p = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, offset))
-    return (r_uint64(p[1]) << 64) | r_uint64(p[0])
+    return (r_uint128(p[1]) << 64) | r_uint128(p[0])
 
 
 def write_u64(buf, offset, val):

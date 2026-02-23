@@ -43,6 +43,9 @@ class RawWALRecord(object):
         self.payload_ptr = payload_ptr
         self.heap_ptr = heap_ptr
 
+    def get_key(self):
+        return self.pk
+
 
 class WALRecord(object):
     def __init__(self, key, weight, component_data):
@@ -75,7 +78,7 @@ def compute_record_size(schema, row, accessor=None):
     """
     if accessor is None:
         accessor = PayloadRowAccessor(schema)
-    
+
     accessor.set_row(row)
     fixed_size = _REC_PAYLOAD_BASE + schema.memtable_stride
     heap_size = serialize.get_heap_size(schema, accessor)
@@ -93,10 +96,10 @@ def write_wal_record(schema, pk, weight, row, buf, base_offset, heap_base_offset
 
     allocator = WALBlobAllocator(buf, heap_base_offset)
     payload_dest = rffi.ptradd(buf, base_offset + _REC_PAYLOAD_BASE)
-    
+
     if accessor is None:
         accessor = PayloadRowAccessor(schema)
-    
+
     accessor.set_row(row)
     serialize.serialize_row(schema, accessor, payload_dest, allocator)
 
@@ -121,7 +124,7 @@ def decode_wal_block(buf, total_size, schema):
     # Use newlist_hint to prevent ListChangeUnallowed (mr-poisoning)
     records = newlist_hint(entry_count)
     current_offset = WAL_BLOCK_HEADER_SIZE
-    
+
     # Pre-allocate accessor to reuse in the loop
     accessor = RawWALAccessor(schema)
 
@@ -137,7 +140,7 @@ def decode_wal_block(buf, total_size, schema):
         heap_ptr = rffi.ptradd(buf, current_offset + f_sz)
 
         raw_rec = RawWALRecord(pk, weight, null_word, payload_ptr, heap_ptr)
-        
+
         # Use unified kernel to calculate heap size for offset advancement
         accessor.set_record(raw_rec)
         h_sz = serialize.get_heap_size(schema, accessor)
@@ -150,7 +153,7 @@ def decode_wal_block(buf, total_size, schema):
 
 def decode_wal_record_to_row(schema, buf, base, heap_base):
     """
-    Unifies test-compatibility paths by reconstructing a PayloadRow 
+    Unifies test-compatibility paths by reconstructing a PayloadRow
     from a WAL record using the extended deserialize_row kernel.
     """
     null_word = wal_layout.read_u64(buf, base + _REC_NULL_OFFSET)
@@ -162,10 +165,10 @@ def write_wal_block(fd, lsn, table_id, records, schema):
     entry_count = len(records)
     total_size = WAL_BLOCK_HEADER_SIZE
     record_sizes = []
-    
+
     # Pre-allocate accessor to reuse across size calculation and writing
     accessor = PayloadRowAccessor(schema)
-    
+
     for rec in records:
         f_sz, h_sz = compute_record_size(schema, rec.component_data, accessor=accessor)
         record_sizes.append((f_sz, h_sz))
@@ -192,7 +195,7 @@ def write_wal_block(fd, lsn, table_id, records, schema):
                 buf,
                 current_offset,
                 current_offset + f_sz,
-                accessor=accessor
+                accessor=accessor,
             )
             current_offset += f_sz + h_sz
 

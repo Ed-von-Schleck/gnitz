@@ -44,27 +44,30 @@ class BaseCursor(object):
         raise NotImplementedError
 
 
-
 class MemTableCursor(AbstractCursor):
     """
     SkipList cursor for the MemTable.
     Implements the AbstractCursor interface for the DBSP VM.
     """
+
     _immutable_fields_ = ["memtable", "schema", "key_size", "accessor"]
 
     def __init__(self, memtable):
         self.memtable = memtable
         self.schema = memtable.schema
         self.key_size = memtable.key_size
-        self.current_node_off = 0
-        # Pre-allocate accessor for zero-allocation iteration
+        # Position at the first real node (level-0 successor of the sentinel
+        # head). Offset 0 is the null sentinel; is_valid() returns False for it.
+        self.current_node_off = node_get_next_off(
+            memtable.arena.base_ptr, memtable.head_off, 0
+        )
+        # Pre-allocate accessor for zero-allocation iteration.
         self.accessor = comparator.PackedNodeAccessor(
             self.schema, memtable.blob_arena.base_ptr
         )
 
     def seek(self, target_key):
         """Finds the first SkipList node >= target_key."""
-        # Fixed: Using the public API restored in Step 6
         self.current_node_off = self.memtable.lower_bound_node(target_key)
 
     def advance(self):
@@ -76,6 +79,12 @@ class MemTableCursor(AbstractCursor):
     def is_valid(self):
         """Returns True if the cursor is pointing at a valid node."""
         return self.current_node_off != 0
+
+    def is_exhausted(self):
+        return not self.is_valid()
+
+    def peek_key(self):
+        return self.key()
 
     def key(self):
         """Returns the Primary Key of the current node or MAX_UINT128 if invalid."""
@@ -93,9 +102,12 @@ class MemTableCursor(AbstractCursor):
 
     def get_accessor(self):
         """Sets the state of the pre-allocated accessor and returns it."""
-        # We only call this when valid (enforced by VM/TournamentTree)
+        # Only call this when valid (enforced by VM/TournamentTree).
         self.accessor.set_row(self.memtable.arena.base_ptr, self.current_node_off)
         return self.accessor
+
+    def get_row_accessor(self):
+        return self.get_accessor()
 
     def close(self):
         """No-op for in-memory cursors."""
@@ -115,6 +127,9 @@ class ShardCursor(BaseCursor):
         self._skip_ghosts()
 
     def get_row_accessor(self):
+        return self.accessor
+
+    def get_accessor(self):
         return self.accessor
 
     def _skip_ghosts(self):
@@ -148,8 +163,7 @@ class ShardCursor(BaseCursor):
 
     def is_valid(self):
         return self.position < self.view.count
-    
-    # Optional: Keep the old one as an alias during transition
+
     def is_exhausted(self):
         return not self.is_valid()
 
@@ -188,7 +202,7 @@ class UnifiedCursor(AbstractCursor):
             if cursor.is_valid():
                 self._current_key = cursor.key()
                 self._current_weight = cursor.weight()
-                self._current_accessor = cursor.get_row_accessor()
+                self._current_accessor = cursor.get_accessor()
                 self._valid = True
             else:
                 self._valid = False
@@ -202,13 +216,13 @@ class UnifiedCursor(AbstractCursor):
             # 1. Find lexicographical minimum payload in group
             best_idx = indices[0]
             best_cursor = self.cursors[best_idx]
-            best_acc = best_cursor.get_row_accessor()
+            best_acc = best_cursor.get_accessor()
 
             idx = 1
             num_candidates = len(indices)
             while idx < num_candidates:
                 curr = self.cursors[indices[idx]]
-                curr_acc = curr.get_row_accessor()
+                curr_acc = curr.get_accessor()
                 if core_comparator.compare_rows(self.schema, curr_acc, best_acc) < 0:
                     best_cursor = curr
                     best_acc = curr_acc
@@ -222,7 +236,7 @@ class UnifiedCursor(AbstractCursor):
             while idx < num_candidates:
                 c_idx = indices[idx]
                 curr = self.cursors[c_idx]
-                curr_acc = curr.get_row_accessor()
+                curr_acc = curr.get_accessor()
                 if core_comparator.compare_rows(self.schema, curr_acc, best_acc) == 0:
                     net_weight += curr.weight()
                     to_advance.append(c_idx)
@@ -264,7 +278,7 @@ class UnifiedCursor(AbstractCursor):
         to_advance = newlist_hint(len(indices))
         for c_idx in indices:
             cursor = self.cursors[c_idx]
-            if core_comparator.compare_rows(self.schema, cursor.get_row_accessor(), target_accessor) == 0:
+            if core_comparator.compare_rows(self.schema, cursor.get_accessor(), target_accessor) == 0:
                 to_advance.append(c_idx)
 
         for c_idx in to_advance:

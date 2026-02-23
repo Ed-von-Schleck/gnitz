@@ -4,48 +4,59 @@ import unittest
 import os
 import shutil
 from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
-from gnitz.core import types
+from gnitz.core import types, serialize
 from gnitz.core import errors
 from gnitz.storage import wal, wal_format
 from tests.row_helpers import create_test_row
 
+
 class TestWALStorage(unittest.TestCase):
     def setUp(self):
         self.test_dir = "test_wal_storage_env"
-        if os.path.exists(self.test_dir): 
+        if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
         os.makedirs(self.test_dir)
-        
+
         # Schema: PK (U64) at index 0, String at index 1
-        self.layout = types.TableSchema([
-            types.ColumnDefinition(types.TYPE_U64),
-            types.ColumnDefinition(types.TYPE_STRING)
-        ], 0)
+        self.layout = types.TableSchema(
+            [
+                types.ColumnDefinition(types.TYPE_U64),
+                types.ColumnDefinition(types.TYPE_STRING),
+            ],
+            0,
+        )
         self.wal_path = os.path.join(self.test_dir, "test.wal")
 
     def tearDown(self):
-        if os.path.exists(self.test_dir): 
+        if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
     def test_wal_binary_roundtrip(self):
         """Verifies binary block serialization and checksum validation."""
         writer = wal.WALWriter(self.wal_path, self.layout)
-        
-        # Construct PayloadRow and WALRecord
+
         row = create_test_row(self.layout, ["block1"])
         recs = [wal_format.WALRecord(r_uint128(10), r_int64(1), row)]
-        
-        writer.append_block(1, 1, recs) # LSN 1, TID 1
+
+        writer.append_block(1, 1, recs)  # LSN 1, TID 1
         writer.close()
 
         reader = wal.WALReader(self.wal_path, self.layout)
         blocks = list(reader.iterate_blocks())
-        
+
         self.assertEqual(len(blocks), 1)
         self.assertEqual(blocks[0].lsn, 1)
-        # Verify PK and data via PayloadRow API
-        self.assertEqual(blocks[0].records[0].get_key(), r_uint128(10))
-        self.assertEqual(blocks[0].records[0].component_data.get_str(0), "block1")
+
+        rec = blocks[0].records[0]
+        self.assertEqual(rec.pk, r_uint128(10))
+
+        # WALReader returns RawWALRecord (zero-copy raw pointers).
+        # Deserialize to a PayloadRow to inspect payload values.
+        payload_row = serialize.deserialize_row(
+            self.layout, rec.payload_ptr, rec.heap_ptr, rec.null_word
+        )
+        self.assertEqual(payload_row.get_str(0), "block1")
+
         reader.close()
 
     def test_single_writer_lock(self):
@@ -58,14 +69,14 @@ class TestWALStorage(unittest.TestCase):
     def test_physical_truncation(self):
         """Verifies that truncation resets the file for checkpointing."""
         writer = wal.WALWriter(self.wal_path, self.layout)
-        
+
         row = create_test_row(self.layout, ["x"])
         recs = [wal_format.WALRecord(r_uint128(1), r_int64(1), row)]
-        
+
         writer.append_block(1, 1, recs)
         self.assertGreater(os.path.getsize(self.wal_path), 0)
-        
-        writer.truncate_before_lsn(2) 
+
+        writer.truncate_before_lsn(2)
         self.assertEqual(os.path.getsize(self.wal_path), 0)
         writer.close()
 
@@ -76,16 +87,16 @@ class TestWALStorage(unittest.TestCase):
         The decoder must correctly skip the blob to find the second record.
         """
         writer = wal.WALWriter(self.wal_path, self.layout)
-        
+
         # 1. Long string to force Blob allocation
-        long_str = "A" * 50 
+        long_str = "A" * 50
         row1 = create_test_row(self.layout, [long_str])
         rec1 = wal_format.WALRecord(r_uint128(1), r_int64(1), row1)
-        
+
         # 2. Short string (Inline)
         row2 = create_test_row(self.layout, ["short"])
         rec2 = wal_format.WALRecord(r_uint128(2), r_int64(1), row2)
-        
+
         # Write both in a single block
         writer.append_block(100, 1, [rec1, rec2])
         writer.close()
@@ -94,15 +105,23 @@ class TestWALStorage(unittest.TestCase):
         reader = wal.WALReader(self.wal_path, self.layout)
         blocks = list(reader.iterate_blocks())
         reader.close()
-        
+
         self.assertEqual(len(blocks), 1)
         decoded_recs = blocks[0].records
         self.assertEqual(len(decoded_recs), 2)
-        
-        # Verify Record 1
-        self.assertEqual(decoded_recs[0].get_key(), r_uint128(1))
-        self.assertEqual(decoded_recs[0].component_data.get_str(0), long_str)
-        
-        # Verify Record 2 (Validates that the decoder successfully skipped the blob of Rec 1)
-        self.assertEqual(decoded_recs[1].get_key(), r_uint128(2))
-        self.assertEqual(decoded_recs[1].component_data.get_str(0), "short")
+
+        # Verify Record 1 — key and deserialized string payload
+        r0 = decoded_recs[0]
+        self.assertEqual(r0.pk, r_uint128(1))
+        payload_row0 = serialize.deserialize_row(
+            self.layout, r0.payload_ptr, r0.heap_ptr, r0.null_word
+        )
+        self.assertEqual(payload_row0.get_str(0), long_str)
+
+        # Verify Record 2 — validates that the decoder correctly skipped the blob of Rec 1
+        r1 = decoded_recs[1]
+        self.assertEqual(r1.pk, r_uint128(2))
+        payload_row1 = serialize.deserialize_row(
+            self.layout, r1.payload_ptr, r1.heap_ptr, r1.null_word
+        )
+        self.assertEqual(payload_row1.get_str(0), "short")

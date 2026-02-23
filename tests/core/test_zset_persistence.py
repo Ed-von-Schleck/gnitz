@@ -6,7 +6,7 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.core import types, errors
 from gnitz.storage.table import PersistentTable
-from gnitz.storage import shard_table, buffer
+from gnitz.storage import shard_table, buffer, index as index_mod
 from tests.row_helpers import create_test_row
 
 class TestZSetPersistence(unittest.TestCase):
@@ -24,8 +24,6 @@ class TestZSetPersistence(unittest.TestCase):
             types.ColumnDefinition(types.TYPE_F64)
         ], 0)
         
-        # Note: PersistentTable must be updated to accept these arguments 
-        # and to include the ref_counter attribute.
         self.db = PersistentTable(
             self.test_dir, 
             "test", 
@@ -41,17 +39,14 @@ class TestZSetPersistence(unittest.TestCase):
             shutil.rmtree(self.test_dir)
 
     def _p(self, i8, s, f64):
-        """Helper to create a PayloadRow matching the test schema."""
         return create_test_row(self.layout, [i8, s, f64])
 
     def test_u128_key_alignment_and_persistence(self):
         """Verify 128-bit key alignment and retrieval through Shards."""
-        # Key that exercises high 64 bits
         key = (r_uint128(0xAAAABBBBCCCCDDDD) << 64) | r_uint128(0x1111222233334444)
         payload = self._p(7, "u128_test", 3.14)
         self.db.insert(key, payload)
         self.db.flush()
-        # Requires get_weight to be implemented in PersistentTable
         self.assertEqual(self.db.get_weight(key, payload), 1)
 
     def test_empty_flush_logic(self):
@@ -62,7 +57,6 @@ class TestZSetPersistence(unittest.TestCase):
         self.db.delete(key, p)
         shard_path = self.db.flush()
         
-        # A shard with count=0 should be created
         if os.path.exists(shard_path):
             view = shard_table.TableShardView(shard_path, self.layout, validate_checksums=False)
             self.assertEqual(view.count, 0)
@@ -75,7 +69,6 @@ class TestZSetPersistence(unittest.TestCase):
         shard_path = self.db.flush()
         self.db.close()
         
-        # Locate the Weight Region (index 1) to corrupt it
         view = shard_table.TableShardView(shard_path, self.layout, validate_checksums=False)
         w_offset = view.get_region_offset(1)
         view.close()
@@ -84,7 +77,6 @@ class TestZSetPersistence(unittest.TestCase):
             f.seek(w_offset)
             f.write(b'\xFF\xFF\xFF\xFF')
             
-        # Should raise CorruptShardError if validate_checksums is True
         with self.assertRaises(errors.CorruptShardError):
             self.db = PersistentTable(
                 self.test_dir, 
@@ -105,7 +97,6 @@ class TestZSetPersistence(unittest.TestCase):
             buf = buffer.MappedBuffer(raw, size)
             buf.read_u8(9)
             with self.assertRaises(errors.BoundsError):
-                # Reading 8 bytes at offset 5 (reaches index 12) exceeds size 10
                 buf.read_i64(5) 
         finally:
             lltype.free(raw, flavor='raw')
@@ -126,10 +117,8 @@ class TestZSetPersistence(unittest.TestCase):
         shard_path = self.db.flush()
         view = shard_table.TableShardView(shard_path, self.layout, validate_checksums=False)
         try:
-            # Check for deduplication
             self.assertLess(view.blob_buf.size, len(long_s) * 2)
             
-            # Check for ghost reclamation
             from rpython.rtyper.lltypesystem import rffi
             found_ghost = False
             for i in range(view.blob_buf.size - len(ghost_s) + 1):
@@ -153,30 +142,65 @@ class TestZSetPersistence(unittest.TestCase):
         self.assertEqual(self.db.get_weight(key, p), 4)
 
     def test_swmr_refcounting_and_cleanup(self):
-        """Verify that active readers protect shards from physical deletion."""
+        """
+        Verify that an active external reader protects a shard from physical
+        deletion until the reader releases its reference.
+
+        The scenario modelled here mirrors the production SWMR lifecycle:
+
+        1. A shard is produced and enters the index (index holds ref_count=1).
+        2. An external process (e.g. the Sync Server) acquires a shared lock
+           on the shard (ref_count -> 2).
+        3. The compactor supersedes the shard via replace_handles, which
+           causes the index to release its own reference (ref_count -> 1).
+        4. The shard is marked for deletion; try_cleanup cannot delete it
+           because the external reader still holds ref_count=1.
+        5. The external reader finishes and releases (ref_count -> 0).
+        6. try_cleanup can now acquire an exclusive flock and unlink the file.
+
+        The original test omitted step 3, so the index's reference was never
+        released, leaving ref_count permanently at 1 after step 5.
+        """
         p = self._p(1, "data", 1.0)
         key = r_uint128(1)
         self.db.insert(key, p)
         shard1 = self.db.flush()
-        
-        # Acquire reference
+
+        # Step 2: external reader acquires the shard.
         self.db.ref_counter.acquire(shard1)
-        
+
+        # Step 3: simulate compaction — replace_handles releases the index's
+        # reference to shard1 while keeping the external reader's reference.
         self.db.insert(r_uint128(2), p)
-        self.db.flush()
-        
-        # Mark for deletion
+        shard2 = self.db.flush()
+        # Build a ShardHandle for the new shard so replace_handles has
+        # something to install.  We source the LSN bounds from the handle
+        # that flush() already added to the index.
+        last_handle = self.db.index.handles[-1]
+        replacement = index_mod.ShardHandle(
+            shard2,
+            self.layout,
+            min_lsn=last_handle.min_lsn,
+            max_lsn=last_handle.lsn,
+        )
+        self.db.index.replace_handles([shard1], replacement)
+
+        # Step 4: mark for deletion; external reader still holds ref_count=1.
         self.db.ref_counter.mark_for_deletion(shard1)
         self.db.ref_counter.try_cleanup()
-        
-        # Shard must remain due to active reference
-        self.assertTrue(os.path.exists(shard1))
-        
+        self.assertTrue(
+            os.path.exists(shard1),
+            "Shard must survive while external reader holds a reference",
+        )
+
+        # Steps 5 & 6: external reader releases; file must now be deleted.
         self.db.ref_counter.release(shard1)
         self.db.ref_counter.try_cleanup()
-        
-        # Shard should be physically deleted now
-        self.assertFalse(os.path.exists(shard1))
+        self.assertFalse(
+            os.path.exists(shard1),
+            "Shard must be physically deleted after all references are released",
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

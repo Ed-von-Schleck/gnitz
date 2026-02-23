@@ -724,6 +724,7 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
 6.  **mr-Poisoning:** Using `[]` for a payload list, causing all future `.append` calls to crash.
 7.  **u128-List Crashes:** Storing raw 128-bit integers in a resizable list instead of splitting into `lo/hi` pairs.
 8.  **Raw-Leak:** Malloc-ing a `dummy_ptr` in an accessor and never freeing it, corrupting the C heap.
+9.  **`r_int64`-Long Overflow:** Storing a value in `[2**63, 2**64)` via `r_int64(x)` and later reading it back with `rffi.cast(rffi.ULONGLONG, ...)` causes `OverflowError: integer is out of bounds` in test mode. Use `r_uint64(x)` for the read-back and `rffi.cast(rffi.LONGLONG, r_uint64(x))` for the write-in.
 
 # Appendix B: Coding practices
 
