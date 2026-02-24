@@ -687,7 +687,8 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
 *   **Best Practice:** Split `u128` values into two `u64` lists (`keys_lo`, `keys_hi`) when storing them in resizable containers. Reconstruct the `u128` only at the point of computation/comparison.
 *   **Prebuilt Long Trap:** Do not use literals > `sys.maxint` (e.g., `0xFFFFFF...`). Python 2 creates a `long` object, which cannot be frozen into the binary. Use `r_uint(-1)` or bit-shifts.
 *   **FFI/Buffer Casting:** The `rffi.cast` utility cannot process `r_uint128` types directly. When writing 128-bit values to buffers or FFI pointers, you must explicitly truncate the value to `r_uint64` (e.g., `r_uint64(val)` or `r_uint64(val >> 64)`) before casting.
-
+*   **128-bit Struct Alignment Bug:** Storing `r_uint128` primitives directly in resizable lists **or as persistent object attributes** (e.g., `self._current_key = r_uint128(0)`) can lead to strict-aliasing violations, alignment issues, or `SIGSEGV` in the translated C code. The RPython C backend does not consistently guarantee 16-byte alignment for these fields inside generated C structs.
+*   **Best Practice:** Always split `u128` values into two `u64` components (`lo` and `hi`) when storing them as object state or inside containers. Reconstruct the `u128` dynamically (e.g., `(r_uint128(hi) << 64) | r_uint128(lo)`) only at the exact point of computation, return, or comparison.
 
 ## 5. Memory & FFI
 *   **Allocations:** Visible to the annotator. Avoid object churn in loops.
@@ -713,7 +714,7 @@ The FLSM will be extended with **Tiered Compaction Heuristics** optimized for di
 4.  **Nullability Mismatch:** Passing a potentially `None` string (from `os`) to a function expecting strict `str` (like `rffi`).
 5.  **List Mutation:** Calling `.append()` on a list previously hinted as immutable.
 6.  **mr-Poisoning:** Using `[]` for a payload list, causing all future `.append` calls to crash.
-7.  **u128-List Crashes:** Storing raw 128-bit integers in a resizable list instead of splitting into `lo/hi` pairs.
+7.  **u128-Alignment Crashes:** Storing raw 128-bit integers directly as class attributes or in resizable lists instead of splitting them into `lo/hi` `r_uint64` pairs, resulting in C-level struct alignment segfaults during property assignment or read-back.
 8.  **Raw-Leak:** Malloc-ing a `dummy_ptr` in an accessor and never freeing it, corrupting the C heap.
 9.  **`r_int64`-Long Overflow:** Storing a value in `[2**63, 2**64)` via `r_int64(x)` and later reading it back with `rffi.cast(rffi.ULONGLONG, ...)` causes `OverflowError: integer is out of bounds` in test mode. Use `r_uint64(x)` for the read-back and `rffi.cast(rffi.LONGLONG, r_uint64(x))` for the write-in.
 10. **Slicing Proof Failure:** Using `s[:i]` or `s[i:]` where `i` is derived from arithmetic or `rfind`. The annotator fails with `AnnotatorError: slicing: not proven to have non-negative stop` because it cannot statically prove `i >= 0`.

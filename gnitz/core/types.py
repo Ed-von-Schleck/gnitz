@@ -1,6 +1,6 @@
 # gnitz/core/types.py
 
-from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import errors
 
 
@@ -52,19 +52,25 @@ def _to_col_def(c):
 class TableSchema(object):
     """
     Defines the physical and logical layout of a Z-Set.
-    
+
     Attributes:
         columns: List of ColumnDefinition.
         pk_index: The index of the column that serves as the Primary Key.
                   GnitzDB requires PKs to be TYPE_U64 or TYPE_U128.
         column_offsets: Physical byte offsets for columns in a packed row (AoS).
-                        The PK column always has an offset of -1 as it is 
+                        The PK column always has an offset of -1 as it is
                         stored separately from the payload.
     """
+
+    # We remove the [*] hint from list fields. While this is a minor JIT
+    # optimization loss, it is required to allow schemas to be constructed
+    # from both resizable lists (like joined schemas) and fixed-size literals
+    # (like test schemas) without triggering RPython's ListChangeUnallowed
+    # (mr-poisoning) errors during attribute assignment.
     _immutable_fields_ = [
-        "columns[*]",
+        "columns",
         "pk_index",
-        "column_offsets[*]",
+        "column_offsets",
         "memtable_stride",
     ]
 
@@ -72,8 +78,13 @@ class TableSchema(object):
         if len(columns) > 64:
             raise errors.LayoutError("Maximum 64 columns supported")
 
-        # Use list comprehension to satisfy RPython list constraints
-        self.columns = [_to_col_def(c) for c in columns]
+        # Create a resizable list for self.columns
+        num_cols = len(columns)
+        cols_list = newlist_hint(num_cols)
+        for c in columns:
+            cols_list.append(_to_col_def(c))
+        self.columns = cols_list
+
         self.pk_index = pk_index
 
         # Validate PK type
@@ -81,8 +92,10 @@ class TableSchema(object):
         if pk_type.code != TYPE_U64.code and pk_type.code != TYPE_U128.code:
             raise errors.LayoutError("Primary Key must be TYPE_U64 or TYPE_U128")
 
-        num_cols = len(self.columns)
-        temp_offsets = [0] * num_cols
+        # Create a resizable list for offsets
+        temp_offsets = newlist_hint(num_cols)
+        for _ in range(num_cols):
+            temp_offsets.append(0)
 
         current_offset = 0
         max_alignment = 1
@@ -118,6 +131,7 @@ class TableSchema(object):
 # Schema Algebra (Used by QueryBuilder and VM)
 # -----------------------------------------------------------------------------
 
+
 def merge_schemas_for_join(schema_left, schema_right):
     """
     Constructs the resulting schema for a Join operation.
@@ -133,18 +147,21 @@ def merge_schemas_for_join(schema_left, schema_right):
             % (pk_left.field_type.code, pk_right.field_type.code)
         )
 
-    # Use list comprehension to build the column list
-    new_cols = []
+    # Use hint to pre-allocate result column list
+    num_l = len(schema_left.columns)
+    num_r = len(schema_right.columns)
+    new_cols = newlist_hint(num_l + num_r - 1)
+
     # 1. Add PK (index 0)
     new_cols.append(pk_left)
 
     # 2. Add Left Payloads
-    for i in range(len(schema_left.columns)):
+    for i in range(num_l):
         if i != schema_left.pk_index:
             new_cols.append(schema_left.columns[i])
 
     # 3. Add Right Payloads (skipping right PK)
-    for i in range(len(schema_right.columns)):
+    for i in range(num_r):
         if i != schema_right.pk_index:
             new_cols.append(schema_right.columns[i])
 
@@ -154,14 +171,12 @@ def merge_schemas_for_join(schema_left, schema_right):
 def _build_reduce_output_schema(input_schema, group_by_cols, agg_func):
     """
     Constructs the output schema for a REDUCE operator.
-    
+
     Rules:
     - If grouping by a single U64 or U128 column, that column is the PK.
     - Otherwise, a synthetic U128 PK is created (to hold a hash of group columns).
     - All group columns and the aggregate result are stored in the payload.
     """
-    new_cols = []
-    
     # Check if we can use a "Natural" PK (single int col)
     use_natural_pk = False
     if len(group_by_cols) == 1:
@@ -173,6 +188,7 @@ def _build_reduce_output_schema(input_schema, group_by_cols, agg_func):
     if use_natural_pk:
         # Col 0: The Group Column (PK)
         # Col 1: The Aggregate result
+        new_cols = newlist_hint(2)
         new_cols.append(input_schema.columns[group_by_cols[0]])
         new_cols.append(ColumnDefinition(agg_func.output_column_type(), name="agg"))
         return TableSchema(new_cols, pk_index=0)
@@ -181,6 +197,7 @@ def _build_reduce_output_schema(input_schema, group_by_cols, agg_func):
         # Col 0: Synthetic U128 Hash (PK)
         # Col 1..N: Group Columns (Payload)
         # Col N+1: Aggregate Result (Payload)
+        new_cols = newlist_hint(len(group_by_cols) + 2)
         new_cols.append(ColumnDefinition(TYPE_U128, name="_group_hash"))
         for idx in group_by_cols:
             new_cols.append(input_schema.columns[idx])

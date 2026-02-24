@@ -102,11 +102,6 @@ class ValueAccessor(PayloadRowAccessor):
 
 @jit.unroll_safe
 def compare_rows(schema, acc1, acc2):
-    """
-    Generic row comparator using RowAccessors.
-    Handles all Gnitz types, including German String content checks and
-    correct signed-integer comparison.
-    """
     num_cols = len(schema.columns)
 
     for i in range(num_cols):
@@ -147,23 +142,9 @@ def compare_rows(schema, acc1, acc2):
                 return -1
             if v1 > v2:
                 return 1
-        elif (
-            col_type == types.TYPE_I64
-            or col_type == types.TYPE_I32
-            or col_type == types.TYPE_I16
-            or col_type == types.TYPE_I8
-        ):
-            # Reinterpret unsigned bit pattern as signed for correct comparison
+        else:
             v1 = acc1.get_int_signed(i)
             v2 = acc2.get_int_signed(i)
-            if v1 < v2:
-                return -1
-            if v1 > v2:
-                return 1
-        else:
-            # Unsigned integer comparison
-            v1 = acc1.get_int(i)
-            v2 = acc2.get_int(i)
             if v1 < v2:
                 return -1
             if v1 > v2:

@@ -1,7 +1,7 @@
 # gnitz/storage/cursor.py
 
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128, r_uint64
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import types
@@ -207,7 +207,9 @@ class UnifiedCursor(AbstractCursor):
         else:
             self.tree = None
 
-        self._current_key = r_uint128(0)
+        # Workaround for RPython r_uint128 struct alignment bugs
+        self._current_key_lo = r_uint64(0)
+        self._current_key_hi = r_uint64(0)
         self._current_weight = r_int64(0)
         self._current_accessor = None
         self._valid = False
@@ -217,7 +219,9 @@ class UnifiedCursor(AbstractCursor):
         if self.is_single_source:
             cursor = self.cursors[0]
             if cursor.is_valid():
-                self._current_key = cursor.key()
+                k = cursor.key()
+                self._current_key_lo = r_uint64(k)
+                self._current_key_hi = r_uint64(k >> 64)
                 self._current_weight = cursor.weight()
                 self._current_accessor = cursor.get_accessor()
                 self._valid = True
@@ -237,7 +241,8 @@ class UnifiedCursor(AbstractCursor):
             idx = 1
             num_candidates = len(indices)
             while idx < num_candidates:
-                curr = self.cursors[indices[idx]]
+                c_idx = indices[idx]
+                curr = self.cursors[c_idx]
                 curr_acc = curr.get_accessor()
                 if core_comparator.compare_rows(self.schema, curr_acc, best_acc) < 0:
                     best_cursor = curr
@@ -259,13 +264,13 @@ class UnifiedCursor(AbstractCursor):
                 idx += 1
 
             if net_weight != 0:
-                self._current_key = min_key
+                self._current_key_lo = r_uint64(min_key)
+                self._current_key_hi = r_uint64(min_key >> 64)
                 self._current_weight = net_weight
                 self._current_accessor = best_acc
                 self._valid = True
                 return
             else:
-                # Ghost detected: advance past this specific payload group and continue searching
                 for c_idx in to_advance:
                     self.tree.advance_cursor_by_index(c_idx)
 
@@ -309,7 +314,7 @@ class UnifiedCursor(AbstractCursor):
         self._find_next_non_ghost()
 
     def key(self):
-        return self._current_key
+        return (r_uint128(self._current_key_hi) << 64) | r_uint128(self._current_key_lo)
 
     def weight(self):
         return self._current_weight

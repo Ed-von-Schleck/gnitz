@@ -6,10 +6,16 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rlib.longlong2float import float2longlong
+from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import errors
 from gnitz.storage import layout, mmap_posix, buffer
 from gnitz.storage.buffer import align_64
-from gnitz.core import types, strings as string_logic, values as db_values, xxh as checksum
+from gnitz.core import (
+    types,
+    strings as string_logic,
+    values as db_values,
+    xxh as checksum,
+)
 from gnitz.storage import comparator as storage_comparator
 from gnitz.core import comparator as core_comparator
 
@@ -56,13 +62,18 @@ class TableShardWriter(object):
         self.w_buf = buffer.Buffer(8 * 1024, growable=True)
 
         num_cols = len(schema.columns)
-        self.col_bufs = [None] * num_cols
+        # Initialize col_bufs list using newlist_hint to avoid mr-poisoning
+        self.col_bufs = newlist_hint(num_cols)
         i = 0
         while i < num_cols:
             if i != schema.pk_index:
-                self.col_bufs[i] = buffer.Buffer(
-                    schema.columns[i].field_type.size * 1024, growable=True
+                self.col_bufs.append(
+                    buffer.Buffer(
+                        schema.columns[i].field_type.size * 1024, growable=True
+                    )
                 )
+            else:
+                self.col_bufs.append(None)
             i += 1
 
         self.b_buf = buffer.Buffer(4096, growable=True)
@@ -115,9 +126,13 @@ class TableShardWriter(object):
             return
 
         if type_code == types.TYPE_STRING.code:
-            length, prefix, src_struct_ptr, src_heap_ptr, py_string = accessor.get_str_struct(
-                col_idx
-            )
+            (
+                length,
+                prefix,
+                src_struct_ptr,
+                src_heap_ptr,
+                py_string,
+            ) = accessor.get_str_struct(col_idx)
             # Allocate the 16-byte slot directly inside the column buffer so
             # relocate_string can write into it without an intermediate scratch
             # copy.  8-byte alignment satisfies the u64 offset/payload field
@@ -134,7 +149,9 @@ class TableShardWriter(object):
             )
 
         elif type_code == types.TYPE_F64.code:
-            buf.put_i64(rffi.cast(rffi.LONGLONG, float2longlong(accessor.get_float(col_idx))))
+            buf.put_i64(
+                rffi.cast(rffi.LONGLONG, float2longlong(accessor.get_float(col_idx)))
+            )
 
         elif type_code == types.TYPE_F32.code:
             val = accessor.get_float(col_idx)
@@ -247,7 +264,12 @@ class TableShardWriter(object):
             dummy_region = (lltype.nullptr(rffi.CCHARP.TO), 0, 0)
 
             num_cols_with_pk_w = 2 + (len(self.col_bufs) - 1)
-            region_list = [dummy_region] * (num_cols_with_pk_w + 1)
+            num_regions = num_cols_with_pk_w + 1
+
+            # Use newlist_hint to avoid mr-poisoning
+            region_list = newlist_hint(num_regions)
+            for _ in range(num_regions):
+                region_list.append(dummy_region)
 
             region_list[0] = (self.pk_buf.ptr, 0, self.pk_buf.offset)
             region_list[1] = (self.w_buf.ptr, 0, self.w_buf.offset)
@@ -264,12 +286,14 @@ class TableShardWriter(object):
 
             region_list[reg_idx] = (self.b_buf.ptr, 0, self.b_buf.offset)
 
-            num_regions = len(region_list)
             dir_size = num_regions * layout.DIR_ENTRY_SIZE
             dir_offset = layout.HEADER_SIZE
             current_pos = align_64(dir_offset + dir_size)
 
-            final_regions = [dummy_region] * num_regions
+            final_regions = newlist_hint(num_regions)
+            for _ in range(num_regions):
+                final_regions.append(dummy_region)
+
             i = 0
             while i < num_regions:
                 buf_ptr, _, sz = region_list[i]

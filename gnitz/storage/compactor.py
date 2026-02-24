@@ -19,10 +19,15 @@ def merge_row_contributions(active_cursors, schema):
     """
     n = len(active_cursors)
     results = newlist_hint(n)
-    processed = [False] * n
 
-    for i in range(n):
+    processed = newlist_hint(n)
+    for _ in range(n):
+        processed.append(False)
+
+    i = 0
+    while i < n:
         if processed[i]:
+            i += 1
             continue
 
         base_cursor = active_cursors[i]
@@ -31,8 +36,10 @@ def merge_row_contributions(active_cursors, schema):
 
         acc_left = base_cursor.get_row_accessor()
 
-        for j in range(i + 1, n):
+        j = i + 1
+        while j < n:
             if processed[j]:
+                j += 1
                 continue
 
             other_cursor = active_cursors[j]
@@ -42,15 +49,19 @@ def merge_row_contributions(active_cursors, schema):
             if core_comparator.compare_rows(schema, acc_left, acc_right) == 0:
                 total_weight += other_cursor.weight()
                 processed[j] = True
+            j += 1
 
         # Only preserve records with a non-zero net weight (Ghost Property)
         if total_weight != 0:
             results.append((total_weight, i))
+        i += 1
 
     return results
 
 
-def compact_shards(input_files, output_file, schema, table_id=0, validate_checksums=False):
+def compact_shards(
+    input_files, output_file, schema, table_id=0, validate_checksums=False
+):
     """
     Executes an N-way merge compaction of overlapping shards.
     """
@@ -63,15 +74,15 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
 
     try:
         # 1. Initialize cursors for all overlapping shards
-        i = 0
-        while i < num_inputs:
-            filename = input_files[i]
+        idx = 0
+        while idx < num_inputs:
+            filename = input_files[idx]
             view = shard_table.TableShardView(
                 filename, schema, validate_checksums=validate_checksums
             )
             views.append(view)
             cursors.append(cursor.ShardCursor(view))
-            i += 1
+            idx += 1
 
         # 2. Setup N-way merge via Tournament Tree
         tree = tournament_tree.TournamentTree(cursors)
@@ -97,13 +108,17 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
                 acc = exemplar_cursor.get_row_accessor()
 
                 # Zero out the temporary AoS buffer
-                for k in range(stride):
+                k = 0
+                while k < stride:
                     tmp_row[k] = "\x00"
+                    k += 1
 
                 # Materialize columnar row into temporary AoS buffer for writing
                 heap_ptr = NULL_PTR
-                for col_idx in range(num_cols):
+                col_idx = 0
+                while col_idx < num_cols:
                     if col_idx == schema.pk_index:
+                        col_idx += 1
                         continue
 
                     col_def = schema.columns[col_idx]
@@ -112,13 +127,16 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
                     dest_ptr = rffi.ptradd(tmp_row, dest_off)
 
                     sz = col_def.field_type.size
-                    for b in range(sz):
+                    b = 0
+                    while b < sz:
                         dest_ptr[b] = col_ptr[b]
+                        b += 1
 
                     # Extract heap pointer if this is a string column to allow relocation
                     if col_def.field_type == types.TYPE_STRING:
                         _, _, _, h_ptr, _ = acc.get_str_struct(col_idx)
                         heap_ptr = h_ptr
+                    col_idx += 1
 
                 writer.add_row(min_key, weight, tmp_row, heap_ptr)
                 m_idx += 1
@@ -130,9 +148,12 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
     finally:
         if tree:
             tree.close()
-        for v in views:
+        v_idx = 0
+        while v_idx < len(views):
+            v = views[v_idx]
             if v:
                 v.close()
+            v_idx += 1
 
 
 def execute_compaction(
@@ -154,12 +175,15 @@ def execute_compaction(
     true_min_lsn = handles[0].min_lsn
     true_max_lsn = handles[0].lsn
 
-    for h in handles:
+    h_idx = 0
+    while h_idx < num_h:
+        h = handles[h_idx]
         input_files.append(h.filename)
         if h.min_lsn < true_min_lsn:
             true_min_lsn = h.min_lsn
         if h.lsn > true_max_lsn:
             true_max_lsn = h.lsn
+        h_idx += 1
 
     lsn_tag = intmask(true_max_lsn)
     out_filename = os.path.join(output_dir, "compacted_%d_%d.db" % (table_id, lsn_tag))
@@ -176,7 +200,11 @@ def execute_compaction(
 
         # 2. Create new handle for the resulting Guard Shard
         new_handle = index.ShardHandle(
-            out_filename, schema, true_min_lsn, true_max_lsn, validate_checksums=validate_checksums
+            out_filename,
+            schema,
+            true_min_lsn,
+            true_max_lsn,
+            validate_checksums=validate_checksums,
         )
 
         # 3. Update the Index (Replaces handles and releases locks)
@@ -186,8 +214,10 @@ def execute_compaction(
         manifest_mgr.publish_new_version(shard_index.get_metadata_list(), true_max_lsn)
 
         # 5. Cleanup physical files
-        for f_path in input_files:
-            shard_index.ref_counter.mark_for_deletion(f_path)
+        f_idx = 0
+        while f_idx < len(input_files):
+            shard_index.ref_counter.mark_for_deletion(input_files[f_idx])
+            f_idx += 1
         shard_index.ref_counter.try_cleanup()
 
     except Exception as e:

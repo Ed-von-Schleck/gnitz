@@ -4,7 +4,14 @@ from rpython.rlib.rrandom import Random
 from rpython.rlib.rarithmetic import r_uint64, intmask, r_int64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import errors, serialize, types, strings as string_logic, comparator as core_comparator
+from rpython.rlib.objectmodel import newlist_hint
+from gnitz.core import (
+    errors,
+    serialize,
+    types,
+    strings as string_logic,
+    comparator as core_comparator,
+)
 from gnitz.storage import buffer, writer_table, comparator
 from gnitz.storage.memtable_node import (
     node_get_next_off,
@@ -76,7 +83,11 @@ class MemTable(object):
         self.arena = buffer.Buffer(arena_size, growable=False)
         self.blob_arena = buffer.Buffer(arena_size, growable=False)
         self.rng = Random(1234)
-        self._update_offsets = [0] * MAX_HEIGHT
+
+        self._update_offsets = newlist_hint(MAX_HEIGHT)
+        for _ in range(MAX_HEIGHT):
+            self._update_offsets.append(0)
+
         self.key_size = schema.get_pk_column().field_type.size
 
         # Node accessor for SkipList traversal comparisons
