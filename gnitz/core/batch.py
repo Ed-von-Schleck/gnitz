@@ -357,9 +357,6 @@ class ArenaZSetBatch(object):
 
 ZSetBatch = ArenaZSetBatch
 
-def make_empty_batch(schema):
-    return ZSetBatch(schema)
-
 def make_singleton_batch(schema, pk, weight, row):
     batch = ZSetBatch(schema)
     batch.append(pk, weight, row)

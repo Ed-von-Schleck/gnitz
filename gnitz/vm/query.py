@@ -231,11 +231,11 @@ class QueryBuilder(object):
         cursor = table.create_cursor()
         self.cursors.append(cursor)
         trace_idx, trace_reg = self._add_register(
-            table.schema, is_trace=True, cursor=cursor
+            table.get_schema(), is_trace=True, cursor=cursor
         )
 
         out_schema = types.merge_schemas_for_join(
-            prev_reg.vm_schema.table_schema, table.schema
+            prev_reg.vm_schema.table_schema, table.get_schema()
         )
         out_idx, out_reg = self._add_register(out_schema)
 

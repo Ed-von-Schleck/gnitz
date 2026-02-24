@@ -2,9 +2,10 @@
 
 import os
 from rpython.rlib import jit
+from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask
-from gnitz.storage import shard_table, writer_table, tournament_tree, comparator, index, cursor
+from gnitz.storage import shard_table, writer_table, tournament_tree, index, cursor
 from gnitz.core import types, comparator as core_comparator
 
 
@@ -17,7 +18,7 @@ def merge_row_contributions(active_cursors, schema):
     Uses the unified get_row_accessor() interface to remain storage-agnostic.
     """
     n = len(active_cursors)
-    results = []
+    results = newlist_hint(n)
     processed = [False] * n
 
     for i in range(n):
@@ -54,8 +55,8 @@ def compact_shards(input_files, output_file, schema, table_id=0, validate_checks
     Executes an N-way merge compaction of overlapping shards.
     """
     num_inputs = len(input_files)
-    views = []
-    cursors = []
+    views = newlist_hint(num_inputs)
+    cursors = newlist_hint(num_inputs)
 
     tree = None
     writer = None
@@ -146,7 +147,8 @@ def execute_compaction(
 
     table_id = shard_index.table_id
     schema = shard_index.schema
-    input_files = []
+    num_h = len(handles)
+    input_files = newlist_hint(num_h)
 
     # Track the aggregate LSN range for the new Guard Shard
     true_min_lsn = handles[0].min_lsn

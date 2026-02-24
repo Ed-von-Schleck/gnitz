@@ -101,7 +101,7 @@ class TournamentTree(object):
 
     def get_all_indices_at_min(self):
         """Returns the original cursor indices currently at the minimum key."""
-        results = []
+        results = newlist_hint(self.num_cursors)
         if self.heap_size == 0:
             return results
         target = self.get_min_key()
@@ -116,7 +116,7 @@ class TournamentTree(object):
             results.append(c_idx)
             self._collect_equal_indices(2 * idx + 1, target, results)
             self._collect_equal_indices(2 * idx + 2, target, results)
-            
+
     def _collect_equal_keys(self, idx, target, results):
         if idx >= self.heap_size:
             return
@@ -127,15 +127,15 @@ class TournamentTree(object):
             self._collect_equal_keys(2 * idx + 2, target, results)
 
     def advance_min_cursors(self, target_key=None):
-        """Restored method: Advances all cursors currently at min_key."""
+        """Advances all cursors currently at min_key."""
         if target_key is None:
             target_key = self.get_min_key()
         while self.heap_size > 0 and self._get_key(0) == target_key:
             c_idx = rffi.cast(lltype.Signed, self.heap[0].cursor_idx)
             self.advance_cursor_by_index(c_idx)
-            
+
     def get_all_cursors_at_min(self):
-        results = []
+        results = newlist_hint(self.num_cursors)
         if self.heap_size == 0:
             return results
         target = self.get_min_key()
@@ -143,17 +143,16 @@ class TournamentTree(object):
         return results
 
     def advance_cursor_by_index(self, cursor_idx):
-        # Defend against -1 from bugs or identity failures
         if cursor_idx < 0 or cursor_idx >= self.num_cursors:
             return
-            
+
         heap_idx = self.pos_map[cursor_idx]
         if heap_idx == -1:
             return
-            
+
         cursor = self.cursors[cursor_idx]
         cursor.advance()
-        
+
         if cursor.is_exhausted():
             self.pos_map[cursor_idx] = -1
             last = self.heap_size - 1

@@ -3,6 +3,7 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import rposix, rposix_stat
 from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
+from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import errors
 from gnitz.storage import mmap_posix, layout
 from gnitz.storage.metadata import ManifestEntry
@@ -84,7 +85,7 @@ def _read_manifest_entry(fd):
         min_l = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 40))[0]
         max_l = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 48))[0]
         
-        fn_chars = []
+        fn_chars = newlist_hint(128)
         for i in range(128):
             if buf[56 + i] == '\x00': break
             fn_chars.append(buf[56 + i])
@@ -158,7 +159,7 @@ class ManifestWriter(object):
     def __init__(self, filename, global_max_lsn=r_uint64(0)):
         self.filename = filename
         self.global_max_lsn = global_max_lsn
-        self.entries = []
+        self.entries = newlist_hint(16)
 
     def add_entry(self, tid, fn, min_k, max_k, min_l, max_l):
         self.entries.append(ManifestEntry(tid, fn, min_k, max_k, min_l, max_l))

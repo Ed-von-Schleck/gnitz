@@ -1,6 +1,9 @@
+# gnitz/storage/index.py
+
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
+from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import errors
 from gnitz.storage import shard_table
 from gnitz.storage.metadata import ManifestEntry
@@ -50,7 +53,7 @@ class ShardIndex(object):
         self.schema = schema
         self.ref_counter = ref_counter
         self.compaction_threshold = compaction_threshold
-        self.handles = []
+        self.handles = newlist_hint(8)
         self.needs_compaction = False
 
     def _sort(self):
@@ -73,8 +76,11 @@ class ShardIndex(object):
 
     def replace_handles(self, old_filenames, new_handle):
         """Atomically replaces a set of shards (e.g. after compaction)."""
-        new_list = []
-        for h in self.handles:
+        num_existing = len(self.handles)
+        new_list = newlist_hint(num_existing + 1)
+        
+        for i in range(num_existing):
+            h = self.handles[i]
             superseded = False
             for old_fn in old_filenames:
                 if h.filename == old_fn:
@@ -95,8 +101,10 @@ class ShardIndex(object):
 
     def find_all_shards_and_indices(self, key):
         """Prunes shards via cached bounds before performing binary search."""
-        results = []
-        for h in self.handles:
+        num_h = len(self.handles)
+        results = newlist_hint(num_h)
+        for i in range(num_h):
+            h = self.handles[i]
             if h.get_min_key() <= key <= h.get_max_key():
                 row_idx = h.view.find_row_index(key)
                 if row_idx != -1:
@@ -113,8 +121,10 @@ class ShardIndex(object):
 
     def get_metadata_list(self):
         """Produces a list of ManifestEntry objects for Manifest/Compactor use."""
-        meta_list = []
-        for h in self.handles:
+        num_h = len(self.handles)
+        meta_list = newlist_hint(num_h)
+        for i in range(num_h):
+            h = self.handles[i]
             # Note: ManifestEntry takes (table_id, shard_filename, ...) 
             # whereas the old ShardMetadata took (filename, table_id, ...)
             meta_list.append(ManifestEntry(
@@ -132,7 +142,7 @@ class ShardIndex(object):
         for h in self.handles:
             h.close()
             self.ref_counter.release(h.filename)
-        self.handles = []
+        self.handles = newlist_hint(0)
 
 
 def index_from_manifest(manifest_path, table_id, schema, ref_counter, validate_checksums=False):

@@ -182,7 +182,10 @@ class ShardCursor(BaseCursor):
 
 def _copy_cursors(cursors):
     """Helper for Tournament Tree initialization to satisfy RPython list constraints."""
-    return [c for c in cursors]
+    res = newlist_hint(len(cursors))
+    for c in cursors:
+        res.append(c)
+    return res
 
 
 class UnifiedCursor(AbstractCursor):

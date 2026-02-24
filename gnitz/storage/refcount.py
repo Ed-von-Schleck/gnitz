@@ -3,6 +3,7 @@ import errno
 from gnitz.core import errors
 from gnitz.storage import mmap_posix
 from rpython.rlib import rposix, rposix_stat
+from rpython.rlib.objectmodel import newlist_hint
 
 class FileLockHandle(object):
     _immutable_fields_ = ['fd']
@@ -13,7 +14,7 @@ class FileLockHandle(object):
 class RefCounter(object):
     def __init__(self):
         self.handles = {}
-        self.pending_deletion = []
+        self.pending_deletion = newlist_hint(16)
     
     def can_delete(self, filename):
         return filename not in self.handles
@@ -62,10 +63,11 @@ class RefCounter(object):
         """
         Attempts to delete unreferenced shards.
         """
-        deleted = []
-        remaining = []
+        num_pending = len(self.pending_deletion)
+        deleted = newlist_hint(num_pending)
+        remaining = newlist_hint(num_pending)
         
-        for idx in range(len(self.pending_deletion)):
+        for idx in range(num_pending):
             filename = self.pending_deletion[idx]
             
             if not self.can_delete(filename):
