@@ -36,7 +36,6 @@ class LongStringMapper(functions.ScalarFunction):
         output_row.append_string(new_str)
 
         # 3. Increment Integer
-        # HARDENED: Use the semantic signed accessor to avoid illegal RPython casts
         orig_int = row_accessor.get_int_signed(3)
         output_row.append_int(r_int64(intmask(orig_int + 1)))
 
@@ -108,6 +107,7 @@ def test_full_vm_pipeline(base_dir):
         b_row.append_string("DEPARTMENT_X")
         b_batch = batch.make_singleton_batch(schema_b, pk, r_int64(1), b_row)
         tab_b.ingest_batch(b_batch)
+        b_batch.free()
         tab_b.flush()
 
         # 2. Build Circuit
@@ -136,14 +136,10 @@ def test_full_vm_pipeline(base_dir):
         view.process(in_batch)
 
         # 5. Verify
-        # negate() makes weight -1; distinct(-1) produces s_new=-1, s_old=0 -> out_w=-1,
-        # but -1 != 0 so a record with weight -1 is emitted; join multiplies by +1
-        # leaving weight -1 in res_tab.  Either way the net expected weight is 0
-        # because distinct clamps: s_old=0, s_new=-1 -> out_w=-1, meaning the
-        # record IS emitted with weight -1 into res_tab.  The comment in the
-        # original test is therefore correct: we expect weight 0 only if the
-        # record was never emitted, but with our corrected sign logic a weight
-        # of -1 will be present.  The test assertion matches the original intent.
+        # Input has weight 1. negate() makes weight -1.
+        # distinct() is defined as: s_new - s_old, where s(w) = 1 if w > 0 else 0.
+        # For a new record with net weight -1: s_old=0, s_new=0 -> out_w=0.
+        # No record should be emitted into res_tab.
         check_acc = PayloadRowAccessor(res_tab.schema)
         exp_row = values.make_payload_row(res_tab.schema)
         exp_row.append_float(0.7)
@@ -156,9 +152,12 @@ def test_full_vm_pipeline(base_dir):
 
         if w != 0:
             os.write(2, "ERR: Expected weight 0 due to negate+distinct\n")
+            in_batch.free()
+            view.close()
             return False
 
         os.write(1, "    [OK] Pipeline verified.\n")
+        in_batch.free()
         view.close()
         return True
     finally:
@@ -201,17 +200,24 @@ def test_reduce_aggregates(base_dir):
         # Result Schema: [PK(U64), Agg(I64)]
         if out_batch.get_weight(0) != 1:
             os.write(2, "ERR: COUNT expected weight 1\n")
+            in_batch.free()
+            view_count.close()
             return False
         if out_batch.get_pk(0) != r_uint128(100):
             os.write(2, "ERR: COUNT expected PK 100\n")
+            in_batch.free()
+            view_count.close()
             return False
 
         val = out_batch.get_accessor(0).get_int_signed(1)
         if val != 5:
             os.write(2, "ERR: COUNT expected 5, got %d\n" % int(val))
+            in_batch.free()
+            view_count.close()
             return False
 
         os.write(1, "    [OK] Reduce COUNT verified.\n")
+        in_batch.free()
         view_count.close()
         return True
     finally:
@@ -266,6 +272,10 @@ def test_temporal_and_smj(base_dir):
     interp.execute(in_batch)
     if r2.batch.length() != 0:
         os.write(2, "ERR: r2 should be empty after Tick 1\n")
+        in_batch.free()
+        r0.batch.free()
+        r1.batch.free()
+        r2.batch.free()
         return False
 
     # Simulate the join that would occur on the next tick: r0 still holds the
@@ -282,9 +292,17 @@ def test_temporal_and_smj(base_dir):
 
     if r2.batch.length() != 1:
         os.write(2, "ERR: SMJ failed to find match, length=%d\n" % r2.batch.length())
+        in_batch.free()
+        r0.batch.free()
+        r1.batch.free()
+        r2.batch.free()
         return False
 
     os.write(1, "    [OK] Temporal and SMJ ops verified.\n")
+    in_batch.free()
+    r0.batch.free()
+    r1.batch.free()
+    r2.batch.free()
     return True
 
 

@@ -6,7 +6,7 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import types, values as db_values, batch as batch_mod, comparator as core_comparator
 from gnitz.storage.table import PersistentTable
-from gnitz.core.row_logic import make_payload_row
+from gnitz.core.values import make_payload_row
 from gnitz.storage import compactor
 
 # ------------------------------------------------------------------------------

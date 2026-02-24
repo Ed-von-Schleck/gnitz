@@ -37,7 +37,7 @@ class AbstractTable(object):
         Implementations should perform optimized batch IO (e.g., WAL 
         group-fsync and MemTable fast-path ingestion).
         
-        batch: ArenaZSetBatch (from gnitz.vm.batch)
+        batch: ArenaZSetBatch (from gnitz.core.batch)
         """
         raise NotImplementedError
 

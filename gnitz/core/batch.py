@@ -6,7 +6,6 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core.values import PayloadRow, make_payload_row, _analyze_schema
-from gnitz.core.row_logic import PayloadRowComparator
 from gnitz.core import serialize, strings as string_logic, comparator as core_comparator
 from gnitz.storage import buffer, comparator as storage_comparator
 
@@ -18,8 +17,6 @@ BATCH_REC_WEIGHT_OFFSET = 16
 BATCH_REC_NULL_OFFSET = 24
 BATCH_REC_PAYLOAD_BASE = 32
 BATCH_HEADER_SIZE = 32
-
-_NULL_ROW_CACHE = {}
 
 
 class BatchBlobAllocator(string_logic.BlobAllocator):
@@ -368,13 +365,3 @@ def make_singleton_batch(schema, pk, weight, row):
     batch.append(pk, weight, row)
     batch._sorted = True
     return batch
-
-def get_null_row(schema):
-    sid = id(schema)
-    if sid not in _NULL_ROW_CACHE:
-        n, has_u128, has_string, _ = _analyze_schema(schema)
-        row = PayloadRow(has_u128, has_string, True, n)
-        for i in range(n):
-            row.append_null(i)
-        _NULL_ROW_CACHE[sid] = row
-    return _NULL_ROW_CACHE[sid]

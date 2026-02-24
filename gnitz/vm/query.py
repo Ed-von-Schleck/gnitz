@@ -47,6 +47,10 @@ class View(object):
         """Closes all persistent cursors associated with the view."""
         for cursor in self.cursors:
             cursor.close()
+        for reg in self.interpreter.register_file.registers:
+            if reg is not None and reg.is_delta():
+                if reg.batch is not None:
+                    reg.batch.free()
 
 
 class QueryBuilder(object):

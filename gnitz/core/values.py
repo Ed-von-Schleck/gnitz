@@ -250,9 +250,8 @@ def make_payload_row(schema):
     Canonical constructor for a ``PayloadRow``.
 
     MUST be called via this function rather than constructing ``PayloadRow``
-    directly. This function is the sole enforcement point for the
-    ``newlist_hint`` requirement described in ``gnitz/core/row_logic.py``:
-    every list inside ``PayloadRow`` uses ``newlist_hint``, never a list
+    directly.
+    Every list inside ``PayloadRow`` uses ``newlist_hint``, never a list
     literal. Using a literal (``[]``, ``[x, y]``, ``[None] * n``) anywhere
     marks that listdef as must-not-resize (mr), permanently poisoning every
     ``.append()`` call on any list of that element type across the entire

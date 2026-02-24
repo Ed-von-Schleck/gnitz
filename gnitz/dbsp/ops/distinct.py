@@ -1,6 +1,6 @@
 # gnitz/dbsp/ops/distinct.py
 
-from rpython.rlib.rarithmetic import r_int64
+from rpython.rlib.rarithmetic import r_int64, intmask
 
 """
 Distinct Operator for the DBSP algebra.
@@ -56,19 +56,11 @@ def op_distinct(delta_batch, history_table, out_batch):
 
         w_old = history_table.get_weight(key, accessor)
 
-        # set_step: sign of weight, clamped to {-1, 0, 1}
-        s_old = 0
-        if w_old > r_int64(0):
-            s_old = 1
-        elif w_old < r_int64(0):
-            s_old = -1
-
-        w_new = w_old + w_delta
-        s_new = 0
-        if w_new > r_int64(0):
-            s_new = 1
-        elif w_new < r_int64(0):
-            s_new = -1
+        # DBSP distinct converts a multiset to a set.
+        # An element is in the set (weight 1) if its accumulated weight is > 0, else 0.
+        s_old = 1 if w_old > r_int64(0) else 0
+        w_new = r_int64(intmask(w_old + w_delta))
+        s_new = 1 if w_new > r_int64(0) else 0
 
         out_w = s_new - s_old
         if out_w != 0:
