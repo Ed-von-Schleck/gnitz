@@ -14,11 +14,6 @@ NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
 
 class BaseCursor(AbstractCursor):
-    """
-    Common base for all storage-layer cursors to satisfy RPython unification.
-    Inherits from the backend interface to maintain VM compatibility.
-    """
-
     def __init__(self):
         pass
 
@@ -54,11 +49,6 @@ class BaseCursor(AbstractCursor):
 
 
 class MemTableCursor(BaseCursor):
-    """
-    SkipList cursor for the MemTable.
-    Implements the AbstractCursor interface for the DBSP VM.
-    """
-
     _immutable_fields_ = ["memtable", "schema", "key_size", "accessor"]
 
     def __init__(self, memtable):
@@ -66,27 +56,22 @@ class MemTableCursor(BaseCursor):
         self.memtable = memtable
         self.schema = memtable.schema
         self.key_size = memtable.key_size
-        # Position at the first real node (level-0 successor of the sentinel head).
         self.current_node_off = node_get_next_off(
             memtable.arena.base_ptr, memtable.head_off, 0
         )
-        # Pre-allocate accessor for zero-allocation iteration.
         self.accessor = comparator.PackedNodeAccessor(
             self.schema, memtable.blob_arena.base_ptr
         )
 
     def seek(self, target_key):
-        """Finds the first SkipList node >= target_key."""
         self.current_node_off = self.memtable.lower_bound_node(target_key)
 
     def advance(self):
-        """Moves to the next node in the SkipList."""
         if self.current_node_off != 0:
             base = self.memtable.arena.base_ptr
             self.current_node_off = node_get_next_off(base, self.current_node_off, 0)
 
     def is_valid(self):
-        """Returns True if the cursor is pointing at a valid node."""
         return self.current_node_off != 0
 
     def is_exhausted(self):
@@ -96,21 +81,18 @@ class MemTableCursor(BaseCursor):
         return self.key()
 
     def key(self):
-        """Returns the Primary Key of the current node or MAX_UINT128 if invalid."""
         if self.current_node_off == 0:
-            return r_uint128(-1)  # Sentinel for Tournament Tree merges
+            return r_uint128(-1)
         return node_get_key(
             self.memtable.arena.base_ptr, self.current_node_off, self.key_size
         )
 
     def weight(self):
-        """Returns the algebraic weight of the current node."""
         if self.current_node_off == 0:
             return r_int64(0)
         return node_get_weight(self.memtable.arena.base_ptr, self.current_node_off)
 
     def get_accessor(self):
-        """Sets the state of the pre-allocated accessor and returns it."""
         self.accessor.set_row(self.memtable.arena.base_ptr, self.current_node_off)
         return self.accessor
 
@@ -119,11 +101,6 @@ class MemTableCursor(BaseCursor):
 
 
 class ShardCursor(BaseCursor):
-    """
-    Columnar cursor for Persistent Shards.
-    Automatically skips 'Ghost' records (weight == 0).
-    """
-
     _immutable_fields_ = ["view", "schema", "is_u128", "accessor"]
 
     def __init__(self, shard_view):
@@ -181,7 +158,6 @@ class ShardCursor(BaseCursor):
 
 
 def _copy_cursors(cursors):
-    """Helper for Tournament Tree initialization to satisfy RPython list constraints."""
     res = newlist_hint(len(cursors))
     for c in cursors:
         res.append(c)
@@ -189,11 +165,6 @@ def _copy_cursors(cursors):
 
 
 class UnifiedCursor(AbstractCursor):
-    """
-    Authoritative cursor providing a merged view over multiple shards and memtables.
-    Handles algebraic weight summation and payload grouping.
-    """
-
     _immutable_fields_ = ["schema", "is_single_source"]
 
     def __init__(self, schema, cursors):
@@ -207,7 +178,6 @@ class UnifiedCursor(AbstractCursor):
         else:
             self.tree = None
 
-        # Workaround for RPython r_uint128 struct alignment bugs
         self._current_key_lo = r_uint64(0)
         self._current_key_hi = r_uint64(0)
         self._current_weight = r_int64(0)
@@ -231,9 +201,13 @@ class UnifiedCursor(AbstractCursor):
 
         while not self.tree.is_exhausted():
             min_key = self.tree.get_min_key()
-            indices = self.tree.get_all_indices_at_min()
 
-            # 1. Find lexicographical minimum payload in group
+            # GUARD: Stop if we hit the sentinel. Prevents infinite loops 
+            # if constituents are exhausted but tree logic remains valid.
+            if min_key == r_uint128(-1):
+                break
+
+            indices = self.tree.get_all_indices_at_min()
             best_idx = indices[0]
             best_cursor = self.cursors[best_idx]
             best_acc = best_cursor.get_accessor()
@@ -249,7 +223,6 @@ class UnifiedCursor(AbstractCursor):
                     best_acc = curr_acc
                 idx += 1
 
-            # 2. Sum weight for this payload group
             net_weight = r_int64(0)
             to_advance = newlist_hint(num_candidates)
 
@@ -271,6 +244,7 @@ class UnifiedCursor(AbstractCursor):
                 self._valid = True
                 return
             else:
+                # Ghost group: advance tree and keep searching
                 for c_idx in to_advance:
                     self.tree.advance_cursor_by_index(c_idx)
 
@@ -279,16 +253,13 @@ class UnifiedCursor(AbstractCursor):
     def seek(self, target_key):
         for c in self.cursors:
             c.seek(target_key)
-
         if not self.is_single_source:
             self.tree.rebuild()
-
         self._find_next_non_ghost()
 
     def advance(self):
         if not self._valid:
             return
-
         if self.is_single_source:
             self.cursors[0].advance()
             self._find_next_non_ghost()
@@ -310,7 +281,6 @@ class UnifiedCursor(AbstractCursor):
 
         for c_idx in to_advance:
             self.tree.advance_cursor_by_index(c_idx)
-
         self._find_next_non_ghost()
 
     def key(self):
