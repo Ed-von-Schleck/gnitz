@@ -83,6 +83,11 @@ class IdentityMapper(ScalarFunction):
     def evaluate_map(self, row_accessor, output_row):
         # Iterate over payload columns (indices 0..N-1 in accessor)
         for i in range(len(self.col_types)):
+            # Check null first to avoid reading invalid data in type-specific branches
+            if row_accessor.is_null(i):
+                output_row.append_null(i)
+                continue
+
             t = self.col_types[i]
             if t == types.TYPE_STRING.code:
                 output_row.append_string(row_accessor.get_str_struct(i)[4])
@@ -92,8 +97,6 @@ class IdentityMapper(ScalarFunction):
                 val = row_accessor.get_u128(i)
                 # Split u128 back to u64 parts for appending
                 output_row.append_u128(r_uint64(val), r_uint64(val >> 64))
-            elif row_accessor.is_null(i):
-                output_row.append_null(i)
             else:
                 # Default integer path
                 output_row.append_int(row_accessor.get_int_signed(i))
@@ -117,9 +120,8 @@ class ProjectionMapper(ScalarFunction):
             t = self.src_types[i]
 
             if row_accessor.is_null(src_idx):
-                # Note: MapOutputAccessor.append_null ignores the arg index 
-                # and appends to the current position, which is correct here.
-                output_row.append_null(0)
+                # Append null to the current output column index 'i'
+                output_row.append_null(i)
                 continue
 
             if t == types.TYPE_STRING.code:

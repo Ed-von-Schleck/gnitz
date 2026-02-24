@@ -3,7 +3,12 @@
 import os
 import errno
 from rpython.rlib import rposix
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import (
+    r_int64,
+    r_uint64,
+    r_ulonglonglong as r_uint128,
+    intmask,
+)
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
@@ -19,11 +24,10 @@ from gnitz.storage import (
     cursor,
 )
 from gnitz.storage.memtable_node import node_get_weight
-from gnitz.storage.ephemeral_table import EphemeralTable
-from gnitz.backend.table import AbstractTable
+from gnitz.storage.ephemeral_table import EphemeralTable, _StorageBase, _name_to_tid
 
 
-class PersistentTable(AbstractTable):
+class PersistentTable(_StorageBase):
     """
     Coordinator for a single persistent Z-Set table.
 
@@ -98,24 +102,9 @@ class PersistentTable(AbstractTable):
     def get_schema(self):
         return self.schema
 
-    def create_cursor(self):
-        num_shards = len(self.index.handles)
-        cs = newlist_hint(1 + num_shards)
-
-        cs.append(cursor.MemTableCursor(self.memtable))
-        for h in self.index.handles:
-            cs.append(cursor.ShardCursor(h.view))
-
-        return cursor.UnifiedCursor(self.schema, cs)
-
     def create_scratch_table(self, name, schema):
         scratch_dir = os.path.join(self.directory, "scratch_" + name)
-
-        tid = 0
-        for char in name:
-            tid = (tid * 31 + ord(char)) & 0x7FFFFFFF
-        if tid == 0:
-            tid = 1
+        tid = _name_to_tid(name)
 
         return EphemeralTable(
             scratch_dir,

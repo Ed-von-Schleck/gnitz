@@ -3,7 +3,12 @@
 import os
 import errno
 from rpython.rlib import rposix
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import (
+    r_int64,
+    r_uint64,
+    r_ulonglonglong as r_uint128,
+    intmask,
+)
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
@@ -20,14 +25,25 @@ from gnitz.storage.memtable_node import node_get_weight
 from gnitz.backend.table import AbstractTable
 
 
-class EphemeralTable(AbstractTable):
+def _name_to_tid(name):
     """
-    Scratch Z-Set storage for internal VM state (Traces, Materialized Views).
+    Standardizes name-to-TID hashing for internal state tables.
+    """
+    tid = 0
+    for char in name:
+        tid = (tid * 31 + ord(char)) & 0x7FFFFFFF
+    if tid == 0:
+        tid = 1
+    return tid
 
-    Bypasses the Write-Ahead Log to maximize throughput. Operates purely on
-    raw memory buffers and Accessors.
+
+class _StorageBase(AbstractTable):
+    """
+    Shared base class for Persistent and Ephemeral tables to deduplicate
+    boilerplate logic that relies on the .memtable and .index attributes.
     """
 
+    # Move immutable hints here so they are consistent across the hierarchy.
     _immutable_fields_ = [
         "schema",
         "table_id",
@@ -35,6 +51,25 @@ class EphemeralTable(AbstractTable):
         "name",
         "ref_counter",
     ]
+
+    def create_cursor(self):
+        num_shards = len(self.index.handles)
+        cs = newlist_hint(1 + num_shards)
+
+        cs.append(cursor.MemTableCursor(self.memtable))
+        for h in self.index.handles:
+            cs.append(cursor.ShardCursor(h.view))
+
+        return cursor.UnifiedCursor(self.schema, cs)
+
+
+class EphemeralTable(_StorageBase):
+    """
+    Scratch Z-Set storage for internal VM state (Traces, Materialized Views).
+
+    Bypasses the Write-Ahead Log to maximize throughput. Operates purely on
+    raw memory buffers and Accessors.
+    """
 
     def __init__(
         self,
@@ -70,25 +105,10 @@ class EphemeralTable(AbstractTable):
     def get_schema(self):
         return self.schema
 
-    def create_cursor(self):
-        num_shards = len(self.index.handles)
-        cs = newlist_hint(1 + num_shards)
-
-        cs.append(cursor.MemTableCursor(self.memtable))
-        for h in self.index.handles:
-            cs.append(cursor.ShardCursor(h.view))
-
-        return cursor.UnifiedCursor(self.schema, cs)
-
     def create_scratch_table(self, name, schema):
         """Returns another EphemeralTable instance for recursive state."""
         scratch_dir = os.path.join(self.directory, "scratch_" + name)
-
-        tid = 0
-        for char in name:
-            tid = (tid * 31 + ord(char)) & 0x7FFFFFFF
-        if tid == 0:
-            tid = 1
+        tid = _name_to_tid(name)
 
         return EphemeralTable(
             scratch_dir,
@@ -122,19 +142,16 @@ class EphemeralTable(AbstractTable):
         total_w = r_int64(0)
 
         # 1. Check SkipList MemTable
-        # Calculate hash for SkipList O(1) payload check directly from accessor.
-        # We must capture the scratch buffer (h_buf) to free it, preventing leaks.
-        h_val, h_buf, _ = serialize.compute_hash(
-            self.schema, accessor, lltype.nullptr(rffi.CCHARP.TO), 0
+        # Reuses the memtable's pre-allocated hash buffer to avoid churn.
+        h_val, h_buf, h_cap = serialize.compute_hash(
+            self.schema, accessor, self.memtable.hash_buf, self.memtable.hash_buf_cap
         )
+        self.memtable.hash_buf = h_buf
+        self.memtable.hash_buf_cap = h_cap
 
-        try:
-            node_off = self.memtable._find_exact_values(r_key, h_val, accessor)
-            if node_off != 0:
-                total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
-        finally:
-            if h_buf:
-                lltype.free(h_buf, flavor="raw")
+        node_off = self.memtable._find_exact_values(r_key, h_val, accessor)
+        if node_off != 0:
+            total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
 
         # 2. Check Columnar Shards via Index
         shard_matches = self.index.find_all_shards_and_indices(r_key)
