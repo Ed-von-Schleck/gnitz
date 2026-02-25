@@ -39,8 +39,10 @@ class TestCatalogBootstrap(unittest.TestCase):
     def test_first_startup_creates_metadata(self):
         """Verifies that the first startup populates all system tables."""
         engine = open_engine(self.tmpdir)
+        print("engine open")
         try:
             # 1. Check Schemas (_system and public)
+            
             self.assertEqual(self._count_records(engine.sys.schemas), 2)
             self.assertTrue(engine.registry.has_schema("_system"))
             self.assertTrue(engine.registry.has_schema("public"))
