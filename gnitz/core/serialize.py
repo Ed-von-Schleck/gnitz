@@ -245,4 +245,10 @@ def compute_hash(schema, accessor, hash_buf, hash_buf_cap):
             rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr, offset))[0] = bits
             offset += 8
 
-    return xxh.compute_checksum(hash_buf, sz), hash_buf, hash_buf_cap
+    # 5. Hold `hash_buf` in a named local across the C call so PyPy2's GC
+    # cannot collect the backing allocation before gnitz_xxh3_64 finishes
+    # reading it.  A bare rffi.cast(VOIDP, hash_buf) does not root the buffer
+    # in ll2ctypes mode; only a live Python reference does.
+    buf = hash_buf
+    checksum = xxh.compute_checksum(buf, sz)
+    return checksum, hash_buf, hash_buf_cap

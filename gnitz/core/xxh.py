@@ -34,11 +34,13 @@ unsigned long long gnitz_xxh3_64(const void* input, size_t length) {
 is_translating = False
 # Standard check: if the translator modules are loaded
 for mod_name in sys.modules:
-    if mod_name.startswith('rpython.translator') or mod_name.startswith('pypy.translator'):
+    if mod_name.startswith("rpython.translator") or mod_name.startswith(
+        "pypy.translator"
+    ):
         is_translating = True
         break
 # Supplemental check for the translation entry point
-if any('translate' in arg for arg in sys.argv):
+if any("translate" in arg for arg in sys.argv):
     is_translating = True
 
 # 3. Dynamic ExternalCompilationInfo Configuration
@@ -47,15 +49,15 @@ if is_translating:
     # We must isolate the implementation to a single object file.
     # We only put the PROTOTYPE in the global header (pre_include_bits).
     eci = ExternalCompilationInfo(
-        includes=['xxhash.h'],
+        includes=["xxhash.h"],
         include_dirs=[CURRENT_DIR],
         pre_include_bits=[
-            '#include <stddef.h>',
-            '#define XXH_NAMESPACE GNZ_STABLE_',
-            '#define XXH_STATIC_LINKING_ONLY',
-            'unsigned long long gnitz_xxh3_64(const void* input, size_t length);'
+            "#include <stddef.h>",
+            "#define XXH_NAMESPACE GNZ_STABLE_",
+            "#define XXH_STATIC_LINKING_ONLY",
+            "unsigned long long gnitz_xxh3_64(const void* input, size_t length);",
         ],
-        separate_module_sources=[implementation_code]
+        separate_module_sources=[implementation_code],
     )
 else:
     # --- UNIT TEST MODE (ll2ctypes / Python 2.7) ---
@@ -63,31 +65,41 @@ else:
     # ll2ctypes compiles exactly one C file, so no multiple definition issues.
     # This ensures the symbol is exported to the ephemeral .so library.
     eci = ExternalCompilationInfo(
-        includes=['xxhash.h'],
+        includes=["xxhash.h"],
         include_dirs=[CURRENT_DIR],
-        pre_include_bits=[implementation_code]
+        pre_include_bits=[implementation_code],
     )
 
 # 4. Define the FFI binding
 _xxh3_64 = rffi.llexternal(
-    'gnitz_xxh3_64',
+    "gnitz_xxh3_64",
     [rffi.VOIDP, rffi.SIZE_T],
     rffi.ULONGLONG,
-    compilation_info=eci
+    compilation_info=eci,
 )
+
 
 def compute_checksum(data_ptr, length):
     """
     Computes a 64-bit XXH3 checksum from a pointer and length.
     Safe for both translated binaries and Python 2.7 unit tests.
+
+    IMPORTANT: In PyPy2 ll2ctypes mode, rffi.cast(VOIDP, x) does not
+    root x against the GC — only a live Python name in the current
+    frame does.  We therefore hold data_ptr in a named local for the
+    entire duration of the C call so PyPy2 cannot collect the backing
+    allocation between the cast and the actual function invocation.
     """
-    # rffi.SIZE_T handles the correct pointer-width for the length field
-    res = _xxh3_64(rffi.cast(rffi.VOIDP, data_ptr), rffi.cast(rffi.SIZE_T, length))
+    live_ptr = data_ptr  # keep backing allocation rooted through C call
+    voidp = rffi.cast(rffi.VOIDP, live_ptr)
+    res = _xxh3_64(voidp, rffi.cast(rffi.SIZE_T, length))
     return r_uint64(res)
+
 
 def verify_checksum(data_ptr, length, expected):
     """Compares the checksum of a buffer against an expected r_uint64."""
     return compute_checksum(data_ptr, length) == expected
+
 
 def compute_checksum_bytes(data_str):
     """Computes a 64-bit XXH3 checksum for an RPython string."""

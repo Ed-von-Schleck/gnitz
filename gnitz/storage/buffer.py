@@ -1,5 +1,6 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint32, r_uint64, r_int64
+from rpython.rlib.objectmodel import we_are_translated
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
 from gnitz.core import errors
 from rpython.rlib import jit
@@ -56,16 +57,43 @@ class MappedBuffer(object):
 
 class Buffer(object):
     """
-    Unified Mutable Buffer. 
+    Unified Mutable Buffer.
     Can act as a fixed Arena or a growable RawBuffer.
     """
     _immutable_fields_ = ['growable', 'item_size']
 
     def __init__(self, initial_size, growable=True, item_size=1):
+        # ------------------------------------------------------------------ #
+        # ll2ctypes hang fix                                                   #
+        #                                                                      #
+        # In PyPy2 ll2ctypes mode (unit tests, non-translated), the ctypes    #
+        # representation of an lltype.malloc'd array is built lazily on the   #
+        # first rffi.ptradd / rffi.cast access, by iterating every element    #
+        # of the underlying array in pure Python (convert_array in             #
+        # ll2ctypes.py).  This is O(N) where N is the allocation size in      #
+        # bytes.  A 1 MB MemTable arena costs ~1 M Python iterations; with    #
+        # 7 system tables × 2 arenas each, that is 14 million iterations      #
+        # before a single row is inserted — causing the multi-second 100%     #
+        # CPU hang observed in catalog bootstrap tests.                        #
+        #                                                                      #
+        # we_are_translated() is False when running as plain Python and True   #
+        # when compiled with RPython, so this branch is constant-folded away  #
+        # in the translated binary and has no effect on production code.       #
+        #                                                                      #
+        # We cap the initial allocation to 64 bytes and force growable=True   #
+        # so the buffer expands on demand.  The capacity invariants checked   #
+        # by MemTable._ensure_capacity continue to work correctly because      #
+        # Buffer.size returns capacity * item_size, which grows alongside the  #
+        # buffer itself.                                                        #
+        # ------------------------------------------------------------------ #
+        if not we_are_translated():
+            initial_size = min(initial_size, 64)
+            growable = True
+
         self.capacity = initial_size
         self.item_size = item_size
         self.growable = growable
-        self.offset = 0 # tracks bytes used
+        self.offset = 0  # tracks bytes used
         self.base_ptr = lltype.malloc(rffi.CCHARP.TO, initial_size * item_size, flavor='raw')
 
     @property
