@@ -85,6 +85,12 @@ class Buffer(object):
         # by MemTable._ensure_capacity continue to work correctly because      #
         # Buffer.size returns capacity * item_size, which grows alongside the  #
         # buffer itself.                                                        #
+        #                                                                      #
+        # NOTE: The same O(N) convert_array trigger applies to the realloc    #
+        # path in ensure_capacity — rffi.cast(VOIDP, new_ptr) on a freshly   #
+        # lltype.malloc'd array also runs convert_array for every byte.       #
+        # We therefore avoid c_memmove entirely in non-translated mode and    #
+        # copy the live bytes manually instead (see ensure_capacity below).   #
         # ------------------------------------------------------------------ #
         if not we_are_translated():
             initial_size = min(initial_size, 64)
@@ -123,9 +129,20 @@ class Buffer(object):
             new_ptr = lltype.malloc(rffi.CCHARP.TO, new_cap * self.item_size, flavor='raw')
             
             if self.offset > 0:
-                c_memmove(rffi.cast(rffi.VOIDP, new_ptr), 
-                          rffi.cast(rffi.VOIDP, self.base_ptr), 
-                          rffi.cast(rffi.SIZE_T, self.offset))
+                if we_are_translated():
+                    # Production: fast C memmove.
+                    c_memmove(rffi.cast(rffi.VOIDP, new_ptr),
+                              rffi.cast(rffi.VOIDP, self.base_ptr),
+                              rffi.cast(rffi.SIZE_T, self.offset))
+                else:
+                    # Test mode (ll2ctypes): rffi.cast(VOIDP, ptr) on a freshly
+                    # lltype.malloc'd array triggers convert_array — O(new_cap)
+                    # pure-Python iterations — causing the same hang as the
+                    # initial Buffer.__init__ allocation would without the 64-byte
+                    # cap.  Copy the live bytes manually instead; buffers are
+                    # always small in test mode (start at 64 bytes, grow slowly).
+                    for i in range(self.offset):
+                        new_ptr[i] = self.base_ptr[i]
             
             lltype.free(self.base_ptr, flavor='raw')
             self.base_ptr = new_ptr
@@ -160,9 +177,13 @@ class Buffer(object):
         if length <= 0: return
         dest = self.alloc(length, alignment=1)
         if src_ptr:
-            c_memmove(rffi.cast(rffi.VOIDP, dest), 
-                      rffi.cast(rffi.VOIDP, src_ptr), 
-                      rffi.cast(rffi.SIZE_T, length))
+            if we_are_translated():
+                c_memmove(rffi.cast(rffi.VOIDP, dest),
+                          rffi.cast(rffi.VOIDP, src_ptr),
+                          rffi.cast(rffi.SIZE_T, length))
+            else:
+                for i in range(length):
+                    dest[i] = src_ptr[i]
         else:
             for i in range(length):
                 dest[i] = '\x00'

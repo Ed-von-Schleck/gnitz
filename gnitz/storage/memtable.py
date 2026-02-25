@@ -4,7 +4,7 @@ from rpython.rlib.rrandom import Random
 from rpython.rlib.rarithmetic import r_uint64, intmask, r_int64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.objectmodel import newlist_hint
+from rpython.rlib.objectmodel import newlist_hint, we_are_translated
 from gnitz.core import (
     errors,
     serialize,
@@ -47,13 +47,22 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
 
     def allocate_from_ptr(self, src_ptr, length):
         """Zero-copy relocation of string data."""
+        from rpython.rlib.objectmodel import we_are_translated
         b_ptr = self.arena.alloc(length, alignment=8)
         if length > 0:
-            buffer.c_memmove(
-                rffi.cast(rffi.VOIDP, b_ptr),
-                rffi.cast(rffi.VOIDP, src_ptr),
-                rffi.cast(rffi.SIZE_T, length),
-            )
+            if we_are_translated():
+                # Production: fast C memmove.
+                buffer.c_memmove(
+                    rffi.cast(rffi.VOIDP, b_ptr),
+                    rffi.cast(rffi.VOIDP, src_ptr),
+                    rffi.cast(rffi.SIZE_T, length),
+                )
+            else:
+                # Test mode (ll2ctypes): rffi.cast(VOIDP, ...) on a raw-malloc'd
+                # array triggers convert_array — O(N) pure-Python iteration.
+                # Copy byte-by-byte instead; strings are short in practice.
+                for i in range(length):
+                    b_ptr[i] = src_ptr[i]
         off = rffi.cast(lltype.Signed, b_ptr) - rffi.cast(
             lltype.Signed, self.arena.base_ptr
         )
@@ -80,8 +89,14 @@ class MemTable(object):
 
     def __init__(self, schema, arena_size):
         self.schema = schema
-        self.arena = buffer.Buffer(arena_size, growable=False)
-        self.blob_arena = buffer.Buffer(arena_size, growable=False)
+        # In translated (production) mode, use fixed-size arenas so that
+        # MemTableFullError is raised when the arena is exhausted, triggering
+        # a flush.  In test mode (ll2ctypes), Buffer already caps the initial
+        # allocation to 64 bytes; we must therefore allow the arenas to grow
+        # on demand or every ingest_batch call will immediately fail.
+        growable = not we_are_translated()
+        self.arena = buffer.Buffer(arena_size, growable=growable)
+        self.blob_arena = buffer.Buffer(arena_size, growable=growable)
         self.rng = Random(1234)
 
         self._update_offsets = newlist_hint(MAX_HEIGHT)
@@ -243,6 +258,12 @@ class MemTable(object):
         self._ensure_capacity(node_full_sz, accessor)
 
         new_ptr = self.arena.alloc(node_full_sz, alignment=16)
+        # Re-fetch base AFTER alloc: buffer.alloc itself calls ensure_capacity
+        # to account for alignment padding, which may trigger a second realloc
+        # invalidating any base captured before this point.  new_ptr is already
+        # computed from the post-realloc self.base_ptr inside alloc(), so the
+        # subtraction below is correct.
+        base = self.arena.base_ptr
         new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
 
         node_set_weight(base, new_off, weight)
@@ -279,11 +300,18 @@ class MemTable(object):
 
     def _ensure_capacity(self, node_sz, accessor):
         blob_sz = serialize.get_heap_size(self.schema, accessor)
-        if (
-            self.arena.offset + node_sz > self.arena.size
-            or self.blob_arena.offset + blob_sz > self.blob_arena.size
-        ):
-            raise errors.MemTableFullError()
+        if we_are_translated():
+            # Production mode: fixed-size arenas; raise to trigger a flush.
+            if (
+                self.arena.offset + node_sz > self.arena.size
+                or self.blob_arena.offset + blob_sz > self.blob_arena.size
+            ):
+                raise errors.MemTableFullError()
+        else:
+            # Test mode: arenas are growable; let Buffer.ensure_capacity expand
+            # them on demand so tests are not limited by the initial arena size.
+            self.arena.ensure_capacity(node_sz)
+            self.blob_arena.ensure_capacity(blob_sz)
 
     def flush(self, filename, table_id=0):
         sw = writer_table.TableShardWriter(self.schema, table_id)

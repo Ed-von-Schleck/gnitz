@@ -177,21 +177,29 @@ def _retract_column_record(
 # ── Internal Logic ───────────────────────────────────────────────────────────
 
 
-def _make_system_tables(sys_dir):
-    def _pt(subdir, name, schema, table_id):
-        directory = sys_dir + "/" + subdir
-        return PersistentTable(directory, name, schema, table_id=table_id)
+def _create_sys_table(sys_dir, subdir, name, schema, table_id):
+    directory = sys_dir + "/" + subdir
+    return PersistentTable(directory, name, schema, table_id=table_id)
 
+def _make_system_tables(sys_dir):
     return SystemTables(
-        schemas=_pt(SYS_SUBDIR_SCHEMAS, "_schemas", make_schemas_schema(), SYS_TABLE_SCHEMAS),
-        tables=_pt(SYS_SUBDIR_TABLES, "_tables", make_tables_schema(), SYS_TABLE_TABLES),
-        views=_pt(SYS_SUBDIR_VIEWS, "_views", make_views_schema(), SYS_TABLE_VIEWS),
-        columns=_pt(SYS_SUBDIR_COLUMNS, "_columns", make_columns_schema(), SYS_TABLE_COLUMNS),
-        indices=_pt(SYS_SUBDIR_INDICES, "_indices", make_indices_schema(), SYS_TABLE_INDICES),
-        view_deps=_pt(SYS_SUBDIR_VIEW_DEPS, "_view_deps", make_view_deps_schema(), SYS_TABLE_VIEW_DEPS),
-        sequences=_pt(SYS_SUBDIR_SEQUENCES, "_sequences", make_sequences_schema(), SYS_TABLE_SEQUENCES),
+        schemas=_create_sys_table(sys_dir, SYS_SUBDIR_SCHEMAS, "_schemas", make_schemas_schema(), SYS_TABLE_SCHEMAS),
+        tables=_create_sys_table(sys_dir, SYS_SUBDIR_TABLES, "_tables", make_tables_schema(), SYS_TABLE_TABLES),
+        views=_create_sys_table(sys_dir, SYS_SUBDIR_VIEWS, "_views", make_views_schema(), SYS_TABLE_VIEWS),
+        columns=_create_sys_table(sys_dir, SYS_SUBDIR_COLUMNS, "_columns", make_columns_schema(), SYS_TABLE_COLUMNS),
+        indices=_create_sys_table(sys_dir, SYS_SUBDIR_INDICES, "_indices", make_indices_schema(), SYS_TABLE_INDICES),
+        view_deps=_create_sys_table(sys_dir, SYS_SUBDIR_VIEW_DEPS, "_view_deps", make_view_deps_schema(), SYS_TABLE_VIEW_DEPS),
+        sequences=_create_sys_table(sys_dir, SYS_SUBDIR_SEQUENCES, "_sequences", make_sequences_schema(), SYS_TABLE_SEQUENCES),
     )
 
+
+def _append_system_cols(batch, schema, table_id, column_defs):
+    """Module level helper to avoid closure in bootstrap."""
+    for i in range(len(column_defs)):
+        col_name, field_type = column_defs[i]
+        _append_column_record(
+            batch, schema, table_id, OWNER_KIND_TABLE, i, col_name, field_type.code, 0, 0, 0
+        )
 
 def _bootstrap_system_tables(sys_tables, base_dir):
     sys_dir = base_dir + "/" + SYS_CATALOG_DIRNAME
@@ -210,116 +218,50 @@ def _bootstrap_system_tables(sys_tables, base_dir):
 
     # 2. Table records
     tables_batch = ZSetBatch(tables_schema)
-
-    def _table_dir(subdir):
-        return sys_dir + "/" + subdir
-
-    _append_table_record(
-        tables_batch, tables_schema, SYS_TABLE_SCHEMAS, SYSTEM_SCHEMA_ID, "_schemas", _table_dir(SYS_SUBDIR_SCHEMAS), 0, 0
-    )
-    _append_table_record(
-        tables_batch, tables_schema, SYS_TABLE_TABLES, SYSTEM_SCHEMA_ID, "_tables", _table_dir(SYS_SUBDIR_TABLES), 0, 0
-    )
-    _append_table_record(
-        tables_batch, tables_schema, SYS_TABLE_VIEWS, SYSTEM_SCHEMA_ID, "_views", _table_dir(SYS_SUBDIR_VIEWS), 0, 0
-    )
-    _append_table_record(
-        tables_batch, tables_schema, SYS_TABLE_COLUMNS, SYSTEM_SCHEMA_ID, "_columns", _table_dir(SYS_SUBDIR_COLUMNS), 0, 0
-    )
-    _append_table_record(
-        tables_batch, tables_schema, SYS_TABLE_INDICES, SYSTEM_SCHEMA_ID, "_indices", _table_dir(SYS_SUBDIR_INDICES), 0, 0
-    )
-    _append_table_record(
-        tables_batch,
-        tables_schema,
-        SYS_TABLE_VIEW_DEPS,
-        SYSTEM_SCHEMA_ID,
-        "_view_deps",
-        _table_dir(SYS_SUBDIR_VIEW_DEPS),
-        0,
-        0,
-    )
-    _append_table_record(
-        tables_batch,
-        tables_schema,
-        SYS_TABLE_SEQUENCES,
-        SYSTEM_SCHEMA_ID,
-        "_sequences",
-        _table_dir(SYS_SUBDIR_SEQUENCES),
-        0,
-        0,
-    )
+    # Inline the directory logic to avoid closure
+    _append_table_record(tables_batch, tables_schema, SYS_TABLE_SCHEMAS, SYSTEM_SCHEMA_ID, "_schemas", sys_dir + "/" + SYS_SUBDIR_SCHEMAS, 0, 0)
+    _append_table_record(tables_batch, tables_schema, SYS_TABLE_TABLES, SYSTEM_SCHEMA_ID, "_tables", sys_dir + "/" + SYS_SUBDIR_TABLES, 0, 0)
+    _append_table_record(tables_batch, tables_schema, SYS_TABLE_VIEWS, SYSTEM_SCHEMA_ID, "_views", sys_dir + "/" + SYS_SUBDIR_VIEWS, 0, 0)
+    _append_table_record(tables_batch, tables_schema, SYS_TABLE_COLUMNS, SYSTEM_SCHEMA_ID, "_columns", sys_dir + "/" + SYS_SUBDIR_COLUMNS, 0, 0)
+    _append_table_record(tables_batch, tables_schema, SYS_TABLE_INDICES, SYSTEM_SCHEMA_ID, "_indices", sys_dir + "/" + SYS_SUBDIR_INDICES, 0, 0)
+    _append_table_record(tables_batch, tables_schema, SYS_TABLE_VIEW_DEPS, SYSTEM_SCHEMA_ID, "_view_deps", sys_dir + "/" + SYS_SUBDIR_VIEW_DEPS, 0, 0)
+    _append_table_record(tables_batch, tables_schema, SYS_TABLE_SEQUENCES, SYSTEM_SCHEMA_ID, "_sequences", sys_dir + "/" + SYS_SUBDIR_SEQUENCES, 0, 0)
     sys_tables.tables.ingest_batch(tables_batch)
     tables_batch.free()
 
     # 3. Column records
     cols_batch = ZSetBatch(cols_schema)
-
-    def _cols_for(table_id, column_defs):
-        for i in range(len(column_defs)):
-            col_name, field_type = column_defs[i]
-            _append_column_record(
-                cols_batch, cols_schema, table_id, OWNER_KIND_TABLE, i, col_name, field_type.code, 0, 0, 0
-            )
-
-    _cols_for(SYS_TABLE_SCHEMAS, [("schema_id", TYPE_U64), ("name", TYPE_STRING)])
-    _cols_for(
-        SYS_TABLE_TABLES,
-        [
-            ("table_id", TYPE_U64),
-            ("schema_id", TYPE_U64),
-            ("name", TYPE_STRING),
-            ("directory", TYPE_STRING),
-            ("pk_col_idx", TYPE_U64),
-            ("created_lsn", TYPE_U64),
-        ],
-    )
-    _cols_for(
-        SYS_TABLE_VIEWS,
-        [
-            ("view_id", TYPE_U64),
-            ("schema_id", TYPE_U64),
-            ("name", TYPE_STRING),
-            ("sql_definition", TYPE_STRING),
-            ("cache_directory", TYPE_STRING),
-            ("created_lsn", TYPE_U64),
-        ],
-    )
-    _cols_for(
-        SYS_TABLE_COLUMNS,
-        [
-            ("column_id", TYPE_U64),
-            ("owner_id", TYPE_U64),
-            ("owner_kind", TYPE_U64),
-            ("col_idx", TYPE_U64),
-            ("name", TYPE_STRING),
-            ("type_code", TYPE_U64),
-            ("is_nullable", TYPE_U64),
-            ("fk_table_id", TYPE_U64),
-            ("fk_col_idx", TYPE_U64),
-        ],
-    )
-    _cols_for(
-        SYS_TABLE_INDICES,
-        [
-            ("index_id", TYPE_U64),
-            ("owner_id", TYPE_U64),
-            ("owner_kind", TYPE_U64),
-            ("source_col_idx", TYPE_U64),
-            ("name", TYPE_STRING),
-            ("is_unique", TYPE_U64),
-            ("cache_directory", TYPE_STRING),
-        ],
-    )
-    _cols_for(
-        SYS_TABLE_VIEW_DEPS, [("dep_id", TYPE_U64), ("view_id", TYPE_U64), ("dep_view_id", TYPE_U64), ("dep_table_id", TYPE_U64)]
-    )
-    _cols_for(SYS_TABLE_SEQUENCES, [("seq_id", TYPE_U64), ("next_val", TYPE_U64)])
+    
+    _append_system_cols(cols_batch, cols_schema, SYS_TABLE_SCHEMAS, [("schema_id", TYPE_U64), ("name", TYPE_STRING)])
+    _append_system_cols(cols_batch, cols_schema, SYS_TABLE_TABLES, [
+        ("table_id", TYPE_U64), ("schema_id", TYPE_U64), ("name", TYPE_STRING),
+        ("directory", TYPE_STRING), ("pk_col_idx", TYPE_U64), ("created_lsn", TYPE_U64)
+    ])
+    _append_system_cols(cols_batch, cols_schema, SYS_TABLE_VIEWS, [
+        ("view_id", TYPE_U64), ("schema_id", TYPE_U64), ("name", TYPE_STRING),
+        ("sql_definition", TYPE_STRING), ("cache_directory", TYPE_STRING), ("created_lsn", TYPE_U64)
+    ])
+    _append_system_cols(cols_batch, cols_schema, SYS_TABLE_COLUMNS, [
+        ("column_id", TYPE_U64), ("owner_id", TYPE_U64), ("owner_kind", TYPE_U64),
+        ("col_idx", TYPE_U64), ("name", TYPE_STRING), ("type_code", TYPE_U64),
+        ("is_nullable", TYPE_U64), ("fk_table_id", TYPE_U64), ("fk_col_idx", TYPE_U64)
+    ])
+    _append_system_cols(cols_batch, cols_schema, SYS_TABLE_INDICES, [
+        ("index_id", TYPE_U64), ("owner_id", TYPE_U64), ("owner_kind", TYPE_U64),
+        ("source_col_idx", TYPE_U64), ("name", TYPE_STRING), ("is_unique", TYPE_U64),
+        ("cache_directory", TYPE_STRING)
+    ])
+    _append_system_cols(cols_batch, cols_schema, SYS_TABLE_VIEW_DEPS, [
+        ("dep_id", TYPE_U64), ("view_id", TYPE_U64), ("dep_view_id", TYPE_U64), ("dep_table_id", TYPE_U64)
+    ])
+    _append_system_cols(cols_batch, cols_schema, SYS_TABLE_SEQUENCES, [
+        ("seq_id", TYPE_U64), ("next_val", TYPE_U64)
+    ])
 
     sys_tables.columns.ingest_batch(cols_batch)
     cols_batch.free()
 
-    # 4. Sequence high-water marks (Self-description complete)
+    # 4. Sequence high-water marks
     seq_batch = ZSetBatch(seq_schema)
     row = make_payload_row(seq_schema)
     row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(FIRST_USER_SCHEMA_ID - 1)))

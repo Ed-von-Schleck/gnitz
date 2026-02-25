@@ -95,7 +95,12 @@ class ArenaZSetBatch(object):
 
     def __init__(self, schema, initial_capacity=1024):
         self._schema = schema
-        self.record_stride = BATCH_HEADER_SIZE + schema.memtable_stride
+        raw_stride = BATCH_HEADER_SIZE + schema.memtable_stride
+        
+        # CRITICAL FIX: Align the stride to 16 bytes.
+        # This ensures that _get_rec_ptr (which uses i * stride) perfectly 
+        # matches the physical memory layout produced by alloc(alignment=16).
+        self.record_stride = (raw_stride + 15) & ~15
 
         self.primary_arena = buffer.Buffer(initial_capacity * self.record_stride)
         self.blob_arena = buffer.Buffer(initial_capacity * 64)
