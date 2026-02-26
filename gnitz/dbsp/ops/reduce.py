@@ -417,6 +417,7 @@ def op_reduce(
             # Non-linear: must replay full history plus the current delta.
             # trace_in_cursor must be non-None when this branch is reachable.
             agg_func.reset()
+            assert trace_in_cursor is not None
             trace_in_cursor.seek(group_key)
             while trace_in_cursor.is_valid() and trace_in_cursor.key() == group_key:
                 agg_func.step(trace_in_cursor.get_accessor(), trace_in_cursor.weight())

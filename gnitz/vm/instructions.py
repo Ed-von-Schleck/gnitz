@@ -5,9 +5,15 @@ from rpython.rlib import jit
 class Instruction(object):
     """
     Base class for all VM instructions.
-    Opcodes are used by the Interpreter's dispatch loop.
+    Standardized layout ensures the RPython annotator can resolve attributes
+    during dispatch loops.
     """
-    _immutable_fields_ = ['opcode']
+    _immutable_fields_ = [
+        'opcode', 'reg_in', 'reg_out', 'func', 'reg_in_a', 'reg_in_b',
+        'reg_history', 'reg_delta', 'reg_trace', 'target_table',
+        'reg_a', 'reg_b', 'reg_trace_in', 'reg_trace_out',
+        'group_by_cols', 'agg_func', 'output_schema'
+    ]
     
     HALT             = 0
     FILTER           = 1
@@ -23,9 +29,25 @@ class Instruction(object):
 
     def __init__(self, opcode):
         self.opcode = opcode
+        # Standardized attribute file initialized to None
+        self.reg_in = None
+        self.reg_out = None
+        self.func = None
+        self.reg_in_a = None
+        self.reg_in_b = None
+        self.reg_history = None
+        self.reg_delta = None
+        self.reg_trace = None
+        self.target_table = None
+        self.reg_a = None
+        self.reg_b = None
+        self.reg_trace_in = None
+        self.reg_trace_out = None
+        self.group_by_cols = None
+        self.agg_func = None
+        self.output_schema = None
 
 class FilterOp(Instruction):
-    _immutable_fields_ = ['reg_in', 'reg_out', 'func']
     def __init__(self, reg_in, reg_out, func):
         Instruction.__init__(self, self.FILTER)
         self.reg_in = reg_in
@@ -33,7 +55,6 @@ class FilterOp(Instruction):
         self.func = func
 
 class MapOp(Instruction):
-    _immutable_fields_ = ['reg_in', 'reg_out', 'func']
     def __init__(self, reg_in, reg_out, func):
         Instruction.__init__(self, self.MAP)
         self.reg_in = reg_in
@@ -41,14 +62,12 @@ class MapOp(Instruction):
         self.func = func
 
 class NegateOp(Instruction):
-    _immutable_fields_ = ['reg_in', 'reg_out']
     def __init__(self, reg_in, reg_out):
         Instruction.__init__(self, self.NEGATE)
         self.reg_in = reg_in
         self.reg_out = reg_out
 
 class UnionOp(Instruction):
-    _immutable_fields_ = ['reg_in_a', 'reg_in_b', 'reg_out']
     def __init__(self, reg_in_a, reg_in_b, reg_out):
         Instruction.__init__(self, self.UNION)
         self.reg_in_a = reg_in_a
@@ -56,12 +75,6 @@ class UnionOp(Instruction):
         self.reg_out = reg_out
 
 class DistinctOp(Instruction):
-    """
-    Operator to convert multiset to set semantics.
-    Internal multiset history is updated using reg_in.batch directly 
-    within the op_distinct implementation.
-    """
-    _immutable_fields_ = ['reg_in', 'reg_history', 'reg_out']
     def __init__(self, reg_in, reg_history, reg_out):
         Instruction.__init__(self, self.DISTINCT)
         self.reg_in = reg_in
@@ -69,7 +82,6 @@ class DistinctOp(Instruction):
         self.reg_out = reg_out
 
 class JoinDeltaTraceOp(Instruction):
-    _immutable_fields_ = ['reg_delta', 'reg_trace', 'reg_out']
     def __init__(self, reg_delta, reg_trace, reg_out):
         Instruction.__init__(self, self.JOIN_DELTA_TRACE)
         self.reg_delta = reg_delta
@@ -77,14 +89,12 @@ class JoinDeltaTraceOp(Instruction):
         self.reg_out = reg_out
 
 class IntegrateOp(Instruction):
-    _immutable_fields_ = ['reg_in', 'target_table']
     def __init__(self, reg_in, target_table):
         Instruction.__init__(self, self.INTEGRATE)
         self.reg_in = reg_in
         self.target_table = target_table
 
 class DelayOp(Instruction):
-    _immutable_fields_ = ['reg_in', 'reg_out']
     def __init__(self, reg_in, reg_out):
         Instruction.__init__(self, self.DELAY)
         self.reg_in = reg_in
@@ -95,7 +105,6 @@ class HaltOp(Instruction):
         Instruction.__init__(self, self.HALT)
 
 class JoinDeltaDeltaOp(Instruction):
-    _immutable_fields_ = ['reg_a', 'reg_b', 'reg_out']
     def __init__(self, reg_a, reg_b, reg_out):
         Instruction.__init__(self, self.JOIN_DELTA_DELTA)
         self.reg_a = reg_a
@@ -103,14 +112,6 @@ class JoinDeltaDeltaOp(Instruction):
         self.reg_out = reg_out
         
 class ReduceOp(Instruction):
-    """
-    Fully decomposed Reduce instruction to facilitate 
-    interpreter-based marshalling.
-    """
-    _immutable_fields_ = [
-        'reg_in', 'reg_trace_in', 'reg_trace_out', 
-        'reg_out', 'group_by_cols[*]', 'agg_func', 'output_schema'
-    ]
     def __init__(self, reg_in, reg_trace_in, reg_trace_out, reg_out, 
                  group_by_cols, agg_func, output_schema):
         Instruction.__init__(self, self.REDUCE)

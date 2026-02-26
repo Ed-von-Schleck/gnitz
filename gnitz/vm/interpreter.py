@@ -95,10 +95,11 @@ class DBSPInterpreter(object):
 
             elif opcode == instructions.Instruction.NEGATE:
                 assert isinstance(instr, instructions.NegateOp)
-                ops.op_negate(
-                    instr.reg_in.batch,
-                    instr.reg_out.batch,
-                )
+                reg_in = instr.reg_in
+                reg_out = instr.reg_out
+                assert reg_in is not None and reg_out is not None
+                assert reg_in.batch is not None and reg_out.batch is not None
+                ops.op_negate(reg_in.batch, reg_out.batch)
 
             elif opcode == instructions.Instruction.UNION:
                 assert isinstance(instr, instructions.UnionOp)
@@ -131,20 +132,23 @@ class DBSPInterpreter(object):
 
             elif opcode == instructions.Instruction.JOIN_DELTA_DELTA:
                 assert isinstance(instr, instructions.JoinDeltaDeltaOp)
+                reg_a = instr.reg_a
+                reg_b = instr.reg_b
+                reg_out = instr.reg_out
+                assert reg_a is not None and reg_b is not None and reg_out is not None
+                assert reg_a.batch is not None and reg_b.batch is not None and reg_out.batch is not None
                 ops.op_join_delta_delta(
-                    instr.reg_a.batch,
-                    instr.reg_b.batch,
-                    instr.reg_out.batch,
-                    instr.reg_a.vm_schema.table_schema,
-                    instr.reg_b.vm_schema.table_schema,
+                    reg_a.batch, reg_b.batch, reg_out.batch,
+                    reg_a.vm_schema.table_schema, reg_b.vm_schema.table_schema
                 )
 
             elif opcode == instructions.Instruction.DELAY:
                 assert isinstance(instr, instructions.DelayOp)
-                ops.op_delay(
-                    instr.reg_in.batch,
-                    instr.reg_out.batch,
-                )
+                reg_in = instr.reg_in
+                reg_out = instr.reg_out
+                assert reg_in is not None and reg_out is not None
+                assert reg_in.batch is not None and reg_out.batch is not None
+                ops.op_delay(reg_in.batch, reg_out.batch)
 
             elif opcode == instructions.Instruction.INTEGRATE:
                 assert isinstance(instr, instructions.IntegrateOp)
