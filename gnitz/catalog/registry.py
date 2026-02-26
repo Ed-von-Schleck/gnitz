@@ -4,7 +4,22 @@ from rpython.rlib.objectmodel import newlist_hint
 from gnitz.catalog.system_tables import (
     FIRST_USER_SCHEMA_ID,
     FIRST_USER_TABLE_ID,
+    FIRST_USER_INDEX_ID,
 )
+from gnitz.core.errors import LayoutError, MemTableFullError
+
+
+def _ingest_into_index(circuit, idx_batch):
+    """
+    Internal helper to handle index ingestion.
+    In translated mode, EphemeralTable may raise MemTableFullError,
+    requiring a flush before retrying the ingestion.
+    """
+    try:
+        circuit.table.ingest_batch(idx_batch)
+    except MemTableFullError:
+        circuit.table.flush()
+        circuit.table.ingest_batch(idx_batch)
 
 
 class SystemTables(object):
@@ -34,9 +49,8 @@ class SystemTables(object):
 
 class TableFamily(object):
     """
-    A logical table entity. Phase A is a thin wrapper around a single 
-    PersistentTable, but carries the metadata required to emit exact 
-    Z-Set retractions during DROP TABLE operations.
+    A logical table entity. Manages a primary PersistentTable and
+    a collection of soft-state secondary indices.
     """
 
     _immutable_fields_ = [
@@ -66,9 +80,11 @@ class TableFamily(object):
         self.schema_id = schema_id
         self.directory = directory
         self.pk_col_idx = pk_col_idx
-        self.created_lsn = 0  # Phase A: logic for LSN tracking is deferred
+        self.created_lsn = 0
         self.primary = primary  # PersistentTable
         self.schema = primary.schema
+        # Soft-state secondary indices
+        self.index_circuits = newlist_hint(4)
 
     def get_schema(self):
         return self.schema
@@ -77,19 +93,34 @@ class TableFamily(object):
         return self.primary.create_cursor()
 
     def ingest_batch(self, batch):
+        """
+        Durable ingestion into primary table followed by soft-state
+        fan-out to all registered secondary indices.
+        """
         self.primary.ingest_batch(batch)
 
+        n = len(self.index_circuits)
+        for i in range(n):
+            circuit = self.index_circuits[i]
+            idx_batch = circuit.compute_index_delta(batch)
+            if not idx_batch.is_empty():
+                _ingest_into_index(circuit, idx_batch)
+            idx_batch.free()
+
     def flush(self):
+        # Flushing primary is sufficient for hard-state durability.
         return self.primary.flush()
 
     def close(self):
         self.primary.close()
+        for circuit in self.index_circuits:
+            circuit.close()
 
 
 class EntityRegistry(object):
     """
     Central directory for mapping names and IDs to catalog entities.
-    Tracks schema and table ID sequences to prevent collisions.
+    Tracks schema, table, and index ID sequences to prevent collisions.
     """
 
     def __init__(self):
@@ -102,16 +133,20 @@ class EntityRegistry(object):
         # Schema_id (int) -> schema name
         self._schema_id_to_name = {}
 
+        # Index Tracking
+        self._index_by_name = {}  # str -> IndexCircuit
+        self._index_by_id = {}  # int -> IndexCircuit
+
         # ID allocators
         self._next_schema_id = FIRST_USER_SCHEMA_ID
         self._next_table_id = FIRST_USER_TABLE_ID
+        self._next_index_id = FIRST_USER_INDEX_ID
 
     # ── Schema management ────────────────────────────────────────────────
 
     def register_schema(self, schema_id, name):
         self._schema_name_to_id[name] = schema_id
         self._schema_id_to_name[schema_id] = name
-        # Keep counter ahead of known IDs to support restarts
         if schema_id >= self._next_schema_id:
             self._next_schema_id = schema_id + 1
 
@@ -125,7 +160,6 @@ class EntityRegistry(object):
         return name in self._schema_name_to_id
 
     def get_schema_id(self, name):
-        # RPython: explicit check instead of .get(k, default) for type proof
         if name in self._schema_name_to_id:
             return self._schema_name_to_id[name]
         return -1
@@ -146,7 +180,6 @@ class EntityRegistry(object):
         qualified = family.schema_name + "." + family.table_name
         self._by_name[qualified] = family
         self._by_id[family.table_id] = family
-        # Advance counter if this ID is >= current pointer
         if family.table_id >= self._next_table_id:
             self._next_table_id = family.table_id + 1
 
@@ -179,12 +212,47 @@ class EntityRegistry(object):
         return tid
 
     def schema_is_empty(self, schema_name):
-        """
-        Returns True if no TableFamily exists in this schema.
-        Iterates over keys; safe in Phase A (single-threaded).
-        """
         for k in self._by_name:
             family = self._by_name[k]
             if family.schema_name == schema_name:
                 return False
         return True
+
+    # ── Index management ─────────────────────────────────────────────────
+
+    def allocate_index_id(self):
+        iid = self._next_index_id
+        self._next_index_id += 1
+        return iid
+
+    def register_index(self, index_id, name, circuit):
+        self._index_by_name[name] = circuit
+        self._index_by_id[index_id] = circuit
+        if index_id >= self._next_index_id:
+            self._next_index_id = index_id + 1
+
+    def unregister_index(self, name, index_id):
+        if name in self._index_by_name:
+            del self._index_by_name[name]
+        if index_id in self._index_by_id:
+            del self._index_by_id[index_id]
+
+    def has_index_by_name(self, name):
+        return name in self._index_by_name
+
+    def get_index_by_name(self, name):
+        if name in self._index_by_name:
+            return self._index_by_name[name]
+        raise LayoutError("Index does not exist: %s" % name)
+
+    def is_joinable(self, owner_id, col_idx):
+        """Returns True if col_idx is the PK or has a secondary index."""
+        if not self.has_id(owner_id):
+            return False
+        family = self.get_by_id(owner_id)
+        if col_idx == family.schema.pk_index:
+            return True
+        for circuit in family.index_circuits:
+            if circuit.source_col_idx == col_idx:
+                return True
+        return False

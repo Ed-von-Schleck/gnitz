@@ -113,7 +113,7 @@ def test_bootstrap(base_dir):
 
         # 4. Check Sequences (2 expected)
         c = _count_records(engine.sys.sequences)
-        if c != 2:
+        if c != 3:
             raise Exception("Expected 2 sequences, got %d" % c)
 
         # 5. Check Registry State

@@ -39,6 +39,10 @@ FIRST_USER_TABLE_ID = 8
 # --- Sequence IDs for internal allocators ---
 SEQ_ID_SCHEMAS = 1
 SEQ_ID_TABLES = 2
+SEQ_ID_INDICES = 3
+
+# --- First user-assigned IDs ---
+FIRST_USER_INDEX_ID = 1
 
 # --- Owner Kind Values ---
 OWNER_KIND_TABLE = 0
@@ -83,7 +87,9 @@ def make_views_schema():
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
     cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
-    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="sql_definition"))
+    cols.append(
+        ColumnDefinition(TYPE_STRING, is_nullable=False, name="sql_definition")
+    )
     cols.append(
         ColumnDefinition(TYPE_STRING, is_nullable=False, name="cache_directory")
     )
@@ -113,7 +119,9 @@ def make_indices_schema():
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="source_col_idx"))
     cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="is_unique"))
-    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="cache_directory"))
+    cols.append(
+        ColumnDefinition(TYPE_STRING, is_nullable=False, name="cache_directory")
+    )
     return TableSchema(cols, pk_index=0)
 
 
