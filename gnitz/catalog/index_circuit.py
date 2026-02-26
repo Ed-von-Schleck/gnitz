@@ -95,6 +95,22 @@ def promote_to_index_key(accessor, col_idx, source_col_type):
         return r_uint128(rffi.cast(rffi.ULONGLONG, signed_64))
 
     raise LayoutError("Cannot promote column type %d to index key" % code)
+    
+    
+def make_fk_index_name(schema_name, table_name, col_name):
+    """
+    Computes the auto-generated name for a Foreign Key index.
+    Convention: schema__table__fk_column
+    """
+    return schema_name + "__" + table_name + "__fk_" + col_name
+
+
+def make_secondary_index_name(schema_name, table_name, col_name):
+    """
+    Computes the auto-generated name for a standard secondary index.
+    Convention: schema__table__idx_column
+    """
+    return schema_name + "__" + table_name + "__idx_" + col_name
 
 
 class IndexCircuit(object):

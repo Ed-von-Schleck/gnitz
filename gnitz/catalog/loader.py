@@ -1,6 +1,11 @@
 # gnitz/catalog/loader.py
 
-from rpython.rlib.rarithmetic import r_uint64, r_int64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import (
+    r_uint64,
+    r_int64,
+    r_ulonglonglong as r_uint128,
+    intmask,
+)
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi
 
@@ -44,7 +49,11 @@ from gnitz.catalog.system_tables import (
     pack_column_id,
     type_code_to_field_type,
 )
-from gnitz.catalog.registry import SystemTables, TableFamily
+from gnitz.catalog.registry import (
+    SystemTables,
+    TableFamily,
+    _wire_fk_constraints_for_family,
+)
 from gnitz.catalog.system_records import (
     _read_string,
     _append_schema_record,
@@ -64,19 +73,35 @@ def _create_sys_table(sys_dir, subdir, name, schema, table_id):
 def _make_system_tables(sys_dir):
     return SystemTables(
         schemas=_create_sys_table(
-            sys_dir, SYS_SUBDIR_SCHEMAS, "_schemas", make_schemas_schema(), SYS_TABLE_SCHEMAS
+            sys_dir,
+            SYS_SUBDIR_SCHEMAS,
+            "_schemas",
+            make_schemas_schema(),
+            SYS_TABLE_SCHEMAS,
         ),
         tables=_create_sys_table(
-            sys_dir, SYS_SUBDIR_TABLES, "_tables", make_tables_schema(), SYS_TABLE_TABLES
+            sys_dir,
+            SYS_SUBDIR_TABLES,
+            "_tables",
+            make_tables_schema(),
+            SYS_TABLE_TABLES,
         ),
         views=_create_sys_table(
             sys_dir, SYS_SUBDIR_VIEWS, "_views", make_views_schema(), SYS_TABLE_VIEWS
         ),
         columns=_create_sys_table(
-            sys_dir, SYS_SUBDIR_COLUMNS, "_columns", make_columns_schema(), SYS_TABLE_COLUMNS
+            sys_dir,
+            SYS_SUBDIR_COLUMNS,
+            "_columns",
+            make_columns_schema(),
+            SYS_TABLE_COLUMNS,
         ),
         indices=_create_sys_table(
-            sys_dir, SYS_SUBDIR_INDICES, "_indices", make_indices_schema(), SYS_TABLE_INDICES
+            sys_dir,
+            SYS_SUBDIR_INDICES,
+            "_indices",
+            make_indices_schema(),
+            SYS_TABLE_INDICES,
         ),
         view_deps=_create_sys_table(
             sys_dir,
@@ -224,9 +249,15 @@ def _bootstrap_system_tables(sys_tables, base_dir):
 
     # 4. Sequence high-water marks
     seq_batch = ZSetBatch(seq_schema)
-    _append_sequence_record(seq_batch, seq_schema, SEQ_ID_SCHEMAS, FIRST_USER_SCHEMA_ID - 1)
-    _append_sequence_record(seq_batch, seq_schema, SEQ_ID_TABLES, FIRST_USER_TABLE_ID - 1)
-    _append_sequence_record(seq_batch, seq_schema, SEQ_ID_INDICES, FIRST_USER_INDEX_ID - 1)
+    _append_sequence_record(
+        seq_batch, seq_schema, SEQ_ID_SCHEMAS, FIRST_USER_SCHEMA_ID - 1
+    )
+    _append_sequence_record(
+        seq_batch, seq_schema, SEQ_ID_TABLES, FIRST_USER_TABLE_ID - 1
+    )
+    _append_sequence_record(
+        seq_batch, seq_schema, SEQ_ID_INDICES, FIRST_USER_INDEX_ID - 1
+    )
 
     sys_tables.sequences.ingest_batch(seq_batch)
     seq_batch.free()
@@ -254,9 +285,21 @@ def _read_column_defs(cols_pt, owner_id):
         col_name = _read_string(acc, 4)
         type_code = intmask(acc.get_int(5))
         is_nullable_val = intmask(acc.get_int(6))
+        # Recover Foreign Key metadata
+        fk_table_id = intmask(acc.get_int(7))
+        fk_col_idx = intmask(acc.get_int(8))
+
         field_type = type_code_to_field_type(type_code)
         is_nullable = is_nullable_val != 0
-        col_defs.append(ColumnDefinition(field_type, is_nullable=is_nullable, name=col_name))
+        col_defs.append(
+            ColumnDefinition(
+                field_type,
+                is_nullable=is_nullable,
+                name=col_name,
+                fk_table_id=fk_table_id,
+                fk_col_idx=fk_col_idx,
+            )
+        )
         cursor.advance()
 
     cursor.close()
@@ -265,7 +308,9 @@ def _read_column_defs(cols_pt, owner_id):
 
 def _register_system_table(registry, pt, tbl_name, table_id, subdir, sys_dir):
     directory = sys_dir + "/" + subdir
-    family = TableFamily("_system", tbl_name, table_id, SYSTEM_SCHEMA_ID, directory, 0, pt)
+    family = TableFamily(
+        "_system", tbl_name, table_id, SYSTEM_SCHEMA_ID, directory, 0, pt
+    )
     registry.register(family)
 
 
@@ -283,19 +328,39 @@ def _rebuild_registry(sys_tables, base_dir, registry):
     # 2. System Table Families
     sys_dir = base_dir + "/" + SYS_CATALOG_DIRNAME
     _register_system_table(
-        registry, sys_tables.schemas, "_schemas", SYS_TABLE_SCHEMAS, SYS_SUBDIR_SCHEMAS, sys_dir
+        registry,
+        sys_tables.schemas,
+        "_schemas",
+        SYS_TABLE_SCHEMAS,
+        SYS_SUBDIR_SCHEMAS,
+        sys_dir,
     )
     _register_system_table(
-        registry, sys_tables.tables, "_tables", SYS_TABLE_TABLES, SYS_SUBDIR_TABLES, sys_dir
+        registry,
+        sys_tables.tables,
+        "_tables",
+        SYS_TABLE_TABLES,
+        SYS_SUBDIR_TABLES,
+        sys_dir,
     )
     _register_system_table(
         registry, sys_tables.views, "_views", SYS_TABLE_VIEWS, SYS_SUBDIR_VIEWS, sys_dir
     )
     _register_system_table(
-        registry, sys_tables.columns, "_columns", SYS_TABLE_COLUMNS, SYS_SUBDIR_COLUMNS, sys_dir
+        registry,
+        sys_tables.columns,
+        "_columns",
+        SYS_TABLE_COLUMNS,
+        SYS_SUBDIR_COLUMNS,
+        sys_dir,
     )
     _register_system_table(
-        registry, sys_tables.indices, "_indices", SYS_TABLE_INDICES, SYS_SUBDIR_INDICES, sys_dir
+        registry,
+        sys_tables.indices,
+        "_indices",
+        SYS_TABLE_INDICES,
+        SYS_SUBDIR_INDICES,
+        sys_dir,
     )
     _register_system_table(
         registry,
@@ -342,7 +407,9 @@ def _rebuild_registry(sys_tables, base_dir, registry):
     if not found_indices_seq:
         seq_schema_m = sys_tables.sequences.schema
         mig_batch = ZSetBatch(seq_schema_m)
-        _append_sequence_record(mig_batch, seq_schema_m, SEQ_ID_INDICES, FIRST_USER_INDEX_ID - 1)
+        _append_sequence_record(
+            mig_batch, seq_schema_m, SEQ_ID_INDICES, FIRST_USER_INDEX_ID - 1
+        )
         sys_tables.sequences.ingest_batch(mig_batch)
         mig_batch.free()
         registry._next_index_id = FIRST_USER_INDEX_ID
@@ -363,10 +430,18 @@ def _rebuild_registry(sys_tables, base_dir, registry):
             pt = PersistentTable(directory, tbl_name, tbl_schema, table_id=tid)
 
             schema_name = registry.get_schema_name(sid)
-            family = TableFamily(schema_name, tbl_name, tid, sid, directory, pk_col_idx, pt)
+            family = TableFamily(
+                schema_name, tbl_name, tid, sid, directory, pk_col_idx, pt
+            )
             registry.register(family)
         cursor.advance()
     cursor.close()
+
+    # Pass 4b: Wire Foreign Key constraints now that all user families are registered.
+    for k in registry._by_name:
+        family = registry._by_name[k]
+        if family.table_id >= FIRST_USER_TABLE_ID:
+            _wire_fk_constraints_for_family(family, registry)
 
     # 5. User Table Indices (soft state rebuild from source)
     idx_cursor = sys_tables.indices.create_cursor()

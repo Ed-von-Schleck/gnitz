@@ -26,9 +26,13 @@ from gnitz.catalog.system_tables import (
     SEQ_ID_INDICES,
     SYS_CATALOG_DIRNAME,
 )
-from gnitz.catalog.registry import TableFamily, EntityRegistry
+from gnitz.catalog.registry import (
+    TableFamily,
+    EntityRegistry,
+    _wire_fk_constraints_for_family,
+)
 from gnitz.catalog.system_records import (
-    _read_string,  # Re-exported for API elegance
+    _read_string,
     _append_schema_record,
     _retract_schema_record,
     _append_table_record,
@@ -44,6 +48,8 @@ from gnitz.catalog.index_circuit import (
     get_index_key_type,
     _make_index_circuit,
     _backfill_index,
+    make_fk_index_name,
+    make_secondary_index_name,
 )
 from gnitz.catalog.loader import (
     _make_system_tables,
@@ -57,9 +63,6 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     Public factory to open a GnitzDB instance.
     Handles directory creation, bootstrapping, and metadata recovery.
     """
-    if not r_uint64(0):  # RPython hint for path strings
-        pass
-
     _ensure_dir(base_dir)
     sys_dir = base_dir + "/" + SYS_CATALOG_DIRNAME
     is_new = not os_path_exists(sys_dir)
@@ -104,6 +107,50 @@ def _remove_circuit_from_family(circuit, family):
         if c.index_id != circuit.index_id:
             new_list.append(c)
     family.index_circuits = new_list
+
+
+def _validate_fk_column(
+    col, col_idx, registry, self_table_id=0, self_pk_index=0, self_pk_type=None
+):
+    """
+    Validates a single ColumnDefinition's FK annotation.
+    Raises LayoutError if any constraint is violated.
+    """
+    if col.fk_table_id == 0:
+        return
+
+    # Resolve target: Self-referential or external
+    if col.fk_table_id == self_table_id:
+        target_pk_index = self_pk_index
+        target_pk_type = self_pk_type
+        target_name = "<self>"
+    else:
+        if not registry.has_id(col.fk_table_id):
+            raise LayoutError(
+                "FK on column '%s' (idx %d) references unknown table_id %d"
+                % (col.name, col_idx, col.fk_table_id)
+            )
+        target_family = registry.get_by_id(col.fk_table_id)
+        target_pk_index = target_family.schema.pk_index
+        target_pk_type = target_family.schema.get_pk_column().field_type
+        target_name = target_family.table_name
+
+    # FK must target the Primary Key column
+    if col.fk_col_idx != target_pk_index:
+        raise LayoutError(
+            "FK on column '%s' must reference the PK column of target table '%s'"
+            % (col.name, target_name)
+        )
+
+    # Promoted FK key type must match target PK type (e.g. U32 promotes to U64)
+    # get_index_key_type raises LayoutError for floats or strings.
+    promoted_type = get_index_key_type(col.field_type)
+    if promoted_type.code != target_pk_type.code:
+        raise LayoutError(
+            "FK column '%s' promoted type (code %d) is incompatible with "
+            "target PK type (code %d)"
+            % (col.name, promoted_type.code, target_pk_type.code)
+        )
 
 
 class Engine(object):
@@ -152,11 +199,24 @@ class Engine(object):
         if self.registry.has(schema_name, table_name):
             raise LayoutError("Table already exists: %s" % qualified_name)
 
-        schema_dir = self.base_dir + "/" + schema_name
-        _ensure_dir(schema_dir)
-
+        # Pre-allocate ID to allow self-referential FK validation
         tid = self.registry.allocate_table_id()
         sid = self.registry.get_schema_id(schema_name)
+
+        # Validate all columns (including FK constraints)
+        self_pk_type = columns[pk_col_idx].field_type
+        for col_idx in range(len(columns)):
+            _validate_fk_column(
+                columns[col_idx],
+                col_idx,
+                self.registry,
+                self_table_id=tid,
+                self_pk_index=pk_col_idx,
+                self_pk_type=self_pk_type,
+            )
+
+        schema_dir = self.base_dir + "/" + schema_name
+        _ensure_dir(schema_dir)
         directory = schema_dir + "/" + table_name + "_" + str(tid)
 
         tbl_schema = TableSchema(columns, pk_col_idx)
@@ -172,6 +232,13 @@ class Engine(object):
             schema_name, table_name, tid, sid, directory, pk_col_idx, pt
         )
         self.registry.register(family)
+
+        # Auto-create indices for FK columns
+        self._create_fk_indices_for_family(family)
+
+        # Wire constraints into the memory model
+        _wire_fk_constraints_for_family(family, self.registry)
+
         return family
 
     def drop_table(self, qualified_name):
@@ -184,9 +251,26 @@ class Engine(object):
 
         family = self.registry.get(schema_name, table_name)
         tid = family.table_id
+
+        # Protect against referenced Foreign Keys (Phase C Step 8)
+        for k in self.registry._by_name:
+            referencing = self.registry._by_name[k]
+            if referencing.table_id == tid:
+                continue
+            for col in referencing.schema.columns:
+                if col.fk_table_id == tid:
+                    raise LayoutError(
+                        "Cannot drop table '%s': table '%s.%s' has a foreign key referencing it"
+                        % (
+                            qualified_name,
+                            referencing.schema_name,
+                            referencing.table_name,
+                        )
+                    )
+
         tbl_schema = family.schema
 
-        # 1. Drop all secondary indices first (retract records + free circuits)
+        # 1. Drop indices (including FK-implied ones)
         circuits_to_drop = newlist_hint(len(family.index_circuits))
         for c in family.index_circuits:
             circuits_to_drop.append(c)
@@ -252,7 +336,8 @@ class Engine(object):
             if existing.source_col_idx == col_idx:
                 raise LayoutError("Index already exists on this column")
 
-        index_name = schema_name + "__" + table_name + "__idx_" + col_name
+        # Refactored for naming consistency (Phase C Step 4)
+        index_name = make_secondary_index_name(schema_name, table_name, col_name)
         if self.registry.has_index_by_name(index_name):
             raise LayoutError("Index name collision: %s" % index_name)
 
@@ -289,8 +374,72 @@ class Engine(object):
 
         return circuit
 
+    def _create_fk_indices_for_family(self, family):
+        """
+        Auto-creates indices for all Foreign Key columns (Phase C Step 6).
+        Called during create_table.
+        """
+        schema_name = family.schema_name
+        table_name = family.table_name
+        columns = family.schema.columns
+
+        for col_idx in range(len(columns)):
+            col = columns[col_idx]
+            if col.fk_table_id == 0 or col_idx == family.schema.pk_index:
+                continue
+
+            index_name = make_fk_index_name(schema_name, table_name, col.name)
+
+            # Avoid duplication if a user index already exists
+            already_exists = False
+            for existing in family.index_circuits:
+                if existing.source_col_idx == col_idx:
+                    already_exists = True
+                    break
+            if already_exists:
+                continue
+
+            index_id = self.registry.allocate_index_id()
+            source_pk_type = family.schema.get_pk_column().field_type
+            idx_dir = family.directory + "/idx_" + str(index_id)
+
+            circuit = _make_index_circuit(
+                index_id,
+                family.table_id,
+                col_idx,
+                col.field_type,
+                source_pk_type,
+                idx_dir,
+                index_name,
+                False,  # is_unique = False
+                "",
+            )
+            _backfill_index(circuit, family)
+
+            self._write_index_record(
+                index_id,
+                family.table_id,
+                OWNER_KIND_TABLE,
+                col_idx,
+                index_name,
+                0,  # is_unique = False
+                "",
+            )
+            self._advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id)
+
+            family.index_circuits.append(circuit)
+            self.registry.register_index(index_id, index_name, circuit)
+
     def drop_index(self, index_name):
         circuit = self.registry.get_index_by_name(index_name)
+        
+        # Guard against manual drop of auto-generated FK indices (Phase C Step 11)
+        if "__fk_" in index_name:
+            raise LayoutError(
+                "Index '%s' is FK-implied and cannot be dropped directly. "
+                "Drop the referencing table or its FK column instead." % index_name
+            )
+
         family = self.registry.get_by_id(circuit.owner_id)
 
         self._retract_index_record(
@@ -377,8 +526,8 @@ class Engine(object):
                 col.name,
                 col.field_type.code,
                 int(col.is_nullable),
-                0,
-                0,
+                col.fk_table_id,
+                col.fk_col_idx,
             )
         self.sys.columns.ingest_batch(batch)
         batch.free()
@@ -397,8 +546,8 @@ class Engine(object):
                 col.name,
                 col.field_type.code,
                 int(col.is_nullable),
-                0,
-                0,
+                col.fk_table_id,
+                col.fk_col_idx,
             )
         self.sys.columns.ingest_batch(batch)
         batch.free()

@@ -29,12 +29,25 @@ TYPE_U128 = FieldType(12, 16, 16)
 
 
 class ColumnDefinition(object):
-    _immutable_fields_ = ["field_type", "is_nullable", "name"]
+    _immutable_fields_ = [
+        "field_type",
+        "is_nullable",
+        "name",
+        "fk_table_id",
+        "fk_col_idx",
+    ]
 
-    def __init__(self, field_type, is_nullable=False, name=""):
+    def __init__(
+        self, field_type, is_nullable=False, name="", fk_table_id=0, fk_col_idx=0
+    ):
         self.field_type = field_type
         self.is_nullable = is_nullable
         self.name = name
+        # Foreign Key Metadata
+        # fk_table_id: 0 = No FK, >0 = referenced table_id
+        self.fk_table_id = fk_table_id
+        # fk_col_idx: Index of the PK column in the target table
+        self.fk_col_idx = fk_col_idx
 
 
 def _align(offset, alignment):

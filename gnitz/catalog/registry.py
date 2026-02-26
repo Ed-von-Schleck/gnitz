@@ -1,12 +1,16 @@
 # gnitz/catalog/registry.py
 
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
+from rpython.rtyper.lltypesystem import rffi
+
 from gnitz.catalog.system_tables import (
     FIRST_USER_SCHEMA_ID,
     FIRST_USER_TABLE_ID,
     FIRST_USER_INDEX_ID,
 )
 from gnitz.core.errors import LayoutError, MemTableFullError
+from gnitz.catalog.index_circuit import promote_to_index_key
 
 
 def _ingest_into_index(circuit, idx_batch):
@@ -20,6 +24,44 @@ def _ingest_into_index(circuit, idx_batch):
     except MemTableFullError:
         circuit.table.flush()
         circuit.table.ingest_batch(idx_batch)
+
+
+def _wire_fk_constraints_for_family(family, registry):
+    """
+    Iterates all FK columns of `family` and wires active FKConstraint objects.
+    Self-referential FKs are handled: if fk_table_id == family.table_id, the
+    target is family itself.
+    Called after the family and all its potential FK targets are registered.
+    """
+    columns = family.schema.columns
+    for col_idx in range(len(columns)):
+        col = columns[col_idx]
+        if col.fk_table_id == 0:
+            continue
+        if col.fk_table_id == family.table_id:
+            target_family = family  # Self-referential FK.
+        elif registry.has_id(col.fk_table_id):
+            target_family = registry.get_by_id(col.fk_table_id)
+        else:
+            # Orphaned FK annotation: target was dropped. Skip silently;
+            # the drop_table guard prevents this in normal operation.
+            continue
+        family._add_fk_constraint(col_idx, target_family)
+
+
+class FKConstraint(object):
+    """
+    An active FK constraint on a single column of a TableFamily.
+    `target_family` is a direct reference to the referenced TableFamily.
+    Constraints are wired during create_table and _rebuild_registry; they are
+    in-memory objects derived from the persisted _system._columns records.
+    """
+
+    _immutable_fields_ = ["fk_col_idx", "target_family"]
+
+    def __init__(self, fk_col_idx, target_family):
+        self.fk_col_idx = fk_col_idx
+        self.target_family = target_family
 
 
 class SystemTables(object):
@@ -85,6 +127,15 @@ class TableFamily(object):
         self.schema = primary.schema
         # Soft-state secondary indices
         self.index_circuits = newlist_hint(4)
+        # Active Foreign Key constraints
+        self.fk_constraints = newlist_hint(0)
+
+    def _add_fk_constraint(self, col_idx, target_family):
+        """
+        Registers an active FK constraint for column `col_idx`.
+        Called once per FK column during create_table and _rebuild_registry.
+        """
+        self.fk_constraints.append(FKConstraint(col_idx, target_family))
 
     def get_schema(self):
         return self.schema
@@ -97,8 +148,56 @@ class TableFamily(object):
         Durable ingestion into primary table followed by soft-state
         fan-out to all registered secondary indices.
         """
+        # FK Enforcement Pre-commit Check
+        n_constraints = len(self.fk_constraints)
+        if n_constraints > 0:
+            n_records = batch.length()
+            for c_idx in range(n_constraints):
+                constraint = self.fk_constraints[c_idx]
+                col_idx = constraint.fk_col_idx
+                target = constraint.target_family
+
+                # Hoist cursor creation to batch-level
+                target_cursor = target.primary.create_cursor()
+                try:
+                    for i in range(n_records):
+                        weight = batch.get_weight(i)
+                        if weight <= 0:
+                            continue  # Skip retractions/annihilations
+
+                        acc = batch.get_accessor(i)
+                        if acc.is_null(col_idx):
+                            continue  # NULL values permitted in FK columns
+
+                        # Correct key promotion for signed/unsigned comparison
+                        col_type = self.schema.columns[col_idx].field_type
+                        fk_key = promote_to_index_key(acc, col_idx, col_type)
+
+                        # O(log N) existence check
+                        target_cursor.seek(fk_key)
+                        found = (
+                            target_cursor.is_valid()
+                            and target_cursor.key() == fk_key
+                            and target_cursor.weight() > 0
+                        )
+
+                        if not found:
+                            raise LayoutError(
+                                "Referential integrity violation: FK column '%s' value not "
+                                "found in target table '%s.%s'"
+                                % (
+                                    self.schema.columns[col_idx].name,
+                                    target.schema_name,
+                                    target.table_name,
+                                )
+                            )
+                finally:
+                    target_cursor.close()
+
+        # Primary Ingestion
         self.primary.ingest_batch(batch)
 
+        # Index propagation
         n = len(self.index_circuits)
         for i in range(n):
             circuit = self.index_circuits[i]
