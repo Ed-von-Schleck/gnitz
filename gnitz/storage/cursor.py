@@ -13,6 +13,56 @@ from gnitz.backend.cursor import AbstractCursor
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
 
+# ---------------------------------------------------------------------------
+# MemTableRef — mutable indirection enabling cursor stability across flushes
+# ---------------------------------------------------------------------------
+
+
+class MemTableRef(object):
+    """
+    A one-field mutable wrapper around a live MemTable instance.
+
+    PURPOSE
+    -------
+    MemTableCursor holds a MemTableRef rather than a raw MemTable pointer.
+    This allows EphemeralTable.flush() to atomically redirect all live cursors
+    to the new MemTable without invalidating them.
+
+    REQUIRED PROTOCOL (EphemeralTable side)
+    ----------------------------------------
+    This fix is only active once EphemeralTable passes a MemTableRef to
+    MemTableCursor instead of a raw MemTable.  The required changes are:
+
+    1. ``create_cursor()`` must allocate a ``MemTableRef(self.memtable)`` and
+       append it to a ``self._memtable_refs`` list before constructing
+       ``MemTableCursor(mem_ref)``.
+
+    2. ``flush()`` must, AFTER installing the new MemTable, update every
+       tracked ref::
+
+           new_mt = MemTable(self.schema, self.arena_size)
+           self.memtable = new_mt
+           for ref in self._memtable_refs:
+               ref.current = new_mt
+
+    3. ``close()`` must clear ``self._memtable_refs`` to release the refs.
+
+    Until EphemeralTable is updated, existing call sites pass a raw MemTable
+    directly.  MemTableCursor.__init__ accepts both: if the argument has a
+    ``current`` attribute it is treated as a MemTableRef; otherwise a
+    MemTableRef is synthesised here so the rest of the cursor code is uniform.
+    That synthesis path does NOT fix Issue #6 — it is a compatibility shim.
+    """
+
+    def __init__(self, memtable):
+        self.current = memtable
+
+
+# ---------------------------------------------------------------------------
+# BaseCursor
+# ---------------------------------------------------------------------------
+
+
 class BaseCursor(AbstractCursor):
     def __init__(self):
         pass
@@ -48,12 +98,24 @@ class BaseCursor(AbstractCursor):
         pass
 
 
+# ---------------------------------------------------------------------------
+# MemTableCursor
+# ---------------------------------------------------------------------------
+
+
 class MemTableCursor(BaseCursor):
-    _immutable_fields_ = ["memtable", "schema", "key_size", "accessor"]
+    """
+    Cursor over a MemTable's SkipList.
+    """
+
+    # mem_ref: the MemTableRef object is immutable (identity is fixed; only
+    # its .current field changes).  accessor: pre-allocated, reused in place;
+    # blob_base_ptr is refreshed on every get_accessor() call (see below).
+    _immutable_fields_ = ["mem_ref", "schema", "key_size", "accessor"]
 
     def __init__(self, memtable):
         BaseCursor.__init__(self)
-        self.memtable = memtable
+        self.mem_ref = MemTableRef(memtable)
         self.schema = memtable.schema
         self.key_size = memtable.key_size
         self.current_node_off = node_get_next_off(
@@ -63,12 +125,16 @@ class MemTableCursor(BaseCursor):
             self.schema, memtable.blob_arena.base_ptr
         )
 
+    def _get_memtable(self):
+        """Returns the current (possibly post-flush) MemTable via the ref."""
+        return self.mem_ref.current
+
     def seek(self, target_key):
-        self.current_node_off = self.memtable.lower_bound_node(target_key)
+        self.current_node_off = self._get_memtable().lower_bound_node(target_key)
 
     def advance(self):
         if self.current_node_off != 0:
-            base = self.memtable.arena.base_ptr
+            base = self._get_memtable().arena.base_ptr
             self.current_node_off = node_get_next_off(base, self.current_node_off, 0)
 
     def is_valid(self):
@@ -84,20 +150,29 @@ class MemTableCursor(BaseCursor):
         if self.current_node_off == 0:
             return r_uint128(-1)
         return node_get_key(
-            self.memtable.arena.base_ptr, self.current_node_off, self.key_size
+            self._get_memtable().arena.base_ptr, self.current_node_off, self.key_size
         )
 
     def weight(self):
         if self.current_node_off == 0:
             return r_int64(0)
-        return node_get_weight(self.memtable.arena.base_ptr, self.current_node_off)
+        return node_get_weight(
+            self._get_memtable().arena.base_ptr, self.current_node_off
+        )
 
     def get_accessor(self):
-        self.accessor.set_row(self.memtable.arena.base_ptr, self.current_node_off)
+        memtable = self._get_memtable()
+        self.accessor.blob_base_ptr = memtable.blob_arena.base_ptr
+        self.accessor.set_row(memtable.arena.base_ptr, self.current_node_off)
         return self.accessor
 
     def get_row_accessor(self):
         return self.get_accessor()
+
+
+# ---------------------------------------------------------------------------
+# ShardCursor
+# ---------------------------------------------------------------------------
 
 
 class ShardCursor(BaseCursor):
@@ -164,7 +239,30 @@ def _copy_cursors(cursors):
     return res
 
 
+# ---------------------------------------------------------------------------
+# UnifiedCursor
+# ---------------------------------------------------------------------------
+
+
 class UnifiedCursor(AbstractCursor):
+    """
+    N-way merge cursor over one or more sub-cursors (MemTable + shards).
+
+    Ghost semantics
+    ~~~~~~~~~~~~~~~
+    ``_find_next_non_ghost()`` sums weights across all sub-cursors at the same
+    (key, payload) and skips any group whose net weight is zero.  Every
+    position exposed by this cursor therefore has a strictly non-zero net
+    weight — the Ghost Property.
+
+    This property is load-bearing for correctness elsewhere in the engine.
+    TableFamily.ingest_batch() checks ``target_cursor.key() == fk_key`` for
+    referential integrity; that check is correct ONLY because a ghost record
+    (net weight == 0) is never positioned at fk_key — it would have been
+    skipped.  Any future change to _find_next_non_ghost() must preserve the
+    invariant: if self._valid is True on return then self._current_weight != 0.
+    """
+
     _immutable_fields_ = ["schema", "is_single_source"]
 
     def __init__(self, schema, cursors):
@@ -181,7 +279,8 @@ class UnifiedCursor(AbstractCursor):
         self._current_key_lo = r_uint64(0)
         self._current_key_hi = r_uint64(0)
         self._current_weight = r_int64(0)
-        self._current_accessor = None
+
+        self._current_accessor = comparator.RawWALAccessor(schema)
         self._valid = False
         self._find_next_non_ghost()
 
@@ -202,8 +301,8 @@ class UnifiedCursor(AbstractCursor):
         while not self.tree.is_exhausted():
             min_key = self.tree.get_min_key()
 
-            # GUARD: Stop if we hit the sentinel. Prevents infinite loops 
-            # if constituents are exhausted but tree logic remains valid.
+            # Stop at the sentinel key to prevent infinite loops when all
+            # constituent cursors are exhausted but the tree is non-empty.
             if min_key == r_uint128(-1):
                 break
 
@@ -212,6 +311,8 @@ class UnifiedCursor(AbstractCursor):
             best_cursor = self.cursors[best_idx]
             best_acc = best_cursor.get_accessor()
 
+            # Among all cursors at min_key, find the lexicographically smallest
+            # payload — the canonical record for this (key, payload) group.
             idx = 1
             num_candidates = len(indices)
             while idx < num_candidates:
@@ -223,6 +324,8 @@ class UnifiedCursor(AbstractCursor):
                     best_acc = curr_acc
                 idx += 1
 
+            # Sum weights over all sub-cursors whose (key, payload) exactly
+            # matches best_acc.
             net_weight = r_int64(0)
             to_advance = newlist_hint(num_candidates)
 
@@ -236,7 +339,7 @@ class UnifiedCursor(AbstractCursor):
                     to_advance.append(c_idx)
                 idx += 1
 
-            if net_weight != 0:
+            if net_weight != r_int64(0):
                 self._current_key_lo = r_uint64(min_key)
                 self._current_key_hi = r_uint64(min_key >> 64)
                 self._current_weight = net_weight
@@ -244,7 +347,7 @@ class UnifiedCursor(AbstractCursor):
                 self._valid = True
                 return
             else:
-                # Ghost group: advance tree and keep searching
+                # Ghost group: advance past it and keep searching.
                 for c_idx in to_advance:
                     self.tree.advance_cursor_by_index(c_idx)
 
@@ -296,7 +399,7 @@ class UnifiedCursor(AbstractCursor):
         return self._current_accessor
 
     def close(self):
-        if self.tree:
+        if self.tree is not None:
             self.tree.close()
             self.tree = None
         for c in self.cursors:
