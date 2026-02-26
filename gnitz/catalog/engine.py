@@ -438,6 +438,10 @@ class Engine(object):
 
     def drop_table(self, qualified_name):
         schema_name, table_name = parse_qualified_name(qualified_name, "public")
+        
+        validate_user_identifier(schema_name)
+        validate_user_identifier(table_name)
+
         if not self.registry.has(schema_name, table_name):
             raise LayoutError("Table does not exist: %s" % qualified_name)
 
