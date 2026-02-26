@@ -78,8 +78,11 @@ class TableSchema(object):
         if len(columns) > 64:
             raise errors.LayoutError("Maximum 64 columns supported")
 
-        # Create a resizable list for self.columns
         num_cols = len(columns)
+        if pk_index < 0 or pk_index >= num_cols:
+            raise errors.LayoutError("Primary Key index out of bounds")
+
+        # Create a resizable list for self.columns
         cols_list = newlist_hint(num_cols)
         for c in columns:
             cols_list.append(_to_col_def(c))
@@ -135,7 +138,7 @@ class TableSchema(object):
 def merge_schemas_for_join(schema_left, schema_right):
     """
     Constructs the resulting schema for a Join operation.
-    Output Schema = [Left_PK] + [Left_Payloads] + [Right_Payloads].
+    Output Schema = [Left_PK] + [Left_Payloads] +[Right_Payloads].
     Note: The right-side PK is dropped as it matches the left-side PK.
     """
     pk_left = schema_left.get_pk_column()
