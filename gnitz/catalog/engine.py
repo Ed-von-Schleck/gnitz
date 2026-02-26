@@ -198,6 +198,8 @@ class Engine(object):
             raise LayoutError("Schema does not exist: %s" % schema_name)
         if self.registry.has(schema_name, table_name):
             raise LayoutError("Table already exists: %s" % qualified_name)
+        if pk_col_idx < 0 or pk_col_idx >= len(columns):
+            raise LayoutError("Primary Key index out of bounds")
 
         # Pre-allocate ID to allow self-referential FK validation
         tid = self.registry.allocate_table_id()

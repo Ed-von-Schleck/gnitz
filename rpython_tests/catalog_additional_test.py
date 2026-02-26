@@ -20,7 +20,9 @@ from gnitz.catalog.index_circuit import (
     _backfill_index, 
     IndexCircuit, 
     get_index_key_type,
-    make_index_schema
+    make_index_schema,
+    make_fk_index_name,
+    make_secondary_index_name
 )
 from gnitz.catalog.system_records import (
     _append_index_record,
@@ -106,10 +108,15 @@ def test_index_functional_and_fanout(base_dir):
 
         if _count_records(circuit.table) != 6:
             raise Exception("Live index fan-out failed")
+
+        # Verify Standard Index Drop
+        engine.drop_index(circuit.name)
+        if engine.registry.has_index_by_name(circuit.name):
+            raise Exception("Standard index should have been dropped")
             
     finally:
         engine.close()
-    os.write(1, "    [OK] Index fan-out verified.\n")
+    os.write(1, "    [OK] Index fan-out and drop verified.\n")
 
 
 def test_orphaned_metadata_recovery(base_dir):
@@ -211,6 +218,229 @@ def test_sequence_gap_recovery(base_dir):
     os.write(1, "    [OK] Sequence gap recovery verified.\n")
 
 
+def test_fk_referential_integrity(base_dir):
+    os.write(1, "[Catalog+] Testing FK Referential Integrity...\n")
+    db_path = base_dir + "/fk_integrity"
+    if not os_path_exists(db_path): rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        # 1. Create Parent (U64 PK)
+        parent_cols = [core_types.ColumnDefinition(core_types.TYPE_U64, name="pid")]
+        parent = engine.create_table("public.parents", parent_cols, 0)
+        
+        # 2. Create Child (U64 FK referencing Parent)
+        child_cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="cid"),
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="pid_fk", 
+                                       fk_table_id=parent.table_id, fk_col_idx=0)
+        ]
+        child = engine.create_table("public.children", child_cols, 0)
+
+        # 3. Insert valid parent
+        pb = batch.ZSetBatch(parent.schema)
+        pb.append(r_uint128(r_uint64(10)), r_int64(1), values.make_payload_row(parent.schema))
+        parent.ingest_batch(pb)
+        pb.free()
+
+        # 4. Insert valid child
+        cb = batch.ZSetBatch(child.schema)
+        row = values.make_payload_row(child.schema)
+        row.append_int(r_int64(10)) # Valid pid
+        cb.append(r_uint128(r_uint64(1)), r_int64(1), row)
+        child.ingest_batch(cb)
+        cb.free()
+
+        # 5. Insert INVALID child (pid 99 does not exist)
+        cb2 = batch.ZSetBatch(child.schema)
+        row2 = values.make_payload_row(child.schema)
+        row2.append_int(r_int64(99))
+        cb2.append(r_uint128(r_uint64(2)), r_int64(1), row2)
+        
+        raised = False
+        try:
+            child.ingest_batch(cb2)
+        except LayoutError:
+            raised = True
+        if not raised:
+            raise Exception("Referential integrity failed to block invalid FK")
+        cb2.free()
+
+        # 6. Test U128 FK (UUID style)
+        u_parent_cols = [core_types.ColumnDefinition(core_types.TYPE_U128, name="uuid")]
+        u_parent = engine.create_table("public.uparents", u_parent_cols, 0)
+        
+        u_child_cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+            core_types.ColumnDefinition(core_types.TYPE_U128, name="ufk",
+                                       fk_table_id=u_parent.table_id, fk_col_idx=0)
+        ]
+        u_child = engine.create_table("public.uchildren", u_child_cols, 0)
+
+        uuid_val = (r_uint128(0xAAAA) << 64) | r_uint128(0xBBBB)
+        upb = batch.ZSetBatch(u_parent.schema)
+        upb.append(uuid_val, r_int64(1), values.make_payload_row(u_parent.schema))
+        u_parent.ingest_batch(upb)
+        upb.free()
+
+        ucb = batch.ZSetBatch(u_child.schema)
+        row3 = values.make_payload_row(u_child.schema)
+        row3.append_u128(r_uint64(0xBBBB), r_uint64(0xAAAA))
+        ucb.append(r_uint128(r_uint64(1)), r_int64(1), row3)
+        u_child.ingest_batch(ucb)
+        ucb.free()
+        
+    finally:
+        engine.close()
+    os.write(1, "    [OK] FK Integrity verified.\n")
+
+
+def test_fk_nullability_and_retractions(base_dir):
+    os.write(1, "[Catalog+] Testing FK Nullability and Retractions...\n")
+    db_path = base_dir + "/fk_null"
+    if not os_path_exists(db_path): rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        parent = engine.create_table("public.p", [core_types.ColumnDefinition(core_types.TYPE_U64, name="id")], 0)
+        # Nullable FK
+        child = engine.create_table("public.c", [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+            core_types.ColumnDefinition(core_types.TYPE_U64, is_nullable=True, name="pid_fk",
+                                       fk_table_id=parent.table_id, fk_col_idx=0)
+        ], 0)
+
+        # 1. Insert NULL FK (Should be allowed even if parent is empty)
+        cb = batch.ZSetBatch(child.schema)
+        row = values.make_payload_row(child.schema)
+        row.append_null(0) # pid_fk is the first payload column
+        cb.append(r_uint128(r_uint64(1)), r_int64(1), row)
+        child.ingest_batch(cb)
+        cb.free()
+
+        # 2. Test Retraction (Weight -1)
+        # Ingesting a retraction for a non-existent parent should NOT trigger FK check
+        cb2 = batch.ZSetBatch(child.schema)
+        row2 = values.make_payload_row(child.schema)
+        row2.append_int(r_int64(999)) # Non-existent
+        cb2.append(r_uint128(r_uint64(2)), r_int64(-1), row2)
+        child.ingest_batch(cb2) # Should succeed
+        cb2.free()
+
+    finally:
+        engine.close()
+    os.write(1, "    [OK] FK Nullability and Retractions verified.\n")
+
+
+def test_fk_protections(base_dir):
+    os.write(1, "[Catalog+] Testing FK Drop/Index Protections...\n")
+    db_path = base_dir + "/fk_prot"
+    if not os_path_exists(db_path): rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        parent = engine.create_table("public.parent", [core_types.ColumnDefinition(core_types.TYPE_U64, name="pid")], 0)
+        child = engine.create_table("public.child", [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="cid"),
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="pid_fk", fk_table_id=parent.table_id, fk_col_idx=0)
+        ], 0)
+
+        # 1. Attempt to drop Parent (Should fail)
+        raised = False
+        try:
+            engine.drop_table("public.parent")
+        except LayoutError:
+            raised = True
+        if not raised:
+            raise Exception("Allowed to drop a referenced table")
+
+        # 2. Attempt to drop the auto-generated FK index (Should fail)
+        idx_name = make_fk_index_name("public", "child", "pid_fk")
+        raised = False
+        try:
+            engine.drop_index(idx_name)
+        except LayoutError:
+            raised = True
+        if not raised:
+            raise Exception("Allowed to drop auto-generated FK index")
+
+        # 3. Drop child, then parent (Should succeed)
+        engine.drop_table("public.child")
+        engine.drop_table("public.parent")
+
+    finally:
+        engine.close()
+    os.write(1, "    [OK] FK Drop protections verified.\n")
+
+
+def test_fk_invalid_targets(base_dir):
+    os.write(1, "[Catalog+] Testing Invalid FK Targets...\n")
+    db_path = base_dir + "/fk_invalid"
+    if not os_path_exists(db_path): rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        p = engine.create_table("public.p", [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="pk"),
+            core_types.ColumnDefinition(core_types.TYPE_I64, name="other")
+        ], 0)
+
+        # Attempt to target column index 1 (not the PK)
+        raised = False
+        try:
+            engine.create_table("public.c_bad", [
+                core_types.ColumnDefinition(core_types.TYPE_U64, name="pk"),
+                core_types.ColumnDefinition(core_types.TYPE_I64, name="fk", fk_table_id=p.table_id, fk_col_idx=1)
+            ], 0)
+        except LayoutError:
+            raised = True
+        if not raised:
+            raise Exception("Allowed to create FK targeting non-PK column")
+
+    finally:
+        engine.close()
+    os.write(1, "    [OK] Invalid FK targets blocked.\n")
+
+
+def test_fk_self_reference(base_dir):
+    os.write(1, "[Catalog+] Testing FK Self-Reference...\n")
+    db_path = base_dir + "/fk_self"
+    if not os_path_exists(db_path): rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        tid = engine.registry._next_table_id
+        cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="emp_id"),
+            core_types.ColumnDefinition(core_types.TYPE_U64, is_nullable=True, 
+                                       name="mgr_id", fk_table_id=tid, fk_col_idx=0)
+        ]
+        emp = engine.create_table("public.employees", cols, 0)
+
+        # 1. Ingest Manager first (Commit required for FK check)
+        b1 = batch.ZSetBatch(emp.schema)
+        r_mgr = values.make_payload_row(emp.schema)
+        r_mgr.append_null(0)
+        b1.append(r_uint128(r_uint64(1)), r_int64(1), r_mgr)
+        emp.ingest_batch(b1)
+        b1.free()
+
+        # 2. Ingest Subordinate referencing the Manager
+        b2 = batch.ZSetBatch(emp.schema)
+        r_sub = values.make_payload_row(emp.schema)
+        r_sub.append_int(r_int64(1)) # Refers to emp_id 1
+        b2.append(r_uint128(r_uint64(2)), r_int64(1), r_sub)
+        emp.ingest_batch(b2)
+        b2.free()
+
+        if _count_records(emp.primary) != 2:
+            raise Exception("Self-referential ingestion failed")
+
+    finally:
+        engine.close()
+    os.write(1, "    [OK] FK Self-reference verified.\n")
+
+
 # --- Entry Point ---
 
 def entry_point(argv):
@@ -226,6 +456,14 @@ def entry_point(argv):
         test_schema_mr_poisoning()
         test_identifier_boundary_slicing()
         test_sequence_gap_recovery(base_dir)
+        
+        # Foreign Key tests
+        test_fk_referential_integrity(base_dir)
+        test_fk_nullability_and_retractions(base_dir)
+        test_fk_protections(base_dir)
+        test_fk_invalid_targets(base_dir)
+        test_fk_self_reference(base_dir)
+        
         os.write(1, "\nALL ADDITIONAL CATALOG TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "\nADDITIONAL TEST FAILED\n")
