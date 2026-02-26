@@ -204,3 +204,19 @@ def unpack_string(struct_ptr, heap_base_ptr):
         offset = rffi.cast(lltype.Signed, u64_payload_ptr[0])
         blob_ptr = rffi.ptradd(heap_base_ptr, offset)
         return rffi.charpsize2str(blob_ptr, length)
+
+
+@jit.unroll_safe
+def resolve_string(struct_ptr, heap_base_ptr, py_string):
+    """
+    Unified extraction logic for RowAccessor string columns.
+    Prioritizes the Python string (VM layer). If None, deserializes
+    from the raw German String struct (Storage layer).
+    """
+    if py_string is not None:
+        return py_string
+
+    if struct_ptr == NULL_PTR:
+        return ""
+
+    return unpack_string(struct_ptr, heap_base_ptr)
