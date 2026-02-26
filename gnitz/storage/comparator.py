@@ -1,10 +1,10 @@
 # gnitz/storage/comparator.py
 
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import types, strings as string_logic, values as db_values
-from gnitz.core.comparator import RowAccessor, ValueAccessor
+from gnitz.core.comparator import RowAccessor, PayloadRowAccessor
 from gnitz.storage.memtable_node import node_get_payload_ptr
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
@@ -245,18 +245,17 @@ class RawWALAccessor(RowAccessor):
         return (r_uint128(hi[0]) << 64) | r_uint128(lo[0])
 
     def get_str_struct(self, col_idx):
-        ptr = self._get_ptr(col_idx)
-        if not ptr:
-            return (0, 0, NULL_PTR, self.heap_ptr, None)
-
+        off = self.schema.get_column_offset(col_idx)
+        ptr = rffi.ptradd(self.payload_ptr, off)
+        
         u32_ptr = rffi.cast(rffi.UINTP, ptr)
-        length = rffi.cast(lltype.Signed, u32_ptr[0])
-        prefix = rffi.cast(lltype.Signed, u32_ptr[1])
-
-        s = None
-        if False:
-            s = ""
-        return (length, prefix, ptr, self.heap_ptr, s)
+        length = intmask(u32_ptr[0])
+        
+        # CRITICAL: Convert r_uint32 to signed int BEFORE returning the tuple
+        prefix = intmask(u32_ptr[1])
+        
+        # Return signature: (int, int, CCHARP, CCHARP, str)
+        return (length, prefix, ptr, self.heap_ptr, None)
 
     def get_col_ptr(self, col_idx):
         return self._get_ptr(col_idx)

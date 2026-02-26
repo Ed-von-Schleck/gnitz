@@ -6,45 +6,29 @@ from gnitz.core import strings as string_logic, types
 
 
 class RowAccessor(object):
-    """
-    Abstract base for accessing row data across different physical formats.
-    """
-
     def get_int(self, col_idx):
-        # Returns r_uint64 (unsigned bit pattern)
         raise NotImplementedError
 
     def get_int_signed(self, col_idx):
-        """
-        Returns the value as r_int64, reinterpreting bits if necessary.
-        Default implementation performs a 64-bit reinterpret cast.
-        Subclasses handling smaller packed types (i8, i16, i32) must
-        override this to ensure proper sign extension.
-        """
         return rffi.cast(rffi.LONGLONG, self.get_int(col_idx))
 
     def get_float(self, col_idx):
         raise NotImplementedError
 
     def get_u128(self, col_idx):
-        # Returns (length, prefix, struct_ptr, heap_ptr, py_string)
         raise NotImplementedError
 
     def get_str_struct(self, col_idx):
-        # Returns (length, prefix, struct_ptr, heap_ptr, py_string)
         raise NotImplementedError
 
     def get_col_ptr(self, col_idx):
         raise NotImplementedError
 
     def is_null(self, col_idx):
-        """Returns True if the column value is logically null."""
         return False
 
 
 class PayloadRowAccessor(RowAccessor):
-    """Accesses data from an in-memory PayloadRow object."""
-
     _immutable_fields_ = ["schema", "_row"]
 
     def __init__(self, schema):
@@ -79,8 +63,8 @@ class PayloadRowAccessor(RowAccessor):
 
     def get_str_struct(self, col_idx):
         s = self._row.get_str(self._payload_idx(col_idx))
-
-        prefix = rffi.cast(lltype.Signed, string_logic.compute_prefix(s))
+        # compute_prefix returns LONGLONG, so the tuple is consistent
+        prefix = string_logic.compute_prefix(s)
         return (
             len(s),
             prefix,
@@ -90,14 +74,7 @@ class PayloadRowAccessor(RowAccessor):
         )
 
     def get_col_ptr(self, col_idx):
-        # Not supported for Python objects
         return lltype.nullptr(rffi.CCHARP.TO)
-
-
-class ValueAccessor(PayloadRowAccessor):
-    """Alias for PayloadRowAccessor used in comparisons."""
-
-    pass
 
 
 @jit.unroll_safe
@@ -108,7 +85,6 @@ def compare_rows(schema, acc1, acc2):
         if i == schema.pk_index:
             continue
 
-        # 1. Null Handling (Null < Not Null)
         n1 = acc1.is_null(i)
         n2 = acc2.is_null(i)
         if n1 and n2:
@@ -118,24 +94,26 @@ def compare_rows(schema, acc1, acc2):
         if n2:
             return 1
 
-        # 2. Type-specific comparison
         col_type = schema.columns[i].field_type
-        if col_type == types.TYPE_STRING:
+        if col_type.code == types.TYPE_STRING.code:
+            # Both acc1 and acc2 now return identical types in the tuple
             l1, p1, ptr1, h1, s1 = acc1.get_str_struct(i)
             l2, p2, ptr2, h2, s2 = acc2.get_str_struct(i)
+            
             res = string_logic.compare_structures(
-                l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+                l1, p1, ptr1, h1, s1,
+                l2, p2, ptr2, h2, s2
             )
             if res != 0:
                 return res
-        elif col_type == types.TYPE_U128:
+        elif col_type.code == types.TYPE_U128.code:
             v1 = acc1.get_u128(i)
             v2 = acc2.get_u128(i)
             if v1 < v2:
                 return -1
             if v1 > v2:
                 return 1
-        elif col_type == types.TYPE_F64 or col_type == types.TYPE_F32:
+        elif col_type.code == types.TYPE_F64.code or col_type.code == types.TYPE_F32.code:
             v1 = acc1.get_float(i)
             v2 = acc2.get_float(i)
             if v1 < v2:
