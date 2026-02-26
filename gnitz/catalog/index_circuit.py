@@ -95,8 +95,8 @@ def promote_to_index_key(accessor, col_idx, source_col_type):
         return r_uint128(rffi.cast(rffi.ULONGLONG, signed_64))
 
     raise LayoutError("Cannot promote column type %d to index key" % code)
-    
-    
+
+
 def make_fk_index_name(schema_name, table_name, col_name):
     """
     Computes the auto-generated name for a Foreign Key index.
@@ -156,13 +156,21 @@ class IndexCircuit(object):
         self.cache_dir = cache_dir  # str
         self.table = table  # EphemeralTable (the index store)
 
+        # Reusable scratch batch for compute_index_delta.  Allocated once here
+        # and cleared at the start of every call, eliminating per-batch arena
+        # allocation in the hot ingest path.  Must be freed in close().
+        self._scratch_batch = ZSetBatch(table.schema)
+
     def compute_index_delta(self, source_batch):
         """
         Transforms a source Z-Set batch into an index Z-Set batch.
         Records where the indexed column is NULL are skipped.
+
+        Returns the circuit's internal scratch batch, which is valid until the
+        next call to compute_index_delta or close().  Callers must not free it.
         """
+        self._scratch_batch.clear()
         idx_schema = self.table.schema
-        idx_batch = ZSetBatch(idx_schema)
         n = source_batch.length()
         for i in range(n):
             acc = source_batch.get_accessor(i)
@@ -181,13 +189,14 @@ class IndexCircuit(object):
             else:
                 row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(source_pk)))
 
-            idx_batch.append(index_key, weight, row)
-        return idx_batch
+            self._scratch_batch.append(index_key, weight, row)
+        return self._scratch_batch
 
     def create_cursor(self):
         return self.table.create_cursor()
 
     def close(self):
+        self._scratch_batch.free()
         self.table.close()
 
 

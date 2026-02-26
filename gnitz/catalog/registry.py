@@ -2,7 +2,6 @@
 
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from rpython.rtyper.lltypesystem import rffi
 
 from gnitz.catalog.system_tables import (
     FIRST_USER_SCHEMA_ID,
@@ -93,6 +92,34 @@ class TableFamily(object):
     """
     A logical table entity. Manages a primary PersistentTable and
     a collection of soft-state secondary indices.
+
+    FK cursor caching
+    -----------------
+    Creating a UnifiedCursor allocates a TournamentTree on the C heap via
+    lltype.malloc.  For high-frequency streaming workloads each
+    ingest_batch() used to create and destroy one cursor per FK constraint
+    per call — a malloc/free cycle on every tick.
+
+    Instead, TableFamily caches one cursor per FK constraint and reuses it
+    across calls via seek().  A cursor remains valid as long as the target
+    table's primary storage has not been flushed.  PersistentTable.flush()
+    frees the old MemTable arena and increments _cursor_generation; this
+    invalidation signal is checked at the top of every ingest_batch() call.
+    Stale cursors are closed and rebuilt before the batch is processed.
+
+    Cursors are created eagerly in _add_fk_constraint so that
+    _fk_cached_cursors is always a homogeneous list (RPython §3: no None
+    in typed lists).  Closing order in close() keeps cached cursors ahead
+    of primary so self-referential FK cursors are released before the table
+    they iterate is torn down.
+
+    Index delta batch pooling
+    -------------------------
+    compute_index_delta() previously allocated a fresh ZSetBatch per
+    circuit per ingest_batch() call.  IndexCircuit now owns a reusable
+    _scratch_batch that is cleared at the start of each call.  The caller
+    must not free the returned batch; it is owned by the circuit and freed
+    in IndexCircuit.close().
     """
 
     _immutable_fields_ = [
@@ -127,15 +154,27 @@ class TableFamily(object):
         self.schema = primary.schema
         # Soft-state secondary indices
         self.index_circuits = newlist_hint(4)
-        # Active Foreign Key constraints
+        # Active Foreign Key constraints (parallel arrays)
         self.fk_constraints = newlist_hint(0)
+        # One cached UnifiedCursor per FK constraint.  Always a real cursor
+        # object (never None) — RPython requires homogeneous typed lists.
+        # Built eagerly in _add_fk_constraint and replaced when stale.
+        self._fk_cached_cursors = newlist_hint(0)
+        # The _cursor_generation of the target table at the time each
+        # cached cursor was built.  -1 is never a valid generation value
+        # and is not used here because cursors are built immediately.
+        self._fk_cursor_gens = newlist_hint(0)
 
     def _add_fk_constraint(self, col_idx, target_family):
         """
-        Registers an active FK constraint for column `col_idx`.
+        Registers an active FK constraint for column `col_idx` and eagerly
+        creates the first cursor for it.
         Called once per FK column during create_table and _rebuild_registry.
         """
         self.fk_constraints.append(FKConstraint(col_idx, target_family))
+        cursor = target_family.primary.create_cursor()
+        self._fk_cached_cursors.append(cursor)
+        self._fk_cursor_gens.append(target_family.primary._cursor_generation)
 
     def get_schema(self):
         return self.schema
@@ -148,7 +187,7 @@ class TableFamily(object):
         Durable ingestion into primary table followed by soft-state
         fan-out to all registered secondary indices.
         """
-        # FK Enforcement Pre-commit Check
+        # ── FK Enforcement Pre-commit Check ──────────────────────────────────
         n_constraints = len(self.fk_constraints)
         if n_constraints > 0:
             n_records = batch.length()
@@ -157,60 +196,75 @@ class TableFamily(object):
                 col_idx = constraint.fk_col_idx
                 target = constraint.target_family
 
-                # Hoist cursor creation to batch-level
-                target_cursor = target.primary.create_cursor()
-                try:
-                    for i in range(n_records):
-                        weight = batch.get_weight(i)
-                        if weight <= 0:
-                            continue  # Skip retractions/annihilations
+                # Refresh the cached cursor if target was flushed since the
+                # last ingest.  flush() frees the old MemTable arena, so any
+                # cursor pointing into it would dereference freed memory.
+                current_gen = target.primary._cursor_generation
+                if self._fk_cursor_gens[c_idx] != current_gen:
+                    self._fk_cached_cursors[c_idx].close()
+                    self._fk_cached_cursors[c_idx] = target.primary.create_cursor()
+                    self._fk_cursor_gens[c_idx] = current_gen
 
-                        acc = batch.get_accessor(i)
-                        if acc.is_null(col_idx):
-                            continue  # NULL values permitted in FK columns
+                target_cursor = self._fk_cached_cursors[c_idx]
 
-                        # Correct key promotion for signed/unsigned comparison
-                        col_type = self.schema.columns[col_idx].field_type
-                        fk_key = promote_to_index_key(acc, col_idx, col_type)
+                # Hoist the column type lookup outside the record loop.
+                col_type = self.schema.columns[col_idx].field_type
 
-                        # O(log N) existence check
-                        target_cursor.seek(fk_key)
-                        found = (
-                            target_cursor.is_valid()
-                            and target_cursor.key() == fk_key
-                            and target_cursor.weight() > 0
+                for i in range(n_records):
+                    weight = batch.get_weight(i)
+                    if weight <= 0:
+                        continue  # Skip retractions/annihilations
+
+                    acc = batch.get_accessor(i)
+                    if acc.is_null(col_idx):
+                        continue  # NULL values permitted in FK columns
+
+                    fk_key = promote_to_index_key(acc, col_idx, col_type)
+
+                    # O(log N) existence check via the cached cursor.
+                    # seek() fully resets cursor state, so reuse across
+                    # iterations within the same batch is safe.
+                    target_cursor.seek(fk_key)
+                    found = (
+                        target_cursor.is_valid()
+                        and target_cursor.key() == fk_key
+                        and target_cursor.weight() > 0
+                    )
+
+                    if not found:
+                        raise LayoutError(
+                            "Referential integrity violation: FK column '%s' value not "
+                            "found in target table '%s.%s'"
+                            % (
+                                self.schema.columns[col_idx].name,
+                                target.schema_name,
+                                target.table_name,
+                            )
                         )
 
-                        if not found:
-                            raise LayoutError(
-                                "Referential integrity violation: FK column '%s' value not "
-                                "found in target table '%s.%s'"
-                                % (
-                                    self.schema.columns[col_idx].name,
-                                    target.schema_name,
-                                    target.table_name,
-                                )
-                            )
-                finally:
-                    target_cursor.close()
-
-        # Primary Ingestion
+        # ── Primary Ingestion ─────────────────────────────────────────────────
         self.primary.ingest_batch(batch)
 
-        # Index propagation
+        # ── Index Propagation ─────────────────────────────────────────────────
+        # compute_index_delta() returns circuit._scratch_batch — a reusable
+        # batch owned by the circuit.  Do not free it here.
         n = len(self.index_circuits)
         for i in range(n):
             circuit = self.index_circuits[i]
             idx_batch = circuit.compute_index_delta(batch)
             if not idx_batch.is_empty():
                 _ingest_into_index(circuit, idx_batch)
-            idx_batch.free()
 
     def flush(self):
         # Flushing primary is sufficient for hard-state durability.
         return self.primary.flush()
 
     def close(self):
+        # Close cached FK cursors before closing primary.  If any constraint
+        # is self-referential the cursor iterates self.primary; releasing it
+        # first avoids a use-after-free during cursor teardown.
+        for cached_cursor in self._fk_cached_cursors:
+            cached_cursor.close()
         self.primary.close()
         for circuit in self.index_circuits:
             circuit.close()

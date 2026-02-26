@@ -59,6 +59,13 @@ class PersistentTable(_StorageBase):
         self.validate_checksums = validate_checksums
         self.is_closed = False
 
+        # Monotonic counter incremented on every flush().  Any UnifiedCursor
+        # that was constructed before a flush() must be discarded and rebuilt,
+        # because flush() frees the old MemTable arena and replaces the object.
+        # Callers that cache cursors (e.g. TableFamily for FK checks) compare
+        # their recorded generation against this value before each use.
+        self._cursor_generation = 0
+
         self.ref_counter = refcount.RefCounter()
 
         try:
@@ -261,6 +268,12 @@ class PersistentTable(_StorageBase):
         arena_size = self.memtable.arena.size
         self.memtable.free()
         self.memtable = memtable.MemTable(self.schema, arena_size)
+
+        # Any UnifiedCursor built before this flush now holds a dangling
+        # MemTableCursor (the old arena has been freed) and is missing the
+        # newly-created shard.  Bump the generation so callers that cache
+        # cursors know to rebuild.
+        self._cursor_generation += 1
 
         return shard_path
 
