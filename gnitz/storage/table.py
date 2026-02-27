@@ -10,10 +10,8 @@ from rpython.rlib.rarithmetic import (
     intmask,
 )
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.core import types, errors, serialize
-from gnitz.core import comparator as core_comparator
+from gnitz.core import errors
 from gnitz.storage import (
     wal,
     index,
@@ -21,18 +19,14 @@ from gnitz.storage import (
     memtable,
     refcount,
     comparator as storage_comparator,
-    cursor,
 )
-from gnitz.storage.memtable_node import node_get_weight
-from gnitz.storage.ephemeral_table import EphemeralTable, _StorageBase, _name_to_tid
+from gnitz.storage.ephemeral_table import _StorageBase, _name_to_tid
 
 
 class PersistentTable(_StorageBase):
     """
     Coordinator for a single persistent Z-Set table.
-
-    Operates purely on raw memory buffers and Accessors. All PayloadRow
-    handling is confined to the external API layer.
+    Manages durability via WAL and versioning via Manifest.
     """
 
     _immutable_fields_ = [
@@ -59,11 +53,9 @@ class PersistentTable(_StorageBase):
         self.validate_checksums = validate_checksums
         self.is_closed = False
 
-        # Monotonic counter incremented on every flush().  Any UnifiedCursor
+        # Monotonic counter incremented on every flush(). Any UnifiedCursor
         # that was constructed before a flush() must be discarded and rebuilt,
         # because flush() frees the old MemTable arena and replaces the object.
-        # Callers that cache cursors (e.g. TableFamily for FK checks) compare
-        # their recorded generation against this value before each use.
         self._cursor_generation = 0
 
         self.ref_counter = refcount.RefCounter()
@@ -103,28 +95,13 @@ class PersistentTable(_StorageBase):
         self.recover_from_wal(wal_path)
 
     # -------------------------------------------------------------------------
-    # AbstractTable Implementation (Pure Accessor/Batch Path)
+    # Mutations
     # -------------------------------------------------------------------------
-
-    def get_schema(self):
-        return self.schema
-
-    def create_scratch_table(self, name, schema):
-        scratch_dir = os.path.join(self.directory, "scratch_" + name)
-        tid = _name_to_tid(name)
-
-        return EphemeralTable(
-            scratch_dir,
-            name,
-            schema,
-            table_id=tid,
-            memtable_arena_size=self.memtable.arena.size,
-        )
 
     def ingest_batch(self, batch):
         """
-        Durable Z-Set batch update. Bypasses all Python object overhead
-        by reading directly from the batch's raw memory arenas.
+        Durable Z-Set batch update.
+        Writes to WAL (durability) then to MemTable (visibility).
         """
         if self.is_closed:
             raise errors.StorageError("Table is closed")
@@ -141,61 +118,9 @@ class PersistentTable(_StorageBase):
         # 2. Visibility: Update MemTable (Zero-copy)
         self.memtable.upsert_batch(batch)
 
-    def get_weight(self, key, accessor):
-        """
-        Returns the net algebraic weight for a specific record.
-        Zero-allocation: uses the provided accessor for SkipList search
-        and columnar shard comparisons.
-        """
-        r_key = r_uint128(key)
-        total_w = r_int64(0)
-
-        # 1. Check SkipList MemTable
-        # Use MemTable's internal hash buffer to avoid per-call allocations.
-        h_val, h_buf, h_cap = serialize.compute_hash(
-            self.schema, accessor, self.memtable.hash_buf, self.memtable.hash_buf_cap
-        )
-        # Update MemTable state in case compute_hash reallocated the buffer.
-        self.memtable.hash_buf = h_buf
-        self.memtable.hash_buf_cap = h_cap
-
-        node_off = self.memtable._find_exact_values(r_key, h_val, accessor)
-        if node_off != 0:
-            total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
-
-        # 2. Check Columnar Shards via Index
-        shard_matches = self.index.find_all_shards_and_indices(r_key)
-        if shard_matches:
-            soa = storage_comparator.SoAAccessor(self.schema)
-
-            for handle, row_idx in shard_matches:
-                view = handle.view
-                idx = row_idx
-                while idx < view.count:
-                    # Check PK Match
-                    if self.schema.get_pk_column().field_type.size == 16:
-                        if view.get_pk_u128(idx) != r_key:
-                            break
-                    else:
-                        if r_uint128(view.get_pk_u64(idx)) != r_key:
-                            break
-
-                    # Check Payload Semantic Equality
-                    soa.set_row(view, idx)
-                    if core_comparator.compare_rows(self.schema, soa, accessor) == 0:
-                        total_w += view.get_weight(idx)
-                    idx += 1
-
-        return total_w
-
-    # -------------------------------------------------------------------------
-    # Internal Logic
-    # -------------------------------------------------------------------------
-
     def recover_from_wal(self, wal_path):
         """
         Replays WAL blocks into the MemTable.
-        Zero-copy: uses RawWALAccessor to bypass PayloadRow instantiation.
         """
         if not os.path.exists(wal_path):
             return
@@ -226,6 +151,10 @@ class PersistentTable(_StorageBase):
                     block.free()
         finally:
             reader.close()
+
+    # -------------------------------------------------------------------------
+    # Maintenance
+    # -------------------------------------------------------------------------
 
     def flush(self):
         """Transitions MemTable state to a permanent columnar shard."""
@@ -269,10 +198,7 @@ class PersistentTable(_StorageBase):
         self.memtable.free()
         self.memtable = memtable.MemTable(self.schema, arena_size)
 
-        # Any UnifiedCursor built before this flush now holds a dangling
-        # MemTableCursor (the old arena has been freed) and is missing the
-        # newly-created shard.  Bump the generation so callers that cache
-        # cursors know to rebuild.
+        # Bump generation to invalidate cached cursors (they contain dead MemTable refs)
         self._cursor_generation += 1
 
         return shard_path

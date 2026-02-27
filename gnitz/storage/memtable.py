@@ -48,6 +48,7 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
     def allocate_from_ptr(self, src_ptr, length):
         """Zero-copy relocation of string data."""
         from rpython.rlib.objectmodel import we_are_translated
+
         b_ptr = self.arena.alloc(length, alignment=8)
         if length > 0:
             if we_are_translated():
@@ -153,6 +154,21 @@ class MemTable(object):
                 next_off = node_get_next_off(base, curr_off, i)
 
         return node_get_next_off(base, curr_off, 0)
+
+    def get_weight_for_pk(self, key):
+        """Zero-allocation aggregation of all weights for a given PK."""
+        base = self.arena.base_ptr
+        # lower_bound_node returns the first node where node.key >= key
+        curr_off = self.lower_bound_node(key)
+        total_w = r_int64(0)
+
+        while curr_off != 0:
+            if node_get_key(base, curr_off, self.key_size) != key:
+                break
+            total_w += node_get_weight(base, curr_off)
+            curr_off = node_get_next_off(base, curr_off, 0)
+
+        return total_w
 
     def _find_exact_values(self, key, target_hash, accessor):
         """

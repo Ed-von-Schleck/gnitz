@@ -21,7 +21,6 @@ from gnitz.storage import (
     comparator as storage_comparator,
     cursor,
 )
-from gnitz.storage.memtable_node import node_get_weight
 from gnitz.backend.table import AbstractTable
 
 
@@ -39,11 +38,10 @@ def _name_to_tid(name):
 
 class _StorageBase(AbstractTable):
     """
-    Shared base class for Persistent and Ephemeral tables to deduplicate
-    boilerplate logic that relies on the .memtable and .index attributes.
+    Shared base class for Persistent and Ephemeral tables.
+    Deduplicates all logic related to schema management and read-path operations.
     """
 
-    # Move immutable hints here so they are consistent across the hierarchy.
     _immutable_fields_ = [
         "schema",
         "table_id",
@@ -51,6 +49,22 @@ class _StorageBase(AbstractTable):
         "name",
         "ref_counter",
     ]
+
+    def get_schema(self):
+        return self.schema
+
+    def create_scratch_table(self, name, schema):
+        """Returns another EphemeralTable instance for recursive state."""
+        scratch_dir = os.path.join(self.directory, "scratch_" + name)
+        tid = _name_to_tid(name)
+
+        return EphemeralTable(
+            scratch_dir,
+            name,
+            schema,
+            table_id=tid,
+            memtable_arena_size=self.memtable.arena.size,
+        )
 
     def create_cursor(self):
         num_shards = len(self.index.handles)
@@ -62,13 +76,91 @@ class _StorageBase(AbstractTable):
 
         return cursor.UnifiedCursor(self.schema, cs)
 
+    def has_pk(self, key):
+        """
+        Fast-path existence check for a Primary Key.
+        Returns True if the net algebraic weight across MemTable and Shards is > 0.
+        Zero-allocation: bypasses UnifiedCursors and TournamentTrees.
+        """
+        r_key = r_uint128(key)
+
+        # 1. SkipList MemTable
+        total_w = self.memtable.get_weight_for_pk(r_key)
+
+        # 2. Columnar Shards via Index
+        shard_matches = self.index.find_all_shards_and_indices(r_key)
+        if shard_matches:
+            is_u128 = self.schema.get_pk_column().field_type.size == 16
+            for handle, row_idx in shard_matches:
+                view = handle.view
+                idx = row_idx
+                while idx < view.count:
+                    # Check PK Match
+                    if is_u128:
+                        if view.get_pk_u128(idx) != r_key:
+                            break
+                    else:
+                        if r_uint128(view.get_pk_u64(idx)) != r_key:
+                            break
+
+                    total_w += view.get_weight(idx)
+                    idx += 1
+
+        return total_w > 0
+
+    def get_weight(self, key, accessor):
+        """
+        Returns the net algebraic weight for a specific record.
+        Zero-allocation: uses the provided accessor for SkipList search
+        and columnar shard comparisons.
+        """
+        r_key = r_uint128(key)
+        total_w = r_int64(0)
+
+        # 1. Check SkipList MemTable
+        # Reuses the memtable's pre-allocated hash buffer to avoid churn.
+        h_val, h_buf, h_cap = serialize.compute_hash(
+            self.schema, accessor, self.memtable.hash_buf, self.memtable.hash_buf_cap
+        )
+        self.memtable.hash_buf = h_buf
+        self.memtable.hash_buf_cap = h_cap
+
+        node_off = self.memtable._find_exact_values(r_key, h_val, accessor)
+        if node_off != 0:
+            from gnitz.storage.memtable_node import node_get_weight
+
+            total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
+
+        # 2. Check Columnar Shards via Index
+        shard_matches = self.index.find_all_shards_and_indices(r_key)
+        if shard_matches:
+            soa = storage_comparator.SoAAccessor(self.schema)
+
+            for handle, row_idx in shard_matches:
+                view = handle.view
+                idx = row_idx
+                while idx < view.count:
+                    # Check PK Match
+                    if self.schema.get_pk_column().field_type.size == 16:
+                        if view.get_pk_u128(idx) != r_key:
+                            break
+                    else:
+                        if r_uint128(view.get_pk_u64(idx)) != r_key:
+                            break
+
+                    # Check Payload Semantic Equality
+                    soa.set_row(view, idx)
+                    if core_comparator.compare_rows(self.schema, soa, accessor) == 0:
+                        total_w += view.get_weight(idx)
+                    idx += 1
+
+        return total_w
+
 
 class EphemeralTable(_StorageBase):
     """
     Scratch Z-Set storage for internal VM state (Traces, Materialized Views).
-
-    Bypasses the Write-Ahead Log to maximize throughput. Operates purely on
-    raw memory buffers and Accessors.
+    Bypasses the Write-Ahead Log to maximize throughput.
     """
 
     def __init__(
@@ -98,96 +190,20 @@ class EphemeralTable(_StorageBase):
         self.index = index.ShardIndex(table_id, schema, self.ref_counter)
         self.memtable = memtable.MemTable(schema, memtable_arena_size)
 
-    # -------------------------------------------------------------------------
-    # AbstractTable Implementation (Pure Accessor/Batch Path)
-    # -------------------------------------------------------------------------
-
-    def get_schema(self):
-        return self.schema
-
-    def create_scratch_table(self, name, schema):
-        """Returns another EphemeralTable instance for recursive state."""
-        scratch_dir = os.path.join(self.directory, "scratch_" + name)
-        tid = _name_to_tid(name)
-
-        return EphemeralTable(
-            scratch_dir,
-            name,
-            schema,
-            table_id=tid,
-            memtable_arena_size=self.memtable.arena.size,
-        )
-
     def ingest_batch(self, batch):
-        """
-        Ingests a batch of Z-Set deltas into the MemTable.
-        Zero-copy: bypasses WAL writer and re-serialization.
-        """
         if self.is_closed:
             raise errors.StorageError("Table is closed")
 
         if batch.length() == 0:
             return
 
-        # Visibility: Update MemTable using the batch's raw memory fast-path.
         self.memtable.upsert_batch(batch)
-
-    def get_weight(self, key, accessor):
-        """
-        Returns the net algebraic weight for a specific record.
-        Zero-allocation: uses the provided accessor for SkipList search
-        and columnar shard comparisons.
-        """
-        r_key = r_uint128(key)
-        total_w = r_int64(0)
-
-        # 1. Check SkipList MemTable
-        # Reuses the memtable's pre-allocated hash buffer to avoid churn.
-        h_val, h_buf, h_cap = serialize.compute_hash(
-            self.schema, accessor, self.memtable.hash_buf, self.memtable.hash_buf_cap
-        )
-        self.memtable.hash_buf = h_buf
-        self.memtable.hash_buf_cap = h_cap
-
-        node_off = self.memtable._find_exact_values(r_key, h_val, accessor)
-        if node_off != 0:
-            total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
-
-        # 2. Check Columnar Shards via Index
-        shard_matches = self.index.find_all_shards_and_indices(r_key)
-        if shard_matches:
-            soa = storage_comparator.SoAAccessor(self.schema)
-
-            for handle, row_idx in shard_matches:
-                view = handle.view
-                idx = row_idx
-                while idx < view.count:
-                    # Check PK Match
-                    if self.schema.get_pk_column().field_type.size == 16:
-                        if view.get_pk_u128(idx) != r_key:
-                            break
-                    else:
-                        if r_uint128(view.get_pk_u64(idx)) != r_key:
-                            break
-
-                    # Check Payload Semantic Equality
-                    soa.set_row(view, idx)
-                    if core_comparator.compare_rows(self.schema, soa, accessor) == 0:
-                        total_w += view.get_weight(idx)
-                    idx += 1
-
-        return total_w
-
-    # -------------------------------------------------------------------------
-    # Maintenance Logic
-    # -------------------------------------------------------------------------
 
     def flush(self):
         """Transitions MemTable state to a temporary columnar shard."""
         if self.is_closed:
             raise errors.StorageError("Table is closed")
 
-        # Use ephemeral naming scheme
         shard_name = "eph_shard_%d_%d.db" % (
             self.table_id,
             intmask(rffi.cast(rffi.SIZE_T, self.memtable.arena.offset)),
