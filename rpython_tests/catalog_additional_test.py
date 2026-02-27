@@ -10,14 +10,13 @@ from gnitz.core import types as core_types
 from gnitz.core import values, batch
 from gnitz.core.errors import LayoutError, GnitzError
 from gnitz.catalog import identifiers
-from gnitz.catalog.engine import open_engine, _read_string
+from gnitz.catalog.engine import open_engine
 from gnitz.catalog.system_tables import (
     FIRST_USER_TABLE_ID, 
     OWNER_KIND_TABLE,
     pack_column_id
 )
 from gnitz.catalog.index_circuit import (
-    _backfill_index, 
     IndexCircuit, 
     get_index_key_type,
     make_index_schema,
@@ -98,7 +97,7 @@ def test_index_functional_and_fanout(base_dir):
         if _count_records(circuit.table) != 5:
             raise Exception("Index backfill count mismatch")
 
-        # Live fan-out test
+        # Live fan-out test (Verify the 3-stage ingestion pipeline)
         b2 = batch.ZSetBatch(family.schema)
         row = values.make_payload_row(family.schema)
         row.append_int(r_int64(777))
@@ -128,7 +127,8 @@ def test_orphaned_metadata_recovery(base_dir):
     try:
         idx_sys = engine.sys.indices
         b = batch.ZSetBatch(idx_sys.schema)
-        # Inject index metadata pointing to a non-existent table ID 99999
+        # Manually inject index metadata pointing to a non-existent table ID 99999
+        # to test the loader's resilience to orphaned records.
         _append_index_record(b, idx_sys.schema, 888, 99999, OWNER_KIND_TABLE, 1, 
                              "orphaned_idx", 0, "")
         idx_sys.ingest_batch(b)
@@ -409,6 +409,7 @@ def test_fk_self_reference(base_dir):
 
     engine = open_engine(db_path)
     try:
+        # Predict the TID of the next table for self-reference
         tid = engine.registry._next_table_id
         cols = [
             core_types.ColumnDefinition(core_types.TYPE_U64, name="emp_id"),

@@ -3,11 +3,13 @@
 import sys
 import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib import rposix, rposix_stat
 
 from gnitz.core import types, values, batch
 from gnitz.core.errors import LayoutError
+from gnitz.core.strings import resolve_string
 from gnitz.catalog import identifiers
-from gnitz.catalog.engine import open_engine, _read_string
+from gnitz.catalog.engine import open_engine
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID
 
 # ------------------------------------------------------------------------------
@@ -15,19 +17,35 @@ from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_I
 # ------------------------------------------------------------------------------
 
 
+def os_path_exists(path):
+    try:
+        rposix_stat.stat(path)
+        return True
+    except OSError:
+        return False
+
+
 def cleanup_dir(path):
-    if not os.path.exists(path):
+    if not os_path_exists(path):
         return
     for item in os.listdir(path):
         p = os.path.join(path, item)
-        if os.path.isdir(p):
-            cleanup_dir(p)
-        else:
-            os.unlink(p)
-    os.rmdir(path)
+        try:
+            st = rposix_stat.stat(p)
+            import stat
+            if stat.S_ISDIR(st.st_mode):
+                cleanup_dir(p)
+            else:
+                os.unlink(p)
+        except OSError:
+            pass
+    try:
+        rposix.rmdir(path)
+    except OSError:
+        pass
 
 
-def _count_records(table):
+def count_records(table):
     count = 0
     cursor = table.create_cursor()
     while cursor.is_valid():
@@ -45,14 +63,14 @@ def _count_records(table):
 def test_identifiers():
     os.write(1, "[Catalog] Testing Identifiers...\n")
 
-    valid_names =["orders", "Orders123", "my_table", "a", "A1_b2", "1a", "99_problems"]
+    valid_names = ["orders", "Orders123", "my_table", "a", "A1_b2", "1a", "99_problems"]
     for name in valid_names:
         try:
             identifiers.validate_user_identifier(name)
         except LayoutError:
             raise Exception("Valid identifier rejected: " + name)
 
-    invalid_names =[
+    invalid_names = [
         "_private",
         "_",
         "_system",
@@ -86,14 +104,14 @@ def test_identifiers():
 
 def test_bootstrap(base_dir):
     os.write(1, "[Catalog] Testing Bootstrap...\n")
-    db_path = os.path.join(base_dir, "bootstrap")
-    if not os.path.exists(db_path):
-        os.mkdir(db_path)
+    db_path = base_dir + "/bootstrap"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
 
     engine = open_engine(db_path)
     try:
         # 1. Check Schemas (_system and public)
-        c = _count_records(engine.sys.schemas)
+        c = count_records(engine.sys.schemas)
         if c != 2:
             raise Exception("Expected 2 schemas, got %d" % c)
         if not engine.registry.has_schema("_system"):
@@ -102,19 +120,19 @@ def test_bootstrap(base_dir):
             raise Exception("Missing public schema")
 
         # 2. Check Tables (7 system tables expected)
-        c = _count_records(engine.sys.tables)
+        c = count_records(engine.sys.tables)
         if c != 7:
             raise Exception("Expected 7 system tables, got %d" % c)
 
         # 3. Check Columns (36 bootstrap columns expected)
-        c = _count_records(engine.sys.columns)
+        c = count_records(engine.sys.columns)
         if c != 36:
             raise Exception("Expected 36 system columns, got %d" % c)
 
-        # 4. Check Sequences (2 expected)
-        c = _count_records(engine.sys.sequences)
+        # 4. Check Sequences (3 expected)
+        c = count_records(engine.sys.sequences)
         if c != 3:
-            raise Exception("Expected 2 sequences, got %d" % c)
+            raise Exception("Expected 3 sequences, got %d" % c)
 
         # 5. Check Registry State
         if engine.registry._next_table_id != FIRST_USER_TABLE_ID:
@@ -127,7 +145,7 @@ def test_bootstrap(base_dir):
     # Idempotent re-open check
     engine2 = open_engine(db_path)
     try:
-        if _count_records(engine2.sys.schemas) != 2:
+        if count_records(engine2.sys.schemas) != 2:
             raise Exception("Bootstrap duplicated records on second open")
     finally:
         engine2.close()
@@ -137,19 +155,19 @@ def test_bootstrap(base_dir):
 
 def test_ddl(base_dir):
     os.write(1, "[Catalog] Testing DDL...\n")
-    db_path = os.path.join(base_dir, "ddl")
-    if not os.path.exists(db_path):
-        os.mkdir(db_path)
+    db_path = base_dir + "/ddl"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
 
     engine = open_engine(db_path)
     try:
-        init_schemas = _count_records(engine.sys.schemas)
+        init_schemas = count_records(engine.sys.schemas)
 
         # Schema Creation
         engine.create_schema("sales")
         if not engine.registry.has_schema("sales"):
             raise Exception("'sales' schema not found")
-        if _count_records(engine.sys.schemas) != init_schemas + 1:
+        if count_records(engine.sys.schemas) != init_schemas + 1:
             raise Exception("schema count didn't increase")
 
         # Duplicate Schema Rejection
@@ -161,12 +179,12 @@ def test_ddl(base_dir):
         if not raised:
             raise Exception("Duplicate schema allowed")
 
-        cols =[
+        cols = [
             types.ColumnDefinition(types.TYPE_U64, name="id"),
             types.ColumnDefinition(types.TYPE_STRING, name="name"),
         ]
-        init_tables = _count_records(engine.sys.tables)
-        init_cols = _count_records(engine.sys.columns)
+        init_tables = count_records(engine.sys.tables)
+        init_cols = count_records(engine.sys.columns)
 
         # Table Creation
         family = engine.create_table("sales.orders", cols, 0)
@@ -174,18 +192,18 @@ def test_ddl(base_dir):
             raise Exception("Family name metadata incorrect")
         if not engine.registry.has("sales", "orders"):
             raise Exception("Table not found in registry")
-        if _count_records(engine.sys.tables) != init_tables + 1:
+        if count_records(engine.sys.tables) != init_tables + 1:
             raise Exception("Table count didn't increase")
-        if _count_records(engine.sys.columns) != init_cols + 2:
+        if count_records(engine.sys.columns) != init_cols + 2:
             raise Exception("Columns count didn't increase correctly")
 
         # Drop Table (Check Retractions)
         engine.drop_table("sales.orders")
         if engine.registry.has("sales", "orders"):
             raise Exception("Table still in registry after drop")
-        if _count_records(engine.sys.tables) != init_tables:
+        if count_records(engine.sys.tables) != init_tables:
             raise Exception("Table count didn't return to baseline")
-        if _count_records(engine.sys.columns) != init_cols:
+        if count_records(engine.sys.columns) != init_cols:
             raise Exception("Columns count didn't return to baseline")
 
         # System Table Drop Rejection
@@ -203,7 +221,7 @@ def test_ddl(base_dir):
         engine.drop_schema("temp")
         if engine.registry.has_schema("temp"):
             raise Exception("Schema still in registry after drop")
-        if _count_records(engine.sys.schemas) != init_schemas + 1:
+        if count_records(engine.sys.schemas) != init_schemas + 1:
             raise Exception("Schema count didn't return to baseline")
     finally:
         engine.close()
@@ -213,13 +231,13 @@ def test_ddl(base_dir):
 
 def test_edge_cases(base_dir):
     os.write(1, "[Catalog] Testing Edge Cases...\n")
-    db_path = os.path.join(base_dir, "edge_cases")
-    if not os.path.exists(db_path):
-        os.mkdir(db_path)
+    db_path = base_dir + "/edge_cases"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
 
     engine = open_engine(db_path)
     try:
-        cols =[
+        cols = [
             types.ColumnDefinition(types.TYPE_U64, name="id"),
         ]
 
@@ -270,7 +288,7 @@ def test_edge_cases(base_dir):
             raised = True
         if not raised:
             raise Exception("Allowed to drop non-empty schema")
-            
+
         # 6. Drop the table, then drop the schema should succeed
         engine.drop_table("my_schema.tbl2")
         engine.drop_schema("my_schema")
@@ -290,7 +308,7 @@ def test_edge_cases(base_dir):
             raise Exception("Unqualified drop table failed to drop from public")
 
         # 9. Invalid PK type
-        invalid_cols =[
+        invalid_cols = [
             types.ColumnDefinition(types.TYPE_STRING, name="id"),
         ]
         raised = False
@@ -302,7 +320,7 @@ def test_edge_cases(base_dir):
             raise Exception("Allowed to create table with non-U64/U128 PK")
 
         # 10. Too many columns (> 64)
-        many_cols =[]
+        many_cols = []
         for i in range(65):
             many_cols.append(types.ColumnDefinition(types.TYPE_U64, name="c" + str(i)))
         raised = False
@@ -351,7 +369,7 @@ def test_edge_cases(base_dir):
         engine.drop_table("public.tbl1_recreate")
 
         # 15. U128 PK support
-        cols_u128 =[
+        cols_u128 = [
             types.ColumnDefinition(types.TYPE_U128, name="uuid_pk"),
             types.ColumnDefinition(types.TYPE_STRING, name="data"),
         ]
@@ -393,7 +411,9 @@ def test_edge_cases(base_dir):
         # 19. Case sensitivity of tables
         engine.create_table("public.CaseTest", cols, 0)
         engine.create_table("public.casetest", cols, 0)
-        if not engine.registry.has("public", "CaseTest") or not engine.registry.has("public", "casetest"):
+        if not engine.registry.has("public", "CaseTest") or not engine.registry.has(
+            "public", "casetest"
+        ):
             raise Exception("Case sensitivity failed")
         engine.drop_table("public.CaseTest")
         engine.drop_table("public.casetest")
@@ -405,7 +425,7 @@ def test_edge_cases(base_dir):
             raise Exception("registry has_id failed")
         if engine.registry.get_by_id(tid).table_name != "reg_test":
             raise Exception("registry get_by_id failed")
-        
+
         raised = False
         try:
             engine.registry.get_by_id(999999)
@@ -413,16 +433,20 @@ def test_edge_cases(base_dir):
             raised = True
         if not raised:
             raise Exception("get_by_id on invalid ID should raise KeyError")
-            
+
         engine.drop_table("public.reg_test")
 
         # 21. Table with U128 payload and Nullable cols
-        cols_payload_u128 =[
+        cols_payload_u128 = [
             types.ColumnDefinition(types.TYPE_U64, name="id"),
             types.ColumnDefinition(types.TYPE_U128, name="uuid_payload"),
-            types.ColumnDefinition(types.TYPE_STRING, is_nullable=True, name="nullable_str"),
+            types.ColumnDefinition(
+                types.TYPE_STRING, is_nullable=True, name="nullable_str"
+            ),
         ]
-        u128_payload_table = engine.create_table("public.u128_payload_tbl", cols_payload_u128, 0)
+        u128_payload_table = engine.create_table(
+            "public.u128_payload_tbl", cols_payload_u128, 0
+        )
         if u128_payload_table.schema.columns[1].field_type.code != types.TYPE_U128.code:
             raise Exception("Failed to create u128 payload table correctly")
         if not u128_payload_table.schema.columns[2].is_nullable:
@@ -430,7 +454,7 @@ def test_edge_cases(base_dir):
         engine.drop_table("public.u128_payload_tbl")
 
         # 22. Schema padding / offsets logic
-        cols_padding =[
+        cols_padding = [
             types.ColumnDefinition(types.TYPE_U64, name="id"),
             types.ColumnDefinition(types.TYPE_U8, name="tiny"),
             types.ColumnDefinition(types.TYPE_U32, name="medium"),
@@ -448,10 +472,10 @@ def test_edge_cases(base_dir):
         n, has_u128, has_string, has_nullable = values._analyze_schema(pad_tbl.schema)
         if has_u128 or has_string or has_nullable:
             raise Exception("Incorrect flags for pad_tbl")
-        
-        n, has_u128, has_string, has_nullable = values._analyze_schema(u128_payload_table.schema)
-        # FIX: The logical evaluation for has_string was incorrect in the previous iteration.
-        # has_string IS True for u128_payload_tbl. Thus we must test `not has_string`.
+
+        n, has_u128, has_string, has_nullable = values._analyze_schema(
+            u128_payload_table.schema
+        )
         if not has_u128 or not has_string or not has_nullable:
             raise Exception("Incorrect flags for u128_payload_tbl")
 
@@ -459,7 +483,7 @@ def test_edge_cases(base_dir):
         name = engine.registry.get_schema_name(999999)
         if name != "":
             raise Exception("get_schema_name for invalid ID should return empty string")
-            
+
         sid = engine.registry.get_schema_id("nonexistent")
         if sid != -1:
             raise Exception("get_schema_id for invalid name should return -1")
@@ -484,12 +508,12 @@ def test_edge_cases(base_dir):
 
 def test_restart(base_dir):
     os.write(1, "[Catalog] Testing Restart & Persistence...\n")
-    db_path = os.path.join(base_dir, "restart")
-    if not os.path.exists(db_path):
-        os.mkdir(db_path)
+    db_path = base_dir + "/restart"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
 
     engine1 = open_engine(db_path)
-    cols =[
+    cols = [
         types.ColumnDefinition(types.TYPE_U64, name="id"),
         types.ColumnDefinition(types.TYPE_STRING, name="name"),
     ]
@@ -553,7 +577,8 @@ def test_restart(base_dir):
 
         acc = cursor.get_accessor()
         # col 1 is 'name' in our layout
-        py_string = _read_string(acc, 1)
+        l, pref, s_ptr, h_ptr, s_obj = acc.get_str_struct(1)
+        py_string = resolve_string(s_ptr, h_ptr, s_obj)
         if py_string != "Gnitz-O-Matic":
             raise Exception("expected 'Gnitz-O-Matic', got " + py_string)
 
@@ -580,9 +605,9 @@ def test_restart(base_dir):
 def entry_point(argv):
     os.write(1, "--- GnitzDB Comprehensive Catalog Test ---\n")
     base_dir = "catalog_test_data"
-    if os.path.exists(base_dir):
-        cleanup_dir(base_dir)
-    os.mkdir(base_dir)
+    cleanup_dir(base_dir)
+    if not os_path_exists(base_dir):
+        rposix.mkdir(base_dir, 0o755)
 
     try:
         test_identifiers()
@@ -594,9 +619,6 @@ def entry_point(argv):
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")
         return 1
-    finally:
-        # cleanup_dir(base_dir)
-        pass
 
     return 0
 

@@ -2,6 +2,7 @@
 
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
+from rpython.rtyper.lltypesystem import rffi
 
 from gnitz.catalog.system_tables import (
     FIRST_USER_SCHEMA_ID,
@@ -10,20 +11,27 @@ from gnitz.catalog.system_tables import (
 )
 from gnitz.core.errors import LayoutError, MemTableFullError
 from gnitz.core.types import TableSchema, ColumnDefinition
-from gnitz.core.batch import ZSetBatch
 from gnitz.catalog.index_circuit import promote_to_index_key
-from gnitz.storage.comparator import RawWALAccessor
 
 
-def _ingest_into_index(circuit, idx_batch):
+def _ingest_into_index_circuit(circuit, index_key, weight, source_pk):
     """
-    Internal helper to handle index ingestion.
+    Directly injects a record into an index circuit's store.
+    Handles uniqueness checks and MemTable exhaustion via flush-and-retry.
     """
+    # 1. Uniqueness check (SQL semantics: check for presence of index_key)
+    if circuit.is_unique and weight > 0:
+        if circuit.table.has_pk(index_key):
+            # Note: Phase B doesn't verify if it's the SAME source_pk;
+            # any existing key is a violation on insertion.
+            raise LayoutError("Unique index violation on index '%s'" % circuit.name)
+
+    # 2. Direct Injection with Flush Recovery. Reaches through to MemTable.
     try:
-        circuit.table.ingest_batch(idx_batch)
+        circuit.table.memtable.upsert_index_row(index_key, weight, source_pk)
     except MemTableFullError:
         circuit.table.flush()
-        circuit.table.ingest_batch(idx_batch)
+        circuit.table.memtable.upsert_index_row(index_key, weight, source_pk)
 
 
 def _wire_fk_constraints_for_family(family, registry):
@@ -48,6 +56,7 @@ class FKConstraint(object):
     """
     An active FK constraint on a single column of a TableFamily.
     """
+
     _immutable_fields_ = ["fk_col_idx", "target_family"]
 
     def __init__(self, fk_col_idx, target_family):
@@ -79,6 +88,7 @@ class TableFamily(object):
     """
     A logical table entity managing primary storage and secondary indices.
     """
+
     _immutable_fields_ = [
         "schema_name",
         "table_name",
@@ -123,110 +133,112 @@ class TableFamily(object):
 
     def ingest_batch(self, batch):
         """
-        Durable ingestion with incremental FK enforcement.
+        Durable ingestion pipeline:
+        1. Validate FKs (incremental)
+        2. Write Primary (WAL + MemTable)
+        3. Project into Indices (Direct Injection)
         """
+        n_records = batch.length()
+        if n_records == 0:
+            return
+
+        # --- Stage 1: Incremental FK Enforcement ---
         n_constraints = len(self.fk_constraints)
         if n_constraints > 0:
-            n_records = batch.length()
-            for c_idx in range(n_constraints):
-                constraint = self.fk_constraints[c_idx]
-                col_idx = constraint.fk_col_idx
-                target = constraint.target_family
-                col_type = self.schema.columns[col_idx].field_type
-
-                for i in range(n_records):
-                    if batch.get_weight(i) <= 0:
-                        continue
-                    acc = batch.get_accessor(i)
+            for i in range(n_records):
+                if batch.get_weight(i) <= 0:
+                    continue  # Only check integrity on insertions
+                
+                acc = batch.get_accessor(i)
+                for c_idx in range(n_constraints):
+                    constraint = self.fk_constraints[c_idx]
+                    col_idx = constraint.fk_col_idx
                     if acc.is_null(col_idx):
                         continue
 
-                    fk_key = promote_to_index_key(acc, col_idx, col_type)
-                    if not target.primary.has_pk(fk_key):
+                    # Promote bit-pattern to U128 for probing
+                    fk_key = promote_to_index_key(
+                        acc, col_idx, self.schema.columns[col_idx].field_type
+                    )
+                    if not constraint.target_family.primary.has_pk(fk_key):
                         raise LayoutError(
-                            "FK violation: column '%s' value not found in '%s.%s'"
-                            % (self.schema.columns[col_idx].name, 
-                               target.schema_name, target.table_name)
+                            "FK violation: column '%s' value not found in target '%s.%s'"
+                            % (
+                                self.schema.columns[col_idx].name,
+                                constraint.target_family.schema_name,
+                                constraint.target_family.table_name,
+                            )
                         )
 
+        # --- Stage 2: Primary Ingestion (Durable) ---
         self.primary.ingest_batch(batch)
 
-        n = len(self.index_circuits)
-        for i in range(n):
-            circuit = self.index_circuits[i]
-            idx_batch = circuit.compute_index_delta(batch)
-            if not idx_batch.is_empty():
-                _ingest_into_index(circuit, idx_batch)
+        # --- Stage 3: Secondary Index Projection (Direct) ---
+        n_indices = len(self.index_circuits)
+        if n_indices > 0:
+            for idx_num in range(n_indices):
+                circuit = self.index_circuits[idx_num]
+                for i in range(n_records):
+                    acc = batch.get_accessor(i)
+                    if acc.is_null(circuit.source_col_idx):
+                        continue
 
-    def bulk_validate_all_constraints(self, chunk_size=131072):
+                    source_pk = batch.get_pk(i)
+                    weight = batch.get_weight(i)
+                    index_key = promote_to_index_key(
+                        acc, circuit.source_col_idx, circuit.source_col_type
+                    )
+
+                    _ingest_into_index_circuit(circuit, index_key, weight, source_pk)
+
+    def bulk_validate_all_constraints(self):
         """
-        High-performance bulk validation using the zero-allocation batch system.
-        Used for full-table audits and after ALTER TABLE.
+        High-performance referential integrity audit.
         """
-        n_constraints = len(self.fk_constraints)
-        if n_constraints == 0:
-            return
+        for c_idx in range(len(self.fk_constraints)):
+            self._bulk_validate_single_fk(self.fk_constraints[c_idx])
 
-        for c_idx in range(n_constraints):
-            constraint = self.fk_constraints[c_idx]
-            self._bulk_validate_single_fk(constraint, chunk_size)
-
-    def _bulk_validate_single_fk(self, constraint, chunk_size):
-        col_idx = constraint.fk_col_idx
-        target = constraint.target_family
-        col_type = self.schema.columns[col_idx].field_type
-
-        # Create a projection schema: just the FK column (as the PK)
-        proj_schema = TableSchema([self.schema.columns[col_idx]], pk_index=0)
-        proj_batch = ZSetBatch(proj_schema, initial_capacity=chunk_size)
-        
-        source_cursor = self.primary.create_cursor()
-        target_cursor = target.primary.create_cursor()
-        
-        # Zero-allocation row (reused for every insertion into proj_batch)
-        dummy_row = make_payload_row(proj_schema)
-
-        while source_cursor.is_valid():
-            # 1. Chunked Projection
-            while source_cursor.is_valid() and proj_batch.length() < chunk_size:
-                if source_cursor.weight() > 0:
-                    acc = source_cursor.get_accessor()
-                    if not acc.is_null(col_idx):
-                        fk_key = promote_to_index_key(acc, col_idx, col_type)
-                        # We only care about unique FK presence.
-                        # weight=1 is sufficient for presence validation.
-                        proj_batch.append(fk_key, r_int64(1), dummy_row)
-                source_cursor.advance()
-
-            if proj_batch.is_empty():
+    def _bulk_validate_single_fk(self, constraint):
+        """
+        Optimized bulk validation. Instead of projecting/sorting, we scan 
+        the secondary index that is already guaranteed to exist for every FK.
+        """
+        # Find the supporting index
+        supporting_circuit = None
+        for circuit in self.index_circuits:
+            if circuit.source_col_idx == constraint.fk_col_idx:
+                supporting_circuit = circuit
                 break
 
-            # 2. Optimized Sort/Consolidate (Fixed-width fast path)
-            proj_batch.sort()
-            proj_batch.consolidate()
+        if supporting_circuit is None:
+            # Should be unreachable given engine-level auto-indexing.
+            raise LayoutError(
+                "No index found to support FK on column %d" % constraint.fk_col_idx
+            )
 
-            # 3. Monotonic target validation
-            n_unique = proj_batch.length()
-            for i in range(n_unique):
-                fk_key = proj_batch.get_pk(i)
-                target_cursor.seek(fk_key)
-                
-                if not target_cursor.is_valid() or target_cursor.key() != fk_key:
-                    proj_batch.free()
-                    source_cursor.close()
-                    target_cursor.close()
+        idx_cursor = supporting_circuit.create_cursor()
+        target_store = constraint.target_family.primary
+
+        while idx_cursor.is_valid():
+            # In index store: PK = Foreign Value, Weight = Algebraic Sum.
+            # We only validate presence for positive sums (active records).
+            if idx_cursor.weight() > 0:
+                fk_val = idx_cursor.key()
+                if not target_store.has_pk(fk_val):
+                    idx_cursor.close()
                     raise LayoutError(
-                        "Referential integrity violation in '%s.%s': "
-                        "value not found in target table '%s.%s'"
-                        % (self.schema_name, self.table_name,
-                           target.schema_name, target.table_name)
+                        "Referential integrity violation: value in '%s.%s' "
+                        "not found in target '%s.%s'"
+                        % (
+                            self.schema_name,
+                            self.table_name,
+                            constraint.target_family.schema_name,
+                            constraint.target_family.table_name,
+                        )
                     )
-            
-            proj_batch.clear()
+            idx_cursor.advance()
 
-        proj_batch.free()
-        source_cursor.close()
-        target_cursor.close()
+        idx_cursor.close()
 
     def flush(self):
         return self.primary.flush()

@@ -32,7 +32,6 @@ from gnitz.catalog.registry import (
     _wire_fk_constraints_for_family,
 )
 from gnitz.catalog.system_records import (
-    _read_string,
     _append_schema_record,
     _retract_schema_record,
     _append_table_record,
@@ -99,7 +98,7 @@ def _ensure_dir(path):
 def _remove_circuit_from_family(circuit, family):
     """
     Rebuilds the index_circuits list excluding the target.
-    Must use newlist_hint to avoid mr-poisoning.
+    Must use newlist_hint to avoid mr-poisoning (Appendix A).
     """
     old = family.index_circuits
     new_list = newlist_hint(len(old))
@@ -143,7 +142,6 @@ def _validate_fk_column(
         )
 
     # Promoted FK key type must match target PK type (e.g. U32 promotes to U64)
-    # get_index_key_type raises LayoutError for floats or strings.
     promoted_type = get_index_key_type(col.field_type)
     if promoted_type.code != target_pk_type.code:
         raise LayoutError(
@@ -272,7 +270,8 @@ class Engine(object):
 
         tbl_schema = family.schema
 
-        # 1. Drop indices (including FK-implied ones)
+        # 1. Drop indices
+        # Use a temporary snapshot to avoid list mutation issues during iteration
         circuits_to_drop = newlist_hint(len(family.index_circuits))
         for c in family.index_circuits:
             circuits_to_drop.append(c)
@@ -338,15 +337,14 @@ class Engine(object):
             if existing.source_col_idx == col_idx:
                 raise LayoutError("Index already exists on this column")
 
-        # Refactored for naming consistency (Phase C Step 4)
         index_name = make_secondary_index_name(schema_name, table_name, col_name)
         if self.registry.has_index_by_name(index_name):
             raise LayoutError("Index name collision: %s" % index_name)
 
         index_id = self.registry.allocate_index_id()
-
         source_pk_type = family.schema.get_pk_column().field_type
         idx_dir = family.directory + "/idx_" + str(index_id)
+        
         circuit = _make_index_circuit(
             index_id,
             family.table_id,
@@ -358,6 +356,8 @@ class Engine(object):
             is_unique,
             "",
         )
+        
+        # Populations uses Direct Injection Kernel (upsert_index_row)
         _backfill_index(circuit, family)
 
         self._write_index_record(
@@ -465,6 +465,7 @@ class Engine(object):
         return self.registry.get(schema_name, table_name)
 
     def close(self):
+        # Create a snapshot of keys to avoid modification issues during close
         keys = newlist_hint(len(self.registry._by_name))
         for k in self.registry._by_name:
             keys.append(k)

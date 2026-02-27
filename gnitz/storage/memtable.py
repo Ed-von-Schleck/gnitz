@@ -70,12 +70,40 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
         return r_uint64(off)
 
 
+class _IndexPayloadAccessor(core_comparator.RowAccessor):
+    """
+    Internal zero-allocation accessor for index projection.
+    Mocks a row where the payload is simply a Source PK.
+
+    FIXED: Uses split u64 components to avoid C-level struct alignment 
+    segfaults on u128 assignment (Appendix A).
+    """
+
+    def __init__(self):
+        self.pk_lo = r_uint64(0)
+        self.pk_hi = r_uint64(0)
+
+    def is_null(self, col_idx):
+        return False
+
+    def get_int(self, col_idx):
+        return self.pk_lo
+
+    def get_u128(self, col_idx):
+        # Appendix A: Reconstruct dynamically only at point of use.
+        return (r_uint128(self.pk_hi) << 64) | r_uint128(self.pk_lo)
+
+    def get_float(self, col_idx):
+        return 0.0
+
+    def get_str_struct(self, col_idx):
+        return (0, 0, lltype.nullptr(rffi.CCHARP.TO), lltype.nullptr(rffi.CCHARP.TO), "")
+
+
 class MemTable(object):
     """
     Mutable, in-memory Z-Set storage.
     Optimized for rapid algebraic coalescing via SkipList + Payload Hashing.
-
-    Entry point for mutations is upsert_batch().
     """
 
     _immutable_fields_ = [
@@ -86,15 +114,11 @@ class MemTable(object):
         "key_size",
         "head_off",
         "node_accessor",
+        "index_accessor",
     ]
 
     def __init__(self, schema, arena_size):
         self.schema = schema
-        # In translated (production) mode, use fixed-size arenas so that
-        # MemTableFullError is raised when the arena is exhausted, triggering
-        # a flush.  In test mode (ll2ctypes), Buffer already caps the initial
-        # allocation to 64 bytes; we must therefore allow the arenas to grow
-        # on demand or every ingest_batch call will immediately fail.
         growable = not we_are_translated()
         self.arena = buffer.Buffer(arena_size, growable=growable)
         self.blob_arena = buffer.Buffer(arena_size, growable=growable)
@@ -110,6 +134,9 @@ class MemTable(object):
         self.node_accessor = comparator.PackedNodeAccessor(
             schema, self.blob_arena.base_ptr
         )
+
+        # Reusable accessor for index projections
+        self.index_accessor = _IndexPayloadAccessor()
 
         # Reusable hash buffer to minimize mallocs
         self.hash_buf_cap = 1024
@@ -231,15 +258,20 @@ class MemTable(object):
             pk = batch.get_pk(i)
             w = batch.get_weight(i)
             acc = batch.get_accessor(i)
-
-            # Note: We rely on the internal upsert logic for correctness.
-            # accessor MUST implement RowAccessor (checked via type annotation).
             self._upsert_internal(pk, w, acc)
+
+    def upsert_index_row(self, index_key, weight, source_pk):
+        """
+        Direct Injection Kernel for secondary indices.
+        FIXED: Performs u128 split during assignment to satisfy C alignment.
+        """
+        self.index_accessor.pk_lo = r_uint64(source_pk)
+        self.index_accessor.pk_hi = r_uint64(source_pk >> 64)
+        self._upsert_internal(index_key, weight, self.index_accessor)
 
     def _upsert_internal(self, key, weight, accessor):
         """
         INTERNAL helper. Ingests a single record from any RowAccessor.
-        Callers must provide a valid RowAccessor implementation (e.g. from Batch).
         """
         base = self.arena.base_ptr
         hash_val, self.hash_buf, self.hash_buf_cap = serialize.compute_hash(
@@ -249,10 +281,8 @@ class MemTable(object):
         match_off = self._find_exact_values(key, hash_val, accessor)
 
         if match_off != 0:
-            # Existing node: additive coalescing
             new_w = node_get_weight(base, match_off) + weight
             if new_w == 0:
-                # Annihilation: unlink node
                 h = ord(base[match_off + 8])
                 for i in range(h):
                     pred_off = self._update_offsets[i]
@@ -263,7 +293,6 @@ class MemTable(object):
                 node_set_weight(base, match_off, new_w)
             return
 
-        # New node creation
         h = 1
         while h < MAX_HEIGHT and (self.rng.genrand32() & 1):
             h += 1
@@ -274,11 +303,6 @@ class MemTable(object):
         self._ensure_capacity(node_full_sz, accessor)
 
         new_ptr = self.arena.alloc(node_full_sz, alignment=16)
-        # Re-fetch base AFTER alloc: buffer.alloc itself calls ensure_capacity
-        # to account for alignment padding, which may trigger a second realloc
-        # invalidating any base captured before this point.  new_ptr is already
-        # computed from the post-realloc self.base_ptr inside alloc(), so the
-        # subtraction below is correct.
         base = self.arena.base_ptr
         new_off = rffi.cast(lltype.Signed, new_ptr) - rffi.cast(lltype.Signed, base)
 
@@ -286,7 +310,6 @@ class MemTable(object):
         new_ptr[8] = chr(h)
         key_ptr = rffi.ptradd(new_ptr, key_off)
 
-        # Write PK
         pk_u128 = r_uint128(key)
         if self.key_size == 16:
             rffi.cast(rffi.ULONGLONGP, key_ptr)[0] = rffi.cast(
@@ -302,13 +325,11 @@ class MemTable(object):
 
         node_set_hash(base, new_off, self.key_size, hash_val)
 
-        # Serialize Payload
         payload_ptr = node_get_payload_ptr(base, new_off, self.key_size)
         serialize.serialize_row(
             self.schema, accessor, payload_ptr, MemTableBlobAllocator(self.blob_arena)
         )
 
-        # Link into SkipList
         for i in range(h):
             pred = self._update_offsets[i]
             node_set_next_off(base, new_off, i, node_get_next_off(base, pred, i))
@@ -317,15 +338,12 @@ class MemTable(object):
     def _ensure_capacity(self, node_sz, accessor):
         blob_sz = serialize.get_heap_size(self.schema, accessor)
         if we_are_translated():
-            # Production mode: fixed-size arenas; raise to trigger a flush.
             if (
                 self.arena.offset + node_sz > self.arena.size
                 or self.blob_arena.offset + blob_sz > self.blob_arena.size
             ):
                 raise errors.MemTableFullError()
         else:
-            # Test mode: arenas are growable; let Buffer.ensure_capacity expand
-            # them on demand so tests are not limited by the initial arena size.
             self.arena.ensure_capacity(node_sz)
             self.blob_arena.ensure_capacity(blob_sz)
 
