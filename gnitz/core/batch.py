@@ -6,8 +6,10 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core.values import PayloadRow, make_payload_row, _analyze_schema
-from gnitz.core import serialize, strings as string_logic, comparator as core_comparator
-from gnitz.storage import buffer, comparator as storage_comparator
+from gnitz.core import serialize, strings as string_logic
+from gnitz.core import comparator as core_comparator
+from gnitz.storage import buffer
+from gnitz.storage import comparator as storage_comparator
 
 # ---------------------------------------------------------------------------
 # Arena Constants
@@ -148,23 +150,37 @@ class ArenaZSetBatch(object):
         return rffi.ptradd(self.primary_arena.base_ptr, i * self.record_stride)
 
     def get_pk(self, i):
+        assert 0 <= i < self._count
         ptr = self._get_rec_ptr(i)
         lo = rffi.cast(rffi.ULONGLONGP, ptr)[0]
         hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
         return (r_uint128(hi) << 64) | r_uint128(lo)
 
     def get_weight(self, i):
+        assert 0 <= i < self._count
         ptr = self._get_rec_ptr(i)
         return rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr, BATCH_REC_WEIGHT_OFFSET))[0]
 
     def get_accessor(self, i):
+        self.bind_raw_accessor(i, self._raw_accessor)
+        return self._raw_accessor
+
+    def bind_raw_accessor(self, i, out_accessor):
+        """
+        Zero-allocation binding of an external RawWALAccessor to record i.
+        Used to avoid singleton interference and Python object churn in loops.
+
+        WARNING: Accessors bound here are invalidated if the batch is
+        cleared, freed, sorted, or consolidated.
+        """
+        assert 0 <= i < self._count
         ptr = self._get_rec_ptr(i)
         null_word = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, BATCH_REC_NULL_OFFSET))[0]
         payload_ptr = rffi.ptradd(ptr, BATCH_REC_PAYLOAD_BASE)
-        self._raw_accessor.set_pointers(payload_ptr, self.blob_arena.base_ptr, null_word)
-        return self._raw_accessor
+        out_accessor.set_pointers(payload_ptr, self.blob_arena.base_ptr, null_word)
 
     def get_row(self, i):
+        assert 0 <= i < self._count
         ptr = self._get_rec_ptr(i)
         null_word = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, BATCH_REC_NULL_OFFSET))[0]
         payload_ptr = rffi.ptradd(ptr, BATCH_REC_PAYLOAD_BASE)
@@ -222,9 +238,6 @@ class ArenaZSetBatch(object):
     def compare_indices(self, idx_a, idx_b):
         """
         Zero-allocation comparison of two records already in primary_arena.
-
-        Reads blob data through self.blob_arena.base_ptr, which must still be
-        valid at the call site (i.e. do not call after blob_arena.free()).
         """
         ptr_a = self._get_rec_ptr(idx_a)
         ptr_b = self._get_rec_ptr(idx_b)
@@ -257,17 +270,6 @@ class ArenaZSetBatch(object):
         """
         Sort the batch in-place by (PK, payload) and compact blobs into a
         fresh contiguous arena.
-
-        After this method returns, ``_sorted`` is True and both primary_arena
-        and blob_arena are new, tightly-packed allocations.
-
-        Memory safety note on the repack loop
-        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        Each iteration reads blob data through ``self.blob_arena`` (the OLD
-        arena) and writes relocated blob data into ``new_blob`` via
-        ``new_alloc``.  ``self.blob_arena.free()`` is called ONLY after the
-        loop is complete, so all source reads are performed while the old
-        arena is still valid.  The two arenas never alias.
         """
         if self._count <= 1 or self._sorted:
             self._sorted = True
@@ -279,46 +281,45 @@ class ArenaZSetBatch(object):
             indices.append(i)
             scratch.append(0)
 
-        # compare_indices reads through self.blob_arena (still valid here).
         _mergesort_indices(indices, self, 0, self._count, scratch)
 
         new_primary = buffer.Buffer(self.primary_arena.capacity)
         new_blob    = buffer.Buffer(self.blob_arena.capacity)
         new_alloc   = BatchBlobAllocator(new_blob)
 
-        old_blob_base = self.blob_arena.base_ptr  # capture before any free()
+        old_blob_base = self.blob_arena.base_ptr
+
+        has_varlen = self._schema.has_varlen
 
         for i in range(self._count):
             old_idx  = indices[i]
-            src_ptr  = self._get_rec_ptr(old_idx)   # lives in old primary_arena
-
+            src_ptr  = self._get_rec_ptr(old_idx)
             dest_ptr = new_primary.alloc(self.record_stride, alignment=16)
 
-            # Copy the fixed-size header fields (PK, weight, null word).
-            # We do NOT do a bulk memmove of the full record because we are
-            # about to re-serialize the payload with relocated blob offsets;
-            # copying the payload bytes would leave stale offsets in dest_ptr
-            # that serialize_row would then silently overwrite anyway.
-            pk_lo   = rffi.cast(rffi.ULONGLONGP, src_ptr)[0]
-            pk_hi   = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
-            weight  = rffi.cast(rffi.LONGLONGP,  rffi.ptradd(src_ptr, BATCH_REC_WEIGHT_OFFSET))[0]
-            null_w  = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, BATCH_REC_NULL_OFFSET))[0]
+            if not has_varlen:
+                # FAST PATH: Fixed-width only, raw memmove the entire record.
+                buffer.c_memmove(
+                    rffi.cast(rffi.VOIDP, dest_ptr),
+                    rffi.cast(rffi.VOIDP, src_ptr),
+                    rffi.cast(rffi.SIZE_T, self.record_stride)
+                )
+            else:
+                # SLOW PATH: Variable-width, must relocate blobs.
+                pk_lo   = rffi.cast(rffi.ULONGLONGP, src_ptr)[0]
+                pk_hi   = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
+                weight  = rffi.cast(rffi.LONGLONGP,  rffi.ptradd(src_ptr, BATCH_REC_WEIGHT_OFFSET))[0]
+                null_w  = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, BATCH_REC_NULL_OFFSET))[0]
 
-            rffi.cast(rffi.ULONGLONGP, dest_ptr)[0] = pk_lo
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, 8))[0] = pk_hi
-            rffi.cast(rffi.LONGLONGP,  rffi.ptradd(dest_ptr, BATCH_REC_WEIGHT_OFFSET))[0] = weight
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, BATCH_REC_NULL_OFFSET))[0] = null_w
+                rffi.cast(rffi.ULONGLONGP, dest_ptr)[0] = pk_lo
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, 8))[0] = pk_hi
+                rffi.cast(rffi.LONGLONGP,  rffi.ptradd(dest_ptr, BATCH_REC_WEIGHT_OFFSET))[0] = weight
+                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, BATCH_REC_NULL_OFFSET))[0] = null_w
 
-            # Point the accessor at the SOURCE record's payload in the OLD
-            # primary arena, using the OLD blob base.  serialize_row reads
-            # blob data through old_blob_base and writes relocated data into
-            # new_blob via new_alloc, storing new offsets into dest_payload.
-            src_payload  = rffi.ptradd(src_ptr,  BATCH_REC_PAYLOAD_BASE)
-            dest_payload = rffi.ptradd(dest_ptr, BATCH_REC_PAYLOAD_BASE)
-            self._raw_accessor.set_pointers(src_payload, old_blob_base, null_w)
-            serialize.serialize_row(self._schema, self._raw_accessor, dest_payload, new_alloc)
+                src_payload  = rffi.ptradd(src_ptr,  BATCH_REC_PAYLOAD_BASE)
+                dest_payload = rffi.ptradd(dest_ptr, BATCH_REC_PAYLOAD_BASE)
+                self._raw_accessor.set_pointers(src_payload, old_blob_base, null_w)
+                serialize.serialize_row(self._schema, self._raw_accessor, dest_payload, new_alloc)
 
-        # All reads from old arenas are complete.  Safe to release them now.
         self.primary_arena.free()
         self.blob_arena.free()
 
@@ -330,10 +331,6 @@ class ArenaZSetBatch(object):
     def consolidate(self):
         """
         Group identical records, sum weights, and drop zero-weight ghosts.
-
-        Requires (and asserts via sort()) that the batch is sorted by
-        (PK, payload) before grouping.  On return the batch is both sorted
-        and consolidated, and ``_sorted`` is explicitly True.
         """
         if self._count == 0:
             return
@@ -345,11 +342,10 @@ class ArenaZSetBatch(object):
         new_alloc   = BatchBlobAllocator(new_blob)
         new_count   = 0
 
-        # Two accessors for the inner equality scan.  Both point into the
-        # OLD primary_arena / blob_arena, which remain valid until the frees
-        # below (after the loop).
         acc_a = storage_comparator.RawWALAccessor(self._schema)
         acc_b = storage_comparator.RawWALAccessor(self._schema)
+
+        has_varlen = self._schema.has_varlen
 
         i = 0
         while i < self._count:
@@ -369,7 +365,6 @@ class ArenaZSetBatch(object):
             while j < self._count:
                 ptr_j = self._get_rec_ptr(j)
 
-                # PK equality check (both words).
                 if rffi.cast(rffi.ULONGLONGP, ptr_j)[0] != pk_i_lo or \
                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_j, 8))[0] != pk_i_hi:
                     break
@@ -389,22 +384,32 @@ class ArenaZSetBatch(object):
                 )[0]
                 j += 1
 
-            # Ghost property: only emit records with a non-zero net weight.
             if weight_acc != 0:
                 dest = new_primary.alloc(self.record_stride, alignment=16)
-                rffi.cast(rffi.ULONGLONGP, dest)[0] = pk_i_lo
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = pk_i_hi
-                rffi.cast(rffi.LONGLONGP,  rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight_acc
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, BATCH_REC_NULL_OFFSET))[0] = null_i
 
-                payload_dest = rffi.ptradd(dest, BATCH_REC_PAYLOAD_BASE)
-                # acc_a still points at record i in the OLD (still-valid) arena.
-                serialize.serialize_row(self._schema, acc_a, payload_dest, new_alloc)
+                if not has_varlen:
+                    # FAST PATH: Fixed-width only, raw memmove.
+                    buffer.c_memmove(
+                        rffi.cast(rffi.VOIDP, dest),
+                        rffi.cast(rffi.VOIDP, ptr_i),
+                        rffi.cast(rffi.SIZE_T, self.record_stride)
+                    )
+                    # Overwrite the weight in the copied header with the accumulated total.
+                    rffi.cast(rffi.LONGLONGP, rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight_acc
+                else:
+                    # SLOW PATH: Variable-width, must re-serialize payload.
+                    rffi.cast(rffi.ULONGLONGP, dest)[0] = pk_i_lo
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = pk_i_hi
+                    rffi.cast(rffi.LONGLONGP,  rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight_acc
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, BATCH_REC_NULL_OFFSET))[0] = null_i
+
+                    payload_dest = rffi.ptradd(dest, BATCH_REC_PAYLOAD_BASE)
+                    serialize.serialize_row(self._schema, acc_a, payload_dest, new_alloc)
+                
                 new_count += 1
 
             i = j
 
-        # All reads from old arenas are complete.  Safe to release them now.
         self.primary_arena.free()
         self.blob_arena.free()
 

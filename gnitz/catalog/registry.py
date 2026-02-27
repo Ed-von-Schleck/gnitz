@@ -1,6 +1,7 @@
 # gnitz/catalog/registry.py
 
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
 
 from gnitz.catalog.system_tables import (
     FIRST_USER_SCHEMA_ID,
@@ -8,14 +9,15 @@ from gnitz.catalog.system_tables import (
     FIRST_USER_INDEX_ID,
 )
 from gnitz.core.errors import LayoutError, MemTableFullError
+from gnitz.core.types import TableSchema, ColumnDefinition
+from gnitz.core.batch import ZSetBatch
 from gnitz.catalog.index_circuit import promote_to_index_key
+from gnitz.storage.comparator import RawWALAccessor
 
 
 def _ingest_into_index(circuit, idx_batch):
     """
     Internal helper to handle index ingestion.
-    In translated mode, EphemeralTable may raise MemTableFullError,
-    requiring a flush before retrying the ingestion.
     """
     try:
         circuit.table.ingest_batch(idx_batch)
@@ -27,8 +29,6 @@ def _ingest_into_index(circuit, idx_batch):
 def _wire_fk_constraints_for_family(family, registry):
     """
     Iterates all FK columns of `family` and wires active FKConstraint objects.
-    Self-referential FKs are handled: if fk_table_id == family.table_id, the
-    target is family itself.
     """
     columns = family.schema.columns
     for col_idx in range(len(columns)):
@@ -36,12 +36,10 @@ def _wire_fk_constraints_for_family(family, registry):
         if col.fk_table_id == 0:
             continue
         if col.fk_table_id == family.table_id:
-            target_family = family  # Self-referential FK.
+            target_family = family
         elif registry.has_id(col.fk_table_id):
             target_family = registry.get_by_id(col.fk_table_id)
         else:
-            # Orphaned FK annotation: target was dropped. Skip silently;
-            # the drop_table guard prevents this in normal operation.
             continue
         family._add_fk_constraint(col_idx, target_family)
 
@@ -49,9 +47,7 @@ def _wire_fk_constraints_for_family(family, registry):
 class FKConstraint(object):
     """
     An active FK constraint on a single column of a TableFamily.
-    `target_family` is a direct reference to the referenced TableFamily.
     """
-
     _immutable_fields_ = ["fk_col_idx", "target_family"]
 
     def __init__(self, fk_col_idx, target_family):
@@ -60,11 +56,6 @@ class FKConstraint(object):
 
 
 class SystemTables(object):
-    """
-    Container for the seven core system tables.
-    Used during bootstrap and registry rebuilding.
-    """
-
     def __init__(self, schemas, tables, views, columns, indices, view_deps, sequences):
         self.schemas = schemas
         self.tables = tables
@@ -86,27 +77,8 @@ class SystemTables(object):
 
 class TableFamily(object):
     """
-    A logical table entity. Manages a primary PersistentTable and
-    a collection of soft-state secondary indices.
-
-    FK Validation Optimization
-    --------------------------
-    Previously, FK constraints were enforced by seeking a UnifiedCursor per
-    constraint. Because flushes invalidate cursors, this caused significant
-    malloc/free churn of TournamentTree structures on the C heap.
-
-    The engine now uses target.primary.has_pk(key) for FK validation. This
-    is a zero-allocation, algebraic existence check that sums weights across
-    the target's MemTable and columnar shards. It eliminates the need for
-    cursor caching and lifecycle management in this class.
-
-    Index delta batch pooling
-    -------------------------
-    IndexCircuit owns a reusable _scratch_batch that is cleared at the start
-    of each call. The caller must not free the returned batch; it is owned
-    by the circuit and freed in IndexCircuit.close().
+    A logical table entity managing primary storage and secondary indices.
     """
-
     _immutable_fields_ = [
         "schema_name",
         "table_name",
@@ -135,18 +107,12 @@ class TableFamily(object):
         self.directory = directory
         self.pk_col_idx = pk_col_idx
         self.created_lsn = 0
-        self.primary = primary  # PersistentTable
+        self.primary = primary
         self.schema = primary.schema
-        # Soft-state secondary indices
         self.index_circuits = newlist_hint(4)
-        # Active Foreign Key constraints
         self.fk_constraints = newlist_hint(0)
 
     def _add_fk_constraint(self, col_idx, target_family):
-        """
-        Registers an active FK constraint for column `col_idx`.
-        Called during create_table and _rebuild_registry.
-        """
         self.fk_constraints.append(FKConstraint(col_idx, target_family))
 
     def get_schema(self):
@@ -157,10 +123,8 @@ class TableFamily(object):
 
     def ingest_batch(self, batch):
         """
-        Durable ingestion into primary table followed by soft-state
-        fan-out to all registered secondary indices.
+        Durable ingestion with incremental FK enforcement.
         """
-        # ── FK Enforcement Pre-commit Check ──────────────────────────────────
         n_constraints = len(self.fk_constraints)
         if n_constraints > 0:
             n_records = batch.length()
@@ -171,38 +135,98 @@ class TableFamily(object):
                 col_type = self.schema.columns[col_idx].field_type
 
                 for i in range(n_records):
-                    weight = batch.get_weight(i)
-                    if weight <= 0:
-                        continue  # Skip retractions/annihilations
-
+                    if batch.get_weight(i) <= 0:
+                        continue
                     acc = batch.get_accessor(i)
                     if acc.is_null(col_idx):
-                        continue  # NULL values permitted in FK columns
+                        continue
 
                     fk_key = promote_to_index_key(acc, col_idx, col_type)
-
-                    # Zero-allocation algebraic existence check.
                     if not target.primary.has_pk(fk_key):
                         raise LayoutError(
-                            "Referential integrity violation: FK column '%s' value not "
-                            "found in target table '%s.%s'"
-                            % (
-                                self.schema.columns[col_idx].name,
-                                target.schema_name,
-                                target.table_name,
-                            )
+                            "FK violation: column '%s' value not found in '%s.%s'"
+                            % (self.schema.columns[col_idx].name, 
+                               target.schema_name, target.table_name)
                         )
 
-        # ── Primary Ingestion ─────────────────────────────────────────────────
         self.primary.ingest_batch(batch)
 
-        # ── Index Propagation ─────────────────────────────────────────────────
         n = len(self.index_circuits)
         for i in range(n):
             circuit = self.index_circuits[i]
             idx_batch = circuit.compute_index_delta(batch)
             if not idx_batch.is_empty():
                 _ingest_into_index(circuit, idx_batch)
+
+    def bulk_validate_all_constraints(self, chunk_size=131072):
+        """
+        High-performance bulk validation using the zero-allocation batch system.
+        Used for full-table audits and after ALTER TABLE.
+        """
+        n_constraints = len(self.fk_constraints)
+        if n_constraints == 0:
+            return
+
+        for c_idx in range(n_constraints):
+            constraint = self.fk_constraints[c_idx]
+            self._bulk_validate_single_fk(constraint, chunk_size)
+
+    def _bulk_validate_single_fk(self, constraint, chunk_size):
+        col_idx = constraint.fk_col_idx
+        target = constraint.target_family
+        col_type = self.schema.columns[col_idx].field_type
+
+        # Create a projection schema: just the FK column (as the PK)
+        proj_schema = TableSchema([self.schema.columns[col_idx]], pk_index=0)
+        proj_batch = ZSetBatch(proj_schema, initial_capacity=chunk_size)
+        
+        source_cursor = self.primary.create_cursor()
+        target_cursor = target.primary.create_cursor()
+        
+        # Zero-allocation row (reused for every insertion into proj_batch)
+        dummy_row = make_payload_row(proj_schema)
+
+        while source_cursor.is_valid():
+            # 1. Chunked Projection
+            while source_cursor.is_valid() and proj_batch.length() < chunk_size:
+                if source_cursor.weight() > 0:
+                    acc = source_cursor.get_accessor()
+                    if not acc.is_null(col_idx):
+                        fk_key = promote_to_index_key(acc, col_idx, col_type)
+                        # We only care about unique FK presence.
+                        # weight=1 is sufficient for presence validation.
+                        proj_batch.append(fk_key, r_int64(1), dummy_row)
+                source_cursor.advance()
+
+            if proj_batch.is_empty():
+                break
+
+            # 2. Optimized Sort/Consolidate (Fixed-width fast path)
+            proj_batch.sort()
+            proj_batch.consolidate()
+
+            # 3. Monotonic target validation
+            n_unique = proj_batch.length()
+            for i in range(n_unique):
+                fk_key = proj_batch.get_pk(i)
+                target_cursor.seek(fk_key)
+                
+                if not target_cursor.is_valid() or target_cursor.key() != fk_key:
+                    proj_batch.free()
+                    source_cursor.close()
+                    target_cursor.close()
+                    raise LayoutError(
+                        "Referential integrity violation in '%s.%s': "
+                        "value not found in target table '%s.%s'"
+                        % (self.schema_name, self.table_name,
+                           target.schema_name, target.table_name)
+                    )
+            
+            proj_batch.clear()
+
+        proj_batch.free()
+        source_cursor.close()
+        target_cursor.close()
 
     def flush(self):
         return self.primary.flush()
@@ -214,31 +238,16 @@ class TableFamily(object):
 
 
 class EntityRegistry(object):
-    """
-    Central directory for mapping names and IDs to catalog entities.
-    Tracks schema, table, and index ID sequences to prevent collisions.
-    """
-
     def __init__(self):
-        # Maps "schema.table" -> TableFamily
         self._by_name = {}
-        # Maps table_id (int) -> TableFamily
         self._by_id = {}
-        # Schema name -> schema_id (int)
         self._schema_name_to_id = {}
-        # Schema_id (int) -> schema name
         self._schema_id_to_name = {}
-
-        # Index Tracking
-        self._index_by_name = {}  # str -> IndexCircuit
-        self._index_by_id = {}  # int -> IndexCircuit
-
-        # ID allocators
+        self._index_by_name = {}
+        self._index_by_id = {}
         self._next_schema_id = FIRST_USER_SCHEMA_ID
         self._next_table_id = FIRST_USER_TABLE_ID
         self._next_index_id = FIRST_USER_INDEX_ID
-
-    # ── Schema management ────────────────────────────────────────────────
 
     def register_schema(self, schema_id, name):
         self._schema_name_to_id[name] = schema_id
@@ -269,8 +278,6 @@ class EntityRegistry(object):
         sid = self._next_schema_id
         self._next_schema_id += 1
         return sid
-
-    # ── Table management ─────────────────────────────────────────────────
 
     def register(self, family):
         qualified = family.schema_name + "." + family.table_name
@@ -314,8 +321,6 @@ class EntityRegistry(object):
                 return False
         return True
 
-    # ── Index management ─────────────────────────────────────────────────
-
     def allocate_index_id(self):
         iid = self._next_index_id
         self._next_index_id += 1
@@ -342,7 +347,6 @@ class EntityRegistry(object):
         raise LayoutError("Index does not exist: %s" % name)
 
     def is_joinable(self, owner_id, col_idx):
-        """Returns True if col_idx is the PK or has a secondary index."""
         if not self.has_id(owner_id):
             return False
         family = self.get_by_id(owner_id)

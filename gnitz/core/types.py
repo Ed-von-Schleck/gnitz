@@ -73,18 +73,16 @@ class TableSchema(object):
         column_offsets: Physical byte offsets for columns in a packed row (AoS).
                         The PK column always has an offset of -1 as it is
                         stored separately from the payload.
+        has_varlen: True if the schema contains variable-length data (Strings)
+                    requiring blob relocation during sort/compact.
     """
 
-    # We remove the [*] hint from list fields. While this is a minor JIT
-    # optimization loss, it is required to allow schemas to be constructed
-    # from both resizable lists (like joined schemas) and fixed-size literals
-    # (like test schemas) without triggering RPython's ListChangeUnallowed
-    # (mr-poisoning) errors during attribute assignment.
     _immutable_fields_ = [
         "columns",
         "pk_index",
         "column_offsets",
         "memtable_stride",
+        "has_varlen",
     ]
 
     def __init__(self, columns, pk_index=0):
@@ -97,11 +95,17 @@ class TableSchema(object):
 
         # Create a resizable list for self.columns
         cols_list = newlist_hint(num_cols)
+        has_varlen = False
         for c in columns:
-            cols_list.append(_to_col_def(c))
-        self.columns = cols_list
+            col_def = _to_col_def(c)
+            cols_list.append(col_def)
+            # Detect variable-length types (Strings)
+            if col_def.field_type.code == TYPE_STRING.code:
+                has_varlen = True
 
+        self.columns = cols_list
         self.pk_index = pk_index
+        self.has_varlen = has_varlen
 
         # Validate PK type
         pk_type = self.columns[pk_index].field_type
