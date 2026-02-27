@@ -1,6 +1,5 @@
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint32, r_uint64, r_int64
-from rpython.rlib.objectmodel import we_are_translated
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
 from gnitz.core import errors
 from rpython.rlib import jit
@@ -74,11 +73,7 @@ class Buffer(object):
         # bytes.  A 1 MB MemTable arena costs ~1 M Python iterations; with    #
         # 7 system tables × 2 arenas each, that is 14 million iterations      #
         # before a single row is inserted — causing the multi-second 100%     #
-        # CPU hang observed in catalog bootstrap tests.                        #
-        #                                                                      #
-        # we_are_translated() is False when running as plain Python and True   #
-        # when compiled with RPython, so this branch is constant-folded away  #
-        # in the translated binary and has no effect on production code.       #
+
         #                                                                      #
         # We cap the initial allocation to 64 bytes and force growable=True   #
         # so the buffer expands on demand.  The capacity invariants checked   #
@@ -92,9 +87,6 @@ class Buffer(object):
         # We therefore avoid c_memmove entirely in non-translated mode and    #
         # copy the live bytes manually instead (see ensure_capacity below).   #
         # ------------------------------------------------------------------ #
-        if not we_are_translated():
-            initial_size = min(initial_size, 64)
-            growable = True
 
         self.capacity = initial_size
         self.item_size = item_size
@@ -132,21 +124,11 @@ class Buffer(object):
             new_ptr = lltype.malloc(rffi.CCHARP.TO, new_cap * self.item_size, flavor='raw')
             
             if self.offset > 0:
-                if we_are_translated():
-                    # Production: fast C memmove.
-                    c_memmove(rffi.cast(rffi.VOIDP, new_ptr),
-                              rffi.cast(rffi.VOIDP, self.base_ptr),
-                              rffi.cast(rffi.SIZE_T, self.offset))
-                else:
-                    # Test mode (ll2ctypes): rffi.cast(VOIDP, ptr) on a freshly
-                    # lltype.malloc'd array triggers convert_array — O(new_cap)
-                    # pure-Python iterations — causing the same hang as the
-                    # initial Buffer.__init__ allocation would without the 64-byte
-                    # cap.  Copy the live bytes manually instead; buffers are
-                    # always small in test mode (start at 64 bytes, grow slowly).
-                    for i in range(self.offset):
-                        new_ptr[i] = self.base_ptr[i]
-            
+                # Production: fast C memmove.
+                c_memmove(rffi.cast(rffi.VOIDP, new_ptr),
+                          rffi.cast(rffi.VOIDP, self.base_ptr),
+                          rffi.cast(rffi.SIZE_T, self.offset))
+
             lltype.free(self.base_ptr, flavor='raw')
             self.base_ptr = new_ptr
             self.capacity = new_cap
@@ -180,13 +162,9 @@ class Buffer(object):
         if length <= 0: return
         dest = self.alloc(length, alignment=1)
         if src_ptr:
-            if we_are_translated():
-                c_memmove(rffi.cast(rffi.VOIDP, dest),
-                          rffi.cast(rffi.VOIDP, src_ptr),
-                          rffi.cast(rffi.SIZE_T, length))
-            else:
-                for i in range(length):
-                    dest[i] = src_ptr[i]
+            c_memmove(rffi.cast(rffi.VOIDP, dest),
+                      rffi.cast(rffi.VOIDP, src_ptr),
+                      rffi.cast(rffi.SIZE_T, length))
         else:
             for i in range(length):
                 dest[i] = '\x00'

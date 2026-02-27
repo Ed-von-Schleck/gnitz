@@ -4,7 +4,7 @@ from rpython.rlib.rrandom import Random
 from rpython.rlib.rarithmetic import r_uint64, intmask, r_int64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.objectmodel import newlist_hint, we_are_translated
+from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import (
     errors,
     serialize,
@@ -47,23 +47,15 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
 
     def allocate_from_ptr(self, src_ptr, length):
         """Zero-copy relocation of string data."""
-        from rpython.rlib.objectmodel import we_are_translated
 
         b_ptr = self.arena.alloc(length, alignment=8)
         if length > 0:
-            if we_are_translated():
-                # Production: fast C memmove.
-                buffer.c_memmove(
-                    rffi.cast(rffi.VOIDP, b_ptr),
-                    rffi.cast(rffi.VOIDP, src_ptr),
-                    rffi.cast(rffi.SIZE_T, length),
-                )
-            else:
-                # Test mode (ll2ctypes): rffi.cast(VOIDP, ...) on a raw-malloc'd
-                # array triggers convert_array — O(N) pure-Python iteration.
-                # Copy byte-by-byte instead; strings are short in practice.
-                for i in range(length):
-                    b_ptr[i] = src_ptr[i]
+            buffer.c_memmove(
+                rffi.cast(rffi.VOIDP, b_ptr),
+                rffi.cast(rffi.VOIDP, src_ptr),
+                rffi.cast(rffi.SIZE_T, length),
+            )
+            
         off = rffi.cast(lltype.Signed, b_ptr) - rffi.cast(
             lltype.Signed, self.arena.base_ptr
         )
@@ -119,7 +111,7 @@ class MemTable(object):
 
     def __init__(self, schema, arena_size):
         self.schema = schema
-        growable = not we_are_translated()
+        growable = True
         self.arena = buffer.Buffer(arena_size, growable=growable)
         self.blob_arena = buffer.Buffer(arena_size, growable=growable)
         self.rng = Random(1234)
@@ -337,15 +329,12 @@ class MemTable(object):
 
     def _ensure_capacity(self, node_sz, accessor):
         blob_sz = serialize.get_heap_size(self.schema, accessor)
-        if we_are_translated():
-            if (
-                self.arena.offset + node_sz > self.arena.size
-                or self.blob_arena.offset + blob_sz > self.blob_arena.size
-            ):
-                raise errors.MemTableFullError()
-        else:
-            self.arena.ensure_capacity(node_sz)
-            self.blob_arena.ensure_capacity(blob_sz)
+        if (
+            self.arena.offset + node_sz > self.arena.size
+            or self.blob_arena.offset + blob_sz > self.blob_arena.size
+        ):
+            raise errors.MemTableFullError()
+
 
     def flush(self, filename, table_id=0):
         sw = writer_table.TableShardWriter(self.schema, table_id)
