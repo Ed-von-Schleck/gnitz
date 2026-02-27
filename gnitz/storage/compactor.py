@@ -4,7 +4,7 @@ import os
 from rpython.rlib import jit
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from gnitz.storage import shard_table, writer_table, tournament_tree, index, cursor
 from gnitz.core import types, comparator as core_comparator
 
@@ -12,58 +12,15 @@ from gnitz.core import types, comparator as core_comparator
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
 
-def merge_row_contributions(active_cursors, schema):
-    """
-    Groups inputs by Semantic Row Payload and sums weights.
-    Uses the unified get_row_accessor() interface to remain storage-agnostic.
-    """
-    n = len(active_cursors)
-    results = newlist_hint(n)
-
-    processed = newlist_hint(n)
-    for _ in range(n):
-        processed.append(False)
-
-    i = 0
-    while i < n:
-        if processed[i]:
-            i += 1
-            continue
-
-        base_cursor = active_cursors[i]
-        total_weight = base_cursor.weight()
-        processed[i] = True
-
-        acc_left = base_cursor.get_row_accessor()
-
-        j = i + 1
-        while j < n:
-            if processed[j]:
-                j += 1
-                continue
-
-            other_cursor = active_cursors[j]
-            acc_right = other_cursor.get_row_accessor()
-
-            # Lexicographical comparison of non-PK columns
-            if core_comparator.compare_rows(schema, acc_left, acc_right) == 0:
-                total_weight += other_cursor.weight()
-                processed[j] = True
-            j += 1
-
-        # Only preserve records with a non-zero net weight (Ghost Property)
-        if total_weight != 0:
-            results.append((total_weight, i))
-        i += 1
-
-    return results
-
-
 def compact_shards(
     input_files, output_file, schema, table_id=0, validate_checksums=False
 ):
     """
     Executes an N-way merge compaction of overlapping shards.
+
+    This implementation uses the payload-aware TournamentTree to automatically
+    group identical (PrimaryKey, Payload) records across all input shards.
+    This eliminates the need for manual pairwise comparisons in the hot loop.
     """
     num_inputs = len(input_files)
     views = newlist_hint(num_inputs)
@@ -71,6 +28,7 @@ def compact_shards(
 
     tree = None
     writer = None
+    tmp_row = NULL_PTR
 
     try:
         # 1. Initialize cursors for all overlapping shards
@@ -85,26 +43,33 @@ def compact_shards(
             idx += 1
 
         # 2. Setup N-way merge via Tournament Tree
-        tree = tournament_tree.TournamentTree(cursors)
+        # The tree now strictly requires the schema to perform (PK, Payload) sorting.
+        tree = tournament_tree.TournamentTree(cursors, schema)
         writer = writer_table.TableShardWriter(schema, table_id)
 
         stride = schema.memtable_stride
         tmp_row = lltype.malloc(rffi.CCHARP.TO, stride, flavor="raw")
 
-        # 3. Process records in PK order
+        # 3. Process records in (PrimaryKey, Payload) order
         while not tree.is_exhausted():
             min_key = tree.get_min_key()
-            active_cursors = tree.get_all_cursors_at_min()
 
-            # Coalesce weights for all payloads matching this PK
-            merged = merge_row_contributions(active_cursors, schema)
+            # get_all_indices_at_min() returns all cursors matching BOTH
+            # Primary Key and Payload. This replaces the O(N^2) pairwise
+            # payload scanning logic previously found in merge_row_contributions.
+            indices = tree.get_all_indices_at_min()
 
-            num_cols = len(schema.columns)
-            m_idx = 0
-            num_merged = len(merged)
-            while m_idx < num_merged:
-                weight, exemplar_idx = merged[m_idx]
-                exemplar_cursor = active_cursors[exemplar_idx]
+            # Coalesce weights for this specific (PK, Payload) group
+            net_weight = r_int64(0)
+            i = 0
+            num_indices = len(indices)
+            while i < num_indices:
+                net_weight += cursors[indices[i]].weight()
+                i += 1
+
+            # Only preserve records with a non-zero net weight (Ghost Property)
+            if net_weight != 0:
+                exemplar_cursor = cursors[indices[0]]
                 acc = exemplar_cursor.get_row_accessor()
 
                 # Zero out the temporary AoS buffer
@@ -115,6 +80,7 @@ def compact_shards(
 
                 # Materialize columnar row into temporary AoS buffer for writing
                 heap_ptr = NULL_PTR
+                num_cols = len(schema.columns)
                 col_idx = 0
                 while col_idx < num_cols:
                     if col_idx == schema.pk_index:
@@ -132,20 +98,25 @@ def compact_shards(
                         dest_ptr[b] = col_ptr[b]
                         b += 1
 
-                    # Extract heap pointer if this is a string column to allow relocation
-                    if col_def.field_type == types.TYPE_STRING:
+                    # Extract heap pointer for string columns to enable zero-copy relocation.
+                    # All strings in a single shard share the same blob buffer pointer.
+                    if col_def.field_type.code == types.TYPE_STRING.code:
                         _, _, _, h_ptr, _ = acc.get_str_struct(col_idx)
                         heap_ptr = h_ptr
                     col_idx += 1
 
-                writer.add_row(min_key, weight, tmp_row, heap_ptr)
-                m_idx += 1
+                writer.add_row(min_key, net_weight, tmp_row, heap_ptr)
 
-            tree.advance_min_cursors(min_key)
+            # Advance all cursors in the processed group
+            i = 0
+            while i < num_indices:
+                tree.advance_cursor_by_index(indices[i])
+                i += 1
 
         writer.finalize(output_file)
-        lltype.free(tmp_row, flavor="raw")
     finally:
+        if tmp_row:
+            lltype.free(tmp_row, flavor="raw")
         if tree:
             tree.close()
         v_idx = 0
