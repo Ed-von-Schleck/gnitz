@@ -119,6 +119,9 @@ class Buffer(object):
 
     def _align(self, offset, alignment):
         return (offset + (alignment - 1)) & ~(alignment - 1)
+        
+    def reset(self):
+        self.offset = 0
 
     def ensure_capacity(self, needed_bytes):
         if self.offset + needed_bytes > self.capacity * self.item_size:

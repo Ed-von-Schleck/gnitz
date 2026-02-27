@@ -1,10 +1,9 @@
 # gnitz/storage/wal_format.py
 
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
-from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import serialize, xxh, strings as string_logic, errors, types
-from gnitz.storage import mmap_posix, wal_layout, buffer as buffer_ops
+from gnitz.core import serialize, xxh, strings as string_logic, errors
+from gnitz.storage import buffer as buffer_ops, wal_layout
 import gnitz.storage.comparator as storage_comparator
 import gnitz.core.comparator as core_comparator
 from gnitz.storage.wal_layout import (
@@ -18,7 +17,7 @@ from gnitz.storage.wal_layout import (
 
 
 class WALBlobAllocator(string_logic.BlobAllocator):
-    """Writes string tails into a growable WAL block buffer."""
+    """Writes string tails into a reused WAL block buffer."""
 
     def __init__(self, block_buf):
         self.block_buf = block_buf
@@ -78,16 +77,53 @@ class WALBlock(object):
 def compute_record_size(schema, accessor):
     """
     Calculates the physical size of a WAL record.
-    Used by WALWriter to determine block chunking boundaries.
+    Includes fixed metadata, stride, and variable-length heap data.
     """
     fixed_size = _REC_PAYLOAD_BASE + schema.memtable_stride
     heap_size = serialize.get_heap_size(schema, accessor)
     return fixed_size, heap_size
 
 
+def append_record_to_buffer(block_buf, schema, acc, pk, weight, allocator):
+    """
+    Writes a single record directly into the provided Buffer.
+    
+    CRITICAL: The caller MUST call block_buf.ensure_capacity() with the 
+    total size (fixed + heap) before calling this. This ensures the buffer 
+    does not reallocate during serialization, keeping rec_ptr stable.
+    """
+    stride = schema.memtable_stride
+    rec_start_off = block_buf.offset
+    
+    # 1. Reserve metadata and payload space
+    fixed_sz = _REC_PAYLOAD_BASE + stride
+    block_buf.alloc(fixed_sz)
+    
+    # Get a stable pointer for this record's fixed section
+    rec_ptr = rffi.ptradd(block_buf.base_ptr, rec_start_off)
+    
+    # 2. Write metadata header
+    wal_layout.write_u128(rec_ptr, _REC_PK_OFFSET, pk)
+    wal_layout.write_i64(rec_ptr, _REC_WEIGHT_OFFSET, weight)
+    
+    null_word = r_uint64(0)
+    if isinstance(acc, storage_comparator.RawWALAccessor):
+        null_word = acc.null_word
+    elif isinstance(acc, core_comparator.PayloadRowAccessor):
+        if acc._row:
+            null_word = acc._row._null_word
+    wal_layout.write_u64(rec_ptr, _REC_NULL_OFFSET, null_word)
+    
+    # 3. Serialize payload and heap blobs
+    # Strings will be allocated via allocator.allocate(), which advances block_buf.offset
+    payload_ptr = rffi.ptradd(rec_ptr, _REC_PAYLOAD_BASE)
+    serialize.serialize_row(schema, acc, payload_ptr, allocator)
+
+
 def decode_wal_block(buf, total_size, schema):
     """
     Decodes a raw WAL block into RawWALRecord pointers.
+    Used for recovery and WAL reading.
     """
     header = WALBlockHeaderView(buf)
     if header.get_format_version() != wal_layout.WAL_FORMAT_VERSION_CURRENT:
@@ -104,7 +140,7 @@ def decode_wal_block(buf, total_size, schema):
         ):
             raise errors.CorruptShardError("WAL checksum mismatch")
 
-    records = newlist_hint(entry_count)
+    records = [] # Resizable list
     current_offset = WAL_BLOCK_HEADER_SIZE
     accessor = storage_comparator.RawWALAccessor(schema)
 
@@ -127,74 +163,3 @@ def decode_wal_block(buf, total_size, schema):
         current_offset += f_sz + h_sz
 
     return WALBlock(header.get_lsn(), header.get_table_id(), records, raw_buf=buf)
-
-
-def write_wal_block(fd, lsn, table_id, batch, start_idx, count, schema):
-    """
-    Serializes a range of records into a WAL block in a single pass.
-    """
-    stride = schema.memtable_stride
-    # Initial capacity estimate: header + average record size
-    initial_cap = WAL_BLOCK_HEADER_SIZE + (count * (32 + stride + 16))
-    block_buf = buffer_ops.Buffer(initial_cap)
-
-    # Stable buffer for AoS payload to prevent dangling pointers during reallocs
-    temp_payload = lltype.malloc(rffi.CCHARP.TO, stride, flavor="raw")
-
-    try:
-        block_buf.alloc(WAL_BLOCK_HEADER_SIZE)
-        allocator = WALBlobAllocator(block_buf)
-
-        for i in range(start_idx, start_idx + count):
-            acc = batch.get_accessor(i)
-            pk = batch.get_pk(i)
-            weight = batch.get_weight(i)
-
-            for k in range(stride):
-                temp_payload[k] = "\x00"
-
-            rec_start_off = block_buf.offset
-            fixed_sz = _REC_PAYLOAD_BASE + stride
-            block_buf.alloc(fixed_sz)
-
-            # Single pass: columns are visited once here
-            serialize.serialize_row(schema, acc, temp_payload, allocator)
-
-            # Refresh ptr in case of reallocation
-            rec_ptr = rffi.ptradd(block_buf.base_ptr, rec_start_off)
-
-            wal_layout.write_u128(rec_ptr, _REC_PK_OFFSET, pk)
-            wal_layout.write_i64(rec_ptr, _REC_WEIGHT_OFFSET, weight)
-
-            null_word = r_uint64(0)
-            if isinstance(acc, storage_comparator.RawWALAccessor):
-                null_word = acc.null_word
-            elif isinstance(acc, core_comparator.PayloadRowAccessor):
-                if acc._row:
-                    null_word = acc._row._null_word
-            wal_layout.write_u64(rec_ptr, _REC_NULL_OFFSET, null_word)
-
-            buffer_ops.c_memmove(
-                rffi.cast(rffi.VOIDP, rffi.ptradd(rec_ptr, _REC_PAYLOAD_BASE)),
-                rffi.cast(rffi.VOIDP, temp_payload),
-                rffi.cast(rffi.SIZE_T, stride),
-            )
-
-        total_size = block_buf.offset
-        header = WALBlockHeaderView(block_buf.base_ptr)
-        header.set_lsn(r_uint64(lsn))
-        header.set_table_id(table_id)
-        header.set_entry_count(count)
-        header.set_total_size(total_size)
-        header.set_format_version(wal_layout.WAL_FORMAT_VERSION_CURRENT)
-
-        body_ptr = rffi.ptradd(block_buf.base_ptr, WAL_BLOCK_HEADER_SIZE)
-        body_size = total_size - WAL_BLOCK_HEADER_SIZE
-        if body_size > 0:
-            header.set_checksum(xxh.compute_checksum(body_ptr, body_size))
-
-        mmap_posix.write_c(fd, block_buf.base_ptr, rffi.cast(rffi.SIZE_T, total_size))
-
-    finally:
-        lltype.free(temp_payload, flavor="raw")
-        block_buf.free()
