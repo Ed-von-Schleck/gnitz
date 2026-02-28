@@ -1,6 +1,7 @@
 # gnitz/storage/wal_format.py
 
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
+from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import serialize, xxh, strings as string_logic, errors
 from gnitz.storage import buffer as buffer_ops, wal_layout
@@ -140,7 +141,7 @@ def decode_wal_block(buf, total_size, schema):
         ):
             raise errors.CorruptShardError("WAL checksum mismatch")
 
-    records = [] # Resizable list
+    records = newlist_hint(entry_count)
     current_offset = WAL_BLOCK_HEADER_SIZE
     accessor = storage_comparator.RawWALAccessor(schema)
 
