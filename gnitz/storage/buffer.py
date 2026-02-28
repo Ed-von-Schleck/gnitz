@@ -1,3 +1,5 @@
+# gnitz/storage/buffer.py
+
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint32, r_uint64, r_int64
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
@@ -5,21 +7,23 @@ from gnitz.core import errors
 from rpython.rlib import jit
 
 # Correctly define the compilation info to include the C string header
-eci = ExternalCompilationInfo(includes=['string.h'])
+eci = ExternalCompilationInfo(includes=["string.h"])
 
-# Declare memmove as an external C function. 
-c_memmove = rffi.llexternal('memmove', 
-                            [rffi.VOIDP, rffi.VOIDP, rffi.SIZE_T], 
-                            rffi.VOIDP, 
-                            compilation_info=eci)
+# Declare memmove as an external C function.
+c_memmove = rffi.llexternal(
+    "memmove", [rffi.VOIDP, rffi.VOIDP, rffi.SIZE_T], rffi.VOIDP, compilation_info=eci
+)
+
 
 def align_64(val):
     """Utility to align a value to 64-byte boundaries (layout requirement)."""
     return (val + 63) & ~63
 
+
 class MappedBuffer(object):
     """Immutable, non-owning view of memory (e.g., mmap)."""
-    _immutable_fields_ = ['ptr', 'size']
+
+    _immutable_fields_ = ["ptr", "size"]
 
     def __init__(self, ptr, size):
         self.ptr = ptr
@@ -57,42 +61,36 @@ class MappedBuffer(object):
 class Buffer(object):
     """
     Unified Mutable Buffer.
-    Can act as a fixed Arena or a growable RawBuffer.
+    Can act as a fixed Arena, a growable RawBuffer, or an unowned memory view.
     """
-    _immutable_fields_ = ['growable', 'item_size']
 
-    def __init__(self, initial_size, growable=True, item_size=1):
-        # ------------------------------------------------------------------ #
-        # ll2ctypes hang fix                                                   #
-        #                                                                      #
-        # In PyPy2 ll2ctypes mode (unit tests, non-translated), the ctypes    #
-        # representation of an lltype.malloc'd array is built lazily on the   #
-        # first rffi.ptradd / rffi.cast access, by iterating every element    #
-        # of the underlying array in pure Python (convert_array in             #
-        # ll2ctypes.py).  This is O(N) where N is the allocation size in      #
-        # bytes.  A 1 MB MemTable arena costs ~1 M Python iterations; with    #
-        # 7 system tables × 2 arenas each, that is 14 million iterations      #
-        # before a single row is inserted — causing the multi-second 100%     #
+    _immutable_fields_ = ["growable", "item_size", "is_owned"]
 
-        #                                                                      #
-        # We cap the initial allocation to 64 bytes and force growable=True   #
-        # so the buffer expands on demand.  The capacity invariants checked   #
-        # by MemTable._ensure_capacity continue to work correctly because      #
-        # Buffer.size returns capacity * item_size, which grows alongside the  #
-        # buffer itself.                                                        #
-        #                                                                      #
-        # NOTE: The same O(N) convert_array trigger applies to the realloc    #
-        # path in ensure_capacity — rffi.cast(VOIDP, new_ptr) on a freshly   #
-        # lltype.malloc'd array also runs convert_array for every byte.       #
-        # We therefore avoid c_memmove entirely in non-translated mode and    #
-        # copy the live bytes manually instead (see ensure_capacity below).   #
-        # ------------------------------------------------------------------ #
-
+    def __init__(self, initial_size, growable=True, item_size=1, is_owned=True):
         self.capacity = initial_size
         self.item_size = item_size
         self.growable = growable
+        self.is_owned = is_owned
         self.offset = 0  # tracks bytes used
-        self.base_ptr = lltype.malloc(rffi.CCHARP.TO, initial_size * item_size, flavor='raw')
+
+        if is_owned:
+            self.base_ptr = lltype.malloc(
+                rffi.CCHARP.TO, initial_size * item_size, flavor="raw"
+            )
+        else:
+            # Case for from_external_ptr. Logic handled by the factory method.
+            # We initialize to null here to satisfy the annotator.
+            self.base_ptr = lltype.nullptr(rffi.CCHARP.TO)
+
+    @staticmethod
+    def from_external_ptr(ptr, capacity, item_size=1):
+        """
+        Creates a Buffer wrapping externally managed memory (e.g. IPC memfd or mmap).
+        This buffer is strictly non-growable and will not free the pointer on disposal.
+        """
+        buf = Buffer(capacity, growable=False, item_size=item_size, is_owned=False)
+        buf.base_ptr = ptr
+        return buf
 
     @property
     def ptr(self):
@@ -111,7 +109,7 @@ class Buffer(object):
 
     def _align(self, offset, alignment):
         return (offset + (alignment - 1)) & ~(alignment - 1)
-        
+
     def reset(self):
         self.offset = 0
 
@@ -119,19 +117,31 @@ class Buffer(object):
         if self.offset + needed_bytes > self.capacity * self.item_size:
             if not self.growable:
                 raise errors.MemTableFullError()
-            
-            new_cap = max(self.capacity * 2, (self.offset + needed_bytes) // self.item_size + 1)
-            new_ptr = lltype.malloc(rffi.CCHARP.TO, new_cap * self.item_size, flavor='raw')
-            
-            if self.offset > 0:
-                # Production: fast C memmove.
-                c_memmove(rffi.cast(rffi.VOIDP, new_ptr),
-                          rffi.cast(rffi.VOIDP, self.base_ptr),
-                          rffi.cast(rffi.SIZE_T, self.offset))
 
-            lltype.free(self.base_ptr, flavor='raw')
+            new_cap = max(
+                self.capacity * 2, (self.offset + needed_bytes) // self.item_size + 1
+            )
+            new_ptr = lltype.malloc(
+                rffi.CCHARP.TO, new_cap * self.item_size, flavor="raw"
+            )
+
+            if self.offset > 0:
+                c_memmove(
+                    rffi.cast(rffi.VOIDP, new_ptr),
+                    rffi.cast(rffi.VOIDP, self.base_ptr),
+                    rffi.cast(rffi.SIZE_T, self.offset),
+                )
+
+            # We can only free the old pointer if we own it.
+            # Note: in current usage, a growable buffer is always an owned buffer.
+            if self.is_owned:
+                lltype.free(self.base_ptr, flavor="raw")
+
             self.base_ptr = new_ptr
             self.capacity = new_cap
+            # If we were forced to reallocate (e.g. during a sort on an unowned view),
+            # this specific Buffer instance now effectively owns its memory.
+            # However, typically sort() constructs a NEW Buffer instance instead.
 
     def alloc(self, nbytes, alignment=16):
         """Bump-pointer allocation. Returns raw pointer."""
@@ -156,20 +166,26 @@ class Buffer(object):
     def put_u128(self, val):
         p = self.alloc(16, alignment=16)
         rffi.cast(rffi.ULONGLONGP, p)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(val))
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(p, 8))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(val >> 64))
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(p, 8))[0] = rffi.cast(
+            rffi.ULONGLONG, r_uint64(val >> 64)
+        )
 
     def put_bytes(self, src_ptr, length):
-        if length <= 0: return
+        if length <= 0:
+            return
         dest = self.alloc(length, alignment=1)
         if src_ptr:
-            c_memmove(rffi.cast(rffi.VOIDP, dest),
-                      rffi.cast(rffi.VOIDP, src_ptr),
-                      rffi.cast(rffi.SIZE_T, length))
+            c_memmove(
+                rffi.cast(rffi.VOIDP, dest),
+                rffi.cast(rffi.VOIDP, src_ptr),
+                rffi.cast(rffi.SIZE_T, length),
+            )
         else:
             for i in range(length):
-                dest[i] = '\x00'
+                dest[i] = "\x00"
 
     def free(self):
         if self.base_ptr:
-            lltype.free(self.base_ptr, flavor='raw')
+            if self.is_owned:
+                lltype.free(self.base_ptr, flavor="raw")
             self.base_ptr = lltype.nullptr(rffi.CCHARP.TO)

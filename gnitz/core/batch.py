@@ -91,13 +91,6 @@ def _merge_indices(indices, batch, lo, mid, hi, scratch):
 class ArenaZSetBatch(object):
     """
     A zero-allocation DBSP Z-Set batch stored in raw memory arenas.
-
-    Invariant: ``_sorted`` means "the current contents of primary_arena are
-    in sorted order by (PK, payload)".  It does NOT merely mean "sort() has
-    been called at some point".  In particular:
-      - ``append_from_accessor`` resets it to False.
-      - ``sort()`` and ``consolidate()`` both set it to True on return.
-      - Any caller that reorders records externally must reset it to False.
     """
 
     _immutable_fields_ = ["_schema", "record_stride"]
@@ -105,27 +98,45 @@ class ArenaZSetBatch(object):
     def __init__(self, schema, initial_capacity=1024):
         self._schema = schema
         raw_stride = BATCH_HEADER_SIZE + schema.memtable_stride
-
-        # Align stride to 16 bytes so that _get_rec_ptr (i * stride) matches
-        # the physical layout produced by alloc(alignment=16).
         self.record_stride = (raw_stride + 15) & ~15
 
+        # If initial_capacity is 0, Buffer will safely initialize to nullptr.
         self.primary_arena = buffer.Buffer(initial_capacity * self.record_stride)
         self.blob_arena = buffer.Buffer(initial_capacity * 64)
 
         self.allocator = BatchBlobAllocator(self.blob_arena)
 
-        # Pre-allocated accessors for internal use (single-threaded; never
-        # escape the method that last called set_pointers on them).
+        # Pre-allocated accessors
         self._raw_accessor = storage_comparator.RawWALAccessor(schema)
         self._row_accessor = core_comparator.PayloadRowAccessor(schema)
-
-        # Dedicated accessors for zero-allocation comparisons in sort/merge.
         self._cmp_acc_a = storage_comparator.RawWALAccessor(schema)
         self._cmp_acc_b = storage_comparator.RawWALAccessor(schema)
 
         self._count = 0
         self._sorted = False
+
+    @staticmethod
+    def from_buffers(schema, primary_buf, blob_buf, count, is_sorted=True):
+        """
+        Zero-copy factory for IPC transport.
+        Uses initial_capacity=0 to skip wasteful heap allocations.
+        """
+        batch = ArenaZSetBatch(schema, initial_capacity=0)
+        
+        # Buffer views are already prepared by ipc.py
+        batch.primary_arena = primary_buf
+        batch.blob_arena = blob_buf
+        
+        # Synchronize offsets so future appends work correctly.
+        batch.primary_arena.offset = count * batch.record_stride
+        
+        batch._count = count
+        batch._sorted = is_sorted
+        
+        # Re-initialize strategy with the correct buffer
+        batch.allocator = BatchBlobAllocator(batch.blob_arena)
+        
+        return batch
 
     def length(self):
         return self._count
@@ -143,6 +154,7 @@ class ArenaZSetBatch(object):
         self._sorted = False
 
     def free(self):
+        # buffer.free() now respects is_owned flags correctly.
         self.primary_arena.free()
         self.blob_arena.free()
 
@@ -166,13 +178,6 @@ class ArenaZSetBatch(object):
         return self._raw_accessor
 
     def bind_raw_accessor(self, i, out_accessor):
-        """
-        Zero-allocation binding of an external RawWALAccessor to record i.
-        Used to avoid singleton interference and Python object churn in loops.
-
-        WARNING: Accessors bound here are invalidated if the batch is
-        cleared, freed, sorted, or consolidated.
-        """
         assert 0 <= i < self._count
         ptr = self._get_rec_ptr(i)
         null_word = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, BATCH_REC_NULL_OFFSET))[0]
@@ -187,10 +192,6 @@ class ArenaZSetBatch(object):
         return serialize.deserialize_row(
             self._schema, payload_ptr, self.blob_arena.base_ptr, null_word
         )
-
-    # ------------------------------------------------------------------
-    # Ingestion API
-    # ------------------------------------------------------------------
 
     def append(self, pk, weight, row):
         self._row_accessor.set_row(row)
@@ -214,7 +215,6 @@ class ArenaZSetBatch(object):
             if accessor._row:
                 null_word = accessor._row._null_word
         else:
-            # Slow-path reconstruction (rarely reached in the VM hot path).
             for i in range(len(self._schema.columns)):
                 if i == self._schema.pk_index:
                     continue
@@ -223,26 +223,16 @@ class ArenaZSetBatch(object):
                     null_word |= r_uint64(1) << payload_idx
 
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, BATCH_REC_NULL_OFFSET))[0] = null_word
-
         payload_dest = rffi.ptradd(dest, BATCH_REC_PAYLOAD_BASE)
         serialize.serialize_row(self._schema, accessor, payload_dest, self.allocator)
 
         self._count += 1
-        # Appending a new record invalidates any prior sorted order.
         self._sorted = False
 
-    # ------------------------------------------------------------------
-    # Sort & Consolidate
-    # ------------------------------------------------------------------
-
     def compare_indices(self, idx_a, idx_b):
-        """
-        Zero-allocation comparison of two records already in primary_arena.
-        """
         ptr_a = self._get_rec_ptr(idx_a)
         ptr_b = self._get_rec_ptr(idx_b)
 
-        # 128-bit PK comparison (hi word first for correct unsigned ordering).
         ahi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_a, 8))[0]
         bhi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_b, 8))[0]
         if ahi < bhi: return -1
@@ -253,7 +243,6 @@ class ArenaZSetBatch(object):
         if alo < blo: return -1
         if alo > blo: return 1
 
-        # Payload comparison (tie-break).
         na = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_a, BATCH_REC_NULL_OFFSET))[0]
         nb = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_b, BATCH_REC_NULL_OFFSET))[0]
 
@@ -267,10 +256,6 @@ class ArenaZSetBatch(object):
         return core_comparator.compare_rows(self._schema, self._cmp_acc_a, self._cmp_acc_b)
 
     def sort(self):
-        """
-        Sort the batch in-place by (PK, payload) and compact blobs into a
-        fresh contiguous arena.
-        """
         if self._count <= 1 or self._sorted:
             self._sorted = True
             return
@@ -283,12 +268,12 @@ class ArenaZSetBatch(object):
 
         _mergesort_indices(indices, self, 0, self._count, scratch)
 
+        # Sorting always produces an OWNED heap-allocated buffer.
         new_primary = buffer.Buffer(self.primary_arena.capacity)
         new_blob    = buffer.Buffer(self.blob_arena.capacity)
         new_alloc   = BatchBlobAllocator(new_blob)
 
         old_blob_base = self.blob_arena.base_ptr
-
         has_varlen = self._schema.has_varlen
 
         for i in range(self._count):
@@ -297,14 +282,12 @@ class ArenaZSetBatch(object):
             dest_ptr = new_primary.alloc(self.record_stride, alignment=16)
 
             if not has_varlen:
-                # FAST PATH: Fixed-width only, raw memmove the entire record.
                 buffer.c_memmove(
                     rffi.cast(rffi.VOIDP, dest_ptr),
                     rffi.cast(rffi.VOIDP, src_ptr),
                     rffi.cast(rffi.SIZE_T, self.record_stride)
                 )
             else:
-                # SLOW PATH: Variable-width, must relocate blobs.
                 pk_lo   = rffi.cast(rffi.ULONGLONGP, src_ptr)[0]
                 pk_hi   = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
                 weight  = rffi.cast(rffi.LONGLONGP,  rffi.ptradd(src_ptr, BATCH_REC_WEIGHT_OFFSET))[0]
@@ -329,9 +312,6 @@ class ArenaZSetBatch(object):
         self._sorted       = True
 
     def consolidate(self):
-        """
-        Group identical records, sum weights, and drop zero-weight ghosts.
-        """
         if self._count == 0:
             return
         if not self._sorted:
@@ -344,7 +324,6 @@ class ArenaZSetBatch(object):
 
         acc_a = storage_comparator.RawWALAccessor(self._schema)
         acc_b = storage_comparator.RawWALAccessor(self._schema)
-
         has_varlen = self._schema.has_varlen
 
         i = 0
@@ -388,16 +367,13 @@ class ArenaZSetBatch(object):
                 dest = new_primary.alloc(self.record_stride, alignment=16)
 
                 if not has_varlen:
-                    # FAST PATH: Fixed-width only, raw memmove.
                     buffer.c_memmove(
                         rffi.cast(rffi.VOIDP, dest),
                         rffi.cast(rffi.VOIDP, ptr_i),
                         rffi.cast(rffi.SIZE_T, self.record_stride)
                     )
-                    # Overwrite the weight in the copied header with the accumulated total.
                     rffi.cast(rffi.LONGLONGP, rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight_acc
                 else:
-                    # SLOW PATH: Variable-width, must re-serialize payload.
                     rffi.cast(rffi.ULONGLONGP, dest)[0] = pk_i_lo
                     rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = pk_i_hi
                     rffi.cast(rffi.LONGLONGP,  rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight_acc
@@ -421,7 +397,7 @@ class ArenaZSetBatch(object):
 
 
 # ---------------------------------------------------------------------------
-# Compatibility Aliases & Helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 ZSetBatch = ArenaZSetBatch
