@@ -63,7 +63,6 @@ def cleanup_dir(path):
 def test_vm_linear_pipeline(base_dir):
     log("[VM] Testing Linear Pipeline (Filter -> Map -> Union -> Sink)...")
     
-    # TableSchema handles resizable lists internally, so we can use a literal here.
     cols = [
         types.ColumnDefinition(types.TYPE_U64, name="pk"),
         types.ColumnDefinition(types.TYPE_I64, name="val")
@@ -73,7 +72,7 @@ def test_vm_linear_pipeline(base_dir):
     src_table = EphemeralTable(os.path.join(base_dir, "src_lin"), "src", schema)
     sink_table = EphemeralTable(os.path.join(base_dir, "sink_lin"), "sink", schema)
 
-    builder = query.QueryBuilder(src_table, schema)
+    builder = query.QueryBuilder(src_table)
     
     filter_fn = functions.IntEq(1, r_int64(42))
     map_fn = functions.IdentityMapper(schema)
@@ -126,12 +125,10 @@ def test_vm_reduce_and_distinct(base_dir):
 
     src_table = EphemeralTable(os.path.join(base_dir, "src_red"), "src", schema)
 
-    # Use a literal list [0] here. Instruction.REDUCE uses [*] hint.
-    # Passing a resizable list (from newlist_hint) would trigger ListChangeUnallowed.
     agg_fn = functions.SumAggregateFunction(1, types.TYPE_I64)
     group_cols = [0]
 
-    view = (query.QueryBuilder(src_table, schema)
+    view = (query.QueryBuilder(src_table)
             .reduce(group_cols, agg_fn) 
             .distinct()
             .build())
@@ -211,7 +208,7 @@ def test_vm_join_persistent(base_dir):
     trace_table.ingest_batch(batch_r)
     batch_r.free()
 
-    view = (query.QueryBuilder(src_table, schema_l)
+    view = (query.QueryBuilder(src_table)
             .join_persistent(trace_table)
             .build())
 
@@ -254,7 +251,7 @@ def test_vm_edge_cases(base_dir):
     src_table = EphemeralTable(os.path.join(base_dir, "src_edge"), "src", schema)
 
     log("  - Processing empty batch...")
-    view = query.QueryBuilder(src_table, schema).build()
+    view = query.QueryBuilder(src_table).build()
     in_batch = batch.ArenaZSetBatch(schema)
     try:
         out_batch = view.process(in_batch)
@@ -264,7 +261,7 @@ def test_vm_edge_cases(base_dir):
         view.close()
 
     log("  - Validating internal Ghost Property annihilation...")
-    view2 = query.QueryBuilder(src_table, schema).distinct().build()
+    view2 = query.QueryBuilder(src_table).distinct().build()
     in_batch2 = batch.ArenaZSetBatch(schema)
     try:
         row = values.make_payload_row(schema)
@@ -282,9 +279,8 @@ def test_vm_edge_cases(base_dir):
     log("  - Validating QueryBuilder schema enforcement...")
     raised = False
     try:
-        builder = query.QueryBuilder(src_table, schema)
+        builder = query.QueryBuilder(src_table)
         agg_fn = functions.MinAggregateFunction(1, types.TYPE_I64)
-        # Use literal [0] to match REDUCE instruction expectations
         group_cols = [0]
         builder.reduce(group_cols, agg_fn, -1)
     except query.QueryError:

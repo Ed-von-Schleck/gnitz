@@ -46,17 +46,13 @@ class VMSchema(object):
 class BaseRegister(object):
     """
     Base class for all VM registers.
-    
-    RPython Requirement: Fields accessed via a base-class reference (like in 
-    the Interpreter or Ops) must be defined and marked immutable at the 
-    base-class level to avoid ImmutableConflictError.
     """
     _immutable_fields_ = ['reg_id', 'vm_schema', 'batch', 'cursor', 'table']
 
     def __init__(self, reg_id, vm_schema):
         self.reg_id = reg_id
         self.vm_schema = vm_schema
-        # Initialize all potential subclass fields to None
+        # Subclass fields initialized to None for annotator monomorphism
         self.batch = None
         self.cursor = None
         self.table = None
@@ -71,7 +67,6 @@ class DeltaRegister(BaseRegister):
 
     def __init__(self, reg_id, vm_schema):
         BaseRegister.__init__(self, reg_id, vm_schema)
-        # Initialize the batch field defined in BaseRegister
         self.batch = ZSetBatch(vm_schema.table_schema)
 
     def is_delta(self): return True
@@ -86,7 +81,6 @@ class TraceRegister(BaseRegister):
 
     def __init__(self, reg_id, vm_schema, cursor, table=None):
         BaseRegister.__init__(self, reg_id, vm_schema)
-        # Initialize fields defined in BaseRegister
         self.cursor = cursor
         self.table = table
 
@@ -96,21 +90,15 @@ class TraceRegister(BaseRegister):
         """Looks up the current algebraic weight for a specific record."""
         if self.table is None:
             return r_int64(0)
+        # TableFamily or EphemeralTable (ZSetStore interface)
         return self.table.get_weight(key, payload)
-
-    def update_weight(self, key, delta, payload):
-        """Updates the stateful trace with an incoming delta (single record)."""
-        if self.table is not None:
-            # Performs an immediate in-memory ingestion into the trace's 
-            # backing table to maintain consistency for the current batch.
-            self.table.ingest(key, delta, payload)
 
     def update_batch(self, batch):
         """
         Updates the stateful trace with an incoming ZSetBatch.
-        Passes the core batch object directly to the storage boundary.
         """
         if self.table is not None:
+            # TableFamily or EphemeralTable (ZSetStore interface)
             self.table.ingest_batch(batch)
 
 

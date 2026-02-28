@@ -17,10 +17,6 @@ def compact_shards(
 ):
     """
     Executes an N-way merge compaction of overlapping shards.
-
-    This implementation uses the payload-aware TournamentTree to automatically
-    group identical (PrimaryKey, Payload) records across all input shards.
-    This eliminates the need for manual pairwise comparisons in the hot loop.
     """
     num_inputs = len(input_files)
     views = newlist_hint(num_inputs)
@@ -31,7 +27,6 @@ def compact_shards(
     tmp_row = NULL_PTR
 
     try:
-        # 1. Initialize cursors for all overlapping shards
         idx = 0
         while idx < num_inputs:
             filename = input_files[idx]
@@ -42,24 +37,16 @@ def compact_shards(
             cursors.append(cursor.ShardCursor(view))
             idx += 1
 
-        # 2. Setup N-way merge via Tournament Tree
-        # The tree now strictly requires the schema to perform (PK, Payload) sorting.
         tree = tournament_tree.TournamentTree(cursors, schema)
         writer = writer_table.TableShardWriter(schema, table_id)
 
         stride = schema.memtable_stride
         tmp_row = lltype.malloc(rffi.CCHARP.TO, stride, flavor="raw")
 
-        # 3. Process records in (PrimaryKey, Payload) order
         while not tree.is_exhausted():
             min_key = tree.get_min_key()
-
-            # get_all_indices_at_min() returns all cursors matching BOTH
-            # Primary Key and Payload. This replaces the O(N^2) pairwise
-            # payload scanning logic previously found in merge_row_contributions.
             indices = tree.get_all_indices_at_min()
 
-            # Coalesce weights for this specific (PK, Payload) group
             net_weight = r_int64(0)
             i = 0
             num_indices = len(indices)
@@ -67,18 +54,16 @@ def compact_shards(
                 net_weight += cursors[indices[i]].weight()
                 i += 1
 
-            # Only preserve records with a non-zero net weight (Ghost Property)
             if net_weight != 0:
                 exemplar_cursor = cursors[indices[0]]
-                acc = exemplar_cursor.get_row_accessor()
+                # FIXED: Use the unified AbstractCursor interface method
+                acc = exemplar_cursor.get_accessor()
 
-                # Zero out the temporary AoS buffer
                 k = 0
                 while k < stride:
                     tmp_row[k] = "\x00"
                     k += 1
 
-                # Materialize columnar row into temporary AoS buffer for writing
                 heap_ptr = NULL_PTR
                 num_cols = len(schema.columns)
                 col_idx = 0
@@ -98,8 +83,6 @@ def compact_shards(
                         dest_ptr[b] = col_ptr[b]
                         b += 1
 
-                    # Extract heap pointer for string columns to enable zero-copy relocation.
-                    # All strings in a single shard share the same blob buffer pointer.
                     if col_def.field_type.code == types.TYPE_STRING.code:
                         _, _, _, h_ptr, _ = acc.get_str_struct(col_idx)
                         heap_ptr = h_ptr
@@ -107,7 +90,6 @@ def compact_shards(
 
                 writer.add_row(min_key, net_weight, tmp_row, heap_ptr)
 
-            # Advance all cursors in the processed group
             i = 0
             while i < num_indices:
                 tree.advance_cursor_by_index(indices[i])

@@ -20,7 +20,7 @@ from gnitz.storage import (
     refcount,
     comparator as storage_comparator,
 )
-from gnitz.storage.ephemeral_table import _StorageBase, _name_to_tid
+from gnitz.storage.ephemeral_table import _StorageBase
 
 
 class PersistentTable(_StorageBase):
@@ -143,7 +143,8 @@ class PersistentTable(_StorageBase):
 
                     for rec in block.records:
                         rec_acc.set_record(rec)
-                        self.memtable._upsert_internal(rec.pk, rec.weight, rec_acc)
+                        # Step 8: Call renamed upsert_single
+                        self.memtable.upsert_single(rec.pk, rec.weight, rec_acc)
 
                     if block.lsn >= self.current_lsn:
                         self.current_lsn = block.lsn + r_uint64(1)

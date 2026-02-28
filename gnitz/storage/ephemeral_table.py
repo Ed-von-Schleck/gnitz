@@ -1,7 +1,6 @@
 # gnitz/storage/ephemeral_table.py
 
 import os
-import errno
 from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import (
     r_int64,
@@ -14,6 +13,8 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, errors, serialize
 from gnitz.core import comparator as core_comparator
+from gnitz.core.store import ZSetStore
+from gnitz.core.keys import promote_to_index_key
 from gnitz.storage import (
     index,
     memtable,
@@ -21,7 +22,6 @@ from gnitz.storage import (
     comparator as storage_comparator,
     cursor,
 )
-from gnitz.backend.table import AbstractTable
 
 
 def _name_to_tid(name):
@@ -36,10 +36,10 @@ def _name_to_tid(name):
     return tid
 
 
-class _StorageBase(AbstractTable):
+class _StorageBase(ZSetStore):
     """
     Shared base class for Persistent and Ephemeral tables.
-    Deduplicates all logic related to schema management and read-path operations.
+    Deduplicates logic related to schema management and read-path operations.
     """
 
     _immutable_fields_ = [
@@ -53,7 +53,7 @@ class _StorageBase(AbstractTable):
     def get_schema(self):
         return self.schema
 
-    def create_scratch_table(self, name, schema):
+    def create_child(self, name, schema):
         """Returns another EphemeralTable instance for recursive state."""
         scratch_dir = os.path.join(self.directory, "scratch_" + name)
         tid = _name_to_tid(name)
@@ -80,7 +80,6 @@ class _StorageBase(AbstractTable):
         """
         Fast-path existence check for a Primary Key.
         Returns True if the net algebraic weight across MemTable and Shards is > 0.
-        Zero-allocation: bypasses UnifiedCursors and TournamentTrees.
         """
         r_key = r_uint128(key)
 
@@ -118,7 +117,6 @@ class _StorageBase(AbstractTable):
         total_w = r_int64(0)
 
         # 1. Check SkipList MemTable
-        # Reuses the memtable's pre-allocated hash buffer to avoid churn.
         h_val, h_buf, h_cap = serialize.compute_hash(
             self.schema, accessor, self.memtable.hash_buf, self.memtable.hash_buf_cap
         )
@@ -159,7 +157,7 @@ class _StorageBase(AbstractTable):
 
 class EphemeralTable(_StorageBase):
     """
-    Scratch Z-Set storage for internal VM state (Traces, Materialized Views).
+    Scratch Z-Set storage for internal VM state or Secondary Indices.
     Bypasses the Write-Ahead Log to maximize throughput.
     """
 
@@ -183,9 +181,8 @@ class EphemeralTable(_StorageBase):
 
         try:
             rposix.mkdir(directory, 0o755)
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                raise
+        except OSError:
+            pass
 
         self.index = index.ShardIndex(table_id, schema, self.ref_counter)
         self.memtable = memtable.MemTable(schema, memtable_arena_size)
@@ -198,6 +195,50 @@ class EphemeralTable(_StorageBase):
             return
 
         self.memtable.upsert_batch(batch)
+
+    def ingest_projection(
+        self, source_batch, source_col_idx, source_col_type, payload_accessor, is_unique
+    ):
+        """
+        Hot-path projection kernel for secondary indices.
+        Extracts index keys from source_batch and injects them into the local store.
+        """
+        n = source_batch.length()
+        for i in range(n):
+            acc = source_batch.get_accessor(i)
+            if acc.is_null(source_col_idx):
+                continue
+
+            weight = source_batch.get_weight(i)
+            if weight == r_int64(0):
+                continue
+
+            index_key = promote_to_index_key(acc, source_col_idx, source_col_type)
+
+            if is_unique and weight > r_int64(0):
+                if self.has_pk(index_key):
+                    raise errors.LayoutError(
+                        "Unique index violation on column index %d" % source_col_idx
+                    )
+
+            source_pk = source_batch.get_pk(i)
+            # Mutation of payload_accessor (IndexPayloadAccessor) to avoid allocation
+            payload_accessor.pk_lo = r_uint64(source_pk)
+            payload_accessor.pk_hi = r_uint64(source_pk >> 64)
+
+            try:
+                self.memtable.upsert_single(index_key, weight, payload_accessor)
+            except errors.MemTableFullError:
+                self.flush()
+                self.memtable.upsert_single(index_key, weight, payload_accessor)
+
+    def ingest_one(self, key, weight, accessor):
+        """Cold-path injection for index backfills."""
+        try:
+            self.memtable.upsert_single(key, weight, accessor)
+        except errors.MemTableFullError:
+            self.flush()
+            self.memtable.upsert_single(key, weight, accessor)
 
     def flush(self):
         """Transitions MemTable state to a temporary columnar shard."""

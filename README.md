@@ -1,27 +1,47 @@
-# GnitzDB
+```markdown
+# Gnitz
 
-An incremental, persistent Z-Set database engine written in RPython.
+A high-performance, incremental database engine and Virtual Machine implemented in RPython. Gnitz implements the **DBSP** (Differential Dataflow) formal model, treating all data as **Z-Sets**—multisets where every record has an associated integer weight, enabling rapid algebraic coalescing of updates.
 
-Implements the [DBSP](https://arxiv.org/abs/2203.16684) computation model: queries are compiled into streaming circuits that process only deltas, not full re-evaluations. The storage layer is columnar and memory-mapped, with a skip-list MemTable, write-ahead log, and an N-way merge compactor.
+## Architecture
 
-## Status
+Gnitz is built on a layered architecture decoupled by the **Z-Store** interface:
 
-Early implementation. The core storage engine (MemTable, WAL, shards, compaction, manifest) is complete and tested. The VM (filter, map, reduce, join, distinct) is implemented but not yet fully exercised end-to-end. The architecture has four layers with strict unidirectional imports:
+- **`gnitz.core`**: Fundamental primitives, the type system, and the `ZSetStore` abstraction.
+- **`gnitz.storage`**: Durable engine featuring a SkipList MemTable, machine-word columnar shards, and a Write-Ahead Log (WAL).
+- **`gnitz.catalog`**: DDL management, secondary indices (implemented via high-performance projection kernels), and incremental Foreign Key enforcement.
+- **`gnitz.vm`**: The DBSP execution engine. It constructs incremental circuits that process delta batches into resulting updates.
 
-```
-core  ←  backend  ←  storage
-              ↑
-             vm
-```
+## Key Abstractions
 
-`backend/` is a narrow interface layer (~3 files) that decouples the VM from the columnar storage implementation, making alternative backends possible without touching VM code.
+### Z-Sets & Weights
+Updates are represented as deltas. An insertion has a weight of `+1`, a deletion `-1`. Algebraic summation across shards and the MemTable determines the current state.
 
-## Requirements
+### Z-Store Interface
+Defined in `gnitz.core.store`, this interface allows the VM and Catalog to operate against primary tables (`PersistentTable`), indices, or operator state (`EphemeralTable`) via a unified API for ingestion and cursors.
 
-PyPy2 and a checkout of the [PyPy source tree](https://pypy.org/download.html) for the RPython toolchain.
+### RPython & Meta-Tracing JIT
+The engine is written in RPython, a statically analyzable subset of Python 2.7. It translates to highly optimized C code with an integrated Meta-Tracing JIT that compiles hot DBSP circuit traces into machine code.
+
+## Directory Structure
+
+- `gnitz/core/`: Type system, serialization, and the `ZSetStore` interface.
+- `gnitz/storage/`: LSM-style storage implementation (MemTable, Shards, WAL, Manifest).
+- `gnitz/catalog/`: Engine for DDL, Table Families, and Index Projection.
+- `gnitz/dbsp/`: Implementations of DBSP operators (Join, Reduce, Distinct).
+- `gnitz/vm/`: Virtual machine interpreter, register file, and circuit builder.
+
+## Building and Testing
+
+Translation requires the PyPy/RPython toolchain.
 
 ```bash
-export PYPY_PATH=../pypy
-export PYTHONPATH=.:$PYPY_PATH
-pypy2 -m unittest discover tests/
+# Run tests
+pytest rpython_tests/
+
+# Translate to C (requires RPython toolchain)
+rpython gnitz/target.py
+```
+
+Refer to `appendix.md` for RPython implementation constraints and internal memory alignment requirements.
 ```

@@ -55,41 +55,11 @@ class MemTableBlobAllocator(string_logic.BlobAllocator):
                 rffi.cast(rffi.VOIDP, src_ptr),
                 rffi.cast(rffi.SIZE_T, length),
             )
-            
+
         off = rffi.cast(lltype.Signed, b_ptr) - rffi.cast(
             lltype.Signed, self.arena.base_ptr
         )
         return r_uint64(off)
-
-
-class _IndexPayloadAccessor(core_comparator.RowAccessor):
-    """
-    Internal zero-allocation accessor for index projection.
-    Mocks a row where the payload is simply a Source PK.
-
-    FIXED: Uses split u64 components to avoid C-level struct alignment 
-    segfaults on u128 assignment (Appendix A).
-    """
-
-    def __init__(self):
-        self.pk_lo = r_uint64(0)
-        self.pk_hi = r_uint64(0)
-
-    def is_null(self, col_idx):
-        return False
-
-    def get_int(self, col_idx):
-        return self.pk_lo
-
-    def get_u128(self, col_idx):
-        # Appendix A: Reconstruct dynamically only at point of use.
-        return (r_uint128(self.pk_hi) << 64) | r_uint128(self.pk_lo)
-
-    def get_float(self, col_idx):
-        return 0.0
-
-    def get_str_struct(self, col_idx):
-        return (0, 0, lltype.nullptr(rffi.CCHARP.TO), lltype.nullptr(rffi.CCHARP.TO), "")
 
 
 class MemTable(object):
@@ -106,7 +76,6 @@ class MemTable(object):
         "key_size",
         "head_off",
         "node_accessor",
-        "index_accessor",
     ]
 
     def __init__(self, schema, arena_size):
@@ -126,9 +95,6 @@ class MemTable(object):
         self.node_accessor = comparator.PackedNodeAccessor(
             schema, self.blob_arena.base_ptr
         )
-
-        # Reusable accessor for index projections
-        self.index_accessor = _IndexPayloadAccessor()
 
         # Reusable hash buffer to minimize mallocs
         self.hash_buf_cap = 1024
@@ -250,20 +216,11 @@ class MemTable(object):
             pk = batch.get_pk(i)
             w = batch.get_weight(i)
             acc = batch.get_accessor(i)
-            self._upsert_internal(pk, w, acc)
+            self.upsert_single(pk, w, acc)
 
-    def upsert_index_row(self, index_key, weight, source_pk):
+    def upsert_single(self, key, weight, accessor):
         """
-        Direct Injection Kernel for secondary indices.
-        FIXED: Performs u128 split during assignment to satisfy C alignment.
-        """
-        self.index_accessor.pk_lo = r_uint64(source_pk)
-        self.index_accessor.pk_hi = r_uint64(source_pk >> 64)
-        self._upsert_internal(index_key, weight, self.index_accessor)
-
-    def _upsert_internal(self, key, weight, accessor):
-        """
-        INTERNAL helper. Ingests a single record from any RowAccessor.
+        Public entry point for single-record ingestion.
         """
         base = self.arena.base_ptr
         hash_val, self.hash_buf, self.hash_buf_cap = serialize.compute_hash(
@@ -334,7 +291,6 @@ class MemTable(object):
             or self.blob_arena.offset + blob_sz > self.blob_arena.size
         ):
             raise errors.MemTableFullError()
-
 
     def flush(self, filename, table_id=0):
         sw = writer_table.TableShardWriter(self.schema, table_id)

@@ -5,10 +5,10 @@ from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128, r_ui
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import types
+from gnitz.core.store import AbstractCursor
 from gnitz.storage import tournament_tree, comparator
 from gnitz.core import comparator as core_comparator
 from gnitz.storage.memtable_node import node_get_key, node_get_weight, node_get_next_off
-from gnitz.backend.cursor import AbstractCursor
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
@@ -58,9 +58,6 @@ class BaseCursor(AbstractCursor):
         raise NotImplementedError
 
     def get_accessor(self):
-        raise NotImplementedError
-
-    def get_row_accessor(self):
         raise NotImplementedError
 
     def close(self):
@@ -131,9 +128,6 @@ class MemTableCursor(BaseCursor):
         self.accessor.set_row(memtable.arena.base_ptr, self.current_node_off)
         return self.accessor
 
-    def get_row_accessor(self):
-        return self.get_accessor()
-
 
 # ---------------------------------------------------------------------------
 # ShardCursor
@@ -151,9 +145,6 @@ class ShardCursor(BaseCursor):
         self.position = 0
         self.accessor = comparator.SoAAccessor(self.schema)
         self._skip_ghosts()
-
-    def get_row_accessor(self):
-        return self.accessor
 
     def get_accessor(self):
         return self.accessor
@@ -212,10 +203,6 @@ def _copy_cursors(cursors):
 class UnifiedCursor(AbstractCursor):
     """
     N-way merge cursor over one or more sub-cursors (MemTable + shards).
-
-    This implementation uses a payload-aware TournamentTree to ensure that
-    all sub-cursors positioned at the exact same (PrimaryKey, Payload)
-    are grouped together efficiently in O(log N).
     """
 
     _immutable_fields_ = ["schema", "is_single_source", "tree"]
@@ -227,7 +214,6 @@ class UnifiedCursor(AbstractCursor):
         self.is_single_source = self.num_cursors == 1
 
         if not self.is_single_source:
-            # The tree is now (PK, Payload) aware.
             self.tree = tournament_tree.TournamentTree(_copy_cursors(self.cursors), schema)
         else:
             self.tree = None
@@ -258,15 +244,11 @@ class UnifiedCursor(AbstractCursor):
         while not self.tree.is_exhausted():
             min_key = self.tree.get_min_key()
 
-            # Stop at the sentinel key to prevent infinite loops.
             if min_key == r_uint128(-1):
                 break
 
-            # get_all_indices_at_min() now returns all cursors that match
-            # BOTH the Primary Key and the Payload of the root node.
             indices = self.tree.get_all_indices_at_min()
             
-            # Sum weights over all identical (PK, Payload) records.
             net_weight = r_int64(0)
             idx = 0
             num_candidates = len(indices)
@@ -279,12 +261,10 @@ class UnifiedCursor(AbstractCursor):
                 self._current_key_lo = r_uint64(min_key)
                 self._current_key_hi = r_uint64(min_key >> 64)
                 self._current_weight = net_weight
-                # Any accessor in this group is valid for reading payload data.
                 self._current_accessor = self.cursors[indices[0]].get_accessor()
                 self._valid = True
                 return
             else:
-                # Ghost group: advance past it and keep searching.
                 idx = 0
                 while idx < num_candidates:
                     self.tree.advance_cursor_by_index(indices[idx])
@@ -307,7 +287,6 @@ class UnifiedCursor(AbstractCursor):
             self._find_next_non_ghost()
             return
 
-        # The tree root is currently at our current (PK, Payload) group.
         indices = self.tree.get_all_indices_at_min()
         idx = 0
         num_to_advance = len(indices)
@@ -318,7 +297,6 @@ class UnifiedCursor(AbstractCursor):
         self._find_next_non_ghost()
 
     def key(self):
-        # Appendix A: Reconstruct u128 for the computation/return point.
         return (r_uint128(self._current_key_hi) << 64) | r_uint128(self._current_key_lo)
 
     def weight(self):

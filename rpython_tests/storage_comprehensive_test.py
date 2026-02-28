@@ -607,7 +607,7 @@ def test_ephemeral_and_persistent_tables(base_dir):
     assert_equal_i64(r_int64(2), net_w2, "Summation visibility lost after ephemeral flush")
     
     # 3. Scratch Table creation
-    t_scr = t_eph.create_scratch_table("rec_trace", schema)
+    t_scr = t_eph.create_child("rec_trace", schema)
     assert_true(t_scr.directory.find("scratch_rec_trace") >= 0, "Scratch directory path incorrect")
     t_scr.close()
     

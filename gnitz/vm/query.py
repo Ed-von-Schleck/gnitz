@@ -1,20 +1,14 @@
 # gnitz/vm/query.py
 
 from gnitz.core import types, batch
-from gnitz.backend.table import AbstractTable
+from gnitz.core.store import ZSetStore
 from gnitz.vm import instructions, runtime, interpreter
 
 """
 Circuit builder for the DBSP virtual machine.
 
 QueryBuilder provides a fluent API for constructing incremental DBSP circuits
-as sequences of VM instructions over a typed register file.  The resulting
-View object drives a DBSPInterpreter to process one batch of updates per tick.
-
-ScalarFunction and AggregateFunction implementations live in
-gnitz.dbsp.functions and are passed into the builder methods as opaque
-arguments; query.py has no dependency on them beyond calling methods that
-are part of their published interfaces (is_linear(), output_column_type()).
+as sequences of VM instructions over a typed register file.
 """
 
 
@@ -56,29 +50,17 @@ class View(object):
 class QueryBuilder(object):
     """
     Fluent API for constructing incremental DBSP circuits.
-
-    Usage::
-
-        view = (
-            QueryBuilder(source_table, source_schema)
-            .filter(MyPredicate())
-            .map(MyMapper(), output_schema)
-            .distinct()
-            .sink(result_table)
-            .build()
-        )
-
-        out_batch = view.process(input_delta_batch)
     """
 
-    def __init__(self, source_table, source_schema):
+    def __init__(self, source_table):
+        # Step 12: source_schema is now derived directly from the ZSetStore
         self._source_table = source_table
         self.instructions = []
         self.registers = []
         self.cursors = []
         self._built = False
 
-        vm_schema_0 = runtime.VMSchema(source_schema)
+        vm_schema_0 = runtime.VMSchema(source_table.get_schema())
         reg_0 = runtime.DeltaRegister(0, vm_schema_0)
         self.registers.append(reg_0)
 
@@ -97,10 +79,6 @@ class QueryBuilder(object):
         return idx, reg
 
     def filter(self, predicate):
-        """
-        Appends a FILTER instruction.  predicate must be a ScalarFunction
-        implementing evaluate_predicate(row_accessor) -> bool.
-        """
         prev_reg = self.registers[self.current_reg_idx]
         if not prev_reg.is_delta():
             raise QueryError("Filter input must be a Delta stream")
@@ -113,10 +91,6 @@ class QueryBuilder(object):
         return self
 
     def map(self, mapper, output_schema):
-        """
-        Appends a MAP instruction.  mapper must be a ScalarFunction
-        implementing evaluate_map(row_accessor, output_row).
-        """
         prev_reg = self.registers[self.current_reg_idx]
         if not prev_reg.is_delta():
             raise QueryError("Map input must be a Delta stream")
@@ -129,7 +103,6 @@ class QueryBuilder(object):
         return self
 
     def negate(self):
-        """Appends a NEGATE instruction (multiplies all weights by -1)."""
         prev_reg = self.registers[self.current_reg_idx]
         if not prev_reg.is_delta():
             raise QueryError("Negate input must be a Delta stream")
@@ -142,17 +115,12 @@ class QueryBuilder(object):
         return self
 
     def distinct(self):
-        """
-        Appends a DISTINCT instruction.
-
-        Converts multiset semantics to set semantics using an internal
-        EphemeralTable as the operator's history trace.
-        """
         prev_reg = self.registers[self.current_reg_idx]
         schema = prev_reg.vm_schema.table_schema
 
         table_name = "_internal_distinct_%d" % len(self.instructions)
-        history_table = self._source_table.create_scratch_table(table_name, schema)
+        # Step 12: Renamed create_child
+        history_table = self._source_table.create_child(table_name, schema)
         cursor = history_table.create_cursor()
         self.cursors.append(cursor)
 
@@ -168,15 +136,6 @@ class QueryBuilder(object):
         return self
 
     def reduce(self, group_by_cols, agg_func, reg_trace_in_idx=-1):
-        """
-        Appends a REDUCE instruction followed by an INTEGRATE instruction that
-        persists the new aggregate values into the operator's internal trace.
-
-        group_by_cols:    list of column indices to group by
-        agg_func:         AggregateFunction instance (from gnitz.dbsp.functions)
-        reg_trace_in_idx: register index of the input history trace; required
-                          when agg_func.is_linear() is False (MIN, MAX)
-        """
         prev_reg = self.registers[self.current_reg_idx]
         input_schema = prev_reg.vm_schema.table_schema
 
@@ -192,7 +151,8 @@ class QueryBuilder(object):
         out_idx, reg_out = self._add_register(out_schema)
 
         trace_name = "_internal_reduce_trace_%d" % len(self.instructions)
-        trace_table = self._source_table.create_scratch_table(trace_name, out_schema)
+        # Step 12: Renamed create_child
+        trace_table = self._source_table.create_child(trace_name, out_schema)
         cursor = trace_table.create_cursor()
         self.cursors.append(cursor)
 
@@ -224,9 +184,6 @@ class QueryBuilder(object):
         return self
 
     def join_persistent(self, table):
-        """
-        Appends a JOIN_DELTA_TRACE instruction against a persistent table.
-        """
         prev_reg = self.registers[self.current_reg_idx]
         cursor = table.create_cursor()
         self.cursors.append(cursor)
@@ -246,10 +203,6 @@ class QueryBuilder(object):
         return self
 
     def union(self, other_builder=None):
-        """
-        Appends a UNION instruction.  If other_builder is None, this is an
-        identity copy of the current stream.
-        """
         prev_reg = self.registers[self.current_reg_idx]
         other_reg = None
         if other_builder is not None:
@@ -263,22 +216,12 @@ class QueryBuilder(object):
         return self
 
     def sink(self, table):
-        """
-        Appends an INTEGRATE instruction that flushes the current stream into
-        a persistent table.  This does not change the current register; the
-        stream remains available for further chaining.
-        """
         prev_reg = self.registers[self.current_reg_idx]
         op = instructions.IntegrateOp(prev_reg, table)
         self.instructions.append(op)
         return self
 
     def build(self):
-        """
-        Finalizes the instruction sequence and returns a compiled View.
-
-        After build() is called, the builder must not be used again.
-        """
         if not self._built:
             self.instructions.append(instructions.HaltOp())
             self._built = True

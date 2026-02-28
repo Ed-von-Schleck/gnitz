@@ -6,7 +6,7 @@ from rpython.rlib.rarithmetic import (
     r_ulonglonglong as r_uint128,
 )
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rtyper.lltypesystem import rffi
+from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core.types import (
     TYPE_U8,
@@ -24,8 +24,43 @@ from gnitz.core.types import (
     ColumnDefinition,
     TableSchema,
 )
-from gnitz.core.errors import LayoutError, MemTableFullError
+from gnitz.core.errors import LayoutError
+from gnitz.core import comparator as core_comparator
+from gnitz.core.keys import promote_to_index_key
 from gnitz.storage.ephemeral_table import EphemeralTable
+
+
+class IndexPayloadAccessor(core_comparator.RowAccessor):
+    """
+    Internal zero-allocation accessor for index projection.
+    Mocks a row where the payload is simply a Source PK.
+
+    Appendix A: Uses split u64 components to avoid C-level struct alignment 
+    segfaults on u128 assignment.
+    """
+
+    def __init__(self):
+        self.pk_lo = r_uint64(0)
+        self.pk_hi = r_uint64(0)
+
+    def is_null(self, col_idx):
+        return False
+
+    def get_int(self, col_idx):
+        return self.pk_lo
+
+    def get_int_signed(self, col_idx):
+        return rffi.cast(rffi.LONGLONG, self.pk_lo)
+
+    def get_u128(self, col_idx):
+        # Appendix A: Reconstruct dynamically only at point of use.
+        return (r_uint128(self.pk_hi) << 64) | r_uint128(self.pk_lo)
+
+    def get_float(self, col_idx):
+        return 0.0
+
+    def get_str_struct(self, col_idx):
+        return (0, r_int64(0), lltype.nullptr(rffi.CCHARP.TO), lltype.nullptr(rffi.CCHARP.TO), "")
 
 
 def get_index_key_type(field_type):
@@ -39,7 +74,6 @@ def get_index_key_type(field_type):
     if code == TYPE_U64.code:
         return TYPE_U64
 
-    # Using explicit 'or' comparisons to avoid RPython TyperError
     if (
         code == TYPE_I64.code
         or code == TYPE_U32.code
@@ -68,32 +102,6 @@ def make_index_schema(index_key_type, source_pk_type):
     return TableSchema(cols, pk_index=0)
 
 
-def promote_to_index_key(accessor, col_idx, source_col_type):
-    """
-    Extracts a value from the source table and promotes it to a uniform
-    r_uint128 key suitable for the index. Signed types are bit-reinterpreted.
-    """
-    code = source_col_type.code
-    if code == TYPE_U128.code:
-        return accessor.get_u128(col_idx)
-    if code == TYPE_U64.code:
-        return r_uint128(accessor.get_int(col_idx))
-
-    if code == TYPE_U32.code or code == TYPE_U16.code or code == TYPE_U8.code:
-        return r_uint128(accessor.get_int(col_idx))  # zero-extend
-
-    if code == TYPE_I64.code:
-        # get_int returns r_uint64 — same bit pattern, zero-extended to r_uint128
-        return r_uint128(accessor.get_int(col_idx))
-
-    if code == TYPE_I32.code or code == TYPE_I16.code or code == TYPE_I8.code:
-        # Sign-extend to 64 bits, then interpret as unsigned bit pattern
-        signed_64 = accessor.get_int_signed(col_idx)  # r_int64
-        return r_uint128(rffi.cast(rffi.ULONGLONG, signed_64))
-
-    raise LayoutError("Cannot promote column type %d to index key" % code)
-
-
 def make_fk_index_name(schema_name, table_name, col_name):
     """Convention: schema__table__fk_column"""
     return schema_name + "__" + table_name + "__fk_" + col_name
@@ -107,8 +115,6 @@ def make_secondary_index_name(schema_name, table_name, col_name):
 class IndexCircuit(object):
     """
     A descriptor and state-holder for a secondary index.
-    The work of projecting deltas is now handled by TableFamily using the 
-    index store's Direct Injection Kernel (upsert_index_row).
     """
 
     _immutable_fields_ = [
@@ -122,6 +128,7 @@ class IndexCircuit(object):
         "is_unique",
         "cache_dir",
         "table",
+        "_index_payload_accessor",
     ]
 
     def __init__(
@@ -137,16 +144,17 @@ class IndexCircuit(object):
         cache_dir,
         table,
     ):
-        self.index_id = index_id  # int
-        self.owner_id = owner_id  # int (table_id of source table)
-        self.source_col_idx = source_col_idx  # int
-        self.source_col_type = source_col_type  # FieldType
-        self.index_key_type = index_key_type  # FieldType: TYPE_U64 or TYPE_U128
-        self.source_pk_type = source_pk_type  # FieldType: TYPE_U64 or TYPE_U128
-        self.name = name  # str
-        self.is_unique = is_unique  # bool
-        self.cache_dir = cache_dir  # str
-        self.table = table  # EphemeralTable (the index store)
+        self.index_id = index_id
+        self.owner_id = owner_id
+        self.source_col_idx = source_col_idx
+        self.source_col_type = source_col_type
+        self.index_key_type = index_key_type
+        self.source_pk_type = source_pk_type
+        self.name = name
+        self.is_unique = is_unique
+        self.cache_dir = cache_dir
+        self.table = table  # EphemeralTable
+        self._index_payload_accessor = IndexPayloadAccessor()
 
     def create_cursor(self):
         return self.table.create_cursor()
@@ -169,9 +177,6 @@ def _make_index_circuit(
     is_unique,
     cache_dir,
 ):
-    """
-    Creates the directory and EphemeralTable for an index and returns the circuit.
-    """
     index_key_type = get_index_key_type(source_col_type)
     idx_schema = make_index_schema(index_key_type, source_pk_type)
     idx_table = EphemeralTable(
@@ -193,35 +198,34 @@ def _make_index_circuit(
 
 def _backfill_index(circuit, source_family):
     """
-    Performs the initial population of a secondary index by scanning the
-    source table. Uses the Direct Injection Kernel to eliminate per-row
-    batch and row object allocations.
+    Initial population of a secondary index by scanning the source table.
+    Uses the ZSetStore interface and the optimized ingest_one kernel.
     """
-    src_cursor = source_family.primary.create_cursor()
+    src_cursor = source_family.create_cursor()
 
     while src_cursor.is_valid():
         acc = src_cursor.get_accessor()
         weight = src_cursor.weight()
 
-        if weight != 0 and not acc.is_null(circuit.source_col_idx):
+        if weight != r_int64(0) and not acc.is_null(circuit.source_col_idx):
             source_pk = src_cursor.key()
             index_key = promote_to_index_key(
                 acc, circuit.source_col_idx, circuit.source_col_type
             )
 
-            # Check uniqueness if required
             if circuit.is_unique and circuit.table.has_pk(index_key):
                 src_cursor.close()
                 raise LayoutError(
                     "Unique index violation for '%s' during backfill" % circuit.name
                 )
 
-            # Direct Injection: Reaches through to the store's MemTable
-            try:
-                circuit.table.memtable.upsert_index_row(index_key, weight, source_pk)
-            except MemTableFullError:
-                circuit.table.flush()
-                circuit.table.memtable.upsert_index_row(index_key, weight, source_pk)
+            # Extract PK components for the alignment-safe accessor
+            acc_inj = circuit._index_payload_accessor
+            acc_inj.pk_lo = r_uint64(source_pk)
+            acc_inj.pk_hi = r_uint64(source_pk >> 64)
+
+            # EphemeralTable.ingest_one handles MemTableFullError internally.
+            circuit.table.ingest_one(index_key, weight, acc_inj)
 
         src_cursor.advance()
 

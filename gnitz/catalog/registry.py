@@ -9,29 +9,10 @@ from gnitz.catalog.system_tables import (
     FIRST_USER_TABLE_ID,
     FIRST_USER_INDEX_ID,
 )
-from gnitz.core.errors import LayoutError, MemTableFullError
+from gnitz.core.errors import LayoutError
 from gnitz.core.types import TableSchema, ColumnDefinition
+from gnitz.core.store import ZSetStore
 from gnitz.catalog.index_circuit import promote_to_index_key
-
-
-def _ingest_into_index_circuit(circuit, index_key, weight, source_pk):
-    """
-    Directly injects a record into an index circuit's store.
-    Handles uniqueness checks and MemTable exhaustion via flush-and-retry.
-    """
-    # 1. Uniqueness check (SQL semantics: check for presence of index_key)
-    if circuit.is_unique and weight > 0:
-        if circuit.table.has_pk(index_key):
-            # Note: Phase B doesn't verify if it's the SAME source_pk;
-            # any existing key is a violation on insertion.
-            raise LayoutError("Unique index violation on index '%s'" % circuit.name)
-
-    # 2. Direct Injection with Flush Recovery. Reaches through to MemTable.
-    try:
-        circuit.table.memtable.upsert_index_row(index_key, weight, source_pk)
-    except MemTableFullError:
-        circuit.table.flush()
-        circuit.table.memtable.upsert_index_row(index_key, weight, source_pk)
 
 
 def _wire_fk_constraints_for_family(family, registry):
@@ -84,9 +65,10 @@ class SystemTables(object):
         self.sequences.close()
 
 
-class TableFamily(object):
+class TableFamily(ZSetStore):
     """
     A logical table entity managing primary storage and secondary indices.
+    Implements ZSetStore to allow transparent use in the DBSP VM.
     """
 
     _immutable_fields_ = [
@@ -118,7 +100,7 @@ class TableFamily(object):
         self.pk_col_idx = pk_col_idx
         self.created_lsn = 0
         self.primary = primary
-        self.schema = primary.schema
+        self.schema = primary.get_schema()
         self.index_circuits = newlist_hint(4)
         self.fk_constraints = newlist_hint(0)
 
@@ -131,12 +113,21 @@ class TableFamily(object):
     def create_cursor(self):
         return self.primary.create_cursor()
 
+    def has_pk(self, key):
+        return self.primary.has_pk(key)
+
+    def get_weight(self, key, accessor):
+        return self.primary.get_weight(key, accessor)
+
+    def create_child(self, name, schema):
+        return self.primary.create_child(name, schema)
+
     def ingest_batch(self, batch):
         """
         Durable ingestion pipeline:
         1. Validate FKs (incremental)
         2. Write Primary (WAL + MemTable)
-        3. Project into Indices (Direct Injection)
+        3. Project into Indices (Direct Projection Kernel)
         """
         n_records = batch.length()
         if n_records == 0:
@@ -147,7 +138,7 @@ class TableFamily(object):
         if n_constraints > 0:
             for i in range(n_records):
                 if batch.get_weight(i) <= 0:
-                    continue  # Only check integrity on insertions
+                    continue
                 
                 acc = batch.get_accessor(i)
                 for c_idx in range(n_constraints):
@@ -156,11 +147,11 @@ class TableFamily(object):
                     if acc.is_null(col_idx):
                         continue
 
-                    # Promote bit-pattern to U128 for probing
                     fk_key = promote_to_index_key(
                         acc, col_idx, self.schema.columns[col_idx].field_type
                     )
-                    if not constraint.target_family.primary.has_pk(fk_key):
+                    # Check target family via the ZSetStore interface
+                    if not constraint.target_family.has_pk(fk_key):
                         raise LayoutError(
                             "FK violation: column '%s' value not found in target '%s.%s'"
                             % (
@@ -173,23 +164,19 @@ class TableFamily(object):
         # --- Stage 2: Primary Ingestion (Durable) ---
         self.primary.ingest_batch(batch)
 
-        # --- Stage 3: Secondary Index Projection (Direct) ---
+        # --- Stage 3: Secondary Index Projection (High-performance kernel) ---
         n_indices = len(self.index_circuits)
         if n_indices > 0:
             for idx_num in range(n_indices):
                 circuit = self.index_circuits[idx_num]
-                for i in range(n_records):
-                    acc = batch.get_accessor(i)
-                    if acc.is_null(circuit.source_col_idx):
-                        continue
-
-                    source_pk = batch.get_pk(i)
-                    weight = batch.get_weight(i)
-                    index_key = promote_to_index_key(
-                        acc, circuit.source_col_idx, circuit.source_col_type
-                    )
-
-                    _ingest_into_index_circuit(circuit, index_key, weight, source_pk)
+                # storage/ephemeral_table.py:ingest_projection
+                circuit.table.ingest_projection(
+                    batch,
+                    circuit.source_col_idx,
+                    circuit.source_col_type,
+                    circuit._index_payload_accessor,
+                    circuit.is_unique,
+                )
 
     def bulk_validate_all_constraints(self):
         """
@@ -200,10 +187,8 @@ class TableFamily(object):
 
     def _bulk_validate_single_fk(self, constraint):
         """
-        Optimized bulk validation. Instead of projecting/sorting, we scan 
-        the secondary index that is already guaranteed to exist for every FK.
+        Optimized bulk validation using existing secondary indices.
         """
-        # Find the supporting index
         supporting_circuit = None
         for circuit in self.index_circuits:
             if circuit.source_col_idx == constraint.fk_col_idx:
@@ -211,20 +196,17 @@ class TableFamily(object):
                 break
 
         if supporting_circuit is None:
-            # Should be unreachable given engine-level auto-indexing.
             raise LayoutError(
                 "No index found to support FK on column %d" % constraint.fk_col_idx
             )
 
         idx_cursor = supporting_circuit.create_cursor()
-        target_store = constraint.target_family.primary
 
         while idx_cursor.is_valid():
-            # In index store: PK = Foreign Value, Weight = Algebraic Sum.
-            # We only validate presence for positive sums (active records).
             if idx_cursor.weight() > 0:
                 fk_val = idx_cursor.key()
-                if not target_store.has_pk(fk_val):
+                # Check target family via the ZSetStore interface
+                if not constraint.target_family.has_pk(fk_val):
                     idx_cursor.close()
                     raise LayoutError(
                         "Referential integrity violation: value in '%s.%s' "
