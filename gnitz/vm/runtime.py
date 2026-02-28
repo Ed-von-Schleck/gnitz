@@ -5,6 +5,20 @@ from rpython.rlib.rarithmetic import r_int64
 from gnitz.core import types
 from gnitz.core.batch import ZSetBatch
 
+# VM Execution Status Codes
+STATUS_INIT    = 0
+STATUS_RUNNING = 1
+STATUS_YIELDED = 2
+STATUS_HALTED  = 3
+STATUS_ERROR   = 4
+
+# Yield Reason Codes
+YIELD_REASON_NONE        = 0
+YIELD_REASON_BUFFER_FULL = 1
+YIELD_REASON_ROW_LIMIT   = 2
+YIELD_REASON_USER        = 3
+
+
 class VMSchema(object):
     """
     Metadata cache for the VM. 
@@ -116,7 +130,25 @@ class RegisterFile(object):
         return reg
 
     def clear_all_deltas(self):
-        """Resets all transient Delta registers before a new epoch."""
+        """Resets all transient Delta registers."""
         for reg in self.registers:
             if reg is not None and reg.is_delta():
                 reg.clear()
+
+
+class ExecutionContext(object):
+    """
+    Maintains the state of a VM execution across multiple chunks/ticks.
+    """
+    _immutable_fields_ = ['reg_file']
+
+    def __init__(self, reg_file):
+        self.reg_file = reg_file
+        self.pc = 0
+        self.status = STATUS_INIT
+        self.yield_reason = YIELD_REASON_NONE
+
+    def reset(self, pc=0):
+        self.pc = pc
+        self.status = STATUS_RUNNING
+        self.yield_reason = YIELD_REASON_NONE

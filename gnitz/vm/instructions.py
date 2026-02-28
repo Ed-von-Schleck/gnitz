@@ -1,18 +1,18 @@
 # gnitz/vm/instructions.py
 
-from rpython.rlib import jit
-
 class Instruction(object):
     """
     Base class for all VM instructions.
     Standardized layout ensures the RPython annotator can resolve attributes
-    during dispatch loops.
+    during dispatch loops without type unions or attribute errors.
     """
     _immutable_fields_ = [
         'opcode', 'reg_in', 'reg_out', 'func', 'reg_in_a', 'reg_in_b',
         'reg_history', 'reg_delta', 'reg_trace', 'target_table',
         'reg_a', 'reg_b', 'reg_trace_in', 'reg_trace_out',
-        'group_by_cols', 'agg_func', 'output_schema'
+        'group_by_cols', 'agg_func', 'output_schema',
+        # --- New Fields for Phase A ---
+        'chunk_limit', 'jump_target', 'yield_reason', 'reg_key'
     ]
     
     HALT             = 0
@@ -26,10 +26,16 @@ class Instruction(object):
     DELAY            = 8
     REDUCE           = 9
     DISTINCT         = 10
+    # --- New Opcodes ---
+    SCAN_TRACE       = 11
+    SEEK_TRACE       = 12
+    YIELD            = 13
+    JUMP             = 14
+    CLEAR_DELTAS     = 15
 
     def __init__(self, opcode):
         self.opcode = opcode
-        # Standardized attribute file initialized to None
+        # Standardized attribute file initialized to None/0
         self.reg_in = None
         self.reg_out = None
         self.func = None
@@ -46,6 +52,11 @@ class Instruction(object):
         self.group_by_cols = None
         self.agg_func = None
         self.output_schema = None
+        # --- New Fields ---
+        self.chunk_limit = 0
+        self.jump_target = 0
+        self.yield_reason = 0
+        self.reg_key = None
 
 class FilterOp(Instruction):
     def __init__(self, reg_in, reg_out, func):
@@ -122,3 +133,32 @@ class ReduceOp(Instruction):
         self.group_by_cols = group_by_cols
         self.agg_func = agg_func
         self.output_schema = output_schema
+
+# --- New Op Classes for Phase A ---
+
+class ScanTraceOp(Instruction):
+    def __init__(self, reg_trace, reg_out, chunk_limit):
+        Instruction.__init__(self, self.SCAN_TRACE)
+        self.reg_trace = reg_trace
+        self.reg_out = reg_out
+        self.chunk_limit = chunk_limit
+
+class SeekTraceOp(Instruction):
+    def __init__(self, reg_trace, reg_key):
+        Instruction.__init__(self, self.SEEK_TRACE)
+        self.reg_trace = reg_trace
+        self.reg_key = reg_key
+
+class YieldOp(Instruction):
+    def __init__(self, reason):
+        Instruction.__init__(self, self.YIELD)
+        self.yield_reason = reason
+
+class JumpOp(Instruction):
+    def __init__(self, target_idx):
+        Instruction.__init__(self, self.JUMP)
+        self.jump_target = target_idx
+
+class ClearDeltasOp(Instruction):
+    def __init__(self):
+        Instruction.__init__(self, self.CLEAR_DELTAS)
