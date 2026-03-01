@@ -193,7 +193,8 @@ class WALWriter(object):
             
             # Pre-calculate size for chunking and pointer stability
             f_sz, h_sz = wal_format.compute_record_size(self.schema, acc)
-            rec_total = f_sz + h_sz
+            # Account for up to 15 bytes of alignment padding per record
+            rec_total = f_sz + h_sz + 16
 
             # If this record would overflow the 32MB block, flush the current chunk
             if current_chunk_count > 0 and (self.block_buf.offset + rec_total > MAX_BLOCK_PAYLOAD):

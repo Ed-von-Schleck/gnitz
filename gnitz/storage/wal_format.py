@@ -1,6 +1,7 @@
 # gnitz/storage/wal_format.py
 
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import serialize, xxh, strings as string_logic, errors
@@ -45,19 +46,33 @@ class WALBlobAllocator(string_logic.BlobAllocator):
 
 
 class RawWALRecord(object):
-    """Metadata for a record read from the WAL, pointing into a raw buffer."""
+    """
+    Metadata for a record read from the WAL, pointing into a raw buffer.
 
-    _immutable_fields_ = ["pk", "weight", "null_word", "payload_ptr", "heap_ptr"]
+    Primary Key is split into lo/hi r_uint64 components to prevent alignment
+    issues and SIGSEGV in translated C code, as per RPython backend
+    constraints for 128-bit primitives in structs.
+    """
 
-    def __init__(self, pk, weight, null_word, payload_ptr, heap_ptr):
-        self.pk = pk
+    _immutable_fields_ = [
+        "pk_lo",
+        "pk_hi",
+        "weight",
+        "null_word",
+        "payload_ptr",
+        "heap_ptr",
+    ]
+
+    def __init__(self, pk_lo, pk_hi, weight, null_word, payload_ptr, heap_ptr):
+        self.pk_lo = pk_lo
+        self.pk_hi = pk_hi
         self.weight = weight
         self.null_word = null_word
         self.payload_ptr = payload_ptr
         self.heap_ptr = heap_ptr
 
     def get_key(self):
-        return self.pk
+        return (r_uint128(self.pk_hi) << 64) | r_uint128(self.pk_lo)
 
 
 class WALBlock(object):
@@ -88,25 +103,30 @@ def compute_record_size(schema, accessor):
 def append_record_to_buffer(block_buf, schema, acc, pk, weight, allocator):
     """
     Writes a single record directly into the provided Buffer.
-    
-    CRITICAL: The caller MUST call block_buf.ensure_capacity() with the 
-    total size (fixed + heap) before calling this. This ensures the buffer 
+
+    CRITICAL: The caller MUST call block_buf.ensure_capacity() with the
+    total size (fixed + heap) before calling this. This ensures the buffer
     does not reallocate during serialization, keeping rec_ptr stable.
     """
     stride = schema.memtable_stride
-    rec_start_off = block_buf.offset
     
+    # Ensure 16-byte alignment for the start of the record. This is vital
+    # to prevent strict-alignment SIGSEGVs when reading u128/u64 fields 
+    # via pointer casting in RawWALAccessor.
+    block_buf.alloc(0, alignment=16)
+    rec_start_off = block_buf.offset
+
     # 1. Reserve metadata and payload space
     fixed_sz = _REC_PAYLOAD_BASE + stride
     block_buf.alloc(fixed_sz)
-    
+
     # Get a stable pointer for this record's fixed section
     rec_ptr = rffi.ptradd(block_buf.base_ptr, rec_start_off)
-    
+
     # 2. Write metadata header
     wal_layout.write_u128(rec_ptr, _REC_PK_OFFSET, pk)
     wal_layout.write_i64(rec_ptr, _REC_WEIGHT_OFFSET, weight)
-    
+
     null_word = r_uint64(0)
     if isinstance(acc, storage_comparator.RawWALAccessor):
         null_word = acc.null_word
@@ -114,7 +134,7 @@ def append_record_to_buffer(block_buf, schema, acc, pk, weight, allocator):
         if acc._row:
             null_word = acc._row._null_word
     wal_layout.write_u64(rec_ptr, _REC_NULL_OFFSET, null_word)
-    
+
     # 3. Serialize payload and heap blobs
     # Strings will be allocated via allocator.allocate(), which advances block_buf.offset
     payload_ptr = rffi.ptradd(rec_ptr, _REC_PAYLOAD_BASE)
@@ -146,7 +166,13 @@ def decode_wal_block(buf, total_size, schema):
     accessor = storage_comparator.RawWALAccessor(schema)
 
     for i in range(entry_count):
-        pk = wal_layout.read_u128(buf, current_offset + _REC_PK_OFFSET)
+        # Mirror the alignment logic used by the writer
+        current_offset = (current_offset + 15) & ~15
+        
+        # Read Primary Key as two 64-bit halves to avoid alignment issues in Python objects
+        pk_lo = wal_layout.read_u64(buf, current_offset + _REC_PK_OFFSET)
+        pk_hi = wal_layout.read_u64(buf, current_offset + _REC_PK_OFFSET + 8)
+
         weight = rffi.cast(
             rffi.LONGLONGP, rffi.ptradd(buf, current_offset + _REC_WEIGHT_OFFSET)
         )[0]
@@ -156,7 +182,7 @@ def decode_wal_block(buf, total_size, schema):
         payload_ptr = rffi.ptradd(buf, current_offset + _REC_PAYLOAD_BASE)
         heap_ptr = buf
 
-        raw_rec = RawWALRecord(pk, weight, null_word, payload_ptr, heap_ptr)
+        raw_rec = RawWALRecord(pk_lo, pk_hi, weight, null_word, payload_ptr, heap_ptr)
         accessor.set_record(raw_rec)
         h_sz = serialize.get_heap_size(schema, accessor)
 

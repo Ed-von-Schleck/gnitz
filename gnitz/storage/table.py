@@ -153,7 +153,7 @@ class PersistentTable(_StorageBase):
 
                     for rec in block.records:
                         rec_acc.set_record(rec)
-                        self.memtable.upsert_single(rec.pk, rec.weight, rec_acc)
+                        self.memtable.upsert_single(rec.get_key(), rec.weight, rec_acc)
 
                     # Ensure the current LSN is higher than any recovered LSN
                     if block.lsn >= self.current_lsn:

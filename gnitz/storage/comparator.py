@@ -77,8 +77,8 @@ class PackedNodeAccessor(RowAccessor):
         length = rffi.cast(lltype.Signed, u32_ptr[0])
         prefix = rffi.cast(lltype.Signed, u32_ptr[1])
 
-        # Annotator hint: ensure the 5th element is Optional to match
-        # the VM's BatchAccessor.
+        # Annotator hint: ensure the 5th element is Optional[str] to match
+        # the VM's BatchAccessor and other storage accessors.
         s = None
         if False:
             s = ""
@@ -189,7 +189,9 @@ class RawWALAccessor(RowAccessor):
 
     def set_record(self, raw_record):
         """Sets state from a RawWALRecord object."""
-        self.set_pointers(raw_record.payload_ptr, raw_record.heap_ptr, raw_record.null_word)
+        self.set_pointers(
+            raw_record.payload_ptr, raw_record.heap_ptr, raw_record.null_word
+        )
 
     def set_pointers(self, payload_ptr, heap_ptr, null_word=r_uint64(0)):
         """Sets state directly from raw pointers (e.g. MemTable flush)."""
@@ -247,15 +249,19 @@ class RawWALAccessor(RowAccessor):
     def get_str_struct(self, col_idx):
         off = self.schema.get_column_offset(col_idx)
         ptr = rffi.ptradd(self.payload_ptr, off)
-        
+
         u32_ptr = rffi.cast(rffi.UINTP, ptr)
         length = intmask(u32_ptr[0])
-        
+
         # CRITICAL: Convert r_uint32 to signed int BEFORE returning the tuple
         prefix = intmask(u32_ptr[1])
-        
-        # Return signature: (int, int, CCHARP, CCHARP, str)
-        return (length, prefix, ptr, self.heap_ptr, None)
+
+        # Annotator hint: ensure the 5th element is Optional[str] to match
+        # PayloadRowAccessor and ensure monomorphism in compute_hash.
+        s = None
+        if False:
+            s = ""
+        return (length, prefix, ptr, self.heap_ptr, s)
 
     def get_col_ptr(self, col_idx):
         return self._get_ptr(col_idx)
