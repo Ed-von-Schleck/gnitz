@@ -38,7 +38,7 @@ class ServerExecutor(object):
     def __init__(self, engine):
         self.engine = engine
         self.program_cache = engine.program_cache
-        
+
         # Connection Registries
         self.active_fds = newlist_hint(16)
         self.client_sockets = {}    # int(fd) -> RSocket
@@ -59,21 +59,21 @@ class ServerExecutor(object):
         server_sock.bind(rsocket.UnixAddress(socket_path))
         server_sock.listen(1024)
         server_sock.setblocking(False)
-        
+
         server_fd = server_sock.fd
         self.active_fds.append(server_fd)
-        
+
         # Keep reference to prevent GC from closing the server socket
         self.client_sockets[server_fd] = server_sock
 
         while True:
             jit.promote(self.engine)
-            
+
             # Prepare fast C-arrays for the multiplexer
             count = len(self.active_fds)
             fds = newlist_hint(count)
             events = newlist_hint(count)
-            
+
             for i in range(count):
                 fds.append(self.active_fds[i])
                 events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
@@ -118,10 +118,10 @@ class ServerExecutor(object):
         payload = None
         try:
             payload = ipc.receive_payload(fd, self.engine.registry)
-            
+
             client_id = intmask(payload.client_id)
             target_id = intmask(payload.target_id)
-            
+
             # Authenticate / Register Client ID
             if client_id > 0:
                 self.fd_to_client[fd] = client_id
@@ -129,7 +129,7 @@ class ServerExecutor(object):
 
             if payload.batch is not None and payload.batch.length() > 0:
                 family = self.engine.registry.get_by_id(target_id)
-                
+
                 # Ingest performs: FK validation -> WAL write -> Index projection.
                 family.ingest_batch(payload.batch)
                 family.flush()
@@ -172,7 +172,7 @@ class ServerExecutor(object):
             sys_subs = self.engine.registry.get_by_id(SYS_TABLE_SUBSCRIPTIONS)
             cursor = sys_subs.create_cursor()
             retract_batch = ZSetBatch(sys_subs.schema)
-            
+
             try:
                 while cursor.is_valid():
                     acc = cursor.get_accessor()
@@ -185,7 +185,7 @@ class ServerExecutor(object):
                             cursor.key(), r_int64(-intmask(weight)), acc
                         )
                     cursor.advance()
-                    
+
                 if retract_batch.length() > 0:
                     sys_subs.ingest_batch(retract_batch)
                     sys_subs.flush()
@@ -203,13 +203,12 @@ class ServerExecutor(object):
             del self.client_sockets[fd]
             sock.close()
 
-
     def _evaluate_dag(self, initial_target_id, initial_delta):
         """
         The Topological Evaluator. Iteratively computes dependent views.
-        
-        This is the heart of the Reactive Dataflow system. When a base table 
-        is updated, this function triggers a cascade through the dependency graph, 
+
+        This is the heart of the Reactive Dataflow system. When a base table
+        is updated, this function triggers a cascade through the dependency graph,
         evaluating views and broadcasting results to subscribers.
         """
         # initial_delta is typically provided by the caller (the ingestion handler)
@@ -233,7 +232,7 @@ class ServerExecutor(object):
             dependent_views = self._get_dependent_views(curr_id)
             for i in range(len(dependent_views)):
                 view_id = dependent_views[i]
-                
+
                 # Fetch the pre-compiled ExecutablePlan
                 plan = self.program_cache.get_program(view_id)
                 if plan is None:
@@ -246,16 +245,18 @@ class ServerExecutor(object):
                 # --- 1. Bind Input (Register 0) ---
                 reg_in = reg_file.registers[0]
                 if reg_in is not None:
-                    # Detach existing batch pointer (we don't free it; it's aliased)
-                    reg_in.batch = None
                     reg_in.batch = delta
 
-                # --- 2. Initialize Output (Register 1) ---
-                reg_out = reg_file.registers[1]
-                if reg_out is not None:
-                    # Clear the persistent batch for the new execution tick
-                    if reg_out.batch is not None:
-                        reg_out.batch.clear()
+                # --- 2. Clear all non-input delta registers for a clean tick ---
+                # Register 0 is the input and was just aliased above; skipping it
+                # avoids wiping the incoming delta and avoids the None-batch
+                # hazard left by the alias cleanup at the end of the previous tick.
+                # All other DeltaRegisters are guaranteed to have a live batch
+                # (created in DeltaRegister.__init__ and never set to None).
+                for reg_idx in range(1, len(reg_file.registers)):
+                    reg = reg_file.registers[reg_idx]
+                    if reg is not None and reg.is_delta():
+                        reg.batch.clear()
 
                 # --- 3. Virtual Machine Execution ---
                 # We create a transient Context but reuse the stored Program array.
@@ -264,28 +265,31 @@ class ServerExecutor(object):
                 interpreter_obj.resume(context)
 
                 # --- 4. Process Cascade and Broadcast ---
+                reg_out = reg_file.registers[1]
                 if reg_out is not None:
-                    # Extract the batch and narrow type from Optional to avoid SomeNone
                     b = reg_out.batch
                     if b is not None and b.length() > 0:
-                        # CLONE is mandatory: 
+                        # CLONE is mandatory:
                         # 1. Physical: reg_out.batch.clear() will be called next tick.
                         # 2. Logic: Downstream views need an immutable snapshot.
                         out_delta_cloned = b.clone()
-                        
+
                         # O(1) Broadcast: Send the FD to all subscribers
                         self._broadcast_delta(view_id, out_delta_cloned)
-                        
+
                         # Recursive Step: Push the new delta into the queue
                         # owns_batch=True ensures this clone is freed after use.
                         queue.append(_CascadeItem(view_id, out_delta_cloned, depth + 1, True))
 
-                # --- 5. Cleanup Aliases ---
-                # Remove the reference to the input delta to assist GC/Arenas
+                # --- 5. Break Input Alias ---
+                # Sever the reference to the external delta so that if the batch
+                # is freed by its owner (owns_batch=True on the queue item),
+                # register 0 does not hold a dangling pointer into freed arenas.
+                # The next tick's step 1 will rebind it before any reads occur.
                 if reg_in is not None:
                     reg_in.batch = None
 
-            # If the current delta was a clone (from an upstream view), 
+            # If the current delta was a clone (from an upstream view),
             # its lifecycle in this cascade is complete.
             if item.owns_batch:
                 delta.free()
@@ -295,26 +299,26 @@ class ServerExecutor(object):
         Queries `_system._view_deps` to find downstream dependents.
         """
         if not self.engine.registry.has_id(SYS_TABLE_VIEW_DEPS):
-            return[]
-            
+            return []
+
         deps_table = self.engine.registry.get_by_id(SYS_TABLE_VIEW_DEPS)
         cursor = deps_table.create_cursor()
         res = newlist_hint(4)
-        
+
         try:
             while cursor.is_valid():
                 acc = cursor.get_accessor()
                 v_id = intmask(acc.get_int(0))
                 d_view_id = intmask(acc.get_int(1))
                 d_table_id = intmask(acc.get_int(2))
-                
+
                 if (d_view_id == target_id or d_table_id == target_id) and cursor.weight() > r_int64(0):
                     if v_id not in res:
                         res.append(v_id)
                 cursor.advance()
         finally:
             cursor.close()
-            
+
         return res
 
     def _broadcast_delta(self, view_id, out_delta):
@@ -323,16 +327,16 @@ class ServerExecutor(object):
         """
         if not self.engine.registry.has_id(SYS_TABLE_SUBSCRIPTIONS):
             return
-            
+
         subs_table = self.engine.registry.get_by_id(SYS_TABLE_SUBSCRIPTIONS)
         cursor = subs_table.create_cursor()
         target_fds = newlist_hint(8)
-        
+
         try:
             while cursor.is_valid():
                 acc = cursor.get_accessor()
                 v_id = intmask(acc.get_int(0))
-                
+
                 if v_id == view_id and cursor.weight() > r_int64(0):
                     c_id = intmask(acc.get_int(1))
                     if c_id in self.client_to_fd:

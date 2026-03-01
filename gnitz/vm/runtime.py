@@ -21,11 +21,11 @@ YIELD_REASON_USER        = 3
 
 class VMSchema(object):
     """
-    Metadata cache for the VM. 
+    Metadata cache for the VM.
     Promoted to constants during JIT tracing to fold address arithmetic.
     """
     _immutable_fields_ = [
-        'table_schema', 'stride', 'column_offsets[*]', 
+        'table_schema', 'stride', 'column_offsets[*]',
         'column_types[*]', 'pk_index', 'pk_type'
     ]
 
@@ -34,11 +34,11 @@ class VMSchema(object):
         self.stride = table_schema.stride
         self.pk_index = table_schema.pk_index
         self.pk_type = table_schema.get_pk_column().field_type.code
-        
+
         num_cols = len(table_schema.columns)
         self.column_offsets = [0] * num_cols
         self.column_types = [0] * num_cols
-        
+
         for i in range(num_cols):
             self.column_offsets[i] = table_schema.get_column_offset(i)
             self.column_types[i] = table_schema.columns[i].field_type.code
@@ -61,7 +61,7 @@ class BaseRegister(object):
     """
     Base class for all VM registers.
     """
-    _immutable_fields_ = ['reg_id', 'vm_schema', 'batch', 'cursor', 'table']
+    _immutable_fields_ = ['reg_id', 'vm_schema']
 
     def __init__(self, reg_id, vm_schema):
         self.reg_id = reg_id
@@ -84,7 +84,7 @@ class DeltaRegister(BaseRegister):
         self.batch = ZSetBatch(vm_schema.table_schema)
 
     def is_delta(self): return True
-    
+
     def clear(self):
         self.batch.clear()
 
@@ -100,19 +100,33 @@ class TraceRegister(BaseRegister):
 
     def is_trace(self): return True
 
+    def refresh(self):
+        """
+        Closes the current cursor and opens a fresh one from the backing table.
+
+        Called at the start of every execution tick so that join, reduce, and
+        distinct operators see the fully up-to-date state of the table rather
+        than the snapshot that existed when the plan was first compiled.
+
+        Registers that were constructed without a table reference (e.g. cursors
+        provided directly by QueryBuilder for one-shot queries) are left
+        unchanged.
+        """
+        if self.table is None:
+            return
+        if self.cursor is not None:
+            self.cursor.close()
+        self.cursor = self.table.create_cursor()
+
     def get_weight(self, key, payload):
         """Looks up the current algebraic weight for a specific record."""
         if self.table is None:
             return r_int64(0)
-        # TableFamily or EphemeralTable (ZSetStore interface)
         return self.table.get_weight(key, payload)
 
     def update_batch(self, batch):
-        """
-        Updates the stateful trace with an incoming ZSetBatch.
-        """
+        """Updates the stateful trace with an incoming ZSetBatch."""
         if self.table is not None:
-            # TableFamily or EphemeralTable (ZSetStore interface)
             self.table.ingest_batch(batch)
 
 
@@ -134,6 +148,33 @@ class RegisterFile(object):
         for reg in self.registers:
             if reg is not None and reg.is_delta():
                 reg.clear()
+
+    def refresh_trace_cursors(self):
+        """
+        Refreshes all TraceRegister cursors to reflect the current table state.
+
+        Must be called at the start of every execution tick for cached plans.
+        Without this, join/reduce/distinct operators will silently operate on
+        the stale snapshot that was captured when the plan was first loaded
+        from the program cache.
+
+        Only registers backed by a live table are refreshed; externally-supplied
+        cursors (table is None) are left untouched.
+        """
+        for reg in self.registers:
+            if reg is not None and reg.is_trace():
+                reg.refresh()
+
+    def prepare_for_tick(self):
+        """
+        Prepares the register file for a new execution tick.
+
+        Combines delta clearing and cursor refresh into a single call so that
+        every execution site (reactive executor, query processor) has one
+        unambiguous hook to call.
+        """
+        self.clear_all_deltas()
+        self.refresh_trace_cursors()
 
 
 class ExecutionContext(object):

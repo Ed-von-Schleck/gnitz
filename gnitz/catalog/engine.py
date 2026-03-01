@@ -27,6 +27,19 @@ from gnitz.catalog.system_tables import (
     SEQ_ID_TABLES,
     SEQ_ID_INDICES,
     SYS_CATALOG_DIRNAME,
+    # _schemas column indices (schema col 0 = schema_id PK)
+    SCHEMAS_COL_NAME,
+    # _tables column indices (schema col 0 = table_id PK)
+    TABLES_COL_SCHEMA_ID,
+    TABLES_COL_NAME,
+    TABLES_COL_DIRECTORY,
+    TABLES_COL_PK_COL_IDX,
+    # _indices column indices (schema col 0 = index_id PK)
+    INDICES_COL_OWNER_ID,
+    INDICES_COL_SOURCE_COL_IDX,
+    INDICES_COL_NAME,
+    INDICES_COL_IS_UNIQUE,
+    INDICES_COL_CACHE_DIRECTORY,
 )
 from gnitz.catalog.registry import (
     TableFamily,
@@ -80,11 +93,11 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     _rebuild_registry(sys_tables, base_dir, registry)
 
     engine = Engine(base_dir, sys_tables, registry)
-    
-    # Wire reactivity AFTER metadata recovery to avoid re-triggering DDL 
+
+    # Wire reactivity AFTER metadata recovery to avoid re-triggering DDL
     # side-effects for existing records during the loader phase.
     engine._wire_reactivity()
-    
+
     return engine
 
 
@@ -128,7 +141,6 @@ def _validate_fk_column(
     if col.fk_table_id == 0:
         return
 
-    # Resolve target: Self-referential or external
     if col.fk_table_id == self_table_id:
         target_pk_index = self_pk_index
         target_pk_type = self_pk_type
@@ -157,28 +169,41 @@ def _validate_fk_column(
             "target PK type (code %d)"
             % (col.name, promoted_type.code, target_pk_type.code)
         )
-        
-        
+
+
 class SchemaReactiveStore(ReactiveStore):
     def __init__(self, inner, engine):
         ReactiveStore.__init__(self, inner)
         self.engine = engine
+
     def on_ingest(self, batch):
         self.engine._on_schema_delta(batch)
+
 
 class TableReactiveStore(ReactiveStore):
     def __init__(self, inner, engine):
         ReactiveStore.__init__(self, inner)
         self.engine = engine
+
     def on_ingest(self, batch):
         self.engine._on_table_delta(batch)
+
+
+class IndexReactiveStore(ReactiveStore):
+    def __init__(self, inner, engine):
+        ReactiveStore.__init__(self, inner)
+        self.engine = engine
+
+    def on_ingest(self, batch):
+        self.engine._on_index_delta(batch)
+
 
 class InstructionReactiveStore(ReactiveStore):
     def __init__(self, inner, engine):
         ReactiveStore.__init__(self, inner)
         self.engine = engine
+
     def on_ingest(self, batch):
-        # Reactively purge the plan cache when instructions change
         self.engine.program_cache.invalidate_all()
 
 
@@ -186,6 +211,7 @@ class Engine(object):
     """
     The reactive DDL supervisor for GnitzDB.
     """
+
     _immutable_fields_ = ["base_dir", "sys", "registry", "program_cache"]
 
     def __init__(self, base_dir, sys_tables, registry):
@@ -197,23 +223,27 @@ class Engine(object):
     def _wire_reactivity(self):
         self.sys.schemas = SchemaReactiveStore(self.sys.schemas, self)
         self.sys.tables = TableReactiveStore(self.sys.tables, self)
+        self.sys.indices = IndexReactiveStore(self.sys.indices, self)
         self.sys.instructions = InstructionReactiveStore(self.sys.instructions, self)
 
-    # ── Reactive Callbacks ───────────────────────────────────────────────────
+    # -- Reactive Callbacks ---------------------------------------------------
+    #
+    # All storage accessors use schema column indices (col 0 = PK, physical
+    # offset -1, not in the payload area).  Named constants from system_tables
+    # make the mapping self-documenting and immune to off-by-one errors.
 
     def _on_schema_delta(self, batch):
         acc = batch.get_accessor(0)
         for i in range(batch.length()):
             weight = batch.get_weight(i)
             batch.bind_raw_accessor(i, acc)
-            
+
             sid = intmask(r_uint64(batch.get_pk(i)))
-            name = _read_string(acc, 0)
-            
+            name = _read_string(acc, SCHEMAS_COL_NAME)
+
             if weight > 0:
                 if self.registry.has_schema(name):
                     continue
-                
                 path = self.base_dir + "/" + name
                 _ensure_dir(path)
                 mmap_posix.fsync_dir(self.base_dir)
@@ -232,11 +262,11 @@ class Engine(object):
             weight = batch.get_weight(i)
             tid = intmask(r_uint64(batch.get_pk(i)))
             batch.bind_raw_accessor(i, acc)
-            
-            sid = intmask(acc.get_int(0))
-            name = _read_string(acc, 1)
-            directory = _read_string(acc, 2)
-            pk_col_idx = intmask(acc.get_int(3))
+
+            sid        = intmask(acc.get_int(TABLES_COL_SCHEMA_ID))
+            name       = _read_string(acc, TABLES_COL_NAME)
+            directory  = _read_string(acc, TABLES_COL_DIRECTORY)
+            pk_col_idx = intmask(acc.get_int(TABLES_COL_PK_COL_IDX))
 
             if weight > 0:
                 if self.registry.has_id(tid):
@@ -249,10 +279,8 @@ class Engine(object):
                     )
 
                 tbl_schema = TableSchema(col_defs, pk_col_idx)
-                # Physical creation of directory and metadata happens in PersistentTable
                 pt = PersistentTable(directory, name, tbl_schema, table_id=tid)
-                
-                # fsync parent schema directory
+
                 schema_name = self.registry.get_schema_name(sid)
                 mmap_posix.fsync_dir(self.base_dir + "/" + schema_name)
 
@@ -264,14 +292,16 @@ class Engine(object):
             else:
                 if self.registry.has_id(tid):
                     family = self.registry.get_by_id(tid)
-                    
-                    # Ref integrity check: Is anyone pointing at us?
+
                     for k in self.registry._by_name:
                         referencing = self.registry._by_name[k]
-                        if referencing.table_id == tid: continue
+                        if referencing.table_id == tid:
+                            continue
                         for col in referencing.schema.columns:
                             if col.fk_table_id == tid:
-                                raise LayoutError("Referential integrity: FK points to '%s'" % name)
+                                raise LayoutError(
+                                    "Referential integrity: FK points to '%s'" % name
+                                )
 
                     family.close()
                     self.registry.unregister(family.schema_name, family.table_name)
@@ -282,51 +312,54 @@ class Engine(object):
             weight = batch.get_weight(i)
             idx_id = intmask(r_uint64(batch.get_pk(i)))
             batch.bind_raw_accessor(i, acc)
-            
-            owner_id = intmask(acc.get_int(0))
-            source_col_idx = intmask(acc.get_int(2))
-            name = _read_string(acc, 3)
-            is_unique = acc.get_int(4) != 0
-            cache_dir = _read_string(acc, 5)
+
+            owner_id       = intmask(acc.get_int(INDICES_COL_OWNER_ID))
+            source_col_idx = intmask(acc.get_int(INDICES_COL_SOURCE_COL_IDX))
+            name           = _read_string(acc, INDICES_COL_NAME)
+            is_unique      = acc.get_int(INDICES_COL_IS_UNIQUE) != 0
+            cache_dir      = _read_string(acc, INDICES_COL_CACHE_DIRECTORY)
 
             if weight > 0:
                 if self.registry.has_index_by_name(name):
                     continue
-                
+
                 family = self.registry.get_by_id(owner_id)
                 col = family.schema.columns[source_col_idx]
                 source_pk_type = family.schema.get_pk_column().field_type
                 idx_dir = family.directory + "/idx_" + str(idx_id)
-                
+
                 circuit = _make_index_circuit(
-                    idx_id, owner_id, source_col_idx, col.field_type,
-                    source_pk_type, idx_dir, name, is_unique, cache_dir
+                    idx_id,
+                    owner_id,
+                    source_col_idx,
+                    col.field_type,
+                    source_pk_type,
+                    idx_dir,
+                    name,
+                    is_unique,
+                    cache_dir,
                 )
-                
-                # Critical: Backfill can raise LayoutError on unique violation.
-                # If it fails, the reactive transaction aborts.
                 _backfill_index(circuit, family)
-                
                 family.index_circuits.append(circuit)
                 self.registry.register_index(idx_id, name, circuit)
             else:
                 if self.registry.has_index_by_name(name):
                     circuit = self.registry.get_index_by_name(name)
                     if "__fk_" in name:
-                        raise LayoutError("Cannot drop internal FK index: %s" % name)
-                    
+                        raise LayoutError(
+                            "Cannot drop internal FK index: %s" % name
+                        )
                     family = self.registry.get_by_id(circuit.owner_id)
                     _remove_circuit_from_family(circuit, family)
                     self.registry.unregister_index(name, idx_id)
                     circuit.close()
 
-    # ── Public Intent API ────────────────────────────────────────────────────
+    # -- Public Intent API ----------------------------------------------------
 
     def create_schema(self, name):
         validate_user_identifier(name)
         if self.registry.has_schema(name):
             raise LayoutError("Schema already exists: %s" % name)
-
         sid = self.registry.allocate_schema_id()
         self._write_schema_record(sid, name)
         self._advance_sequence(SEQ_ID_SCHEMAS, sid - 1, sid)
@@ -337,7 +370,6 @@ class Engine(object):
             raise LayoutError("Schema does not exist: %s" % name)
         if name == "_system":
             raise LayoutError("Cannot drop system schema")
-
         sid = self.registry.get_schema_id(name)
         self._retract_schema_record(sid, name)
 
@@ -354,25 +386,29 @@ class Engine(object):
         tid = self.registry.allocate_table_id()
         sid = self.registry.get_schema_id(schema_name)
         self_pk_type = columns[pk_col_idx].field_type
-        
+
         for col_idx in range(len(columns)):
             _validate_fk_column(
-                columns[col_idx], col_idx, self.registry,
-                self_table_id=tid, self_pk_index=pk_col_idx, self_pk_type=self_pk_type,
+                columns[col_idx],
+                col_idx,
+                self.registry,
+                self_table_id=tid,
+                self_pk_index=pk_col_idx,
+                self_pk_type=self_pk_type,
             )
 
-        directory = self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
+        directory = (
+            self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
+        )
 
-        # 1. Write columns first (required for reactive schema reconstruction)
         self._write_column_records(tid, OWNER_KIND_TABLE, columns)
         self.sys.columns.flush()
-        
-        # 2. Write table record (triggers reactive _on_table_delta)
+
         self._write_table_record(tid, sid, table_name, directory, pk_col_idx, 0)
         self.sys.tables.flush()
 
         self._advance_sequence(SEQ_ID_TABLES, tid - 1, tid)
-        
+
         family = self.registry.get(schema_name, table_name)
         self._create_fk_indices_for_family(family)
         return family
@@ -385,25 +421,25 @@ class Engine(object):
         family = self.registry.get(schema_name, table_name)
         tid = family.table_id
 
-        # Retract table record (triggers reactive teardown)
         self._retract_table_record(
             tid, family.schema_id, table_name, family.directory, family.pk_col_idx, 0
         )
         self.sys.tables.flush()
 
-        # Retract columns
         self._retract_column_records(tid, OWNER_KIND_TABLE, family.schema.columns)
         self.sys.columns.flush()
 
     def create_index(self, qualified_owner_name, col_name, is_unique=False):
         schema_name, table_name = parse_qualified_name(qualified_owner_name, "public")
         family = self.get_table(qualified_owner_name)
-        
+
         col_idx = -1
         for i in range(len(family.schema.columns)):
             if family.schema.columns[i].name == col_name:
-                col_idx = i; break
-        if col_idx == -1: raise LayoutError("Column not found")
+                col_idx = i
+                break
+        if col_idx == -1:
+            raise LayoutError("Column not found")
 
         index_name = make_secondary_index_name(schema_name, table_name, col_name)
         if self.registry.has_index_by_name(index_name):
@@ -411,17 +447,18 @@ class Engine(object):
 
         index_id = self.registry.allocate_index_id()
         self._write_index_record(
-            index_id, family.table_id, OWNER_KIND_TABLE, col_idx, index_name, int(is_unique), ""
+            index_id, family.table_id, OWNER_KIND_TABLE, col_idx,
+            index_name, int(is_unique), "",
         )
         self.sys.indices.flush()
         self._advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id)
-        
+
         return self.registry.get_index_by_name(index_name)
 
     def _create_fk_indices_for_family(self, family):
         schema_name = family.schema_name
-        table_name = family.table_name
-        columns = family.schema.columns
+        table_name  = family.table_name
+        columns     = family.schema.columns
 
         for col_idx in range(len(columns)):
             col = columns[col_idx]
@@ -432,12 +469,15 @@ class Engine(object):
             already_exists = False
             for existing in family.index_circuits:
                 if existing.source_col_idx == col_idx:
-                    already_exists = True; break
-            if already_exists: continue
+                    already_exists = True
+                    break
+            if already_exists:
+                continue
 
             index_id = self.registry.allocate_index_id()
             self._write_index_record(
-                index_id, family.table_id, OWNER_KIND_TABLE, col_idx, index_name, 0, ""
+                index_id, family.table_id, OWNER_KIND_TABLE, col_idx,
+                index_name, 0, "",
             )
             self.sys.indices.flush()
             self._advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id)
@@ -446,7 +486,8 @@ class Engine(object):
         circuit = self.registry.get_index_by_name(index_name)
         self._retract_index_record(
             circuit.index_id, circuit.owner_id, OWNER_KIND_TABLE,
-            circuit.source_col_idx, circuit.name, int(circuit.is_unique), circuit.cache_dir
+            circuit.source_col_idx, circuit.name,
+            int(circuit.is_unique), circuit.cache_dir,
         )
         self.sys.indices.flush()
 
@@ -458,13 +499,15 @@ class Engine(object):
 
     def close(self):
         keys = newlist_hint(len(self.registry._by_name))
-        for k in self.registry._by_name: keys.append(k)
+        for k in self.registry._by_name:
+            keys.append(k)
         for k in keys:
             family = self.registry._by_name[k]
-            if family.table_id >= FIRST_USER_TABLE_ID: family.close()
+            if family.table_id >= FIRST_USER_TABLE_ID:
+                family.close()
         self.sys.close()
 
-    # ── Private Write Helpers ────────────────────────────────────────────────
+    # -- Private Write Helpers ------------------------------------------------
 
     def _write_schema_record(self, schema_id, name):
         s = self.sys.schemas.schema
@@ -508,8 +551,9 @@ class Engine(object):
         for i in range(len(columns)):
             col = columns[i]
             _append_column_record(
-                batch, s, owner_id, owner_kind, i, col.name, col.field_type.code,
-                int(col.is_nullable), col.fk_table_id, col.fk_col_idx
+                batch, s, owner_id, owner_kind, i,
+                col.name, col.field_type.code,
+                int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
             )
         self.sys.columns.ingest_batch(batch)
         batch.free()
@@ -520,30 +564,35 @@ class Engine(object):
         for i in range(len(columns)):
             col = columns[i]
             _retract_column_record(
-                batch, s, owner_id, owner_kind, i, col.name, col.field_type.code,
-                int(col.is_nullable), col.fk_table_id, col.fk_col_idx
+                batch, s, owner_id, owner_kind, i,
+                col.name, col.field_type.code,
+                int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
             )
         self.sys.columns.ingest_batch(batch)
         batch.free()
 
     def _write_index_record(
-        self, index_id, owner_id, owner_kind, source_col_idx, name, is_unique, cache_directory
+        self, index_id, owner_id, owner_kind, source_col_idx,
+        name, is_unique, cache_directory,
     ):
         s = self.sys.indices.schema
         batch = ZSetBatch(s)
         _append_index_record(
-            batch, s, index_id, owner_id, owner_kind, source_col_idx, name, is_unique, cache_directory
+            batch, s, index_id, owner_id, owner_kind, source_col_idx,
+            name, is_unique, cache_directory,
         )
         self.sys.indices.ingest_batch(batch)
         batch.free()
 
     def _retract_index_record(
-        self, index_id, owner_id, owner_kind, source_col_idx, name, is_unique, cache_directory
+        self, index_id, owner_id, owner_kind, source_col_idx,
+        name, is_unique, cache_directory,
     ):
         s = self.sys.indices.schema
         batch = ZSetBatch(s)
         _retract_index_record(
-            batch, s, index_id, owner_id, owner_kind, source_col_idx, name, is_unique, cache_directory
+            batch, s, index_id, owner_id, owner_kind, source_col_idx,
+            name, is_unique, cache_directory,
         )
         self.sys.indices.ingest_batch(batch)
         batch.free()

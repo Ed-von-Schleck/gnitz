@@ -3,14 +3,17 @@
 from gnitz.core import types
 from gnitz.vm import instructions, runtime, interpreter
 
+
 class QueryError(Exception):
     pass
+
 
 class View(object):
     """
     A compiled execution handle for a DBSP circuit.
     Holds the ExecutionContext, allowing the query to be paused and resumed.
     """
+
     def __init__(self, interp, context, input_reg_id, output_reg_id, cursors):
         self.interpreter = interp
         self.context = context
@@ -28,14 +31,15 @@ class View(object):
         Processes a single batch of updates through the circuit.
         Used for standard push-based incremental computation.
         """
-        # 1. Reset context and clear transient state
+        # 1. Reset context, clear transient delta state, and refresh all trace
+        #    cursors so operators see the current table state for this tick.
         self.context.reset(pc=0)
-        self.context.reg_file.clear_all_deltas()
+        self.context.reg_file.prepare_for_tick()
 
         # 2. Ingest data into the input register
         reg0 = self.context.reg_file.get_register(self.input_reg_id)
         assert isinstance(reg0, runtime.DeltaRegister)
-        
+
         for i in range(delta_batch.length()):
             reg0.batch.append_from_accessor(
                 delta_batch.get_pk(i),
@@ -67,6 +71,7 @@ class QueryBuilder(object):
     Fluent API for constructing incremental DBSP circuits.
     Supports chunked execution, explicit control flow, and standard operators.
     """
+
     def __init__(self, source_table):
         self._source_table = source_table
         self.instructions = []
@@ -122,7 +127,7 @@ class QueryBuilder(object):
         schema = table.get_schema()
         cursor = table.create_cursor()
         self.cursors.append(cursor)
-        
+
         tr_idx, tr_reg = self._add_register(schema, is_trace=True, cursor=cursor, table=table)
         return self.scan_trace(tr_idx, chunk_limit)
 
@@ -131,9 +136,9 @@ class QueryBuilder(object):
         tr_reg = self.registers[trace_reg_idx]
         if not tr_reg.is_trace():
             raise QueryError("scan_trace requires a Trace register")
-        
+
         out_idx, out_reg = self._add_register(tr_reg.vm_schema.table_schema)
-        
+
         op = instructions.ScanTraceOp(tr_reg, out_reg, chunk_limit)
         self.instructions.append(op)
         self.current_reg_idx = out_idx
@@ -185,7 +190,7 @@ class QueryBuilder(object):
         other_reg = None
         if other_builder is not None:
             other_reg = other_builder.registers[other_builder.current_reg_idx]
-        
+
         idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
         op = instructions.UnionOp(prev_reg, other_reg, new_reg)
         self.instructions.append(op)
@@ -200,7 +205,9 @@ class QueryBuilder(object):
         cursor = history_table.create_cursor()
         self.cursors.append(cursor)
 
-        trace_idx, trace_reg = self._add_register(schema, is_trace=True, cursor=cursor, table=history_table)
+        trace_idx, trace_reg = self._add_register(
+            schema, is_trace=True, cursor=cursor, table=history_table
+        )
         out_idx, out_reg = self._add_register(schema)
         op = instructions.DistinctOp(prev_reg, trace_reg, out_reg)
         self.instructions.append(op)
@@ -222,7 +229,9 @@ class QueryBuilder(object):
         cursor = trace_table.create_cursor()
         self.cursors.append(cursor)
 
-        tr_out_idx, reg_tr_out = self._add_register(out_schema, is_trace=True, cursor=cursor, table=trace_table)
+        tr_out_idx, reg_tr_out = self._add_register(
+            out_schema, is_trace=True, cursor=cursor, table=trace_table
+        )
 
         reg_trace_in = None
         if reg_trace_in_idx != -1:
@@ -235,7 +244,7 @@ class QueryBuilder(object):
             group_by_cols, agg_func, out_schema
         )
         self.instructions.append(op)
-        
+
         # Integration of internal reduce state
         sink_op = instructions.IntegrateOp(reg_out, trace_table)
         self.instructions.append(sink_op)
@@ -247,9 +256,13 @@ class QueryBuilder(object):
         prev_reg = self.registers[self.current_reg_idx]
         cursor = table.create_cursor()
         self.cursors.append(cursor)
-        trace_idx, trace_reg = self._add_register(table.get_schema(), is_trace=True, cursor=cursor)
+        trace_idx, trace_reg = self._add_register(
+            table.get_schema(), is_trace=True, cursor=cursor, table=table
+        )
 
-        out_schema = types.merge_schemas_for_join(prev_reg.vm_schema.table_schema, table.get_schema())
+        out_schema = types.merge_schemas_for_join(
+            prev_reg.vm_schema.table_schema, table.get_schema()
+        )
         out_idx, out_reg = self._add_register(out_schema)
 
         op = instructions.JoinDeltaTraceOp(prev_reg, trace_reg, out_reg)
@@ -276,5 +289,5 @@ class QueryBuilder(object):
 
         context = runtime.ExecutionContext(reg_file)
         interp = interpreter.DBSPInterpreter(program)
-        
+
         return View(interp, context, 0, self.current_reg_idx, self.cursors)
