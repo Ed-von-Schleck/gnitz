@@ -18,24 +18,27 @@ from gnitz.catalog.index_circuit import promote_to_index_key
 def _wire_fk_constraints_for_family(family, registry):
     """
     Iterates all FK columns of `family` and wires active FKConstraint objects.
+    Enables incremental validation during ingestion.
     """
     columns = family.schema.columns
     for col_idx in range(len(columns)):
         col = columns[col_idx]
         if col.fk_table_id == 0:
             continue
+
+        target_family = None
         if col.fk_table_id == family.table_id:
             target_family = family
         elif registry.has_id(col.fk_table_id):
             target_family = registry.get_by_id(col.fk_table_id)
-        else:
-            continue
-        family._add_fk_constraint(col_idx, target_family)
+
+        if target_family:
+            family._add_fk_constraint(col_idx, target_family)
 
 
 class FKConstraint(object):
     """
-    An active FK constraint on a single column of a TableFamily.
+    An active Foreign Key constraint tracking a source column and its target table.
     """
 
     _immutable_fields_ = ["fk_col_idx", "target_family"]
@@ -46,7 +49,12 @@ class FKConstraint(object):
 
 
 class SystemTables(object):
-    def __init__(self, schemas, tables, views, columns, indices, view_deps, sequences):
+    """
+    Container for the core catalog tables.
+    """
+
+    def __init__(self, schemas, tables, views, columns, indices, view_deps, sequences, 
+                 instructions, functions, subscriptions):
         self.schemas = schemas
         self.tables = tables
         self.views = views
@@ -54,6 +62,10 @@ class SystemTables(object):
         self.indices = indices
         self.view_deps = view_deps
         self.sequences = sequences
+        # New for Phase 4
+        self.instructions = instructions
+        self.functions = functions
+        self.subscriptions = subscriptions
 
     def close(self):
         self.schemas.close()
@@ -63,12 +75,57 @@ class SystemTables(object):
         self.indices.close()
         self.view_deps.close()
         self.sequences.close()
+        self.instructions.close()
+        self.functions.close()
+        self.subscriptions.close()
+
+
+class ReactiveStore(ZSetStore):
+    """
+    A base proxy for ZSetStore that provides an overridable hook 
+    for DDL side-effects.
+    """
+    _immutable_fields_ = ["inner", "schema"]
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.schema = inner.get_schema()
+
+    def on_ingest(self, batch):
+        """Override in subclasses to implement side-effects."""
+        pass
+
+    def get_schema(self):
+        return self.inner.get_schema()
+
+    def ingest_batch(self, batch):
+        # The hook is called before the storage is touched.
+        self.on_ingest(batch)
+        self.inner.ingest_batch(batch)
+
+    def create_cursor(self):
+        return self.inner.create_cursor()
+
+    def has_pk(self, key):
+        return self.inner.has_pk(key)
+
+    def get_weight(self, key, accessor):
+        return self.inner.get_weight(key, accessor)
+
+    def create_child(self, name, schema):
+        return self.inner.create_child(name, schema)
+
+    def flush(self):
+        return self.inner.flush()
+
+    def close(self):
+        self.inner.close()
 
 
 class TableFamily(ZSetStore):
     """
-    A logical table entity managing primary storage and secondary indices.
-    Implements ZSetStore to allow transparent use in the DBSP VM.
+    The primary entity for user data. Manages a PersistentTable and 
+    associated secondary IndexCircuits.
     """
 
     _immutable_fields_ = [
@@ -124,22 +181,23 @@ class TableFamily(ZSetStore):
 
     def ingest_batch(self, batch):
         """
-        Durable ingestion pipeline:
-        1. Validate FKs (incremental)
-        2. Write Primary (WAL + MemTable)
-        3. Project into Indices (Direct Projection Kernel)
+        Durable ingestion pipeline with referential integrity.
+        
+        Failure Policy: If any stage fails, the exception propagates. 
+        FK violations stop ingestion before the WAL is written.
         """
         n_records = batch.length()
         if n_records == 0:
             return
 
-        # --- Stage 1: Incremental FK Enforcement ---
+        # --- Stage 1: Incremental Foreign Key Enforcement ---
         n_constraints = len(self.fk_constraints)
         if n_constraints > 0:
             for i in range(n_records):
+                # We only validate insertions (positive weights)
                 if batch.get_weight(i) <= 0:
                     continue
-                
+
                 acc = batch.get_accessor(i)
                 for c_idx in range(n_constraints):
                     constraint = self.fk_constraints[c_idx]
@@ -147,29 +205,33 @@ class TableFamily(ZSetStore):
                     if acc.is_null(col_idx):
                         continue
 
+                    # Promote the value to the index key type of the target PK
                     fk_key = promote_to_index_key(
                         acc, col_idx, self.schema.columns[col_idx].field_type
                     )
-                    # Check target family via the ZSetStore interface
+                    
                     if not constraint.target_family.has_pk(fk_key):
                         raise LayoutError(
-                            "FK violation: column '%s' value not found in target '%s.%s'"
+                            "Foreign Key violation in '%s.%s': value for column '%s' "
+                            "not found in target '%s.%s'"
                             % (
+                                self.schema_name,
+                                self.table_name,
                                 self.schema.columns[col_idx].name,
                                 constraint.target_family.schema_name,
                                 constraint.target_family.table_name,
                             )
                         )
 
-        # --- Stage 2: Primary Ingestion (Durable) ---
+        # --- Stage 2: Primary Ingestion (Durable WAL + MemTable) ---
         self.primary.ingest_batch(batch)
 
-        # --- Stage 3: Secondary Index Projection (High-performance kernel) ---
+        # --- Stage 3: Secondary Index Projection ---
         n_indices = len(self.index_circuits)
         if n_indices > 0:
             for idx_num in range(n_indices):
                 circuit = self.index_circuits[idx_num]
-                # storage/ephemeral_table.py:ingest_projection
+                # High-performance kernel in EphemeralTable
                 circuit.table.ingest_projection(
                     batch,
                     circuit.source_col_idx,
@@ -180,14 +242,14 @@ class TableFamily(ZSetStore):
 
     def bulk_validate_all_constraints(self):
         """
-        High-performance referential integrity audit.
+        Performs a full audit of referential integrity using secondary indices.
         """
         for c_idx in range(len(self.fk_constraints)):
             self._bulk_validate_single_fk(self.fk_constraints[c_idx])
 
     def _bulk_validate_single_fk(self, constraint):
         """
-        Optimized bulk validation using existing secondary indices.
+        Optimized bulk validation via supporting index scan.
         """
         supporting_circuit = None
         for circuit in self.index_circuits:
@@ -197,15 +259,14 @@ class TableFamily(ZSetStore):
 
         if supporting_circuit is None:
             raise LayoutError(
-                "No index found to support FK on column %d" % constraint.fk_col_idx
+                "No supporting index found for FK on column '%s'" 
+                % self.schema.columns[constraint.fk_col_idx].name
             )
 
         idx_cursor = supporting_circuit.create_cursor()
-
         while idx_cursor.is_valid():
             if idx_cursor.weight() > 0:
                 fk_val = idx_cursor.key()
-                # Check target family via the ZSetStore interface
                 if not constraint.target_family.has_pk(fk_val):
                     idx_cursor.close()
                     raise LayoutError(
@@ -219,7 +280,6 @@ class TableFamily(ZSetStore):
                         )
                     )
             idx_cursor.advance()
-
         idx_cursor.close()
 
     def flush(self):
@@ -232,6 +292,11 @@ class TableFamily(ZSetStore):
 
 
 class EntityRegistry(object):
+    """
+    Central hub for name resolution and metadata mapping.
+    All lookup methods are O(1).
+    """
+
     def __init__(self):
         self._by_name = {}
         self._by_id = {}
@@ -295,9 +360,13 @@ class EntityRegistry(object):
 
     def get(self, schema_name, table_name):
         qualified = schema_name + "." + table_name
+        if qualified not in self._by_name:
+            raise KeyError(qualified)
         return self._by_name[qualified]
 
     def get_by_id(self, table_id):
+        if table_id not in self._by_id:
+            raise KeyError("table_id %d" % table_id)
         return self._by_id[table_id]
 
     def has_id(self, table_id):
@@ -309,6 +378,7 @@ class EntityRegistry(object):
         return tid
 
     def schema_is_empty(self, schema_name):
+        # Iterate keys to check if any table belongs to this schema
         for k in self._by_name:
             family = self._by_name[k]
             if family.schema_name == schema_name:
@@ -341,6 +411,9 @@ class EntityRegistry(object):
         raise LayoutError("Index does not exist: %s" % name)
 
     def is_joinable(self, owner_id, col_idx):
+        """
+        Determines if a column can be used as a join key (PK or Indexed).
+        """
         if not self.has_id(owner_id):
             return False
         family = self.get_by_id(owner_id)

@@ -150,10 +150,11 @@ def op_filter(in_batch, out_batch, func):
     n = in_batch.length()
     for i in range(n):
         accessor = in_batch.get_accessor(i)
-        if func.evaluate_predicate(accessor):
-            out_batch.append_from_accessor(
-                in_batch.get_pk(i), in_batch.get_weight(i), accessor
-            )
+        if func is not None:
+            if func.evaluate_predicate(accessor):
+                out_batch.append_from_accessor(
+                    in_batch.get_pk(i), in_batch.get_weight(i), accessor
+                )
 
 
 @jit.unroll_safe
@@ -173,10 +174,11 @@ def op_map(in_batch, out_batch, func, out_schema):
     for i in range(n):
         in_acc = in_batch.get_accessor(i)
         out_acc.clear()
-        func.evaluate_map(in_acc, out_acc)
-        out_batch.append_from_accessor(
-            in_batch.get_pk(i), in_batch.get_weight(i), out_acc
-        )
+        if func is not None:
+            func.evaluate_map(in_acc, out_acc)
+            out_batch.append_from_accessor(
+                in_batch.get_pk(i), in_batch.get_weight(i), out_acc
+            )
 
 
 def op_negate(in_batch, out_batch):

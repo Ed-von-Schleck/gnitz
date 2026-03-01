@@ -49,6 +49,7 @@ class ZSetStore(object):
     The unified storage interface (Z-Store).
     Implemented by TableFamily (Catalog), PersistentTable, and EphemeralTable.
     """
+    _immutable_fields_ = ["schema"]
 
     def get_schema(self):
         """Returns the TableSchema defining the physical layout."""

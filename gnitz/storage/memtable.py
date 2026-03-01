@@ -291,6 +291,9 @@ class MemTable(object):
             or self.blob_arena.offset + blob_sz > self.blob_arena.size
         ):
             raise errors.MemTableFullError()
+            
+    def is_empty(self):
+        return node_get_next_off(self.arena.base_ptr, self.head_off, 0) == 0
 
     def flush(self, filename, table_id=0):
         sw = writer_table.TableShardWriter(self.schema, table_id)

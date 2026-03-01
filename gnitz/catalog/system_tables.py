@@ -34,12 +34,17 @@ SYS_TABLE_COLUMNS = 4
 SYS_TABLE_INDICES = 5
 SYS_TABLE_VIEW_DEPS = 6
 SYS_TABLE_SEQUENCES = 7
-FIRST_USER_TABLE_ID = 8
+# --- New for Phase 4 ---
+SYS_TABLE_INSTRUCTIONS = 8
+SYS_TABLE_FUNCTIONS = 9
+SYS_TABLE_SUBSCRIPTIONS = 10
+FIRST_USER_TABLE_ID = 11
 
 # --- Sequence IDs for internal allocators ---
 SEQ_ID_SCHEMAS = 1
 SEQ_ID_TABLES = 2
 SEQ_ID_INDICES = 3
+SEQ_ID_PROGRAMS = 4
 
 # --- First user-assigned IDs ---
 FIRST_USER_INDEX_ID = 1
@@ -57,6 +62,9 @@ SYS_SUBDIR_COLUMNS = "_columns"
 SYS_SUBDIR_INDICES = "_indices"
 SYS_SUBDIR_VIEW_DEPS = "_view_deps"
 SYS_SUBDIR_SEQUENCES = "_sequences"
+SYS_SUBDIR_INSTRUCTIONS = "_instructions"
+SYS_SUBDIR_FUNCTIONS = "_functions"
+SYS_SUBDIR_SUBSCRIPTIONS = "_subscriptions"
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +146,57 @@ def make_sequences_schema():
     cols = newlist_hint(2)
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="seq_id"))
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="next_val"))
+    return TableSchema(cols, pk_index=0)
+
+
+def make_instructions_schema():
+    """
+    Schema for the VM Instruction Z-Set.
+    PK: instr_pk (U128) -> (program_id << 64) | instr_idx
+    """
+    cols = newlist_hint(21)
+    # PK
+    cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="instr_pk"))
+    # Opcodes and Registers (Packed as U64 for RPython monomorphism)
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="opcode"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_in"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_out"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_in_a"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_in_b"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_trace"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_trace_in"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_trace_out"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_delta"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_history"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_a"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_b"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_key"))
+    # Metadata / Refs
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="target_table_id"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="func_id"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="agg_func_id"))
+    # Varlen Metadata
+    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="group_by_cols"))
+    # Control Flow
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="chunk_limit"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="jump_target"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="yield_reason"))
+    return TableSchema(cols, pk_index=0)
+
+
+def make_functions_schema():
+    cols = newlist_hint(3)
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="func_id"))
+    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="func_type"))
+    return TableSchema(cols, pk_index=0)
+
+
+def make_subscriptions_schema():
+    cols = newlist_hint(3)
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="sub_id"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
+    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="client_id"))
     return TableSchema(cols, pk_index=0)
 
 

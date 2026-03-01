@@ -254,6 +254,29 @@ class ArenaZSetBatch(object):
         )
 
         return core_comparator.compare_rows(self._schema, self._cmp_acc_a, self._cmp_acc_b)
+        
+    def clone(self):
+        """
+        Creates a deep copy of the batch. 
+        The resulting batch owns its own memory arenas and is physically 
+        independent of the source.
+        """
+        # Allocate based on current count, minimum 8 to avoid zero-sized issues
+        cap = self._count if self._count > 8 else 8
+        new_batch = ArenaZSetBatch(self._schema, initial_capacity=cap)
+        
+        # We iterate and use append_from_accessor. 
+        # This is the safest way to "clone" because it handles the 
+        # relocation of strings/blobs into the new batch's blob arena.
+        for i in range(self._count):
+            new_batch.append_from_accessor(
+                self.get_pk(i),
+                self.get_weight(i),
+                self.get_accessor(i)
+            )
+        
+        new_batch._sorted = self._sorted
+        return new_batch
 
     def sort(self):
         if self._count <= 1 or self._sorted:

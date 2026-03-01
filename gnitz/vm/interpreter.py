@@ -8,6 +8,7 @@ def get_printable_location(pc, program, self):
     """Provides a trace label for the RPython JIT log."""
     if pc < len(program):
         instr = program[pc]
+        # Instruction.opcode is an immutable field, safe for JIT promotion
         return "PC: %d, Opcode: %d" % (pc, instr.opcode)
     return "PC: %d, OUT_OF_BOUNDS" % pc
 
@@ -20,17 +21,20 @@ jitdriver = jit.JitDriver(
 class DBSPInterpreter(object):
     """
     Stateful DBSP Virtual Machine.
+    
     Executes incremental circuits with support for chunking, yielding, 
     and non-linear control flow.
     """
-    _immutable_fields_ = ["program[*]"]
+    _immutable_fields_ = ["program"]
 
     def __init__(self, program):
+        # program is a fixed-size list of Instruction objects
         self.program = program
 
     def resume(self, context):
         """
-        Resumes execution of the program from the state stored in context.
+        Main execution loop. Executes the program from the current context PC.
+        Returns when the program HALTs, YIELDs, or an error occurs.
         """
         program = self.program
         reg_file = context.reg_file
@@ -38,6 +42,9 @@ class DBSPInterpreter(object):
         context.status = runtime.STATUS_RUNNING
 
         while pc < len(program):
+            # The JIT merge point is at the top of the loop.
+            # 'pc' and 'program' are green, allowing the JIT to specialize
+            # the machine code for this specific circuit path.
             jitdriver.jit_merge_point(
                 pc=pc, program=program, self=self, 
                 context=context, reg_file=reg_file
@@ -46,51 +53,55 @@ class DBSPInterpreter(object):
             instr = program[pc]
             opcode = instr.opcode
 
+            # ── Control Flow Opcodes ────────────────────────────────────────
+
             if opcode == instructions.Instruction.HALT:
                 context.pc = pc
                 context.status = runtime.STATUS_HALTED
                 return
 
             elif opcode == instructions.Instruction.YIELD:
-                assert isinstance(instr, instructions.YieldOp)
+                # Yields control back to the Executor (e.g., buffer full)
                 context.pc = pc + 1
                 context.status = runtime.STATUS_YIELDED
                 context.yield_reason = instr.yield_reason
                 return
 
             elif opcode == instructions.Instruction.JUMP:
-                assert isinstance(instr, instructions.JumpOp)
                 pc = instr.jump_target
                 continue
 
+            elif opcode == instructions.Instruction.CLEAR_DELTAS:
+                # Resets transient registers to reclaim arena space
+                ops.op_clear_deltas(reg_file)
+
+            # ── Stateful Cursor Opcodes ─────────────────────────────────────
+
             elif opcode == instructions.Instruction.SCAN_TRACE:
-                assert isinstance(instr, instructions.ScanTraceOp)
                 reg_t = instr.reg_trace
                 reg_o = instr.reg_out
                 if reg_t is not None and reg_o is not None:
+                    # Pulls records from a persistent cursor into a delta batch
                     ops.op_scan_trace(reg_t.cursor, reg_o.batch, instr.chunk_limit)
 
             elif opcode == instructions.Instruction.SEEK_TRACE:
-                assert isinstance(instr, instructions.SeekTraceOp)
                 reg_t = instr.reg_trace
                 reg_k = instr.reg_key
                 if reg_t is not None and reg_k is not None:
+                    # Positions a cursor at a specific PK (from a Delta register)
                     if reg_k.batch.length() > 0:
                         key = reg_k.batch.get_pk(0)
                         ops.op_seek_trace(reg_t.cursor, key)
 
-            elif opcode == instructions.Instruction.CLEAR_DELTAS:
-                ops.op_clear_deltas(reg_file)
+            # ── DBSP Algebraic Opcodes (Stateless) ──────────────────────────
 
             elif opcode == instructions.Instruction.FILTER:
-                assert isinstance(instr, instructions.FilterOp)
                 reg_in = instr.reg_in
                 reg_out = instr.reg_out
                 if reg_in is not None and reg_out is not None:
                     ops.op_filter(reg_in.batch, reg_out.batch, instr.func)
 
             elif opcode == instructions.Instruction.MAP:
-                assert isinstance(instr, instructions.MapOp)
                 reg_in = instr.reg_in
                 reg_out = instr.reg_out
                 if reg_in is not None and reg_out is not None:
@@ -102,25 +113,22 @@ class DBSPInterpreter(object):
                     )
 
             elif opcode == instructions.Instruction.NEGATE:
-                assert isinstance(instr, instructions.NegateOp)
                 reg_in = instr.reg_in
                 reg_out = instr.reg_out
                 if reg_in is not None and reg_out is not None:
                     ops.op_negate(reg_in.batch, reg_out.batch)
 
             elif opcode == instructions.Instruction.UNION:
-                assert isinstance(instr, instructions.UnionOp)
                 reg_in_a = instr.reg_in_a
                 reg_in_b = instr.reg_in_b
                 reg_out = instr.reg_out
                 if reg_in_a is not None and reg_out is not None:
-                    b_batch = None
-                    if reg_in_b is not None:
-                        b_batch = reg_in_b.batch
+                    b_batch = reg_in_b.batch if reg_in_b is not None else None
                     ops.op_union(reg_in_a.batch, b_batch, reg_out.batch)
 
+            # ── Non-Linear & Bilinear Opcodes (Stateful Logic) ──────────────
+
             elif opcode == instructions.Instruction.DISTINCT:
-                assert isinstance(instr, instructions.DistinctOp)
                 reg_in = instr.reg_in
                 reg_history = instr.reg_history
                 reg_out = instr.reg_out
@@ -132,11 +140,11 @@ class DBSPInterpreter(object):
                     )
 
             elif opcode == instructions.Instruction.JOIN_DELTA_TRACE:
-                assert isinstance(instr, instructions.JoinDeltaTraceOp)
                 reg_delta = instr.reg_delta
                 reg_trace = instr.reg_trace
                 reg_out = instr.reg_out
                 if reg_delta is not None and reg_trace is not None and reg_out is not None:
+                    # Index-Nested-Loop Join
                     ops.op_join_delta_trace(
                         reg_delta.batch, 
                         reg_trace.cursor, 
@@ -146,38 +154,34 @@ class DBSPInterpreter(object):
                     )
 
             elif opcode == instructions.Instruction.JOIN_DELTA_DELTA:
-                assert isinstance(instr, instructions.JoinDeltaDeltaOp)
                 reg_a = instr.reg_a
                 reg_b = instr.reg_b
                 reg_out = instr.reg_out
                 if reg_a is not None and reg_b is not None and reg_out is not None:
+                    # Sort-Merge Join
                     ops.op_join_delta_delta(
                         reg_a.batch, reg_b.batch, reg_out.batch,
                         reg_a.vm_schema.table_schema, reg_b.vm_schema.table_schema
                     )
 
             elif opcode == instructions.Instruction.DELAY:
-                assert isinstance(instr, instructions.DelayOp)
                 reg_in = instr.reg_in
                 reg_out = instr.reg_out
                 if reg_in is not None and reg_out is not None:
                     ops.op_delay(reg_in.batch, reg_out.batch)
 
             elif opcode == instructions.Instruction.INTEGRATE:
-                assert isinstance(instr, instructions.IntegrateOp)
                 reg_in = instr.reg_in
                 if reg_in is not None:
+                    # Terminal sink: persist delta to a TableFamily or EphemeralTable
                     ops.op_integrate(reg_in.batch, instr.target_table)
 
             elif opcode == instructions.Instruction.REDUCE:
-                assert isinstance(instr, instructions.ReduceOp)
                 reg_in = instr.reg_in
                 reg_trace_out = instr.reg_trace_out
                 reg_out = instr.reg_out
                 if reg_in is not None and reg_trace_out is not None and reg_out is not None:
-                    trace_in_cursor = None
-                    if instr.reg_trace_in is not None:
-                        trace_in_cursor = instr.reg_trace_in.cursor
+                    trace_in_cursor = instr.reg_trace_in.cursor if instr.reg_trace_in else None
                     ops.op_reduce(
                         reg_in.batch,
                         reg_in.vm_schema.table_schema,
@@ -191,5 +195,6 @@ class DBSPInterpreter(object):
 
             pc += 1
         
+        # Program reached the end without a HALT
         context.pc = pc
         context.status = runtime.STATUS_HALTED

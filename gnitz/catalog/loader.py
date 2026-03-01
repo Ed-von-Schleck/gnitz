@@ -1,5 +1,8 @@
 # gnitz/catalog/loader.py
 
+import os
+import errno
+from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import (
     r_uint64,
     r_int64,
@@ -9,9 +12,14 @@ from rpython.rlib.rarithmetic import (
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi
 
-from gnitz.core.types import ColumnDefinition, TableSchema, TYPE_U64, TYPE_STRING
+from gnitz.core.types import (
+    ColumnDefinition, 
+    TableSchema, 
+    TYPE_U64, 
+    TYPE_STRING,
+    TYPE_U128 # Added for instructions
+)
 from gnitz.core.batch import ZSetBatch
-from gnitz.core.values import make_payload_row
 from gnitz.storage.table import PersistentTable
 
 from gnitz.catalog.system_tables import (
@@ -25,12 +33,20 @@ from gnitz.catalog.system_tables import (
     SYS_TABLE_INDICES,
     SYS_TABLE_VIEW_DEPS,
     SYS_TABLE_SEQUENCES,
+    # --- New Phase 4 Table IDs ---
+    SYS_TABLE_INSTRUCTIONS,
+    SYS_TABLE_FUNCTIONS,
+    SYS_TABLE_SUBSCRIPTIONS,
+    # -----------------------------
     FIRST_USER_TABLE_ID,
     FIRST_USER_INDEX_ID,
     OWNER_KIND_TABLE,
     SEQ_ID_SCHEMAS,
     SEQ_ID_TABLES,
     SEQ_ID_INDICES,
+    # --- New Phase 4 Seq IDs ---
+    SEQ_ID_PROGRAMS,
+    # ---------------------------
     SYS_CATALOG_DIRNAME,
     SYS_SUBDIR_SCHEMAS,
     SYS_SUBDIR_TABLES,
@@ -39,6 +55,11 @@ from gnitz.catalog.system_tables import (
     SYS_SUBDIR_INDICES,
     SYS_SUBDIR_VIEW_DEPS,
     SYS_SUBDIR_SEQUENCES,
+    # --- New Phase 4 Subdirs ---
+    SYS_SUBDIR_INSTRUCTIONS,
+    SYS_SUBDIR_FUNCTIONS,
+    SYS_SUBDIR_SUBSCRIPTIONS,
+    # ---------------------------
     make_schemas_schema,
     make_tables_schema,
     make_views_schema,
@@ -46,6 +67,11 @@ from gnitz.catalog.system_tables import (
     make_indices_schema,
     make_view_deps_schema,
     make_sequences_schema,
+    # --- New Phase 4 Schemas ---
+    make_instructions_schema,
+    make_functions_schema,
+    make_subscriptions_schema,
+    # ---------------------------
     pack_column_id,
     type_code_to_field_type,
 )
@@ -65,12 +91,22 @@ from gnitz.catalog.system_records import (
 from gnitz.catalog.index_circuit import _make_index_circuit, _backfill_index
 
 
+def _ensure_dir(path):
+    """Ensures a directory exists, ignoring EEXIST."""
+    try:
+        rposix.mkdir(path, 0o755)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+
 def _create_sys_table(sys_dir, subdir, name, schema, table_id):
     directory = sys_dir + "/" + subdir
     return PersistentTable(directory, name, schema, table_id=table_id)
 
 
-def _make_system_tables(sys_dir):
+def _make_system_tables(base_dir):
+    sys_dir = base_dir + "/" + SYS_CATALOG_DIRNAME
     return SystemTables(
         schemas=_create_sys_table(
             sys_dir,
@@ -117,11 +153,24 @@ def _make_system_tables(sys_dir):
             make_sequences_schema(),
             SYS_TABLE_SEQUENCES,
         ),
+        instructions=_create_sys_table(
+            sys_dir, SYS_SUBDIR_INSTRUCTIONS, "_instructions", 
+            make_instructions_schema(), SYS_TABLE_INSTRUCTIONS
+        ),
+        functions=_create_sys_table(
+            sys_dir, SYS_SUBDIR_FUNCTIONS, "_functions", 
+            make_functions_schema(), SYS_TABLE_FUNCTIONS
+        ),
+        subscriptions=_create_sys_table(
+            sys_dir, SYS_SUBDIR_SUBSCRIPTIONS, "_subscriptions", 
+            make_subscriptions_schema(), SYS_TABLE_SUBSCRIPTIONS
+        ),
     )
 
 
 def _bootstrap_system_tables(sys_tables, base_dir):
     sys_dir = base_dir + "/" + SYS_CATALOG_DIRNAME
+    _ensure_dir(sys_dir)
 
     schemas_schema = sys_tables.schemas.schema
     tables_schema = sys_tables.tables.schema
@@ -145,6 +194,9 @@ def _bootstrap_system_tables(sys_tables, base_dir):
         (SYS_TABLE_INDICES, "_indices", SYS_SUBDIR_INDICES),
         (SYS_TABLE_VIEW_DEPS, "_view_deps", SYS_SUBDIR_VIEW_DEPS),
         (SYS_TABLE_SEQUENCES, "_sequences", SYS_SUBDIR_SEQUENCES),
+        (SYS_TABLE_INSTRUCTIONS, "_instructions", SYS_SUBDIR_INSTRUCTIONS),
+        (SYS_TABLE_FUNCTIONS, "_functions", SYS_SUBDIR_FUNCTIONS),
+        (SYS_TABLE_SUBSCRIPTIONS, "_subscriptions", SYS_SUBDIR_SUBSCRIPTIONS),
     ]
 
     for tid, name, subdir in table_configs:
@@ -243,6 +295,25 @@ def _bootstrap_system_tables(sys_tables, base_dir):
         SYS_TABLE_SEQUENCES,
         [("seq_id", TYPE_U64), ("next_val", TYPE_U64)],
     )
+    
+    _append_system_cols(
+        cols_batch, cols_schema, SYS_TABLE_INSTRUCTIONS,
+        [("instr_pk", TYPE_U128), ("opcode", TYPE_U64), ("reg_in", TYPE_U64),
+         ("reg_out", TYPE_U64), ("reg_in_a", TYPE_U64), ("reg_in_b", TYPE_U64),
+         ("reg_trace", TYPE_U64), ("reg_trace_in", TYPE_U64), ("reg_trace_out", TYPE_U64),
+         ("reg_delta", TYPE_U64), ("reg_history", TYPE_U64), ("reg_a", TYPE_U64),
+         ("reg_b", TYPE_U64), ("reg_key", TYPE_U64), ("target_table_id", TYPE_U64),
+         ("func_id", TYPE_U64), ("agg_func_id", TYPE_U64), ("group_by_cols", TYPE_STRING),
+         ("chunk_limit", TYPE_U64), ("jump_target", TYPE_U64), ("yield_reason", TYPE_U64)]
+    )
+    _append_system_cols(
+        cols_batch, cols_schema, SYS_TABLE_FUNCTIONS,
+        [("func_id", TYPE_U64), ("name", TYPE_STRING), ("func_type", TYPE_U64)]
+    )
+    _append_system_cols(
+        cols_batch, cols_schema, SYS_TABLE_SUBSCRIPTIONS,
+        [("sub_id", TYPE_U64), ("view_id", TYPE_U64), ("client_id", TYPE_U64)]
+    )
 
     sys_tables.columns.ingest_batch(cols_batch)
     cols_batch.free()
@@ -257,6 +328,9 @@ def _bootstrap_system_tables(sys_tables, base_dir):
     )
     _append_sequence_record(
         seq_batch, seq_schema, SEQ_ID_INDICES, FIRST_USER_INDEX_ID - 1
+    )
+    _append_sequence_record(
+        seq_batch, seq_schema, SEQ_ID_PROGRAMS, FIRST_USER_TABLE_ID - 1
     )
 
     sys_tables.sequences.ingest_batch(seq_batch)
@@ -274,36 +348,36 @@ def _bootstrap_system_tables(sys_tables, base_dir):
 
 def _read_column_defs(cols_pt, owner_id):
     cursor = cols_pt.create_cursor()
-    start_key = r_uint128(pack_column_id(owner_id, 0))
-    end_key = r_uint128(pack_column_id(owner_id + 1, 0))
+    try:
+        start_key = r_uint128(pack_column_id(owner_id, 0))
+        end_key = r_uint128(pack_column_id(owner_id + 1, 0))
 
-    cursor.seek(start_key)
+        cursor.seek(start_key)
 
-    col_defs = newlist_hint(8)
-    while cursor.is_valid() and cursor.key() < end_key:
-        acc = cursor.get_accessor()
-        col_name = _read_string(acc, 4)
-        type_code = intmask(acc.get_int(5))
-        is_nullable_val = intmask(acc.get_int(6))
-        # Recover Foreign Key metadata
-        fk_table_id = intmask(acc.get_int(7))
-        fk_col_idx = intmask(acc.get_int(8))
+        col_defs = newlist_hint(8)
+        while cursor.is_valid() and cursor.key() < end_key:
+            acc = cursor.get_accessor()
+            col_name = _read_string(acc, 4)
+            type_code = intmask(acc.get_int(5))
+            is_nullable_val = intmask(acc.get_int(6))
+            fk_table_id = intmask(acc.get_int(7))
+            fk_col_idx = intmask(acc.get_int(8))
 
-        field_type = type_code_to_field_type(type_code)
-        is_nullable = is_nullable_val != 0
-        col_defs.append(
-            ColumnDefinition(
-                field_type,
-                is_nullable=is_nullable,
-                name=col_name,
-                fk_table_id=fk_table_id,
-                fk_col_idx=fk_col_idx,
+            field_type = type_code_to_field_type(type_code)
+            is_nullable = is_nullable_val != 0
+            col_defs.append(
+                ColumnDefinition(
+                    field_type,
+                    is_nullable=is_nullable,
+                    name=col_name,
+                    fk_table_id=fk_table_id,
+                    fk_col_idx=fk_col_idx,
+                )
             )
-        )
-        cursor.advance()
-
-    cursor.close()
-    return col_defs
+            cursor.advance()
+        return col_defs
+    finally:
+        cursor.close()
 
 
 def _register_system_table(registry, pt, tbl_name, table_id, subdir, sys_dir):
@@ -317,167 +391,103 @@ def _register_system_table(registry, pt, tbl_name, table_id, subdir, sys_dir):
 def _rebuild_registry(sys_tables, base_dir, registry):
     # 1. Schemas
     cursor = sys_tables.schemas.create_cursor()
-    while cursor.is_valid():
-        acc = cursor.get_accessor()
-        sid = intmask(r_uint64(cursor.key()))
-        name = _read_string(acc, 1)
-        registry.register_schema(sid, name)
-        cursor.advance()
-    cursor.close()
+    try:
+        while cursor.is_valid():
+            acc = cursor.get_accessor()
+            sid = intmask(r_uint64(cursor.key()))
+            name = _read_string(acc, 1)
+            registry.register_schema(sid, name)
+            cursor.advance()
+    finally:
+        cursor.close()
 
     # 2. System Table Families
     sys_dir = base_dir + "/" + SYS_CATALOG_DIRNAME
-    _register_system_table(
-        registry,
-        sys_tables.schemas,
-        "_schemas",
-        SYS_TABLE_SCHEMAS,
-        SYS_SUBDIR_SCHEMAS,
-        sys_dir,
-    )
-    _register_system_table(
-        registry,
-        sys_tables.tables,
-        "_tables",
-        SYS_TABLE_TABLES,
-        SYS_SUBDIR_TABLES,
-        sys_dir,
-    )
-    _register_system_table(
-        registry, sys_tables.views, "_views", SYS_TABLE_VIEWS, SYS_SUBDIR_VIEWS, sys_dir
-    )
-    _register_system_table(
-        registry,
-        sys_tables.columns,
-        "_columns",
-        SYS_TABLE_COLUMNS,
-        SYS_SUBDIR_COLUMNS,
-        sys_dir,
-    )
-    _register_system_table(
-        registry,
-        sys_tables.indices,
-        "_indices",
-        SYS_TABLE_INDICES,
-        SYS_SUBDIR_INDICES,
-        sys_dir,
-    )
-    _register_system_table(
-        registry,
-        sys_tables.view_deps,
-        "_view_deps",
-        SYS_TABLE_VIEW_DEPS,
-        SYS_SUBDIR_VIEW_DEPS,
-        sys_dir,
-    )
-    _register_system_table(
-        registry,
-        sys_tables.sequences,
-        "_sequences",
-        SYS_TABLE_SEQUENCES,
-        SYS_SUBDIR_SEQUENCES,
-        sys_dir,
-    )
+    _register_system_table(registry, sys_tables.schemas, "_schemas", SYS_TABLE_SCHEMAS, SYS_SUBDIR_SCHEMAS, sys_dir)
+    _register_system_table(registry, sys_tables.tables, "_tables", SYS_TABLE_TABLES, SYS_SUBDIR_TABLES, sys_dir)
+    _register_system_table(registry, sys_tables.views, "_views", SYS_TABLE_VIEWS, SYS_SUBDIR_VIEWS, sys_dir)
+    _register_system_table(registry, sys_tables.columns, "_columns", SYS_TABLE_COLUMNS, SYS_SUBDIR_COLUMNS, sys_dir)
+    _register_system_table(registry, sys_tables.indices, "_indices", SYS_TABLE_INDICES, SYS_SUBDIR_INDICES, sys_dir)
+    _register_system_table(registry, sys_tables.view_deps, "_view_deps", SYS_TABLE_VIEW_DEPS, SYS_SUBDIR_VIEW_DEPS, sys_dir)
+    _register_system_table(registry, sys_tables.sequences, "_sequences", SYS_TABLE_SEQUENCES, SYS_SUBDIR_SEQUENCES, sys_dir)
+    # Phase 4
+    _register_system_table(registry, sys_tables.instructions, "_instructions", SYS_TABLE_INSTRUCTIONS, SYS_SUBDIR_INSTRUCTIONS, sys_dir)
+    _register_system_table(registry, sys_tables.functions, "_functions", SYS_TABLE_FUNCTIONS, SYS_SUBDIR_FUNCTIONS, sys_dir)
+    _register_system_table(registry, sys_tables.subscriptions, "_subscriptions", SYS_TABLE_SUBSCRIPTIONS, SYS_SUBDIR_SUBSCRIPTIONS, sys_dir)
 
     # 3. Sequences (Counters)
     cursor = sys_tables.sequences.create_cursor()
-    while cursor.is_valid():
-        acc = cursor.get_accessor()
-        seq_id = intmask(r_uint64(cursor.key()))
-        val = intmask(acc.get_int(1))
-        if seq_id == SEQ_ID_SCHEMAS:
-            registry._next_schema_id = val + 1
-        elif seq_id == SEQ_ID_TABLES:
-            registry._next_table_id = val + 1
-        elif seq_id == SEQ_ID_INDICES:
-            registry._next_index_id = val + 1
-        cursor.advance()
-    cursor.close()
-
-    # Migration: Phase A databases lack SEQ_ID_INDICES — seed it now.
-    seq2_cursor = sys_tables.sequences.create_cursor()
-    found_indices_seq = False
-    while seq2_cursor.is_valid():
-        if intmask(r_uint64(seq2_cursor.key())) == SEQ_ID_INDICES:
-            found_indices_seq = True
-            break
-        seq2_cursor.advance()
-    seq2_cursor.close()
-
-    if not found_indices_seq:
-        seq_schema_m = sys_tables.sequences.schema
-        mig_batch = ZSetBatch(seq_schema_m)
-        _append_sequence_record(
-            mig_batch, seq_schema_m, SEQ_ID_INDICES, FIRST_USER_INDEX_ID - 1
-        )
-        sys_tables.sequences.ingest_batch(mig_batch)
-        mig_batch.free()
-        registry._next_index_id = FIRST_USER_INDEX_ID
+    try:
+        while cursor.is_valid():
+            acc = cursor.get_accessor()
+            seq_id = intmask(r_uint64(cursor.key()))
+            val = intmask(acc.get_int(1))
+            if seq_id == SEQ_ID_SCHEMAS:
+                registry._next_schema_id = val + 1
+            elif seq_id == SEQ_ID_TABLES:
+                registry._next_table_id = val + 1
+            elif seq_id == SEQ_ID_INDICES:
+                registry._next_index_id = val + 1
+            elif seq_id == SEQ_ID_PROGRAMS:
+                if val + 1 > registry._next_table_id:
+                    registry._next_table_id = val + 1
+            cursor.advance()
+    finally:
+        cursor.close()
 
     # 4. User Tables
     cursor = sys_tables.tables.create_cursor()
-    while cursor.is_valid():
-        tid = intmask(r_uint64(cursor.key()))
-        if tid >= FIRST_USER_TABLE_ID:
-            acc = cursor.get_accessor()
-            sid = intmask(acc.get_int(1))
-            tbl_name = _read_string(acc, 2)
-            directory = _read_string(acc, 3)
-            pk_col_idx = intmask(acc.get_int(4))
+    try:
+        while cursor.is_valid():
+            tid = intmask(r_uint64(cursor.key()))
+            if tid >= FIRST_USER_TABLE_ID:
+                acc = cursor.get_accessor()
+                sid = intmask(acc.get_int(1))
+                tbl_name = _read_string(acc, 2)
+                directory = _read_string(acc, 3)
+                pk_col_idx = intmask(acc.get_int(4))
 
-            col_defs = _read_column_defs(sys_tables.columns, tid)
-            tbl_schema = TableSchema(col_defs, pk_col_idx)
-            pt = PersistentTable(directory, tbl_name, tbl_schema, table_id=tid)
+                col_defs = _read_column_defs(sys_tables.columns, tid)
+                tbl_schema = TableSchema(col_defs, pk_col_idx)
+                pt = PersistentTable(directory, tbl_name, tbl_schema, table_id=tid)
 
-            schema_name = registry.get_schema_name(sid)
-            family = TableFamily(
-                schema_name, tbl_name, tid, sid, directory, pk_col_idx, pt
-            )
-            registry.register(family)
-        cursor.advance()
-    cursor.close()
+                schema_name = registry.get_schema_name(sid)
+                family = TableFamily(schema_name, tbl_name, tid, sid, directory, pk_col_idx, pt)
+                registry.register(family)
+            cursor.advance()
+    finally:
+        cursor.close()
 
-    # Pass 4b: Wire Foreign Key constraints now that all user families are registered.
+    # Pass 4b: Wire Foreign Key constraints
     for k in registry._by_name:
         family = registry._by_name[k]
         if family.table_id >= FIRST_USER_TABLE_ID:
             _wire_fk_constraints_for_family(family, registry)
 
-    # 5. User Table Indices (soft state rebuild from source)
+    # 5. User Table Indices
     idx_cursor = sys_tables.indices.create_cursor()
-    while idx_cursor.is_valid():
-        idx_id = intmask(r_uint64(idx_cursor.key()))
-        acc = idx_cursor.get_accessor()
-        owner_id = intmask(acc.get_int(1))
-        owner_kind = intmask(acc.get_int(2))
-        source_col_idx = intmask(acc.get_int(3))
-        idx_name = _read_string(acc, 4)
-        is_unique = intmask(acc.get_int(5)) != 0
-        cache_dir = _read_string(acc, 6)
+    try:
+        while idx_cursor.is_valid():
+            idx_id = intmask(r_uint64(idx_cursor.key()))
+            acc = idx_cursor.get_accessor()
+            owner_id = intmask(acc.get_int(1))
+            owner_kind = intmask(acc.get_int(2))
+            source_col_idx = intmask(acc.get_int(3))
+            idx_name = _read_string(acc, 4)
+            is_unique = intmask(acc.get_int(5)) != 0
+            cache_dir = _read_string(acc, 6)
 
-        # Orphaned record check: skip if owner table was dropped but index record remains
-        if owner_kind == OWNER_KIND_TABLE and registry.has_id(owner_id):
-            family = registry.get_by_id(owner_id)
-            if source_col_idx < len(family.schema.columns):
-                col = family.schema.columns[source_col_idx]
-                source_col_type = col.field_type
-                source_pk_type = family.schema.get_pk_column().field_type
-                idx_dir = family.directory + "/idx_" + str(idx_id)
-
-                circuit = _make_index_circuit(
-                    idx_id,
-                    owner_id,
-                    source_col_idx,
-                    source_col_type,
-                    source_pk_type,
-                    idx_dir,
-                    idx_name,
-                    is_unique,
-                    cache_dir,
-                )
-                _backfill_index(circuit, family)
-                family.index_circuits.append(circuit)
-                registry.register_index(idx_id, idx_name, circuit)
-
-        idx_cursor.advance()
-    idx_cursor.close()
+            if owner_kind == OWNER_KIND_TABLE and registry.has_id(owner_id):
+                from gnitz.catalog.index_circuit import _make_index_circuit, _backfill_index
+                family = registry.get_by_id(owner_id)
+                if source_col_idx < len(family.schema.columns):
+                    col = family.schema.columns[source_col_idx]
+                    source_pk_type = family.schema.get_pk_column().field_type
+                    idx_dir = family.directory + "/idx_" + str(idx_id)
+                    circuit = _make_index_circuit(idx_id, owner_id, source_col_idx, col.field_type, source_pk_type, idx_dir, idx_name, is_unique, cache_dir)
+                    _backfill_index(circuit, family)
+                    family.index_circuits.append(circuit)
+                    registry.register_index(idx_id, idx_name, circuit)
+            idx_cursor.advance()
+    finally:
+        idx_cursor.close()

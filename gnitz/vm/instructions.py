@@ -3,18 +3,20 @@
 class Instruction(object):
     """
     Base class for all VM instructions.
+    
     Standardized layout ensures the RPython annotator can resolve attributes
-    during dispatch loops without type unions or attribute errors.
+    during dispatch loops without type unions or attribute errors. 
+    Every field used by any subclass is defined here.
     """
     _immutable_fields_ = [
         'opcode', 'reg_in', 'reg_out', 'func', 'reg_in_a', 'reg_in_b',
         'reg_history', 'reg_delta', 'reg_trace', 'target_table',
         'reg_a', 'reg_b', 'reg_trace_in', 'reg_trace_out',
         'group_by_cols', 'agg_func', 'output_schema',
-        # --- New Fields for Phase A ---
         'chunk_limit', 'jump_target', 'yield_reason', 'reg_key'
     ]
     
+    # --- Opcode Constants ---
     HALT             = 0
     FILTER           = 1
     MAP              = 2
@@ -26,7 +28,6 @@ class Instruction(object):
     DELAY            = 8
     REDUCE           = 9
     DISTINCT         = 10
-    # --- New Opcodes ---
     SCAN_TRACE       = 11
     SEEK_TRACE       = 12
     YIELD            = 13
@@ -35,7 +36,7 @@ class Instruction(object):
 
     def __init__(self, opcode):
         self.opcode = opcode
-        # Standardized attribute file initialized to None/0
+        # Standardized attribute file initialized to None/0 to satisfy Monomorphism
         self.reg_in = None
         self.reg_out = None
         self.func = None
@@ -52,11 +53,12 @@ class Instruction(object):
         self.group_by_cols = None
         self.agg_func = None
         self.output_schema = None
-        # --- New Fields ---
         self.chunk_limit = 0
         self.jump_target = 0
         self.yield_reason = 0
         self.reg_key = None
+
+# ── DBSP Algebraic Instructions ───────────────────────────────────────────
 
 class FilterOp(Instruction):
     def __init__(self, reg_in, reg_out, func):
@@ -111,10 +113,6 @@ class DelayOp(Instruction):
         self.reg_in = reg_in
         self.reg_out = reg_out
 
-class HaltOp(Instruction):
-    def __init__(self):
-        Instruction.__init__(self, self.HALT)
-
 class JoinDeltaDeltaOp(Instruction):
     def __init__(self, reg_a, reg_b, reg_out):
         Instruction.__init__(self, self.JOIN_DELTA_DELTA)
@@ -134,7 +132,11 @@ class ReduceOp(Instruction):
         self.agg_func = agg_func
         self.output_schema = output_schema
 
-# --- New Op Classes for Phase A ---
+# ── Control Flow & Cursor Management ──────────────────────────────────────
+
+class HaltOp(Instruction):
+    def __init__(self):
+        Instruction.__init__(self, self.HALT)
 
 class ScanTraceOp(Instruction):
     def __init__(self, reg_trace, reg_out, chunk_limit):
