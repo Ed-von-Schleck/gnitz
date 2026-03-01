@@ -9,9 +9,14 @@ from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
 from gnitz.core.batch import ZSetBatch
 from gnitz.vm import runtime, interpreter
-from gnitz.catalog.system_tables import SYS_TABLE_VIEW_DEPS, SYS_TABLE_SUBSCRIPTIONS
+from gnitz.catalog.system_tables import (
+    SYS_TABLE_VIEW_DEPS,
+    SYS_TABLE_SUBSCRIPTIONS,
+    VIEW_DEPS_COL_VIEW_ID,
+    VIEW_DEPS_COL_DEP_VIEW_ID,
+    VIEW_DEPS_COL_DEP_TABLE_ID,
+)
 
-# Assuming program_cache is implemented as part of Phase 4
 from gnitz.catalog.program_cache import ProgramCache
 
 STATUS_OK = 0
@@ -20,6 +25,7 @@ STATUS_ERROR = 1
 
 class _CascadeItem(object):
     """Container for the DAG evaluation queue."""
+
     def __init__(self, target_id, batch, depth, owns_batch):
         self.target_id = target_id
         self.batch = batch
@@ -41,9 +47,9 @@ class ServerExecutor(object):
 
         # Connection Registries
         self.active_fds = newlist_hint(16)
-        self.client_sockets = {}    # int(fd) -> RSocket
-        self.fd_to_client = {}      # int(fd) -> int(client_id)
-        self.client_to_fd = {}      # int(client_id) -> int(fd)
+        self.client_sockets = {}  # int(fd) -> RSocket
+        self.fd_to_client = {}  # int(fd) -> int(client_id)
+        self.client_to_fd = {}  # int(client_id) -> int(fd)
 
     def run_socket_server(self, socket_path):
         """
@@ -144,7 +150,7 @@ class ServerExecutor(object):
                 ipc.send_batch(fd, target_id, None, STATUS_OK, "", client_id)
 
         except errors.GnitzError as ge:
-            err_msg = ge.msg if hasattr(ge, 'msg') else str(ge)
+            err_msg = ge.msg if hasattr(ge, "msg") else str(ge)
             tid = intmask(payload.target_id) if payload else 0
             cid = intmask(payload.client_id) if payload else 0
             ipc.send_error(fd, err_msg, target_id=tid, client_id=cid)
@@ -279,7 +285,9 @@ class ServerExecutor(object):
 
                         # Recursive Step: Push the new delta into the queue
                         # owns_batch=True ensures this clone is freed after use.
-                        queue.append(_CascadeItem(view_id, out_delta_cloned, depth + 1, True))
+                        queue.append(
+                            _CascadeItem(view_id, out_delta_cloned, depth + 1, True)
+                        )
 
                 # --- 5. Break Input Alias ---
                 # Sever the reference to the external delta so that if the batch
@@ -297,6 +305,11 @@ class ServerExecutor(object):
     def _get_dependent_views(self, target_id):
         """
         Queries `_system._view_deps` to find downstream dependents.
+
+        The _view_deps schema is (dep_id PK, view_id, dep_view_id, dep_table_id).
+        A row (dep_id, V, U_view, U_table) means view V depends on upstream
+        entity U_view (another view) or U_table (a base table).  We want all V
+        where either U_view == target_id or U_table == target_id.
         """
         if not self.engine.registry.has_id(SYS_TABLE_VIEW_DEPS):
             return []
@@ -307,12 +320,16 @@ class ServerExecutor(object):
 
         try:
             while cursor.is_valid():
-                acc = cursor.get_accessor()
-                v_id = intmask(acc.get_int(0))
-                d_view_id = intmask(acc.get_int(1))
-                d_table_id = intmask(acc.get_int(2))
+                if cursor.weight() <= r_int64(0):
+                    cursor.advance()
+                    continue
 
-                if (d_view_id == target_id or d_table_id == target_id) and cursor.weight() > r_int64(0):
+                acc = cursor.get_accessor()
+                dep_view_id = intmask(acc.get_int(VIEW_DEPS_COL_DEP_VIEW_ID))
+                dep_table_id = intmask(acc.get_int(VIEW_DEPS_COL_DEP_TABLE_ID))
+
+                if dep_view_id == target_id or dep_table_id == target_id:
+                    v_id = intmask(acc.get_int(VIEW_DEPS_COL_VIEW_ID))
                     if v_id not in res:
                         res.append(v_id)
                 cursor.advance()

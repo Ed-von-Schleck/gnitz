@@ -5,7 +5,13 @@ from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, int
 from rpython.rtyper.lltypesystem import rffi
 
 from gnitz.core import strings
-from gnitz.catalog.system_tables import SYS_TABLE_INSTRUCTIONS, SYS_TABLE_VIEW_DEPS
+from gnitz.catalog.system_tables import (
+    SYS_TABLE_INSTRUCTIONS,
+    SYS_TABLE_VIEW_DEPS,
+    VIEW_DEPS_COL_VIEW_ID,
+    VIEW_DEPS_COL_DEP_VIEW_ID,
+    VIEW_DEPS_COL_DEP_TABLE_ID,
+)
 from gnitz.vm import instructions, runtime
 from gnitz.dbsp import functions
 
@@ -14,10 +20,12 @@ from gnitz.dbsp import functions
 NULL_PREDICATE = functions.NullPredicate()
 NULL_AGGREGATE = functions.NullAggregate()
 
+
 def _get_scalar_func(func_id):
     # Logic to look up func in registry...
     # if not found:
     return NULL_PREDICATE
+
 
 def _get_agg_func(agg_func_id):
     # Logic to look up agg in registry...
@@ -39,6 +47,7 @@ class ExecutablePlan(object):
     There is no single `in_schema` field because multi-input views (joins) have
     multiple input schemas; each register carries its own.
     """
+
     _immutable_fields_ = ["program", "reg_file", "out_schema"]
 
     def __init__(self, program, reg_file, out_schema):
@@ -124,14 +133,10 @@ class ProgramCache(object):
                     continue
 
                 acc = cursor.get_accessor()
-                # view_deps payload layout (pk_index=0, dep_id is PK):
-                #   payload col 0 = view_id
-                #   payload col 1 = dep_view_id
-                #   payload col 2 = dep_table_id
-                v_id = intmask(acc.get_int(0))
+                v_id = intmask(acc.get_int(VIEW_DEPS_COL_VIEW_ID))
                 if v_id == program_id:
-                    dep_table_id = intmask(acc.get_int(2))
-                    dep_view_id = intmask(acc.get_int(1))
+                    dep_table_id = intmask(acc.get_int(VIEW_DEPS_COL_DEP_TABLE_ID))
+                    dep_view_id = intmask(acc.get_int(VIEW_DEPS_COL_DEP_VIEW_ID))
 
                     # Prefer a concrete base table over a derived view dependency.
                     source_id = dep_table_id if dep_table_id > 0 else dep_view_id
@@ -207,7 +212,9 @@ class ProgramCache(object):
                         r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
                         reg_file.registers[rid_out] = r_out
 
-                    instr = instructions.FilterOp(r_in, r_out, _get_scalar_func(intmask(acc.get_int(14))))
+                    instr = instructions.FilterOp(
+                        r_in, r_out, _get_scalar_func(intmask(acc.get_int(14)))
+                    )
 
                 elif opcode == instructions.Instruction.MAP:
                     rid_in = intmask(acc.get_int(1))
@@ -231,7 +238,9 @@ class ProgramCache(object):
                         r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
                         reg_file.registers[rid_out] = r_out
 
-                    instr = instructions.MapOp(r_in, r_out, _get_scalar_func(intmask(acc.get_int(14))))
+                    instr = instructions.MapOp(
+                        r_in, r_out, _get_scalar_func(intmask(acc.get_int(14)))
+                    )
 
                 elif opcode == instructions.Instruction.NEGATE:
                     rid_in = intmask(acc.get_int(1))
@@ -291,18 +300,27 @@ class ProgramCache(object):
                     # The output register carries the join output schema.
                     r_delta = reg_file.registers[rid_delta]
                     if r_delta is None:
-                        r_delta = runtime.DeltaRegister(rid_delta, runtime.VMSchema(in_schema))
+                        r_delta = runtime.DeltaRegister(
+                            rid_delta, runtime.VMSchema(in_schema)
+                        )
                         reg_file.registers[rid_delta] = r_delta
 
                     r_trace = reg_file.registers[rid_trace]
                     if r_trace is None and tid > 0:
                         f = self.registry.get_by_id(tid)
-                        r_trace = runtime.TraceRegister(rid_trace, runtime.VMSchema(f.schema), f.create_cursor(), f)
+                        r_trace = runtime.TraceRegister(
+                            rid_trace,
+                            runtime.VMSchema(f.schema),
+                            f.create_cursor(),
+                            f,
+                        )
                         reg_file.registers[rid_trace] = r_trace
 
                     r_out = reg_file.registers[rid_out]
                     if r_out is None:
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(out_schema))
+                        r_out = runtime.DeltaRegister(
+                            rid_out, runtime.VMSchema(out_schema)
+                        )
                         reg_file.registers[rid_out] = r_out
                     instr = instructions.JoinDeltaTraceOp(r_delta, r_trace, r_out)
 
@@ -316,15 +334,21 @@ class ProgramCache(object):
                     # The output carries the join output schema.
                     r_a = reg_file.registers[rid_a]
                     if r_a is None:
-                        r_a = runtime.DeltaRegister(rid_a, runtime.VMSchema(in_schema))
+                        r_a = runtime.DeltaRegister(
+                            rid_a, runtime.VMSchema(in_schema)
+                        )
                         reg_file.registers[rid_a] = r_a
                     r_b = reg_file.registers[rid_b]
                     if r_b is None:
-                        r_b = runtime.DeltaRegister(rid_b, runtime.VMSchema(in_schema))
+                        r_b = runtime.DeltaRegister(
+                            rid_b, runtime.VMSchema(in_schema)
+                        )
                         reg_file.registers[rid_b] = r_b
                     r_out = reg_file.registers[rid_out]
                     if r_out is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else out_schema
+                        sch = (
+                            self.registry.get_by_id(tid).schema if tid > 0 else out_schema
+                        )
                         r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
                         reg_file.registers[rid_out] = r_out
                     instr = instructions.JoinDeltaDeltaOp(r_a, r_b, r_out)
@@ -337,7 +361,11 @@ class ProgramCache(object):
                         sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
                         r_in = runtime.DeltaRegister(rid_in, runtime.VMSchema(sch))
                         reg_file.registers[rid_in] = r_in
-                    target = self.registry.get_by_id(tid) if self.registry.has_id(tid) else None
+                    target = (
+                        self.registry.get_by_id(tid)
+                        if self.registry.has_id(tid)
+                        else None
+                    )
                     instr = instructions.IntegrateOp(r_in, target)
 
                 elif opcode == instructions.Instruction.DELAY:
@@ -371,30 +399,48 @@ class ProgramCache(object):
                     # schema here silently produces incorrect group assignments.
                     r_in = reg_file.registers[rid_in]
                     if r_in is None:
-                        r_in = runtime.DeltaRegister(rid_in, runtime.VMSchema(in_schema))
+                        r_in = runtime.DeltaRegister(
+                            rid_in, runtime.VMSchema(in_schema)
+                        )
                         reg_file.registers[rid_in] = r_in
 
                     r_tr_in = reg_file.registers[rid_tr_in]
                     if r_tr_in is None and tid > 0:
                         f = self.registry.get_by_id(tid)
-                        r_tr_in = runtime.TraceRegister(rid_tr_in, runtime.VMSchema(f.schema), f.create_cursor(), f)
+                        r_tr_in = runtime.TraceRegister(
+                            rid_tr_in,
+                            runtime.VMSchema(f.schema),
+                            f.create_cursor(),
+                            f,
+                        )
                         reg_file.registers[rid_tr_in] = r_tr_in
 
                     r_tr_out = reg_file.registers[rid_tr_out]
                     if r_tr_out is None and tid > 0:
                         f = self.registry.get_by_id(tid)
-                        r_tr_out = runtime.TraceRegister(rid_tr_out, runtime.VMSchema(f.schema), f.create_cursor(), f)
+                        r_tr_out = runtime.TraceRegister(
+                            rid_tr_out,
+                            runtime.VMSchema(f.schema),
+                            f.create_cursor(),
+                            f,
+                        )
                         reg_file.registers[rid_tr_out] = r_tr_out
 
                     r_out = reg_file.registers[rid_out]
                     if r_out is None:
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(out_schema))
+                        r_out = runtime.DeltaRegister(
+                            rid_out, runtime.VMSchema(out_schema)
+                        )
                         reg_file.registers[rid_out] = r_out
 
                     instr = instructions.ReduceOp(
-                        r_in, r_tr_in, r_tr_out, r_out,
+                        r_in,
+                        r_tr_in,
+                        r_tr_out,
+                        r_out,
                         self._parse_group_by_cols(self._read_string(acc, 16)),
-                        _get_agg_func(intmask(acc.get_int(15))), out_schema,
+                        _get_agg_func(intmask(acc.get_int(15))),
+                        out_schema,
                     )
 
                 elif opcode == instructions.Instruction.DISTINCT:
@@ -406,16 +452,25 @@ class ProgramCache(object):
                     # DISTINCT is schema-preserving across all three registers.
                     r_in = reg_file.registers[rid_in]
                     if r_in is None:
-                        r_in = runtime.DeltaRegister(rid_in, runtime.VMSchema(in_schema))
+                        r_in = runtime.DeltaRegister(
+                            rid_in, runtime.VMSchema(in_schema)
+                        )
                         reg_file.registers[rid_in] = r_in
                     r_hist = reg_file.registers[rid_hist]
                     if r_hist is None and tid > 0:
                         f = self.registry.get_by_id(tid)
-                        r_hist = runtime.TraceRegister(rid_hist, runtime.VMSchema(f.schema), f.create_cursor(), f)
+                        r_hist = runtime.TraceRegister(
+                            rid_hist,
+                            runtime.VMSchema(f.schema),
+                            f.create_cursor(),
+                            f,
+                        )
                         reg_file.registers[rid_hist] = r_hist
                     r_out = reg_file.registers[rid_out]
                     if r_out is None:
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(in_schema))
+                        r_out = runtime.DeltaRegister(
+                            rid_out, runtime.VMSchema(in_schema)
+                        )
                         reg_file.registers[rid_out] = r_out
                     instr = instructions.DistinctOp(r_in, r_hist, r_out)
 
@@ -427,11 +482,18 @@ class ProgramCache(object):
                     r_tr = reg_file.registers[rid_tr]
                     if r_tr is None and tid > 0:
                         f = self.registry.get_by_id(tid)
-                        r_tr = runtime.TraceRegister(rid_tr, runtime.VMSchema(f.schema), f.create_cursor(), f)
+                        r_tr = runtime.TraceRegister(
+                            rid_tr,
+                            runtime.VMSchema(f.schema),
+                            f.create_cursor(),
+                            f,
+                        )
                         reg_file.registers[rid_tr] = r_tr
                     r_out = reg_file.registers[rid_out]
                     if r_out is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else out_schema
+                        sch = (
+                            self.registry.get_by_id(tid).schema if tid > 0 else out_schema
+                        )
                         r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
                         reg_file.registers[rid_out] = r_out
                     instr = instructions.ScanTraceOp(r_tr, r_out, intmask(acc.get_int(17)))
@@ -443,11 +505,18 @@ class ProgramCache(object):
                     r_tr = reg_file.registers[rid_tr]
                     if r_tr is None and tid > 0:
                         f = self.registry.get_by_id(tid)
-                        r_tr = runtime.TraceRegister(rid_tr, runtime.VMSchema(f.schema), f.create_cursor(), f)
+                        r_tr = runtime.TraceRegister(
+                            rid_tr,
+                            runtime.VMSchema(f.schema),
+                            f.create_cursor(),
+                            f,
+                        )
                         reg_file.registers[rid_tr] = r_tr
                     r_key = reg_file.registers[rid_key]
                     if r_key is None:
-                        r_key = runtime.DeltaRegister(rid_key, runtime.VMSchema(in_schema))
+                        r_key = runtime.DeltaRegister(
+                            rid_key, runtime.VMSchema(in_schema)
+                        )
                         reg_file.registers[rid_key] = r_key
                     instr = instructions.SeekTraceOp(r_tr, r_key)
 

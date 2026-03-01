@@ -69,6 +69,16 @@ SYS_SUBDIR_SUBSCRIPTIONS = "_subscriptions"
 
 # ---------------------------------------------------------------------------
 # Schema Factory Functions
+# Column index constants follow immediately after each factory function.
+#
+# Convention: all constants are *schema* column indices (0-based, col 0 = PK).
+# This matches the calling convention of every storage accessor:
+#   RawWALAccessor._get_ptr  → schema.get_column_offset(col_idx)
+#   PackedNodeAccessor._get_ptr → schema.get_column_offset(col_idx)
+#   SoAAccessor._get_ptr     → view.get_col_ptr(row_idx, col_idx)
+#
+# The PK is always col 0 with physical offset -1 (not stored in the payload).
+# Non-PK fields start at col 1.
 # ---------------------------------------------------------------------------
 
 
@@ -79,6 +89,8 @@ def make_schemas_schema():
     return TableSchema(cols, pk_index=0)
 
 
+# -- _schemas: col 0 = schema_id (PK) ----------------------------------------
+SCHEMAS_COL_NAME = 1  # VARCHAR  schema name
 
 
 def make_tables_schema():
@@ -90,6 +102,14 @@ def make_tables_schema():
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="pk_col_idx"))
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="created_lsn"))
     return TableSchema(cols, pk_index=0)
+
+
+# -- _tables: col 0 = table_id (PK) ------------------------------------------
+TABLES_COL_SCHEMA_ID = 1  # UINT64   owning schema id
+TABLES_COL_NAME = 2  # VARCHAR  table name
+TABLES_COL_DIRECTORY = 3  # VARCHAR  on-disk directory path
+TABLES_COL_PK_COL_IDX = 4  # UINT32   schema column index of the PK
+TABLES_COL_CREATED_LSN = 5  # UINT64   LSN at creation time
 
 
 def make_views_schema():
@@ -107,6 +127,14 @@ def make_views_schema():
     return TableSchema(cols, pk_index=0)
 
 
+# -- _views: col 0 = view_id (PK) --------------------------------------------
+VIEWS_COL_SCHEMA_ID = 1  # UINT64   owning schema id
+VIEWS_COL_NAME = 2  # VARCHAR  view name
+VIEWS_COL_SQL_DEFINITION = 3  # VARCHAR  SQL source text
+VIEWS_COL_CACHE_DIRECTORY = 4  # VARCHAR  optional cache dir path
+VIEWS_COL_CREATED_LSN = 5  # UINT64   LSN at creation time
+
+
 def make_columns_schema():
     cols = newlist_hint(9)
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="column_id"))
@@ -119,6 +147,17 @@ def make_columns_schema():
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="fk_table_id"))
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="fk_col_idx"))
     return TableSchema(cols, pk_index=0)
+
+
+# -- _columns: col 0 = column_id (PK) ----------------------------------------
+COLUMNS_COL_OWNER_ID = 1  # UINT64   owning table_id
+COLUMNS_COL_OWNER_KIND = 2  # UINT8    OWNER_KIND_TABLE / OWNER_KIND_VIEW
+COLUMNS_COL_COL_IDX = 3  # UINT32   position in owning schema
+COLUMNS_COL_NAME = 4  # VARCHAR  column name
+COLUMNS_COL_FIELD_TYPE_CODE = 5  # UINT16   FieldType.code
+COLUMNS_COL_IS_NULLABLE = 6  # UINT8    0 / 1
+COLUMNS_COL_FK_TABLE_ID = 7  # UINT64   FK target table_id (0 = none)
+COLUMNS_COL_FK_COL_IDX = 8  # UINT32   FK target column index
 
 
 def make_indices_schema():
@@ -135,6 +174,15 @@ def make_indices_schema():
     return TableSchema(cols, pk_index=0)
 
 
+# -- _indices: col 0 = index_id (PK) -----------------------------------------
+INDICES_COL_OWNER_ID = 1  # UINT64   owning table_id
+INDICES_COL_OWNER_KIND = 2  # UINT8    OWNER_KIND_TABLE / OWNER_KIND_VIEW
+INDICES_COL_SOURCE_COL_IDX = 3  # UINT32   indexed column (schema col idx)
+INDICES_COL_NAME = 4  # VARCHAR  index name
+INDICES_COL_IS_UNIQUE = 5  # UINT8    0 / 1
+INDICES_COL_CACHE_DIRECTORY = 6  # VARCHAR  optional cache dir path
+
+
 def make_view_deps_schema():
     cols = newlist_hint(4)
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dep_id"))
@@ -144,11 +192,21 @@ def make_view_deps_schema():
     return TableSchema(cols, pk_index=0)
 
 
+# -- _view_deps: col 0 = dep_id (PK) -----------------------------------------
+VIEW_DEPS_COL_VIEW_ID = 1  # UINT64   the view that depends on something
+VIEW_DEPS_COL_DEP_VIEW_ID = 2  # UINT64   upstream view dependency (0 = none)
+VIEW_DEPS_COL_DEP_TABLE_ID = 3  # UINT64   upstream table dependency (0 = none)
+
+
 def make_sequences_schema():
     cols = newlist_hint(2)
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="seq_id"))
     cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="next_val"))
     return TableSchema(cols, pk_index=0)
+
+
+# -- _sequences: col 0 = seq_id (PK) -----------------------------------------
+SEQUENCES_COL_VALUE = 1  # UINT64   current high-water mark
 
 
 def make_instructions_schema():
@@ -248,50 +306,3 @@ def type_code_to_field_type(code):
     if code == TYPE_U128.code:
         return TYPE_U128
     raise LayoutError("Unknown type code: %d" % code)
-
-# ============================================================================
-# ADDITIONS TO gnitz/catalog/system_tables.py
-#
-# Add these constant blocks immediately after each make_*_schema() factory
-# function, in the same position order as the columns are declared.
-#
-# Convention: all constants are *schema* column indices (0-based, col 0 = PK).
-# This matches the calling convention of every storage accessor:
-#   RawWALAccessor._get_ptr  → schema.get_column_offset(col_idx)
-#   PackedNodeAccessor._get_ptr → schema.get_column_offset(col_idx)
-#   SoAAccessor._get_ptr     → view.get_col_ptr(row_idx, col_idx)
-#
-# The PK is always col 0 with physical offset -1 (not stored in the payload).
-# Non-PK fields start at col 1.
-# ============================================================================
-
-# -- _schemas: col 0 = schema_id (PK) ----------------------------------------
-SCHEMAS_COL_NAME           = 1   # VARCHAR  schema name
-
-# -- _tables: col 0 = table_id (PK) ------------------------------------------
-TABLES_COL_SCHEMA_ID       = 1   # UINT64   owning schema id
-TABLES_COL_NAME            = 2   # VARCHAR  table name
-TABLES_COL_DIRECTORY       = 3   # VARCHAR  on-disk directory path
-TABLES_COL_PK_COL_IDX      = 4   # UINT32   schema column index of the PK
-TABLES_COL_CREATED_LSN     = 5   # UINT64   LSN at creation time
-
-# -- _columns: col 0 = col_pk (PK) -------------------------------------------
-COLUMNS_COL_OWNER_ID       = 1   # UINT64   owning table_id
-COLUMNS_COL_OWNER_KIND     = 2   # UINT8    OWNER_KIND_TABLE / OWNER_KIND_VIEW
-COLUMNS_COL_COL_IDX        = 3   # UINT32   position in owning schema
-COLUMNS_COL_NAME           = 4   # VARCHAR  column name
-COLUMNS_COL_FIELD_TYPE_CODE = 5  # UINT16   FieldType.code
-COLUMNS_COL_IS_NULLABLE    = 6   # UINT8    0 / 1
-COLUMNS_COL_FK_TABLE_ID    = 7   # UINT64   FK target table_id (0 = none)
-COLUMNS_COL_FK_COL_IDX     = 8   # UINT32   FK target column index
-
-# -- _indices: col 0 = index_id (PK) -----------------------------------------
-INDICES_COL_OWNER_ID       = 1   # UINT64   owning table_id
-INDICES_COL_OWNER_KIND     = 2   # UINT8    OWNER_KIND_TABLE / OWNER_KIND_VIEW
-INDICES_COL_SOURCE_COL_IDX = 3   # UINT32   indexed column (schema col idx)
-INDICES_COL_NAME           = 4   # VARCHAR  index name
-INDICES_COL_IS_UNIQUE      = 5   # UINT8    0 / 1
-INDICES_COL_CACHE_DIRECTORY = 6  # VARCHAR  optional cache dir path
-
-# -- _sequences: col 0 = seq_id (PK) -----------------------------------------
-SEQUENCES_COL_VALUE        = 1   # UINT64   current high-water mark
