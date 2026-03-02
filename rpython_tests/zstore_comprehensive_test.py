@@ -1,4 +1,4 @@
-# zstore_comprehensive_test.py
+# rpython_tests/zstore_comprehensive_test.py
 
 import os
 from rpython.rlib import rposix
@@ -11,215 +11,335 @@ from rpython.rlib.rarithmetic import (
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core import types, values, batch
-from gnitz.storage import table
+from gnitz.core.errors import LayoutError
 from gnitz.catalog import system_tables as sys
-from gnitz.catalog import engine
+from gnitz.catalog import engine, identifiers
+from gnitz.catalog.metadata import ensure_dir
 from gnitz.vm import runtime, interpreter, instructions
-from gnitz.server import ipc
+
+# -- RPython Safe Hex Formatting ----------------------------------------------
 
 
-def assert_true(condition, msg):
-    if not condition:
-        os.write(2, "\n!!! ASSERTION FAILURE: " + msg + " !!!\n")
-        raise Exception("Assertion Failed")
+def _u64_to_hex_padded(val):
+    """
+    Manual hex conversion because RPython % formatting does not support
+    zero-padding/width specifiers for hex.
+    """
+    chars = "0123456789abcdef"
+    res = ["0"] * 16
+    temp = val
+    for i in range(15, -1, -1):
+        res[i] = chars[intmask(temp & r_uint64(0xF))]
+        temp >>= 4
+    return "".join(res)
+
+
+# -- RPython Test Utilities ---------------------------------------------------
+
+
+def log(msg):
+    os.write(1, "[TEST] " + msg + "\n")
+
+
+def log_step(name):
+    os.write(1, "\n[CHECKPOINT] " + name + "...\n")
+
+
+def fail(msg):
+    os.write(2, "\n!!! CRITICAL TEST FAILURE !!!\n")
+    os.write(2, msg + "\n")
+    raise Exception("Test Failure")
+
+
+def assert_true(cond, msg):
+    if not cond:
+        fail("Assertion Failed: " + msg)
 
 
 def assert_equal_i(expected, actual, msg):
     if expected != actual:
-        os.write(2, "\n!!! VALUE MISMATCH: " + msg + " !!!\n")
-        os.write(2, "   Expected: " + str(expected) + "\n")
-        os.write(2, "   Actual:   " + str(actual) + "\n")
-        raise Exception("Value Mismatch")
+        fail(msg + " -> Expected: %d, Actual: %d" % (expected, actual))
 
 
-def cleanup_path(path):
+def assert_equal_u128(expected, actual, msg):
+    if expected != actual:
+        hi_e = r_uint64(expected >> 64)
+        lo_e = r_uint64(expected)
+        hi_a = r_uint64(actual >> 64)
+        lo_a = r_uint64(actual)
+
+        os.write(
+            2,
+            "   Expected: " + _u64_to_hex_padded(hi_e) + _u64_to_hex_padded(lo_e) + "\n",
+        )
+        os.write(
+            2, "   Actual:   " + _u64_to_hex_padded(hi_a) + _u64_to_hex_padded(lo_a) + "\n"
+        )
+        fail(msg + " -> U128 Mismatch")
+
+
+def dump_filesystem(path, indent=""):
     """
-    RPython-compliant cleanup.
-    Avoids os.path.join and heterogenous iteration.
+    Diagnostic helper to prove what files actually exist on disk.
     """
     if not os.path.exists(path):
         return
-
-    files = newlist_hint(2)
-    files.append("t1.wal")
-    files.append("MANIFEST")
-
-    for i in range(len(files)):
-        f_name = files[i]
-        full_p = path + "/" + f_name
-        try:
-            os.unlink(full_p)
-        except OSError:
-            pass
-
-    subs = newlist_hint(3)
-    subs.append("chunk_test")
-    subs.append("public")
-    subs.append("source")
-
-    for i in range(len(subs)):
-        sub_path = path + "/" + subs[i]
-        if os.path.exists(sub_path):
-            for j in range(len(files)):
-                f_name = files[j]
-                try:
-                    os.unlink(sub_path + "/" + f_name)
-                except OSError:
-                    pass
-            try:
-                rposix.rmdir(sub_path)
-            except OSError:
-                pass
-
     try:
-        rposix.rmdir(path)
+        items = os.listdir(path)
+        for item in items:
+            full_path = path + "/" + item
+            # RPython: os.path.isdir/isfile is fine
+            if os.path.isdir(full_path):
+                log(indent + " [D] " + item)
+                dump_filesystem(full_path, indent + "    ")
+            else:
+                log(indent + " [F] " + item)
     except OSError:
         pass
 
 
-def test_vm_chunking_and_yield():
-    os.write(1, "[VM] Testing Chunked Execution and YIELD...\n")
-
-    schema = sys.TableTab.schema()
-    base_dir = "/tmp/gnitz_test_vm"
-    cleanup_path(base_dir)
-    if not os.path.exists(base_dir):
-        os.mkdir(base_dir, 0o755)
-
-    pt = table.PersistentTable(base_dir + "/chunk_test", "t1", schema)
-
-    b = batch.ArenaZSetBatch(schema)
-    for i in range(3):
-        row = values.make_payload_row(schema)
-        row.append_int(r_int64(1))
-        row.append_string("name_" + str(i))
-        row.append_string("dir")
-        row.append_int(r_int64(0))
-        row.append_int(r_int64(0))
-        b.append(r_uint128(i), r_int64(1), row)
-
-    pt.ingest_batch(b)
-
-    vm_schema = runtime.VMSchema(schema)
-    reg_file = runtime.RegisterFile(16)
-    reg_trace = runtime.TraceRegister(0, vm_schema, pt.create_cursor(), pt)
-    reg_out = runtime.DeltaRegister(1, vm_schema)
-    reg_file.registers[0] = reg_trace
-    reg_file.registers[1] = reg_out
-
-    program = newlist_hint(4)
-    program.append(instructions.ScanTraceOp(reg_trace, reg_out, chunk_limit=2))
-    program.append(instructions.YieldOp(reason=ipc.YIELD_REASON_BUFFER_FULL))
-    program.append(instructions.ScanTraceOp(reg_trace, reg_out, chunk_limit=2))
-    program.append(instructions.HaltOp())
-
-    # Update: Use the new ExecutionContext and run_vm boundary
-    ctx = runtime.ExecutionContext()
-    ctx.reset()
-
-    interpreter.run_vm(program, reg_file, ctx)
-    assert_equal_i(runtime.STATUS_YIELDED, ctx.status, "Should yield after 2 rows")
-    assert_equal_i(2, reg_out.batch.length(), "Out batch size mismatch")
-
-    # Resume the VM
-    reg_out.batch.clear()
-    interpreter.run_vm(program, reg_file, ctx)
-    assert_equal_i(runtime.STATUS_HALTED, ctx.status, "Should halt after finish")
-    assert_equal_i(1, reg_out.batch.length(), "Remaining row count mismatch")
-
-    pt.close()
-    b.free()
-    os.write(1, "[VM] Chunked Execution Test Passed.\n")
+def _recursive_delete(path):
+    """
+    Nasty but necessary RPython recursive cleanup.
+    RPython does not provide shutil.rmtree.
+    """
+    if not os.path.exists(path):
+        return
+    if os.path.isdir(path):
+        items = os.listdir(path)
+        for item in items:
+            _recursive_delete(path + "/" + item)
+        try:
+            rposix.rmdir(path)
+        except OSError:
+            pass
+    else:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
-def test_reactive_ddl_and_registry():
-    os.write(1, "[CATALOG] Testing Reactive DDL Triggers...\n")
+def cleanup_base_dir(path):
+    """
+    Aggressive cleanup of the test environment.
+    """
+    if not os.path.exists(path):
+        return
+    log("Cleaning up: " + path)
+    _recursive_delete(path)
 
-    base_dir = "/tmp/gnitz_test_ddl"
-    cleanup_path(base_dir)
-    if not os.path.exists(base_dir):
-        os.mkdir(base_dir, 0o755)
+    if os.path.exists(path):
+        log("WARNING: Cleanup failed to remove base directory.")
+        dump_filesystem(path)
 
+
+# -- Simple Query Builder for View Intent -------------------------------------
+
+
+class QueryBuilder(object):
+    """
+    Minimal builder to hold instructions for view creation.
+    We use REAL runtime registers to satisfy RPython type unification.
+    """
+
+    _immutable_fields_ = ["instructions", "registers", "current_reg_idx"]
+
+    def __init__(self, instructions_list, out_reg, registers):
+        self.instructions = instructions_list
+        self.registers = registers
+        self.current_reg_idx = out_reg.reg_id
+
+
+# -- The Main Test Suite ------------------------------------------------------
+
+
+def test_programmable_zset_lifecycle():
+    log("Starting Comprehensive Programmable Z-Set Lifecycle Test...")
+
+    base_dir = "/tmp/gnitz_comp_test"
+    cleanup_base_dir(base_dir)
+    ensure_dir(base_dir)
+
+    # 1. Bootstrapping
+    log_step("Phase 1: Bootstrapping Engine")
     db = engine.open_engine(base_dir)
+    assert_true(db.registry.has_schema("public"), "Public schema missing")
 
-    cols = newlist_hint(1)
-    cols.append(types.ColumnDefinition(types.TYPE_U64, name="id"))
+    # DIAGNOSTIC: Check registry state after bootstrap
+    log("--- Registry Post-Bootstrap Diagnostic ---")
+    app_exists = db.registry.has_schema("app")
+    log("Schema 'app' exists: " + ("YES" if app_exists else "NO"))
+    if app_exists:
+        u_exists = db.registry.has("app", "users")
+        o_exists = db.registry.has("app", "orders")
+        log("Table 'app.users' exists: " + ("YES" if u_exists else "NO"))
+        log("Table 'app.orders' exists: " + ("YES" if o_exists else "NO"))
 
-    db.create_table("public.test_table", cols, 0)
+    # 2. Schema and 128-bit Table Creation
+    log_step("Phase 2: Creating 128-bit Relational Schema")
+    db.create_schema("app")
 
-    # Path check confirms reactive side-effect of catalog mutation.
-    table_path = base_dir + "/public/test_table_" + str(sys.FIRST_USER_TABLE_ID)
-    assert_true(os.path.exists(table_path), "DDL directory not created")
+    # app.users: PK is U128
+    user_cols = newlist_hint(2)
+    user_cols.append(types.ColumnDefinition(types.TYPE_U128, name="uid"))
+    user_cols.append(types.ColumnDefinition(types.TYPE_STRING, name="username"))
+    users_family = db.create_table("app.users", user_cols, 0)
 
-    family = db.get_table("public.test_table")
-    assert_equal_i(
-        sys.FIRST_USER_TABLE_ID, family.table_id, "Table ID registration failed"
+    # app.orders: FK is U128 to users.uid
+    order_cols = newlist_hint(3)
+    order_cols.append(types.ColumnDefinition(types.TYPE_U64, name="oid"))
+    order_cols.append(
+        types.ColumnDefinition(
+            types.TYPE_U128,
+            name="uid",
+            fk_table_id=users_family.table_id,
+            fk_col_idx=0,
+        )
     )
+    order_cols.append(types.ColumnDefinition(types.TYPE_I64, name="amount"))
+    orders_family = db.create_table("app.orders", order_cols, 0)
+
+    log("Verifying Registry and FK Wiring...")
+    assert_equal_i(1, len(orders_family.fk_constraints), "FK Constraint not wired")
+
+    # 3. Referential Integrity Enforcement
+    log_step("Phase 3: Testing Foreign Key Enforcement")
+    # Synthetic 128-bit key
+    u128_val = (r_uint128(0xDEADBEEF) << 64) | r_uint128(0xCAFEBABE)
+
+    # PROBE: Verify user doesn't exist yet
+    assert_true(
+        not users_family.has_pk(u128_val), "User unexpectedly found before ingestion"
+    )
+
+    # Attempt to ingest order for non-existent user
+    bad_batch = batch.ZSetBatch(orders_family.schema)
+    r = values.make_payload_row(orders_family.schema)
+    r.append_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
+    r.append_int(r_int64(500))
+    bad_batch.append(r_uint128(1), r_int64(1), r)
+
+    fk_raised = False
+    try:
+        orders_family.ingest_batch(bad_batch)
+    except LayoutError:
+        fk_raised = True
+        log("Caught expected FK violation (User not found)")
+    assert_true(fk_raised, "FK violation should have raised LayoutError")
+    bad_batch.free()
+
+    # 4. Valid Data Ingestion
+    log_step("Phase 4: Ingesting valid relational data")
+    # Ingest User
+    u_batch = batch.ZSetBatch(users_family.schema)
+    ru = values.make_payload_row(users_family.schema)
+    ru.append_string("alice")
+    u_batch.append(u128_val, r_int64(1), ru)
+    users_family.ingest_batch(u_batch)
+    u_batch.free()
+
+    assert_true(users_family.has_pk(u128_val), "User ingestion failed visibility check")
+
+    # Ingest Order (now valid)
+    o_batch = batch.ZSetBatch(orders_family.schema)
+    ro = values.make_payload_row(orders_family.schema)
+    ro.append_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
+    ro.append_int(r_int64(1000))
+    o_batch.append(r_uint128(101), r_int64(1), ro)
+    orders_family.ingest_batch(o_batch)
+    o_batch.free()
+
+    assert_true(orders_family.has_pk(r_uint128(101)), "Order ingestion visibility failed")
+
+    # 5. Reactive View (Programmable Z-Set)
+    log_step("Phase 5: Creating Reactive View (Scan Users)")
+
+    v_sch = runtime.VMSchema(users_family.schema)
+    reg0 = runtime.TraceRegister(0, v_sch, users_family.create_cursor(), users_family)
+    reg1 = runtime.DeltaRegister(1, v_sch)
+
+    regs = newlist_hint(16)
+    for _ in range(16):
+        regs.append(None)
+    regs[0] = reg0
+    regs[1] = reg1
+
+    instrs = newlist_hint(2)
+    instrs.append(instructions.ScanTraceOp(reg0, reg1, chunk_limit=0))
+    instrs.append(instructions.HaltOp())
+
+    builder = QueryBuilder(instrs, reg1, regs)
+    db.create_view("app.active_users", builder, "SELECT * FROM users")
+
+    view_family = db.get_table("app.active_users")
+
+    # 6. Persistence Audit (Close and Restart)
+    log_step("Phase 6: Persistence Audit (Close and Restart)")
+    db.create_table("app.tombstone_test", user_cols, 0)
+    db.drop_table("app.tombstone_test")
 
     db.close()
-    os.write(1, "[CATALOG] Reactive DDL Test Passed.\n")
+    log("Engine closed. Re-opening for recovery...")
 
-
-def test_vm_dataflow_cascade_logic():
-    os.write(1, "[VM] Testing Dataflow Cascade Logic...\n")
-
-    schema = sys.TableTab.schema()
-    base_dir = "/tmp/gnitz_test_cascade_vm"
-    cleanup_path(base_dir)
-    if not os.path.exists(base_dir):
-        os.mkdir(base_dir, 0o755)
-
-    pt = table.PersistentTable(base_dir + "/source", "src", schema)
-
-    # Add test data
-    b = batch.ArenaZSetBatch(schema)
-    row = values.make_payload_row(schema)
-    row.append_int(r_int64(1))
-    row.append_string("cascade_test")
-    row.append_string("dir")
-    row.append_int(r_int64(0))
-    row.append_int(r_int64(0))
-    b.append(r_uint128(999), r_int64(1), row)
-    pt.ingest_batch(b)
-
-    # Setup Registers
-    vm_schema = runtime.VMSchema(schema)
-    reg_file = runtime.RegisterFile(4)
-    reg_trace = runtime.TraceRegister(0, vm_schema, pt.create_cursor(), pt)
-    reg_delta = runtime.DeltaRegister(1, vm_schema)
-    reg_file.registers[0] = reg_trace
-    reg_file.registers[1] = reg_delta
-
-    # Program: Scan source into sink
-    program = newlist_hint(2)
-    program.append(instructions.ScanTraceOp(reg_trace, reg_delta, chunk_limit=0))
-    program.append(instructions.HaltOp())
-
-    ctx = runtime.ExecutionContext()
-    ctx.reset()
-    interpreter.run_vm(program, reg_file, ctx)
-
-    assert_equal_i(runtime.STATUS_HALTED, ctx.status, "VM failed to complete")
-    assert_equal_i(1, reg_delta.batch.length(), "Cascade failed to propagate data")
-    assert_equal_i(
-        999, intmask(r_uint64(reg_delta.batch.get_pk(0))), "Cascade data corruption"
+    db2 = engine.open_engine(base_dir)
+    assert_true(db2.registry.has("app", "users"), "Registry lost users table")
+    assert_true(
+        not db2.registry.has("app", "tombstone_test"), "Dropped table resurrected!"
     )
 
-    pt.close()
-    b.free()
-    os.write(1, "[VM] Dataflow Cascade Logic Passed.\n")
+    # 7. Recovery Audit (Program Cache)
+    log_step("Phase 7: Auditing recovered VM Program")
+    plan = db2.program_cache.get_program(view_family.table_id)
+    assert_true(plan is not None, "Failed to recover view plan")
+
+    # Verify recovered ScanTraceOp
+    scan_op = plan.program[0]
+    assert_equal_i(
+        instructions.Instruction.SCAN_TRACE, scan_op.opcode, "Opcode mismatch"
+    )
+
+    # 8. VM Execution
+    log_step("Phase 8: VM Execution on recovered Programmable Z-Set")
+    ctx = runtime.ExecutionContext()
+    ctx.reset()
+    interpreter.run_vm(plan.program, plan.reg_file, ctx)
+
+    out_reg = plan.reg_file.registers[1]
+    # Check result (1 user: Alice)
+    assert_equal_i(1, out_reg.batch.length(), "View produced wrong row count")
+    assert_equal_u128(u128_val, out_reg.batch.get_pk(0), "View data corrupted")
+
+    db2.close()
+    log("Full Programmable Z-Set lifecycle audit PASSED.")
+
+
+# -- Diagnostic Entry Point ---------------------------------------------------
 
 
 def entry_point(argv):
-    os.write(1, "=== GnitzDB Z-Store Comprehensive Test Suite ===\n")
+    os.write(1, "====================================================\n")
+    os.write(1, "      GnitzDB Diagnostic Integration Suite          \n")
+    os.write(1, "====================================================\n")
+
     try:
-        test_vm_chunking_and_yield()
-        test_reactive_ddl_and_registry()
-        test_vm_dataflow_cascade_logic()
-        os.write(1, "\nALL SYSTEM INTEGRATION TESTS PASSED\n")
-    except Exception:
-        os.write(2, "\n!! TEST SUITE FAILED !!\n")
+        test_programmable_zset_lifecycle()
+    except LayoutError as e:
+        # RPython: avoid hasattr/getattr on exceptions.
+        # str(e) is the safest way to extract the message passed to raise.
+        os.write(2, "\n[FATAL] Caught LayoutError: " + str(e) + "\n")
         return 1
+    except KeyError:
+        os.write(2, "\n[FATAL] Caught KeyError: Registry/Cache lookup failure.\n")
+        return 1
+    except OSError as e:
+        os.write(2, "\n[FATAL] Caught OSError: Errno " + str(e.errno) + "\n")
+        return 1
+    except Exception as e:
+        os.write(2, "\n[FATAL] Caught Unhandled Exception: " + str(e) + "\n")
+        return 1
+
+    os.write(1, "\nSUCCESS: System integrity verified.\n")
     return 0
 
 

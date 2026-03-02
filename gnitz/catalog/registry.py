@@ -1,7 +1,8 @@
 # gnitz/catalog/registry.py
 
+import os
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rtyper.lltypesystem import rffi
 
 from gnitz.catalog.system_tables import (
@@ -40,44 +41,11 @@ class FKConstraint(object):
     """
     An active Foreign Key constraint tracking a source column and its target table.
     """
-
     _immutable_fields_ = ["fk_col_idx", "target_family"]
 
     def __init__(self, fk_col_idx, target_family):
         self.fk_col_idx = fk_col_idx
         self.target_family = target_family
-
-
-class SystemTables(object):
-    """
-    Container for the core catalog tables.
-    """
-
-    def __init__(self, schemas, tables, views, columns, indices, view_deps, sequences, 
-                 instructions, functions, subscriptions):
-        self.schemas = schemas
-        self.tables = tables
-        self.views = views
-        self.columns = columns
-        self.indices = indices
-        self.view_deps = view_deps
-        self.sequences = sequences
-        # New for Phase 4
-        self.instructions = instructions
-        self.functions = functions
-        self.subscriptions = subscriptions
-
-    def close(self):
-        self.schemas.close()
-        self.tables.close()
-        self.views.close()
-        self.columns.close()
-        self.indices.close()
-        self.view_deps.close()
-        self.sequences.close()
-        self.instructions.close()
-        self.functions.close()
-        self.subscriptions.close()
 
 
 class ReactiveStore(ZSetStore):
@@ -182,33 +150,39 @@ class TableFamily(ZSetStore):
     def ingest_batch(self, batch):
         """
         Durable ingestion pipeline with referential integrity.
-        
-        Failure Policy: If any stage fails, the exception propagates. 
-        FK violations stop ingestion before the WAL is written.
         """
         n_records = batch.length()
         if n_records == 0:
             return
 
-        # --- Stage 1: Incremental Foreign Key Enforcement ---
+        # --- Stage 1: Foreign Key Enforcement ---
         n_constraints = len(self.fk_constraints)
         if n_constraints > 0:
+            # We use a single shared accessor and bind it explicitly inside 
+            # the loop to ensure the RPython annotator correctly tracks offsets.
+            acc = batch.get_accessor(0)
+            
             for i in range(n_records):
                 # We only validate insertions (positive weights)
                 if batch.get_weight(i) <= 0:
                     continue
 
-                acc = batch.get_accessor(i)
+                batch.bind_raw_accessor(i, acc)
+                
                 for c_idx in range(n_constraints):
                     constraint = self.fk_constraints[c_idx]
                     col_idx = constraint.fk_col_idx
                     if acc.is_null(col_idx):
                         continue
 
-                    # Promote the value to the index key type of the target PK
+                    # Extract value and promote to the target PK's index key type
                     fk_key = promote_to_index_key(
                         acc, col_idx, self.schema.columns[col_idx].field_type
                     )
+                    
+                    # PROBE: Verify the key lookup for diagnostics
+                    # os.write(1, " [FK-DEBUG] Table %s: checking target %s for key...\n" % 
+                    #         (self.table_name, constraint.target_family.table_name))
                     
                     if not constraint.target_family.has_pk(fk_key):
                         raise LayoutError(
@@ -231,7 +205,6 @@ class TableFamily(ZSetStore):
         if n_indices > 0:
             for idx_num in range(n_indices):
                 circuit = self.index_circuits[idx_num]
-                # High-performance kernel in EphemeralTable
                 circuit.table.ingest_projection(
                     batch,
                     circuit.source_col_idx,
@@ -241,16 +214,12 @@ class TableFamily(ZSetStore):
                 )
 
     def bulk_validate_all_constraints(self):
-        """
-        Performs a full audit of referential integrity using secondary indices.
-        """
+        """Performs a full audit of referential integrity."""
         for c_idx in range(len(self.fk_constraints)):
             self._bulk_validate_single_fk(self.fk_constraints[c_idx])
 
     def _bulk_validate_single_fk(self, constraint):
-        """
-        Optimized bulk validation via supporting index scan.
-        """
+        """Optimized bulk validation via supporting index scan."""
         supporting_circuit = None
         for circuit in self.index_circuits:
             if circuit.source_col_idx == constraint.fk_col_idx:
@@ -294,7 +263,6 @@ class TableFamily(ZSetStore):
 class EntityRegistry(object):
     """
     Central hub for name resolution and metadata mapping.
-    All lookup methods are O(1).
     """
 
     def __init__(self):
@@ -378,7 +346,6 @@ class EntityRegistry(object):
         return tid
 
     def schema_is_empty(self, schema_name):
-        # Iterate keys to check if any table belongs to this schema
         for k in self._by_name:
             family = self._by_name[k]
             if family.schema_name == schema_name:
@@ -409,17 +376,3 @@ class EntityRegistry(object):
         if name in self._index_by_name:
             return self._index_by_name[name]
         raise LayoutError("Index does not exist: %s" % name)
-
-    def is_joinable(self, owner_id, col_idx):
-        """
-        Determines if a column can be used as a join key (PK or Indexed).
-        """
-        if not self.has_id(owner_id):
-            return False
-        family = self.get_by_id(owner_id)
-        if col_idx == family.schema.pk_index:
-            return True
-        for circuit in family.index_circuits:
-            if circuit.source_col_idx == col_idx:
-                return True
-        return False
