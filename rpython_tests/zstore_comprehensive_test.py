@@ -1,7 +1,7 @@
 # zstore_comprehensive_test.py
 
 import os
-from rpython.rlib import rposix, rsocket
+from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import (
     r_int64,
     r_uint64,
@@ -12,7 +12,8 @@ from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core import types, values, batch
 from gnitz.storage import table
-from gnitz.catalog import system_tables, engine
+from gnitz.catalog import system_tables as sys
+from gnitz.catalog import engine
 from gnitz.vm import runtime, interpreter, instructions
 from gnitz.server import ipc
 
@@ -34,9 +35,7 @@ def assert_equal_i(expected, actual, msg):
 def cleanup_path(path):
     """
     RPython-compliant cleanup.
-    1. Avoids os.path.join to prevent Annotator slicing proof failures.
-    2. Uses newlist_hint to prevent resizability poisoning.
-    3. Uses index-based loops to avoid heterogenous tuple iteration errors.
+    Avoids os.path.join and heterogenous iteration.
     """
     if not os.path.exists(path):
         return
@@ -81,7 +80,7 @@ def cleanup_path(path):
 def test_vm_chunking_and_yield():
     os.write(1, "[VM] Testing Chunked Execution and YIELD...\n")
 
-    schema = system_tables.make_tables_schema()
+    schema = sys.TableTab.schema()
     base_dir = "/tmp/gnitz_test_vm"
     cleanup_path(base_dir)
     if not os.path.exists(base_dir):
@@ -146,26 +145,22 @@ def test_reactive_ddl_and_registry():
 
     db.create_table("public.test_table", cols, 0)
 
-    # Path check confirms reactive side-effect of catalog mutation
-    table_path = base_dir + "/public/test_table_11"
+    # Path check confirms reactive side-effect of catalog mutation.
+    # We use sys.FIRST_USER_TABLE_ID (11) as the baseline.
+    table_path = base_dir + "/public/test_table_" + str(sys.FIRST_USER_TABLE_ID)
     assert_true(os.path.exists(table_path), "DDL directory not created")
 
     family = db.get_table("public.test_table")
-    assert_equal_i(11, family.table_id, "Table ID registration failed")
+    assert_equal_i(sys.FIRST_USER_TABLE_ID, family.table_id, "Table ID registration failed")
 
     db.close()
     os.write(1, "[CATALOG] Reactive DDL Test Passed.\n")
 
 
 def test_vm_dataflow_cascade_logic():
-    """
-    Compliant replacement for Cascade test.
-    Tests that the VM correctly propagates data from a Persistent source
-    to a Sink register, simulating one 'hop' in the DAG.
-    """
     os.write(1, "[VM] Testing Dataflow Cascade Logic...\n")
 
-    schema = system_tables.make_tables_schema()
+    schema = sys.TableTab.schema()
     base_dir = "/tmp/gnitz_test_cascade_vm"
     cleanup_path(base_dir)
     if not os.path.exists(base_dir):
@@ -229,6 +224,5 @@ def target(driver, args):
 
 
 if __name__ == "__main__":
-    import sys
-
-    entry_point(sys.argv)
+    import sys as pysys
+    entry_point(pysys.argv)

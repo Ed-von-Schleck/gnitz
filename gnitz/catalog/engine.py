@@ -4,61 +4,21 @@ import errno
 from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import r_uint64, r_int64, intmask
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rtyper.lltypesystem import rffi
 from rpython.rlib import rposix_stat
 
-from gnitz.core.types import TableSchema, TYPE_U64, TYPE_STRING
+from gnitz.core.types import TableSchema
 from gnitz.core.errors import LayoutError
 from gnitz.core.batch import ZSetBatch
 from gnitz.storage import mmap_posix
 from gnitz.catalog.program_cache import ProgramCache
 
 from gnitz.catalog.identifiers import validate_user_identifier, parse_qualified_name
-from gnitz.catalog.system_tables import (
-    SYS_TABLE_SCHEMAS,
-    SYS_TABLE_TABLES,
-    SYS_TABLE_COLUMNS,
-    SYS_TABLE_INDICES,
-    SYS_TABLE_SEQUENCES,
-    SYSTEM_SCHEMA_ID,
-    FIRST_USER_TABLE_ID,
-    OWNER_KIND_TABLE,
-    SEQ_ID_SCHEMAS,
-    SEQ_ID_TABLES,
-    SEQ_ID_INDICES,
-    SYS_CATALOG_DIRNAME,
-    # _schemas column indices (schema col 0 = schema_id PK)
-    SCHEMAS_COL_NAME,
-    # _tables column indices (schema col 0 = table_id PK)
-    TABLES_COL_SCHEMA_ID,
-    TABLES_COL_NAME,
-    TABLES_COL_DIRECTORY,
-    TABLES_COL_PK_COL_IDX,
-    # _indices column indices (schema col 0 = index_id PK)
-    INDICES_COL_OWNER_ID,
-    INDICES_COL_SOURCE_COL_IDX,
-    INDICES_COL_NAME,
-    INDICES_COL_IS_UNIQUE,
-    INDICES_COL_CACHE_DIRECTORY,
-)
+from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import (
     TableFamily,
     EntityRegistry,
     ReactiveStore,
     _wire_fk_constraints_for_family,
-)
-from gnitz.catalog.system_records import (
-    _read_string,
-    _append_schema_record,
-    _retract_schema_record,
-    _append_table_record,
-    _retract_table_record,
-    _append_column_record,
-    _retract_column_record,
-    _append_index_record,
-    _retract_index_record,
-    _append_sequence_record,
-    _retract_sequence_record,
 )
 from gnitz.catalog.index_circuit import (
     get_index_key_type,
@@ -78,10 +38,9 @@ from gnitz.catalog.loader import (
 def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     """
     Public factory to open a GnitzDB instance.
-    Handles directory creation, bootstrapping, and metadata recovery.
     """
     _ensure_dir(base_dir)
-    sys_dir = base_dir + "/" + SYS_CATALOG_DIRNAME
+    sys_dir = base_dir + "/" + sys.SYS_CATALOG_DIRNAME
     is_new = not os_path_exists(sys_dir)
 
     registry = EntityRegistry()
@@ -93,9 +52,6 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     _rebuild_registry(sys_tables, base_dir, registry)
 
     engine = Engine(base_dir, sys_tables, registry)
-
-    # Wire reactivity AFTER metadata recovery to avoid re-triggering DDL
-    # side-effects for existing records during the loader phase.
     engine._wire_reactivity()
 
     return engine
@@ -120,10 +76,7 @@ def _ensure_dir(path):
 
 
 def _remove_circuit_from_family(circuit, family):
-    """
-    Rebuilds the index_circuits list excluding the target.
-    Must use newlist_hint to avoid mr-poisoning.
-    """
+    """Rebuilds the index_circuits list excluding the target."""
     old = family.index_circuits
     new_list = newlist_hint(len(old))
     for c in old:
@@ -135,9 +88,6 @@ def _remove_circuit_from_family(circuit, family):
 def _validate_fk_column(
     col, col_idx, registry, self_table_id=0, self_pk_index=0, self_pk_type=None
 ):
-    """
-    Validates a single ColumnDefinition's FK annotation.
-    """
     if col.fk_table_id == 0:
         return
 
@@ -171,40 +121,24 @@ def _validate_fk_column(
         )
 
 
-class SchemaReactiveStore(ReactiveStore):
-    def __init__(self, inner, engine):
+class EngineReactiveStore(ReactiveStore):
+    """
+    Unified reactive proxy that dispatches ingestion deltas to engine callbacks.
+    """
+    def __init__(self, inner, engine, callback_name):
         ReactiveStore.__init__(self, inner)
         self.engine = engine
+        self.callback_name = callback_name
 
     def on_ingest(self, batch):
-        self.engine._on_schema_delta(batch)
-
-
-class TableReactiveStore(ReactiveStore):
-    def __init__(self, inner, engine):
-        ReactiveStore.__init__(self, inner)
-        self.engine = engine
-
-    def on_ingest(self, batch):
-        self.engine._on_table_delta(batch)
-
-
-class IndexReactiveStore(ReactiveStore):
-    def __init__(self, inner, engine):
-        ReactiveStore.__init__(self, inner)
-        self.engine = engine
-
-    def on_ingest(self, batch):
-        self.engine._on_index_delta(batch)
-
-
-class InstructionReactiveStore(ReactiveStore):
-    def __init__(self, inner, engine):
-        ReactiveStore.__init__(self, inner)
-        self.engine = engine
-
-    def on_ingest(self, batch):
-        self.engine.program_cache.invalidate_all()
+        if self.callback_name == "schema":
+            self.engine._on_schema_delta(batch)
+        elif self.callback_name == "table":
+            self.engine._on_table_delta(batch)
+        elif self.callback_name == "index":
+            self.engine._on_index_delta(batch)
+        elif self.callback_name == "instr":
+            self.engine.program_cache.invalidate_all()
 
 
 class Engine(object):
@@ -221,16 +155,12 @@ class Engine(object):
         self.program_cache = ProgramCache(registry)
 
     def _wire_reactivity(self):
-        self.sys.schemas = SchemaReactiveStore(self.sys.schemas, self)
-        self.sys.tables = TableReactiveStore(self.sys.tables, self)
-        self.sys.indices = IndexReactiveStore(self.sys.indices, self)
-        self.sys.instructions = InstructionReactiveStore(self.sys.instructions, self)
+        self.sys.schemas = EngineReactiveStore(self.sys.schemas, self, "schema")
+        self.sys.tables = EngineReactiveStore(self.sys.tables, self, "table")
+        self.sys.indices = EngineReactiveStore(self.sys.indices, self, "index")
+        self.sys.instructions = EngineReactiveStore(self.sys.instructions, self, "instr")
 
     # -- Reactive Callbacks ---------------------------------------------------
-    #
-    # All storage accessors use schema column indices (col 0 = PK, physical
-    # offset -1, not in the payload area).  Named constants from system_tables
-    # make the mapping self-documenting and immune to off-by-one errors.
 
     def _on_schema_delta(self, batch):
         acc = batch.get_accessor(0)
@@ -239,7 +169,7 @@ class Engine(object):
             batch.bind_raw_accessor(i, acc)
 
             sid = intmask(r_uint64(batch.get_pk(i)))
-            name = _read_string(acc, SCHEMAS_COL_NAME)
+            name = sys.read_string(acc, sys.SchemaTab.COL_NAME)
 
             if weight > 0:
                 if self.registry.has_schema(name):
@@ -263,10 +193,10 @@ class Engine(object):
             tid = intmask(r_uint64(batch.get_pk(i)))
             batch.bind_raw_accessor(i, acc)
 
-            sid        = intmask(acc.get_int(TABLES_COL_SCHEMA_ID))
-            name       = _read_string(acc, TABLES_COL_NAME)
-            directory  = _read_string(acc, TABLES_COL_DIRECTORY)
-            pk_col_idx = intmask(acc.get_int(TABLES_COL_PK_COL_IDX))
+            sid        = intmask(acc.get_int(sys.TableTab.COL_SCHEMA_ID))
+            name       = sys.read_string(acc, sys.TableTab.COL_NAME)
+            directory  = sys.read_string(acc, sys.TableTab.COL_DIRECTORY)
+            pk_col_idx = intmask(acc.get_int(sys.TableTab.COL_PK_COL_IDX))
 
             if weight > 0:
                 if self.registry.has_id(tid):
@@ -313,11 +243,11 @@ class Engine(object):
             idx_id = intmask(r_uint64(batch.get_pk(i)))
             batch.bind_raw_accessor(i, acc)
 
-            owner_id       = intmask(acc.get_int(INDICES_COL_OWNER_ID))
-            source_col_idx = intmask(acc.get_int(INDICES_COL_SOURCE_COL_IDX))
-            name           = _read_string(acc, INDICES_COL_NAME)
-            is_unique      = acc.get_int(INDICES_COL_IS_UNIQUE) != 0
-            cache_dir      = _read_string(acc, INDICES_COL_CACHE_DIRECTORY)
+            owner_id       = intmask(acc.get_int(sys.IdxTab.COL_OWNER_ID))
+            source_col_idx = intmask(acc.get_int(sys.IdxTab.COL_SOURCE_COL_IDX))
+            name           = sys.read_string(acc, sys.IdxTab.COL_NAME)
+            is_unique      = acc.get_int(sys.IdxTab.COL_IS_UNIQUE) != 0
+            cache_dir      = sys.read_string(acc, sys.IdxTab.COL_CACHE_DIRECTORY)
 
             if weight > 0:
                 if self.registry.has_index_by_name(name):
@@ -346,9 +276,7 @@ class Engine(object):
                 if self.registry.has_index_by_name(name):
                     circuit = self.registry.get_index_by_name(name)
                     if "__fk_" in name:
-                        raise LayoutError(
-                            "Cannot drop internal FK index: %s" % name
-                        )
+                        raise LayoutError("Cannot drop internal FK index: %s" % name)
                     family = self.registry.get_by_id(circuit.owner_id)
                     _remove_circuit_from_family(circuit, family)
                     self.registry.unregister_index(name, idx_id)
@@ -362,7 +290,7 @@ class Engine(object):
             raise LayoutError("Schema already exists: %s" % name)
         sid = self.registry.allocate_schema_id()
         self._write_schema_record(sid, name)
-        self._advance_sequence(SEQ_ID_SCHEMAS, sid - 1, sid)
+        self._advance_sequence(sys.SEQ_ID_SCHEMAS, sid - 1, sid)
 
     def drop_schema(self, name):
         validate_user_identifier(name)
@@ -401,13 +329,13 @@ class Engine(object):
             self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
         )
 
-        self._write_column_records(tid, OWNER_KIND_TABLE, columns)
+        self._write_column_records(tid, sys.OWNER_KIND_TABLE, columns)
         self.sys.columns.flush()
 
         self._write_table_record(tid, sid, table_name, directory, pk_col_idx, 0)
         self.sys.tables.flush()
 
-        self._advance_sequence(SEQ_ID_TABLES, tid - 1, tid)
+        self._advance_sequence(sys.SEQ_ID_TABLES, tid - 1, tid)
 
         family = self.registry.get(schema_name, table_name)
         self._create_fk_indices_for_family(family)
@@ -426,7 +354,7 @@ class Engine(object):
         )
         self.sys.tables.flush()
 
-        self._retract_column_records(tid, OWNER_KIND_TABLE, family.schema.columns)
+        self._retract_column_records(tid, sys.OWNER_KIND_TABLE, family.schema.columns)
         self.sys.columns.flush()
 
     def create_index(self, qualified_owner_name, col_name, is_unique=False):
@@ -447,11 +375,11 @@ class Engine(object):
 
         index_id = self.registry.allocate_index_id()
         self._write_index_record(
-            index_id, family.table_id, OWNER_KIND_TABLE, col_idx,
+            index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx,
             index_name, int(is_unique), "",
         )
         self.sys.indices.flush()
-        self._advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id)
+        self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
 
         return self.registry.get_index_by_name(index_name)
 
@@ -476,16 +404,16 @@ class Engine(object):
 
             index_id = self.registry.allocate_index_id()
             self._write_index_record(
-                index_id, family.table_id, OWNER_KIND_TABLE, col_idx,
+                index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx,
                 index_name, 0, "",
             )
             self.sys.indices.flush()
-            self._advance_sequence(SEQ_ID_INDICES, index_id - 1, index_id)
+            self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
 
     def drop_index(self, index_name):
         circuit = self.registry.get_index_by_name(index_name)
         self._retract_index_record(
-            circuit.index_id, circuit.owner_id, OWNER_KIND_TABLE,
+            circuit.index_id, circuit.owner_id, sys.OWNER_KIND_TABLE,
             circuit.source_col_idx, circuit.name,
             int(circuit.is_unique), circuit.cache_dir,
         )
@@ -503,7 +431,7 @@ class Engine(object):
             keys.append(k)
         for k in keys:
             family = self.registry._by_name[k]
-            if family.table_id >= FIRST_USER_TABLE_ID:
+            if family.table_id >= sys.FIRST_USER_TABLE_ID:
                 family.close()
         self.sys.close()
 
@@ -512,14 +440,14 @@ class Engine(object):
     def _write_schema_record(self, schema_id, name):
         s = self.sys.schemas.schema
         batch = ZSetBatch(s)
-        _append_schema_record(batch, s, schema_id, name)
+        sys.SchemaTab.append(batch, s, schema_id, name)
         self.sys.schemas.ingest_batch(batch)
         batch.free()
 
     def _retract_schema_record(self, schema_id, name):
         s = self.sys.schemas.schema
         batch = ZSetBatch(s)
-        _retract_schema_record(batch, s, schema_id, name)
+        sys.SchemaTab.retract(batch, s, schema_id, name)
         self.sys.schemas.ingest_batch(batch)
         batch.free()
 
@@ -528,7 +456,7 @@ class Engine(object):
     ):
         s = self.sys.tables.schema
         batch = ZSetBatch(s)
-        _append_table_record(
+        sys.TableTab.append(
             batch, s, table_id, schema_id, name, directory, pk_col_idx, created_lsn
         )
         self.sys.tables.ingest_batch(batch)
@@ -539,7 +467,7 @@ class Engine(object):
     ):
         s = self.sys.tables.schema
         batch = ZSetBatch(s)
-        _retract_table_record(
+        sys.TableTab.retract(
             batch, s, table_id, schema_id, name, directory, pk_col_idx, created_lsn
         )
         self.sys.tables.ingest_batch(batch)
@@ -550,7 +478,7 @@ class Engine(object):
         batch = ZSetBatch(s)
         for i in range(len(columns)):
             col = columns[i]
-            _append_column_record(
+            sys.ColTab.append(
                 batch, s, owner_id, owner_kind, i,
                 col.name, col.field_type.code,
                 int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
@@ -563,7 +491,7 @@ class Engine(object):
         batch = ZSetBatch(s)
         for i in range(len(columns)):
             col = columns[i]
-            _retract_column_record(
+            sys.ColTab.retract(
                 batch, s, owner_id, owner_kind, i,
                 col.name, col.field_type.code,
                 int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
@@ -577,7 +505,7 @@ class Engine(object):
     ):
         s = self.sys.indices.schema
         batch = ZSetBatch(s)
-        _append_index_record(
+        sys.IdxTab.append(
             batch, s, index_id, owner_id, owner_kind, source_col_idx,
             name, is_unique, cache_directory,
         )
@@ -590,7 +518,7 @@ class Engine(object):
     ):
         s = self.sys.indices.schema
         batch = ZSetBatch(s)
-        _retract_index_record(
+        sys.IdxTab.retract(
             batch, s, index_id, owner_id, owner_kind, source_col_idx,
             name, is_unique, cache_directory,
         )
@@ -600,7 +528,7 @@ class Engine(object):
     def _advance_sequence(self, seq_id, old_val, new_val):
         s = self.sys.sequences.schema
         batch = ZSetBatch(s)
-        _retract_sequence_record(batch, s, seq_id, old_val)
-        _append_sequence_record(batch, s, seq_id, new_val)
+        sys.SeqTab.retract(batch, s, seq_id, old_val)
+        sys.SeqTab.append(batch, s, seq_id, new_val)
         self.sys.sequences.ingest_batch(batch)
         batch.free()

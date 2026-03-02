@@ -1,308 +1,251 @@
-# gnitz/catalog/system_tables.py
-
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128
-
+from rpython.rlib.rarithmetic import r_uint64, r_int64, r_ulonglonglong as r_uint128
+from rpython.rtyper.lltypesystem import rffi, lltype
+from gnitz.core import strings as string_logic
+from gnitz.core.values import make_payload_row
 from gnitz.core.types import (
-    TYPE_U8,
-    TYPE_I8,
-    TYPE_U16,
-    TYPE_I16,
-    TYPE_U32,
-    TYPE_I32,
-    TYPE_F32,
-    TYPE_U64,
-    TYPE_I64,
-    TYPE_F64,
-    TYPE_STRING,
-    TYPE_U128,
-    ColumnDefinition,
-    TableSchema,
+    TYPE_U8, TYPE_I8, TYPE_U16, TYPE_I16, TYPE_U32, TYPE_I32, TYPE_F32,
+    TYPE_U64, TYPE_I64, TYPE_F64, TYPE_STRING, TYPE_U128,
+    ColumnDefinition, TableSchema
 )
 from gnitz.core.errors import LayoutError
 
-# --- Schema IDs (Hardcoded) ---
+# Constants
 SYSTEM_SCHEMA_ID = 1
 PUBLIC_SCHEMA_ID = 2
 FIRST_USER_SCHEMA_ID = 3
-
-# --- System Table IDs (Hardcoded) ---
-SYS_TABLE_SCHEMAS = 1
-SYS_TABLE_TABLES = 2
-SYS_TABLE_VIEWS = 3
-SYS_TABLE_COLUMNS = 4
-SYS_TABLE_INDICES = 5
-SYS_TABLE_VIEW_DEPS = 6
-SYS_TABLE_SEQUENCES = 7
-# --- New for Phase 4 ---
-SYS_TABLE_INSTRUCTIONS = 8
-SYS_TABLE_FUNCTIONS = 9
-SYS_TABLE_SUBSCRIPTIONS = 10
-FIRST_USER_TABLE_ID = 11
-
-# --- Sequence IDs for internal allocators ---
-SEQ_ID_SCHEMAS = 1
-SEQ_ID_TABLES = 2
-SEQ_ID_INDICES = 3
-SEQ_ID_PROGRAMS = 4
-
-# --- First user-assigned IDs ---
-FIRST_USER_INDEX_ID = 1
-
-# --- Owner Kind Values ---
 OWNER_KIND_TABLE = 0
 OWNER_KIND_VIEW = 1
-
-# --- Physical Directory Names ---
+SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES, SEQ_ID_PROGRAMS = 1, 2, 3, 4
+FIRST_USER_TABLE_ID, FIRST_USER_INDEX_ID = 11, 1
 SYS_CATALOG_DIRNAME = "_system_catalog"
-SYS_SUBDIR_SCHEMAS = "_schemas"
-SYS_SUBDIR_TABLES = "_tables"
-SYS_SUBDIR_VIEWS = "_views"
-SYS_SUBDIR_COLUMNS = "_columns"
-SYS_SUBDIR_INDICES = "_indices"
-SYS_SUBDIR_VIEW_DEPS = "_view_deps"
-SYS_SUBDIR_SEQUENCES = "_sequences"
-SYS_SUBDIR_INSTRUCTIONS = "_instructions"
-SYS_SUBDIR_FUNCTIONS = "_functions"
-SYS_SUBDIR_SUBSCRIPTIONS = "_subscriptions"
 
-
-# ---------------------------------------------------------------------------
-# Schema Factory Functions
-# Column index constants follow immediately after each factory function.
-#
-# Convention: all constants are *schema* column indices (0-based, col 0 = PK).
-# This matches the calling convention of every storage accessor:
-#   RawWALAccessor._get_ptr  → schema.get_column_offset(col_idx)
-#   PackedNodeAccessor._get_ptr → schema.get_column_offset(col_idx)
-#   SoAAccessor._get_ptr     → view.get_col_ptr(row_idx, col_idx)
-#
-# The PK is always col 0 with physical offset -1 (not stored in the payload).
-# Non-PK fields start at col 1.
-# ---------------------------------------------------------------------------
-
-
-def make_schemas_schema():
-    cols = newlist_hint(2)
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
-    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
-    return TableSchema(cols, pk_index=0)
-
-
-# -- _schemas: col 0 = schema_id (PK) ----------------------------------------
-SCHEMAS_COL_NAME = 1  # VARCHAR  schema name
-
-
-def make_tables_schema():
-    cols = newlist_hint(6)
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="table_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
-    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
-    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="directory"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="pk_col_idx"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="created_lsn"))
-    return TableSchema(cols, pk_index=0)
-
-
-# -- _tables: col 0 = table_id (PK) ------------------------------------------
-TABLES_COL_SCHEMA_ID = 1  # UINT64   owning schema id
-TABLES_COL_NAME = 2  # VARCHAR  table name
-TABLES_COL_DIRECTORY = 3  # VARCHAR  on-disk directory path
-TABLES_COL_PK_COL_IDX = 4  # UINT32   schema column index of the PK
-TABLES_COL_CREATED_LSN = 5  # UINT64   LSN at creation time
-
-
-def make_views_schema():
-    cols = newlist_hint(6)
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
-    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
-    cols.append(
-        ColumnDefinition(TYPE_STRING, is_nullable=False, name="sql_definition")
-    )
-    cols.append(
-        ColumnDefinition(TYPE_STRING, is_nullable=False, name="cache_directory")
-    )
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="created_lsn"))
-    return TableSchema(cols, pk_index=0)
-
-
-# -- _views: col 0 = view_id (PK) --------------------------------------------
-VIEWS_COL_SCHEMA_ID = 1  # UINT64   owning schema id
-VIEWS_COL_NAME = 2  # VARCHAR  view name
-VIEWS_COL_SQL_DEFINITION = 3  # VARCHAR  SQL source text
-VIEWS_COL_CACHE_DIRECTORY = 4  # VARCHAR  optional cache dir path
-VIEWS_COL_CREATED_LSN = 5  # UINT64   LSN at creation time
-
-
-def make_columns_schema():
-    cols = newlist_hint(9)
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="column_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="owner_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="owner_kind"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="col_idx"))
-    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="type_code"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="is_nullable"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="fk_table_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="fk_col_idx"))
-    return TableSchema(cols, pk_index=0)
-
-
-# -- _columns: col 0 = column_id (PK) ----------------------------------------
-COLUMNS_COL_OWNER_ID = 1  # UINT64   owning table_id
-COLUMNS_COL_OWNER_KIND = 2  # UINT8    OWNER_KIND_TABLE / OWNER_KIND_VIEW
-COLUMNS_COL_COL_IDX = 3  # UINT32   position in owning schema
-COLUMNS_COL_NAME = 4  # VARCHAR  column name
-COLUMNS_COL_FIELD_TYPE_CODE = 5  # UINT16   FieldType.code
-COLUMNS_COL_IS_NULLABLE = 6  # UINT8    0 / 1
-COLUMNS_COL_FK_TABLE_ID = 7  # UINT64   FK target table_id (0 = none)
-COLUMNS_COL_FK_COL_IDX = 8  # UINT32   FK target column index
-
-
-def make_indices_schema():
-    cols = newlist_hint(7)
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="index_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="owner_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="owner_kind"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="source_col_idx"))
-    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="is_unique"))
-    cols.append(
-        ColumnDefinition(TYPE_STRING, is_nullable=False, name="cache_directory")
-    )
-    return TableSchema(cols, pk_index=0)
-
-
-# -- _indices: col 0 = index_id (PK) -----------------------------------------
-INDICES_COL_OWNER_ID = 1  # UINT64   owning table_id
-INDICES_COL_OWNER_KIND = 2  # UINT8    OWNER_KIND_TABLE / OWNER_KIND_VIEW
-INDICES_COL_SOURCE_COL_IDX = 3  # UINT32   indexed column (schema col idx)
-INDICES_COL_NAME = 4  # VARCHAR  index name
-INDICES_COL_IS_UNIQUE = 5  # UINT8    0 / 1
-INDICES_COL_CACHE_DIRECTORY = 6  # VARCHAR  optional cache dir path
-
-
-def make_view_deps_schema():
-    cols = newlist_hint(4)
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dep_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dep_view_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dep_table_id"))
-    return TableSchema(cols, pk_index=0)
-
-
-# -- _view_deps: col 0 = dep_id (PK) -----------------------------------------
-VIEW_DEPS_COL_VIEW_ID = 1  # UINT64   the view that depends on something
-VIEW_DEPS_COL_DEP_VIEW_ID = 2  # UINT64   upstream view dependency (0 = none)
-VIEW_DEPS_COL_DEP_TABLE_ID = 3  # UINT64   upstream table dependency (0 = none)
-
-
-def make_sequences_schema():
-    cols = newlist_hint(2)
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="seq_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="next_val"))
-    return TableSchema(cols, pk_index=0)
-
-
-# -- _sequences: col 0 = seq_id (PK) -----------------------------------------
-SEQUENCES_COL_VALUE = 1  # UINT64   current high-water mark
-
-
-def make_instructions_schema():
-    """
-    Schema for the VM Instruction Z-Set.
-    PK: instr_pk (U128) -> (program_id << 64) | instr_idx
-    """
-    cols = newlist_hint(21)
-    # PK
-    cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="instr_pk"))
-    # Opcodes and Registers (Packed as U64 for RPython monomorphism)
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="opcode"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_in"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_out"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_in_a"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_in_b"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_trace"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_trace_in"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_trace_out"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_delta"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_history"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_a"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_b"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="reg_key"))
-    # Metadata / Refs
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="target_table_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="func_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="agg_func_id"))
-    # Varlen Metadata
-    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="group_by_cols"))
-    # Control Flow
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="chunk_limit"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="jump_target"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="yield_reason"))
-    return TableSchema(cols, pk_index=0)
-
-
-def make_functions_schema():
-    cols = newlist_hint(3)
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="func_id"))
-    cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="func_type"))
-    return TableSchema(cols, pk_index=0)
-
-
-def make_subscriptions_schema():
-    cols = newlist_hint(3)
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="sub_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
-    cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="client_id"))
-    return TableSchema(cols, pk_index=0)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
+def read_string(accessor, col_idx):
+    length, prefix, struct_ptr, heap_ptr, py_string = accessor.get_str_struct(col_idx)
+    if py_string is not None:
+        return py_string
+    if rffi.cast(rffi.SIZE_T, struct_ptr) == 0:
+        return ""
+    return string_logic.unpack_string(struct_ptr, heap_ptr)
 
 def pack_column_id(owner_id, col_idx):
-    """
-    Packs owner_id and col_idx into a 64-bit key.
-    Calculated as (owner_id << 9) | col_idx.
-    Matches the TYPE_U64 Primary Key of the _columns table.
-    """
-    # owner_id (max ~10^6) << 9 fits easily in 64-bit.
-    val = (r_uint64(owner_id) << 9) | r_uint64(col_idx)
-    return val
+    return (r_uint64(owner_id) << 9) | r_uint64(col_idx)
 
+class BaseTab(object):
+    ID = 0
+    SUBDIR = ""
+    NAME = ""
+    @staticmethod
+    def schema(): return None
+
+class SchemaTab(BaseTab):
+    ID, SUBDIR, NAME = 1, "_schemas", "_schemas"
+    COL_NAME = 1
+    @staticmethod
+    def schema():
+        cols = newlist_hint(2)
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
+        return TableSchema(cols, pk_index=0)
+    @staticmethod
+    def append(batch, schema, sid, name):
+        row = make_payload_row(schema)
+        row.append_string(name)
+        batch.append(r_uint128(r_uint64(sid)), r_int64(1), row)
+
+class TableTab(BaseTab):
+    ID, SUBDIR, NAME = 2, "_tables", "_tables"
+    COL_SCHEMA_ID, COL_NAME, COL_DIRECTORY, COL_PK_COL_IDX, COL_CREATED_LSN = 1, 2, 3, 4, 5
+    @staticmethod
+    def schema():
+        cols = newlist_hint(6)
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="table_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="directory"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="pk_col_idx"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="created_lsn"))
+        return TableSchema(cols, pk_index=0)
+    @staticmethod
+    def append(batch, schema, tid, sid, name, directory, pk_idx, lsn):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
+        row.append_string(name)
+        row.append_string(directory)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(pk_idx)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(lsn)))
+        batch.append(r_uint128(r_uint64(tid)), r_int64(1), row)
+    @staticmethod
+    def retract(batch, schema, tid, sid, name, directory, pk_idx, lsn):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
+        row.append_string(name)
+        row.append_string(directory)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(pk_idx)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(lsn)))
+        batch.append(r_uint128(r_uint64(tid)), r_int64(-1), row)
+
+class ColTab(BaseTab):
+    ID, SUBDIR, NAME = 4, "_columns", "_columns"
+    COL_OWNER_ID, COL_OWNER_KIND, COL_COL_IDX, COL_NAME, COL_TYPE_CODE, COL_IS_NULLABLE, COL_FK_TABLE_ID, COL_FK_COL_IDX = 1, 2, 3, 4, 5, 6, 7, 8
+    @staticmethod
+    def schema():
+        cols = newlist_hint(9)
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="column_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="owner_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="owner_kind"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="col_idx"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="type_code"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="is_nullable"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="fk_table_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="fk_col_idx"))
+        return TableSchema(cols, pk_index=0)
+    @staticmethod
+    def append(batch, schema, owner_id, kind, idx, name, code, null, fk_tid, fk_cid):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(owner_id)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(kind)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(idx)))
+        row.append_string(name)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(code)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(null)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(fk_tid)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(fk_cid)))
+        batch.append(r_uint128(pack_column_id(owner_id, idx)), r_int64(1), row)
+    @staticmethod
+    def retract(batch, schema, owner_id, kind, idx, name, code, null, fk_tid, fk_cid):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(owner_id)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(kind)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(idx)))
+        row.append_string(name)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(code)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(null)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(fk_tid)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(fk_cid)))
+        batch.append(r_uint128(pack_column_id(owner_id, idx)), r_int64(-1), row)
+    @staticmethod
+    def append_system(batch, schema, tid, column_defs):
+        for i in range(len(column_defs)):
+            name, ftype = column_defs[i]
+            ColTab.append(batch, schema, tid, OWNER_KIND_TABLE, i, name, ftype.code, 0, 0, 0)
+
+class IdxTab(BaseTab):
+    ID, SUBDIR, NAME = 5, "_indices", "_indices"
+    COL_OWNER_ID, COL_OWNER_KIND, COL_SOURCE_COL_IDX, COL_NAME, COL_IS_UNIQUE, COL_CACHE_DIRECTORY = 1, 2, 3, 4, 5, 6
+    @staticmethod
+    def schema():
+        cols = newlist_hint(7)
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="index_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="owner_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="owner_kind"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="source_col_idx"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="is_unique"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="cache_directory"))
+        return TableSchema(cols, pk_index=0)
+    @staticmethod
+    def append(batch, schema, iid, oid, kind, src_idx, name, unique, cache_dir):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(oid)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(kind)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(src_idx)))
+        row.append_string(name)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(unique)))
+        row.append_string(cache_dir)
+        batch.append(r_uint128(r_uint64(iid)), r_int64(1), row)
+    @staticmethod
+    def retract(batch, schema, iid, oid, kind, src_idx, name, unique, cache_dir):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(oid)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(kind)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(src_idx)))
+        row.append_string(name)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(unique)))
+        row.append_string(cache_dir)
+        batch.append(r_uint128(r_uint64(iid)), r_int64(-1), row)
+
+class ViewTab(BaseTab):
+    ID, SUBDIR, NAME = 3, "_views", "_views"
+    COL_SCHEMA_ID, COL_NAME, COL_SQL_DEFINITION, COL_CACHE_DIRECTORY, COL_CREATED_LSN = 1, 2, 3, 4, 5
+    @staticmethod
+    def schema():
+        cols = newlist_hint(6)
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="sql_definition"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="cache_directory"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="created_lsn"))
+        return TableSchema(cols, pk_index=0)
+
+class DepTab(BaseTab):
+    ID, SUBDIR, NAME = 6, "_view_deps", "_view_deps"
+    COL_VIEW_ID, COL_DEP_VIEW_ID, COL_DEP_TABLE_ID = 1, 2, 3
+    @staticmethod
+    def schema():
+        cols = newlist_hint(4)
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dep_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dep_view_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dep_table_id"))
+        return TableSchema(cols, pk_index=0)
+
+class SeqTab(BaseTab):
+    ID, SUBDIR, NAME = 7, "_sequences" , "_sequences"
+    COL_VALUE = 1
+    @staticmethod
+    def schema():
+        cols = newlist_hint(2)
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="seq_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="next_val"))
+        return TableSchema(cols, pk_index=0)
+    @staticmethod
+    def append(batch, schema, seq_id, val):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(val)))
+        batch.append(r_uint128(r_uint64(seq_id)), r_int64(1), row)
+    @staticmethod
+    def retract(batch, schema, seq_id, val):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(val)))
+        batch.append(r_uint128(r_uint64(seq_id)), r_int64(-1), row)
+
+class InstrTab(BaseTab):
+    ID, SUBDIR, NAME = 8, "_instructions", "_instructions"
+    @staticmethod
+    def schema():
+        cols = newlist_hint(21)
+        cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="instr_pk"))
+        regs = ["opcode", "reg_in", "reg_out", "reg_in_a", "reg_in_b", "reg_trace", "reg_trace_in", "reg_trace_out", "reg_delta", "reg_history", "reg_a", "reg_b", "reg_key", "target_table_id", "func_id", "agg_func_id"]
+        for r in regs: cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name=r))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="group_by_cols"))
+        for r in ["chunk_limit", "jump_target", "yield_reason"]: cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name=r))
+        return TableSchema(cols, pk_index=0)
+
+class FuncTab(BaseTab):
+    ID, SUBDIR, NAME = 9, "_functions", "_functions"
+    @staticmethod
+    def schema():
+        cols = newlist_hint(3)
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="func_id"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="func_type"))
+        return TableSchema(cols, pk_index=0)
+
+class SubTab(BaseTab):
+    ID, SUBDIR, NAME = 10, "_subscriptions", "_subscriptions"
+    @staticmethod
+    def schema():
+        cols = newlist_hint(3)
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="sub_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="client_id"))
+        return TableSchema(cols, pk_index=0)
 
 def type_code_to_field_type(code):
-    """
-    Maps integer type codes back to FieldType singletons.
-    Flat if-chain avoids type-annotation ambiguity in RPython.
-    """
-    if code == TYPE_U8.code:
-        return TYPE_U8
-    if code == TYPE_I8.code:
-        return TYPE_I8
-    if code == TYPE_U16.code:
-        return TYPE_U16
-    if code == TYPE_I16.code:
-        return TYPE_I16
-    if code == TYPE_U32.code:
-        return TYPE_U32
-    if code == TYPE_I32.code:
-        return TYPE_I32
-    if code == TYPE_F32.code:
-        return TYPE_F32
-    if code == TYPE_U64.code:
-        return TYPE_U64
-    if code == TYPE_I64.code:
-        return TYPE_I64
-    if code == TYPE_F64.code:
-        return TYPE_F64
-    if code == TYPE_STRING.code:
-        return TYPE_STRING
-    if code == TYPE_U128.code:
-        return TYPE_U128
+    types = [TYPE_U8, TYPE_I8, TYPE_U16, TYPE_I16, TYPE_U32, TYPE_I32, TYPE_F32, TYPE_U64, TYPE_I64, TYPE_F64, TYPE_STRING, TYPE_U128]
+    for t in types:
+        if code == t.code: return t
     raise LayoutError("Unknown type code: %d" % code)
