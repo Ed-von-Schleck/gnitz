@@ -12,7 +12,7 @@ from gnitz.catalog.system_tables import (
 from gnitz.core.errors import LayoutError
 from gnitz.core.types import TableSchema, ColumnDefinition
 from gnitz.core.store import ZSetStore
-from gnitz.catalog.index_circuit import promote_to_index_key
+from gnitz.core.keys import promote_to_index_key
 
 
 def _wire_fk_constraints_for_family(family, registry):

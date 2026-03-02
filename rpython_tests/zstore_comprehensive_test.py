@@ -113,15 +113,17 @@ def test_vm_chunking_and_yield():
     program.append(instructions.ScanTraceOp(reg_trace, reg_out, chunk_limit=2))
     program.append(instructions.HaltOp())
 
-    ctx = runtime.ExecutionContext(reg_file)
-    interp = interpreter.DBSPInterpreter(program)
+    # Update: Use the new ExecutionContext and run_vm boundary
+    ctx = runtime.ExecutionContext()
+    ctx.reset()
 
-    interp.resume(ctx)
+    interpreter.run_vm(program, reg_file, ctx)
     assert_equal_i(runtime.STATUS_YIELDED, ctx.status, "Should yield after 2 rows")
     assert_equal_i(2, reg_out.batch.length(), "Out batch size mismatch")
 
+    # Resume the VM
     reg_out.batch.clear()
-    interp.resume(ctx)
+    interpreter.run_vm(program, reg_file, ctx)
     assert_equal_i(runtime.STATUS_HALTED, ctx.status, "Should halt after finish")
     assert_equal_i(1, reg_out.batch.length(), "Remaining row count mismatch")
 
@@ -146,12 +148,13 @@ def test_reactive_ddl_and_registry():
     db.create_table("public.test_table", cols, 0)
 
     # Path check confirms reactive side-effect of catalog mutation.
-    # We use sys.FIRST_USER_TABLE_ID (11) as the baseline.
     table_path = base_dir + "/public/test_table_" + str(sys.FIRST_USER_TABLE_ID)
     assert_true(os.path.exists(table_path), "DDL directory not created")
 
     family = db.get_table("public.test_table")
-    assert_equal_i(sys.FIRST_USER_TABLE_ID, family.table_id, "Table ID registration failed")
+    assert_equal_i(
+        sys.FIRST_USER_TABLE_ID, family.table_id, "Table ID registration failed"
+    )
 
     db.close()
     os.write(1, "[CATALOG] Reactive DDL Test Passed.\n")
@@ -192,10 +195,11 @@ def test_vm_dataflow_cascade_logic():
     program.append(instructions.ScanTraceOp(reg_trace, reg_delta, chunk_limit=0))
     program.append(instructions.HaltOp())
 
-    ctx = runtime.ExecutionContext(reg_file)
-    interp = interpreter.DBSPInterpreter(program)
-    interp.resume(ctx)
+    ctx = runtime.ExecutionContext()
+    ctx.reset()
+    interpreter.run_vm(program, reg_file, ctx)
 
+    assert_equal_i(runtime.STATUS_HALTED, ctx.status, "VM failed to complete")
     assert_equal_i(1, reg_delta.batch.length(), "Cascade failed to propagate data")
     assert_equal_i(
         999, intmask(r_uint64(reg_delta.batch.get_pk(0))), "Cascade data corruption"
@@ -225,4 +229,5 @@ def target(driver, args):
 
 if __name__ == "__main__":
     import sys as pysys
+
     entry_point(pysys.argv)

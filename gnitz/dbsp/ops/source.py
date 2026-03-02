@@ -3,7 +3,6 @@
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64
 
-@jit.unroll_safe
 def op_scan_trace(cursor, out_batch, chunk_limit):
     """
     Scans records from a stateful cursor into a Delta batch.
@@ -11,17 +10,17 @@ def op_scan_trace(cursor, out_batch, chunk_limit):
     Returns the number of records scanned.
     The cursor is left at the position of the next record to be scanned.
     """
-    # chunk_limit <= 0 means scan everything until exhaustion
     scanned_count = 0
     
     while cursor.is_valid():
+        # chunk_limit <= 0 means scan everything until exhaustion
         if chunk_limit > 0 and scanned_count >= chunk_limit:
             break
             
         key = cursor.key()
         weight = cursor.weight()
         
-        # In DBSP, we only process records with non-zero weight.
+        # In DBSP/Differential logic, we only process records with non-zero weight.
         if weight != r_int64(0):
             accessor = cursor.get_accessor()
             out_batch.append_from_accessor(key, weight, accessor)
@@ -43,7 +42,7 @@ def op_seek_trace(cursor, key):
 def op_clear_deltas(reg_file):
     """
     Explicitly clears all transient Delta registers in the register file.
-    This is called to prepare for a new 'tick' or to free up arena 
-    space before a new chunk scan.
+    Unlike prepare_for_tick(), this does NOT refresh cursors, making it
+    safe for mid-program execution (e.g., between chunked scans).
     """
-    reg_file.clear_all_deltas()
+    reg_file.clear_deltas()

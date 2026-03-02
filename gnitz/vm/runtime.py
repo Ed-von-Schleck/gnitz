@@ -53,20 +53,14 @@ class VMSchema(object):
         assert col_idx >= 0 and col_idx < len(self.column_types)
         return self.column_types[col_idx]
 
-    def is_u128_pk(self):
-        return self.pk_type == types.TYPE_U128.code
-
 
 class BaseRegister(object):
-    """
-    Base class for all VM registers.
-    """
+    """Base class for all VM registers."""
     _immutable_fields_ = ['reg_id', 'vm_schema']
 
     def __init__(self, reg_id, vm_schema):
         self.reg_id = reg_id
         self.vm_schema = vm_schema
-        # Subclass fields initialized to None for annotator monomorphism
         self.batch = None
         self.cursor = None
         self.table = None
@@ -76,23 +70,29 @@ class BaseRegister(object):
 
 
 class DeltaRegister(BaseRegister):
-    """R_Delta: Holds transient Z-Set batches for the current epoch."""
-    _immutable_fields_ = []
-
+    """R_Delta: Holds transient Z-Set batches."""
     def __init__(self, reg_id, vm_schema):
         BaseRegister.__init__(self, reg_id, vm_schema)
-        self.batch = ZSetBatch(vm_schema.table_schema)
+        self._internal_batch = ZSetBatch(vm_schema.table_schema)
+        self.batch = self._internal_batch
 
     def is_delta(self): return True
 
     def clear(self):
-        self.batch.clear()
+        """Clears the internal arena."""
+        self._internal_batch.clear()
+
+    def bind(self, external_batch):
+        """Temporarily borrows an external batch (e.g., for Register 0)."""
+        self.batch = external_batch
+
+    def unbind(self):
+        """Restores the internal transient batch."""
+        self.batch = self._internal_batch
 
 
 class TraceRegister(BaseRegister):
-    """R_Trace: Holds persistent cursors (Traces) or stateful Table references."""
-    _immutable_fields_ = []
-
+    """R_Trace: Holds persistent cursors or stateful Table references."""
     def __init__(self, reg_id, vm_schema, cursor, table=None):
         BaseRegister.__init__(self, reg_id, vm_schema)
         self.cursor = cursor
@@ -101,33 +101,11 @@ class TraceRegister(BaseRegister):
     def is_trace(self): return True
 
     def refresh(self):
-        """
-        Closes the current cursor and opens a fresh one from the backing table.
-
-        Called at the start of every execution tick so that join, reduce, and
-        distinct operators see the fully up-to-date state of the table rather
-        than the snapshot that existed when the plan was first compiled.
-
-        Registers that were constructed without a table reference (e.g. cursors
-        provided directly by QueryBuilder for one-shot queries) are left
-        unchanged.
-        """
         if self.table is None:
             return
         if self.cursor is not None:
             self.cursor.close()
         self.cursor = self.table.create_cursor()
-
-    def get_weight(self, key, payload):
-        """Looks up the current algebraic weight for a specific record."""
-        if self.table is None:
-            return r_int64(0)
-        return self.table.get_weight(key, payload)
-
-    def update_batch(self, batch):
-        """Updates the stateful trace with an incoming ZSetBatch."""
-        if self.table is not None:
-            self.table.ingest_batch(batch)
 
 
 class RegisterFile(object):
@@ -143,53 +121,79 @@ class RegisterFile(object):
         assert reg is not None
         return reg
 
-    def clear_all_deltas(self):
-        """Resets all transient Delta registers."""
+    def prepare_for_tick(self):
+        """Unified lifecycle hook called at the start of every epoch."""
+        for reg in self.registers:
+            if reg is None:
+                continue
+            if reg.is_delta():
+                reg.clear()
+            elif reg.is_trace():
+                reg.refresh()
+                
+    def clear_deltas(self):
+        """Only clears transient data; does NOT refresh cursors."""
         for reg in self.registers:
             if reg is not None and reg.is_delta():
                 reg.clear()
 
-    def refresh_trace_cursors(self):
-        """
-        Refreshes all TraceRegister cursors to reflect the current table state.
-
-        Must be called at the start of every execution tick for cached plans.
-        Without this, join/reduce/distinct operators will silently operate on
-        the stale snapshot that was captured when the plan was first loaded
-        from the program cache.
-
-        Only registers backed by a live table are refreshed; externally-supplied
-        cursors (table is None) are left untouched.
-        """
-        for reg in self.registers:
-            if reg is not None and reg.is_trace():
-                reg.refresh()
-
-    def prepare_for_tick(self):
-        """
-        Prepares the register file for a new execution tick.
-
-        Combines delta clearing and cursor refresh into a single call so that
-        every execution site (reactive executor, query processor) has one
-        unambiguous hook to call.
-        """
-        self.clear_all_deltas()
-        self.refresh_trace_cursors()
-
 
 class ExecutionContext(object):
-    """
-    Maintains the state of a VM execution across multiple chunks/ticks.
-    """
-    _immutable_fields_ = ['reg_file']
-
-    def __init__(self, reg_file):
-        self.reg_file = reg_file
+    """Maintains the state of a VM execution (PC and status)."""
+    def __init__(self):
         self.pc = 0
         self.status = STATUS_INIT
         self.yield_reason = YIELD_REASON_NONE
 
-    def reset(self, pc=0):
-        self.pc = pc
+    def reset(self):
+        self.pc = 0
         self.status = STATUS_RUNNING
         self.yield_reason = YIELD_REASON_NONE
+
+
+class ExecutablePlan(object):
+    """
+    Stateful, pre-compiled execution context for a Reactive View.
+    Acts as the primary API boundary between the Executor and the VM.
+    """
+    _immutable_fields_ = ["program", "reg_file", "out_schema", "in_reg_idx", "out_reg_idx"]
+
+    def __init__(self, program, reg_file, out_schema, in_reg_idx=0, out_reg_idx=1):
+        self.program = program
+        self.reg_file = reg_file
+        self.out_schema = out_schema
+        self.in_reg_idx = in_reg_idx
+        self.out_reg_idx = out_reg_idx
+        self.context = ExecutionContext()
+
+    def execute_epoch(self, input_delta):
+        """
+        Executes the plan for one epoch/tick.
+        Returns a cloned output ZSetBatch if changes were produced, otherwise None.
+        """
+        from gnitz.vm.interpreter import run_vm
+
+        # 1. Lifecycle: Clear transient state and refresh cursors
+        self.reg_file.prepare_for_tick()
+        self.context.reset()
+
+        # 2. Binding: Borrow the input batch into the designated register
+        in_reg = self.reg_file.get_register(self.in_reg_idx)
+        assert in_reg.is_delta()
+        in_reg.bind(input_delta)
+
+        # 3. Execution: Run the interpreter logic
+        run_vm(self.program, self.reg_file, self.context)
+
+        # 4. Result Extraction: Capture output if the VM halted normally
+        result = None
+        if self.context.status == STATUS_HALTED:
+            out_reg = self.reg_file.get_register(self.out_reg_idx)
+            assert out_reg.is_delta()
+            if out_reg.batch.length() > 0:
+                result = out_reg.batch.clone()
+
+        # 5. Cleanup: Release borrowed reference
+        in_reg.unbind()
+
+        return result

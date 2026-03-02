@@ -11,65 +11,46 @@ class QueryError(Exception):
 class View(object):
     """
     A compiled execution handle for a DBSP circuit.
-    Holds the ExecutionContext, allowing the query to be paused and resumed.
+    Wraps an ExecutablePlan to provide an interactive or push-based API.
     """
 
-    def __init__(self, interp, context, input_reg_id, output_reg_id, cursors):
-        self.interpreter = interp
-        self.context = context
-        self.input_reg_id = input_reg_id
-        self.output_reg_id = output_reg_id
+    def __init__(self, plan, cursors):
+        self.plan = plan
         self.cursors = cursors
 
     def run(self):
         """Runs or resumes the circuit until a YIELD or HALT."""
-        self.interpreter.resume(self.context)
-        return self.context.status
+        # Use the module-level function and the plan's internal state
+        interpreter.run_vm(self.plan.program, self.plan.reg_file, self.plan.context)
+        return self.plan.context.status
 
     def process(self, delta_batch):
         """
         Processes a single batch of updates through the circuit.
-        Used for standard push-based incremental computation.
+        Utilizes the zero-copy bind mechanism in ExecutablePlan.
         """
-        # 1. Reset context, clear transient delta state, and refresh all trace
-        #    cursors so operators see the current table state for this tick.
-        self.context.reset(pc=0)
-        self.context.reg_file.prepare_for_tick()
-
-        # 2. Ingest data into the input register
-        reg0 = self.context.reg_file.get_register(self.input_reg_id)
-        assert isinstance(reg0, runtime.DeltaRegister)
-
-        for i in range(delta_batch.length()):
-            reg0.batch.append_from_accessor(
-                delta_batch.get_pk(i),
-                delta_batch.get_weight(i),
-                delta_batch.get_accessor(i),
-            )
-
-        # 3. Execute
-        self.run()
-
-        # 4. Return result
-        out_reg = self.context.reg_file.get_register(self.output_reg_id)
-        if not out_reg.is_delta():
-            raise QueryError("Output register is not a Delta register")
-        return out_reg.batch
+        # execute_epoch handles prepare_for_tick, binding, running, and cloning the result.
+        return self.plan.execute_epoch(delta_batch)
 
     def close(self):
         """Closes all persistent cursors and frees transient batches."""
         for cursor in self.cursors:
             cursor.close()
-        for reg in self.context.reg_file.registers:
+        
+        # Free all transient arenas owned by DeltaRegisters
+        for reg in self.plan.reg_file.registers:
             if reg is not None and reg.is_delta():
-                if reg.batch is not None:
+                # We access the internal batch specifically to ensure the 
+                # physical memory arena is released.
+                if hasattr(reg, '_internal_batch'):
+                    reg._internal_batch.free()
+                elif reg.batch is not None:
                     reg.batch.free()
 
 
 class QueryBuilder(object):
     """
     Fluent API for constructing incremental DBSP circuits.
-    Supports chunked execution, explicit control flow, and standard operators.
     """
 
     def __init__(self, source_table):
@@ -95,35 +76,26 @@ class QueryBuilder(object):
         self.registers.append(reg)
         return idx, reg
 
-    # ------------------------------------------------------------------
-    # Control Flow & State Management
-    # ------------------------------------------------------------------
+    # ── Control Flow & State Management ───────────────────────────────
 
     def label(self):
-        """Returns the index of the next instruction (for JUMP targets)."""
         return len(self.instructions)
 
     def yield_(self, reason=runtime.YIELD_REASON_USER):
-        op = instructions.YieldOp(reason)
-        self.instructions.append(op)
+        self.instructions.append(instructions.YieldOp(reason))
         return self
 
     def jump(self, target_idx):
-        op = instructions.JumpOp(target_idx)
-        self.instructions.append(op)
+        self.instructions.append(instructions.JumpOp(target_idx))
         return self
 
     def clear_deltas(self):
-        op = instructions.ClearDeltasOp()
-        self.instructions.append(op)
+        self.instructions.append(instructions.ClearDeltasOp())
         return self
 
-    # ------------------------------------------------------------------
-    # Source & Leaf Operators
-    # ------------------------------------------------------------------
+    # ── Source & Leaf Operators ───────────────────────────────────────
 
     def scan(self, table, chunk_limit=1000):
-        """Creates a fresh cursor and scans from it."""
         schema = table.get_schema()
         cursor = table.create_cursor()
         self.cursors.append(cursor)
@@ -132,56 +104,46 @@ class QueryBuilder(object):
         return self.scan_trace(tr_idx, chunk_limit)
 
     def scan_trace(self, trace_reg_idx, chunk_limit=1000):
-        """Scans from an existing TraceRegister (cursor)."""
         tr_reg = self.registers[trace_reg_idx]
         if not tr_reg.is_trace():
             raise QueryError("scan_trace requires a Trace register")
 
         out_idx, out_reg = self._add_register(tr_reg.vm_schema.table_schema)
-
-        op = instructions.ScanTraceOp(tr_reg, out_reg, chunk_limit)
-        self.instructions.append(op)
+        self.instructions.append(instructions.ScanTraceOp(tr_reg, out_reg, chunk_limit))
         self.current_reg_idx = out_idx
         return self
 
     def seek_trace(self, trace_reg_idx, key_reg_idx):
         t_reg = self.registers[trace_reg_idx]
         k_reg = self.registers[key_reg_idx]
-        op = instructions.SeekTraceOp(t_reg, k_reg)
-        self.instructions.append(op)
+        self.instructions.append(instructions.SeekTraceOp(t_reg, k_reg))
         return self
 
     def sink(self, table):
         prev_reg = self.registers[self.current_reg_idx]
-        op = instructions.IntegrateOp(prev_reg, table)
-        self.instructions.append(op)
+        self.instructions.append(instructions.IntegrateOp(prev_reg, table))
         return self
 
-    # ------------------------------------------------------------------
-    # Transformation Operators
-    # ------------------------------------------------------------------
+    # ── Transformation Operators ──────────────────────────────────────
 
     def filter(self, predicate):
         prev_reg = self.registers[self.current_reg_idx]
         idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
-        op = instructions.FilterOp(prev_reg, new_reg, predicate)
-        self.instructions.append(op)
+        self.instructions.append(instructions.FilterOp(prev_reg, new_reg, predicate))
         self.current_reg_idx = idx
         return self
 
     def map(self, mapper, output_schema):
         prev_reg = self.registers[self.current_reg_idx]
         idx, new_reg = self._add_register(output_schema)
-        op = instructions.MapOp(prev_reg, new_reg, mapper)
-        self.instructions.append(op)
+        self.instructions.append(instructions.MapOp(prev_reg, new_reg, mapper))
         self.current_reg_idx = idx
         return self
 
     def negate(self):
         prev_reg = self.registers[self.current_reg_idx]
         idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
-        op = instructions.NegateOp(prev_reg, new_reg)
-        self.instructions.append(op)
+        self.instructions.append(instructions.NegateOp(prev_reg, new_reg))
         self.current_reg_idx = idx
         return self
 
@@ -192,8 +154,7 @@ class QueryBuilder(object):
             other_reg = other_builder.registers[other_builder.current_reg_idx]
 
         idx, new_reg = self._add_register(prev_reg.vm_schema.table_schema)
-        op = instructions.UnionOp(prev_reg, other_reg, new_reg)
-        self.instructions.append(op)
+        self.instructions.append(instructions.UnionOp(prev_reg, other_reg, new_reg))
         self.current_reg_idx = idx
         return self
 
@@ -209,8 +170,7 @@ class QueryBuilder(object):
             schema, is_trace=True, cursor=cursor, table=history_table
         )
         out_idx, out_reg = self._add_register(schema)
-        op = instructions.DistinctOp(prev_reg, trace_reg, out_reg)
-        self.instructions.append(op)
+        self.instructions.append(instructions.DistinctOp(prev_reg, trace_reg, out_reg))
         self.current_reg_idx = out_idx
         return self
 
@@ -239,15 +199,13 @@ class QueryBuilder(object):
             if not reg_trace_in.is_trace():
                 raise QueryError("reg_trace_in must be a Trace register")
 
-        op = instructions.ReduceOp(
+        self.instructions.append(instructions.ReduceOp(
             prev_reg, reg_trace_in, reg_tr_out, reg_out,
             group_by_cols, agg_func, out_schema
-        )
-        self.instructions.append(op)
+        ))
 
         # Integration of internal reduce state
-        sink_op = instructions.IntegrateOp(reg_out, trace_table)
-        self.instructions.append(sink_op)
+        self.instructions.append(instructions.IntegrateOp(reg_out, trace_table))
 
         self.current_reg_idx = out_idx
         return self
@@ -265,20 +223,18 @@ class QueryBuilder(object):
         )
         out_idx, out_reg = self._add_register(out_schema)
 
-        op = instructions.JoinDeltaTraceOp(prev_reg, trace_reg, out_reg)
-        self.instructions.append(op)
+        self.instructions.append(instructions.JoinDeltaTraceOp(prev_reg, trace_reg, out_reg))
         self.current_reg_idx = out_idx
         return self
 
-    # ------------------------------------------------------------------
-    # Finalization
-    # ------------------------------------------------------------------
+    # ── Finalization ──────────────────────────────────────────────────
 
     def build(self):
         if not self._built:
             self.instructions.append(instructions.HaltOp())
             self._built = True
 
+        # Convert to fixed-size list for RPython
         program = [None] * len(self.instructions)
         for i in range(len(self.instructions)):
             program[i] = self.instructions[i]
@@ -287,7 +243,16 @@ class QueryBuilder(object):
         for i in range(len(self.registers)):
             reg_file.registers[i] = self.registers[i]
 
-        context = runtime.ExecutionContext(reg_file)
-        interp = interpreter.DBSPInterpreter(program)
+        # The last register defined is the output register.
+        # Register 0 is conventionally the input.
+        out_reg = self.registers[self.current_reg_idx]
+        
+        plan = runtime.ExecutablePlan(
+            program, 
+            reg_file, 
+            out_reg.vm_schema.table_schema,
+            in_reg_idx=0,
+            out_reg_idx=self.current_reg_idx
+        )
 
-        return View(interp, context, 0, self.current_reg_idx, self.cursors)
+        return View(plan, self.cursors)

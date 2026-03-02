@@ -41,17 +41,25 @@ class BaseTab(object):
 class SchemaTab(BaseTab):
     ID, SUBDIR, NAME = 1, "_schemas", "_schemas"
     COL_NAME = 1
+    
     @staticmethod
     def schema():
         cols = newlist_hint(2)
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
         cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
         return TableSchema(cols, pk_index=0)
+        
     @staticmethod
     def append(batch, schema, sid, name):
         row = make_payload_row(schema)
         row.append_string(name)
         batch.append(r_uint128(r_uint64(sid)), r_int64(1), row)
+
+    @staticmethod
+    def retract(batch, schema, sid, name):
+        row = make_payload_row(schema)
+        row.append_string(name)
+        batch.append(r_uint128(r_uint64(sid)), r_int64(-1), row)
 
 class TableTab(BaseTab):
     ID, SUBDIR, NAME = 2, "_tables", "_tables"
