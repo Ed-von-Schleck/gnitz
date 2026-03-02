@@ -21,7 +21,7 @@ OWNER_KIND_TABLE = 0
 OWNER_KIND_VIEW = 1
 
 SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES, SEQ_ID_PROGRAMS = 1, 2, 3, 4
-FIRST_USER_TABLE_ID, FIRST_USER_INDEX_ID = 11, 1
+FIRST_USER_TABLE_ID, FIRST_USER_INDEX_ID = 16, 1
 SYS_CATALOG_DIRNAME = "_system_catalog"
 
 
@@ -38,6 +38,25 @@ def read_string(accessor, col_idx):
 def pack_column_id(owner_id, col_idx):
     """Synthetic PK for ColTab: (owner_id << 9) | col_idx."""
     return (r_uint64(owner_id) << 9) | r_uint64(col_idx)
+    
+
+def pack_node_pk(view_id, node_id):
+    return (r_uint128(r_uint64(view_id)) << 64) | r_uint128(r_uint64(node_id))
+
+
+def pack_edge_pk(view_id, edge_id):
+    return (r_uint128(r_uint64(view_id)) << 64) | r_uint128(r_uint64(edge_id))
+
+
+def pack_param_pk(view_id, node_id, slot):
+    # slot fits in 8 bits; node_id in 32 bits for headroom
+    lo = (r_uint64(node_id) << 8) | r_uint64(slot)
+    return (r_uint128(r_uint64(view_id)) << 64) | r_uint128(lo)
+
+
+def pack_gcol_pk(view_id, node_id, col_idx):
+    lo = (r_uint64(node_id) << 16) | r_uint64(col_idx)
+    return (r_uint128(r_uint64(view_id)) << 64) | r_uint128(lo)
 
 
 class BaseTab(object):
@@ -364,6 +383,156 @@ class SubTab(BaseTab):
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="client_id"))
         return TableSchema(cols, pk_index=0)
+
+class CircuitNodesTab(BaseTab):
+    """
+    One row per operator node in a compiled view circuit.
+    PK: pack_node_pk(view_id, node_id)
+    """
+    ID, SUBDIR, NAME = 11, "_circuit_nodes", "_circuit_nodes"
+    COL_OPCODE = 1  # only payload column
+
+    @staticmethod
+    def schema():
+        cols = newlist_hint(2)
+        cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="node_pk"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="opcode"))
+        return TableSchema(cols, pk_index=0)
+
+    @staticmethod
+    def append(batch, schema, view_id, node_id, opcode):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(opcode)))
+        batch.append(pack_node_pk(view_id, node_id), r_int64(1), row)
+
+    @staticmethod
+    def retract(batch, schema, view_id, node_id, opcode):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(opcode)))
+        batch.append(pack_node_pk(view_id, node_id), r_int64(-1), row)
+
+
+class CircuitEdgesTab(BaseTab):
+    """
+    One row per directed edge (data stream) between operator nodes.
+    PK: pack_edge_pk(view_id, edge_id)
+    edge_id is assigned sequentially by CircuitBuilder.
+    """
+    ID, SUBDIR, NAME = 12, "_circuit_edges", "_circuit_edges"
+    COL_SRC_NODE = 1
+    COL_DST_NODE = 2
+    COL_DST_PORT = 3
+
+    @staticmethod
+    def schema():
+        cols = newlist_hint(4)
+        cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="edge_pk"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="src_node"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dst_node"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dst_port"))
+        return TableSchema(cols, pk_index=0)
+
+    @staticmethod
+    def append(batch, schema, view_id, edge_id, src_node, dst_node, dst_port):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(src_node)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(dst_node)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(dst_port)))
+        batch.append(pack_edge_pk(view_id, edge_id), r_int64(1), row)
+
+    @staticmethod
+    def retract(batch, schema, view_id, edge_id, src_node, dst_node, dst_port):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(src_node)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(dst_node)))
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(dst_port)))
+        batch.append(pack_edge_pk(view_id, edge_id), r_int64(-1), row)
+
+
+class CircuitSourcesTab(BaseTab):
+    """
+    Leaf nodes that read from a persistent table (TraceRegisters).
+    table_id=0 means 'the view's input delta stream' (DeltaRegister).
+    PK: pack_node_pk(view_id, node_id)  -- same space as nodes, non-overlapping by convention
+    """
+    ID, SUBDIR, NAME = 13, "_circuit_sources", "_circuit_sources"
+    COL_TABLE_ID = 1
+
+    @staticmethod
+    def schema():
+        cols = newlist_hint(2)
+        cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="source_pk"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="table_id"))
+        return TableSchema(cols, pk_index=0)
+
+    @staticmethod
+    def append(batch, schema, view_id, node_id, table_id):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(table_id)))
+        batch.append(pack_node_pk(view_id, node_id), r_int64(1), row)
+
+    @staticmethod
+    def retract(batch, schema, view_id, node_id, table_id):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(table_id)))
+        batch.append(pack_node_pk(view_id, node_id), r_int64(-1), row)
+
+
+class CircuitParamsTab(BaseTab):
+    """
+    Non-register scalar parameters for operator nodes.
+    One row per (node, slot) pair.
+    PK: pack_param_pk(view_id, node_id, slot)
+    """
+    ID, SUBDIR, NAME = 14, "_circuit_params", "_circuit_params"
+    COL_VALUE = 1
+
+    @staticmethod
+    def schema():
+        cols = newlist_hint(2)
+        cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="param_pk"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="value"))
+        return TableSchema(cols, pk_index=0)
+
+    @staticmethod
+    def append(batch, schema, view_id, node_id, slot, value):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(value)))
+        batch.append(pack_param_pk(view_id, node_id, slot), r_int64(1), row)
+
+    @staticmethod
+    def retract(batch, schema, view_id, node_id, slot, value):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(value)))
+        batch.append(pack_param_pk(view_id, node_id, slot), r_int64(-1), row)
+
+
+class CircuitGroupColsTab(BaseTab):
+    """
+    Group-by column indices for REDUCE nodes.
+    One row per (node, col_idx) pair. The PK encodes both.
+    """
+    ID, SUBDIR, NAME = 15, "_circuit_group_cols", "_circuit_group_cols"
+    COL_COL_IDX = 1
+
+    @staticmethod
+    def schema():
+        cols = newlist_hint(2)
+        cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="gcol_pk"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="col_idx"))
+        return TableSchema(cols, pk_index=0)
+
+    @staticmethod
+    def append(batch, schema, view_id, node_id, col_idx):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(col_idx)))
+        batch.append(pack_gcol_pk(view_id, node_id, col_idx), r_int64(1), row)
+
+    @staticmethod
+    def retract(batch, schema, view_id, node_id, col_idx):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(col_idx)))
+        batch.append(pack_gcol_pk(view_id, node_id, col_idx), r_int64(-1), row)
 
 
 def type_code_to_field_type(code):

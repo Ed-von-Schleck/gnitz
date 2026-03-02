@@ -1,5 +1,7 @@
 # gnitz/vm/instructions.py
 
+import gnitz.core.opcodes as op
+
 class Instruction(object):
     """
     Base class for all VM instructions.
@@ -17,22 +19,22 @@ class Instruction(object):
     ]
     
     # --- Opcode Constants ---
-    HALT             = 0
-    FILTER           = 1
-    MAP              = 2
-    NEGATE           = 3
-    UNION            = 4
-    JOIN_DELTA_TRACE = 5
-    JOIN_DELTA_DELTA = 6
-    INTEGRATE        = 7
-    DELAY            = 8
-    REDUCE           = 9
-    DISTINCT         = 10
-    SCAN_TRACE       = 11
-    SEEK_TRACE       = 12
-    YIELD            = 13
-    JUMP             = 14
-    CLEAR_DELTAS     = 15
+    HALT             = op.OPCODE_HALT
+    FILTER           = op.OPCODE_FILTER
+    MAP              = op.OPCODE_MAP
+    NEGATE           = op.OPCODE_NEGATE
+    UNION            = op.OPCODE_UNION
+    JOIN_DELTA_TRACE = op.OPCODE_JOIN_DELTA_TRACE
+    JOIN_DELTA_DELTA = op.OPCODE_JOIN_DELTA_DELTA
+    INTEGRATE        = op.OPCODE_INTEGRATE
+    DELAY            = op.OPCODE_DELAY
+    REDUCE           = op.OPCODE_REDUCE
+    DISTINCT         = op.OPCODE_DISTINCT
+    SCAN_TRACE       = op.OPCODE_SCAN_TRACE
+    SEEK_TRACE       = op.OPCODE_SEEK_TRACE
+    YIELD            = op.OPCODE_YIELD
+    JUMP             = op.OPCODE_JUMP
+    CLEAR_DELTAS     = op.OPCODE_CLEAR_DELTAS
 
     def __init__(self, opcode):
         self.opcode = opcode

@@ -116,6 +116,8 @@ def read_column_defs(cols_pt, owner_id):
 SYSTEM_TAB_LIST = unrolling_iterable([
     sys.SchemaTab, sys.TableTab, sys.ViewTab, sys.ColTab, sys.IdxTab,
     sys.DepTab, sys.SeqTab, sys.InstrTab, sys.FuncTab, sys.SubTab,
+    sys.CircuitNodesTab, sys.CircuitEdgesTab, sys.CircuitSourcesTab,
+    sys.CircuitParamsTab, sys.CircuitGroupColsTab,
 ])
 
 def _create_sys_table(sys_dir, tab_class):
