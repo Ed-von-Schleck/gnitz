@@ -50,7 +50,7 @@ class FKConstraint(object):
 
 class ReactiveStore(ZSetStore):
     """
-    A base proxy for ZSetStore that provides an overridable hook 
+    A base proxy for ZSetStore that provides an overridable hook
     for DDL side-effects.
     """
     _immutable_fields_ = ["inner", "schema"]
@@ -92,7 +92,7 @@ class ReactiveStore(ZSetStore):
 
 class TableFamily(ZSetStore):
     """
-    The primary entity for user data. Manages a PersistentTable and 
+    The primary entity for user data. Manages a PersistentTable and
     associated secondary IndexCircuits.
     """
 
@@ -128,6 +128,7 @@ class TableFamily(ZSetStore):
         self.schema = primary.get_schema()
         self.index_circuits = newlist_hint(4)
         self.fk_constraints = newlist_hint(0)
+        self.depth = 0
 
     def _add_fk_constraint(self, col_idx, target_family):
         self.fk_constraints.append(FKConstraint(col_idx, target_family))
@@ -158,17 +159,17 @@ class TableFamily(ZSetStore):
         # --- Stage 1: Foreign Key Enforcement ---
         n_constraints = len(self.fk_constraints)
         if n_constraints > 0:
-            # We use a single shared accessor and bind it explicitly inside 
+            # We use a single shared accessor and bind it explicitly inside
             # the loop to ensure the RPython annotator correctly tracks offsets.
             acc = batch.get_accessor(0)
-            
+
             for i in range(n_records):
                 # We only validate insertions (positive weights)
                 if batch.get_weight(i) <= 0:
                     continue
 
                 batch.bind_raw_accessor(i, acc)
-                
+
                 for c_idx in range(n_constraints):
                     constraint = self.fk_constraints[c_idx]
                     col_idx = constraint.fk_col_idx
@@ -179,11 +180,7 @@ class TableFamily(ZSetStore):
                     fk_key = promote_to_index_key(
                         acc, col_idx, self.schema.columns[col_idx].field_type
                     )
-                    
-                    # PROBE: Verify the key lookup for diagnostics
-                    # os.write(1, " [FK-DEBUG] Table %s: checking target %s for key...\n" % 
-                    #         (self.table_name, constraint.target_family.table_name))
-                    
+
                     if not constraint.target_family.has_pk(fk_key):
                         raise LayoutError(
                             "Foreign Key violation in '%s.%s': value for column '%s' "
@@ -228,7 +225,7 @@ class TableFamily(ZSetStore):
 
         if supporting_circuit is None:
             raise LayoutError(
-                "No supporting index found for FK on column '%s'" 
+                "No supporting index found for FK on column '%s'"
                 % self.schema.columns[constraint.fk_col_idx].name
             )
 
@@ -376,3 +373,8 @@ class EntityRegistry(object):
         if name in self._index_by_name:
             return self._index_by_name[name]
         raise LayoutError("Index does not exist: %s" % name)
+
+    def get_depth(self, view_id):
+        if view_id in self._by_id:
+            return self._by_id[view_id].depth
+        return 0

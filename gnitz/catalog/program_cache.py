@@ -23,24 +23,12 @@ def _get_agg_func(agg_func_id):
     return NULL_AGGREGATE
 
 
-class ExecutablePlan(object):
-    """
-    An immutable, pre-compiled execution context for the Gnitz VM.
-    """
-
-    _immutable_fields_ = ["program", "reg_file", "out_schema"]
-
-    def __init__(self, program, reg_file, out_schema):
-        self.program = program
-        self.reg_file = reg_file
-        self.out_schema = out_schema
-
-
 class ProgramCache(object):
     """
     Caches execution plans for Reactive Views.
-    Translates rows from `_system._instructions` into `ExecutablePlan` objects
-    containing monomorphic `Instruction` lists and pre-allocated `RegisterFile`s.
+    Translates rows from `_system._instructions` into `runtime.ExecutablePlan`
+    objects containing monomorphic `Instruction` lists and pre-allocated
+    `RegisterFile`s.
     """
 
     _immutable_fields_ = ["registry", "_cache"]
@@ -409,4 +397,12 @@ class ProgramCache(object):
 
         if len(program) == 0:
             return None
-        return ExecutablePlan(program, reg_file, out_schema)
+
+        out_reg_idx = 1
+        for scan_instr in program:
+            if scan_instr.opcode == instructions.Instruction.INTEGRATE:
+                if scan_instr.reg_in is not None:
+                    out_reg_idx = scan_instr.reg_in.reg_id
+                break
+
+        return runtime.ExecutablePlan(program, reg_file, out_schema, 0, out_reg_idx)

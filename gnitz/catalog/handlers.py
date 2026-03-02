@@ -22,6 +22,26 @@ from gnitz.catalog.index_circuit import (
 )
 
 
+def _compute_view_depth(vid, view_deps_store, registry):
+    max_depth = 0
+    cursor = view_deps_store.create_cursor()
+    try:
+        while cursor.is_valid():
+            if cursor.weight() > 0:
+                acc = cursor.get_accessor()
+                v_id = intmask(acc.get_int(sys.DepTab.COL_VIEW_ID))
+                if v_id == vid:
+                    dep_vid = intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID))
+                    if dep_vid > 0 and registry.has_id(dep_vid):
+                        candidate = registry.get_by_id(dep_vid).depth + 1
+                        if candidate > max_depth:
+                            max_depth = candidate
+            cursor.advance()
+    finally:
+        cursor.close()
+    return max_depth
+
+
 class CatalogReactiveStore(ReactiveStore):
     """
     Reactive proxy that bridges durable System Z-Sets to catalog handlers.
@@ -77,11 +97,11 @@ class CatalogHandlers(object):
             if weight > 0:
                 if self.registry.has_schema(name):
                     continue
-                
+
                 path = self.base_dir + "/" + name
                 ensure_dir(path)
                 mmap_posix.fsync_dir(self.base_dir)
-                
+
                 self.registry.register_schema(sid, name)
             else:
                 if self.registry.has_schema(name):
@@ -166,6 +186,25 @@ class CatalogHandlers(object):
                 schema_name = self.registry.get_schema_name(sid)
 
                 family = TableFamily(schema_name, name, vid, sid, directory, 0, et)
+
+                # Compute and cache the topological depth of this view.
+                #
+                # Placed after TableFamily construction (depth defaults to 0)
+                # and before registry.register(family), so that any downstream
+                # view registered later can read this view's depth out of the
+                # registry and correctly compute its own depth.
+                #
+                # During live DDL: engine.create_view calls view_deps.flush()
+                # before writing the view record, so dep records are already in
+                # a flushed shard and visible to the cursor opened here.
+                #
+                # During replay: the PersistentTable for view_deps is fully
+                # recovered from disk before any on_view_delta call is made,
+                # so the same guarantee holds.
+                family.depth = _compute_view_depth(
+                    vid, self.sys_tables.view_deps, self.registry
+                )
+
                 self.registry.register(family)
             else:
                 if self.registry.has_id(vid):
@@ -200,7 +239,7 @@ class CatalogHandlers(object):
                     idx_id, owner_id, source_col_idx, col.field_type,
                     source_pk_type, idx_dir, name, is_unique, cache_dir,
                 )
-                
+
                 _backfill_index(circuit, family)
                 family.index_circuits.append(circuit)
                 self.registry.register_index(idx_id, name, circuit)
@@ -209,7 +248,7 @@ class CatalogHandlers(object):
                     circuit = self.registry.get_index_by_name(name)
                     if "__fk_" in name:
                         raise LayoutError("Forbidden: cannot drop internal FK index")
-                    
+
                     family = self.registry.get_by_id(circuit.owner_id)
                     _remove_circuit_from_family(circuit, family)
                     self.registry.unregister_index(name, idx_id)

@@ -202,9 +202,9 @@ class ServerExecutor(object):
 
                 acc = cursor.get_accessor()
                 # Dep columns: 0: view_id, 1: dep_table_id, 2: dep_view_id
-                v_id = intmask(acc.get_int(0))
-                dep_tid = intmask(acc.get_int(1))
-                dep_vid = intmask(acc.get_int(2))
+                v_id    = intmask(r_uint64(acc.get_int(sys.DepTab.COL_VIEW_ID)))       # 1
+                dep_tid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)))  # 3
+                dep_vid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)))   # 2
 
                 if dep_tid == source_id or dep_vid == source_id:
                     if v_id not in res:
