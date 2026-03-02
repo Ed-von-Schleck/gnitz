@@ -67,9 +67,12 @@ class ReactiveStore(ZSetStore):
         return self.inner.get_schema()
 
     def ingest_batch(self, batch):
-        # The hook is called before the storage is touched.
-        self.on_ingest(batch)
+        # Commit the batch to the internal storage (SkipList/MemTable) first.
+        # This ensures that any cursors opened within the reactive 'on_ingest'
+        # handler can immediately see the new records without requiring an 
+        # explicit flush to disk.
         self.inner.ingest_batch(batch)
+        self.on_ingest(batch)
 
     def create_cursor(self):
         return self.inner.create_cursor()

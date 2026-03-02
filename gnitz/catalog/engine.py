@@ -156,14 +156,11 @@ class Engine(object):
 
         directory = self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
 
-        # CRITICAL: Column metadata must be flushed to disk BEFORE the table record.
-        # This ensures that when the reactive handler for the table record runs,
-        # it can successfully read the column definitions from the storage layer.
+        # Metadata records are written in sequence. Reactive handlers for the table
+        # record will be able to read the preceding column definitions from the
+        # system table's MemTable without requiring an explicit flush to disk.
         self._write_column_records(tid, sys.OWNER_KIND_TABLE, columns)
-        self.sys.columns.flush()
-
         self._write_table_record(tid, sid, table_name, directory, pk_col_idx, 0)
-        self.sys.tables.flush()
 
         self._advance_sequence(sys.SEQ_ID_TABLES, tid - 1, tid)
         family = self.registry.get(schema_name, table_name)
@@ -177,9 +174,7 @@ class Engine(object):
         self._check_for_dependencies(tid, table_name)
 
         self._retract_table_record(tid, family.schema_id, table_name, family.directory, family.pk_col_idx, 0)
-        self.sys.tables.flush()
         self._retract_column_records(tid, sys.OWNER_KIND_TABLE, family.schema.columns)
-        self.sys.columns.flush()
 
     def create_view(self, qualified_name, query_builder, sql_definition=""):
         schema_name, view_name = parse_qualified_name(qualified_name, "public")
@@ -191,19 +186,15 @@ class Engine(object):
         out_schema = query_builder.registers[query_builder.current_reg_idx].vm_schema.table_schema
         directory = self.base_dir + "/" + schema_name + "/view_" + view_name + "_" + str(vid)
 
-        # Metadata ordering as in create_table
+        # Dependency metadata must be written before the view record to ensure
+        # topological depth calculation works in the reactive handler.
         self._write_column_records(vid, sys.OWNER_KIND_VIEW, out_schema.columns)
-        self.sys.columns.flush()
 
         deps = self._extract_builder_dependencies(query_builder)
         self._write_view_deps(vid, deps)
-        self.sys.view_deps.flush()
 
         self._write_instruction_records(vid, query_builder.instructions)
-        self.sys.instructions.flush()
-
         self._write_view_record(vid, sid, view_name, sql_definition, directory, 0)
-        self.sys.views.flush()
 
         self._advance_sequence(sys.SEQ_ID_TABLES, vid - 1, vid)
         return self.registry.get(schema_name, view_name)
@@ -218,13 +209,9 @@ class Engine(object):
         instrs = self._read_view_instructions(vid)
 
         self._retract_view_record(vid, family.schema_id, view_name, "", family.directory, 0)
-        self.sys.views.flush()
         self._retract_instruction_records(vid, instrs)
-        self.sys.instructions.flush()
         self._retract_view_deps(vid, deps)
-        self.sys.view_deps.flush()
         self._retract_column_records(vid, sys.OWNER_KIND_VIEW, family.schema.columns)
-        self.sys.columns.flush()
 
     def create_index(self, qualified_owner_name, col_name, is_unique=False):
         schema_name, table_name = parse_qualified_name(qualified_owner_name, "public")
@@ -241,7 +228,6 @@ class Engine(object):
         index_id = self.registry.allocate_index_id()
         self._write_index_record(index_id, family.table_id, sys.OWNER_KIND_TABLE, 
                                  col_idx, index_name, int(is_unique), "")
-        self.sys.indices.flush()
         self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
         return self.registry.get_index_by_name(index_name)
 
@@ -255,7 +241,6 @@ class Engine(object):
             if self.registry.has_index_by_name(index_name): continue
             index_id = self.registry.allocate_index_id()
             self._write_index_record(index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx, index_name, 0, "")
-            self.sys.indices.flush()
             self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
 
     def drop_index(self, index_name):
@@ -263,7 +248,6 @@ class Engine(object):
         self._retract_index_record(circuit.index_id, circuit.owner_id, sys.OWNER_KIND_TABLE, 
                                    circuit.source_col_idx, circuit.name, int(circuit.is_unique), 
                                    circuit.cache_dir)
-        self.sys.indices.flush()
 
     def get_table(self, qualified_name):
         schema_name, table_name = parse_qualified_name(qualified_name, "public")

@@ -130,9 +130,9 @@ class CatalogHandlers(object):
 
                 col_defs = read_column_defs(self.sys_tables.columns, tid)
                 if len(col_defs) == 0:
-                    # FIX: If metadata is not yet visible, skip reactive registration.
-                    # It will be caught during the 'replay_catalog' phase of engine startup.
-                    os.write(1, " [WARN] Delaying registration for table '%s': columns not visible\n" % name)
+                    # If metadata is missing, we cannot register the family. This is
+                    # only expected if the WAL is corrupt or DDL was interrupted.
+                    os.write(1, " [ERROR] Cannot register table '%s': columns not found\n" % name)
                     continue
 
                 tbl_schema = TableSchema(col_defs, pk_col_idx)
@@ -178,7 +178,7 @@ class CatalogHandlers(object):
 
                 col_defs = read_column_defs(self.sys_tables.columns, vid)
                 if len(col_defs) == 0:
-                    os.write(1, " [WARN] Delaying registration for view '%s': columns not visible\n" % name)
+                    os.write(1, " [ERROR] Cannot register view '%s': columns not found\n" % name)
                     continue
 
                 tbl_schema = TableSchema(col_defs, pk_index=0)
@@ -194,13 +194,15 @@ class CatalogHandlers(object):
                 # view registered later can read this view's depth out of the
                 # registry and correctly compute its own depth.
                 #
-                # During live DDL: engine.create_view calls view_deps.flush()
-                # before writing the view record, so dep records are already in
-                # a flushed shard and visible to the cursor opened here.
+                # During live DDL: engine.create_view ingests dependency metadata
+                # into the system stores before the view record itself. Because 
+                # CatalogReactiveStore runs the handler AFTER the internal store 
+                # ingestion, the dependency records are visible in the MemTable 
+                # to the cursor opened by _compute_view_depth.
                 #
-                # During replay: the PersistentTable for view_deps is fully
-                # recovered from disk before any on_view_delta call is made,
-                # so the same guarantee holds.
+                # During replay: the system stores are fully re-hydrated from 
+                # disk before any reactive handlers are triggered, ensuring 
+                # global visibility.
                 family.depth = _compute_view_depth(
                     vid, self.sys_tables.view_deps, self.registry
                 )
