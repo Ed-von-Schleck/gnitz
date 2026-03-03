@@ -91,6 +91,8 @@ def _merge_indices(indices, batch, lo, mid, hi, scratch):
 class ArenaZSetBatch(object):
     """
     A zero-allocation DBSP Z-Set batch stored in raw memory arenas.
+    Operations like sort() and consolidate() are functional: they return 
+    a new batch if work is required, leaving the original untouched.
     """
 
     _immutable_fields_ = ["_schema", "record_stride"]
@@ -117,25 +119,14 @@ class ArenaZSetBatch(object):
 
     @staticmethod
     def from_buffers(schema, primary_buf, blob_buf, count, is_sorted=True):
-        """
-        Zero-copy factory for IPC transport.
-        Uses initial_capacity=0 to skip wasteful heap allocations.
-        """
+        """Zero-copy factory for IPC transport."""
         batch = ArenaZSetBatch(schema, initial_capacity=0)
-        
-        # Buffer views are already prepared by ipc.py
         batch.primary_arena = primary_buf
         batch.blob_arena = blob_buf
-        
-        # Synchronize offsets so future appends work correctly.
         batch.primary_arena.offset = count * batch.record_stride
-        
         batch._count = count
         batch._sorted = is_sorted
-        
-        # Re-initialize strategy with the correct buffer
         batch.allocator = BatchBlobAllocator(batch.blob_arena)
-        
         return batch
 
     def length(self):
@@ -154,7 +145,6 @@ class ArenaZSetBatch(object):
         self._sorted = False
 
     def free(self):
-        # buffer.free() now respects is_owned flags correctly.
         self.primary_arena.free()
         self.blob_arena.free()
 
@@ -256,32 +246,26 @@ class ArenaZSetBatch(object):
         return core_comparator.compare_rows(self._schema, self._cmp_acc_a, self._cmp_acc_b)
         
     def clone(self):
-        """
-        Creates a deep copy of the batch. 
-        The resulting batch owns its own memory arenas and is physically 
-        independent of the source.
-        """
-        # Allocate based on current count, minimum 8 to avoid zero-sized issues
+        """Creates a deep copy of the batch."""
         cap = self._count if self._count > 8 else 8
         new_batch = ArenaZSetBatch(self._schema, initial_capacity=cap)
-        
-        # We iterate and use append_from_accessor. 
-        # This is the safest way to "clone" because it handles the 
-        # relocation of strings/blobs into the new batch's blob arena.
         for i in range(self._count):
             new_batch.append_from_accessor(
                 self.get_pk(i),
                 self.get_weight(i),
                 self.get_accessor(i)
             )
-        
         new_batch._sorted = self._sorted
         return new_batch
 
     def sort(self):
+        """
+        Functional sort. Returns a new batch if sorting is needed,
+        otherwise returns self.
+        """
         if self._count <= 1 or self._sorted:
             self._sorted = True
-            return
+            return self
 
         indices = newlist_hint(self._count)
         scratch = newlist_hint(self._count)
@@ -291,10 +275,9 @@ class ArenaZSetBatch(object):
 
         _mergesort_indices(indices, self, 0, self._count, scratch)
 
-        # Sorting always produces an OWNED heap-allocated buffer.
-        new_primary = buffer.Buffer(self.primary_arena.capacity)
-        new_blob    = buffer.Buffer(self.blob_arena.capacity)
-        new_alloc   = BatchBlobAllocator(new_blob)
+        # Allocate new functional batch.
+        new_batch = ArenaZSetBatch(self._schema, initial_capacity=self._count)
+        new_alloc = new_batch.allocator
 
         old_blob_base = self.blob_arena.base_ptr
         has_varlen = self._schema.has_varlen
@@ -302,7 +285,7 @@ class ArenaZSetBatch(object):
         for i in range(self._count):
             old_idx  = indices[i]
             src_ptr  = self._get_rec_ptr(old_idx)
-            dest_ptr = new_primary.alloc(self.record_stride, alignment=16)
+            dest_ptr = new_batch.primary_arena.alloc(self.record_stride, alignment=16)
 
             if not has_varlen:
                 buffer.c_memmove(
@@ -325,33 +308,35 @@ class ArenaZSetBatch(object):
                 dest_payload = rffi.ptradd(dest_ptr, BATCH_REC_PAYLOAD_BASE)
                 self._raw_accessor.set_pointers(src_payload, old_blob_base, null_w)
                 serialize.serialize_row(self._schema, self._raw_accessor, dest_payload, new_alloc)
+            
+            new_batch._count += 1
 
-        self.primary_arena.free()
-        self.blob_arena.free()
-
-        self.primary_arena = new_primary
-        self.blob_arena    = new_blob
-        self.allocator     = BatchBlobAllocator(self.blob_arena)
-        self._sorted       = True
+        new_batch._sorted = True
+        return new_batch
 
     def consolidate(self):
+        """
+        Functional consolidation. Returns a new consolidated batch.
+        The intermediate sorted view is managed internally and freed 
+        if it was a temporary.
+        """
         if self._count == 0:
-            return
-        if not self._sorted:
-            self.sort()
+            return self
 
-        new_primary = buffer.Buffer(self.primary_arena.capacity)
-        new_blob    = buffer.Buffer(self.blob_arena.capacity)
-        new_alloc   = BatchBlobAllocator(new_blob)
-        new_count   = 0
+        # 1. Obtain a sorted view
+        sorted_view = self.sort()
+
+        # 2. Consolidate into a new batch
+        res = ArenaZSetBatch(self._schema, initial_capacity=sorted_view._count)
+        new_alloc   = res.allocator
+        has_varlen = self._schema.has_varlen
 
         acc_a = storage_comparator.RawWALAccessor(self._schema)
         acc_b = storage_comparator.RawWALAccessor(self._schema)
-        has_varlen = self._schema.has_varlen
 
         i = 0
-        while i < self._count:
-            ptr_i    = self._get_rec_ptr(i)
+        while i < sorted_view._count:
+            ptr_i    = sorted_view._get_rec_ptr(i)
             pk_i_lo  = rffi.cast(rffi.ULONGLONGP, ptr_i)[0]
             pk_i_hi  = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_i, 8))[0]
             weight_acc = rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr_i, BATCH_REC_WEIGHT_OFFSET))[0]
@@ -359,14 +344,13 @@ class ArenaZSetBatch(object):
 
             acc_a.set_pointers(
                 rffi.ptradd(ptr_i, BATCH_REC_PAYLOAD_BASE),
-                self.blob_arena.base_ptr,
+                sorted_view.blob_arena.base_ptr,
                 null_i,
             )
 
             j = i + 1
-            while j < self._count:
-                ptr_j = self._get_rec_ptr(j)
-
+            while j < sorted_view._count:
+                ptr_j = sorted_view._get_rec_ptr(j)
                 if rffi.cast(rffi.ULONGLONGP, ptr_j)[0] != pk_i_lo or \
                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_j, 8))[0] != pk_i_hi:
                     break
@@ -374,7 +358,7 @@ class ArenaZSetBatch(object):
                 null_j = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_j, BATCH_REC_NULL_OFFSET))[0]
                 acc_b.set_pointers(
                     rffi.ptradd(ptr_j, BATCH_REC_PAYLOAD_BASE),
-                    self.blob_arena.base_ptr,
+                    sorted_view.blob_arena.base_ptr,
                     null_j,
                 )
 
@@ -387,8 +371,7 @@ class ArenaZSetBatch(object):
                 j += 1
 
             if weight_acc != 0:
-                dest = new_primary.alloc(self.record_stride, alignment=16)
-
+                dest = res.primary_arena.alloc(self.record_stride, alignment=16)
                 if not has_varlen:
                     buffer.c_memmove(
                         rffi.cast(rffi.VOIDP, dest),
@@ -401,22 +384,49 @@ class ArenaZSetBatch(object):
                     rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = pk_i_hi
                     rffi.cast(rffi.LONGLONGP,  rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight_acc
                     rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, BATCH_REC_NULL_OFFSET))[0] = null_i
-
                     payload_dest = rffi.ptradd(dest, BATCH_REC_PAYLOAD_BASE)
                     serialize.serialize_row(self._schema, acc_a, payload_dest, new_alloc)
-                
-                new_count += 1
-
+                res._count += 1
             i = j
 
-        self.primary_arena.free()
-        self.blob_arena.free()
+        # 3. Clean up intermediate sorted view if it was a temporary
+        if sorted_view is not self:
+            sorted_view.free()
 
-        self.primary_arena = new_primary
-        self.blob_arena    = new_blob
-        self.allocator     = BatchBlobAllocator(self.blob_arena)
-        self._count        = new_count
-        self._sorted       = True
+        res._sorted = True
+        return res
+
+
+# ---------------------------------------------------------------------------
+# Scope Management (RAII-style for RPython)
+# ---------------------------------------------------------------------------
+
+class BatchScope(object):
+    """
+    Context manager base that ensures functional batch copies are 
+    properly freed at the end of an operator's execution scope.
+    """
+    def __init__(self, batch):
+        self.input = batch
+        self.output = None
+
+    def __enter__(self):
+        self.output = self.input
+        return self.output
+
+    def __exit__(self, etype, evalue, etb):
+        if self.output is not None and self.output is not self.input:
+            self.output.free()
+
+class SortedScope(BatchScope):
+    def __enter__(self):
+        self.output = self.input.sort()
+        return self.output
+
+class ConsolidatedScope(BatchScope):
+    def __enter__(self):
+        self.output = self.input.consolidate()
+        return self.output
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64
 
 from gnitz.core.comparator import RowAccessor
+from gnitz.core.batch import SortedScope
 
 """
 Bilinear Join Operators for the DBSP algebra.
@@ -180,45 +181,44 @@ def op_join_delta_delta(batch_a, batch_b, out_batch, schema_a, schema_b):
     schema_a:  TableSchema     — schema of batch_a
     schema_b:  TableSchema     — schema of batch_b
     """
-    batch_a.sort()
-    batch_b.sort()
+    with SortedScope(batch_a) as batch_a:
+        with SortedScope(batch_b) as batch_b:
+            composite_acc = CompositeAccessor(schema_a, schema_b)
 
-    composite_acc = CompositeAccessor(schema_a, schema_b)
+            idx_a = 0
+            idx_b = 0
+            n_a = batch_a.length()
+            n_b = batch_b.length()
 
-    idx_a = 0
-    idx_b = 0
-    n_a = batch_a.length()
-    n_b = batch_b.length()
+            while idx_a < n_a and idx_b < n_b:
+                key_a = batch_a.get_pk(idx_a)
+                key_b = batch_b.get_pk(idx_b)
 
-    while idx_a < n_a and idx_b < n_b:
-        key_a = batch_a.get_pk(idx_a)
-        key_b = batch_b.get_pk(idx_b)
+                if key_a < key_b:
+                    idx_a += 1
+                elif key_b < key_a:
+                    idx_b += 1
+                else:
+                    match_key = key_a
 
-        if key_a < key_b:
-            idx_a += 1
-        elif key_b < key_a:
-            idx_b += 1
-        else:
-            match_key = key_a
+                    start_a = idx_a
+                    while idx_a < n_a and batch_a.get_pk(idx_a) == match_key:
+                        idx_a += 1
 
-            start_a = idx_a
-            while idx_a < n_a and batch_a.get_pk(idx_a) == match_key:
-                idx_a += 1
+                    start_b = idx_b
+                    while idx_b < n_b and batch_b.get_pk(idx_b) == match_key:
+                        idx_b += 1
 
-            start_b = idx_b
-            while idx_b < n_b and batch_b.get_pk(idx_b) == match_key:
-                idx_b += 1
-
-            for i in range(start_a, idx_a):
-                wa = batch_a.get_weight(i)
-                if wa == r_int64(0):
-                    continue
-                for j in range(start_b, idx_b):
-                    wb = batch_b.get_weight(j)
-                    w_out = wa * wb
-                    if w_out != r_int64(0):
-                        composite_acc.set_accessors(
-                            batch_a.get_accessor(i),
-                            batch_b.get_accessor(j),
-                        )
-                        out_batch.append_from_accessor(match_key, w_out, composite_acc)
+                    for i in range(start_a, idx_a):
+                        wa = batch_a.get_weight(i)
+                        if wa == r_int64(0):
+                            continue
+                        for j in range(start_b, idx_b):
+                            wb = batch_b.get_weight(j)
+                            w_out = wa * wb
+                            if w_out != r_int64(0):
+                                composite_acc.set_accessors(
+                                    batch_a.get_accessor(i),
+                                    batch_b.get_accessor(j),
+                                )
+                                out_batch.append_from_accessor(match_key, w_out, composite_acc)

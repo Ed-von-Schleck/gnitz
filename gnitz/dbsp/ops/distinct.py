@@ -1,6 +1,7 @@
 # gnitz/dbsp/ops/distinct.py
 
 from rpython.rlib.rarithmetic import r_int64, intmask
+from gnitz.core.batch import ConsolidatedScope
 
 """
 Distinct Operator for the DBSP algebra.
@@ -32,38 +33,32 @@ def op_distinct(delta_batch, history_table, out_batch):
                                      I(δ_in) accumulated over all past ticks
     out_batch:     ArenaZSetBatch  — output destination (caller clears beforehand)
 
-    The delta_batch is consolidated in-place before processing so that
-    multiple updates to the same (key, payload) pair within a single tick
-    are algebraically summed before the history lookup.  This is required for
-    correctness: two +1 deltas for a record that was previously at weight 0
-    must produce exactly one +1 output, not two.
-
-    After producing the output, history_table is updated with the consolidated
-    delta so that future ticks see the correct accumulated weight.
+    The logic is wrapped in ConsolidatedScope, which ensures that delta_batch 
+    is sorted and consolidated before processing. If a new temporary batch 
+    is created during consolidation, it is automatically freed when exiting 
+    the 'with' block.
     """
-    if not delta_batch.is_sorted():
-        delta_batch.sort()
-    delta_batch.consolidate()
+    with ConsolidatedScope(delta_batch) as b:
+        n = b.length()
+        if n == 0:
+            return
 
-    n = delta_batch.length()
-    if n == 0:
-        return
+        for i in range(n):
+            key = b.get_pk(i)
+            w_delta = b.get_weight(i)
+            accessor = b.get_accessor(i)
 
-    for i in range(n):
-        key = delta_batch.get_pk(i)
-        w_delta = delta_batch.get_weight(i)
-        accessor = delta_batch.get_accessor(i)
+            w_old = history_table.get_weight(key, accessor)
 
-        w_old = history_table.get_weight(key, accessor)
+            # DBSP distinct converts a multiset to a set.
+            # An element is in the set (weight 1) if its accumulated weight is > 0, else 0.
+            s_old = 1 if w_old > r_int64(0) else 0
+            w_new = r_int64(intmask(w_old + w_delta))
+            s_new = 1 if w_new > r_int64(0) else 0
 
-        # DBSP distinct converts a multiset to a set.
-        # An element is in the set (weight 1) if its accumulated weight is > 0, else 0.
-        s_old = 1 if w_old > r_int64(0) else 0
-        w_new = r_int64(intmask(w_old + w_delta))
-        s_new = 1 if w_new > r_int64(0) else 0
+            out_w = s_new - s_old
+            if out_w != 0:
+                out_batch.append_from_accessor(key, r_int64(out_w), accessor)
 
-        out_w = s_new - s_old
-        if out_w != 0:
-            out_batch.append_from_accessor(key, r_int64(out_w), accessor)
-
-    history_table.ingest_batch(delta_batch)
+        # Update the history with the consolidated delta before the scope expires.
+        history_table.ingest_batch(b)
