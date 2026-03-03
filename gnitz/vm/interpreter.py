@@ -1,6 +1,7 @@
 # gnitz/vm/interpreter.py
 
 from rpython.rlib import jit
+from gnitz.core import batch
 from gnitz.dbsp import ops
 from gnitz.vm import instructions, runtime
 
@@ -62,7 +63,10 @@ def run_vm(program, reg_file, context):
             reg_t = instr.reg_trace
             reg_o = instr.reg_out
             assert reg_t is not None and reg_o is not None
-            ops.op_scan_trace(reg_t.cursor, reg_o.batch, instr.chunk_limit)
+            # Note: For chunked scanning, the VM logic assumes the register 
+            # is cleared before the first scan of a sequence.
+            writer = batch.BatchWriter(reg_o.batch)
+            ops.op_scan_trace(reg_t.cursor, writer, instr.chunk_limit)
 
         elif opcode == instructions.Instruction.SEEK_TRACE:
             reg_t = instr.reg_trace
@@ -78,7 +82,11 @@ def run_vm(program, reg_file, context):
             reg_in = instr.reg_in
             reg_out = instr.reg_out
             assert reg_in is not None and reg_out is not None
-            ops.op_filter(reg_in.batch, reg_out.batch, instr.func)
+            ops.op_filter(
+                reg_in.batch, 
+                batch.BatchWriter(reg_out.batch), 
+                instr.func
+            )
 
         elif opcode == instructions.Instruction.MAP:
             reg_in = instr.reg_in
@@ -86,7 +94,7 @@ def run_vm(program, reg_file, context):
             assert reg_in is not None and reg_out is not None
             ops.op_map(
                 reg_in.batch,
-                reg_out.batch,
+                batch.BatchWriter(reg_out.batch),
                 instr.func,
                 reg_out.vm_schema.table_schema
             )
@@ -95,7 +103,10 @@ def run_vm(program, reg_file, context):
             reg_in = instr.reg_in
             reg_out = instr.reg_out
             assert reg_in is not None and reg_out is not None
-            ops.op_negate(reg_in.batch, reg_out.batch)
+            ops.op_negate(
+                reg_in.batch, 
+                batch.BatchWriter(reg_out.batch)
+            )
 
         elif opcode == instructions.Instruction.UNION:
             reg_in_a = instr.reg_in_a
@@ -103,7 +114,11 @@ def run_vm(program, reg_file, context):
             reg_out = instr.reg_out
             assert reg_in_a is not None and reg_out is not None
             b_batch = reg_in_b.batch if reg_in_b is not None else None
-            ops.op_union(reg_in_a.batch, b_batch, reg_out.batch)
+            ops.op_union(
+                reg_in_a.batch, 
+                b_batch, 
+                batch.BatchWriter(reg_out.batch)
+            )
 
         # ── Non-Linear & Bilinear Opcodes (Stateful Logic) ──────────────
 
@@ -115,7 +130,7 @@ def run_vm(program, reg_file, context):
             ops.op_distinct(
                 reg_in.batch,
                 reg_history.table,
-                reg_out.batch
+                batch.BatchWriter(reg_out.batch)
             )
 
         elif opcode == instructions.Instruction.JOIN_DELTA_TRACE:
@@ -126,7 +141,7 @@ def run_vm(program, reg_file, context):
             ops.op_join_delta_trace(
                 reg_delta.batch,
                 reg_trace.cursor,
-                reg_out.batch,
+                batch.BatchWriter(reg_out.batch),
                 reg_delta.vm_schema.table_schema,
                 reg_trace.vm_schema.table_schema
             )
@@ -137,15 +152,21 @@ def run_vm(program, reg_file, context):
             reg_out = instr.reg_out
             assert reg_a is not None and reg_b is not None and reg_out is not None
             ops.op_join_delta_delta(
-                reg_a.batch, reg_b.batch, reg_out.batch,
-                reg_a.vm_schema.table_schema, reg_b.vm_schema.table_schema
+                reg_a.batch, 
+                reg_b.batch, 
+                batch.BatchWriter(reg_out.batch),
+                reg_a.vm_schema.table_schema, 
+                reg_b.vm_schema.table_schema
             )
 
         elif opcode == instructions.Instruction.DELAY:
             reg_in = instr.reg_in
             reg_out = instr.reg_out
             assert reg_in is not None and reg_out is not None
-            ops.op_delay(reg_in.batch, reg_out.batch)
+            ops.op_delay(
+                reg_in.batch, 
+                batch.BatchWriter(reg_out.batch)
+            )
 
         elif opcode == instructions.Instruction.INTEGRATE:
             reg_in = instr.reg_in
@@ -163,7 +184,7 @@ def run_vm(program, reg_file, context):
                 reg_in.vm_schema.table_schema,
                 trace_in_cursor,
                 reg_trace_out.cursor,
-                reg_out.batch,
+                batch.BatchWriter(reg_out.batch),
                 instr.group_by_cols,
                 instr.agg_func,
                 instr.output_schema,

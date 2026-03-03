@@ -6,7 +6,7 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core.values import PayloadRow, make_payload_row, _analyze_schema
-from gnitz.core import serialize, strings as string_logic
+from gnitz.core import serialize, strings as string_logic, errors
 from gnitz.core import comparator as core_comparator
 from gnitz.storage import buffer
 from gnitz.storage import comparator as storage_comparator
@@ -33,7 +33,8 @@ class BatchBlobAllocator(string_logic.BlobAllocator):
         for i in range(length):
             dest[i] = string_data[i]
         return r_uint64(
-            rffi.cast(lltype.Signed, dest) - rffi.cast(lltype.Signed, self.arena.base_ptr)
+            rffi.cast(lltype.Signed, dest)
+            - rffi.cast(lltype.Signed, self.arena.base_ptr)
         )
 
     def allocate_from_ptr(self, src_ptr, length):
@@ -44,13 +45,15 @@ class BatchBlobAllocator(string_logic.BlobAllocator):
             rffi.cast(rffi.SIZE_T, length),
         )
         return r_uint64(
-            rffi.cast(lltype.Signed, dest) - rffi.cast(lltype.Signed, self.arena.base_ptr)
+            rffi.cast(lltype.Signed, dest)
+            - rffi.cast(lltype.Signed, self.arena.base_ptr)
         )
 
 
 # ---------------------------------------------------------------------------
 # Mergesort Support (Raw Indices)
 # ---------------------------------------------------------------------------
+
 
 def _mergesort_indices(indices, batch, lo, hi, scratch):
     if hi - lo <= 1:
@@ -88,14 +91,15 @@ def _merge_indices(indices, batch, lo, mid, hi, scratch):
 # ArenaZSetBatch
 # ---------------------------------------------------------------------------
 
+
 class ArenaZSetBatch(object):
     """
     A zero-allocation DBSP Z-Set batch stored in raw memory arenas.
-    Operations like sort() and consolidate() are functional: they return 
-    a new batch if work is required, leaving the original untouched.
+    Operations like to_sorted() and to_consolidated() are functional: they
+    return a new batch if work is required, leaving the original untouched.
     """
 
-    _immutable_fields_ = ["_schema", "record_stride"]
+    _immutable_fields_ =["_schema", "record_stride"]
 
     def __init__(self, schema, initial_capacity=1024):
         self._schema = schema
@@ -116,6 +120,7 @@ class ArenaZSetBatch(object):
 
         self._count = 0
         self._sorted = False
+        self._freed = False
 
     @staticmethod
     def from_buffers(schema, primary_buf, blob_buf, count, is_sorted=True):
@@ -145,8 +150,11 @@ class ArenaZSetBatch(object):
         self._sorted = False
 
     def free(self):
+        if self._freed:
+            return
         self.primary_arena.free()
         self.blob_arena.free()
+        self._freed = True
 
     def _get_rec_ptr(self, i):
         return rffi.ptradd(self.primary_arena.base_ptr, i * self.record_stride)
@@ -170,33 +178,43 @@ class ArenaZSetBatch(object):
     def bind_raw_accessor(self, i, out_accessor):
         assert 0 <= i < self._count
         ptr = self._get_rec_ptr(i)
-        null_word = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, BATCH_REC_NULL_OFFSET))[0]
+        null_word = rffi.cast(
+            rffi.ULONGLONGP, rffi.ptradd(ptr, BATCH_REC_NULL_OFFSET)
+        )[0]
         payload_ptr = rffi.ptradd(ptr, BATCH_REC_PAYLOAD_BASE)
         out_accessor.set_pointers(payload_ptr, self.blob_arena.base_ptr, null_word)
 
     def get_row(self, i):
         assert 0 <= i < self._count
         ptr = self._get_rec_ptr(i)
-        null_word = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, BATCH_REC_NULL_OFFSET))[0]
+        null_word = rffi.cast(
+            rffi.ULONGLONGP, rffi.ptradd(ptr, BATCH_REC_NULL_OFFSET)
+        )[0]
         payload_ptr = rffi.ptradd(ptr, BATCH_REC_PAYLOAD_BASE)
         return serialize.deserialize_row(
             self._schema, payload_ptr, self.blob_arena.base_ptr, null_word
         )
 
     def append(self, pk, weight, row):
+        assert not self._freed
         self._row_accessor.set_row(row)
         self.append_from_accessor(pk, weight, self._row_accessor)
 
     def append_from_accessor(self, pk, weight, accessor):
+        assert not self._freed
         dest = self.primary_arena.alloc(self.record_stride, alignment=16)
 
         pk_u128 = r_uint128(pk)
-        rffi.cast(rffi.ULONGLONGP, dest)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(pk_u128))
+        rffi.cast(rffi.ULONGLONGP, dest)[0] = rffi.cast(
+            rffi.ULONGLONG, r_uint64(pk_u128)
+        )
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = rffi.cast(
             rffi.ULONGLONG, r_uint64(pk_u128 >> 64)
         )
 
-        rffi.cast(rffi.LONGLONGP, rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight
+        rffi.cast(rffi.LONGLONGP, rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[
+            0
+        ] = weight
 
         null_word = r_uint64(0)
         if isinstance(accessor, storage_comparator.RawWALAccessor):
@@ -212,7 +230,9 @@ class ArenaZSetBatch(object):
                     payload_idx = i if i < self._schema.pk_index else i - 1
                     null_word |= r_uint64(1) << payload_idx
 
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, BATCH_REC_NULL_OFFSET))[0] = null_word
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, BATCH_REC_NULL_OFFSET))[
+            0
+        ] = null_word
         payload_dest = rffi.ptradd(dest, BATCH_REC_PAYLOAD_BASE)
         serialize.serialize_row(self._schema, accessor, payload_dest, self.allocator)
 
@@ -225,13 +245,17 @@ class ArenaZSetBatch(object):
 
         ahi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_a, 8))[0]
         bhi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_b, 8))[0]
-        if ahi < bhi: return -1
-        if ahi > bhi: return 1
+        if ahi < bhi:
+            return -1
+        if ahi > bhi:
+            return 1
 
         alo = rffi.cast(rffi.ULONGLONGP, ptr_a)[0]
         blo = rffi.cast(rffi.ULONGLONGP, ptr_b)[0]
-        if alo < blo: return -1
-        if alo > blo: return 1
+        if alo < blo:
+            return -1
+        if alo > blo:
+            return 1
 
         na = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_a, BATCH_REC_NULL_OFFSET))[0]
         nb = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_b, BATCH_REC_NULL_OFFSET))[0]
@@ -243,22 +267,22 @@ class ArenaZSetBatch(object):
             rffi.ptradd(ptr_b, BATCH_REC_PAYLOAD_BASE), self.blob_arena.base_ptr, nb
         )
 
-        return core_comparator.compare_rows(self._schema, self._cmp_acc_a, self._cmp_acc_b)
-        
+        return core_comparator.compare_rows(
+            self._schema, self._cmp_acc_a, self._cmp_acc_b
+        )
+
     def clone(self):
         """Creates a deep copy of the batch."""
         cap = self._count if self._count > 8 else 8
         new_batch = ArenaZSetBatch(self._schema, initial_capacity=cap)
         for i in range(self._count):
             new_batch.append_from_accessor(
-                self.get_pk(i),
-                self.get_weight(i),
-                self.get_accessor(i)
+                self.get_pk(i), self.get_weight(i), self.get_accessor(i)
             )
         new_batch._sorted = self._sorted
         return new_batch
 
-    def sort(self):
+    def to_sorted(self):
         """
         Functional sort. Returns a new batch if sorting is needed,
         otherwise returns self.
@@ -283,52 +307,62 @@ class ArenaZSetBatch(object):
         has_varlen = self._schema.has_varlen
 
         for i in range(self._count):
-            old_idx  = indices[i]
-            src_ptr  = self._get_rec_ptr(old_idx)
+            old_idx = indices[i]
+            src_ptr = self._get_rec_ptr(old_idx)
             dest_ptr = new_batch.primary_arena.alloc(self.record_stride, alignment=16)
 
             if not has_varlen:
                 buffer.c_memmove(
                     rffi.cast(rffi.VOIDP, dest_ptr),
                     rffi.cast(rffi.VOIDP, src_ptr),
-                    rffi.cast(rffi.SIZE_T, self.record_stride)
+                    rffi.cast(rffi.SIZE_T, self.record_stride),
                 )
             else:
-                pk_lo   = rffi.cast(rffi.ULONGLONGP, src_ptr)[0]
-                pk_hi   = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
-                weight  = rffi.cast(rffi.LONGLONGP,  rffi.ptradd(src_ptr, BATCH_REC_WEIGHT_OFFSET))[0]
-                null_w  = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, BATCH_REC_NULL_OFFSET))[0]
+                pk_lo = rffi.cast(rffi.ULONGLONGP, src_ptr)[0]
+                pk_hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
+                weight = rffi.cast(
+                    rffi.LONGLONGP, rffi.ptradd(src_ptr, BATCH_REC_WEIGHT_OFFSET)
+                )[0]
+                null_w = rffi.cast(
+                    rffi.ULONGLONGP, rffi.ptradd(src_ptr, BATCH_REC_NULL_OFFSET)
+                )[0]
 
                 rffi.cast(rffi.ULONGLONGP, dest_ptr)[0] = pk_lo
                 rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, 8))[0] = pk_hi
-                rffi.cast(rffi.LONGLONGP,  rffi.ptradd(dest_ptr, BATCH_REC_WEIGHT_OFFSET))[0] = weight
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, BATCH_REC_NULL_OFFSET))[0] = null_w
+                rffi.cast(
+                    rffi.LONGLONGP, rffi.ptradd(dest_ptr, BATCH_REC_WEIGHT_OFFSET)
+                )[0] = weight
+                rffi.cast(
+                    rffi.ULONGLONGP, rffi.ptradd(dest_ptr, BATCH_REC_NULL_OFFSET)
+                )[0] = null_w
 
-                src_payload  = rffi.ptradd(src_ptr,  BATCH_REC_PAYLOAD_BASE)
+                src_payload = rffi.ptradd(src_ptr, BATCH_REC_PAYLOAD_BASE)
                 dest_payload = rffi.ptradd(dest_ptr, BATCH_REC_PAYLOAD_BASE)
                 self._raw_accessor.set_pointers(src_payload, old_blob_base, null_w)
-                serialize.serialize_row(self._schema, self._raw_accessor, dest_payload, new_alloc)
-            
+                serialize.serialize_row(
+                    self._schema, self._raw_accessor, dest_payload, new_alloc
+                )
+
             new_batch._count += 1
 
         new_batch._sorted = True
         return new_batch
 
-    def consolidate(self):
+    def to_consolidated(self):
         """
         Functional consolidation. Returns a new consolidated batch.
-        The intermediate sorted view is managed internally and freed 
+        The intermediate sorted view is managed internally and freed
         if it was a temporary.
         """
         if self._count == 0:
             return self
 
         # 1. Obtain a sorted view
-        sorted_view = self.sort()
+        sorted_view = self.to_sorted()
 
         # 2. Consolidate into a new batch
         res = ArenaZSetBatch(self._schema, initial_capacity=sorted_view._count)
-        new_alloc   = res.allocator
+        new_alloc = res.allocator
         has_varlen = self._schema.has_varlen
 
         acc_a = storage_comparator.RawWALAccessor(self._schema)
@@ -336,11 +370,15 @@ class ArenaZSetBatch(object):
 
         i = 0
         while i < sorted_view._count:
-            ptr_i    = sorted_view._get_rec_ptr(i)
-            pk_i_lo  = rffi.cast(rffi.ULONGLONGP, ptr_i)[0]
-            pk_i_hi  = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_i, 8))[0]
-            weight_acc = rffi.cast(rffi.LONGLONGP, rffi.ptradd(ptr_i, BATCH_REC_WEIGHT_OFFSET))[0]
-            null_i   = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_i, BATCH_REC_NULL_OFFSET))[0]
+            ptr_i = sorted_view._get_rec_ptr(i)
+            pk_i_lo = rffi.cast(rffi.ULONGLONGP, ptr_i)[0]
+            pk_i_hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_i, 8))[0]
+            weight_acc = rffi.cast(
+                rffi.LONGLONGP, rffi.ptradd(ptr_i, BATCH_REC_WEIGHT_OFFSET)
+            )[0]
+            null_i = rffi.cast(
+                rffi.ULONGLONGP, rffi.ptradd(ptr_i, BATCH_REC_NULL_OFFSET)
+            )[0]
 
             acc_a.set_pointers(
                 rffi.ptradd(ptr_i, BATCH_REC_PAYLOAD_BASE),
@@ -351,11 +389,15 @@ class ArenaZSetBatch(object):
             j = i + 1
             while j < sorted_view._count:
                 ptr_j = sorted_view._get_rec_ptr(j)
-                if rffi.cast(rffi.ULONGLONGP, ptr_j)[0] != pk_i_lo or \
-                   rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_j, 8))[0] != pk_i_hi:
+                if (
+                    rffi.cast(rffi.ULONGLONGP, ptr_j)[0] != pk_i_lo
+                    or rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_j, 8))[0] != pk_i_hi
+                ):
                     break
 
-                null_j = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr_j, BATCH_REC_NULL_OFFSET))[0]
+                null_j = rffi.cast(
+                    rffi.ULONGLONGP, rffi.ptradd(ptr_j, BATCH_REC_NULL_OFFSET)
+                )[0]
                 acc_b.set_pointers(
                     rffi.ptradd(ptr_j, BATCH_REC_PAYLOAD_BASE),
                     sorted_view.blob_arena.base_ptr,
@@ -376,16 +418,24 @@ class ArenaZSetBatch(object):
                     buffer.c_memmove(
                         rffi.cast(rffi.VOIDP, dest),
                         rffi.cast(rffi.VOIDP, ptr_i),
-                        rffi.cast(rffi.SIZE_T, self.record_stride)
+                        rffi.cast(rffi.SIZE_T, self.record_stride),
                     )
-                    rffi.cast(rffi.LONGLONGP, rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight_acc
+                    rffi.cast(
+                        rffi.LONGLONGP, rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET)
+                    )[0] = weight_acc
                 else:
                     rffi.cast(rffi.ULONGLONGP, dest)[0] = pk_i_lo
                     rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = pk_i_hi
-                    rffi.cast(rffi.LONGLONGP,  rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET))[0] = weight_acc
-                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, BATCH_REC_NULL_OFFSET))[0] = null_i
+                    rffi.cast(
+                        rffi.LONGLONGP, rffi.ptradd(dest, BATCH_REC_WEIGHT_OFFSET)
+                    )[0] = weight_acc
+                    rffi.cast(
+                        rffi.ULONGLONGP, rffi.ptradd(dest, BATCH_REC_NULL_OFFSET)
+                    )[0] = null_i
                     payload_dest = rffi.ptradd(dest, BATCH_REC_PAYLOAD_BASE)
-                    serialize.serialize_row(self._schema, acc_a, payload_dest, new_alloc)
+                    serialize.serialize_row(
+                        self._schema, acc_a, payload_dest, new_alloc
+                    )
                 res._count += 1
             i = j
 
@@ -398,14 +448,50 @@ class ArenaZSetBatch(object):
 
 
 # ---------------------------------------------------------------------------
+# Output Capability Security
+# ---------------------------------------------------------------------------
+
+
+class BatchWriter(object):
+    """
+    A strictly write-only facade for an output register.
+    Guarantees the destination is empty upon creation and restricts the API
+    to prevent operators from accidentally reading or mutating existing data.
+    """
+
+    _immutable_fields_ =["_batch"]
+
+    def __init__(self, batch):
+        if batch.length() != 0:
+            raise errors.StorageError(
+                "FATAL: Operator output register is not empty. "
+                "The VM must clear destination registers before evaluation."
+            )
+        self._batch = batch
+
+    def get_schema(self):
+        """Returns the schema expected by this destination batch."""
+        return self._batch._schema
+
+    @jit.unroll_safe
+    def append_from_accessor(self, pk, weight, accessor):
+        self._batch.append_from_accessor(pk, weight, accessor)
+
+    def append(self, pk, weight, row):
+        self._batch.append(pk, weight, row)
+
+
+# ---------------------------------------------------------------------------
 # Scope Management (RAII-style for RPython)
 # ---------------------------------------------------------------------------
 
+
 class BatchScope(object):
     """
-    Context manager base that ensures functional batch copies are 
+    Context manager base that ensures functional batch copies are
     properly freed at the end of an operator's execution scope.
     """
+
     def __init__(self, batch):
         self.input = batch
         self.output = None
@@ -418,14 +504,16 @@ class BatchScope(object):
         if self.output is not None and self.output is not self.input:
             self.output.free()
 
+
 class SortedScope(BatchScope):
     def __enter__(self):
-        self.output = self.input.sort()
+        self.output = self.input.to_sorted()
         return self.output
+
 
 class ConsolidatedScope(BatchScope):
     def __enter__(self):
-        self.output = self.input.consolidate()
+        self.output = self.input.to_consolidated()
         return self.output
 
 
@@ -434,6 +522,7 @@ class ConsolidatedScope(BatchScope):
 # ---------------------------------------------------------------------------
 
 ZSetBatch = ArenaZSetBatch
+
 
 def make_singleton_batch(schema, pk, weight, row):
     batch = ZSetBatch(schema)

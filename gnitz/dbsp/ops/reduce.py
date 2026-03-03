@@ -7,9 +7,9 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
-from gnitz.core import types, strings, xxh
+from gnitz.core import types, strings, xxh, errors
 from gnitz.core.comparator import RowAccessor
-from gnitz.core.batch import ConsolidatedScope
+from gnitz.core.batch import ConsolidatedScope, BatchWriter
 from gnitz.storage.comparator import RawWALAccessor
 from gnitz.dbsp.functions import NULL_AGGREGATE
 
@@ -17,12 +17,15 @@ from gnitz.dbsp.functions import NULL_AGGREGATE
 Non-linear Reduce Operator for the DBSP algebra.
 
 Implements incremental GROUP BY + aggregation.
+Formula: δ_out = Agg(history + δ_in) - Agg(history).
 """
 
 
 class ReduceAccessor(RowAccessor):
     """
     Virtual RowAccessor that assembles one output record for the REDUCE operator.
+    Mapps output column indices to either the group exemplar columns or 
+    the result of the aggregate function.
     """
 
     _immutable_fields_ = [
@@ -39,6 +42,7 @@ class ReduceAccessor(RowAccessor):
         mapping = [0] * num_out
 
         pk_code = output_schema.columns[0].field_type.code
+        # A 'natural' PK is used if we group by a single U64/U128 column.
         use_natural_pk = (
             len(group_indices) == 1
             and output_schema.pk_index == 0
@@ -50,22 +54,23 @@ class ReduceAccessor(RowAccessor):
 
         if use_natural_pk:
             mapping[0] = group_indices[0]
-            mapping[1] = -1
+            mapping[1] = -1  # -1 represents the aggregate column
         else:
-            mapping[0] = -2
+            mapping[0] = -2  # -2 represents the synthetic PK (group hash)
             for i in range(len(group_indices)):
                 mapping[i + 1] = group_indices[i]
             mapping[num_out - 1] = -1
 
         self.mapping_to_input = mapping
 
-        # Initialize to Null Object to satisfy annotator
+        # Mutable state for context switching during iteration
         self.exemplar = None 
         self.agg_func = NULL_AGGREGATE
         self.old_val_bits = r_uint64(0)
         self.use_old_val = False
 
     def set_context(self, exemplar, agg_func, old_val_bits, use_old_val):
+        """Prepares the accessor to represent a specific group output."""
         self.exemplar = exemplar
         if agg_func is not None:
             self.agg_func = agg_func
@@ -102,9 +107,8 @@ class ReduceAccessor(RowAccessor):
     def get_int_signed(self, col_idx):
         src = self.mapping_to_input[col_idx]
         if src == -1:
-            if self.use_old_val:
-                return rffi.cast(rffi.LONGLONG, self.old_val_bits)
-            return rffi.cast(rffi.LONGLONG, self.agg_func.get_value_bits())
+            bits = self.old_val_bits if self.use_old_val else self.agg_func.get_value_bits()
+            return rffi.cast(rffi.LONGLONG, bits)
         if src < 0:
             return r_int64(0)
         if self.exemplar is not None:
@@ -115,9 +119,8 @@ class ReduceAccessor(RowAccessor):
     def get_float(self, col_idx):
         src = self.mapping_to_input[col_idx]
         if src == -1:
-            if self.use_old_val:
-                return longlong2float(rffi.cast(rffi.LONGLONG, self.old_val_bits))
-            return longlong2float(rffi.cast(rffi.LONGLONG, self.agg_func.get_value_bits()))
+            bits = self.old_val_bits if self.use_old_val else self.agg_func.get_value_bits()
+            return longlong2float(rffi.cast(rffi.LONGLONG, bits))
         if src < 0:
             return 0.0
         if self.exemplar is not None:
@@ -205,6 +208,8 @@ def _argsort_delta(batch, schema, col_indices):
     acc_a = RawWALAccessor(schema)
     acc_b = RawWALAccessor(schema)
 
+    # Insertion sort for small deltas; should be replaced by merge sort
+    # if large unindexed deltas become common.
     for i in range(1, count):
         j = i
         while j > 0:
@@ -222,6 +227,7 @@ def _argsort_delta(batch, schema, col_indices):
 
 @jit.unroll_safe
 def _extract_group_key(accessor, schema, col_indices):
+    """Computes a 128-bit key identifying the group."""
     if len(col_indices) == 1:
         c_idx = col_indices[0]
         t = schema.columns[c_idx].field_type.code
@@ -241,6 +247,7 @@ def _extract_group_key(accessor, schema, col_indices):
             h_lo ^= xxh.compute_checksum_bytes(s)
         else:
             h_lo ^= accessor.get_int(c_idx)
+        # Simple mixing to form 128-bit composite key
         h_hi = (h_hi << 1) | (h_lo >> 63)
     return (r_uint128(h_hi) << 64) | r_uint128(h_lo)
 
@@ -255,7 +262,7 @@ def op_reduce(
     input_schema,
     trace_in_cursor,
     trace_out_cursor,
-    out_batch,
+    out_writer,
     group_by_cols,
     agg_func,
     output_schema,
@@ -263,23 +270,28 @@ def op_reduce(
     """
     Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
     """
-    # Use ConsolidatedScope to ensure delta_in is sorted/consolidated safely.
+    if agg_func is None:
+        return
+
+    # 1. Obtain a consolidated view of the input delta
     with ConsolidatedScope(delta_in) as b:
         n = b.length()
-        if n == 0 or agg_func is None:
+        if n == 0:
             return
 
-        # 1. Grouping
+        # 2. Grouping
         group_by_pk = (
             len(group_by_cols) == 1
             and group_by_cols[0] == input_schema.pk_index
         )
 
         if group_by_pk:
+            # Batch is already sorted by PK
             sorted_indices = newlist_hint(n)
             for i in range(n):
                 sorted_indices.append(i)
         else:
+            # Sort the delta by the requested group columns
             sorted_indices = _argsort_delta(b, input_schema, group_by_cols)
 
         acc_in = RawWALAccessor(input_schema)
@@ -298,7 +310,7 @@ def op_reduce(
             else:
                 group_key = _extract_group_key(acc_exemplar, input_schema, group_by_cols)
 
-            # 2. Delta Contribution
+            # 3. Calculate Delta contribution for this group
             agg_func.reset()
             while idx < n:
                 curr_idx = sorted_indices[idx]
@@ -314,7 +326,7 @@ def op_reduce(
                 agg_func.step(acc_in, b.get_weight(curr_idx))
                 idx += 1
 
-            # 3. Retraction
+            # 4. Retraction: Agg(history)
             trace_out_cursor.seek(group_key)
             has_old = False
             old_val_bits = r_uint64(0)
@@ -323,13 +335,16 @@ def op_reduce(
                 agg_col_idx = len(output_schema.columns) - 1
                 old_val_bits = trace_out_cursor.get_accessor().get_int(agg_col_idx)
 
+                # Emit retraction of the previous aggregate value
                 reduce_acc.set_context(acc_exemplar, agg_func, old_val_bits, True)
-                out_batch.append_from_accessor(group_key, r_int64(-1), reduce_acc)
+                out_writer.append_from_accessor(group_key, r_int64(-1), reduce_acc)
 
-            # 4. New Value Calculation
+            # 5. New Value Calculation: Agg(history + delta)
             if agg_func.is_linear() and has_old:
+                # Optimized path for SUM/COUNT: Agg(H+D) = Agg(H) + Agg(D)
                 agg_func.merge_accumulated(old_val_bits, r_int64(1))
-            elif not agg_func.is_linear():
+            else:
+                # Non-linear path (MIN/MAX): must replay full history + current delta
                 agg_func.reset()
                 if trace_in_cursor is not None:
                     trace_in_cursor.seek(group_key)
@@ -337,16 +352,13 @@ def op_reduce(
                         agg_func.step(trace_in_cursor.get_accessor(), trace_in_cursor.weight())
                         trace_in_cursor.advance()
                 
+                # Apply current tick's contribution
                 for k in range(group_start_pos, idx):
                     d_idx = sorted_indices[k]
                     b.bind_raw_accessor(d_idx, acc_in)
                     agg_func.step(acc_in, b.get_weight(d_idx))
 
-            # 5. Emission
+            # 6. Emission: +1 Agg(history + delta)
             if not agg_func.is_accumulator_zero():
                 reduce_acc.set_context(acc_exemplar, agg_func, r_uint64(0), False)
-                out_batch.append_from_accessor(group_key, r_int64(1), reduce_acc)
-
-    # Note: We do not sort/consolidate out_batch here. The functional sort 
-    # would return a new instance that would be lost. The consumer of this 
-    # batch is responsible for using a Scope if they require a sorted view.
+                out_writer.append_from_accessor(group_key, r_int64(1), reduce_acc)

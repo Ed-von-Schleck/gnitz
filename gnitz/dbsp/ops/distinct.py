@@ -1,7 +1,7 @@
 # gnitz/dbsp/ops/distinct.py
 
 from rpython.rlib.rarithmetic import r_int64, intmask
-from gnitz.core.batch import ConsolidatedScope
+from gnitz.core.batch import ConsolidatedScope, BatchWriter
 
 """
 Distinct Operator for the DBSP algebra.
@@ -24,14 +24,14 @@ history_table, which is an AbstractTable acting as the operator's trace.
 """
 
 
-def op_distinct(delta_batch, history_table, out_batch):
+def op_distinct(delta_batch, history_table, out_writer):
     """
     DBSP Distinct: converts multiset deltas into set-membership deltas.
 
     delta_batch:   ArenaZSetBatch  — consolidated input delta for this tick
-    history_table: AbstractTable   — persistent trace holding the running sum
+    history_table: ZSetStore       — persistent trace holding the running sum
                                      I(δ_in) accumulated over all past ticks
-    out_batch:     ArenaZSetBatch  — output destination (caller clears beforehand)
+    out_writer:    BatchWriter     — strictly write-only destination
 
     The logic is wrapped in ConsolidatedScope, which ensures that delta_batch 
     is sorted and consolidated before processing. If a new temporary batch 
@@ -52,13 +52,26 @@ def op_distinct(delta_batch, history_table, out_batch):
 
             # DBSP distinct converts a multiset to a set.
             # An element is in the set (weight 1) if its accumulated weight is > 0, else 0.
-            s_old = 1 if w_old > r_int64(0) else 0
+            # In intermediate nodes, weights can be negative, so we use sign logic.
+            s_old = 0
+            if w_old > r_int64(0):
+                s_old = 1
+            elif w_old < r_int64(0):
+                s_old = -1
+
+            # Algebraic summation with RPython machine-word truncation
             w_new = r_int64(intmask(w_old + w_delta))
-            s_new = 1 if w_new > r_int64(0) else 0
+            
+            s_new = 0
+            if w_new > r_int64(0):
+                s_new = 1
+            elif w_new < r_int64(0):
+                s_new = -1
 
             out_w = s_new - s_old
             if out_w != 0:
-                out_batch.append_from_accessor(key, r_int64(out_w), accessor)
+                out_writer.append_from_accessor(key, r_int64(out_w), accessor)
 
         # Update the history with the consolidated delta before the scope expires.
+        # This reflects history_table = I(δ_in)
         history_table.ingest_batch(b)

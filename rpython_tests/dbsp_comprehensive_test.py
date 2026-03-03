@@ -86,6 +86,7 @@ def test_linear_ops(base_dir):
     b_mapped = None
     b_neg = batch.ArenaZSetBatch(schema)
     b_union = batch.ArenaZSetBatch(schema)
+    b_delay = None
 
     try:
         # 1. Null handling in Filter/Map
@@ -124,8 +125,10 @@ def test_linear_ops(base_dir):
         log("  - Negate & Union...")
         linear.op_negate(b_in, b_neg)
         linear.op_union(b_in, b_neg, b_union)
-        b_union.consolidate()
-        assert_equal_i(0, b_union.length(), "Union/Negate failed to annihilate")
+
+        # Functional consolidation: we must use the result or a Scope to avoid leaks
+        with batch.ConsolidatedScope(b_union) as b_union_cons:
+            assert_equal_i(0, b_union_cons.length(), "Union/Negate failed to annihilate")
 
         log("  - Delay & Integrate...")
         b_delay = batch.ArenaZSetBatch(schema)
@@ -137,7 +140,6 @@ def test_linear_ops(base_dir):
         linear.op_integrate(b_in, sink)
         assert_true(sink.has_pk(r_uint128(1)), "Integrate failed to sink data")
         sink.close()
-        b_delay.free()
 
     finally:
         b_in.free()
@@ -146,6 +148,8 @@ def test_linear_ops(base_dir):
             b_mapped.free()
         b_neg.free()
         b_union.free()
+        if b_delay:
+            b_delay.free()
 
 
 def test_join_ops(base_dir):
@@ -197,16 +201,16 @@ def test_join_ops(base_dir):
         b_out.clear()
         trace_path = os.path.join(base_dir, "j_trace")
         trace_r = EphemeralTable(trace_path, "tr", schema_r)
-        
+
         # Ingest the 3 rows. Because the strings differ, they won't be consolidated.
         trace_r.ingest_batch(b_r)
 
         cursor_r = trace_r.create_cursor()
         join.op_join_delta_trace(b_l, cursor_r, b_out, schema_l, schema_r)
         cursor_r.close()
-        
+
         assert_equal_i(6, b_out.length(), "Delta-Trace Join failed")
-        
+
         # Verify the weight multiplication still holds
         for i in range(b_out.length()):
             assert_equal_i64(r_int64(1), b_out.get_weight(i), "Join weight error")
@@ -309,8 +313,9 @@ def test_reduce_op(base_dir):
         c_out = trace_out.create_cursor()
 
         reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], sum_agg, out_schema)
-        b_out.consolidate()
-        assert_equal_i(2, b_out.length(), "Incremental reduce failed to retract")
+
+        with batch.ConsolidatedScope(b_out) as b_out_cons:
+            assert_equal_i(2, b_out_cons.length(), "Incremental reduce failed to retract")
 
         log("  - Non-linear Max (History Replay)...")
         max_agg = functions.UniversalAccumulator(1, functions.AGG_MAX, types.TYPE_I64)
@@ -326,7 +331,9 @@ def test_reduce_op(base_dir):
         found_max = False
         for i in range(b_out.length()):
             if b_out.get_weight(i) == r_int64(1):
-                assert_equal_i64(r_int64(100), b_out.get_row(i).get_int_signed(0), "Max error")
+                assert_equal_i64(
+                    r_int64(100), b_out.get_row(i).get_int_signed(0), "Max error"
+                )
                 found_max = True
         assert_true(found_max, "Max insertion not found")
 
@@ -356,6 +363,9 @@ def test_source_ops(base_dir):
 
     b_out = batch.ArenaZSetBatch(schema)
     cursor = table.create_cursor()
+
+    # Per AbstractCursor protocol, cursors must be seeked before scanning.
+    source.op_seek_trace(cursor, r_uint128(0))
 
     # Scan in chunks of 3
     n1 = source.op_scan_trace(cursor, b_out, 3)
