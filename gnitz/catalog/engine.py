@@ -1,11 +1,11 @@
 # gnitz/catalog/engine.py
 
 import os
-from rpython.rlib import rposix, rposix_stat
+from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import r_uint64, intmask, r_ulonglonglong as r_uint128
 from rpython.rlib.objectmodel import newlist_hint
 
-from gnitz.core.types import TableSchema, ColumnDefinition
+from gnitz.core.types import ColumnDefinition
 from gnitz.core.errors import LayoutError
 from gnitz.core.batch import ZSetBatch
 from gnitz.catalog.program_cache import ProgramCache
@@ -31,14 +31,14 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     """
     Public factory to open a GnitzDB instance.
     """
-    os.write(1, " -> 1. ensure_dir(base_dir)\n")
+    rposix.write(1, " -> 1. ensure_dir(base_dir)\n")
     ensure_dir(base_dir)
 
     sys_dir = base_dir + "/" + sys.SYS_CATALOG_DIRNAME
-    os.write(1, " -> 2. ensure_dir(sys_dir)\n")
+    rposix.write(1, " -> 2. ensure_dir(sys_dir)\n")
     ensure_dir(sys_dir)
 
-    os.write(1, " -> 3. make_system_tables\n")
+    rposix.write(1, " -> 3. make_system_tables\n")
     sys_tables = make_system_tables(base_dir)
 
     tmp_cursor = sys_tables.tables.create_cursor()
@@ -46,7 +46,7 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     tmp_cursor.close()
 
     if is_new:
-        os.write(1, " -> 4. bootstrap_system_tables (Fresh Instance)\n")
+        rposix.write(1, " -> 4. bootstrap_system_tables (Fresh Instance)\n")
         bootstrap_system_tables(sys_tables, base_dir)
 
     registry = EntityRegistry()
@@ -54,15 +54,15 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     handlers = CatalogHandlers(registry, sys_tables, base_dir, program_cache)
     bootstrapper = CatalogBootstrapper(registry, sys_tables, base_dir)
 
-    os.write(1, " -> 5. recover_system_state (Counters)\n")
+    rposix.write(1, " -> 5. recover_system_state (Counters)\n")
     bootstrapper.recover_system_state()
 
     engine = Engine(base_dir, sys_tables, registry, handlers, program_cache)
 
-    os.write(1, " -> 6. wire_reactivity\n")
+    rposix.write(1, " -> 6. wire_reactivity\n")
     engine._wire_reactivity()
 
-    os.write(1, " -> 7. replay_catalog (Logical Recovery)\n")
+    rposix.write(1, " -> 7. replay_catalog (Logical Recovery)\n")
     bootstrapper.replay_catalog(handlers)
 
     return engine
@@ -172,9 +172,7 @@ class Engine(object):
                 columns[col_idx], col_idx, self.registry, tid, pk_col_idx, self_pk_type
             )
 
-        directory = (
-            self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
-        )
+        directory = self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
 
         self._write_column_records(tid, sys.OWNER_KIND_TABLE, columns)
         self._write_table_record(tid, sid, table_name, directory, pk_col_idx, 0)
@@ -197,40 +195,57 @@ class Engine(object):
 
     def create_view(self, qualified_name, graph, sql_definition=""):
         """
-        Creates a reactive view from a CircuitGraph produced by CircuitBuilder.build().
+        Creates a reactive view from a CircuitGraph.
 
-        graph: CircuitGraph — carries output_col_defs, dependencies, and the
-               five circuit table payloads (nodes, edges, sources, params,
-               group_cols).
+        Dry-run validates the graph's structure and dependencies before
+        persisting metadata to the system catalog.
         """
         schema_name, view_name = parse_qualified_name(qualified_name, "public")
+        validate_user_identifier(schema_name)
+        validate_user_identifier(view_name)
+
         if self.registry.has(schema_name, view_name):
-            raise LayoutError("View/Table already exists")
+            raise LayoutError("View/Table already exists: %s" % qualified_name)
+
+        # 1. Fail-fast validation (Dry-Run Compilation)
+        # Ensure the graph is a valid DAG with a sink and clear primary input.
+        self.program_cache.validate_graph_structure(graph)
+
+        # 2. Relational Integrity Validation
+        # Verify that the primary source exists in the registry.
+        if not self.registry.has_id(graph.primary_source_id):
+            raise LayoutError(
+                "Primary source %d for view does not exist" % graph.primary_source_id
+            )
+
+        # Verify secondary dependencies (scans).
+        for dep_id in graph.dependencies:
+            if not self.registry.has_id(dep_id):
+                raise LayoutError("Secondary dependency %d does not exist" % dep_id)
 
         vid = self.registry.allocate_table_id()
         sid = self.registry.get_schema_id(schema_name)
         directory = (
-            self.base_dir
-            + "/"
-            + schema_name
-            + "/view_"
-            + view_name
-            + "_"
-            + str(vid)
+            self.base_dir + "/" + schema_name + "/view_" + view_name + "_" + str(vid)
         )
 
-        # 1. Column records — must precede the view record so the reactive
-        #    handler can reconstruct the TableFamily schema on ingestion.
+        # 3. Column records — Reconstruct TableFamily schema on ingestion.
         col_defs = _col_defs_from_graph(graph)
         self._write_column_records(vid, sys.OWNER_KIND_VIEW, col_defs)
         self.sys.columns.flush()
 
-        # 2. View dependency records — must precede the view record so that
-        #    _compute_view_depth can resolve upstream depths immediately.
-        self._write_view_deps(vid, graph.dependencies)
+        # 4. View dependency records — Includes primary_source_id for depth resolution.
+        # We merge dependencies to ensure they are all tracked in _view_deps.
+        all_deps = newlist_hint(len(graph.dependencies) + 1)
+        all_deps.append(graph.primary_source_id)
+        for d in graph.dependencies:
+            if d != graph.primary_source_id:
+                all_deps.append(d)
+
+        self._write_view_deps(vid, all_deps)
         self.sys.view_deps.flush()
 
-        # 3. Circuit graph records (five tables).
+        # 5. Circuit graph records (the binary intent).
         self._write_circuit_graph(vid, graph)
         self.sys.circuit_nodes.flush()
         self.sys.circuit_edges.flush()
@@ -238,8 +253,7 @@ class Engine(object):
         self.sys.circuit_params.flush()
         self.sys.circuit_group_cols.flush()
 
-        # 4. View record — triggers the reactive handler which registers the
-        #    TableFamily in the EntityRegistry.
+        # 6. View record — Triggers reactive ingestion.
         self._write_view_record(vid, sid, view_name, sql_definition, directory, 0)
         self.sys.views.flush()
 
@@ -254,9 +268,7 @@ class Engine(object):
 
         deps = self._read_view_deps(vid)
 
-        # Evict the compiled plan before retracting metadata so that any
-        # concurrent get_program call that races with drop cannot receive a
-        # stale plan pointing at freed resources.
+        # Evict plan from cache before retracting metadata.
         self.program_cache.invalidate(vid)
 
         self._retract_view_record(
@@ -281,7 +293,13 @@ class Engine(object):
         index_name = make_secondary_index_name(schema_name, table_name, col_name)
         index_id = self.registry.allocate_index_id()
         self._write_index_record(
-            index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx, index_name, int(is_unique), ""
+            index_id,
+            family.table_id,
+            sys.OWNER_KIND_TABLE,
+            col_idx,
+            index_name,
+            int(is_unique),
+            "",
         )
         self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
         return self.registry.get_index_by_name(index_name)
@@ -292,14 +310,18 @@ class Engine(object):
             col = columns[col_idx]
             if col.fk_table_id == 0 or col_idx == family.schema.pk_index:
                 continue
-            index_name = make_fk_index_name(
-                family.schema_name, family.table_name, col.name
-            )
+            index_name = make_fk_index_name(family.schema_name, family.table_name, col.name)
             if self.registry.has_index_by_name(index_name):
                 continue
             index_id = self.registry.allocate_index_id()
             self._write_index_record(
-                index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx, index_name, 0, ""
+                index_id,
+                family.table_id,
+                sys.OWNER_KIND_TABLE,
+                col_idx,
+                index_name,
+                0,
+                "",
             )
             self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
 
@@ -341,8 +363,10 @@ class Engine(object):
             while cursor.is_valid():
                 if cursor.weight() > 0:
                     acc = cursor.get_accessor()
-                    if intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)) == tid or \
-                       intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)) == tid:
+                    if (
+                        intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)) == tid
+                        or intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)) == tid
+                    ):
                         raise LayoutError("View dependency: entity '%s'" % name)
                 cursor.advance()
         finally:
@@ -354,7 +378,10 @@ class Engine(object):
         try:
             while cursor.is_valid():
                 acc = cursor.get_accessor()
-                if intmask(acc.get_int(sys.DepTab.COL_VIEW_ID)) == vid and cursor.weight() > 0:
+                if (
+                    intmask(acc.get_int(sys.DepTab.COL_VIEW_ID)) == vid
+                    and cursor.weight() > 0
+                ):
                     res.append(
                         (
                             intmask(r_uint64(cursor.key())),
@@ -409,8 +436,7 @@ class Engine(object):
     def _retract_circuit_graph(self, vid):
         """
         Scans all five circuit tables for the given view_id and retracts every
-        record found.  Uses the same range-scan convention as ProgramCache's
-        loaders: [vid << 64, (vid+1) << 64).
+        record found.
         """
         start_key = r_uint128(r_uint64(vid)) << 64
         end_key = r_uint128(r_uint64(vid + 1)) << 64
@@ -582,8 +608,16 @@ class Engine(object):
         for i in range(len(columns)):
             col = columns[i]
             sys.ColTab.append(
-                batch, s, oid, kind, i, col.name, col.field_type.code,
-                int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
+                batch,
+                s,
+                oid,
+                kind,
+                i,
+                col.name,
+                col.field_type.code,
+                int(col.is_nullable),
+                col.fk_table_id,
+                col.fk_col_idx,
             )
         self.sys.columns.ingest_batch(batch)
         batch.free()
@@ -594,8 +628,16 @@ class Engine(object):
         for i in range(len(columns)):
             col = columns[i]
             sys.ColTab.retract(
-                batch, s, oid, kind, i, col.name, col.field_type.code,
-                int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
+                batch,
+                s,
+                oid,
+                kind,
+                i,
+                col.name,
+                col.field_type.code,
+                int(col.is_nullable),
+                col.fk_table_id,
+                col.fk_col_idx,
             )
         self.sys.columns.ingest_batch(batch)
         batch.free()

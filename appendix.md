@@ -82,3 +82,4 @@
 * Attributes, methods and functions starting with underscore (`_`) are considered private. They should not be used by code outside the class/module, not even by tests. If you encounter a test using a private method, fix it by either making it use a public attribute/method/function, or remove it entirely.
 * When fixing a problem, don't leave code comments like `# FIXED: ...` or `# REMOVED: ...` or similar. Code comments are not for documenting change.
 * Prefer module-level functions to staticmethods.
+* This is a database. The best reaction to any unexpected error is usually to fail, and to fail as loudly as possible.

@@ -36,16 +36,16 @@ def _u64_to_hex_padded(val):
 
 
 def log(msg):
-    os.write(1, "[TEST] " + msg + "\n")
+    rposix.write(1, "[TEST] " + msg + "\n")
 
 
 def log_step(name):
-    os.write(1, "\n[CHECKPOINT] " + name + "...\n")
+    rposix.write(1, "\n[CHECKPOINT] " + name + "...\n")
 
 
 def fail(msg):
-    os.write(2, "\n!!! CRITICAL TEST FAILURE !!!\n")
-    os.write(2, msg + "\n")
+    rposix.write(2, "\n!!! CRITICAL TEST FAILURE !!!\n")
+    rposix.write(2, msg + "\n")
     raise Exception("Test Failure")
 
 
@@ -66,11 +66,11 @@ def assert_equal_u128(expected, actual, msg):
         hi_a = r_uint64(actual >> 64)
         lo_a = r_uint64(actual)
 
-        os.write(
+        rposix.write(
             2,
             "   Expected: " + _u64_to_hex_padded(hi_e) + _u64_to_hex_padded(lo_e) + "\n",
         )
-        os.write(
+        rposix.write(
             2, "   Actual:   " + _u64_to_hex_padded(hi_a) + _u64_to_hex_padded(lo_a) + "\n"
         )
         fail(msg + " -> U128 Mismatch")
@@ -180,9 +180,10 @@ def test_programmable_zset_lifecycle():
     # 5. Reactive View Construction (New Circuit API)
     log_step("Phase 5: Creating Reactive View (Scan Users)")
 
-    builder = CircuitBuilder(0)
-    # table_id=0 represents the primary incoming delta stream
-    users_src = builder.source(0)
+    # CircuitBuilder now requires the primary_source_id (users table)
+    builder = CircuitBuilder(view_id=0, primary_source_id=users_family.table_id)
+    # input_delta() represents the reactive delta stream for that source
+    users_src = builder.input_delta()
     builder.sink(users_src, target_table_id=0)
 
     out_cols = newlist_hint(2)
@@ -190,8 +191,6 @@ def test_programmable_zset_lifecycle():
     out_cols.append(("username", types.TYPE_STRING.code))
 
     graph = builder.build(out_cols)
-    # Manually wire the dependency so relational integrity logic finds it
-    graph.dependencies.append(users_family.table_id)
 
     db.create_view("app.active_users", graph, "SELECT * FROM users")
     view_family = db.get_table("app.active_users")
@@ -241,39 +240,37 @@ def test_programmable_zset_lifecycle():
     log_step("Phase 9: Testing Graph Compilation Failures")
 
     # A. Disconnected sink failure
-    bad_builder = CircuitBuilder(0)
-    bad_builder.source(0)
+    bad_builder = CircuitBuilder(0, users_family.table_id)
+    bad_builder.input_delta()
     # No sink
     bad_graph = bad_builder.build(out_cols)
-    bad_graph.dependencies.append(users_family.table_id)
-    db2.create_view("app.bad_view", bad_graph, "")
-
-    bad_view_id = db2.get_table("app.bad_view").table_id
-    assert_true(
-        db2.program_cache.get_program(bad_view_id) is None,
-        "Should fail compilation: missing sink",
-    )
+    
+    compilation_failed = False
+    try:
+        db2.create_view("app.bad_view", bad_graph, "")
+    except LayoutError:
+        compilation_failed = True
+        log("Correctly rejected view missing sink")
+    assert_true(compilation_failed, "Should fail compilation: missing sink")
 
     # B. Cyclic Graph
-    cycle_builder = CircuitBuilder(0)
-    s1 = cycle_builder.source(0)
+    cycle_builder = CircuitBuilder(0, users_family.table_id)
+    s1 = cycle_builder.input_delta()
     d1 = cycle_builder.delay(s1)
     # Manual connection to create a cycle (illegal for Kahn's)
     cycle_builder._connect(d1, s1, 1)  # PORT_IN
     cycle_graph = cycle_builder.build(out_cols)
-    cycle_graph.dependencies.append(users_family.table_id)
-    db2.create_view("app.cycle_view", cycle_graph, "")
-
-    cycle_view_id = db2.get_table("app.cycle_view").table_id
-    assert_true(
-        db2.program_cache.get_program(cycle_view_id) is None,
-        "Should fail compilation: cycle detected",
-    )
+    
+    compilation_failed = False
+    try:
+        db2.create_view("app.cycle_view", cycle_graph, "")
+    except LayoutError:
+        compilation_failed = True
+        log("Correctly rejected cyclic graph")
+    assert_true(compilation_failed, "Should fail compilation: cycle detected")
 
     # 10. Teardown
     log_step("Phase 10: Full Teardown and Cleanup")
-    db2.drop_view("app.cycle_view")
-    db2.drop_view("app.bad_view")
     db2.drop_view("app.active_users")
     db2.drop_table("app.orders")
     db2.drop_table("app.users")
@@ -285,26 +282,26 @@ def test_programmable_zset_lifecycle():
 
 
 def entry_point(argv):
-    os.write(1, "====================================================\n")
-    os.write(1, "      GnitzDB Diagnostic Integration Suite          \n")
-    os.write(1, "====================================================\n")
+    rposix.write(1, "====================================================\n")
+    rposix.write(1, "      GnitzDB Diagnostic Integration Suite          \n")
+    rposix.write(1, "====================================================\n")
 
     try:
         test_programmable_zset_lifecycle()
     except LayoutError as e:
-        os.write(2, "\n[FATAL] Caught LayoutError: " + str(e) + "\n")
+        rposix.write(2, "\n[FATAL] Caught LayoutError: " + str(e) + "\n")
         return 1
     except KeyError as e:
-        os.write(2, "\n[FATAL] Caught KeyError: " + str(e) + "\n")
+        rposix.write(2, "\n[FATAL] Caught KeyError: " + str(e) + "\n")
         return 1
     except OSError as e:
-        os.write(2, "\n[FATAL] Caught OSError: Errno " + str(e.errno) + "\n")
+        rposix.write(2, "\n[FATAL] Caught OSError: Errno " + str(e.errno) + "\n")
         return 1
     except Exception as e:
-        os.write(2, "\n[FATAL] Caught Unhandled Exception: " + str(e) + "\n")
+        rposix.write(2, "\n[FATAL] Caught Unhandled Exception: " + str(e) + "\n")
         return 1
 
-    os.write(1, "\nSUCCESS: System integrity verified.\n")
+    rposix.write(1, "\nSUCCESS: System integrity verified.\n")
     return 0
 
 
