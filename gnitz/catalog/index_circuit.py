@@ -201,7 +201,7 @@ def _backfill_index(circuit, source_family):
     Initial population of a secondary index by scanning the source table.
     Uses the ZSetStore interface and the optimized ingest_one kernel.
     """
-    src_cursor = source_family.create_cursor()
+    src_cursor = source_family.store.create_cursor()
 
     while src_cursor.is_valid():
         acc = src_cursor.get_accessor()

@@ -60,8 +60,6 @@ class IPCPayload(object):
     """
 
     _immutable_fields_ = [
-        "fd",
-        "ptr",
         "total_size",
         "status",
         "error_msg",

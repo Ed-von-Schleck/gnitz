@@ -25,20 +25,10 @@ class SystemTables(object):
     """
 
     _immutable_fields_ = [
-        "schemas",
-        "tables",
-        "views",
-        "columns",
-        "indices",
-        "view_deps",
-        "sequences",
-        "functions",
-        "subscriptions",
-        "circuit_nodes",
-        "circuit_edges",
-        "circuit_sources",
-        "circuit_params",
-        "circuit_group_cols",
+        "schemas", "tables", "views", "columns", "indices",
+        "view_deps", "sequences", "functions", "subscriptions",
+        "circuit_nodes", "circuit_edges", "circuit_sources",
+        "circuit_params", "circuit_group_cols",
     ]
 
     def __init__(

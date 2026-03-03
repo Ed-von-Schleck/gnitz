@@ -9,6 +9,7 @@ from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
 from gnitz.vm import runtime
 from gnitz.catalog import system_tables as sys
+from gnitz.catalog.registry import ingest_to_family
 from gnitz.dbsp import ops
 
 STATUS_OK = 0
@@ -99,8 +100,10 @@ class ServerExecutor(object):
 
             if payload.batch is not None and payload.batch.length() > 0:
                 family = self.engine.registry.get_by_id(target_id)
-                family.ingest_batch(payload.batch)
-                family.flush()
+
+                # Use the catalog ingestion pipeline for FK and Index enforcement
+                ingest_to_family(family, payload.batch)
+                family.store.flush()
 
                 ipc.send_batch(fd, target_id, None, STATUS_OK, "", client_id)
 
@@ -138,12 +141,11 @@ class ServerExecutor(object):
 
         while len(pending_deltas) > 0:
             # 1. Find the "shallowest" view (lowest topological depth).
-            # This ensures we don't evaluate a view until all its upstreams are done.
             target_view_id = -1
             min_depth = 0x7FFFFFFF
             
             for v_id in pending_deltas:
-                # Note: In a production system, depth is pre-calculated by the compiler.
+                # Depth is an attribute of TableFamily
                 depth = self.engine.registry.get_depth(v_id) 
                 if depth < min_depth:
                     min_depth = depth
@@ -160,7 +162,6 @@ class ServerExecutor(object):
                 continue
             
             # 2. Boundary: Execute the plan epoch.
-            # This handles prepare_for_tick (clearing/refreshing) and binding.
             out_delta = plan.execute_epoch(incoming_delta)
             
             # 3. Propagate Results
@@ -171,7 +172,6 @@ class ServerExecutor(object):
                 for dep_id in dependents:
                     if dep_id in pending_deltas:
                         # Accumulate: Union the new delta with existing pending delta
-                        # for the same view to prevent redundant executions.
                         existing = pending_deltas[dep_id]
                         new_acc = runtime.ZSetBatch(existing._schema)
                         ops.op_union(existing, out_delta, new_acc)
@@ -180,8 +180,6 @@ class ServerExecutor(object):
                     else:
                         pending_deltas[dep_id] = out_delta.clone()
                 
-                # We produced a clone for propagation; we can free the plan's 
-                # immediate result if cloning was required.
                 out_delta.free()
 
             incoming_delta.free()
@@ -191,7 +189,7 @@ class ServerExecutor(object):
             return []
 
         deps_table = self.engine.registry.get_by_id(sys.DepTab.ID)
-        cursor = deps_table.create_cursor()
+        cursor = deps_table.store.create_cursor()
         res = []
 
         try:
@@ -202,9 +200,9 @@ class ServerExecutor(object):
 
                 acc = cursor.get_accessor()
                 # Dep columns: 0: view_id, 1: dep_table_id, 2: dep_view_id
-                v_id    = intmask(r_uint64(acc.get_int(sys.DepTab.COL_VIEW_ID)))       # 1
-                dep_tid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)))  # 3
-                dep_vid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)))   # 2
+                v_id    = intmask(r_uint64(acc.get_int(sys.DepTab.COL_VIEW_ID)))
+                dep_tid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)))
+                dep_vid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)))
 
                 if dep_tid == source_id or dep_vid == source_id:
                     if v_id not in res:
@@ -219,7 +217,7 @@ class ServerExecutor(object):
             return
 
         subs_table = self.engine.registry.get_by_id(sys.SubTab.ID)
-        cursor = subs_table.create_cursor()
+        cursor = subs_table.store.create_cursor()
         target_fds = []
 
         try:
@@ -245,5 +243,22 @@ class ServerExecutor(object):
                     os.close(memfd)
 
     def _cleanup_client(self, fd):
-        # Implementation of cleanup (omitted for brevity, same as previous)
-        pass
+        if fd in self.client_sockets:
+            sock = self.client_sockets[fd]
+            try:
+                sock.close()
+            except rsocket.SocketError:
+                pass
+            del self.client_sockets[fd]
+        
+        if fd in self.fd_to_client:
+            client_id = self.fd_to_client[fd]
+            if client_id in self.client_to_fd:
+                del self.client_to_fd[client_id]
+            del self.fd_to_client[fd]
+
+        new_fds = newlist_hint(len(self.active_fds))
+        for active_fd in self.active_fds:
+            if active_fd != fd:
+                new_fds.append(active_fd)
+        self.active_fds = new_fds

@@ -1,15 +1,11 @@
 # gnitz/storage/table.py
 
 import os
-import errno
-from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import (
     r_int64,
     r_uint64,
-    r_ulonglonglong as r_uint128,
     intmask,
 )
-from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core import errors
 from gnitz.storage import (
@@ -17,25 +13,16 @@ from gnitz.storage import (
     index,
     manifest,
     memtable,
-    refcount,
     comparator as storage_comparator,
 )
-from gnitz.storage.ephemeral_table import _StorageBase
+from gnitz.storage.ephemeral_table import EphemeralTable
 
 
-def _ensure_dir(path):
-    """Ensures a directory exists, ignoring EEXIST."""
-    try:
-        rposix.mkdir(path, 0o755)
-    except OSError as e:
-        if e.errno != errno.EEXIST:
-            raise
-
-
-class PersistentTable(_StorageBase):
+class PersistentTable(EphemeralTable):
     """
     Coordinator for a single durable Z-Set table.
-    Manages the lifecycle of the WAL, MemTable, and Columnar Shards.
+    Extends EphemeralTable by adding a Write-Ahead Log (WAL) and 
+    a Manifest for persistent columnar shards.
     """
 
     _immutable_fields_ = [
@@ -44,6 +31,8 @@ class PersistentTable(_StorageBase):
         "directory",
         "name",
         "ref_counter",
+        "manifest_manager",
+        "wal_writer",
     ]
 
     def __init__(
@@ -55,26 +44,21 @@ class PersistentTable(_StorageBase):
         memtable_arena_size=1 * 1024 * 1024,
         validate_checksums=False,
     ):
-        self.directory = directory
-        self.name = name
-        self.schema = schema
-        self.table_id = table_id
-        self.validate_checksums = validate_checksums
-        self.is_closed = False
+        # EphemeralTable.__init__ handles directory creation, ref_counter,
+        # index, and memtable initialization.
+        EphemeralTable.__init__(
+            self, directory, name, schema, table_id, 
+            memtable_arena_size, validate_checksums
+        )
 
         # Monotonic counter incremented on every flush().
         # Used by cursors to detect when the MemTable has been rotated.
         self._cursor_generation = 0
 
-        self.ref_counter = refcount.RefCounter()
-
-        _ensure_dir(directory)
-
-        manifest_path = os.path.join(directory, "MANIFEST")
+        # Avoid os.path.join (Appendix A §10 slicing proof failure)
+        manifest_path = directory + "/MANIFEST"
         self.manifest_manager = manifest.ManifestManager(manifest_path)
 
-        self.index = index.ShardIndex(table_id, schema, self.ref_counter)
-        
         # 1. Recover Shard Index from Manifest
         if self.manifest_manager.exists():
             reader = self.manifest_manager.load_current()
@@ -95,22 +79,20 @@ class PersistentTable(_StorageBase):
         else:
             self.current_lsn = r_uint64(1)
 
-        # 2. Initialize Volatile State
-        self.memtable = memtable.MemTable(schema, memtable_arena_size)
-
-        # 3. Initialize Durability Layer
-        wal_path = os.path.join(directory, name + ".wal")
+        # 2. Initialize Durability Layer
+        wal_path = directory + "/" + name + ".wal"
         self.wal_writer = wal.WALWriter(wal_path, self.schema)
 
-        # 4. Replay WAL into MemTable to recover recent un-flushed writes
+        # 3. Replay WAL into MemTable to recover recent un-flushed writes
         self.recover_from_wal(wal_path)
 
-    # ── Mutations ────────────────────────────────────────────────────────────
+    # -- Mutations ------------------------------------------------------------
 
     def ingest_batch(self, batch):
         """
         Durable Z-Set batch update.
-        Atomicity: Batch is committed to WAL before it becomes visible in the MemTable.
+        Atomicity: Batch is committed to WAL before it becomes visible in the
+        MemTable.
         """
         if self.is_closed:
             raise errors.StorageError("Table '%s' is closed" % self.name)
@@ -125,7 +107,14 @@ class PersistentTable(_StorageBase):
         self.wal_writer.append_batch(lsn, self.table_id, batch)
 
         # Step 2: Write to SkipList (Visibility)
-        self.memtable.upsert_batch(batch)
+        # Guard against MemTableFullError: the WAL write above has already
+        # committed, so the data is durable. Flush the MemTable to a shard
+        # and retry so that the batch also becomes visible in memory.
+        try:
+            self.memtable.upsert_batch(batch)
+        except errors.MemTableFullError:
+            self.flush()
+            self.memtable.upsert_batch(batch)
 
     def recover_from_wal(self, wal_path):
         """
@@ -163,21 +152,22 @@ class PersistentTable(_StorageBase):
         finally:
             reader.close()
 
-    # ── Maintenance ──────────────────────────────────────────────────────────
+    # -- Maintenance ----------------------------------------------------------
 
     def flush(self):
         """
-        The Point of No Return: Transitions MemTable state to a permanent shard.
+        Transitions MemTable state to a permanent shard and updates the manifest.
         """
         if self.is_closed:
             raise errors.StorageError("Table '%s' is closed" % self.name)
 
         mt = self.memtable
-        if mt is None or mt.is_empty():
+        if mt.is_empty():
             return ""
 
+        # Avoid os.path.join (Appendix A §10)
         shard_name = "shard_%d_%d.db" % (self.table_id, intmask(self.current_lsn))
-        shard_path = os.path.join(self.directory, shard_name)
+        shard_path = self.directory + "/" + shard_name
 
         # 1. Physical: Build and sync the columnar file
         self.memtable.flush(shard_path, self.table_id)
@@ -213,7 +203,7 @@ class PersistentTable(_StorageBase):
                 self.index.get_metadata_list(), lsn_max
             )
 
-        # 4. Rotation: Swap MemTable and invalidate cursors
+        # 4. Rotation: Swap MemTable
         arena_size = self.memtable.arena.size
         self.memtable.free()
         self.memtable = memtable.MemTable(self.schema, arena_size)
@@ -225,20 +215,15 @@ class PersistentTable(_StorageBase):
 
     def close(self):
         """
-        Idempotent closure of all file handles and memory arenas.
+        Idempotent closure. The WAL writer must be closed before the parent
+        frees the memory arenas to ensure consistent teardown if a crash occurs.
         """
         if self.is_closed:
             return
-        
-        self.is_closed = True
-        
+
         if self.wal_writer:
             self.wal_writer.close()
         
-        if self.memtable:
-            self.memtable.free()
-            self.memtable = None
-            
-        if self.index:
-            self.index.close_all()
-            self.index = None
+        # Delegates to EphemeralTable to handle memtable.free(), 
+        # index.close_all(), and setting is_closed = True.
+        EphemeralTable.close(self)

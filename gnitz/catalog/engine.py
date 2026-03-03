@@ -1,11 +1,11 @@
 # gnitz/catalog/engine.py
 
 import os
-from rpython.rlib import rposix
+from rpython.rlib import rposix, rposix_stat
 from rpython.rlib.rarithmetic import r_uint64, intmask, r_ulonglonglong as r_uint128
 from rpython.rlib.objectmodel import newlist_hint
 
-from gnitz.core.types import ColumnDefinition
+from gnitz.core.types import TableSchema, ColumnDefinition
 from gnitz.core.errors import LayoutError
 from gnitz.core.batch import ZSetBatch
 from gnitz.catalog.program_cache import ProgramCache
@@ -24,21 +24,21 @@ from gnitz.catalog.metadata import (
     bootstrap_system_tables,
 )
 from gnitz.catalog.loader import CatalogBootstrapper
-from gnitz.catalog.handlers import CatalogHandlers, CatalogReactiveStore
+from gnitz.catalog.handlers import CatalogHandlers
 
 
 def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     """
     Public factory to open a GnitzDB instance.
     """
-    rposix.write(1, " -> 1. ensure_dir(base_dir)\n")
+    os.write(1, " -> 1. ensure_dir(base_dir)\n")
     ensure_dir(base_dir)
 
     sys_dir = base_dir + "/" + sys.SYS_CATALOG_DIRNAME
-    rposix.write(1, " -> 2. ensure_dir(sys_dir)\n")
+    os.write(1, " -> 2. ensure_dir(sys_dir)\n")
     ensure_dir(sys_dir)
 
-    rposix.write(1, " -> 3. make_system_tables\n")
+    os.write(1, " -> 3. make_system_tables\n")
     sys_tables = make_system_tables(base_dir)
 
     tmp_cursor = sys_tables.tables.create_cursor()
@@ -46,7 +46,7 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     tmp_cursor.close()
 
     if is_new:
-        rposix.write(1, " -> 4. bootstrap_system_tables (Fresh Instance)\n")
+        os.write(1, " -> 4. bootstrap_system_tables (Fresh Instance)\n")
         bootstrap_system_tables(sys_tables, base_dir)
 
     registry = EntityRegistry()
@@ -54,15 +54,12 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     handlers = CatalogHandlers(registry, sys_tables, base_dir, program_cache)
     bootstrapper = CatalogBootstrapper(registry, sys_tables, base_dir)
 
-    rposix.write(1, " -> 5. recover_system_state (Counters)\n")
+    os.write(1, " -> 5. recover_system_state (Counters)\n")
     bootstrapper.recover_system_state()
 
     engine = Engine(base_dir, sys_tables, registry, handlers, program_cache)
 
-    rposix.write(1, " -> 6. wire_reactivity\n")
-    engine._wire_reactivity()
-
-    rposix.write(1, " -> 7. replay_catalog (Logical Recovery)\n")
+    os.write(1, " -> 6. replay_catalog (Logical Recovery)\n")
     bootstrapper.replay_catalog(handlers)
 
     return engine
@@ -98,8 +95,7 @@ def _validate_fk_column(
 
 def _col_defs_from_graph(graph):
     """
-    Converts a CircuitGraph's output_col_defs list of (name, type_code) tuples
-    into a list of ColumnDefinition objects suitable for _write_column_records.
+    Converts a CircuitGraph's output_col_defs list into a list of ColumnDefinition objects.
     """
     result = newlist_hint(len(graph.output_col_defs))
     for name, type_code in graph.output_col_defs:
@@ -116,7 +112,7 @@ def _col_defs_from_graph(graph):
 class Engine(object):
     """
     The Supervisor for catalog mutations.
-    Writes durable intent to System Z-Sets; Handlers react to perform side-effects.
+    Writes durable intent to System Z-Sets and invokes handlers to perform side-effects.
     """
 
     _immutable_fields_ = ["base_dir", "sys", "registry", "handlers", "program_cache"]
@@ -127,14 +123,6 @@ class Engine(object):
         self.registry = registry
         self.handlers = handlers
         self.program_cache = program_cache
-
-    def _wire_reactivity(self):
-        """Links System Z-Sets to the reactive handlers."""
-        h = self.handlers
-        self.sys.schemas = CatalogReactiveStore(self.sys.schemas, h, "schema")
-        self.sys.tables = CatalogReactiveStore(self.sys.tables, h, "table")
-        self.sys.views = CatalogReactiveStore(self.sys.views, h, "view")
-        self.sys.indices = CatalogReactiveStore(self.sys.indices, h, "index")
 
     # -- Public Intent API ----------------------------------------------------
 
@@ -172,8 +160,11 @@ class Engine(object):
                 columns[col_idx], col_idx, self.registry, tid, pk_col_idx, self_pk_type
             )
 
-        directory = self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
+        directory = (
+            self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
+        )
 
+        # Columns are written first so that the table handler can read them.
         self._write_column_records(tid, sys.OWNER_KIND_TABLE, columns)
         self._write_table_record(tid, sid, table_name, directory, pk_col_idx, 0)
 
@@ -194,58 +185,35 @@ class Engine(object):
         self._retract_column_records(tid, sys.OWNER_KIND_TABLE, family.schema.columns)
 
     def create_view(self, qualified_name, graph, sql_definition=""):
-        """
-        Creates a reactive view from a CircuitGraph.
-
-        Dry-run validates the graph's structure and dependencies before
-        persisting metadata to the system catalog.
-        """
         schema_name, view_name = parse_qualified_name(qualified_name, "public")
-        validate_user_identifier(schema_name)
-        validate_user_identifier(view_name)
-
         if self.registry.has(schema_name, view_name):
-            raise LayoutError("View/Table already exists: %s" % qualified_name)
+            raise LayoutError("View/Table already exists")
 
-        # 1. Fail-fast validation (Dry-Run Compilation)
-        # Ensure the graph is a valid DAG with a sink and clear primary input.
+        # Validate graph structure (sink presence, DAG properties) before persistence.
         self.program_cache.validate_graph_structure(graph)
-
-        # 2. Relational Integrity Validation
-        # Verify that the primary source exists in the registry.
-        if not self.registry.has_id(graph.primary_source_id):
-            raise LayoutError(
-                "Primary source %d for view does not exist" % graph.primary_source_id
-            )
-
-        # Verify secondary dependencies (scans).
-        for dep_id in graph.dependencies:
-            if not self.registry.has_id(dep_id):
-                raise LayoutError("Secondary dependency %d does not exist" % dep_id)
 
         vid = self.registry.allocate_table_id()
         sid = self.registry.get_schema_id(schema_name)
         directory = (
-            self.base_dir + "/" + schema_name + "/view_" + view_name + "_" + str(vid)
+            self.base_dir
+            + "/"
+            + schema_name
+            + "/view_"
+            + view_name
+            + "_"
+            + str(vid)
         )
 
-        # 3. Column records — Reconstruct TableFamily schema on ingestion.
+        # 1. Column records (Durable + Visible to view handler)
         col_defs = _col_defs_from_graph(graph)
         self._write_column_records(vid, sys.OWNER_KIND_VIEW, col_defs)
         self.sys.columns.flush()
 
-        # 4. View dependency records — Includes primary_source_id for depth resolution.
-        # We merge dependencies to ensure they are all tracked in _view_deps.
-        all_deps = newlist_hint(len(graph.dependencies) + 1)
-        all_deps.append(graph.primary_source_id)
-        for d in graph.dependencies:
-            if d != graph.primary_source_id:
-                all_deps.append(d)
-
-        self._write_view_deps(vid, all_deps)
+        # 2. View dependency records
+        self._write_view_deps(vid, graph.dependencies)
         self.sys.view_deps.flush()
 
-        # 5. Circuit graph records (the binary intent).
+        # 3. Circuit graph records
         self._write_circuit_graph(vid, graph)
         self.sys.circuit_nodes.flush()
         self.sys.circuit_edges.flush()
@@ -253,7 +221,7 @@ class Engine(object):
         self.sys.circuit_params.flush()
         self.sys.circuit_group_cols.flush()
 
-        # 6. View record — Triggers reactive ingestion.
+        # 4. View record (Invokes reactive handler)
         self._write_view_record(vid, sid, view_name, sql_definition, directory, 0)
         self.sys.views.flush()
 
@@ -268,7 +236,7 @@ class Engine(object):
 
         deps = self._read_view_deps(vid)
 
-        # Evict plan from cache before retracting metadata.
+        # Evict plan first
         self.program_cache.invalidate(vid)
 
         self._retract_view_record(
@@ -293,13 +261,7 @@ class Engine(object):
         index_name = make_secondary_index_name(schema_name, table_name, col_name)
         index_id = self.registry.allocate_index_id()
         self._write_index_record(
-            index_id,
-            family.table_id,
-            sys.OWNER_KIND_TABLE,
-            col_idx,
-            index_name,
-            int(is_unique),
-            "",
+            index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx, index_name, int(is_unique), ""
         )
         self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
         return self.registry.get_index_by_name(index_name)
@@ -310,18 +272,14 @@ class Engine(object):
             col = columns[col_idx]
             if col.fk_table_id == 0 or col_idx == family.schema.pk_index:
                 continue
-            index_name = make_fk_index_name(family.schema_name, family.table_name, col.name)
+            index_name = make_fk_index_name(
+                family.schema_name, family.table_name, col.name
+            )
             if self.registry.has_index_by_name(index_name):
                 continue
             index_id = self.registry.allocate_index_id()
             self._write_index_record(
-                index_id,
-                family.table_id,
-                sys.OWNER_KIND_TABLE,
-                col_idx,
-                index_name,
-                0,
-                "",
+                index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx, index_name, 0, ""
             )
             self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
 
@@ -342,16 +300,14 @@ class Engine(object):
         return self.registry.get(schema_name, table_name)
 
     def close(self):
-        for k in self.registry._by_name:
-            family = self.registry._by_name[k]
+        for family in self.registry.iter_families():
             if family.table_id >= sys.FIRST_USER_TABLE_ID:
                 family.close()
         self.sys.close()
 
     def _check_for_dependencies(self, tid, name):
         """Validates that no entities depend on the given ID before dropping it."""
-        for k in self.registry._by_name:
-            referencing = self.registry._by_name[k]
+        for referencing in self.registry.iter_families():
             if referencing.table_id == tid:
                 continue
             for col in referencing.schema.columns:
@@ -363,10 +319,8 @@ class Engine(object):
             while cursor.is_valid():
                 if cursor.weight() > 0:
                     acc = cursor.get_accessor()
-                    if (
-                        intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)) == tid
-                        or intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)) == tid
-                    ):
+                    if intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)) == tid or \
+                       intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)) == tid:
                         raise LayoutError("View dependency: entity '%s'" % name)
                 cursor.advance()
         finally:
@@ -378,10 +332,7 @@ class Engine(object):
         try:
             while cursor.is_valid():
                 acc = cursor.get_accessor()
-                if (
-                    intmask(acc.get_int(sys.DepTab.COL_VIEW_ID)) == vid
-                    and cursor.weight() > 0
-                ):
+                if intmask(acc.get_int(sys.DepTab.COL_VIEW_ID)) == vid and cursor.weight() > 0:
                     res.append(
                         (
                             intmask(r_uint64(cursor.key())),
@@ -434,10 +385,6 @@ class Engine(object):
         batch.free()
 
     def _retract_circuit_graph(self, vid):
-        """
-        Scans all five circuit tables for the given view_id and retracts every
-        record found.
-        """
         start_key = r_uint128(r_uint64(vid)) << 64
         end_key = r_uint128(r_uint64(vid + 1)) << 64
 
@@ -541,13 +488,14 @@ class Engine(object):
         self.sys.circuit_group_cols.ingest_batch(batch)
         batch.free()
 
-    # -- Private Write Helpers ------------------------------------------------
+    # -- Private Write Helpers (With Handlers) --------------------------------
 
     def _write_schema_record(self, sid, name):
         s = self.sys.schemas.schema
         batch = ZSetBatch(s)
         sys.SchemaTab.append(batch, s, sid, name)
         self.sys.schemas.ingest_batch(batch)
+        self.handlers.on_schema_delta(batch)
         batch.free()
 
     def _retract_schema_record(self, sid, name):
@@ -555,6 +503,7 @@ class Engine(object):
         batch = ZSetBatch(s)
         sys.SchemaTab.retract(batch, s, sid, name)
         self.sys.schemas.ingest_batch(batch)
+        self.handlers.on_schema_delta(batch)
         batch.free()
 
     def _write_table_record(self, tid, sid, name, directory, pk_idx, lsn):
@@ -562,6 +511,7 @@ class Engine(object):
         batch = ZSetBatch(s)
         sys.TableTab.append(batch, s, tid, sid, name, directory, pk_idx, lsn)
         self.sys.tables.ingest_batch(batch)
+        self.handlers.on_table_delta(batch)
         batch.free()
 
     def _retract_table_record(self, tid, sid, name, directory, pk_idx, lsn):
@@ -569,6 +519,7 @@ class Engine(object):
         batch = ZSetBatch(s)
         sys.TableTab.retract(batch, s, tid, sid, name, directory, pk_idx, lsn)
         self.sys.tables.ingest_batch(batch)
+        self.handlers.on_table_delta(batch)
         batch.free()
 
     def _write_view_record(self, vid, sid, name, sql_def, directory, lsn):
@@ -576,6 +527,7 @@ class Engine(object):
         batch = ZSetBatch(s)
         sys.ViewTab.append(batch, s, vid, sid, name, sql_def, directory, lsn)
         self.sys.views.ingest_batch(batch)
+        self.handlers.on_view_delta(batch)
         batch.free()
 
     def _retract_view_record(self, vid, sid, name, sql_def, directory, lsn):
@@ -583,6 +535,7 @@ class Engine(object):
         batch = ZSetBatch(s)
         sys.ViewTab.retract(batch, s, vid, sid, name, sql_def, directory, lsn)
         self.sys.views.ingest_batch(batch)
+        self.handlers.on_view_delta(batch)
         batch.free()
 
     def _write_view_deps(self, vid, dep_ids):
@@ -608,16 +561,8 @@ class Engine(object):
         for i in range(len(columns)):
             col = columns[i]
             sys.ColTab.append(
-                batch,
-                s,
-                oid,
-                kind,
-                i,
-                col.name,
-                col.field_type.code,
-                int(col.is_nullable),
-                col.fk_table_id,
-                col.fk_col_idx,
+                batch, s, oid, kind, i, col.name, col.field_type.code,
+                int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
             )
         self.sys.columns.ingest_batch(batch)
         batch.free()
@@ -628,16 +573,8 @@ class Engine(object):
         for i in range(len(columns)):
             col = columns[i]
             sys.ColTab.retract(
-                batch,
-                s,
-                oid,
-                kind,
-                i,
-                col.name,
-                col.field_type.code,
-                int(col.is_nullable),
-                col.fk_table_id,
-                col.fk_col_idx,
+                batch, s, oid, kind, i, col.name, col.field_type.code,
+                int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
             )
         self.sys.columns.ingest_batch(batch)
         batch.free()
@@ -647,6 +584,7 @@ class Engine(object):
         batch = ZSetBatch(s)
         sys.IdxTab.append(batch, s, idx_id, oid, kind, s_idx, name, unique, c_dir)
         self.sys.indices.ingest_batch(batch)
+        self.handlers.on_index_delta(batch)
         batch.free()
 
     def _retract_index_record(self, idx_id, oid, kind, s_idx, name, unique, c_dir):
@@ -654,6 +592,7 @@ class Engine(object):
         batch = ZSetBatch(s)
         sys.IdxTab.retract(batch, s, idx_id, oid, kind, s_idx, name, unique, c_dir)
         self.sys.indices.ingest_batch(batch)
+        self.handlers.on_index_delta(batch)
         batch.free()
 
     def _advance_sequence(self, seq_id, old_val, new_val):

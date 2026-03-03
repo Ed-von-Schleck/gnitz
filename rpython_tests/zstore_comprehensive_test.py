@@ -15,6 +15,7 @@ from gnitz.core import types, values, batch
 from gnitz.core.errors import LayoutError
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog import engine, identifiers
+from gnitz.catalog.registry import ingest_to_family
 from gnitz.catalog.metadata import ensure_dir
 from gnitz.client.circuit_builder import CircuitBuilder
 from gnitz.vm.query import View
@@ -151,7 +152,7 @@ def test_programmable_zset_lifecycle():
 
     fk_raised = False
     try:
-        orders_family.ingest_batch(bad_batch)
+        ingest_to_family(orders_family, bad_batch)
     except LayoutError:
         fk_raised = True
         log("Caught expected FK violation (User not found)")
@@ -164,17 +165,17 @@ def test_programmable_zset_lifecycle():
     ru = values.make_payload_row(users_family.schema)
     ru.append_string("alice")
     u_batch.append(u128_val, r_int64(1), ru)
-    users_family.ingest_batch(u_batch)
+    ingest_to_family(users_family, u_batch)
     u_batch.free()
 
-    assert_true(users_family.has_pk(u128_val), "User ingestion visibility failed")
+    assert_true(users_family.store.has_pk(u128_val), "User ingestion visibility failed")
 
     o_batch = batch.ZSetBatch(orders_family.schema)
     ro = values.make_payload_row(orders_family.schema)
     ro.append_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
     ro.append_int(r_int64(1000))
     o_batch.append(r_uint128(101), r_int64(1), ro)
-    orders_family.ingest_batch(o_batch)
+    ingest_to_family(orders_family, o_batch)
     o_batch.free()
 
     # 5. Reactive View Construction (New Circuit API)
@@ -310,6 +311,6 @@ def target(driver, args):
 
 
 if __name__ == "__main__":
-    import sys as pysys
+    import pysys
 
     entry_point(pysys.argv)

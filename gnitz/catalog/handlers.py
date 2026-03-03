@@ -13,8 +13,7 @@ from gnitz.catalog import system_tables as sys
 from gnitz.catalog.metadata import ensure_dir, read_column_defs
 from gnitz.catalog.registry import (
     TableFamily,
-    ReactiveStore,
-    _wire_fk_constraints_for_family,
+    wire_fk_constraints_for_family,
 )
 from gnitz.catalog.index_circuit import (
     _make_index_circuit,
@@ -23,6 +22,10 @@ from gnitz.catalog.index_circuit import (
 
 
 def _compute_view_depth(vid, view_deps_store, registry):
+    """
+    Traverses the view dependency graph to determine the topological rank.
+    view_deps_store is a ZSetStore (PersistentTable).
+    """
     max_depth = 0
     cursor = view_deps_store.create_cursor()
     try:
@@ -40,29 +43,6 @@ def _compute_view_depth(vid, view_deps_store, registry):
     finally:
         cursor.close()
     return max_depth
-
-
-class CatalogReactiveStore(ReactiveStore):
-    """
-    Reactive proxy that bridges durable System Z-Sets to catalog handlers.
-    """
-
-    _immutable_fields_ = ["handlers", "callback_kind"]
-
-    def __init__(self, inner, handlers, callback_kind):
-        ReactiveStore.__init__(self, inner)
-        self.handlers = handlers
-        self.callback_kind = callback_kind
-
-    def on_ingest(self, batch):
-        if self.callback_kind == "schema":
-            self.handlers.on_schema_delta(batch)
-        elif self.callback_kind == "table":
-            self.handlers.on_table_delta(batch)
-        elif self.callback_kind == "view":
-            self.handlers.on_view_delta(batch)
-        elif self.callback_kind == "index":
-            self.handlers.on_index_delta(batch)
 
 
 class CatalogHandlers(object):
@@ -129,7 +109,8 @@ class CatalogHandlers(object):
                 if len(col_defs) == 0:
                     os.write(
                         1,
-                        " [ERROR] Cannot register table '%s': columns not found\n" % name,
+                        " [ERROR] Cannot register table '%s': columns not found\n"
+                        % name,
                     )
                     continue
 
@@ -139,22 +120,27 @@ class CatalogHandlers(object):
                 schema_name = self.registry.get_schema_name(sid)
                 mmap_posix.fsync_dir(self.base_dir + "/" + schema_name)
 
+                # positional arg 'pt' becomes 'family.store'
                 family = TableFamily(
                     schema_name, name, tid, sid, directory, pk_col_idx, pt
                 )
                 self.registry.register(family)
-                _wire_fk_constraints_for_family(family, self.registry)
+                wire_fk_constraints_for_family(family, self.registry)
             else:
                 if self.registry.has_id(tid):
                     family = self.registry.get_by_id(tid)
-                    for k in self.registry._by_name:
-                        referencing = self.registry._by_name[k]
+                    for referencing in self.registry.iter_families():
                         if referencing.table_id == tid:
                             continue
                         for col in referencing.schema.columns:
                             if col.fk_table_id == tid:
                                 raise LayoutError(
-                                    "Integrity violation: table referenced by '%s'" % k
+                                    "Integrity violation: table referenced by '%s'"
+                                    % (
+                                        referencing.schema_name
+                                        + "."
+                                        + referencing.table_name
+                                    )
                                 )
 
                     family.close()
@@ -180,7 +166,8 @@ class CatalogHandlers(object):
                 if len(col_defs) == 0:
                     os.write(
                         1,
-                        " [ERROR] Cannot register view '%s': columns not found\n" % name,
+                        " [ERROR] Cannot register view '%s': columns not found\n"
+                        % name,
                     )
                     continue
 
@@ -188,6 +175,7 @@ class CatalogHandlers(object):
                 et = EphemeralTable(directory, name, tbl_schema, table_id=vid)
                 schema_name = self.registry.get_schema_name(sid)
 
+                # positional arg 'et' becomes 'family.store'
                 family = TableFamily(schema_name, name, vid, sid, directory, 0, et)
 
                 family.depth = _compute_view_depth(

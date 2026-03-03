@@ -1,5 +1,6 @@
 # gnitz/storage/ephemeral_table.py
 
+import errno
 import os
 from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import (
@@ -36,10 +37,11 @@ def _name_to_tid(name):
     return tid
 
 
-class _StorageBase(ZSetStore):
+class EphemeralTable(ZSetStore):
     """
-    Shared base class for Persistent and Ephemeral tables.
-    Deduplicates logic related to schema management and read-path operations.
+    Scratch Z-Set storage for internal VM state or Secondary Indices.
+    Bypasses the Write-Ahead Log to maximize throughput.
+    Inherits directly from ZSetStore; PersistentTable inherits from this.
     """
 
     _immutable_fields_ = [
@@ -50,12 +52,42 @@ class _StorageBase(ZSetStore):
         "ref_counter",
     ]
 
+    def __init__(
+        self,
+        directory,
+        name,
+        schema,
+        table_id=0,
+        memtable_arena_size=1 * 1024 * 1024,
+        validate_checksums=False,
+    ):
+        self.directory = directory
+        self.name = name
+        self.schema = schema
+        self.table_id = table_id
+        self.validate_checksums = validate_checksums
+        self.is_closed = False
+
+        self.ref_counter = refcount.RefCounter()
+
+        try:
+            rposix.mkdir(directory, 0o755)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+
+        self.index = index.ShardIndex(table_id, schema, self.ref_counter)
+        self.memtable = memtable.MemTable(schema, memtable_arena_size)
+
+    # -- ZSetStore Interface Implementation -----------------------------------
+
     def get_schema(self):
         return self.schema
 
     def create_child(self, name, schema):
         """Returns another EphemeralTable instance for recursive state."""
-        scratch_dir = os.path.join(self.directory, "scratch_" + name)
+        # Avoid os.path.join (Appendix A §10 slicing proof failure)
+        scratch_dir = self.directory + "/scratch_" + name
         tid = _name_to_tid(name)
 
         return EphemeralTable(
@@ -94,7 +126,6 @@ class _StorageBase(ZSetStore):
                 view = handle.view
                 idx = row_idx
                 while idx < view.count:
-                    # Check PK Match
                     if is_u128:
                         if view.get_pk_u128(idx) != r_key:
                             break
@@ -138,7 +169,6 @@ class _StorageBase(ZSetStore):
                 view = handle.view
                 idx = row_idx
                 while idx < view.count:
-                    # Check PK Match
                     if self.schema.get_pk_column().field_type.size == 16:
                         if view.get_pk_u128(idx) != r_key:
                             break
@@ -146,46 +176,12 @@ class _StorageBase(ZSetStore):
                         if r_uint128(view.get_pk_u64(idx)) != r_key:
                             break
 
-                    # Check Payload Semantic Equality
                     soa.set_row(view, idx)
                     if core_comparator.compare_rows(self.schema, soa, accessor) == 0:
                         total_w += view.get_weight(idx)
                     idx += 1
 
         return total_w
-
-
-class EphemeralTable(_StorageBase):
-    """
-    Scratch Z-Set storage for internal VM state or Secondary Indices.
-    Bypasses the Write-Ahead Log to maximize throughput.
-    """
-
-    def __init__(
-        self,
-        directory,
-        name,
-        schema,
-        table_id=0,
-        memtable_arena_size=1 * 1024 * 1024,
-        validate_checksums=False,
-    ):
-        self.directory = directory
-        self.name = name
-        self.schema = schema
-        self.table_id = table_id
-        self.validate_checksums = validate_checksums
-        self.is_closed = False
-
-        self.ref_counter = refcount.RefCounter()
-
-        try:
-            rposix.mkdir(directory, 0o755)
-        except OSError:
-            pass
-
-        self.index = index.ShardIndex(table_id, schema, self.ref_counter)
-        self.memtable = memtable.MemTable(schema, memtable_arena_size)
 
     def ingest_batch(self, batch):
         if self.is_closed:
@@ -194,62 +190,23 @@ class EphemeralTable(_StorageBase):
         if batch.length() == 0:
             return
 
-        self.memtable.upsert_batch(batch)
-
-    def ingest_projection(
-        self, source_batch, source_col_idx, source_col_type, payload_accessor, is_unique
-    ):
-        """
-        Hot-path projection kernel for secondary indices.
-        Extracts index keys from source_batch and injects them into the local store.
-        """
-        n = source_batch.length()
-        for i in range(n):
-            acc = source_batch.get_accessor(i)
-            if acc.is_null(source_col_idx):
-                continue
-
-            weight = source_batch.get_weight(i)
-            if weight == r_int64(0):
-                continue
-
-            index_key = promote_to_index_key(acc, source_col_idx, source_col_type)
-
-            if is_unique and weight > r_int64(0):
-                if self.has_pk(index_key):
-                    raise errors.LayoutError(
-                        "Unique index violation on column index %d" % source_col_idx
-                    )
-
-            source_pk = source_batch.get_pk(i)
-            # Mutation of payload_accessor (IndexPayloadAccessor) to avoid allocation
-            payload_accessor.pk_lo = r_uint64(source_pk)
-            payload_accessor.pk_hi = r_uint64(source_pk >> 64)
-
-            try:
-                self.memtable.upsert_single(index_key, weight, payload_accessor)
-            except errors.MemTableFullError:
-                self.flush()
-                self.memtable.upsert_single(index_key, weight, payload_accessor)
-
-    def ingest_one(self, key, weight, accessor):
-        """Cold-path injection for index backfills."""
         try:
-            self.memtable.upsert_single(key, weight, accessor)
+            self.memtable.upsert_batch(batch)
         except errors.MemTableFullError:
             self.flush()
-            self.memtable.upsert_single(key, weight, accessor)
+            self.memtable.upsert_batch(batch)
 
     def flush(self):
         """Transitions MemTable state to a temporary columnar shard."""
         if self.is_closed:
             raise errors.StorageError("Table is closed")
 
+        # Avoid os.path.join (Appendix A §10)
         shard_name = "eph_shard_%d_%d.db" % (
             self.table_id,
             intmask(rffi.cast(rffi.SIZE_T, self.memtable.arena.offset)),
         )
-        shard_path = os.path.join(self.directory, shard_name)
+        shard_path = self.directory + "/" + shard_name
 
         self.memtable.flush(shard_path, self.table_id)
 
@@ -287,3 +244,55 @@ class EphemeralTable(_StorageBase):
         if self.index:
             self.index.close_all()
         self.is_closed = True
+
+    # -- Internal / Index Specific APIs ---------------------------------------
+
+    def ingest_projection(
+        self, source_batch, source_col_idx, source_col_type, payload_accessor, is_unique
+    ):
+        """
+        Hot-path projection kernel for secondary indices.
+        Extracts index keys from source_batch and injects them into the local store.
+        """
+        n = source_batch.length()
+        if n == 0:
+            return
+
+        acc = source_batch.get_accessor(0)
+
+        for i in range(n):
+            source_batch.bind_raw_accessor(i, acc)
+
+            if acc.is_null(source_col_idx):
+                continue
+
+            weight = source_batch.get_weight(i)
+            if weight == r_int64(0):
+                continue
+
+            index_key = promote_to_index_key(acc, source_col_idx, source_col_type)
+
+            if is_unique and weight > r_int64(0):
+                if self.has_pk(index_key):
+                    raise errors.LayoutError(
+                        "Unique index violation on column index %d" % source_col_idx
+                    )
+
+            source_pk = source_batch.get_pk(i)
+            # Alignment-safe u128 assignment (Appendix A §4)
+            payload_accessor.pk_lo = r_uint64(source_pk)
+            payload_accessor.pk_hi = r_uint64(source_pk >> 64)
+
+            try:
+                self.memtable.upsert_single(index_key, weight, payload_accessor)
+            except errors.MemTableFullError:
+                self.flush()
+                self.memtable.upsert_single(index_key, weight, payload_accessor)
+
+    def ingest_one(self, key, weight, accessor):
+        """Cold-path injection for index backfills."""
+        try:
+            self.memtable.upsert_single(key, weight, accessor)
+        except errors.MemTableFullError:
+            self.flush()
+            self.memtable.upsert_single(key, weight, accessor)

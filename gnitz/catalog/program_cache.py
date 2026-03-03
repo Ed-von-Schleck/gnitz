@@ -24,7 +24,7 @@ class ProgramCache(object):
     Caches execution plans for Reactive Views.
     """
 
-    _immutable_fields_ = ["registry", "_cache"]
+    _immutable_fields_ = ["registry"]
 
     def __init__(self, registry):
         self.registry = registry
@@ -102,11 +102,10 @@ class ProgramCache(object):
         if count != len(node_ids):
             raise LayoutError("View graph contains cycles (not a DAG)")
 
-    # -- Graph Table Loaders (omitted for brevity, same as before) --
     def _load_nodes(self, view_id):
         if not self.registry.has_id(sys.CircuitNodesTab.ID): return []
         family = self.registry.get_by_id(sys.CircuitNodesTab.ID)
-        cursor = family.create_cursor()
+        cursor = family.store.create_cursor()
         result = newlist_hint(8)
         start_key = r_uint128(r_uint64(view_id)) << 64
         end_key = r_uint128(r_uint64(view_id + 1)) << 64
@@ -127,7 +126,7 @@ class ProgramCache(object):
     def _load_edges(self, view_id):
         if not self.registry.has_id(sys.CircuitEdgesTab.ID): return []
         family = self.registry.get_by_id(sys.CircuitEdgesTab.ID)
-        cursor = family.create_cursor()
+        cursor = family.store.create_cursor()
         result = newlist_hint(8)
         start_key = r_uint128(r_uint64(view_id)) << 64
         end_key = r_uint128(r_uint64(view_id + 1)) << 64
@@ -150,7 +149,7 @@ class ProgramCache(object):
     def _load_sources(self, view_id):
         if not self.registry.has_id(sys.CircuitSourcesTab.ID): return {}
         family = self.registry.get_by_id(sys.CircuitSourcesTab.ID)
-        cursor = family.create_cursor()
+        cursor = family.store.create_cursor()
         result = {}
         start_key = r_uint128(r_uint64(view_id)) << 64
         end_key = r_uint128(r_uint64(view_id + 1)) << 64
@@ -171,7 +170,7 @@ class ProgramCache(object):
     def _load_params(self, view_id):
         if not self.registry.has_id(sys.CircuitParamsTab.ID): return {}
         family = self.registry.get_by_id(sys.CircuitParamsTab.ID)
-        cursor = family.create_cursor()
+        cursor = family.store.create_cursor()
         result = {}
         start_key = r_uint128(r_uint64(view_id)) << 64
         end_key = r_uint128(r_uint64(view_id + 1)) << 64
@@ -195,7 +194,7 @@ class ProgramCache(object):
     def _load_group_cols(self, view_id):
         if not self.registry.has_id(sys.CircuitGroupColsTab.ID): return {}
         family = self.registry.get_by_id(sys.CircuitGroupColsTab.ID)
-        cursor = family.create_cursor()
+        cursor = family.store.create_cursor()
         result = {}
         start_key = r_uint128(r_uint64(view_id)) << 64
         end_key = r_uint128(r_uint64(view_id + 1)) << 64
@@ -218,7 +217,7 @@ class ProgramCache(object):
     def _resolve_primary_input_schema(self, program_id, fallback):
         if not self.registry.has_id(sys.DepTab.ID): return fallback
         deps_family = self.registry.get_by_id(sys.DepTab.ID)
-        cursor = deps_family.create_cursor()
+        cursor = deps_family.store.create_cursor()
         result = fallback
         try:
             while cursor.is_valid():
@@ -253,7 +252,7 @@ class ProgramCache(object):
         out_schema = view_family.schema
         in_schema = self._resolve_primary_input_schema(view_id, out_schema)
 
-        # 1. Topological sort (Simplified Kahn's, assumed valid from engine validation)
+        # 1. Topological sort
         node_ids = newlist_hint(len(nodes))
         opcode_of = {}
         for nid, op in nodes:
@@ -339,11 +338,11 @@ class ProgramCache(object):
                     input_delta_reg_id = reg_id
                 elif nid in trace_side_sources:
                     family = self.registry.get_by_id(table_id)
-                    reg = runtime.TraceRegister(reg_id, runtime.VMSchema(family.schema), family.create_cursor(), family)
+                    reg = runtime.TraceRegister(reg_id, runtime.VMSchema(family.schema), family.store.create_cursor(), family.store)
                     reg_file.registers[reg_id] = reg
                 else:
                     family = self.registry.get_by_id(table_id)
-                    trace_reg = runtime.TraceRegister(reg_id, runtime.VMSchema(family.schema), family.create_cursor(), family)
+                    trace_reg = runtime.TraceRegister(reg_id, runtime.VMSchema(family.schema), family.store.create_cursor(), family.store)
                     reg_file.registers[reg_id] = trace_reg
                     out_delta_id = next_extra_reg
                     next_extra_reg += 1
@@ -398,7 +397,7 @@ class ProgramCache(object):
             elif op == opcodes.OPCODE_DISTINCT:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN_DISTINCT]]
                 hist_schema = in_reg.vm_schema.table_schema
-                history_table = view_family.create_child("_hist_%d_%d" % (view_id, nid), hist_schema)
+                history_table = view_family.store.create_child("_hist_%d_%d" % (view_id, nid), hist_schema)
                 hist_reg = runtime.TraceRegister(reg_id, runtime.VMSchema(hist_schema), history_table.create_cursor(), history_table)
                 reg_file.registers[reg_id] = hist_reg
                 out_delta_id = next_extra_reg
@@ -414,7 +413,7 @@ class ProgramCache(object):
                 agg_func = _get_agg_func(agg_func_id)
                 gcols = group_cols.get(nid, [])
                 reduce_out_schema = _build_reduce_output_schema(in_reg.vm_schema.table_schema, gcols, agg_func)
-                trace_table = view_family.create_child("_reduce_%d_%d" % (view_id, nid), reduce_out_schema)
+                trace_table = view_family.store.create_child("_reduce_%d_%d" % (view_id, nid), reduce_out_schema)
                 tr_out_reg = runtime.TraceRegister(reg_id, runtime.VMSchema(reduce_out_schema), trace_table.create_cursor(), trace_table)
                 reg_file.registers[reg_id] = tr_out_reg
                 out_delta_id = next_extra_reg
@@ -436,7 +435,8 @@ class ProgramCache(object):
                 if target_table_id > 0 and self.registry.has_id(target_table_id):
                     target = self.registry.get_by_id(target_table_id)
                 sink_reg_id = in_reg_id
-                instr = instructions.IntegrateOp(in_reg, target)
+                # Final views integrate into target.store
+                instr = instructions.IntegrateOp(in_reg, target.store if target else None)
 
             elif op == opcodes.OPCODE_DELAY:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
