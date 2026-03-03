@@ -9,6 +9,7 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.core import types, strings, xxh
 from gnitz.core.comparator import RowAccessor
+from gnitz.core.batch import ConsolidatedScope
 from gnitz.storage.comparator import RawWALAccessor
 from gnitz.dbsp.functions import NULL_AGGREGATE
 
@@ -58,7 +59,7 @@ class ReduceAccessor(RowAccessor):
 
         self.mapping_to_input = mapping
 
-        # FIX: Initialize to Null Object instead of None to satisfy annotator
+        # Initialize to Null Object to satisfy annotator
         self.exemplar = None 
         self.agg_func = NULL_AGGREGATE
         self.old_val_bits = r_uint64(0)
@@ -80,7 +81,6 @@ class ReduceAccessor(RowAccessor):
             return self.agg_func.is_accumulator_zero()
         if src < 0:
             return False
-        # Guard exemplar access
         if self.exemplar is not None:
             return self.exemplar.is_null(src)
         return True
@@ -94,7 +94,6 @@ class ReduceAccessor(RowAccessor):
             return self.agg_func.get_value_bits()
         if src < 0:
             return r_uint64(0)
-        # Guard exemplar access
         if self.exemplar is not None:
             return self.exemplar.get_int(src)
         return r_uint64(0)
@@ -137,7 +136,6 @@ class ReduceAccessor(RowAccessor):
         src = self.mapping_to_input[col_idx]
         if src >= 0 and self.exemplar is not None:
             return self.exemplar.get_str_struct(src)
-        # Return empty string struct
         return (0, 0, lltype.nullptr(rffi.CCHARP.TO), 
                 lltype.nullptr(rffi.CCHARP.TO), None)
 
@@ -156,9 +154,6 @@ class ReduceAccessor(RowAccessor):
 
 @jit.unroll_safe
 def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):
-    """
-    Compares two rows on a specified subset of schema columns.
-    """
     for i in range(len(col_indices)):
         col_idx = col_indices[i]
         col_type = schema.columns[col_idx].field_type.code
@@ -175,47 +170,30 @@ def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):
         elif col_type == types.TYPE_F64.code or col_type == types.TYPE_F32.code:
             va = accessor_a.get_float(col_idx)
             vb = accessor_b.get_float(col_idx)
-            if va < vb:
-                return -1
-            if va > vb:
-                return 1
+            if va < vb: return -1
+            if va > vb: return 1
         elif col_type == types.TYPE_U128.code:
             va = accessor_a.get_u128(col_idx)
             vb = accessor_b.get_u128(col_idx)
-            if va < vb:
-                return -1
-            if va > vb:
-                return 1
+            if va < vb: return -1
+            if va > vb: return 1
         elif (
-            col_type == types.TYPE_I8.code
-            or col_type == types.TYPE_I16.code
-            or col_type == types.TYPE_I32.code
-            or col_type == types.TYPE_I64.code
+            col_type == types.TYPE_I8.code or col_type == types.TYPE_I16.code or
+            col_type == types.TYPE_I32.code or col_type == types.TYPE_I64.code
         ):
             va = accessor_a.get_int_signed(col_idx)
             vb = accessor_b.get_int_signed(col_idx)
-            if va < vb:
-                return -1
-            if va > vb:
-                return 1
+            if va < vb: return -1
+            if va > vb: return 1
         else:
             va = accessor_a.get_int(col_idx)
             vb = accessor_b.get_int(col_idx)
-            if va < vb:
-                return -1
-            if va > vb:
-                return 1
-
+            if va < vb: return -1
+            if va > vb: return 1
     return 0
 
 
 def _argsort_delta(batch, schema, col_indices):
-    """
-    Returns a permutation of [0, count) sorted by the specified group-by columns.
-
-    Optimization: Uses two local RawWALAccessors and bind_raw_accessor to 
-    eliminate PayloadRow allocations during the sort.
-    """
     count = batch.length()
     indices = newlist_hint(count)
     for i in range(count):
@@ -239,15 +217,11 @@ def _argsort_delta(batch, schema, col_indices):
                 j -= 1
             else:
                 break
-
     return indices
 
 
 @jit.unroll_safe
 def _extract_group_key(accessor, schema, col_indices):
-    """
-    Derives the 128-bit group key from the group-by column values.
-    """
     if len(col_indices) == 1:
         c_idx = col_indices[0]
         t = schema.columns[c_idx].field_type.code
@@ -288,117 +262,91 @@ def op_reduce(
 ):
     """
     Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
-    
-    This function implements the core of incremental aggregation. It calculates
-    the change in aggregate values for each modified group.
     """
-    if delta_in.length() == 0:
-        return
+    # Use ConsolidatedScope to ensure delta_in is sorted/consolidated safely.
+    with ConsolidatedScope(delta_in) as b:
+        n = b.length()
+        if n == 0 or agg_func is None:
+            return
 
-    # 1. Pre-processing: Consolidation is required for algebraic correctness.
-    if not delta_in.is_sorted():
-        delta_in.sort()
-    delta_in.consolidate()
+        # 1. Grouping
+        group_by_pk = (
+            len(group_by_cols) == 1
+            and group_by_cols[0] == input_schema.pk_index
+        )
 
-    n = delta_in.length()
-    if n == 0:
-        return
-
-    # Null-guard for agg_func to satisfy RPython Annotator
-    if agg_func is None:
-        return
-
-    # 2. Grouping: Sort the incoming delta by the group-by columns.
-    # Optimization: If we are grouping by the Primary Key, we can skip the argsort.
-    group_by_pk = (
-        len(group_by_cols) == 1
-        and group_by_cols[0] == input_schema.pk_index
-    )
-
-    if group_by_pk:
-        sorted_indices = newlist_hint(n)
-        for i in range(n):
-            sorted_indices.append(i)
-    else:
-        # _argsort_delta uses RawWALAccessors to sort without allocations
-        sorted_indices = _argsort_delta(delta_in, input_schema, group_by_cols)
-
-    # Reusable accessors for the loop
-    acc_in = RawWALAccessor(input_schema)
-    acc_exemplar = RawWALAccessor(input_schema)
-    reduce_acc = ReduceAccessor(input_schema, output_schema, group_by_cols)
-
-    idx = 0
-    while idx < n:
-        # --- Start of Group ---
-        group_start_pos = idx
-        group_start_idx = sorted_indices[group_start_pos]
-
-        delta_in.bind_raw_accessor(group_start_idx, acc_exemplar)
         if group_by_pk:
-            group_key = delta_in.get_pk(group_start_idx)
+            sorted_indices = newlist_hint(n)
+            for i in range(n):
+                sorted_indices.append(i)
         else:
-            group_key = _extract_group_key(acc_exemplar, input_schema, group_by_cols)
+            sorted_indices = _argsort_delta(b, input_schema, group_by_cols)
 
-        # 3. Delta Contribution: Accumulate only the changes from this tick.
-        agg_func.reset()
+        acc_in = RawWALAccessor(input_schema)
+        acc_exemplar = RawWALAccessor(input_schema)
+        reduce_acc = ReduceAccessor(input_schema, output_schema, group_by_cols)
+
+        idx = 0
         while idx < n:
-            curr_idx = sorted_indices[idx]
-            delta_in.bind_raw_accessor(curr_idx, acc_in)
-            
-            # Check if we are still in the same group
+            # --- Start of Group ---
+            group_start_pos = idx
+            group_start_idx = sorted_indices[group_start_pos]
+
+            b.bind_raw_accessor(group_start_idx, acc_exemplar)
             if group_by_pk:
-                if delta_in.get_pk(curr_idx) != group_key:
-                    break
+                group_key = b.get_pk(group_start_idx)
             else:
-                if _compare_by_cols(acc_in, acc_exemplar, input_schema, group_by_cols) != 0:
-                    break
-            
-            agg_func.step(acc_in, delta_in.get_weight(curr_idx))
-            idx += 1
+                group_key = _extract_group_key(acc_exemplar, input_schema, group_by_cols)
 
-        # 4. Retraction: Find the previously emitted aggregate for this group.
-        trace_out_cursor.seek(group_key)
-
-        has_old = False
-        old_val_bits = r_uint64(0)
-        if trace_out_cursor.is_valid() and trace_out_cursor.key() == group_key:
-            has_old = True
-            # The aggregate result is always the last column in the output schema.
-            agg_col_idx = len(output_schema.columns) - 1
-            old_val_bits = trace_out_cursor.get_accessor().get_int(agg_col_idx)
-
-            # Emit the retraction of the previous aggregate value (-1 weight).
-            reduce_acc.set_context(acc_exemplar, agg_func, old_val_bits, True)
-            out_batch.append_from_accessor(group_key, r_int64(-1), reduce_acc)
-
-        # 5. New Value Calculation
-        if agg_func.is_linear() and has_old:
-            # Linear shortcut (Count/Sum): new_agg = old_agg + delta_contribution.
-            agg_func.merge_accumulated(old_val_bits, r_int64(1))
-        
-        elif not agg_func.is_linear():
-            # Non-linear (Min/Max): must replay the full history for this group.
+            # 2. Delta Contribution
             agg_func.reset()
-            if trace_in_cursor is not None:
-                trace_in_cursor.seek(group_key)
-                while trace_in_cursor.is_valid() and trace_in_cursor.key() == group_key:
-                    agg_func.step(trace_in_cursor.get_accessor(), trace_in_cursor.weight())
-                    trace_in_cursor.advance()
-            
-            # Then apply the current tick's delta on top of the recovered history.
-            for k in range(group_start_pos, idx):
-                d_idx = sorted_indices[k]
-                delta_in.bind_raw_accessor(d_idx, acc_in)
-                agg_func.step(acc_in, delta_in.get_weight(d_idx))
+            while idx < n:
+                curr_idx = sorted_indices[idx]
+                b.bind_raw_accessor(curr_idx, acc_in)
+                
+                if group_by_pk:
+                    if b.get_pk(curr_idx) != group_key:
+                        break
+                else:
+                    if _compare_by_cols(acc_in, acc_exemplar, input_schema, group_by_cols) != 0:
+                        break
+                
+                agg_func.step(acc_in, b.get_weight(curr_idx))
+                idx += 1
 
-        # 6. Emission: Emit the updated aggregate value (+1 weight).
-        # Note: In DBSP, if the new count is 0, we simply don't emit an insertion,
-        # effectively leaving only the retraction of the previous value.
-        if not agg_func.is_accumulator_zero():
-            reduce_acc.set_context(acc_exemplar, agg_func, r_uint64(0), False)
-            out_batch.append_from_accessor(group_key, r_int64(1), reduce_acc)
+            # 3. Retraction
+            trace_out_cursor.seek(group_key)
+            has_old = False
+            old_val_bits = r_uint64(0)
+            if trace_out_cursor.is_valid() and trace_out_cursor.key() == group_key:
+                has_old = True
+                agg_col_idx = len(output_schema.columns) - 1
+                old_val_bits = trace_out_cursor.get_accessor().get_int(agg_col_idx)
 
-    # Clean up output batch
-    out_batch.sort()
-    out_batch.consolidate()
+                reduce_acc.set_context(acc_exemplar, agg_func, old_val_bits, True)
+                out_batch.append_from_accessor(group_key, r_int64(-1), reduce_acc)
+
+            # 4. New Value Calculation
+            if agg_func.is_linear() and has_old:
+                agg_func.merge_accumulated(old_val_bits, r_int64(1))
+            elif not agg_func.is_linear():
+                agg_func.reset()
+                if trace_in_cursor is not None:
+                    trace_in_cursor.seek(group_key)
+                    while trace_in_cursor.is_valid() and trace_in_cursor.key() == group_key:
+                        agg_func.step(trace_in_cursor.get_accessor(), trace_in_cursor.weight())
+                        trace_in_cursor.advance()
+                
+                for k in range(group_start_pos, idx):
+                    d_idx = sorted_indices[k]
+                    b.bind_raw_accessor(d_idx, acc_in)
+                    agg_func.step(acc_in, b.get_weight(d_idx))
+
+            # 5. Emission
+            if not agg_func.is_accumulator_zero():
+                reduce_acc.set_context(acc_exemplar, agg_func, r_uint64(0), False)
+                out_batch.append_from_accessor(group_key, r_int64(1), reduce_acc)
+
+    # Note: We do not sort/consolidate out_batch here. The functional sort 
+    # would return a new instance that would be lost. The consumer of this 
+    # batch is responsible for using a Scope if they require a sorted view.
