@@ -8,7 +8,7 @@ from gnitz.core.values import make_payload_row
 from gnitz.core.types import (
     TYPE_U8, TYPE_I8, TYPE_U16, TYPE_I16, TYPE_U32, TYPE_I32, TYPE_F32,
     TYPE_U64, TYPE_I64, TYPE_F64, TYPE_STRING, TYPE_U128,
-    ColumnDefinition, TableSchema
+    ColumnDefinition, TableSchema,
 )
 from gnitz.core.errors import LayoutError
 
@@ -38,7 +38,7 @@ def read_string(accessor, col_idx):
 def pack_column_id(owner_id, col_idx):
     """Synthetic PK for ColTab: (owner_id << 9) | col_idx."""
     return (r_uint64(owner_id) << 9) | r_uint64(col_idx)
-    
+
 
 def pack_node_pk(view_id, node_id):
     return (r_uint128(r_uint64(view_id)) << 64) | r_uint128(r_uint64(node_id))
@@ -127,6 +127,42 @@ class TableTab(BaseTab):
         row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(pk_idx)))
         row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(lsn)))
         batch.append(r_uint128(r_uint64(tid)), r_int64(-1), row)
+
+
+class ViewTab(BaseTab):
+    ID, SUBDIR, NAME = 3, "_views", "_views"
+    COL_SCHEMA_ID, COL_NAME, COL_SQL_DEFINITION, COL_CACHE_DIRECTORY, COL_CREATED_LSN = 1, 2, 3, 4, 5
+
+    @staticmethod
+    def schema():
+        cols = newlist_hint(6)
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="sql_definition"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="cache_directory"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="created_lsn"))
+        return TableSchema(cols, pk_index=0)
+
+    @staticmethod
+    def append(batch, schema, vid, sid, name, sql_def, cache_dir, lsn):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
+        row.append_string(name)
+        row.append_string(sql_def)
+        row.append_string(cache_dir)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(lsn)))
+        batch.append(r_uint128(r_uint64(vid)), r_int64(1), row)
+
+    @staticmethod
+    def retract(batch, schema, vid, sid, name, sql_def, cache_dir, lsn):
+        row = make_payload_row(schema)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
+        row.append_string(name)
+        row.append_string(sql_def)
+        row.append_string(cache_dir)
+        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(lsn)))
+        batch.append(r_uint128(r_uint64(vid)), r_int64(-1), row)
 
 
 class ColTab(BaseTab):
@@ -221,42 +257,6 @@ class IdxTab(BaseTab):
         batch.append(r_uint128(r_uint64(iid)), r_int64(-1), row)
 
 
-class ViewTab(BaseTab):
-    ID, SUBDIR, NAME = 3, "_views", "_views"
-    COL_SCHEMA_ID, COL_NAME, COL_SQL_DEFINITION, COL_CACHE_DIRECTORY, COL_CREATED_LSN = 1, 2, 3, 4, 5
-
-    @staticmethod
-    def schema():
-        cols = newlist_hint(6)
-        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
-        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
-        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
-        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="sql_definition"))
-        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="cache_directory"))
-        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="created_lsn"))
-        return TableSchema(cols, pk_index=0)
-
-    @staticmethod
-    def append(batch, schema, vid, sid, name, sql_def, cache_dir, lsn):
-        row = make_payload_row(schema)
-        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
-        row.append_string(name)
-        row.append_string(sql_def)
-        row.append_string(cache_dir)
-        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(lsn)))
-        batch.append(r_uint128(r_uint64(vid)), r_int64(1), row)
-
-    @staticmethod
-    def retract(batch, schema, vid, sid, name, sql_def, cache_dir, lsn):
-        row = make_payload_row(schema)
-        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
-        row.append_string(name)
-        row.append_string(sql_def)
-        row.append_string(cache_dir)
-        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(lsn)))
-        batch.append(r_uint128(r_uint64(vid)), r_int64(-1), row)
-
-
 class DepTab(BaseTab):
     ID, SUBDIR, NAME = 6, "_view_deps", "_view_deps"
     COL_VIEW_ID, COL_DEP_VIEW_ID, COL_DEP_TABLE_ID = 1, 2, 3
@@ -311,56 +311,6 @@ class SeqTab(BaseTab):
         batch.append(r_uint128(r_uint64(seq_id)), r_int64(-1), row)
 
 
-class InstrTab(BaseTab):
-    ID, SUBDIR, NAME = 8, "_instructions", "_instructions"
-
-    @staticmethod
-    def schema():
-        cols = newlist_hint(21)
-        cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="instr_pk"))
-        regs = [
-            "opcode", "reg_in", "reg_out", "reg_in_a", "reg_in_b",
-            "reg_trace", "reg_trace_in", "reg_trace_out", "reg_delta",
-            "reg_history", "reg_a", "reg_b", "reg_key", "target_table_id",
-            "func_id", "agg_func_id"
-        ]
-        for r in regs:
-            cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name=r))
-        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="group_by_cols"))
-        for r in ["chunk_limit", "jump_target", "yield_reason"]:
-            cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name=r))
-        return TableSchema(cols, pk_index=0)
-
-    @staticmethod
-    def append(batch, schema, ipk, op, rin, rout, rina, rinb, rtr, rtr_in,
-               rtr_out, rdel, rhis, ra, rb, rk, tid, fid, afid, gby, clim, jmp, yres):
-        row = make_payload_row(schema)
-        # Registers 1-16
-        for val in [op, rin, rout, rina, rinb, rtr, rtr_in, rtr_out,
-                    rdel, rhis, ra, rb, rk, tid, fid, afid]:
-            row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(val)))
-        # Group by string
-        row.append_string(gby)
-        # Tail u64s
-        for val in [clim, jmp, yres]:
-            row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(val)))
-
-        batch.append(ipk, r_int64(1), row)
-
-    @staticmethod
-    def retract(batch, schema, ipk, op, rin, rout, rina, rinb, rtr, rtr_in,
-                rtr_out, rdel, rhis, ra, rb, rk, tid, fid, afid, gby, clim, jmp, yres):
-        row = make_payload_row(schema)
-        for val in [op, rin, rout, rina, rinb, rtr, rtr_in, rtr_out,
-                    rdel, rhis, ra, rb, rk, tid, fid, afid]:
-            row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(val)))
-        row.append_string(gby)
-        for val in [clim, jmp, yres]:
-            row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(val)))
-
-        batch.append(ipk, r_int64(-1), row)
-
-
 class FuncTab(BaseTab):
     ID, SUBDIR, NAME = 9, "_functions", "_functions"
 
@@ -384,13 +334,15 @@ class SubTab(BaseTab):
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="client_id"))
         return TableSchema(cols, pk_index=0)
 
+
 class CircuitNodesTab(BaseTab):
     """
     One row per operator node in a compiled view circuit.
     PK: pack_node_pk(view_id, node_id)
     """
+
     ID, SUBDIR, NAME = 11, "_circuit_nodes", "_circuit_nodes"
-    COL_OPCODE = 1  # only payload column
+    COL_OPCODE = 1
 
     @staticmethod
     def schema():
@@ -418,6 +370,7 @@ class CircuitEdgesTab(BaseTab):
     PK: pack_edge_pk(view_id, edge_id)
     edge_id is assigned sequentially by CircuitBuilder.
     """
+
     ID, SUBDIR, NAME = 12, "_circuit_edges", "_circuit_edges"
     COL_SRC_NODE = 1
     COL_DST_NODE = 2
@@ -452,9 +405,10 @@ class CircuitEdgesTab(BaseTab):
 class CircuitSourcesTab(BaseTab):
     """
     Leaf nodes that read from a persistent table (TraceRegisters).
-    table_id=0 means 'the view's input delta stream' (DeltaRegister).
-    PK: pack_node_pk(view_id, node_id)  -- same space as nodes, non-overlapping by convention
+    table_id=0 means the view's input delta stream (DeltaRegister).
+    PK: pack_node_pk(view_id, node_id)
     """
+
     ID, SUBDIR, NAME = 13, "_circuit_sources", "_circuit_sources"
     COL_TABLE_ID = 1
 
@@ -484,6 +438,7 @@ class CircuitParamsTab(BaseTab):
     One row per (node, slot) pair.
     PK: pack_param_pk(view_id, node_id, slot)
     """
+
     ID, SUBDIR, NAME = 14, "_circuit_params", "_circuit_params"
     COL_VALUE = 1
 
@@ -511,7 +466,9 @@ class CircuitGroupColsTab(BaseTab):
     """
     Group-by column indices for REDUCE nodes.
     One row per (node, col_idx) pair. The PK encodes both.
+    PK: pack_gcol_pk(view_id, node_id, col_idx)
     """
+
     ID, SUBDIR, NAME = 15, "_circuit_group_cols", "_circuit_group_cols"
     COL_COL_IDX = 1
 
@@ -539,7 +496,7 @@ def type_code_to_field_type(code):
     """Maps a numeric type code back to a FieldType instance."""
     types_list = [
         TYPE_U8, TYPE_I8, TYPE_U16, TYPE_I16, TYPE_U32, TYPE_I32,
-        TYPE_F32, TYPE_U64, TYPE_I64, TYPE_F64, TYPE_STRING, TYPE_U128
+        TYPE_F32, TYPE_U64, TYPE_I64, TYPE_F64, TYPE_STRING, TYPE_U128,
     ]
     for t in types_list:
         if code == t.code:

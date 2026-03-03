@@ -5,7 +5,7 @@ from rpython.rlib import rposix, rposix_stat
 from rpython.rlib.rarithmetic import r_uint64, intmask, r_ulonglonglong as r_uint128
 from rpython.rlib.objectmodel import newlist_hint
 
-from gnitz.core.types import TableSchema
+from gnitz.core.types import TableSchema, ColumnDefinition
 from gnitz.core.errors import LayoutError
 from gnitz.core.batch import ZSetBatch
 from gnitz.catalog.program_cache import ProgramCache
@@ -41,8 +41,6 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     os.write(1, " -> 3. make_system_tables\n")
     sys_tables = make_system_tables(base_dir)
 
-    # Robust Freshness Check: If the internal tables catalog is empty, 
-    # we must perform the initial bootstrap injection.
     tmp_cursor = sys_tables.tables.create_cursor()
     is_new = not tmp_cursor.is_valid()
     tmp_cursor.close()
@@ -92,8 +90,27 @@ def _validate_fk_column(
 
     promoted_type = get_index_key_type(col.field_type)
     if promoted_type.code != target_pk_type.code:
-        raise LayoutError("FK type mismatch: promoted code %d vs target %d" % 
-                          (promoted_type.code, target_pk_type.code))
+        raise LayoutError(
+            "FK type mismatch: promoted code %d vs target %d"
+            % (promoted_type.code, target_pk_type.code)
+        )
+
+
+def _col_defs_from_graph(graph):
+    """
+    Converts a CircuitGraph's output_col_defs list of (name, type_code) tuples
+    into a list of ColumnDefinition objects suitable for _write_column_records.
+    """
+    result = newlist_hint(len(graph.output_col_defs))
+    for name, type_code in graph.output_col_defs:
+        result.append(
+            ColumnDefinition(
+                sys.type_code_to_field_type(type_code),
+                is_nullable=False,
+                name=name,
+            )
+        )
+    return result
 
 
 class Engine(object):
@@ -101,6 +118,7 @@ class Engine(object):
     The Supervisor for catalog mutations.
     Writes durable intent to System Z-Sets; Handlers react to perform side-effects.
     """
+
     _immutable_fields_ = ["base_dir", "sys", "registry", "handlers", "program_cache"]
 
     def __init__(self, base_dir, sys_tables, registry, handlers, program_cache):
@@ -117,7 +135,6 @@ class Engine(object):
         self.sys.tables = CatalogReactiveStore(self.sys.tables, h, "table")
         self.sys.views = CatalogReactiveStore(self.sys.views, h, "view")
         self.sys.indices = CatalogReactiveStore(self.sys.indices, h, "index")
-        self.sys.instructions = CatalogReactiveStore(self.sys.instructions, h, "instr")
 
     # -- Public Intent API ----------------------------------------------------
 
@@ -151,14 +168,14 @@ class Engine(object):
         self_pk_type = columns[pk_col_idx].field_type
 
         for col_idx in range(len(columns)):
-            _validate_fk_column(columns[col_idx], col_idx, self.registry, 
-                               tid, pk_col_idx, self_pk_type)
+            _validate_fk_column(
+                columns[col_idx], col_idx, self.registry, tid, pk_col_idx, self_pk_type
+            )
 
-        directory = self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
+        directory = (
+            self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
+        )
 
-        # Metadata records are written in sequence. Reactive handlers for the table
-        # record will be able to read the preceding column definitions from the
-        # system table's MemTable without requiring an explicit flush to disk.
         self._write_column_records(tid, sys.OWNER_KIND_TABLE, columns)
         self._write_table_record(tid, sid, table_name, directory, pk_col_idx, 0)
 
@@ -173,28 +190,58 @@ class Engine(object):
         tid = family.table_id
         self._check_for_dependencies(tid, table_name)
 
-        self._retract_table_record(tid, family.schema_id, table_name, family.directory, family.pk_col_idx, 0)
+        self._retract_table_record(
+            tid, family.schema_id, table_name, family.directory, family.pk_col_idx, 0
+        )
         self._retract_column_records(tid, sys.OWNER_KIND_TABLE, family.schema.columns)
 
-    def create_view(self, qualified_name, query_builder, sql_definition=""):
+    def create_view(self, qualified_name, graph, sql_definition=""):
+        """
+        Creates a reactive view from a CircuitGraph produced by CircuitBuilder.build().
+
+        graph: CircuitGraph — carries output_col_defs, dependencies, and the
+               five circuit table payloads (nodes, edges, sources, params,
+               group_cols).
+        """
         schema_name, view_name = parse_qualified_name(qualified_name, "public")
         if self.registry.has(schema_name, view_name):
             raise LayoutError("View/Table already exists")
 
         vid = self.registry.allocate_table_id()
         sid = self.registry.get_schema_id(schema_name)
-        out_schema = query_builder.registers[query_builder.current_reg_idx].vm_schema.table_schema
-        directory = self.base_dir + "/" + schema_name + "/view_" + view_name + "_" + str(vid)
+        directory = (
+            self.base_dir
+            + "/"
+            + schema_name
+            + "/view_"
+            + view_name
+            + "_"
+            + str(vid)
+        )
 
-        # Dependency metadata must be written before the view record to ensure
-        # topological depth calculation works in the reactive handler.
-        self._write_column_records(vid, sys.OWNER_KIND_VIEW, out_schema.columns)
+        # 1. Column records — must precede the view record so the reactive
+        #    handler can reconstruct the TableFamily schema on ingestion.
+        col_defs = _col_defs_from_graph(graph)
+        self._write_column_records(vid, sys.OWNER_KIND_VIEW, col_defs)
+        self.sys.columns.flush()
 
-        deps = self._extract_builder_dependencies(query_builder)
-        self._write_view_deps(vid, deps)
+        # 2. View dependency records — must precede the view record so that
+        #    _compute_view_depth can resolve upstream depths immediately.
+        self._write_view_deps(vid, graph.dependencies)
+        self.sys.view_deps.flush()
 
-        self._write_instruction_records(vid, query_builder.instructions)
+        # 3. Circuit graph records (five tables).
+        self._write_circuit_graph(vid, graph)
+        self.sys.circuit_nodes.flush()
+        self.sys.circuit_edges.flush()
+        self.sys.circuit_sources.flush()
+        self.sys.circuit_params.flush()
+        self.sys.circuit_group_cols.flush()
+
+        # 4. View record — triggers the reactive handler which registers the
+        #    TableFamily in the EntityRegistry.
         self._write_view_record(vid, sid, view_name, sql_definition, directory, 0)
+        self.sys.views.flush()
 
         self._advance_sequence(sys.SEQ_ID_TABLES, vid - 1, vid)
         return self.registry.get(schema_name, view_name)
@@ -206,10 +253,16 @@ class Engine(object):
         self._check_for_dependencies(vid, view_name)
 
         deps = self._read_view_deps(vid)
-        instrs = self._read_view_instructions(vid)
 
-        self._retract_view_record(vid, family.schema_id, view_name, "", family.directory, 0)
-        self._retract_instruction_records(vid, instrs)
+        # Evict the compiled plan before retracting metadata so that any
+        # concurrent get_program call that races with drop cannot receive a
+        # stale plan pointing at freed resources.
+        self.program_cache.invalidate(vid)
+
+        self._retract_view_record(
+            vid, family.schema_id, view_name, "", family.directory, 0
+        )
+        self._retract_circuit_graph(vid)
         self._retract_view_deps(vid, deps)
         self._retract_column_records(vid, sys.OWNER_KIND_VIEW, family.schema.columns)
 
@@ -222,12 +275,14 @@ class Engine(object):
             if family.schema.columns[i].name == col_name:
                 col_idx = i
                 break
-        if col_idx == -1: raise LayoutError("Column not found in owner")
+        if col_idx == -1:
+            raise LayoutError("Column not found in owner")
 
         index_name = make_secondary_index_name(schema_name, table_name, col_name)
         index_id = self.registry.allocate_index_id()
-        self._write_index_record(index_id, family.table_id, sys.OWNER_KIND_TABLE, 
-                                 col_idx, index_name, int(is_unique), "")
+        self._write_index_record(
+            index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx, index_name, int(is_unique), ""
+        )
         self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
         return self.registry.get_index_by_name(index_name)
 
@@ -237,17 +292,28 @@ class Engine(object):
             col = columns[col_idx]
             if col.fk_table_id == 0 or col_idx == family.schema.pk_index:
                 continue
-            index_name = make_fk_index_name(family.schema_name, family.table_name, col.name)
-            if self.registry.has_index_by_name(index_name): continue
+            index_name = make_fk_index_name(
+                family.schema_name, family.table_name, col.name
+            )
+            if self.registry.has_index_by_name(index_name):
+                continue
             index_id = self.registry.allocate_index_id()
-            self._write_index_record(index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx, index_name, 0, "")
+            self._write_index_record(
+                index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx, index_name, 0, ""
+            )
             self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
 
     def drop_index(self, index_name):
         circuit = self.registry.get_index_by_name(index_name)
-        self._retract_index_record(circuit.index_id, circuit.owner_id, sys.OWNER_KIND_TABLE, 
-                                   circuit.source_col_idx, circuit.name, int(circuit.is_unique), 
-                                   circuit.cache_dir)
+        self._retract_index_record(
+            circuit.index_id,
+            circuit.owner_id,
+            sys.OWNER_KIND_TABLE,
+            circuit.source_col_idx,
+            circuit.name,
+            int(circuit.is_unique),
+            circuit.cache_dir,
+        )
 
     def get_table(self, qualified_name):
         schema_name, table_name = parse_qualified_name(qualified_name, "public")
@@ -256,16 +322,19 @@ class Engine(object):
     def close(self):
         for k in self.registry._by_name:
             family = self.registry._by_name[k]
-            if family.table_id >= sys.FIRST_USER_TABLE_ID: family.close()
+            if family.table_id >= sys.FIRST_USER_TABLE_ID:
+                family.close()
         self.sys.close()
 
     def _check_for_dependencies(self, tid, name):
         """Validates that no entities depend on the given ID before dropping it."""
         for k in self.registry._by_name:
             referencing = self.registry._by_name[k]
-            if referencing.table_id == tid: continue
+            if referencing.table_id == tid:
+                continue
             for col in referencing.schema.columns:
-                if col.fk_table_id == tid: raise LayoutError("FK dependency: table '%s'" % name)
+                if col.fk_table_id == tid:
+                    raise LayoutError("FK dependency: table '%s'" % name)
 
         cursor = self.sys.view_deps.create_cursor()
         try:
@@ -279,14 +348,6 @@ class Engine(object):
         finally:
             cursor.close()
 
-    def _extract_builder_dependencies(self, builder):
-        deps = newlist_hint(len(builder.registers))
-        for reg in builder.registers:
-            if reg is not None and reg.is_trace() and reg.table is not None:
-                tid = reg.table.table_id
-                if tid > 0 and tid not in deps: deps.append(tid)
-        return deps
-
     def _read_view_deps(self, vid):
         cursor = self.sys.view_deps.create_cursor()
         res = newlist_hint(4)
@@ -294,38 +355,165 @@ class Engine(object):
             while cursor.is_valid():
                 acc = cursor.get_accessor()
                 if intmask(acc.get_int(sys.DepTab.COL_VIEW_ID)) == vid and cursor.weight() > 0:
-                    res.append((intmask(r_uint64(cursor.key())), 
-                                intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)),
-                                intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID))))
+                    res.append(
+                        (
+                            intmask(r_uint64(cursor.key())),
+                            intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)),
+                            intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)),
+                        )
+                    )
                 cursor.advance()
         finally:
             cursor.close()
         return res
 
-    def _read_view_instructions(self, vid):
-        cursor = self.sys.instructions.create_cursor()
-        res = newlist_hint(16)
+    # -- Circuit Graph Write Helpers ------------------------------------------
+
+    def _write_circuit_graph(self, vid, graph):
+        """Ingests all five circuit table payloads from a CircuitGraph."""
+        s = self.sys.circuit_nodes.schema
+        batch = ZSetBatch(s)
+        for node_id, opcode in graph.nodes:
+            sys.CircuitNodesTab.append(batch, s, vid, node_id, opcode)
+        self.sys.circuit_nodes.ingest_batch(batch)
+        batch.free()
+
+        s = self.sys.circuit_edges.schema
+        batch = ZSetBatch(s)
+        for edge_id, src, dst, port in graph.edges:
+            sys.CircuitEdgesTab.append(batch, s, vid, edge_id, src, dst, port)
+        self.sys.circuit_edges.ingest_batch(batch)
+        batch.free()
+
+        s = self.sys.circuit_sources.schema
+        batch = ZSetBatch(s)
+        for node_id, table_id in graph.sources:
+            sys.CircuitSourcesTab.append(batch, s, vid, node_id, table_id)
+        self.sys.circuit_sources.ingest_batch(batch)
+        batch.free()
+
+        s = self.sys.circuit_params.schema
+        batch = ZSetBatch(s)
+        for node_id, slot, value in graph.params:
+            sys.CircuitParamsTab.append(batch, s, vid, node_id, slot, value)
+        self.sys.circuit_params.ingest_batch(batch)
+        batch.free()
+
+        s = self.sys.circuit_group_cols.schema
+        batch = ZSetBatch(s)
+        for node_id, col_idx in graph.group_cols:
+            sys.CircuitGroupColsTab.append(batch, s, vid, node_id, col_idx)
+        self.sys.circuit_group_cols.ingest_batch(batch)
+        batch.free()
+
+    def _retract_circuit_graph(self, vid):
+        """
+        Scans all five circuit tables for the given view_id and retracts every
+        record found.  Uses the same range-scan convention as ProgramCache's
+        loaders: [vid << 64, (vid+1) << 64).
+        """
+        start_key = r_uint128(r_uint64(vid)) << 64
+        end_key = r_uint128(r_uint64(vid + 1)) << 64
+
+        # Nodes
+        s = self.sys.circuit_nodes.schema
+        batch = ZSetBatch(s)
+        cursor = self.sys.circuit_nodes.create_cursor()
         try:
-            start_key = r_uint128(r_uint64(vid)) << 64
             cursor.seek(start_key)
-            while cursor.is_valid():
-                key = cursor.key()
-                if intmask(r_uint64(key >> 64)) != vid: break
+            while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > 0:
+                    pk = cursor.key()
                     acc = cursor.get_accessor()
-                    payload = newlist_hint(20)
-                    for j in range(1, 14 + 1): payload.append(intmask(acc.get_int(j)))
-                    payload.append(intmask(acc.get_int(15)))
-                    payload.append(intmask(acc.get_int(16)))
-                    payload.append(sys.read_string(acc, 17))
-                    payload.append(intmask(acc.get_int(18)))
-                    payload.append(intmask(acc.get_int(19)))
-                    payload.append(intmask(acc.get_int(20)))
-                    res.append((key, payload))
+                    node_id = intmask(r_uint64(pk))
+                    opcode = intmask(acc.get_int(sys.CircuitNodesTab.COL_OPCODE))
+                    sys.CircuitNodesTab.retract(batch, s, vid, node_id, opcode)
                 cursor.advance()
         finally:
             cursor.close()
-        return res
+        self.sys.circuit_nodes.ingest_batch(batch)
+        batch.free()
+
+        # Edges
+        s = self.sys.circuit_edges.schema
+        batch = ZSetBatch(s)
+        cursor = self.sys.circuit_edges.create_cursor()
+        try:
+            cursor.seek(start_key)
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > 0:
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    edge_id = intmask(r_uint64(pk))
+                    src = intmask(acc.get_int(sys.CircuitEdgesTab.COL_SRC_NODE))
+                    dst = intmask(acc.get_int(sys.CircuitEdgesTab.COL_DST_NODE))
+                    port = intmask(acc.get_int(sys.CircuitEdgesTab.COL_DST_PORT))
+                    sys.CircuitEdgesTab.retract(batch, s, vid, edge_id, src, dst, port)
+                cursor.advance()
+        finally:
+            cursor.close()
+        self.sys.circuit_edges.ingest_batch(batch)
+        batch.free()
+
+        # Sources
+        s = self.sys.circuit_sources.schema
+        batch = ZSetBatch(s)
+        cursor = self.sys.circuit_sources.create_cursor()
+        try:
+            cursor.seek(start_key)
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > 0:
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    node_id = intmask(r_uint64(pk))
+                    table_id = intmask(acc.get_int(sys.CircuitSourcesTab.COL_TABLE_ID))
+                    sys.CircuitSourcesTab.retract(batch, s, vid, node_id, table_id)
+                cursor.advance()
+        finally:
+            cursor.close()
+        self.sys.circuit_sources.ingest_batch(batch)
+        batch.free()
+
+        # Params
+        s = self.sys.circuit_params.schema
+        batch = ZSetBatch(s)
+        cursor = self.sys.circuit_params.create_cursor()
+        try:
+            cursor.seek(start_key)
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > 0:
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    lo64 = r_uint64(pk)
+                    node_id = intmask(lo64 >> 8)
+                    slot = intmask(lo64 & r_uint64(0xFF))
+                    value = intmask(acc.get_int(sys.CircuitParamsTab.COL_VALUE))
+                    sys.CircuitParamsTab.retract(batch, s, vid, node_id, slot, value)
+                cursor.advance()
+        finally:
+            cursor.close()
+        self.sys.circuit_params.ingest_batch(batch)
+        batch.free()
+
+        # Group cols
+        s = self.sys.circuit_group_cols.schema
+        batch = ZSetBatch(s)
+        cursor = self.sys.circuit_group_cols.create_cursor()
+        try:
+            cursor.seek(start_key)
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > 0:
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    lo64 = r_uint64(pk)
+                    node_id = intmask(lo64 >> 16)
+                    col_idx = intmask(lo64 & r_uint64(0xFFFF))
+                    sys.CircuitGroupColsTab.retract(batch, s, vid, node_id, col_idx)
+                cursor.advance()
+        finally:
+            cursor.close()
+        self.sys.circuit_group_cols.ingest_batch(batch)
+        batch.free()
 
     # -- Private Write Helpers ------------------------------------------------
 
@@ -388,66 +576,15 @@ class Engine(object):
         self.sys.view_deps.ingest_batch(batch)
         batch.free()
 
-    def _extract_tid_from_instr(self, instr):
-        """
-        Derives the table_id context for a VM instruction.
-        Essential for re-hydrating the VM Program Cache after a restart.
-        """
-        if instr.target_table: 
-            return instr.target_table.table_id
-        
-        # Inspection of associated registers
-        if instr.reg_trace and instr.reg_trace.table: 
-            return instr.reg_trace.table.table_id
-        if instr.reg_trace_in and instr.reg_trace_in.table: 
-            return instr.reg_trace_in.table.table_id
-        if instr.reg_trace_out and instr.reg_trace_out.table: 
-            return instr.reg_trace_out.table.table_id
-        return 0
-
-    def _write_instruction_records(self, vid, instructions):
-        s = self.sys.instructions.schema
-        batch = ZSetBatch(s)
-        v_hi = r_uint64(vid)
-        for i in range(len(instructions)):
-            instr = instructions[i]
-            ipk = (r_uint128(v_hi) << 64) | r_uint128(r_uint64(i))
-            
-            # Deep inspection of instruction context for persistence
-            tid = self._extract_tid_from_instr(instr)
-
-            sys.InstrTab.append(batch, s, ipk, instr.opcode,
-                instr.reg_in.reg_id if instr.reg_in else 0,
-                instr.reg_out.reg_id if instr.reg_out else 0,
-                instr.reg_in_a.reg_id if instr.reg_in_a else 0,
-                instr.reg_in_b.reg_id if instr.reg_in_b else 0,
-                instr.reg_trace.reg_id if instr.reg_trace else 0,
-                instr.reg_trace_in.reg_id if instr.reg_trace_in else 0,
-                instr.reg_trace_out.reg_id if instr.reg_trace_out else 0,
-                instr.reg_delta.reg_id if instr.reg_delta else 0,
-                instr.reg_history.reg_id if instr.reg_history else 0,
-                instr.reg_a.reg_id if instr.reg_a else 0,
-                instr.reg_b.reg_id if instr.reg_b else 0,
-                instr.reg_key.reg_id if instr.reg_key else 0,
-                tid, 0, 0, "", 
-                instr.chunk_limit, instr.jump_target, instr.yield_reason)
-        self.sys.instructions.ingest_batch(batch)
-        batch.free()
-
-    def _retract_instruction_records(self, vid, records):
-        s = self.sys.instructions.schema
-        batch = ZSetBatch(s)
-        for ipk, p in records:
-            sys.InstrTab.retract(batch, s, ipk, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15], p[16], p[17], p[18], p[19])
-        self.sys.instructions.ingest_batch(batch)
-        batch.free()
-
     def _write_column_records(self, oid, kind, columns):
         s = self.sys.columns.schema
         batch = ZSetBatch(s)
         for i in range(len(columns)):
             col = columns[i]
-            sys.ColTab.append(batch, s, oid, kind, i, col.name, col.field_type.code, int(col.is_nullable), col.fk_table_id, col.fk_col_idx)
+            sys.ColTab.append(
+                batch, s, oid, kind, i, col.name, col.field_type.code,
+                int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
+            )
         self.sys.columns.ingest_batch(batch)
         batch.free()
 
@@ -456,7 +593,10 @@ class Engine(object):
         batch = ZSetBatch(s)
         for i in range(len(columns)):
             col = columns[i]
-            sys.ColTab.retract(batch, s, oid, kind, i, col.name, col.field_type.code, int(col.is_nullable), col.fk_table_id, col.fk_col_idx)
+            sys.ColTab.retract(
+                batch, s, oid, kind, i, col.name, col.field_type.code,
+                int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
+            )
         self.sys.columns.ingest_batch(batch)
         batch.free()
 

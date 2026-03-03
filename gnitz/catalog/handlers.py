@@ -63,9 +63,6 @@ class CatalogReactiveStore(ReactiveStore):
             self.handlers.on_view_delta(batch)
         elif self.callback_kind == "index":
             self.handlers.on_index_delta(batch)
-        elif self.callback_kind == "instr":
-            # Instruction changes invalidate the JIT-compiled VM program cache.
-            self.handlers.program_cache.invalidate_all()
 
 
 class CatalogHandlers(object):
@@ -130,9 +127,10 @@ class CatalogHandlers(object):
 
                 col_defs = read_column_defs(self.sys_tables.columns, tid)
                 if len(col_defs) == 0:
-                    # If metadata is missing, we cannot register the family. This is
-                    # only expected if the WAL is corrupt or DDL was interrupted.
-                    os.write(1, " [ERROR] Cannot register table '%s': columns not found\n" % name)
+                    os.write(
+                        1,
+                        " [ERROR] Cannot register table '%s': columns not found\n" % name,
+                    )
                     continue
 
                 tbl_schema = TableSchema(col_defs, pk_col_idx)
@@ -149,13 +147,15 @@ class CatalogHandlers(object):
             else:
                 if self.registry.has_id(tid):
                     family = self.registry.get_by_id(tid)
-                    # Referential integrity audit
                     for k in self.registry._by_name:
                         referencing = self.registry._by_name[k]
-                        if referencing.table_id == tid: continue
+                        if referencing.table_id == tid:
+                            continue
                         for col in referencing.schema.columns:
                             if col.fk_table_id == tid:
-                                raise LayoutError("Integrity violation: table referenced by '%s'" % k)
+                                raise LayoutError(
+                                    "Integrity violation: table referenced by '%s'" % k
+                                )
 
                     family.close()
                     self.registry.unregister(family.schema_name, family.table_name)
@@ -178,7 +178,10 @@ class CatalogHandlers(object):
 
                 col_defs = read_column_defs(self.sys_tables.columns, vid)
                 if len(col_defs) == 0:
-                    os.write(1, " [ERROR] Cannot register view '%s': columns not found\n" % name)
+                    os.write(
+                        1,
+                        " [ERROR] Cannot register view '%s': columns not found\n" % name,
+                    )
                     continue
 
                 tbl_schema = TableSchema(col_defs, pk_index=0)
@@ -187,22 +190,6 @@ class CatalogHandlers(object):
 
                 family = TableFamily(schema_name, name, vid, sid, directory, 0, et)
 
-                # Compute and cache the topological depth of this view.
-                #
-                # Placed after TableFamily construction (depth defaults to 0)
-                # and before registry.register(family), so that any downstream
-                # view registered later can read this view's depth out of the
-                # registry and correctly compute its own depth.
-                #
-                # During live DDL: engine.create_view ingests dependency metadata
-                # into the system stores before the view record itself. Because 
-                # CatalogReactiveStore runs the handler AFTER the internal store 
-                # ingestion, the dependency records are visible in the MemTable 
-                # to the cursor opened by _compute_view_depth.
-                #
-                # During replay: the system stores are fully re-hydrated from 
-                # disk before any reactive handlers are triggered, ensuring 
-                # global visibility.
                 family.depth = _compute_view_depth(
                     vid, self.sys_tables.view_deps, self.registry
                 )
@@ -238,8 +225,15 @@ class CatalogHandlers(object):
                 idx_dir = family.directory + "/idx_" + str(idx_id)
 
                 circuit = _make_index_circuit(
-                    idx_id, owner_id, source_col_idx, col.field_type,
-                    source_pk_type, idx_dir, name, is_unique, cache_dir,
+                    idx_id,
+                    owner_id,
+                    source_col_idx,
+                    col.field_type,
+                    source_pk_type,
+                    idx_dir,
+                    name,
+                    is_unique,
+                    cache_dir,
                 )
 
                 _backfill_index(circuit, family)

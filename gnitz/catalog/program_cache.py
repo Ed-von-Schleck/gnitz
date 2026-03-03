@@ -3,6 +3,8 @@
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask, r_int64
 
+from gnitz.core import opcodes
+from gnitz.core.types import merge_schemas_for_join, _build_reduce_output_schema
 from gnitz.catalog import system_tables as sys
 from gnitz.vm import instructions, runtime
 from gnitz.dbsp import functions
@@ -26,9 +28,10 @@ def _get_agg_func(agg_func_id):
 class ProgramCache(object):
     """
     Caches execution plans for Reactive Views.
-    Translates rows from `_system._instructions` into `runtime.ExecutablePlan`
-    objects containing monomorphic `Instruction` lists and pre-allocated
-    `RegisterFile`s.
+    Translates the five _circuit_* graph tables into runtime.ExecutablePlan
+    objects containing monomorphic Instruction lists and pre-allocated
+    RegisterFiles. Three clean passes: topological sort, register
+    assignment, instruction emission.
     """
 
     _immutable_fields_ = ["registry", "_cache"]
@@ -48,25 +51,146 @@ class ProgramCache(object):
         if program_id in self._cache:
             return self._cache[program_id]
 
-        plan = self._load_program(program_id)
+        plan = self.compile_from_graph(program_id)
         if plan is not None:
             self._cache[program_id] = plan
         return plan
 
-    def _parse_group_by_cols(self, s):
-        if not s:
-            return newlist_hint(0)
-        parts = s.split(",")
-        res = newlist_hint(len(parts))
-        for p in parts:
-            if p:
-                res.append(int(p))
-        return res
+    # ── Graph Table Loaders ───────────────────────────────────────────────
+
+    def _load_nodes(self, view_id):
+        """Returns list of (node_id, opcode) tuples."""
+        if not self.registry.has_id(sys.CircuitNodesTab.ID):
+            return []
+        family = self.registry.get_by_id(sys.CircuitNodesTab.ID)
+        cursor = family.create_cursor()
+        result = newlist_hint(8)
+        start_key = r_uint128(r_uint64(view_id)) << 64
+        end_key = r_uint128(r_uint64(view_id + 1)) << 64
+        try:
+            cursor.seek(start_key)
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > r_int64(0):
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    node_id = intmask(r_uint64(pk))
+                    opcode = intmask(acc.get_int(sys.CircuitNodesTab.COL_OPCODE))
+                    result.append((node_id, opcode))
+                cursor.advance()
+        finally:
+            cursor.close()
+        return result
+
+    def _load_edges(self, view_id):
+        """Returns list of (edge_id, src_node, dst_node, dst_port) tuples."""
+        if not self.registry.has_id(sys.CircuitEdgesTab.ID):
+            return []
+        family = self.registry.get_by_id(sys.CircuitEdgesTab.ID)
+        cursor = family.create_cursor()
+        result = newlist_hint(8)
+        start_key = r_uint128(r_uint64(view_id)) << 64
+        end_key = r_uint128(r_uint64(view_id + 1)) << 64
+        try:
+            cursor.seek(start_key)
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > r_int64(0):
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    edge_id = intmask(r_uint64(pk))
+                    src = intmask(acc.get_int(sys.CircuitEdgesTab.COL_SRC_NODE))
+                    dst = intmask(acc.get_int(sys.CircuitEdgesTab.COL_DST_NODE))
+                    port = intmask(acc.get_int(sys.CircuitEdgesTab.COL_DST_PORT))
+                    result.append((edge_id, src, dst, port))
+                cursor.advance()
+        finally:
+            cursor.close()
+        return result
+
+    def _load_sources(self, view_id):
+        """Returns dict: node_id -> table_id."""
+        if not self.registry.has_id(sys.CircuitSourcesTab.ID):
+            return {}
+        family = self.registry.get_by_id(sys.CircuitSourcesTab.ID)
+        cursor = family.create_cursor()
+        result = {}
+        start_key = r_uint128(r_uint64(view_id)) << 64
+        end_key = r_uint128(r_uint64(view_id + 1)) << 64
+        try:
+            cursor.seek(start_key)
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > r_int64(0):
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    node_id = intmask(r_uint64(pk))
+                    table_id = intmask(acc.get_int(sys.CircuitSourcesTab.COL_TABLE_ID))
+                    result[node_id] = table_id
+                cursor.advance()
+        finally:
+            cursor.close()
+        return result
+
+    def _load_params(self, view_id):
+        """Returns dict: node_id -> dict: slot -> value."""
+        if not self.registry.has_id(sys.CircuitParamsTab.ID):
+            return {}
+        family = self.registry.get_by_id(sys.CircuitParamsTab.ID)
+        cursor = family.create_cursor()
+        result = {}
+        start_key = r_uint128(r_uint64(view_id)) << 64
+        end_key = r_uint128(r_uint64(view_id + 1)) << 64
+        try:
+            cursor.seek(start_key)
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > r_int64(0):
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    # pack_param_pk encodes: lo64 = (node_id << 8) | slot
+                    lo64 = r_uint64(pk)
+                    node_id = intmask(lo64 >> 8)
+                    slot = intmask(lo64 & r_uint64(0xFF))
+                    value = intmask(acc.get_int(sys.CircuitParamsTab.COL_VALUE))
+                    if node_id not in result:
+                        result[node_id] = {}
+                    result[node_id][slot] = value
+                cursor.advance()
+        finally:
+            cursor.close()
+        return result
+
+    def _load_group_cols(self, view_id):
+        """Returns dict: node_id -> list of col_idx."""
+        if not self.registry.has_id(sys.CircuitGroupColsTab.ID):
+            return {}
+        family = self.registry.get_by_id(sys.CircuitGroupColsTab.ID)
+        cursor = family.create_cursor()
+        result = {}
+        start_key = r_uint128(r_uint64(view_id)) << 64
+        end_key = r_uint128(r_uint64(view_id + 1)) << 64
+        try:
+            cursor.seek(start_key)
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > r_int64(0):
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    # pack_gcol_pk encodes: lo64 = (node_id << 16) | col_idx
+                    lo64 = r_uint64(pk)
+                    node_id = intmask(lo64 >> 16)
+                    col_idx = intmask(lo64 & r_uint64(0xFFFF))
+                    if node_id not in result:
+                        result[node_id] = newlist_hint(4)
+                    result[node_id].append(col_idx)
+                cursor.advance()
+        finally:
+            cursor.close()
+        return result
+
+    # ── Schema Resolution ─────────────────────────────────────────────────
 
     def _resolve_primary_input_schema(self, program_id, fallback):
         """
-        Queries _system._view_deps to find the schema of the primary upstream
-        source for this view (the table or view whose delta arrives in register 0).
+        Queries _view_deps to find the schema of the primary upstream source
+        for this view (the table or view whose delta arrives in the input
+        DeltaRegister).
         """
         if not self.registry.has_id(sys.DepTab.ID):
             return fallback
@@ -86,7 +210,6 @@ class ProgramCache(object):
                     dep_table_id = intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID))
                     dep_view_id = intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID))
 
-                    # Prefer a concrete base table over a derived view dependency.
                     source_id = dep_table_id if dep_table_id > 0 else dep_view_id
                     if source_id > 0 and self.registry.has_id(source_id):
                         result = self.registry.get_by_id(source_id).schema
@@ -96,313 +219,335 @@ class ProgramCache(object):
             cursor.close()
         return result
 
-    def _load_program(self, program_id):
-        if not self.registry.has_id(sys.InstrTab.ID):
+    # ── Compiler ──────────────────────────────────────────────────────────
+
+    def compile_from_graph(self, view_id):
+        """
+        Compiles a stored circuit graph into an ExecutablePlan.
+
+        Three passes:
+          1. Topological sort (Kahn's algorithm).
+          2. Register assignment — one slot per node output.
+          3. Instruction emission — walks ordered nodes, builds RegisterFile
+             and program list.
+
+        SCAN_TRACE nodes are handled in three sub-cases:
+          - table_id=0  : primary input DeltaRegister; no instruction emitted.
+          - feeds PORT_TRACE : trace-side source for a join; stays a
+            TraceRegister so the join can access its cursor directly; no
+            ScanTraceOp emitted.
+          - otherwise   : explicit scan; allocates a TraceRegister (cursor
+            holder) plus an extra DeltaRegister (output); emits ScanTraceOp.
+
+        DISTINCT and REDUCE similarly require one extra DeltaRegister each
+        for their output delta, in addition to the TraceRegister used for
+        history / accumulation state.  All extra registers are pre-counted
+        before the RegisterFile is allocated to avoid resizing.
+        """
+        nodes = self._load_nodes(view_id)
+        if not nodes:
             return None
 
-        if not self.registry.has_id(program_id):
+        if not self.registry.has_id(view_id):
             return None
 
-        view_family = self.registry.get_by_id(program_id)
+        edges = self._load_edges(view_id)
+        sources = self._load_sources(view_id)
+        params = self._load_params(view_id)
+        group_cols = self._load_group_cols(view_id)
+
+        view_family = self.registry.get_by_id(view_id)
         out_schema = view_family.schema
+        in_schema = self._resolve_primary_input_schema(view_id, out_schema)
 
-        # Resolve input schema (Register 0) by checking the dependency graph.
-        in_schema = self._resolve_primary_input_schema(program_id, out_schema)
+        # ── Pass 1: Topological sort (Kahn's algorithm) ───────────────────
 
-        sys_instr = self.registry.get_by_id(sys.InstrTab.ID)
-        cursor = sys_instr.create_cursor()
+        node_ids = newlist_hint(len(nodes))
+        opcode_of = {}
+        for nid, op in nodes:
+            node_ids.append(nid)
+            opcode_of[nid] = op
 
-        program = [instructions.Instruction(0)]
-        program.pop()
-        reg_file = runtime.RegisterFile(16)
+        outgoing = {}
+        incoming = {}
+        for nid in node_ids:
+            outgoing[nid] = newlist_hint(2)
+            incoming[nid] = newlist_hint(2)
 
-        try:
-            pid_hi = r_uint64(program_id)
-            pid_lo = r_uint64(0)
-            start_key = (r_uint128(pid_hi) << 64) | r_uint128(pid_lo)
-            cursor.seek(start_key)
+        for _, src, dst, port in edges:
+            outgoing[src].append((dst, port))
+            incoming[dst].append(src)
 
-            while cursor.is_valid():
-                key = cursor.key()
-                current_prog_id = intmask(r_uint64(key >> 64))
-                if current_prog_id != program_id:
-                    break
+        in_degree = {}
+        for nid in node_ids:
+            in_degree[nid] = len(incoming[nid])
 
-                if cursor.weight() <= r_int64(0):
-                    cursor.advance()
-                    continue
+        queue = newlist_hint(len(node_ids))
+        for nid in node_ids:
+            if in_degree[nid] == 0:
+                queue.append(nid)
 
-                acc = cursor.get_accessor()
-                # Instructions schema (Payload indices start after Col 0 PK):
-                # acc(0) -> Opcode, acc(1) -> reg_in, acc(2) -> reg_out, etc.
-                opcode = intmask(acc.get_int(1))
-                instr = None
+        ordered = newlist_hint(len(node_ids))
+        while queue:
+            nid = queue.pop(0)
+            ordered.append(nid)
+            for dst, _ in outgoing[nid]:
+                in_degree[dst] -= 1
+                if in_degree[dst] == 0:
+                    queue.append(dst)
 
-                if opcode == instructions.Instruction.FILTER:
-                    rid_in = intmask(acc.get_int(2))
-                    rid_out = intmask(acc.get_int(3))
-                    tid = intmask(acc.get_int(14))
-
-                    r_in = reg_file.registers[rid_in]
-                    if r_in is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
-                        r_in = runtime.DeltaRegister(rid_in, runtime.VMSchema(sch))
-                        reg_file.registers[rid_in] = r_in
-
-                    r_out = reg_file.registers[rid_out]
-                    if r_out is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
-                        reg_file.registers[rid_out] = r_out
-
-                    instr = instructions.FilterOp(
-                        r_in, r_out, _get_scalar_func(intmask(acc.get_int(15)))
-                    )
-
-                elif opcode == instructions.Instruction.MAP:
-                    rid_in = intmask(acc.get_int(2))
-                    rid_out = intmask(acc.get_int(3))
-                    tid = intmask(acc.get_int(14))
-
-                    r_in = reg_file.registers[rid_in]
-                    if r_in is None:
-                        r_in = runtime.DeltaRegister(rid_in, runtime.VMSchema(in_schema))
-                        reg_file.registers[rid_in] = r_in
-
-                    r_out = reg_file.registers[rid_out]
-                    if r_out is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else out_schema
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
-                        reg_file.registers[rid_out] = r_out
-
-                    instr = instructions.MapOp(
-                        r_in, r_out, _get_scalar_func(intmask(acc.get_int(15)))
-                    )
-
-                elif opcode == instructions.Instruction.NEGATE:
-                    rid_in = intmask(acc.get_int(2))
-                    rid_out = intmask(acc.get_int(3))
-                    tid = intmask(acc.get_int(14))
-
-                    r_in = reg_file.registers[rid_in]
-                    if r_in is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
-                        r_in = runtime.DeltaRegister(rid_in, runtime.VMSchema(sch))
-                        reg_file.registers[rid_in] = r_in
-                    r_out = reg_file.registers[rid_out]
-                    if r_out is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
-                        reg_file.registers[rid_out] = r_out
-                    instr = instructions.NegateOp(r_in, r_out)
-
-                elif opcode == instructions.Instruction.UNION:
-                    rid_in_a = intmask(acc.get_int(4))
-                    rid_in_b = intmask(acc.get_int(5))
-                    rid_out = intmask(acc.get_int(3))
-                    tid = intmask(acc.get_int(14))
-
-                    r_in_a = reg_file.registers[rid_in_a]
-                    if r_in_a is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
-                        r_in_a = runtime.DeltaRegister(rid_in_a, runtime.VMSchema(sch))
-                        reg_file.registers[rid_in_a] = r_in_a
-                    r_in_b = reg_file.registers[rid_in_b]
-                    if r_in_b is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
-                        r_in_b = runtime.DeltaRegister(rid_in_b, runtime.VMSchema(sch))
-                        reg_file.registers[rid_in_b] = r_in_b
-                    r_out = reg_file.registers[rid_out]
-                    if r_out is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
-                        reg_file.registers[rid_out] = r_out
-                    instr = instructions.UnionOp(r_in_a, r_in_b, r_out)
-
-                elif opcode == instructions.Instruction.JOIN_DELTA_TRACE:
-                    rid_delta = intmask(acc.get_int(9))
-                    rid_trace = intmask(acc.get_int(6))
-                    rid_out = intmask(acc.get_int(3))
-                    tid = intmask(acc.get_int(14))
-
-                    r_delta = reg_file.registers[rid_delta]
-                    if r_delta is None:
-                        r_delta = runtime.DeltaRegister(rid_delta, runtime.VMSchema(in_schema))
-                        reg_file.registers[rid_delta] = r_delta
-
-                    r_trace = reg_file.registers[rid_trace]
-                    if r_trace is None and tid > 0:
-                        f = self.registry.get_by_id(tid)
-                        r_trace = runtime.TraceRegister(rid_trace, runtime.VMSchema(f.schema), f.create_cursor(), f)
-                        reg_file.registers[rid_trace] = r_trace
-
-                    r_out = reg_file.registers[rid_out]
-                    if r_out is None:
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(out_schema))
-                        reg_file.registers[rid_out] = r_out
-                    instr = instructions.JoinDeltaTraceOp(r_delta, r_trace, r_out)
-
-                elif opcode == instructions.Instruction.JOIN_DELTA_DELTA:
-                    rid_a = intmask(acc.get_int(11))
-                    rid_b = intmask(acc.get_int(12))
-                    rid_out = intmask(acc.get_int(3))
-                    tid = intmask(acc.get_int(14))
-
-                    r_a = reg_file.registers[rid_a]
-                    if r_a is None:
-                        r_a = runtime.DeltaRegister(rid_a, runtime.VMSchema(in_schema))
-                        reg_file.registers[rid_a] = r_a
-                    r_b = reg_file.registers[rid_b]
-                    if r_b is None:
-                        r_b = runtime.DeltaRegister(rid_b, runtime.VMSchema(in_schema))
-                        reg_file.registers[rid_b] = r_b
-                    r_out = reg_file.registers[rid_out]
-                    if r_out is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else out_schema
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
-                        reg_file.registers[rid_out] = r_out
-                    instr = instructions.JoinDeltaDeltaOp(r_a, r_b, r_out)
-
-                elif opcode == instructions.Instruction.INTEGRATE:
-                    rid_in = intmask(acc.get_int(2))
-                    tid = intmask(acc.get_int(14))
-                    r_in = reg_file.registers[rid_in]
-                    if r_in is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
-                        r_in = runtime.DeltaRegister(rid_in, runtime.VMSchema(sch))
-                        reg_file.registers[rid_in] = r_in
-                    target = self.registry.get_by_id(tid) if self.registry.has_id(tid) else None
-                    instr = instructions.IntegrateOp(r_in, target)
-
-                elif opcode == instructions.Instruction.DELAY:
-                    rid_in = intmask(acc.get_int(2))
-                    rid_out = intmask(acc.get_int(3))
-                    tid = intmask(acc.get_int(14))
-
-                    r_in = reg_file.registers[rid_in]
-                    if r_in is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
-                        r_in = runtime.DeltaRegister(rid_in, runtime.VMSchema(sch))
-                        reg_file.registers[rid_in] = r_in
-                    r_out = reg_file.registers[rid_out]
-                    if r_out is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else in_schema
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
-                        reg_file.registers[rid_out] = r_out
-                    instr = instructions.DelayOp(r_in, r_out)
-
-                elif opcode == instructions.Instruction.REDUCE:
-                    rid_in = intmask(acc.get_int(2))
-                    rid_tr_in = intmask(acc.get_int(7))
-                    rid_tr_out = intmask(acc.get_int(8))
-                    rid_out = intmask(acc.get_int(3))
-                    tid = intmask(acc.get_int(14))
-
-                    r_in = reg_file.registers[rid_in]
-                    if r_in is None:
-                        r_in = runtime.DeltaRegister(rid_in, runtime.VMSchema(in_schema))
-                        reg_file.registers[rid_in] = r_in
-
-                    r_tr_in = reg_file.registers[rid_tr_in]
-                    if r_tr_in is None and tid > 0:
-                        f = self.registry.get_by_id(tid)
-                        r_tr_in = runtime.TraceRegister(rid_tr_in, runtime.VMSchema(f.schema), f.create_cursor(), f)
-                        reg_file.registers[rid_tr_in] = r_tr_in
-
-                    r_tr_out = reg_file.registers[rid_tr_out]
-                    if r_tr_out is None and tid > 0:
-                        f = self.registry.get_by_id(tid)
-                        r_tr_out = runtime.TraceRegister(rid_tr_out, runtime.VMSchema(f.schema), f.create_cursor(), f)
-                        reg_file.registers[rid_tr_out] = r_tr_out
-
-                    r_out = reg_file.registers[rid_out]
-                    if r_out is None:
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(out_schema))
-                        reg_file.registers[rid_out] = r_out
-
-                    instr = instructions.ReduceOp(
-                        r_in, r_tr_in, r_tr_out, r_out,
-                        self._parse_group_by_cols(sys.read_string(acc, 17)),
-                        _get_agg_func(intmask(acc.get_int(16))),
-                        out_schema,
-                    )
-
-                elif opcode == instructions.Instruction.DISTINCT:
-                    rid_in = intmask(acc.get_int(2))
-                    rid_hist = intmask(acc.get_int(10))
-                    rid_out = intmask(acc.get_int(3))
-                    tid = intmask(acc.get_int(14))
-
-                    r_in = reg_file.registers[rid_in]
-                    if r_in is None:
-                        r_in = runtime.DeltaRegister(rid_in, runtime.VMSchema(in_schema))
-                        reg_file.registers[rid_in] = r_in
-                    r_hist = reg_file.registers[rid_hist]
-                    if r_hist is None and tid > 0:
-                        f = self.registry.get_by_id(tid)
-                        r_hist = runtime.TraceRegister(rid_hist, runtime.VMSchema(f.schema), f.create_cursor(), f)
-                        reg_file.registers[rid_hist] = r_hist
-                    r_out = reg_file.registers[rid_out]
-                    if r_out is None:
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(in_schema))
-                        reg_file.registers[rid_out] = r_out
-                    instr = instructions.DistinctOp(r_in, r_hist, r_out)
-
-                elif opcode == instructions.Instruction.SCAN_TRACE:
-                    rid_tr = intmask(acc.get_int(6))
-                    rid_out = intmask(acc.get_int(3))
-                    tid = intmask(acc.get_int(14))
-                    r_tr = reg_file.registers[rid_tr]
-                    if r_tr is None and tid > 0:
-                        f = self.registry.get_by_id(tid)
-                        r_tr = runtime.TraceRegister(rid_tr, runtime.VMSchema(f.schema), f.create_cursor(), f)
-                        reg_file.registers[rid_tr] = r_tr
-                    r_out = reg_file.registers[rid_out]
-                    if r_out is None:
-                        sch = self.registry.get_by_id(tid).schema if tid > 0 else out_schema
-                        r_out = runtime.DeltaRegister(rid_out, runtime.VMSchema(sch))
-                        reg_file.registers[rid_out] = r_out
-                    instr = instructions.ScanTraceOp(r_tr, r_out, intmask(acc.get_int(18)))
-
-                elif opcode == instructions.Instruction.SEEK_TRACE:
-                    rid_tr = intmask(acc.get_int(6))
-                    rid_key = intmask(acc.get_int(13))
-                    tid = intmask(acc.get_int(14))
-                    r_tr = reg_file.registers[rid_tr]
-                    if r_tr is None and tid > 0:
-                        f = self.registry.get_by_id(tid)
-                        r_tr = runtime.TraceRegister(rid_tr, runtime.VMSchema(f.schema), f.create_cursor(), f)
-                        reg_file.registers[rid_tr] = r_tr
-                    r_key = reg_file.registers[rid_key]
-                    if r_key is None:
-                        r_key = runtime.DeltaRegister(rid_key, runtime.VMSchema(in_schema))
-                        reg_file.registers[rid_key] = r_key
-                    instr = instructions.SeekTraceOp(r_tr, r_key)
-
-                elif opcode == instructions.Instruction.YIELD:
-                    instr = instructions.YieldOp(intmask(acc.get_int(20)))
-                elif opcode == instructions.Instruction.JUMP:
-                    instr = instructions.JumpOp(intmask(acc.get_int(19)))
-                elif opcode == instructions.Instruction.CLEAR_DELTAS:
-                    instr = instructions.ClearDeltasOp()
-                elif opcode == instructions.Instruction.HALT:
-                    instr = instructions.HaltOp()
-
-                if instr is not None:
-                    program.append(instr)
-                cursor.advance()
-
-        finally:
-            cursor.close()
-
-        if len(program) == 0:
+        if len(ordered) != len(node_ids):
+            # Cycle detected — not a valid DAG.
             return None
 
-        out_reg_idx = 1
-        for scan_instr in program:
-            if scan_instr.opcode == instructions.Instruction.INTEGRATE:
-                if scan_instr.reg_in is not None:
-                    out_reg_idx = scan_instr.reg_in.reg_id
-                break
+        # ── Pass 2: Register assignment ───────────────────────────────────
 
-        return runtime.ExecutablePlan(program, reg_file, out_schema, 0, out_reg_idx)
+        out_reg_of = {}
+        next_reg = 0
+        for nid in ordered:
+            out_reg_of[nid] = next_reg
+            next_reg += 1
+
+        # Pre-pass: identify SCAN_TRACE nodes that feed a JOIN's PORT_TRACE.
+        # These must remain TraceRegisters so the join can access their cursor.
+        trace_side_sources = {}
+        for _, src, dst, port in edges:
+            if opcode_of.get(src, -1) == opcodes.OPCODE_SCAN_TRACE:
+                if port == opcodes.PORT_TRACE:
+                    trace_side_sources[src] = True
+
+        # Count extra registers needed before allocating the RegisterFile.
+        extra_regs = 0
+        for nid, op in nodes:
+            if op == opcodes.OPCODE_DISTINCT or op == opcodes.OPCODE_REDUCE:
+                # Need one extra DeltaRegister for output.
+                extra_regs += 1
+            elif op == opcodes.OPCODE_SCAN_TRACE:
+                table_id = sources.get(nid, 0)
+                if table_id > 0 and nid not in trace_side_sources:
+                    # Explicit scan: TraceRegister (cursor) + DeltaRegister (output).
+                    extra_regs += 1
+
+        reg_file = runtime.RegisterFile(next_reg + extra_regs)
+        next_extra_reg = next_reg
+
+        # ── Pass 3: Instruction emission ──────────────────────────────────
+
+        program = newlist_hint(len(ordered) + 1)
+        input_delta_reg_id = -1
+        sink_reg_id = -1
+
+        for nid in ordered:
+            op = opcode_of[nid]
+            reg_id = out_reg_of[nid]
+            node_params = params.get(nid, {})
+
+            # Build in_regs: dst_port -> register_id of that input's output.
+            # Evaluated after out_reg_of remapping from prior DISTINCT/REDUCE
+            # nodes, so downstream ops always see the correct delta register.
+            in_regs = {}
+            for _, src, dst, port in edges:
+                if dst == nid:
+                    in_regs[port] = out_reg_of[src]
+
+            instr = None
+
+            if op == opcodes.OPCODE_SCAN_TRACE:
+                table_id = sources.get(nid, 0)
+                chunk_limit = node_params.get(opcodes.PARAM_CHUNK_LIMIT, 0)
+
+                if table_id == 0:
+                    # Primary input delta — bound at execute_epoch time.
+                    reg = runtime.DeltaRegister(reg_id, runtime.VMSchema(in_schema))
+                    reg_file.registers[reg_id] = reg
+                    input_delta_reg_id = reg_id
+                    # No instruction emitted; data arrives via DeltaRegister.bind().
+
+                elif nid in trace_side_sources:
+                    # Trace-side source for a JOIN_DELTA_TRACE — the join
+                    # accesses reg_trace.cursor directly; no ScanTraceOp needed.
+                    family = self.registry.get_by_id(table_id)
+                    reg = runtime.TraceRegister(
+                        reg_id,
+                        runtime.VMSchema(family.schema),
+                        family.create_cursor(),
+                        family,
+                    )
+                    reg_file.registers[reg_id] = reg
+                    # out_reg_of[nid] remains reg_id (the TraceRegister).
+
+                else:
+                    # Explicit scan — TraceRegister holds the cursor;
+                    # an extra DeltaRegister receives the scan output.
+                    family = self.registry.get_by_id(table_id)
+                    trace_reg = runtime.TraceRegister(
+                        reg_id,
+                        runtime.VMSchema(family.schema),
+                        family.create_cursor(),
+                        family,
+                    )
+                    reg_file.registers[reg_id] = trace_reg
+
+                    out_delta_id = next_extra_reg
+                    next_extra_reg += 1
+                    out_delta_reg = runtime.DeltaRegister(
+                        out_delta_id, runtime.VMSchema(family.schema)
+                    )
+                    reg_file.registers[out_delta_id] = out_delta_reg
+                    out_reg_of[nid] = out_delta_id
+
+                    instr = instructions.ScanTraceOp(trace_reg, out_delta_reg, chunk_limit)
+
+            elif op == opcodes.OPCODE_FILTER:
+                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
+                out_reg = runtime.DeltaRegister(reg_id, in_reg.vm_schema)
+                reg_file.registers[reg_id] = out_reg
+                func_id = node_params.get(opcodes.PARAM_FUNC_ID, 0)
+                instr = instructions.FilterOp(in_reg, out_reg, _get_scalar_func(func_id))
+
+            elif op == opcodes.OPCODE_MAP:
+                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
+                out_reg = runtime.DeltaRegister(reg_id, runtime.VMSchema(out_schema))
+                reg_file.registers[reg_id] = out_reg
+                func_id = node_params.get(opcodes.PARAM_FUNC_ID, 0)
+                instr = instructions.MapOp(in_reg, out_reg, _get_scalar_func(func_id))
+
+            elif op == opcodes.OPCODE_NEGATE:
+                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
+                out_reg = runtime.DeltaRegister(reg_id, in_reg.vm_schema)
+                reg_file.registers[reg_id] = out_reg
+                instr = instructions.NegateOp(in_reg, out_reg)
+
+            elif op == opcodes.OPCODE_UNION:
+                in_a = reg_file.registers[in_regs[opcodes.PORT_IN_A]]
+                in_b = reg_file.registers[in_regs[opcodes.PORT_IN_B]]
+                out_reg = runtime.DeltaRegister(reg_id, in_a.vm_schema)
+                reg_file.registers[reg_id] = out_reg
+                instr = instructions.UnionOp(in_a, in_b, out_reg)
+
+            elif op == opcodes.OPCODE_JOIN_DELTA_TRACE:
+                delta_reg = reg_file.registers[in_regs[opcodes.PORT_DELTA]]
+                trace_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE]]
+                join_schema = merge_schemas_for_join(
+                    delta_reg.vm_schema.table_schema,
+                    trace_reg.vm_schema.table_schema,
+                )
+                out_reg = runtime.DeltaRegister(reg_id, runtime.VMSchema(join_schema))
+                reg_file.registers[reg_id] = out_reg
+                instr = instructions.JoinDeltaTraceOp(delta_reg, trace_reg, out_reg)
+
+            elif op == opcodes.OPCODE_JOIN_DELTA_DELTA:
+                reg_a = reg_file.registers[in_regs[opcodes.PORT_IN_A]]
+                reg_b = reg_file.registers[in_regs[opcodes.PORT_IN_B]]
+                join_schema = merge_schemas_for_join(
+                    reg_a.vm_schema.table_schema,
+                    reg_b.vm_schema.table_schema,
+                )
+                out_reg = runtime.DeltaRegister(reg_id, runtime.VMSchema(join_schema))
+                reg_file.registers[reg_id] = out_reg
+                instr = instructions.JoinDeltaDeltaOp(reg_a, reg_b, out_reg)
+
+            elif op == opcodes.OPCODE_DISTINCT:
+                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN_DISTINCT]]
+                hist_schema = in_reg.vm_schema.table_schema
+                history_table = view_family.create_child(
+                    "_hist_%d_%d" % (view_id, nid), hist_schema
+                )
+                hist_reg = runtime.TraceRegister(
+                    reg_id,
+                    runtime.VMSchema(hist_schema),
+                    history_table.create_cursor(),
+                    history_table,
+                )
+                reg_file.registers[reg_id] = hist_reg
+
+                out_delta_id = next_extra_reg
+                next_extra_reg += 1
+                out_delta_reg = runtime.DeltaRegister(out_delta_id, in_reg.vm_schema)
+                reg_file.registers[out_delta_id] = out_delta_reg
+                out_reg_of[nid] = out_delta_id
+
+                instr = instructions.DistinctOp(in_reg, hist_reg, out_delta_reg)
+
+            elif op == opcodes.OPCODE_REDUCE:
+                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN_REDUCE]]
+                agg_func_id = node_params.get(opcodes.PARAM_AGG_FUNC_ID, 0)
+                agg_func = _get_agg_func(agg_func_id)
+                gcols = group_cols.get(nid, newlist_hint(0))
+                reduce_out_schema = _build_reduce_output_schema(
+                    in_reg.vm_schema.table_schema, gcols, agg_func
+                )
+
+                trace_table = view_family.create_child(
+                    "_reduce_%d_%d" % (view_id, nid), reduce_out_schema
+                )
+                tr_out_reg = runtime.TraceRegister(
+                    reg_id,
+                    runtime.VMSchema(reduce_out_schema),
+                    trace_table.create_cursor(),
+                    trace_table,
+                )
+                reg_file.registers[reg_id] = tr_out_reg
+
+                out_delta_id = next_extra_reg
+                next_extra_reg += 1
+                out_delta_reg = runtime.DeltaRegister(
+                    out_delta_id, runtime.VMSchema(reduce_out_schema)
+                )
+                reg_file.registers[out_delta_id] = out_delta_reg
+                out_reg_of[nid] = out_delta_id
+
+                tr_in_reg = None
+                if opcodes.PORT_TRACE_IN in in_regs:
+                    tr_in_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE_IN]]
+
+                reduce_instr = instructions.ReduceOp(
+                    in_reg,
+                    tr_in_reg,
+                    tr_out_reg,
+                    out_delta_reg,
+                    gcols,
+                    agg_func,
+                    reduce_out_schema,
+                )
+                program.append(reduce_instr)
+                # Integrate reduce output into the trace table.
+                instr = instructions.IntegrateOp(out_delta_reg, trace_table)
+
+            elif op == opcodes.OPCODE_INTEGRATE:
+                in_reg_id = in_regs[opcodes.PORT_IN]
+                in_reg = reg_file.registers[in_reg_id]
+                target_table_id = node_params.get(opcodes.PARAM_TABLE_ID, 0)
+                if target_table_id > 0 and self.registry.has_id(target_table_id):
+                    target = self.registry.get_by_id(target_table_id)
+                else:
+                    target = None
+                sink_reg_id = in_reg_id
+                instr = instructions.IntegrateOp(in_reg, target)
+
+            elif op == opcodes.OPCODE_DELAY:
+                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
+                out_reg = runtime.DeltaRegister(reg_id, in_reg.vm_schema)
+                reg_file.registers[reg_id] = out_reg
+                instr = instructions.DelayOp(in_reg, out_reg)
+
+            elif op == opcodes.OPCODE_SEEK_TRACE:
+                trace_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE]]
+                key_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
+                instr = instructions.SeekTraceOp(trace_reg, key_reg)
+
+            if instr is not None:
+                program.append(instr)
+
+        program.append(instructions.HaltOp())
+
+        if input_delta_reg_id == -1 or sink_reg_id == -1:
+            return None
+
+        return runtime.ExecutablePlan(
+            program,
+            reg_file,
+            out_schema,
+            in_reg_idx=input_delta_reg_id,
+            out_reg_idx=sink_reg_id,
+        )

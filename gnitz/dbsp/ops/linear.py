@@ -238,9 +238,11 @@ def op_delay(in_batch, out_batch):
 def op_integrate(in_batch, target_table):
     """
     Terminal sink: flushes a batch into persistent storage.
+    If target_table is None, the batch is effectively yielded without
+    materialization.
 
     in_batch:     ArenaZSetBatch
-    target_table: AbstractTable
+    target_table: ZSetStore or None
     """
-    if in_batch.length() > 0:
+    if in_batch.length() > 0 and target_table is not None:
         target_table.ingest_batch(in_batch)

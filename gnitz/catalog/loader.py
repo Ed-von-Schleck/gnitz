@@ -13,15 +13,16 @@ KIND_TABLE = 2
 KIND_VIEW = 3
 KIND_INDEX = 4
 
+
 class CatalogBootstrapper(object):
     """
     Coordinates the transition from raw disk files to a live in-memory Registry.
-    
-    Unifies the startup sequence by replaying the durable System Z-Sets 
-    through the same reactive handlers used at runtime, ensuring symmetry 
+
+    Unifies the startup sequence by replaying the durable System Z-Sets
+    through the same reactive handlers used at runtime, ensuring symmetry
     and fixing the 'Resurrection Bug' by filtering out tombstone records.
     """
-    
+
     _immutable_fields_ = ["registry", "sys_tables", "base_dir"]
 
     def __init__(self, registry, sys_tables, base_dir):
@@ -38,12 +39,11 @@ class CatalogBootstrapper(object):
         cursor = self.sys_tables.sequences.create_cursor()
         try:
             while cursor.is_valid():
-                # Filter for active records only
                 if cursor.weight() > 0:
                     acc = cursor.get_accessor()
                     seq_id = intmask(r_uint64(cursor.key()))
                     val = intmask(acc.get_int(sys.SeqTab.COL_VALUE))
-                    
+
                     if seq_id == sys.SEQ_ID_SCHEMAS:
                         self.registry._next_schema_id = val + 1
                     elif seq_id == sys.SEQ_ID_TABLES:
@@ -57,12 +57,13 @@ class CatalogBootstrapper(object):
         finally:
             cursor.close()
 
-        # 2. Register Foundation System Tables into the Registry
-        # This allows handlers to find the tables they need (like ColTab) 
+        # 2. Register Foundation System Tables into the Registry.
+        # This allows handlers to find the tables they need (like ColTab)
         # during the replay phase.
         sys_dir = self.base_dir + "/" + sys.SYS_CATALOG_DIRNAME
-        
+
         from gnitz.catalog.registry import TableFamily
+
         for pt, t in [
             (self.sys_tables.schemas, sys.SchemaTab),
             (self.sys_tables.tables, sys.TableTab),
@@ -71,19 +72,27 @@ class CatalogBootstrapper(object):
             (self.sys_tables.indices, sys.IdxTab),
             (self.sys_tables.view_deps, sys.DepTab),
             (self.sys_tables.sequences, sys.SeqTab),
-            (self.sys_tables.instructions, sys.InstrTab),
             (self.sys_tables.functions, sys.FuncTab),
             (self.sys_tables.subscriptions, sys.SubTab),
+            (self.sys_tables.circuit_nodes, sys.CircuitNodesTab),
+            (self.sys_tables.circuit_edges, sys.CircuitEdgesTab),
+            (self.sys_tables.circuit_sources, sys.CircuitSourcesTab),
+            (self.sys_tables.circuit_params, sys.CircuitParamsTab),
+            (self.sys_tables.circuit_group_cols, sys.CircuitGroupColsTab),
         ]:
             self.registry.register(
-                TableFamily("_system", t.NAME, t.ID, sys.SYSTEM_SCHEMA_ID, 
-                            sys_dir + "/" + t.SUBDIR, 0, pt)
+                TableFamily(
+                    "_system",
+                    t.NAME,
+                    t.ID,
+                    sys.SYSTEM_SCHEMA_ID,
+                    sys_dir + "/" + t.SUBDIR,
+                    0,
+                    pt,
+                )
             )
 
     def replay_catalog(self, handlers):
-        """
-        Phase 2: Replays the durable log of catalog mutations into the Registry.
-        """
         # Strict ordering to respect relational dependencies (Schemas first).
         self._replay_store(self.sys_tables.schemas, handlers, KIND_SCHEMA)
         self._replay_store(self.sys_tables.tables, handlers, KIND_TABLE)
@@ -94,28 +103,24 @@ class CatalogBootstrapper(object):
         """Scans a system store and feeds active records into the reactive loop."""
         cursor = store.create_cursor()
         schema = store.get_schema()
-        
-        # We reuse the same batching logic used during normal ingestion
+
         batch = ZSetBatch(schema)
         try:
             while cursor.is_valid():
-                # Fix: ONLY replay records with positive weight.
-                # Tombstones (weight 0 or -1) are ignored, preventing resurrection.
                 if cursor.weight() > 0:
                     batch.append_from_accessor(
-                        cursor.key(), 
-                        cursor.weight(), 
-                        cursor.get_accessor()
+                        cursor.key(),
+                        cursor.weight(),
+                        cursor.get_accessor(),
                     )
-                    
-                    # Periodic dispatch to manage memory pressure during large catalog replays
+
                     if batch.length() >= 512:
                         self._dispatch(handlers, kind, batch)
                         batch.free()
                         batch = ZSetBatch(schema)
-                
+
                 cursor.advance()
-                
+
             if batch.length() > 0:
                 self._dispatch(handlers, kind, batch)
         finally:
