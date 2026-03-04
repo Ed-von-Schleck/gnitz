@@ -114,6 +114,10 @@ def ingest_to_family(family, batch):
                 circuit.is_unique,
             )
 
+    # --- Stage 4: Post-Ingestion Effect Hooks ---
+    for h_idx in range(len(family.post_ingest_hooks)):
+        family.post_ingest_hooks[h_idx].on_delta(batch)
+
 
 class TableFamily(object):
     """
@@ -153,6 +157,7 @@ class TableFamily(object):
         self.schema = store.get_schema()
         self.index_circuits = newlist_hint(4)
         self.fk_constraints = newlist_hint(0)
+        self.post_ingest_hooks = newlist_hint(0)
         self.depth = 0
         self.created_lsn = 0
 

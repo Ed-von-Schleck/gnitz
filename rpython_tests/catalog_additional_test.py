@@ -11,21 +11,20 @@ from gnitz.core import values, batch
 from gnitz.core.errors import LayoutError, GnitzError
 from gnitz.catalog import identifiers
 from gnitz.catalog.engine import open_engine
+from gnitz.catalog.registry import ingest_to_family
 from gnitz.catalog.system_tables import (
-    FIRST_USER_TABLE_ID, 
+    FIRST_USER_TABLE_ID,
     OWNER_KIND_TABLE,
-    pack_column_id
+    pack_column_id,
+    IdxTab,
+    ColTab,
 )
 from gnitz.catalog.index_circuit import (
-    IndexCircuit, 
+    IndexCircuit,
     get_index_key_type,
     make_index_schema,
     make_fk_index_name,
     make_secondary_index_name
-)
-from gnitz.catalog.system_records import (
-    _append_index_record,
-    _append_column_record
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
 
@@ -79,7 +78,7 @@ def test_index_functional_and_fanout(base_dir):
             core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
             core_types.ColumnDefinition(core_types.TYPE_I64, name="val"),
         ]
-        
+
         family = engine.create_table("public.tfanout", cols, 0)
 
         # Ingest baseline
@@ -88,7 +87,7 @@ def test_index_functional_and_fanout(base_dir):
             row = values.make_payload_row(family.schema)
             row.append_int(r_int64(i * 100))
             b.append(r_uint128(r_uint64(i)), r_int64(1), row)
-        family.ingest_batch(b)
+        ingest_to_family(family, b)
         b.free()
 
         # Create Index
@@ -102,7 +101,7 @@ def test_index_functional_and_fanout(base_dir):
         row = values.make_payload_row(family.schema)
         row.append_int(r_int64(777))
         b2.append(r_uint128(r_uint64(99)), r_int64(1), row)
-        family.ingest_batch(b2)
+        ingest_to_family(family, b2)
         b2.free()
 
         if _count_records(circuit.table) != 6:
@@ -112,7 +111,7 @@ def test_index_functional_and_fanout(base_dir):
         engine.drop_index(circuit.name)
         if engine.registry.has_index_by_name(circuit.name):
             raise Exception("Standard index should have been dropped")
-            
+
     finally:
         engine.close()
     os.write(1, "    [OK] Index fan-out and drop verified.\n")
@@ -128,31 +127,32 @@ def test_orphaned_metadata_recovery(base_dir):
         idx_sys = engine.sys.indices
         b = batch.ZSetBatch(idx_sys.schema)
         # Manually inject index metadata pointing to a non-existent table ID 99999
-        # to test the loader's resilience to orphaned records.
-        _append_index_record(b, idx_sys.schema, 888, 99999, OWNER_KIND_TABLE, 1, 
-                             "orphaned_idx", 0, "")
+        IdxTab.append(b, idx_sys.schema, 888, 99999, OWNER_KIND_TABLE, 1,
+                       "orphaned_idx", 0, "")
         idx_sys.ingest_batch(b)
         b.free()
         idx_sys.flush()
     finally:
         engine.close()
 
-    # Re-open: The loader should skip the index record because table 99999 doesn't exist
-    engine2 = open_engine(db_path)
+    # Re-open: The loader should fail because orphaned metadata is corruption
+    raised = False
     try:
-        if engine2.registry.has_index_by_name("orphaned_idx"):
-            raise Exception("Orphaned index should not have been registered")
-    finally:
+        engine2 = open_engine(db_path)
         engine2.close()
-    os.write(1, "    [OK] Orphaned metadata handled.\n")
+    except KeyError:
+        raised = True
+    if not raised:
+        raise Exception("Orphaned index should cause a KeyError on reload")
+    os.write(1, "    [OK] Orphaned metadata correctly rejected.\n")
 
 
 def test_schema_mr_poisoning():
     os.write(1, "[Catalog+] Testing Schema mr-poisoning...\n")
     s1 = core_types.TableSchema([core_types.ColumnDefinition(core_types.TYPE_U64, name="pk")], 0)
-    s2 = core_types.TableSchema([core_types.ColumnDefinition(core_types.TYPE_U64, name="pk2"), 
+    s2 = core_types.TableSchema([core_types.ColumnDefinition(core_types.TYPE_U64, name="pk2"),
                                  core_types.ColumnDefinition(core_types.TYPE_I64, name="val")], 0)
-    
+
     s3 = core_types.merge_schemas_for_join(s1, s2)
     row = values.make_payload_row(s3)
     row.append_int(r_int64(123))
@@ -179,7 +179,7 @@ def test_sequence_gap_recovery(base_dir):
     try:
         cols = [core_types.ColumnDefinition(core_types.TYPE_U64, name="id")]
         engine.create_table("public.t1", cols, 0)
-        
+
         # 1. Inject table record for tid 250
         tbl_sys = engine.sys.tables
         b = batch.ZSetBatch(tbl_sys.schema)
@@ -187,8 +187,8 @@ def test_sequence_gap_recovery(base_dir):
         row.append_int(r_int64(2)) # sid public
         row.append_string("gap_table")
         row.append_string(db_path + "/gap")
-        row.append_int(r_int64(0)) 
-        row.append_int(r_int64(0)) 
+        row.append_int(r_int64(0))
+        row.append_int(r_int64(0))
         b.append(r_uint128(r_uint64(250)), r_int64(1), row)
         tbl_sys.ingest_batch(b)
         b.free()
@@ -197,8 +197,8 @@ def test_sequence_gap_recovery(base_dir):
         # 2. Inject column record for tid 250 (Required for reconstruction)
         col_sys = engine.sys.columns
         bc = batch.ZSetBatch(col_sys.schema)
-        _append_column_record(
-            bc, col_sys.schema, 250, OWNER_KIND_TABLE, 0, "id", 
+        ColTab.append(
+            bc, col_sys.schema, 250, OWNER_KIND_TABLE, 0, "id",
             core_types.TYPE_U64.code, 0, 0, 0
         )
         col_sys.ingest_batch(bc)
@@ -228,11 +228,11 @@ def test_fk_referential_integrity(base_dir):
         # 1. Create Parent (U64 PK)
         parent_cols = [core_types.ColumnDefinition(core_types.TYPE_U64, name="pid")]
         parent = engine.create_table("public.parents", parent_cols, 0)
-        
+
         # 2. Create Child (U64 FK referencing Parent)
         child_cols = [
             core_types.ColumnDefinition(core_types.TYPE_U64, name="cid"),
-            core_types.ColumnDefinition(core_types.TYPE_U64, name="pid_fk", 
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="pid_fk",
                                        fk_table_id=parent.table_id, fk_col_idx=0)
         ]
         child = engine.create_table("public.children", child_cols, 0)
@@ -240,7 +240,7 @@ def test_fk_referential_integrity(base_dir):
         # 3. Insert valid parent
         pb = batch.ZSetBatch(parent.schema)
         pb.append(r_uint128(r_uint64(10)), r_int64(1), values.make_payload_row(parent.schema))
-        parent.ingest_batch(pb)
+        ingest_to_family(parent, pb)
         pb.free()
 
         # 4. Insert valid child
@@ -248,7 +248,7 @@ def test_fk_referential_integrity(base_dir):
         row = values.make_payload_row(child.schema)
         row.append_int(r_int64(10)) # Valid pid
         cb.append(r_uint128(r_uint64(1)), r_int64(1), row)
-        child.ingest_batch(cb)
+        ingest_to_family(child, cb)
         cb.free()
 
         # 5. Insert INVALID child (pid 99 does not exist)
@@ -256,10 +256,10 @@ def test_fk_referential_integrity(base_dir):
         row2 = values.make_payload_row(child.schema)
         row2.append_int(r_int64(99))
         cb2.append(r_uint128(r_uint64(2)), r_int64(1), row2)
-        
+
         raised = False
         try:
-            child.ingest_batch(cb2)
+            ingest_to_family(child, cb2)
         except LayoutError:
             raised = True
         if not raised:
@@ -269,7 +269,7 @@ def test_fk_referential_integrity(base_dir):
         # 6. Test U128 FK (UUID style)
         u_parent_cols = [core_types.ColumnDefinition(core_types.TYPE_U128, name="uuid")]
         u_parent = engine.create_table("public.uparents", u_parent_cols, 0)
-        
+
         u_child_cols = [
             core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
             core_types.ColumnDefinition(core_types.TYPE_U128, name="ufk",
@@ -280,16 +280,16 @@ def test_fk_referential_integrity(base_dir):
         uuid_val = (r_uint128(0xAAAA) << 64) | r_uint128(0xBBBB)
         upb = batch.ZSetBatch(u_parent.schema)
         upb.append(uuid_val, r_int64(1), values.make_payload_row(u_parent.schema))
-        u_parent.ingest_batch(upb)
+        ingest_to_family(u_parent, upb)
         upb.free()
 
         ucb = batch.ZSetBatch(u_child.schema)
         row3 = values.make_payload_row(u_child.schema)
         row3.append_u128(r_uint64(0xBBBB), r_uint64(0xAAAA))
         ucb.append(r_uint128(r_uint64(1)), r_int64(1), row3)
-        u_child.ingest_batch(ucb)
+        ingest_to_family(u_child, ucb)
         ucb.free()
-        
+
     finally:
         engine.close()
     os.write(1, "    [OK] FK Integrity verified.\n")
@@ -315,7 +315,7 @@ def test_fk_nullability_and_retractions(base_dir):
         row = values.make_payload_row(child.schema)
         row.append_null(0) # pid_fk is the first payload column
         cb.append(r_uint128(r_uint64(1)), r_int64(1), row)
-        child.ingest_batch(cb)
+        ingest_to_family(child, cb)
         cb.free()
 
         # 2. Test Retraction (Weight -1)
@@ -324,7 +324,7 @@ def test_fk_nullability_and_retractions(base_dir):
         row2 = values.make_payload_row(child.schema)
         row2.append_int(r_int64(999)) # Non-existent
         cb2.append(r_uint128(r_uint64(2)), r_int64(-1), row2)
-        child.ingest_batch(cb2) # Should succeed
+        ingest_to_family(child, cb2) # Should succeed
         cb2.free()
 
     finally:
@@ -413,7 +413,7 @@ def test_fk_self_reference(base_dir):
         tid = engine.registry._next_table_id
         cols = [
             core_types.ColumnDefinition(core_types.TYPE_U64, name="emp_id"),
-            core_types.ColumnDefinition(core_types.TYPE_U64, is_nullable=True, 
+            core_types.ColumnDefinition(core_types.TYPE_U64, is_nullable=True,
                                        name="mgr_id", fk_table_id=tid, fk_col_idx=0)
         ]
         emp = engine.create_table("public.employees", cols, 0)
@@ -423,7 +423,7 @@ def test_fk_self_reference(base_dir):
         r_mgr = values.make_payload_row(emp.schema)
         r_mgr.append_null(0)
         b1.append(r_uint128(r_uint64(1)), r_int64(1), r_mgr)
-        emp.ingest_batch(b1)
+        ingest_to_family(emp, b1)
         b1.free()
 
         # 2. Ingest Subordinate referencing the Manager
@@ -431,10 +431,10 @@ def test_fk_self_reference(base_dir):
         r_sub = values.make_payload_row(emp.schema)
         r_sub.append_int(r_int64(1)) # Refers to emp_id 1
         b2.append(r_uint128(r_uint64(2)), r_int64(1), r_sub)
-        emp.ingest_batch(b2)
+        ingest_to_family(emp, b2)
         b2.free()
 
-        if _count_records(emp.primary) != 2:
+        if _count_records(emp.store) != 2:
             raise Exception("Self-referential ingestion failed")
 
     finally:
@@ -457,14 +457,14 @@ def entry_point(argv):
         test_schema_mr_poisoning()
         test_identifier_boundary_slicing()
         test_sequence_gap_recovery(base_dir)
-        
+
         # Foreign Key tests
         test_fk_referential_integrity(base_dir)
         test_fk_nullability_and_retractions(base_dir)
         test_fk_protections(base_dir)
         test_fk_invalid_targets(base_dir)
         test_fk_self_reference(base_dir)
-        
+
         os.write(1, "\nALL ADDITIONAL CATALOG TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "\nADDITIONAL TEST FAILED\n")

@@ -8,19 +8,13 @@ from gnitz.catalog import system_tables as sys
 from gnitz.catalog.metadata import read_column_defs
 from gnitz.catalog.registry import TableFamily
 
-# Dispatch constants to fix RPython TyperError with bound methods
-KIND_SCHEMA = 1
-KIND_TABLE = 2
-KIND_VIEW = 3
-KIND_INDEX = 4
-
 
 class CatalogBootstrapper(object):
     """
     Coordinates the transition from raw disk files to a live in-memory Registry.
 
     Unifies the startup sequence by replaying the durable System Z-Sets
-    through the same reactive handlers used at runtime, ensuring symmetry
+    through the post-ingestion hooks on TableFamily, ensuring symmetry
     and fixing the 'Resurrection Bug' by filtering out tombstone records.
     """
 
@@ -69,7 +63,7 @@ class CatalogBootstrapper(object):
         self.registry.recover_sequences(schema_hwm, table_hwm, index_hwm, programs_hwm)
 
         # 2. Register Foundation System Tables directly into the Registry so
-        #    that handlers can locate them (e.g. ColTab) during replay.
+        #    that hooks can locate them (e.g. ColTab) during replay.
         sys_dir = self.base_dir + "/" + sys.SYS_CATALOG_DIRNAME
 
         self.registry.register(TableFamily(
@@ -143,20 +137,21 @@ class CatalogBootstrapper(object):
             self.sys_tables.circuit_group_cols,
         ))
 
-    def replay_catalog(self, handlers):
-        # Strict ordering to respect relational dependencies (Schemas first).
-        self._replay_store(self.sys_tables.schemas, handlers, KIND_SCHEMA)
-        self._replay_store(self.sys_tables.tables, handlers, KIND_TABLE)
-        self._replay_store(self.sys_tables.views, handlers, KIND_VIEW)
-        self._replay_store(self.sys_tables.indices, handlers, KIND_INDEX)
+    def replay_catalog(self):
+        """Replays system stores through post-ingestion hooks in dependency order."""
+        self._replay_family("_system", sys.SchemaTab.NAME)
+        self._replay_family("_system", sys.TableTab.NAME)
+        self._replay_family("_system", sys.ViewTab.NAME)
+        self._replay_family("_system", sys.IdxTab.NAME)
 
-    def _replay_store(self, store, handlers, kind):
-        """Scans a system store and feeds active records into the reactive loop."""
-        schema = store.get_schema()
-        cursor = store.create_cursor()
+    def _replay_family(self, schema_name, table_name):
+        """Scans a system store and feeds active records through family hooks."""
+        family = self.registry.get(schema_name, table_name)
+        if len(family.post_ingest_hooks) == 0:
+            return
+        schema = family.store.get_schema()
+        cursor = family.store.create_cursor()
         try:
-            # Nest the batch lifecycle inside the cursor try so that a
-            # ZSetBatch allocation failure cannot leak the already-open cursor.
             batch = ZSetBatch(schema)
             try:
                 while cursor.is_valid():
@@ -168,29 +163,20 @@ class CatalogBootstrapper(object):
                         )
 
                         if batch.length() >= 512:
-                            self._dispatch(handlers, kind, batch)
+                            self._fire_hooks(family, batch)
                             batch.free()
                             batch = ZSetBatch(schema)
 
                     cursor.advance()
 
                 if batch.length() > 0:
-                    self._dispatch(handlers, kind, batch)
+                    self._fire_hooks(family, batch)
             finally:
                 batch.free()
         finally:
             cursor.close()
 
-    def _dispatch(self, handlers, kind, batch):
-        """
-        Explicit dispatcher to satisfy RPython's monomorphism constraints.
-        Bound methods of the same class cannot be treated as anonymous callables.
-        """
-        if kind == KIND_SCHEMA:
-            handlers.on_schema_delta(batch)
-        elif kind == KIND_TABLE:
-            handlers.on_table_delta(batch)
-        elif kind == KIND_VIEW:
-            handlers.on_view_delta(batch)
-        elif kind == KIND_INDEX:
-            handlers.on_index_delta(batch)
+    def _fire_hooks(self, family, batch):
+        """Fires all post-ingestion hooks on a family."""
+        for h_idx in range(len(family.post_ingest_hooks)):
+            family.post_ingest_hooks[h_idx].on_delta(batch)

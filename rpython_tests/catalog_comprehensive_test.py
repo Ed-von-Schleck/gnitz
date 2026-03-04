@@ -119,20 +119,20 @@ def test_bootstrap(base_dir):
         if not engine.registry.has_schema("public"):
             raise Exception("Missing public schema")
 
-        # 2. Check Tables (7 system tables expected)
+        # 2. Check Tables (14 system tables expected)
         c = count_records(engine.sys.tables)
-        if c != 7:
-            raise Exception("Expected 7 system tables, got %d" % c)
+        if c != 14:
+            raise Exception("Expected 14 system tables, got %d" % c)
 
-        # 3. Check Columns (36 bootstrap columns expected)
+        # 3. Check Columns (44 bootstrap columns expected)
         c = count_records(engine.sys.columns)
-        if c != 36:
-            raise Exception("Expected 36 system columns, got %d" % c)
+        if c != 44:
+            raise Exception("Expected 44 system columns, got %d" % c)
 
-        # 4. Check Sequences (3 expected)
+        # 4. Check Sequences (4 expected)
         c = count_records(engine.sys.sequences)
-        if c != 3:
-            raise Exception("Expected 3 sequences, got %d" % c)
+        if c != 4:
+            raise Exception("Expected 4 sequences, got %d" % c)
 
         # 5. Check Registry State
         if engine.registry._next_table_id != FIRST_USER_TABLE_ID:
@@ -534,11 +534,11 @@ def test_restart(base_dir):
     row = values.make_payload_row(table1.schema)
     row.append_string("Gnitz-O-Matic")
     batch1.append(r_uint128(r_uint64(42)), r_int64(1), row)
-    table1.ingest_batch(batch1)
+    table1.store.ingest_batch(batch1)
     batch1.free()
 
     # Flush to ensure table metadata writes are hardened
-    table1.flush()
+    table1.store.flush()
     engine1.close()
 
     # Restart Engine
@@ -567,7 +567,7 @@ def test_restart(base_dir):
             raise Exception("Rebuilt schema pk_index is wrong")
 
         # Verify user data mapping works correctly
-        cursor = table2.create_cursor()
+        cursor = table2.store.create_cursor()
         if not cursor.is_valid():
             raise Exception("no data in restarted table")
 

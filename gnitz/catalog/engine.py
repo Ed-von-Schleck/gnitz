@@ -12,10 +12,9 @@ from gnitz.catalog.program_cache import ProgramCache
 
 from gnitz.catalog.identifiers import validate_user_identifier, parse_qualified_name
 from gnitz.catalog import system_tables as sys
-from gnitz.catalog.registry import EntityRegistry
+from gnitz.catalog.registry import EntityRegistry, ingest_to_family
 from gnitz.catalog.index_circuit import (
     get_index_key_type,
-    make_fk_index_name,
     make_secondary_index_name,
 )
 from gnitz.catalog.metadata import (
@@ -24,7 +23,7 @@ from gnitz.catalog.metadata import (
     bootstrap_system_tables,
 )
 from gnitz.catalog.loader import CatalogBootstrapper
-from gnitz.catalog.handlers import CatalogHandlers
+from gnitz.catalog.hooks import wire_catalog_hooks
 
 
 def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
@@ -51,16 +50,20 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
 
     registry = EntityRegistry()
     program_cache = ProgramCache(registry)
-    handlers = CatalogHandlers(registry, sys_tables, base_dir, program_cache)
     bootstrapper = CatalogBootstrapper(registry, sys_tables, base_dir)
 
     os.write(1, " -> 5. recover_system_state (Counters)\n")
     bootstrapper.recover_system_state()
 
-    engine = Engine(base_dir, sys_tables, registry, handlers, program_cache)
+    table_hook = wire_catalog_hooks(registry, sys_tables, base_dir, program_cache)
+
+    engine = Engine(base_dir, sys_tables, registry, program_cache)
 
     os.write(1, " -> 6. replay_catalog (Logical Recovery)\n")
-    bootstrapper.replay_catalog(handlers)
+    bootstrapper.replay_catalog()
+
+    # Enable cascading effects now that replay is complete
+    table_hook.cascade_enabled = True
 
     return engine
 
@@ -112,17 +115,25 @@ def _col_defs_from_graph(graph):
 class Engine(object):
     """
     The Supervisor for catalog mutations.
-    Writes durable intent to System Z-Sets and invokes handlers to perform side-effects.
+    Writes durable intent to System Z-Sets; side-effects fire automatically
+    via post-ingestion hooks on TableFamily.
     """
 
-    _immutable_fields_ = ["base_dir", "sys", "registry", "handlers", "program_cache"]
+    _immutable_fields_ = [
+        "base_dir", "sys", "registry", "program_cache",
+        "_schemas_family", "_tables_family", "_views_family", "_indices_family",
+    ]
 
-    def __init__(self, base_dir, sys_tables, registry, handlers, program_cache):
+    def __init__(self, base_dir, sys_tables, registry, program_cache):
         self.base_dir = base_dir
         self.sys = sys_tables
         self.registry = registry
-        self.handlers = handlers
         self.program_cache = program_cache
+        # Cache family references for system tables with hooks
+        self._schemas_family = registry.get("_system", sys.SchemaTab.NAME)
+        self._tables_family = registry.get("_system", sys.TableTab.NAME)
+        self._views_family = registry.get("_system", sys.ViewTab.NAME)
+        self._indices_family = registry.get("_system", sys.IdxTab.NAME)
 
     # -- Public Intent API ----------------------------------------------------
 
@@ -151,6 +162,11 @@ class Engine(object):
         if self.registry.has(schema_name, table_name):
             raise LayoutError("Table already exists")
 
+        if len(columns) > 64:
+            raise LayoutError("Maximum 64 columns supported")
+        if pk_col_idx < 0 or pk_col_idx >= len(columns):
+            raise LayoutError("Primary Key index out of bounds")
+
         tid = self.registry.allocate_table_id()
         sid = self.registry.get_schema_id(schema_name)
         self_pk_type = columns[pk_col_idx].field_type
@@ -170,11 +186,14 @@ class Engine(object):
 
         self._advance_sequence(sys.SEQ_ID_TABLES, tid - 1, tid)
         family = self.registry.get(schema_name, table_name)
-        self._create_fk_indices_for_family(family)
         return family
 
     def drop_table(self, qualified_name):
         schema_name, table_name = parse_qualified_name(qualified_name, "public")
+        validate_user_identifier(schema_name)
+        validate_user_identifier(table_name)
+        if not self.registry.has(schema_name, table_name):
+            raise LayoutError("Table does not exist: %s.%s" % (schema_name, table_name))
         family = self.registry.get(schema_name, table_name)
         tid = family.table_id
         self._check_for_dependencies(tid, table_name)
@@ -265,23 +284,6 @@ class Engine(object):
         )
         self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
         return self.registry.get_index_by_name(index_name)
-
-    def _create_fk_indices_for_family(self, family):
-        columns = family.schema.columns
-        for col_idx in range(len(columns)):
-            col = columns[col_idx]
-            if col.fk_table_id == 0 or col_idx == family.schema.pk_index:
-                continue
-            index_name = make_fk_index_name(
-                family.schema_name, family.table_name, col.name
-            )
-            if self.registry.has_index_by_name(index_name):
-                continue
-            index_id = self.registry.allocate_index_id()
-            self._write_index_record(
-                index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx, index_name, 0, ""
-            )
-            self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
 
     def drop_index(self, index_name):
         circuit = self.registry.get_index_by_name(index_name)
@@ -488,54 +490,48 @@ class Engine(object):
         self.sys.circuit_group_cols.ingest_batch(batch)
         batch.free()
 
-    # -- Private Write Helpers (With Handlers) --------------------------------
+    # -- Private Write Helpers ------------------------------------------------
 
     def _write_schema_record(self, sid, name):
         s = self.sys.schemas.schema
         batch = ZSetBatch(s)
         sys.SchemaTab.append(batch, s, sid, name)
-        self.sys.schemas.ingest_batch(batch)
-        self.handlers.on_schema_delta(batch)
+        ingest_to_family(self._schemas_family, batch)
         batch.free()
 
     def _retract_schema_record(self, sid, name):
         s = self.sys.schemas.schema
         batch = ZSetBatch(s)
         sys.SchemaTab.retract(batch, s, sid, name)
-        self.sys.schemas.ingest_batch(batch)
-        self.handlers.on_schema_delta(batch)
+        ingest_to_family(self._schemas_family, batch)
         batch.free()
 
     def _write_table_record(self, tid, sid, name, directory, pk_idx, lsn):
         s = self.sys.tables.schema
         batch = ZSetBatch(s)
         sys.TableTab.append(batch, s, tid, sid, name, directory, pk_idx, lsn)
-        self.sys.tables.ingest_batch(batch)
-        self.handlers.on_table_delta(batch)
+        ingest_to_family(self._tables_family, batch)
         batch.free()
 
     def _retract_table_record(self, tid, sid, name, directory, pk_idx, lsn):
         s = self.sys.tables.schema
         batch = ZSetBatch(s)
         sys.TableTab.retract(batch, s, tid, sid, name, directory, pk_idx, lsn)
-        self.sys.tables.ingest_batch(batch)
-        self.handlers.on_table_delta(batch)
+        ingest_to_family(self._tables_family, batch)
         batch.free()
 
     def _write_view_record(self, vid, sid, name, sql_def, directory, lsn):
         s = self.sys.views.schema
         batch = ZSetBatch(s)
         sys.ViewTab.append(batch, s, vid, sid, name, sql_def, directory, lsn)
-        self.sys.views.ingest_batch(batch)
-        self.handlers.on_view_delta(batch)
+        ingest_to_family(self._views_family, batch)
         batch.free()
 
     def _retract_view_record(self, vid, sid, name, sql_def, directory, lsn):
         s = self.sys.views.schema
         batch = ZSetBatch(s)
         sys.ViewTab.retract(batch, s, vid, sid, name, sql_def, directory, lsn)
-        self.sys.views.ingest_batch(batch)
-        self.handlers.on_view_delta(batch)
+        ingest_to_family(self._views_family, batch)
         batch.free()
 
     def _write_view_deps(self, vid, dep_ids):
@@ -583,16 +579,14 @@ class Engine(object):
         s = self.sys.indices.schema
         batch = ZSetBatch(s)
         sys.IdxTab.append(batch, s, idx_id, oid, kind, s_idx, name, unique, c_dir)
-        self.sys.indices.ingest_batch(batch)
-        self.handlers.on_index_delta(batch)
+        ingest_to_family(self._indices_family, batch)
         batch.free()
 
     def _retract_index_record(self, idx_id, oid, kind, s_idx, name, unique, c_dir):
         s = self.sys.indices.schema
         batch = ZSetBatch(s)
         sys.IdxTab.retract(batch, s, idx_id, oid, kind, s_idx, name, unique, c_dir)
-        self.sys.indices.ingest_batch(batch)
-        self.handlers.on_index_delta(batch)
+        ingest_to_family(self._indices_family, batch)
         batch.free()
 
     def _advance_sequence(self, seq_id, old_val, new_val):
