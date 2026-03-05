@@ -8,23 +8,9 @@ from gnitz.core import types
 from gnitz.core.store import AbstractCursor
 from gnitz.storage import tournament_tree, comparator
 from gnitz.core import comparator as core_comparator
-from gnitz.storage.memtable_node import node_get_key, node_get_weight, node_get_next_off
+from gnitz.core.batch import ColumnarBatchAccessor
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
-
-
-# ---------------------------------------------------------------------------
-# MemTableRef — mutable indirection enabling cursor stability across flushes
-# ---------------------------------------------------------------------------
-
-
-class MemTableRef(object):
-    """
-    A one-field mutable wrapper around a live MemTable instance.
-    """
-
-    def __init__(self, memtable):
-        self.current = memtable
 
 
 # ---------------------------------------------------------------------------
@@ -71,36 +57,36 @@ class BaseCursor(AbstractCursor):
 
 class MemTableCursor(BaseCursor):
     """
-    Cursor over a MemTable's SkipList.
+    Cursor over a consolidated snapshot of a MemTable's columnar batch.
     """
 
-    _immutable_fields_ = ["mem_ref", "schema", "key_size", "accessor"]
+    _immutable_fields_ = ["schema", "accessor"]
 
     def __init__(self, memtable):
         BaseCursor.__init__(self)
-        self.mem_ref = MemTableRef(memtable)
         self.schema = memtable.schema
-        self.key_size = memtable.key_size
-        self.current_node_off = node_get_next_off(
-            memtable.arena.base_ptr, memtable.head_off, 0
-        )
-        self.accessor = comparator.PackedNodeAccessor(
-            self.schema, memtable.blob_arena.base_ptr
-        )
-
-    def _get_memtable(self):
-        return self.mem_ref.current
+        self.snapshot = memtable.batch.to_consolidated()
+        self.owns_snapshot = self.snapshot is not memtable.batch
+        self.position = 0
+        self.accessor = ColumnarBatchAccessor(self.schema)
 
     def seek(self, target_key):
-        self.current_node_off = self._get_memtable().lower_bound_node(target_key)
+        lo = 0
+        hi = self.snapshot.length()
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            mid_key = self.snapshot.get_pk(mid)
+            if mid_key < target_key:
+                lo = mid + 1
+            else:
+                hi = mid
+        self.position = lo
 
     def advance(self):
-        if self.current_node_off != 0:
-            base = self._get_memtable().arena.base_ptr
-            self.current_node_off = node_get_next_off(base, self.current_node_off, 0)
+        self.position += 1
 
     def is_valid(self):
-        return self.current_node_off != 0
+        return self.position < self.snapshot.length()
 
     def is_exhausted(self):
         return not self.is_valid()
@@ -109,24 +95,22 @@ class MemTableCursor(BaseCursor):
         return self.key()
 
     def key(self):
-        if self.current_node_off == 0:
+        if self.position >= self.snapshot.length():
             return r_uint128(-1)
-        return node_get_key(
-            self._get_memtable().arena.base_ptr, self.current_node_off, self.key_size
-        )
+        return self.snapshot.get_pk(self.position)
 
     def weight(self):
-        if self.current_node_off == 0:
+        if self.position >= self.snapshot.length():
             return r_int64(0)
-        return node_get_weight(
-            self._get_memtable().arena.base_ptr, self.current_node_off
-        )
+        return self.snapshot.get_weight(self.position)
 
     def get_accessor(self):
-        memtable = self._get_memtable()
-        self.accessor.blob_base_ptr = memtable.blob_arena.base_ptr
-        self.accessor.set_row(memtable.arena.base_ptr, self.current_node_off)
+        self.accessor.bind(self.snapshot, self.position)
         return self.accessor
+
+    def close(self):
+        if self.owns_snapshot:
+            self.snapshot.free()
 
 
 # ---------------------------------------------------------------------------

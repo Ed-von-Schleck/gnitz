@@ -12,7 +12,7 @@ from rpython.rlib.rarithmetic import (
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.core import types, errors, serialize
+from gnitz.core import types, errors
 from gnitz.core import comparator as core_comparator
 from gnitz.core.store import ZSetStore
 from gnitz.core.keys import promote_to_index_key
@@ -95,7 +95,7 @@ class EphemeralTable(ZSetStore):
             name,
             schema,
             table_id=tid,
-            memtable_arena_size=self.memtable.arena.size,
+            memtable_arena_size=self.memtable.max_bytes,
         )
 
     def create_cursor(self):
@@ -141,24 +141,12 @@ class EphemeralTable(ZSetStore):
     def get_weight(self, key, accessor):
         """
         Returns the net algebraic weight for a specific record.
-        Zero-allocation: uses the provided accessor for SkipList search
-        and columnar shard comparisons.
         """
         r_key = r_uint128(key)
         total_w = r_int64(0)
 
-        # 1. Check SkipList MemTable
-        h_val, h_buf, h_cap = serialize.compute_hash(
-            self.schema, accessor, self.memtable.hash_buf, self.memtable.hash_buf_cap
-        )
-        self.memtable.hash_buf = h_buf
-        self.memtable.hash_buf_cap = h_cap
-
-        node_off = self.memtable._find_exact_values(r_key, h_val, accessor)
-        if node_off != 0:
-            from gnitz.storage.memtable_node import node_get_weight
-
-            total_w += node_get_weight(self.memtable.arena.base_ptr, node_off)
+        # 1. Check MemTable
+        total_w += self.memtable.find_weight_for_row(r_key, accessor)
 
         # 2. Check Columnar Shards via Index
         shard_matches = self.index.find_all_shards_and_indices(r_key)
@@ -192,6 +180,8 @@ class EphemeralTable(ZSetStore):
 
         try:
             self.memtable.upsert_batch(batch)
+            if self.memtable.should_flush():
+                self.flush()
         except errors.MemTableFullError:
             self.flush()
             self.memtable.upsert_batch(batch)
@@ -204,7 +194,7 @@ class EphemeralTable(ZSetStore):
         # Avoid os.path.join (Appendix A §10)
         shard_name = "eph_shard_%d_%d.db" % (
             self.table_id,
-            intmask(rffi.cast(rffi.SIZE_T, self.memtable.arena.offset)),
+            self.memtable.batch.length(),
         )
         shard_path = self.directory + "/" + shard_name
 
@@ -230,9 +220,9 @@ class EphemeralTable(ZSetStore):
             except OSError:
                 pass
 
-        arena_size = self.memtable.arena.size
+        max_bytes = self.memtable.max_bytes
         self.memtable.free()
-        self.memtable = memtable.MemTable(self.schema, arena_size)
+        self.memtable = memtable.MemTable(self.schema, max_bytes)
 
         return shard_path
 

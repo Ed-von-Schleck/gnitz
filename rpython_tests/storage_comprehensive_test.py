@@ -18,7 +18,6 @@ from gnitz.core import types, values, serialize, batch, xxh, errors
 from gnitz.storage import (
     buffer,
     memtable,
-    memtable_node,
     wal,
     wal_layout,
     writer_table,
@@ -287,19 +286,11 @@ def test_wal_storage(base_dir):
     os.write(1, "    [OK] Z-Set WAL passed.\n")
 
 
-def test_memtable_and_skiplist(base_dir):
-    os.write(1, "[Storage] Testing MemTable & SkipList...\n")
+def test_memtable(base_dir):
+    os.write(1, "[Storage] Testing MemTable...\n")
     schema_u128 = make_u128_i64_schema()
 
-    # 1. Key Alignment Geometry
-    for h in range(1, 17):
-        key_off = memtable_node.get_key_offset(h)
-        assert_equal_i(
-            0, key_off % 16, "Key offset must be 16-byte aligned for height %d" % h
-        )
-        assert_true(key_off >= 12 + (h * 4), "Pointers overflow into key")
-
-    # 2. Active Annihilation
+    # 1. Upsert and weight coalescing
     mt = memtable.MemTable(schema_u128, 1024 * 1024)
     try:
         pk1 = r_uint128(1)
@@ -309,23 +300,26 @@ def test_memtable_and_skiplist(base_dir):
         b_add = batch.make_singleton_batch(schema_u128, pk1, r_int64(1), row)
         mt.upsert_batch(b_add)
 
-        head_next = memtable_node.node_get_next_off(mt.arena.base_ptr, mt.head_off, 0)
-        assert_true(head_next != 0, "SkipList head pointer is null after insertion")
+        assert_false(mt.is_empty(), "MemTable should not be empty after insert")
+        assert_equal_i64(
+            r_int64(1), mt.get_weight_for_pk(pk1), "Weight should be 1 after insert"
+        )
 
         b_sub = batch.make_singleton_batch(schema_u128, pk1, r_int64(-1), row)
         mt.upsert_batch(b_sub)
 
-        head_next_after = memtable_node.node_get_next_off(
-            mt.arena.base_ptr, mt.head_off, 0
+        assert_equal_i64(
+            r_int64(0),
+            mt.get_weight_for_pk(pk1),
+            "Weight should be 0 after annihilation",
         )
-        assert_equal_i(0, head_next_after, "SkipList failed to unlink annihilated node")
 
         b_add.free()
         b_sub.free()
     finally:
         mt.free()
 
-    # 3. Transmutation Roundtrip & Blob Pruning
+    # 2. Flush with annihilation and blob pruning
     schema_str = make_u64_str_schema()
     mt2 = memtable.MemTable(schema_str, 1024 * 1024)
     try:
@@ -364,7 +358,56 @@ def test_memtable_and_skiplist(base_dir):
     finally:
         mt2.free()
 
-    os.write(1, "    [OK] MemTable & SkipList passed.\n")
+    # 3. Cursor iteration order after consolidation
+    mt3 = memtable.MemTable(schema_u128, 1024 * 1024)
+    try:
+        for pk_val in [30, 10, 20]:
+            row_c = values.make_payload_row(schema_u128)
+            row_c.append_int(rffi.cast(rffi.LONGLONG, r_int64(pk_val)))
+            b_c = batch.make_singleton_batch(
+                schema_u128, r_uint128(pk_val), r_int64(1), row_c
+            )
+            mt3.upsert_batch(b_c)
+            b_c.free()
+
+        mc = cursor.MemTableCursor(mt3)
+        assert_true(mc.is_valid(), "MemTableCursor should be valid")
+        assert_equal_u128(r_uint128(10), mc.key(), "Cursor should start at PK 10")
+        mc.advance()
+        assert_equal_u128(r_uint128(20), mc.key(), "Cursor should advance to PK 20")
+        mc.advance()
+        assert_equal_u128(r_uint128(30), mc.key(), "Cursor should advance to PK 30")
+        mc.advance()
+        assert_true(mc.is_exhausted(), "Cursor should be exhausted")
+
+        # 4. Cursor seek
+        mc2 = cursor.MemTableCursor(mt3)
+        mc2.seek(r_uint128(20))
+        assert_true(mc2.is_valid(), "Cursor should be valid after seek")
+        assert_equal_u128(r_uint128(20), mc2.key(), "Cursor should seek to PK 20")
+        mc2.close()
+        mc.close()
+    finally:
+        mt3.free()
+
+    # 5. MemTableFullError
+    tiny_mt = memtable.MemTable(schema_u128, 64)
+    raised = False
+    try:
+        for j in range(1000):
+            row_f = values.make_payload_row(schema_u128)
+            row_f.append_int(rffi.cast(rffi.LONGLONG, r_int64(j)))
+            b_f = batch.make_singleton_batch(
+                schema_u128, r_uint128(j), r_int64(1), row_f
+            )
+            tiny_mt.upsert_batch(b_f)
+            b_f.free()
+    except errors.MemTableFullError:
+        raised = True
+    assert_true(raised, "MemTableFullError not raised when capacity exceeded")
+    tiny_mt.free()
+
+    os.write(1, "    [OK] MemTable passed.\n")
 
 
 def test_shards_and_columnar(base_dir):
@@ -748,7 +791,7 @@ def entry_point(argv):
     try:
         test_integrity_and_lowlevel(base_dir)
         test_wal_storage(base_dir)
-        test_memtable_and_skiplist(base_dir)
+        test_memtable(base_dir)
         test_shards_and_columnar(base_dir)
         test_manifest_and_spine(base_dir)
         test_compaction(base_dir)

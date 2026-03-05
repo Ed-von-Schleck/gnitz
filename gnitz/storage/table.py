@@ -106,12 +106,14 @@ class PersistentTable(EphemeralTable):
         # Step 1: Write to Write-Ahead Log (Durability)
         self.wal_writer.append_batch(lsn, self.table_id, batch)
 
-        # Step 2: Write to SkipList (Visibility)
+        # Step 2: Write to MemTable (Visibility)
         # Guard against MemTableFullError: the WAL write above has already
         # committed, so the data is durable. Flush the MemTable to a shard
         # and retry so that the batch also becomes visible in memory.
         try:
             self.memtable.upsert_batch(batch)
+            if self.memtable.should_flush():
+                self.flush()
         except errors.MemTableFullError:
             self.flush()
             self.memtable.upsert_batch(batch)
@@ -204,9 +206,9 @@ class PersistentTable(EphemeralTable):
             )
 
         # 4. Rotation: Swap MemTable
-        arena_size = self.memtable.arena.size
+        max_bytes = self.memtable.max_bytes
         self.memtable.free()
-        self.memtable = memtable.MemTable(self.schema, arena_size)
+        self.memtable = memtable.MemTable(self.schema, max_bytes)
 
         # Bump generation to notify UnifiedCursors that sources have changed
         self._cursor_generation += 1
