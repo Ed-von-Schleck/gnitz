@@ -56,7 +56,7 @@ class BloomFilter(object):
         h2 = (h_val >> 32) | r_uint64(1)
         num_bits_u = r_uint64(self.num_bits)
         bits = self.bits
-        
+
         i = 0
         while i < NUM_PROBES:
             # Fully unsigned math avoids the negative modulo trap in RPython

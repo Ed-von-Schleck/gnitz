@@ -85,9 +85,9 @@ class Xor8Filter(object):
     def may_contain(self, key):
         h = self._hash_key(key)
         f = intmask(r_uint64(h) >> 56) & 0xFF
-        
+
         h0, h1, h2 = _get_h0_h1_h2(h, self.segment_length)
-        
+
         fp = self.fingerprints
         got = (ord(fp[h0]) ^ ord(fp[h1]) ^ ord(fp[h2])) & 0xFF
         return f == got
@@ -132,7 +132,8 @@ def build_xor8(keys_ptr, num_keys, key_size):
     if num_keys == 0:
         return None
 
-    segment_length = intmask(1 + (num_keys * 123 + 99) // 100 // 3)
+    capacity = intmask(1 + (num_keys * 123 + 99) // 100 + 32)
+    segment_length = intmask((capacity + 2) // 3)
     if segment_length < 4:
         segment_length = 4
     total_size = 3 * segment_length

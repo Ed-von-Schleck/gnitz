@@ -224,6 +224,17 @@ def _argsort_delta(batch, schema, col_indices):
     return indices
 
 
+def _mix64(v):
+    """Murmur3 64-bit finalizer. Pure RPython, JIT-inlinable."""
+    v = r_uint64(v)
+    v ^= v >> 33
+    v = r_uint64(v * r_uint64(0xFF51AFD7ED558CCD))
+    v ^= v >> 33
+    v = r_uint64(v * r_uint64(0xC4CEB9FE1A85EC53))
+    v ^= v >> 33
+    return v
+
+
 @jit.unroll_safe
 def _extract_group_key(accessor, schema, col_indices):
     """Computes a 128-bit key identifying the group."""
@@ -235,20 +246,20 @@ def _extract_group_key(accessor, schema, col_indices):
         if t == types.TYPE_U128.code:
             return accessor.get_u128(c_idx)
 
-    h_lo = r_uint64(0)
-    h_hi = r_uint64(0)
+    h = r_uint64(0x9E3779B97F4A7C15)  # golden ratio seed
     for i in range(len(col_indices)):
         c_idx = col_indices[i]
         t = schema.columns[c_idx].field_type.code
         if t == types.TYPE_STRING.code:
             res = accessor.get_str_struct(c_idx)
             s = strings.resolve_string(res[2], res[3], res[4])
-            h_lo ^= xxh.compute_checksum_bytes(s)
+            col_hash = xxh.compute_checksum_bytes(s)
         else:
-            h_lo ^= accessor.get_int(c_idx)
-        # Simple mixing to form 128-bit composite key
-        h_hi = (h_hi << 1) | (h_lo >> 63)
-    return (r_uint128(h_hi) << 64) | r_uint128(h_lo)
+            col_hash = _mix64(accessor.get_int(c_idx))
+        h = _mix64(h ^ col_hash ^ r_uint64(i))
+
+    h_hi = _mix64(h ^ r_uint64(len(col_indices)))
+    return (r_uint128(h_hi) << 64) | r_uint128(h)
 
 
 # ---------------------------------------------------------------------------

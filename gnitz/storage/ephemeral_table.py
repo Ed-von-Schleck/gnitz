@@ -78,6 +78,7 @@ class EphemeralTable(ZSetStore):
 
         self.index = index.ShardIndex(table_id, schema, self.ref_counter)
         self.memtable = memtable.MemTable(schema, memtable_arena_size)
+        self._flush_seq = 0
 
     # -- ZSetStore Interface Implementation -----------------------------------
 
@@ -196,10 +197,8 @@ class EphemeralTable(ZSetStore):
             raise errors.StorageError("Table is closed")
 
         # Avoid os.path.join (Appendix A §10)
-        shard_name = "eph_shard_%d_%d.db" % (
-            self.table_id,
-            self.memtable.batch.length(),
-        )
+        self._flush_seq += 1
+        shard_name = "eph_shard_%d_%d.db" % (self.table_id, self._flush_seq)
         shard_path = self.directory + "/" + shard_name
 
         self.memtable.flush(shard_path, self.table_id)
