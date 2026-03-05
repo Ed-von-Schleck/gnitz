@@ -231,13 +231,12 @@ class UnifiedCursor(AbstractCursor):
             if min_key == r_uint128(-1):
                 break
 
-            indices = self.tree.get_all_indices_at_min()
-            
+            num_candidates = self.tree.get_all_indices_at_min()
+
             net_weight = r_int64(0)
             idx = 0
-            num_candidates = len(indices)
             while idx < num_candidates:
-                c_idx = indices[idx]
+                c_idx = self.tree._min_indices[idx]
                 net_weight += self.cursors[c_idx].weight()
                 idx += 1
 
@@ -245,13 +244,13 @@ class UnifiedCursor(AbstractCursor):
                 self._current_key_lo = r_uint64(min_key)
                 self._current_key_hi = r_uint64(min_key >> 64)
                 self._current_weight = net_weight
-                self._current_accessor = self.cursors[indices[0]].get_accessor()
+                self._current_accessor = self.cursors[self.tree._min_indices[0]].get_accessor()
                 self._valid = True
                 return
             else:
                 idx = 0
                 while idx < num_candidates:
-                    self.tree.advance_cursor_by_index(indices[idx])
+                    self.tree.advance_cursor_by_index(self.tree._min_indices[idx])
                     idx += 1
 
         self._valid = False
@@ -271,13 +270,14 @@ class UnifiedCursor(AbstractCursor):
             self._find_next_non_ghost()
             return
 
-        indices = self.tree.get_all_indices_at_min()
+        # Reuse cached indices from the last _find_next_non_ghost() call
+        # instead of traversing the heap again.
+        count = self.tree._min_count
         idx = 0
-        num_to_advance = len(indices)
-        while idx < num_to_advance:
-            self.tree.advance_cursor_by_index(indices[idx])
+        while idx < count:
+            self.tree.advance_cursor_by_index(self.tree._min_indices[idx])
             idx += 1
-            
+
         self._find_next_non_ghost()
 
     def key(self):

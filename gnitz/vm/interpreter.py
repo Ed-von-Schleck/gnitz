@@ -97,7 +97,7 @@ def run_vm(program, reg_file, context):
                 reg_in.batch,
                 reg_out.batch,
                 instr.func,
-                reg_out.vm_schema.table_schema
+                reg_out.table_schema
             )
 
         elif opcode == op.OPCODE_NEGATE:
@@ -143,8 +143,8 @@ def run_vm(program, reg_file, context):
                 reg_delta.batch,
                 reg_trace.cursor,
                 batch.BatchWriter(reg_out.batch),
-                reg_delta.vm_schema.table_schema,
-                reg_trace.vm_schema.table_schema
+                reg_delta.table_schema,
+                reg_trace.table_schema
             )
 
         elif opcode == op.OPCODE_JOIN_DELTA_DELTA:
@@ -156,8 +156,8 @@ def run_vm(program, reg_file, context):
                 reg_a.batch, 
                 reg_b.batch, 
                 batch.BatchWriter(reg_out.batch),
-                reg_a.vm_schema.table_schema, 
-                reg_b.vm_schema.table_schema
+                reg_a.table_schema, 
+                reg_b.table_schema
             )
 
         elif opcode == op.OPCODE_DELAY:
@@ -182,7 +182,7 @@ def run_vm(program, reg_file, context):
             trace_in_cursor = instr.reg_trace_in.cursor if instr.reg_trace_in else None
             ops.op_reduce(
                 reg_in.batch,
-                reg_in.vm_schema.table_schema,
+                reg_in.table_schema,
                 trace_in_cursor,
                 reg_trace_out.cursor,
                 batch.BatchWriter(reg_out.batch),

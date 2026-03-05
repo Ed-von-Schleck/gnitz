@@ -35,23 +35,22 @@ def compact_shards(
 
         while not tree.is_exhausted():
             min_key = tree.get_min_key()
-            indices = tree.get_all_indices_at_min()
+            num_indices = tree.get_all_indices_at_min()
 
             net_weight = r_int64(0)
             i = 0
-            num_indices = len(indices)
             while i < num_indices:
-                net_weight += cursors[indices[i]].weight()
+                net_weight += cursors[tree._min_indices[i]].weight()
                 i += 1
 
             if net_weight != 0:
-                exemplar_cursor = cursors[indices[0]]
+                exemplar_cursor = cursors[tree._min_indices[0]]
                 acc = exemplar_cursor.get_accessor()
                 writer.add_row_from_accessor(min_key, net_weight, acc)
 
             i = 0
             while i < num_indices:
-                tree.advance_cursor_by_index(indices[i])
+                tree.advance_cursor_by_index(tree._min_indices[i])
                 i += 1
 
         writer.finalize(output_file)

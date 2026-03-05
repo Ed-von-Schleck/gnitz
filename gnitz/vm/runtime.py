@@ -15,24 +15,13 @@ STATUS_ERROR   = 4
 YIELD_REASON_NONE = 0
 
 
-class VMSchema(object):
-    """
-    Metadata cache for the VM.
-    Promoted to constants during JIT tracing to fold address arithmetic.
-    """
-    _immutable_fields_ = ['table_schema']
-
-    def __init__(self, table_schema):
-        self.table_schema = table_schema
-
-
 class BaseRegister(object):
     """Base class for all VM registers."""
-    _immutable_fields_ = ['reg_id', 'vm_schema']
+    _immutable_fields_ = ['reg_id', 'table_schema']
 
-    def __init__(self, reg_id, vm_schema):
+    def __init__(self, reg_id, table_schema):
         self.reg_id = reg_id
-        self.vm_schema = vm_schema
+        self.table_schema = table_schema
         self.batch = None
         self.cursor = None
         self.table = None
@@ -43,9 +32,9 @@ class BaseRegister(object):
 
 class DeltaRegister(BaseRegister):
     """R_Delta: Holds transient Z-Set batches."""
-    def __init__(self, reg_id, vm_schema):
-        BaseRegister.__init__(self, reg_id, vm_schema)
-        self._internal_batch = ZSetBatch(vm_schema.table_schema)
+    def __init__(self, reg_id, table_schema):
+        BaseRegister.__init__(self, reg_id, table_schema)
+        self._internal_batch = ZSetBatch(table_schema)
         self.batch = self._internal_batch
 
     def is_delta(self): return True
@@ -65,8 +54,8 @@ class DeltaRegister(BaseRegister):
 
 class TraceRegister(BaseRegister):
     """R_Trace: Holds persistent cursors or stateful Table references."""
-    def __init__(self, reg_id, vm_schema, cursor, table=None):
-        BaseRegister.__init__(self, reg_id, vm_schema)
+    def __init__(self, reg_id, table_schema, cursor, table=None):
+        BaseRegister.__init__(self, reg_id, table_schema)
         self.cursor = cursor
         self.table = table
 

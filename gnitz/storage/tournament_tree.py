@@ -41,6 +41,13 @@ class TournamentTree(object):
         for _ in range(self.num_cursors):
             self.pos_map.append(-1)
 
+        # Pre-allocated buffer for get_all_indices_at_min results.
+        # Avoids per-call list allocation in the hot merge loop.
+        self._min_indices = newlist_hint(self.num_cursors)
+        for _ in range(self.num_cursors):
+            self._min_indices.append(0)
+        self._min_count = 0
+
         self.rebuild()
 
     def rebuild(self):
@@ -150,21 +157,22 @@ class TournamentTree(object):
 
     def get_all_indices_at_min(self):
         """
-        Returns all original cursor indices currently matching the global
-        minimum (PrimaryKey, Payload).
+        Populates _min_indices with all original cursor indices matching
+        the global minimum (PrimaryKey, Payload). Returns the count.
 
-        LEVERAGES HEAP PRUNING: Because the heap is sorted by (PK, Payload),
-        once we encounter a node > root, we prune the entire branch.
+        Results are stored in self._min_indices[0:return_value].
+        LEVERAGES HEAP PRUNING: once we encounter a node > root, we prune
+        the entire branch.
         """
-        results = newlist_hint(self.num_cursors)
+        self._min_count = 0
         if self.heap_size == 0:
-            return results
+            return 0
 
         # Node 0 is always the global minimum.
-        self._collect_equal_indices(0, results)
-        return results
+        self._collect_equal_indices(0)
+        return self._min_count
 
-    def _collect_equal_indices(self, idx, results):
+    def _collect_equal_indices(self, idx):
         if idx >= self.heap_size:
             return
 
@@ -174,10 +182,12 @@ class TournamentTree(object):
         if cmp_res == 0:
             # Exact match (PK and Payload).
             c_idx = rffi.cast(lltype.Signed, self.heap[idx].cursor_idx)
-            results.append(c_idx)
+            pos = self._min_count
+            self._min_indices[pos] = c_idx
+            self._min_count = pos + 1
             # Recurse to children.
-            self._collect_equal_indices(2 * idx + 1, results)
-            self._collect_equal_indices(2 * idx + 2, results)
+            self._collect_equal_indices(2 * idx + 1)
+            self._collect_equal_indices(2 * idx + 2)
         # If cmp_res > 0, the node is strictly larger than the minimum,
         # so all its descendants must also be larger. PRUNE.
 

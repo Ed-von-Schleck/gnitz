@@ -76,7 +76,7 @@ def test_filter_map_negate():
         types.ColumnDefinition(types.TYPE_STRING, name="label"),
     ]
     in_schema = types.TableSchema(in_cols, 0)
-    in_vm = runtime.VMSchema(in_schema)
+    in_vm = in_schema
 
     # Map output schema: (pk:U64, val:I64, label:STRING) — project [val, label]
     # The map projects col 1 (val) and col 2 (label) from the input
@@ -87,7 +87,7 @@ def test_filter_map_negate():
         types.ColumnDefinition(types.TYPE_STRING, name="label"),
     ]
     out_map_schema = types.TableSchema(out_map_cols, 0)
-    out_map_vm = runtime.VMSchema(out_map_schema)
+    out_map_vm = out_map_schema
 
     # Registers: R0=input, R1=filter out, R2=map out, R3=negate out
     reg_file = runtime.RegisterFile(4)
@@ -163,7 +163,7 @@ def test_union():
         types.ColumnDefinition(types.TYPE_I64, name="val"),
     ]
     schema = types.TableSchema(cols, 0)
-    vm_schema = runtime.VMSchema(schema)
+    vm_schema = schema
 
     # R0=input A, R1=input B, R2=output
     reg_file = runtime.RegisterFile(3)
@@ -232,7 +232,7 @@ def test_join_delta_trace(base_dir):
         types.ColumnDefinition(types.TYPE_I64, name="dept"),
     ]
     schema_l = types.TableSchema(cols_l, 0)
-    vm_l = runtime.VMSchema(schema_l)
+    vm_l = schema_l
 
     # Right schema: (pk:U64, budget:I64)
     cols_r = [
@@ -240,11 +240,11 @@ def test_join_delta_trace(base_dir):
         types.ColumnDefinition(types.TYPE_I64, name="budget"),
     ]
     schema_r = types.TableSchema(cols_r, 0)
-    vm_r = runtime.VMSchema(schema_r)
+    vm_r = schema_r
 
     # Output schema: merge_schemas_for_join => (pk:U64, dept:I64, budget:I64)
     out_schema = types.merge_schemas_for_join(schema_l, schema_r)
-    out_vm = runtime.VMSchema(out_schema)
+    out_vm = out_schema
 
     # Pre-populate right-side EphemeralTable
     trace_dir = os.path.join(base_dir, "trace_join")
@@ -323,7 +323,7 @@ def test_distinct_multi_tick(base_dir):
         types.ColumnDefinition(types.TYPE_I64, name="val"),
     ]
     schema = types.TableSchema(cols, 0)
-    vm_schema = runtime.VMSchema(schema)
+    vm_schema = schema
 
     # History table for distinct state
     hist_dir = os.path.join(base_dir, "distinct_hist")
@@ -396,7 +396,7 @@ def test_reduce_sum(base_dir):
         types.ColumnDefinition(types.TYPE_I64, name="amount"),
     ]
     in_schema = types.TableSchema(in_cols, 0)
-    in_vm = runtime.VMSchema(in_schema)
+    in_vm = in_schema
 
     # Output schema: built by _build_reduce_output_schema
     # GROUP BY col 1 (grp:U64) => natural PK
@@ -404,7 +404,7 @@ def test_reduce_sum(base_dir):
     agg_func = functions.UniversalAccumulator(2, functions.AGG_SUM, types.TYPE_I64)
     group_by_cols = [1]
     out_schema = types._build_reduce_output_schema(in_schema, group_by_cols, agg_func)
-    out_vm = runtime.VMSchema(out_schema)
+    out_vm = out_schema
 
     # Trace tables for reduce state
     trace_in_dir = os.path.join(base_dir, "reduce_trace_in")
@@ -532,7 +532,7 @@ def test_ghost_property():
         types.ColumnDefinition(types.TYPE_I64, name="val"),
     ]
     schema = types.TableSchema(cols, 0)
-    vm_schema = runtime.VMSchema(schema)
+    vm_schema = schema
 
     # Simple passthrough: FilterOp with no predicate (pass all) then Halt
     # Use a null predicate that always returns True
@@ -586,7 +586,7 @@ def test_empty_input():
         types.ColumnDefinition(types.TYPE_I64, name="val"),
     ]
     schema = types.TableSchema(cols, 0)
-    vm_schema = runtime.VMSchema(schema)
+    vm_schema = schema
 
     reg_file = runtime.RegisterFile(2)
     reg_file.registers[0] = runtime.DeltaRegister(0, vm_schema)
@@ -622,7 +622,7 @@ def test_chunked_scan_resume(base_dir):
         types.ColumnDefinition(types.TYPE_I64, name="val"),
     ]
     schema = types.TableSchema(cols, 0)
-    vm_schema = runtime.VMSchema(schema)
+    vm_schema = schema
 
     table_path = os.path.join(base_dir, "chunk_table")
     table = EphemeralTable(table_path, "chunks", schema)
@@ -685,7 +685,7 @@ def test_seek_trace_point_lookup(base_dir):
         types.ColumnDefinition(types.TYPE_I64, name="val"),
     ]
     schema = types.TableSchema(cols, 0)
-    vm_schema = runtime.VMSchema(schema)
+    vm_schema = schema
 
     table_path = os.path.join(base_dir, "seek_table")
     table = EphemeralTable(table_path, "seek", schema)
@@ -751,7 +751,7 @@ def test_empty_table_scan(base_dir):
         types.ColumnDefinition(types.TYPE_I64, name="val"),
     ]
     schema = types.TableSchema(cols, 0)
-    vm_schema = runtime.VMSchema(schema)
+    vm_schema = schema
 
     table_path = os.path.join(base_dir, "empty_table")
     table = EphemeralTable(table_path, "empty", schema)
@@ -791,7 +791,7 @@ def test_join_delta_delta():
         types.ColumnDefinition(types.TYPE_I64, name="val_a"),
     ]
     schema_a = types.TableSchema(cols_a, 0)
-    vm_a = runtime.VMSchema(schema_a)
+    vm_a = schema_a
 
     # Schema B: (pk:U64, val_b:I64)
     cols_b = [
@@ -799,10 +799,10 @@ def test_join_delta_delta():
         types.ColumnDefinition(types.TYPE_I64, name="val_b"),
     ]
     schema_b = types.TableSchema(cols_b, 0)
-    vm_b = runtime.VMSchema(schema_b)
+    vm_b = schema_b
 
     out_schema = types.merge_schemas_for_join(schema_a, schema_b)
-    out_vm = runtime.VMSchema(out_schema)
+    out_vm = out_schema
 
     # R0=delta A, R1=delta B, R2=output
     reg_file = runtime.RegisterFile(3)
@@ -873,7 +873,7 @@ def test_delay_op():
         types.ColumnDefinition(types.TYPE_I64, name="val"),
     ]
     schema = types.TableSchema(cols, 0)
-    vm_schema = runtime.VMSchema(schema)
+    vm_schema = schema
 
     # R0=input, R1=delay output
     reg_file = runtime.RegisterFile(2)
@@ -943,13 +943,13 @@ def test_reduce_min_nonlinear(base_dir):
         types.ColumnDefinition(types.TYPE_I64, name="val"),
     ]
     in_schema = types.TableSchema(in_cols, 0)
-    in_vm = runtime.VMSchema(in_schema)
+    in_vm = in_schema
 
     # AGG_MIN on col 1 (val) is non-linear, so is_linear() returns False
     agg_func = functions.UniversalAccumulator(1, functions.AGG_MIN, types.TYPE_I64)
     group_by_cols = [0]  # GROUP BY pk
     out_schema = types._build_reduce_output_schema(in_schema, group_by_cols, agg_func)
-    out_vm = runtime.VMSchema(out_schema)
+    out_vm = out_schema
 
     trace_in_dir = os.path.join(base_dir, "min_trace_in")
     trace_out_dir = os.path.join(base_dir, "min_trace_out")
@@ -1051,7 +1051,7 @@ def test_join_delta_trace_multi_match(base_dir):
         types.ColumnDefinition(types.TYPE_I64, name="tag"),
     ]
     schema_l = types.TableSchema(cols_l, 0)
-    vm_l = runtime.VMSchema(schema_l)
+    vm_l = schema_l
 
     # Right (trace): (pk:U64, data:I64)
     cols_r = [
@@ -1059,10 +1059,10 @@ def test_join_delta_trace_multi_match(base_dir):
         types.ColumnDefinition(types.TYPE_I64, name="data"),
     ]
     schema_r = types.TableSchema(cols_r, 0)
-    vm_r = runtime.VMSchema(schema_r)
+    vm_r = schema_r
 
     out_schema = types.merge_schemas_for_join(schema_l, schema_r)
-    out_vm = runtime.VMSchema(out_schema)
+    out_vm = out_schema
 
     # Pre-populate trace with pk=42 appearing 3 times (different payloads, w=1)
     trace_dir = os.path.join(base_dir, "trace_multi")
