@@ -83,7 +83,7 @@ class SchemaEffectHook(DeltaHook):
         acc = batch.get_accessor(0)
         for i in range(batch.length()):
             weight = batch.get_weight(i)
-            batch.bind_raw_accessor(i, acc)
+            batch.bind_accessor(i, acc)
 
             sid = intmask(r_uint64(batch.get_pk(i)))
             name = sys.read_string(acc, sys.SchemaTab.COL_NAME)
@@ -122,7 +122,7 @@ class TableEffectHook(DeltaHook):
         for i in range(batch.length()):
             weight = batch.get_weight(i)
             tid = intmask(r_uint64(batch.get_pk(i)))
-            batch.bind_raw_accessor(i, acc)
+            batch.bind_accessor(i, acc)
 
             sid = intmask(acc.get_int(sys.TableTab.COL_SCHEMA_ID))
             name = sys.read_string(acc, sys.TableTab.COL_NAME)
@@ -224,7 +224,7 @@ class ViewEffectHook(DeltaHook):
         for i in range(batch.length()):
             weight = batch.get_weight(i)
             vid = intmask(r_uint64(batch.get_pk(i)))
-            batch.bind_raw_accessor(i, acc)
+            batch.bind_accessor(i, acc)
 
             sid = intmask(acc.get_int(sys.ViewTab.COL_SCHEMA_ID))
             name = sys.read_string(acc, sys.ViewTab.COL_NAME)
@@ -276,7 +276,7 @@ class IndexEffectHook(DeltaHook):
         for i in range(batch.length()):
             weight = batch.get_weight(i)
             idx_id = intmask(r_uint64(batch.get_pk(i)))
-            batch.bind_raw_accessor(i, acc)
+            batch.bind_accessor(i, acc)
 
             owner_id = intmask(acc.get_int(sys.IdxTab.COL_OWNER_ID))
             source_col_idx = intmask(acc.get_int(sys.IdxTab.COL_SOURCE_COL_IDX))

@@ -108,7 +108,7 @@ def cleanup_base_dir(path):
 def test_programmable_zset_lifecycle():
     log("Starting Comprehensive Programmable Z-Set Lifecycle Test...")
 
-    base_dir = "/tmp/gnitz_comp_test"
+    base_dir = "zstore_test_data"
     cleanup_base_dir(base_dir)
     ensure_dir(base_dir)
 

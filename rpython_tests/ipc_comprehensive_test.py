@@ -149,10 +149,10 @@ def test_ipc_bounds_and_forgery():
 
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_MAGIC))[0] = ipc.MAGIC_IPC
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_TARGET_ID))[0] = r_uint64(42)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_COUNT))[0] = r_uint64(1)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_PRIMARY_SZ))[0] = r_uint64(
-            2000
-        )
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_COUNT))[0] = r_uint64(99999)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_BLOB_SZ))[0] = r_uint64(0)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_NUM_COLS))[0] = r_uint64(2)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_PK_INDEX))[0] = r_uint64(0)
 
         s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
         try:
@@ -163,7 +163,7 @@ def test_ipc_bounds_and_forgery():
                 ipc.receive_payload(s2.fd, registry)
             except errors.StorageError:
                 raised = True
-            assert_true(raised, "IPC layer failed to detect primary arena overflow")
+            assert_true(raised, "IPC layer failed to detect column buffer overflow")
         finally:
             s1.close()
             s2.close()
@@ -197,7 +197,7 @@ def test_zero_copy_roundtrip():
         assert_true(rec_batch is not None, "Batch should not be None")
         assert_equal_i(1, rec_batch.length(), "Batch count mismatch")
         assert_true(
-            rec_batch.primary_arena.is_owned == False,
+            rec_batch.pk_lo_buf.is_owned == False,
             "Received batch should use unowned views",
         )
 

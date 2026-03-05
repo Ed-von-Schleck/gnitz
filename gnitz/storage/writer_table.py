@@ -224,6 +224,18 @@ class TableShardWriter(object):
         self.raw_accessor.set_pointers(packed_row_ptr, source_heap_ptr)
         self._append_from_accessor(self.raw_accessor)
 
+    def add_row_from_accessor(self, key, weight, accessor):
+        """Direct accessor ingestion — no AoS intermediate required."""
+        if weight == 0:
+            return
+        self.count += 1
+        if self.schema.get_pk_column().field_type.size == 16:
+            self.pk_buf.put_u128(key)
+        else:
+            self.pk_buf.put_u64(r_uint64(key))
+        self.w_buf.put_i64(weight)
+        self._append_from_accessor(accessor)
+
     def add_row_from_values(self, pk, weight, row):
         """
         Ingests data from a PayloadRow.

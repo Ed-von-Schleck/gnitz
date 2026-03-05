@@ -1,15 +1,9 @@
 # gnitz/storage/compactor.py
 
 import os
-from rpython.rlib import jit
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import r_int64, intmask
 from gnitz.storage import shard_table, writer_table, tournament_tree, index, cursor
-from gnitz.core import types, comparator as core_comparator
-
-
-NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
 
 def compact_shards(
@@ -24,7 +18,6 @@ def compact_shards(
 
     tree = None
     writer = None
-    tmp_row = NULL_PTR
 
     try:
         idx = 0
@@ -40,9 +33,6 @@ def compact_shards(
         tree = tournament_tree.TournamentTree(cursors, schema)
         writer = writer_table.TableShardWriter(schema, table_id)
 
-        stride = schema.memtable_stride
-        tmp_row = lltype.malloc(rffi.CCHARP.TO, stride, flavor="raw")
-
         while not tree.is_exhausted():
             min_key = tree.get_min_key()
             indices = tree.get_all_indices_at_min()
@@ -56,39 +46,8 @@ def compact_shards(
 
             if net_weight != 0:
                 exemplar_cursor = cursors[indices[0]]
-                # FIXED: Use the unified AbstractCursor interface method
                 acc = exemplar_cursor.get_accessor()
-
-                k = 0
-                while k < stride:
-                    tmp_row[k] = "\x00"
-                    k += 1
-
-                heap_ptr = NULL_PTR
-                num_cols = len(schema.columns)
-                col_idx = 0
-                while col_idx < num_cols:
-                    if col_idx == schema.pk_index:
-                        col_idx += 1
-                        continue
-
-                    col_def = schema.columns[col_idx]
-                    col_ptr = acc.get_col_ptr(col_idx)
-                    dest_off = schema.get_column_offset(col_idx)
-                    dest_ptr = rffi.ptradd(tmp_row, dest_off)
-
-                    sz = col_def.field_type.size
-                    b = 0
-                    while b < sz:
-                        dest_ptr[b] = col_ptr[b]
-                        b += 1
-
-                    if col_def.field_type.code == types.TYPE_STRING.code:
-                        _, _, _, h_ptr, _ = acc.get_str_struct(col_idx)
-                        heap_ptr = h_ptr
-                    col_idx += 1
-
-                writer.add_row(min_key, net_weight, tmp_row, heap_ptr)
+                writer.add_row_from_accessor(min_key, net_weight, acc)
 
             i = 0
             while i < num_indices:
@@ -97,8 +56,6 @@ def compact_shards(
 
         writer.finalize(output_file)
     finally:
-        if tmp_row:
-            lltype.free(tmp_row, flavor="raw")
         if tree:
             tree.close()
         v_idx = 0

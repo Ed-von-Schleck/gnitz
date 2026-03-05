@@ -3,6 +3,7 @@
 import os
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_uint32, r_uint64, intmask
+from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import mmap_posix, buffer
 from gnitz.server import ipc_ffi
@@ -11,36 +12,36 @@ from gnitz.core import errors, batch
 # "GNITZIPC" in little-endian hex: 0x474E49545A495043
 MAGIC_IPC = r_uint64(0x474E49545A495043)
 
-# Increased from 48 to 56 to accommodate Client ID
-HEADER_SIZE = 56
-ALIGNMENT = 64
-MAX_ERR_LEN = 65536  # Safety limit for error messages
-
-# Header Layout:
+# Header: 72 bytes
 # [00-07] Magic
 # [08-11] Status (u32)
 # [12-15] Error String Length (u32)
-# [16-23] Primary Arena Size (u64)
-# [24-31] Blob Arena Size (u64)
-# [32-39] Row Count (u64)
-# [40-47] Target Entity ID (u64)
-# [48-55] Client ID (u64)
+# [16-23] Row Count (u64)
+# [24-31] Target Entity ID (u64)
+# [32-39] Client ID (u64)
+# [40-47] Blob Arena Size (u64)
+# [48-55] Num Columns (u64) — total schema columns including PK
+# [56-63] PK Index (u64)
+# [64-71] Reserved (u64)
+HEADER_SIZE = 72
+ALIGNMENT = 64
+MAX_ERR_LEN = 65536
 
 OFF_MAGIC = 0
 OFF_STATUS = 8
 OFF_ERR_LEN = 12
-OFF_PRIMARY_SZ = 16
-OFF_BLOB_SZ = 24
-OFF_COUNT = 32
-OFF_TARGET_ID = 40
-OFF_CLIENT_ID = 48
+OFF_COUNT = 16
+OFF_TARGET_ID = 24
+OFF_CLIENT_ID = 32
+OFF_BLOB_SZ = 40
+OFF_NUM_COLS = 48
+OFF_PK_INDEX = 56
 
 # --- Status Codes ---
 STATUS_OK = 0
 STATUS_ERROR = 1
 
 # --- Yield Reason Codes ---
-# Mirroring runtime.py for protocol interpretation
 YIELD_REASON_NONE        = 0
 YIELD_REASON_BUFFER_FULL = 1
 YIELD_REASON_ROW_LIMIT   = 2
@@ -88,22 +89,84 @@ class IPCPayload(object):
             self.fd = -1
 
 
+def _compute_col_sizes(schema, count):
+    """Returns list of byte sizes for each column buffer (0 for PK column)."""
+    num_cols = len(schema.columns)
+    sizes = newlist_hint(num_cols)
+    for i in range(num_cols):
+        if i == schema.pk_index:
+            sizes.append(0)
+        else:
+            sizes.append(schema.columns[i].field_type.size * count)
+    return sizes
+
+
 @jit.dont_look_inside
 def serialize_to_memfd(target_id, zbatch=None, status=0, error_msg="", client_id=0):
     """
-    Decoupled Serialization: Writes a batch into a shared-memory file descriptor.
-    In Phase 4, the resulting FD is broadcast to multiple subscribers.
+    Serializes a columnar batch into a shared-memory file descriptor.
+
+    Wire format (columnar):
+      [Header 72B]
+      [Error string (aligned to 64)]
+      [PK Lo buffer — count * 8]
+      [PK Hi buffer — count * 8]
+      [Weight buffer — count * 8]
+      [Null buffer — count * 8]
+      [Col 0 buffer — count * stride] (skipping PK col)
+      [Col 1 buffer — count * stride]
+      ...
+      [Blob arena]
+    Each section is aligned to ALIGNMENT (64).
     """
     err_len = r_uint64(len(error_msg))
-    primary_sz = r_uint64(zbatch.primary_arena.offset) if zbatch else r_uint64(0)
+    count = intmask(zbatch.length()) if zbatch else 0
     blob_sz = r_uint64(zbatch.blob_arena.offset) if zbatch else r_uint64(0)
-    count = r_uint64(zbatch.length()) if zbatch else r_uint64(0)
 
-    # 1. Calculate strictly aligned offsets
-    err_str_off = r_uint64(HEADER_SIZE)
-    primary_off = align_up(err_str_off + err_len, ALIGNMENT)
-    blob_off = align_up(primary_off + primary_sz, ALIGNMENT)
-    total_size = blob_off + blob_sz
+    schema = zbatch._schema if zbatch else None
+    num_cols = intmask(len(schema.columns)) if schema else 0
+
+    # Calculate total size
+    cur_off = align_up(r_uint64(HEADER_SIZE) + err_len, ALIGNMENT)
+
+    if zbatch and count > 0:
+        pk_lo_sz = r_uint64(count * 8)
+        pk_hi_sz = r_uint64(count * 8)
+        weight_sz = r_uint64(count * 8)
+        null_sz = r_uint64(count * 8)
+
+        pk_lo_off = cur_off
+        cur_off = align_up(cur_off + pk_lo_sz, ALIGNMENT)
+        pk_hi_off = cur_off
+        cur_off = align_up(cur_off + pk_hi_sz, ALIGNMENT)
+        weight_off = cur_off
+        cur_off = align_up(cur_off + weight_sz, ALIGNMENT)
+        null_off = cur_off
+        cur_off = align_up(cur_off + null_sz, ALIGNMENT)
+
+        col_offsets = newlist_hint(num_cols)
+        col_sizes = newlist_hint(num_cols)
+        for ci in range(num_cols):
+            if ci == schema.pk_index:
+                col_offsets.append(r_uint64(0))
+                col_sizes.append(r_uint64(0))
+            else:
+                sz = r_uint64(schema.columns[ci].field_type.size * count)
+                col_offsets.append(cur_off)
+                col_sizes.append(sz)
+                cur_off = align_up(cur_off + sz, ALIGNMENT)
+
+        blob_off = cur_off
+        total_size = cur_off + blob_sz
+    else:
+        pk_lo_off = cur_off
+        pk_hi_off = cur_off
+        weight_off = cur_off
+        null_off = cur_off
+        col_offsets = newlist_hint(0)
+        col_sizes = newlist_hint(0)
+        blob_off = cur_off
+        total_size = cur_off
 
     fd = -1
     ptr = lltype.nullptr(rffi.CCHARP.TO)
@@ -118,35 +181,39 @@ def serialize_to_memfd(target_id, zbatch=None, status=0, error_msg="", client_id
             flags=mmap_posix.MAP_SHARED,
         )
 
-        # 2. Write Header
+        # Write Header
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_MAGIC))[0] = MAGIC_IPC
         rffi.cast(rffi.UINTP, rffi.ptradd(ptr, OFF_STATUS))[0] = r_uint32(status)
         rffi.cast(rffi.UINTP, rffi.ptradd(ptr, OFF_ERR_LEN))[0] = r_uint32(err_len)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_PRIMARY_SZ))[0] = primary_sz
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_BLOB_SZ))[0] = blob_sz
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_COUNT))[0] = count
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_COUNT))[0] = r_uint64(count)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_TARGET_ID))[0] = r_uint64(target_id)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_CLIENT_ID))[0] = r_uint64(client_id)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_BLOB_SZ))[0] = blob_sz
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_NUM_COLS))[0] = r_uint64(num_cols)
+        pk_idx_val = r_uint64(schema.pk_index) if schema else r_uint64(0)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_PK_INDEX))[0] = pk_idx_val
 
-        # 3. Write Error String
+        # Write Error String
         if err_len > 0:
             for i in range(intmask(err_len)):
-                ptr[intmask(err_str_off) + i] = error_msg[i]
+                ptr[HEADER_SIZE + i] = error_msg[i]
 
-        # 4. Copy Arenas
-        if zbatch:
-            if primary_sz > 0:
-                buffer.c_memmove(
-                    rffi.cast(rffi.VOIDP, rffi.ptradd(ptr, intmask(primary_off))),
-                    rffi.cast(rffi.VOIDP, zbatch.primary_arena.base_ptr),
-                    rffi.cast(rffi.SIZE_T, primary_sz),
-                )
+        # Write column buffers
+        if zbatch and count > 0:
+            _copy_buf(ptr, pk_lo_off, zbatch.pk_lo_buf, count * 8)
+            _copy_buf(ptr, pk_hi_off, zbatch.pk_hi_buf, count * 8)
+            _copy_buf(ptr, weight_off, zbatch.weight_buf, count * 8)
+            _copy_buf(ptr, null_off, zbatch.null_buf, count * 8)
+
+            for ci in range(num_cols):
+                if ci == schema.pk_index:
+                    continue
+                sz = intmask(col_sizes[ci])
+                if sz > 0:
+                    _copy_buf(ptr, col_offsets[ci], zbatch.col_bufs[ci], sz)
+
             if blob_sz > 0:
-                buffer.c_memmove(
-                    rffi.cast(rffi.VOIDP, rffi.ptradd(ptr, intmask(blob_off))),
-                    rffi.cast(rffi.VOIDP, zbatch.blob_arena.base_ptr),
-                    rffi.cast(rffi.SIZE_T, blob_sz),
-                )
+                _copy_buf(ptr, blob_off, zbatch.blob_arena, intmask(blob_sz))
 
         mmap_posix.munmap_file(ptr, intmask(total_size))
         return fd
@@ -159,16 +226,24 @@ def serialize_to_memfd(target_id, zbatch=None, status=0, error_msg="", client_id
         raise e
 
 
+def _copy_buf(dest_base, dest_off, src_buf, nbytes):
+    """Copies nbytes from src_buf.base_ptr to dest_base + dest_off."""
+    if nbytes > 0 and src_buf.base_ptr:
+        buffer.c_memmove(
+            rffi.cast(rffi.VOIDP, rffi.ptradd(dest_base, intmask(dest_off))),
+            rffi.cast(rffi.VOIDP, src_buf.base_ptr),
+            rffi.cast(rffi.SIZE_T, nbytes),
+        )
+
+
 @jit.dont_look_inside
 def send_batch(sock_fd, target_id, zbatch, status=0, error_msg="", client_id=0):
     """
     Synchronous send: Serializes and transmits a single batch.
-    Used for request-response pairs and ingestion acknowledgments.
     """
     memfd = serialize_to_memfd(target_id, zbatch, status, error_msg, client_id)
     try:
         if ipc_ffi.send_fd(sock_fd, memfd) < 0:
-            # Most likely the client disconnected (EPIPE)
             raise errors.StorageError("Failed to transmit IPC segment (Disconnected)")
     finally:
         os.close(memfd)
@@ -183,7 +258,6 @@ def send_error(sock_fd, error_msg, target_id=0, client_id=0):
 def receive_payload(sock_fd, registry):
     """
     Receives an IPC segment and reconstructs metadata and batch view.
-    Utilizes target_id for O(1) schema resolution.
     """
     fd = ipc_ffi.recv_fd(sock_fd)
     if fd < 0:
@@ -203,26 +277,20 @@ def receive_payload(sock_fd, registry):
             flags=mmap_posix.MAP_SHARED,
         )
 
-        # 1. Verify Magic
+        # Verify Magic
         magic = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_MAGIC))[0]
         if magic != MAGIC_IPC:
             raise errors.StorageError("Invalid IPC Magic")
 
-        # 2. Parse Header
-        # Fixed: Use primitive constructors (intmask, r_uint64) for RPython type conversion,
-        # not rffi.cast.
+        # Parse Header
         status = intmask(rffi.cast(rffi.UINTP, rffi.ptradd(ptr, OFF_STATUS))[0])
-        
         raw_err_len = rffi.cast(rffi.UINTP, rffi.ptradd(ptr, OFF_ERR_LEN))[0]
         err_len = r_uint64(raw_err_len)
-
-        primary_sz = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_PRIMARY_SZ))[0])
-        blob_sz = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_BLOB_SZ))[0])
-        count = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_COUNT))[0])
+        count = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_COUNT))[0])
         target_id = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_TARGET_ID))[0]
         client_id = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_CLIENT_ID))[0]
+        blob_sz = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_BLOB_SZ))[0])
 
-        # 3. Validation: Bounds and Arithmetic Overflows
         if err_len > r_uint64(MAX_ERR_LEN):
             raise errors.StorageError("Error message length exceeds safety limit")
 
@@ -238,7 +306,6 @@ def receive_payload(sock_fd, registry):
         zbatch = None
         tid = intmask(target_id)
 
-        # 4. Resolve Schema and Reconstruct Batch if data is present
         if count > 0:
             if not registry.has_id(tid):
                 raise errors.StorageError(
@@ -247,28 +314,67 @@ def receive_payload(sock_fd, registry):
 
             family = registry.get_by_id(tid)
             schema = family.get_schema()
+            num_cols = len(schema.columns)
 
-            # Check Primary Arena bounds
-            primary_off = align_up(r_uint64(HEADER_SIZE) + err_len, ALIGNMENT)
-            if primary_off > total_size or primary_sz > (total_size - primary_off):
-                raise errors.StorageError("Truncated IPC (Primary arena boundary)")
+            cur_off = align_up(r_uint64(HEADER_SIZE) + err_len, ALIGNMENT)
 
-            # Check Blob Arena bounds
-            blob_off = align_up(primary_off + primary_sz, ALIGNMENT)
-            if blob_off > total_size or blob_sz > (total_size - blob_off):
-                raise errors.StorageError("Truncated IPC (Blob arena boundary)")
+            pk_lo_sz = count * 8
+            pk_lo_off = cur_off
+            cur_off = align_up(cur_off + r_uint64(pk_lo_sz), ALIGNMENT)
 
-            # Construct zero-copy buffer view (is_owned=False)
-            primary_buf = buffer.Buffer.from_external_ptr(
-                rffi.ptradd(ptr, intmask(primary_off)), intmask(primary_sz)
+            pk_hi_off = cur_off
+            cur_off = align_up(cur_off + r_uint64(count * 8), ALIGNMENT)
+
+            weight_off = cur_off
+            cur_off = align_up(cur_off + r_uint64(count * 8), ALIGNMENT)
+
+            null_off = cur_off
+            cur_off = align_up(cur_off + r_uint64(count * 8), ALIGNMENT)
+
+            if cur_off > total_size:
+                raise errors.StorageError("Truncated IPC (column buffer boundary)")
+
+            pk_lo_buf = buffer.Buffer.from_external_ptr(
+                rffi.ptradd(ptr, intmask(pk_lo_off)), pk_lo_sz
             )
+            pk_lo_buf.offset = pk_lo_sz
+            pk_hi_buf = buffer.Buffer.from_external_ptr(
+                rffi.ptradd(ptr, intmask(pk_hi_off)), count * 8
+            )
+            pk_hi_buf.offset = count * 8
+            weight_buf = buffer.Buffer.from_external_ptr(
+                rffi.ptradd(ptr, intmask(weight_off)), count * 8
+            )
+            weight_buf.offset = count * 8
+            null_buf = buffer.Buffer.from_external_ptr(
+                rffi.ptradd(ptr, intmask(null_off)), count * 8
+            )
+            null_buf.offset = count * 8
+
+            col_bufs = newlist_hint(num_cols)
+            col_strides = newlist_hint(num_cols)
+            for ci in range(num_cols):
+                if ci == schema.pk_index:
+                    col_bufs.append(buffer.Buffer(0))
+                    col_strides.append(0)
+                else:
+                    col_sz = schema.columns[ci].field_type.size * count
+                    cb = buffer.Buffer.from_external_ptr(
+                        rffi.ptradd(ptr, intmask(cur_off)), col_sz
+                    )
+                    cb.offset = col_sz
+                    col_bufs.append(cb)
+                    col_strides.append(schema.columns[ci].field_type.size)
+                    cur_off = align_up(cur_off + r_uint64(col_sz), ALIGNMENT)
+
             blob_buf = buffer.Buffer.from_external_ptr(
-                rffi.ptradd(ptr, intmask(blob_off)), intmask(blob_sz)
+                rffi.ptradd(ptr, intmask(cur_off)), intmask(blob_sz)
             )
             blob_buf.offset = intmask(blob_sz)
 
             zbatch = batch.ArenaZSetBatch.from_buffers(
-                schema, primary_buf, blob_buf, intmask(count), is_sorted=True
+                schema, pk_lo_buf, pk_hi_buf, weight_buf, null_buf,
+                col_bufs, col_strides, blob_buf, count, is_sorted=True
             )
 
         return IPCPayload(fd, ptr, total_size, status, error_msg, zbatch, tid, intmask(client_id))

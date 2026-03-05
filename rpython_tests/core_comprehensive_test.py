@@ -337,9 +337,6 @@ def test_batch_operations():
 
     b = batch.ArenaZSetBatch(schema, initial_capacity=10)
 
-    # Verify Alignment 
-    assert_equal_i(0, b.record_stride % 16, "Arena stride is not 16-byte aligned")
-
     pk1 = r_uint128(100)
     pk2 = r_uint128(200)
 
@@ -357,30 +354,30 @@ def test_batch_operations():
     assert_equal_i(4, b.length(), "Pre-sort length mismatch")
     assert_false(b.is_sorted(), "Batch erroneously flagged as sorted")
 
-    # Sort
-    b.sort()
-    assert_true(b.is_sorted(), "Sort failed to flag batch as sorted")
+    # Sort (functional: to_sorted() returns a new batch, SortedScope frees it)
+    with batch.SortedScope(b) as sorted_b:
+        assert_true(sorted_b.is_sorted(), "Sort failed to flag batch as sorted")
 
-    # Post sort, PK1 (100) should be before PK2 (200)
-    assert_equal_u128(pk1, b.get_pk(0), "Sort order mismatch idx 0")
-    assert_equal_u128(pk1, b.get_pk(1), "Sort order mismatch idx 1")
-    assert_equal_u128(pk2, b.get_pk(2), "Sort order mismatch idx 2")
-    assert_equal_u128(pk2, b.get_pk(3), "Sort order mismatch idx 3")
+        # Post sort, PK1 (100) should be before PK2 (200)
+        assert_equal_u128(pk1, sorted_b.get_pk(0), "Sort order mismatch idx 0")
+        assert_equal_u128(pk1, sorted_b.get_pk(1), "Sort order mismatch idx 1")
+        assert_equal_u128(pk2, sorted_b.get_pk(2), "Sort order mismatch idx 2")
+        assert_equal_u128(pk2, sorted_b.get_pk(3), "Sort order mismatch idx 3")
 
     # Consolidate (Algebraic Merge + Ghost Pruning)
-    b.consolidate()
-    
+    # ConsolidatedScope handles sorting internally and frees the temporary.
+    #
     # Expected End State:
     # PK 100, "Payload_A": W = 10 + 5 = 15
     # PK 200, "Payload_B": W = 5 - 5 = 0 -> GHOSTED (Removed)
-    
-    assert_equal_i(1, b.length(), "Ghost Property failed: zero-weight record was preserved")
-    assert_equal_u128(pk1, b.get_pk(0), "Consolidated PK mismatch")
-    assert_equal_i64(r_int64(15), b.get_weight(0), "Algebraic summation mismatch")
-    
-    # Read the row back to ensure blob strings survived the relocation passes
-    rec_row = b.get_row(0)
-    assert_equal_s("Payload_A", rec_row.get_str(0), "Consolidated payload string mismatch")
+    with batch.ConsolidatedScope(b) as cb:
+        assert_equal_i(1, cb.length(), "Ghost Property failed: zero-weight record was preserved")
+        assert_equal_u128(pk1, cb.get_pk(0), "Consolidated PK mismatch")
+        assert_equal_i64(r_int64(15), cb.get_weight(0), "Algebraic summation mismatch")
+
+        # Read the row back to ensure blob strings survived the relocation passes
+        rec_row = cb.get_row(0)
+        assert_equal_s("Payload_A", rec_row.get_str(0), "Consolidated payload string mismatch")
 
     b.free()
     os.write(1, "    [OK] ZSetBatch & Ghost Property passed.\n")

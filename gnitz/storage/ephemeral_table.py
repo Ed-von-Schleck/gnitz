@@ -261,7 +261,7 @@ class EphemeralTable(ZSetStore):
         acc = source_batch.get_accessor(0)
 
         for i in range(n):
-            source_batch.bind_raw_accessor(i, acc)
+            source_batch.bind_accessor(i, acc)
 
             if acc.is_null(source_col_idx):
                 continue

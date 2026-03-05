@@ -9,8 +9,7 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.core import types, strings, xxh, errors
 from gnitz.core.comparator import RowAccessor
-from gnitz.core.batch import ConsolidatedScope, BatchWriter
-from gnitz.storage.comparator import RawWALAccessor
+from gnitz.core.batch import ConsolidatedScope, BatchWriter, ColumnarBatchAccessor
 from gnitz.dbsp.functions import NULL_AGGREGATE
 
 """
@@ -205,16 +204,16 @@ def _argsort_delta(batch, schema, col_indices):
     if count <= 1:
         return indices
 
-    acc_a = RawWALAccessor(schema)
-    acc_b = RawWALAccessor(schema)
+    acc_a = ColumnarBatchAccessor(schema)
+    acc_b = ColumnarBatchAccessor(schema)
 
     # Insertion sort for small deltas; should be replaced by merge sort
     # if large unindexed deltas become common.
     for i in range(1, count):
         j = i
         while j > 0:
-            batch.bind_raw_accessor(indices[j], acc_a)
-            batch.bind_raw_accessor(indices[j - 1], acc_b)
+            batch.bind_accessor(indices[j], acc_a)
+            batch.bind_accessor(indices[j - 1], acc_b)
             if _compare_by_cols(acc_a, acc_b, schema, col_indices) < 0:
                 tmp = indices[j]
                 indices[j] = indices[j - 1]
@@ -294,8 +293,8 @@ def op_reduce(
             # Sort the delta by the requested group columns
             sorted_indices = _argsort_delta(b, input_schema, group_by_cols)
 
-        acc_in = RawWALAccessor(input_schema)
-        acc_exemplar = RawWALAccessor(input_schema)
+        acc_in = ColumnarBatchAccessor(input_schema)
+        acc_exemplar = ColumnarBatchAccessor(input_schema)
         reduce_acc = ReduceAccessor(input_schema, output_schema, group_by_cols)
 
         idx = 0
@@ -304,7 +303,7 @@ def op_reduce(
             group_start_pos = idx
             group_start_idx = sorted_indices[group_start_pos]
 
-            b.bind_raw_accessor(group_start_idx, acc_exemplar)
+            b.bind_accessor(group_start_idx, acc_exemplar)
             if group_by_pk:
                 group_key = b.get_pk(group_start_idx)
             else:
@@ -314,7 +313,7 @@ def op_reduce(
             agg_func.reset()
             while idx < n:
                 curr_idx = sorted_indices[idx]
-                b.bind_raw_accessor(curr_idx, acc_in)
+                b.bind_accessor(curr_idx, acc_in)
                 
                 if group_by_pk:
                     if b.get_pk(curr_idx) != group_key:
@@ -355,7 +354,7 @@ def op_reduce(
                 # Apply current tick's contribution
                 for k in range(group_start_pos, idx):
                     d_idx = sorted_indices[k]
-                    b.bind_raw_accessor(d_idx, acc_in)
+                    b.bind_accessor(d_idx, acc_in)
                     agg_func.step(acc_in, b.get_weight(d_idx))
 
             # 6. Emission: +1 Agg(history + delta)

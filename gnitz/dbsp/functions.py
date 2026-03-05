@@ -153,13 +153,14 @@ class UniversalAccumulator(AggregateFunction):
         if op != AGG_COUNT and row_accessor.is_null(self.col_idx):
             return
 
+        first = not self._has_value
         self._has_value = True
         code = self.col_type_code
         is_f = (code == types.TYPE_F64.code or code == types.TYPE_F32.code)
 
         if op == AGG_COUNT:
             self._acc = r_int64(intmask(self._acc + weight))
-        
+
         elif op == AGG_SUM:
             if is_f:
                 val_f = row_accessor.get_float(self.col_idx)
@@ -173,21 +174,21 @@ class UniversalAccumulator(AggregateFunction):
         elif op == AGG_MIN:
             if is_f:
                 v = row_accessor.get_float(self.col_idx)
-                if not self._has_value or v < longlong2float(self._acc):
+                if first or v < longlong2float(self._acc):
                     self._acc = float2longlong(v)
             else:
                 v = row_accessor.get_int_signed(self.col_idx)
-                if not self._has_value or v < self._acc:
+                if first or v < self._acc:
                     self._acc = v
 
         elif op == AGG_MAX:
             if is_f:
                 v = row_accessor.get_float(self.col_idx)
-                if not self._has_value or v > longlong2float(self._acc):
+                if first or v > longlong2float(self._acc):
                     self._acc = float2longlong(v)
             else:
                 v = row_accessor.get_int_signed(self.col_idx)
-                if not self._has_value or v > self._acc:
+                if first or v > self._acc:
                     self._acc = v
 
     def merge_accumulated(self, value_bits, weight):

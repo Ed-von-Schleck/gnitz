@@ -71,7 +71,7 @@ def ingest_to_family(family, batch):
             if batch.get_weight(i) <= 0:
                 continue
 
-            batch.bind_raw_accessor(i, acc)
+            batch.bind_accessor(i, acc)
 
             for c_idx in range(n_constraints):
                 constraint = family.fk_constraints[c_idx]
