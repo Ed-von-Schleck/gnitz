@@ -115,8 +115,11 @@ class EphemeralTable(ZSetStore):
         """
         r_key = r_uint128(key)
 
-        # 1. SkipList MemTable
-        total_w = self.memtable.get_weight_for_pk(r_key)
+        # 1. MemTable (Bloom-filtered)
+        if self.memtable.may_contain_pk(r_key):
+            total_w = self.memtable.get_weight_for_pk(r_key)
+        else:
+            total_w = r_int64(0)
 
         # 2. Columnar Shards via Index
         shard_matches = self.index.find_all_shards_and_indices(r_key)
@@ -145,8 +148,9 @@ class EphemeralTable(ZSetStore):
         r_key = r_uint128(key)
         total_w = r_int64(0)
 
-        # 1. Check MemTable
-        total_w += self.memtable.find_weight_for_row(r_key, accessor)
+        # 1. Check MemTable (Bloom-filtered)
+        if self.memtable.may_contain_pk(r_key):
+            total_w += self.memtable.find_weight_for_row(r_key, accessor)
 
         # 2. Check Columnar Shards via Index
         shard_matches = self.index.find_all_shards_and_indices(r_key)

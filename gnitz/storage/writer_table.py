@@ -382,9 +382,22 @@ class TableShardWriter(object):
                 i += 1
 
             mmap_posix.fsync_c(fd)
+
+            xor8_filter = None
+            if self.count > 0:
+                from gnitz.storage.xor8 import build_xor8
+
+                pk_size = self.schema.get_pk_column().field_type.size
+                xor8_filter = build_xor8(self.pk_buf.ptr, self.count, pk_size)
         finally:
             rposix.close(fd)
             self.close()
 
         os.rename(tmp_filename, filename)
         mmap_posix.fsync_dir(filename)
+
+        if xor8_filter is not None:
+            from gnitz.storage.xor8 import save_xor8
+
+            save_xor8(xor8_filter, filename + ".xor8")
+            xor8_filter.free()

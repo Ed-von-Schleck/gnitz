@@ -777,6 +777,175 @@ def test_u128_payloads(base_dir):
     os.write(1, "    [OK] U128 Payloads passed.\n")
 
 
+def test_bloom_filter(base_dir):
+    os.write(1, "[Storage] Testing Bloom Filter...\n")
+    from gnitz.storage.bloom import BloomFilter
+
+    # 1. No false negatives
+    bf = BloomFilter(200)
+    for i in range(100):
+        bf.add(r_uint128(i))
+    for i in range(100):
+        assert_true(bf.may_contain(r_uint128(i)), "Bloom FN for key %d" % i)
+
+    # 2. Low false positive rate
+    fp_count = 0
+    for i in range(1000, 2000):
+        if bf.may_contain(r_uint128(i)):
+            fp_count += 1
+    assert_true(fp_count < 50, "Bloom FPR too high: %d/1000" % fp_count)
+    bf.free()
+
+    # 3. Empty filter returns False
+    bf2 = BloomFilter(100)
+    assert_false(bf2.may_contain(r_uint128(42)), "Empty bloom should return False")
+    bf2.free()
+
+    os.write(1, "    [OK] Bloom Filter passed.\n")
+
+
+def test_xor8_filter(base_dir):
+    os.write(1, "[Storage] Testing XOR8 Filter...\n")
+    from gnitz.storage.xor8 import build_xor8, save_xor8, load_xor8
+
+    num_keys = 200
+    key_size = 8
+    pk_buf = lltype.malloc(rffi.CCHARP.TO, num_keys * key_size, flavor="raw")
+    try:
+        i = 0
+        while i < num_keys:
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(pk_buf, i * key_size))[
+                0
+            ] = rffi.cast(rffi.ULONGLONG, r_uint64(i + 1))
+            i += 1
+
+        # 1. Construction + no false negatives
+        xf = build_xor8(pk_buf, num_keys, key_size)
+        assert_true(xf is not None, "XOR8 build returned None")
+
+        for i in range(num_keys):
+            assert_true(
+                xf.may_contain(r_uint128(i + 1)),
+                "XOR8 FN for key %d" % (i + 1),
+            )
+
+        # 2. Low false positive rate
+        fp_count = 0
+        for i in range(5000, 7000):
+            if xf.may_contain(r_uint128(i)):
+                fp_count += 1
+        assert_true(fp_count < 40, "XOR8 FPR too high: %d/2000" % fp_count)
+
+        # 3. Serde roundtrip
+        xor_path = os.path.join(base_dir, "test.xor8")
+        save_xor8(xf, xor_path)
+        xf2 = load_xor8(xor_path)
+        assert_true(xf2 is not None, "XOR8 load returned None")
+
+        for i in range(num_keys):
+            assert_true(
+                xf2.may_contain(r_uint128(i + 1)),
+                "XOR8 serde FN for key %d" % (i + 1),
+            )
+        xf2.free()
+        xf.free()
+    finally:
+        lltype.free(pk_buf, flavor="raw")
+
+    # 4. Small set (2 keys)
+    small_buf = lltype.malloc(rffi.CCHARP.TO, 2 * key_size, flavor="raw")
+    try:
+        rffi.cast(rffi.ULONGLONGP, small_buf)[0] = rffi.cast(
+            rffi.ULONGLONG, r_uint64(999)
+        )
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(small_buf, 8))[0] = rffi.cast(
+            rffi.ULONGLONG, r_uint64(1000)
+        )
+        xf3 = build_xor8(small_buf, 2, key_size)
+        assert_true(xf3 is not None, "XOR8 small set build failed")
+        assert_true(xf3.may_contain(r_uint128(999)), "XOR8 small FN key 999")
+        assert_true(xf3.may_contain(r_uint128(1000)), "XOR8 small FN key 1000")
+        xf3.free()
+    finally:
+        lltype.free(small_buf, flavor="raw")
+
+    # 5. load_xor8 returns None for missing file
+    missing = load_xor8(os.path.join(base_dir, "nonexistent.xor8"))
+    assert_true(missing is None, "load_xor8 should return None for missing file")
+
+    os.write(1, "    [OK] XOR8 Filter passed.\n")
+
+
+def test_filter_integration(base_dir):
+    os.write(1, "[Storage] Testing Filter Integration...\n")
+    schema = make_u64_str_schema()
+
+    # 1. MemTable Bloom integration
+    mt = memtable.MemTable(schema, 1024 * 1024)
+    try:
+        for i in range(1, 51):
+            row = values.make_payload_row(schema)
+            row.append_string("v%d" % i)
+            b = batch.make_singleton_batch(schema, r_uint128(i), r_int64(1), row)
+            mt.upsert_batch(b)
+            b.free()
+
+        for i in range(1, 51):
+            assert_true(
+                mt.may_contain_pk(r_uint128(i)),
+                "Bloom missed inserted key %d" % i,
+            )
+
+        fp_count = 0
+        for i in range(1000, 1100):
+            if mt.may_contain_pk(r_uint128(i)):
+                fp_count += 1
+        assert_true(fp_count < 20, "MemTable bloom FPR too high: %d/100" % fp_count)
+    finally:
+        mt.free()
+
+    # 2. Shard XOR8 integration
+    shard_path = os.path.join(base_dir, "xor8_shard.db")
+    sw = writer_table.TableShardWriter(schema, table_id=1)
+    for i in range(1, 51):
+        row = values.make_payload_row(schema)
+        row.append_string("shard_v%d" % i)
+        sw.add_row_from_values(r_uint128(i), r_int64(1), row)
+    sw.finalize(shard_path)
+
+    xor8_path = shard_path + ".xor8"
+    assert_true(os.path.exists(xor8_path), "XOR8 sidecar file not created")
+
+    h = index.ShardHandle(
+        shard_path, schema, r_uint64(0), r_uint64(0)
+    )
+    assert_true(h.xor8_filter is not None, "ShardHandle xor8_filter not loaded")
+
+    for i in range(1, 51):
+        assert_true(
+            h.xor8_filter.may_contain(r_uint128(i)),
+            "Shard XOR8 FN for key %d" % i,
+        )
+    h.close()
+
+    # 3. EphemeralTable with Bloom
+    eph_dir = os.path.join(base_dir, "filter_eph")
+    t_eph = EphemeralTable(eph_dir, "filter_test", schema)
+    row = values.make_payload_row(schema)
+    row.append_string("test_val")
+    b = batch.make_singleton_batch(schema, r_uint128(42), r_int64(1), row)
+    t_eph.ingest_batch(b)
+    b.free()
+
+    assert_true(t_eph.has_pk(r_uint128(42)), "EphemeralTable has_pk failed for 42")
+    assert_false(
+        t_eph.has_pk(r_uint128(9999)), "EphemeralTable has_pk FP for 9999"
+    )
+    t_eph.close()
+
+    os.write(1, "    [OK] Filter Integration passed.\n")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -797,6 +966,9 @@ def entry_point(argv):
         test_compaction(base_dir)
         test_ephemeral_and_persistent_tables(base_dir)
         test_u128_payloads(base_dir)
+        test_bloom_filter(base_dir)
+        test_xor8_filter(base_dir)
+        test_filter_integration(base_dir)
         os.write(1, "\nALL STORAGE TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

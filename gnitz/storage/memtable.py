@@ -8,6 +8,7 @@ from gnitz.core import errors
 from gnitz.core import comparator as core_comparator
 from gnitz.core.batch import ArenaZSetBatch, ColumnarBatchAccessor
 from gnitz.storage import writer_table
+from gnitz.storage.bloom import BloomFilter
 
 
 class MemTable(object):
@@ -25,6 +26,7 @@ class MemTable(object):
             initial_capacity = 16
         self.batch = ArenaZSetBatch(schema, initial_capacity=initial_capacity)
         self.max_bytes = arena_size
+        self.bloom = BloomFilter(initial_capacity)
 
     def upsert_batch(self, batch):
         self._check_capacity()
@@ -34,10 +36,12 @@ class MemTable(object):
             w = batch.get_weight(i)
             acc = batch.get_accessor(i)
             self.batch.append_from_accessor(pk, w, acc)
+            self.bloom.add(pk)
 
     def upsert_single(self, key, weight, accessor):
         self._check_capacity()
         self.batch.append_from_accessor(key, weight, accessor)
+        self.bloom.add(key)
 
     def _total_bytes(self):
         total = (
@@ -84,7 +88,7 @@ class MemTable(object):
         return total_w
 
     def may_contain_pk(self, key):
-        return True
+        return self.bloom.may_contain(key)
 
     def flush(self, filename, table_id=0):
         consolidated = self.batch.to_consolidated()
@@ -104,3 +108,4 @@ class MemTable(object):
 
     def free(self):
         self.batch.free()
+        self.bloom.free()

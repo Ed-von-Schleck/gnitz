@@ -32,6 +32,10 @@ class ShardHandle(object):
             filename, schema, validate_checksums=validate_checksums
         )
 
+        from gnitz.storage.xor8 import load_xor8
+
+        self.xor8_filter = load_xor8(filename + ".xor8")
+
         if self.view.count > 0:
             from gnitz.core import types
 
@@ -64,6 +68,8 @@ class ShardHandle(object):
 
     def close(self):
         self.view.close()
+        if self.xor8_filter is not None:
+            self.xor8_filter.free()
 
 
 class ShardIndex(object):
@@ -127,6 +133,9 @@ class ShardIndex(object):
         for i in range(num_h):
             h = self.handles[i]
             if h.get_min_key() <= key <= h.get_max_key():
+                if h.xor8_filter is not None:
+                    if not h.xor8_filter.may_contain(key):
+                        continue
                 row_idx = h.view.find_row_index(key)
                 if row_idx != -1:
                     results.append((h, row_idx))
