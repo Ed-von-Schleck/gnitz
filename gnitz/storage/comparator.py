@@ -24,6 +24,16 @@ class SoAAccessor(RowAccessor):
         self.view = view
         self.row_idx = row_idx
 
+    def is_null(self, col_idx):
+        schema = self.view.schema
+        if col_idx == schema.pk_index:
+            return False
+        if not schema.has_nullable:
+            return False
+        null_word = self.view.null_buf.read_u64(self.row_idx * 8)
+        payload_idx = col_idx if col_idx < schema.pk_index else col_idx - 1
+        return bool(r_uint64(null_word) & (r_uint64(1) << payload_idx))
+
     def _get_ptr(self, col_idx):
         return self.view.get_col_ptr(self.row_idx, col_idx)
 

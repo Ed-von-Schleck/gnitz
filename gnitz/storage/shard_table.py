@@ -28,6 +28,7 @@ class TableShardView(object):
         "size",
         "pk_buf",
         "w_buf",
+        "null_buf",
         "col_bufs",
         "blob_buf",
         "dir_off",
@@ -79,7 +80,7 @@ class TableShardView(object):
                 self.dir_off = d_off
 
                 num_cols = len(schema.columns)
-                num_regions = 2 + (num_cols - 1) + 1
+                num_regions = 2 + 1 + (num_cols - 1) + 1  # PK, Weight, Null, cols, blob
 
                 # Lists (AoS mapping / metadata)
                 dir_checksums = newlist_hint(num_regions)
@@ -97,13 +98,14 @@ class TableShardView(object):
                     col_to_reg_map.append(0)
                 self.col_to_reg_map = col_to_reg_map
 
-                # Eagerly initialize Region 0 (PK) and Region 1 (Weight)
+                # Eagerly initialize Region 0 (PK), Region 1 (Weight), Region 2 (Null)
                 self.pk_buf = self._init_region(0)
                 self.w_buf = self._init_region(1)
+                self.null_buf = self._init_region(2)
 
                 # Map column buffers to regions
                 col_bufs = newlist_hint(num_cols)
-                reg_idx = 2
+                reg_idx = 3
                 i = 0
                 while i < num_cols:
                     if i == schema.pk_index:

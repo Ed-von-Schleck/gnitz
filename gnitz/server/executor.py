@@ -7,10 +7,21 @@ from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
-from gnitz.vm import runtime
+from gnitz.core.batch import ZSetBatch
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import ingest_to_family
 from gnitz.dbsp import ops
+
+
+def _sort_pending(pending):
+    """Insertion sort by depth (index 0). RPython-safe."""
+    for i in range(1, len(pending)):
+        item = pending[i]
+        j = i - 1
+        while j >= 0 and pending[j][0] > item[0]:
+            pending[j + 1] = pending[j]
+            j -= 1
+        pending[j + 1] = item
 
 STATUS_OK = 0
 STATUS_ERROR = 1
@@ -125,92 +136,78 @@ class ServerExecutor(object):
 
     def _evaluate_dag(self, initial_source_id, initial_delta):
         """
-        Topological Evaluator. 
+        Topological Evaluator.
         Uses a depth-sorted approach to ensure each view evaluates exactly once
         per epoch, even in diamond dependency graphs.
         """
-        # pending_deltas: view_id -> ZSetBatch (Accumulated inputs for this epoch)
-        pending_deltas = {}
-        
-        # We start by finding views directly dependent on the base table
-        first_layer = self._get_dependent_views(initial_source_id)
-        for v_id in first_layer:
-            # We clone the delta because different views might have different 
-            # life-cycles for their input registers.
-            pending_deltas[v_id] = initial_delta.clone()
+        # Build dep_map once: source_id -> [view_id, ...]
+        dep_map = {}
+        if self.engine.registry.has_id(sys.DepTab.ID):
+            deps_family = self.engine.registry.get_by_id(sys.DepTab.ID)
+            cursor = deps_family.store.create_cursor()
+            try:
+                while cursor.is_valid():
+                    if cursor.weight() > r_int64(0):
+                        acc = cursor.get_accessor()
+                        v_id    = intmask(r_uint64(acc.get_int(sys.DepTab.COL_VIEW_ID)))
+                        dep_tid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)))
+                        dep_vid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)))
+                        if dep_tid > 0:
+                            if dep_tid not in dep_map:
+                                dep_map[dep_tid] = []
+                            if v_id not in dep_map[dep_tid]:
+                                dep_map[dep_tid].append(v_id)
+                        if dep_vid > 0:
+                            if dep_vid not in dep_map:
+                                dep_map[dep_vid] = []
+                            if v_id not in dep_map[dep_vid]:
+                                dep_map[dep_vid].append(v_id)
+                    cursor.advance()
+            finally:
+                cursor.close()
 
-        while len(pending_deltas) > 0:
-            # 1. Find the "shallowest" view (lowest topological depth).
-            target_view_id = -1
-            min_depth = 0x7FFFFFFF
-            
-            for v_id in pending_deltas:
-                # Depth is an attribute of TableFamily
-                depth = self.engine.registry.get_depth(v_id) 
-                if depth < min_depth:
-                    min_depth = depth
-                    target_view_id = v_id
-            
-            if target_view_id == -1:
-                break
-                
-            incoming_delta = pending_deltas.pop(target_view_id)
+        # pending: list of (depth, view_id, batch), sorted ascending by depth
+        first_layer = dep_map.get(initial_source_id, [])
+        pending = []
+        for v_id in first_layer:
+            d = self.engine.registry.get_depth(v_id)
+            pending.append((d, v_id, initial_delta.clone()))
+        _sort_pending(pending)
+
+        while len(pending) > 0:
+            depth, target_view_id, incoming_delta = pending[0]
+            del pending[0]
+
             plan = self.program_cache.get_program(target_view_id)
-            
             if plan is None:
                 incoming_delta.free()
                 continue
-            
-            # 2. Boundary: Execute the plan epoch.
-            out_delta = plan.execute_epoch(incoming_delta)
-            
-            # 3. Propagate Results
-            if out_delta is not None and out_delta.length() > 0:
-                self._broadcast_delta(target_view_id, out_delta)
-                
-                dependents = self._get_dependent_views(target_view_id)
-                for dep_id in dependents:
-                    if dep_id in pending_deltas:
-                        # Accumulate: Union the new delta with existing pending delta
-                        existing = pending_deltas[dep_id]
-                        new_acc = runtime.ZSetBatch(existing._schema)
-                        ops.op_union(existing, out_delta, new_acc)
-                        existing.free()
-                        pending_deltas[dep_id] = new_acc
-                    else:
-                        pending_deltas[dep_id] = out_delta.clone()
-                
-                out_delta.free()
 
+            out_delta = plan.execute_epoch(incoming_delta)
             incoming_delta.free()
 
-    def _get_dependent_views(self, source_id):
-        if not self.engine.registry.has_id(sys.DepTab.ID):
-            return []
+            if out_delta is not None and out_delta.length() > 0:
+                self._broadcast_delta(target_view_id, out_delta)
 
-        deps_table = self.engine.registry.get_by_id(sys.DepTab.ID)
-        cursor = deps_table.store.create_cursor()
-        res = []
+                dependents = dep_map.get(target_view_id, [])
+                for dep_id in dependents:
+                    found = -1
+                    for pi in range(len(pending)):
+                        if pending[pi][1] == dep_id:
+                            found = pi
+                            break
+                    if found >= 0:
+                        existing_d, existing_id, existing_batch = pending[found]
+                        merged = ZSetBatch(existing_batch._schema)
+                        ops.op_union(existing_batch, out_delta, merged)
+                        existing_batch.free()
+                        pending[found] = (existing_d, existing_id, merged)
+                    else:
+                        d = self.engine.registry.get_depth(dep_id)
+                        pending.append((d, dep_id, out_delta.clone()))
+                        _sort_pending(pending)
 
-        try:
-            while cursor.is_valid():
-                if cursor.weight() <= r_int64(0):
-                    cursor.advance()
-                    continue
-
-                acc = cursor.get_accessor()
-                # Dep columns: 0: view_id, 1: dep_table_id, 2: dep_view_id
-                v_id    = intmask(r_uint64(acc.get_int(sys.DepTab.COL_VIEW_ID)))
-                dep_tid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)))
-                dep_vid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)))
-
-                if dep_tid == source_id or dep_vid == source_id:
-                    if v_id not in res:
-                        res.append(v_id)
-                cursor.advance()
-        finally:
-            cursor.close()
-        return res
+                out_delta.free()
 
     def _broadcast_delta(self, view_id, out_delta):
         pass

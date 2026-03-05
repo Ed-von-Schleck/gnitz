@@ -73,6 +73,7 @@ class TableShardWriter(object):
                 self.col_bufs.append(None)
             i += 1
 
+        self.null_buf = buffer.Buffer(8 * 1024, growable=True)
         self.b_buf = buffer.Buffer(4096, growable=True)
         self.blob_cache = {}
         # scratch_val_buf is used for non-string fixed-width types (≤ 8 bytes)
@@ -192,14 +193,20 @@ class TableShardWriter(object):
             buf.put_i64(rffi.cast(rffi.LONGLONG, accessor.get_int(col_idx)))
 
     def _append_from_accessor(self, accessor):
+        null_word = r_uint64(0)
+        pk_index = self.schema.pk_index
         i = 0
         num_cols = len(self.schema.columns)
         while i < num_cols:
-            if i == self.schema.pk_index:
+            if i == pk_index:
                 i += 1
                 continue
+            if accessor.is_null(i):
+                payload_idx = i if i < pk_index else i - 1
+                null_word |= r_uint64(1) << payload_idx
             self._write_column(i, accessor)
             i += 1
+        self.null_buf.put_u64(null_word)
 
     def add_row_from_accessor(self, key, weight, accessor):
         """Direct accessor ingestion — no AoS intermediate required."""
@@ -216,6 +223,7 @@ class TableShardWriter(object):
     def close(self):
         self.pk_buf.free()
         self.w_buf.free()
+        self.null_buf.free()
         i = 0
         num_bufs = len(self.col_bufs)
         while i < num_bufs:
@@ -235,7 +243,7 @@ class TableShardWriter(object):
             dummy_region = (lltype.nullptr(rffi.CCHARP.TO), 0, 0)
 
             num_cols_with_pk_w = 2 + (len(self.col_bufs) - 1)
-            num_regions = num_cols_with_pk_w + 1
+            num_regions = num_cols_with_pk_w + 1 + 1  # +1 for null bitmap region
 
             # Use newlist_hint to avoid mr-poisoning
             region_list = newlist_hint(num_regions)
@@ -244,8 +252,9 @@ class TableShardWriter(object):
 
             region_list[0] = (self.pk_buf.ptr, 0, self.pk_buf.offset)
             region_list[1] = (self.w_buf.ptr, 0, self.w_buf.offset)
+            region_list[2] = (self.null_buf.ptr, 0, self.null_buf.offset)
 
-            reg_idx = 2
+            reg_idx = 3
             i = 0
             num_bufs = len(self.col_bufs)
             while i < num_bufs:
