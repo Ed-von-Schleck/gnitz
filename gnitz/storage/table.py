@@ -13,7 +13,6 @@ from gnitz.storage import (
     index,
     manifest,
     memtable,
-    comparator as storage_comparator,
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
 
@@ -128,9 +127,6 @@ class PersistentTable(EphemeralTable):
         boundary = self.current_lsn
         reader = wal.WALReader(wal_path, self.schema)
 
-        # Reuse a single accessor for the recovery loop
-        rec_acc = storage_comparator.RawWALAccessor(self.schema)
-
         try:
             while True:
                 block = reader.read_next_block()
@@ -138,15 +134,11 @@ class PersistentTable(EphemeralTable):
                     break
 
                 try:
-                    # Only replay batches that haven't been flushed to shards yet
                     if block.tid != self.table_id or block.lsn < boundary:
                         continue
 
-                    for rec in block.records:
-                        rec_acc.set_record(rec)
-                        self.memtable.upsert_single(rec.get_key(), rec.weight, rec_acc)
+                    self.memtable.upsert_batch(block.batch)
 
-                    # Ensure the current LSN is higher than any recovered LSN
                     if block.lsn >= self.current_lsn:
                         self.current_lsn = block.lsn + r_uint64(1)
                 finally:

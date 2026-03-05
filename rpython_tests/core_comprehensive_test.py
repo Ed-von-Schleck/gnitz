@@ -2,10 +2,8 @@
 import sys
 import os
 
-from rpython.rlib import rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
-from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core import types, values, serialize, strings, comparator, batch, xxh, errors
@@ -222,7 +220,7 @@ def test_strings_german_layout():
 
 
 def test_serialize_and_hash():
-    os.write(1, "[Core] Testing Raw C Serialization & Stable XXHash...\n")
+    os.write(1, "[Core] Testing Stable XXHash...\n")
 
     cols = newlist_hint(3)
     cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
@@ -245,11 +243,10 @@ def test_serialize_and_hash():
         h1, hash_buf, cap1 = serialize.compute_hash(schema, accessor, hash_buf, 0)
         # Call 2 (tests reuse of same buffer without dirty padding bytes)
         h2, hash_buf, cap2 = serialize.compute_hash(schema, accessor, hash_buf, cap1)
-        
+
         assert_equal_u64(h1, h2, "Serialization hash is unstable across sequential calls")
 
         # Prove alteration changes hash
-        # We must build a new PayloadRow because mutation of completed rows is forbidden.
         row_mut = values.make_payload_row(schema)
         row_mut.append_int(rffi.cast(rffi.LONGLONG, 12345))
         row_mut.append_string("Mutated_Now_Invalidated")
@@ -261,28 +258,7 @@ def test_serialize_and_hash():
         if hash_buf:
             lltype.free(hash_buf, flavor='raw')
 
-    # Re-establish stable row
-    row2 = values.make_payload_row(schema)
-    row2.append_int(rffi.cast(rffi.LONGLONG, 999))
-    row2.append_string("Roundtrip")
-    accessor.set_row(row2)
-
-    # 2. Test Binary Roundtrip (AoS)
-    dest_size = schema.memtable_stride
-    dest_ptr = lltype.malloc(rffi.CCHARP.TO, dest_size, flavor='raw')
-    allocator = DummyBlobAllocator(fixed_offset=0)
-    try:
-        serialize.serialize_row(schema, accessor, dest_ptr, allocator)
-        
-        # Deserialize from pointer
-        recovered_row = serialize.deserialize_row(schema, dest_ptr, lltype.nullptr(rffi.CCHARP.TO), r_uint64(0))
-        
-        assert_equal_i64(r_int64(999), recovered_row.get_int_signed(0), "Recovered int mismatch")
-        assert_equal_s("Roundtrip", recovered_row.get_str(1), "Recovered inline string mismatch")
-    finally:
-        lltype.free(dest_ptr, flavor='raw')
-
-    os.write(1, "    [OK] Serialization & Hash passed.\n")
+    os.write(1, "    [OK] Stable Hash passed.\n")
 
 
 def test_comparator():

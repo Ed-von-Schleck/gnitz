@@ -10,15 +10,12 @@ WAL_OFF_COUNT = 12
 WAL_OFF_SIZE = 16
 WAL_OFF_VERSION = 20
 WAL_OFF_CHECKSUM = 24
-WAL_BLOCK_HEADER_SIZE = 32
+WAL_OFF_NUM_REGIONS = 32
+WAL_OFF_RESERVED = 36
+WAL_OFF_BLOB_SIZE = 40
+WAL_BLOCK_HEADER_SIZE = 48
 
-_REC_PK_OFFSET = 0
-_REC_WEIGHT_OFFSET = 16
-_REC_NULL_OFFSET = 24
-_REC_PAYLOAD_BASE = 32
-
-WAL_FORMAT_VERSION_LEGACY = 0
-WAL_FORMAT_VERSION_CURRENT = 1
+WAL_FORMAT_VERSION_CURRENT = 2
 
 
 class WALBlockHeaderView(object):
@@ -71,8 +68,22 @@ class WALBlockHeaderView(object):
     def set_checksum(self, cs):
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, WAL_OFF_CHECKSUM))[0] = cs
 
+    def get_num_regions(self):
+        p = rffi.cast(rffi.UINTP, rffi.ptradd(self.ptr, WAL_OFF_NUM_REGIONS))
+        return intmask(p[0])
 
-# Utility raw writers used by wal_format
+    def set_num_regions(self, n):
+        p = rffi.cast(rffi.UINTP, rffi.ptradd(self.ptr, WAL_OFF_NUM_REGIONS))
+        p[0] = rffi.cast(rffi.UINT, n)
+
+    def get_blob_size(self):
+        return rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, WAL_OFF_BLOB_SIZE))[0]
+
+    def set_blob_size(self, sz):
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self.ptr, WAL_OFF_BLOB_SIZE))[0] = sz
+
+
+# Utility raw writers
 def write_u128(buf, offset, val):
     p = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, offset))
     p[0] = rffi.cast(rffi.ULONGLONG, r_uint64(val))

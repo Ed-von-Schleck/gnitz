@@ -16,7 +16,6 @@ from gnitz.core import (
     values as db_values,
     xxh as checksum,
 )
-from gnitz.storage import comparator as storage_comparator
 from gnitz.core import comparator as core_comparator
 
 NULL_CHARP = lltype.nullptr(rffi.CCHARP.TO)
@@ -81,9 +80,6 @@ class TableShardWriter(object):
         # scratch_val_buf is used for non-string fixed-width types (≤ 8 bytes)
         self.scratch_val_buf = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
         self.blob_allocator = ShardWriterBlobAllocator(self)
-
-        # Unified Accessors for reading input
-        self.raw_accessor = storage_comparator.RawWALAccessor(schema)
         self.val_accessor = core_comparator.PayloadRowAccessor(schema)
 
     def _get_or_append_blob(self, src_ptr, length):
@@ -207,22 +203,6 @@ class TableShardWriter(object):
                 continue
             self._write_column(i, accessor)
             i += 1
-
-    def add_row(self, key, weight, packed_row_ptr, source_heap_ptr):
-        """Optimized path for MemTable flush (raw pointers)."""
-        if weight == 0:
-            return
-        self.count += 1
-
-        if self.schema.get_pk_column().field_type.size == 16:
-            self.pk_buf.put_u128(key)
-        else:
-            self.pk_buf.put_u64(r_uint64(key))
-        self.w_buf.put_i64(weight)
-
-        # Zero-allocation wrap of raw pointers
-        self.raw_accessor.set_pointers(packed_row_ptr, source_heap_ptr)
-        self._append_from_accessor(self.raw_accessor)
 
     def add_row_from_accessor(self, key, weight, accessor):
         """Direct accessor ingestion — no AoS intermediate required."""

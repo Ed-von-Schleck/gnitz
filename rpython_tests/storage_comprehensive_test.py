@@ -14,7 +14,8 @@ from rpython.rlib.rarithmetic import (
 )
 from rpython.rlib.objectmodel import newlist_hint
 
-from gnitz.core import types, values, serialize, batch, xxh, errors
+from gnitz.core import types, values, batch, xxh, errors
+from gnitz.core import strings as string_logic
 from gnitz.storage import (
     buffer,
     memtable,
@@ -29,11 +30,11 @@ from gnitz.storage import (
     refcount,
     index,
     mmap_posix,
-    comparator,
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.storage.table import PersistentTable
 from gnitz.core import comparator as core_comparator
+from gnitz.core.batch import ColumnarBatchAccessor
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -187,11 +188,11 @@ def test_integrity_and_lowlevel(base_dir):
 
 
 def test_wal_storage(base_dir):
-    os.write(1, "[Storage] Testing Z-Set WAL...\n")
+    os.write(1, "[Storage] Testing Columnar Z-Set WAL...\n")
     schema = make_u64_str_schema()
     wal_path = os.path.join(base_dir, "test.wal")
 
-    # 1. WAL Binary Roundtrip
+    # 1. WAL Columnar Roundtrip
     writer = wal.WALWriter(wal_path, schema)
 
     b1 = batch.ZSetBatch(schema)
@@ -211,16 +212,17 @@ def test_wal_storage(base_dir):
     assert_equal_i(1, len(blocks), "WALReader didn't read exactly 1 block")
     assert_equal_u64(r_uint64(1), blocks[0].lsn, "WAL LSN mismatch")
 
-    rec = blocks[0].records[0]
-    assert_equal_u128(r_uint128(10), rec.get_key(), "WAL PK mismatch")
+    rb = blocks[0].batch
+    assert_equal_i(1, rb.length(), "WAL batch length mismatch")
+    assert_equal_u128(r_uint128(10), rb.get_pk(0), "WAL PK mismatch")
+    assert_equal_i64(r_int64(1), rb.get_weight(0), "WAL weight mismatch")
 
-    # Deserialize payload
-    payload_row = serialize.deserialize_row(
-        schema, rec.payload_ptr, rec.heap_ptr, rec.null_word
-    )
-    assert_equal_s(
-        "block1", payload_row.get_str(0), "WAL string deserialization mismatch"
-    )
+    # Read string value via ColumnarBatchAccessor
+    acc = ColumnarBatchAccessor(schema)
+    acc.bind(rb, 0)
+    length, prefix, struct_ptr, heap_ptr, py_str = acc.get_str_struct(1)
+    recovered_str = string_logic.unpack_string(struct_ptr, heap_ptr)
+    assert_equal_s("block1", recovered_str, "WAL string deserialization mismatch")
 
     blocks[0].free()
     reader.close()
@@ -265,25 +267,25 @@ def test_wal_storage(base_dir):
     r_blob = wal.WALReader(wal_blob_path, schema)
     block_b = r_blob.read_next_block()
     assert_true(block_b is not None, "Failed to read blob WAL block")
-    assert_equal_i(2, len(block_b.records), "Multi-record WAL decode failed")
 
-    rec1 = block_b.records[0]
-    rec2 = block_b.records[1]
+    rb_blob = block_b.batch
+    assert_equal_i(2, rb_blob.length(), "Multi-record WAL decode failed")
 
-    p1 = serialize.deserialize_row(
-        schema, rec1.payload_ptr, rec1.heap_ptr, rec1.null_word
-    )
-    assert_equal_s(long_str, p1.get_str(0), "WAL long string alignment mismatch")
+    acc_b = ColumnarBatchAccessor(schema)
+    acc_b.bind(rb_blob, 0)
+    _, _, sp1, hp1, _ = acc_b.get_str_struct(1)
+    s1 = string_logic.unpack_string(sp1, hp1)
+    assert_equal_s(long_str, s1, "WAL long string alignment mismatch")
 
-    p2 = serialize.deserialize_row(
-        schema, rec2.payload_ptr, rec2.heap_ptr, rec2.null_word
-    )
-    assert_equal_s("short", p2.get_str(0), "WAL short string alignment mismatch")
+    acc_b.bind(rb_blob, 1)
+    _, _, sp2, hp2, _ = acc_b.get_str_struct(1)
+    s2 = string_logic.unpack_string(sp2, hp2)
+    assert_equal_s("short", s2, "WAL short string alignment mismatch")
 
     block_b.free()
     r_blob.close()
 
-    os.write(1, "    [OK] Z-Set WAL passed.\n")
+    os.write(1, "    [OK] Columnar Z-Set WAL passed.\n")
 
 
 def test_memtable(base_dir):
