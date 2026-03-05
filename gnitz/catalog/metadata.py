@@ -26,7 +26,7 @@ class SystemTables(object):
 
     _immutable_fields_ = [
         "schemas", "tables", "views", "columns", "indices",
-        "view_deps", "sequences", "functions", "subscriptions",
+        "view_deps", "sequences",
         "circuit_nodes", "circuit_edges", "circuit_sources",
         "circuit_params", "circuit_group_cols",
     ]
@@ -40,8 +40,6 @@ class SystemTables(object):
         indices,
         view_deps,
         sequences,
-        functions,
-        subscriptions,
         circuit_nodes,
         circuit_edges,
         circuit_sources,
@@ -55,8 +53,6 @@ class SystemTables(object):
         self.indices = indices
         self.view_deps = view_deps
         self.sequences = sequences
-        self.functions = functions
-        self.subscriptions = subscriptions
         self.circuit_nodes = circuit_nodes
         self.circuit_edges = circuit_edges
         self.circuit_sources = circuit_sources
@@ -71,8 +67,6 @@ class SystemTables(object):
         self.indices.close()
         self.view_deps.close()
         self.sequences.close()
-        self.functions.close()
-        self.subscriptions.close()
         self.circuit_nodes.close()
         self.circuit_edges.close()
         self.circuit_sources.close()
@@ -152,8 +146,6 @@ SYSTEM_TAB_LIST = unrolling_iterable(
         sys.IdxTab,
         sys.DepTab,
         sys.SeqTab,
-        sys.FuncTab,
-        sys.SubTab,
         sys.CircuitNodesTab,
         sys.CircuitEdgesTab,
         sys.CircuitSourcesTab,
@@ -184,8 +176,6 @@ def make_system_tables(base_dir):
         indices=_create_sys_table(sys_dir, sys.IdxTab),
         view_deps=_create_sys_table(sys_dir, sys.DepTab),
         sequences=_create_sys_table(sys_dir, sys.SeqTab),
-        functions=_create_sys_table(sys_dir, sys.FuncTab),
-        subscriptions=_create_sys_table(sys_dir, sys.SubTab),
         circuit_nodes=_create_sys_table(sys_dir, sys.CircuitNodesTab),
         circuit_edges=_create_sys_table(sys_dir, sys.CircuitEdgesTab),
         circuit_sources=_create_sys_table(sys_dir, sys.CircuitSourcesTab),

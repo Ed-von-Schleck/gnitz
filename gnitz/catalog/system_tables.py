@@ -310,30 +310,6 @@ class SeqTab(BaseTab):
         SeqTab._emit(batch, schema, r_int64(-1), seq_id, val)
 
 
-class FuncTab(BaseTab):
-    ID, SUBDIR, NAME = 9, "_functions", "_functions"
-
-    @staticmethod
-    def schema():
-        cols = newlist_hint(3)
-        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="func_id"))
-        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
-        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="func_type"))
-        return TableSchema(cols, pk_index=0)
-
-
-class SubTab(BaseTab):
-    ID, SUBDIR, NAME = 10, "_subscriptions", "_subscriptions"
-
-    @staticmethod
-    def schema():
-        cols = newlist_hint(3)
-        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="sub_id"))
-        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
-        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="client_id"))
-        return TableSchema(cols, pk_index=0)
-
-
 class CircuitNodesTab(BaseTab):
     """
     One row per operator node in a compiled view circuit.

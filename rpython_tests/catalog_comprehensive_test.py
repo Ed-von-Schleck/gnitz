@@ -130,10 +130,10 @@ def test_bootstrap(base_dir):
         if not engine.registry.has_schema("public"):
             raise Exception("Missing public schema")
 
-        # 2. Check Tables (14 system tables expected)
+        # 2. Check Tables (12 system tables expected)
         c = count_records(engine.sys.tables)
-        if c != 14:
-            raise Exception("Expected 14 system tables, got %d" % c)
+        if c != 12:
+            raise Exception("Expected 12 system tables, got %d" % c)
 
         # 3. Check Columns (44 bootstrap columns expected)
         c = count_records(engine.sys.columns)

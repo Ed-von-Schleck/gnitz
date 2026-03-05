@@ -105,10 +105,10 @@ def test_filter_map_negate():
     )
 
     program = [
-        instructions.FilterOp(reg_file.registers[0], reg_file.registers[1], filter_func),
-        instructions.MapOp(reg_file.registers[1], reg_file.registers[2], map_func),
-        instructions.NegateOp(reg_file.registers[2], reg_file.registers[3]),
-        instructions.HaltOp(),
+        instructions.filter_op(reg_file.registers[0], reg_file.registers[1], filter_func),
+        instructions.map_op(reg_file.registers[1], reg_file.registers[2], map_func),
+        instructions.negate_op(reg_file.registers[2], reg_file.registers[3]),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, out_map_schema, in_reg=0, out_reg=3)
@@ -172,8 +172,8 @@ def test_union():
     reg_file.registers[2] = runtime.DeltaRegister(2, vm_schema)
 
     program = [
-        instructions.UnionOp(reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]),
-        instructions.HaltOp(),
+        instructions.union_op(reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=2)
@@ -272,10 +272,10 @@ def test_join_delta_trace(base_dir):
     reg_file.registers[2] = runtime.DeltaRegister(2, out_vm)
 
     program = [
-        instructions.JoinDeltaTraceOp(
+        instructions.join_delta_trace_op(
             reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]
         ),
-        instructions.HaltOp(),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=2)
@@ -341,10 +341,10 @@ def test_distinct_multi_tick(base_dir):
     # DistinctOp(reg_in=R0, reg_history=R1, reg_out=R2) uses history_table from R1
     # Then IntegrateOp merges the delta into history (already done inside op_distinct)
     program = [
-        instructions.DistinctOp(
+        instructions.distinct_op(
             reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]
         ),
-        instructions.HaltOp(),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=2)
@@ -422,7 +422,7 @@ def test_reduce_sum(base_dir):
     reg_file.registers[3] = runtime.DeltaRegister(3, out_vm)
 
     program = [
-        instructions.ReduceOp(
+        instructions.reduce_op(
             reg_file.registers[0],       # reg_in
             reg_file.registers[1],       # reg_trace_in
             reg_file.registers[2],       # reg_trace_out
@@ -432,9 +432,9 @@ def test_reduce_sum(base_dir):
             out_schema,
         ),
         # Integrate delta into trace_in (for history) and trace_out (for agg state)
-        instructions.IntegrateOp(reg_file.registers[0], trace_in_table),
-        instructions.IntegrateOp(reg_file.registers[3], trace_out_table),
-        instructions.HaltOp(),
+        instructions.integrate_op(reg_file.registers[0], trace_in_table),
+        instructions.integrate_op(reg_file.registers[3], trace_out_table),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=3)
@@ -543,8 +543,8 @@ def test_ghost_property():
     reg_file.registers[1] = runtime.DeltaRegister(1, vm_schema)
 
     program = [
-        instructions.FilterOp(reg_file.registers[0], reg_file.registers[1], pass_func),
-        instructions.HaltOp(),
+        instructions.filter_op(reg_file.registers[0], reg_file.registers[1], pass_func),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=1)
@@ -593,11 +593,11 @@ def test_empty_input():
     reg_file.registers[1] = runtime.DeltaRegister(1, vm_schema)
 
     program = [
-        instructions.FilterOp(
+        instructions.filter_op(
             reg_file.registers[0], reg_file.registers[1],
             functions.NullPredicate(),
         ),
-        instructions.HaltOp(),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=1)
@@ -645,10 +645,10 @@ def test_chunked_scan_resume(base_dir):
 
     # Program: ScanTrace(R0, R1, chunk=10) -> Yield(ROW_LIMIT) -> ClearDeltas -> Jump(0)
     program = [
-        instructions.ScanTraceOp(reg_file.registers[0], reg_file.registers[1], 10),
-        instructions.YieldOp(2),
-        instructions.ClearDeltasOp(),
-        instructions.JumpOp(0),
+        instructions.scan_trace_op(reg_file.registers[0], reg_file.registers[1], 10),
+        instructions.yield_op(2),
+        instructions.clear_deltas_op(),
+        instructions.jump_op(0),
     ]
 
     context = runtime.ExecutionContext()
@@ -710,9 +710,9 @@ def test_seek_trace_point_lookup(base_dir):
 
     # Program: SeekTrace(R0, R1) -> ScanTrace(R0, R2, chunk=1) -> Halt
     program = [
-        instructions.SeekTraceOp(reg_file.registers[0], reg_file.registers[1]),
-        instructions.ScanTraceOp(reg_file.registers[0], reg_file.registers[2], 1),
-        instructions.HaltOp(),
+        instructions.seek_trace_op(reg_file.registers[0], reg_file.registers[1]),
+        instructions.scan_trace_op(reg_file.registers[0], reg_file.registers[2], 1),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, schema, in_reg=1, out_reg=2)
@@ -764,8 +764,8 @@ def test_empty_table_scan(base_dir):
 
     # Program: ScanTrace(R0, R1, chunk=10) -> Halt
     program = [
-        instructions.ScanTraceOp(reg_file.registers[0], reg_file.registers[1], 10),
-        instructions.HaltOp(),
+        instructions.scan_trace_op(reg_file.registers[0], reg_file.registers[1], 10),
+        instructions.halt_op(),
     ]
 
     context = runtime.ExecutionContext()
@@ -811,10 +811,10 @@ def test_join_delta_delta():
     reg_file.registers[2] = runtime.DeltaRegister(2, out_vm)
 
     program = [
-        instructions.JoinDeltaDeltaOp(
+        instructions.join_delta_delta_op(
             reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]
         ),
-        instructions.HaltOp(),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=2)
@@ -881,8 +881,8 @@ def test_delay_op():
     reg_file.registers[1] = runtime.DeltaRegister(1, vm_schema)
 
     program = [
-        instructions.DelayOp(reg_file.registers[0], reg_file.registers[1]),
-        instructions.HaltOp(),
+        instructions.delay_op(reg_file.registers[0], reg_file.registers[1]),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=1)
@@ -965,7 +965,7 @@ def test_reduce_min_nonlinear(base_dir):
     reg_file.registers[3] = runtime.DeltaRegister(3, out_vm)
 
     program = [
-        instructions.ReduceOp(
+        instructions.reduce_op(
             reg_file.registers[0],
             reg_file.registers[1],
             reg_file.registers[2],
@@ -974,9 +974,9 @@ def test_reduce_min_nonlinear(base_dir):
             agg_func,
             out_schema,
         ),
-        instructions.IntegrateOp(reg_file.registers[0], trace_in_table),
-        instructions.IntegrateOp(reg_file.registers[3], trace_out_table),
-        instructions.HaltOp(),
+        instructions.integrate_op(reg_file.registers[0], trace_in_table),
+        instructions.integrate_op(reg_file.registers[3], trace_out_table),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=3)
@@ -1085,10 +1085,10 @@ def test_join_delta_trace_multi_match(base_dir):
     reg_file.registers[2] = runtime.DeltaRegister(2, out_vm)
 
     program = [
-        instructions.JoinDeltaTraceOp(
+        instructions.join_delta_trace_op(
             reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]
         ),
-        instructions.HaltOp(),
+        instructions.halt_op(),
     ]
 
     plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=2)

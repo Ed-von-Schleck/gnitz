@@ -25,11 +25,42 @@ def _open_system_scan(registry, table_id, view_id):
     cursor.seek(start_key)
     return cursor, end_key
 
-def _get_scalar_func(func_id):
-    return NULL_PREDICATE
+def _topo_sort(nodes, edges):
+    """Kahn's algorithm. Returns (ordered, outgoing, incoming) or raises LayoutError on cycle."""
+    node_ids = newlist_hint(len(nodes))
+    outgoing = {}
+    incoming = {}
+    in_degree = {}
+    for nid, _ in nodes:
+        node_ids.append(nid)
+        outgoing[nid] = []
+        incoming[nid] = []
+        in_degree[nid] = 0
 
-def _get_agg_func(agg_func_id):
-    return NULL_AGGREGATE
+    for _, src, dst, port in edges:
+        outgoing[src].append((dst, port))
+        incoming[dst].append(src)
+        in_degree[dst] += 1
+
+    queue = []
+    for nid in node_ids:
+        if in_degree[nid] == 0:
+            queue.append(nid)
+
+    ordered = newlist_hint(len(node_ids))
+    while queue:
+        nid = queue.pop(0)
+        ordered.append(nid)
+        for dst, _ in outgoing[nid]:
+            in_degree[dst] -= 1
+            if in_degree[dst] == 0:
+                queue.append(dst)
+
+    if len(ordered) != len(node_ids):
+        raise LayoutError("View graph contains cycles (not a DAG)")
+
+    return ordered, outgoing, incoming
+
 
 class ProgramCache(object):
     """
@@ -85,34 +116,7 @@ class ProgramCache(object):
             raise LayoutError("View graph missing sink (INTEGRATE node)")
 
         # 3. Cycle Detection (Topological Sort)
-        node_ids = newlist_hint(len(graph.nodes))
-        outgoing = {}
-        in_degree = {}
-        for nid, _ in graph.nodes:
-            node_ids.append(nid)
-            outgoing[nid] = []
-            in_degree[nid] = 0
-
-        for _, src, dst, _ in graph.edges:
-            outgoing[src].append(dst)
-            in_degree[dst] += 1
-
-        queue = []
-        for nid in node_ids:
-            if in_degree[nid] == 0:
-                queue.append(nid)
-
-        count = 0
-        while queue:
-            nid = queue.pop(0)
-            count += 1
-            for dst in outgoing[nid]:
-                in_degree[dst] -= 1
-                if in_degree[dst] == 0:
-                    queue.append(dst)
-
-        if count != len(node_ids):
-            raise LayoutError("View graph contains cycles (not a DAG)")
+        _topo_sort(graph.nodes, graph.edges)
 
     def _load_nodes(self, view_id):
         cursor, end_key = _open_system_scan(self.registry, sys.CircuitNodesTab.ID, view_id)
@@ -250,38 +254,14 @@ class ProgramCache(object):
         in_schema = self._resolve_primary_input_schema(view_id, out_schema)
 
         # 1. Topological sort
-        node_ids = newlist_hint(len(nodes))
         opcode_of = {}
         for nid, op in nodes:
-            node_ids.append(nid)
             opcode_of[nid] = op
 
-        outgoing = {}
-        incoming = {}
-        for nid in node_ids:
-            outgoing[nid] = []
-            incoming[nid] = []
-        for _, src, dst, port in edges:
-            outgoing[src].append((dst, port))
-            incoming[dst].append(src)
-
-        in_degree = {}
-        for nid in node_ids:
-            in_degree[nid] = len(incoming[nid])
-
-        queue = []
-        for nid in node_ids:
-            if in_degree[nid] == 0: queue.append(nid)
-
-        ordered = newlist_hint(len(node_ids))
-        while queue:
-            nid = queue.pop(0)
-            ordered.append(nid)
-            for dst, _ in outgoing[nid]:
-                in_degree[dst] -= 1
-                if in_degree[dst] == 0: queue.append(dst)
-
-        if len(ordered) != len(node_ids): return None
+        try:
+            ordered, outgoing, incoming = _topo_sort(nodes, edges)
+        except LayoutError:
+            return None
 
         # 2. Register assignment
         out_reg_of = {}
@@ -346,34 +326,34 @@ class ProgramCache(object):
                     out_delta_reg = runtime.DeltaRegister(out_delta_id, runtime.VMSchema(family.schema))
                     reg_file.registers[out_delta_id] = out_delta_reg
                     out_reg_of[nid] = out_delta_id
-                    instr = instructions.ScanTraceOp(trace_reg, out_delta_reg, chunk_limit)
+                    instr = instructions.scan_trace_op(trace_reg, out_delta_reg, chunk_limit)
 
             elif op == opcodes.OPCODE_FILTER:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
                 out_reg = runtime.DeltaRegister(reg_id, in_reg.vm_schema)
                 reg_file.registers[reg_id] = out_reg
                 func_id = node_params.get(opcodes.PARAM_FUNC_ID, 0)
-                instr = instructions.FilterOp(in_reg, out_reg, _get_scalar_func(func_id))
+                instr = instructions.filter_op(in_reg, out_reg, NULL_PREDICATE)
 
             elif op == opcodes.OPCODE_MAP:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
                 out_reg = runtime.DeltaRegister(reg_id, runtime.VMSchema(out_schema))
                 reg_file.registers[reg_id] = out_reg
                 func_id = node_params.get(opcodes.PARAM_FUNC_ID, 0)
-                instr = instructions.MapOp(in_reg, out_reg, _get_scalar_func(func_id))
+                instr = instructions.map_op(in_reg, out_reg, NULL_PREDICATE)
 
             elif op == opcodes.OPCODE_NEGATE:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
                 out_reg = runtime.DeltaRegister(reg_id, in_reg.vm_schema)
                 reg_file.registers[reg_id] = out_reg
-                instr = instructions.NegateOp(in_reg, out_reg)
+                instr = instructions.negate_op(in_reg, out_reg)
 
             elif op == opcodes.OPCODE_UNION:
                 in_a = reg_file.registers[in_regs[opcodes.PORT_IN_A]]
                 in_b = reg_file.registers[in_regs[opcodes.PORT_IN_B]]
                 out_reg = runtime.DeltaRegister(reg_id, in_a.vm_schema)
                 reg_file.registers[reg_id] = out_reg
-                instr = instructions.UnionOp(in_a, in_b, out_reg)
+                instr = instructions.union_op(in_a, in_b, out_reg)
 
             elif op == opcodes.OPCODE_JOIN_DELTA_TRACE:
                 delta_reg = reg_file.registers[in_regs[opcodes.PORT_DELTA]]
@@ -381,7 +361,7 @@ class ProgramCache(object):
                 join_schema = merge_schemas_for_join(delta_reg.vm_schema.table_schema, trace_reg.vm_schema.table_schema)
                 out_reg = runtime.DeltaRegister(reg_id, runtime.VMSchema(join_schema))
                 reg_file.registers[reg_id] = out_reg
-                instr = instructions.JoinDeltaTraceOp(delta_reg, trace_reg, out_reg)
+                instr = instructions.join_delta_trace_op(delta_reg, trace_reg, out_reg)
 
             elif op == opcodes.OPCODE_JOIN_DELTA_DELTA:
                 reg_a = reg_file.registers[in_regs[opcodes.PORT_IN_A]]
@@ -389,7 +369,7 @@ class ProgramCache(object):
                 join_schema = merge_schemas_for_join(reg_a.vm_schema.table_schema, reg_b.vm_schema.table_schema)
                 out_reg = runtime.DeltaRegister(reg_id, runtime.VMSchema(join_schema))
                 reg_file.registers[reg_id] = out_reg
-                instr = instructions.JoinDeltaDeltaOp(reg_a, reg_b, out_reg)
+                instr = instructions.join_delta_delta_op(reg_a, reg_b, out_reg)
 
             elif op == opcodes.OPCODE_DISTINCT:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN_DISTINCT]]
@@ -402,12 +382,12 @@ class ProgramCache(object):
                 out_delta_reg = runtime.DeltaRegister(out_delta_id, in_reg.vm_schema)
                 reg_file.registers[out_delta_id] = out_delta_reg
                 out_reg_of[nid] = out_delta_id
-                instr = instructions.DistinctOp(in_reg, hist_reg, out_delta_reg)
+                instr = instructions.distinct_op(in_reg, hist_reg, out_delta_reg)
 
             elif op == opcodes.OPCODE_REDUCE:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN_REDUCE]]
                 agg_func_id = node_params.get(opcodes.PARAM_AGG_FUNC_ID, 0)
-                agg_func = _get_agg_func(agg_func_id)
+                agg_func = NULL_AGGREGATE
                 gcols = group_cols.get(nid, [])
                 reduce_out_schema = _build_reduce_output_schema(in_reg.vm_schema.table_schema, gcols, agg_func)
                 trace_table = view_family.store.create_child("_reduce_%d_%d" % (view_id, nid), reduce_out_schema)
@@ -420,9 +400,9 @@ class ProgramCache(object):
                 out_reg_of[nid] = out_delta_id
                 tr_in_reg = None
                 if opcodes.PORT_TRACE_IN in in_regs: tr_in_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE_IN]]
-                reduce_instr = instructions.ReduceOp(in_reg, tr_in_reg, tr_out_reg, out_delta_reg, gcols, agg_func, reduce_out_schema)
+                reduce_instr = instructions.reduce_op(in_reg, tr_in_reg, tr_out_reg, out_delta_reg, gcols, agg_func, reduce_out_schema)
                 program.append(reduce_instr)
-                instr = instructions.IntegrateOp(out_delta_reg, trace_table)
+                instr = instructions.integrate_op(out_delta_reg, trace_table)
 
             elif op == opcodes.OPCODE_INTEGRATE:
                 in_reg_id = in_regs[opcodes.PORT_IN]
@@ -433,22 +413,22 @@ class ProgramCache(object):
                     target = self.registry.get_by_id(target_table_id)
                 sink_reg_id = in_reg_id
                 # Final views integrate into target.store
-                instr = instructions.IntegrateOp(in_reg, target.store if target else None)
+                instr = instructions.integrate_op(in_reg, target.store if target else None)
 
             elif op == opcodes.OPCODE_DELAY:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
                 out_reg = runtime.DeltaRegister(reg_id, in_reg.vm_schema)
                 reg_file.registers[reg_id] = out_reg
-                instr = instructions.DelayOp(in_reg, out_reg)
+                instr = instructions.delay_op(in_reg, out_reg)
 
             elif op == opcodes.OPCODE_SEEK_TRACE:
                 trace_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE]]
                 key_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
-                instr = instructions.SeekTraceOp(trace_reg, key_reg)
+                instr = instructions.seek_trace_op(trace_reg, key_reg)
 
             if instr is not None: program.append(instr)
 
-        program.append(instructions.HaltOp())
+        program.append(instructions.halt_op())
         if input_delta_reg_id == -1 or sink_reg_id == -1: return None
 
         return runtime.ExecutablePlan(program, reg_file, out_schema, in_reg_idx=input_delta_reg_id, out_reg_idx=sink_reg_id)

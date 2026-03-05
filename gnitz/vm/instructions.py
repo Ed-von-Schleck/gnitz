@@ -9,7 +9,7 @@ class Instruction(object):
 
     Standardized layout ensures the RPython annotator can resolve attributes
     during dispatch loops without type unions or attribute errors.
-    Every field used by any subclass is defined here.
+    Every field used by any instruction is defined here.
     """
 
     _immutable_fields_ = [
@@ -63,125 +63,123 @@ class Instruction(object):
 # ── DBSP Algebraic Instructions ───────────────────────────────────────────
 
 
-class FilterOp(Instruction):
-    def __init__(self, reg_in, reg_out, func):
-        Instruction.__init__(self, op.OPCODE_FILTER)
-        self.reg_in = reg_in
-        self.reg_out = reg_out
-        self.func = func
+def filter_op(reg_in, reg_out, func):
+    i = Instruction(op.OPCODE_FILTER)
+    i.reg_in = reg_in
+    i.reg_out = reg_out
+    i.func = func
+    return i
 
 
-class MapOp(Instruction):
-    def __init__(self, reg_in, reg_out, func):
-        Instruction.__init__(self, op.OPCODE_MAP)
-        self.reg_in = reg_in
-        self.reg_out = reg_out
-        self.func = func
+def map_op(reg_in, reg_out, func):
+    i = Instruction(op.OPCODE_MAP)
+    i.reg_in = reg_in
+    i.reg_out = reg_out
+    i.func = func
+    return i
 
 
-class NegateOp(Instruction):
-    def __init__(self, reg_in, reg_out):
-        Instruction.__init__(self, op.OPCODE_NEGATE)
-        self.reg_in = reg_in
-        self.reg_out = reg_out
+def negate_op(reg_in, reg_out):
+    i = Instruction(op.OPCODE_NEGATE)
+    i.reg_in = reg_in
+    i.reg_out = reg_out
+    return i
 
 
-class UnionOp(Instruction):
-    def __init__(self, reg_in_a, reg_in_b, reg_out):
-        Instruction.__init__(self, op.OPCODE_UNION)
-        self.reg_in_a = reg_in_a
-        self.reg_in_b = reg_in_b
-        self.reg_out = reg_out
+def union_op(reg_in_a, reg_in_b, reg_out):
+    i = Instruction(op.OPCODE_UNION)
+    i.reg_in_a = reg_in_a
+    i.reg_in_b = reg_in_b
+    i.reg_out = reg_out
+    return i
 
 
-class DistinctOp(Instruction):
-    def __init__(self, reg_in, reg_history, reg_out):
-        Instruction.__init__(self, op.OPCODE_DISTINCT)
-        self.reg_in = reg_in
-        self.reg_history = reg_history
-        self.reg_out = reg_out
+def distinct_op(reg_in, reg_history, reg_out):
+    i = Instruction(op.OPCODE_DISTINCT)
+    i.reg_in = reg_in
+    i.reg_history = reg_history
+    i.reg_out = reg_out
+    return i
 
 
-class JoinDeltaTraceOp(Instruction):
-    def __init__(self, reg_delta, reg_trace, reg_out):
-        Instruction.__init__(self, op.OPCODE_JOIN_DELTA_TRACE)
-        self.reg_delta = reg_delta
-        self.reg_trace = reg_trace
-        self.reg_out = reg_out
+def join_delta_trace_op(reg_delta, reg_trace, reg_out):
+    i = Instruction(op.OPCODE_JOIN_DELTA_TRACE)
+    i.reg_delta = reg_delta
+    i.reg_trace = reg_trace
+    i.reg_out = reg_out
+    return i
 
 
-class IntegrateOp(Instruction):
-    def __init__(self, reg_in, target_table):
-        Instruction.__init__(self, op.OPCODE_INTEGRATE)
-        self.reg_in = reg_in
-        self.target_table = target_table
+def integrate_op(reg_in, target_table):
+    i = Instruction(op.OPCODE_INTEGRATE)
+    i.reg_in = reg_in
+    i.target_table = target_table
+    return i
 
 
-class DelayOp(Instruction):
-    def __init__(self, reg_in, reg_out):
-        Instruction.__init__(self, op.OPCODE_DELAY)
-        self.reg_in = reg_in
-        self.reg_out = reg_out
+def delay_op(reg_in, reg_out):
+    i = Instruction(op.OPCODE_DELAY)
+    i.reg_in = reg_in
+    i.reg_out = reg_out
+    return i
 
 
-class JoinDeltaDeltaOp(Instruction):
-    def __init__(self, reg_a, reg_b, reg_out):
-        Instruction.__init__(self, op.OPCODE_JOIN_DELTA_DELTA)
-        self.reg_a = reg_a
-        self.reg_b = reg_b
-        self.reg_out = reg_out
+def join_delta_delta_op(reg_a, reg_b, reg_out):
+    i = Instruction(op.OPCODE_JOIN_DELTA_DELTA)
+    i.reg_a = reg_a
+    i.reg_b = reg_b
+    i.reg_out = reg_out
+    return i
 
 
-class ReduceOp(Instruction):
-    def __init__(
-        self, reg_in, reg_trace_in, reg_trace_out, reg_out,
-        group_by_cols, agg_func, output_schema,
-    ):
-        Instruction.__init__(self, op.OPCODE_REDUCE)
-        self.reg_in = reg_in
-        self.reg_trace_in = reg_trace_in
-        self.reg_trace_out = reg_trace_out
-        self.reg_out = reg_out
-        self.group_by_cols = group_by_cols
-        self.agg_func = agg_func
-        self.output_schema = output_schema
+def reduce_op(
+    reg_in, reg_trace_in, reg_trace_out, reg_out,
+    group_by_cols, agg_func, output_schema,
+):
+    i = Instruction(op.OPCODE_REDUCE)
+    i.reg_in = reg_in
+    i.reg_trace_in = reg_trace_in
+    i.reg_trace_out = reg_trace_out
+    i.reg_out = reg_out
+    i.group_by_cols = group_by_cols
+    i.agg_func = agg_func
+    i.output_schema = output_schema
+    return i
 
 
 # ── Control Flow & Cursor Management ──────────────────────────────────────
 
 
-class HaltOp(Instruction):
-    def __init__(self):
-        Instruction.__init__(self, op.OPCODE_HALT)
+def halt_op():
+    return Instruction(op.OPCODE_HALT)
 
 
-class ScanTraceOp(Instruction):
-    def __init__(self, reg_trace, reg_out, chunk_limit):
-        Instruction.__init__(self, op.OPCODE_SCAN_TRACE)
-        self.reg_trace = reg_trace
-        self.reg_out = reg_out
-        self.chunk_limit = chunk_limit
+def scan_trace_op(reg_trace, reg_out, chunk_limit):
+    i = Instruction(op.OPCODE_SCAN_TRACE)
+    i.reg_trace = reg_trace
+    i.reg_out = reg_out
+    i.chunk_limit = chunk_limit
+    return i
 
 
-class SeekTraceOp(Instruction):
-    def __init__(self, reg_trace, reg_key):
-        Instruction.__init__(self, op.OPCODE_SEEK_TRACE)
-        self.reg_trace = reg_trace
-        self.reg_key = reg_key
+def seek_trace_op(reg_trace, reg_key):
+    i = Instruction(op.OPCODE_SEEK_TRACE)
+    i.reg_trace = reg_trace
+    i.reg_key = reg_key
+    return i
 
 
-class YieldOp(Instruction):
-    def __init__(self, reason):
-        Instruction.__init__(self, op.OPCODE_YIELD)
-        self.yield_reason = reason
+def yield_op(reason):
+    i = Instruction(op.OPCODE_YIELD)
+    i.yield_reason = reason
+    return i
 
 
-class JumpOp(Instruction):
-    def __init__(self, target_idx):
-        Instruction.__init__(self, op.OPCODE_JUMP)
-        self.jump_target = target_idx
+def jump_op(target_idx):
+    i = Instruction(op.OPCODE_JUMP)
+    i.jump_target = target_idx
+    return i
 
 
-class ClearDeltasOp(Instruction):
-    def __init__(self):
-        Instruction.__init__(self, op.OPCODE_CLEAR_DELTAS)
+def clear_deltas_op():
+    return Instruction(op.OPCODE_CLEAR_DELTAS)

@@ -102,16 +102,6 @@ class CatalogBootstrapper(object):
             self.sys_tables.sequences,
         ))
         self.registry.register(TableFamily(
-            "_system", sys.FuncTab.NAME, sys.FuncTab.ID,
-            sys.SYSTEM_SCHEMA_ID, sys_dir + "/" + sys.FuncTab.SUBDIR, 0,
-            self.sys_tables.functions,
-        ))
-        self.registry.register(TableFamily(
-            "_system", sys.SubTab.NAME, sys.SubTab.ID,
-            sys.SYSTEM_SCHEMA_ID, sys_dir + "/" + sys.SubTab.SUBDIR, 0,
-            self.sys_tables.subscriptions,
-        ))
-        self.registry.register(TableFamily(
             "_system", sys.CircuitNodesTab.NAME, sys.CircuitNodesTab.ID,
             sys.SYSTEM_SCHEMA_ID, sys_dir + "/" + sys.CircuitNodesTab.SUBDIR, 0,
             self.sys_tables.circuit_nodes,

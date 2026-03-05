@@ -2,7 +2,7 @@
 
 import os
 from rpython.rlib import rsocket, jit
-from rpython.rlib.rarithmetic import r_int64, intmask
+from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.server import ipc, ipc_ffi
@@ -213,34 +213,7 @@ class ServerExecutor(object):
         return res
 
     def _broadcast_delta(self, view_id, out_delta):
-        if not self.engine.registry.has_id(sys.SubTab.ID):
-            return
-
-        subs_table = self.engine.registry.get_by_id(sys.SubTab.ID)
-        cursor = subs_table.store.create_cursor()
-        target_fds = []
-
-        try:
-            while cursor.is_valid():
-                acc = cursor.get_accessor()
-                if intmask(acc.get_int(0)) == view_id and cursor.weight() > r_int64(0):
-                    c_id = intmask(acc.get_int(1))
-                    if c_id in self.client_to_fd:
-                        target_fds.append(self.client_to_fd[c_id])
-                cursor.advance()
-        finally:
-            cursor.close()
-
-        if len(target_fds) > 0:
-            memfd = -1
-            try:
-                memfd = ipc.serialize_to_memfd(view_id, zbatch=out_delta)
-                for fd in target_fds:
-                    if ipc_ffi.send_fd(fd, memfd) < 0:
-                        self._cleanup_client(fd)
-            finally:
-                if memfd >= 0:
-                    os.close(memfd)
+        pass
 
     def _cleanup_client(self, fd):
         if fd in self.client_sockets:
