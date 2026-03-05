@@ -19,13 +19,9 @@ class CorruptShardError(StorageError):
 
 class BoundsError(StorageError):
     """Raised when accessing memory outside defined region bounds."""
-    _immutable_fields_ = ['offset', 'length', 'limit']
-    
+
     def __init__(self, offset, length, limit):
-        # RPython requires strict signatures; defaults removed.
-        self.offset = offset
-        self.length = length
-        self.limit = limit
+        self.msg = "Out of bounds: offset=%d length=%d limit=%d" % (offset, length, limit)
 
 class LayoutError(StorageError):
     """Raised when data violates physical alignment rules."""

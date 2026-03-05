@@ -1,14 +1,9 @@
 # gnitz/dbsp/ops/linear.py
 
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
-from rpython.rlib.longlong2float import float2longlong, longlong2float
-from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import r_int64, intmask
 
-from gnitz.core import strings, types, errors
-from gnitz.core.batch import ArenaZSetBatch, BatchWriter
-from gnitz.core.comparator import RowAccessor
-from gnitz.core.types import _analyze_schema
+from gnitz.core.batch import RowBuilder
 
 """
 Linear Operators for the DBSP algebra.
@@ -21,146 +16,13 @@ Zero-Copy: operators pipe data between batches via accessor forwarding.
 """
 
 
-class MapRowBuilder(RowAccessor):
-    """
-    A reusable, mutable RowAccessor used for zero-allocation MAP operations.
-    It acts as a builder for the output row and validates schema constraints.
-    """
-
-    _immutable_fields_ = [
-        "schema",
-        "pk_index",
-        "_has_nullable",
-        "expected_cols",
-        "target_writer",
-    ]
-
-    def __init__(self, schema, target_writer):
-        self.schema = schema
-        self.pk_index = schema.pk_index
-        self.target_writer = target_writer
-
-        n, has_u128, has_string, has_nullable = _analyze_schema(schema)
-        # expected_cols is the number of non-PK columns in the schema.
-        self.expected_cols = n
-
-        self._lo = [r_int64(0)] * n
-        self._hi = [r_uint64(0)] * n if has_u128 else None
-        self._strs = [""] * n if has_string else None
-
-        self._has_nullable = has_nullable
-        self._null_word = r_uint64(0)
-        self._curr = 0
-
-    def _payload_idx(self, col_idx):
-        if col_idx < self.pk_index:
-            return col_idx
-        return col_idx - 1
-
-    def _check_overflow(self):
-        if self._curr >= self.expected_cols:
-            raise errors.LayoutError(
-                "Map function attempted to write too many columns "
-                "(Schema expects %d non-PK columns)" % self.expected_cols
-            )
-
-    # ------------------------------------------------------------------
-    # ScalarFunction 'Writer' API (Self-Validating)
-    # ------------------------------------------------------------------
-
-    def append_int(self, val):
-        self._check_overflow()
-        self._lo[self._curr] = val
-        self._curr += 1
-
-    def append_float(self, val_f64):
-        self._check_overflow()
-        self._lo[self._curr] = float2longlong(val_f64)
-        self._curr += 1
-
-    def append_string(self, val_str):
-        self._check_overflow()
-        self._lo[self._curr] = r_int64(0)
-        if self._strs is not None:
-            self._strs[self._curr] = val_str
-        self._curr += 1
-
-    def append_u128(self, lo_u64, hi_u64):
-        self._check_overflow()
-        self._lo[self._curr] = r_int64(intmask(lo_u64))
-        if self._hi is not None:
-            self._hi[self._curr] = hi_u64
-        self._curr += 1
-
-    def append_null(self, payload_col_idx):
-        self._check_overflow()
-        # Verify the mapper is providing nulls in the correct sequence.
-        if payload_col_idx != self._curr:
-            raise errors.LayoutError(
-                "Out-of-order column append detected: expected payload col %d, got %d"
-                % (self._curr, payload_col_idx)
-            )
-
-        self._lo[self._curr] = r_int64(0)
-        self._null_word |= r_uint64(1) << payload_col_idx
-        self._curr += 1
-
-    def commit_row(self, pk, weight):
-        """
-        Validates the completed row, appends it to the batch writer,
-        and resets state for the next row.
-        """
-        if self._curr != self.expected_cols:
-            raise errors.LayoutError(
-                "Map function failed to write all columns: "
-                "expected %d, wrote %d" % (self.expected_cols, self._curr)
-            )
-
-        self.target_writer.append_from_accessor(pk, weight, self)
-
-        # Auto-reset for the next record.
-        self._curr = 0
-        self._null_word = r_uint64(0)
-
-    # ------------------------------------------------------------------
-    # RowAccessor 'Reader' API (for Batch.append_from_accessor)
-    # ------------------------------------------------------------------
-
-    def is_null(self, col_idx):
-        if not self._has_nullable:
-            return False
-        return bool(self._null_word & (r_uint64(1) << self._payload_idx(col_idx)))
-
-    def get_int(self, col_idx):
-        return r_uint64(self._lo[self._payload_idx(col_idx)])
-
-    def get_int_signed(self, col_idx):
-        return rffi.cast(rffi.LONGLONG, r_uint64(self._lo[self._payload_idx(col_idx)]))
-
-    def get_float(self, col_idx):
-        return longlong2float(self._lo[self._payload_idx(col_idx)])
-
-    def get_u128(self, col_idx):
-        p_idx = self._payload_idx(col_idx)
-        lo = r_uint64(self._lo[p_idx])
-        hi = self._hi[p_idx] if self._hi is not None else r_uint64(0)
-        from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-
-        return (r_uint128(hi) << 64) | r_uint128(lo)
-
-    def get_str_struct(self, col_idx):
-        s = self._strs[self._payload_idx(col_idx)] if self._strs is not None else ""
-        prefix = rffi.cast(lltype.Signed, strings.compute_prefix(s))
-        return (
-            len(s),
-            prefix,
-            lltype.nullptr(rffi.CCHARP.TO),
-            lltype.nullptr(rffi.CCHARP.TO),
-            s,
+def _forward_batch(in_batch, out_writer):
+    """Copy all rows from in_batch to out_writer unchanged."""
+    n = in_batch.length()
+    for i in range(n):
+        out_writer.append_from_accessor(
+            in_batch.get_pk(i), in_batch.get_weight(i), in_batch.get_accessor(i)
         )
-
-    def get_col_ptr(self, col_idx):
-        return lltype.nullptr(rffi.CCHARP.TO)
 
 
 # ---------------------------------------------------------------------------
@@ -189,17 +51,17 @@ def op_filter(in_batch, out_writer, func):
 
 
 @jit.unroll_safe
-def op_map(in_batch, out_writer, func, out_schema):
+def op_map(in_batch, out_batch, func, out_schema):
     """
     Applies a transformation to every row.
-    Uses MapRowBuilder to validate row construction and commit to the writer.
+    Uses RowBuilder to validate row construction and commit to the batch.
 
     in_batch:   ArenaZSetBatch
-    out_writer: BatchWriter  (strictly write-only destination)
+    out_batch:  ArenaZSetBatch (destination)
     func:       ScalarFunction  (evaluate_map)
     out_schema: TableSchema for the output batch
     """
-    builder = MapRowBuilder(out_schema, out_writer)
+    builder = RowBuilder(out_schema, out_batch)
 
     n = in_batch.length()
     for i in range(n):
@@ -226,18 +88,9 @@ def op_union(batch_a, batch_b, out_writer):
     Algebraic addition of two Z-Set streams.
     batch_b may be None, in which case this is an identity copy of batch_a.
     """
-    n_a = batch_a.length()
-    for i in range(n_a):
-        out_writer.append_from_accessor(
-            batch_a.get_pk(i), batch_a.get_weight(i), batch_a.get_accessor(i)
-        )
-
+    _forward_batch(batch_a, out_writer)
     if batch_b is not None:
-        n_b = batch_b.length()
-        for i in range(n_b):
-            out_writer.append_from_accessor(
-                batch_b.get_pk(i), batch_b.get_weight(i), batch_b.get_accessor(i)
-            )
+        _forward_batch(batch_b, out_writer)
 
 
 def op_delay(in_batch, out_writer):
@@ -245,11 +98,7 @@ def op_delay(in_batch, out_writer):
     The z^{-1} operator: forwards the current tick's batch to the next tick's
     input register.
     """
-    n = in_batch.length()
-    for i in range(n):
-        out_writer.append_from_accessor(
-            in_batch.get_pk(i), in_batch.get_weight(i), in_batch.get_accessor(i)
-        )
+    _forward_batch(in_batch, out_writer)
 
 
 def op_integrate(in_batch, target_table):

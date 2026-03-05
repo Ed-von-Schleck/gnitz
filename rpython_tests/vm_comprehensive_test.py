@@ -143,10 +143,9 @@ def test_filter_map_negate():
                          "Negate should flip weight to -1")
 
     # Check that pk=1 (val=5) was filtered out
-    pks = []
     for i in range(result.length()):
-        pks.append(result.get_pk(i))
-    assert_true(r_uint128(1) not in pks, "pk=1 should be filtered (val=5 <= 10)")
+        assert_true(result.get_pk(i) != r_uint128(1),
+                    "pk=1 should be filtered (val=5 <= 10)")
 
     result.free()
     in_batch.free()
@@ -647,7 +646,7 @@ def test_chunked_scan_resume(base_dir):
     # Program: ScanTrace(R0, R1, chunk=10) -> Yield(ROW_LIMIT) -> ClearDeltas -> Jump(0)
     program = [
         instructions.ScanTraceOp(reg_file.registers[0], reg_file.registers[1], 10),
-        instructions.YieldOp(runtime.YIELD_REASON_ROW_LIMIT),
+        instructions.YieldOp(2),
         instructions.ClearDeltasOp(),
         instructions.JumpOp(0),
     ]

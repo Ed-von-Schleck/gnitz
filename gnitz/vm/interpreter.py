@@ -2,8 +2,9 @@
 
 from rpython.rlib import jit
 from gnitz.core import batch
+from gnitz.core import opcodes as op
 from gnitz.dbsp import ops
-from gnitz.vm import instructions, runtime
+from gnitz.vm import runtime
 
 def get_printable_location(pc, program):
     """Provides a trace label for the RPython JIT log."""
@@ -39,27 +40,27 @@ def run_vm(program, reg_file, context):
 
         # ── Control Flow Opcodes ────────────────────────────────────────
 
-        if opcode == instructions.Instruction.HALT:
+        if opcode == op.OPCODE_HALT:
             context.pc = pc
             context.status = runtime.STATUS_HALTED
             return
 
-        elif opcode == instructions.Instruction.YIELD:
+        elif opcode == op.OPCODE_YIELD:
             context.pc = pc + 1
             context.status = runtime.STATUS_YIELDED
             context.yield_reason = instr.yield_reason
             return
 
-        elif opcode == instructions.Instruction.JUMP:
+        elif opcode == op.OPCODE_JUMP:
             pc = instr.jump_target
             continue
 
-        elif opcode == instructions.Instruction.CLEAR_DELTAS:
+        elif opcode == op.OPCODE_CLEAR_DELTAS:
             ops.op_clear_deltas(reg_file)
 
         # ── Stateful Cursor Opcodes ─────────────────────────────────────
 
-        elif opcode == instructions.Instruction.SCAN_TRACE:
+        elif opcode == op.OPCODE_SCAN_TRACE:
             reg_t = instr.reg_trace
             reg_o = instr.reg_out
             assert reg_t is not None and reg_o is not None
@@ -68,7 +69,7 @@ def run_vm(program, reg_file, context):
             writer = batch.BatchWriter(reg_o.batch)
             ops.op_scan_trace(reg_t.cursor, writer, instr.chunk_limit)
 
-        elif opcode == instructions.Instruction.SEEK_TRACE:
+        elif opcode == op.OPCODE_SEEK_TRACE:
             reg_t = instr.reg_trace
             reg_k = instr.reg_key
             assert reg_t is not None and reg_k is not None
@@ -78,7 +79,7 @@ def run_vm(program, reg_file, context):
 
         # ── DBSP Algebraic Opcodes (Stateless) ──────────────────────────
 
-        elif opcode == instructions.Instruction.FILTER:
+        elif opcode == op.OPCODE_FILTER:
             reg_in = instr.reg_in
             reg_out = instr.reg_out
             assert reg_in is not None and reg_out is not None
@@ -88,18 +89,18 @@ def run_vm(program, reg_file, context):
                 instr.func
             )
 
-        elif opcode == instructions.Instruction.MAP:
+        elif opcode == op.OPCODE_MAP:
             reg_in = instr.reg_in
             reg_out = instr.reg_out
             assert reg_in is not None and reg_out is not None
             ops.op_map(
                 reg_in.batch,
-                batch.BatchWriter(reg_out.batch),
+                reg_out.batch,
                 instr.func,
                 reg_out.vm_schema.table_schema
             )
 
-        elif opcode == instructions.Instruction.NEGATE:
+        elif opcode == op.OPCODE_NEGATE:
             reg_in = instr.reg_in
             reg_out = instr.reg_out
             assert reg_in is not None and reg_out is not None
@@ -108,7 +109,7 @@ def run_vm(program, reg_file, context):
                 batch.BatchWriter(reg_out.batch)
             )
 
-        elif opcode == instructions.Instruction.UNION:
+        elif opcode == op.OPCODE_UNION:
             reg_in_a = instr.reg_in_a
             reg_in_b = instr.reg_in_b
             reg_out = instr.reg_out
@@ -122,7 +123,7 @@ def run_vm(program, reg_file, context):
 
         # ── Non-Linear & Bilinear Opcodes (Stateful Logic) ──────────────
 
-        elif opcode == instructions.Instruction.DISTINCT:
+        elif opcode == op.OPCODE_DISTINCT:
             reg_in = instr.reg_in
             reg_history = instr.reg_history
             reg_out = instr.reg_out
@@ -133,7 +134,7 @@ def run_vm(program, reg_file, context):
                 batch.BatchWriter(reg_out.batch)
             )
 
-        elif opcode == instructions.Instruction.JOIN_DELTA_TRACE:
+        elif opcode == op.OPCODE_JOIN_DELTA_TRACE:
             reg_delta = instr.reg_delta
             reg_trace = instr.reg_trace
             reg_out = instr.reg_out
@@ -146,7 +147,7 @@ def run_vm(program, reg_file, context):
                 reg_trace.vm_schema.table_schema
             )
 
-        elif opcode == instructions.Instruction.JOIN_DELTA_DELTA:
+        elif opcode == op.OPCODE_JOIN_DELTA_DELTA:
             reg_a = instr.reg_a
             reg_b = instr.reg_b
             reg_out = instr.reg_out
@@ -159,7 +160,7 @@ def run_vm(program, reg_file, context):
                 reg_b.vm_schema.table_schema
             )
 
-        elif opcode == instructions.Instruction.DELAY:
+        elif opcode == op.OPCODE_DELAY:
             reg_in = instr.reg_in
             reg_out = instr.reg_out
             assert reg_in is not None and reg_out is not None
@@ -168,12 +169,12 @@ def run_vm(program, reg_file, context):
                 batch.BatchWriter(reg_out.batch)
             )
 
-        elif opcode == instructions.Instruction.INTEGRATE:
+        elif opcode == op.OPCODE_INTEGRATE:
             reg_in = instr.reg_in
             assert reg_in is not None
             ops.op_integrate(reg_in.batch, instr.target_table)
 
-        elif opcode == instructions.Instruction.REDUCE:
+        elif opcode == op.OPCODE_REDUCE:
             reg_in = instr.reg_in
             reg_trace_out = instr.reg_trace_out
             reg_out = instr.reg_out

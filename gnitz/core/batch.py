@@ -6,7 +6,6 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.core.types import _analyze_schema
 from gnitz.core import serialize, strings as string_logic, errors, types
 from gnitz.core import comparator as core_comparator
 from gnitz.storage import buffer
@@ -120,16 +119,16 @@ class RowBuilder(core_comparator.RowAccessor):
 
     _immutable_fields_ = ["_schema", "_pk_index", "_n", "_has_nullable"]
 
-    def __init__(self, schema, batch):
+    def __init__(self, schema, target):
         self._schema = schema
-        self._batch = batch
+        self._target = target
         self._pk_index = schema.pk_index
-        n, has_u128, has_string, has_nullable = _analyze_schema(schema)
+        n = schema.n_payload
         self._n = n
-        self._has_nullable = has_nullable
+        self._has_nullable = schema.has_nullable
         self._lo = [r_int64(0)] * n
-        self._hi = [r_uint64(0)] * n if has_u128 else None
-        self._strs = [""] * n if has_string else None
+        self._hi = [r_uint64(0)] * n if schema.has_u128 else None
+        self._strs = [""] * n if schema.has_string else None
         self._null_word = r_uint64(0)
         self._pk_lo = r_uint64(0)
         self._pk_hi = r_uint64(0)
@@ -173,7 +172,62 @@ class RowBuilder(core_comparator.RowAccessor):
 
     def commit(self):
         pk = (r_uint128(self._pk_hi) << 64) | r_uint128(self._pk_lo)
-        self._batch.append_from_accessor(pk, self._weight, self)
+        self._target.append_from_accessor(pk, self._weight, self)
+
+    # -- append_* API (used by op_map via ScalarFunction.evaluate_map) --
+
+    def _check_overflow(self):
+        if self._curr >= self._n:
+            raise errors.LayoutError(
+                "Map function attempted to write too many columns "
+                "(Schema expects %d non-PK columns)" % self._n
+            )
+
+    def append_int(self, val):
+        self._check_overflow()
+        self._lo[self._curr] = val
+        self._curr += 1
+
+    def append_float(self, val_f64):
+        self._check_overflow()
+        self._lo[self._curr] = float2longlong(val_f64)
+        self._curr += 1
+
+    def append_string(self, val_str):
+        self._check_overflow()
+        self._lo[self._curr] = r_int64(0)
+        if self._strs is not None:
+            self._strs[self._curr] = val_str
+        self._curr += 1
+
+    def append_u128(self, lo_u64, hi_u64):
+        from rpython.rlib.rarithmetic import intmask
+        self._check_overflow()
+        self._lo[self._curr] = r_int64(intmask(lo_u64))
+        if self._hi is not None:
+            self._hi[self._curr] = hi_u64
+        self._curr += 1
+
+    def append_null(self, payload_col_idx):
+        self._check_overflow()
+        if payload_col_idx != self._curr:
+            raise errors.LayoutError(
+                "Out-of-order column append detected: expected payload col %d, got %d"
+                % (self._curr, payload_col_idx)
+            )
+        self._lo[self._curr] = r_int64(0)
+        self._null_word |= r_uint64(1) << payload_col_idx
+        self._curr += 1
+
+    def commit_row(self, pk, weight):
+        if self._curr != self._n:
+            raise errors.LayoutError(
+                "Map function failed to write all columns: "
+                "expected %d, wrote %d" % (self._n, self._curr)
+            )
+        self._target.append_from_accessor(pk, weight, self)
+        self._curr = 0
+        self._null_word = r_uint64(0)
 
     # RowAccessor read interface
 

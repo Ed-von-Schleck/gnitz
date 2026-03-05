@@ -13,6 +13,18 @@ from gnitz.dbsp import functions
 NULL_PREDICATE = functions.NullPredicate()
 NULL_AGGREGATE = functions.NullAggregate()
 
+
+def _open_system_scan(registry, table_id, view_id):
+    """Returns (cursor, end_key) with cursor pre-seeked, or (None, 0) if table absent."""
+    if not registry.has_id(table_id):
+        return None, r_uint128(0)
+    family = registry.get_by_id(table_id)
+    cursor = family.store.create_cursor()
+    start_key = r_uint128(r_uint64(view_id)) << 64
+    end_key = r_uint128(r_uint64(view_id + 1)) << 64
+    cursor.seek(start_key)
+    return cursor, end_key
+
 def _get_scalar_func(func_id):
     return NULL_PREDICATE
 
@@ -103,14 +115,11 @@ class ProgramCache(object):
             raise LayoutError("View graph contains cycles (not a DAG)")
 
     def _load_nodes(self, view_id):
-        if not self.registry.has_id(sys.CircuitNodesTab.ID): return []
-        family = self.registry.get_by_id(sys.CircuitNodesTab.ID)
-        cursor = family.store.create_cursor()
+        cursor, end_key = _open_system_scan(self.registry, sys.CircuitNodesTab.ID, view_id)
+        if cursor is None:
+            return []
         result = newlist_hint(8)
-        start_key = r_uint128(r_uint64(view_id)) << 64
-        end_key = r_uint128(r_uint64(view_id + 1)) << 64
         try:
-            cursor.seek(start_key)
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > r_int64(0):
                     pk = cursor.key()
@@ -124,14 +133,11 @@ class ProgramCache(object):
         return result
 
     def _load_edges(self, view_id):
-        if not self.registry.has_id(sys.CircuitEdgesTab.ID): return []
-        family = self.registry.get_by_id(sys.CircuitEdgesTab.ID)
-        cursor = family.store.create_cursor()
+        cursor, end_key = _open_system_scan(self.registry, sys.CircuitEdgesTab.ID, view_id)
+        if cursor is None:
+            return []
         result = newlist_hint(8)
-        start_key = r_uint128(r_uint64(view_id)) << 64
-        end_key = r_uint128(r_uint64(view_id + 1)) << 64
         try:
-            cursor.seek(start_key)
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > r_int64(0):
                     pk = cursor.key()
@@ -147,14 +153,11 @@ class ProgramCache(object):
         return result
 
     def _load_sources(self, view_id):
-        if not self.registry.has_id(sys.CircuitSourcesTab.ID): return {}
-        family = self.registry.get_by_id(sys.CircuitSourcesTab.ID)
-        cursor = family.store.create_cursor()
+        cursor, end_key = _open_system_scan(self.registry, sys.CircuitSourcesTab.ID, view_id)
+        if cursor is None:
+            return {}
         result = {}
-        start_key = r_uint128(r_uint64(view_id)) << 64
-        end_key = r_uint128(r_uint64(view_id + 1)) << 64
         try:
-            cursor.seek(start_key)
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > r_int64(0):
                     pk = cursor.key()
@@ -168,14 +171,11 @@ class ProgramCache(object):
         return result
 
     def _load_params(self, view_id):
-        if not self.registry.has_id(sys.CircuitParamsTab.ID): return {}
-        family = self.registry.get_by_id(sys.CircuitParamsTab.ID)
-        cursor = family.store.create_cursor()
+        cursor, end_key = _open_system_scan(self.registry, sys.CircuitParamsTab.ID, view_id)
+        if cursor is None:
+            return {}
         result = {}
-        start_key = r_uint128(r_uint64(view_id)) << 64
-        end_key = r_uint128(r_uint64(view_id + 1)) << 64
         try:
-            cursor.seek(start_key)
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > r_int64(0):
                     pk = cursor.key()
@@ -192,14 +192,11 @@ class ProgramCache(object):
         return result
 
     def _load_group_cols(self, view_id):
-        if not self.registry.has_id(sys.CircuitGroupColsTab.ID): return {}
-        family = self.registry.get_by_id(sys.CircuitGroupColsTab.ID)
-        cursor = family.store.create_cursor()
+        cursor, end_key = _open_system_scan(self.registry, sys.CircuitGroupColsTab.ID, view_id)
+        if cursor is None:
+            return {}
         result = {}
-        start_key = r_uint128(r_uint64(view_id)) << 64
-        end_key = r_uint128(r_uint64(view_id + 1)) << 64
         try:
-            cursor.seek(start_key)
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > r_int64(0):
                     pk = cursor.key()

@@ -79,6 +79,10 @@ class TableSchema(object):
         "pk_index",
         "memtable_stride",
         "has_varlen",
+        "n_payload",
+        "has_u128",
+        "has_string",
+        "has_nullable",
     ]
 
     def __init__(self, columns, pk_index=0):
@@ -121,6 +125,13 @@ class TableSchema(object):
                 max_alignment = field_type.alignment
 
         self.memtable_stride = _align(current_offset, max_alignment)
+
+        # Cache _analyze_schema results
+        n, hu128, hstr, hnull = _analyze_schema(self)
+        self.n_payload = n
+        self.has_u128 = hu128
+        self.has_string = hstr
+        self.has_nullable = hnull
 
     @property
     def stride(self):

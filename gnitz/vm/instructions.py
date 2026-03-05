@@ -36,24 +36,6 @@ class Instruction(object):
         "reg_key",
     ]
 
-    # --- Opcode Constants ---
-    HALT             = op.OPCODE_HALT
-    FILTER           = op.OPCODE_FILTER
-    MAP              = op.OPCODE_MAP
-    NEGATE           = op.OPCODE_NEGATE
-    UNION            = op.OPCODE_UNION
-    JOIN_DELTA_TRACE = op.OPCODE_JOIN_DELTA_TRACE
-    JOIN_DELTA_DELTA = op.OPCODE_JOIN_DELTA_DELTA
-    INTEGRATE        = op.OPCODE_INTEGRATE
-    DELAY            = op.OPCODE_DELAY
-    REDUCE           = op.OPCODE_REDUCE
-    DISTINCT         = op.OPCODE_DISTINCT
-    SCAN_TRACE       = op.OPCODE_SCAN_TRACE
-    SEEK_TRACE       = op.OPCODE_SEEK_TRACE
-    YIELD            = op.OPCODE_YIELD
-    JUMP             = op.OPCODE_JUMP
-    CLEAR_DELTAS     = op.OPCODE_CLEAR_DELTAS
-
     def __init__(self, opcode):
         self.opcode = opcode
         self.reg_in = None
@@ -83,7 +65,7 @@ class Instruction(object):
 
 class FilterOp(Instruction):
     def __init__(self, reg_in, reg_out, func):
-        Instruction.__init__(self, self.FILTER)
+        Instruction.__init__(self, op.OPCODE_FILTER)
         self.reg_in = reg_in
         self.reg_out = reg_out
         self.func = func
@@ -91,7 +73,7 @@ class FilterOp(Instruction):
 
 class MapOp(Instruction):
     def __init__(self, reg_in, reg_out, func):
-        Instruction.__init__(self, self.MAP)
+        Instruction.__init__(self, op.OPCODE_MAP)
         self.reg_in = reg_in
         self.reg_out = reg_out
         self.func = func
@@ -99,14 +81,14 @@ class MapOp(Instruction):
 
 class NegateOp(Instruction):
     def __init__(self, reg_in, reg_out):
-        Instruction.__init__(self, self.NEGATE)
+        Instruction.__init__(self, op.OPCODE_NEGATE)
         self.reg_in = reg_in
         self.reg_out = reg_out
 
 
 class UnionOp(Instruction):
     def __init__(self, reg_in_a, reg_in_b, reg_out):
-        Instruction.__init__(self, self.UNION)
+        Instruction.__init__(self, op.OPCODE_UNION)
         self.reg_in_a = reg_in_a
         self.reg_in_b = reg_in_b
         self.reg_out = reg_out
@@ -114,7 +96,7 @@ class UnionOp(Instruction):
 
 class DistinctOp(Instruction):
     def __init__(self, reg_in, reg_history, reg_out):
-        Instruction.__init__(self, self.DISTINCT)
+        Instruction.__init__(self, op.OPCODE_DISTINCT)
         self.reg_in = reg_in
         self.reg_history = reg_history
         self.reg_out = reg_out
@@ -122,7 +104,7 @@ class DistinctOp(Instruction):
 
 class JoinDeltaTraceOp(Instruction):
     def __init__(self, reg_delta, reg_trace, reg_out):
-        Instruction.__init__(self, self.JOIN_DELTA_TRACE)
+        Instruction.__init__(self, op.OPCODE_JOIN_DELTA_TRACE)
         self.reg_delta = reg_delta
         self.reg_trace = reg_trace
         self.reg_out = reg_out
@@ -130,21 +112,21 @@ class JoinDeltaTraceOp(Instruction):
 
 class IntegrateOp(Instruction):
     def __init__(self, reg_in, target_table):
-        Instruction.__init__(self, self.INTEGRATE)
+        Instruction.__init__(self, op.OPCODE_INTEGRATE)
         self.reg_in = reg_in
         self.target_table = target_table
 
 
 class DelayOp(Instruction):
     def __init__(self, reg_in, reg_out):
-        Instruction.__init__(self, self.DELAY)
+        Instruction.__init__(self, op.OPCODE_DELAY)
         self.reg_in = reg_in
         self.reg_out = reg_out
 
 
 class JoinDeltaDeltaOp(Instruction):
     def __init__(self, reg_a, reg_b, reg_out):
-        Instruction.__init__(self, self.JOIN_DELTA_DELTA)
+        Instruction.__init__(self, op.OPCODE_JOIN_DELTA_DELTA)
         self.reg_a = reg_a
         self.reg_b = reg_b
         self.reg_out = reg_out
@@ -155,7 +137,7 @@ class ReduceOp(Instruction):
         self, reg_in, reg_trace_in, reg_trace_out, reg_out,
         group_by_cols, agg_func, output_schema,
     ):
-        Instruction.__init__(self, self.REDUCE)
+        Instruction.__init__(self, op.OPCODE_REDUCE)
         self.reg_in = reg_in
         self.reg_trace_in = reg_trace_in
         self.reg_trace_out = reg_trace_out
@@ -170,12 +152,12 @@ class ReduceOp(Instruction):
 
 class HaltOp(Instruction):
     def __init__(self):
-        Instruction.__init__(self, self.HALT)
+        Instruction.__init__(self, op.OPCODE_HALT)
 
 
 class ScanTraceOp(Instruction):
     def __init__(self, reg_trace, reg_out, chunk_limit):
-        Instruction.__init__(self, self.SCAN_TRACE)
+        Instruction.__init__(self, op.OPCODE_SCAN_TRACE)
         self.reg_trace = reg_trace
         self.reg_out = reg_out
         self.chunk_limit = chunk_limit
@@ -183,23 +165,23 @@ class ScanTraceOp(Instruction):
 
 class SeekTraceOp(Instruction):
     def __init__(self, reg_trace, reg_key):
-        Instruction.__init__(self, self.SEEK_TRACE)
+        Instruction.__init__(self, op.OPCODE_SEEK_TRACE)
         self.reg_trace = reg_trace
         self.reg_key = reg_key
 
 
 class YieldOp(Instruction):
     def __init__(self, reason):
-        Instruction.__init__(self, self.YIELD)
+        Instruction.__init__(self, op.OPCODE_YIELD)
         self.yield_reason = reason
 
 
 class JumpOp(Instruction):
     def __init__(self, target_idx):
-        Instruction.__init__(self, self.JUMP)
+        Instruction.__init__(self, op.OPCODE_JUMP)
         self.jump_target = target_idx
 
 
 class ClearDeltasOp(Instruction):
     def __init__(self):
-        Instruction.__init__(self, self.CLEAR_DELTAS)
+        Instruction.__init__(self, op.OPCODE_CLEAR_DELTAS)

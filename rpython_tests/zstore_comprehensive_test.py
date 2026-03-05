@@ -19,7 +19,6 @@ from gnitz.catalog import engine, identifiers
 from gnitz.catalog.registry import ingest_to_family
 from gnitz.catalog.metadata import ensure_dir
 from gnitz.client.circuit_builder import CircuitBuilder
-from gnitz.vm.query import View
 
 # -- RPython Safe Hex Formatting ----------------------------------------------
 
@@ -240,8 +239,6 @@ def test_programmable_zset_lifecycle():
 
     # 8. View Execution (New View API)
     log_step("Phase 8: Execution of Recovered View handle")
-    view_handle = View(view_family.table_id, plan)
-
     # Feed the actual alice record as a delta to the reactive view
     in_batch = batch.ZSetBatch(users_family.schema)
     rb_in = RowBuilder(users_family.schema, in_batch)
@@ -249,7 +246,7 @@ def test_programmable_zset_lifecycle():
     rb_in.put_string("alice")
     rb_in.commit()
 
-    out_batch = view_handle.process(in_batch)
+    out_batch = plan.execute_epoch(in_batch)
     in_batch.free()
 
     assert_true(out_batch is not None, "View should have produced Alice")

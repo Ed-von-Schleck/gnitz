@@ -12,11 +12,7 @@ STATUS_YIELDED = 2
 STATUS_HALTED  = 3
 STATUS_ERROR   = 4
 
-# Yield Reason Codes
-YIELD_REASON_NONE        = 0
-YIELD_REASON_BUFFER_FULL = 1
-YIELD_REASON_ROW_LIMIT   = 2
-YIELD_REASON_USER        = 3
+YIELD_REASON_NONE = 0
 
 
 class VMSchema(object):
@@ -24,27 +20,10 @@ class VMSchema(object):
     Metadata cache for the VM.
     Promoted to constants during JIT tracing to fold address arithmetic.
     """
-    _immutable_fields_ = [
-        'table_schema', 'stride',
-        'column_types[*]', 'pk_index', 'pk_type'
-    ]
+    _immutable_fields_ = ['table_schema']
 
     def __init__(self, table_schema):
         self.table_schema = table_schema
-        self.stride = table_schema.stride
-        self.pk_index = table_schema.pk_index
-        self.pk_type = table_schema.get_pk_column().field_type.code
-
-        num_cols = len(table_schema.columns)
-        self.column_types = [0] * num_cols
-
-        for i in range(num_cols):
-            self.column_types[i] = table_schema.columns[i].field_type.code
-
-    @jit.elidable
-    def get_type(self, col_idx):
-        assert col_idx >= 0 and col_idx < len(self.column_types)
-        return self.column_types[col_idx]
 
 
 class BaseRegister(object):

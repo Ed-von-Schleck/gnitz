@@ -351,48 +351,37 @@ class Engine(object):
 
     def _write_circuit_graph(self, vid, graph):
         """Ingests all five circuit table payloads from a CircuitGraph."""
-        s = self.sys.circuit_nodes.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.CircuitNodesTab)
         for node_id, opcode in graph.nodes:
             sys.CircuitNodesTab.append(batch, s, vid, node_id, opcode)
-        self.sys.circuit_nodes.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.circuit_nodes, batch)
 
-        s = self.sys.circuit_edges.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.CircuitEdgesTab)
         for edge_id, src, dst, port in graph.edges:
             sys.CircuitEdgesTab.append(batch, s, vid, edge_id, src, dst, port)
-        self.sys.circuit_edges.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.circuit_edges, batch)
 
-        s = self.sys.circuit_sources.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.CircuitSourcesTab)
         for node_id, table_id in graph.sources:
             sys.CircuitSourcesTab.append(batch, s, vid, node_id, table_id)
-        self.sys.circuit_sources.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.circuit_sources, batch)
 
-        s = self.sys.circuit_params.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.CircuitParamsTab)
         for node_id, slot, value in graph.params:
             sys.CircuitParamsTab.append(batch, s, vid, node_id, slot, value)
-        self.sys.circuit_params.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.circuit_params, batch)
 
-        s = self.sys.circuit_group_cols.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.CircuitGroupColsTab)
         for node_id, col_idx in graph.group_cols:
             sys.CircuitGroupColsTab.append(batch, s, vid, node_id, col_idx)
-        self.sys.circuit_group_cols.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.circuit_group_cols, batch)
 
     def _retract_circuit_graph(self, vid):
         start_key = r_uint128(r_uint64(vid)) << 64
         end_key = r_uint128(r_uint64(vid + 1)) << 64
 
         # Nodes
-        s = self.sys.circuit_nodes.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.CircuitNodesTab)
         cursor = self.sys.circuit_nodes.create_cursor()
         try:
             cursor.seek(start_key)
@@ -406,12 +395,10 @@ class Engine(object):
                 cursor.advance()
         finally:
             cursor.close()
-        self.sys.circuit_nodes.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.circuit_nodes, batch)
 
         # Edges
-        s = self.sys.circuit_edges.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.CircuitEdgesTab)
         cursor = self.sys.circuit_edges.create_cursor()
         try:
             cursor.seek(start_key)
@@ -427,12 +414,10 @@ class Engine(object):
                 cursor.advance()
         finally:
             cursor.close()
-        self.sys.circuit_edges.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.circuit_edges, batch)
 
         # Sources
-        s = self.sys.circuit_sources.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.CircuitSourcesTab)
         cursor = self.sys.circuit_sources.create_cursor()
         try:
             cursor.seek(start_key)
@@ -446,12 +431,10 @@ class Engine(object):
                 cursor.advance()
         finally:
             cursor.close()
-        self.sys.circuit_sources.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.circuit_sources, batch)
 
         # Params
-        s = self.sys.circuit_params.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.CircuitParamsTab)
         cursor = self.sys.circuit_params.create_cursor()
         try:
             cursor.seek(start_key)
@@ -467,12 +450,10 @@ class Engine(object):
                 cursor.advance()
         finally:
             cursor.close()
-        self.sys.circuit_params.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.circuit_params, batch)
 
         # Group cols
-        s = self.sys.circuit_group_cols.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.CircuitGroupColsTab)
         cursor = self.sys.circuit_group_cols.create_cursor()
         try:
             cursor.seek(start_key)
@@ -487,112 +468,97 @@ class Engine(object):
                 cursor.advance()
         finally:
             cursor.close()
-        self.sys.circuit_group_cols.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.circuit_group_cols, batch)
 
     # -- Private Write Helpers ------------------------------------------------
 
-    def _write_schema_record(self, sid, name):
-        s = self.sys.schemas.schema
-        batch = ZSetBatch(s)
-        sys.SchemaTab.append(batch, s, sid, name)
-        ingest_to_family(self._schemas_family, batch)
+    def _begin_write(self, tab_class):
+        s = tab_class.schema()
+        return s, ZSetBatch(s)
+
+    def _finish_write(self, family, batch):
+        ingest_to_family(family, batch)
         batch.free()
+
+    def _finish_write_sys(self, sys_table, batch):
+        sys_table.ingest_batch(batch)
+        batch.free()
+
+    def _write_schema_record(self, sid, name):
+        s, batch = self._begin_write(sys.SchemaTab)
+        sys.SchemaTab.append(batch, s, sid, name)
+        self._finish_write(self._schemas_family, batch)
 
     def _retract_schema_record(self, sid, name):
-        s = self.sys.schemas.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.SchemaTab)
         sys.SchemaTab.retract(batch, s, sid, name)
-        ingest_to_family(self._schemas_family, batch)
-        batch.free()
+        self._finish_write(self._schemas_family, batch)
 
     def _write_table_record(self, tid, sid, name, directory, pk_idx, lsn):
-        s = self.sys.tables.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.TableTab)
         sys.TableTab.append(batch, s, tid, sid, name, directory, pk_idx, lsn)
-        ingest_to_family(self._tables_family, batch)
-        batch.free()
+        self._finish_write(self._tables_family, batch)
 
     def _retract_table_record(self, tid, sid, name, directory, pk_idx, lsn):
-        s = self.sys.tables.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.TableTab)
         sys.TableTab.retract(batch, s, tid, sid, name, directory, pk_idx, lsn)
-        ingest_to_family(self._tables_family, batch)
-        batch.free()
+        self._finish_write(self._tables_family, batch)
 
     def _write_view_record(self, vid, sid, name, sql_def, directory, lsn):
-        s = self.sys.views.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.ViewTab)
         sys.ViewTab.append(batch, s, vid, sid, name, sql_def, directory, lsn)
-        ingest_to_family(self._views_family, batch)
-        batch.free()
+        self._finish_write(self._views_family, batch)
 
     def _retract_view_record(self, vid, sid, name, sql_def, directory, lsn):
-        s = self.sys.views.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.ViewTab)
         sys.ViewTab.retract(batch, s, vid, sid, name, sql_def, directory, lsn)
-        ingest_to_family(self._views_family, batch)
-        batch.free()
+        self._finish_write(self._views_family, batch)
 
     def _write_view_deps(self, vid, dep_ids):
-        s = self.sys.view_deps.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.DepTab)
         for dep_tid in dep_ids:
             dep_id = intmask(r_uint64(vid) ^ r_uint64(dep_tid))
             sys.DepTab.append(batch, s, dep_id, vid, 0, dep_tid)
-        self.sys.view_deps.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.view_deps, batch)
 
     def _retract_view_deps(self, vid, deps_info):
-        s = self.sys.view_deps.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.DepTab)
         for d_id, dvid, dtid in deps_info:
             sys.DepTab.retract(batch, s, d_id, vid, dvid, dtid)
-        self.sys.view_deps.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.view_deps, batch)
 
     def _write_column_records(self, oid, kind, columns):
-        s = self.sys.columns.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.ColTab)
         for i in range(len(columns)):
             col = columns[i]
             sys.ColTab.append(
                 batch, s, oid, kind, i, col.name, col.field_type.code,
                 int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
             )
-        self.sys.columns.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.columns, batch)
 
     def _retract_column_records(self, oid, kind, columns):
-        s = self.sys.columns.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.ColTab)
         for i in range(len(columns)):
             col = columns[i]
             sys.ColTab.retract(
                 batch, s, oid, kind, i, col.name, col.field_type.code,
                 int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
             )
-        self.sys.columns.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.columns, batch)
 
     def _write_index_record(self, idx_id, oid, kind, s_idx, name, unique, c_dir):
-        s = self.sys.indices.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.IdxTab)
         sys.IdxTab.append(batch, s, idx_id, oid, kind, s_idx, name, unique, c_dir)
-        ingest_to_family(self._indices_family, batch)
-        batch.free()
+        self._finish_write(self._indices_family, batch)
 
     def _retract_index_record(self, idx_id, oid, kind, s_idx, name, unique, c_dir):
-        s = self.sys.indices.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.IdxTab)
         sys.IdxTab.retract(batch, s, idx_id, oid, kind, s_idx, name, unique, c_dir)
-        ingest_to_family(self._indices_family, batch)
-        batch.free()
+        self._finish_write(self._indices_family, batch)
 
     def _advance_sequence(self, seq_id, old_val, new_val):
-        s = self.sys.sequences.schema
-        batch = ZSetBatch(s)
+        s, batch = self._begin_write(sys.SeqTab)
         sys.SeqTab.retract(batch, s, seq_id, old_val)
         sys.SeqTab.append(batch, s, seq_id, new_val)
-        self.sys.sequences.ingest_batch(batch)
-        batch.free()
+        self._finish_write_sys(self.sys.sequences, batch)

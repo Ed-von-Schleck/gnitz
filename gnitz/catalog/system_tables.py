@@ -81,18 +81,19 @@ class SchemaTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, sid, name):
+    def _emit(batch, schema, weight, sid, name):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(sid)), r_int64(1))
+        rb.begin(r_uint128(r_uint64(sid)), weight)
         rb.put_string(name)
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, sid, name):
+        SchemaTab._emit(batch, schema, r_int64(1), sid, name)
+
+    @staticmethod
     def retract(batch, schema, sid, name):
-        rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(sid)), r_int64(-1))
-        rb.put_string(name)
-        rb.commit()
+        SchemaTab._emit(batch, schema, r_int64(-1), sid, name)
 
 
 class TableTab(BaseTab):
@@ -111,9 +112,9 @@ class TableTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, tid, sid, name, directory, pk_idx, lsn):
+    def _emit(batch, schema, weight, tid, sid, name, directory, pk_idx, lsn):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(tid)), r_int64(1))
+        rb.begin(r_uint128(r_uint64(tid)), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
         rb.put_string(name)
         rb.put_string(directory)
@@ -122,15 +123,12 @@ class TableTab(BaseTab):
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, tid, sid, name, directory, pk_idx, lsn):
+        TableTab._emit(batch, schema, r_int64(1), tid, sid, name, directory, pk_idx, lsn)
+
+    @staticmethod
     def retract(batch, schema, tid, sid, name, directory, pk_idx, lsn):
-        rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(tid)), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
-        rb.put_string(name)
-        rb.put_string(directory)
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(pk_idx)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(lsn)))
-        rb.commit()
+        TableTab._emit(batch, schema, r_int64(-1), tid, sid, name, directory, pk_idx, lsn)
 
 
 class ViewTab(BaseTab):
@@ -149,9 +147,9 @@ class ViewTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, vid, sid, name, sql_def, cache_dir, lsn):
+    def _emit(batch, schema, weight, vid, sid, name, sql_def, cache_dir, lsn):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(vid)), r_int64(1))
+        rb.begin(r_uint128(r_uint64(vid)), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
         rb.put_string(name)
         rb.put_string(sql_def)
@@ -160,15 +158,12 @@ class ViewTab(BaseTab):
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, vid, sid, name, sql_def, cache_dir, lsn):
+        ViewTab._emit(batch, schema, r_int64(1), vid, sid, name, sql_def, cache_dir, lsn)
+
+    @staticmethod
     def retract(batch, schema, vid, sid, name, sql_def, cache_dir, lsn):
-        rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(vid)), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
-        rb.put_string(name)
-        rb.put_string(sql_def)
-        rb.put_string(cache_dir)
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(lsn)))
-        rb.commit()
+        ViewTab._emit(batch, schema, r_int64(-1), vid, sid, name, sql_def, cache_dir, lsn)
 
 
 class ColTab(BaseTab):
@@ -191,9 +186,9 @@ class ColTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, owner_id, kind, idx, name, code, null, fk_tid, fk_cid):
+    def _emit(batch, schema, weight, owner_id, kind, idx, name, code, null, fk_tid, fk_cid):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(pack_column_id(owner_id, idx)), r_int64(1))
+        rb.begin(r_uint128(pack_column_id(owner_id, idx)), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(owner_id)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(kind)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(idx)))
@@ -205,18 +200,12 @@ class ColTab(BaseTab):
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, owner_id, kind, idx, name, code, null, fk_tid, fk_cid):
+        ColTab._emit(batch, schema, r_int64(1), owner_id, kind, idx, name, code, null, fk_tid, fk_cid)
+
+    @staticmethod
     def retract(batch, schema, owner_id, kind, idx, name, code, null, fk_tid, fk_cid):
-        rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(pack_column_id(owner_id, idx)), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(owner_id)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(kind)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(idx)))
-        rb.put_string(name)
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(code)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(null)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(fk_tid)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(fk_cid)))
-        rb.commit()
+        ColTab._emit(batch, schema, r_int64(-1), owner_id, kind, idx, name, code, null, fk_tid, fk_cid)
 
     @staticmethod
     def append_system(batch, schema, tid, column_defs):
@@ -243,9 +232,9 @@ class IdxTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, iid, oid, kind, src_idx, name, unique, cache_dir):
+    def _emit(batch, schema, weight, iid, oid, kind, src_idx, name, unique, cache_dir):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(iid)), r_int64(1))
+        rb.begin(r_uint128(r_uint64(iid)), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(oid)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(kind)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(src_idx)))
@@ -255,16 +244,12 @@ class IdxTab(BaseTab):
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, iid, oid, kind, src_idx, name, unique, cache_dir):
+        IdxTab._emit(batch, schema, r_int64(1), iid, oid, kind, src_idx, name, unique, cache_dir)
+
+    @staticmethod
     def retract(batch, schema, iid, oid, kind, src_idx, name, unique, cache_dir):
-        rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(iid)), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(oid)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(kind)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(src_idx)))
-        rb.put_string(name)
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(unique)))
-        rb.put_string(cache_dir)
-        rb.commit()
+        IdxTab._emit(batch, schema, r_int64(-1), iid, oid, kind, src_idx, name, unique, cache_dir)
 
 
 class DepTab(BaseTab):
@@ -281,22 +266,21 @@ class DepTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, dep_id, view_id, dep_vid, dep_tid):
+    def _emit(batch, schema, weight, dep_id, view_id, dep_vid, dep_tid):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(dep_id)), r_int64(1))
+        rb.begin(r_uint128(r_uint64(dep_id)), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(view_id)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dep_vid)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dep_tid)))
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, dep_id, view_id, dep_vid, dep_tid):
+        DepTab._emit(batch, schema, r_int64(1), dep_id, view_id, dep_vid, dep_tid)
+
+    @staticmethod
     def retract(batch, schema, dep_id, view_id, dep_vid, dep_tid):
-        rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(dep_id)), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(view_id)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dep_vid)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dep_tid)))
-        rb.commit()
+        DepTab._emit(batch, schema, r_int64(-1), dep_id, view_id, dep_vid, dep_tid)
 
 
 class SeqTab(BaseTab):
@@ -311,18 +295,19 @@ class SeqTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, seq_id, val):
+    def _emit(batch, schema, weight, seq_id, val):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(seq_id)), r_int64(1))
+        rb.begin(r_uint128(r_uint64(seq_id)), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(val)))
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, seq_id, val):
+        SeqTab._emit(batch, schema, r_int64(1), seq_id, val)
+
+    @staticmethod
     def retract(batch, schema, seq_id, val):
-        rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(seq_id)), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(val)))
-        rb.commit()
+        SeqTab._emit(batch, schema, r_int64(-1), seq_id, val)
 
 
 class FuncTab(BaseTab):
@@ -366,18 +351,19 @@ class CircuitNodesTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, view_id, node_id, opcode):
+    def _emit(batch, schema, weight, view_id, node_id, opcode):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_node_pk(view_id, node_id), r_int64(1))
+        rb.begin(pack_node_pk(view_id, node_id), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(opcode)))
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, view_id, node_id, opcode):
+        CircuitNodesTab._emit(batch, schema, r_int64(1), view_id, node_id, opcode)
+
+    @staticmethod
     def retract(batch, schema, view_id, node_id, opcode):
-        rb = RowBuilder(schema, batch)
-        rb.begin(pack_node_pk(view_id, node_id), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(opcode)))
-        rb.commit()
+        CircuitNodesTab._emit(batch, schema, r_int64(-1), view_id, node_id, opcode)
 
 
 class CircuitEdgesTab(BaseTab):
@@ -402,22 +388,21 @@ class CircuitEdgesTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, view_id, edge_id, src_node, dst_node, dst_port):
+    def _emit(batch, schema, weight, view_id, edge_id, src_node, dst_node, dst_port):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_edge_pk(view_id, edge_id), r_int64(1))
+        rb.begin(pack_edge_pk(view_id, edge_id), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(src_node)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dst_node)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dst_port)))
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, view_id, edge_id, src_node, dst_node, dst_port):
+        CircuitEdgesTab._emit(batch, schema, r_int64(1), view_id, edge_id, src_node, dst_node, dst_port)
+
+    @staticmethod
     def retract(batch, schema, view_id, edge_id, src_node, dst_node, dst_port):
-        rb = RowBuilder(schema, batch)
-        rb.begin(pack_edge_pk(view_id, edge_id), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(src_node)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dst_node)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dst_port)))
-        rb.commit()
+        CircuitEdgesTab._emit(batch, schema, r_int64(-1), view_id, edge_id, src_node, dst_node, dst_port)
 
 
 class CircuitSourcesTab(BaseTab):
@@ -438,18 +423,19 @@ class CircuitSourcesTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, view_id, node_id, table_id):
+    def _emit(batch, schema, weight, view_id, node_id, table_id):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_node_pk(view_id, node_id), r_int64(1))
+        rb.begin(pack_node_pk(view_id, node_id), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(table_id)))
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, view_id, node_id, table_id):
+        CircuitSourcesTab._emit(batch, schema, r_int64(1), view_id, node_id, table_id)
+
+    @staticmethod
     def retract(batch, schema, view_id, node_id, table_id):
-        rb = RowBuilder(schema, batch)
-        rb.begin(pack_node_pk(view_id, node_id), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(table_id)))
-        rb.commit()
+        CircuitSourcesTab._emit(batch, schema, r_int64(-1), view_id, node_id, table_id)
 
 
 class CircuitParamsTab(BaseTab):
@@ -470,18 +456,19 @@ class CircuitParamsTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, view_id, node_id, slot, value):
+    def _emit(batch, schema, weight, view_id, node_id, slot, value):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_param_pk(view_id, node_id, slot), r_int64(1))
+        rb.begin(pack_param_pk(view_id, node_id, slot), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(value)))
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, view_id, node_id, slot, value):
+        CircuitParamsTab._emit(batch, schema, r_int64(1), view_id, node_id, slot, value)
+
+    @staticmethod
     def retract(batch, schema, view_id, node_id, slot, value):
-        rb = RowBuilder(schema, batch)
-        rb.begin(pack_param_pk(view_id, node_id, slot), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(value)))
-        rb.commit()
+        CircuitParamsTab._emit(batch, schema, r_int64(-1), view_id, node_id, slot, value)
 
 
 class CircuitGroupColsTab(BaseTab):
@@ -502,18 +489,19 @@ class CircuitGroupColsTab(BaseTab):
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def append(batch, schema, view_id, node_id, col_idx):
+    def _emit(batch, schema, weight, view_id, node_id, col_idx):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_gcol_pk(view_id, node_id, col_idx), r_int64(1))
+        rb.begin(pack_gcol_pk(view_id, node_id, col_idx), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(col_idx)))
         rb.commit()
 
     @staticmethod
+    def append(batch, schema, view_id, node_id, col_idx):
+        CircuitGroupColsTab._emit(batch, schema, r_int64(1), view_id, node_id, col_idx)
+
+    @staticmethod
     def retract(batch, schema, view_id, node_id, col_idx):
-        rb = RowBuilder(schema, batch)
-        rb.begin(pack_gcol_pk(view_id, node_id, col_idx), r_int64(-1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(col_idx)))
-        rb.commit()
+        CircuitGroupColsTab._emit(batch, schema, r_int64(-1), view_id, node_id, col_idx)
 
 
 def type_code_to_field_type(code):

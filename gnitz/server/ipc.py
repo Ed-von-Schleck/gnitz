@@ -41,11 +41,6 @@ OFF_PK_INDEX = 56
 STATUS_OK = 0
 STATUS_ERROR = 1
 
-# --- Yield Reason Codes ---
-YIELD_REASON_NONE        = 0
-YIELD_REASON_BUFFER_FULL = 1
-YIELD_REASON_ROW_LIMIT   = 2
-YIELD_REASON_USER        = 3
 
 
 def align_up(val, align):

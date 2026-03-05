@@ -167,8 +167,5 @@ class ManifestWriter(object):
     def add_entry_obj(self, entry):
         self.entries.append(entry)
 
-    def add_entry_values(self, tid, fn, min_k, max_k, min_l, max_l):
-        self.add_entry(tid, fn, min_k, max_k, min_l, max_l)
-
     def finalize(self):
         ManifestManager(self.filename).publish_new_version(self.entries, self.global_max_lsn)
