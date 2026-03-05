@@ -14,7 +14,7 @@ from rpython.rlib.rarithmetic import (
 )
 from rpython.rlib.objectmodel import newlist_hint
 
-from gnitz.core import types, values, batch, xxh, errors
+from gnitz.core import types, batch, xxh, errors
 from gnitz.core import strings as string_logic
 from gnitz.storage import (
     buffer,
@@ -33,8 +33,7 @@ from gnitz.storage import (
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.storage.table import PersistentTable
-from gnitz.core import comparator as core_comparator
-from gnitz.core.batch import ColumnarBatchAccessor
+from gnitz.core.batch import ColumnarBatchAccessor, RowBuilder
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -196,9 +195,10 @@ def test_wal_storage(base_dir):
     writer = wal.WALWriter(wal_path, schema)
 
     b1 = batch.ZSetBatch(schema)
-    r1 = values.make_payload_row(schema)
-    r1.append_string("block1")
-    b1.append(r_uint128(10), r_int64(1), r1)
+    rb = RowBuilder(schema, b1)
+    rb.begin(r_uint128(10), r_int64(1))
+    rb.put_string("block1")
+    rb.commit()
 
     writer.append_batch(r_uint64(1), 1, b1)
     writer.close()
@@ -212,14 +212,14 @@ def test_wal_storage(base_dir):
     assert_equal_i(1, len(blocks), "WALReader didn't read exactly 1 block")
     assert_equal_u64(r_uint64(1), blocks[0].lsn, "WAL LSN mismatch")
 
-    rb = blocks[0].batch
-    assert_equal_i(1, rb.length(), "WAL batch length mismatch")
-    assert_equal_u128(r_uint128(10), rb.get_pk(0), "WAL PK mismatch")
-    assert_equal_i64(r_int64(1), rb.get_weight(0), "WAL weight mismatch")
+    read_batch = blocks[0].batch
+    assert_equal_i(1, read_batch.length(), "WAL batch length mismatch")
+    assert_equal_u128(r_uint128(10), read_batch.get_pk(0), "WAL PK mismatch")
+    assert_equal_i64(r_int64(1), read_batch.get_weight(0), "WAL weight mismatch")
 
     # Read string value via ColumnarBatchAccessor
     acc = ColumnarBatchAccessor(schema)
-    acc.bind(rb, 0)
+    acc.bind(read_batch, 0)
     length, prefix, struct_ptr, heap_ptr, py_str = acc.get_str_struct(1)
     recovered_str = string_logic.unpack_string(struct_ptr, heap_ptr)
     assert_equal_s("block1", recovered_str, "WAL string deserialization mismatch")
@@ -248,17 +248,18 @@ def test_wal_storage(base_dir):
     writer_blob = wal.WALWriter(wal_blob_path, schema)
 
     b_blob = batch.ZSetBatch(schema)
+    rb_blob = RowBuilder(schema, b_blob)
 
     # Long string forces Blob allocation inside WAL block body
     long_str = "A" * 50
-    rb1 = values.make_payload_row(schema)
-    rb1.append_string(long_str)
-    b_blob.append(r_uint128(1), r_int64(1), rb1)
+    rb_blob.begin(r_uint128(1), r_int64(1))
+    rb_blob.put_string(long_str)
+    rb_blob.commit()
 
     # Short string immediately follows
-    rb2 = values.make_payload_row(schema)
-    rb2.append_string("short")
-    b_blob.append(r_uint128(2), r_int64(1), rb2)
+    rb_blob.begin(r_uint128(2), r_int64(1))
+    rb_blob.put_string("short")
+    rb_blob.commit()
 
     writer_blob.append_batch(r_uint64(100), 1, b_blob)
     writer_blob.close()
@@ -268,16 +269,16 @@ def test_wal_storage(base_dir):
     block_b = r_blob.read_next_block()
     assert_true(block_b is not None, "Failed to read blob WAL block")
 
-    rb_blob = block_b.batch
-    assert_equal_i(2, rb_blob.length(), "Multi-record WAL decode failed")
+    rb_blob_batch = block_b.batch
+    assert_equal_i(2, rb_blob_batch.length(), "Multi-record WAL decode failed")
 
     acc_b = ColumnarBatchAccessor(schema)
-    acc_b.bind(rb_blob, 0)
+    acc_b.bind(rb_blob_batch, 0)
     _, _, sp1, hp1, _ = acc_b.get_str_struct(1)
     s1 = string_logic.unpack_string(sp1, hp1)
     assert_equal_s(long_str, s1, "WAL long string alignment mismatch")
 
-    acc_b.bind(rb_blob, 1)
+    acc_b.bind(rb_blob_batch, 1)
     _, _, sp2, hp2, _ = acc_b.get_str_struct(1)
     s2 = string_logic.unpack_string(sp2, hp2)
     assert_equal_s("short", s2, "WAL short string alignment mismatch")
@@ -296,10 +297,12 @@ def test_memtable(base_dir):
     mt = memtable.MemTable(schema_u128, 1024 * 1024)
     try:
         pk1 = r_uint128(1)
-        row = values.make_payload_row(schema_u128)
-        row.append_int(rffi.cast(rffi.LONGLONG, r_uint64(100)))
 
-        b_add = batch.make_singleton_batch(schema_u128, pk1, r_int64(1), row)
+        b_add = batch.ZSetBatch(schema_u128)
+        rb = RowBuilder(schema_u128, b_add)
+        rb.begin(pk1, r_int64(1))
+        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(100)))
+        rb.commit()
         mt.upsert_batch(b_add)
 
         assert_false(mt.is_empty(), "MemTable should not be empty after insert")
@@ -307,7 +310,11 @@ def test_memtable(base_dir):
             r_int64(1), mt.get_weight_for_pk(pk1), "Weight should be 1 after insert"
         )
 
-        b_sub = batch.make_singleton_batch(schema_u128, pk1, r_int64(-1), row)
+        b_sub = batch.ZSetBatch(schema_u128)
+        rb_sub = RowBuilder(schema_u128, b_sub)
+        rb_sub.begin(pk1, r_int64(-1))
+        rb_sub.put_int(rffi.cast(rffi.LONGLONG, r_uint64(100)))
+        rb_sub.commit()
         mt.upsert_batch(b_sub)
 
         assert_equal_i64(
@@ -328,17 +335,26 @@ def test_memtable(base_dir):
         dead_str = "ANNIHILATE" * 10
         live_str = "SURVIVE" * 10
 
-        r_dead = values.make_payload_row(schema_str)
-        r_dead.append_string(dead_str)
-        r_live = values.make_payload_row(schema_str)
-        r_live.append_string(live_str)
-
         pk1 = r_uint128(1)
         pk2 = r_uint128(2)
 
-        b_d1 = batch.make_singleton_batch(schema_str, pk1, r_int64(1), r_dead)
-        b_d2 = batch.make_singleton_batch(schema_str, pk1, r_int64(-1), r_dead)
-        b_l1 = batch.make_singleton_batch(schema_str, pk2, r_int64(1), r_live)
+        b_d1 = batch.ZSetBatch(schema_str)
+        rb_d1 = RowBuilder(schema_str, b_d1)
+        rb_d1.begin(pk1, r_int64(1))
+        rb_d1.put_string(dead_str)
+        rb_d1.commit()
+
+        b_d2 = batch.ZSetBatch(schema_str)
+        rb_d2 = RowBuilder(schema_str, b_d2)
+        rb_d2.begin(pk1, r_int64(-1))
+        rb_d2.put_string(dead_str)
+        rb_d2.commit()
+
+        b_l1 = batch.ZSetBatch(schema_str)
+        rb_l1 = RowBuilder(schema_str, b_l1)
+        rb_l1.begin(pk2, r_int64(1))
+        rb_l1.put_string(live_str)
+        rb_l1.commit()
 
         mt2.upsert_batch(b_d1)
         mt2.upsert_batch(b_d2)
@@ -364,11 +380,11 @@ def test_memtable(base_dir):
     mt3 = memtable.MemTable(schema_u128, 1024 * 1024)
     try:
         for pk_val in [30, 10, 20]:
-            row_c = values.make_payload_row(schema_u128)
-            row_c.append_int(rffi.cast(rffi.LONGLONG, r_int64(pk_val)))
-            b_c = batch.make_singleton_batch(
-                schema_u128, r_uint128(pk_val), r_int64(1), row_c
-            )
+            b_c = batch.ZSetBatch(schema_u128)
+            rb_c = RowBuilder(schema_u128, b_c)
+            rb_c.begin(r_uint128(pk_val), r_int64(1))
+            rb_c.put_int(rffi.cast(rffi.LONGLONG, r_int64(pk_val)))
+            rb_c.commit()
             mt3.upsert_batch(b_c)
             b_c.free()
 
@@ -397,11 +413,11 @@ def test_memtable(base_dir):
     raised = False
     try:
         for j in range(1000):
-            row_f = values.make_payload_row(schema_u128)
-            row_f.append_int(rffi.cast(rffi.LONGLONG, r_int64(j)))
-            b_f = batch.make_singleton_batch(
-                schema_u128, r_uint128(j), r_int64(1), row_f
-            )
+            b_f = batch.ZSetBatch(schema_u128)
+            rb_f = RowBuilder(schema_u128, b_f)
+            rb_f.begin(r_uint128(j), r_int64(1))
+            rb_f.put_int(rffi.cast(rffi.LONGLONG, r_int64(j)))
+            rb_f.commit()
             tiny_mt.upsert_batch(b_f)
             b_f.free()
     except errors.MemTableFullError:
@@ -420,13 +436,21 @@ def test_shards_and_columnar(base_dir):
     # 1. Write and Validate Checksums
     writer = writer_table.TableShardWriter(schema, 1)
 
-    r1 = values.make_payload_row(schema)
-    r1.append_string("test")
-    writer.add_row_from_values(r_uint128(10), r_int64(1), r1)
+    tmp1 = batch.ZSetBatch(schema)
+    rb1 = RowBuilder(schema, tmp1)
+    rb1.begin(r_uint128(10), r_int64(1))
+    rb1.put_string("test")
+    rb1.commit()
+    writer.add_row_from_accessor(r_uint128(10), r_int64(1), tmp1.get_accessor(0))
+    tmp1.free()
 
-    r2 = values.make_payload_row(schema)
-    r2.append_string("data_long_string_for_blob")
-    writer.add_row_from_values(r_uint128(20), r_int64(1), r2)
+    tmp2 = batch.ZSetBatch(schema)
+    rb2 = RowBuilder(schema, tmp2)
+    rb2.begin(r_uint128(20), r_int64(1))
+    rb2.put_string("data_long_string_for_blob")
+    rb2.commit()
+    writer.add_row_from_accessor(r_uint128(20), r_int64(1), tmp2.get_accessor(0))
+    tmp2.free()
 
     writer.finalize(fn)
 
@@ -544,9 +568,15 @@ def test_manifest_and_spine(base_dir):
     # 4. Index Resolution
     idx_db = os.path.join(base_dir, "shard_idx.db")
     w = writer_table.TableShardWriter(schema, table_id=1)
-    r1 = values.make_payload_row(schema)
-    r1.append_string("index")
-    w.add_row_from_values(r_uint128(10), r_int64(1), r1)
+
+    tmp = batch.ZSetBatch(schema)
+    rb_idx = RowBuilder(schema, tmp)
+    rb_idx.begin(r_uint128(10), r_int64(1))
+    rb_idx.put_string("index")
+    rb_idx.commit()
+    w.add_row_from_accessor(r_uint128(10), r_int64(1), tmp.get_accessor(0))
+    tmp.free()
+
     w.finalize(idx_db)
 
     mgr.publish_new_version(
@@ -575,15 +605,13 @@ def make_compaction_schema():
 
 def ingest_test_row(tbl, pk_val, weight, name_str, int_val):
     schema = tbl.get_schema()
-    row = values.make_payload_row(schema)
-    row.append_string(name_str)
-    row.append_int(r_int64(int_val))
+    b = batch.ZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    rb.begin(r_uint128(pk_val), r_int64(weight))
+    rb.put_string(name_str)
+    rb.put_int(r_int64(int_val))
+    rb.commit()
 
-    # PersistentTable.ingest_batch expects an ArenaZSetBatch.
-    # For testing simplicity, we use the singleton helper.
-    from gnitz.core import batch
-
-    b = batch.make_singleton_batch(schema, r_uint128(pk_val), r_int64(weight), row)
     tbl.ingest_batch(b)
     # Flush immediately to create a physical shard
     tbl.flush()
@@ -686,18 +714,28 @@ def test_ephemeral_and_persistent_tables(base_dir):
     eph_dir = os.path.join(base_dir, "eph")
     t_eph = EphemeralTable(eph_dir, "trace1", schema)
 
-    row1 = values.make_payload_row(schema)
-    row1.append_string("sum_test")
-
     pk1 = r_uint128(1)
-    b_add = batch.make_singleton_batch(schema, pk1, r_int64(5), row1)
+
+    b_add = batch.ZSetBatch(schema)
+    rb_add = RowBuilder(schema, b_add)
+    rb_add.begin(pk1, r_int64(5))
+    rb_add.put_string("sum_test")
+    rb_add.commit()
     t_eph.ingest_batch(b_add)
 
-    b_sub = batch.make_singleton_batch(schema, pk1, r_int64(-3), row1)
+    b_sub = batch.ZSetBatch(schema)
+    rb_sub = RowBuilder(schema, b_sub)
+    rb_sub.begin(pk1, r_int64(-3))
+    rb_sub.put_string("sum_test")
+    rb_sub.commit()
     t_eph.ingest_batch(b_sub)
 
-    acc1 = core_comparator.PayloadRowAccessor(schema)
-    acc1.set_row(row1)
+    tmp_acc = batch.ZSetBatch(schema)
+    rb_acc = RowBuilder(schema, tmp_acc)
+    rb_acc.begin(pk1, r_int64(1))
+    rb_acc.put_string("sum_test")
+    rb_acc.commit()
+    acc1 = tmp_acc.get_accessor(0)
 
     net_w = t_eph.get_weight(pk1, acc1)
     assert_equal_i64(r_int64(2), net_w, "Ephemeral algebraic summation failed")
@@ -723,9 +761,11 @@ def test_ephemeral_and_persistent_tables(base_dir):
 
     # 4. Unified Cursor
     r_k2 = r_uint128(2)
-    row2 = values.make_payload_row(schema)
-    row2.append_string("mem_only")
-    b2 = batch.make_singleton_batch(schema, r_k2, r_int64(1), row2)
+    b2 = batch.ZSetBatch(schema)
+    rb2 = RowBuilder(schema, b2)
+    rb2.begin(r_k2, r_int64(1))
+    rb2.put_string("mem_only")
+    rb2.commit()
     t_eph.ingest_batch(b2)
 
     uc = t_eph.create_cursor()
@@ -737,6 +777,7 @@ def test_ephemeral_and_persistent_tables(base_dir):
     assert_false(uc.is_valid(), "UnifiedCursor should be exhausted")
     uc.close()
 
+    tmp_acc.free()
     t_eph.close()
     b_add.free()
     b_sub.free()
@@ -756,11 +797,13 @@ def test_u128_payloads(base_dir):
     uuid_lo = r_uint64(0xCAFEBABEDEADBEEF)
     uuid_hi = r_uint64(0x0123456789ABCDEF)
 
-    row_a = values.make_payload_row(schema)
-    row_a.append_u128(uuid_lo, uuid_hi)
-    row_a.append_string("a")
+    b = batch.ZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    rb.begin(pk1, r_int64(1))
+    rb.put_u128(uuid_lo, uuid_hi)
+    rb.put_string("a")
+    rb.commit()
 
-    b = batch.make_singleton_batch(schema, pk1, r_int64(1), row_a)
     t_u128.ingest_batch(b)
     t_u128.flush()
 
@@ -886,9 +929,11 @@ def test_filter_integration(base_dir):
     mt = memtable.MemTable(schema, 1024 * 1024)
     try:
         for i in range(1, 51):
-            row = values.make_payload_row(schema)
-            row.append_string("v%d" % i)
-            b = batch.make_singleton_batch(schema, r_uint128(i), r_int64(1), row)
+            b = batch.ZSetBatch(schema)
+            rb = RowBuilder(schema, b)
+            rb.begin(r_uint128(i), r_int64(1))
+            rb.put_string("v%d" % i)
+            rb.commit()
             mt.upsert_batch(b)
             b.free()
 
@@ -910,9 +955,13 @@ def test_filter_integration(base_dir):
     shard_path = os.path.join(base_dir, "xor8_shard.db")
     sw = writer_table.TableShardWriter(schema, table_id=1)
     for i in range(1, 51):
-        row = values.make_payload_row(schema)
-        row.append_string("shard_v%d" % i)
-        sw.add_row_from_values(r_uint128(i), r_int64(1), row)
+        tmp = batch.ZSetBatch(schema)
+        rb_s = RowBuilder(schema, tmp)
+        rb_s.begin(r_uint128(i), r_int64(1))
+        rb_s.put_string("shard_v%d" % i)
+        rb_s.commit()
+        sw.add_row_from_accessor(r_uint128(i), r_int64(1), tmp.get_accessor(0))
+        tmp.free()
     sw.finalize(shard_path)
 
     xor8_path = shard_path + ".xor8"
@@ -933,9 +982,11 @@ def test_filter_integration(base_dir):
     # 3. EphemeralTable with Bloom
     eph_dir = os.path.join(base_dir, "filter_eph")
     t_eph = EphemeralTable(eph_dir, "filter_test", schema)
-    row = values.make_payload_row(schema)
-    row.append_string("test_val")
-    b = batch.make_singleton_batch(schema, r_uint128(42), r_int64(1), row)
+    b = batch.ZSetBatch(schema)
+    rb_e = RowBuilder(schema, b)
+    rb_e.begin(r_uint128(42), r_int64(1))
+    rb_e.put_string("test_val")
+    rb_e.commit()
     t_eph.ingest_batch(b)
     b.free()
 

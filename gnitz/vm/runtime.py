@@ -25,7 +25,7 @@ class VMSchema(object):
     Promoted to constants during JIT tracing to fold address arithmetic.
     """
     _immutable_fields_ = [
-        'table_schema', 'stride', 'column_offsets[*]',
+        'table_schema', 'stride',
         'column_types[*]', 'pk_index', 'pk_type'
     ]
 
@@ -36,17 +36,10 @@ class VMSchema(object):
         self.pk_type = table_schema.get_pk_column().field_type.code
 
         num_cols = len(table_schema.columns)
-        self.column_offsets = [0] * num_cols
         self.column_types = [0] * num_cols
 
         for i in range(num_cols):
-            self.column_offsets[i] = table_schema.get_column_offset(i)
             self.column_types[i] = table_schema.columns[i].field_type.code
-
-    @jit.elidable
-    def get_offset(self, col_idx):
-        assert col_idx >= 0 and col_idx < len(self.column_offsets)
-        return self.column_offsets[col_idx]
 
     @jit.elidable
     def get_type(self, col_idx):

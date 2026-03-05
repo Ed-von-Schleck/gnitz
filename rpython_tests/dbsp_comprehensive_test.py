@@ -14,7 +14,8 @@ from rpython.rlib.rarithmetic import (
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.longlong2float import float2longlong
 
-from gnitz.core import types, values, batch, comparator
+from gnitz.core import types, batch
+from gnitz.core.batch import RowBuilder
 from gnitz.dbsp.ops import linear, join, reduce, distinct, source
 from gnitz.dbsp import functions
 from gnitz.storage.ephemeral_table import EphemeralTable
@@ -90,15 +91,16 @@ def test_linear_ops(base_dir):
 
     try:
         # 1. Null handling in Filter/Map
-        r1 = values.make_payload_row(schema)
-        r1.append_null(0)  # val_int is null
-        r1.append_float(1.5)
-        b_in.append(r_uint128(1), r_int64(1), r1)
+        rb = RowBuilder(schema, b_in)
+        rb.begin(r_uint128(1), r_int64(1))
+        rb.put_null()  # val_int is null
+        rb.put_float(1.5)
+        rb.commit()
 
-        r2 = values.make_payload_row(schema)
-        r2.append_int(r_int64(20))
-        r2.append_float(15.5)
-        b_in.append(r_uint128(2), r_int64(2), r2)
+        rb.begin(r_uint128(2), r_int64(2))
+        rb.put_int(r_int64(20))
+        rb.put_float(15.5)
+        rb.commit()
 
         log("  - Filter + Nulls...")
         # Predicate: val_float > 10.0
@@ -172,26 +174,28 @@ def test_join_ops(base_dir):
 
     try:
         # Left: 2 DISTINCT rows for PK 10
-        rl1 = values.make_payload_row(schema_l)
-        rl1.append_int(r_int64(1))
-        b_l.append(r_uint128(10), r_int64(1), rl1)
+        rb_l = RowBuilder(schema_l, b_l)
+        rb_l.begin(r_uint128(10), r_int64(1))
+        rb_l.put_int(r_int64(1))
+        rb_l.commit()
 
-        rl2 = values.make_payload_row(schema_l)
-        rl2.append_int(r_int64(2))
-        b_l.append(r_uint128(10), r_int64(1), rl2)
+        rb_l.begin(r_uint128(10), r_int64(1))
+        rb_l.put_int(r_int64(2))
+        rb_l.commit()
 
         # Right: 3 DISTINCT rows for PK 10
-        rr1 = values.make_payload_row(schema_r)
-        rr1.append_string("match1")
-        b_r.append(r_uint128(10), r_int64(1), rr1)
+        rb_r = RowBuilder(schema_r, b_r)
+        rb_r.begin(r_uint128(10), r_int64(1))
+        rb_r.put_string("match1")
+        rb_r.commit()
 
-        rr2 = values.make_payload_row(schema_r)
-        rr2.append_string("match2")
-        b_r.append(r_uint128(10), r_int64(1), rr2)
+        rb_r.begin(r_uint128(10), r_int64(1))
+        rb_r.put_string("match2")
+        rb_r.commit()
 
-        rr3 = values.make_payload_row(schema_r)
-        rr3.append_string("match3")
-        b_r.append(r_uint128(10), r_int64(1), rr3)
+        rb_r.begin(r_uint128(10), r_int64(1))
+        rb_r.put_string("match3")
+        rb_r.commit()
 
         log("  - Delta-Delta Sort-Merge (M:N)...")
         join.op_join_delta_delta(b_l, b_r, b_out, schema_l, schema_r)
@@ -238,24 +242,33 @@ def test_distinct_op(base_dir):
     b_out = batch.ArenaZSetBatch(schema)
 
     try:
-        r = values.make_payload_row(schema)
-        r.append_int(r_int64(1))
+        rb = RowBuilder(schema, b_in)
+
         # Tick 1: Weight 10 -> Should output Weight 1
-        b_in.append(r_uint128(1), r_int64(10), r)
+        rb.begin(r_uint128(1), r_int64(10))
+        rb.put_int(r_int64(1))
+        rb.commit()
+
         distinct.op_distinct(b_in, trace, b_out)
         assert_equal_i64(r_int64(1), b_out.get_weight(0), "Distinct failed to clamp")
 
         # Tick 2: Weight -5 -> Should output Weight 0 (Total 5 is still > 0)
         b_in.clear()
         b_out.clear()
-        b_in.append(r_uint128(1), r_int64(-5), r)
+        rb.begin(r_uint128(1), r_int64(-5))
+        rb.put_int(r_int64(1))
+        rb.commit()
+
         distinct.op_distinct(b_in, trace, b_out)
         assert_equal_i(0, b_out.length(), "Distinct produced unnecessary update")
 
         # Tick 3: Weight -5 -> Should output Weight -1 (Total 0)
         b_in.clear()
         b_out.clear()
-        b_in.append(r_uint128(1), r_int64(-5), r)
+        rb.begin(r_uint128(1), r_int64(-5))
+        rb.put_int(r_int64(1))
+        rb.commit()
+
         distinct.op_distinct(b_in, trace, b_out)
         assert_equal_i64(r_int64(-1), b_out.get_weight(0), "Distinct failed to retract")
 
@@ -287,17 +300,20 @@ def test_reduce_op(base_dir):
 
     try:
         log("  - Linear Sum...")
-        r = values.make_payload_row(in_schema)
-        r.append_int(r_int64(10))  # grp 10
-        r.append_int(r_int64(5))  # val 5
-        b_in.append(r_uint128(1), r_int64(1), r)
+        rb = RowBuilder(in_schema, b_in)
+        rb.begin(r_uint128(1), r_int64(1))
+        rb.put_int(r_int64(10))  # grp 10
+        rb.put_int(r_int64(5))  # val 5
+        rb.commit()
 
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
         reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], sum_agg, out_schema)
         assert_equal_i64(r_int64(1), b_out.get_weight(0), "Reduce insertion failed")
-        assert_equal_i64(r_int64(5), b_out.get_row(0).get_int_signed(0), "Sum error")
+        assert_equal_i64(
+            r_int64(5), b_out.get_accessor(0).get_int_signed(1), "Sum error"
+        )
 
         trace_in.ingest_batch(b_in)
         trace_out.ingest_batch(b_out)
@@ -305,7 +321,10 @@ def test_reduce_op(base_dir):
         log("  - Retraction & Shortcut...")
         b_in.clear()
         b_out.clear()
-        b_in.append(r_uint128(2), r_int64(1), r)  # Same group, new record
+        rb.begin(r_uint128(2), r_int64(1))
+        rb.put_int(r_int64(10))  # grp 10
+        rb.put_int(r_int64(5))  # val 5
+        rb.commit()
 
         c_in.close()
         c_out.close()
@@ -321,10 +340,10 @@ def test_reduce_op(base_dir):
         max_agg = functions.UniversalAccumulator(1, functions.AGG_MAX, types.TYPE_I64)
         b_in.clear()
         b_out.clear()
-        r_large = values.make_payload_row(in_schema)
-        r_large.append_int(r_int64(10))
-        r_large.append_int(r_int64(100))
-        b_in.append(r_uint128(3), r_int64(1), r_large)
+        rb.begin(r_uint128(3), r_int64(1))
+        rb.put_int(r_int64(10))  # grp 10
+        rb.put_int(r_int64(100))  # val 100
+        rb.commit()
 
         reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], max_agg, out_schema)
         # Search for weight +1 (the insertion)
@@ -332,7 +351,9 @@ def test_reduce_op(base_dir):
         for i in range(b_out.length()):
             if b_out.get_weight(i) == r_int64(1):
                 assert_equal_i64(
-                    r_int64(100), b_out.get_row(i).get_int_signed(0), "Max error"
+                    r_int64(100),
+                    b_out.get_accessor(i).get_int_signed(1),
+                    "Max error",
                 )
                 found_max = True
         assert_true(found_max, "Max insertion not found")
@@ -357,8 +378,10 @@ def test_source_ops(base_dir):
     table = EphemeralTable(table_path, "src", schema)
 
     b_in = batch.ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b_in)
     for i in range(10):
-        b_in.append(r_uint128(i), r_int64(1), values.make_payload_row(schema))
+        rb.begin(r_uint128(i), r_int64(1))
+        rb.commit()
     table.ingest_batch(b_in)
 
     b_out = batch.ArenaZSetBatch(schema)

@@ -13,10 +13,8 @@ from gnitz.storage.buffer import align_64
 from gnitz.core import (
     types,
     strings as string_logic,
-    values as db_values,
     xxh as checksum,
 )
-from gnitz.core import comparator as core_comparator
 
 NULL_CHARP = lltype.nullptr(rffi.CCHARP.TO)
 
@@ -46,7 +44,7 @@ class ShardWriterBlobAllocator(string_logic.BlobAllocator):
 class TableShardWriter(object):
     """
     Handles the creation of N-Partition columnar shards.
-    Uses Unified Accessor API to read from MemTable nodes (Raw) or PayloadRows.
+    Uses Unified Accessor API to read from MemTable nodes or batch accessors.
     """
 
     _immutable_fields_ = ["schema", "table_id"]
@@ -80,7 +78,6 @@ class TableShardWriter(object):
         # scratch_val_buf is used for non-string fixed-width types (≤ 8 bytes)
         self.scratch_val_buf = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
         self.blob_allocator = ShardWriterBlobAllocator(self)
-        self.val_accessor = core_comparator.PayloadRowAccessor(schema)
 
     def _get_or_append_blob(self, src_ptr, length):
         """
@@ -215,24 +212,6 @@ class TableShardWriter(object):
             self.pk_buf.put_u64(r_uint64(key))
         self.w_buf.put_i64(weight)
         self._append_from_accessor(accessor)
-
-    def add_row_from_values(self, pk, weight, row):
-        """
-        Ingests data from a PayloadRow.
-        Used by the test suite and high-level ingestion API.
-        """
-        if weight == 0:
-            return
-        self.count += 1
-
-        if self.schema.get_pk_column().field_type.size == 16:
-            self.pk_buf.put_u128(r_uint128(pk))
-        else:
-            self.pk_buf.put_u64(r_uint64(pk))
-        self.w_buf.put_i64(weight)
-
-        self.val_accessor.set_row(row)
-        self._append_from_accessor(self.val_accessor)
 
     def close(self):
         self.pk_buf.free()

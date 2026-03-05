@@ -28,55 +28,6 @@ class RowAccessor(object):
         return False
 
 
-class PayloadRowAccessor(RowAccessor):
-    _immutable_fields_ = ["schema", "_row"]
-
-    def __init__(self, schema):
-        self.schema = schema
-        self._row = None
-        self.pk_index = schema.pk_index
-
-    def set_row(self, row):
-        self._row = row
-
-    def _payload_idx(self, col_idx):
-        if col_idx < self.pk_index:
-            return col_idx
-        return col_idx - 1
-
-    def is_null(self, col_idx):
-        if self._row is None:
-            return True
-        return self._row.is_null(self._payload_idx(col_idx))
-
-    def get_int(self, col_idx):
-        return self._row.get_int(self._payload_idx(col_idx))
-
-    def get_int_signed(self, col_idx):
-        return self._row.get_int_signed(self._payload_idx(col_idx))
-
-    def get_float(self, col_idx):
-        return self._row.get_float(self._payload_idx(col_idx))
-
-    def get_u128(self, col_idx):
-        return self._row.get_u128(self._payload_idx(col_idx))
-
-    def get_str_struct(self, col_idx):
-        s = self._row.get_str(self._payload_idx(col_idx))
-        # compute_prefix returns LONGLONG, so the tuple is consistent
-        prefix = string_logic.compute_prefix(s)
-        return (
-            len(s),
-            prefix,
-            lltype.nullptr(rffi.CCHARP.TO),
-            lltype.nullptr(rffi.CCHARP.TO),
-            s,
-        )
-
-    def get_col_ptr(self, col_idx):
-        return lltype.nullptr(rffi.CCHARP.TO)
-
-
 @jit.unroll_safe
 def compare_rows(schema, acc1, acc2):
     num_cols = len(schema.columns)

@@ -9,7 +9,9 @@ from rpython.rlib.rarithmetic import (
     r_ulonglonglong as r_uint128,
 )
 
-from gnitz.core import types, values, batch, errors
+from gnitz.core import types, batch, errors
+from gnitz.core import strings as string_logic
+from gnitz.core.batch import RowBuilder
 from gnitz.storage import buffer, mmap_posix
 from gnitz.server import ipc, ipc_ffi
 
@@ -52,7 +54,10 @@ def assert_true(condition, msg):
 
 def assert_equal_i(expected, actual, msg):
     if expected != actual:
-        os.write(2, "FAIL: " + msg + " (Expected %d, got %d)\n" % (expected, actual))
+        os.write(
+            2,
+            "FAIL: " + msg + " (Expected %d, got %d)\n" % (expected, actual),
+        )
         raise Exception("Value Mismatch")
 
 
@@ -97,11 +102,14 @@ def test_unowned_buffer_lifecycle():
 
         buf.free()
         assert_true(
-            buf.base_ptr == lltype.nullptr(rffi.CCHARP.TO), "Base ptr not neutralized"
+            buf.base_ptr == lltype.nullptr(rffi.CCHARP.TO),
+            "Base ptr not neutralized",
         )
 
         raw_mem[0] = "A"
-        assert_true(raw_mem[0] == "A", "Underlying memory corrupted after buffer free")
+        assert_true(
+            raw_mem[0] == "A", "Underlying memory corrupted after buffer free"
+        )
 
     finally:
         lltype.free(raw_mem, flavor="raw")
@@ -123,7 +131,11 @@ def test_ipc_fd_hardening():
         received_fd = ipc_ffi.recv_fd(s2.fd)
         assert_true(received_fd >= 0, "Failed to receive FD")
 
-        assert_equal_i(1024, mmap_posix.fget_size(received_fd), "FD content mismatch")
+        assert_equal_i(
+            1024,
+            mmap_posix.fget_size(received_fd),
+            "FD content mismatch",
+        )
 
         os.close(fd_to_send)
         os.close(received_fd)
@@ -144,15 +156,29 @@ def test_ipc_bounds_and_forgery():
         total_sz = 1024
         mmap_posix.ftruncate_c(fd, total_sz)
         ptr = mmap_posix.mmap_file(
-            fd, total_sz, prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE
+            fd,
+            total_sz,
+            prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
         )
 
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_MAGIC))[0] = ipc.MAGIC_IPC
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_TARGET_ID))[0] = r_uint64(42)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_COUNT))[0] = r_uint64(99999)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_BLOB_SZ))[0] = r_uint64(0)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_NUM_COLS))[0] = r_uint64(2)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_PK_INDEX))[0] = r_uint64(0)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_MAGIC))[
+            0
+        ] = ipc.MAGIC_IPC
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_TARGET_ID))[
+            0
+        ] = r_uint64(42)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_COUNT))[
+            0
+        ] = r_uint64(99999)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_BLOB_SZ))[
+            0
+        ] = r_uint64(0)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_NUM_COLS))[
+            0
+        ] = r_uint64(2)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_PK_INDEX))[
+            0
+        ] = r_uint64(0)
 
         s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
         try:
@@ -163,7 +189,9 @@ def test_ipc_bounds_and_forgery():
                 ipc.receive_payload(s2.fd, registry)
             except errors.StorageError:
                 raised = True
-            assert_true(raised, "IPC layer failed to detect column buffer overflow")
+            assert_true(
+                raised, "IPC layer failed to detect column buffer overflow"
+            )
         finally:
             s1.close()
             s2.close()
@@ -182,16 +210,19 @@ def test_zero_copy_roundtrip():
 
     try:
         zbatch = batch.ArenaZSetBatch(schema, initial_capacity=10)
-        row = values.make_payload_row(schema)
-        row.append_string("Hello Zero-Copy World")
-        zbatch.append(r_uint128(42), r_int64(1), row)
+        rb = RowBuilder(schema, zbatch)
+        rb.begin(r_uint128(42), r_int64(1))
+        rb.put_string("Hello Zero-Copy World")
+        rb.commit()
 
         ipc.send_batch(s1.fd, 42, zbatch, status=0, error_msg="Success")
 
         payload = ipc.receive_payload(s2.fd, registry)
 
         assert_equal_i(0, payload.status, "Status mismatch")
-        assert_true(payload.error_msg == "Success", "Error msg mismatch")
+        assert_true(
+            payload.error_msg == "Success", "Error msg mismatch"
+        )
 
         rec_batch = payload.batch
         assert_true(rec_batch is not None, "Batch should not be None")
@@ -207,9 +238,10 @@ def test_zero_copy_roundtrip():
             "Accessor should point to raw memory, not Python str",
         )
 
-        row_recovered = rec_batch.get_row(0)
+        length, prefix, sptr, hptr, py_s = acc.get_str_struct(1)
+        s = py_s if py_s is not None else string_logic.unpack_string(sptr, hptr)
         assert_true(
-            row_recovered.get_str(0) == "Hello Zero-Copy World",
+            s == "Hello Zero-Copy World",
             "String corruption in transport",
         )
 
@@ -233,8 +265,12 @@ def test_executor_error_path():
 
         payload = ipc.receive_payload(s2.fd, registry)
         assert_equal_i(1, payload.status, "Error status mismatch")
-        assert_true(payload.error_msg == "Fatal VM Crash", "Error string mismatch")
-        assert_true(payload.batch is None, "Error payload should have no batch")
+        assert_true(
+            payload.error_msg == "Fatal VM Crash", "Error string mismatch"
+        )
+        assert_true(
+            payload.batch is None, "Error payload should have no batch"
+        )
 
         payload.close()
     finally:

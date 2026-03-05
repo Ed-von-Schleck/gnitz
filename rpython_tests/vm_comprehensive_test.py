@@ -6,7 +6,8 @@ import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rtyper.lltypesystem import rffi
 
-from gnitz.core import types, values, batch
+from gnitz.core import types, batch
+from gnitz.core.batch import RowBuilder
 from gnitz.dbsp import functions
 from gnitz.vm import runtime, instructions, interpreter
 from gnitz.storage.ephemeral_table import EphemeralTable
@@ -52,6 +53,7 @@ def cleanup_dir(path):
         else:
             os.unlink(p)
     os.rmdir(path)
+
 
 # ------------------------------------------------------------------------------
 # Plan Builder Helper
@@ -113,20 +115,22 @@ def test_filter_map_negate():
 
     # Input: 3 rows. pk=1 val=5 (below threshold), pk=2 val=20, pk=3 val=42
     in_batch = batch.ZSetBatch(in_schema)
-    r1 = values.make_payload_row(in_schema)
-    r1.append_int(r_int64(5))
-    r1.append_string("low")
-    in_batch.append(r_uint128(1), r_int64(1), r1)
+    rb = RowBuilder(in_schema, in_batch)
 
-    r2 = values.make_payload_row(in_schema)
-    r2.append_int(r_int64(20))
-    r2.append_string("mid")
-    in_batch.append(r_uint128(2), r_int64(1), r2)
+    rb.begin(r_uint128(1), r_int64(1))
+    rb.put_int(r_int64(5))
+    rb.put_string("low")
+    rb.commit()
 
-    r3 = values.make_payload_row(in_schema)
-    r3.append_int(r_int64(42))
-    r3.append_string("high")
-    in_batch.append(r_uint128(3), r_int64(1), r3)
+    rb.begin(r_uint128(2), r_int64(1))
+    rb.put_int(r_int64(20))
+    rb.put_string("mid")
+    rb.commit()
+
+    rb.begin(r_uint128(3), r_int64(1))
+    rb.put_int(r_int64(42))
+    rb.put_string("high")
+    rb.commit()
 
     result = plan.execute_epoch(in_batch)
 
@@ -177,16 +181,18 @@ def test_union():
 
     # Batch A: pk=1 val=10
     batch_a = batch.ZSetBatch(schema)
-    ra = values.make_payload_row(schema)
-    ra.append_int(r_int64(10))
-    batch_a.append(r_uint128(1), r_int64(1), ra)
+    rb_a = RowBuilder(schema, batch_a)
+    rb_a.begin(r_uint128(1), r_int64(1))
+    rb_a.put_int(r_int64(10))
+    rb_a.commit()
 
     # Pre-load R1 with batch B data before execute_epoch
     # We need to manually put data in R1 since execute_epoch only binds R0
     batch_b_data = batch.ZSetBatch(schema)
-    rb = values.make_payload_row(schema)
-    rb.append_int(r_int64(20))
-    batch_b_data.append(r_uint128(2), r_int64(1), rb)
+    rb_b = RowBuilder(schema, batch_b_data)
+    rb_b.begin(r_uint128(2), r_int64(1))
+    rb_b.put_int(r_int64(20))
+    rb_b.commit()
 
     # Manually load R1 with batch B before execution
     # We'll use bind to set R1's batch
@@ -246,13 +252,15 @@ def test_join_delta_trace(base_dir):
     trace_table = EphemeralTable(trace_dir, "trace_r", schema_r)
 
     batch_r = batch.ZSetBatch(schema_r)
-    rr = values.make_payload_row(schema_r)
-    rr.append_int(r_int64(50000))
-    batch_r.append(r_uint128(99), r_int64(2), rr)
+    rb_r = RowBuilder(schema_r, batch_r)
 
-    rr2 = values.make_payload_row(schema_r)
-    rr2.append_int(r_int64(30000))
-    batch_r.append(r_uint128(100), r_int64(1), rr2)
+    rb_r.begin(r_uint128(99), r_int64(2))
+    rb_r.put_int(r_int64(50000))
+    rb_r.commit()
+
+    rb_r.begin(r_uint128(100), r_int64(1))
+    rb_r.put_int(r_int64(30000))
+    rb_r.commit()
 
     trace_table.ingest_batch(batch_r)
     batch_r.free()
@@ -275,13 +283,15 @@ def test_join_delta_trace(base_dir):
 
     # Delta: pk=99 dept=7 w=3 (matches right pk=99), pk=101 dept=9 w=1 (no match)
     in_batch = batch.ZSetBatch(schema_l)
-    rl = values.make_payload_row(schema_l)
-    rl.append_int(r_int64(7))
-    in_batch.append(r_uint128(99), r_int64(3), rl)
+    rb_l = RowBuilder(schema_l, in_batch)
 
-    rl2 = values.make_payload_row(schema_l)
-    rl2.append_int(r_int64(9))
-    in_batch.append(r_uint128(101), r_int64(1), rl2)
+    rb_l.begin(r_uint128(99), r_int64(3))
+    rb_l.put_int(r_int64(7))
+    rb_l.commit()
+
+    rb_l.begin(r_uint128(101), r_int64(1))
+    rb_l.put_int(r_int64(9))
+    rb_l.commit()
 
     result = plan.execute_epoch(in_batch)
 
@@ -292,9 +302,10 @@ def test_join_delta_trace(base_dir):
     assert_equal_i64(r_int64(6), result.get_weight(0), "Join weight = 3*2 = 6")
 
     # Check merged payload: dept=7, budget=50000
-    out_row = result.get_row(0)
-    assert_equal_i64(r_int64(7), out_row.get_int_signed(0), "Left dept mismatch")
-    assert_equal_i64(r_int64(50000), out_row.get_int_signed(1), "Right budget mismatch")
+    # get_accessor uses schema col indices; pk is col 0, so dept=1, budget=2
+    acc = result.get_accessor(0)
+    assert_equal_i64(r_int64(7), acc.get_int_signed(1), "Left dept mismatch")
+    assert_equal_i64(r_int64(50000), acc.get_int_signed(2), "Right budget mismatch")
 
     result.free()
     in_batch.free()
@@ -341,9 +352,10 @@ def test_distinct_multi_tick(base_dir):
 
     # Tick 1: insert pk=1 w=3 => distinct output should be w=+1 (appeared)
     in_batch1 = batch.ZSetBatch(schema)
-    row1 = values.make_payload_row(schema)
-    row1.append_int(r_int64(42))
-    in_batch1.append(r_uint128(1), r_int64(3), row1)
+    rb1 = RowBuilder(schema, in_batch1)
+    rb1.begin(r_uint128(1), r_int64(3))
+    rb1.put_int(r_int64(42))
+    rb1.commit()
 
     result1 = plan.execute_epoch(in_batch1)
     assert_true(result1 is not None, "Tick 1: distinct should emit output")
@@ -355,9 +367,10 @@ def test_distinct_multi_tick(base_dir):
 
     # Tick 2: retract pk=1 w=-3 => net becomes 0 => distinct output w=-1 (disappeared)
     in_batch2 = batch.ZSetBatch(schema)
-    row2 = values.make_payload_row(schema)
-    row2.append_int(r_int64(42))
-    in_batch2.append(r_uint128(1), r_int64(-3), row2)
+    rb2 = RowBuilder(schema, in_batch2)
+    rb2.begin(r_uint128(1), r_int64(-3))
+    rb2.put_int(r_int64(42))
+    rb2.commit()
 
     result2 = plan.execute_epoch(in_batch2)
     assert_true(result2 is not None, "Tick 2: distinct should emit output")
@@ -429,21 +442,22 @@ def test_reduce_sum(base_dir):
 
     # Tick 1: group=10 amount=100, group=10 amount=50, group=20 amount=200
     in_batch1 = batch.ZSetBatch(in_schema)
+    rb1 = RowBuilder(in_schema, in_batch1)
 
-    row_a = values.make_payload_row(in_schema)
-    row_a.append_int(rffi.cast(rffi.LONGLONG, r_uint64(10)))  # grp=10
-    row_a.append_int(r_int64(100))
-    in_batch1.append(r_uint128(1), r_int64(1), row_a)
+    rb1.begin(r_uint128(1), r_int64(1))
+    rb1.put_int(rffi.cast(rffi.LONGLONG, r_uint64(10)))  # grp=10
+    rb1.put_int(r_int64(100))
+    rb1.commit()
 
-    row_b = values.make_payload_row(in_schema)
-    row_b.append_int(rffi.cast(rffi.LONGLONG, r_uint64(10)))  # grp=10
-    row_b.append_int(r_int64(50))
-    in_batch1.append(r_uint128(2), r_int64(1), row_b)
+    rb1.begin(r_uint128(2), r_int64(1))
+    rb1.put_int(rffi.cast(rffi.LONGLONG, r_uint64(10)))  # grp=10
+    rb1.put_int(r_int64(50))
+    rb1.commit()
 
-    row_c = values.make_payload_row(in_schema)
-    row_c.append_int(rffi.cast(rffi.LONGLONG, r_uint64(20)))  # grp=20
-    row_c.append_int(r_int64(200))
-    in_batch1.append(r_uint128(3), r_int64(1), row_c)
+    rb1.begin(r_uint128(3), r_int64(1))
+    rb1.put_int(rffi.cast(rffi.LONGLONG, r_uint64(20)))  # grp=20
+    rb1.put_int(r_int64(200))
+    rb1.commit()
 
     result1 = plan.execute_epoch(in_batch1)
 
@@ -451,15 +465,16 @@ def test_reduce_sum(base_dir):
     assert_equal_i(2, result1.length(), "Tick 1: two groups")
 
     # Find group 10 (sum=150) and group 20 (sum=200)
+    # get_accessor uses schema col indices; pk is col 0, so agg col = 1
     for i in range(result1.length()):
         pk = result1.get_pk(i)
-        row = result1.get_row(i)
+        acc = result1.get_accessor(i)
         w = result1.get_weight(i)
         if pk == r_uint128(10):
-            assert_equal_i64(r_int64(150), row.get_int_signed(0), "Group 10 sum should be 150")
+            assert_equal_i64(r_int64(150), acc.get_int_signed(1), "Group 10 sum should be 150")
             assert_equal_i64(r_int64(1), w, "Group 10 weight should be +1")
         elif pk == r_uint128(20):
-            assert_equal_i64(r_int64(200), row.get_int_signed(0), "Group 20 sum should be 200")
+            assert_equal_i64(r_int64(200), acc.get_int_signed(1), "Group 20 sum should be 200")
             assert_equal_i64(r_int64(1), w, "Group 20 weight should be +1")
         else:
             fail("Unexpected group PK")
@@ -469,10 +484,11 @@ def test_reduce_sum(base_dir):
 
     # Tick 2: retract one row from group 10 (pk=2, amount=50, w=-1)
     in_batch2 = batch.ZSetBatch(in_schema)
-    row_d = values.make_payload_row(in_schema)
-    row_d.append_int(rffi.cast(rffi.LONGLONG, r_uint64(10)))
-    row_d.append_int(r_int64(50))
-    in_batch2.append(r_uint128(2), r_int64(-1), row_d)
+    rb2 = RowBuilder(in_schema, in_batch2)
+    rb2.begin(r_uint128(2), r_int64(-1))
+    rb2.put_int(rffi.cast(rffi.LONGLONG, r_uint64(10)))
+    rb2.put_int(r_int64(50))
+    rb2.commit()
 
     result2 = plan.execute_epoch(in_batch2)
 
@@ -484,15 +500,15 @@ def test_reduce_sum(base_dir):
     found_insert = False
     for i in range(result2.length()):
         pk = result2.get_pk(i)
-        row = result2.get_row(i)
+        acc = result2.get_accessor(i)
         w = result2.get_weight(i)
         if pk == r_uint128(10):
             if w == r_int64(-1):
-                assert_equal_i64(r_int64(150), row.get_int_signed(0),
+                assert_equal_i64(r_int64(150), acc.get_int_signed(1),
                                  "Retraction should have old sum 150")
                 found_retract = True
             elif w == r_int64(1):
-                assert_equal_i64(r_int64(100), row.get_int_signed(0),
+                assert_equal_i64(r_int64(100), acc.get_int_signed(1),
                                  "Insertion should have new sum 100")
                 found_insert = True
 
@@ -536,13 +552,15 @@ def test_ghost_property():
 
     # Insert pk=1 w=+1 and pk=1 w=-1 in same batch
     in_batch = batch.ZSetBatch(schema)
-    row1 = values.make_payload_row(schema)
-    row1.append_int(r_int64(123))
-    in_batch.append(r_uint128(1), r_int64(1), row1)
+    rb = RowBuilder(schema, in_batch)
 
-    row2 = values.make_payload_row(schema)
-    row2.append_int(r_int64(123))
-    in_batch.append(r_uint128(1), r_int64(-1), row2)
+    rb.begin(r_uint128(1), r_int64(1))
+    rb.put_int(r_int64(123))
+    rb.commit()
+
+    rb.begin(r_uint128(1), r_int64(-1))
+    rb.put_int(r_int64(123))
+    rb.commit()
 
     # Consolidate the input batch (this is where ghost annihilation happens)
     consolidated = in_batch.to_consolidated()
@@ -612,10 +630,11 @@ def test_chunked_scan_resume(base_dir):
 
     # Fill table with 25 rows
     b = batch.ZSetBatch(schema)
+    rb = RowBuilder(schema, b)
     for i in range(25):
-        row = values.make_payload_row(schema)
-        row.append_int(r_int64(i * 10))
-        b.append(r_uint128(i), r_int64(1), row)
+        rb.begin(r_uint128(i), r_int64(1))
+        rb.put_int(r_int64(i * 10))
+        rb.commit()
     table.ingest_batch(b)
     b.free()
 
@@ -674,11 +693,12 @@ def test_seek_trace_point_lookup(base_dir):
 
     # Populate with PKs [10, 20, 30, 40, 50]
     b = batch.ZSetBatch(schema)
+    rb = RowBuilder(schema, b)
     ids = [10, 20, 30, 40, 50]
     for pk_val in ids:
-        row = values.make_payload_row(schema)
-        row.append_int(r_int64(pk_val * 100))
-        b.append(r_uint128(pk_val), r_int64(1), row)
+        rb.begin(r_uint128(pk_val), r_int64(1))
+        rb.put_int(r_int64(pk_val * 100))
+        rb.commit()
     table.ingest_batch(b)
     b.free()
 
@@ -700,16 +720,19 @@ def test_seek_trace_point_lookup(base_dir):
 
     # Bind R1 with a batch containing pk=30
     seek_batch = batch.ZSetBatch(schema)
-    r = values.make_payload_row(schema)
-    r.append_int(r_int64(0))
-    seek_batch.append(r_uint128(30), r_int64(1), r)
+    rb_seek = RowBuilder(schema, seek_batch)
+    rb_seek.begin(r_uint128(30), r_int64(1))
+    rb_seek.put_int(r_int64(0))
+    rb_seek.commit()
 
     result = plan.execute_epoch(seek_batch)
 
     assert_true(result is not None, "Seek should find a result")
     assert_equal_i(1, result.length(), "Should find exactly 1 row")
     assert_equal_u128(r_uint128(30), result.get_pk(0), "Should find pk=30")
-    assert_equal_i64(r_int64(3000), result.get_row(0).get_int_signed(0),
+    # get_accessor uses schema col indices; pk is col 0, so val = col 1
+    acc = result.get_accessor(0)
+    assert_equal_i64(r_int64(3000), acc.get_int_signed(1),
                      "Payload val should be 3000 for pk=30")
 
     result.free()
@@ -799,21 +822,23 @@ def test_join_delta_delta():
 
     # Batch A: pk=5 w=1, pk=10 w=2
     batch_a = batch.ZSetBatch(schema_a)
-    ra1 = values.make_payload_row(schema_a)
-    ra1.append_int(r_int64(55))
-    batch_a.append(r_uint128(5), r_int64(1), ra1)
-    ra2 = values.make_payload_row(schema_a)
-    ra2.append_int(r_int64(100))
-    batch_a.append(r_uint128(10), r_int64(2), ra2)
+    rb_a = RowBuilder(schema_a, batch_a)
+    rb_a.begin(r_uint128(5), r_int64(1))
+    rb_a.put_int(r_int64(55))
+    rb_a.commit()
+    rb_a.begin(r_uint128(10), r_int64(2))
+    rb_a.put_int(r_int64(100))
+    rb_a.commit()
 
     # Batch B: pk=10 w=3, pk=20 w=1
     batch_b = batch.ZSetBatch(schema_b)
-    rb1 = values.make_payload_row(schema_b)
-    rb1.append_int(r_int64(200))
-    batch_b.append(r_uint128(10), r_int64(3), rb1)
-    rb2 = values.make_payload_row(schema_b)
-    rb2.append_int(r_int64(300))
-    batch_b.append(r_uint128(20), r_int64(1), rb2)
+    rb_b = RowBuilder(schema_b, batch_b)
+    rb_b.begin(r_uint128(10), r_int64(3))
+    rb_b.put_int(r_int64(200))
+    rb_b.commit()
+    rb_b.begin(r_uint128(20), r_int64(1))
+    rb_b.put_int(r_int64(300))
+    rb_b.commit()
 
     # Pre-load R1 with batch B
     reg_file.registers[1].bind(batch_b)
@@ -826,9 +851,10 @@ def test_join_delta_delta():
     assert_equal_i64(r_int64(6), result.get_weight(0), "Weight should be 2*3=6")
 
     # Check merged payload: val_a=100, val_b=200
-    out_row = result.get_row(0)
-    assert_equal_i64(r_int64(100), out_row.get_int_signed(0), "val_a mismatch")
-    assert_equal_i64(r_int64(200), out_row.get_int_signed(1), "val_b mismatch")
+    # get_accessor uses schema col indices; pk is col 0, so val_a=1, val_b=2
+    acc = result.get_accessor(0)
+    assert_equal_i64(r_int64(100), acc.get_int_signed(1), "val_a mismatch")
+    assert_equal_i64(r_int64(200), acc.get_int_signed(2), "val_b mismatch")
 
     reg_file.registers[1].unbind()
     result.free()
@@ -864,13 +890,15 @@ def test_delay_op():
 
     # Input: 2 rows
     in_batch = batch.ZSetBatch(schema)
-    r1 = values.make_payload_row(schema)
-    r1.append_int(r_int64(111))
-    in_batch.append(r_uint128(1), r_int64(1), r1)
+    rb = RowBuilder(schema, in_batch)
 
-    r2 = values.make_payload_row(schema)
-    r2.append_int(r_int64(222))
-    in_batch.append(r_uint128(2), r_int64(3), r2)
+    rb.begin(r_uint128(1), r_int64(1))
+    rb.put_int(r_int64(111))
+    rb.commit()
+
+    rb.begin(r_uint128(2), r_int64(3))
+    rb.put_int(r_int64(222))
+    rb.commit()
 
     result = plan.execute_epoch(in_batch)
 
@@ -878,18 +906,21 @@ def test_delay_op():
     assert_equal_i(2, result.length(), "Delay should forward all rows")
 
     # Verify rows are forwarded with same PKs, weights, and payloads
+    # get_accessor uses schema col indices; pk is col 0, so val = col 1
     found_pk1 = False
     found_pk2 = False
     for i in range(result.length()):
         pk = result.get_pk(i)
         if pk == r_uint128(1):
             assert_equal_i64(r_int64(1), result.get_weight(i), "pk=1 weight mismatch")
-            assert_equal_i64(r_int64(111), result.get_row(i).get_int_signed(0),
+            acc = result.get_accessor(i)
+            assert_equal_i64(r_int64(111), acc.get_int_signed(1),
                              "pk=1 payload should be 111")
             found_pk1 = True
         elif pk == r_uint128(2):
             assert_equal_i64(r_int64(3), result.get_weight(i), "pk=2 weight mismatch")
-            assert_equal_i64(r_int64(222), result.get_row(i).get_int_signed(0),
+            acc = result.get_accessor(i)
+            assert_equal_i64(r_int64(222), acc.get_int_signed(1),
                              "pk=2 payload should be 222")
             found_pk2 = True
     assert_true(found_pk1, "Missing pk=1 in delay output")
@@ -953,15 +984,18 @@ def test_reduce_min_nonlinear(base_dir):
 
     # Tick 1: pk=1 val=30 w=1 => MIN(val)=30
     in_batch1 = batch.ZSetBatch(in_schema)
-    row_a = values.make_payload_row(in_schema)
-    row_a.append_int(r_int64(30))
-    in_batch1.append(r_uint128(1), r_int64(1), row_a)
+    rb1 = RowBuilder(in_schema, in_batch1)
+    rb1.begin(r_uint128(1), r_int64(1))
+    rb1.put_int(r_int64(30))
+    rb1.commit()
 
     result1 = plan.execute_epoch(in_batch1)
 
     assert_true(result1 is not None, "Tick 1: reduce MIN should produce output")
     assert_equal_i(1, result1.length(), "Tick 1: one group")
-    assert_equal_i64(r_int64(30), result1.get_row(0).get_int_signed(0),
+    # get_accessor uses schema col indices; pk is col 0, so agg col = 1
+    acc1 = result1.get_accessor(0)
+    assert_equal_i64(r_int64(30), acc1.get_int_signed(1),
                      "Tick 1: MIN should be 30")
     assert_equal_i64(r_int64(1), result1.get_weight(0), "Tick 1: weight should be +1")
 
@@ -971,9 +1005,10 @@ def test_reduce_min_nonlinear(base_dir):
     # Tick 2: pk=1 val=10 w=1 => replay history(val=30) + delta(val=10) => MIN=10
     # This forces the non-linear replay path since AGG_MIN.is_linear() is False.
     in_batch2 = batch.ZSetBatch(in_schema)
-    row_b = values.make_payload_row(in_schema)
-    row_b.append_int(r_int64(10))
-    in_batch2.append(r_uint128(1), r_int64(1), row_b)
+    rb2 = RowBuilder(in_schema, in_batch2)
+    rb2.begin(r_uint128(1), r_int64(1))
+    rb2.put_int(r_int64(10))
+    rb2.commit()
 
     result2 = plan.execute_epoch(in_batch2)
 
@@ -984,14 +1019,14 @@ def test_reduce_min_nonlinear(base_dir):
     found_retract = False
     found_insert = False
     for i in range(result2.length()):
-        row = result2.get_row(i)
+        acc = result2.get_accessor(i)
         w = result2.get_weight(i)
         if w == r_int64(-1):
-            assert_equal_i64(r_int64(30), row.get_int_signed(0),
+            assert_equal_i64(r_int64(30), acc.get_int_signed(1),
                              "Retraction should have old MIN=30")
             found_retract = True
         elif w == r_int64(1):
-            assert_equal_i64(r_int64(10), row.get_int_signed(0),
+            assert_equal_i64(r_int64(10), acc.get_int_signed(1),
                              "Insertion should have new MIN=10")
             found_insert = True
 
@@ -1037,9 +1072,10 @@ def test_join_delta_trace_multi_match(base_dir):
     # Ingest 3 separate batches so pk=42 has 3 entries
     for payload_val in [100, 200, 300]:
         tb = batch.ZSetBatch(schema_r)
-        tr = values.make_payload_row(schema_r)
-        tr.append_int(r_int64(payload_val))
-        tb.append(r_uint128(42), r_int64(1), tr)
+        rb_t = RowBuilder(schema_r, tb)
+        rb_t.begin(r_uint128(42), r_int64(1))
+        rb_t.put_int(r_int64(payload_val))
+        rb_t.commit()
         trace_table.ingest_batch(tb)
         tb.free()
 
@@ -1060,13 +1096,15 @@ def test_join_delta_trace_multi_match(base_dir):
 
     # Delta: pk=42 w=2 (should match 3 trace rows), pk=99 w=0 (zero-weight, skip)
     in_batch = batch.ZSetBatch(schema_l)
-    rl1 = values.make_payload_row(schema_l)
-    rl1.append_int(r_int64(7))
-    in_batch.append(r_uint128(42), r_int64(2), rl1)
+    rb_l = RowBuilder(schema_l, in_batch)
 
-    rl2 = values.make_payload_row(schema_l)
-    rl2.append_int(r_int64(9))
-    in_batch.append(r_uint128(99), r_int64(0), rl2)
+    rb_l.begin(r_uint128(42), r_int64(2))
+    rb_l.put_int(r_int64(7))
+    rb_l.commit()
+
+    rb_l.begin(r_uint128(99), r_int64(0))
+    rb_l.put_int(r_int64(9))
+    rb_l.commit()
 
     result = plan.execute_epoch(in_batch)
 
@@ -1078,11 +1116,11 @@ def test_join_delta_trace_multi_match(base_dir):
     for i in range(result.length()):
         assert_equal_u128(r_uint128(42), result.get_pk(i), "All output PKs should be 42")
         assert_equal_i64(r_int64(2), result.get_weight(i), "Weight should be 2*1=2")
-        out_row = result.get_row(i)
-        # col 0 = left tag (should be 7), col 1 = right data (100/200/300)
-        assert_equal_i64(r_int64(7), out_row.get_int_signed(0),
+        # get_accessor uses schema col indices; pk is col 0, so tag=1, data=2
+        acc = result.get_accessor(i)
+        assert_equal_i64(r_int64(7), acc.get_int_signed(1),
                          "Left tag payload should be 7")
-        right_data = out_row.get_int_signed(1)
+        right_data = acc.get_int_signed(2)
         for j in range(3):
             if right_data == trace_vals[j]:
                 found_payloads[j] = True

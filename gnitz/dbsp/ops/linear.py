@@ -8,7 +8,7 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import strings, types, errors
 from gnitz.core.batch import ArenaZSetBatch, BatchWriter
 from gnitz.core.comparator import RowAccessor
-from gnitz.core.values import _analyze_schema
+from gnitz.core.types import _analyze_schema
 
 """
 Linear Operators for the DBSP algebra.
@@ -17,8 +17,7 @@ These operators satisfy the identity L(A + B) = L(A) + L(B).
 They are stateless transformations acting on Z-Set batches.
 Each function now accepts a BatchWriter for the output register.
 
-Zero-Copy: operators pipe data between batches without instantiating
-PayloadRow objects.
+Zero-Copy: operators pipe data between batches via accessor forwarding.
 """
 
 

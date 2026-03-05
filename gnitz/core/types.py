@@ -70,9 +70,6 @@ class TableSchema(object):
         columns: List of ColumnDefinition.
         pk_index: The index of the column that serves as the Primary Key.
                   GnitzDB requires PKs to be TYPE_U64 or TYPE_U128.
-        column_offsets: Physical byte offsets for columns in a packed row (AoS).
-                        The PK column always has an offset of -1 as it is
-                        stored separately from the payload.
         has_varlen: True if the schema contains variable-length data (Strings)
                     requiring blob relocation during sort/compact.
     """
@@ -80,7 +77,6 @@ class TableSchema(object):
     _immutable_fields_ = [
         "columns",
         "pk_index",
-        "column_offsets",
         "memtable_stride",
         "has_varlen",
     ]
@@ -112,36 +108,23 @@ class TableSchema(object):
         if pk_type.code != TYPE_U64.code and pk_type.code != TYPE_U128.code:
             raise errors.LayoutError("Primary Key must be TYPE_U64 or TYPE_U128")
 
-        # Create a resizable list for offsets
-        temp_offsets = newlist_hint(num_cols)
-        for _ in range(num_cols):
-            temp_offsets.append(0)
-
         current_offset = 0
         max_alignment = 1
 
         for i in range(num_cols):
             if i == pk_index:
-                temp_offsets[i] = -1
                 continue
-
             field_type = self.columns[i].field_type
             current_offset = _align(current_offset, field_type.alignment)
-            temp_offsets[i] = current_offset
             current_offset += field_type.size
-
             if field_type.alignment > max_alignment:
                 max_alignment = field_type.alignment
 
-        self.column_offsets = temp_offsets
         self.memtable_stride = _align(current_offset, max_alignment)
 
     @property
     def stride(self):
         return self.memtable_stride
-
-    def get_column_offset(self, col_idx):
-        return self.column_offsets[col_idx]
 
     def get_pk_column(self):
         return self.columns[self.pk_index]
@@ -186,6 +169,30 @@ def merge_schemas_for_join(schema_left, schema_right):
             new_cols.append(schema_right.columns[i])
 
     return TableSchema(new_cols, pk_index=0)
+
+
+def _analyze_schema(schema):
+    """
+    Derives allocation flags from a TableSchema by scanning non-PK columns.
+    Returns (n_payload_cols, has_u128, has_string, has_nullable).
+    """
+    has_u128 = False
+    has_string = False
+    has_nullable = False
+    n = 0
+    for i in range(len(schema.columns)):
+        if i == schema.pk_index:
+            continue
+        n += 1
+        col = schema.columns[i]
+        ft = col.field_type
+        if ft.code == TYPE_U128.code:
+            has_u128 = True
+        if ft.code == TYPE_STRING.code:
+            has_string = True
+        if col.is_nullable:
+            has_nullable = True
+    return n, has_u128, has_string, has_nullable
 
 
 def _build_reduce_output_schema(input_schema, group_by_cols, agg_func):

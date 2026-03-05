@@ -5,7 +5,9 @@ import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rlib import rposix, rposix_stat
 
-from gnitz.core import types, values, batch
+from gnitz.core import types, batch
+from gnitz.core.batch import RowBuilder
+from gnitz.core.types import _analyze_schema
 from gnitz.core.errors import LayoutError
 from gnitz.core.strings import resolve_string
 from gnitz.catalog import identifiers
@@ -33,6 +35,7 @@ def cleanup_dir(path):
         try:
             st = rposix_stat.stat(p)
             import stat
+
             if stat.S_ISDIR(st.st_mode):
                 cleanup_dir(p)
             else:
@@ -63,7 +66,15 @@ def count_records(table):
 def test_identifiers():
     os.write(1, "[Catalog] Testing Identifiers...\n")
 
-    valid_names = ["orders", "Orders123", "my_table", "a", "A1_b2", "1a", "99_problems"]
+    valid_names = [
+        "orders",
+        "Orders123",
+        "my_table",
+        "a",
+        "A1_b2",
+        "1a",
+        "99_problems",
+    ]
     for name in valid_names:
         try:
             identifiers.validate_user_identifier(name)
@@ -207,14 +218,15 @@ def test_ddl(base_dir):
             raise Exception("Columns count didn't return to baseline")
 
         # System Table Drop Rejection
-        # This relies on the fix in engine.py: drop_table now validates identifiers
         raised = False
         try:
             engine.drop_table("_system._columns")
         except LayoutError:
             raised = True
         if not raised:
-            raise Exception("Allowed to drop system table (Identifier validation failed)")
+            raise Exception(
+                "Allowed to drop system table (Identifier validation failed)"
+            )
 
         # Drop Schema
         engine.create_schema("temp")
@@ -322,7 +334,9 @@ def test_edge_cases(base_dir):
         # 10. Too many columns (> 64)
         many_cols = []
         for i in range(65):
-            many_cols.append(types.ColumnDefinition(types.TYPE_U64, name="c" + str(i)))
+            many_cols.append(
+                types.ColumnDefinition(types.TYPE_U64, name="c" + str(i))
+            )
         raised = False
         try:
             engine.create_table("public.too_many_cols", many_cols, 0)
@@ -394,7 +408,9 @@ def test_edge_cases(base_dir):
         except KeyError:
             raised = True
         if not raised:
-            raise Exception("get_table on non-existent table should raise KeyError")
+            raise Exception(
+                "get_table on non-existent table should raise KeyError"
+            )
 
         # 18. schema_is_empty logic
         engine.create_schema("empty_test")
@@ -411,9 +427,9 @@ def test_edge_cases(base_dir):
         # 19. Case sensitivity of tables
         engine.create_table("public.CaseTest", cols, 0)
         engine.create_table("public.casetest", cols, 0)
-        if not engine.registry.has("public", "CaseTest") or not engine.registry.has(
-            "public", "casetest"
-        ):
+        if not engine.registry.has(
+            "public", "CaseTest"
+        ) or not engine.registry.has("public", "casetest"):
             raise Exception("Case sensitivity failed")
         engine.drop_table("public.CaseTest")
         engine.drop_table("public.casetest")
@@ -447,33 +463,32 @@ def test_edge_cases(base_dir):
         u128_payload_table = engine.create_table(
             "public.u128_payload_tbl", cols_payload_u128, 0
         )
-        if u128_payload_table.schema.columns[1].field_type.code != types.TYPE_U128.code:
+        if (
+            u128_payload_table.schema.columns[1].field_type.code
+            != types.TYPE_U128.code
+        ):
             raise Exception("Failed to create u128 payload table correctly")
         if not u128_payload_table.schema.columns[2].is_nullable:
             raise Exception("Failed to create nullable column correctly")
         engine.drop_table("public.u128_payload_tbl")
 
-        # 22. Schema padding / offsets logic
+        # 22. Schema padding / stride logic
         cols_padding = [
             types.ColumnDefinition(types.TYPE_U64, name="id"),
             types.ColumnDefinition(types.TYPE_U8, name="tiny"),
             types.ColumnDefinition(types.TYPE_U32, name="medium"),
         ]
         pad_tbl = engine.create_table("public.pad_tbl", cols_padding, 0)
-        if pad_tbl.schema.get_column_offset(1) != 0:
-            raise Exception("Incorrect offset for column 1")
-        if pad_tbl.schema.get_column_offset(2) != 4:
-            raise Exception("Incorrect offset for column 2 (padding failed)")
         if pad_tbl.schema.memtable_stride != 8:
             raise Exception("Incorrect memtable_stride (expected 8)")
         engine.drop_table("public.pad_tbl")
 
         # 23. Test schema analysis flags
-        n, has_u128, has_string, has_nullable = values._analyze_schema(pad_tbl.schema)
+        n, has_u128, has_string, has_nullable = _analyze_schema(pad_tbl.schema)
         if has_u128 or has_string or has_nullable:
             raise Exception("Incorrect flags for pad_tbl")
 
-        n, has_u128, has_string, has_nullable = values._analyze_schema(
+        n, has_u128, has_string, has_nullable = _analyze_schema(
             u128_payload_table.schema
         )
         if not has_u128 or not has_string or not has_nullable:
@@ -482,11 +497,15 @@ def test_edge_cases(base_dir):
         # 24. Invalid schema ID lookup
         name = engine.registry.get_schema_name(999999)
         if name != "":
-            raise Exception("get_schema_name for invalid ID should return empty string")
+            raise Exception(
+                "get_schema_name for invalid ID should return empty string"
+            )
 
         sid = engine.registry.get_schema_id("nonexistent")
         if sid != -1:
-            raise Exception("get_schema_id for invalid name should return -1")
+            raise Exception(
+                "get_schema_id for invalid name should return -1"
+            )
 
         # 25. Unregister non-existent
         engine.registry.unregister("public", "never_existed")
@@ -531,9 +550,10 @@ def test_restart(base_dir):
 
     # Ingest data into the persistent table
     batch1 = batch.ZSetBatch(table1.schema)
-    row = values.make_payload_row(table1.schema)
-    row.append_string("Gnitz-O-Matic")
-    batch1.append(r_uint128(r_uint64(42)), r_int64(1), row)
+    rb = RowBuilder(table1.schema, batch1)
+    rb.begin(r_uint128(r_uint64(42)), r_int64(1))
+    rb.put_string("Gnitz-O-Matic")
+    rb.commit()
     table1.store.ingest_batch(batch1)
     batch1.free()
 

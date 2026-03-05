@@ -6,7 +6,7 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.core.values import PayloadRow, make_payload_row, _analyze_schema
+from gnitz.core.types import _analyze_schema
 from gnitz.core import serialize, strings as string_logic, errors, types
 from gnitz.core import comparator as core_comparator
 from gnitz.storage import buffer
@@ -107,6 +107,117 @@ class ColumnarBatchAccessor(core_comparator.RowAccessor):
 
 
 # ---------------------------------------------------------------------------
+# RowBuilder — direct columnar row construction
+# ---------------------------------------------------------------------------
+
+
+class RowBuilder(core_comparator.RowAccessor):
+    """
+    Reusable builder for appending rows directly into an ArenaZSetBatch.
+    Eliminates intermediate row object allocations.
+    Uses fixed-size arrays (index assignment, not .append()) for zero-alloc reuse.
+    """
+
+    _immutable_fields_ = ["_schema", "_pk_index", "_n", "_has_nullable"]
+
+    def __init__(self, schema, batch):
+        self._schema = schema
+        self._batch = batch
+        self._pk_index = schema.pk_index
+        n, has_u128, has_string, has_nullable = _analyze_schema(schema)
+        self._n = n
+        self._has_nullable = has_nullable
+        self._lo = [r_int64(0)] * n
+        self._hi = [r_uint64(0)] * n if has_u128 else None
+        self._strs = [""] * n if has_string else None
+        self._null_word = r_uint64(0)
+        self._pk_lo = r_uint64(0)
+        self._pk_hi = r_uint64(0)
+        self._weight = r_int64(0)
+        self._curr = 0
+
+    def begin(self, pk, weight):
+        pk_u128 = r_uint128(pk)
+        self._pk_lo = r_uint64(pk_u128)
+        self._pk_hi = r_uint64(pk_u128 >> 64)
+        self._weight = weight
+        self._curr = 0
+        self._null_word = r_uint64(0)
+
+    def put_int(self, val_i64):
+        self._lo[self._curr] = val_i64
+        self._curr += 1
+
+    def put_float(self, val_f64):
+        from rpython.rlib.longlong2float import float2longlong
+        self._lo[self._curr] = float2longlong(val_f64)
+        self._curr += 1
+
+    def put_string(self, val_str):
+        self._lo[self._curr] = r_int64(0)
+        if self._strs is not None:
+            self._strs[self._curr] = val_str
+        self._curr += 1
+
+    def put_u128(self, lo_u64, hi_u64):
+        from rpython.rlib.rarithmetic import intmask
+        self._lo[self._curr] = r_int64(intmask(lo_u64))
+        if self._hi is not None:
+            self._hi[self._curr] = hi_u64
+        self._curr += 1
+
+    def put_null(self):
+        self._lo[self._curr] = r_int64(0)
+        self._null_word = self._null_word | (r_uint64(1) << self._curr)
+        self._curr += 1
+
+    def commit(self):
+        pk = (r_uint128(self._pk_hi) << 64) | r_uint128(self._pk_lo)
+        self._batch.append_from_accessor(pk, self._weight, self)
+
+    # RowAccessor read interface
+
+    def _payload_idx(self, col_idx):
+        if col_idx < self._pk_index:
+            return col_idx
+        return col_idx - 1
+
+    def is_null(self, col_idx):
+        if not self._has_nullable:
+            return False
+        return bool(self._null_word & (r_uint64(1) << self._payload_idx(col_idx)))
+
+    def get_int(self, col_idx):
+        return r_uint64(self._lo[self._payload_idx(col_idx)])
+
+    def get_int_signed(self, col_idx):
+        return rffi.cast(rffi.LONGLONG, r_uint64(self._lo[self._payload_idx(col_idx)]))
+
+    def get_float(self, col_idx):
+        return longlong2float(self._lo[self._payload_idx(col_idx)])
+
+    def get_u128(self, col_idx):
+        p_idx = self._payload_idx(col_idx)
+        lo = r_uint64(self._lo[p_idx])
+        hi = self._hi[p_idx] if self._hi is not None else r_uint64(0)
+        return (r_uint128(hi) << 64) | r_uint128(lo)
+
+    def get_str_struct(self, col_idx):
+        s = self._strs[self._payload_idx(col_idx)] if self._strs is not None else ""
+        prefix = rffi.cast(lltype.Signed, string_logic.compute_prefix(s))
+        return (
+            len(s),
+            prefix,
+            lltype.nullptr(rffi.CCHARP.TO),
+            lltype.nullptr(rffi.CCHARP.TO),
+            s,
+        )
+
+    def get_col_ptr(self, col_idx):
+        return lltype.nullptr(rffi.CCHARP.TO)
+
+
+# ---------------------------------------------------------------------------
 # Mergesort Support (Raw Indices)
 # ---------------------------------------------------------------------------
 
@@ -183,7 +294,6 @@ class ArenaZSetBatch(object):
         self.allocator = BatchBlobAllocator(self.blob_arena)
 
         self._raw_accessor = ColumnarBatchAccessor(schema)
-        self._row_accessor = core_comparator.PayloadRowAccessor(schema)
         self._cmp_acc_a = ColumnarBatchAccessor(schema)
         self._cmp_acc_b = ColumnarBatchAccessor(schema)
 
@@ -337,59 +447,6 @@ class ArenaZSetBatch(object):
         assert 0 <= i < self._count
         out_accessor.bind(self, i)
 
-    def get_row(self, i):
-        assert 0 <= i < self._count
-        acc = ColumnarBatchAccessor(self._schema)
-        acc.bind(self, i)
-        schema = self._schema
-        row = make_payload_row(schema)
-        num_cols = len(schema.columns)
-        payload_col = 0
-        for ci in range(num_cols):
-            if ci == schema.pk_index:
-                continue
-            null_word = self._read_null_word(i)
-            if null_word & (r_uint64(1) << payload_col):
-                row.append_null(payload_col)
-                payload_col += 1
-                continue
-
-            col_type = schema.columns[ci].field_type
-            code = col_type.code
-            if code == types.TYPE_STRING.code:
-                row.append_string(
-                    string_logic.unpack_string(
-                        self._col_ptr(i, ci), self.blob_arena.base_ptr
-                    )
-                )
-            elif code == types.TYPE_F64.code or code == types.TYPE_F32.code:
-                row.append_float(self._read_col_float(i, ci))
-            elif code == types.TYPE_U128.code:
-                v = self._read_col_u128(i, ci)
-                row.append_u128(r_uint64(v), r_uint64(v >> 64))
-            elif (
-                code == types.TYPE_I64.code
-                or code == types.TYPE_I32.code
-                or code == types.TYPE_I16.code
-                or code == types.TYPE_I8.code
-            ):
-                ptr = self._col_ptr(i, ci)
-                row.append_int(
-                    rffi.cast(rffi.LONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
-                )
-            else:
-                ptr = self._col_ptr(i, ci)
-                row.append_int(
-                    rffi.cast(rffi.LONGLONG, rffi.cast(rffi.ULONGLONGP, ptr)[0])
-                )
-            payload_col += 1
-        return row
-
-    def append(self, pk, weight, row):
-        assert not self._freed
-        self._row_accessor.set_row(row)
-        self.append_from_accessor(pk, weight, self._row_accessor)
-
     @jit.unroll_safe
     def append_from_accessor(self, pk, weight, accessor):
         assert not self._freed
@@ -407,9 +464,8 @@ class ArenaZSetBatch(object):
             src_batch = accessor._batch
             if src_batch is not None:
                 null_word = src_batch._read_null_word(accessor._row_idx)
-        elif isinstance(accessor, core_comparator.PayloadRowAccessor):
-            if accessor._row:
-                null_word = accessor._row._null_word
+        elif isinstance(accessor, RowBuilder):
+            null_word = accessor._null_word
         else:
             for i in range(len(self._schema.columns)):
                 if i == self._schema.pk_index:
@@ -692,9 +748,6 @@ class BatchWriter(object):
     def append_from_accessor(self, pk, weight, accessor):
         self._batch.append_from_accessor(pk, weight, accessor)
 
-    def append(self, pk, weight, row):
-        self._batch.append(pk, weight, row)
-
 
 # ---------------------------------------------------------------------------
 # Scope Management (RAII-style for RPython)
@@ -737,10 +790,3 @@ class ConsolidatedScope(BatchScope):
 # ---------------------------------------------------------------------------
 
 ZSetBatch = ArenaZSetBatch
-
-
-def make_singleton_batch(schema, pk, weight, row):
-    batch = ZSetBatch(schema)
-    batch.append(pk, weight, row)
-    batch._sorted = True
-    return batch

@@ -11,7 +11,8 @@ from rpython.rlib.rarithmetic import (
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi
 
-from gnitz.core import types, values, batch
+from gnitz.core import types, batch
+from gnitz.core.batch import RowBuilder
 from gnitz.core.errors import LayoutError
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog import engine, identifiers
@@ -69,10 +70,17 @@ def assert_equal_u128(expected, actual, msg):
 
         rposix.write(
             2,
-            "   Expected: " + _u64_to_hex_padded(hi_e) + _u64_to_hex_padded(lo_e) + "\n",
+            "   Expected: "
+            + _u64_to_hex_padded(hi_e)
+            + _u64_to_hex_padded(lo_e)
+            + "\n",
         )
         rposix.write(
-            2, "   Actual:   " + _u64_to_hex_padded(hi_a) + _u64_to_hex_padded(lo_a) + "\n"
+            2,
+            "   Actual:   "
+            + _u64_to_hex_padded(hi_a)
+            + _u64_to_hex_padded(lo_a)
+            + "\n",
         )
         fail(msg + " -> U128 Mismatch")
 
@@ -145,10 +153,11 @@ def test_programmable_zset_lifecycle():
     u128_val = (r_uint128(0xDEADBEEF) << 64) | r_uint128(0xCAFEBABE)
 
     bad_batch = batch.ZSetBatch(orders_family.schema)
-    r = values.make_payload_row(orders_family.schema)
-    r.append_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
-    r.append_int(r_int64(500))
-    bad_batch.append(r_uint128(1), r_int64(1), r)
+    rb_bad = RowBuilder(orders_family.schema, bad_batch)
+    rb_bad.begin(r_uint128(1), r_int64(1))
+    rb_bad.put_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
+    rb_bad.put_int(r_int64(500))
+    rb_bad.commit()
 
     fk_raised = False
     try:
@@ -162,19 +171,23 @@ def test_programmable_zset_lifecycle():
     # 4. Valid Data Ingestion
     log_step("Phase 4: Ingesting valid relational data")
     u_batch = batch.ZSetBatch(users_family.schema)
-    ru = values.make_payload_row(users_family.schema)
-    ru.append_string("alice")
-    u_batch.append(u128_val, r_int64(1), ru)
+    rb_u = RowBuilder(users_family.schema, u_batch)
+    rb_u.begin(u128_val, r_int64(1))
+    rb_u.put_string("alice")
+    rb_u.commit()
     ingest_to_family(users_family, u_batch)
     u_batch.free()
 
-    assert_true(users_family.store.has_pk(u128_val), "User ingestion visibility failed")
+    assert_true(
+        users_family.store.has_pk(u128_val), "User ingestion visibility failed"
+    )
 
     o_batch = batch.ZSetBatch(orders_family.schema)
-    ro = values.make_payload_row(orders_family.schema)
-    ro.append_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
-    ro.append_int(r_int64(1000))
-    o_batch.append(r_uint128(101), r_int64(1), ro)
+    rb_o = RowBuilder(orders_family.schema, o_batch)
+    rb_o.begin(r_uint128(101), r_int64(1))
+    rb_o.put_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
+    rb_o.put_int(r_int64(1000))
+    rb_o.commit()
     ingest_to_family(orders_family, o_batch)
     o_batch.free()
 
@@ -182,7 +195,9 @@ def test_programmable_zset_lifecycle():
     log_step("Phase 5: Creating Reactive View (Scan Users)")
 
     # CircuitBuilder now requires the primary_source_id (users table)
-    builder = CircuitBuilder(view_id=0, primary_source_id=users_family.table_id)
+    builder = CircuitBuilder(
+        view_id=0, primary_source_id=users_family.table_id
+    )
     # input_delta() represents the reactive delta stream for that source
     users_src = builder.input_delta()
     builder.sink(users_src, target_table_id=0)
@@ -211,8 +226,12 @@ def test_programmable_zset_lifecycle():
     db.close()
 
     db2 = engine.open_engine(base_dir)
-    assert_true(db2.registry.has("app", "users"), "Registry lost users table")
-    assert_true(db2.registry.has("app", "active_users"), "Registry lost view")
+    assert_true(
+        db2.registry.has("app", "users"), "Registry lost users table"
+    )
+    assert_true(
+        db2.registry.has("app", "active_users"), "Registry lost view"
+    )
 
     # 7. Recovery Audit
     log_step("Phase 7: Auditing recovered VM Program")
@@ -225,9 +244,10 @@ def test_programmable_zset_lifecycle():
 
     # Feed the actual alice record as a delta to the reactive view
     in_batch = batch.ZSetBatch(users_family.schema)
-    ru = values.make_payload_row(users_family.schema)
-    ru.append_string("alice")
-    in_batch.append(u128_val, r_int64(1), ru)
+    rb_in = RowBuilder(users_family.schema, in_batch)
+    rb_in.begin(u128_val, r_int64(1))
+    rb_in.put_string("alice")
+    rb_in.commit()
 
     out_batch = view_handle.process(in_batch)
     in_batch.free()
@@ -245,7 +265,7 @@ def test_programmable_zset_lifecycle():
     bad_builder.input_delta()
     # No sink
     bad_graph = bad_builder.build(out_cols)
-    
+
     compilation_failed = False
     try:
         db2.create_view("app.bad_view", bad_graph, "")
@@ -261,14 +281,16 @@ def test_programmable_zset_lifecycle():
     # Manual connection to create a cycle (illegal for Kahn's)
     cycle_builder._connect(d1, s1, 1)  # PORT_IN
     cycle_graph = cycle_builder.build(out_cols)
-    
+
     compilation_failed = False
     try:
         db2.create_view("app.cycle_view", cycle_graph, "")
     except LayoutError:
         compilation_failed = True
         log("Correctly rejected cyclic graph")
-    assert_true(compilation_failed, "Should fail compilation: cycle detected")
+    assert_true(
+        compilation_failed, "Should fail compilation: cycle detected"
+    )
 
     # 10. Teardown
     log_step("Phase 10: Full Teardown and Cleanup")
@@ -296,10 +318,14 @@ def entry_point(argv):
         rposix.write(2, "\n[FATAL] Caught KeyError: " + str(e) + "\n")
         return 1
     except OSError as e:
-        rposix.write(2, "\n[FATAL] Caught OSError: Errno " + str(e.errno) + "\n")
+        rposix.write(
+            2, "\n[FATAL] Caught OSError: Errno " + str(e.errno) + "\n"
+        )
         return 1
     except Exception as e:
-        rposix.write(2, "\n[FATAL] Caught Unhandled Exception: " + str(e) + "\n")
+        rposix.write(
+            2, "\n[FATAL] Caught Unhandled Exception: " + str(e) + "\n"
+        )
         return 1
 
     rposix.write(1, "\nSUCCESS: System integrity verified.\n")
