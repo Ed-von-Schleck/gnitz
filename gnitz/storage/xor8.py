@@ -4,12 +4,45 @@ import os
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from rpython.rlib import rposix, rposix_stat, jit
+from rpython.rlib import rposix, rposix_stat, jit, objectmodel
 
 from gnitz.core import xxh
 from gnitz.storage import mmap_posix
 
 MAX_CONSTRUCTION_ATTEMPTS = 64
+
+
+@objectmodel.always_inline
+def rotl64(n, c):
+    """64-bit bitwise left rotation. Inlined at the C level."""
+    n = r_uint64(n)
+    return (n << c) | (n >> (64 - c))
+
+
+@jit.elidable
+def fastrange32(hash32, size):
+    """
+    Lemire's fastrange. Maps a 32-bit hash evenly to [0, size).
+    Marked elidable to allow the JIT to constant-fold the calculation.
+    """
+    return intmask((r_uint64(hash32) * r_uint64(size)) >> 32)
+
+
+@jit.elidable
+def _get_h0_h1_h2(h, segment_length):
+    """
+    Derives 3 independent block indices from a single 64-bit hash.
+    Marked elidable so the JIT can remove redundant calls in a trace.
+    """
+    h_val = r_uint64(h)
+    seg_u = r_uint64(segment_length)
+    mask = r_uint64(0xFFFFFFFF)
+    
+    h0 = fastrange32(h_val & mask, seg_u)
+    h1 = fastrange32(rotl64(h_val, 21) & mask, seg_u) + segment_length
+    h2 = fastrange32(rotl64(h_val, 42) & mask, seg_u) + 2 * segment_length
+    
+    return h0, h1, h2
 
 
 class Xor8Filter(object):
@@ -32,21 +65,29 @@ class Xor8Filter(object):
     def _get_seed(self):
         return (r_uint128(self.seed_hi) << 64) | r_uint128(self.seed_lo)
 
+    @jit.elidable
     def _hash_key(self, key):
         seed = self._get_seed()
-        mixed = r_uint64(key ^ seed)
-        rffi.cast(rffi.ULONGLONGP, self._scratch)[0] = rffi.cast(
-            rffi.ULONGLONG, mixed
-        )
-        return xxh.compute_checksum(self._scratch, 8)
+        # Preserve full 128-bit entropy via XOR
+        mixed = key ^ seed
+        
+        lo = r_uint64(mixed)
+        hi = r_uint64(mixed >> 64)
+        
+        # Write both 64-bit halves to the 16-byte scratch buffer
+        scratch_p = rffi.cast(rffi.ULONGLONGP, self._scratch)
+        scratch_p[0] = rffi.cast(rffi.ULONGLONG, lo)
+        scratch_p[1] = rffi.cast(rffi.ULONGLONG, hi)
+        
+        # Hash the full 16 bytes
+        return xxh.compute_checksum(self._scratch, 16)
 
     def may_contain(self, key):
         h = self._hash_key(key)
-        f = intmask(h >> 56) & 0xFF
-        seg = self.segment_length
-        h0 = intmask(h) % seg
-        h1 = intmask(h >> 16) % seg + seg
-        h2 = intmask(h >> 32) % seg + 2 * seg
+        f = intmask(r_uint64(h) >> 56) & 0xFF
+        
+        h0, h1, h2 = _get_h0_h1_h2(h, self.segment_length)
+        
         fp = self.fingerprints
         got = (ord(fp[h0]) ^ ord(fp[h1]) ^ ord(fp[h2])) & 0xFF
         return f == got
@@ -61,14 +102,22 @@ class Xor8Filter(object):
 
 
 def _hash_with_seed(key_val, seed, scratch):
-    """Hash key_val XOR'd with seed using a caller-supplied 8-byte scratch buffer."""
-    mixed = r_uint64(key_val ^ seed)
-    rffi.cast(rffi.ULONGLONGP, scratch)[0] = rffi.cast(rffi.ULONGLONG, mixed)
-    return xxh.compute_checksum(scratch, 8)
+    """
+    Hash key_val XOR'd with seed using a caller-supplied 16-byte scratch buffer.
+    """
+    mixed = key_val ^ seed
+    
+    lo = r_uint64(mixed)
+    hi = r_uint64(mixed >> 64)
+    
+    scratch_p = rffi.cast(rffi.ULONGLONGP, scratch)
+    scratch_p[0] = rffi.cast(rffi.ULONGLONG, lo)
+    scratch_p[1] = rffi.cast(rffi.ULONGLONG, hi)
+    
+    return xxh.compute_checksum(scratch, 16)
 
 
 def _read_key_from_buf(keys_ptr, i, key_size):
-    """Read a key from the PK buffer as r_uint128."""
     offset = i * key_size
     ptr = rffi.ptradd(keys_ptr, offset)
     if key_size == 16:
@@ -80,10 +129,6 @@ def _read_key_from_buf(keys_ptr, i, key_size):
 
 
 def build_xor8(keys_ptr, num_keys, key_size):
-    """
-    Constructs an Xor8Filter from a raw PK buffer using peeling-based construction.
-    Returns Xor8Filter or None on failure.
-    """
     if num_keys == 0:
         return None
 
@@ -93,14 +138,11 @@ def build_xor8(keys_ptr, num_keys, key_size):
     total_size = 3 * segment_length
 
     fingerprints = lltype.malloc(rffi.CCHARP.TO, total_size, flavor="raw")
-    # counts array (int per slot)
     counts = lltype.malloc(rffi.CCHARP.TO, total_size * 4, flavor="raw")
-    # keys_at array (uint64 per slot - XOR of hashes)
     keys_at = lltype.malloc(rffi.CCHARP.TO, total_size * 8, flavor="raw")
-    # stack: stores (hash: u64, solo_slot: i32) = 12 bytes per entry
     stack = lltype.malloc(rffi.CCHARP.TO, num_keys * 12, flavor="raw")
     queue_buf = lltype.malloc(rffi.CCHARP.TO, total_size * 4, flavor="raw")
-    hash_scratch = lltype.malloc(rffi.CCHARP.TO, 8, flavor="raw")
+    hash_scratch = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
 
     counts_p = rffi.cast(rffi.INTP, counts)
     keys_at_p = rffi.cast(rffi.ULONGLONGP, keys_at)
@@ -112,41 +154,28 @@ def build_xor8(keys_ptr, num_keys, key_size):
     try:
         attempt = 0
         while attempt < MAX_CONSTRUCTION_ATTEMPTS:
-            # Zero counts and keys_at
             i = 0
             while i < total_size:
                 counts_p[i] = rffi.cast(rffi.INT, 0)
                 keys_at_p[i] = rffi.cast(rffi.ULONGLONG, 0)
                 i += 1
 
-            # Populate
             i = 0
             while i < num_keys:
                 key_val = _read_key_from_buf(keys_ptr, i, key_size)
                 h = _hash_with_seed(key_val, seed, hash_scratch)
-                seg = segment_length
-                h0 = intmask(h) % seg
-                h1 = intmask(h >> 16) % seg + seg
-                h2 = intmask(h >> 32) % seg + 2 * seg
+                h0, h1, h2 = _get_h0_h1_h2(h, segment_length)
 
                 counts_p[h0] = rffi.cast(rffi.INT, intmask(counts_p[h0]) + 1)
-                keys_at_p[h0] = rffi.cast(
-                    rffi.ULONGLONG, r_uint64(keys_at_p[h0]) ^ h
-                )
+                keys_at_p[h0] = rffi.cast(rffi.ULONGLONG, r_uint64(keys_at_p[h0]) ^ h)
                 counts_p[h1] = rffi.cast(rffi.INT, intmask(counts_p[h1]) + 1)
-                keys_at_p[h1] = rffi.cast(
-                    rffi.ULONGLONG, r_uint64(keys_at_p[h1]) ^ h
-                )
+                keys_at_p[h1] = rffi.cast(rffi.ULONGLONG, r_uint64(keys_at_p[h1]) ^ h)
                 counts_p[h2] = rffi.cast(rffi.INT, intmask(counts_p[h2]) + 1)
-                keys_at_p[h2] = rffi.cast(
-                    rffi.ULONGLONG, r_uint64(keys_at_p[h2]) ^ h
-                )
+                keys_at_p[h2] = rffi.cast(rffi.ULONGLONG, r_uint64(keys_at_p[h2]) ^ h)
                 i += 1
 
-            # Peel: find slots with count == 1
             queue_head = 0
             queue_tail = 0
-
             i = 0
             while i < total_size:
                 if intmask(counts_p[i]) == 1:
@@ -161,90 +190,50 @@ def build_xor8(keys_ptr, num_keys, key_size):
             while queue_head < queue_tail:
                 s = intmask(queue_p[queue_head])
                 queue_head += 1
-
                 if intmask(counts_p[s]) != 1:
                     continue
-
                 h = r_uint64(keys_at_p[s])
-
                 stack_hash_p[stack_size] = rffi.cast(rffi.ULONGLONG, h)
                 stack_slot_p[stack_size] = rffi.cast(rffi.INT, s)
                 stack_size += 1
 
-                seg = segment_length
-                h0 = intmask(h) % seg
-                h1 = intmask(h >> 16) % seg + seg
-                h2 = intmask(h >> 32) % seg + 2 * seg
-
-                # Remove hash from all three positions
-                slots_0 = h0
-                slots_1 = h1
-                slots_2 = h2
-
-                counts_p[slots_0] = rffi.cast(rffi.INT, intmask(counts_p[slots_0]) - 1)
-                keys_at_p[slots_0] = rffi.cast(
-                    rffi.ULONGLONG, r_uint64(keys_at_p[slots_0]) ^ h
-                )
-                if intmask(counts_p[slots_0]) == 1:
-                    queue_p[queue_tail] = rffi.cast(rffi.INT, slots_0)
-                    queue_tail += 1
-
-                counts_p[slots_1] = rffi.cast(rffi.INT, intmask(counts_p[slots_1]) - 1)
-                keys_at_p[slots_1] = rffi.cast(
-                    rffi.ULONGLONG, r_uint64(keys_at_p[slots_1]) ^ h
-                )
-                if intmask(counts_p[slots_1]) == 1:
-                    queue_p[queue_tail] = rffi.cast(rffi.INT, slots_1)
-                    queue_tail += 1
-
-                counts_p[slots_2] = rffi.cast(rffi.INT, intmask(counts_p[slots_2]) - 1)
-                keys_at_p[slots_2] = rffi.cast(
-                    rffi.ULONGLONG, r_uint64(keys_at_p[slots_2]) ^ h
-                )
-                if intmask(counts_p[slots_2]) == 1:
-                    queue_p[queue_tail] = rffi.cast(rffi.INT, slots_2)
-                    queue_tail += 1
+                h0, h1, h2 = _get_h0_h1_h2(h, segment_length)
+                for slot in [h0, h1, h2]:
+                    counts_p[slot] = rffi.cast(rffi.INT, intmask(counts_p[slot]) - 1)
+                    keys_at_p[slot] = rffi.cast(rffi.ULONGLONG, r_uint64(keys_at_p[slot]) ^ h)
+                    if intmask(counts_p[slot]) == 1:
+                        queue_p[queue_tail] = rffi.cast(rffi.INT, slot)
+                        queue_tail += 1
 
             if stack_size == num_keys:
                 built = True
                 break
-
             seed = seed + r_uint128(1)
             attempt += 1
 
-        if not built:
-            return None
+        if not built: return None
 
-        # Assign fingerprints in reverse stack order
         i = 0
         while i < total_size:
             fingerprints[i] = "\x00"
             i += 1
 
-        stack_hash_p = rffi.cast(rffi.ULONGLONGP, stack)
-        stack_slot_p = rffi.cast(rffi.INTP, rffi.ptradd(stack, num_keys * 8))
-
         i = stack_size - 1
         while i >= 0:
             h = r_uint64(stack_hash_p[i])
             solo_slot = intmask(stack_slot_p[i])
-
             f = intmask(h >> 56) & 0xFF
-            seg = segment_length
-            h0 = intmask(h) % seg
-            h1 = intmask(h >> 16) % seg + seg
-            h2 = intmask(h >> 32) % seg + 2 * seg
-
+            h0, h1, h2 = _get_h0_h1_h2(h, segment_length)
             xored = ord(fingerprints[h0]) ^ ord(fingerprints[h1]) ^ ord(fingerprints[h2])
             fingerprints[solo_slot] = chr((f ^ xored) & 0xFF)
             i -= 1
 
         return Xor8Filter(fingerprints, segment_length, seed, total_size, owned=True)
     finally:
-        lltype.free(counts,       flavor="raw")
-        lltype.free(keys_at,      flavor="raw")
-        lltype.free(stack,        flavor="raw")
-        lltype.free(queue_buf,    flavor="raw")
+        lltype.free(counts, flavor="raw")
+        lltype.free(keys_at, flavor="raw")
+        lltype.free(stack, flavor="raw")
+        lltype.free(queue_buf, flavor="raw")
         lltype.free(hash_scratch, flavor="raw")
         if not built:
             lltype.free(fingerprints, flavor="raw")

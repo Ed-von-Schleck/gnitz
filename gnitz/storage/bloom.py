@@ -40,21 +40,28 @@ class BloomFilter(object):
     def _hash_key(self, key):
         lo = r_uint64(key)
         hi = r_uint64(key >> 64)
-        rffi.cast(rffi.ULONGLONGP, self._scratch)[0] = rffi.cast(
-            rffi.ULONGLONG, lo ^ hi
-        )
-        return xxh.compute_checksum(self._scratch, 8)
+        
+        # Cast scratch to a 64-bit pointer to write both halves
+        scratch_u64 = rffi.cast(rffi.ULONGLONGP, self._scratch)
+        scratch_u64[0] = rffi.cast(rffi.ULONGLONG, lo)
+        scratch_u64[1] = rffi.cast(rffi.ULONGLONG, hi)
+        
+        # Hash the full 16-byte buffer
+        return xxh.compute_checksum(self._scratch, 16)
 
     @jit.unroll_safe
     def add(self, key):
-        h = self._hash_key(key)
-        h1 = intmask(h) & 0x7FFFFFFF
-        h2 = intmask(h >> 32) | 1
-        num_bits = self.num_bits
+        h_val = r_uint64(self._hash_key(key))
+        h1 = h_val
+        h2 = (h_val >> 32) | r_uint64(1)
+        num_bits_u = r_uint64(self.num_bits)
         bits = self.bits
+        
         i = 0
         while i < NUM_PROBES:
-            pos = (h1 + i * h2) % num_bits
+            # Fully unsigned math avoids the negative modulo trap in RPython
+            # and prevents the 256MB capacity limit of the 31-bit signed mask.
+            pos = intmask((h1 + r_uint64(i) * h2) % num_bits_u)
             byte_idx = pos >> 3
             bit_mask = 1 << (pos & 7)
             bits[byte_idx] = chr(ord(bits[byte_idx]) | bit_mask)
@@ -62,19 +69,21 @@ class BloomFilter(object):
 
     @jit.unroll_safe
     def may_contain(self, key):
-        h = self._hash_key(key)
-        h1 = intmask(h) & 0x7FFFFFFF
-        h2 = intmask(h >> 32) | 1
-        num_bits = self.num_bits
+        h_val = r_uint64(self._hash_key(key))
+        h1 = h_val
+        h2 = (h_val >> 32) | r_uint64(1)
+        num_bits_u = r_uint64(self.num_bits)
         bits = self.bits
+        
         i = 0
         while i < NUM_PROBES:
-            pos = (h1 + i * h2) % num_bits
+            pos = intmask((h1 + r_uint64(i) * h2) % num_bits_u)
             byte_idx = pos >> 3
             bit_mask = 1 << (pos & 7)
             if not (ord(bits[byte_idx]) & bit_mask):
                 return False
             i += 1
+            
         return True
 
     def free(self):
