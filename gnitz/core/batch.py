@@ -65,11 +65,15 @@ class ColumnarBatchAccessor(core_comparator.RowAccessor):
         self._row_idx = row_idx
 
     def _payload_idx(self, col_idx):
+        if col_idx == self._schema.pk_index:
+            return -1  # PK is not in the payload
         if col_idx < self._schema.pk_index:
             return col_idx
         return col_idx - 1
 
     def is_null(self, col_idx):
+        if col_idx == self._schema.pk_index:
+            return False  # PKs are never null
         batch = self._batch
         assert batch is not None
         payload_idx = self._payload_idx(col_idx)
@@ -79,6 +83,8 @@ class ColumnarBatchAccessor(core_comparator.RowAccessor):
     def get_int(self, col_idx):
         batch = self._batch
         assert batch is not None
+        if col_idx == self._schema.pk_index:
+            return batch._read_pk_lo(self._row_idx)
         return batch._read_col_int(self._row_idx, col_idx)
 
     def get_int_signed(self, col_idx):
@@ -232,16 +238,22 @@ class RowBuilder(core_comparator.RowAccessor):
     # RowAccessor read interface
 
     def _payload_idx(self, col_idx):
+        if col_idx == self._pk_index:
+            return -1  # PK is not in the payload
         if col_idx < self._pk_index:
             return col_idx
         return col_idx - 1
 
     def is_null(self, col_idx):
+        if col_idx == self._pk_index:
+            return False  # PKs are never null
         if not self._has_nullable:
             return False
         return bool(self._null_word & (r_uint64(1) << self._payload_idx(col_idx)))
 
     def get_int(self, col_idx):
+        if col_idx == self._pk_index:
+            return self._pk_lo
         return r_uint64(self._lo[self._payload_idx(col_idx)])
 
     def get_int_signed(self, col_idx):

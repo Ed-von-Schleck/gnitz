@@ -79,9 +79,9 @@ class UniversalProjection(ScalarFunction):
     _immutable_fields_ = ['src_indices[*]', 'src_types[*]']
 
     def __init__(self, indices, types_list):
-        # [*] marks fixed-size arrays for JIT unrolling
-        self.src_indices = indices
-        self.src_types = types_list
+        # copy: [*] requires never-resized lists for JIT unrolling
+        self.src_indices = indices[:]
+        self.src_types = types_list[:]
 
     @jit.unroll_safe
     def evaluate_map(self, row_accessor, output_row):

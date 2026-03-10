@@ -742,6 +742,157 @@ def test_anti_semi_complement(base_dir):
     log("  PASSED")
 
 
+def test_filter_with_expr(base_dir):
+    """input_delta -> filter(col1 > 25) -> sink: expression-based filtering."""
+    log("[COMPILE] Testing filter with expression bytecode...")
+    db = engine.open_engine(base_dir)
+
+    db.create_schema("test")
+    table_cols = _make_table_cols_i64(["val"])
+    table = db.create_table("test.src", table_cols, 0)
+
+    # Build expression: col1 > 25  (col1 is column index 1, the I64 "val" column)
+    from gnitz.dbsp.expr import ExprBuilder
+    eb = ExprBuilder()
+    col1 = eb.load_col_int(1)       # reg 0 = row.col[1]
+    const25 = eb.load_const_int(25) # reg 1 = 25
+    result = eb.cmp_gt(col1, const25)  # reg 2 = col1 > 25
+    prog = eb.build(result)
+
+    builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
+    src = builder.input_delta()
+    flt = builder.filter(src, expr_code=prog.code_as_ints(),
+                         expr_num_regs=prog.num_regs,
+                         expr_result_reg=prog.result_reg)
+    builder.sink(flt, target_table_id=0)
+    out_cols = [("pk", types.TYPE_U64.code), ("val", types.TYPE_I64.code)]
+    graph = builder.build(out_cols)
+    db.create_view("test.v_flt_expr", graph, "")
+
+    view = db.get_table("test.v_flt_expr")
+    plan = db.program_cache.get_program(view.table_id)
+    assert_true(plan is not None, "filter_expr plan is None")
+
+    in_batch = batch.ZSetBatch(table.schema)
+    rb = RowBuilder(table.schema, in_batch)
+    _add_int_row(rb, 1, [10])
+    _add_int_row(rb, 2, [20])
+    _add_int_row(rb, 3, [30])
+    _add_int_row(rb, 4, [40])
+    _add_int_row(rb, 5, [50])
+
+    out = plan.execute_epoch(in_batch)
+    in_batch.free()
+    assert_true(out is not None, "filter_expr produced None")
+    assert_equal_i(3, out.length(), "filter_expr should keep 3 rows (30,40,50)")
+    out.free()
+
+    db.drop_view("test.v_flt_expr")
+    db.drop_table("test.src")
+    db.drop_schema("test")
+    db.close()
+    log("  PASSED")
+
+
+def test_map_projection(base_dir):
+    """input_delta -> map(projection=[2]) -> sink: column projection (payload cols only, PK auto-copied)."""
+    log("[COMPILE] Testing map with projection...")
+    db = engine.open_engine(base_dir)
+
+    db.create_schema("test")
+    # Input schema: pk(U64), col_a(I64), col_b(I64)
+    table_cols = _make_table_cols_i64(["col_a", "col_b"])
+    table = db.create_table("test.src", table_cols, 0)
+
+    # Output schema: pk(U64), col_b(I64) — projects only col_b from input payload
+    # PK is auto-copied by op_map's commit_row, projection covers payload columns only
+    out_col_defs = [("pk", types.TYPE_U64.code), ("col_b", types.TYPE_I64.code)]
+
+    builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
+    src = builder.input_delta()
+    m = builder.map(src, projection=[2])  # select col 2 (col_b) from input schema
+    builder.sink(m, target_table_id=0)
+    graph = builder.build(out_col_defs)
+    db.create_view("test.v_map", graph, "")
+
+    view = db.get_table("test.v_map")
+    plan = db.program_cache.get_program(view.table_id)
+    assert_true(plan is not None, "map_proj plan is None")
+
+    in_batch = batch.ZSetBatch(table.schema)
+    rb = RowBuilder(table.schema, in_batch)
+    _add_int_row(rb, 1, [100, 200])
+    _add_int_row(rb, 2, [300, 400])
+
+    out = plan.execute_epoch(in_batch)
+    in_batch.free()
+    assert_true(out is not None, "map_proj produced None")
+    assert_equal_i(2, out.length(), "map_proj row count")
+
+    # Verify projected values: output col 1 should be input col 2 (col_b)
+    acc = out.get_accessor(0)
+    val0 = acc.get_int_signed(1)  # output col 1 = input col_b
+    assert_equal_i64(r_int64(200), val0, "map_proj row 0 col_b")
+    acc2 = out.get_accessor(1)
+    val1 = acc2.get_int_signed(1)
+    assert_equal_i64(r_int64(400), val1, "map_proj row 1 col_b")
+    out.free()
+
+    db.drop_view("test.v_map")
+    db.drop_table("test.src")
+    db.drop_schema("test")
+    db.close()
+    log("  PASSED")
+
+
+def test_reduce_sum(base_dir):
+    """input_delta -> reduce(AGG_SUM, group=[0], agg_col=1) -> sink."""
+    log("[COMPILE] Testing reduce with SUM aggregation...")
+    db = engine.open_engine(base_dir)
+
+    db.create_schema("test")
+    # Input schema: pk(U64), val(I64)
+    table_cols = _make_table_cols_i64(["val"])
+    table = db.create_table("test.src", table_cols, 0)
+
+    from gnitz.dbsp.functions import AGG_SUM
+    builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
+    src = builder.input_delta()
+    r = builder.reduce(src, agg_func_id=AGG_SUM, group_by_cols=[0], agg_col_idx=1)
+    builder.sink(r, target_table_id=0)
+    # Reduce output: group_col(U64), agg_result(I64)
+    out_cols = [("pk", types.TYPE_U64.code), ("sum_val", types.TYPE_I64.code)]
+    graph = builder.build(out_cols)
+    db.create_view("test.v_reduce", graph, "")
+
+    view = db.get_table("test.v_reduce")
+    plan = db.program_cache.get_program(view.table_id)
+    assert_true(plan is not None, "reduce_sum plan is None")
+
+    # 3 rows with same PK=1 but different values; weight=1 each
+    in_batch = batch.ZSetBatch(table.schema)
+    rb = RowBuilder(table.schema, in_batch)
+    _add_int_row(rb, 1, [10])
+    _add_int_row(rb, 1, [20])
+    _add_int_row(rb, 1, [30])
+
+    out = plan.execute_epoch(in_batch)
+    in_batch.free()
+    assert_true(out is not None, "reduce_sum produced None")
+    # Should produce 1 group with sum = 10+20+30 = 60
+    assert_equal_i(1, out.length(), "reduce_sum row count")
+    acc = out.get_accessor(0)
+    sum_val = acc.get_int_signed(1)
+    assert_equal_i64(r_int64(60), sum_val, "reduce_sum value")
+    out.free()
+
+    db.drop_view("test.v_reduce")
+    db.drop_table("test.src")
+    db.drop_schema("test")
+    db.close()
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -801,6 +952,18 @@ def entry_point(argv):
         ensure_dir(base_dir)
 
         test_anti_semi_complement(base_dir)
+        cleanup(base_dir)
+        ensure_dir(base_dir)
+
+        test_filter_with_expr(base_dir)
+        cleanup(base_dir)
+        ensure_dir(base_dir)
+
+        test_map_projection(base_dir)
+        cleanup(base_dir)
+        ensure_dir(base_dir)
+
+        test_reduce_sum(base_dir)
 
         log("\nALL COMPILE_GRAPH TESTS PASSED")
     except Exception as e:

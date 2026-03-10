@@ -219,7 +219,7 @@ class ProgramCache(object):
         if not self.registry.has_id(sys.DepTab.ID): return fallback
         deps_family = self.registry.get_by_id(sys.DepTab.ID)
         cursor = deps_family.store.create_cursor()
-        result = fallback
+        result = None
         try:
             while cursor.is_valid():
                 if cursor.weight() <= r_int64(0):
@@ -237,7 +237,12 @@ class ProgramCache(object):
                 cursor.advance()
         finally:
             cursor.close()
-        return result
+        if result is not None:
+            return result
+        if fallback is not None:
+            return fallback
+        raise LayoutError("Cannot resolve primary input schema for view %d: "
+                          "no dependency record found" % program_id)
 
     def compile_from_graph(self, view_id):
         nodes = self._load_nodes(view_id)
@@ -341,15 +346,38 @@ class ProgramCache(object):
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
                 out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
                 reg_file.registers[reg_id] = out_reg
-                func_id = node_params.get(opcodes.PARAM_FUNC_ID, 0)
-                instr = instructions.filter_op(in_reg, out_reg, NULL_PREDICATE)
+                num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
+                if num_regs > 0:
+                    result_reg = node_params.get(opcodes.PARAM_EXPR_RESULT_REG, 0)
+                    code = []
+                    idx = 0
+                    while (opcodes.PARAM_EXPR_BASE + idx) in node_params:
+                        code.append(r_int64(node_params[opcodes.PARAM_EXPR_BASE + idx]))
+                        idx += 1
+                    from gnitz.dbsp.expr import ExprProgram, ExprPredicate
+                    prog = ExprProgram(code, num_regs, result_reg)
+                    func = ExprPredicate(prog)
+                else:
+                    func = NULL_PREDICATE
+                instr = instructions.filter_op(in_reg, out_reg, func)
 
             elif op == opcodes.OPCODE_MAP:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
+                if opcodes.PARAM_PROJ_BASE in node_params:
+                    src_indices = []
+                    src_types = []
+                    idx = 0
+                    while (opcodes.PARAM_PROJ_BASE + idx) in node_params:
+                        src_col = node_params[opcodes.PARAM_PROJ_BASE + idx]
+                        src_indices.append(src_col)
+                        src_types.append(in_reg.table_schema.columns[src_col].field_type.code)
+                        idx += 1
+                    func = functions.UniversalProjection(src_indices, src_types)
+                else:
+                    func = NULL_PREDICATE
                 out_reg = runtime.DeltaRegister(reg_id, out_schema)
                 reg_file.registers[reg_id] = out_reg
-                func_id = node_params.get(opcodes.PARAM_FUNC_ID, 0)
-                instr = instructions.map_op(in_reg, out_reg, NULL_PREDICATE)
+                instr = instructions.map_op(in_reg, out_reg, func)
 
             elif op == opcodes.OPCODE_NEGATE:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
@@ -396,7 +424,12 @@ class ProgramCache(object):
             elif op == opcodes.OPCODE_REDUCE:
                 in_reg = reg_file.registers[in_regs[opcodes.PORT_IN_REDUCE]]
                 agg_func_id = node_params.get(opcodes.PARAM_AGG_FUNC_ID, 0)
-                agg_func = NULL_AGGREGATE
+                agg_col_idx = node_params.get(opcodes.PARAM_AGG_COL_IDX, 0)
+                if agg_func_id > 0:
+                    col_type = in_reg.table_schema.columns[agg_col_idx].field_type
+                    agg_func = functions.UniversalAccumulator(agg_col_idx, agg_func_id, col_type)
+                else:
+                    agg_func = NULL_AGGREGATE
                 gcols = group_cols.get(nid, [])
                 reduce_out_schema = _build_reduce_output_schema(in_reg.table_schema, gcols, agg_func)
                 trace_table = view_family.store.create_child("_reduce_%d_%d" % (view_id, nid), reduce_out_schema)

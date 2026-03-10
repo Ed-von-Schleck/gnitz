@@ -50,3 +50,8 @@ PARAM_CHUNK_LIMIT  = 2   # SCAN_TRACE: max records per tick
 PARAM_TABLE_ID     = 3   # INTEGRATE: target table id
 PARAM_JUMP_TARGET  = 4   # JUMP: target pc (kept for compatibility)
 PARAM_YIELD_REASON = 5   # YIELD: reason code
+PARAM_AGG_COL_IDX    = 6   # REDUCE: which column to aggregate
+PARAM_EXPR_NUM_REGS  = 7   # FILTER: expression register count
+PARAM_EXPR_RESULT_REG = 8  # FILTER: which register holds the result
+PARAM_PROJ_BASE      = 32  # MAP: slots 32..63 = source col index per output col
+PARAM_EXPR_BASE      = 64  # FILTER: slots 64..255 = expression bytecode words

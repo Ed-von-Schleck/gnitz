@@ -70,10 +70,16 @@ class ExprProgram(object):
     _immutable_fields_ = ['code[*]', 'num_regs', 'result_reg', 'num_instrs']
 
     def __init__(self, code, num_regs, result_reg):
-        self.code = code            # list of r_int64, 4 words per instruction
+        self.code = code[:]         # copy: [*] requires a never-resized list
         self.num_regs = num_regs
         self.result_reg = result_reg
         self.num_instrs = len(code) // 4
+
+    def code_as_ints(self):
+        result = []
+        for w in self.code:
+            result.append(intmask(w))
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +392,7 @@ class ExprBuilder(object):
     # --- Build ---
 
     def build(self, result_reg):
-        return ExprProgram(self._code[:], self._next_reg, result_reg)
+        return ExprProgram(self._code, self._next_reg, result_reg)
 
     def build_predicate(self, result_reg):
         return ExprPredicate(self.build(result_reg))

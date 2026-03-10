@@ -63,16 +63,24 @@ class CircuitBuilder(object):
         self._sources.append((handle.node_id, table_id))
         return handle
 
-    def filter(self, input_handle, func_id):
+    def filter(self, input_handle, func_id=0, expr_code=None, expr_num_regs=0, expr_result_reg=0):
         handle = self._alloc_node(OPCODE_FILTER)
         self._connect(input_handle, handle, PORT_IN)
         self._params.append((handle.node_id, PARAM_FUNC_ID, func_id))
+        if expr_code is not None:
+            self._params.append((handle.node_id, PARAM_EXPR_NUM_REGS, expr_num_regs))
+            self._params.append((handle.node_id, PARAM_EXPR_RESULT_REG, expr_result_reg))
+            for i in range(len(expr_code)):
+                self._params.append((handle.node_id, PARAM_EXPR_BASE + i, expr_code[i]))
         return handle
 
-    def map(self, input_handle, func_id):
+    def map(self, input_handle, func_id=0, projection=None):
         handle = self._alloc_node(OPCODE_MAP)
         self._connect(input_handle, handle, PORT_IN)
         self._params.append((handle.node_id, PARAM_FUNC_ID, func_id))
+        if projection is not None:
+            for i in range(len(projection)):
+                self._params.append((handle.node_id, PARAM_PROJ_BASE + i, projection[i]))
         return handle
 
     def negate(self, input_handle):
@@ -109,10 +117,11 @@ class CircuitBuilder(object):
         self._connect(input_handle, handle, PORT_IN_DISTINCT)
         return handle
 
-    def reduce(self, input_handle, agg_func_id, group_by_cols):
+    def reduce(self, input_handle, agg_func_id, group_by_cols, agg_col_idx=0):
         handle = self._alloc_node(OPCODE_REDUCE)
         self._connect(input_handle, handle, PORT_IN_REDUCE)
         self._params.append((handle.node_id, PARAM_AGG_FUNC_ID, agg_func_id))
+        self._params.append((handle.node_id, PARAM_AGG_COL_IDX, agg_col_idx))
         for col_idx in group_by_cols:
             self._group_cols.append((handle.node_id, col_idx))
         return handle
@@ -158,6 +167,8 @@ class CircuitBuilder(object):
 
     def build(self, output_col_defs):
         deps = []
+        if self.primary_source_id > 0 and self.primary_source_id not in deps:
+            deps.append(self.primary_source_id)
         for node_id, table_id in self._sources:
             if table_id > 0 and table_id not in deps:
                 deps.append(table_id)
