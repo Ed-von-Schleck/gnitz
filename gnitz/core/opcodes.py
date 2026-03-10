@@ -21,6 +21,10 @@ OPCODE_SEEK_TRACE       = 12
 OPCODE_YIELD            = 13
 OPCODE_JUMP             = 14
 OPCODE_CLEAR_DELTAS     = 15
+OPCODE_ANTI_JOIN_DELTA_TRACE = 16
+OPCODE_ANTI_JOIN_DELTA_DELTA = 17
+OPCODE_SEMI_JOIN_DELTA_TRACE = 18
+OPCODE_SEMI_JOIN_DELTA_DELTA = 19
 
 # --- Input port indices (dst_port values in _circuit_edges) ---
 # Unary ops

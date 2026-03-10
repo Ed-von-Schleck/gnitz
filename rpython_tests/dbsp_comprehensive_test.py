@@ -16,7 +16,7 @@ from rpython.rlib.longlong2float import float2longlong
 
 from gnitz.core import types, batch
 from gnitz.core.batch import RowBuilder
-from gnitz.dbsp.ops import linear, join, reduce, distinct, source
+from gnitz.dbsp.ops import linear, join, anti_join, reduce, distinct, source
 from gnitz.dbsp import functions
 from gnitz.storage.ephemeral_table import EphemeralTable
 
@@ -646,6 +646,289 @@ def test_reduce_count(base_dir):
         trace_out.close()
 
 
+def test_anti_join_basic(base_dir):
+    """
+    Anti-join: A has keys 1,2,3. B has keys 2,3. Output should be key 1 only.
+    """
+    log("[DBSP] Testing Anti-Join basic...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_a = batch.ArenaZSetBatch(schema)
+    b_b = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb_a = RowBuilder(schema, b_a)
+        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.put_int(r_int64(10))
+        rb_a.commit()
+        rb_a.begin(r_uint128(2), r_int64(1))
+        rb_a.put_int(r_int64(20))
+        rb_a.commit()
+        rb_a.begin(r_uint128(3), r_int64(1))
+        rb_a.put_int(r_int64(30))
+        rb_a.commit()
+
+        rb_b = RowBuilder(schema, b_b)
+        rb_b.begin(r_uint128(2), r_int64(1))
+        rb_b.put_int(r_int64(200))
+        rb_b.commit()
+        rb_b.begin(r_uint128(3), r_int64(1))
+        rb_b.put_int(r_int64(300))
+        rb_b.commit()
+
+        log("  - Delta-Delta Anti-Join...")
+        anti_join.op_anti_join_delta_delta(b_a, b_b, b_out, schema)
+        assert_equal_i(1, b_out.length(), "Anti-join should emit 1 row")
+        assert_equal_u128(r_uint128(1), b_out.get_pk(0), "Anti-join should emit key 1")
+        assert_equal_i64(r_int64(1), b_out.get_weight(0), "Anti-join weight should be 1")
+
+        log("  - Delta-Trace Anti-Join...")
+        b_out.clear()
+        trace_path = os.path.join(base_dir, "aj_trace")
+        trace_b = EphemeralTable(trace_path, "tr", schema)
+        trace_b.ingest_batch(b_b)
+
+        cursor_b = trace_b.create_cursor()
+        anti_join.op_anti_join_delta_trace(b_a, cursor_b, b_out, schema)
+        cursor_b.close()
+
+        assert_equal_i(1, b_out.length(), "Anti-join DT should emit 1 row")
+        assert_equal_u128(r_uint128(1), b_out.get_pk(0), "Anti-join DT should emit key 1")
+
+        trace_b.close()
+
+    finally:
+        b_a.free()
+        b_b.free()
+        b_out.free()
+
+
+def test_anti_join_empty_right(base_dir):
+    """When B is empty, all of A should be emitted."""
+    log("[DBSP] Testing Anti-Join empty right...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_a = batch.ArenaZSetBatch(schema)
+    b_b = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb_a = RowBuilder(schema, b_a)
+        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.put_int(r_int64(10))
+        rb_a.commit()
+        rb_a.begin(r_uint128(2), r_int64(1))
+        rb_a.put_int(r_int64(20))
+        rb_a.commit()
+
+        anti_join.op_anti_join_delta_delta(b_a, b_b, b_out, schema)
+        assert_equal_i(2, b_out.length(), "Empty-right anti-join should emit all A rows")
+
+    finally:
+        b_a.free()
+        b_b.free()
+        b_out.free()
+
+
+def test_anti_join_full_overlap(base_dir):
+    """When all A keys exist in B, output should be empty."""
+    log("[DBSP] Testing Anti-Join full overlap...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_a = batch.ArenaZSetBatch(schema)
+    b_b = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb_a = RowBuilder(schema, b_a)
+        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.put_int(r_int64(10))
+        rb_a.commit()
+
+        rb_b = RowBuilder(schema, b_b)
+        rb_b.begin(r_uint128(1), r_int64(1))
+        rb_b.put_int(r_int64(99))
+        rb_b.commit()
+
+        anti_join.op_anti_join_delta_delta(b_a, b_b, b_out, schema)
+        assert_equal_i(0, b_out.length(), "Full-overlap anti-join should be empty")
+
+    finally:
+        b_a.free()
+        b_b.free()
+        b_out.free()
+
+
+def test_anti_join_weight_semantics(base_dir):
+    """
+    Only positive-weight B records count as 'present'.
+    B has key=1 with w=-1 (retraction) -> should NOT suppress A's key=1.
+    """
+    log("[DBSP] Testing Anti-Join weight semantics...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_a = batch.ArenaZSetBatch(schema)
+    b_b = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb_a = RowBuilder(schema, b_a)
+        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.put_int(r_int64(10))
+        rb_a.commit()
+
+        # B has key=1 but with negative weight (retraction)
+        rb_b = RowBuilder(schema, b_b)
+        rb_b.begin(r_uint128(1), r_int64(-1))
+        rb_b.put_int(r_int64(99))
+        rb_b.commit()
+
+        anti_join.op_anti_join_delta_delta(b_a, b_b, b_out, schema)
+        assert_equal_i(1, b_out.length(), "Negative-weight B should not suppress A")
+        assert_equal_u128(r_uint128(1), b_out.get_pk(0), "Should emit key 1")
+
+    finally:
+        b_a.free()
+        b_b.free()
+        b_out.free()
+
+
+def test_semi_join_basic(base_dir):
+    """
+    Semi-join: A has keys 1,2,3. B has keys 2,3. Output should be keys 2,3.
+    """
+    log("[DBSP] Testing Semi-Join basic...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_a = batch.ArenaZSetBatch(schema)
+    b_b = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb_a = RowBuilder(schema, b_a)
+        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.put_int(r_int64(10))
+        rb_a.commit()
+        rb_a.begin(r_uint128(2), r_int64(1))
+        rb_a.put_int(r_int64(20))
+        rb_a.commit()
+        rb_a.begin(r_uint128(3), r_int64(1))
+        rb_a.put_int(r_int64(30))
+        rb_a.commit()
+
+        rb_b = RowBuilder(schema, b_b)
+        rb_b.begin(r_uint128(2), r_int64(1))
+        rb_b.put_int(r_int64(200))
+        rb_b.commit()
+        rb_b.begin(r_uint128(3), r_int64(1))
+        rb_b.put_int(r_int64(300))
+        rb_b.commit()
+
+        log("  - Delta-Delta Semi-Join...")
+        anti_join.op_semi_join_delta_delta(b_a, b_b, b_out, schema)
+        assert_equal_i(2, b_out.length(), "Semi-join should emit 2 rows")
+
+        # Verify the output has left-side values (not right-side)
+        found_key2 = False
+        found_key3 = False
+        for i in range(b_out.length()):
+            pk = b_out.get_pk(i)
+            val = b_out.get_accessor(i).get_int_signed(1)
+            if pk == r_uint128(2):
+                found_key2 = True
+                assert_equal_i64(r_int64(20), val, "Semi-join key 2 should have left val")
+            elif pk == r_uint128(3):
+                found_key3 = True
+                assert_equal_i64(r_int64(30), val, "Semi-join key 3 should have left val")
+        assert_true(found_key2, "Semi-join missing key 2")
+        assert_true(found_key3, "Semi-join missing key 3")
+
+        log("  - Delta-Trace Semi-Join...")
+        b_out.clear()
+        trace_path = os.path.join(base_dir, "sj_trace")
+        trace_b = EphemeralTable(trace_path, "tr", schema)
+        trace_b.ingest_batch(b_b)
+
+        cursor_b = trace_b.create_cursor()
+        anti_join.op_semi_join_delta_trace(b_a, cursor_b, b_out, schema)
+        cursor_b.close()
+
+        assert_equal_i(2, b_out.length(), "Semi-join DT should emit 2 rows")
+
+        trace_b.close()
+
+    finally:
+        b_a.free()
+        b_b.free()
+        b_out.free()
+
+
+def test_anti_semi_join_complement(base_dir):
+    """
+    Anti-join and semi-join should be complements:
+    anti_join(A, B) + semi_join(A, B) = A (after consolidation).
+    """
+    log("[DBSP] Testing Anti/Semi-Join complement property...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_a = batch.ArenaZSetBatch(schema)
+    b_b = batch.ArenaZSetBatch(schema)
+    b_anti = batch.ArenaZSetBatch(schema)
+    b_semi = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb_a = RowBuilder(schema, b_a)
+        for pk in range(1, 6):  # keys 1..5
+            rb_a.begin(r_uint128(pk), r_int64(1))
+            rb_a.put_int(r_int64(pk * 10))
+            rb_a.commit()
+
+        rb_b = RowBuilder(schema, b_b)
+        for pk in [2, 4]:  # B has keys 2 and 4
+            rb_b.begin(r_uint128(pk), r_int64(1))
+            rb_b.put_int(r_int64(pk * 100))
+            rb_b.commit()
+
+        anti_join.op_anti_join_delta_delta(b_a, b_b, b_anti, schema)
+        anti_join.op_semi_join_delta_delta(b_a, b_b, b_semi, schema)
+
+        total = b_anti.length() + b_semi.length()
+        assert_equal_i(5, total, "Anti + Semi should cover all A rows")
+        assert_equal_i(3, b_anti.length(), "Anti-join should have 3 rows (keys 1,3,5)")
+        assert_equal_i(2, b_semi.length(), "Semi-join should have 2 rows (keys 2,4)")
+
+    finally:
+        b_a.free()
+        b_b.free()
+        b_anti.free()
+        b_semi.free()
+
+
 def test_source_ops(base_dir):
     log("[DBSP] Testing Source Ops...")
 
@@ -704,6 +987,12 @@ def entry_point(argv):
         test_reduce_group_becomes_empty(base_dir)
         test_reduce_multiple_groups(base_dir)
         test_reduce_count(base_dir)
+        test_anti_join_basic(base_dir)
+        test_anti_join_empty_right(base_dir)
+        test_anti_join_full_overlap(base_dir)
+        test_anti_join_weight_semantics(base_dir)
+        test_semi_join_basic(base_dir)
+        test_anti_semi_join_complement(base_dir)
         test_source_ops(base_dir)
         log("\nALL DBSP TESTS PASSED")
     except Exception as e:

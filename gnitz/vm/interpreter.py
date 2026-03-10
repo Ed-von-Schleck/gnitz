@@ -174,6 +174,54 @@ def run_vm(program, reg_file, context):
             assert reg_in is not None
             ops.op_integrate(reg_in.batch, instr.target_table)
 
+        elif opcode == op.OPCODE_ANTI_JOIN_DELTA_TRACE:
+            reg_delta = instr.reg_delta
+            reg_trace = instr.reg_trace
+            reg_out = instr.reg_out
+            assert reg_delta is not None and reg_trace is not None and reg_out is not None
+            ops.op_anti_join_delta_trace(
+                reg_delta.batch,
+                reg_trace.cursor,
+                batch.BatchWriter(reg_out.batch),
+                reg_delta.table_schema
+            )
+
+        elif opcode == op.OPCODE_ANTI_JOIN_DELTA_DELTA:
+            reg_a = instr.reg_a
+            reg_b = instr.reg_b
+            reg_out = instr.reg_out
+            assert reg_a is not None and reg_b is not None and reg_out is not None
+            ops.op_anti_join_delta_delta(
+                reg_a.batch,
+                reg_b.batch,
+                batch.BatchWriter(reg_out.batch),
+                reg_a.table_schema
+            )
+
+        elif opcode == op.OPCODE_SEMI_JOIN_DELTA_TRACE:
+            reg_delta = instr.reg_delta
+            reg_trace = instr.reg_trace
+            reg_out = instr.reg_out
+            assert reg_delta is not None and reg_trace is not None and reg_out is not None
+            ops.op_semi_join_delta_trace(
+                reg_delta.batch,
+                reg_trace.cursor,
+                batch.BatchWriter(reg_out.batch),
+                reg_delta.table_schema
+            )
+
+        elif opcode == op.OPCODE_SEMI_JOIN_DELTA_DELTA:
+            reg_a = instr.reg_a
+            reg_b = instr.reg_b
+            reg_out = instr.reg_out
+            assert reg_a is not None and reg_b is not None and reg_out is not None
+            ops.op_semi_join_delta_delta(
+                reg_a.batch,
+                reg_b.batch,
+                batch.BatchWriter(reg_out.batch),
+                reg_a.table_schema
+            )
+
         elif opcode == op.OPCODE_REDUCE:
             reg_in = instr.reg_in
             reg_trace_out = instr.reg_trace_out

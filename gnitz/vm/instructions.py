@@ -181,5 +181,37 @@ def jump_op(target_idx):
     return i
 
 
+def anti_join_delta_trace_op(reg_delta, reg_trace, reg_out):
+    i = Instruction(op.OPCODE_ANTI_JOIN_DELTA_TRACE)
+    i.reg_delta = reg_delta
+    i.reg_trace = reg_trace
+    i.reg_out = reg_out
+    return i
+
+
+def anti_join_delta_delta_op(reg_a, reg_b, reg_out):
+    i = Instruction(op.OPCODE_ANTI_JOIN_DELTA_DELTA)
+    i.reg_a = reg_a
+    i.reg_b = reg_b
+    i.reg_out = reg_out
+    return i
+
+
+def semi_join_delta_trace_op(reg_delta, reg_trace, reg_out):
+    i = Instruction(op.OPCODE_SEMI_JOIN_DELTA_TRACE)
+    i.reg_delta = reg_delta
+    i.reg_trace = reg_trace
+    i.reg_out = reg_out
+    return i
+
+
+def semi_join_delta_delta_op(reg_a, reg_b, reg_out):
+    i = Instruction(op.OPCODE_SEMI_JOIN_DELTA_DELTA)
+    i.reg_a = reg_a
+    i.reg_b = reg_b
+    i.reg_out = reg_out
+    return i
+
+
 def clear_deltas_op():
     return Instruction(op.OPCODE_CLEAR_DELTAS)
