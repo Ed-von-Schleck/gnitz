@@ -117,6 +117,32 @@ class CircuitBuilder(object):
             self._group_cols.append((handle.node_id, col_idx))
         return handle
 
+    def anti_join(self, delta_handle, trace_table_id):
+        trace_src = self.trace_scan(trace_table_id)
+        handle = self._alloc_node(OPCODE_ANTI_JOIN_DELTA_TRACE)
+        self._connect(delta_handle, handle, PORT_DELTA)
+        self._connect(trace_src, handle, PORT_TRACE)
+        return handle
+
+    def anti_join_delta_delta(self, handle_a, handle_b):
+        handle = self._alloc_node(OPCODE_ANTI_JOIN_DELTA_DELTA)
+        self._connect(handle_a, handle, PORT_IN_A)
+        self._connect(handle_b, handle, PORT_IN_B)
+        return handle
+
+    def semi_join(self, delta_handle, trace_table_id):
+        trace_src = self.trace_scan(trace_table_id)
+        handle = self._alloc_node(OPCODE_SEMI_JOIN_DELTA_TRACE)
+        self._connect(delta_handle, handle, PORT_DELTA)
+        self._connect(trace_src, handle, PORT_TRACE)
+        return handle
+
+    def semi_join_delta_delta(self, handle_a, handle_b):
+        handle = self._alloc_node(OPCODE_SEMI_JOIN_DELTA_DELTA)
+        self._connect(handle_a, handle, PORT_IN_A)
+        self._connect(handle_b, handle, PORT_IN_B)
+        return handle
+
     def seek(self, trace_handle, key_handle):
         handle = self._alloc_node(OPCODE_SEEK_TRACE)
         self._connect(trace_handle, handle, PORT_TRACE)

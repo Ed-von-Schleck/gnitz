@@ -274,7 +274,16 @@ class ProgramCache(object):
         for _, src, dst, port in edges:
             if opcode_of.get(src, -1) == opcodes.OPCODE_SCAN_TRACE:
                 if port == opcodes.PORT_TRACE:
-                    trace_side_sources[src] = True
+                    # Only treat as trace-side if the destination actually
+                    # consumes a cursor (join/anti_join/semi_join delta_trace,
+                    # seek_trace).  PORT_TRACE == PORT_IN_B == 1, so without
+                    # this check, UNION's B input would be misidentified.
+                    dst_op = opcode_of.get(dst, -1)
+                    if (dst_op == opcodes.OPCODE_JOIN_DELTA_TRACE or
+                        dst_op == opcodes.OPCODE_ANTI_JOIN_DELTA_TRACE or
+                        dst_op == opcodes.OPCODE_SEMI_JOIN_DELTA_TRACE or
+                        dst_op == opcodes.OPCODE_SEEK_TRACE):
+                        trace_side_sources[src] = True
 
         extra_regs = 0
         for nid, op in nodes:
@@ -420,6 +429,34 @@ class ProgramCache(object):
                 out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
                 reg_file.registers[reg_id] = out_reg
                 instr = instructions.delay_op(in_reg, out_reg)
+
+            elif op == opcodes.OPCODE_ANTI_JOIN_DELTA_TRACE:
+                delta_reg = reg_file.registers[in_regs[opcodes.PORT_DELTA]]
+                trace_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE]]
+                out_reg = runtime.DeltaRegister(reg_id, delta_reg.table_schema)
+                reg_file.registers[reg_id] = out_reg
+                instr = instructions.anti_join_delta_trace_op(delta_reg, trace_reg, out_reg)
+
+            elif op == opcodes.OPCODE_ANTI_JOIN_DELTA_DELTA:
+                reg_a = reg_file.registers[in_regs[opcodes.PORT_IN_A]]
+                reg_b = reg_file.registers[in_regs[opcodes.PORT_IN_B]]
+                out_reg = runtime.DeltaRegister(reg_id, reg_a.table_schema)
+                reg_file.registers[reg_id] = out_reg
+                instr = instructions.anti_join_delta_delta_op(reg_a, reg_b, out_reg)
+
+            elif op == opcodes.OPCODE_SEMI_JOIN_DELTA_TRACE:
+                delta_reg = reg_file.registers[in_regs[opcodes.PORT_DELTA]]
+                trace_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE]]
+                out_reg = runtime.DeltaRegister(reg_id, delta_reg.table_schema)
+                reg_file.registers[reg_id] = out_reg
+                instr = instructions.semi_join_delta_trace_op(delta_reg, trace_reg, out_reg)
+
+            elif op == opcodes.OPCODE_SEMI_JOIN_DELTA_DELTA:
+                reg_a = reg_file.registers[in_regs[opcodes.PORT_IN_A]]
+                reg_b = reg_file.registers[in_regs[opcodes.PORT_IN_B]]
+                out_reg = runtime.DeltaRegister(reg_id, reg_a.table_schema)
+                reg_file.registers[reg_id] = out_reg
+                instr = instructions.semi_join_delta_delta_op(reg_a, reg_b, out_reg)
 
             elif op == opcodes.OPCODE_SEEK_TRACE:
                 trace_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE]]
