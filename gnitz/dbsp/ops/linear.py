@@ -22,20 +22,25 @@ Each function now accepts a BatchWriter for the output register.
 def op_filter(in_batch, out_writer, func):
     """
     Retains only records for which the predicate returns True.
-    Weights and payloads are forwarded via zero-copy accessor transfer.
+    Uses contiguous-range bulk copy to bypass per-row accessor dispatch.
 
     in_batch:   ArenaZSetBatch
     out_writer: BatchWriter  (strictly write-only destination)
     func:       ScalarFunction  (evaluate_predicate)
     """
     n = in_batch.length()
+    range_start = -1
     for i in range(n):
         accessor = in_batch.get_accessor(i)
-        if func is not None:
-            if func.evaluate_predicate(accessor):
-                out_writer.append_from_accessor(
-                    in_batch.get_pk(i), in_batch.get_weight(i), accessor
-                )
+        if func is not None and func.evaluate_predicate(accessor):
+            if range_start < 0:
+                range_start = i
+        else:
+            if range_start >= 0:
+                out_writer.append_batch(in_batch, range_start, i)
+                range_start = -1
+    if range_start >= 0:
+        out_writer.append_batch(in_batch, range_start, n)
 
 
 @jit.unroll_safe

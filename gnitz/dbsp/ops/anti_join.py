@@ -2,7 +2,7 @@
 
 from rpython.rlib.rarithmetic import r_int64, intmask
 
-from gnitz.core.batch import SortedScope
+from gnitz.core.batch import ConsolidatedScope
 
 """
 Anti-Join and Semi-Join Operators for the DBSP algebra.
@@ -67,8 +67,8 @@ def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
     out_writer: BatchWriter     — strictly write-only destination
     left_schema: TableSchema    — schema of batch_a (= output schema)
     """
-    with SortedScope(batch_a) as b_a:
-        with SortedScope(batch_b) as b_b:
+    with ConsolidatedScope(batch_a) as b_a:
+        with ConsolidatedScope(batch_b) as b_b:
             idx_a = 0
             idx_b = 0
             n_a = b_a.length()
@@ -91,19 +91,13 @@ def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
                             break
                         scan_b += 1
 
+                # Find end of key group in b_a
+                start_a = idx_a
+                while idx_a < n_a and b_a.get_pk(idx_a) == key_a:
+                    idx_a += 1
+
                 if not has_match:
-                    # Emit all a rows at this key
-                    while idx_a < n_a and b_a.get_pk(idx_a) == key_a:
-                        wa = b_a.get_weight(idx_a)
-                        if wa != r_int64(0):
-                            out_writer.append_from_accessor(
-                                key_a, wa, b_a.get_accessor(idx_a)
-                            )
-                        idx_a += 1
-                else:
-                    # Skip all a rows at this key
-                    while idx_a < n_a and b_a.get_pk(idx_a) == key_a:
-                        idx_a += 1
+                    out_writer.append_batch(b_a, start_a, idx_a)
 
 
 def op_semi_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema):
@@ -154,8 +148,8 @@ def op_semi_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
     out_writer: BatchWriter     — strictly write-only destination
     left_schema: TableSchema    — schema of batch_a (= output schema)
     """
-    with SortedScope(batch_a) as b_a:
-        with SortedScope(batch_b) as b_b:
+    with ConsolidatedScope(batch_a) as b_a:
+        with ConsolidatedScope(batch_b) as b_b:
             idx_a = 0
             idx_b = 0
             n_a = b_a.length()
@@ -178,16 +172,10 @@ def op_semi_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
                             break
                         scan_b += 1
 
+                # Find end of key group in b_a
+                start_a = idx_a
+                while idx_a < n_a and b_a.get_pk(idx_a) == key_a:
+                    idx_a += 1
+
                 if has_match:
-                    # Emit all a rows at this key
-                    while idx_a < n_a and b_a.get_pk(idx_a) == key_a:
-                        wa = b_a.get_weight(idx_a)
-                        if wa != r_int64(0):
-                            out_writer.append_from_accessor(
-                                key_a, wa, b_a.get_accessor(idx_a)
-                            )
-                        idx_a += 1
-                else:
-                    # Skip all a rows at this key
-                    while idx_a < n_a and b_a.get_pk(idx_a) == key_a:
-                        idx_a += 1
+                    out_writer.append_batch(b_a, start_a, idx_a)
