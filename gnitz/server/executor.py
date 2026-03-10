@@ -28,6 +28,28 @@ STATUS_OK = 0
 STATUS_ERROR = 1
 
 
+def _validate_schema_match(wire_schema, expected_schema):
+    """Validates that a wire schema matches the expected schema."""
+    wire_cols = wire_schema.columns
+    exp_cols = expected_schema.columns
+    if len(wire_cols) != len(exp_cols):
+        raise errors.StorageError(
+            "Schema mismatch: expected %d columns, got %d"
+            % (len(exp_cols), len(wire_cols))
+        )
+    if wire_schema.pk_index != expected_schema.pk_index:
+        raise errors.StorageError(
+            "Schema mismatch: expected pk_index=%d, got %d"
+            % (expected_schema.pk_index, wire_schema.pk_index)
+        )
+    for i in range(len(wire_cols)):
+        if wire_cols[i].field_type.code != exp_cols[i].field_type.code:
+            raise errors.StorageError(
+                "Schema mismatch at column %d: expected type %d, got %d"
+                % (i, exp_cols[i].field_type.code, wire_cols[i].field_type.code)
+            )
+
+
 class ServerExecutor(object):
     """
     Coordinates IPC sessions and the Reactive DAG.
@@ -143,16 +165,36 @@ class ServerExecutor(object):
     def _handle_client_data(self, fd):
         payload = None
         try:
-            payload = ipc.receive_payload(fd, self.engine.registry)
+            payload = ipc.receive_payload(fd)
             client_id = intmask(payload.client_id)
             target_id = intmask(payload.target_id)
+
+            # ID allocation
+            if payload.flags & ipc.FLAG_ALLOCATE_ID and target_id == 0:
+                target_id = self.engine.registry.allocate_table_id()
 
             if client_id > 0:
                 self.fd_to_client[fd] = client_id
                 self.client_to_fd[client_id] = fd
 
+            # Schema validation (if pushing data)
+            if payload.batch is not None and payload.schema is not None:
+                family = self.engine.registry.get_by_id(target_id)
+                _validate_schema_match(payload.schema, family.schema)
+
             result = self.handle_push(target_id, payload.batch)
-            ipc.send_batch(fd, target_id, result, STATUS_OK, "", client_id)
+
+            # Response always includes schema
+            resp_schema = None
+            if result is not None:
+                resp_schema = result._schema
+            else:
+                family = self.engine.registry.get_by_id(target_id)
+                resp_schema = family.schema
+            ipc.send_batch(
+                fd, target_id, result, STATUS_OK, "",
+                client_id, schema=resp_schema,
+            )
             if result is not None:
                 result.free()
 

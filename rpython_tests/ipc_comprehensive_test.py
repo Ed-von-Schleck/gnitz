@@ -17,31 +17,6 @@ from gnitz.server import ipc, ipc_ffi
 
 
 # ------------------------------------------------------------------------------
-# Mock Registry for IPC testing
-# ------------------------------------------------------------------------------
-
-
-class MockFamily(object):
-    def __init__(self, schema):
-        self._schema = schema
-
-    def get_schema(self):
-        return self._schema
-
-
-class MockRegistry(object):
-    def __init__(self, schema, tid):
-        self.family = MockFamily(schema)
-        self.tid = tid
-
-    def has_id(self, tid):
-        return tid == self.tid
-
-    def get_by_id(self, tid):
-        return self.family
-
-
-# ------------------------------------------------------------------------------
 # Assertions & Helpers
 # ------------------------------------------------------------------------------
 
@@ -65,6 +40,15 @@ def make_test_schema():
     cols = [
         types.ColumnDefinition(types.TYPE_U64, name="id"),
         types.ColumnDefinition(types.TYPE_STRING, name="data"),
+    ]
+    return types.TableSchema(cols, 0)
+
+
+def make_int_only_schema():
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
+        types.ColumnDefinition(types.TYPE_U32, name="flag"),
     ]
     return types.TableSchema(cols, 0)
 
@@ -144,68 +128,39 @@ def test_ipc_fd_hardening():
         s2.close()
 
 
-def test_ipc_bounds_and_forgery():
-    """Verifies that the receiver detects malicious/overflowing headers."""
-    os.write(1, "[IPC] Testing Header Validation & Overflow Protection...\n")
+def test_meta_schema_roundtrip():
+    """Verifies schema -> batch -> schema roundtrip."""
+    os.write(1, "[IPC] Testing Meta-Schema Roundtrip...\n")
 
     schema = make_test_schema()
-    registry = MockRegistry(schema, 42)
-    fd = mmap_posix.memfd_create_c("malicious_header")
+    schema_batch = ipc.schema_to_batch(schema)
 
-    try:
-        total_sz = 1024
-        mmap_posix.ftruncate_c(fd, total_sz)
-        ptr = mmap_posix.mmap_file(
-            fd,
-            total_sz,
-            prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
+    assert_equal_i(2, schema_batch.length(), "Schema batch should have 2 rows")
+
+    reconstructed = ipc.batch_to_schema(schema_batch)
+
+    assert_equal_i(
+        len(schema.columns),
+        len(reconstructed.columns),
+        "Column count mismatch",
+    )
+    assert_equal_i(schema.pk_index, reconstructed.pk_index, "PK index mismatch")
+
+    for i in range(len(schema.columns)):
+        assert_equal_i(
+            schema.columns[i].field_type.code,
+            reconstructed.columns[i].field_type.code,
+            "Type code mismatch at col %d" % i,
         )
 
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_MAGIC))[
-            0
-        ] = ipc.MAGIC_IPC
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_TARGET_ID))[
-            0
-        ] = r_uint64(42)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_COUNT))[
-            0
-        ] = r_uint64(99999)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_BLOB_SZ))[
-            0
-        ] = r_uint64(0)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_NUM_COLS))[
-            0
-        ] = r_uint64(2)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, ipc.OFF_PK_INDEX))[
-            0
-        ] = r_uint64(0)
-
-        s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
-        try:
-            ipc_ffi.send_fd(s1.fd, fd)
-
-            raised = False
-            try:
-                ipc.receive_payload(s2.fd, registry)
-            except errors.StorageError:
-                raised = True
-            assert_true(
-                raised, "IPC layer failed to detect column buffer overflow"
-            )
-        finally:
-            s1.close()
-            s2.close()
-            mmap_posix.munmap_file(ptr, total_sz)
-    finally:
-        os.close(fd)
+    schema_batch.free()
 
 
-def test_zero_copy_roundtrip():
-    """Verifies full serialization, transport, and reconstruction."""
-    os.write(1, "[IPC] Testing Zero-Copy Roundtrip...\n")
+def test_v2_roundtrip():
+    """Verifies full v2 serialize + receive with mixed columns (ints + strings)."""
+    os.write(1, "[IPC] Testing V2 Full Roundtrip...\n")
 
     schema = make_test_schema()
-    registry = MockRegistry(schema, 42)
     s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
 
     try:
@@ -214,36 +169,47 @@ def test_zero_copy_roundtrip():
         rb.begin(r_uint128(42), r_int64(1))
         rb.put_string("Hello Zero-Copy World")
         rb.commit()
+        rb.begin(r_uint128(99), r_int64(1))
+        rb.put_string("Short")
+        rb.commit()
 
-        ipc.send_batch(s1.fd, 42, zbatch, status=0, error_msg="Success")
+        ipc.send_batch(s1.fd, 42, zbatch, status=0, error_msg="")
 
-        payload = ipc.receive_payload(s2.fd, registry)
+        payload = ipc.receive_payload(s2.fd)
 
         assert_equal_i(0, payload.status, "Status mismatch")
-        assert_true(
-            payload.error_msg == "Success", "Error msg mismatch"
+        assert_true(payload.schema is not None, "Schema should be present")
+        assert_true(payload.batch is not None, "Batch should be present")
+        assert_equal_i(2, payload.batch.length(), "Batch count mismatch")
+
+        # Verify schema
+        assert_equal_i(
+            len(schema.columns),
+            len(payload.schema.columns),
+            "Schema column count mismatch",
+        )
+        assert_equal_i(
+            schema.columns[0].field_type.code,
+            payload.schema.columns[0].field_type.code,
+            "Schema col 0 type mismatch",
+        )
+        assert_equal_i(
+            schema.columns[1].field_type.code,
+            payload.schema.columns[1].field_type.code,
+            "Schema col 1 type mismatch",
         )
 
+        # Verify data
         rec_batch = payload.batch
-        assert_true(rec_batch is not None, "Batch should not be None")
-        assert_equal_i(1, rec_batch.length(), "Batch count mismatch")
-        assert_true(
-            rec_batch.pk_lo_buf.is_owned == False,
-            "Received batch should use unowned views",
-        )
-
         acc = rec_batch.get_accessor(0)
-        assert_true(
-            acc.get_str_struct(1)[4] is None,
-            "Accessor should point to raw memory, not Python str",
-        )
-
         length, prefix, sptr, hptr, py_s = acc.get_str_struct(1)
-        s = py_s if py_s is not None else string_logic.unpack_string(sptr, hptr)
-        assert_true(
-            s == "Hello Zero-Copy World",
-            "String corruption in transport",
-        )
+        s = string_logic.resolve_string(sptr, hptr, py_s)
+        assert_true(s == "Hello Zero-Copy World", "String corruption row 0")
+
+        acc = rec_batch.get_accessor(1)
+        length, prefix, sptr, hptr, py_s = acc.get_str_struct(1)
+        s = string_logic.resolve_string(sptr, hptr, py_s)
+        assert_true(s == "Short", "String corruption row 1")
 
         payload.close()
         zbatch.free()
@@ -252,24 +218,66 @@ def test_zero_copy_roundtrip():
         s2.close()
 
 
-def test_executor_error_path():
-    """Verifies that VM errors are sent without dummy batch allocations."""
-    os.write(1, "[IPC] Testing Executor Error Propagation...\n")
+def test_v2_int_only_roundtrip():
+    """Verifies v2 roundtrip with integer-only schema (no strings)."""
+    os.write(1, "[IPC] Testing V2 Int-Only Roundtrip...\n")
 
-    schema = make_test_schema()
-    registry = MockRegistry(schema, 42)
+    schema = make_int_only_schema()
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+
+    try:
+        zbatch = batch.ArenaZSetBatch(schema, initial_capacity=10)
+        rb = RowBuilder(schema, zbatch)
+        rb.begin(r_uint128(1), r_int64(1))
+        rb.put_int(r_int64(42))
+        rb.put_int(r_int64(7))
+        rb.commit()
+        rb.begin(r_uint128(2), r_int64(1))
+        rb.put_int(r_int64(-100))
+        rb.put_int(r_int64(255))
+        rb.commit()
+
+        ipc.send_batch(s1.fd, 10, zbatch, status=0)
+
+        payload = ipc.receive_payload(s2.fd)
+
+        assert_equal_i(0, payload.status, "Status mismatch")
+        assert_true(payload.batch is not None, "Batch should be present")
+        assert_equal_i(2, payload.batch.length(), "Row count mismatch")
+
+        acc = payload.batch.get_accessor(0)
+        assert_equal_i(42, intmask(r_uint64(acc.get_int(1))), "Row 0 col 1 mismatch")
+
+        acc = payload.batch.get_accessor(1)
+        val = rffi.cast(rffi.LONGLONG, acc.get_int(1))
+        assert_equal_i(-100, intmask(val), "Row 1 col 1 mismatch")
+
+        payload.close()
+        zbatch.free()
+    finally:
+        s1.close()
+        s2.close()
+
+
+def test_v2_error_path():
+    """Verifies that error responses work via v2 format."""
+    os.write(1, "[IPC] Testing V2 Error Path...\n")
+
     s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
 
     try:
         ipc.send_error(s1.fd, "Fatal VM Crash")
 
-        payload = ipc.receive_payload(s2.fd, registry)
+        payload = ipc.receive_payload(s2.fd)
         assert_equal_i(1, payload.status, "Error status mismatch")
         assert_true(
             payload.error_msg == "Fatal VM Crash", "Error string mismatch"
         )
         assert_true(
             payload.batch is None, "Error payload should have no batch"
+        )
+        assert_true(
+            payload.schema is None, "Error payload should have no schema"
         )
 
         payload.close()
@@ -278,19 +286,164 @@ def test_executor_error_path():
         s2.close()
 
 
+def test_v2_scan_request():
+    """Verifies empty push (scan request) has no schema or data."""
+    os.write(1, "[IPC] Testing V2 Scan Request (empty push)...\n")
+
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+
+    try:
+        # Send empty push (scan request): no data, no schema
+        ipc.send_batch(s1.fd, 42, None, status=0)
+
+        payload = ipc.receive_payload(s2.fd)
+        assert_equal_i(0, payload.status, "Status mismatch")
+        assert_true(payload.batch is None, "Scan request should have no batch")
+        assert_equal_i(42, payload.target_id, "Target ID mismatch")
+
+        payload.close()
+    finally:
+        s1.close()
+        s2.close()
+
+
+def test_v2_ipc_string_encoding():
+    """Verifies IPC string encoding with various lengths."""
+    os.write(1, "[IPC] Testing V2 IPC String Encoding...\n")
+
+    schema = make_test_schema()
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+
+    try:
+        zbatch = batch.ArenaZSetBatch(schema, initial_capacity=10)
+        rb = RowBuilder(schema, zbatch)
+
+        test_strings = [
+            "",         # empty
+            "Hi",       # 2 bytes (short, fits in prefix)
+            "Test",     # 4 bytes (exact prefix length)
+            "Hello World!",  # 12 bytes (SHORT_STRING_THRESHOLD)
+            "13 bytes str!",  # 13 bytes (just over threshold)
+            "A" * 100,  # 100 bytes (long string in blob)
+        ]
+
+        for i in range(len(test_strings)):
+            rb.begin(r_uint128(r_uint64(i + 1)), r_int64(1))
+            rb.put_string(test_strings[i])
+            rb.commit()
+
+        ipc.send_batch(s1.fd, 42, zbatch, status=0)
+
+        payload = ipc.receive_payload(s2.fd)
+        assert_equal_i(len(test_strings), payload.batch.length(), "Row count mismatch")
+
+        for i in range(len(test_strings)):
+            acc = payload.batch.get_accessor(i)
+            length, prefix, sptr, hptr, py_s = acc.get_str_struct(1)
+            s = string_logic.resolve_string(sptr, hptr, py_s)
+            assert_true(
+                s == test_strings[i],
+                "String mismatch at row %d: '%s' != '%s'" % (i, s, test_strings[i]),
+            )
+
+        payload.close()
+        zbatch.free()
+    finally:
+        s1.close()
+        s2.close()
+
+
+def test_v2_null_strings():
+    """Verifies NULL string encoding roundtrip."""
+    os.write(1, "[IPC] Testing V2 NULL String Encoding...\n")
+
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_STRING, is_nullable=True, name="data"),
+    ]
+    schema = types.TableSchema(cols, 0)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+
+    try:
+        zbatch = batch.ArenaZSetBatch(schema, initial_capacity=10)
+        rb = RowBuilder(schema, zbatch)
+
+        # Row with non-null string
+        rb.begin(r_uint128(1), r_int64(1))
+        rb.put_string("not null")
+        rb.commit()
+
+        # Row with null string
+        rb.begin(r_uint128(2), r_int64(1))
+        rb.put_null()
+        rb.commit()
+
+        ipc.send_batch(s1.fd, 42, zbatch, status=0)
+
+        payload = ipc.receive_payload(s2.fd)
+        assert_equal_i(2, payload.batch.length(), "Row count mismatch")
+
+        # Row 0: non-null
+        acc = payload.batch.get_accessor(0)
+        assert_true(not acc.is_null(1), "Row 0 should not be null")
+        length, prefix, sptr, hptr, py_s = acc.get_str_struct(1)
+        s = string_logic.resolve_string(sptr, hptr, py_s)
+        assert_true(s == "not null", "Row 0 string mismatch")
+
+        # Row 1: null
+        acc = payload.batch.get_accessor(1)
+        assert_true(acc.is_null(1), "Row 1 should be null")
+
+        payload.close()
+        zbatch.free()
+    finally:
+        s1.close()
+        s2.close()
+
+
+def test_v2_schema_mismatch():
+    """Verifies that schema validation rejects mismatched schemas."""
+    os.write(1, "[IPC] Testing V2 Schema Mismatch Detection...\n")
+
+    from gnitz.server.executor import _validate_schema_match
+
+    schema_a = make_test_schema()
+    schema_b = make_int_only_schema()
+
+    raised = False
+    try:
+        _validate_schema_match(schema_a, schema_b)
+    except errors.StorageError:
+        raised = True
+    assert_true(raised, "Schema validation should reject mismatched schemas")
+
+    # Same schema should pass
+    schema_c = make_test_schema()
+    _validate_schema_match(schema_a, schema_c)
+
+
+# Bring in intmask for int comparisons
+from rpython.rlib.rarithmetic import intmask
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
 
 
 def entry_point(argv):
-    os.write(1, "--- GnitzDB IPC Transport Test ---\n")
+    os.write(1, "--- GnitzDB IPC Transport Test (v2) ---\n")
     try:
         test_unowned_buffer_lifecycle()
         test_ipc_fd_hardening()
-        test_ipc_bounds_and_forgery()
-        test_zero_copy_roundtrip()
-        test_executor_error_path()
+        test_meta_schema_roundtrip()
+        test_v2_roundtrip()
+        test_v2_int_only_roundtrip()
+        test_v2_error_path()
+        test_v2_scan_request()
+        test_v2_ipc_string_encoding()
+        test_v2_null_strings()
+        test_v2_schema_mismatch()
         os.write(1, "\nALL IPC TRANSPORT TESTS PASSED\n")
     except Exception:
         os.write(2, "TESTING FAILED\n")

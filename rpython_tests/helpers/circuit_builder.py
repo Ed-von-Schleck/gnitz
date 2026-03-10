@@ -1,4 +1,4 @@
-# gnitz/client/circuit_builder.py
+# rpython_tests/helpers/circuit_builder.py
 
 from gnitz.core.opcodes import *
 

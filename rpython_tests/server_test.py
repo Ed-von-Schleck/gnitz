@@ -317,7 +317,7 @@ def test_reactive_view_via_push(srv, source_table_id):
     log("[SERVER] Testing reactive view via push...")
 
     from gnitz.dbsp.expr import ExprBuilder
-    from gnitz.client.circuit_builder import CircuitBuilder
+    from rpython_tests.helpers.circuit_builder import CircuitBuilder
 
     # Build expression: col1 > 150
     eb = ExprBuilder()

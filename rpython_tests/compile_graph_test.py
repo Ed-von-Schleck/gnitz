@@ -22,7 +22,7 @@ from gnitz.core.errors import LayoutError
 from gnitz.catalog import engine
 from gnitz.catalog.registry import ingest_to_family
 from gnitz.catalog.metadata import ensure_dir
-from gnitz.client.circuit_builder import CircuitBuilder
+from rpython_tests.helpers.circuit_builder import CircuitBuilder
 
 
 # ------------------------------------------------------------------------------
