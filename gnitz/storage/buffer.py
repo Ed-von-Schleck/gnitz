@@ -9,9 +9,14 @@ from rpython.rlib import jit
 # Correctly define the compilation info to include the C string header
 eci = ExternalCompilationInfo(includes=["string.h"])
 
-# Declare memmove as an external C function.
+# Declare libc functions as external C functions.
 c_memmove = rffi.llexternal(
     "memmove", [rffi.VOIDP, rffi.VOIDP, rffi.SIZE_T], rffi.VOIDP, compilation_info=eci
+)
+
+c_memset = rffi.llexternal(
+    "memset", [rffi.VOIDP, rffi.INT, rffi.SIZE_T], rffi.VOIDP,
+    compilation_info=eci, _nowrapper=True,
 )
 
 
