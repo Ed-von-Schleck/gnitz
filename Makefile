@@ -64,8 +64,14 @@ clean:
 	@rm -f $(TEST_BINS)
 	@rm -rf $(TEST_DATA_DIRS)
 
-.PHONY: server
+.PHONY: server pytest pytest-only
 
 server:
 	$(RPYTHON) $(RPYFLAGS) gnitz/server/main.py
 	@mv main-c gnitz-server-c
+
+pytest: server
+	cd py_client && uv run pytest tests/ -v
+
+pytest-only:
+	cd py_client && uv run pytest tests/ -v

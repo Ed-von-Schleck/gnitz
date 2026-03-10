@@ -122,3 +122,16 @@ ArenaZSetBatch (Columnar buffers in memory)
     │                           Compaction (Columnar merge)
     │
     └──→ DBSP Ops (Vectorized column-at-a-time processing)
+```
+
+# Appendix D: Make Targets
+
+| Target | Description |
+|---|---|
+| `make test` | Compile and run all RPython test suites |
+| `make server` | Compile the server binary (`gnitz-server-c`) |
+| `make pytest` | Build server, then run Python E2E tests |
+| `make pytest-only` | Run Python E2E tests without rebuilding server |
+| `make clean` | Remove test binaries and data directories |
+
+The `pytest` targets use `uv run pytest` inside `py_client/`. Test fixtures manage server lifecycle automatically (start, stop, temp directory cleanup).
