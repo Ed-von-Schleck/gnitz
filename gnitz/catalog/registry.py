@@ -309,12 +309,12 @@ class EntityRegistry(object):
     def get(self, schema_name, table_name):
         qualified = schema_name + "." + table_name
         if qualified not in self._by_name:
-            raise KeyError(qualified)
+            raise LayoutError("Unknown entity: %s" % qualified)
         return self._by_name[qualified]
 
     def get_by_id(self, table_id):
         if table_id not in self._by_id:
-            raise KeyError("table_id %d" % table_id)
+            raise LayoutError("Unknown table_id %d" % table_id)
         return self._by_id[table_id]
 
     def has_id(self, table_id):

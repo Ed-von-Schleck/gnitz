@@ -22,12 +22,14 @@ IPC_C_CODE = """
 #endif
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/uio.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <fcntl.h>
 
 /* MSG_NOSIGNAL prevents the kernel from sending SIGPIPE and killing the DB
    when writing to a client that just abruptly disconnected. */
@@ -165,6 +167,41 @@ int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int ti
 
     return res;
 }
+
+int gnitz_server_create(const char *socket_path) {
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (fd < 0) return -1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    unlink(socket_path);
+
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -2;
+    }
+    if (listen(fd, 1024) < 0) {
+        close(fd);
+        return -3;
+    }
+
+    /* Set non-blocking */
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    return fd;
+}
+
+int gnitz_server_accept(int server_fd) {
+    int client_fd;
+    do {
+        client_fd = accept(server_fd, NULL, NULL);
+    } while (client_fd < 0 && errno == EINTR);
+    return client_fd;
+}
 """
 
 
@@ -172,10 +209,12 @@ eci = ExternalCompilationInfo(
     pre_include_bits=[
         "int gnitz_ipc_send_fd(int sock_fd, int fd_to_send);",
         "int gnitz_ipc_recv_fd(int sock_fd);",
-        "int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int timeout_ms);"
+        "int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int timeout_ms);",
+        "int gnitz_server_create(const char *socket_path);",
+        "int gnitz_server_accept(int server_fd);",
     ],
     separate_module_sources=[IPC_C_CODE],
-    includes=["sys/socket.h", "sys/uio.h", "string.h", "unistd.h", "errno.h", "poll.h", "stdlib.h"],
+    includes=["sys/socket.h", "sys/un.h", "sys/uio.h", "string.h", "unistd.h", "errno.h", "poll.h", "stdlib.h", "fcntl.h"],
 )
 
 _gnitz_ipc_send_fd = rffi.llexternal(
@@ -259,5 +298,35 @@ def poll(fds, events, timeout_ms):
         lltype.free(c_fds, flavor='raw')
         lltype.free(c_events, flavor='raw')
         lltype.free(c_revents, flavor='raw')
-        
+
     return revents
+
+
+_gnitz_server_create = rffi.llexternal(
+    "gnitz_server_create",
+    [rffi.CCHARP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_gnitz_server_accept = rffi.llexternal(
+    "gnitz_server_accept",
+    [rffi.INT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+
+def server_create(socket_path):
+    """Creates a Unix SEQPACKET server socket, binds, and listens.
+    Returns the server fd, or a negative value on error."""
+    buf = rffi.str2charp(socket_path)
+    try:
+        return int(_gnitz_server_create(buf))
+    finally:
+        rffi.free_charp(buf)
+
+
+def server_accept(server_fd):
+    """Accepts a new client connection. Returns client fd or -1."""
+    return int(_gnitz_server_accept(rffi.cast(rffi.INT, server_fd)))

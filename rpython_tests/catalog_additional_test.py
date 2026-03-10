@@ -160,10 +160,10 @@ def test_orphaned_metadata_recovery(base_dir):
     try:
         engine2 = open_engine(db_path)
         engine2.close()
-    except KeyError:
+    except LayoutError:
         raised = True
     if not raised:
-        raise Exception("Orphaned index should cause a KeyError on reload")
+        raise Exception("Orphaned index should cause a LayoutError on reload")
     os.write(1, "    [OK] Orphaned metadata correctly rejected.\n")
 
 

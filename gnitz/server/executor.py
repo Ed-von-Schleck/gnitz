@@ -1,7 +1,7 @@
 # gnitz/server/executor.py
 
 import os
-from rpython.rlib import rsocket, jit
+from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 
@@ -64,25 +64,15 @@ class ServerExecutor(object):
 
         # Connection Registries
         self.active_fds = newlist_hint(16)
-        self.client_sockets = {}  # int(fd) -> RSocket
+        self.client_fds = {}  # int(fd) -> 1 (set of known client fds)
         self.fd_to_client = {}  # int(fd) -> int(client_id)
         self.client_to_fd = {}  # int(client_id) -> int(fd)
 
     def run_socket_server(self, socket_path):
-        if os.path.exists(socket_path):
-            try:
-                os.unlink(socket_path)
-            except OSError:
-                pass
-
-        server_sock = rsocket.RSocket(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
-        server_sock.bind(rsocket.UnixAddress(socket_path))
-        server_sock.listen(1024)
-        server_sock.setblocking(False)
-
-        server_fd = server_sock.fd
+        server_fd = ipc_ffi.server_create(socket_path)
+        if server_fd < 0:
+            raise errors.StorageError("Failed to create server socket")
         self.active_fds.append(server_fd)
-        self.client_sockets[server_fd] = server_sock
 
         while True:
             jit.promote(self.engine)
@@ -109,15 +99,12 @@ class ServerExecutor(object):
 
                 if rev & ipc_ffi.POLLIN:
                     if fd == server_fd:
-                        try:
-                            while True:
-                                client_sock, _ = server_sock.accept()
-                                client_sock.setblocking(False)
-                                c_fd = client_sock.fd
-                                self.active_fds.append(c_fd)
-                                self.client_sockets[c_fd] = client_sock
-                        except rsocket.SocketError:
-                            pass
+                        while True:
+                            c_fd = ipc_ffi.server_accept(server_fd)
+                            if c_fd < 0:
+                                break
+                            self.active_fds.append(c_fd)
+                            self.client_fds[c_fd] = 1
                     else:
                         self._handle_client_data(fd)
 
@@ -199,7 +186,7 @@ class ServerExecutor(object):
                 result.free()
 
         except errors.GnitzError as ge:
-            err_msg = ge.msg if hasattr(ge, "msg") else str(ge)
+            err_msg = ge.msg
             tid = intmask(payload.target_id) if payload else 0
             cid = intmask(payload.client_id) if payload else 0
             ipc.send_error(fd, err_msg, target_id=tid, client_id=cid)
@@ -292,14 +279,13 @@ class ServerExecutor(object):
         pass
 
     def _cleanup_client(self, fd):
-        if fd in self.client_sockets:
-            sock = self.client_sockets[fd]
+        if fd in self.client_fds:
             try:
-                sock.close()
-            except rsocket.SocketError:
+                os.close(intmask(fd))
+            except OSError:
                 pass
-            del self.client_sockets[fd]
-        
+            del self.client_fds[fd]
+
         if fd in self.fd_to_client:
             client_id = self.fd_to_client[fd]
             if client_id in self.client_to_fd:

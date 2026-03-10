@@ -6,7 +6,8 @@ Exception hierarchy for GnitzDB storage subsystem.
 
 class GnitzError(Exception):
     """Base class for all GnitzDB exceptions."""
-    pass
+    def __init__(self, msg=""):
+        self.msg = msg
 
 class StorageError(GnitzError):
     """Base class for storage subsystem errors."""

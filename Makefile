@@ -63,3 +63,9 @@ clean:
 	@echo "Cleaning all test binaries and data directories..."
 	@rm -f $(TEST_BINS)
 	@rm -rf $(TEST_DATA_DIRS)
+
+.PHONY: server
+
+server:
+	$(RPYTHON) $(RPYFLAGS) gnitz/server/main.py
+	@mv main-c gnitz-server-c

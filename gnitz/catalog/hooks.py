@@ -126,7 +126,6 @@ class TableEffectHook(DeltaHook):
 
             sid = intmask(acc.get_int(sys.TableTab.COL_SCHEMA_ID))
             name = sys.read_string(acc, sys.TableTab.COL_NAME)
-            directory = sys.read_string(acc, sys.TableTab.COL_DIRECTORY)
             pk_col_idx = intmask(acc.get_int(sys.TableTab.COL_PK_COL_IDX))
 
             if weight > 0:
@@ -142,10 +141,14 @@ class TableEffectHook(DeltaHook):
                     )
                     continue
 
+                schema_name = self.registry.get_schema_name(sid)
+                directory = (
+                    self.base_dir + "/" + schema_name + "/" + name + "_" + str(tid)
+                )
+
                 tbl_schema = TableSchema(col_defs, pk_col_idx)
                 pt = PersistentTable(directory, name, tbl_schema, table_id=tid)
 
-                schema_name = self.registry.get_schema_name(sid)
                 mmap_posix.fsync_dir(self.base_dir + "/" + schema_name)
 
                 family = TableFamily(
@@ -228,7 +231,6 @@ class ViewEffectHook(DeltaHook):
 
             sid = intmask(acc.get_int(sys.ViewTab.COL_SCHEMA_ID))
             name = sys.read_string(acc, sys.ViewTab.COL_NAME)
-            directory = sys.read_string(acc, sys.ViewTab.COL_CACHE_DIRECTORY)
 
             if weight > 0:
                 if self.registry.has_id(vid):
@@ -243,9 +245,13 @@ class ViewEffectHook(DeltaHook):
                     )
                     continue
 
+                schema_name = self.registry.get_schema_name(sid)
+                directory = (
+                    self.base_dir + "/" + schema_name + "/view_" + name + "_" + str(vid)
+                )
+
                 tbl_schema = TableSchema(col_defs, pk_index=0)
                 et = EphemeralTable(directory, name, tbl_schema, table_id=vid)
-                schema_name = self.registry.get_schema_name(sid)
 
                 family = TableFamily(schema_name, name, vid, sid, directory, 0, et)
 

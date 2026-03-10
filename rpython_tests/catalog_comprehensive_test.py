@@ -401,15 +401,15 @@ def test_edge_cases(base_dir):
         if not raised:
             raise Exception("Allowed to create table with multiple dots")
 
-        # 17. get_table raises KeyError on nonexistent
+        # 17. get_table raises LayoutError on nonexistent
         raised = False
         try:
             engine.get_table("public.nonexistent")
-        except KeyError:
+        except LayoutError:
             raised = True
         if not raised:
             raise Exception(
-                "get_table on non-existent table should raise KeyError"
+                "get_table on non-existent table should raise LayoutError"
             )
 
         # 18. schema_is_empty logic
@@ -445,10 +445,10 @@ def test_edge_cases(base_dir):
         raised = False
         try:
             engine.registry.get_by_id(999999)
-        except KeyError:
+        except LayoutError:
             raised = True
         if not raised:
-            raise Exception("get_by_id on invalid ID should raise KeyError")
+            raise Exception("get_by_id on invalid ID should raise LayoutError")
 
         engine.drop_table("public.reg_test")
 

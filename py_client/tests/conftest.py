@@ -1,0 +1,60 @@
+"""Session-scoped server fixture and per-test client fixture."""
+
+import os
+import subprocess
+import tempfile
+import time
+import shutil
+
+import pytest
+
+from gnitz_client import GnitzClient
+
+
+@pytest.fixture(scope="session")
+def server():
+    """Start gnitz-server-c, yield the socket path, kill on teardown."""
+    tmpdir = tempfile.mkdtemp(prefix="gnitz_e2e_")
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+
+    binary = os.environ.get(
+        "GNITZ_SERVER_BIN",
+        os.path.join(os.path.dirname(__file__), "..", "..", "gnitz-server-c"),
+    )
+    binary = os.path.abspath(binary)
+
+    if not os.path.isfile(binary):
+        pytest.skip(f"Server binary not found: {binary}")
+
+    proc = subprocess.Popen(
+        [binary, data_dir, sock_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Wait for socket to appear
+    for _ in range(100):  # 10s timeout
+        if os.path.exists(sock_path):
+            break
+        time.sleep(0.1)
+    else:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+        raise RuntimeError(
+            f"Server failed to start.\nstdout: {stdout.decode()}\nstderr: {stderr.decode()}"
+        )
+
+    yield sock_path
+
+    proc.kill()
+    proc.wait()
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@pytest.fixture
+def client(server):
+    """Per-test client connection."""
+    c = GnitzClient(server)
+    yield c
+    c.close()
