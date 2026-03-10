@@ -13,7 +13,8 @@ TEST_FILES := \
 	rpython_tests/catalog_comprehensive_test.py \
 	rpython_tests/catalog_additional_test.py \
 	rpython_tests/vm_comprehensive_test.py \
-	rpython_tests/ipc_comprehensive_test.py
+	rpython_tests/ipc_comprehensive_test.py \
+	rpython_tests/expr_test.py
 
 # Derived names for cleanup
 TEST_BINS := $(notdir $(TEST_FILES:.py=-c))
