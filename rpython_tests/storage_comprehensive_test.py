@@ -465,7 +465,7 @@ def test_shards_and_columnar(base_dir):
 
     # Calculate absolute file offsets via pointer arithmetic on the mmap
     # Offset = (Region Pointer) - (File Base Pointer)
-    off_pk = rffi.cast(lltype.Signed, view1.pk_buf.ptr) - rffi.cast(
+    off_pk = rffi.cast(lltype.Signed, view1.pk_lo_buf.ptr) - rffi.cast(
         lltype.Signed, view1.ptr
     )
     off_blob = rffi.cast(lltype.Signed, view1.blob_buf.ptr) - rffi.cast(
@@ -854,18 +854,21 @@ def test_xor8_filter(base_dir):
     from gnitz.storage.xor8 import build_xor8, save_xor8, load_xor8
 
     num_keys = 200
-    key_size = 8
-    pk_buf = lltype.malloc(rffi.CCHARP.TO, num_keys * key_size, flavor="raw")
+    pk_lo_buf = lltype.malloc(rffi.CCHARP.TO, num_keys * 8, flavor="raw")
+    pk_hi_buf = lltype.malloc(rffi.CCHARP.TO, num_keys * 8, flavor="raw")
     try:
         i = 0
         while i < num_keys:
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(pk_buf, i * key_size))[
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(pk_lo_buf, i * 8))[
                 0
             ] = rffi.cast(rffi.ULONGLONG, r_uint64(i + 1))
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(pk_hi_buf, i * 8))[
+                0
+            ] = rffi.cast(rffi.ULONGLONG, r_uint64(0))
             i += 1
 
         # 1. Construction + no false negatives
-        xf = build_xor8(pk_buf, num_keys, key_size)
+        xf = build_xor8(pk_lo_buf, pk_hi_buf, num_keys)
         assert_true(xf is not None, "XOR8 build returned None")
 
         for i in range(num_keys):
@@ -895,24 +898,33 @@ def test_xor8_filter(base_dir):
         xf2.free()
         xf.free()
     finally:
-        lltype.free(pk_buf, flavor="raw")
+        lltype.free(pk_lo_buf, flavor="raw")
+        lltype.free(pk_hi_buf, flavor="raw")
 
     # 4. Small set (2 keys)
-    small_buf = lltype.malloc(rffi.CCHARP.TO, 2 * key_size, flavor="raw")
+    small_lo = lltype.malloc(rffi.CCHARP.TO, 2 * 8, flavor="raw")
+    small_hi = lltype.malloc(rffi.CCHARP.TO, 2 * 8, flavor="raw")
     try:
-        rffi.cast(rffi.ULONGLONGP, small_buf)[0] = rffi.cast(
+        rffi.cast(rffi.ULONGLONGP, small_lo)[0] = rffi.cast(
             rffi.ULONGLONG, r_uint64(999)
         )
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(small_buf, 8))[0] = rffi.cast(
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(small_lo, 8))[0] = rffi.cast(
             rffi.ULONGLONG, r_uint64(1000)
         )
-        xf3 = build_xor8(small_buf, 2, key_size)
+        rffi.cast(rffi.ULONGLONGP, small_hi)[0] = rffi.cast(
+            rffi.ULONGLONG, r_uint64(0)
+        )
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(small_hi, 8))[0] = rffi.cast(
+            rffi.ULONGLONG, r_uint64(0)
+        )
+        xf3 = build_xor8(small_lo, small_hi, 2)
         assert_true(xf3 is not None, "XOR8 small set build failed")
         assert_true(xf3.may_contain(r_uint128(999)), "XOR8 small FN key 999")
         assert_true(xf3.may_contain(r_uint128(1000)), "XOR8 small FN key 1000")
         xf3.free()
     finally:
-        lltype.free(small_buf, flavor="raw")
+        lltype.free(small_lo, flavor="raw")
+        lltype.free(small_hi, flavor="raw")
 
     # 5. load_xor8 returns None for missing file
     missing = load_xor8(os.path.join(base_dir, "nonexistent.xor8"))

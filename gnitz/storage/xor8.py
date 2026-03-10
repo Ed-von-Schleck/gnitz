@@ -86,18 +86,13 @@ class Xor8Filter(object):
             self.fingerprints = lltype.nullptr(rffi.CCHARP.TO)
 
 
-def _read_key_from_buf(keys_ptr, i, key_size):
-    offset = i * key_size
-    ptr = rffi.ptradd(keys_ptr, offset)
-    if key_size == 16:
-        lo = r_uint64(rffi.cast(rffi.ULONGLONGP, ptr)[0])
-        hi = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0])
-        return (r_uint128(hi) << 64) | r_uint128(lo)
-    else:
-        return r_uint128(rffi.cast(rffi.ULONGLONGP, ptr)[0])
+def _read_key_from_bufs(pk_lo_ptr, pk_hi_ptr, i):
+    lo_p = rffi.cast(rffi.ULONGLONGP, pk_lo_ptr)
+    hi_p = rffi.cast(rffi.ULONGLONGP, pk_hi_ptr)
+    return (r_uint128(hi_p[i]) << 64) | r_uint128(lo_p[i])
 
 
-def build_xor8(keys_ptr, num_keys, key_size):
+def build_xor8(pk_lo_ptr, pk_hi_ptr, num_keys):
     if num_keys == 0:
         return None
 
@@ -134,7 +129,7 @@ def build_xor8(keys_ptr, num_keys, key_size):
 
             i = 0
             while i < num_keys:
-                key_val = _read_key_from_buf(keys_ptr, i, key_size)
+                key_val = _read_key_from_bufs(pk_lo_ptr, pk_hi_ptr, i)
                 h = xxh.hash_u128_inline(r_uint64(key_val), r_uint64(key_val >> 64), seed_lo, seed_hi)
                 h0, h1, h2 = _get_h0_h1_h2(h, segment_length)
 

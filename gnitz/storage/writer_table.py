@@ -55,7 +55,8 @@ class TableShardWriter(object):
         self.count = 0
         pk_col = schema.get_pk_column()
 
-        self.pk_buf = buffer.Buffer(pk_col.field_type.size * 1024, growable=True)
+        self.pk_lo_buf = buffer.Buffer(8 * 1024, growable=True)
+        self.pk_hi_buf = buffer.Buffer(8 * 1024, growable=True)
         self.w_buf = buffer.Buffer(8 * 1024, growable=True)
 
         num_cols = len(schema.columns)
@@ -213,15 +214,14 @@ class TableShardWriter(object):
         if weight == 0:
             return
         self.count += 1
-        if self.schema.get_pk_column().field_type.size == 16:
-            self.pk_buf.put_u128(key)
-        else:
-            self.pk_buf.put_u64(r_uint64(key))
+        self.pk_lo_buf.put_u64(r_uint64(key))
+        self.pk_hi_buf.put_u64(r_uint64(key >> 64))
         self.w_buf.put_i64(weight)
         self._append_from_accessor(accessor)
 
     def close(self):
-        self.pk_buf.free()
+        self.pk_lo_buf.free()
+        self.pk_hi_buf.free()
         self.w_buf.free()
         self.null_buf.free()
         i = 0
@@ -242,7 +242,7 @@ class TableShardWriter(object):
         try:
             dummy_region = (lltype.nullptr(rffi.CCHARP.TO), 0, 0)
 
-            num_cols_with_pk_w = 2 + (len(self.col_bufs) - 1)
+            num_cols_with_pk_w = 3 + (len(self.col_bufs) - 1)
             num_regions = num_cols_with_pk_w + 1 + 1  # +1 for null bitmap region
 
             # Use newlist_hint to avoid mr-poisoning
@@ -250,11 +250,12 @@ class TableShardWriter(object):
             for _ in range(num_regions):
                 region_list.append(dummy_region)
 
-            region_list[0] = (self.pk_buf.ptr, 0, self.pk_buf.offset)
-            region_list[1] = (self.w_buf.ptr, 0, self.w_buf.offset)
-            region_list[2] = (self.null_buf.ptr, 0, self.null_buf.offset)
+            region_list[0] = (self.pk_lo_buf.ptr, 0, self.pk_lo_buf.offset)
+            region_list[1] = (self.pk_hi_buf.ptr, 0, self.pk_hi_buf.offset)
+            region_list[2] = (self.w_buf.ptr, 0, self.w_buf.offset)
+            region_list[3] = (self.null_buf.ptr, 0, self.null_buf.offset)
 
-            reg_idx = 3
+            reg_idx = 4
             i = 0
             num_bufs = len(self.col_bufs)
             while i < num_bufs:
@@ -355,8 +356,7 @@ class TableShardWriter(object):
             if self.count > 0:
                 from gnitz.storage.xor8 import build_xor8
 
-                pk_size = self.schema.get_pk_column().field_type.size
-                xor8_filter = build_xor8(self.pk_buf.ptr, self.count, pk_size)
+                xor8_filter = build_xor8(self.pk_lo_buf.ptr, self.pk_hi_buf.ptr, self.count)
         finally:
             rposix.close(fd)
             self.close()

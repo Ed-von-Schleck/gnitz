@@ -1,7 +1,7 @@
 from rpython.rlib.rarithmetic import r_uint64
 
 MAGIC_NUMBER = r_uint64(0x31305F5A54494E47)
-VERSION      = 2
+VERSION      = 3
 ALIGNMENT    = 64
 HEADER_SIZE  = 64
 DIR_ENTRY_SIZE = 24

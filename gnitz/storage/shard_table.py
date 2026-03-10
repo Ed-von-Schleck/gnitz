@@ -26,7 +26,8 @@ class TableShardView(object):
         "schema",
         "ptr",
         "size",
-        "pk_buf",
+        "pk_lo_buf",
+        "pk_hi_buf",
         "w_buf",
         "null_buf",
         "col_bufs",
@@ -61,6 +62,13 @@ class TableShardView(object):
                 if rffi.cast(rffi.ULONGLONGP, ptr)[0] != layout.MAGIC_NUMBER:
                     raise errors.CorruptShardError("Magic mismatch")
 
+                version = rffi.cast(
+                    lltype.Signed,
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, layout.OFF_VERSION))[0],
+                )
+                if version != layout.VERSION:
+                    raise errors.CorruptShardError("Unsupported shard version %d" % version)
+
                 self.ptr = ptr
                 # Row Count (u64 on disk -> Signed in memory)
                 self.count = rffi.cast(
@@ -80,7 +88,7 @@ class TableShardView(object):
                 self.dir_off = d_off
 
                 num_cols = len(schema.columns)
-                num_regions = 2 + 1 + (num_cols - 1) + 1  # PK, Weight, Null, cols, blob
+                num_regions = 3 + 1 + (num_cols - 1) + 1  # pk_lo, pk_hi, Weight, Null, cols, blob
 
                 # Lists (AoS mapping / metadata)
                 dir_checksums = newlist_hint(num_regions)
@@ -98,14 +106,15 @@ class TableShardView(object):
                     col_to_reg_map.append(0)
                 self.col_to_reg_map = col_to_reg_map
 
-                # Eagerly initialize Region 0 (PK), Region 1 (Weight), Region 2 (Null)
-                self.pk_buf = self._init_region(0)
-                self.w_buf = self._init_region(1)
-                self.null_buf = self._init_region(2)
+                # Eagerly initialize Region 0 (pk_lo), Region 1 (pk_hi), Region 2 (Weight), Region 3 (Null)
+                self.pk_lo_buf = self._init_region(0)
+                self.pk_hi_buf = self._init_region(1)
+                self.w_buf = self._init_region(2)
+                self.null_buf = self._init_region(3)
 
                 # Map column buffers to regions
                 col_bufs = newlist_hint(num_cols)
-                reg_idx = 3
+                reg_idx = 4
                 i = 0
                 while i < num_cols:
                     if i == schema.pk_index:
@@ -173,8 +182,8 @@ class TableShardView(object):
         self.dir_checksums[idx] = u_cs
         region_ptr = rffi.ptradd(base_ptr, s_off)
 
-        # 6. Eager Validation for PK/Weight (Region 0/1)
-        if self.validate_on_access and idx < 2 and s_sz > 0:
+        # 6. Eager Validation for pk_lo/pk_hi/Weight (Region 0/1/2)
+        if self.validate_on_access and idx < 3 and s_sz > 0:
             if checksum.compute_checksum(region_ptr, s_sz) != u_cs:
                 raise errors.CorruptShardError("Checksum mismatch in region %d" % idx)
             self.region_validated[idx] = True
@@ -195,32 +204,27 @@ class TableShardView(object):
     def get_pk_u64(self, index):
         if self.count == 0 or index >= self.count or index < 0:
             return r_uint64(0)
-        self._check_region(self.pk_buf, 0)
-        stride = self.schema.get_pk_column().field_type.size
-        return self.pk_buf.read_u64(index * stride)
+        self._check_region(self.pk_lo_buf, 0)
+        return self.pk_lo_buf.read_u64(index * 8)
 
     def get_pk_u128(self, index):
         if self.count == 0 or index >= self.count or index < 0:
             return r_uint128(0)
-        self._check_region(self.pk_buf, 0)
-        stride = self.schema.get_pk_column().field_type.size
-        ptr = rffi.ptradd(self.pk_buf.ptr, index * stride)
-        low = rffi.cast(rffi.ULONGLONGP, ptr)[0]
-        high = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
-        return (r_uint128(high) << 64) | r_uint128(low)
+        self._check_region(self.pk_lo_buf, 0)
+        self._check_region(self.pk_hi_buf, 1)
+        lo = self.pk_lo_buf.read_u64(index * 8)
+        hi = self.pk_hi_buf.read_u64(index * 8)
+        return (r_uint128(hi) << 64) | r_uint128(lo)
 
     def get_weight(self, index):
         if self.count == 0 or index >= self.count or index < 0:
             return 0
-        self._check_region(self.w_buf, 1)
+        self._check_region(self.w_buf, 2)
         return self.w_buf.read_i64(index * 8)
 
     def get_col_ptr(self, row_idx, col_idx):
         if col_idx == self.schema.pk_index:
-            return rffi.ptradd(
-                self.pk_buf.ptr,
-                row_idx * self.schema.get_pk_column().field_type.size,
-            )
+            return rffi.ptradd(self.pk_lo_buf.ptr, row_idx * 8)
 
         buf = self.col_bufs[col_idx]
         if buf is DUMMY_BUF:
