@@ -86,12 +86,6 @@ class Xor8Filter(object):
             self.fingerprints = lltype.nullptr(rffi.CCHARP.TO)
 
 
-def _read_key_from_bufs(pk_lo_ptr, pk_hi_ptr, i):
-    lo_p = rffi.cast(rffi.ULONGLONGP, pk_lo_ptr)
-    hi_p = rffi.cast(rffi.ULONGLONGP, pk_hi_ptr)
-    return (r_uint128(hi_p[i]) << 64) | r_uint128(lo_p[i])
-
-
 def build_xor8(pk_lo_ptr, pk_hi_ptr, num_keys):
     if num_keys == 0:
         return None
@@ -111,6 +105,8 @@ def build_xor8(pk_lo_ptr, pk_hi_ptr, num_keys):
     counts_p = rffi.cast(rffi.INTP, counts)
     keys_at_p = rffi.cast(rffi.ULONGLONGP, keys_at)
     queue_p = rffi.cast(rffi.INTP, queue_buf)
+    lo_p = rffi.cast(rffi.ULONGLONGP, pk_lo_ptr)
+    hi_p = rffi.cast(rffi.ULONGLONGP, pk_hi_ptr)
 
     seed = r_uint128(1)
     built = False
@@ -129,8 +125,7 @@ def build_xor8(pk_lo_ptr, pk_hi_ptr, num_keys):
 
             i = 0
             while i < num_keys:
-                key_val = _read_key_from_bufs(pk_lo_ptr, pk_hi_ptr, i)
-                h = xxh.hash_u128_inline(r_uint64(key_val), r_uint64(key_val >> 64), seed_lo, seed_hi)
+                h = xxh.hash_u128_inline(r_uint64(lo_p[i]), r_uint64(hi_p[i]), seed_lo, seed_hi)
                 h0, h1, h2 = _get_h0_h1_h2(h, segment_length)
 
                 counts_p[h0] = rffi.cast(rffi.INT, intmask(counts_p[h0]) + 1)
