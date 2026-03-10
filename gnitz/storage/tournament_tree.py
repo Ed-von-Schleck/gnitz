@@ -226,8 +226,9 @@ class TournamentTree(object):
             nk = cursor.peek_key()
             self.heap[heap_idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(nk))
             self.heap[heap_idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(nk >> 64))
+            # Only sift_down: cursors yield strictly increasing PKs, so
+            # new_key > old_key >= parent_key — the node can only move down.
             self._sift_down(heap_idx)
-            self._sift_up(heap_idx)
 
     def is_exhausted(self):
         return self.heap_size == 0
