@@ -89,9 +89,7 @@ class MemTable(object):
 
     def flush(self, filename, table_id=0):
         consolidated = self.batch.to_consolidated()
-        sw = writer_table.TableShardWriter(self.schema, table_id)
-        sw.add_batch(consolidated)
-        sw.finalize(filename)
+        writer_table.write_batch_to_shard(consolidated, filename, table_id)
         if consolidated is not self.batch:
             consolidated.free()
 
