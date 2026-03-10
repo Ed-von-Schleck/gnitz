@@ -30,13 +30,10 @@ class MemTable(object):
 
     def upsert_batch(self, batch):
         self._check_capacity()
+        self.batch.append_batch(batch)
         num_records = batch.length()
         for i in range(num_records):
-            pk = batch.get_pk(i)
-            w = batch.get_weight(i)
-            acc = batch.get_accessor(i)
-            self.batch.append_from_accessor(pk, w, acc)
-            self.bloom.add(pk)
+            self.bloom.add(batch.get_pk(i))
 
     def upsert_single(self, key, weight, accessor):
         self._check_capacity()
@@ -93,12 +90,7 @@ class MemTable(object):
     def flush(self, filename, table_id=0):
         consolidated = self.batch.to_consolidated()
         sw = writer_table.TableShardWriter(self.schema, table_id)
-        n = consolidated.length()
-        for i in range(n):
-            pk = consolidated.get_pk(i)
-            w = consolidated.get_weight(i)
-            acc = consolidated.get_accessor(i)
-            sw.add_row_from_accessor(pk, w, acc)
+        sw.add_batch(consolidated)
         sw.finalize(filename)
         if consolidated is not self.batch:
             consolidated.free()

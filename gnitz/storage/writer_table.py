@@ -219,6 +219,57 @@ class TableShardWriter(object):
         self.w_buf.put_i64(weight)
         self._append_from_accessor(accessor)
 
+    def add_batch(self, batch):
+        """
+        Bulk ingest from a same-schema ArenaZSetBatch.
+        Uses per-column memcpy for fixed-width columns, falling back to
+        per-row string relocation with blob deduplication for string columns.
+        """
+        n = batch.length()
+        if n == 0:
+            return
+
+        # Structural columns: pk_lo, pk_hi, weight, null
+        self.pk_lo_buf.append_from_buffer(batch.pk_lo_buf, 0, n * 8)
+        self.pk_hi_buf.append_from_buffer(batch.pk_hi_buf, 0, n * 8)
+        self.w_buf.append_from_buffer(batch.weight_buf, 0, n * 8)
+        self.null_buf.append_from_buffer(batch.null_buf, 0, n * 8)
+
+        # Payload columns
+        schema = self.schema
+        num_cols = len(schema.columns)
+        for ci in range(num_cols):
+            if ci == schema.pk_index:
+                continue
+            col_type = schema.columns[ci].field_type
+            stride = col_type.size
+
+            if col_type.code != types.TYPE_STRING.code:
+                # Fixed-width: single memcpy
+                self.col_bufs[ci].append_from_buffer(
+                    batch.col_bufs[ci], 0, n * stride
+                )
+            else:
+                # Strings: per-row relocation with blob deduplication
+                for row in range(n):
+                    src_ptr = rffi.ptradd(
+                        batch.col_bufs[ci].base_ptr, row * stride
+                    )
+                    u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
+                    length = rffi.cast(lltype.Signed, u32_ptr[0])
+                    prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+                    dest = self.col_bufs[ci].alloc(16, alignment=8)
+                    s = None
+                    if False:
+                        s = ""
+                    string_logic.relocate_string(
+                        dest, length, prefix,
+                        src_ptr, batch.blob_arena.base_ptr,
+                        s, self.blob_allocator,
+                    )
+
+        self.count += n
+
     def close(self):
         self.pk_lo_buf.free()
         self.pk_hi_buf.free()

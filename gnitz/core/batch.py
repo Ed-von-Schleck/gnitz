@@ -2,7 +2,7 @@
 
 from rpython.rlib import jit
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rtyper.lltypesystem import rffi, lltype
 
@@ -637,12 +637,167 @@ class ArenaZSetBatch(object):
         """Creates a deep copy of the batch."""
         cap = self._count if self._count > 8 else 8
         new_batch = ArenaZSetBatch(self._schema, initial_capacity=cap)
-        for i in range(self._count):
-            new_batch.append_from_accessor(
-                self.get_pk(i), self.get_weight(i), self.get_accessor(i)
-            )
+        new_batch.append_batch(self)
         new_batch._sorted = self._sorted
         return new_batch
+
+    def append_batch(self, other, start=0, end=-1):
+        """
+        Bulk-append rows [start, end) from another same-schema batch.
+        Uses per-column memcpy for fixed-width columns, falling back to
+        per-row string relocation for string columns.
+        """
+        assert not self._freed
+        if end == -1:
+            end = other._count
+        n = end - start
+        if n <= 0:
+            return
+
+        # Structural columns: pk_lo, pk_hi, weight, null (all 8-byte stride)
+        self.pk_lo_buf.append_from_buffer(other.pk_lo_buf, start * 8, n * 8)
+        self.pk_hi_buf.append_from_buffer(other.pk_hi_buf, start * 8, n * 8)
+        self.weight_buf.append_from_buffer(other.weight_buf, start * 8, n * 8)
+        self.null_buf.append_from_buffer(other.null_buf, start * 8, n * 8)
+
+        # Payload columns
+        schema = self._schema
+        has_varlen = schema.has_varlen
+        num_cols = len(schema.columns)
+        for ci in range(num_cols):
+            if ci == schema.pk_index:
+                continue
+            col_type = schema.columns[ci].field_type
+            stride = col_type.size
+
+            if not has_varlen or col_type.code != types.TYPE_STRING.code:
+                # Fixed-width: single memcpy
+                self.col_bufs[ci].append_from_buffer(
+                    other.col_bufs[ci], start * stride, n * stride
+                )
+            else:
+                # Strings: per-row relocation (blob offsets differ between arenas)
+                for row in range(start, end):
+                    src_ptr = other._col_ptr(row, ci)
+                    dest = self.col_bufs[ci].alloc(stride, alignment=col_type.alignment)
+                    u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
+                    length = rffi.cast(lltype.Signed, u32_ptr[0])
+                    prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+                    s = None
+                    if False:
+                        s = ""
+                    string_logic.relocate_string(
+                        dest, length, prefix,
+                        src_ptr, other.blob_arena.base_ptr,
+                        s, self.allocator,
+                    )
+
+        self._count += n
+        self._sorted = False
+
+    def append_batch_negated(self, other, start=0, end=-1):
+        """
+        Bulk-append rows [start, end) with all weights negated.
+        Uses per-column memcpy for payload, writes negated weights.
+        """
+        assert not self._freed
+        if end == -1:
+            end = other._count
+        n = end - start
+        if n <= 0:
+            return
+
+        # PK, null — bulk copy
+        self.pk_lo_buf.append_from_buffer(other.pk_lo_buf, start * 8, n * 8)
+        self.pk_hi_buf.append_from_buffer(other.pk_hi_buf, start * 8, n * 8)
+        self.null_buf.append_from_buffer(other.null_buf, start * 8, n * 8)
+
+        # Weight — negate during copy
+        for row in range(start, end):
+            w = other._read_weight(row)
+            self.weight_buf.put_i64(r_int64(-intmask(w)))
+
+        # Payload columns — same as append_batch
+        schema = self._schema
+        has_varlen = schema.has_varlen
+        num_cols = len(schema.columns)
+        for ci in range(num_cols):
+            if ci == schema.pk_index:
+                continue
+            col_type = schema.columns[ci].field_type
+            stride = col_type.size
+
+            if not has_varlen or col_type.code != types.TYPE_STRING.code:
+                self.col_bufs[ci].append_from_buffer(
+                    other.col_bufs[ci], start * stride, n * stride
+                )
+            else:
+                for row in range(start, end):
+                    src_ptr = other._col_ptr(row, ci)
+                    dest = self.col_bufs[ci].alloc(stride, alignment=col_type.alignment)
+                    u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
+                    length = rffi.cast(lltype.Signed, u32_ptr[0])
+                    prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+                    s = None
+                    if False:
+                        s = ""
+                    string_logic.relocate_string(
+                        dest, length, prefix,
+                        src_ptr, other.blob_arena.base_ptr,
+                        s, self.allocator,
+                    )
+
+        self._count += n
+        self._sorted = False
+
+    def _direct_append_row(self, src, src_idx, weight_override):
+        """
+        Append a single row from src batch using direct column copy (no accessor).
+        Uses weight_override instead of the source weight.
+        """
+        assert not self._freed
+        self.pk_lo_buf.put_u64(src._read_pk_lo(src_idx))
+        self.pk_hi_buf.put_u64(src._read_pk_hi(src_idx))
+        self.weight_buf.put_i64(weight_override)
+        self.null_buf.put_u64(src._read_null_word(src_idx))
+
+        schema = self._schema
+        has_varlen = schema.has_varlen
+        num_cols = len(schema.columns)
+        for ci in range(num_cols):
+            if ci == schema.pk_index:
+                continue
+            stride = self.col_strides[ci]
+            src_ptr = src._col_ptr(src_idx, ci)
+            col_type = schema.columns[ci].field_type
+
+            if not has_varlen or col_type.code != types.TYPE_STRING.code:
+                dest = self.col_bufs[ci].alloc(
+                    stride, alignment=col_type.alignment
+                )
+                buffer.c_memmove(
+                    rffi.cast(rffi.VOIDP, dest),
+                    rffi.cast(rffi.VOIDP, src_ptr),
+                    rffi.cast(rffi.SIZE_T, stride),
+                )
+            else:
+                dest = self.col_bufs[ci].alloc(
+                    stride, alignment=col_type.alignment
+                )
+                u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
+                length = rffi.cast(lltype.Signed, u32_ptr[0])
+                prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+                s = None
+                if False:
+                    s = ""
+                string_logic.relocate_string(
+                    dest, length, prefix,
+                    src_ptr, src.blob_arena.base_ptr,
+                    s, self.allocator,
+                )
+
+        self._count += 1
+        self._sorted = False
 
     def to_sorted(self):
         """
@@ -724,6 +879,7 @@ class ArenaZSetBatch(object):
     def to_consolidated(self):
         """
         Functional consolidation. Returns a new consolidated batch.
+        Uses direct column copy instead of accessor dispatch.
         """
         if self._count == 0:
             return self
@@ -760,8 +916,7 @@ class ArenaZSetBatch(object):
                 j += 1
 
             if weight_acc != 0:
-                pk = (r_uint128(pk_i_hi) << 64) | r_uint128(pk_i_lo)
-                res.append_from_accessor(pk, weight_acc, acc_a)
+                res._direct_append_row(sorted_view, i, weight_acc)
 
             i = j
 
@@ -801,6 +956,14 @@ class BatchWriter(object):
     @jit.unroll_safe
     def append_from_accessor(self, pk, weight, accessor):
         self._batch.append_from_accessor(pk, weight, accessor)
+
+    def append_batch(self, other, start=0, end=-1):
+        """Bulk column copy from another same-schema batch."""
+        self._batch.append_batch(other, start, end)
+
+    def append_batch_negated(self, other, start=0, end=-1):
+        """Bulk column copy with negated weights."""
+        self._batch.append_batch_negated(other, start, end)
 
 
 # ---------------------------------------------------------------------------

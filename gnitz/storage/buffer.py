@@ -189,6 +189,17 @@ class Buffer(object):
             for i in range(length):
                 dest[i] = "\x00"
 
+    def append_from_buffer(self, src, src_byte_offset, nbytes):
+        """Bulk-append nbytes from another buffer via memmove."""
+        if nbytes <= 0:
+            return
+        dest = self.alloc(nbytes, alignment=8)
+        c_memmove(
+            rffi.cast(rffi.VOIDP, dest),
+            rffi.cast(rffi.VOIDP, rffi.ptradd(src.base_ptr, src_byte_offset)),
+            rffi.cast(rffi.SIZE_T, nbytes),
+        )
+
     def free(self):
         if self.base_ptr:
             if self.is_owned:

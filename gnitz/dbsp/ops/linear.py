@@ -1,7 +1,6 @@
 # gnitz/dbsp/ops/linear.py
 
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, intmask
 
 from gnitz.core.batch import RowBuilder
 
@@ -11,18 +10,7 @@ Linear Operators for the DBSP algebra.
 These operators satisfy the identity L(A + B) = L(A) + L(B).
 They are stateless transformations acting on Z-Set batches.
 Each function now accepts a BatchWriter for the output register.
-
-Zero-Copy: operators pipe data between batches via accessor forwarding.
 """
-
-
-def _forward_batch(in_batch, out_writer):
-    """Copy all rows from in_batch to out_writer unchanged."""
-    n = in_batch.length()
-    for i in range(n):
-        out_writer.append_from_accessor(
-            in_batch.get_pk(i), in_batch.get_weight(i), in_batch.get_accessor(i)
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -74,13 +62,9 @@ def op_map(in_batch, out_batch, func, out_schema):
 def op_negate(in_batch, out_writer):
     """
     DBSP negation: flips the sign of every weight.
+    Uses bulk column copy with negated weight write.
     """
-    n = in_batch.length()
-    for i in range(n):
-        neg_weight = r_int64(-intmask(in_batch.get_weight(i)))
-        out_writer.append_from_accessor(
-            in_batch.get_pk(i), neg_weight, in_batch.get_accessor(i)
-        )
+    out_writer.append_batch_negated(in_batch)
 
 
 def op_union(batch_a, batch_b, out_writer):
@@ -88,9 +72,9 @@ def op_union(batch_a, batch_b, out_writer):
     Algebraic addition of two Z-Set streams.
     batch_b may be None, in which case this is an identity copy of batch_a.
     """
-    _forward_batch(batch_a, out_writer)
+    out_writer.append_batch(batch_a)
     if batch_b is not None:
-        _forward_batch(batch_b, out_writer)
+        out_writer.append_batch(batch_b)
 
 
 def op_delay(in_batch, out_writer):
@@ -98,7 +82,7 @@ def op_delay(in_batch, out_writer):
     The z^{-1} operator: forwards the current tick's batch to the next tick's
     input register.
     """
-    _forward_batch(in_batch, out_writer)
+    out_writer.append_batch(in_batch)
 
 
 def op_integrate(in_batch, target_table):
