@@ -4,7 +4,16 @@ from rpython.rlib import jit
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, r_int64, r_ulonglonglong as r_uint128
 from rpython.rlib.longlong2float import float2longlong, longlong2float
+from rpython.translator.tool.cbuild import ExternalCompilationInfo as _ECI
 from gnitz.core import types, strings as string_logic, xxh
+
+_c_memset = rffi.llexternal(
+    'memset',
+    [rffi.VOIDP, rffi.INT, rffi.SIZE_T],
+    rffi.VOIDP,
+    compilation_info=_ECI(includes=['string.h']),
+    _nowrapper=True,
+)
 
 
 @jit.unroll_safe
@@ -39,8 +48,7 @@ def compute_hash(schema, accessor, hash_buf, hash_buf_cap):
 
     # 3. CRITICAL: Zero out the buffer up to 'sz'
     # This ensures alignment padding bytes are deterministic for the hash.
-    for i in range(sz):
-        hash_buf[i] = "\x00"
+    _c_memset(rffi.cast(rffi.VOIDP, hash_buf), rffi.cast(rffi.INT, 0), rffi.cast(rffi.SIZE_T, sz))
 
     # 4. Write data into the deterministic buffer
     ptr = hash_buf

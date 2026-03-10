@@ -35,19 +35,12 @@ class BloomFilter(object):
         while i < num_bytes:
             self.bits[i] = "\x00"
             i += 1
-        self._scratch = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
 
+    @jit.elidable
     def _hash_key(self, key):
         lo = r_uint64(key)
         hi = r_uint64(key >> 64)
-        
-        # Cast scratch to a 64-bit pointer to write both halves
-        scratch_u64 = rffi.cast(rffi.ULONGLONGP, self._scratch)
-        scratch_u64[0] = rffi.cast(rffi.ULONGLONG, lo)
-        scratch_u64[1] = rffi.cast(rffi.ULONGLONG, hi)
-        
-        # Hash the full 16-byte buffer
-        return xxh.compute_checksum(self._scratch, 16)
+        return xxh.hash_u128_inline(lo, hi)
 
     @jit.unroll_safe
     def add(self, key):
@@ -90,6 +83,3 @@ class BloomFilter(object):
         if self.bits:
             lltype.free(self.bits, flavor="raw")
             self.bits = lltype.nullptr(rffi.CCHARP.TO)
-        if self._scratch:
-            lltype.free(self._scratch, flavor="raw")
-            self._scratch = lltype.nullptr(rffi.CCHARP.TO)

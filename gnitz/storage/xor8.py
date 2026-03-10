@@ -60,27 +60,15 @@ class Xor8Filter(object):
         self.seed_hi = r_uint64(seed >> 64)
         self.total_size = total_size
         self.owned = owned
-        self._scratch = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
 
     def _get_seed(self):
         return (r_uint128(self.seed_hi) << 64) | r_uint128(self.seed_lo)
 
     @jit.elidable
     def _hash_key(self, key):
-        seed = self._get_seed()
-        # Preserve full 128-bit entropy via XOR
-        mixed = key ^ seed
-        
-        lo = r_uint64(mixed)
-        hi = r_uint64(mixed >> 64)
-        
-        # Write both 64-bit halves to the 16-byte scratch buffer
-        scratch_p = rffi.cast(rffi.ULONGLONGP, self._scratch)
-        scratch_p[0] = rffi.cast(rffi.ULONGLONG, lo)
-        scratch_p[1] = rffi.cast(rffi.ULONGLONG, hi)
-        
-        # Hash the full 16 bytes
-        return xxh.compute_checksum(self._scratch, 16)
+        lo = r_uint64(key)
+        hi = r_uint64(key >> 64)
+        return xxh.hash_u128_inline(lo, hi, self.seed_lo, self.seed_hi)
 
     def may_contain(self, key):
         h = self._hash_key(key)
@@ -96,25 +84,6 @@ class Xor8Filter(object):
         if self.owned and self.fingerprints:
             lltype.free(self.fingerprints, flavor="raw")
             self.fingerprints = lltype.nullptr(rffi.CCHARP.TO)
-        if self._scratch:
-            lltype.free(self._scratch, flavor="raw")
-            self._scratch = lltype.nullptr(rffi.CCHARP.TO)
-
-
-def _hash_with_seed(key_val, seed, scratch):
-    """
-    Hash key_val XOR'd with seed using a caller-supplied 16-byte scratch buffer.
-    """
-    mixed = key_val ^ seed
-    
-    lo = r_uint64(mixed)
-    hi = r_uint64(mixed >> 64)
-    
-    scratch_p = rffi.cast(rffi.ULONGLONGP, scratch)
-    scratch_p[0] = rffi.cast(rffi.ULONGLONG, lo)
-    scratch_p[1] = rffi.cast(rffi.ULONGLONG, hi)
-    
-    return xxh.compute_checksum(scratch, 16)
 
 
 def _read_key_from_buf(keys_ptr, i, key_size):
@@ -143,7 +112,6 @@ def build_xor8(keys_ptr, num_keys, key_size):
     keys_at = lltype.malloc(rffi.CCHARP.TO, total_size * 8, flavor="raw")
     stack = lltype.malloc(rffi.CCHARP.TO, num_keys * 12, flavor="raw")
     queue_buf = lltype.malloc(rffi.CCHARP.TO, total_size * 4, flavor="raw")
-    hash_scratch = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
 
     counts_p = rffi.cast(rffi.INTP, counts)
     keys_at_p = rffi.cast(rffi.ULONGLONGP, keys_at)
@@ -161,10 +129,13 @@ def build_xor8(keys_ptr, num_keys, key_size):
                 keys_at_p[i] = rffi.cast(rffi.ULONGLONG, 0)
                 i += 1
 
+            seed_lo = r_uint64(seed)
+            seed_hi = r_uint64(seed >> 64)
+
             i = 0
             while i < num_keys:
                 key_val = _read_key_from_buf(keys_ptr, i, key_size)
-                h = _hash_with_seed(key_val, seed, hash_scratch)
+                h = xxh.hash_u128_inline(r_uint64(key_val), r_uint64(key_val >> 64), seed_lo, seed_hi)
                 h0, h1, h2 = _get_h0_h1_h2(h, segment_length)
 
                 counts_p[h0] = rffi.cast(rffi.INT, intmask(counts_p[h0]) + 1)
@@ -235,7 +206,6 @@ def build_xor8(keys_ptr, num_keys, key_size):
         lltype.free(keys_at, flavor="raw")
         lltype.free(stack, flavor="raw")
         lltype.free(queue_buf, flavor="raw")
-        lltype.free(hash_scratch, flavor="raw")
         if not built:
             lltype.free(fingerprints, flavor="raw")
 
@@ -309,15 +279,11 @@ def load_xor8(filepath):
         if file_size < 16 + total_size:
             return None
 
-        fp_data = rposix.read(fd, total_size)
-        if len(fp_data) < total_size:
-            return None
-
         fingerprints = lltype.malloc(rffi.CCHARP.TO, total_size, flavor="raw")
-        i = 0
-        while i < total_size:
-            fingerprints[i] = fp_data[i]
-            i += 1
+        bytes_read = mmap_posix.read_into_ptr(fd, fingerprints, total_size)
+        if bytes_read < total_size:
+            lltype.free(fingerprints, flavor="raw")
+            return None
 
         return Xor8Filter(
             fingerprints,

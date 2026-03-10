@@ -95,6 +95,14 @@ _ftruncate = rffi.llexternal(
     _nowrapper=True
 )
 
+_read = rffi.llexternal(
+    "read",
+    [rffi.INT, rffi.CCHARP, rffi.SIZE_T],
+    rffi.SSIZE_T,
+    compilation_info=eci,
+    _nowrapper=True
+)
+
 # ============================================================================
 # Public High-Level Wrappers
 # ============================================================================
@@ -194,6 +202,22 @@ def ftruncate_c(fd, length):
     res = _ftruncate(rffi.cast(rffi.INT, fd), rffi.cast(rffi.LONGLONG, length))
     if rffi.cast(lltype.Signed, res) < 0:
         raise MMapError()
+
+@jit.dont_look_inside
+def read_into_ptr(fd, ptr, length):
+    """Read exactly `length` bytes into ptr. Returns bytes read, or -1 on error."""
+    total = 0
+    while total < length:
+        got = _read(
+            rffi.cast(rffi.INT, fd),
+            rffi.ptradd(ptr, total),
+            rffi.cast(rffi.SIZE_T, length - total),
+        )
+        n = rffi.cast(lltype.Signed, got)
+        if n <= 0:
+            return -1
+        total += n
+    return total
 
 @jit.dont_look_inside
 def fget_size(fd):

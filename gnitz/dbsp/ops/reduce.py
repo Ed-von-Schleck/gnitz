@@ -251,9 +251,19 @@ def _extract_group_key(accessor, schema, col_indices):
         c_idx = col_indices[i]
         t = schema.columns[c_idx].field_type.code
         if t == types.TYPE_STRING.code:
-            res = accessor.get_str_struct(c_idx)
-            s = strings.resolve_string(res[2], res[3], res[4])
-            col_hash = xxh.compute_checksum_bytes(s)
+            length, _, struct_ptr, heap_ptr, py_string = accessor.get_str_struct(c_idx)
+            if length == 0:
+                col_hash = r_uint64(0)
+            elif py_string is not None:
+                col_hash = xxh.compute_checksum_bytes(py_string)
+            else:
+                if length <= strings.SHORT_STRING_THRESHOLD:
+                    target_ptr = rffi.ptradd(struct_ptr, 4)
+                else:
+                    u64_p = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(struct_ptr, 8))
+                    heap_off = rffi.cast(lltype.Signed, u64_p[0])
+                    target_ptr = rffi.ptradd(heap_ptr, heap_off)
+                col_hash = xxh.compute_checksum(target_ptr, length)
         else:
             col_hash = _mix64(accessor.get_int(c_idx))
         h = _mix64(h ^ col_hash ^ r_uint64(i))
