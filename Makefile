@@ -15,13 +15,14 @@ TEST_FILES := \
 	rpython_tests/vm_comprehensive_test.py \
 	rpython_tests/ipc_comprehensive_test.py \
 	rpython_tests/expr_test.py \
-	rpython_tests/compile_graph_test.py
+	rpython_tests/compile_graph_test.py \
+	rpython_tests/server_test.py
 
 # Derived names for cleanup
 TEST_BINS := $(notdir $(TEST_FILES:.py=-c))
 TEST_DATA_DIRS := storage_test_data dbsp_test_data zstore_test_data \
                   catalog_test_data catalog_additional_test_data vm_test_data \
-                  compile_graph_test_data
+                  compile_graph_test_data server_test_data
 
 # Disable parallel execution to prevent shared directory collisions
 .NOTPARALLEL:

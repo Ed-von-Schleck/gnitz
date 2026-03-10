@@ -7,10 +7,11 @@ from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
-from gnitz.core.batch import ZSetBatch
+from gnitz.core.batch import ZSetBatch, BatchWriter
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import ingest_to_family
 from gnitz.dbsp import ops
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 
 def _sort_pending(pending):
@@ -98,6 +99,47 @@ class ServerExecutor(object):
                     else:
                         self._handle_client_data(fd)
 
+    # -- Unified Protocol ---------------------------------------------------
+
+    def handle_push(self, target_id, in_batch):
+        """
+        Unified protocol handler.  Every operation is a batch push.
+
+        - non-empty batch  -> UPSERT: ingest into target, trigger hooks & DAG
+        - empty/None batch -> SCAN:   return snapshot of target's current state
+
+        Works identically for system tables (DDL via hooks) and user tables
+        (DML + reactive cascade).  Returns a response batch (scan) or None.
+        """
+        if in_batch is not None and in_batch.length() > 0:
+            family = self.engine.registry.get_by_id(target_id)
+            ingest_to_family(family, in_batch)
+            family.store.flush()
+            self._evaluate_dag(target_id, in_batch)
+            return None
+        else:
+            return self._scan_family(target_id)
+
+    def _scan_family(self, target_id):
+        """Build a batch containing every positive-weight row in the target."""
+        family = self.engine.registry.get_by_id(target_id)
+        schema = family.schema
+        result = ZSetBatch(schema)
+        cursor = family.store.create_cursor()
+        try:
+            while cursor.is_valid():
+                w = cursor.weight()
+                if w > r_int64(0):
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    result.append_from_accessor(r_uint128(pk), w, acc)
+                cursor.advance()
+        finally:
+            cursor.close()
+        return result
+
+    # -- Socket Layer (delegates to handle_push) ---------------------------
+
     def _handle_client_data(self, fd):
         payload = None
         try:
@@ -109,19 +151,10 @@ class ServerExecutor(object):
                 self.fd_to_client[fd] = client_id
                 self.client_to_fd[client_id] = fd
 
-            if payload.batch is not None and payload.batch.length() > 0:
-                family = self.engine.registry.get_by_id(target_id)
-
-                # Use the catalog ingestion pipeline for FK and Index enforcement
-                ingest_to_family(family, payload.batch)
-                family.store.flush()
-
-                ipc.send_batch(fd, target_id, None, STATUS_OK, "", client_id)
-
-                # Trigger the Reactive Cascade
-                self._evaluate_dag(target_id, payload.batch)
-            else:
-                ipc.send_batch(fd, target_id, None, STATUS_OK, "", client_id)
+            result = self.handle_push(target_id, payload.batch)
+            ipc.send_batch(fd, target_id, result, STATUS_OK, "", client_id)
+            if result is not None:
+                result.free()
 
         except errors.GnitzError as ge:
             err_msg = ge.msg if hasattr(ge, "msg") else str(ge)
@@ -187,6 +220,9 @@ class ServerExecutor(object):
             incoming_delta.free()
 
             if out_delta is not None and out_delta.length() > 0:
+                view_family = self.engine.registry.get_by_id(target_view_id)
+                ingest_to_family(view_family, out_delta)
+                view_family.store.flush()
                 self._broadcast_delta(target_view_id, out_delta)
 
                 dependents = dep_map.get(target_view_id, [])
@@ -199,7 +235,8 @@ class ServerExecutor(object):
                     if found >= 0:
                         existing_d, existing_id, existing_batch = pending[found]
                         merged = ZSetBatch(existing_batch._schema)
-                        ops.op_union(existing_batch, out_delta, merged)
+                        writer = BatchWriter(merged)
+                        ops.op_union(existing_batch, out_delta, writer)
                         existing_batch.free()
                         pending[found] = (existing_d, existing_id, merged)
                     else:
