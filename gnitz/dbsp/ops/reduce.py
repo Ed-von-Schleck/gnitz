@@ -9,7 +9,9 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.core import types, strings, xxh, errors
 from gnitz.core.comparator import RowAccessor
-from gnitz.core.batch import ConsolidatedScope, BatchWriter, ColumnarBatchAccessor
+from gnitz.core.batch import (
+    ArenaZSetBatch, ConsolidatedScope, BatchWriter, ColumnarBatchAccessor,
+)
 from gnitz.dbsp.functions import NULL_AGGREGATE
 
 """
@@ -204,24 +206,48 @@ def _argsort_delta(batch, schema, col_indices):
     if count <= 1:
         return indices
 
+    scratch = newlist_hint(count)
+    for _ in range(count):
+        scratch.append(0)
+
     acc_a = ColumnarBatchAccessor(schema)
     acc_b = ColumnarBatchAccessor(schema)
-
-    # Insertion sort for small deltas; should be replaced by merge sort
-    # if large unindexed deltas become common.
-    for i in range(1, count):
-        j = i
-        while j > 0:
-            batch.bind_accessor(indices[j], acc_a)
-            batch.bind_accessor(indices[j - 1], acc_b)
-            if _compare_by_cols(acc_a, acc_b, schema, col_indices) < 0:
-                tmp = indices[j]
-                indices[j] = indices[j - 1]
-                indices[j - 1] = tmp
-                j -= 1
-            else:
-                break
+    _mergesort_by_cols(indices, batch, schema, col_indices, 0, count, scratch, acc_a, acc_b)
     return indices
+
+
+def _mergesort_by_cols(indices, batch, schema, col_indices, lo, hi, scratch, acc_a, acc_b):
+    if hi - lo <= 1:
+        return
+    mid = (lo + hi) >> 1
+    _mergesort_by_cols(indices, batch, schema, col_indices, lo, mid, scratch, acc_a, acc_b)
+    _mergesort_by_cols(indices, batch, schema, col_indices, mid, hi, scratch, acc_a, acc_b)
+    _merge_by_cols(indices, batch, schema, col_indices, lo, mid, hi, scratch, acc_a, acc_b)
+
+
+def _merge_by_cols(indices, batch, schema, col_indices, lo, mid, hi, scratch, acc_a, acc_b):
+    for k in range(lo, mid):
+        scratch[k] = indices[k]
+
+    i = lo
+    j = mid
+    k = lo
+
+    while i < mid and j < hi:
+        batch.bind_accessor(scratch[i], acc_a)
+        batch.bind_accessor(indices[j], acc_b)
+        if _compare_by_cols(acc_a, acc_b, schema, col_indices) <= 0:
+            indices[k] = scratch[i]
+            i += 1
+        else:
+            indices[k] = indices[j]
+            j += 1
+        k += 1
+
+    while i < mid:
+        indices[k] = scratch[i]
+        i += 1
+        k += 1
 
 
 def _mix64(v):
@@ -364,19 +390,54 @@ def op_reduce(
                 # Optimized path for SUM/COUNT: Agg(H+D) = Agg(H) + Agg(D)
                 agg_func.merge_accumulated(old_val_bits, r_int64(1))
             else:
-                # Non-linear path (MIN/MAX): must replay full history + current delta
-                agg_func.reset()
+                # Non-linear path (MIN/MAX): consolidate history + delta,
+                # then aggregate only over positive-weight records.
+                # This is necessary because MIN/MAX cannot algebraically
+                # cancel retractions — a retracted value must be excluded,
+                # not merely "stepped" with a negative weight.
+                replay = ArenaZSetBatch(input_schema, initial_capacity=32)
+
                 if trace_in_cursor is not None:
-                    trace_in_cursor.seek(group_key)
-                    while trace_in_cursor.is_valid() and trace_in_cursor.key() == group_key:
-                        agg_func.step(trace_in_cursor.get_accessor(), trace_in_cursor.weight())
-                        trace_in_cursor.advance()
-                
-                # Apply current tick's contribution
+                    if group_by_pk:
+                        # Group key matches table PK — direct seek
+                        trace_in_cursor.seek(group_key)
+                        while trace_in_cursor.is_valid() and trace_in_cursor.key() == group_key:
+                            replay.append_from_accessor(
+                                trace_in_cursor.key(), trace_in_cursor.weight(),
+                                trace_in_cursor.get_accessor(),
+                            )
+                            trace_in_cursor.advance()
+                    else:
+                        # Group key differs from table PK — scan and
+                        # filter by group column match.
+                        trace_in_cursor.seek(r_uint128(0))
+                        while trace_in_cursor.is_valid():
+                            trace_acc = trace_in_cursor.get_accessor()
+                            if _compare_by_cols(trace_acc, acc_exemplar, input_schema, group_by_cols) == 0:
+                                replay.append_from_accessor(
+                                    trace_in_cursor.key(), trace_in_cursor.weight(),
+                                    trace_acc,
+                                )
+                            trace_in_cursor.advance()
+
                 for k in range(group_start_pos, idx):
                     d_idx = sorted_indices[k]
                     b.bind_accessor(d_idx, acc_in)
-                    agg_func.step(acc_in, b.get_weight(d_idx))
+                    replay.append_from_accessor(
+                        b.get_pk(d_idx), b.get_weight(d_idx), acc_in,
+                    )
+
+                merged = replay.to_consolidated()
+                agg_func.reset()
+                replay_acc = ColumnarBatchAccessor(input_schema)
+                for m in range(merged.length()):
+                    w = merged.get_weight(m)
+                    if w > r_int64(0):
+                        merged.bind_accessor(m, replay_acc)
+                        agg_func.step(replay_acc, w)
+                if merged is not replay:
+                    merged.free()
+                replay.free()
 
             # 6. Emission: +1 Agg(history + delta)
             if not agg_func.is_accumulator_zero():
