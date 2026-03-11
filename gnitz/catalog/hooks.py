@@ -8,8 +8,11 @@ from gnitz.core.errors import LayoutError
 from gnitz.core.types import TableSchema
 from gnitz.core.batch import ZSetBatch
 from gnitz.storage import mmap_posix
-from gnitz.storage.table import PersistentTable
-from gnitz.storage.ephemeral_table import EphemeralTable
+from gnitz.storage.partitioned_table import (
+    make_partitioned_persistent,
+    make_partitioned_ephemeral,
+    get_num_partitions,
+)
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.metadata import ensure_dir, read_column_defs
 from gnitz.catalog.registry import (
@@ -147,7 +150,10 @@ class TableEffectHook(DeltaHook):
                 )
 
                 tbl_schema = TableSchema(col_defs, pk_col_idx)
-                pt = PersistentTable(directory, name, tbl_schema, table_id=tid)
+                n = get_num_partitions(tid)
+                pt = make_partitioned_persistent(
+                    directory, name, tbl_schema, tid, n
+                )
 
                 mmap_posix.fsync_dir(self.base_dir + "/" + schema_name)
 
@@ -251,7 +257,10 @@ class ViewEffectHook(DeltaHook):
                 )
 
                 tbl_schema = TableSchema(col_defs, pk_index=0)
-                et = EphemeralTable(directory, name, tbl_schema, table_id=vid)
+                n = get_num_partitions(vid)
+                et = make_partitioned_ephemeral(
+                    directory, name, tbl_schema, vid, n
+                )
 
                 family = TableFamily(schema_name, name, vid, sid, directory, 0, et)
 
