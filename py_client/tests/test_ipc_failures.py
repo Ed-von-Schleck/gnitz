@@ -879,14 +879,14 @@ class TestEdgeCases:
         assert_ok(hdr)
 
     def test_all_flags_set(self, raw):
-        """All flag bits set including FLAG_ALLOCATE_ID.
-        target_id=0 + FLAG_ALLOCATE_ID → allocates a new ID.
-        But data_count=0 so it's a scan, which then tries to scan
-        the allocated ID. The allocated ID has no table registered yet."""
+        """All flag bits set including FLAG_ALLOCATE_TABLE_ID.
+        target_id=0 + FLAG_ALLOCATE_TABLE_ID → atomically allocates a
+        new ID and returns it immediately (early-return path)."""
         msg = make_scan_message(target_id=0, flags=0xFFFFFFFFFFFFFFFF)
         hdr, data = raw.send_and_recv(msg)
-        # Could be error (unknown table) or success — depends on server logic
-        # The key point is the server doesn't crash
+        # Server allocates an ID and returns OK (early-return path)
+        assert hdr["status"] == 0
+        assert hdr["target_id"] > 0
 
     def test_client_sends_status_error(self, raw):
         """Client sets status=STATUS_ERROR with err_len=5.

@@ -820,12 +820,8 @@ class TestForeignKeys:
     def _create_fk_table(self, client, schema_name, table_name, columns, fk_target_id, fk_col):
         """Create a table where one column has a FK constraint."""
         from gnitz_client.client import _pack_column_id
-        from gnitz_client.types import SEQ_ID_TABLES
 
-        _, seq_batch = client.scan(SEQ_TAB)
-        old_hwm = client._find_seq_val(seq_batch, SEQ_ID_TABLES)
-        new_tid = old_hwm + 1
-        client._advance_seq(SEQ_ID_TABLES, old_hwm, new_tid)
+        new_tid = client.allocate_table_id()
 
         _, schema_batch = client.scan(SCHEMA_TAB)
         schema_id = client._find_schema_id(schema_batch, schema_name)
@@ -936,9 +932,7 @@ class TestSystemTableEdgeCases:
     def test_push_to_system_table_direct(self, client):
         """Direct pushes to system tables are valid (DDL-as-DML)."""
         sn = "directpush" + _uid()
-        _, seq_batch = client.scan(SEQ_TAB)
-        old_hwm = client._find_seq_val(seq_batch, 1)
-        new_sid = old_hwm + 1
+        new_sid = client.allocate_schema_id()
         schema_s = SCHEMA_TAB_SCHEMA
         b = ZSetBatch(
             schema=schema_s,
@@ -949,7 +943,6 @@ class TestSystemTableEdgeCases:
             columns=[[], [sn]],
         )
         client.push(SCHEMA_TAB, schema_s, b)
-        client._advance_seq(1, old_hwm, new_sid)
         names = _scan_positive_names(client, SCHEMA_TAB)
         assert sn in names
 
@@ -1072,3 +1065,44 @@ class TestScanEdgeCases:
     def test_scan_nonexistent_target(self, client):
         with pytest.raises(GnitzError, match="(?i)unknown"):
             client.scan(99999)
+
+
+# ===========================================================================
+# ID Allocation Tests
+# ===========================================================================
+
+class TestIDAllocation:
+
+    def test_allocate_table_id(self, client):
+        tid = client.allocate_table_id()
+        assert tid >= FIRST_USER_TABLE_ID
+
+    def test_allocate_schema_id(self, client):
+        sid = client.allocate_schema_id()
+        assert sid >= FIRST_USER_SCHEMA_ID
+
+    def test_allocate_table_ids_monotonic(self, client):
+        t1 = client.allocate_table_id()
+        t2 = client.allocate_table_id()
+        t3 = client.allocate_table_id()
+        assert t1 < t2 < t3
+
+    def test_allocate_schema_ids_monotonic(self, client):
+        s1 = client.allocate_schema_id()
+        s2 = client.allocate_schema_id()
+        s3 = client.allocate_schema_id()
+        assert s1 < s2 < s3
+
+    def test_allocate_table_id_reflected_in_seqtab(self, client):
+        """Allocated ID should be reflected in SeqTab."""
+        tid = client.allocate_table_id()
+        _, seq_batch = client.scan(SEQ_TAB)
+        hwm = client._find_seq_val(seq_batch, 2)  # SEQ_ID_TABLES
+        assert hwm >= tid
+
+    def test_allocate_schema_id_reflected_in_seqtab(self, client):
+        """Allocated ID should be reflected in SeqTab."""
+        sid = client.allocate_schema_id()
+        _, seq_batch = client.scan(SEQ_TAB)
+        hwm = client._find_seq_val(seq_batch, 1)  # SEQ_ID_SCHEMAS
+        assert hwm >= sid

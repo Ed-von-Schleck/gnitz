@@ -49,7 +49,13 @@ STATUS_OK = 0
 STATUS_ERROR = 1
 
 # --- Protocol Flags ---
-FLAG_ALLOCATE_ID = 1
+# ID allocation protocol:
+#   Client sends: target_id=0, flags=FLAG_ALLOCATE_*_ID, no batch
+#   Server responds: target_id=allocated_id, STATUS_OK, no schema/data
+#   Server atomically: allocates in-memory + advances SeqTab
+FLAG_ALLOCATE_TABLE_ID = 1   # Allocate a table/view ID atomically
+FLAG_ALLOCATE_SCHEMA_ID = 2  # Allocate a schema ID atomically
+FLAG_ALLOCATE_ID = FLAG_ALLOCATE_TABLE_ID  # backward compat
 
 # --- IPC String Encoding ---
 IPC_STRING_STRIDE = 8

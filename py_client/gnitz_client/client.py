@@ -2,7 +2,7 @@
 
 from gnitz_client.protocol import (
     MAGIC_V2, HEADER_SIZE, ALIGNMENT, STATUS_OK, STATUS_ERROR,
-    IPC_STRING_STRIDE,
+    IPC_STRING_STRIDE, FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID,
     align_up, pack_header, unpack_header,
 )
 from gnitz_client.types import (
@@ -166,14 +166,22 @@ class GnitzClient:
         hdr, resp_schema, resp_batch = self._receive()
         return resp_schema, resp_batch
 
+    def allocate_table_id(self) -> int:
+        """Ask server to atomically allocate a table/view ID."""
+        self._send(target_id=0, flags=FLAG_ALLOCATE_TABLE_ID)
+        hdr, _, _ = self._receive()
+        return hdr["target_id"]
+
+    def allocate_schema_id(self) -> int:
+        """Ask server to atomically allocate a schema ID."""
+        self._send(target_id=0, flags=FLAG_ALLOCATE_SCHEMA_ID)
+        hdr, _, _ = self._receive()
+        return hdr["target_id"]
+
     def create_schema(self, name: str) -> int:
         """Create a schema by pushing to system tables."""
-        # 1. Read current schema HWM from SeqTab
-        _, seq_batch = self.scan(SEQ_TAB)
-        old_hwm = self._find_seq_val(seq_batch, SEQ_ID_SCHEMAS)
-        new_sid = old_hwm + 1
+        new_sid = self.allocate_schema_id()
 
-        # 2. Push schema record to SchemaTab
         schema_s = SCHEMA_TAB_SCHEMA
         b = ZSetBatch(
             schema=schema_s,
@@ -184,9 +192,6 @@ class GnitzClient:
             columns=[[], [name]],  # col0=pk(empty), col1=name
         )
         self.push(SCHEMA_TAB, schema_s, b)
-
-        # 3. Advance sequence
-        self._advance_seq(SEQ_ID_SCHEMAS, old_hwm, new_sid)
         return new_sid
 
     def create_table(
@@ -197,13 +202,7 @@ class GnitzClient:
         pk_col_idx: int = 0,
     ) -> int:
         """Create a table by pushing columns + table record to system tables."""
-        # 1. Read current table HWM from SeqTab and advance immediately.
-        #    This "burns" the ID so that even if a later step fails,
-        #    the next create_table call gets a fresh tid (no stale cols).
-        _, seq_batch = self.scan(SEQ_TAB)
-        old_hwm = self._find_seq_val(seq_batch, SEQ_ID_TABLES)
-        new_tid = old_hwm + 1
-        self._advance_seq(SEQ_ID_TABLES, old_hwm, new_tid)
+        new_tid = self.allocate_table_id()
 
         # 2. Find schema_id by scanning SchemaTab
         _, schema_batch = self.scan(SCHEMA_TAB)
@@ -316,11 +315,7 @@ class GnitzClient:
           node 1: INTEGRATE (sink, target=view_id)
           edge 0: node 0 -> node 1, port 0
         """
-        # Allocate view ID (advance seq first to burn the ID)
-        _, seq_batch = self.scan(SEQ_TAB)
-        old_hwm = self._find_seq_val(seq_batch, SEQ_ID_TABLES)
-        vid = old_hwm + 1
-        self._advance_seq(SEQ_ID_TABLES, old_hwm, vid)
+        vid = self.allocate_table_id()
 
         # Find schema_id
         _, schema_batch = self.scan(SCHEMA_TAB)

@@ -156,9 +156,18 @@ class ServerExecutor(object):
             client_id = intmask(payload.client_id)
             target_id = intmask(payload.target_id)
 
-            # ID allocation
-            if payload.flags & ipc.FLAG_ALLOCATE_ID and target_id == 0:
-                target_id = self.engine.registry.allocate_table_id()
+            # ID allocation — returns immediately with new ID, no push/scan
+            if target_id == 0:
+                if payload.flags & ipc.FLAG_ALLOCATE_TABLE_ID:
+                    new_id = self.engine.registry.allocate_table_id()
+                    self.engine._advance_sequence(sys.SEQ_ID_TABLES, new_id - 1, new_id)
+                    ipc.send_batch(fd, new_id, None, STATUS_OK, "", client_id)
+                    return
+                if payload.flags & ipc.FLAG_ALLOCATE_SCHEMA_ID:
+                    new_id = self.engine.registry.allocate_schema_id()
+                    self.engine._advance_sequence(sys.SEQ_ID_SCHEMAS, new_id - 1, new_id)
+                    ipc.send_batch(fd, new_id, None, STATUS_OK, "", client_id)
+                    return
 
             if client_id > 0:
                 self.fd_to_client[fd] = client_id
