@@ -7,9 +7,17 @@ from gnitz_client.protocol import (
 )
 from gnitz_client.types import (
     TypeCode, ColumnDef, Schema, META_SCHEMA,
-    SCHEMA_TAB, TABLE_TAB, COL_TAB, SEQ_TAB,
-    SEQ_ID_SCHEMAS, SEQ_ID_TABLES, OWNER_KIND_TABLE,
-    SCHEMA_TAB_SCHEMA, TABLE_TAB_SCHEMA, COL_TAB_SCHEMA, SEQ_TAB_SCHEMA,
+    SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, SEQ_TAB,
+    SEQ_ID_SCHEMAS, SEQ_ID_TABLES,
+    OWNER_KIND_TABLE, OWNER_KIND_VIEW,
+    SCHEMA_TAB_SCHEMA, TABLE_TAB_SCHEMA, VIEW_TAB_SCHEMA,
+    COL_TAB_SCHEMA, DEP_TAB_SCHEMA, SEQ_TAB_SCHEMA,
+    CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_SOURCES_TAB,
+    CIRCUIT_PARAMS_TAB, CIRCUIT_GROUP_COLS_TAB,
+    CIRCUIT_NODES_SCHEMA, CIRCUIT_EDGES_SCHEMA, CIRCUIT_SOURCES_SCHEMA,
+    CIRCUIT_PARAMS_SCHEMA, CIRCUIT_GROUP_COLS_SCHEMA,
+    OPCODE_FILTER, OPCODE_MAP, OPCODE_INTEGRATE, OPCODE_SCAN_TRACE,
+    PORT_IN, PORT_TRACE, PARAM_TABLE_ID,
     TYPE_STRIDES,
 )
 from gnitz_client.batch import (
@@ -189,10 +197,13 @@ class GnitzClient:
         pk_col_idx: int = 0,
     ) -> int:
         """Create a table by pushing columns + table record to system tables."""
-        # 1. Read current table HWM from SeqTab
+        # 1. Read current table HWM from SeqTab and advance immediately.
+        #    This "burns" the ID so that even if a later step fails,
+        #    the next create_table call gets a fresh tid (no stale cols).
         _, seq_batch = self.scan(SEQ_TAB)
         old_hwm = self._find_seq_val(seq_batch, SEQ_ID_TABLES)
         new_tid = old_hwm + 1
+        self._advance_seq(SEQ_ID_TABLES, old_hwm, new_tid)
 
         # 2. Find schema_id by scanning SchemaTab
         _, schema_batch = self.scan(SCHEMA_TAB)
@@ -249,9 +260,357 @@ class GnitzClient:
         )
         self.push(TABLE_TAB, table_s, tb)
 
-        # 5. Advance sequence
-        self._advance_seq(SEQ_ID_TABLES, old_hwm, new_tid)
         return new_tid
+
+    def drop_schema(self, name: str):
+        """Drop a schema by retracting from SchemaTab."""
+        _, schema_batch = self.scan(SCHEMA_TAB)
+        schema_id = self._find_schema_id(schema_batch, name)
+
+        schema_s = SCHEMA_TAB_SCHEMA
+        b = ZSetBatch(
+            schema=schema_s,
+            pk_lo=[schema_id],
+            pk_hi=[0],
+            weights=[-1],
+            nulls=[0],
+            columns=[[], [name]],
+        )
+        self.push(SCHEMA_TAB, schema_s, b)
+
+    def drop_table(self, schema_name: str, table_name: str):
+        """Drop a table by retracting from TableTab and ColTab."""
+        # Find table record
+        _, tbl_batch = self.scan(TABLE_TAB)
+        tid, sid, directory, pk_col_idx, created_lsn = self._find_table_record(
+            tbl_batch, schema_name, table_name
+        )
+
+        # Find and retract column records
+        _, col_batch = self.scan(COL_TAB)
+        self._retract_columns_for_owner(col_batch, tid, OWNER_KIND_TABLE)
+
+        # Retract table record
+        table_s = TABLE_TAB_SCHEMA
+        tb = ZSetBatch(
+            schema=table_s,
+            pk_lo=[tid],
+            pk_hi=[0],
+            weights=[-1],
+            nulls=[0],
+            columns=[[], [sid], [table_name], [directory], [pk_col_idx], [created_lsn]],
+        )
+        self.push(TABLE_TAB, table_s, tb)
+
+    def create_view(
+        self,
+        schema_name: str,
+        view_name: str,
+        source_table_id: int,
+        output_columns: list[ColumnDef],
+    ) -> int:
+        """Create a minimal passthrough view on a source table.
+
+        This builds the simplest possible circuit graph:
+          node 0: SCAN_TRACE (primary input, table_id=0)
+          node 1: INTEGRATE (sink, target=view_id)
+          edge 0: node 0 -> node 1, port 0
+        """
+        # Allocate view ID (advance seq first to burn the ID)
+        _, seq_batch = self.scan(SEQ_TAB)
+        old_hwm = self._find_seq_val(seq_batch, SEQ_ID_TABLES)
+        vid = old_hwm + 1
+        self._advance_seq(SEQ_ID_TABLES, old_hwm, vid)
+
+        # Find schema_id
+        _, schema_batch = self.scan(SCHEMA_TAB)
+        sid = self._find_schema_id(schema_batch, schema_name)
+
+        # 1. Column records
+        col_schema = COL_TAB_SCHEMA
+        col_batch = ZSetBatch(schema=col_schema)
+        for i, col in enumerate(output_columns):
+            col_pk = _pack_column_id(vid, i)
+            col_batch.pk_lo.append(col_pk)
+            col_batch.pk_hi.append(0)
+            col_batch.weights.append(1)
+            col_batch.nulls.append(0)
+        pk_col: list = []
+        owner_ids = []
+        owner_kinds = []
+        col_idxs = []
+        names = []
+        type_codes = []
+        is_nullables = []
+        fk_table_ids = []
+        fk_col_idxs = []
+        for i, col in enumerate(output_columns):
+            pk_col.append(None)
+            owner_ids.append(vid)
+            owner_kinds.append(OWNER_KIND_VIEW)
+            col_idxs.append(i)
+            names.append(col.name)
+            type_codes.append(col.type_code)
+            is_nullables.append(1 if col.is_nullable else 0)
+            fk_table_ids.append(0)
+            fk_col_idxs.append(0)
+        col_batch.columns = [pk_col, owner_ids, owner_kinds, col_idxs, names,
+                             type_codes, is_nullables, fk_table_ids, fk_col_idxs]
+        self.push(COL_TAB, col_schema, col_batch)
+
+        # 2. Dependency records
+        dep_id = vid ^ source_table_id
+        dep_s = DEP_TAB_SCHEMA
+        dep_batch = ZSetBatch(
+            schema=dep_s,
+            pk_lo=[dep_id],
+            pk_hi=[0],
+            weights=[1],
+            nulls=[0],
+            columns=[[], [vid], [0], [source_table_id]],
+        )
+        self.push(DEP_TAB, dep_s, dep_batch)
+
+        # 3. Circuit graph: 2 nodes, 1 edge, 1 source, 1 param
+        # U128 PKs: pk_hi = view_id (high 64), pk_lo = node_id (low 64)
+        nodes_s = CIRCUIT_NODES_SCHEMA
+        nodes_batch = ZSetBatch(
+            schema=nodes_s,
+            pk_lo=[0, 1],       # node_id 0, 1
+            pk_hi=[vid, vid],   # view_id in high 64 bits
+            weights=[1, 1],
+            nulls=[0, 0],
+            columns=[[], [OPCODE_SCAN_TRACE, OPCODE_INTEGRATE]],
+        )
+        self.push(CIRCUIT_NODES_TAB, nodes_s, nodes_batch)
+
+        edges_s = CIRCUIT_EDGES_SCHEMA
+        edges_batch = ZSetBatch(
+            schema=edges_s,
+            pk_lo=[0],       # edge_id 0
+            pk_hi=[vid],
+            weights=[1],
+            nulls=[0],
+            columns=[[], [0], [1], [PORT_IN]],
+        )
+        self.push(CIRCUIT_EDGES_TAB, edges_s, edges_batch)
+
+        sources_s = CIRCUIT_SOURCES_SCHEMA
+        sources_batch = ZSetBatch(
+            schema=sources_s,
+            pk_lo=[0],       # node_id 0
+            pk_hi=[vid],
+            weights=[1],
+            nulls=[0],
+            columns=[[], [0]],  # table_id=0 means primary input
+        )
+        self.push(CIRCUIT_SOURCES_TAB, sources_s, sources_batch)
+
+        # Param: INTEGRATE node needs PARAM_TABLE_ID = vid
+        # param pk low 64 bits: (node_id << 8) | slot
+        param_lo = (1 << 8) | PARAM_TABLE_ID
+        params_s = CIRCUIT_PARAMS_SCHEMA
+        params_batch = ZSetBatch(
+            schema=params_s,
+            pk_lo=[param_lo],
+            pk_hi=[vid],
+            weights=[1],
+            nulls=[0],
+            columns=[[], [vid]],
+        )
+        self.push(CIRCUIT_PARAMS_TAB, params_s, params_batch)
+
+        # 4. View record (triggers hook)
+        view_s = VIEW_TAB_SCHEMA
+        vb = ZSetBatch(
+            schema=view_s,
+            pk_lo=[vid],
+            pk_hi=[0],
+            weights=[1],
+            nulls=[0],
+            columns=[[], [sid], [view_name], [""], [""], [0]],
+        )
+        self.push(VIEW_TAB, view_s, vb)
+
+        return vid
+
+    def drop_view(self, schema_name: str, view_name: str):
+        """Drop a view by retracting from ViewTab, circuit tables, DepTab, ColTab."""
+        # Find view record
+        _, view_batch = self.scan(VIEW_TAB)
+        vid, sid, sql_def, cache_dir, created_lsn = self._find_view_record(
+            view_batch, schema_name, view_name
+        )
+
+        # Retract view record
+        view_s = VIEW_TAB_SCHEMA
+        vb = ZSetBatch(
+            schema=view_s,
+            pk_lo=[vid],
+            pk_hi=[0],
+            weights=[-1],
+            nulls=[0],
+            columns=[[], [sid], [view_name], [sql_def], [cache_dir], [created_lsn]],
+        )
+        self.push(VIEW_TAB, view_s, vb)
+
+        # Retract circuit graph records
+        self._retract_circuit_graph(vid)
+
+        # Retract dep records
+        self._retract_deps_for_view(vid)
+
+        # Retract column records
+        _, col_batch = self.scan(COL_TAB)
+        self._retract_columns_for_owner(col_batch, vid, OWNER_KIND_VIEW)
+
+    def _find_table_record(
+        self, batch: ZSetBatch | None, schema_name: str, table_name: str
+    ) -> tuple[int, int, str, int, int]:
+        """Find a table record by schema + name in TableTab scan."""
+        if batch is None:
+            raise GnitzError(f"Table '{schema_name}.{table_name}' not found")
+        # We need schema_id for the schema_name
+        _, schema_batch = self.scan(SCHEMA_TAB)
+        sid = self._find_schema_id(schema_batch, schema_name)
+
+        for i in range(len(batch.pk_lo)):
+            if batch.weights[i] > 0:
+                if batch.columns[1][i] == sid and batch.columns[2][i] == table_name:
+                    tid = batch.pk_lo[i]
+                    directory = batch.columns[3][i]
+                    pk_col_idx = batch.columns[4][i]
+                    created_lsn = batch.columns[5][i]
+                    return tid, sid, directory, pk_col_idx, created_lsn
+        raise GnitzError(f"Table '{schema_name}.{table_name}' not found")
+
+    def _find_view_record(
+        self, batch: ZSetBatch | None, schema_name: str, view_name: str
+    ) -> tuple[int, int, str, str, int]:
+        """Find a view record by schema + name in ViewTab scan."""
+        if batch is None:
+            raise GnitzError(f"View '{schema_name}.{view_name}' not found")
+        _, schema_batch = self.scan(SCHEMA_TAB)
+        sid = self._find_schema_id(schema_batch, schema_name)
+
+        for i in range(len(batch.pk_lo)):
+            if batch.weights[i] > 0:
+                if batch.columns[1][i] == sid and batch.columns[2][i] == view_name:
+                    vid = batch.pk_lo[i]
+                    sql_def = batch.columns[3][i]
+                    cache_dir = batch.columns[4][i]
+                    created_lsn = batch.columns[5][i]
+                    return vid, sid, sql_def, cache_dir, created_lsn
+        raise GnitzError(f"View '{schema_name}.{view_name}' not found")
+
+    def _retract_columns_for_owner(self, col_batch: ZSetBatch | None, owner_id: int, owner_kind: int):
+        """Retract all column records for a given owner from ColTab."""
+        if col_batch is None:
+            return
+        retract = ZSetBatch(schema=COL_TAB_SCHEMA)
+        for i in range(len(col_batch.pk_lo)):
+            if col_batch.weights[i] > 0 and col_batch.columns[1][i] == owner_id and col_batch.columns[2][i] == owner_kind:
+                retract.pk_lo.append(col_batch.pk_lo[i])
+                retract.pk_hi.append(0)
+                retract.weights.append(-1)
+                retract.nulls.append(0)
+        if len(retract.pk_lo) == 0:
+            return
+        # Build column lists
+        cols = [[] for _ in range(9)]
+        for i in range(len(col_batch.pk_lo)):
+            if col_batch.weights[i] > 0 and col_batch.columns[1][i] == owner_id and col_batch.columns[2][i] == owner_kind:
+                for c in range(9):
+                    if c == 0:
+                        cols[c].append(None)
+                    else:
+                        cols[c].append(col_batch.columns[c][i])
+        retract.columns = cols
+        self.push(COL_TAB, COL_TAB_SCHEMA, retract)
+
+    def _retract_circuit_graph(self, vid: int):
+        """Retract all circuit table records for a view."""
+        # Nodes
+        _, nodes_batch = self.scan(CIRCUIT_NODES_TAB)
+        if nodes_batch:
+            self._retract_records_for_view_u128(
+                CIRCUIT_NODES_TAB, CIRCUIT_NODES_SCHEMA, nodes_batch, vid
+            )
+        # Edges
+        _, edges_batch = self.scan(CIRCUIT_EDGES_TAB)
+        if edges_batch:
+            self._retract_records_for_view_u128(
+                CIRCUIT_EDGES_TAB, CIRCUIT_EDGES_SCHEMA, edges_batch, vid
+            )
+        # Sources
+        _, src_batch = self.scan(CIRCUIT_SOURCES_TAB)
+        if src_batch:
+            self._retract_records_for_view_u128(
+                CIRCUIT_SOURCES_TAB, CIRCUIT_SOURCES_SCHEMA, src_batch, vid
+            )
+        # Params
+        _, params_batch = self.scan(CIRCUIT_PARAMS_TAB)
+        if params_batch:
+            self._retract_records_for_view_u128(
+                CIRCUIT_PARAMS_TAB, CIRCUIT_PARAMS_SCHEMA, params_batch, vid
+            )
+        # Group cols
+        _, gcols_batch = self.scan(CIRCUIT_GROUP_COLS_TAB)
+        if gcols_batch:
+            self._retract_records_for_view_u128(
+                CIRCUIT_GROUP_COLS_TAB, CIRCUIT_GROUP_COLS_SCHEMA, gcols_batch, vid
+            )
+
+    def _retract_records_for_view_u128(
+        self, table_id: int, schema: Schema, batch: ZSetBatch, vid: int
+    ):
+        """Retract all records whose U128 PK has view_id in high 64 bits (pk_hi)."""
+        retract = ZSetBatch(schema=schema)
+        for i in range(len(batch.pk_lo)):
+            pk_view_id = batch.pk_hi[i]  # high 64 bits = view_id
+            if batch.weights[i] > 0 and pk_view_id == vid:
+                retract.pk_lo.append(batch.pk_lo[i])
+                retract.pk_hi.append(batch.pk_hi[i])
+                retract.weights.append(-1)
+                retract.nulls.append(0)
+        if len(retract.pk_lo) == 0:
+            return
+        ncols = len(schema.columns)
+        cols = [[] for _ in range(ncols)]
+        for i in range(len(batch.pk_lo)):
+            pk_view_id = batch.pk_hi[i]
+            if batch.weights[i] > 0 and pk_view_id == vid:
+                for c in range(ncols):
+                    if c == schema.pk_index:
+                        cols[c].append(None)
+                    else:
+                        cols[c].append(batch.columns[c][i])
+        retract.columns = cols
+        self.push(table_id, schema, retract)
+
+    def _retract_deps_for_view(self, vid: int):
+        """Retract all dependency records for a view."""
+        _, dep_batch = self.scan(DEP_TAB)
+        if dep_batch is None:
+            return
+        retract = ZSetBatch(schema=DEP_TAB_SCHEMA)
+        for i in range(len(dep_batch.pk_lo)):
+            if dep_batch.weights[i] > 0 and dep_batch.columns[1][i] == vid:
+                retract.pk_lo.append(dep_batch.pk_lo[i])
+                retract.pk_hi.append(0)
+                retract.weights.append(-1)
+                retract.nulls.append(0)
+        if len(retract.pk_lo) == 0:
+            return
+        cols = [[] for _ in range(4)]
+        for i in range(len(dep_batch.pk_lo)):
+            if dep_batch.weights[i] > 0 and dep_batch.columns[1][i] == vid:
+                cols[0].append(None)
+                cols[1].append(dep_batch.columns[1][i])
+                cols[2].append(dep_batch.columns[2][i])
+                cols[3].append(dep_batch.columns[3][i])
+        retract.columns = cols
+        self.push(DEP_TAB, DEP_TAB_SCHEMA, retract)
 
     def _advance_seq(self, seq_id: int, old_val: int, new_val: int):
         """Retract old HWM and insert new HWM in SeqTab."""

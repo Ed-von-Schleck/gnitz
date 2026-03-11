@@ -70,6 +70,11 @@ SEQ_ID_TABLES = 2
 
 # Owner kind
 OWNER_KIND_TABLE = 0
+OWNER_KIND_VIEW = 1
+
+# First user IDs
+FIRST_USER_TABLE_ID = 16
+FIRST_USER_SCHEMA_ID = 3
 
 # System table schemas (must exactly match system_tables.py)
 
@@ -108,6 +113,28 @@ COL_TAB_SCHEMA = Schema(
     pk_index=0,
 )
 
+VIEW_TAB_SCHEMA = Schema(
+    columns=[
+        ColumnDef("view_id", TypeCode.U64),
+        ColumnDef("schema_id", TypeCode.U64),
+        ColumnDef("name", TypeCode.STRING),
+        ColumnDef("sql_definition", TypeCode.STRING),
+        ColumnDef("cache_directory", TypeCode.STRING),
+        ColumnDef("created_lsn", TypeCode.U64),
+    ],
+    pk_index=0,
+)
+
+DEP_TAB_SCHEMA = Schema(
+    columns=[
+        ColumnDef("dep_id", TypeCode.U64),
+        ColumnDef("view_id", TypeCode.U64),
+        ColumnDef("dep_view_id", TypeCode.U64),
+        ColumnDef("dep_table_id", TypeCode.U64),
+    ],
+    pk_index=0,
+)
+
 SEQ_TAB_SCHEMA = Schema(
     columns=[
         ColumnDef("seq_id", TypeCode.U64),
@@ -115,3 +142,66 @@ SEQ_TAB_SCHEMA = Schema(
     ],
     pk_index=0,
 )
+
+# Circuit table schemas (U128 PK)
+CIRCUIT_NODES_SCHEMA = Schema(
+    columns=[
+        ColumnDef("node_pk", TypeCode.U128),
+        ColumnDef("opcode", TypeCode.U64),
+    ],
+    pk_index=0,
+)
+
+CIRCUIT_EDGES_SCHEMA = Schema(
+    columns=[
+        ColumnDef("edge_pk", TypeCode.U128),
+        ColumnDef("src_node", TypeCode.U64),
+        ColumnDef("dst_node", TypeCode.U64),
+        ColumnDef("dst_port", TypeCode.U64),
+    ],
+    pk_index=0,
+)
+
+CIRCUIT_SOURCES_SCHEMA = Schema(
+    columns=[
+        ColumnDef("source_pk", TypeCode.U128),
+        ColumnDef("table_id", TypeCode.U64),
+    ],
+    pk_index=0,
+)
+
+CIRCUIT_PARAMS_SCHEMA = Schema(
+    columns=[
+        ColumnDef("param_pk", TypeCode.U128),
+        ColumnDef("value", TypeCode.U64),
+    ],
+    pk_index=0,
+)
+
+CIRCUIT_GROUP_COLS_SCHEMA = Schema(
+    columns=[
+        ColumnDef("gcol_pk", TypeCode.U128),
+        ColumnDef("col_idx", TypeCode.U64),
+    ],
+    pk_index=0,
+)
+
+# Circuit table IDs
+CIRCUIT_NODES_TAB = 11
+CIRCUIT_EDGES_TAB = 12
+CIRCUIT_SOURCES_TAB = 13
+CIRCUIT_PARAMS_TAB = 14
+CIRCUIT_GROUP_COLS_TAB = 15
+
+# Opcodes (matching gnitz/core/opcodes.py)
+OPCODE_FILTER = 1
+OPCODE_MAP = 2
+OPCODE_INTEGRATE = 7
+OPCODE_SCAN_TRACE = 11
+
+# Ports
+PORT_IN = 0
+PORT_TRACE = 1
+
+# Params
+PARAM_TABLE_ID = 0
