@@ -58,6 +58,7 @@ FLAG_ALLOCATE_SCHEMA_ID = 2  # Allocate a schema ID atomically
 FLAG_ALLOCATE_ID = FLAG_ALLOCATE_TABLE_ID  # backward compat
 FLAG_SHUTDOWN = 4
 FLAG_DDL_SYNC = 8
+FLAG_EXCHANGE = 16
 
 # --- IPC String Encoding ---
 IPC_STRING_STRIDE = 8

@@ -28,14 +28,16 @@ STATUS_OK = 0
 STATUS_ERROR = 1
 
 
-def evaluate_dag(engine, initial_source_id, initial_delta):
+def evaluate_dag(engine, initial_source_id, initial_delta,
+                 exchange_handler=None):
     """
     Module-level topological DAG evaluator.
     Uses a depth-sorted approach to ensure each view evaluates exactly once
     per epoch, even in diamond dependency graphs.
 
     Called by both the single-process ServerExecutor and multi-worker
-    WorkerProcess paths.
+    WorkerProcess paths. When exchange_handler is provided, plans with
+    exchange_post_plan will perform IPC exchange mid-circuit.
     """
     registry = engine.registry
     program_cache = engine.program_cache
@@ -83,8 +85,23 @@ def evaluate_dag(engine, initial_source_id, initial_delta):
             incoming_delta.free()
             continue
 
-        out_delta = plan.execute_epoch(incoming_delta)
-        incoming_delta.free()
+        if plan.exchange_post_plan is not None and exchange_handler is not None:
+            # Split execution: pre-exchange -> IPC exchange -> post-exchange
+            pre_result = plan.execute_epoch(incoming_delta)
+            incoming_delta.free()
+            if pre_result is None:
+                pre_result = ZSetBatch(plan.out_schema)
+
+            exchanged = exchange_handler.do_exchange(
+                target_view_id, pre_result, plan.exchange_shard_cols
+            )
+            pre_result.free()
+
+            out_delta = plan.exchange_post_plan.execute_epoch(exchanged)
+            exchanged.free()
+        else:
+            out_delta = plan.execute_epoch(incoming_delta)
+            incoming_delta.free()
 
         if out_delta is not None and out_delta.length() > 0:
             view_family = registry.get_by_id(target_view_id)

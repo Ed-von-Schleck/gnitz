@@ -117,7 +117,10 @@ class ExecutablePlan(object):
     Stateful, pre-compiled execution context for a Reactive View.
     Acts as the primary API boundary between the Executor and the VM.
     """
-    _immutable_fields_ = ["program", "reg_file", "out_schema", "in_reg_idx", "out_reg_idx"]
+    _immutable_fields_ = [
+        "program", "reg_file", "out_schema", "in_reg_idx", "out_reg_idx",
+        "exchange_post_plan", "exchange_shard_cols",
+    ]
 
     def __init__(self, program, reg_file, out_schema, in_reg_idx=0, out_reg_idx=1):
         self.program = program
@@ -126,6 +129,8 @@ class ExecutablePlan(object):
         self.in_reg_idx = in_reg_idx
         self.out_reg_idx = out_reg_idx
         self.context = ExecutionContext()
+        self.exchange_post_plan = None    # ExecutablePlan or None
+        self.exchange_shard_cols = None   # list[int] or None
 
     def execute_epoch(self, input_delta):
         """

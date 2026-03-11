@@ -62,7 +62,8 @@ class MasterDispatcher(object):
         self.assignment = assignment
 
     def fan_out_push(self, target_id, batch, schema):
-        """Split batch by worker partition, send sub-batches, collect ACKs."""
+        """Split batch by worker partition, send sub-batches, collect ACKs.
+        Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE."""
         n = batch.length()
         sub_batches = [None] * self.num_workers
 
@@ -75,32 +76,92 @@ class MasterDispatcher(object):
                 sub_batches[w] = ArenaZSetBatch(schema)
             sub_batches[w]._direct_append_row(batch, i, batch.get_weight(i))
 
-        sent_workers = newlist_hint(self.num_workers)
+        # Send to ALL workers (even empty batches) so they all participate
+        # in potential exchange barriers
         for w in range(self.num_workers):
             sb = sub_batches[w]
+            ipc.send_batch(
+                self.worker_fds[w], target_id, sb, schema=schema
+            )
             if sb is not None:
-                ipc.send_batch(
-                    self.worker_fds[w], target_id, sb, schema=schema
-                )
                 sb.free()
-                sent_workers.append(w)
 
-        for i in range(len(sent_workers)):
-            w = sent_workers[i]
-            payload = ipc.receive_payload(self.worker_fds[w])
-            if payload.status != 0:
-                err = payload.error_msg
-                payload.close()
-                raise errors.StorageError(
-                    "Worker %d push error: %s" % (w, err)
-                )
-            payload.close()
+        # Message loop: handle both ACKs and exchange relays
+        acked = [False] * self.num_workers
+        num_acked = 0
+        exchange_buffers = {}   # view_id -> [batch_per_worker]
+        exchange_counts = {}    # view_id -> int
+        exchange_schemas = {}   # view_id -> schema
+
+        while num_acked < self.num_workers:
+            for w in range(self.num_workers):
+                if acked[w]:
+                    continue
+                payload = ipc.receive_payload(self.worker_fds[w])
+                if payload.flags & ipc.FLAG_EXCHANGE:
+                    vid = intmask(payload.target_id)
+                    if vid not in exchange_buffers:
+                        exchange_buffers[vid] = [None] * self.num_workers
+                        exchange_counts[vid] = 0
+                    if payload.batch is not None and payload.batch.length() > 0:
+                        exchange_buffers[vid][w] = payload.batch.clone()
+                    if payload.schema is not None:
+                        exchange_schemas[vid] = payload.schema
+                    exchange_counts[vid] += 1
+                    payload.close()
+
+                    if exchange_counts[vid] == self.num_workers:
+                        ex_schema = exchange_schemas.get(vid, schema)
+                        self._relay_exchange(vid, exchange_buffers[vid], ex_schema)
+                        del exchange_buffers[vid]
+                        del exchange_counts[vid]
+                        if vid in exchange_schemas:
+                            del exchange_schemas[vid]
+                else:
+                    # Normal ACK
+                    if payload.status != 0:
+                        err = payload.error_msg
+                        payload.close()
+                        raise errors.StorageError(
+                            "Worker %d push error: %s" % (w, err)
+                        )
+                    payload.close()
+                    acked[w] = True
+                    num_acked += 1
 
         log.debug(
             "fan_out_push tid=" + str(target_id)
             + " rows=" + str(n)
-            + " workers=" + str(len(sent_workers))
         )
+
+    def _relay_exchange(self, view_id, worker_batches, schema):
+        """Repartition collected exchange batches and send to workers."""
+        # Merge all worker batches into one
+        merged = ZSetBatch(schema)
+        for w in range(self.num_workers):
+            if worker_batches[w] is not None:
+                merged.append_batch(worker_batches[w])
+                worker_batches[w].free()
+
+        # Repartition by PK (the pre-exchange plan should MAP shard key -> PK)
+        dest_batches = [None] * self.num_workers
+        for i in range(merged.length()):
+            pk_lo = r_uint64(merged._read_pk_lo(i))
+            pk_hi = r_uint64(merged._read_pk_hi(i))
+            p = _partition_for_key(pk_lo, pk_hi)
+            w = self.assignment.worker_for_partition(p)
+            if dest_batches[w] is None:
+                dest_batches[w] = ArenaZSetBatch(schema)
+            dest_batches[w]._direct_append_row(merged, i, merged.get_weight(i))
+        merged.free()
+
+        for w in range(self.num_workers):
+            ipc.send_batch(
+                self.worker_fds[w], view_id, dest_batches[w],
+                schema=schema,
+            )
+            if dest_batches[w] is not None:
+                dest_batches[w].free()
 
     def fan_out_scan(self, target_id, schema):
         """Send scan to all workers, concatenate result batches."""
