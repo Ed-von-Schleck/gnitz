@@ -611,69 +611,6 @@ def test_empty_input():
     log("  PASSED")
 
 # ------------------------------------------------------------------------------
-# Test 8: Chunked scan with yield/resume loop
-# ------------------------------------------------------------------------------
-
-def test_chunked_scan_resume(base_dir):
-    log("[VM] Test 8: Chunked scan with yield/resume (ScanTrace + Yield + Jump)...")
-
-    cols = [
-        types.ColumnDefinition(types.TYPE_U64, name="pk"),
-        types.ColumnDefinition(types.TYPE_I64, name="val"),
-    ]
-    schema = types.TableSchema(cols, 0)
-    vm_schema = schema
-
-    table_path = os.path.join(base_dir, "chunk_table")
-    table = EphemeralTable(table_path, "chunks", schema)
-
-    # Fill table with 25 rows
-    b = batch.ZSetBatch(schema)
-    rb = RowBuilder(schema, b)
-    for i in range(25):
-        rb.begin(r_uint128(i), r_int64(1))
-        rb.put_int(r_int64(i * 10))
-        rb.commit()
-    table.ingest_batch(b)
-    b.free()
-
-    # R0=trace (cursor into table), R1=output
-    trace_cursor = table.create_cursor()
-    reg_file = runtime.RegisterFile(2)
-    reg_file.registers[0] = runtime.TraceRegister(0, vm_schema, trace_cursor, table)
-    reg_file.registers[1] = runtime.DeltaRegister(1, vm_schema)
-
-    # Program: ScanTrace(R0, R1, chunk=10) -> Yield(ROW_LIMIT) -> ClearDeltas -> Jump(0)
-    program = [
-        instructions.scan_trace_op(reg_file.registers[0], reg_file.registers[1], 10),
-        instructions.yield_op(2),
-        instructions.clear_deltas_op(),
-        instructions.jump_op(0),
-    ]
-
-    context = runtime.ExecutionContext()
-
-    # Chunk 1: expect 10 rows, then yield
-    context.reset()
-    interpreter.run_vm(program, reg_file, context)
-    assert_equal_i(runtime.STATUS_YIELDED, context.status, "Chunk 1: should yield")
-    assert_equal_i(10, reg_file.registers[1].batch.length(), "Chunk 1: should have 10 rows")
-    assert_equal_i(2, context.pc, "Chunk 1: PC should be at ClearDeltas (idx 2)")
-
-    # Chunk 2: resume from PC=2 (ClearDeltas), expect 10 more rows
-    interpreter.run_vm(program, reg_file, context)
-    assert_equal_i(runtime.STATUS_YIELDED, context.status, "Chunk 2: should yield")
-    assert_equal_i(10, reg_file.registers[1].batch.length(), "Chunk 2: should have 10 rows")
-
-    # Chunk 3: resume, expect remaining 5 rows
-    interpreter.run_vm(program, reg_file, context)
-    assert_equal_i(runtime.STATUS_YIELDED, context.status, "Chunk 3: should yield")
-    assert_equal_i(5, reg_file.registers[1].batch.length(), "Chunk 3: should have 5 rows")
-
-    table.close()
-    log("  PASSED")
-
-# ------------------------------------------------------------------------------
 # Test 9: Seek trace point lookup
 # ------------------------------------------------------------------------------
 
@@ -1150,7 +1087,6 @@ def entry_point(argv):
         test_reduce_sum(base_dir)
         test_ghost_property()
         test_empty_input()
-        test_chunked_scan_resume(base_dir)
         test_seek_trace_point_lookup(base_dir)
         test_empty_table_scan(base_dir)
         test_join_delta_delta()

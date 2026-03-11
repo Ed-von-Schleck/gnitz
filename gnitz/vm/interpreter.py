@@ -22,7 +22,7 @@ jitdriver = jit.JitDriver(
 def run_vm(program, reg_file, context):
     """
     Main execution loop. Executes the program from the current context PC.
-    Returns when the program HALTs or YIELDs.
+    Returns when the program HALTs.
     """
     pc = context.pc
     context.status = runtime.STATUS_RUNNING
@@ -44,16 +44,6 @@ def run_vm(program, reg_file, context):
             context.pc = pc
             context.status = runtime.STATUS_HALTED
             return
-
-        elif opcode == op.OPCODE_YIELD:
-            context.pc = pc + 1
-            context.status = runtime.STATUS_YIELDED
-            context.yield_reason = instr.yield_reason
-            return
-
-        elif opcode == op.OPCODE_JUMP:
-            pc = instr.jump_target
-            continue
 
         elif opcode == op.OPCODE_CLEAR_DELTAS:
             ops.op_clear_deltas(reg_file)

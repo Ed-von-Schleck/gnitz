@@ -8,11 +8,8 @@ from gnitz.core.batch import ZSetBatch
 # VM Execution Status Codes
 STATUS_INIT    = 0
 STATUS_RUNNING = 1
-STATUS_YIELDED = 2
 STATUS_HALTED  = 3
 STATUS_ERROR   = 4
-
-YIELD_REASON_NONE = 0
 
 
 class BaseRegister(object):
@@ -104,12 +101,10 @@ class ExecutionContext(object):
     def __init__(self):
         self.pc = 0
         self.status = STATUS_INIT
-        self.yield_reason = YIELD_REASON_NONE
 
     def reset(self):
         self.pc = 0
         self.status = STATUS_RUNNING
-        self.yield_reason = YIELD_REASON_NONE
 
 
 class ExecutablePlan(object):

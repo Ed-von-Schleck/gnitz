@@ -31,8 +31,6 @@ class Instruction(object):
         "agg_func",
         "output_schema",
         "chunk_limit",
-        "jump_target",
-        "yield_reason",
         "reg_key",
     ]
 
@@ -55,8 +53,6 @@ class Instruction(object):
         self.agg_func = None
         self.output_schema = None
         self.chunk_limit = 0
-        self.jump_target = 0
-        self.yield_reason = 0
         self.reg_key = None
 
 
@@ -166,18 +162,6 @@ def seek_trace_op(reg_trace, reg_key):
     i = Instruction(op.OPCODE_SEEK_TRACE)
     i.reg_trace = reg_trace
     i.reg_key = reg_key
-    return i
-
-
-def yield_op(reason):
-    i = Instruction(op.OPCODE_YIELD)
-    i.yield_reason = reason
-    return i
-
-
-def jump_op(target_idx):
-    i = Instruction(op.OPCODE_JUMP)
-    i.jump_target = target_idx
     return i
 
 
