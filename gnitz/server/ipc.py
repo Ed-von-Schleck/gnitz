@@ -171,11 +171,14 @@ def _compute_ipc_blob_size(src_batch, col_idx):
     return total
 
 
-def _write_ipc_strings(src_batch, col_idx, dest_ptr, dest_blob_ptr, count):
+def _write_ipc_strings(src_batch, col_idx, dest_ptr, dest_blob_ptr, count,
+                       global_blob_offset=0):
     """
     Writes IPC string encoding for a column.
     dest_ptr: points to the column buffer (count * 8 bytes).
-    dest_blob_ptr: points to the blob arena start.
+    dest_blob_ptr: points to where this column's blob data is written.
+    global_blob_offset: accumulated blob offset from prior string columns,
+        so that per-entry offsets are global (relative to blob area start).
     Returns bytes written to blob arena.
     """
     blob_offset = 0
@@ -198,7 +201,7 @@ def _write_ipc_strings(src_batch, col_idx, dest_ptr, dest_blob_ptr, count):
         s = string_logic.resolve_string(struct_ptr, heap_ptr, py_string)
         s_len = len(s)
 
-        u32_entry[0] = rffi.cast(rffi.UINT, blob_offset)
+        u32_entry[0] = rffi.cast(rffi.UINT, global_blob_offset + blob_offset)
         u32_entry[1] = rffi.cast(rffi.UINT, s_len)
 
         for bi in range(s_len):
@@ -424,7 +427,8 @@ def _write_zset_section(
             dest_col_ptr = rffi.ptradd(ptr, intmask(dest_off))
             dest_blob_ptr = rffi.ptradd(ptr, intmask(section_base + blob_offset) + blob_written)
             written = _write_ipc_strings(
-                zbatch, ci, dest_col_ptr, dest_blob_ptr, count
+                zbatch, ci, dest_col_ptr, dest_blob_ptr, count,
+                global_blob_offset=blob_written,
             )
             blob_written += written
         else:

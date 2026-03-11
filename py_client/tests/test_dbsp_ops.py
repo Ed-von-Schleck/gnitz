@@ -454,6 +454,82 @@ class TestReduce:
         sums = sorted(r[3] for r in rows)
         assert sums == [30, 100]  # group 1: 10+20=30, group 2: 100
 
+    def test_reduce_min(self, client, sn):
+        """A12a: reduce MIN per group."""
+        cols = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("val", TypeCode.I64),
+        ]
+        tid = client.create_table(sn, "t_a12a_" + _uid(), cols, pk_col_idx=0)
+        ts = Schema(columns=cols, pk_index=0)
+
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
+
+        def build(cb, vid):
+            inp = cb.input_delta()
+            r = cb.reduce(inp, group_by_cols=[1], agg_func_id=3, agg_col_idx=2)
+            cb.sink(r, vid)
+
+        vid = _build_and_create_view(client, sn, "v_a12a", tid, build, out_cols)
+
+        batch = ZSetBatch(schema=ts)
+        data = [(1, 1, 50), (2, 1, 10), (3, 1, 30), (4, 2, 80), (5, 2, 20)]
+        for pk, gid, val in data:
+            batch.pk_lo.append(pk)
+            batch.pk_hi.append(0)
+            batch.weights.append(1)
+            batch.nulls.append(0)
+        batch.columns = [[], [d[1] for d in data], [d[2] for d in data]]
+        client.push(tid, ts, batch)
+
+        rows = _scan_to_list(client, vid)
+        assert len(rows) == 2
+        mins = sorted(r[3] for r in rows)
+        assert mins == [10, 20]  # group 1: min(50,10,30)=10, group 2: min(80,20)=20
+
+    def test_reduce_max(self, client, sn):
+        """A12b: reduce MAX per group."""
+        cols = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("val", TypeCode.I64),
+        ]
+        tid = client.create_table(sn, "t_a12b_" + _uid(), cols, pk_col_idx=0)
+        ts = Schema(columns=cols, pk_index=0)
+
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
+
+        def build(cb, vid):
+            inp = cb.input_delta()
+            r = cb.reduce(inp, group_by_cols=[1], agg_func_id=4, agg_col_idx=2)
+            cb.sink(r, vid)
+
+        vid = _build_and_create_view(client, sn, "v_a12b", tid, build, out_cols)
+
+        batch = ZSetBatch(schema=ts)
+        data = [(1, 1, 50), (2, 1, 10), (3, 1, 30), (4, 2, 80), (5, 2, 20)]
+        for pk, gid, val in data:
+            batch.pk_lo.append(pk)
+            batch.pk_hi.append(0)
+            batch.weights.append(1)
+            batch.nulls.append(0)
+        batch.columns = [[], [d[1] for d in data], [d[2] for d in data]]
+        client.push(tid, ts, batch)
+
+        rows = _scan_to_list(client, vid)
+        assert len(rows) == 2
+        maxes = sorted(r[3] for r in rows)
+        assert maxes == [50, 80]  # group 1: max(50,10,30)=50, group 2: max(80,20)=80
+
     def test_reduce_retraction(self, client, sn):
         """A13: reduce retraction updates aggregate."""
         cols = [
@@ -782,6 +858,45 @@ class TestCombinations:
         pks = _scan_pks(client, vid)
         assert pks == [1]  # only pk=1 where a_val=10 > 0
 
+    def test_join_then_reduce(self, client, sn):
+        """B3: join(trace=B) → reduce(group_by b_val, SUM a_val)."""
+        tid_a, ts_a = _create_table_2col(client, sn, name="t_b3_a_" + _uid())
+        tid_b, ts_b = _create_table_2col(client, sn, name="t_b3_b_" + _uid())
+
+        # After join: col 0=pk(U64), col 1=a_val(I64), col 2=b_val(I64)
+        # Reduce groups by col 2 (b_val), SUM of col 1 (a_val)
+        # Reduce output: (U128 hash PK, I64 group_id, I64 agg)
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
+
+        # B has pk=1,2,3 all with b_val=10 (same group), pk=4 with b_val=20
+        _push_rows_2col(client, tid_b, ts_b, [
+            (1, 10, 1), (2, 10, 1), (3, 10, 1), (4, 20, 1),
+        ])
+
+        def build(cb, vid):
+            inp = cb.input_delta()
+            j = cb.join(inp, tid_b)
+            r = cb.reduce(j, group_by_cols=[2], agg_func_id=2, agg_col_idx=1)
+            cb.sink(r, vid)
+
+        vid = _build_and_create_view(client, sn, "v_b3", tid_a, build, out_cols)
+
+        # Push A: pk=1 a_val=5, pk=2 a_val=3, pk=4 a_val=7
+        _push_rows_2col(client, tid_a, ts_a, [
+            (1, 5, 1), (2, 3, 1), (4, 7, 1),
+        ])
+
+        rows = _scan_to_list(client, vid)
+        assert len(rows) == 2
+        # group b_val=10: sum(a_val for pk=1,2) = 5+3 = 8
+        # group b_val=20: sum(a_val for pk=4) = 7
+        sums = sorted(r[3] for r in rows)
+        assert sums == [7, 8]
+
     def test_negate_then_union(self, client, sn):
         """B4: union(input, negate(input)) should cancel to empty."""
         tid, ts = _create_table_2col(client, sn)
@@ -950,6 +1065,81 @@ class TestMultiTableView:
         pks = _scan_pks(client, vid)
         assert 1 in pks
 
+    def test_view_cascade(self, client, sn):
+        """C2: V2 reads from V1 (view-on-view cascade)."""
+        tid, ts = _create_table_2col(client, sn)
+        out_cols = [ColumnDef("pk", TypeCode.U64), ColumnDef("val", TypeCode.I64)]
+
+        # V1: filter val > 50
+        eb = ExprBuilder()
+        r0 = eb.load_col_int(1)
+        r1 = eb.load_const(50)
+        r2 = eb.cmp_gt(r0, r1)
+        expr = eb.build(r2)
+
+        def build_v1(cb, vid):
+            inp = cb.input_delta()
+            f = cb.filter(inp, expr=expr)
+            cb.sink(f, vid)
+
+        vid1 = _build_and_create_view(client, sn, "v_c2_v1_" + _uid(), tid, build_v1, out_cols)
+
+        # V2: passthrough on V1 (primary_source_id = vid1)
+        def build_v2(cb, vid):
+            inp = cb.input_delta()
+            f = cb.filter(inp)  # null predicate = passthrough
+            cb.sink(f, vid)
+
+        vid2 = client.allocate_table_id()
+        cb2 = CircuitBuilder(vid2, vid1)  # source is V1, not T
+        build_v2(cb2, vid2)
+        graph2 = cb2.build()
+        client.create_view_with_circuit(sn, "v_c2_v2_" + _uid(), graph2, out_cols)
+
+        # Push to T → should cascade through V1 → V2
+        _push_rows_2col(client, tid, ts, [
+            (1, 10, 1), (2, 60, 1), (3, 80, 1),
+        ])
+
+        # V1 should have 2 rows (val > 50)
+        assert _scan_pks(client, vid1) == [2, 3]
+        # V2 should have the same 2 rows (passthrough of V1)
+        assert _scan_pks(client, vid2) == [2, 3]
+
+    def test_multiple_joins_chain(self, client, sn):
+        """C4: chained joins: A → join(B) → join(C)."""
+        tid_a, ts_a = _create_table_2col(client, sn, name="t_c4_a_" + _uid())
+        tid_b, ts_b = _create_table_2col(client, sn, name="t_c4_b_" + _uid())
+        tid_c, ts_c = _create_table_2col(client, sn, name="t_c4_c_" + _uid())
+
+        # First join: A(pk, a_val) ⋈ B(pk, b_val) → (pk, a_val, b_val)
+        # Second join: result(pk, a_val, b_val) ⋈ C(pk, c_val) → (pk, a_val, b_val, c_val)
+        out_cols = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("a_val", TypeCode.I64),
+            ColumnDef("b_val", TypeCode.I64),
+            ColumnDef("c_val", TypeCode.I64),
+        ]
+
+        # Populate B with pk=1,2 and C with pk=1,3
+        _push_rows_2col(client, tid_b, ts_b, [(1, 100, 1), (2, 200, 1)])
+        _push_rows_2col(client, tid_c, ts_c, [(1, 1000, 1), (3, 3000, 1)])
+
+        def build(cb, vid):
+            inp = cb.input_delta()
+            j1 = cb.join(inp, tid_b)
+            j2 = cb.join(j1, tid_c)
+            cb.sink(j2, vid)
+
+        vid = _build_and_create_view(client, sn, "v_c4", tid_a, build, out_cols)
+
+        # Push A with pk=1,2,3
+        _push_rows_2col(client, tid_a, ts_a, [(1, 10, 1), (2, 20, 1), (3, 30, 1)])
+
+        # Only pk=1 matches both B and C
+        pks = _scan_pks(client, vid)
+        assert pks == [1]
+
 
 # ===========================================================================
 # Part D: Incremental / DBSP Semantics Tests
@@ -1031,6 +1221,77 @@ class TestIncremental:
         # Insert val=3 (does NOT pass filter → no view change)
         _push_rows_2col(client, tid, ts, [(2, 3, 1)])
         assert _scan_pks(client, vid) == []
+
+        # Delete val=3 (does NOT pass filter → no view change)
+        _push_rows_2col(client, tid, ts, [(2, 3, -1)])
+        assert _scan_pks(client, vid) == []
+
+    def test_reduce_multi_tick(self, client, sn):
+        """D3: reduce across 3 ticks — insert, insert more, delete some."""
+        cols = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("val", TypeCode.I64),
+        ]
+        tid = client.create_table(sn, "t_d3_" + _uid(), cols, pk_col_idx=0)
+        ts = Schema(columns=cols, pk_index=0)
+
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
+
+        def build(cb, vid):
+            inp = cb.input_delta()
+            r = cb.reduce(inp, group_by_cols=[1], agg_func_id=2, agg_col_idx=2)
+            cb.sink(r, vid)
+
+        vid = _build_and_create_view(client, sn, "v_d3", tid, build, out_cols)
+
+        # Tick 1: push val=10, val=20 in group 1
+        batch = ZSetBatch(schema=ts)
+        batch.pk_lo = [1, 2]
+        batch.pk_hi = [0, 0]
+        batch.weights = [1, 1]
+        batch.nulls = [0, 0]
+        batch.columns = [[], [1, 1], [10, 20]]
+        client.push(tid, ts, batch)
+
+        rows = _scan_to_list(client, vid)
+        positive = [r for r in rows if r[1] > 0]
+        assert len(positive) == 1
+        assert positive[0][3] == 30  # sum = 10+20
+
+        # Tick 2: push val=30 in group 1, val=50 in group 2
+        batch2 = ZSetBatch(schema=ts)
+        batch2.pk_lo = [3, 4]
+        batch2.pk_hi = [0, 0]
+        batch2.weights = [1, 1]
+        batch2.nulls = [0, 0]
+        batch2.columns = [[], [1, 2], [30, 50]]
+        client.push(tid, ts, batch2)
+
+        rows = _scan_to_list(client, vid)
+        positive = [r for r in rows if r[1] > 0]
+        assert len(positive) == 2
+        sums = sorted(r[3] for r in positive)
+        assert sums == [50, 60]  # group 1: 10+20+30=60, group 2: 50
+
+        # Tick 3: delete val=10 from group 1 (pk=1, weight=-1)
+        batch3 = ZSetBatch(schema=ts)
+        batch3.pk_lo = [1]
+        batch3.pk_hi = [0]
+        batch3.weights = [-1]
+        batch3.nulls = [0]
+        batch3.columns = [[], [1], [10]]
+        client.push(tid, ts, batch3)
+
+        rows = _scan_to_list(client, vid)
+        positive = [r for r in rows if r[1] > 0]
+        assert len(positive) == 2
+        sums = sorted(r[3] for r in positive)
+        assert sums == [50, 50]  # group 1: 20+30=50, group 2: 50
 
 
 # ===========================================================================
@@ -1125,7 +1386,6 @@ class TestEdgeCases:
         assert labels[2] == ""
         assert labels[3] == "a" * 100
 
-    @pytest.mark.xfail(reason="Server-side join outputs left string for both columns (CompositeAccessor bug)")
     def test_string_columns_through_join(self, client, sn):
         """E7: string columns survive join."""
         cols_a = [
@@ -1205,6 +1465,205 @@ class TestEdgeCases:
         # pk=1 from tick 2 is blocked, but pk=1 from tick 1 is still in view
         # (anti-join only filters the current delta, not the accumulated trace)
         assert 2 in pks
+
+    def test_null_values_through_filter(self, client, sn):
+        """E3: nullable column filtered with IS_NOT_NULL expression."""
+        cols = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("val", TypeCode.I64, is_nullable=True),
+        ]
+        tid = client.create_table(sn, "t_e3_" + _uid(), cols, pk_col_idx=0)
+        ts = Schema(columns=cols, pk_index=0)
+        out_cols = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("val", TypeCode.I64, is_nullable=True),
+        ]
+
+        # Filter: IS_NOT_NULL(col 1)
+        eb = ExprBuilder()
+        r0 = eb.is_not_null(1)
+        expr = eb.build(r0)
+
+        def build(cb, vid):
+            inp = cb.input_delta()
+            f = cb.filter(inp, expr=expr)
+            cb.sink(f, vid)
+
+        vid = _build_and_create_view(client, sn, "v_e3", tid, build, out_cols)
+
+        # Push rows: pk=1 val=10, pk=2 val=NULL, pk=3 val=30
+        batch = ZSetBatch(schema=ts)
+        batch.pk_lo = [1, 2, 3]
+        batch.pk_hi = [0, 0, 0]
+        batch.weights = [1, 1, 1]
+        # null bitmap: col 1 is payload_idx 0 (ci=1, pk_index=0 → 1-1=0)
+        # For pk=2 (row 1), set bit 0: nulls = 1
+        batch.nulls = [0, 1, 0]
+        batch.columns = [[], [10, 0, 30]]  # val=0 for null row (placeholder)
+        client.push(tid, ts, batch)
+
+        # Only non-null rows should pass
+        pks = _scan_pks(client, vid)
+        assert pks == [1, 3]
+
+    def test_null_values_through_join(self, client, sn):
+        """E4: nullable payload columns survive join correctly."""
+        cols_a = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("a_val", TypeCode.I64, is_nullable=True),
+        ]
+        cols_b = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("b_val", TypeCode.I64, is_nullable=True),
+        ]
+        tid_a = client.create_table(sn, "t_e4_a_" + _uid(), cols_a, pk_col_idx=0)
+        ts_a = Schema(columns=cols_a, pk_index=0)
+        tid_b = client.create_table(sn, "t_e4_b_" + _uid(), cols_b, pk_col_idx=0)
+        ts_b = Schema(columns=cols_b, pk_index=0)
+
+        out_cols = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("a_val", TypeCode.I64, is_nullable=True),
+            ColumnDef("b_val", TypeCode.I64, is_nullable=True),
+        ]
+
+        # Populate B: pk=1 with b_val=NULL, pk=2 with b_val=200
+        b_batch = ZSetBatch(schema=ts_b)
+        b_batch.pk_lo = [1, 2]
+        b_batch.pk_hi = [0, 0]
+        b_batch.weights = [1, 1]
+        b_batch.nulls = [1, 0]  # pk=1 has null b_val
+        b_batch.columns = [[], [0, 200]]
+        client.push(tid_b, ts_b, b_batch)
+
+        def build(cb, vid):
+            inp = cb.input_delta()
+            j = cb.join(inp, tid_b)
+            cb.sink(j, vid)
+
+        vid = _build_and_create_view(client, sn, "v_e4", tid_a, build, out_cols)
+
+        # Push A: pk=1 with a_val=10, pk=2 with a_val=NULL
+        a_batch = ZSetBatch(schema=ts_a)
+        a_batch.pk_lo = [1, 2]
+        a_batch.pk_hi = [0, 0]
+        a_batch.weights = [1, 1]
+        a_batch.nulls = [0, 1]  # pk=2 has null a_val
+        a_batch.columns = [[], [10, 0]]
+        client.push(tid_a, ts_a, a_batch)
+
+        # Both PKs should match
+        pks = _scan_pks(client, vid)
+        assert pks == [1, 2]
+
+    def test_null_values_through_reduce(self, client, sn):
+        """E5: COUNT counts all rows; SUM skips NULLs."""
+        cols = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("val", TypeCode.I64, is_nullable=True),
+        ]
+        tid = client.create_table(sn, "t_e5_" + _uid(), cols, pk_col_idx=0)
+        ts = Schema(columns=cols, pk_index=0)
+
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
+
+        # COUNT view
+        def build_count(cb, vid):
+            inp = cb.input_delta()
+            r = cb.reduce(inp, group_by_cols=[1], agg_func_id=1, agg_col_idx=2)
+            cb.sink(r, vid)
+
+        vid_count = _build_and_create_view(client, sn, "v_e5_count_" + _uid(), tid, build_count, out_cols)
+
+        # SUM view
+        def build_sum(cb, vid):
+            inp = cb.input_delta()
+            r = cb.reduce(inp, group_by_cols=[1], agg_func_id=2, agg_col_idx=2)
+            cb.sink(r, vid)
+
+        vid_sum = _build_and_create_view(client, sn, "v_e5_sum_" + _uid(), tid, build_sum, out_cols)
+
+        # Push: group 1 has val=10, val=NULL, val=30
+        # null bitmap: col 2 (val) is payload_idx 1 (ci=2, pk_index=0 → 2-1=1)
+        batch = ZSetBatch(schema=ts)
+        batch.pk_lo = [1, 2, 3]
+        batch.pk_hi = [0, 0, 0]
+        batch.weights = [1, 1, 1]
+        batch.nulls = [0, 2, 0]  # row 1 (pk=2): bit 1 set = col 2 null
+        batch.columns = [[], [1, 1, 1], [10, 0, 30]]
+        client.push(tid, ts, batch)
+
+        # COUNT should count all 3 rows (including the null one)
+        rows_count = _scan_to_list(client, vid_count)
+        positive_count = [r for r in rows_count if r[1] > 0]
+        assert len(positive_count) == 1
+        assert positive_count[0][3] == 3
+
+        # SUM should skip the NULL: 10 + 30 = 40
+        rows_sum = _scan_to_list(client, vid_sum)
+        positive_sum = [r for r in rows_sum if r[1] > 0]
+        assert len(positive_sum) == 1
+        assert positive_sum[0][3] == 40
+
+    def test_reduce_group_becomes_empty(self, client, sn):
+        """E9: delete all rows in a group → group disappears from view."""
+        cols = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("val", TypeCode.I64),
+        ]
+        tid = client.create_table(sn, "t_e9_" + _uid(), cols, pk_col_idx=0)
+        ts = Schema(columns=cols, pk_index=0)
+
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
+
+        def build(cb, vid):
+            inp = cb.input_delta()
+            r = cb.reduce(inp, group_by_cols=[1], agg_func_id=2, agg_col_idx=2)
+            cb.sink(r, vid)
+
+        vid = _build_and_create_view(client, sn, "v_e9", tid, build, out_cols)
+
+        # Push 2 rows in group 1
+        batch = ZSetBatch(schema=ts)
+        batch.pk_lo = [1, 2]
+        batch.pk_hi = [0, 0]
+        batch.weights = [1, 1]
+        batch.nulls = [0, 0]
+        batch.columns = [[], [1, 1], [10, 20]]
+        client.push(tid, ts, batch)
+
+        rows = _scan_to_list(client, vid)
+        positive = [r for r in rows if r[1] > 0]
+        assert len(positive) == 1
+        assert positive[0][3] == 30  # sum = 10+20
+
+        # Delete both rows (weight=-1)
+        batch2 = ZSetBatch(schema=ts)
+        batch2.pk_lo = [1, 2]
+        batch2.pk_hi = [0, 0]
+        batch2.weights = [-1, -1]
+        batch2.nulls = [0, 0]
+        batch2.columns = [[], [1, 1], [10, 20]]
+        client.push(tid, ts, batch2)
+
+        # DBSP semantics: the group still exists with sum=0 (identity element).
+        # The reduce emits a retraction of the old aggregate (30) and an
+        # insertion of the new aggregate (0). After consolidation, the view
+        # has one row with agg=0.
+        rows = _scan_to_list(client, vid)
+        positive = [r for r in rows if r[1] > 0]
+        assert len(positive) == 1
+        assert positive[0][3] == 0  # sum of empty group = 0
 
     def test_distinct_weight_accumulation(self, client, sn):
         """E10: distinct weight accumulation and cancellation."""
