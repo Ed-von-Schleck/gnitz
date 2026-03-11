@@ -117,6 +117,25 @@ class PersistentTable(EphemeralTable):
             self.flush()
             self.memtable.upsert_batch(batch)
 
+    def ingest_batch_memonly(self, batch):
+        """Ingest into memtable only, bypassing the WAL.
+
+        Used by workers for DDL sync: the master owns the system-table WAL,
+        so workers must never touch it. This method uses the EphemeralTable
+        flush path (no WAL, no manifest) if the memtable overflows.
+        """
+        if self.is_closed:
+            raise errors.StorageError("Table '%s' is closed" % self.name)
+        if batch.length() == 0:
+            return
+        try:
+            self.memtable.upsert_batch(batch)
+            if self.memtable.should_flush():
+                EphemeralTable.flush(self)
+        except errors.MemTableFullError:
+            EphemeralTable.flush(self)
+            self.memtable.upsert_batch(batch)
+
     def recover_from_wal(self, wal_path):
         """
         Synchronizes the MemTable state with the persistent WAL during startup.

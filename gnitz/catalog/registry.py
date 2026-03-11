@@ -225,6 +225,10 @@ class EntityRegistry(object):
         self._next_schema_id = FIRST_USER_SCHEMA_ID
         self._next_table_id = FIRST_USER_TABLE_ID
         self._next_index_id = FIRST_USER_INDEX_ID
+        # Partition range for user-table creation. Default: all 256.
+        # Workers narrow this after fork; master sets (0, 0) to skip.
+        self.active_part_start = 0
+        self.active_part_end = 256
 
     def recover_sequences(self, schema_hwm, table_hwm, index_hwm, programs_hwm):
         """

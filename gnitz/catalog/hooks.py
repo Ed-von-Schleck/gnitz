@@ -152,7 +152,9 @@ class TableEffectHook(DeltaHook):
                 tbl_schema = TableSchema(col_defs, pk_col_idx)
                 n = get_num_partitions(tid)
                 pt = make_partitioned_persistent(
-                    directory, name, tbl_schema, tid, n
+                    directory, name, tbl_schema, tid, n,
+                    part_start=self.registry.active_part_start,
+                    part_end=self.registry.active_part_end,
                 )
 
                 mmap_posix.fsync_dir(self.base_dir + "/" + schema_name)
@@ -259,7 +261,9 @@ class ViewEffectHook(DeltaHook):
                 tbl_schema = TableSchema(col_defs, pk_index=0)
                 n = get_num_partitions(vid)
                 et = make_partitioned_ephemeral(
-                    directory, name, tbl_schema, vid, n
+                    directory, name, tbl_schema, vid, n,
+                    part_start=self.registry.active_part_start,
+                    part_end=self.registry.active_part_end,
                 )
 
                 family = TableFamily(schema_name, name, vid, sid, directory, 0, et)

@@ -105,3 +105,15 @@ class ZSetStore(object):
     def close(self):
         """Closes the store and releases memory/file handles."""
         raise NotImplementedError
+
+    def ingest_batch_memonly(self, batch):
+        """Ingest into memtable only, bypassing the WAL. Worker DDL sync use."""
+        self.ingest_batch(batch)
+
+    def close_partitions_outside(self, start, end):
+        """Close partitions not in [start, end). Only meaningful for PartitionedTable."""
+        raise NotImplementedError
+
+    def close_all_partitions(self):
+        """Close all partitions. Only meaningful for PartitionedTable."""
+        raise NotImplementedError

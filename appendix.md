@@ -124,7 +124,7 @@ ArenaZSetBatch (Columnar buffers in memory)
     └──→ DBSP Ops (Vectorized column-at-a-time processing)
 ```
 
-# Appendix D: Make Targets
+# Appendix D: Make Targets and Running Tests
 
 | Target | Description |
 |---|---|
@@ -135,3 +135,52 @@ ArenaZSetBatch (Columnar buffers in memory)
 | `make clean` | Remove test binaries and data directories |
 
 The `pytest` targets use `uv run pytest` inside `py_client/`. Test fixtures manage server lifecycle automatically (start, stop, temp directory cleanup).
+
+## Running RPython Tests
+
+`make test` compiles and runs all test suites in parallel (`-j$(nproc)`). Output is interleaved.
+
+**To capture all output and check results:**
+```bash
+# Full run — redirect ALL output to a file, then check result
+make test 2>&1 | tee /tmp/test.log
+echo "Exit: $?"
+
+# Check for failures in the log
+grep -E "FAIL|Error|Traceback|SEGV|Abort" /tmp/test.log
+```
+
+**Never** use `| tail -N` or `| head -N` to read test output — parallel compilation interleaves messages, so the real failure may appear in the middle. Always capture the full output and search it.
+
+**To run a single RPython test in isolation:**
+```bash
+make clean
+make run-<test_name>-c    # e.g. make run-master_worker_test-c
+```
+
+## Running Python E2E Tests
+
+```bash
+# Full suite (rebuilds server)
+make pytest 2>&1 | tee /tmp/pytest.log
+
+# Without rebuilding server
+make pytest-only 2>&1 | tee /tmp/pytest.log
+
+# Single test file or test
+cd py_client && uv run pytest tests/test_workers.py -xvs
+
+# Single test function
+cd py_client && uv run pytest tests/test_workers.py::test_workers_insert_and_scan -xvs
+```
+
+The `-x` flag stops on the first failure. The `-v` flag shows each test name. The `-s` flag shows stdout/stderr (useful for debugging server output).
+
+## Debugging Multi-Worker Issues
+
+Start the server with `--log-level=verbose` to enable debug logging from both master dispatcher and worker processes:
+```bash
+./gnitz-server-c --workers=4 --log-level=verbose /tmp/test_data /tmp/test.sock
+```
+
+Worker and master messages are timestamped and tagged. Use `log.error`/`log.warn`/`log.debug` (not raw `os.write(2, ...)`) for all diagnostic output in RPython code so that messages are structured and controllable.

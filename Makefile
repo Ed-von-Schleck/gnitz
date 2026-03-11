@@ -18,7 +18,8 @@ TEST_FILES := \
 	rpython_tests/expr_test.py \
 	rpython_tests/compile_graph_test.py \
 	rpython_tests/server_test.py \
-	rpython_tests/partitioned_table_test.py
+	rpython_tests/partitioned_table_test.py \
+	rpython_tests/master_worker_test.py
 
 # Derived names
 TEST_BINS := $(notdir $(TEST_FILES:.py=-c))
@@ -34,10 +35,12 @@ DATA_DIR_vm_comprehensive_test-c := vm_test_data
 DATA_DIR_compile_graph_test-c := compile_graph_test_data
 DATA_DIR_server_test-c := server_test_data
 DATA_DIR_partitioned_table_test-c := partitioned_table_test_data
+DATA_DIR_master_worker_test-c := master_worker_test_data
 
 ALL_DATA_DIRS := storage_test_data dbsp_test_data zstore_test_data \
                  catalog_test_data catalog_additional_test_data vm_test_data \
-                 compile_graph_test_data server_test_data partitioned_table_test_data
+                 compile_graph_test_data server_test_data partitioned_table_test_data \
+                 master_worker_test_data
 
 .PHONY: all test clean server pytest pytest-only $(RUN_TARGETS)
 

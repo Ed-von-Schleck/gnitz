@@ -56,11 +56,12 @@ class ServerExecutor(object):
     Uses topological ranking to ensure glitch-free incremental evaluation.
     """
 
-    _immutable_fields_ = ["engine", "program_cache"]
+    _immutable_fields_ = ["engine", "program_cache", "dispatcher"]
 
-    def __init__(self, engine):
+    def __init__(self, engine, dispatcher=None):
         self.engine = engine
         self.program_cache = engine.program_cache
+        self.dispatcher = dispatcher
 
         # Connection Registries
         self.active_fds = newlist_hint(16)
@@ -76,6 +77,18 @@ class ServerExecutor(object):
 
         while True:
             jit.promote(self.engine)
+
+            # Check for worker crashes (non-blocking)
+            if self.dispatcher is not None:
+                crashed = self.dispatcher.check_workers()
+                if crashed >= 0:
+                    os.write(
+                        2,
+                        "Worker %d crashed, shutting down\n" % crashed,
+                    )
+                    self.dispatcher.shutdown_workers()
+                    return
+
             count = len(self.active_fds)
             fds = newlist_hint(count)
             events = newlist_hint(count)
@@ -119,7 +132,19 @@ class ServerExecutor(object):
 
         Works identically for system tables (DDL via hooks) and user tables
         (DML + reactive cascade).  Returns a response batch (scan) or None.
+
+        When a dispatcher is active, user-table operations are fanned out
+        to worker processes. System tables stay local to master.
         """
+        if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
+            schema = self.engine.registry.get_by_id(target_id).schema
+            if in_batch is not None and in_batch.length() > 0:
+                self.dispatcher.fan_out_push(target_id, in_batch, schema)
+                self._evaluate_dag(target_id, in_batch)
+                return None
+            else:
+                return self.dispatcher.fan_out_scan(target_id, schema)
+
         if in_batch is not None and in_batch.length() > 0:
             family = self.engine.registry.get_by_id(target_id)
             ingest_to_family(family, in_batch)
@@ -179,6 +204,18 @@ class ServerExecutor(object):
                 _validate_schema_match(payload.schema, family.schema)
 
             result = self.handle_push(target_id, payload.batch)
+
+            # Broadcast system-table deltas to workers for DDL sync
+            if (
+                self.dispatcher is not None
+                and target_id < sys.FIRST_USER_TABLE_ID
+                and payload.batch is not None
+                and payload.batch.length() > 0
+            ):
+                family = self.engine.registry.get_by_id(target_id)
+                self.dispatcher.broadcast_ddl(
+                    target_id, payload.batch, family.schema
+                )
 
             # Response always includes schema
             resp_schema = None

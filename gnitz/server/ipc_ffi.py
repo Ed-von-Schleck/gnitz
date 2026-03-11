@@ -168,6 +168,10 @@ int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int ti
     return res;
 }
 
+int gnitz_socketpair(int fds_out[2]) {
+    return socketpair(AF_UNIX, SOCK_SEQPACKET, 0, fds_out);
+}
+
 int gnitz_server_create(const char *socket_path) {
     int fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
     if (fd < 0) return -1;
@@ -210,6 +214,7 @@ eci = ExternalCompilationInfo(
         "int gnitz_ipc_send_fd(int sock_fd, int fd_to_send);",
         "int gnitz_ipc_recv_fd(int sock_fd);",
         "int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int timeout_ms);",
+        "int gnitz_socketpair(int fds_out[2]);",
         "int gnitz_server_create(const char *socket_path);",
         "int gnitz_server_accept(int server_fd);",
     ],
@@ -300,6 +305,30 @@ def poll(fds, events, timeout_ms):
         lltype.free(c_revents, flavor='raw')
 
     return revents
+
+
+_gnitz_socketpair = rffi.llexternal(
+    "gnitz_socketpair",
+    [rffi.INTP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+
+def create_socketpair():
+    """Creates a SEQPACKET socketpair. Returns (parent_fd, child_fd)."""
+    fds = lltype.malloc(rffi.INTP.TO, 2, flavor="raw")
+    try:
+        fds[0] = rffi.cast(rffi.INT, 0)
+        fds[1] = rffi.cast(rffi.INT, 0)
+        ret = _gnitz_socketpair(fds)
+        if int(ret) < 0:
+            raise OSError(0, "socketpair failed")
+        parent_fd = int(fds[0])
+        child_fd = int(fds[1])
+        return parent_fd, child_fd
+    finally:
+        lltype.free(fds, flavor="raw")
 
 
 _gnitz_server_create = rffi.llexternal(
