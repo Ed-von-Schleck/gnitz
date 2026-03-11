@@ -210,16 +210,23 @@ def _write_ipc_strings(src_batch, col_idx, dest_ptr, dest_blob_ptr, count):
 
 def _read_ipc_strings(
     ipc_col_ptr, ipc_blob_ptr, ipc_blob_sz, count,
-    dest_batch, dest_col_idx, owned_bufs
+    dest_batch, dest_col_idx, owned_bufs, shared_blob_buf=None
 ):
     """
     Reads IPC string encoding and writes German Strings into dest_batch's column.
     Creates owned buffers for the German String column and blob data.
     Appends created buffers to owned_bufs for lifecycle management.
+
+    If shared_blob_buf is provided, long strings are allocated into it
+    (all string columns in a section must share the same blob arena so that
+    offsets are valid when the batch resolves them).
     """
     stride = types.TYPE_STRING.size  # 16
     col_buf = buffer.Buffer(count * stride)
-    blob_buf = buffer.Buffer(intmask(ipc_blob_sz) + 64)
+    if shared_blob_buf is not None:
+        blob_buf = shared_blob_buf
+    else:
+        blob_buf = buffer.Buffer(intmask(ipc_blob_sz) + 64)
     allocator = batch.BatchBlobAllocator(blob_buf)
 
     for row in range(count):
@@ -250,7 +257,8 @@ def _read_ipc_strings(
         string_logic.pack_and_write_blob(dest, s, allocator)
 
     owned_bufs.append(col_buf)
-    owned_bufs.append(blob_buf)
+    if shared_blob_buf is None:
+        owned_bufs.append(blob_buf)
     return col_buf, blob_buf
 
 
@@ -686,6 +694,16 @@ def _parse_zset_section(
     # The blob region starts after all columns
     blob_region_off = section_base + cur_off
 
+    # Create a single shared blob buffer for ALL string columns so that
+    # German String heap offsets are relative to the same base pointer.
+    # (Previously each _read_ipc_strings call created its own blob_buf,
+    # but only the last one was used as the batch blob arena — offsets from
+    # earlier string columns pointed into orphaned buffers → segfault.)
+    shared_blob_buf = None
+    if schema.has_string:
+        shared_blob_buf = buffer.Buffer(intmask(blob_sz) + 64)
+        owned_bufs.append(shared_blob_buf)
+
     # Now parse string columns (need blob region offset)
     # Re-walk to find each string column's wire offset
     str_cur_off = r_uint64(0)
@@ -710,25 +728,17 @@ def _parse_zset_section(
 
             col_buf, str_blob_buf = _read_ipc_strings(
                 ipc_col_ptr, ipc_blob_ptr, blob_sz, count,
-                None, ci, owned_bufs,
+                None, ci, owned_bufs, shared_blob_buf,
             )
             col_bufs[ci] = col_buf
         else:
             wire_stride = col_type.size
             str_cur_off = align_up(str_cur_off + r_uint64(wire_stride * count), ALIGNMENT)
 
-    # Build a combined blob arena for the batch
-    # For string columns we use the owned blobs from _read_ipc_strings.
-    # For non-string batches, just use a dummy empty blob.
-    # We need to pick the blob_buf from the last string column parsed,
-    # or create an empty one.
+    # Use the shared blob buffer as the batch's blob arena.
     final_blob_buf = buffer.Buffer(0)
-    if schema.has_string:
-        # Find the last string column's blob buffer from owned_bufs
-        # The _read_ipc_strings appends [col_buf, blob_buf] pairs
-        # The last blob_buf is the one we want as the batch blob_arena
-        if len(owned_bufs) >= 2:
-            final_blob_buf = owned_bufs[len(owned_bufs) - 1]
+    if shared_blob_buf is not None:
+        final_blob_buf = shared_blob_buf
 
     zbatch_obj = batch.ArenaZSetBatch.from_buffers(
         schema, pk_lo_buf, pk_hi_buf, weight_buf, null_buf,

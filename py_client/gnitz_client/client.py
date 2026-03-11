@@ -24,6 +24,7 @@ from gnitz_client.batch import (
     ZSetBatch, encode_zset_section, decode_zset_section,
     schema_to_batch, batch_to_schema,
 )
+from gnitz_client.circuit import CircuitGraph
 from gnitz_client import transport
 
 
@@ -416,6 +417,166 @@ class GnitzClient:
         self.push(CIRCUIT_PARAMS_TAB, params_s, params_batch)
 
         # 4. View record (triggers hook)
+        view_s = VIEW_TAB_SCHEMA
+        vb = ZSetBatch(
+            schema=view_s,
+            pk_lo=[vid],
+            pk_hi=[0],
+            weights=[1],
+            nulls=[0],
+            columns=[[], [sid], [view_name], [""], [""], [0]],
+        )
+        self.push(VIEW_TAB, view_s, vb)
+
+        return vid
+
+    def create_view_with_circuit(
+        self,
+        schema_name: str,
+        view_name: str,
+        circuit: CircuitGraph,
+        output_columns: list[ColumnDef],
+    ) -> int:
+        """Create a view with an arbitrary circuit graph.
+
+        The circuit's view_id must already be allocated (via allocate_table_id).
+        """
+        vid = circuit.view_id
+
+        # Find schema_id
+        _, schema_batch = self.scan(SCHEMA_TAB)
+        sid = self._find_schema_id(schema_batch, schema_name)
+
+        # 1. Column records (same pattern as create_view)
+        col_schema = COL_TAB_SCHEMA
+        col_batch = ZSetBatch(schema=col_schema)
+        for i, col in enumerate(output_columns):
+            col_pk = _pack_column_id(vid, i)
+            col_batch.pk_lo.append(col_pk)
+            col_batch.pk_hi.append(0)
+            col_batch.weights.append(1)
+            col_batch.nulls.append(0)
+        pk_col: list = []
+        owner_ids = []
+        owner_kinds = []
+        col_idxs = []
+        names = []
+        type_codes = []
+        is_nullables = []
+        fk_table_ids = []
+        fk_col_idxs = []
+        for i, col in enumerate(output_columns):
+            pk_col.append(None)
+            owner_ids.append(vid)
+            owner_kinds.append(OWNER_KIND_VIEW)
+            col_idxs.append(i)
+            names.append(col.name)
+            type_codes.append(col.type_code)
+            is_nullables.append(1 if col.is_nullable else 0)
+            fk_table_ids.append(0)
+            fk_col_idxs.append(0)
+        col_batch.columns = [pk_col, owner_ids, owner_kinds, col_idxs, names,
+                             type_codes, is_nullables, fk_table_ids, fk_col_idxs]
+        self.push(COL_TAB, col_schema, col_batch)
+
+        # 2. Dependency records
+        dep_s = DEP_TAB_SCHEMA
+        if circuit.dependencies:
+            dep_batch = ZSetBatch(schema=dep_s)
+            dep_pks = []
+            dep_vids = []
+            dep_view_ids = []
+            dep_table_ids = []
+            for dep_tid in circuit.dependencies:
+                dep_id = vid ^ dep_tid
+                dep_batch.pk_lo.append(dep_id)
+                dep_batch.pk_hi.append(0)
+                dep_batch.weights.append(1)
+                dep_batch.nulls.append(0)
+                dep_pks.append(None)
+                dep_vids.append(vid)
+                dep_view_ids.append(0)
+                dep_table_ids.append(dep_tid)
+            dep_batch.columns = [dep_pks, dep_vids, dep_view_ids, dep_table_ids]
+            self.push(DEP_TAB, dep_s, dep_batch)
+
+        # 3. Circuit nodes
+        if circuit.nodes:
+            nodes_s = CIRCUIT_NODES_SCHEMA
+            nodes_batch = ZSetBatch(schema=nodes_s)
+            opcodes_col = []
+            for node_id, opcode in circuit.nodes:
+                nodes_batch.pk_lo.append(node_id)
+                nodes_batch.pk_hi.append(vid)
+                nodes_batch.weights.append(1)
+                nodes_batch.nulls.append(0)
+                opcodes_col.append(opcode)
+            nodes_batch.columns = [[], opcodes_col]
+            self.push(CIRCUIT_NODES_TAB, nodes_s, nodes_batch)
+
+        # 4. Circuit edges
+        if circuit.edges:
+            edges_s = CIRCUIT_EDGES_SCHEMA
+            edges_batch = ZSetBatch(schema=edges_s)
+            src_col = []
+            dst_col = []
+            port_col = []
+            for edge_id, src, dst, port in circuit.edges:
+                edges_batch.pk_lo.append(edge_id)
+                edges_batch.pk_hi.append(vid)
+                edges_batch.weights.append(1)
+                edges_batch.nulls.append(0)
+                src_col.append(src)
+                dst_col.append(dst)
+                port_col.append(port)
+            edges_batch.columns = [[], src_col, dst_col, port_col]
+            self.push(CIRCUIT_EDGES_TAB, edges_s, edges_batch)
+
+        # 5. Circuit sources
+        if circuit.sources:
+            sources_s = CIRCUIT_SOURCES_SCHEMA
+            sources_batch = ZSetBatch(schema=sources_s)
+            table_id_col = []
+            for node_id, table_id in circuit.sources:
+                sources_batch.pk_lo.append(node_id)
+                sources_batch.pk_hi.append(vid)
+                sources_batch.weights.append(1)
+                sources_batch.nulls.append(0)
+                table_id_col.append(table_id)
+            sources_batch.columns = [[], table_id_col]
+            self.push(CIRCUIT_SOURCES_TAB, sources_s, sources_batch)
+
+        # 6. Circuit params
+        if circuit.params:
+            params_s = CIRCUIT_PARAMS_SCHEMA
+            params_batch = ZSetBatch(schema=params_s)
+            value_col = []
+            for node_id, slot, value in circuit.params:
+                param_lo = (node_id << 8) | slot
+                params_batch.pk_lo.append(param_lo)
+                params_batch.pk_hi.append(vid)
+                params_batch.weights.append(1)
+                params_batch.nulls.append(0)
+                value_col.append(value)
+            params_batch.columns = [[], value_col]
+            self.push(CIRCUIT_PARAMS_TAB, params_s, params_batch)
+
+        # 7. Circuit group cols
+        if circuit.group_cols:
+            gcols_s = CIRCUIT_GROUP_COLS_SCHEMA
+            gcols_batch = ZSetBatch(schema=gcols_s)
+            col_idx_col = []
+            for node_id, col_idx in circuit.group_cols:
+                gcol_lo = (node_id << 16) | col_idx
+                gcols_batch.pk_lo.append(gcol_lo)
+                gcols_batch.pk_hi.append(vid)
+                gcols_batch.weights.append(1)
+                gcols_batch.nulls.append(0)
+                col_idx_col.append(col_idx)
+            gcols_batch.columns = [[], col_idx_col]
+            self.push(CIRCUIT_GROUP_COLS_TAB, gcols_s, gcols_batch)
+
+        # 8. View record (triggers hook — must be last)
         view_s = VIEW_TAB_SCHEMA
         vb = ZSetBatch(
             schema=view_s,

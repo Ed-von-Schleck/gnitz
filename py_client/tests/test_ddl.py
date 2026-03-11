@@ -48,6 +48,28 @@ def test_create_table(client):
     assert len(tbl_schema.columns) == 3
 
 
+def test_create_table_long_name(client):
+    """Create a table with a name > 12 chars (German String heap path)."""
+    client.create_schema("longname_schema")
+    columns = [
+        ColumnDef("pk", TypeCode.U64),
+        ColumnDef("value", TypeCode.I64),
+    ]
+    # 13-char name — previously crashed the server (string > SHORT_STRING_THRESHOLD)
+    tid = client.create_table("longname_schema", "long_name_table", columns)
+    assert tid > 0
+
+    # 20-char name
+    tid2 = client.create_table("longname_schema", "very_long_table_name", columns)
+    assert tid2 > 0
+
+    # Verify tables are scannable
+    schema, batch = client.scan(tid)
+    assert schema is not None
+    schema2, batch2 = client.scan(tid2)
+    assert schema2 is not None
+
+
 def test_scan_system_tables(client):
     """Scan SchemaTab, verify at least _system and public schemas exist."""
     schema, batch = client.scan(SCHEMA_TAB)

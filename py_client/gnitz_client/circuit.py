@@ -98,10 +98,16 @@ class CircuitBuilder:
         self._sources.append((handle.node_id, table_id))
         return handle
 
-    def filter(self, input_handle: NodeHandle, func_id: int = 0) -> NodeHandle:
+    def filter(self, input_handle: NodeHandle, func_id: int = 0,
+               expr: dict | None = None) -> NodeHandle:
         handle = self._alloc_node(OPCODE_FILTER)
         self._connect(input_handle, handle, PORT_IN)
         self._params.append((handle.node_id, PARAM_FUNC_ID, func_id))
+        if expr is not None:
+            self._params.append((handle.node_id, PARAM_EXPR_NUM_REGS, expr['num_regs']))
+            self._params.append((handle.node_id, PARAM_EXPR_RESULT_REG, expr['result_reg']))
+            for i, word in enumerate(expr['code']):
+                self._params.append((handle.node_id, PARAM_EXPR_BASE + i, word))
         return handle
 
     def map(self, input_handle: NodeHandle, func_id: int = 0, projection: list[int] | None = None) -> NodeHandle:
@@ -132,6 +138,30 @@ class CircuitBuilder:
     def join(self, delta_handle: NodeHandle, trace_table_id: int) -> NodeHandle:
         trace_src = self.trace_scan(trace_table_id)
         handle = self._alloc_node(OPCODE_JOIN_DELTA_TRACE)
+        self._connect(delta_handle, handle, PORT_DELTA)
+        self._connect(trace_src, handle, PORT_TRACE)
+        return handle
+
+    def reduce(self, input_handle: NodeHandle, group_by_cols: list[int],
+               agg_func_id: int = 0, agg_col_idx: int = 0) -> NodeHandle:
+        handle = self._alloc_node(OPCODE_REDUCE)
+        self._connect(input_handle, handle, PORT_IN_REDUCE)
+        self._params.append((handle.node_id, PARAM_AGG_FUNC_ID, agg_func_id))
+        self._params.append((handle.node_id, PARAM_AGG_COL_IDX, agg_col_idx))
+        for col in group_by_cols:
+            self._group_cols.append((handle.node_id, col))
+        return handle
+
+    def anti_join(self, delta_handle: NodeHandle, trace_table_id: int) -> NodeHandle:
+        trace_src = self.trace_scan(trace_table_id)
+        handle = self._alloc_node(OPCODE_ANTI_JOIN_DELTA_TRACE)
+        self._connect(delta_handle, handle, PORT_DELTA)
+        self._connect(trace_src, handle, PORT_TRACE)
+        return handle
+
+    def semi_join(self, delta_handle: NodeHandle, trace_table_id: int) -> NodeHandle:
+        trace_src = self.trace_scan(trace_table_id)
+        handle = self._alloc_node(OPCODE_SEMI_JOIN_DELTA_TRACE)
         self._connect(delta_handle, handle, PORT_DELTA)
         self._connect(trace_src, handle, PORT_TRACE)
         return handle
