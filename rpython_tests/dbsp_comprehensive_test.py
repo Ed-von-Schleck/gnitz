@@ -121,7 +121,7 @@ def test_linear_ops(base_dir):
 
         # Project column 1 (val_int) which has a null in row 1
         mapper = functions.UniversalProjection([1], [types.TYPE_I64.code])
-        linear.op_map(b_in, b_mapped, mapper, map_schema)
+        linear.op_map(b_in, batch.BatchWriter(b_mapped), mapper, map_schema)
         assert_true(b_mapped.get_accessor(0).is_null(1), "Map failed to propagate null")
 
         log("  - Negate & Union...")
@@ -694,7 +694,7 @@ def test_anti_join_basic(base_dir):
         trace_b.ingest_batch(b_b)
 
         cursor_b = trace_b.create_cursor()
-        anti_join.op_anti_join_delta_trace(b_a, cursor_b, b_out, schema)
+        anti_join.op_anti_join_delta_trace(b_a, cursor_b, batch.BatchWriter(b_out), schema)
         cursor_b.close()
 
         assert_equal_i(1, b_out.length(), "Anti-join DT should emit 1 row")
@@ -871,7 +871,7 @@ def test_semi_join_basic(base_dir):
         trace_b.ingest_batch(b_b)
 
         cursor_b = trace_b.create_cursor()
-        anti_join.op_semi_join_delta_trace(b_a, cursor_b, b_out, schema)
+        anti_join.op_semi_join_delta_trace(b_a, cursor_b, batch.BatchWriter(b_out), schema)
         cursor_b.close()
 
         assert_equal_i(2, b_out.length(), "Semi-join DT should emit 2 rows")

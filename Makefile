@@ -56,6 +56,11 @@ all: test
 # and execution: as soon as a binary is ready, its test starts running
 # while other binaries are still compiling.
 #
+# Cache warming: RPython's gcc_cache is shared and not process-safe.
+# Parallel compilations race on cache directory creation/writes.
+# We compile one test first (serial) to populate the cache, then
+# compile+run the rest in parallel — all subsequent probes are hits.
+#
 # Fail-fast: Make's default -j behaviour stops starting new targets on
 # first failure and waits for in-flight targets to finish.
 #
@@ -63,9 +68,13 @@ all: test
 # Failed tests leave artifacts behind for inspection.
 # ---------------------------------------------------------------------------
 
+FIRST_TEST := core_comprehensive_test
+REST_RUN_TARGETS := $(filter-out run-$(FIRST_TEST)-c,$(RUN_TARGETS))
+
 test:
 	@$(MAKE) --no-print-directory clean
-	@$(MAKE) --no-print-directory -j$(JOBS) $(RUN_TARGETS)
+	@$(MAKE) --no-print-directory run-$(FIRST_TEST)-c
+	@$(MAKE) --no-print-directory -j$(JOBS) $(REST_RUN_TARGETS)
 	@echo ""
 	@echo "========================================"
 	@echo "  ALL TESTS PASSED"

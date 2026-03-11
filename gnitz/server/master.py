@@ -19,7 +19,8 @@ WNOHANG = 1
 class PartitionAssignment(object):
     """Maps 256 partitions to N workers. Worker w owns [start, end)."""
 
-    _immutable_fields_ = ["num_workers", "starts[*]", "ends[*]"]
+    _immutable_fields_ = ["num_workers", "starts[*]", "ends[*]",
+                          "_partition_to_worker[*]"]
 
     def __init__(self, num_workers):
         self.num_workers = num_workers
@@ -34,13 +35,16 @@ class PartitionAssignment(object):
                 ends[w] = (w + 1) * chunk
         self.starts = starts
         self.ends = ends
+        # Precompute O(1) lookup table
+        lut = [0] * 256
+        for w in range(num_workers):
+            for p in range(starts[w], ends[w]):
+                lut[p] = w
+        self._partition_to_worker = lut
 
     def worker_for_partition(self, partition_idx):
         """Returns the worker ID that owns the given partition."""
-        for w in range(self.num_workers):
-            if partition_idx >= self.starts[w] and partition_idx < self.ends[w]:
-                return w
-        return self.num_workers - 1
+        return self._partition_to_worker[partition_idx]
 
     def range_for_worker(self, worker_id):
         """Returns (start, end) partition range for the given worker."""
@@ -61,13 +65,10 @@ class MasterDispatcher(object):
         self.worker_pids = worker_pids
         self.assignment = assignment
 
-    def fan_out_push(self, target_id, batch, schema):
-        """Split batch by worker partition, send sub-batches, collect ACKs.
-        Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE."""
-        n = batch.length()
+    def _split_batch_by_pk(self, batch, schema):
+        """Split batch into per-worker sub-batches by PK hash."""
         sub_batches = [None] * self.num_workers
-
-        for i in range(n):
+        for i in range(batch.length()):
             pk_lo = r_uint64(batch._read_pk_lo(i))
             pk_hi = r_uint64(batch._read_pk_hi(i))
             p = _partition_for_key(pk_lo, pk_hi)
@@ -75,6 +76,13 @@ class MasterDispatcher(object):
             if sub_batches[w] is None:
                 sub_batches[w] = ArenaZSetBatch(schema)
             sub_batches[w]._direct_append_row(batch, i, batch.get_weight(i))
+        return sub_batches
+
+    def fan_out_push(self, target_id, batch, schema):
+        """Split batch by worker partition, send sub-batches, collect ACKs.
+        Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE."""
+        n = batch.length()
+        sub_batches = self._split_batch_by_pk(batch, schema)
 
         # Send to ALL workers (even empty batches) so they all participate
         # in potential exchange barriers
@@ -144,15 +152,7 @@ class MasterDispatcher(object):
                 worker_batches[w].free()
 
         # Repartition by PK (the pre-exchange plan should MAP shard key -> PK)
-        dest_batches = [None] * self.num_workers
-        for i in range(merged.length()):
-            pk_lo = r_uint64(merged._read_pk_lo(i))
-            pk_hi = r_uint64(merged._read_pk_hi(i))
-            p = _partition_for_key(pk_lo, pk_hi)
-            w = self.assignment.worker_for_partition(p)
-            if dest_batches[w] is None:
-                dest_batches[w] = ArenaZSetBatch(schema)
-            dest_batches[w]._direct_append_row(merged, i, merged.get_weight(i))
+        dest_batches = self._split_batch_by_pk(merged, schema)
         merged.free()
 
         for w in range(self.num_workers):

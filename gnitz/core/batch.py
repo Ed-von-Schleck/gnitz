@@ -483,6 +483,7 @@ class ArenaZSetBatch(object):
         length = rffi.cast(lltype.Signed, u32_ptr[0])
         prefix = rffi.cast(lltype.Signed, u32_ptr[1])
 
+        # RPython annotation: force str-or-None union type for relocate_string
         s = None
         if False:
             s = ""
@@ -695,6 +696,7 @@ class ArenaZSetBatch(object):
                     u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
                     length = rffi.cast(lltype.Signed, u32_ptr[0])
                     prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+                    # RPython annotation: force str-or-None union type for relocate_string
                     s = None
                     if False:
                         s = ""
@@ -750,6 +752,7 @@ class ArenaZSetBatch(object):
                     u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
                     length = rffi.cast(lltype.Signed, u32_ptr[0])
                     prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+                    # RPython annotation: force str-or-None union type for relocate_string
                     s = None
                     if False:
                         s = ""
@@ -799,6 +802,7 @@ class ArenaZSetBatch(object):
                 u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
                 length = rffi.cast(lltype.Signed, u32_ptr[0])
                 prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+                # RPython annotation: force str-or-None union type for relocate_string
                 s = None
                 if False:
                     s = ""
@@ -870,6 +874,7 @@ class ArenaZSetBatch(object):
                     u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
                     length = rffi.cast(lltype.Signed, u32_ptr[0])
                     prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+                    # RPython annotation: force str-or-None union type for relocate_string
                     s = None
                     if False:
                         s = ""
@@ -976,6 +981,10 @@ class BatchWriter(object):
     def append_batch_negated(self, other, start=0, end=-1):
         """Bulk column copy with negated weights."""
         self._batch.append_batch_negated(other, start, end)
+
+    def direct_append_row(self, src_batch, src_idx, weight):
+        """Single-row direct column copy (no accessor dispatch)."""
+        self._batch._direct_append_row(src_batch, src_idx, weight)
 
 
 # ---------------------------------------------------------------------------

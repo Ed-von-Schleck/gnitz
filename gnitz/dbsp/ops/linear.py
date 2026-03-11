@@ -44,17 +44,17 @@ def op_filter(in_batch, out_writer, func):
 
 
 @jit.unroll_safe
-def op_map(in_batch, out_batch, func, out_schema):
+def op_map(in_batch, out_writer, func, out_schema):
     """
     Applies a transformation to every row.
     Uses RowBuilder to validate row construction and commit to the batch.
 
     in_batch:   ArenaZSetBatch
-    out_batch:  ArenaZSetBatch (destination)
+    out_writer: BatchWriter  (strictly write-only destination)
     func:       ScalarFunction  (evaluate_map)
     out_schema: TableSchema for the output batch
     """
-    builder = RowBuilder(out_schema, out_batch)
+    builder = RowBuilder(out_schema, out_writer._batch)
 
     n = in_batch.length()
     for i in range(n):

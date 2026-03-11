@@ -52,9 +52,7 @@ def op_anti_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema)
             trace_cursor.advance()
 
         if not has_match:
-            out_writer.append_from_accessor(
-                key, w, delta_batch.get_accessor(i)
-            )
+            out_writer.direct_append_row(delta_batch, i, w)
 
 
 def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
@@ -131,9 +129,7 @@ def op_semi_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema)
             trace_cursor.advance()
 
         if has_match:
-            out_writer.append_from_accessor(
-                key, w, delta_batch.get_accessor(i)
-            )
+            out_writer.direct_append_row(delta_batch, i, w)
 
 
 def op_semi_join_delta_delta(batch_a, batch_b, out_writer, left_schema):

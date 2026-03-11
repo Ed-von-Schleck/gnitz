@@ -95,7 +95,7 @@ def run_vm(program, reg_file, context):
             assert reg_in is not None and reg_out is not None
             ops.op_map(
                 reg_in.batch,
-                reg_out.batch,
+                batch.BatchWriter(reg_out.batch),
                 instr.func,
                 reg_out.table_schema
             )
