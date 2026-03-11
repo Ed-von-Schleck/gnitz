@@ -28,6 +28,91 @@ STATUS_OK = 0
 STATUS_ERROR = 1
 
 
+def evaluate_dag(engine, initial_source_id, initial_delta):
+    """
+    Module-level topological DAG evaluator.
+    Uses a depth-sorted approach to ensure each view evaluates exactly once
+    per epoch, even in diamond dependency graphs.
+
+    Called by both the single-process ServerExecutor and multi-worker
+    WorkerProcess paths.
+    """
+    registry = engine.registry
+    program_cache = engine.program_cache
+
+    # Build dep_map once: source_id -> [view_id, ...]
+    dep_map = {}
+    if registry.has_id(sys.DepTab.ID):
+        deps_family = registry.get_by_id(sys.DepTab.ID)
+        cursor = deps_family.store.create_cursor()
+        try:
+            while cursor.is_valid():
+                if cursor.weight() > r_int64(0):
+                    acc = cursor.get_accessor()
+                    v_id    = intmask(r_uint64(acc.get_int(sys.DepTab.COL_VIEW_ID)))
+                    dep_tid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)))
+                    dep_vid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)))
+                    if dep_tid > 0:
+                        if dep_tid not in dep_map:
+                            dep_map[dep_tid] = []
+                        if v_id not in dep_map[dep_tid]:
+                            dep_map[dep_tid].append(v_id)
+                    if dep_vid > 0:
+                        if dep_vid not in dep_map:
+                            dep_map[dep_vid] = []
+                        if v_id not in dep_map[dep_vid]:
+                            dep_map[dep_vid].append(v_id)
+                cursor.advance()
+        finally:
+            cursor.close()
+
+    # pending: list of (depth, view_id, batch), sorted ascending by depth
+    first_layer = dep_map.get(initial_source_id, [])
+    pending = []
+    for v_id in first_layer:
+        d = registry.get_depth(v_id)
+        pending.append((d, v_id, initial_delta.clone()))
+    _sort_pending(pending)
+
+    while len(pending) > 0:
+        depth, target_view_id, incoming_delta = pending[0]
+        del pending[0]
+
+        plan = program_cache.get_program(target_view_id)
+        if plan is None:
+            incoming_delta.free()
+            continue
+
+        out_delta = plan.execute_epoch(incoming_delta)
+        incoming_delta.free()
+
+        if out_delta is not None and out_delta.length() > 0:
+            view_family = registry.get_by_id(target_view_id)
+            ingest_to_family(view_family, out_delta)
+            view_family.store.flush()
+
+            dependents = dep_map.get(target_view_id, [])
+            for dep_id in dependents:
+                found = -1
+                for pi in range(len(pending)):
+                    if pending[pi][1] == dep_id:
+                        found = pi
+                        break
+                if found >= 0:
+                    existing_d, existing_id, existing_batch = pending[found]
+                    merged = ZSetBatch(existing_batch._schema)
+                    writer = BatchWriter(merged)
+                    ops.op_union(existing_batch, out_delta, writer)
+                    existing_batch.free()
+                    pending[found] = (existing_d, existing_id, merged)
+                else:
+                    d = registry.get_depth(dep_id)
+                    pending.append((d, dep_id, out_delta.clone()))
+                    _sort_pending(pending)
+
+            out_delta.free()
+
+
 def _validate_schema_match(wire_schema, expected_schema):
     """Validates that a wire schema matches the expected schema."""
     wire_cols = wire_schema.columns
@@ -140,7 +225,7 @@ class ServerExecutor(object):
             schema = self.engine.registry.get_by_id(target_id).schema
             if in_batch is not None and in_batch.length() > 0:
                 self.dispatcher.fan_out_push(target_id, in_batch, schema)
-                self._evaluate_dag(target_id, in_batch)
+                # No _evaluate_dag here — workers handle it
                 return None
             else:
                 return self.dispatcher.fan_out_scan(target_id, schema)
@@ -243,86 +328,7 @@ class ServerExecutor(object):
                 payload.close()
 
     def _evaluate_dag(self, initial_source_id, initial_delta):
-        """
-        Topological Evaluator.
-        Uses a depth-sorted approach to ensure each view evaluates exactly once
-        per epoch, even in diamond dependency graphs.
-        """
-        # Build dep_map once: source_id -> [view_id, ...]
-        dep_map = {}
-        if self.engine.registry.has_id(sys.DepTab.ID):
-            deps_family = self.engine.registry.get_by_id(sys.DepTab.ID)
-            cursor = deps_family.store.create_cursor()
-            try:
-                while cursor.is_valid():
-                    if cursor.weight() > r_int64(0):
-                        acc = cursor.get_accessor()
-                        v_id    = intmask(r_uint64(acc.get_int(sys.DepTab.COL_VIEW_ID)))
-                        dep_tid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)))
-                        dep_vid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)))
-                        if dep_tid > 0:
-                            if dep_tid not in dep_map:
-                                dep_map[dep_tid] = []
-                            if v_id not in dep_map[dep_tid]:
-                                dep_map[dep_tid].append(v_id)
-                        if dep_vid > 0:
-                            if dep_vid not in dep_map:
-                                dep_map[dep_vid] = []
-                            if v_id not in dep_map[dep_vid]:
-                                dep_map[dep_vid].append(v_id)
-                    cursor.advance()
-            finally:
-                cursor.close()
-
-        # pending: list of (depth, view_id, batch), sorted ascending by depth
-        first_layer = dep_map.get(initial_source_id, [])
-        pending = []
-        for v_id in first_layer:
-            d = self.engine.registry.get_depth(v_id)
-            pending.append((d, v_id, initial_delta.clone()))
-        _sort_pending(pending)
-
-        while len(pending) > 0:
-            depth, target_view_id, incoming_delta = pending[0]
-            del pending[0]
-
-            plan = self.program_cache.get_program(target_view_id)
-            if plan is None:
-                incoming_delta.free()
-                continue
-
-            out_delta = plan.execute_epoch(incoming_delta)
-            incoming_delta.free()
-
-            if out_delta is not None and out_delta.length() > 0:
-                view_family = self.engine.registry.get_by_id(target_view_id)
-                ingest_to_family(view_family, out_delta)
-                view_family.store.flush()
-                self._broadcast_delta(target_view_id, out_delta)
-
-                dependents = dep_map.get(target_view_id, [])
-                for dep_id in dependents:
-                    found = -1
-                    for pi in range(len(pending)):
-                        if pending[pi][1] == dep_id:
-                            found = pi
-                            break
-                    if found >= 0:
-                        existing_d, existing_id, existing_batch = pending[found]
-                        merged = ZSetBatch(existing_batch._schema)
-                        writer = BatchWriter(merged)
-                        ops.op_union(existing_batch, out_delta, writer)
-                        existing_batch.free()
-                        pending[found] = (existing_d, existing_id, merged)
-                    else:
-                        d = self.engine.registry.get_depth(dep_id)
-                        pending.append((d, dep_id, out_delta.clone()))
-                        _sort_pending(pending)
-
-                out_delta.free()
-
-    def _broadcast_delta(self, view_id, out_delta):
-        pass
+        evaluate_dag(self.engine, initial_source_id, initial_delta)
 
     def _cleanup_client(self, fd):
         if fd in self.client_fds:

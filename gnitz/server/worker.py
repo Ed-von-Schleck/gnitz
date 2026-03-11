@@ -13,6 +13,7 @@ from gnitz.core import errors
 from gnitz.core.batch import ZSetBatch
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import ingest_to_family
+from gnitz.server.executor import evaluate_dag
 
 
 class WorkerProcess(object):
@@ -98,10 +99,11 @@ class WorkerProcess(object):
                 payload.close()
 
     def _handle_push(self, target_id, batch):
-        """Ingest batch into the local partition store and flush."""
+        """Ingest batch into the local partition store, flush, and evaluate DAG."""
         family = self.engine.registry.get_by_id(target_id)
         family.store.ingest_batch(batch)
         family.store.flush()
+        evaluate_dag(self.engine, target_id, batch)
         log.debug(
             "W" + str(self.worker_id)
             + " push tid=" + str(target_id)

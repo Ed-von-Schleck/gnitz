@@ -145,6 +145,10 @@ def entry_point(argv):
             # Trim existing partitions to only this worker's range
             _trim_worker_partitions(engine, part_start, part_end)
 
+            # Discard any plans compiled before fork — workers recompile
+            # lazily with their own partition stores
+            engine.program_cache.invalidate_all()
+
             os.write(
                 1,
                 "Worker " + str(w) + " (pid " + str(os.getpid())
