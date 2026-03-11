@@ -378,13 +378,16 @@ class TestReduce:
         tid = client.create_table(sn, "t_a10_" + _uid(), cols, pk_col_idx=0)
         ts = Schema(columns=cols, pk_index=0)
 
-        # Output schema from reduce: (pk U64, agg I64) when grouping by
-        # a single U64 column
-        out_cols = [ColumnDef("pk", TypeCode.U64), ColumnDef("agg", TypeCode.I64)]
+        # Reduce output schema: grouping by I64 col → synthetic U128 PK
+        # Server produces: (U128 _group_hash PK, I64 group_id, I64 agg)
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
 
         def build(cb, vid):
             inp = cb.input_delta()
-            # group_by col 0 (pk used as group key), agg_func_id=1 (COUNT), agg_col=2 (val)
             r = cb.reduce(inp, group_by_cols=[1], agg_func_id=1, agg_col_idx=2)
             cb.sink(r, vid)
 
@@ -406,8 +409,8 @@ class TestReduce:
 
         rows = _scan_to_list(client, vid)
         assert len(rows) == 2
-        # Find counts by looking at the agg column
-        counts = sorted(r[2] for r in rows)  # col index 2 = agg value
+        # rows: (pk_lo, weight, group_id, agg) — agg is at index 3
+        counts = sorted(r[3] for r in rows)
         assert counts == [2, 3]
 
     def test_reduce_sum(self, client, sn):
@@ -419,7 +422,14 @@ class TestReduce:
         ]
         tid = client.create_table(sn, "t_a11_" + _uid(), cols, pk_col_idx=0)
         ts = Schema(columns=cols, pk_index=0)
-        out_cols = [ColumnDef("pk", TypeCode.U64), ColumnDef("agg", TypeCode.I64)]
+
+        # Reduce output schema: grouping by I64 col → synthetic U128 PK
+        # Server produces: (U128 _group_hash PK, I64 group_id, I64 agg)
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
 
         def build(cb, vid):
             inp = cb.input_delta()
@@ -440,10 +450,10 @@ class TestReduce:
 
         rows = _scan_to_list(client, vid)
         assert len(rows) == 2
-        sums = sorted(r[2] for r in rows)
+        # rows: (pk_lo, weight, group_id, agg) — agg is at index 3
+        sums = sorted(r[3] for r in rows)
         assert sums == [30, 100]  # group 1: 10+20=30, group 2: 100
 
-    @pytest.mark.xfail(reason="Server-side reduce retraction produces wrong aggregate values")
     def test_reduce_retraction(self, client, sn):
         """A13: reduce retraction updates aggregate."""
         cols = [
@@ -453,7 +463,14 @@ class TestReduce:
         ]
         tid = client.create_table(sn, "t_a13_" + _uid(), cols, pk_col_idx=0)
         ts = Schema(columns=cols, pk_index=0)
-        out_cols = [ColumnDef("pk", TypeCode.U64), ColumnDef("agg", TypeCode.I64)]
+
+        # Reduce output schema: grouping by I64 col → synthetic U128 PK
+        # Server produces: (U128 _group_hash PK, I64 group_id, I64 agg)
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
 
         def build(cb, vid):
             inp = cb.input_delta()
@@ -473,7 +490,8 @@ class TestReduce:
 
         rows = _scan_to_list(client, vid)
         assert len(rows) == 1
-        assert rows[0][2] == 30  # sum = 10+20
+        # rows: (pk_lo, weight, group_id, agg) — agg is at index 3
+        assert rows[0][3] == 30  # sum = 10+20
 
         # Tick 2: delete val=10 (pk=1, weight=-1)
         batch2 = ZSetBatch(schema=ts)
@@ -484,12 +502,12 @@ class TestReduce:
         batch2.columns = [[], [1], [10]]
         client.push(tid, ts, batch2)
 
-        # After retraction, the view has both old aggregate (weight=-1)
-        # and new aggregate (weight=+1). Filter for positive weight only.
+        # After retraction, the old aggregate (w=-1) and new aggregate (w=+1)
+        # should consolidate. The cursor filters to positive-weight rows.
         rows = _scan_to_list(client, vid)
         positive_rows = [r for r in rows if r[1] > 0]
         assert len(positive_rows) == 1
-        assert positive_rows[0][2] == 20  # sum = 20
+        assert positive_rows[0][3] == 20  # sum = 20
 
 
 class TestJoin:

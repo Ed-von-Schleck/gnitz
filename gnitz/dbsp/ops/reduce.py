@@ -42,16 +42,15 @@ class ReduceAccessor(RowAccessor):
         num_out = len(output_schema.columns)
         mapping = [0] * num_out
 
-        pk_code = output_schema.columns[0].field_type.code
         # A 'natural' PK is used if we group by a single U64/U128 column.
-        use_natural_pk = (
-            len(group_indices) == 1
-            and output_schema.pk_index == 0
-            and (
-                pk_code == types.TYPE_U64.code
-                or pk_code == types.TYPE_U128.code
-            )
-        )
+        # Must check the INPUT column type, not the output PK (which is
+        # always U128 for synthetic PKs).
+        use_natural_pk = False
+        if len(group_indices) == 1:
+            grp_col_type = input_schema.columns[group_indices[0]].field_type.code
+            if (grp_col_type == types.TYPE_U64.code
+                    or grp_col_type == types.TYPE_U128.code):
+                use_natural_pk = True
 
         if use_natural_pk:
             mapping[0] = group_indices[0]
