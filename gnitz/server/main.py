@@ -8,6 +8,24 @@ from gnitz import log
 from gnitz.catalog.engine import open_engine
 from gnitz.server.executor import ServerExecutor
 
+HELP_TEXT = (
+    "gnitz-server — GnitzDB database server\n"
+    "\n"
+    "Usage:\n"
+    "  gnitz-server [OPTIONS] <data_dir> <socket_path>\n"
+    "\n"
+    "Arguments:\n"
+    "  <data_dir>      Path to the database data directory (created if absent)\n"
+    "  <socket_path>   Path for the Unix domain socket to listen on\n"
+    "\n"
+    "Options:\n"
+    "  --log-level=LEVEL  Set log verbosity: quiet, normal, verbose (default: quiet)\n"
+    "  --help, -h         Show this help message and exit\n"
+    "\n"
+    "Environment:\n"
+    "  GNITZ_LOG_LEVEL    Same as --log-level; CLI flag takes precedence\n"
+)
+
 
 def entry_point(argv):
     level = log.QUIET
@@ -21,7 +39,10 @@ def entry_point(argv):
     i = 1
     while i < len(argv):
         arg = argv[i]
-        if arg.startswith("--log-level="):
+        if arg == "--help" or arg == "-h":
+            os.write(1, HELP_TEXT)
+            return 0
+        elif arg.startswith("--log-level="):
             level = log.parse_level(arg[12:])
         elif pos == 0:
             data_dir = arg
@@ -34,11 +55,8 @@ def entry_point(argv):
     log.init(level)
 
     if pos < 2:
-        os.write(
-            2,
-            "Usage: gnitz-server [--log-level=quiet|normal|verbose]"
-            " <data_dir> <socket_path>\n",
-        )
+        os.write(2, "Error: missing required arguments\n")
+        os.write(2, "Try 'gnitz-server --help' for usage information\n")
         return 1
 
     log.info("Opening database at " + data_dir)
