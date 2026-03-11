@@ -37,12 +37,6 @@ class BaseCursor(AbstractCursor):
     def is_valid(self):
         raise NotImplementedError
 
-    def is_exhausted(self):
-        raise NotImplementedError
-
-    def peek_key(self):
-        raise NotImplementedError
-
     def get_accessor(self):
         raise NotImplementedError
 
@@ -87,12 +81,6 @@ class MemTableCursor(BaseCursor):
 
     def is_valid(self):
         return self.position < self.snapshot.length()
-
-    def is_exhausted(self):
-        return not self.is_valid()
-
-    def peek_key(self):
-        return self.key()
 
     def key(self):
         if self.position >= self.snapshot.length():
@@ -164,12 +152,6 @@ class ShardCursor(BaseCursor):
 
     def is_valid(self):
         return self.position < self.view.count
-
-    def is_exhausted(self):
-        return not self.is_valid()
-
-    def peek_key(self):
-        return self.key()
 
 
 def _copy_cursors(cursors):

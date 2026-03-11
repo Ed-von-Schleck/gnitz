@@ -24,6 +24,14 @@ class AbstractCursor(object):
         # -> bool
         raise NotImplementedError
 
+    def is_exhausted(self):
+        """Returns True if no more records remain."""
+        return not self.is_valid()
+
+    def peek_key(self):
+        """Returns the key without consuming the record. Default: same as key()."""
+        return self.key()
+
     def key(self):
         """Returns the Primary Key of the current record."""
         # -> r_uint128

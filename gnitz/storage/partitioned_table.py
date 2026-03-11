@@ -13,7 +13,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import xxh
 from gnitz.core.store import ZSetStore
 from gnitz.core.batch import ArenaZSetBatch
-from gnitz.storage.cursor import UnifiedCursor, MemTableCursor, ShardCursor
+from gnitz.storage.cursor import UnifiedCursor
 from gnitz.storage.table import PersistentTable
 from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID
@@ -91,16 +91,9 @@ class PartitionedTable(ZSetStore):
         if num_p == 1:
             return self.partitions[0].create_cursor()
 
-        # Collect raw sub-cursors (MemTableCursor, ShardCursor) from each
-        # partition directly, rather than nesting UnifiedCursors — the
-        # TournamentTree requires peek_key()/is_exhausted() which only
-        # BaseCursor subclasses provide.
-        cursors = newlist_hint(num_p * 2)
+        cursors = newlist_hint(num_p)
         for p in range(num_p):
-            part = self.partitions[p]
-            cursors.append(MemTableCursor(part.memtable))
-            for h in part.index.handles:
-                cursors.append(ShardCursor(h.view))
+            cursors.append(self.partitions[p].create_cursor())
         return UnifiedCursor(self.schema, cursors)
 
     def has_pk(self, key):
