@@ -13,6 +13,11 @@ from gnitz.dbsp import functions
 NULL_PREDICATE = functions.NullPredicate()
 NULL_AGGREGATE = functions.NullAggregate()
 
+# Indices into the mutable state list passed to _emit_node
+_ST_NEXT_EXTRA_REG = 0
+_ST_SINK_REG_ID = 1
+_ST_INPUT_DELTA_REG_ID = 2
+
 
 def _open_system_scan(registry, table_id, view_id):
     """Returns (cursor, end_key) with cursor pre-seeked, or (None, 0) if table absent."""
@@ -244,6 +249,196 @@ class ProgramCache(object):
         raise LayoutError("Cannot resolve primary input schema for view %d: "
                           "no dependency record found" % program_id)
 
+    def _emit_node(self, nid, op, reg_id, node_params, in_regs,
+                   cur_reg_file, out_reg_of, sources, trace_side_sources,
+                   group_cols, view_family, view_id, out_schema, in_schema,
+                   program, state):
+        """Emit a single operator node. Returns instruction or None.
+
+        state: mutable list [next_extra_reg, sink_reg_id, input_delta_reg_id].
+        Mutates cur_reg_file, out_reg_of, and state in-place.
+        REDUCE appends its reduce pre-instruction to program directly.
+        """
+        if op == opcodes.OPCODE_SCAN_TRACE:
+            table_id = sources.get(nid, 0)
+            chunk_limit = node_params.get(opcodes.PARAM_CHUNK_LIMIT, 0)
+
+            if table_id == 0:
+                reg = runtime.DeltaRegister(reg_id, in_schema)
+                cur_reg_file.registers[reg_id] = reg
+                state[_ST_INPUT_DELTA_REG_ID] = reg_id
+                return None
+            elif nid in trace_side_sources:
+                family = self.registry.get_by_id(table_id)
+                reg = runtime.TraceRegister(reg_id, family.schema, family.store.create_cursor(), family.store)
+                cur_reg_file.registers[reg_id] = reg
+                return None
+            else:
+                family = self.registry.get_by_id(table_id)
+                trace_reg = runtime.TraceRegister(reg_id, family.schema, family.store.create_cursor(), family.store)
+                cur_reg_file.registers[reg_id] = trace_reg
+                out_delta_id = state[_ST_NEXT_EXTRA_REG]
+                state[_ST_NEXT_EXTRA_REG] += 1
+                out_delta_reg = runtime.DeltaRegister(out_delta_id, family.schema)
+                cur_reg_file.registers[out_delta_id] = out_delta_reg
+                out_reg_of[nid] = out_delta_id
+                return instructions.scan_trace_op(trace_reg, out_delta_reg, chunk_limit)
+
+        elif op == opcodes.OPCODE_FILTER:
+            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
+            out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
+            if num_regs > 0:
+                result_reg = node_params.get(opcodes.PARAM_EXPR_RESULT_REG, 0)
+                code = []
+                idx = 0
+                while (opcodes.PARAM_EXPR_BASE + idx) in node_params:
+                    code.append(r_int64(node_params[opcodes.PARAM_EXPR_BASE + idx]))
+                    idx += 1
+                from gnitz.dbsp.expr import ExprProgram, ExprPredicate
+                prog = ExprProgram(code, num_regs, result_reg)
+                func = ExprPredicate(prog)
+            else:
+                func = NULL_PREDICATE
+            return instructions.filter_op(in_reg, out_reg, func)
+
+        elif op == opcodes.OPCODE_MAP:
+            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
+            if opcodes.PARAM_PROJ_BASE in node_params:
+                src_indices = []
+                src_types = []
+                idx = 0
+                while (opcodes.PARAM_PROJ_BASE + idx) in node_params:
+                    src_col = node_params[opcodes.PARAM_PROJ_BASE + idx]
+                    src_indices.append(src_col)
+                    src_types.append(in_reg.table_schema.columns[src_col].field_type.code)
+                    idx += 1
+                func = functions.UniversalProjection(src_indices, src_types)
+            else:
+                func = NULL_PREDICATE
+            out_reg = runtime.DeltaRegister(reg_id, out_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.map_op(in_reg, out_reg, func)
+
+        elif op == opcodes.OPCODE_NEGATE:
+            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
+            out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.negate_op(in_reg, out_reg)
+
+        elif op == opcodes.OPCODE_UNION:
+            in_a = cur_reg_file.registers[in_regs[opcodes.PORT_IN_A]]
+            in_b = cur_reg_file.registers[in_regs[opcodes.PORT_IN_B]]
+            out_reg = runtime.DeltaRegister(reg_id, in_a.table_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.union_op(in_a, in_b, out_reg)
+
+        elif op == opcodes.OPCODE_JOIN_DELTA_TRACE:
+            delta_reg = cur_reg_file.registers[in_regs[opcodes.PORT_DELTA]]
+            trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
+            join_schema = merge_schemas_for_join(delta_reg.table_schema, trace_reg.table_schema)
+            out_reg = runtime.DeltaRegister(reg_id, join_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.join_delta_trace_op(delta_reg, trace_reg, out_reg)
+
+        elif op == opcodes.OPCODE_JOIN_DELTA_DELTA:
+            reg_a = cur_reg_file.registers[in_regs[opcodes.PORT_IN_A]]
+            reg_b = cur_reg_file.registers[in_regs[opcodes.PORT_IN_B]]
+            join_schema = merge_schemas_for_join(reg_a.table_schema, reg_b.table_schema)
+            out_reg = runtime.DeltaRegister(reg_id, join_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.join_delta_delta_op(reg_a, reg_b, out_reg)
+
+        elif op == opcodes.OPCODE_DISTINCT:
+            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN_DISTINCT]]
+            hist_schema = in_reg.table_schema
+            history_table = view_family.store.create_child("_hist_%d_%d" % (view_id, nid), hist_schema)
+            hist_reg = runtime.TraceRegister(reg_id, hist_schema, history_table.create_cursor(), history_table)
+            cur_reg_file.registers[reg_id] = hist_reg
+            out_delta_id = state[_ST_NEXT_EXTRA_REG]
+            state[_ST_NEXT_EXTRA_REG] += 1
+            out_delta_reg = runtime.DeltaRegister(out_delta_id, in_reg.table_schema)
+            cur_reg_file.registers[out_delta_id] = out_delta_reg
+            out_reg_of[nid] = out_delta_id
+            return instructions.distinct_op(in_reg, hist_reg, out_delta_reg)
+
+        elif op == opcodes.OPCODE_REDUCE:
+            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN_REDUCE]]
+            agg_func_id = node_params.get(opcodes.PARAM_AGG_FUNC_ID, 0)
+            agg_col_idx = node_params.get(opcodes.PARAM_AGG_COL_IDX, 0)
+            if agg_func_id > 0:
+                col_type = in_reg.table_schema.columns[agg_col_idx].field_type
+                agg_func = functions.UniversalAccumulator(agg_col_idx, agg_func_id, col_type)
+            else:
+                agg_func = NULL_AGGREGATE
+            gcols = group_cols.get(nid, [])
+            reduce_out_schema = _build_reduce_output_schema(in_reg.table_schema, gcols, agg_func)
+            trace_table = view_family.store.create_child("_reduce_%d_%d" % (view_id, nid), reduce_out_schema)
+            tr_out_reg = runtime.TraceRegister(reg_id, reduce_out_schema, trace_table.create_cursor(), trace_table)
+            cur_reg_file.registers[reg_id] = tr_out_reg
+            out_delta_id = state[_ST_NEXT_EXTRA_REG]
+            state[_ST_NEXT_EXTRA_REG] += 1
+            out_delta_reg = runtime.DeltaRegister(out_delta_id, reduce_out_schema)
+            cur_reg_file.registers[out_delta_id] = out_delta_reg
+            out_reg_of[nid] = out_delta_id
+            tr_in_reg = None
+            if opcodes.PORT_TRACE_IN in in_regs: tr_in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE_IN]]
+            reduce_instr = instructions.reduce_op(in_reg, tr_in_reg, tr_out_reg, out_delta_reg, gcols, agg_func, reduce_out_schema)
+            program.append(reduce_instr)
+            return instructions.integrate_op(out_delta_reg, trace_table)
+
+        elif op == opcodes.OPCODE_INTEGRATE:
+            in_reg_id = in_regs[opcodes.PORT_IN]
+            in_reg = cur_reg_file.registers[in_reg_id]
+            target_table_id = node_params.get(opcodes.PARAM_TABLE_ID, 0)
+            target = None
+            if target_table_id > 0 and self.registry.has_id(target_table_id):
+                target = self.registry.get_by_id(target_table_id)
+            state[_ST_SINK_REG_ID] = in_reg_id
+            return instructions.integrate_op(in_reg, target.store if target else None)
+
+        elif op == opcodes.OPCODE_DELAY:
+            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
+            out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.delay_op(in_reg, out_reg)
+
+        elif op == opcodes.OPCODE_ANTI_JOIN_DELTA_TRACE:
+            delta_reg = cur_reg_file.registers[in_regs[opcodes.PORT_DELTA]]
+            trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
+            out_reg = runtime.DeltaRegister(reg_id, delta_reg.table_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.anti_join_delta_trace_op(delta_reg, trace_reg, out_reg)
+
+        elif op == opcodes.OPCODE_ANTI_JOIN_DELTA_DELTA:
+            reg_a = cur_reg_file.registers[in_regs[opcodes.PORT_IN_A]]
+            reg_b = cur_reg_file.registers[in_regs[opcodes.PORT_IN_B]]
+            out_reg = runtime.DeltaRegister(reg_id, reg_a.table_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.anti_join_delta_delta_op(reg_a, reg_b, out_reg)
+
+        elif op == opcodes.OPCODE_SEMI_JOIN_DELTA_TRACE:
+            delta_reg = cur_reg_file.registers[in_regs[opcodes.PORT_DELTA]]
+            trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
+            out_reg = runtime.DeltaRegister(reg_id, delta_reg.table_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.semi_join_delta_trace_op(delta_reg, trace_reg, out_reg)
+
+        elif op == opcodes.OPCODE_SEMI_JOIN_DELTA_DELTA:
+            reg_a = cur_reg_file.registers[in_regs[opcodes.PORT_IN_A]]
+            reg_b = cur_reg_file.registers[in_regs[opcodes.PORT_IN_B]]
+            out_reg = runtime.DeltaRegister(reg_id, reg_a.table_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.semi_join_delta_delta_op(reg_a, reg_b, out_reg)
+
+        elif op == opcodes.OPCODE_SEEK_TRACE:
+            trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
+            key_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
+            return instructions.seek_trace_op(trace_reg, key_reg)
+
+        return None
+
     def compile_from_graph(self, view_id):
         nodes = self._load_nodes(view_id)
         if not nodes: return None
@@ -300,12 +495,11 @@ class ProgramCache(object):
                     extra_regs += 1
 
         reg_file = runtime.RegisterFile(next_reg + extra_regs)
-        next_extra_reg = next_reg
 
         # 3. Instruction emission
         program = newlist_hint(len(ordered) + 1)
-        input_delta_reg_id = -1
-        sink_reg_id = -1
+        # state: [next_extra_reg, sink_reg_id, input_delta_reg_id]
+        state = [next_reg, -1, -1]
 
         for nid in ordered:
             op = opcode_of[nid]
@@ -317,188 +511,8 @@ class ProgramCache(object):
                 if dst == nid:
                     in_regs[port] = out_reg_of[src]
 
-            instr = None
-
-            if op == opcodes.OPCODE_SCAN_TRACE:
-                table_id = sources.get(nid, 0)
-                chunk_limit = node_params.get(opcodes.PARAM_CHUNK_LIMIT, 0)
-
-                if table_id == 0:
-                    reg = runtime.DeltaRegister(reg_id, in_schema)
-                    reg_file.registers[reg_id] = reg
-                    input_delta_reg_id = reg_id
-                elif nid in trace_side_sources:
-                    family = self.registry.get_by_id(table_id)
-                    reg = runtime.TraceRegister(reg_id, family.schema, family.store.create_cursor(), family.store)
-                    reg_file.registers[reg_id] = reg
-                else:
-                    family = self.registry.get_by_id(table_id)
-                    trace_reg = runtime.TraceRegister(reg_id, family.schema, family.store.create_cursor(), family.store)
-                    reg_file.registers[reg_id] = trace_reg
-                    out_delta_id = next_extra_reg
-                    next_extra_reg += 1
-                    out_delta_reg = runtime.DeltaRegister(out_delta_id, family.schema)
-                    reg_file.registers[out_delta_id] = out_delta_reg
-                    out_reg_of[nid] = out_delta_id
-                    instr = instructions.scan_trace_op(trace_reg, out_delta_reg, chunk_limit)
-
-            elif op == opcodes.OPCODE_FILTER:
-                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
-                out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
-                reg_file.registers[reg_id] = out_reg
-                num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
-                if num_regs > 0:
-                    result_reg = node_params.get(opcodes.PARAM_EXPR_RESULT_REG, 0)
-                    code = []
-                    idx = 0
-                    while (opcodes.PARAM_EXPR_BASE + idx) in node_params:
-                        code.append(r_int64(node_params[opcodes.PARAM_EXPR_BASE + idx]))
-                        idx += 1
-                    from gnitz.dbsp.expr import ExprProgram, ExprPredicate
-                    prog = ExprProgram(code, num_regs, result_reg)
-                    func = ExprPredicate(prog)
-                else:
-                    func = NULL_PREDICATE
-                instr = instructions.filter_op(in_reg, out_reg, func)
-
-            elif op == opcodes.OPCODE_MAP:
-                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
-                if opcodes.PARAM_PROJ_BASE in node_params:
-                    src_indices = []
-                    src_types = []
-                    idx = 0
-                    while (opcodes.PARAM_PROJ_BASE + idx) in node_params:
-                        src_col = node_params[opcodes.PARAM_PROJ_BASE + idx]
-                        src_indices.append(src_col)
-                        src_types.append(in_reg.table_schema.columns[src_col].field_type.code)
-                        idx += 1
-                    func = functions.UniversalProjection(src_indices, src_types)
-                else:
-                    func = NULL_PREDICATE
-                out_reg = runtime.DeltaRegister(reg_id, out_schema)
-                reg_file.registers[reg_id] = out_reg
-                instr = instructions.map_op(in_reg, out_reg, func)
-
-            elif op == opcodes.OPCODE_NEGATE:
-                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
-                out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
-                reg_file.registers[reg_id] = out_reg
-                instr = instructions.negate_op(in_reg, out_reg)
-
-            elif op == opcodes.OPCODE_UNION:
-                in_a = reg_file.registers[in_regs[opcodes.PORT_IN_A]]
-                in_b = reg_file.registers[in_regs[opcodes.PORT_IN_B]]
-                out_reg = runtime.DeltaRegister(reg_id, in_a.table_schema)
-                reg_file.registers[reg_id] = out_reg
-                instr = instructions.union_op(in_a, in_b, out_reg)
-
-            elif op == opcodes.OPCODE_JOIN_DELTA_TRACE:
-                delta_reg = reg_file.registers[in_regs[opcodes.PORT_DELTA]]
-                trace_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE]]
-                join_schema = merge_schemas_for_join(delta_reg.table_schema, trace_reg.table_schema)
-                out_reg = runtime.DeltaRegister(reg_id, join_schema)
-                reg_file.registers[reg_id] = out_reg
-                instr = instructions.join_delta_trace_op(delta_reg, trace_reg, out_reg)
-
-            elif op == opcodes.OPCODE_JOIN_DELTA_DELTA:
-                reg_a = reg_file.registers[in_regs[opcodes.PORT_IN_A]]
-                reg_b = reg_file.registers[in_regs[opcodes.PORT_IN_B]]
-                join_schema = merge_schemas_for_join(reg_a.table_schema, reg_b.table_schema)
-                out_reg = runtime.DeltaRegister(reg_id, join_schema)
-                reg_file.registers[reg_id] = out_reg
-                instr = instructions.join_delta_delta_op(reg_a, reg_b, out_reg)
-
-            elif op == opcodes.OPCODE_DISTINCT:
-                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN_DISTINCT]]
-                hist_schema = in_reg.table_schema
-                history_table = view_family.store.create_child("_hist_%d_%d" % (view_id, nid), hist_schema)
-                hist_reg = runtime.TraceRegister(reg_id, hist_schema, history_table.create_cursor(), history_table)
-                reg_file.registers[reg_id] = hist_reg
-                out_delta_id = next_extra_reg
-                next_extra_reg += 1
-                out_delta_reg = runtime.DeltaRegister(out_delta_id, in_reg.table_schema)
-                reg_file.registers[out_delta_id] = out_delta_reg
-                out_reg_of[nid] = out_delta_id
-                instr = instructions.distinct_op(in_reg, hist_reg, out_delta_reg)
-
-            elif op == opcodes.OPCODE_REDUCE:
-                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN_REDUCE]]
-                agg_func_id = node_params.get(opcodes.PARAM_AGG_FUNC_ID, 0)
-                agg_col_idx = node_params.get(opcodes.PARAM_AGG_COL_IDX, 0)
-                if agg_func_id > 0:
-                    col_type = in_reg.table_schema.columns[agg_col_idx].field_type
-                    agg_func = functions.UniversalAccumulator(agg_col_idx, agg_func_id, col_type)
-                else:
-                    agg_func = NULL_AGGREGATE
-                gcols = group_cols.get(nid, [])
-                reduce_out_schema = _build_reduce_output_schema(in_reg.table_schema, gcols, agg_func)
-                trace_table = view_family.store.create_child("_reduce_%d_%d" % (view_id, nid), reduce_out_schema)
-                tr_out_reg = runtime.TraceRegister(reg_id, reduce_out_schema, trace_table.create_cursor(), trace_table)
-                reg_file.registers[reg_id] = tr_out_reg
-                out_delta_id = next_extra_reg
-                next_extra_reg += 1
-                out_delta_reg = runtime.DeltaRegister(out_delta_id, reduce_out_schema)
-                reg_file.registers[out_delta_id] = out_delta_reg
-                out_reg_of[nid] = out_delta_id
-                tr_in_reg = None
-                if opcodes.PORT_TRACE_IN in in_regs: tr_in_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE_IN]]
-                reduce_instr = instructions.reduce_op(in_reg, tr_in_reg, tr_out_reg, out_delta_reg, gcols, agg_func, reduce_out_schema)
-                program.append(reduce_instr)
-                instr = instructions.integrate_op(out_delta_reg, trace_table)
-
-            elif op == opcodes.OPCODE_INTEGRATE:
-                in_reg_id = in_regs[opcodes.PORT_IN]
-                in_reg = reg_file.registers[in_reg_id]
-                target_table_id = node_params.get(opcodes.PARAM_TABLE_ID, 0)
-                target = None
-                if target_table_id > 0 and self.registry.has_id(target_table_id):
-                    target = self.registry.get_by_id(target_table_id)
-                sink_reg_id = in_reg_id
-                # Final views integrate into target.store
-                instr = instructions.integrate_op(in_reg, target.store if target else None)
-
-            elif op == opcodes.OPCODE_DELAY:
-                in_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
-                out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
-                reg_file.registers[reg_id] = out_reg
-                instr = instructions.delay_op(in_reg, out_reg)
-
-            elif op == opcodes.OPCODE_ANTI_JOIN_DELTA_TRACE:
-                delta_reg = reg_file.registers[in_regs[opcodes.PORT_DELTA]]
-                trace_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE]]
-                out_reg = runtime.DeltaRegister(reg_id, delta_reg.table_schema)
-                reg_file.registers[reg_id] = out_reg
-                instr = instructions.anti_join_delta_trace_op(delta_reg, trace_reg, out_reg)
-
-            elif op == opcodes.OPCODE_ANTI_JOIN_DELTA_DELTA:
-                reg_a = reg_file.registers[in_regs[opcodes.PORT_IN_A]]
-                reg_b = reg_file.registers[in_regs[opcodes.PORT_IN_B]]
-                out_reg = runtime.DeltaRegister(reg_id, reg_a.table_schema)
-                reg_file.registers[reg_id] = out_reg
-                instr = instructions.anti_join_delta_delta_op(reg_a, reg_b, out_reg)
-
-            elif op == opcodes.OPCODE_SEMI_JOIN_DELTA_TRACE:
-                delta_reg = reg_file.registers[in_regs[opcodes.PORT_DELTA]]
-                trace_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE]]
-                out_reg = runtime.DeltaRegister(reg_id, delta_reg.table_schema)
-                reg_file.registers[reg_id] = out_reg
-                instr = instructions.semi_join_delta_trace_op(delta_reg, trace_reg, out_reg)
-
-            elif op == opcodes.OPCODE_SEMI_JOIN_DELTA_DELTA:
-                reg_a = reg_file.registers[in_regs[opcodes.PORT_IN_A]]
-                reg_b = reg_file.registers[in_regs[opcodes.PORT_IN_B]]
-                out_reg = runtime.DeltaRegister(reg_id, reg_a.table_schema)
-                reg_file.registers[reg_id] = out_reg
-                instr = instructions.semi_join_delta_delta_op(reg_a, reg_b, out_reg)
-
-            elif op == opcodes.OPCODE_SEEK_TRACE:
-                trace_reg = reg_file.registers[in_regs[opcodes.PORT_TRACE]]
-                key_reg = reg_file.registers[in_regs[opcodes.PORT_IN]]
-                instr = instructions.seek_trace_op(trace_reg, key_reg)
-
-            elif op == opcodes.OPCODE_EXCHANGE_SHARD or op == opcodes.OPCODE_EXCHANGE_GATHER:
+            if op == opcodes.OPCODE_EXCHANGE_SHARD or op == opcodes.OPCODE_EXCHANGE_GATHER:
                 # Exchange marker: split the plan into pre and post.
-                # The input to this node becomes the pre-plan output.
                 in_reg_id_for_exchange = in_regs[opcodes.PORT_EXCHANGE_IN]
 
                 # Extract shard column indices from params
@@ -510,11 +524,14 @@ class ProgramCache(object):
                         idx += 1
                 # For GATHER, shard_cols stays empty (sentinel for "gather to worker 0")
 
+                # The pre-plan output schema is the schema at the exchange boundary
+                exchange_in_schema = reg_file.registers[in_reg_id_for_exchange].table_schema
+
                 # Finalize the pre-plan
                 program.append(instructions.halt_op())
                 pre_plan = runtime.ExecutablePlan(
-                    program, reg_file, out_schema,
-                    in_reg_idx=input_delta_reg_id,
+                    program, reg_file, exchange_in_schema,
+                    in_reg_idx=state[_ST_INPUT_DELTA_REG_ID],
                     out_reg_idx=in_reg_id_for_exchange,
                 )
 
@@ -527,9 +544,6 @@ class ProgramCache(object):
                         continue
                     if found_exchange:
                         post_ordered.append(post_nid)
-
-                # The post-plan input schema is the schema of the exchanged batch
-                exchange_in_schema = reg_file.registers[in_reg_id_for_exchange].table_schema
 
                 # Count registers needed for post-plan
                 post_next_reg = 0
@@ -554,21 +568,17 @@ class ProgramCache(object):
                 post_next_reg += 1
 
                 post_reg_file = runtime.RegisterFile(post_next_reg + post_extra_regs)
-                post_next_extra_reg = post_next_reg
 
                 # Create the input delta register for exchanged data
                 post_in_reg = runtime.DeltaRegister(post_input_reg_id, exchange_in_schema)
                 post_reg_file.registers[post_input_reg_id] = post_in_reg
 
                 # Map the exchange node's output to the post input register
-                # (downstream nodes that consumed the exchange node's output
-                #  will reference it via edges)
-                # We need to map: edges from exchange node -> downstream nodes
-                # use the post_input_reg_id for that
                 post_out_reg_of[nid] = post_input_reg_id
 
                 post_program = newlist_hint(len(post_ordered) + 1)
-                post_sink_reg_id = -1
+                # state: [next_extra_reg, sink_reg_id, input_delta_reg_id]
+                post_state = [post_next_reg, -1, -1]
 
                 for pnid in post_ordered:
                     pop = opcode_of[pnid]
@@ -581,185 +591,18 @@ class ProgramCache(object):
                             if src in post_out_reg_of:
                                 pin_regs[port] = post_out_reg_of[src]
 
-                    pinstr = None
-
-                    if pop == opcodes.OPCODE_FILTER:
-                        pin_reg = post_reg_file.registers[pin_regs[opcodes.PORT_IN]]
-                        pout_reg = runtime.DeltaRegister(preg_id, pin_reg.table_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        num_regs = pnode_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
-                        if num_regs > 0:
-                            result_reg = pnode_params.get(opcodes.PARAM_EXPR_RESULT_REG, 0)
-                            code = []
-                            idx = 0
-                            while (opcodes.PARAM_EXPR_BASE + idx) in pnode_params:
-                                code.append(r_int64(pnode_params[opcodes.PARAM_EXPR_BASE + idx]))
-                                idx += 1
-                            from gnitz.dbsp.expr import ExprProgram, ExprPredicate
-                            prog = ExprProgram(code, num_regs, result_reg)
-                            func = ExprPredicate(prog)
-                        else:
-                            func = NULL_PREDICATE
-                        pinstr = instructions.filter_op(pin_reg, pout_reg, func)
-
-                    elif pop == opcodes.OPCODE_MAP:
-                        pin_reg = post_reg_file.registers[pin_regs[opcodes.PORT_IN]]
-                        if opcodes.PARAM_PROJ_BASE in pnode_params:
-                            src_indices = []
-                            src_types = []
-                            idx = 0
-                            while (opcodes.PARAM_PROJ_BASE + idx) in pnode_params:
-                                src_col = pnode_params[opcodes.PARAM_PROJ_BASE + idx]
-                                src_indices.append(src_col)
-                                src_types.append(pin_reg.table_schema.columns[src_col].field_type.code)
-                                idx += 1
-                            func = functions.UniversalProjection(src_indices, src_types)
-                        else:
-                            func = NULL_PREDICATE
-                        pout_reg = runtime.DeltaRegister(preg_id, out_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        pinstr = instructions.map_op(pin_reg, pout_reg, func)
-
-                    elif pop == opcodes.OPCODE_NEGATE:
-                        pin_reg = post_reg_file.registers[pin_regs[opcodes.PORT_IN]]
-                        pout_reg = runtime.DeltaRegister(preg_id, pin_reg.table_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        pinstr = instructions.negate_op(pin_reg, pout_reg)
-
-                    elif pop == opcodes.OPCODE_UNION:
-                        pin_a = post_reg_file.registers[pin_regs[opcodes.PORT_IN_A]]
-                        pin_b = post_reg_file.registers[pin_regs[opcodes.PORT_IN_B]]
-                        pout_reg = runtime.DeltaRegister(preg_id, pin_a.table_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        pinstr = instructions.union_op(pin_a, pin_b, pout_reg)
-
-                    elif pop == opcodes.OPCODE_INTEGRATE:
-                        pin_reg_id = pin_regs[opcodes.PORT_IN]
-                        pin_reg = post_reg_file.registers[pin_reg_id]
-                        target_table_id = pnode_params.get(opcodes.PARAM_TABLE_ID, 0)
-                        target = None
-                        if target_table_id > 0 and self.registry.has_id(target_table_id):
-                            target = self.registry.get_by_id(target_table_id)
-                        post_sink_reg_id = pin_reg_id
-                        pinstr = instructions.integrate_op(pin_reg, target.store if target else None)
-
-                    elif pop == opcodes.OPCODE_DELAY:
-                        pin_reg = post_reg_file.registers[pin_regs[opcodes.PORT_IN]]
-                        pout_reg = runtime.DeltaRegister(preg_id, pin_reg.table_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        pinstr = instructions.delay_op(pin_reg, pout_reg)
-
-                    elif pop == opcodes.OPCODE_DISTINCT:
-                        pin_reg = post_reg_file.registers[pin_regs[opcodes.PORT_IN_DISTINCT]]
-                        hist_schema = pin_reg.table_schema
-                        history_table = view_family.store.create_child("_hist_%d_%d" % (view_id, pnid), hist_schema)
-                        hist_reg = runtime.TraceRegister(preg_id, hist_schema, history_table.create_cursor(), history_table)
-                        post_reg_file.registers[preg_id] = hist_reg
-                        pout_delta_id = post_next_extra_reg
-                        post_next_extra_reg += 1
-                        pout_delta_reg = runtime.DeltaRegister(pout_delta_id, pin_reg.table_schema)
-                        post_reg_file.registers[pout_delta_id] = pout_delta_reg
-                        post_out_reg_of[pnid] = pout_delta_id
-                        pinstr = instructions.distinct_op(pin_reg, hist_reg, pout_delta_reg)
-
-                    elif pop == opcodes.OPCODE_REDUCE:
-                        pin_reg = post_reg_file.registers[pin_regs[opcodes.PORT_IN_REDUCE]]
-                        agg_func_id = pnode_params.get(opcodes.PARAM_AGG_FUNC_ID, 0)
-                        agg_col_idx = pnode_params.get(opcodes.PARAM_AGG_COL_IDX, 0)
-                        if agg_func_id > 0:
-                            col_type = pin_reg.table_schema.columns[agg_col_idx].field_type
-                            agg_func = functions.UniversalAccumulator(agg_col_idx, agg_func_id, col_type)
-                        else:
-                            agg_func = NULL_AGGREGATE
-                        gcols = group_cols.get(pnid, [])
-                        reduce_out_schema = _build_reduce_output_schema(pin_reg.table_schema, gcols, agg_func)
-                        trace_table = view_family.store.create_child("_reduce_%d_%d" % (view_id, pnid), reduce_out_schema)
-                        tr_out_reg = runtime.TraceRegister(preg_id, reduce_out_schema, trace_table.create_cursor(), trace_table)
-                        post_reg_file.registers[preg_id] = tr_out_reg
-                        pout_delta_id = post_next_extra_reg
-                        post_next_extra_reg += 1
-                        pout_delta_reg = runtime.DeltaRegister(pout_delta_id, reduce_out_schema)
-                        post_reg_file.registers[pout_delta_id] = pout_delta_reg
-                        post_out_reg_of[pnid] = pout_delta_id
-                        tr_in_reg = None
-                        if opcodes.PORT_TRACE_IN in pin_regs:
-                            tr_in_reg = post_reg_file.registers[pin_regs[opcodes.PORT_TRACE_IN]]
-                        reduce_instr = instructions.reduce_op(pin_reg, tr_in_reg, tr_out_reg, pout_delta_reg, gcols, agg_func, reduce_out_schema)
-                        post_program.append(reduce_instr)
-                        pinstr = instructions.integrate_op(pout_delta_reg, trace_table)
-
-                    elif pop == opcodes.OPCODE_SCAN_TRACE:
-                        table_id = sources.get(pnid, 0)
-                        chunk_limit = pnode_params.get(opcodes.PARAM_CHUNK_LIMIT, 0)
-                        if table_id > 0:
-                            if pnid in trace_side_sources:
-                                family = self.registry.get_by_id(table_id)
-                                preg = runtime.TraceRegister(preg_id, family.schema, family.store.create_cursor(), family.store)
-                                post_reg_file.registers[preg_id] = preg
-                            else:
-                                family = self.registry.get_by_id(table_id)
-                                trace_reg = runtime.TraceRegister(preg_id, family.schema, family.store.create_cursor(), family.store)
-                                post_reg_file.registers[preg_id] = trace_reg
-                                pout_delta_id = post_next_extra_reg
-                                post_next_extra_reg += 1
-                                pout_delta_reg = runtime.DeltaRegister(pout_delta_id, family.schema)
-                                post_reg_file.registers[pout_delta_id] = pout_delta_reg
-                                post_out_reg_of[pnid] = pout_delta_id
-                                pinstr = instructions.scan_trace_op(trace_reg, pout_delta_reg, chunk_limit)
-
-                    elif pop == opcodes.OPCODE_JOIN_DELTA_TRACE:
-                        delta_reg = post_reg_file.registers[pin_regs[opcodes.PORT_DELTA]]
-                        trace_reg = post_reg_file.registers[pin_regs[opcodes.PORT_TRACE]]
-                        join_schema = merge_schemas_for_join(delta_reg.table_schema, trace_reg.table_schema)
-                        pout_reg = runtime.DeltaRegister(preg_id, join_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        pinstr = instructions.join_delta_trace_op(delta_reg, trace_reg, pout_reg)
-
-                    elif pop == opcodes.OPCODE_JOIN_DELTA_DELTA:
-                        preg_a = post_reg_file.registers[pin_regs[opcodes.PORT_IN_A]]
-                        preg_b = post_reg_file.registers[pin_regs[opcodes.PORT_IN_B]]
-                        join_schema = merge_schemas_for_join(preg_a.table_schema, preg_b.table_schema)
-                        pout_reg = runtime.DeltaRegister(preg_id, join_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        pinstr = instructions.join_delta_delta_op(preg_a, preg_b, pout_reg)
-
-                    elif pop == opcodes.OPCODE_ANTI_JOIN_DELTA_TRACE:
-                        delta_reg = post_reg_file.registers[pin_regs[opcodes.PORT_DELTA]]
-                        trace_reg = post_reg_file.registers[pin_regs[opcodes.PORT_TRACE]]
-                        pout_reg = runtime.DeltaRegister(preg_id, delta_reg.table_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        pinstr = instructions.anti_join_delta_trace_op(delta_reg, trace_reg, pout_reg)
-
-                    elif pop == opcodes.OPCODE_ANTI_JOIN_DELTA_DELTA:
-                        preg_a = post_reg_file.registers[pin_regs[opcodes.PORT_IN_A]]
-                        preg_b = post_reg_file.registers[pin_regs[opcodes.PORT_IN_B]]
-                        pout_reg = runtime.DeltaRegister(preg_id, preg_a.table_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        pinstr = instructions.anti_join_delta_delta_op(preg_a, preg_b, pout_reg)
-
-                    elif pop == opcodes.OPCODE_SEMI_JOIN_DELTA_TRACE:
-                        delta_reg = post_reg_file.registers[pin_regs[opcodes.PORT_DELTA]]
-                        trace_reg = post_reg_file.registers[pin_regs[opcodes.PORT_TRACE]]
-                        pout_reg = runtime.DeltaRegister(preg_id, delta_reg.table_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        pinstr = instructions.semi_join_delta_trace_op(delta_reg, trace_reg, pout_reg)
-
-                    elif pop == opcodes.OPCODE_SEMI_JOIN_DELTA_DELTA:
-                        preg_a = post_reg_file.registers[pin_regs[opcodes.PORT_IN_A]]
-                        preg_b = post_reg_file.registers[pin_regs[opcodes.PORT_IN_B]]
-                        pout_reg = runtime.DeltaRegister(preg_id, preg_a.table_schema)
-                        post_reg_file.registers[preg_id] = pout_reg
-                        pinstr = instructions.semi_join_delta_delta_op(preg_a, preg_b, pout_reg)
-
-                    elif pop == opcodes.OPCODE_SEEK_TRACE:
-                        trace_reg = post_reg_file.registers[pin_regs[opcodes.PORT_TRACE]]
-                        key_reg = post_reg_file.registers[pin_regs[opcodes.PORT_IN]]
-                        pinstr = instructions.seek_trace_op(trace_reg, key_reg)
-
+                    pinstr = self._emit_node(
+                        pnid, pop, preg_id, pnode_params, pin_regs,
+                        post_reg_file, post_out_reg_of, sources,
+                        trace_side_sources, group_cols, view_family,
+                        view_id, out_schema, exchange_in_schema,
+                        post_program, post_state,
+                    )
                     if pinstr is not None:
                         post_program.append(pinstr)
 
                 post_program.append(instructions.halt_op())
+                post_sink_reg_id = post_state[_ST_SINK_REG_ID]
                 if post_sink_reg_id == -1:
                     return None
 
@@ -772,9 +615,17 @@ class ProgramCache(object):
                 pre_plan.exchange_shard_cols = shard_cols
                 return pre_plan
 
+            instr = self._emit_node(
+                nid, op, reg_id, node_params, in_regs,
+                reg_file, out_reg_of, sources, trace_side_sources,
+                group_cols, view_family, view_id, out_schema,
+                in_schema, program, state,
+            )
             if instr is not None: program.append(instr)
 
         program.append(instructions.halt_op())
+        input_delta_reg_id = state[_ST_INPUT_DELTA_REG_ID]
+        sink_reg_id = state[_ST_SINK_REG_ID]
         if input_delta_reg_id == -1 or sink_reg_id == -1: return None
 
         return runtime.ExecutablePlan(program, reg_file, out_schema, in_reg_idx=input_delta_reg_id, out_reg_idx=sink_reg_id)

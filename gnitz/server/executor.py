@@ -86,7 +86,7 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
             continue
 
         if plan.exchange_post_plan is not None and exchange_handler is not None:
-            # Split execution: pre-exchange -> IPC exchange -> post-exchange
+            # Multi-worker: pre-plan -> IPC exchange -> post-plan
             pre_result = plan.execute_epoch(incoming_delta)
             incoming_delta.free()
             if pre_result is None:
@@ -99,6 +99,14 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
 
             out_delta = plan.exchange_post_plan.execute_epoch(exchanged)
             exchanged.free()
+        elif plan.exchange_post_plan is not None:
+            # Single-process: pre-plan -> post-plan (no exchange needed)
+            pre_result = plan.execute_epoch(incoming_delta)
+            incoming_delta.free()
+            if pre_result is None:
+                pre_result = ZSetBatch(plan.out_schema)
+            out_delta = plan.exchange_post_plan.execute_epoch(pre_result)
+            pre_result.free()
         else:
             out_delta = plan.execute_epoch(incoming_delta)
             incoming_delta.free()

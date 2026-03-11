@@ -19,8 +19,7 @@ from gnitz.server.executor import evaluate_dag
 class WorkerExchangeHandler(object):
     """Sends pre-exchange output to master, receives repartitioned input."""
 
-    def __init__(self, worker_id, master_fd):
-        self.worker_id = worker_id
+    def __init__(self, master_fd):
         self.master_fd = master_fd
 
     def do_exchange(self, view_id, batch, shard_cols):
@@ -52,7 +51,7 @@ class WorkerProcess(object):
         self.engine = engine
         self.part_start = part_start
         self.part_end = part_end
-        self.exchange_handler = WorkerExchangeHandler(worker_id, master_fd)
+        self.exchange_handler = WorkerExchangeHandler(master_fd)
 
     def run(self):
         """Main poll loop. Blocks until master disconnects or sends shutdown."""
