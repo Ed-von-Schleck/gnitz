@@ -1,6 +1,6 @@
 # gnitz/storage/memtable.py
 
-from rpython.rlib.rarithmetic import r_int64, r_uint64
+from rpython.rlib.rarithmetic import r_int64
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
@@ -175,7 +175,7 @@ def _merge_runs_to_consolidated(runs, schema):
             consolidated = runs[0].clone()
         return consolidated
 
-    # k-way merge via TournamentTree
+    # Fused k-way merge + inline consolidation: one pass, one allocation.
     from gnitz.storage.cursor import SortedBatchCursor
     from gnitz.storage import tournament_tree
 
@@ -184,22 +184,49 @@ def _merge_runs_to_consolidated(runs, schema):
         cursors.append(SortedBatchCursor(r))
     tree = tournament_tree.TournamentTree(cursors, schema)
 
-    merged = ArenaZSetBatch(schema)
+    consolidated = ArenaZSetBatch(schema)
+
+    has_pending = False
+    pending_pk = r_uint128(0)
+    pending_weight_acc = r_int64(0)
+    pending_acc = ColumnarBatchAccessor(schema)
+    cur_acc = ColumnarBatchAccessor(schema)
+
     while not tree.is_exhausted():
         ci = rffi.cast(lltype.Signed, tree.heap[0].cursor_idx)
         cur = cursors[ci]
-        merged.append_from_accessor(cur.key(), cur.weight(), cur.get_accessor())
-        tree.advance_cursor_by_index(ci)
-    tree.close()
+        cur_pk = cur.key()
+        cur_weight = cur.weight()
 
-    merged._sorted = True
-    consolidated = merged.to_consolidated()
-    if consolidated is not merged:
-        merged.free()
-    else:
-        # to_consolidated returned self; clone for owned semantics
-        consolidated = merged.clone()
-        merged.free()
+        if not has_pending:
+            pending_pk = cur_pk
+            pending_weight_acc = cur_weight
+            cur.bind_to(pending_acc)
+            has_pending = True
+        elif cur_pk != pending_pk:
+            if pending_weight_acc != r_int64(0):
+                consolidated.append_from_accessor(pending_pk, pending_weight_acc, pending_acc)
+            pending_pk = cur_pk
+            pending_weight_acc = cur_weight
+            cur.bind_to(pending_acc)
+        else:
+            cur.bind_to(cur_acc)
+            if core_comparator.compare_rows(schema, pending_acc, cur_acc) == 0:
+                pending_weight_acc += cur_weight
+            else:
+                if pending_weight_acc != r_int64(0):
+                    consolidated.append_from_accessor(pending_pk, pending_weight_acc, pending_acc)
+                pending_pk = cur_pk
+                pending_weight_acc = cur_weight
+                cur.bind_to(pending_acc)
+
+        tree.advance_cursor_by_index(ci)
+
+    if has_pending and pending_weight_acc != r_int64(0):
+        consolidated.append_from_accessor(pending_pk, pending_weight_acc, pending_acc)
+
+    tree.close()
+    consolidated._sorted = True
     return consolidated
 
 

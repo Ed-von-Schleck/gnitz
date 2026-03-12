@@ -99,6 +99,10 @@ class SortedBatchCursor(BaseCursor):
     def is_exhausted(self):
         return self._pos >= self._batch.length()
 
+    def bind_to(self, acc):
+        """Bind an external ColumnarBatchAccessor to this cursor's current position."""
+        acc.bind(self._batch, self._pos)
+
     def close(self):
         pass
 
