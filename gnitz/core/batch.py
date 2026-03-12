@@ -297,6 +297,18 @@ def _mergesort_indices(indices, batch, lo, hi, scratch):
     _merge_indices(indices, batch, lo, mid, hi, scratch)
 
 
+def _build_sorted_indices(batch):
+    """Build an index array [0..N) and mergesort it by batch row order."""
+    n = batch._count
+    indices = newlist_hint(n)
+    scratch = newlist_hint(n)
+    for i in range(n):
+        indices.append(i)
+        scratch.append(0)
+    _mergesort_indices(indices, batch, 0, n, scratch)
+    return indices
+
+
 def _merge_indices(indices, batch, lo, mid, hi, scratch):
     for k in range(lo, mid):
         scratch[k] = indices[k]
@@ -827,72 +839,12 @@ class ArenaZSetBatch(object):
             self._sorted = True
             return self
 
-        indices = newlist_hint(self._count)
-        scratch = newlist_hint(self._count)
-        for i in range(self._count):
-            indices.append(i)
-            scratch.append(0)
-
-        _mergesort_indices(indices, self, 0, self._count, scratch)
+        indices = _build_sorted_indices(self)
 
         new_batch = ArenaZSetBatch(self._schema, initial_capacity=self._count)
-        has_varlen = self._schema.has_varlen
-
         for i in range(self._count):
-            old_idx = indices[i]
-
-            # Copy pk_lo
-            new_batch.pk_lo_buf.put_u64(self._read_pk_lo(old_idx))
-            # Copy pk_hi
-            new_batch.pk_hi_buf.put_u64(self._read_pk_hi(old_idx))
-            # Copy weight
-            new_batch.weight_buf.put_i64(self._read_weight(old_idx))
-            # Copy null word
-            null_w = self._read_null_word(old_idx)
-            new_batch.null_buf.put_u64(null_w)
-
-            # Copy each column
-            schema = self._schema
-            num_cols = len(schema.columns)
-            for ci in range(num_cols):
-                if ci == schema.pk_index:
-                    continue
-                stride = self.col_strides[ci]
-                src_ptr = self._col_ptr(old_idx, ci)
-                col_type = schema.columns[ci].field_type
-
-                if not has_varlen or col_type.code != types.TYPE_STRING.code:
-                    dest = new_batch.col_bufs[ci].alloc(
-                        stride, alignment=col_type.alignment
-                    )
-                    buffer.c_memmove(
-                        rffi.cast(rffi.VOIDP, dest),
-                        rffi.cast(rffi.VOIDP, src_ptr),
-                        rffi.cast(rffi.SIZE_T, stride),
-                    )
-                else:
-                    dest = new_batch.col_bufs[ci].alloc(
-                        stride, alignment=col_type.alignment
-                    )
-                    u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
-                    length = rffi.cast(lltype.Signed, u32_ptr[0])
-                    prefix = rffi.cast(lltype.Signed, u32_ptr[1])
-                    # RPython annotation: force str-or-None union type for relocate_string
-                    s = None
-                    if False:
-                        s = ""
-                    string_logic.relocate_string(
-                        dest,
-                        length,
-                        prefix,
-                        src_ptr,
-                        self.blob_arena.base_ptr,
-                        s,
-                        new_batch.allocator,
-                    )
-
-            new_batch._count += 1
-
+            idx = indices[i]
+            new_batch._direct_append_row(self, idx, self._read_weight(idx))
         new_batch._sorted = True
         return new_batch
 
@@ -900,48 +852,51 @@ class ArenaZSetBatch(object):
         """
         Functional consolidation. Returns a new consolidated batch.
         Uses direct column copy instead of accessor dispatch.
+
+        When the batch is unsorted, mergesorts an index array and walks it
+        over the original batch with inline consolidation — the intermediate
+        sorted batch is never materialized.
         """
         if self._count == 0:
             return self
 
-        sorted_view = self.to_sorted()
+        # Build index array: identity for sorted, mergesorted for unsorted.
+        if self._sorted:
+            indices = newlist_hint(self._count)
+            for i in range(self._count):
+                indices.append(i)
+        else:
+            indices = _build_sorted_indices(self)
 
-        res = ArenaZSetBatch(self._schema, initial_capacity=sorted_view._count)
-
+        # Single consolidation loop over sorted indices.
+        res = ArenaZSetBatch(self._schema, initial_capacity=self._count)
         acc_a = ColumnarBatchAccessor(self._schema)
         acc_b = ColumnarBatchAccessor(self._schema)
+        schema = self._schema
 
         i = 0
-        while i < sorted_view._count:
-            pk_i_lo = sorted_view._read_pk_lo(i)
-            pk_i_hi = sorted_view._read_pk_hi(i)
-            weight_acc = sorted_view._read_weight(i)
-
-            acc_a.bind(sorted_view, i)
+        while i < self._count:
+            anchor = indices[i]
+            pk_i_lo = self._read_pk_lo(anchor)
+            pk_i_hi = self._read_pk_hi(anchor)
+            weight_acc = self._read_weight(anchor)
+            acc_a.bind(self, anchor)
 
             j = i + 1
-            while j < sorted_view._count:
-                if (
-                    sorted_view._read_pk_lo(j) != pk_i_lo
-                    or sorted_view._read_pk_hi(j) != pk_i_hi
-                ):
+            while j < self._count:
+                next_idx = indices[j]
+                if (self._read_pk_lo(next_idx) != pk_i_lo
+                        or self._read_pk_hi(next_idx) != pk_i_hi):
                     break
-
-                acc_b.bind(sorted_view, j)
-
-                if core_comparator.compare_rows(self._schema, acc_a, acc_b) != 0:
+                acc_b.bind(self, next_idx)
+                if core_comparator.compare_rows(schema, acc_a, acc_b) != 0:
                     break
-
-                weight_acc += sorted_view._read_weight(j)
+                weight_acc += self._read_weight(next_idx)
                 j += 1
 
             if weight_acc != 0:
-                res._direct_append_row(sorted_view, i, weight_acc)
-
+                res._direct_append_row(self, anchor, weight_acc)
             i = j
-
-        if sorted_view is not self:
-            sorted_view.free()
 
         res._sorted = True
         return res
