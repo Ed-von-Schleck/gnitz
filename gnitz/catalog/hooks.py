@@ -132,6 +132,8 @@ class TableEffectHook(DeltaHook):
             sid = intmask(acc.get_int(sys.TableTab.COL_SCHEMA_ID))
             name = sys.read_string(acc, sys.TableTab.COL_NAME)
             pk_col_idx = intmask(acc.get_int(sys.TableTab.COL_PK_COL_IDX))
+            flags = intmask(acc.get_int(sys.TableTab.COL_FLAGS))
+            unique_pk = (flags & sys.TableTab.FLAG_UNIQUE_PK) != 0
 
             if weight > 0:
                 if self.registry.has_id(tid):
@@ -162,7 +164,8 @@ class TableEffectHook(DeltaHook):
                 mmap_posix.fsync_dir(self.base_dir + "/" + schema_name)
 
                 family = TableFamily(
-                    schema_name, name, tid, sid, directory, pk_col_idx, pt
+                    schema_name, name, tid, sid, directory, pk_col_idx, pt,
+                    unique_pk=unique_pk,
                 )
                 self.registry.register(family)
                 wire_fk_constraints_for_family(family, self.registry)

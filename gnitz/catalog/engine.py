@@ -152,7 +152,7 @@ class Engine(object):
         sid = self.registry.get_schema_id(name)
         self._retract_schema_record(sid, name)
 
-    def create_table(self, qualified_name, columns, pk_col_idx):
+    def create_table(self, qualified_name, columns, pk_col_idx, unique_pk=True):
         schema_name, table_name = parse_qualified_name(qualified_name, "public")
         validate_user_identifier(schema_name)
         validate_user_identifier(table_name)
@@ -180,9 +180,11 @@ class Engine(object):
             self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
         )
 
+        flags = sys.TableTab.FLAG_UNIQUE_PK if unique_pk else 0
+
         # Columns are written first so that the table handler can read them.
         self._write_column_records(tid, sys.OWNER_KIND_TABLE, columns)
-        self._write_table_record(tid, sid, table_name, directory, pk_col_idx, 0)
+        self._write_table_record(tid, sid, table_name, directory, pk_col_idx, 0, flags)
 
         self._advance_sequence(sys.SEQ_ID_TABLES, tid - 1, tid)
         family = self.registry.get(schema_name, table_name)
@@ -198,8 +200,9 @@ class Engine(object):
         tid = family.table_id
         self._check_for_dependencies(tid, table_name)
 
+        flags = sys.TableTab.FLAG_UNIQUE_PK if family.unique_pk else 0
         self._retract_table_record(
-            tid, family.schema_id, table_name, family.directory, family.pk_col_idx, 0
+            tid, family.schema_id, table_name, family.directory, family.pk_col_idx, 0, flags
         )
         self._retract_column_records(tid, sys.OWNER_KIND_TABLE, family.schema.columns)
 
@@ -497,14 +500,14 @@ class Engine(object):
         sys.SchemaTab.retract(batch, s, sid, name)
         self._finish_write(self._schemas_family, batch)
 
-    def _write_table_record(self, tid, sid, name, directory, pk_idx, lsn):
+    def _write_table_record(self, tid, sid, name, directory, pk_idx, lsn, flags):
         s, batch = self._begin_write(sys.TableTab)
-        sys.TableTab.append(batch, s, tid, sid, name, directory, pk_idx, lsn)
+        sys.TableTab.append(batch, s, tid, sid, name, directory, pk_idx, lsn, flags)
         self._finish_write(self._tables_family, batch)
 
-    def _retract_table_record(self, tid, sid, name, directory, pk_idx, lsn):
+    def _retract_table_record(self, tid, sid, name, directory, pk_idx, lsn, flags):
         s, batch = self._begin_write(sys.TableTab)
-        sys.TableTab.retract(batch, s, tid, sid, name, directory, pk_idx, lsn)
+        sys.TableTab.retract(batch, s, tid, sid, name, directory, pk_idx, lsn, flags)
         self._finish_write(self._tables_family, batch)
 
     def _write_view_record(self, vid, sid, name, sql_def, directory, lsn):

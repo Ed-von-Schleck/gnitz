@@ -213,6 +213,7 @@ def bootstrap_system_tables(sys_tables, base_dir):
             sys_dir + "/" + t.SUBDIR,
             0,
             0,
+            0,
         )
     sys_tables.tables.ingest_batch(tables_batch)
     tables_batch.free()
@@ -238,6 +239,7 @@ def bootstrap_system_tables(sys_tables, base_dir):
             ("directory", TYPE_STRING),
             ("pk_col_idx", TYPE_U64),
             ("created_lsn", TYPE_U64),
+            ("flags", TYPE_U64),
         ],
     )
 

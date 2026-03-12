@@ -201,6 +201,7 @@ class GnitzClient:
         table_name: str,
         columns: list[ColumnDef],
         pk_col_idx: int = 0,
+        unique_pk: bool = True,
     ) -> int:
         """Create a table by pushing columns + table record to system tables."""
         new_tid = self.allocate_table_id()
@@ -256,7 +257,7 @@ class GnitzClient:
             pk_hi=[0],
             weights=[1],
             nulls=[0],
-            columns=[[], [schema_id], [table_name], [directory], [pk_col_idx], [0]],
+            columns=[[], [schema_id], [table_name], [directory], [pk_col_idx], [0], [1 if unique_pk else 0]],
         )
         self.push(TABLE_TAB, table_s, tb)
 
@@ -282,7 +283,7 @@ class GnitzClient:
         """Drop a table by retracting from TableTab and ColTab."""
         # Find table record
         _, tbl_batch = self.scan(TABLE_TAB)
-        tid, sid, directory, pk_col_idx, created_lsn = self._find_table_record(
+        tid, sid, directory, pk_col_idx, created_lsn, flags = self._find_table_record(
             tbl_batch, schema_name, table_name
         )
 
@@ -298,7 +299,7 @@ class GnitzClient:
             pk_hi=[0],
             weights=[-1],
             nulls=[0],
-            columns=[[], [sid], [table_name], [directory], [pk_col_idx], [created_lsn]],
+            columns=[[], [sid], [table_name], [directory], [pk_col_idx], [created_lsn], [flags]],
         )
         self.push(TABLE_TAB, table_s, tb)
 
@@ -606,7 +607,7 @@ class GnitzClient:
 
     def _find_table_record(
         self, batch: ZSetBatch | None, schema_name: str, table_name: str
-    ) -> tuple[int, int, str, int, int]:
+    ) -> tuple[int, int, str, int, int, int]:
         """Find a table record by schema + name in TableTab scan."""
         if batch is None:
             raise GnitzError(f"Table '{schema_name}.{table_name}' not found")
@@ -621,7 +622,8 @@ class GnitzClient:
                     directory = batch.columns[3][i]
                     pk_col_idx = batch.columns[4][i]
                     created_lsn = batch.columns[5][i]
-                    return tid, sid, directory, pk_col_idx, created_lsn
+                    flags = batch.columns[6][i]
+                    return tid, sid, directory, pk_col_idx, created_lsn, flags
         raise GnitzError(f"Table '{schema_name}.{table_name}' not found")
 
     def _find_view_record(

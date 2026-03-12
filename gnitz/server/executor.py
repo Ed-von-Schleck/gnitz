@@ -257,9 +257,9 @@ class ServerExecutor(object):
 
         if in_batch is not None and in_batch.length() > 0:
             family = self.engine.registry.get_by_id(target_id)
-            ingest_to_family(family, in_batch)
+            effective = ingest_to_family(family, in_batch)
             family.store.flush()
-            self._evaluate_dag(target_id, in_batch)
+            self._evaluate_dag(target_id, effective)
             return None
         else:
             return self._scan_family(target_id)

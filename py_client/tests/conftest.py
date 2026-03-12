@@ -27,8 +27,13 @@ def server():
     if not os.path.isfile(binary):
         pytest.skip(f"Server binary not found: {binary}")
 
+    cmd = [binary, data_dir, sock_path]
+    num_workers = os.environ.get("GNITZ_WORKERS", "")
+    if num_workers:
+        cmd.append(f"--workers={num_workers}")
+
     proc = subprocess.Popen(
-        [binary, data_dir, sock_path],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )

@@ -94,6 +94,7 @@ TABLE_TAB_SCHEMA = Schema(
         ColumnDef("directory", TypeCode.STRING),
         ColumnDef("pk_col_idx", TypeCode.U64),
         ColumnDef("created_lsn", TypeCode.U64),
+        ColumnDef("flags", TypeCode.U64),
     ],
     pk_index=0,
 )

@@ -870,7 +870,7 @@ class TestForeignKeys:
             pk_hi=[0],
             weights=[1],
             nulls=[0],
-            columns=[[], [schema_id], [table_name], [""], [0], [0]],
+            columns=[[], [schema_id], [table_name], [""], [0], [0], [0]],
         )
         client.push(TABLE_TAB, table_s, tb)
 

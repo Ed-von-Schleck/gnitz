@@ -14,6 +14,84 @@ from gnitz.catalog.system_tables import (
 )
 from gnitz.core.errors import LayoutError
 from gnitz.core.keys import promote_to_index_key
+from gnitz.core.batch import ZSetBatch
+
+
+def _find_seen(lo_list, hi_list, pk_lo, pk_hi):
+    """Linear scan of seen-PK lists. Returns index, or -1 if not found."""
+    for i in range(len(lo_list)):
+        if lo_list[i] == pk_lo and hi_list[i] == pk_hi:
+            return i
+    return -1
+
+
+def _retract_from_out(out, schema, src_idx):
+    """Copy out[src_idx] into a temp batch with w=-1, then append to out."""
+    tmp = ZSetBatch(schema)
+    tmp._direct_append_row(out, src_idx, r_int64(-1))
+    out.append_batch(tmp, 0, tmp.length())
+    tmp.free()
+
+
+def _remove_seen(lo_list, hi_list, idx_list, i):
+    """RPython-safe removal: overwrite slot i with last element, then shrink."""
+    last = len(lo_list) - 1
+    lo_list[i] = lo_list[last]
+    hi_list[i] = hi_list[last]
+    idx_list[i] = idx_list[last]
+    del lo_list[last]
+    del hi_list[last]
+    del idx_list[last]
+
+
+def _enforce_unique_pk(family, batch):
+    """
+    Transform batch for a unique_pk=True table into UPSERT/DELETE-by-PK semantics.
+
+    - w > 0: auto-retract any stored row with same PK, then insert new row.
+    - w < 0: emit retraction using stored payload (ignore incoming payload).
+
+    Returns a new ZSetBatch. The caller owns it and must free it when done.
+    """
+    store = family.store
+    schema = family.schema
+    n = batch.length()
+    out = ZSetBatch(schema)
+    seen_lo = []    # r_uint64: lower 64 bits of seen PKs
+    seen_hi = []    # r_uint64: upper 64 bits of seen PKs
+    seen_out_idx = []   # int: index in out of the last +w row for this PK
+
+    for i in range(n):
+        pk = batch.get_pk(i)
+        weight = batch.get_weight(i)
+        pk_lo = r_uint64(pk)
+        pk_hi = r_uint64(pk >> 64)
+
+        if weight > r_int64(0):
+            intra_idx = _find_seen(seen_lo, seen_hi, pk_lo, pk_hi)
+            if intra_idx >= 0:
+                # Cancel the previous in-batch insertion for this PK
+                _retract_from_out(out, schema, seen_out_idx[intra_idx])
+                seen_out_idx[intra_idx] = out.length()
+            else:
+                # Retract any existing stored row for this PK
+                store.retract_pk(pk, out)
+                seen_lo.append(pk_lo)
+                seen_hi.append(pk_hi)
+                seen_out_idx.append(out.length())
+            out._direct_append_row(batch, i, weight)
+
+        elif weight < r_int64(0):
+            intra_idx = _find_seen(seen_lo, seen_hi, pk_lo, pk_hi)
+            if intra_idx >= 0:
+                # Cancel the pending in-batch insert (no net change)
+                _retract_from_out(out, schema, seen_out_idx[intra_idx])
+                _remove_seen(seen_lo, seen_hi, seen_out_idx, intra_idx)
+            else:
+                # Delete from storage by PK (ignore incoming payload)
+                store.retract_pk(pk, out)
+
+    return out
 
 
 def wire_fk_constraints_for_family(family, registry):
@@ -52,14 +130,26 @@ class FKConstraint(object):
 def ingest_to_family(family, batch):
     """
     The external ingestion pipeline for user-table data.
-    Enforces FK constraints, writes to storage, and then updates secondary indices.
+    Enforces unique-PK and FK constraints, writes to storage, and updates
+    secondary indices.
+
+    Returns the effective batch (may be a new transformed batch when
+    unique_pk=True, or the same object otherwise). Callers may use the
+    returned batch for downstream DAG evaluation.
 
     For internal writes (VM operator state, catalog bootstrap, index backfill),
     call family.store.ingest_batch(batch) directly to bypass enforcement.
     """
     n_records = batch.length()
     if n_records == 0:
-        return
+        return batch
+
+    # --- Stage 0: Unique PK Enforcement ---
+    if family.unique_pk:
+        batch = _enforce_unique_pk(family, batch)
+        n_records = batch.length()
+        if n_records == 0:
+            return batch
 
     # --- Stage 1: Foreign Key Enforcement ---
     n_constraints = len(family.fk_constraints)
@@ -118,6 +208,8 @@ def ingest_to_family(family, batch):
     for h_idx in range(len(family.post_ingest_hooks)):
         family.post_ingest_hooks[h_idx].on_delta(batch)
 
+    return batch
+
 
 class TableFamily(object):
     """
@@ -135,6 +227,7 @@ class TableFamily(object):
         "pk_col_idx",
         "store",
         "schema",
+        "unique_pk",
     ]
 
     def __init__(
@@ -146,6 +239,7 @@ class TableFamily(object):
         directory,
         pk_col_idx,
         store,
+        unique_pk=False,
     ):
         self.schema_name = schema_name
         self.table_name = table_name
@@ -154,6 +248,7 @@ class TableFamily(object):
         self.directory = directory
         self.pk_col_idx = pk_col_idx
         self.store = store
+        self.unique_pk = unique_pk
         self.schema = store.get_schema()
         self.index_circuits = newlist_hint(4)
         self.fk_constraints = newlist_hint(0)

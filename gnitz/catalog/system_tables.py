@@ -103,20 +103,23 @@ class SchemaTab(BaseTab):
 class TableTab(BaseTab):
     ID, SUBDIR, NAME = 2, "_tables", "_tables"
     COL_SCHEMA_ID, COL_NAME, COL_DIRECTORY, COL_PK_COL_IDX, COL_CREATED_LSN = 1, 2, 3, 4, 5
+    COL_FLAGS = 6
+    FLAG_UNIQUE_PK = 1
 
     @staticmethod
     def schema():
-        cols = newlist_hint(6)
+        cols = newlist_hint(7)
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="table_id"))
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="schema_id"))
         cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="name"))
         cols.append(ColumnDefinition(TYPE_STRING, is_nullable=False, name="directory"))
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="pk_col_idx"))
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="created_lsn"))
+        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="flags"))
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def _emit(batch, schema, weight, tid, sid, name, directory, pk_idx, lsn):
+    def _emit(batch, schema, weight, tid, sid, name, directory, pk_idx, lsn, flags):
         rb = RowBuilder(schema, batch)
         rb.begin(r_uint128(r_uint64(tid)), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
@@ -124,15 +127,16 @@ class TableTab(BaseTab):
         rb.put_string(directory)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(pk_idx)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(lsn)))
+        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(flags)))
         rb.commit()
 
     @staticmethod
-    def append(batch, schema, tid, sid, name, directory, pk_idx, lsn):
-        TableTab._emit(batch, schema, r_int64(1), tid, sid, name, directory, pk_idx, lsn)
+    def append(batch, schema, tid, sid, name, directory, pk_idx, lsn, flags):
+        TableTab._emit(batch, schema, r_int64(1), tid, sid, name, directory, pk_idx, lsn, flags)
 
     @staticmethod
-    def retract(batch, schema, tid, sid, name, directory, pk_idx, lsn):
-        TableTab._emit(batch, schema, r_int64(-1), tid, sid, name, directory, pk_idx, lsn)
+    def retract(batch, schema, tid, sid, name, directory, pk_idx, lsn, flags):
+        TableTab._emit(batch, schema, r_int64(-1), tid, sid, name, directory, pk_idx, lsn, flags)
 
 
 class ViewTab(BaseTab):

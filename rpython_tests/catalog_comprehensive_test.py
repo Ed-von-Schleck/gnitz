@@ -135,10 +135,10 @@ def test_bootstrap(base_dir):
         if c != 12:
             raise Exception("Expected 12 system tables, got %d" % c)
 
-        # 3. Check Columns (44 bootstrap columns expected)
+        # 3. Check Columns (45 bootstrap columns expected)
         c = count_records(engine.sys.columns)
-        if c != 44:
-            raise Exception("Expected 44 system columns, got %d" % c)
+        if c != 45:
+            raise Exception("Expected 45 system columns, got %d" % c)
 
         # 4. Check Sequences (4 expected)
         c = count_records(engine.sys.sequences)
@@ -525,6 +525,199 @@ def test_edge_cases(base_dir):
     os.write(1, "    [OK] Edge Cases verified.\n")
 
 
+def test_unique_pk_metadata(base_dir):
+    os.write(1, "[Catalog] Testing unique_pk metadata...\n")
+    db_path = base_dir + "/unique_pk"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="id"),
+        types.ColumnDefinition(types.TYPE_STRING, name="val"),
+    ]
+
+    # Sub-test 1: default is True
+    engine = open_engine(db_path)
+    try:
+        engine.create_schema("sales")
+        family = engine.create_table("sales.u_default", cols, 0)
+        if not family.unique_pk:
+            raise Exception("unique_pk should default to True")
+        os.write(1, "    [OK] default unique_pk=True\n")
+
+        # Sub-test 2: explicit False
+        family2 = engine.create_table("sales.u_off", cols, 0, unique_pk=False)
+        if family2.unique_pk:
+            raise Exception("unique_pk should be False when explicitly set")
+        os.write(1, "    [OK] explicit unique_pk=False\n")
+
+        # Sub-test 3: survives restart
+        engine.create_table("sales.u_restart", cols, 0)
+    finally:
+        engine.close()
+
+    engine2 = open_engine(db_path)
+    try:
+        family3 = engine2.registry.get("sales", "u_restart")
+        if not family3.unique_pk:
+            raise Exception("unique_pk=True did not survive restart")
+
+        family4 = engine2.registry.get("sales", "u_off")
+        if family4.unique_pk:
+            raise Exception("unique_pk=False did not survive restart")
+        os.write(1, "    [OK] unique_pk survives restart\n")
+    finally:
+        engine2.close()
+
+    os.write(1, "    [OK] unique_pk metadata verified.\n")
+
+
+def _make_upk_row(schema, pk, val, w):
+    """Build a single-row ZSetBatch for the (U64 id, I64 val) schema."""
+    from gnitz.core.batch import ZSetBatch, RowBuilder
+    b = ZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    rb.begin(r_uint128(r_uint64(pk)), r_int64(w))
+    rb.put_int(r_int64(val))
+    rb.commit()
+    return b
+
+
+def test_enforce_unique_pk(base_dir):
+    os.write(1, "[Catalog] Testing _enforce_unique_pk...\n")
+    db_path = base_dir + "/enforce_unique_pk"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    from gnitz.catalog.registry import _enforce_unique_pk
+    from gnitz.core.batch import ZSetBatch, RowBuilder
+
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="id"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
+    ]
+
+    engine = open_engine(db_path)
+    try:
+        engine.create_schema("utest")
+        family = engine.create_table("utest.t", cols, 0)
+        schema = family.schema
+
+        # Sub-test 1: insert new PK (no stored row) → 1 row in output
+        b1 = _make_upk_row(schema, 1, 10, 1)
+        out1 = _enforce_unique_pk(family, b1)
+        if out1.length() != 1:
+            raise Exception("ST1: expected 1 row, got %d" % out1.length())
+        if out1.get_weight(0) != r_int64(1):
+            raise Exception("ST1: expected w=+1")
+        out1.free()
+        b1.free()
+        os.write(1, "    [OK] ST1: insert new PK\n")
+
+        # Sub-test 2: update existing PK → retraction + new row
+        b2a = _make_upk_row(schema, 2, 10, 1)
+        family.store.ingest_batch(b2a)
+        family.store.flush()
+        b2a.free()
+
+        b2b = _make_upk_row(schema, 2, 20, 1)
+        out2 = _enforce_unique_pk(family, b2b)
+        if out2.length() != 2:
+            raise Exception("ST2: expected 2 rows, got %d" % out2.length())
+        neg_count = 0
+        pos_count = 0
+        for i in range(out2.length()):
+            w = out2.get_weight(i)
+            if w < r_int64(0):
+                neg_count += 1
+            else:
+                pos_count += 1
+        if neg_count != 1 or pos_count != 1:
+            raise Exception("ST2: expected 1 retraction + 1 insertion")
+        out2.free()
+        b2b.free()
+        os.write(1, "    [OK] ST2: update existing PK\n")
+
+        # Sub-test 3: delete-by-PK existing → retraction with stored payload
+        b3a = _make_upk_row(schema, 3, 30, 1)
+        family.store.ingest_batch(b3a)
+        family.store.flush()
+        b3a.free()
+
+        b3b = _make_upk_row(schema, 3, 0, -1)
+        out3 = _enforce_unique_pk(family, b3b)
+        if out3.length() != 1:
+            raise Exception("ST3: expected 1 retraction, got %d" % out3.length())
+        if out3.get_weight(0) != r_int64(-1):
+            raise Exception("ST3: expected w=-1")
+        out3.free()
+        b3b.free()
+        os.write(1, "    [OK] ST3: delete-by-PK existing\n")
+
+        # Sub-test 4: delete-by-PK absent → empty output, no error
+        b4 = _make_upk_row(schema, 999, 0, -1)
+        out4 = _enforce_unique_pk(family, b4)
+        if out4.length() != 0:
+            raise Exception("ST4: expected empty output, got %d" % out4.length())
+        out4.free()
+        b4.free()
+        os.write(1, "    [OK] ST4: delete-by-PK absent\n")
+
+        # Sub-test 5: intra-batch duplicate insert → last value wins
+        b5 = ZSetBatch(schema)
+        rb5 = RowBuilder(schema, b5)
+        rb5.begin(r_uint128(r_uint64(5)), r_int64(1))
+        rb5.put_int(r_int64(10))
+        rb5.commit()
+        rb5.begin(r_uint128(r_uint64(5)), r_int64(1))
+        rb5.put_int(r_int64(20))
+        rb5.commit()
+        out5 = _enforce_unique_pk(family, b5)
+        # 3 rows: (+1,v=10), (-1,v=10), (+1,v=20) — net: (PK=5,v=20)
+        if out5.length() != 3:
+            raise Exception("ST5: expected 3 rows, got %d" % out5.length())
+        pos5 = 0
+        neg5 = 0
+        for i in range(out5.length()):
+            w = out5.get_weight(i)
+            if w > r_int64(0):
+                pos5 += 1
+            else:
+                neg5 += 1
+        if pos5 != 2 or neg5 != 1:
+            raise Exception("ST5: expected 2 pos + 1 neg, got %d pos %d neg" % (pos5, neg5))
+        out5.free()
+        b5.free()
+        os.write(1, "    [OK] ST5: intra-batch duplicate insert\n")
+
+        # Sub-test 6: intra-batch insert then delete → cancel each other
+        b6 = ZSetBatch(schema)
+        rb6 = RowBuilder(schema, b6)
+        rb6.begin(r_uint128(r_uint64(6)), r_int64(1))
+        rb6.put_int(r_int64(10))
+        rb6.commit()
+        rb6.begin(r_uint128(r_uint64(6)), r_int64(-1))
+        rb6.put_int(r_int64(10))
+        rb6.commit()
+        out6 = _enforce_unique_pk(family, b6)
+        # 2 rows: (+1,v=10) original + (-1,v=10) cancellation — net weight = 0
+        if out6.length() != 2:
+            raise Exception("ST6: expected 2 rows, got %d" % out6.length())
+        sum_w6 = r_int64(0)
+        for i in range(out6.length()):
+            sum_w6 += out6.get_weight(i)
+        if sum_w6 != r_int64(0):
+            raise Exception("ST6: expected net weight 0")
+        out6.free()
+        b6.free()
+        os.write(1, "    [OK] ST6: intra-batch insert then delete\n")
+
+    finally:
+        engine.close()
+
+    os.write(1, "    [OK] _enforce_unique_pk verified.\n")
+
+
 def test_restart(base_dir):
     os.write(1, "[Catalog] Testing Restart & Persistence...\n")
     db_path = base_dir + "/restart"
@@ -633,7 +826,9 @@ def entry_point(argv):
         test_identifiers()
         test_bootstrap(base_dir)
         test_ddl(base_dir)
+        test_unique_pk_metadata(base_dir)
         test_edge_cases(base_dir)
+        test_enforce_unique_pk(base_dir)
         test_restart(base_dir)
         os.write(1, "\nALL CATALOG TEST PATHS PASSED\n")
     except Exception as e:

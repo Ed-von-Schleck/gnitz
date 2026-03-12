@@ -89,7 +89,8 @@ class MasterDispatcher(object):
         for w in range(self.num_workers):
             sb = sub_batches[w]
             ipc.send_batch(
-                self.worker_fds[w], target_id, sb, schema=schema
+                self.worker_fds[w], target_id, sb, schema=schema,
+                flags=ipc.FLAG_PUSH,
             )
             if sb is not None:
                 sb.free()

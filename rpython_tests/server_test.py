@@ -121,7 +121,7 @@ def push_create_table(srv, schema_name, table_name, col_defs, pk_col_idx):
     # 2. Push table record — hook fires here
     ts = srv.engine.sys.tables.schema
     tb = ZSetBatch(ts)
-    sys_tab.TableTab.append(tb, ts, tid, sid, table_name, directory, pk_col_idx, 0)
+    sys_tab.TableTab.append(tb, ts, tid, sid, table_name, directory, pk_col_idx, 0, 0)
     srv.handle_push(sys_tab.TableTab.ID, tb)
     tb.free()
 

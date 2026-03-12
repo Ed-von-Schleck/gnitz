@@ -173,7 +173,7 @@ class TestQ1FilterReduce:
 
     def _setup(self, client, sn, tpch_data):
         """Create lineitem table, load bulk data, create view."""
-        tid = client.create_table(sn, "lineitem_q1_" + _uid(), LINEITEM_COLS, pk_col_idx=0)
+        tid = client.create_table(sn, "lineitem_q1_" + _uid(), LINEITEM_COLS, pk_col_idx=0, unique_pk=False)
 
         out_cols = [
             ColumnDef("_group_hash", TypeCode.U128),
@@ -325,10 +325,10 @@ class TestQ2JoinReduce:
         Returns (li_agg_tid, li_agg_schema, vid, tpch_data).
         """
         # Delta source: aggregated lineitem (pk=orderkey, total_price)
-        li_tid = client.create_table(sn, "li_q2_" + _uid(), LI_AGG_COLS, pk_col_idx=0)
+        li_tid = client.create_table(sn, "li_q2_" + _uid(), LI_AGG_COLS, pk_col_idx=0, unique_pk=False)
 
         # Trace: orders with STRING status column
-        ord_tid = client.create_table(sn, "ord_q2_" + _uid(), ORDERS_COLS, pk_col_idx=0)
+        ord_tid = client.create_table(sn, "ord_q2_" + _uid(), ORDERS_COLS, pk_col_idx=0, unique_pk=False)
         _push_orders_rows(client, ord_tid, tpch_data['orders'])
 
         # Join output: (orderkey:U64, total_price:I64,
@@ -460,10 +460,10 @@ class TestQ3JoinChain:
     def _setup(self, client, sn, tpch_data):
         """Create tables with STRING columns, load bulk, build view."""
         # Delta source: aggregated lineitem
-        a_tid = client.create_table(sn, "li_q3_" + _uid(), LI_AGG_COLS, pk_col_idx=0)
+        a_tid = client.create_table(sn, "li_q3_" + _uid(), LI_AGG_COLS, pk_col_idx=0, unique_pk=False)
 
         # Trace: orders with STRING status
-        b_tid = client.create_table(sn, "ord_q3_" + _uid(), ORDERS_COLS, pk_col_idx=0)
+        b_tid = client.create_table(sn, "ord_q3_" + _uid(), ORDERS_COLS, pk_col_idx=0, unique_pk=False)
         _push_orders_rows(client, b_tid, tpch_data['orders'])
 
         # Join A(2 cols) x B(4 cols, incl STRING status):
@@ -630,9 +630,9 @@ class TestQ4JoinReduceMin:
 
     def _setup(self, client, sn, tpch_data):
         """Create tables, load bulk, create view with MIN aggregate."""
-        li_tid = client.create_table(sn, "li_q4_" + _uid(), LI_AGG_COLS, pk_col_idx=0)
+        li_tid = client.create_table(sn, "li_q4_" + _uid(), LI_AGG_COLS, pk_col_idx=0, unique_pk=False)
 
-        ord_tid = client.create_table(sn, "ord_q4_" + _uid(), ORDERS_COLS, pk_col_idx=0)
+        ord_tid = client.create_table(sn, "ord_q4_" + _uid(), ORDERS_COLS, pk_col_idx=0, unique_pk=False)
         _push_orders_rows(client, ord_tid, tpch_data['orders'])
 
         out_cols = [
@@ -823,9 +823,9 @@ class TestQ5JoinReduceMax:
 
     def _setup(self, client, sn, tpch_data):
         """Create tables, load bulk, create view with MAX aggregate."""
-        li_tid = client.create_table(sn, "li_q5_" + _uid(), LI_AGG_COLS, pk_col_idx=0)
+        li_tid = client.create_table(sn, "li_q5_" + _uid(), LI_AGG_COLS, pk_col_idx=0, unique_pk=False)
 
-        ord_tid = client.create_table(sn, "ord_q5_" + _uid(), ORDERS_COLS, pk_col_idx=0)
+        ord_tid = client.create_table(sn, "ord_q5_" + _uid(), ORDERS_COLS, pk_col_idx=0, unique_pk=False)
         _push_orders_rows(client, ord_tid, tpch_data['orders'])
 
         out_cols = [

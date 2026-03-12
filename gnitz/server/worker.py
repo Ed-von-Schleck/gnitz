@@ -12,7 +12,7 @@ from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
 from gnitz.core.batch import ZSetBatch
 from gnitz.catalog import system_tables as sys
-from gnitz.catalog.registry import ingest_to_family
+from gnitz.catalog.registry import ingest_to_family, _enforce_unique_pk
 from gnitz.server.executor import evaluate_dag
 
 
@@ -88,8 +88,17 @@ class WorkerProcess(object):
                 ipc.send_batch(self.master_fd, target_id, None)
                 return False
 
-            if payload.batch is not None and payload.batch.length() > 0:
-                self._handle_push(target_id, payload.batch)
+            if flags & ipc.FLAG_PUSH:
+                batch = payload.batch
+                if batch is not None and batch.length() > 0:
+                    self._handle_push(target_id, batch)
+                else:
+                    # Empty push — still need to participate in exchange barriers
+                    family = self.engine.registry.get_by_id(target_id)
+                    empty = ZSetBatch(family.schema)
+                    evaluate_dag(self.engine, target_id, empty,
+                                 exchange_handler=self.exchange_handler)
+                    empty.free()
                 ipc.send_batch(self.master_fd, target_id, None)
             else:
                 result = self._handle_scan(target_id)
@@ -123,10 +132,17 @@ class WorkerProcess(object):
     def _handle_push(self, target_id, batch):
         """Ingest batch into the local partition store, flush, and evaluate DAG."""
         family = self.engine.registry.get_by_id(target_id)
-        family.store.ingest_batch(batch)
-        family.store.flush()
-        evaluate_dag(self.engine, target_id, batch,
-                     exchange_handler=self.exchange_handler)
+        if family.unique_pk:
+            effective = _enforce_unique_pk(family, batch)
+            family.store.ingest_batch(effective)
+            family.store.flush()
+            evaluate_dag(self.engine, target_id, effective,
+                         exchange_handler=self.exchange_handler)
+        else:
+            family.store.ingest_batch(batch)
+            family.store.flush()
+            evaluate_dag(self.engine, target_id, batch,
+                         exchange_handler=self.exchange_handler)
         log.debug(
             "W" + str(self.worker_id)
             + " push tid=" + str(target_id)
