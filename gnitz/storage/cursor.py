@@ -115,17 +115,15 @@ class MemTableCursor(BaseCursor):
     frees runs while the cursor is live.
     """
 
-    _immutable_fields_ = ["schema"]
+    _immutable_fields_ = ["schema", "_snapshot", "_accessor"]
 
     def __init__(self, memtable):
-        from gnitz.core.batch import ArenaZSetBatch
+        from gnitz.storage.memtable import _merge_runs_to_consolidated
 
         BaseCursor.__init__(self)
         self.schema = memtable.schema
 
         # Build list of all sorted runs (including sorted accumulator).
-        # We only borrow references to the runs here — clone/merge below
-        # produces an owned snapshot independent of the memtable.
         num_runs = len(memtable.runs)
         has_acc = memtable._accumulator.length() > 0
         all_runs = newlist_hint(num_runs + 1)
@@ -136,57 +134,45 @@ class MemTableCursor(BaseCursor):
             temp_sorted_acc = memtable._accumulator.to_sorted()
             all_runs.append(temp_sorted_acc)
 
-        if len(all_runs) == 0:
-            self._snapshot = ArenaZSetBatch(memtable.schema)
-        elif len(all_runs) == 1:
-            # Single run — consolidate to collapse duplicates
-            consolidated = all_runs[0].to_consolidated()
-            if consolidated is all_runs[0]:
-                consolidated = all_runs[0].clone()
-            self._snapshot = consolidated
-        else:
-            # k-way merge via TournamentTree
-            cursors = newlist_hint(len(all_runs))
-            for r in all_runs:
-                cursors.append(SortedBatchCursor(r))
-            tree = tournament_tree.TournamentTree(cursors, memtable.schema)
-            merged = ArenaZSetBatch(memtable.schema)
-            while not tree.is_exhausted():
-                ci = rffi.cast(lltype.Signed, tree.heap[0].cursor_idx)
-                cur = cursors[ci]
-                merged.append_from_accessor(cur.key(), cur.weight(), cur.get_accessor())
-                tree.advance_cursor_by_index(ci)
-            tree.close()
-            merged._sorted = True
-            # Consolidate to collapse duplicates and drop zero-weight rows
-            consolidated = merged.to_consolidated()
-            if consolidated is not merged:
-                merged.free()
-            self._snapshot = consolidated
+        self._snapshot = _merge_runs_to_consolidated(all_runs, memtable.schema)
 
         # Free temporary sorted accumulator if to_sorted() created a new batch
         if temp_sorted_acc is not None and temp_sorted_acc is not memtable._accumulator:
             temp_sorted_acc.free()
 
-        self._inner = SortedBatchCursor(self._snapshot)
+        self._pos = 0
+        self._accessor = ColumnarBatchAccessor(memtable.schema)
 
     def seek(self, target_key):
-        self._inner.seek(target_key)
+        lo = 0
+        hi = self._snapshot.length()
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if self._snapshot.get_pk(mid) < target_key:
+                lo = mid + 1
+            else:
+                hi = mid
+        self._pos = lo
 
     def advance(self):
-        self._inner.advance()
+        self._pos += 1
 
     def is_valid(self):
-        return self._inner.is_valid()
+        return self._pos < self._snapshot.length()
 
     def key(self):
-        return self._inner.key()
+        if self._pos >= self._snapshot.length():
+            return r_uint128(-1)
+        return self._snapshot.get_pk(self._pos)
 
     def weight(self):
-        return self._inner.weight()
+        if self._pos >= self._snapshot.length():
+            return r_int64(0)
+        return self._snapshot.get_weight(self._pos)
 
     def get_accessor(self):
-        return self._inner.get_accessor()
+        self._accessor.bind(self._snapshot, self._pos)
+        return self._accessor
 
     def close(self):
         self._snapshot.free()

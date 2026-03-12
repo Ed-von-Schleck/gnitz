@@ -147,48 +147,10 @@ class MemTable(object):
         return self.bloom.may_contain(key)
 
     def flush(self, filename, table_id=0):
-        # Flush accumulator into runs first
         self._flush_accumulator()
-
-        if len(self.runs) == 0:
-            # Nothing to flush — write an empty consolidated batch
-            empty = ArenaZSetBatch(self.schema)
-            writer_table.write_batch_to_shard(empty, filename, table_id)
-            empty.free()
-            return
-
-        if len(self.runs) == 1:
-            consolidated = self.runs[0].to_consolidated()
-            writer_table.write_batch_to_shard(consolidated, filename, table_id)
-            if consolidated is not self.runs[0]:
-                consolidated.free()
-        else:
-            # k-way merge all runs into a single consolidated batch
-            from gnitz.storage.cursor import SortedBatchCursor
-            from gnitz.storage import tournament_tree
-
-            cursors = newlist_hint(len(self.runs))
-            for r in self.runs:
-                cursors.append(SortedBatchCursor(r))
-            tree = tournament_tree.TournamentTree(cursors, self.schema)
-
-            merged = ArenaZSetBatch(self.schema)
-
-            while not tree.is_exhausted():
-                # Heap root is always the global minimum
-                ci = rffi.cast(lltype.Signed, tree.heap[0].cursor_idx)
-                cur = cursors[ci]
-                merged.append_from_accessor(cur.key(), cur.weight(), cur.get_accessor())
-                tree.advance_cursor_by_index(ci)
-
-            tree.close()
-
-            # The merged batch is sorted but not consolidated — consolidate it
-            consolidated = merged.to_consolidated()
-            writer_table.write_batch_to_shard(consolidated, filename, table_id)
-            if consolidated is not merged:
-                consolidated.free()
-            merged.free()
+        consolidated = _merge_runs_to_consolidated(self.runs, self.schema)
+        writer_table.write_batch_to_shard(consolidated, filename, table_id)
+        consolidated.free()
 
     def is_empty(self):
         return self._total_row_count == 0
@@ -200,6 +162,45 @@ class MemTable(object):
         self._accumulator.free()
         self._total_row_count = 0
         self.bloom.free()
+
+
+def _merge_runs_to_consolidated(runs, schema):
+    """Merge N sorted runs into one owned, consolidated ArenaZSetBatch."""
+    if len(runs) == 0:
+        return ArenaZSetBatch(schema)
+
+    if len(runs) == 1:
+        consolidated = runs[0].to_consolidated()
+        if consolidated is runs[0]:
+            consolidated = runs[0].clone()
+        return consolidated
+
+    # k-way merge via TournamentTree
+    from gnitz.storage.cursor import SortedBatchCursor
+    from gnitz.storage import tournament_tree
+
+    cursors = newlist_hint(len(runs))
+    for r in runs:
+        cursors.append(SortedBatchCursor(r))
+    tree = tournament_tree.TournamentTree(cursors, schema)
+
+    merged = ArenaZSetBatch(schema)
+    while not tree.is_exhausted():
+        ci = rffi.cast(lltype.Signed, tree.heap[0].cursor_idx)
+        cur = cursors[ci]
+        merged.append_from_accessor(cur.key(), cur.weight(), cur.get_accessor())
+        tree.advance_cursor_by_index(ci)
+    tree.close()
+
+    merged._sorted = True
+    consolidated = merged.to_consolidated()
+    if consolidated is not merged:
+        merged.free()
+    else:
+        # to_consolidated returned self; clone for owned semantics
+        consolidated = merged.clone()
+        merged.free()
+    return consolidated
 
 
 def _binary_search_weight(run, key):
