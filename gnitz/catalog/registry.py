@@ -115,6 +115,95 @@ def wire_fk_constraints_for_family(family, registry):
             family._add_fk_constraint(col_idx, target_family)
 
 
+def _build_pk_check_batch(schema, lo_list, hi_list):
+    """Build a batch containing the given PK (lo,hi) pairs, columns zeroed."""
+    n = len(lo_list)
+    batch = ZSetBatch(schema, initial_capacity=max(n, 1))
+    num_cols = len(schema.columns)
+    for k in range(n):
+        batch.pk_lo_buf.put_u64(lo_list[k])
+        batch.pk_hi_buf.put_u64(hi_list[k])
+        batch.weight_buf.put_i64(r_int64(1))
+        batch.null_buf.put_u64(r_uint64(0xFFFFFFFFFFFFFFFF))
+        for ci in range(num_cols):
+            if ci == schema.pk_index:
+                continue
+            stride = schema.columns[ci].field_type.size
+            dest = batch.col_bufs[ci].alloc(
+                stride, alignment=schema.columns[ci].field_type.alignment
+            )
+            for b in range(stride):
+                dest[b] = "\x00"
+        batch._count += 1
+    return batch
+
+
+def validate_fk_distributed(family, batch, dispatcher):
+    """Validate FK constraints via distributed PK lookups through the dispatcher.
+
+    Called by the master before fan_out_push. For each FK constraint, collects
+    unique FK values, builds a check batch, and asks workers if those PKs exist
+    in the target table. Raises LayoutError on violation.
+    """
+    n_constraints = len(family.fk_constraints)
+    if n_constraints == 0:
+        return
+
+    n_records = batch.length()
+    acc = batch.get_accessor(0)
+
+    for c_idx in range(n_constraints):
+        constraint = family.fk_constraints[c_idx]
+        col_idx = constraint.fk_col_idx
+        target_family = constraint.target_family
+        target_id = target_family.table_id
+        target_schema = target_family.schema
+
+        # Collect unique FK values as (lo, hi) pairs — avoid r_uint128 lists
+        seen_lo = []
+        seen_hi = []
+
+        for i in range(n_records):
+            if batch.get_weight(i) <= r_int64(0):
+                continue
+            batch.bind_accessor(i, acc)
+            if acc.is_null(col_idx):
+                continue
+
+            fk_key = promote_to_index_key(
+                acc, col_idx, family.schema.columns[col_idx].field_type
+            )
+            fk_lo = r_uint64(fk_key)
+            fk_hi = r_uint64(fk_key >> 64)
+
+            # Dedup
+            if _find_seen(seen_lo, seen_hi, fk_lo, fk_hi) < 0:
+                seen_lo.append(fk_lo)
+                seen_hi.append(fk_hi)
+
+        if len(seen_lo) == 0:
+            continue
+
+        check_batch = _build_pk_check_batch(target_schema, seen_lo, seen_hi)
+        any_missing = dispatcher.check_fk_batch(
+            target_id, check_batch, target_schema
+        )
+        check_batch.free()
+
+        if any_missing:
+            raise LayoutError(
+                "Foreign Key violation in '%s.%s': value for column '%s' "
+                "not found in target '%s.%s'"
+                % (
+                    family.schema_name,
+                    family.table_name,
+                    family.schema.columns[col_idx].name,
+                    target_family.schema_name,
+                    target_family.table_name,
+                )
+            )
+
+
 class FKConstraint(object):
     """
     An active Foreign Key constraint tracking a source column and its target table.

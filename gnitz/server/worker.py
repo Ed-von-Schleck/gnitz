@@ -88,6 +88,10 @@ class WorkerProcess(object):
                 ipc.send_batch(self.master_fd, target_id, None)
                 return False
 
+            if flags & ipc.FLAG_HAS_PK:
+                self._handle_has_pk(target_id, payload.batch)
+                return False
+
             if flags & ipc.FLAG_PUSH:
                 batch = payload.batch
                 if batch is not None and batch.length() > 0:
@@ -148,6 +152,20 @@ class WorkerProcess(object):
             + " push tid=" + str(target_id)
             + " rows=" + str(batch.length())
         )
+
+    def _handle_has_pk(self, target_id, batch):
+        """Check PK existence for FK validation. Responds with weights 1/0."""
+        family = self.engine.registry.get_by_id(target_id)
+        schema = family.schema
+        result = ZSetBatch(schema)
+        n = batch.length() if batch is not None else 0
+        for i in range(n):
+            pk = batch.get_pk(i)
+            exists = family.store.has_pk(pk)
+            w = r_int64(1) if exists else r_int64(0)
+            result._direct_append_row(batch, i, w)
+        ipc.send_batch(self.master_fd, target_id, result, schema=schema)
+        result.free()
 
     def _handle_scan(self, target_id):
         """Scan all local partitions for target, return result batch."""

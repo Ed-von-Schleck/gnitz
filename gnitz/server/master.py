@@ -210,6 +210,42 @@ class MasterDispatcher(object):
             + " rows=" + str(batch.length())
         )
 
+    def check_fk_batch(self, target_id, check_batch, schema):
+        """Check PK existence across workers. Returns True if any key is missing."""
+        sub_batches = self._split_batch_by_pk(check_batch, schema)
+
+        # Send HAS_PK requests only to workers that have keys to check
+        sent = [False] * self.num_workers
+        for w in range(self.num_workers):
+            sb = sub_batches[w]
+            if sb is not None and sb.length() > 0:
+                ipc.send_batch(
+                    self.worker_fds[w], target_id, sb, schema=schema,
+                    flags=ipc.FLAG_HAS_PK,
+                )
+                sent[w] = True
+                sb.free()
+
+        # Collect responses, check for missing keys
+        any_missing = False
+        for w in range(self.num_workers):
+            if not sent[w]:
+                continue
+            payload = ipc.receive_payload(self.worker_fds[w])
+            if payload.status != 0:
+                err = payload.error_msg
+                payload.close()
+                raise errors.StorageError(
+                    "Worker %d has_pk error: %s" % (w, err)
+                )
+            if payload.batch is not None:
+                for j in range(payload.batch.length()):
+                    if payload.batch.get_weight(j) == r_int64(0):
+                        any_missing = True
+            payload.close()
+
+        return any_missing
+
     def check_workers(self):
         """Non-blocking check for crashed workers. Returns -1 if all OK."""
         for w in range(self.num_workers):

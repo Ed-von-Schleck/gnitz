@@ -9,7 +9,7 @@ from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
 from gnitz.core.batch import ZSetBatch, BatchWriter
 from gnitz.catalog import system_tables as sys
-from gnitz.catalog.registry import ingest_to_family
+from gnitz.catalog.registry import ingest_to_family, validate_fk_distributed
 from gnitz.dbsp import ops
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
@@ -247,8 +247,10 @@ class ServerExecutor(object):
         to worker processes. System tables stay local to master.
         """
         if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
-            schema = self.engine.registry.get_by_id(target_id).schema
+            family = self.engine.registry.get_by_id(target_id)
+            schema = family.schema
             if in_batch is not None and in_batch.length() > 0:
+                validate_fk_distributed(family, in_batch, self.dispatcher)
                 self.dispatcher.fan_out_push(target_id, in_batch, schema)
                 # No _evaluate_dag here — workers handle it
                 return None
