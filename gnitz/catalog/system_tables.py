@@ -54,6 +54,10 @@ def pack_param_pk(view_id, node_id, slot):
     return (r_uint128(r_uint64(view_id)) << 64) | r_uint128(lo)
 
 
+def pack_dep_pk(view_id, dep_tid):
+    return (r_uint128(r_uint64(view_id)) << 64) | r_uint128(r_uint64(dep_tid))
+
+
 def pack_gcol_pk(view_id, node_id, col_idx):
     lo = (r_uint64(node_id) << 16) | r_uint64(col_idx)
     return (r_uint128(r_uint64(view_id)) << 64) | r_uint128(lo)
@@ -259,28 +263,28 @@ class DepTab(BaseTab):
     @staticmethod
     def schema():
         cols = newlist_hint(4)
-        cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dep_id"))
+        cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="dep_pk"))
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="view_id"))
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dep_view_id"))
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="dep_table_id"))
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def _emit(batch, schema, weight, dep_id, view_id, dep_vid, dep_tid):
+    def _emit(batch, schema, weight, view_id, dep_vid, dep_tid):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(dep_id)), weight)
+        rb.begin(pack_dep_pk(view_id, dep_tid), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(view_id)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dep_vid)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dep_tid)))
         rb.commit()
 
     @staticmethod
-    def append(batch, schema, dep_id, view_id, dep_vid, dep_tid):
-        DepTab._emit(batch, schema, r_int64(1), dep_id, view_id, dep_vid, dep_tid)
+    def append(batch, schema, view_id, dep_vid, dep_tid):
+        DepTab._emit(batch, schema, r_int64(1), view_id, dep_vid, dep_tid)
 
     @staticmethod
-    def retract(batch, schema, dep_id, view_id, dep_vid, dep_tid):
-        DepTab._emit(batch, schema, r_int64(-1), dep_id, view_id, dep_vid, dep_tid)
+    def retract(batch, schema, view_id, dep_vid, dep_tid):
+        DepTab._emit(batch, schema, r_int64(-1), view_id, dep_vid, dep_tid)
 
 
 class SeqTab(BaseTab):

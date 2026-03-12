@@ -329,15 +329,18 @@ class Engine(object):
             cursor.close()
 
     def _read_view_deps(self, vid):
+        from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_int64
+        start_key = r_uint128(r_uint64(vid)) << 64
+        end_key = r_uint128(r_uint64(vid + 1)) << 64
         cursor = self.sys.view_deps.create_cursor()
         res = newlist_hint(4)
         try:
-            while cursor.is_valid():
-                acc = cursor.get_accessor()
-                if intmask(acc.get_int(sys.DepTab.COL_VIEW_ID)) == vid and cursor.weight() > 0:
+            cursor.seek(start_key)
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > r_int64(0):
+                    acc = cursor.get_accessor()
                     res.append(
                         (
-                            intmask(r_uint64(cursor.key())),
                             intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)),
                             intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)),
                         )
@@ -517,14 +520,13 @@ class Engine(object):
     def _write_view_deps(self, vid, dep_ids):
         s, batch = self._begin_write(sys.DepTab)
         for dep_tid in dep_ids:
-            dep_id = intmask(r_uint64(vid) ^ r_uint64(dep_tid))
-            sys.DepTab.append(batch, s, dep_id, vid, 0, dep_tid)
+            sys.DepTab.append(batch, s, vid, 0, dep_tid)
         self._finish_write_sys(self.sys.view_deps, batch)
 
     def _retract_view_deps(self, vid, deps_info):
         s, batch = self._begin_write(sys.DepTab)
-        for d_id, dvid, dtid in deps_info:
-            sys.DepTab.retract(batch, s, d_id, vid, dvid, dtid)
+        for dvid, dtid in deps_info:
+            sys.DepTab.retract(batch, s, vid, dvid, dtid)
         self._finish_write_sys(self.sys.view_deps, batch)
 
     def _write_column_records(self, oid, kind, columns):

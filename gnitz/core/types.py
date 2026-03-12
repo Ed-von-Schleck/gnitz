@@ -206,6 +206,20 @@ def _analyze_schema(schema):
     return n, has_u128, has_string, has_nullable
 
 
+def _build_map_output_schema(input_schema, src_indices):
+    """Build output schema for op_map given source column indices.
+
+    The PK column is always preserved by op_map (auto-copied), so the
+    output schema is: [input_PK] + [projected columns].
+    """
+    cols = newlist_hint(len(src_indices) + 1)
+    cols.append(input_schema.get_pk_column())
+    for i in src_indices:
+        if i != input_schema.pk_index:
+            cols.append(input_schema.columns[i])
+    return TableSchema(cols, pk_index=0)
+
+
 def _build_reduce_output_schema(input_schema, group_by_cols, agg_func):
     """
     Constructs the output schema for a REDUCE operator.

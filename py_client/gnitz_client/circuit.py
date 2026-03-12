@@ -4,7 +4,7 @@ from gnitz_client.types import (
     OPCODE_SCAN_TRACE, OPCODE_FILTER, OPCODE_MAP, OPCODE_INTEGRATE,
     OPCODE_EXCHANGE_SHARD, OPCODE_EXCHANGE_GATHER,
     PORT_IN, PORT_TRACE, PORT_EXCHANGE_IN,
-    PARAM_TABLE_ID, PARAM_SHARD_COL_BASE, PARAM_GATHER_WORKER,
+    PARAM_SHARD_COL_BASE, PARAM_GATHER_WORKER,
 )
 
 # Opcodes used by CircuitBuilder (not all are in types.py)
@@ -187,7 +187,7 @@ class CircuitBuilder:
     def sink(self, input_handle: NodeHandle, target_table_id: int) -> NodeHandle:
         handle = self._alloc_node(OPCODE_INTEGRATE)
         self._connect(input_handle, handle, PORT_IN)
-        self._params.append((handle.node_id, PARAM_TABLE_ID, target_table_id))
+        # PARAM_TABLE_ID intentionally not emitted — evaluate_dag is the sole write path
         return handle
 
     def build(self) -> CircuitGraph:

@@ -4,7 +4,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask, r_int64
 
 from gnitz.core import opcodes
-from gnitz.core.types import merge_schemas_for_join, _build_reduce_output_schema
+from gnitz.core.types import merge_schemas_for_join, _build_map_output_schema, _build_reduce_output_schema
 from gnitz.core.errors import LayoutError
 from gnitz.catalog import system_tables as sys
 from gnitz.vm import instructions, runtime
@@ -221,52 +221,52 @@ class ProgramCache(object):
         return result
 
     def _resolve_primary_input_schema(self, program_id, fallback,
-                                      trace_table_ids=None):
+                                      circuit_sources, trace_side_sources):
         """Resolve the schema of the primary input (delta) source for a view.
 
-        trace_table_ids: dict {table_id: True} of tables used as trace-side
-        sources in the circuit graph.  These are skipped so that the primary
-        (delta) dependency is selected, not a secondary (trace) dependency.
-        For self-joins (primary table is also a trace table), falls back to
-        any matching dep.
+        Uses CircuitSources + trace_side_sources to identify the primary
+        input table.  The primary input node has table_id==0 (sentinel),
+        so we find its actual table from DepTab — specifically, the
+        dependency that is NOT a trace-side source table.
         """
-        if not self.registry.has_id(sys.DepTab.ID): return fallback
-        deps_family = self.registry.get_by_id(sys.DepTab.ID)
-        cursor = deps_family.store.create_cursor()
-        result = None
-        any_dep_schema = None  # fallback for self-join case
+        # Collect table IDs that feed trace ports
+        trace_table_ids = {}
+        for nid in trace_side_sources:
+            tid = circuit_sources.get(nid, 0)
+            if tid > 0:
+                trace_table_ids[tid] = True
+
+        # DepTab uses (view_id << 64 | dep_tid) PK — range scan by view_id
+        cursor, end_key = _open_system_scan(self.registry, sys.DepTab.ID, program_id)
+        if cursor is None:
+            if fallback is not None:
+                return fallback
+            raise LayoutError("Cannot resolve primary input schema for view %d: "
+                              "no DepTab" % program_id)
+        any_dep_schema = None
         try:
-            while cursor.is_valid():
-                if cursor.weight() <= r_int64(0):
-                    cursor.advance()
-                    continue
-                acc = cursor.get_accessor()
-                v_id = intmask(acc.get_int(sys.DepTab.COL_VIEW_ID))
-                if v_id == program_id:
-                    dep_table_id = intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID))
-                    dep_view_id = intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID))
-                    source_id = dep_table_id if dep_table_id > 0 else dep_view_id
-                    if source_id > 0 and self.registry.has_id(source_id):
-                        schema = self.registry.get_by_id(source_id).schema
+            while cursor.is_valid() and cursor.key() < end_key:
+                if cursor.weight() > r_int64(0):
+                    acc = cursor.get_accessor()
+                    dep_tid = intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID))
+                    if dep_tid > 0 and self.registry.has_id(dep_tid):
+                        dep_schema = self.registry.get_by_id(dep_tid).schema
                         if any_dep_schema is None:
-                            any_dep_schema = schema
-                        if trace_table_ids is not None and source_id in trace_table_ids:
-                            cursor.advance()
-                            continue
-                        result = schema
-                        break
+                            any_dep_schema = dep_schema
+                        if dep_tid not in trace_table_ids:
+                            return dep_schema
                 cursor.advance()
         finally:
             cursor.close()
-        if result is not None:
-            return result
-        # Self-join: primary source is also a trace table, use any dep
+
+        # Self-join fallback: primary and trace are the same table,
+        # so all deps are in trace_table_ids. Any dep works.
         if any_dep_schema is not None:
             return any_dep_schema
         if fallback is not None:
             return fallback
         raise LayoutError("Cannot resolve primary input schema for view %d: "
-                          "no dependency record found" % program_id)
+                          "no source found" % program_id)
 
     def _emit_node(self, nid, op, reg_id, node_params, in_regs,
                    cur_reg_file, out_reg_of, sources, trace_side_sources,
@@ -283,6 +283,7 @@ class ProgramCache(object):
             chunk_limit = node_params.get(opcodes.PARAM_CHUNK_LIMIT, 0)
 
             if table_id == 0:
+                # Primary input (delta): bind external batch at execution time
                 reg = runtime.DeltaRegister(reg_id, in_schema)
                 cur_reg_file.registers[reg_id] = reg
                 state[_ST_INPUT_DELTA_REG_ID] = reg_id
@@ -334,9 +335,11 @@ class ProgramCache(object):
                     src_types.append(in_reg.table_schema.columns[src_col].field_type.code)
                     idx += 1
                 func = functions.UniversalProjection(src_indices, src_types)
+                node_schema = _build_map_output_schema(in_reg.table_schema, src_indices)
             else:
                 func = NULL_PREDICATE
-            out_reg = runtime.DeltaRegister(reg_id, out_schema)
+                node_schema = in_reg.table_schema
+            out_reg = runtime.DeltaRegister(reg_id, node_schema)
             cur_reg_file.registers[reg_id] = out_reg
             return instructions.map_op(in_reg, out_reg, func)
 
@@ -410,12 +413,8 @@ class ProgramCache(object):
         elif op == opcodes.OPCODE_INTEGRATE:
             in_reg_id = in_regs[opcodes.PORT_IN]
             in_reg = cur_reg_file.registers[in_reg_id]
-            target_table_id = node_params.get(opcodes.PARAM_TABLE_ID, 0)
-            target = None
-            if target_table_id > 0 and self.registry.has_id(target_table_id):
-                target = self.registry.get_by_id(target_table_id)
             state[_ST_SINK_REG_ID] = in_reg_id
-            return instructions.integrate_op(in_reg, target.store if target else None)
+            return instructions.integrate_op(in_reg, None)
 
         elif op == opcodes.OPCODE_DELAY:
             in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
@@ -471,17 +470,6 @@ class ProgramCache(object):
         view_family = self.registry.get_by_id(view_id)
         out_schema = view_family.schema
 
-        # Collect trace-side table IDs so _resolve_primary_input_schema
-        # skips them and picks the actual primary (delta) source.
-        trace_table_ids = {}
-        for nid in sources:
-            tid = sources[nid]
-            if tid > 0:
-                trace_table_ids[tid] = True
-
-        in_schema = self._resolve_primary_input_schema(
-            view_id, out_schema, trace_table_ids)
-
         # 1. Topological sort
         opcode_of = {}
         for nid, op in nodes:
@@ -492,13 +480,7 @@ class ProgramCache(object):
         except LayoutError:
             return None
 
-        # 2. Register assignment
-        out_reg_of = {}
-        next_reg = 0
-        for nid in ordered:
-            out_reg_of[nid] = next_reg
-            next_reg += 1
-
+        # 2. Identify trace-side source nodes (must be before schema resolution)
         trace_side_sources = {}
         for _, src, dst, port in edges:
             if opcode_of.get(src, -1) == opcodes.OPCODE_SCAN_TRACE:
@@ -513,6 +495,17 @@ class ProgramCache(object):
                         dst_op == opcodes.OPCODE_SEMI_JOIN_DELTA_TRACE or
                         dst_op == opcodes.OPCODE_SEEK_TRACE):
                         trace_side_sources[src] = True
+
+        in_schema = self._resolve_primary_input_schema(view_id, out_schema,
+                                                       sources,
+                                                       trace_side_sources)
+
+        # 3. Register assignment
+        out_reg_of = {}
+        next_reg = 0
+        for nid in ordered:
+            out_reg_of[nid] = next_reg
+            next_reg += 1
 
         extra_regs = 0
         for nid, op in nodes:

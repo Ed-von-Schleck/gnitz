@@ -127,7 +127,7 @@ VIEW_TAB_SCHEMA = Schema(
 
 DEP_TAB_SCHEMA = Schema(
     columns=[
-        ColumnDef("dep_id", TypeCode.U64),
+        ColumnDef("dep_pk", TypeCode.U128),
         ColumnDef("view_id", TypeCode.U64),
         ColumnDef("dep_view_id", TypeCode.U64),
         ColumnDef("dep_table_id", TypeCode.U64),

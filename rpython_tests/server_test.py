@@ -155,8 +155,7 @@ def push_create_view(srv, schema_name, view_name, graph):
     ds = srv.engine.sys.view_deps.schema
     db = ZSetBatch(ds)
     for dep_tid in graph.dependencies:
-        dep_id = intmask(r_uint64(vid) ^ r_uint64(dep_tid))
-        sys_tab.DepTab.append(db, ds, dep_id, vid, 0, dep_tid)
+        sys_tab.DepTab.append(db, ds, vid, 0, dep_tid)
     if db.length() > 0:
         srv.handle_push(sys_tab.DepTab.ID, db)
     db.free()

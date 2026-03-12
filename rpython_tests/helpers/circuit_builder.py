@@ -174,7 +174,7 @@ class CircuitBuilder(object):
     def sink(self, input_handle, target_table_id):
         handle = self._alloc_node(OPCODE_INTEGRATE)
         self._connect(input_handle, handle, PORT_IN)
-        self._params.append((handle.node_id, PARAM_TABLE_ID, target_table_id))
+        # PARAM_TABLE_ID intentionally not emitted — evaluate_dag is the sole write path
         self._sink_node = handle
         return handle
 

@@ -32,19 +32,21 @@ def _compute_view_depth(vid, view_deps_store, registry):
     Traverses the view dependency graph to determine the topological rank.
     view_deps_store is a ZSetStore (PersistentTable).
     """
+    from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_int64
+    start_key = r_uint128(r_uint64(vid)) << 64
+    end_key = r_uint128(r_uint64(vid + 1)) << 64
     max_depth = 0
     cursor = view_deps_store.create_cursor()
     try:
-        while cursor.is_valid():
-            if cursor.weight() > 0:
+        cursor.seek(start_key)
+        while cursor.is_valid() and cursor.key() < end_key:
+            if cursor.weight() > r_int64(0):
                 acc = cursor.get_accessor()
-                v_id = intmask(acc.get_int(sys.DepTab.COL_VIEW_ID))
-                if v_id == vid:
-                    dep_vid = intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID))
-                    if dep_vid > 0 and registry.has_id(dep_vid):
-                        candidate = registry.get_by_id(dep_vid).depth + 1
-                        if candidate > max_depth:
-                            max_depth = candidate
+                dep_vid = intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID))
+                if dep_vid > 0 and registry.has_id(dep_vid):
+                    candidate = registry.get_by_id(dep_vid).depth + 1
+                    if candidate > max_depth:
+                        max_depth = candidate
             cursor.advance()
     finally:
         cursor.close()

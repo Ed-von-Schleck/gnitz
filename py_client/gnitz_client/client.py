@@ -17,7 +17,7 @@ from gnitz_client.types import (
     CIRCUIT_NODES_SCHEMA, CIRCUIT_EDGES_SCHEMA, CIRCUIT_SOURCES_SCHEMA,
     CIRCUIT_PARAMS_SCHEMA, CIRCUIT_GROUP_COLS_SCHEMA,
     OPCODE_FILTER, OPCODE_MAP, OPCODE_INTEGRATE, OPCODE_SCAN_TRACE,
-    PORT_IN, PORT_TRACE, PARAM_TABLE_ID,
+    PORT_IN, PORT_TRACE,
     TYPE_STRIDES,
 )
 from gnitz_client.batch import (
@@ -354,13 +354,12 @@ class GnitzClient:
                              type_codes, is_nullables, fk_table_ids, fk_col_idxs]
         self.push(COL_TAB, col_schema, col_batch)
 
-        # 2. Dependency records
-        dep_id = vid ^ source_table_id
+        # 2. Dependency records — U128 PK: pk_hi=vid, pk_lo=dep_tid
         dep_s = DEP_TAB_SCHEMA
         dep_batch = ZSetBatch(
             schema=dep_s,
-            pk_lo=[dep_id],
-            pk_hi=[0],
+            pk_lo=[source_table_id],
+            pk_hi=[vid],
             weights=[1],
             nulls=[0],
             columns=[[], [vid], [0], [source_table_id]],
@@ -401,20 +400,6 @@ class GnitzClient:
             columns=[[], [0]],  # table_id=0 means primary input
         )
         self.push(CIRCUIT_SOURCES_TAB, sources_s, sources_batch)
-
-        # Param: INTEGRATE node needs PARAM_TABLE_ID = vid
-        # param pk low 64 bits: (node_id << 8) | slot
-        param_lo = (1 << 8) | PARAM_TABLE_ID
-        params_s = CIRCUIT_PARAMS_SCHEMA
-        params_batch = ZSetBatch(
-            schema=params_s,
-            pk_lo=[param_lo],
-            pk_hi=[vid],
-            weights=[1],
-            nulls=[0],
-            columns=[[], [vid]],
-        )
-        self.push(CIRCUIT_PARAMS_TAB, params_s, params_batch)
 
         # 4. View record (triggers hook)
         view_s = VIEW_TAB_SCHEMA
@@ -479,7 +464,7 @@ class GnitzClient:
                              type_codes, is_nullables, fk_table_ids, fk_col_idxs]
         self.push(COL_TAB, col_schema, col_batch)
 
-        # 2. Dependency records
+        # 2. Dependency records — U128 PK: pk_hi=vid, pk_lo=dep_tid
         dep_s = DEP_TAB_SCHEMA
         if circuit.dependencies:
             dep_batch = ZSetBatch(schema=dep_s)
@@ -488,9 +473,8 @@ class GnitzClient:
             dep_view_ids = []
             dep_table_ids = []
             for dep_tid in circuit.dependencies:
-                dep_id = vid ^ dep_tid
-                dep_batch.pk_lo.append(dep_id)
-                dep_batch.pk_hi.append(0)
+                dep_batch.pk_lo.append(dep_tid)
+                dep_batch.pk_hi.append(vid)
                 dep_batch.weights.append(1)
                 dep_batch.nulls.append(0)
                 dep_pks.append(None)
@@ -753,7 +737,7 @@ class GnitzClient:
         for i in range(len(dep_batch.pk_lo)):
             if dep_batch.weights[i] > 0 and dep_batch.columns[1][i] == vid:
                 retract.pk_lo.append(dep_batch.pk_lo[i])
-                retract.pk_hi.append(0)
+                retract.pk_hi.append(dep_batch.pk_hi[i])
                 retract.weights.append(-1)
                 retract.nulls.append(0)
         if len(retract.pk_lo) == 0:
