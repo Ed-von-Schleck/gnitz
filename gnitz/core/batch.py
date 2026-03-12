@@ -288,8 +288,19 @@ class RowBuilder(core_comparator.RowAccessor):
 # ---------------------------------------------------------------------------
 
 
+def _insertion_sort_indices(indices, batch, lo, hi):
+    for i in range(lo + 1, hi):
+        key = indices[i]
+        j = i - 1
+        while j >= lo and batch.compare_indices(indices[j], key) > 0:
+            indices[j + 1] = indices[j]
+            j -= 1
+        indices[j + 1] = key
+
+
 def _mergesort_indices(indices, batch, lo, hi, scratch):
-    if hi - lo <= 1:
+    if hi - lo <= 32:
+        _insertion_sort_indices(indices, batch, lo, hi)
         return
     mid = (lo + hi) >> 1
     _mergesort_indices(indices, batch, lo, mid, scratch)
@@ -301,15 +312,21 @@ def _build_sorted_indices(batch):
     """Build an index array [0..N) and mergesort it by batch row order."""
     n = batch._count
     indices = newlist_hint(n)
-    scratch = newlist_hint(n)
     for i in range(n):
         indices.append(i)
-        scratch.append(0)
-    _mergesort_indices(indices, batch, 0, n, scratch)
+    if n <= 32:
+        _insertion_sort_indices(indices, batch, 0, n)
+    else:
+        scratch = newlist_hint(n)
+        for i in range(n):
+            scratch.append(0)
+        _mergesort_indices(indices, batch, 0, n, scratch)
     return indices
 
 
 def _merge_indices(indices, batch, lo, mid, hi, scratch):
+    if batch.compare_indices(indices[mid - 1], indices[mid]) <= 0:
+        return
     for k in range(lo, mid):
         scratch[k] = indices[k]
 
@@ -870,28 +887,17 @@ class ArenaZSetBatch(object):
 
         # Single consolidation loop over sorted indices.
         res = ArenaZSetBatch(self._schema, initial_capacity=self._count)
-        acc_a = ColumnarBatchAccessor(self._schema)
-        acc_b = ColumnarBatchAccessor(self._schema)
-        schema = self._schema
 
         i = 0
         while i < self._count:
             anchor = indices[i]
-            pk_i_lo = self._read_pk_lo(anchor)
-            pk_i_hi = self._read_pk_hi(anchor)
             weight_acc = self._read_weight(anchor)
-            acc_a.bind(self, anchor)
 
             j = i + 1
             while j < self._count:
-                next_idx = indices[j]
-                if (self._read_pk_lo(next_idx) != pk_i_lo
-                        or self._read_pk_hi(next_idx) != pk_i_hi):
+                if self.compare_indices(anchor, indices[j]) != 0:
                     break
-                acc_b.bind(self, next_idx)
-                if core_comparator.compare_rows(schema, acc_a, acc_b) != 0:
-                    break
-                weight_acc += self._read_weight(next_idx)
+                weight_acc += self._read_weight(indices[j])
                 j += 1
 
             if weight_acc != 0:

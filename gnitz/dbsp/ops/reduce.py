@@ -205,18 +205,35 @@ def _argsort_delta(batch, schema, col_indices):
     if count <= 1:
         return indices
 
-    scratch = newlist_hint(count)
-    for _ in range(count):
-        scratch.append(0)
-
     acc_a = ColumnarBatchAccessor(schema)
     acc_b = ColumnarBatchAccessor(schema)
-    _mergesort_by_cols(indices, batch, schema, col_indices, 0, count, scratch, acc_a, acc_b)
+    if count <= 32:
+        _insertion_sort_by_cols(indices, batch, schema, col_indices, 0, count, acc_a, acc_b)
+    else:
+        scratch = newlist_hint(count)
+        for _ in range(count):
+            scratch.append(0)
+        _mergesort_by_cols(indices, batch, schema, col_indices, 0, count, scratch, acc_a, acc_b)
     return indices
 
 
+def _insertion_sort_by_cols(indices, batch, schema, col_indices, lo, hi, acc_a, acc_b):
+    for i in range(lo + 1, hi):
+        key = indices[i]
+        j = i - 1
+        batch.bind_accessor(key, acc_b)
+        while j >= lo:
+            batch.bind_accessor(indices[j], acc_a)
+            if _compare_by_cols(acc_a, acc_b, schema, col_indices) <= 0:
+                break
+            indices[j + 1] = indices[j]
+            j -= 1
+        indices[j + 1] = key
+
+
 def _mergesort_by_cols(indices, batch, schema, col_indices, lo, hi, scratch, acc_a, acc_b):
-    if hi - lo <= 1:
+    if hi - lo <= 32:
+        _insertion_sort_by_cols(indices, batch, schema, col_indices, lo, hi, acc_a, acc_b)
         return
     mid = (lo + hi) >> 1
     _mergesort_by_cols(indices, batch, schema, col_indices, lo, mid, scratch, acc_a, acc_b)
@@ -225,6 +242,10 @@ def _mergesort_by_cols(indices, batch, schema, col_indices, lo, hi, scratch, acc
 
 
 def _merge_by_cols(indices, batch, schema, col_indices, lo, mid, hi, scratch, acc_a, acc_b):
+    batch.bind_accessor(indices[mid - 1], acc_a)
+    batch.bind_accessor(indices[mid], acc_b)
+    if _compare_by_cols(acc_a, acc_b, schema, col_indices) <= 0:
+        return
     for k in range(lo, mid):
         scratch[k] = indices[k]
 
