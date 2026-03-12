@@ -258,6 +258,32 @@ class TestQ1FilterReduce:
             f"orderkey={target_okey}: expected {expected_sum}, got {after.get(target_okey)}"
         )
 
+    def test_group_elimination(self, client, sn, tpch_data):
+        """Retract all rows for a group — the group should vanish from output."""
+        tid, vid, orders = self._setup(client, sn, tpch_data)
+
+        by_okey = {}
+        for pk, okey, qty, price in tpch_data['lineitem']:
+            if price > 5000:
+                by_okey.setdefault(okey, []).append((pk, okey, qty, price))
+
+        target_okey = None
+        target_rows = None
+        for okey, rows in by_okey.items():
+            if len(rows) == 1:
+                target_okey = okey
+                target_rows = rows
+                break
+        assert target_okey is not None, "Need a group with exactly 1 filtered row"
+
+        _push_lineitem_rows(client, tid, target_rows, weight=-1)
+
+        after = _scan_reduce_result(client, vid)
+        val = after.get(target_okey)
+        assert val is None or val == 0, (
+            f"orderkey={target_okey} should have been eliminated or zero, got sum={val}"
+        )
+
     def test_timing_proportionality(self, client, sn, tpch_data):
         """Push varying batch sizes and verify sub-linear scaling."""
         tid, vid, orders = self._setup(client, sn, tpch_data)
@@ -575,7 +601,7 @@ def _build_cust_prices(lineitem_data, orders_data):
     return cust_prices
 
 
-def _find_cust_with_distinct_prices(cust_prices, order_to_cust, li_agg, key_fn):
+def _find_cust_with_distinct_prices(cust_prices, key_fn):
     """Find a customer with >= 2 distinct prices and return
     (ckey, retract_okey, new_expected) where retract_okey holds the
     current extremum (min or max per key_fn) and new_expected is the
@@ -677,11 +703,10 @@ class TestQ4JoinReduceMin:
         li_tid, vid, data = self._setup(client, sn, tpch_data)
 
         cust_prices = _build_cust_prices(data['lineitem'], data['orders'])
-        order_to_cust = {o[0]: o[1] for o in data['orders']}
         li_agg = dict(_aggregate_lineitem_by_orderkey(data['lineitem']))
 
         target_ckey, retract_okey, new_expected_min = _find_cust_with_distinct_prices(
-            cust_prices, order_to_cust, li_agg, min
+            cust_prices, min
         )
         assert target_ckey is not None, "Need a customer with >= 2 distinct prices"
 
@@ -694,7 +719,8 @@ class TestQ4JoinReduceMin:
         )
 
     def test_incremental_new_min(self, client, sn, tpch_data):
-        """Push a value smaller than current MIN — should become the new MIN."""
+        """Push an additional contribution for an existing orderkey with price=1 —
+        the customer's MIN should update to 1."""
         li_tid, vid, data = self._setup(client, sn, tpch_data)
 
         # Pick any customer and push a very small price via an existing orderkey
@@ -706,6 +732,80 @@ class TestQ4JoinReduceMin:
         after = _scan_reduce_result(client, vid)
         assert after[ckey] == tiny_price, (
             f"custkey={ckey}: expected new MIN={tiny_price}, got {after.get(ckey)}"
+        )
+
+    def test_group_elimination(self, client, sn, tpch_data):
+        """Retract all rows for a customer group — MIN group should vanish."""
+        li_tid, vid, data = self._setup(client, sn, tpch_data)
+
+        cust_prices = _build_cust_prices(data['lineitem'], data['orders'])
+        li_agg = dict(_aggregate_lineitem_by_orderkey(data['lineitem']))
+
+        target_ckey = None
+        target_okey = None
+        for ckey, okey_prices in cust_prices.items():
+            if len(okey_prices) == 1:
+                target_ckey = ckey
+                target_okey = okey_prices[0][0]
+                break
+        assert target_ckey is not None, "Need a customer with exactly 1 orderkey"
+
+        _push_li_agg_rows(client, li_tid, [(target_okey, li_agg[target_okey])], weight=-1)
+
+        after = _scan_reduce_result(client, vid)
+        assert target_ckey not in after, (
+            f"custkey={target_ckey} should have been eliminated but still present"
+        )
+
+    def test_multi_tick_retraction(self, client, sn, tpch_data):
+        """Insert, retract, re-insert with different value — verifies trace accumulation."""
+        li_tid, vid, data = self._setup(client, sn, tpch_data)
+
+        okey = data['orders'][0][0]
+        ckey = data['orders'][0][1]
+
+        cust_prices = _build_cust_prices(data['lineitem'], data['orders'])
+        original_min = min(p for _, p in cust_prices.get(ckey, [(0, 1)]))
+
+        # Tick 1: push tiny_price=1 — MIN for ckey drops to 1
+        _push_li_agg_rows(client, li_tid, [(okey, 1)])
+        assert _scan_reduce_result(client, vid).get(ckey) == 1
+
+        # Tick 2: retract tiny_price — MIN should be restored to original
+        _push_li_agg_rows(client, li_tid, [(okey, 1)], weight=-1)
+        after_retract = _scan_reduce_result(client, vid)
+        assert after_retract.get(ckey) == original_min, (
+            f"After retraction: expected {original_min}, got {after_retract.get(ckey)}"
+        )
+
+        # Tick 3: push huge value — MIN stays at original_min (not displaced upward)
+        _push_li_agg_rows(client, li_tid, [(okey, 99999998)])
+        after_reinsert = _scan_reduce_result(client, vid)
+        assert after_reinsert.get(ckey) == original_min, (
+            f"After re-insert: expected {original_min}, got {after_reinsert.get(ckey)}"
+        )
+
+    def test_timing_proportionality(self, client, sn, tpch_data):
+        """Verify incremental push scales with delta, not total data."""
+        li_tid, vid, data = self._setup(client, sn, tpch_data)
+
+        def push_n(n, offset):
+            rows = [(700000 + offset + i, 5000) for i in range(n)]
+            t0 = time.perf_counter()
+            _push_li_agg_rows(client, li_tid, rows)
+            client.scan(vid)
+            return time.perf_counter() - t0
+
+        push_n(5, 0)  # warm up
+
+        timings = {}
+        for i, n in enumerate([1, 10, 50]):
+            timings[n] = push_n(n, 10000 + i * 1000)
+
+        ratio = timings[50] / max(timings[1], 1e-9)
+        assert ratio < 30, (
+            f"Non-incremental! push(50)/push(1) = {ratio:.1f}x "
+            f"(timings: {timings})"
         )
 
 
@@ -759,16 +859,45 @@ class TestQ5JoinReduceMax:
         actual = _scan_reduce_result(client, vid)
         assert actual == expected
 
+    def test_retraction_of_non_max(self, client, sn, tpch_data):
+        """Retract a non-maximum row — MAX should be unchanged."""
+        li_tid, vid, data = self._setup(client, sn, tpch_data)
+
+        before = _scan_reduce_result(client, vid)
+
+        cust_prices = _build_cust_prices(data['lineitem'], data['orders'])
+        li_agg = dict(_aggregate_lineitem_by_orderkey(data['lineitem']))
+
+        target_ckey = None
+        retract_okey = None
+        for ckey, okey_prices in cust_prices.items():
+            if len(okey_prices) >= 2:
+                max_price = max(p for _, p in okey_prices)
+                for okey, price in okey_prices:
+                    if price < max_price:
+                        target_ckey = ckey
+                        retract_okey = okey
+                        break
+            if target_ckey is not None:
+                break
+        assert target_ckey is not None, "Need a customer with a retractable non-max order"
+
+        _push_li_agg_rows(client, li_tid, [(retract_okey, li_agg[retract_okey])], weight=-1)
+
+        after = _scan_reduce_result(client, vid)
+        assert after[target_ckey] == before[target_ckey], (
+            f"custkey={target_ckey}: MAX should be unchanged after retracting non-max row"
+        )
+
     def test_retraction_of_max(self, client, sn, tpch_data):
         """Retract the current maximum — forces history replay to find new MAX."""
         li_tid, vid, data = self._setup(client, sn, tpch_data)
 
         cust_prices = _build_cust_prices(data['lineitem'], data['orders'])
-        order_to_cust = {o[0]: o[1] for o in data['orders']}
         li_agg = dict(_aggregate_lineitem_by_orderkey(data['lineitem']))
 
         target_ckey, retract_okey, new_expected_max = _find_cust_with_distinct_prices(
-            cust_prices, order_to_cust, li_agg, max
+            cust_prices, max
         )
         assert target_ckey is not None, "Need a customer with >= 2 distinct prices"
 
@@ -781,7 +910,8 @@ class TestQ5JoinReduceMax:
         )
 
     def test_incremental_new_max(self, client, sn, tpch_data):
-        """Push a value larger than current MAX — should become the new MAX."""
+        """Push an additional contribution for an existing orderkey with a huge price —
+        the customer's MAX should update."""
         li_tid, vid, data = self._setup(client, sn, tpch_data)
 
         okey = data['orders'][0][0]
@@ -792,4 +922,50 @@ class TestQ5JoinReduceMax:
         after = _scan_reduce_result(client, vid)
         assert after[ckey] == huge_price, (
             f"custkey={ckey}: expected new MAX={huge_price}, got {after.get(ckey)}"
+        )
+
+    def test_group_elimination(self, client, sn, tpch_data):
+        """Retract all rows for a customer group — MAX group should vanish."""
+        li_tid, vid, data = self._setup(client, sn, tpch_data)
+
+        cust_prices = _build_cust_prices(data['lineitem'], data['orders'])
+        li_agg = dict(_aggregate_lineitem_by_orderkey(data['lineitem']))
+
+        target_ckey = None
+        target_okey = None
+        for ckey, okey_prices in cust_prices.items():
+            if len(okey_prices) == 1:
+                target_ckey = ckey
+                target_okey = okey_prices[0][0]
+                break
+        assert target_ckey is not None, "Need a customer with exactly 1 orderkey"
+
+        _push_li_agg_rows(client, li_tid, [(target_okey, li_agg[target_okey])], weight=-1)
+
+        after = _scan_reduce_result(client, vid)
+        assert target_ckey not in after, (
+            f"custkey={target_ckey} should have been eliminated but still present"
+        )
+
+    def test_timing_proportionality(self, client, sn, tpch_data):
+        """Verify incremental push scales with delta, not total data."""
+        li_tid, vid, data = self._setup(client, sn, tpch_data)
+
+        def push_n(n, offset):
+            rows = [(600000 + offset + i, 5000) for i in range(n)]
+            t0 = time.perf_counter()
+            _push_li_agg_rows(client, li_tid, rows)
+            client.scan(vid)
+            return time.perf_counter() - t0
+
+        push_n(5, 0)  # warm up
+
+        timings = {}
+        for i, n in enumerate([1, 10, 50]):
+            timings[n] = push_n(n, 10000 + i * 1000)
+
+        ratio = timings[50] / max(timings[1], 1e-9)
+        assert ratio < 30, (
+            f"Non-incremental! push(50)/push(1) = {ratio:.1f}x "
+            f"(timings: {timings})"
         )
