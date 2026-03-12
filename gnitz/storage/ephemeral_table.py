@@ -16,6 +16,7 @@ from gnitz.core import types, errors
 from gnitz.core import comparator as core_comparator
 from gnitz.core.store import ZSetStore
 from gnitz.core.keys import promote_to_index_key
+from gnitz.core.batch import ColumnarBatchAccessor
 from gnitz.storage import (
     index,
     memtable,
@@ -79,6 +80,8 @@ class EphemeralTable(ZSetStore):
         self.index = index.ShardIndex(table_id, schema, self.ref_counter)
         self.memtable = memtable.MemTable(schema, memtable_arena_size)
         self._flush_seq = 0
+        self._retract_acc = ColumnarBatchAccessor(schema)
+        self._retract_soa = storage_comparator.SoAAccessor(schema)
 
     # -- ZSetStore Interface Implementation -----------------------------------
 
@@ -109,20 +112,14 @@ class EphemeralTable(ZSetStore):
 
         return cursor.UnifiedCursor(self.schema, cs)
 
-    def has_pk(self, key):
-        """
-        Fast-path existence check for a Primary Key.
-        Returns True if the net algebraic weight across MemTable and Shards is > 0.
-        """
-        r_key = r_uint128(key)
+    def _scan_shards_for_pk(self, r_key):
+        """Walk shards for a PK via the shard index.
 
-        # 1. MemTable (Bloom-filtered)
-        if self.memtable.may_contain_pk(r_key):
-            total_w = self.memtable.get_weight_for_pk(r_key)
-        else:
-            total_w = r_int64(0)
-
-        # 2. Columnar Shards via Index
+        Returns (net_weight_from_shards, view_or_None, first_row_idx).
+        """
+        total_w = r_int64(0)
+        found_view = None
+        found_idx = -1
         shard_matches = self.index.find_all_shards_and_indices(r_key)
         if shard_matches:
             is_u128 = self.schema.get_pk_column().field_type.size == 16
@@ -136,11 +133,52 @@ class EphemeralTable(ZSetStore):
                     else:
                         if r_uint128(view.get_pk_u64(idx)) != r_key:
                             break
-
                     total_w += view.get_weight(idx)
+                    if found_view is None:
+                        found_view = view
+                        found_idx = idx
                     idx += 1
+        return total_w, found_view, found_idx
 
+    def has_pk(self, key):
+        """
+        Fast-path existence check for a Primary Key.
+        Returns True if the net algebraic weight across MemTable and Shards is > 0.
+        """
+        r_key = r_uint128(key)
+        total_w = r_int64(0)
+        if self.memtable.may_contain_pk(r_key):
+            mt_w, _, _ = self.memtable.lookup_pk(r_key)
+            total_w = mt_w
+        shard_w, _, _ = self._scan_shards_for_pk(r_key)
+        total_w += shard_w
         return total_w > 0
+
+    def retract_pk(self, key, out_batch):
+        """If PK exists with positive net weight, append a retraction
+        (weight=-1) of the current row to out_batch.
+
+        Returns True if a retraction was emitted, False if PK was absent
+        or had non-positive net weight.
+        """
+        r_key = r_uint128(key)
+        total_w = r_int64(0)
+        mt_batch = None
+        mt_idx = -1
+        if self.memtable.may_contain_pk(r_key):
+            mt_w, mt_batch, mt_idx = self.memtable.lookup_pk(r_key)
+            total_w = mt_w
+        shard_w, shard_view, shard_idx = self._scan_shards_for_pk(r_key)
+        total_w += shard_w
+        if total_w <= r_int64(0):
+            return False
+        if mt_batch is not None:
+            self._retract_acc.bind(mt_batch, mt_idx)
+            out_batch.append_from_accessor(r_key, r_int64(-1), self._retract_acc)
+        elif shard_view is not None:
+            self._retract_soa.set_row(shard_view, shard_idx)
+            out_batch.append_from_accessor(r_key, r_int64(-1), self._retract_soa)
+        return True
 
     def get_weight(self, key, accessor):
         """

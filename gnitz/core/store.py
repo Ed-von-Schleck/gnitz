@@ -97,6 +97,13 @@ class ZSetStore(object):
         """
         raise NotImplementedError
 
+    def retract_pk(self, key, out_batch):
+        """If PK exists with positive net weight, append retraction to out_batch.
+        Returns True if retraction was emitted.
+        key: r_uint128, out_batch: ArenaZSetBatch -> bool
+        """
+        raise NotImplementedError
+
     def flush(self):
         """Forces pending mutations to persistent storage."""
         # -> str (path to created shard or empty)

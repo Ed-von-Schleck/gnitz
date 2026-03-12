@@ -156,6 +156,20 @@ class PartitionedTable(ZSetStore):
             cursors.append(self.partitions[local].create_cursor())
         return UnifiedCursor(self.schema, cursors)
 
+    def retract_pk(self, key, out_batch):
+        if len(self.partitions) == 0:
+            return False
+        if self.num_partitions == 1:
+            return self.partitions[0].retract_pk(key, out_batch)
+        r_key = r_uint128(key)
+        pk_lo = r_uint64(r_key)
+        pk_hi = r_uint64(r_key >> 64)
+        p = _partition_for_key(pk_lo, pk_hi)
+        local = p - self.part_offset
+        if local < 0 or local >= len(self.partitions):
+            return False
+        return self.partitions[local].retract_pk(key, out_batch)
+
     def has_pk(self, key):
         if len(self.partitions) == 0:
             return False

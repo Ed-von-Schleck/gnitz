@@ -307,7 +307,7 @@ def test_memtable(base_dir):
 
         assert_false(mt.is_empty(), "MemTable should not be empty after insert")
         assert_equal_i64(
-            r_int64(1), mt.get_weight_for_pk(pk1), "Weight should be 1 after insert"
+            r_int64(1), mt.lookup_pk(pk1)[0], "Weight should be 1 after insert"
         )
 
         b_sub = batch.ZSetBatch(schema_u128)
@@ -319,7 +319,7 @@ def test_memtable(base_dir):
 
         assert_equal_i64(
             r_int64(0),
-            mt.get_weight_for_pk(pk1),
+            mt.lookup_pk(pk1)[0],
             "Weight should be 0 after annihilation",
         )
 
@@ -1012,6 +1012,200 @@ def test_filter_integration(base_dir):
 
 
 # ------------------------------------------------------------------------------
+# retract_pk Tests
+# ------------------------------------------------------------------------------
+
+
+def test_retract_pk(base_dir):
+    os.write(1, "  test_retract_pk ...\n")
+    schema = make_u64_str_schema()
+
+    # --- test_retract_pk_found_in_memtable ---
+    eph_dir = os.path.join(base_dir, "retract_mt")
+    t = EphemeralTable(eph_dir, "retract_mt", schema)
+    b = batch.ZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    rb.begin(r_uint128(10), r_int64(1))
+    rb.put_string("hello")
+    rb.commit()
+    t.ingest_batch(b)
+    b.free()
+
+    out = batch.ArenaZSetBatch(schema)
+    result = t.retract_pk(r_uint128(10), out)
+    assert_true(result, "retract_pk memtable should return True")
+    assert_equal_i(1, out.length(), "retract_pk memtable out should have 1 row")
+    assert_true(out.get_weight(0) == r_int64(-1), "retract weight should be -1")
+    assert_true(out.get_pk(0) == r_uint128(10), "retract pk should be 10")
+    out.free()
+    t.close()
+
+    # --- test_retract_pk_found_in_shard ---
+    eph_dir2 = os.path.join(base_dir, "retract_shard")
+    t2 = EphemeralTable(eph_dir2, "retract_shard", schema)
+    b2 = batch.ZSetBatch(schema)
+    rb2 = RowBuilder(schema, b2)
+    rb2.begin(r_uint128(20), r_int64(1))
+    rb2.put_string("world")
+    rb2.commit()
+    t2.ingest_batch(b2)
+    b2.free()
+    t2.flush()  # moves to shard
+
+    out2 = batch.ArenaZSetBatch(schema)
+    result2 = t2.retract_pk(r_uint128(20), out2)
+    assert_true(result2, "retract_pk shard should return True")
+    assert_equal_i(1, out2.length(), "retract_pk shard out should have 1 row")
+    assert_true(out2.get_weight(0) == r_int64(-1), "retract shard weight should be -1")
+    out2.free()
+    t2.close()
+
+    # --- test_retract_pk_absent ---
+    eph_dir3 = os.path.join(base_dir, "retract_absent")
+    t3 = EphemeralTable(eph_dir3, "retract_absent", schema)
+    out3 = batch.ArenaZSetBatch(schema)
+    result3 = t3.retract_pk(r_uint128(999), out3)
+    assert_false(result3, "retract_pk absent should return False")
+    assert_equal_i(0, out3.length(), "retract_pk absent out should be empty")
+    out3.free()
+    t3.close()
+
+    # --- test_retract_pk_after_retraction (net=0) ---
+    eph_dir4 = os.path.join(base_dir, "retract_net0")
+    t4 = EphemeralTable(eph_dir4, "retract_net0", schema)
+    b4a = batch.ZSetBatch(schema)
+    rb4a = RowBuilder(schema, b4a)
+    rb4a.begin(r_uint128(30), r_int64(1))
+    rb4a.put_string("ins")
+    rb4a.commit()
+    t4.ingest_batch(b4a)
+    b4a.free()
+    b4b = batch.ZSetBatch(schema)
+    rb4b = RowBuilder(schema, b4b)
+    rb4b.begin(r_uint128(30), r_int64(-1))
+    rb4b.put_string("ins")
+    rb4b.commit()
+    t4.ingest_batch(b4b)
+    b4b.free()
+
+    out4 = batch.ArenaZSetBatch(schema)
+    result4 = t4.retract_pk(r_uint128(30), out4)
+    assert_false(result4, "retract_pk net=0 should return False")
+    assert_equal_i(0, out4.length(), "retract_pk net=0 out should be empty")
+    out4.free()
+    t4.close()
+
+    # --- test_retract_pk_split_weight (shard+memtable both positive) ---
+    eph_dir5 = os.path.join(base_dir, "retract_split")
+    t5 = EphemeralTable(eph_dir5, "retract_split", schema)
+    b5a = batch.ZSetBatch(schema)
+    rb5a = RowBuilder(schema, b5a)
+    rb5a.begin(r_uint128(40), r_int64(1))
+    rb5a.put_string("split")
+    rb5a.commit()
+    t5.ingest_batch(b5a)
+    b5a.free()
+    t5.flush()  # +1 in shard
+    b5b = batch.ZSetBatch(schema)
+    rb5b = RowBuilder(schema, b5b)
+    rb5b.begin(r_uint128(40), r_int64(1))
+    rb5b.put_string("split")
+    rb5b.commit()
+    t5.ingest_batch(b5b)
+    b5b.free()  # +1 in memtable
+
+    out5 = batch.ArenaZSetBatch(schema)
+    result5 = t5.retract_pk(r_uint128(40), out5)
+    assert_true(result5, "retract_pk split weight should return True")
+    assert_equal_i(1, out5.length(), "retract_pk split should emit exactly 1 retraction")
+    assert_true(out5.get_weight(0) == r_int64(-1), "retract split weight should be -1")
+    out5.free()
+    t5.close()
+
+    # --- test_retract_pk_weight_canceled (shard +1, memtable -1) ---
+    eph_dir6 = os.path.join(base_dir, "retract_cancel")
+    t6 = EphemeralTable(eph_dir6, "retract_cancel", schema)
+    b6a = batch.ZSetBatch(schema)
+    rb6a = RowBuilder(schema, b6a)
+    rb6a.begin(r_uint128(50), r_int64(1))
+    rb6a.put_string("cancel")
+    rb6a.commit()
+    t6.ingest_batch(b6a)
+    b6a.free()
+    t6.flush()  # +1 in shard
+    b6b = batch.ZSetBatch(schema)
+    rb6b = RowBuilder(schema, b6b)
+    rb6b.begin(r_uint128(50), r_int64(-1))
+    rb6b.put_string("cancel")
+    rb6b.commit()
+    t6.ingest_batch(b6b)
+    b6b.free()  # -1 in memtable
+
+    out6 = batch.ArenaZSetBatch(schema)
+    result6 = t6.retract_pk(r_uint128(50), out6)
+    assert_false(result6, "retract_pk canceled should return False")
+    assert_equal_i(0, out6.length(), "retract_pk canceled out should be empty")
+    out6.free()
+    t6.close()
+
+    # --- test_retract_pk_string_column (verify string data copied correctly) ---
+    eph_dir7 = os.path.join(base_dir, "retract_str")
+    t7 = EphemeralTable(eph_dir7, "retract_str", schema)
+    test_str = "retract_string_payload"
+    b7 = batch.ZSetBatch(schema)
+    rb7 = RowBuilder(schema, b7)
+    rb7.begin(r_uint128(60), r_int64(1))
+    rb7.put_string(test_str)
+    rb7.commit()
+    t7.ingest_batch(b7)
+
+    # Build a reference row for comparison
+    ref = batch.ZSetBatch(schema)
+    rb_ref = RowBuilder(schema, ref)
+    rb_ref.begin(r_uint128(60), r_int64(-1))
+    rb_ref.put_string(test_str)
+    rb_ref.commit()
+
+    out7 = batch.ArenaZSetBatch(schema)
+    result7 = t7.retract_pk(r_uint128(60), out7)
+    assert_true(result7, "retract_pk string should return True")
+    assert_equal_i(1, out7.length(), "retract_pk string out should have 1 row")
+    # Compare the retracted row's payload against the reference
+    from gnitz.core import comparator as core_comparator
+    acc_out = ColumnarBatchAccessor(schema)
+    acc_out.bind(out7, 0)
+    acc_ref = ColumnarBatchAccessor(schema)
+    acc_ref.bind(ref, 0)
+    cmp_result = core_comparator.compare_rows(schema, acc_out, acc_ref)
+    assert_equal_i(0, cmp_result, "retract_pk string payload should match original")
+    out7.free()
+    ref.free()
+    b7.free()
+    t7.close()
+
+    # --- test_has_pk_unchanged (verify has_pk still works after refactor) ---
+    eph_dir8 = os.path.join(base_dir, "retract_has")
+    t8 = EphemeralTable(eph_dir8, "retract_has", schema)
+    b8 = batch.ZSetBatch(schema)
+    rb8 = RowBuilder(schema, b8)
+    rb8.begin(r_uint128(70), r_int64(1))
+    rb8.put_string("exists")
+    rb8.commit()
+    t8.ingest_batch(b8)
+    b8.free()
+
+    assert_true(t8.has_pk(r_uint128(70)), "has_pk should find pk=70")
+    assert_false(t8.has_pk(r_uint128(71)), "has_pk should not find pk=71")
+
+    t8.flush()
+    assert_true(t8.has_pk(r_uint128(70)), "has_pk should find pk=70 after flush")
+    assert_false(t8.has_pk(r_uint128(71)), "has_pk should not find pk=71 after flush")
+    t8.close()
+
+    os.write(1, "    [OK] retract_pk tests passed.\n")
+
+
+# ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
 
@@ -1034,6 +1228,7 @@ def entry_point(argv):
         test_bloom_filter(base_dir)
         test_xor8_filter(base_dir)
         test_filter_integration(base_dir)
+        test_retract_pk(base_dir)
         os.write(1, "\nALL STORAGE TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

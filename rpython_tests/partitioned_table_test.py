@@ -331,6 +331,59 @@ def test_create_child(base_dir):
     log("  PASSED")
 
 
+def test_retract_pk_partitioned(base_dir):
+    log("test_retract_pk_partitioned")
+    d = base_dir + "/retract_part"
+    os.mkdir(d)
+
+    schema = make_u64_i64_schema()
+    table_id = FIRST_USER_TABLE_ID + 10
+
+    store = make_partitioned_persistent(d, "retract_test", schema, table_id, NUM_PARTITIONS)
+
+    # Insert rows
+    b = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    for i in range(20):
+        rb.begin(r_uint128(i + 1), r_int64(1))
+        rb.put_int(r_int64(i * 10))
+        rb.commit()
+    store.ingest_batch(b)
+    b.free()
+
+    # retract_pk for an existing key
+    out = ArenaZSetBatch(schema)
+    result = store.retract_pk(r_uint128(5), out)
+    assert_true(result, "retract_pk partitioned should return True for pk=5")
+    assert_equal_i(1, out.length(), "retract_pk partitioned should emit 1 row")
+    assert_true(out.get_weight(0) == r_int64(-1), "retract weight should be -1")
+    assert_true(out.get_pk(0) == r_uint128(5), "retract pk should be 5")
+    out.free()
+
+    store.close()
+    log("  PASSED")
+
+
+def test_retract_pk_partitioned_absent(base_dir):
+    log("test_retract_pk_partitioned_absent")
+    d = base_dir + "/retract_part_absent"
+    os.mkdir(d)
+
+    schema = make_u64_i64_schema()
+    table_id = FIRST_USER_TABLE_ID + 11
+
+    store = make_partitioned_persistent(d, "retract_absent", schema, table_id, NUM_PARTITIONS)
+
+    out = ArenaZSetBatch(schema)
+    result = store.retract_pk(r_uint128(12345), out)
+    assert_true(not result, "retract_pk partitioned absent should return False")
+    assert_equal_i(0, out.length(), "retract_pk partitioned absent out should be empty")
+    out.free()
+
+    store.close()
+    log("  PASSED")
+
+
 # -- Entry Point ---------------------------------------------------------------
 
 
@@ -349,6 +402,8 @@ def entry_point(argv):
         test_n256_flush_and_rescan(base_dir)
         test_n256_ephemeral(base_dir)
         test_create_child(base_dir)
+        test_retract_pk_partitioned(base_dir)
+        test_retract_pk_partitioned_absent(base_dir)
         os.write(1, "\nALL PARTITIONED TABLE TESTS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

@@ -102,18 +102,32 @@ class MemTable(object):
     def should_flush(self):
         return self._total_bytes() > self.max_bytes * 3 // 4
 
-    def get_weight_for_pk(self, key):
+    def lookup_pk(self, key):
+        """Find a PK across all runs and the accumulator.
+
+        Returns (net_weight, batch_or_None, row_idx) where batch+row_idx
+        point to the first row found with this PK.
+        """
         total_w = r_int64(0)
-        # Binary search each sorted run
+        found_batch = None
+        found_idx = -1
         for ri in range(len(self.runs)):
             run = self.runs[ri]
-            total_w += _binary_search_weight(run, key)
-        # Linear scan accumulator
+            lo = _lower_bound(run, key)
+            while lo < run.length() and run.get_pk(lo) == key:
+                total_w += run.get_weight(lo)
+                if found_batch is None:
+                    found_batch = run
+                    found_idx = lo
+                lo += 1
         n = self._accumulator.length()
         for i in range(n):
             if self._accumulator.get_pk(i) == key:
                 total_w += self._accumulator.get_weight(i)
-        return total_w
+                if found_batch is None:
+                    found_batch = self._accumulator
+                    found_idx = i
+        return total_w, found_batch, found_idx
 
     def find_weight_for_row(self, key, accessor):
         total_w = r_int64(0)
@@ -230,9 +244,8 @@ def _merge_runs_to_consolidated(runs, schema):
     return consolidated
 
 
-def _binary_search_weight(run, key):
-    """Binary search a sorted run for all rows with the given PK, sum weights."""
-    total_w = r_int64(0)
+def _lower_bound(run, key):
+    """Binary search for the first index where pk >= key."""
     lo = 0
     hi = run.length()
     while lo < hi:
@@ -241,7 +254,13 @@ def _binary_search_weight(run, key):
             lo = mid + 1
         else:
             hi = mid
-    # lo is now the first position where pk >= key
+    return lo
+
+
+def _binary_search_weight(run, key):
+    """Binary search a sorted run for all rows with the given PK, sum weights."""
+    total_w = r_int64(0)
+    lo = _lower_bound(run, key)
     while lo < run.length() and run.get_pk(lo) == key:
         total_w += run.get_weight(lo)
         lo += 1
