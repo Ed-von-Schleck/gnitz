@@ -405,9 +405,26 @@ class ProgramCache(object):
             cur_reg_file.registers[out_delta_id] = out_delta_reg
             out_reg_of[nid] = out_delta_id
             tr_in_reg = None
-            if opcodes.PORT_TRACE_IN in in_regs: tr_in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE_IN]]
+            tr_in_table = None
+            if opcodes.PORT_TRACE_IN in in_regs:
+                tr_in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE_IN]]
+            elif not agg_func.is_linear():
+                # Auto-create intermediate trace for reduce's input history.
+                # Non-linear aggregates (MIN/MAX) replay this trace on retraction.
+                tr_in_table = view_family.store.create_child(
+                    "_reduce_in_%d_%d" % (view_id, nid), in_reg.table_schema
+                )
+                tr_in_reg_id = state[_ST_NEXT_EXTRA_REG]
+                state[_ST_NEXT_EXTRA_REG] += 1
+                tr_in_reg = runtime.TraceRegister(
+                    tr_in_reg_id, in_reg.table_schema,
+                    tr_in_table.create_cursor(), tr_in_table
+                )
+                cur_reg_file.registers[tr_in_reg_id] = tr_in_reg
             reduce_instr = instructions.reduce_op(in_reg, tr_in_reg, tr_out_reg, out_delta_reg, gcols, agg_func, reduce_out_schema)
             program.append(reduce_instr)
+            if tr_in_table is not None:
+                program.append(instructions.integrate_op(in_reg, tr_in_table))
             return instructions.integrate_op(out_delta_reg, trace_table)
 
         elif op == opcodes.OPCODE_INTEGRATE:
@@ -509,8 +526,10 @@ class ProgramCache(object):
 
         extra_regs = 0
         for nid, op in nodes:
-            if op == opcodes.OPCODE_DISTINCT or op == opcodes.OPCODE_REDUCE:
+            if op == opcodes.OPCODE_DISTINCT:
                 extra_regs += 1
+            elif op == opcodes.OPCODE_REDUCE:
+                extra_regs += 2  # out_delta + auto trace_in
             elif op == opcodes.OPCODE_SCAN_TRACE:
                 table_id = sources.get(nid, 0)
                 if table_id > 0 and nid not in trace_side_sources:
@@ -578,8 +597,10 @@ class ProgramCache(object):
                 post_extra_regs = 0
                 for pnid in post_ordered:
                     pop = opcode_of[pnid]
-                    if pop == opcodes.OPCODE_DISTINCT or pop == opcodes.OPCODE_REDUCE:
+                    if pop == opcodes.OPCODE_DISTINCT:
                         post_extra_regs += 1
+                    elif pop == opcodes.OPCODE_REDUCE:
+                        post_extra_regs += 2  # out_delta + auto trace_in
                     elif pop == opcodes.OPCODE_SCAN_TRACE:
                         ptid = sources.get(pnid, 0)
                         if ptid > 0 and pnid not in trace_side_sources:
