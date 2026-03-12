@@ -41,6 +41,7 @@ def op_filter(in_batch, out_writer, func):
                 range_start = -1
     if range_start >= 0:
         out_writer.append_batch(in_batch, range_start, n)
+    out_writer.mark_sorted(in_batch._sorted)
 
 
 @jit.unroll_safe
@@ -62,6 +63,7 @@ def op_map(in_batch, out_writer, func, out_schema):
         if func is not None:
             func.evaluate_map(in_acc, builder)
             builder.commit_row(in_batch.get_pk(i), in_batch.get_weight(i))
+    out_writer.mark_sorted(in_batch._sorted)
 
 
 def op_negate(in_batch, out_writer):
@@ -70,6 +72,7 @@ def op_negate(in_batch, out_writer):
     Uses bulk column copy with negated weight write.
     """
     out_writer.append_batch_negated(in_batch)
+    out_writer.mark_sorted(in_batch._sorted)
 
 
 def op_union(batch_a, batch_b, out_writer):
@@ -88,6 +91,7 @@ def op_delay(in_batch, out_writer):
     input register.
     """
     out_writer.append_batch(in_batch)
+    out_writer.mark_sorted(in_batch._sorted)
 
 
 def op_integrate(in_batch, target_table):

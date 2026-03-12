@@ -400,6 +400,9 @@ class ArenaZSetBatch(object):
     def is_sorted(self):
         return self._sorted
 
+    def mark_sorted(self, value):
+        self._sorted = value
+
     def is_empty(self):
         return self._count == 0
 
@@ -985,6 +988,9 @@ class BatchWriter(object):
     def direct_append_row(self, src_batch, src_idx, weight):
         """Single-row direct column copy (no accessor dispatch)."""
         self._batch._direct_append_row(src_batch, src_idx, weight)
+
+    def mark_sorted(self, value):
+        self._batch._sorted = value
 
 
 # ---------------------------------------------------------------------------

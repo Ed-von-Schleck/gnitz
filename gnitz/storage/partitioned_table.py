@@ -124,6 +124,15 @@ class PartitionedTable(ZSetStore):
                 sub_batches[p] = sb
             sb._direct_append_row(batch, i, batch.get_weight(i))
 
+        # Propagate sortedness: subsequences of a sorted sequence are sorted
+        if batch._sorted:
+            p2 = 0
+            while p2 < self.num_partitions:
+                sb = sub_batches[p2]
+                if sb is not None:
+                    sb._sorted = True
+                p2 += 1
+
         # Ingest owned sub-batches, free all sub-batches
         offset = self.part_offset
         for p in range(self.num_partitions):

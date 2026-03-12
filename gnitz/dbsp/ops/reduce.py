@@ -442,3 +442,5 @@ def op_reduce(
             if not agg_func.is_accumulator_zero():
                 reduce_acc.set_context(acc_exemplar, agg_func, r_uint64(0), False)
                 out_writer.append_from_accessor(group_key, r_int64(1), reduce_acc)
+
+        out_writer.mark_sorted(group_by_pk)

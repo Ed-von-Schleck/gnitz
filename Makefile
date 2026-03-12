@@ -44,6 +44,8 @@ ALL_DATA_DIRS := storage_test_data dbsp_test_data zstore_test_data \
                  compile_graph_test_data server_test_data partitioned_table_test_data \
                  master_worker_test_data exchange_test_data
 
+LOG_DIR := .test_logs
+
 .PHONY: all test clean server pytest pytest-only $(RUN_TARGETS)
 
 all: test
@@ -51,21 +53,11 @@ all: test
 # ---------------------------------------------------------------------------
 # Parallel test pipeline
 #
-# `make test` compiles and runs all tests in parallel (up to JOBS).
-# Each run target depends on its binary, so Make pipelines compilation
-# and execution: as soon as a binary is ready, its test starts running
-# while other binaries are still compiling.
+# Each test's compile+run output is captured to .test_logs/<name>.log.
+# On success: prints one PASS line.
+# On failure: prints one FAIL line. Full log is shown in the summary.
 #
-# Cache warming: RPython's gcc_cache is shared and not process-safe.
-# Parallel compilations race on cache directory creation/writes.
-# We compile one test first (serial) to populate the cache, then
-# compile+run the rest in parallel — all subsequent probes are hits.
-#
-# Fail-fast: Make's default -j behaviour stops starting new targets on
-# first failure and waits for in-flight targets to finish.
-#
-# Cleanup: only successful tests clean up their binary and data dir.
-# Failed tests leave artifacts behind for inspection.
+# Cache warming: first test compiles serially to populate gcc_cache.
 # ---------------------------------------------------------------------------
 
 FIRST_TEST := core_comprehensive_test
@@ -73,34 +65,80 @@ REST_RUN_TARGETS := $(filter-out run-$(FIRST_TEST)-c,$(RUN_TARGETS))
 
 test:
 	@$(MAKE) --no-print-directory clean
+	@mkdir -p $(LOG_DIR)
 	@$(MAKE) --no-print-directory run-$(FIRST_TEST)-c
-	@$(MAKE) --no-print-directory -j$(JOBS) $(REST_RUN_TARGETS)
-	@echo ""
-	@echo "========================================"
-	@echo "  ALL TESTS PASSED"
-	@echo "========================================"
+	@$(MAKE) --no-print-directory -j$(JOBS) -k $(REST_RUN_TARGETS); \
+	 EXIT=$$?; \
+	 echo ""; \
+	 echo "========================================"; \
+	 echo "  TEST SUMMARY"; \
+	 echo "========================================"; \
+	 FAILED=0; \
+	 for log in $(LOG_DIR)/*.log; do \
+	   name=$$(basename $$log .log); \
+	   if [ -f "$(LOG_DIR)/$$name.pass" ]; then \
+	     echo "  PASS  $$name"; \
+	   else \
+	     echo "  FAIL  $$name"; \
+	     FAILED=$$((FAILED + 1)); \
+	   fi; \
+	 done; \
+	 echo "========================================"; \
+	 if [ $$FAILED -gt 0 ]; then \
+	   echo ""; \
+	   echo "$$FAILED test(s) FAILED. Logs below:"; \
+	   echo ""; \
+	   for log in $(LOG_DIR)/*.log; do \
+	     name=$$(basename $$log .log); \
+	     if [ ! -f "$(LOG_DIR)/$$name.pass" ]; then \
+	       echo ""; \
+	       echo "vvvvvvvv FULL LOG: $$name vvvvvvvv"; \
+	       cat $$log; \
+	       echo "^^^^^^^^ END LOG: $$name ^^^^^^^^"; \
+	       echo ""; \
+	     fi; \
+	   done; \
+	   exit 1; \
+	 else \
+	   echo "  ALL TESTS PASSED"; \
+	   rm -rf $(LOG_DIR); \
+	 fi
 
-# Compile: produce binary from source
+# Compile: produce binary from source (output captured by run target)
 $(TEST_BINS): %-c: rpython_tests/%.py
-	@echo "======================================== Compiling: $< ========================================"
-	@$(RPYTHON) $(RPYFLAGS) $<
+	@$(RPYTHON) $(RPYFLAGS) $< 2>&1
 
-# Run: execute binary, clean up own artifacts on success only
-$(RUN_TARGETS): run-%-c: %-c
-	@echo "======================================== Running: $* ========================================"
-	@./$<
-	@echo "  PASSED: $<"
-	@rm -f $<
-	@rm -rf $(DATA_DIR_$<)
+# Run: compile + execute, capture ALL output to log file.
+# On success: create .pass marker, clean up binary + data.
+# On failure: leave binary + data for inspection.
+$(RUN_TARGETS): run-%-c: rpython_tests/%.py
+	@mkdir -p $(LOG_DIR)
+	@( \
+	  echo "=== Compiling: $< ===" && \
+	  $(RPYTHON) $(RPYFLAGS) $< && \
+	  echo "=== Running: $*-c ===" && \
+	  ./$*-c && \
+	  echo "=== PASSED: $*-c ===" \
+	) > $(LOG_DIR)/$*-c.log 2>&1 && \
+	( \
+	  touch $(LOG_DIR)/$*-c.pass && \
+	  echo "  PASS  $*-c" && \
+	  rm -f $*-c && \
+	  rm -rf $(DATA_DIR_$*-c) \
+	) || \
+	( \
+	  echo "  FAIL  $*-c (see $(LOG_DIR)/$*-c.log)" \
+	)
 
 # ---------------------------------------------------------------------------
 # Housekeeping
 # ---------------------------------------------------------------------------
 
 clean:
-	@echo "Cleaning all test binaries and data directories..."
+	@echo "Cleaning all test binaries, data directories, and logs..."
 	@rm -f $(TEST_BINS)
 	@rm -rf $(ALL_DATA_DIRS)
+	@rm -rf $(LOG_DIR)
 
 server:
 	$(RPYTHON) $(RPYFLAGS) gnitz/server/main.py

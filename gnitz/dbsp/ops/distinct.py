@@ -72,6 +72,8 @@ def op_distinct(delta_batch, history_table, out_writer):
             if out_w != 0:
                 out_writer.append_from_accessor(key, r_int64(out_w), accessor)
 
+        out_writer.mark_sorted(True)
+
         # Update the history with the consolidated delta before the scope expires.
         # This reflects history_table = I(δ_in)
         history_table.ingest_batch(b)

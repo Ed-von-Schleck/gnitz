@@ -158,6 +158,7 @@ def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schem
                 out_writer.append_from_accessor(key, w_out, composite_acc)
 
             trace_cursor.advance()
+    out_writer.mark_sorted(delta_batch._sorted)
 
 
 def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):
@@ -213,3 +214,4 @@ def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):
                                 out_writer.append_from_accessor(
                                     match_key, w_out, composite_acc
                                 )
+    out_writer.mark_sorted(True)
