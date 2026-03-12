@@ -1689,3 +1689,57 @@ class TestEdgeCases:
         # Push key 1 with weight -2 (net = 0)
         _push_rows_2col(client, tid, ts, [(1, 42, -2)])
         assert 1 not in _scan_pks(client, vid)
+
+
+class TestStringThroughReduce:
+    """Verify STRING columns in join output don't break reduce."""
+
+    def test_join_with_string_trace_then_reduce(self, client, sn):
+        """Join a 2-col delta with a 3-col STRING trace, then reduce.
+
+        This is the exact pattern that was misdiagnosed as a STRING-reduce
+        bug (it was actually a test-ordering bug: data pushed before view).
+        """
+        # Delta: (pk U64, val I64)
+        tid_a, ts_a = _create_table_2col(client, sn, name="t_str_red_a_" + _uid())
+
+        # Trace: (pk U64, val I64, label STRING) — STRING column present
+        tid_b, ts_b = _create_table_3col(client, sn, name="t_str_red_b_" + _uid())
+
+        # Load trace B first (before view creation)
+        _push_rows_3col(client, tid_b, ts_b, [
+            (1, 100, "foo", 1),
+            (2, 200, "bar", 1),
+            (3, 300, "foo", 1),
+        ])
+
+        # Join output: (pk U64, a_val I64, b_val I64, b_label STRING)
+        # Reduce: group by col 2 (b_val), SUM col 1 (a_val)
+        # The STRING at col 3 is in the input but NOT in the output.
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
+
+        def build(cb, vid):
+            inp = cb.input_delta()
+            j = cb.join(inp, tid_b)
+            r = cb.reduce(j, group_by_cols=[2], agg_func_id=2, agg_col_idx=1)
+            cb.sink(r, vid)
+
+        # Create view BEFORE pushing delta data
+        vid = _build_and_create_view(client, sn, "v_str_red", tid_a, build, out_cols)
+
+        # Now push delta
+        _push_rows_2col(client, tid_a, ts_a, [
+            (1, 10, 1),  # matches B pk=1 (b_val=100)
+            (2, 20, 1),  # matches B pk=2 (b_val=200)
+            (3, 30, 1),  # matches B pk=3 (b_val=300)
+        ])
+
+        rows = _scan_to_list(client, vid)
+        assert len(rows) == 3
+        # Groups: b_val=100 → sum=10, b_val=200 → sum=20, b_val=300 → sum=30
+        sums = sorted(r[3] for r in rows)
+        assert sums == [10, 20, 30]

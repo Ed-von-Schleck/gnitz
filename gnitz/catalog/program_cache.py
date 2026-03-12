@@ -220,11 +220,21 @@ class ProgramCache(object):
             cursor.close()
         return result
 
-    def _resolve_primary_input_schema(self, program_id, fallback):
+    def _resolve_primary_input_schema(self, program_id, fallback,
+                                      trace_table_ids=None):
+        """Resolve the schema of the primary input (delta) source for a view.
+
+        trace_table_ids: dict {table_id: True} of tables used as trace-side
+        sources in the circuit graph.  These are skipped so that the primary
+        (delta) dependency is selected, not a secondary (trace) dependency.
+        For self-joins (primary table is also a trace table), falls back to
+        any matching dep.
+        """
         if not self.registry.has_id(sys.DepTab.ID): return fallback
         deps_family = self.registry.get_by_id(sys.DepTab.ID)
         cursor = deps_family.store.create_cursor()
         result = None
+        any_dep_schema = None  # fallback for self-join case
         try:
             while cursor.is_valid():
                 if cursor.weight() <= r_int64(0):
@@ -237,13 +247,22 @@ class ProgramCache(object):
                     dep_view_id = intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID))
                     source_id = dep_table_id if dep_table_id > 0 else dep_view_id
                     if source_id > 0 and self.registry.has_id(source_id):
-                        result = self.registry.get_by_id(source_id).schema
+                        schema = self.registry.get_by_id(source_id).schema
+                        if any_dep_schema is None:
+                            any_dep_schema = schema
+                        if trace_table_ids is not None and source_id in trace_table_ids:
+                            cursor.advance()
+                            continue
+                        result = schema
                         break
                 cursor.advance()
         finally:
             cursor.close()
         if result is not None:
             return result
+        # Self-join: primary source is also a trace table, use any dep
+        if any_dep_schema is not None:
+            return any_dep_schema
         if fallback is not None:
             return fallback
         raise LayoutError("Cannot resolve primary input schema for view %d: "
@@ -451,7 +470,17 @@ class ProgramCache(object):
 
         view_family = self.registry.get_by_id(view_id)
         out_schema = view_family.schema
-        in_schema = self._resolve_primary_input_schema(view_id, out_schema)
+
+        # Collect trace-side table IDs so _resolve_primary_input_schema
+        # skips them and picks the actual primary (delta) source.
+        trace_table_ids = {}
+        for nid in sources:
+            tid = sources[nid]
+            if tid > 0:
+                trace_table_ids[tid] = True
+
+        in_schema = self._resolve_primary_input_schema(
+            view_id, out_schema, trace_table_ids)
 
         # 1. Topological sort
         opcode_of = {}
