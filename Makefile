@@ -146,6 +146,8 @@ server:
 
 pytest: server
 	cd py_client && uv run pytest tests/ -v
+	cd py_client && GNITZ_WORKERS=4 uv run pytest tests/ -v
 
 pytest-only:
 	cd py_client && uv run pytest tests/ -v
+	cd py_client && GNITZ_WORKERS=4 uv run pytest tests/ -v

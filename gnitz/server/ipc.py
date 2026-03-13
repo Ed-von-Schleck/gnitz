@@ -754,14 +754,8 @@ def _parse_zset_section(
 
 
 @jit.dont_look_inside
-def receive_payload(sock_fd):
-    """
-    Receives a v2 IPC segment. Self-describing — no registry needed.
-    """
-    fd = ipc_ffi.recv_fd(sock_fd)
-    if fd < 0:
-        raise errors.StorageError("Failed to receive IPC descriptor (Socket closed)")
-
+def _recv_and_parse(fd):
+    """Parse an already-received memfd into an IPCPayload."""
     ptr = lltype.nullptr(rffi.CCHARP.TO)
     total_size = r_uint64(0)
     owned_bufs = newlist_hint(8)
@@ -861,3 +855,25 @@ def receive_payload(sock_fd):
         if fd >= 0:
             os.close(fd)
         raise e
+
+
+@jit.dont_look_inside
+def receive_payload(sock_fd):
+    """
+    Receives a v2 IPC segment. Self-describing — no registry needed.
+    """
+    fd = ipc_ffi.recv_fd(sock_fd)
+    if fd < 0:
+        raise errors.StorageError("Failed to receive IPC descriptor (Socket closed)")
+    return _recv_and_parse(fd)
+
+
+@jit.dont_look_inside
+def try_receive_payload(sock_fd):
+    """Non-blocking receive. Returns None if no message ready (EAGAIN)."""
+    fd = ipc_ffi.recv_fd_nb(sock_fd)
+    if fd == -2:
+        return None
+    if fd < 0:
+        raise errors.StorageError("Failed to receive IPC descriptor (Socket closed)")
+    return _recv_and_parse(fd)

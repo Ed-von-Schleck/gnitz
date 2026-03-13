@@ -4,6 +4,7 @@ Requires a separate server fixture that starts with --workers 4.
 These tests are skipped if the server binary is not found.
 """
 
+import multiprocessing
 import os
 import subprocess
 import tempfile
@@ -318,3 +319,128 @@ def test_workers_multiple_views_same_table(wclient):
     rows2 = _scan_rows(wclient, vid2)
     assert len(rows1) == 2
     assert len(rows2) == 2
+
+
+# -- Concurrent push tests (multi-process) ---------------------------------
+
+
+def _mp_push_worker(sock_path, tid, pk_start, num_rows, barrier):
+    """Child process: connect, barrier-sync, push rows to a U64/I64 table."""
+    from gnitz_client import GnitzClient, ColumnDef, TypeCode
+    from gnitz_client.batch import ZSetBatch
+    from gnitz_client.types import Schema
+
+    columns = [ColumnDef("pk", TypeCode.U64), ColumnDef("value", TypeCode.I64)]
+    tbl_schema = Schema(columns=columns, pk_index=0)
+    pks = list(range(pk_start, pk_start + num_rows))
+    vals = [pk * 10 for pk in pks]
+
+    client = GnitzClient(sock_path)
+    try:
+        batch = ZSetBatch(
+            schema=tbl_schema,
+            pk_lo=pks,
+            pk_hi=[0] * num_rows,
+            weights=[1] * num_rows,
+            nulls=[0] * num_rows,
+            columns=[[], vals],
+        )
+        barrier.wait(timeout=10)
+        client.push(tid, tbl_schema, batch)
+    finally:
+        client.close()
+
+
+def test_workers_concurrent_push_same_table(worker_server):
+    """Multiple processes push to the same table simultaneously.
+
+    Exercises the batch merge path in _flush_pending_pushes: with 8 processes
+    barrier-synced, several pushes land in the same poll cycle and get merged
+    into one fan_out_push call per target.
+    """
+    client = GnitzClient(worker_server)
+    try:
+        tid, _ = _make_table(client)
+
+        num_procs = 8
+        rows_per_proc = 50
+        total_rows = num_procs * rows_per_proc
+        barrier = multiprocessing.Barrier(num_procs)
+
+        procs = []
+        for i in range(num_procs):
+            pk_start = i * rows_per_proc + 1
+            p = multiprocessing.Process(
+                target=_mp_push_worker,
+                args=(worker_server, tid, pk_start, rows_per_proc, barrier),
+            )
+            procs.append(p)
+
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=30)
+            assert p.exitcode == 0, f"child exited with {p.exitcode}"
+
+        schema, result = client.scan(tid)
+        assert len(result.pk_lo) == total_rows
+        assert sorted(result.pk_lo) == list(range(1, total_rows + 1))
+
+        got_vals = {
+            result.pk_lo[i]: result.columns[1][i]
+            for i in range(len(result.pk_lo))
+        }
+        for pk in range(1, total_rows + 1):
+            assert got_vals[pk] == pk * 10
+    finally:
+        client.close()
+
+
+def test_workers_concurrent_push_multi_table(worker_server):
+    """Processes push to different tables simultaneously.
+
+    Exercises the sort-by-target-id grouping in _flush_pending_pushes:
+    pushes to 4 tables from 12 processes get sorted, merged per-target,
+    and fanned out in 4 calls instead of 12.
+    """
+    client = GnitzClient(worker_server)
+    try:
+        num_tables = 4
+        procs_per_table = 3
+        rows_per_proc = 30
+        total_procs = num_tables * procs_per_table
+
+        table_ids = []
+        for _ in range(num_tables):
+            tid, _ = _make_table(client)
+            table_ids.append(tid)
+
+        barrier = multiprocessing.Barrier(total_procs)
+
+        procs = []
+        for t_idx, tid in enumerate(table_ids):
+            for p_idx in range(procs_per_table):
+                pk_start = p_idx * rows_per_proc + 1
+                p = multiprocessing.Process(
+                    target=_mp_push_worker,
+                    args=(worker_server, tid, pk_start, rows_per_proc, barrier),
+                )
+                procs.append(p)
+
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=30)
+            assert p.exitcode == 0, f"child exited with {p.exitcode}"
+
+        expected_per_table = procs_per_table * rows_per_proc
+        for tid in table_ids:
+            schema, result = client.scan(tid)
+            assert len(result.pk_lo) == expected_per_table
+            expected_pks = set()
+            for p_idx in range(procs_per_table):
+                pk_start = p_idx * rows_per_proc + 1
+                expected_pks.update(range(pk_start, pk_start + rows_per_proc))
+            assert set(result.pk_lo) == expected_pks
+    finally:
+        client.close()

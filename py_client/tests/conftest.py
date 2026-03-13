@@ -52,6 +52,13 @@ def server():
 
     yield sock_path
 
+    # Check if server died early
+    early_exit = proc.poll()
+    if early_exit is not None:
+        stdout, stderr = proc.communicate()
+        print(f"\n[server died early with code {early_exit}]")
+        print(f"[stdout]\n{stdout.decode(errors='replace')}")
+        print(f"[stderr]\n{stderr.decode(errors='replace')}")
     proc.kill()
     proc.wait()
     shutil.rmtree(tmpdir, ignore_errors=True)

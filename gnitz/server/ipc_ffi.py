@@ -132,6 +132,59 @@ int gnitz_ipc_recv_fd(int sock_fd) {
     return received_fd;
 }
 
+int gnitz_ipc_recv_fd_nb(int sock_fd) {
+    struct msghdr msg = {0};
+    char dummy_data[1];
+    struct iovec io = {
+        .iov_base = dummy_data,
+        .iov_len = 1
+    };
+
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } u;
+
+    memset(u.buf, 0, sizeof(u.buf));
+
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    msg.msg_control = u.buf;
+    msg.msg_controllen = sizeof(u.buf);
+
+    ssize_t n;
+    do {
+        n = recvmsg(sock_fd, &msg, MSG_DONTWAIT);
+    } while (n < 0 && errno == EINTR);
+
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return -2;   /* sentinel: no message ready */
+    if (n <= 0)
+        return -1;   /* connection closed or hard error */
+
+    int received_fd = -1;
+    struct cmsghdr *cmsg;
+
+    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+            int *fd_ptr = (int *) CMSG_DATA(cmsg);
+            int payload_len = cmsg->cmsg_len - CMSG_LEN(0);
+            int num_fds = payload_len / sizeof(int);
+
+            for (int i = 0; i < num_fds; i++) {
+                int fd = fd_ptr[i];
+                if (received_fd == -1 && fd >= 0) {
+                    received_fd = fd;
+                } else if (fd >= 0) {
+                    close(fd);
+                }
+            }
+        }
+    }
+
+    return received_fd;
+}
+
 int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int timeout_ms) {
     if (count <= 0) return 0;
 
@@ -213,6 +266,7 @@ eci = ExternalCompilationInfo(
     pre_include_bits=[
         "int gnitz_ipc_send_fd(int sock_fd, int fd_to_send);",
         "int gnitz_ipc_recv_fd(int sock_fd);",
+        "int gnitz_ipc_recv_fd_nb(int sock_fd);",
         "int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int timeout_ms);",
         "int gnitz_socketpair(int fds_out[2]);",
         "int gnitz_server_create(const char *socket_path);",
@@ -231,6 +285,13 @@ _gnitz_ipc_send_fd = rffi.llexternal(
 
 _gnitz_ipc_recv_fd = rffi.llexternal(
     "gnitz_ipc_recv_fd",
+    [rffi.INT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_gnitz_ipc_recv_fd_nb = rffi.llexternal(
+    "gnitz_ipc_recv_fd_nb",
     [rffi.INT],
     rffi.INT,
     compilation_info=eci,
@@ -258,6 +319,15 @@ def recv_fd(sock_fd):
     Returns the file descriptor, or -1 on failure.
     """
     return int(_gnitz_ipc_recv_fd(rffi.cast(rffi.INT, sock_fd)))
+
+
+def recv_fd_nb(sock_fd):
+    """
+    Non-blocking receive of a file descriptor from a Unix Domain Socket.
+    Returns the file descriptor on success, -2 if no message is ready (EAGAIN),
+    or -1 on connection close / hard error.
+    """
+    return int(_gnitz_ipc_recv_fd_nb(rffi.cast(rffi.INT, sock_fd)))
 
 
 @jit.dont_look_inside

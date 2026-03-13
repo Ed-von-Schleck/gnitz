@@ -24,8 +24,33 @@ def _sort_pending(pending):
             j -= 1
         pending[j + 1] = item
 
+MAX_PENDING_ROWS = 100000
+
 STATUS_OK = 0
 STATUS_ERROR = 1
+
+
+def _sort_pending_by_tid(fds, cids, tids, batches, schemas):
+    """Insertion sort parallel lists by target_id. RPython-safe."""
+    for i in range(1, len(tids)):
+        key_tid = tids[i]
+        key_fd = fds[i]
+        key_cid = cids[i]
+        key_batch = batches[i]
+        key_schema = schemas[i]
+        j = i - 1
+        while j >= 0 and tids[j] > key_tid:
+            tids[j + 1] = tids[j]
+            fds[j + 1] = fds[j]
+            cids[j + 1] = cids[j]
+            batches[j + 1] = batches[j]
+            schemas[j + 1] = schemas[j]
+            j -= 1
+        tids[j + 1] = key_tid
+        fds[j + 1] = key_fd
+        cids[j + 1] = key_cid
+        batches[j + 1] = key_batch
+        schemas[j + 1] = key_schema
 
 
 def evaluate_dag(engine, initial_source_id, initial_delta,
@@ -220,17 +245,36 @@ class ServerExecutor(object):
 
             revents = ipc_ffi.poll(fds, events, 500)
 
+            # Phase 1: Drain all ready FDs
+            pending_fds = newlist_hint(16)
+            pending_cids = newlist_hint(16)
+            pending_tids = newlist_hint(16)
+            pending_batches = newlist_hint(16)
+            pending_schemas = newlist_hint(16)
+            pending_row_count = 0
+
+            # Pass 1: cleanup disconnected clients before accepting new ones.
+            # Without this, if a client disconnects and a new client connects
+            # in the same poll() call, server_fd is processed first (new fd
+            # accepted), then the old POLLHUP fires _cleanup_client on the
+            # same fd number, killing the newly accepted connection.
             for i in range(len(fds)):
                 fd = fds[i]
                 rev = revents[i]
                 if rev == 0:
                     continue
-
                 if rev & (ipc_ffi.POLLERR | ipc_ffi.POLLHUP | ipc_ffi.POLLNVAL):
                     if fd != server_fd:
                         self._cleanup_client(fd)
-                    continue
 
+            # Pass 2: accept new connections and drain existing clients.
+            for i in range(len(fds)):
+                fd = fds[i]
+                rev = revents[i]
+                if rev == 0:
+                    continue
+                if rev & (ipc_ffi.POLLERR | ipc_ffi.POLLHUP | ipc_ffi.POLLNVAL):
+                    continue  # Already handled in pass 1
                 if rev & ipc_ffi.POLLIN:
                     if fd == server_fd:
                         while True:
@@ -240,7 +284,35 @@ class ServerExecutor(object):
                             self.active_fds.append(c_fd)
                             self.client_fds[c_fd] = 1
                     else:
-                        self._handle_client_data(fd)
+                        while True:
+                            rows = self._drain_client(
+                                fd, pending_fds, pending_cids,
+                                pending_tids, pending_batches,
+                                pending_schemas,
+                            )
+                            if rows < 0:
+                                break
+                            pending_row_count += rows
+                            if pending_row_count >= MAX_PENDING_ROWS:
+                                self._flush_pending_pushes(
+                                    pending_fds, pending_cids,
+                                    pending_tids, pending_batches,
+                                    pending_schemas,
+                                )
+                                pending_fds = newlist_hint(16)
+                                pending_cids = newlist_hint(16)
+                                pending_tids = newlist_hint(16)
+                                pending_batches = newlist_hint(16)
+                                pending_schemas = newlist_hint(16)
+                                pending_row_count = 0
+
+            # Phase 2: Flush remaining buffered pushes
+            if len(pending_fds) > 0:
+                self._flush_pending_pushes(
+                    pending_fds, pending_cids,
+                    pending_tids, pending_batches,
+                    pending_schemas,
+                )
 
     # -- Unified Protocol ---------------------------------------------------
 
@@ -297,25 +369,34 @@ class ServerExecutor(object):
 
     # -- Socket Layer (delegates to handle_push) ---------------------------
 
-    def _handle_client_data(self, fd):
+    def _drain_client(self, fd, p_fds, p_cids, p_tids, p_batches, p_schemas):
+        """Receive one IPC message. Buffer multi-worker user-table pushes;
+        process everything else inline. Returns rows buffered, or -1 (EAGAIN)."""
         payload = None
+        rows_buffered = 0
         try:
-            payload = ipc.receive_payload(fd)
+            payload = ipc.try_receive_payload(fd)
+            if payload is None:
+                return -1  # EAGAIN — no message ready on this FD
             client_id = intmask(payload.client_id)
             target_id = intmask(payload.target_id)
 
-            # ID allocation — returns immediately with new ID, no push/scan
+            # ID allocation — immediate response
             if target_id == 0:
                 if payload.flags & ipc.FLAG_ALLOCATE_TABLE_ID:
                     new_id = self.engine.registry.allocate_table_id()
-                    self.engine._advance_sequence(sys.SEQ_ID_TABLES, new_id - 1, new_id)
+                    self.engine._advance_sequence(
+                        sys.SEQ_ID_TABLES, new_id - 1, new_id
+                    )
                     ipc.send_batch(fd, new_id, None, STATUS_OK, "", client_id)
-                    return
+                    return 0
                 if payload.flags & ipc.FLAG_ALLOCATE_SCHEMA_ID:
                     new_id = self.engine.registry.allocate_schema_id()
-                    self.engine._advance_sequence(sys.SEQ_ID_SCHEMAS, new_id - 1, new_id)
+                    self.engine._advance_sequence(
+                        sys.SEQ_ID_SCHEMAS, new_id - 1, new_id
+                    )
                     ipc.send_batch(fd, new_id, None, STATUS_OK, "", client_id)
-                    return
+                    return 0
 
             if client_id > 0:
                 self.fd_to_client[fd] = client_id
@@ -326,6 +407,27 @@ class ServerExecutor(object):
                 family = self.engine.registry.get_by_id(target_id)
                 _validate_schema_match(payload.schema, family.schema)
 
+            # Bufferable: multi-worker user-table DML with data
+            if (
+                self.dispatcher is not None
+                and target_id >= sys.FIRST_USER_TABLE_ID
+                and payload.batch is not None
+                and payload.batch.length() > 0
+            ):
+                family = self.engine.registry.get_by_id(target_id)
+                validate_fk_distributed(
+                    family, payload.batch, self.dispatcher
+                )
+                cloned = payload.batch.clone()
+                p_fds.append(fd)
+                p_cids.append(client_id)
+                p_tids.append(target_id)
+                p_batches.append(cloned)
+                p_schemas.append(family.schema)
+                rows_buffered = cloned.length()
+                return rows_buffered
+
+            # Non-bufferable: process inline
             result = self.handle_push(target_id, payload.batch)
 
             # Broadcast system-table deltas to workers for DDL sync
@@ -358,13 +460,66 @@ class ServerExecutor(object):
             err_msg = ge.msg
             tid = intmask(payload.target_id) if payload else 0
             cid = intmask(payload.client_id) if payload else 0
-            ipc.send_error(fd, err_msg, target_id=tid, client_id=cid)
+            try:
+                ipc.send_error(fd, err_msg, target_id=tid, client_id=cid)
+            except errors.GnitzError:
+                # Socket disconnected while sending error — clean up and stop
+                # draining this fd.
+                self._cleanup_client(fd)
+                return -1
         except Exception as e:
             os.write(2, "MASTER EXCEPTION: " + str(e) + "\n")
             self._cleanup_client(fd)
+            return -1
         finally:
             if payload is not None:
                 payload.close()
+        return rows_buffered
+
+    def _flush_pending_pushes(self, p_fds, p_cids, p_tids, p_batches,
+                              p_schemas):
+        """Merge same-target pushes and fan out once per target."""
+        n = len(p_fds)
+        if n == 0:
+            return
+
+        _sort_pending_by_tid(p_fds, p_cids, p_tids, p_batches, p_schemas)
+
+        run_start = 0
+        while run_start < n:
+            target_id = p_tids[run_start]
+            schema = p_schemas[run_start]
+            merged = p_batches[run_start]
+            run_end = run_start + 1
+            while run_end < n and p_tids[run_end] == target_id:
+                merged.append_batch(p_batches[run_end])
+                p_batches[run_end].free()
+                run_end += 1
+
+            err_msg = ""
+            try:
+                self.dispatcher.fan_out_push(target_id, merged, schema)
+            except errors.GnitzError as ge:
+                err_msg = ge.msg
+
+            merged.free()
+
+            for k in range(run_start, run_end):
+                try:
+                    if len(err_msg) > 0:
+                        ipc.send_error(
+                            p_fds[k], err_msg,
+                            target_id=target_id, client_id=p_cids[k],
+                        )
+                    else:
+                        ipc.send_batch(
+                            p_fds[k], target_id, None, STATUS_OK, "",
+                            p_cids[k], schema=schema,
+                        )
+                except Exception:
+                    self._cleanup_client(p_fds[k])
+
+            run_start = run_end
 
     def _evaluate_dag(self, initial_source_id, initial_delta):
         evaluate_dag(self.engine, initial_source_id, initial_delta)
