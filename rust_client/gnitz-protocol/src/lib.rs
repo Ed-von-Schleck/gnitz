@@ -5,6 +5,8 @@ pub mod error;
 pub mod types;
 pub mod header;
 pub mod codec;
+pub mod transport;
+pub mod message;
 
 pub use error::ProtocolError;
 pub use types::{TypeCode, ColumnDef, Schema, ColData, ZSetBatch, meta_schema};
@@ -17,3 +19,5 @@ pub use header::{
 };
 pub use codec::{align_up, Layout, layout, encode_zset, decode_zset,
                 schema_to_batch, batch_to_schema};
+pub use transport::{connect, send_memfd, recv_memfd, close_fd};
+pub use message::{Message, send_message, recv_message};
