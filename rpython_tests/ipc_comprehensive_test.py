@@ -401,6 +401,68 @@ def test_v2_null_strings():
         s2.close()
 
 
+def test_v2_multi_string_column_roundtrip():
+    """Verifies IPC roundtrip with two string columns sharing a blob arena.
+
+    Exercises the shared_blob_buf path: per-entry blob offsets must be global
+    (relative to the single blob area start), not per-column-relative.
+    """
+    os.write(1, "[IPC] Testing V2 Multi-String Column Roundtrip...\n")
+
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_STRING, name="name"),
+        types.ColumnDefinition(types.TYPE_STRING, name="description"),
+    ]
+    schema = types.TableSchema(cols, 0)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+
+    try:
+        zbatch = batch.ArenaZSetBatch(schema, initial_capacity=4)
+        rb = RowBuilder(schema, zbatch)
+
+        # Four rows with varying string lengths in both columns.
+        # Long strings (> 12 chars) exercise the blob allocator.
+        names = ["Alice", "Bob", "Charlie Davidson", "D" * 60]
+        descs = ["Short desc", "X" * 50, "Medium length description", "tiny"]
+
+        for i in range(4):
+            rb.begin(r_uint128(r_uint64(i + 1)), r_int64(1))
+            rb.put_string(names[i])
+            rb.put_string(descs[i])
+            rb.commit()
+
+        ipc.send_batch(s1.fd, 77, zbatch, status=0)
+
+        payload = ipc.receive_payload(s2.fd)
+        assert_equal_i(0, payload.status, "Status mismatch")
+        assert_true(payload.batch is not None, "Batch should be present")
+        assert_equal_i(4, payload.batch.length(), "Row count mismatch")
+
+        for i in range(4):
+            acc = payload.batch.get_accessor(i)
+
+            length, prefix, sptr, hptr, py_s = acc.get_str_struct(1)
+            got_name = string_logic.resolve_string(sptr, hptr, py_s)
+            assert_true(
+                got_name == names[i],
+                "name mismatch row %d: '%s' != '%s'" % (i, got_name, names[i]),
+            )
+
+            length, prefix, sptr, hptr, py_s = acc.get_str_struct(2)
+            got_desc = string_logic.resolve_string(sptr, hptr, py_s)
+            assert_true(
+                got_desc == descs[i],
+                "desc mismatch row %d: '%s' != '%s'" % (i, got_desc, descs[i]),
+            )
+
+        payload.close()
+        zbatch.free()
+    finally:
+        s1.close()
+        s2.close()
+
+
 def test_v2_schema_mismatch():
     """Verifies that schema validation rejects mismatched schemas."""
     os.write(1, "[IPC] Testing V2 Schema Mismatch Detection...\n")
@@ -443,6 +505,7 @@ def entry_point(argv):
         test_v2_scan_request()
         test_v2_ipc_string_encoding()
         test_v2_null_strings()
+        test_v2_multi_string_column_roundtrip()
         test_v2_schema_mismatch()
         os.write(1, "\nALL IPC TRANSPORT TESTS PASSED\n")
     except Exception:

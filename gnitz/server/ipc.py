@@ -874,6 +874,8 @@ def try_receive_payload(sock_fd):
     fd = ipc_ffi.recv_fd_nb(sock_fd)
     if fd == -2:
         return None
+    if fd == -1:
+        raise errors.ClientDisconnectedError("Client disconnected")
     if fd < 0:
-        raise errors.StorageError("Failed to receive IPC descriptor (Socket closed)")
+        raise errors.StorageError("Message received without file descriptor")
     return _recv_and_parse(fd)

@@ -31,3 +31,12 @@ class LayoutError(StorageError):
 class MemTableFullError(StorageError):
     """Raised when MemTable arena is exhausted."""
     pass
+
+
+class ClientDisconnectedError(GnitzError):
+    """Raised when the client peer has closed the socket (EOF on receive or
+    EPIPE on send from the client-facing path). Not raised for worker↔master
+    calls."""
+
+    def __init__(self, msg=""):
+        GnitzError.__init__(self, msg)

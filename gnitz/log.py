@@ -2,8 +2,8 @@
 #
 # Structured logging for GnitzDB.
 #
-# Three levels: QUIET (default), NORMAL, VERBOSE.
-# error/warn always emit; info requires NORMAL; debug requires VERBOSE.
+# Three levels: QUIET (default), NORMAL, DEBUG.
+# error/warn always emit; info requires NORMAL; debug requires DEBUG.
 # All output goes to stderr. Timestamps are epoch seconds + milliseconds.
 
 import os
@@ -11,7 +11,8 @@ import time
 
 QUIET = 0
 NORMAL = 1
-VERBOSE = 2
+DEBUG = 2
+VERBOSE = DEBUG  # backward-compat alias
 
 
 class _LogState(object):
@@ -31,8 +32,8 @@ def parse_level(s):
         return QUIET
     elif s == "normal":
         return NORMAL
-    elif s == "verbose":
-        return VERBOSE
+    elif s == "debug" or s == "verbose":
+        return DEBUG
     os.write(2, "Unknown log level '" + s + "', defaulting to quiet\n")
     return QUIET
 

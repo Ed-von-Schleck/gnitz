@@ -84,6 +84,7 @@
 * Prefer module-level functions to staticmethods.
 * This is a database. The best reaction to any unexpected error is usually to fail, and to fail as loudly as possible.
 
+
 # Appendix C: Columnar (SoA) Architecture Guide
 
 ## The Unified Columnar Design

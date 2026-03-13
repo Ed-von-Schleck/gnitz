@@ -222,23 +222,20 @@ class MasterDispatcher(object):
         """Check PK existence across workers. Returns True if any key is missing."""
         sub_batches = self._split_batch_by_pk(check_batch, schema)
 
-        # Send HAS_PK requests only to workers that have keys to check
-        sent = [False] * self.num_workers
+        # Send to ALL workers (even empty sub-batches) so the request/response
+        # pattern is always symmetric and cannot deadlock.
         for w in range(self.num_workers):
             sb = sub_batches[w]
-            if sb is not None and sb.length() > 0:
-                ipc.send_batch(
-                    self.worker_fds[w], target_id, sb, schema=schema,
-                    flags=ipc.FLAG_HAS_PK,
-                )
-                sent[w] = True
+            ipc.send_batch(
+                self.worker_fds[w], target_id, sb, schema=schema,
+                flags=ipc.FLAG_HAS_PK,
+            )
+            if sb is not None:
                 sb.free()
 
-        # Collect responses, check for missing keys
+        # Collect responses from ALL workers.
         any_missing = False
         for w in range(self.num_workers):
-            if not sent[w]:
-                continue
             payload = ipc.receive_payload(self.worker_fds[w])
             if payload.status != 0:
                 err = payload.error_msg

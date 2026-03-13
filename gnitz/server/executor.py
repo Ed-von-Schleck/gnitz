@@ -228,9 +228,16 @@ class ServerExecutor(object):
             if self.dispatcher is not None:
                 crashed = self.dispatcher.check_workers()
                 if crashed >= 0:
+                    log_path = (
+                        self.engine.base_dir
+                        + "/worker_"
+                        + str(crashed)
+                        + ".log"
+                    )
                     os.write(
                         2,
-                        "Worker %d crashed, shutting down\n" % crashed,
+                        "Worker %d crashed (log: %s), shutting down\n"
+                        % (crashed, log_path),
                     )
                     self.dispatcher.shutdown_workers()
                     return
@@ -456,6 +463,10 @@ class ServerExecutor(object):
             if result is not None:
                 result.free()
 
+        except errors.ClientDisconnectedError:
+            # Peer closed before or during message read — normal, no response needed.
+            self._cleanup_client(fd)
+            return -1
         except errors.GnitzError as ge:
             err_msg = ge.msg
             tid = intmask(payload.target_id) if payload else 0

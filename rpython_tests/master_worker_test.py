@@ -12,6 +12,7 @@ from rpython.rlib.rarithmetic import (
     intmask,
 )
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi
 
 from gnitz.core import types
 from gnitz.core.batch import RowBuilder, ArenaZSetBatch, ZSetBatch
@@ -23,6 +24,7 @@ from gnitz.storage.partitioned_table import (
     NUM_PARTITIONS,
 )
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID
+from gnitz.dbsp.ops.exchange import hash_row_by_columns, _mix64
 
 
 # -- Helpers -------------------------------------------------------------------
@@ -390,6 +392,193 @@ def test_multi_worker_integration(base_dir):
     log("  PASSED")
 
 
+def make_u64_u64_schema():
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_U64, name="group_key"),
+    ]
+    return types.TableSchema(cols, 0)
+
+
+def test_exchange_routing_contract():
+    """Verify exchange.hash_row_by_columns agrees with _partition_for_key on
+    the same inputs, for both the single-U64 fast path and the general
+    Murmur3 path."""
+    log("test_exchange_routing_contract")
+
+    # --- Single U64 group-by column (fast path) ---
+    # exchange: _partition_for_key(val, 0)
+    # reduce:   PK = r_uint128(val) → lo=val, hi=0 → _partition_for_key(val, 0)
+    u64_schema = make_u64_u64_schema()
+    u64_batch = ArenaZSetBatch(u64_schema)
+    rb = RowBuilder(u64_schema, u64_batch)
+    for i in range(256):
+        v = r_uint64(i * 997 + 1)
+        rb.begin(r_uint128(r_uint64(i + 1)), r_int64(1))
+        rb.put_int(rffi.cast(rffi.LONGLONG, v))
+        rb.commit()
+
+    for i in range(256):
+        val = r_uint64(u64_batch._read_col_int(i, 1))
+        expected = _partition_for_key(val, r_uint64(0))
+        got = hash_row_by_columns(u64_batch, i, [1])
+        assert_equal_i(
+            expected, got,
+            "single-U64 routing mismatch at row %d" % i,
+        )
+
+    u64_batch.free()
+
+    # --- Multi-column (I64 + I64) general Murmur3 path ---
+    # Build a 3-col schema: pk U64, a I64, b I64
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_I64, name="a"),
+        types.ColumnDefinition(types.TYPE_I64, name="b"),
+    ]
+    mc_schema = types.TableSchema(cols, 0)
+    mc_batch = ArenaZSetBatch(mc_schema)
+    rb2 = RowBuilder(mc_schema, mc_batch)
+    for i in range(64):
+        rb2.begin(r_uint128(r_uint64(i + 1)), r_int64(1))
+        rb2.put_int(r_int64(i * 31 + 7))
+        rb2.put_int(r_int64(i * 97 - 3))
+        rb2.commit()
+
+    col_indices = [1, 2]
+    for i in range(64):
+        # Replicate the general Murmur3 formula to compute expected partition.
+        h = r_uint64(0x9E3779B97F4A7C15)
+        for j in range(len(col_indices)):
+            col_hash = _mix64(mc_batch._read_col_int(i, col_indices[j]))
+            h = _mix64(h ^ col_hash ^ r_uint64(j))
+        h_hi = _mix64(h ^ r_uint64(len(col_indices)))
+        expected = _partition_for_key(h, h_hi)
+        got = hash_row_by_columns(mc_batch, i, col_indices)
+        assert_equal_i(
+            expected, got,
+            "multi-col routing mismatch at row %d" % i,
+        )
+
+    mc_batch.free()
+    log("  PASSED")
+
+
+def test_empty_push_barrier(base_dir):
+    """Fork 4 workers. Push a batch where all rows hash to worker 0.
+    Workers 1-3 receive empty batches but must still ACK (barrier participation).
+    Verify: no deadlock, all rows present in subsequent scan."""
+    log("test_empty_push_barrier (4 workers, rows all on worker 0)")
+    schema = make_u64_i64_schema()
+    num_workers = 4
+    assignment = PartitionAssignment(num_workers)
+
+    # Find 4 pk values that hash to worker 0 (partitions 0-63).
+    pk_vals = newlist_hint(4)
+    candidate = r_uint64(1)
+    while len(pk_vals) < 4:
+        p = _partition_for_key(candidate, r_uint64(0))
+        w = assignment.worker_for_partition(p)
+        if w == 0:
+            pk_vals.append(candidate)
+        candidate = candidate + r_uint64(1)
+
+    # Create socketpairs
+    pairs = newlist_hint(num_workers)
+    for w in range(num_workers):
+        p_fd, c_fd = ipc_ffi.create_socketpair()
+        pairs.append((p_fd, c_fd))
+
+    pids = newlist_hint(num_workers)
+    for w in range(num_workers):
+        pid = os.fork()
+        if pid == 0:
+            for j in range(len(pairs)):
+                os.close(pairs[j][0])
+            for j in range(len(pairs)):
+                if j != w:
+                    os.close(pairs[j][1])
+            my_fd = pairs[w][1]
+
+            # Receive push (may be empty), ACK
+            payload = ipc.receive_payload(my_fd)
+            if payload.batch is not None and payload.batch.length() > 0:
+                stored = payload.batch.clone()
+                payload.close()
+            else:
+                stored = ArenaZSetBatch(schema)
+                payload.close()
+            ipc.send_batch(my_fd, 0, None)
+
+            # Receive scan, respond
+            payload2 = ipc.receive_payload(my_fd)
+            payload2.close()
+            ipc.send_batch(my_fd, 0, stored, schema=schema)
+            stored.free()
+
+            os.close(my_fd)
+            os._exit(0)
+        pids.append(pid)
+
+    # Parent: close child-side fds
+    for w in range(num_workers):
+        os.close(pairs[w][1])
+
+    worker_fds = newlist_hint(num_workers)
+    for w in range(num_workers):
+        worker_fds.append(pairs[w][0])
+
+    # Build batch with all rows targeting worker 0
+    src_batch = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, src_batch)
+    for i in range(len(pk_vals)):
+        rb.begin(r_uint128(pk_vals[i]), r_int64(1))
+        rb.put_int(r_int64(intmask(pk_vals[i]) * 10))
+        rb.commit()
+
+    # Split and send to ALL workers (empty batches to workers 1-3)
+    sub_batches = [None] * num_workers
+    for i in range(src_batch.length()):
+        pk_lo = r_uint64(src_batch._read_pk_lo(i))
+        pk_hi = r_uint64(src_batch._read_pk_hi(i))
+        p = _partition_for_key(pk_lo, pk_hi)
+        w = assignment.worker_for_partition(p)
+        if sub_batches[w] is None:
+            sub_batches[w] = ArenaZSetBatch(schema)
+        sub_batches[w]._direct_append_row(src_batch, i, src_batch.get_weight(i))
+
+    for w in range(num_workers):
+        ipc.send_batch(worker_fds[w], 0, sub_batches[w], schema=schema)
+        if sub_batches[w] is not None:
+            sub_batches[w].free()
+
+    # Collect ACKs from ALL workers — deadlock if any worker doesn't respond
+    for w in range(num_workers):
+        ack = ipc.receive_payload(worker_fds[w])
+        ack.close()
+
+    # Scan all workers, verify all 4 rows present
+    for w in range(num_workers):
+        ipc.send_batch(worker_fds[w], 0, None, schema=schema)
+
+    total = 0
+    for w in range(num_workers):
+        resp = ipc.receive_payload(worker_fds[w])
+        if resp.batch is not None:
+            total += resp.batch.length()
+        resp.close()
+
+    assert_equal_i(4, total, "all 4 rows must be present after empty-push barrier")
+
+    for w in range(num_workers):
+        os.close(worker_fds[w])
+    for w in range(len(pids)):
+        os.waitpid(pids[w], 0)
+
+    src_batch.free()
+    log("  PASSED")
+
+
 # -- Entry Point ---------------------------------------------------------------
 
 
@@ -407,6 +596,8 @@ def entry_point(argv):
         test_fork_ipc_push_round_trip(base_dir)
         test_fork_ipc_scan_round_trip(base_dir)
         test_multi_worker_integration(base_dir)
+        test_exchange_routing_contract()
+        test_empty_push_barrier(base_dir)
         os.write(1, "\nALL MASTER/WORKER TESTS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

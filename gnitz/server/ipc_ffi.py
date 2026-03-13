@@ -182,7 +182,9 @@ int gnitz_ipc_recv_fd_nb(int sock_fd) {
         }
     }
 
-    return received_fd;
+    /* Message was received but carried no SCM_RIGHTS fd — malformed protocol
+       frame, not a disconnect.  Caller should send an error response. */
+    return (received_fd == -1) ? -3 : received_fd;
 }
 
 int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int timeout_ms) {
@@ -325,7 +327,8 @@ def recv_fd_nb(sock_fd):
     """
     Non-blocking receive of a file descriptor from a Unix Domain Socket.
     Returns the file descriptor on success, -2 if no message is ready (EAGAIN),
-    or -1 on connection close / hard error.
+    -1 on connection close / hard error, or -3 if a message arrived but
+    contained no SCM_RIGHTS fd (malformed frame).
     """
     return int(_gnitz_ipc_recv_fd_nb(rffi.cast(rffi.INT, sock_fd)))
 
