@@ -486,9 +486,9 @@ class ProgramCache(object):
                     tr_in_table.create_cursor(), tr_in_table
                 )
                 cur_reg_file.registers[tr_in_reg_id] = tr_in_reg
-            # Build a secondary group index if the group column is a ≤64-bit int
-            # (not U128/STRING/FLOAT) and there is exactly one group column.
-            # This turns O(N) trace scans into O(log N + k) range lookups.
+            # Build a secondary group index for O(log N + k) group lookup.
+            # Enabled only when: exactly one group column AND its type is a ≤64-bit int
+            # (not U128/STRING/FLOAT). All other cases fall back to O(N) full trace scan.
             grp_idx = None
             if tr_in_table is not None and len(gcols) == 1:
                 gc_col_idx = gcols[0]
@@ -560,6 +560,10 @@ class ProgramCache(object):
             trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
             key_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
             return instructions.seek_trace_op(trace_reg, key_reg)
+
+        elif op == opcodes.OPCODE_CLEAR_DELTAS:
+            # No register assignment — CLEAR_DELTAS resets all delta registers globally.
+            return instructions.clear_deltas_op()
 
         return None
 

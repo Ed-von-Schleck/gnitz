@@ -18,31 +18,12 @@ from gnitz.core.keys import promote_to_index_key
 from gnitz.core.batch import ZSetBatch
 
 
-def _find_seen(lo_list, hi_list, pk_lo, pk_hi):
-    """Linear scan of seen-PK lists. Returns index, or -1 if not found."""
-    for i in range(len(lo_list)):
-        if lo_list[i] == pk_lo and hi_list[i] == pk_hi:
-            return i
-    return -1
-
-
 def _retract_from_out(out, schema, src_idx):
     """Copy out[src_idx] into a temp batch with w=-1, then append to out."""
     tmp = ZSetBatch(schema)
     tmp._direct_append_row(out, src_idx, r_int64(-1))
     out.append_batch(tmp, 0, tmp.length())
     tmp.free()
-
-
-def _remove_seen(lo_list, hi_list, idx_list, i):
-    """RPython-safe removal: overwrite slot i with last element, then shrink."""
-    last = len(lo_list) - 1
-    lo_list[i] = lo_list[last]
-    hi_list[i] = hi_list[last]
-    idx_list[i] = idx_list[last]
-    del lo_list[last]
-    del hi_list[last]
-    del idx_list[last]
 
 
 def _enforce_unique_pk(family, batch):
@@ -58,36 +39,44 @@ def _enforce_unique_pk(family, batch):
     schema = family.schema
     n = batch.length()
     out = ZSetBatch(schema)
-    seen_lo = []    # r_uint64: lower 64 bits of seen PKs
-    seen_hi = []    # r_uint64: upper 64 bits of seen PKs
-    seen_out_idx = []   # int: index in out of the last +w row for this PK
+    seen_dict = {}   # {int: {int: int}}  intmask(pk_lo) -> {intmask(pk_hi) -> out_idx}
 
     for i in range(n):
         pk_lo = r_uint64(batch._read_pk_lo(i))
         pk_hi = r_uint64(batch._read_pk_hi(i))
         weight = batch.get_weight(i)
+        lo_key = intmask(pk_lo)
+        hi_key = intmask(pk_hi)
 
         if weight > r_int64(0):
-            intra_idx = _find_seen(seen_lo, seen_hi, pk_lo, pk_hi)
-            if intra_idx >= 0:
+            intra_out_idx = -1
+            if lo_key in seen_dict:
+                inner = seen_dict[lo_key]
+                if hi_key in inner:
+                    intra_out_idx = inner[hi_key]
+            if intra_out_idx >= 0:
                 # Cancel the previous in-batch insertion for this PK
-                _retract_from_out(out, schema, seen_out_idx[intra_idx])
-                seen_out_idx[intra_idx] = out.length()
+                _retract_from_out(out, schema, intra_out_idx)
+                seen_dict[lo_key][hi_key] = out.length()
             else:
                 # Retract any existing stored row for this PK
                 pk128 = (r_uint128(pk_hi) << 64) | r_uint128(pk_lo)
                 store.retract_pk(pk128, out)
-                seen_lo.append(pk_lo)
-                seen_hi.append(pk_hi)
-                seen_out_idx.append(out.length())
+                if lo_key not in seen_dict:
+                    seen_dict[lo_key] = {}
+                seen_dict[lo_key][hi_key] = out.length()
             out._direct_append_row(batch, i, weight)
 
         elif weight < r_int64(0):
-            intra_idx = _find_seen(seen_lo, seen_hi, pk_lo, pk_hi)
-            if intra_idx >= 0:
+            intra_out_idx = -1
+            if lo_key in seen_dict:
+                inner = seen_dict[lo_key]
+                if hi_key in inner:
+                    intra_out_idx = inner[hi_key]
+            if intra_out_idx >= 0:
                 # Cancel the pending in-batch insert (no net change)
-                _retract_from_out(out, schema, seen_out_idx[intra_idx])
-                _remove_seen(seen_lo, seen_hi, seen_out_idx, intra_idx)
+                _retract_from_out(out, schema, intra_out_idx)
+                del seen_dict[lo_key][hi_key]
             else:
                 # Delete from storage by PK (ignore incoming payload)
                 pk128 = (r_uint128(pk_hi) << 64) | r_uint128(pk_lo)
@@ -126,6 +115,9 @@ def _build_pk_check_batch(schema, lo_list, hi_list):
         batch.pk_lo_buf.put_u64(lo_list[k])
         batch.pk_hi_buf.put_u64(hi_list[k])
         batch.weight_buf.put_i64(r_int64(1))
+        # Payload columns are intentionally null-masked. This batch is PK-only:
+        # only pk_lo_buf / pk_hi_buf matter for has_pk() checks. All null bits are
+        # set so that accidental column reads return NULL instead of garbage bytes.
         batch.null_buf.put_u64(r_uint64(0xFFFFFFFFFFFFFFFF))
         for ci in range(num_cols):
             if ci == schema.pk_index:
@@ -164,6 +156,7 @@ def validate_fk_distributed(family, batch, dispatcher):
         # Collect unique FK values as (lo, hi) pairs — avoid r_uint128 lists
         seen_lo = []
         seen_hi = []
+        seen_dict = {}   # {int: {int: int}}  dedup sentinel
 
         for i in range(n_records):
             if batch.get_weight(i) <= r_int64(0):
@@ -178,8 +171,13 @@ def validate_fk_distributed(family, batch, dispatcher):
             fk_lo = r_uint64(intmask(fk_key))
             fk_hi = r_uint64(intmask(fk_key >> 64))
 
-            # Dedup
-            if _find_seen(seen_lo, seen_hi, fk_lo, fk_hi) < 0:
+            # Dedup via O(1) dict lookup
+            lo_key = intmask(fk_lo)
+            hi_key = intmask(fk_hi)
+            if lo_key not in seen_dict or hi_key not in seen_dict[lo_key]:
+                if lo_key not in seen_dict:
+                    seen_dict[lo_key] = {}
+                seen_dict[lo_key][hi_key] = 1
                 seen_lo.append(fk_lo)
                 seen_hi.append(fk_hi)
 

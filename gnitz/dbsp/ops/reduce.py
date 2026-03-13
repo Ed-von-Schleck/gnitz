@@ -463,7 +463,11 @@ def op_reduce(
                                 gi_cursor.advance()
                             gi_cursor.close()
                         else:
-                            # O(N) fallback — scan and filter by group column match.
+                            # O(N) fallback: full trace scan with per-row group-column comparison.
+                            # Occurs when trace_in_group_idx is None — i.e., multi-column group-by
+                            # or a non-integer group type (U128, STRING, FLOAT).
+                            # For single-column ≤64-bit integer group-by the ReduceGroupIndex path
+                            # above provides O(log N + k) lookup.
                             trace_in_cursor.seek(r_uint128(0))
                             while trace_in_cursor.is_valid():
                                 trace_acc = trace_in_cursor.get_accessor()

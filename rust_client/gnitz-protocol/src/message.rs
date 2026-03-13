@@ -9,6 +9,7 @@ pub struct Message {
     pub header:       Header,
     pub schema_batch: Option<ZSetBatch>,
     pub data_batch:   Option<ZSetBatch>,
+    pub error_text:   Option<String>,   // Some(_) when header.status == STATUS_ERROR
 }
 
 pub fn send_message(
@@ -73,12 +74,13 @@ pub fn recv_message(
     let hdr = Header::unpack(&buf)?;
 
     if hdr.status == STATUS_ERROR {
-        let err_start = HEADER_SIZE;
-        let err_end   = (err_start + hdr.err_len as usize).min(buf.len());
-        let err_text  = std::str::from_utf8(&buf[err_start..err_end])
+        let err_end = (HEADER_SIZE + hdr.err_len as usize).min(buf.len());
+        let text = std::str::from_utf8(&buf[HEADER_SIZE..err_end])
             .unwrap_or("<invalid utf8>")
             .to_string();
-        return Err(ProtocolError::DecodeError(err_text));
+        return Ok(Message {
+            header: hdr, schema_batch: None, data_batch: None, error_text: Some(text)
+        });
     }
 
     let body_start = align_up(HEADER_SIZE + hdr.err_len as usize, ALIGNMENT);
@@ -117,7 +119,7 @@ pub fn recv_message(
         None
     };
 
-    Ok(Message { header: hdr, schema_batch, data_batch })
+    Ok(Message { header: hdr, schema_batch, data_batch, error_text: None })
 }
 
 #[cfg(test)]

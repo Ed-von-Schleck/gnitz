@@ -668,6 +668,8 @@ def _parse_zset_section(
     col_bufs = newlist_hint(num_cols)
     col_strides = newlist_hint(num_cols)
     blob_arena_offset = r_uint64(0)  # tracks where blob region starts
+    str_col_indices  = newlist_hint(4)   # int: column index
+    str_col_ptr_offs = newlist_hint(4)   # r_uint64: wire offset saved from first pass
 
     for ci in range(num_cols):
         if ci == schema.pk_index:
@@ -678,7 +680,9 @@ def _parse_zset_section(
             col_wire_sz = count * IPC_STRING_STRIDE
             col_ptr_off = section_base + cur_off
             cur_off = align_up(cur_off + r_uint64(col_wire_sz), ALIGNMENT)
-            # Defer string parsing until we know the blob offset
+            # Save offset for the second pass; defer parsing until blob offset is known
+            str_col_indices.append(ci)
+            str_col_ptr_offs.append(col_ptr_off)
             col_bufs.append(None)  # placeholder
             col_strides.append(types.TYPE_STRING.size)
         else:
@@ -710,36 +714,17 @@ def _parse_zset_section(
         shared_blob_buf = buffer.Buffer(intmask(blob_sz) + 64)
         owned_bufs.append(shared_blob_buf)
 
-    # Now parse string columns (need blob region offset)
-    # Re-walk to find each string column's wire offset
-    str_cur_off = r_uint64(0)
-    # Skip structural buffers
-    str_cur_off = align_up(r_uint64(struct_sz), ALIGNMENT)
-    str_cur_off = align_up(str_cur_off + r_uint64(struct_sz), ALIGNMENT)
-    str_cur_off = align_up(str_cur_off + r_uint64(struct_sz), ALIGNMENT)
-    str_cur_off = align_up(str_cur_off + r_uint64(struct_sz), ALIGNMENT)
-
-    for ci in range(num_cols):
-        if ci == schema.pk_index:
-            continue
-
-        col_type = schema.columns[ci].field_type
-        if col_type.code == types.TYPE_STRING.code:
-            col_wire_sz = count * IPC_STRING_STRIDE
-            col_ptr_off = section_base + str_cur_off
-            str_cur_off = align_up(str_cur_off + r_uint64(col_wire_sz), ALIGNMENT)
-
-            ipc_col_ptr = rffi.ptradd(ptr, intmask(col_ptr_off))
-            ipc_blob_ptr = rffi.ptradd(ptr, intmask(blob_region_off))
-
-            col_buf, str_blob_buf = _read_ipc_strings(
-                ipc_col_ptr, ipc_blob_ptr, blob_sz, count,
-                None, ci, owned_bufs, shared_blob_buf,
-            )
-            col_bufs[ci] = col_buf
-        else:
-            wire_stride = col_type.size
-            str_cur_off = align_up(str_cur_off + r_uint64(wire_stride * count), ALIGNMENT)
+    # Parse string columns using the offsets saved during the first pass
+    for sco_i in range(len(str_col_indices)):
+        ci_val    = str_col_indices[sco_i]
+        saved_off = str_col_ptr_offs[sco_i]
+        ipc_col_ptr  = rffi.ptradd(ptr, intmask(saved_off))
+        ipc_blob_ptr = rffi.ptradd(ptr, intmask(blob_region_off))
+        col_buf, str_blob_buf = _read_ipc_strings(
+            ipc_col_ptr, ipc_blob_ptr, blob_sz, count,
+            None, ci_val, owned_bufs, shared_blob_buf,
+        )
+        col_bufs[ci_val] = col_buf
 
     # Use the shared blob buffer as the batch's blob arena.
     final_blob_buf = buffer.Buffer(0)

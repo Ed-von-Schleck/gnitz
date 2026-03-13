@@ -8,7 +8,7 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uin
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz import log
-from gnitz.server import ipc
+from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch, ZSetBatch
 from gnitz.storage.partitioned_table import _partition_for_key
@@ -105,40 +105,51 @@ class MasterDispatcher(object):
         exchange_schemas = {}   # view_id -> schema
 
         while num_acked < self.num_workers:
+            poll_fds    = newlist_hint(self.num_workers)
+            poll_events = newlist_hint(self.num_workers)
+            poll_wids   = newlist_hint(self.num_workers)
             for w in range(self.num_workers):
-                if acked[w]:
-                    continue
-                payload = ipc.receive_payload(self.worker_fds[w])
-                if payload.flags & ipc.FLAG_EXCHANGE:
-                    vid = intmask(payload.target_id)
-                    if vid not in exchange_buffers:
-                        exchange_buffers[vid] = [None] * self.num_workers
-                        exchange_counts[vid] = 0
-                    if payload.batch is not None and payload.batch.length() > 0:
-                        exchange_buffers[vid][w] = payload.batch.clone()
-                    if payload.schema is not None:
-                        exchange_schemas[vid] = payload.schema
-                    exchange_counts[vid] += 1
-                    payload.close()
+                if not acked[w]:
+                    poll_fds.append(self.worker_fds[w])
+                    poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
+                    poll_wids.append(w)
 
-                    if exchange_counts[vid] == self.num_workers:
-                        ex_schema = exchange_schemas.get(vid, schema)
-                        self._relay_exchange(vid, exchange_buffers[vid], ex_schema)
-                        del exchange_buffers[vid]
-                        del exchange_counts[vid]
-                        if vid in exchange_schemas:
-                            del exchange_schemas[vid]
-                else:
-                    # Normal ACK
-                    if payload.status != 0:
-                        err = payload.error_msg
+            revents = ipc_ffi.poll(poll_fds, poll_events, 10)
+
+            for pi in range(len(poll_fds)):
+                if revents[pi] & (ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP):
+                    w = poll_wids[pi]
+                    payload = ipc.receive_payload(self.worker_fds[w])
+                    if payload.flags & ipc.FLAG_EXCHANGE:
+                        vid = intmask(payload.target_id)
+                        if vid not in exchange_buffers:
+                            exchange_buffers[vid] = [None] * self.num_workers
+                            exchange_counts[vid] = 0
+                        if payload.batch is not None and payload.batch.length() > 0:
+                            exchange_buffers[vid][w] = payload.batch.clone()
+                        if payload.schema is not None:
+                            exchange_schemas[vid] = payload.schema
+                        exchange_counts[vid] += 1
                         payload.close()
-                        raise errors.StorageError(
-                            "Worker %d push error: %s" % (w, err)
-                        )
-                    payload.close()
-                    acked[w] = True
-                    num_acked += 1
+
+                        if exchange_counts[vid] == self.num_workers:
+                            ex_schema = exchange_schemas.get(vid, schema)
+                            self._relay_exchange(vid, exchange_buffers[vid], ex_schema)
+                            del exchange_buffers[vid]
+                            del exchange_counts[vid]
+                            if vid in exchange_schemas:
+                                del exchange_schemas[vid]
+                    else:
+                        # Normal ACK
+                        if payload.status != 0:
+                            err = payload.error_msg
+                            payload.close()
+                            raise errors.StorageError(
+                                "Worker %d push error: %s" % (w, err)
+                            )
+                        payload.close()
+                        acked[w] = True
+                        num_acked += 1
 
         log.debug(
             "fan_out_push tid=" + str(target_id)

@@ -1,0 +1,10 @@
+[package]
+name = "gnitz-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+integration = []
+
+[dependencies]
+gnitz-protocol = { path = "../gnitz-protocol" }
