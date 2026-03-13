@@ -311,8 +311,8 @@ class EphemeralTable(ZSetStore):
 
             source_pk = source_batch.get_pk(i)
             # Alignment-safe u128 assignment (Appendix A §4)
-            payload_accessor.pk_lo = r_uint64(source_pk)
-            payload_accessor.pk_hi = r_uint64(source_pk >> 64)
+            payload_accessor.pk_lo = r_uint64(intmask(source_pk))
+            payload_accessor.pk_hi = r_uint64(intmask(source_pk >> 64))
 
             try:
                 self.memtable.upsert_single(index_key, weight, payload_accessor)

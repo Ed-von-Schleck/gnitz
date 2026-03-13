@@ -119,15 +119,6 @@ def read_column_defs(cols_pt, owner_id):
                 )
             cursor.advance()
 
-        if len(col_defs) == 0:
-            os.write(1, " [INFO] No columns found for owner_id %d\n" % owner_id)
-        else:
-            os.write(
-                1,
-                " [INFO] Recovered %d columns for owner_id %d\n"
-                % (len(col_defs), owner_id),
-            )
-
         return col_defs
     finally:
         cursor.close()

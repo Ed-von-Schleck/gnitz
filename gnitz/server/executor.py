@@ -111,11 +111,16 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
             out_delta = plan.execute_epoch(incoming_delta)
             incoming_delta.free()
 
-        if out_delta is not None and out_delta.length() > 0:
+        has_output = out_delta is not None and out_delta.length() > 0
+        if has_output:
             view_family = registry.get_by_id(target_view_id)
             ingest_to_family(view_family, out_delta)
             view_family.store.flush()
 
+        # In multi-worker mode, downstream views must always be queued
+        # even with empty deltas, so every worker participates in
+        # exchange barriers. Skipping would deadlock the master.
+        if has_output or exchange_handler is not None:
             dependents = dep_map.get(target_view_id, [])
             for dep_id in dependents:
                 found = -1
@@ -124,17 +129,23 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                         found = pi
                         break
                 if found >= 0:
-                    existing_d, existing_id, existing_batch = pending[found]
-                    merged = ZSetBatch(existing_batch._schema)
-                    writer = BatchWriter(merged)
-                    ops.op_union(existing_batch, out_delta, writer)
-                    existing_batch.free()
-                    pending[found] = (existing_d, existing_id, merged)
+                    if has_output:
+                        existing_d, existing_id, existing_batch = pending[found]
+                        merged = ZSetBatch(existing_batch._schema)
+                        writer = BatchWriter(merged)
+                        ops.op_union(existing_batch, out_delta, writer)
+                        existing_batch.free()
+                        pending[found] = (existing_d, existing_id, merged)
                 else:
                     d = registry.get_depth(dep_id)
-                    pending.append((d, dep_id, out_delta.clone()))
+                    if has_output:
+                        pending.append((d, dep_id, out_delta.clone()))
+                    else:
+                        dep_family = registry.get_by_id(dep_id)
+                        pending.append((d, dep_id, ZSetBatch(dep_family.schema)))
                     _sort_pending(pending)
 
+        if out_delta is not None and out_delta.length() > 0:
             out_delta.free()
 
 
@@ -348,7 +359,8 @@ class ServerExecutor(object):
             tid = intmask(payload.target_id) if payload else 0
             cid = intmask(payload.client_id) if payload else 0
             ipc.send_error(fd, err_msg, target_id=tid, client_id=cid)
-        except Exception:
+        except Exception as e:
+            os.write(2, "MASTER EXCEPTION: " + str(e) + "\n")
             self._cleanup_client(fd)
         finally:
             if payload is not None:

@@ -9,7 +9,7 @@ leaf node to prevent circular dependencies between index.py, manifest.py,
 engine.py, and compactor.py.
 """
 
-from rpython.rlib.rarithmetic import r_uint64
+from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 
@@ -25,10 +25,10 @@ class ManifestEntry(object):
         self.shard_filename = shard_filename
         mk = r_uint128(min_key)
         xk = r_uint128(max_key)
-        self.pk_min_lo = r_uint64(mk)
-        self.pk_min_hi = r_uint64(mk >> 64)
-        self.pk_max_lo = r_uint64(xk)
-        self.pk_max_hi = r_uint64(xk >> 64)
+        self.pk_min_lo = r_uint64(intmask(mk))
+        self.pk_min_hi = r_uint64(intmask(mk >> 64))
+        self.pk_max_lo = r_uint64(intmask(xk))
+        self.pk_max_hi = r_uint64(intmask(xk >> 64))
         self.min_lsn = r_uint64(min_lsn)
         self.max_lsn = r_uint64(max_lsn)
 

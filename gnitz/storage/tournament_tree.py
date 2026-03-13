@@ -1,7 +1,7 @@
 # gnitz/storage/tournament_tree.py
 
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint64
+from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib import jit
@@ -61,8 +61,8 @@ class TournamentTree(object):
                 key = cursor.peek_key()
 
                 # CRITICAL: Split u128 into u64 components to satisfy alignment.
-                self.heap[idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(key))
-                self.heap[idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(key >> 64))
+                self.heap[idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(key)))
+                self.heap[idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(key >> 64)))
                 self.heap[idx].cursor_idx = rffi.cast(rffi.INT, i)
                 self.pos_map[i] = idx
             else:
@@ -224,8 +224,8 @@ class TournamentTree(object):
         else:
             # Update key and re-sift
             nk = cursor.peek_key()
-            self.heap[heap_idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(nk))
-            self.heap[heap_idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(nk >> 64))
+            self.heap[heap_idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(nk)))
+            self.heap[heap_idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(nk >> 64)))
             # Only sift_down: cursors yield strictly increasing PKs, so
             # new_key > old_key >= parent_key — the node can only move down.
             self._sift_down(heap_idx)

@@ -118,8 +118,10 @@ class CircuitBuilder(object):
         return handle
 
     def reduce(self, input_handle, agg_func_id, group_by_cols, agg_col_idx=0):
+        # Auto-insert exchange shard by group columns for multi-worker correctness
+        sharded = self.shard(input_handle, group_by_cols)
         handle = self._alloc_node(OPCODE_REDUCE)
-        self._connect(input_handle, handle, PORT_IN_REDUCE)
+        self._connect(sharded, handle, PORT_IN_REDUCE)
         self._params.append((handle.node_id, PARAM_AGG_FUNC_ID, agg_func_id))
         self._params.append((handle.node_id, PARAM_AGG_COL_IDX, agg_col_idx))
         for col_idx in group_by_cols:

@@ -876,8 +876,15 @@ def test_reduce_sum(base_dir):
     _add_int_row(rb, 1, [20])
     _add_int_row(rb, 1, [30])
 
-    out = plan.execute_epoch(in_batch)
+    # Plan now has exchange_post_plan due to auto-inserted EXCHANGE_SHARD
+    pre_result = plan.execute_epoch(in_batch)
     in_batch.free()
+    assert_true(pre_result is not None, "reduce_sum pre-plan produced None")
+    if plan.exchange_post_plan is not None:
+        out = plan.exchange_post_plan.execute_epoch(pre_result)
+        pre_result.free()
+    else:
+        out = pre_result
     assert_true(out is not None, "reduce_sum produced None")
     # Should produce 1 group with sum = 10+20+30 = 60
     assert_equal_i(1, out.length(), "reduce_sum row count")

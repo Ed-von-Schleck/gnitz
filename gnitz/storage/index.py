@@ -51,10 +51,10 @@ class ShardHandle(object):
                 else r_uint128(self.view.get_pk_u64(self.view.count - 1))
             )
 
-            self.pk_min_lo = r_uint64(k_min)
-            self.pk_min_hi = r_uint64(k_min >> 64)
-            self.pk_max_lo = r_uint64(k_max)
-            self.pk_max_hi = r_uint64(k_max >> 64)
+            self.pk_min_lo = r_uint64(intmask(k_min))
+            self.pk_min_hi = r_uint64(intmask(k_min >> 64))
+            self.pk_max_lo = r_uint64(intmask(k_max))
+            self.pk_max_hi = r_uint64(intmask(k_max >> 64))
         else:
             self.pk_min_lo = self.pk_min_hi = self.pk_max_lo = self.pk_max_hi = r_uint64(
                 0

@@ -143,8 +143,8 @@ class RowBuilder(core_comparator.RowAccessor):
 
     def begin(self, pk, weight):
         pk_u128 = r_uint128(pk)
-        self._pk_lo = r_uint64(pk_u128)
-        self._pk_hi = r_uint64(pk_u128 >> 64)
+        self._pk_lo = rffi.cast(rffi.ULONGLONG, pk_u128)
+        self._pk_hi = rffi.cast(rffi.ULONGLONG, pk_u128 >> 64)
         self._weight = weight
         self._curr = 0
         self._null_word = r_uint64(0)
@@ -551,9 +551,9 @@ class ArenaZSetBatch(object):
         assert not self._freed
         pk_u128 = r_uint128(pk)
 
-        self.pk_lo_buf.put_u64(rffi.cast(rffi.ULONGLONG, r_uint64(pk_u128)))
+        self.pk_lo_buf.put_u64(rffi.cast(rffi.ULONGLONG, pk_u128))
         self.pk_hi_buf.put_u64(
-            rffi.cast(rffi.ULONGLONG, r_uint64(pk_u128 >> 64))
+            rffi.cast(rffi.ULONGLONG, pk_u128 >> 64)
         )
         self.weight_buf.put_i64(weight)
 
@@ -617,10 +617,10 @@ class ArenaZSetBatch(object):
             elif code == types.TYPE_U128.code:
                 v = accessor.get_u128(ci)
                 rffi.cast(rffi.ULONGLONGP, dest)[0] = rffi.cast(
-                    rffi.ULONGLONG, r_uint64(v)
+                    rffi.ULONGLONG, v
                 )
                 rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = rffi.cast(
-                    rffi.ULONGLONG, r_uint64(v >> 64)
+                    rffi.ULONGLONG, v >> 64
                 )
             elif code == types.TYPE_U64.code:
                 rffi.cast(rffi.ULONGLONGP, dest)[0] = rffi.cast(

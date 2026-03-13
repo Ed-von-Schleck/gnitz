@@ -142,7 +142,7 @@ class TableEffectHook(DeltaHook):
                 col_defs = read_column_defs(self.sys_tables.columns, tid)
                 if len(col_defs) == 0:
                     os.write(
-                        1,
+                        2,
                         " [ERROR] Cannot register table '%s': columns not found\n"
                         % name,
                     )
@@ -252,7 +252,7 @@ class ViewEffectHook(DeltaHook):
                 col_defs = read_column_defs(self.sys_tables.columns, vid)
                 if len(col_defs) == 0:
                     os.write(
-                        1,
+                        2,
                         " [ERROR] Cannot register view '%s': columns not found\n"
                         % name,
                     )

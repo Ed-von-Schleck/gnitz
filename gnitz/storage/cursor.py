@@ -1,7 +1,7 @@
 # gnitz/storage/cursor.py
 
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128, r_uint64
+from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128, r_uint64, intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import types
@@ -279,8 +279,8 @@ class UnifiedCursor(AbstractCursor):
             cursor = self.cursors[0]
             if cursor.is_valid():
                 k = cursor.key()
-                self._current_key_lo = r_uint64(k)
-                self._current_key_hi = r_uint64(k >> 64)
+                self._current_key_lo = r_uint64(intmask(k))
+                self._current_key_hi = r_uint64(intmask(k >> 64))
                 self._current_weight = cursor.weight()
                 self._current_accessor = cursor.get_accessor()
                 self._valid = True
@@ -304,8 +304,8 @@ class UnifiedCursor(AbstractCursor):
                 idx += 1
 
             if net_weight != r_int64(0):
-                self._current_key_lo = r_uint64(min_key)
-                self._current_key_hi = r_uint64(min_key >> 64)
+                self._current_key_lo = r_uint64(intmask(min_key))
+                self._current_key_hi = r_uint64(intmask(min_key >> 64))
                 self._current_weight = net_weight
                 self._current_accessor = self.cursors[self.tree._min_indices[0]].get_accessor()
                 self._valid = True

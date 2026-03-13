@@ -118,14 +118,14 @@ class WorkerProcess(object):
             ipc.send_error(self.master_fd, ge.msg)
             return False
         except OSError as oe:
-            log.error(
-                "W" + str(self.worker_id) + " OSError errno=" + str(oe.errno)
+            os.write(2,
+                "W" + str(self.worker_id) + " OSError errno=" + str(oe.errno) + "\n"
             )
             self._shutdown()
             return True
         except Exception as e:
-            log.error(
-                "W" + str(self.worker_id) + " unhandled: " + str(e)
+            os.write(2,
+                "W" + str(self.worker_id) + " unhandled: " + str(e) + "\n"
             )
             self._shutdown()
             return True

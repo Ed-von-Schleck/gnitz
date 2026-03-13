@@ -126,6 +126,19 @@ def entry_point(argv):
         pid = os.fork()
         if pid == 0:
             # --- Child process ---
+            # Redirect stderr and stdout to a per-worker log file.
+            # stdout MUST be redirected: the parent captures it via a pipe
+            # with a finite buffer. Any accumulated writes to fd 1 will
+            # eventually fill the pipe and deadlock the worker.
+            log_path = data_dir + "/worker_" + str(w) + ".log"
+            try:
+                log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                os.dup2(log_fd, 1)
+                os.dup2(log_fd, 2)
+                os.close(log_fd)
+            except OSError:
+                pass
+
             # Close parent-side fds of all socketpairs
             for j in range(num_workers):
                 os.close(parent_fds[j])
@@ -171,7 +184,8 @@ def entry_point(argv):
     engine.registry.active_part_start = 0
     engine.registry.active_part_end = 0
 
-    dispatcher = MasterDispatcher(num_workers, parent_fds, worker_pids, assignment)
+    dispatcher = MasterDispatcher(num_workers, parent_fds, worker_pids, assignment,
+                                   engine.program_cache)
 
     log.info("Listening on " + socket_path)
     os.write(1, "GnitzDB ready\n")

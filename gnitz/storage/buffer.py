@@ -1,7 +1,7 @@
 # gnitz/storage/buffer.py
 
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint32, r_uint64, r_int64
+from rpython.rlib.rarithmetic import r_uint32, r_uint64, r_int64, intmask
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
 from gnitz.core import errors
 from rpython.rlib import jit
@@ -170,9 +170,9 @@ class Buffer(object):
 
     def put_u128(self, val):
         p = self.alloc(16, alignment=16)
-        rffi.cast(rffi.ULONGLONGP, p)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(val))
+        rffi.cast(rffi.ULONGLONGP, p)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(val)))
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(p, 8))[0] = rffi.cast(
-            rffi.ULONGLONG, r_uint64(val >> 64)
+            rffi.ULONGLONG, r_uint64(intmask(val >> 64))
         )
 
     def put_bytes(self, src_ptr, length):

@@ -56,8 +56,8 @@ class Xor8Filter(object):
     def __init__(self, fingerprints, segment_length, seed, total_size, owned):
         self.fingerprints = fingerprints
         self.segment_length = segment_length
-        self.seed_lo = r_uint64(seed)
-        self.seed_hi = r_uint64(seed >> 64)
+        self.seed_lo = r_uint64(intmask(seed))
+        self.seed_hi = r_uint64(intmask(seed >> 64))
         self.total_size = total_size
         self.owned = owned
 
@@ -66,8 +66,8 @@ class Xor8Filter(object):
 
     @jit.elidable
     def _hash_key(self, key):
-        lo = r_uint64(key)
-        hi = r_uint64(key >> 64)
+        lo = r_uint64(intmask(key))
+        hi = r_uint64(intmask(key >> 64))
         return xxh.hash_u128_inline(lo, hi, self.seed_lo, self.seed_hi)
 
     def may_contain(self, key):
@@ -120,8 +120,8 @@ def build_xor8(pk_lo_ptr, pk_hi_ptr, num_keys):
                 keys_at_p[i] = rffi.cast(rffi.ULONGLONG, 0)
                 i += 1
 
-            seed_lo = r_uint64(seed)
-            seed_hi = r_uint64(seed >> 64)
+            seed_lo = r_uint64(intmask(seed))
+            seed_hi = r_uint64(intmask(seed >> 64))
 
             i = 0
             while i < num_keys:
@@ -208,7 +208,7 @@ def save_xor8(xor_filter, filepath):
         try:
             seed = xor_filter._get_seed()
             rffi.cast(rffi.ULONGLONGP, header)[0] = rffi.cast(
-                rffi.ULONGLONG, r_uint64(seed)
+                rffi.ULONGLONG, r_uint64(intmask(seed))
             )
             rffi.cast(rffi.UINTP, rffi.ptradd(header, 8))[0] = rffi.cast(
                 rffi.UINT, xor_filter.segment_length

@@ -102,7 +102,7 @@ class UniversalProjection(ScalarFunction):
                 output_row.append_float(row_accessor.get_float(src_idx))
             elif t == types.TYPE_U128.code:
                 val = row_accessor.get_u128(src_idx)
-                output_row.append_u128(r_uint64(val), r_uint64(val >> 64))
+                output_row.append_u128(r_uint64(intmask(val)), r_uint64(intmask(val >> 64)))
             else:
                 output_row.append_int(row_accessor.get_int_signed(src_idx))
 

@@ -214,8 +214,8 @@ class TableShardWriter(object):
         if weight == 0:
             return
         self.count += 1
-        self.pk_lo_buf.put_u64(r_uint64(key))
-        self.pk_hi_buf.put_u64(r_uint64(key >> 64))
+        self.pk_lo_buf.put_u64(r_uint64(intmask(key)))
+        self.pk_hi_buf.put_u64(r_uint64(intmask(key >> 64)))
         self.w_buf.put_i64(weight)
         self._append_from_accessor(accessor)
 

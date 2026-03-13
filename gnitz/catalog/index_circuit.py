@@ -4,6 +4,7 @@ from rpython.rlib.rarithmetic import (
     r_uint64,
     r_int64,
     r_ulonglonglong as r_uint128,
+    intmask,
 )
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
@@ -221,8 +222,8 @@ def _backfill_index(circuit, source_family):
 
             # Extract PK components for the alignment-safe accessor
             acc_inj = circuit._index_payload_accessor
-            acc_inj.pk_lo = r_uint64(source_pk)
-            acc_inj.pk_hi = r_uint64(source_pk >> 64)
+            acc_inj.pk_lo = r_uint64(intmask(source_pk))
+            acc_inj.pk_hi = r_uint64(intmask(source_pk >> 64))
 
             # EphemeralTable.ingest_one handles MemTableFullError internally.
             circuit.table.ingest_one(index_key, weight, acc_inj)

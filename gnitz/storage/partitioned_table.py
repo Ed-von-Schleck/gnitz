@@ -162,8 +162,8 @@ class PartitionedTable(ZSetStore):
         if self.num_partitions == 1:
             return self.partitions[0].retract_pk(key, out_batch)
         r_key = r_uint128(key)
-        pk_lo = r_uint64(r_key)
-        pk_hi = r_uint64(r_key >> 64)
+        pk_lo = r_uint64(intmask(r_key))
+        pk_hi = r_uint64(intmask(r_key >> 64))
         p = _partition_for_key(pk_lo, pk_hi)
         local = p - self.part_offset
         if local < 0 or local >= len(self.partitions):
@@ -176,8 +176,8 @@ class PartitionedTable(ZSetStore):
         if self.num_partitions == 1:
             return self.partitions[0].has_pk(key)
         r_key = r_uint128(key)
-        pk_lo = r_uint64(r_key)
-        pk_hi = r_uint64(r_key >> 64)
+        pk_lo = r_uint64(intmask(r_key))
+        pk_hi = r_uint64(intmask(r_key >> 64))
         p = _partition_for_key(pk_lo, pk_hi)
         local = p - self.part_offset
         if local < 0 or local >= len(self.partitions):
@@ -190,8 +190,8 @@ class PartitionedTable(ZSetStore):
         if self.num_partitions == 1:
             return self.partitions[0].get_weight(key, accessor)
         r_key = r_uint128(key)
-        pk_lo = r_uint64(r_key)
-        pk_hi = r_uint64(r_key >> 64)
+        pk_lo = r_uint64(intmask(r_key))
+        pk_hi = r_uint64(intmask(r_key >> 64))
         p = _partition_for_key(pk_lo, pk_hi)
         local = p - self.part_offset
         if local < 0 or local >= len(self.partitions):

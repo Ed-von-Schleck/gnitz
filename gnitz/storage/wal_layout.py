@@ -86,8 +86,8 @@ class WALBlockHeaderView(object):
 # Utility raw writers
 def write_u128(buf, offset, val):
     p = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, offset))
-    p[0] = rffi.cast(rffi.ULONGLONG, r_uint64(val))
-    p[1] = rffi.cast(rffi.ULONGLONG, r_uint64(val >> 64))
+    p[0] = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(val)))
+    p[1] = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(val >> 64)))
 
 
 def read_u128(buf, offset):

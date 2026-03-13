@@ -2,7 +2,7 @@
 
 from rpython.rlib import jit
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint64, r_int64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_uint64, r_int64, r_ulonglonglong as r_uint128, intmask
 from rpython.rlib.longlong2float import float2longlong, longlong2float
 from gnitz.core import types, strings as string_logic, xxh
 from gnitz.storage.buffer import c_memset as _c_memset
@@ -88,9 +88,9 @@ def compute_hash(schema, accessor, hash_buf, hash_buf_cap):
             offset = (offset + 7) & ~7
             v = accessor.get_u128(i)
             target = rffi.ptradd(ptr, offset)
-            rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(v))
+            rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(v)))
             rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(
-                rffi.ULONGLONG, r_uint64(v >> 64)
+                rffi.ULONGLONG, r_uint64(intmask(v >> 64))
             )
             offset += 16
         else:

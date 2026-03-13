@@ -38,8 +38,8 @@ class BloomFilter(object):
 
     @jit.elidable
     def _hash_key(self, key):
-        lo = r_uint64(key)
-        hi = r_uint64(key >> 64)
+        lo = r_uint64(intmask(key))
+        hi = r_uint64(intmask(key >> 64))
         return xxh.hash_u128_inline(lo, hi)
 
     @jit.unroll_safe

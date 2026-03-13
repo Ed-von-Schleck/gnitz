@@ -3,23 +3,49 @@
 # Column-based hash for repartitioning batches across workers.
 
 from rpython.rlib.rarithmetic import r_uint64, intmask
-from gnitz.core import xxh
+from gnitz.core import xxh, types
 from gnitz.core.batch import ArenaZSetBatch
+from gnitz.storage.partitioned_table import _partition_for_key
+
+
+def _mix64(v):
+    """Murmur3 64-bit finalizer — must match reduce.py._mix64 exactly."""
+    v = r_uint64(v)
+    v ^= v >> 33
+    v = r_uint64(v * r_uint64(0xFF51AFD7ED558CCD))
+    v ^= v >> 33
+    v = r_uint64(v * r_uint64(0xC4CEB9FE1A85EC53))
+    v ^= v >> 33
+    return v
 
 
 def hash_row_by_columns(batch, row_idx, col_indices):
-    """Hash specified columns of a row to determine destination partition.
-    Uses xxh.hash_u128_inline for quality. Fixed-width columns only."""
-    lo = r_uint64(0)
-    hi = r_uint64(0)
+    """Compute destination partition for a row using group-key semantics.
+
+    Mirrors _extract_group_key in reduce.py so that the exchange routing
+    is consistent with the reduce output PK partition routing:
+      - Single U64 column: use value directly as PK lo; partition = _partition_for_key(val, 0)
+      - Everything else:   Murmur3 combination → _partition_for_key(lo, hi)
+
+    This guarantees that the worker receiving the exchange data also owns the
+    partition where the reduce result will be stored.
+    """
+    schema = batch._schema
+    if len(col_indices) == 1:
+        c_idx = col_indices[0]
+        col_type = schema.columns[c_idx].field_type.code
+        if col_type == types.TYPE_U64.code:
+            val = r_uint64(batch._read_col_int(row_idx, c_idx))
+            return _partition_for_key(val, r_uint64(0))
+
+    # General path: Murmur3 combination (matches _extract_group_key for non-U64 single-col
+    # and all multi-col cases)
+    h = r_uint64(0x9E3779B97F4A7C15)
     for i in range(len(col_indices)):
-        val = r_uint64(batch._read_col_int(row_idx, col_indices[i]))
-        if i % 2 == 0:
-            lo = lo ^ (val * r_uint64(0x9E3779B97F4A7C15))
-        else:
-            hi = hi ^ (val * r_uint64(0x9E3779B97F4A7C15))
-    h = xxh.hash_u128_inline(lo, hi)
-    return intmask(r_uint64(h) & r_uint64(0xFF))
+        col_hash = _mix64(batch._read_col_int(row_idx, col_indices[i]))
+        h = _mix64(h ^ col_hash ^ r_uint64(i))
+    h_hi = _mix64(h ^ r_uint64(len(col_indices)))
+    return _partition_for_key(h, h_hi)
 
 
 def repartition_batch(batch, shard_col_indices, num_workers, assignment):

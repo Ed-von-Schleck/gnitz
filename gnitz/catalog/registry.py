@@ -5,6 +5,7 @@ from rpython.rlib.rarithmetic import (
     r_int64,
     r_uint64,
     r_ulonglonglong as r_uint128,
+    intmask,
 )
 
 from gnitz.catalog.system_tables import (
@@ -62,10 +63,9 @@ def _enforce_unique_pk(family, batch):
     seen_out_idx = []   # int: index in out of the last +w row for this PK
 
     for i in range(n):
-        pk = batch.get_pk(i)
+        pk_lo = r_uint64(batch._read_pk_lo(i))
+        pk_hi = r_uint64(batch._read_pk_hi(i))
         weight = batch.get_weight(i)
-        pk_lo = r_uint64(pk)
-        pk_hi = r_uint64(pk >> 64)
 
         if weight > r_int64(0):
             intra_idx = _find_seen(seen_lo, seen_hi, pk_lo, pk_hi)
@@ -75,7 +75,8 @@ def _enforce_unique_pk(family, batch):
                 seen_out_idx[intra_idx] = out.length()
             else:
                 # Retract any existing stored row for this PK
-                store.retract_pk(pk, out)
+                pk128 = (r_uint128(pk_hi) << 64) | r_uint128(pk_lo)
+                store.retract_pk(pk128, out)
                 seen_lo.append(pk_lo)
                 seen_hi.append(pk_hi)
                 seen_out_idx.append(out.length())
@@ -89,7 +90,8 @@ def _enforce_unique_pk(family, batch):
                 _remove_seen(seen_lo, seen_hi, seen_out_idx, intra_idx)
             else:
                 # Delete from storage by PK (ignore incoming payload)
-                store.retract_pk(pk, out)
+                pk128 = (r_uint128(pk_hi) << 64) | r_uint128(pk_lo)
+                store.retract_pk(pk128, out)
 
     return out
 
@@ -173,8 +175,8 @@ def validate_fk_distributed(family, batch, dispatcher):
             fk_key = promote_to_index_key(
                 acc, col_idx, family.schema.columns[col_idx].field_type
             )
-            fk_lo = r_uint64(fk_key)
-            fk_hi = r_uint64(fk_key >> 64)
+            fk_lo = r_uint64(intmask(fk_key))
+            fk_hi = r_uint64(intmask(fk_key >> 64))
 
             # Dedup
             if _find_seen(seen_lo, seen_hi, fk_lo, fk_hi) < 0:

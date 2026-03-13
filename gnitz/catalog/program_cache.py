@@ -77,13 +77,17 @@ class ProgramCache(object):
     def __init__(self, registry):
         self.registry = registry
         self._cache = {}
+        self._shard_cols_cache = {}
 
     def invalidate(self, program_id):
         if program_id in self._cache:
             del self._cache[program_id]
+        if program_id in self._shard_cols_cache:
+            del self._shard_cols_cache[program_id]
 
     def invalidate_all(self):
         self._cache.clear()
+        self._shard_cols_cache.clear()
 
     def get_program(self, program_id):
         if program_id in self._cache:
@@ -189,7 +193,7 @@ class ProgramCache(object):
                 if cursor.weight() > r_int64(0):
                     pk = cursor.key()
                     acc = cursor.get_accessor()
-                    lo64 = r_uint64(pk)
+                    lo64 = r_uint64(intmask(pk))
                     node_id = intmask(lo64 >> 8)
                     slot = intmask(lo64 & r_uint64(0xFF))
                     value = intmask(acc.get_int(sys.CircuitParamsTab.COL_VALUE))
@@ -210,7 +214,7 @@ class ProgramCache(object):
                 if cursor.weight() > r_int64(0):
                     pk = cursor.key()
                     acc = cursor.get_accessor()
-                    lo64 = r_uint64(pk)
+                    lo64 = r_uint64(intmask(pk))
                     node_id = intmask(lo64 >> 16)
                     col_idx = intmask(lo64 & r_uint64(0xFFFF))
                     if node_id not in result: result[node_id] = newlist_hint(4)
@@ -219,6 +223,26 @@ class ProgramCache(object):
         finally:
             cursor.close()
         return result
+
+    def get_shard_cols(self, view_id):
+        """Extract shard columns for a view without full compilation.
+        Reads only system tables — safe for master process."""
+        if view_id in self._shard_cols_cache:
+            return self._shard_cols_cache[view_id]
+        nodes = self._load_nodes(view_id)
+        params = self._load_params(view_id)
+        for nid, op in nodes:
+            if op == opcodes.OPCODE_EXCHANGE_SHARD:
+                node_params = params.get(nid, {})
+                shard_cols = []
+                idx = 0
+                while (opcodes.PARAM_SHARD_COL_BASE + idx) in node_params:
+                    shard_cols.append(node_params[opcodes.PARAM_SHARD_COL_BASE + idx])
+                    idx += 1
+                self._shard_cols_cache[view_id] = shard_cols
+                return shard_cols
+        self._shard_cols_cache[view_id] = []
+        return []
 
     def _resolve_primary_input_schema(self, program_id, fallback,
                                       circuit_sources, trace_side_sources):

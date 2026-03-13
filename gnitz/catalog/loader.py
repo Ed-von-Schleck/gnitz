@@ -46,7 +46,7 @@ class CatalogBootstrapper(object):
             while cursor.is_valid():
                 if cursor.weight() > 0:
                     acc = cursor.get_accessor()
-                    seq_id = intmask(r_uint64(cursor.key()))
+                    seq_id = intmask(cursor.key())
                     val = intmask(acc.get_int(sys.SeqTab.COL_VALUE))
                     if seq_id == sys.SEQ_ID_SCHEMAS:
                         schema_hwm = val

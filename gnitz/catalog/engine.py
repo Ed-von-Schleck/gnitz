@@ -30,14 +30,11 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     """
     Public factory to open a GnitzDB instance.
     """
-    os.write(1, " -> 1. ensure_dir(base_dir)\n")
     ensure_dir(base_dir)
 
     sys_dir = base_dir + "/" + sys.SYS_CATALOG_DIRNAME
-    os.write(1, " -> 2. ensure_dir(sys_dir)\n")
     ensure_dir(sys_dir)
 
-    os.write(1, " -> 3. make_system_tables\n")
     sys_tables = make_system_tables(base_dir)
 
     tmp_cursor = sys_tables.tables.create_cursor()
@@ -45,21 +42,18 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     tmp_cursor.close()
 
     if is_new:
-        os.write(1, " -> 4. bootstrap_system_tables (Fresh Instance)\n")
         bootstrap_system_tables(sys_tables, base_dir)
 
     registry = EntityRegistry()
     program_cache = ProgramCache(registry)
     bootstrapper = CatalogBootstrapper(registry, sys_tables, base_dir)
 
-    os.write(1, " -> 5. recover_system_state (Counters)\n")
     bootstrapper.recover_system_state()
 
     table_hook = wire_catalog_hooks(registry, sys_tables, base_dir, program_cache)
 
     engine = Engine(base_dir, sys_tables, registry, program_cache)
 
-    os.write(1, " -> 6. replay_catalog (Logical Recovery)\n")
     bootstrapper.replay_catalog()
 
     # Enable cascading effects now that replay is complete
@@ -448,7 +442,7 @@ class Engine(object):
                 if cursor.weight() > 0:
                     pk = cursor.key()
                     acc = cursor.get_accessor()
-                    lo64 = r_uint64(pk)
+                    lo64 = r_uint64(intmask(pk))
                     node_id = intmask(lo64 >> 8)
                     slot = intmask(lo64 & r_uint64(0xFF))
                     value = intmask(acc.get_int(sys.CircuitParamsTab.COL_VALUE))
@@ -467,7 +461,7 @@ class Engine(object):
                 if cursor.weight() > 0:
                     pk = cursor.key()
                     acc = cursor.get_accessor()
-                    lo64 = r_uint64(pk)
+                    lo64 = r_uint64(intmask(pk))
                     node_id = intmask(lo64 >> 16)
                     col_idx = intmask(lo64 & r_uint64(0xFFFF))
                     sys.CircuitGroupColsTab.retract(batch, s, vid, node_id, col_idx)

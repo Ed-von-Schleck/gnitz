@@ -12,6 +12,7 @@ from gnitz.server import ipc
 from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch, ZSetBatch
 from gnitz.storage.partitioned_table import _partition_for_key
+from gnitz.dbsp.ops.exchange import repartition_batch
 
 WNOHANG = 1
 
@@ -59,11 +60,12 @@ class MasterDispatcher(object):
 
     _immutable_fields_ = ["num_workers", "worker_fds[*]", "assignment"]
 
-    def __init__(self, num_workers, worker_fds, worker_pids, assignment):
+    def __init__(self, num_workers, worker_fds, worker_pids, assignment, program_cache):
         self.num_workers = num_workers
         self.worker_fds = worker_fds
         self.worker_pids = worker_pids
         self.assignment = assignment
+        self.program_cache = program_cache
 
     def _split_batch_by_pk(self, batch, schema):
         """Split batch into per-worker sub-batches by PK hash."""
@@ -152,8 +154,14 @@ class MasterDispatcher(object):
                 merged.append_batch(worker_batches[w])
                 worker_batches[w].free()
 
-        # Repartition by PK (the pre-exchange plan should MAP shard key -> PK)
-        dest_batches = self._split_batch_by_pk(merged, schema)
+        # Repartition by shard columns (group-by key), not by PK
+        shard_cols = self.program_cache.get_shard_cols(view_id)
+        if len(shard_cols) > 0:
+            dest_batches = repartition_batch(
+                merged, shard_cols, self.num_workers, self.assignment
+            )
+        else:
+            dest_batches = self._split_batch_by_pk(merged, schema)
         merged.free()
 
         for w in range(self.num_workers):
