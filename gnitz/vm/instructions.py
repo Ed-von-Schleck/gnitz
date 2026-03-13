@@ -32,6 +32,8 @@ class Instruction(object):
         "output_schema",
         "chunk_limit",
         "reg_key",
+        "trace_in_group_idx",
+        "group_idx",
     ]
 
     def __init__(self, opcode):
@@ -54,6 +56,8 @@ class Instruction(object):
         self.output_schema = None
         self.chunk_limit = 0
         self.reg_key = None
+        self.trace_in_group_idx = None
+        self.group_idx = None
 
 
 # ── DBSP Algebraic Instructions ───────────────────────────────────────────
@@ -106,10 +110,11 @@ def join_delta_trace_op(reg_delta, reg_trace, reg_out):
     return i
 
 
-def integrate_op(reg_in, target_table):
+def integrate_op(reg_in, target_table, group_idx=None):
     i = Instruction(op.OPCODE_INTEGRATE)
     i.reg_in = reg_in
     i.target_table = target_table
+    i.group_idx = group_idx
     return i
 
 
@@ -131,6 +136,7 @@ def join_delta_delta_op(reg_a, reg_b, reg_out):
 def reduce_op(
     reg_in, reg_trace_in, reg_trace_out, reg_out,
     group_by_cols, agg_func, output_schema,
+    trace_in_group_idx=None,
 ):
     i = Instruction(op.OPCODE_REDUCE)
     i.reg_in = reg_in
@@ -140,6 +146,7 @@ def reduce_op(
     i.group_by_cols = group_by_cols
     i.agg_func = agg_func
     i.output_schema = output_schema
+    i.trace_in_group_idx = trace_in_group_idx
     return i
 
 

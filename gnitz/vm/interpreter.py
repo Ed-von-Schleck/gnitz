@@ -1,9 +1,14 @@
 # gnitz/vm/interpreter.py
 
 from rpython.rlib import jit
-from gnitz.core import batch
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
+from gnitz.core import batch, errors
 from gnitz.core import opcodes as op
 from gnitz.dbsp import ops
+from gnitz.dbsp.ops.group_index import (
+    GroupIdxAccessor as _GroupIdxAccessor,
+    promote_group_col_to_u64 as _gi_promote,
+)
 from gnitz.vm import runtime
 
 def get_printable_location(pc, program):
@@ -163,6 +168,30 @@ def run_vm(program, reg_file, context):
             reg_in = instr.reg_in
             assert reg_in is not None
             ops.op_integrate(reg_in.batch, instr.target_table)
+            if instr.group_idx is not None:
+                gi = instr.group_idx
+                b = reg_in.batch
+                n = b.length()
+                if n > 0:
+                    gi_acc = _GroupIdxAccessor()
+                    acc = b.get_accessor(0)
+                    for idx in range(n):
+                        b.bind_accessor(idx, acc)
+                        if acc.is_null(gi.col_idx):
+                            continue
+                        gc_u64 = _gi_promote(
+                            acc, gi.col_idx, gi.col_type,
+                        )
+                        source_pk = b.get_pk(idx)
+                        ck = ((r_uint128(gc_u64) << 64)
+                              | r_uint128(r_uint64(intmask(source_pk))))
+                        gi_acc.spk_hi = r_int64(intmask(source_pk >> 64))
+                        weight = b.get_weight(idx)
+                        try:
+                            gi.table.memtable.upsert_single(ck, weight, gi_acc)
+                        except errors.MemTableFullError:
+                            gi.table.flush()
+                            gi.table.memtable.upsert_single(ck, weight, gi_acc)
 
         elif opcode == op.OPCODE_ANTI_JOIN_DELTA_TRACE:
             reg_delta = instr.reg_delta
@@ -227,6 +256,7 @@ def run_vm(program, reg_file, context):
                 instr.group_by_cols,
                 instr.agg_func,
                 instr.output_schema,
+                instr.trace_in_group_idx,
             )
 
         pc += 1

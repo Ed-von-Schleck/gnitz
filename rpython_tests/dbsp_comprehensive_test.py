@@ -14,9 +14,9 @@ from rpython.rlib.rarithmetic import (
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.longlong2float import float2longlong
 
-from gnitz.core import types, batch
+from gnitz.core import types, batch, errors
 from gnitz.core.batch import RowBuilder
-from gnitz.dbsp.ops import linear, join, anti_join, reduce, distinct, source
+from gnitz.dbsp.ops import linear, join, anti_join, reduce, distinct, source, group_index
 from gnitz.dbsp import functions
 from gnitz.storage.ephemeral_table import EphemeralTable
 
@@ -968,6 +968,146 @@ def test_source_ops(base_dir):
 
 
 # ------------------------------------------------------------------------------
+# Group-Index helpers and test
+# ------------------------------------------------------------------------------
+
+
+def _update_group_idx(b_in, gi):
+    """Populate or update the group secondary index from a delta batch."""
+    n = b_in.length()
+    if n == 0:
+        return
+    gi_acc = group_index.GroupIdxAccessor()
+    acc = b_in.get_accessor(0)
+    for i in range(n):
+        b_in.bind_accessor(i, acc)
+        if acc.is_null(gi.col_idx):
+            continue
+        gc_u64 = group_index.promote_group_col_to_u64(acc, gi.col_idx, gi.col_type)
+        source_pk = b_in.get_pk(i)
+        ck = ((r_uint128(gc_u64) << 64)
+              | r_uint128(r_uint64(intmask(source_pk))))
+        gi_acc.spk_hi = r_int64(intmask(source_pk >> 64))
+        weight = b_in.get_weight(i)
+        try:
+            gi.table.memtable.upsert_single(ck, weight, gi_acc)
+        except errors.MemTableFullError:
+            gi.table.flush()
+            gi.table.memtable.upsert_single(ck, weight, gi_acc)
+
+
+def _find_min_for_dept(b_out, dept_id):
+    """
+    Find the MIN salary insertion in the reduce output for a given dept_id.
+    Output schema: (U128 hash [pk=0], I64 dept_id [col 1], I64 agg [col 2]).
+    Returns r_int64(-9999999) if not found.
+    """
+    for i in range(b_out.length()):
+        if b_out.get_weight(i) == r_int64(1):
+            acc = b_out.get_accessor(i)
+            if acc.get_int_signed(1) == dept_id:
+                return acc.get_int_signed(2)
+    return r_int64(-9999999)
+
+
+def test_reduce_group_idx(base_dir):
+    """
+    Group secondary index: non-PK I64 group-by triggers O(log N + k) indexed path.
+    Schema: (pk: U128, dept_id: I64, salary: I64); GROUP BY dept_id; MIN(salary).
+    10 departments, 10 rows each (salaries 0..9 within each dept).
+    """
+    log("[DBSP] Testing Reduce non-PK group secondary index...")
+
+    cols = newlist_hint(3)
+    cols.append(types.ColumnDefinition(types.TYPE_U128, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="dept_id"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="salary"))
+    in_schema = types.TableSchema(cols, pk_index=0)
+
+    min_agg = functions.UniversalAccumulator(2, functions.AGG_MIN, types.TYPE_I64)
+    out_schema = types._build_reduce_output_schema(in_schema, [1], min_agg)
+
+    t_in_path = os.path.join(base_dir, "gi_trace_in")
+    t_out_path = os.path.join(base_dir, "gi_trace_out")
+    t_gi_path = os.path.join(base_dir, "gi_idx")
+    trace_in = EphemeralTable(t_in_path, "in", in_schema)
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+    gi_schema = group_index.make_group_idx_schema()
+    gi_table = EphemeralTable(t_gi_path, "gidx", gi_schema, table_id=0)
+    gi = group_index.ReduceGroupIndex(gi_table, 1, types.TYPE_I64)
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+
+        # Tick 1: Insert 100 rows, 10 per dept.
+        # dept d: pk = d*10+1 .. d*10+10, salary = d*10+0 .. d*10+9
+        # MIN per dept d = d*10.
+        log("  - Tick 1: insert 100 rows across 10 depts...")
+        for dept in range(10):
+            for row in range(10):
+                actual_pk = dept * 10 + row + 1
+                salary = dept * 10 + row
+                rb.begin(r_uint128(actual_pk), r_int64(1))
+                rb.put_int(r_int64(dept))
+                rb.put_int(r_int64(salary))
+                rb.commit()
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [1], min_agg, out_schema, gi)
+        c_in.close()
+        c_out.close()
+
+        # Verify initial MIN per department
+        for dept in range(10):
+            expected = r_int64(dept * 10)
+            actual = _find_min_for_dept(b_out, r_int64(dept))
+            assert_equal_i64(expected, actual,
+                             "Tick 1 MIN for dept " + str(dept))
+
+        # Populate traces and group index before Tick 2
+        trace_in.ingest_batch(b_in)
+        trace_out.ingest_batch(b_out)
+        _update_group_idx(b_in, gi)
+        b_in.clear()
+        b_out.clear()
+
+        # Tick 2: Retract the minimum-salary row in each dept.
+        # After retraction, MIN per dept d should become d*10+1.
+        log("  - Tick 2: retract min-salary row in each dept...")
+        for dept in range(10):
+            actual_pk = dept * 10 + 1  # row=0 of each dept
+            salary = dept * 10         # = d*10 + 0
+            rb.begin(r_uint128(actual_pk), r_int64(-1))
+            rb.put_int(r_int64(dept))
+            rb.put_int(r_int64(salary))
+            rb.commit()
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [1], min_agg, out_schema, gi)
+        c_in.close()
+        c_out.close()
+
+        for dept in range(10):
+            expected = r_int64(dept * 10 + 1)
+            actual = _find_min_for_dept(b_out, r_int64(dept))
+            assert_equal_i64(expected, actual,
+                             "Tick 2 MIN for dept " + str(dept))
+
+        log("[DBSP] Reduce non-PK group index test PASSED")
+    finally:
+        b_in.free()
+        b_out.free()
+        trace_in.close()
+        trace_out.close()
+        gi_table.close()
+
+
+# ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
 
@@ -994,6 +1134,7 @@ def entry_point(argv):
         test_semi_join_basic(base_dir)
         test_anti_semi_join_complement(base_dir)
         test_source_ops(base_dir)
+        test_reduce_group_idx(base_dir)
         log("\nALL DBSP TESTS PASSED")
     except Exception as e:
         os.write(2, "FAILURE\n")

@@ -5,10 +5,13 @@ from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, int
 
 from gnitz.core import opcodes
 from gnitz.core.types import merge_schemas_for_join, _build_map_output_schema, _build_reduce_output_schema
+from gnitz.core.types import TYPE_U128, TYPE_STRING, TYPE_F32, TYPE_F64
 from gnitz.core.errors import LayoutError
 from gnitz.catalog import system_tables as sys
 from gnitz.vm import instructions, runtime
 from gnitz.dbsp import functions
+from gnitz.dbsp.ops import group_index
+from gnitz.storage.ephemeral_table import EphemeralTable
 
 NULL_PREDICATE = functions.NullPredicate()
 NULL_AGGREGATE = functions.NullAggregate()
@@ -445,10 +448,34 @@ class ProgramCache(object):
                     tr_in_table.create_cursor(), tr_in_table
                 )
                 cur_reg_file.registers[tr_in_reg_id] = tr_in_reg
-            reduce_instr = instructions.reduce_op(in_reg, tr_in_reg, tr_out_reg, out_delta_reg, gcols, agg_func, reduce_out_schema)
+            # Build a secondary group index if the group column is a ≤64-bit int
+            # (not U128/STRING/FLOAT) and there is exactly one group column.
+            # This turns O(N) trace scans into O(log N + k) range lookups.
+            grp_idx = None
+            if tr_in_table is not None and len(gcols) == 1:
+                gc_col_idx = gcols[0]
+                gc_type = in_reg.table_schema.columns[gc_col_idx].field_type
+                if (gc_type.code != TYPE_U128.code
+                        and gc_type.code != TYPE_STRING.code
+                        and gc_type.code != TYPE_F32.code
+                        and gc_type.code != TYPE_F64.code):
+                    gi_table = EphemeralTable(
+                        tr_in_table.directory + "_gidx",
+                        "_gidx",
+                        group_index.make_group_idx_schema(),
+                        table_id=0,
+                    )
+                    grp_idx = group_index.ReduceGroupIndex(gi_table, gc_col_idx, gc_type)
+
+            reduce_instr = instructions.reduce_op(
+                in_reg, tr_in_reg, tr_out_reg, out_delta_reg,
+                gcols, agg_func, reduce_out_schema,
+                trace_in_group_idx=grp_idx,
+            )
             program.append(reduce_instr)
             if tr_in_table is not None:
-                program.append(instructions.integrate_op(in_reg, tr_in_table))
+                program.append(instructions.integrate_op(in_reg, tr_in_table,
+                                                         group_idx=grp_idx))
             return instructions.integrate_op(out_delta_reg, trace_table)
 
         elif op == opcodes.OPCODE_INTEGRATE:

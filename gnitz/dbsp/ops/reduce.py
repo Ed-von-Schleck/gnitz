@@ -13,6 +13,7 @@ from gnitz.core.batch import (
     ArenaZSetBatch, ConsolidatedScope, BatchWriter, ColumnarBatchAccessor,
 )
 from gnitz.dbsp.functions import NULL_AGGREGATE
+from gnitz.dbsp.ops.group_index import promote_group_col_to_u64 as _gi_promote
 
 """
 Non-linear Reduce Operator for the DBSP algebra.
@@ -332,6 +333,7 @@ def op_reduce(
     group_by_cols,
     agg_func,
     output_schema,
+    trace_in_group_idx=None,
 ):
     """
     Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
@@ -428,17 +430,51 @@ def op_reduce(
                             )
                             trace_in_cursor.advance()
                     else:
-                        # Group key differs from table PK — scan and
-                        # filter by group column match.
-                        trace_in_cursor.seek(r_uint128(0))
-                        while trace_in_cursor.is_valid():
-                            trace_acc = trace_in_cursor.get_accessor()
-                            if _compare_by_cols(trace_acc, acc_exemplar, input_schema, group_by_cols) == 0:
-                                replay.append_from_accessor(
-                                    trace_in_cursor.key(), trace_in_cursor.weight(),
-                                    trace_acc,
-                                )
-                            trace_in_cursor.advance()
+                        # Group key differs from table PK.
+                        if trace_in_group_idx is not None:
+                            # O(log N + k): composite-key index lookup.
+                            gc_u64 = _gi_promote(
+                                acc_exemplar,
+                                trace_in_group_idx.col_idx,
+                                trace_in_group_idx.col_type,
+                            )
+                            target_prefix = r_uint128(gc_u64) << 64
+                            gi_cursor = trace_in_group_idx.create_cursor()
+                            gi_cursor.seek(target_prefix)
+                            while gi_cursor.is_valid():
+                                gk = gi_cursor.key()
+                                if r_uint64(intmask(gk >> 64)) != gc_u64:
+                                    break
+                                if gi_cursor.weight() > r_int64(0):
+                                    spk_lo = r_uint128(r_uint64(intmask(gk)))
+                                    spk_hi = r_uint128(rffi.cast(
+                                        rffi.ULONGLONG,
+                                        gi_cursor.get_accessor().get_int_signed(1),
+                                    ))
+                                    src_pk = (spk_hi << 64) | spk_lo
+                                    trace_in_cursor.seek(src_pk)
+                                    if (trace_in_cursor.is_valid()
+                                            and trace_in_cursor.key() == src_pk):
+                                        replay.append_from_accessor(
+                                            trace_in_cursor.key(),
+                                            trace_in_cursor.weight(),
+                                            trace_in_cursor.get_accessor(),
+                                        )
+                                gi_cursor.advance()
+                            gi_cursor.close()
+                        else:
+                            # O(N) fallback — scan and filter by group column match.
+                            trace_in_cursor.seek(r_uint128(0))
+                            while trace_in_cursor.is_valid():
+                                trace_acc = trace_in_cursor.get_accessor()
+                                if _compare_by_cols(trace_acc, acc_exemplar,
+                                                    input_schema, group_by_cols) == 0:
+                                    replay.append_from_accessor(
+                                        trace_in_cursor.key(),
+                                        trace_in_cursor.weight(),
+                                        trace_acc,
+                                    )
+                                trace_in_cursor.advance()
 
                 for k in range(group_start_pos, idx):
                     d_idx = sorted_indices[k]
