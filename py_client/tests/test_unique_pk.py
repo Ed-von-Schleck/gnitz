@@ -11,9 +11,9 @@ def _uid():
     return str(random.randint(100000, 999999))
 
 
-def _make_table(client, unique_pk=True):
-    """Create a fresh schema + (U64 pk, I64 val) table."""
-    schema_name = "upk_" + _uid()
+def _make_table_ex(client, unique_pk=True, prefix="upk"):
+    """Create a fresh schema + (U64 pk, I64 val) table; return (tid, schema, schema_name)."""
+    schema_name = prefix + "_" + _uid()
     client.create_schema(schema_name)
     columns = [
         ColumnDef("pk", TypeCode.U64),
@@ -21,8 +21,13 @@ def _make_table(client, unique_pk=True):
     ]
     tid = client.create_table(schema_name, "t", columns, pk_col_idx=0,
                               unique_pk=unique_pk)
-    tbl_schema = Schema(columns=columns, pk_index=0)
-    return tid, tbl_schema
+    return tid, Schema(columns=columns, pk_index=0), schema_name
+
+
+def _make_table(client, unique_pk=True):
+    """Create a fresh schema + (U64 pk, I64 val) table."""
+    tid, schema, _ = _make_table_ex(client, unique_pk=unique_pk)
+    return tid, schema
 
 
 def _push(client, tid, tbl_schema, rows, weight=1):
@@ -146,3 +151,103 @@ def test_multiple_keys_independent(client):
     _push(client, tid, schema, [(2, 99)])  # update pk=2 only
     rows = _scan_rows(client, tid)
     assert rows == [(1, 10), (2, 99), (3, 30)]
+
+
+def test_delete_then_reinsert(client):
+    """Insert pk=1 val=10, delete pk=1, insert pk=1 val=20; scan shows [(1, 20)]."""
+    tid, schema = _make_table(client)
+    _push(client, tid, schema, [(1, 10)])
+    _push_delete(client, tid, schema, [1])
+    _push(client, tid, schema, [(1, 20)])
+    rows = _scan_rows(client, tid)
+    assert rows == [(1, 20)]
+
+
+def test_delete_multiple_pks(client):
+    """Insert pk=1,2,3; delete pk=1,3 in one call; scan shows [(2, 20)]."""
+    tid, schema = _make_table(client)
+    _push(client, tid, schema, [(1, 10), (2, 20), (3, 30)])
+    _push_delete(client, tid, schema, [1, 3])
+    rows = _scan_rows(client, tid)
+    assert rows == [(2, 20)]
+
+
+def test_upsert_intra_batch_insert_then_delete(client):
+    """Single batch: insert pk=1 then delete pk=1 (zero payload); scan shows empty."""
+    tid, schema = _make_table(client)
+    b = ZSetBatch(schema=schema)
+    b.pk_lo.append(1)
+    b.pk_hi.append(0)
+    b.weights.append(1)
+    b.nulls.append(0)
+    b.pk_lo.append(1)
+    b.pk_hi.append(0)
+    b.weights.append(-1)
+    b.nulls.append(0)
+    b.columns = [[], [10, 0]]
+    client.push(tid, schema, b)
+    rows = _scan_rows(client, tid)
+    assert rows == []
+
+
+def test_upsert_intra_batch_delete_then_insert(client):
+    """Pre-insert pk=1 val=10; single batch: delete pk=1 then insert pk=1 val=99; scan shows [(1, 99)]."""
+    tid, schema = _make_table(client)
+    _push(client, tid, schema, [(1, 10)])
+    b = ZSetBatch(schema=schema)
+    b.pk_lo.append(1)
+    b.pk_hi.append(0)
+    b.weights.append(-1)
+    b.nulls.append(0)
+    b.pk_lo.append(1)
+    b.pk_hi.append(0)
+    b.weights.append(1)
+    b.nulls.append(0)
+    b.columns = [[], [0, 99]]
+    client.push(tid, schema, b)
+    rows = _scan_rows(client, tid)
+    assert rows == [(1, 99)]
+
+
+def test_upsert_updates_view(client):
+    """Create table + passthrough view; upsert pk=1; view reflects new value only."""
+    tid, schema, schema_name = _make_table_ex(client)
+    columns = [ColumnDef("pk", TypeCode.U64), ColumnDef("val", TypeCode.I64)]
+    vid = client.create_view(schema_name, "v", tid, columns)
+    _push(client, tid, schema, [(1, 10)])
+    view_rows = _scan_rows(client, vid)
+    assert view_rows == [(1, 10)]
+    _push(client, tid, schema, [(1, 99)])
+    view_rows = _scan_rows(client, vid)
+    assert view_rows == [(1, 99)]
+
+
+def test_delete_updates_view(client):
+    """Create table + passthrough view; delete pk=1; view shows empty."""
+    tid, schema, schema_name = _make_table_ex(client)
+    columns = [ColumnDef("pk", TypeCode.U64), ColumnDef("val", TypeCode.I64)]
+    vid = client.create_view(schema_name, "v", tid, columns)
+    _push(client, tid, schema, [(1, 10)])
+    view_rows = _scan_rows(client, vid)
+    assert view_rows == [(1, 10)]
+    _push_delete(client, tid, schema, [1])
+    view_rows = _scan_rows(client, vid)
+    assert view_rows == []
+
+
+def test_delete_convenience(client):
+    """client.delete() removes rows by PK."""
+    tid, schema = _make_table(client)
+    _push(client, tid, schema, [(1, 10), (2, 20), (3, 30)])
+    client.delete(tid, schema, [1, 3])
+    rows = _scan_rows(client, tid)
+    assert rows == [(2, 20)]
+
+
+def test_update_convenience(client):
+    """client.update() upserts rows; old value replaced by new value."""
+    tid, schema = _make_table(client)
+    _push(client, tid, schema, [(1, 10)])
+    client.update(tid, schema, [[1, 99]])
+    rows = _scan_rows(client, tid)
+    assert rows == [(1, 99)]

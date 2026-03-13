@@ -34,6 +34,7 @@ from gnitz.storage import (
 from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.storage.table import PersistentTable
 from gnitz.core.batch import ColumnarBatchAccessor, RowBuilder
+from gnitz.catalog.registry import _enforce_unique_pk, TableFamily
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -56,6 +57,14 @@ def make_u64_str_schema():
     cols = [
         types.ColumnDefinition(types.TYPE_U64, name="id"),
         types.ColumnDefinition(types.TYPE_STRING, name="val"),
+    ]
+    return types.TableSchema(cols, 0)
+
+
+def make_u64_i64_schema():
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="id"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
     ]
     return types.TableSchema(cols, 0)
 
@@ -1205,6 +1214,133 @@ def test_retract_pk(base_dir):
     os.write(1, "    [OK] retract_pk tests passed.\n")
 
 
+def test_enforce_unique_pk(base_dir):
+    os.write(1, "  test_enforce_unique_pk ...\n")
+    schema = make_u64_i64_schema()
+
+    # --- insert_new: new PK, no stored row → output = input row ---
+    sub_dir1 = os.path.join(base_dir, "upk_t1")
+    t1 = EphemeralTable(sub_dir1, "upk_t1", schema)
+    family1 = TableFamily("s", "upk_t1", 1, 1, sub_dir1, 0, t1, unique_pk=True)
+    b1 = batch.ZSetBatch(schema)
+    rb1 = RowBuilder(schema, b1)
+    rb1.begin(r_uint128(1), r_int64(1))
+    rb1.put_int(r_int64(10))
+    rb1.commit()
+    result1 = _enforce_unique_pk(family1, b1)
+    assert_equal_i(1, result1.length(), "insert_new: should have 1 row")
+    assert_true(result1.get_weight(0) == r_int64(1), "insert_new: weight should be +1")
+    result1.free()
+    b1.free()
+    t1.close()
+
+    # --- update_existing: stored row → retraction + new row ---
+    sub_dir2 = os.path.join(base_dir, "upk_t2")
+    t2 = EphemeralTable(sub_dir2, "upk_t2", schema)
+    family2 = TableFamily("s", "upk_t2", 2, 1, sub_dir2, 0, t2, unique_pk=True)
+    b2pre = batch.ZSetBatch(schema)
+    rb2pre = RowBuilder(schema, b2pre)
+    rb2pre.begin(r_uint128(1), r_int64(1))
+    rb2pre.put_int(r_int64(10))
+    rb2pre.commit()
+    t2.ingest_batch(b2pre)
+    b2pre.free()
+    b2 = batch.ZSetBatch(schema)
+    rb2 = RowBuilder(schema, b2)
+    rb2.begin(r_uint128(1), r_int64(1))
+    rb2.put_int(r_int64(20))
+    rb2.commit()
+    result2 = _enforce_unique_pk(family2, b2)
+    assert_equal_i(2, result2.length(), "update_existing: should have 2 rows")
+    assert_true(result2.get_weight(0) == r_int64(-1), "update_existing: retraction first w=-1")
+    assert_true(result2.get_weight(1) == r_int64(1), "update_existing: insertion second w=+1")
+    result2.free()
+    b2.free()
+    t2.close()
+
+    # --- delete_existing: stored row + w=-1 input → retraction with stored payload ---
+    sub_dir3 = os.path.join(base_dir, "upk_t3")
+    t3 = EphemeralTable(sub_dir3, "upk_t3", schema)
+    family3 = TableFamily("s", "upk_t3", 3, 1, sub_dir3, 0, t3, unique_pk=True)
+    b3pre = batch.ZSetBatch(schema)
+    rb3pre = RowBuilder(schema, b3pre)
+    rb3pre.begin(r_uint128(1), r_int64(1))
+    rb3pre.put_int(r_int64(10))
+    rb3pre.commit()
+    t3.ingest_batch(b3pre)
+    b3pre.free()
+    b3 = batch.ZSetBatch(schema)
+    rb3 = RowBuilder(schema, b3)
+    rb3.begin(r_uint128(1), r_int64(-1))
+    rb3.put_int(r_int64(0))
+    rb3.commit()
+    result3 = _enforce_unique_pk(family3, b3)
+    assert_equal_i(1, result3.length(), "delete_existing: should have 1 row")
+    assert_true(result3.get_weight(0) == r_int64(-1), "delete_existing: weight should be -1")
+    assert_true(result3.get_pk(0) == r_uint128(1), "delete_existing: pk should be 1")
+    result3.free()
+    b3.free()
+    t3.close()
+
+    # --- delete_absent: no stored row + w=-1 → empty output ---
+    sub_dir4 = os.path.join(base_dir, "upk_t4")
+    t4 = EphemeralTable(sub_dir4, "upk_t4", schema)
+    family4 = TableFamily("s", "upk_t4", 4, 1, sub_dir4, 0, t4, unique_pk=True)
+    b4 = batch.ZSetBatch(schema)
+    rb4 = RowBuilder(schema, b4)
+    rb4.begin(r_uint128(99), r_int64(-1))
+    rb4.put_int(r_int64(0))
+    rb4.commit()
+    result4 = _enforce_unique_pk(family4, b4)
+    assert_equal_i(0, result4.length(), "delete_absent: should be empty")
+    result4.free()
+    b4.free()
+    t4.close()
+
+    # --- intra_batch_duplicate: two inserts for same PK → 3 rows (last wins) ---
+    sub_dir5 = os.path.join(base_dir, "upk_t5")
+    t5 = EphemeralTable(sub_dir5, "upk_t5", schema)
+    family5 = TableFamily("s", "upk_t5", 5, 1, sub_dir5, 0, t5, unique_pk=True)
+    b5 = batch.ZSetBatch(schema)
+    rb5a = RowBuilder(schema, b5)
+    rb5a.begin(r_uint128(1), r_int64(1))
+    rb5a.put_int(r_int64(10))
+    rb5a.commit()
+    rb5b = RowBuilder(schema, b5)
+    rb5b.begin(r_uint128(1), r_int64(1))
+    rb5b.put_int(r_int64(20))
+    rb5b.commit()
+    result5 = _enforce_unique_pk(family5, b5)
+    assert_equal_i(3, result5.length(), "intra_batch_duplicate: should have 3 rows")
+    result5.free()
+    b5.free()
+    t5.close()
+
+    # --- intra_batch_insert_then_delete: insert then delete same PK → net zero ---
+    sub_dir6 = os.path.join(base_dir, "upk_t6")
+    t6 = EphemeralTable(sub_dir6, "upk_t6", schema)
+    family6 = TableFamily("s", "upk_t6", 6, 1, sub_dir6, 0, t6, unique_pk=True)
+    b6 = batch.ZSetBatch(schema)
+    rb6a = RowBuilder(schema, b6)
+    rb6a.begin(r_uint128(1), r_int64(1))
+    rb6a.put_int(r_int64(10))
+    rb6a.commit()
+    rb6b = RowBuilder(schema, b6)
+    rb6b.begin(r_uint128(1), r_int64(-1))
+    rb6b.put_int(r_int64(0))
+    rb6b.commit()
+    result6 = _enforce_unique_pk(family6, b6)
+    # Insert then delete: output carries [+1, -1] pair that nets to zero
+    assert_equal_i(2, result6.length(), "intra_batch_insert_then_delete: should have 2 rows")
+    assert_true(result6.get_weight(0) == r_int64(1), "intra_batch_insert_then_delete: row0 w=+1")
+    assert_true(result6.get_weight(1) == r_int64(-1), "intra_batch_insert_then_delete: row1 w=-1")
+    result6.free()
+    b6.free()
+    t6.close()
+
+    os.write(1, "    [OK] enforce_unique_pk tests passed.\n")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -1229,6 +1365,7 @@ def entry_point(argv):
         test_xor8_filter(base_dir)
         test_filter_integration(base_dir)
         test_retract_pk(base_dir)
+        test_enforce_unique_pk(base_dir)
         os.write(1, "\nALL STORAGE TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

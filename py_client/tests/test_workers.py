@@ -396,6 +396,79 @@ def test_workers_concurrent_push_same_table(worker_server):
         client.close()
 
 
+def _push_delete(client, tid, tbl_schema, pks):
+    """Push delete-by-PK rows (w=-1) with zero payload."""
+    batch = ZSetBatch(schema=tbl_schema)
+    for pk in pks:
+        batch.pk_lo.append(pk)
+        batch.pk_hi.append(0)
+        batch.weights.append(-1)
+        batch.nulls.append(0)
+    batch.columns = [[], [0] * len(pks)]
+    client.push(tid, tbl_schema, batch)
+
+
+def test_workers_upsert(wclient):
+    """Multi-worker: upsert pk=1 updates val; other PKs unchanged."""
+    tid, tbl_schema = _make_table(wclient)
+
+    batch = ZSetBatch(
+        schema=tbl_schema,
+        pk_lo=[1, 2],
+        pk_hi=[0, 0],
+        weights=[1, 1],
+        nulls=[0, 0],
+        columns=[[], [10, 20]],
+    )
+    wclient.push(tid, tbl_schema, batch)
+
+    # Upsert pk=1 with new val=99
+    upsert = ZSetBatch(
+        schema=tbl_schema,
+        pk_lo=[1],
+        pk_hi=[0],
+        weights=[1],
+        nulls=[0],
+        columns=[[], [99]],
+    )
+    wclient.push(tid, tbl_schema, upsert)
+
+    schema, result = wclient.scan(tid)
+    assert result is not None
+    rows = {result.pk_lo[i]: result.columns[1][i]
+            for i in range(len(result.pk_lo))
+            if result.weights[i] > 0}
+    assert len(rows) == 2
+    assert rows[1] == 99
+    assert rows[2] == 20
+
+
+def test_workers_delete_by_pk(wclient):
+    """Multi-worker: delete pk=2 by PK; pk=1 and pk=3 remain."""
+    tid, tbl_schema = _make_table(wclient)
+
+    batch = ZSetBatch(
+        schema=tbl_schema,
+        pk_lo=[1, 2, 3],
+        pk_hi=[0, 0, 0],
+        weights=[1, 1, 1],
+        nulls=[0, 0, 0],
+        columns=[[], [10, 20, 30]],
+    )
+    wclient.push(tid, tbl_schema, batch)
+
+    _push_delete(wclient, tid, tbl_schema, [2])
+
+    schema, result = wclient.scan(tid)
+    assert result is not None
+    present_pks = sorted(
+        result.pk_lo[i]
+        for i in range(len(result.pk_lo))
+        if result.weights[i] > 0
+    )
+    assert present_pks == [1, 3]
+
+
 def test_workers_concurrent_push_multi_table(worker_server):
     """Processes push to different tables simultaneously.
 

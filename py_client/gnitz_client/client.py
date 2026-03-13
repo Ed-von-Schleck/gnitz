@@ -167,6 +167,48 @@ class GnitzClient:
         hdr, resp_schema, resp_batch = self._receive()
         return resp_schema, resp_batch
 
+    def delete(self, target_id: int, schema: Schema, pks: list[int]):
+        """Delete rows by primary key. Server fills in stored payload (unique_pk tables)."""
+        n = len(pks)
+        ncols = len(schema.columns)
+        cols: list[list] = []
+        for c in range(ncols):
+            if c == schema.pk_index:
+                cols.append([])
+            else:
+                cols.append([0] * n)
+        b = ZSetBatch(
+            schema=schema,
+            pk_lo=list(pks),
+            pk_hi=[0] * n,
+            weights=[-1] * n,
+            nulls=[0] * n,
+            columns=cols,
+        )
+        self.push(target_id, schema, b)
+
+    def update(self, target_id: int, schema: Schema, rows: list[list]):
+        """Upsert rows. Server auto-retracts old row with same PK (unique_pk tables).
+        rows: list of column value lists in schema column order."""
+        n = len(rows)
+        ncols = len(schema.columns)
+        pk_lo_list = [row[schema.pk_index] for row in rows]
+        cols: list[list] = []
+        for c in range(ncols):
+            if c == schema.pk_index:
+                cols.append([])
+            else:
+                cols.append([row[c] for row in rows])
+        b = ZSetBatch(
+            schema=schema,
+            pk_lo=pk_lo_list,
+            pk_hi=[0] * n,
+            weights=[1] * n,
+            nulls=[0] * n,
+            columns=cols,
+        )
+        self.push(target_id, schema, b)
+
     def allocate_table_id(self) -> int:
         """Ask server to atomically allocate a table/view ID."""
         self._send(target_id=0, flags=FLAG_ALLOCATE_TABLE_ID)
