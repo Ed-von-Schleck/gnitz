@@ -142,6 +142,7 @@ class WorkerProcess(object):
             family.store.flush()
             evaluate_dag(self.engine, target_id, effective,
                          exchange_handler=self.exchange_handler)
+            effective.free()
         else:
             family.store.ingest_batch(batch)
             family.store.flush()

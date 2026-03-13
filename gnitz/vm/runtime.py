@@ -117,15 +117,16 @@ class ExecutablePlan(object):
         "exchange_post_plan", "exchange_shard_cols",
     ]
 
-    def __init__(self, program, reg_file, out_schema, in_reg_idx=0, out_reg_idx=1):
+    def __init__(self, program, reg_file, out_schema, in_reg_idx=0, out_reg_idx=1,
+                 exchange_post_plan=None, exchange_shard_cols=None):
         self.program = program
         self.reg_file = reg_file
         self.out_schema = out_schema
         self.in_reg_idx = in_reg_idx
         self.out_reg_idx = out_reg_idx
         self.context = ExecutionContext()
-        self.exchange_post_plan = None    # ExecutablePlan or None
-        self.exchange_shard_cols = None   # list[int] or None
+        self.exchange_post_plan = exchange_post_plan
+        self.exchange_shard_cols = exchange_shard_cols
 
     def execute_epoch(self, input_delta):
         """

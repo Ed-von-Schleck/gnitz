@@ -592,14 +592,6 @@ class ProgramCache(object):
                 # The pre-plan output schema is the schema at the exchange boundary
                 exchange_in_schema = reg_file.registers[in_reg_id_for_exchange].table_schema
 
-                # Finalize the pre-plan
-                program.append(instructions.halt_op())
-                pre_plan = runtime.ExecutablePlan(
-                    program, reg_file, exchange_in_schema,
-                    in_reg_idx=state[_ST_INPUT_DELTA_REG_ID],
-                    out_reg_idx=in_reg_id_for_exchange,
-                )
-
                 # Build the post-plan: fresh register file, continue with remaining nodes
                 post_ordered = []
                 found_exchange = False
@@ -678,8 +670,16 @@ class ProgramCache(object):
                     in_reg_idx=post_input_reg_id,
                     out_reg_idx=post_sink_reg_id,
                 )
-                pre_plan.exchange_post_plan = post_plan
-                pre_plan.exchange_shard_cols = shard_cols
+
+                # Finalize the pre-plan with exchange fields set at construction time
+                program.append(instructions.halt_op())
+                pre_plan = runtime.ExecutablePlan(
+                    program, reg_file, exchange_in_schema,
+                    in_reg_idx=state[_ST_INPUT_DELTA_REG_ID],
+                    out_reg_idx=in_reg_id_for_exchange,
+                    exchange_post_plan=post_plan,
+                    exchange_shard_cols=shard_cols,
+                )
                 return pre_plan
 
             instr = self._emit_node(

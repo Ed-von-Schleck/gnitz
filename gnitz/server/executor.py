@@ -352,6 +352,8 @@ class ServerExecutor(object):
             effective = ingest_to_family(family, in_batch)
             family.store.flush()
             self._evaluate_dag(target_id, effective)
+            if effective is not in_batch:
+                effective.free()
             return None
         else:
             return self._scan_family(target_id)
