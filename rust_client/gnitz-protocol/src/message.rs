@@ -21,12 +21,8 @@ pub fn send_message(
     let ms = meta_schema();
 
     // 1. Determine effective schema batch
-    let owned_sbatch: Option<ZSetBatch> = schema.map(|s| schema_to_batch(s));
-    let effective_schema_batch: Option<&ZSetBatch> = if owned_sbatch.is_some() {
-        owned_sbatch.as_ref()
-    } else {
-        schema_batch_arg
-    };
+    let owned_sbatch: Option<ZSetBatch> = schema.map(schema_to_batch);
+    let effective_schema_batch: Option<&ZSetBatch> = owned_sbatch.as_ref().or(schema_batch_arg);
 
     // 2. Encode schema section
     let (schema_bytes, schema_blob_sz) = match effective_schema_batch {

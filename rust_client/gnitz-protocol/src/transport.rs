@@ -3,11 +3,15 @@ use std::mem::{size_of, zeroed};
 use std::os::unix::io::RawFd;
 use crate::error::ProtocolError;
 
+fn io_err() -> ProtocolError {
+    ProtocolError::IoError(std::io::Error::last_os_error())
+}
+
 pub fn connect(socket_path: &str) -> Result<RawFd, ProtocolError> {
     unsafe {
         let sock_fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0);
         if sock_fd < 0 {
-            return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
+            return Err(io_err());
         }
 
         let mut addr: libc::sockaddr_un = zeroed();
@@ -32,7 +36,7 @@ pub fn connect(socket_path: &str) -> Result<RawFd, ProtocolError> {
         );
         if ret < 0 {
             libc::close(sock_fd);
-            return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
+            return Err(io_err());
         }
 
         Ok(sock_fd)
@@ -44,13 +48,13 @@ pub fn send_memfd(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
         let name = CString::new("gnitz_client").unwrap();
         let mem_fd = libc::memfd_create(name.as_ptr(), 0);
         if mem_fd < 0 {
-            return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
+            return Err(io_err());
         }
 
         if !data.is_empty() {
             if libc::ftruncate(mem_fd, data.len() as libc::off_t) < 0 {
                 libc::close(mem_fd);
-                return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
+                return Err(io_err());
             }
             let ptr = libc::mmap(
                 std::ptr::null_mut(),
@@ -62,7 +66,7 @@ pub fn send_memfd(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
             );
             if ptr == libc::MAP_FAILED {
                 libc::close(mem_fd);
-                return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
+                return Err(io_err());
             }
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
             libc::munmap(ptr, data.len());
@@ -93,7 +97,7 @@ pub fn send_memfd(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
         libc::close(mem_fd);
 
         if ret < 0 {
-            return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
+            return Err(io_err());
         }
 
         Ok(())
@@ -119,7 +123,7 @@ pub fn recv_memfd(sock_fd: RawFd) -> Result<Vec<u8>, ProtocolError> {
 
         let ret = libc::recvmsg(sock_fd, &mut msg, 0);
         if ret < 0 {
-            return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
+            return Err(io_err());
         }
 
         let mut recv_fd: libc::c_int = -1;
@@ -143,7 +147,7 @@ pub fn recv_memfd(sock_fd: RawFd) -> Result<Vec<u8>, ProtocolError> {
         let mut stat_buf: libc::stat = zeroed();
         if libc::fstat(recv_fd, &mut stat_buf) < 0 {
             libc::close(recv_fd);
-            return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
+            return Err(io_err());
         }
 
         let size = stat_buf.st_size as usize;
@@ -162,7 +166,7 @@ pub fn recv_memfd(sock_fd: RawFd) -> Result<Vec<u8>, ProtocolError> {
         );
         if ptr == libc::MAP_FAILED {
             libc::close(recv_fd);
-            return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
+            return Err(io_err());
         }
 
         let result = std::slice::from_raw_parts(ptr as *const u8, size).to_vec();
