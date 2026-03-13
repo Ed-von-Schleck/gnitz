@@ -17,6 +17,7 @@ import pytest
 from gnitz_client import GnitzClient, GnitzError, TypeCode, ColumnDef
 from gnitz_client.batch import ZSetBatch
 from gnitz_client.types import Schema
+from gnitz_client.circuit import CircuitBuilder
 
 
 @pytest.fixture(scope="module")
@@ -239,6 +240,16 @@ def _scan_rows(client, tid):
         rows.append((batch.pk_lo[i], batch.columns[1][i]))
     rows.sort()
     return rows
+
+
+def _build_and_create_view(client, sn, view_name, source_tid, builder_fn, output_cols):
+    """Allocate vid, build circuit via builder_fn, persist, return vid."""
+    vid = client.allocate_table_id()
+    cb = CircuitBuilder(vid, source_tid)
+    builder_fn(cb, vid)
+    graph = cb.build()
+    client.create_view_with_circuit(sn, view_name, graph, output_cols)
+    return vid
 
 
 # -- View tests (DAG evaluation on workers) --------------------------------
@@ -517,3 +528,140 @@ def test_workers_concurrent_push_multi_table(worker_server):
             assert set(result.pk_lo) == expected_pks
     finally:
         client.close()
+
+
+# -- Reduce / exchange tests (Phase 3) ------------------------------------
+
+
+def test_workers_reduce_sum(wclient):
+    """Multi-worker: SUM aggregate across all 4 workers gives correct global result.
+
+    PKs 1-10 land in group 1, PKs 11-20 land in group 2.
+    They hash to different partitions/workers.  The SHARD exchange collects
+    partial sums to the correct worker per group key; the final scan merges
+    globally.  Expected: group1_sum=550, group2_sum=775.
+    """
+    suffix = _uid()
+    sn = "wreduce_" + suffix
+    wclient.create_schema(sn)
+    cols = [
+        ColumnDef("pk", TypeCode.U64),
+        ColumnDef("group_id", TypeCode.I64),
+        ColumnDef("val", TypeCode.I64),
+    ]
+    tid = wclient.create_table(sn, "t_" + suffix, cols, pk_col_idx=0)
+    ts = Schema(columns=cols, pk_index=0)
+
+    out_cols = [
+        ColumnDef("_group_hash", TypeCode.U128),
+        ColumnDef("group_id", TypeCode.I64),
+        ColumnDef("agg", TypeCode.I64),
+    ]
+
+    def build(cb, vid):
+        inp = cb.input_delta()
+        r = cb.reduce(inp, group_by_cols=[1], agg_func_id=2, agg_col_idx=2)
+        cb.sink(r, vid)
+
+    vid = _build_and_create_view(wclient, sn, "v_" + suffix, tid, build, out_cols)
+
+    # pks 1-10: group 1, val = pk*10  → sum = 10*(1+2+…+10) = 550
+    # pks 11-20: group 2, val = pk*5  → sum = 5*(11+12+…+20) = 775
+    pks = list(range(1, 21))
+    groups = [1] * 10 + [2] * 10
+    vals = [pk * 10 for pk in range(1, 11)] + [pk * 5 for pk in range(11, 21)]
+    batch = ZSetBatch(
+        schema=ts,
+        pk_lo=pks,
+        pk_hi=[0] * 20,
+        weights=[1] * 20,
+        nulls=[0] * 20,
+        columns=[[], groups, vals],
+    )
+    wclient.push(tid, ts, batch)
+
+    schema, result = wclient.scan(vid)
+    assert result is not None
+    # collect positive-weight (group_id, agg) pairs
+    agg_by_group = {}
+    for i in range(len(result.pk_lo)):
+        if result.weights[i] > 0:
+            gid = result.columns[1][i]
+            agg = result.columns[2][i]
+            agg_by_group[gid] = agg_by_group.get(gid, 0) + agg
+    assert agg_by_group[1] == 550
+    assert agg_by_group[2] == 775
+
+
+def test_workers_reduce_incremental(wclient):
+    """Multi-worker: incremental retraction updates the aggregate correctly.
+
+    Tick 1: push 4 rows across 2 groups.
+    Tick 2: retract one row from group 1.
+    Verify aggregate after each tick.
+    """
+    suffix = _uid()
+    sn = "wredincr_" + suffix
+    wclient.create_schema(sn)
+    cols = [
+        ColumnDef("pk", TypeCode.U64),
+        ColumnDef("group_id", TypeCode.I64),
+        ColumnDef("val", TypeCode.I64),
+    ]
+    tid = wclient.create_table(sn, "t_" + suffix, cols, pk_col_idx=0)
+    ts = Schema(columns=cols, pk_index=0)
+
+    out_cols = [
+        ColumnDef("_group_hash", TypeCode.U128),
+        ColumnDef("group_id", TypeCode.I64),
+        ColumnDef("agg", TypeCode.I64),
+    ]
+
+    def build(cb, vid):
+        inp = cb.input_delta()
+        r = cb.reduce(inp, group_by_cols=[1], agg_func_id=2, agg_col_idx=2)
+        cb.sink(r, vid)
+
+    vid = _build_and_create_view(wclient, sn, "v_" + suffix, tid, build, out_cols)
+
+    # Tick 1: pk=1,2 → group 1 (vals 10, 20); pk=3,4 → group 2 (vals 30, 40)
+    batch1 = ZSetBatch(
+        schema=ts,
+        pk_lo=[1, 2, 3, 4],
+        pk_hi=[0, 0, 0, 0],
+        weights=[1, 1, 1, 1],
+        nulls=[0, 0, 0, 0],
+        columns=[[], [1, 1, 2, 2], [10, 20, 30, 40]],
+    )
+    wclient.push(tid, ts, batch1)
+
+    def _get_agg(client, vid):
+        _, result = client.scan(vid)
+        if result is None:
+            return {}
+        agg = {}
+        for i in range(len(result.pk_lo)):
+            if result.weights[i] > 0:
+                gid = result.columns[1][i]
+                val = result.columns[2][i]
+                agg[gid] = agg.get(gid, 0) + val
+        return agg
+
+    agg = _get_agg(wclient, vid)
+    assert agg[1] == 30   # 10+20
+    assert agg[2] == 70   # 30+40
+
+    # Tick 2: retract pk=1 (val=10) from group 1
+    batch2 = ZSetBatch(
+        schema=ts,
+        pk_lo=[1],
+        pk_hi=[0],
+        weights=[-1],
+        nulls=[0],
+        columns=[[], [1], [10]],
+    )
+    wclient.push(tid, ts, batch2)
+
+    agg2 = _get_agg(wclient, vid)
+    assert agg2[1] == 20   # only pk=2 remains
+    assert agg2[2] == 70   # unchanged
