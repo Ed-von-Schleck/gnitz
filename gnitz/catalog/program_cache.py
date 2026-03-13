@@ -81,16 +81,54 @@ class ProgramCache(object):
         self.registry = registry
         self._cache = {}
         self._shard_cols_cache = {}
+        self._dep_map = {}
+        self._dep_map_valid = False
 
     def invalidate(self, program_id):
         if program_id in self._cache:
             del self._cache[program_id]
         if program_id in self._shard_cols_cache:
             del self._shard_cols_cache[program_id]
+        self._dep_map_valid = False
 
     def invalidate_all(self):
         self._cache.clear()
         self._shard_cols_cache.clear()
+        self._dep_map_valid = False
+
+    def invalidate_dep_map(self):
+        self._dep_map_valid = False
+
+    def get_dep_map(self, registry):
+        if self._dep_map_valid:
+            return self._dep_map
+        dep_map = {}
+        if registry.has_id(sys.DepTab.ID):
+            deps_family = registry.get_by_id(sys.DepTab.ID)
+            cursor = deps_family.store.create_cursor()
+            try:
+                while cursor.is_valid():
+                    if cursor.weight() > r_int64(0):
+                        acc = cursor.get_accessor()
+                        v_id    = intmask(r_uint64(acc.get_int(sys.DepTab.COL_VIEW_ID)))
+                        dep_tid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)))
+                        dep_vid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)))
+                        if dep_tid > 0:
+                            if dep_tid not in dep_map:
+                                dep_map[dep_tid] = []
+                            if v_id not in dep_map[dep_tid]:
+                                dep_map[dep_tid].append(v_id)
+                        if dep_vid > 0:
+                            if dep_vid not in dep_map:
+                                dep_map[dep_vid] = []
+                            if v_id not in dep_map[dep_vid]:
+                                dep_map[dep_vid].append(v_id)
+                    cursor.advance()
+            finally:
+                cursor.close()
+        self._dep_map = dep_map
+        self._dep_map_valid = True
+        return dep_map
 
     def get_program(self, program_id):
         if program_id in self._cache:

@@ -228,6 +228,7 @@ class Engine(object):
         # 2. View dependency records
         self._write_view_deps(vid, graph.dependencies)
         self.sys.view_deps.flush()
+        self.program_cache.invalidate_dep_map()
 
         # 3. Circuit graph records
         self._write_circuit_graph(vid, graph)

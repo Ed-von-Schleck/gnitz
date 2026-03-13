@@ -285,6 +285,18 @@ class ViewEffectHook(DeltaHook):
                     self.registry.unregister(family.schema_name, family.table_name)
 
 
+class DepTabEffectHook(DeltaHook):
+    """Invalidates the cached dep_map whenever DepTab is modified."""
+
+    _immutable_fields_ = ["program_cache"]
+
+    def __init__(self, program_cache):
+        self.program_cache = program_cache
+
+    def on_delta(self, batch):
+        self.program_cache.invalidate_dep_map()
+
+
 class IndexEffectHook(DeltaHook):
     """Reacts to additions or removals of secondary index circuits."""
 
@@ -368,5 +380,8 @@ def wire_catalog_hooks(registry, sys_tables, base_dir, program_cache):
     indices_family.post_ingest_hooks.append(
         IndexEffectHook(registry, sys_tables, base_dir)
     )
+
+    deps_family = registry.get("_system", sys.DepTab.NAME)
+    deps_family.post_ingest_hooks.append(DepTabEffectHook(program_cache))
 
     return table_hook

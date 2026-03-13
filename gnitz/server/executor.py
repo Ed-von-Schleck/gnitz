@@ -11,6 +11,7 @@ from gnitz.core.batch import ZSetBatch, BatchWriter
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import ingest_to_family, validate_fk_distributed
 from gnitz.dbsp import ops
+from gnitz import log
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 
@@ -20,6 +21,17 @@ def _sort_pending(pending):
         item = pending[i]
         j = i - 1
         while j >= 0 and pending[j][0] > item[0]:
+            pending[j + 1] = pending[j]
+            j -= 1
+        pending[j + 1] = item
+
+
+def _sort_pending_desc(pending):
+    """Insertion sort by depth DESCENDING (deeper left, shallowest at tail). RPython-safe."""
+    for i in range(1, len(pending)):
+        item = pending[i]
+        j = i - 1
+        while j >= 0 and pending[j][0] < item[0]:
             pending[j + 1] = pending[j]
             j -= 1
         pending[j + 1] = item
@@ -67,46 +79,28 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
     registry = engine.registry
     program_cache = engine.program_cache
 
-    # Build dep_map once: source_id -> [view_id, ...]
-    dep_map = {}
-    if registry.has_id(sys.DepTab.ID):
-        deps_family = registry.get_by_id(sys.DepTab.ID)
-        cursor = deps_family.store.create_cursor()
-        try:
-            while cursor.is_valid():
-                if cursor.weight() > r_int64(0):
-                    acc = cursor.get_accessor()
-                    v_id    = intmask(r_uint64(acc.get_int(sys.DepTab.COL_VIEW_ID)))
-                    dep_tid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)))
-                    dep_vid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)))
-                    if dep_tid > 0:
-                        if dep_tid not in dep_map:
-                            dep_map[dep_tid] = []
-                        if v_id not in dep_map[dep_tid]:
-                            dep_map[dep_tid].append(v_id)
-                    if dep_vid > 0:
-                        if dep_vid not in dep_map:
-                            dep_map[dep_vid] = []
-                        if v_id not in dep_map[dep_vid]:
-                            dep_map[dep_vid].append(v_id)
-                cursor.advance()
-        finally:
-            cursor.close()
+    dep_map = program_cache.get_dep_map(registry)
 
-    # pending: list of (depth, view_id, batch), sorted ascending by depth
+    # pending: list of (depth, view_id, batch), sorted DESCENDING by depth
+    # so the shallowest (min-depth) node is always at the tail for O(1) pop.
     first_layer = dep_map.get(initial_source_id, [])
     pending = []
+    pending_pos = {}   # view_id -> index in pending
     for v_id in first_layer:
         d = registry.get_depth(v_id)
         pending.append((d, v_id, initial_delta.clone()))
-    _sort_pending(pending)
+    _sort_pending_desc(pending)
+    for pi in range(len(pending)):
+        pending_pos[pending[pi][1]] = pi
 
     while len(pending) > 0:
-        depth, target_view_id, incoming_delta = pending[0]
-        del pending[0]
+        depth, target_view_id, incoming_delta = pending[-1]   # O(1) tail = min-depth
+        del pending[-1]                                        # O(1)
+        del pending_pos[target_view_id]
 
         plan = program_cache.get_program(target_view_id)
         if plan is None:
+            log.warn("evaluate_dag: no plan for view_id=%d, skipping" % target_view_id)
             incoming_delta.free()
             continue
 
@@ -148,19 +142,16 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
         if has_output or exchange_handler is not None:
             dependents = dep_map.get(target_view_id, [])
             for dep_id in dependents:
-                found = -1
-                for pi in range(len(pending)):
-                    if pending[pi][1] == dep_id:
-                        found = pi
-                        break
-                if found >= 0:
+                if dep_id in pending_pos:                        # O(1) lookup
                     if has_output:
+                        found = pending_pos[dep_id]
                         existing_d, existing_id, existing_batch = pending[found]
                         merged = ZSetBatch(existing_batch._schema)
                         writer = BatchWriter(merged)
                         ops.op_union(existing_batch, out_delta, writer)
                         existing_batch.free()
                         pending[found] = (existing_d, existing_id, merged)
+                        # pending_pos[dep_id] unchanged — in-place update
                 else:
                     d = registry.get_depth(dep_id)
                     if has_output:
@@ -168,9 +159,13 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                     else:
                         dep_family = registry.get_by_id(dep_id)
                         pending.append((d, dep_id, ZSetBatch(dep_family.schema)))
-                    _sort_pending(pending)
+                    _sort_pending_desc(pending)
+                    # All positions may have shifted — full rebuild
+                    pending_pos.clear()
+                    for pi in range(len(pending)):
+                        pending_pos[pending[pi][1]] = pi
 
-        if out_delta is not None and out_delta.length() > 0:
+        if has_output:
             out_delta.free()
 
 
@@ -215,6 +210,11 @@ class ServerExecutor(object):
         self.fd_to_client = {}  # int(fd) -> int(client_id)
         self.client_to_fd = {}  # int(client_id) -> int(fd)
 
+        # Poll-cache: rebuilt only when active_fds changes (Fix N2)
+        self._poll_fds    = newlist_hint(8)
+        self._poll_events = newlist_hint(8)
+        self._poll_dirty  = True
+
     def run_socket_server(self, socket_path):
         server_fd = ipc_ffi.server_create(socket_path)
         if server_fd < 0:
@@ -242,15 +242,16 @@ class ServerExecutor(object):
                     self.dispatcher.shutdown_workers()
                     return
 
-            count = len(self.active_fds)
-            fds = newlist_hint(count)
-            events = newlist_hint(count)
-
-            for i in range(count):
-                fds.append(self.active_fds[i])
-                events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
-
-            revents = ipc_ffi.poll(fds, events, 500)
+            if self._poll_dirty:
+                count = len(self.active_fds)
+                self._poll_fds = newlist_hint(count)
+                self._poll_events = newlist_hint(count)
+                for i in range(count):
+                    self._poll_fds.append(self.active_fds[i])
+                    self._poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
+                self._poll_dirty = False
+            fds = self._poll_fds
+            revents = ipc_ffi.poll(self._poll_fds, self._poll_events, 500)
 
             # Phase 1: Drain all ready FDs
             pending_fds = newlist_hint(16)
@@ -290,6 +291,7 @@ class ServerExecutor(object):
                                 break
                             self.active_fds.append(c_fd)
                             self.client_fds[c_fd] = 1
+                            self._poll_dirty = True
                     else:
                         while True:
                             rows = self._drain_client(
@@ -411,19 +413,21 @@ class ServerExecutor(object):
                 self.fd_to_client[fd] = client_id
                 self.client_to_fd[client_id] = fd
 
-            # Schema validation (if pushing data)
-            if payload.batch is not None and payload.schema is not None:
+            # Hoist family lookup: used by schema validation, buffering, broadcast,
+            # and response — look it up once when a batch is present.
+            family = None
+            if payload.batch is not None:
                 family = self.engine.registry.get_by_id(target_id)
-                _validate_schema_match(payload.schema, family.schema)
+                if payload.schema is not None:
+                    _validate_schema_match(payload.schema, family.schema)
 
             # Bufferable: multi-worker user-table DML with data
             if (
                 self.dispatcher is not None
                 and target_id >= sys.FIRST_USER_TABLE_ID
-                and payload.batch is not None
+                and family is not None
                 and payload.batch.length() > 0
             ):
-                family = self.engine.registry.get_by_id(target_id)
                 validate_fk_distributed(
                     family, payload.batch, self.dispatcher
                 )
@@ -443,10 +447,9 @@ class ServerExecutor(object):
             if (
                 self.dispatcher is not None
                 and target_id < sys.FIRST_USER_TABLE_ID
-                and payload.batch is not None
+                and family is not None
                 and payload.batch.length() > 0
             ):
-                family = self.engine.registry.get_by_id(target_id)
                 self.dispatcher.broadcast_ddl(
                     target_id, payload.batch, family.schema
                 )
@@ -455,9 +458,10 @@ class ServerExecutor(object):
             resp_schema = None
             if result is not None:
                 resp_schema = result._schema
-            else:
-                family = self.engine.registry.get_by_id(target_id)
+            elif family is not None:
                 resp_schema = family.schema
+            else:
+                resp_schema = self.engine.registry.get_by_id(target_id).schema
             ipc.send_batch(
                 fd, target_id, result, STATUS_OK, "",
                 client_id, schema=resp_schema,
@@ -551,8 +555,10 @@ class ServerExecutor(object):
                 del self.client_to_fd[client_id]
             del self.fd_to_client[fd]
 
-        new_fds = newlist_hint(len(self.active_fds))
-        for active_fd in self.active_fds:
-            if active_fd != fd:
-                new_fds.append(active_fd)
-        self.active_fds = new_fds
+        for i in range(len(self.active_fds)):
+            if self.active_fds[i] == fd:
+                last = len(self.active_fds) - 1
+                self.active_fds[i] = self.active_fds[last]
+                del self.active_fds[last]
+                break
+        self._poll_dirty = True
