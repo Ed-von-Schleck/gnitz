@@ -1,0 +1,34 @@
+import gnitz._native as _native
+
+
+class CircuitBuilder:
+    def __init__(self, view_id, source_table_id):
+        self._view_id = view_id
+        self._native  = _native.CircuitBuilder(view_id, source_table_id)
+
+    def input_delta(self):                        return self._native.input_delta()
+    def trace_scan(self, table_id):               return self._native.trace_scan(table_id)
+    def negate(self, input):                      return self._native.negate(input)
+    def union(self, a, b):                        return self._native.union(a, b)
+    def delay(self, input):                       return self._native.delay(input)
+    def distinct(self, input):                    return self._native.distinct(input)
+    def filter(self, input, expr=None):           return self._native.filter(input, expr)
+    def map(self, input, projection=None):        return self._native.map(input, projection)
+    def join(self, delta, trace_table_id):        return self._native.join(delta, trace_table_id)
+    def anti_join(self, delta, trace_table_id):   return self._native.anti_join(delta, trace_table_id)
+    def semi_join(self, delta, trace_table_id):   return self._native.semi_join(delta, trace_table_id)
+    def shard(self, input, shard_columns):        return self._native.shard(input, shard_columns)
+    def gather(self, input, worker_id=0):         return self._native.gather(input, worker_id)
+    def sink(self, input, target_table_id):       return self._native.sink(input, target_table_id)
+
+    def reduce(self, input, group_by_cols, agg_func_id=0, agg_col_idx=0):
+        return self._native.reduce(input, group_by_cols, agg_func_id, agg_col_idx)
+
+    def build(self):
+        return CircuitGraph(self._view_id, self._native.build())
+
+
+class CircuitGraph:
+    def __init__(self, view_id, graph):
+        self._view_id = view_id
+        self._graph   = graph  # _native.CircuitGraph (consumed on create_view_with_circuit)

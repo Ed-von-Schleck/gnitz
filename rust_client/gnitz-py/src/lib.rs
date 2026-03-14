@@ -8,7 +8,7 @@ use gnitz_protocol::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 // GnitzError Python exception
 // ---------------------------------------------------------------------------
 
-pyo3::create_exception!(gnitz, GnitzError, pyo3::exceptions::PyException);
+pyo3::create_exception!(_native, GnitzError, pyo3::exceptions::PyException);
 
 // ---------------------------------------------------------------------------
 // TypeCode — Python class whose class attributes mirror gnitz_client.TypeCode
@@ -694,7 +694,7 @@ impl PyCircuitGraph {
 // ---------------------------------------------------------------------------
 
 #[pymodule]
-fn gnitz(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTypeCode>()?;
     m.add_class::<PyColumnDef>()?;
     m.add_class::<PySchema>()?;

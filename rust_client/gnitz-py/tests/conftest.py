@@ -35,6 +35,5 @@ def server():
 
 @pytest.fixture
 def client(server):
-    c = gnitz.GnitzClient(server)
-    yield c
-    c.close()
+    with gnitz.connect(server) as conn:
+        yield conn

@@ -13,6 +13,7 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    "maturin>=1.12.6",
     "pytest>=9.0.2",
 ]
 

@@ -17,9 +17,9 @@ def test_create_schema(client):
 def test_create_table(client):
     sn = "s" + _uid()
     client.create_schema(sn)
-    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-    tid = client.create_table(sn, "nums", cols, pk_col_idx=0)
+    tid = client.create_table(sn, "nums", cols)
     assert tid > 0
     client.drop_table(sn, "nums")
     client.drop_schema(sn)
@@ -41,9 +41,9 @@ def test_drop_table_not_found(client):
 def test_create_table_with_string_col(client):
     sn = "s" + _uid()
     client.create_schema(sn)
-    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("label", gnitz.TypeCode.STRING, is_nullable=True)]
-    tid = client.create_table(sn, "labels", cols, pk_col_idx=0)
+    tid = client.create_table(sn, "labels", cols)
     assert tid > 0
     client.drop_table(sn, "labels")
     client.drop_schema(sn)
@@ -52,9 +52,9 @@ def test_create_table_with_string_col(client):
 def test_resolve_table_id(client):
     sn = "s" + _uid()
     client.create_schema(sn)
-    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-    tid = client.create_table(sn, "t", cols, pk_col_idx=0)
+    tid = client.create_table(sn, "t", cols)
     resolved_tid, schema = client.resolve_table_id(sn, "t")
     assert resolved_tid == tid
     assert len(schema.columns) == 2
