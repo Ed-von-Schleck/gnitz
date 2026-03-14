@@ -4,7 +4,7 @@ mod helpers;
 
 use gnitz_core::{Connection, alloc_table_id, alloc_schema_id, push, scan,
                  SCHEMA_TAB, FIRST_USER_TABLE_ID};
-use gnitz_core::GnitzClient;
+use gnitz_core::{GnitzClient, ExprBuilder, CircuitBuilder};
 use gnitz_protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData};
 use helpers::ServerHandle;
 
@@ -342,6 +342,360 @@ fn test_resolve_table_id() {
     assert_eq!(schema.columns[2].name, "score");
     assert_eq!(schema.columns[2].type_code, TypeCode::F64);
     assert!(schema.columns[2].is_nullable);
+
+    client.close();
+}
+
+// --- Phase 5: circuit and expression builder tests ---
+
+/// Read i64 from a Fixed ColData column at row i (stride = 8).
+fn col_i64(col: &ColData, i: usize) -> i64 {
+    match col {
+        ColData::Fixed(b) => i64::from_le_bytes(b[i*8..(i+1)*8].try_into().unwrap()),
+        _ => panic!("col_i64: expected Fixed"),
+    }
+}
+
+#[test]
+fn test_filter_view() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+
+    client.create_schema("sv1").unwrap();
+    let cols = vec![
+        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
+        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+    ];
+    let tid = client.create_table("sv1", "ft1", &cols, 0, true).unwrap();
+
+    // Build filter: val > 50
+    let mut eb = ExprBuilder::new();
+    let r0 = eb.load_col_int(1);  // col 1 = val
+    let r1 = eb.load_const(50);
+    let r2 = eb.cmp_gt(r0, r1);
+    let expr = eb.build(r2);
+
+    let vid = client.alloc_table_id().unwrap();
+    let mut cb = CircuitBuilder::new(vid, tid);
+    let inp = cb.input_delta();
+    let f   = cb.filter(inp, Some(expr));
+    cb.sink(f, vid);
+    let circuit = cb.build();
+
+    let table_schema = Schema { columns: cols, pk_index: 0 };
+    client.create_view_with_circuit("sv1", "filter_v", circuit, &table_schema.columns).unwrap();
+
+    let mut batch = ZSetBatch::new(&table_schema);
+    for &(pk, val) in &[(1u64, 10i64), (2, 30), (3, 50), (4, 70), (5, 90)] {
+        batch.pk_lo.push(pk);
+        batch.pk_hi.push(0);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+    client.push(tid, &table_schema, &batch).unwrap();
+
+    let (_, data) = client.scan(vid).unwrap();
+    let data = data.unwrap();
+    let mut positive_pks: Vec<u64> = data.pk_lo.iter().copied()
+        .zip(data.weights.iter().copied())
+        .filter(|(_, w)| *w > 0)
+        .map(|(pk, _)| pk)
+        .collect();
+    positive_pks.sort_unstable();
+    assert_eq!(positive_pks, vec![4, 5],
+        "filter val>50 should keep pks 4 and 5; got {:?}", positive_pks);
+
+    client.close();
+}
+
+#[test]
+fn test_reduce_view() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+
+    client.create_schema("sv2").unwrap();
+    let cols = vec![
+        ColumnDef { name: "pk".into(),       type_code: TypeCode::U64, is_nullable: false },
+        ColumnDef { name: "group_id".into(), type_code: TypeCode::I64, is_nullable: false },
+        ColumnDef { name: "val".into(),      type_code: TypeCode::I64, is_nullable: false },
+    ];
+    let tid = client.create_table("sv2", "rt2", &cols, 0, true).unwrap();
+
+    let vid = client.alloc_table_id().unwrap();
+    let mut cb = CircuitBuilder::new(vid, tid);
+    let inp = cb.input_delta();
+    // group by col 1, SUM col 2; agg_func_id=2 (SUM)
+    let red = cb.reduce(inp, &[1], 2, 2);
+    cb.sink(red, vid);
+    let circuit = cb.build();
+
+    let out_cols = vec![
+        ColumnDef { name: "_group_hash".into(), type_code: TypeCode::U128, is_nullable: false },
+        ColumnDef { name: "group_id".into(),    type_code: TypeCode::I64,  is_nullable: false },
+        ColumnDef { name: "agg".into(),         type_code: TypeCode::I64,  is_nullable: false },
+    ];
+    client.create_view_with_circuit("sv2", "reduce_v", circuit, &out_cols).unwrap();
+
+    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let mut batch = ZSetBatch::new(&table_schema);
+    // group=1: vals 10, 20 → sum=30
+    // group=2: vals 30, 40 → sum=70
+    for &(pk, gid, val) in &[(1u64, 1i64, 10i64), (2, 1, 20), (3, 2, 30), (4, 2, 40)] {
+        batch.pk_lo.push(pk);
+        batch.pk_hi.push(0);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] { buf.extend_from_slice(&gid.to_le_bytes()); }
+        if let ColData::Fixed(buf) = &mut batch.columns[2] { buf.extend_from_slice(&val.to_le_bytes()); }
+    }
+    client.push(tid, &table_schema, &batch).unwrap();
+
+    let (_, data) = client.scan(vid).unwrap();
+    let data = data.unwrap();
+
+    let mut group1_sum: i64 = 0;
+    let mut group2_sum: i64 = 0;
+    for i in 0..data.len() {
+        if data.weights[i] <= 0 { continue; }
+        let gid = col_i64(&data.columns[1], i);
+        let agg = col_i64(&data.columns[2], i);
+        if gid == 1 { group1_sum += agg; }
+        if gid == 2 { group2_sum += agg; }
+    }
+    assert_eq!(group1_sum, 30, "group1 sum should be 30; got {}", group1_sum);
+    assert_eq!(group2_sum, 70, "group2 sum should be 70; got {}", group2_sum);
+
+    client.close();
+}
+
+#[test]
+fn test_join_view() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+
+    client.create_schema("sv3").unwrap();
+    let cols = vec![
+        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
+        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+    ];
+    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let tid_a = client.create_table("sv3", "jt3a", &table_schema.columns, 0, true).unwrap();
+    let tid_b = client.create_table("sv3", "jt3b", &table_schema.columns, 0, true).unwrap();
+
+    // Pre-populate B with pk=1,2,3
+    let mut batch_b = ZSetBatch::new(&table_schema);
+    for &pk in &[1u64, 2, 3] {
+        batch_b.pk_lo.push(pk);
+        batch_b.pk_hi.push(0);
+        batch_b.weights.push(1);
+        batch_b.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch_b.columns[1] { buf.extend_from_slice(&0i64.to_le_bytes()); }
+    }
+    client.push(tid_b, &table_schema, &batch_b).unwrap();
+
+    let vid = client.alloc_table_id().unwrap();
+    let mut cb = CircuitBuilder::new(vid, tid_a);
+    let inp    = cb.input_delta();
+    let joined = cb.join(inp, tid_b);
+    cb.sink(joined, vid);
+    let circuit = cb.build();
+
+    client.create_view_with_circuit("sv3", "join_v", circuit, &table_schema.columns).unwrap();
+
+    // Push A rows: pk=1 (matches B), pk=4 (no match)
+    let mut batch_a = ZSetBatch::new(&table_schema);
+    for &pk in &[1u64, 4] {
+        batch_a.pk_lo.push(pk);
+        batch_a.pk_hi.push(0);
+        batch_a.weights.push(1);
+        batch_a.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch_a.columns[1] { buf.extend_from_slice(&0i64.to_le_bytes()); }
+    }
+    client.push(tid_a, &table_schema, &batch_a).unwrap();
+
+    let (_, data) = client.scan(vid).unwrap();
+    let data = data.unwrap();
+    let positive_pks: Vec<u64> = data.pk_lo.iter().copied()
+        .zip(data.weights.iter().copied())
+        .filter(|(_, w)| *w > 0)
+        .map(|(pk, _)| pk)
+        .collect();
+    assert!(positive_pks.contains(&1), "pk=1 should be in join output; got {:?}", positive_pks);
+    assert!(!positive_pks.contains(&4), "pk=4 should not be in join output (no match in B)");
+
+    client.close();
+}
+
+#[test]
+fn test_anti_join_view() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+
+    client.create_schema("sv4").unwrap();
+    let cols = vec![
+        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
+        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+    ];
+    let table_schema = Schema { columns: cols, pk_index: 0 };
+    let tid_a = client.create_table("sv4", "ajt4a", &table_schema.columns, 0, true).unwrap();
+    let tid_b = client.create_table("sv4", "ajt4b", &table_schema.columns, 0, true).unwrap();
+
+    // Pre-populate B with pk=1,2
+    let mut batch_b = ZSetBatch::new(&table_schema);
+    for &pk in &[1u64, 2] {
+        batch_b.pk_lo.push(pk);
+        batch_b.pk_hi.push(0);
+        batch_b.weights.push(1);
+        batch_b.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch_b.columns[1] { buf.extend_from_slice(&0i64.to_le_bytes()); }
+    }
+    client.push(tid_b, &table_schema, &batch_b).unwrap();
+
+    let vid = client.alloc_table_id().unwrap();
+    let mut cb = CircuitBuilder::new(vid, tid_a);
+    let inp  = cb.input_delta();
+    let anti = cb.anti_join(inp, tid_b);
+    cb.sink(anti, vid);
+    let circuit = cb.build();
+
+    client.create_view_with_circuit("sv4", "antijoin_v", circuit, &table_schema.columns).unwrap();
+
+    // Push A rows: pk=1,2,3; only pk=3 has no match in B
+    let mut batch_a = ZSetBatch::new(&table_schema);
+    for &pk in &[1u64, 2, 3] {
+        batch_a.pk_lo.push(pk);
+        batch_a.pk_hi.push(0);
+        batch_a.weights.push(1);
+        batch_a.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch_a.columns[1] { buf.extend_from_slice(&0i64.to_le_bytes()); }
+    }
+    client.push(tid_a, &table_schema, &batch_a).unwrap();
+
+    let (_, data) = client.scan(vid).unwrap();
+    let data = data.unwrap();
+    let positive_pks: Vec<u64> = data.pk_lo.iter().copied()
+        .zip(data.weights.iter().copied())
+        .filter(|(_, w)| *w > 0)
+        .map(|(pk, _)| pk)
+        .collect();
+    assert_eq!(positive_pks, vec![3],
+        "anti-join should keep only pk=3 (no match in B); got {:?}", positive_pks);
+
+    client.close();
+}
+
+#[test]
+fn test_exchange_multi_worker() {
+    let srv = match ServerHandle::start_n(4) { Some(s) => s, None => return };
+    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+
+    client.create_schema("sv5").unwrap();
+    let cols = vec![
+        ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
+    ];
+    let tid = client.create_table("sv5", "et5", &cols, 0, true).unwrap();
+    let table_schema = Schema { columns: cols, pk_index: 0 };
+
+    // Push 1000 rows
+    let mut batch = ZSetBatch::new(&table_schema);
+    for pk in 1u64..=1000 {
+        batch.pk_lo.push(pk);
+        batch.pk_hi.push(0);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+    }
+    client.push(tid, &table_schema, &batch).unwrap();
+
+    let (_, data) = client.scan(tid).unwrap();
+    let data = data.unwrap();
+    let mut pks: Vec<u64> = data.pk_lo.iter().copied()
+        .zip(data.weights.iter().copied())
+        .filter(|(_, w)| *w > 0)
+        .map(|(pk, _)| pk)
+        .collect();
+    pks.sort_unstable();
+    assert_eq!(pks.len(), 1000, "expected 1000 rows; got {}", pks.len());
+    assert_eq!(pks[0], 1);
+    assert_eq!(pks[999], 1000);
+
+    client.close();
+}
+
+#[test]
+fn test_incremental_update() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+
+    client.create_schema("sv6").unwrap();
+    let table_schema = Schema {
+        columns: vec![
+            ColumnDef { name: "pk".into(),       type_code: TypeCode::U64, is_nullable: false },
+            ColumnDef { name: "group_id".into(), type_code: TypeCode::I64, is_nullable: false },
+            ColumnDef { name: "val".into(),      type_code: TypeCode::I64, is_nullable: false },
+        ],
+        pk_index: 0,
+    };
+    let tid = client.create_table("sv6", "iu6", &table_schema.columns, 0, true).unwrap();
+
+    let vid = client.alloc_table_id().unwrap();
+    let mut cb = CircuitBuilder::new(vid, tid);
+    let inp = cb.input_delta();
+    let red = cb.reduce(inp, &[1], 2, 2);
+    cb.sink(red, vid);
+    let circuit = cb.build();
+
+    let out_cols = vec![
+        ColumnDef { name: "_group_hash".into(), type_code: TypeCode::U128, is_nullable: false },
+        ColumnDef { name: "group_id".into(),    type_code: TypeCode::I64,  is_nullable: false },
+        ColumnDef { name: "agg".into(),         type_code: TypeCode::I64,  is_nullable: false },
+    ];
+    client.create_view_with_circuit("sv6", "incr_v", circuit, &out_cols).unwrap();
+
+    // Tick 1: push pk=1,2 (group=1, vals=10,20) and pk=3,4 (group=2, vals=30,40)
+    let mut batch = ZSetBatch::new(&table_schema);
+    for &(pk, gid, val) in &[(1u64, 1i64, 10i64), (2, 1, 20), (3, 2, 30), (4, 2, 40)] {
+        batch.pk_lo.push(pk);
+        batch.pk_hi.push(0);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] { buf.extend_from_slice(&gid.to_le_bytes()); }
+        if let ColData::Fixed(buf) = &mut batch.columns[2] { buf.extend_from_slice(&val.to_le_bytes()); }
+    }
+    client.push(tid, &table_schema, &batch).unwrap();
+
+    // Verify tick 1: group1=30, group2=70
+    let (_, data1) = client.scan(vid).unwrap();
+    let data1 = data1.unwrap();
+    let (mut g1, mut g2) = (0i64, 0i64);
+    for i in 0..data1.len() {
+        if data1.weights[i] <= 0 { continue; }
+        let gid = col_i64(&data1.columns[1], i);
+        let agg = col_i64(&data1.columns[2], i);
+        if gid == 1 { g1 += agg; }
+        if gid == 2 { g2 += agg; }
+    }
+    assert_eq!(g1, 30, "tick1 group1 should be 30; got {}", g1);
+    assert_eq!(g2, 70, "tick1 group2 should be 70; got {}", g2);
+
+    // Tick 2: retract pk=1 (group=1, val=10)
+    client.delete(tid, &table_schema, &[(1u64, 0u64)]).unwrap();
+
+    // Verify tick 2: group1=20, group2=70 (unchanged)
+    let (_, data2) = client.scan(vid).unwrap();
+    let data2 = data2.unwrap();
+    let (mut g1, mut g2) = (0i64, 0i64);
+    for i in 0..data2.len() {
+        if data2.weights[i] <= 0 { continue; }
+        let gid = col_i64(&data2.columns[1], i);
+        let agg = col_i64(&data2.columns[2], i);
+        if gid == 1 { g1 += agg; }
+        if gid == 2 { g2 += agg; }
+    }
+    assert_eq!(g1, 20, "tick2 group1 should be 20 after retraction; got {}", g1);
+    assert_eq!(g2, 70, "tick2 group2 should be 70 (unchanged); got {}", g2);
 
     client.close();
 }

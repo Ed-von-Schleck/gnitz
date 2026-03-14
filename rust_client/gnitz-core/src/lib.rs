@@ -3,6 +3,8 @@ pub mod connection;
 pub mod ops;
 pub mod types;
 pub mod client;
+pub mod expr;
+pub mod circuit;
 
 pub use error::ClientError;
 pub use connection::Connection;
@@ -12,6 +14,8 @@ pub use ops::{
     FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
 };
 pub use client::GnitzClient;
+pub use expr::{ExprBuilder, ExprProgram};
+pub use circuit::{CircuitBuilder, NodeId};
 pub use types::{
     CircuitGraph,
     CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_SOURCES_TAB,
