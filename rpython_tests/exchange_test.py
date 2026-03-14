@@ -18,7 +18,7 @@ from rpython.rlib.rarithmetic import (
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core import types, batch
-from gnitz.core.batch import RowBuilder, ZSetBatch
+from gnitz.core.batch import RowBuilder, ArenaZSetBatch
 from gnitz.catalog import engine
 from gnitz.catalog.registry import ingest_to_family
 from gnitz.catalog.metadata import ensure_dir
@@ -96,7 +96,7 @@ def test_hash_distribution():
         _make_table_cols_i64(["val"]),
         pk_index=0,
     )
-    b = batch.ZSetBatch(schema)
+    b = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
 
     # Insert 1000 rows with distinct PKs
@@ -131,7 +131,7 @@ def test_repartition_batch():
         _make_table_cols_i64(["val"]),
         pk_index=0,
     )
-    b = batch.ZSetBatch(schema)
+    b = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
 
     for i in range(100):
@@ -192,7 +192,7 @@ def test_compile_split_plan(base_dir):
     assert_equal_i(1, plan.exchange_shard_cols[0], "shard column should be 1")
 
     # Execute pre-plan in single-process mode (no exchange handler)
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [100])
     _add_int_row(rb, 2, [200])
@@ -241,7 +241,7 @@ def test_compile_shard_with_negate(base_dir):
     assert_true(plan is not None, "negate+shard plan is None")
     assert_true(plan.exchange_post_plan is not None, "exchange_post_plan should be set")
 
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [100], weight=3)
 

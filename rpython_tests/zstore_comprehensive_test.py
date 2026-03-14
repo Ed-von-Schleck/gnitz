@@ -151,7 +151,7 @@ def test_programmable_zset_lifecycle():
     # Synthetic 128-bit key using shifts to avoid prebuilt long literals
     u128_val = (r_uint128(0xDEADBEEF) << 64) | r_uint128(0xCAFEBABE)
 
-    bad_batch = batch.ZSetBatch(orders_family.schema)
+    bad_batch = batch.ArenaZSetBatch(orders_family.schema)
     rb_bad = RowBuilder(orders_family.schema, bad_batch)
     rb_bad.begin(r_uint128(1), r_int64(1))
     rb_bad.put_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
@@ -169,7 +169,7 @@ def test_programmable_zset_lifecycle():
 
     # 4. Valid Data Ingestion
     log_step("Phase 4: Ingesting valid relational data")
-    u_batch = batch.ZSetBatch(users_family.schema)
+    u_batch = batch.ArenaZSetBatch(users_family.schema)
     rb_u = RowBuilder(users_family.schema, u_batch)
     rb_u.begin(u128_val, r_int64(1))
     rb_u.put_string("alice")
@@ -181,7 +181,7 @@ def test_programmable_zset_lifecycle():
         users_family.store.has_pk(u128_val), "User ingestion visibility failed"
     )
 
-    o_batch = batch.ZSetBatch(orders_family.schema)
+    o_batch = batch.ArenaZSetBatch(orders_family.schema)
     rb_o = RowBuilder(orders_family.schema, o_batch)
     rb_o.begin(r_uint128(101), r_int64(1))
     rb_o.put_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
@@ -240,7 +240,7 @@ def test_programmable_zset_lifecycle():
     # 8. View Execution (New View API)
     log_step("Phase 8: Execution of Recovered View handle")
     # Feed the actual alice record as a delta to the reactive view
-    in_batch = batch.ZSetBatch(users_family.schema)
+    in_batch = batch.ArenaZSetBatch(users_family.schema)
     rb_in = RowBuilder(users_family.schema, in_batch)
     rb_in.begin(u128_val, r_int64(1))
     rb_in.put_string("alice")

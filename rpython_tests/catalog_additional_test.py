@@ -90,7 +90,7 @@ def test_index_functional_and_fanout(base_dir):
         family = engine.create_table("public.tfanout", cols, 0)
 
         # Ingest baseline
-        b = batch.ZSetBatch(family.schema)
+        b = batch.ArenaZSetBatch(family.schema)
         rb = RowBuilder(family.schema, b)
         for i in range(5):
             rb.begin(r_uint128(r_uint64(i)), r_int64(1))
@@ -106,7 +106,7 @@ def test_index_functional_and_fanout(base_dir):
             raise Exception("Index backfill count mismatch")
 
         # Live fan-out test (Verify the 3-stage ingestion pipeline)
-        b2 = batch.ZSetBatch(family.schema)
+        b2 = batch.ArenaZSetBatch(family.schema)
         rb2 = RowBuilder(family.schema, b2)
         rb2.begin(r_uint128(r_uint64(99)), r_int64(1))
         rb2.put_int(r_int64(777))
@@ -136,7 +136,7 @@ def test_orphaned_metadata_recovery(base_dir):
     engine = open_engine(db_path)
     try:
         idx_sys = engine.sys.indices
-        b = batch.ZSetBatch(idx_sys.schema)
+        b = batch.ArenaZSetBatch(idx_sys.schema)
         # Manually inject index metadata pointing to a non-existent table ID 99999
         IdxTab.append(
             b,
@@ -181,7 +181,7 @@ def test_schema_mr_poisoning():
     )
 
     s3 = core_types.merge_schemas_for_join(s1, s2)
-    b = batch.ZSetBatch(s3)
+    b = batch.ArenaZSetBatch(s3)
     rb = RowBuilder(s3, b)
     rb.begin(r_uint128(r_uint64(0)), r_int64(1))
     rb.put_int(r_int64(123))
@@ -218,7 +218,7 @@ def test_sequence_gap_recovery(base_dir):
 
         # 1. Inject table record for tid 250
         tbl_sys = engine.sys.tables
-        b = batch.ZSetBatch(tbl_sys.schema)
+        b = batch.ArenaZSetBatch(tbl_sys.schema)
         rb = RowBuilder(tbl_sys.schema, b)
         rb.begin(r_uint128(r_uint64(250)), r_int64(1))
         rb.put_int(r_int64(2))  # sid public
@@ -233,7 +233,7 @@ def test_sequence_gap_recovery(base_dir):
 
         # 2. Inject column record for tid 250 (Required for reconstruction)
         col_sys = engine.sys.columns
-        bc = batch.ZSetBatch(col_sys.schema)
+        bc = batch.ArenaZSetBatch(col_sys.schema)
         ColTab.append(
             bc,
             col_sys.schema,
@@ -290,7 +290,7 @@ def test_fk_referential_integrity(base_dir):
         child = engine.create_table("public.children", child_cols, 0)
 
         # 3. Insert valid parent (PK-only schema, no payload columns)
-        pb = batch.ZSetBatch(parent.schema)
+        pb = batch.ArenaZSetBatch(parent.schema)
         rb_p = RowBuilder(parent.schema, pb)
         rb_p.begin(r_uint128(r_uint64(10)), r_int64(1))
         rb_p.commit()
@@ -298,7 +298,7 @@ def test_fk_referential_integrity(base_dir):
         pb.free()
 
         # 4. Insert valid child
-        cb = batch.ZSetBatch(child.schema)
+        cb = batch.ArenaZSetBatch(child.schema)
         rb_c = RowBuilder(child.schema, cb)
         rb_c.begin(r_uint128(r_uint64(1)), r_int64(1))
         rb_c.put_int(r_int64(10))  # Valid pid
@@ -307,7 +307,7 @@ def test_fk_referential_integrity(base_dir):
         cb.free()
 
         # 5. Insert INVALID child (pid 99 does not exist)
-        cb2 = batch.ZSetBatch(child.schema)
+        cb2 = batch.ArenaZSetBatch(child.schema)
         rb_c2 = RowBuilder(child.schema, cb2)
         rb_c2.begin(r_uint128(r_uint64(2)), r_int64(1))
         rb_c2.put_int(r_int64(99))
@@ -340,14 +340,14 @@ def test_fk_referential_integrity(base_dir):
         u_child = engine.create_table("public.uchildren", u_child_cols, 0)
 
         uuid_val = (r_uint128(0xAAAA) << 64) | r_uint128(0xBBBB)
-        upb = batch.ZSetBatch(u_parent.schema)
+        upb = batch.ArenaZSetBatch(u_parent.schema)
         rb_up = RowBuilder(u_parent.schema, upb)
         rb_up.begin(uuid_val, r_int64(1))
         rb_up.commit()
         ingest_to_family(u_parent, upb)
         upb.free()
 
-        ucb = batch.ZSetBatch(u_child.schema)
+        ucb = batch.ArenaZSetBatch(u_child.schema)
         rb_uc = RowBuilder(u_child.schema, ucb)
         rb_uc.begin(r_uint128(r_uint64(1)), r_int64(1))
         rb_uc.put_u128(r_uint64(0xBBBB), r_uint64(0xAAAA))
@@ -390,7 +390,7 @@ def test_fk_nullability_and_retractions(base_dir):
         )
 
         # 1. Insert NULL FK (Should be allowed even if parent is empty)
-        cb = batch.ZSetBatch(child.schema)
+        cb = batch.ArenaZSetBatch(child.schema)
         rb = RowBuilder(child.schema, cb)
         rb.begin(r_uint128(r_uint64(1)), r_int64(1))
         rb.put_null()
@@ -400,7 +400,7 @@ def test_fk_nullability_and_retractions(base_dir):
 
         # 2. Test Retraction (Weight -1)
         # Ingesting a retraction for a non-existent parent should NOT trigger FK check
-        cb2 = batch.ZSetBatch(child.schema)
+        cb2 = batch.ArenaZSetBatch(child.schema)
         rb2 = RowBuilder(child.schema, cb2)
         rb2.begin(r_uint128(r_uint64(2)), r_int64(-1))
         rb2.put_int(r_int64(999))  # Non-existent
@@ -534,7 +534,7 @@ def test_fk_self_reference(base_dir):
         emp = engine.create_table("public.employees", cols, 0)
 
         # 1. Ingest Manager first (Commit required for FK check)
-        b1 = batch.ZSetBatch(emp.schema)
+        b1 = batch.ArenaZSetBatch(emp.schema)
         rb1 = RowBuilder(emp.schema, b1)
         rb1.begin(r_uint128(r_uint64(1)), r_int64(1))
         rb1.put_null()
@@ -543,7 +543,7 @@ def test_fk_self_reference(base_dir):
         b1.free()
 
         # 2. Ingest Subordinate referencing the Manager
-        b2 = batch.ZSetBatch(emp.schema)
+        b2 = batch.ArenaZSetBatch(emp.schema)
         rb2 = RowBuilder(emp.schema, b2)
         rb2.begin(r_uint128(r_uint64(2)), r_int64(1))
         rb2.put_int(r_int64(1))  # Refers to emp_id 1

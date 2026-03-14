@@ -203,7 +203,7 @@ def test_wal_storage(base_dir):
     # 1. WAL Columnar Roundtrip
     writer = wal.WALWriter(wal_path, schema)
 
-    b1 = batch.ZSetBatch(schema)
+    b1 = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b1)
     rb.begin(r_uint128(10), r_int64(1))
     rb.put_string("block1")
@@ -256,7 +256,7 @@ def test_wal_storage(base_dir):
     wal_blob_path = os.path.join(base_dir, "blob.wal")
     writer_blob = wal.WALWriter(wal_blob_path, schema)
 
-    b_blob = batch.ZSetBatch(schema)
+    b_blob = batch.ArenaZSetBatch(schema)
     rb_blob = RowBuilder(schema, b_blob)
 
     # Long string forces Blob allocation inside WAL block body
@@ -307,7 +307,7 @@ def test_memtable(base_dir):
     try:
         pk1 = r_uint128(1)
 
-        b_add = batch.ZSetBatch(schema_u128)
+        b_add = batch.ArenaZSetBatch(schema_u128)
         rb = RowBuilder(schema_u128, b_add)
         rb.begin(pk1, r_int64(1))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(100)))
@@ -319,7 +319,7 @@ def test_memtable(base_dir):
             r_int64(1), mt.lookup_pk(pk1)[0], "Weight should be 1 after insert"
         )
 
-        b_sub = batch.ZSetBatch(schema_u128)
+        b_sub = batch.ArenaZSetBatch(schema_u128)
         rb_sub = RowBuilder(schema_u128, b_sub)
         rb_sub.begin(pk1, r_int64(-1))
         rb_sub.put_int(rffi.cast(rffi.LONGLONG, r_uint64(100)))
@@ -347,19 +347,19 @@ def test_memtable(base_dir):
         pk1 = r_uint128(1)
         pk2 = r_uint128(2)
 
-        b_d1 = batch.ZSetBatch(schema_str)
+        b_d1 = batch.ArenaZSetBatch(schema_str)
         rb_d1 = RowBuilder(schema_str, b_d1)
         rb_d1.begin(pk1, r_int64(1))
         rb_d1.put_string(dead_str)
         rb_d1.commit()
 
-        b_d2 = batch.ZSetBatch(schema_str)
+        b_d2 = batch.ArenaZSetBatch(schema_str)
         rb_d2 = RowBuilder(schema_str, b_d2)
         rb_d2.begin(pk1, r_int64(-1))
         rb_d2.put_string(dead_str)
         rb_d2.commit()
 
-        b_l1 = batch.ZSetBatch(schema_str)
+        b_l1 = batch.ArenaZSetBatch(schema_str)
         rb_l1 = RowBuilder(schema_str, b_l1)
         rb_l1.begin(pk2, r_int64(1))
         rb_l1.put_string(live_str)
@@ -389,7 +389,7 @@ def test_memtable(base_dir):
     mt3 = memtable.MemTable(schema_u128, 1024 * 1024)
     try:
         for pk_val in [30, 10, 20]:
-            b_c = batch.ZSetBatch(schema_u128)
+            b_c = batch.ArenaZSetBatch(schema_u128)
             rb_c = RowBuilder(schema_u128, b_c)
             rb_c.begin(r_uint128(pk_val), r_int64(1))
             rb_c.put_int(rffi.cast(rffi.LONGLONG, r_int64(pk_val)))
@@ -422,7 +422,7 @@ def test_memtable(base_dir):
     raised = False
     try:
         for j in range(1000):
-            b_f = batch.ZSetBatch(schema_u128)
+            b_f = batch.ArenaZSetBatch(schema_u128)
             rb_f = RowBuilder(schema_u128, b_f)
             rb_f.begin(r_uint128(j), r_int64(1))
             rb_f.put_int(rffi.cast(rffi.LONGLONG, r_int64(j)))
@@ -445,7 +445,7 @@ def test_shards_and_columnar(base_dir):
     # 1. Write and Validate Checksums
     writer = writer_table.TableShardWriter(schema, 1)
 
-    tmp1 = batch.ZSetBatch(schema)
+    tmp1 = batch.ArenaZSetBatch(schema)
     rb1 = RowBuilder(schema, tmp1)
     rb1.begin(r_uint128(10), r_int64(1))
     rb1.put_string("test")
@@ -453,7 +453,7 @@ def test_shards_and_columnar(base_dir):
     writer.add_row_from_accessor(r_uint128(10), r_int64(1), tmp1.get_accessor(0))
     tmp1.free()
 
-    tmp2 = batch.ZSetBatch(schema)
+    tmp2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, tmp2)
     rb2.begin(r_uint128(20), r_int64(1))
     rb2.put_string("data_long_string_for_blob")
@@ -578,7 +578,7 @@ def test_manifest_and_spine(base_dir):
     idx_db = os.path.join(base_dir, "shard_idx.db")
     w = writer_table.TableShardWriter(schema, table_id=1)
 
-    tmp = batch.ZSetBatch(schema)
+    tmp = batch.ArenaZSetBatch(schema)
     rb_idx = RowBuilder(schema, tmp)
     rb_idx.begin(r_uint128(10), r_int64(1))
     rb_idx.put_string("index")
@@ -614,7 +614,7 @@ def make_compaction_schema():
 
 def ingest_test_row(tbl, pk_val, weight, name_str, int_val):
     schema = tbl.get_schema()
-    b = batch.ZSetBatch(schema)
+    b = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     rb.begin(r_uint128(pk_val), r_int64(weight))
     rb.put_string(name_str)
@@ -725,21 +725,21 @@ def test_ephemeral_and_persistent_tables(base_dir):
 
     pk1 = r_uint128(1)
 
-    b_add = batch.ZSetBatch(schema)
+    b_add = batch.ArenaZSetBatch(schema)
     rb_add = RowBuilder(schema, b_add)
     rb_add.begin(pk1, r_int64(5))
     rb_add.put_string("sum_test")
     rb_add.commit()
     t_eph.ingest_batch(b_add)
 
-    b_sub = batch.ZSetBatch(schema)
+    b_sub = batch.ArenaZSetBatch(schema)
     rb_sub = RowBuilder(schema, b_sub)
     rb_sub.begin(pk1, r_int64(-3))
     rb_sub.put_string("sum_test")
     rb_sub.commit()
     t_eph.ingest_batch(b_sub)
 
-    tmp_acc = batch.ZSetBatch(schema)
+    tmp_acc = batch.ArenaZSetBatch(schema)
     rb_acc = RowBuilder(schema, tmp_acc)
     rb_acc.begin(pk1, r_int64(1))
     rb_acc.put_string("sum_test")
@@ -770,7 +770,7 @@ def test_ephemeral_and_persistent_tables(base_dir):
 
     # 4. Unified Cursor
     r_k2 = r_uint128(2)
-    b2 = batch.ZSetBatch(schema)
+    b2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, b2)
     rb2.begin(r_k2, r_int64(1))
     rb2.put_string("mem_only")
@@ -806,7 +806,7 @@ def test_u128_payloads(base_dir):
     uuid_lo = r_uint64(0xCAFEBABEDEADBEEF)
     uuid_hi = r_uint64(0x0123456789ABCDEF)
 
-    b = batch.ZSetBatch(schema)
+    b = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     rb.begin(pk1, r_int64(1))
     rb.put_u128(uuid_lo, uuid_hi)
@@ -950,7 +950,7 @@ def test_filter_integration(base_dir):
     mt = memtable.MemTable(schema, 1024 * 1024)
     try:
         for i in range(1, 51):
-            b = batch.ZSetBatch(schema)
+            b = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, b)
             rb.begin(r_uint128(i), r_int64(1))
             rb.put_string("v%d" % i)
@@ -976,7 +976,7 @@ def test_filter_integration(base_dir):
     shard_path = os.path.join(base_dir, "xor8_shard.db")
     sw = writer_table.TableShardWriter(schema, table_id=1)
     for i in range(1, 51):
-        tmp = batch.ZSetBatch(schema)
+        tmp = batch.ArenaZSetBatch(schema)
         rb_s = RowBuilder(schema, tmp)
         rb_s.begin(r_uint128(i), r_int64(1))
         rb_s.put_string("shard_v%d" % i)
@@ -1003,7 +1003,7 @@ def test_filter_integration(base_dir):
     # 3. EphemeralTable with Bloom
     eph_dir = os.path.join(base_dir, "filter_eph")
     t_eph = EphemeralTable(eph_dir, "filter_test", schema)
-    b = batch.ZSetBatch(schema)
+    b = batch.ArenaZSetBatch(schema)
     rb_e = RowBuilder(schema, b)
     rb_e.begin(r_uint128(42), r_int64(1))
     rb_e.put_string("test_val")
@@ -1032,7 +1032,7 @@ def test_retract_pk(base_dir):
     # --- test_retract_pk_found_in_memtable ---
     eph_dir = os.path.join(base_dir, "retract_mt")
     t = EphemeralTable(eph_dir, "retract_mt", schema)
-    b = batch.ZSetBatch(schema)
+    b = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     rb.begin(r_uint128(10), r_int64(1))
     rb.put_string("hello")
@@ -1052,7 +1052,7 @@ def test_retract_pk(base_dir):
     # --- test_retract_pk_found_in_shard ---
     eph_dir2 = os.path.join(base_dir, "retract_shard")
     t2 = EphemeralTable(eph_dir2, "retract_shard", schema)
-    b2 = batch.ZSetBatch(schema)
+    b2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, b2)
     rb2.begin(r_uint128(20), r_int64(1))
     rb2.put_string("world")
@@ -1082,14 +1082,14 @@ def test_retract_pk(base_dir):
     # --- test_retract_pk_after_retraction (net=0) ---
     eph_dir4 = os.path.join(base_dir, "retract_net0")
     t4 = EphemeralTable(eph_dir4, "retract_net0", schema)
-    b4a = batch.ZSetBatch(schema)
+    b4a = batch.ArenaZSetBatch(schema)
     rb4a = RowBuilder(schema, b4a)
     rb4a.begin(r_uint128(30), r_int64(1))
     rb4a.put_string("ins")
     rb4a.commit()
     t4.ingest_batch(b4a)
     b4a.free()
-    b4b = batch.ZSetBatch(schema)
+    b4b = batch.ArenaZSetBatch(schema)
     rb4b = RowBuilder(schema, b4b)
     rb4b.begin(r_uint128(30), r_int64(-1))
     rb4b.put_string("ins")
@@ -1107,7 +1107,7 @@ def test_retract_pk(base_dir):
     # --- test_retract_pk_split_weight (shard+memtable both positive) ---
     eph_dir5 = os.path.join(base_dir, "retract_split")
     t5 = EphemeralTable(eph_dir5, "retract_split", schema)
-    b5a = batch.ZSetBatch(schema)
+    b5a = batch.ArenaZSetBatch(schema)
     rb5a = RowBuilder(schema, b5a)
     rb5a.begin(r_uint128(40), r_int64(1))
     rb5a.put_string("split")
@@ -1115,7 +1115,7 @@ def test_retract_pk(base_dir):
     t5.ingest_batch(b5a)
     b5a.free()
     t5.flush()  # +1 in shard
-    b5b = batch.ZSetBatch(schema)
+    b5b = batch.ArenaZSetBatch(schema)
     rb5b = RowBuilder(schema, b5b)
     rb5b.begin(r_uint128(40), r_int64(1))
     rb5b.put_string("split")
@@ -1134,7 +1134,7 @@ def test_retract_pk(base_dir):
     # --- test_retract_pk_weight_canceled (shard +1, memtable -1) ---
     eph_dir6 = os.path.join(base_dir, "retract_cancel")
     t6 = EphemeralTable(eph_dir6, "retract_cancel", schema)
-    b6a = batch.ZSetBatch(schema)
+    b6a = batch.ArenaZSetBatch(schema)
     rb6a = RowBuilder(schema, b6a)
     rb6a.begin(r_uint128(50), r_int64(1))
     rb6a.put_string("cancel")
@@ -1142,7 +1142,7 @@ def test_retract_pk(base_dir):
     t6.ingest_batch(b6a)
     b6a.free()
     t6.flush()  # +1 in shard
-    b6b = batch.ZSetBatch(schema)
+    b6b = batch.ArenaZSetBatch(schema)
     rb6b = RowBuilder(schema, b6b)
     rb6b.begin(r_uint128(50), r_int64(-1))
     rb6b.put_string("cancel")
@@ -1161,7 +1161,7 @@ def test_retract_pk(base_dir):
     eph_dir7 = os.path.join(base_dir, "retract_str")
     t7 = EphemeralTable(eph_dir7, "retract_str", schema)
     test_str = "retract_string_payload"
-    b7 = batch.ZSetBatch(schema)
+    b7 = batch.ArenaZSetBatch(schema)
     rb7 = RowBuilder(schema, b7)
     rb7.begin(r_uint128(60), r_int64(1))
     rb7.put_string(test_str)
@@ -1169,7 +1169,7 @@ def test_retract_pk(base_dir):
     t7.ingest_batch(b7)
 
     # Build a reference row for comparison
-    ref = batch.ZSetBatch(schema)
+    ref = batch.ArenaZSetBatch(schema)
     rb_ref = RowBuilder(schema, ref)
     rb_ref.begin(r_uint128(60), r_int64(-1))
     rb_ref.put_string(test_str)
@@ -1195,7 +1195,7 @@ def test_retract_pk(base_dir):
     # --- test_has_pk_unchanged (verify has_pk still works after refactor) ---
     eph_dir8 = os.path.join(base_dir, "retract_has")
     t8 = EphemeralTable(eph_dir8, "retract_has", schema)
-    b8 = batch.ZSetBatch(schema)
+    b8 = batch.ArenaZSetBatch(schema)
     rb8 = RowBuilder(schema, b8)
     rb8.begin(r_uint128(70), r_int64(1))
     rb8.put_string("exists")
@@ -1222,7 +1222,7 @@ def test_enforce_unique_pk(base_dir):
     sub_dir1 = os.path.join(base_dir, "upk_t1")
     t1 = EphemeralTable(sub_dir1, "upk_t1", schema)
     family1 = TableFamily("s", "upk_t1", 1, 1, sub_dir1, 0, t1, unique_pk=True)
-    b1 = batch.ZSetBatch(schema)
+    b1 = batch.ArenaZSetBatch(schema)
     rb1 = RowBuilder(schema, b1)
     rb1.begin(r_uint128(1), r_int64(1))
     rb1.put_int(r_int64(10))
@@ -1238,14 +1238,14 @@ def test_enforce_unique_pk(base_dir):
     sub_dir2 = os.path.join(base_dir, "upk_t2")
     t2 = EphemeralTable(sub_dir2, "upk_t2", schema)
     family2 = TableFamily("s", "upk_t2", 2, 1, sub_dir2, 0, t2, unique_pk=True)
-    b2pre = batch.ZSetBatch(schema)
+    b2pre = batch.ArenaZSetBatch(schema)
     rb2pre = RowBuilder(schema, b2pre)
     rb2pre.begin(r_uint128(1), r_int64(1))
     rb2pre.put_int(r_int64(10))
     rb2pre.commit()
     t2.ingest_batch(b2pre)
     b2pre.free()
-    b2 = batch.ZSetBatch(schema)
+    b2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, b2)
     rb2.begin(r_uint128(1), r_int64(1))
     rb2.put_int(r_int64(20))
@@ -1262,14 +1262,14 @@ def test_enforce_unique_pk(base_dir):
     sub_dir3 = os.path.join(base_dir, "upk_t3")
     t3 = EphemeralTable(sub_dir3, "upk_t3", schema)
     family3 = TableFamily("s", "upk_t3", 3, 1, sub_dir3, 0, t3, unique_pk=True)
-    b3pre = batch.ZSetBatch(schema)
+    b3pre = batch.ArenaZSetBatch(schema)
     rb3pre = RowBuilder(schema, b3pre)
     rb3pre.begin(r_uint128(1), r_int64(1))
     rb3pre.put_int(r_int64(10))
     rb3pre.commit()
     t3.ingest_batch(b3pre)
     b3pre.free()
-    b3 = batch.ZSetBatch(schema)
+    b3 = batch.ArenaZSetBatch(schema)
     rb3 = RowBuilder(schema, b3)
     rb3.begin(r_uint128(1), r_int64(-1))
     rb3.put_int(r_int64(0))
@@ -1286,7 +1286,7 @@ def test_enforce_unique_pk(base_dir):
     sub_dir4 = os.path.join(base_dir, "upk_t4")
     t4 = EphemeralTable(sub_dir4, "upk_t4", schema)
     family4 = TableFamily("s", "upk_t4", 4, 1, sub_dir4, 0, t4, unique_pk=True)
-    b4 = batch.ZSetBatch(schema)
+    b4 = batch.ArenaZSetBatch(schema)
     rb4 = RowBuilder(schema, b4)
     rb4.begin(r_uint128(99), r_int64(-1))
     rb4.put_int(r_int64(0))
@@ -1301,7 +1301,7 @@ def test_enforce_unique_pk(base_dir):
     sub_dir5 = os.path.join(base_dir, "upk_t5")
     t5 = EphemeralTable(sub_dir5, "upk_t5", schema)
     family5 = TableFamily("s", "upk_t5", 5, 1, sub_dir5, 0, t5, unique_pk=True)
-    b5 = batch.ZSetBatch(schema)
+    b5 = batch.ArenaZSetBatch(schema)
     rb5a = RowBuilder(schema, b5)
     rb5a.begin(r_uint128(1), r_int64(1))
     rb5a.put_int(r_int64(10))
@@ -1320,7 +1320,7 @@ def test_enforce_unique_pk(base_dir):
     sub_dir6 = os.path.join(base_dir, "upk_t6")
     t6 = EphemeralTable(sub_dir6, "upk_t6", schema)
     family6 = TableFamily("s", "upk_t6", 6, 1, sub_dir6, 0, t6, unique_pk=True)
-    b6 = batch.ZSetBatch(schema)
+    b6 = batch.ArenaZSetBatch(schema)
     rb6a = RowBuilder(schema, b6)
     rb6a.begin(r_uint128(1), r_int64(1))
     rb6a.put_int(r_int64(10))

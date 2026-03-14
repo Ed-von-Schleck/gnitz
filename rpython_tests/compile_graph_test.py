@@ -122,7 +122,7 @@ def test_passthrough(base_dir):
     plan = db.program_cache.get_program(view.table_id)
     assert_true(plan is not None, "pass-through plan is None")
 
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [100])
     _add_int_row(rb, 2, [200])
@@ -161,7 +161,7 @@ def test_negate(base_dir):
     plan = db.program_cache.get_program(view.table_id)
     assert_true(plan is not None, "negate plan is None")
 
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [100], weight=3)
 
@@ -200,7 +200,7 @@ def test_filter_passthrough(base_dir):
     plan = db.program_cache.get_program(view.table_id)
     assert_true(plan is not None, "filter plan is None")
 
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [10])
     _add_int_row(rb, 2, [20])
@@ -241,7 +241,7 @@ def test_union(base_dir):
     db.create_view("test.v_union", graph, "")
 
     # Ingest data into src_b so the trace scan has something
-    b_batch = batch.ZSetBatch(table_b.schema)
+    b_batch = batch.ArenaZSetBatch(table_b.schema)
     rb_b = RowBuilder(table_b.schema, b_batch)
     _add_int_row(rb_b, 10, [1000])
     _add_int_row(rb_b, 11, [1100])
@@ -253,7 +253,7 @@ def test_union(base_dir):
     assert_true(plan is not None, "union plan is None")
 
     # Feed 1 row as delta for src_a
-    in_batch = batch.ZSetBatch(table_a.schema)
+    in_batch = batch.ArenaZSetBatch(table_a.schema)
     rb = RowBuilder(table_a.schema, in_batch)
     _add_int_row(rb, 1, [100])
 
@@ -293,7 +293,7 @@ def test_delay(base_dir):
     plan = db.program_cache.get_program(view.table_id)
     assert_true(plan is not None, "delay plan is None")
 
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [42])
     _add_int_row(rb, 2, [99])
@@ -323,7 +323,7 @@ def test_join_delta_trace(base_dir):
     table_r = db.create_table("test.right", cols_r, 0)
 
     # Populate right table with trace data
-    r_batch = batch.ZSetBatch(table_r.schema)
+    r_batch = batch.ArenaZSetBatch(table_r.schema)
     rb_r = RowBuilder(table_r.schema, r_batch)
     _add_int_row(rb_r, 10, [500])
     _add_int_row(rb_r, 20, [600])
@@ -349,7 +349,7 @@ def test_join_delta_trace(base_dir):
     assert_true(plan is not None, "join plan is None")
 
     # Delta with pk=10 should match right table pk=10
-    in_batch = batch.ZSetBatch(table_l.schema)
+    in_batch = batch.ArenaZSetBatch(table_l.schema)
     rb = RowBuilder(table_l.schema, in_batch)
     _add_int_row(rb, 10, [100])
 
@@ -379,7 +379,7 @@ def test_anti_join_delta_trace(base_dir):
     table_r = db.create_table("test.right", cols, 0)
 
     # Populate right table: pk=10, pk=20
-    r_batch = batch.ZSetBatch(table_r.schema)
+    r_batch = batch.ArenaZSetBatch(table_r.schema)
     rb_r = RowBuilder(table_r.schema, r_batch)
     _add_int_row(rb_r, 10, [500])
     _add_int_row(rb_r, 20, [600])
@@ -399,7 +399,7 @@ def test_anti_join_delta_trace(base_dir):
     assert_true(plan is not None, "anti_join plan is None")
 
     # Delta with pk=10 (matches), pk=30 (no match), pk=40 (no match)
-    in_batch = batch.ZSetBatch(table_l.schema)
+    in_batch = batch.ArenaZSetBatch(table_l.schema)
     rb = RowBuilder(table_l.schema, in_batch)
     _add_int_row(rb, 10, [100])
     _add_int_row(rb, 30, [300])
@@ -432,7 +432,7 @@ def test_semi_join_delta_trace(base_dir):
     table_r = db.create_table("test.right", cols, 0)
 
     # Populate right table: pk=10, pk=20
-    r_batch = batch.ZSetBatch(table_r.schema)
+    r_batch = batch.ArenaZSetBatch(table_r.schema)
     rb_r = RowBuilder(table_r.schema, r_batch)
     _add_int_row(rb_r, 10, [500])
     _add_int_row(rb_r, 20, [600])
@@ -452,7 +452,7 @@ def test_semi_join_delta_trace(base_dir):
     assert_true(plan is not None, "semi_join plan is None")
 
     # Delta with pk=10 (matches), pk=30 (no match), pk=40 (no match)
-    in_batch = batch.ZSetBatch(table_l.schema)
+    in_batch = batch.ArenaZSetBatch(table_l.schema)
     rb = RowBuilder(table_l.schema, in_batch)
     _add_int_row(rb, 10, [100])
     _add_int_row(rb, 30, [300])
@@ -495,7 +495,7 @@ def test_distinct(base_dir):
     assert_true(plan is not None, "distinct plan is None")
 
     # Tick 1: insert pk=1 with weight=3 -> distinct should output w=1
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [100], weight=3)
 
@@ -525,7 +525,7 @@ def test_join_delta_delta(base_dir):
     table_b = db.create_table("test.src_b", cols_b, 0)
 
     # Populate table_b so its scan_trace emits delta rows
-    b_batch = batch.ZSetBatch(table_b.schema)
+    b_batch = batch.ArenaZSetBatch(table_b.schema)
     rb_b = RowBuilder(table_b.schema, b_batch)
     _add_int_row(rb_b, 5, [50])
     _add_int_row(rb_b, 10, [100])
@@ -554,7 +554,7 @@ def test_join_delta_delta(base_dir):
     assert_true(plan is not None, "join_delta_delta plan is None")
 
     # Delta_a: pk=5 and pk=10 -> should match scan_b pk=5 and pk=10
-    in_batch = batch.ZSetBatch(table_a.schema)
+    in_batch = batch.ArenaZSetBatch(table_a.schema)
     rb = RowBuilder(table_a.schema, in_batch)
     _add_int_row(rb, 5, [55])
     _add_int_row(rb, 10, [110])
@@ -595,7 +595,7 @@ def test_negate_union_annihilation(base_dir):
     plan = db.program_cache.get_program(view.table_id)
     assert_true(plan is not None, "annihilation plan is None")
 
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [100])
     _add_int_row(rb, 2, [200])
@@ -645,7 +645,7 @@ def test_persistence_and_recovery(base_dir):
 
     # Execute the recovered plan
     src_schema = db2.get_table("test.src").schema
-    in_batch = batch.ZSetBatch(src_schema)
+    in_batch = batch.ArenaZSetBatch(src_schema)
     rb = RowBuilder(src_schema, in_batch)
     _add_int_row(rb, 1, [42])
 
@@ -674,7 +674,7 @@ def test_anti_semi_complement(base_dir):
     table_r = db.create_table("test.right", cols, 0)
 
     # Populate right table: pk=1, pk=3, pk=5
-    r_batch = batch.ZSetBatch(table_r.schema)
+    r_batch = batch.ArenaZSetBatch(table_r.schema)
     rb_r = RowBuilder(table_r.schema, r_batch)
     _add_int_row(rb_r, 1, [10])
     _add_int_row(rb_r, 3, [30])
@@ -708,8 +708,8 @@ def test_anti_semi_complement(base_dir):
     # Right has pk=1,3,5
     # Semi should get pk=1,3,5 (3 rows)
     # Anti should get pk=2,4 (2 rows)
-    in_batch_aj = batch.ZSetBatch(table_l.schema)
-    in_batch_sj = batch.ZSetBatch(table_l.schema)
+    in_batch_aj = batch.ArenaZSetBatch(table_l.schema)
+    in_batch_sj = batch.ArenaZSetBatch(table_l.schema)
     rb_aj = RowBuilder(table_l.schema, in_batch_aj)
     rb_sj = RowBuilder(table_l.schema, in_batch_sj)
     for pk in range(1, 6):
@@ -773,7 +773,7 @@ def test_filter_with_expr(base_dir):
     plan = db.program_cache.get_program(view.table_id)
     assert_true(plan is not None, "filter_expr plan is None")
 
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [10])
     _add_int_row(rb, 2, [20])
@@ -819,7 +819,7 @@ def test_map_projection(base_dir):
     plan = db.program_cache.get_program(view.table_id)
     assert_true(plan is not None, "map_proj plan is None")
 
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [100, 200])
     _add_int_row(rb, 2, [300, 400])
@@ -870,7 +870,7 @@ def test_reduce_sum(base_dir):
     assert_true(plan is not None, "reduce_sum plan is None")
 
     # 3 rows with same PK=1 but different values; weight=1 each
-    in_batch = batch.ZSetBatch(table.schema)
+    in_batch = batch.ArenaZSetBatch(table.schema)
     rb = RowBuilder(table.schema, in_batch)
     _add_int_row(rb, 1, [10])
     _add_int_row(rb, 1, [20])

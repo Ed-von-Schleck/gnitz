@@ -574,8 +574,8 @@ def test_unique_pk_metadata(base_dir):
 
 def _make_upk_row(schema, pk, val, w):
     """Build a single-row ZSetBatch for the (U64 id, I64 val) schema."""
-    from gnitz.core.batch import ZSetBatch, RowBuilder
-    b = ZSetBatch(schema)
+    from gnitz.core.batch import ArenaZSetBatch, RowBuilder
+    b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     rb.begin(r_uint128(r_uint64(pk)), r_int64(w))
     rb.put_int(r_int64(val))
@@ -590,7 +590,7 @@ def test_enforce_unique_pk(base_dir):
         rposix.mkdir(db_path, 0o755)
 
     from gnitz.catalog.registry import _enforce_unique_pk
-    from gnitz.core.batch import ZSetBatch, RowBuilder
+    from gnitz.core.batch import ArenaZSetBatch, RowBuilder
 
     cols = [
         types.ColumnDefinition(types.TYPE_U64, name="id"),
@@ -664,7 +664,7 @@ def test_enforce_unique_pk(base_dir):
         os.write(1, "    [OK] ST4: delete-by-PK absent\n")
 
         # Sub-test 5: intra-batch duplicate insert → last value wins
-        b5 = ZSetBatch(schema)
+        b5 = ArenaZSetBatch(schema)
         rb5 = RowBuilder(schema, b5)
         rb5.begin(r_uint128(r_uint64(5)), r_int64(1))
         rb5.put_int(r_int64(10))
@@ -691,7 +691,7 @@ def test_enforce_unique_pk(base_dir):
         os.write(1, "    [OK] ST5: intra-batch duplicate insert\n")
 
         # Sub-test 6: intra-batch insert then delete → cancel each other
-        b6 = ZSetBatch(schema)
+        b6 = ArenaZSetBatch(schema)
         rb6 = RowBuilder(schema, b6)
         rb6.begin(r_uint128(r_uint64(6)), r_int64(1))
         rb6.put_int(r_int64(10))
@@ -742,7 +742,7 @@ def test_restart(base_dir):
     engine1.drop_schema("trash")
 
     # Ingest data into the persistent table
-    batch1 = batch.ZSetBatch(table1.schema)
+    batch1 = batch.ArenaZSetBatch(table1.schema)
     rb = RowBuilder(table1.schema, batch1)
     rb.begin(r_uint128(r_uint64(42)), r_int64(1))
     rb.put_string("Gnitz-O-Matic")

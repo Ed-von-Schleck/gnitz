@@ -15,7 +15,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi
 
 from gnitz.core import types
-from gnitz.core.batch import RowBuilder, ArenaZSetBatch, ZSetBatch
+from gnitz.core.batch import RowBuilder, ArenaZSetBatch
 from gnitz.server import ipc, ipc_ffi
 from gnitz.server.master import PartitionAssignment, MasterDispatcher
 from gnitz.storage.partitioned_table import (

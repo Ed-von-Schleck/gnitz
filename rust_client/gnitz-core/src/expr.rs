@@ -4,12 +4,27 @@ const EXPR_LOAD_COL_FLOAT: u32 = 2;
 const EXPR_LOAD_CONST:     u32 = 3;
 const EXPR_INT_ADD:        u32 = 4;
 const EXPR_INT_SUB:        u32 = 5;
+const EXPR_INT_MUL:        u32 = 6;
+const EXPR_INT_DIV:        u32 = 7;
+const EXPR_INT_MOD:        u32 = 8;
+const EXPR_INT_NEG:        u32 = 9;
+const EXPR_FLOAT_ADD:      u32 = 10;
+const EXPR_FLOAT_SUB:      u32 = 11;
+const EXPR_FLOAT_MUL:      u32 = 12;
+const EXPR_FLOAT_DIV:      u32 = 13;
+const EXPR_FLOAT_NEG:      u32 = 14;
 const EXPR_CMP_EQ:         u32 = 15;
 const EXPR_CMP_NE:         u32 = 16;
 const EXPR_CMP_GT:         u32 = 17;
 const EXPR_CMP_GE:         u32 = 18;
 const EXPR_CMP_LT:         u32 = 19;
 const EXPR_CMP_LE:         u32 = 20;
+const EXPR_FCMP_EQ:        u32 = 21;
+const EXPR_FCMP_NE:        u32 = 22;
+const EXPR_FCMP_GT:        u32 = 23;
+const EXPR_FCMP_GE:        u32 = 24;
+const EXPR_FCMP_LT:        u32 = 25;
+const EXPR_FCMP_LE:        u32 = 26;
 const EXPR_BOOL_AND:       u32 = 27;
 const EXPR_BOOL_OR:        u32 = 28;
 const EXPR_BOOL_NOT:       u32 = 29;
@@ -58,12 +73,15 @@ impl ExprBuilder {
         dst
     }
 
-    /// `value as u32` — lower 32 bits; sufficient for typical filter constants.
+    /// Full i64 constant. Low 32 bits in arg1, high 32 bits in arg2.
+    /// The RPython VM reconstructs: `r_int64((a2 << 32) | (a1 & 0xFFFFFFFF))`.
     pub fn load_const(&mut self, value: i64) -> u32 {
         let dst = self.alloc_reg();
-        self.emit(EXPR_LOAD_CONST, dst, value as u32, 0);
+        self.emit(EXPR_LOAD_CONST, dst, value as u32, (value >> 32) as u32);
         dst
     }
+
+    // --- Integer arithmetic ---
 
     pub fn add(&mut self, a: u32, b: u32) -> u32 {
         let dst = self.alloc_reg();
@@ -76,6 +94,64 @@ impl ExprBuilder {
         self.emit(EXPR_INT_SUB, dst, a, b);
         dst
     }
+
+    pub fn mul(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_INT_MUL, dst, a, b);
+        dst
+    }
+
+    pub fn div(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_INT_DIV, dst, a, b);
+        dst
+    }
+
+    pub fn modulo(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_INT_MOD, dst, a, b);
+        dst
+    }
+
+    pub fn neg_int(&mut self, a: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_INT_NEG, dst, a, 0);
+        dst
+    }
+
+    // --- Float arithmetic ---
+
+    pub fn float_add(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FLOAT_ADD, dst, a, b);
+        dst
+    }
+
+    pub fn float_sub(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FLOAT_SUB, dst, a, b);
+        dst
+    }
+
+    pub fn float_mul(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FLOAT_MUL, dst, a, b);
+        dst
+    }
+
+    pub fn float_div(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FLOAT_DIV, dst, a, b);
+        dst
+    }
+
+    pub fn float_neg(&mut self, a: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FLOAT_NEG, dst, a, 0);
+        dst
+    }
+
+    // --- Integer comparison ---
 
     pub fn cmp_eq(&mut self, a: u32, b: u32) -> u32 {
         let dst = self.alloc_reg();
@@ -113,6 +189,46 @@ impl ExprBuilder {
         dst
     }
 
+    // --- Float comparison ---
+
+    pub fn fcmp_eq(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FCMP_EQ, dst, a, b);
+        dst
+    }
+
+    pub fn fcmp_ne(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FCMP_NE, dst, a, b);
+        dst
+    }
+
+    pub fn fcmp_gt(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FCMP_GT, dst, a, b);
+        dst
+    }
+
+    pub fn fcmp_ge(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FCMP_GE, dst, a, b);
+        dst
+    }
+
+    pub fn fcmp_lt(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FCMP_LT, dst, a, b);
+        dst
+    }
+
+    pub fn fcmp_le(&mut self, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_FCMP_LE, dst, a, b);
+        dst
+    }
+
+    // --- Boolean ---
+
     pub fn bool_and(&mut self, a: u32, b: u32) -> u32 {
         let dst = self.alloc_reg();
         self.emit(EXPR_BOOL_AND, dst, a, b);
@@ -130,6 +246,8 @@ impl ExprBuilder {
         self.emit(EXPR_BOOL_NOT, dst, a, 0);
         dst
     }
+
+    // --- Null checks ---
 
     pub fn is_null(&mut self, col_idx: usize) -> u32 {
         let dst = self.alloc_reg();

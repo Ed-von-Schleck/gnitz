@@ -114,7 +114,7 @@ def test_filter_map_negate():
     plan = make_plan(program, reg_file, out_map_schema, in_reg=0, out_reg=3)
 
     # Input: 3 rows. pk=1 val=5 (below threshold), pk=2 val=20, pk=3 val=42
-    in_batch = batch.ZSetBatch(in_schema)
+    in_batch = batch.ArenaZSetBatch(in_schema)
     rb = RowBuilder(in_schema, in_batch)
 
     rb.begin(r_uint128(1), r_int64(1))
@@ -179,7 +179,7 @@ def test_union():
     plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=2)
 
     # Batch A: pk=1 val=10
-    batch_a = batch.ZSetBatch(schema)
+    batch_a = batch.ArenaZSetBatch(schema)
     rb_a = RowBuilder(schema, batch_a)
     rb_a.begin(r_uint128(1), r_int64(1))
     rb_a.put_int(r_int64(10))
@@ -187,7 +187,7 @@ def test_union():
 
     # Pre-load R1 with batch B data before execute_epoch
     # We need to manually put data in R1 since execute_epoch only binds R0
-    batch_b_data = batch.ZSetBatch(schema)
+    batch_b_data = batch.ArenaZSetBatch(schema)
     rb_b = RowBuilder(schema, batch_b_data)
     rb_b.begin(r_uint128(2), r_int64(1))
     rb_b.put_int(r_int64(20))
@@ -250,7 +250,7 @@ def test_join_delta_trace(base_dir):
     trace_dir = os.path.join(base_dir, "trace_join")
     trace_table = EphemeralTable(trace_dir, "trace_r", schema_r)
 
-    batch_r = batch.ZSetBatch(schema_r)
+    batch_r = batch.ArenaZSetBatch(schema_r)
     rb_r = RowBuilder(schema_r, batch_r)
 
     rb_r.begin(r_uint128(99), r_int64(2))
@@ -281,7 +281,7 @@ def test_join_delta_trace(base_dir):
     plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=2)
 
     # Delta: pk=99 dept=7 w=3 (matches right pk=99), pk=101 dept=9 w=1 (no match)
-    in_batch = batch.ZSetBatch(schema_l)
+    in_batch = batch.ArenaZSetBatch(schema_l)
     rb_l = RowBuilder(schema_l, in_batch)
 
     rb_l.begin(r_uint128(99), r_int64(3))
@@ -350,7 +350,7 @@ def test_distinct_multi_tick(base_dir):
     plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=2)
 
     # Tick 1: insert pk=1 w=3 => distinct output should be w=+1 (appeared)
-    in_batch1 = batch.ZSetBatch(schema)
+    in_batch1 = batch.ArenaZSetBatch(schema)
     rb1 = RowBuilder(schema, in_batch1)
     rb1.begin(r_uint128(1), r_int64(3))
     rb1.put_int(r_int64(42))
@@ -365,7 +365,7 @@ def test_distinct_multi_tick(base_dir):
     in_batch1.free()
 
     # Tick 2: retract pk=1 w=-3 => net becomes 0 => distinct output w=-1 (disappeared)
-    in_batch2 = batch.ZSetBatch(schema)
+    in_batch2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, in_batch2)
     rb2.begin(r_uint128(1), r_int64(-3))
     rb2.put_int(r_int64(42))
@@ -440,7 +440,7 @@ def test_reduce_sum(base_dir):
     plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=3)
 
     # Tick 1: group=10 amount=100, group=10 amount=50, group=20 amount=200
-    in_batch1 = batch.ZSetBatch(in_schema)
+    in_batch1 = batch.ArenaZSetBatch(in_schema)
     rb1 = RowBuilder(in_schema, in_batch1)
 
     rb1.begin(r_uint128(1), r_int64(1))
@@ -482,7 +482,7 @@ def test_reduce_sum(base_dir):
     in_batch1.free()
 
     # Tick 2: retract one row from group 10 (pk=2, amount=50, w=-1)
-    in_batch2 = batch.ZSetBatch(in_schema)
+    in_batch2 = batch.ArenaZSetBatch(in_schema)
     rb2 = RowBuilder(in_schema, in_batch2)
     rb2.begin(r_uint128(2), r_int64(-1))
     rb2.put_int(rffi.cast(rffi.LONGLONG, r_uint64(10)))
@@ -550,7 +550,7 @@ def test_ghost_property():
     plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=1)
 
     # Insert pk=1 w=+1 and pk=1 w=-1 in same batch
-    in_batch = batch.ZSetBatch(schema)
+    in_batch = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, in_batch)
 
     rb.begin(r_uint128(1), r_int64(1))
@@ -602,7 +602,7 @@ def test_empty_input():
 
     plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=1)
 
-    empty_batch = batch.ZSetBatch(schema)
+    empty_batch = batch.ArenaZSetBatch(schema)
     result = plan.execute_epoch(empty_batch)
 
     assert_true(result is None, "Empty input should produce None result")
@@ -628,7 +628,7 @@ def test_seek_trace_point_lookup(base_dir):
     table = EphemeralTable(table_path, "seek", schema)
 
     # Populate with PKs [10, 20, 30, 40, 50]
-    b = batch.ZSetBatch(schema)
+    b = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     ids = [10, 20, 30, 40, 50]
     for pk_val in ids:
@@ -655,7 +655,7 @@ def test_seek_trace_point_lookup(base_dir):
     plan = make_plan(program, reg_file, schema, in_reg=1, out_reg=2)
 
     # Bind R1 with a batch containing pk=30
-    seek_batch = batch.ZSetBatch(schema)
+    seek_batch = batch.ArenaZSetBatch(schema)
     rb_seek = RowBuilder(schema, seek_batch)
     rb_seek.begin(r_uint128(30), r_int64(1))
     rb_seek.put_int(r_int64(0))
@@ -757,7 +757,7 @@ def test_join_delta_delta():
     plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=2)
 
     # Batch A: pk=5 w=1, pk=10 w=2
-    batch_a = batch.ZSetBatch(schema_a)
+    batch_a = batch.ArenaZSetBatch(schema_a)
     rb_a = RowBuilder(schema_a, batch_a)
     rb_a.begin(r_uint128(5), r_int64(1))
     rb_a.put_int(r_int64(55))
@@ -767,7 +767,7 @@ def test_join_delta_delta():
     rb_a.commit()
 
     # Batch B: pk=10 w=3, pk=20 w=1
-    batch_b = batch.ZSetBatch(schema_b)
+    batch_b = batch.ArenaZSetBatch(schema_b)
     rb_b = RowBuilder(schema_b, batch_b)
     rb_b.begin(r_uint128(10), r_int64(3))
     rb_b.put_int(r_int64(200))
@@ -825,7 +825,7 @@ def test_delay_op():
     plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=1)
 
     # Input: 2 rows
-    in_batch = batch.ZSetBatch(schema)
+    in_batch = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, in_batch)
 
     rb.begin(r_uint128(1), r_int64(1))
@@ -919,7 +919,7 @@ def test_reduce_min_nonlinear(base_dir):
     plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=3)
 
     # Tick 1: pk=1 val=30 w=1 => MIN(val)=30
-    in_batch1 = batch.ZSetBatch(in_schema)
+    in_batch1 = batch.ArenaZSetBatch(in_schema)
     rb1 = RowBuilder(in_schema, in_batch1)
     rb1.begin(r_uint128(1), r_int64(1))
     rb1.put_int(r_int64(30))
@@ -940,7 +940,7 @@ def test_reduce_min_nonlinear(base_dir):
 
     # Tick 2: pk=1 val=10 w=1 => replay history(val=30) + delta(val=10) => MIN=10
     # This forces the non-linear replay path since AGG_MIN.is_linear() is False.
-    in_batch2 = batch.ZSetBatch(in_schema)
+    in_batch2 = batch.ArenaZSetBatch(in_schema)
     rb2 = RowBuilder(in_schema, in_batch2)
     rb2.begin(r_uint128(1), r_int64(1))
     rb2.put_int(r_int64(10))
@@ -1007,7 +1007,7 @@ def test_join_delta_trace_multi_match(base_dir):
 
     # Ingest 3 separate batches so pk=42 has 3 entries
     for payload_val in [100, 200, 300]:
-        tb = batch.ZSetBatch(schema_r)
+        tb = batch.ArenaZSetBatch(schema_r)
         rb_t = RowBuilder(schema_r, tb)
         rb_t.begin(r_uint128(42), r_int64(1))
         rb_t.put_int(r_int64(payload_val))
@@ -1031,7 +1031,7 @@ def test_join_delta_trace_multi_match(base_dir):
     plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=2)
 
     # Delta: pk=42 w=2 (should match 3 trace rows), pk=99 w=0 (zero-weight, skip)
-    in_batch = batch.ZSetBatch(schema_l)
+    in_batch = batch.ArenaZSetBatch(schema_l)
     rb_l = RowBuilder(schema_l, in_batch)
 
     rb_l.begin(r_uint128(42), r_int64(2))

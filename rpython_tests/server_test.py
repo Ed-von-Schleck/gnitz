@@ -18,7 +18,7 @@ from rpython.rlib.rarithmetic import (
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core import types, batch
-from gnitz.core.batch import RowBuilder, ZSetBatch
+from gnitz.core.batch import RowBuilder, ArenaZSetBatch
 from gnitz.core.errors import LayoutError
 from gnitz.catalog import engine, system_tables as sys_tab
 from gnitz.catalog.metadata import ensure_dir
@@ -75,7 +75,7 @@ def cleanup(path):
 def _advance_seq(srv, seq_id, old_val, new_val):
     """Retract old HWM, insert new HWM for a sequence."""
     s = srv.engine.sys.sequences.schema
-    b = ZSetBatch(s)
+    b = ArenaZSetBatch(s)
     sys_tab.SeqTab.retract(b, s, seq_id, old_val)
     sys_tab.SeqTab.append(b, s, seq_id, new_val)
     srv.handle_push(sys_tab.SeqTab.ID, b)
@@ -86,7 +86,7 @@ def push_create_schema(srv, schema_name):
     """Create a schema by upserting into SchemaTab."""
     sid = srv.engine.registry.allocate_schema_id()
     s = srv.engine.sys.schemas.schema
-    b = ZSetBatch(s)
+    b = ArenaZSetBatch(s)
     sys_tab.SchemaTab.append(b, s, sid, schema_name)
     srv.handle_push(sys_tab.SchemaTab.ID, b)
     b.free()
@@ -107,7 +107,7 @@ def push_create_table(srv, schema_name, table_name, col_defs, pk_col_idx):
 
     # 1. Push column records
     cs = srv.engine.sys.columns.schema
-    cb = ZSetBatch(cs)
+    cb = ArenaZSetBatch(cs)
     for i in range(len(col_defs)):
         col = col_defs[i]
         sys_tab.ColTab.append(
@@ -120,7 +120,7 @@ def push_create_table(srv, schema_name, table_name, col_defs, pk_col_idx):
 
     # 2. Push table record — hook fires here
     ts = srv.engine.sys.tables.schema
-    tb = ZSetBatch(ts)
+    tb = ArenaZSetBatch(ts)
     sys_tab.TableTab.append(tb, ts, tid, sid, table_name, directory, pk_col_idx, 0, 0)
     srv.handle_push(sys_tab.TableTab.ID, tb)
     tb.free()
@@ -141,7 +141,7 @@ def push_create_view(srv, schema_name, view_name, graph):
 
     # 1. Column records for the view output
     cs = srv.engine.sys.columns.schema
-    cb = ZSetBatch(cs)
+    cb = ArenaZSetBatch(cs)
     for i in range(len(graph.output_col_defs)):
         name, type_code = graph.output_col_defs[i]
         sys_tab.ColTab.append(
@@ -153,7 +153,7 @@ def push_create_view(srv, schema_name, view_name, graph):
 
     # 2. View dependency records
     ds = srv.engine.sys.view_deps.schema
-    db = ZSetBatch(ds)
+    db = ArenaZSetBatch(ds)
     for dep_tid in graph.dependencies:
         sys_tab.DepTab.append(db, ds, vid, 0, dep_tid)
     if db.length() > 0:
@@ -162,28 +162,28 @@ def push_create_view(srv, schema_name, view_name, graph):
 
     # 3. Circuit graph (5 tables)
     ns = srv.engine.sys.circuit_nodes.schema
-    nb = ZSetBatch(ns)
+    nb = ArenaZSetBatch(ns)
     for node_id, opcode in graph.nodes:
         sys_tab.CircuitNodesTab.append(nb, ns, vid, node_id, opcode)
     srv.handle_push(sys_tab.CircuitNodesTab.ID, nb)
     nb.free()
 
     es = srv.engine.sys.circuit_edges.schema
-    eb = ZSetBatch(es)
+    eb = ArenaZSetBatch(es)
     for edge_id, src, dst, port in graph.edges:
         sys_tab.CircuitEdgesTab.append(eb, es, vid, edge_id, src, dst, port)
     srv.handle_push(sys_tab.CircuitEdgesTab.ID, eb)
     eb.free()
 
     ss = srv.engine.sys.circuit_sources.schema
-    sb = ZSetBatch(ss)
+    sb = ArenaZSetBatch(ss)
     for node_id, table_id in graph.sources:
         sys_tab.CircuitSourcesTab.append(sb, ss, vid, node_id, table_id)
     srv.handle_push(sys_tab.CircuitSourcesTab.ID, sb)
     sb.free()
 
     ps = srv.engine.sys.circuit_params.schema
-    pb = ZSetBatch(ps)
+    pb = ArenaZSetBatch(ps)
     for node_id, slot, value in graph.params:
         sys_tab.CircuitParamsTab.append(pb, ps, vid, node_id, slot, value)
     if pb.length() > 0:
@@ -191,7 +191,7 @@ def push_create_view(srv, schema_name, view_name, graph):
     pb.free()
 
     gs = srv.engine.sys.circuit_group_cols.schema
-    gb = ZSetBatch(gs)
+    gb = ArenaZSetBatch(gs)
     for node_id, col_idx in graph.group_cols:
         sys_tab.CircuitGroupColsTab.append(gb, gs, vid, node_id, col_idx)
     if gb.length() > 0:
@@ -200,7 +200,7 @@ def push_create_view(srv, schema_name, view_name, graph):
 
     # 4. View record — hook fires here, compiles the graph
     vs = srv.engine.sys.views.schema
-    vb = ZSetBatch(vs)
+    vb = ArenaZSetBatch(vs)
     sys_tab.ViewTab.append(vb, vs, vid, sid, view_name, "", directory, 0)
     srv.handle_push(sys_tab.ViewTab.ID, vb)
     vb.free()
@@ -250,7 +250,7 @@ def test_upsert_and_scan(srv, table_id):
     schema = family.schema
 
     # Push 3 rows
-    b = ZSetBatch(schema)
+    b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     _add_int_row(rb, 1, [100])
     _add_int_row(rb, 2, [200])
@@ -282,7 +282,7 @@ def test_delete_via_push(srv, table_id):
     schema = family.schema
 
     # Delete pk=2 with weight=-1
-    b = ZSetBatch(schema)
+    b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     _add_int_row(rb, 2, [200], weight=-1)
     srv.handle_push(table_id, b)
@@ -345,7 +345,7 @@ def test_reactive_view_via_push(srv, source_table_id):
 
     # Push new data to source table — reactive DAG fires
     family = srv.engine.registry.get_by_id(source_table_id)
-    b = ZSetBatch(family.schema)
+    b = ArenaZSetBatch(family.schema)
     rb = RowBuilder(family.schema, b)
     _add_int_row(rb, 10, [50])    # filtered out (50 <= 150)
     _add_int_row(rb, 11, [250])   # passes (250 > 150)

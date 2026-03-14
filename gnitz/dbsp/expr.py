@@ -106,7 +106,7 @@ def eval_expr(program, accessor):
         elif op == EXPR_LOAD_COL_FLOAT:
             regs[dst] = float2longlong(accessor.get_float(a1))
         elif op == EXPR_LOAD_CONST:
-            regs[dst] = r_int64(a1)
+            regs[dst] = r_int64(intmask((a2 << 32) | (a1 & 0xFFFFFFFF)))
 
         elif op == EXPR_INT_ADD:
             regs[dst] = r_int64(intmask(regs[a1] + regs[a2]))
@@ -229,12 +229,18 @@ class ExprBuilder(object):
 
     def load_const_int(self, value):
         dst = self._alloc_reg()
-        self._emit(EXPR_LOAD_CONST, dst, value, 0)
+        v = r_int64(value)
+        lo = intmask(v)
+        hi = intmask(v >> 32)
+        self._emit(EXPR_LOAD_CONST, dst, lo, hi)
         return dst
 
     def load_const_float(self, value):
         dst = self._alloc_reg()
-        self._emit(EXPR_LOAD_CONST, dst, intmask(float2longlong(value)), 0)
+        bits = float2longlong(value)
+        lo = intmask(bits)
+        hi = intmask(bits >> 32)
+        self._emit(EXPR_LOAD_CONST, dst, lo, hi)
         return dst
 
     # --- Integer arithmetic ---
