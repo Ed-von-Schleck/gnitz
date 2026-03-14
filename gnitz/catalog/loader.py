@@ -3,7 +3,7 @@
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 
-from gnitz.core.batch import ZSetBatch
+from gnitz.core.batch import ArenaZSetBatch
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.metadata import read_column_defs
 from gnitz.catalog.registry import TableFamily
@@ -142,7 +142,7 @@ class CatalogBootstrapper(object):
         schema = family.store.get_schema()
         cursor = family.store.create_cursor()
         try:
-            batch = ZSetBatch(schema)
+            batch = ArenaZSetBatch(schema)
             try:
                 while cursor.is_valid():
                     if cursor.weight() > 0:
@@ -155,7 +155,7 @@ class CatalogBootstrapper(object):
                         if batch.length() >= 512:
                             self._fire_hooks(family, batch)
                             batch.free()
-                            batch = ZSetBatch(schema)
+                            batch = ArenaZSetBatch(schema)
 
                     cursor.advance()
 

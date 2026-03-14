@@ -3,7 +3,7 @@
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64
 from gnitz.core import types
-from gnitz.core.batch import ZSetBatch
+from gnitz.core.batch import ArenaZSetBatch
 
 # VM Execution Status Codes
 STATUS_INIT    = 0
@@ -31,7 +31,7 @@ class DeltaRegister(BaseRegister):
     """R_Delta: Holds transient Z-Set batches."""
     def __init__(self, reg_id, table_schema):
         BaseRegister.__init__(self, reg_id, table_schema)
-        self._internal_batch = ZSetBatch(table_schema)
+        self._internal_batch = ArenaZSetBatch(table_schema)
         self.batch = self._internal_batch
 
     def is_delta(self): return True
@@ -131,7 +131,7 @@ class ExecutablePlan(object):
     def execute_epoch(self, input_delta):
         """
         Executes the plan for one epoch/tick.
-        Returns a cloned output ZSetBatch if changes were produced, otherwise None.
+        Returns a cloned output ArenaZSetBatch if changes were produced, otherwise None.
         """
         from gnitz.vm.interpreter import run_vm
 

@@ -15,12 +15,12 @@ from gnitz.catalog.system_tables import (
 )
 from gnitz.core.errors import LayoutError
 from gnitz.core.keys import promote_to_index_key
-from gnitz.core.batch import ZSetBatch
+from gnitz.core.batch import ArenaZSetBatch
 
 
 def _retract_from_out(out, schema, src_idx):
     """Copy out[src_idx] into a temp batch with w=-1, then append to out."""
-    tmp = ZSetBatch(schema)
+    tmp = ArenaZSetBatch(schema)
     tmp._direct_append_row(out, src_idx, r_int64(-1))
     out.append_batch(tmp, 0, tmp.length())
     tmp.free()
@@ -33,12 +33,12 @@ def _enforce_unique_pk(family, batch):
     - w > 0: auto-retract any stored row with same PK, then insert new row.
     - w < 0: emit retraction using stored payload (ignore incoming payload).
 
-    Returns a new ZSetBatch. The caller owns it and must free it when done.
+    Returns a new ArenaZSetBatch. The caller owns it and must free it when done.
     """
     store = family.store
     schema = family.schema
     n = batch.length()
-    out = ZSetBatch(schema)
+    out = ArenaZSetBatch(schema)
     seen_dict = {}   # {int: {int: int}}  intmask(pk_lo) -> {intmask(pk_hi) -> out_idx}
 
     for i in range(n):
@@ -109,7 +109,7 @@ def wire_fk_constraints_for_family(family, registry):
 def _build_pk_check_batch(schema, lo_list, hi_list):
     """Build a batch containing the given PK (lo,hi) pairs, columns zeroed."""
     n = len(lo_list)
-    batch = ZSetBatch(schema, initial_capacity=max(n, 1))
+    batch = ArenaZSetBatch(schema, initial_capacity=max(n, 1))
     num_cols = len(schema.columns)
     for k in range(n):
         batch.pk_lo_buf.put_u64(lo_list[k])

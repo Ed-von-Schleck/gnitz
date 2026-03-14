@@ -9,7 +9,7 @@ from rpython.rlib.jit import unrolling_iterable
 
 from gnitz.core.types import ColumnDefinition, TYPE_U64, TYPE_STRING, TYPE_U128
 from gnitz.core.errors import LayoutError
-from gnitz.core.batch import ZSetBatch
+from gnitz.core.batch import ArenaZSetBatch
 from gnitz.storage.table import PersistentTable
 from gnitz.catalog import system_tables as sys
 
@@ -182,7 +182,7 @@ def bootstrap_system_tables(sys_tables, base_dir):
     sys_dir = base_dir + "/" + sys.SYS_CATALOG_DIRNAME
 
     # 1. Core Schema records
-    schemas_batch = ZSetBatch(sys_tables.schemas.schema)
+    schemas_batch = ArenaZSetBatch(sys_tables.schemas.schema)
     sys.SchemaTab.append(
         schemas_batch, sys_tables.schemas.schema, sys.SYSTEM_SCHEMA_ID, "_system"
     )
@@ -193,7 +193,7 @@ def bootstrap_system_tables(sys_tables, base_dir):
     schemas_batch.free()
 
     # 2. Table records (Self-registration)
-    tables_batch = ZSetBatch(sys_tables.tables.schema)
+    tables_batch = ArenaZSetBatch(sys_tables.tables.schema)
     for t in SYSTEM_TAB_LIST:
         sys.TableTab.append(
             tables_batch,
@@ -210,7 +210,7 @@ def bootstrap_system_tables(sys_tables, base_dir):
     tables_batch.free()
 
     # 3. Column records (Logical Schemas for Catalog)
-    cols_batch = ZSetBatch(sys_tables.columns.schema)
+    cols_batch = ArenaZSetBatch(sys_tables.columns.schema)
 
     sys.ColTab.append_system(
         cols_batch,
@@ -331,7 +331,7 @@ def bootstrap_system_tables(sys_tables, base_dir):
     cols_batch.free()
 
     # 4. Sequence High-Water Marks
-    seq_batch = ZSetBatch(sys_tables.sequences.schema)
+    seq_batch = ArenaZSetBatch(sys_tables.sequences.schema)
     sys.SeqTab.append(
         seq_batch,
         sys_tables.sequences.schema,

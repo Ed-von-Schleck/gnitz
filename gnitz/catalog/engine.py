@@ -7,7 +7,7 @@ from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core.types import TableSchema, ColumnDefinition
 from gnitz.core.errors import LayoutError
-from gnitz.core.batch import ZSetBatch
+from gnitz.core.batch import ArenaZSetBatch
 from gnitz.catalog.program_cache import ProgramCache
 
 from gnitz.catalog.identifiers import validate_user_identifier, parse_qualified_name
@@ -475,7 +475,7 @@ class Engine(object):
 
     def _begin_write(self, tab_class):
         s = tab_class.schema()
-        return s, ZSetBatch(s)
+        return s, ArenaZSetBatch(s)
 
     def _finish_write(self, family, batch):
         ingest_to_family(family, batch)

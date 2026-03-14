@@ -10,7 +10,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from gnitz import log
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
-from gnitz.core.batch import ArenaZSetBatch, ZSetBatch
+from gnitz.core.batch import ArenaZSetBatch
 from gnitz.storage.partitioned_table import _partition_for_key
 from gnitz.dbsp.ops.exchange import repartition_batch
 
@@ -159,7 +159,7 @@ class MasterDispatcher(object):
     def _relay_exchange(self, view_id, worker_batches, schema):
         """Repartition collected exchange batches and send to workers."""
         # Merge all worker batches into one
-        merged = ZSetBatch(schema)
+        merged = ArenaZSetBatch(schema)
         for w in range(self.num_workers):
             if worker_batches[w] is not None:
                 merged.append_batch(worker_batches[w])
@@ -188,7 +188,7 @@ class MasterDispatcher(object):
         for w in range(self.num_workers):
             ipc.send_batch(self.worker_fds[w], target_id, None, schema=schema)
 
-        result = ZSetBatch(schema)
+        result = ArenaZSetBatch(schema)
         for w in range(self.num_workers):
             payload = ipc.receive_payload(self.worker_fds[w])
             if payload.status != 0:

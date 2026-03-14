@@ -139,7 +139,7 @@ class WALWriter(object):
 
     def append_batch(self, lsn, table_id, batch):
         """
-        Serializes a ZSetBatch into the WAL as a single columnar block.
+        Serializes an ArenaZSetBatch into the WAL as a single columnar block.
         """
         if self.closed:
             raise errors.StorageError("Attempted to write to a closed WAL")

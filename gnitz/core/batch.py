@@ -990,8 +990,3 @@ class ConsolidatedScope(BatchScope):
         return self.output
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-ZSetBatch = ArenaZSetBatch

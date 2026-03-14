@@ -7,7 +7,7 @@ from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
-from gnitz.core.batch import ZSetBatch, BatchWriter
+from gnitz.core.batch import ArenaZSetBatch, BatchWriter
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import ingest_to_family, validate_fk_distributed
 from gnitz.dbsp import ops
@@ -109,7 +109,7 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
             pre_result = plan.execute_epoch(incoming_delta)
             incoming_delta.free()
             if pre_result is None:
-                pre_result = ZSetBatch(plan.out_schema)
+                pre_result = ArenaZSetBatch(plan.out_schema)
 
             exchanged = exchange_handler.do_exchange(
                 target_view_id, pre_result, plan.exchange_shard_cols
@@ -123,7 +123,7 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
             pre_result = plan.execute_epoch(incoming_delta)
             incoming_delta.free()
             if pre_result is None:
-                pre_result = ZSetBatch(plan.out_schema)
+                pre_result = ArenaZSetBatch(plan.out_schema)
             out_delta = plan.exchange_post_plan.execute_epoch(pre_result)
             pre_result.free()
         else:
@@ -146,7 +146,7 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                     if has_output:
                         found = pending_pos[dep_id]
                         existing_d, existing_id, existing_batch = pending[found]
-                        merged = ZSetBatch(existing_batch._schema)
+                        merged = ArenaZSetBatch(existing_batch._schema)
                         writer = BatchWriter(merged)
                         ops.op_union(existing_batch, out_delta, writer)
                         existing_batch.free()
@@ -158,7 +158,7 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                         pending.append((d, dep_id, out_delta.clone()))
                     else:
                         dep_family = registry.get_by_id(dep_id)
-                        pending.append((d, dep_id, ZSetBatch(dep_family.schema)))
+                        pending.append((d, dep_id, ArenaZSetBatch(dep_family.schema)))
                     _sort_pending_desc(pending)
                     # All positions may have shifted — full rebuild
                     pending_pos.clear()
@@ -364,7 +364,7 @@ class ServerExecutor(object):
         """Build a batch containing every positive-weight row in the target."""
         family = self.engine.registry.get_by_id(target_id)
         schema = family.schema
-        result = ZSetBatch(schema)
+        result = ArenaZSetBatch(schema)
         cursor = family.store.create_cursor()
         try:
             while cursor.is_valid():

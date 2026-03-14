@@ -6,7 +6,7 @@ from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core.errors import LayoutError
 from gnitz.core.types import TableSchema
-from gnitz.core.batch import ZSetBatch
+from gnitz.core.batch import ArenaZSetBatch
 from gnitz.storage import mmap_posix
 from gnitz.storage.partitioned_table import (
     make_partitioned_persistent,
@@ -205,7 +205,7 @@ class TableEffectHook(DeltaHook):
                 continue
             index_id = self.registry.allocate_index_id()
             s = self.sys_tables.indices.schema
-            idx_batch = ZSetBatch(s)
+            idx_batch = ArenaZSetBatch(s)
             sys.IdxTab.append(
                 idx_batch, s, index_id, family.table_id,
                 sys.OWNER_KIND_TABLE, col_idx, index_name, 0, ""
@@ -217,7 +217,7 @@ class TableEffectHook(DeltaHook):
 
     def _advance_sequence(self, seq_id, old_val, new_val):
         s = self.sys_tables.sequences.schema
-        batch = ZSetBatch(s)
+        batch = ArenaZSetBatch(s)
         sys.SeqTab.retract(batch, s, seq_id, old_val)
         sys.SeqTab.append(batch, s, seq_id, new_val)
         self.sys_tables.sequences.ingest_batch(batch)

@@ -10,7 +10,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from gnitz import log
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
-from gnitz.core.batch import ZSetBatch
+from gnitz.core.batch import ArenaZSetBatch
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import ingest_to_family, _enforce_unique_pk
 from gnitz.server.executor import evaluate_dag
@@ -32,7 +32,7 @@ class WorkerExchangeHandler(object):
         if payload.batch is not None and payload.batch.length() > 0:
             result = payload.batch.clone()
         else:
-            result = ZSetBatch(schema)
+            result = ArenaZSetBatch(schema)
         payload.close()
         return result
 
@@ -99,7 +99,7 @@ class WorkerProcess(object):
                 else:
                     # Empty push — still need to participate in exchange barriers
                     family = self.engine.registry.get_by_id(target_id)
-                    empty = ZSetBatch(family.schema)
+                    empty = ArenaZSetBatch(family.schema)
                     evaluate_dag(self.engine, target_id, empty,
                                  exchange_handler=self.exchange_handler)
                     empty.free()
@@ -158,7 +158,7 @@ class WorkerProcess(object):
         """Check PK existence for FK validation. Responds with weights 1/0."""
         family = self.engine.registry.get_by_id(target_id)
         schema = family.schema
-        result = ZSetBatch(schema)
+        result = ArenaZSetBatch(schema)
         n = batch.length() if batch is not None else 0
         for i in range(n):
             pk = batch.get_pk(i)
@@ -172,7 +172,7 @@ class WorkerProcess(object):
         """Scan all local partitions for target, return result batch."""
         family = self.engine.registry.get_by_id(target_id)
         schema = family.schema
-        result = ZSetBatch(schema)
+        result = ArenaZSetBatch(schema)
         cursor = family.store.create_cursor()
         try:
             while cursor.is_valid():
