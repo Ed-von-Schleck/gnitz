@@ -172,6 +172,7 @@ pub fn circuit_group_cols_schema() -> Schema {
 // --- CircuitGraph ---
 
 /// Data bag describing a full circuit graph for `create_view_with_circuit`.
+#[derive(Clone, Debug)]
 pub struct CircuitGraph {
     pub view_id:           u64,
     pub primary_source_id: u64,

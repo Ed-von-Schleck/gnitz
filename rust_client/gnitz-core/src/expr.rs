@@ -18,6 +18,7 @@ const EXPR_IS_NOT_NULL:    u32 = 31;
 
 /// A compiled expression program: a flat list of 4-word instructions
 /// (opcode, dst_reg, arg1, arg2) plus metadata for embedding in filter params.
+#[derive(Clone, Debug)]
 pub struct ExprProgram {
     pub num_regs:   u32,
     pub result_reg: u32,
