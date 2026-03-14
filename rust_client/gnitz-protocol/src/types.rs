@@ -49,12 +49,14 @@ impl TypeCode {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct ColumnDef {
     pub name:        std::string::String,
     pub type_code:   TypeCode,
     pub is_nullable: bool,
 }
 
+#[derive(Clone, Debug)]
 pub struct Schema {
     pub columns:  Vec<ColumnDef>,
     pub pk_index: usize,
@@ -75,6 +77,7 @@ pub fn meta_schema() -> &'static Schema {
 }
 
 /// Per-column payload data.
+#[derive(Clone, Debug)]
 pub enum ColData {
     /// Raw little-endian bytes; length = count * wire_stride (for all non-String, non-U128).
     Fixed(Vec<u8>),
@@ -82,6 +85,7 @@ pub enum ColData {
     U128s(Vec<u128>),
 }
 
+#[derive(Clone, Debug)]
 pub struct ZSetBatch {
     pub pk_lo:   Vec<u64>,
     pub pk_hi:   Vec<u64>,

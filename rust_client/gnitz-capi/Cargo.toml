@@ -1,13 +1,18 @@
 [package]
-name = "gnitz-capi"
+name    = "gnitz-capi"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
-[dependencies]
-gnitz-core = { path = "../gnitz-core" }
+[features]
+default     = []
+integration = ["gnitz-core/integration"]
 
-# [build-dependencies]
-# cbindgen = "0.27"   -- added in Phase 6
+[dependencies]
+gnitz-core     = { path = "../gnitz-core" }
+gnitz-protocol = { path = "../gnitz-protocol" }
+
+[build-dependencies]
+cbindgen = "0.27"

@@ -1,0 +1,29 @@
+language        = "C"
+include_guard   = "GNITZ_H"
+tab_width       = 4
+documentation   = false
+usize_is_size_t = true
+
+# Inject opaque forward declarations for all handle types.
+# Their struct bodies are excluded below because they contain non-FFI Rust internals.
+after_includes = """
+typedef struct GnitzConn           GnitzConn;
+typedef struct GnitzSchema         GnitzSchema;
+typedef struct GnitzBatch          GnitzBatch;
+typedef struct GnitzExprBuilder    GnitzExprBuilder;
+typedef struct GnitzExprProgram    GnitzExprProgram;
+typedef struct GnitzCircuitBuilder GnitzCircuitBuilder;
+typedef struct GnitzCircuit        GnitzCircuit;
+"""
+
+[export]
+# Exclude struct bodies — cbindgen cannot represent non-FFI Rust internals.
+exclude = [
+    "GnitzConn",
+    "GnitzSchema",
+    "GnitzBatch",
+    "GnitzExprBuilder",
+    "GnitzExprProgram",
+    "GnitzCircuitBuilder",
+    "GnitzCircuit",
+]
