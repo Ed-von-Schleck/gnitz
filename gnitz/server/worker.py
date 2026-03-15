@@ -13,6 +13,7 @@ from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import ingest_to_family, _enforce_unique_pk
+from gnitz.core.types import TYPE_U128
 from gnitz.server.executor import evaluate_dag
 
 
@@ -104,6 +105,24 @@ class WorkerProcess(object):
                                  exchange_handler=self.exchange_handler)
                     empty.free()
                 ipc.send_batch(self.master_fd, target_id, None)
+            elif flags & ipc.FLAG_SEEK_BY_INDEX:
+                result = self._handle_seek_by_index(
+                    target_id, intmask(payload.seek_col_idx),
+                    intmask(payload.seek_pk_lo), intmask(payload.seek_pk_hi),
+                )
+                schema = self.engine.registry.get_by_id(target_id).schema
+                ipc.send_batch(self.master_fd, target_id, result, schema=schema)
+                if result is not None:
+                    result.free()
+            elif flags & ipc.FLAG_SEEK:
+                result = self._handle_seek(
+                    target_id,
+                    intmask(payload.seek_pk_lo), intmask(payload.seek_pk_hi),
+                )
+                schema = self.engine.registry.get_by_id(target_id).schema
+                ipc.send_batch(self.master_fd, target_id, result, schema=schema)
+                if result is not None:
+                    result.free()
             else:
                 result = self._handle_scan(target_id)
                 schema = self.engine.registry.get_by_id(target_id).schema
@@ -136,18 +155,27 @@ class WorkerProcess(object):
     def _handle_push(self, target_id, batch):
         """Ingest batch into the local partition store, flush, and evaluate DAG."""
         family = self.engine.registry.get_by_id(target_id)
+        effective = batch
         if family.unique_pk:
             effective = _enforce_unique_pk(family, batch)
-            family.store.ingest_batch(effective)
-            family.store.flush()
-            evaluate_dag(self.engine, target_id, effective,
-                         exchange_handler=self.exchange_handler)
+        family.store.ingest_batch(effective)
+        # Secondary index maintenance (mirrors ingest_to_family Stage 3)
+        n_indices = len(family.index_circuits)
+        if n_indices > 0:
+            for idx_num in range(n_indices):
+                circuit = family.index_circuits[idx_num]
+                circuit.table.ingest_projection(
+                    effective,
+                    circuit.source_col_idx,
+                    circuit.source_col_type,
+                    circuit._index_payload_accessor,
+                    circuit.is_unique,
+                )
+        family.store.flush()
+        evaluate_dag(self.engine, target_id, effective,
+                     exchange_handler=self.exchange_handler)
+        if family.unique_pk:
             effective.free()
-        else:
-            family.store.ingest_batch(batch)
-            family.store.flush()
-            evaluate_dag(self.engine, target_id, batch,
-                         exchange_handler=self.exchange_handler)
         log.debug(
             "W" + str(self.worker_id)
             + " push tid=" + str(target_id)
@@ -190,6 +218,60 @@ class WorkerProcess(object):
             + " rows=" + str(result.length())
         )
         return result
+
+    def _handle_seek(self, target_id, pk_lo_raw, pk_hi_raw):
+        """Point lookup by primary key on this worker's local partitions."""
+        family = self.engine.registry.get_by_id(target_id)
+        cursor = family.store.create_cursor()
+        key = r_uint128(
+            (r_uint128(r_uint64(pk_hi_raw)) << 64) | r_uint128(r_uint64(pk_lo_raw))
+        )
+        try:
+            cursor.seek(key)
+            if not cursor.is_valid():
+                return None
+            if cursor.key() != key:
+                return None
+            w = cursor.weight()
+            if w <= r_int64(0):
+                return None
+            result = ArenaZSetBatch(family.schema, initial_capacity=1)
+            acc = cursor.get_accessor()
+            result.append_from_accessor(key, w, acc)
+            return result
+        finally:
+            cursor.close()
+
+    def _handle_seek_by_index(self, target_id, col_idx, key_lo, key_hi):
+        """Index-assisted lookup on this worker's local index circuits."""
+        family = self.engine.registry.get_by_id(target_id)
+        circuit = None
+        for c in family.index_circuits:
+            if c.source_col_idx == col_idx:
+                circuit = c
+                break
+        if circuit is None:
+            return None
+
+        key = r_uint128(
+            (r_uint128(r_uint64(key_hi)) << 64) | r_uint128(r_uint64(key_lo))
+        )
+        idx_cursor = circuit.table.create_cursor()
+        try:
+            idx_cursor.seek(key)
+            if not idx_cursor.is_valid() or idx_cursor.key() != key:
+                return None
+            if circuit.source_pk_type.code == TYPE_U128.code:
+                source_pk = idx_cursor.get_accessor().get_u128(1)
+            else:
+                source_pk = r_uint128(
+                    r_uint64(intmask(idx_cursor.get_accessor().get_int(1)))
+                )
+            src_lo = intmask(r_uint64(intmask(source_pk)))
+            src_hi = intmask(r_uint64(intmask(source_pk >> 64)))
+        finally:
+            idx_cursor.close()
+        return self._handle_seek(target_id, src_lo, src_hi)
 
     def _handle_ddl_sync(self, target_id, batch):
         """Replay a system-table delta to keep the local registry in sync.

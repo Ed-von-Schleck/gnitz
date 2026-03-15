@@ -65,6 +65,14 @@ class ScanResult:
         self._schema = schema
         self._batch  = batch
 
+    @property
+    def batch(self):
+        return self._batch
+
+    @property
+    def schema(self):
+        return self._schema
+
     def _iter_rows(self):
         if self._batch is None or len(self._batch.pk_lo) == 0:
             return

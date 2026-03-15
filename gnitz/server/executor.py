@@ -8,6 +8,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch, BatchWriter
+from gnitz.core.types import TYPE_U128
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import ingest_to_family, validate_fk_distributed
 from gnitz.dbsp import ops
@@ -401,6 +402,39 @@ class ServerExecutor(object):
         finally:
             cursor.close()
 
+    def _seek_by_index(self, table_id, col_idx, key_lo, key_hi):
+        """Index-assisted point lookup. Returns single-row batch or None."""
+        family = self.engine.registry.get_by_id(table_id)
+        circuit = None
+        for c in family.index_circuits:
+            if c.source_col_idx == col_idx:
+                circuit = c
+                break
+        if circuit is None:
+            return None   # no index on this column
+
+        key = r_uint128(
+            (r_uint128(r_uint64(key_hi)) << 64) | r_uint128(r_uint64(key_lo))
+        )
+        idx_cursor = circuit.table.create_cursor()
+        try:
+            idx_cursor.seek(key)
+            if not idx_cursor.is_valid() or idx_cursor.key() != key:
+                return None
+            # source_pk is at col 1 in the 2-col index schema.
+            # Type dispatch needed: source_pk_type is U64 or U128.
+            if circuit.source_pk_type.code == TYPE_U128.code:
+                source_pk = idx_cursor.get_accessor().get_u128(1)
+            else:
+                source_pk = r_uint128(
+                    r_uint64(intmask(idx_cursor.get_accessor().get_int(1)))
+                )
+            src_lo = intmask(r_uint64(intmask(source_pk)))
+            src_hi = intmask(r_uint64(intmask(source_pk >> 64)))
+        finally:
+            idx_cursor.close()
+        return self._seek_family(table_id, src_lo, src_hi)
+
     # -- Socket Layer (delegates to handle_push) ---------------------------
 
     def _drain_client(self, fd, p_fds, p_cids, p_tids, p_batches, p_schemas):
@@ -431,22 +465,56 @@ class ServerExecutor(object):
                     )
                     ipc.send_batch(fd, new_id, None, STATUS_OK, "", client_id)
                     return 0
+                if payload.flags & ipc.FLAG_ALLOCATE_INDEX_ID:
+                    new_id = self.engine.registry.allocate_index_id()
+                    self.engine._advance_sequence(
+                        sys.SEQ_ID_INDICES, new_id - 1, new_id
+                    )
+                    ipc.send_batch(fd, new_id, None, STATUS_OK, "", client_id)
+                    return 0
 
             if client_id > 0:
                 self.fd_to_client[fd] = client_id
                 self.client_to_fd[client_id] = fd
 
+            # Index seek — O(log n) lookup via secondary index
+            if payload.flags & ipc.FLAG_SEEK_BY_INDEX:
+                col_idx = intmask(payload.seek_col_idx)
+                schema = self.engine.registry.get_by_id(target_id).schema
+                if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
+                    result = self.dispatcher.fan_out_seek_by_index(
+                        target_id, col_idx,
+                        intmask(payload.seek_pk_lo), intmask(payload.seek_pk_hi),
+                        schema,
+                    )
+                else:
+                    result = self._seek_by_index(
+                        target_id, col_idx,
+                        payload.seek_pk_lo, payload.seek_pk_hi,
+                    )
+                resp_schema = result._schema if result is not None else schema
+                ipc.send_batch(fd, target_id, result, STATUS_OK, "", client_id,
+                               schema=resp_schema)
+                if result is not None:
+                    result.free()
+                return 0
+
             # PK seek — O(log n) point lookup
             if payload.flags & ipc.FLAG_SEEK:
-                result = self._seek_family(
-                    target_id, payload.seek_pk_lo, payload.seek_pk_hi
-                )
-                resp_schema = (result._schema if result is not None
-                               else self.engine.registry.get_by_id(target_id).schema)
-                ipc.send_batch(
-                    fd, target_id, result, STATUS_OK, "",
-                    client_id, schema=resp_schema,
-                )
+                schema = self.engine.registry.get_by_id(target_id).schema
+                if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
+                    result = self.dispatcher.fan_out_seek(
+                        target_id,
+                        intmask(payload.seek_pk_lo), intmask(payload.seek_pk_hi),
+                        schema,
+                    )
+                else:
+                    result = self._seek_family(
+                        target_id, payload.seek_pk_lo, payload.seek_pk_hi,
+                    )
+                resp_schema = result._schema if result is not None else schema
+                ipc.send_batch(fd, target_id, result, STATUS_OK, "", client_id,
+                               schema=resp_schema)
                 if result is not None:
                     result.free()
                 return 0

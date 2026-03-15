@@ -91,6 +91,15 @@ class Connection:
             return ScanResult(None, None)
         return ScanResult(_from_native_schema(native_schema), batch)
 
+    def seek_by_index(self, table_id: int, col_idx: int,
+                      key_lo: int = 0, key_hi: int = 0) -> "ScanResult":
+        native_schema, batch = self._client.seek_by_index(
+            table_id, col_idx, key_lo, key_hi
+        )
+        if native_schema is None:
+            return ScanResult(None, None)
+        return ScanResult(_from_native_schema(native_schema), batch)
+
     def execute_sql(self, sql: str, schema_name: str = "public") -> list:
         return self._client.execute_sql(schema_name, sql)
 

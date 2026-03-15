@@ -1,11 +1,12 @@
 use sqlparser::ast::{
     Query, SetExpr, Values, Expr, Value, SelectItem,
-    TableFactor, Statement, TableObject,
+    TableFactor, Statement, TableObject, BinaryOperator,
 };
 use gnitz_protocol::{Schema, ZSetBatch, ColData, TypeCode};
 use gnitz_core::GnitzClient;
 use crate::error::GnitzSqlError;
 use crate::binder::Binder;
+use crate::logical_plan::BoundExpr;
 use crate::SqlResult;
 
 // ---------------------------------------------------------------------------
@@ -13,10 +14,10 @@ use crate::SqlResult;
 // ---------------------------------------------------------------------------
 
 pub fn execute_insert(
-    client:      &GnitzClient,
-    schema_name: &str,
-    stmt:        &Statement,
-    binder:      &mut Binder<'_>,
+    client:       &GnitzClient,
+    _schema_name: &str,
+    stmt:         &Statement,
+    binder:       &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     // Extract table name and source from the INSERT statement
     let (table_name_str, rows) = extract_insert_parts(stmt)?;
@@ -167,10 +168,10 @@ fn append_value_to_col(
 // ---------------------------------------------------------------------------
 
 pub fn execute_select(
-    client:      &GnitzClient,
-    schema_name: &str,
-    query:       &Query,
-    binder:      &mut Binder<'_>,
+    client:       &GnitzClient,
+    _schema_name: &str,
+    query:        &Query,
+    binder:       &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     let limit = extract_limit(query);
 
@@ -199,12 +200,17 @@ pub fn execute_select(
 
     // Check WHERE clause
     let (schema_out, batch_opt) = if let Some(where_expr) = &select.selection {
-        // Only accept WHERE pk_col = literal (point lookup via seek)
         if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
             client.seek(tid, pk_lo, pk_hi)?
+        } else if let Some((col_idx, key_lo, key_hi, residual)) =
+            try_extract_index_seek(where_expr, &schema, binder, tid)?
+        {
+            let result = client.seek_by_index(tid, col_idx as u64, key_lo, key_hi)?;
+            apply_residual_filter(result, residual.as_ref(), &schema)?
         } else {
-            return Err(GnitzSqlError::Plan(
-                "Non-indexed WHERE in SELECT; use CREATE VIEW for server-side filtering".to_string()
+            return Err(GnitzSqlError::Unsupported(
+                "WHERE on non-indexed column not supported in direct SELECT; \
+                 use CREATE INDEX first, or CREATE VIEW for server-side filtering".to_string()
             ));
         }
     } else {
@@ -270,6 +276,195 @@ fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<(u64, u64)> {
     }
 }
 
+/// Extracts (col_idx, key_lo, key_hi) from `col = integer_literal`. Does NOT check index existence.
+fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u64, u64)> {
+    match expr {
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            let is_num = |e: &Expr| matches!(e, Expr::Value(vws) if matches!(vws.value, Value::Number(_, _)));
+            let (col_expr, lit_expr) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Identifier(_), r) if is_num(r) => (left.as_ref(), right.as_ref()),
+                (l, Expr::Identifier(_)) if is_num(l) => (right.as_ref(), left.as_ref()),
+                _ => return None,
+            };
+            let col_name = if let Expr::Identifier(id) = col_expr { &id.value } else { return None; };
+            let n_str = if let Expr::Value(vws) = lit_expr {
+                if let Value::Number(n, _) = &vws.value { n } else { return None; }
+            } else { return None; };
+            let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))?;
+            let key_lo = n_str.parse::<u64>().ok()?;
+            Some((col_idx, key_lo, 0u64))
+        }
+        _ => None,
+    }
+}
+
+/// Returns Some((col_idx, key_lo, key_hi, residual)) when WHERE contains an equality on an indexed column.
+fn try_extract_index_seek(
+    expr:     &Expr,
+    schema:   &Schema,
+    binder:   &mut Binder<'_>,
+    table_id: u64,
+) -> Result<Option<(usize, u64, u64, Option<BoundExpr>)>, GnitzSqlError> {
+    // Case 1: simple `col = literal`
+    if let Some((col_idx, key_lo, key_hi)) = try_col_eq_literal(expr, schema) {
+        if col_idx != schema.pk_index && binder.find_index(table_id, col_idx)?.is_some() {
+            return Ok(Some((col_idx, key_lo, key_hi, None)));
+        }
+    }
+    // Case 2: `(indexed_col = literal) AND rest`
+    if let Expr::BinaryOp { left, op: BinaryOperator::And, right } = expr {
+        for (candidate, other) in [
+            (left.as_ref(), right.as_ref()),
+            (right.as_ref(), left.as_ref()),
+        ] {
+            if let Some((col_idx, key_lo, key_hi)) = try_col_eq_literal(candidate, schema) {
+                if col_idx != schema.pk_index
+                    && binder.find_index(table_id, col_idx)?.is_some()
+                {
+                    let residual = binder.bind_expr(other, schema)?;
+                    return Ok(Some((col_idx, key_lo, key_hi, Some(residual))));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn apply_residual_filter(
+    result:  (Option<Schema>, Option<ZSetBatch>),
+    pred:    Option<&BoundExpr>,
+    schema:  &Schema,
+) -> Result<(Option<Schema>, Option<ZSetBatch>), GnitzSqlError> {
+    let pred = match pred {
+        None => return Ok(result),
+        Some(p) => p,
+    };
+    let (schema_opt, batch_opt) = result;
+    let batch = match batch_opt {
+        None => return Ok((schema_opt, None)),
+        Some(b) => b,
+    };
+    let actual_schema = schema_opt.as_ref().unwrap_or(schema);
+    let mut new_batch = ZSetBatch::new(actual_schema);
+
+    for i in 0..batch.pk_lo.len() {
+        if eval_pred_row(pred, &batch, i, actual_schema)? {
+            copy_batch_row(&batch, i, &mut new_batch, actual_schema);
+        }
+    }
+    Ok((schema_opt, Some(new_batch)))
+}
+
+#[derive(Debug)]
+enum ColumnValue { Int(i64), Float(f64) }
+
+fn eval_pred_row(
+    pred:   &BoundExpr,
+    batch:  &ZSetBatch,
+    i:      usize,
+    schema: &Schema,
+) -> Result<bool, GnitzSqlError> {
+    Ok(eval_expr(pred, batch, i, schema)? != 0)
+}
+
+fn eval_expr(
+    expr:   &BoundExpr,
+    batch:  &ZSetBatch,
+    i:      usize,
+    schema: &Schema,
+) -> Result<i64, GnitzSqlError> {
+    use crate::logical_plan::{BinOp, UnaryOp};
+    match expr {
+        BoundExpr::ColRef(c) => {
+            let col_def = &schema.columns[*c];
+            match &batch.columns[*c] {
+                ColData::Fixed(buf) => {
+                    let stride = col_def.type_code.wire_stride();
+                    let start  = i * stride;
+                    let slice  = &buf[start..start + stride];
+                    let v = match stride {
+                        1 => slice[0] as i8  as i64,
+                        2 => i16::from_le_bytes(slice.try_into().unwrap()) as i64,
+                        4 => i32::from_le_bytes(slice.try_into().unwrap()) as i64,
+                        8 => i64::from_le_bytes(slice.try_into().unwrap()),
+                        _ => 0,
+                    };
+                    Ok(v)
+                }
+                ColData::Strings(_) => Err(GnitzSqlError::Unsupported(
+                    "residual filter on string column not supported".to_string()
+                )),
+                ColData::U128s(_) => Err(GnitzSqlError::Unsupported(
+                    "residual filter on U128 column not supported".to_string()
+                )),
+            }
+        }
+        BoundExpr::LitInt(v) => Ok(*v),
+        BoundExpr::LitFloat(_) => Err(GnitzSqlError::Unsupported(
+            "float literals in residual filter not supported".to_string()
+        )),
+        BoundExpr::BinOp(l, op, r) => {
+            let lv = eval_expr(l, batch, i, schema)?;
+            let rv = eval_expr(r, batch, i, schema)?;
+            Ok(match op {
+                BinOp::Add => lv.wrapping_add(rv),
+                BinOp::Sub => lv.wrapping_sub(rv),
+                BinOp::Mul => lv.wrapping_mul(rv),
+                BinOp::Div => if rv == 0 { 0 } else { lv / rv },
+                BinOp::Mod => if rv == 0 { 0 } else { lv % rv },
+                BinOp::Eq  => (lv == rv) as i64,
+                BinOp::Ne  => (lv != rv) as i64,
+                BinOp::Gt  => (lv >  rv) as i64,
+                BinOp::Ge  => (lv >= rv) as i64,
+                BinOp::Lt  => (lv <  rv) as i64,
+                BinOp::Le  => (lv <= rv) as i64,
+                BinOp::And => ((lv != 0) && (rv != 0)) as i64,
+                BinOp::Or  => ((lv != 0) || (rv != 0)) as i64,
+            })
+        }
+        BoundExpr::UnaryOp(op, e) => {
+            let v = eval_expr(e, batch, i, schema)?;
+            use crate::logical_plan::UnaryOp;
+            Ok(match op {
+                UnaryOp::Neg => v.wrapping_neg(),
+                UnaryOp::Not => (v == 0) as i64,
+            })
+        }
+        BoundExpr::IsNull(c) => {
+            // nulls are stored as a bitmask per row; simplified: always false for now
+            let _ = c;
+            Ok(0)
+        }
+        BoundExpr::IsNotNull(c) => {
+            let _ = c;
+            Ok(1)
+        }
+    }
+}
+
+fn copy_batch_row(src: &ZSetBatch, i: usize, dst: &mut ZSetBatch, schema: &Schema) {
+    dst.pk_lo.push(src.pk_lo[i]);
+    dst.pk_hi.push(src.pk_hi[i]);
+    dst.weights.push(src.weights[i]);
+    dst.nulls.push(src.nulls[i]);
+    for (ci, col_def) in schema.columns.iter().enumerate() {
+        if ci == schema.pk_index { continue; }
+        let stride = col_def.type_code.wire_stride();
+        match (&src.columns[ci], &mut dst.columns[ci]) {
+            (ColData::Fixed(s), ColData::Fixed(d)) => {
+                d.extend_from_slice(&s[i * stride..(i + 1) * stride]);
+            }
+            (ColData::Strings(s), ColData::Strings(d)) => {
+                d.push(s[i].clone());
+            }
+            (ColData::U128s(s), ColData::U128s(d)) => {
+                d.push(s[i]);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn apply_projection(
     projection: &[SelectItem],
     schema:     &Schema,
@@ -284,7 +479,7 @@ fn apply_projection(
         return Ok((schema.clone(), b));
     }
 
-    // Extract named columns
+    // Extract named columns; dedup preserving first-occurrence order
     let mut col_indices: Vec<usize> = Vec::new();
     for item in projection {
         match item {
@@ -293,10 +488,12 @@ fn apply_projection(
                     .ok_or_else(|| GnitzSqlError::Bind(
                         format!("column '{}' not found in projection", ident.value)
                     ))?;
-                col_indices.push(idx);
+                if !col_indices.contains(&idx) { col_indices.push(idx); }
             }
             SelectItem::Wildcard(_) => {
-                for i in 0..schema.columns.len() { col_indices.push(i); }
+                for i in 0..schema.columns.len() {
+                    if !col_indices.contains(&i) { col_indices.push(i); }
+                }
             }
             _ => return Err(GnitzSqlError::Unsupported(
                 "only simple column references supported in SELECT projection".to_string()
@@ -312,7 +509,6 @@ fn apply_projection(
     let new_schema = Schema { columns: new_cols, pk_index: new_pk_idx };
 
     // Build new batch
-    let n = src_batch.pk_lo.len();
     let mut new_batch = ZSetBatch::new(&new_schema);
     new_batch.pk_lo  = src_batch.pk_lo.clone();
     new_batch.pk_hi  = src_batch.pk_hi.clone();

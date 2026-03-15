@@ -496,7 +496,7 @@ impl PyGnitzClient {
         &self, py: Python<'_>,
         schema_name: &str, table_name: &str,
     ) -> PyResult<PyObject> {
-        let (tid, schema) = client!(self).resolve_table_id(schema_name, table_name)
+        let (tid, schema) = client!(self).resolve_table_or_view_id(schema_name, table_name)
             .map_err(|e| GnitzError::new_err(e.to_string()))?;
         let py_schema = rust_schema_to_py(py, &schema)?.into_any();
         let tid_obj   = tid.into_pyobject(py)?.into_any().unbind();
@@ -511,6 +511,31 @@ impl PyGnitzClient {
     /// allocate_schema_id()
     pub fn allocate_schema_id(&self) -> PyResult<u64> {
         client!(self).alloc_schema_id().map_err(|e| GnitzError::new_err(e.to_string()))
+    }
+
+    /// seek_by_index(table_id, col_idx, key_lo, key_hi) -> (Schema | None, ZSetBatch | None)
+    pub fn seek_by_index(
+        &self, py: Python<'_>, table_id: u64, col_idx: u64,
+        key_lo: u64, key_hi: u64,
+    ) -> PyResult<PyObject> {
+        match client!(self).seek_by_index(table_id, col_idx, key_lo, key_hi) {
+            Ok((opt_schema, opt_batch)) => {
+                let (py_schema, py_batch) = match (opt_schema, opt_batch) {
+                    (Some(s), Some(b)) => {
+                        let ps = rust_schema_to_py(py, &s)?.into_any();
+                        let pb = rust_batch_to_py(py, &s, &b)?.into_any();
+                        (ps, pb)
+                    }
+                    (Some(s), None) => {
+                        let ps = rust_schema_to_py(py, &s)?.into_any();
+                        (ps, py.None())
+                    }
+                    _ => (py.None(), py.None()),
+                };
+                Ok(PyTuple::new(py, [py_schema, py_batch])?.into_any().unbind())
+            }
+            Err(e) => Err(GnitzError::new_err(e.to_string())),
+        }
     }
 
     /// seek(table_id, pk_lo, pk_hi) -> (Schema | None, ZSetBatch | None)
@@ -553,6 +578,10 @@ impl PyGnitzClient {
                 SqlResult::ViewCreated { view_id } => {
                     d.set_item("type", "ViewCreated")?;
                     d.set_item("view_id", view_id)?;
+                }
+                SqlResult::IndexCreated { index_id } => {
+                    d.set_item("type", "IndexCreated")?;
+                    d.set_item("index_id", index_id)?;
                 }
                 SqlResult::Dropped => {
                     d.set_item("type", "Dropped")?;

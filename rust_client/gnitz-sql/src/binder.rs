@@ -6,14 +6,15 @@ use crate::error::GnitzSqlError;
 use crate::logical_plan::{BoundExpr, BinOp, UnaryOp};
 
 pub struct Binder<'a> {
-    pub client:      &'a GnitzClient,
-    pub schema_name: &'a str,
-    cache:           HashMap<String, (u64, Schema)>,
+    client:      &'a GnitzClient,
+    schema_name: &'a str,
+    cache:       HashMap<String, (u64, Schema)>,
+    index_cache: HashMap<(u64, usize), Option<u64>>,
 }
 
 impl<'a> Binder<'a> {
     pub fn new(client: &'a GnitzClient, schema_name: &'a str) -> Self {
-        Binder { client, schema_name, cache: HashMap::new() }
+        Binder { client, schema_name, cache: HashMap::new(), index_cache: HashMap::new() }
     }
 
     pub fn resolve(&mut self, name: &str) -> Result<(u64, Schema), GnitzSqlError> {
@@ -23,6 +24,18 @@ impl<'a> Binder<'a> {
         let result = self.client.resolve_table_or_view_id(self.schema_name, name)
             .map_err(GnitzSqlError::Exec)?;
         self.cache.insert(name.to_string(), result.clone());
+        Ok(result)
+    }
+
+    pub fn find_index(
+        &mut self, table_id: u64, col_idx: usize,
+    ) -> Result<Option<u64>, GnitzSqlError> {
+        if let Some(&cached) = self.index_cache.get(&(table_id, col_idx)) {
+            return Ok(cached);
+        }
+        let result = self.client.find_index_for_column(table_id, col_idx)
+            .map_err(GnitzSqlError::Exec)?;
+        self.index_cache.insert((table_id, col_idx), result);
         Ok(result)
     }
 
@@ -71,7 +84,7 @@ impl<'a> Binder<'a> {
                     BinaryOperator::And       => BinOp::And,
                     BinaryOperator::Or        => BinOp::Or,
                     op => return Err(GnitzSqlError::Unsupported(
-                        format!("binary operator {:?} not supported in Phase 1", op)
+                        format!("binary operator {:?} not supported", op)
                     )),
                 };
                 Ok(BoundExpr::BinOp(Box::new(l), bop, Box::new(r)))
@@ -82,7 +95,7 @@ impl<'a> Binder<'a> {
                     UnaryOperator::Minus => UnaryOp::Neg,
                     UnaryOperator::Not   => UnaryOp::Not,
                     op => return Err(GnitzSqlError::Unsupported(
-                        format!("unary operator {:?} not supported in Phase 1", op)
+                        format!("unary operator {:?} not supported", op)
                     )),
                 };
                 Ok(BoundExpr::UnaryOp(uop, Box::new(inner)))
@@ -112,7 +125,7 @@ impl<'a> Binder<'a> {
                 }
             }
             _ => Err(GnitzSqlError::Unsupported(
-                format!("expression type not supported in Phase 1: {:?}", expr)
+                format!("expression type not supported: {:?}", expr)
             )),
         }
     }

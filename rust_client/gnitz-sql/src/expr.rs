@@ -23,7 +23,7 @@ pub fn compile_bound_expr(
         }
         BoundExpr::LitFloat(_v) => {
             // ExprBuilder only has load_const (integer). Float literals are stored as i64 bits.
-            // For Phase 1, treat float literals as integer bit patterns.
+            // Float literals are stored as i64 bit patterns (only integer ExprVM ops exist).
             Ok(eb.load_const(_v.to_bits() as i64))
         }
         BoundExpr::BinOp(left, op, right) => {

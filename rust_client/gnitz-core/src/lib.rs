@@ -9,8 +9,8 @@ pub mod circuit;
 pub use error::ClientError;
 pub use connection::Connection;
 pub use ops::{
-    alloc_table_id, alloc_schema_id, push, scan, seek,
-    SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, SEQ_TAB,
+    alloc_table_id, alloc_schema_id, alloc_index_id, push, scan, seek, seek_by_index,
+    SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB, DEP_TAB, SEQ_TAB,
     FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
 };
 pub use client::GnitzClient;

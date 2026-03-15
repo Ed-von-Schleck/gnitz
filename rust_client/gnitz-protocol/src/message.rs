@@ -44,7 +44,12 @@ pub fn send_message(
     header.schema_blob_sz = schema_blob_sz;
     header.data_count     = data_count;
     header.data_blob_sz   = data_blob_sz;
-    header.data_pk_index  = schema.map(|s| s.pk_index as u64).unwrap_or(0);
+    // Only set data_pk_index from schema when a schema is present.
+    // If schema is None, the caller may have set data_pk_index for another purpose
+    // (e.g., col_idx for FLAG_SEEK_BY_INDEX), so preserve it.
+    if let Some(s) = schema {
+        header.data_pk_index = s.pk_index as u64;
+    }
 
     // 5. Assemble buffer
     let err_len    = header.err_len as usize;

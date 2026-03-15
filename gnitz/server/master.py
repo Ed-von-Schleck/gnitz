@@ -207,6 +207,49 @@ class MasterDispatcher(object):
         )
         return result
 
+    def fan_out_seek(self, target_id, pk_lo, pk_hi, schema):
+        """Route PK seek to the single worker that owns the relevant partition."""
+        partition = _partition_for_key(r_uint64(pk_lo), r_uint64(pk_hi))
+        worker = self.assignment.worker_for_partition(partition)
+        ipc.send_batch(
+            self.worker_fds[worker], target_id, None, schema=schema,
+            flags=ipc.FLAG_SEEK, seek_pk_lo=pk_lo, seek_pk_hi=pk_hi,
+        )
+        payload = ipc.receive_payload(self.worker_fds[worker])
+        if payload.status != 0:
+            err = payload.error_msg
+            payload.close()
+            raise errors.StorageError("Worker %d seek error: %s" % (worker, err))
+        result = None
+        if payload.batch is not None and payload.batch.length() > 0:
+            result = ArenaZSetBatch(schema)
+            result.append_batch(payload.batch)
+        payload.close()
+        return result
+
+    def fan_out_seek_by_index(self, target_id, col_idx, key_lo, key_hi, schema):
+        """Broadcast index seek to all workers; return first non-empty result."""
+        for w in range(self.num_workers):
+            ipc.send_batch(
+                self.worker_fds[w], target_id, None, schema=schema,
+                flags=ipc.FLAG_SEEK_BY_INDEX,
+                seek_col_idx=col_idx, seek_pk_lo=key_lo, seek_pk_hi=key_hi,
+            )
+        result = None
+        for w in range(self.num_workers):
+            payload = ipc.receive_payload(self.worker_fds[w])
+            if payload.status != 0:
+                err = payload.error_msg
+                payload.close()
+                raise errors.StorageError(
+                    "Worker %d seek_by_index error: %s" % (w, err)
+                )
+            if result is None and payload.batch is not None and payload.batch.length() > 0:
+                result = ArenaZSetBatch(schema)
+                result.append_batch(payload.batch)
+            payload.close()
+        return result
+
     def broadcast_ddl(self, target_id, batch, schema):
         """Send a system-table delta to all workers for registry sync."""
         for w in range(self.num_workers):

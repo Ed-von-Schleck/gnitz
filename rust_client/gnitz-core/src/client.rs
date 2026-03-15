@@ -2,7 +2,7 @@ use gnitz_protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData};
 use crate::connection::Connection;
 use crate::error::ClientError;
 use crate::ops::{
-    self, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB,
+    self, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB,
 };
 use crate::types::{
     CircuitGraph,
@@ -37,6 +37,35 @@ fn col_str(col: &ColData, i: usize) -> Option<&str> {
 
 fn push_u64_bytes(buf: &mut Vec<u8>, val: u64) {
     buf.extend_from_slice(&val.to_le_bytes());
+}
+
+fn push_str(col: &mut ColData, s: &str) {
+    if let ColData::Strings(v) = col { v.push(Some(s.to_string())); }
+}
+
+fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
+    match tc {
+        TypeCode::F32 | TypeCode::F64 | TypeCode::String => Err(ClientError::ServerError(
+            "index on float/string column not supported".to_string()
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn idx_tab_schema() -> Schema {
+    use gnitz_protocol::ColumnDef;
+    Schema {
+        columns: vec![
+            ColumnDef { name: "index_id".into(),       type_code: TypeCode::U64,    is_nullable: false },
+            ColumnDef { name: "owner_id".into(),        type_code: TypeCode::U64,    is_nullable: false },
+            ColumnDef { name: "owner_kind".into(),      type_code: TypeCode::U64,    is_nullable: false },
+            ColumnDef { name: "source_col_idx".into(),  type_code: TypeCode::U64,    is_nullable: false },
+            ColumnDef { name: "name".into(),            type_code: TypeCode::String, is_nullable: false },
+            ColumnDef { name: "is_unique".into(),       type_code: TypeCode::U64,    is_nullable: false },
+            ColumnDef { name: "cache_directory".into(), type_code: TypeCode::String, is_nullable: false },
+        ],
+        pk_index: 0,
+    }
 }
 
 fn copy_col_row(src: &ColData, row: usize, dst: &mut ColData, stride: usize) {
@@ -105,6 +134,10 @@ impl GnitzClient {
         ops::alloc_schema_id(&self.conn)
     }
 
+    pub fn alloc_index_id(&self) -> Result<u64, ClientError> {
+        ops::alloc_index_id(&self.conn)
+    }
+
     pub fn push(&self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<(), ClientError> {
         ops::push(&self.conn, table_id, schema, batch)?;
         Ok(())
@@ -121,6 +154,93 @@ impl GnitzClient {
         pk_hi:    u64,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>), ClientError> {
         ops::seek(&self.conn, table_id, pk_lo, pk_hi)
+    }
+
+    pub fn seek_by_index(
+        &self, table_id: u64, col_idx: u64, key_lo: u64, key_hi: u64,
+    ) -> Result<(Option<Schema>, Option<ZSetBatch>), ClientError> {
+        ops::seek_by_index(&self.conn, table_id, col_idx, key_lo, key_hi)
+    }
+
+    pub fn find_index_for_column(
+        &self, table_id: u64, col_idx: usize,
+    ) -> Result<Option<u64>, ClientError> {
+        let (_, idx_batch) = ops::scan(&self.conn, IDX_TAB)?;
+        let idx_batch = match idx_batch { None => return Ok(None), Some(b) => b };
+        for i in 0..idx_batch.len() {
+            if idx_batch.weights[i] <= 0 { continue; }
+            let owner_id       = col_u64(&idx_batch.columns[1], i);
+            let source_col_idx = col_u64(&idx_batch.columns[3], i);
+            if owner_id == table_id && source_col_idx == col_idx as u64 {
+                return Ok(Some(idx_batch.pk_lo[i]));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn create_index(
+        &self, schema_name: &str, table_name: &str, col_name: &str, is_unique: bool,
+    ) -> Result<u64, ClientError> {
+        let (table_id, schema) = self.resolve_table_or_view_id(schema_name, table_name)?;
+        let col_idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
+            .ok_or_else(|| ClientError::ServerError(
+                format!("column '{}' not found in table '{}'", col_name, table_name)
+            ))?;
+        validate_index_col_type(schema.columns[col_idx].type_code)?;
+
+        let index_name = format!("{}__{}__idx_{}", schema_name, table_name, col_name);
+        let index_id = self.alloc_index_id()?;
+
+        let idx_schema = idx_tab_schema();
+        let mut batch = ZSetBatch::new(&idx_schema);
+        batch.pk_lo.push(index_id);
+        batch.pk_hi.push(0);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] { push_u64_bytes(buf, table_id); }
+        if let ColData::Fixed(buf) = &mut batch.columns[2] { push_u64_bytes(buf, 0u64); }
+        if let ColData::Fixed(buf) = &mut batch.columns[3] { push_u64_bytes(buf, col_idx as u64); }
+        push_str(&mut batch.columns[4], &index_name);
+        if let ColData::Fixed(buf) = &mut batch.columns[5] { push_u64_bytes(buf, is_unique as u64); }
+        push_str(&mut batch.columns[6], "");
+
+        self.push(IDX_TAB, &idx_schema, &batch)?;
+        Ok(index_id)
+    }
+
+    pub fn drop_index_by_name(&self, index_name: &str) -> Result<(), ClientError> {
+        let (_, idx_batch) = ops::scan(&self.conn, IDX_TAB)?;
+        let idx_batch = idx_batch.ok_or_else(|| {
+            ClientError::ServerError(format!("index '{}' not found", index_name))
+        })?;
+        for i in 0..idx_batch.len() {
+            if idx_batch.weights[i] <= 0 { continue; }
+            let name = col_str(&idx_batch.columns[4], i).unwrap_or("");
+            if name != index_name { continue; }
+
+            let index_id   = idx_batch.pk_lo[i];
+            let owner_id   = col_u64(&idx_batch.columns[1], i);
+            let owner_kind = col_u64(&idx_batch.columns[2], i);
+            let src_col    = col_u64(&idx_batch.columns[3], i);
+            let is_unique  = col_u64(&idx_batch.columns[5], i);
+            let cache_dir  = col_str(&idx_batch.columns[6], i).unwrap_or("").to_string();
+
+            let idx_schema = idx_tab_schema();
+            let mut batch = ZSetBatch::new(&idx_schema);
+            batch.pk_lo.push(index_id);
+            batch.pk_hi.push(0);
+            batch.weights.push(-1);
+            batch.nulls.push(0);
+            if let ColData::Fixed(buf) = &mut batch.columns[1] { push_u64_bytes(buf, owner_id); }
+            if let ColData::Fixed(buf) = &mut batch.columns[2] { push_u64_bytes(buf, owner_kind); }
+            if let ColData::Fixed(buf) = &mut batch.columns[3] { push_u64_bytes(buf, src_col); }
+            push_str(&mut batch.columns[4], index_name);
+            if let ColData::Fixed(buf) = &mut batch.columns[5] { push_u64_bytes(buf, is_unique); }
+            push_str(&mut batch.columns[6], &cache_dir);
+            self.push(IDX_TAB, &idx_schema, &batch)?;
+            return Ok(());
+        }
+        Err(ClientError::ServerError(format!("index '{}' not found", index_name)))
     }
 
     pub fn delete(&self, table_id: u64, schema: &Schema, pks: &[(u64, u64)]) -> Result<(), ClientError> {
@@ -533,14 +653,16 @@ impl GnitzClient {
         })?;
         let schema_id = self.find_schema_id(&schema_batch, schema_name)?;
 
+        // Scan COL_TAB once — shared by both the table and view branches below
+        let (_, col_batch) = ops::scan(&self.conn, COL_TAB)?;
+        let col_batch = col_batch.ok_or_else(|| {
+            ClientError::ServerError("COL_TAB is empty".to_string())
+        })?;
+
         // Try TABLE_TAB first (most common path)
         let (_, tbl_batch) = ops::scan(&self.conn, TABLE_TAB)?;
         if let Some(ref tbl_batch) = tbl_batch {
             if let Ok(record) = self.find_table_record(tbl_batch, schema_id, name) {
-                let (_, col_batch) = ops::scan(&self.conn, COL_TAB)?;
-                let col_batch = col_batch.ok_or_else(|| {
-                    ClientError::ServerError("COL_TAB is empty".to_string())
-                })?;
                 let columns = self.extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
                 return Ok((record.tid, Schema { columns, pk_index: record.pk_col_idx as usize }));
             }
@@ -554,10 +676,6 @@ impl GnitzClient {
             )
         })?;
         let record = self.find_view_record(&view_batch, schema_id, name)?;
-        let (_, col_batch) = ops::scan(&self.conn, COL_TAB)?;
-        let col_batch = col_batch.ok_or_else(|| {
-            ClientError::ServerError("COL_TAB is empty".to_string())
-        })?;
         let columns = self.extract_col_entries(&col_batch, record.vid, OWNER_KIND_VIEW)?;
         // View PK is always the U128 hash column at index 0
         Ok((record.vid, Schema { columns, pk_index: 0 }))

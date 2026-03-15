@@ -1,8 +1,8 @@
 use sqlparser::ast::{
-    Statement, ObjectType, ColumnOption, TableConstraint, Query, SetExpr, Values, Expr, Value,
+    Statement, ObjectType, ColumnOption, TableConstraint, Query, SetExpr, Expr,
     SelectItem, TableFactor,
 };
-use gnitz_protocol::{ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_protocol::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{GnitzClient, CircuitBuilder, ExprBuilder};
 use crate::error::GnitzSqlError;
 use crate::binder::Binder;
@@ -34,8 +34,11 @@ pub fn execute_statement(
         Statement::Query(query) => {
             dml::execute_select(client, schema_name, query, &mut binder)
         }
+        Statement::CreateIndex(ci) => {
+            execute_create_index(client, schema_name, ci)
+        }
         _ => Err(GnitzSqlError::Unsupported(
-            format!("statement type not supported in Phase 1: {:?}", stmt)
+            format!("unsupported SQL statement: {:?}", stmt)
         )),
     }
 }
@@ -119,6 +122,9 @@ fn execute_drop(
             ObjectType::View => {
                 client.drop_view(schema_name, &name).map_err(GnitzSqlError::Exec)?;
             }
+            ObjectType::Index => {
+                client.drop_index_by_name(&name).map_err(GnitzSqlError::Exec)?;
+            }
             _ => return Err(GnitzSqlError::Unsupported(
                 format!("DROP {:?} not supported", object_type)
             )),
@@ -147,12 +153,12 @@ fn execute_create_view(
         _ => return Err(GnitzSqlError::Unsupported("CREATE VIEW only supports SELECT".to_string())),
     };
 
-    // Reject JOINs and GROUP BY for Phase 1
+    // Reject JOINs and GROUP BY
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-        return Err(GnitzSqlError::Unsupported("CREATE VIEW: only single-table, no JOIN in Phase 1".to_string()));
+        return Err(GnitzSqlError::Unsupported("CREATE VIEW: only single-table queries supported; JOINs not supported".to_string()));
     }
     if select.group_by != sqlparser::ast::GroupByExpr::Expressions(vec![], vec![]) {
-        return Err(GnitzSqlError::Unsupported("CREATE VIEW: GROUP BY not supported in Phase 1".to_string()));
+        return Err(GnitzSqlError::Unsupported("CREATE VIEW: GROUP BY not supported".to_string()));
     }
 
     let table_name = match &select.from[0].relation {
@@ -200,6 +206,35 @@ fn execute_create_view(
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
+}
+
+fn execute_create_index(
+    client:      &GnitzClient,
+    schema_name: &str,
+    ci:          &sqlparser::ast::CreateIndex,
+) -> Result<SqlResult, GnitzSqlError> {
+    let table_name = ci.table_name.0.last()
+        .and_then(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .ok_or_else(|| GnitzSqlError::Bind("empty table name in CREATE INDEX".to_string()))?;
+
+    if ci.columns.len() != 1 {
+        return Err(GnitzSqlError::Unsupported(
+            "CREATE INDEX: only single-column indices supported".to_string()
+        ));
+    }
+    let col_name = match &ci.columns[0].column.expr {
+        Expr::Identifier(id) => id.value.clone(),
+        _ => return Err(GnitzSqlError::Bind(
+            "CREATE INDEX: column must be a simple identifier".to_string()
+        )),
+    };
+    let is_unique = ci.unique;
+
+    let index_id = client.create_index(schema_name, &table_name, &col_name, is_unique)
+        .map_err(GnitzSqlError::Exec)?;
+
+    Ok(SqlResult::IndexCreated { index_id })
 }
 
 fn build_projection(

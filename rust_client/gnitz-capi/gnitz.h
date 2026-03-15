@@ -212,6 +212,21 @@ void gnitz_circuit_builder_free(GnitzCircuitBuilder *cb);
 
 void gnitz_circuit_free(GnitzCircuit *c);
 
+int gnitz_seek(GnitzConn *conn,
+               uint64_t table_id,
+               uint64_t pk_lo,
+               uint64_t pk_hi,
+               GnitzBatch **out_batch);
+
+int gnitz_seek_by_index(GnitzConn *conn,
+                        uint64_t table_id,
+                        uint64_t col_idx,
+                        uint64_t key_lo,
+                        uint64_t key_hi,
+                        GnitzBatch **out_batch);
+
+int gnitz_execute_sql(GnitzConn *conn, const char *sql, const char *schema, uint64_t *out_id);
+
 void gnitz_free_string(char *s);
 
 #endif  /* GNITZ_H */

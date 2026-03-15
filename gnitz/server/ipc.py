@@ -25,9 +25,10 @@ MAGIC_V2 = r_uint64(0x474E49545A325043)
 # [40-47]  Schema Blob Size u64
 # [48-55]  Data Row Count   u64
 # [56-63]  Data Blob Size   u64
-# [64-71]  Data PK Index    u64
+# [64-71]  p4 (data_pk_index) — seek_col_idx when FLAG_SEEK_BY_INDEX, else 0
 # [72-79]  Flags            u64
-# [80-95]  Reserved         16B
+# [80-87]  p5 (seek_pk_lo)  — seek key lo for FLAG_SEEK / FLAG_SEEK_BY_INDEX
+# [88-95]  p6 (seek_pk_hi)  — seek key hi for FLAG_SEEK / FLAG_SEEK_BY_INDEX
 HEADER_SIZE = 96
 ALIGNMENT = 64
 MAX_ERR_LEN = 65536
@@ -62,9 +63,15 @@ FLAG_EXCHANGE = 16
 FLAG_PUSH = 32
 FLAG_HAS_PK = 64
 FLAG_SEEK = 128
+FLAG_SEEK_BY_INDEX     = 256   # p4=col_idx, p5/p6=index_key; target_id=table_id
+FLAG_ALLOCATE_INDEX_ID = 512   # target_id=0; response carries new index_id in target_id
+FLAG_SCAN              = 0     # explicit name for "no flags" (no wire change)
 
 OFF_SEEK_PK_LO = 80
 OFF_SEEK_PK_HI = 88
+OFF_SEEK_IDX_COL    = OFF_DATA_PK_INDEX   # p4 alias when FLAG_SEEK_BY_INDEX
+OFF_SEEK_IDX_KEY_LO = OFF_SEEK_PK_LO      # p5 alias
+OFF_SEEK_IDX_KEY_HI = OFF_SEEK_PK_HI      # p6 alias
 
 # --- IPC String Encoding ---
 IPC_STRING_STRIDE = 8
@@ -345,6 +352,7 @@ class IPCPayload(object):
         "target_id",
         "client_id",
         "flags",
+        "seek_col_idx",
         "seek_pk_lo",
         "seek_pk_hi",
     ]
@@ -352,7 +360,7 @@ class IPCPayload(object):
     def __init__(
         self, fd, ptr, total_size, status, error_msg,
         schema, batch_obj, target_id, client_id, flags, owned_bufs,
-        seek_pk_lo=0, seek_pk_hi=0
+        seek_col_idx=0, seek_pk_lo=0, seek_pk_hi=0
     ):
         self.fd = fd
         self.ptr = ptr
@@ -365,6 +373,7 @@ class IPCPayload(object):
         self.client_id = client_id
         self.flags = flags
         self.owned_bufs = owned_bufs
+        self.seek_col_idx = seek_col_idx
         self.seek_pk_lo = seek_pk_lo
         self.seek_pk_hi = seek_pk_hi
 
@@ -452,7 +461,8 @@ def _write_zset_section(
 @jit.dont_look_inside
 def serialize_to_memfd(
     target_id, schema=None, zbatch=None,
-    status=0, error_msg="", client_id=0, flags=0
+    status=0, error_msg="", client_id=0, flags=0,
+    seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0,
 ):
     """
     Serializes a v2 IPC message into a shared-memory file descriptor.
@@ -531,8 +541,6 @@ def serialize_to_memfd(
     if total_size < r_uint64(HEADER_SIZE):
         total_size = r_uint64(HEADER_SIZE)
 
-    data_pk_index = r_uint64(schema.pk_index) if schema is not None else r_uint64(0)
-
     fd = -1
     ptr = lltype.nullptr(rffi.CCHARP.TO)
     try:
@@ -556,9 +564,10 @@ def serialize_to_memfd(
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SCHEMA_BLOB_SZ))[0] = s_total_blob_sz
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_COUNT))[0] = r_uint64(data_count)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_BLOB_SZ))[0] = d_total_blob_sz
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_PK_INDEX))[0] = data_pk_index
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_FLAGS))[0] = r_uint64(flags)
-        # Reserved (bytes 80-95): zero by default from ftruncate
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_PK_INDEX))[0] = r_uint64(seek_col_idx)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_LO))[0] = r_uint64(seek_pk_lo)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_HI))[0] = r_uint64(seek_pk_hi)
 
         # Write Error String
         if err_len > 0:
@@ -602,12 +611,14 @@ def serialize_to_memfd(
 @jit.dont_look_inside
 def send_batch(
     sock_fd, target_id, zbatch, status=0, error_msg="",
-    client_id=0, schema=None, flags=0
+    client_id=0, schema=None, flags=0,
+    seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0,
 ):
     """Synchronous send: Serializes and transmits a single v2 batch."""
     memfd = serialize_to_memfd(
         target_id, schema=schema, zbatch=zbatch,
         status=status, error_msg=error_msg, client_id=client_id, flags=flags,
+        seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi, seek_col_idx=seek_col_idx,
     )
     try:
         if ipc_ffi.send_fd(sock_fd, memfd) < 0:
@@ -780,12 +791,16 @@ def _recv_and_parse(fd):
         schema_blob_sz = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SCHEMA_BLOB_SZ))[0])
         data_count = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_COUNT))[0])
         data_blob_sz = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_BLOB_SZ))[0])
-        data_pk_index = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_PK_INDEX))[0])
         flags = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_FLAGS))[0])
 
+        seek_col_idx = 0
         seek_pk_lo = 0
         seek_pk_hi = 0
-        if intmask(flags) & FLAG_SEEK:
+        if intmask(flags) & FLAG_SEEK_BY_INDEX:
+            seek_col_idx = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_COL))[0])
+            seek_pk_lo   = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_KEY_LO))[0])
+            seek_pk_hi   = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_KEY_HI))[0])
+        elif intmask(flags) & FLAG_SEEK:
             seek_pk_lo = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_LO))[0])
             seek_pk_hi = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_HI))[0])
 
@@ -845,7 +860,7 @@ def _recv_and_parse(fd):
         return IPCPayload(
             fd, ptr, total_size, status, error_msg,
             wire_schema, zbatch, target_id, client_id, flags, owned_bufs,
-            seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi,
+            seek_col_idx=seek_col_idx, seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi,
         )
 
     except Exception as e:

@@ -915,16 +915,45 @@ pub unsafe extern "C" fn gnitz_seek(
     }
 }
 
-/// Execute a SQL statement. Returns the first result's ID (table_id/view_id/row_count).
+/// Low-level seek on secondary index.
+/// table_id: source TABLE id (not the index id).
+/// col_idx: 0-based column index the index was created on.
+/// key_lo/key_hi: 128-bit index key split into two u64.
+/// out_batch: receives pointer to result batch (NULL if not found).
+/// Returns 0 on success, -1 on error (call gnitz_last_error for message).
+#[no_mangle]
+pub unsafe extern "C" fn gnitz_seek_by_index(
+    conn:      *mut GnitzConn,
+    table_id:  u64,
+    col_idx:   u64,
+    key_lo:    u64,
+    key_hi:    u64,
+    out_batch: *mut *mut GnitzBatch,
+) -> c_int {
+    clear_error();
+    let c = check_ptr_mut!(conn, -1);
+    match c.0.seek_by_index(table_id, col_idx, key_lo, key_hi) {
+        Ok((server_schema, data)) => {
+            if !out_batch.is_null() {
+                let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_index: 0 });
+                let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
+                *out_batch = Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch }));
+            }
+            0
+        }
+        Err(e) => { set_error(e); -1 }
+    }
+}
+
+/// Execute a SQL statement. Returns the first result's ID (table_id/view_id/index_id/row_count).
 /// Returns 0 on DROP/other, -1 on error. Check gnitz_last_error on -1.
 /// out_id may be NULL.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_execute_sql(
-    conn:    *mut GnitzConn,
-    sql:     *const c_char,
-    _sql_len: usize,
-    schema:  *const c_char,
-    out_id:  *mut u64,
+    conn:   *mut GnitzConn,
+    sql:    *const c_char,
+    schema: *const c_char,
+    out_id: *mut u64,
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
@@ -937,11 +966,12 @@ pub unsafe extern "C" fn gnitz_execute_sql(
                 if let Some(r) = results.into_iter().next() {
                     use gnitz_sql::SqlResult;
                     *out_id = match r {
-                        SqlResult::TableCreated { table_id } => table_id,
-                        SqlResult::ViewCreated  { view_id  } => view_id,
-                        SqlResult::RowsAffected { count    } => count as u64,
-                        SqlResult::Dropped                   => 0,
-                        SqlResult::Rows { .. }               => 0,
+                        SqlResult::TableCreated  { table_id  } => table_id,
+                        SqlResult::ViewCreated   { view_id   } => view_id,
+                        SqlResult::IndexCreated  { index_id  } => index_id,
+                        SqlResult::RowsAffected  { count     } => count as u64,
+                        SqlResult::Dropped                     => 0,
+                        SqlResult::Rows { .. }                 => 0,
                     };
                 } else {
                     *out_id = 0;

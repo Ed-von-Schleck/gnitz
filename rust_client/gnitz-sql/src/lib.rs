@@ -15,11 +15,12 @@ use sqlparser::parser::Parser;
 
 /// Result of executing a single SQL statement.
 pub enum SqlResult {
-    TableCreated { table_id: u64 },
-    ViewCreated  { view_id:  u64 },
+    TableCreated  { table_id:  u64 },
+    ViewCreated   { view_id:   u64 },
+    IndexCreated  { index_id:  u64 },
     Dropped,
-    RowsAffected { count: usize },
-    Rows         { schema: Schema, batch: ZSetBatch },
+    RowsAffected  { count: usize },
+    Rows          { schema: Schema, batch: ZSetBatch },
 }
 
 /// High-level SQL execution planner.

@@ -12,6 +12,8 @@ pub const FLAG_EXCHANGE:           u64 = 16;
 pub const FLAG_PUSH:               u64 = 32;
 pub const FLAG_HAS_PK:             u64 = 64;
 pub const FLAG_SEEK:               u64 = 128;
+pub const FLAG_SEEK_BY_INDEX:      u64 = 256;
+pub const FLAG_ALLOCATE_INDEX_ID:  u64 = 512;
 
 pub const STATUS_OK:    u32 = 0;
 pub const STATUS_ERROR: u32 = 1;
@@ -25,7 +27,13 @@ pub const IPC_NULL_STRING_OFFSET: u32   = 0xFFFF_FFFF;
 /// Wire layout (LE, 96 bytes):
 ///   magic[8] status[4] err_len[4] target_id[8] client_id[8]
 ///   schema_count[8] schema_blob_sz[8] data_count[8] data_blob_sz[8]
-///   data_pk_index[8] flags[8]  reserved[16]
+///   [64] p4 data_pk_index[8]  [72] flags[8]
+///   [80] p5 seek_pk_lo[8]     [88] p6 seek_pk_hi[8]
+///
+/// p4/p5/p6 usage by flag:
+///   FLAG_SEEK           — p5=pk_lo, p6=pk_hi, p4=0
+///   FLAG_SEEK_BY_INDEX  — p4=col_idx, p5=index_key_lo, p6=index_key_hi
+///   (all other flags)   — p4=p5=p6=0
 pub struct Header {
     pub magic:          u64,
     pub status:         u32,
@@ -112,6 +120,18 @@ impl Header {
     }
 }
 
+impl Header {
+    /// Set p4/p5/p6 for FLAG_SEEK_BY_INDEX requests.
+    pub fn set_seek_by_index(&mut self, col_idx: u64, key_lo: u64, key_hi: u64) {
+        self.data_pk_index = col_idx;
+        self.seek_pk_lo    = key_lo;
+        self.seek_pk_hi    = key_hi;
+    }
+    pub fn seek_col_idx(&self)    -> u64 { self.data_pk_index }
+    pub fn seek_idx_key_lo(&self) -> u64 { self.seek_pk_lo }
+    pub fn seek_idx_key_hi(&self) -> u64 { self.seek_pk_hi }
+}
+
 impl Default for Header {
     fn default() -> Self {
         Header {
@@ -148,7 +168,7 @@ mod tests {
             schema_blob_sz: 256,
             data_count:     100,
             data_blob_sz:   4096,
-            data_pk_index:  2,
+            data_pk_index:  42,
             flags:          FLAG_PUSH | FLAG_HAS_PK,
             seek_pk_lo:     0xDEAD_BEEF_1234_5678,
             seek_pk_hi:     0x1111_2222_3333_4444,
