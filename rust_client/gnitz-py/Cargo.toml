@@ -15,3 +15,4 @@ integration = ["gnitz-core/integration"]
 pyo3           = { version = "0.23", features = ["extension-module", "abi3-py310"] }
 gnitz-core     = { path = "../gnitz-core" }
 gnitz-protocol = { path = "../gnitz-protocol" }
+gnitz-sql      = { path = "../gnitz-sql" }

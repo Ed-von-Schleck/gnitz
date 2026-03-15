@@ -1,7 +1,7 @@
 use std::os::unix::io::RawFd;
 use gnitz_protocol::{
     Header, Message, Schema, ZSetBatch,
-    STATUS_ERROR, send_message, recv_message,
+    STATUS_ERROR, FLAG_SEEK, send_message, recv_message,
     connect as proto_connect, close_fd,
 };
 use crate::error::ClientError;
@@ -36,6 +36,28 @@ impl Connection {
         send_message(self.sock_fd, hdr, schema, None, data)?;
         let msg = recv_message(self.sock_fd, None)?;
 
+        if msg.header.status == STATUS_ERROR {
+            return Err(ClientError::ServerError(
+                msg.error_text.unwrap_or_else(|| "unknown server error".into())
+            ));
+        }
+        Ok(msg)
+    }
+
+    pub fn roundtrip_seek(
+        &self,
+        target_id: u64,
+        pk_lo:     u64,
+        pk_hi:     u64,
+    ) -> Result<Message, ClientError> {
+        let mut hdr = Header::default();
+        hdr.target_id  = target_id;
+        hdr.client_id  = self.client_id;
+        hdr.flags      = FLAG_SEEK;
+        hdr.seek_pk_lo = pk_lo;
+        hdr.seek_pk_hi = pk_hi;
+        send_message(self.sock_fd, hdr, None, None, None)?;
+        let msg = recv_message(self.sock_fd, None)?;
         if msg.header.status == STATUS_ERROR {
             return Err(ClientError::ServerError(
                 msg.error_text.unwrap_or_else(|| "unknown server error".into())

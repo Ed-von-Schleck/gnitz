@@ -1,8 +1,9 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyTuple};
+use pyo3::types::{PyList, PyDict, PyTuple};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, ExprProgram, CircuitGraph, GnitzClient};
 use gnitz_protocol::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_sql::{SqlPlanner, SqlResult};
 
 // ---------------------------------------------------------------------------
 // GnitzError Python exception
@@ -481,7 +482,7 @@ impl PyGnitzClient {
         let graph = circuit.inner.take()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("CircuitGraph already consumed"))?;
         let rust_schema = py_schema_to_rust(py, &output_schema)?;
-        client!(self).create_view_with_circuit(schema_name, view_name, graph, &rust_schema.columns)
+        client!(self).create_view_with_circuit(schema_name, view_name, "", graph, &rust_schema.columns)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
@@ -510,6 +511,67 @@ impl PyGnitzClient {
     /// allocate_schema_id()
     pub fn allocate_schema_id(&self) -> PyResult<u64> {
         client!(self).alloc_schema_id().map_err(|e| GnitzError::new_err(e.to_string()))
+    }
+
+    /// seek(table_id, pk_lo, pk_hi) -> (Schema | None, ZSetBatch | None)
+    pub fn seek(&self, py: Python<'_>, table_id: u64, pk_lo: u64, pk_hi: u64) -> PyResult<PyObject> {
+        match client!(self).seek(table_id, pk_lo, pk_hi) {
+            Ok((opt_schema, opt_batch)) => {
+                let (py_schema, py_batch) = match (opt_schema, opt_batch) {
+                    (Some(s), Some(b)) => {
+                        let ps = rust_schema_to_py(py, &s)?.into_any();
+                        let pb = rust_batch_to_py(py, &s, &b)?.into_any();
+                        (ps, pb)
+                    }
+                    (Some(s), None) => {
+                        let ps = rust_schema_to_py(py, &s)?.into_any();
+                        (ps, py.None())
+                    }
+                    _ => (py.None(), py.None()),
+                };
+                Ok(PyTuple::new(py, [py_schema, py_batch])?.into_any().unbind())
+            }
+            Err(e) => Err(GnitzError::new_err(e.to_string())),
+        }
+    }
+
+    /// execute_sql(schema_name, sql) -> list of result dicts
+    pub fn execute_sql(&self, py: Python<'_>, schema_name: &str, sql: &str) -> PyResult<PyObject> {
+        let client_ref = client!(self);
+        let planner = SqlPlanner::new(client_ref, schema_name);
+        let results = planner.execute(sql)
+            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+
+        let py_list = PyList::empty(py);
+        for r in results {
+            let d = PyDict::new(py);
+            match r {
+                SqlResult::TableCreated { table_id } => {
+                    d.set_item("type", "TableCreated")?;
+                    d.set_item("table_id", table_id)?;
+                }
+                SqlResult::ViewCreated { view_id } => {
+                    d.set_item("type", "ViewCreated")?;
+                    d.set_item("view_id", view_id)?;
+                }
+                SqlResult::Dropped => {
+                    d.set_item("type", "Dropped")?;
+                }
+                SqlResult::RowsAffected { count } => {
+                    d.set_item("type", "RowsAffected")?;
+                    d.set_item("count", count)?;
+                }
+                SqlResult::Rows { schema, batch } => {
+                    d.set_item("type", "Rows")?;
+                    let py_schema = rust_schema_to_py(py, &schema)?.into_any();
+                    let py_batch  = rust_batch_to_py(py, &schema, &batch)?.into_any();
+                    d.set_item("schema", py_schema)?;
+                    d.set_item("batch", py_batch)?;
+                }
+            }
+            py_list.append(d)?;
+        }
+        Ok(py_list.into_any().unbind())
     }
 }
 

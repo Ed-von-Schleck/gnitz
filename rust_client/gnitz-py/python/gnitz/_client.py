@@ -85,6 +85,15 @@ class Connection:
     def resolve_table_id(self, schema_name, table_name):
         return self.resolve_table(schema_name, table_name)
 
+    def seek(self, table_id: int, pk_lo: int = 0, pk_hi: int = 0) -> "ScanResult":
+        native_schema, batch = self._client.seek(table_id, pk_lo, pk_hi)
+        if native_schema is None:
+            return ScanResult(None, None)
+        return ScanResult(_from_native_schema(native_schema), batch)
+
+    def execute_sql(self, sql: str, schema_name: str = "public") -> list:
+        return self._client.execute_sql(schema_name, sql)
+
     # Low-level
 
     def allocate_table_id(self):

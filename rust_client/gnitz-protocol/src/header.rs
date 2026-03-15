@@ -11,6 +11,7 @@ pub const FLAG_DDL_SYNC:           u64 = 8;
 pub const FLAG_EXCHANGE:           u64 = 16;
 pub const FLAG_PUSH:               u64 = 32;
 pub const FLAG_HAS_PK:             u64 = 64;
+pub const FLAG_SEEK:               u64 = 128;
 
 pub const STATUS_OK:    u32 = 0;
 pub const STATUS_ERROR: u32 = 1;
@@ -37,6 +38,8 @@ pub struct Header {
     pub data_blob_sz:   u64,
     pub data_pk_index:  u64,
     pub flags:          u64,
+    pub seek_pk_lo:     u64,   // bytes 80-87; 0 for non-seek messages
+    pub seek_pk_hi:     u64,   // bytes 88-95; 0 for non-seek messages
 }
 
 impl Header {
@@ -63,7 +66,8 @@ impl Header {
         write_le!(self.data_blob_sz,   8);
         write_le!(self.data_pk_index,  8);
         write_le!(self.flags,          8);
-        // bytes 80-95 remain zero (reserved)
+        write_le!(self.seek_pk_lo,     8);  // bytes 80-87
+        write_le!(self.seek_pk_hi,     8);  // bytes 88-95
         buf
     }
 
@@ -102,6 +106,8 @@ impl Header {
             data_blob_sz:   read_le_u64!(56),
             data_pk_index:  read_le_u64!(64),
             flags:          read_le_u64!(72),
+            seek_pk_lo:     read_le_u64!(80),
+            seek_pk_hi:     read_le_u64!(88),
         })
     }
 }
@@ -120,6 +126,8 @@ impl Default for Header {
             data_blob_sz:   0,
             data_pk_index:  0,
             flags:          0,
+            seek_pk_lo:     0,
+            seek_pk_hi:     0,
         }
     }
 }
@@ -142,6 +150,8 @@ mod tests {
             data_blob_sz:   4096,
             data_pk_index:  2,
             flags:          FLAG_PUSH | FLAG_HAS_PK,
+            seek_pk_lo:     0xDEAD_BEEF_1234_5678,
+            seek_pk_hi:     0x1111_2222_3333_4444,
         };
 
         let packed = h.pack();
@@ -159,9 +169,8 @@ mod tests {
         assert_eq!(h2.data_blob_sz,   h.data_blob_sz);
         assert_eq!(h2.data_pk_index,  h.data_pk_index);
         assert_eq!(h2.flags,          h.flags);
-
-        // Reserved bytes 80-95 must be zero
-        assert_eq!(&packed[80..96], &[0u8; 16]);
+        assert_eq!(h2.seek_pk_lo,     h.seek_pk_lo);
+        assert_eq!(h2.seek_pk_hi,     h.seek_pk_hi);
     }
 
     #[test]

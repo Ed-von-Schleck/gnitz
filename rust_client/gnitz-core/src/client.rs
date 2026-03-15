@@ -114,6 +114,15 @@ impl GnitzClient {
         ops::scan(&self.conn, table_id)
     }
 
+    pub fn seek(
+        &self,
+        table_id: u64,
+        pk_lo:    u64,
+        pk_hi:    u64,
+    ) -> Result<(Option<Schema>, Option<ZSetBatch>), ClientError> {
+        ops::seek(&self.conn, table_id, pk_lo, pk_hi)
+    }
+
     pub fn delete(&self, table_id: u64, schema: &Schema, pks: &[(u64, u64)]) -> Result<(), ClientError> {
         let n = pks.len();
         let mut batch = ZSetBatch::new(schema);
@@ -327,7 +336,7 @@ impl GnitzClient {
         }
 
         // 6. View record — must be last (triggers server-side hook + circuit compilation)
-        self.push_view_record(vid, schema_id, view_name)?;
+        self.push_view_record(vid, schema_id, view_name, "")?;
 
         Ok(vid)
     }
@@ -336,6 +345,7 @@ impl GnitzClient {
         &self,
         schema_name: &str,
         view_name: &str,
+        sql_text: &str,
         circuit: CircuitGraph,
         output_columns: &[ColumnDef],
     ) -> Result<u64, ClientError> {
@@ -441,7 +451,7 @@ impl GnitzClient {
         }
 
         // 8. View record — must be last
-        self.push_view_record(vid, schema_id, view_name)?;
+        self.push_view_record(vid, schema_id, view_name, sql_text)?;
 
         Ok(vid)
     }
@@ -508,12 +518,65 @@ impl GnitzClient {
             ClientError::ServerError("COL_TAB is empty".to_string())
         })?;
 
+        let columns = self.extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
+        Ok((record.tid, Schema { columns, pk_index: record.pk_col_idx as usize }))
+    }
+
+    pub fn resolve_table_or_view_id(
+        &self,
+        schema_name: &str,
+        name: &str,
+    ) -> Result<(u64, Schema), ClientError> {
+        let (_, schema_batch) = ops::scan(&self.conn, SCHEMA_TAB)?;
+        let schema_batch = schema_batch.ok_or_else(|| {
+            ClientError::ServerError(format!("Schema '{}' not found", schema_name))
+        })?;
+        let schema_id = self.find_schema_id(&schema_batch, schema_name)?;
+
+        // Try TABLE_TAB first (most common path)
+        let (_, tbl_batch) = ops::scan(&self.conn, TABLE_TAB)?;
+        if let Some(ref tbl_batch) = tbl_batch {
+            if let Ok(record) = self.find_table_record(tbl_batch, schema_id, name) {
+                let (_, col_batch) = ops::scan(&self.conn, COL_TAB)?;
+                let col_batch = col_batch.ok_or_else(|| {
+                    ClientError::ServerError("COL_TAB is empty".to_string())
+                })?;
+                let columns = self.extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
+                return Ok((record.tid, Schema { columns, pk_index: record.pk_col_idx as usize }));
+            }
+        }
+
+        // Fall back to VIEW_TAB
+        let (_, view_batch) = ops::scan(&self.conn, VIEW_TAB)?;
+        let view_batch = view_batch.ok_or_else(|| {
+            ClientError::ServerError(
+                format!("Table or view '{}.{}' not found", schema_name, name)
+            )
+        })?;
+        let record = self.find_view_record(&view_batch, schema_id, name)?;
+        let (_, col_batch) = ops::scan(&self.conn, COL_TAB)?;
+        let col_batch = col_batch.ok_or_else(|| {
+            ClientError::ServerError("COL_TAB is empty".to_string())
+        })?;
+        let columns = self.extract_col_entries(&col_batch, record.vid, OWNER_KIND_VIEW)?;
+        // View PK is always the U128 hash column at index 0
+        Ok((record.vid, Schema { columns, pk_index: 0 }))
+    }
+
+    // --- Private helpers ---
+
+    fn extract_col_entries(
+        &self,
+        col_batch:  &ZSetBatch,
+        owner_id:   u64,
+        owner_kind: u64,
+    ) -> Result<Vec<ColumnDef>, ClientError> {
         let mut col_entries: Vec<(u64, String, TypeCode, bool)> = Vec::new();
         for i in 0..col_batch.len() {
             if col_batch.weights[i] <= 0 { continue; }
             let row_owner_id   = col_u64(&col_batch.columns[1], i);
             let row_owner_kind = col_u64(&col_batch.columns[2], i);
-            if row_owner_id != record.tid || row_owner_kind != OWNER_KIND_TABLE { continue; }
+            if row_owner_id != owner_id || row_owner_kind != owner_kind { continue; }
 
             let col_idx     = col_u64(&col_batch.columns[3], i);
             let name        = col_str(&col_batch.columns[4], i).unwrap_or("").to_string();
@@ -522,17 +585,11 @@ impl GnitzClient {
             let is_nullable = col_u64(&col_batch.columns[6], i) != 0;
             col_entries.push((col_idx, name, type_code, is_nullable));
         }
-
         col_entries.sort_by_key(|e| e.0);
-
-        let columns: Vec<ColumnDef> = col_entries.into_iter().map(|(_, name, type_code, is_nullable)| {
+        Ok(col_entries.into_iter().map(|(_, name, type_code, is_nullable)| {
             ColumnDef { name, type_code, is_nullable }
-        }).collect();
-
-        Ok((record.tid, Schema { columns, pk_index: record.pk_col_idx as usize }))
+        }).collect())
     }
-
-    // --- Private helpers ---
 
     fn find_schema_id(&self, batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
         for i in 0..batch.len() {
@@ -711,7 +768,7 @@ impl GnitzClient {
         Ok(())
     }
 
-    fn push_view_record(&self, vid: u64, schema_id: u64, view_name: &str) -> Result<(), ClientError> {
+    fn push_view_record(&self, vid: u64, schema_id: u64, view_name: &str, sql_text: &str) -> Result<(), ClientError> {
         let view_s = view_tab_schema();
         let mut vb = ZSetBatch::new(&view_s);
         vb.pk_lo.push(vid);
@@ -720,7 +777,7 @@ impl GnitzClient {
         vb.nulls.push(0);
         if let ColData::Fixed(buf) = &mut vb.columns[1] { push_u64_bytes(buf, schema_id); }
         if let ColData::Strings(v) = &mut vb.columns[2] { v.push(Some(view_name.to_string())); }
-        if let ColData::Strings(v) = &mut vb.columns[3] { v.push(Some(String::new())); }
+        if let ColData::Strings(v) = &mut vb.columns[3] { v.push(Some(sql_text.to_string())); }
         if let ColData::Strings(v) = &mut vb.columns[4] { v.push(Some(String::new())); }
         if let ColData::Fixed(buf) = &mut vb.columns[5] { push_u64_bytes(buf, 0); }
         ops::push(&self.conn, VIEW_TAB, &view_s, &vb)?;

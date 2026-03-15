@@ -378,6 +378,29 @@ class ServerExecutor(object):
             cursor.close()
         return result
 
+    def _seek_family(self, target_id, pk_lo_raw, pk_hi_raw):
+        """Point lookup: returns a one-row ArenaZSetBatch or None."""
+        family = self.engine.registry.get_by_id(target_id)
+        cursor = family.store.create_cursor()
+        try:
+            key = r_uint128(
+                (r_uint128(r_uint64(pk_hi_raw)) << 64) | r_uint128(r_uint64(pk_lo_raw))
+            )
+            cursor.seek(key)
+            if not cursor.is_valid():
+                return None
+            if cursor.key() != key:
+                return None
+            w = cursor.weight()
+            if w <= r_int64(0):
+                return None
+            result = ArenaZSetBatch(family.schema, initial_capacity=1)
+            acc = cursor.get_accessor()
+            result.append_from_accessor(key, w, acc)
+            return result
+        finally:
+            cursor.close()
+
     # -- Socket Layer (delegates to handle_push) ---------------------------
 
     def _drain_client(self, fd, p_fds, p_cids, p_tids, p_batches, p_schemas):
@@ -412,6 +435,21 @@ class ServerExecutor(object):
             if client_id > 0:
                 self.fd_to_client[fd] = client_id
                 self.client_to_fd[client_id] = fd
+
+            # PK seek — O(log n) point lookup
+            if payload.flags & ipc.FLAG_SEEK:
+                result = self._seek_family(
+                    target_id, payload.seek_pk_lo, payload.seek_pk_hi
+                )
+                resp_schema = (result._schema if result is not None
+                               else self.engine.registry.get_by_id(target_id).schema)
+                ipc.send_batch(
+                    fd, target_id, result, STATUS_OK, "",
+                    client_id, schema=resp_schema,
+                )
+                if result is not None:
+                    result.free()
+                return 0
 
             # Hoist family lookup: used by schema validation, buffering, broadcast,
             # and response — look it up once when a batch is present.

@@ -4,6 +4,7 @@ use std::os::raw::{c_char, c_int, c_void};
 
 use gnitz_core::{CircuitBuilder, ExprBuilder, GnitzClient};
 use gnitz_protocol::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_sql::SqlPlanner;
 
 // ---------------------------------------------------------------------------
 // TypeCode constants — cbindgen emits these as #define macros
@@ -564,7 +565,7 @@ pub extern "C" fn gnitz_create_view_with_circuit(
     let s = check_ptr!(output_schema, 0);
     if circuit.is_null() { set_error("null circuit"); return 0; }
     let graph = unsafe { Box::from_raw(circuit) }.0;
-    match c.0.create_view_with_circuit(cstr(schema_name), cstr(view_name),
+    match c.0.create_view_with_circuit(cstr(schema_name), cstr(view_name), "",
                                         graph, &s.0.columns) {
         Ok(id) => id, Err(e) => { set_error(e); 0 }
     }
@@ -882,6 +883,74 @@ pub extern "C" fn gnitz_circuit_builder_free(cb: *mut GnitzCircuitBuilder) {
 #[no_mangle]
 pub extern "C" fn gnitz_circuit_free(c: *mut GnitzCircuit) {
     if !c.is_null() { unsafe { drop(Box::from_raw(c)); } }
+}
+
+// ---------------------------------------------------------------------------
+// Seek (point lookup)
+// ---------------------------------------------------------------------------
+
+/// Point lookup by primary key. Returns a GnitzBatch with 0 or 1 rows.
+/// Returns NULL on error (check gnitz_last_error).
+/// Caller must free with gnitz_batch_free.
+#[no_mangle]
+pub unsafe extern "C" fn gnitz_seek(
+    conn:      *mut GnitzConn,
+    table_id:  u64,
+    pk_lo:     u64,
+    pk_hi:     u64,
+    out_batch: *mut *mut GnitzBatch,
+) -> c_int {
+    clear_error();
+    let c = check_ptr_mut!(conn, -1);
+    match c.0.seek(table_id, pk_lo, pk_hi) {
+        Ok((server_schema, data)) => {
+            if !out_batch.is_null() {
+                let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_index: 0 });
+                let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
+                *out_batch = Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch }));
+            }
+            0
+        }
+        Err(e) => { set_error(e); -1 }
+    }
+}
+
+/// Execute a SQL statement. Returns the first result's ID (table_id/view_id/row_count).
+/// Returns 0 on DROP/other, -1 on error. Check gnitz_last_error on -1.
+/// out_id may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn gnitz_execute_sql(
+    conn:    *mut GnitzConn,
+    sql:     *const c_char,
+    _sql_len: usize,
+    schema:  *const c_char,
+    out_id:  *mut u64,
+) -> c_int {
+    clear_error();
+    let c = check_ptr_mut!(conn, -1);
+    let sql_str = cstr(sql);
+    let schema_name = cstr(schema);
+    let planner = SqlPlanner::new(&c.0, schema_name);
+    match planner.execute(sql_str) {
+        Ok(results) => {
+            if !out_id.is_null() {
+                if let Some(r) = results.into_iter().next() {
+                    use gnitz_sql::SqlResult;
+                    *out_id = match r {
+                        SqlResult::TableCreated { table_id } => table_id,
+                        SqlResult::ViewCreated  { view_id  } => view_id,
+                        SqlResult::RowsAffected { count    } => count as u64,
+                        SqlResult::Dropped                   => 0,
+                        SqlResult::Rows { .. }               => 0,
+                    };
+                } else {
+                    *out_id = 0;
+                }
+            }
+            0
+        }
+        Err(e) => { set_error(e); -1 }
+    }
 }
 
 // ---------------------------------------------------------------------------

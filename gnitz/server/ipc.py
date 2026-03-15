@@ -61,6 +61,10 @@ FLAG_DDL_SYNC = 8
 FLAG_EXCHANGE = 16
 FLAG_PUSH = 32
 FLAG_HAS_PK = 64
+FLAG_SEEK = 128
+
+OFF_SEEK_PK_LO = 80
+OFF_SEEK_PK_HI = 88
 
 # --- IPC String Encoding ---
 IPC_STRING_STRIDE = 8
@@ -341,11 +345,14 @@ class IPCPayload(object):
         "target_id",
         "client_id",
         "flags",
+        "seek_pk_lo",
+        "seek_pk_hi",
     ]
 
     def __init__(
         self, fd, ptr, total_size, status, error_msg,
-        schema, batch_obj, target_id, client_id, flags, owned_bufs
+        schema, batch_obj, target_id, client_id, flags, owned_bufs,
+        seek_pk_lo=0, seek_pk_hi=0
     ):
         self.fd = fd
         self.ptr = ptr
@@ -358,6 +365,8 @@ class IPCPayload(object):
         self.client_id = client_id
         self.flags = flags
         self.owned_bufs = owned_bufs
+        self.seek_pk_lo = seek_pk_lo
+        self.seek_pk_hi = seek_pk_hi
 
     def close(self):
         """Physical cleanup of the mapped segment and owned buffers."""
@@ -774,6 +783,12 @@ def _recv_and_parse(fd):
         data_pk_index = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_PK_INDEX))[0])
         flags = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_FLAGS))[0])
 
+        seek_pk_lo = 0
+        seek_pk_hi = 0
+        if intmask(flags) & FLAG_SEEK:
+            seek_pk_lo = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_LO))[0])
+            seek_pk_hi = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_HI))[0])
+
         if err_len > r_uint64(MAX_ERR_LEN):
             raise errors.StorageError("Error message length exceeds safety limit")
         if r_uint64(HEADER_SIZE) + err_len > total_size:
@@ -830,6 +845,7 @@ def _recv_and_parse(fd):
         return IPCPayload(
             fd, ptr, total_size, status, error_msg,
             wire_schema, zbatch, target_id, client_id, flags, owned_bufs,
+            seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi,
         )
 
     except Exception as e:

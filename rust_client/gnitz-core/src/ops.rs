@@ -43,3 +43,18 @@ pub fn scan(
         .map_err(ClientError::Protocol)?;
     Ok((schema, msg.data_batch))
 }
+
+pub fn seek(
+    conn:      &Connection,
+    target_id: u64,
+    pk_lo:     u64,
+    pk_hi:     u64,
+) -> Result<(Option<Schema>, Option<ZSetBatch>), ClientError> {
+    let msg = conn.roundtrip_seek(target_id, pk_lo, pk_hi)?;
+    let schema = msg.schema_batch
+        .as_ref()
+        .map(batch_to_schema)
+        .transpose()
+        .map_err(ClientError::Protocol)?;
+    Ok((schema, msg.data_batch))
+}
