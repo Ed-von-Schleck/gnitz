@@ -470,7 +470,7 @@ def test_div_by_zero():
         d = eb.int_div(c1, c2)
         prog = eb.build(d)
         acc = b.get_accessor(0)
-        result = eval_expr(prog, acc)
+        result, _null = eval_expr(prog, acc)
         assert_equal_i64(r_int64(0), result, "INT div by zero")
 
         # col1 % col2 where col2 == 0 => result should be 0
@@ -479,7 +479,7 @@ def test_div_by_zero():
         c2 = eb.load_col_int(2)
         m = eb.int_mod(c1, c2)
         prog = eb.build(m)
-        result = eval_expr(prog, acc)
+        result, _null = eval_expr(prog, acc)
         assert_equal_i64(r_int64(0), result, "INT mod by zero")
 
         # float div by zero
@@ -502,7 +502,7 @@ def test_div_by_zero():
             d = eb.float_div(c1, c2)
             prog = eb.build(d)
             facc = fb.get_accessor(0)
-            result = eval_expr(prog, facc)
+            result, _null = eval_expr(prog, facc)
             assert_equal_i64(r_int64(0), result, "FLOAT div by zero")
         finally:
             fb.free()

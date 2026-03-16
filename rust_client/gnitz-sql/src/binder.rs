@@ -127,6 +127,7 @@ impl<'a> Binder<'a> {
                     _ => Err(GnitzSqlError::Unsupported("IS NOT NULL on non-column expression".to_string())),
                 }
             }
+            Expr::Nested(inner) => self.bind_expr(inner, schema),
             _ => Err(GnitzSqlError::Unsupported(
                 format!("expression type not supported: {:?}", expr)
             )),

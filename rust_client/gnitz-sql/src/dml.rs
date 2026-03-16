@@ -32,9 +32,10 @@ pub fn execute_insert(
         batch.pk_lo.push(pk_val);
         batch.pk_hi.push(0);
         batch.weights.push(1);
-        batch.nulls.push(0);
 
+        let mut null_bits: u64 = 0;
         let mut col_data_idx = 0usize; // index into row (skipping PK col)
+        let mut payload_idx = 0usize;
         for (ci, col_def) in schema.columns.iter().enumerate() {
             if ci == schema.pk_index {
                 // pk column: the actual data is in pk_lo/pk_hi, ColData stays empty
@@ -49,8 +50,14 @@ pub fn execute_insert(
             }
             let val_expr = &row[col_data_idx];
             col_data_idx += 1;
+            // Check if this value is NULL and set the null bitmap
+            if is_null_expr(val_expr) {
+                null_bits |= 1u64 << payload_idx;
+            }
             append_value_to_col(&mut batch.columns[ci], col_def.type_code, val_expr)?;
+            payload_idx += 1;
         }
+        batch.nulls.push(null_bits);
     }
 
     client.push(tid, &schema, &batch)?;
@@ -100,6 +107,10 @@ fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<u64, GnitzSqlError>
         },
         _ => Err(GnitzSqlError::Bind("PK value must be a numeric literal".to_string())),
     }
+}
+
+fn is_null_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Value(vws) if matches!(vws.value, Value::Null))
 }
 
 fn append_value_to_col(

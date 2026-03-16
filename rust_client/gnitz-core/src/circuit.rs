@@ -85,6 +85,19 @@ impl CircuitBuilder {
         nid
     }
 
+    /// Map with expression program (Phase 4: computed projections).
+    /// Discriminator: `PARAM_EXPR_NUM_REGS > 0` on a MAP node = expr-map mode.
+    pub fn map_expr(&mut self, input: NodeId, program: ExprProgram) -> NodeId {
+        let nid = self.alloc_node(OPCODE_MAP);
+        self.connect(input, nid, PORT_IN);
+        self.params.push((nid, PARAM_FUNC_ID, 0));
+        self.params.push((nid, PARAM_EXPR_NUM_REGS, program.num_regs as u64));
+        for (i, &word) in program.code.iter().enumerate() {
+            self.params.push((nid, PARAM_EXPR_BASE + i as u64, word as u64));
+        }
+        nid
+    }
+
     /// Map/projection operator. Emits `PARAM_FUNC_ID=0` and one param per column.
     pub fn map(&mut self, input: NodeId, projection: &[usize]) -> NodeId {
         let nid = self.alloc_node(OPCODE_MAP);

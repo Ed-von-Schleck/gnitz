@@ -83,8 +83,12 @@ class ScanResult:
         pk_idx     = schema.pk_index
         pk_is_u128 = schema.columns[pk_idx].type_code == TypeCode.U128
 
+        has_nulls = hasattr(batch, 'nulls') and len(batch.nulls) == n
+
         for i in range(n):
+            null_word = batch.nulls[i] if has_nulls else 0
             values = []
+            payload_idx = 0
             for ci in range(len(schema.columns)):
                 if ci == pk_idx:
                     if pk_is_u128:
@@ -92,7 +96,11 @@ class ScanResult:
                     else:
                         values.append(batch.pk_lo[i])
                 else:
-                    values.append(batch.columns[ci][i])
+                    if null_word & (1 << payload_idx):
+                        values.append(None)
+                    else:
+                        values.append(batch.columns[ci][i])
+                    payload_idx += 1
             yield Row(fields, tuple(values), batch.weights[i])
 
     def __iter__(self):

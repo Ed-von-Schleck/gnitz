@@ -61,6 +61,11 @@ EXPR_BOOL_NOT = 29
 EXPR_IS_NULL     = 30   # dst = accessor.is_null(arg1) ? 1 : 0
 EXPR_IS_NOT_NULL = 31
 
+# Output opcodes (Phase 4: computed projections)
+EXPR_EMIT          = 32   # builder.append_int(regs[a1]) or append_null(a2)
+EXPR_INT_TO_FLOAT  = 33   # regs[dst] = float2longlong(float(intmask(regs[a1])))
+EXPR_COPY_COL      = 34   # type-dispatched direct copy: input col → output col
+
 
 # ---------------------------------------------------------------------------
 # ExprProgram — immutable bytecode for JIT
@@ -88,10 +93,11 @@ class ExprProgram(object):
 
 @jit.unroll_safe
 def eval_expr(program, accessor):
-    """Evaluate expression program against a row. Returns regs[result_reg]."""
+    """Evaluate expression program against a row. Returns (value, is_null)."""
     program = jit.promote(program)
     code = program.code
     regs = [r_int64(0)] * program.num_regs
+    null = [False] * program.num_regs
 
     i = 0
     while i < program.num_instrs:
@@ -102,83 +108,114 @@ def eval_expr(program, accessor):
         a2  = intmask(code[base + 3])
 
         if op == EXPR_LOAD_COL_INT:
+            null[dst] = accessor.is_null(a1)
             regs[dst] = accessor.get_int_signed(a1)
         elif op == EXPR_LOAD_COL_FLOAT:
+            null[dst] = accessor.is_null(a1)
             regs[dst] = float2longlong(accessor.get_float(a1))
         elif op == EXPR_LOAD_CONST:
+            null[dst] = False
             regs[dst] = r_int64(intmask((a2 << 32) | (a1 & 0xFFFFFFFF)))
 
         elif op == EXPR_INT_ADD:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(intmask(regs[a1] + regs[a2]))
         elif op == EXPR_INT_SUB:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(intmask(regs[a1] - regs[a2]))
         elif op == EXPR_INT_MUL:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(intmask(regs[a1] * regs[a2]))
         elif op == EXPR_INT_DIV:
+            null[dst] = null[a1] or null[a2]
             d = regs[a2]
             regs[dst] = r_int64(intmask(regs[a1] / d)) if d != r_int64(0) else r_int64(0)
         elif op == EXPR_INT_MOD:
+            null[dst] = null[a1] or null[a2]
             d = regs[a2]
             regs[dst] = r_int64(intmask(regs[a1] % d)) if d != r_int64(0) else r_int64(0)
         elif op == EXPR_INT_NEG:
+            null[dst] = null[a1]
             regs[dst] = r_int64(intmask(-regs[a1]))
 
         elif op == EXPR_FLOAT_ADD:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = float2longlong(longlong2float(regs[a1]) + longlong2float(regs[a2]))
         elif op == EXPR_FLOAT_SUB:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = float2longlong(longlong2float(regs[a1]) - longlong2float(regs[a2]))
         elif op == EXPR_FLOAT_MUL:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = float2longlong(longlong2float(regs[a1]) * longlong2float(regs[a2]))
         elif op == EXPR_FLOAT_DIV:
+            null[dst] = null[a1] or null[a2]
             rhs = longlong2float(regs[a2])
             if rhs != 0.0:
                 regs[dst] = float2longlong(longlong2float(regs[a1]) / rhs)
             else:
                 regs[dst] = r_int64(0)
         elif op == EXPR_FLOAT_NEG:
+            null[dst] = null[a1]
             regs[dst] = float2longlong(-longlong2float(regs[a1]))
 
         elif op == EXPR_CMP_EQ:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if regs[a1] == regs[a2] else r_int64(0)
         elif op == EXPR_CMP_NE:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if regs[a1] != regs[a2] else r_int64(0)
         elif op == EXPR_CMP_GT:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if regs[a1] > regs[a2] else r_int64(0)
         elif op == EXPR_CMP_GE:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if regs[a1] >= regs[a2] else r_int64(0)
         elif op == EXPR_CMP_LT:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if regs[a1] < regs[a2] else r_int64(0)
         elif op == EXPR_CMP_LE:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if regs[a1] <= regs[a2] else r_int64(0)
 
         elif op == EXPR_FCMP_EQ:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if longlong2float(regs[a1]) == longlong2float(regs[a2]) else r_int64(0)
         elif op == EXPR_FCMP_NE:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if longlong2float(regs[a1]) != longlong2float(regs[a2]) else r_int64(0)
         elif op == EXPR_FCMP_GT:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if longlong2float(regs[a1]) > longlong2float(regs[a2]) else r_int64(0)
         elif op == EXPR_FCMP_GE:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if longlong2float(regs[a1]) >= longlong2float(regs[a2]) else r_int64(0)
         elif op == EXPR_FCMP_LT:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if longlong2float(regs[a1]) < longlong2float(regs[a2]) else r_int64(0)
         elif op == EXPR_FCMP_LE:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if longlong2float(regs[a1]) <= longlong2float(regs[a2]) else r_int64(0)
 
         elif op == EXPR_BOOL_AND:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if (regs[a1] != r_int64(0) and regs[a2] != r_int64(0)) else r_int64(0)
         elif op == EXPR_BOOL_OR:
+            null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(1) if (regs[a1] != r_int64(0) or regs[a2] != r_int64(0)) else r_int64(0)
         elif op == EXPR_BOOL_NOT:
+            null[dst] = null[a1]
             regs[dst] = r_int64(1) if regs[a1] == r_int64(0) else r_int64(0)
 
         elif op == EXPR_IS_NULL:
+            null[dst] = False
             regs[dst] = r_int64(1) if accessor.is_null(a1) else r_int64(0)
         elif op == EXPR_IS_NOT_NULL:
+            null[dst] = False
             regs[dst] = r_int64(0) if accessor.is_null(a1) else r_int64(1)
 
         i += 1
 
-    return regs[program.result_reg]
+    return regs[program.result_reg], null[program.result_reg]
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +229,178 @@ class ExprPredicate(ScalarFunction):
         self.program = program
 
     def evaluate_predicate(self, row_accessor):
-        return eval_expr(self.program, row_accessor) != r_int64(0)
+        result, is_null = eval_expr(self.program, row_accessor)
+        return (not is_null) and (result != r_int64(0))
+
+
+# ---------------------------------------------------------------------------
+# eval_expr_map — expression VM for computed projections (Phase 4)
+# ---------------------------------------------------------------------------
+
+@jit.unroll_safe
+def eval_expr_map(program, accessor, builder):
+    """Evaluate expression map program: computes columns and writes to builder."""
+    from gnitz.core import types, strings
+    from rpython.rlib.rarithmetic import r_uint64
+
+    program = jit.promote(program)
+    code = program.code
+    regs = [r_int64(0)] * program.num_regs
+    null = [False] * program.num_regs
+
+    i = 0
+    while i < program.num_instrs:
+        base = i * 4
+        op  = intmask(code[base])
+        dst = intmask(code[base + 1])
+        a1  = intmask(code[base + 2])
+        a2  = intmask(code[base + 3])
+
+        if op == EXPR_LOAD_COL_INT:
+            null[dst] = accessor.is_null(a1)
+            regs[dst] = accessor.get_int_signed(a1)
+        elif op == EXPR_LOAD_COL_FLOAT:
+            null[dst] = accessor.is_null(a1)
+            regs[dst] = float2longlong(accessor.get_float(a1))
+        elif op == EXPR_LOAD_CONST:
+            null[dst] = False
+            regs[dst] = r_int64(intmask((a2 << 32) | (a1 & 0xFFFFFFFF)))
+
+        elif op == EXPR_INT_ADD:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(intmask(regs[a1] + regs[a2]))
+        elif op == EXPR_INT_SUB:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(intmask(regs[a1] - regs[a2]))
+        elif op == EXPR_INT_MUL:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(intmask(regs[a1] * regs[a2]))
+        elif op == EXPR_INT_DIV:
+            null[dst] = null[a1] or null[a2]
+            d = regs[a2]
+            regs[dst] = r_int64(intmask(regs[a1] / d)) if d != r_int64(0) else r_int64(0)
+        elif op == EXPR_INT_MOD:
+            null[dst] = null[a1] or null[a2]
+            d = regs[a2]
+            regs[dst] = r_int64(intmask(regs[a1] % d)) if d != r_int64(0) else r_int64(0)
+        elif op == EXPR_INT_NEG:
+            null[dst] = null[a1]
+            regs[dst] = r_int64(intmask(-regs[a1]))
+
+        elif op == EXPR_FLOAT_ADD:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = float2longlong(longlong2float(regs[a1]) + longlong2float(regs[a2]))
+        elif op == EXPR_FLOAT_SUB:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = float2longlong(longlong2float(regs[a1]) - longlong2float(regs[a2]))
+        elif op == EXPR_FLOAT_MUL:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = float2longlong(longlong2float(regs[a1]) * longlong2float(regs[a2]))
+        elif op == EXPR_FLOAT_DIV:
+            null[dst] = null[a1] or null[a2]
+            rhs = longlong2float(regs[a2])
+            if rhs != 0.0:
+                regs[dst] = float2longlong(longlong2float(regs[a1]) / rhs)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_FLOAT_NEG:
+            null[dst] = null[a1]
+            regs[dst] = float2longlong(-longlong2float(regs[a1]))
+
+        elif op == EXPR_CMP_EQ:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] == regs[a2] else r_int64(0)
+        elif op == EXPR_CMP_NE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] != regs[a2] else r_int64(0)
+        elif op == EXPR_CMP_GT:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] > regs[a2] else r_int64(0)
+        elif op == EXPR_CMP_GE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] >= regs[a2] else r_int64(0)
+        elif op == EXPR_CMP_LT:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] < regs[a2] else r_int64(0)
+        elif op == EXPR_CMP_LE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] <= regs[a2] else r_int64(0)
+
+        elif op == EXPR_FCMP_EQ:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) == longlong2float(regs[a2]) else r_int64(0)
+        elif op == EXPR_FCMP_NE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) != longlong2float(regs[a2]) else r_int64(0)
+        elif op == EXPR_FCMP_GT:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) > longlong2float(regs[a2]) else r_int64(0)
+        elif op == EXPR_FCMP_GE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) >= longlong2float(regs[a2]) else r_int64(0)
+        elif op == EXPR_FCMP_LT:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) < longlong2float(regs[a2]) else r_int64(0)
+        elif op == EXPR_FCMP_LE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) <= longlong2float(regs[a2]) else r_int64(0)
+
+        elif op == EXPR_BOOL_AND:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if (regs[a1] != r_int64(0) and regs[a2] != r_int64(0)) else r_int64(0)
+        elif op == EXPR_BOOL_OR:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if (regs[a1] != r_int64(0) or regs[a2] != r_int64(0)) else r_int64(0)
+        elif op == EXPR_BOOL_NOT:
+            null[dst] = null[a1]
+            regs[dst] = r_int64(1) if regs[a1] == r_int64(0) else r_int64(0)
+
+        elif op == EXPR_IS_NULL:
+            null[dst] = False
+            regs[dst] = r_int64(1) if accessor.is_null(a1) else r_int64(0)
+        elif op == EXPR_IS_NOT_NULL:
+            null[dst] = False
+            regs[dst] = r_int64(0) if accessor.is_null(a1) else r_int64(1)
+
+        elif op == EXPR_INT_TO_FLOAT:
+            null[dst] = null[a1]
+            regs[dst] = float2longlong(float(intmask(regs[a1])))
+
+        elif op == EXPR_EMIT:
+            # a1 = src_reg, a2 = payload_col_idx
+            if null[a1]:
+                builder.append_null(a2)
+            else:
+                builder.append_int(regs[a1])
+
+        elif op == EXPR_COPY_COL:
+            # dst = type_code, a1 = src_col_idx, a2 = payload_col_idx
+            tc = dst
+            if accessor.is_null(a1):
+                builder.append_null(a2)
+            elif tc == types.TYPE_STRING.code:
+                res = accessor.get_str_struct(a1)
+                s = strings.resolve_string(res[2], res[3], res[4])
+                builder.append_string(s)
+            elif tc == types.TYPE_F64.code or tc == types.TYPE_F32.code:
+                builder.append_float(accessor.get_float(a1))
+            elif tc == types.TYPE_U128.code:
+                val = accessor.get_u128(a1)
+                builder.append_u128(r_uint64(intmask(val)), r_uint64(intmask(val >> 64)))
+            else:
+                builder.append_int(accessor.get_int_signed(a1))
+
+        i += 1
+
+
+class ExprMapFunction(ScalarFunction):
+    _immutable_fields_ = ['program']
+
+    def __init__(self, program):
+        self.program = program
+
+    def evaluate_map(self, row_accessor, output_row):
+        eval_expr_map(self.program, row_accessor, output_row)
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +602,21 @@ class ExprBuilder(object):
         dst = self._alloc_reg()
         self._emit(EXPR_IS_NOT_NULL, dst, col_idx, 0)
         return dst
+
+    # --- Type conversion ---
+
+    def int_to_float(self, src):
+        dst = self._alloc_reg()
+        self._emit(EXPR_INT_TO_FLOAT, dst, src, 0)
+        return dst
+
+    # --- Output opcodes ---
+
+    def emit_col(self, src_reg, payload_col_idx):
+        self._emit(EXPR_EMIT, 0, src_reg, payload_col_idx)
+
+    def copy_col(self, type_code, src_col_idx, payload_col_idx):
+        self._emit(EXPR_COPY_COL, type_code, src_col_idx, payload_col_idx)
 
     # --- Build ---
 

@@ -31,6 +31,11 @@ const EXPR_BOOL_NOT:       u32 = 29;
 const EXPR_IS_NULL:        u32 = 30;
 const EXPR_IS_NOT_NULL:    u32 = 31;
 
+// Output opcodes (Phase 4: computed projections)
+const EXPR_EMIT:           u32 = 32;
+const EXPR_INT_TO_FLOAT:   u32 = 33;
+const EXPR_COPY_COL:       u32 = 34;
+
 /// A compiled expression program: a flat list of 4-word instructions
 /// (opcode, dst_reg, arg1, arg2) plus metadata for embedding in filter params.
 #[derive(Clone, Debug)]
@@ -259,6 +264,24 @@ impl ExprBuilder {
         let dst = self.alloc_reg();
         self.emit(EXPR_IS_NOT_NULL, dst, col_idx as u32, 0);
         dst
+    }
+
+    // --- Type conversion ---
+
+    pub fn int_to_float(&mut self, src: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_INT_TO_FLOAT, dst, src, 0);
+        dst
+    }
+
+    // --- Output opcodes ---
+
+    pub fn emit_col(&mut self, src_reg: u32, payload_col_idx: u32) {
+        self.emit(EXPR_EMIT, 0, src_reg, payload_col_idx);
+    }
+
+    pub fn copy_col(&mut self, type_code: u32, src_col_idx: u32, payload_col_idx: u32) {
+        self.emit(EXPR_COPY_COL, type_code, src_col_idx, payload_col_idx);
     }
 
     pub fn build(self, result_reg: u32) -> ExprProgram {

@@ -390,7 +390,20 @@ class ProgramCache(object):
 
         elif op == opcodes.OPCODE_MAP:
             in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
-            if opcodes.PARAM_PROJ_BASE in node_params:
+            num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
+
+            if num_regs > 0:
+                # Expr-map mode (Phase 4: computed projections)
+                code = []
+                idx = 0
+                while (opcodes.PARAM_EXPR_BASE + idx) in node_params:
+                    code.append(r_int64(node_params[opcodes.PARAM_EXPR_BASE + idx]))
+                    idx += 1
+                from gnitz.dbsp.expr import ExprProgram, ExprMapFunction
+                prog = ExprProgram(code, num_regs, 0)  # result_reg=0 unused
+                func = ExprMapFunction(prog)
+                node_schema = out_schema   # view's registered schema
+            elif opcodes.PARAM_PROJ_BASE in node_params:
                 src_indices = []
                 src_types = []
                 idx = 0
