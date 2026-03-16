@@ -1,6 +1,7 @@
 use sqlparser::ast::{
     Query, SetExpr, Values, Expr, Value, SelectItem,
     TableFactor, Statement, TableObject, BinaryOperator,
+    FromTable, Assignment, AssignmentTarget,
 };
 use gnitz_protocol::{Schema, ZSetBatch, ColData, TypeCode};
 use gnitz_core::GnitzClient;
@@ -356,7 +357,7 @@ fn apply_residual_filter(
 }
 
 #[derive(Debug)]
-enum ColumnValue { Int(i64), Float(f64) }
+enum ColumnValue { Int(i64), Float(f64), Str(String), Null }
 
 fn eval_pred_row(
     pred:   &BoundExpr,
@@ -402,6 +403,10 @@ fn eval_expr(
         BoundExpr::LitInt(v) => Ok(*v),
         BoundExpr::LitFloat(_) => Err(GnitzSqlError::Unsupported(
             "float literals in residual filter not supported".to_string()
+        )),
+        BoundExpr::LitStr(_) => Err(GnitzSqlError::Unsupported(
+            "string literals in WHERE predicate not supported; \
+             use CREATE INDEX or CREATE VIEW".to_string()
         )),
         BoundExpr::BinOp(l, op, r) => {
             let lv = eval_expr(l, batch, i, schema)?;
@@ -562,4 +567,402 @@ fn apply_limit(batch: ZSetBatch, schema: &Schema, limit: usize) -> ZSetBatch {
         }
     }
     new_batch
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE / DELETE helpers
+// ---------------------------------------------------------------------------
+
+fn eval_set_expr(
+    expr:    &BoundExpr,
+    batch:   &ZSetBatch,
+    row_idx: usize,
+    schema:  &Schema,
+) -> Result<ColumnValue, GnitzSqlError> {
+    match expr {
+        BoundExpr::LitStr(s) => return Ok(ColumnValue::Str(s.clone())),
+        BoundExpr::ColRef(c) => {
+            if let ColData::Strings(v) = &batch.columns[*c] {
+                return Ok(match &v[row_idx] {
+                    Some(s) => ColumnValue::Str(s.clone()),
+                    None    => ColumnValue::Null,
+                });
+            }
+            // fall through: numeric column handled by eval_expr below
+        }
+        _ => {}
+    }
+    eval_expr(expr, batch, row_idx, schema).map(ColumnValue::Int)
+}
+
+fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Result<(), GnitzSqlError> {
+    match cv {
+        ColumnValue::Null => {
+            match col {
+                ColData::Fixed(buf) => buf.extend(std::iter::repeat(0u8).take(tc.wire_stride())),
+                ColData::Strings(v) => v.push(None),
+                ColData::U128s(v)   => v.push(0u128),
+            }
+        }
+        ColumnValue::Int(i) => {
+            match col {
+                ColData::Fixed(buf) => match tc {
+                    TypeCode::U8  => buf.push(i as u8),
+                    TypeCode::I8  => buf.push(i as u8),
+                    TypeCode::U16 => buf.extend_from_slice(&(i as u16).to_le_bytes()),
+                    TypeCode::I16 => buf.extend_from_slice(&(i as i16).to_le_bytes()),
+                    TypeCode::U32 => buf.extend_from_slice(&(i as u32).to_le_bytes()),
+                    TypeCode::I32 => buf.extend_from_slice(&(i as i32).to_le_bytes()),
+                    TypeCode::U64 => buf.extend_from_slice(&(i as u64).to_le_bytes()),
+                    TypeCode::I64 => buf.extend_from_slice(&i.to_le_bytes()),
+                    _ => return Err(GnitzSqlError::Bind(format!("cannot assign Int to {:?}", tc))),
+                },
+                _ => return Err(GnitzSqlError::Bind("Int value for non-numeric column".to_string())),
+            }
+        }
+        ColumnValue::Float(f) => {
+            match col {
+                ColData::Fixed(buf) => match tc {
+                    TypeCode::F32 => buf.extend_from_slice(&(f as f32).to_le_bytes()),
+                    TypeCode::F64 => buf.extend_from_slice(&f.to_le_bytes()),
+                    _ => return Err(GnitzSqlError::Bind(format!("cannot assign Float to {:?}", tc))),
+                },
+                _ => return Err(GnitzSqlError::Bind("Float value for non-float column".to_string())),
+            }
+        }
+        ColumnValue::Str(s) => {
+            match col {
+                ColData::Strings(v) => v.push(Some(s)),
+                _ => return Err(GnitzSqlError::Bind("String value for non-string column".to_string())),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_assignment_col_name(assignment: &Assignment) -> Result<String, GnitzSqlError> {
+    match &assignment.target {
+        AssignmentTarget::ColumnName(obj_name) => obj_name.0.last()
+            .and_then(|p| p.as_ident())
+            .map(|i| i.value.clone())
+            .ok_or_else(|| GnitzSqlError::Bind("empty column name in SET".to_string())),
+        _ => Err(GnitzSqlError::Unsupported(
+            "only simple column assignments supported in UPDATE SET".to_string()
+        )),
+    }
+}
+
+fn write_set_columns(
+    current:     &ZSetBatch,
+    row_idx:     usize,
+    assignments: &[(usize, BoundExpr)],
+    schema:      &Schema,
+    dst:         &mut ZSetBatch,
+) -> Result<(), GnitzSqlError> {
+    dst.pk_lo.push(current.pk_lo[row_idx]);
+    dst.pk_hi.push(current.pk_hi[row_idx]);
+    dst.weights.push(1);
+    dst.nulls.push(current.nulls[row_idx]);
+
+    for (ci, col_def) in schema.columns.iter().enumerate() {
+        if ci == schema.pk_index { continue; }
+        if let Some((_, expr)) = assignments.iter().find(|(idx, _)| *idx == ci) {
+            let cv = eval_set_expr(expr, current, row_idx, schema)?;
+            append_column_value(&mut dst.columns[ci], cv, col_def.type_code)?;
+        } else {
+            let stride = col_def.type_code.wire_stride();
+            match (&current.columns[ci], &mut dst.columns[ci]) {
+                (ColData::Fixed(s), ColData::Fixed(d)) => {
+                    d.extend_from_slice(&s[row_idx * stride..(row_idx + 1) * stride]);
+                }
+                (ColData::Strings(s), ColData::Strings(d)) => { d.push(s[row_idx].clone()); }
+                (ColData::U128s(s), ColData::U128s(d))     => { d.push(s[row_idx]); }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<(u64, u64)>> {
+    if let Expr::InList { expr: col_expr, list, negated, .. } = expr {
+        if *negated { return None; }
+        let col_name = match col_expr.as_ref() {
+            Expr::Identifier(id) => &id.value,
+            _ => return None,
+        };
+        let pk_col = &schema.columns[schema.pk_index];
+        if !pk_col.name.eq_ignore_ascii_case(col_name) { return None; }
+        let mut pks = Vec::with_capacity(list.len());
+        for item in list {
+            if let Expr::Value(vws) = item {
+                if let Value::Number(n, _) = &vws.value {
+                    pks.push((n.parse::<u64>().ok()?, 0u64));
+                    continue;
+                }
+            }
+            return None;
+        }
+        Some(pks)
+    } else {
+        None
+    }
+}
+
+fn try_extract_unique_index_seek(
+    expr:     &Expr,
+    schema:   &Schema,
+    binder:   &mut Binder<'_>,
+    table_id: u64,
+) -> Result<Option<(usize, u64, u64, Option<BoundExpr>)>, GnitzSqlError> {
+    // Case 1: simple `col = literal`
+    if let Some((col_idx, key_lo, key_hi)) = try_col_eq_literal(expr, schema) {
+        if col_idx != schema.pk_index {
+            if let Some((_, is_unique)) = binder.find_index(table_id, col_idx)? {
+                if is_unique {
+                    return Ok(Some((col_idx, key_lo, key_hi, None)));
+                }
+            }
+        }
+    }
+    // Case 2: `(indexed_col = literal) AND rest`
+    if let Expr::BinaryOp { left, op: BinaryOperator::And, right } = expr {
+        for (candidate, other) in [
+            (left.as_ref(), right.as_ref()),
+            (right.as_ref(), left.as_ref()),
+        ] {
+            if let Some((col_idx, key_lo, key_hi)) = try_col_eq_literal(candidate, schema) {
+                if col_idx != schema.pk_index {
+                    if let Some((_, is_unique)) = binder.find_index(table_id, col_idx)? {
+                        if is_unique {
+                            let residual = binder.bind_expr(other, schema)?;
+                            return Ok(Some((col_idx, key_lo, key_hi, Some(residual))));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE
+// ---------------------------------------------------------------------------
+
+pub fn execute_update(
+    client:       &GnitzClient,
+    _schema_name: &str,
+    stmt:         &Statement,
+    binder:       &mut Binder<'_>,
+) -> Result<SqlResult, GnitzSqlError> {
+    let (table, assignments_raw, selection) = match stmt {
+        Statement::Update { table, assignments, selection, .. } => (table, assignments, selection),
+        _ => return Err(GnitzSqlError::Bind("not an UPDATE statement".to_string())),
+    };
+
+    let table_name = match &table.relation {
+        TableFactor::Table { name, .. } => name.0.last()
+            .and_then(|p| p.as_ident()).map(|i| i.value.clone())
+            .ok_or_else(|| GnitzSqlError::Bind("empty table name in UPDATE".to_string()))?,
+        _ => return Err(GnitzSqlError::Unsupported(
+            "UPDATE: only simple table references supported".to_string()
+        )),
+    };
+
+    let (table_id, schema) = binder.resolve(&table_name)?;
+
+    // Bind SET assignments; reject any assignment to the PK column
+    let mut assignments: Vec<(usize, BoundExpr)> = Vec::new();
+    for assignment in assignments_raw {
+        let col_name = extract_assignment_col_name(assignment)?;
+        let col_idx = schema.columns.iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+            .ok_or_else(|| GnitzSqlError::Bind(
+                format!("column '{}' not found in UPDATE SET", col_name)
+            ))?;
+        if col_idx == schema.pk_index {
+            return Err(GnitzSqlError::Unsupported(
+                "cannot UPDATE primary key column".to_string()
+            ));
+        }
+        let bound_val = binder.bind_expr(&assignment.value, &schema)?;
+        assignments.push((col_idx, bound_val));
+    }
+
+    if let Some(where_expr) = selection {
+        // Path 1: PK equality
+        if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
+            let (schema_opt, batch_opt) = client.seek(table_id, pk_lo, pk_hi)?;
+            let current = match batch_opt {
+                None => return Ok(SqlResult::RowsAffected { count: 0 }),
+                Some(b) if b.pk_lo.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
+                Some(b) => b,
+            };
+            let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+            let mut new_batch = ZSetBatch::new(actual_schema);
+            write_set_columns(&current, 0, &assignments, actual_schema, &mut new_batch)?;
+            client.push(table_id, actual_schema, &new_batch)?;
+            return Ok(SqlResult::RowsAffected { count: 1 });
+        }
+
+        // Path 2: Unique index seek
+        if let Some((col_idx, key_lo, key_hi, residual)) =
+            try_extract_unique_index_seek(where_expr, &schema, binder, table_id)?
+        {
+            let (schema_opt, batch_opt) =
+                client.seek_by_index(table_id, col_idx as u64, key_lo, key_hi)?;
+            let current = match batch_opt {
+                None => return Ok(SqlResult::RowsAffected { count: 0 }),
+                Some(b) if b.pk_lo.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
+                Some(b) => b,
+            };
+            let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+            if let Some(pred) = residual {
+                if !eval_pred_row(&pred, &current, 0, actual_schema)? {
+                    return Ok(SqlResult::RowsAffected { count: 0 });
+                }
+            }
+            let mut new_batch = ZSetBatch::new(actual_schema);
+            write_set_columns(&current, 0, &assignments, actual_schema, &mut new_batch)?;
+            client.push(table_id, actual_schema, &new_batch)?;
+            return Ok(SqlResult::RowsAffected { count: 1 });
+        }
+
+        // Path 3: Full scan with predicate
+        let pred = binder.bind_expr(where_expr, &schema)?;
+        let (schema_opt, batch_opt) = client.scan(table_id)?;
+        let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+        let mut updates = ZSetBatch::new(actual_schema);
+        let mut count = 0usize;
+        if let Some(ref scan_batch) = batch_opt {
+            for i in 0..scan_batch.pk_lo.len() {
+                if !eval_pred_row(&pred, scan_batch, i, actual_schema)? { continue; }
+                write_set_columns(scan_batch, i, &assignments, actual_schema, &mut updates)?;
+                count += 1;
+            }
+            if count > 0 { client.push(table_id, actual_schema, &updates)?; }
+        }
+        return Ok(SqlResult::RowsAffected { count });
+    }
+
+    // Path 4: No WHERE — update all rows
+    let (schema_opt, batch_opt) = client.scan(table_id)?;
+    let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
+    let mut updates = ZSetBatch::new(actual_schema);
+    match batch_opt {
+        None => Ok(SqlResult::RowsAffected { count: 0 }),
+        Some(ref scan_batch) => {
+            let n = scan_batch.pk_lo.len();
+            for i in 0..n {
+                write_set_columns(scan_batch, i, &assignments, actual_schema, &mut updates)?;
+            }
+            if n > 0 { client.push(table_id, actual_schema, &updates)?; }
+            Ok(SqlResult::RowsAffected { count: n })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE
+// ---------------------------------------------------------------------------
+
+pub fn execute_delete(
+    client:       &GnitzClient,
+    _schema_name: &str,
+    stmt:         &Statement,
+    binder:       &mut Binder<'_>,
+) -> Result<SqlResult, GnitzSqlError> {
+    let del = match stmt {
+        Statement::Delete(d) => d,
+        _ => return Err(GnitzSqlError::Bind("not a DELETE statement".to_string())),
+    };
+
+    let tables = match &del.from {
+        FromTable::WithFromKeyword(ts) | FromTable::WithoutKeyword(ts) => ts,
+    };
+    if tables.len() != 1 || !tables[0].joins.is_empty() {
+        return Err(GnitzSqlError::Unsupported(
+            "DELETE: exactly one simple FROM table required".to_string()
+        ));
+    }
+    let table_name = match &tables[0].relation {
+        TableFactor::Table { name, .. } => name.0.last()
+            .and_then(|p| p.as_ident()).map(|i| i.value.clone())
+            .ok_or_else(|| GnitzSqlError::Bind("empty table name in DELETE".to_string()))?,
+        _ => return Err(GnitzSqlError::Unsupported(
+            "DELETE: only simple table references supported".to_string()
+        )),
+    };
+
+    let (table_id, schema) = binder.resolve(&table_name)?;
+
+    match &del.selection {
+        None => {
+            // DELETE all rows
+            let (_, batch_opt) = client.scan(table_id)?;
+            let batch = match batch_opt {
+                None => return Ok(SqlResult::RowsAffected { count: 0 }),
+                Some(b) => b,
+            };
+            let n = batch.pk_lo.len();
+            if n == 0 { return Ok(SqlResult::RowsAffected { count: 0 }); }
+            let pks: Vec<(u64, u64)> =
+                (0..n).map(|i| (batch.pk_lo[i], batch.pk_hi[i])).collect();
+            client.delete(table_id, &schema, &pks)?;
+            Ok(SqlResult::RowsAffected { count: n })
+        }
+        Some(where_expr) => {
+            // Path 1: PK equality — seek first for accurate count
+            if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
+                let (_, batch_opt) = client.seek(table_id, pk_lo, pk_hi)?;
+                let exists = batch_opt.map_or(false, |b| !b.pk_lo.is_empty());
+                if !exists { return Ok(SqlResult::RowsAffected { count: 0 }); }
+                client.delete(table_id, &schema, &[(pk_lo, pk_hi)])?;
+                return Ok(SqlResult::RowsAffected { count: 1 });
+            }
+
+            // Path 2: PK IN list
+            if let Some(pks) = try_extract_pk_in(where_expr, &schema) {
+                let n = pks.len();
+                if n > 0 { client.delete(table_id, &schema, &pks)?; }
+                return Ok(SqlResult::RowsAffected { count: n });
+            }
+
+            // Path 3: Unique index seek
+            if let Some((col_idx, key_lo, key_hi, residual)) =
+                try_extract_unique_index_seek(where_expr, &schema, binder, table_id)?
+            {
+                let (_, batch_opt) =
+                    client.seek_by_index(table_id, col_idx as u64, key_lo, key_hi)?;
+                let batch = match batch_opt {
+                    None => return Ok(SqlResult::RowsAffected { count: 0 }),
+                    Some(b) if b.pk_lo.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
+                    Some(b) => b,
+                };
+                if let Some(pred) = residual {
+                    if !eval_pred_row(&pred, &batch, 0, &schema)? {
+                        return Ok(SqlResult::RowsAffected { count: 0 });
+                    }
+                }
+                client.delete(table_id, &schema, &[(batch.pk_lo[0], batch.pk_hi[0])])?;
+                return Ok(SqlResult::RowsAffected { count: 1 });
+            }
+
+            // Path 4: Full scan with predicate
+            let pred = binder.bind_expr(where_expr, &schema)?;
+            let (_, batch_opt) = client.scan(table_id)?;
+            let mut pks: Vec<(u64, u64)> = Vec::new();
+            if let Some(ref scan_batch) = batch_opt {
+                for i in 0..scan_batch.pk_lo.len() {
+                    if eval_pred_row(&pred, scan_batch, i, &schema)? {
+                        pks.push((scan_batch.pk_lo[i], scan_batch.pk_hi[i]));
+                    }
+                }
+            }
+            let n = pks.len();
+            if n > 0 { client.delete(table_id, &schema, &pks)?; }
+            Ok(SqlResult::RowsAffected { count: n })
+        }
+    }
 }

@@ -21,6 +21,11 @@ pub fn compile_bound_expr(
         BoundExpr::LitInt(v) => {
             Ok(eb.load_const(*v))
         }
+        BoundExpr::LitStr(_) => {
+            Err(GnitzSqlError::Unsupported(
+                "string literals not supported in view predicates".to_string()
+            ))
+        }
         BoundExpr::LitFloat(_v) => {
             // ExprBuilder only has load_const (integer). Float literals are stored as i64 bits.
             // Float literals are stored as i64 bit patterns (only integer ExprVM ops exist).

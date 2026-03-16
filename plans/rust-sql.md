@@ -210,7 +210,7 @@ pub enum BoundExpr {
     ColRef(usize),
     LitInt(i64),
     LitFloat(f64),
-    // LitStr(String) — TODO Phase 3: add for string literals in UPDATE SET / WHERE
+    // LitStr(String) — Phase 3: string literals in UPDATE SET (✅ DONE)
     BinOp(Box<Self>, BinOp, Box<Self>),
     UnaryOp(UnaryOp, Box<Self>),
     IsNull(usize),           // column index (only column IS NULL supported)
@@ -825,7 +825,7 @@ Verify: `cd rust_client && cargo build -p gnitz-py && make server`
 
 ---
 
-### Phase 3 — UPDATE + DELETE
+### Phase 3 — UPDATE + DELETE ✅ DONE
 
 **Goals (Phase 3 scope):**
 - `UPDATE t SET val = 42 WHERE pk = 1` — O(log n) via PK seek
@@ -879,7 +879,8 @@ The existing `eval_expr` handles `ColRef` (integer-typed columns only), `LitInt`
 `LitFloat` and string columns — this is acceptable for WHERE predicates in Phase 3
 (float/string WHERE deferred; users get a clear error).
 
-**New — add to `dml.rs` (used for SET clause evaluation):**
+**Extend existing `ColumnValue` in `dml.rs`** (already defined at line 358 with `Int(i64)`
+and `Float(f64)` variants; add `Str(String)` and `Null`):
 ```rust
 #[derive(Debug)]
 enum ColumnValue { Int(i64), Float(f64), Str(String), Null }
@@ -972,10 +973,14 @@ be worth a special path. Always seek/scan before building the new batch.
      - `client.push(table_id, &schema, &new_batch)`.
      - Return `SqlResult::RowsAffected { count: 1 }`.
    - **Unique-indexed column equality** (`WHERE col = literal`, index found AND
-     `index.is_unique`; via `try_extract_index_seek`):
+     `index.is_unique`; via `try_extract_unique_index_seek`):
      - `client.seek_by_index(table_id, col_idx, key_lo, key_hi)` → current row.
      - If `None`: return `SqlResult::RowsAffected { count: 0 }`.
-     - `write_set_columns` → push. Return `count: 1`.
+     - If residual is `Some(pred)`: `eval_pred_row(pred, &batch, 0, &schema)`;
+       if false, return `SqlResult::RowsAffected { count: 0 }`.
+     - `write_set_columns(current, 0, &assignments, &schema)` → `new_batch`.
+     - `client.push(table_id, &schema, &new_batch)`.
+     - Return `SqlResult::RowsAffected { count: 1 }`.
    - **Full scan (all other cases, including non-unique indexed columns)**:
      - `client.scan(table_id)` → all rows.
      - For each row: evaluate WHERE predicate with `eval_pred_row` (skip if false).
@@ -1004,9 +1009,19 @@ be worth a special path. Always seek/scan before building the new batch.
      `(pk_lo, pk_hi)` pairs → `client.delete(table_id, &schema, &all_pks)`.
 4. Return `SqlResult::RowsAffected { count }`.
 
-**Index path: unique vs non-unique.** `binder.find_index` calls `client.find_index_for_column`,
-which returns the index entry from `IdxTab`. The `is_unique` field (already stored in
-`IdxTab`) determines which path to take. Add a helper:
+**Index path: unique vs non-unique.** `is_unique` is stored in `IdxTab` column[5] as a
+`u64`, but `client.find_index_for_column` currently returns `Option<u64>` (index ID only,
+no `is_unique` flag). Before `try_extract_unique_index_seek` can be implemented, extend
+the API:
+
+1. Change `client.find_index_for_column` to return `Option<(u64, bool)>` (index_id,
+   is_unique) by also reading `col_u64(&idx_batch.columns[5], i) != 0`.
+2. Change `binder.index_cache` from `HashMap<(u64, usize), Option<u64>>` to
+   `HashMap<(u64, usize), Option<(u64, bool)>>` and update `Binder::find_index`
+   to return `Option<(u64, bool)>`. `try_extract_index_seek` still just checks
+   `.is_some()` — SELECT behaviour is unchanged.
+
+Then add:
 
 ```rust
 fn try_extract_unique_index_seek(
@@ -1014,17 +1029,27 @@ fn try_extract_unique_index_seek(
     schema:   &Schema,
     binder:   &mut Binder<'_>,
     table_id: u64,
-) -> Result<Option<(usize, u64, u64)>, GnitzSqlError>
+) -> Result<Option<(usize, u64, u64, Option<BoundExpr>)>, GnitzSqlError>
 ```
 
 Same logic as `try_extract_index_seek` but only returns `Some` when the found index
 has `is_unique = true`. Non-unique indexed columns fall through to full scan.
+The return type includes the residual predicate (matching `try_extract_index_seek`) —
+required to handle compound WHERE like `col = literal AND other = val` correctly.
 
 **`planner.rs`:** Add to the `match stmt` block:
 ```rust
-Statement::Update(_) => dml::execute_update(client, schema_name, stmt, &mut binder),
-Statement::Delete(_) => dml::execute_delete(client, schema_name, stmt, &mut binder),
+Statement::Update { .. } => dml::execute_update(client, schema_name, stmt, &mut binder),
+Statement::Delete(_)     => dml::execute_delete(client, schema_name, stmt, &mut binder),
 ```
+Note: `Statement::Update` is a named-field struct variant in sqlparser 0.56 — `(_)` is a
+compile error. Use `{ .. }`. Internally, `execute_update` matches
+`Statement::Update { table, assignments, selection, .. }`.
+`Statement::Delete` is a tuple variant `Delete(Delete)` — `(_)` is correct.
+
+**`client.rs` bool consistency:** `create_table` (line 342) encodes `unique_pk` as
+`if unique_pk { 1 } else { 0 }`. Change to `unique_pk as u64` to match the pattern
+used in `create_index` (`is_unique as u64`). No behavioural change.
 
 #### 3C — Tests
 

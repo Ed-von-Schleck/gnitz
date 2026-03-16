@@ -11,6 +11,7 @@ pub enum BoundExpr {
     ColRef(usize),
     LitInt(i64),
     LitFloat(f64),
+    LitStr(String),
     BinOp(Box<BoundExpr>, BinOp, Box<BoundExpr>),
     UnaryOp(UnaryOp, Box<BoundExpr>),
     IsNull(usize),

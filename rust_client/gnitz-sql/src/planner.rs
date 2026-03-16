@@ -37,6 +37,8 @@ pub fn execute_statement(
         Statement::CreateIndex(ci) => {
             execute_create_index(client, schema_name, ci)
         }
+        Statement::Update { .. } => dml::execute_update(client, schema_name, stmt, &mut binder),
+        Statement::Delete(_)     => dml::execute_delete(client, schema_name, stmt, &mut binder),
         _ => Err(GnitzSqlError::Unsupported(
             format!("unsupported SQL statement: {:?}", stmt)
         )),

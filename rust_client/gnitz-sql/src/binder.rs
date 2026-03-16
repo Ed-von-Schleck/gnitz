@@ -9,7 +9,7 @@ pub struct Binder<'a> {
     client:      &'a GnitzClient,
     schema_name: &'a str,
     cache:       HashMap<String, (u64, Schema)>,
-    index_cache: HashMap<(u64, usize), Option<u64>>,
+    index_cache: HashMap<(u64, usize), Option<(u64, bool)>>,
 }
 
 impl<'a> Binder<'a> {
@@ -29,7 +29,7 @@ impl<'a> Binder<'a> {
 
     pub fn find_index(
         &mut self, table_id: u64, col_idx: usize,
-    ) -> Result<Option<u64>, GnitzSqlError> {
+    ) -> Result<Option<(u64, bool)>, GnitzSqlError> {
         if let Some(&cached) = self.index_cache.get(&(table_id, col_idx)) {
             return Ok(cached);
         }
@@ -60,6 +60,9 @@ impl<'a> Binder<'a> {
                         } else {
                             Err(GnitzSqlError::Bind(format!("invalid number literal: {}", n)))
                         }
+                    }
+                    Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+                        Ok(BoundExpr::LitStr(s.clone()))
                     }
                     _ => Err(GnitzSqlError::Unsupported(
                         format!("value type not supported in expressions: {:?}", vws.value)

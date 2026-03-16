@@ -164,7 +164,7 @@ impl GnitzClient {
 
     pub fn find_index_for_column(
         &self, table_id: u64, col_idx: usize,
-    ) -> Result<Option<u64>, ClientError> {
+    ) -> Result<Option<(u64, bool)>, ClientError> {
         let (_, idx_batch) = ops::scan(&self.conn, IDX_TAB)?;
         let idx_batch = match idx_batch { None => return Ok(None), Some(b) => b };
         for i in 0..idx_batch.len() {
@@ -172,7 +172,8 @@ impl GnitzClient {
             let owner_id       = col_u64(&idx_batch.columns[1], i);
             let source_col_idx = col_u64(&idx_batch.columns[3], i);
             if owner_id == table_id && source_col_idx == col_idx as u64 {
-                return Ok(Some(idx_batch.pk_lo[i]));
+                let is_unique = col_u64(&idx_batch.columns[5], i) != 0;
+                return Ok(Some((idx_batch.pk_lo[i], is_unique)));
             }
         }
         Ok(None)
@@ -339,7 +340,7 @@ impl GnitzClient {
         if let ColData::Strings(v) = &mut tb.columns[3] { v.push(Some(String::new())); }
         if let ColData::Fixed(buf) = &mut tb.columns[4] { push_u64_bytes(buf, pk_col_idx as u64); }
         if let ColData::Fixed(buf) = &mut tb.columns[5] { push_u64_bytes(buf, 0); }
-        if let ColData::Fixed(buf) = &mut tb.columns[6] { push_u64_bytes(buf, if unique_pk { 1 } else { 0 }); }
+        if let ColData::Fixed(buf) = &mut tb.columns[6] { push_u64_bytes(buf, unique_pk as u64); }
         ops::push(&self.conn, TABLE_TAB, &tbl_schema, &tb)?;
 
         Ok(new_tid)
