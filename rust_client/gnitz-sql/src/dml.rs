@@ -204,7 +204,7 @@ pub fn execute_select(
         if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
             client.seek(tid, pk_lo, pk_hi)?
         } else if let Some((col_idx, key_lo, key_hi, residual)) =
-            try_extract_index_seek(where_expr, &schema, binder, tid)?
+            try_extract_index_seek(where_expr, &schema, binder, tid, false)?
         {
             let result = client.seek_by_index(tid, col_idx as u64, key_lo, key_hi)?;
             apply_residual_filter(result, residual.as_ref(), &schema)?
@@ -300,16 +300,22 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u64, u64)>
 }
 
 /// Returns Some((col_idx, key_lo, key_hi, residual)) when WHERE contains an equality on an indexed column.
+/// When `require_unique` is true, only matches indexes where `is_unique` is set.
 fn try_extract_index_seek(
-    expr:     &Expr,
-    schema:   &Schema,
-    binder:   &mut Binder<'_>,
-    table_id: u64,
+    expr:           &Expr,
+    schema:         &Schema,
+    binder:         &mut Binder<'_>,
+    table_id:       u64,
+    require_unique: bool,
 ) -> Result<Option<(usize, u64, u64, Option<BoundExpr>)>, GnitzSqlError> {
     // Case 1: simple `col = literal`
     if let Some((col_idx, key_lo, key_hi)) = try_col_eq_literal(expr, schema) {
-        if col_idx != schema.pk_index && binder.find_index(table_id, col_idx)?.is_some() {
-            return Ok(Some((col_idx, key_lo, key_hi, None)));
+        if col_idx != schema.pk_index {
+            if let Some((_, is_unique)) = binder.find_index(table_id, col_idx)? {
+                if !require_unique || is_unique {
+                    return Ok(Some((col_idx, key_lo, key_hi, None)));
+                }
+            }
         }
     }
     // Case 2: `(indexed_col = literal) AND rest`
@@ -319,11 +325,13 @@ fn try_extract_index_seek(
             (right.as_ref(), left.as_ref()),
         ] {
             if let Some((col_idx, key_lo, key_hi)) = try_col_eq_literal(candidate, schema) {
-                if col_idx != schema.pk_index
-                    && binder.find_index(table_id, col_idx)?.is_some()
-                {
-                    let residual = binder.bind_expr(other, schema)?;
-                    return Ok(Some((col_idx, key_lo, key_hi, Some(residual))));
+                if col_idx != schema.pk_index {
+                    if let Some((_, is_unique)) = binder.find_index(table_id, col_idx)? {
+                        if !require_unique || is_unique {
+                            let residual = binder.bind_expr(other, schema)?;
+                            return Ok(Some((col_idx, key_lo, key_hi, Some(residual))));
+                        }
+                    }
                 }
             }
         }
@@ -374,7 +382,7 @@ fn eval_expr(
     i:      usize,
     schema: &Schema,
 ) -> Result<i64, GnitzSqlError> {
-    use crate::logical_plan::{BinOp, UnaryOp};
+    use crate::logical_plan::BinOp;
     match expr {
         BoundExpr::ColRef(c) => {
             let col_def = &schema.columns[*c];
@@ -465,7 +473,7 @@ fn copy_batch_row(src: &ZSetBatch, i: usize, dst: &mut ZSetBatch, schema: &Schem
             (ColData::U128s(s), ColData::U128s(d)) => {
                 d.push(s[i]);
             }
-            _ => {}
+            _ => unreachable!("mismatched ColData variants for column {}", ci),
         }
     }
 }
@@ -677,7 +685,7 @@ fn write_set_columns(
                 }
                 (ColData::Strings(s), ColData::Strings(d)) => { d.push(s[row_idx].clone()); }
                 (ColData::U128s(s), ColData::U128s(d))     => { d.push(s[row_idx]); }
-                _ => {}
+                _ => unreachable!("mismatched ColData variants for column {}", ci),
             }
         }
     }
@@ -707,43 +715,6 @@ fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<(u64, u64)>> {
     } else {
         None
     }
-}
-
-fn try_extract_unique_index_seek(
-    expr:     &Expr,
-    schema:   &Schema,
-    binder:   &mut Binder<'_>,
-    table_id: u64,
-) -> Result<Option<(usize, u64, u64, Option<BoundExpr>)>, GnitzSqlError> {
-    // Case 1: simple `col = literal`
-    if let Some((col_idx, key_lo, key_hi)) = try_col_eq_literal(expr, schema) {
-        if col_idx != schema.pk_index {
-            if let Some((_, is_unique)) = binder.find_index(table_id, col_idx)? {
-                if is_unique {
-                    return Ok(Some((col_idx, key_lo, key_hi, None)));
-                }
-            }
-        }
-    }
-    // Case 2: `(indexed_col = literal) AND rest`
-    if let Expr::BinaryOp { left, op: BinaryOperator::And, right } = expr {
-        for (candidate, other) in [
-            (left.as_ref(), right.as_ref()),
-            (right.as_ref(), left.as_ref()),
-        ] {
-            if let Some((col_idx, key_lo, key_hi)) = try_col_eq_literal(candidate, schema) {
-                if col_idx != schema.pk_index {
-                    if let Some((_, is_unique)) = binder.find_index(table_id, col_idx)? {
-                        if is_unique {
-                            let residual = binder.bind_expr(other, schema)?;
-                            return Ok(Some((col_idx, key_lo, key_hi, Some(residual))));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -808,7 +779,7 @@ pub fn execute_update(
 
         // Path 2: Unique index seek
         if let Some((col_idx, key_lo, key_hi, residual)) =
-            try_extract_unique_index_seek(where_expr, &schema, binder, table_id)?
+            try_extract_index_seek(where_expr, &schema, binder, table_id, true)?
         {
             let (schema_opt, batch_opt) =
                 client.seek_by_index(table_id, col_idx as u64, key_lo, key_hi)?;
@@ -900,7 +871,8 @@ pub fn execute_delete(
     match &del.selection {
         None => {
             // DELETE all rows
-            let (_, batch_opt) = client.scan(table_id)?;
+            let (schema_opt, batch_opt) = client.scan(table_id)?;
+            let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
             let batch = match batch_opt {
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) => b,
@@ -909,16 +881,17 @@ pub fn execute_delete(
             if n == 0 { return Ok(SqlResult::RowsAffected { count: 0 }); }
             let pks: Vec<(u64, u64)> =
                 (0..n).map(|i| (batch.pk_lo[i], batch.pk_hi[i])).collect();
-            client.delete(table_id, &schema, &pks)?;
+            client.delete(table_id, actual_schema, &pks)?;
             Ok(SqlResult::RowsAffected { count: n })
         }
         Some(where_expr) => {
             // Path 1: PK equality — seek first for accurate count
             if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
-                let (_, batch_opt) = client.seek(table_id, pk_lo, pk_hi)?;
+                let (schema_opt, batch_opt) = client.seek(table_id, pk_lo, pk_hi)?;
+                let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
                 let exists = batch_opt.map_or(false, |b| !b.pk_lo.is_empty());
                 if !exists { return Ok(SqlResult::RowsAffected { count: 0 }); }
-                client.delete(table_id, &schema, &[(pk_lo, pk_hi)])?;
+                client.delete(table_id, actual_schema, &[(pk_lo, pk_hi)])?;
                 return Ok(SqlResult::RowsAffected { count: 1 });
             }
 
@@ -931,37 +904,39 @@ pub fn execute_delete(
 
             // Path 3: Unique index seek
             if let Some((col_idx, key_lo, key_hi, residual)) =
-                try_extract_unique_index_seek(where_expr, &schema, binder, table_id)?
+                try_extract_index_seek(where_expr, &schema, binder, table_id, true)?
             {
-                let (_, batch_opt) =
+                let (schema_opt, batch_opt) =
                     client.seek_by_index(table_id, col_idx as u64, key_lo, key_hi)?;
+                let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
                 let batch = match batch_opt {
                     None => return Ok(SqlResult::RowsAffected { count: 0 }),
                     Some(b) if b.pk_lo.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
                     Some(b) => b,
                 };
                 if let Some(pred) = residual {
-                    if !eval_pred_row(&pred, &batch, 0, &schema)? {
+                    if !eval_pred_row(&pred, &batch, 0, actual_schema)? {
                         return Ok(SqlResult::RowsAffected { count: 0 });
                     }
                 }
-                client.delete(table_id, &schema, &[(batch.pk_lo[0], batch.pk_hi[0])])?;
+                client.delete(table_id, actual_schema, &[(batch.pk_lo[0], batch.pk_hi[0])])?;
                 return Ok(SqlResult::RowsAffected { count: 1 });
             }
 
             // Path 4: Full scan with predicate
             let pred = binder.bind_expr(where_expr, &schema)?;
-            let (_, batch_opt) = client.scan(table_id)?;
+            let (schema_opt, batch_opt) = client.scan(table_id)?;
+            let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
             let mut pks: Vec<(u64, u64)> = Vec::new();
             if let Some(ref scan_batch) = batch_opt {
                 for i in 0..scan_batch.pk_lo.len() {
-                    if eval_pred_row(&pred, scan_batch, i, &schema)? {
+                    if eval_pred_row(&pred, scan_batch, i, actual_schema)? {
                         pks.push((scan_batch.pk_lo[i], scan_batch.pk_hi[i]));
                     }
                 }
             }
             let n = pks.len();
-            if n > 0 { client.delete(table_id, &schema, &pks)?; }
+            if n > 0 { client.delete(table_id, actual_schema, &pks)?; }
             Ok(SqlResult::RowsAffected { count: n })
         }
     }
