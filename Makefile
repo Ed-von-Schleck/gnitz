@@ -46,7 +46,7 @@ ALL_DATA_DIRS := storage_test_data dbsp_test_data zstore_test_data \
 
 LOG_DIR := .test_logs
 
-.PHONY: all test clean server pytest pytest-only $(RUN_TARGETS)
+.PHONY: all test clean server pytest pytest-only e2e $(RUN_TARGETS)
 
 all: test
 
@@ -151,3 +151,6 @@ pytest: server
 pytest-only:
 	cd py_client && uv run pytest tests/ -v
 	cd py_client && GNITZ_WORKERS=4 uv run pytest tests/ -v
+
+e2e: gnitz-server-c
+	cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -v --tb=short

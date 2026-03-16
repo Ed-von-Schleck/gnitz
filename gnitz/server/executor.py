@@ -10,7 +10,7 @@ from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch, BatchWriter
 from gnitz.core.types import TYPE_U128
 from gnitz.catalog import system_tables as sys
-from gnitz.catalog.registry import ingest_to_family, validate_fk_distributed
+from gnitz.catalog.registry import ingest_to_family, validate_fk_inline, validate_fk_distributed
 from gnitz.dbsp import ops
 from gnitz import log
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
@@ -352,6 +352,7 @@ class ServerExecutor(object):
 
         if in_batch is not None and in_batch.length() > 0:
             family = self.engine.registry.get_by_id(target_id)
+            validate_fk_inline(family, in_batch)
             effective = ingest_to_family(family, in_batch)
             family.store.flush()
             self._evaluate_dag(target_id, effective)

@@ -111,6 +111,8 @@ def entry_point(argv):
 
     # Multi-worker mode: create socketpairs, fork workers
     os.write(1, "Starting " + str(num_workers) + " workers\n")
+    os.write(1, "Worker logs: " + data_dir + "/worker_N.log (N=0.."
+             + str(num_workers - 1) + ")\n")
 
     parent_fds = [0] * num_workers
     child_fds = [0] * num_workers

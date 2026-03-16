@@ -12,7 +12,7 @@ from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch
 from gnitz.catalog import system_tables as sys
-from gnitz.catalog.registry import ingest_to_family, _enforce_unique_pk
+from gnitz.catalog.registry import ingest_to_family
 from gnitz.core.types import TYPE_U128
 from gnitz.server.executor import evaluate_dag
 
@@ -155,26 +155,13 @@ class WorkerProcess(object):
     def _handle_push(self, target_id, batch):
         """Ingest batch into the local partition store, flush, and evaluate DAG."""
         family = self.engine.registry.get_by_id(target_id)
-        effective = batch
-        if family.unique_pk:
-            effective = _enforce_unique_pk(family, batch)
-        family.store.ingest_batch(effective)
-        # Secondary index maintenance (mirrors ingest_to_family Stage 3)
-        n_indices = len(family.index_circuits)
-        if n_indices > 0:
-            for idx_num in range(n_indices):
-                circuit = family.index_circuits[idx_num]
-                circuit.table.ingest_projection(
-                    effective,
-                    circuit.source_col_idx,
-                    circuit.source_col_type,
-                    circuit._index_payload_accessor,
-                    circuit.is_unique,
-                )
+        # FK validation was done by the master before fan_out_push.
+        # ingest_to_family is partition-local ZSet algebra — correct for workers.
+        effective = ingest_to_family(family, batch)
         family.store.flush()
         evaluate_dag(self.engine, target_id, effective,
                      exchange_handler=self.exchange_handler)
-        if family.unique_pk:
+        if effective is not batch:
             effective.free()
         log.debug(
             "W" + str(self.worker_id)

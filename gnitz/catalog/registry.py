@@ -204,6 +204,56 @@ def validate_fk_distributed(family, batch, dispatcher):
             )
 
 
+def validate_fk_inline(family, batch):
+    """
+    Single-process FK validation. Checks foreign key values against the local
+    PartitionedTable store, which owns all 256 partitions.
+
+    ONLY call this in single-process (no dispatcher) mode, where the local store
+    is complete. In multi-worker mode, FK validation is done at the master via
+    validate_fk_distributed() before fan_out_push — workers receive pre-validated
+    batches and must NOT call this function.
+
+    Called by: executor.handle_push (single-process path) before ingest_to_family.
+    Counterpart: validate_fk_distributed (master, multi-worker path).
+    """
+    n_constraints = len(family.fk_constraints)
+    if n_constraints == 0:
+        return
+
+    n_records = batch.length()
+    acc = batch.get_accessor(0)
+
+    for i in range(n_records):
+        if batch.get_weight(i) <= r_int64(0):
+            continue
+
+        batch.bind_accessor(i, acc)
+
+        for c_idx in range(n_constraints):
+            constraint = family.fk_constraints[c_idx]
+            col_idx = constraint.fk_col_idx
+            if acc.is_null(col_idx):
+                continue
+
+            fk_key = promote_to_index_key(
+                acc, col_idx, family.schema.columns[col_idx].field_type
+            )
+
+            if not constraint.target_family.store.has_pk(fk_key):
+                raise LayoutError(
+                    "Foreign Key violation in '%s.%s': value for column '%s' "
+                    "not found in target '%s.%s'"
+                    % (
+                        family.schema_name,
+                        family.table_name,
+                        family.schema.columns[col_idx].name,
+                        constraint.target_family.schema_name,
+                        constraint.target_family.table_name,
+                    )
+                )
+
+
 class FKConstraint(object):
     """
     An active Foreign Key constraint tracking a source column and its target table.
@@ -218,16 +268,29 @@ class FKConstraint(object):
 
 def ingest_to_family(family, batch):
     """
-    The external ingestion pipeline for user-table data.
-    Enforces unique-PK and FK constraints, writes to storage, and updates
-    secondary indices.
+    The ZSet ingestion pipeline for a table family.
 
-    Returns the effective batch (may be a new transformed batch when
-    unique_pk=True, or the same object otherwise). Callers may use the
-    returned batch for downstream DAG evaluation.
+    Stages:
+      0 — Unique-PK dedup (if family.unique_pk): transforms batch into effective
+          batch with auto-retract semantics. Returns new batch when unique_pk=True;
+          returns same batch object when unique_pk=False.
+      2 — Storage ingest (WAL + memtable). Does NOT flush.
+      3 — Secondary index projection for all family.index_circuits.
+      4 — Post-ingestion hooks (e.g. DDL effect hooks on system tables).
 
-    For internal writes (VM operator state, catalog bootstrap, index backfill),
-    call family.store.ingest_batch(batch) directly to bypass enforcement.
+    FK constraints are NOT enforced here. FK validation is a partition-global
+    concern and belongs at the request layer:
+      - Single-process:  call validate_fk_inline(family, batch) BEFORE this.
+      - Multi-worker:    master calls validate_fk_distributed() before fan_out_push.
+                         Workers receive pre-validated batches and call this directly.
+
+    Flush is NOT called. Callers are responsible for calling family.store.flush()
+    after this function when durability is required.
+
+    Return value: the effective batch (same object as batch when unique_pk=False;
+    a newly allocated batch when unique_pk=True). When unique_pk=True, the caller
+    must free the returned batch if it is not the same object as the input.
+    Use `if effective is not batch: effective.free()` after use.
     """
     n_records = batch.length()
     if n_records == 0:
@@ -239,42 +302,6 @@ def ingest_to_family(family, batch):
         n_records = batch.length()
         if n_records == 0:
             return batch
-
-    # --- Stage 1: Foreign Key Enforcement ---
-    n_constraints = len(family.fk_constraints)
-    if n_constraints > 0:
-        acc = batch.get_accessor(0)
-
-        for i in range(n_records):
-            # We only validate insertions (positive weights)
-            if batch.get_weight(i) <= 0:
-                continue
-
-            batch.bind_accessor(i, acc)
-
-            for c_idx in range(n_constraints):
-                constraint = family.fk_constraints[c_idx]
-                col_idx = constraint.fk_col_idx
-                if acc.is_null(col_idx):
-                    continue
-
-                # Extract value and promote to the target PK's index key type
-                fk_key = promote_to_index_key(
-                    acc, col_idx, family.schema.columns[col_idx].field_type
-                )
-
-                if not constraint.target_family.store.has_pk(fk_key):
-                    raise LayoutError(
-                        "Foreign Key violation in '%s.%s': value for column '%s' "
-                        "not found in target '%s.%s'"
-                        % (
-                            family.schema_name,
-                            family.table_name,
-                            family.schema.columns[col_idx].name,
-                            constraint.target_family.schema_name,
-                            constraint.target_family.table_name,
-                        )
-                    )
 
     # --- Stage 2: Primary Ingestion (Durable WAL + MemTable) ---
     family.store.ingest_batch(batch)

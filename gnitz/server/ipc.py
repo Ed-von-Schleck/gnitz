@@ -42,7 +42,7 @@ OFF_SCHEMA_COUNT = 32
 OFF_SCHEMA_BLOB_SZ = 40
 OFF_DATA_COUNT = 48
 OFF_DATA_BLOB_SZ = 56
-OFF_DATA_PK_INDEX = 64
+OFF_P4 = 64
 OFF_FLAGS = 72
 
 # --- Status Codes ---
@@ -69,7 +69,7 @@ FLAG_SCAN              = 0     # explicit name for "no flags" (no wire change)
 
 OFF_SEEK_PK_LO = 80
 OFF_SEEK_PK_HI = 88
-OFF_SEEK_IDX_COL    = OFF_DATA_PK_INDEX   # p4 alias when FLAG_SEEK_BY_INDEX
+OFF_SEEK_IDX_COL    = OFF_P4              # p4 alias when FLAG_SEEK_BY_INDEX
 OFF_SEEK_IDX_KEY_LO = OFF_SEEK_PK_LO      # p5 alias
 OFF_SEEK_IDX_KEY_HI = OFF_SEEK_PK_HI      # p6 alias
 
@@ -565,7 +565,7 @@ def serialize_to_memfd(
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_COUNT))[0] = r_uint64(data_count)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_BLOB_SZ))[0] = d_total_blob_sz
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_FLAGS))[0] = r_uint64(flags)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_PK_INDEX))[0] = r_uint64(seek_col_idx)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_P4))[0] = r_uint64(seek_col_idx)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_LO))[0] = r_uint64(seek_pk_lo)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_HI))[0] = r_uint64(seek_pk_hi)
 
