@@ -803,6 +803,9 @@ def _recv_and_parse(fd):
         elif intmask(flags) & FLAG_SEEK:
             seek_pk_lo = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_LO))[0])
             seek_pk_hi = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_HI))[0])
+        elif intmask(flags) & FLAG_EXCHANGE:
+            # source_id piggybacked on seek_pk_lo for join exchange
+            seek_pk_lo = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_LO))[0])
 
         if err_len > r_uint64(MAX_ERR_LEN):
             raise errors.StorageError("Error message length exceeds safety limit")

@@ -17,6 +17,10 @@ When adding a new server-side constraint, validation rule, or invariant:
 - [ ] Is there a multi-worker E2E test in `rust_client/gnitz-py/tests/test_workers.py`
       covering it?
 - [ ] Is there a unit test in `master_worker_test.py` covering the IPC path?
+- [ ] Does the feature use `hash_row_by_columns` for exchange routing across
+      tables where the same logical value may have different column types
+      (e.g., PK column = U64 vs regular column = I64)? The hash must produce
+      identical partitions regardless of type for co-partitioning correctness.
 
 ## Running E2E tests
 

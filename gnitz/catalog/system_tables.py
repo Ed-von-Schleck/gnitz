@@ -431,28 +431,34 @@ class CircuitParamsTab(BaseTab):
 
     ID, SUBDIR, NAME = 14, "_circuit_params", "_circuit_params"
     COL_VALUE = 1
+    COL_STR_VALUE = 2
 
     @staticmethod
     def schema():
-        cols = newlist_hint(2)
+        cols = newlist_hint(3)
         cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="param_pk"))
         cols.append(ColumnDefinition(TYPE_U64, is_nullable=False, name="value"))
+        cols.append(ColumnDefinition(TYPE_STRING, is_nullable=True, name="str_value"))
         return TableSchema(cols, pk_index=0)
 
     @staticmethod
-    def _emit(batch, schema, weight, view_id, node_id, slot, value):
+    def _emit(batch, schema, weight, view_id, node_id, slot, value, str_value=None):
         rb = RowBuilder(schema, batch)
         rb.begin(pack_param_pk(view_id, node_id, slot), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(value)))
+        if str_value is None:
+            rb.put_null()
+        else:
+            rb.put_string(str_value)
         rb.commit()
 
     @staticmethod
-    def append(batch, schema, view_id, node_id, slot, value):
-        CircuitParamsTab._emit(batch, schema, r_int64(1), view_id, node_id, slot, value)
+    def append(batch, schema, view_id, node_id, slot, value, str_value=None):
+        CircuitParamsTab._emit(batch, schema, r_int64(1), view_id, node_id, slot, value, str_value)
 
     @staticmethod
-    def retract(batch, schema, view_id, node_id, slot, value):
-        CircuitParamsTab._emit(batch, schema, r_int64(-1), view_id, node_id, slot, value)
+    def retract(batch, schema, view_id, node_id, slot, value, str_value=None):
+        CircuitParamsTab._emit(batch, schema, r_int64(-1), view_id, node_id, slot, value, str_value)
 
 
 class CircuitGroupColsTab(BaseTab):

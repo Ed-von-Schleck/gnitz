@@ -5,6 +5,47 @@ use gnitz_core::GnitzClient;
 use crate::error::GnitzSqlError;
 use crate::logical_plan::{BoundExpr, BinOp, UnaryOp};
 
+/// Resolves a column in a multi-table context (for joins).
+/// `tables` maps alias/name → (table_id, Schema, column_offset).
+pub fn resolve_qualified_column(
+    table_alias: &str,
+    col_name: &str,
+    tables: &HashMap<String, (u64, Schema, usize)>,
+) -> Result<usize, GnitzSqlError> {
+    let (_, schema, offset) = tables.get(table_alias)
+        .ok_or_else(|| GnitzSqlError::Bind(
+            format!("table alias '{}' not found", table_alias)
+        ))?;
+    let idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
+        .ok_or_else(|| GnitzSqlError::Bind(
+            format!("column '{}' not found in table '{}'", col_name, table_alias)
+        ))?;
+    Ok(offset + idx)
+}
+
+/// Resolves an unqualified column in a multi-table context.
+/// Tries each table in order; errors on ambiguity.
+pub fn resolve_unqualified_column(
+    col_name: &str,
+    tables: &HashMap<String, (u64, Schema, usize)>,
+) -> Result<usize, GnitzSqlError> {
+    let mut found: Option<usize> = None;
+    for (alias, (_, schema, offset)) in tables {
+        if let Some(idx) = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name)) {
+            if found.is_some() {
+                return Err(GnitzSqlError::Bind(
+                    format!("ambiguous column '{}' — qualify with table alias", col_name)
+                ));
+            }
+            found = Some(offset + idx);
+        }
+        let _ = alias;
+    }
+    found.ok_or_else(|| GnitzSqlError::Bind(
+        format!("column '{}' not found in any table", col_name)
+    ))
+}
+
 pub struct Binder<'a> {
     client:      &'a GnitzClient,
     schema_name: &'a str,
@@ -125,6 +166,22 @@ impl<'a> Binder<'a> {
                         Ok(BoundExpr::IsNotNull(idx))
                     }
                     _ => Err(GnitzSqlError::Unsupported("IS NOT NULL on non-column expression".to_string())),
+                }
+            }
+            Expr::CompoundIdentifier(parts) => {
+                // Qualified column ref like t1.col — for single-table context,
+                // just use the column name (ignore table qualifier)
+                if parts.len() == 2 {
+                    let col_name = &parts[1].value;
+                    let idx = schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
+                        .ok_or_else(|| GnitzSqlError::Bind(
+                            format!("column '{}' not found", col_name)
+                        ))?;
+                    Ok(BoundExpr::ColRef(idx))
+                } else {
+                    Err(GnitzSqlError::Unsupported(
+                        format!("compound identifier with {} parts not supported", parts.len())
+                    ))
                 }
             }
             Expr::Nested(inner) => self.bind_expr(inner, schema),

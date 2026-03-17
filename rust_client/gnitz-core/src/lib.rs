@@ -32,6 +32,8 @@ pub use types::{
     PARAM_FUNC_ID, PARAM_AGG_FUNC_ID, PARAM_AGG_COL_IDX,
     PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_EXPR_NUM_REGS,
     PARAM_EXPR_RESULT_REG, PARAM_SHARD_COL_BASE, PARAM_GATHER_WORKER,
+    PARAM_REINDEX_COL, PARAM_JOIN_SOURCE_TABLE, PARAM_CONST_STR_BASE,
+    PARAM_TABLE_ID,
     schema_tab_schema, table_tab_schema, col_tab_schema, view_tab_schema,
     dep_tab_schema, circuit_nodes_schema, circuit_edges_schema,
     circuit_sources_schema, circuit_params_schema, circuit_group_cols_schema,

@@ -447,7 +447,10 @@ class Engine(object):
                     node_id = intmask(lo64 >> 8)
                     slot = intmask(lo64 & r_uint64(0xFF))
                     value = intmask(acc.get_int(sys.CircuitParamsTab.COL_VALUE))
-                    sys.CircuitParamsTab.retract(batch, s, vid, node_id, slot, value)
+                    str_value = None
+                    if not acc.is_null(sys.CircuitParamsTab.COL_STR_VALUE):
+                        str_value = sys.read_string(acc, sys.CircuitParamsTab.COL_STR_VALUE)
+                    sys.CircuitParamsTab.retract(batch, s, vid, node_id, slot, value, str_value)
                 cursor.advance()
         finally:
             cursor.close()

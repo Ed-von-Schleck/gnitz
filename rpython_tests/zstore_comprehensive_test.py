@@ -16,7 +16,7 @@ from gnitz.core.batch import RowBuilder
 from gnitz.core.errors import LayoutError
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog import engine, identifiers
-from gnitz.catalog.registry import ingest_to_family
+from gnitz.catalog.registry import ingest_to_family, validate_fk_inline
 from gnitz.catalog.metadata import ensure_dir
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
 
@@ -160,6 +160,7 @@ def test_programmable_zset_lifecycle():
 
     fk_raised = False
     try:
+        validate_fk_inline(orders_family, bad_batch)
         ingest_to_family(orders_family, bad_batch)
     except LayoutError:
         fk_raised = True

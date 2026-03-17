@@ -56,6 +56,9 @@ PARAM_AGG_COL_IDX    = 6   # REDUCE: which column to aggregate
 PARAM_EXPR_NUM_REGS  = 7   # FILTER: expression register count
 PARAM_EXPR_RESULT_REG = 8  # FILTER: which register holds the result
 PARAM_GATHER_WORKER   = 9   # GATHER: destination worker id
+PARAM_REINDEX_COL        = 10   # MAP: use column value as new PK
+PARAM_JOIN_SOURCE_TABLE  = 11   # SCAN_TRACE: source table for multi-input circuits
 PARAM_PROJ_BASE      = 32  # MAP: slots 32..63 = source col index per output col
 PARAM_EXPR_BASE      = 64  # FILTER: slots 64..255 = expression bytecode words
 PARAM_SHARD_COL_BASE = 128  # SHARD: slots 128..159 = shard column indices
+PARAM_CONST_STR_BASE = 160  # Slots 160-191: string constants for expressions

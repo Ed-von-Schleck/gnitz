@@ -12,7 +12,7 @@ from gnitz.core.batch import RowBuilder
 from gnitz.core.errors import LayoutError, GnitzError
 from gnitz.catalog import identifiers
 from gnitz.catalog.engine import open_engine
-from gnitz.catalog.registry import ingest_to_family
+from gnitz.catalog.registry import ingest_to_family, validate_fk_inline
 from gnitz.catalog.system_tables import (
     FIRST_USER_TABLE_ID,
     OWNER_KIND_TABLE,
@@ -303,6 +303,7 @@ def test_fk_referential_integrity(base_dir):
         rb_c.begin(r_uint128(r_uint64(1)), r_int64(1))
         rb_c.put_int(r_int64(10))  # Valid pid
         rb_c.commit()
+        validate_fk_inline(child, cb)
         ingest_to_family(child, cb)
         cb.free()
 
@@ -315,6 +316,7 @@ def test_fk_referential_integrity(base_dir):
 
         raised = False
         try:
+            validate_fk_inline(child, cb2)
             ingest_to_family(child, cb2)
         except LayoutError:
             raised = True
@@ -352,6 +354,7 @@ def test_fk_referential_integrity(base_dir):
         rb_uc.begin(r_uint128(r_uint64(1)), r_int64(1))
         rb_uc.put_u128(r_uint64(0xBBBB), r_uint64(0xAAAA))
         rb_uc.commit()
+        validate_fk_inline(u_child, ucb)
         ingest_to_family(u_child, ucb)
         ucb.free()
 
@@ -395,6 +398,7 @@ def test_fk_nullability_and_retractions(base_dir):
         rb.begin(r_uint128(r_uint64(1)), r_int64(1))
         rb.put_null()
         rb.commit()
+        validate_fk_inline(child, cb)
         ingest_to_family(child, cb)
         cb.free()
 
@@ -405,6 +409,7 @@ def test_fk_nullability_and_retractions(base_dir):
         rb2.begin(r_uint128(r_uint64(2)), r_int64(-1))
         rb2.put_int(r_int64(999))  # Non-existent
         rb2.commit()
+        validate_fk_inline(child, cb2)
         ingest_to_family(child, cb2)  # Should succeed
         cb2.free()
 

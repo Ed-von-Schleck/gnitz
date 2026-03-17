@@ -544,17 +544,30 @@ The index key is promoted from the SQL literal using the same rules as
 
 ## Gap Analysis for CREATE VIEW (future phases)
 
-### 1. General equi-join operator — Phase 5
+### 1. General equi-join — Phase 5 (pre-indexing approach, no new DBSP operators)
 
-Current joins match on U128 PK. SQL `JOIN ON t1.a = t2.b` requires matching on
-arbitrary columns. New operators (NOT wrappers around existing PK join):
-`op_equijoin_delta_trace` + `op_equijoin_delta_delta`. Parameters: `left_key_cols[],
-right_key_cols[]`. Hash key columns inline using `_extract_group_key`-style Murmur3.
-The trace cursor can't be reused (sorted by PK, not join key) — needs a temporary
-sorted structure or hash table. `merge_schemas_for_join` can't be reused either
-(requires matching PK types).
+SQL `JOIN ON t1.a = t2.b` requires matching on arbitrary columns. The original plan
+proposed new `op_equijoin_delta_trace` + `op_equijoin_delta_delta` operators with
+inline hash table construction. **This was superseded** by a pre-indexing approach
+after discovering that gnitz Z-sets do NOT enforce unique PKs at the storage level
+(see §5B for full analysis).
 
-Rust: new `CircuitBuilder::equijoin(delta, trace_tid, left_cols, right_cols)`.
+**Key insight:** gnitz consolidation groups by full row identity (PK + all payload
+columns), not PK alone. `compare_indices` → `core_comparator.compare_rows` compares
+every non-PK column when PKs match. Two rows with the same PK but different payloads
+survive as independent Z-set elements. Cursors iterate all same-PK entries:
+`op_join_delta_trace` already has `while cursor.key() == key: advance()`.
+
+**Approach:** A MAP variant with `PARAM_REINDEX_COL` changes the output PK to a
+specified column's value (promoted to U128). This reindexes a relation by join key.
+The existing PK-based join operators then work unchanged — the trace is sorted by
+join key (the new PK), cursor seeks are O(log N), multiple rows with the same join
+key but different payloads coexist as separate Z-set elements.
+
+No new DBSP opcodes. No new RPython join operators. Just one MAP parameter.
+
+Rust: `CircuitBuilder::map_reindex(input, reindex_col_idx, type_code)` — emits MAP
+node with `PARAM_REINDEX_COL` set.
 
 ### 2. Computed projections (`SELECT a + b AS c`) — Phase 4
 
@@ -593,26 +606,37 @@ directly. Also fixes the pre-existing filter bug where `NULL = 0` incorrectly
 matches (`eval_expr` returns `(result, is_null)`; `ExprPredicate` returns False when
 is_null).
 
-### 3. String expressions in ExprVM — Phase 5
+### 3. String predicates in ExprVM — Phase 5 (fused opcodes, no string registers)
 
 ExprVM (31 base opcodes + EXPR_EMIT (32), EXPR_INT_TO_FLOAT (33), EXPR_COPY_COL (34)
 from Phase 4) has no string expression opcodes. String **predicates** in views
-(`WHERE name = 'Alice'`, `ON t1.name = t2.name`) require new opcodes (40-47) for
-loading and comparing strings. String **pass-through** in computed projections
-(`SELECT name, a + b AS total FROM t`) is already handled by Phase 4's
-`EXPR_COPY_COL` — no Phase 5 dependency for that case.
+(`WHERE name = 'Alice'`) require new opcodes (40-45) for comparing strings. String
+**pass-through** in computed projections (`SELECT name, a + b AS total FROM t`) is
+already handled by Phase 4's `EXPR_COPY_COL` — no Phase 5 dependency for that case.
 
-Phase 5 adds string *computation* opcodes: LOAD_COL_STR, LOAD_CONST_STR, STR_EQ..GE,
-and EMIT_STR. These require a separate string register file (`str_regs`) alongside the
-existing `r_int64` registers, and a three-way type tag in `compile_bound_expr` (from
-`(u32, bool)` to `(u32, TypeTag)` where TypeTag = Int | Float | String). The
-`const_strings` pool encoding for `EXPR_LOAD_CONST_STR` needs design work — strings
-can't fit in u64 param values.
+**Original plan (superseded):** LOAD_COL_STR, LOAD_CONST_STR, STR_EQ..GE, EMIT_STR
+with a separate `str_regs = [""] * N` string register file and a three-way TypeTag
+in `compile_bound_expr`. This was replaced by fused comparison opcodes after
+discovering that gnitz already has zero-allocation string comparison infrastructure
+(`compare_structures` and `string_equals` in `gnitz/core/strings.py`) that operates
+directly on raw column buffer memory via `accessor.get_str_struct()`, without
+materializing Python string objects. See §5A for full analysis.
+
+**Revised design:** 6 fused opcodes (40-45). Each reads column values and/or string
+constants inline, compares via `compare_structures`/`string_equals`, writes 0/1 to
+an integer register. No string register file. No LOAD/EMIT opcodes. The register
+file stays homogeneous `[r_int64]`. `compile_bound_expr` stays `(u32, bool)`.
+
+**const_strings pool:** Stored in `CircuitParamsTab` via a new nullable STRING column
+`str_value`. String constants are just param rows with `str_value` populated. No new
+system table needed.
 
 UPDATE/DELETE WHERE filtering is done **client-side** in the Rust evaluator and does not
-use ExprVM. String opcodes are needed only for server-side view predicates. They are
-correctly placed in Phase 5 (alongside equijoins, where `ON t1.name = t2.name` is the
-primary use case).
+use ExprVM. String opcodes are needed only for server-side view predicates.
+
+String join predicates (`ON t1.name = t2.name`) are handled at the circuit level by
+pre-indexing both inputs with `hash(name)` as the new PK (see §1 above). No ExprVM
+string comparison needed for join keys.
 
 ### 4. LEFT OUTER JOIN — Phase 6
 
@@ -1426,142 +1450,681 @@ TestNullPropagation
 
 ---
 
-### Phase 5 — String support + equijoins in CREATE VIEW
+### Phase 5 — String predicates + equijoins in CREATE VIEW
 
 **Goals:**
 - `CREATE VIEW v AS SELECT * FROM t WHERE name = 'Alice'`
 - `CREATE VIEW v AS SELECT t1.id, t2.name FROM t1 JOIN t2 ON t1.cid = t2.id`
 - `CREATE VIEW v AS SELECT t1.id FROM t1 JOIN t2 ON t1.name = t2.name`
 
-#### 5A — ExprVM string opcodes (RPython)
+#### 5A — Fused string comparison opcodes (RPython) — no string register file
 
-Add 9 new opcodes (starting from 40; opcodes 32-33 = EXPR_EMIT + EXPR_INT_TO_FLOAT
-from Phase 4; 34-39 reserved):
+**Design revision:** The original plan proposed `str_regs = [""] * N` alongside the
+existing `regs = [r_int64(0)] * N`, with LOAD_COL_STR / LOAD_CONST_STR / STR_EQ..GE /
+EMIT_STR opcodes (9 total). This was replaced by fused comparison opcodes after
+analysis of RPython JIT behavior and discovery of gnitz's existing zero-allocation
+string comparison infrastructure.
+
+##### Why string registers are harmful
+
+The ExprVM's performance depends on RPython's JIT virtualizing local arrays into CPU
+registers. For `regs = [r_int64(0)] * N`:
+- Each element is an unboxed 64-bit integer → lives in a CPU register
+- The array never escapes → JIT removes the allocation entirely (`ArrayPtrInfo` virtual)
+- Zero GC interaction
+
+A `str_regs = [""] * N` array would be virtualized at the container level (same
+`ArrayPtrInfo` handler for `_I` and `_R` variants in `optimizeopt/virtualize.py`),
+but the elements are **GC pointers to heap-allocated `rstr.STR` objects**:
+
+1. **Allocation per load:** `LOAD_COL_STR` must call `resolve_string()` →
+   `unpack_string()` → `rffi.charpsize2str()` → nursery allocation. The string must
+   be a concrete `rstr.STR` because `ll_streq()` dereferences `.chars[j]`.
+2. **GC map pressure:** Each `str_regs` slot holding a string reference requires a
+   GC map entry for guard recovery frames. `regs` slots (raw integers) do not.
+3. **Comparison cost:** RPython's `ll_streq()` is a **function call** (not inlined by
+   the JIT for dynamic strings). It dereferences both string pointers, compares lengths,
+   then runs a byte loop. Compare to integer `CMP_EQ`: one `CMP` instruction.
+4. **No escape analysis help:** `unpack_string()` allocates the string, then it's
+   passed to `ll_streq()` — a function call that forces the virtual. The JIT cannot
+   remove the allocation.
+
+##### The existing zero-allocation path
+
+gnitz already has `compare_structures()` and `string_equals()` in `gnitz/core/strings.py`
+that compare string column values **directly on raw column buffer memory** without
+creating Python string objects:
+
+```python
+# gnitz/core/strings.py — operates on raw CCHARP pointers, zero allocation
+def compare_structures(len1, pref1, ptr1, heap1, str1,
+                       len2, pref2, ptr2, heap2, str2):
+    # 1. Compare 4-byte prefix integers (single CMP instruction via JIT)
+    # 2. If prefixes differ → early exit (covers most unequal strings)
+    # 3. Short string (≤4 bytes): prefix was exhaustive, compare lengths
+    # 4. Compare suffix bytes via raw pointer arithmetic
+    # Returns -1, 0, or 1
+```
+
+The input is the 5-tuple from `accessor.get_str_struct(col_idx)`:
+```
+(length: int, prefix: int, struct_ptr: CCHARP, heap_base_ptr: CCHARP, py_string: str|None)
+```
+
+This tuple contains **only integers and raw pointers** — no GC references. The JIT
+virtualizes it perfectly (fixed-size struct, never escapes). `compare_structures`
+reads bytes directly from the column buffer and blob arena via raw pointer arithmetic.
+
+For column-vs-constant equality, `string_equals(packed_ptr, packed_heap_ptr, search_str)`
+is even more optimized — it compares a German String struct against a Python search
+string without unpacking.
+
+##### Fused comparison opcodes
+
+6 opcodes, each self-contained. Read directly from accessor/const pool, compare via
+`compare_structures`/`string_equals`, write 0/1 to an integer register:
 
 ```
-EXPR_LOAD_COL_STR   = 40   # load string column value → string register
-EXPR_LOAD_CONST_STR = 41   # load string constant from constant pool → string register
-EXPR_STR_EQ         = 42
-EXPR_STR_NE         = 43
-EXPR_STR_LT         = 44
-EXPR_STR_LE         = 45
-EXPR_STR_GT         = 46
-EXPR_STR_GE         = 47
-EXPR_EMIT_STR       = 48   # builder.append_string(str_regs[a1])
+EXPR_STR_COL_EQ_CONST = 40   # dst = (col[a1] == const_strings[a2]) ? 1 : 0
+EXPR_STR_COL_LT_CONST = 41   # dst = (col[a1] <  const_strings[a2]) ? 1 : 0
+EXPR_STR_COL_LE_CONST = 42   # dst = (col[a1] <= const_strings[a2]) ? 1 : 0
+EXPR_STR_COL_EQ_COL   = 43   # dst = (col[a1] == col[a2]) ? 1 : 0
+EXPR_STR_COL_LT_COL   = 44   # dst = (col[a1] <  col[a2]) ? 1 : 0
+EXPR_STR_COL_LE_COL   = 45   # dst = (col[a1] <= col[a2]) ? 1 : 0
 ```
 
-The 4-word fixed-width instruction format is preserved. String constants are not
-embedded inline in the bytecode (variable length). Instead, `ExprProgram` gains an
-optional `const_strings: [str]` pool; `EXPR_LOAD_CONST_STR` carries a pool index
-in words 1–2 (u64 index, zero-padded).
+NE, GT, GE are composed: `NE(a,b) = BOOL_NOT(EQ(a,b))`, `GT(a,b) = LT(b,a)` (swap
+operands at compile time), `GE(a,b) = LE(b,a)`. This halves the opcode count vs the
+original plan's 6+3 (load/compare/emit) with no expressiveness loss.
 
-**const_strings pool encoding:** Strings can't fit in u64 param values. Options
-to evaluate at implementation time: (a) a new system table for bytecode string pools,
-(b) pack strings into the blob area of the IPC batch alongside the circuit params,
-(c) encode each string character-by-character in sequential param slots with a length
-prefix. Option (a) is cleanest for large pools.
+**Column vs. constant implementation (eval_expr / eval_expr_map):**
 
-`eval_expr` and `eval_expr_map` (Phase 4) both gain a string register array alongside
-the existing r_int64 registers. Boolean results from string comparisons are stored
-in the integer register (0 or 1) as with other comparisons.
-
-**Why EXPR_EMIT_STR is needed:** Phase 4's type-agnostic `EXPR_EMIT` works because
-int/float share the `r_int64` representation in both ExprVM registers and
-RowBuilder `_lo[]`. Strings are different — they use `_strs[]` via
-`append_string(val_str)`, not `append_int`. So string output columns in computed
-projections require their own emit opcode.
-
-**Scope:** string column-to-column and string column-to-constant comparisons only.
-String arithmetic (concatenation) is out of scope.
-
-#### 5B — Equijoin operators (RPython)
-
-New operators: `op_equijoin_delta_trace` and `op_equijoin_delta_delta`. These are
-**new implementations**, not wrappers around the existing PK-based join operators.
-
-**Why new operators:** The existing `op_join_delta_trace` matches rows by PK —
-it calls `delta_batch.get_pk(i)` and `trace_cursor.seek(key)`. Equijoin matches
-on arbitrary key columns that may not be the PK. The hashing must happen inline
-per row during the join loop.
-
-**Implementation approach:** For each input row, compute a U128 key from the
-specified columns using the same Murmur3 hashing as `_extract_group_key` in
-`reduce.py` (which already handles int, u128, and string columns). Then:
-
-- `op_equijoin_delta_trace`: For each delta row, hash left key cols → U128.
-  Build a temporary sorted structure (or hash table) from the trace's key col
-  hashes, then match. The trace cursor cannot be used directly (it's sorted by
-  the trace's PK, not by the join key hash).
-- `op_equijoin_delta_delta`: Sort-merge or hash join on key col hashes.
-
-**Output schema:** Cannot reuse `merge_schemas_for_join` (it requires matching PK
-types on both sides). Equijoin needs its own schema builder:
-- Output PK = synthetic U128 hash of (left_PK, right_PK)
-- Output columns = left PK + left payloads + right payloads
-- Duplicate column names disambiguated by table alias prefix (resolved at bind
-  time in the Rust planner)
-
-New opcodes: `OP_EQUIJOIN_DELTA_TRACE = 22`, `OP_EQUIJOIN_DELTA_DELTA = 23`.
-
-Existing opcode assignments (from `gnitz/core/opcodes.py`):
+```python
+elif op == EXPR_STR_COL_EQ_CONST:
+    null[dst] = accessor.is_null(a1)
+    if not null[dst]:
+        _len, _pref, ptr, heap, pystr = accessor.get_str_struct(a1)
+        const_str = program.const_strings[a2]
+        regs[dst] = r_int64(1) if string_equals(ptr, heap, const_str) else r_int64(0)
+    else:
+        regs[dst] = r_int64(0)
 ```
-0=HALT   1=FILTER   2=MAP      3=NEGATE   4=UNION
-5=JOIN_DELTA_TRACE   6=JOIN_DELTA_DELTA   7=INTEGRATE   8=DELAY
-9=REDUCE  10=DISTINCT  11=SCAN_TRACE  12=SEEK_TRACE
-13=unallocated  14=unallocated
-15=CLEAR_DELTAS
-16=ANTI_JOIN_DELTA_TRACE  17=ANTI_JOIN_DELTA_DELTA
-18=SEMI_JOIN_DELTA_TRACE  19=SEMI_JOIN_DELTA_DELTA
-20=EXCHANGE_SHARD  21=EXCHANGE_GATHER
-22=OP_EQUIJOIN_DELTA_TRACE (Phase 5)
-23=OP_EQUIJOIN_DELTA_DELTA (Phase 5)
-```
-Note: Phase 4 computed projections reuse OPCODE_MAP (2) — no new DBSP opcode.
-Phase 4 adds expression opcodes EXPR_EMIT (32) and EXPR_INT_TO_FLOAT (33) — these
-are in the ExprVM opcode namespace, NOT the DBSP VM namespace.
-20/21 are EXCHANGE_SHARD/GATHER — do NOT use them for equijoin.
 
-**Instruction format:** New instructions must carry key column indices. The
-`Instruction` class needs new fields (`left_key_cols`, `right_key_cols`) or the
-key cols can be encoded as params and passed to the operator at construction time
-(similar to how reduce receives `group_cols`).
+- **Zero allocation:** `get_str_struct` returns integers + raw pointers (JIT-virtualized
+  tuple). `string_equals` compares raw bytes in the column buffer against the constant.
+  No `unpack_string`, no `rffi.charpsize2str`, no nursery allocation.
+- **Prefix fast-path:** `string_equals` compares the 4-byte prefix integer first —
+  one CPU `CMP` instruction rejects most non-matching strings before touching suffix
+  bytes.
+
+**Column vs. column implementation:**
+
+```python
+elif op == EXPR_STR_COL_EQ_COL:
+    null[dst] = accessor.is_null(a1) or accessor.is_null(a2)
+    if not null[dst]:
+        l1, p1, ptr1, h1, s1 = accessor.get_str_struct(a1)
+        l2, p2, ptr2, h2, s2 = accessor.get_str_struct(a2)
+        regs[dst] = r_int64(1) if compare_structures(
+            l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+        ) == 0 else r_int64(0)
+    else:
+        regs[dst] = r_int64(0)
+```
+
+Both 5-tuples are JIT-virtualized (10 integer/pointer values on the stack).
+`compare_structures` operates on raw memory. Zero GC interaction.
+
+**LT/LE variants** use the same pattern but check `compare_structures(...) < 0`
+or `compare_structures(...) <= 0`.
+
+##### What this eliminates
+
+- ~~`str_regs = [""] * N`~~ — no string register file
+- ~~`EXPR_LOAD_COL_STR` (40)~~ — columns accessed inline by fused opcodes
+- ~~`EXPR_LOAD_CONST_STR` (41)~~ — constants accessed inline from `const_strings` pool
+- ~~`EXPR_STR_EQ..GE` (42-47)~~ — replaced by 6 fused column-level opcodes
+- ~~`EXPR_EMIT_STR` (48)~~ — `COPY_COL` (Phase 4) handles string output
+- ~~Three-way `TypeTag`~~ — `compile_bound_expr` stays `(u32, bool)`
+
+**Performance comparison** (per-row cost for `WHERE name = 'Alice'`):
+
+| | String registers (original) | Fused opcode (revised) |
+|---|---|---|
+| Heap allocations | 1-3 (charpsize2str) | **0** |
+| GC pointers in reg file | 1 | **0** |
+| Comparison | `ll_streq()` call (~20 instrs) | `string_equals()` inline (prefix CMP + memcmp) |
+| Register file type | Mixed (int64 + GC refs) | **Homogeneous `[r_int64]`** |
+
+##### Null propagation
+
+Same shadow null tracking as Phase 4's integer/float opcodes:
+- Column-vs-constant: `null[dst] = accessor.is_null(col_idx)`
+- Column-vs-column: `null[dst] = accessor.is_null(a1) or accessor.is_null(a2)`
+- Result is always in integer `regs[dst]` — downstream `BOOL_AND`/`BOOL_OR` work
+  unchanged.
+
+##### Scope
+
+String column-to-constant and column-to-column **comparisons** only. String
+computation (concatenation, SUBSTRING, UPPER) is out of scope. If string computation
+is added in a future phase, THAT is when string registers would be needed — and the
+requirements will be clearer then.
+
+String **pass-through** in projections (`SELECT name, a + b AS total FROM t`) is
+already handled by Phase 4's `EXPR_COPY_COL` opcode.
+
+String **join predicates** (`ON t1.name = t2.name`) are handled at the circuit level
+by pre-indexing with `hash(name)` as the new PK (see §5B). No ExprVM string
+comparison needed for join keys.
+
+##### compile_bound_expr: no signature change
+
+When the Rust compiler encounters `BinOp(ColRef(name_idx), Eq, LitStr("Alice"))`:
+1. Detect left is `TypeCode::String` (from schema), right is `LitStr`
+2. Add `"Alice"` to the const_strings pool → `const_idx`
+3. Emit `STR_COL_EQ_CONST dst, name_idx, const_idx`
+4. Return `(dst, false)` — result is integer 0/1
+
+No `TypeTag` enum. No new return type. String comparisons are pattern-matched at
+compile time and lowered directly to fused opcodes. The existing `(u32, bool)` return
+works because fused opcodes always produce integer results.
+
+For `WHERE name > 'M'`: the compiler emits `STR_COL_LE_CONST` with swapped sense
+(name > 'M' ↔ NOT(name <= 'M')), wraps in `BOOL_NOT`, returns `(result, false)`.
+
+For `WHERE first_name = last_name` (same-row column comparison): both operands are
+`ColRef` with `TypeCode::String` → emit `STR_COL_EQ_COL dst, col_a, col_b`.
+
+##### ExprProgram changes
+
+```python
+class ExprProgram(object):
+    _immutable_fields_ = ['code[*]', 'num_regs', 'result_reg', 'num_instrs',
+                          'const_strings[*]']
+
+    def __init__(self, code, num_regs, result_reg, const_strings=None):
+        self.code = code[:]
+        self.num_regs = num_regs
+        self.result_reg = result_reg
+        self.num_instrs = len(code) // 4
+        self.const_strings = const_strings[:] if const_strings else []
+```
+
+The `const_strings` list is immutable (`[*]`), so the JIT can inline constant lookups
+when `program` is promoted. For programs without string constants (the vast majority),
+`const_strings` is an empty list — zero overhead.
+
+##### Rust ExprBuilder additions
+
+```rust
+const EXPR_STR_COL_EQ_CONST: u32 = 40;
+const EXPR_STR_COL_LT_CONST: u32 = 41;
+const EXPR_STR_COL_LE_CONST: u32 = 42;
+const EXPR_STR_COL_EQ_COL:   u32 = 43;
+const EXPR_STR_COL_LT_COL:   u32 = 44;
+const EXPR_STR_COL_LE_COL:   u32 = 45;
+
+pub fn str_col_eq_const(&mut self, col_idx: usize, const_idx: u32) -> u32 {
+    let dst = self.alloc_reg();
+    self.emit(EXPR_STR_COL_EQ_CONST, dst, col_idx as u32, const_idx);
+    dst
+}
+// ... analogous methods for LT_CONST, LE_CONST, EQ_COL, LT_COL, LE_COL
+```
+
+#### 5A-const — String constant pool: extend CircuitParamsTab
+
+String constants in expressions (e.g., `'Alice'` in `WHERE name = 'Alice'`) must be
+persisted alongside the circuit graph and loaded at compile time.
+
+**Design:** Add a nullable STRING column to `CircuitParamsTab`:
+
+```python
+# CircuitParamsTab.schema() — revised
+cols = [
+    ColumnDefinition(TYPE_U128, is_nullable=False, name="param_pk"),
+    ColumnDefinition(TYPE_U64,  is_nullable=False, name="value"),
+    ColumnDefinition(TYPE_STRING, is_nullable=True, name="str_value"),   # NEW
+]
+```
+
+String constants are stored as regular param rows with `str_value` populated:
+```
+(view_id, node_id, PARAM_CONST_STR_BASE + 0) → value=0, str_value="Alice"
+(view_id, node_id, PARAM_CONST_STR_BASE + 1) → value=0, str_value="Bob"
+```
+
+New constant: `PARAM_CONST_STR_BASE = 160` (slots 160-191, up to 32 string constants
+per node — matching the capacity of other PARAM_*_BASE ranges).
+
+**Why this approach (not a new system table):**
+
+- **Zero new tables.** `CircuitGroupColsTab` is the precedent for per-node auxiliary
+  data, but adding a table costs ~150 lines of boilerplate (system_tables.py,
+  loader.py, metadata.py, types.rs, client.rs, engine.py, program_cache.py). Adding
+  one nullable column to an existing table costs ~40 lines.
+- **gnitz-native string storage.** The blob arena handles string persistence,
+  deduplication, and GC automatically — same as all other string columns.
+- **Existing serialization works.** `CircuitParamsTab.append()` gains a `str_value`
+  parameter. The Rust client already knows how to push rows with string columns.
+- **Existing retraction works.** `_retract_circuit_graph` scans and retracts all
+  params for a view — strings are retracted automatically.
+- **Clean semantics.** A param row with `str_value=NULL` is a numeric param (existing
+  behavior). A param row with `str_value` set is a string constant. No ambiguity.
+- **Future-proof.** If other constant types are needed later (dates, blobs), add
+  another nullable column. No new tables.
+
+**Loading in program_cache.py:**
+
+`_load_params` returns a second dict alongside the existing params:
+```python
+def _load_params(self, view_id):
+    # ... existing code reads numeric params into result dict ...
+    str_params = {}  # node_id → {slot → string}
+    # When str_value column is present and non-null:
+    #   str_params[node_id][slot - PARAM_CONST_STR_BASE] = str_value
+    return result, str_params
+```
+
+Then in the FILTER/MAP handler:
+```python
+const_strings = []
+if nid in str_params:
+    idx = 0
+    while (opcodes.PARAM_CONST_STR_BASE + idx) in str_params[nid]:
+        const_strings.append(str_params[nid][opcodes.PARAM_CONST_STR_BASE + idx])
+        idx += 1
+prog = ExprProgram(code, num_regs, result_reg, const_strings)
+```
+
+**Rust CircuitBuilder additions:**
+
+```rust
+pub struct CircuitBuilder {
+    // ... existing fields ...
+    const_strings: Vec<(u64, u64, String)>,  // (node_id, slot, value)
+}
+
+impl CircuitBuilder {
+    pub fn add_const_string(&mut self, node_id: NodeId, index: u32, value: String) {
+        let slot = PARAM_CONST_STR_BASE + index as u64;
+        self.const_strings.push((node_id, slot, value));
+    }
+}
+```
+
+Serialization in `create_view_with_circuit`: push const_string entries as
+CircuitParamsTab rows with the `str_value` column populated.
+
+**Schema migration:** System tables are created fresh at database initialization.
+Existing databases without the new column will not have any string constants in their
+circuits (Phase 5 is not yet deployed). The NULL default is correct for all existing
+rows.
+
+#### 5B — Equijoins via pre-indexing (no new DBSP operators)
+
+**Design revision:** The original plan proposed two new equijoin operators
+(`op_equijoin_delta_trace` + `op_equijoin_delta_delta`, opcodes 22-23) that would
+hash join key columns inline and build temporary hash tables per step. This was
+replaced by a pre-indexing approach after discovering that **gnitz Z-sets do NOT
+enforce unique PKs at the storage level**.
+
+##### The foundational insight: Z-set element identity is (PK + all payloads)
+
+gnitz's `unique_pk` flag is a DML-level enforcement (Stage 0 of `ingest_to_family`
+in `registry.py`). At the storage level:
+
+1. **Consolidation groups by full row**, not PK alone.
+   `ArenaZSetBatch.to_consolidated()` calls `compare_indices()`, which calls
+   `core_comparator.compare_rows(schema, acc_a, acc_b)` when PKs match. Two rows with
+   the same PK but different payloads are **independent Z-set elements** — they survive
+   consolidation with separate weights.
+
+2. **Cursors iterate all same-PK entries.**
+   `SortedBatchCursor.advance()` increments position unconditionally.
+   `UnifiedCursor._find_next_non_ghost()` compares via `TournamentTree._compare_nodes`,
+   which calls `compare_rows` after PK comparison. Same-PK, different-payload entries
+   are emitted separately.
+
+3. **Join operators handle multiple matches per PK.**
+   `op_join_delta_trace` (`join.py:124`) already has:
+   ```python
+   trace_cursor.seek(key)
+   while trace_cursor.is_valid():
+       if trace_cursor.key() != key:
+           break
+       # ... process match, emit output row ...
+       trace_cursor.advance()
+   ```
+   It iterates ALL trace entries matching the PK, producing one output per match with
+   multiplied weights. `op_join_delta_delta` similarly processes PK groups.
+
+4. **`merge_schemas_for_join` works** when both sides have the same PK type — which
+   is guaranteed when both are reindexed by the same join key column type.
+
+This means Feldera's pre-indexing approach (project join key to PK, then use standard
+PK-based join) works in gnitz without modification to any join operator.
+
+##### The approach: PARAM_REINDEX_COL on MAP
+
+Add a single parameter to the existing `OPCODE_MAP`: `PARAM_REINDEX_COL`. When set,
+`op_map` uses the specified column's value (promoted to U128) as the output PK,
+instead of passing through the input PK. The original PK is preserved as a payload
+column via `COPY_COL`.
+
+**RPython changes** (`gnitz/dbsp/ops/linear.py`, ~20 lines):
+
+```python
+def op_map(in_batch, out_register, func, out_schema, reindex_col=-1):
+    for i in range(length):
+        if reindex_col >= 0:
+            # Read join key column value, promote to U128 for use as new PK
+            new_pk = _promote_col_to_u128(accessor, reindex_col, in_schema)
+            weight = in_batch.get_weight(i)
+            func.evaluate_map(accessor, builder)
+            builder.commit_row(new_pk, weight)
+        else:
+            # Existing behavior: pass through input PK
+            pk = in_batch.get_pk(i)
+            weight = in_batch.get_weight(i)
+            func.evaluate_map(accessor, builder)
+            builder.commit_row(pk, weight)
+```
+
+`_promote_col_to_u128` promotes the column value to U128 based on type:
+- Integer types (I8..U64): zero-extend to U128 (same as `get_index_key_type`)
+- U128: direct value
+- String: xxh64 hash → U128 (same hash used in `_extract_group_key`)
+- Float: bit reinterpretation → U128
+
+New constant: `PARAM_REINDEX_COL = 10` in `opcodes.py`.
+
+**program_cache.py** MAP handler: read `reindex_col` from node_params and pass to
+`op_map`:
+```python
+reindex_col = node_params.get(opcodes.PARAM_REINDEX_COL, -1)
+return instructions.map_op(in_reg, out_reg, func, reindex_col=reindex_col)
+```
+
+##### Single circuit, multiple entry points
+
+The Rust planner emits **one circuit** per join view containing both join directions
+and a delta-delta path. The circuit has **two primary inputs**, one per source table.
+At execution time, the triggering delta is bound to the matching input register; the
+other input remains empty, and its entire path naturally produces zero output.
+
+**The key property:** every operator in the codebase guards on input length.
+`op_map` (`linear.py:61`), `op_join_delta_trace` (`join.py:136`),
+`op_join_delta_delta` (`join.py:183`), `op_integrate` (`linear.py:102`),
+`op_filter` (`linear.py:31`) — all iterate `for i in range(n)` where `n` is the
+input batch length. **Empty in → empty out → zero side effects.** Inactive paths
+are completely inert with no code changes to any operator.
+
+##### Circuit pattern for JOIN ON t1.cid = t2.id
+
+One circuit, one `create_view_with_circuit` call, one cached `ExecutablePlan`:
+
+```
+input_A (SCAN_TRACE source=0, PARAM_JOIN_SOURCE_TABLE=T1)
+input_B (SCAN_TRACE source=0, PARAM_JOIN_SOURCE_TABLE=T2)
+
+                                                                      ┌──────────┐
+input_A → reindex(cid) → fork ──→ integrate(T1_reindex_trace)        │          │
+                              └──→ join_delta_trace(trace=T2_reindex) │          │
+                                     └──→ project_A ─────────────────→│          │
+                                                                      │  union   │→ sink(V)
+input_B → reindex(id) → fork ──→ integrate(T2_reindex_trace)         │          │
+                             └──→ join_delta_trace(trace=T1_reindex)  │          │
+                                    └──→ project_B ──────────────────→│          │
+                                                                      │          │
+join_delta_delta(reindex_A, reindex_B) → project_DD ─────────────────→│          │
+                                                                      └──────────┘
+```
+
+When T1 is ingested, `execute_epoch` binds ΔT1 to input_A. input_B stays empty.
+Tracing the inactive Path B: `reindex(empty)` → empty → `integrate(empty)` → no-op →
+`join(empty, T1_trace)` → loop runs 0 times → empty → `project_B(empty)` → empty.
+`join_delta_delta(non-empty, empty)` → `while idx_a < n_a and idx_b < n_b` with
+n_b=0 → loop never enters → empty. Union receives only Path A's results. ✓
+
+**Why the circuit always produces exactly the right DBSP terms:**
+
+Using the `z^{-1}` formulation (all trace cursors reflect state BEFORE this step,
+since `prepare_for_tick` refreshes them once at the start, before any INTEGRATEs):
+
+- Path A: `ΔA ⋈ z^{-1}(I(B))`
+- Path B: `ΔB ⋈ z^{-1}(I(A))`
+- Path DD: `ΔA ⋈ ΔB`
+- Sum: `ΔA ⋈ z^{-1}(I(B)) + z^{-1}(I(A)) ⋈ ΔB + ΔA ⋈ ΔB` = correct incremental join
+
+For cross-table joins (T1 ≠ T2): exactly one input is non-zero per step, so two of
+three terms vanish automatically. For self-joins (`FROM t1 a JOIN t1 b ON a.x = b.y`):
+both inputs are bound to the same ΔT1, all three terms are computed, and the result
+is correct without any special-casing.
+
+**Execution order does not matter** — all trace cursors were created at
+`prepare_for_tick` time. INTEGRATEs happen later in the instruction stream but cannot
+affect cursors created before them (writes go to the memtable; the cursor was opened
+on pre-existing shards). Both directions read `z^{-1}` state regardless of
+topological ordering.
+
+##### Circuit structure walkthrough
+
+Each path in the circuit:
+1. **Reindexes** its delta via `map_reindex` + `ExprMapFunction` (Phase 4):
+   copies the original PK to a payload position via `COPY_COL`, other payload columns
+   are copied, and the join key column's value becomes the new PK via
+   `PARAM_REINDEX_COL`.
+2. **Forks** the reindexed delta to two downstream nodes (two edges from the same
+   source in the circuit graph — the VM reads from the same DeltaRegister without
+   consuming it).
+3. **Integrates** its reindexed delta into a persistent trace table (for the
+   other direction's join to seek against in future steps).
+4. **Joins** the reindexed delta against the other table's reindexed trace via the
+   existing `op_join_delta_trace` — cursor seeks by PK = join key, O(log N).
+5. **Projects** the join output to V's canonical output schema. This is needed because
+   `CompositeAccessor` puts the delta side's columns first: Path A produces
+   `[T1_payloads, T2_payloads]` while Path B produces `[T2_payloads, T1_payloads]`.
+   Each path's projection maps its direction-specific column indices to V's column
+   order. This reuses the existing MAP/projection infrastructure (PARAM_PROJ_BASE).
+
+The **delta-delta path** takes the two reindexed deltas and joins them directly via
+the existing `op_join_delta_delta` (sort-merge join, `join.py:164`). Its output is
+projected to V's schema and unioned with the other two paths. For cross-table joins,
+this path always receives at least one empty input and produces nothing — zero overhead.
+
+The **union** combines all three projected paths into a single delta written to V's sink.
+
+**Shared reindexed trace tables:** T1_reindexed_trace and T2_reindexed_trace are
+persistent tables managed as children of V's store (same pattern as `_hist_` tables
+for DISTINCT). Path A writes to T1_reindexed_trace and reads T2_reindexed_trace.
+Path B writes to T2_reindexed_trace and reads T1_reindexed_trace. These are created
+once during circuit compilation and cleaned up when V is dropped.
+
+##### Infrastructure changes
+
+**`compile_from_graph`** (~15 lines): Handle multiple SCAN_TRACE(table_id=0) nodes.
+For each, read `PARAM_JOIN_SOURCE_TABLE` from params, look up the source table's
+schema from the registry, create a DeltaRegister with that schema:
+
+```python
+if table_id == 0:
+    source_tid = node_params.get(opcodes.PARAM_JOIN_SOURCE_TABLE, 0)
+    if source_tid > 0:
+        node_schema = self.registry.get_by_id(source_tid).schema
+    else:
+        node_schema = in_schema  # backward compat: single-source views
+    reg = runtime.DeltaRegister(reg_id, node_schema)
+    cur_reg_file.registers[reg_id] = reg
+    source_reg_map[source_tid] = reg_id  # built alongside state
+    return None
+```
+
+For single-source views (no `PARAM_JOIN_SOURCE_TABLE`), `source_tid=0` falls through
+to `in_schema` — fully backward compatible.
+
+**`ExecutablePlan`** (~8 lines): Add `source_reg_map` field (dict or None).
+`execute_epoch` gains a `source_id` parameter:
+
+```python
+def execute_epoch(self, input_delta, source_id=0):
+    self.reg_file.prepare_for_tick()   # all DeltaRegisters clear()'d to empty
+    self.context.reset()
+    if self.source_reg_map is not None and source_id in self.source_reg_map:
+        in_reg_idx = self.source_reg_map[source_id]
+    else:
+        in_reg_idx = self.in_reg_idx   # single-source fallback
+    in_reg = self.reg_file.get_register(in_reg_idx)
+    in_reg.bind(input_delta)
+    # ... rest unchanged ...
+```
+
+**`evaluate_dag`** (~8 lines): Track `source_id` alongside each pending entry.
+First-layer entries use `initial_source_id`. Downstream entries use `target_view_id`
+(the view that produced the output):
+
+```python
+# pending tuples: (depth, view_id, source_id, batch)
+for v_id in first_layer:
+    pending.append((d, v_id, initial_source_id, initial_delta.clone()))
+# ...
+depth, target_view_id, source_id, incoming_delta = pending[-1]
+out_delta = plan.execute_epoch(incoming_delta, source_id)
+# ...
+for dep_id in dependents:
+    pending.append((d, dep_id, target_view_id, out_delta.clone()))
+```
+
+**`opcodes.py`**: +1 constant (`PARAM_JOIN_SOURCE_TABLE = 11`).
+
+**No changes to `get_program`** — one circuit per view_id, one cached plan.
+No per-source plan routing. No new system tables. No graph partitioning.
+
+##### Performance: O(D log N), not O(N)
+
+The trace is sorted by the new PK (= join key value). `op_join_delta_trace` seeks
+each delta row's PK in the trace via binary search: **O(D log N_trace)** per step,
+where D = delta size and N = trace size.
+
+Compare to the original plan's hash-based equijoin operators:
+- Hash join: **O(N_trace)** per step — must scan entire trace to build hash map
+- Pre-indexing: **O(D log N_trace)** — D << N in the typical DBSP case (small deltas
+  against large accumulated state)
+
+Pre-indexing is asymptotically better for the incremental use case.
+
+##### Integer join keys: exact matching, zero hash collisions
+
+For integer join columns (the overwhelming common case):
+- The column value IS the new PK (e.g., I64 promoted to U64 in the PK)
+- No hashing needed. PK-based join matches exactly by join key value
+- Zero collision risk
+
+For string join keys:
+- xxh64 hash → U128 (same as `_extract_group_key` in `reduce.py`). Effective
+  collision resistance is 64 bits (~2^-64 per pair). xxh64 produces 64 bits; the
+  U128 is derived deterministically from those 64 bits via `_mix64`.
+- At 1 billion distinct strings, expected collisions ≈ 0.03. Practically negligible.
+- For absolute correctness, a post-join filter could verify actual string equality,
+  but this is practically unnecessary at any realistic scale.
+
+##### What this eliminates from the original plan
+
+- ~~`op_equijoin_delta_trace`~~ — reuse existing `op_join_delta_trace`
+- ~~`op_equijoin_delta_delta`~~ — reuse existing `op_join_delta_delta`
+- ~~Opcodes 22, 23~~ — no new DBSP opcodes
+- ~~Inline hash table construction~~ — trace IS sorted by join key
+- ~~Custom output schema builder~~ — `merge_schemas_for_join` works (matching PK types)
+- ~~New `Instruction` fields for key cols~~ — key cols are implicit (the PK)
+- ~~`CircuitJoinKeysTab` system table~~ — no per-join key column metadata needed
+- ~~Two-circuit persistence~~ — one circuit per view, one cached plan
+- ~~Per-source plan routing~~ — bind delta to matching input register
+- ~~Multi-input delta routing~~ — inactive paths auto-zero via empty-in/empty-out
+- ~~Graph partitioning in compiler~~ — single connected graph, standard topo sort
+
+**Total RPython changes for equijoin support:** ~40 lines in `op_map` (reindex mode
++ `_promote_col_to_u128` + threading through `Instruction`/`interpreter.py`) +
+~15 lines in `compile_from_graph` (multi-input handling + source_reg_map) +
+~8 lines in `execute_epoch` (source_id param + register selection) +
+~8 lines in `evaluate_dag` (source_id tracking in pending tuples) +
+1 new constant in `opcodes.py`.
+
+##### Rust CircuitBuilder
+
+```rust
+/// Map with PK reindexing. The output PK becomes the value of
+/// `reindex_col` (promoted to U128). Used for equijoin pre-indexing.
+pub fn map_reindex(
+    &mut self, input: NodeId, reindex_col: usize, program: ExprProgram,
+) -> NodeId {
+    let nid = self.alloc_node(OPCODE_MAP);
+    self.connect(input, nid, PORT_IN);
+    self.params.push((nid, PARAM_FUNC_ID, 0));
+    self.params.push((nid, PARAM_REINDEX_COL, reindex_col as u64));
+    self.params.push((nid, PARAM_EXPR_NUM_REGS, program.num_regs as u64));
+    for (i, &word) in program.code.iter().enumerate() {
+        self.params.push((nid, PARAM_EXPR_BASE + i as u64, word as u64));
+    }
+    nid
+}
+```
 
 #### 5C — Rust planner additions
 
-**gnitz-core:** new opcode constants + `CircuitBuilder::equijoin(left, right_trace_tid,
-left_key_cols: &[usize], right_key_cols: &[usize]) -> NodeId`. Key column indices
-encoded as params (similar to `PARAM_SHARD_COL_BASE` for exchange).
-
 **gnitz-sql/src/planner.rs:** Parse `TableWithJoins.joins` in `execute_create_view`.
+
 For each `JoinOperator::Inner(JoinConstraint::On(Expr))`:
-- Extract `ON t1.a = t2.b` from the expression.
-- Resolve column references to `(table_idx, col_idx)` pairs.
-- Emit `CircuitBuilder::equijoin(left_node, right_table_id, left_key_cols, right_key_cols)`.
-- Handle multi-table joins by chaining equijoin nodes (left-deep tree).
+1. Extract equijoin keys via a dedicated `extract_equijoin_keys(on_expr, left_schema,
+   right_schema) → Vec<(usize, usize)>` function. Pattern-matches
+   `BinaryOp { op: Eq, left: Identifier, right: Identifier }` against both schemas.
+   No full binder refactor needed — this is a targeted pattern match.
+2. Call `input_delta()` twice, tag each with `PARAM_JOIN_SOURCE_TABLE`.
+3. Build reindex MAP for each side: `ExprMapFunction` copies original PK + relevant
+   columns to payload, `PARAM_REINDEX_COL` sets the join key as new PK.
+4. Emit the full join circuit: two `join_delta_trace` paths (one per direction) +
+   one `join_delta_delta` path + integrate nodes for both reindexed traces + post-join
+   projections + three-way `union` + sink. All in one `CircuitBuilder`, one call to
+   `create_view_with_circuit`.
+5. For multi-table joins, chain left-deep: result of first join → INTEGRATE → DELAY →
+   reindex by next join key → join with next table.
 
 `JOIN … USING (col)` desugars to `ON t1.col = t2.col`. Cross joins (`CROSS JOIN`,
 `JOIN` without `ON`) are rejected (`GnitzSqlError::Unsupported`).
 
-**Schema inference for joins:** The binder resolves all table references in the `FROM`
-clause, fetches their schemas, and produces a merged schema for the output. Duplicate
-column names are prefixed with their table alias: `t1.id`, `t2.id`. The join output
-PK is a synthetic U128 (hash of both table PKs).
+**Schema inference for joins:** The planner builds the output schema by combining
+left and right schemas after reindexing. The output PK is the join key value. Original
+PKs from both sides are preserved as payload columns. Duplicate column names are
+disambiguated by table alias prefix at bind time.
+
+**Binder changes:** Minimal. No full multi-table refactor. `extract_equijoin_keys`
+resolves column names against left and right schemas independently. The existing
+`binder.resolve()` fetches schemas for each table. Qualified column references
+(`t1.col`) are split on `.` and matched against table aliases tracked in a local
+`HashMap<String, (u64, Schema)>`.
 
 #### 5D — Tests
 
 ```
-TestStringViews
-  test_view_string_eq_literal  CREATE VIEW v AS SELECT * FROM t WHERE name = 'Alice'
-  test_view_string_cmp         CREATE VIEW v AS SELECT * FROM t WHERE name > 'M'
-  test_view_string_col_to_col  (requires join, tested in TestJoins)
+TestStringPredicates
+  test_view_string_eq_literal    CREATE VIEW v AS SELECT * FROM t WHERE name = 'Alice'
+  test_view_string_ne_literal    WHERE name != 'Bob' (composed: BOOL_NOT + EQ)
+  test_view_string_gt_literal    WHERE name > 'M' (composed: LT with swapped operands)
+  test_view_string_le_literal    WHERE name <= 'M'
+  test_view_string_col_eq_col    WHERE first_name = last_name (same-row comparison)
+  test_view_string_null          WHERE name = 'Alice' with NULL name → filtered out
+  test_view_string_and_int       WHERE name = 'Alice' AND age > 21 (mixed predicate)
 
 TestJoins
-  test_inner_join_basic        JOIN on integer PK
-  test_inner_join_string_key   JOIN ON t1.name = t2.name
-  test_inner_join_multi        three-table join (chained equijoin nodes)
-  test_join_using              JOIN USING (col)
-  test_join_cross_rejects      CROSS JOIN → error
-  test_join_non_equi_rejects   JOIN ON t1.a < t2.b → error (Phase 5 = equijoin only)
+  test_inner_join_int_key        JOIN ON t1.cid = t2.id (integer key, exact matching)
+  test_inner_join_string_key     JOIN ON t1.name = t2.name (string key, hash-based)
+  test_inner_join_multi_match    JOIN with one-to-many (multiple rows per key)
+  test_inner_join_self           FROM t a JOIN t b ON a.x = b.y (self-join, both paths + DD)
+  test_inner_join_three_tables   three-table join (left-deep chain)
+  test_join_using                JOIN USING (col)
+  test_join_view_propagation     insert after join view → output updates
+  test_join_cross_rejects        CROSS JOIN → error
+  test_join_non_equi_rejects     JOIN ON t1.a < t2.b → error (equijoin only)
 ```
 
 ---

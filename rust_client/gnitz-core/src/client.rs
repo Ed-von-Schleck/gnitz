@@ -541,18 +541,33 @@ impl GnitzClient {
             ops::push(&self.conn, CIRCUIT_SOURCES_TAB, &sources_s, &sources)?;
         }
 
-        // 6. Circuit params
-        if !circuit.params.is_empty() {
+        // 6. Circuit params (3-column schema: param_pk, value, str_value)
+        if !circuit.params.is_empty() || !circuit.const_strings.is_empty() {
             let params_s = circuit_params_schema();
             let mut params = ZSetBatch::new(&params_s);
+
+            // Numeric params: str_value = NULL
             for &(node_id, slot, value) in &circuit.params {
                 let param_lo = (node_id << 8) | slot;
                 params.pk_lo.push(param_lo);
                 params.pk_hi.push(vid);
                 params.weights.push(1);
-                params.nulls.push(0);
+                params.nulls.push(1 << 1); // bit 1 = str_value (payload col idx 1) is null
                 if let ColData::Fixed(buf) = &mut params.columns[1] { push_u64_bytes(buf, value); }
+                if let ColData::Strings(v) = &mut params.columns[2] { v.push(None); }
             }
+
+            // String constant params: str_value = actual string
+            for (node_id, slot, ref value) in &circuit.const_strings {
+                let param_lo = (node_id << 8) | slot;
+                params.pk_lo.push(param_lo);
+                params.pk_hi.push(vid);
+                params.weights.push(1);
+                params.nulls.push(0); // no nulls
+                if let ColData::Fixed(buf) = &mut params.columns[1] { push_u64_bytes(buf, 0); }
+                if let ColData::Strings(v) = &mut params.columns[2] { v.push(Some(value.clone())); }
+            }
+
             ops::push(&self.conn, CIRCUIT_PARAMS_TAB, &params_s, &params)?;
         }
 

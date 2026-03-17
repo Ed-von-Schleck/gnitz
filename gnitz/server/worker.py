@@ -23,11 +23,12 @@ class WorkerExchangeHandler(object):
     def __init__(self, master_fd):
         self.master_fd = master_fd
 
-    def do_exchange(self, view_id, batch, shard_cols):
+    def do_exchange(self, view_id, batch, shard_cols, source_id=0):
         schema = batch._schema
         ipc.send_batch(
             self.master_fd, view_id, batch,
             schema=schema, flags=ipc.FLAG_EXCHANGE,
+            seek_pk_lo=source_id,
         )
         payload = ipc.receive_payload(self.master_fd)
         if payload.batch is not None and payload.batch.length() > 0:

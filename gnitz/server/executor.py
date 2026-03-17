@@ -66,6 +66,11 @@ def _sort_pending_by_tid(fds, cids, tids, batches, schemas):
         schemas[j + 1] = key_schema
 
 
+def _pending_key(view_id, source_id):
+    """Encode (view_id, source_id) as a single int for dict keying."""
+    return (view_id << 32) | (source_id & 0xFFFFFFFF)
+
+
 def evaluate_dag(engine, initial_source_id, initial_delta,
                  exchange_handler=None):
     """
@@ -76,28 +81,33 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
     Called by both the single-process ServerExecutor and multi-worker
     WorkerProcess paths. When exchange_handler is provided, plans with
     exchange_post_plan will perform IPC exchange mid-circuit.
+
+    Pending entries are 4-tuples: (depth, view_id, source_id, batch).
+    source_id tracks which source table triggered the delta, enabling
+    multi-input circuits to bind to the correct register.
     """
     registry = engine.registry
     program_cache = engine.program_cache
 
     dep_map = program_cache.get_dep_map(registry)
 
-    # pending: list of (depth, view_id, batch), sorted DESCENDING by depth
+    # pending: list of (depth, view_id, source_id, batch), sorted DESCENDING by depth
     # so the shallowest (min-depth) node is always at the tail for O(1) pop.
     first_layer = dep_map.get(initial_source_id, [])
     pending = []
-    pending_pos = {}   # view_id -> index in pending
+    pending_pos = {}   # _pending_key(view_id, source_id) -> index in pending
     for v_id in first_layer:
         d = registry.get_depth(v_id)
-        pending.append((d, v_id, initial_delta.clone()))
+        pending.append((d, v_id, initial_source_id, initial_delta.clone()))
     _sort_pending_desc(pending)
     for pi in range(len(pending)):
-        pending_pos[pending[pi][1]] = pi
+        pk = _pending_key(pending[pi][1], pending[pi][2])
+        pending_pos[pk] = pi
 
     while len(pending) > 0:
-        depth, target_view_id, incoming_delta = pending[-1]   # O(1) tail = min-depth
-        del pending[-1]                                        # O(1)
-        del pending_pos[target_view_id]
+        depth, target_view_id, source_id, incoming_delta = pending[-1]   # O(1) tail = min-depth
+        del pending[-1]                                                   # O(1)
+        del pending_pos[_pending_key(target_view_id, source_id)]
 
         plan = program_cache.get_program(target_view_id)
         if plan is None:
@@ -107,7 +117,7 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
 
         if plan.exchange_post_plan is not None and exchange_handler is not None:
             # Multi-worker: pre-plan -> IPC exchange -> post-plan
-            pre_result = plan.execute_epoch(incoming_delta)
+            pre_result = plan.execute_epoch(incoming_delta, source_id=source_id)
             incoming_delta.free()
             if pre_result is None:
                 pre_result = ArenaZSetBatch(plan.out_schema)
@@ -121,14 +131,28 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
             exchanged.free()
         elif plan.exchange_post_plan is not None:
             # Single-process: pre-plan -> post-plan (no exchange needed)
-            pre_result = plan.execute_epoch(incoming_delta)
+            pre_result = plan.execute_epoch(incoming_delta, source_id=source_id)
             incoming_delta.free()
             if pre_result is None:
                 pre_result = ArenaZSetBatch(plan.out_schema)
             out_delta = plan.exchange_post_plan.execute_epoch(pre_result)
             pre_result.free()
+        elif (plan.join_shard_map is not None
+              and source_id in plan.join_shard_map
+              and exchange_handler is not None):
+            # Multi-worker join: exchange raw delta by join key column
+            # BEFORE running the circuit, so all rows with the same join
+            # key land on the same worker (co-partitioning).
+            shard_cols = plan.join_shard_map[source_id]
+            exchanged = exchange_handler.do_exchange(
+                target_view_id, incoming_delta, shard_cols,
+                source_id=source_id,
+            )
+            incoming_delta.free()
+            out_delta = plan.execute_epoch(exchanged, source_id=source_id)
+            exchanged.free()
         else:
-            out_delta = plan.execute_epoch(incoming_delta)
+            out_delta = plan.execute_epoch(incoming_delta, source_id=source_id)
             incoming_delta.free()
 
         has_output = out_delta is not None and out_delta.length() > 0
@@ -143,28 +167,30 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
         if has_output or exchange_handler is not None:
             dependents = dep_map.get(target_view_id, [])
             for dep_id in dependents:
-                if dep_id in pending_pos:                        # O(1) lookup
+                dep_pk = _pending_key(dep_id, target_view_id)
+                if dep_pk in pending_pos:                        # O(1) lookup
                     if has_output:
-                        found = pending_pos[dep_id]
-                        existing_d, existing_id, existing_batch = pending[found]
+                        found = pending_pos[dep_pk]
+                        existing_d, existing_id, existing_sid, existing_batch = pending[found]
                         merged = ArenaZSetBatch(existing_batch._schema)
                         writer = BatchWriter(merged)
                         ops.op_union(existing_batch, out_delta, writer)
                         existing_batch.free()
-                        pending[found] = (existing_d, existing_id, merged)
-                        # pending_pos[dep_id] unchanged — in-place update
+                        pending[found] = (existing_d, existing_id, existing_sid, merged)
+                        # pending_pos[dep_pk] unchanged — in-place update
                 else:
                     d = registry.get_depth(dep_id)
                     if has_output:
-                        pending.append((d, dep_id, out_delta.clone()))
+                        pending.append((d, dep_id, target_view_id, out_delta.clone()))
                     else:
                         dep_family = registry.get_by_id(dep_id)
-                        pending.append((d, dep_id, ArenaZSetBatch(dep_family.schema)))
+                        pending.append((d, dep_id, target_view_id, ArenaZSetBatch(dep_family.schema)))
                     _sort_pending_desc(pending)
                     # All positions may have shifted — full rebuild
                     pending_pos.clear()
                     for pi in range(len(pending)):
-                        pending_pos[pending[pi][1]] = pi
+                        ppk = _pending_key(pending[pi][1], pending[pi][2])
+                        pending_pos[ppk] = pi
 
         if has_output:
             out_delta.free()

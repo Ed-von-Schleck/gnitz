@@ -6,9 +6,10 @@
 # to hand-written comparisons.
 
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, intmask
+from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi
 
 from gnitz.dbsp.functions import ScalarFunction
 
@@ -66,6 +67,14 @@ EXPR_EMIT          = 32   # builder.append_int(regs[a1]) or append_null(a2)
 EXPR_INT_TO_FLOAT  = 33   # regs[dst] = float2longlong(float(intmask(regs[a1])))
 EXPR_COPY_COL      = 34   # type-dispatched direct copy: input col → output col
 
+# Fused string comparison opcodes (Phase 5: string predicates)
+EXPR_STR_COL_EQ_CONST = 40   # dst = (col[a1] == const_strings[a2]) ? 1 : 0
+EXPR_STR_COL_LT_CONST = 41   # dst = (col[a1] <  const_strings[a2]) ? 1 : 0
+EXPR_STR_COL_LE_CONST = 42   # dst = (col[a1] <= const_strings[a2]) ? 1 : 0
+EXPR_STR_COL_EQ_COL   = 43   # dst = (col[a1] == col[a2]) ? 1 : 0
+EXPR_STR_COL_LT_COL   = 44   # dst = (col[a1] <  col[a2]) ? 1 : 0
+EXPR_STR_COL_LE_COL   = 45   # dst = (col[a1] <= col[a2]) ? 1 : 0
+
 
 # ---------------------------------------------------------------------------
 # ExprProgram — immutable bytecode for JIT
@@ -74,11 +83,16 @@ EXPR_COPY_COL      = 34   # type-dispatched direct copy: input col → output co
 class ExprProgram(object):
     _immutable_fields_ = ['code[*]', 'num_regs', 'result_reg', 'num_instrs']
 
-    def __init__(self, code, num_regs, result_reg):
+    def __init__(self, code, num_regs, result_reg, const_strings=None):
         self.code = code[:]         # copy: [*] requires a never-resized list
         self.num_regs = num_regs
         self.result_reg = result_reg
         self.num_instrs = len(code) // 4
+        if const_strings is not None:
+            self.const_strings = const_strings
+        else:
+            # RPython annotation: must be same type as the 'not None' branch
+            self.const_strings = [""][0:0]
 
     def code_as_ints(self):
         result = []
@@ -212,6 +226,82 @@ def eval_expr(program, accessor):
         elif op == EXPR_IS_NOT_NULL:
             null[dst] = False
             regs[dst] = r_int64(0) if accessor.is_null(a1) else r_int64(1)
+
+        elif op == EXPR_STR_COL_EQ_CONST:
+            from gnitz.core import strings
+            null[dst] = accessor.is_null(a1)
+            if not null[dst]:
+                _len, _pref, ptr, heap, pystr = accessor.get_str_struct(a1)
+                const_str = program.const_strings[a2]
+                regs[dst] = r_int64(1) if strings.string_equals(
+                    ptr, heap, const_str, len(const_str),
+                    r_uint64(strings.compute_prefix(const_str))
+                ) else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LT_CONST:
+            from gnitz.core import strings
+            null[dst] = accessor.is_null(a1)
+            if not null[dst]:
+                l_len, l_pref, l_ptr, l_heap, l_str = accessor.get_str_struct(a1)
+                const_str = program.const_strings[a2]
+                cmp = strings.compare_structures(
+                    l_len, l_pref, l_ptr, l_heap, l_str,
+                    len(const_str),
+                    rffi.cast(rffi.LONGLONG, r_uint64(strings.compute_prefix(const_str))),
+                    strings.NULL_PTR, strings.NULL_PTR, const_str
+                )
+                regs[dst] = r_int64(1) if cmp < 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LE_CONST:
+            from gnitz.core import strings
+            null[dst] = accessor.is_null(a1)
+            if not null[dst]:
+                l_len, l_pref, l_ptr, l_heap, l_str = accessor.get_str_struct(a1)
+                const_str = program.const_strings[a2]
+                cmp = strings.compare_structures(
+                    l_len, l_pref, l_ptr, l_heap, l_str,
+                    len(const_str),
+                    rffi.cast(rffi.LONGLONG, r_uint64(strings.compute_prefix(const_str))),
+                    strings.NULL_PTR, strings.NULL_PTR, const_str
+                )
+                regs[dst] = r_int64(1) if cmp <= 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_EQ_COL:
+            from gnitz.core import strings
+            null[dst] = accessor.is_null(a1) or accessor.is_null(a2)
+            if not null[dst]:
+                l1, p1, ptr1, h1, s1 = accessor.get_str_struct(a1)
+                l2, p2, ptr2, h2, s2 = accessor.get_str_struct(a2)
+                regs[dst] = r_int64(1) if strings.compare_structures(
+                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+                ) == 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LT_COL:
+            from gnitz.core import strings
+            null[dst] = accessor.is_null(a1) or accessor.is_null(a2)
+            if not null[dst]:
+                l1, p1, ptr1, h1, s1 = accessor.get_str_struct(a1)
+                l2, p2, ptr2, h2, s2 = accessor.get_str_struct(a2)
+                regs[dst] = r_int64(1) if strings.compare_structures(
+                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+                ) < 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LE_COL:
+            from gnitz.core import strings
+            null[dst] = accessor.is_null(a1) or accessor.is_null(a2)
+            if not null[dst]:
+                l1, p1, ptr1, h1, s1 = accessor.get_str_struct(a1)
+                l2, p2, ptr2, h2, s2 = accessor.get_str_struct(a2)
+                regs[dst] = r_int64(1) if strings.compare_structures(
+                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+                ) <= 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
 
         i += 1
 
@@ -389,6 +479,76 @@ def eval_expr_map(program, accessor, builder):
                 builder.append_u128(r_uint64(intmask(val)), r_uint64(intmask(val >> 64)))
             else:
                 builder.append_int(accessor.get_int_signed(a1))
+
+        elif op == EXPR_STR_COL_EQ_CONST:
+            null[dst] = accessor.is_null(a1)
+            if not null[dst]:
+                _len, _pref, ptr, heap, pystr = accessor.get_str_struct(a1)
+                const_str = program.const_strings[a2]
+                regs[dst] = r_int64(1) if strings.string_equals(
+                    ptr, heap, const_str, len(const_str),
+                    r_uint64(strings.compute_prefix(const_str))
+                ) else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LT_CONST:
+            null[dst] = accessor.is_null(a1)
+            if not null[dst]:
+                l_len, l_pref, l_ptr, l_heap, l_str = accessor.get_str_struct(a1)
+                const_str = program.const_strings[a2]
+                cmp = strings.compare_structures(
+                    l_len, l_pref, l_ptr, l_heap, l_str,
+                    len(const_str),
+                    rffi.cast(rffi.LONGLONG, r_uint64(strings.compute_prefix(const_str))),
+                    strings.NULL_PTR, strings.NULL_PTR, const_str
+                )
+                regs[dst] = r_int64(1) if cmp < 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LE_CONST:
+            null[dst] = accessor.is_null(a1)
+            if not null[dst]:
+                l_len, l_pref, l_ptr, l_heap, l_str = accessor.get_str_struct(a1)
+                const_str = program.const_strings[a2]
+                cmp = strings.compare_structures(
+                    l_len, l_pref, l_ptr, l_heap, l_str,
+                    len(const_str),
+                    rffi.cast(rffi.LONGLONG, r_uint64(strings.compute_prefix(const_str))),
+                    strings.NULL_PTR, strings.NULL_PTR, const_str
+                )
+                regs[dst] = r_int64(1) if cmp <= 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_EQ_COL:
+            null[dst] = accessor.is_null(a1) or accessor.is_null(a2)
+            if not null[dst]:
+                l1, p1, ptr1, h1, s1 = accessor.get_str_struct(a1)
+                l2, p2, ptr2, h2, s2 = accessor.get_str_struct(a2)
+                regs[dst] = r_int64(1) if strings.compare_structures(
+                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+                ) == 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LT_COL:
+            null[dst] = accessor.is_null(a1) or accessor.is_null(a2)
+            if not null[dst]:
+                l1, p1, ptr1, h1, s1 = accessor.get_str_struct(a1)
+                l2, p2, ptr2, h2, s2 = accessor.get_str_struct(a2)
+                regs[dst] = r_int64(1) if strings.compare_structures(
+                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+                ) < 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LE_COL:
+            null[dst] = accessor.is_null(a1) or accessor.is_null(a2)
+            if not null[dst]:
+                l1, p1, ptr1, h1, s1 = accessor.get_str_struct(a1)
+                l2, p2, ptr2, h2, s2 = accessor.get_str_struct(a2)
+                regs[dst] = r_int64(1) if strings.compare_structures(
+                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+                ) <= 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
 
         i += 1
 
@@ -618,10 +778,43 @@ class ExprBuilder(object):
     def copy_col(self, type_code, src_col_idx, payload_col_idx):
         self._emit(EXPR_COPY_COL, type_code, src_col_idx, payload_col_idx)
 
+    # --- String comparison ---
+
+    def str_col_eq_const(self, col_idx, const_idx):
+        dst = self._alloc_reg()
+        self._emit(EXPR_STR_COL_EQ_CONST, dst, col_idx, const_idx)
+        return dst
+
+    def str_col_lt_const(self, col_idx, const_idx):
+        dst = self._alloc_reg()
+        self._emit(EXPR_STR_COL_LT_CONST, dst, col_idx, const_idx)
+        return dst
+
+    def str_col_le_const(self, col_idx, const_idx):
+        dst = self._alloc_reg()
+        self._emit(EXPR_STR_COL_LE_CONST, dst, col_idx, const_idx)
+        return dst
+
+    def str_col_eq_col(self, col_a, col_b):
+        dst = self._alloc_reg()
+        self._emit(EXPR_STR_COL_EQ_COL, dst, col_a, col_b)
+        return dst
+
+    def str_col_lt_col(self, col_a, col_b):
+        dst = self._alloc_reg()
+        self._emit(EXPR_STR_COL_LT_COL, dst, col_a, col_b)
+        return dst
+
+    def str_col_le_col(self, col_a, col_b):
+        dst = self._alloc_reg()
+        self._emit(EXPR_STR_COL_LE_COL, dst, col_a, col_b)
+        return dst
+
     # --- Build ---
 
-    def build(self, result_reg):
-        return ExprProgram(self._code, self._next_reg, result_reg)
+    def build(self, result_reg, const_strings=None):
+        return ExprProgram(self._code, self._next_reg, result_reg,
+                           const_strings=const_strings)
 
-    def build_predicate(self, result_reg):
-        return ExprPredicate(self.build(result_reg))
+    def build_predicate(self, result_reg, const_strings=None):
+        return ExprPredicate(self.build(result_reg, const_strings=const_strings))

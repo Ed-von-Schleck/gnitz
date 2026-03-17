@@ -34,6 +34,7 @@ class Instruction(object):
         "reg_key",
         "trace_in_group_idx",
         "group_idx",
+        "reindex_col",
     ]
 
     def __init__(self, opcode):
@@ -58,6 +59,7 @@ class Instruction(object):
         self.reg_key = None
         self.trace_in_group_idx = None
         self.group_idx = None
+        self.reindex_col = -1
 
 
 # ── DBSP Algebraic Instructions ───────────────────────────────────────────
@@ -71,11 +73,12 @@ def filter_op(reg_in, reg_out, func):
     return i
 
 
-def map_op(reg_in, reg_out, func):
+def map_op(reg_in, reg_out, func, reindex_col=-1):
     i = Instruction(op.OPCODE_MAP)
     i.reg_in = reg_in
     i.reg_out = reg_out
     i.func = func
+    i.reindex_col = reindex_col
     return i
 
 

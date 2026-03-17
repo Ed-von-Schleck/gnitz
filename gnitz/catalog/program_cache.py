@@ -227,8 +227,9 @@ class ProgramCache(object):
     def _load_params(self, view_id):
         cursor, end_key = _open_system_scan(self.registry, sys.CircuitParamsTab.ID, view_id)
         if cursor is None:
-            return {}
+            return {}, {}
         result = {}
+        str_params = {}
         try:
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > r_int64(0):
@@ -240,10 +241,14 @@ class ProgramCache(object):
                     value = intmask(acc.get_int(sys.CircuitParamsTab.COL_VALUE))
                     if node_id not in result: result[node_id] = {}
                     result[node_id][slot] = value
+                    if not acc.is_null(sys.CircuitParamsTab.COL_STR_VALUE):
+                        sv = sys.read_string(acc, sys.CircuitParamsTab.COL_STR_VALUE)
+                        if node_id not in str_params: str_params[node_id] = {}
+                        str_params[node_id][slot] = sv
                 cursor.advance()
         finally:
             cursor.close()
-        return result
+        return result, str_params
 
     def _load_group_cols(self, view_id):
         cursor, end_key = _open_system_scan(self.registry, sys.CircuitGroupColsTab.ID, view_id)
@@ -271,7 +276,7 @@ class ProgramCache(object):
         if view_id in self._shard_cols_cache:
             return self._shard_cols_cache[view_id]
         nodes = self._load_nodes(view_id)
-        params = self._load_params(view_id)
+        params, _str_params = self._load_params(view_id)
         for nid, op in nodes:
             if op == opcodes.OPCODE_EXCHANGE_SHARD:
                 node_params = params.get(nid, {})
@@ -283,6 +288,37 @@ class ProgramCache(object):
                 self._shard_cols_cache[view_id] = shard_cols
                 return shard_cols
         self._shard_cols_cache[view_id] = []
+        return []
+
+    def get_join_shard_cols(self, view_id, source_id):
+        """Get the shard column index for a join view's specific source.
+
+        Scans the circuit graph for SCAN_TRACE(PARAM_JOIN_SOURCE_TABLE=source_id)
+        → MAP(PARAM_REINDEX_COL=X) and returns [X].
+        Returns [] if this view is not a join or source_id is not found.
+        """
+        nodes = self._load_nodes(view_id)
+        params_dict, _str = self._load_params(view_id)
+        edges = self._load_edges(view_id)
+
+        # Find the SCAN_TRACE node for this source_id
+        scan_nid = -1
+        for nid, op in nodes:
+            if op == opcodes.OPCODE_SCAN_TRACE:
+                np = params_dict.get(nid, {})
+                if np.get(opcodes.PARAM_JOIN_SOURCE_TABLE, 0) == source_id:
+                    scan_nid = nid
+                    break
+        if scan_nid < 0:
+            return []
+
+        # Find the MAP node that this SCAN_TRACE feeds into
+        for _eid, src, dst, _port in edges:
+            if src == scan_nid:
+                dst_params = params_dict.get(dst, {})
+                reindex_col = dst_params.get(opcodes.PARAM_REINDEX_COL, -1)
+                if reindex_col >= 0:
+                    return [reindex_col]
         return []
 
     def _resolve_primary_input_schema(self, program_id, fallback,
@@ -336,18 +372,29 @@ class ProgramCache(object):
     def _emit_node(self, nid, op, reg_id, node_params, in_regs,
                    cur_reg_file, out_reg_of, sources, trace_side_sources,
                    group_cols, view_family, view_id, out_schema, in_schema,
-                   program, state):
+                   program, state, str_params, source_reg_map=None):
         """Emit a single operator node. Returns instruction or None.
 
         state: mutable list [next_extra_reg, sink_reg_id, input_delta_reg_id].
         Mutates cur_reg_file, out_reg_of, and state in-place.
         REDUCE appends its reduce pre-instruction to program directly.
+        source_reg_map: dict {source_table_id: reg_id} for multi-input circuits.
         """
         if op == opcodes.OPCODE_SCAN_TRACE:
             table_id = sources.get(nid, 0)
             chunk_limit = node_params.get(opcodes.PARAM_CHUNK_LIMIT, 0)
 
             if table_id == 0:
+                # Check for multi-input: PARAM_JOIN_SOURCE_TABLE > 0
+                join_source_table = node_params.get(opcodes.PARAM_JOIN_SOURCE_TABLE, 0)
+                if join_source_table > 0:
+                    # Secondary input delta for multi-input circuits
+                    src_family = self.registry.get_by_id(join_source_table)
+                    reg = runtime.DeltaRegister(reg_id, src_family.schema)
+                    cur_reg_file.registers[reg_id] = reg
+                    if source_reg_map is not None:
+                        source_reg_map[join_source_table] = reg_id
+                    return None
                 # Primary input (delta): bind external batch at execution time
                 reg = runtime.DeltaRegister(reg_id, in_schema)
                 cur_reg_file.registers[reg_id] = reg
@@ -381,8 +428,15 @@ class ProgramCache(object):
                 while (opcodes.PARAM_EXPR_BASE + idx) in node_params:
                     code.append(r_int64(node_params[opcodes.PARAM_EXPR_BASE + idx]))
                     idx += 1
+                const_strings = []
+                if nid in str_params:
+                    node_str = str_params[nid]
+                    sidx = 0
+                    while (opcodes.PARAM_CONST_STR_BASE + sidx) in node_str:
+                        const_strings.append(node_str[opcodes.PARAM_CONST_STR_BASE + sidx])
+                        sidx += 1
                 from gnitz.dbsp.expr import ExprProgram, ExprPredicate
-                prog = ExprProgram(code, num_regs, result_reg)
+                prog = ExprProgram(code, num_regs, result_reg, const_strings if const_strings else None)
                 func = ExprPredicate(prog)
             else:
                 func = NULL_PREDICATE
@@ -391,18 +445,37 @@ class ProgramCache(object):
         elif op == opcodes.OPCODE_MAP:
             in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
             num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
+            has_expr_code = num_regs > 0 or opcodes.PARAM_EXPR_BASE in node_params
 
-            if num_regs > 0:
+            if has_expr_code:
                 # Expr-map mode (Phase 4: computed projections)
                 code = []
                 idx = 0
                 while (opcodes.PARAM_EXPR_BASE + idx) in node_params:
                     code.append(r_int64(node_params[opcodes.PARAM_EXPR_BASE + idx]))
                     idx += 1
+                const_strings = []
+                if nid in str_params:
+                    node_str = str_params[nid]
+                    sidx = 0
+                    while (opcodes.PARAM_CONST_STR_BASE + sidx) in node_str:
+                        const_strings.append(node_str[opcodes.PARAM_CONST_STR_BASE + sidx])
+                        sidx += 1
                 from gnitz.dbsp.expr import ExprProgram, ExprMapFunction
-                prog = ExprProgram(code, num_regs, 0)  # result_reg=0 unused
+                prog = ExprProgram(code, num_regs, 0, const_strings if const_strings else None)  # result_reg=0 unused
                 func = ExprMapFunction(prog)
-                node_schema = out_schema   # view's registered schema
+                reindex_check = node_params.get(opcodes.PARAM_REINDEX_COL, -1)
+                if reindex_check >= 0:
+                    # Reindex MAP: output = [U128 PK, all input cols as payload]
+                    from gnitz.core.types import TableSchema, ColumnDefinition
+                    in_cols = in_reg.table_schema.columns
+                    reindex_cols = newlist_hint(len(in_cols) + 1)
+                    reindex_cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="__pk"))
+                    for ci in range(len(in_cols)):
+                        reindex_cols.append(in_cols[ci])
+                    node_schema = TableSchema(reindex_cols, pk_index=0)
+                else:
+                    node_schema = out_schema   # view's registered schema
             elif opcodes.PARAM_PROJ_BASE in node_params:
                 src_indices = []
                 src_types = []
@@ -417,9 +490,10 @@ class ProgramCache(object):
             else:
                 func = NULL_PREDICATE
                 node_schema = in_reg.table_schema
+            reindex_col = node_params.get(opcodes.PARAM_REINDEX_COL, -1)
             out_reg = runtime.DeltaRegister(reg_id, node_schema)
             cur_reg_file.registers[reg_id] = out_reg
-            return instructions.map_op(in_reg, out_reg, func)
+            return instructions.map_op(in_reg, out_reg, func, reindex_col=reindex_col)
 
         elif op == opcodes.OPCODE_NEGATE:
             in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
@@ -532,6 +606,18 @@ class ProgramCache(object):
         elif op == opcodes.OPCODE_INTEGRATE:
             in_reg_id = in_regs[opcodes.PORT_IN]
             in_reg = cur_reg_file.registers[in_reg_id]
+            int_table_id = node_params.get(opcodes.PARAM_TABLE_ID, 0)
+            if int_table_id > 0 and int_table_id != view_id:
+                # Intermediate INTEGRATE: create child table + TraceRegister
+                int_table = view_family.store.create_child(
+                    "_int_%d_%d" % (view_id, nid), in_reg.table_schema
+                )
+                int_trace_reg = runtime.TraceRegister(
+                    reg_id, in_reg.table_schema,
+                    int_table.create_cursor(), int_table
+                )
+                cur_reg_file.registers[reg_id] = int_trace_reg
+                return instructions.integrate_op(in_reg, int_table)
             state[_ST_SINK_REG_ID] = in_reg_id
             return instructions.integrate_op(in_reg, None)
 
@@ -587,7 +673,7 @@ class ProgramCache(object):
 
         edges = self._load_edges(view_id)
         sources = self._load_sources(view_id)
-        params = self._load_params(view_id)
+        params, str_params = self._load_params(view_id)
         group_cols = self._load_group_cols(view_id)
 
         view_family = self.registry.get_by_id(view_id)
@@ -623,6 +709,20 @@ class ProgramCache(object):
                                                        sources,
                                                        trace_side_sources)
 
+        # 2b. Build join_shard_map: source_table_id → [reindex_col]
+        # For multi-input join circuits, this tells evaluate_dag which column
+        # to shard by when exchanging the raw source delta.
+        join_shard_map = {}
+        for _, src, dst, _port in edges:
+            if opcode_of.get(src, -1) == opcodes.OPCODE_SCAN_TRACE:
+                src_params = params.get(src, {})
+                source_tid = src_params.get(opcodes.PARAM_JOIN_SOURCE_TABLE, 0)
+                if source_tid > 0 and opcode_of.get(dst, -1) == opcodes.OPCODE_MAP:
+                    dst_params = params.get(dst, {})
+                    reindex_col = dst_params.get(opcodes.PARAM_REINDEX_COL, -1)
+                    if reindex_col >= 0:
+                        join_shard_map[source_tid] = [reindex_col]
+
         # 3. Register assignment
         out_reg_of = {}
         next_reg = 0
@@ -647,6 +747,7 @@ class ProgramCache(object):
         program = newlist_hint(len(ordered) + 1)
         # state: [next_extra_reg, sink_reg_id, input_delta_reg_id]
         state = [next_reg, -1, -1]
+        source_reg_map = {}
 
         for nid in ordered:
             op = opcode_of[nid]
@@ -737,7 +838,8 @@ class ProgramCache(object):
                         post_reg_file, post_out_reg_of, sources,
                         trace_side_sources, group_cols, view_family,
                         view_id, out_schema, exchange_in_schema,
-                        post_program, post_state,
+                        post_program, post_state, str_params,
+                        source_reg_map=None,
                     )
                     if pinstr is not None:
                         post_program.append(pinstr)
@@ -768,13 +870,24 @@ class ProgramCache(object):
                 nid, op, reg_id, node_params, in_regs,
                 reg_file, out_reg_of, sources, trace_side_sources,
                 group_cols, view_family, view_id, out_schema,
-                in_schema, program, state,
+                in_schema, program, state, str_params,
+                source_reg_map=source_reg_map,
             )
             if instr is not None: program.append(instr)
 
         program.append(instructions.halt_op())
         input_delta_reg_id = state[_ST_INPUT_DELTA_REG_ID]
         sink_reg_id = state[_ST_SINK_REG_ID]
+        # Multi-input circuits (joins): no single primary input, use first source register
+        if input_delta_reg_id == -1 and source_reg_map:
+            for _k in source_reg_map:
+                input_delta_reg_id = source_reg_map[_k]
+                break
         if input_delta_reg_id == -1 or sink_reg_id == -1: return None
 
-        return runtime.ExecutablePlan(program, reg_file, out_schema, in_reg_idx=input_delta_reg_id, out_reg_idx=sink_reg_id)
+        return runtime.ExecutablePlan(
+            program, reg_file, out_schema,
+            in_reg_idx=input_delta_reg_id, out_reg_idx=sink_reg_id,
+            source_reg_map=source_reg_map if source_reg_map else None,
+            join_shard_map=join_shard_map if join_shard_map else None,
+        )

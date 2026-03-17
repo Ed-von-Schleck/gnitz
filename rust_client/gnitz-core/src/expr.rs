@@ -36,24 +36,34 @@ const EXPR_EMIT:           u32 = 32;
 const EXPR_INT_TO_FLOAT:   u32 = 33;
 const EXPR_COPY_COL:       u32 = 34;
 
+// String comparison opcodes — must match gnitz/dbsp/expr.py
+const EXPR_STR_COL_EQ_CONST: u32 = 40;
+const EXPR_STR_COL_LT_CONST: u32 = 41;
+const EXPR_STR_COL_LE_CONST: u32 = 42;
+const EXPR_STR_COL_EQ_COL:   u32 = 43;
+const EXPR_STR_COL_LT_COL:   u32 = 44;
+const EXPR_STR_COL_LE_COL:   u32 = 45;
+
 /// A compiled expression program: a flat list of 4-word instructions
 /// (opcode, dst_reg, arg1, arg2) plus metadata for embedding in filter params.
 #[derive(Clone, Debug)]
 pub struct ExprProgram {
-    pub num_regs:   u32,
-    pub result_reg: u32,
-    pub code:       Vec<u32>,
+    pub num_regs:     u32,
+    pub result_reg:   u32,
+    pub code:         Vec<u32>,
+    pub const_strings: Vec<String>,
 }
 
 /// Builds an expression bytecode program with automatic register allocation.
 pub struct ExprBuilder {
-    code:     Vec<u32>,
-    next_reg: u32,
+    code:          Vec<u32>,
+    next_reg:      u32,
+    const_strings: Vec<String>,
 }
 
 impl ExprBuilder {
     pub fn new() -> Self {
-        ExprBuilder { code: Vec::new(), next_reg: 0 }
+        ExprBuilder { code: Vec::new(), next_reg: 0, const_strings: Vec::new() }
     }
 
     fn alloc_reg(&mut self) -> u32 {
@@ -284,11 +294,58 @@ impl ExprBuilder {
         self.emit(EXPR_COPY_COL, type_code, src_col_idx, payload_col_idx);
     }
 
+    // --- String constants ---
+
+    pub fn add_const_string(&mut self, s: String) -> u32 {
+        let idx = self.const_strings.len() as u32;
+        self.const_strings.push(s);
+        idx
+    }
+
+    // --- String comparisons ---
+
+    pub fn str_col_eq_const(&mut self, col_idx: usize, const_idx: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_STR_COL_EQ_CONST, dst, col_idx as u32, const_idx);
+        dst
+    }
+
+    pub fn str_col_lt_const(&mut self, col_idx: usize, const_idx: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_STR_COL_LT_CONST, dst, col_idx as u32, const_idx);
+        dst
+    }
+
+    pub fn str_col_le_const(&mut self, col_idx: usize, const_idx: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_STR_COL_LE_CONST, dst, col_idx as u32, const_idx);
+        dst
+    }
+
+    pub fn str_col_eq_col(&mut self, col_a: usize, col_b: usize) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_STR_COL_EQ_COL, dst, col_a as u32, col_b as u32);
+        dst
+    }
+
+    pub fn str_col_lt_col(&mut self, col_a: usize, col_b: usize) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_STR_COL_LT_COL, dst, col_a as u32, col_b as u32);
+        dst
+    }
+
+    pub fn str_col_le_col(&mut self, col_a: usize, col_b: usize) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_STR_COL_LE_COL, dst, col_a as u32, col_b as u32);
+        dst
+    }
+
     pub fn build(self, result_reg: u32) -> ExprProgram {
         ExprProgram {
-            num_regs:   self.next_reg,
+            num_regs:      self.next_reg,
             result_reg,
-            code:       self.code,
+            code:          self.code,
+            const_strings: self.const_strings,
         }
     }
 }

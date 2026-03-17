@@ -8,6 +8,7 @@ use crate::types::{
     PARAM_FUNC_ID, PARAM_AGG_FUNC_ID, PARAM_AGG_COL_IDX,
     PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_EXPR_NUM_REGS, PARAM_EXPR_RESULT_REG,
     PARAM_SHARD_COL_BASE, PARAM_GATHER_WORKER,
+    PARAM_REINDEX_COL, PARAM_JOIN_SOURCE_TABLE, PARAM_CONST_STR_BASE, PARAM_TABLE_ID,
 };
 use crate::expr::ExprProgram;
 
@@ -25,6 +26,7 @@ pub struct CircuitBuilder {
     sources:    Vec<(u64, u64)>,
     params:     Vec<(u64, u64, u64)>,
     group_cols: Vec<(u64, u64)>,
+    const_strings: Vec<(u64, u64, String)>,
 }
 
 impl CircuitBuilder {
@@ -39,6 +41,7 @@ impl CircuitBuilder {
             sources:    Vec::new(),
             params:     Vec::new(),
             group_cols: Vec::new(),
+            const_strings: Vec::new(),
         }
     }
 
@@ -81,6 +84,9 @@ impl CircuitBuilder {
             for (i, &word) in e.code.iter().enumerate() {
                 self.params.push((nid, PARAM_EXPR_BASE + i as u64, word as u64));
             }
+            for (i, s) in e.const_strings.iter().enumerate() {
+                self.const_strings.push((nid, PARAM_CONST_STR_BASE + i as u64, s.clone()));
+            }
         }
         nid
     }
@@ -94,6 +100,9 @@ impl CircuitBuilder {
         self.params.push((nid, PARAM_EXPR_NUM_REGS, program.num_regs as u64));
         for (i, &word) in program.code.iter().enumerate() {
             self.params.push((nid, PARAM_EXPR_BASE + i as u64, word as u64));
+        }
+        for (i, s) in program.const_strings.iter().enumerate() {
+            self.const_strings.push((nid, PARAM_CONST_STR_BASE + i as u64, s.clone()));
         }
         nid
     }
@@ -199,6 +208,55 @@ impl CircuitBuilder {
         nid
     }
 
+    /// Tagged primary input for join views.
+    /// Creates a SCAN_TRACE with source=0 and PARAM_JOIN_SOURCE_TABLE.
+    pub fn input_delta_tagged(&mut self, source_table_id: u64) -> NodeId {
+        let nid = self.alloc_node(OPCODE_SCAN_TRACE);
+        self.sources.push((nid, 0));
+        self.params.push((nid, PARAM_JOIN_SOURCE_TABLE, source_table_id));
+        nid
+    }
+
+    /// Map with PK reindexing (equijoin pre-indexing).
+    pub fn map_reindex(
+        &mut self, input: NodeId, reindex_col: usize, program: ExprProgram,
+    ) -> NodeId {
+        let nid = self.alloc_node(OPCODE_MAP);
+        self.connect(input, nid, PORT_IN);
+        self.params.push((nid, PARAM_FUNC_ID, 0));
+        self.params.push((nid, PARAM_REINDEX_COL, reindex_col as u64));
+        self.params.push((nid, PARAM_EXPR_NUM_REGS, program.num_regs as u64));
+        for (i, &word) in program.code.iter().enumerate() {
+            self.params.push((nid, PARAM_EXPR_BASE + i as u64, word as u64));
+        }
+        for (i, s) in program.const_strings.iter().enumerate() {
+            self.const_strings.push((nid, PARAM_CONST_STR_BASE + i as u64, s.clone()));
+        }
+        nid
+    }
+
+    /// Intermediate trace integration (equijoin accumulator).
+    pub fn integrate_trace(&mut self, input: NodeId) -> NodeId {
+        let nid = self.alloc_node(OPCODE_INTEGRATE);
+        self.connect(input, nid, PORT_IN);
+        self.params.push((nid, PARAM_TABLE_ID, 1));
+        nid
+    }
+
+    /// Join delta with a trace node (e.g. an INTEGRATE node providing a TraceRegister).
+    pub fn join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
+        let nid = self.alloc_node(OPCODE_JOIN_DELTA_TRACE);
+        self.connect(delta, nid, PORT_IN_A);
+        self.connect(trace_node, nid, PORT_TRACE);
+        nid
+    }
+
+    /// Add a string constant associated with a node (for expr programs).
+    pub fn add_const_string(&mut self, node_id: NodeId, index: u32, value: String) {
+        let slot = PARAM_CONST_STR_BASE + index as u64;
+        self.const_strings.push((node_id, slot, value));
+    }
+
     /// Integrate (sink) operator. Does NOT emit PARAM_TABLE_ID — evaluate_dag
     /// is the sole write path on the server side.
     pub fn sink(&mut self, input: NodeId, _view_id: u64) -> NodeId {
@@ -218,6 +276,12 @@ impl CircuitBuilder {
                 deps.push(table_id);
             }
         }
+        // Include join source tables as dependencies
+        for &(_, slot, value) in &self.params {
+            if slot == PARAM_JOIN_SOURCE_TABLE && value > 0 && !deps.contains(&value) {
+                deps.push(value);
+            }
+        }
         CircuitGraph {
             view_id:           self.view_id,
             primary_source_id: self.primary_source_id,
@@ -226,6 +290,7 @@ impl CircuitBuilder {
             sources:           self.sources,
             params:            self.params,
             group_cols:        self.group_cols,
+            const_strings:     self.const_strings,
             dependencies:      deps,
         }
     }

@@ -135,10 +135,10 @@ def test_bootstrap(base_dir):
         if c != 12:
             raise Exception("Expected 12 system tables, got %d" % c)
 
-        # 3. Check Columns (45 bootstrap columns expected)
+        # 3. Check Columns (46 bootstrap columns expected)
         c = count_records(engine.sys.columns)
-        if c != 45:
-            raise Exception("Expected 45 system columns, got %d" % c)
+        if c != 46:
+            raise Exception("Expected 46 system columns, got %d" % c)
 
         # 4. Check Sequences (4 expected)
         c = count_records(engine.sys.sequences)

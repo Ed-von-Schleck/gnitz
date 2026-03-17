@@ -3,6 +3,69 @@ use gnitz_core::ExprBuilder;
 use crate::error::GnitzSqlError;
 use crate::logical_plan::{BoundExpr, BinOp, UnaryOp};
 
+/// Try to compile a string comparison (col vs const, const vs col, col vs col).
+/// Returns Some((reg, false)) if this is a string comparison, None otherwise.
+fn try_compile_string_cmp(
+    left: &BoundExpr, op: &BinOp, right: &BoundExpr,
+    schema: &Schema, eb: &mut ExprBuilder,
+) -> Result<Option<(u32, bool)>, GnitzSqlError> {
+    // ColRef(string) op LitStr(s)
+    if let (BoundExpr::ColRef(idx), BoundExpr::LitStr(s)) = (left, right) {
+        if schema.columns[*idx].type_code == TypeCode::String {
+            let const_idx = eb.add_const_string(s.clone());
+            let reg = match op {
+                BinOp::Eq => eb.str_col_eq_const(*idx, const_idx),
+                BinOp::Ne => { let r = eb.str_col_eq_const(*idx, const_idx); eb.bool_not(r) },
+                BinOp::Lt => eb.str_col_lt_const(*idx, const_idx),
+                BinOp::Le => eb.str_col_le_const(*idx, const_idx),
+                BinOp::Gt => { let r = eb.str_col_le_const(*idx, const_idx); eb.bool_not(r) },
+                BinOp::Ge => { let r = eb.str_col_lt_const(*idx, const_idx); eb.bool_not(r) },
+                _ => return Err(GnitzSqlError::Unsupported(
+                    format!("operator {:?} not supported for strings", op)
+                )),
+            };
+            return Ok(Some((reg, false)));
+        }
+    }
+    // LitStr(s) op ColRef(string) — swap operand semantics
+    if let (BoundExpr::LitStr(s), BoundExpr::ColRef(idx)) = (left, right) {
+        if schema.columns[*idx].type_code == TypeCode::String {
+            let const_idx = eb.add_const_string(s.clone());
+            let reg = match op {
+                BinOp::Eq => eb.str_col_eq_const(*idx, const_idx),
+                BinOp::Ne => { let r = eb.str_col_eq_const(*idx, const_idx); eb.bool_not(r) },
+                BinOp::Gt => eb.str_col_lt_const(*idx, const_idx),  // 'A' > col ↔ col < 'A'
+                BinOp::Ge => eb.str_col_le_const(*idx, const_idx),
+                BinOp::Lt => { let r = eb.str_col_le_const(*idx, const_idx); eb.bool_not(r) },
+                BinOp::Le => { let r = eb.str_col_lt_const(*idx, const_idx); eb.bool_not(r) },
+                _ => return Err(GnitzSqlError::Unsupported(
+                    format!("operator {:?} not supported for strings", op)
+                )),
+            };
+            return Ok(Some((reg, false)));
+        }
+    }
+    // ColRef(string) op ColRef(string)
+    if let (BoundExpr::ColRef(a), BoundExpr::ColRef(b)) = (left, right) {
+        if schema.columns[*a].type_code == TypeCode::String
+           && schema.columns[*b].type_code == TypeCode::String {
+            let reg = match op {
+                BinOp::Eq => eb.str_col_eq_col(*a, *b),
+                BinOp::Ne => { let r = eb.str_col_eq_col(*a, *b); eb.bool_not(r) },
+                BinOp::Lt => eb.str_col_lt_col(*a, *b),
+                BinOp::Le => eb.str_col_le_col(*a, *b),
+                BinOp::Gt => eb.str_col_lt_col(*b, *a),
+                BinOp::Ge => eb.str_col_le_col(*b, *a),
+                _ => return Err(GnitzSqlError::Unsupported(
+                    format!("operator {:?} not supported for strings", op)
+                )),
+            };
+            return Ok(Some((reg, false)));
+        }
+    }
+    Ok(None)
+}
+
 /// Compile a BoundExpr to ExprBuilder opcodes.
 /// Returns `(result_reg, is_float)` where `is_float` indicates the register
 /// holds f64 bit-pattern rather than a plain i64.
@@ -31,6 +94,11 @@ pub fn compile_bound_expr(
             ))
         }
         BoundExpr::BinOp(left, op, right) => {
+            // String comparison detection
+            if let Some(result) = try_compile_string_cmp(left, op, right, schema, eb)? {
+                return Ok(result);
+            }
+
             let (mut l, l_float) = compile_bound_expr(left, schema, eb)?;
             let (mut r, r_float) = compile_bound_expr(right, schema, eb)?;
 

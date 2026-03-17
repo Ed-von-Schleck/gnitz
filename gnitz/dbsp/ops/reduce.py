@@ -288,7 +288,7 @@ def _extract_group_key(accessor, schema, col_indices):
     if len(col_indices) == 1:
         c_idx = col_indices[0]
         t = schema.columns[c_idx].field_type.code
-        if t == types.TYPE_U64.code:
+        if t == types.TYPE_U64.code or t == types.TYPE_I64.code:
             return r_uint128(accessor.get_int(c_idx))
         if t == types.TYPE_U128.code:
             return accessor.get_u128(c_idx)

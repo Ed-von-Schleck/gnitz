@@ -114,11 +114,13 @@ class ExecutablePlan(object):
     """
     _immutable_fields_ = [
         "program", "reg_file", "out_schema", "in_reg_idx", "out_reg_idx",
-        "exchange_post_plan", "exchange_shard_cols",
+        "exchange_post_plan", "exchange_shard_cols", "source_reg_map",
+        "join_shard_map",
     ]
 
     def __init__(self, program, reg_file, out_schema, in_reg_idx=0, out_reg_idx=1,
-                 exchange_post_plan=None, exchange_shard_cols=None):
+                 exchange_post_plan=None, exchange_shard_cols=None,
+                 source_reg_map=None, join_shard_map=None):
         self.program = program
         self.reg_file = reg_file
         self.out_schema = out_schema
@@ -127,11 +129,16 @@ class ExecutablePlan(object):
         self.context = ExecutionContext()
         self.exchange_post_plan = exchange_post_plan
         self.exchange_shard_cols = exchange_shard_cols
+        self.source_reg_map = source_reg_map   # dict {source_table_id: reg_id} or None
+        self.join_shard_map = join_shard_map    # dict {source_table_id: [col_idx]} or None
 
-    def execute_epoch(self, input_delta):
+    def execute_epoch(self, input_delta, source_id=0):
         """
         Executes the plan for one epoch/tick.
         Returns a cloned output ArenaZSetBatch if changes were produced, otherwise None.
+
+        source_id: when source_reg_map is set and source_id is in it,
+                   bind input_delta to that register instead of in_reg_idx.
         """
         from gnitz.vm.interpreter import run_vm
 
@@ -140,7 +147,10 @@ class ExecutablePlan(object):
         self.context.reset()
 
         # 2. Binding: Borrow the input batch into the designated register
-        in_reg = self.reg_file.get_register(self.in_reg_idx)
+        target_reg_idx = self.in_reg_idx
+        if self.source_reg_map is not None and source_id in self.source_reg_map:
+            target_reg_idx = self.source_reg_map[source_id]
+        in_reg = self.reg_file.get_register(target_reg_idx)
         assert in_reg.is_delta()
         in_reg.bind(input_delta)
 

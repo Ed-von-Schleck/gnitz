@@ -19,6 +19,7 @@
 
 ## 3. Type System & Containers
 *   **Lists:** Strictly homogeneous. `[1, "a"]` is illegal. Use a base class wrapper for heterogeneous data.
+    *   **Empty List Typing:** An empty list `[]` that no code path ever populates cannot be typed by the annotator (`SomeImpossibleValue`). If a list field may legitimately be empty, initialize it with a sentinel value of the correct type (e.g., `[""]` for `list[str]`).
     *   **Resizability Poisoning:** If a list is created in a way that RPython considers "fixed-size," the entire listdef is marked as **must-not-resize (mr)**. Any subsequent `.append()` call on *any* instance of that list type will fail with `ListChangeUnallowed`.
     *   **Fixed-Size Triggers:**
         *   Literals: `[]`, `[x, y]`.
@@ -42,6 +43,7 @@
 *   **Prebuilt Long Trap:** Do not use literals > `sys.maxint` (e.g., `0xFFFFFF...`). Python 2 creates a `long` object, which cannot be frozen into the binary. Use `r_uint(-1)` or bit-shifts.
 *   **FFI/Buffer Casting:** The `rffi.cast` utility cannot process `r_uint128` types directly. When writing 128-bit values to buffers or FFI pointers, you must explicitly truncate the value to `r_uint64` (e.g., `r_uint64(val)` or `r_uint64(val >> 64)`) before casting.
 *   **128-bit Struct Alignment Bug:** Storing `r_uint128` primitives directly in resizable lists **or as persistent object attributes** (e.g., `self._current_key = r_uint128(0)`) can lead to strict-aliasing violations, alignment issues, or `SIGSEGV` in the translated C code. The RPython C backend does not consistently guarantee 16-byte alignment for these fields inside generated C structs.
+*   **PK Type Promotion:** `TableSchema` requires PK columns to be `TYPE_U64` or `TYPE_U128`. User-declared `BIGINT` (I64) PKs are silently promoted to U64 during schema construction. Any code that hashes or compares column values across tables (e.g., exchange routing, join key matching) must treat I64 and U64 as equivalent for the same numerical value, or the hash will diverge.
 *   **Best Practice:** Always split `u128` values into two `u64` components (`lo` and `hi`) when storing them as object state or inside containers. Reconstruct the `u128` dynamically (e.g., `(r_uint128(hi) << 64) | r_uint128(lo)`) only at the exact point of computation, return, or comparison.
 
 ## 5. Memory & FFI

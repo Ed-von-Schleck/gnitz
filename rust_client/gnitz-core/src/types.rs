@@ -44,8 +44,12 @@ pub const PARAM_PROJ_BASE:       u64 = 32;
 pub const PARAM_EXPR_BASE:       u64 = 64;
 pub const PARAM_EXPR_NUM_REGS:   u64 = 7;
 pub const PARAM_EXPR_RESULT_REG: u64 = 8;
-pub const PARAM_SHARD_COL_BASE:  u64 = 128;
-pub const PARAM_GATHER_WORKER:   u64 = 9;
+pub const PARAM_REINDEX_COL:       u64 = 10;
+pub const PARAM_JOIN_SOURCE_TABLE: u64 = 11;
+pub const PARAM_SHARD_COL_BASE:    u64 = 128;
+pub const PARAM_CONST_STR_BASE:    u64 = 160;
+pub const PARAM_GATHER_WORKER:     u64 = 9;
+pub const PARAM_TABLE_ID:          u64 = 3;
 
 // --- Schema constructor functions ---
 
@@ -152,8 +156,9 @@ pub fn circuit_sources_schema() -> Schema {
 pub fn circuit_params_schema() -> Schema {
     Schema {
         columns: vec![
-            ColumnDef { name: "param_pk".into(), type_code: TypeCode::U128, is_nullable: false },
-            ColumnDef { name: "value".into(),    type_code: TypeCode::U64,  is_nullable: false },
+            ColumnDef { name: "param_pk".into(),  type_code: TypeCode::U128,   is_nullable: false },
+            ColumnDef { name: "value".into(),     type_code: TypeCode::U64,    is_nullable: false },
+            ColumnDef { name: "str_value".into(), type_code: TypeCode::String, is_nullable: true },
         ],
         pk_index: 0,
     }
@@ -176,10 +181,11 @@ pub fn circuit_group_cols_schema() -> Schema {
 pub struct CircuitGraph {
     pub view_id:           u64,
     pub primary_source_id: u64,
-    pub nodes:       Vec<(u64, u64)>,           // (node_id, opcode)
-    pub edges:       Vec<(u64, u64, u64, u64)>, // (edge_id, src, dst, port)
-    pub sources:     Vec<(u64, u64)>,           // (node_id, table_id)
-    pub params:      Vec<(u64, u64, u64)>,      // (node_id, slot, value)
-    pub group_cols:  Vec<(u64, u64)>,           // (node_id, col_idx)
-    pub dependencies: Vec<u64>,                 // dep table_ids
+    pub nodes:         Vec<(u64, u64)>,           // (node_id, opcode)
+    pub edges:         Vec<(u64, u64, u64, u64)>, // (edge_id, src, dst, port)
+    pub sources:       Vec<(u64, u64)>,           // (node_id, table_id)
+    pub params:        Vec<(u64, u64, u64)>,      // (node_id, slot, value)
+    pub group_cols:    Vec<(u64, u64)>,           // (node_id, col_idx)
+    pub const_strings: Vec<(u64, u64, String)>,   // (node_id, slot, string_value)
+    pub dependencies:  Vec<u64>,                  // dep table_ids
 }

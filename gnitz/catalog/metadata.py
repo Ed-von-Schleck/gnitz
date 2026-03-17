@@ -317,7 +317,7 @@ def bootstrap_system_tables(sys_tables, base_dir):
         cols_batch,
         sys_tables.columns.schema,
         sys.CircuitParamsTab.ID,
-        [("param_pk", TYPE_U128), ("value", TYPE_U64)],
+        [("param_pk", TYPE_U128), ("value", TYPE_U64), ("str_value", TYPE_STRING)],
     )
 
     sys.ColTab.append_system(

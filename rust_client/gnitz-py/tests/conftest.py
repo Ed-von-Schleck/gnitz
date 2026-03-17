@@ -18,7 +18,9 @@ def server():
     cmd = [binary, data_dir, sock_path]
     if w := os.environ.get("GNITZ_WORKERS"):
         cmd += [f"--workers={w}"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stderr_path = os.path.expanduser("~/git/gnitz/tmp/server_debug.log")
+    stderr_f = open(stderr_path, "w")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_f)
     for _ in range(100):
         if os.path.exists(sock_path):
             break
@@ -30,6 +32,7 @@ def server():
     yield sock_path
     proc.kill()
     proc.wait()
+    stderr_f.close()
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
