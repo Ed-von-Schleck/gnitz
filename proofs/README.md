@@ -49,6 +49,12 @@ proofs/
     serialize_offsets.py # Serialization two-phase offset consistency
     ipc_column_chain.py # IPC ZSet full column offset chain
     agg_spec_pack.py    # Aggregation spec packing roundtrip
+    ipc_flags.py        # IPC protocol flag bit-safety
+    opcode_slots.py     # Opcode distinctness and parameter slot non-overlap
+    type_constants.py   # Type code distinctness and size/alignment consistency
+    join_mapping.py     # CompositeAccessor column mapping correctness
+    group_index_key.py  # Reduce group index key composition roundtrip
+    schema_stride.py    # Memtable stride calculation correctness
 ```
 
 ## Prerequisites

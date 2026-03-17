@@ -40,7 +40,13 @@ PROOFS := \
 	reduce-sentinel:reduce_sentinel \
 	serialize-offsets:serialize_offsets \
 	ipc-column-chain:ipc_column_chain \
-	agg-spec-pack:agg_spec_pack
+	agg-spec-pack:agg_spec_pack \
+	ipc-flags:ipc_flags \
+	opcode-slots:opcode_slots \
+	type-constants:type_constants \
+	join-mapping:join_mapping \
+	group-index-key:group_index_key \
+	schema-stride:schema_stride
 
 TARGETS := $(foreach p,$(PROOFS),prove-$(firstword $(subst :, ,$(p))))
 
