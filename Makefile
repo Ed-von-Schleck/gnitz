@@ -46,7 +46,7 @@ ALL_DATA_DIRS := storage_test_data dbsp_test_data zstore_test_data \
 
 LOG_DIR := .test_logs
 
-.PHONY: all test clean server pytest pytest-only e2e $(RUN_TARGETS)
+.PHONY: all test clean server pytest pytest-only e2e prove $(RUN_TARGETS)
 
 all: test
 
@@ -154,3 +154,6 @@ pytest-only:
 
 e2e: gnitz-server-c
 	cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -v --tb=short
+
+prove:
+	$(MAKE) -C proofs prove
