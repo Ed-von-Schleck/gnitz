@@ -19,7 +19,11 @@ PROOFS := \
 	exchange-reduce:exchange_reduce \
 	shard-bounds:shard_bounds \
 	distinct-bounds:distinct_bounds \
-	ipc-wire:ipc_wire
+	ipc-wire:ipc_wire \
+	catalog-keys:catalog_keys \
+	pending-key:pending_key \
+	partition-assign:partition_assign \
+	weight-arith:weight_arith
 
 TARGETS := $(foreach p,$(PROOFS),prove-$(firstword $(subst :, ,$(p))))
 

@@ -28,6 +28,10 @@ proofs/
     shard_bounds.py     # shard region bounds check safety
     distinct_bounds.py  # distinct operator output bounds
     ipc_wire.py         # IPC wire format structural integrity
+    catalog_keys.py     # system table composite key pack/unpack
+    pending_key.py      # DAG pending key bijectivity
+    partition_assign.py # partition assignment coverage
+    weight_arith.py     # DBSP weight arithmetic
 ```
 
 ## Prerequisites
