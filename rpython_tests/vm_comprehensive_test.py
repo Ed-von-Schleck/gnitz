@@ -403,7 +403,7 @@ def test_reduce_sum(base_dir):
     # Output: (grp:U64, agg:I64)
     agg_func = functions.UniversalAccumulator(2, functions.AGG_SUM, types.TYPE_I64)
     group_by_cols = [1]
-    out_schema = types._build_reduce_output_schema(in_schema, group_by_cols, agg_func)
+    out_schema = types._build_reduce_output_schema(in_schema, group_by_cols, [agg_func])
     out_vm = out_schema
 
     # Trace tables for reduce state
@@ -428,7 +428,7 @@ def test_reduce_sum(base_dir):
             reg_file.registers[2],       # reg_trace_out
             reg_file.registers[3],       # reg_out
             group_by_cols,
-            agg_func,
+            [agg_func],
             out_schema,
         ),
         # Integrate delta into trace_in (for history) and trace_out (for agg state)
@@ -885,7 +885,7 @@ def test_reduce_min_nonlinear(base_dir):
     # AGG_MIN on col 1 (val) is non-linear, so is_linear() returns False
     agg_func = functions.UniversalAccumulator(1, functions.AGG_MIN, types.TYPE_I64)
     group_by_cols = [0]  # GROUP BY pk
-    out_schema = types._build_reduce_output_schema(in_schema, group_by_cols, agg_func)
+    out_schema = types._build_reduce_output_schema(in_schema, group_by_cols, [agg_func])
     out_vm = out_schema
 
     trace_in_dir = os.path.join(base_dir, "min_trace_in")
@@ -908,7 +908,7 @@ def test_reduce_min_nonlinear(base_dir):
             reg_file.registers[2],
             reg_file.registers[3],
             group_by_cols,
-            agg_func,
+            [agg_func],
             out_schema,
         ),
         instructions.integrate_op(reg_file.registers[0], trace_in_table),

@@ -392,7 +392,7 @@ impl PyGnitzClient {
 
     #[pyo3(signature = (schema_name, table_name, columns, pk_col_idx = 0, unique_pk = true))]
     pub fn create_table(
-        &self, py: Python<'_>,
+        &self, _py: Python<'_>,
         schema_name: &str, table_name: &str,
         columns: Bound<'_, PyList>,
         pk_col_idx: usize,

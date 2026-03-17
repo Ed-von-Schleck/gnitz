@@ -170,5 +170,10 @@ pub fn compile_bound_expr(
         BoundExpr::IsNotNull(idx) => {
             Ok((eb.is_not_null(*idx), false))
         }
+        BoundExpr::AggCall { .. } => {
+            Err(GnitzSqlError::Unsupported(
+                "aggregate function not allowed in expression context".to_string()
+            ))
+        }
     }
 }

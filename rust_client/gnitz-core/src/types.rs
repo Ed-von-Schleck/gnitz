@@ -50,6 +50,15 @@ pub const PARAM_SHARD_COL_BASE:    u64 = 128;
 pub const PARAM_CONST_STR_BASE:    u64 = 160;
 pub const PARAM_GATHER_WORKER:     u64 = 9;
 pub const PARAM_TABLE_ID:          u64 = 3;
+pub const PARAM_AGG_COUNT:         u64 = 12;
+pub const PARAM_AGG_SPEC_BASE:     u64 = 13;
+
+// Aggregate function IDs (must match gnitz/dbsp/functions.py)
+pub const AGG_COUNT:          u64 = 1;
+pub const AGG_SUM:            u64 = 2;
+pub const AGG_MIN:            u64 = 3;
+pub const AGG_MAX:            u64 = 4;
+pub const AGG_COUNT_NON_NULL: u64 = 5;
 
 // --- Schema constructor functions ---
 

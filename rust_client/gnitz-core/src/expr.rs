@@ -43,6 +43,7 @@ const EXPR_STR_COL_LE_CONST: u32 = 42;
 const EXPR_STR_COL_EQ_COL:   u32 = 43;
 const EXPR_STR_COL_LT_COL:   u32 = 44;
 const EXPR_STR_COL_LE_COL:   u32 = 45;
+const EXPR_EMIT_NULL:        u32 = 46;
 
 /// A compiled expression program: a flat list of 4-word instructions
 /// (opcode, dst_reg, arg1, arg2) plus metadata for embedding in filter params.
@@ -292,6 +293,10 @@ impl ExprBuilder {
 
     pub fn copy_col(&mut self, type_code: u32, src_col_idx: u32, payload_col_idx: u32) {
         self.emit(EXPR_COPY_COL, type_code, src_col_idx, payload_col_idx);
+    }
+
+    pub fn emit_null(&mut self, payload_col_idx: u32) {
+        self.emit(EXPR_EMIT_NULL, 0, payload_col_idx, 0);
     }
 
     // --- String constants ---

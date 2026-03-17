@@ -307,7 +307,7 @@ def test_reduce_op(base_dir):
     in_schema = _make_reduce_schema()
 
     sum_agg = functions.UniversalAccumulator(1, functions.AGG_SUM, types.TYPE_I64)
-    out_schema = types._build_reduce_output_schema(in_schema, [0], sum_agg)
+    out_schema = types._build_reduce_output_schema(in_schema, [0], [sum_agg])
 
     t_in_path = os.path.join(base_dir, "red_in")
     t_out_path = os.path.join(base_dir, "red_out")
@@ -327,7 +327,7 @@ def test_reduce_op(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], sum_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [sum_agg], out_schema)
         assert_equal_i64(r_int64(1), b_out.get_weight(0), "Reduce insertion failed")
         assert_equal_i64(r_int64(5), _find_insertion(b_out), "Sum error")
 
@@ -345,7 +345,7 @@ def test_reduce_op(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], sum_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [sum_agg], out_schema)
 
         with batch.ConsolidatedScope(b_out) as b_out_cons:
             assert_equal_i(2, b_out_cons.length(), "Incremental reduce failed to retract")
@@ -369,7 +369,7 @@ def test_reduce_min_retraction(base_dir):
     log("[DBSP] Testing Reduce MIN retraction...")
     in_schema = _make_reduce_schema()
     min_agg = functions.UniversalAccumulator(1, functions.AGG_MIN, types.TYPE_I64)
-    out_schema = types._build_reduce_output_schema(in_schema, [0], min_agg)
+    out_schema = types._build_reduce_output_schema(in_schema, [0], [min_agg])
 
     t_in_path = os.path.join(base_dir, "min_in")
     t_out_path = os.path.join(base_dir, "min_out")
@@ -390,7 +390,7 @@ def test_reduce_min_retraction(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], min_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [min_agg], out_schema)
         assert_equal_i64(r_int64(5), _find_insertion(b_out), "Initial MIN should be 5")
 
         trace_in.ingest_batch(b_in)
@@ -407,7 +407,7 @@ def test_reduce_min_retraction(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], min_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [min_agg], out_schema)
         assert_equal_i64(r_int64(10), _find_insertion(b_out), "MIN after retraction should be 10")
 
         c_in.close()
@@ -429,7 +429,7 @@ def test_reduce_max_retraction(base_dir):
     log("[DBSP] Testing Reduce MAX retraction...")
     in_schema = _make_reduce_schema()
     max_agg = functions.UniversalAccumulator(1, functions.AGG_MAX, types.TYPE_I64)
-    out_schema = types._build_reduce_output_schema(in_schema, [0], max_agg)
+    out_schema = types._build_reduce_output_schema(in_schema, [0], [max_agg])
 
     t_in_path = os.path.join(base_dir, "max_in")
     t_out_path = os.path.join(base_dir, "max_out")
@@ -450,7 +450,7 @@ def test_reduce_max_retraction(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], max_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [max_agg], out_schema)
         assert_equal_i64(r_int64(100), _find_insertion(b_out), "Initial MAX should be 100")
 
         trace_in.ingest_batch(b_in)
@@ -467,7 +467,7 @@ def test_reduce_max_retraction(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], max_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [max_agg], out_schema)
         assert_equal_i64(r_int64(5), _find_insertion(b_out), "MAX after retraction should be 5")
 
         c_in.close()
@@ -487,7 +487,7 @@ def test_reduce_group_becomes_empty(base_dir):
     log("[DBSP] Testing Reduce group becomes empty...")
     in_schema = _make_reduce_schema()
     min_agg = functions.UniversalAccumulator(1, functions.AGG_MIN, types.TYPE_I64)
-    out_schema = types._build_reduce_output_schema(in_schema, [0], min_agg)
+    out_schema = types._build_reduce_output_schema(in_schema, [0], [min_agg])
 
     t_in_path = os.path.join(base_dir, "empty_in")
     t_out_path = os.path.join(base_dir, "empty_out")
@@ -505,7 +505,7 @@ def test_reduce_group_becomes_empty(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], min_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [min_agg], out_schema)
         assert_equal_i64(r_int64(42), _find_insertion(b_out), "Initial MIN should be 42")
 
         trace_in.ingest_batch(b_in)
@@ -520,7 +520,7 @@ def test_reduce_group_becomes_empty(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], min_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [min_agg], out_schema)
 
         # Output should have exactly one record: the retraction (w=-1)
         assert_equal_i(1, b_out.length(), "Empty group should emit only retraction")
@@ -542,7 +542,7 @@ def test_reduce_multiple_groups(base_dir):
     log("[DBSP] Testing Reduce multiple groups...")
     in_schema = _make_reduce_schema()
     sum_agg = functions.UniversalAccumulator(1, functions.AGG_SUM, types.TYPE_I64)
-    out_schema = types._build_reduce_output_schema(in_schema, [0], sum_agg)
+    out_schema = types._build_reduce_output_schema(in_schema, [0], [sum_agg])
 
     t_in_path = os.path.join(base_dir, "multi_in")
     t_out_path = os.path.join(base_dir, "multi_out")
@@ -563,7 +563,7 @@ def test_reduce_multiple_groups(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], sum_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [sum_agg], out_schema)
 
         assert_equal_i(2, b_out.length(), "Should have 2 group outputs")
 
@@ -597,7 +597,7 @@ def test_reduce_count(base_dir):
     log("[DBSP] Testing Reduce COUNT...")
     in_schema = _make_reduce_schema()
     count_agg = functions.UniversalAccumulator(1, functions.AGG_COUNT, types.TYPE_I64)
-    out_schema = types._build_reduce_output_schema(in_schema, [0], count_agg)
+    out_schema = types._build_reduce_output_schema(in_schema, [0], [count_agg])
 
     t_in_path = os.path.join(base_dir, "cnt_in")
     t_out_path = os.path.join(base_dir, "cnt_out")
@@ -618,7 +618,7 @@ def test_reduce_count(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], count_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [count_agg], out_schema)
         assert_equal_i64(r_int64(3), _find_insertion(b_out), "Initial COUNT should be 3")
 
         trace_in.ingest_batch(b_in)
@@ -634,7 +634,7 @@ def test_reduce_count(base_dir):
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
 
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], count_agg, out_schema)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [count_agg], out_schema)
         assert_equal_i64(r_int64(2), _find_insertion(b_out), "COUNT after retraction should be 2")
 
         c_in.close()
@@ -1025,7 +1025,7 @@ def test_reduce_group_idx(base_dir):
     in_schema = types.TableSchema(cols, pk_index=0)
 
     min_agg = functions.UniversalAccumulator(2, functions.AGG_MIN, types.TYPE_I64)
-    out_schema = types._build_reduce_output_schema(in_schema, [1], min_agg)
+    out_schema = types._build_reduce_output_schema(in_schema, [1], [min_agg])
 
     t_in_path = os.path.join(base_dir, "gi_trace_in")
     t_out_path = os.path.join(base_dir, "gi_trace_out")
@@ -1057,7 +1057,7 @@ def test_reduce_group_idx(base_dir):
 
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [1], min_agg, out_schema, gi)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [1], [min_agg], out_schema, gi)
         c_in.close()
         c_out.close()
 
@@ -1088,7 +1088,7 @@ def test_reduce_group_idx(base_dir):
 
         c_in = trace_in.create_cursor()
         c_out = trace_out.create_cursor()
-        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [1], min_agg, out_schema, gi)
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [1], [min_agg], out_schema, gi)
         c_in.close()
         c_out.close()
 
@@ -1105,6 +1105,268 @@ def test_reduce_group_idx(base_dir):
         trace_in.close()
         trace_out.close()
         gi_table.close()
+
+
+def test_reduce_multi_agg(base_dir):
+    """Multi-aggregate: COUNT(*) + SUM(val) on same group."""
+    log("[DBSP] Testing Reduce multi-agg (COUNT + SUM)...")
+    in_schema = _make_reduce_schema()
+
+    count_agg = functions.UniversalAccumulator(1, functions.AGG_COUNT, types.TYPE_I64)
+    sum_agg = functions.UniversalAccumulator(1, functions.AGG_SUM, types.TYPE_I64)
+    agg_funcs = [count_agg, sum_agg]
+    out_schema = types._build_reduce_output_schema(in_schema, [0], agg_funcs)
+
+    t_in_path = os.path.join(base_dir, "multi_in")
+    t_out_path = os.path.join(base_dir, "multi_out")
+    trace_in = EphemeralTable(t_in_path, "in", in_schema)
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+        # grp=10: val=5, val=10, val=15 => COUNT=3, SUM=30
+        _add_row(rb, pk=1, grp=10, val=5, weight=1)
+        _add_row(rb, pk=2, grp=10, val=10, weight=1)
+        _add_row(rb, pk=3, grp=10, val=15, weight=1)
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], agg_funcs, out_schema)
+
+        # Find the +1 weight row
+        found = False
+        for i in range(b_out.length()):
+            if b_out.get_weight(i) == r_int64(1):
+                acc = b_out.get_accessor(i)
+                count_val = acc.get_int_signed(1)
+                sum_val = acc.get_int_signed(2)
+                assert_equal_i64(r_int64(3), count_val, "multi-agg COUNT")
+                assert_equal_i64(r_int64(30), sum_val, "multi-agg SUM")
+                found = True
+        assert_true(found, "multi-agg: no +1 weight row found")
+
+        c_in.close()
+        c_out.close()
+    finally:
+        b_in.free()
+        b_out.free()
+        trace_in.close()
+        trace_out.close()
+    log("  PASSED")
+
+
+def test_reduce_multi_agg_linear_merge(base_dir):
+    """Multi-agg linear merge: incremental insert with COUNT + SUM."""
+    log("[DBSP] Testing Reduce multi-agg linear merge...")
+    in_schema = _make_reduce_schema()
+
+    count_agg = functions.UniversalAccumulator(1, functions.AGG_COUNT, types.TYPE_I64)
+    sum_agg = functions.UniversalAccumulator(1, functions.AGG_SUM, types.TYPE_I64)
+    agg_funcs = [count_agg, sum_agg]
+    out_schema = types._build_reduce_output_schema(in_schema, [0], agg_funcs)
+
+    t_in_path = os.path.join(base_dir, "mlm_in")
+    t_out_path = os.path.join(base_dir, "mlm_out")
+    trace_in = EphemeralTable(t_in_path, "in", in_schema)
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+
+        # Tick 1: grp=10, val=5
+        _add_row(rb, pk=1, grp=10, val=5, weight=1)
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], agg_funcs, out_schema)
+
+        found = False
+        for i in range(b_out.length()):
+            if b_out.get_weight(i) == r_int64(1):
+                acc = b_out.get_accessor(i)
+                assert_equal_i64(r_int64(1), acc.get_int_signed(1), "T1 COUNT")
+                assert_equal_i64(r_int64(5), acc.get_int_signed(2), "T1 SUM")
+                found = True
+        assert_true(found, "T1: no +1 weight row")
+
+        trace_in.ingest_batch(b_in)
+        trace_out.ingest_batch(b_out)
+        c_in.close()
+        c_out.close()
+
+        # Tick 2: add val=10 to same group => COUNT=2, SUM=15
+        b_in.clear()
+        b_out.clear()
+        count_agg.reset()
+        sum_agg.reset()
+        _add_row(rb, pk=2, grp=10, val=10, weight=1)
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], agg_funcs, out_schema)
+
+        # Should have retraction (-1 for old) and insertion (+1 for new)
+        assert_equal_i(2, b_out.length(), "T2 should have 2 rows (retraction + insertion)")
+        found_new = False
+        for i in range(b_out.length()):
+            if b_out.get_weight(i) == r_int64(1):
+                acc = b_out.get_accessor(i)
+                assert_equal_i64(r_int64(2), acc.get_int_signed(1), "T2 COUNT")
+                assert_equal_i64(r_int64(15), acc.get_int_signed(2), "T2 SUM")
+                found_new = True
+        assert_true(found_new, "T2: no +1 weight row")
+
+        c_in.close()
+        c_out.close()
+    finally:
+        b_in.free()
+        b_out.free()
+        trace_in.close()
+        trace_out.close()
+    log("  PASSED")
+
+
+def test_reduce_multi_agg_nonlinear(base_dir):
+    """Multi-agg non-linear: COUNT(*) + MIN(val) triggers replay path."""
+    log("[DBSP] Testing Reduce multi-agg non-linear (COUNT + MIN)...")
+    in_schema = _make_reduce_schema()
+
+    count_agg = functions.UniversalAccumulator(1, functions.AGG_COUNT, types.TYPE_I64)
+    min_agg = functions.UniversalAccumulator(1, functions.AGG_MIN, types.TYPE_I64)
+    agg_funcs = [count_agg, min_agg]
+    out_schema = types._build_reduce_output_schema(in_schema, [0], agg_funcs)
+
+    t_in_path = os.path.join(base_dir, "mnl_in")
+    t_out_path = os.path.join(base_dir, "mnl_out")
+    trace_in = EphemeralTable(t_in_path, "in", in_schema)
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+
+        # Tick 1: grp=10, val=5 and val=10 => COUNT=2, MIN=5
+        _add_row(rb, pk=1, grp=10, val=5, weight=1)
+        _add_row(rb, pk=2, grp=10, val=10, weight=1)
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], agg_funcs, out_schema)
+
+        found = False
+        for i in range(b_out.length()):
+            if b_out.get_weight(i) == r_int64(1):
+                acc = b_out.get_accessor(i)
+                assert_equal_i64(r_int64(2), acc.get_int_signed(1), "T1 COUNT")
+                assert_equal_i64(r_int64(5), acc.get_int_signed(2), "T1 MIN")
+                found = True
+        assert_true(found, "T1: no +1 weight row")
+
+        trace_in.ingest_batch(b_in)
+        trace_out.ingest_batch(b_out)
+        c_in.close()
+        c_out.close()
+
+        # Tick 2: retract val=5 => COUNT=1, MIN=10 (replay path for MIN)
+        b_in.clear()
+        b_out.clear()
+        count_agg.reset()
+        min_agg.reset()
+        _add_row(rb, pk=1, grp=10, val=5, weight=-1)
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], agg_funcs, out_schema)
+
+        # Find the new insertion
+        found_new = False
+        for i in range(b_out.length()):
+            if b_out.get_weight(i) == r_int64(1):
+                acc = b_out.get_accessor(i)
+                assert_equal_i64(r_int64(1), acc.get_int_signed(1), "T2 COUNT")
+                assert_equal_i64(r_int64(10), acc.get_int_signed(2), "T2 MIN")
+                found_new = True
+        assert_true(found_new, "T2: no +1 weight row after retraction")
+
+        c_in.close()
+        c_out.close()
+    finally:
+        b_in.free()
+        b_out.free()
+        trace_in.close()
+        trace_out.close()
+    log("  PASSED")
+
+
+def test_count_non_null(base_dir):
+    """AGG_COUNT_NON_NULL skips NULLs."""
+    log("[DBSP] Testing COUNT_NON_NULL with nullable column...")
+
+    cols = newlist_hint(3)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="grp"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val", is_nullable=True))
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    in_schema = types.TableSchema(cols, 2)
+
+    count_nn = functions.UniversalAccumulator(1, functions.AGG_COUNT_NON_NULL, types.TYPE_I64)
+    out_schema = types._build_reduce_output_schema(in_schema, [0], [count_nn])
+
+    t_in_path = os.path.join(base_dir, "cnn_in")
+    t_out_path = os.path.join(base_dir, "cnn_out")
+    trace_in = EphemeralTable(t_in_path, "in", in_schema)
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+
+        # grp=10: val=5 (non-null), val=NULL, val=15 (non-null) => COUNT_NON_NULL=2
+        rb.begin(r_uint128(1), r_int64(1))
+        rb.put_int(r_int64(10))  # grp
+        rb.put_int(r_int64(5))   # val (non-null)
+        rb.commit()
+
+        rb.begin(r_uint128(2), r_int64(1))
+        rb.put_int(r_int64(10))  # grp
+        rb.put_null()             # val (NULL)
+        rb.commit()
+
+        rb.begin(r_uint128(3), r_int64(1))
+        rb.put_int(r_int64(10))  # grp
+        rb.put_int(r_int64(15))  # val (non-null)
+        rb.commit()
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, c_in, c_out, b_out, [0], [count_nn], out_schema)
+
+        found = False
+        for i in range(b_out.length()):
+            if b_out.get_weight(i) == r_int64(1):
+                acc = b_out.get_accessor(i)
+                assert_equal_i64(r_int64(2), acc.get_int_signed(1), "COUNT_NON_NULL")
+                found = True
+        assert_true(found, "COUNT_NON_NULL: no +1 weight row")
+
+        c_in.close()
+        c_out.close()
+    finally:
+        b_in.free()
+        b_out.free()
+        trace_in.close()
+        trace_out.close()
+    log("  PASSED")
 
 
 # ------------------------------------------------------------------------------
@@ -1135,6 +1397,10 @@ def entry_point(argv):
         test_anti_semi_join_complement(base_dir)
         test_source_ops(base_dir)
         test_reduce_group_idx(base_dir)
+        test_reduce_multi_agg(base_dir)
+        test_reduce_multi_agg_linear_merge(base_dir)
+        test_reduce_multi_agg_nonlinear(base_dir)
+        test_count_non_null(base_dir)
         log("\nALL DBSP TESTS PASSED")
     except Exception as e:
         os.write(2, "FAILURE\n")

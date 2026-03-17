@@ -539,15 +539,29 @@ class ProgramCache(object):
 
         elif op == opcodes.OPCODE_REDUCE:
             in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN_REDUCE]]
-            agg_func_id = node_params.get(opcodes.PARAM_AGG_FUNC_ID, 0)
-            agg_col_idx = node_params.get(opcodes.PARAM_AGG_COL_IDX, 0)
-            if agg_func_id > 0:
-                col_type = in_reg.table_schema.columns[agg_col_idx].field_type
-                agg_func = functions.UniversalAccumulator(agg_col_idx, agg_func_id, col_type)
+            # Multi-agg path: PARAM_AGG_COUNT > 0
+            agg_count = node_params.get(opcodes.PARAM_AGG_COUNT, 0)
+            if agg_count > 0:
+                agg_funcs = newlist_hint(agg_count)
+                for ai in range(agg_count):
+                    packed = node_params.get(opcodes.PARAM_AGG_SPEC_BASE + ai, 0)
+                    func_id = packed >> 32
+                    col_idx = packed & 0xFFFFFFFF
+                    col_type = in_reg.table_schema.columns[col_idx].field_type
+                    agg_funcs.append(functions.UniversalAccumulator(col_idx, func_id, col_type))
             else:
-                agg_func = NULL_AGGREGATE
+                # Backward compat: single-agg path
+                agg_func_id = node_params.get(opcodes.PARAM_AGG_FUNC_ID, 0)
+                agg_col_idx = node_params.get(opcodes.PARAM_AGG_COL_IDX, 0)
+                if agg_func_id > 0:
+                    col_type = in_reg.table_schema.columns[agg_col_idx].field_type
+                    agg_funcs = newlist_hint(1)
+                    agg_funcs.append(functions.UniversalAccumulator(agg_col_idx, agg_func_id, col_type))
+                else:
+                    agg_funcs = newlist_hint(1)
+                    agg_funcs.append(NULL_AGGREGATE)
             gcols = group_cols.get(nid, [])
-            reduce_out_schema = _build_reduce_output_schema(in_reg.table_schema, gcols, agg_func)
+            reduce_out_schema = _build_reduce_output_schema(in_reg.table_schema, gcols, agg_funcs)
             trace_table = view_family.store.create_child("_reduce_%d_%d" % (view_id, nid), reduce_out_schema)
             tr_out_reg = runtime.TraceRegister(reg_id, reduce_out_schema, trace_table.create_cursor(), trace_table)
             cur_reg_file.registers[reg_id] = tr_out_reg
@@ -558,11 +572,14 @@ class ProgramCache(object):
             out_reg_of[nid] = out_delta_id
             tr_in_reg = None
             tr_in_table = None
+            all_linear = True
+            for af in agg_funcs:
+                if not af.is_linear():
+                    all_linear = False
+                    break
             if opcodes.PORT_TRACE_IN in in_regs:
                 tr_in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE_IN]]
-            elif not agg_func.is_linear():
-                # Auto-create intermediate trace for reduce's input history.
-                # Non-linear aggregates (MIN/MAX) replay this trace on retraction.
+            elif not all_linear:
                 tr_in_table = view_family.store.create_child(
                     "_reduce_in_%d_%d" % (view_id, nid), in_reg.table_schema
                 )
@@ -573,9 +590,6 @@ class ProgramCache(object):
                     tr_in_table.create_cursor(), tr_in_table
                 )
                 cur_reg_file.registers[tr_in_reg_id] = tr_in_reg
-            # Build a secondary group index for O(log N + k) group lookup.
-            # Enabled only when: exactly one group column AND its type is a ≤64-bit int
-            # (not U128/STRING/FLOAT). All other cases fall back to O(N) full trace scan.
             grp_idx = None
             if tr_in_table is not None and len(gcols) == 1:
                 gc_col_idx = gcols[0]
@@ -594,7 +608,7 @@ class ProgramCache(object):
 
             reduce_instr = instructions.reduce_op(
                 in_reg, tr_in_reg, tr_out_reg, out_delta_reg,
-                gcols, agg_func, reduce_out_schema,
+                gcols, agg_funcs, reduce_out_schema,
                 trace_in_group_idx=grp_idx,
             )
             program.append(reduce_instr)

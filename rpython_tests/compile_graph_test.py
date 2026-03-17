@@ -900,6 +900,62 @@ def test_reduce_sum(base_dir):
     log("  PASSED")
 
 
+def test_reduce_multi_agg(base_dir):
+    """Multi-agg reduce via PARAM_AGG_COUNT: COUNT + SUM compiled from graph."""
+    log("[COMPILE] Testing multi-agg reduce (COUNT + SUM)...")
+    db = engine.open_engine(base_dir)
+
+    db.create_schema("test")
+    # Input: pk(U64), val(I64)
+    table_cols = _make_table_cols_i64(["val"])
+    table = db.create_table("test.src", table_cols, 0)
+
+    from gnitz.dbsp.functions import AGG_COUNT, AGG_SUM
+    builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
+    src = builder.input_delta()
+    # Multi-agg: COUNT(col=1), SUM(col=1)
+    r = builder.reduce_multi(src, agg_specs=[(AGG_COUNT, 1), (AGG_SUM, 1)], group_by_cols=[0])
+    builder.sink(r, target_table_id=0)
+    # Output: pk(U64), count(I64), sum(I64)
+    out_cols = [("pk", types.TYPE_U64.code), ("count_val", types.TYPE_I64.code),
+                ("sum_val", types.TYPE_I64.code)]
+    graph = builder.build(out_cols)
+    db.create_view("test.v_multi", graph, "")
+
+    view = db.get_table("test.v_multi")
+    plan = db.program_cache.get_program(view.table_id)
+    assert_true(plan is not None, "multi_agg plan is None")
+
+    in_batch = batch.ArenaZSetBatch(table.schema)
+    rb = RowBuilder(table.schema, in_batch)
+    _add_int_row(rb, 1, [10])
+    _add_int_row(rb, 1, [20])
+    _add_int_row(rb, 1, [30])
+
+    pre_result = plan.execute_epoch(in_batch)
+    in_batch.free()
+    assert_true(pre_result is not None, "multi_agg pre-plan produced None")
+    if plan.exchange_post_plan is not None:
+        out = plan.exchange_post_plan.execute_epoch(pre_result)
+        pre_result.free()
+    else:
+        out = pre_result
+    assert_true(out is not None, "multi_agg produced None")
+    assert_equal_i(1, out.length(), "multi_agg row count")
+    acc = out.get_accessor(0)
+    count_val = acc.get_int_signed(1)
+    sum_val = acc.get_int_signed(2)
+    assert_equal_i64(r_int64(3), count_val, "multi_agg COUNT")
+    assert_equal_i64(r_int64(60), sum_val, "multi_agg SUM")
+    out.free()
+
+    db.drop_view("test.v_multi")
+    db.drop_table("test.src")
+    db.drop_schema("test")
+    db.close()
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -971,6 +1027,10 @@ def entry_point(argv):
         ensure_dir(base_dir)
 
         test_reduce_sum(base_dir)
+        cleanup(base_dir)
+        ensure_dir(base_dir)
+
+        test_reduce_multi_agg(base_dir)
 
         log("\nALL COMPILE_GRAPH TESTS PASSED")
     except Exception as e:

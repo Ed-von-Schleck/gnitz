@@ -75,6 +75,9 @@ EXPR_STR_COL_EQ_COL   = 43   # dst = (col[a1] == col[a2]) ? 1 : 0
 EXPR_STR_COL_LT_COL   = 44   # dst = (col[a1] <  col[a2]) ? 1 : 0
 EXPR_STR_COL_LE_COL   = 45   # dst = (col[a1] <= col[a2]) ? 1 : 0
 
+# Null emission (Phase 6: LEFT JOIN null-fill)
+EXPR_EMIT_NULL = 46   # builder.append_null(a1)  — a1 = payload_col_idx
+
 
 # ---------------------------------------------------------------------------
 # ExprProgram — immutable bytecode for JIT
@@ -492,6 +495,10 @@ def eval_expr_map(program, accessor, builder):
             else:
                 builder.append_int(accessor.get_int_signed(a1))
 
+        elif op == EXPR_EMIT_NULL:
+            # a1 = payload_col_idx
+            builder.append_null(a1)
+
         elif op == EXPR_STR_COL_EQ_CONST:
             null[dst] = accessor.is_null(a1)
             if not null[dst]:
@@ -789,6 +796,9 @@ class ExprBuilder(object):
 
     def copy_col(self, type_code, src_col_idx, payload_col_idx):
         self._emit(EXPR_COPY_COL, type_code, src_col_idx, payload_col_idx)
+
+    def emit_null(self, payload_col_idx):
+        self._emit(EXPR_EMIT_NULL, 0, payload_col_idx, 0)
 
     # --- String comparison ---
 

@@ -1,6 +1,6 @@
 use crate::error::ProtocolError;
 use crate::header::{IPC_STRING_STRIDE, IPC_NULL_STRING_OFFSET, META_FLAG_NULLABLE, META_FLAG_IS_PK, ALIGNMENT};
-use crate::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, meta_schema};
+use crate::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 
 pub fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)

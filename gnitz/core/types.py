@@ -220,16 +220,18 @@ def _build_map_output_schema(input_schema, src_indices):
     return TableSchema(cols, pk_index=0)
 
 
-def _build_reduce_output_schema(input_schema, group_by_cols, agg_func):
+def _build_reduce_output_schema(input_schema, group_by_cols, agg_funcs):
     """
     Constructs the output schema for a REDUCE operator.
+
+    agg_funcs: list of AggregateFunction (one per aggregate column).
 
     Rules:
     - If grouping by a single U64 or U128 column, that column is the PK.
     - Otherwise, a synthetic U128 PK is created (to hold a hash of group columns).
-    - All group columns and the aggregate result are stored in the payload.
+    - All group columns and all aggregate results are stored in the payload.
     """
-    # Check if we can use a "Natural" PK (single int col)
+    num_aggs = len(agg_funcs)
     use_natural_pk = False
     if len(group_by_cols) == 1:
         col_idx = group_by_cols[0]
@@ -239,19 +241,21 @@ def _build_reduce_output_schema(input_schema, group_by_cols, agg_func):
 
     if use_natural_pk:
         # Col 0: The Group Column (PK)
-        # Col 1: The Aggregate result
-        new_cols = newlist_hint(2)
+        # Col 1..N: Aggregate results
+        new_cols = newlist_hint(1 + num_aggs)
         new_cols.append(input_schema.columns[group_by_cols[0]])
-        new_cols.append(ColumnDefinition(agg_func.output_column_type(), name="agg"))
+        for af in agg_funcs:
+            new_cols.append(ColumnDefinition(af.output_column_type(), name="agg"))
         return TableSchema(new_cols, pk_index=0)
     else:
         # Synthetic PK required (e.g. GROUP BY string_col or multiple cols)
         # Col 0: Synthetic U128 Hash (PK)
-        # Col 1..N: Group Columns (Payload)
-        # Col N+1: Aggregate Result (Payload)
-        new_cols = newlist_hint(len(group_by_cols) + 2)
+        # Col 1..K: Group Columns (Payload)
+        # Col K+1..K+N: Aggregate Results (Payload)
+        new_cols = newlist_hint(len(group_by_cols) + 1 + num_aggs)
         new_cols.append(ColumnDefinition(TYPE_U128, name="_group_hash"))
         for idx in group_by_cols:
             new_cols.append(input_schema.columns[idx])
-        new_cols.append(ColumnDefinition(agg_func.output_column_type(), name="agg"))
+        for af in agg_funcs:
+            new_cols.append(ColumnDefinition(af.output_column_type(), name="agg"))
         return TableSchema(new_cols, pk_index=0)

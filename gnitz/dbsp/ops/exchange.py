@@ -3,7 +3,8 @@
 # Column-based hash for repartitioning batches across workers.
 
 from rpython.rlib.rarithmetic import r_uint64, intmask
-from gnitz.core import xxh, types
+from rpython.rtyper.lltypesystem import rffi, lltype
+from gnitz.core import xxh, types, strings
 from gnitz.core.batch import ArenaZSetBatch
 from gnitz.storage.partitioned_table import _partition_for_key
 
@@ -30,6 +31,32 @@ def _read_col_or_pk(batch, row_idx, col_idx):
     return r_uint64(batch._read_col_int(row_idx, col_idx))
 
 
+def _read_col_u128_parts(batch, row_idx, col_idx):
+    """Read U128 column as (lo, hi) u64 pair for partition routing."""
+    ptr = rffi.ptradd(batch.col_bufs[col_idx].base_ptr,
+                       row_idx * batch.col_strides[col_idx])
+    lo = r_uint64(rffi.cast(rffi.ULONGLONGP, ptr)[0])
+    hi = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0])
+    return lo, hi
+
+
+def _hash_string_col(batch, row_idx, col_idx):
+    """Hash string column content via xxh, matching reduce.py._extract_group_key."""
+    ptr = rffi.ptradd(batch.col_bufs[col_idx].base_ptr,
+                       row_idx * batch.col_strides[col_idx])
+    u32_ptr = rffi.cast(rffi.UINTP, ptr)
+    length = rffi.cast(lltype.Signed, u32_ptr[0])
+    if length == 0:
+        return r_uint64(0)
+    if length <= strings.SHORT_STRING_THRESHOLD:
+        target_ptr = rffi.ptradd(ptr, 4)
+    else:
+        u64_p = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))
+        heap_off = rffi.cast(lltype.Signed, u64_p[0])
+        target_ptr = rffi.ptradd(batch.blob_arena.base_ptr, heap_off)
+    return xxh.compute_checksum(target_ptr, length)
+
+
 def hash_row_by_columns(batch, row_idx, col_indices):
     """Compute destination partition for a row using group-key semantics.
 
@@ -48,12 +75,20 @@ def hash_row_by_columns(batch, row_idx, col_indices):
         if col_type == types.TYPE_U64.code or col_type == types.TYPE_I64.code:
             val = _read_col_or_pk(batch, row_idx, c_idx)
             return _partition_for_key(val, r_uint64(0))
+        if col_type == types.TYPE_U128.code:
+            lo, hi = _read_col_u128_parts(batch, row_idx, c_idx)
+            return _partition_for_key(lo, hi)
 
     # General path: Murmur3 combination (matches _extract_group_key for non-U64 single-col
     # and all multi-col cases)
     h = r_uint64(0x9E3779B97F4A7C15)
     for i in range(len(col_indices)):
-        col_hash = _mix64(_read_col_or_pk(batch, row_idx, col_indices[i]))
+        c_idx = col_indices[i]
+        col_type = schema.columns[c_idx].field_type.code
+        if col_type == types.TYPE_STRING.code:
+            col_hash = _hash_string_col(batch, row_idx, c_idx)
+        else:
+            col_hash = _mix64(_read_col_or_pk(batch, row_idx, c_idx))
         h = _mix64(h ^ col_hash ^ r_uint64(i))
     h_hi = _mix64(h ^ r_uint64(len(col_indices)))
     return _partition_for_key(h, h_hi)

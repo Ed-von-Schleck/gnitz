@@ -51,6 +51,7 @@ pub struct Header {
 }
 
 impl Header {
+    #[allow(unused_assignments)]
     pub fn pack(&self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
         let mut off = 0;

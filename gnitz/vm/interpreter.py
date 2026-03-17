@@ -255,7 +255,7 @@ def run_vm(program, reg_file, context):
                 reg_trace_out.cursor,
                 batch.BatchWriter(reg_out.batch),
                 instr.group_by_cols,
-                instr.agg_func,
+                instr.agg_funcs,
                 instr.output_schema,
                 instr.trace_in_group_idx,
             )

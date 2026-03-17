@@ -376,6 +376,7 @@ fn apply_residual_filter(
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum ColumnValue { Int(i64), Float(f64), Str(String), Null }
 
 fn eval_pred_row(
@@ -463,6 +464,9 @@ fn eval_expr(
             let _ = c;
             Ok(1)
         }
+        BoundExpr::AggCall { .. } => Err(GnitzSqlError::Unsupported(
+            "aggregate functions not allowed in this context".to_string()
+        )),
     }
 }
 

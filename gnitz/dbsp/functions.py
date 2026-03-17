@@ -12,10 +12,11 @@ OP_GT = 2
 OP_LT = 3
 
 # --- Aggregate Opcodes ---
-AGG_COUNT = 1
-AGG_SUM   = 2
-AGG_MIN   = 3
-AGG_MAX   = 4
+AGG_COUNT          = 1
+AGG_SUM            = 2
+AGG_MIN            = 3
+AGG_MAX            = 4
+AGG_COUNT_NON_NULL = 5
 
 class ScalarFunction(object):
     """
@@ -161,6 +162,10 @@ class UniversalAccumulator(AggregateFunction):
         if op == AGG_COUNT:
             self._acc = r_int64(intmask(self._acc + weight))
 
+        elif op == AGG_COUNT_NON_NULL:
+            if not row_accessor.is_null(self.col_idx):
+                self._acc = r_int64(intmask(self._acc + weight))
+
         elif op == AGG_SUM:
             if is_f:
                 val_f = row_accessor.get_float(self.col_idx)
@@ -194,7 +199,7 @@ class UniversalAccumulator(AggregateFunction):
     def merge_accumulated(self, value_bits, weight):
         """Used by the linear shortcut in op_reduce."""
         op = jit.promote(self.agg_op)
-        if op == AGG_COUNT:
+        if op == AGG_COUNT or op == AGG_COUNT_NON_NULL:
             prev = rffi.cast(rffi.LONGLONG, value_bits)
             self._acc = r_int64(intmask(self._acc + (prev * weight)))
             self._has_value = True
@@ -215,14 +220,15 @@ class UniversalAccumulator(AggregateFunction):
 
     def output_is_float(self):
         code = self.col_type_code
-        return (code == types.TYPE_F64.code or code == types.TYPE_F32.code) and self.agg_op != AGG_COUNT
+        return (code == types.TYPE_F64.code or code == types.TYPE_F32.code) and self.agg_op != AGG_COUNT and self.agg_op != AGG_COUNT_NON_NULL
 
     def is_linear(self):
         op = jit.promote(self.agg_op)
-        return op == AGG_COUNT or op == AGG_SUM
+        return op == AGG_COUNT or op == AGG_SUM or op == AGG_COUNT_NON_NULL
 
     def output_column_type(self):
-        if self.agg_op == AGG_COUNT: return types.TYPE_I64
+        if self.agg_op == AGG_COUNT or self.agg_op == AGG_COUNT_NON_NULL:
+            return types.TYPE_I64
         if self.output_is_float(): return types.TYPE_F64
         return types.TYPE_I64
 

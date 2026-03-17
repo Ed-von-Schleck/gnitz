@@ -128,6 +128,24 @@ class CircuitBuilder(object):
             self._group_cols.append((handle.node_id, col_idx))
         return handle
 
+    def reduce_multi(self, input_handle, agg_specs, group_by_cols):
+        """Multi-aggregate reduce.
+
+        agg_specs: list of (agg_func_id, agg_col_idx) tuples.
+        Emits PARAM_AGG_COUNT + packed PARAM_AGG_SPEC_BASE entries.
+        """
+        sharded = self.shard(input_handle, group_by_cols)
+        handle = self._alloc_node(OPCODE_REDUCE)
+        self._connect(sharded, handle, PORT_IN_REDUCE)
+        self._params.append((handle.node_id, PARAM_AGG_COUNT, len(agg_specs)))
+        for i in range(len(agg_specs)):
+            func_id, col_idx = agg_specs[i]
+            packed = (func_id << 32) | col_idx
+            self._params.append((handle.node_id, PARAM_AGG_SPEC_BASE + i, packed))
+        for col_idx in group_by_cols:
+            self._group_cols.append((handle.node_id, col_idx))
+        return handle
+
     def anti_join(self, delta_handle, trace_table_id):
         trace_src = self.trace_scan(trace_table_id)
         handle = self._alloc_node(OPCODE_ANTI_JOIN_DELTA_TRACE)

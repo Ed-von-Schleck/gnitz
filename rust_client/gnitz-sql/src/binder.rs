@@ -1,9 +1,12 @@
 use std::collections::HashMap;
-use sqlparser::ast::{Expr, BinaryOperator, UnaryOperator, Value};
+use sqlparser::ast::{
+    Expr, BinaryOperator, UnaryOperator, Value,
+    FunctionArguments, FunctionArg, FunctionArgExpr,
+};
 use gnitz_protocol::Schema;
 use gnitz_core::GnitzClient;
 use crate::error::GnitzSqlError;
-use crate::logical_plan::{BoundExpr, BinOp, UnaryOp};
+use crate::logical_plan::{BoundExpr, BinOp, UnaryOp, AggFunc};
 
 /// Resolves a column in a multi-table context (for joins).
 /// `tables` maps alias/name → (table_id, Schema, column_offset).
@@ -66,6 +69,11 @@ impl<'a> Binder<'a> {
             .map_err(GnitzSqlError::Exec)?;
         self.cache.insert(name.to_string(), result.clone());
         Ok(result)
+    }
+
+    /// Cache a CTE or alias name as resolving to the given (table_id, schema).
+    pub fn cache_alias(&mut self, name: String, resolved: (u64, Schema)) {
+        self.cache.insert(name, resolved);
     }
 
     pub fn find_index(
@@ -185,6 +193,57 @@ impl<'a> Binder<'a> {
                 }
             }
             Expr::Nested(inner) => self.bind_expr(inner, schema),
+            Expr::Function(func) => {
+                let name = func.name.to_string().to_lowercase();
+                match name.as_str() {
+                    "count" => {
+                        if let FunctionArguments::List(list) = &func.args {
+                            if list.args.len() == 1 {
+                                match &list.args[0] {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                                        return Ok(BoundExpr::AggCall { func: AggFunc::Count, arg: None });
+                                    }
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
+                                        let bound = self.bind_expr(inner, schema)?;
+                                        return Ok(BoundExpr::AggCall {
+                                            func: AggFunc::CountNonNull,
+                                            arg: Some(Box::new(bound)),
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Err(GnitzSqlError::Unsupported("COUNT: unsupported argument form".to_string()))
+                    }
+                    "sum" | "min" | "max" | "avg" => {
+                        let agg_func = match name.as_str() {
+                            "sum" => AggFunc::Sum,
+                            "min" => AggFunc::Min,
+                            "max" => AggFunc::Max,
+                            "avg" => AggFunc::Avg,
+                            _ => unreachable!(),
+                        };
+                        if let FunctionArguments::List(list) = &func.args {
+                            if list.args.len() == 1 {
+                                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = &list.args[0] {
+                                    let bound = self.bind_expr(inner, schema)?;
+                                    return Ok(BoundExpr::AggCall {
+                                        func: agg_func,
+                                        arg: Some(Box::new(bound)),
+                                    });
+                                }
+                            }
+                        }
+                        Err(GnitzSqlError::Unsupported(
+                            format!("{}: requires exactly one column argument", name)
+                        ))
+                    }
+                    _ => Err(GnitzSqlError::Unsupported(
+                        format!("function '{}' not supported", name)
+                    )),
+                }
+            }
             _ => Err(GnitzSqlError::Unsupported(
                 format!("expression type not supported: {:?}", expr)
             )),

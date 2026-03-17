@@ -9,6 +9,7 @@ use crate::types::{
     PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_EXPR_NUM_REGS, PARAM_EXPR_RESULT_REG,
     PARAM_SHARD_COL_BASE, PARAM_GATHER_WORKER,
     PARAM_REINDEX_COL, PARAM_JOIN_SOURCE_TABLE, PARAM_CONST_STR_BASE, PARAM_TABLE_ID,
+    PARAM_AGG_COUNT, PARAM_AGG_SPEC_BASE,
 };
 use crate::expr::ExprProgram;
 
@@ -190,6 +191,28 @@ impl CircuitBuilder {
         nid
     }
 
+    /// Multi-aggregate reduce with automatic shard insertion.
+    /// `agg_specs`: list of (agg_func_id, agg_col_idx) tuples.
+    pub fn reduce_multi(
+        &mut self,
+        input: NodeId,
+        group_cols: &[usize],
+        agg_specs: &[(u64, usize)],
+    ) -> NodeId {
+        let sharded = self.shard(input, group_cols);
+        let nid = self.alloc_node(OPCODE_REDUCE);
+        self.connect(sharded, nid, PORT_IN);
+        self.params.push((nid, PARAM_AGG_COUNT, agg_specs.len() as u64));
+        for (i, &(func_id, col_idx)) in agg_specs.iter().enumerate() {
+            let packed = (func_id << 32) | (col_idx as u64);
+            self.params.push((nid, PARAM_AGG_SPEC_BASE + i as u64, packed));
+        }
+        for &col in group_cols {
+            self.group_cols.push((nid, col as u64));
+        }
+        nid
+    }
+
     /// Exchange shard: routes rows to workers by hashing the given columns.
     pub fn shard(&mut self, input: NodeId, shard_cols: &[usize]) -> NodeId {
         let nid = self.alloc_node(OPCODE_EXCHANGE_SHARD);
@@ -246,6 +269,22 @@ impl CircuitBuilder {
     /// Join delta with a trace node (e.g. an INTEGRATE node providing a TraceRegister).
     pub fn join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
         let nid = self.alloc_node(OPCODE_JOIN_DELTA_TRACE);
+        self.connect(delta, nid, PORT_IN_A);
+        self.connect(trace_node, nid, PORT_TRACE);
+        nid
+    }
+
+    /// Anti-join delta with a trace node.
+    pub fn anti_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
+        let nid = self.alloc_node(OPCODE_ANTI_JOIN_DELTA_TRACE);
+        self.connect(delta, nid, PORT_IN_A);
+        self.connect(trace_node, nid, PORT_TRACE);
+        nid
+    }
+
+    /// Semi-join delta with a trace node.
+    pub fn semi_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
+        let nid = self.alloc_node(OPCODE_SEMI_JOIN_DELTA_TRACE);
         self.connect(delta, nid, PORT_IN_A);
         self.connect(trace_node, nid, PORT_TRACE);
         nid

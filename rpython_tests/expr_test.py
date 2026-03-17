@@ -17,7 +17,7 @@ from rpython.rlib.longlong2float import float2longlong, longlong2float
 from gnitz.core import types, batch
 from gnitz.core.batch import RowBuilder
 from gnitz.dbsp.ops import linear
-from gnitz.dbsp.expr import ExprBuilder, eval_expr
+from gnitz.dbsp.expr import ExprBuilder, ExprMapFunction, eval_expr
 
 
 # ------------------------------------------------------------------------------
@@ -609,6 +609,66 @@ def test_integration_with_op_filter():
         b_out.free()
 
 
+def test_emit_null():
+    """EXPR_EMIT_NULL writes a NULL at the specified payload column."""
+    log("[EXPR] Testing EMIT_NULL in eval_expr_map...")
+
+    # Input schema: pk(U64), col1(I64), col2(I64)
+    in_schema = _make_int_schema()
+
+    # Output schema: pk(U64), a(I64), b(I64 nullable), c(I64)
+    # We'll MAP: COPY_COL col1→payload0, EMIT_NULL payload1, COPY_COL col2→payload2
+    out_cols = newlist_hint(4)
+    out_cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    out_cols.append(types.ColumnDefinition(types.TYPE_I64, name="a"))
+    out_cols.append(types.ColumnDefinition(types.TYPE_I64, name="b", is_nullable=True))
+    out_cols.append(types.ColumnDefinition(types.TYPE_I64, name="c"))
+    out_schema = types.TableSchema(out_cols, 0)
+
+    b = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+    try:
+        rb = RowBuilder(in_schema, b)
+        rb.begin(r_uint128(1), r_int64(1))
+        rb.put_int(r_int64(42))   # col1
+        rb.put_int(r_int64(99))   # col2
+        rb.commit()
+
+        rb.begin(r_uint128(2), r_int64(1))
+        rb.put_int(r_int64(7))
+        rb.put_int(r_int64(13))
+        rb.commit()
+
+        # Build map program: copy col1 → payload 0, emit NULL → payload 1, copy col2 → payload 2
+        # payload_col_idx is 0-based sequential (PK is handled separately by op_map)
+        eb = ExprBuilder()
+        eb.copy_col(types.TYPE_I64.code, 1, 0)  # src=col1, dst=payload0
+        eb.emit_null(1)                           # NULL at payload1
+        eb.copy_col(types.TYPE_I64.code, 2, 2)  # src=col2, dst=payload2
+        prog = eb.build(0)  # result_reg unused for map
+        map_func = ExprMapFunction(prog)
+
+        linear.op_map(b, batch.BatchWriter(b_out), map_func, out_schema)
+        assert_equal_i(2, b_out.length(), "EMIT_NULL row count")
+
+        # Row 0: a=42, b=NULL, c=99
+        acc0 = b_out.get_accessor(0)
+        assert_equal_i64(r_int64(42), acc0.get_int_signed(1), "Row 0 col a")
+        assert_true(acc0.is_null(2), "Row 0 col b should be NULL")
+        assert_equal_i64(r_int64(99), acc0.get_int_signed(3), "Row 0 col c")
+
+        # Row 1: a=7, b=NULL, c=13
+        acc1 = b_out.get_accessor(1)
+        assert_equal_i64(r_int64(7), acc1.get_int_signed(1), "Row 1 col a")
+        assert_true(acc1.is_null(2), "Row 1 col b should be NULL")
+        assert_equal_i64(r_int64(13), acc1.get_int_signed(3), "Row 1 col c")
+
+        log("  PASSED")
+    finally:
+        b.free()
+        b_out.free()
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -625,6 +685,7 @@ def entry_point(argv):
         test_div_by_zero()
         test_complex_predicate()
         test_integration_with_op_filter()
+        test_emit_null()
         log("\nALL EXPR TESTS PASSED")
     except Exception as e:
         os.write(2, "FAILURE\n")

@@ -28,7 +28,7 @@ class Instruction(object):
         "reg_trace_in",
         "reg_trace_out",
         "group_by_cols",
-        "agg_func",
+        "agg_funcs",
         "output_schema",
         "chunk_limit",
         "reg_key",
@@ -53,7 +53,7 @@ class Instruction(object):
         self.reg_trace_in = None
         self.reg_trace_out = None
         self.group_by_cols = None
-        self.agg_func = None
+        self.agg_funcs = None
         self.output_schema = None
         self.chunk_limit = 0
         self.reg_key = None
@@ -138,7 +138,7 @@ def join_delta_delta_op(reg_a, reg_b, reg_out):
 
 def reduce_op(
     reg_in, reg_trace_in, reg_trace_out, reg_out,
-    group_by_cols, agg_func, output_schema,
+    group_by_cols, agg_funcs, output_schema,
     trace_in_group_idx=None,
 ):
     i = Instruction(op.OPCODE_REDUCE)
@@ -147,7 +147,7 @@ def reduce_op(
     i.reg_trace_out = reg_trace_out
     i.reg_out = reg_out
     i.group_by_cols = group_by_cols
-    i.agg_func = agg_func
+    i.agg_funcs = agg_funcs
     i.output_schema = output_schema
     i.trace_in_group_idx = trace_in_group_idx
     return i

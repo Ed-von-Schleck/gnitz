@@ -165,6 +165,62 @@ def test_repartition_batch():
     log("  PASSED")
 
 
+def test_string_hash_consistency():
+    """Two rows with the same string value should hash to the same partition."""
+    log("[EXCHANGE] Testing string hash consistency...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_STRING, name="name"))
+    schema = types.TableSchema(cols, pk_index=0)
+
+    b = batch.ArenaZSetBatch(schema)
+    from gnitz.core.batch import RowBuilder
+    rb = RowBuilder(schema, b)
+
+    # Two rows with the same string "hello" but different PKs
+    rb.begin(r_uint128(1), r_int64(1))
+    rb.put_string("hello")
+    rb.commit()
+
+    rb.begin(r_uint128(2), r_int64(1))
+    rb.put_string("hello")
+    rb.commit()
+
+    # A row with a different string
+    rb.begin(r_uint128(3), r_int64(1))
+    rb.put_string("world")
+    rb.commit()
+
+    col_indices = [1]
+    p0 = hash_row_by_columns(b, 0, col_indices)
+    p1 = hash_row_by_columns(b, 1, col_indices)
+    p2 = hash_row_by_columns(b, 2, col_indices)
+
+    assert_equal_i(p0, p1, "same string 'hello' should hash to same partition")
+    # p2 may or may not differ, but at least the same-string case must match
+
+    # Also test a longer string (> 12 bytes, heap-allocated)
+    b2 = batch.ArenaZSetBatch(schema)
+    rb2 = RowBuilder(schema, b2)
+
+    rb2.begin(r_uint128(10), r_int64(1))
+    rb2.put_string("this is a longer string for heap")
+    rb2.commit()
+
+    rb2.begin(r_uint128(11), r_int64(1))
+    rb2.put_string("this is a longer string for heap")
+    rb2.commit()
+
+    q0 = hash_row_by_columns(b2, 0, col_indices)
+    q1 = hash_row_by_columns(b2, 1, col_indices)
+    assert_equal_i(q0, q1, "same long string should hash to same partition")
+
+    b.free()
+    b2.free()
+    log("  PASSED")
+
+
 def test_compile_split_plan(base_dir):
     """Build circuit with SHARD node, compile, verify exchange_post_plan is set."""
     log("[EXCHANGE] Testing compile_from_graph with SHARD node...")
@@ -282,6 +338,8 @@ def entry_point(argv):
         test_hash_distribution()
 
         test_repartition_batch()
+
+        test_string_hash_consistency()
 
         test_compile_split_plan(base_dir)
         cleanup(base_dir)
