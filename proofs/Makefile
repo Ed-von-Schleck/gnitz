@@ -46,7 +46,12 @@ PROOFS := \
 	type-constants:type_constants \
 	join-mapping:join_mapping \
 	group-index-key:group_index_key \
-	schema-stride:schema_stride
+	schema-stride:schema_stride \
+	distinct-sign:distinct_sign \
+	ipc-header-layout:ipc_header_layout \
+	german-string-layout:german_string_layout \
+	mergesort-partition:mergesort_partition \
+	wal-region-count:wal_region_count
 
 TARGETS := $(foreach p,$(PROOFS),prove-$(firstword $(subst :, ,$(p))))
 

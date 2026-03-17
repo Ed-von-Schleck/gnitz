@@ -55,6 +55,11 @@ proofs/
     join_mapping.py     # CompositeAccessor column mapping correctness
     group_index_key.py  # Reduce group index key composition roundtrip
     schema_stride.py    # Memtable stride calculation correctness
+    distinct_sign.py        # DBSP distinct operator sign function correctness
+    ipc_header_layout.py    # IPC v2 96-byte request/response header field layout
+    german_string_layout.py # German string 16-byte struct layout correctness
+    mergesort_partition.py  # Merge sort range partition invariants
+    wal_region_count.py     # WAL columnar block region count formula
 ```
 
 ## Prerequisites
