@@ -2,54 +2,30 @@ PYPY2     := pypy2
 PYPY_PATH ?= ../../pypy
 ENV       := PYTHONPATH=".:..:$(PYPY_PATH)"
 
-.PHONY: prove prove-mix64 prove-xor8 prove-bloom prove-string-prefix prove-align-up prove-u128 prove-promote-key prove-bounds prove-serialize-align prove-promote-group prove-null-word prove-load-const prove-exchange-reduce prove-shard-bounds prove-distinct-bounds prove-ipc-wire
+# target-name  →  checks/script.py
+PROOFS := \
+	mix64:mix64 \
+	xor8:xor8_bounds \
+	bloom:bloom_safety \
+	string-prefix:string_prefix \
+	align-up:align_up \
+	u128:u128_roundtrip \
+	promote-key:promote_key \
+	bounds:bounds_check \
+	serialize-align:serialize_align \
+	promote-group:promote_group \
+	null-word:null_word \
+	load-const:load_const \
+	exchange-reduce:exchange_reduce \
+	shard-bounds:shard_bounds \
+	distinct-bounds:distinct_bounds \
+	ipc-wire:ipc_wire
 
-prove: prove-mix64 prove-xor8 prove-bloom prove-string-prefix prove-align-up prove-u128 prove-promote-key prove-bounds prove-serialize-align prove-promote-group prove-null-word prove-load-const prove-exchange-reduce prove-shard-bounds prove-distinct-bounds prove-ipc-wire
+TARGETS := $(foreach p,$(PROOFS),prove-$(firstword $(subst :, ,$(p))))
 
-prove-mix64:
-	$(ENV) $(PYPY2) checks/mix64.py
+.PHONY: prove $(TARGETS)
 
-prove-xor8:
-	$(ENV) $(PYPY2) checks/xor8_bounds.py
+prove: $(TARGETS)
 
-prove-bloom:
-	$(ENV) $(PYPY2) checks/bloom_safety.py
-
-prove-string-prefix:
-	$(ENV) $(PYPY2) checks/string_prefix.py
-
-prove-align-up:
-	$(ENV) $(PYPY2) checks/align_up.py
-
-prove-u128:
-	$(ENV) $(PYPY2) checks/u128_roundtrip.py
-
-prove-promote-key:
-	$(ENV) $(PYPY2) checks/promote_key.py
-
-prove-bounds:
-	$(ENV) $(PYPY2) checks/bounds_check.py
-
-prove-serialize-align:
-	$(ENV) $(PYPY2) checks/serialize_align.py
-
-prove-promote-group:
-	$(ENV) $(PYPY2) checks/promote_group.py
-
-prove-null-word:
-	$(ENV) $(PYPY2) checks/null_word.py
-
-prove-load-const:
-	$(ENV) $(PYPY2) checks/load_const.py
-
-prove-exchange-reduce:
-	$(ENV) $(PYPY2) checks/exchange_reduce.py
-
-prove-shard-bounds:
-	$(ENV) $(PYPY2) checks/shard_bounds.py
-
-prove-distinct-bounds:
-	$(ENV) $(PYPY2) checks/distinct_bounds.py
-
-prove-ipc-wire:
-	$(ENV) $(PYPY2) checks/ipc_wire.py
+# Pattern: prove-<name> runs checks/<script>.py
+$(foreach p,$(PROOFS),$(eval prove-$(firstword $(subst :, ,$(p))): ; $(ENV) $(PYPY2) checks/$(lastword $(subst :, ,$(p))).py))
