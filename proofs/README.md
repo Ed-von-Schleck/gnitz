@@ -20,6 +20,14 @@ proofs/
     u128_roundtrip.py   # write/read u128 serialization roundtrip
     promote_key.py      # promote_to_index_key injectivity
     bounds_check.py     # MappedBuffer bounds check safety
+    serialize_align.py  # serialize.py alignment formula correctness
+    promote_group.py    # promote_group_col_to_u64 injectivity
+    null_word.py        # null-word bit-set/test correctness
+    load_const.py       # LOAD_CONST i64 split/join roundtrip
+    exchange_reduce.py  # exchange <-> reduce partition consistency
+    shard_bounds.py     # shard region bounds check safety
+    distinct_bounds.py  # distinct operator output bounds
+    ipc_wire.py         # IPC wire format structural integrity
 ```
 
 ## Prerequisites

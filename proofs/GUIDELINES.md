@@ -54,6 +54,13 @@ In order of cost (cheapest to most expensive):
 Prefer `bvand` masks over `bvurem` when the divisor is a power of 2. Prefer shifts over
 multiplication by powers of 2.
 
+## Cross-check comparison pitfall
+
+PyPy2's `r_int64(big_positive)` returns a Python `long`; `r_int64(intmask(x))` returns
+a Python `int`. Same 64-bit bit pattern, different types — `==` compares them as
+mathematical integers and returns `False` when bit 63 is set. Always compare via
+`(int(a) & MASK64) == (int(b) & MASK64)` in cross-checks.
+
 ## RPython-to-SMT correspondence
 
 When the RPython code uses `r_uint64`, the natural encoding is 64-bit BV. But if the
