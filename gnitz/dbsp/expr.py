@@ -81,18 +81,30 @@ EXPR_STR_COL_LE_COL   = 45   # dst = (col[a1] <= col[a2]) ? 1 : 0
 # ---------------------------------------------------------------------------
 
 class ExprProgram(object):
-    _immutable_fields_ = ['code[*]', 'num_regs', 'result_reg', 'num_instrs']
+    _immutable_fields_ = ['code[*]', 'num_regs', 'result_reg', 'num_instrs',
+                          'const_strings[*]', 'const_prefixes[*]',
+                          'const_lengths[*]']
 
     def __init__(self, code, num_regs, result_reg, const_strings=None):
+        from gnitz.core import strings as _strings
         self.code = code[:]         # copy: [*] requires a never-resized list
         self.num_regs = num_regs
         self.result_reg = result_reg
         self.num_instrs = len(code) // 4
         if const_strings is not None:
-            self.const_strings = const_strings
+            self.const_strings = const_strings[:]
+            prefixes = [0] * len(const_strings)
+            lengths = [0] * len(const_strings)
+            for _i in range(len(const_strings)):
+                prefixes[_i] = _strings.compute_prefix(const_strings[_i])
+                lengths[_i] = len(const_strings[_i])
+            self.const_prefixes = prefixes
+            self.const_lengths = lengths
         else:
             # RPython annotation: must be same type as the 'not None' branch
             self.const_strings = [""][0:0]
+            self.const_prefixes = [0][0:0]
+            self.const_lengths = [0][0:0]
 
     def code_as_ints(self):
         result = []
@@ -234,8 +246,8 @@ def eval_expr(program, accessor):
                 _len, _pref, ptr, heap, pystr = accessor.get_str_struct(a1)
                 const_str = program.const_strings[a2]
                 regs[dst] = r_int64(1) if strings.string_equals(
-                    ptr, heap, const_str, len(const_str),
-                    r_uint64(strings.compute_prefix(const_str))
+                    ptr, heap, const_str, program.const_lengths[a2],
+                    r_uint64(program.const_prefixes[a2])
                 ) else r_int64(0)
             else:
                 regs[dst] = r_int64(0)
@@ -247,8 +259,8 @@ def eval_expr(program, accessor):
                 const_str = program.const_strings[a2]
                 cmp = strings.compare_structures(
                     l_len, l_pref, l_ptr, l_heap, l_str,
-                    len(const_str),
-                    rffi.cast(rffi.LONGLONG, r_uint64(strings.compute_prefix(const_str))),
+                    program.const_lengths[a2],
+                    rffi.cast(rffi.LONGLONG, r_uint64(program.const_prefixes[a2])),
                     strings.NULL_PTR, strings.NULL_PTR, const_str
                 )
                 regs[dst] = r_int64(1) if cmp < 0 else r_int64(0)
@@ -262,8 +274,8 @@ def eval_expr(program, accessor):
                 const_str = program.const_strings[a2]
                 cmp = strings.compare_structures(
                     l_len, l_pref, l_ptr, l_heap, l_str,
-                    len(const_str),
-                    rffi.cast(rffi.LONGLONG, r_uint64(strings.compute_prefix(const_str))),
+                    program.const_lengths[a2],
+                    rffi.cast(rffi.LONGLONG, r_uint64(program.const_prefixes[a2])),
                     strings.NULL_PTR, strings.NULL_PTR, const_str
                 )
                 regs[dst] = r_int64(1) if cmp <= 0 else r_int64(0)
@@ -486,8 +498,8 @@ def eval_expr_map(program, accessor, builder):
                 _len, _pref, ptr, heap, pystr = accessor.get_str_struct(a1)
                 const_str = program.const_strings[a2]
                 regs[dst] = r_int64(1) if strings.string_equals(
-                    ptr, heap, const_str, len(const_str),
-                    r_uint64(strings.compute_prefix(const_str))
+                    ptr, heap, const_str, program.const_lengths[a2],
+                    r_uint64(program.const_prefixes[a2])
                 ) else r_int64(0)
             else:
                 regs[dst] = r_int64(0)
@@ -498,8 +510,8 @@ def eval_expr_map(program, accessor, builder):
                 const_str = program.const_strings[a2]
                 cmp = strings.compare_structures(
                     l_len, l_pref, l_ptr, l_heap, l_str,
-                    len(const_str),
-                    rffi.cast(rffi.LONGLONG, r_uint64(strings.compute_prefix(const_str))),
+                    program.const_lengths[a2],
+                    rffi.cast(rffi.LONGLONG, r_uint64(program.const_prefixes[a2])),
                     strings.NULL_PTR, strings.NULL_PTR, const_str
                 )
                 regs[dst] = r_int64(1) if cmp < 0 else r_int64(0)
@@ -512,8 +524,8 @@ def eval_expr_map(program, accessor, builder):
                 const_str = program.const_strings[a2]
                 cmp = strings.compare_structures(
                     l_len, l_pref, l_ptr, l_heap, l_str,
-                    len(const_str),
-                    rffi.cast(rffi.LONGLONG, r_uint64(strings.compute_prefix(const_str))),
+                    program.const_lengths[a2],
+                    rffi.cast(rffi.LONGLONG, r_uint64(program.const_prefixes[a2])),
                     strings.NULL_PTR, strings.NULL_PTR, const_str
                 )
                 regs[dst] = r_int64(1) if cmp <= 0 else r_int64(0)
