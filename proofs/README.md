@@ -32,6 +32,23 @@ proofs/
     pending_key.py      # DAG pending key bijectivity
     partition_assign.py # partition assignment coverage
     weight_arith.py     # DBSP weight arithmetic
+    xor8_capacity.py    # XOR filter capacity formula correctness
+    manifest_layout.py  # Manifest entry/header field layout integrity
+    heap_index.py       # Tournament tree heap index arithmetic
+    xor8_fingerprint.py # XOR filter fingerprint XOR properties
+    float_const.py      # Float constant encoding roundtrip & injectivity
+    wal_header.py       # WAL block header field layout integrity
+    bloom_sizing.py     # Bloom filter sizing formula correctness
+    byte_encoding.py    # U16/U8/U32 byte-level encoding roundtrip
+    bsearch_midpoint.py # Binary search midpoint safety
+    range_key.py        # U128 range key scanning correctness
+    wal_directory.py    # WAL columnar directory entry layout
+    shard_directory.py  # Shard file header + directory entry layout
+    ipc_string_offsets.py # IPC string encoding offset safety
+    reduce_sentinel.py  # Reduce accessor sentinel encoding roundtrip
+    serialize_offsets.py # Serialization two-phase offset consistency
+    ipc_column_chain.py # IPC ZSet full column offset chain
+    agg_spec_pack.py    # Aggregation spec packing roundtrip
 ```
 
 ## Prerequisites

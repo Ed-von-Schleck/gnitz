@@ -23,7 +23,24 @@ PROOFS := \
 	catalog-keys:catalog_keys \
 	pending-key:pending_key \
 	partition-assign:partition_assign \
-	weight-arith:weight_arith
+	weight-arith:weight_arith \
+	xor8-capacity:xor8_capacity \
+	manifest-layout:manifest_layout \
+	heap-index:heap_index \
+	xor8-fingerprint:xor8_fingerprint \
+	float-const:float_const \
+	wal-header:wal_header \
+	bloom-sizing:bloom_sizing \
+	byte-encoding:byte_encoding \
+	bsearch-midpoint:bsearch_midpoint \
+	range-key:range_key \
+	wal-directory:wal_directory \
+	shard-directory:shard_directory \
+	ipc-string-offsets:ipc_string_offsets \
+	reduce-sentinel:reduce_sentinel \
+	serialize-offsets:serialize_offsets \
+	ipc-column-chain:ipc_column_chain \
+	agg-spec-pack:agg_spec_pack
 
 TARGETS := $(foreach p,$(PROOFS),prove-$(firstword $(subst :, ,$(p))))
 
