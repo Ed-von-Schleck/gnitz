@@ -34,10 +34,24 @@ cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -v --tb=short
 The Makefile `e2e` target already sets `GNITZ_WORKERS=4`. Never run
 `uv run pytest tests/` without the `GNITZ_WORKERS` variable set.
 
-## Debugging workers
+## Debug logging during development
 
-Worker stdout/stderr goes to `<DATA_DIR>/worker_N.log`, not the terminal.
-The server prints the log paths at startup.
+To enable verbose logging during E2E tests:
+
+```bash
+GNITZ_WORKERS=4 GNITZ_LOG_LEVEL=debug uv run pytest tests/test_joins.py -x
+```
+
+Master log: `~/git/gnitz/tmp/server_debug.log`
+Worker logs (always preserved from last run): `~/git/gnitz/tmp/last_worker_N.log`
+
+Log format: `<epoch>.<ms> <process> <level> <message>`
+- Process tags: `M` (master), `W0`-`WN` (workers)
+
+To add temporary debug logging in RPython code, use `log.debug()` —
+never raw `os.write(2, ...)`. This ensures timestamps, process identity,
+and level-gating. Remove debug calls before committing.
+
 To watch all worker logs live:
 
 ```bash

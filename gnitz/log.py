@@ -18,6 +18,7 @@ VERBOSE = DEBUG  # backward-compat alias
 class _LogState(object):
     def __init__(self):
         self.level = QUIET
+        self.process_tag = "M"
 
 
 _state = _LogState()
@@ -25,6 +26,10 @@ _state = _LogState()
 
 def init(level):
     _state.level = level
+
+
+def set_process_tag(tag):
+    _state.process_tag = tag
 
 
 def parse_level(s):
@@ -77,5 +82,7 @@ def _emit(tag, msg):
     secs = int(t)
     millis = int((t - float(secs)) * 1000.0)
     os.write(
-        2, str(secs) + "." + _pad3(millis) + " " + tag + " " + msg + "\n"
+        2, str(secs) + "." + _pad3(millis)
+        + " " + _state.process_tag
+        + " " + tag + " " + msg + "\n"
     )

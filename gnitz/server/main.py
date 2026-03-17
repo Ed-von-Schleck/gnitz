@@ -171,6 +171,7 @@ def entry_point(argv):
                 + ")\n",
             )
 
+            log.set_process_tag("W" + str(w))
             WorkerProcess(w, my_fd, engine, part_start, part_end).run()
             os._exit(0)
 

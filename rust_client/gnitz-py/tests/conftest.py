@@ -18,6 +18,8 @@ def server():
     cmd = [binary, data_dir, sock_path]
     if w := os.environ.get("GNITZ_WORKERS"):
         cmd += [f"--workers={w}"]
+    if ll := os.environ.get("GNITZ_LOG_LEVEL"):
+        cmd += [f"--log-level={ll}"]
     stderr_path = os.path.expanduser("~/git/gnitz/tmp/server_debug.log")
     stderr_f = open(stderr_path, "w")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_f)
@@ -33,6 +35,11 @@ def server():
     proc.kill()
     proc.wait()
     stderr_f.close()
+    stable_dir = os.path.expanduser("~/git/gnitz/tmp")
+    for wlog in ("worker_0.log", "worker_1.log", "worker_2.log", "worker_3.log"):
+        src = os.path.join(data_dir, wlog)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(stable_dir, "last_" + wlog))
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
