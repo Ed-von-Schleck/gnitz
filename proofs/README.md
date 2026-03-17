@@ -14,6 +14,7 @@ proofs/
     mix64.py            # Murmur3 finalizer bijectivity
     xor8_bounds.py      # XOR filter index safety
     bloom_safety.py     # Bloom filter memory safety
+    string_prefix.py    # compute_prefix byte-packing correctness
 ```
 
 ## What this proves
@@ -36,6 +37,13 @@ total + cross-check.
 byte value, and all 7 probes are distinct. 11 Z3 queries + cross-check. Uses reduced
 bitvector widths (8–32 bit) to avoid expensive `bvurem` bit-blasting.
 
+**`compute_prefix` byte-packing** (`checks/string_prefix.py`) — two properties of
+`gnitz/core/strings.py` `compute_prefix()`: byte roundtrip (extracting byte `i` from
+the packed prefix recovers the original byte) and injectivity (different 4-byte tuples
+produce different prefixes). Together these guarantee that the prefix comparison in
+`compare_structures()` is a sound fast-path for string equality. 5 Z3 queries + 8
+cross-checks. All 32-bit BVs with only `bvor`/`bvshl`/`bvlshr`/`bvand`.
+
 ## Prerequisites
 
 - `pypy2` (RPython host interpreter)
@@ -51,7 +59,7 @@ make prove
 
 Exit code 0 = all proofs pass. Exit code 1 = failure.
 
-Individual targets: `make prove-mix64`, `make prove-xor8`, `make prove-bloom`.
+Individual targets: `make prove-mix64`, `make prove-xor8`, `make prove-bloom`, `make prove-string-prefix`.
 
 ## How divergence is prevented
 

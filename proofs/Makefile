@@ -2,9 +2,9 @@ PYPY2     := pypy2
 PYPY_PATH ?= ../../pypy
 ENV       := PYTHONPATH=".:..:$(PYPY_PATH)"
 
-.PHONY: prove prove-mix64 prove-xor8 prove-bloom
+.PHONY: prove prove-mix64 prove-xor8 prove-bloom prove-string-prefix
 
-prove: prove-mix64 prove-xor8 prove-bloom
+prove: prove-mix64 prove-xor8 prove-bloom prove-string-prefix
 
 prove-mix64:
 	$(ENV) $(PYPY2) checks/mix64.py
@@ -14,3 +14,6 @@ prove-xor8:
 
 prove-bloom:
 	$(ENV) $(PYPY2) checks/bloom_safety.py
+
+prove-string-prefix:
+	$(ENV) $(PYPY2) checks/string_prefix.py
