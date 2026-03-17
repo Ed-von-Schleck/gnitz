@@ -91,7 +91,7 @@ class WorkerProcess(object):
                 return False
 
             if flags & ipc.FLAG_HAS_PK:
-                self._handle_has_pk(target_id, payload.batch)
+                self._handle_has_pk(target_id, payload.batch, intmask(payload.seek_col_idx))
                 return False
 
             if flags & ipc.FLAG_PUSH:
@@ -170,15 +170,37 @@ class WorkerProcess(object):
             + " rows=" + str(batch.length())
         )
 
-    def _handle_has_pk(self, target_id, batch):
-        """Check PK existence for FK validation. Responds with weights 1/0."""
+    def _handle_has_pk(self, target_id, batch, col_hint):
+        """Check PK existence for FK / unique-index validation. Responds with weights 1/0.
+
+        col_hint == 0: FK check against the main table store.
+        col_hint > 0:  unique index check on column (col_hint - 1).
+        """
         family = self.engine.registry.get_by_id(target_id)
-        schema = family.schema
+        if col_hint > 0:
+            col_idx = col_hint - 1
+            store = None
+            schema = None
+            for ic in range(len(family.index_circuits)):
+                circuit = family.index_circuits[ic]
+                if circuit.source_col_idx == col_idx and circuit.is_unique:
+                    store = circuit.table
+                    schema = circuit.table.get_schema()
+                    break
+            if store is None:
+                raise errors.LayoutError(
+                    "No unique index on column %d for table %d"
+                    % (col_idx, target_id)
+                )
+        else:
+            store = family.store
+            schema = family.schema
+
         result = ArenaZSetBatch(schema)
         n = batch.length() if batch is not None else 0
         for i in range(n):
             pk = batch.get_pk(i)
-            exists = family.store.has_pk(pk)
+            exists = store.has_pk(pk)
             w = r_int64(1) if exists else r_int64(0)
             result._direct_append_row(batch, i, w)
         ipc.send_batch(self.master_fd, target_id, result, schema=schema)

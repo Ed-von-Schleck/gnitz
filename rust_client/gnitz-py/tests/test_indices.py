@@ -409,11 +409,6 @@ class TestIndexSql:
 # ---------------------------------------------------------------------------
 
 class TestIndexIntegrity:
-    @pytest.mark.skipif(
-        _NUM_WORKERS > 1,
-        reason="Unique constraint is per-partition only; cross-partition enforcement "
-               "requires distributed coordination not yet implemented",
-    )
     def test_unique_index_violation(self, client):
         sn = _sn()
         client.create_schema(sn)
@@ -469,3 +464,196 @@ class TestIndexIntegrity:
             assert len(result.batch.pk_lo) == 1
         finally:
             _drop_all(client, sn, views=["v"], tables=["t"])
+
+    def test_unique_cross_partition(self, client):
+        """Two separate INSERTs with different PKs but same indexed value must fail."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                # pk=1000000 likely lands on a different partition than pk=1
+                client.execute_sql("INSERT INTO t VALUES (1000000, 42)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_unique_batch_internal_duplicate(self, client):
+        """Single INSERT with two rows sharing the same indexed value must fail."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "INSERT INTO t VALUES (1, 42), (2, 42)", schema_name=sn
+                )
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_unique_upsert_same_value_allowed(self, client):
+        """UPSERT with same indexed value must succeed (not a violation)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            # Re-insert same PK with same value — UPSERT, not a violation
+            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_unique_upsert_change_value(self, client):
+        """UPSERT that changes the indexed value must succeed."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 99)", schema_name=sn)
+            # Verify final state
+            tid, _ = client.resolve_table(sn, "t")
+            result = client.scan(tid)
+            assert result.batch is not None
+            assert len(result.batch.pk_lo) == 1
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    @pytest.mark.xfail(
+        _NUM_WORKERS > 1,
+        reason="Row modification (INSERT-as-UPSERT or UPDATE) changing a unique-indexed "
+               "column to a value held by a row on a different worker is not caught. "
+               "The pre-push check skips existing PKs, and the worker-level check only "
+               "sees its local index partition. Requires index re-partitioning or a "
+               "two-phase protocol to fix.",
+    )
+    def test_unique_upsert_to_existing_value(self, client):
+        """UPSERT pk=1 to val=99 when pk=2 already holds val=99 must fail."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (2, 99)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                # UPSERT pk=1 to val=99 — conflicts with pk=2
+                client.execute_sql("INSERT INTO t VALUES (1, 99)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    @pytest.mark.xfail(
+        _NUM_WORKERS > 1,
+        reason="UPDATE changing a unique-indexed column to a value held by a row on a "
+               "different worker is not caught. Same root cause as "
+               "test_unique_upsert_to_existing_value — UPDATE is implemented as a "
+               "push with the same PK (weight=+1), triggering the UPSERT path.",
+    )
+    def test_unique_update_to_existing_value(self, client):
+        """UPDATE pk=1 SET val=99 when pk=2 already holds val=99 must fail."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (2, 99)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "UPDATE t SET val = 99 WHERE pk = 1", schema_name=sn
+                )
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_unique_null_not_violation(self, client):
+        """Multiple NULLs in a unique-indexed nullable column must not conflict."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, NULL)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (2, NULL)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_unique_after_delete(self, client):
+        """Inserting a value freed by a prior DELETE must succeed."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            # val=42 is now free
+            client.execute_sql("INSERT INTO t VALUES (2, 42)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_unique_multi_index(self, client):
+        """Table with two unique indices; violation on first index is caught."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=sn)
+            client.execute_sql("CREATE UNIQUE INDEX ON t(b)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 10, 20)", schema_name=sn)
+            # Unique on both a and b
+            client.execute_sql("INSERT INTO t VALUES (2, 11, 21)", schema_name=sn)
+            # Violates unique on a
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO t VALUES (3, 10, 22)", schema_name=sn)
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_a", f"{sn}__t__idx_b"],
+                      tables=["t"])

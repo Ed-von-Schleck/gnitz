@@ -254,6 +254,107 @@ def validate_fk_inline(family, batch):
                 )
 
 
+def validate_unique_indices_distributed(family, batch, dispatcher):
+    """Validate unique index constraints via distributed PK lookups.
+
+    Called by the master before fan_out_push. For each unique index, collects
+    index keys from positive-weight rows, checks batch-internal duplicates,
+    then broadcasts to ALL workers (index stores are partitioned by main-table PK,
+    not index key). Raises LayoutError on violation.
+
+    For unique_pk tables, UPSERT rows (PKs already in the table) are skipped —
+    the worker-level check in ingest_projection handles those after
+    _enforce_unique_pk retracts the old indexed value.
+    """
+    # Quick check: any unique index circuits?
+    has_unique = False
+    for ic in range(len(family.index_circuits)):
+        if family.index_circuits[ic].is_unique:
+            has_unique = True
+            break
+    if not has_unique:
+        return
+
+    n = batch.length()
+    acc = batch.get_accessor(0)
+
+    # For unique_pk tables, determine which PKs already exist (UPSERT rows)
+    existing_pks = None
+    if family.unique_pk:
+        pk_lo_list = []
+        pk_hi_list = []
+        for i in range(n):
+            if batch.get_weight(i) <= r_int64(0):
+                continue
+            pk_lo_list.append(r_uint64(batch._read_pk_lo(i)))
+            pk_hi_list.append(r_uint64(batch._read_pk_hi(i)))
+        if len(pk_lo_list) > 0:
+            pk_check = _build_pk_check_batch(family.schema, pk_lo_list, pk_hi_list)
+            existing_pks = dispatcher.check_pk_existence(
+                family.table_id, pk_check, family.schema
+            )
+            pk_check.free()
+
+    # Check each unique index
+    for ic_idx in range(len(family.index_circuits)):
+        circuit = family.index_circuits[ic_idx]
+        if not circuit.is_unique:
+            continue
+
+        seen_lo = []
+        seen_hi = []
+        seen_dict = {}   # {int: {int: int}}
+
+        for i in range(n):
+            if batch.get_weight(i) <= r_int64(0):
+                continue
+            batch.bind_accessor(i, acc)
+            if acc.is_null(circuit.source_col_idx):
+                continue
+
+            # Skip UPSERT rows (worker handles after _enforce_unique_pk)
+            if existing_pks is not None:
+                pk_lo = intmask(r_uint64(batch._read_pk_lo(i)))
+                pk_hi = intmask(r_uint64(batch._read_pk_hi(i)))
+                if pk_lo in existing_pks and pk_hi in existing_pks[pk_lo]:
+                    continue
+
+            idx_key = promote_to_index_key(
+                acc, circuit.source_col_idx, circuit.source_col_type
+            )
+            lo = r_uint64(intmask(idx_key))
+            hi = r_uint64(intmask(idx_key >> 64))
+            lo_key = intmask(lo)
+            hi_key = intmask(hi)
+
+            if lo_key in seen_dict and hi_key in seen_dict[lo_key]:
+                raise LayoutError(
+                    "Unique index violation on column '%s': duplicate in batch"
+                    % family.schema.columns[circuit.source_col_idx].name
+                )
+            if lo_key not in seen_dict:
+                seen_dict[lo_key] = {}
+            seen_dict[lo_key][hi_key] = 1
+            seen_lo.append(lo)
+            seen_hi.append(hi)
+
+        if len(seen_lo) == 0:
+            continue
+
+        idx_schema = circuit.table.get_schema()
+        check_batch = _build_pk_check_batch(idx_schema, seen_lo, seen_hi)
+        any_exists = dispatcher.check_pk_exists_broadcast(
+            family.table_id, circuit.source_col_idx, check_batch, idx_schema
+        )
+        check_batch.free()
+
+        if any_exists:
+            raise LayoutError(
+                "Unique index violation on column '%s'"
+                % family.schema.columns[circuit.source_col_idx].name
+            )
+
+
 class FKConstraint(object):
     """
     An active Foreign Key constraint tracking a source column and its target table.

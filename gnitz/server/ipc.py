@@ -800,6 +800,8 @@ def _recv_and_parse(fd):
             seek_col_idx = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_COL))[0])
             seek_pk_lo   = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_KEY_LO))[0])
             seek_pk_hi   = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_KEY_HI))[0])
+        elif intmask(flags) & FLAG_HAS_PK:
+            seek_col_idx = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_COL))[0])
         elif intmask(flags) & FLAG_SEEK:
             seek_pk_lo = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_LO))[0])
             seek_pk_hi = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_HI))[0])

@@ -10,7 +10,10 @@ from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch, BatchWriter
 from gnitz.core.types import TYPE_U128
 from gnitz.catalog import system_tables as sys
-from gnitz.catalog.registry import ingest_to_family, validate_fk_inline, validate_fk_distributed
+from gnitz.catalog.registry import (
+    ingest_to_family, validate_fk_inline, validate_fk_distributed,
+    validate_unique_indices_distributed,
+)
 from gnitz.dbsp import ops
 from gnitz import log
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
@@ -370,6 +373,7 @@ class ServerExecutor(object):
             schema = family.schema
             if in_batch is not None and in_batch.length() > 0:
                 validate_fk_distributed(family, in_batch, self.dispatcher)
+                validate_unique_indices_distributed(family, in_batch, self.dispatcher)
                 self.dispatcher.fan_out_push(target_id, in_batch, schema)
                 # No _evaluate_dag here — workers handle it
                 return None
@@ -562,6 +566,9 @@ class ServerExecutor(object):
                 and payload.batch.length() > 0
             ):
                 validate_fk_distributed(
+                    family, payload.batch, self.dispatcher
+                )
+                validate_unique_indices_distributed(
                     family, payload.batch, self.dispatcher
                 )
                 cloned = payload.batch.clone()

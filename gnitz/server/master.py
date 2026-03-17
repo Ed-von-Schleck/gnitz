@@ -316,6 +316,68 @@ class MasterDispatcher(object):
 
         return any_missing
 
+    def check_pk_exists_broadcast(self, owner_table_id, source_col_idx, check_batch, schema):
+        """Broadcast PK existence check to all workers. Returns True if any key exists.
+
+        Used for unique index enforcement: index stores are partitioned by main-table PK
+        (not index key), so we must ask ALL workers.
+        """
+        col_hint = source_col_idx + 1
+        for w in range(self.num_workers):
+            ipc.send_batch(
+                self.worker_fds[w], owner_table_id, check_batch, schema=schema,
+                flags=ipc.FLAG_HAS_PK, seek_col_idx=col_hint,
+            )
+        any_exists = False
+        for w in range(self.num_workers):
+            payload = ipc.receive_payload(self.worker_fds[w])
+            if payload.status != 0:
+                err = payload.error_msg
+                payload.close()
+                raise errors.StorageError(
+                    "Worker %d has_pk error: %s" % (w, err)
+                )
+            if payload.batch is not None:
+                for j in range(payload.batch.length()):
+                    if payload.batch.get_weight(j) == r_int64(1):
+                        any_exists = True
+            payload.close()
+        return any_exists
+
+    def check_pk_existence(self, target_id, check_batch, schema):
+        """Split-route PK check. Returns {lo: {hi: 1}} dict of existing PKs.
+
+        Used to identify UPSERT rows before unique index enforcement.
+        """
+        sub_batches = self._split_batch_by_pk(check_batch, schema)
+        for w in range(self.num_workers):
+            sb = sub_batches[w]
+            ipc.send_batch(
+                self.worker_fds[w], target_id, sb, schema=schema,
+                flags=ipc.FLAG_HAS_PK,
+            )
+            if sb is not None:
+                sb.free()
+        existing = {}
+        for w in range(self.num_workers):
+            payload = ipc.receive_payload(self.worker_fds[w])
+            if payload.status != 0:
+                err = payload.error_msg
+                payload.close()
+                raise errors.StorageError(
+                    "Worker %d has_pk error: %s" % (w, err)
+                )
+            if payload.batch is not None:
+                for j in range(payload.batch.length()):
+                    if payload.batch.get_weight(j) == r_int64(1):
+                        lo = intmask(r_uint64(payload.batch._read_pk_lo(j)))
+                        hi = intmask(r_uint64(payload.batch._read_pk_hi(j)))
+                        if lo not in existing:
+                            existing[lo] = {}
+                        existing[lo][hi] = 1
+            payload.close()
+        return existing
+
     def check_workers(self):
         """Non-blocking check for crashed workers. Returns -1 if all OK."""
         for w in range(self.num_workers):
