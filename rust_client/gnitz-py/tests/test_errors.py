@@ -14,7 +14,7 @@ def test_push_to_nonexistent_target(client):
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=10)
     with pytest.raises(gnitz.GnitzError):
-        client.push(99999, schema, batch)
+        client.push(99999, batch)
 
 
 def test_scan_nonexistent_target(client):

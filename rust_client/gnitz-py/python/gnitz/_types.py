@@ -59,4 +59,6 @@ def _to_native_schema(s):
 
 
 def _from_native_schema(s):
-    return Schema([_from_native_col(c) for c in s.columns], pk_index=s.pk_index)
+    cols = [_from_native_col(c) for c in s.columns]
+    cols[s.pk_index].primary_key = True
+    return Schema(cols, pk_index=s.pk_index)

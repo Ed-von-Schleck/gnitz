@@ -256,7 +256,7 @@ def _push_rows(client, tid, schema, pk_val_pairs, weight=1):
     batch = ZSetBatch(schema)
     for pk, val in pk_val_pairs:
         batch.append(pk=pk, val=val, weight=weight)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
 
 
 class TestZSetBatchExtend:
@@ -265,7 +265,7 @@ class TestZSetBatchExtend:
         sn, tid, schema = _make_table(client)
         batch = ZSetBatch(schema)
         batch.extend([{"pk": 1, "val": 10}, {"pk": 2, "val": 20}])
-        client.push(tid, schema, batch)
+        client.push(tid, batch)
         result = client.scan(tid)
         assert len(result) == 2
         assert {row.pk: row.val for row in result} == {1: 10, 2: 20}
@@ -276,7 +276,7 @@ class TestZSetBatchExtend:
         sn, tid, schema = _make_table(client)
         batch = ZSetBatch(schema)
         batch.extend([{"pk": 1, "val": 10, "_weight": 3}])
-        client.push(tid, schema, batch)
+        client.push(tid, batch)
         row = client.scan(tid).first()
         assert row is not None
         assert row.pk == 1

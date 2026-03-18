@@ -227,7 +227,7 @@ class TestIndexSeek:
             )
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
 
-            result = client.seek_by_index(tid, col_idx=1, key_lo=42)
+            result = client.seek_by_index(tid, col_idx=1, key=42)
             assert result.batch is not None
             assert len(result.batch.pk_lo) == 1
             assert result.batch.pk_lo[0] == 1
@@ -246,7 +246,7 @@ class TestIndexSeek:
             )
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
 
-            result = client.seek_by_index(tid, col_idx=1, key_lo=999)
+            result = client.seek_by_index(tid, col_idx=1, key=999)
             assert result.batch is None or len(result.batch.pk_lo) == 0
         finally:
             _drop_all(client, sn,
@@ -264,7 +264,7 @@ class TestIndexSeek:
             )
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
 
-            result = client.seek_by_index(tid, col_idx=1, key_lo=77)
+            result = client.seek_by_index(tid, col_idx=1, key=77)
             assert result.batch is not None
             assert len(result.batch.pk_lo) == 1
             assert result.batch.pk_lo[0] == 10
@@ -281,7 +281,7 @@ class TestIndexSeek:
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
             client.execute_sql("INSERT INTO t VALUES (5, 55)", schema_name=sn)
 
-            result = client.seek_by_index(tid, col_idx=1, key_lo=55)
+            result = client.seek_by_index(tid, col_idx=1, key=55)
             assert result.batch is not None
             assert len(result.batch.pk_lo) == 1
             assert result.batch.pk_lo[0] == 5
@@ -311,9 +311,9 @@ class TestIndexSql:
                 "SELECT * FROM t WHERE cust_id = 42", schema_name=sn
             )
             assert results[0]["type"] == "Rows"
-            batch = results[0]["batch"]
-            assert len(batch.pk_lo) == 1
-            assert batch.pk_lo[0] == 1
+            rows = results[0]["rows"]
+            assert len(rows.batch.pk_lo) == 1
+            assert rows.batch.pk_lo[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -334,7 +334,7 @@ class TestIndexSql:
                 "SELECT * FROM t WHERE pk = 7", schema_name=sn
             )
             assert results[0]["type"] == "Rows"
-            assert results[0]["batch"].pk_lo[0] == 7
+            assert results[0]["rows"].batch.pk_lo[0] == 7
         finally:
             _drop_all(client, sn, tables=["t"])
 
@@ -373,9 +373,9 @@ class TestIndexSql:
                 schema_name=sn,
             )
             assert results[0]["type"] == "Rows"
-            batch = results[0]["batch"]
-            assert len(batch.pk_lo) == 1
-            assert batch.pk_lo[0] == 1
+            rows = results[0]["rows"]
+            assert len(rows.batch.pk_lo) == 1
+            assert rows.batch.pk_lo[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],
@@ -397,7 +397,7 @@ class TestIndexSql:
                 "SELECT * FROM t WHERE val = 999", schema_name=sn
             )
             assert results[0]["type"] == "Rows"
-            assert len(results[0]["batch"].pk_lo) == 0
+            assert len(results[0]["rows"].batch.pk_lo) == 0
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],

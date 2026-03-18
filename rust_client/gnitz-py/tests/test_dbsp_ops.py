@@ -22,7 +22,7 @@ def _push(client, tid, schema, rows):
     batch = gnitz.ZSetBatch(schema)
     for pk, val, w in rows:
         batch.append(pk=pk, val=val, weight=w)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
 
 
 def _scan_dict(client, target_id):
@@ -53,13 +53,13 @@ class TestFilterView:
         prog = eb.build(result_reg=cond)
 
         filt = cb.filter(inp, prog)
-        cb.sink(filt, cb._view_id)
+        cb.sink(filt)
         circuit = cb.build()
 
         out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                     gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
         view_id = client.create_view_with_circuit(sn, "vf", circuit, out_cols)
-        assert view_id == circuit._view_id
+        assert view_id > 0
 
         _push(client, tid, schema, [(1, 30, 1), (2, 70, 1), (3, 100, 1)])
         data = _scan_dict(client, view_id)
@@ -91,7 +91,7 @@ class TestReduceView:
         inp = cb.input_delta()
         # reduce: group_by=[col 1 = group_id], agg_col=2 (val), agg_func=1 (count)
         red = cb.reduce(inp, group_by_cols=[1], agg_func_id=1, agg_col_idx=2)
-        cb.sink(red, cb._view_id)
+        cb.sink(red)
         circuit = cb.build()
 
         # Output schema for reduce: (U128 hash pk, I64 group_id, I64 agg)
@@ -104,7 +104,7 @@ class TestReduceView:
         batch = gnitz.ZSetBatch(schema)
         for pk, gid, val in [(1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40)]:
             batch.append(pk=pk, group_id=gid, val=val)
-        client.push(tid, schema, batch)
+        client.push(tid, batch)
 
         result = client.scan(view_id)
         assert len(result) > 0
@@ -136,7 +136,7 @@ class TestMapOperator:
         cb = client.circuit_builder(source_table_id=tid)
         inp = cb.input_delta()
         out = cb.map(inp, projection=[2, 1])  # swap a and b (1-indexed payload cols)
-        cb.sink(out, cb._view_id)
+        cb.sink(out)
         circuit = cb.build()
 
         # Output: (pk, b, a)
@@ -147,7 +147,7 @@ class TestMapOperator:
 
         batch = gnitz.ZSetBatch(schema)
         batch.append(pk=1, a=10, b=20)
-        client.push(tid, schema, batch)
+        client.push(tid, batch)
 
         rows = [r for r in client.scan(vid) if r.weight > 0]
         assert len(rows) == 1
@@ -173,7 +173,7 @@ class TestMapOperator:
         cb = client.circuit_builder(source_table_id=tid)
         inp = cb.input_delta()
         out = cb.map(inp, projection=[1])  # only a
-        cb.sink(out, cb._view_id)
+        cb.sink(out)
         circuit = cb.build()
 
         # Output: (pk, a)
@@ -183,7 +183,7 @@ class TestMapOperator:
 
         batch = gnitz.ZSetBatch(schema)
         batch.append(pk=1, a=10, b=99)
-        client.push(tid, schema, batch)
+        client.push(tid, batch)
 
         rows = [r for r in client.scan(vid) if r.weight > 0]
         assert len(rows) == 1
@@ -213,7 +213,7 @@ class TestNegateOperator:
         cb = client.circuit_builder(source_table_id=tid)
         inp = cb.input_delta()
         out = cb.negate(inp)
-        cb.sink(out, cb._view_id)
+        cb.sink(out)
         circuit = cb.build()
 
         out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
@@ -223,7 +223,7 @@ class TestNegateOperator:
         # Push w=-1 (retraction): negate produces w=+1, visible in scan
         batch = gnitz.ZSetBatch(schema)
         batch.append(pk=1, val=10, weight=-1)
-        client.push(tid, schema, batch)
+        client.push(tid, batch)
 
         rows = [r for r in client.scan(vid) if r.weight > 0]
         assert len(rows) == 1
@@ -334,7 +334,7 @@ class TestOperatorCombinations:
         inp = cb.input_delta()
         filt = cb.filter(inp, prog)
         mapped = cb.map(filt, projection=[2, 1])  # swap a and b
-        cb.sink(mapped, cb._view_id)
+        cb.sink(mapped)
         circuit = cb.build()
 
         out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
@@ -345,7 +345,7 @@ class TestOperatorCombinations:
         batch = gnitz.ZSetBatch(schema)
         batch.append(pk=1, a=5, b=50)   # filtered out (a=5 <= 10)
         batch.append(pk=2, a=20, b=200)  # passes (a=20 > 10)
-        client.push(tid, schema, batch)
+        client.push(tid, batch)
 
         rows = [r for r in client.scan(vid) if r.weight > 0]
         assert len(rows) == 1
@@ -379,14 +379,14 @@ class TestOperatorCombinations:
             b_batch.append(pk=1, extra=0)
             b_batch.append(pk=2, extra=0)
             b_batch.append(pk=3, extra=0)
-            client.push(b_tid, b_schema, b_batch)
+            client.push(b_tid, b_batch)
 
             # join output: (pk, group_id, val, extra) → col 1=group_id, col 2=val
             cb = client.circuit_builder(source_table_id=a_tid)
             inp = cb.input_delta()
             j = cb.join(inp, b_tid)
             red = cb.reduce(j, group_by_cols=[1], agg_func_id=2, agg_col_idx=2)
-            cb.sink(red, cb._view_id)
+            cb.sink(red)
             circuit = cb.build()
 
             out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U128, primary_key=True),
@@ -398,7 +398,7 @@ class TestOperatorCombinations:
             a_batch.append(pk=1, group_id=10, val=100)
             a_batch.append(pk=2, group_id=10, val=200)
             a_batch.append(pk=3, group_id=20, val=50)
-            client.push(a_tid, a_schema, a_batch)
+            client.push(a_tid, a_batch)
 
             rows = [r for r in client.scan(vid) if r.weight > 0]
             totals = {row[1]: row[2] for row in rows}
@@ -438,7 +438,7 @@ class TestOperatorCombinations:
 
         cb1 = client.circuit_builder(source_table_id=tid)
         filt1 = cb1.filter(cb1.input_delta(), prog1)
-        cb1.sink(filt1, cb1._view_id)
+        cb1.sink(filt1)
         vid1 = client.create_view_with_circuit(sn, "v1", cb1.build(), out_cols)
 
         # View 2: filter val > 50
@@ -450,14 +450,14 @@ class TestOperatorCombinations:
 
         cb2 = client.circuit_builder(source_table_id=tid)
         filt2 = cb2.filter(cb2.input_delta(), prog2)
-        cb2.sink(filt2, cb2._view_id)
+        cb2.sink(filt2)
         vid2 = client.create_view_with_circuit(sn, "v2", cb2.build(), out_cols)
 
         batch = gnitz.ZSetBatch(schema)
         batch.append(pk=1, val=5)
         batch.append(pk=2, val=30)
         batch.append(pk=3, val=100)
-        client.push(tid, schema, batch)
+        client.push(tid, batch)
 
         v1_pks = sorted(r.pk for r in client.scan(vid1) if r.weight > 0)
         v2_pks = sorted(r.pk for r in client.scan(vid2) if r.weight > 0)

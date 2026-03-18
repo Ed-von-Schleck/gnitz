@@ -234,7 +234,7 @@ class TestTableDDL:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=10)
             batch.append(pk=2, val=20)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             client.drop_table(sn, tn)  # must not raise
         finally:
             client.drop_schema(sn)
@@ -288,7 +288,7 @@ class TestDMLEdgeCases:
         try:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=0, val=42)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             rows = _scan_positive(client, tid)
             assert len(rows) == 1
             assert rows[0].pk == 0
@@ -305,7 +305,7 @@ class TestDMLEdgeCases:
         try:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=max_u64, val=99)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             rows = _scan_positive(client, tid)
             assert len(rows) == 1
             assert rows[0].pk == max_u64
@@ -322,7 +322,7 @@ class TestDMLEdgeCases:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=-100)
             batch.append(pk=2, val=-(2**62))
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             vals = {r.pk: r.val for r in _scan_positive(client, tid)}
             assert vals[1] == -100
             assert vals[2] == -(2**62)
@@ -343,10 +343,10 @@ class TestDMLEdgeCases:
             tid2 = client.create_table(sn2, "items", cols)
             b1 = gnitz.ZSetBatch(schema)
             b1.append(pk=1, val=100)
-            client.push(tid1, schema, b1)
+            client.push(tid1, b1)
             b2 = gnitz.ZSetBatch(schema)
             b2.append(pk=1, val=200)
-            client.push(tid2, schema, b2)
+            client.push(tid2, b2)
             rows1 = _scan_positive(client, tid1)
             rows2 = _scan_positive(client, tid2)
             assert rows1[0].val == 100
@@ -368,7 +368,7 @@ class TestDMLEdgeCases:
             batch = gnitz.ZSetBatch(schema)
             for i in range(1, 1001):
                 batch.append(pk=i, val=i * 10)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             rows = _scan_positive(client, tid)
             assert len(rows) == 1000
         finally:
@@ -417,10 +417,10 @@ class TestViewLifecycle:
             ins = gnitz.ZSetBatch(schema)
             for i in range(1, 4):
                 ins.append(pk=i, val=i * 10)
-            client.push(tid, schema, ins)
+            client.push(tid, ins)
             ret = gnitz.ZSetBatch(schema)
             ret.append(pk=2, val=20, weight=-1)
-            client.push(tid, schema, ret)
+            client.push(tid, ret)
             rows = _scan_positive(client, vid)
             pks = {r.pk for r in rows}
             assert len(rows) == 2
@@ -445,7 +445,7 @@ class TestViewLifecycle:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=10)
             batch.append(pk=2, val=20)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             assert len(_scan_positive(client, vid1)) == 2
             assert len(_scan_positive(client, vid2)) == 2
         finally:
@@ -468,7 +468,7 @@ class TestViewLifecycle:
             batch = gnitz.ZSetBatch(schema)
             for pk, val in [(10, 100), (20, 200), (30, 300)]:
                 batch.append(pk=pk, val=val)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             src  = sorted((r.pk, r.val) for r in _scan_positive(client, tid))
             view = sorted((r.pk, r.val) for r in _scan_positive(client, vid))
             assert src == view
@@ -495,10 +495,10 @@ class TestViewLifecycle:
             vid = client.create_view(sn, vn, tid_a, schema)
             ba = gnitz.ZSetBatch(schema)
             ba.append(pk=1, val=10)
-            client.push(tid_a, schema, ba)
+            client.push(tid_a, ba)
             bb = gnitz.ZSetBatch(schema)
             bb.append(pk=2, val=20)
-            client.push(tid_b, schema, bb)
+            client.push(tid_b, bb)
             rows = _scan_positive(client, vid)
             assert len(rows) == 1
             assert rows[0].pk == 1
@@ -542,7 +542,7 @@ class TestViewLifecycle:
             assert vid2 > vid1
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=10)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             assert len(_scan_positive(client, vid2)) == 1
         finally:
             try:
@@ -563,7 +563,7 @@ class TestViewLifecycle:
             vid2 = client.create_view(sn, vn2, tid, schema)
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=10)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             client.drop_view(sn, vn1)
             assert len(_scan_positive(client, vid2)) == 1
             with pytest.raises(gnitz.GnitzError):

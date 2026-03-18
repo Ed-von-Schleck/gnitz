@@ -24,7 +24,7 @@ def _push(client, tid, schema, rows, weight=1):
     batch = gnitz.ZSetBatch(schema)
     for pk, val in rows:
         batch.append(pk=pk, val=val, weight=weight)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
 
 
 def _scan_rows(client, tid):
@@ -80,7 +80,7 @@ def test_intra_batch_overwrite(client):
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=7, val=10)
     batch.append(pk=7, val=20)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
     assert _scan_rows(client, tid) == [(7, 20)]
     client.drop_table(sn, "t")
     client.drop_schema(sn)
@@ -134,7 +134,7 @@ def test_upsert_intra_batch_insert_then_delete(client):
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=10, weight=1)
     batch.append(pk=1, val=0, weight=-1)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
     assert _scan_rows(client, tid) == []
     client.drop_table(sn, "t")
     client.drop_schema(sn)
@@ -147,7 +147,7 @@ def test_upsert_intra_batch_delete_then_insert(client):
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=0, weight=-1)
     batch.append(pk=1, val=99, weight=1)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
     assert _scan_rows(client, tid) == [(1, 99)]
     client.drop_table(sn, "t")
     client.drop_schema(sn)

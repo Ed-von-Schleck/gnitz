@@ -470,7 +470,11 @@ impl GnitzClient {
         circuit: CircuitGraph,
         output_columns: &[ColumnDef],
     ) -> Result<u64, ClientError> {
-        let vid = circuit.view_id;
+        let vid = if circuit.view_id == 0 {
+            ops::alloc_table_id(&self.conn)?
+        } else {
+            circuit.view_id
+        };
 
         let (_, schema_batch) = ops::scan(&self.conn, SCHEMA_TAB)?;
         let schema_batch = schema_batch.ok_or_else(|| {

@@ -446,15 +446,17 @@ impl PyGnitzClient {
         }
     }
 
-    /// delete(target_id, schema, pks: list[int]) — pks are pk_lo values; pk_hi assumed 0.
+    /// delete(target_id, schema, pks: list[int]) — pks are full U128 primary keys.
     pub fn delete(
         &self, py: Python<'_>,
         target_id: u64,
         schema: PyRef<'_, PySchema>,
-        pks: Vec<u64>,
+        pks: Vec<u128>,
     ) -> PyResult<()> {
         let rust_schema = py_schema_to_rust(py, &schema)?;
-        let pk_pairs: Vec<(u64, u64)> = pks.into_iter().map(|pk| (pk, 0u64)).collect();
+        let pk_pairs: Vec<(u64, u64)> = pks.into_iter()
+            .map(|pk| (pk as u64, (pk >> 64) as u64))
+            .collect();
         client!(self).delete(target_id, &rust_schema, &pk_pairs)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
@@ -652,22 +654,19 @@ impl PyExprBuilder {
     pub fn build(&mut self, result_reg: u32) -> PyResult<PyExprProgram> {
         let b = self.inner.take()
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("ExprBuilder already consumed"))?;
-        Ok(PyExprProgram { inner: Some(b.build(result_reg)) })
+        Ok(PyExprProgram { inner: b.build(result_reg) })
     }
 }
 
 #[pyclass(name = "ExprProgram")]
 pub struct PyExprProgram {
-    pub(crate) inner: Option<ExprProgram>,
+    pub(crate) inner: ExprProgram,
 }
 
 #[pymethods]
 impl PyExprProgram {
     pub fn __repr__(&self) -> String {
-        match &self.inner {
-            Some(p) => format!("ExprProgram(num_regs={}, result_reg={})", p.num_regs, p.result_reg),
-            None    => "ExprProgram(consumed)".to_string(),
-        }
+        format!("ExprProgram(num_regs={}, result_reg={})", self.inner.num_regs, self.inner.result_reg)
     }
 }
 
@@ -707,14 +706,7 @@ impl PyCircuitBuilder {
         &mut self, input: u64,
         expr: Option<PyRef<'_, PyExprProgram>>,
     ) -> PyResult<u64> {
-        let expr_opt = match expr {
-            Some(e) => Some(
-                e.inner.as_ref()
-                    .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("ExprProgram consumed"))?
-                    .clone()
-            ),
-            None => None,
-        };
+        let expr_opt = expr.map(|e| e.inner.clone());
         Ok(circuit_builder!(self).filter(input, expr_opt))
     }
 
@@ -752,9 +744,12 @@ impl PyCircuitBuilder {
         Ok(circuit_builder!(self).gather(input, worker_id))
     }
 
-    /// sink(input, target_table_id) — target_table_id is informational only.
-    pub fn sink(&mut self, input: u64, target_table_id: u64) -> PyResult<u64> {
-        Ok(circuit_builder!(self).sink(input, target_table_id))
+    pub fn sink(&mut self, input: u64) -> PyResult<u64> {
+        Ok(circuit_builder!(self).sink(input, 0))
+    }
+
+    pub fn map_expr(&mut self, input: u64, expr: PyRef<'_, PyExprProgram>) -> PyResult<u64> {
+        Ok(circuit_builder!(self).map_expr(input, expr.inner.clone()))
     }
 
     /// Consume builder and produce a CircuitGraph for create_view_with_circuit.

@@ -27,7 +27,7 @@ def test_push_scan_multiworker(client):
     batch = gnitz.ZSetBatch(schema)
     for i in range(1, n + 1):
         batch.append(pk=i, val=i * 10)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
 
     result = client.scan(tid)
     pks = sorted(row.pk for row in result if row.weight > 0)
@@ -77,7 +77,7 @@ def test_index_maintained_on_all_workers(client):
 
         tid, _ = client.resolve_table(sn, "t")
         for i in range(1, n + 1):
-            result = client.seek_by_index(tid, col_idx=1, key_lo=i * 100)
+            result = client.seek_by_index(tid, col_idx=1, key=i * 100)
             assert result.batch is not None and len(result.batch.pk_lo) == 1, \
                 f"cust_id={i * 100} not found via index"
             assert result.batch.pk_lo[0] == i
@@ -124,7 +124,7 @@ def test_seek_routes_to_correct_worker(client):
         client.execute_sql("INSERT INTO t VALUES (42, 999)", schema_name=sn)
 
         tid, _ = client.resolve_table(sn, "t")
-        result = client.seek(tid, pk_lo=42)
+        result = client.seek(tid, pk=42)
         assert result.batch is not None and len(result.batch.pk_lo) == 1
         assert result.batch.pk_lo[0] == 42
     finally:
@@ -145,7 +145,7 @@ def test_seek_by_index_broadcast(client):
         client.execute_sql("INSERT INTO t VALUES (7, 1234)", schema_name=sn)
 
         tid, _ = client.resolve_table(sn, "t")
-        result = client.seek_by_index(tid, col_idx=1, key_lo=1234)
+        result = client.seek_by_index(tid, col_idx=1, key=1234)
         assert result.batch is not None and len(result.batch.pk_lo) == 1
         assert result.batch.pk_lo[0] == 7
     finally:
@@ -448,7 +448,7 @@ def _concurrent_push_worker(server_path, tid, pk_start, pk_end, barrier):
         batch = _gnitz.ZSetBatch(schema)
         for pk in range(pk_start, pk_end):
             batch.append(pk=pk, val=pk)
-        c.push(tid, schema, batch)
+        c.push(tid, batch)
 
 
 def _concurrent_multi_table_worker(server_path, tid, pk_start, pk_end, barrier):
@@ -462,7 +462,7 @@ def _concurrent_multi_table_worker(server_path, tid, pk_start, pk_end, barrier):
         batch = _gnitz.ZSetBatch(schema)
         for pk in range(pk_start, pk_end):
             batch.append(pk=pk, val=pk)
-        c.push(tid, schema, batch)
+        c.push(tid, batch)
 
 
 @_NEEDS_MULTI

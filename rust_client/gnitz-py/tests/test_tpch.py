@@ -61,7 +61,7 @@ def _push_lineitem(client, tid, rows, weight=1):
     batch = gnitz.ZSetBatch(LINEITEM_SCHEMA)
     for pk, okey, qty, price in rows:
         batch.append(pk=pk, orderkey=okey, quantity=qty, price=price, weight=weight)
-    client.push(tid, LINEITEM_SCHEMA, batch)
+    client.push(tid, batch)
 
 
 def _push_orders(client, tid, rows):
@@ -69,14 +69,14 @@ def _push_orders(client, tid, rows):
     for row in rows:
         okey, ckey, _totalprice, status = row
         batch.append(orderkey=okey, custkey=ckey, status=status)
-    client.push(tid, ORDERS_SCHEMA, batch)
+    client.push(tid, batch)
 
 
 def _push_li_agg(client, tid, rows, weight=1):
     batch = gnitz.ZSetBatch(LI_AGG_SCHEMA)
     for okey, total_price in rows:
         batch.append(orderkey=okey, total_price=total_price, weight=weight)
-    client.push(tid, LI_AGG_SCHEMA, batch)
+    client.push(tid, batch)
 
 
 def _scan_reduce(client, vid):
@@ -173,7 +173,7 @@ class TestQ1FilterReduceScaling:
         inp = cb.input_delta()
         filt = cb.filter(inp, prog)
         red = cb.reduce(filt, group_by_cols=[1], agg_func_id=2, agg_col_idx=2)
-        cb.sink(red, cb._view_id)
+        cb.sink(red)
         circuit = cb.build()
 
         vname = "v_q1_" + _uid()
@@ -319,7 +319,7 @@ class TestQ2JoinReduceScaling:
         # join output: (orderkey:U64, total_price:I64, custkey:I64, status:STRING)
         # group_by=[2](custkey), SUM col 1 (total_price)
         red = cb.reduce(j, group_by_cols=[2], agg_func_id=2, agg_col_idx=1)
-        cb.sink(red, cb._view_id)
+        cb.sink(red)
         circuit = cb.build()
 
         vname = "v_q2_" + _uid()
@@ -428,7 +428,7 @@ class TestQ3JoinChainScaling:
         inp = cb.input_delta()
         j = cb.join(inp, b_tid)
         red = cb.reduce(j, group_by_cols=[2], agg_func_id=1, agg_col_idx=1)
-        cb.sink(red, cb._view_id)
+        cb.sink(red)
         circuit = cb.build()
 
         vname = "v_q3_" + _uid()
@@ -533,7 +533,7 @@ class TestQ4MinScaling:
         inp = cb.input_delta()
         j = cb.join(inp, ord_tid)
         red = cb.reduce(j, group_by_cols=[2], agg_func_id=3, agg_col_idx=1)  # MIN
-        cb.sink(red, cb._view_id)
+        cb.sink(red)
         circuit = cb.build()
 
         vname = "v_q4_" + _uid()
@@ -693,7 +693,7 @@ class TestQ5MaxScaling:
         inp = cb.input_delta()
         j = cb.join(inp, ord_tid)
         red = cb.reduce(j, group_by_cols=[2], agg_func_id=4, agg_col_idx=1)  # MAX
-        cb.sink(red, cb._view_id)
+        cb.sink(red)
         circuit = cb.build()
 
         vname = "v_q5_" + _uid()

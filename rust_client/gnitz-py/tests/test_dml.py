@@ -22,7 +22,7 @@ def test_push_and_scan(client):
     batch = gnitz.ZSetBatch(schema)
     for i in range(1, 6):
         batch.append(pk=i, val=i * 10)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
     result = client.scan(tid)
     assert len(result) == 5
     client.drop_table(sn, "t")
@@ -42,7 +42,7 @@ def test_delete_rows(client):
     batch = gnitz.ZSetBatch(schema)
     for pk, val in [(1, 10), (2, 20), (3, 30)]:
         batch.append(pk=pk, val=val)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
     client.delete(tid, schema, [2])
     result = client.scan(tid)
     pks = sorted(row.pk for row in result if row.weight > 0)
@@ -62,7 +62,7 @@ def test_nullable_string_columns(client):
     batch.append(pk=1, s="hello")
     batch.append(pk=2, s=None)
     batch.append(pk=3, s="world")
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
     result = client.scan(tid)
     assert len(result) == 3
     client.drop_table(sn, "strs")
@@ -76,7 +76,7 @@ def test_scan_values_correct(client):
     batch = gnitz.ZSetBatch(schema)
     for pk, val in rows_in:
         batch.append(pk=pk, val=val)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
     result = client.scan(tid)
     assert len(result) == 10
     pairs = sorted((row.pk, row.val) for row in result)
@@ -429,13 +429,13 @@ class TestDeleteSQL:
             tid, _ = client.resolve_table(sn, "t")
 
             # Confirm row is found via index before delete
-            before = client.seek_by_index(tid, col_idx=2, key_lo=10)
+            before = client.seek_by_index(tid, col_idx=2, key=10)
             assert before.batch is not None and len(before.batch.pk_lo) == 1
 
             client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
 
             # After delete the index should return empty
-            after = client.seek_by_index(tid, col_idx=2, key_lo=10)
+            after = client.seek_by_index(tid, col_idx=2, key=10)
             empty = after.batch is None or len(after.batch.pk_lo) == 0
             assert empty
         finally:
@@ -497,7 +497,7 @@ class TestStringEdgeCases:
         try:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, label="")
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             rows = [r for r in client.scan(tid) if r.weight > 0]
             assert len(rows) == 1
             assert rows[0].label == ""
@@ -513,7 +513,7 @@ class TestStringEdgeCases:
             assert len(s12) == 12
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, label=s12)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             rows = [r for r in client.scan(tid) if r.weight > 0]
             assert len(rows) == 1
             assert rows[0].label == s12
@@ -529,7 +529,7 @@ class TestStringEdgeCases:
             assert len(long_s) > 12
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, label=long_s)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             rows = [r for r in client.scan(tid) if r.weight > 0]
             assert len(rows) == 1
             assert rows[0].label == long_s
@@ -543,7 +543,7 @@ class TestStringEdgeCases:
         try:
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, label=None)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
             rows = [r for r in client.scan(tid) if r.weight > 0]
             assert len(rows) == 1
             assert rows[0].label is None

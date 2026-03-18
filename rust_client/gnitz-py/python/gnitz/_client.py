@@ -40,9 +40,8 @@ class Connection:
 
     # DML
 
-    def push(self, target_id, schema, batch):
-        raw_batch = batch._raw if isinstance(batch, ZSetBatch) else batch
-        self._client.push(target_id, _to_native_schema(schema), raw_batch)
+    def push(self, target_id, batch):
+        self._client.push(target_id, _to_native_schema(batch._schema), batch._raw)
 
     def scan(self, target_id):
         native_schema, batch = self._client.scan(target_id)
@@ -56,9 +55,7 @@ class Connection:
     # Views
 
     def circuit_builder(self, source_table_id):
-        """Allocate view_id internally and return a CircuitBuilder."""
-        view_id = self._client.allocate_table_id()
-        return CircuitBuilder(view_id, source_table_id)
+        return CircuitBuilder(source_table_id)
 
     def create_view(self, schema_name, view_name, source_table_id, output_schema):
         return self._client.create_view(
@@ -85,23 +82,28 @@ class Connection:
     def resolve_table_id(self, schema_name, table_name):
         return self.resolve_table(schema_name, table_name)
 
-    def seek(self, table_id: int, pk_lo: int = 0, pk_hi: int = 0) -> "ScanResult":
+    def seek(self, table_id: int, pk: int = 0) -> "ScanResult":
+        pk_lo = pk & 0xFFFFFFFFFFFFFFFF
+        pk_hi = (pk >> 64) & 0xFFFFFFFFFFFFFFFF
         native_schema, batch = self._client.seek(table_id, pk_lo, pk_hi)
         if native_schema is None:
             return ScanResult(None, None)
         return ScanResult(_from_native_schema(native_schema), batch)
 
-    def seek_by_index(self, table_id: int, col_idx: int,
-                      key_lo: int = 0, key_hi: int = 0) -> "ScanResult":
-        native_schema, batch = self._client.seek_by_index(
-            table_id, col_idx, key_lo, key_hi
-        )
+    def seek_by_index(self, table_id: int, col_idx: int, key: int = 0) -> "ScanResult":
+        key_lo = key & 0xFFFFFFFFFFFFFFFF
+        key_hi = (key >> 64) & 0xFFFFFFFFFFFFFFFF
+        native_schema, batch = self._client.seek_by_index(table_id, col_idx, key_lo, key_hi)
         if native_schema is None:
             return ScanResult(None, None)
         return ScanResult(_from_native_schema(native_schema), batch)
 
     def execute_sql(self, sql: str, schema_name: str = "public") -> list:
-        return self._client.execute_sql(schema_name, sql)
+        results = self._client.execute_sql(schema_name, sql)
+        for r in results:
+            if isinstance(r, dict) and r.get("type") == "Rows":
+                r["rows"] = ScanResult(_from_native_schema(r.pop("schema")), r.pop("batch"))
+        return results
 
     # Low-level
 

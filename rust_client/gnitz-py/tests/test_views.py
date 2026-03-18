@@ -31,7 +31,7 @@ def test_view_scan_propagates_inserts(client):
 
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=10).append(pk=2, val=20).append(pk=3, val=30)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
 
     result = client.scan(vid)
     assert len(result) == 3

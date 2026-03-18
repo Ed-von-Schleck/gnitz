@@ -20,7 +20,7 @@ def _push(client, tid, schema, rows, weight=1):
         else:
             pk, val = row
             batch.append(pk=pk, val=val, weight=weight)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
 
 
 def _scan_positive(client, target_id):
@@ -70,7 +70,7 @@ class TestFilterRetraction:
             schema = gnitz.Schema(cols)
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=100, weight=-1)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
 
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
         finally:
@@ -104,7 +104,7 @@ class TestFilterRetraction:
             schema = gnitz.Schema(cols)
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=10, weight=-1)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
 
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
         finally:
@@ -155,7 +155,7 @@ class TestJoinRetraction:
             a_schema = gnitz.Schema(a_cols)
             batch = gnitz.ZSetBatch(a_schema)
             batch.append(pk=1, val=100, weight=-1)
-            client.push(a_tid, a_schema, batch)
+            client.push(a_tid, batch)
 
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
         finally:
@@ -181,7 +181,7 @@ class TestJoinRetraction:
             b_schema = gnitz.Schema(b_cols)
             batch = gnitz.ZSetBatch(b_schema)
             batch.append(pk=1, label=999, weight=-1)
-            client.push(b_tid, b_schema, batch)
+            client.push(b_tid, batch)
 
             assert len([r for r in client.scan(vid) if r.weight > 0]) == 0
         finally:
@@ -215,7 +215,7 @@ def _make_reduce_view(client, sn, tid, agg_func_id, vname=None):
     cb = client.circuit_builder(source_table_id=tid)
     inp = cb.input_delta()
     red = cb.reduce(inp, group_by_cols=[1], agg_func_id=agg_func_id, agg_col_idx=2)
-    cb.sink(red, cb._view_id)
+    cb.sink(red)
     circuit = cb.build()
     out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U128, primary_key=True),
                 gnitz.ColumnDef("grp", gnitz.TypeCode.I64),
@@ -229,7 +229,7 @@ def _push_grp(client, tid, schema, rows, weight=1):
     batch = gnitz.ZSetBatch(schema)
     for pk, grp, val in rows:
         batch.append(pk=pk, grp=grp, val=val, weight=weight)
-    client.push(tid, schema, batch)
+    client.push(tid, batch)
 
 
 class TestReduceSumRetraction:
@@ -561,7 +561,7 @@ class TestViewCascade:
             schema = gnitz.Schema(cols)
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=100, weight=-1)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
 
             assert len([r for r in client.scan(v1_id) if r.weight > 0]) == 0
             assert len([r for r in client.scan(v2_id) if r.weight > 0]) == 0
@@ -715,12 +715,12 @@ class TestAntiJoinSemantics:
             # Pre-populate trace BEFORE creating the circuit
             batch = gnitz.ZSetBatch(t_schema)
             batch.append(pk=2, val=2)
-            client.push(trace_tid, t_schema, batch)
+            client.push(trace_tid, batch)
 
             cb = client.circuit_builder(source_table_id=delta_tid)
             inp = cb.input_delta()
             out = cb.anti_join(inp, trace_tid)
-            cb.sink(out, cb._view_id)
+            cb.sink(out)
             circuit = cb.build()
             out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                         gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
@@ -729,7 +729,7 @@ class TestAntiJoinSemantics:
             batch = gnitz.ZSetBatch(d_schema)
             for pk in [1, 2, 3]:
                 batch.append(pk=pk, val=pk)
-            client.push(delta_tid, d_schema, batch)
+            client.push(delta_tid, batch)
 
             positive = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
             assert positive == [1, 3]
@@ -756,12 +756,12 @@ class TestAntiJoinSemantics:
             for pk in [1, 2, 3]:
                 batch = gnitz.ZSetBatch(t_schema)
                 batch.append(pk=pk, val=pk)
-                client.push(trace_tid, t_schema, batch)
+                client.push(trace_tid, batch)
 
             cb = client.circuit_builder(source_table_id=delta_tid)
             inp = cb.input_delta()
             out = cb.anti_join(inp, trace_tid)
-            cb.sink(out, cb._view_id)
+            cb.sink(out)
             circuit = cb.build()
             out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                         gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
@@ -770,7 +770,7 @@ class TestAntiJoinSemantics:
             batch = gnitz.ZSetBatch(d_schema)
             for pk in [1, 2, 3]:
                 batch.append(pk=pk, val=pk)
-            client.push(delta_tid, d_schema, batch)
+            client.push(delta_tid, batch)
 
             positive = [r for r in client.scan(vid) if r.weight > 0]
             assert len(positive) == 0
@@ -797,7 +797,7 @@ class TestAntiJoinSemantics:
             cb = client.circuit_builder(source_table_id=delta_tid)
             inp = cb.input_delta()
             out = cb.anti_join(inp, trace_tid)
-            cb.sink(out, cb._view_id)
+            cb.sink(out)
             circuit = cb.build()
             out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                         gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
@@ -806,7 +806,7 @@ class TestAntiJoinSemantics:
             batch = gnitz.ZSetBatch(d_schema)
             for pk in [1, 2, 3]:
                 batch.append(pk=pk, val=pk)
-            client.push(delta_tid, d_schema, batch)
+            client.push(delta_tid, batch)
 
             positive = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
             assert positive == [1, 2, 3]
@@ -833,7 +833,7 @@ class TestAntiJoinSemantics:
             cb = client.circuit_builder(source_table_id=delta_tid)
             inp = cb.input_delta()
             out = cb.anti_join(inp, trace_tid)
-            cb.sink(out, cb._view_id)
+            cb.sink(out)
             circuit = cb.build()
             out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                         gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
@@ -843,20 +843,20 @@ class TestAntiJoinSemantics:
             batch = gnitz.ZSetBatch(d_schema)
             batch.append(pk=1, val=1)
             batch.append(pk=2, val=2)
-            client.push(delta_tid, d_schema, batch)
+            client.push(delta_tid, batch)
             positive = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
             assert positive == [1, 2]
 
             # Add [1] to trace
             t_batch = gnitz.ZSetBatch(t_schema)
             t_batch.append(pk=1, val=1)
-            client.push(trace_tid, t_schema, t_batch)
+            client.push(trace_tid, t_batch)
 
             # Tick 2: push new delta [3] — circuit fires, trace now has [1]
             # [3] is NOT in trace, so only [3] is added
             batch2 = gnitz.ZSetBatch(d_schema)
             batch2.append(pk=3, val=3)
-            client.push(delta_tid, d_schema, batch2)
+            client.push(delta_tid, batch2)
 
             # The new delta row 3 should pass through (not in trace)
             positive2 = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
@@ -890,12 +890,12 @@ class TestSemiJoinSemantics:
 
             batch = gnitz.ZSetBatch(t_schema)
             batch.append(pk=2, val=2)
-            client.push(trace_tid, t_schema, batch)
+            client.push(trace_tid, batch)
 
             cb = client.circuit_builder(source_table_id=delta_tid)
             inp = cb.input_delta()
             out = cb.semi_join(inp, trace_tid)
-            cb.sink(out, cb._view_id)
+            cb.sink(out)
             circuit = cb.build()
             out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                         gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
@@ -904,7 +904,7 @@ class TestSemiJoinSemantics:
             batch = gnitz.ZSetBatch(d_schema)
             for pk in [1, 2, 3]:
                 batch.append(pk=pk, val=pk)
-            client.push(delta_tid, d_schema, batch)
+            client.push(delta_tid, batch)
 
             positive = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
             assert positive == [2]
@@ -930,7 +930,7 @@ class TestSemiJoinSemantics:
 
             batch = gnitz.ZSetBatch(t_schema)
             batch.append(pk=2, val=2)
-            client.push(trace_tid, t_schema, batch)
+            client.push(trace_tid, batch)
 
             out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                         gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
@@ -938,21 +938,21 @@ class TestSemiJoinSemantics:
             cb_aj = client.circuit_builder(source_table_id=delta_tid)
             inp_aj = cb_aj.input_delta()
             out_aj = cb_aj.anti_join(inp_aj, trace_tid)
-            cb_aj.sink(out_aj, cb_aj._view_id)
+            cb_aj.sink(out_aj)
             aj_circuit = cb_aj.build()
             aj_vid = client.create_view_with_circuit(sn, "vaj2", aj_circuit, out_cols)
 
             cb_sj = client.circuit_builder(source_table_id=delta_tid)
             inp_sj = cb_sj.input_delta()
             out_sj = cb_sj.semi_join(inp_sj, trace_tid)
-            cb_sj.sink(out_sj, cb_sj._view_id)
+            cb_sj.sink(out_sj)
             sj_circuit = cb_sj.build()
             sj_vid = client.create_view_with_circuit(sn, "vsj2", sj_circuit, out_cols)
 
             batch = gnitz.ZSetBatch(d_schema)
             for pk in [1, 2, 3]:
                 batch.append(pk=pk, val=pk)
-            client.push(delta_tid, d_schema, batch)
+            client.push(delta_tid, batch)
 
             aj_pks = sorted(r.pk for r in client.scan(aj_vid) if r.weight > 0)
             sj_pks = sorted(r.pk for r in client.scan(sj_vid) if r.weight > 0)
@@ -994,7 +994,7 @@ class TestDistinctOperator:
             cb = client.circuit_builder(source_table_id=tid)
             inp = cb.input_delta()
             out = cb.distinct(inp)
-            cb.sink(out, cb._view_id)
+            cb.sink(out)
             circuit = cb.build()
             out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                         gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
@@ -1002,11 +1002,11 @@ class TestDistinctOperator:
 
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=10, weight=1)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
 
             batch2 = gnitz.ZSetBatch(schema)
             batch2.append(pk=1, val=10, weight=1)
-            client.push(tid, schema, batch2)
+            client.push(tid, batch2)
 
             rows = [r for r in client.scan(vid) if r.weight > 0]
             assert len(rows) == 1
@@ -1036,7 +1036,7 @@ class TestDistinctOperator:
             cb = client.circuit_builder(source_table_id=tid)
             inp = cb.input_delta()
             out = cb.distinct(inp)
-            cb.sink(out, cb._view_id)
+            cb.sink(out)
             circuit = cb.build()
             out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                         gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
@@ -1044,11 +1044,11 @@ class TestDistinctOperator:
 
             batch = gnitz.ZSetBatch(schema)
             batch.append(pk=1, val=10, weight=1)
-            client.push(tid, schema, batch)
+            client.push(tid, batch)
 
             batch2 = gnitz.ZSetBatch(schema)
             batch2.append(pk=1, val=10, weight=-1)
-            client.push(tid, schema, batch2)
+            client.push(tid, batch2)
 
             rows = [r for r in client.scan(vid) if r.weight > 0]
             assert len(rows) == 0
@@ -1126,7 +1126,7 @@ class TestStringThroughPipeline:
             r_batch = gnitz.ZSetBatch(right_schema)
             r_batch.append(pk=1, label="A")
             r_batch.append(pk=2, label="B")
-            client.push(r_tid, right_schema, r_batch)
+            client.push(r_tid, r_batch)
 
             # Circuit: join left with right, then reduce SUM(val) GROUP BY grp
             # join output: (pk, grp, val, label) → col 1=grp, col 2=val, col 3=label
@@ -1134,7 +1134,7 @@ class TestStringThroughPipeline:
             inp = cb.input_delta()
             j = cb.join(inp, r_tid)
             red = cb.reduce(j, group_by_cols=[1], agg_func_id=2, agg_col_idx=2)
-            cb.sink(red, cb._view_id)
+            cb.sink(red)
             circuit = cb.build()
 
             vname = "v_" + _uid()
@@ -1146,7 +1146,7 @@ class TestStringThroughPipeline:
             l_batch = gnitz.ZSetBatch(left_schema)
             l_batch.append(pk=1, grp=10, val=100)
             l_batch.append(pk=2, grp=10, val=200)
-            client.push(l_tid, left_schema, l_batch)
+            client.push(l_tid, l_batch)
 
             rows = [r for r in client.scan(vid) if r.weight > 0]
             assert len(rows) == 1
@@ -1197,7 +1197,7 @@ class TestChainedJoin:
             for tid, schema in [(b_tid, b_schema), (c_tid, c_schema)]:
                 batch = gnitz.ZSetBatch(schema)
                 batch.append(pk=1, val=0)
-                client.push(tid, schema, batch)
+                client.push(tid, batch)
 
             # Circuit: join A with B → (pk, a_val, b_val), then join result with C
             # join A×B output: (pk, a_val, b_val) — 3 cols
@@ -1206,7 +1206,7 @@ class TestChainedJoin:
             inp = cb.input_delta()
             j1 = cb.join(inp, b_tid)
             j2 = cb.join(j1, c_tid)
-            cb.sink(j2, cb._view_id)
+            cb.sink(j2)
             circuit = cb.build()
 
             out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
@@ -1217,7 +1217,7 @@ class TestChainedJoin:
 
             batch = gnitz.ZSetBatch(a_schema)
             batch.append(pk=1, val=10)
-            client.push(a_tid, a_schema, batch)
+            client.push(a_tid, batch)
 
             rows = [r for r in client.scan(vid) if r.weight > 0]
             assert len(rows) == 1

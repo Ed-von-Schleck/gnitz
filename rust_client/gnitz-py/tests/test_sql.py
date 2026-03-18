@@ -143,7 +143,7 @@ class TestSqlSelect:
             self._setup_with_rows(client, sn)
             results = client.execute_sql("SELECT * FROM t", schema_name=sn)
             assert results[0]["type"] == "Rows"
-            batch = results[0]["batch"]
+            batch = results[0]["rows"]
             assert len(batch) == 5
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
@@ -160,7 +160,7 @@ class TestSqlSelect:
             )
             results = client.execute_sql("SELECT * FROM v", schema_name=sn)
             assert results[0]["type"] == "Rows"
-            batch = results[0]["batch"]
+            batch = results[0]["rows"]
             # View contains rows with val 30, 40, 50 after processing
             assert len(batch) >= 0  # view may or may not have rows yet depending on ordering
 
@@ -176,7 +176,7 @@ class TestSqlSelect:
             self._setup_with_rows(client, sn)
             results = client.execute_sql("SELECT * FROM t WHERE pk = 3", schema_name=sn)
             assert results[0]["type"] == "Rows"
-            batch = results[0]["batch"]
+            batch = results[0]["rows"]
             # Should find row with pk=3
             assert len(batch) <= 1  # point lookup returns at most one row
             client.execute_sql("DROP TABLE t", schema_name=sn)
@@ -201,7 +201,7 @@ class TestSqlSelect:
             self._setup_with_rows(client, sn)
             results = client.execute_sql("SELECT * FROM t LIMIT 2", schema_name=sn)
             assert results[0]["type"] == "Rows"
-            batch = results[0]["batch"]
+            batch = results[0]["rows"]
             assert len(batch) == 2
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
