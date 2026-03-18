@@ -132,6 +132,24 @@ def test_linear_ops(base_dir):
         with batch.ConsolidatedScope(b_union) as b_union_cons:
             assert_equal_i(0, b_union_cons.length(), "Union/Negate failed to annihilate")
 
+        log("  - Union single-input sorted/consolidated propagation (Opt 1)...")
+        b_cons = b_in.to_consolidated()
+        b_empty = batch.ArenaZSetBatch(schema)
+        b_union_single = batch.ArenaZSetBatch(schema)
+        try:
+            linear.op_union(b_cons, b_empty, b_union_single)
+            assert_true(b_union_single._sorted,
+                        "Union single-input: _sorted should propagate from consolidated input")
+            assert_true(b_union_single._consolidated,
+                        "Union single-input: _consolidated should propagate")
+            assert_equal_i(b_in.length(), b_union_single.length(),
+                           "Union single-input: row count mismatch")
+        finally:
+            if b_cons is not b_in:
+                b_cons.free()
+            b_empty.free()
+            b_union_single.free()
+
         log("  - Delay & Integrate...")
         b_delay = batch.ArenaZSetBatch(schema)
         linear.op_delay(b_in, b_delay)

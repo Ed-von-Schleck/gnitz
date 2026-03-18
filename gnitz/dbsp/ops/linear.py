@@ -133,14 +133,52 @@ def op_negate(in_batch, out_writer):
         out_writer.mark_sorted(in_batch._sorted)
 
 
+def _op_union_merge(batch_a, batch_b, out_writer):
+    n_a = batch_a.length()
+    n_b = batch_b.length()
+    i = 0
+    j = 0
+    while i < n_a and j < n_b:
+        pk_a = batch_a.get_pk(i)
+        pk_b = batch_b.get_pk(j)
+        if pk_a < pk_b:
+            out_writer.append_batch(batch_a, i, i + 1)
+            i += 1
+        elif pk_b < pk_a:
+            out_writer.append_batch(batch_b, j, j + 1)
+            j += 1
+        else:
+            out_writer.append_batch(batch_a, i, i + 1)
+            out_writer.append_batch(batch_b, j, j + 1)
+            i += 1
+            j += 1
+    while i < n_a:
+        out_writer.append_batch(batch_a, i, i + 1)
+        i += 1
+    while j < n_b:
+        out_writer.append_batch(batch_b, j, j + 1)
+        j += 1
+    out_writer.mark_sorted(True)
+
+
 def op_union(batch_a, batch_b, out_writer):
     """
     Algebraic addition of two Z-Set streams.
-    batch_b may be None, in which case this is an identity copy of batch_a.
+    batch_b may be None or empty, in which case this is an identity copy of batch_a.
+    When both inputs are sorted, performs an O(N) merge preserving sort order.
     """
+    if batch_b is None or batch_b.length() == 0:
+        out_writer.append_batch(batch_a)
+        if batch_a._consolidated:
+            out_writer.mark_consolidated(True)
+        else:
+            out_writer.mark_sorted(batch_a._sorted)
+        return
+    if batch_a._sorted and batch_b._sorted:
+        _op_union_merge(batch_a, batch_b, out_writer)
+        return
     out_writer.append_batch(batch_a)
-    if batch_b is not None:
-        out_writer.append_batch(batch_b)
+    out_writer.append_batch(batch_b)
 
 
 def op_delay(in_batch, out_writer):
