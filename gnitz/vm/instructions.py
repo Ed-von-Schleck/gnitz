@@ -212,5 +212,13 @@ def semi_join_delta_delta_op(reg_a, reg_b, reg_out):
     return i
 
 
+def join_delta_trace_outer_op(reg_delta, reg_trace, reg_out):
+    i = Instruction(op.OPCODE_JOIN_DELTA_TRACE_OUTER)
+    i.reg_delta = reg_delta
+    i.reg_trace = reg_trace
+    i.reg_out = reg_out
+    return i
+
+
 def clear_deltas_op():
     return Instruction(op.OPCODE_CLEAR_DELTAS)

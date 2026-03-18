@@ -52,51 +52,23 @@ preserves correct M:N join semantics at one extra comparison per iteration.
 
 ---
 
-## Optimization 6: Left Outer Join
+## Optimization 6: Single-Pass Left Outer Join — DONE
 
-### What changes
+`OPCODE_JOIN_DELTA_TRACE_OUTER = 22` fuses inner-join + anti-join + null-fill into one
+merge-walk, eliminating the 3-node decomposition previously emitted by the planner.
 
-#### `NullAccessor` — `gnitz/core/comparator.py`
-
-```python
-class NullAccessor(RowAccessor):
-    """Returns NULL for every column. Used for outer-join right-side placeholder."""
-    def is_null(self, col_idx):       return True
-    def get_int(self, col_idx):       return r_uint64(0)
-    def get_int_signed(self, col_idx): return r_int64(0)
-    def get_float(self, col_idx):     return 0.0
-    def get_u128(self, col_idx):      return r_uint128(0)
-    def get_str_struct(self, col_idx): return (0, 0, NULL_PTR, NULL_PTR, "")
-    def get_col_ptr(self, col_idx):   return NULL_PTR
-
-NULL_ACCESSOR = NullAccessor()
-```
-
-#### `merge_schemas_for_join_outer` — `gnitz/core/types.py`
-
-Same layout as `merge_schemas_for_join` but right-side non-PK columns marked nullable.
-
-#### `op_join_delta_trace_outer` / `op_join_delta_delta_outer` — `gnitz/dbsp/ops/join.py`
-
-Mirror of the inner-join operators. When no trace match is found for a delta row,
-emit that row with `composite_acc.set_accessors(delta_acc, NULL_ACCESSOR)` and
-`weight = w_delta`. `NullAccessor.is_null()` returns True for all columns so
-`append_from_accessor` writes zeros with null bits set — correct SQL NULL encoding.
-
-#### New opcodes — `gnitz/core/opcodes.py`
-
-```python
-OPCODE_LEFT_JOIN_DELTA_TRACE = 20
-OPCODE_LEFT_JOIN_DELTA_DELTA = 21
-```
-
-Wire up in `gnitz/vm/interpreter.py` dispatch and add builder functions in
-`gnitz/vm/instructions.py`.
-
-#### Planner — `gnitz/catalog/program_cache.py`
-
-`CircuitBuilder.left_join(left_node, right_node)` uses `merge_schemas_for_join_outer`
-and emits the new opcodes. SQL planner emits `left_join(...)` for `LEFT JOIN` nodes.
+**Files changed:**
+- `gnitz/core/opcodes.py`: `OPCODE_JOIN_DELTA_TRACE_OUTER = 22`
+- `gnitz/core/comparator.py`: `NullAccessor` — right-side null-fill placeholder
+- `gnitz/core/types.py`: `merge_schemas_for_join_outer` — nullable right-side columns
+- `gnitz/dbsp/ops/join.py`: `op_join_delta_trace_outer` + `_join_dt_outer_merge_walk`
+- `gnitz/vm/instructions.py`: `join_delta_trace_outer_op` builder
+- `gnitz/vm/interpreter.py`: dispatch for opcode 22
+- `gnitz/catalog/program_cache.py`: compile handler + trace-side-source detection
+- `rust_client/gnitz-core/src/types.rs`: `OPCODE_JOIN_DELTA_TRACE_OUTER = 22`
+- `rust_client/gnitz-core/src/circuit.rs`: `left_join` + `left_join_with_trace_node`
+- `rust_client/gnitz-sql/src/planner.rs`: replaced 3-node subgraph with single node
+- `rpython_tests/dbsp_comprehensive_test.py`: `test_outer_join_delta_trace`
 
 ---
 
@@ -109,9 +81,5 @@ DONE
   1. estimated_length() + seek_key_exact() + swapped paths (join, semi-join)
   2. _join_dt_merge_walk + anti/semi merge-walk
   5. Eliminate _normal paths: always ConsolidatedScope + merge-walk
-
-TODO
-  6. NullAccessor + merge_schemas_for_join_outer
-  7. op_join_delta_trace_outer + op_join_delta_delta_outer + opcodes + VM dispatch
-  8. CircuitBuilder.left_join + SQL planner
+  6. Single-pass left outer join via OPCODE_JOIN_DELTA_TRACE_OUTER
 ```

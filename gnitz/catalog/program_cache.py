@@ -4,7 +4,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask, r_int64
 
 from gnitz.core import opcodes
-from gnitz.core.types import merge_schemas_for_join, _build_map_output_schema, _build_reduce_output_schema
+from gnitz.core.types import merge_schemas_for_join, merge_schemas_for_join_outer, _build_map_output_schema, _build_reduce_output_schema
 from gnitz.core.types import TYPE_U128, TYPE_STRING, TYPE_F32, TYPE_F64
 from gnitz.core.errors import LayoutError
 from gnitz.catalog import system_tables as sys
@@ -531,6 +531,15 @@ class ProgramCache(object):
             cur_reg_file.registers[reg_id] = out_reg
             return instructions.join_delta_trace_op(delta_reg, trace_reg, out_reg)
 
+        elif op == opcodes.OPCODE_JOIN_DELTA_TRACE_OUTER:
+            delta_reg = cur_reg_file.registers[in_regs[opcodes.PORT_DELTA]]
+            trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
+            outer_schema = merge_schemas_for_join_outer(delta_reg.table_schema,
+                                                        trace_reg.table_schema)
+            out_reg = runtime.DeltaRegister(reg_id, outer_schema)
+            cur_reg_file.registers[reg_id] = out_reg
+            return instructions.join_delta_trace_outer_op(delta_reg, trace_reg, out_reg)
+
         elif op == opcodes.OPCODE_JOIN_DELTA_DELTA:
             reg_a = cur_reg_file.registers[in_regs[opcodes.PORT_IN_A]]
             reg_b = cur_reg_file.registers[in_regs[opcodes.PORT_IN_B]]
@@ -761,6 +770,7 @@ class ProgramCache(object):
                     # this check, UNION's B input would be misidentified.
                     dst_op = opcode_of.get(dst, -1)
                     if (dst_op == opcodes.OPCODE_JOIN_DELTA_TRACE or
+                        dst_op == opcodes.OPCODE_JOIN_DELTA_TRACE_OUTER or
                         dst_op == opcodes.OPCODE_ANTI_JOIN_DELTA_TRACE or
                         dst_op == opcodes.OPCODE_SEMI_JOIN_DELTA_TRACE or
                         dst_op == opcodes.OPCODE_SEEK_TRACE):

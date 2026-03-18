@@ -8,7 +8,7 @@ from gnitz.dbsp.ops.linear import (
     op_delay, 
     op_integrate
 )
-from gnitz.dbsp.ops.join import op_join_delta_trace, op_join_delta_delta
+from gnitz.dbsp.ops.join import op_join_delta_trace, op_join_delta_delta, op_join_delta_trace_outer
 from gnitz.dbsp.ops.anti_join import (
     op_anti_join_delta_trace, op_anti_join_delta_delta,
     op_semi_join_delta_trace, op_semi_join_delta_delta,

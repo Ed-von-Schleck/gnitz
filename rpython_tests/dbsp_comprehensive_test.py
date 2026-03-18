@@ -2511,6 +2511,195 @@ def test_union_sorted_merge():
     log("  PASSED")
 
 
+def test_outer_join_delta_trace(base_dir):
+    """
+    Tests for op_join_delta_trace_outer covering:
+    1. Match case: delta PK in trace -> inner join rows, no null-fill.
+    2. No-match case: delta PK not in trace -> null-fill row.
+    3. Mixed: some PKs match, some don't.
+    4. Multiset delta: two delta rows with same PK, different payload, no match.
+    5. Negative-weight trace: w_delta * w_trace != 0 -> matched, no null-fill.
+    6. Schema: right-side columns are nullable in output schema.
+    """
+    log("[DBSP] Testing Left Outer Join (delta-trace)...")
+
+    cols_l = newlist_hint(2)
+    cols_l.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols_l.append(types.ColumnDefinition(types.TYPE_I64, name="val_l"))
+    schema_l = types.TableSchema(cols_l, 0)
+
+    cols_r = newlist_hint(2)
+    cols_r.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols_r.append(types.ColumnDefinition(types.TYPE_I64, name="val_r"))
+    schema_r = types.TableSchema(cols_r, 0)
+
+    schema_out = types.merge_schemas_for_join_outer(schema_l, schema_r)
+
+    log("  - Schema: right col is nullable...")
+    assert_true(not schema_out.columns[1].is_nullable,
+                "Outer join: left payload col should not be nullable")
+    assert_true(schema_out.columns[2].is_nullable,
+                "Outer join: right payload col must be nullable")
+
+    log("  - Match case: inner join rows emitted, no null-fill...")
+    b_delta = batch.ArenaZSetBatch(schema_l)
+    b_out = batch.ArenaZSetBatch(schema_out)
+    trace_path = os.path.join(base_dir, "oj_trace_match")
+    trace_r = EphemeralTable(trace_path, "tr", schema_r)
+    try:
+        rb_l = RowBuilder(schema_l, b_delta)
+        rb_l.begin(r_uint128(10), r_int64(1))
+        rb_l.put_int(r_int64(100))
+        rb_l.commit()
+
+        rb_r_batch = batch.ArenaZSetBatch(schema_r)
+        rb_r = RowBuilder(schema_r, rb_r_batch)
+        rb_r.begin(r_uint128(10), r_int64(1))
+        rb_r.put_int(r_int64(200))
+        rb_r.commit()
+        trace_r.ingest_batch(rb_r_batch)
+        rb_r_batch.free()
+
+        cursor_r = trace_r.create_cursor()
+        join.op_join_delta_trace_outer(b_delta, cursor_r,
+                                       batch.BatchWriter(b_out), schema_l, schema_r)
+        cursor_r.close()
+        assert_equal_i(1, b_out.length(), "Match: should emit 1 inner-join row")
+        acc = b_out.get_accessor(0)
+        assert_equal_u128(r_uint128(10), b_out.get_pk(0), "Match: PK should be 10")
+        assert_true(not acc.is_null(2), "Match: right col must not be null")
+        assert_equal_i64(r_int64(200), acc.get_int_signed(2), "Match: right val should be 200")
+    finally:
+        b_delta.free()
+        b_out.free()
+        trace_r.close()
+
+    log("  - No-match case: null-fill row emitted...")
+    b_delta2 = batch.ArenaZSetBatch(schema_l)
+    b_out2 = batch.ArenaZSetBatch(schema_out)
+    trace_path2 = os.path.join(base_dir, "oj_trace_nomatch")
+    trace_r2 = EphemeralTable(trace_path2, "tr", schema_r)
+    try:
+        rb_l2 = RowBuilder(schema_l, b_delta2)
+        rb_l2.begin(r_uint128(5), r_int64(1))
+        rb_l2.put_int(r_int64(50))
+        rb_l2.commit()
+
+        cursor_r2 = trace_r2.create_cursor()
+        join.op_join_delta_trace_outer(b_delta2, cursor_r2,
+                                       batch.BatchWriter(b_out2), schema_l, schema_r)
+        cursor_r2.close()
+        assert_equal_i(1, b_out2.length(), "No-match: should emit 1 null-fill row")
+        acc2 = b_out2.get_accessor(0)
+        assert_equal_u128(r_uint128(5), b_out2.get_pk(0), "No-match: PK should be 5")
+        assert_equal_i64(r_int64(50), acc2.get_int_signed(1), "No-match: left val should be 50")
+        assert_true(acc2.is_null(2), "No-match: right col must be null")
+    finally:
+        b_delta2.free()
+        b_out2.free()
+        trace_r2.close()
+
+    log("  - Mixed case: PK=1 matches, PK=2 does not...")
+    b_delta3 = batch.ArenaZSetBatch(schema_l)
+    b_out3 = batch.ArenaZSetBatch(schema_out)
+    trace_path3 = os.path.join(base_dir, "oj_trace_mixed")
+    trace_r3 = EphemeralTable(trace_path3, "tr", schema_r)
+    try:
+        rb_l3 = RowBuilder(schema_l, b_delta3)
+        rb_l3.begin(r_uint128(1), r_int64(1))
+        rb_l3.put_int(r_int64(10))
+        rb_l3.commit()
+        rb_l3.begin(r_uint128(2), r_int64(1))
+        rb_l3.put_int(r_int64(20))
+        rb_l3.commit()
+
+        rb_r3_batch = batch.ArenaZSetBatch(schema_r)
+        rb_r3 = RowBuilder(schema_r, rb_r3_batch)
+        rb_r3.begin(r_uint128(1), r_int64(1))
+        rb_r3.put_int(r_int64(100))
+        rb_r3.commit()
+        trace_r3.ingest_batch(rb_r3_batch)
+        rb_r3_batch.free()
+
+        cursor_r3 = trace_r3.create_cursor()
+        join.op_join_delta_trace_outer(b_delta3, cursor_r3,
+                                       batch.BatchWriter(b_out3), schema_l, schema_r)
+        cursor_r3.close()
+        assert_equal_i(2, b_out3.length(), "Mixed: should emit 2 rows")
+        # Row 0: PK=1 matched
+        acc3a = b_out3.get_accessor(0)
+        assert_equal_u128(r_uint128(1), b_out3.get_pk(0), "Mixed: first row PK=1")
+        assert_true(not acc3a.is_null(2), "Mixed: PK=1 right col not null")
+        assert_equal_i64(r_int64(100), acc3a.get_int_signed(2), "Mixed: PK=1 right val=100")
+        # Row 1: PK=2 not matched -> null-fill
+        acc3b = b_out3.get_accessor(1)
+        assert_equal_u128(r_uint128(2), b_out3.get_pk(1), "Mixed: second row PK=2")
+        assert_true(acc3b.is_null(2), "Mixed: PK=2 right col is null")
+    finally:
+        b_delta3.free()
+        b_out3.free()
+        trace_r3.close()
+
+    log("  - Multiset delta: same PK, different payload, no trace match...")
+    b_delta4 = batch.ArenaZSetBatch(schema_l)
+    b_out4 = batch.ArenaZSetBatch(schema_out)
+    trace_path4 = os.path.join(base_dir, "oj_trace_multiset")
+    trace_r4 = EphemeralTable(trace_path4, "tr", schema_r)
+    try:
+        rb_l4 = RowBuilder(schema_l, b_delta4)
+        rb_l4.begin(r_uint128(7), r_int64(1))
+        rb_l4.put_int(r_int64(71))
+        rb_l4.commit()
+        rb_l4.begin(r_uint128(7), r_int64(1))
+        rb_l4.put_int(r_int64(72))
+        rb_l4.commit()
+
+        cursor_r4 = trace_r4.create_cursor()
+        join.op_join_delta_trace_outer(b_delta4, cursor_r4,
+                                       batch.BatchWriter(b_out4), schema_l, schema_r)
+        cursor_r4.close()
+        assert_equal_i(2, b_out4.length(), "Multiset: should emit 2 null-fill rows")
+        assert_true(b_out4.get_accessor(0).is_null(2), "Multiset: row 0 right col null")
+        assert_true(b_out4.get_accessor(1).is_null(2), "Multiset: row 1 right col null")
+    finally:
+        b_delta4.free()
+        b_out4.free()
+        trace_r4.close()
+
+    log("  - Negative-weight trace: w_out != 0 -> matched, no null-fill...")
+    b_delta5 = batch.ArenaZSetBatch(schema_l)
+    b_out5 = batch.ArenaZSetBatch(schema_out)
+    trace_path5 = os.path.join(base_dir, "oj_trace_negw")
+    trace_r5 = EphemeralTable(trace_path5, "tr", schema_r)
+    try:
+        rb_l5 = RowBuilder(schema_l, b_delta5)
+        rb_l5.begin(r_uint128(3), r_int64(1))
+        rb_l5.put_int(r_int64(30))
+        rb_l5.commit()
+
+        rb_r5_batch = batch.ArenaZSetBatch(schema_r)
+        rb_r5 = RowBuilder(schema_r, rb_r5_batch)
+        rb_r5.begin(r_uint128(3), r_int64(-1))
+        rb_r5.put_int(r_int64(300))
+        rb_r5.commit()
+        trace_r5.ingest_batch(rb_r5_batch)
+        rb_r5_batch.free()
+
+        cursor_r5 = trace_r5.create_cursor()
+        join.op_join_delta_trace_outer(b_delta5, cursor_r5,
+                                       batch.BatchWriter(b_out5), schema_l, schema_r)
+        cursor_r5.close()
+        assert_equal_i(1, b_out5.length(), "NegWeight: should emit 1 inner-join row (w=-1)")
+        assert_equal_i64(r_int64(-1), b_out5.get_weight(0), "NegWeight: output weight=-1")
+        assert_true(not b_out5.get_accessor(0).is_null(2), "NegWeight: right col not null")
+    finally:
+        b_delta5.free()
+        b_out5.free()
+        trace_r5.close()
+
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -2560,6 +2749,7 @@ def entry_point(argv):
         test_distinct_marks_consolidated(base_dir)
         test_clone_preserves_consolidated()
         test_union_sorted_merge()
+        test_outer_join_delta_trace(base_dir)
         log("\nALL DBSP TESTS PASSED")
     except Exception as e:
         os.write(2, "FAILURE\n")

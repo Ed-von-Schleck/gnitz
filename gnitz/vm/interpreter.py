@@ -264,6 +264,19 @@ def run_vm(program, reg_file, context):
                 reg_a.table_schema
             )
 
+        elif opcode == op.OPCODE_JOIN_DELTA_TRACE_OUTER:
+            reg_delta = instr.reg_delta
+            reg_trace = instr.reg_trace
+            reg_out = instr.reg_out
+            assert reg_delta is not None and reg_trace is not None and reg_out is not None
+            ops.op_join_delta_trace_outer(
+                reg_delta.batch,
+                reg_trace.cursor,
+                batch.BatchWriter(reg_out.batch),
+                reg_delta.table_schema,
+                reg_trace.table_schema,
+            )
+
         elif opcode == op.OPCODE_REDUCE:
             reg_in = instr.reg_in
             reg_trace_out = instr.reg_trace_out

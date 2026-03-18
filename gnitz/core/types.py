@@ -182,6 +182,32 @@ def merge_schemas_for_join(schema_left, schema_right):
     return TableSchema(new_cols, pk_index=0)
 
 
+def merge_schemas_for_join_outer(schema_left, schema_right):
+    """Like merge_schemas_for_join but right-side non-PK columns are nullable."""
+    pk_left = schema_left.get_pk_column()
+    pk_right = schema_right.get_pk_column()
+    if pk_left.field_type.code != pk_right.field_type.code:
+        raise errors.LayoutError(
+            "Join PK Type Mismatch: Left=%d Right=%d"
+            % (pk_left.field_type.code, pk_right.field_type.code)
+        )
+    num_l = len(schema_left.columns)
+    num_r = len(schema_right.columns)
+    new_cols = newlist_hint(num_l + num_r - 1)
+    new_cols.append(pk_left)
+    for i in range(num_l):
+        if i != schema_left.pk_index:
+            new_cols.append(schema_left.columns[i])
+    for i in range(num_r):
+        if i != schema_right.pk_index:
+            col = schema_right.columns[i]
+            new_cols.append(ColumnDefinition(
+                col.field_type, is_nullable=True, name=col.name,
+                fk_table_id=col.fk_table_id, fk_col_idx=col.fk_col_idx,
+            ))
+    return TableSchema(new_cols, pk_index=0)
+
+
 def _analyze_schema(schema):
     """
     Derives allocation flags from a TableSchema by scanning non-PK columns.

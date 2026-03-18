@@ -29,6 +29,7 @@ pub const OPCODE_SEMI_JOIN_DELTA_TRACE: u64 = 18;
 pub const OPCODE_SEMI_JOIN_DELTA_DELTA: u64 = 19;
 pub const OPCODE_EXCHANGE_SHARD:        u64 = 20;
 pub const OPCODE_EXCHANGE_GATHER:       u64 = 21;
+pub const OPCODE_JOIN_DELTA_TRACE_OUTER: u64 = 22;
 
 // Port constants
 pub const PORT_IN:    u64 = 0;

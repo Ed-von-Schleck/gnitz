@@ -3,7 +3,7 @@
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, intmask
 
-from gnitz.core.comparator import RowAccessor
+from gnitz.core.comparator import RowAccessor, NullAccessor
 from gnitz.core.batch import ConsolidatedScope, BatchWriter
 from gnitz.storage.cursor import SortedBatchCursor
 
@@ -200,6 +200,64 @@ def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
                 )
                 out_writer.append_from_accessor(d_key, w_out, composite_acc)
             trace_cursor.advance()
+    out_writer.mark_sorted(True)
+
+
+def op_join_delta_trace_outer(delta_batch, trace_cursor, out_writer, d_schema, t_schema):
+    """
+    Delta-Trace Left Outer Join (single-pass): ΔA LEFT⋈ I(B).
+
+    For each consolidated delta row:
+      - If ANY inner-join output is produced (w_delta * w_trace != 0): emit those rows.
+      - Otherwise: emit one null-fill row (left cols intact, right cols NULL).
+
+    No adaptive swap: we must iterate delta to identify no-match rows.
+    """
+    composite_acc = CompositeAccessor(d_schema, t_schema)
+    null_acc = NullAccessor()
+    with ConsolidatedScope(delta_batch) as consolidated:
+        _join_dt_outer_merge_walk(consolidated, trace_cursor, out_writer,
+                                  composite_acc, null_acc)
+    # mark_sorted(True) called inside helper
+
+
+def _join_dt_outer_merge_walk(delta_batch, trace_cursor, out_writer,
+                               composite_acc, null_acc):
+    count = delta_batch.length()
+    if count == 0:
+        out_writer.mark_sorted(True)
+        return
+    trace_cursor.seek(delta_batch.get_pk(0))
+    for i in range(count):
+        d_key = delta_batch.get_pk(i)
+        w_delta = delta_batch.get_weight(i)
+        # w_delta is non-zero by _consolidated invariant.
+
+        if i > 0 and delta_batch.get_pk(i - 1) == d_key:
+            # Multiset delta: same PK, different payload — re-seek trace.
+            trace_cursor.seek(d_key)
+        else:
+            while trace_cursor.is_valid() and trace_cursor.key() < d_key:
+                trace_cursor.advance()
+
+        matched = False
+        while trace_cursor.is_valid() and trace_cursor.key() == d_key:
+            w_trace = trace_cursor.weight()
+            w_out = r_int64(intmask(w_delta * w_trace))
+            if w_out != r_int64(0):
+                composite_acc.set_accessors(
+                    delta_batch.get_accessor(i),
+                    trace_cursor.get_accessor(),
+                )
+                out_writer.append_from_accessor(d_key, w_out, composite_acc)
+                matched = True
+            trace_cursor.advance()
+
+        if not matched:
+            # No inner-join output for this delta key — emit null-fill row.
+            composite_acc.set_accessors(delta_batch.get_accessor(i), null_acc)
+            out_writer.append_from_accessor(d_key, w_delta, composite_acc)
+
     out_writer.mark_sorted(True)
 
 

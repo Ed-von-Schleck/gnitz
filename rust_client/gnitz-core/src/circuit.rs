@@ -1,7 +1,8 @@
 use crate::types::{
     CircuitGraph,
     OPCODE_SCAN_TRACE, OPCODE_FILTER, OPCODE_MAP, OPCODE_NEGATE, OPCODE_UNION,
-    OPCODE_JOIN_DELTA_TRACE, OPCODE_DELAY, OPCODE_REDUCE, OPCODE_DISTINCT, OPCODE_INTEGRATE,
+    OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_OUTER,
+    OPCODE_DELAY, OPCODE_REDUCE, OPCODE_DISTINCT, OPCODE_INTEGRATE,
     OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_SEMI_JOIN_DELTA_TRACE,
     OPCODE_EXCHANGE_SHARD, OPCODE_EXCHANGE_GATHER,
     PORT_IN, PORT_TRACE, PORT_IN_A, PORT_IN_B,
@@ -277,6 +278,23 @@ impl CircuitBuilder {
     /// Anti-join delta with a trace node.
     pub fn anti_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
         let nid = self.alloc_node(OPCODE_ANTI_JOIN_DELTA_TRACE);
+        self.connect(delta, nid, PORT_IN_A);
+        self.connect(trace_node, nid, PORT_TRACE);
+        nid
+    }
+
+    /// Left outer join: delta→port 0, internal trace_scan(trace_table_id)→port 1.
+    pub fn left_join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
+        let trace = self.trace_scan(trace_table_id);
+        let nid = self.alloc_node(OPCODE_JOIN_DELTA_TRACE_OUTER);
+        self.connect(delta, nid, PORT_IN_A);
+        self.connect(trace, nid, PORT_TRACE);
+        nid
+    }
+
+    /// Left outer join delta with a trace node.
+    pub fn left_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
+        let nid = self.alloc_node(OPCODE_JOIN_DELTA_TRACE_OUTER);
         self.connect(delta, nid, PORT_IN_A);
         self.connect(trace_node, nid, PORT_TRACE);
         nid

@@ -2,7 +2,9 @@
 
 from rpython.rlib import jit
 from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128
 from gnitz.core import strings as string_logic, types
+from gnitz.core.strings import NULL_PTR
 
 
 class RowAccessor(object):
@@ -26,6 +28,30 @@ class RowAccessor(object):
 
     def is_null(self, col_idx):
         return False
+
+
+class NullAccessor(RowAccessor):
+    """Right-side placeholder for outer join null-fill rows.
+    Every column is null; getters return zero/null but are never called
+    because append_from_accessor short-circuits on the null_word."""
+
+    def is_null(self, col_idx):
+        return True
+
+    def get_int(self, col_idx):
+        return r_uint64(0)
+
+    def get_float(self, col_idx):
+        return 0.0
+
+    def get_u128(self, col_idx):
+        return r_uint128(0)
+
+    def get_str_struct(self, col_idx):
+        return (0, 0, NULL_PTR, NULL_PTR, None)
+
+    def get_col_ptr(self, col_idx):
+        return NULL_PTR
 
 
 @jit.unroll_safe

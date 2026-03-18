@@ -601,23 +601,9 @@ fn execute_create_join_view(
     let inner_merged = cb.union(proj_ab_node, proj_ba_node);
 
     let merged = if is_left_join {
-        // LEFT JOIN: inner ∪ (anti_join(ΔA, trace_b) → null-fill MAP)
-        let anti_ab = cb.anti_join_with_trace_node(reindex_a, trace_b);
-        // Anti-join output: [A_PK, A_cols...] (left schema only, no right cols)
-        // Null-fill MAP: COPY_COL all left cols, EMIT_NULL for each right col
-        let mut eb = ExprBuilder::new();
-        let mut payload_idx = 0u32;
-        for (ci, col) in left_schema.columns.iter().enumerate() {
-            eb.copy_col(col.type_code as u32, 1 + ci as u32, payload_idx); // +1 for anti-join PK
-            payload_idx += 1;
-        }
-        for _ in 0..right_n {
-            eb.emit_null(payload_idx);
-            payload_idx += 1;
-        }
-        let null_fill_prog = eb.build(0);
-        let null_filled = cb.map_expr(anti_ab, null_fill_prog);
-        cb.union(inner_merged, null_filled)
+        // Single-pass LEFT OUTER JOIN: replaces anti_join + null_fill_map + union.
+        let outer_ab = cb.left_join_with_trace_node(reindex_a, trace_b);
+        cb.union(inner_merged, outer_ab)
     } else {
         inner_merged
     };
