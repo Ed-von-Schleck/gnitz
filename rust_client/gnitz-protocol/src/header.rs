@@ -207,4 +207,49 @@ mod tests {
         let res = Header::unpack(&[0u8; 10]);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
+
+    #[test]
+    fn test_bad_magic_all_zeros() {
+        let res = Header::unpack(&[0u8; HEADER_SIZE]);
+        assert!(matches!(res, Err(ProtocolError::BadMagic(0))));
+    }
+
+    #[test]
+    fn test_bad_magic_off_by_one_high() {
+        let mut packed = Header::default().pack();
+        packed[7] ^= 1; // corrupt high byte of MAGIC_V2
+        let res = Header::unpack(&packed);
+        assert!(matches!(res, Err(ProtocolError::BadMagic(_))));
+    }
+
+    #[test]
+    fn test_bad_magic_off_by_one_low() {
+        let mut packed = Header::default().pack();
+        packed[0] = packed[0].wrapping_add(1); // MAGIC_V2 low byte + 1
+        let res = Header::unpack(&packed);
+        assert!(matches!(res, Err(ProtocolError::BadMagic(_))));
+    }
+
+    #[test]
+    fn test_bad_magic_byte_swapped() {
+        // MAGIC_V2 LE bytes[0]=0x43, bytes[1]=0x50 — swap → different value
+        let mut packed = Header::default().pack();
+        packed.swap(0, 1);
+        let res = Header::unpack(&packed);
+        assert!(matches!(res, Err(ProtocolError::BadMagic(_))));
+    }
+
+    #[test]
+    fn test_header_too_short_1_byte() {
+        let res = Header::unpack(&[0x47u8]);
+        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
+    }
+
+    #[test]
+    fn test_header_too_short_95_bytes() {
+        // One byte shy of HEADER_SIZE
+        let full = Header::default().pack();
+        let res = Header::unpack(&full[..95]);
+        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
+    }
 }

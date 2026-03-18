@@ -403,7 +403,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColData, Schema, ColumnDef, TypeCode, ZSetBatch};
+    use crate::types::{ColData, Schema, ColumnDef, TypeCode, ZSetBatch, meta_schema};
 
     // ── align_up ────────────────────────────────────────────────────────────
 
@@ -680,6 +680,182 @@ mod tests {
             ColData::U128s(got) => assert_eq!(got, &u128_vals),
             _ => panic!("expected U128s at col 3"),
         }
+    }
+
+    // ── TypeCode::try_from_u64 error paths ──────────────────────────────────
+
+    #[test]
+    fn test_unknown_type_code_zero() {
+        use crate::types::TypeCode;
+        use crate::error::ProtocolError;
+        assert!(matches!(TypeCode::try_from_u64(0), Err(ProtocolError::UnknownTypeCode(0))));
+    }
+
+    #[test]
+    fn test_unknown_type_code_13() {
+        use crate::types::TypeCode;
+        use crate::error::ProtocolError;
+        assert!(matches!(TypeCode::try_from_u64(13), Err(ProtocolError::UnknownTypeCode(13))));
+    }
+
+    #[test]
+    fn test_unknown_type_code_max() {
+        use crate::types::TypeCode;
+        use crate::error::ProtocolError;
+        assert!(matches!(TypeCode::try_from_u64(u64::MAX), Err(ProtocolError::UnknownTypeCode(_))));
+    }
+
+    // ── batch_to_schema error paths ──────────────────────────────────────────
+
+    /// Build a valid META_SCHEMA batch for `ncols` columns (all U64, col 0 is PK).
+    fn make_meta_batch(ncols: usize) -> ZSetBatch {
+        use crate::header::{META_FLAG_IS_PK};
+        let mut type_code_bytes = vec![];
+        let mut flags_bytes     = vec![];
+        let mut names           = vec![];
+        for i in 0..ncols {
+            type_code_bytes.extend_from_slice(&8u64.to_le_bytes()); // U64 = 8
+            let flags: u64 = if i == 0 { META_FLAG_IS_PK } else { 0 };
+            flags_bytes.extend_from_slice(&flags.to_le_bytes());
+            names.push(Some(format!("col{}", i)));
+        }
+        ZSetBatch {
+            pk_lo:   (0..ncols as u64).collect(),
+            pk_hi:   vec![0; ncols],
+            weights: vec![1; ncols],
+            nulls:   vec![0; ncols],
+            columns: vec![
+                ColData::Fixed(vec![]),
+                ColData::Fixed(type_code_bytes),
+                ColData::Fixed(flags_bytes),
+                ColData::Strings(names),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_batch_to_schema_no_pk_flag() {
+        use crate::error::ProtocolError;
+        let mut batch = make_meta_batch(2);
+        // Clear all IS_PK flags
+        if let ColData::Fixed(ref mut v) = batch.columns[2] {
+            for b in v.iter_mut() { *b = 0; }
+        }
+        let res = batch_to_schema(&batch);
+        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
+    }
+
+    #[test]
+    fn test_batch_to_schema_col_idx_out_of_order() {
+        use crate::error::ProtocolError;
+        let mut batch = make_meta_batch(2);
+        batch.pk_lo.swap(0, 1); // [1, 0] instead of [0, 1]
+        let res = batch_to_schema(&batch);
+        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
+    }
+
+    #[test]
+    fn test_batch_to_schema_col_idx_gap() {
+        use crate::error::ProtocolError;
+        let mut batch = make_meta_batch(2);
+        batch.pk_lo[1] = 5; // gap: [0, 5]
+        let res = batch_to_schema(&batch);
+        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
+    }
+
+    #[test]
+    fn test_batch_to_schema_col_idx_duplicate() {
+        use crate::error::ProtocolError;
+        let mut batch = make_meta_batch(2);
+        batch.pk_lo[1] = 0; // duplicate: [0, 0]
+        let res = batch_to_schema(&batch);
+        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
+    }
+
+    // ── decode_zset error paths ──────────────────────────────────────────────
+
+    fn two_col_schema() -> Schema {
+        Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+            ],
+            pk_index: 0,
+        }
+    }
+
+    fn str_col_schema() -> Schema {
+        Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64,    is_nullable: false },
+                ColumnDef { name: "str".into(), type_code: TypeCode::String, is_nullable: false },
+            ],
+            pk_index: 0,
+        }
+    }
+
+    fn one_str_batch(val: &str) -> ZSetBatch {
+        ZSetBatch {
+            pk_lo:   vec![1],
+            pk_hi:   vec![0],
+            weights: vec![1],
+            nulls:   vec![0],
+            columns: vec![
+                ColData::Fixed(vec![]),
+                ColData::Strings(vec![Some(val.to_string())]),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_decode_zset_buffer_too_short() {
+        use crate::error::ProtocolError;
+        let schema = two_col_schema();
+        let res = decode_zset(&[0u8; 10], 0, &schema, 1, 0);
+        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
+    }
+
+    #[test]
+    fn test_decode_zset_string_offset_beyond_blob() {
+        use crate::error::ProtocolError;
+        let schema = str_col_schema();
+        let batch = one_str_batch("hello");
+        let (mut encoded, _) = encode_zset(&schema, &batch);
+        // Corrupt the string offset to a huge value
+        let lay = layout(&schema, 1);
+        let str_off = lay.col_offsets[1];
+        encoded[str_off..str_off + 4].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+        let res = decode_zset(&encoded, 0, &schema, 1, 0);
+        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
+    }
+
+    #[test]
+    fn test_decode_zset_string_length_overflows_blob() {
+        use crate::error::ProtocolError;
+        let schema = str_col_schema();
+        let batch = one_str_batch("hi");
+        let (mut encoded, _) = encode_zset(&schema, &batch);
+        // Keep offset=0, set length to something huge
+        let lay = layout(&schema, 1);
+        let str_off = lay.col_offsets[1];
+        // offset=0 is unchanged; corrupt length (bytes +4..+8)
+        encoded[str_off + 4..str_off + 8].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes());
+        let res = decode_zset(&encoded, 0, &schema, 1, 0);
+        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
+    }
+
+    #[test]
+    fn test_decode_zset_invalid_utf8() {
+        use crate::error::ProtocolError;
+        let schema = str_col_schema();
+        let batch = one_str_batch("valid");
+        let (mut encoded, _) = encode_zset(&schema, &batch);
+        // Overwrite blob bytes with invalid UTF-8
+        let lay = layout(&schema, 1);
+        encoded[lay.blob_off] = 0xFF;
+        encoded[lay.blob_off + 1] = 0xFE;
+        let res = decode_zset(&encoded, 0, &schema, 1, 0);
+        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
 
     // ── schema/meta roundtrip ────────────────────────────────────────────────
