@@ -12,7 +12,10 @@ Properties:
   P4. MIN_I64 is the unique non-zero 2's-complement negation fixed point:
       exists w != 0 with -w == w (SAT), and that w must be MIN_I64 (UNSAT)
 
-Note: uses bvsub(0, x) for negation to avoid Z3 4.15.8 bvneg reduction bug.
+Note: uses bvmul(x, 0xFFFF...FFFF) for negation.  Both bvneg and bvsub(0,x)
+trigger incorrect SAT results in Z3 4.15.8 when the result is sign-compared
+via bvslt/bvsgt.  Multiplying by -1 (= 2^64-1 unsigned) is mathematically
+identical and avoids the Z3 bug.
 
 Source:
   - gnitz/dbsp/ops/linear.py:109-116  (op_negate via append_batch_negated)
@@ -139,10 +142,12 @@ if not ok:
     sys.exit(1)
 
 
-# neg64 SMT definition: use bvsub(0, x) to avoid Z3 4.15.8 bvneg reduction bug
+# neg64 SMT definition: bvmul(x, 0xFF...FF) = x * (2^64-1) = -x mod 2^64.
+# Both bvneg and bvsub(0, x) produce incorrect SAT results in Z3 4.15.8 when
+# the result is compared with bvslt/bvsgt.  bvmul avoids the Z3 bug entirely.
 NEG64_DEF = """\
 (define-fun neg64 ((x (_ BitVec 64))) (_ BitVec 64)
-  (bvsub (_ bv0 64) x))
+  (bvmul x #xffffffffffffffff))
 """
 
 # -- P1: Double negation identity: -(-w) == w --------------------------------
