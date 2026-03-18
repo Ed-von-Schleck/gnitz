@@ -21,6 +21,7 @@ from gnitz.storage import (
     index,
     memtable,
     refcount,
+    compactor,
     comparator as storage_comparator,
     cursor,
 )
@@ -102,7 +103,7 @@ class EphemeralTable(ZSetStore):
             memtable_arena_size=self.memtable.max_bytes,
         )
 
-    def create_cursor(self):
+    def _build_cursor(self):
         num_shards = len(self.index.handles)
         cs = newlist_hint(1 + num_shards)
 
@@ -111,6 +112,59 @@ class EphemeralTable(ZSetStore):
             cs.append(cursor.ShardCursor(h.view))
 
         return cursor.UnifiedCursor(self.schema, cs)
+
+    def compact_if_needed(self):
+        if self.index.needs_compaction:
+            self._compact()
+
+    def create_cursor(self):
+        self.compact_if_needed()
+        return self._build_cursor()
+
+    def _compact(self):
+        handles = self.index.handles
+        num_h = len(handles)
+        if num_h <= 1:
+            return
+
+        input_files = newlist_hint(num_h)
+        h_idx = 0
+        while h_idx < num_h:
+            input_files.append(handles[h_idx].filename)
+            h_idx += 1
+
+        self._flush_seq += 1
+        out_path = self.directory + "/compact_%d_%d.db" % (
+            self.table_id, self._flush_seq
+        )
+
+        try:
+            compactor.compact_shards(
+                input_files, out_path, self.schema,
+                self.table_id, self.validate_checksums,
+            )
+
+            new_handle = index.ShardHandle(
+                out_path, self.schema,
+                r_uint64(0), r_uint64(0),
+                validate_checksums=self.validate_checksums,
+            )
+
+            self.index.replace_handles(input_files, new_handle)
+
+            f_idx = 0
+            while f_idx < len(input_files):
+                self.ref_counter.mark_for_deletion(input_files[f_idx])
+                f_idx += 1
+            self.ref_counter.try_cleanup()
+
+        except Exception as e:
+            if os.path.exists(out_path):
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
+            raise e
 
     def _scan_shards_for_pk(self, r_key):
         """Walk shards for a PK via the shard index.

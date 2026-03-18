@@ -113,6 +113,10 @@ class ZSetStore(object):
         """Closes the store and releases memory/file handles."""
         raise NotImplementedError
 
+    def compact_if_needed(self):
+        """Trigger compaction if shard count exceeds threshold. No-op by default."""
+        pass
+
     def ingest_batch_memonly(self, batch):
         """Ingest into memtable only, bypassing the WAL. Worker DDL sync use."""
         self.ingest_batch(batch)

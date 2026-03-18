@@ -209,6 +209,10 @@ class PartitionedTable(ZSetStore):
                 last = result
         return last
 
+    def compact_if_needed(self):
+        for local in range(len(self.partitions)):
+            self.partitions[local].compact_if_needed()
+
     def close_partitions_outside(self, start, end):
         """Close partitions not in [start, end). Rebuilds the dense list."""
         old_offset = self.part_offset

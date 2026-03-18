@@ -13,6 +13,7 @@ from gnitz.storage import (
     index,
     manifest,
     memtable,
+    compactor,
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
 
@@ -84,6 +85,20 @@ class PersistentTable(EphemeralTable):
 
         # 3. Replay WAL into MemTable to recover recent un-flushed writes
         self.recover_from_wal(wal_path)
+
+    # -- Cursor Interface Override --------------------------------------------
+
+    def create_cursor(self):
+        return self._build_cursor()
+
+    def compact_if_needed(self):
+        if not self.index.needs_compaction:
+            return
+        compactor.execute_compaction(
+            self.index, self.manifest_manager,
+            output_dir=self.directory,
+            validate_checksums=self.validate_checksums,
+        )
 
     # -- Mutations ------------------------------------------------------------
 

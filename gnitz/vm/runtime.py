@@ -63,6 +63,7 @@ class TraceRegister(BaseRegister):
             return
         if self.cursor is not None:
             self.cursor.close()
+        self.table.compact_if_needed()
         self.cursor = self.table.create_cursor()
 
 

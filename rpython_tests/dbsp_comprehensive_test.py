@@ -1369,6 +1369,75 @@ def test_count_non_null(base_dir):
     log("  PASSED")
 
 
+def test_compaction_through_ticks(base_dir):
+    """EphemeralTable shards stay bounded across many ticks via auto-compaction."""
+    log("[DBSP] Testing compaction through tick lifecycle...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="v"))
+    schema = types.TableSchema(cols, 0)
+
+    trace_path = os.path.join(base_dir, "ctt_trace")
+    trace = EphemeralTable(trace_path, "ctt", schema)
+
+    b_in = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb = RowBuilder(schema, b_in)
+        tick = 1
+        while tick <= 10:
+            b_in.clear()
+            b_out.clear()
+
+            # Each tick introduces a fresh unique PK
+            rb.begin(r_uint128(tick), r_int64(1))
+            rb.put_int(r_int64(tick))
+            rb.commit()
+
+            distinct.op_distinct(b_in, trace, b_out)
+
+            # New PK always produces output weight +1
+            if b_out.length() != 1:
+                fail("Tick " + str(tick) + ": expected 1 output row")
+            if b_out.get_weight(0) != r_int64(1):
+                fail("Tick " + str(tick) + ": expected output weight 1")
+
+            # Simulate TraceRegister lifecycle: ingest delta into history, flush
+            trace.ingest_batch(b_in)
+            trace.flush()
+
+            # Simulate prepare_for_tick(): compact_if_needed() + create_cursor()
+            c = trace.create_cursor()
+            c.close()
+
+            tick += 1
+
+        # Shard count bounded: <= 2 * compaction_threshold (default threshold=4)
+        num_handles = len(trace.index.handles)
+        if num_handles > 8:
+            fail(
+                "Shard count unbounded: "
+                + str(num_handles)
+                + " handles after 10 ticks"
+            )
+
+        # All 10 inserted PKs must be present in trace
+        i = 1
+        while i <= 10:
+            if not trace.has_pk(r_uint128(i)):
+                fail("PK " + str(i) + " missing from trace after 10 ticks")
+            i += 1
+
+    finally:
+        b_in.free()
+        b_out.free()
+        trace.close()
+
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -1401,6 +1470,7 @@ def entry_point(argv):
         test_reduce_multi_agg_linear_merge(base_dir)
         test_reduce_multi_agg_nonlinear(base_dir)
         test_count_non_null(base_dir)
+        test_compaction_through_ticks(base_dir)
         log("\nALL DBSP TESTS PASSED")
     except Exception as e:
         os.write(2, "FAILURE\n")
