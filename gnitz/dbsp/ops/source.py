@@ -40,7 +40,8 @@ def op_scan_trace(cursor, out_writer, chunk_limit):
             scanned_count += 1
             
         cursor.advance()
-        
+
+    out_writer.mark_consolidated(True)
     return scanned_count
 
 

@@ -96,6 +96,8 @@ class ReduceAccessor(RowAccessor):
     def is_null(self, col_idx):
         src = self.mapping_to_input[col_idx]
         if src == -1 or src <= -3:
+            if self.use_old_val:
+                return False  # Old value from trace is never null
             return self.agg_funcs[self._agg_idx(src)].is_accumulator_zero()
         if src < 0:
             return False
@@ -373,6 +375,16 @@ def op_reduce(
         acc_exemplar = ColumnarBatchAccessor(input_schema)
         reduce_acc = ReduceAccessor(input_schema, output_schema, group_by_cols, num_aggs)
 
+        # Hoist linearity flags: is_linear() is a compile-time constant per agg_func (Opt 5)
+        agg_lin_flags = newlist_hint(num_aggs)
+        all_linear = True
+        for af in agg_funcs:
+            lin = jit.promote(af.is_linear())
+            agg_lin_flags.append(lin)
+            if not lin:
+                all_linear = False
+        all_linear = jit.promote(all_linear)
+
         # Hoist cursors: create once outside the per-group loop (Opt 3)
         gi_cursor = None
         avi_cursor = None
@@ -408,8 +420,9 @@ def op_reduce(
                         break
 
                 w = b.get_weight(curr_idx)
-                for af in agg_funcs:
-                    af.step(acc_in, w)
+                for k in range(num_aggs):
+                    if agg_lin_flags[k]:
+                        agg_funcs[k].step(acc_in, w)
                 idx += 1
 
             # 4. Retraction: Agg(history)
@@ -428,12 +441,6 @@ def op_reduce(
                 out_writer.append_from_accessor(group_key, r_int64(-1), reduce_acc)
 
             # 5. New Value Calculation: Agg(history + delta)
-            all_linear = True
-            for af in agg_funcs:
-                if not af.is_linear():
-                    all_linear = False
-                    break
-
             if all_linear and has_old:
                 for k in range(num_aggs):
                     agg_funcs[k].merge_accumulated(old_vals_bits[k], r_int64(1))

@@ -1831,6 +1831,277 @@ def test_compaction_through_ticks(base_dir):
 
 
 # ------------------------------------------------------------------------------
+# _consolidated flag tests
+# ------------------------------------------------------------------------------
+
+
+def test_consolidated_flag_basics():
+    log("[DBSP] Testing consolidated flag basics...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b = batch.ArenaZSetBatch(schema)
+    try:
+        rb = RowBuilder(schema, b)
+        rb.begin(r_uint128(1), r_int64(1))
+        rb.put_int(r_int64(10))
+        rb.commit()
+        rb.begin(r_uint128(2), r_int64(2))
+        rb.put_int(r_int64(20))
+        rb.commit()
+        rb.begin(r_uint128(3), r_int64(1))
+        rb.put_int(r_int64(30))
+        rb.commit()
+
+        b.mark_consolidated(True)
+        assert_true(b._consolidated, "mark_consolidated(True) should set _consolidated")
+        assert_true(b._sorted, "mark_consolidated(True) should imply _sorted=True")
+
+        # to_consolidated() should short-circuit and return self
+        result = b.to_consolidated()
+        assert_true(result is b, "to_consolidated() on consolidated batch should return self")
+        assert_equal_i(3, result._count, "count unchanged after short-circuit")
+
+    finally:
+        b.free()
+    log("  PASSED")
+
+
+def test_consolidated_short_circuit_empty():
+    log("[DBSP] Testing consolidated short-circuit on empty batch...")
+
+    cols = newlist_hint(1)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    schema = types.TableSchema(cols, 0)
+
+    b = batch.ArenaZSetBatch(schema)
+    try:
+        result = b.to_consolidated()
+        assert_true(result is b, "Empty batch: to_consolidated() should return self")
+        assert_equal_i(0, result._count, "Empty batch count should be 0")
+    finally:
+        b.free()
+    log("  PASSED")
+
+
+def test_consolidated_propagation_filter(base_dir):
+    log("[DBSP] Testing consolidated propagation through op_filter...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_in = batch.ArenaZSetBatch(schema)
+    b_out1 = batch.ArenaZSetBatch(schema)
+    b_out2 = batch.ArenaZSetBatch(schema)
+    b_out3 = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb = RowBuilder(schema, b_in)
+        rb.begin(r_uint128(1), r_int64(1))
+        rb.put_int(r_int64(5))
+        rb.commit()
+        rb.begin(r_uint128(2), r_int64(1))
+        rb.put_int(r_int64(15))
+        rb.commit()
+        rb.begin(r_uint128(3), r_int64(1))
+        rb.put_int(r_int64(25))
+        rb.commit()
+        b_in.mark_consolidated(True)
+
+        # Case 1: pass-all predicate (NullPredicate) — output should be consolidated
+        pass_func = functions.NullPredicate()
+        linear.op_filter(b_in, b_out1, pass_func)
+        assert_true(b_out1._consolidated, "Filter pass-all: output should be consolidated")
+
+        # Case 2: predicate keeps 2 of 3 rows (val > 10) — output still consolidated
+        filter_func = functions.UniversalPredicate(1, functions.OP_GT, r_uint64(10))
+        linear.op_filter(b_in, b_out2, filter_func)
+        assert_true(b_out2._consolidated, "Filter subset: output should be consolidated")
+        assert_equal_i(2, b_out2._count, "Filter should keep 2 rows (val>10)")
+
+        # Case 3: sorted-but-not-consolidated input — _consolidated should stay False
+        b_sorted = batch.ArenaZSetBatch(schema)
+        rb2 = RowBuilder(schema, b_sorted)
+        rb2.begin(r_uint128(4), r_int64(1))
+        rb2.put_int(r_int64(40))
+        rb2.commit()
+        b_sorted.mark_sorted(True)
+        # _consolidated is False by default
+
+        linear.op_filter(b_sorted, b_out3, pass_func)
+        assert_true(not b_out3._consolidated,
+                    "Filter on sorted-not-consolidated: _consolidated should be False")
+        assert_true(b_out3._sorted, "Filter on sorted input: _sorted should be True")
+        b_sorted.free()
+
+    finally:
+        b_in.free()
+        b_out1.free()
+        b_out2.free()
+        b_out3.free()
+    log("  PASSED")
+
+
+def test_consolidated_propagation_negate():
+    log("[DBSP] Testing consolidated propagation through op_negate...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_in = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb = RowBuilder(schema, b_in)
+        rb.begin(r_uint128(1), r_int64(3))
+        rb.put_int(r_int64(10))
+        rb.commit()
+        rb.begin(r_uint128(2), r_int64(1))
+        rb.put_int(r_int64(20))
+        rb.commit()
+        b_in.mark_consolidated(True)
+
+        linear.op_negate(b_in, b_out)
+        assert_true(b_out._consolidated, "Negate of consolidated: output should be consolidated")
+        assert_equal_i(2, b_out._count, "Negate should preserve row count")
+        assert_equal_i64(r_int64(-3), b_out.get_weight(0), "Negate: weight should be flipped")
+
+    finally:
+        b_in.free()
+        b_out.free()
+    log("  PASSED")
+
+
+def test_scan_trace_marks_consolidated(base_dir):
+    log("[DBSP] Testing scan_trace marks output consolidated...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    table_path = os.path.join(base_dir, "scan_trace_cons")
+    table = EphemeralTable(table_path, "scan_cons", schema)
+
+    b_in = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb = RowBuilder(schema, b_in)
+        rb.begin(r_uint128(1), r_int64(1))
+        rb.put_int(r_int64(10))
+        rb.commit()
+        rb.begin(r_uint128(2), r_int64(1))
+        rb.put_int(r_int64(20))
+        rb.commit()
+        rb.begin(r_uint128(3), r_int64(1))
+        rb.put_int(r_int64(30))
+        rb.commit()
+        table.ingest_batch(b_in)
+
+        cursor = table.create_cursor()
+        source.op_seek_trace(cursor, r_uint128(0))
+        source.op_scan_trace(cursor, b_out, 0)
+        cursor.close()
+
+        assert_true(b_out._consolidated, "scan_trace should mark output consolidated")
+        assert_equal_i(3, b_out._count, "scan_trace should emit 3 rows")
+
+    finally:
+        b_in.free()
+        b_out.free()
+        table.close()
+    log("  PASSED")
+
+
+def test_distinct_marks_consolidated(base_dir):
+    log("[DBSP] Testing distinct marks output consolidated...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    hist_path = os.path.join(base_dir, "distinct_cons_hist")
+    hist_table = EphemeralTable(hist_path, "hist_cons", schema)
+
+    b_in = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb = RowBuilder(schema, b_in)
+        rb.begin(r_uint128(10), r_int64(2))
+        rb.put_int(r_int64(100))
+        rb.commit()
+        rb.begin(r_uint128(20), r_int64(1))
+        rb.put_int(r_int64(200))
+        rb.commit()
+
+        cursor = hist_table.create_cursor()
+        distinct.op_distinct(b_in, cursor, hist_table, batch.BatchWriter(b_out))
+        cursor.close()
+
+        assert_true(b_out._consolidated, "op_distinct should mark output consolidated")
+        assert_equal_i(2, b_out._count, "distinct should emit 2 rows")
+
+    finally:
+        b_in.free()
+        b_out.free()
+        hist_table.close()
+    log("  PASSED")
+
+
+def test_clone_preserves_consolidated():
+    log("[DBSP] Testing clone preserves _consolidated flag...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_cons = batch.ArenaZSetBatch(schema)
+    b_sorted = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb = RowBuilder(schema, b_cons)
+        rb.begin(r_uint128(1), r_int64(1))
+        rb.put_int(r_int64(10))
+        rb.commit()
+        b_cons.mark_consolidated(True)
+
+        clone_cons = b_cons.clone()
+        assert_true(clone_cons._consolidated, "Clone of consolidated: _consolidated should be True")
+        assert_true(clone_cons._sorted, "Clone of consolidated: _sorted should be True")
+        clone_cons.free()
+
+        rb2 = RowBuilder(schema, b_sorted)
+        rb2.begin(r_uint128(2), r_int64(1))
+        rb2.put_int(r_int64(20))
+        rb2.commit()
+        b_sorted.mark_sorted(True)
+        # _consolidated remains False
+
+        clone_sorted = b_sorted.clone()
+        assert_true(not clone_sorted._consolidated,
+                    "Clone of sorted-not-consolidated: _consolidated should be False")
+        assert_true(clone_sorted._sorted,
+                    "Clone of sorted-not-consolidated: _sorted should be True")
+        clone_sorted.free()
+
+    finally:
+        b_cons.free()
+        b_sorted.free()
+    log("  PASSED")
+
+
+# ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
 
@@ -1866,6 +2137,13 @@ def entry_point(argv):
         test_reduce_multi_agg_nonlinear(base_dir)
         test_count_non_null(base_dir)
         test_compaction_through_ticks(base_dir)
+        test_consolidated_flag_basics()
+        test_consolidated_short_circuit_empty()
+        test_consolidated_propagation_filter(base_dir)
+        test_consolidated_propagation_negate()
+        test_scan_trace_marks_consolidated(base_dir)
+        test_distinct_marks_consolidated(base_dir)
+        test_clone_preserves_consolidated()
         log("\nALL DBSP TESTS PASSED")
     except Exception as e:
         os.write(2, "FAILURE\n")

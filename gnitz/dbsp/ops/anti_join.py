@@ -97,7 +97,7 @@ def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
 
                 if not has_match:
                     out_writer.append_batch(b_a, start_a, idx_a)
-            out_writer.mark_sorted(True)
+            out_writer.mark_consolidated(True)
 
 
 def op_semi_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema):
@@ -178,4 +178,4 @@ def op_semi_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
 
                 if has_match:
                     out_writer.append_batch(b_a, start_a, idx_a)
-            out_writer.mark_sorted(True)
+            out_writer.mark_consolidated(True)

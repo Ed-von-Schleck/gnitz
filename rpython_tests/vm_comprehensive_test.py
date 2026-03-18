@@ -33,7 +33,7 @@ def assert_equal_i(expected, actual, msg):
 
 def assert_equal_i64(expected, actual, msg):
     if expected != actual:
-        fail(msg + " (i64 mismatch)")
+        fail(msg + " (expected=" + str(expected) + " actual=" + str(actual) + ")")
 
 def assert_equal_u128(expected, actual, msg):
     if expected != actual:
@@ -1146,6 +1146,139 @@ def test_trace_register_refresh_compacts(base_dir):
 
 
 # ------------------------------------------------------------------------------
+# Tests: execute_epoch seal (consolidated invariant at circuit entry)
+# ------------------------------------------------------------------------------
+
+def test_execute_epoch_seal_deduplicates(base_dir):
+    log("[VM] Test: execute_epoch seal deduplicates input...")
+
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
+    ]
+    schema = types.TableSchema(cols, 0)
+    vm_schema = schema
+
+    hist_dir = os.path.join(base_dir, "seal_distinct_hist")
+    history_table = EphemeralTable(hist_dir, "hist_seal", schema)
+
+    hist_cursor = history_table.create_cursor()
+    reg_file = runtime.RegisterFile(3)
+    reg_file.registers[0] = runtime.DeltaRegister(0, vm_schema)
+    reg_file.registers[1] = runtime.TraceRegister(1, vm_schema, hist_cursor, history_table)
+    reg_file.registers[2] = runtime.DeltaRegister(2, vm_schema)
+
+    program = [
+        instructions.distinct_op(
+            reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]
+        ),
+        instructions.halt_op(),
+    ]
+
+    plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=2)
+
+    # Unsorted batch with duplicate PKs:
+    # (PK=1, val=42, w=+2) and (PK=1, val=42, w=-1) → net w=+1 after seal
+    # (PK=2, val=99, w=+1)
+    # The seal (execute_epoch → to_consolidated) consolidates PK=1 to w=+1.
+    # DISTINCT on empty history: both PKs appear → output (PK=1, w=+1), (PK=2, w=+1).
+    in_batch = batch.ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, in_batch)
+
+    rb.begin(r_uint128(1), r_int64(2))
+    rb.put_int(r_int64(42))
+    rb.commit()
+
+    rb.begin(r_uint128(1), r_int64(-1))
+    rb.put_int(r_int64(42))
+    rb.commit()
+
+    rb.begin(r_uint128(2), r_int64(1))
+    rb.put_int(r_int64(99))
+    rb.commit()
+
+    result = plan.execute_epoch(in_batch)
+
+    assert_true(result is not None, "Seal test: should produce output")
+    assert_equal_i(2, result.length(), "Seal test: should have 2 rows (PK=1 deduped, PK=2)")
+
+    found_pk1 = False
+    found_pk2 = False
+    for i in range(result.length()):
+        pk = result.get_pk(i)
+        w = result.get_weight(i)
+        if pk == r_uint128(1):
+            assert_equal_i64(r_int64(1), w, "Seal test: PK=1 should have weight +1")
+            found_pk1 = True
+        elif pk == r_uint128(2):
+            assert_equal_i64(r_int64(1), w, "Seal test: PK=2 should have weight +1")
+            found_pk2 = True
+    assert_true(found_pk1, "Seal test: missing PK=1 in output")
+    assert_true(found_pk2, "Seal test: missing PK=2 in output")
+
+    result.free()
+    in_batch.free()
+    history_table.close()
+    log("  PASSED")
+
+
+def test_execute_epoch_seal_free_on_consolidated(base_dir):
+    log("[VM] Test: execute_epoch seal skips free for already-consolidated input...")
+
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
+    ]
+    schema = types.TableSchema(cols, 0)
+    vm_schema = schema
+
+    hist_dir = os.path.join(base_dir, "seal_cons_hist")
+    history_table = EphemeralTable(hist_dir, "hist_cons", schema)
+
+    hist_cursor = history_table.create_cursor()
+    reg_file = runtime.RegisterFile(3)
+    reg_file.registers[0] = runtime.DeltaRegister(0, vm_schema)
+    reg_file.registers[1] = runtime.TraceRegister(1, vm_schema, hist_cursor, history_table)
+    reg_file.registers[2] = runtime.DeltaRegister(2, vm_schema)
+
+    program = [
+        instructions.distinct_op(
+            reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]
+        ),
+        instructions.halt_op(),
+    ]
+
+    plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=2)
+
+    # Already-consolidated batch: mark_consolidated(True) before passing to execute_epoch.
+    # The seal returns self (no allocation), and execute_epoch must NOT free it.
+    in_batch = batch.ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, in_batch)
+
+    rb.begin(r_uint128(5), r_int64(1))
+    rb.put_int(r_int64(55))
+    rb.commit()
+
+    in_batch.mark_consolidated(True)
+
+    result = plan.execute_epoch(in_batch)
+
+    assert_true(result is not None, "Consolidated seal: should produce output")
+    assert_equal_i(1, result.length(), "Consolidated seal: should have 1 output row")
+    assert_equal_u128(r_uint128(5), result.get_pk(0), "Consolidated seal: PK should be 5")
+    assert_equal_i64(r_int64(1), result.get_weight(0),
+                     "Consolidated seal: weight should be +1")
+
+    # Verify the original batch is still usable (not freed by execute_epoch)
+    assert_equal_i(1, in_batch._count, "Original consolidated batch must still be alive")
+
+    result.free()
+    in_batch.free()
+    history_table.close()
+    log("  PASSED")
+
+
+# ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
 
@@ -1170,6 +1303,8 @@ def entry_point(argv):
         test_reduce_min_nonlinear(base_dir)
         test_join_delta_trace_multi_match(base_dir)
         test_trace_register_refresh_compacts(base_dir)
+        test_execute_epoch_seal_deduplicates(base_dir)
+        test_execute_epoch_seal_free_on_consolidated(base_dir)
         os.write(1, "\nALL VM TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

@@ -148,13 +148,17 @@ class ExecutablePlan(object):
         self.reg_file.prepare_for_tick()
         self.context.reset()
 
+        # Seal: enforce consolidated invariant at circuit entry.
+        # Returns self if already consolidated (zero cost); O(N log N) otherwise.
+        sealed = input_delta.to_consolidated()
+
         # 2. Binding: Borrow the input batch into the designated register
         target_reg_idx = self.in_reg_idx
         if self.source_reg_map is not None and source_id in self.source_reg_map:
             target_reg_idx = self.source_reg_map[source_id]
         in_reg = self.reg_file.get_register(target_reg_idx)
         assert in_reg.is_delta()
-        in_reg.bind(input_delta)
+        in_reg.bind(sealed)
 
         # 3. Execution: Run the interpreter logic
         run_vm(self.program, self.reg_file, self.context)
@@ -169,5 +173,7 @@ class ExecutablePlan(object):
 
         # 5. Cleanup: Release borrowed reference
         in_reg.unbind()
+        if sealed is not input_delta:
+            sealed.free()
 
         return result

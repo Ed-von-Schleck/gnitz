@@ -394,6 +394,7 @@ class ArenaZSetBatch(object):
 
         self._count = 0
         self._sorted = False
+        self._consolidated = False
         self._freed = False
 
     @staticmethod
@@ -420,6 +421,7 @@ class ArenaZSetBatch(object):
         batch.blob_arena = blob_buf
         batch._count = count
         batch._sorted = is_sorted
+        batch._consolidated = False   # IPC batches: sorted but not consolidated
         batch.allocator = BatchBlobAllocator(batch.blob_arena)
         return batch
 
@@ -431,6 +433,11 @@ class ArenaZSetBatch(object):
 
     def mark_sorted(self, value):
         self._sorted = value
+
+    def mark_consolidated(self, value):
+        self._consolidated = value
+        if value:
+            self._sorted = True   # consolidated ⇒ sorted, always
 
     def is_empty(self):
         return self._count == 0
@@ -445,6 +452,7 @@ class ArenaZSetBatch(object):
             self.col_bufs[i].offset = 0
         self._count = 0
         self._sorted = False
+        self._consolidated = False
 
     def free(self):
         if self._freed:
@@ -684,6 +692,7 @@ class ArenaZSetBatch(object):
         new_batch = ArenaZSetBatch(self._schema, initial_capacity=cap)
         new_batch.append_batch(self)
         new_batch._sorted = self._sorted
+        new_batch._consolidated = self._consolidated
         return new_batch
 
     def append_batch(self, other, start=0, end=-1):
@@ -863,6 +872,7 @@ class ArenaZSetBatch(object):
             idx = indices[i]
             new_batch._direct_append_row(self, idx, self._read_weight(idx))
         new_batch._sorted = True
+        new_batch._consolidated = self._consolidated
         return new_batch
 
     def to_consolidated(self):
@@ -874,7 +884,7 @@ class ArenaZSetBatch(object):
         over the original batch with inline consolidation — the intermediate
         sorted batch is never materialized.
         """
-        if self._count == 0:
+        if self._count == 0 or self._consolidated:
             return self
 
         # Build index array: identity for sorted, mergesorted for unsorted.
@@ -905,6 +915,7 @@ class ArenaZSetBatch(object):
             i = j
 
         res._sorted = True
+        res._consolidated = True
         return res
 
 
@@ -952,6 +963,9 @@ class BatchWriter(object):
 
     def mark_sorted(self, value):
         self._batch._sorted = value
+
+    def mark_consolidated(self, value):
+        self._batch.mark_consolidated(value)
 
 
 # ---------------------------------------------------------------------------
