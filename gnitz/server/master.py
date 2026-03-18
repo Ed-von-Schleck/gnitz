@@ -4,52 +4,16 @@
 # and collects responses.
 
 import os
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz import log
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch
-from gnitz.storage.partitioned_table import _partition_for_key
-from gnitz.dbsp.ops.exchange import repartition_batch
+from gnitz.dbsp.ops.exchange import repartition_batch, worker_for_pk, relay_scatter
 
 WNOHANG = 1
-
-
-class PartitionAssignment(object):
-    """Maps 256 partitions to N workers. Worker w owns [start, end)."""
-
-    _immutable_fields_ = ["num_workers", "starts[*]", "ends[*]",
-                          "_partition_to_worker[*]"]
-
-    def __init__(self, num_workers):
-        self.num_workers = num_workers
-        chunk = 256 // num_workers
-        starts = [0] * num_workers
-        ends = [0] * num_workers
-        for w in range(num_workers):
-            starts[w] = w * chunk
-            if w == num_workers - 1:
-                ends[w] = 256
-            else:
-                ends[w] = (w + 1) * chunk
-        self.starts = starts
-        self.ends = ends
-        # Precompute O(1) lookup table
-        lut = [0] * 256
-        for w in range(num_workers):
-            for p in range(starts[w], ends[w]):
-                lut[p] = w
-        self._partition_to_worker = lut
-
-    def worker_for_partition(self, partition_idx):
-        """Returns the worker ID that owns the given partition."""
-        return self._partition_to_worker[partition_idx]
-
-    def range_for_worker(self, worker_id):
-        """Returns (start, end) partition range for the given worker."""
-        return self.starts[worker_id], self.ends[worker_id]
 
 
 class MasterDispatcher(object):
@@ -67,24 +31,11 @@ class MasterDispatcher(object):
         self.assignment = assignment
         self.program_cache = program_cache
 
-    def _split_batch_by_pk(self, batch, schema):
-        """Split batch into per-worker sub-batches by PK hash."""
-        sub_batches = [None] * self.num_workers
-        for i in range(batch.length()):
-            pk_lo = r_uint64(batch._read_pk_lo(i))
-            pk_hi = r_uint64(batch._read_pk_hi(i))
-            p = _partition_for_key(pk_lo, pk_hi)
-            w = self.assignment.worker_for_partition(p)
-            if sub_batches[w] is None:
-                sub_batches[w] = ArenaZSetBatch(schema)
-            sub_batches[w]._direct_append_row(batch, i, batch.get_weight(i))
-        return sub_batches
-
     def fan_out_push(self, target_id, batch, schema):
         """Split batch by worker partition, send sub-batches, collect ACKs.
         Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE."""
         n = batch.length()
-        sub_batches = self._split_batch_by_pk(batch, schema)
+        sub_batches = repartition_batch(batch, [schema.pk_index], self.num_workers, self.assignment)
 
         # Send to ALL workers (even empty batches) so they all participate
         # in potential exchange barriers
@@ -165,26 +116,16 @@ class MasterDispatcher(object):
 
     def _relay_exchange(self, view_id, worker_batches, schema, source_id=0):
         """Repartition collected exchange batches and send to workers."""
-        # Merge all worker batches into one
-        merged = ArenaZSetBatch(schema)
-        for w in range(self.num_workers):
-            if worker_batches[w] is not None:
-                merged.append_batch(worker_batches[w])
-                worker_batches[w].free()
-
         # Determine shard columns: join-specific first, then circuit-level
         shard_cols = []
         if source_id > 0:
             shard_cols = self.program_cache.get_join_shard_cols(view_id, source_id)
         if len(shard_cols) == 0:
             shard_cols = self.program_cache.get_shard_cols(view_id)
-        if len(shard_cols) > 0:
-            dest_batches = repartition_batch(
-                merged, shard_cols, self.num_workers, self.assignment
-            )
-        else:
-            dest_batches = self._split_batch_by_pk(merged, schema)
-        merged.free()
+        dest_batches = relay_scatter(worker_batches, shard_cols, self.num_workers, self.assignment)
+        for w in range(self.num_workers):
+            if worker_batches[w] is not None:
+                worker_batches[w].free()
 
         for w in range(self.num_workers):
             ipc.send_batch(
@@ -220,8 +161,7 @@ class MasterDispatcher(object):
 
     def fan_out_seek(self, target_id, pk_lo, pk_hi, schema):
         """Route PK seek to the single worker that owns the relevant partition."""
-        partition = _partition_for_key(r_uint64(pk_lo), r_uint64(pk_hi))
-        worker = self.assignment.worker_for_partition(partition)
+        worker = worker_for_pk(pk_lo, pk_hi, self.assignment)
         ipc.send_batch(
             self.worker_fds[worker], target_id, None, schema=schema,
             flags=ipc.FLAG_SEEK, seek_pk_lo=pk_lo, seek_pk_hi=pk_hi,
@@ -285,7 +225,7 @@ class MasterDispatcher(object):
 
     def check_fk_batch(self, target_id, check_batch, schema):
         """Check PK existence across workers. Returns True if any key is missing."""
-        sub_batches = self._split_batch_by_pk(check_batch, schema)
+        sub_batches = repartition_batch(check_batch, [schema.pk_index], self.num_workers, self.assignment)
 
         # Send to ALL workers (even empty sub-batches) so the request/response
         # pattern is always symmetric and cannot deadlock.
@@ -349,7 +289,7 @@ class MasterDispatcher(object):
 
         Used to identify UPSERT rows before unique index enforcement.
         """
-        sub_batches = self._split_batch_by_pk(check_batch, schema)
+        sub_batches = repartition_batch(check_batch, [schema.pk_index], self.num_workers, self.assignment)
         for w in range(self.num_workers):
             sb = sub_batches[w]
             ipc.send_batch(

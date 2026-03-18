@@ -179,12 +179,6 @@ class CircuitBuilder(object):
             self._params.append((handle.node_id, PARAM_SHARD_COL_BASE + i, shard_columns[i]))
         return handle
 
-    def gather(self, input_handle, worker_id=0):
-        handle = self._alloc_node(OPCODE_EXCHANGE_GATHER)
-        self._connect(input_handle, handle, PORT_EXCHANGE_IN)
-        self._params.append((handle.node_id, PARAM_GATHER_WORKER, worker_id))
-        return handle
-
     def seek(self, trace_handle, key_handle):
         handle = self._alloc_node(OPCODE_SEEK_TRACE)
         self._connect(trace_handle, handle, PORT_TRACE)

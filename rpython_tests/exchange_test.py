@@ -22,8 +22,9 @@ from gnitz.core.batch import RowBuilder, ArenaZSetBatch
 from gnitz.catalog import engine
 from gnitz.catalog.registry import ingest_to_family
 from gnitz.catalog.metadata import ensure_dir
-from gnitz.dbsp.ops.exchange import hash_row_by_columns, repartition_batch
-from gnitz.server.master import PartitionAssignment
+from gnitz.core import opcodes
+from gnitz.dbsp.ops.exchange import hash_row_by_columns, repartition_batch, PartitionAssignment
+from gnitz.storage.partitioned_table import _partition_for_key
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
 
 
@@ -243,9 +244,9 @@ def test_compile_split_plan(base_dir):
     plan = db.program_cache.get_program(view.table_id)
     assert_true(plan is not None, "shard plan is None")
     assert_true(plan.exchange_post_plan is not None, "exchange_post_plan should be set")
-    assert_true(plan.exchange_shard_cols is not None, "exchange_shard_cols should be set")
-    assert_equal_i(1, len(plan.exchange_shard_cols), "should have 1 shard column")
-    assert_equal_i(1, plan.exchange_shard_cols[0], "shard column should be 1")
+    shard_cols = db.program_cache.get_shard_cols(view.table_id)
+    assert_equal_i(1, len(shard_cols), "should have 1 shard column")
+    assert_equal_i(1, shard_cols[0], "shard column should be 1")
 
     # Execute pre-plan in single-process mode (no exchange handler)
     in_batch = batch.ArenaZSetBatch(table.schema)
@@ -325,6 +326,156 @@ def test_compile_shard_with_negate(base_dir):
     log("  PASSED")
 
 
+def _make_table_cols_u128(col_names):
+    cols = [types.ColumnDefinition(types.TYPE_U128, name="pk")]
+    for n in col_names:
+        cols.append(types.ColumnDefinition(types.TYPE_I64, name=n))
+    return cols
+
+
+def test_gather_deleted(base_dir):
+    """Opcode 21 (old GATHER) is no longer a split marker; plan skips it."""
+    log("[EXCHANGE] Testing GATHER opcode is dead...")
+
+    # Verify OPCODE_EXCHANGE_SHARD is still 20
+    assert_equal_i(20, opcodes.OPCODE_EXCHANGE_SHARD, "OPCODE_EXCHANGE_SHARD must be 20")
+
+    # Build a circuit with raw opcode 21 in the node list (no gather() helper anymore).
+    # compile_from_graph should silently skip it (not produce exchange_post_plan).
+    db = engine.open_engine(base_dir)
+    db.create_schema("test")
+    table_cols = _make_table_cols_i64(["val"])
+    table = db.create_table("test.src_g", table_cols, 0)
+
+    # Build circuit by inserting opcode 21 manually via circuit_builder internals
+    builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
+    src = builder.input_delta()
+    # Manually allocate a node with raw opcode 21 (old GATHER) and connect it
+    from rpython_tests.helpers.circuit_builder import NodeHandle
+    nid = builder._next_node_id
+    builder._next_node_id += 1
+    builder._nodes.append((nid, 21))
+    eid = builder._next_edge_id
+    builder._next_edge_id += 1
+    builder._edges.append((eid, src.node_id, nid, 0))
+    gather_handle = NodeHandle(nid)
+    builder.sink(gather_handle, target_table_id=0)
+    out_cols = [("pk", types.TYPE_U64.code), ("val", types.TYPE_I64.code)]
+    graph = builder.build(out_cols)
+    db.create_view("test.v_gather", graph, "")
+
+    view = db.get_table("test.v_gather")
+    plan = db.program_cache.get_program(view.table_id)
+    # Opcode 21 is silently skipped; plan compiles but has no exchange split
+    assert_true(plan is not None, "plan for opcode-21 circuit must not be None")
+    assert_true(plan.exchange_post_plan is None,
+                "opcode 21 must not produce an exchange_post_plan")
+
+    db.drop_view("test.v_gather")
+    db.drop_table("test.src_g")
+    db.drop_schema("test")
+    db.close()
+    log("  PASSED")
+
+
+def test_hash_row_pk_col(base_dir):
+    """repartition_batch with [pk_index] uses pk_lo/pk_hi, not col_bufs (U128 PK)."""
+    log("[EXCHANGE] Testing hash_row_by_columns with U128 PK column...")
+
+    cols = _make_table_cols_u128(["val"])
+    schema = types.TableSchema(cols, pk_index=0)
+    b = batch.ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+
+    assignment = PartitionAssignment(4)
+
+    # pk_lo and pk_hi values as separate lists (avoids prebuilt-long issues in RPython)
+    # Rows: pk_hi=0 (U64-like) and pk_hi!=0 (true U128)
+    pk_los = [1, 2, 999983, 305419896]
+    pk_his = [0, 0, 1, 268435456]
+
+    for i in range(len(pk_los)):
+        pk_lo = pk_los[i]
+        pk_hi = pk_his[i]
+        pk = r_uint128((r_uint128(r_uint64(pk_hi)) << 64) | r_uint128(r_uint64(pk_lo)))
+        rb.begin(pk, r_int64(1))
+        rb.put_int(r_int64(42))
+        rb.commit()
+
+    # repartition by pk_index and verify each row lands on the expected worker
+    sub_batches = repartition_batch(b, [schema.pk_index], 4, assignment)
+
+    for i in range(len(pk_los)):
+        pk_lo = pk_los[i]
+        pk_hi = pk_his[i]
+        expected_p = _partition_for_key(r_uint64(pk_lo), r_uint64(pk_hi))
+        expected_w = assignment.worker_for_partition(expected_p)
+        found = False
+        for w in range(4):
+            sb = sub_batches[w]
+            if sb is None:
+                continue
+            for j in range(sb.length()):
+                lo = sb._read_pk_lo(j)
+                hi = sb._read_pk_hi(j)
+                if lo == r_uint64(pk_lo) and hi == r_uint64(pk_hi):
+                    assert_equal_i(expected_w, w,
+                                   "U128 PK row " + str(i) + " on wrong worker")
+                    found = True
+                    break
+        assert_true(found, "U128 PK row " + str(i) + " not found in any sub-batch")
+
+    for w in range(4):
+        if sub_batches[w] is not None:
+            sub_batches[w].free()
+    b.free()
+    log("  PASSED")
+
+
+def test_repartition_batch_pk_equals_split(base_dir):
+    """repartition_batch([pk_index]) produces same assignment as manual _partition_for_key."""
+    log("[EXCHANGE] Testing repartition_batch pk-routing golden values...")
+
+    schema = types.TableSchema(
+        _make_table_cols_i64(["val"]),
+        pk_index=0,
+    )
+    b = batch.ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+
+    pks = [1, 7, 42, 100, 255, 1024, 65537, 999983]
+    for pk in pks:
+        _add_int_row(rb, pk, [pk * 2])
+
+    assignment = PartitionAssignment(4)
+    sub_batches = repartition_batch(b, [schema.pk_index], 4, assignment)
+
+    # Compute expected worker for each PK manually
+    for i in range(len(pks)):
+        pk_val = pks[i]
+        expected_p = _partition_for_key(r_uint64(pk_val), r_uint64(0))
+        expected_w = assignment.worker_for_partition(expected_p)
+        found = False
+        for w in range(4):
+            sb = sub_batches[w]
+            if sb is None:
+                continue
+            for j in range(sb.length()):
+                lo = sb._read_pk_lo(j)
+                if lo == r_uint64(pk_val):
+                    assert_equal_i(expected_w, w,
+                                   "PK " + str(pk_val) + " on wrong worker")
+                    found = True
+                    break
+        assert_true(found, "PK " + str(pk_val) + " not found in any sub-batch")
+
+    for w in range(4):
+        if sub_batches[w] is not None:
+            sub_batches[w].free()
+    b.free()
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -346,6 +497,16 @@ def entry_point(argv):
         ensure_dir(base_dir)
 
         test_compile_shard_with_negate(base_dir)
+        cleanup(base_dir)
+        ensure_dir(base_dir)
+
+        test_gather_deleted(base_dir)
+        cleanup(base_dir)
+        ensure_dir(base_dir)
+
+        test_hash_row_pk_col(base_dir)
+
+        test_repartition_batch_pk_equals_split(base_dir)
 
         log("\nALL EXCHANGE TESTS PASSED")
     except Exception as e:

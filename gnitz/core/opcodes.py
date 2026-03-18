@@ -26,7 +26,6 @@ OPCODE_SEMI_JOIN_DELTA_DELTA = 19
 
 # Compile-time markers (not VM opcodes — never emitted as instructions)
 OPCODE_EXCHANGE_SHARD  = 20
-OPCODE_EXCHANGE_GATHER = 21
 
 # --- Input port indices (dst_port values in _circuit_edges) ---
 # Unary ops
@@ -55,7 +54,6 @@ PARAM_TABLE_ID     = 3   # INTEGRATE: target table id
 PARAM_AGG_COL_IDX    = 6   # REDUCE: which column to aggregate
 PARAM_EXPR_NUM_REGS  = 7   # FILTER: expression register count
 PARAM_EXPR_RESULT_REG = 8  # FILTER: which register holds the result
-PARAM_GATHER_WORKER   = 9   # GATHER: destination worker id
 PARAM_REINDEX_COL        = 10   # MAP: use column value as new PK
 PARAM_JOIN_SOURCE_TABLE  = 11   # SCAN_TRACE: source table for multi-input circuits
 PARAM_AGG_COUNT          = 12   # REDUCE: number of aggregate functions

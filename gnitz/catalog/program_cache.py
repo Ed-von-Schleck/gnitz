@@ -820,18 +820,16 @@ class ProgramCache(object):
                 if dst == nid:
                     in_regs[port] = out_reg_of[src]
 
-            if op == opcodes.OPCODE_EXCHANGE_SHARD or op == opcodes.OPCODE_EXCHANGE_GATHER:
+            if op == opcodes.OPCODE_EXCHANGE_SHARD:
                 # Exchange marker: split the plan into pre and post.
                 in_reg_id_for_exchange = in_regs[opcodes.PORT_EXCHANGE_IN]
 
                 # Extract shard column indices from params
                 shard_cols = []
-                if op == opcodes.OPCODE_EXCHANGE_SHARD:
-                    idx = 0
-                    while (opcodes.PARAM_SHARD_COL_BASE + idx) in node_params:
-                        shard_cols.append(node_params[opcodes.PARAM_SHARD_COL_BASE + idx])
-                        idx += 1
-                # For GATHER, shard_cols stays empty (sentinel for "gather to worker 0")
+                idx = 0
+                while (opcodes.PARAM_SHARD_COL_BASE + idx) in node_params:
+                    shard_cols.append(node_params[opcodes.PARAM_SHARD_COL_BASE + idx])
+                    idx += 1
 
                 # The pre-plan output schema is the schema at the exchange boundary
                 exchange_in_schema = reg_file.registers[in_reg_id_for_exchange].table_schema
@@ -923,7 +921,6 @@ class ProgramCache(object):
                     in_reg_idx=state[_ST_INPUT_DELTA_REG_ID],
                     out_reg_idx=in_reg_id_for_exchange,
                     exchange_post_plan=post_plan,
-                    exchange_shard_cols=shard_cols,
                 )
                 return pre_plan
 

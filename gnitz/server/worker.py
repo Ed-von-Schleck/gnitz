@@ -23,7 +23,7 @@ class WorkerExchangeHandler(object):
     def __init__(self, master_fd):
         self.master_fd = master_fd
 
-    def do_exchange(self, view_id, batch, shard_cols, source_id=0):
+    def do_exchange(self, view_id, batch, source_id=0):
         schema = batch._schema
         ipc.send_batch(
             self.master_fd, view_id, batch,

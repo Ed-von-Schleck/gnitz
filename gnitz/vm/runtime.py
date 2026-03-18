@@ -116,12 +116,12 @@ class ExecutablePlan(object):
     """
     _immutable_fields_ = [
         "program", "reg_file", "out_schema", "in_reg_idx", "out_reg_idx",
-        "exchange_post_plan", "exchange_shard_cols", "source_reg_map",
+        "exchange_post_plan", "source_reg_map",
         "join_shard_map",
     ]
 
     def __init__(self, program, reg_file, out_schema, in_reg_idx=0, out_reg_idx=1,
-                 exchange_post_plan=None, exchange_shard_cols=None,
+                 exchange_post_plan=None,
                  source_reg_map=None, join_shard_map=None):
         self.program = program
         self.reg_file = reg_file
@@ -130,7 +130,6 @@ class ExecutablePlan(object):
         self.out_reg_idx = out_reg_idx
         self.context = ExecutionContext()
         self.exchange_post_plan = exchange_post_plan
-        self.exchange_shard_cols = exchange_shard_cols
         self.source_reg_map = source_reg_map   # dict {source_table_id: reg_id} or None
         self.join_shard_map = join_shard_map    # dict {source_table_id: [col_idx]} or None
 

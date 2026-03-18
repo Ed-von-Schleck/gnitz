@@ -126,7 +126,7 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                 pre_result = ArenaZSetBatch(plan.out_schema)
 
             exchanged = exchange_handler.do_exchange(
-                target_view_id, pre_result, plan.exchange_shard_cols
+                target_view_id, pre_result
             )
             pre_result.free()
 
@@ -146,9 +146,8 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
             # Multi-worker join: exchange raw delta by join key column
             # BEFORE running the circuit, so all rows with the same join
             # key land on the same worker (co-partitioning).
-            shard_cols = plan.join_shard_map[source_id]
             exchanged = exchange_handler.do_exchange(
-                target_view_id, incoming_delta, shard_cols,
+                target_view_id, incoming_delta,
                 source_id=source_id,
             )
             incoming_delta.free()
