@@ -12,7 +12,8 @@ from gnitz.catalog.engine import open_engine
 from gnitz.catalog import system_tables as sys
 from gnitz.server.executor import ServerExecutor
 from gnitz.server import ipc_ffi
-from gnitz.server.master import PartitionAssignment, MasterDispatcher
+from gnitz.server.master import MasterDispatcher
+from gnitz.dbsp.ops.exchange import PartitionAssignment
 from gnitz.server.worker import WorkerProcess
 
 HELP_TEXT = (

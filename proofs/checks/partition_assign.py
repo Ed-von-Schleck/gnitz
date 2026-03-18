@@ -8,7 +8,7 @@ gnitz/server/master.py PartitionAssignment:
   Exhaustive: All 256 partitions covered exactly once for every N in [1, 256]
 
 Source:
-  - gnitz/server/master.py:20-52
+  - gnitz/dbsp/ops/exchange.py (PartitionAssignment class)
 
   chunk = 256 // num_workers
   starts[w] = w * chunk

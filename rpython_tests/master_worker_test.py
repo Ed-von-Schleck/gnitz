@@ -17,14 +17,16 @@ from rpython.rtyper.lltypesystem import rffi
 from gnitz.core import types
 from gnitz.core.batch import RowBuilder, ArenaZSetBatch
 from gnitz.server import ipc, ipc_ffi
-from gnitz.server.master import PartitionAssignment, MasterDispatcher
+from gnitz.server.master import MasterDispatcher
+from gnitz.dbsp.ops.exchange import PartitionAssignment
 from gnitz.storage.partitioned_table import (
     _partition_for_key,
     make_partitioned_persistent,
     NUM_PARTITIONS,
 )
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID
-from gnitz.dbsp.ops.exchange import hash_row_by_columns, _mix64
+from gnitz.dbsp.ops.exchange import hash_row_by_columns
+from gnitz.dbsp.ops.group_index import _mix64
 
 
 # -- Helpers -------------------------------------------------------------------
