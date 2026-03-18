@@ -65,86 +65,17 @@ All five links must be in place before the redundant PK sort disappears.
 
 ## Phase 0: Routing unification — DONE (cfbde4b..918d014)
 
-`exchange.py` is now the single authority for all partition routing.
-
-- **0a** Delete `OPCODE_EXCHANGE_GATHER`/`PARAM_GATHER_WORKER`, `gather()`,
-  `exchange_shard_cols` field, GATHER fallback in `_relay_exchange`, dead
-  `shard_cols` param from `do_exchange`. ~-40 lines, zero functional change.
-- **0b** Fix `hash_row_by_columns` U128 PK bug (col_bufs[pk_index] stride=0);
-  replace body with `_extract_group_key` delegation; delete `_mix64`,
-  `_read_col_or_pk`, `_read_col_u128_parts`, `_hash_string_col`; import
-  `_mix64` in `linear.py` from `group_index`. ~-50 lines.
-- **0c** Move `PartitionAssignment` to `exchange.py`; add `worker_for_pk`,
-  `relay_scatter`; delete `_split_batch_by_pk`; replace all call sites. ~-30 lines.
-- **0d** Add `multi_scatter` with PK-spec flag propagation. +35 lines.
+`exchange.py` is the single authority for all partition routing. GATHER deleted,
+`hash_row_by_columns` PK bug fixed, `PartitionAssignment`/`worker_for_pk`/
+`relay_scatter` moved in, `multi_scatter` added with PK-spec flag propagation.
 
 ---
 
-## Phase 1: Mechanical efficiency
+## Phase 1: Mechanical efficiency — DONE (b1641ce)
 
-No protocol changes. Each item is one commit.
-
-### 1a. Pre-allocation hints
-
-**Files:** `gnitz/dbsp/ops/exchange.py`
-
-After Phase 0, all batch scatter goes through `repartition_batch`. Add pre-allocation
-in one place:
-
-```python
-if sub_batches[w] is None:
-    sub_batches[w] = ArenaZSetBatch(schema,
-                         initial_capacity=batch.length() // num_workers)
-```
-
-This covers push routing, FK routing, UPSERT routing, and exchange relay — all callers
-of `repartition_batch`. No change to `master.py` needed.
-
-### 1b. Poll loop uniformity
-
-**Files:** `gnitz/server/master.py`
-
-`fan_out_push` rebuilds three `newlist_hint` arrays on every iteration of
-`while num_acked < num_workers` (master.py lines 109–116), including no-event
-timeouts. Build once before the loop; swap-remove on ACK (O(1)).
-
-`fan_out_scan` receives in fixed order w=0..N-1 (master.py lines 202–213). Replace
-with the same poll pattern as `fan_out_push`: scan latency becomes O(max worker)
-instead of O(sum).
-
-### 1c. Master-side index routing cache
-
-**Files:** `gnitz/dbsp/ops/exchange.py`, `gnitz/server/master.py`
-
-After Phase 0, the routing cache is a routing concern and belongs in `exchange.py`.
-Add a `PartitionRouter` wrapper:
-
-```python
-class PartitionRouter(object):
-    def __init__(self, assignment):
-        self.assignment = assignment
-        self._index_routing = {}   # (table_id, col_idx, key_lo, key_hi) → worker
-
-    def worker_for_index_key(self, table_id, col_idx, key_lo, key_hi):
-        """Returns worker on cache hit, -1 on miss."""
-        ...
-
-    def record_routing(self, batch, table_id, col_idx, weight):
-        """Populate or invalidate cache entries from push/delete events."""
-        ...
-```
-
-`MasterDispatcher` holds a `PartitionRouter`. `fan_out_seek_by_index` fast path:
-call `self.router.worker_for_index_key(...)`. On hit: 1 IPC round-trip. On miss:
-existing broadcast (handles unseen keys, non-unique indices — no regression).
-
-The cache is populated as a side effect of the push scatter: after
-`repartition_batch` or `multi_scatter` (Phase 0d), call `router.record_routing` for
-the relevant index column. After Phase 4, the `multi_scatter` pass already iterates
-every row once; recording index routing adds negligible overhead with no extra scan.
-Weight -1 rows delete the entry.
-
-Scope: unique index seeks (FK validation, secondary index point lookups).
+- **1a** `repartition_batch` and `multi_scatter` pass `initial_capacity=batch.length()//num_workers` to avoid repeated buffer growth.
+- **1b** `fan_out_push` builds poll lists once and uses backwards swap-remove on ACK. `fan_out_scan` uses the same poll pattern (latency O(max worker) vs O(sum)).
+- **1c** `PartitionRouter` in `exchange.py` caches `(table_id, col_idx, key_lo, 0) → worker` for unique secondary indexes. `fan_out_push` records routing after repartitioning; `fan_out_seek_by_index` unicasts on hit, broadcasts on miss.
 
 ---
 
@@ -550,10 +481,10 @@ Phase 0 ─── prerequisite for all phases ───────────�
        (exchange.py, master.py, main.py, ~-30 lines net)
   [0d] Add multi_scatter              (exchange.py, ~30 lines)
 
-Phase 1 ─── all unblocked, independent ─────────────────────────────────
-  [1a] Pre-allocation hints            (exchange.py only, ~2 lines)
-  [1b] Poll loop uniformity            (master.py, ~35 lines)
-  [1c] Master-side index routing       (exchange.py, master.py, ~60 lines)
+Phase 1 ─── DONE (b1641ce) ──────────────────────────────────────────────
+  [1a] Pre-allocation hints            DONE
+  [1b] Poll loop uniformity            DONE
+  [1c] Master-side index routing       DONE
 
 Phase 2 ─── DONE (0cdf59d) ──────────────────────────────────────────────
   [2a] DDL ACK removal + broadcast_batch  DONE
@@ -563,9 +494,10 @@ Phase 2 ─── DONE (0cdf59d) ───────────────�
 
 Phase 3 ─── sequential within phase ────────────────────────────────────
   [3a] repartition_batches             (exchange.py, ~25 lines)
-  [3b] repartition_batches_merged      (exchange.py, ~40 lines)
-  [3c] Collect loop + _relay_exchange  (master.py, ~30 lines; relay_scatter
-                                        already in exchange.py from Phase 0c)
+  [3b] repartition_batches_merged + update relay_scatter to dispatch between
+       repartition_batches and repartition_batches_merged based on _consolidated
+                                       (exchange.py, ~45 lines)
+  [3c] Collect loop + _relay_exchange  (master.py, ~30 lines)
        ↓ enables Phase 4
 
 Phase 4 ─── after Phase 3 ──────────────────────────────────────────────
