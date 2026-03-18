@@ -146,6 +146,70 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
 
+    def test_inner_join_left_delete_retraction(self, client):
+        """Deleting a left-side row retracts its matched rows from the view."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM t1 JOIN t2 ON t1.fk = t2.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO t2 VALUES (10, 100)", schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO t1 VALUES (1, 10), (2, 10)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            rows = _scan_dicts(client, vid)
+            assert len(rows) == 2, f"expected 2 rows before delete, got {rows}"
+
+            client.execute_sql("DELETE FROM t1 WHERE id = 1", schema_name=sn)
+            rows = _scan_dicts(client, vid)
+            assert len(rows) == 1, f"expected 1 row after left-side delete, got {rows}"
+        finally:
+            _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
+
+    def test_inner_join_right_delete_retraction(self, client):
+        """Deleting a right-side row retracts all matched rows from the view."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM t1 JOIN t2 ON t1.fk = t2.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO t2 VALUES (10, 100)", schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO t1 VALUES (1, 10), (2, 10)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            rows = _scan_dicts(client, vid)
+            assert len(rows) == 2, f"expected 2 rows before delete, got {rows}"
+
+            client.execute_sql("DELETE FROM t2 WHERE id = 10", schema_name=sn)
+            rows = _scan_dicts(client, vid)
+            assert len(rows) == 0, f"expected 0 rows after right-side delete, got {rows}"
+        finally:
+            _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
+
     def test_join_non_equi_rejects(self, client):
         """Non-equi join condition should be rejected."""
         sn = "s" + _uid()

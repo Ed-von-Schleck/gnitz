@@ -227,6 +227,65 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_count_retraction(self, client):
+        """Deleting a row decrements the group count."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt FROM orders GROUP BY category",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60), (3, 10, 300, 70)",
+                schema_name=sn,
+            )
+            rows = client.scan(vid)
+            assert len(rows) == 1
+            assert next(iter(rows))["cnt"] == 3
+
+            client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
+            rows = client.scan(vid)
+            assert len(rows) == 1
+            assert next(iter(rows))["cnt"] == 2, f"expected cnt=2 after delete, got {rows}"
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE orders", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_sum_retraction(self, client):
+        """Deleting a row decrements the group sum."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT category, SUM(amount) AS total FROM orders GROUP BY category",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60)",
+                schema_name=sn,
+            )
+            rows = client.scan(vid)
+            assert next(iter(rows))["total"] == 300
+
+            client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
+            rows = client.scan(vid)
+            assert len(rows) == 1
+            assert next(iter(rows))["total"] == 200, f"expected total=200, got {rows}"
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE orders", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_incremental_group_by(self, client):
         """Insert in two batches; verify the view updates incrementally."""
         sn = "s" + _uid()

@@ -601,9 +601,12 @@ fn execute_create_join_view(
     let inner_merged = cb.union(proj_ab_node, proj_ba_node);
 
     let merged = if is_left_join {
-        // Single-pass LEFT OUTER JOIN: replaces anti_join + null_fill_map + union.
+        // Single-pass LEFT OUTER JOIN: outer_ab handles ΔA (inner rows + null-fill for
+        // unmatched); proj_ba_node handles ΔB updates via the inner join path.
+        // Do NOT union with inner_merged — that would double-count proj_ab_node.
+        let _ = inner_merged; // suppress unused-variable warning
         let outer_ab = cb.left_join_with_trace_node(reindex_a, trace_b);
-        cb.union(inner_merged, outer_ab)
+        cb.union(outer_ab, proj_ba_node)
     } else {
         inner_merged
     };
