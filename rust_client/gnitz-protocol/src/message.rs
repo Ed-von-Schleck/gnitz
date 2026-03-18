@@ -9,10 +9,16 @@ use crate::wal_block::{encode_wal_block, decode_wal_block, IPC_CONTROL_TID, WAL_
 use crate::transport::{send_memfd, recv_memfd};
 
 pub struct Message {
-    pub header:       Header,
+    pub status:       u32,
+    pub target_id:    u64,
+    pub client_id:    u64,
+    pub flags:        u64,
+    pub seek_pk_lo:   u64,
+    pub seek_pk_hi:   u64,
+    pub seek_col_idx: u64,
     pub schema_batch: Option<ZSetBatch>,
     pub data_batch:   Option<ZSetBatch>,
-    pub error_text:   Option<String>,   // Some(_) when header.status == STATUS_ERROR
+    pub error_text:   Option<String>,   // Some(_) when status == STATUS_ERROR
 }
 
 // ── CONTROL_SCHEMA ────────────────────────────────────────────────────────────
@@ -157,36 +163,39 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String), ProtocolErr
 }
 
 pub fn send_message(
-    sock_fd:          RawFd,
-    mut header:       Header,
-    schema:           Option<&Schema>,
-    schema_batch_arg: Option<&ZSetBatch>,
-    data_batch:       Option<&ZSetBatch>,
+    sock_fd:      RawFd,
+    target_id:    u64,
+    client_id:    u64,
+    flags:        u64,
+    seek_pk_lo:   u64,
+    seek_pk_hi:   u64,
+    seek_col_idx: u64,
+    schema:       Option<&Schema>,
+    data_batch:   Option<&ZSetBatch>,
 ) -> Result<(), ProtocolError> {
     let has_data   = data_batch.map(|b| !b.is_empty()).unwrap_or(false);
-    let has_schema = has_data || (schema.is_some() && header.status == STATUS_OK);
+    let has_schema = has_data || schema.is_some();
 
-    if has_schema { header.flags |= FLAG_HAS_SCHEMA; }
-    if has_data   { header.flags |= FLAG_HAS_DATA;   }
+    let mut flags_out = flags;
+    if has_schema { flags_out |= FLAG_HAS_SCHEMA; }
+    if has_data   { flags_out |= FLAG_HAS_DATA;   }
 
-    let mut buf = encode_control_block(&header, "")?;
+    let ctrl_hdr = Header {
+        status: STATUS_OK, target_id, client_id, flags: flags_out,
+        seek_pk_lo, seek_pk_hi, p4: seek_col_idx,
+    };
+    let mut buf = encode_control_block(&ctrl_hdr, "")?;
 
     if has_schema {
         let ms = meta_schema();
-        let owned: ZSetBatch;
-        let sbatch: &ZSetBatch = if let Some(b) = schema_batch_arg {
-            b
-        } else {
-            owned = schema_to_batch(schema.unwrap());
-            &owned
-        };
-        let schema_block = encode_wal_block(ms, header.target_id as u32, sbatch);
+        let owned = schema_to_batch(schema.unwrap());
+        let schema_block = encode_wal_block(ms, target_id as u32, &owned);
         buf.extend_from_slice(&schema_block);
     }
 
     if has_data {
         let data_block = encode_wal_block(
-            schema.unwrap(), header.target_id as u32, data_batch.unwrap()
+            schema.unwrap(), target_id as u32, data_batch.unwrap()
         );
         buf.extend_from_slice(&data_block);
     }
@@ -258,14 +267,31 @@ pub fn recv_message(
 
     if ctrl_header.status == STATUS_ERROR {
         return Ok(Message {
-            header:       ctrl_header,
+            status:       ctrl_header.status,
+            target_id:    ctrl_header.target_id,
+            client_id:    ctrl_header.client_id,
+            flags:        ctrl_header.flags,
+            seek_pk_lo:   ctrl_header.seek_pk_lo,
+            seek_pk_hi:   ctrl_header.seek_pk_hi,
+            seek_col_idx: ctrl_header.p4,
             schema_batch: None,
             data_batch:   None,
             error_text:   Some(error_msg),
         });
     }
 
-    Ok(Message { header: ctrl_header, schema_batch, data_batch, error_text: None })
+    Ok(Message {
+        status:       ctrl_header.status,
+        target_id:    ctrl_header.target_id,
+        client_id:    ctrl_header.client_id,
+        flags:        ctrl_header.flags,
+        seek_pk_lo:   ctrl_header.seek_pk_lo,
+        seek_pk_hi:   ctrl_header.seek_pk_hi,
+        seek_col_idx: ctrl_header.p4,
+        schema_batch,
+        data_batch,
+        error_text:   None,
+    })
 }
 
 #[cfg(test)]
@@ -279,10 +305,6 @@ mod tests {
         let mut fds = [0i32; 2];
         unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()); }
         (fds[0], fds[1])
-    }
-
-    fn default_header() -> Header {
-        Header { flags: FLAG_PUSH, ..Header::default() }
     }
 
     // ── control block roundtrip ─────────────────────────────────────────────
@@ -335,7 +357,7 @@ mod tests {
 
         let empty_batch = ZSetBatch::new(&schema);
         let (a, b) = make_socketpair();
-        send_message(a, default_header(), Some(&schema), None, Some(&empty_batch)).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, 0, 0, 0, Some(&schema), Some(&empty_batch)).unwrap();
         let msg = recv_message(b, None).unwrap();
 
         // Schema was sent, data was not (empty batch)
@@ -382,7 +404,7 @@ mod tests {
         };
 
         let (a, b) = make_socketpair();
-        send_message(a, default_header(), Some(&schema), None, Some(&batch)).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, 0, 0, 0, Some(&schema), Some(&batch)).unwrap();
         let msg = recv_message(b, None).unwrap();
 
         let data = msg.data_batch.unwrap();
@@ -438,7 +460,7 @@ mod tests {
         };
 
         let (a, b) = make_socketpair();
-        send_message(a, default_header(), Some(&schema), None, Some(&batch)).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, 0, 0, 0, Some(&schema), Some(&batch)).unwrap();
         let msg = recv_message(b, None).unwrap();
 
         let data = msg.data_batch.unwrap();
@@ -460,7 +482,7 @@ mod tests {
     fn test_message_no_schema_no_data() {
         // Control-only message (scan/alloc style)
         let (a, b) = make_socketpair();
-        send_message(a, default_header(), None, None, None).unwrap();
+        send_message(a, 0, 0, FLAG_PUSH, 0, 0, 0, None, None).unwrap();
         let msg = recv_message(b, None).unwrap();
         assert!(msg.schema_batch.is_none());
         assert!(msg.data_batch.is_none());
@@ -472,10 +494,11 @@ mod tests {
         // STATUS_ERROR response: schema and data should be None; error_text populated
         let (a, b) = make_socketpair();
         let err_hdr = Header { status: STATUS_ERROR, ..Header::default() };
-        send_message(a, err_hdr, None, None, None).unwrap();
+        let encoded = encode_control_block(&err_hdr, "something broke").unwrap();
+        crate::transport::send_memfd(a, &encoded).unwrap();
         let msg = recv_message(b, None).unwrap();
-        assert_eq!(msg.header.status, STATUS_ERROR);
-        // error_text is Some (possibly empty since we send no error string)
+        assert_eq!(msg.status, STATUS_ERROR);
+        assert!(msg.error_text.is_some());
         unsafe { libc::close(a); libc::close(b); }
     }
 }

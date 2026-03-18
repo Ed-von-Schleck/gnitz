@@ -1,6 +1,6 @@
 use std::os::unix::io::RawFd;
 use gnitz_protocol::{
-    Header, Message, Schema, ZSetBatch,
+    Message, Schema, ZSetBatch,
     STATUS_ERROR, FLAG_SEEK, FLAG_SEEK_BY_INDEX, send_message, recv_message,
     connect as proto_connect, close_fd,
 };
@@ -28,15 +28,10 @@ impl Connection {
         schema:    Option<&Schema>,
         data:      Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
-        let mut hdr = Header::default();
-        hdr.target_id = target_id;
-        hdr.client_id = self.client_id;
-        hdr.flags     = flags;
-
-        send_message(self.sock_fd, hdr, schema, None, data)?;
+        send_message(self.sock_fd, target_id, self.client_id, flags, 0, 0, 0, schema, data)?;
         let msg = recv_message(self.sock_fd, None)?;
 
-        if msg.header.status == STATUS_ERROR {
+        if msg.status == STATUS_ERROR {
             return Err(ClientError::ServerError(
                 msg.error_text.unwrap_or_else(|| "unknown server error".into())
             ));
@@ -51,14 +46,9 @@ impl Connection {
         key_lo:   u64,
         key_hi:   u64,
     ) -> Result<Message, ClientError> {
-        let mut hdr = Header::default();
-        hdr.target_id = table_id;
-        hdr.client_id = self.client_id;
-        hdr.flags     = FLAG_SEEK_BY_INDEX;
-        hdr.set_seek_by_index(col_idx, key_lo, key_hi);
-        send_message(self.sock_fd, hdr, None, None, None)?;
+        send_message(self.sock_fd, table_id, self.client_id, FLAG_SEEK_BY_INDEX, key_lo, key_hi, col_idx, None, None)?;
         let msg = recv_message(self.sock_fd, None)?;
-        if msg.header.status == STATUS_ERROR {
+        if msg.status == STATUS_ERROR {
             return Err(ClientError::ServerError(
                 msg.error_text.unwrap_or_else(|| "unknown server error".into())
             ));
@@ -72,15 +62,9 @@ impl Connection {
         pk_lo:     u64,
         pk_hi:     u64,
     ) -> Result<Message, ClientError> {
-        let mut hdr = Header::default();
-        hdr.target_id  = target_id;
-        hdr.client_id  = self.client_id;
-        hdr.flags      = FLAG_SEEK;
-        hdr.seek_pk_lo = pk_lo;
-        hdr.seek_pk_hi = pk_hi;
-        send_message(self.sock_fd, hdr, None, None, None)?;
+        send_message(self.sock_fd, target_id, self.client_id, FLAG_SEEK, pk_lo, pk_hi, 0, None, None)?;
         let msg = recv_message(self.sock_fd, None)?;
-        if msg.header.status == STATUS_ERROR {
+        if msg.status == STATUS_ERROR {
             return Err(ClientError::ServerError(
                 msg.error_text.unwrap_or_else(|| "unknown server error".into())
             ));

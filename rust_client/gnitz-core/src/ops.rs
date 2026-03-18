@@ -15,17 +15,17 @@ pub const FIRST_USER_SCHEMA_ID: u64 = 3;
 
 pub fn alloc_table_id(conn: &Connection) -> Result<u64, ClientError> {
     let msg = conn.roundtrip(0, FLAG_ALLOCATE_TABLE_ID, None, None)?;
-    Ok(msg.header.target_id)
+    Ok(msg.target_id)
 }
 
 pub fn alloc_schema_id(conn: &Connection) -> Result<u64, ClientError> {
     let msg = conn.roundtrip(0, FLAG_ALLOCATE_SCHEMA_ID, None, None)?;
-    Ok(msg.header.target_id)
+    Ok(msg.target_id)
 }
 
 pub fn alloc_index_id(conn: &Connection) -> Result<u64, ClientError> {
     let msg = conn.roundtrip(0, FLAG_ALLOCATE_INDEX_ID, None, None)?;
-    Ok(msg.header.target_id)
+    Ok(msg.target_id)
 }
 
 pub fn seek_by_index(

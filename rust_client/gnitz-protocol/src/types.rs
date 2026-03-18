@@ -19,13 +19,14 @@ pub enum TypeCode {
 }
 
 impl TypeCode {
-    /// Wire stride in bytes. String returns 8 (u32 offset + u32 length).
+    /// Wire stride in bytes. String returns 16 (German String struct).
     pub fn wire_stride(self) -> usize {
         match self {
             TypeCode::U8  | TypeCode::I8  => 1,
             TypeCode::U16 | TypeCode::I16 => 2,
             TypeCode::U32 | TypeCode::I32 | TypeCode::F32 => 4,
-            TypeCode::U64 | TypeCode::I64 | TypeCode::F64 | TypeCode::String => 8,
+            TypeCode::U64 | TypeCode::I64 | TypeCode::F64 => 8,
+            TypeCode::String => 16,
             TypeCode::U128 => 16,
         }
     }
