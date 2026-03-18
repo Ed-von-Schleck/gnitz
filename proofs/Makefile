@@ -66,7 +66,8 @@ PROOFS := \
 	manifest-key-split:manifest_key_split \
 	negate-involution:negate_involution \
 	union-merge-sorted:union_merge_sorted \
-	anti-semi-complement:anti_semi_complement
+	anti-semi-complement:anti_semi_complement \
+	dbsp-join-correctness:dbsp_join_correctness
 
 TARGETS := $(foreach p,$(PROOFS),prove-$(firstword $(subst :, ,$(p))))
 
