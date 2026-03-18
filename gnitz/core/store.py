@@ -47,6 +47,15 @@ class AbstractCursor(object):
         # -> RowAccessor
         raise NotImplementedError
 
+    def estimated_length(self):
+        """Upper bound on live records. Permitted to over-count; must not under-count."""
+        return 0
+
+    def seek_key_exact(self, key):
+        """Seek to key. Returns True iff cursor is now positioned exactly on key."""
+        self.seek(key)
+        return self.is_valid() and self.key() == key
+
     def close(self):
         """Releases any resources held by the cursor."""
         raise NotImplementedError

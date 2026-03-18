@@ -99,6 +99,9 @@ class SortedBatchCursor(BaseCursor):
     def is_exhausted(self):
         return self._pos >= self._batch.length()
 
+    def estimated_length(self):
+        return self._batch.length()
+
     def bind_to(self, acc):
         """Bind an external ColumnarBatchAccessor to this cursor's current position."""
         acc.bind(self._batch, self._pos)
@@ -178,6 +181,9 @@ class MemTableCursor(BaseCursor):
         self._accessor.bind(self._snapshot, self._pos)
         return self._accessor
 
+    def estimated_length(self):
+        return self._snapshot.length()
+
     def close(self):
         self._snapshot.free()
 
@@ -233,6 +239,9 @@ class ShardCursor(BaseCursor):
 
     def is_valid(self):
         return self.position < self.view.count
+
+    def estimated_length(self):
+        return self.view.count
 
 
 def _copy_cursors(cursors):
@@ -354,6 +363,12 @@ class UnifiedCursor(AbstractCursor):
 
     def get_accessor(self):
         return self._current_accessor
+
+    def estimated_length(self):
+        total = 0
+        for c in self.cursors:
+            total += c.estimated_length()
+        return total
 
     def close(self):
         if self.tree is not None:

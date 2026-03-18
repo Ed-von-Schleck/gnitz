@@ -4,7 +4,8 @@ from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, intmask
 
 from gnitz.core.comparator import RowAccessor
-from gnitz.core.batch import ConsolidatedScope, BatchWriter
+from gnitz.core.batch import ConsolidatedScope, SortedScope, BatchWriter
+from gnitz.storage.cursor import SortedBatchCursor
 
 """
 Bilinear Join Operators for the DBSP algebra.
@@ -119,6 +120,8 @@ class CompositeAccessor(RowAccessor):
 CONSOLIDATE_INTERVAL = 8192       # output rows written before each consolidation (delta-trace)
 CONSOLIDATE_INTERVAL_DD = 16384   # output rows written before each consolidation (delta-delta)
 
+ADAPTIVE_SWAP_THRESHOLD = 1   # swap when delta_len > trace_len
+
 # ---------------------------------------------------------------------------
 # Join operator implementations
 # ---------------------------------------------------------------------------
@@ -135,9 +138,22 @@ def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schem
     t_schema:      TableSchema     — schema of the trace
     """
     composite_acc = CompositeAccessor(d_schema, t_schema)
+    delta_len = delta_batch.length()
+    trace_len = trace_cursor.estimated_length()
 
+    if delta_len > trace_len * ADAPTIVE_SWAP_THRESHOLD:
+        _join_dt_swapped(delta_batch, trace_cursor, out_writer, composite_acc)
+        out_writer.mark_sorted(True)
+    elif delta_batch._consolidated:
+        _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc)
+        # mark_consolidated is called inside _join_dt_merge_walk
+    else:
+        _join_dt_normal(delta_batch, trace_cursor, out_writer, composite_acc)
+        out_writer.mark_sorted(delta_batch._sorted)
+
+
+def _join_dt_normal(delta_batch, trace_cursor, out_writer, composite_acc):
     count = delta_batch.length()
-    rows_since_consolidation = 0
     for i in range(count):
         w_delta = delta_batch.get_weight(i)
         if w_delta == r_int64(0):
@@ -151,7 +167,6 @@ def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schem
                 break
 
             w_trace = trace_cursor.weight()
-            # weight multiplication with RPython machine-word truncation
             w_out = r_int64(intmask(w_delta * w_trace))
 
             if w_out != r_int64(0):
@@ -160,13 +175,58 @@ def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schem
                     trace_cursor.get_accessor(),
                 )
                 out_writer.append_from_accessor(key, w_out, composite_acc)
-                rows_since_consolidation += 1
-                if rows_since_consolidation >= CONSOLIDATE_INTERVAL:
-                    out_writer.consolidate()
-                    rows_since_consolidation = 0
 
             trace_cursor.advance()
-    out_writer.mark_sorted(delta_batch._sorted)
+    # No mark_sorted here — dispatch owns it.
+
+
+def _join_dt_swapped(delta_batch, trace_cursor, out_writer, composite_acc):
+    with ConsolidatedScope(delta_batch) as sorted_delta:
+        delta_cursor = SortedBatchCursor(sorted_delta)
+        while trace_cursor.is_valid():
+            trace_key = trace_cursor.key()
+            if not delta_cursor.seek_key_exact(trace_key):
+                trace_cursor.advance()
+                continue
+            w_trace = trace_cursor.weight()
+            while delta_cursor.is_valid() and delta_cursor.key() == trace_key:
+                w_delta = delta_cursor.weight()
+                w_out = r_int64(intmask(w_delta * w_trace))
+                if w_out != r_int64(0):
+                    composite_acc.set_accessors(
+                        delta_cursor.get_accessor(),
+                        trace_cursor.get_accessor(),
+                    )
+                    out_writer.append_from_accessor(trace_key, w_out, composite_acc)
+                delta_cursor.advance()
+            trace_cursor.advance()
+    # Caller sets mark_sorted(True) — output is in trace key order.
+
+
+def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
+    count = delta_batch.length()
+    if count == 0:
+        out_writer.mark_sorted(True)
+        return
+    trace_cursor.seek(delta_batch.get_pk(0))
+    for i in range(count):
+        d_key = delta_batch.get_pk(i)
+        w_delta = delta_batch.get_weight(i)
+        # w_delta is non-zero by _consolidated invariant.
+        while trace_cursor.is_valid() and trace_cursor.key() < d_key:
+            trace_cursor.advance()
+        # Iterate all trace records for d_key (trace may have multiple rows per PK).
+        while trace_cursor.is_valid() and trace_cursor.key() == d_key:
+            w_trace = trace_cursor.weight()
+            w_out = r_int64(intmask(w_delta * w_trace))
+            if w_out != r_int64(0):
+                composite_acc.set_accessors(
+                    delta_batch.get_accessor(i),
+                    trace_cursor.get_accessor(),
+                )
+                out_writer.append_from_accessor(d_key, w_out, composite_acc)
+            trace_cursor.advance()
+    out_writer.mark_sorted(True)
 
 
 def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):
