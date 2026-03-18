@@ -33,6 +33,7 @@ from gnitz.storage import (
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.storage.table import PersistentTable
+from gnitz.storage.partitioned_table import make_partitioned_ephemeral
 from gnitz.core.batch import ColumnarBatchAccessor, RowBuilder
 from gnitz.catalog.registry import _enforce_unique_pk, TableFamily
 
@@ -1341,6 +1342,489 @@ def test_enforce_unique_pk(base_dir):
     os.write(1, "    [OK] enforce_unique_pk tests passed.\n")
 
 
+def test_ephemeral_compaction(base_dir):
+    """Auto-compaction via create_cursor(): sawtooth pattern, ghost property."""
+    os.write(1, "[Storage] Testing EphemeralTable auto-compaction...\n")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    tbl_dir = os.path.join(base_dir, "eph_compact")
+    tbl = EphemeralTable(tbl_dir, "ec", schema)
+
+    try:
+        # Phase 1: 6 rows, one flush each -> 6 shards -> needs_compaction True
+        i = 1
+        while i <= 6:
+            b = batch.ArenaZSetBatch(schema)
+            rb = RowBuilder(schema, b)
+            rb.begin(r_uint128(i), r_int64(1))
+            rb.put_int(r_int64(i * 10))
+            rb.commit()
+            tbl.ingest_batch(b)
+            tbl.flush()
+            b.free()
+            i += 1
+
+        if not tbl.index.needs_compaction:
+            raise Exception("needs_compaction should be True after 6 flushes")
+        if len(tbl.index.handles) != 6:
+            raise Exception(
+                "Expected 6 shards, got " + str(len(tbl.index.handles))
+            )
+
+        # Record pre-compaction shard filenames to verify deletion afterward
+        pre_compact_files = []
+        h_idx = 0
+        while h_idx < len(tbl.index.handles):
+            pre_compact_files.append(tbl.index.handles[h_idx].filename)
+            h_idx += 1
+
+        # create_cursor() triggers compaction, returns cursor over 1 merged shard
+        c = tbl.create_cursor()
+
+        if len(tbl.index.handles) != 1:
+            raise Exception(
+                "Expected 1 shard post-compaction, got "
+                + str(len(tbl.index.handles))
+            )
+        if tbl.index.needs_compaction:
+            raise Exception("needs_compaction should be False after compaction")
+
+        # Verify all 6 rows present (cursor already at position after compaction)
+        row_count = 0
+        while c.is_valid():
+            if c.weight() > r_int64(0):
+                row_count += 1
+            c.advance()
+        c.close()
+        if row_count != 6:
+            raise Exception("Expected 6 rows post-compaction, got " + str(row_count))
+
+        # Old shard files should be deleted (ref_counter.try_cleanup() inside _compact())
+        f_idx = 0
+        while f_idx < len(pre_compact_files):
+            if os.path.exists(pre_compact_files[f_idx]):
+                os.write(1, "    [WARN] old shard not deleted: "
+                         + pre_compact_files[f_idx] + "\n")
+            f_idx += 1
+
+        # Phase 2: retract PK=3 + add PKs 7-10 -> 5 more shards -> second compaction
+        b = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, b)
+        rb.begin(r_uint128(3), r_int64(-1))
+        rb.put_int(r_int64(30))
+        rb.commit()
+        tbl.ingest_batch(b)
+        tbl.flush()
+        b.free()
+
+        i = 7
+        while i <= 10:
+            b = batch.ArenaZSetBatch(schema)
+            rb = RowBuilder(schema, b)
+            rb.begin(r_uint128(i), r_int64(1))
+            rb.put_int(r_int64(i * 10))
+            rb.commit()
+            tbl.ingest_batch(b)
+            tbl.flush()
+            b.free()
+            i += 1
+
+        # 1 compacted shard + 5 new shards = 6 -> needs_compaction True again
+        if not tbl.index.needs_compaction:
+            raise Exception(
+                "needs_compaction should be True before second compaction"
+            )
+
+        c = tbl.create_cursor()
+        if len(tbl.index.handles) != 1:
+            raise Exception(
+                "Expected 1 shard after second compaction, got "
+                + str(len(tbl.index.handles))
+            )
+        c.close()
+
+        # Ghost property: PK=3 net weight = +1 - 1 = 0, must be absent
+        if tbl.has_pk(r_uint128(3)):
+            raise Exception("Ghost property violation: PK=3 should be annihilated")
+
+        # Row count: 6 original - 1 retracted + 4 new = 9
+        shard = tbl.index.handles[0].view
+        if shard.count != 9:
+            raise Exception(
+                "Expected 9 rows in compacted shard, got " + str(shard.count)
+            )
+
+    finally:
+        tbl.close()
+
+    os.write(1, "[Storage] EphemeralTable auto-compaction Test Passed.\n")
+
+
+def test_compact_no_op_and_idempotent(base_dir):
+    """compact_if_needed(): no-op on empty table, no-op at threshold, idempotent after compact."""
+    os.write(1, "[Storage] Testing compaction no-op and idempotency...\n")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    tbl_dir = os.path.join(base_dir, "eph_noop")
+    tbl = EphemeralTable(tbl_dir, "en", schema)
+
+    try:
+        # Phase 0 (Gap M): freshly created table (0 shards) -> compact_if_needed() is a no-op
+        if tbl.index.needs_compaction:
+            raise Exception("needs_compaction must be False for newly created table")
+        tbl.compact_if_needed()
+        if len(tbl.index.handles) != 0:
+            raise Exception(
+                "compact_if_needed() on empty table must leave 0 shards, got "
+                + str(len(tbl.index.handles))
+            )
+
+        # Phase 1 (Gap A): exactly at threshold (4 shards) -> needs_compaction must be False
+        i = 1
+        while i <= 4:
+            b = batch.ArenaZSetBatch(schema)
+            rb = RowBuilder(schema, b)
+            rb.begin(r_uint128(i), r_int64(1))
+            rb.put_int(r_int64(i * 10))
+            rb.commit()
+            tbl.ingest_batch(b)
+            tbl.flush()
+            b.free()
+            i += 1
+
+        if tbl.index.needs_compaction:
+            raise Exception(
+                "needs_compaction must be False at threshold boundary (4 shards)"
+            )
+        tbl.compact_if_needed()
+        if len(tbl.index.handles) != 4:
+            raise Exception(
+                "compact_if_needed() must be no-op at boundary; got "
+                + str(len(tbl.index.handles)) + " shards"
+            )
+
+        # Phase 2 (Gap A): one more flush pushes past threshold (5 > 4) -> compaction fires
+        b = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, b)
+        rb.begin(r_uint128(5), r_int64(1))
+        rb.put_int(r_int64(50))
+        rb.commit()
+        tbl.ingest_batch(b)
+        tbl.flush()
+        b.free()
+
+        if not tbl.index.needs_compaction:
+            raise Exception("needs_compaction must be True with 5 shards (> threshold 4)")
+
+        tbl.compact_if_needed()
+
+        if len(tbl.index.handles) != 1:
+            raise Exception(
+                "Expected 1 shard after compaction, got "
+                + str(len(tbl.index.handles))
+            )
+        if tbl.index.needs_compaction:
+            raise Exception("needs_compaction must be False after compaction")
+
+        # Phase 3 (Gap J): second compact_if_needed() -> idempotent no-op
+        tbl.compact_if_needed()
+        if len(tbl.index.handles) != 1:
+            raise Exception(
+                "compact_if_needed() must be idempotent; got "
+                + str(len(tbl.index.handles)) + " shards after second call"
+            )
+        if tbl.index.needs_compaction:
+            raise Exception(
+                "needs_compaction must remain False after idempotent compact call"
+            )
+
+    finally:
+        tbl.close()
+
+    os.write(1, "[Storage] Compaction no-op and idempotency Test Passed.\n")
+
+
+def test_compact_preserves_memtable(base_dir):
+    """Shard compaction does not lose rows that are still in the memtable."""
+    os.write(1, "[Storage] Testing compaction preserves memtable rows...\n")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    tbl_dir = os.path.join(base_dir, "eph_memtab")
+    tbl = EphemeralTable(tbl_dir, "em", schema)
+
+    try:
+        # 5 flushed shards (> threshold 4) -> compaction fires on next create_cursor()
+        i = 1
+        while i <= 5:
+            b = batch.ArenaZSetBatch(schema)
+            rb = RowBuilder(schema, b)
+            rb.begin(r_uint128(i), r_int64(1))
+            rb.put_int(r_int64(i * 10))
+            rb.commit()
+            tbl.ingest_batch(b)
+            tbl.flush()
+            b.free()
+            i += 1
+
+        if not tbl.index.needs_compaction:
+            raise Exception("Expected needs_compaction=True before memtable test")
+
+        # PK=99 written to memtable only — deliberately NOT flushed
+        b = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, b)
+        rb.begin(r_uint128(99), r_int64(1))
+        rb.put_int(r_int64(990))
+        rb.commit()
+        tbl.ingest_batch(b)
+        b.free()
+
+        # create_cursor() compacts the 5 shards; memtable is untouched
+        c = tbl.create_cursor()
+
+        if len(tbl.index.handles) != 1:
+            raise Exception(
+                "Expected 1 shard post-compaction, got "
+                + str(len(tbl.index.handles))
+            )
+
+        # All 6 rows must be visible: 5 from the compacted shard + 1 from memtable
+        row_count = 0
+        while c.is_valid():
+            if c.weight() > r_int64(0):
+                row_count += 1
+            c.advance()
+        c.close()
+
+        if row_count != 6:
+            raise Exception(
+                "Expected 6 rows (5 shard + 1 memtable), got " + str(row_count)
+            )
+
+        # PK=99 (memtable-only row) must survive shard compaction
+        if not tbl.has_pk(r_uint128(99)):
+            raise Exception("PK=99 (memtable-only) must survive shard compaction")
+
+    finally:
+        tbl.close()
+
+    os.write(1, "[Storage] Compaction preserves memtable Test Passed.\n")
+
+
+def test_persistent_compact_if_needed(base_dir):
+    """PersistentTable: create_cursor() bypasses compaction; compact_if_needed() compacts."""
+    os.write(1, "[Storage] Testing PersistentTable.compact_if_needed()...\n")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    tbl_dir = os.path.join(base_dir, "persist_compact")
+    tbl = PersistentTable(tbl_dir, "pc", schema)
+
+    try:
+        # 5 flushes -> 5 shards -> needs_compaction True
+        i = 1
+        while i <= 5:
+            b = batch.ArenaZSetBatch(schema)
+            rb = RowBuilder(schema, b)
+            rb.begin(r_uint128(i), r_int64(1))
+            rb.put_int(r_int64(i * 10))
+            rb.commit()
+            tbl.ingest_batch(b)
+            tbl.flush()
+            b.free()
+            i += 1
+
+        if not tbl.index.needs_compaction:
+            raise Exception("Expected needs_compaction=True after 5 flushes")
+        if len(tbl.index.handles) != 5:
+            raise Exception(
+                "Expected 5 shards before compact, got "
+                + str(len(tbl.index.handles))
+            )
+
+        # PersistentTable.create_cursor() must NOT compact (concurrent cursor safety)
+        c = tbl.create_cursor()
+        c.close()
+
+        if len(tbl.index.handles) != 5:
+            raise Exception(
+                "PersistentTable.create_cursor() must not compact; expected 5 shards, got "
+                + str(len(tbl.index.handles))
+            )
+
+        # compact_if_needed() must compact (calls execute_compaction with manifest update)
+        tbl.compact_if_needed()
+
+        if len(tbl.index.handles) != 1:
+            raise Exception(
+                "PersistentTable.compact_if_needed() must compact; expected 1 shard, got "
+                + str(len(tbl.index.handles))
+            )
+        if tbl.index.needs_compaction:
+            raise Exception("needs_compaction must be False after compaction")
+
+        # All 5 rows accessible after compaction
+        c = tbl.create_cursor()
+        row_count = 0
+        while c.is_valid():
+            if c.weight() > r_int64(0):
+                row_count += 1
+            c.advance()
+        c.close()
+
+        if row_count != 5:
+            raise Exception(
+                "Expected 5 rows post-compaction, got " + str(row_count)
+            )
+
+    finally:
+        tbl.close()
+
+    os.write(1, "[Storage] PersistentTable compact_if_needed Test Passed.\n")
+
+
+def test_compact_with_strings(base_dir):
+    """Compaction correctly relocates string blob arenas."""
+    os.write(1, "[Storage] Testing compaction with string columns...\n")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_STRING, name="name"))
+    schema = types.TableSchema(cols, 0)
+
+    tbl_dir = os.path.join(base_dir, "eph_strings")
+    tbl = EphemeralTable(tbl_dir, "es", schema)
+
+    try:
+        strings = ["alpha", "bravo", "charlie", "delta", "echo"]
+        i = 0
+        while i < 5:
+            b = batch.ArenaZSetBatch(schema)
+            rb = RowBuilder(schema, b)
+            rb.begin(r_uint128(i + 1), r_int64(1))
+            rb.put_string(strings[i])
+            rb.commit()
+            tbl.ingest_batch(b)
+            tbl.flush()
+            b.free()
+            i += 1
+
+        if not tbl.index.needs_compaction:
+            raise Exception("Expected needs_compaction=True after 5 flushes")
+
+        # Compaction must relocate string blobs without corruption
+        c = tbl.create_cursor()
+
+        if len(tbl.index.handles) != 1:
+            raise Exception(
+                "Expected 1 shard post-compaction, got "
+                + str(len(tbl.index.handles))
+            )
+
+        # All 5 string rows must survive blob relocation
+        row_count = 0
+        while c.is_valid():
+            if c.weight() > r_int64(0):
+                row_count += 1
+            c.advance()
+        c.close()
+
+        if row_count != 5:
+            raise Exception(
+                "Expected 5 string rows post-compaction, got " + str(row_count)
+            )
+
+        # PK lookups (which exercise the xor8 filter on the new shard) must all succeed
+        i = 1
+        while i <= 5:
+            if not tbl.has_pk(r_uint128(i)):
+                raise Exception(
+                    "PK=" + str(i) + " missing after string shard compaction"
+                )
+            i += 1
+
+    finally:
+        tbl.close()
+
+    os.write(1, "[Storage] String column compaction Test Passed.\n")
+
+
+def test_partitioned_compact_if_needed(base_dir):
+    """PartitionedTable.compact_if_needed() propagates to each partition."""
+    os.write(1, "[Storage] Testing PartitionedTable.compact_if_needed() propagation...\n")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    tbl_dir = os.path.join(base_dir, "part_compact")
+    store = make_partitioned_ephemeral(tbl_dir, "pct", schema, 200, 2)
+
+    try:
+        # Flush each partition 5 times directly (bypasses hash routing)
+        p = 0
+        while p < 2:
+            part = store.partitions[p]
+            i = 1
+            while i <= 5:
+                b = batch.ArenaZSetBatch(schema)
+                rb = RowBuilder(schema, b)
+                rb.begin(r_uint128(p * 100 + i), r_int64(1))
+                rb.put_int(r_int64(i * 10))
+                rb.commit()
+                part.ingest_batch(b)
+                part.flush()
+                b.free()
+                i += 1
+            p += 1
+
+        if not store.partitions[0].index.needs_compaction:
+            raise Exception("partition 0 should need compaction after 5 flushes")
+        if not store.partitions[1].index.needs_compaction:
+            raise Exception("partition 1 should need compaction after 5 flushes")
+
+        # compact_if_needed() on PartitionedTable must delegate to each partition
+        store.compact_if_needed()
+
+        if len(store.partitions[0].index.handles) != 1:
+            raise Exception(
+                "partition 0: expected 1 shard post-compaction, got "
+                + str(len(store.partitions[0].index.handles))
+            )
+        if len(store.partitions[1].index.handles) != 1:
+            raise Exception(
+                "partition 1: expected 1 shard post-compaction, got "
+                + str(len(store.partitions[1].index.handles))
+            )
+        if store.partitions[0].index.needs_compaction:
+            raise Exception("partition 0: needs_compaction must be False after compaction")
+        if store.partitions[1].index.needs_compaction:
+            raise Exception("partition 1: needs_compaction must be False after compaction")
+
+    finally:
+        local = 0
+        while local < len(store.partitions):
+            store.partitions[local].close()
+            local += 1
+
+    os.write(1, "[Storage] PartitionedTable compaction propagation Test Passed.\n")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -1366,6 +1850,12 @@ def entry_point(argv):
         test_filter_integration(base_dir)
         test_retract_pk(base_dir)
         test_enforce_unique_pk(base_dir)
+        test_ephemeral_compaction(base_dir)
+        test_compact_no_op_and_idempotent(base_dir)
+        test_compact_preserves_memtable(base_dir)
+        test_persistent_compact_if_needed(base_dir)
+        test_compact_with_strings(base_dir)
+        test_partitioned_compact_if_needed(base_dir)
         os.write(1, "\nALL STORAGE TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

@@ -1069,6 +1069,82 @@ def test_join_delta_trace_multi_match(base_dir):
     trace_table.close()
     log("  PASSED")
 
+def test_trace_register_refresh_compacts(base_dir):
+    """TraceRegister.refresh() calls compact_if_needed() in the cursor-safe window."""
+    os.write(1, "[VM] Testing TraceRegister.refresh() triggers compaction...\n")
+
+    cols = []
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    tbl_dir = os.path.join(base_dir, "trace_refresh")
+    tbl = EphemeralTable(tbl_dir, "trr", schema)
+    reg = None
+
+    try:
+        # create_cursor() on empty table: compact_if_needed() is no-op -> empty cursor
+        initial_cursor = tbl.create_cursor()
+        reg = runtime.TraceRegister(0, schema, initial_cursor, tbl)
+
+        # Build 5 shards without creating cursors (simulates tick data accumulation)
+        i = 1
+        while i <= 5:
+            b = batch.ArenaZSetBatch(schema)
+            rb = RowBuilder(schema, b)
+            rb.begin(r_uint128(i), r_int64(1))
+            rb.put_int(r_int64(i * 10))
+            rb.commit()
+            tbl.ingest_batch(b)
+            tbl.flush()
+            b.free()
+            i += 1
+
+        if not tbl.index.needs_compaction:
+            raise Exception("Expected needs_compaction=True before refresh")
+
+        # refresh(): closes old cursor, calls compact_if_needed(), creates new cursor
+        reg.refresh()
+
+        if len(tbl.index.handles) != 1:
+            raise Exception(
+                "refresh() must trigger compaction; expected 1 shard, got "
+                + str(len(tbl.index.handles))
+            )
+        if tbl.index.needs_compaction:
+            raise Exception("needs_compaction must be False after refresh")
+        if reg.cursor is None:
+            raise Exception("refresh() must create a new cursor")
+
+        # New cursor must see all 5 rows
+        row_count = 0
+        while reg.cursor.is_valid():
+            if reg.cursor.weight() > r_int64(0):
+                row_count += 1
+            reg.cursor.advance()
+        if row_count != 5:
+            raise Exception(
+                "Expected 5 rows via cursor after refresh, got " + str(row_count)
+            )
+
+        # Second refresh: 1 shard (<= threshold 4) -> compact_if_needed() is no-op
+        reg.refresh()
+        if len(tbl.index.handles) != 1:
+            raise Exception(
+                "Second refresh must not re-compact; expected 1 shard, got "
+                + str(len(tbl.index.handles))
+            )
+        if reg.cursor is None:
+            raise Exception("Second refresh must still produce a cursor")
+
+    finally:
+        if reg is not None and reg.cursor is not None:
+            reg.cursor.close()
+        tbl.close()
+
+    os.write(1, "[VM] TraceRegister.refresh() compaction Test Passed.\n")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -1093,6 +1169,7 @@ def entry_point(argv):
         test_delay_op()
         test_reduce_min_nonlinear(base_dir)
         test_join_delta_trace_multi_match(base_dir)
+        test_trace_register_refresh_compacts(base_dir)
         os.write(1, "\nALL VM TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")
