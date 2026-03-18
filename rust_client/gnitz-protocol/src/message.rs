@@ -490,6 +490,32 @@ mod tests {
     }
 
     #[test]
+    fn test_message_recv_control_fields() {
+        // Verify that send_message/recv_message correctly propagates all control
+        // fields into the flat Message struct: target_id, client_id, seek_pk_lo,
+        // seek_pk_hi, seek_col_idx.  Regression for Step 5b rename (p4→seek_col_idx).
+        let (a, b) = make_socketpair();
+        send_message(
+            a,
+            0xDEAD_BEEF_1234_5678,  // target_id
+            0xCAFE_BABE_0000_0001,  // client_id
+            FLAG_PUSH,              // flags
+            0xAAAA_BBBB_CCCC_DDDD,  // seek_pk_lo
+            0x1111_2222_3333_4444,  // seek_pk_hi
+            7,                      // seek_col_idx
+            None,
+            None,
+        ).unwrap();
+        let msg = recv_message(b, None).unwrap();
+        assert_eq!(msg.target_id,    0xDEAD_BEEF_1234_5678);
+        assert_eq!(msg.client_id,    0xCAFE_BABE_0000_0001);
+        assert_eq!(msg.seek_pk_lo,   0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(msg.seek_pk_hi,   0x1111_2222_3333_4444);
+        assert_eq!(msg.seek_col_idx, 7);
+        unsafe { libc::close(a); libc::close(b); }
+    }
+
+    #[test]
     fn test_message_error_response() {
         // STATUS_ERROR response: schema and data should be None; error_text populated
         let (a, b) = make_socketpair();

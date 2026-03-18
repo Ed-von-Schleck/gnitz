@@ -126,3 +126,30 @@ impl ZSetBatch {
         self.pk_lo.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TypeCode;
+
+    #[test]
+    fn test_wire_stride_string() {
+        assert_eq!(TypeCode::String.wire_stride(), 16,
+            "String wire stride must be 16 (German String struct: 4B len + 4B prefix + 8B ptr/inline)");
+    }
+
+    #[test]
+    fn test_wire_stride_all() {
+        assert_eq!(TypeCode::U8.wire_stride(),   1);
+        assert_eq!(TypeCode::I8.wire_stride(),   1);
+        assert_eq!(TypeCode::U16.wire_stride(),  2);
+        assert_eq!(TypeCode::I16.wire_stride(),  2);
+        assert_eq!(TypeCode::U32.wire_stride(),  4);
+        assert_eq!(TypeCode::I32.wire_stride(),  4);
+        assert_eq!(TypeCode::F32.wire_stride(),  4);
+        assert_eq!(TypeCode::U64.wire_stride(),  8);
+        assert_eq!(TypeCode::I64.wire_stride(),  8);
+        assert_eq!(TypeCode::F64.wire_stride(),  8);
+        assert_eq!(TypeCode::String.wire_stride(), 16);
+        assert_eq!(TypeCode::U128.wire_stride(), 16);
+    }
+}
