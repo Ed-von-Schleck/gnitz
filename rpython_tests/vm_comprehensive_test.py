@@ -1278,6 +1278,86 @@ def test_execute_epoch_seal_free_on_consolidated(base_dir):
     log("  PASSED")
 
 
+def test_execute_epoch_evict():
+    log("[VM] Test: execute_epoch evict path (Opt 4)...")
+
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
+    ]
+    schema = types.TableSchema(cols, 0)
+    vm_schema = schema
+
+    # R0=input, R1=zero (empty second input), R2=UNION output
+    reg_file = runtime.RegisterFile(3)
+    reg_file.registers[0] = runtime.DeltaRegister(0, vm_schema)
+    reg_file.registers[1] = runtime.DeltaRegister(1, vm_schema)
+    reg_file.registers[2] = runtime.DeltaRegister(2, vm_schema)
+
+    program = [
+        instructions.union_op(
+            reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]
+        ),
+        instructions.halt_op(),
+    ]
+
+    plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=2)
+
+    # Tick 1: pk=1
+    in1 = batch.ArenaZSetBatch(schema)
+    rb1 = RowBuilder(schema, in1)
+    rb1.begin(r_uint128(1), r_int64(1))
+    rb1.put_int(r_int64(100))
+    rb1.commit()
+    result1 = plan.execute_epoch(in1)
+    in1.free()
+    assert_true(result1 is not None, "Evict tick-1: expected output")
+    assert_equal_i(1, result1.length(), "Evict tick-1: wrong row count")
+    assert_equal_u128(r_uint128(1), result1.get_pk(0), "Evict tick-1: wrong PK")
+    result1.free()
+
+    # Tick 2: pk=2 — no bleed from tick 1
+    in2 = batch.ArenaZSetBatch(schema)
+    rb2 = RowBuilder(schema, in2)
+    rb2.begin(r_uint128(2), r_int64(1))
+    rb2.put_int(r_int64(200))
+    rb2.commit()
+    result2 = plan.execute_epoch(in2)
+    in2.free()
+    assert_true(result2 is not None, "Evict tick-2: expected output")
+    assert_equal_i(1, result2.length(), "Evict tick-2: wrong row count")
+    assert_equal_u128(r_uint128(2), result2.get_pk(0), "Evict tick-2: wrong PK")
+    result2.free()
+
+    # Tick 3: pk=3
+    in3 = batch.ArenaZSetBatch(schema)
+    rb3 = RowBuilder(schema, in3)
+    rb3.begin(r_uint128(3), r_int64(1))
+    rb3.put_int(r_int64(300))
+    rb3.commit()
+    result3 = plan.execute_epoch(in3)
+    in3.free()
+    assert_true(result3 is not None, "Evict tick-3: expected output")
+    assert_equal_i(1, result3.length(), "Evict tick-3: wrong row count")
+    assert_equal_u128(r_uint128(3), result3.get_pk(0), "Evict tick-3: wrong PK")
+    result3.free()
+
+    # Tick 4: pk=4 — confirm fresh internal batch is in place
+    in4 = batch.ArenaZSetBatch(schema)
+    rb4 = RowBuilder(schema, in4)
+    rb4.begin(r_uint128(4), r_int64(1))
+    rb4.put_int(r_int64(400))
+    rb4.commit()
+    result4 = plan.execute_epoch(in4)
+    in4.free()
+    assert_true(result4 is not None, "Evict tick-4: expected output")
+    assert_equal_i(1, result4.length(), "Evict tick-4: wrong row count")
+    assert_equal_u128(r_uint128(4), result4.get_pk(0), "Evict tick-4: wrong PK")
+    result4.free()
+
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -1305,6 +1385,7 @@ def entry_point(argv):
         test_trace_register_refresh_compacts(base_dir)
         test_execute_epoch_seal_deduplicates(base_dir)
         test_execute_epoch_seal_free_on_consolidated(base_dir)
+        test_execute_epoch_evict()
         os.write(1, "\nALL VM TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

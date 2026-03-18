@@ -168,8 +168,19 @@ class ExecutablePlan(object):
         if self.context.status == STATUS_HALTED:
             out_reg = self.reg_file.get_register(self.out_reg_idx)
             assert out_reg.is_delta()
-            if out_reg.batch.length() > 0:
-                result = out_reg.batch.clone()
+            if out_reg.batch is out_reg._internal_batch:
+                # Non-aliased path: evict to avoid clone.
+                if out_reg.batch.length() > 0:
+                    result = out_reg._internal_batch
+                    out_reg._internal_batch = ArenaZSetBatch(
+                        out_reg.table_schema, initial_capacity=0
+                    )
+                    out_reg.batch = out_reg._internal_batch
+            else:
+                # Aliased path (DELAY from Opt 2): clone then unbind.
+                if out_reg.batch.length() > 0:
+                    result = out_reg.batch.clone()
+                out_reg.unbind()
 
         # 5. Cleanup: Release borrowed reference
         in_reg.unbind()

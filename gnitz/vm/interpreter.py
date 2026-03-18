@@ -164,10 +164,7 @@ def run_vm(program, reg_file, context):
             reg_in = instr.reg_in
             reg_out = instr.reg_out
             assert reg_in is not None and reg_out is not None
-            ops.op_delay(
-                reg_in.batch, 
-                batch.BatchWriter(reg_out.batch)
-            )
+            reg_out.batch = reg_in.batch
 
         elif opcode == op.OPCODE_INTEGRATE:
             reg_in = instr.reg_in

@@ -48,6 +48,10 @@ def assert_equal_i64(expected, actual, msg):
     if expected != actual:
         fail(msg + " (i64 mismatch)")
 
+def assert_equal_u128(expected, actual, msg):
+    if expected != actual:
+        fail(msg + " (u128 mismatch)")
+
 def _recursive_delete(path):
     if not os.path.exists(path):
         return
@@ -303,6 +307,17 @@ def test_delay(base_dir):
     assert_true(out is not None, "delay produced None")
     assert_equal_i(2, out.length(), "delay row count")
     out.free()
+
+    # Second tick: different input — verify no cross-tick bleed (Opt 2)
+    in_batch_2 = batch.ArenaZSetBatch(table.schema)
+    rb2 = RowBuilder(table.schema, in_batch_2)
+    _add_int_row(rb2, 3, [77])
+    out2 = plan.execute_epoch(in_batch_2)
+    in_batch_2.free()
+    assert_true(out2 is not None, "delay tick-2 produced None")
+    assert_equal_i(1, out2.length(), "delay tick-2 row count")
+    assert_equal_u128(r_uint128(3), out2.get_pk(0), "delay tick-2 pk mismatch")
+    out2.free()
 
     db.drop_view("test.v_delay")
     db.drop_table("test.src")
