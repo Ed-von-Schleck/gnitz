@@ -639,79 +639,81 @@ def test_compaction(base_dir):
     # 1. Setup Table
     tbl = PersistentTable(path, "compact_me", schema, table_id=500)
 
-    # 2. Create Overlapping State
-    # Shard 1: PK=100 (W=1), PK=200 (W=1)
-    ingest_test_row(tbl, 100, 1, "record_a", 1000)
-    ingest_test_row(tbl, 200, 1, "record_b", 2000)
-
-    # Shard 2: PK=100 (W=1) [Duplicate Payload], PK=300 (W=1)
-    ingest_test_row(tbl, 100, 1, "record_a", 1000)
-    ingest_test_row(tbl, 300, 1, "record_c", 3000)
-
-    # Shard 3: PK=100 (W=-2) [Annihilation payload]
-    ingest_test_row(tbl, 100, -2, "record_a", 1000)
-
-    # At this point, Read Amplification is high.
+    # 2. Create Overlapping State (5 flushes -> needs_compaction = True)
     # PK 100: (1 + 1 - 2) = 0  -> Should be GHOSTED
     # PK 200: 1                -> Should survive
     # PK 300: 1                -> Should survive
+    ingest_test_row(tbl, 100, 1, "record_a", 1000)
+    ingest_test_row(tbl, 200, 1, "record_b", 2000)
+    ingest_test_row(tbl, 100, 1, "record_a", 1000)
+    ingest_test_row(tbl, 300, 1, "record_c", 3000)
+    ingest_test_row(tbl, 100, -2, "record_a", 1000)
 
     initial_shards = tbl.index.handles
-    if len(initial_shards) < 3:
-        raise Exception("Failed to create overlapping shards")
+    if len(initial_shards) < 5:
+        raise Exception("Failed to create 5 shards for compaction test")
 
-    # 3. Execute Compaction
-    # We manually trigger compaction for the test.
-    out_shard = compactor.execute_compaction(
-        tbl.index, tbl.manifest_manager, output_dir=path, validate_checksums=True
-    )
+    # Record filenames for cleanup verification
+    initial_filenames = newlist_hint(len(initial_shards))
+    fi = 0
+    while fi < len(initial_shards):
+        initial_filenames.append(initial_shards[fi].filename)
+        fi += 1
 
-    if not os.path.exists(out_shard):
-        raise Exception("Compactor failed to produce output shard")
+    if not tbl.index.needs_compaction:
+        raise Exception("Expected needs_compaction=True before compaction")
 
-    # 4. Verify Index and Manifest State
-    # Only the new Guard Shard should remain in the index.
-    if len(tbl.index.handles) != 1:
-        raise Exception("Index was not correctly updated after compaction")
+    # 3. Execute Compaction via compact_if_needed
+    tbl.compact_if_needed()
 
-    # 5. Verify Content (The Ghost Property)
-    view = shard_table.TableShardView(out_shard, schema)
-    try:
-        # PK 100 should be physically removed because its net weight was 0.
-        # PK 200 and 300 should be the only records left.
-        if view.count != 2:
-            os.write(1, "Error: Shard count is " + str(view.count) + " expected 2\n")
-            raise Exception("Annihilation failed: zero-weight record preserved")
+    # 4. Verify Index State: L0 cleared, L1 guards installed
+    if len(tbl.index.handles) != 0:
+        raise Exception(
+            "Expected 0 L0 handles after L0->L1 compaction, got "
+            + str(len(tbl.index.handles))
+        )
+    if len(tbl.index.levels) != 1:
+        raise Exception(
+            "Expected 1 L1 level after compaction, got "
+            + str(len(tbl.index.levels))
+        )
+    if tbl.index.needs_compaction:
+        raise Exception("needs_compaction must be False after compaction")
 
-        # Verify PK 200 survives with correct weight
-        idx_200 = view.find_row_index(r_uint128(200))
-        if idx_200 == -1 or view.get_weight(idx_200) != 1:
-            raise Exception("Survived record 200 missing or corrupted")
+    # 5. Verify Content (The Ghost Property) via cursor scan
+    c = tbl.create_cursor()
+    row_count = 0
+    pk100_weight = r_int64(0)
+    while c.is_valid():
+        k = c.key()
+        w = c.weight()
+        if k == r_uint128(100):
+            pk100_weight = pk100_weight + w
+        if w > r_int64(0):
+            row_count += 1
+        c.advance()
+    c.close()
 
-        # Verify PK 300 survives
-        idx_300 = view.find_row_index(r_uint128(300))
-        if idx_300 == -1:
-            raise Exception("Survived record 300 missing")
+    if row_count != 2:
+        raise Exception(
+            "Expected 2 surviving rows (PK 200 and 300), got " + str(row_count)
+        )
+    if pk100_weight != r_int64(0):
+        raise Exception("Ghost Property Violation: PK 100 net weight != 0")
 
-        # Double check PK 100 is absent
-        if view.find_row_index(r_uint128(100)) != -1:
-            raise Exception("Ghost Property Violation: PK 100 still exists")
+    if tbl.has_pk(r_uint128(100)):
+        raise Exception("Ghost Property Violation: has_pk(100) should be False")
+    if not tbl.has_pk(r_uint128(200)):
+        raise Exception("PK 200 should survive compaction")
+    if not tbl.has_pk(r_uint128(300)):
+        raise Exception("PK 300 should survive compaction")
 
-    finally:
-        view.close()
-
-    # 6. Verify Cleanup (Refcounting)
-    # The compactor marks old shards for deletion.
-    # We must call try_cleanup to physically remove them from disk.
-    tbl.index.ref_counter.try_cleanup()
-
-    # Verify file unlinking
-    # Note: RPython loop required instead of any()
-    for h in initial_shards:
-        if os.path.exists(h.filename) and h.filename != out_shard:
-            # Note: In some OS environments, file locks might delay unlinking.
-            # We skip hard failure here but log it.
-            os.write(1, "[Warning] Old shard still on disk: " + h.filename + "\n")
+    # 6. Verify Cleanup: old L0 shard files should be deleted
+    fi = 0
+    while fi < len(initial_filenames):
+        if os.path.exists(initial_filenames[fi]):
+            os.write(1, "[Warning] Old shard still on disk: " + initial_filenames[fi] + "\n")
+        fi += 1
 
     tbl.close()
     os.write(1, "[Storage] Compaction Test Passed.\n")
@@ -1383,18 +1385,23 @@ def test_ephemeral_compaction(base_dir):
             pre_compact_files.append(tbl.index.handles[h_idx].filename)
             h_idx += 1
 
-        # create_cursor() triggers compaction, returns cursor over 1 merged shard
+        # create_cursor() triggers compaction, routes L0 to L1 guards
         c = tbl.create_cursor()
 
-        if len(tbl.index.handles) != 1:
+        if len(tbl.index.handles) != 0:
             raise Exception(
-                "Expected 1 shard post-compaction, got "
+                "Expected 0 L0 handles post-compaction, got "
                 + str(len(tbl.index.handles))
+            )
+        if len(tbl.index.levels) != 1:
+            raise Exception(
+                "Expected 1 L1 level post-compaction, got "
+                + str(len(tbl.index.levels))
             )
         if tbl.index.needs_compaction:
             raise Exception("needs_compaction should be False after compaction")
 
-        # Verify all 6 rows present (cursor already at position after compaction)
+        # Verify all 6 rows present via cursor scan
         row_count = 0
         while c.is_valid():
             if c.weight() > r_int64(0):
@@ -1404,7 +1411,7 @@ def test_ephemeral_compaction(base_dir):
         if row_count != 6:
             raise Exception("Expected 6 rows post-compaction, got " + str(row_count))
 
-        # Old shard files should be deleted (ref_counter.try_cleanup() inside _compact())
+        # Old shard files should be deleted (ref_counter.try_cleanup() inside run_compact)
         f_idx = 0
         while f_idx < len(pre_compact_files):
             if os.path.exists(pre_compact_files[f_idx]):
@@ -1412,7 +1419,7 @@ def test_ephemeral_compaction(base_dir):
                          + pre_compact_files[f_idx] + "\n")
             f_idx += 1
 
-        # Phase 2: retract PK=3 + add PKs 7-10 -> 5 more shards -> second compaction
+        # Phase 2: retract PK=3 + add PKs 7-10 -> 5 more L0 shards -> second compaction
         b = batch.ArenaZSetBatch(schema)
         rb = RowBuilder(schema, b)
         rb.begin(r_uint128(3), r_int64(-1))
@@ -1434,16 +1441,16 @@ def test_ephemeral_compaction(base_dir):
             b.free()
             i += 1
 
-        # 1 compacted shard + 5 new shards = 6 -> needs_compaction True again
+        # 5 new L0 shards -> needs_compaction True again
         if not tbl.index.needs_compaction:
             raise Exception(
                 "needs_compaction should be True before second compaction"
             )
 
         c = tbl.create_cursor()
-        if len(tbl.index.handles) != 1:
+        if len(tbl.index.handles) != 0:
             raise Exception(
-                "Expected 1 shard after second compaction, got "
+                "Expected 0 L0 handles after second compaction, got "
                 + str(len(tbl.index.handles))
             )
         c.close()
@@ -1453,10 +1460,16 @@ def test_ephemeral_compaction(base_dir):
             raise Exception("Ghost property violation: PK=3 should be annihilated")
 
         # Row count: 6 original - 1 retracted + 4 new = 9
-        shard = tbl.index.handles[0].view
-        if shard.count != 9:
+        c = tbl.create_cursor()
+        row_count_2 = 0
+        while c.is_valid():
+            if c.weight() > r_int64(0):
+                row_count_2 += 1
+            c.advance()
+        c.close()
+        if row_count_2 != 9:
             raise Exception(
-                "Expected 9 rows in compacted shard, got " + str(shard.count)
+                "Expected 9 rows after second compaction, got " + str(row_count_2)
             )
 
     finally:
@@ -1527,20 +1540,30 @@ def test_compact_no_op_and_idempotent(base_dir):
 
         tbl.compact_if_needed()
 
-        if len(tbl.index.handles) != 1:
+        if len(tbl.index.handles) != 0:
             raise Exception(
-                "Expected 1 shard after compaction, got "
+                "Expected 0 L0 handles after compaction, got "
                 + str(len(tbl.index.handles))
+            )
+        if len(tbl.index.levels) != 1:
+            raise Exception(
+                "Expected 1 L1 level after compaction, got "
+                + str(len(tbl.index.levels))
             )
         if tbl.index.needs_compaction:
             raise Exception("needs_compaction must be False after compaction")
 
         # Phase 3 (Gap J): second compact_if_needed() -> idempotent no-op
         tbl.compact_if_needed()
-        if len(tbl.index.handles) != 1:
+        if len(tbl.index.handles) != 0:
             raise Exception(
                 "compact_if_needed() must be idempotent; got "
-                + str(len(tbl.index.handles)) + " shards after second call"
+                + str(len(tbl.index.handles)) + " L0 handles after second call"
+            )
+        if len(tbl.index.levels) != 1:
+            raise Exception(
+                "compact_if_needed() must be idempotent; got "
+                + str(len(tbl.index.levels)) + " levels after second call"
             )
         if tbl.index.needs_compaction:
             raise Exception(
@@ -1591,16 +1614,21 @@ def test_compact_preserves_memtable(base_dir):
         tbl.ingest_batch(b)
         b.free()
 
-        # create_cursor() compacts the 5 shards; memtable is untouched
+        # create_cursor() compacts the 5 shards into L1; memtable is untouched
         c = tbl.create_cursor()
 
-        if len(tbl.index.handles) != 1:
+        if len(tbl.index.handles) != 0:
             raise Exception(
-                "Expected 1 shard post-compaction, got "
+                "Expected 0 L0 handles post-compaction, got "
                 + str(len(tbl.index.handles))
             )
+        if len(tbl.index.levels) != 1:
+            raise Exception(
+                "Expected 1 L1 level post-compaction, got "
+                + str(len(tbl.index.levels))
+            )
 
-        # All 6 rows must be visible: 5 from the compacted shard + 1 from memtable
+        # All 6 rows must be visible: 5 from L1 guards + 1 from memtable
         row_count = 0
         while c.is_valid():
             if c.weight() > r_int64(0):
@@ -1667,13 +1695,18 @@ def test_persistent_compact_if_needed(base_dir):
                 + str(len(tbl.index.handles))
             )
 
-        # compact_if_needed() must compact (calls execute_compaction with manifest update)
+        # compact_if_needed() must run L0->L1 compaction with manifest update
         tbl.compact_if_needed()
 
-        if len(tbl.index.handles) != 1:
+        if len(tbl.index.handles) != 0:
             raise Exception(
-                "PersistentTable.compact_if_needed() must compact; expected 1 shard, got "
+                "PersistentTable.compact_if_needed() must compact; expected 0 L0 handles, got "
                 + str(len(tbl.index.handles))
+            )
+        if len(tbl.index.levels) != 1:
+            raise Exception(
+                "PersistentTable.compact_if_needed() must create L1; got "
+                + str(len(tbl.index.levels)) + " levels"
             )
         if tbl.index.needs_compaction:
             raise Exception("needs_compaction must be False after compaction")
@@ -1730,10 +1763,15 @@ def test_compact_with_strings(base_dir):
         # Compaction must relocate string blobs without corruption
         c = tbl.create_cursor()
 
-        if len(tbl.index.handles) != 1:
+        if len(tbl.index.handles) != 0:
             raise Exception(
-                "Expected 1 shard post-compaction, got "
+                "Expected 0 L0 handles post-compaction, got "
                 + str(len(tbl.index.handles))
+            )
+        if len(tbl.index.levels) != 1:
+            raise Exception(
+                "Expected 1 L1 level post-compaction, got "
+                + str(len(tbl.index.levels))
             )
 
         # All 5 string rows must survive blob relocation
@@ -1802,15 +1840,25 @@ def test_partitioned_compact_if_needed(base_dir):
         # compact_if_needed() on PartitionedTable must delegate to each partition
         store.compact_if_needed()
 
-        if len(store.partitions[0].index.handles) != 1:
+        if len(store.partitions[0].index.handles) != 0:
             raise Exception(
-                "partition 0: expected 1 shard post-compaction, got "
+                "partition 0: expected 0 L0 handles post-compaction, got "
                 + str(len(store.partitions[0].index.handles))
             )
-        if len(store.partitions[1].index.handles) != 1:
+        if len(store.partitions[0].index.levels) != 1:
             raise Exception(
-                "partition 1: expected 1 shard post-compaction, got "
+                "partition 0: expected 1 L1 level post-compaction, got "
+                + str(len(store.partitions[0].index.levels))
+            )
+        if len(store.partitions[1].index.handles) != 0:
+            raise Exception(
+                "partition 1: expected 0 L0 handles post-compaction, got "
                 + str(len(store.partitions[1].index.handles))
+            )
+        if len(store.partitions[1].index.levels) != 1:
+            raise Exception(
+                "partition 1: expected 1 L1 level post-compaction, got "
+                + str(len(store.partitions[1].index.levels))
             )
         if store.partitions[0].index.needs_compaction:
             raise Exception("partition 0: needs_compaction must be False after compaction")
@@ -2077,6 +2125,192 @@ def test_zero_copy_wal_recovery(base_dir):
     os.write(1, "    [OK] Zero-copy WAL recovery passed.\n")
 
 
+def test_flsm_l0_to_l1_compaction(base_dir):
+    os.write(1, "[Storage] Testing FLSM L0->L1 compaction...\n")
+    schema = make_u64_i64_schema()
+
+    # --- Sub-test 1: basic L0->L1 compaction ---
+    tbl_dir = os.path.join(base_dir, "flsm_l0l1")
+    tbl = EphemeralTable(tbl_dir, "l0l1test", schema)
+
+    pk = 1
+    while pk <= 5:
+        b = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, b)
+        rb.begin(r_uint128(pk), r_int64(1))
+        rb.put_int(r_int64(pk * 10))
+        rb.commit()
+        tbl.ingest_batch(b)
+        b.free()
+        tbl.flush()
+        pk += 1
+
+    assert_equal_i(5, len(tbl.index.handles), "Expected 5 L0 handles before compaction")
+
+    # create_cursor() triggers compaction
+    c = tbl.create_cursor()
+
+    assert_equal_i(0, len(tbl.index.handles), "L0 handles should be 0 after compaction")
+    assert_equal_i(1, len(tbl.index.levels), "Should have exactly 1 level after compaction")
+
+    l1 = tbl.index.levels[0]
+    guard_count = len(l1.guards)
+    if guard_count < 1:
+        raise Exception("Guard count should be >= 1, got 0")
+    if guard_count > 5:
+        raise Exception("Guard count %d should be <= 5" % guard_count)
+
+    # Verify guards are sorted by guard_key
+    gi = 1
+    while gi < guard_count:
+        if l1.guards[gi].guard_key() <= l1.guards[gi - 1].guard_key():
+            raise Exception("Guards not sorted at index %d" % gi)
+        gi += 1
+
+    # Scan cursor: assert 5 positive-weight rows
+    row_count = 0
+    while c.is_valid():
+        if c.weight() > r_int64(0):
+            row_count += 1
+        c.advance()
+    c.close()
+    assert_equal_i(5, row_count, "Expected 5 rows after L0->L1 compaction")
+
+    tbl.close()
+
+    # --- Sub-test 2: ghost elimination ---
+    tbl2_dir = os.path.join(base_dir, "flsm_ghost")
+    tbl2 = EphemeralTable(tbl2_dir, "ghosttest", schema)
+
+    # flush A(+1), B(+1), A(-1), C(+1), D(+1) -> 5 L0 shards
+    ghost_pks = [r_uint128(1), r_uint128(2), r_uint128(1), r_uint128(3), r_uint128(4)]
+    ghost_weights = [r_int64(1), r_int64(1), r_int64(-1), r_int64(1), r_int64(1)]
+    ghost_vals = [r_int64(100), r_int64(200), r_int64(100), r_int64(300), r_int64(400)]
+    gi2 = 0
+    while gi2 < 5:
+        b = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, b)
+        rb.begin(ghost_pks[gi2], ghost_weights[gi2])
+        rb.put_int(ghost_vals[gi2])
+        rb.commit()
+        tbl2.ingest_batch(b)
+        b.free()
+        tbl2.flush()
+        gi2 += 1
+
+    assert_equal_i(5, len(tbl2.index.handles), "Expected 5 L0 handles before ghost compaction")
+
+    c2 = tbl2.create_cursor()
+
+    # pk=1 (A) should be absent (net weight 0)
+    found_pk1 = False
+    while c2.is_valid():
+        if c2.key() == r_uint128(1) and c2.weight() > r_int64(0):
+            found_pk1 = True
+        c2.advance()
+    c2.close()
+
+    assert_false(found_pk1, "Ghost key A (pk=1) should be absent after compaction")
+    assert_true(tbl2.has_pk(r_uint128(2)), "key B (pk=2) should be present")
+    assert_true(tbl2.has_pk(r_uint128(3)), "key C (pk=3) should be present")
+
+    tbl2.close()
+    os.write(1, "    [OK] FLSM L0->L1 compaction passed.\n")
+
+
+def test_flsm_manifest_persistence(base_dir):
+    os.write(1, "[Storage] Testing FLSM manifest V3 persistence...\n")
+    schema = make_u64_i64_schema()
+
+    tbl_dir = os.path.join(base_dir, "flsm_persist")
+    manifest_path = tbl_dir + "/MANIFEST"
+
+    # 1. Create PersistentTable, flush 5 shards, compact into L1
+    tbl = PersistentTable(tbl_dir, "fp", schema, table_id=42)
+    i = 1
+    while i <= 5:
+        b = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, b)
+        rb.begin(r_uint128(i), r_int64(1))
+        rb.put_int(r_int64(i * 10))
+        rb.commit()
+        tbl.ingest_batch(b)
+        tbl.flush()
+        b.free()
+        i += 1
+
+    tbl.compact_if_needed()
+
+    assert_equal_i(0, len(tbl.index.handles), "Expected 0 L0 after compact")
+    assert_equal_i(1, len(tbl.index.levels), "Expected 1 L1 after compact")
+
+    pre_guard_count = len(tbl.index.levels[0].guards)
+    if pre_guard_count < 1:
+        raise Exception("Expected at least 1 L1 guard after compaction")
+
+    # Record guard keys for comparison
+    pre_guard_keys_lo = newlist_hint(pre_guard_count)
+    pre_guard_keys_hi = newlist_hint(pre_guard_count)
+    gi = 0
+    while gi < pre_guard_count:
+        pre_guard_keys_lo.append(tbl.index.levels[0].guards[gi].guard_key_lo)
+        pre_guard_keys_hi.append(tbl.index.levels[0].guards[gi].guard_key_hi)
+        gi += 1
+
+    tbl.close()
+
+    # 2. Verify V3 manifest: at least one entry with non-zero level
+    reader = manifest.ManifestReader(manifest_path)
+    found_l1_entry = False
+    for entry in reader.iterate_entries():
+        if entry.level != 0:
+            found_l1_entry = True
+            break
+    reader.close()
+
+    assert_true(found_l1_entry, "V3 manifest should have at least one L1 entry")
+
+    # 3. Reopen PersistentTable and verify L1 structure is restored
+    tbl2 = PersistentTable(tbl_dir, "fp", schema, table_id=42)
+
+    assert_equal_i(0, len(tbl2.index.handles), "Reopened table: expected 0 L0 handles")
+    assert_equal_i(1, len(tbl2.index.levels), "Reopened table: expected 1 L1 level")
+    assert_equal_i(pre_guard_count, len(tbl2.index.levels[0].guards),
+                   "Reopened table: guard count mismatch")
+
+    # Guard keys must match pre-close values
+    gi = 0
+    while gi < pre_guard_count:
+        if tbl2.index.levels[0].guards[gi].guard_key_lo != pre_guard_keys_lo[gi]:
+            raise Exception("Guard key_lo mismatch at index %d" % gi)
+        if tbl2.index.levels[0].guards[gi].guard_key_hi != pre_guard_keys_hi[gi]:
+            raise Exception("Guard key_hi mismatch at index %d" % gi)
+        gi += 1
+
+    # 4. Verify index_from_manifest produces same structure
+    rc2 = refcount.RefCounter()
+    idx2 = flsm.index_from_manifest(manifest_path, 42, schema, rc2,
+                                     validate_checksums=False, output_dir=tbl_dir)
+    assert_equal_i(0, len(idx2.handles), "index_from_manifest: expected 0 L0 handles")
+    assert_equal_i(1, len(idx2.levels), "index_from_manifest: expected 1 L1 level")
+    assert_equal_i(pre_guard_count, len(idx2.levels[0].guards),
+                   "index_from_manifest: guard count mismatch")
+    idx2.close_all()
+
+    # 5. Scan all rows via cursor
+    c = tbl2.create_cursor()
+    row_count = 0
+    while c.is_valid():
+        if c.weight() > r_int64(0):
+            row_count += 1
+        c.advance()
+    c.close()
+    assert_equal_i(5, row_count, "Reopened table: expected 5 rows from cursor")
+
+    tbl2.close()
+    os.write(1, "    [OK] FLSM manifest V3 persistence passed.\n")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -2110,6 +2344,8 @@ def entry_point(argv):
         test_partitioned_compact_if_needed(base_dir)
         test_flsm_data_structures(base_dir)
         test_flsm_guard_read_path(base_dir)
+        test_flsm_l0_to_l1_compaction(base_dir)
+        test_flsm_manifest_persistence(base_dir)
         test_zero_copy_wal_recovery(base_dir)
         os.write(1, "\nALL STORAGE TEST PATHS PASSED\n")
     except Exception as e:

@@ -9,9 +9,11 @@ from gnitz.storage import mmap_posix, layout
 from gnitz.storage.metadata import ManifestEntry
 
 MAGIC_NUMBER = r_uint64(0x4D414E49464E5447)
-VERSION = 2
+VERSION = 3
+VERSION_LEGACY = 2
 HEADER_SIZE = 64
-ENTRY_SIZE = 184 
+ENTRY_SIZE_V2 = 184
+ENTRY_SIZE = 208   # V3: adds level(8) + guard_key_lo(8) + guard_key_hi(8)
 
 def _write_manifest_header(fd, count, max_lsn):
     """Writes the 64-byte Manifest authority header."""
@@ -61,35 +63,53 @@ def _write_manifest_entry(fd, entry):
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, 32))[0] = rffi.cast(rffi.ULONGLONG, entry.pk_max_hi)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, 40))[0] = rffi.cast(rffi.ULONGLONG, entry.min_lsn)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, 48))[0] = rffi.cast(rffi.ULONGLONG, entry.max_lsn)
-        
+
         fn = entry.shard_filename
         limit = 127 if len(fn) > 127 else len(fn)
         for i in range(limit): entry_buf[56 + i] = fn[i]
+
+        # V3 fields: level(8) + guard_key_lo(8) + guard_key_hi(8)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, 184))[0] = rffi.cast(rffi.ULONGLONG, r_uint64(entry.level))
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, 192))[0] = rffi.cast(rffi.ULONGLONG, entry.guard_key_lo)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, 200))[0] = rffi.cast(rffi.ULONGLONG, entry.guard_key_hi)
+
         mmap_posix.write_c(fd, entry_buf, rffi.cast(rffi.SIZE_T, ENTRY_SIZE))
     finally:
         lltype.free(entry_buf, flavor='raw')
 
-def _read_manifest_entry(fd):
-    res = rposix.read(fd, ENTRY_SIZE)
-    if len(res) < ENTRY_SIZE: return None
+def _read_manifest_entry(fd, version):
+    stride = ENTRY_SIZE if version >= VERSION else ENTRY_SIZE_V2
+    res = rposix.read(fd, stride)
+    if len(res) < stride: return None
     with rffi.scoped_str2charp(res) as buf:
         tid = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, buf)[0])
         min_lo = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 8))[0]
         min_hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 16))[0]
         max_lo = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 24))[0]
         max_hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 32))[0]
-        
+
         min_k = (r_uint128(min_hi) << 64) | r_uint128(min_lo)
         max_k = (r_uint128(max_hi) << 64) | r_uint128(max_lo)
-        
+
         min_l = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 40))[0]
         max_l = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 48))[0]
-        
+
         fn_chars = newlist_hint(128)
         for i in range(128):
             if buf[56 + i] == '\x00': break
             fn_chars.append(buf[56 + i])
-        return ManifestEntry(tid, "".join(fn_chars), min_k, max_k, r_uint64(min_l), r_uint64(max_l))
+
+        if version >= VERSION:
+            level = rffi.cast(lltype.Signed, rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 184))[0])
+            guard_lo = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 192))[0]
+            guard_hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(buf, 200))[0]
+        else:
+            level = 0
+            guard_lo = rffi.cast(rffi.ULONGLONG, r_uint64(0))
+            guard_hi = rffi.cast(rffi.ULONGLONG, r_uint64(0))
+
+        return ManifestEntry(tid, "".join(fn_chars), min_k, max_k, r_uint64(min_l), r_uint64(max_l),
+                             level=level, guard_key_lo=r_uint64(guard_lo), guard_key_hi=r_uint64(guard_hi))
 
 class ManifestReader(object):
     def __init__(self, filename):
@@ -132,7 +152,7 @@ class ManifestReader(object):
     def iterate_entries(self):
         rposix.lseek(self.fd, HEADER_SIZE, 0)
         for _ in range(self.entry_count):
-            e = _read_manifest_entry(self.fd)
+            e = _read_manifest_entry(self.fd, self.version)
             if e: yield e
             
     def close(self):

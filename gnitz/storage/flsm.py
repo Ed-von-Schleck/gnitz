@@ -1,11 +1,13 @@
 # gnitz/storage/flsm.py
 
+import os
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rlib.objectmodel import newlist_hint
 from gnitz.storage.index import ShardHandle
 from gnitz.storage.metadata import ManifestEntry
 from gnitz.storage import manifest
+from gnitz.storage import compactor
 
 MAX_LEVELS = 3
 L0_COMPACT_THRESHOLD = 4
@@ -235,6 +237,99 @@ class FLSMIndex(object):
                         result = h.lsn
         return result
 
+    def populate_from_reader(self, table_id, reader):
+        """Load shard handles from a ManifestReader into this index."""
+        for entry in reader.iterate_entries():
+            if entry.table_id != table_id:
+                continue
+            handle = ShardHandle(entry.shard_filename, self.schema,
+                                 entry.min_lsn, entry.max_lsn, self.validate_checksums)
+            if entry.level == 0:
+                self.add_l0_handle(handle)
+            else:
+                level = self.get_or_create_level(entry.level)
+                gk_lo = entry.guard_key_lo
+                gk_hi = entry.guard_key_hi
+                gk = (r_uint128(gk_hi) << 64) | r_uint128(gk_lo)
+                g_idx = level.find_guard_idx(gk)
+                if g_idx == -1 or level.guards[g_idx].guard_key() != gk:
+                    g = LevelGuard(gk_lo, gk_hi)
+                    level.insert_guard_sorted(g)
+                    g_idx = level.find_guard_idx(gk)
+                level.guards[g_idx].add_handle(self.ref_counter, handle)
+
+    def commit_l0_to_l1(self, l0_input_filenames, guard_outputs, max_lsn):
+        """Clear compacted L0 handles and install output handles into L1 guards."""
+        new_l0 = newlist_hint(len(self.handles))
+        for h in self.handles:
+            found = False
+            for fn in l0_input_filenames:
+                if h.filename == fn:
+                    found = True
+                    break
+            if found:
+                h.close()
+                self.ref_counter.release(h.filename)
+            else:
+                new_l0.append(h)
+        self.handles = new_l0
+
+        l1 = self.get_or_create_level(1)
+        i = 0
+        while i < len(guard_outputs):
+            gk_lo, gk_hi, filename = guard_outputs[i]
+            new_handle = ShardHandle(filename, self.schema, r_uint64(0), max_lsn,
+                                     self.validate_checksums)
+            gk = (r_uint128(gk_hi) << 64) | r_uint128(gk_lo)
+            g_idx = l1.find_guard_idx(gk)
+            if g_idx == -1 or l1.guards[g_idx].guard_key() != gk:
+                new_guard = LevelGuard(gk_lo, gk_hi)
+                l1.insert_guard_sorted(new_guard)
+                g_idx = l1.find_guard_idx(gk)
+            l1.guards[g_idx].add_handle(self.ref_counter, new_handle)
+            i += 1
+
+        self._update_flags()
+
+    def run_compact(self):
+        """L0 overflow → tournament-tree merge → rows routed into L1 guards."""
+        if not self.needs_compaction:
+            return
+
+        self._compact_seq += 1
+        l0_max_lsn = r_uint64(0)
+        l0_input_files = newlist_hint(len(self.handles))
+        for h in self.handles:
+            l0_input_files.append(h.filename)
+            if h.lsn > l0_max_lsn:
+                l0_max_lsn = h.lsn
+        if l0_max_lsn > r_uint64(0):
+            lsn_tag = intmask(l0_max_lsn)
+        else:
+            lsn_tag = self._compact_seq
+
+        guard_outputs = newlist_hint(0)
+        try:
+            guard_outputs = compactor.compact_l0_to_l1(
+                self, self.output_dir, self.schema, self.table_id, lsn_tag,
+                self.validate_checksums,
+            )
+            self.commit_l0_to_l1(l0_input_files, guard_outputs, l0_max_lsn)
+            for fn in l0_input_files:
+                self.ref_counter.mark_for_deletion(fn)
+            self.ref_counter.try_cleanup()
+        except Exception as e:
+            i = 0
+            while i < len(guard_outputs):
+                gk_lo_x, gk_hi_x, fn = guard_outputs[i]
+                if os.path.exists(fn):
+                    try:
+                        os.unlink(fn)
+                    except OSError:
+                        pass
+                i += 1
+            raise e
+
     def close_all(self):
         for h in self.handles:
             h.close()
@@ -251,11 +346,7 @@ def index_from_manifest(manifest_path, table_id, schema, ref_counter,
     idx = FLSMIndex(table_id, schema, ref_counter, output_dir, validate_checksums)
     reader = manifest.ManifestReader(manifest_path)
     try:
-        for entry in reader.iterate_entries():
-            if entry.table_id == table_id:
-                handle = ShardHandle(entry.shard_filename, schema,
-                                     entry.min_lsn, entry.max_lsn, validate_checksums)
-                idx.add_handle(handle)
+        idx.populate_from_reader(table_id, reader)
     finally:
         reader.close()
     return idx

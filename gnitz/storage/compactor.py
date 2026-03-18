@@ -3,7 +3,8 @@
 import os
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_int64, intmask
-from gnitz.storage import shard_table, writer_table, tournament_tree, index, cursor
+from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
+from gnitz.storage import shard_table, writer_table, tournament_tree, cursor
 
 
 def compact_shards(
@@ -65,73 +66,131 @@ def compact_shards(
             v_idx += 1
 
 
-def execute_compaction(
-    shard_index, manifest_mgr, output_dir=".", validate_checksums=False
-):
-    """
-    High-level orchestrator for table-scoped compaction using the unified ShardIndex.
-    """
-    handles = shard_index.handles
-    if not handles:
-        return None
+def _find_guard_for_key(guard_keys, key):
+    """Binary search: index of the rightmost guard with guard_key <= key.
+    Rows below the first guard key always map to index 0."""
+    n = len(guard_keys)
+    lo, hi = 0, n - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        gk_lo, gk_hi = guard_keys[mid]
+        gk = (r_uint128(gk_hi) << 64) | r_uint128(gk_lo)
+        if gk <= key:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
 
-    table_id = shard_index.table_id
-    schema = shard_index.schema
-    num_h = len(handles)
-    input_files = newlist_hint(num_h)
 
-    # Track the aggregate LSN range for the new Guard Shard
-    true_min_lsn = handles[0].min_lsn
-    true_max_lsn = handles[0].lsn
+def _merge_and_route(input_files, guard_keys, output_dir, table_id, level_num, lsn_tag,
+                     schema, validate_checksums=False):
+    """N-way merge of input_files, routing each row to the appropriate guard writer."""
+    num_inputs = len(input_files)
+    num_guards = len(guard_keys)
 
-    h_idx = 0
-    while h_idx < num_h:
-        h = handles[h_idx]
-        input_files.append(h.filename)
-        if h.min_lsn < true_min_lsn:
-            true_min_lsn = h.min_lsn
-        if h.lsn > true_max_lsn:
-            true_max_lsn = h.lsn
-        h_idx += 1
+    views = newlist_hint(num_inputs)
+    cursors_list = newlist_hint(num_inputs)
+    writers = newlist_hint(num_guards)
+    out_filenames = newlist_hint(num_guards)
 
-    lsn_tag = intmask(true_max_lsn)
-    out_filename = os.path.join(output_dir, "compacted_%d_%d.db" % (table_id, lsn_tag))
+    i = 0
+    while i < num_guards:
+        fn = output_dir + "/shard_%d_%d_L%d_G%d.db" % (table_id, lsn_tag, level_num, i)
+        out_filenames.append(fn)
+        writers.append(writer_table.TableShardWriter(schema, table_id))
+        i += 1
 
+    tree = None
     try:
-        # 1. Perform physical merge
-        compact_shards(
-            input_files,
-            out_filename,
-            schema,
-            table_id,
-            validate_checksums=validate_checksums,
-        )
+        i = 0
+        while i < num_inputs:
+            view = shard_table.TableShardView(
+                input_files[i], schema, validate_checksums=validate_checksums
+            )
+            views.append(view)
+            cursors_list.append(cursor.ShardCursor(view))
+            i += 1
 
-        # 2. Create new handle for the resulting Guard Shard
-        new_handle = index.ShardHandle(
-            out_filename,
-            schema,
-            true_min_lsn,
-            true_max_lsn,
-            validate_checksums=validate_checksums,
-        )
+        tree = tournament_tree.TournamentTree(cursors_list, schema)
 
-        # 3. Update the Index (Replaces handles and releases locks)
-        shard_index.replace_handles(input_files, new_handle)
+        while not tree.is_exhausted():
+            min_key = tree.get_min_key()
+            num_indices = tree.get_all_indices_at_min()
 
-        # 4. Update the Manifest Authority
-        manifest_mgr.publish_new_version(shard_index.get_metadata_list(), true_max_lsn)
+            net_weight = r_int64(0)
+            i = 0
+            while i < num_indices:
+                net_weight += cursors_list[tree._min_indices[i]].weight()
+                i += 1
 
-        # 5. Cleanup physical files
-        f_idx = 0
-        while f_idx < len(input_files):
-            shard_index.ref_counter.mark_for_deletion(input_files[f_idx])
-            f_idx += 1
-        shard_index.ref_counter.try_cleanup()
+            if net_weight != 0:
+                guard_idx = _find_guard_for_key(guard_keys, min_key)
+                exemplar_cursor = cursors_list[tree._min_indices[0]]
+                acc = exemplar_cursor.get_accessor()
+                writers[guard_idx].add_row_from_accessor(min_key, net_weight, acc)
 
-    except Exception as e:
-        if os.path.exists(out_filename):
-            os.unlink(out_filename)
-        raise e
+            i = 0
+            while i < num_indices:
+                tree.advance_cursor_by_index(tree._min_indices[i])
+                i += 1
+    finally:
+        if tree is not None:
+            tree.close()
+        v_idx = 0
+        while v_idx < len(views):
+            v = views[v_idx]
+            if v:
+                v.close()
+            v_idx += 1
 
-    return out_filename
+    guard_outputs = newlist_hint(num_guards)
+    i = 0
+    while i < num_guards:
+        w = writers[i]
+        if w.count > 0:
+            w.finalize(out_filenames[i])
+            if os.path.exists(out_filenames[i]):
+                gk_lo, gk_hi = guard_keys[i]
+                guard_outputs.append((gk_lo, gk_hi, out_filenames[i]))
+        else:
+            w.close()
+        i += 1
+
+    return guard_outputs
+
+
+def compact_l0_to_l1(flsm_index, output_dir, schema, table_id, lsn_tag,
+                     validate_checksums=False):
+    """Route L0 handles into L1 guards via tournament-tree merge."""
+    if len(flsm_index.levels) > 0 and len(flsm_index.levels[0].guards) > 0:
+        l1 = flsm_index.levels[0]
+        ng = len(l1.guards)
+        guard_keys = newlist_hint(ng)
+        gi = 0
+        while gi < ng:
+            g = l1.guards[gi]
+            guard_keys.append((g.guard_key_lo, g.guard_key_hi))
+            gi += 1
+    else:
+        n_handles = len(flsm_index.handles)
+        guard_keys = newlist_hint(n_handles)
+        hi_idx = 0
+        while hi_idx < n_handles:
+            h = flsm_index.handles[hi_idx]
+            if hi_idx == 0:
+                guard_keys.append((h.pk_min_lo, h.pk_min_hi))
+            else:
+                prev = flsm_index.handles[hi_idx - 1]
+                if h.pk_min_lo != prev.pk_min_lo or h.pk_min_hi != prev.pk_min_hi:
+                    guard_keys.append((h.pk_min_lo, h.pk_min_hi))
+            hi_idx += 1
+
+    n_inputs = len(flsm_index.handles)
+    input_files = newlist_hint(n_inputs)
+    fi = 0
+    while fi < n_inputs:
+        input_files.append(flsm_index.handles[fi].filename)
+        fi += 1
+
+    return _merge_and_route(input_files, guard_keys, output_dir, table_id, 1, lsn_tag,
+                            schema, validate_checksums)

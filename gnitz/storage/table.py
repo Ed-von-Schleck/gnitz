@@ -13,7 +13,6 @@ from gnitz.storage import (
     index,
     manifest,
     memtable,
-    compactor,
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
 
@@ -63,16 +62,7 @@ class PersistentTable(EphemeralTable):
         if self.manifest_manager.exists():
             reader = self.manifest_manager.load_current()
             try:
-                for entry in reader.iterate_entries():
-                    if entry.table_id == self.table_id:
-                        h = index.ShardHandle(
-                            entry.shard_filename,
-                            schema,
-                            entry.min_lsn,
-                            entry.max_lsn,
-                            validate_checksums=validate_checksums,
-                        )
-                        self.index.add_handle(h)
+                self.index.populate_from_reader(self.table_id, reader)
                 self.current_lsn = reader.global_max_lsn + r_uint64(1)
             finally:
                 reader.close()
@@ -94,10 +84,9 @@ class PersistentTable(EphemeralTable):
     def compact_if_needed(self):
         if not self.index.needs_compaction:
             return
-        compactor.execute_compaction(
-            self.index, self.manifest_manager,
-            output_dir=self.directory,
-            validate_checksums=self.validate_checksums,
+        self.index.run_compact()
+        self.manifest_manager.publish_new_version(
+            self.index.get_metadata_list(), self.index.max_lsn()
         )
 
     # -- Mutations ------------------------------------------------------------

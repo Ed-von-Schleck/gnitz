@@ -97,7 +97,7 @@ These are module-level constants (RPython immutable after translation), not `_im
 
 ---
 
-## Phase 2: L0→L1 Vertical Compaction
+## Phase 2: L0→L1 Vertical Compaction ✓ DONE
 
 **Goal**: When L0 overflows (`needs_compaction == True`), merge and route L0 data into L1 guards.
 Replaces `compact_shards()` (merge-all-to-one) with guard-partitioned output. Extends the manifest
@@ -148,6 +148,7 @@ with `index.py` not importing `flsm.py` (ensured in Phase 1), the module graph i
 flsm.py      → compactor.py   (run_compact calls merge helpers)
              → index.py       (ShardHandle for new handles in commit_l0_to_l1)
 compactor.py → shard_table, writer_table, tournament_tree, cursor   (no index, no flsm)
+             + adds `r_ulonglonglong as r_uint128` to arithmetic imports (used by `_find_guard_for_key`)
 index.py     → shard_table, metadata, manifest                      (no flsm)
 ```
 
@@ -202,7 +203,10 @@ def _merge_and_route(input_files, guard_keys, output_dir, table_id, level_num, l
                 i += 1
 
         for i in range(num_guards):
-            writers[i].finalize(out_filenames[i])
+            if writers[i].count > 0:
+                writers[i].finalize(out_filenames[i])
+            else:
+                writers[i].close()  # free buffers without writing file
     finally:
         tree.close()
         for v in views:
@@ -215,8 +219,32 @@ def _merge_and_route(input_files, guard_keys, output_dir, table_id, level_num, l
     return results
 ```
 
-`_find_guard_for_key(guard_keys, key)` — binary search returning the index `i` such that
-`guard_keys[i] ≤ key < guard_keys[i+1]` (last guard wins for `key ≥ guard_keys[-1]`).
+`TableShardWriter.finalize()` always creates the output file via an unconditional `O_CREAT` open
+followed by atomic rename — even when zero rows were written. Guards that received only ghost rows
+(all weights cancelled to zero) would produce empty shard files that get registered as real
+handles. The `count > 0` guard ensures only non-empty writers call `finalize`; empty writers call
+`close()` to free their buffers. Because files are now only created for non-empty output, the
+`os.path.exists` check in the results loop is a reliable filter.
+
+`_find_guard_for_key(guard_keys, key)` — binary search over the sorted `(lo, hi)` tuple list.
+Returns index `i` such that `guard_keys[i] ≤ key < guard_keys[i+1]`; last guard wins for
+`key ≥ guard_keys[-1]`. `guard_keys` is always sorted ascending (built from sorted L0 handles or
+from the already-sorted `l1.guards` list):
+
+```python
+def _find_guard_for_key(guard_keys, key):
+    n = len(guard_keys)
+    lo, hi = 0, n - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        gk_lo, gk_hi = guard_keys[mid]
+        gk = (r_uint128(gk_hi) << 64) | r_uint128(gk_lo)
+        if gk <= key:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+```
 
 ### New function: `compactor.compact_l0_to_l1`
 
@@ -311,6 +339,7 @@ def run_compact(self):
             l0_max_lsn = h.lsn
     lsn_tag = intmask(l0_max_lsn) if l0_max_lsn > r_uint64(0) else self._compact_seq
 
+    guard_outputs = []   # must be initialised before try; except block iterates it
     try:
         guard_outputs = compactor.compact_l0_to_l1(
             self, self.output_dir, self.schema, self.table_id, lsn_tag,
@@ -344,7 +373,7 @@ def _compact(self):
 
 ### Changes to `gnitz/storage/table.py`
 
-Replace `compact_if_needed()` with a thin wrapper. The only thing `PersistentTable` adds beyond
+**`compact_if_needed`**: replace with a thin wrapper. The only thing `PersistentTable` adds beyond
 `EphemeralTable` is the manifest publish; `run_compact()` handles everything else:
 
 ```python
@@ -359,51 +388,106 @@ def compact_if_needed(self):
 `self.index.max_lsn()` after `run_compact()` returns the correct boundary: L0 handles are gone,
 their LSNs are now embedded in L1 `ShardHandle` objects.
 
+**`__init__` manifest recovery**: the existing inline loop calls `self.index.add_handle(h)` for
+every entry regardless of `entry.level`, routing all entries to L0. After Phase 2, a V3 manifest
+contains L1 guard entries; the old loop would load them into L0 on restart, destroying the guard
+structure. Replace the loop body with `populate_from_reader`:
+
+```python
+if self.manifest_manager.exists():
+    reader = self.manifest_manager.load_current()
+    try:
+        self.index.populate_from_reader(self.table_id, reader)
+        self.current_lsn = reader.global_max_lsn + r_uint64(1)
+    finally:
+        reader.close()
+```
+
+`self.index` already exists as an empty `FLSMIndex` (created by `EphemeralTable.__init__`);
+`populate_from_reader` fills it in-place. `reader.global_max_lsn` (set during `load_current()`)
+is read after `populate_from_reader` returns — single file open, no second pass needed. No new
+import is required: `self.index` is typed as `FLSMIndex` by the annotator, so the method call
+resolves without an explicit `import flsm` in `table.py`.
+
 ### Manifest format extension (PersistentTable only)
 
 EphemeralTable has no manifest; skip this section for ephemeral.
 
 **`gnitz/storage/manifest.py`**:
 
-- Bump `VERSION = 3`. Keep `VERSION_LEGACY = 2`.
-- Change `ENTRY_SIZE = 208` (was 184). New trailing 24 bytes:
+- Bump `VERSION = 3`. Add `VERSION_LEGACY = 2`. Add `ENTRY_SIZE_V2 = 184` (legacy stride).
+  `ENTRY_SIZE = 208`. New trailing 24 bytes:
   - `[184–191]` level_num (u64)
   - `[192–199]` guard_key_lo (u64)
   - `[200–207]` guard_key_hi (u64)
-- `_write_manifest_entry`: write the three new fields.
-- `_read_manifest_entry`: if version == 2 (legacy), return with `level=0, guard_key_lo=0,
-  guard_key_hi=0`. If version == 3, read all fields.
+- `_write_manifest_entry`: allocate 208-byte buffer; write the three new fields at offsets 184,
+  192, 200. The write path always produces V3.
+- `_read_manifest_entry(fd, version)` — **signature gains a `version` parameter**. Read
+  `ENTRY_SIZE if version >= VERSION else ENTRY_SIZE_V2` bytes; return `None` if fewer bytes are
+  available. Extract the V2 fields from [0..183] unconditionally. Read level/guard fields from
+  [184..207] only when `version >= VERSION`; otherwise default to `level=0, guard_key_lo=0,
+  guard_key_hi=0`. This is the critical fix: a V2 file stores 184-byte entries. Reading 208 bytes
+  per entry without branching on version would advance the file cursor 24 bytes into the next
+  entry after the first read, corrupting every subsequent entry. A V2 manifest with a single shard
+  would return zero entries immediately (184 < 208 triggers the `None` guard), silently losing the
+  shard.
+- `ManifestReader.iterate_entries`: pass `self.version` to each `_read_manifest_entry` call.
+  `ManifestReader.reload` already stores `self.version` from the header; this is the single
+  threading point that makes V2/V3 stride selection automatic for all callers.
+
+**`gnitz/storage/flsm.py` — new method `FLSMIndex.populate_from_reader`**:
+
+All manifest recovery logic — both in `index_from_manifest` and in `PersistentTable.__init__` —
+needs the same level-routing loop. Extract it as a method on `FLSMIndex` so there is exactly one
+definition:
+
+```python
+def populate_from_reader(self, table_id, reader):
+    """Populate this index from an open ManifestReader, routing entries by level."""
+    for entry in reader.iterate_entries():
+        if entry.table_id != table_id:
+            continue
+        handle = ShardHandle(entry.shard_filename, self.schema,
+                             entry.min_lsn, entry.max_lsn, self.validate_checksums)
+        if entry.level == 0:
+            self.add_l0_handle(handle)
+        else:
+            level = self.get_or_create_level(entry.level)
+            gk = (r_uint128(entry.guard_key_hi) << 64) | r_uint128(entry.guard_key_lo)
+            g_idx = level.find_guard_idx(gk)
+            if g_idx == -1 or level.guards[g_idx].guard_key() != gk:
+                g = LevelGuard(entry.guard_key_lo, entry.guard_key_hi)
+                level.insert_guard_sorted(g)
+                g_idx = level.find_guard_idx(gk)
+            level.guards[g_idx].add_handle(self.ref_counter, handle)
+```
+
+`add_l0_handle` acquires the refcount; `LevelGuard.add_handle` also acquires. Both paths are
+refcount-balanced: every handle tracked by the index has exactly one acquisition, released by
+`close_all()`. V2 manifest entries arrive with `entry.level == 0` (the default after the Bug 1
+fix), so all V2 entries route to L0 correctly without any special-casing here.
 
 **`gnitz/storage/flsm.py` — `index_from_manifest`** (moved from `index.py` in Phase 1):
 
-Update the already-moved function to route V3 manifest entries to the correct level/guard:
+`index_from_manifest` is only called from tests; `PersistentTable.__init__` has its own inline
+recovery. Update both to delegate to `populate_from_reader`. `index_from_manifest` becomes a
+thin factory:
 
 ```python
 def index_from_manifest(manifest_path, table_id, schema, ref_counter,
-                         output_dir, validate_checksums=False):
+                        output_dir="", validate_checksums=False):
     idx = FLSMIndex(table_id, schema, ref_counter, output_dir, validate_checksums)
-    reader = ManifestReader(manifest_path)
+    reader = manifest.ManifestReader(manifest_path)
     try:
-        for entry in reader.iterate_entries():
-            if entry.table_id != table_id:
-                continue
-            handle = ShardHandle(entry.shard_filename, schema, entry.min_lsn, entry.max_lsn,
-                                  validate_checksums)
-            if entry.level == 0:
-                idx.add_l0_handle(handle)
-            else:
-                level = idx.get_or_create_level(entry.level)
-                gk = (r_uint128(entry.guard_key_hi) << 64) | r_uint128(entry.guard_key_lo)
-                g_idx = level.find_guard_idx(gk)
-                if g_idx == -1 or level.guards[g_idx].guard_key() != gk:
-                    g = LevelGuard(entry.guard_key_lo, entry.guard_key_hi)
-                    level.insert_guard_sorted(g)
-                    g_idx = level.find_guard_idx(gk)
-                level.guards[g_idx].add_handle(ref_counter, handle)
+        idx.populate_from_reader(table_id, reader)
     finally:
         reader.close()
     return idx
 ```
+
+The signature keeps `output_dir=""` as a keyword-with-default (unchanged from Phase 1) so the
+existing test call `index_from_manifest(path, tid, schema, rc)` continues to work without
+modification.
 
 Also delete `execute_compaction` from `compactor.py` in this phase (it is replaced by
 `run_compact`). Remove the now-unused `import index` line from `compactor.py`.
@@ -417,15 +501,22 @@ Add `test_flsm_l0_to_l1_compaction` in `storage_comprehensive_test.py`:
 2. Assert `len(index.handles) == 0`. Assert `len(index.levels) == 1` (L1 created).
 3. Assert guards are sorted by guard_key. Assert guard count == number of distinct pk_min values.
 4. Call `create_cursor()`. Scan all rows — assert count == 5, weights correct.
-5. Test ghost elimination: insert key A (+1), insert key B (+1), flush each. Insert retraction of
-   A (-1), flush. Trigger compaction. Assert A is absent from all L1 guards. Assert B is present.
+5. Test ghost elimination: insert key A (+1) and flush; insert key B (+1) and flush; insert
+   retraction of A (−1) and flush; insert two further dummy rows and flush each — 5 L0 handles
+   total. Call `create_cursor()` to auto-compact. Assert A is absent from all L1 guards; assert B
+   is present. (Exactly 5 flushes are required: `L0_COMPACT_THRESHOLD = 4`, so
+   `needs_compaction = (n > 4)`; fewer than 5 handles leaves the flag False and `create_cursor()`
+   skips compaction silently.)
 
 Add `test_flsm_manifest_persistence` in `storage_comprehensive_test.py`:
 
 1. Create `PersistentTable`. Write 6 rows, triggering 5 flushes. Run `compact_if_needed()`.
 2. Assert manifest entries have `level=1` and non-zero guard keys.
-3. Close the table. Reconstruct via `index_from_manifest`. Assert same guard structure and file
-   count.
+3. Close the table. Open a new `PersistentTable` on the same directory; its `__init__` now uses
+   `populate_from_reader`, so L1 guards are restored correctly. Assert `index.levels` has 1 level
+   with the same guard count and filenames as before close. Also call `index_from_manifest`
+   directly on the MANIFEST path and assert identical guard structure — both paths share
+   `populate_from_reader`, so this tests the shared logic from two entry points.
 4. Verify reads return correct data after reconstruction.
 
 ---
@@ -745,13 +836,13 @@ filenames are unchanged (only the affected guard was recompacted).
 
 | File | Phase | Change |
 |------|-------|--------|
-| `gnitz/storage/flsm.py` | 1 | **New file**: `LevelGuard`, `FLSMLevel`, `FLSMIndex` + constants; `MAX_UINT128` sentinel; stores `output_dir`, `validate_checksums`, `_compact_seq` |
+| `gnitz/storage/flsm.py` | 1, 2 | **New file** (Phase 1): `LevelGuard`, `FLSMLevel`, `FLSMIndex` + constants; `MAX_UINT128` sentinel. **Phase 2**: adds `FLSMIndex.populate_from_reader` (shared recovery logic); `FLSMIndex.run_compact`, `FLSMIndex.commit_l0_to_l1`; `index_from_manifest` becomes thin wrapper over `populate_from_reader` |
 | `gnitz/storage/metadata.py` | 1 | Add `level`, `guard_key_lo`, `guard_key_hi` to `ManifestEntry` (defaulted) |
 | `gnitz/storage/index.py` | 1 | Move `index_from_manifest` to `flsm.py`; `index.py` keeps no `flsm` import; delete `execute_compaction` in Phase 2 |
 | `gnitz/storage/ephemeral_table.py` | 1, 2 | Construct `FLSMIndex(…, directory, validate_checksums)`; update `_build_cursor` → `all_handles_for_cursor()`; `_compact()` → 2-line delegate to `self.index.run_compact()` |
-| `gnitz/storage/table.py` | — | **No changes**: `PersistentTable` inherits `_build_cursor` from `EphemeralTable`; `compact_if_needed` becomes a 5-line thin wrapper in Phase 2 only |
-| `gnitz/storage/compactor.py` | 2, 3, 4 | Add `_merge_and_route`, `compact_l0_to_l1`, `compact_guard_horizontal`, `compact_guard_vertical`; delete `execute_compaction` in Phase 2 to break circular import |
-| `gnitz/storage/manifest.py` | 2 | Bump `VERSION=3`, `ENTRY_SIZE=208`; handle V2 legacy reads |
+| `gnitz/storage/table.py` | 2 | `compact_if_needed` replaced with 5-line wrapper calling `run_compact` + `publish_new_version`; `__init__` manifest recovery loop replaced with `self.index.populate_from_reader(self.table_id, reader)` |
+| `gnitz/storage/compactor.py` | 2, 3, 4 | Add `r_ulonglonglong as r_uint128` to arithmetic imports; add `_merge_and_route`, `compact_l0_to_l1`, `compact_guard_horizontal`, `compact_guard_vertical`; delete `execute_compaction` in Phase 2 to break circular import |
+| `gnitz/storage/manifest.py` | 2 | Bump `VERSION=3`, `ENTRY_SIZE=208`; add `ENTRY_SIZE_V2=184`, `VERSION_LEGACY=2`; `_read_manifest_entry(fd, version)` gains version param and reads correct stride per version; `iterate_entries` passes `self.version` |
 | `gnitz/storage/partitioned_table.py` | — | **No changes**: each partition already delegates to `run_compact()` via `EphemeralTable._compact()` |
 | `rpython_tests/storage_comprehensive_test.py` | all | New test functions per phase |
 
