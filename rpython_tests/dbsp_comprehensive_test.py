@@ -249,7 +249,9 @@ def test_distinct_op(base_dir):
         rb.put_int(r_int64(1))
         rb.commit()
 
-        distinct.op_distinct(b_in, trace, b_out)
+        cursor = trace.create_cursor()
+        distinct.op_distinct(b_in, cursor, trace, batch.BatchWriter(b_out))
+        cursor.close()
         assert_equal_i64(r_int64(1), b_out.get_weight(0), "Distinct failed to clamp")
 
         # Tick 2: Weight -5 -> Should output Weight 0 (Total 5 is still > 0)
@@ -259,7 +261,9 @@ def test_distinct_op(base_dir):
         rb.put_int(r_int64(1))
         rb.commit()
 
-        distinct.op_distinct(b_in, trace, b_out)
+        cursor = trace.create_cursor()
+        distinct.op_distinct(b_in, cursor, trace, batch.BatchWriter(b_out))
+        cursor.close()
         assert_equal_i(0, b_out.length(), "Distinct produced unnecessary update")
 
         # Tick 3: Weight -5 -> Should output Weight -1 (Total 0)
@@ -269,7 +273,9 @@ def test_distinct_op(base_dir):
         rb.put_int(r_int64(1))
         rb.commit()
 
-        distinct.op_distinct(b_in, trace, b_out)
+        cursor = trace.create_cursor()
+        distinct.op_distinct(b_in, cursor, trace, batch.BatchWriter(b_out))
+        cursor.close()
         assert_equal_i64(r_int64(-1), b_out.get_weight(0), "Distinct failed to retract")
 
     finally:
@@ -1107,6 +1113,395 @@ def test_reduce_group_idx(base_dir):
         gi_table.close()
 
 
+# ------------------------------------------------------------------------------
+# AggValueIndex helpers and tests
+# ------------------------------------------------------------------------------
+
+
+def _update_avi(b_in, avi):
+    """Populate or update the AggValueIndex from a delta batch."""
+    n = b_in.length()
+    if n == 0:
+        return
+    acc = b_in.get_accessor(0)
+    for i in range(n):
+        b_in.bind_accessor(i, acc)
+        if acc.is_null(avi.agg_col_idx):
+            continue
+        gc_u64 = group_index._extract_gc_u64(acc, avi.input_schema, avi.group_by_cols)
+        av_u64 = group_index.promote_agg_col_to_u64_ordered(
+            acc, avi.agg_col_idx, avi.agg_col_type, avi.for_max,
+        )
+        ck = (r_uint128(gc_u64) << 64) | r_uint128(av_u64)
+        weight = b_in.get_weight(i)
+        try:
+            avi.table.memtable.upsert_single(ck, weight, group_index._UNIT_GI_ACC)
+        except errors.MemTableFullError:
+            avi.table.flush()
+            avi.table.memtable.upsert_single(ck, weight, group_index._UNIT_GI_ACC)
+
+
+def test_reduce_min_agg_value_idx(base_dir):
+    """
+    AggValueIndex path: MIN(salary) GROUP BY dept_id (I64), no trace_in (Opt 2).
+    Schema: (pk: U128, dept_id: I64, salary: I64).
+    10 departments, 10 rows each (salaries d*10+0 .. d*10+9).
+    """
+    log("[DBSP] Testing AggValueIndex MIN path...")
+
+    cols = newlist_hint(3)
+    cols.append(types.ColumnDefinition(types.TYPE_U128, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="dept_id"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="salary"))
+    in_schema = types.TableSchema(cols, pk_index=0)
+
+    min_agg = functions.UniversalAccumulator(2, functions.AGG_MIN, types.TYPE_I64)
+    out_schema = types._build_reduce_output_schema(in_schema, [1], [min_agg])
+
+    t_out_path = os.path.join(base_dir, "avi_trace_out")
+    t_avi_path = os.path.join(base_dir, "avi_idx")
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+    avi_schema = group_index.make_agg_value_idx_schema()
+    avi_table = EphemeralTable(t_avi_path, "avidx", avi_schema, table_id=0)
+    avi = group_index.AggValueIndex(
+        avi_table, [1], in_schema, 2, types.TYPE_I64, False,
+    )
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+
+        # Tick 1: Insert 100 rows, 10 per dept.
+        log("  - AVI Tick 1: insert 100 rows across 10 depts...")
+        for dept in range(10):
+            for row in range(10):
+                actual_pk = dept * 10 + row + 1
+                salary = dept * 10 + row
+                rb.begin(r_uint128(actual_pk), r_int64(1))
+                rb.put_int(r_int64(dept))
+                rb.put_int(r_int64(salary))
+                rb.commit()
+
+        _update_avi(b_in, avi)
+
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, None, c_out, b_out, [1], [min_agg], out_schema,
+                         agg_value_idx=avi)
+        c_out.close()
+
+        for dept in range(10):
+            expected = r_int64(dept * 10)
+            actual = _find_min_for_dept(b_out, r_int64(dept))
+            assert_equal_i64(expected, actual, "AVI Tick 1 MIN for dept " + str(dept))
+
+        trace_out.ingest_batch(b_out)
+        b_in.clear()
+        b_out.clear()
+        min_agg.reset()
+
+        # Tick 2: Retract min-salary row in each dept; new MIN = d*10+1.
+        log("  - AVI Tick 2: retract min-salary row in each dept...")
+        for dept in range(10):
+            actual_pk = dept * 10 + 1
+            salary = dept * 10
+            rb.begin(r_uint128(actual_pk), r_int64(-1))
+            rb.put_int(r_int64(dept))
+            rb.put_int(r_int64(salary))
+            rb.commit()
+
+        _update_avi(b_in, avi)
+
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, None, c_out, b_out, [1], [min_agg], out_schema,
+                         agg_value_idx=avi)
+        c_out.close()
+
+        for dept in range(10):
+            expected = r_int64(dept * 10 + 1)
+            actual = _find_min_for_dept(b_out, r_int64(dept))
+            assert_equal_i64(expected, actual, "AVI Tick 2 MIN for dept " + str(dept))
+
+        trace_out.ingest_batch(b_out)
+        b_in.clear()
+        b_out.clear()
+        min_agg.reset()
+
+        # Tick 3: Retract ALL rows in dept 5; no output for dept 5.
+        log("  - AVI Tick 3: retract all rows in dept 5...")
+        for row in range(1, 10):   # row 0 already retracted in Tick 2
+            actual_pk = 5 * 10 + row + 1
+            salary = 5 * 10 + row
+            rb.begin(r_uint128(actual_pk), r_int64(-1))
+            rb.put_int(r_int64(5))
+            rb.put_int(r_int64(salary))
+            rb.commit()
+
+        _update_avi(b_in, avi)
+
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, None, c_out, b_out, [1], [min_agg], out_schema,
+                         agg_value_idx=avi)
+        c_out.close()
+
+        # dept 5 should produce only a retraction (weight=-1), no insertion
+        found_positive = False
+        for i in range(b_out.length()):
+            if b_out.get_weight(i) == r_int64(1):
+                acc_i = b_out.get_accessor(i)
+                if acc_i.get_int_signed(1) == r_int64(5):
+                    found_positive = True
+        assert_true(not found_positive, "AVI Tick 3: dept 5 should have no +1 output")
+
+        log("[DBSP] AggValueIndex MIN path test PASSED")
+    finally:
+        b_in.free()
+        b_out.free()
+        trace_out.close()
+        avi_table.close()
+
+
+def _find_min_for_dept_year(b_out, dept_id, year_id):
+    """Find MIN salary for a specific (dept_id, year) group in output batch."""
+    for i in range(b_out.length()):
+        if b_out.get_weight(i) == r_int64(1):
+            acc = b_out.get_accessor(i)
+            if (acc.get_int_signed(1) == dept_id
+                    and acc.get_int_signed(2) == year_id):
+                return acc.get_int_signed(3)
+    return r_int64(-9999999)
+
+
+def test_reduce_min_multi_col_group(base_dir):
+    """
+    AggValueIndex with multi-column GROUP BY: MIN(salary) GROUP BY (dept_id, year).
+    Schema: (pk: U128, dept_id: I64, year: I64, salary: I64).
+    3 depts x 3 years x 5 salaries = 45 rows. Uses hash-based gc_u64.
+    """
+    log("[DBSP] Testing AggValueIndex multi-col group MIN...")
+
+    cols = newlist_hint(4)
+    cols.append(types.ColumnDefinition(types.TYPE_U128, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="dept_id"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="year"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="salary"))
+    in_schema = types.TableSchema(cols, pk_index=0)
+
+    min_agg = functions.UniversalAccumulator(3, functions.AGG_MIN, types.TYPE_I64)
+    out_schema = types._build_reduce_output_schema(in_schema, [1, 2], [min_agg])
+
+    t_out_path = os.path.join(base_dir, "mc_trace_out")
+    t_avi_path = os.path.join(base_dir, "mc_avi_idx")
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+    avi_schema = group_index.make_agg_value_idx_schema()
+    avi_table = EphemeralTable(t_avi_path, "avidx", avi_schema, table_id=0)
+    avi = group_index.AggValueIndex(
+        avi_table, [1, 2], in_schema, 3, types.TYPE_I64, False,
+    )
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+
+        # Tick 1: Insert 45 rows. salaries are dept*30 + year*5 + 0..4.
+        # MIN per (dept, year) = dept*30 + year*5.
+        log("  - MCG Tick 1: insert 45 rows...")
+        pk = 1
+        for dept in range(3):
+            for year in range(3):
+                for s in range(5):
+                    salary = dept * 30 + year * 5 + s
+                    rb.begin(r_uint128(pk), r_int64(1))
+                    rb.put_int(r_int64(dept))
+                    rb.put_int(r_int64(year))
+                    rb.put_int(r_int64(salary))
+                    rb.commit()
+                    pk += 1
+
+        _update_avi(b_in, avi)
+
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, None, c_out, b_out, [1, 2], [min_agg], out_schema,
+                         agg_value_idx=avi)
+        c_out.close()
+
+        for dept in range(3):
+            for year in range(3):
+                expected = r_int64(dept * 30 + year * 5)
+                actual = _find_min_for_dept_year(b_out, r_int64(dept), r_int64(year))
+                assert_equal_i64(expected, actual,
+                                 "MCG T1 MIN dept=" + str(dept) + " year=" + str(year))
+
+        trace_out.ingest_batch(b_out)
+        b_in.clear()
+        b_out.clear()
+        min_agg.reset()
+
+        # Tick 2: Retract minimum-salary row for (dept=1, year=2); new MIN = 41.
+        # dept=1, year=2, s=0: salary = 1*30 + 2*5 + 0 = 40; pk = 1*15 + 2*5 + 0 + 1 = 26
+        log("  - MCG Tick 2: retract min-salary row for (dept=1, year=2)...")
+        rb.begin(r_uint128(26), r_int64(-1))
+        rb.put_int(r_int64(1))
+        rb.put_int(r_int64(2))
+        rb.put_int(r_int64(40))
+        rb.commit()
+
+        _update_avi(b_in, avi)
+
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, None, c_out, b_out, [1, 2], [min_agg], out_schema,
+                         agg_value_idx=avi)
+        c_out.close()
+
+        expected_new_min = r_int64(41)   # dept*30 + year*5 + 1 = 30+10+1
+        actual = _find_min_for_dept_year(b_out, r_int64(1), r_int64(2))
+        assert_equal_i64(expected_new_min, actual, "MCG T2 new MIN for (dept=1, year=2)")
+
+        trace_out.ingest_batch(b_out)
+        b_in.clear()
+        b_out.clear()
+        min_agg.reset()
+
+        # Tick 3: Retract all rows for (dept=0, year=0); no output for that group.
+        log("  - MCG Tick 3: retract all rows for (dept=0, year=0)...")
+        # (dept=0, year=0): pks 1..5, salaries 0..4
+        for s in range(5):
+            pk_r = s + 1
+            rb.begin(r_uint128(pk_r), r_int64(-1))
+            rb.put_int(r_int64(0))
+            rb.put_int(r_int64(0))
+            rb.put_int(r_int64(s))
+            rb.commit()
+
+        _update_avi(b_in, avi)
+
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, None, c_out, b_out, [1, 2], [min_agg], out_schema,
+                         agg_value_idx=avi)
+        c_out.close()
+
+        # (dept=0, year=0) should have only retraction, no new insertion
+        found_positive = False
+        for i in range(b_out.length()):
+            if b_out.get_weight(i) == r_int64(1):
+                acc_i = b_out.get_accessor(i)
+                if (acc_i.get_int_signed(1) == r_int64(0)
+                        and acc_i.get_int_signed(2) == r_int64(0)):
+                    found_positive = True
+        assert_true(not found_positive, "MCG T3: (dept=0,year=0) should have no +1 output")
+
+        log("[DBSP] AggValueIndex multi-col group MIN test PASSED")
+    finally:
+        b_in.free()
+        b_out.free()
+        trace_out.close()
+        avi_table.close()
+
+
+def test_reduce_max_string_group(base_dir):
+    """
+    AggValueIndex with STRING group column: MAX(value) GROUP BY category.
+    Schema: (pk: U128, category: STRING, value: I64).
+    4 distinct categories, 5 rows each (values 1..5). Uses hash-based gc_u64.
+    """
+    log("[DBSP] Testing AggValueIndex MAX with STRING group...")
+
+    cols = newlist_hint(3)
+    cols.append(types.ColumnDefinition(types.TYPE_U128, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_STRING, name="category"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="value"))
+    in_schema = types.TableSchema(cols, pk_index=0)
+
+    max_agg = functions.UniversalAccumulator(2, functions.AGG_MAX, types.TYPE_I64)
+    out_schema = types._build_reduce_output_schema(in_schema, [1], [max_agg])
+
+    t_out_path = os.path.join(base_dir, "sg_trace_out")
+    t_avi_path = os.path.join(base_dir, "sg_avi_idx")
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+    avi_schema = group_index.make_agg_value_idx_schema()
+    avi_table = EphemeralTable(t_avi_path, "avidx", avi_schema, table_id=0)
+    avi = group_index.AggValueIndex(
+        avi_table, [1], in_schema, 2, types.TYPE_I64, True,
+    )
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+        categories = ["alpha", "beta", "gamma", "delta"]
+
+        # Tick 1: Insert 20 rows, 4 categories x 5 values (1..5).
+        # MAX per category = 5.
+        log("  - SG Tick 1: insert 20 rows (4 categories x values 1..5)...")
+        pk = 1
+        for ci in range(4):
+            for v in range(1, 6):
+                rb.begin(r_uint128(pk), r_int64(1))
+                rb.put_string(categories[ci])
+                rb.put_int(r_int64(v))
+                rb.commit()
+                pk += 1
+
+        _update_avi(b_in, avi)
+
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, None, c_out, b_out, [1], [max_agg], out_schema,
+                         agg_value_idx=avi)
+        c_out.close()
+
+        # All 4 categories should have MAX = 5; count +1 rows
+        pos_count = 0
+        for i in range(b_out.length()):
+            if b_out.get_weight(i) == r_int64(1):
+                acc_i = b_out.get_accessor(i)
+                assert_equal_i64(r_int64(5), acc_i.get_int_signed(2),
+                                 "SG T1 MAX should be 5")
+                pos_count += 1
+        assert_equal_i(4, pos_count, "SG T1: should have 4 positive output rows")
+
+        trace_out.ingest_batch(b_out)
+        b_in.clear()
+        b_out.clear()
+        max_agg.reset()
+
+        # Tick 2: Retract value=5 rows for all categories; new MAX = 4.
+        log("  - SG Tick 2: retract value=5 rows for all categories...")
+        # value=5 rows are at pks 5, 10, 15, 20
+        for ci in range(4):
+            pk_r = ci * 5 + 5
+            rb.begin(r_uint128(pk_r), r_int64(-1))
+            rb.put_string(categories[ci])
+            rb.put_int(r_int64(5))
+            rb.commit()
+
+        _update_avi(b_in, avi)
+
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(b_in, in_schema, None, c_out, b_out, [1], [max_agg], out_schema,
+                         agg_value_idx=avi)
+        c_out.close()
+
+        pos_count = 0
+        for i in range(b_out.length()):
+            if b_out.get_weight(i) == r_int64(1):
+                acc_i = b_out.get_accessor(i)
+                assert_equal_i64(r_int64(4), acc_i.get_int_signed(2),
+                                 "SG T2 new MAX should be 4")
+                pos_count += 1
+        assert_equal_i(4, pos_count, "SG T2: should have 4 positive output rows")
+
+        log("[DBSP] AggValueIndex MAX with STRING group test PASSED")
+    finally:
+        b_in.free()
+        b_out.free()
+        trace_out.close()
+        avi_table.close()
+
+
 def test_reduce_multi_agg(base_dir):
     """Multi-aggregate: COUNT(*) + SUM(val) on same group."""
     log("[DBSP] Testing Reduce multi-agg (COUNT + SUM)...")
@@ -1396,7 +1791,9 @@ def test_compaction_through_ticks(base_dir):
             rb.put_int(r_int64(tick))
             rb.commit()
 
-            distinct.op_distinct(b_in, trace, b_out)
+            cursor = trace.create_cursor()
+            distinct.op_distinct(b_in, cursor, trace, batch.BatchWriter(b_out))
+            cursor.close()
 
             # New PK always produces output weight +1
             if b_out.length() != 1:
@@ -1404,13 +1801,8 @@ def test_compaction_through_ticks(base_dir):
             if b_out.get_weight(0) != r_int64(1):
                 fail("Tick " + str(tick) + ": expected output weight 1")
 
-            # Simulate TraceRegister lifecycle: ingest delta into history, flush
-            trace.ingest_batch(b_in)
+            # Flush to disk to exercise compaction (ingest already done by op_distinct)
             trace.flush()
-
-            # Simulate prepare_for_tick(): compact_if_needed() + create_cursor()
-            c = trace.create_cursor()
-            c.close()
 
             tick += 1
 
@@ -1466,6 +1858,9 @@ def entry_point(argv):
         test_anti_semi_join_complement(base_dir)
         test_source_ops(base_dir)
         test_reduce_group_idx(base_dir)
+        test_reduce_min_agg_value_idx(base_dir)
+        test_reduce_min_multi_col_group(base_dir)
+        test_reduce_max_string_group(base_dir)
         test_reduce_multi_agg(base_dir)
         test_reduce_multi_agg_linear_merge(base_dir)
         test_reduce_multi_agg_nonlinear(base_dir)

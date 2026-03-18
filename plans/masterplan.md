@@ -5,7 +5,7 @@
 ```
 Phase 1 ─── all independent, do in parallel ───────────────────────────
   [1] Compaction ✓        [2] Reduce Bugfixes      [3] Distinct Cursor ✓
-                               (R3,R4,R5)               (D1)
+                           (R3✓,R4,R5)               (D1)
 
 Phase 2 ─── foundational, unlocks many downstream ─────────────────────
   [4] Source Optimizations (_consolidated flag + seal)
@@ -22,7 +22,7 @@ Phase 5 ─── independent of each other ────────────
       (E1,E4,E5,E6)             (E3, needs Phase 2)
 
 Phase 6 ─── complex multi-file feature ────────────────────────────────
-  [11] AggValueIndex (R1+R2)  →  [12] Group Index Extensions (G1)
+  [11] AggValueIndex ✓  →  [12] Group Index Extensions ✓
 
 Phase 7 ─── new features, all independent ─────────────────────────────
   [13] AVERAGE    [14] Semigroup    [15] LEFT JOIN
@@ -41,11 +41,11 @@ Phase 7 ─── new features, all independent ──────────�
 
 All changes in `dbsp/ops/reduce.py`:
 
-| Opt | Change | Lines |
-|---|---|---|
-| R3 | Hoist `gi_cursor` creation before group loop; seek per group, close after loop | ~10 |
-| R4 | Remove `has_old` guard on `is_linear()` — fix new-group correctness | ~5 |
-| R5 | Guard `step()` call with `is_lin` — skip for non-linear aggregates | ~3 |
+| Opt | Change | Lines | Status |
+|---|---|---|---|
+| R3 | Hoist `gi_cursor` creation before group loop; seek per group, close after loop | ~10 | ✓ DONE (group-index commit) |
+| R4 | Remove `has_old` guard on `is_linear()` — fix new-group correctness | ~5 | pending |
+| R5 | Guard `step()` call with `is_lin` — skip for non-linear aggregates | ~3 | pending |
 
 **Tests:** Existing reduce tests cover all three. No new tests required.
 
@@ -150,29 +150,11 @@ All changes in `dbsp/ops/reduce.py`:
 
 ## Phase 6: AggValueIndex (Complex Feature)
 
-### Unit 11: AggValueIndex for MIN/MAX
-**Plan:** `reduce-optimizations.md` Opts 1+2 | **~120 lines**
+### Unit 11: AggValueIndex for MIN/MAX ✓ DONE
+**Plan:** `reduce-optimizations.md` Opts 1+2
 
-| Step | File | Change |
-|---|---|---|
-| 11a | `dbsp/ops/group_index.py` | `make_agg_value_idx_schema`, encoding helpers, `AggValueIndex` class |
-| 11b | `vm/interpreter.py` | INTEGRATE handler for AggValueIndex maintenance |
-| 11c | `dbsp/ops/reduce.py` | `_read_agg_from_value_index` helper; AggValueIndex path in op_reduce |
-| 11d | `catalog/program_cache.py` | Create AggValueIndex for eligible MIN/MAX; skip `tr_in_table` when AVI exists |
-
-**Tests:** New tests: MIN/MAX query correctness with AggValueIndex; verify trace_in not created.
-
-### Unit 12: Group Index Extensions
-**Plan:** `group-index.md` | **Depends on Unit 11** | **~30 lines**
-
-| File | Change |
-|---|---|
-| `dbsp/ops/group_index.py` | Move `_mix64`/`_extract_group_key` from reduce.py; add `_extract_gc_u64` |
-| `dbsp/ops/reduce.py` | Import from group_index.py |
-| `vm/interpreter.py` | Use `_extract_gc_u64` in INTEGRATE |
-| `catalog/program_cache.py` | Remove `len(gcols)==1` gate |
-
-**Tests:** `test_reduce_min_multi_col_group`, `test_reduce_max_string_group`.
+### Unit 12: Group Index Extensions ✓ DONE
+**Plan:** `group-index.md` | **Depends on Unit 11**
 
 ---
 
@@ -190,7 +172,7 @@ All changes in `dbsp/ops/reduce.py`:
 
 ## Recommended Execution Strategy
 
-~~**Session 1:** Units 1+2+3 in parallel~~ — Units 1, 3, 7 done. **Next: Unit 2** (reduce R3/R4/R5, standalone).
+~~**Session 1:** Units 1+2+3 in parallel~~ — Units 1, 3, 7, 11, 12 done; R3 done. **Next: Unit 2** (reduce R4/R5 remaining).
 **Next session:** Unit 4 (foundational — unlocks Phases 3-5)
 **Then:** Units 5+6 in parallel (Unit 7 already done)
 **Then:** Unit 8 (join adaptive/merge-walk)

@@ -7,13 +7,17 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
-from gnitz.core import types, strings, xxh, errors
+from gnitz.core import types, strings, errors
 from gnitz.core.comparator import RowAccessor
 from gnitz.core.batch import (
     ArenaZSetBatch, ConsolidatedScope, BatchWriter, ColumnarBatchAccessor,
 )
 from gnitz.dbsp.functions import NULL_AGGREGATE, AggregateFunction
-from gnitz.dbsp.ops.group_index import promote_group_col_to_u64 as _gi_promote
+from gnitz.dbsp.ops.group_index import (
+    promote_group_col_to_u64 as _gi_promote,
+    _extract_group_key,
+    _extract_gc_u64,
+)
 
 """
 Non-linear Reduce Operator for the DBSP algebra.
@@ -282,57 +286,40 @@ def _merge_by_cols(indices, batch, schema, col_indices, lo, mid, hi, scratch, ac
         k += 1
 
 
-def _mix64(v):
-    """Murmur3 64-bit finalizer. Pure RPython, JIT-inlinable."""
-    v = r_uint64(v)
-    v ^= v >> 33
-    v = r_uint64(v * r_uint64(0xFF51AFD7ED558CCD))
-    v ^= v >> 33
-    v = r_uint64(v * r_uint64(0xC4CEB9FE1A85EC53))
-    v ^= v >> 33
-    return v
-
-
-@jit.unroll_safe
-def _extract_group_key(accessor, schema, col_indices):
-    """Computes a 128-bit key identifying the group."""
-    if len(col_indices) == 1:
-        c_idx = col_indices[0]
-        t = schema.columns[c_idx].field_type.code
-        if t == types.TYPE_U64.code or t == types.TYPE_I64.code:
-            return r_uint128(accessor.get_int(c_idx))
-        if t == types.TYPE_U128.code:
-            return accessor.get_u128(c_idx)
-
-    h = r_uint64(0x9E3779B97F4A7C15)  # golden ratio seed
-    for i in range(len(col_indices)):
-        c_idx = col_indices[i]
-        t = schema.columns[c_idx].field_type.code
-        if t == types.TYPE_STRING.code:
-            length, _, struct_ptr, heap_ptr, py_string = accessor.get_str_struct(c_idx)
-            if length == 0:
-                col_hash = r_uint64(0)
-            elif py_string is not None:
-                col_hash = xxh.compute_checksum_bytes(py_string)
-            else:
-                if length <= strings.SHORT_STRING_THRESHOLD:
-                    target_ptr = rffi.ptradd(struct_ptr, 4)
-                else:
-                    u64_p = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(struct_ptr, 8))
-                    heap_off = rffi.cast(lltype.Signed, u64_p[0])
-                    target_ptr = rffi.ptradd(heap_ptr, heap_off)
-                col_hash = xxh.compute_checksum(target_ptr, length)
-        else:
-            col_hash = _mix64(accessor.get_int(c_idx))
-        h = _mix64(h ^ col_hash ^ r_uint64(i))
-
-    h_hi = _mix64(h ^ r_uint64(len(col_indices)))
-    return (r_uint128(h_hi) << 64) | r_uint128(h)
-
-
 # ---------------------------------------------------------------------------
 # Reduce operator implementation
 # ---------------------------------------------------------------------------
+
+
+def _apply_agg_from_value_index(avi_cursor, gc_u64, for_max, agg_col_type, agg_func):
+    """
+    Seek AVI to group prefix; apply the decoded min/max to agg_func.
+    Resets agg_func if the group is empty (no positive-weight entry found).
+    Returns True if a value was found.
+    """
+    avi_cursor.seek(r_uint128(gc_u64) << 64)
+    while avi_cursor.is_valid():
+        k = avi_cursor.key()
+        if r_uint64(intmask(k >> 64)) != gc_u64:
+            break
+        if avi_cursor.weight() > r_int64(0):
+            encoded = r_uint64(intmask(k))
+            if for_max:
+                encoded = r_uint64(~intmask(encoded))
+            code = agg_col_type.code
+            if (code == types.TYPE_I64.code or code == types.TYPE_I32.code
+                    or code == types.TYPE_I16.code or code == types.TYPE_I8.code):
+                encoded = r_uint64(intmask(encoded) - intmask(r_uint64(1) << 63))
+            elif code == types.TYPE_F64.code or code == types.TYPE_F32.code:
+                if encoded >> 63:
+                    encoded = r_uint64(intmask(encoded) ^ intmask(r_uint64(1) << 63))
+                else:
+                    encoded = r_uint64(~intmask(encoded))
+            agg_func.seed_from_raw_bits(encoded)
+            return True
+        avi_cursor.advance()
+    agg_func.reset()
+    return False
 
 
 def op_reduce(
@@ -345,6 +332,7 @@ def op_reduce(
     agg_funcs,
     output_schema,
     trace_in_group_idx=None,
+    agg_value_idx=None,
 ):
     """
     Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
@@ -384,6 +372,14 @@ def op_reduce(
         acc_in = ColumnarBatchAccessor(input_schema)
         acc_exemplar = ColumnarBatchAccessor(input_schema)
         reduce_acc = ReduceAccessor(input_schema, output_schema, group_by_cols, num_aggs)
+
+        # Hoist cursors: create once outside the per-group loop (Opt 3)
+        gi_cursor = None
+        avi_cursor = None
+        if trace_in_group_idx is not None:
+            gi_cursor = trace_in_group_idx.create_cursor()
+        if agg_value_idx is not None:
+            avi_cursor = agg_value_idx.create_cursor()
 
         idx = 0
         while idx < n:
@@ -443,81 +439,90 @@ def op_reduce(
                     agg_funcs[k].merge_accumulated(old_vals_bits[k], r_int64(1))
             else:
                 if not all_linear:
-                    replay = ArenaZSetBatch(input_schema, initial_capacity=32)
+                    if avi_cursor is not None:
+                        # AVI path: O(log N + 1) — seed accumulator from index
+                        gc_u64 = _extract_gc_u64(
+                            acc_exemplar, agg_value_idx.input_schema,
+                            agg_value_idx.group_by_cols,
+                        )
+                        _apply_agg_from_value_index(
+                            avi_cursor, gc_u64, agg_value_idx.for_max,
+                            agg_value_idx.agg_col_type, agg_funcs[0],
+                        )
+                    else:
+                        replay = ArenaZSetBatch(input_schema, initial_capacity=32)
 
-                    if trace_in_cursor is not None:
-                        if group_by_pk:
-                            trace_in_cursor.seek(group_key)
-                            while trace_in_cursor.is_valid() and trace_in_cursor.key() == group_key:
-                                replay.append_from_accessor(
-                                    trace_in_cursor.key(), trace_in_cursor.weight(),
-                                    trace_in_cursor.get_accessor(),
-                                )
-                                trace_in_cursor.advance()
-                        else:
-                            if trace_in_group_idx is not None:
-                                gc_u64 = _gi_promote(
-                                    acc_exemplar,
-                                    trace_in_group_idx.col_idx,
-                                    trace_in_group_idx.col_type,
-                                )
-                                target_prefix = r_uint128(gc_u64) << 64
-                                gi_cursor = trace_in_group_idx.create_cursor()
-                                gi_cursor.seek(target_prefix)
-                                while gi_cursor.is_valid():
-                                    gk = gi_cursor.key()
-                                    if r_uint64(intmask(gk >> 64)) != gc_u64:
-                                        break
-                                    if gi_cursor.weight() > r_int64(0):
-                                        spk_lo = r_uint128(r_uint64(intmask(gk)))
-                                        spk_hi = r_uint128(rffi.cast(
-                                            rffi.ULONGLONG,
-                                            gi_cursor.get_accessor().get_int_signed(1),
-                                        ))
-                                        src_pk = (spk_hi << 64) | spk_lo
-                                        trace_in_cursor.seek(src_pk)
-                                        if (trace_in_cursor.is_valid()
-                                                and trace_in_cursor.key() == src_pk):
+                        if trace_in_cursor is not None:
+                            if group_by_pk:
+                                trace_in_cursor.seek(group_key)
+                                while trace_in_cursor.is_valid() and trace_in_cursor.key() == group_key:
+                                    replay.append_from_accessor(
+                                        trace_in_cursor.key(), trace_in_cursor.weight(),
+                                        trace_in_cursor.get_accessor(),
+                                    )
+                                    trace_in_cursor.advance()
+                            else:
+                                if gi_cursor is not None:
+                                    gc_u64 = _gi_promote(
+                                        acc_exemplar,
+                                        trace_in_group_idx.col_idx,
+                                        trace_in_group_idx.col_type,
+                                    )
+                                    target_prefix = r_uint128(gc_u64) << 64
+                                    gi_cursor.seek(target_prefix)
+                                    while gi_cursor.is_valid():
+                                        gk = gi_cursor.key()
+                                        if r_uint64(intmask(gk >> 64)) != gc_u64:
+                                            break
+                                        if gi_cursor.weight() > r_int64(0):
+                                            spk_lo = r_uint128(r_uint64(intmask(gk)))
+                                            spk_hi = r_uint128(rffi.cast(
+                                                rffi.ULONGLONG,
+                                                gi_cursor.get_accessor().get_int_signed(1),
+                                            ))
+                                            src_pk = (spk_hi << 64) | spk_lo
+                                            trace_in_cursor.seek(src_pk)
+                                            if (trace_in_cursor.is_valid()
+                                                    and trace_in_cursor.key() == src_pk):
+                                                replay.append_from_accessor(
+                                                    trace_in_cursor.key(),
+                                                    trace_in_cursor.weight(),
+                                                    trace_in_cursor.get_accessor(),
+                                                )
+                                        gi_cursor.advance()
+                                else:
+                                    trace_in_cursor.seek(r_uint128(0))
+                                    while trace_in_cursor.is_valid():
+                                        trace_acc = trace_in_cursor.get_accessor()
+                                        if _compare_by_cols(trace_acc, acc_exemplar,
+                                                            input_schema, group_by_cols) == 0:
                                             replay.append_from_accessor(
                                                 trace_in_cursor.key(),
                                                 trace_in_cursor.weight(),
-                                                trace_in_cursor.get_accessor(),
+                                                trace_acc,
                                             )
-                                    gi_cursor.advance()
-                                gi_cursor.close()
-                            else:
-                                trace_in_cursor.seek(r_uint128(0))
-                                while trace_in_cursor.is_valid():
-                                    trace_acc = trace_in_cursor.get_accessor()
-                                    if _compare_by_cols(trace_acc, acc_exemplar,
-                                                        input_schema, group_by_cols) == 0:
-                                        replay.append_from_accessor(
-                                            trace_in_cursor.key(),
-                                            trace_in_cursor.weight(),
-                                            trace_acc,
-                                        )
-                                    trace_in_cursor.advance()
+                                        trace_in_cursor.advance()
 
-                    for k in range(group_start_pos, idx):
-                        d_idx = sorted_indices[k]
-                        b.bind_accessor(d_idx, acc_in)
-                        replay.append_from_accessor(
-                            b.get_pk(d_idx), b.get_weight(d_idx), acc_in,
-                        )
+                        for k in range(group_start_pos, idx):
+                            d_idx = sorted_indices[k]
+                            b.bind_accessor(d_idx, acc_in)
+                            replay.append_from_accessor(
+                                b.get_pk(d_idx), b.get_weight(d_idx), acc_in,
+                            )
 
-                    merged = replay.to_consolidated()
-                    for af in agg_funcs:
-                        af.reset()
-                    replay_acc = ColumnarBatchAccessor(input_schema)
-                    for m in range(merged.length()):
-                        w = merged.get_weight(m)
-                        if w > r_int64(0):
-                            merged.bind_accessor(m, replay_acc)
-                            for af in agg_funcs:
-                                af.step(replay_acc, w)
-                    if merged is not replay:
-                        merged.free()
-                    replay.free()
+                        merged = replay.to_consolidated()
+                        for af in agg_funcs:
+                            af.reset()
+                        replay_acc = ColumnarBatchAccessor(input_schema)
+                        for m in range(merged.length()):
+                            w = merged.get_weight(m)
+                            if w > r_int64(0):
+                                merged.bind_accessor(m, replay_acc)
+                                for af in agg_funcs:
+                                    af.step(replay_acc, w)
+                        if merged is not replay:
+                            merged.free()
+                        replay.free()
 
             # 6. Emission: +1 Agg(history + delta)
             any_nonzero = False
@@ -528,5 +533,10 @@ def op_reduce(
             if any_nonzero:
                 reduce_acc.set_context(acc_exemplar, agg_funcs, dummy_old_vals, False)
                 out_writer.append_from_accessor(group_key, r_int64(1), reduce_acc)
+
+        if gi_cursor is not None:
+            gi_cursor.close()
+        if avi_cursor is not None:
+            avi_cursor.close()
 
         out_writer.mark_sorted(group_by_pk)

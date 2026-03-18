@@ -8,6 +8,9 @@ from gnitz.dbsp import ops
 from gnitz.dbsp.ops.group_index import (
     GroupIdxAccessor as _GroupIdxAccessor,
     promote_group_col_to_u64 as _gi_promote,
+    promote_agg_col_to_u64_ordered as _gi_agg_promote,
+    _extract_gc_u64,
+    _UNIT_GI_ACC,
 )
 from gnitz.vm import runtime
 
@@ -194,6 +197,27 @@ def run_vm(program, reg_file, context):
                         except errors.MemTableFullError:
                             gi.table.flush()
                             gi.table.memtable.upsert_single(ck, weight, gi_acc)
+            if instr.agg_value_idx is not None:
+                avi = instr.agg_value_idx
+                b = reg_in.batch
+                n = b.length()
+                if n > 0:
+                    acc = b.get_accessor(0)
+                    for idx in range(n):
+                        b.bind_accessor(idx, acc)
+                        if acc.is_null(avi.agg_col_idx):
+                            continue
+                        gc_u64 = _extract_gc_u64(acc, avi.input_schema, avi.group_by_cols)
+                        av_u64 = _gi_agg_promote(
+                            acc, avi.agg_col_idx, avi.agg_col_type, avi.for_max,
+                        )
+                        ck = (r_uint128(gc_u64) << 64) | r_uint128(av_u64)
+                        weight = b.get_weight(idx)
+                        try:
+                            avi.table.memtable.upsert_single(ck, weight, _UNIT_GI_ACC)
+                        except errors.MemTableFullError:
+                            avi.table.flush()
+                            avi.table.memtable.upsert_single(ck, weight, _UNIT_GI_ACC)
 
         elif opcode == op.OPCODE_ANTI_JOIN_DELTA_TRACE:
             reg_delta = instr.reg_delta
@@ -259,6 +283,7 @@ def run_vm(program, reg_file, context):
                 instr.agg_funcs,
                 instr.output_schema,
                 instr.trace_in_group_idx,
+                instr.agg_value_idx,
             )
 
         pc += 1

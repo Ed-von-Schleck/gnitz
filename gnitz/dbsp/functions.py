@@ -124,6 +124,7 @@ class AggregateFunction(object):
     def is_linear(self): return True
     def output_column_type(self): return types.TYPE_I64
     def is_accumulator_zero(self): return True
+    def seed_from_raw_bits(self, bits): pass
 
 
 class NullAggregate(AggregateFunction):
@@ -214,6 +215,10 @@ class UniversalAccumulator(AggregateFunction):
                 prev = rffi.cast(rffi.LONGLONG, value_bits)
                 self._acc = r_int64(intmask(self._acc + (prev * weight)))
             self._has_value = True
+
+    def seed_from_raw_bits(self, bits):
+        self._acc = r_int64(intmask(bits))
+        self._has_value = True
 
     def get_value_bits(self):
         return r_uint64(intmask(self._acc))

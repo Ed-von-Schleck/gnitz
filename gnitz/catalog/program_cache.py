@@ -22,6 +22,20 @@ _ST_SINK_REG_ID = 1
 _ST_INPUT_DELTA_REG_ID = 2
 
 
+def _agg_value_idx_eligible(col_type):
+    """True if the agg column type can be stored in AggValueIndex."""
+    return (col_type.code != TYPE_U128.code
+            and col_type.code != TYPE_STRING.code)
+
+
+def _will_use_agg_value_idx(agg_func_id, agg_col_idx, schema):
+    """True if this single-agg reduce will use AggValueIndex (Opt 2: skip tr_in_table)."""
+    if agg_func_id != functions.AGG_MIN and agg_func_id != functions.AGG_MAX:
+        return False
+    agg_col_type = schema.columns[agg_col_idx].field_type
+    return _agg_value_idx_eligible(agg_col_type)
+
+
 def _open_system_scan(registry, table_id, view_id):
     """Returns (cursor, end_key) with cursor pre-seeked, or (None, 0) if table absent."""
     if not registry.has_id(table_id):
@@ -549,6 +563,8 @@ class ProgramCache(object):
         elif op == opcodes.OPCODE_REDUCE:
             in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN_REDUCE]]
             # Multi-agg path: PARAM_AGG_COUNT > 0
+            agg_func_id = 0   # sentinel: not single-agg
+            agg_col_idx = 0
             agg_count = node_params.get(opcodes.PARAM_AGG_COUNT, 0)
             if agg_count > 0:
                 agg_funcs = newlist_hint(agg_count)
@@ -589,7 +605,8 @@ class ProgramCache(object):
                     break
             if opcodes.PORT_TRACE_IN in in_regs:
                 tr_in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE_IN]]
-            elif not all_linear:
+            elif not all_linear and not _will_use_agg_value_idx(
+                    agg_func_id, agg_col_idx, in_reg.table_schema):
                 tr_in_table = view_family.store.create_child(
                     "_reduce_in_%d_%d" % (view_id, nid), in_reg.table_schema
                 )
@@ -616,15 +633,35 @@ class ProgramCache(object):
                     )
                     grp_idx = group_index.ReduceGroupIndex(gi_table, gc_col_idx, gc_type)
 
+            agg_val_idx = None
+            if agg_func_id == functions.AGG_MIN or agg_func_id == functions.AGG_MAX:
+                agg_col_type = in_reg.table_schema.columns[agg_col_idx].field_type
+                if _agg_value_idx_eligible(agg_col_type):
+                    for_max = (agg_func_id == functions.AGG_MAX)
+                    av_table = view_family.store.create_child(
+                        "_avidx_%d_%d" % (view_id, nid),
+                        group_index.make_agg_value_idx_schema(),
+                    )
+                    agg_val_idx = group_index.AggValueIndex(
+                        av_table, gcols, in_reg.table_schema,
+                        agg_col_idx, agg_col_type, for_max,
+                    )
+
             reduce_instr = instructions.reduce_op(
                 in_reg, tr_in_reg, tr_out_reg, out_delta_reg,
                 gcols, agg_funcs, reduce_out_schema,
                 trace_in_group_idx=grp_idx,
+                agg_value_idx=agg_val_idx,
             )
             program.append(reduce_instr)
             if tr_in_table is not None:
                 program.append(instructions.integrate_op(in_reg, tr_in_table,
-                                                         group_idx=grp_idx))
+                                                         group_idx=grp_idx,
+                                                         agg_value_idx=agg_val_idx))
+            elif agg_val_idx is not None:
+                # Opt 2: no tr_in_table, but AVI must be updated each tick
+                program.append(instructions.integrate_op(in_reg, None,
+                                                         agg_value_idx=agg_val_idx))
             return instructions.integrate_op(out_delta_reg, trace_table)
 
         elif op == opcodes.OPCODE_INTEGRATE:

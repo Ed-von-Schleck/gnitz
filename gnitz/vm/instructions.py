@@ -34,6 +34,7 @@ class Instruction(object):
         "reg_key",
         "trace_in_group_idx",
         "group_idx",
+        "agg_value_idx",
         "reindex_col",
     ]
 
@@ -59,6 +60,7 @@ class Instruction(object):
         self.reg_key = None
         self.trace_in_group_idx = None
         self.group_idx = None
+        self.agg_value_idx = None
         self.reindex_col = -1
 
 
@@ -113,11 +115,12 @@ def join_delta_trace_op(reg_delta, reg_trace, reg_out):
     return i
 
 
-def integrate_op(reg_in, target_table, group_idx=None):
+def integrate_op(reg_in, target_table, group_idx=None, agg_value_idx=None):
     i = Instruction(op.OPCODE_INTEGRATE)
     i.reg_in = reg_in
     i.target_table = target_table
     i.group_idx = group_idx
+    i.agg_value_idx = agg_value_idx
     return i
 
 
@@ -140,6 +143,7 @@ def reduce_op(
     reg_in, reg_trace_in, reg_trace_out, reg_out,
     group_by_cols, agg_funcs, output_schema,
     trace_in_group_idx=None,
+    agg_value_idx=None,
 ):
     i = Instruction(op.OPCODE_REDUCE)
     i.reg_in = reg_in
@@ -150,6 +154,7 @@ def reduce_op(
     i.agg_funcs = agg_funcs
     i.output_schema = output_schema
     i.trace_in_group_idx = trace_in_group_idx
+    i.agg_value_idx = agg_value_idx
     return i
 
 
