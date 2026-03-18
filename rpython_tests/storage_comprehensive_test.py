@@ -29,6 +29,7 @@ from gnitz.storage import (
     manifest,
     refcount,
     index,
+    flsm,
     mmap_posix,
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
@@ -594,7 +595,7 @@ def test_manifest_and_spine(base_dir):
         global_max_lsn=r_uint64(1),
     )
 
-    idx = index.index_from_manifest(manifest_file, 1, schema, rc)
+    idx = flsm.index_from_manifest(manifest_file, 1, schema, rc)
     res = idx.find_all_shards_and_indices(r_uint128(10))
     assert_equal_i(1, len(res), "Index resolution failed to find shard")
     assert_equal_s(idx_db, res[0][0].filename, "Index resolved to wrong filename")
@@ -1825,6 +1826,165 @@ def test_partitioned_compact_if_needed(base_dir):
     os.write(1, "[Storage] PartitionedTable compaction propagation Test Passed.\n")
 
 
+def test_flsm_data_structures(base_dir):
+    os.write(1, "[Storage] Testing FLSM data structures...\n")
+    schema = make_u64_i64_schema()
+
+    # 1. LevelGuard.guard_key()
+    g = flsm.LevelGuard(r_uint64(100), r_uint64(0))
+    assert_equal_u128(r_uint128(100), g.guard_key(), "LevelGuard.guard_key failed")
+
+    # 2. FLSMLevel.find_guard_idx: empty level returns -1
+    level = flsm.FLSMLevel(1)
+    assert_equal_i(-1, level.find_guard_idx(r_uint128(50)), "empty level should return -1")
+
+    # Insert guards at keys 0, 100, 200, 300
+    g0 = flsm.LevelGuard(r_uint64(0), r_uint64(0))
+    g1 = flsm.LevelGuard(r_uint64(100), r_uint64(0))
+    g2 = flsm.LevelGuard(r_uint64(200), r_uint64(0))
+    g3 = flsm.LevelGuard(r_uint64(300), r_uint64(0))
+    level.insert_guard_sorted(g0)
+    level.insert_guard_sorted(g1)
+    level.insert_guard_sorted(g2)
+    level.insert_guard_sorted(g3)
+
+    assert_equal_i(0, level.find_guard_idx(r_uint128(50)),  "key=50 should be guard 0")
+    assert_equal_i(1, level.find_guard_idx(r_uint128(100)), "key=100 should be guard 1")
+    assert_equal_i(2, level.find_guard_idx(r_uint128(250)), "key=250 should be guard 2")
+    assert_equal_i(3, level.find_guard_idx(r_uint128(350)), "key=350 should be guard 3")
+    assert_equal_i(0, level.find_guard_idx(r_uint128(0)),   "key=0 should be guard 0")
+
+    # 3. find_guards_for_range(80, 210) -> indices [0, 1, 2]
+    indices = level.find_guards_for_range(r_uint128(80), r_uint128(210))
+    assert_equal_i(3, len(indices), "find_guards_for_range(80,210) should return 3 indices")
+    assert_equal_i(0, indices[0], "range[0] should be 0")
+    assert_equal_i(1, indices[1], "range[1] should be 1")
+    assert_equal_i(2, indices[2], "range[2] should be 2")
+
+    # 4. FLSMIndex handle management: create 5 real shard files
+    shard_dir = os.path.join(base_dir, "flsm_ds")
+    rposix.mkdir(shard_dir, 0o755)
+    rc = refcount.RefCounter()
+    idx = flsm.FLSMIndex(99, schema, rc, shard_dir)
+    assert_equal_i(0, len(idx.handles), "FLSMIndex initially empty")
+
+    shard_paths = []
+    i = 0
+    while i < 5:
+        shard_path = shard_dir + "/ds_shard_%d.db" % i
+        sw = writer_table.TableShardWriter(schema, table_id=99)
+        tmp = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, tmp)
+        rb.begin(r_uint128(i * 10), r_int64(1))
+        rb.put_int(r_int64(i))
+        rb.commit()
+        sw.add_row_from_accessor(r_uint128(i * 10), r_int64(1), tmp.get_accessor(0))
+        tmp.free()
+        sw.finalize(shard_path)
+        shard_paths.append(shard_path)
+        i += 1
+
+    h0 = index.ShardHandle(shard_paths[0], schema, r_uint64(0), r_uint64(0))
+    idx.add_handle(h0)
+    if idx.needs_compaction:
+        raise Exception("needs_compaction should be False with 1 handle")
+
+    i = 1
+    while i < 5:
+        h = index.ShardHandle(shard_paths[i], schema, r_uint64(0), r_uint64(0))
+        idx.add_handle(h)
+        i += 1
+    if not idx.needs_compaction:
+        raise Exception("needs_compaction should be True with 5 handles (> threshold 4)")
+
+    idx.close_all()
+
+    os.write(1, "    [OK] FLSM data structures passed.\n")
+
+
+def test_flsm_guard_read_path(base_dir):
+    os.write(1, "[Storage] Testing FLSM guard-aware read path...\n")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    tbl_dir = os.path.join(base_dir, "flsm_grp")
+    tbl = EphemeralTable(tbl_dir, "grp", schema)
+
+    # 1. Insert 20 rows PKs 0-19, 4 rows per batch, flush after each batch
+    batch_num = 0
+    while batch_num < 5:
+        b = batch.ArenaZSetBatch(schema)
+        row_in_batch = 0
+        while row_in_batch < 4:
+            pk = r_uint128(batch_num * 4 + row_in_batch)
+            rb = RowBuilder(schema, b)
+            rb.begin(pk, r_int64(1))
+            rb.put_int(r_int64(batch_num * 4 + row_in_batch))
+            rb.commit()
+            row_in_batch += 1
+        tbl.ingest_batch(b)
+        b.free()
+        tbl.flush()
+        batch_num += 1
+
+    if len(tbl.index.handles) != 5:
+        raise Exception("Expected 5 L0 handles, got " + str(len(tbl.index.handles)))
+
+    # 2. Build L1 guards using actual pk_min of first handle placed in each
+    handles = tbl.index.handles  # sorted: [0-3], [4-7], [8-11], [12-15], [16-19]
+    level1 = tbl.index.get_or_create_level(1)
+
+    guard0 = flsm.LevelGuard(handles[0].pk_min_lo, handles[0].pk_min_hi)
+    guard1 = flsm.LevelGuard(handles[3].pk_min_lo, handles[3].pk_min_hi)
+
+    # Directly append without add_handle: already refcounted by original add_handle
+    guard0.handles.append(handles[0])
+    guard0.handles.append(handles[1])
+    guard1.handles.append(handles[3])
+    guard1.handles.append(handles[4])
+
+    level1.insert_guard_sorted(guard0)
+    level1.insert_guard_sorted(guard1)
+
+    # 3. L0 now holds only handles[2] (covers [8-11])
+    new_l0 = newlist_hint(1)
+    new_l0.append(handles[2])
+    tbl.index.handles = new_l0
+
+    # 4. create_cursor() — assert yields all 20 rows
+    c = tbl.create_cursor()
+    row_count = 0
+    while c.is_valid():
+        if c.weight() > r_int64(0):
+            row_count += 1
+        c.advance()
+    c.close()
+    if row_count != 20:
+        raise Exception("Expected 20 rows from cursor, got " + str(row_count))
+
+    # 5. has_pk for all k in 0..19 — assert True
+    k = 0
+    while k < 20:
+        if not tbl.has_pk(r_uint128(k)):
+            raise Exception("has_pk(%d) should be True" % k)
+        k += 1
+
+    # 6. has_pk(50) -> False (50 routes to guard1 but not in [12-15] or [16-19])
+    if tbl.has_pk(r_uint128(50)):
+        raise Exception("has_pk(50) should be False")
+
+    # 7. all_handles_for_cursor() -> exactly 5 handles
+    all_h = tbl.index.all_handles_for_cursor()
+    if len(all_h) != 5:
+        raise Exception("all_handles_for_cursor should return 5, got " + str(len(all_h)))
+
+    tbl.close()
+    os.write(1, "    [OK] FLSM guard-aware read path passed.\n")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -1856,6 +2016,8 @@ def entry_point(argv):
         test_persistent_compact_if_needed(base_dir)
         test_compact_with_strings(base_dir)
         test_partitioned_compact_if_needed(base_dir)
+        test_flsm_data_structures(base_dir)
+        test_flsm_guard_read_path(base_dir)
         os.write(1, "\nALL STORAGE TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

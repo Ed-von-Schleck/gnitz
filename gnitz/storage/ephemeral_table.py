@@ -19,6 +19,7 @@ from gnitz.core.keys import promote_to_index_key
 from gnitz.core.batch import ColumnarBatchAccessor
 from gnitz.storage import (
     index,
+    flsm,
     memtable,
     refcount,
     compactor,
@@ -78,7 +79,8 @@ class EphemeralTable(ZSetStore):
             if e.errno != errno.EEXIST:
                 raise
 
-        self.index = index.ShardIndex(table_id, schema, self.ref_counter)
+        self.index = flsm.FLSMIndex(table_id, schema, self.ref_counter,
+                                    directory, validate_checksums)
         self.memtable = memtable.MemTable(schema, memtable_arena_size)
         self._flush_seq = 0
         self._retract_acc = ColumnarBatchAccessor(schema)
@@ -104,13 +106,11 @@ class EphemeralTable(ZSetStore):
         )
 
     def _build_cursor(self):
-        num_shards = len(self.index.handles)
-        cs = newlist_hint(1 + num_shards)
-
+        all_handles = self.index.all_handles_for_cursor()
+        cs = newlist_hint(1 + len(all_handles))
         cs.append(cursor.MemTableCursor(self.memtable))
-        for h in self.index.handles:
+        for h in all_handles:
             cs.append(cursor.ShardCursor(h.view))
-
         return cursor.UnifiedCursor(self.schema, cs)
 
     def compact_if_needed(self):

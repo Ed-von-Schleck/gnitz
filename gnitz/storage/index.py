@@ -176,24 +176,3 @@ class ShardIndex(object):
             self.ref_counter.release(h.filename)
         self.handles = newlist_hint(0)
 
-
-def index_from_manifest(
-    manifest_path, table_id, schema, ref_counter, validate_checksums=False
-):
-    """Factory to initialize an Index from a Manifest file."""
-    idx = ShardIndex(table_id, schema, ref_counter)
-    reader = manifest.ManifestReader(manifest_path)
-    try:
-        for entry in reader.iterate_entries():
-            if entry.table_id == table_id:
-                handle = ShardHandle(
-                    entry.shard_filename,
-                    schema,
-                    entry.min_lsn,
-                    entry.max_lsn,
-                    validate_checksums,
-                )
-                idx.add_handle(handle)
-    finally:
-        reader.close()
-    return idx

@@ -16,11 +16,13 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 class ManifestEntry(object):
     """Authoritative shard metadata record."""
     _immutable_fields_ = [
-        'table_id', 'shard_filename', 'pk_min_lo', 'pk_min_hi', 
-        'pk_max_lo', 'pk_max_hi', 'min_lsn', 'max_lsn'
+        'table_id', 'shard_filename', 'pk_min_lo', 'pk_min_hi',
+        'pk_max_lo', 'pk_max_hi', 'min_lsn', 'max_lsn',
+        'level', 'guard_key_lo', 'guard_key_hi',
     ]
-    
-    def __init__(self, table_id, shard_filename, min_key, max_key, min_lsn, max_lsn):
+
+    def __init__(self, table_id, shard_filename, min_key, max_key, min_lsn, max_lsn,
+                 level=0, guard_key_lo=r_uint64(0), guard_key_hi=r_uint64(0)):
         self.table_id = table_id
         self.shard_filename = shard_filename
         mk = r_uint128(min_key)
@@ -31,6 +33,9 @@ class ManifestEntry(object):
         self.pk_max_hi = r_uint64(intmask(xk >> 64))
         self.min_lsn = r_uint64(min_lsn)
         self.max_lsn = r_uint64(max_lsn)
+        self.level = level
+        self.guard_key_lo = r_uint64(guard_key_lo)
+        self.guard_key_hi = r_uint64(guard_key_hi)
 
     def get_min_key(self):
         return (r_uint128(self.pk_min_hi) << 64) | r_uint128(self.pk_min_lo)
