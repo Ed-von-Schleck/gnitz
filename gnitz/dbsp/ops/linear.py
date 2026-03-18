@@ -7,6 +7,7 @@ from rpython.rlib.longlong2float import float2longlong
 from gnitz.core.batch import RowBuilder
 from gnitz.core import types as core_types, xxh, strings as core_strings
 from rpython.rtyper.lltypesystem import rffi, lltype
+from gnitz.dbsp.ops.group_index import _mix64
 
 """
 Linear Operators for the DBSP algebra.
@@ -15,17 +16,6 @@ These operators satisfy the identity L(A + B) = L(A) + L(B).
 They are stateless transformations acting on Z-Set batches.
 Each function now accepts a BatchWriter for the output register.
 """
-
-
-def _mix64(v):
-    """Murmur3 64-bit finalizer. Must match reduce.py._mix64 exactly."""
-    v = r_uint64(v)
-    v ^= v >> 33
-    v = r_uint64(v * r_uint64(0xFF51AFD7ED558CCD))
-    v ^= v >> 33
-    v = r_uint64(v * r_uint64(0xC4CEB9FE1A85EC53))
-    v ^= v >> 33
-    return v
 
 
 def _promote_col_to_u128(accessor, col_idx, schema):

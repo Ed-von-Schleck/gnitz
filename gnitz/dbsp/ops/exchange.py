@@ -1,97 +1,70 @@
 # gnitz/dbsp/ops/exchange.py
 #
 # Column-based hash for repartitioning batches across workers.
+# Single authority for all partition routing logic.
 
-from rpython.rlib.rarithmetic import r_uint64, intmask
-from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core import xxh, types, strings
-from gnitz.core.batch import ArenaZSetBatch
+from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask
+from gnitz.core.batch import ArenaZSetBatch, ColumnarBatchAccessor
 from gnitz.storage.partitioned_table import _partition_for_key
+from gnitz.dbsp.ops.group_index import _extract_group_key
 
 
-def _mix64(v):
-    """Murmur3 64-bit finalizer — must match reduce.py._mix64 exactly."""
-    v = r_uint64(v)
-    v ^= v >> 33
-    v = r_uint64(v * r_uint64(0xFF51AFD7ED558CCD))
-    v ^= v >> 33
-    v = r_uint64(v * r_uint64(0xC4CEB9FE1A85EC53))
-    v ^= v >> 33
-    return v
+class PartitionAssignment(object):
+    """Maps 256 partitions to N workers. Worker w owns [start, end)."""
+
+    _immutable_fields_ = ["num_workers", "starts[*]", "ends[*]",
+                          "_partition_to_worker[*]"]
+
+    def __init__(self, num_workers):
+        self.num_workers = num_workers
+        chunk = 256 // num_workers
+        starts = [0] * num_workers
+        ends = [0] * num_workers
+        for w in range(num_workers):
+            starts[w] = w * chunk
+            if w == num_workers - 1:
+                ends[w] = 256
+            else:
+                ends[w] = (w + 1) * chunk
+        self.starts = starts
+        self.ends = ends
+        # Precompute O(1) lookup table
+        lut = [0] * 256
+        for w in range(num_workers):
+            for p in range(starts[w], ends[w]):
+                lut[p] = w
+        self._partition_to_worker = lut
+
+    def worker_for_partition(self, partition_idx):
+        """Returns the worker ID that owns the given partition."""
+        return self._partition_to_worker[partition_idx]
+
+    def range_for_worker(self, worker_id):
+        """Returns (start, end) partition range for the given worker."""
+        return self.starts[worker_id], self.ends[worker_id]
 
 
-def _read_col_or_pk(batch, row_idx, col_idx):
-    """Read column value as u64, handling the PK column correctly.
-
-    col_bufs[pk_index] is an empty buffer (stride=0) — PK data lives in
-    pk_lo_buf.  This helper redirects PK reads transparently.
-    """
-    if col_idx == batch._schema.pk_index:
-        return r_uint64(batch._read_pk_lo(row_idx))
-    return r_uint64(batch._read_col_int(row_idx, col_idx))
-
-
-def _read_col_u128_parts(batch, row_idx, col_idx):
-    """Read U128 column as (lo, hi) u64 pair for partition routing."""
-    ptr = rffi.ptradd(batch.col_bufs[col_idx].base_ptr,
-                       row_idx * batch.col_strides[col_idx])
-    lo = r_uint64(rffi.cast(rffi.ULONGLONGP, ptr)[0])
-    hi = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0])
-    return lo, hi
-
-
-def _hash_string_col(batch, row_idx, col_idx):
-    """Hash string column content via xxh, matching reduce.py._extract_group_key."""
-    ptr = rffi.ptradd(batch.col_bufs[col_idx].base_ptr,
-                       row_idx * batch.col_strides[col_idx])
-    u32_ptr = rffi.cast(rffi.UINTP, ptr)
-    length = rffi.cast(lltype.Signed, u32_ptr[0])
-    if length == 0:
-        return r_uint64(0)
-    if length <= strings.SHORT_STRING_THRESHOLD:
-        target_ptr = rffi.ptradd(ptr, 4)
-    else:
-        u64_p = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))
-        heap_off = rffi.cast(lltype.Signed, u64_p[0])
-        target_ptr = rffi.ptradd(batch.blob_arena.base_ptr, heap_off)
-    return xxh.compute_checksum(target_ptr, length)
+def worker_for_pk(pk_lo, pk_hi, assignment):
+    """Route a single PK to its owning worker (for fan_out_seek)."""
+    return assignment.worker_for_partition(_partition_for_key(r_uint64(pk_lo), r_uint64(pk_hi)))
 
 
 def hash_row_by_columns(batch, row_idx, col_indices):
     """Compute destination partition for a row using group-key semantics.
 
-    Mirrors _extract_group_key in reduce.py so that the exchange routing
-    is consistent with the reduce output PK partition routing:
-      - Single U64/I64 column: use value directly as PK lo; partition = _partition_for_key(val, 0)
-      - Everything else:       Murmur3 combination → _partition_for_key(lo, hi)
-
-    This guarantees that the worker receiving the exchange data also owns the
-    partition where the reduce result will be stored.
+    For single-column shards on the PK column, reads pk_lo/pk_hi directly
+    (col_bufs[pk_index] has stride=0 and cannot be used for routing).
+    All other cases delegate to _extract_group_key for consistency with
+    the reduce output PK partition routing.
     """
     schema = batch._schema
-    if len(col_indices) == 1:
-        c_idx = col_indices[0]
-        col_type = schema.columns[c_idx].field_type.code
-        if col_type == types.TYPE_U64.code or col_type == types.TYPE_I64.code:
-            val = _read_col_or_pk(batch, row_idx, c_idx)
-            return _partition_for_key(val, r_uint64(0))
-        if col_type == types.TYPE_U128.code:
-            lo, hi = _read_col_u128_parts(batch, row_idx, c_idx)
-            return _partition_for_key(lo, hi)
-
-    # General path: Murmur3 combination (matches _extract_group_key for non-U64 single-col
-    # and all multi-col cases)
-    h = r_uint64(0x9E3779B97F4A7C15)
-    for i in range(len(col_indices)):
-        c_idx = col_indices[i]
-        col_type = schema.columns[c_idx].field_type.code
-        if col_type == types.TYPE_STRING.code:
-            col_hash = _hash_string_col(batch, row_idx, c_idx)
-        else:
-            col_hash = _mix64(_read_col_or_pk(batch, row_idx, c_idx))
-        h = _mix64(h ^ col_hash ^ r_uint64(i))
-    h_hi = _mix64(h ^ r_uint64(len(col_indices)))
-    return _partition_for_key(h, h_hi)
+    if len(col_indices) == 1 and col_indices[0] == schema.pk_index:
+        return _partition_for_key(r_uint64(batch._read_pk_lo(row_idx)),
+                                  r_uint64(batch._read_pk_hi(row_idx)))
+    acc = ColumnarBatchAccessor(schema)
+    acc.bind(batch, row_idx)
+    group_key = _extract_group_key(acc, schema, col_indices)
+    return _partition_for_key(r_uint64(group_key), r_uint64(group_key >> 64))
 
 
 def repartition_batch(batch, shard_col_indices, num_workers, assignment):
@@ -106,3 +79,52 @@ def repartition_batch(batch, shard_col_indices, num_workers, assignment):
             sub_batches[w] = ArenaZSetBatch(schema)
         sub_batches[w]._direct_append_row(batch, i, batch.get_weight(i))
     return sub_batches
+
+
+def relay_scatter(source_batches, shard_cols, num_workers, assignment):
+    """Scatter N exchange results. Sources must remain alive during call.
+    Caller is responsible for freeing source_batches after this returns."""
+    schema = None
+    for sb in source_batches:
+        if sb is not None and sb.length() > 0:
+            schema = sb._schema
+            break
+    if schema is None:
+        return [None] * num_workers
+    merged = ArenaZSetBatch(schema)
+    for sb in source_batches:
+        if sb is not None:
+            merged.append_batch(sb)
+    dest = repartition_batch(merged, shard_cols, num_workers, assignment)
+    merged.free()
+    return dest
+
+
+def multi_scatter(batch, col_spec_list, num_workers, assignment):
+    """Scatter one batch by multiple column specs in a single pass.
+    Returns list[list[ArenaZSetBatch|None]], one inner list per spec.
+    Used by Phase 4's combined push+preload pass."""
+    n_specs = len(col_spec_list)
+    results = [[None] * num_workers for _ in range(n_specs)]
+    schema = batch._schema
+    for i in range(batch.length()):
+        weight = batch.get_weight(i)
+        for si in range(n_specs):
+            p = hash_row_by_columns(batch, i, col_spec_list[si])
+            w = assignment.worker_for_partition(p)
+            if results[si][w] is None:
+                results[si][w] = ArenaZSetBatch(schema)
+            results[si][w]._direct_append_row(batch, i, weight)
+    # Flag propagation: PK-spec sub-batches inherit consolidation from source
+    for si in range(n_specs):
+        spec = col_spec_list[si]
+        if len(spec) == 1 and spec[0] == schema.pk_index:
+            if batch._sorted or batch._consolidated:
+                for w in range(num_workers):
+                    sb = results[si][w]
+                    if sb is not None:
+                        if batch._sorted:
+                            sb.mark_sorted(True)
+                        if batch._consolidated:
+                            sb.mark_consolidated(True)
+    return results
