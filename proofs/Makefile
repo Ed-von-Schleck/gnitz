@@ -51,7 +51,12 @@ PROOFS := \
 	ipc-header-layout:ipc_header_layout \
 	german-string-layout:german_string_layout \
 	mergesort-partition:mergesort_partition \
-	wal-region-count:wal_region_count
+	wal-region-count:wal_region_count \
+	expr-opcodes:expr_opcodes \
+	mix64-consistency:mix64_consistency \
+	short-string-unpack:short_string_unpack \
+	reduce-mapping-count:reduce_mapping_count \
+	expr-instr-width:expr_instr_width
 
 TARGETS := $(foreach p,$(PROOFS),prove-$(firstword $(subst :, ,$(p))))
 
