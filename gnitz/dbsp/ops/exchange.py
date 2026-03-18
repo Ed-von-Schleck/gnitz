@@ -81,23 +81,106 @@ def repartition_batch(batch, shard_col_indices, num_workers, assignment):
     return sub_batches
 
 
-def relay_scatter(source_batches, shard_cols, num_workers, assignment):
-    """Scatter N exchange results. Sources must remain alive during call.
-    Caller is responsible for freeing source_batches after this returns."""
+def repartition_batches(source_batches, shard_col_indices, num_workers, assignment):
+    """Scatter N source batches into N dest batches without an intermediate merge.
+    Sources are iterated sequentially. Output is NOT marked consolidated.
+    Fallback when sources are not all consolidated."""
+    dest = [None] * num_workers
     schema = None
+    total = 0
     for sb in source_batches:
         if sb is not None and sb.length() > 0:
-            schema = sb._schema
-            break
+            if schema is None:
+                schema = sb._schema
+            total += sb.length()
     if schema is None:
-        return [None] * num_workers
-    merged = ArenaZSetBatch(schema)
+        return dest
+    cap = total // num_workers
     for sb in source_batches:
         if sb is not None:
-            merged.append_batch(sb)
-    dest = repartition_batch(merged, shard_cols, num_workers, assignment)
-    merged.free()
+            for i in range(sb.length()):
+                p = hash_row_by_columns(sb, i, shard_col_indices)
+                w = assignment.worker_for_partition(p)
+                if dest[w] is None:
+                    dest[w] = ArenaZSetBatch(schema, initial_capacity=cap)
+                dest[w]._direct_append_row(sb, i, sb.get_weight(i))
     return dest
+
+
+def repartition_batches_merged(source_batches, shard_col_indices, num_workers,
+                                assignment):
+    """K-way merge of N consolidated source batches in merged PK order.
+    Produces consolidated dest batches. source_batches must all have
+    _consolidated=True and have globally unique PKs."""
+    dest = [None] * num_workers
+    schema = None
+    total = 0
+    for sb in source_batches:
+        if sb is not None and sb.length() > 0:
+            if schema is None:
+                schema = sb._schema
+            total += sb.length()
+    if schema is None:
+        return dest
+    cap = total // num_workers
+    n = len(source_batches)
+    cursors = [0] * n
+
+    while True:
+        # Linear scan: find source with minimum current PK
+        min_w = -1
+        for w in range(n):
+            sb = source_batches[w]
+            if sb is None:
+                continue
+            idx = cursors[w]
+            if idx >= sb.length():
+                continue
+            if min_w == -1:
+                min_w = w
+            else:
+                min_sb = source_batches[min_w]
+                min_idx = cursors[min_w]
+                cur_hi = sb._read_pk_hi(idx)
+                min_hi = min_sb._read_pk_hi(min_idx)
+                if cur_hi < min_hi:
+                    min_w = w
+                elif cur_hi == min_hi:
+                    if sb._read_pk_lo(idx) < min_sb._read_pk_lo(min_idx):
+                        min_w = w
+        if min_w == -1:
+            break
+        src = source_batches[min_w]
+        src_idx = cursors[min_w]
+        p = hash_row_by_columns(src, src_idx, shard_col_indices)
+        dw = assignment.worker_for_partition(p)
+        if dest[dw] is None:
+            dest[dw] = ArenaZSetBatch(schema, initial_capacity=cap)
+        dest[dw]._direct_append_row(src, src_idx, src.get_weight(src_idx))
+        cursors[min_w] += 1
+
+    for w in range(num_workers):
+        if dest[w] is not None:
+            dest[w].mark_consolidated(True)
+    return dest
+
+
+def relay_scatter(source_batches, shard_cols, num_workers, assignment):
+    """Scatter N exchange results. Sources must remain alive during call."""
+    all_consolidated = True
+    has_any = False
+    for sb in source_batches:
+        if sb is not None and sb.length() > 0:
+            has_any = True
+            if not sb._consolidated:
+                all_consolidated = False
+                break
+    if not has_any:
+        return [None] * num_workers
+    if all_consolidated:
+        return repartition_batches_merged(source_batches, shard_cols,
+                                          num_workers, assignment)
+    return repartition_batches(source_batches, shard_cols, num_workers, assignment)
 
 
 class PartitionRouter(object):

@@ -6,7 +6,7 @@ Proves five properties of gnitz/core/opcodes.py:7-66:
            JOIN_DT=5, JOIN_DD=6, INTEGRATE=7, DELAY=8, REDUCE=9,
            DISTINCT=10, SCAN_TRACE=11, SEEK_TRACE=12, CLEAR_DELTAS=15,
            ANTI_JOIN_DT=16, ANTI_JOIN_DD=17, SEMI_JOIN_DT=18, SEMI_JOIN_DD=19,
-           EXCHANGE_SHARD=20
+           EXCHANGE_SHARD=20, JOIN_DT_OUTER=22
 
   Parameter slot ranges:
     Named:    [0, 12]    (PARAM_FUNC_ID=0 .. PARAM_AGG_COUNT=12)
@@ -16,7 +16,7 @@ Proves five properties of gnitz/core/opcodes.py:7-66:
     SHARD:    [128, 159] (PARAM_SHARD_COL_BASE=128)
     CONST_STR:[160, 191] (PARAM_CONST_STR_BASE=160)
 
-  P1. All 19 opcode values are distinct (Python cross-check)
+  P1. All 20 opcode values are distinct (Python cross-check)
   P2. Named slot indices [0,12] are all in range [0,12] (16-bit BV, UNSAT)
   P3. Named [0,12] and AGG_SPEC [13,31] ranges are disjoint (16-bit BV, UNSAT)
   P4. All 5 slot range pairs [agg-proj, proj-expr, expr-shard, shard-const] are
@@ -82,6 +82,7 @@ OPCODE_ANTI_JOIN_DELTA_DELTA = 17
 OPCODE_SEMI_JOIN_DELTA_TRACE = 18
 OPCODE_SEMI_JOIN_DELTA_DELTA = 19
 OPCODE_EXCHANGE_SHARD   = 20
+OPCODE_JOIN_DELTA_TRACE_OUTER = 22
 
 ALL_OPCODES = [
     OPCODE_HALT, OPCODE_FILTER, OPCODE_MAP, OPCODE_NEGATE, OPCODE_UNION,
@@ -90,7 +91,7 @@ ALL_OPCODES = [
     OPCODE_SEEK_TRACE, OPCODE_CLEAR_DELTAS,
     OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_ANTI_JOIN_DELTA_DELTA,
     OPCODE_SEMI_JOIN_DELTA_TRACE, OPCODE_SEMI_JOIN_DELTA_DELTA,
-    OPCODE_EXCHANGE_SHARD,
+    OPCODE_EXCHANGE_SHARD, OPCODE_JOIN_DELTA_TRACE_OUTER,
 ]
 
 # Named parameter slots from gnitz/core/opcodes.py:51-62
@@ -128,7 +129,7 @@ ok = True
 
 report("  ... cross-checking opcode constants")
 
-# P1: all 19 opcode values are distinct
+# P1: all 20 opcode values are distinct
 if len(set(ALL_OPCODES)) == len(ALL_OPCODES):
     report("  PASS  cross-check: all %d opcodes are distinct" % len(ALL_OPCODES))
 else:
@@ -293,7 +294,7 @@ ok &= prove("P5: any named slot s <= 12 satisfies s < PARAM_AGG_SPEC_BASE(13)", 
 print("=" * 56)
 if ok:
     print("  PROVED: Opcode distinctness and slot non-overlap")
-    print("    P1: all 19 opcode values are distinct")
+    print("    P1: all 20 opcode values are distinct")
     print("    P2: named slot range [0,12] is below AGG_SPEC_BASE=13")
     print("    P3: named [0,12] and AGG_SPEC [13,31] are disjoint")
     print("    P4: all 4 adjacent slot range pairs are non-overlapping")

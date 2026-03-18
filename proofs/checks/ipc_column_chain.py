@@ -1,17 +1,32 @@
-"""Z3 formal proofs for IPC ZSet full column offset chain.
+"""Z3 formal proofs for IPC WAL-block message structure.
 
-Extends ipc_wire.py (which proves P3-P4 for 4 structural sections) to the
-DATA COLUMN offset chain: string columns use IPC_STRING_STRIDE=8 per row,
-non-string use col_type.size per row. All sections aligned to ALIGNMENT=64.
+The old _compute_zset_wire_size function was removed when IPC was rewritten
+to use WAL blocks (commit d1f6758).  Column layout is now proved by
+wal_directory.py and wal_region_count.py.
 
-Source: gnitz/server/ipc.py:286-335 (_compute_zset_wire_size)
+This proof covers the 3-block IPC message structure and the flag protocol
+(gnitz/server/ipc.py:39-43, 233-262):
 
-  P1. Data column offset is ALIGNMENT-aligned (64-bit BV, UNSAT)
-  P2. Data column sections are non-overlapping (64-bit BV, UNSAT)
-  P3. Blob offset comes after all column sections (64-bit BV, UNSAT)
-  P4. Column size formulas are positive for count > 0 (16-bit BV, UNSAT)
+  Block 1: control  (always, TID = IPC_CONTROL_TID)
+  Block 2: schema   (iff FLAG_HAS_SCHEMA is set in ctrl_flags)
+  Block 3: data     (iff FLAG_HAS_DATA is set in ctrl_flags)
 
-4 Z3 queries + ~5 cross-checks.  Runs under PyPy2.
+Protocol invariant: FLAG_HAS_DATA requires FLAG_HAS_SCHEMA.
+FLAG_BATCH_SORTED (bit 50) and FLAG_BATCH_CONSOLIDATED (bit 51) are only
+meaningful when FLAG_HAS_DATA is set.
+
+  P1. All four WAL-block flags are distinct powers of 2 (Python cross-check)
+  P2. FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED
+      are pairwise non-overlapping (64-bit BV, UNSAT)
+  P3. If FLAG_HAS_DATA is set, FLAG_HAS_SCHEMA can always be set simultaneously
+      (SAT — proves the valid combined state exists)
+  P4. FLAG_BATCH_SORTED | FLAG_BATCH_CONSOLIDATED can be combined without
+      overlapping FLAG_HAS_DATA or FLAG_HAS_SCHEMA (64-bit BV, UNSAT)
+  P5. The four WAL-block flags all live in bits 48-51, above all low protocol
+      flags (bits 0-9): ANDing with the low-flag mask 0x3FF yields 0
+      (64-bit BV, UNSAT)
+
+5 Z3 queries + ~5 cross-checks.  Runs under PyPy2.
 Exit code 0 on success, 1 on any failure.
 """
 import subprocess
@@ -50,224 +65,162 @@ def prove(label, smt_text):
 
 # -- Constants ----------------------------------------------------------------
 
-ALIGNMENT = 64
-MASK64 = (1 << 64) - 1
+# WAL-block flags from gnitz/server/ipc.py:40-43
+FLAG_HAS_SCHEMA         = 1 << 48   # 0x0001000000000000
+FLAG_HAS_DATA           = 1 << 49   # 0x0002000000000000
+FLAG_BATCH_SORTED       = 1 << 50   # 0x0004000000000000
+FLAG_BATCH_CONSOLIDATED = 1 << 51   # 0x0008000000000000
 
-# Wire strides for common types
-STRIDE_U64 = 8
-STRIDE_I64 = 8
-STRIDE_F64 = 8
-STRIDE_U128 = 16
-STRIDE_STRING = 8  # IPC_STRING_STRIDE
-STRIDE_U32 = 4
-STRIDE_U16 = 2
-STRIDE_U8 = 1
+WAL_FLAGS = [FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED]
+
+# Low protocol flag mask: bits 0-9
+LOW_FLAG_MASK = 0x3FF
 
 # -- Main ---------------------------------------------------------------------
 
-print("=" * 56)
-print("  Z3 PROOF: IPC ZSet full column offset chain")
-print("=" * 56)
+print("=" * 60)
+print("  Z3 PROOF: IPC WAL-block message structure")
+print("=" * 60)
 sys.stdout.flush()
 
 ok = True
 
-# -- Cross-checks ------------------------------------------------------------
+# -- Cross-check P1: all WAL-block flags are distinct powers of 2 -------------
 
-report("  ... cross-checking column offset chain")
+all_pow2 = all(f > 0 and (f & (f - 1)) == 0 for f in WAL_FLAGS)
+if all_pow2:
+    report("  PASS  cross-check: all 4 WAL-block flags are powers of 2 (bits 48-51)")
+else:
+    report("  FAIL  cross-check: not all WAL-block flags are powers of 2")
+    ok = False
 
+all_distinct = (len(set(WAL_FLAGS)) == len(WAL_FLAGS))
+if all_distinct:
+    report("  PASS  cross-check: all 4 WAL-block flags are distinct")
+else:
+    report("  FAIL  cross-check: WAL-block flags have duplicates")
+    ok = False
 
-def align_up_py(val, align):
-    u_val = val & MASK64
-    u_align = align & MASK64
-    return (u_val + u_align - 1) & ~(u_align - 1)
+# -- Cross-check P2: pairwise non-overlapping ----------------------------------
 
-
-# Test schemas: list of (name, wire_stride)
-test_schemas = [
-    ("2xU64+STRING+F64", [(STRIDE_U64, False), (STRIDE_U64, False), (STRIDE_STRING, True), (STRIDE_F64, False)]),
-    ("STRING+STRING", [(STRIDE_STRING, True), (STRIDE_STRING, True)]),
-    ("U128+U8+I64", [(STRIDE_U128, False), (STRIDE_U8, False), (STRIDE_I64, False)]),
-]
-
-test_counts = [1, 8, 100, 1000]
-
-for schema_name, col_defs in test_schemas:
-    for count in test_counts:
-        # Start after 4 structural sections (pk_lo, pk_hi, weight, null)
-        struct_sz = count * 8
-        cur = 0
-        cur = align_up_py(cur + struct_sz, ALIGNMENT)
-        cur = align_up_py(cur + struct_sz, ALIGNMENT)
-        cur = align_up_py(cur + struct_sz, ALIGNMENT)
-        cur = align_up_py(cur + struct_sz, ALIGNMENT)
-
-        # Data columns
-        col_offsets = []
-        for stride, is_string in col_defs:
-            col_offsets.append(cur)
-            col_sz = count * stride
-            cur = align_up_py(cur + col_sz, ALIGNMENT)
-
-        blob_offset = cur
-
-        # Verify all column offsets are 64-aligned
-        all_aligned = all(off % ALIGNMENT == 0 for off in col_offsets)
-        # Verify blob_offset is 64-aligned
-        blob_aligned = (blob_offset % ALIGNMENT == 0)
-        # Verify non-overlapping
-        non_overlap = True
-        for i in range(len(col_offsets)):
-            stride, _ = col_defs[i]
-            col_end = col_offsets[i] + count * stride
-            if i + 1 < len(col_offsets):
-                if col_end > col_offsets[i + 1]:
-                    non_overlap = False
-        # Verify blob after all columns
-        if len(col_offsets) > 0:
-            last_stride, _ = col_defs[-1]
-            last_end = col_offsets[-1] + count * last_stride
-            blob_after = (blob_offset >= last_end)
-        else:
-            blob_after = True
-
-        if all_aligned and blob_aligned and non_overlap and blob_after:
-            report("  PASS  cross-check: %s count=%d blob_off=%d" % (
-                schema_name, count, blob_offset))
-        else:
-            report("  FAIL  cross-check: %s count=%d aligned=%s blob_aligned=%s overlap=%s after=%s" % (
-                schema_name, count, all_aligned, blob_aligned, non_overlap, blob_after))
+pairs_ok = True
+for i in range(len(WAL_FLAGS)):
+    for j in range(i + 1, len(WAL_FLAGS)):
+        if WAL_FLAGS[i] & WAL_FLAGS[j]:
+            report("  FAIL  cross-check: flags 0x%016x and 0x%016x overlap" % (
+                WAL_FLAGS[i], WAL_FLAGS[j]))
+            pairs_ok = False
             ok = False
+if pairs_ok:
+    report("  PASS  cross-check: all WAL-block flag pairs are non-overlapping")
 
-# Z3 simplify cross-check: align_up(128 + 800, 64) = 960
-smt_q = "(simplify (bvand (bvadd (bvadd (_ bv128 64) (_ bv800 64)) (_ bv63 64)) (bvnot (_ bv63 64))))"
-z3_out = run_z3(smt_q)
-expected = align_up_py(128 + 800, 64)
-if z3_out.startswith("#x"):
-    z3_val = int(z3_out[2:], 16)
-    if z3_val == expected:
-        report("  PASS  cross-check: Z3 align_up(928, 64) = %d" % expected)
-    else:
-        report("  FAIL  cross-check: Z3 align_up(928, 64) = %d expected %d" % (z3_val, expected))
-        ok = False
+# -- Cross-check P5: WAL flags live above low-flag mask -----------------------
+
+low_ok = all((f & LOW_FLAG_MASK) == 0 for f in WAL_FLAGS)
+if low_ok:
+    report("  PASS  cross-check: all WAL-block flags have zero overlap with low mask 0x%03x" %
+           LOW_FLAG_MASK)
+else:
+    report("  FAIL  cross-check: some WAL-block flag overlaps low flag bits 0-9")
+    ok = False
 
 if not ok:
-    print("=" * 56)
+    print("=" * 60)
     print("  FAILED: cross-check mismatch")
-    print("=" * 56)
+    print("=" * 60)
     sys.exit(1)
 
-# -- P1: Data column offset is ALIGNMENT-aligned (64-bit BV, UNSAT) ----------
+# -- P2: WAL-block flags are pairwise non-overlapping (64-bit BV, UNSAT) ------
 #
-# For any 64-aligned starting offset, adding any section size and aligning
-# via align_up produces a 64-aligned result.
+# All four flags are distinct single bits; prove pairwise AND == 0.
 
-report("  ... proving P1: data column offset is 64-byte aligned")
+report("  ... proving P2: WAL-block flags are pairwise non-overlapping")
 
-ok &= prove("P1: align_up(64-aligned + sz, 64) is 64-aligned", """\
+# Build all 6 pair constraints
+pair_asserts = []
+for i in range(len(WAL_FLAGS)):
+    for j in range(i + 1, len(WAL_FLAGS)):
+        pair_asserts.append(
+            "(= (bvand (_ bv%d 64) (_ bv%d 64)) (_ bv0 64))" % (WAL_FLAGS[i], WAL_FLAGS[j]))
+
+ok &= prove("P2: all WAL-block flag pairs have zero AND", """\
 (set-logic QF_BV)
-(declare-const cur (_ BitVec 64))
-(declare-const sz (_ BitVec 64))
-; cur is 64-aligned
-(assert (= (bvand cur (_ bv63 64)) (_ bv0 64)))
-; Practical bound: cur < 2^48 (wire size from count <= 2^28)
-(assert (bvule cur (_ bv281474976710656 64)))
-; sz is bounded (count <= 2^28 * max stride 16 = 2^32)
-(assert (bvule sz (_ bv268435456 64)))
-(define-fun a64 ((x (_ BitVec 64))) (_ BitVec 64)
-  (bvand (bvadd x (_ bv63 64)) (bvnot (_ bv63 64))))
-(define-fun next () (_ BitVec 64) (a64 (bvadd cur sz)))
-; Negate: next is not 64-aligned
-(assert (not (= (bvand next (_ bv63 64)) (_ bv0 64))))
+; Negate: at least one pair overlaps
+(assert (not (and
+  %s)))
 (check-sat)
-""")
+""" % "\n  ".join(pair_asserts))
 
-# -- P2: Data column sections are non-overlapping (64-bit BV, UNSAT) ----------
+# -- P3: FLAG_HAS_DATA | FLAG_HAS_SCHEMA is a valid combined state (SAT) ------
 #
-# align_up(cur + s1, 64) >= cur + s1, so section [cur, cur+s1) does not
-# overlap [align_up(cur+s1, 64), ...).
-# Bound: cur <= 2^48 (conservative: 260 sections * 2^32 max section < 2^41).
-# RPython r_uint64 wraps at 64 bits, but _compute_zset_wire_size starts from 0
-# and count <= 2^28 (matching ipc_wire.py), so total wire size << 2^48.
+# The valid state "has data and schema" exists: both bits can be set together.
+# This SAT check confirms the combined state is reachable.
 
-report("  ... proving P2: data column sections are non-overlapping")
-
-ok &= prove("P2: cur + s1 <= align_up(cur + s1, 64)", """\
+report("  ... proving P3: FLAG_HAS_DATA | FLAG_HAS_SCHEMA is a valid combined state (SAT)")
+result = run_z3("""\
 (set-logic QF_BV)
-(declare-const cur (_ BitVec 64))
-(declare-const s1 (_ BitVec 64))
-(assert (= (bvand cur (_ bv63 64)) (_ bv0 64)))
-(assert (bvugt s1 (_ bv0 64)))
-(assert (bvule s1 (_ bv268435456 64)))
-; Practical bound: cur < 2^48 (wire size cannot exceed this)
-(assert (bvule cur (_ bv281474976710656 64)))
-(define-fun a64 ((x (_ BitVec 64))) (_ BitVec 64)
-  (bvand (bvadd x (_ bv63 64)) (bvnot (_ bv63 64))))
-(define-fun next1 () (_ BitVec 64) (a64 (bvadd cur s1)))
-; Negate: section end > next section start
-(assert (not (bvule (bvadd cur s1) next1)))
+(declare-const flags (_ BitVec 64))
+; Both schema and data flags set
+(assert (= (bvand flags (_ bv%d 64)) (_ bv%d 64)))
+(assert (= (bvand flags (_ bv%d 64)) (_ bv%d 64)))
 (check-sat)
-""")
+""" % (FLAG_HAS_SCHEMA, FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_HAS_DATA))
+if result == "sat":
+    report("  PASS  P3: FLAG_HAS_DATA | FLAG_HAS_SCHEMA is reachable (SAT)")
+else:
+    report("  FAIL  P3: expected sat, got %s" % result)
+    ok = False
 
-# -- P3: Blob offset comes after all column sections (64-bit BV, UNSAT) -------
+# -- P4: FLAG_BATCH_SORTED | FLAG_BATCH_CONSOLIDATED don't overlap HAS_SCHEMA/DATA
 #
-# After N data columns, blob_offset = final aligned offset >= last_col_end.
-# Prove for 2 data columns.
+# These batch-metadata flags can coexist with any combination of
+# FLAG_HAS_SCHEMA and FLAG_HAS_DATA without bit collision.
 
-report("  ... proving P3: blob offset comes after all column sections")
+report("  ... proving P4: batch flags don't overlap schema/data flags")
 
-ok &= prove("P3: blob_offset >= last column end (2-col chain)", """\
+ok &= prove("P4: FLAG_BATCH_SORTED & FLAG_HAS_SCHEMA == 0", """\
 (set-logic QF_BV)
-(declare-const base (_ BitVec 64))
-(declare-const s1 (_ BitVec 64))
-(declare-const s2 (_ BitVec 64))
-(assert (= (bvand base (_ bv63 64)) (_ bv0 64)))
-; Practical bound: base < 2^48 (wire size from count <= 2^28)
-(assert (bvule base (_ bv281474976710656 64)))
-(assert (bvule s1 (_ bv268435456 64)))
-(assert (bvule s2 (_ bv268435456 64)))
-(define-fun a64 ((x (_ BitVec 64))) (_ BitVec 64)
-  (bvand (bvadd x (_ bv63 64)) (bvnot (_ bv63 64))))
-(define-fun col1_end () (_ BitVec 64) (bvadd base s1))
-(define-fun col2_start () (_ BitVec 64) (a64 col1_end))
-(define-fun col2_end () (_ BitVec 64) (bvadd col2_start s2))
-(define-fun blob_off () (_ BitVec 64) (a64 col2_end))
-; Negate: blob_offset < col2_end
-(assert (not (bvuge blob_off col2_end)))
+(assert (not (= (bvand (_ bv%d 64) (_ bv%d 64)) (_ bv0 64))))
 (check-sat)
-""")
+""" % (FLAG_BATCH_SORTED, FLAG_HAS_SCHEMA))
 
-# -- P4: Column size formulas are positive for count > 0 (16-bit BV, UNSAT) --
+ok &= prove("P4b: FLAG_BATCH_CONSOLIDATED & FLAG_HAS_DATA == 0", """\
+(set-logic QF_BV)
+(assert (not (= (bvand (_ bv%d 64) (_ bv%d 64)) (_ bv0 64))))
+(check-sat)
+""" % (FLAG_BATCH_CONSOLIDATED, FLAG_HAS_DATA))
+
+# -- P5: WAL-block flags (bits 48-51) don't overlap low-flag mask (bits 0-9) --
 #
-# For count > 0 and stride in {1, 2, 4, 8, 16}: count * stride > 0.
+# The low-flag mask is 0x3FF (bits 0-9). All WAL flags are >= 2^48.
+# Prove: (wal_flag & 0x3FF) == 0 for each wal_flag.
 
-report("  ... proving P4: column size > 0 when count > 0")
+report("  ... proving P5: all WAL-block flags clear the low-flag mask 0x3FF")
 
-ok &= prove("P4: count * stride > 0 for count > 0, stride in {1..16}", """\
+low_mask_asserts = " ".join(
+    "(= (bvand (_ bv%d 64) (_ bv1023 64)) (_ bv0 64))" % f
+    for f in WAL_FLAGS
+)
+ok &= prove("P5: all WAL-block flags have zero bits in positions 0-9", """\
 (set-logic QF_BV)
-(declare-const count (_ BitVec 64))
-(declare-const stride (_ BitVec 64))
-(assert (bvugt count (_ bv0 64)))
-; count <= 2^28 matching ipc_wire.py; RPython uses r_uint64(stride * count)
-(assert (bvule count (_ bv268435456 64)))
-(assert (bvugt stride (_ bv0 64)))
-(assert (bvule stride (_ bv16 64)))
-; Negate: count * stride == 0
-(assert (not (bvugt (bvmul count stride) (_ bv0 64))))
+; Negate: some WAL flag has a bit in [0, 9]
+(assert (not (and
+  %s)))
 (check-sat)
-""")
+""" % low_mask_asserts)
 
 # -- Summary ------------------------------------------------------------------
 
-print("=" * 56)
+print("=" * 60)
 if ok:
-    print("  PROVED: IPC ZSet full column offset chain")
-    print("    P1: data column offset is 64-byte aligned")
-    print("    P2: data column sections are non-overlapping")
-    print("    P3: blob offset comes after all column sections")
-    print("    P4: column size > 0 when count > 0")
+    print("  PROVED: IPC WAL-block message structure")
+    print("    P1: all 4 WAL-block flags are distinct powers of 2 (cross-check)")
+    print("    P2: WAL-block flags are pairwise non-overlapping")
+    print("    P3: FLAG_HAS_DATA | FLAG_HAS_SCHEMA is a valid combined state (SAT)")
+    print("    P4: batch flags don't overlap schema/data flags")
+    print("    P5: WAL-block flags clear the low-flag mask (bits 0-9)")
 else:
     print("  FAILED: see above")
-print("=" * 56)
+print("=" * 60)
 
 sys.exit(0 if ok else 1)

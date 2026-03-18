@@ -70,10 +70,10 @@ class MasterDispatcher(object):
             poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
             poll_wids.append(w)
 
-        exchange_buffers = {}   # view_id -> [batch_per_worker]
-        exchange_counts = {}    # view_id -> int
-        exchange_schemas = {}   # view_id -> schema
-        exchange_source_ids = {}  # view_id -> source_id (for join exchange)
+        exchange_payloads = {}   # view_id -> [IPCPayload | None] * num_workers
+        exchange_counts = {}     # view_id -> int
+        exchange_schemas = {}    # view_id -> schema
+        exchange_source_ids = {} # view_id -> source_id (for join exchange)
 
         while len(poll_fds) > 0:
             revents = ipc_ffi.poll(poll_fds, poll_events, 10)
@@ -85,28 +85,28 @@ class MasterDispatcher(object):
                     if payload.flags & ipc.FLAG_EXCHANGE:
                         vid = intmask(payload.target_id)
                         ex_source_id = intmask(payload.seek_pk_lo)
-                        if vid not in exchange_buffers:
-                            exchange_buffers[vid] = [None] * self.num_workers
+                        if vid not in exchange_payloads:
+                            exchange_payloads[vid] = [None] * self.num_workers
                             exchange_counts[vid] = 0
-                        if payload.batch is not None and payload.batch.length() > 0:
-                            exchange_buffers[vid][w] = payload.batch.clone()
+                        exchange_payloads[vid][w] = payload          # store; do NOT close
                         if payload.schema is not None:
                             exchange_schemas[vid] = payload.schema
                         if ex_source_id > 0:
                             exchange_source_ids[vid] = ex_source_id
                         exchange_counts[vid] += 1
-                        payload.close()
+                        # payload.close() is deferred to _relay_exchange
 
                         if exchange_counts[vid] == self.num_workers:
                             ex_schema = exchange_schemas.get(vid, schema)
                             src_id = exchange_source_ids.get(vid, 0)
-                            self._relay_exchange(vid, exchange_buffers[vid], ex_schema, src_id)
-                            del exchange_buffers[vid]
+                            self._relay_exchange(vid, exchange_payloads[vid], ex_schema, src_id)
+                            del exchange_payloads[vid]
                             del exchange_counts[vid]
                             if vid in exchange_schemas:
                                 del exchange_schemas[vid]
                             if vid in exchange_source_ids:
                                 del exchange_source_ids[vid]
+                            # payloads closed inside _relay_exchange
                     else:
                         # Normal ACK — swap-remove this worker from the poll set
                         if payload.status != 0:
@@ -131,19 +131,22 @@ class MasterDispatcher(object):
             + " rows=" + str(n)
         )
 
-    def _relay_exchange(self, view_id, worker_batches, schema, source_id=0):
-        """Repartition collected exchange batches and send to workers."""
-        # Determine shard columns: join-specific first, then circuit-level
+    def _relay_exchange(self, view_id, payloads, schema, source_id=0):
+        """Repartition collected exchange payloads and relay to workers."""
         shard_cols = []
         if source_id > 0:
             shard_cols = self.program_cache.get_join_shard_cols(view_id, source_id)
         if len(shard_cols) == 0:
             shard_cols = self.program_cache.get_shard_cols(view_id)
-        dest_batches = relay_scatter(worker_batches, shard_cols, self.num_workers, self.assignment)
-        for w in range(self.num_workers):
-            if worker_batches[w] is not None:
-                worker_batches[w].free()
-
+        sources = [None] * self.num_workers
+        for i in range(len(payloads)):
+            p = payloads[i]
+            if p is not None:
+                sources[i] = p.batch
+        dest_batches = relay_scatter(sources, shard_cols, self.num_workers, self.assignment)
+        for p in payloads:
+            if p is not None:
+                p.close()
         for w in range(self.num_workers):
             ipc.send_batch(
                 self.worker_fds[w], view_id, dest_batches[w],

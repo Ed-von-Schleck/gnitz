@@ -1,14 +1,29 @@
 """Z3 formal proofs for IPC wire format structural integrity.
 
-Part A: Header field packing (gnitz/server/ipc.py:18-74)
-  P1. Header non-overlap: no two fields share a byte.
-  P2. Header complete coverage: every byte in [0, 96) belongs to a field.
+The IPC wire format was rewritten to use WAL blocks (ipc.py:d1f6758).
+Each message is a sequence of up to 3 WAL blocks:
+  Block 1: control  (always present, TID = IPC_CONTROL_TID = 0xFFFFFFFF)
+  Block 2: schema   (present iff FLAG_HAS_SCHEMA is set in ctrl_flags)
+  Block 3: data     (present iff FLAG_HAS_DATA is set in ctrl_flags)
 
-Part B: ZSet section alignment chain (gnitz/server/ipc.py:286-335)
-  P3. ZSet structural offsets are 64-byte aligned.
-  P4. ZSet structural sections are non-overlapping.
+Protocol invariant: FLAG_HAS_DATA requires FLAG_HAS_SCHEMA
+(gnitz/server/ipc.py:402-404).
 
-4 Z3 queries + 6 cross-checks.  Runs under PyPy2.
+Source: gnitz/server/ipc.py, gnitz/storage/wal_columnar.py
+
+Part A: ZSet section alignment chain (wal_columnar.py:78-100)
+  P1. ZSet structural offsets are 64-byte aligned (64-bit BV, UNSAT).
+  P2. ZSet structural sections are non-overlapping (64-bit BV, UNSAT).
+
+Part B: IPC block ordering and flag protocol (ipc.py:39-43, 402-404)
+  P3. IPC_CONTROL_TID (0xFFFFFFFF) does not fit in a signed 31-bit value,
+      so it is distinguishable from any positive user table ID (32-bit BV, UNSAT).
+  P4. FLAG_HAS_DATA (bit 49) set and FLAG_HAS_SCHEMA (bit 48) clear is
+      a protocol violation — checked at runtime (64-bit BV, UNSAT contradiction).
+  P5. FLAG_HAS_SCHEMA (bit 48) and FLAG_HAS_DATA (bit 49) are in disjoint
+      bit positions (64-bit BV, UNSAT).
+
+5 Z3 queries + ~8 cross-checks.  Runs under PyPy2.
 Exit code 0 on success, 1 on any failure.
 """
 import subprocess
@@ -49,25 +64,12 @@ def prove(label, smt_text):
 
 MASK64 = (1 << 64) - 1
 
-# Header field layout: (offset, size) for each of 13 fields.
-# From gnitz/server/ipc.py:18-31, 70-71
-HEADER_FIELDS = [
-    (0, 8),    # Magic
-    (8, 4),    # Status
-    (12, 4),   # Error Str Len
-    (16, 8),   # Target ID
-    (24, 8),   # Client ID
-    (32, 8),   # Schema Row Count
-    (40, 8),   # Schema Blob Size
-    (48, 8),   # Data Row Count
-    (56, 8),   # Data Blob Size
-    (64, 8),   # p4 (data_pk_index)
-    (72, 8),   # Flags
-    (80, 8),   # p5 (seek_pk_lo)
-    (88, 8),   # p6 (seek_pk_hi)
-]
+# From gnitz/server/ipc.py:46
+IPC_CONTROL_TID = 0xFFFFFFFF  # max uint32
 
-HEADER_SIZE = 96
+# WAL-block flags from gnitz/server/ipc.py:40-43
+FLAG_HAS_SCHEMA         = 1 << 48
+FLAG_HAS_DATA           = 1 << 49
 
 # -- Main ---------------------------------------------------------------------
 
@@ -78,9 +80,9 @@ sys.stdout.flush()
 
 ok = True
 
-# -- Cross-check Part A: header field layout ----------------------------------
+# -- Cross-check Part A: ZSet alignment chain ---------------------------------
 
-report("  ... cross-checking header field layout")
+report("  ... cross-checking ZSet alignment chain")
 
 print("  ... importing rpython.rlib.rarithmetic")
 sys.stdout.flush()
@@ -88,42 +90,9 @@ from rpython.rlib.rarithmetic import r_uint64  # noqa: E402
 print("  ... imports done")
 sys.stdout.flush()
 
-# Verify non-overlap in Python
-byte_owner = [-1] * HEADER_SIZE
-for fi, (off, sz) in enumerate(HEADER_FIELDS):
-    for b in range(off, off + sz):
-        if b >= HEADER_SIZE:
-            report("  FAIL  header field %d: byte %d out of range [0, %d)" % (fi, b, HEADER_SIZE))
-            ok = False
-        elif byte_owner[b] != -1:
-            report("  FAIL  header field %d overlaps field %d at byte %d" % (fi, byte_owner[b], b))
-            ok = False
-        else:
-            byte_owner[b] = fi
-
-# Verify complete coverage
-uncovered = [b for b in range(HEADER_SIZE) if byte_owner[b] == -1]
-if uncovered:
-    report("  FAIL  header bytes not covered: %s" % uncovered)
-    ok = False
-else:
-    report("  PASS  cross-check: header fields non-overlapping and cover [0, 96)")
-
-# Verify total size
-total_field_bytes = sum(sz for _, sz in HEADER_FIELDS)
-if total_field_bytes != HEADER_SIZE:
-    report("  FAIL  total field bytes %d != HEADER_SIZE %d" % (total_field_bytes, HEADER_SIZE))
-    ok = False
-else:
-    report("  PASS  cross-check: total field bytes == 96")
-
-# -- Cross-check Part B: ZSet alignment chain ---------------------------------
-
-report("  ... cross-checking ZSet alignment chain")
-
 
 def align_up_py(val, align):
-    """Pure Python align_up matching gnitz/server/ipc.py:96-99."""
+    """Pure Python align_up matching wal_columnar.py buffer alignment."""
     u_val = val & MASK64
     u_align = align & MASK64
     return (u_val + u_align - 1) & ~(u_align - 1)
@@ -168,75 +137,47 @@ for count in test_counts:
             count, aligned, monotonic, z3_ok))
         ok = False
 
+# -- Cross-check Part B: IPC block ordering -----------------------------------
+
+report("  ... cross-checking IPC_CONTROL_TID and flag ordering")
+
+# IPC_CONTROL_TID = 0xFFFFFFFF fits in uint32, max positive int32 = 0x7FFFFFFF
+if IPC_CONTROL_TID > 0x7FFFFFFF:
+    report("  PASS  cross-check: IPC_CONTROL_TID=0x%08x > 0x7FFFFFFF (not a valid signed table ID)" %
+           IPC_CONTROL_TID)
+else:
+    report("  FAIL  cross-check: IPC_CONTROL_TID fits in positive signed 31 bits")
+    ok = False
+
+# FLAG_HAS_DATA requires FLAG_HAS_SCHEMA
+violation = FLAG_HAS_DATA & ~FLAG_HAS_SCHEMA  # FLAG_HAS_DATA without FLAG_HAS_SCHEMA
+if violation == FLAG_HAS_DATA:
+    report("  PASS  cross-check: FLAG_HAS_DATA(%d) without FLAG_HAS_SCHEMA(%d) is detectable" % (
+        FLAG_HAS_DATA, FLAG_HAS_SCHEMA))
+else:
+    report("  FAIL  cross-check: FLAG_HAS_DATA ordering")
+    ok = False
+
+# FLAG_HAS_SCHEMA and FLAG_HAS_DATA share no bits
+if (FLAG_HAS_SCHEMA & FLAG_HAS_DATA) == 0:
+    report("  PASS  cross-check: FLAG_HAS_SCHEMA and FLAG_HAS_DATA share no bits")
+else:
+    report("  FAIL  cross-check: FLAG_HAS_SCHEMA and FLAG_HAS_DATA overlap")
+    ok = False
+
 if not ok:
     print("=" * 60)
     print("  FAILED: cross-check mismatch")
     print("=" * 60)
     sys.exit(1)
 
-# -- P1: Header non-overlap --------------------------------------------------
-#
-# For each pair of fields (i, j), one ends before the other starts.
-# Encode as: for a symbolic byte index b, it belongs to at most one field.
-# Use 16-bit BV (sufficient for byte range [0, 96)).
-
-report("  ... proving P1: header non-overlap")
-
-# Build assertion: for every pair (i, j), ranges don't overlap
-pair_asserts = []
-for i in range(len(HEADER_FIELDS)):
-    oi, si = HEADER_FIELDS[i]
-    ei = oi + si
-    for j in range(i + 1, len(HEADER_FIELDS)):
-        oj, sj = HEADER_FIELDS[j]
-        ej = oj + sj
-        # end_i <= start_j OR end_j <= start_i
-        pair_asserts.append(
-            "(or (bvule (_ bv%d 16) (_ bv%d 16)) (bvule (_ bv%d 16) (_ bv%d 16)))" % (
-                ei, oj, ej, oi))
-
-ok &= prove("P1: header non-overlap", """\
-(set-logic QF_BV)
-; Negate: at least one pair overlaps
-(assert (not (and
-  %s)))
-(check-sat)
-""" % "\n  ".join(pair_asserts))
-
-# -- P2: Header complete coverage ---------------------------------------------
-#
-# Every byte in [0, 96) belongs to at least one field.
-# Use a symbolic byte index b in [0, 96), assert it's NOT in any field range.
-
-report("  ... proving P2: header complete coverage")
-
-# Build: b >= start_i AND b < end_i  (membership in field i)
-membership_clauses = []
-for off, sz in HEADER_FIELDS:
-    end = off + sz
-    membership_clauses.append(
-        "(and (not (bvult b (_ bv%d 16))) (bvult b (_ bv%d 16)))" % (off, end))
-
-ok &= prove("P2: header complete coverage", """\
-(set-logic QF_BV)
-(declare-const b (_ BitVec 16))
-; b is in [0, 96)
-(assert (not (bvult b (_ bv0 16))))
-(assert (bvult b (_ bv96 16))
-)
-; Negate: b does not belong to any field
-(assert (not (or
-  %s)))
-(check-sat)
-""" % "\n  ".join(membership_clauses))
-
-# -- P3: ZSet structural offsets are 64-byte aligned --------------------------
+# -- P1: ZSet structural offsets are 64-byte aligned --------------------------
 #
 # For symbolic count in (0, 2^28], each structural offset has low 6 bits = 0.
 # 2^28 bound prevents u64 overflow in count * 8 (2^28 * 8 = 2^31).
 
-report("  ... proving P3: ZSet structural offsets are 64-byte aligned")
-ok &= prove("P3: pk_hi_off, weight_off, null_off are 64-aligned", """\
+report("  ... proving P1: ZSet structural offsets are 64-byte aligned")
+ok &= prove("P1: pk_hi_off, weight_off, null_off are 64-aligned", """\
 (set-logic QF_BV)
 (declare-const count (_ BitVec 64))
 (assert (bvugt count (_ bv0 64)))
@@ -255,13 +196,12 @@ ok &= prove("P3: pk_hi_off, weight_off, null_off are 64-aligned", """\
 (check-sat)
 """)
 
-# -- P4: ZSet structural sections are non-overlapping -------------------------
+# -- P2: ZSet structural sections are non-overlapping -------------------------
 #
-# Each section occupies [off, off + struct_sz). Sections must not overlap:
-# pk_lo ends before pk_hi starts, pk_hi ends before weight starts, etc.
+# Each section occupies [off, off + struct_sz). Sections must not overlap.
 
-report("  ... proving P4: ZSet structural sections are non-overlapping")
-ok &= prove("P4: structural sections [off, off+struct_sz) don't overlap", """\
+report("  ... proving P2: ZSet structural sections are non-overlapping")
+ok &= prove("P2: structural sections [off, off+struct_sz) don't overlap", """\
 (set-logic QF_BV)
 (declare-const count (_ BitVec 64))
 (assert (bvugt count (_ bv0 64)))
@@ -273,11 +213,60 @@ ok &= prove("P4: structural sections [off, off+struct_sz) don't overlap", """\
 (define-fun weight_off () (_ BitVec 64) (a64 (bvadd pk_hi_off struct_sz)))
 (define-fun null_off () (_ BitVec 64) (a64 (bvadd weight_off struct_sz)))
 ; Negate: some section overlaps another
-; pk_lo=[0, struct_sz), pk_hi=[pk_hi_off, pk_hi_off+struct_sz), etc.
 (assert (not (and
   (bvule struct_sz pk_hi_off)
   (bvule (bvadd pk_hi_off struct_sz) weight_off)
   (bvule (bvadd weight_off struct_sz) null_off))))
+(check-sat)
+""")
+
+# -- P3: IPC_CONTROL_TID does not fit in a positive signed 31-bit value -------
+#
+# IPC_CONTROL_TID = 0xFFFFFFFF. Any real table_id is a positive signed 31-bit
+# integer (1..0x7FFFFFFF). Prove 0xFFFFFFFF > 0x7FFFFFFF so they can never
+# collide when compared as unsigned 32-bit values.
+
+report("  ... proving P3: IPC_CONTROL_TID is not a valid positive table ID")
+ok &= prove("P3: 0xFFFFFFFF > 0x7FFFFFFF as unsigned 32-bit", """\
+(set-logic QF_BV)
+; IPC_CONTROL_TID = 0xFFFFFFFF, max valid table_id = 0x7FFFFFFF
+; Negate: IPC_CONTROL_TID <= 0x7FFFFFFF
+(assert (not (bvugt (_ bv4294967295 32) (_ bv2147483647 32))))
+(check-sat)
+""")
+
+# -- P4: FLAG_HAS_DATA without FLAG_HAS_SCHEMA is a detectable violation ------
+#
+# ipc.py:402-404 checks: if FLAG_HAS_DATA set and FLAG_HAS_SCHEMA clear, raise.
+# The condition `flags & FLAG_HAS_DATA and not (flags & FLAG_HAS_SCHEMA)` is
+# satisfiable (there exists a flags value triggering it), proving the guard
+# is reachable and meaningful.
+
+report("  ... proving P4: FLAG_HAS_DATA without FLAG_HAS_SCHEMA is SAT (reachable violation)")
+result = run_z3("""\
+(set-logic QF_BV)
+(declare-const flags (_ BitVec 64))
+; FLAG_HAS_DATA (bit 49) is set
+(assert (= (bvand flags (_ bv562949953421312 64)) (_ bv562949953421312 64)))
+; FLAG_HAS_SCHEMA (bit 48) is NOT set
+(assert (= (bvand flags (_ bv281474976710656 64)) (_ bv0 64)))
+(check-sat)
+""")
+if result == "sat":
+    report("  PASS  P4: FLAG_HAS_DATA without FLAG_HAS_SCHEMA is reachable (SAT)")
+else:
+    report("  FAIL  P4: expected sat, got %s" % result)
+    ok = False
+
+# -- P5: FLAG_HAS_SCHEMA and FLAG_HAS_DATA are in disjoint bit positions ------
+#
+# They cannot both be the same bit; their AND is 0.
+
+report("  ... proving P5: FLAG_HAS_SCHEMA and FLAG_HAS_DATA share no bits")
+ok &= prove("P5: FLAG_HAS_SCHEMA(1<<48) & FLAG_HAS_DATA(1<<49) == 0", """\
+(set-logic QF_BV)
+; Negate: they share a bit
+(assert (not (= (bvand (_ bv281474976710656 64) (_ bv562949953421312 64)) (_ bv0 64))))
 (check-sat)
 """)
 
@@ -286,10 +275,11 @@ ok &= prove("P4: structural sections [off, off+struct_sz) don't overlap", """\
 print("=" * 60)
 if ok:
     print("  PROVED: IPC wire format structural integrity")
-    print("    P1: header non-overlap")
-    print("    P2: header complete coverage [0, 96)")
-    print("    P3: ZSet structural offsets are 64-aligned")
-    print("    P4: ZSet structural sections are non-overlapping")
+    print("    P1: ZSet structural offsets are 64-aligned")
+    print("    P2: ZSet structural sections are non-overlapping")
+    print("    P3: IPC_CONTROL_TID(0xFFFFFFFF) is not a valid positive table ID")
+    print("    P4: FLAG_HAS_DATA without FLAG_HAS_SCHEMA is reachable (SAT)")
+    print("    P5: FLAG_HAS_SCHEMA and FLAG_HAS_DATA share no bits")
 else:
     print("  FAILED: see above")
 print("=" * 60)

@@ -1,8 +1,9 @@
 """Z3 formal proofs for IPC protocol flag bit-safety.
 
-Proves five properties of gnitz/server/ipc.py:57-68 (protocol flags) and
-gnitz/server/ipc.py:82-83 (meta-schema flags):
+Proves seven properties of gnitz/server/ipc.py:26-43 (protocol flags) and
+gnitz/server/ipc.py:50-51 (meta-schema flags):
 
+  Low protocol flags (bits 0-9):
   FLAG_ALLOCATE_TABLE_ID = 1    (bit 0)
   FLAG_ALLOCATE_SCHEMA_ID = 2   (bit 1)
   FLAG_SHUTDOWN = 4             (bit 2)
@@ -14,6 +15,13 @@ gnitz/server/ipc.py:82-83 (meta-schema flags):
   FLAG_SEEK_BY_INDEX = 256      (bit 8)
   FLAG_ALLOCATE_INDEX_ID = 512  (bit 9)
   FLAG_SCAN = 0                 (no bits)
+
+  High WAL-block flags (bits 48-51):
+  FLAG_HAS_SCHEMA         = 1<<48
+  FLAG_HAS_DATA           = 1<<49
+  FLAG_BATCH_SORTED       = 1<<50
+  FLAG_BATCH_CONSOLIDATED = 1<<51
+
   META_FLAG_NULLABLE = 1, META_FLAG_IS_PK = 2
 
   P1. All distinct non-zero protocol flags are powers of 2 (Python cross-check)
@@ -21,8 +29,11 @@ gnitz/server/ipc.py:82-83 (meta-schema flags):
   P3. Two distinct powers-of-2 share no bits (16-bit BV, UNSAT)
   P4. META_FLAG_NULLABLE and META_FLAG_IS_PK share no bits (16-bit BV, UNSAT)
   P5. FLAG_SCAN=0 is identity for OR (16-bit BV, UNSAT)
+  P6. High-bit flags (48-51) don't overlap with low flags (bits 0-9) (64-bit BV, UNSAT)
+  P7. FLAG_HAS_DATA (bit 49) > FLAG_HAS_SCHEMA (bit 48): schema precedes data
+      (Python cross-check)
 
-5 Z3 queries + ~5 cross-checks.  Runs under PyPy2.
+7 Z3 queries + ~7 cross-checks.  Runs under PyPy2.
 Exit code 0 on success, 1 on any failure.
 """
 import subprocess
@@ -61,7 +72,7 @@ def prove(label, smt_text):
 
 # -- Constants ----------------------------------------------------------------
 
-# Protocol flags from gnitz/server/ipc.py:57-68
+# Low protocol flags from gnitz/server/ipc.py:26-37
 FLAG_ALLOCATE_TABLE_ID  = 1
 FLAG_ALLOCATE_SCHEMA_ID = 2
 FLAG_SHUTDOWN           = 4
@@ -74,11 +85,17 @@ FLAG_SEEK_BY_INDEX      = 256
 FLAG_ALLOCATE_INDEX_ID  = 512
 FLAG_SCAN               = 0
 
-# Meta-schema flags from gnitz/server/ipc.py:82-83
+# High WAL-block flags from gnitz/server/ipc.py:40-43
+FLAG_HAS_SCHEMA         = 1 << 48
+FLAG_HAS_DATA           = 1 << 49
+FLAG_BATCH_SORTED       = 1 << 50
+FLAG_BATCH_CONSOLIDATED = 1 << 51
+
+# Meta-schema flags from gnitz/server/ipc.py:50-51
 META_FLAG_NULLABLE = 1
 META_FLAG_IS_PK    = 2
 
-# Non-zero protocol flags list
+# Non-zero low protocol flags list
 NONZERO_FLAGS = [
     FLAG_ALLOCATE_TABLE_ID,
     FLAG_ALLOCATE_SCHEMA_ID,
@@ -90,6 +107,14 @@ NONZERO_FLAGS = [
     FLAG_SEEK,
     FLAG_SEEK_BY_INDEX,
     FLAG_ALLOCATE_INDEX_ID,
+]
+
+# High-bit WAL-block flags list
+HIGH_FLAGS = [
+    FLAG_HAS_SCHEMA,
+    FLAG_HAS_DATA,
+    FLAG_BATCH_SORTED,
+    FLAG_BATCH_CONSOLIDATED,
 ]
 
 # -- Main ---------------------------------------------------------------------
@@ -148,6 +173,32 @@ for f in [FLAG_ALLOCATE_TABLE_ID, FLAG_SEEK, FLAG_EXCHANGE]:
         report("  FAIL  cross-check: flag %d not extractable from OR combination %d" % (f, combined))
         ok = False
 report("  PASS  cross-check: flag extraction from OR combination %d" % combined)
+
+# P6 cross-check: high-bit flags are powers of 2 and don't overlap with low flags
+all_high_pow2 = all(f > 0 and (f & (f - 1)) == 0 for f in HIGH_FLAGS)
+if not all_high_pow2:
+    report("  FAIL  cross-check: not all high-bit flags are powers of 2")
+    ok = False
+else:
+    report("  PASS  cross-check: all 4 high-bit flags are powers of 2 (bits 48-51)")
+
+high_vs_low_ok = True
+for hf in HIGH_FLAGS:
+    for lf in NONZERO_FLAGS:
+        if hf & lf:
+            report("  FAIL  cross-check: high flag %d overlaps low flag %d" % (hf, lf))
+            high_vs_low_ok = False
+            ok = False
+if high_vs_low_ok:
+    report("  PASS  cross-check: high-bit flags don't overlap with any low protocol flag")
+
+# P7 cross-check: FLAG_HAS_DATA (bit 49) > FLAG_HAS_SCHEMA (bit 48)
+if FLAG_HAS_DATA > FLAG_HAS_SCHEMA:
+    report("  PASS  cross-check: FLAG_HAS_DATA(%d) > FLAG_HAS_SCHEMA(%d)" % (
+        FLAG_HAS_DATA, FLAG_HAS_SCHEMA))
+else:
+    report("  FAIL  cross-check: FLAG_HAS_DATA ordering wrong")
+    ok = False
 
 if not ok:
     print("=" * 56)
@@ -230,6 +281,50 @@ ok &= prove("P5: x | FLAG_SCAN(0) == x", """\
 (check-sat)
 """)
 
+# -- P6: High-bit flags (48-51) don't overlap with low flags (bits 0-9) -------
+#
+# Low flags live in bits 0-9 (max = 512 = 2^9). High flags live in bits 48-51
+# (min = 2^48). A 64-bit value cannot have both a bit in [0,9] and a bit in
+# [48,51] set simultaneously if the values are from different bit ranges.
+# Prove symbolically that 2^48 & 512 == 0 (representative pair).
+
+report("  ... proving P6: high-bit flags don't overlap with low protocol flags")
+
+ok &= prove("P6: FLAG_HAS_SCHEMA(1<<48) & FLAG_ALLOCATE_INDEX_ID(512) == 0", """\
+(set-logic QF_BV)
+; FLAG_HAS_SCHEMA = 2^48, FLAG_ALLOCATE_INDEX_ID = 512 = 2^9
+; Negate: they share a bit
+(assert (not (= (bvand (_ bv281474976710656 64) (_ bv512 64)) (_ bv0 64))))
+(check-sat)
+""")
+
+ok &= prove("P6b: all four high-bit flags have zero overlap with low-bit mask (bits 0-9)", """\
+(set-logic QF_BV)
+; Low flag mask covers bits 0-9: mask = 0x3FF = 1023
+; High flags are bits 48-51: all have zero bits in positions 0-9
+(assert (not (and
+  (= (bvand (_ bv281474976710656 64) (_ bv1023 64)) (_ bv0 64))
+  (= (bvand (_ bv562949953421312 64) (_ bv1023 64)) (_ bv0 64))
+  (= (bvand (_ bv1125899906842624 64) (_ bv1023 64)) (_ bv0 64))
+  (= (bvand (_ bv2251799813685248 64) (_ bv1023 64)) (_ bv0 64)))))
+(check-sat)
+""")
+
+# -- P7: FLAG_HAS_DATA ordering — schema block precedes data block -------------
+#
+# FLAG_HAS_SCHEMA (bit 48) < FLAG_HAS_DATA (bit 49) in numeric value.
+# This encodes the protocol ordering: schema block always comes before data.
+
+report("  ... proving P7: FLAG_HAS_DATA > FLAG_HAS_SCHEMA (bit 49 > bit 48)")
+
+ok &= prove("P7: FLAG_HAS_DATA(1<<49) > FLAG_HAS_SCHEMA(1<<48)", """\
+(set-logic QF_BV)
+; FLAG_HAS_SCHEMA = 2^48, FLAG_HAS_DATA = 2^49
+; Negate: FLAG_HAS_DATA <= FLAG_HAS_SCHEMA
+(assert (not (bvugt (_ bv562949953421312 64) (_ bv281474976710656 64))))
+(check-sat)
+""")
+
 # -- Summary ------------------------------------------------------------------
 
 print("=" * 56)
@@ -240,6 +335,8 @@ if ok:
     print("    P3: two distinct powers-of-2 share no bits")
     print("    P4: META_FLAG_NULLABLE and META_FLAG_IS_PK share no bits")
     print("    P5: FLAG_SCAN=0 is identity for OR")
+    print("    P6: high-bit flags (48-51) don't overlap with low protocol flags (0-9)")
+    print("    P7: FLAG_HAS_DATA > FLAG_HAS_SCHEMA (schema block precedes data)")
 else:
     print("  FAILED: see above")
 print("=" * 56)

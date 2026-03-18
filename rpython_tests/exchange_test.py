@@ -23,7 +23,10 @@ from gnitz.catalog import engine
 from gnitz.catalog.registry import ingest_to_family
 from gnitz.catalog.metadata import ensure_dir
 from gnitz.core import opcodes
-from gnitz.dbsp.ops.exchange import hash_row_by_columns, repartition_batch, PartitionAssignment
+from gnitz.dbsp.ops.exchange import (
+    hash_row_by_columns, repartition_batch, repartition_batches,
+    repartition_batches_merged, PartitionAssignment,
+)
 from gnitz.storage.partitioned_table import _partition_for_key
 from gnitz.server import ipc, ipc_ffi
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
@@ -588,6 +591,115 @@ def test_repartition_does_not_propagate_consolidated():
     log("  PASSED")
 
 
+def test_repartition_batches():
+    """repartition_batches: sequential fallback, output NOT consolidated."""
+    log("[EXCHANGE] Testing repartition_batches (fallback)...")
+    schema = _make_simple_schema()
+    assignment = PartitionAssignment(4)
+
+    # 4 non-consolidated source batches, 8 rows each (PKs 1-8, 9-16, 17-24, 25-32)
+    batches = [None] * 4
+    for b_idx in range(4):
+        sb = ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, sb)
+        for i in range(8):
+            pk = b_idx * 8 + i + 1
+            _add_int_row(rb, pk, [pk * 10])
+        batches[b_idx] = sb
+
+    dest = repartition_batches(batches, [schema.pk_index], 4, assignment)
+
+    # Total rows == 32
+    total = 0
+    for w in range(4):
+        if dest[w] is not None:
+            total += dest[w].length()
+    assert_equal_i(32, total, "repartition_batches total row count")
+
+    # No dest batch should be consolidated
+    for w in range(4):
+        if dest[w] is not None:
+            assert_true(not dest[w]._consolidated,
+                        "repartition_batches: dest[" + str(w) + "] must not be consolidated")
+
+    # Each row in dest[w] must hash to w
+    for w in range(4):
+        if dest[w] is not None:
+            for j in range(dest[w].length()):
+                p = _partition_for_key(dest[w]._read_pk_lo(j), dest[w]._read_pk_hi(j))
+                expected_w = assignment.worker_for_partition(p)
+                assert_equal_i(expected_w, w,
+                               "repartition_batches: row in dest[" + str(w) + "] routes to wrong worker")
+
+    for b_idx in range(4):
+        batches[b_idx].free()
+    for w in range(4):
+        if dest[w] is not None:
+            dest[w].free()
+    log("  PASSED")
+
+
+def test_repartition_batches_merged():
+    """repartition_batches_merged: k-way merge, output consolidated and PK-sorted."""
+    log("[EXCHANGE] Testing repartition_batches_merged (k-way merge)...")
+    schema = _make_simple_schema()
+    assignment = PartitionAssignment(4)
+
+    # 4 consolidated source batches, 8 rows each (PKs 1-8, 9-16, 17-24, 25-32)
+    batches = [None] * 4
+    for b_idx in range(4):
+        sb = ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, sb)
+        for i in range(8):
+            pk = b_idx * 8 + i + 1
+            _add_int_row(rb, pk, [pk * 10])
+        sb.mark_consolidated(True)
+        batches[b_idx] = sb
+
+    dest = repartition_batches_merged(batches, [schema.pk_index], 4, assignment)
+
+    # Total rows == 32
+    total = 0
+    for w in range(4):
+        if dest[w] is not None:
+            total += dest[w].length()
+    assert_equal_i(32, total, "repartition_batches_merged total row count")
+
+    # Every non-None dest batch must be consolidated
+    for w in range(4):
+        if dest[w] is not None:
+            assert_true(dest[w]._consolidated,
+                        "repartition_batches_merged: dest[" + str(w) + "] must be consolidated")
+
+    # Within each non-None dest batch, PKs must be strictly increasing
+    for w in range(4):
+        if dest[w] is not None and dest[w].length() > 1:
+            for j in range(dest[w].length() - 1):
+                cur_hi = dest[w]._read_pk_hi(j)
+                nxt_hi = dest[w]._read_pk_hi(j + 1)
+                cur_lo = dest[w]._read_pk_lo(j)
+                nxt_lo = dest[w]._read_pk_lo(j + 1)
+                strictly_less = cur_hi < nxt_hi or (cur_hi == nxt_hi and cur_lo < nxt_lo)
+                assert_true(strictly_less,
+                            "repartition_batches_merged: PKs not strictly increasing in dest[" + str(w) + "]")
+
+    # Each row in dest[w] must hash to w
+    for w in range(4):
+        if dest[w] is not None:
+            for j in range(dest[w].length()):
+                p = _partition_for_key(dest[w]._read_pk_lo(j), dest[w]._read_pk_hi(j))
+                expected_w = assignment.worker_for_partition(p)
+                assert_equal_i(expected_w, w,
+                               "repartition_batches_merged: row in dest[" + str(w) + "] routes to wrong worker")
+
+    for b_idx in range(4):
+        batches[b_idx].free()
+    for w in range(4):
+        if dest[w] is not None:
+            dest[w].free()
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -624,6 +736,9 @@ def entry_point(argv):
         test_batch_consolidated_flag_roundtrip()
         test_batch_no_flags_roundtrip()
         test_repartition_does_not_propagate_consolidated()
+
+        test_repartition_batches()
+        test_repartition_batches_merged()
 
         log("\nALL EXCHANGE TESTS PASSED")
     except Exception as e:

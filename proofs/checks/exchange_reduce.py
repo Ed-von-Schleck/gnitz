@@ -8,13 +8,13 @@ _partition_for_key.  These must agree.
 
 Properties:
   P1. U64/I64 fast-path: promote-and-split identity
-      exchange: _partition_for_key(val, 0)
-      reduce:   r_uint128(val) -> split -> _partition_for_key(val, 0)
+      exchange: _extract_group_key -> r_uint128(val) -> split -> _partition_for_key(val, 0)
+      reduce:   _extract_group_key -> r_uint128(val) as output PK -> _partition_for_key(val, 0)
 
   P2. General-path: u128 assembly/split roundtrip
-      reduce:   key = (zext(h_hi) << 64) | zext(h)
-      split:    extract[63:0](key) == h, extract[127:64](key) == h_hi
-      exchange: _partition_for_key(h, h_hi) directly
+      _extract_group_key: key = (zext(h_hi) << 64) | zext(h)
+      exchange: split -> (r_uint64(key), r_uint64(key>>64)) == (h, h_hi)
+      reduce:   output PK split as (pk_lo, pk_hi) == (h, h_hi)
 
   P3. _partition_for_key output bounds
       result = h & 0xFF  =>  result < 256
@@ -35,10 +35,10 @@ Known inconsistencies (latent bugs, not currently triggered):
   for when support expands.
 
 Source:
-  - gnitz/dbsp/ops/exchange.py:48-50 (U64/I64 fast-path)
-  - gnitz/dbsp/ops/exchange.py:54-59 (general path)
-  - gnitz/dbsp/ops/reduce.py:288-292 (U64/I64 fast-path)
-  - gnitz/dbsp/ops/reduce.py:296-319 (general path)
+  - gnitz/dbsp/ops/exchange.py:61-63 (PK fast-path)
+  - gnitz/dbsp/ops/exchange.py:64-67 (general path, via _extract_group_key)
+  - gnitz/dbsp/ops/reduce.py:403-404 (group_by_pk fast-path)
+  - gnitz/dbsp/ops/reduce.py:405-406 (general path, via _extract_group_key)
   - gnitz/storage/partitioned_table.py:60-63 (_partition_for_key)
 
 3 Z3 queries + ~13 cross-checks.  Runs under PyPy2.

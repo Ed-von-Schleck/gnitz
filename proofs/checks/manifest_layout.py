@@ -1,23 +1,27 @@
 """Z3 formal proofs for manifest entry/header field layout integrity.
 
-Proves five properties of gnitz/storage/manifest.py:14-92:
+Proves six properties of gnitz/storage/manifest.py:14-112:
 
-Entry layout (ENTRY_SIZE = 184):
+Entry layout V3 (ENTRY_SIZE = 208):
   [0,8)    table_id       [8,16)   pk_min_lo     [16,24)  pk_min_hi
   [24,32)  pk_max_lo      [32,40)  pk_max_hi     [40,48)  min_lsn
   [48,56)  max_lsn        [56,184) filename (128 bytes)
+  [184,192) level         [192,200) guard_key_lo [200,208) guard_key_hi
+
+  V2 legacy stride: 184 (ENTRY_SIZE_V2); V3 adds 24 bytes for FLSM fields.
 
 Header layout (HEADER_SIZE = 64):
   [0,8)    magic          [8,16)   version       [16,24)  entry_count
   [24,32)  global_max_lsn [32,64)  padding (32 bytes)
 
   P1. Entry fields non-overlapping (Python exhaustive byte-ownership check)
-  P2. Entry fields cover [0, 184) (16-bit BV, UNSAT)
+  P2. Entry fields cover [0, 208) (16-bit BV, UNSAT)
   P3. Header fields cover [0, 64) (16-bit BV, UNSAT)
   P4. U128 split/reconstruct roundtrip (128-bit BV, UNSAT)
-  P5. Filename region safety: 56 + 128 == 184 (16-bit BV, UNSAT)
+  P5. Filename region safety: 56 + 128 == 184 (no overrun, 16-bit BV, UNSAT)
+  P6. V3 extension: 184 + 8 + 8 + 8 == 208 (ENTRY_SIZE) (16-bit BV, UNSAT)
 
-5 Z3 queries + ~6 cross-checks.  Runs under PyPy2.
+6 Z3 queries + ~6 cross-checks.  Runs under PyPy2.
 Exit code 0 on success, 1 on any failure.
 """
 import subprocess
@@ -68,10 +72,11 @@ def parse_z3_value(z3_out):
 
 # -- Constants ----------------------------------------------------------------
 
-ENTRY_SIZE = 184
+ENTRY_SIZE = 208        # V3 (current)
+ENTRY_SIZE_V2 = 184    # V2 legacy stride
 HEADER_SIZE = 64
 
-# Entry field layout: (offset, size, name)
+# Entry field layout V3: (offset, size, name)
 ENTRY_FIELDS = [
     (0, 8, "table_id"),
     (8, 8, "pk_min_lo"),
@@ -81,6 +86,9 @@ ENTRY_FIELDS = [
     (40, 8, "min_lsn"),
     (48, 8, "max_lsn"),
     (56, 128, "filename"),
+    (184, 8, "level"),
+    (192, 8, "guard_key_lo"),
+    (200, 8, "guard_key_hi"),
 ]
 
 # Header field layout: (offset, size, name)
@@ -126,14 +134,14 @@ if uncovered_entry:
     report("  FAIL  entry bytes not covered: %s" % uncovered_entry)
     ok = False
 else:
-    report("  PASS  cross-check: entry fields non-overlapping and cover [0, 184)")
+    report("  PASS  cross-check: entry fields non-overlapping and cover [0, 208)")
 
 total_entry_bytes = sum(sz for _, sz, _ in ENTRY_FIELDS)
 if total_entry_bytes != ENTRY_SIZE:
     report("  FAIL  total entry bytes %d != ENTRY_SIZE %d" % (total_entry_bytes, ENTRY_SIZE))
     ok = False
 else:
-    report("  PASS  cross-check: total entry bytes == 184")
+    report("  PASS  cross-check: total entry bytes == 208")
 
 # Header byte-ownership
 byte_owner_h = [-1] * HEADER_SIZE
@@ -200,11 +208,11 @@ if not ok:
     print("=" * 56)
     sys.exit(1)
 
-# -- P2: Entry fields cover [0, 184) (16-bit BV, UNSAT) ----------------------
+# -- P2: Entry fields cover [0, 208) (16-bit BV, UNSAT) ----------------------
 #
-# Symbolic byte b in [0, 184), assert NOT in any field range.
+# Symbolic byte b in [0, 208), assert NOT in any field range.
 
-report("  ... proving P2: entry fields cover [0, 184)")
+report("  ... proving P2: entry fields cover [0, 208)")
 
 entry_membership = []
 for off, sz, _ in ENTRY_FIELDS:
@@ -212,11 +220,11 @@ for off, sz, _ in ENTRY_FIELDS:
     entry_membership.append(
         "(and (not (bvult b (_ bv%d 16))) (bvult b (_ bv%d 16)))" % (off, end))
 
-ok &= prove("P2: entry coverage [0, 184)", """\
+ok &= prove("P2: entry coverage [0, 208)", """\
 (set-logic QF_BV)
 (declare-const b (_ BitVec 16))
 (assert (not (bvult b (_ bv0 16))))
-(assert (bvult b (_ bv184 16)))
+(assert (bvult b (_ bv208 16)))
 ; Negate: b does not belong to any field
 (assert (not (or
   %s)))
@@ -266,16 +274,34 @@ ok &= prove("P4: U128 roundtrip", """\
 
 # -- P5: Filename region safety (16-bit BV, UNSAT) ---------------------------
 #
-# Filename starts at offset 56 and is 128 bytes: 56 + 128 == 184 == ENTRY_SIZE.
-# No buffer overrun when writing/reading the filename field.
+# Filename starts at offset 56 and is 128 bytes: 56 + 128 == 184.
+# This is ENTRY_SIZE_V2 (the V2 stride), not ENTRY_SIZE (208).
+# Proves filename write/read does not overrun into the V3 field region.
 
-report("  ... proving P5: filename region safety")
-ok &= prove("P5: 56 + 128 == 184 (ENTRY_SIZE)", """\
+report("  ... proving P5: filename region safety (56 + 128 == 184 < 208)")
+ok &= prove("P5: 56 + 128 == 184 (filename ends at V2 boundary)", """\
 (set-logic QF_BV)
-(declare-const entry_size (_ BitVec 16))
-(assert (= entry_size (_ bv184 16)))
-; Negate: filename end != entry_size
-(assert (not (= (bvadd (_ bv56 16) (_ bv128 16)) entry_size)))
+; filename_end = 56 + 128 = 184 = ENTRY_SIZE_V2
+(assert (not (= (bvadd (_ bv56 16) (_ bv128 16)) (_ bv184 16))))
+(check-sat)
+""")
+
+# -- P6: V3 extension layout (16-bit BV, UNSAT) ------------------------------
+#
+# V3 adds three 8-byte fields after the V2 stride:
+#   level:         [184, 192)
+#   guard_key_lo:  [192, 200)
+#   guard_key_hi:  [200, 208)
+# Proves ENTRY_SIZE_V2 + 24 == ENTRY_SIZE (208).
+
+report("  ... proving P6: V3 extension 184 + 24 == 208 (ENTRY_SIZE)")
+ok &= prove("P6: V3 extension ENTRY_SIZE_V2(184) + 3*8 == ENTRY_SIZE(208)", """\
+(set-logic QF_BV)
+; Each V3 field is 8 bytes; three fields: 184+8=192, 192+8=200, 200+8=208
+(assert (not (and
+  (= (bvadd (_ bv184 16) (_ bv8 16)) (_ bv192 16))
+  (= (bvadd (_ bv192 16) (_ bv8 16)) (_ bv200 16))
+  (= (bvadd (_ bv200 16) (_ bv8 16)) (_ bv208 16)))))
 (check-sat)
 """)
 
@@ -285,10 +311,11 @@ print("=" * 56)
 if ok:
     print("  PROVED: Manifest field layout is correct")
     print("    P1: entry fields non-overlapping (cross-check)")
-    print("    P2: entry fields cover [0, 184)")
+    print("    P2: entry fields cover [0, 208)")
     print("    P3: header fields cover [0, 64)")
     print("    P4: U128 split/reconstruct roundtrip")
-    print("    P5: filename region safety (56 + 128 == 184)")
+    print("    P5: filename region safety (56 + 128 == 184 = ENTRY_SIZE_V2)")
+    print("    P6: V3 extension 184 + 24 == 208 (ENTRY_SIZE)")
 else:
     print("  FAILED: see above")
 print("=" * 56)

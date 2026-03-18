@@ -63,7 +63,10 @@ PROOFS := \
 	promote-group-narrow:promote_group_narrow \
 	partition-key-routing:partition_key_routing \
 	name-tid-hash:name_tid_hash \
-	manifest-key-split:manifest_key_split
+	manifest-key-split:manifest_key_split \
+	negate-involution:negate_involution \
+	union-merge-sorted:union_merge_sorted \
+	anti-semi-complement:anti_semi_complement
 
 TARGETS := $(foreach p,$(PROOFS),prove-$(firstword $(subst :, ,$(p))))
 

@@ -1,29 +1,29 @@
-"""Z3 formal proofs for IPC v2 96-byte request/response header field layout.
+"""Z3 formal proofs for IPC CONTROL_SCHEMA column layout.
 
-Proves five properties of gnitz/server/ipc.py:18-71:
+The 96-byte request/response header was removed when IPC was rewritten to
+use WAL blocks (commit d1f6758).  The control block now carries a
+9-column ZSet encoded as a WAL block.
 
-IPC v2 header (HEADER_SIZE = 96):
-  [0,8)   MAGIC          u64
-  [8,12)  STATUS         u32
-  [12,16) ERR_LEN        u32
-  [16,24) TARGET_ID      u64
-  [24,32) CLIENT_ID      u64
-  [32,40) SCHEMA_COUNT   u64
-  [40,48) SCHEMA_BLOB_SZ u64
-  [48,56) DATA_COUNT     u64
-  [56,64) DATA_BLOB_SZ   u64
-  [64,72) P4             u64
-  [72,80) FLAGS          u64
-  [80,88) SEEK_PK_LO     u64
-  [88,96) SEEK_PK_HI     u64
+Source: gnitz/server/ipc.py:64-87
 
-Sum: 8+4+4+8+8+8+8+8+8+8+8+8+8 = 96 = HEADER_SIZE
+CONTROL_SCHEMA (pk_index=0):
+  col 0: msg_idx        U64  (PK)
+  col 1: status         U64
+  col 2: client_id      U64
+  col 3: target_id      U64
+  col 4: flags          U64
+  col 5: seek_pk_lo     U64
+  col 6: seek_pk_hi     U64
+  col 7: seek_col_idx   U64
+  col 8: error_msg      STRING (nullable)
 
-  P1. Fields non-overlapping and cover [0, 96) (Python exhaustive check)
-  P2. Every byte in [0, 96) belongs to some field (8-bit BV, UNSAT)
-  P3. All u64 fields are 8-byte aligned (8-bit BV, UNSAT)
-  P4. All u32 fields are 4-byte aligned (8-bit BV, UNSAT)
-  P5. SEEK_PK_LO >= OFF_FLAGS+8, SEEK_PK_HI == SEEK_PK_LO+8 (8-bit BV, UNSAT)
+CTRL_COL_STATUS=1 .. CTRL_COL_ERROR_MSG=8 (contiguous, starting at 1).
+
+  P1. CTRL_COL_* indices are distinct and cover {1..8} (Python cross-check)
+  P2. All CTRL_COL_* values are in range [1, 8] (8-bit BV, UNSAT)
+  P3. PK column (col 0) is disjoint from all CTRL_COL_* (8-bit BV, UNSAT)
+  P4. Total column count == 9 (Python cross-check)
+  P5. CTRL_COL_ERROR_MSG == 8 == CTRL_COL_STATUS + 7 (8-bit BV, UNSAT)
 
 5 Z3 queries + ~5 cross-checks.  Runs under PyPy2.
 Exit code 0 on success, 1 on any failure.
@@ -64,105 +64,78 @@ def prove(label, smt_text):
 
 # -- Constants ----------------------------------------------------------------
 
-HEADER_SIZE = 96
+# CONTROL_SCHEMA has 9 columns (0..8); pk_index = 0
+CONTROL_NUM_COLS = 9
+CONTROL_PK_INDEX = 0
 
-# (offset, size_bytes, type_size, name)
-# type_size: 8 for u64, 4 for u32
-FIELDS = [
-    (0,  8, 8, "MAGIC"),
-    (8,  4, 4, "STATUS"),
-    (12, 4, 4, "ERR_LEN"),
-    (16, 8, 8, "TARGET_ID"),
-    (24, 8, 8, "CLIENT_ID"),
-    (32, 8, 8, "SCHEMA_COUNT"),
-    (40, 8, 8, "SCHEMA_BLOB_SZ"),
-    (48, 8, 8, "DATA_COUNT"),
-    (56, 8, 8, "DATA_BLOB_SZ"),
-    (64, 8, 8, "P4"),
-    (72, 8, 8, "FLAGS"),
-    (80, 8, 8, "SEEK_PK_LO"),
-    (88, 8, 8, "SEEK_PK_HI"),
+# Named column indices from gnitz/server/ipc.py:79-86
+CTRL_COL_STATUS      = 1
+CTRL_COL_CLIENT_ID   = 2
+CTRL_COL_TARGET_ID   = 3
+CTRL_COL_FLAGS       = 4
+CTRL_COL_SEEK_PK_LO  = 5
+CTRL_COL_SEEK_PK_HI  = 6
+CTRL_COL_SEEK_COL    = 7
+CTRL_COL_ERROR_MSG   = 8
+
+CTRL_COLS = [
+    CTRL_COL_STATUS, CTRL_COL_CLIENT_ID, CTRL_COL_TARGET_ID, CTRL_COL_FLAGS,
+    CTRL_COL_SEEK_PK_LO, CTRL_COL_SEEK_PK_HI, CTRL_COL_SEEK_COL, CTRL_COL_ERROR_MSG,
 ]
-
-# Source constants from gnitz/server/ipc.py
-SOURCE_OFFSETS = {
-    "MAGIC":          0,
-    "STATUS":         8,
-    "ERR_LEN":        12,
-    "TARGET_ID":      16,
-    "CLIENT_ID":      24,
-    "SCHEMA_COUNT":   32,
-    "SCHEMA_BLOB_SZ": 40,
-    "DATA_COUNT":     48,
-    "DATA_BLOB_SZ":   56,
-    "P4":             64,
-    "FLAGS":          72,
-    "SEEK_PK_LO":     80,
-    "SEEK_PK_HI":     88,
-}
 
 # -- Main ---------------------------------------------------------------------
 
 print("=" * 60)
-print("  Z3 PROOF: IPC v2 96-byte header field layout")
+print("  Z3 PROOF: IPC CONTROL_SCHEMA column layout")
 print("=" * 60)
 sys.stdout.flush()
 
 ok = True
 
-# -- P1: Python exhaustive byte-ownership cross-check ------------------------
+# -- Cross-check P1: CTRL_COL_* values are distinct and cover {1..8} ----------
 
-report("  ... cross-checking field layout (P1)")
+report("  ... cross-checking CTRL_COL_* indices")
 
-byte_owner = [-1] * HEADER_SIZE
-for fi, (off, sz, _tsz, name) in enumerate(FIELDS):
-    for b in range(off, off + sz):
-        if b >= HEADER_SIZE:
-            report("  FAIL  field %d (%s): byte %d out of [0, %d)" % (fi, name, b, HEADER_SIZE))
-            ok = False
-        elif byte_owner[b] != -1:
-            report("  FAIL  field %d (%s) overlaps field %d at byte %d" % (
-                fi, name, byte_owner[b], b))
-            ok = False
-        else:
-            byte_owner[b] = fi
-
-uncovered = [b for b in range(HEADER_SIZE) if byte_owner[b] == -1]
-if uncovered:
-    report("  FAIL  bytes not covered: %s" % uncovered)
+if len(set(CTRL_COLS)) == len(CTRL_COLS):
+    report("  PASS  cross-check: all 8 CTRL_COL_* values are distinct")
+else:
+    report("  FAIL  cross-check: CTRL_COL_* values have duplicates")
     ok = False
-else:
-    report("  PASS  cross-check: fields non-overlapping and cover [0, 96)")
 
-total_bytes = sum(sz for _, sz, _, _ in FIELDS)
-if total_bytes != HEADER_SIZE:
-    report("  FAIL  total field bytes %d != HEADER_SIZE %d" % (total_bytes, HEADER_SIZE))
+expected = set(range(1, 9))
+actual = set(CTRL_COLS)
+if actual == expected:
+    report("  PASS  cross-check: CTRL_COL_* values cover {1..8} exactly")
+else:
+    report("  FAIL  cross-check: CTRL_COL_* expected {1..8}, got %s" % sorted(actual))
     ok = False
-else:
-    report("  PASS  cross-check: sum of field sizes == 96 == HEADER_SIZE")
 
-# Verify each OFF_* constant from source matches FIELDS table
-for off, _sz, _tsz, name in FIELDS:
-    expected = SOURCE_OFFSETS[name]
-    if off != expected:
-        report("  FAIL  %s offset %d != source OFF_%s=%d" % (name, off, name, expected))
-        ok = False
-    else:
-        report("  PASS  cross-check: OFF_%s == %d" % (name, off))
+# -- Cross-check P3: PK (col 0) not in CTRL_COL_* ----------------------------
 
-# Verify Z3 simplify: last field end = SEEK_PK_HI + 8 = 88 + 8 = 96 = HEADER_SIZE
-z3_out = run_z3("(simplify (bvadd (_ bv88 8) (_ bv8 8)))")
-z3_out = z3_out.strip()
-got_96 = False
-if z3_out.startswith("#x"):
-    got_96 = (int(z3_out[2:], 16) == 96)
-elif z3_out.startswith("(_ bv"):
-    parts = z3_out.split()
-    got_96 = (int(parts[1][2:]) == 96)
-if got_96:
-    report("  PASS  cross-check: Z3 simplify (88+8) == #x60 (96)")
+if CONTROL_PK_INDEX not in CTRL_COLS:
+    report("  PASS  cross-check: PK index 0 is not in CTRL_COL_* set")
 else:
-    report("  FAIL  cross-check: Z3 simplify (88+8) expected 96, got %s" % z3_out)
+    report("  FAIL  cross-check: PK index 0 appears in CTRL_COL_* set")
+    ok = False
+
+# -- Cross-check P4: total column count == 9 ----------------------------------
+
+# Payload cols = CTRL_COL_* (8) + PK col (1) = 9
+total_cols = len(CTRL_COLS) + 1  # +1 for PK column
+if total_cols == CONTROL_NUM_COLS:
+    report("  PASS  cross-check: total column count == 9 (1 PK + 8 payload)")
+else:
+    report("  FAIL  cross-check: total column count %d != %d" % (total_cols, CONTROL_NUM_COLS))
+    ok = False
+
+# -- Cross-check P5: CTRL_COL_ERROR_MSG == CTRL_COL_STATUS + 7 ---------------
+
+if CTRL_COL_ERROR_MSG == CTRL_COL_STATUS + 7:
+    report("  PASS  cross-check: CTRL_COL_ERROR_MSG(%d) == CTRL_COL_STATUS(%d) + 7" % (
+        CTRL_COL_ERROR_MSG, CTRL_COL_STATUS))
+else:
+    report("  FAIL  cross-check: CTRL_COL_ERROR_MSG(%d) != CTRL_COL_STATUS(%d) + 7" % (
+        CTRL_COL_ERROR_MSG, CTRL_COL_STATUS))
     ok = False
 
 if not ok:
@@ -171,89 +144,66 @@ if not ok:
     print("=" * 60)
     sys.exit(1)
 
-# -- P2: Every byte in [0, 96) belongs to some field (8-bit BV, UNSAT) -------
+# -- P2: All CTRL_COL_* values are in range [1, 8] (8-bit BV, UNSAT) ----------
 #
-# 8-bit BV is sufficient: all offsets and HEADER_SIZE < 256.
+# A valid CTRL_COL_* index c satisfies 1 <= c <= 8.
+# Encode each concrete value and negate: prove no value is outside [1, 8].
 
-report("  ... proving P2: fields cover [0, 96)")
+report("  ... proving P2: all CTRL_COL_* values in [1, 8]")
 
-membership = []
-for off, sz, _tsz, _ in FIELDS:
-    end = off + sz
-    membership.append(
-        "(and (bvuge b (_ bv%d 8)) (bvult b (_ bv%d 8)))" % (off, end))
-
-ok &= prove("P2: field coverage [0, 96)", """\
+in_range_asserts = " ".join(
+    "(and (bvule (_ bv1 8) (_ bv%d 8)) (bvule (_ bv%d 8) (_ bv8 8)))" % (c, c)
+    for c in CTRL_COLS
+)
+ok &= prove("P2: all 8 CTRL_COL_* values in [1, 8]", """\
 (set-logic QF_BV)
-(declare-const b (_ BitVec 8))
-(assert (bvult b (_ bv96 8)))
-; Negate: b does not belong to any field
-(assert (not (or
-  %s)))
-(check-sat)
-""" % "\n  ".join(membership))
-
-# -- P3: All u64 fields are 8-byte aligned (8-bit BV, UNSAT) -----------------
-#
-# Offsets 0, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88 are all divisible by 8.
-# Use bvand with mask 7 (cheaper than bvurem).
-
-report("  ... proving P3: u64 fields are 8-byte aligned")
-
-u64_offsets = [off for off, _sz, tsz, _ in FIELDS if tsz == 8]
-# Each offset is concrete — enumerate all as an 'and' of equality checks
-align_asserts = ["(= (bvand (_ bv%d 8) (_ bv7 8)) (_ bv0 8))" % o
-                 for o in u64_offsets]
-
-ok &= prove("P3: u64 fields 8-byte aligned", """\
-(set-logic QF_BV)
-; Negate: not all u64 offsets are 8-aligned
+; Negate: at least one CTRL_COL_* value is outside [1, 8]
 (assert (not (and
   %s)))
 (check-sat)
-""" % "\n  ".join(align_asserts))
+""" % in_range_asserts)
 
-# -- P4: All u32 fields are 4-byte aligned (8-bit BV, UNSAT) -----------------
+# -- P3: PK column (0) is disjoint from all CTRL_COL_* (8-bit BV, UNSAT) ------
 #
-# Offsets 8 and 12 are both divisible by 4.
+# Prove that 0 != c for every c in CTRL_COLS.
 
-report("  ... proving P4: u32 fields are 4-byte aligned")
+report("  ... proving P3: PK col 0 is not equal to any CTRL_COL_* value")
 
-u32_offsets = [off for off, _sz, tsz, _ in FIELDS if tsz == 4]
-align_asserts_u32 = ["(= (bvand (_ bv%d 8) (_ bv3 8)) (_ bv0 8))" % o
-                     for o in u32_offsets]
-
-ok &= prove("P4: u32 fields 4-byte aligned", """\
+neq_asserts = " ".join(
+    "(not (= (_ bv0 8) (_ bv%d 8)))" % c
+    for c in CTRL_COLS
+)
+ok &= prove("P3: PK col 0 != any CTRL_COL_*", """\
 (set-logic QF_BV)
-; Negate: not all u32 offsets are 4-aligned
+; Negate: 0 equals some CTRL_COL_* value
 (assert (not (and
   %s)))
 (check-sat)
-""" % "\n  ".join(align_asserts_u32))
+""" % neq_asserts)
 
-# -- P5a: SEEK_PK_LO starts at end of FLAGS field (8-bit BV, UNSAT) ----------
+# -- P4: Total column count = 9 (8-bit BV, UNSAT) ----------------------------
 #
-# OFF_SEEK_PK_LO (80) >= OFF_FLAGS (72) + 8.
-# With these concrete values this reduces to 80 >= 80 = true, so negation
-# is false => UNSAT.
+# len(CTRL_COLS) = 8 payload cols + 1 PK col = 9.
 
-report("  ... proving P5a: SEEK_PK_LO >= OFF_FLAGS + 8")
-
-ok &= prove("P5a: SEEK_PK_LO >= OFF_FLAGS + 8", """\
+report("  ... proving P4: total column count == 9")
+ok &= prove("P4: 8 payload cols + 1 PK col == 9", """\
 (set-logic QF_BV)
-; 80 >= 72 + 8 = 80
-(assert (not (bvuge (_ bv80 8) (bvadd (_ bv72 8) (_ bv8 8)))))
+; Negate: 8 + 1 != 9
+(assert (not (= (bvadd (_ bv8 8) (_ bv1 8)) (_ bv9 8))))
 (check-sat)
 """)
 
-# -- P5b: SEEK_PK_HI immediately follows SEEK_PK_LO (8-bit BV, UNSAT) --------
+# -- P5: CTRL_COL_ERROR_MSG == CTRL_COL_STATUS + 7 (8-bit BV, UNSAT) ---------
+#
+# The payload columns are laid out contiguously: STATUS=1, ..., ERROR_MSG=8.
+# 8 - 1 = 7 columns span the range.
 
-report("  ... proving P5b: SEEK_PK_HI == SEEK_PK_LO + 8")
-
-ok &= prove("P5b: SEEK_PK_HI == SEEK_PK_LO + 8", """\
+report("  ... proving P5: CTRL_COL_ERROR_MSG == CTRL_COL_STATUS + 7")
+ok &= prove("P5: 1 + 7 == 8 (CTRL_COL_STATUS + span = CTRL_COL_ERROR_MSG)", """\
 (set-logic QF_BV)
-; 88 == 80 + 8
-(assert (not (= (_ bv88 8) (bvadd (_ bv80 8) (_ bv8 8)))))
+; CTRL_COL_STATUS=1, CTRL_COL_ERROR_MSG=8, span=7
+; Negate: 1 + 7 != 8
+(assert (not (= (bvadd (_ bv1 8) (_ bv7 8)) (_ bv8 8))))
 (check-sat)
 """)
 
@@ -261,12 +211,12 @@ ok &= prove("P5b: SEEK_PK_HI == SEEK_PK_LO + 8", """\
 
 print("=" * 60)
 if ok:
-    print("  PROVED: IPC v2 96-byte header field layout is correct")
-    print("    P1: fields non-overlapping and cover [0, 96) (cross-check)")
-    print("    P2: fields cover [0, 96) (BV proof)")
-    print("    P3: u64 fields are 8-byte aligned")
-    print("    P4: u32 fields are 4-byte aligned")
-    print("    P5: seek fields follow flags field in order")
+    print("  PROVED: IPC CONTROL_SCHEMA column layout")
+    print("    P1: CTRL_COL_* indices are distinct and cover {1..8}")
+    print("    P2: all CTRL_COL_* values in [1, 8]")
+    print("    P3: PK col 0 is disjoint from all CTRL_COL_* values")
+    print("    P4: total column count == 9")
+    print("    P5: CTRL_COL_ERROR_MSG == CTRL_COL_STATUS + 7")
 else:
     print("  FAILED: see above")
 print("=" * 60)
