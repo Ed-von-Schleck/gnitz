@@ -198,7 +198,7 @@ def test_join_ops(base_dir):
         rb_r.commit()
 
         log("  - Delta-Delta Sort-Merge (M:N)...")
-        join.op_join_delta_delta(b_l, b_r, b_out, schema_l, schema_r)
+        join.op_join_delta_delta(b_l, b_r, batch.BatchWriter(b_out), schema_l, schema_r)
         assert_equal_i(6, b_out.length(), "M:N Join failed")
 
         log("  - Delta-Trace Index-Nested...")
@@ -210,7 +210,7 @@ def test_join_ops(base_dir):
         trace_r.ingest_batch(b_r)
 
         cursor_r = trace_r.create_cursor()
-        join.op_join_delta_trace(b_l, cursor_r, b_out, schema_l, schema_r)
+        join.op_join_delta_trace(b_l, cursor_r, batch.BatchWriter(b_out), schema_l, schema_r)
         cursor_r.close()
 
         assert_equal_i(6, b_out.length(), "Delta-Trace Join failed")

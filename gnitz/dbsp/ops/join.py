@@ -4,7 +4,7 @@ from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, intmask
 
 from gnitz.core.comparator import RowAccessor
-from gnitz.core.batch import SortedScope, BatchWriter
+from gnitz.core.batch import ConsolidatedScope, BatchWriter
 
 """
 Bilinear Join Operators for the DBSP algebra.
@@ -116,6 +116,9 @@ class CompositeAccessor(RowAccessor):
         return self.right_acc.get_col_ptr(self.mapping_idx[col_idx])
 
 
+CONSOLIDATE_INTERVAL = 8192       # output rows written before each consolidation (delta-trace)
+CONSOLIDATE_INTERVAL_DD = 16384   # output rows written before each consolidation (delta-delta)
+
 # ---------------------------------------------------------------------------
 # Join operator implementations
 # ---------------------------------------------------------------------------
@@ -134,6 +137,7 @@ def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schem
     composite_acc = CompositeAccessor(d_schema, t_schema)
 
     count = delta_batch.length()
+    rows_since_consolidation = 0
     for i in range(count):
         w_delta = delta_batch.get_weight(i)
         if w_delta == r_int64(0):
@@ -149,13 +153,17 @@ def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schem
             w_trace = trace_cursor.weight()
             # weight multiplication with RPython machine-word truncation
             w_out = r_int64(intmask(w_delta * w_trace))
-            
+
             if w_out != r_int64(0):
                 composite_acc.set_accessors(
                     delta_batch.get_accessor(i),
                     trace_cursor.get_accessor(),
                 )
                 out_writer.append_from_accessor(key, w_out, composite_acc)
+                rows_since_consolidation += 1
+                if rows_since_consolidation >= CONSOLIDATE_INTERVAL:
+                    out_writer.consolidate()
+                    rows_since_consolidation = 0
 
             trace_cursor.advance()
     out_writer.mark_sorted(delta_batch._sorted)
@@ -171,8 +179,8 @@ def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):
     schema_a:   TableSchema     — schema of batch_a
     schema_b:   TableSchema     — schema of batch_b
     """
-    with SortedScope(batch_a) as b_a:
-        with SortedScope(batch_b) as b_b:
+    with ConsolidatedScope(batch_a) as b_a:
+        with ConsolidatedScope(batch_b) as b_b:
             composite_acc = CompositeAccessor(schema_a, schema_b)
 
             idx_a = 0
@@ -180,6 +188,7 @@ def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):
             n_a = b_a.length()
             n_b = b_b.length()
 
+            rows_since_consolidation = 0
             while idx_a < n_a and idx_b < n_b:
                 key_a = b_a.get_pk(idx_a)
                 key_b = b_b.get_pk(idx_b)
@@ -214,4 +223,8 @@ def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):
                                 out_writer.append_from_accessor(
                                     match_key, w_out, composite_acc
                                 )
+                                rows_since_consolidation += 1
+                                if rows_since_consolidation >= CONSOLIDATE_INTERVAL_DD:
+                                    out_writer.consolidate()
+                                    rows_since_consolidation = 0
     out_writer.mark_sorted(True)

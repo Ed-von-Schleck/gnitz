@@ -71,10 +71,21 @@ Implement in each concrete cursor in `gnitz/storage/cursor.py`:
 | `SortedBatchCursor` | `return self._batch.length()` |
 | `MemTableCursor` | `return self._snapshot.length()` |
 | `ShardCursor` | `return self.view.count` (includes ghosts, slight over-count — acceptable) |
-| `UnifiedCursor` | `sum(c.estimated_length() for c in self.cursors)` |
+| `UnifiedCursor` | manual for-loop sum (see below) |
 
 The `UnifiedCursor` sum double-counts cancelled pairs. That is fine — it is an upper bound
 and the comparison only needs to be directionally correct.
+
+RPython does not support generator expressions as arguments to builtins. The `UnifiedCursor`
+implementation must use a manual loop, not `sum(... for ...)`:
+
+```python
+def estimated_length(self):
+    total = 0
+    for c in self.cursors:
+        total += c.estimated_length()
+    return total
+```
 
 #### Step 2 — Add `seek_key_exact()` to `AbstractCursor`
 
@@ -112,7 +123,7 @@ def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schem
 
     if delta_len > trace_len * ADAPTIVE_SWAP_THRESHOLD:
         _join_dt_swapped(delta_batch, trace_cursor, out_writer, composite_acc)
-        out_writer.mark_sorted(delta_batch._sorted)
+        out_writer.mark_sorted(True)  # output is always sorted: emitted in trace key order
     elif delta_batch._consolidated:
         _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc)
         # _join_dt_merge_walk calls mark_consolidated(True), which sets _sorted=True
@@ -122,6 +133,11 @@ def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schem
 ```
 
 **Normal path** (existing logic, extracted into helper):
+
+Note: the existing `op_join_delta_trace` ends with `out_writer.mark_sorted(delta_batch._sorted)`
+at line 161. That call must be **deleted** from the body during extraction — the dispatch
+function now owns all `mark_sorted`/`mark_consolidated` calls. Leaving it in `_join_dt_normal`
+would double-apply the flag (harmless, but wrong in principle).
 
 ```python
 def _join_dt_normal(delta_batch, trace_cursor, out_writer, composite_acc):
@@ -144,6 +160,7 @@ def _join_dt_normal(delta_batch, trace_cursor, out_writer, composite_acc):
                 )
                 out_writer.append_from_accessor(key, w_out, composite_acc)
             trace_cursor.advance()
+    # No mark_sorted here — dispatch function owns that call.
 ```
 
 **Swapped path** (new, iterate trace / seek delta):
@@ -178,9 +195,9 @@ swapped path we still pass delta accessor as `left` and trace accessor as `right
 swap is in the *iteration order*, not in the schema role.
 
 Note: `SortedBatchCursor` is created inside `_join_dt_swapped`. It holds a reference to
-`sorted_delta` which is valid for the lifetime of the `SortedScope` context manager.
-RPython's GC will keep `sorted_delta` alive through the `SortedScope.__exit__` call, so
-there is no lifetime issue.
+`sorted_delta` which is valid for the lifetime of the `ConsolidatedScope` context manager.
+`sorted_delta` is in scope for the entire `with` block (RPython uses reference counting),
+so there is no lifetime issue.
 
 #### Step 4 — RPython annotation considerations
 
@@ -194,16 +211,26 @@ annotator will see two calls to `CompositeAccessor.set_accessors`: one with a
 The JIT will trace the two helpers as separate code paths (different call sites), which
 is correct and enables independent JIT specialization.
 
-#### Step 5 — Anti/semi-join adaptive swap
+#### Step 5 — Semi-join adaptive swap (anti-join: swap does NOT apply)
 
-The same swap applies to `op_anti_join_delta_trace` and `op_semi_join_delta_trace`
-(`gnitz/dbsp/ops/anti_join.py`).
+The adaptive swap applies to `op_semi_join_delta_trace` but **not** to
+`op_anti_join_delta_trace`.
 
-For anti-join, the swap logic is simpler: in the swapped version, iterate trace keys and
-check for exact match in delta. If the key exists in both, the row is excluded from anti-join
-output. If a trace key has no matching delta key, it produces no output (anti-join output
-schema is left-only). So the outer loop iteration order flip still gives the same
-`O(min · log max)` cost. Implementation mirrors the join case above.
+**Semi-join** — swap is valid. Semi-join emits delta rows whose key HAS a match in the
+trace. If we iterate trace (smaller) and seek each trace key in delta, we correctly
+identify every delta key that matches; the inner loop emits all delta rows at that key.
+Delta keys with no trace counterpart are never visited, which is correct (semi-join
+excludes them). Cost reduces from `O(|Δ| · log |I|)` to `O(|I| · log |Δ|)` when
+`|Δ| ≫ |I|`.
+
+**Anti-join** — swap is invalid. Anti-join emits delta rows whose key has NO match in the
+trace. Iterating the trace side and seeking in delta only visits trace keys. Delta keys
+that do not appear in the trace at all — which are exactly the rows anti-join must emit —
+are never visited, producing empty output. The swap cannot be applied to anti-join.
+
+For anti-join, use the merge-walk (Step 3 of Optimization 2) when the delta is
+consolidated; it correctly handles the "no match" case while still achieving the
+O(K log K + (N+M) × log K) cost reduction.
 
 ---
 
@@ -263,6 +290,8 @@ def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
     all non-zero weights.
     """
     count = delta_batch.length()
+    if count == 0:
+        return
     # One seek to anchor the trace cursor at the first delta key.
     trace_cursor.seek(delta_batch.get_pk(0))
 
@@ -292,9 +321,8 @@ def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
     out_writer.mark_consolidated(True)   # requires source-optimizations.md Step 1
 ```
 
-The `mark_consolidated(True)` call requires `BatchWriter.mark_consolidated` added in
-`source-optimizations.md`. Until that lands, use `out_writer.mark_sorted(True)` as a
-placeholder — output is sorted even without the full `_consolidated` semantics.
+`BatchWriter.mark_consolidated` was added in `source-optimizations.md` (DONE, commit
+f487d2f). No placeholder needed.
 
 #### Step 2 — Dispatch in `op_join_delta_trace`
 
@@ -309,24 +337,36 @@ The same merge-walk applies to `op_anti_join_delta_trace` and `op_semi_join_delt
 For anti-join, "no match in trace" = emit the delta row; for semi-join, "match in trace"
 = emit the delta row. Both become:
 
+The existing `op_anti_join_delta_trace` and `op_semi_join_delta_trace` check
+`trace_cursor.weight() > r_int64(0)` when testing for a match — a negative net weight
+(a retracted record not yet zeroed) does NOT count as a match. `UnifiedCursor` suppresses
+zero-weight keys but can still present a key with negative net weight. The merge_walk must
+replicate this by checking the weight sign, not just key presence:
+
 ```python
 def _anti_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
     count = delta_batch.length()
+    if count == 0:
+        return
     trace_cursor.seek(delta_batch.get_pk(0))
     for i in range(count):
         d_key = delta_batch.get_pk(i)
         while trace_cursor.is_valid() and trace_cursor.key() < d_key:
             trace_cursor.advance()
-        in_trace = trace_cursor.is_valid() and trace_cursor.key() == d_key
+        in_trace = (trace_cursor.is_valid() and trace_cursor.key() == d_key
+                    and trace_cursor.weight() > r_int64(0))
         if not in_trace:   # anti-join: emit if NOT in trace
-            out_writer.append_from_accessor(d_key, delta_batch.get_weight(i),
-                                            delta_batch.get_accessor(i))
-        if in_trace:
-            trace_cursor.advance()
+            out_writer.direct_append_row(delta_batch, i, delta_batch.get_weight(i))
+        if trace_cursor.is_valid() and trace_cursor.key() == d_key:
+            trace_cursor.advance()   # advance past d_key regardless of weight sign
     out_writer.mark_consolidated(True)
 ```
 
-`_semi_join_dt_merge_walk` is identical with the condition flipped (`if in_trace`).
+Note: `trace_cursor.advance()` is conditioned on key equality (not on `in_trace`) so that
+a negative-weight trace record at `d_key` still advances the cursor past that key.
+
+`_semi_join_dt_merge_walk` is identical with the condition flipped (`if in_trace`) and
+the same `direct_append_row` call.
 
 ### Interaction with Optimization 5 (key-gather prefetch)
 
@@ -345,158 +385,28 @@ output if the output batch already has `_consolidated = True`.
 
 ---
 
-## Optimization 3: `ConsolidatedScope` in `op_join_delta_delta`
+## Optimization 3: `ConsolidatedScope` in `op_join_delta_delta` — DONE
 
-### Motivation
+**Commit:** J3+J4 commit (this session).
 
-`op_join_delta_delta` (`gnitz/dbsp/ops/join.py:164`) currently uses `SortedScope` on both
-inputs. `SortedScope` only sorts; it does not merge rows with the same (PK, payload).
-
-If a delta batch contains multiple rows for the same PK — which happens whenever two
-operations on the same key arrive in the same tick (e.g., a delete followed by a re-insert)
-— `SortedScope` leaves both rows. The cartesian product then emits multiple output rows for
-that key, all of which need to be consolidated later by the caller.
-
-`to_consolidated()` is only marginally more expensive than `to_sorted()` (sort is shared;
-consolidation adds one O(N) merge pass). The savings are in output size: cancelled pairs
-(net weight = 0 after merging) are eliminated before the cartesian product, and the
-remaining rows have their weights correctly summed so the product is exact.
-
-Feldera's equivalent is that its trace is always consolidated (the spine background-merges
-batches) and its delta batches are pushed through a `Batcher` before being passed to the
-join, which consolidates them.
-
-### What changes
-
-File: `gnitz/dbsp/ops/join.py`
-
-One-line change in `op_join_delta_delta`:
-
-```python
-# Before:
-with SortedScope(batch_a) as b_a:
-    with SortedScope(batch_b) as b_b:
-
-# After:
-with ConsolidatedScope(batch_a) as b_a:
-    with ConsolidatedScope(batch_b) as b_b:
-```
-
-Add `ConsolidatedScope` to the import:
-```python
-from gnitz.core.batch import ConsolidatedScope, SortedScope, BatchWriter
-```
-
-`SortedScope` is no longer needed in `join.py` after this change (it is still used
-elsewhere).
-
-### Impact
-
-For typical OLTP deltas where each PK appears at most once per tick, `to_consolidated()`
-and `to_sorted()` produce identical results and have the same cost. For update-heavy
-workloads (delete + re-insert on same PK), this eliminates the spurious cartesian product
-expansion and reduces output size by up to 2×.
+`SortedScope` replaced with `ConsolidatedScope` on both inputs in `op_join_delta_delta`.
+Eliminates spurious cartesian product expansion when the same PK appears multiple times in
+a delta (delete+reinsert same tick). Import updated: `SortedScope` removed from `join.py`.
 
 ---
 
-## Optimization 4: Intermediate Output Consolidation
+## Optimization 4: Intermediate Output Consolidation — DONE
 
-### Motivation
+**Commit:** J3+J4 commit (this session).
 
-Feldera consolidates output *during* the join loop using a `Batcher`:
-
-```rust
-if output_tuples.len() >= chunk_size / 3 {
-    batcher.push_batch(&mut output_tuples);  // consolidates here
-    if batcher.tuples() >= chunk_size {
-        yield (batch, false, position);
-        batcher = new Batcher();
-    }
-}
-```
-
-This keeps peak output batch memory bounded even for joins with high per-key fan-out, and
-eliminates zero-weight pairs early (e.g., when the same output key is produced by multiple
-input combinations and the weights cancel).
-
-Gnitz accumulates all output rows in the output `ArenaZSetBatch` without any intermediate
-consolidation. For joins that produce large intermediate outputs (e.g., a many-to-many join
-between two large deltas), this inflates peak memory unnecessarily.
-
-Gnitz's synchronous RPython model cannot `yield` mid-operator the way Feldera's async
-stream can. However, the *consolidation* benefit is still fully achievable within the
-synchronous model by periodically calling `to_consolidated()` on the output batch.
-
-### What changes
-
-#### Step 1 — Add `consolidate()` to `BatchWriter`
-
-File: `gnitz/core/batch.py`
-
-`BatchWriter` currently wraps `self._batch` (the output `ArenaZSetBatch`) as write-only.
-Add a consolidation method:
-
-```python
-class BatchWriter(object):
-    # ... existing methods ...
-
-    def consolidate(self):
-        """Consolidate the output batch in place, merging duplicate (PK, payload) pairs.
-        Frees the pre-consolidation batch if a new one was allocated."""
-        old = self._batch
-        new = old.to_consolidated()
-        if new is not old:
-            # to_consolidated() returned a new batch; replace and free the old one.
-            self._batch = new
-            old.free()
-```
-
-This is safe because `BatchWriter` is the exclusive writer to its underlying batch, and
-`to_consolidated()` is a functional operation that returns either `self` (if already
-consolidated) or a fresh batch. The `old.free()` call is safe because nothing else holds
-a reference to the pre-consolidation batch at the point `BatchWriter.consolidate()` is
-called (the `out_writer` is the sole owner).
-
-**RPython annotation**: `self._batch` is typed as `ArenaZSetBatch` throughout. The
-reassignment `self._batch = new` preserves that type. RPython's annotator handles this
-correctly because both `old` and `new` are `ArenaZSetBatch` instances.
-
-#### Step 2 — Add periodic consolidation to `op_join_delta_trace`
-
-File: `gnitz/dbsp/ops/join.py`
-
-Add a consolidation trigger in `_join_dt_normal` (and `_join_dt_swapped`):
-
-```python
-CONSOLIDATE_INTERVAL = 8192   # rows written before consolidation
-
-def _join_dt_normal(delta_batch, trace_cursor, out_writer, composite_acc):
-    count = delta_batch.length()
-    rows_since_consolidation = 0
-    for i in range(count):
-        # ... existing loop body ...
-        if w_out != r_int64(0):
-            out_writer.append_from_accessor(key, w_out, composite_acc)
-            rows_since_consolidation += 1
-            if rows_since_consolidation >= CONSOLIDATE_INTERVAL:
-                out_writer.consolidate()
-                rows_since_consolidation = 0
-```
-
-`CONSOLIDATE_INTERVAL = 8192` is a tunable constant. The cost is one `to_consolidated()`
-call (O(N) if already sorted by PK, O(N log N) if not) per 8K output rows. For joins that
-produce millions of output rows this is a net win; for joins that produce a few dozen rows
-the interval is never reached and there is zero overhead.
-
-#### Step 3 — Add consolidation in `op_join_delta_delta`
-
-The same `consolidate()` call applies after the cartesian product inner loop. However,
-because `op_join_delta_delta` with `ConsolidatedScope` already minimizes duplicates in the
-inputs, the trigger should be less frequent:
-
-```python
-CONSOLIDATE_INTERVAL_DD = 16384
-```
+- `BatchWriter._immutable_fields_` cleared (was `["_batch"]`; blocked JIT reassignment).
+- `BatchWriter.consolidate()` added: calls `to_consolidated()`, swaps `self._batch`, frees old.
+- `op_join_delta_trace`: counter-based trigger every `CONSOLIDATE_INTERVAL = 8192` rows.
+- `op_join_delta_delta`: same trigger every `CONSOLIDATE_INTERVAL_DD = 16384` rows.
+- **RPython gotcha fixed:** test called join operators with raw `ArenaZSetBatch` as
+  `out_writer` (unlike VM which wraps in `BatchWriter`). Annotator unified both call sites
+  → `ArenaZSetBatch` lacked `consolidate()`. Fixed by wrapping `b_out` in
+  `batch.BatchWriter(b_out)` at both test call sites, matching the VM pattern.
 
 ---
 
@@ -826,12 +736,12 @@ P2. mark_consolidated() at all production sites            ← source-optimizati
 P3. Seal in execute_epoch                                  ← source-optimizations.md Step 3
 
 # Join-specific, ordered by impact and dependency
-1. ConsolidatedScope in op_join_delta_delta     ← no join dependencies, 2-line change
+1. ConsolidatedScope in op_join_delta_delta     ← DONE (Opt 3)
 2. estimated_length() + seek_key_exact()        ← preconditions for (3)
 3. Adaptive cursor swapping + ConsolidatedScope in _join_dt_swapped  ← depends on (2)
 4. _join_dt_merge_walk + anti/semi-join walk    ← depends on P1–P3
-5. BatchWriter.consolidate()                    ← no dependencies
-6. Periodic consolidation in join operators     ← depends on (5)
+5. BatchWriter.consolidate()                    ← DONE (Opt 4)
+6. Periodic consolidation in join operators     ← DONE (Opt 4)
 7. NullAccessor + merge_schemas_outer           ← no dependencies
 8. op_join_delta_trace_outer + opcodes          ← depends on (7)
 9. _gather_shard_rows + create_filtered_cursor  ← no dependencies for helper
@@ -858,3 +768,4 @@ Each optimization has a natural regression target:
 | Prefetch | `partitioned_table_test` or new test | Join against large shard (>L3 cache): verify correctness; benchmark seek count |
 
 All tests must be run with `GNITZ_WORKERS=4` per project convention.
+

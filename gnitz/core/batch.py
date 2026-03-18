@@ -931,7 +931,7 @@ class BatchWriter(object):
     to prevent operators from accidentally reading or mutating existing data.
     """
 
-    _immutable_fields_ = ["_batch"]
+    _immutable_fields_ = []
 
     def __init__(self, batch):
         if batch.length() != 0:
@@ -966,6 +966,15 @@ class BatchWriter(object):
 
     def mark_consolidated(self, value):
         self._batch.mark_consolidated(value)
+
+    def consolidate(self):
+        """Consolidate the output batch in place, merging duplicate (PK, payload) pairs.
+        Frees the pre-consolidation batch if a new one was allocated."""
+        old = self._batch
+        new = old.to_consolidated()
+        if new is not old:
+            self._batch = new
+            old.free()
 
 
 # ---------------------------------------------------------------------------
