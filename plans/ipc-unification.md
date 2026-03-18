@@ -131,7 +131,16 @@ Remove entirely:
 | `_copy_raw` | only used by above |
 | `IPCPayload.owned_bufs` field | no scratch buffers needed |
 
-### 2b. Add `CONTROL_SCHEMA` and constants
+### 2b. Add imports and `CONTROL_SCHEMA` and constants
+
+Add to the import block:
+```python
+from gnitz.storage import wal_columnar, wal_layout
+from gnitz.storage import buffer as buffer_ops   # rename existing 'buffer' import
+```
+(`buffer_ops` is the alias used throughout the plan code for `buffer.Buffer` / `buffer.c_memmove`.)
+
+### 2c. Add `CONTROL_SCHEMA` and constants
 
 ```python
 IPC_CONTROL_TID = -1   # intmask(u32_all_ones); set_table_id(0xFFFFFFFF) → get_table_id() = -1
@@ -167,7 +176,7 @@ FLAG_HAS_DATA   = r_uint64(1 << 49)   # set when data block follows schema block
 `FLAG_HAS_SCHEMA` and `FLAG_HAS_DATA` are new high bits in the existing `flags` field;
 they do not conflict with the existing low-bit protocol flags.
 
-### 2c. `IPCPayload` simplification
+### 2d. `IPCPayload` simplification
 
 No `_immutable_fields_` (post-construction assignment pattern is incompatible); the JIT
 optimization is recovered by `@jit.dont_look_inside` on callers.
@@ -176,7 +185,7 @@ optimization is recovered by `@jit.dont_look_inside` on callers.
 class IPCPayload(object):
     def __init__(self):
         self.fd           = -1
-        self.ptr          = rffi.cast(rffi.CCHARP, 0)
+        self.ptr          = lltype.nullptr(rffi.CCHARP.TO)
         self.total_size   = 0
         self.batch        = None
         self.schema       = None
@@ -201,7 +210,7 @@ class IPCPayload(object):
 `close()` uses existing `mmap_posix.munmap_file` and `os.close` — no new FFI helpers
 needed. No `for buf in owned_bufs: buf.free()` loop.
 
-### 2d. Control batch helpers
+### 2e. Control batch helpers
 
 ```python
 def _encode_control_batch(target_id, client_id, flags, seek_pk_lo, seek_pk_hi,
@@ -242,13 +251,12 @@ def _decode_control_batch(ctrl_batch, payload):
         payload.error_msg = string_logic.resolve_string(sptr, hptr, py_s)
 ```
 
-### 2e. `serialize_to_memfd` rewrite
+### 2f. `serialize_to_memfd` rewrite
 
-Uses `Buffer(0, growable=True)` — `encode_batch_to_buffer` calls `block_buf.reset()` then
-`block_buf.alloc(...)` which drives `ensure_capacity` automatically. Block size is
-`buf.offset` after encoding. Note: `mmap_posix.mmap_file` + `mmap_posix.munmap_file` +
-`mmap_posix.memfd_create_c` + `mmap_posix.ftruncate_c` — not fictitious `ipc_ffi`
-helpers; these already exist in the codebase.
+`Buffer(0)` is growable by default. `encode_batch_to_buffer` calls `block_buf.reset()` then
+`block_buf.alloc(...)` which triggers `ensure_capacity` on the first call. All three encode
+buffers are allocated before any encoding begins so a single `try/finally` covers all of
+them — if any `encode_batch_to_buffer` call raises, no buffer leaks.
 
 ```python
 @jit.dont_look_inside
@@ -258,58 +266,54 @@ def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
     has_data   = zbatch is not None and zbatch.length() > 0
     has_schema = has_data or (schema is not None and status == STATUS_OK)
 
-    # Build control flags
     ctrl_flags = r_uint64(flags)
     if has_schema:
         ctrl_flags = ctrl_flags | FLAG_HAS_SCHEMA
     if has_data:
         ctrl_flags = ctrl_flags | FLAG_HAS_DATA
 
-    # Encode control block
-    ctrl_batch = _encode_control_batch(
-        target_id, client_id, ctrl_flags,
-        seek_pk_lo, seek_pk_hi, seek_col_idx,
-        status, error_msg,
-    )
-    ctrl_buf = buffer_ops.Buffer(0)
-    wal_columnar.encode_batch_to_buffer(
-        ctrl_buf, CONTROL_SCHEMA, r_uint64(0), IPC_CONTROL_TID, ctrl_batch
-    )
-    ctrl_batch.free()
-    ctrl_size = ctrl_buf.offset
-
-    # Encode schema block
-    schema_size = 0
-    schema_buf  = buffer_ops.Buffer(0)
-    if has_schema:
-        schema_batch = schema_to_batch(schema if schema is not None else zbatch._schema)
-        wal_columnar.encode_batch_to_buffer(
-            schema_buf, META_SCHEMA, r_uint64(0), target_id, schema_batch
-        )
-        schema_batch.free()
-        schema_size = schema_buf.offset
-
-    # Encode data block
-    data_size = 0
-    data_buf  = buffer_ops.Buffer(0)
-    if has_data:
-        wal_columnar.encode_batch_to_buffer(
-            data_buf, zbatch._schema, r_uint64(0), target_id, zbatch
-        )
-        data_size = data_buf.offset
-
-    total_size = ctrl_size + schema_size + data_size
-    if total_size == 0:
-        total_size = wal_layout.WAL_BLOCK_HEADER_SIZE  # floor
-
-    fd = mmap_posix.memfd_create_c("gnitz_ipc")
-    mmap_posix.ftruncate_c(fd, total_size)
-    ptr = mmap_posix.mmap_file(
-        fd, total_size,
-        prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
-        flags=mmap_posix.MAP_SHARED,
-    )
+    ctrl_buf   = buffer_ops.Buffer(0)
+    schema_buf = buffer_ops.Buffer(0)
+    data_buf   = buffer_ops.Buffer(0)
     try:
+        ctrl_batch = _encode_control_batch(
+            target_id, client_id, ctrl_flags,
+            seek_pk_lo, seek_pk_hi, seek_col_idx,
+            status, error_msg,
+        )
+        wal_columnar.encode_batch_to_buffer(
+            ctrl_buf, CONTROL_SCHEMA, r_uint64(0), IPC_CONTROL_TID, ctrl_batch
+        )
+        ctrl_batch.free()
+        ctrl_size = ctrl_buf.offset
+
+        schema_size = 0
+        if has_schema:
+            schema_batch = schema_to_batch(schema if schema is not None else zbatch._schema)
+            wal_columnar.encode_batch_to_buffer(
+                schema_buf, META_SCHEMA, r_uint64(0), target_id, schema_batch
+            )
+            schema_batch.free()
+            schema_size = schema_buf.offset
+
+        data_size = 0
+        if has_data:
+            wal_columnar.encode_batch_to_buffer(
+                data_buf, zbatch._schema, r_uint64(0), target_id, zbatch
+            )
+            data_size = data_buf.offset
+
+        total_size = ctrl_size + schema_size + data_size
+        if total_size == 0:
+            total_size = wal_layout.WAL_BLOCK_HEADER_SIZE  # defensive floor
+
+        fd = mmap_posix.memfd_create_c("gnitz_ipc")
+        mmap_posix.ftruncate_c(fd, total_size)
+        ptr = mmap_posix.mmap_file(
+            fd, total_size,
+            prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
+            flags=mmap_posix.MAP_SHARED,
+        )
         if ctrl_size > 0:
             buffer_ops.c_memmove(
                 rffi.cast(rffi.VOIDP, ptr),
@@ -328,8 +332,8 @@ def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
                 rffi.cast(rffi.VOIDP, data_buf.base_ptr),
                 rffi.cast(rffi.SIZE_T, data_size),
             )
-    finally:
         mmap_posix.munmap_file(ptr, total_size)
+    finally:
         ctrl_buf.free()
         schema_buf.free()
         data_buf.free()
@@ -339,10 +343,12 @@ def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
 
 `send_batch` unpacks the tuple: `memfd, _size = serialize_to_memfd(...)`.
 
-### 2f. `_recv_and_parse` rewrite
+### 2g. `_recv_and_parse` rewrite
 
-Blocks are self-delimiting: read `WAL_OFF_SIZE` from each block header to find the next.
-No explicit block-size fields needed.
+Blocks are self-delimiting via `get_total_size()`. Bounds-check `off` before reading each
+block header. Explicit guard for `FLAG_HAS_DATA` without `FLAG_HAS_SCHEMA` (protocol
+error, not a silent skip). Exception handler restores pre-`IPCPayload` cleanup behaviour:
+on any error after mmap, `payload.close()` is called to unmap and close the fd.
 
 ```python
 @jit.dont_look_inside
@@ -362,40 +368,53 @@ def _recv_and_parse(fd):
     )
     payload.ptr = ptr
 
-    # Block 0: control — always present
-    ctrl_header = wal_layout.WALBlockHeaderView(ptr)
-    if ctrl_header.get_table_id() != IPC_CONTROL_TID:
-        raise errors.StorageError("IPC: bad control block TID")
-    ctrl_size  = ctrl_header.get_total_size()
-    ctrl_batch = wal_columnar.decode_batch_from_ptr(ptr, ctrl_size, CONTROL_SCHEMA)
-    _decode_control_batch(ctrl_batch, payload)   # sets all fields incl. target_id
-    ctrl_batch.free()
+    try:
+        # Block 0: control — always present
+        ctrl_header = wal_layout.WALBlockHeaderView(ptr)
+        if ctrl_header.get_table_id() != IPC_CONTROL_TID:
+            raise errors.StorageError("IPC: bad control block TID")
+        ctrl_size  = ctrl_header.get_total_size()
+        ctrl_batch = wal_columnar.decode_batch_from_ptr(ptr, ctrl_size, CONTROL_SCHEMA)
+        _decode_control_batch(ctrl_batch, payload)
+        ctrl_batch.free()
 
-    off = ctrl_size
+        off = ctrl_size
 
-    # Block 1: schema — if FLAG_HAS_SCHEMA
-    if payload.flags & FLAG_HAS_SCHEMA:
-        schema_size = wal_layout.WALBlockHeaderView(rffi.ptradd(ptr, off)).get_total_size()
-        schema_batch = wal_columnar.decode_batch_from_ptr(
-            rffi.ptradd(ptr, off), schema_size, META_SCHEMA
-        )
-        payload.schema = batch_to_schema(schema_batch)
-        schema_batch.free()
-        off += schema_size
+        # Validate FLAG_HAS_DATA/SCHEMA consistency
+        if payload.flags & FLAG_HAS_DATA and not (payload.flags & FLAG_HAS_SCHEMA):
+            raise errors.StorageError("IPC: FLAG_HAS_DATA requires FLAG_HAS_SCHEMA")
 
-    # Block 2: data — if FLAG_HAS_DATA
-    if payload.flags & FLAG_HAS_DATA and payload.schema is not None:
-        data_size = wal_layout.WALBlockHeaderView(rffi.ptradd(ptr, off)).get_total_size()
-        payload.batch = wal_columnar.decode_batch_from_ptr(
-            rffi.ptradd(ptr, off), data_size, payload.schema
-        )
-        # batch holds non-owning Buffer views into ptr (the mmap).
-        # Must not be used after payload.close().
+        # Block 1: schema — if FLAG_HAS_SCHEMA
+        if payload.flags & FLAG_HAS_SCHEMA:
+            if off + wal_layout.WAL_BLOCK_HEADER_SIZE > total_size:
+                raise errors.StorageError("IPC: truncated schema block")
+            schema_size = wal_layout.WALBlockHeaderView(rffi.ptradd(ptr, off)).get_total_size()
+            schema_batch = wal_columnar.decode_batch_from_ptr(
+                rffi.ptradd(ptr, off), schema_size, META_SCHEMA
+            )
+            payload.schema = batch_to_schema(schema_batch)
+            schema_batch.free()
+            off += schema_size
+
+        # Block 2: data — if FLAG_HAS_DATA
+        if payload.flags & FLAG_HAS_DATA:
+            if off + wal_layout.WAL_BLOCK_HEADER_SIZE > total_size:
+                raise errors.StorageError("IPC: truncated data block")
+            data_size = wal_layout.WALBlockHeaderView(rffi.ptradd(ptr, off)).get_total_size()
+            payload.batch = wal_columnar.decode_batch_from_ptr(
+                rffi.ptradd(ptr, off), data_size, payload.schema
+            )
+            # batch holds non-owning Buffer views into ptr (the mmap).
+            # Must not be used after payload.close().
+
+    except Exception as e:
+        payload.close()
+        raise e
 
     return payload
 ```
 
-## Step 3 — `send_batch` / `serialize_to_memfd` signature
+## Step 3 — `send_batch` update
 
 `serialize_to_memfd` now returns `(fd, total_size)`. Update `send_batch`:
 
@@ -478,19 +497,24 @@ tolerance.
 
 ## Validated Assumptions
 
-| Claim | Evidence |
-|---|---|
-| `encode_batch_to_buffer` handles count=0 | writes header with count=0; `count * 8` region sizes → 0; skips no code |
-| `decode_batch_from_buffer` owns `raw_buf` | `WALColumnarBlock.free()` calls `lltype.free(self._raw_buf, flavor="raw")` |
-| `Buffer.from_external_ptr.free()` is a no-op | `if self.is_owned: lltype.free(...)` — external ptrs have `is_owned=False`; pointer is nulled but not freed |
-| `batch_to_schema` survives munmap | uses `rffi.charpsize2str` → Python str; `TableSchema` holds only Python objects |
-| `IPCPayload.owned_bufs` holds only string conversion buffers | `_parse_zset_section` appends `col_buf` and `shared_blob_buf`; nothing else |
-| WAL block checksum protects data integrity | XXHash64 over everything after header, verified on decode |
-| `@jit.dont_look_inside` on IPC functions | `serialize_to_memfd` line 461, `_recv_and_parse` line 761 |
-| `Buffer(0, growable=True)` works with `encode_batch_to_buffer` | function calls `block_buf.reset()` then `block_buf.alloc(...)` which drives `ensure_capacity`; auto-grows |
-| `mmap_posix.munmap_file` / `os.close` are the correct cleanup calls | current `IPCPayload.close()` uses exactly these; `ipc_ffi.munmap` / `ipc_ffi.close_fd` do not exist |
-| `WALBlockHeaderView.get_total_size()` gives block size | `WAL_OFF_SIZE = 16`, u32 getter; used by `WALReader.read_next_block()` today |
-| `_immutable_fields_` removed from `IPCPayload` | post-construction assignment (`payload.flags = ...`) is incompatible with immutable field JIT hints; removing them is correct |
-| `ipc_ffi` exports only `send_fd`, `recv_fd`, `recv_fd_nb`, `poll`, `create_socketpair`, `server_create`, `server_accept` | confirmed by reading `ipc_ffi.py`; no `munmap`, `close_fd`, `create_memfd`, `mmap_fd` |
-| `IPC_CONTROL_TID` must be `-1`, not `0xFFFFFFFF` | `set_table_id(0xFFFFFFFF)` stores all-ones bits; `get_table_id()` returns `intmask(u32_all_ones) = -1`; the sentinel check `get_table_id() != IPC_CONTROL_TID` would be `-1 != 4294967295` — always True, always raising StorageError |
-| `target_id` cannot be inferred from schema/data block TID for allocation responses | allocation responses (FLAG_ALLOCATE_*) carry no schema or data block; without an explicit `target_id` field in CONTROL_SCHEMA, `payload.target_id` is always 0 for these responses — the allocated ID is lost |
+| Claim | Verdict | Evidence |
+|---|---|---|
+| `encode_batch_to_buffer` handles count=0 | ✓ | writes header with count=0; `count * 8` region sizes → 0; skips no code |
+| `decode_batch_from_buffer` owns `raw_buf` | ✓ | `WALColumnarBlock.free()` calls `lltype.free(self._raw_buf, flavor="raw")` |
+| `Buffer.from_external_ptr.free()` is a no-op on memory | ✓ | `if self.is_owned: lltype.free(...)` — external ptrs have `is_owned=False`; pointer is nulled but not freed |
+| `batch_to_schema` survives munmap | ✓ | uses `rffi.charpsize2str` → Python str; `TableSchema` holds only Python objects |
+| WAL block checksum protects data integrity | ✓ | XXHash64 over everything after header, verified on decode |
+| `Buffer(0)` works with `encode_batch_to_buffer` | ✓ | `growable=True` is default; `ensure_capacity` triggers on first alloc; `malloc(0)` + grow on first use is safe |
+| `mmap_posix.munmap_file` / `os.close` are the correct cleanup calls | ✓ | confirmed; `ipc_ffi` has no `munmap`, `close_fd`, `create_memfd`, `mmap_fd` |
+| `WALBlockHeaderView.get_total_size()` gives block size | ✓ | `WAL_OFF_SIZE = 16`, u32 getter |
+| `_immutable_fields_` removed from `IPCPayload` | ✓ | post-construction assignment is incompatible with immutable field JIT hints |
+| `ipc_ffi` exports only 7 functions | ✓ | confirmed by reading `ipc_ffi.py` |
+| `IPC_CONTROL_TID` must be `-1`, not `0xFFFFFFFF` | ✓ | `set_table_id(-1)` → `rffi.cast(rffi.UINT, -1)` stores 0xFFFFFFFF; `get_table_id()` → `intmask(0xFFFFFFFF) = -1` |
+| `target_id` cannot be inferred from schema/data block TID for allocation responses | ✓ | FLAG_ALLOCATE_* responses carry no schema or data block |
+| `get_str_struct` on null column is safe | ✓ | reads 16 zero bytes from column buffer; `unpack_string` exits immediately on `length == 0`; no blob dereference |
+| `FLAG_HAS_SCHEMA/DATA` bits 48/49 don't conflict with existing flags | ✓ | highest existing flag is `FLAG_ALLOCATE_INDEX_ID = 512 = 2⁹` |
+| `rffi.cast(rffi.CCHARP, 0)` in `IPCPayload.__init__` | ✗ FIXED | inconsistent with `lltype.nullptr(rffi.CCHARP.TO)` used in `close()`; RPython annotator prefers consistent null-pointer form — use `lltype.nullptr` throughout |
+| `serialize_to_memfd` try/finally covers only memmove | ✗ FIXED | buffers allocated before try → leak if encode raises; moved all allocs inside single try/finally |
+| `_recv_and_parse` reads block header at `off` without bounds check | ✗ FIXED | truncated payload → SIGSEGV; added `off + WAL_BLOCK_HEADER_SIZE > total_size` guard before each header read |
+| `FLAG_HAS_DATA` without `FLAG_HAS_SCHEMA` silently skipped | ✗ FIXED | protocol error should raise explicitly, not silently produce a no-data payload |
+| `_recv_and_parse` has no exception handler | ✗ FIXED | on parse error after mmap, fd and ptr leaked; added `except` that calls `payload.close()` |
