@@ -1,7 +1,6 @@
 # Master Implementation Plan
 
-**Completed:** Units 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 18a/b/c/s5a (IPC + rust_client wire format).
-**In progress:** Unit 18 Step 5b (rust_client design cleanup).
+**Completed:** Units 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 18 (IPC unification + rust_client).
 
 ## Dependency Graph
 
@@ -9,22 +8,11 @@
 Phase 1 ─── all unblocked ──────────────────────────────────────────────
   [6b] Join bug fixes    [9] Exchange Standalone    [10] Exchange IPC Flags
   (B1,B2,B3)                 (Opt 1,4,5,6)               (Opt 3)
-                         [18s5b] rust_client cleanup
-                              (Message flatten, field renames)
-  [16] Push-time routing ─── depends on [9]; benefits from [10]
-       (Opt 2)
-
-Phase 2 ─── depends on [18a/b/c/s5a]✓ ────────────────────────────────
-  [9] Exchange Standalone    [18s5] rust_client update
-      (Opt 1,4,5,6)               (IPC wire format)
-
-  [10] Exchange IPC Flags ─── unblocked ([4]✓ + [18a/b/c]✓)
-       (Opt 3)
 
   [16] Push-time routing ─── depends on [9]; benefits from [10]
        (Opt 2)
 
-Phase 4 ─── depends on [18a/b/c]✓ ─────────────────────────────────────
+Phase 2 ─── now unblocked (Unit 18 complete) ───────────────────────────
   [19] WAL-Block Improvements
 
 Phase 3 ─── new features, all independent ──────────────────────────────
@@ -53,9 +41,9 @@ Three correctness/cleanup gaps left by Units 6 + 8:
 
 ---
 
-## Phase 1: Exchange + IPC rust_client
+## Phase 1: Exchange
 
-**[6b], [9], [10], [18s5] are all independent. [16] must follow [9].**
+**[6b], [9], [10] are all independent. [16] must follow [9].**
 
 ### Unit 9: Exchange Standalone
 **Plan:** `exchange-optimizations.md` Opts 1, 4, 5, 6 | **~60 lines**
@@ -70,7 +58,7 @@ Three correctness/cleanup gaps left by Units 6 + 8:
 **Tests:** Existing exchange + multi-worker tests. Add assertion that sub-batch `_sorted` equals input `_sorted` in `test_repartition_batch`.
 
 ### Unit 10: Exchange IPC Flags
-**Plan:** `exchange-optimizations.md` Opt 3 | **Unblocked** | **~20 lines**
+**Plan:** `exchange-optimizations.md` Opt 3 | **~20 lines**
 
 Sorted/consolidated flags carried as new high bits in `CONTROL_SCHEMA.flags` (alongside `FLAG_HAS_SCHEMA` / `FLAG_HAS_DATA`).
 
@@ -96,28 +84,14 @@ For `INPUT → SHARD → REDUCE` circuits, master routes directly to shard-colum
 
 **Tests:** `test_trivial_preplan_no_exchange` (new, `GNITZ_WORKERS=4`); `test_push_scan_multiworker` regression.
 
-### Unit 18 Step 5b: rust_client Design Cleanup
-**Plan:** `ipc-unification.md` Step 5b | **In progress** | **Rust only**
-
-Wire format correct (5a done, 27 unit tests pass). Remaining cosmetic cleanup:
-
-| Item | File | Change |
-|---|---|---|
-| `TypeCode::String.wire_stride()` returns 8, should be 16 | `gnitz-protocol/src/types.rs` | Fix return value |
-| `Message` nests `header: Header` | `gnitz-protocol/src/message.rs` | Flatten to top-level fields |
-| `send_message` takes `Header` param | `gnitz-protocol/src/message.rs` | Rewrite to positional args |
-| `msg.header.status/target_id/client_id` | `gnitz-core/src/connection.rs`, `gnitz-core/src/ops.rs` | Update to `msg.status/target_id/client_id` |
-
-**Tests:** `cargo test`; `GNITZ_WORKERS=4 make e2e`.
-
 ---
 
 ## Phase 2: WAL-Block Improvements
 
 ### Unit 19: WAL-Block Improvements
-**Plan:** `wal-block-improvements.md` | **Depends on Unit 18a/b/c ✓** | **~6 commits**
+**Plan:** `wal-block-improvements.md` | **Now unblocked (Unit 18 complete)** | **~6 commits**
 
-Each item is a separate commit; independent of each other once IPC unification is done.
+Each item is a separate commit; independent of each other.
 
 | Item | Files | Change |
 |---|---|---|
@@ -210,9 +184,8 @@ Picks overfull L1 guard, merges with overlapping L2 guards, enforces Lazy Leveli
 
 ## Execution Strategy
 
-**In progress:** Unit 18 Step 5b (rust_client cleanup).
-**Next (all unblocked, do in parallel):** Join bug fixes (B1/B2/B3), Unit 9 (Exchange), Unit 10 (Exchange IPC Flags), Units 20+ (FLSM).
-**Then:** Unit 16 (push-time routing, after Unit 9); Unit 19 (WAL-Block Improvements, after Unit 18 complete).
+**Next (all unblocked, do in parallel):** Join bug fixes (B1/B2/B3), Unit 9 (Exchange), Unit 10 (Exchange IPC Flags), Unit 19 (WAL-Block Improvements), Units 20+ (FLSM).
+**Then:** Unit 16 (push-time routing, after Unit 9).
 **Then:** Units 13-15, 17 (new features, any order).
 **FLSM track:** Units 20→21→22→23 sequentially, independent of all other work.
 
