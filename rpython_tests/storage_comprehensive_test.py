@@ -2311,6 +2311,407 @@ def test_flsm_manifest_persistence(base_dir):
     os.write(1, "    [OK] FLSM manifest V3 persistence passed.\n")
 
 
+def test_flsm_horizontal_compaction(base_dir):
+    os.write(1, "[Storage] Testing FLSM horizontal compaction...\n")
+    schema = make_u64_i64_schema()
+
+    shard_dir = os.path.join(base_dir, "flsm_hcomp")
+    rposix.mkdir(shard_dir, 0o755)
+    rc = refcount.RefCounter()
+    idx = flsm.FLSMIndex(77, schema, rc, shard_dir)
+
+    l1 = idx.get_or_create_level(1)
+    guard = flsm.LevelGuard(r_uint64(0), r_uint64(0))
+    l1.insert_guard_sorted(guard)
+
+    # Create 6 shard files (10 distinct rows each, PKs 0-9, 10-19, ..., 50-59)
+    i = 0
+    while i < 6:
+        shard_path = shard_dir + "/hcomp_src_%d.db" % i
+        sw = writer_table.TableShardWriter(schema, table_id=77)
+        row = 0
+        while row < 10:
+            pk = r_uint128(i * 10 + row)
+            tmp = batch.ArenaZSetBatch(schema)
+            rb = RowBuilder(schema, tmp)
+            rb.begin(pk, r_int64(1))
+            rb.put_int(r_int64(i * 10 + row))
+            rb.commit()
+            sw.add_row_from_accessor(pk, r_int64(1), tmp.get_accessor(0))
+            tmp.free()
+            row += 1
+        sw.finalize(shard_path)
+        h = index.ShardHandle(shard_path, schema, r_uint64(0), r_uint64(0))
+        guard.add_handle(rc, h)
+        i += 1
+
+    assert_equal_i(6, len(guard.handles), "Expected 6 handles before compaction")
+    assert_true(guard.needs_horizontal_compact(flsm.GUARD_FILE_THRESHOLD),
+                "Guard should need horizontal compaction")
+
+    idx.compact_guards_if_needed()
+
+    assert_equal_i(1, len(guard.handles), "Expected 1 handle after horizontal compaction")
+    assert_equal_i(1, len(l1.guards), "Guard count should be unchanged")
+    assert_equal_i(1, len(idx.levels), "No new level should be created")
+
+    # Verify data integrity
+    out_view = shard_table.TableShardView(guard.handles[0].filename, schema)
+    assert_equal_i(60, out_view.count, "Expected 60 rows in merged shard")
+    out_view.close()
+
+    idx.close_all()
+    os.write(1, "    [OK] FLSM horizontal compaction passed.\n")
+
+
+def test_flsm_horizontal_ghost_elimination(base_dir):
+    os.write(1, "[Storage] Testing FLSM horizontal ghost elimination...\n")
+    schema = make_u64_i64_schema()
+
+    shard_dir = os.path.join(base_dir, "flsm_hghost")
+    rposix.mkdir(shard_dir, 0o755)
+    rc = refcount.RefCounter()
+    idx = flsm.FLSMIndex(78, schema, rc, shard_dir)
+
+    l1 = idx.get_or_create_level(1)
+    guard = flsm.LevelGuard(r_uint64(0), r_uint64(0))
+    l1.insert_guard_sorted(guard)
+
+    # Shard 0: pk=10 (+1), pk=20 (+1), pk=30 (+1)
+    # Shard 1: pk=10 (-1) — cancels shard 0's pk=10
+    # Shard 2: pk=40 (+1), pk=50 (+1)
+    # Shard 3: pk=20 (-1) — cancels shard 0's pk=20
+    # Shard 4: pk=60 (+1)
+    shard_specs = [
+        [(r_uint128(10), r_int64(1)), (r_uint128(20), r_int64(1)), (r_uint128(30), r_int64(1))],
+        [(r_uint128(10), r_int64(-1))],
+        [(r_uint128(40), r_int64(1)), (r_uint128(50), r_int64(1))],
+        [(r_uint128(20), r_int64(-1))],
+        [(r_uint128(60), r_int64(1))],
+    ]
+    original_paths = newlist_hint(5)
+    s = 0
+    while s < 5:
+        shard_path = shard_dir + "/ghost_src_%d.db" % s
+        original_paths.append(shard_path)
+        sw = writer_table.TableShardWriter(schema, table_id=78)
+        for pk, w in shard_specs[s]:
+            tmp = batch.ArenaZSetBatch(schema)
+            rb = RowBuilder(schema, tmp)
+            rb.begin(pk, w)
+            rb.put_int(r_int64(intmask(pk)))
+            rb.commit()
+            sw.add_row_from_accessor(pk, w, tmp.get_accessor(0))
+            tmp.free()
+        sw.finalize(shard_path)
+        h = index.ShardHandle(shard_path, schema, r_uint64(0), r_uint64(0))
+        guard.add_handle(rc, h)
+        s += 1
+
+    idx.compact_guards_if_needed()
+
+    assert_equal_i(1, len(guard.handles), "Expected 1 handle after ghost elimination")
+
+    out_view = shard_table.TableShardView(guard.handles[0].filename, schema)
+    assert_equal_i(4, out_view.count, "Expected 4 surviving rows (pk=30,40,50,60)")
+    out_view.close()
+
+    # Original shard files must be deleted
+    p = 0
+    while p < 5:
+        if os.path.exists(original_paths[p]):
+            raise Exception("Original shard %d should have been deleted" % p)
+        p += 1
+
+    idx.close_all()
+    os.write(1, "    [OK] FLSM horizontal ghost elimination passed.\n")
+
+
+def _make_single_row_shard(path, schema, table_id, pk_val):
+    sw = writer_table.TableShardWriter(schema, table_id=table_id)
+    tmp = batch.ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, tmp)
+    rb.begin(r_uint128(pk_val), r_int64(1))
+    rb.put_int(r_int64(pk_val))
+    rb.commit()
+    sw.add_row_from_accessor(r_uint128(pk_val), r_int64(1), tmp.get_accessor(0))
+    tmp.free()
+    sw.finalize(path)
+
+
+def test_flsm_lmax_horizontal_threshold(base_dir):
+    os.write(1, "[Storage] Testing FLSM Lmax horizontal threshold...\n")
+    schema = make_u64_i64_schema()
+
+    shard_dir = os.path.join(base_dir, "flsm_lmax")
+    rposix.mkdir(shard_dir, 0o755)
+    rc = refcount.RefCounter()
+    idx = flsm.FLSMIndex(79, schema, rc, shard_dir)
+
+    # Sub-test A: L2 fires at 2 handles (LMAX_FILE_THRESHOLD=1, trigger when > 1)
+    l2 = idx.get_or_create_level(2)
+    guard_a = flsm.LevelGuard(r_uint64(0), r_uint64(0))
+    l2.insert_guard_sorted(guard_a)
+
+    p0 = shard_dir + "/lmax_a0.db"
+    p1 = shard_dir + "/lmax_a1.db"
+    _make_single_row_shard(p0, schema, 79, 1)
+    _make_single_row_shard(p1, schema, 79, 2)
+    guard_a.add_handle(rc, index.ShardHandle(p0, schema, r_uint64(0), r_uint64(0)))
+    guard_a.add_handle(rc, index.ShardHandle(p1, schema, r_uint64(0), r_uint64(0)))
+
+    assert_true(guard_a.needs_horizontal_compact(flsm.LMAX_FILE_THRESHOLD),
+                "L2 guard with 2 handles should need compaction (threshold=1)")
+    idx.compact_guards_if_needed()
+    assert_equal_i(1, len(guard_a.handles), "L2 guard should have 1 handle after compaction")
+
+    # Sub-test B: L1 does NOT fire at exactly 4 handles (threshold=4, trigger when > 4)
+    l1 = idx.get_or_create_level(1)
+    guard_b = flsm.LevelGuard(r_uint64(1000), r_uint64(0))
+    l1.insert_guard_sorted(guard_b)
+
+    j = 0
+    while j < 4:
+        pb = shard_dir + "/lmax_b%d.db" % j
+        _make_single_row_shard(pb, schema, 79, 1000 + j)
+        guard_b.add_handle(rc, index.ShardHandle(pb, schema, r_uint64(0), r_uint64(0)))
+        j += 1
+
+    assert_true(not guard_b.needs_horizontal_compact(flsm.GUARD_FILE_THRESHOLD),
+                "L1 guard with exactly 4 handles should NOT need compaction")
+    idx.compact_guards_if_needed()
+    assert_equal_i(4, len(guard_b.handles), "L1 guard with 4 handles should be unchanged")
+
+    # Sub-test C: L1 fires at 5 handles
+    pc = shard_dir + "/lmax_b4.db"
+    _make_single_row_shard(pc, schema, 79, 1004)
+    guard_b.add_handle(rc, index.ShardHandle(pc, schema, r_uint64(0), r_uint64(0)))
+
+    assert_true(guard_b.needs_horizontal_compact(flsm.GUARD_FILE_THRESHOLD),
+                "L1 guard with 5 handles should need compaction")
+    idx.compact_guards_if_needed()
+    assert_equal_i(1, len(guard_b.handles), "L1 guard should have 1 handle after compaction")
+
+    idx.close_all()
+    os.write(1, "    [OK] FLSM Lmax horizontal threshold passed.\n")
+
+
+def test_flsm_multilevel_compaction(base_dir):
+    os.write(1, "[Storage] Testing FLSM multilevel compaction...\n")
+    schema = make_u64_i64_schema()
+
+    shard_dir = os.path.join(base_dir, "flsm_ml")
+    rposix.mkdir(shard_dir, 0o755)
+    rc = refcount.RefCounter()
+    idx = flsm.FLSMIndex(80, schema, rc, shard_dir)
+
+    l1 = idx.get_or_create_level(1)
+    guard_keys_lo = [100, 200, 300, 400, 500]
+    g = 0
+    while g < 5:
+        gk_lo = guard_keys_lo[g]
+        guard = flsm.LevelGuard(r_uint64(gk_lo), r_uint64(0))
+        l1.insert_guard_sorted(guard)
+        j = 0
+        while j < 4:
+            pk_val = gk_lo + 1 + j
+            path = shard_dir + "/ml_g%d_s%d.db" % (g, j)
+            _make_single_row_shard(path, schema, 80, pk_val)
+            guard.add_handle(rc, index.ShardHandle(path, schema, r_uint64(0), r_uint64(0)))
+            j += 1
+        g += 1
+
+    assert_equal_i(5, len(l1.guards), "Expected 5 L1 guards before vertical compaction")
+    assert_equal_i(20, l1.total_file_count(), "Expected 20 L1 files before vertical compaction")
+
+    idx.compact_guard_vertical_if_needed(1)
+
+    assert_true(len(idx.levels) >= 2, "L2 should be created after vertical compaction")
+    assert_true(len(idx.levels[1].guards) >= 1, "L2 should have at least one guard")
+    assert_equal_i(4, len(l1.guards), "L1 should have 4 guards after promoting worst")
+    assert_equal_i(16, l1.total_file_count(), "L1 should have 16 files after promoting one guard")
+
+    # Scan all rows: no data loss
+    all_handles = idx.all_handles_for_cursor()
+    total_rows = 0
+    hi = 0
+    while hi < len(all_handles):
+        v = shard_table.TableShardView(all_handles[hi].filename, schema)
+        total_rows += v.count
+        v.close()
+        hi += 1
+    assert_equal_i(20, total_rows, "Expected 20 rows total across all levels")
+
+    # Point lookup for each PK
+    gi = 0
+    while gi < 5:
+        gk_lo = guard_keys_lo[gi]
+        j = 0
+        while j < 4:
+            pk_val = gk_lo + 1 + j
+            results = idx.find_all_shards_and_indices(r_uint128(pk_val))
+            assert_true(len(results) > 0, "PK %d should be present" % pk_val)
+            j += 1
+        gi += 1
+
+    # Every L2 guard has exactly 1 handle (Z=1)
+    l2 = idx.levels[1]
+    gi2 = 0
+    while gi2 < len(l2.guards):
+        assert_equal_i(1, len(l2.guards[gi2].handles),
+                       "L2 guard %d should have exactly 1 handle" % gi2)
+        gi2 += 1
+
+    # L2 guard keys are sorted ascending
+    gi3 = 1
+    while gi3 < len(l2.guards):
+        if l2.guards[gi3].guard_key() <= l2.guards[gi3 - 1].guard_key():
+            raise Exception("L2 guards not sorted at index %d" % gi3)
+        gi3 += 1
+
+    idx.close_all()
+    os.write(1, "    [OK] FLSM multilevel compaction passed.\n")
+
+
+def test_flsm_lazy_leveling_lmax(base_dir):
+    os.write(1, "[Storage] Testing FLSM Lazy Leveling Lmax...\n")
+    schema = make_u64_i64_schema()
+
+    shard_dir = os.path.join(base_dir, "flsm_lazy")
+    rposix.mkdir(shard_dir, 0o755)
+    rc = refcount.RefCounter()
+    idx = flsm.FLSMIndex(81, schema, rc, shard_dir)
+
+    # Round 1: one L1 guard with 2 files → L2 created with 1 guard × 1 file
+    l1 = idx.get_or_create_level(1)
+    guard1 = flsm.LevelGuard(r_uint64(0), r_uint64(0))
+    l1.insert_guard_sorted(guard1)
+
+    p0 = shard_dir + "/lazy_r1_0.db"
+    p1 = shard_dir + "/lazy_r1_1.db"
+    _make_single_row_shard(p0, schema, 81, 1)
+    _make_single_row_shard(p1, schema, 81, 2)
+    guard1.add_handle(rc, index.ShardHandle(p0, schema, r_uint64(0), r_uint64(0)))
+    guard1.add_handle(rc, index.ShardHandle(p1, schema, r_uint64(0), r_uint64(0)))
+
+    idx.compact_guard_vertical_if_needed(1)
+
+    assert_true(len(idx.levels) >= 2, "L2 should be created after round 1")
+    assert_equal_i(0, l1.total_file_count(), "L1 should be empty after promoting only guard")
+
+    l2 = idx.levels[1]
+    gi = 0
+    while gi < len(l2.guards):
+        assert_equal_i(1, len(l2.guards[gi].handles),
+                       "L2 guard should have exactly 1 handle after round 1")
+        gi += 1
+
+    # Round 2: new L1 guard same range with 3 files → merged with existing L2 guard
+    guard2 = flsm.LevelGuard(r_uint64(0), r_uint64(0))
+    l1.insert_guard_sorted(guard2)
+
+    p2 = shard_dir + "/lazy_r2_0.db"
+    p3 = shard_dir + "/lazy_r2_1.db"
+    p4 = shard_dir + "/lazy_r2_2.db"
+    _make_single_row_shard(p2, schema, 81, 10)
+    _make_single_row_shard(p3, schema, 81, 20)
+    _make_single_row_shard(p4, schema, 81, 30)
+    guard2.add_handle(rc, index.ShardHandle(p2, schema, r_uint64(0), r_uint64(0)))
+    guard2.add_handle(rc, index.ShardHandle(p3, schema, r_uint64(0), r_uint64(0)))
+    guard2.add_handle(rc, index.ShardHandle(p4, schema, r_uint64(0), r_uint64(0)))
+
+    idx.compact_guard_vertical_if_needed(1)
+
+    # Z=1 still enforced after re-compaction
+    gi2 = 0
+    while gi2 < len(l2.guards):
+        assert_equal_i(1, len(l2.guards[gi2].handles),
+                       "L2 guard should have exactly 1 handle after round 2")
+        gi2 += 1
+
+    # All 5 rows present (pks 1, 2, 10, 20, 30)
+    all_handles = idx.all_handles_for_cursor()
+    total_rows = 0
+    hi = 0
+    while hi < len(all_handles):
+        v = shard_table.TableShardView(all_handles[hi].filename, schema)
+        total_rows += v.count
+        v.close()
+        hi += 1
+    assert_equal_i(5, total_rows, "Expected 5 rows total after two compaction rounds")
+
+    idx.close_all()
+    os.write(1, "    [OK] FLSM Lazy Leveling Lmax passed.\n")
+
+
+def test_flsm_guard_isolation(base_dir):
+    os.write(1, "[Storage] Testing FLSM guard isolation...\n")
+    schema = make_u64_i64_schema()
+
+    shard_dir = os.path.join(base_dir, "flsm_iso")
+    rposix.mkdir(shard_dir, 0o755)
+    rc = refcount.RefCounter()
+    idx = flsm.FLSMIndex(82, schema, rc, shard_dir)
+
+    l1 = idx.get_or_create_level(1)
+
+    # Guard A: 1 file at key 0
+    guard_a = flsm.LevelGuard(r_uint64(0), r_uint64(0))
+    l1.insert_guard_sorted(guard_a)
+    fn_a_path = shard_dir + "/iso_a.db"
+    _make_single_row_shard(fn_a_path, schema, 82, 50)
+    guard_a.add_handle(rc, index.ShardHandle(fn_a_path, schema, r_uint64(0), r_uint64(0)))
+    fn_a = guard_a.handles[0].filename
+
+    # Guard B: 4 files at key 1000 (worst)
+    guard_b = flsm.LevelGuard(r_uint64(1000), r_uint64(0))
+    l1.insert_guard_sorted(guard_b)
+    j = 0
+    while j < 4:
+        pb = shard_dir + "/iso_b%d.db" % j
+        _make_single_row_shard(pb, schema, 82, 1001 + j)
+        guard_b.add_handle(rc, index.ShardHandle(pb, schema, r_uint64(0), r_uint64(0)))
+        j += 1
+
+    # Guard C: 1 file at key 2000
+    guard_c = flsm.LevelGuard(r_uint64(2000), r_uint64(0))
+    l1.insert_guard_sorted(guard_c)
+    fn_c_path = shard_dir + "/iso_c.db"
+    _make_single_row_shard(fn_c_path, schema, 82, 2050)
+    guard_c.add_handle(rc, index.ShardHandle(fn_c_path, schema, r_uint64(0), r_uint64(0)))
+    fn_c = guard_c.handles[0].filename
+
+    idx.compact_guard_vertical_if_needed(1)
+
+    # L1 has exactly 2 guards (A and C remain; B promoted)
+    assert_equal_i(2, len(l1.guards), "L1 should have 2 guards after promoting B")
+
+    # A's and C's files are unchanged
+    assert_equal_s(fn_a, l1.guards[0].handles[0].filename, "Guard A file should be unchanged")
+    assert_equal_s(fn_c, l1.guards[1].handles[0].filename, "Guard C file should be unchanged")
+
+    # L2 has exactly 1 guard covering key 1000
+    assert_true(len(idx.levels) >= 2, "L2 should exist")
+    l2 = idx.levels[1]
+    assert_equal_i(1, len(l2.guards), "L2 should have exactly 1 guard")
+    assert_equal_u64(r_uint64(1000), l2.guards[0].guard_key_lo, "L2 guard key should be 1000")
+
+    # L2 guard has exactly 1 handle (Z=1)
+    assert_equal_i(1, len(l2.guards[0].handles), "L2 guard should have exactly 1 handle")
+
+    # Point lookups for all pks
+    check_pks = [50, 1001, 1002, 1003, 1004, 2050]
+    ci = 0
+    while ci < len(check_pks):
+        pk_val = check_pks[ci]
+        results = idx.find_all_shards_and_indices(r_uint128(pk_val))
+        assert_true(len(results) > 0, "PK %d should be present" % pk_val)
+        ci += 1
+
+    idx.close_all()
+    os.write(1, "    [OK] FLSM guard isolation passed.\n")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -2346,6 +2747,12 @@ def entry_point(argv):
         test_flsm_guard_read_path(base_dir)
         test_flsm_l0_to_l1_compaction(base_dir)
         test_flsm_manifest_persistence(base_dir)
+        test_flsm_horizontal_compaction(base_dir)
+        test_flsm_horizontal_ghost_elimination(base_dir)
+        test_flsm_lmax_horizontal_threshold(base_dir)
+        test_flsm_multilevel_compaction(base_dir)
+        test_flsm_lazy_leveling_lmax(base_dir)
+        test_flsm_guard_isolation(base_dir)
         test_zero_copy_wal_recovery(base_dir)
         os.write(1, "\nALL STORAGE TEST PATHS PASSED\n")
     except Exception as e:

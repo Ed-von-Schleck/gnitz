@@ -159,6 +159,37 @@ def _merge_and_route(input_files, guard_keys, output_dir, table_id, level_num, l
     return guard_outputs
 
 
+def compact_guard_horizontal(guard, output_path, schema, table_id, validate_checksums=False):
+    """Merges all files within a single guard into one output file. Zero-weight rows dropped."""
+    input_files = newlist_hint(len(guard.handles))
+    for h in guard.handles:
+        input_files.append(h.filename)
+    compact_shards(input_files, output_path, schema, table_id, validate_checksums)
+
+
+def compact_guard_vertical(src_guard, dest_guards, output_dir, schema, table_id,
+                           dest_level_num, lsn_tag, validate_checksums=False):
+    """Merges src_guard's files with overlapping dest_guards' files, routing to dest boundaries."""
+    all_input_files = newlist_hint(len(src_guard.handles))
+    for h in src_guard.handles:
+        all_input_files.append(h.filename)
+    for dg in dest_guards:
+        for h in dg.handles:
+            all_input_files.append(h.filename)
+
+    if len(dest_guards) > 0:
+        guard_keys = newlist_hint(len(dest_guards))
+        for dg in dest_guards:
+            guard_keys.append((dg.guard_key_lo, dg.guard_key_hi))
+    else:
+        # First L1→L2: L2 is empty; use src_guard's range as the single output guard
+        guard_keys = newlist_hint(1)
+        guard_keys.append((src_guard.guard_key_lo, src_guard.guard_key_hi))
+
+    return _merge_and_route(all_input_files, guard_keys, output_dir, table_id,
+                            dest_level_num, lsn_tag, schema, validate_checksums)
+
+
 def compact_l0_to_l1(flsm_index, output_dir, schema, table_id, lsn_tag,
                      validate_checksums=False):
     """Route L0 handles into L1 guards via tournament-tree merge."""

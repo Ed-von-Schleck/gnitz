@@ -291,6 +291,192 @@ class FLSMIndex(object):
 
         self._update_flags()
 
+    def compact_guards_if_needed(self):
+        """
+        Scans all level guards. Runs horizontal compaction on any guard exceeding its threshold.
+        L2 (Lmax, level_num == MAX_LEVELS-1 == 2) uses LMAX_FILE_THRESHOLD=1.
+        All other levels use GUARD_FILE_THRESHOLD=4.
+        """
+        for level in self.levels:
+            if level.level_num == MAX_LEVELS - 1:
+                threshold = LMAX_FILE_THRESHOLD
+            else:
+                threshold = GUARD_FILE_THRESHOLD
+            g_idx = 0
+            while g_idx < len(level.guards):
+                guard = level.guards[g_idx]
+                if guard.needs_horizontal_compact(threshold):
+                    self._compact_one_guard(level, g_idx)
+                g_idx += 1
+
+    def _compact_one_guard(self, level, guard_idx):
+        guard = level.guards[guard_idx]
+        self._compact_seq += 1
+
+        guard_max_lsn = r_uint64(0)
+        for h in guard.handles:
+            if h.lsn > guard_max_lsn:
+                guard_max_lsn = h.lsn
+
+        out_path = self.output_dir + "/hcomp_%d_L%d_G%d_%d.db" % (
+            self.table_id, level.level_num,
+            intmask(guard.guard_key_lo), self._compact_seq)
+
+        try:
+            compactor.compact_guard_horizontal(
+                guard, out_path, self.schema, self.table_id, self.validate_checksums)
+            new_handle = ShardHandle(out_path, self.schema, r_uint64(0), guard_max_lsn,
+                                     self.validate_checksums)
+            # Acquire new handle BEFORE releasing old ones — exception-safe ordering:
+            # if acquire fails, guard.handles is still the valid original list.
+            self.ref_counter.acquire(new_handle.filename)
+            old_handles = guard.handles
+            new_handles = newlist_hint(1)
+            new_handles.append(new_handle)
+            guard.handles = new_handles          # atomic swap: guard is valid from here on
+            for h in old_handles:
+                h.close()
+                self.ref_counter.release(h.filename)
+                self.ref_counter.mark_for_deletion(h.filename)
+            self.ref_counter.try_cleanup()
+        except Exception as e:
+            if os.path.exists(out_path):
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
+            raise e
+
+    def compact_guard_vertical_if_needed(self, src_level_num):
+        if src_level_num < 1 or src_level_num >= MAX_LEVELS:
+            return
+        src_level = self.levels[src_level_num - 1]
+
+        # Phase A: select worst guard
+        worst_idx = -1
+        worst_count = 0
+        for i in range(len(src_level.guards)):
+            n = len(src_level.guards[i].handles)
+            if n > worst_count:
+                worst_count = n
+                worst_idx = i
+        if worst_idx == -1 or worst_count <= 1:
+            return   # Nothing to promote
+
+        # Phase B: compute LSN tag + collect overlapping dest guards
+        src_guard = src_level.guards[worst_idx]
+        dest_level = self.get_or_create_level(src_level_num + 1)
+
+        vert_max_lsn = r_uint64(0)
+        for h in src_guard.handles:
+            if h.lsn > vert_max_lsn:
+                vert_max_lsn = h.lsn
+
+        src_min = src_guard.guard_key()
+        if worst_idx + 1 < len(src_level.guards):
+            src_max_bound = src_level.guards[worst_idx + 1].guard_key() - r_uint128(1)
+        else:
+            src_max_bound = MAX_UINT128
+
+        dest_guard_indices = dest_level.find_guards_for_range(src_min, src_max_bound)
+        dest_guards = newlist_hint(len(dest_guard_indices))
+        for di in dest_guard_indices:
+            dg = dest_level.guards[di]
+            dest_guards.append(dg)
+            for h in dg.handles:
+                if h.lsn > vert_max_lsn:
+                    vert_max_lsn = h.lsn
+
+        if vert_max_lsn > r_uint64(0):
+            lsn_tag = intmask(vert_max_lsn)
+        else:
+            self._compact_seq += 1       # fallback when all inputs have lsn=0
+            lsn_tag = self._compact_seq
+
+        # Phase C: compact BEFORE mutating in-memory state (exception safety)
+        results = newlist_hint(0)
+        try:
+            results = compactor.compact_guard_vertical(
+                src_guard, dest_guards, self.output_dir, self.schema, self.table_id,
+                src_level_num + 1, lsn_tag, self.validate_checksums)
+        except Exception as e:
+            i = 0
+            while i < len(results):
+                gk_lo_x, gk_hi_x, fn = results[i]
+                if os.path.exists(fn):
+                    try:
+                        os.unlink(fn)
+                    except OSError:
+                        pass
+                i += 1
+            raise e
+
+        # Phase D: tear down old handles and guards
+
+        # Close src_guard handles
+        for h in src_guard.handles:
+            h.close()
+            self.ref_counter.release(h.filename)
+            self.ref_counter.mark_for_deletion(h.filename)
+
+        # Close dest_guard handles AND clear the list (edge case: stale handle refs)
+        for dg in dest_guards:
+            for h in dg.handles:
+                h.close()
+                self.ref_counter.release(h.filename)
+                self.ref_counter.mark_for_deletion(h.filename)
+            dg.handles = newlist_hint(0)   # CRITICAL: prevent stale closed handles
+
+        # Remove src_guard from src_level (promoted out)
+        new_src_guards = newlist_hint(len(src_level.guards) - 1)
+        for i in range(len(src_level.guards)):
+            if i != worst_idx:
+                new_src_guards.append(src_level.guards[i])
+        src_level.guards = new_src_guards
+
+        # Remove old dest_guards from dest_level
+        replaced_lo = newlist_hint(len(dest_guards))
+        replaced_hi = newlist_hint(len(dest_guards))
+        for dg in dest_guards:
+            replaced_lo.append(dg.guard_key_lo)
+            replaced_hi.append(dg.guard_key_hi)
+        new_dest_guards = newlist_hint(len(dest_level.guards))
+        for g in dest_level.guards:
+            is_replaced = False
+            for ri in range(len(replaced_lo)):
+                if g.guard_key_lo == replaced_lo[ri] and g.guard_key_hi == replaced_hi[ri]:
+                    is_replaced = True
+                    break
+            if not is_replaced:
+                new_dest_guards.append(g)
+        dest_level.guards = new_dest_guards
+
+        # Phase E: install outputs + Lazy Leveling enforcement
+        i = 0
+        while i < len(results):
+            dest_gk_lo, dest_gk_hi, out_fn = results[i]
+            new_handle = ShardHandle(out_fn, self.schema, r_uint64(0), vert_max_lsn,
+                                     self.validate_checksums)
+            dest_gk = (r_uint128(dest_gk_hi) << 64) | r_uint128(dest_gk_lo)
+            g_idx = dest_level.find_guard_idx(dest_gk)
+            if g_idx == -1 or dest_level.guards[g_idx].guard_key() != dest_gk:
+                new_guard = LevelGuard(dest_gk_lo, dest_gk_hi)
+                dest_level.insert_guard_sorted(new_guard)
+                g_idx = dest_level.find_guard_idx(dest_gk)
+            dest_level.guards[g_idx].add_handle(self.ref_counter, new_handle)
+            i += 1
+
+        self.ref_counter.try_cleanup()
+        self._update_flags()
+
+        # Lazy Leveling safety net: Z=1 at Lmax (each L2 guard holds exactly one file)
+        if dest_level.level_num == MAX_LEVELS - 1:
+            g_idx = 0
+            while g_idx < len(dest_level.guards):
+                if dest_level.guards[g_idx].needs_horizontal_compact(LMAX_FILE_THRESHOLD):
+                    self._compact_one_guard(dest_level, g_idx)
+                g_idx += 1
+
     def run_compact(self):
         """L0 overflow → tournament-tree merge → rows routed into L1 guards."""
         if not self.needs_compaction:
@@ -329,6 +515,15 @@ class FLSMIndex(object):
                         pass
                 i += 1
             raise e
+
+        # Phase 3: horizontal compaction within guards
+        self.compact_guards_if_needed()
+
+        # Phase 4: L1→L2 vertical if L1 is overfull
+        if len(self.levels) > 0:
+            l1 = self.levels[0]
+            if l1.total_file_count() > L1_TARGET_FILES:
+                self.compact_guard_vertical_if_needed(1)
 
     def close_all(self):
         for h in self.handles:
