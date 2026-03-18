@@ -580,40 +580,88 @@ while num_acked < self.num_workers:
 
 ---
 
-## Optimization 6: `fan_out_seek_by_index` targets the owning worker
+## Optimization 6: `fan_out_seek_by_index` — master-side index routing table
 
 ### Problem
 
-`master.py:232–251`: Broadcasts the index seek to all N workers and returns the first
+`master.py:241–262`: Broadcasts the index seek to all N workers and returns the first
 non-empty result. For most secondary index seeks the target value is on exactly one worker.
 All N-1 non-owning workers do a seek + miss, wasting N-1 IPC round-trips.
 
+The naïve fix — route by `_partition_for_key(key_lo, key_hi)` on the index key — does **not**
+work. Index entries are distributed by **source row PK hash**, not by index key hash. Worker
+`w` receives source rows with PK in its partition range, runs `ingest_to_family`, and builds
+index entries into its local `EphemeralTable` from those rows. The index entry for column value
+`v` lands on whichever worker owns the source row with `v`, which is determined by the source
+PK — unknown at seek time.
+
 ### Fix
 
-Secondary index keys are stored in partitioned tables, partitioned by the index key's PK hash
-(the index key becomes a synthetic U128, partitioned the same way as primary data). For a
-given `(table_id, col_idx, key)` lookup, the owning partition and thus owning worker are
-deterministic:
+The master already has all information needed at push time: `fan_out_push` scans every row to
+assign it to a worker via `_split_batch_by_pk`. In that same pass, the full row data is
+available including every indexed column value. Record the mapping
+`(table_id, col_idx, index_key) → worker_id` in a master-side routing dict as the scan
+proceeds.
+
+Add `_index_routing = {}` to `MasterDispatcher.__init__` and call a helper from
+`fan_out_push` after the per-row worker assignment is known:
+
+```python
+# For each row i, after w = assignment.worker_for_partition(_partition_for_key(...)):
+for circuit in family.index_circuits:
+    idx_key = promote_to_index_key_from_batch(batch, i, circuit)
+    idx_lo = intmask(r_uint64(idx_key))
+    idx_hi = intmask(r_uint64(idx_key >> 64))
+    if batch.get_weight(i) >= r_int64(0):
+        _routing_set(self._index_routing, target_id, circuit.source_col_idx,
+                     idx_lo, idx_hi, w)
+    else:
+        _routing_del(self._index_routing, target_id, circuit.source_col_idx,
+                     idx_lo, idx_hi)
+```
+
+`fan_out_seek_by_index` gains a fast path:
 
 ```python
 def fan_out_seek_by_index(self, target_id, col_idx, key_lo, key_hi, schema):
-    # Route to the single worker that owns this index key's partition.
-    partition = _partition_for_key(r_uint64(key_lo), r_uint64(key_hi))
-    worker = self.assignment.worker_for_partition(partition)
-    ipc.send_batch(
-        self.worker_fds[worker], target_id, None, schema=schema,
-        flags=ipc.FLAG_SEEK_BY_INDEX,
-        seek_col_idx=col_idx, seek_pk_lo=key_lo, seek_pk_hi=key_hi,
-    )
-    payload = ipc.receive_payload(self.worker_fds[worker])
-    ...
+    w = _routing_lookup(self._index_routing, target_id, col_idx, key_lo, key_hi)
+    if w >= 0:
+        # Fast path: routing table hit — 1 IPC round-trip.
+        ipc.send_batch(
+            self.worker_fds[w], target_id, None, schema=schema,
+            flags=ipc.FLAG_SEEK_BY_INDEX,
+            seek_col_idx=col_idx, seek_pk_lo=key_lo, seek_pk_hi=key_hi,
+        )
+        payload = ipc.receive_payload(self.worker_fds[w])
+        ...
+    else:
+        # Fallback: key not yet seen — broadcast as before, no regression.
+        ...
 ```
 
-This reduces `fan_out_seek_by_index` from N IPC round-trips to 1, matching the already-correct
-`fan_out_seek` behaviour for PK seeks. Requires verifying that the index table's partitioning
-uses the index key hash as the partition key — confirmed: `PartitionedTable` uses
-`hash_u128_inline(pk_lo, pk_hi) & 0xFF` on the row's PK, and the index row's PK is the
-synthetic hash of the indexed value.
+### Scope and constraints
+
+- Works correctly for **unique** indices (the primary use case: FK validation, secondary index
+  point lookups): one source row per index key → one routing entry per key → perfect routing.
+- For **non-unique** indices (multiple source rows share an index value, potentially on
+  different workers): the routing entry holds the last-seen worker only. The fallback broadcast
+  handles misses. A complete solution for non-unique indices requires a `{key: list[worker_id]}`
+  structure; deferred.
+- The routing table is in-memory on the master, size proportional to rows × indexed columns.
+  Consistent with the worker `EphemeralTable` index storage — both are rebuilt on restart.
+- No IPC protocol changes. No worker changes. No index storage changes.
+
+### Impact
+
+For unique index seeks (FK validation, secondary index point lookups):
+
+| Before | After |
+|---|---|
+| N IPC round-trips, N-1 are miss | 1 IPC round-trip after routing table is populated |
+| All N workers do seek | 1 worker does seek |
+
+Keys not yet in the routing table (pre-push, or non-unique miss): fall back to existing
+broadcast. No regression.
 
 ---
 
@@ -666,8 +714,9 @@ concern from the performance optimizations above.
 3. Optimization 5: poll array build-once
    — master.py: fan_out_push poll loop
 
-4. Optimization 6: fan_out_seek_by_index single-worker routing
-   — master.py: fan_out_seek_by_index
+4. Optimization 6: fan_out_seek_by_index master-side routing table
+   — master.py: _index_routing dict in __init__; routing update in fan_out_push row scan
+     (same pass as _split_batch_by_pk); fast-path lookup in fan_out_seek_by_index
 
 5. Optimization 3: IPC sorted/consolidated flags        ← after source-optimizations.md Step 1
    — ipc.py: FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED in serialize/receive
