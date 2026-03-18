@@ -76,7 +76,7 @@ def repartition_batch(batch, shard_col_indices, num_workers, assignment):
         p = hash_row_by_columns(batch, i, shard_col_indices)
         w = assignment.worker_for_partition(p)
         if sub_batches[w] is None:
-            sub_batches[w] = ArenaZSetBatch(schema)
+            sub_batches[w] = ArenaZSetBatch(schema, initial_capacity=batch.length() // num_workers)
         sub_batches[w]._direct_append_row(batch, i, batch.get_weight(i))
     return sub_batches
 
@@ -100,6 +100,42 @@ def relay_scatter(source_batches, shard_cols, num_workers, assignment):
     return dest
 
 
+class PartitionRouter(object):
+    """Master-side cache: maps (table_id, col_idx, key_lo, key_hi) -> worker.
+
+    Populated by fan_out_push after repartitioning unique-indexed columns.
+    Lets fan_out_seek_by_index unicast instead of broadcast on cache hit.
+    """
+
+    def __init__(self, assignment):
+        self.assignment = assignment
+        self._index_routing = {}  # (table_id, col_idx, key_lo, key_hi) -> worker
+
+    def worker_for_index_key(self, table_id, col_idx, key_lo, key_hi):
+        """Returns worker on cache hit, -1 on miss."""
+        key = (table_id, col_idx, key_lo, key_hi)
+        if key in self._index_routing:
+            return self._index_routing[key]
+        return -1
+
+    def record_routing(self, batch, table_id, col_idx, worker):
+        """Populate or invalidate cache entries from a push sub-batch.
+
+        All rows in batch belong to worker.  Rows with negative weight
+        invalidate the entry (delete); positive weight records the mapping.
+        """
+        acc = ColumnarBatchAccessor(batch._schema)
+        for i in range(batch.length()):
+            acc.bind(batch, i)
+            key_lo = intmask(r_uint64(acc.get_int(col_idx)))
+            key = (table_id, col_idx, key_lo, 0)
+            if batch.get_weight(i) < 0:
+                if key in self._index_routing:
+                    del self._index_routing[key]
+            else:
+                self._index_routing[key] = worker
+
+
 def multi_scatter(batch, col_spec_list, num_workers, assignment):
     """Scatter one batch by multiple column specs in a single pass.
     Returns list[list[ArenaZSetBatch|None]], one inner list per spec.
@@ -113,7 +149,7 @@ def multi_scatter(batch, col_spec_list, num_workers, assignment):
             p = hash_row_by_columns(batch, i, col_spec_list[si])
             w = assignment.worker_for_partition(p)
             if results[si][w] is None:
-                results[si][w] = ArenaZSetBatch(schema)
+                results[si][w] = ArenaZSetBatch(schema, initial_capacity=batch.length() // num_workers)
             results[si][w]._direct_append_row(batch, i, weight)
     # Flag propagation: PK-spec sub-batches inherit consolidation from source
     for si in range(n_specs):

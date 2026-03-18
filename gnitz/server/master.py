@@ -11,7 +11,7 @@ from gnitz import log
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch
-from gnitz.dbsp.ops.exchange import repartition_batch, worker_for_pk, relay_scatter
+from gnitz.dbsp.ops.exchange import repartition_batch, worker_for_pk, relay_scatter, PartitionRouter
 
 WNOHANG = 1
 
@@ -30,12 +30,24 @@ class MasterDispatcher(object):
         self.worker_pids = worker_pids
         self.assignment = assignment
         self.program_cache = program_cache
+        self.router = PartitionRouter(assignment)
 
     def fan_out_push(self, target_id, batch, schema):
         """Split batch by worker partition, send sub-batches, collect ACKs.
         Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE."""
         n = batch.length()
         sub_batches = repartition_batch(batch, [schema.pk_index], self.num_workers, self.assignment)
+
+        # Record index routing for unique secondary indexes on this table.
+        family = self.program_cache.registry.get_by_id(target_id)
+        for ci in range(len(family.index_circuits)):
+            circuit = family.index_circuits[ci]
+            if circuit.is_unique:
+                col_idx = circuit.source_col_idx
+                for w in range(self.num_workers):
+                    sb = sub_batches[w]
+                    if sb is not None and sb.length() > 0:
+                        self.router.record_routing(sb, target_id, col_idx, w)
 
         # Send to ALL workers (even empty batches) so they all participate
         # in potential exchange barriers
@@ -48,27 +60,25 @@ class MasterDispatcher(object):
             if sb is not None:
                 sb.free()
 
-        # Message loop: handle both ACKs and exchange relays
-        acked = [False] * self.num_workers
-        num_acked = 0
+        # Message loop: handle both ACKs and exchange relays.
+        # Build poll lists once; swap-remove on ACK (O(1) per worker).
+        poll_fds    = newlist_hint(self.num_workers)
+        poll_events = newlist_hint(self.num_workers)
+        poll_wids   = newlist_hint(self.num_workers)
+        for w in range(self.num_workers):
+            poll_fds.append(self.worker_fds[w])
+            poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
+            poll_wids.append(w)
+
         exchange_buffers = {}   # view_id -> [batch_per_worker]
         exchange_counts = {}    # view_id -> int
         exchange_schemas = {}   # view_id -> schema
         exchange_source_ids = {}  # view_id -> source_id (for join exchange)
 
-        while num_acked < self.num_workers:
-            poll_fds    = newlist_hint(self.num_workers)
-            poll_events = newlist_hint(self.num_workers)
-            poll_wids   = newlist_hint(self.num_workers)
-            for w in range(self.num_workers):
-                if not acked[w]:
-                    poll_fds.append(self.worker_fds[w])
-                    poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
-                    poll_wids.append(w)
-
+        while len(poll_fds) > 0:
             revents = ipc_ffi.poll(poll_fds, poll_events, 10)
-
-            for pi in range(len(poll_fds)):
+            pi = len(poll_fds) - 1
+            while pi >= 0:
                 if revents[pi] & (ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP):
                     w = poll_wids[pi]
                     payload = ipc.receive_payload(self.worker_fds[w])
@@ -98,7 +108,7 @@ class MasterDispatcher(object):
                             if vid in exchange_source_ids:
                                 del exchange_source_ids[vid]
                     else:
-                        # Normal ACK
+                        # Normal ACK — swap-remove this worker from the poll set
                         if payload.status != 0:
                             err = payload.error_msg
                             payload.close()
@@ -106,8 +116,15 @@ class MasterDispatcher(object):
                                 "Worker %d push error: %s" % (w, err)
                             )
                         payload.close()
-                        acked[w] = True
-                        num_acked += 1
+                        last = len(poll_fds) - 1
+                        if pi != last:
+                            poll_fds[pi]    = poll_fds[last]
+                            poll_events[pi] = poll_events[last]
+                            poll_wids[pi]   = poll_wids[last]
+                        poll_fds.pop()
+                        poll_events.pop()
+                        poll_wids.pop()
+                pi -= 1
 
         log.debug(
             "fan_out_push tid=" + str(target_id)
@@ -141,17 +158,39 @@ class MasterDispatcher(object):
             ipc.send_batch(self.worker_fds[w], target_id, None, schema=schema)
 
         result = ArenaZSetBatch(schema)
+        scan_fds    = newlist_hint(self.num_workers)
+        scan_events = newlist_hint(self.num_workers)
+        scan_wids   = newlist_hint(self.num_workers)
         for w in range(self.num_workers):
-            payload = ipc.receive_payload(self.worker_fds[w])
-            if payload.status != 0:
-                err = payload.error_msg
-                payload.close()
-                raise errors.StorageError(
-                    "Worker %d scan error: %s" % (w, err)
-                )
-            if payload.batch is not None and payload.batch.length() > 0:
-                result.append_batch(payload.batch)
-            payload.close()
+            scan_fds.append(self.worker_fds[w])
+            scan_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
+            scan_wids.append(w)
+
+        while len(scan_fds) > 0:
+            revents = ipc_ffi.poll(scan_fds, scan_events, 10)
+            pi = len(scan_fds) - 1
+            while pi >= 0:
+                if revents[pi] & (ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP):
+                    w = scan_wids[pi]
+                    payload = ipc.receive_payload(self.worker_fds[w])
+                    if payload.status != 0:
+                        err = payload.error_msg
+                        payload.close()
+                        raise errors.StorageError(
+                            "Worker %d scan error: %s" % (w, err)
+                        )
+                    if payload.batch is not None and payload.batch.length() > 0:
+                        result.append_batch(payload.batch)
+                    payload.close()
+                    last = len(scan_fds) - 1
+                    if pi != last:
+                        scan_fds[pi]    = scan_fds[last]
+                        scan_events[pi] = scan_events[last]
+                        scan_wids[pi]   = scan_wids[last]
+                    scan_fds.pop()
+                    scan_events.pop()
+                    scan_wids.pop()
+                pi -= 1
 
         log.debug(
             "fan_out_scan tid=" + str(target_id)
@@ -179,7 +218,29 @@ class MasterDispatcher(object):
         return result
 
     def fan_out_seek_by_index(self, target_id, col_idx, key_lo, key_hi, schema):
-        """Broadcast index seek to all workers; return first non-empty result."""
+        """Broadcast index seek to all workers; return first non-empty result.
+        On cache hit, unicasts to the single owning worker instead."""
+        cached_worker = self.router.worker_for_index_key(target_id, col_idx, key_lo, key_hi)
+        if cached_worker >= 0:
+            ipc.send_batch(
+                self.worker_fds[cached_worker], target_id, None, schema=schema,
+                flags=ipc.FLAG_SEEK_BY_INDEX,
+                seek_col_idx=col_idx, seek_pk_lo=key_lo, seek_pk_hi=key_hi,
+            )
+            payload = ipc.receive_payload(self.worker_fds[cached_worker])
+            if payload.status != 0:
+                err = payload.error_msg
+                payload.close()
+                raise errors.StorageError(
+                    "Worker %d seek_by_index error: %s" % (cached_worker, err)
+                )
+            result = None
+            if payload.batch is not None and payload.batch.length() > 0:
+                result = ArenaZSetBatch(schema)
+                result.append_batch(payload.batch)
+            payload.close()
+            return result
+        # Cache miss: broadcast to all workers
         for w in range(self.num_workers):
             ipc.send_batch(
                 self.worker_fds[w], target_id, None, schema=schema,
