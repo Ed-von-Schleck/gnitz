@@ -141,19 +141,16 @@ def encode_batch_to_buffer(block_buf, schema, lsn, table_id, batch):
         header.set_checksum(xxh.compute_checksum(body_ptr, body_size))
 
 
-def decode_batch_from_buffer(buf, total_size, schema):
-    """
-    Decodes a columnar WAL block from a raw buffer into a WALColumnarBlock.
-    The returned block owns the raw buffer; call block.free() when done.
-    """
-    header = wal_layout.WALBlockHeaderView(buf)
+def _parse_wal_block(ptr, total_size, schema):
+    """Non-owning parse. ptr must remain valid while the returned batch is in use.
+    Returns (batch, lsn, tid). Raises CorruptShardError on bad version/checksum."""
+    header = wal_layout.WALBlockHeaderView(ptr)
     if header.get_format_version() != wal_layout.WAL_FORMAT_VERSION_CURRENT:
         raise errors.CorruptShardError("Unsupported WAL version")
 
-    # Verify checksum
     expected_cs = header.get_checksum()
     if total_size > wal_layout.WAL_BLOCK_HEADER_SIZE:
-        body_ptr = rffi.ptradd(buf, wal_layout.WAL_BLOCK_HEADER_SIZE)
+        body_ptr = rffi.ptradd(ptr, wal_layout.WAL_BLOCK_HEADER_SIZE)
         body_size = total_size - wal_layout.WAL_BLOCK_HEADER_SIZE
         if xxh.compute_checksum(body_ptr, body_size) != expected_cs:
             raise errors.CorruptShardError("WAL checksum mismatch")
@@ -163,40 +160,37 @@ def decode_batch_from_buffer(buf, total_size, schema):
     tid = header.get_table_id()
     num_regions = header.get_num_regions()
 
-    # Read directory
     dir_start = wal_layout.WAL_BLOCK_HEADER_SIZE
     offsets = newlist_hint(num_regions)
     sizes = newlist_hint(num_regions)
     for ri in range(num_regions):
-        dir_entry_ptr = rffi.ptradd(buf, dir_start + ri * 8)
+        dir_entry_ptr = rffi.ptradd(ptr, dir_start + ri * 8)
         u32p = rffi.cast(rffi.UINTP, dir_entry_ptr)
         offsets.append(intmask(u32p[0]))
         sizes.append(intmask(u32p[1]))
 
-    # Wrap regions as non-owning Buffers
     region_idx = 0
 
     pk_lo_buf = buffer_ops.Buffer.from_external_ptr(
-        rffi.ptradd(buf, offsets[region_idx]), sizes[region_idx]
+        rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
     region_idx += 1
 
     pk_hi_buf = buffer_ops.Buffer.from_external_ptr(
-        rffi.ptradd(buf, offsets[region_idx]), sizes[region_idx]
+        rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
     region_idx += 1
 
     weight_buf = buffer_ops.Buffer.from_external_ptr(
-        rffi.ptradd(buf, offsets[region_idx]), sizes[region_idx]
+        rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
     region_idx += 1
 
     null_buf = buffer_ops.Buffer.from_external_ptr(
-        rffi.ptradd(buf, offsets[region_idx]), sizes[region_idx]
+        rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
     region_idx += 1
 
-    # Non-PK column buffers
     num_cols = len(schema.columns)
     col_bufs = newlist_hint(num_cols)
     col_strides = newlist_hint(num_cols)
@@ -208,20 +202,35 @@ def decode_batch_from_buffer(buf, total_size, schema):
             stride = schema.columns[ci].field_type.size
             col_bufs.append(
                 buffer_ops.Buffer.from_external_ptr(
-                    rffi.ptradd(buf, offsets[region_idx]), sizes[region_idx]
+                    rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
                 )
             )
             col_strides.append(stride)
             region_idx += 1
 
-    # Blob arena
     blob_buf = buffer_ops.Buffer.from_external_ptr(
-        rffi.ptradd(buf, offsets[region_idx]), sizes[region_idx]
+        rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
 
-    batch = ArenaZSetBatch.from_buffers(
+    result_batch = ArenaZSetBatch.from_buffers(
         schema, pk_lo_buf, pk_hi_buf, weight_buf, null_buf,
         col_bufs, col_strides, blob_buf, count, is_sorted=False
     )
 
-    return WALColumnarBlock(lsn, tid, batch, raw_buf=buf)
+    return result_batch, lsn, tid
+
+
+def decode_batch_from_buffer(buf, total_size, schema):
+    """
+    Decodes a columnar WAL block from a raw buffer into a WALColumnarBlock.
+    The returned block owns the raw buffer; call block.free() when done.
+    """
+    result_batch, lsn, tid = _parse_wal_block(buf, total_size, schema)
+    return WALColumnarBlock(lsn, tid, result_batch, raw_buf=buf)
+
+
+def decode_batch_from_ptr(ptr, total_size, schema):
+    """Non-owning decode. ptr must remain valid while the batch is in use.
+    Caller owns the memory; batch Buffers do NOT free the regions."""
+    result_batch, _lsn, _tid = _parse_wal_block(ptr, total_size, schema)
+    return result_batch
