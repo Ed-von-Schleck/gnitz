@@ -56,7 +56,7 @@ the same pattern.
 
 ---
 
-## Optimization 5: Eliminate _normal Paths — Always-Consolidate Delta-Trace
+## Optimization 5: Eliminate _normal Paths — Always-Consolidate Delta-Trace — DONE
 
 ### Finding
 

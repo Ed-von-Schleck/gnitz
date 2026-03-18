@@ -1221,6 +1221,70 @@ def test_semi_join_merge_walk(base_dir):
     log("  PASSED")
 
 
+def test_semi_join_dt_nonconsolidated(base_dir):
+    """
+    Semi-join DT: non-consolidated delta (2 rows), trace larger (3 rows) so swap
+    does not fire (delta_len=2 <= trace_len=3). Exercises ConsolidatedScope else branch.
+    Delta PKs: 1, 2 (not consolidated). Trace PKs: 2 (+1), 3 (+1), 4 (+1).
+    Expected output: PK 2 only. Output must be consolidated.
+    """
+    log("[DBSP] Testing Semi-Join DT non-consolidated path...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_a = batch.ArenaZSetBatch(schema)
+    b_t = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        # Delta: 2 rows (PKs 1, 2), _consolidated explicitly False
+        rb_a = RowBuilder(schema, b_a)
+        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.put_int(r_int64(10))
+        rb_a.commit()
+        rb_a.begin(r_uint128(2), r_int64(1))
+        rb_a.put_int(r_int64(20))
+        rb_a.commit()
+        # leave _consolidated = False (default)
+
+        # Trace: 3 rows (PKs 2, 3, 4) — all positive weight so delta_len (2) <= trace_len (3)
+        rb_t = RowBuilder(schema, b_t)
+        rb_t.begin(r_uint128(2), r_int64(1))
+        rb_t.put_int(r_int64(200))
+        rb_t.commit()
+        rb_t.begin(r_uint128(3), r_int64(1))
+        rb_t.put_int(r_int64(300))
+        rb_t.commit()
+        rb_t.begin(r_uint128(4), r_int64(1))
+        rb_t.put_int(r_int64(400))
+        rb_t.commit()
+
+        trace_path = os.path.join(base_dir, "sjdtnc_trace")
+        trace_t = EphemeralTable(trace_path, "tr", schema)
+        trace_t.ingest_batch(b_t)
+
+        cursor_t = trace_t.create_cursor()
+        anti_join.op_semi_join_delta_trace(b_a, cursor_t, batch.BatchWriter(b_out), schema)
+        cursor_t.close()
+
+        assert_equal_i(1, b_out.length(), "Semi-join DT nonconsolidated: expected 1 row (PK 2)")
+        assert_true(b_out._consolidated, "Semi-join DT nonconsolidated: output should be consolidated")
+        assert_true(b_out.get_pk(0) == r_uint128(2),
+                    "Semi-join DT nonconsolidated: expected PK 2")
+        assert_equal_i64(r_int64(20), b_out.get_accessor(0).get_int_signed(1),
+                         "Semi-join DT nonconsolidated: val should be 20 (from delta)")
+
+        trace_t.close()
+    finally:
+        b_a.free()
+        b_t.free()
+        b_out.free()
+    log("  PASSED")
+
+
 def test_source_ops(base_dir):
     log("[DBSP] Testing Source Ops...")
 
@@ -2477,6 +2541,7 @@ def entry_point(argv):
         test_join_merge_walk(base_dir)
         test_anti_join_merge_walk(base_dir)
         test_semi_join_merge_walk(base_dir)
+        test_semi_join_dt_nonconsolidated(base_dir)
         test_source_ops(base_dir)
         test_reduce_group_idx(base_dir)
         test_reduce_min_agg_value_idx(base_dir)

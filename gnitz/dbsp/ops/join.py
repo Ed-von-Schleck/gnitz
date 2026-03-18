@@ -117,7 +117,6 @@ class CompositeAccessor(RowAccessor):
         return self.right_acc.get_col_ptr(self.mapping_idx[col_idx])
 
 
-CONSOLIDATE_INTERVAL = 8192       # output rows written before each consolidation (delta-trace)
 CONSOLIDATE_INTERVAL_DD = 16384   # output rows written before each consolidation (delta-delta)
 
 ADAPTIVE_SWAP_THRESHOLD = 1   # swap when delta_len > trace_len
@@ -144,45 +143,11 @@ def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schem
     if delta_len > trace_len * ADAPTIVE_SWAP_THRESHOLD:
         _join_dt_swapped(delta_batch, trace_cursor, out_writer, composite_acc)
         out_writer.mark_sorted(True)
-    elif delta_batch._consolidated:
-        _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc)
-        # mark_consolidated is called inside _join_dt_merge_walk
     else:
-        _join_dt_normal(delta_batch, trace_cursor, out_writer, composite_acc)
-        out_writer.mark_sorted(delta_batch._sorted)
+        with ConsolidatedScope(delta_batch) as consolidated:
+            _join_dt_merge_walk(consolidated, trace_cursor, out_writer, composite_acc)
+        # mark_sorted(True) called inside _join_dt_merge_walk
 
-
-def _join_dt_normal(delta_batch, trace_cursor, out_writer, composite_acc):
-    count = delta_batch.length()
-    rows_since_consolidation = 0
-    for i in range(count):
-        w_delta = delta_batch.get_weight(i)
-        if w_delta == r_int64(0):
-            continue
-
-        key = delta_batch.get_pk(i)
-        trace_cursor.seek(key)
-
-        while trace_cursor.is_valid():
-            if trace_cursor.key() != key:
-                break
-
-            w_trace = trace_cursor.weight()
-            w_out = r_int64(intmask(w_delta * w_trace))
-
-            if w_out != r_int64(0):
-                composite_acc.set_accessors(
-                    delta_batch.get_accessor(i),
-                    trace_cursor.get_accessor(),
-                )
-                out_writer.append_from_accessor(key, w_out, composite_acc)
-                rows_since_consolidation += 1
-                if rows_since_consolidation >= CONSOLIDATE_INTERVAL:
-                    out_writer.consolidate()
-                    rows_since_consolidation = 0
-
-            trace_cursor.advance()
-    # No mark_sorted here — dispatch owns it.
 
 
 def _join_dt_swapped(delta_batch, trace_cursor, out_writer, composite_acc):
@@ -218,8 +183,12 @@ def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
         d_key = delta_batch.get_pk(i)
         w_delta = delta_batch.get_weight(i)
         # w_delta is non-zero by _consolidated invariant.
-        while trace_cursor.is_valid() and trace_cursor.key() < d_key:
-            trace_cursor.advance()
+        if i > 0 and delta_batch.get_pk(i - 1) == d_key:
+            # Multiset delta: multiple rows with same PK → re-seek trace.
+            trace_cursor.seek(d_key)
+        else:
+            while trace_cursor.is_valid() and trace_cursor.key() < d_key:
+                trace_cursor.advance()
         # Iterate all trace records for d_key (trace may have multiple rows per PK).
         while trace_cursor.is_valid() and trace_cursor.key() == d_key:
             w_trace = trace_cursor.weight()
