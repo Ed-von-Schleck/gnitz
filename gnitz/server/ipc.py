@@ -2,48 +2,17 @@
 
 import os
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_uint32, r_uint64, intmask
+from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
-from gnitz.storage import mmap_posix, buffer
+from gnitz.storage import mmap_posix
+from gnitz.storage import buffer as buffer_ops
+from gnitz.storage import wal_columnar, wal_layout
 from gnitz.server import ipc_ffi
 from gnitz.core import errors, batch, types, strings as string_logic
 from gnitz.core.batch import RowBuilder
 from gnitz.catalog import system_tables
-
-# "GNITZ2PC" in little-endian hex
-MAGIC_V2 = r_uint64(0x474E49545A325043)
-
-# --- v2 Header: 96 bytes ---
-# [00-07]  Magic            u64
-# [08-11]  Status           u32    0=OK, 1=ERROR
-# [12-15]  Error Str Len    u32
-# [16-23]  Target ID        u64
-# [24-31]  Client ID        u64
-# [32-39]  Schema Row Count u64
-# [40-47]  Schema Blob Size u64
-# [48-55]  Data Row Count   u64
-# [56-63]  Data Blob Size   u64
-# [64-71]  p4 (data_pk_index) — seek_col_idx when FLAG_SEEK_BY_INDEX, else 0
-# [72-79]  Flags            u64
-# [80-87]  p5 (seek_pk_lo)  — seek key lo for FLAG_SEEK / FLAG_SEEK_BY_INDEX
-# [88-95]  p6 (seek_pk_hi)  — seek key hi for FLAG_SEEK / FLAG_SEEK_BY_INDEX
-HEADER_SIZE = 96
-ALIGNMENT = 64
-MAX_ERR_LEN = 65536
-
-OFF_MAGIC = 0
-OFF_STATUS = 8
-OFF_ERR_LEN = 12
-OFF_TARGET_ID = 16
-OFF_CLIENT_ID = 24
-OFF_SCHEMA_COUNT = 32
-OFF_SCHEMA_BLOB_SZ = 40
-OFF_DATA_COUNT = 48
-OFF_DATA_BLOB_SZ = 56
-OFF_P4 = 64
-OFF_FLAGS = 72
 
 # --- Status Codes ---
 STATUS_OK = 0
@@ -67,15 +36,12 @@ FLAG_SEEK_BY_INDEX     = 256   # p4=col_idx, p5/p6=index_key; target_id=table_id
 FLAG_ALLOCATE_INDEX_ID = 512   # target_id=0; response carries new index_id in target_id
 FLAG_SCAN              = 0     # explicit name for "no flags" (no wire change)
 
-OFF_SEEK_PK_LO = 80
-OFF_SEEK_PK_HI = 88
-OFF_SEEK_IDX_COL    = OFF_P4              # p4 alias when FLAG_SEEK_BY_INDEX
-OFF_SEEK_IDX_KEY_LO = OFF_SEEK_PK_LO      # p5 alias
-OFF_SEEK_IDX_KEY_HI = OFF_SEEK_PK_HI      # p6 alias
+# --- New WAL-block wire format flags ---
+FLAG_HAS_SCHEMA = r_uint64(1 << 48)  # schema block follows control block
+FLAG_HAS_DATA   = r_uint64(1 << 49)  # data block follows schema block
 
-# --- IPC String Encoding ---
-IPC_STRING_STRIDE = 8
-IPC_NULL_STRING_OFFSET = 0xFFFFFFFF
+# --- Control block TID ---
+IPC_CONTROL_TID = 0xFFFFFFFF   # max uint32; never a real table ID; get_table_id() returns 4294967295
 
 # --- Meta-Schema Constants ---
 # The Schema ZSet has this fixed 4-column layout.
@@ -92,11 +58,30 @@ META_SCHEMA = types.TableSchema(
     pk_index=0,
 )
 
+# --- Control Schema ---
+CONTROL_SCHEMA = types.TableSchema(
+    [
+        types.ColumnDefinition(types.TYPE_U64, name="msg_idx"),      # col 0: PK
+        types.ColumnDefinition(types.TYPE_U64, name="status"),       # col 1
+        types.ColumnDefinition(types.TYPE_U64, name="client_id"),    # col 2
+        types.ColumnDefinition(types.TYPE_U64, name="target_id"),    # col 3
+        types.ColumnDefinition(types.TYPE_U64, name="flags"),        # col 4
+        types.ColumnDefinition(types.TYPE_U64, name="seek_pk_lo"),   # col 5
+        types.ColumnDefinition(types.TYPE_U64, name="seek_pk_hi"),   # col 6
+        types.ColumnDefinition(types.TYPE_U64, name="seek_col_idx"), # col 7
+        types.ColumnDefinition(types.TYPE_STRING, is_nullable=True, name="error_msg"),  # col 8
+    ],
+    pk_index=0,
+)
 
-def align_up(val, align):
-    u_val = r_uint64(val)
-    u_align = r_uint64(align)
-    return (u_val + u_align - 1) & ~(u_align - 1)
+CTRL_COL_STATUS      = 1
+CTRL_COL_CLIENT_ID   = 2
+CTRL_COL_TARGET_ID   = 3
+CTRL_COL_FLAGS       = 4
+CTRL_COL_SEEK_PK_LO  = 5
+CTRL_COL_SEEK_PK_HI  = 6
+CTRL_COL_SEEK_COL    = 7
+CTRL_COL_ERROR_MSG   = 8
 
 
 # ---------------------------------------------------------------------------
@@ -167,172 +152,43 @@ def batch_to_schema(schema_batch):
 
 
 # ---------------------------------------------------------------------------
-# IPC String Encoding Helpers
+# Control Batch Encode/Decode
 # ---------------------------------------------------------------------------
 
 
-def _compute_ipc_blob_size(src_batch, col_idx):
-    """Compute total blob bytes needed for IPC string encoding of a column."""
-    total = 0
-    count = src_batch.length()
-    for row in range(count):
-        length, prefix, struct_ptr, heap_ptr, py_string = (
-            src_batch._read_col_str_struct(row, col_idx)
-        )
-        s = string_logic.resolve_string(struct_ptr, heap_ptr, py_string)
-        total += len(s)
-    return total
-
-
-def _write_ipc_strings(src_batch, col_idx, dest_ptr, dest_blob_ptr, count,
-                       global_blob_offset=0):
-    """
-    Writes IPC string encoding for a column.
-    dest_ptr: points to the column buffer (count * 8 bytes).
-    dest_blob_ptr: points to where this column's blob data is written.
-    global_blob_offset: accumulated blob offset from prior string columns,
-        so that per-entry offsets are global (relative to blob area start).
-    Returns bytes written to blob arena.
-    """
-    blob_offset = 0
-    for row in range(count):
-        null_word = src_batch._read_null_word(row)
-        payload_idx = col_idx if col_idx < src_batch._schema.pk_index else col_idx - 1
-        is_null = bool(null_word & (r_uint64(1) << payload_idx))
-
-        entry_ptr = rffi.ptradd(dest_ptr, row * IPC_STRING_STRIDE)
-        u32_entry = rffi.cast(rffi.UINTP, entry_ptr)
-
-        if is_null:
-            u32_entry[0] = rffi.cast(rffi.UINT, IPC_NULL_STRING_OFFSET)
-            u32_entry[1] = rffi.cast(rffi.UINT, 0)
-            continue
-
-        length, prefix, struct_ptr, heap_ptr, py_string = (
-            src_batch._read_col_str_struct(row, col_idx)
-        )
-        s = string_logic.resolve_string(struct_ptr, heap_ptr, py_string)
-        s_len = len(s)
-
-        u32_entry[0] = rffi.cast(rffi.UINT, global_blob_offset + blob_offset)
-        u32_entry[1] = rffi.cast(rffi.UINT, s_len)
-
-        for bi in range(s_len):
-            dest_blob_ptr[blob_offset + bi] = s[bi]
-        blob_offset += s_len
-
-    return blob_offset
-
-
-def _read_ipc_strings(
-    ipc_col_ptr, ipc_blob_ptr, ipc_blob_sz, count,
-    dest_batch, dest_col_idx, owned_bufs, shared_blob_buf=None
-):
-    """
-    Reads IPC string encoding and writes German Strings into dest_batch's column.
-    Creates owned buffers for the German String column and blob data.
-    Appends created buffers to owned_bufs for lifecycle management.
-
-    If shared_blob_buf is provided, long strings are allocated into it
-    (all string columns in a section must share the same blob arena so that
-    offsets are valid when the batch resolves them).
-    """
-    stride = types.TYPE_STRING.size  # 16
-    col_buf = buffer.Buffer(count * stride)
-    if shared_blob_buf is not None:
-        blob_buf = shared_blob_buf
+def _encode_control_batch(target_id, client_id, flags, seek_pk_lo, seek_pk_hi,
+                          seek_col_idx, status, error_msg):
+    ctrl = batch.ArenaZSetBatch(CONTROL_SCHEMA, initial_capacity=1)
+    rb = RowBuilder(CONTROL_SCHEMA, ctrl)
+    rb.begin(r_uint128(r_uint64(0)), r_int64(1))          # msg_idx PK = 0
+    rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(status)))
+    rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(client_id)))
+    rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(target_id)))
+    rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(flags)))
+    rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(seek_pk_lo)))
+    rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(seek_pk_hi)))
+    rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(seek_col_idx)))
+    if len(error_msg) > 0:
+        rb.put_string(error_msg)
     else:
-        blob_buf = buffer.Buffer(intmask(ipc_blob_sz) + 64)
-    allocator = batch.BatchBlobAllocator(blob_buf)
-
-    for row in range(count):
-        entry_ptr = rffi.ptradd(ipc_col_ptr, row * IPC_STRING_STRIDE)
-        u32_entry = rffi.cast(rffi.UINTP, entry_ptr)
-        offset_val = intmask(u32_entry[0])
-        length_val = intmask(u32_entry[1])
-
-        dest = col_buf.alloc(stride, alignment=types.TYPE_STRING.alignment)
-
-        # Check for null
-        if r_uint64(offset_val) == r_uint64(IPC_NULL_STRING_OFFSET):
-            # Write a zero-length German String (null marker handled via null_buf)
-            for b in range(stride):
-                dest[b] = "\x00"
-            continue
-
-        # Validate bounds
-        if offset_val + length_val > intmask(ipc_blob_sz):
-            raise errors.StorageError(
-                "IPC string offset+length exceeds blob arena"
-            )
-
-        # Extract the string bytes
-        src_data = rffi.ptradd(ipc_blob_ptr, offset_val)
-        s = rffi.charpsize2str(src_data, length_val)
-
-        string_logic.pack_and_write_blob(dest, s, allocator)
-
-    owned_bufs.append(col_buf)
-    if shared_blob_buf is None:
-        owned_bufs.append(blob_buf)
-    return col_buf, blob_buf
+        rb.put_null()
+    rb.commit()
+    return ctrl
 
 
-# ---------------------------------------------------------------------------
-# ZSet Section Layout Computation
-# ---------------------------------------------------------------------------
-
-
-def _compute_zset_wire_size(schema, count, blob_sizes_for_strings):
-    """
-    Computes the total wire bytes for a ZSet section.
-    blob_sizes_for_strings: list of blob sizes per string column (in schema order).
-    Returns (total_bytes, col_offsets, col_wire_strides, blob_offset, total_blob_sz).
-    col_offsets and col_wire_strides indexed by schema column index.
-    """
-    cur_off = r_uint64(0)
-    num_cols = len(schema.columns)
-
-    # Structural buffers: pk_lo, pk_hi, weight, null
-    struct_sz = r_uint64(count * 8)
-    pk_lo_off = cur_off
-    cur_off = align_up(cur_off + struct_sz, ALIGNMENT)
-    pk_hi_off = cur_off
-    cur_off = align_up(cur_off + struct_sz, ALIGNMENT)
-    weight_off = cur_off
-    cur_off = align_up(cur_off + struct_sz, ALIGNMENT)
-    null_off = cur_off
-    cur_off = align_up(cur_off + struct_sz, ALIGNMENT)
-
-    col_offsets = newlist_hint(num_cols)
-    col_wire_strides = newlist_hint(num_cols)
-    str_col_idx = 0
-    total_blob_sz = r_uint64(0)
-
-    for ci in range(num_cols):
-        if ci == schema.pk_index:
-            col_offsets.append(r_uint64(0))
-            col_wire_strides.append(0)
-        elif schema.columns[ci].field_type.code == types.TYPE_STRING.code:
-            col_offsets.append(cur_off)
-            col_wire_strides.append(IPC_STRING_STRIDE)
-            cur_off = align_up(cur_off + r_uint64(count * IPC_STRING_STRIDE), ALIGNMENT)
-            if str_col_idx < len(blob_sizes_for_strings):
-                total_blob_sz = total_blob_sz + r_uint64(blob_sizes_for_strings[str_col_idx])
-            str_col_idx += 1
-        else:
-            wire_stride = schema.columns[ci].field_type.size
-            col_offsets.append(cur_off)
-            col_wire_strides.append(wire_stride)
-            cur_off = align_up(cur_off + r_uint64(wire_stride * count), ALIGNMENT)
-
-    blob_offset = cur_off
-    total_size = cur_off + total_blob_sz
-
-    return (
-        total_size, pk_lo_off, pk_hi_off, weight_off, null_off,
-        col_offsets, col_wire_strides, blob_offset, total_blob_sz,
-    )
+def _decode_control_batch(ctrl_batch, payload):
+    acc = batch.ColumnarBatchAccessor(CONTROL_SCHEMA)
+    acc.bind(ctrl_batch, 0)
+    payload.status       = intmask(r_uint64(acc.get_int(CTRL_COL_STATUS)))
+    payload.client_id    = intmask(r_uint64(acc.get_int(CTRL_COL_CLIENT_ID)))
+    payload.target_id    = intmask(r_uint64(acc.get_int(CTRL_COL_TARGET_ID)))
+    payload.flags        = r_uint64(acc.get_int(CTRL_COL_FLAGS))
+    payload.seek_pk_lo   = intmask(r_uint64(acc.get_int(CTRL_COL_SEEK_PK_LO)))
+    payload.seek_pk_hi   = intmask(r_uint64(acc.get_int(CTRL_COL_SEEK_PK_HI)))
+    payload.seek_col_idx = intmask(r_uint64(acc.get_int(CTRL_COL_SEEK_COL)))
+    if not acc.is_null(CTRL_COL_ERROR_MSG):
+        length, prefix, sptr, hptr, py_s = acc.get_str_struct(CTRL_COL_ERROR_MSG)
+        payload.error_msg = string_logic.resolve_string(sptr, hptr, py_s)
 
 
 # ---------------------------------------------------------------------------
@@ -341,51 +197,27 @@ def _compute_zset_wire_size(schema, count, blob_sizes_for_strings):
 
 
 class IPCPayload(object):
-    """Handle for a received IPC v2 segment."""
-
-    _immutable_fields_ = [
-        "total_size",
-        "status",
-        "error_msg",
-        "batch",
-        "schema",
-        "target_id",
-        "client_id",
-        "flags",
-        "seek_col_idx",
-        "seek_pk_lo",
-        "seek_pk_hi",
-    ]
-
-    def __init__(
-        self, fd, ptr, total_size, status, error_msg,
-        schema, batch_obj, target_id, client_id, flags, owned_bufs,
-        seek_col_idx=0, seek_pk_lo=0, seek_pk_hi=0
-    ):
-        self.fd = fd
-        self.ptr = ptr
-        self.total_size = r_uint64(total_size)
-        self.status = status
-        self.error_msg = error_msg
-        self.schema = schema
-        self.batch = batch_obj
-        self.target_id = target_id
-        self.client_id = client_id
-        self.flags = flags
-        self.owned_bufs = owned_bufs
-        self.seek_col_idx = seek_col_idx
-        self.seek_pk_lo = seek_pk_lo
-        self.seek_pk_hi = seek_pk_hi
+    def __init__(self):
+        self.fd           = -1
+        self.ptr          = lltype.nullptr(rffi.CCHARP.TO)
+        self.total_size   = r_uint64(0)
+        self.batch        = None
+        self.schema       = None
+        self.target_id    = 0
+        self.client_id    = 0
+        self.flags        = r_uint64(0)
+        self.seek_col_idx = 0
+        self.seek_pk_lo   = 0
+        self.seek_pk_hi   = 0
+        self.status       = 0
+        self.error_msg    = ""
 
     def close(self):
-        """Physical cleanup of the mapped segment and owned buffers."""
-        for buf in self.owned_bufs:
-            buf.free()
         if self.ptr:
             mmap_posix.munmap_file(self.ptr, intmask(self.total_size))
             self.ptr = lltype.nullptr(rffi.CCHARP.TO)
         if self.fd >= 0:
-            os.close(self.fd)
+            os.close(intmask(self.fd))
             self.fd = -1
 
 
@@ -394,231 +226,109 @@ class IPCPayload(object):
 # ---------------------------------------------------------------------------
 
 
-def _copy_buf(dest_base, dest_off, src_buf, nbytes):
-    """Copies nbytes from src_buf.base_ptr to dest_base + dest_off."""
-    if nbytes > 0 and src_buf.base_ptr:
-        buffer.c_memmove(
-            rffi.cast(rffi.VOIDP, rffi.ptradd(dest_base, intmask(dest_off))),
-            rffi.cast(rffi.VOIDP, src_buf.base_ptr),
-            rffi.cast(rffi.SIZE_T, nbytes),
-        )
-
-
-def _copy_raw(dest_base, dest_off, src_ptr, nbytes):
-    """Copies nbytes from src_ptr to dest_base + dest_off."""
-    if nbytes > 0:
-        buffer.c_memmove(
-            rffi.cast(rffi.VOIDP, rffi.ptradd(dest_base, intmask(dest_off))),
-            rffi.cast(rffi.VOIDP, src_ptr),
-            rffi.cast(rffi.SIZE_T, nbytes),
-        )
-
-
-def _write_zset_section(
-    ptr, section_base, zbatch, schema, count,
-    pk_lo_off, pk_hi_off, weight_off, null_off,
-    col_offsets, col_wire_strides, blob_offset
-):
-    """
-    Writes a ZSet's column data into the mmap at section_base.
-    Returns bytes written to blob arena.
-    """
-    base = intmask(section_base)
-
-    # Structural buffers
-    _copy_buf(ptr, section_base + pk_lo_off, zbatch.pk_lo_buf, count * 8)
-    _copy_buf(ptr, section_base + pk_hi_off, zbatch.pk_hi_buf, count * 8)
-    _copy_buf(ptr, section_base + weight_off, zbatch.weight_buf, count * 8)
-    _copy_buf(ptr, section_base + null_off, zbatch.null_buf, count * 8)
-
-    # Payload columns
-    num_cols = len(schema.columns)
-    blob_written = 0
-
-    for ci in range(num_cols):
-        if ci == schema.pk_index:
-            continue
-
-        col_type = schema.columns[ci].field_type
-        dest_off = section_base + col_offsets[ci]
-
-        if col_type.code == types.TYPE_STRING.code:
-            # IPC string encoding
-            dest_col_ptr = rffi.ptradd(ptr, intmask(dest_off))
-            dest_blob_ptr = rffi.ptradd(ptr, intmask(section_base + blob_offset) + blob_written)
-            written = _write_ipc_strings(
-                zbatch, ci, dest_col_ptr, dest_blob_ptr, count,
-                global_blob_offset=blob_written,
-            )
-            blob_written += written
-        else:
-            # Fixed-width: direct memcpy
-            _copy_buf(ptr, dest_off, zbatch.col_bufs[ci], col_type.size * count)
-
-    return blob_written
-
-
 @jit.dont_look_inside
-def serialize_to_memfd(
-    target_id, schema=None, zbatch=None,
-    status=0, error_msg="", client_id=0, flags=0,
-    seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0,
-):
-    """
-    Serializes a v2 IPC message into a shared-memory file descriptor.
-    Schema is always included when zbatch has rows (or when explicitly provided).
-    """
-    err_len = r_uint64(len(error_msg))
-    data_count = intmask(zbatch.length()) if zbatch else 0
+def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
+                       seek_pk_lo, seek_pk_hi, seek_col_idx,
+                       status, error_msg):
+    has_data   = zbatch is not None and zbatch.length() > 0
+    has_schema = has_data or (schema is not None and status == STATUS_OK)
 
-    if schema is None and zbatch is not None:
-        schema = zbatch._schema
+    ctrl_flags = r_uint64(flags)
+    if has_schema:
+        ctrl_flags = ctrl_flags | FLAG_HAS_SCHEMA
+    if has_data:
+        ctrl_flags = ctrl_flags | FLAG_HAS_DATA
 
-    # Build schema batch if we have a schema to send
+    ctrl_buf   = buffer_ops.Buffer(0)
+    schema_buf = buffer_ops.Buffer(0)
+    data_buf   = buffer_ops.Buffer(0)
+    ctrl_batch   = None
     schema_batch = None
-    schema_count = 0
-    if schema is not None and (data_count > 0 or status == STATUS_OK):
-        schema_batch = schema_to_batch(schema)
-        schema_count = schema_batch.length()
-
-    # Compute string blob sizes for schema batch
-    schema_str_blob_sizes = newlist_hint(1)
-    if schema_batch is not None and schema_count > 0:
-        # META_SCHEMA has 1 string column: "name" at index 3
-        schema_str_blob_sizes.append(_compute_ipc_blob_size(schema_batch, 3))
-
-    # Compute string blob sizes for data batch
-    data_str_blob_sizes = newlist_hint(4)
-    if zbatch is not None and data_count > 0 and schema is not None:
-        num_cols = len(schema.columns)
-        for ci in range(num_cols):
-            if ci == schema.pk_index:
-                continue
-            if schema.columns[ci].field_type.code == types.TYPE_STRING.code:
-                data_str_blob_sizes.append(_compute_ipc_blob_size(zbatch, ci))
-
-    # Compute section sizes
-    # Error section
-    body_start = align_up(r_uint64(HEADER_SIZE) + err_len, ALIGNMENT)
-
-    # Schema ZSet section
-    schema_section_base = body_start
-    schema_section_size = r_uint64(0)
-    s_pk_lo_off = r_uint64(0)
-    s_pk_hi_off = r_uint64(0)
-    s_weight_off = r_uint64(0)
-    s_null_off = r_uint64(0)
-    s_col_offsets = newlist_hint(0)
-    s_col_wire_strides = newlist_hint(0)
-    s_blob_offset = r_uint64(0)
-    s_total_blob_sz = r_uint64(0)
-
-    if schema_batch is not None and schema_count > 0:
-        (
-            schema_section_size, s_pk_lo_off, s_pk_hi_off, s_weight_off, s_null_off,
-            s_col_offsets, s_col_wire_strides, s_blob_offset, s_total_blob_sz,
-        ) = _compute_zset_wire_size(META_SCHEMA, schema_count, schema_str_blob_sizes)
-
-    # Data ZSet section
-    data_section_base = align_up(schema_section_base + schema_section_size, ALIGNMENT)
-    data_section_size = r_uint64(0)
-    d_pk_lo_off = r_uint64(0)
-    d_pk_hi_off = r_uint64(0)
-    d_weight_off = r_uint64(0)
-    d_null_off = r_uint64(0)
-    d_col_offsets = newlist_hint(0)
-    d_col_wire_strides = newlist_hint(0)
-    d_blob_offset = r_uint64(0)
-    d_total_blob_sz = r_uint64(0)
-
-    if zbatch is not None and data_count > 0 and schema is not None:
-        (
-            data_section_size, d_pk_lo_off, d_pk_hi_off, d_weight_off, d_null_off,
-            d_col_offsets, d_col_wire_strides, d_blob_offset, d_total_blob_sz,
-        ) = _compute_zset_wire_size(schema, data_count, data_str_blob_sizes)
-
-    total_size = align_up(data_section_base + data_section_size, ALIGNMENT)
-    if total_size < r_uint64(HEADER_SIZE):
-        total_size = r_uint64(HEADER_SIZE)
-
-    fd = -1
-    ptr = lltype.nullptr(rffi.CCHARP.TO)
     try:
-        fd = mmap_posix.memfd_create_c("gnitz_ipc_v2")
-        mmap_posix.ftruncate_c(fd, intmask(total_size))
+        ctrl_batch = _encode_control_batch(
+            target_id, client_id, ctrl_flags,
+            seek_pk_lo, seek_pk_hi, seek_col_idx,
+            status, error_msg,
+        )
+        wal_columnar.encode_batch_to_buffer(
+            ctrl_buf, CONTROL_SCHEMA, r_uint64(0), IPC_CONTROL_TID, ctrl_batch
+        )
+        ctrl_batch.free()
+        ctrl_batch = None
+        ctrl_size = ctrl_buf.offset
 
+        schema_size = 0
+        if has_schema:
+            eff_schema = schema if schema is not None else zbatch._schema
+            schema_batch = schema_to_batch(eff_schema)
+            wal_columnar.encode_batch_to_buffer(
+                schema_buf, META_SCHEMA, r_uint64(0), target_id, schema_batch
+            )
+            schema_batch.free()
+            schema_batch = None
+            schema_size = schema_buf.offset
+
+        data_size = 0
+        if has_data:
+            wal_columnar.encode_batch_to_buffer(
+                data_buf, zbatch._schema, r_uint64(0), target_id, zbatch
+            )
+            data_size = data_buf.offset
+
+        total_size = ctrl_size + schema_size + data_size
+        if total_size == 0:
+            total_size = wal_layout.WAL_BLOCK_HEADER_SIZE  # defensive floor
+
+        fd = mmap_posix.memfd_create_c("gnitz_ipc")
+        mmap_posix.ftruncate_c(fd, total_size)
         ptr = mmap_posix.mmap_file(
-            fd,
-            intmask(total_size),
+            fd, total_size,
             prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
             flags=mmap_posix.MAP_SHARED,
         )
-
-        # Write Header (96 bytes)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_MAGIC))[0] = MAGIC_V2
-        rffi.cast(rffi.UINTP, rffi.ptradd(ptr, OFF_STATUS))[0] = r_uint32(status)
-        rffi.cast(rffi.UINTP, rffi.ptradd(ptr, OFF_ERR_LEN))[0] = r_uint32(err_len)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_TARGET_ID))[0] = r_uint64(target_id)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_CLIENT_ID))[0] = r_uint64(client_id)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SCHEMA_COUNT))[0] = r_uint64(schema_count)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SCHEMA_BLOB_SZ))[0] = s_total_blob_sz
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_COUNT))[0] = r_uint64(data_count)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_BLOB_SZ))[0] = d_total_blob_sz
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_FLAGS))[0] = r_uint64(flags)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_P4))[0] = r_uint64(seek_col_idx)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_LO))[0] = r_uint64(seek_pk_lo)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_HI))[0] = r_uint64(seek_pk_hi)
-
-        # Write Error String
-        if err_len > 0:
-            for i in range(intmask(err_len)):
-                ptr[HEADER_SIZE + i] = error_msg[i]
-
-        # Write Schema ZSet
-        if schema_batch is not None and schema_count > 0:
-            _write_zset_section(
-                ptr, schema_section_base, schema_batch, META_SCHEMA, schema_count,
-                s_pk_lo_off, s_pk_hi_off, s_weight_off, s_null_off,
-                s_col_offsets, s_col_wire_strides, s_blob_offset,
+        if ctrl_size > 0:
+            buffer_ops.c_memmove(
+                rffi.cast(rffi.VOIDP, ptr),
+                rffi.cast(rffi.VOIDP, ctrl_buf.base_ptr),
+                rffi.cast(rffi.SIZE_T, ctrl_size),
             )
-
-        # Write Data ZSet
-        if zbatch is not None and data_count > 0 and schema is not None:
-            _write_zset_section(
-                ptr, data_section_base, zbatch, schema, data_count,
-                d_pk_lo_off, d_pk_hi_off, d_weight_off, d_null_off,
-                d_col_offsets, d_col_wire_strides, d_blob_offset,
+        if schema_size > 0:
+            buffer_ops.c_memmove(
+                rffi.cast(rffi.VOIDP, rffi.ptradd(ptr, ctrl_size)),
+                rffi.cast(rffi.VOIDP, schema_buf.base_ptr),
+                rffi.cast(rffi.SIZE_T, schema_size),
             )
-
-        mmap_posix.munmap_file(ptr, intmask(total_size))
-        ptr = lltype.nullptr(rffi.CCHARP.TO)
-
+        if data_size > 0:
+            buffer_ops.c_memmove(
+                rffi.cast(rffi.VOIDP, rffi.ptradd(ptr, ctrl_size + schema_size)),
+                rffi.cast(rffi.VOIDP, data_buf.base_ptr),
+                rffi.cast(rffi.SIZE_T, data_size),
+            )
+        mmap_posix.munmap_file(ptr, total_size)
+    finally:
+        if ctrl_batch is not None:
+            ctrl_batch.free()
         if schema_batch is not None:
             schema_batch.free()
+        ctrl_buf.free()
+        schema_buf.free()
+        data_buf.free()
 
-        return fd
-
-    except Exception as e:
-        if ptr:
-            mmap_posix.munmap_file(ptr, intmask(total_size))
-        if fd >= 0:
-            os.close(fd)
-        if schema_batch is not None:
-            schema_batch.free()
-        raise e
+    return fd, total_size
 
 
 @jit.dont_look_inside
-def send_batch(
-    sock_fd, target_id, zbatch, status=0, error_msg="",
-    client_id=0, schema=None, flags=0,
-    seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0,
-):
-    """Synchronous send: Serializes and transmits a single v2 batch."""
-    memfd = serialize_to_memfd(
-        target_id, schema=schema, zbatch=zbatch,
-        status=status, error_msg=error_msg, client_id=client_id, flags=flags,
-        seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi, seek_col_idx=seek_col_idx,
+def send_batch(sock_fd, target_id, zbatch, status=0, error_msg="",
+               client_id=0, schema=None, flags=0,
+               seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
+    """Synchronous send: Serializes and transmits a single IPC batch."""
+    eff_schema = schema
+    if eff_schema is None and zbatch is not None:
+        eff_schema = zbatch._schema
+    memfd, _total = serialize_to_memfd(
+        target_id, client_id, zbatch,
+        eff_schema, flags, seek_pk_lo, seek_pk_hi, seek_col_idx,
+        status, error_msg,
     )
     try:
         if ipc_ffi.send_fd(sock_fd, memfd) < 0:
@@ -640,249 +350,74 @@ def send_error(sock_fd, error_msg, target_id=0, client_id=0):
 # ---------------------------------------------------------------------------
 
 
-def _parse_zset_section(
-    ptr, section_base, total_file_size, schema, count, blob_sz, owned_bufs
-):
-    """
-    Parses a ZSet from mapped memory at section_base using the given schema.
-    Returns an ArenaZSetBatch. String columns get owned buffers appended to owned_bufs.
-    Non-string columns use zero-copy external pointers.
-    """
-    num_cols = len(schema.columns)
-    struct_sz = count * 8
-
-    # Walk the layout to find offsets (mirrors _compute_zset_wire_size)
-    cur_off = r_uint64(0)
-
-    pk_lo_off = section_base + cur_off
-    cur_off = align_up(cur_off + r_uint64(struct_sz), ALIGNMENT)
-    pk_hi_off = section_base + cur_off
-    cur_off = align_up(cur_off + r_uint64(struct_sz), ALIGNMENT)
-    weight_off = section_base + cur_off
-    cur_off = align_up(cur_off + r_uint64(struct_sz), ALIGNMENT)
-    null_off = section_base + cur_off
-    cur_off = align_up(cur_off + r_uint64(struct_sz), ALIGNMENT)
-
-    # Bounds check structural buffers
-    if null_off + r_uint64(struct_sz) > total_file_size:
-        raise errors.StorageError("Truncated IPC (structural buffer boundary)")
-
-    pk_lo_buf = buffer.Buffer.from_external_ptr(
-        rffi.ptradd(ptr, intmask(pk_lo_off)), struct_sz
-    )
-    pk_lo_buf.offset = struct_sz
-    pk_hi_buf = buffer.Buffer.from_external_ptr(
-        rffi.ptradd(ptr, intmask(pk_hi_off)), struct_sz
-    )
-    pk_hi_buf.offset = struct_sz
-    weight_buf = buffer.Buffer.from_external_ptr(
-        rffi.ptradd(ptr, intmask(weight_off)), struct_sz
-    )
-    weight_buf.offset = struct_sz
-    null_buf = buffer.Buffer.from_external_ptr(
-        rffi.ptradd(ptr, intmask(null_off)), struct_sz
-    )
-    null_buf.offset = struct_sz
-
-    # Payload columns
-    col_bufs = newlist_hint(num_cols)
-    col_strides = newlist_hint(num_cols)
-    blob_arena_offset = r_uint64(0)  # tracks where blob region starts
-    str_col_indices  = newlist_hint(4)   # int: column index
-    str_col_ptr_offs = newlist_hint(4)   # r_uint64: wire offset saved from first pass
-
-    for ci in range(num_cols):
-        if ci == schema.pk_index:
-            col_bufs.append(buffer.Buffer(0))
-            col_strides.append(0)
-        elif schema.columns[ci].field_type.code == types.TYPE_STRING.code:
-            # IPC string column: 8 bytes per row, need to convert to German Strings
-            col_wire_sz = count * IPC_STRING_STRIDE
-            col_ptr_off = section_base + cur_off
-            cur_off = align_up(cur_off + r_uint64(col_wire_sz), ALIGNMENT)
-            # Save offset for the second pass; defer parsing until blob offset is known
-            str_col_indices.append(ci)
-            str_col_ptr_offs.append(col_ptr_off)
-            col_bufs.append(None)  # placeholder
-            col_strides.append(types.TYPE_STRING.size)
-        else:
-            wire_stride = schema.columns[ci].field_type.size
-            col_wire_sz = wire_stride * count
-            col_ptr_off = section_base + cur_off
-
-            if col_ptr_off + r_uint64(col_wire_sz) > total_file_size:
-                raise errors.StorageError("Truncated IPC (column buffer boundary)")
-
-            cb = buffer.Buffer.from_external_ptr(
-                rffi.ptradd(ptr, intmask(col_ptr_off)), col_wire_sz
-            )
-            cb.offset = col_wire_sz
-            col_bufs.append(cb)
-            col_strides.append(wire_stride)
-            cur_off = align_up(cur_off + r_uint64(col_wire_sz), ALIGNMENT)
-
-    # The blob region starts after all columns
-    blob_region_off = section_base + cur_off
-
-    # Create a single shared blob buffer for ALL string columns so that
-    # German String heap offsets are relative to the same base pointer.
-    # (Previously each _read_ipc_strings call created its own blob_buf,
-    # but only the last one was used as the batch blob arena — offsets from
-    # earlier string columns pointed into orphaned buffers → segfault.)
-    shared_blob_buf = None
-    if schema.has_string:
-        shared_blob_buf = buffer.Buffer(intmask(blob_sz) + 64)
-        owned_bufs.append(shared_blob_buf)
-
-    # Parse string columns using the offsets saved during the first pass
-    for sco_i in range(len(str_col_indices)):
-        ci_val    = str_col_indices[sco_i]
-        saved_off = str_col_ptr_offs[sco_i]
-        ipc_col_ptr  = rffi.ptradd(ptr, intmask(saved_off))
-        ipc_blob_ptr = rffi.ptradd(ptr, intmask(blob_region_off))
-        col_buf, str_blob_buf = _read_ipc_strings(
-            ipc_col_ptr, ipc_blob_ptr, blob_sz, count,
-            None, ci_val, owned_bufs, shared_blob_buf,
-        )
-        col_bufs[ci_val] = col_buf
-
-    # Use the shared blob buffer as the batch's blob arena.
-    final_blob_buf = buffer.Buffer(0)
-    if shared_blob_buf is not None:
-        final_blob_buf = shared_blob_buf
-
-    zbatch_obj = batch.ArenaZSetBatch.from_buffers(
-        schema, pk_lo_buf, pk_hi_buf, weight_buf, null_buf,
-        col_bufs, col_strides, final_blob_buf, count, is_sorted=True,
-    )
-    return zbatch_obj
-
-
 @jit.dont_look_inside
 def _recv_and_parse(fd):
-    """Parse an already-received memfd into an IPCPayload."""
-    ptr = lltype.nullptr(rffi.CCHARP.TO)
-    total_size = r_uint64(0)
-    owned_bufs = newlist_hint(8)
+    payload = IPCPayload()
+    payload.fd = fd
+
+    total_size = intmask(r_uint64(mmap_posix.fget_size(fd)))
+    if total_size < wal_layout.WAL_BLOCK_HEADER_SIZE:
+        raise errors.StorageError("IPC payload too small")
+    payload.total_size = r_uint64(total_size)
+
+    ptr = mmap_posix.mmap_file(
+        fd, total_size,
+        prot=mmap_posix.PROT_READ,
+        flags=mmap_posix.MAP_SHARED,
+    )
+    payload.ptr = ptr
+
     try:
-        total_size = r_uint64(mmap_posix.fget_size(fd))
-        if total_size < r_uint64(HEADER_SIZE):
-            raise errors.StorageError("IPC payload too small for header")
+        # Block 0: control — always present
+        ctrl_header = wal_layout.WALBlockHeaderView(ptr)
+        if ctrl_header.get_table_id() != IPC_CONTROL_TID:
+            raise errors.StorageError("IPC: bad control block TID")
+        ctrl_size  = ctrl_header.get_total_size()
+        ctrl_batch = wal_columnar.decode_batch_from_ptr(ptr, ctrl_size, CONTROL_SCHEMA)
+        _decode_control_batch(ctrl_batch, payload)
+        ctrl_batch.free()
 
-        ptr = mmap_posix.mmap_file(
-            fd,
-            intmask(total_size),
-            prot=mmap_posix.PROT_READ,
-            flags=mmap_posix.MAP_SHARED,
-        )
+        off = ctrl_size
 
-        # Verify Magic
-        magic = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_MAGIC))[0]
-        if magic != MAGIC_V2:
-            raise errors.StorageError("Invalid IPC Magic (expected v2)")
+        # Protocol invariant: FLAG_HAS_DATA requires FLAG_HAS_SCHEMA
+        if payload.flags & FLAG_HAS_DATA and not (payload.flags & FLAG_HAS_SCHEMA):
+            raise errors.StorageError("IPC: FLAG_HAS_DATA requires FLAG_HAS_SCHEMA")
 
-        # Parse Header
-        status = intmask(rffi.cast(rffi.UINTP, rffi.ptradd(ptr, OFF_STATUS))[0])
-        raw_err_len = rffi.cast(rffi.UINTP, rffi.ptradd(ptr, OFF_ERR_LEN))[0]
-        err_len = r_uint64(raw_err_len)
-        target_id = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_TARGET_ID))[0])
-        client_id = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_CLIENT_ID))[0])
-        schema_count = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SCHEMA_COUNT))[0])
-        schema_blob_sz = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SCHEMA_BLOB_SZ))[0])
-        data_count = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_COUNT))[0])
-        data_blob_sz = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_DATA_BLOB_SZ))[0])
-        flags = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_FLAGS))[0])
-
-        seek_col_idx = 0
-        seek_pk_lo = 0
-        seek_pk_hi = 0
-        if intmask(flags) & FLAG_SEEK_BY_INDEX:
-            seek_col_idx = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_COL))[0])
-            seek_pk_lo   = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_KEY_LO))[0])
-            seek_pk_hi   = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_KEY_HI))[0])
-        elif intmask(flags) & FLAG_HAS_PK:
-            seek_col_idx = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_IDX_COL))[0])
-        elif intmask(flags) & FLAG_SEEK:
-            seek_pk_lo = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_LO))[0])
-            seek_pk_hi = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_HI))[0])
-        elif intmask(flags) & FLAG_EXCHANGE:
-            # source_id piggybacked on seek_pk_lo for join exchange
-            seek_pk_lo = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, OFF_SEEK_PK_LO))[0])
-
-        if err_len > r_uint64(MAX_ERR_LEN):
-            raise errors.StorageError("Error message length exceeds safety limit")
-        if r_uint64(HEADER_SIZE) + err_len > total_size:
-            raise errors.StorageError("Truncated IPC (Error string boundary)")
-
-        error_msg = ""
-        if err_len > 0:
-            error_msg = rffi.charpsize2str(
-                rffi.ptradd(ptr, HEADER_SIZE), intmask(err_len)
+        # Block 1: schema — if FLAG_HAS_SCHEMA
+        if payload.flags & FLAG_HAS_SCHEMA:
+            if off + wal_layout.WAL_BLOCK_HEADER_SIZE > total_size:
+                raise errors.StorageError("IPC: truncated schema block")
+            schema_header = wal_layout.WALBlockHeaderView(rffi.ptradd(ptr, off))
+            schema_size = schema_header.get_total_size()
+            schema_batch = wal_columnar.decode_batch_from_ptr(
+                rffi.ptradd(ptr, off), schema_size, META_SCHEMA
             )
-
-        # Validate protocol invariant
-        if data_count > 0 and schema_count == 0:
-            raise errors.StorageError("Protocol error: data_rows > 0 but schema_rows == 0")
-
-        body_start = align_up(r_uint64(HEADER_SIZE) + err_len, ALIGNMENT)
-
-        # Parse Schema ZSet
-        wire_schema = None
-        schema_section_base = body_start
-        schema_section_end = schema_section_base
-
-        if schema_count > 0:
-            schema_owned = newlist_hint(4)
-            schema_batch = _parse_zset_section(
-                ptr, schema_section_base, total_size,
-                META_SCHEMA, schema_count, schema_blob_sz, schema_owned,
-            )
-            wire_schema = batch_to_schema(schema_batch)
-            # Free the intermediate schema batch buffers
+            payload.schema = batch_to_schema(schema_batch)
             schema_batch.free()
-            for buf in schema_owned:
-                buf.free()
+            off += schema_size
 
-            # Compute schema section size to find data section start
-            schema_str_blobs = newlist_hint(1)
-            schema_str_blobs.append(intmask(schema_blob_sz))
-            schema_wire_result = _compute_zset_wire_size(
-                META_SCHEMA, schema_count, schema_str_blobs
+        # Block 2: data — if FLAG_HAS_DATA
+        if payload.flags & FLAG_HAS_DATA:
+            if off + wal_layout.WAL_BLOCK_HEADER_SIZE > total_size:
+                raise errors.StorageError("IPC: truncated data block")
+            data_header = wal_layout.WALBlockHeaderView(rffi.ptradd(ptr, off))
+            data_size = data_header.get_total_size()
+            payload.batch = wal_columnar.decode_batch_from_ptr(
+                rffi.ptradd(ptr, off), data_size, payload.schema
             )
-            schema_section_end = align_up(
-                schema_section_base + schema_wire_result[0], ALIGNMENT
-            )
-
-        # Parse Data ZSet
-        zbatch = None
-        if data_count > 0 and wire_schema is not None:
-            data_section_base = schema_section_end
-            zbatch = _parse_zset_section(
-                ptr, data_section_base, total_size,
-                wire_schema, data_count, data_blob_sz, owned_bufs,
-            )
-
-        return IPCPayload(
-            fd, ptr, total_size, status, error_msg,
-            wire_schema, zbatch, target_id, client_id, flags, owned_bufs,
-            seek_col_idx=seek_col_idx, seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi,
-        )
+            # batch holds non-owning Buffer views into ptr (the mmap).
+            # Must not be used after payload.close().
 
     except Exception as e:
-        for buf in owned_bufs:
-            buf.free()
-        if ptr:
-            mmap_posix.munmap_file(ptr, intmask(total_size))
-        if fd >= 0:
-            os.close(fd)
+        payload.close()
         raise e
+
+    return payload
 
 
 @jit.dont_look_inside
 def receive_payload(sock_fd):
-    """
-    Receives a v2 IPC segment. Self-describing — no registry needed.
-    """
+    """Receives an IPC segment. Self-describing — no registry needed."""
     fd = ipc_ffi.recv_fd(sock_fd)
     if fd < 0:
         raise errors.StorageError("Failed to receive IPC descriptor (Socket closed)")

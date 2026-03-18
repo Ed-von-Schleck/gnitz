@@ -1,4 +1,4 @@
-# ipc_comprehensive_test.py
+# IPC comprehensive test (WAL-block envelope)
 
 import os
 from rpython.rlib import rsocket
@@ -7,12 +7,14 @@ from rpython.rlib.rarithmetic import (
     r_int64,
     r_uint64,
     r_ulonglonglong as r_uint128,
+    intmask,
 )
 
 from gnitz.core import types, batch, errors
 from gnitz.core import strings as string_logic
 from gnitz.core.batch import RowBuilder
-from gnitz.storage import buffer, mmap_posix
+from gnitz.storage import buffer, buffer as buffer_ops, mmap_posix
+from gnitz.storage import wal_columnar
 from gnitz.server import ipc, ipc_ffi
 
 
@@ -156,9 +158,9 @@ def test_meta_schema_roundtrip():
     schema_batch.free()
 
 
-def test_v2_roundtrip():
-    """Verifies full v2 serialize + receive with mixed columns (ints + strings)."""
-    os.write(1, "[IPC] Testing V2 Full Roundtrip...\n")
+def test_ipc_roundtrip():
+    """Verifies full serialize + receive with mixed columns (ints + strings)."""
+    os.write(1, "[IPC] Testing IPC Roundtrip...\n")
 
     schema = make_test_schema()
     s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
@@ -218,9 +220,9 @@ def test_v2_roundtrip():
         s2.close()
 
 
-def test_v2_int_only_roundtrip():
-    """Verifies v2 roundtrip with integer-only schema (no strings)."""
-    os.write(1, "[IPC] Testing V2 Int-Only Roundtrip...\n")
+def test_int_only_roundtrip():
+    """Verifies roundtrip with integer-only schema (no strings)."""
+    os.write(1, "[IPC] Testing Int-Only Roundtrip...\n")
 
     schema = make_int_only_schema()
     s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
@@ -259,9 +261,9 @@ def test_v2_int_only_roundtrip():
         s2.close()
 
 
-def test_v2_error_path():
-    """Verifies that error responses work via v2 format."""
-    os.write(1, "[IPC] Testing V2 Error Path...\n")
+def test_error_path():
+    """Verifies that error responses work."""
+    os.write(1, "[IPC] Testing Error Path...\n")
 
     s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
 
@@ -286,9 +288,9 @@ def test_v2_error_path():
         s2.close()
 
 
-def test_v2_scan_request():
+def test_scan_request():
     """Verifies empty push (scan request) has no schema or data."""
-    os.write(1, "[IPC] Testing V2 Scan Request (empty push)...\n")
+    os.write(1, "[IPC] Testing Scan Request...\n")
 
     s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
 
@@ -307,9 +309,9 @@ def test_v2_scan_request():
         s2.close()
 
 
-def test_v2_ipc_string_encoding():
-    """Verifies IPC string encoding with various lengths."""
-    os.write(1, "[IPC] Testing V2 IPC String Encoding...\n")
+def test_string_roundtrip():
+    """Verifies IPC string roundtrip with various lengths."""
+    os.write(1, "[IPC] Testing String Roundtrip...\n")
 
     schema = make_test_schema()
     s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
@@ -353,7 +355,7 @@ def test_v2_ipc_string_encoding():
         s2.close()
 
 
-def test_v2_null_strings():
+def test_null_strings():
     """Verifies NULL string encoding roundtrip."""
     os.write(1, "[IPC] Testing V2 NULL String Encoding...\n")
 
@@ -401,12 +403,8 @@ def test_v2_null_strings():
         s2.close()
 
 
-def test_v2_multi_string_column_roundtrip():
-    """Verifies IPC roundtrip with two string columns sharing a blob arena.
-
-    Exercises the shared_blob_buf path: per-entry blob offsets must be global
-    (relative to the single blob area start), not per-column-relative.
-    """
+def test_multi_string_column_roundtrip():
+    """Exercises multi-string-column roundtrip."""
     os.write(1, "[IPC] Testing V2 Multi-String Column Roundtrip...\n")
 
     cols = [
@@ -463,7 +461,7 @@ def test_v2_multi_string_column_roundtrip():
         s2.close()
 
 
-def test_v2_schema_mismatch():
+def test_schema_mismatch():
     """Verifies that schema validation rejects mismatched schemas."""
     os.write(1, "[IPC] Testing V2 Schema Mismatch Detection...\n")
 
@@ -484,8 +482,68 @@ def test_v2_schema_mismatch():
     _validate_schema_match(schema_a, schema_c)
 
 
-# Bring in intmask for int comparisons
-from rpython.rlib.rarithmetic import intmask
+def test_control_schema_roundtrip():
+    """Verifies CONTROL_SCHEMA encode/decode roundtrip preserves all fields."""
+    os.write(1, "[IPC] Testing control schema roundtrip...\n")
+
+    # --- Case 1: OK message, empty error string ---
+    ctrl_batch = ipc._encode_control_batch(
+        target_id=42, client_id=7,
+        flags=r_uint64(ipc.FLAG_PUSH),
+        seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0,
+        status=ipc.STATUS_OK, error_msg="",
+    )
+    assert_equal_i(1, ctrl_batch.length(), "Control batch should have 1 row")
+
+    buf = buffer_ops.Buffer(0)
+    wal_columnar.encode_batch_to_buffer(
+        buf, ipc.CONTROL_SCHEMA, r_uint64(0), ipc.IPC_CONTROL_TID, ctrl_batch
+    )
+    ctrl_batch.free()
+
+    decoded = wal_columnar.decode_batch_from_ptr(
+        buf.base_ptr, buf.offset, ipc.CONTROL_SCHEMA
+    )
+    p = ipc.IPCPayload()
+    ipc._decode_control_batch(decoded, p)
+    decoded.free()
+    buf.free()
+
+    assert_equal_i(42, p.target_id, "target_id mismatch")
+    assert_equal_i(7, p.client_id, "client_id mismatch")
+    assert_equal_i(ipc.STATUS_OK, p.status, "status mismatch")
+    assert_true(p.error_msg == "", "error_msg should be empty")
+    assert_true(
+        p.flags == r_uint64(ipc.FLAG_PUSH),
+        "flags mismatch",
+    )
+
+    # --- Case 2: ERROR message with non-null error string ---
+    ctrl_batch2 = ipc._encode_control_batch(
+        target_id=0, client_id=0,
+        flags=r_uint64(0),
+        seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0,
+        status=ipc.STATUS_ERROR, error_msg="something went wrong",
+    )
+    buf2 = buffer_ops.Buffer(0)
+    wal_columnar.encode_batch_to_buffer(
+        buf2, ipc.CONTROL_SCHEMA, r_uint64(0), ipc.IPC_CONTROL_TID, ctrl_batch2
+    )
+    ctrl_batch2.free()
+
+    decoded2 = wal_columnar.decode_batch_from_ptr(
+        buf2.base_ptr, buf2.offset, ipc.CONTROL_SCHEMA
+    )
+    p2 = ipc.IPCPayload()
+    ipc._decode_control_batch(decoded2, p2)
+    decoded2.free()
+    buf2.free()
+
+    assert_equal_i(ipc.STATUS_ERROR, p2.status, "status mismatch")
+    assert_true(
+        p2.error_msg == "something went wrong",
+        "error_msg mismatch: '%s'" % p2.error_msg,
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -494,19 +552,20 @@ from rpython.rlib.rarithmetic import intmask
 
 
 def entry_point(argv):
-    os.write(1, "--- GnitzDB IPC Transport Test (v2) ---\n")
+    os.write(1, "--- GnitzDB IPC Transport Test (WAL-block envelope) ---\n")
     try:
         test_unowned_buffer_lifecycle()
         test_ipc_fd_hardening()
         test_meta_schema_roundtrip()
-        test_v2_roundtrip()
-        test_v2_int_only_roundtrip()
-        test_v2_error_path()
-        test_v2_scan_request()
-        test_v2_ipc_string_encoding()
-        test_v2_null_strings()
-        test_v2_multi_string_column_roundtrip()
-        test_v2_schema_mismatch()
+        test_ipc_roundtrip()
+        test_int_only_roundtrip()
+        test_error_path()
+        test_scan_request()
+        test_string_roundtrip()
+        test_null_strings()
+        test_multi_string_column_roundtrip()
+        test_schema_mismatch()
+        test_control_schema_roundtrip()
         os.write(1, "\nALL IPC TRANSPORT TESTS PASSED\n")
     except Exception:
         os.write(2, "TESTING FAILED\n")
