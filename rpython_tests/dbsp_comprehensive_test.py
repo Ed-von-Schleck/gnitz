@@ -953,6 +953,274 @@ def test_anti_semi_join_complement(base_dir):
         b_semi.free()
 
 
+def test_join_adaptive_swap(base_dir):
+    """
+    Swap path: delta 10 rows, trace 2 rows → delta_len > trace_len triggers swap.
+    Verify output matches expected join result (PKs 3 and 7 match).
+    """
+    log("[DBSP] Testing Join adaptive swap path...")
+
+    cols_l = newlist_hint(2)
+    cols_l.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols_l.append(types.ColumnDefinition(types.TYPE_I64, name="val_l"))
+    schema_l = types.TableSchema(cols_l, 0)
+
+    cols_r = newlist_hint(2)
+    cols_r.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols_r.append(types.ColumnDefinition(types.TYPE_I64, name="val_r"))
+    schema_r = types.TableSchema(cols_r, 0)
+
+    schema_out = types.merge_schemas_for_join(schema_l, schema_r)
+    b_l = batch.ArenaZSetBatch(schema_l)
+    b_r = batch.ArenaZSetBatch(schema_r)
+    b_out = batch.ArenaZSetBatch(schema_out)
+
+    try:
+        rb_l = RowBuilder(schema_l, b_l)
+        for pk in range(1, 11):  # 10 distinct delta rows
+            rb_l.begin(r_uint128(pk), r_int64(1))
+            rb_l.put_int(r_int64(pk * 10))
+            rb_l.commit()
+
+        rb_r = RowBuilder(schema_r, b_r)
+        rb_r.begin(r_uint128(3), r_int64(1))
+        rb_r.put_int(r_int64(300))
+        rb_r.commit()
+        rb_r.begin(r_uint128(7), r_int64(1))
+        rb_r.put_int(r_int64(700))
+        rb_r.commit()
+
+        trace_path = os.path.join(base_dir, "jas_trace")
+        trace_r = EphemeralTable(trace_path, "tr", schema_r)
+        trace_r.ingest_batch(b_r)
+
+        cursor_r = trace_r.create_cursor()
+        join.op_join_delta_trace(b_l, cursor_r, batch.BatchWriter(b_out), schema_l, schema_r)
+        cursor_r.close()
+
+        assert_equal_i(2, b_out.length(), "Swap join: expected 2 output rows")
+        found_3 = False
+        found_7 = False
+        for i in range(b_out.length()):
+            pk = b_out.get_pk(i)
+            if pk == r_uint128(3):
+                found_3 = True
+            elif pk == r_uint128(7):
+                found_7 = True
+        assert_true(found_3, "Swap join: missing PK 3")
+        assert_true(found_7, "Swap join: missing PK 7")
+
+        trace_r.close()
+    finally:
+        b_l.free()
+        b_r.free()
+        b_out.free()
+    log("  PASSED")
+
+
+def test_join_merge_walk(base_dir):
+    """
+    Merge-walk path: consolidated delta (5 rows), larger trace (8 rows).
+    delta_len <= trace_len and _consolidated -> merge-walk path.
+    """
+    log("[DBSP] Testing Join merge-walk path...")
+
+    cols_l = newlist_hint(2)
+    cols_l.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols_l.append(types.ColumnDefinition(types.TYPE_I64, name="val_l"))
+    schema_l = types.TableSchema(cols_l, 0)
+
+    cols_r = newlist_hint(2)
+    cols_r.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols_r.append(types.ColumnDefinition(types.TYPE_I64, name="val_r"))
+    schema_r = types.TableSchema(cols_r, 0)
+
+    schema_out = types.merge_schemas_for_join(schema_l, schema_r)
+    b_l = batch.ArenaZSetBatch(schema_l)
+    b_r = batch.ArenaZSetBatch(schema_r)
+    b_out = batch.ArenaZSetBatch(schema_out)
+
+    try:
+        rb_l = RowBuilder(schema_l, b_l)
+        for pk in range(1, 6):  # 5 distinct consolidated delta rows
+            rb_l.begin(r_uint128(pk), r_int64(1))
+            rb_l.put_int(r_int64(pk * 10))
+            rb_l.commit()
+        b_l.mark_consolidated(True)
+
+        rb_r = RowBuilder(schema_r, b_r)
+        for pk in range(1, 9):  # 8 trace rows (superset of delta PKs)
+            rb_r.begin(r_uint128(pk), r_int64(1))
+            rb_r.put_int(r_int64(pk * 100))
+            rb_r.commit()
+
+        trace_path = os.path.join(base_dir, "jmw_trace")
+        trace_r = EphemeralTable(trace_path, "tr", schema_r)
+        trace_r.ingest_batch(b_r)
+
+        cursor_r = trace_r.create_cursor()
+        join.op_join_delta_trace(b_l, cursor_r, batch.BatchWriter(b_out), schema_l, schema_r)
+        cursor_r.close()
+
+        # All 5 delta PKs (1-5) match trace PKs (1-8) -> 5 output rows
+        assert_equal_i(5, b_out.length(), "Merge-walk join: expected 5 output rows")
+        assert_true(b_out._sorted, "Merge-walk join: output should be sorted")
+
+        trace_r.close()
+    finally:
+        b_l.free()
+        b_r.free()
+        b_out.free()
+    log("  PASSED")
+
+
+def test_anti_join_merge_walk(base_dir):
+    """
+    Anti-join merge-walk: consolidated delta PKs 1-5.
+    Trace: PK 2 (+1), PK 3 (+1), PK 4 (-1).
+    Expected output: PKs 1, 4, 5 (PK 4 has negative weight so not suppressed).
+    """
+    log("[DBSP] Testing Anti-Join merge-walk path...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_a = batch.ArenaZSetBatch(schema)
+    b_t = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb_a = RowBuilder(schema, b_a)
+        for pk in range(1, 6):
+            rb_a.begin(r_uint128(pk), r_int64(1))
+            rb_a.put_int(r_int64(pk * 10))
+            rb_a.commit()
+        b_a.mark_consolidated(True)
+
+        rb_t = RowBuilder(schema, b_t)
+        rb_t.begin(r_uint128(2), r_int64(1))   # positive: suppresses delta PK 2
+        rb_t.put_int(r_int64(200))
+        rb_t.commit()
+        rb_t.begin(r_uint128(3), r_int64(1))   # positive: suppresses delta PK 3
+        rb_t.put_int(r_int64(300))
+        rb_t.commit()
+        rb_t.begin(r_uint128(4), r_int64(-1))  # negative: does NOT suppress delta PK 4
+        rb_t.put_int(r_int64(400))
+        rb_t.commit()
+
+        trace_path = os.path.join(base_dir, "ajmw_trace")
+        trace_t = EphemeralTable(trace_path, "tr", schema)
+        trace_t.ingest_batch(b_t)
+
+        cursor_t = trace_t.create_cursor()
+        anti_join.op_anti_join_delta_trace(b_a, cursor_t, batch.BatchWriter(b_out), schema)
+        cursor_t.close()
+
+        assert_equal_i(3, b_out.length(), "Anti-join merge-walk: expected 3 rows (PKs 1,4,5)")
+        assert_true(b_out._consolidated, "Anti-join merge-walk: output should be consolidated")
+        found_1 = False
+        found_4 = False
+        found_5 = False
+        for i in range(b_out.length()):
+            pk = b_out.get_pk(i)
+            if pk == r_uint128(1):
+                found_1 = True
+            elif pk == r_uint128(4):
+                found_4 = True
+            elif pk == r_uint128(5):
+                found_5 = True
+        assert_true(found_1, "Anti-join merge-walk: missing PK 1")
+        assert_true(found_4, "Anti-join merge-walk: missing PK 4 (negative trace weight)")
+        assert_true(found_5, "Anti-join merge-walk: missing PK 5")
+
+        trace_t.close()
+    finally:
+        b_a.free()
+        b_t.free()
+        b_out.free()
+    log("  PASSED")
+
+
+def test_semi_join_merge_walk(base_dir):
+    """
+    Semi-join merge-walk: consolidated delta (3 rows), trace larger (5 rows) to
+    avoid triggering the swap path (3 <= 5).
+    Trace: PK 2 (+1), PK 3 (+1), PK 4 (-1), PKs 5,6 (+1).
+    Expected output: PKs 2, 3 only (PK 1 not in trace, PK 4 has negative weight).
+    """
+    log("[DBSP] Testing Semi-Join merge-walk path...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    b_a = batch.ArenaZSetBatch(schema)
+    b_t = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        # Delta: 3 rows (PKs 1, 2, 3) — consolidated, trace has 5 rows so no swap
+        rb_a = RowBuilder(schema, b_a)
+        for pk in range(1, 4):
+            rb_a.begin(r_uint128(pk), r_int64(1))
+            rb_a.put_int(r_int64(pk * 10))
+            rb_a.commit()
+        b_a.mark_consolidated(True)
+
+        rb_t = RowBuilder(schema, b_t)
+        rb_t.begin(r_uint128(2), r_int64(1))   # positive: matches delta PK 2
+        rb_t.put_int(r_int64(200))
+        rb_t.commit()
+        rb_t.begin(r_uint128(3), r_int64(1))   # positive: matches delta PK 3
+        rb_t.put_int(r_int64(300))
+        rb_t.commit()
+        rb_t.begin(r_uint128(4), r_int64(-1))  # negative weight (extra trace entry)
+        rb_t.put_int(r_int64(400))
+        rb_t.commit()
+        rb_t.begin(r_uint128(5), r_int64(1))
+        rb_t.put_int(r_int64(500))
+        rb_t.commit()
+        rb_t.begin(r_uint128(6), r_int64(1))
+        rb_t.put_int(r_int64(600))
+        rb_t.commit()
+
+        trace_path = os.path.join(base_dir, "sjmw_trace")
+        trace_t = EphemeralTable(trace_path, "tr", schema)
+        trace_t.ingest_batch(b_t)
+
+        cursor_t = trace_t.create_cursor()
+        anti_join.op_semi_join_delta_trace(b_a, cursor_t, batch.BatchWriter(b_out), schema)
+        cursor_t.close()
+
+        # PK 1: not in trace → not emitted; PKs 2,3: positive weight → emitted
+        assert_equal_i(2, b_out.length(), "Semi-join merge-walk: expected 2 rows (PKs 2,3)")
+        assert_true(b_out._consolidated, "Semi-join merge-walk: output should be consolidated")
+        found_2 = False
+        found_3 = False
+        for i in range(b_out.length()):
+            pk = b_out.get_pk(i)
+            if pk == r_uint128(2):
+                found_2 = True
+                assert_equal_i64(r_int64(20), b_out.get_accessor(i).get_int_signed(1),
+                                 "Semi-join merge-walk: PK 2 should have left val")
+            elif pk == r_uint128(3):
+                found_3 = True
+                assert_equal_i64(r_int64(30), b_out.get_accessor(i).get_int_signed(1),
+                                 "Semi-join merge-walk: PK 3 should have left val")
+        assert_true(found_2, "Semi-join merge-walk: missing PK 2")
+        assert_true(found_3, "Semi-join merge-walk: missing PK 3")
+
+        trace_t.close()
+    finally:
+        b_a.free()
+        b_t.free()
+        b_out.free()
+    log("  PASSED")
+
+
 def test_source_ops(base_dir):
     log("[DBSP] Testing Source Ops...")
 
@@ -2119,6 +2387,66 @@ def test_clone_preserves_consolidated():
     log("  PASSED")
 
 
+def test_union_sorted_merge():
+    log("[DBSP] Testing op_union sorted merge (Opt 3)...")
+
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    schema = types.TableSchema(cols, 0)
+
+    batch_a_raw = batch.ArenaZSetBatch(schema)
+    batch_b_raw = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(schema)
+
+    try:
+        rb_a = RowBuilder(schema, batch_a_raw)
+        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.put_int(r_int64(10))
+        rb_a.commit()
+        rb_a.begin(r_uint128(2), r_int64(1))
+        rb_a.put_int(r_int64(20))
+        rb_a.commit()
+        rb_a.begin(r_uint128(3), r_int64(1))
+        rb_a.put_int(r_int64(30))
+        rb_a.commit()
+
+        rb_b = RowBuilder(schema, batch_b_raw)
+        rb_b.begin(r_uint128(2), r_int64(1))
+        rb_b.put_int(r_int64(20))
+        rb_b.commit()
+        rb_b.begin(r_uint128(4), r_int64(1))
+        rb_b.put_int(r_int64(40))
+        rb_b.commit()
+        rb_b.begin(r_uint128(5), r_int64(1))
+        rb_b.put_int(r_int64(50))
+        rb_b.commit()
+
+        batch_a_sorted = batch_a_raw.to_sorted()
+        batch_b_sorted = batch_b_raw.to_sorted()
+
+        try:
+            linear.op_union(batch_a_sorted, batch_b_sorted, b_out)
+            assert_true(b_out._sorted, "Sorted merge: output _sorted should be True")
+            assert_equal_i(6, b_out.length(),
+                           "Sorted merge: pk=1,2,2,3,4,5 -> 6 rows")
+            for i in range(b_out.length() - 1):
+                pk_i = b_out.get_pk(i)
+                pk_next = b_out.get_pk(i + 1)
+                assert_true(pk_i <= pk_next, "Sorted merge: PKs not in ascending order")
+        finally:
+            if batch_a_sorted is not batch_a_raw:
+                batch_a_sorted.free()
+            if batch_b_sorted is not batch_b_raw:
+                batch_b_sorted.free()
+
+    finally:
+        batch_a_raw.free()
+        batch_b_raw.free()
+        b_out.free()
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -2145,6 +2473,10 @@ def entry_point(argv):
         test_anti_join_weight_semantics(base_dir)
         test_semi_join_basic(base_dir)
         test_anti_semi_join_complement(base_dir)
+        test_join_adaptive_swap(base_dir)
+        test_join_merge_walk(base_dir)
+        test_anti_join_merge_walk(base_dir)
+        test_semi_join_merge_walk(base_dir)
         test_source_ops(base_dir)
         test_reduce_group_idx(base_dir)
         test_reduce_min_agg_value_idx(base_dir)
@@ -2162,6 +2494,7 @@ def entry_point(argv):
         test_scan_trace_marks_consolidated(base_dir)
         test_distinct_marks_consolidated(base_dir)
         test_clone_preserves_consolidated()
+        test_union_sorted_merge()
         log("\nALL DBSP TESTS PASSED")
     except Exception as e:
         os.write(2, "FAILURE\n")

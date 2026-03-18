@@ -3,6 +3,9 @@
 from rpython.rlib.rarithmetic import r_int64, intmask
 
 from gnitz.core.batch import ConsolidatedScope
+from gnitz.storage.cursor import SortedBatchCursor
+
+ADAPTIVE_SWAP_THRESHOLD = 1   # swap when delta_len > trace_len
 
 """
 Anti-Join and Semi-Join Operators for the DBSP algebra.
@@ -33,6 +36,14 @@ def op_anti_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema)
     out_writer:    BatchWriter     — strictly write-only destination
     left_schema:   TableSchema     — schema of delta_batch (= output schema)
     """
+    if delta_batch._consolidated:
+        _anti_join_dt_merge_walk(delta_batch, trace_cursor, out_writer)
+    else:
+        _anti_join_dt_normal(delta_batch, trace_cursor, out_writer)
+        out_writer.mark_sorted(delta_batch._sorted)
+
+
+def _anti_join_dt_normal(delta_batch, trace_cursor, out_writer):
     count = delta_batch.length()
     for i in range(count):
         w = delta_batch.get_weight(i)
@@ -53,7 +64,26 @@ def op_anti_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema)
 
         if not has_match:
             out_writer.direct_append_row(delta_batch, i, w)
-    out_writer.mark_sorted(delta_batch._sorted)
+    # No mark_sorted here — dispatch owns it.
+
+
+def _anti_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
+    count = delta_batch.length()
+    if count == 0:
+        out_writer.mark_consolidated(True)
+        return
+    trace_cursor.seek(delta_batch.get_pk(0))
+    for i in range(count):
+        d_key = delta_batch.get_pk(i)
+        while trace_cursor.is_valid() and trace_cursor.key() < d_key:
+            trace_cursor.advance()
+        in_trace = (trace_cursor.is_valid() and trace_cursor.key() == d_key
+                    and trace_cursor.weight() > r_int64(0))
+        if not in_trace:
+            out_writer.direct_append_row(delta_batch, i, delta_batch.get_weight(i))
+        if trace_cursor.is_valid() and trace_cursor.key() == d_key:
+            trace_cursor.advance()   # advance past d_key even for negative-weight trace records
+    out_writer.mark_consolidated(True)
 
 
 def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
@@ -112,6 +142,14 @@ def op_semi_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema)
     out_writer:    BatchWriter     — strictly write-only destination
     left_schema:   TableSchema     — schema of delta_batch (= output schema)
     """
+    if delta_batch._consolidated:
+        _semi_join_dt_merge_walk(delta_batch, trace_cursor, out_writer)
+    else:
+        _semi_join_dt_normal(delta_batch, trace_cursor, out_writer)
+        out_writer.mark_sorted(delta_batch._sorted)
+
+
+def _semi_join_dt_normal(delta_batch, trace_cursor, out_writer):
     count = delta_batch.length()
     for i in range(count):
         w = delta_batch.get_weight(i)
@@ -132,7 +170,45 @@ def op_semi_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema)
 
         if has_match:
             out_writer.direct_append_row(delta_batch, i, w)
-    out_writer.mark_sorted(delta_batch._sorted)
+    # No mark_sorted here — dispatch owns it.
+
+
+def _semi_join_dt_swapped(delta_batch, trace_cursor, out_writer):
+    with ConsolidatedScope(delta_batch) as sorted_delta:
+        delta_cursor = SortedBatchCursor(sorted_delta)
+        while trace_cursor.is_valid():
+            trace_key = trace_cursor.key()
+            if trace_cursor.weight() <= r_int64(0):
+                trace_cursor.advance()
+                continue
+            if not delta_cursor.seek_key_exact(trace_key):
+                trace_cursor.advance()
+                continue
+            while delta_cursor.is_valid() and delta_cursor.key() == trace_key:
+                w_delta = delta_cursor.weight()
+                out_writer.direct_append_row(sorted_delta, delta_cursor._pos, w_delta)
+                delta_cursor.advance()
+            trace_cursor.advance()
+    # Caller sets mark_sorted(True).
+
+
+def _semi_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
+    count = delta_batch.length()
+    if count == 0:
+        out_writer.mark_consolidated(True)
+        return
+    trace_cursor.seek(delta_batch.get_pk(0))
+    for i in range(count):
+        d_key = delta_batch.get_pk(i)
+        while trace_cursor.is_valid() and trace_cursor.key() < d_key:
+            trace_cursor.advance()
+        in_trace = (trace_cursor.is_valid() and trace_cursor.key() == d_key
+                    and trace_cursor.weight() > r_int64(0))
+        if in_trace:
+            out_writer.direct_append_row(delta_batch, i, delta_batch.get_weight(i))
+        if trace_cursor.is_valid() and trace_cursor.key() == d_key:
+            trace_cursor.advance()
+    out_writer.mark_consolidated(True)
 
 
 def op_semi_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
