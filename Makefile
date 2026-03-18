@@ -4,7 +4,6 @@ export PYTHONPATH := .:${PYPY_PATH}
 
 RPYTHON  := pypy2 ${PYPY_PATH}/rpython/bin/rpython
 RPYFLAGS := --opt=1 --gc=incminimark --lldebug
-JOBS     ?= $(shell nproc 2>/dev/null || echo 4)
 
 TEST_FILES := \
 	rpython_tests/core_comprehensive_test.py \
@@ -51,23 +50,23 @@ LOG_DIR := .test_logs
 all: test
 
 # ---------------------------------------------------------------------------
-# Parallel test pipeline
+# Sequential test pipeline
 #
 # Each test's compile+run output is captured to .test_logs/<name>.log.
 # On success: prints one PASS line.
 # On failure: prints one FAIL line. Full log is shown in the summary.
 #
-# Cache warming: first test compiles serially to populate gcc_cache.
+# Tests compile sequentially to avoid races in the RPython build system.
+# RPython's platform.compile() writes temp/object files during compilation;
+# parallel invocations sharing the same gcc_cache can race on those files.
+# gcc_cache uses atomic rename for its own writes, but the underlying
+# platform.compile() step is not safe for concurrent calls on a cold cache.
 # ---------------------------------------------------------------------------
-
-FIRST_TEST := core_comprehensive_test
-REST_RUN_TARGETS := $(filter-out run-$(FIRST_TEST)-c,$(RUN_TARGETS))
 
 test:
 	@$(MAKE) --no-print-directory clean
 	@mkdir -p $(LOG_DIR)
-	@$(MAKE) --no-print-directory run-$(FIRST_TEST)-c
-	@$(MAKE) --no-print-directory -j$(JOBS) -k $(REST_RUN_TARGETS); \
+	@$(MAKE) --no-print-directory -k $(RUN_TARGETS); \
 	 EXIT=$$?; \
 	 echo ""; \
 	 echo "========================================"; \
