@@ -142,7 +142,12 @@ def op_semi_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema)
     out_writer:    BatchWriter     — strictly write-only destination
     left_schema:   TableSchema     — schema of delta_batch (= output schema)
     """
-    if delta_batch._consolidated:
+    delta_len = delta_batch.length()
+    trace_len = trace_cursor.estimated_length()
+    if delta_len > trace_len * ADAPTIVE_SWAP_THRESHOLD:
+        _semi_join_dt_swapped(delta_batch, trace_cursor, out_writer)
+        out_writer.mark_sorted(True)
+    elif delta_batch._consolidated:
         _semi_join_dt_merge_walk(delta_batch, trace_cursor, out_writer)
     else:
         _semi_join_dt_normal(delta_batch, trace_cursor, out_writer)

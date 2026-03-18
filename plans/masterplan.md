@@ -1,7 +1,7 @@
 # Master Implementation Plan
 
-**Completed:** Units 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 18a/b/c (IPC RPython side).
-**In progress:** Unit 18 Step 5 (rust_client).
+**Completed:** Units 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 18a/b/c/s5a (IPC + rust_client wire format).
+**In progress:** Unit 18 Step 5b (rust_client design cleanup).
 
 ## Dependency Graph
 
@@ -9,12 +9,12 @@
 Phase 1 ─── all unblocked ──────────────────────────────────────────────
   [6b] Join bug fixes    [9] Exchange Standalone    [10] Exchange IPC Flags
   (B1,B2,B3)                 (Opt 1,4,5,6)               (Opt 3)
-                         [18s5] rust_client update
-                              (IPC wire format)
+                         [18s5b] rust_client cleanup
+                              (Message flatten, field renames)
   [16] Push-time routing ─── depends on [9]; benefits from [10]
        (Opt 2)
 
-Phase 2 ─── depends on [18a/b/c]✓ ─────────────────────────────────────
+Phase 2 ─── depends on [18a/b/c/s5a]✓ ────────────────────────────────
   [9] Exchange Standalone    [18s5] rust_client update
       (Opt 1,4,5,6)               (IPC wire format)
 
@@ -96,22 +96,19 @@ For `INPUT → SHARD → REDUCE` circuits, master routes directly to shard-colum
 
 **Tests:** `test_trivial_preplan_no_exchange` (new, `GNITZ_WORKERS=4`); `test_push_scan_multiworker` regression.
 
-### Unit 18 Step 5: rust_client Wire Format Update
-**Plan:** `ipc-unification.md` Step 5 | **In progress** | **Rust only**
+### Unit 18 Step 5b: rust_client Design Cleanup
+**Plan:** `ipc-unification.md` Step 5b | **In progress** | **Rust only**
 
-RPython IPC side complete (18a/b/c done). Update `rust_client/gnitz-protocol` to WAL-block wire format.
+Wire format correct (5a done, 27 unit tests pass). Remaining cosmetic cleanup:
 
-| File | Change |
-|---|---|
-| `gnitz-protocol/src/header.rs` | Replace 96-byte `Header` + `MAGIC_V2` with WAL block header constants |
-| `gnitz-protocol/src/codec.rs` | Delete bespoke ZSet encoding; add `encode_block`, `decode_block`, German String helpers |
-| `gnitz-protocol/src/message.rs` | Replace `send_message`/`recv_message` with WAL-block equivalents; add `CONTROL_SCHEMA`, control batch encode/decode |
-| `gnitz-protocol/src/types.rs` | `TypeCode::String.wire_stride()` returns 16 (German String stride) |
-| `gnitz-protocol/src/lib.rs` | Update exports |
-| `gnitz-core/src/connection.rs` | `msg.header.status` → `msg.status`; `msg.header.target_id` → `msg.target_id` etc. |
-| `gnitz-core/src/ops.rs` | `msg.header.target_id` → `msg.target_id` |
+| Item | File | Change |
+|---|---|---|
+| `TypeCode::String.wire_stride()` returns 8, should be 16 | `gnitz-protocol/src/types.rs` | Fix return value |
+| `Message` nests `header: Header` | `gnitz-protocol/src/message.rs` | Flatten to top-level fields |
+| `send_message` takes `Header` param | `gnitz-protocol/src/message.rs` | Rewrite to positional args |
+| `msg.header.status/target_id/client_id` | `gnitz-core/src/connection.rs`, `gnitz-core/src/ops.rs` | Update to `msg.status/target_id/client_id` |
 
-**Tests:** E2E `GNITZ_WORKERS=4` pass after this lands.
+**Tests:** `cargo test`; `GNITZ_WORKERS=4 make e2e`.
 
 ---
 
@@ -213,7 +210,7 @@ Picks overfull L1 guard, merges with overlapping L2 guards, enforces Lazy Leveli
 
 ## Execution Strategy
 
-**In progress:** Unit 18 Step 5 (rust_client).
+**In progress:** Unit 18 Step 5b (rust_client cleanup).
 **Next (all unblocked, do in parallel):** Join bug fixes (B1/B2/B3), Unit 9 (Exchange), Unit 10 (Exchange IPC Flags), Units 20+ (FLSM).
 **Then:** Unit 16 (push-time routing, after Unit 9); Unit 19 (WAL-Block Improvements, after Unit 18 complete).
 **Then:** Units 13-15, 17 (new features, any order).

@@ -4,7 +4,7 @@ from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, intmask
 
 from gnitz.core.comparator import RowAccessor
-from gnitz.core.batch import ConsolidatedScope, SortedScope, BatchWriter
+from gnitz.core.batch import ConsolidatedScope, BatchWriter
 from gnitz.storage.cursor import SortedBatchCursor
 
 """
@@ -154,6 +154,7 @@ def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schem
 
 def _join_dt_normal(delta_batch, trace_cursor, out_writer, composite_acc):
     count = delta_batch.length()
+    rows_since_consolidation = 0
     for i in range(count):
         w_delta = delta_batch.get_weight(i)
         if w_delta == r_int64(0):
@@ -175,6 +176,10 @@ def _join_dt_normal(delta_batch, trace_cursor, out_writer, composite_acc):
                     trace_cursor.get_accessor(),
                 )
                 out_writer.append_from_accessor(key, w_out, composite_acc)
+                rows_since_consolidation += 1
+                if rows_since_consolidation >= CONSOLIDATE_INTERVAL:
+                    out_writer.consolidate()
+                    rows_since_consolidation = 0
 
             trace_cursor.advance()
     # No mark_sorted here — dispatch owns it.
