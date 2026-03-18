@@ -125,6 +125,7 @@ class AggregateFunction(object):
     def output_column_type(self): return types.TYPE_I64
     def is_accumulator_zero(self): return True
     def seed_from_raw_bits(self, bits): pass
+    def combine(self, other_bits): pass
 
 
 class NullAggregate(AggregateFunction):
@@ -215,6 +216,50 @@ class UniversalAccumulator(AggregateFunction):
                 prev = rffi.cast(rffi.LONGLONG, value_bits)
                 self._acc = r_int64(intmask(self._acc + (prev * weight)))
             self._has_value = True
+
+    def combine(self, other_bits):
+        """Merge a partial aggregate (other_bits = get_value_bits() from a non-zero
+        accumulator on another shard) into this accumulator.
+        Caller must verify is_accumulator_zero() == False on the source before calling.
+        """
+        op = jit.promote(self.agg_op)
+        if op == AGG_COUNT or op == AGG_COUNT_NON_NULL:
+            prev = rffi.cast(rffi.LONGLONG, other_bits)
+            self._acc = r_int64(intmask(self._acc + prev))
+            self._has_value = True
+        elif op == AGG_SUM:
+            code = self.col_type_code
+            if code == types.TYPE_F64.code or code == types.TYPE_F32.code:
+                prev_f = longlong2float(rffi.cast(rffi.LONGLONG, other_bits))
+                self._acc = float2longlong(longlong2float(self._acc) + prev_f)
+            else:
+                prev = rffi.cast(rffi.LONGLONG, other_bits)
+                self._acc = r_int64(intmask(self._acc + prev))
+            self._has_value = True
+        elif op == AGG_MIN:
+            first = not self._has_value
+            self._has_value = True
+            code = self.col_type_code
+            if code == types.TYPE_F64.code or code == types.TYPE_F32.code:
+                other_f = longlong2float(rffi.cast(rffi.LONGLONG, other_bits))
+                if first or other_f < longlong2float(self._acc):
+                    self._acc = float2longlong(other_f)
+            else:
+                other_v = rffi.cast(rffi.LONGLONG, other_bits)
+                if first or other_v < self._acc:
+                    self._acc = other_v
+        elif op == AGG_MAX:
+            first = not self._has_value
+            self._has_value = True
+            code = self.col_type_code
+            if code == types.TYPE_F64.code or code == types.TYPE_F32.code:
+                other_f = longlong2float(rffi.cast(rffi.LONGLONG, other_bits))
+                if first or other_f > longlong2float(self._acc):
+                    self._acc = float2longlong(other_f)
+            else:
+                other_v = rffi.cast(rffi.LONGLONG, other_bits)
+                if first or other_v > self._acc:
+                    self._acc = other_v
 
     def seed_from_raw_bits(self, bits):
         self._acc = r_int64(intmask(bits))

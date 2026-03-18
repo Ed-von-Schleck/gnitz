@@ -12,7 +12,7 @@ from rpython.rlib.rarithmetic import (
     intmask,
 )
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rlib.longlong2float import float2longlong
+from rpython.rlib.longlong2float import float2longlong, longlong2float
 
 from gnitz.core import types, batch, errors
 from gnitz.core.batch import RowBuilder
@@ -2114,6 +2114,119 @@ def test_count_non_null(base_dir):
     log("  PASSED")
 
 
+def test_accumulator_combine_count(base_dir):
+    # acc_a=3 partial count, acc_b=7 partial count -> combined=10
+    log("[DBSP] Testing UniversalAccumulator.combine COUNT...")
+    acc_a = functions.UniversalAccumulator(0, functions.AGG_COUNT, types.TYPE_I64)
+    acc_b = functions.UniversalAccumulator(0, functions.AGG_COUNT, types.TYPE_I64)
+    acc_a.seed_from_raw_bits(r_uint64(3))
+    acc_b.seed_from_raw_bits(r_uint64(7))
+    acc_b.combine(acc_a.get_value_bits())
+    assert_equal_i64(r_int64(10), rffi.cast(rffi.LONGLONG, acc_b.get_value_bits()), "COUNT combine")
+    log("  PASSED")
+
+
+def test_accumulator_combine_count_non_null(base_dir):
+    # Same arithmetic as COUNT
+    log("[DBSP] Testing UniversalAccumulator.combine COUNT_NON_NULL...")
+    acc_a = functions.UniversalAccumulator(0, functions.AGG_COUNT_NON_NULL, types.TYPE_I64)
+    acc_b = functions.UniversalAccumulator(0, functions.AGG_COUNT_NON_NULL, types.TYPE_I64)
+    acc_a.seed_from_raw_bits(r_uint64(4))
+    acc_b.seed_from_raw_bits(r_uint64(6))
+    acc_b.combine(acc_a.get_value_bits())
+    assert_equal_i64(r_int64(10), rffi.cast(rffi.LONGLONG, acc_b.get_value_bits()), "COUNT_NON_NULL combine")
+    log("  PASSED")
+
+
+def test_accumulator_combine_sum_int(base_dir):
+    # partial sums 100 + 200 = 300
+    log("[DBSP] Testing UniversalAccumulator.combine SUM int...")
+    acc_a = functions.UniversalAccumulator(0, functions.AGG_SUM, types.TYPE_I64)
+    acc_b = functions.UniversalAccumulator(0, functions.AGG_SUM, types.TYPE_I64)
+    acc_a.seed_from_raw_bits(r_uint64(100))
+    acc_b.seed_from_raw_bits(r_uint64(200))
+    acc_b.combine(acc_a.get_value_bits())
+    assert_equal_i64(r_int64(300), rffi.cast(rffi.LONGLONG, acc_b.get_value_bits()), "SUM int combine")
+    log("  PASSED")
+
+
+def test_accumulator_combine_sum_float(base_dir):
+    # partial sums 1.5 + 2.5 = 4.0
+    log("[DBSP] Testing UniversalAccumulator.combine SUM float...")
+    acc_a = functions.UniversalAccumulator(0, functions.AGG_SUM, types.TYPE_F64)
+    acc_b = functions.UniversalAccumulator(0, functions.AGG_SUM, types.TYPE_F64)
+    acc_a.seed_from_raw_bits(r_uint64(intmask(float2longlong(1.5))))
+    acc_b.seed_from_raw_bits(r_uint64(intmask(float2longlong(2.5))))
+    acc_b.combine(acc_a.get_value_bits())
+    result = longlong2float(rffi.cast(rffi.LONGLONG, acc_b.get_value_bits()))
+    assert_true(result == 4.0, "SUM float combine")
+    log("  PASSED")
+
+
+def test_accumulator_combine_min_int(base_dir):
+    # min(3, 7) = 3
+    log("[DBSP] Testing UniversalAccumulator.combine MIN int...")
+    acc_a = functions.UniversalAccumulator(0, functions.AGG_MIN, types.TYPE_I64)
+    acc_b = functions.UniversalAccumulator(0, functions.AGG_MIN, types.TYPE_I64)
+    acc_a.seed_from_raw_bits(r_uint64(3))
+    acc_b.seed_from_raw_bits(r_uint64(7))
+    acc_b.combine(acc_a.get_value_bits())
+    assert_equal_i64(r_int64(3), rffi.cast(rffi.LONGLONG, acc_b.get_value_bits()), "MIN int combine")
+    # combine into empty accumulator -> takes the value unconditionally
+    acc_empty = functions.UniversalAccumulator(0, functions.AGG_MIN, types.TYPE_I64)
+    acc_other = functions.UniversalAccumulator(0, functions.AGG_MIN, types.TYPE_I64)
+    acc_other.seed_from_raw_bits(r_uint64(5))
+    acc_empty.combine(acc_other.get_value_bits())
+    assert_true(not acc_empty.is_accumulator_zero(), "MIN empty combine: has_value")
+    assert_equal_i64(r_int64(5), rffi.cast(rffi.LONGLONG, acc_empty.get_value_bits()), "MIN empty combine: value")
+    log("  PASSED")
+
+
+def test_accumulator_combine_min_float(base_dir):
+    # -1.5 < 2.0 -> combined min = -1.5 (validates non-bitwise compare for negative floats)
+    log("[DBSP] Testing UniversalAccumulator.combine MIN float...")
+    acc_a = functions.UniversalAccumulator(0, functions.AGG_MIN, types.TYPE_F64)
+    acc_b = functions.UniversalAccumulator(0, functions.AGG_MIN, types.TYPE_F64)
+    acc_a.seed_from_raw_bits(r_uint64(intmask(float2longlong(-1.5))))
+    acc_b.seed_from_raw_bits(r_uint64(intmask(float2longlong(2.0))))
+    acc_b.combine(acc_a.get_value_bits())
+    result = longlong2float(rffi.cast(rffi.LONGLONG, acc_b.get_value_bits()))
+    assert_true(result == -1.5, "MIN float combine: negative value wins")
+    log("  PASSED")
+
+
+def test_accumulator_combine_max_int(base_dir):
+    # max(3, 7) = 7
+    log("[DBSP] Testing UniversalAccumulator.combine MAX int...")
+    acc_a = functions.UniversalAccumulator(0, functions.AGG_MAX, types.TYPE_I64)
+    acc_b = functions.UniversalAccumulator(0, functions.AGG_MAX, types.TYPE_I64)
+    acc_a.seed_from_raw_bits(r_uint64(3))
+    acc_b.seed_from_raw_bits(r_uint64(7))
+    acc_b.combine(acc_a.get_value_bits())
+    assert_equal_i64(r_int64(7), rffi.cast(rffi.LONGLONG, acc_b.get_value_bits()), "MAX int combine")
+    # combine into empty accumulator
+    acc_empty = functions.UniversalAccumulator(0, functions.AGG_MAX, types.TYPE_I64)
+    acc_other = functions.UniversalAccumulator(0, functions.AGG_MAX, types.TYPE_I64)
+    acc_other.seed_from_raw_bits(r_uint64(9))
+    acc_empty.combine(acc_other.get_value_bits())
+    assert_true(not acc_empty.is_accumulator_zero(), "MAX empty combine: has_value")
+    assert_equal_i64(r_int64(9), rffi.cast(rffi.LONGLONG, acc_empty.get_value_bits()), "MAX empty combine: value")
+    log("  PASSED")
+
+
+def test_accumulator_combine_max_float(base_dir):
+    # -0.5 vs -2.0 -> max = -0.5 (validates non-bitwise compare for negative floats)
+    log("[DBSP] Testing UniversalAccumulator.combine MAX float...")
+    acc_a = functions.UniversalAccumulator(0, functions.AGG_MAX, types.TYPE_F64)
+    acc_b = functions.UniversalAccumulator(0, functions.AGG_MAX, types.TYPE_F64)
+    acc_a.seed_from_raw_bits(r_uint64(intmask(float2longlong(-0.5))))
+    acc_b.seed_from_raw_bits(r_uint64(intmask(float2longlong(-2.0))))
+    acc_b.combine(acc_a.get_value_bits())
+    result = longlong2float(rffi.cast(rffi.LONGLONG, acc_b.get_value_bits()))
+    assert_true(result == -0.5, "MAX float combine: less-negative value wins")
+    log("  PASSED")
+
+
 def test_compaction_through_ticks(base_dir):
     """EphemeralTable shards stay bounded across many ticks via auto-compaction."""
     log("[DBSP] Testing compaction through tick lifecycle...")
@@ -2740,6 +2853,14 @@ def entry_point(argv):
         test_reduce_multi_agg_linear_merge(base_dir)
         test_reduce_multi_agg_nonlinear(base_dir)
         test_count_non_null(base_dir)
+        test_accumulator_combine_count(base_dir)
+        test_accumulator_combine_count_non_null(base_dir)
+        test_accumulator_combine_sum_int(base_dir)
+        test_accumulator_combine_sum_float(base_dir)
+        test_accumulator_combine_min_int(base_dir)
+        test_accumulator_combine_min_float(base_dir)
+        test_accumulator_combine_max_int(base_dir)
+        test_accumulator_combine_max_float(base_dir)
         test_compaction_through_ticks(base_dir)
         test_consolidated_flag_basics()
         test_consolidated_short_circuit_empty()
