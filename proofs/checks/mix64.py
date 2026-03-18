@@ -1,7 +1,7 @@
 """Z3 formal proof of _mix64 (Murmur3 64-bit finalizer) bijectivity.
 
 Runs under PyPy2.  Four phases:
-  1. Parse reduce.py, translate _mix64 to SMT-LIB2
+  1. Parse group_index.py, translate _mix64 to SMT-LIB2
   2. Cross-check translator against concrete RPython execution
   3. Compositional bijectivity proof (3 Z3 queries)
   4. Summary
@@ -36,7 +36,7 @@ def fmt64(n):
 
 # ── Phase 1: Parse and translate ─────────────────────────────────────
 
-source_path = "../gnitz/dbsp/ops/reduce.py"
+source_path = "../gnitz/dbsp/ops/group_index.py"
 with open(source_path) as f:
     tree = ast.parse(f.read())
 
@@ -62,7 +62,7 @@ print("=" * 40)
 # ── Phase 2: Cross-check ────────────────────────────────────────────
 
 from rpython.rlib.rarithmetic import r_uint64   # noqa: E402
-from gnitz.dbsp.ops.reduce import _mix64         # noqa: E402
+from gnitz.dbsp.ops.group_index import _mix64     # noqa: E402
 
 TEST_VECTORS = [0, 1, 2, 42, 0xFFFFFFFFFFFFFFFF, 0xDEADBEEFCAFEBABE]
 

@@ -56,7 +56,14 @@ PROOFS := \
 	mix64-consistency:mix64_consistency \
 	short-string-unpack:short_string_unpack \
 	reduce-mapping-count:reduce_mapping_count \
-	expr-instr-width:expr_instr_width
+	expr-instr-width:expr_instr_width \
+	catalog-node-edge-dep-pk:catalog_node_edge_dep_pk \
+	tournament-tree-key-split:tournament_tree_key_split \
+	promote-col-to-u128:promote_col_to_u128 \
+	promote-group-narrow:promote_group_narrow \
+	partition-key-routing:partition_key_routing \
+	name-tid-hash:name_tid_hash \
+	manifest-key-split:manifest_key_split
 
 TARGETS := $(foreach p,$(PROOFS),prove-$(firstword $(subst :, ,$(p))))
 

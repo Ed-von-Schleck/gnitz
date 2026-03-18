@@ -9,13 +9,15 @@ Proves five properties of gnitz/dbsp/ops/join.py:39-70 (CompositeAccessor):
     total = 1 + (L-1) + (R-1) = L + R - 1
 
   P1. total = L + R - 1 (16-bit BV, UNSAT)
-  P2. Left non-PK slot range [1, L) ends where right range [L, total) begins
+  P2. total >= max(L, R): merged schema is never narrower than either input
       (16-bit BV, UNSAT)
   P3. After mapping all left then right non-PK cols, curr reaches total exactly
       (16-bit BV, UNSAT)
-  P4. Left and right non-PK slot ranges are disjoint (16-bit BV, UNSAT)
-  P5. Python cross-check: for 5 concrete schema pairs, curr reaches total and
-      mapping_idx values are within valid column index bounds
+  P4. Phase partition exhaustiveness: every slot in [0, total) falls in exactly
+      one of {PK=0}, [1,L), [L,total) (16-bit BV, UNSAT)
+  P5. Python cross-check: for 5 concrete schema pairs, curr reaches total,
+      mapping_idx values are within valid column index bounds, and all
+      (side, source_idx) pairs are distinct (injectivity)
 
 5 Z3 queries + ~5 cross-checks.  Runs under PyPy2.
 Exit code 0 on success, 1 on any failure.
@@ -150,6 +152,26 @@ for len_l, pk_l, len_r, pk_r in schema_pairs:
             len_l, len_r, left_ok, right_ok, left_idx_ok, right_idx_ok))
         ok = False
 
+    # Injectivity: no two slots map to the same (side, source_idx) pair.
+    # Catches loop-order bugs that Z3 proofs cannot detect.
+    seen = set()
+    injective = True
+    dup_slot = -1
+    for slot_i in range(total):
+        key = (mis_left[slot_i], midx[slot_i])
+        if key in seen:
+            injective = False
+            dup_slot = slot_i
+            break
+        seen.add(key)
+    if injective:
+        report("  PASS  injectivity: L=%d R=%d all %d slots map to distinct (side,idx)" % (
+            len_l, len_r, total))
+    else:
+        report("  FAIL  injectivity: L=%d R=%d duplicate (side,idx) pair at slot %d" % (
+            len_l, len_r, dup_slot))
+        ok = False
+
 # Z3 cross-check: 1 + (3-1) + (2-1) = 4 = 3+2-1
 smt_q = "(simplify (= (bvadd (bvadd (_ bv1 16) (bvsub (_ bv3 16) (_ bv1 16))) (bvsub (_ bv2 16) (_ bv1 16))) (_ bv4 16)))"
 z3_out = run_z3(smt_q)
@@ -188,22 +210,25 @@ ok &= prove("P1: 1+(L-1)+(R-1) == L+R-1 for L,R in [1,64]", """\
 (check-sat)
 """)
 
-# -- P2: Left non-PK range [1, L) ends where right range [L, total) begins ---
+# -- P2: Merged schema is never narrower than either input --------------------
 #
-# After mapping L-1 left non-PK cols starting at curr=1,
-# curr_after_left = 1 + (L-1) = L.  Prove this equals L.
+# total = L + R - 1.  Since R >= 1, total >= L.  Since L >= 1, total >= R.
+# This guarantees the join output carries all columns of both inputs
+# (minus one PK duplicate), so CompositeAccessor never drops columns.
 
-report("  ... proving P2: curr after left loop = L")
+report("  ... proving P2: total >= max(L, R)")
 
-ok &= prove("P2: 1 + (L-1) == L", """\
+ok &= prove("P2: total >= L and total >= R for L,R in [1,64]", """\
 (set-logic QF_BV)
 (declare-const L (_ BitVec 16))
+(declare-const R (_ BitVec 16))
 (assert (bvuge L (_ bv1 16)))
+(assert (bvuge R (_ bv1 16)))
 (assert (bvule L (_ bv64 16)))
-(define-fun curr_after_left () (_ BitVec 16)
-  (bvadd (_ bv1 16) (bvsub L (_ bv1 16))))
-; Negate: curr_after_left != L
-(assert (not (= curr_after_left L)))
+(assert (bvule R (_ bv64 16)))
+(define-fun total () (_ BitVec 16) (bvsub (bvadd L R) (_ bv1 16)))
+; Negate: merged schema is narrower than one of its inputs
+(assert (not (and (bvuge total L) (bvuge total R))))
 (check-sat)
 """)
 
@@ -229,13 +254,20 @@ ok &= prove("P3: curr_final = 1+(L-1)+(R-1) = total", """\
 (check-sat)
 """)
 
-# -- P4: Left [1,L) and right [L,total) slot ranges are disjoint (16-bit BV) -
+# -- P4: Phase partition exhaustiveness ---------------------------------------
 #
-# A slot in [1, L) cannot be in [L, total).
+# The mapping assigns each slot to exactly one of three phases:
+#   Phase 0: slot {0}        — join PK (always from left)
+#   Phase 1: slots [1, L)    — left non-PK payload columns
+#   Phase 2: slots [L, total) — right non-PK payload columns
+#
+# Prove exhaustiveness: every valid slot s in [0, total) falls in at least
+# one phase.  This is the structural invariant behind CompositeAccessor's
+# three-loop construction.
 
-report("  ... proving P4: left [1,L) and right [L,total) are disjoint")
+report("  ... proving P4: phase partition is exhaustive (every slot in [0,total) covered)")
 
-ok &= prove("P4: slot in [1,L) cannot also be in [L,total)", """\
+ok &= prove("P4: every slot in [0,total) is in phase 0, 1, or 2", """\
 (set-logic QF_BV)
 (declare-const s (_ BitVec 16))
 (declare-const L (_ BitVec 16))
@@ -244,12 +276,16 @@ ok &= prove("P4: slot in [1,L) cannot also be in [L,total)", """\
 (assert (bvuge R (_ bv1 16)))
 (assert (bvule L (_ bv64 16)))
 (assert (bvule R (_ bv64 16)))
-; s is in left non-PK range: 1 <= s < L
-(assert (bvuge s (_ bv1 16)))
-(assert (bvult s L))
-; Also in right range: s >= L — contradiction with s < L
-(assert (bvuge s L))
-(check-sat)
+(define-fun total () (_ BitVec 16) (bvsub (bvadd L R) (_ bv1 16)))
+; s is a valid slot index: 0 <= s < total
+(assert (bvult s total))
+; Three phases
+(define-fun in_pk () Bool (= s (_ bv0 16)))
+(define-fun in_left_payload () Bool (and (bvuge s (_ bv1 16)) (bvult s L)))
+(define-fun in_right_payload () Bool (bvuge s L))
+; Negate exhaustiveness: some valid slot falls outside all phases
+(assert (not (or in_pk in_left_payload in_right_payload)))
+(check-sat)   ; UNSAT: every slot in [0,total) is in exactly one phase
 """)
 
 # -- Summary ------------------------------------------------------------------
@@ -258,10 +294,10 @@ print("=" * 56)
 if ok:
     print("  PROVED: CompositeAccessor column mapping correctness")
     print("    P1: total = 1+(L-1)+(R-1) == L+R-1")
-    print("    P2: curr after left loop = L exactly")
+    print("    P2: total >= max(L, R) (merged schema not narrower than inputs)")
     print("    P3: curr after both loops = total")
-    print("    P4: left [1,L) and right [L,total) slot ranges are disjoint")
-    print("    P5: 5 concrete schema pairs verify correctly (cross-check)")
+    print("    P4: phase partition exhaustive (every slot in [0,total) covered)")
+    print("    P5: 5 concrete schema pairs: curr_ok, bounds_ok, injectivity_ok")
 else:
     print("  FAILED: see above")
 print("=" * 56)

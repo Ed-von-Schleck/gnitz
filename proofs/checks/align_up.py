@@ -7,12 +7,11 @@ Proves four properties of the alignment formula used throughout gnitz:
   P4. align_64 matches generic: hardcoded align=64 matches the generic formula
 
 Source functions (all use the same formula: (val + align - 1) & ~(align - 1)):
-  - gnitz/server/ipc.py:96-99      align_up(val, align) using r_uint64
   - gnitz/core/types.py:53-54      _align(offset, alignment)
   - gnitz/storage/buffer.py:115    Buffer._align(offset, alignment)
   - gnitz/storage/buffer.py:23-25  align_64(val) hardcoded to 64
 
-4 Z3 queries + ~15 cross-checks.  Runs under PyPy2.
+5 Z3 queries (4 UNSAT + 1 SAT) + ~15 cross-checks.  Runs under PyPy2.
 Exit code 0 on success, 1 on any failure.
 """
 import subprocess
@@ -46,6 +45,17 @@ def prove(label, smt_text):
         return True
     else:
         report("  FAIL  %s: expected unsat, got %s" % (label, result))
+        return False
+
+
+def witness(label, smt_text):
+    """Run a query expecting sat (counterexample exists). Returns True on success."""
+    result = run_z3(smt_text)
+    if result == "sat":
+        report("  PASS  %s" % label)
+        return True
+    else:
+        report("  FAIL  %s: expected sat, got %s" % (label, result))
         return False
 
 
@@ -91,10 +101,10 @@ ok = True
 
 report("  ... cross-checking align_up against RPython")
 
-print("  ... importing gnitz.server.ipc")
+print("  ... importing gnitz.core.types")
 sys.stdout.flush()
-from gnitz.server.ipc import align_up  # noqa: E402
-from gnitz.storage.buffer import align_64  # noqa: E402
+from gnitz.core.types import _align as align_up  # noqa: E402
+from gnitz.storage.buffer import align_64         # noqa: E402
 print("  ... imports done")
 sys.stdout.flush()
 
@@ -215,6 +225,23 @@ ok &= prove("P4: (val+63) & ~63 == align_up(val, 64)", """\
 (check-sat)
 """)
 
+# -- P5: SAT witness — overflow guard is essential for P2/P3 -----------------
+#
+# P2 and P3 include the guard: val <= 0xFFFFFFFF - align + 1.
+# Without it, val + align - 1 wraps unsigned, producing align_up < val.
+#
+# Witness: val=0xFFFFFFFF, align=2
+#   val + align - 1 = 0xFFFFFFFF + 1 = 0x00000000 (unsigned wrap)
+#   align_up = 0x00000000 & ~0x1 = 0x00000000 < 0xFFFFFFFF = val
+
+report("  ... P5 SAT: overflow guard is essential (wrap makes align_up < val)")
+ok &= witness("P5: SAT witness — overflow guard in P2/P3 is load-bearing", ALIGN_PREAMBLE + """\
+; No overflow guard: val may be large enough to wrap
+; align_up wraps below val
+(assert (bvult align_up val))
+(check-sat)   ; SAT: e.g. val=0xFFFFFFFF, align=2 gives align_up=0
+""")
+
 # -- Summary ------------------------------------------------------------------
 
 print("=" * 56)
@@ -224,6 +251,7 @@ if ok:
     print("    P2: never decreases val (no overflow)")
     print("    P3: rounds up by less than one alignment unit")
     print("    P4: align_64 matches generic align_up(val, 64)")
+    print("    P5: SAT — wrap makes align_up < val; P2/P3 guard is load-bearing")
 else:
     print("  FAILED: see above")
 print("=" * 56)

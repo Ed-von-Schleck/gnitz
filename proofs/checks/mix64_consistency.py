@@ -2,7 +2,7 @@
 
 Source: gnitz/dbsp/ops/linear.py:20-28,
         gnitz/dbsp/ops/exchange.py:12-20,
-        gnitz/dbsp/ops/reduce.py:285-293
+        gnitz/dbsp/ops/group_index.py:110-118
 
 Three independent copies of _mix64 exist, each carrying a docstring saying it
 must match the others exactly.  This proof verifies symbolic equality of all
@@ -13,7 +13,7 @@ three using independently-defined SMT-LIB2 functions.
   SHIFT = 33
 
   P1. mix64_linear == mix64_exchange for all 64-bit inputs (64-bit BV, UNSAT)
-  P2. mix64_exchange == mix64_reduce for all 64-bit inputs (64-bit BV, UNSAT)
+  P2. mix64_exchange == mix64_group_index for all 64-bit inputs (64-bit BV, UNSAT)
 
 2 Z3 queries + 7 cross-checks (6 concrete + 1 Z3-encoding validation).
 Runs under PyPy2.
@@ -90,8 +90,8 @@ def mix64_exchange(v):
     return v
 
 
-def mix64_reduce(v):
-    """Python translation of gnitz/dbsp/ops/reduce.py:285-293."""
+def mix64_group_index(v):
+    """Python translation of gnitz/dbsp/ops/group_index.py:110-118."""
     v = v & MASK64
     v ^= (v >> SHIFT) & MASK64
     v = (v * C1) & MASK64
@@ -121,7 +121,7 @@ MIX64_DEFS = (
     + "\n"
     + MIX64_BODY_TEMPLATE % "mix64_exchange"
     + "\n"
-    + MIX64_BODY_TEMPLATE % "mix64_reduce"
+    + MIX64_BODY_TEMPLATE % "mix64_group_index"
 )
 
 # -- Main ---------------------------------------------------------------------
@@ -143,12 +143,12 @@ TEST_VECTORS = [0, 1, 0xDEADBEEF, 0xFFFFFFFF,
 for tv in TEST_VECTORS:
     a = mix64_linear(tv)
     b = mix64_exchange(tv)
-    c = mix64_reduce(tv)
+    c = mix64_group_index(tv)
     # GUIDELINES §cross-check comparison pitfall: compare via MASK64
     if (a & MASK64) == (b & MASK64) == (c & MASK64):
         report("  PASS  cross-check %s -> %s" % (fmt64(tv), fmt64(a)))
     else:
-        report("  FAIL  cross-check %s: linear=%s exchange=%s reduce=%s" % (
+        report("  FAIL  cross-check %s: linear=%s exchange=%s group_index=%s" % (
             fmt64(tv), fmt64(a), fmt64(b), fmt64(c)))
         ok = False
 
@@ -198,15 +198,15 @@ ok &= prove("P1: linear and exchange implementations agree", """\
 (check-sat)
 """ % MIX64_DEFS)
 
-# -- P2: mix64_exchange == mix64_reduce for all 64-bit inputs (UNSAT) ---------
+# -- P2: mix64_exchange == mix64_group_index for all 64-bit inputs (UNSAT) ---------
 
-report("  ... proving P2: mix64_exchange == mix64_reduce for all inputs")
+report("  ... proving P2: mix64_exchange == mix64_group_index for all inputs")
 
-ok &= prove("P2: exchange and reduce implementations agree", """\
+ok &= prove("P2: exchange and group_index implementations agree", """\
 (set-logic QF_BV)
 %s
 (declare-const v (_ BitVec 64))
-(assert (not (= (mix64_exchange v) (mix64_reduce v))))
+(assert (not (= (mix64_exchange v) (mix64_group_index v))))
 (check-sat)
 """ % MIX64_DEFS)
 
@@ -216,7 +216,7 @@ print("=" * 56)
 if ok:
     print("  PROVED: _mix64 cross-module consistency")
     print("    P1: mix64_linear == mix64_exchange for all 64-bit inputs")
-    print("    P2: mix64_exchange == mix64_reduce for all 64-bit inputs")
+    print("    P2: mix64_exchange == mix64_group_index for all 64-bit inputs")
 else:
     print("  FAILED: see above")
 print("=" * 56)

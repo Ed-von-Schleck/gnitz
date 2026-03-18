@@ -11,7 +11,7 @@ Source function:
       if offset < 0 or length < 0 or offset > self.size - length:
           raise errors.BoundsError(offset, length, self.size)
 
-3 Z3 queries + 8 cross-checks.  Runs under PyPy2.
+4 Z3 queries (3 UNSAT + 1 SAT) + 8 cross-checks.  Runs under PyPy2.
 Exit code 0 on success, 1 on any failure.
 """
 import subprocess
@@ -45,6 +45,17 @@ def prove(label, smt_text):
         return True
     else:
         report("  FAIL  %s: expected unsat, got %s" % (label, result))
+        return False
+
+
+def witness(label, smt_text):
+    """Run a query expecting sat (counterexample exists). Returns True on success."""
+    result = run_z3(smt_text)
+    if result == "sat":
+        report("  PASS  %s" % label)
+        return True
+    else:
+        report("  FAIL  %s: expected sat, got %s" % (label, result))
         return False
 
 
@@ -187,6 +198,30 @@ ok &= prove("P3: (offset > size - length) <-> (offset + length > size)", BOUNDS_
 (check-sat)
 """)
 
+# -- P4: SAT witness — overflow breaks addition form without local guards -----
+#
+# P3 requires offset <= size AND length <= size.  Without these guards,
+# bvadd(offset, length) can overflow signed 32-bit, making the addition form
+# give the wrong answer while the subtraction form (used by the code) is correct.
+#
+# Witness: offset=0x70000000, length=0x10000000, size=0x20000000
+#   subtraction: 0x70000000 > 0x20000000 - 0x10000000 = 0x10000000  -> TRUE (OOB)
+#   addition:    0x70000000 + 0x10000000 = 0x80000000 as signed = MIN_INT32
+#                MIN_INT32 > 0x20000000 = FALSE (wrong)
+
+report("  ... P4 SAT: overflow breaks addition form without local guards")
+ok &= witness("P4: SAT witness — guards in P3 are load-bearing (overflow breaks add form)", BOUNDS_PREAMBLE + """\
+; Non-negative inputs; size < 2^30 maintained (preamble guards)
+(assert (not (bvslt offset (_ bv0 32))))
+(assert (not (bvslt length (_ bv0 32))))
+; No local guards: offset and length may exceed size
+; Subtraction form says OOB
+(assert (bvsgt offset (bvsub size length)))
+; Addition form (with overflow) says in-bounds
+(assert (not (bvsgt (bvadd offset length) size)))
+(check-sat)   ; SAT: e.g. offset=0x70000000, length=0x10000000, size=0x20000000
+""")
+
 # -- Summary ------------------------------------------------------------------
 
 print("=" * 56)
@@ -195,6 +230,7 @@ if ok:
     print("    P1: soundness (check passes -> access in bounds)")
     print("    P2: completeness (valid access -> check passes)")
     print("    P3: subtraction form == addition form")
+    print("    P4: SAT — overflow breaks add form; P3 guards are load-bearing")
 else:
     print("  FAILED: see above")
 print("=" * 56)

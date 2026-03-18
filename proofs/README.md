@@ -60,6 +60,18 @@ proofs/
     german_string_layout.py # German string 16-byte struct layout correctness
     mergesort_partition.py  # Merge sort range partition invariants
     wal_region_count.py     # WAL columnar block region count formula
+    expr_opcodes.py         # Expression VM opcode namespace properties
+    mix64_consistency.py    # Murmur3 mix64 consistency with avalanche
+    short_string_unpack.py  # Short string unpack byte extraction
+    reduce_mapping_count.py # Reduce accessor mapping count bounds
+    expr_instr_width.py     # Expression instruction width encoding
+    catalog_node_edge_dep_pk.py # Catalog node/edge/dep composite PK roundtrip
+    tournament_tree_key_split.py # TournamentTree 128-bit key split/join/ordering
+    promote_col_to_u128.py  # promote_col_to_u128 injectivity
+    promote_group_narrow.py # promote_group_narrow injectivity
+    partition_key_routing.py # _partition_for_key bitmask: output always in [0, 255]
+    name_tid_hash.py        # _name_to_tid output range [1, 0x7FFFFFFF]
+    manifest_key_split.py   # ManifestEntry 128-bit key split/join roundtrip & ordering
 ```
 
 ## Prerequisites
