@@ -15,3 +15,16 @@ def test_context_manager(server):
 def test_close_idempotent(client):
     client.close()
     client.close()  # second call must not raise
+
+
+def test_reconnect(server):
+    """Close a connection and open a new one; new connection must be functional."""
+    conn = gnitz.connect(server)
+    conn.close()
+    conn2 = gnitz.connect(server)
+    try:
+        # Verify conn2 works by scanning a system table (always exists)
+        result = conn2.scan(1)
+        assert result is not None
+    finally:
+        conn2.close()

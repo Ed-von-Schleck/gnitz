@@ -1,5 +1,6 @@
 import os
 import random
+import multiprocessing
 import pytest
 import gnitz
 
@@ -176,3 +177,377 @@ def test_unique_pk_across_workers(client):
         assert rows[0].val == 200
     finally:
         _drop_all(client, sn, tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# New multi-worker tests
+# ---------------------------------------------------------------------------
+
+@_NEEDS_MULTI
+def test_workers_ddl_create_table(client):
+    """Create table while workers running; push rows; scan → all rows present."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        n = 50
+        vals = ",".join(f"({i}, {i * 10})" for i in range(1, n + 1))
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+
+        tid, _ = client.resolve_table(sn, "t")
+        pks = sorted(r.pk for r in client.scan(tid) if r.weight > 0)
+        assert pks == list(range(1, n + 1))
+    finally:
+        _drop_all(client, sn, tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_view_passthrough(client):
+    """SQL passthrough view; push rows; scan view → all rows."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE VIEW v AS SELECT * FROM t", schema_name=sn)
+        client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
+
+        vid, _ = client.resolve_table(sn, "v")
+        pks = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
+        assert pks == [1, 2, 3]
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_view_deletes(client):
+    """Push inserts then retractions; passthrough view shows only non-retracted rows."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE VIEW v AS SELECT * FROM t", schema_name=sn)
+        client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
+        client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+
+        vid, _ = client.resolve_table(sn, "v")
+        pks = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
+        assert pks == [1, 3]
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_view_cascade(client):
+    """V1 = filter view, V2 = passthrough of V1; push rows; verify V2 has matching rows."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v1 AS SELECT * FROM t WHERE val > 10",
+            schema_name=sn,
+        )
+        v1_id, v1_schema = client.resolve_table(sn, "v1")
+        v2_id = client.create_view(sn, "v2", v1_id, v1_schema)
+
+        client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 50), (3, 100)", schema_name=sn)
+
+        v1_pks = sorted(r.pk for r in client.scan(v1_id) if r.weight > 0)
+        v2_pks = sorted(r.pk for r in client.scan(v2_id) if r.weight > 0)
+        assert v1_pks == [2, 3]
+        assert v2_pks == [2, 3]
+    finally:
+        try:
+            client.drop_view(sn, "v2")
+        except Exception:
+            pass
+        _drop_all(client, sn, views=["v1"], tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_view_ddl_then_push(client):
+    """Push rows THEN create view; push more rows; scan view → only post-creation rows."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        # Push rows BEFORE view creation — should NOT appear in view
+        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
+
+        client.execute_sql("CREATE VIEW v AS SELECT * FROM t", schema_name=sn)
+
+        # Push rows AFTER view creation — should appear in view
+        client.execute_sql("INSERT INTO t VALUES (2, 20), (3, 30)", schema_name=sn)
+
+        vid, _ = client.resolve_table(sn, "v")
+        pks = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
+        # Only post-creation rows (no backfill)
+        assert pks == [2, 3]
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_multiple_views_same_table(client):
+    """Two views on same table; both get pushed data."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE VIEW v1 AS SELECT * FROM t WHERE val > 10", schema_name=sn)
+        client.execute_sql("CREATE VIEW v2 AS SELECT * FROM t WHERE val > 50", schema_name=sn)
+
+        client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 30), (3, 100)", schema_name=sn)
+
+        v1_id, _ = client.resolve_table(sn, "v1")
+        v2_id, _ = client.resolve_table(sn, "v2")
+
+        v1_pks = sorted(r.pk for r in client.scan(v1_id) if r.weight > 0)
+        v2_pks = sorted(r.pk for r in client.scan(v2_id) if r.weight > 0)
+        assert v1_pks == [2, 3]
+        assert v2_pks == [3]
+    finally:
+        _drop_all(client, sn, views=["v1", "v2"], tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_upsert(client):
+    """Push PK=1 val=10, then PK=1 val=99 (upsert); scan → one row with val=99."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
+        client.execute_sql("INSERT INTO t VALUES (1, 99)", schema_name=sn)
+
+        tid, _ = client.resolve_table(sn, "t")
+        rows = [r for r in client.scan(tid) if r.weight > 0]
+        assert len(rows) == 1
+        assert rows[0].pk == 1
+        assert rows[0].val == 99
+    finally:
+        _drop_all(client, sn, tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_delete_by_pk(client):
+    """Push 3 rows; delete PK=2; scan → 2 rows (PK=1,3)."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
+        client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+
+        tid, _ = client.resolve_table(sn, "t")
+        pks = sorted(r.pk for r in client.scan(tid) if r.weight > 0)
+        assert pks == [1, 3]
+    finally:
+        _drop_all(client, sn, tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_reduce_sum(client):
+    """SQL SUM GROUP BY across partitions produces correct per-group sums."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "grp BIGINT NOT NULL, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT grp, SUM(val) AS total FROM t GROUP BY grp",
+            schema_name=sn,
+        )
+        # Push 100 rows across two groups
+        vals = ",".join(
+            f"({i}, {1 if i % 2 == 0 else 2}, {i})" for i in range(1, 101)
+        )
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+
+        vid, _ = client.resolve_table(sn, "v")
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        totals = {r[1]: r[2] for r in rows}
+
+        # group 1: even PKs (2,4,...,100) — sum = 2+4+...+100 = 2550
+        # group 2: odd PKs (1,3,...,99) — sum = 1+3+...+99 = 2500
+        assert totals[1] == sum(i for i in range(1, 101) if i % 2 == 0)
+        assert totals[2] == sum(i for i in range(1, 101) if i % 2 != 0)
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_reduce_incremental(client):
+    """Retract rows through reduce SUM view; verify sum decreases."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "grp BIGINT NOT NULL, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT grp, SUM(val) AS total FROM t GROUP BY grp",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t VALUES (1, 1, 100), (2, 1, 200)", schema_name=sn
+        )
+        vid, _ = client.resolve_table(sn, "v")
+
+        rows_before = {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}
+        assert rows_before[1] == 300
+
+        client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+        rows_after = {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}
+        assert rows_after[1] == 100
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# Concurrent push worker (module-level for pickling)
+# ---------------------------------------------------------------------------
+
+def _concurrent_push_worker(server_path, tid, pk_start, pk_end, barrier):
+    """Worker function: barrier sync then push a batch of rows."""
+    import gnitz as _gnitz
+    barrier.wait()
+    cols = [_gnitz.ColumnDef("pk", _gnitz.TypeCode.U64, primary_key=True),
+            _gnitz.ColumnDef("val", _gnitz.TypeCode.I64)]
+    schema = _gnitz.Schema(cols)
+    with _gnitz.connect(server_path) as c:
+        batch = _gnitz.ZSetBatch(schema)
+        for pk in range(pk_start, pk_end):
+            batch.append(pk=pk, val=pk)
+        c.push(tid, schema, batch)
+
+
+def _concurrent_multi_table_worker(server_path, tid, pk_start, pk_end, barrier):
+    """Worker function for multi-table concurrent test."""
+    import gnitz as _gnitz
+    barrier.wait()
+    cols = [_gnitz.ColumnDef("pk", _gnitz.TypeCode.U64, primary_key=True),
+            _gnitz.ColumnDef("val", _gnitz.TypeCode.I64)]
+    schema = _gnitz.Schema(cols)
+    with _gnitz.connect(server_path) as c:
+        batch = _gnitz.ZSetBatch(schema)
+        for pk in range(pk_start, pk_end):
+            batch.append(pk=pk, val=pk)
+        c.push(tid, schema, batch)
+
+
+@_NEEDS_MULTI
+def test_workers_concurrent_push_same_table(client, server):
+    """8 processes barrier-synced push non-overlapping PK ranges; scan → all rows."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        tid = client.create_table(sn, "t", cols)
+
+        n_procs = 8
+        rows_per_proc = 25
+        total = n_procs * rows_per_proc
+        barrier = multiprocessing.Barrier(n_procs)
+
+        procs = []
+        for i in range(n_procs):
+            pk_start = i * rows_per_proc + 1
+            pk_end = pk_start + rows_per_proc
+            p = multiprocessing.Process(
+                target=_concurrent_push_worker,
+                args=(server, tid, pk_start, pk_end, barrier),
+            )
+            procs.append(p)
+
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join()
+
+        for p in procs:
+            assert p.exitcode == 0, f"Worker exited with code {p.exitcode}"
+
+        result = client.scan(tid)
+        pks = sorted(r.pk for r in result if r.weight > 0)
+        assert pks == list(range(1, total + 1))
+    finally:
+        _drop_all(client, sn, tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_concurrent_push_multi_table(client, server):
+    """12 processes push to 4 tables (3 each); scan each → all rows present."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        n_tables = 4
+        n_procs_per_table = 3
+        rows_per_proc = 20
+
+        tids = []
+        for i in range(n_tables):
+            tid = client.create_table(sn, f"t{i}", cols)
+            tids.append(tid)
+
+        total_per_table = n_procs_per_table * rows_per_proc
+        barrier = multiprocessing.Barrier(n_tables * n_procs_per_table)
+
+        procs = []
+        for ti, tid in enumerate(tids):
+            for pi in range(n_procs_per_table):
+                pk_start = pi * rows_per_proc + 1
+                pk_end = pk_start + rows_per_proc
+                p = multiprocessing.Process(
+                    target=_concurrent_multi_table_worker,
+                    args=(server, tid, pk_start, pk_end, barrier),
+                )
+                procs.append(p)
+
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join()
+
+        for p in procs:
+            assert p.exitcode == 0, f"Worker exited with code {p.exitcode}"
+
+        for i, tid in enumerate(tids):
+            pks = sorted(r.pk for r in client.scan(tid) if r.weight > 0)
+            assert len(pks) == total_per_table, (
+                f"table t{i}: expected {total_per_table} rows, got {len(pks)}"
+            )
+    finally:
+        _drop_all(client, sn, tables=[f"t{i}" for i in range(n_tables)])

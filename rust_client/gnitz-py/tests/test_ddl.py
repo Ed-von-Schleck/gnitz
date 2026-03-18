@@ -49,6 +49,21 @@ def test_create_table_with_string_col(client):
     client.drop_schema(sn)
 
 
+def test_create_table_long_name(client):
+    """Table name > 12 chars exercises German String heap allocation path."""
+    sn = "s" + _uid()
+    client.create_schema(sn)
+    long_name = "orders_archive_2024"
+    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+    tid = client.create_table(sn, long_name, cols)
+    assert tid > 0
+    resolved_tid, _ = client.resolve_table_id(sn, long_name)
+    assert resolved_tid == tid
+    client.drop_table(sn, long_name)
+    client.drop_schema(sn)
+
+
 def test_resolve_table_id(client):
     sn = "s" + _uid()
     client.create_schema(sn)

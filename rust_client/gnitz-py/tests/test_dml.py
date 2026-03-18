@@ -474,3 +474,79 @@ class TestDeleteSQL:
                 except Exception:
                     pass
             client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# TestStringEdgeCases
+# ---------------------------------------------------------------------------
+
+class TestStringEdgeCases:
+
+    def _setup(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("label", gnitz.TypeCode.STRING, is_nullable=True)]
+        schema = gnitz.Schema(cols)
+        tid = client.create_table(sn, "strs", cols)
+        return sn, tid, schema
+
+    def test_string_empty(self, client):
+        """Push row with empty string; verify empty string round-trips."""
+        sn, tid, schema = self._setup(client)
+        try:
+            batch = gnitz.ZSetBatch(schema)
+            batch.append(pk=1, label="")
+            client.push(tid, schema, batch)
+            rows = [r for r in client.scan(tid) if r.weight > 0]
+            assert len(rows) == 1
+            assert rows[0].label == ""
+        finally:
+            client.drop_table(sn, "strs")
+            client.drop_schema(sn)
+
+    def test_string_12byte_boundary(self, client):
+        """Push row with exactly 12-char string (inline boundary); verify round-trip."""
+        sn, tid, schema = self._setup(client)
+        try:
+            s12 = "abcdefghijkl"  # exactly 12 bytes
+            assert len(s12) == 12
+            batch = gnitz.ZSetBatch(schema)
+            batch.append(pk=1, label=s12)
+            client.push(tid, schema, batch)
+            rows = [r for r in client.scan(tid) if r.weight > 0]
+            assert len(rows) == 1
+            assert rows[0].label == s12
+        finally:
+            client.drop_table(sn, "strs")
+            client.drop_schema(sn)
+
+    def test_string_long(self, client):
+        """Push row with string > 12 chars (heap allocation); verify round-trip."""
+        sn, tid, schema = self._setup(client)
+        try:
+            long_s = "this_is_a_longer_string_value"
+            assert len(long_s) > 12
+            batch = gnitz.ZSetBatch(schema)
+            batch.append(pk=1, label=long_s)
+            client.push(tid, schema, batch)
+            rows = [r for r in client.scan(tid) if r.weight > 0]
+            assert len(rows) == 1
+            assert rows[0].label == long_s
+        finally:
+            client.drop_table(sn, "strs")
+            client.drop_schema(sn)
+
+    def test_string_null(self, client):
+        """Push row with null label; verify row.label is None in scan result."""
+        sn, tid, schema = self._setup(client)
+        try:
+            batch = gnitz.ZSetBatch(schema)
+            batch.append(pk=1, label=None)
+            client.push(tid, schema, batch)
+            rows = [r for r in client.scan(tid) if r.weight > 0]
+            assert len(rows) == 1
+            assert rows[0].label is None
+        finally:
+            client.drop_table(sn, "strs")
+            client.drop_schema(sn)
