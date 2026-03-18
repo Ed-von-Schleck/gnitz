@@ -8,7 +8,7 @@
 import sys
 import os
 
-from rpython.rlib import rposix
+from rpython.rlib import rposix, rsocket
 from rpython.rlib.rarithmetic import (
     r_int64,
     r_uint64,
@@ -25,6 +25,7 @@ from gnitz.catalog.metadata import ensure_dir
 from gnitz.core import opcodes
 from gnitz.dbsp.ops.exchange import hash_row_by_columns, repartition_batch, PartitionAssignment
 from gnitz.storage.partitioned_table import _partition_for_key
+from gnitz.server import ipc, ipc_ffi
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
 
 
@@ -476,6 +477,117 @@ def test_repartition_batch_pk_equals_split(base_dir):
     log("  PASSED")
 
 
+def _make_simple_schema():
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    return types.TableSchema(cols, 0)
+
+
+def _make_simple_batch(schema):
+    b = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    _add_int_row(rb, 1, [100])
+    _add_int_row(rb, 2, [200])
+    return b
+
+
+def test_batch_sorted_flag_roundtrip():
+    """FLAG_BATCH_SORTED preserved through serialize_to_memfd / _recv_and_parse."""
+    log("[EXCHANGE] Testing FLAG_BATCH_SORTED roundtrip...")
+    schema = _make_simple_schema()
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    try:
+        b = _make_simple_batch(schema)
+        b.mark_sorted(True)
+        ipc.send_batch(s1.fd, 1, b, schema=schema)
+        b.free()
+
+        payload = ipc.receive_payload(s2.fd)
+        assert_true(payload.batch is not None, "batch should be present")
+        assert_true(payload.batch._sorted,
+                    "FLAG_BATCH_SORTED: _sorted should be True after roundtrip")
+        assert_true(not payload.batch._consolidated,
+                    "sorted-only batch should not be consolidated")
+        payload.close()
+    finally:
+        s1.close()
+        s2.close()
+    log("  PASSED")
+
+
+def test_batch_consolidated_flag_roundtrip():
+    """FLAG_BATCH_CONSOLIDATED preserved through IPC; implies _sorted."""
+    log("[EXCHANGE] Testing FLAG_BATCH_CONSOLIDATED roundtrip...")
+    schema = _make_simple_schema()
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    try:
+        b = _make_simple_batch(schema)
+        b.mark_consolidated(True)
+        ipc.send_batch(s1.fd, 1, b, schema=schema)
+        b.free()
+
+        payload = ipc.receive_payload(s2.fd)
+        assert_true(payload.batch is not None, "batch should be present")
+        assert_true(payload.batch._consolidated,
+                    "FLAG_BATCH_CONSOLIDATED: _consolidated should be True")
+        assert_true(payload.batch._sorted,
+                    "consolidated batch must also be sorted")
+        payload.close()
+    finally:
+        s1.close()
+        s2.close()
+    log("  PASSED")
+
+
+def test_batch_no_flags_roundtrip():
+    """Plain (unsorted) batch: neither _sorted nor _consolidated set after roundtrip."""
+    log("[EXCHANGE] Testing no batch property flags roundtrip...")
+    schema = _make_simple_schema()
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    try:
+        b = _make_simple_batch(schema)
+        # default: _sorted=False, _consolidated=False
+        ipc.send_batch(s1.fd, 1, b, schema=schema)
+        b.free()
+
+        payload = ipc.receive_payload(s2.fd)
+        assert_true(payload.batch is not None, "batch should be present")
+        assert_true(not payload.batch._sorted,
+                    "plain batch: _sorted should be False")
+        assert_true(not payload.batch._consolidated,
+                    "plain batch: _consolidated should be False")
+        payload.close()
+    finally:
+        s1.close()
+        s2.close()
+    log("  PASSED")
+
+
+def test_repartition_does_not_propagate_consolidated():
+    """repartition_batch sub-batches are NOT consolidated even if input is."""
+    log("[EXCHANGE] Testing repartition_batch does not propagate _consolidated...")
+    schema = _make_simple_schema()
+    assignment = PartitionAssignment(4)
+
+    b = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    for i in range(8):
+        _add_int_row(rb, i + 1, [(i + 1) * 10])
+    b.mark_consolidated(True)
+
+    sub_batches = repartition_batch(b, [schema.pk_index], 4, assignment)
+    b.free()
+
+    for w in range(4):
+        sb = sub_batches[w]
+        if sb is not None:
+            assert_true(not sb._consolidated,
+                        "sub-batch should not be consolidated")
+            sb.free()
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -507,6 +619,11 @@ def entry_point(argv):
         test_hash_row_pk_col(base_dir)
 
         test_repartition_batch_pk_equals_split(base_dir)
+
+        test_batch_sorted_flag_roundtrip()
+        test_batch_consolidated_flag_roundtrip()
+        test_batch_no_flags_roundtrip()
+        test_repartition_does_not_propagate_consolidated()
 
         log("\nALL EXCHANGE TESTS PASSED")
     except Exception as e:

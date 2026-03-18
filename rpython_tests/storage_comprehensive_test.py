@@ -1985,6 +1985,98 @@ def test_flsm_guard_read_path(base_dir):
     os.write(1, "    [OK] FLSM guard-aware read path passed.\n")
 
 
+def test_zero_copy_wal_recovery(base_dir):
+    os.write(1, "[Storage] Testing zero-copy WAL recovery (mmap reader)...\n")
+    schema = make_u64_i64_schema()
+    wal_path = os.path.join(base_dir, "zc_recovery.wal")
+
+    # 1. Write 3 blocks with distinct LSNs and table IDs
+    writer = wal.WALWriter(wal_path, schema)
+    written = []   # list of (lsn, tid, [(pk, val)])
+    for i in range(3):
+        b = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, b)
+        for j in range(i + 1):
+            rb.begin(r_uint128(i * 10 + j), r_int64(1))
+            rb.put_int(r_int64(i * 100 + j))
+            rb.commit()
+        lsn = r_uint64(i + 1)
+        tid = i + 1
+        writer.append_batch(lsn, tid, b)
+        rows = newlist_hint(i + 1)
+        for j in range(i + 1):
+            rows.append((i * 10 + j, i * 100 + j))
+        written.append((i + 1, tid, rows))
+        b.free()
+    writer.close()
+
+    # 2. Read back with mmap reader while reader is still open; verify all blocks
+    reader = wal.WALReader(wal_path, schema)
+    blocks = newlist_hint(3)
+    for block in reader.iterate_blocks():
+        blocks.append(block)
+
+    assert_equal_i(3, len(blocks), "mmap WALReader: expected 3 blocks")
+    for i in range(3):
+        exp_lsn, exp_tid, exp_rows = written[i]
+        assert_equal_u64(r_uint64(exp_lsn), blocks[i].lsn,
+                         "block " + str(i) + " lsn mismatch")
+        assert_equal_i(exp_tid, intmask(r_uint64(blocks[i].tid)),
+                       "block " + str(i) + " tid mismatch")
+        assert_equal_i(len(exp_rows), blocks[i].batch.length(),
+                       "block " + str(i) + " row count mismatch")
+        acc = ColumnarBatchAccessor(schema)
+        for j in range(len(exp_rows)):
+            exp_pk, exp_val = exp_rows[j]
+            assert_equal_u128(r_uint128(exp_pk), blocks[i].batch.get_pk(j),
+                              "block " + str(i) + " row " + str(j) + " pk mismatch")
+            acc.bind(blocks[i].batch, j)
+            assert_equal_i(exp_val, intmask(r_uint64(acc.get_int(1))),
+                           "block " + str(i) + " row " + str(j) + " val mismatch")
+        blocks[i].free()
+
+    # Close reader last (mmap unmapped here; blocks already freed above)
+    reader.close()
+
+    # 3. Empty WAL: zero-size file -> read_next_block returns None immediately
+    empty_path = os.path.join(base_dir, "empty.wal")
+    fd = rposix.open(empty_path, os.O_WRONLY | os.O_CREAT, 0o644)
+    rposix.close(fd)
+    empty_reader = wal.WALReader(empty_path, schema)
+    assert_true(empty_reader.read_next_block() is None,
+                "empty WAL should return None")
+    empty_reader.close()
+
+    # 4. Corrupt block: truncate mid-block -> CorruptShardError
+    trunc_path = os.path.join(base_dir, "trunc.wal")
+    writer2 = wal.WALWriter(trunc_path, schema)
+    b2 = batch.ArenaZSetBatch(schema)
+    rb2 = RowBuilder(schema, b2)
+    rb2.begin(r_uint128(999), r_int64(1))
+    rb2.put_int(r_int64(42))
+    rb2.commit()
+    writer2.append_batch(r_uint64(10), 5, b2)
+    b2.free()
+    writer2.close()
+
+    # Truncate the WAL to header_size + 4 (body present but incomplete)
+    full_size = os.path.getsize(trunc_path)
+    trunc_fd = rposix.open(trunc_path, os.O_WRONLY, 0o644)
+    rposix.ftruncate(trunc_fd, wal_layout.WAL_BLOCK_HEADER_SIZE + 4)
+    rposix.close(trunc_fd)
+
+    corrupt_reader = wal.WALReader(trunc_path, schema)
+    raised = False
+    try:
+        corrupt_reader.read_next_block()
+    except errors.CorruptShardError:
+        raised = True
+    corrupt_reader.close()
+    assert_true(raised, "truncated WAL block should raise CorruptShardError")
+
+    os.write(1, "    [OK] Zero-copy WAL recovery passed.\n")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -2018,6 +2110,7 @@ def entry_point(argv):
         test_partitioned_compact_if_needed(base_dir)
         test_flsm_data_structures(base_dir)
         test_flsm_guard_read_path(base_dir)
+        test_zero_copy_wal_recovery(base_dir)
         os.write(1, "\nALL STORAGE TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

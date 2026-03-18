@@ -1,10 +1,9 @@
 # gnitz/storage/wal.py
 
 import os
-import errno
-from rpython.rlib import rposix, rposix_stat
+from rpython.rlib import rposix
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint64
+from rpython.rlib.rarithmetic import r_uint64, intmask
 from gnitz.core import errors
 from gnitz.storage import wal_columnar, mmap_posix, buffer as buffer_ops, wal_layout
 
@@ -13,37 +12,35 @@ class WALReader(object):
     """
     Reader for the columnar Z-Set Write-Ahead Log.
     Each block is a serialized ArenaZSetBatch.
+    Uses mmap for zero-copy access during static startup recovery.
     """
 
     def __init__(self, filename, schema):
         self.filename = filename
         self.schema = schema
         self.fd = -1
-        self.last_inode = rffi.cast(rffi.ULONGLONG, 0)
+        self.file_size = 0
+        self.ptr = lltype.nullptr(rffi.CCHARP.TO)
+        self._off = 0
         self.closed = False
         self._open_file()
 
     def _open_file(self):
-        new_fd = rposix.open(self.filename, os.O_RDONLY, 0)
+        fd = rposix.open(self.filename, os.O_RDONLY, 0)
         try:
-            st = rposix_stat.fstat(new_fd)
-            if self.fd != -1:
-                rposix.close(self.fd)
-            self.fd = new_fd
-            self.last_inode = rffi.cast(rffi.ULONGLONG, st.st_ino)
+            self.file_size = intmask(mmap_posix.fget_size(fd))
+            if self.file_size > 0:
+                self.ptr = mmap_posix.mmap_file(
+                    fd, self.file_size,
+                    prot=mmap_posix.PROT_READ,
+                    flags=mmap_posix.MAP_SHARED,
+                )
+            # file_size == 0: ptr stays nullptr; read_next_block returns None
         except Exception:
-            if new_fd != -1:
-                rposix.close(new_fd)
+            rposix.close(fd)
             raise
-
-    def _has_rotated(self):
-        try:
-            st = rposix_stat.stat(self.filename)
-            return rffi.cast(rffi.ULONGLONG, st.st_ino) != self.last_inode
-        except OSError as e:
-            if e.errno == errno.ENOENT:
-                return False
-            raise e
+        self.fd = fd
+        self._off = 0
 
     def read_next_block(self):
         """
@@ -52,47 +49,24 @@ class WALReader(object):
         """
         if self.closed:
             return None
-
-        h_str = rposix.read(self.fd, wal_layout.WAL_BLOCK_HEADER_SIZE)
-        if not h_str or len(h_str) < wal_layout.WAL_BLOCK_HEADER_SIZE:
-            if self._has_rotated():
-                self._open_file()
-                h_str = rposix.read(self.fd, wal_layout.WAL_BLOCK_HEADER_SIZE)
-                if not h_str or len(h_str) < wal_layout.WAL_BLOCK_HEADER_SIZE:
-                    return None
-            else:
-                return None
-
-        total_size = 0
-        with rffi.scoped_str2charp(h_str) as h_p:
-            header = wal_layout.WALBlockHeaderView(h_p)
-            total_size = header.get_total_size()
-
-        if total_size < wal_layout.WAL_BLOCK_HEADER_SIZE:
+        if self._off >= self.file_size:
+            return None
+        if self._off + wal_layout.WAL_BLOCK_HEADER_SIZE > self.file_size:
+            raise errors.CorruptShardError("Truncated WAL block header")
+        hdr = wal_layout.WALBlockHeaderView(rffi.ptradd(self.ptr, self._off))
+        block_size = hdr.get_total_size()
+        if block_size < wal_layout.WAL_BLOCK_HEADER_SIZE:
             raise errors.CorruptShardError("Invalid WAL block size in header")
-
-        f_ptr = lltype.malloc(rffi.CCHARP.TO, total_size, flavor="raw")
-        success = False
-        try:
-            for i in range(wal_layout.WAL_BLOCK_HEADER_SIZE):
-                f_ptr[i] = h_str[i]
-
-            body_sz = total_size - wal_layout.WAL_BLOCK_HEADER_SIZE
-            if body_sz > 0:
-                b_str = rposix.read(self.fd, body_sz)
-                if not b_str or len(b_str) < body_sz:
-                    return None
-                for i in range(body_sz):
-                    f_ptr[wal_layout.WAL_BLOCK_HEADER_SIZE + i] = b_str[i]
-
-            res = wal_columnar.decode_batch_from_buffer(
-                f_ptr, total_size, self.schema
-            )
-            success = True
-            return res
-        finally:
-            if not success:
-                lltype.free(f_ptr, flavor="raw")
+        if self._off + block_size > self.file_size:
+            raise errors.CorruptShardError("WAL block extends beyond file")
+        lsn = hdr.get_lsn()
+        tid = hdr.get_table_id()
+        batch = wal_columnar.decode_batch_from_ptr(
+            rffi.ptradd(self.ptr, self._off), block_size, self.schema
+        )
+        self._off += block_size
+        return wal_columnar.WALColumnarBlock(lsn, tid, batch,
+                                            raw_buf=lltype.nullptr(rffi.CCHARP.TO))
 
     def iterate_blocks(self):
         while True:
@@ -103,6 +77,9 @@ class WALReader(object):
 
     def close(self):
         if not self.closed:
+            if self.ptr:
+                mmap_posix.munmap_file(self.ptr, self.file_size)
+                self.ptr = lltype.nullptr(rffi.CCHARP.TO)
             if self.fd != -1:
                 rposix.close(self.fd)
                 self.fd = -1

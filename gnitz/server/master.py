@@ -203,21 +203,8 @@ class MasterDispatcher(object):
 
     def broadcast_ddl(self, target_id, batch, schema):
         """Send a system-table delta to all workers for registry sync."""
-        for w in range(self.num_workers):
-            ipc.send_batch(
-                self.worker_fds[w], target_id, batch,
-                schema=schema, flags=ipc.FLAG_DDL_SYNC,
-            )
-        for w in range(self.num_workers):
-            payload = ipc.receive_payload(self.worker_fds[w])
-            if payload.status != 0:
-                err = payload.error_msg
-                payload.close()
-                raise errors.StorageError(
-                    "Worker %d DDL sync error: %s" % (w, err)
-                )
-            payload.close()
-
+        ipc.broadcast_batch(self.worker_fds, target_id, batch,
+                            schema=schema, flags=ipc.FLAG_DDL_SYNC)
         log.debug(
             "broadcast_ddl tid=" + str(target_id)
             + " rows=" + str(batch.length())

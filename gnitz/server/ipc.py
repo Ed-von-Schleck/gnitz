@@ -37,8 +37,10 @@ FLAG_ALLOCATE_INDEX_ID = 512   # target_id=0; response carries new index_id in t
 FLAG_SCAN              = 0     # explicit name for "no flags" (no wire change)
 
 # --- New WAL-block wire format flags ---
-FLAG_HAS_SCHEMA = r_uint64(1 << 48)  # schema block follows control block
-FLAG_HAS_DATA   = r_uint64(1 << 49)  # data block follows schema block
+FLAG_HAS_SCHEMA         = r_uint64(1 << 48)  # schema block follows control block
+FLAG_HAS_DATA           = r_uint64(1 << 49)  # data block follows schema block
+FLAG_BATCH_SORTED       = r_uint64(1 << 50)  # batch is sorted by PK
+FLAG_BATCH_CONSOLIDATED = r_uint64(1 << 51)  # batch is consolidated (unique PKs, positive weights)
 
 # --- Control block TID ---
 IPC_CONTROL_TID = 0xFFFFFFFF   # max uint32; never a real table ID; get_table_id() returns 4294967295
@@ -238,6 +240,10 @@ def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
         ctrl_flags = ctrl_flags | FLAG_HAS_SCHEMA
     if has_data:
         ctrl_flags = ctrl_flags | FLAG_HAS_DATA
+        if zbatch._sorted:
+            ctrl_flags = ctrl_flags | FLAG_BATCH_SORTED
+        if zbatch._consolidated:
+            ctrl_flags = ctrl_flags | FLAG_BATCH_CONSOLIDATED
 
     ctrl_buf   = buffer_ops.Buffer(0)
     schema_buf = buffer_ops.Buffer(0)
@@ -345,6 +351,20 @@ def send_error(sock_fd, error_msg, target_id=0, client_id=0):
     )
 
 
+def broadcast_batch(sock_fds, target_id, zbatch, schema=None, flags=0,
+                    seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
+    """Encode once, send fd to N sockets via SCM_RIGHTS. No ACK expected."""
+    eff_schema = schema if schema is not None else (zbatch._schema if zbatch is not None else None)
+    fd, _ = serialize_to_memfd(target_id, 0, zbatch, eff_schema, flags,
+                               seek_pk_lo, seek_pk_hi, seek_col_idx, STATUS_OK, "")
+    try:
+        for i in range(len(sock_fds)):
+            if ipc_ffi.send_fd(sock_fds[i], fd) < 0:
+                raise errors.StorageError("broadcast_batch: send_fd failed")
+    finally:
+        os.close(fd)
+
+
 # ---------------------------------------------------------------------------
 # Receive
 # ---------------------------------------------------------------------------
@@ -405,6 +425,10 @@ def _recv_and_parse(fd):
             payload.batch = wal_columnar.decode_batch_from_ptr(
                 rffi.ptradd(ptr, off), data_size, payload.schema
             )
+            if payload.flags & FLAG_BATCH_SORTED:
+                payload.batch.mark_sorted(True)
+            if payload.flags & FLAG_BATCH_CONSOLIDATED:
+                payload.batch.mark_consolidated(True)
             # batch holds non-owning Buffer views into ptr (the mmap).
             # Must not be used after payload.close().
 

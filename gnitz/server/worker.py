@@ -87,7 +87,6 @@ class WorkerProcess(object):
 
             if flags & ipc.FLAG_DDL_SYNC:
                 self._handle_ddl_sync(target_id, payload.batch)
-                ipc.send_batch(self.master_fd, target_id, None)
                 return False
 
             if flags & ipc.FLAG_HAS_PK:
