@@ -33,6 +33,7 @@ class DeltaRegister(BaseRegister):
         BaseRegister.__init__(self, reg_id, table_schema)
         self._internal_batch = ArenaZSetBatch(table_schema)
         self.batch = self._internal_batch
+        self.is_distinct = False  # compile-time property; not used by RPython interpreter
 
     def is_delta(self): return True
 

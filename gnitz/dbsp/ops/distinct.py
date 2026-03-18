@@ -24,19 +24,20 @@ history_table, which is an AbstractTable acting as the operator's trace.
 """
 
 
-def op_distinct(delta_batch, history_table, out_writer):
+def op_distinct(delta_batch, hist_cursor, hist_table, out_writer):
     """
     DBSP Distinct: converts multiset deltas into set-membership deltas.
 
-    delta_batch:   ArenaZSetBatch  — consolidated input delta for this tick
-    history_table: ZSetStore       — persistent trace holding the running sum
-                                     I(δ_in) accumulated over all past ticks
-    out_writer:    BatchWriter     — strictly write-only destination
+    delta_batch: ArenaZSetBatch  — consolidated input delta for this tick
+    hist_cursor: AbstractCursor  — seekable cursor over the persistent history
+                                   (I(δ_in) snapped at the start of this tick)
+    hist_table:  ZSetStore       — persistent trace holding the running sum
+                                   I(δ_in) accumulated over all past ticks
+    out_writer:  BatchWriter     — strictly write-only destination
 
-    The logic is wrapped in ConsolidatedScope, which ensures that delta_batch 
-    is sorted and consolidated before processing. If a new temporary batch 
-    is created during consolidation, it is automatically freed when exiting 
-    the 'with' block.
+    The delta batch is processed in PK order; hist_cursor is advanced
+    monotonically via seek(), giving O((|Δ|+|H|)·log K) amortised cost
+    instead of O(|Δ|·K) independent per-key probes.
     """
     with ConsolidatedScope(delta_batch) as b:
         n = b.length()
@@ -48,7 +49,10 @@ def op_distinct(delta_batch, history_table, out_writer):
             w_delta = b.get_weight(i)
             accessor = b.get_accessor(i)
 
-            w_old = history_table.get_weight(key, accessor)
+            hist_cursor.seek(key)
+            w_old = r_int64(0)
+            if hist_cursor.is_valid() and hist_cursor.key() == key:
+                w_old = hist_cursor.weight()
 
             # DBSP distinct converts a multiset to a set.
             # An element is in the set (weight 1) if its accumulated weight is > 0, else 0.
@@ -61,7 +65,7 @@ def op_distinct(delta_batch, history_table, out_writer):
 
             # Algebraic summation with RPython machine-word truncation
             w_new = r_int64(intmask(w_old + w_delta))
-            
+
             s_new = 0
             if w_new > r_int64(0):
                 s_new = 1
@@ -75,5 +79,5 @@ def op_distinct(delta_batch, history_table, out_writer):
         out_writer.mark_sorted(True)
 
         # Update the history with the consolidated delta before the scope expires.
-        # This reflects history_table = I(δ_in)
-        history_table.ingest_batch(b)
+        # This reflects hist_table = I(δ_in)
+        hist_table.ingest_batch(b)

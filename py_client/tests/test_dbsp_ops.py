@@ -1743,3 +1743,67 @@ class TestStringThroughReduce:
         # Groups: b_val=100 → sum=10, b_val=200 → sum=20, b_val=300 → sum=30
         sums = sorted(r[3] for r in rows)
         assert sums == [10, 20, 30]
+
+
+class TestReduceThenDistinct:
+    """Verify REDUCE → DISTINCT compile-time skip: output matches plain REDUCE."""
+
+    def test_reduce_then_distinct_skip(self, client, sn):
+        """REDUCE output is already at set semantics; DISTINCT after it is a no-op.
+
+        The compile-time elimination means no history table is created and no
+        DISTINCT instruction is emitted. The view output must equal what a plain
+        REDUCE without DISTINCT would produce.
+        """
+        cols = [
+            ColumnDef("pk", TypeCode.U64),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("val", TypeCode.I64),
+        ]
+        tid = client.create_table(sn, "t_rd_" + _uid(), cols, pk_col_idx=0)
+        ts = Schema(columns=cols, pk_index=0)
+
+        # REDUCE output: (U128 _group_hash PK, I64 group_id, I64 count)
+        out_cols = [
+            ColumnDef("_group_hash", TypeCode.U128),
+            ColumnDef("group_id", TypeCode.I64),
+            ColumnDef("agg", TypeCode.I64),
+        ]
+
+        def build(cb, vid):
+            inp = cb.input_delta()
+            r = cb.reduce(inp, group_by_cols=[1], agg_func_id=1, agg_col_idx=2)
+            d = cb.distinct(r)
+            cb.sink(d, vid)
+
+        vid = _build_and_create_view(client, sn, "v_rd_" + _uid(), tid, build, out_cols)
+
+        # Push 4 rows: 3 in group 10, 1 in group 20
+        batch = ZSetBatch(schema=ts)
+        data = [(1, 10, 0), (2, 10, 0), (3, 10, 0), (4, 20, 0)]
+        for pk, gid, val in data:
+            batch.pk_lo.append(pk)
+            batch.pk_hi.append(0)
+            batch.weights.append(1)
+            batch.nulls.append(0)
+        batch.columns = [[], [d[1] for d in data], [d[2] for d in data]]
+        client.push(tid, ts, batch)
+
+        rows = _scan_to_list(client, vid)
+        assert len(rows) == 2
+        counts = sorted(r[3] for r in rows)
+        assert counts == [1, 3]
+
+        # Second tick: add one more row to group 10; group 10 count 3→4
+        batch2 = ZSetBatch(schema=ts)
+        batch2.pk_lo.append(5)
+        batch2.pk_hi.append(0)
+        batch2.weights.append(1)
+        batch2.nulls.append(0)
+        batch2.columns = [[], [10], [0]]
+        client.push(tid, ts, batch2)
+
+        rows2 = _scan_to_list(client, vid)
+        assert len(rows2) == 2
+        counts2 = sorted(r[3] for r in rows2)
+        assert counts2 == [1, 4]

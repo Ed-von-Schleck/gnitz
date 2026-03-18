@@ -419,6 +419,7 @@ class ProgramCache(object):
         elif op == opcodes.OPCODE_FILTER:
             in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
             out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
+            out_reg.is_distinct = in_reg.is_distinct
             cur_reg_file.registers[reg_id] = out_reg
             num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
             if num_regs > 0:
@@ -526,6 +527,13 @@ class ProgramCache(object):
 
         elif op == opcodes.OPCODE_DISTINCT:
             in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN_DISTINCT]]
+
+            # Compile-time elimination: skip when input is already at set semantics.
+            # No history table is created; output aliases the input register.
+            if in_reg.is_distinct:
+                out_reg_of[nid] = in_regs[opcodes.PORT_IN_DISTINCT]
+                return None
+
             hist_schema = in_reg.table_schema
             history_table = view_family.store.create_child("_hist_%d_%d" % (view_id, nid), hist_schema)
             hist_reg = runtime.TraceRegister(reg_id, hist_schema, history_table.create_cursor(), history_table)
@@ -533,6 +541,7 @@ class ProgramCache(object):
             out_delta_id = state[_ST_NEXT_EXTRA_REG]
             state[_ST_NEXT_EXTRA_REG] += 1
             out_delta_reg = runtime.DeltaRegister(out_delta_id, in_reg.table_schema)
+            out_delta_reg.is_distinct = True
             cur_reg_file.registers[out_delta_id] = out_delta_reg
             out_reg_of[nid] = out_delta_id
             return instructions.distinct_op(in_reg, hist_reg, out_delta_reg)
@@ -568,6 +577,7 @@ class ProgramCache(object):
             out_delta_id = state[_ST_NEXT_EXTRA_REG]
             state[_ST_NEXT_EXTRA_REG] += 1
             out_delta_reg = runtime.DeltaRegister(out_delta_id, reduce_out_schema)
+            out_delta_reg.is_distinct = True
             cur_reg_file.registers[out_delta_id] = out_delta_reg
             out_reg_of[nid] = out_delta_id
             tr_in_reg = None
