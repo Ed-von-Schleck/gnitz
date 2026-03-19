@@ -119,19 +119,24 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
             continue
 
         if plan.exchange_post_plan is not None and exchange_handler is not None:
-            # Multi-worker: pre-plan -> IPC exchange -> post-plan
+            # Multi-worker: pre-plan -> (optional IPC exchange) -> post-plan
             pre_result = plan.execute_epoch(incoming_delta, source_id=source_id)
             incoming_delta.free()
             if pre_result is None:
                 pre_result = ArenaZSetBatch(plan.out_schema)
 
-            exchanged = exchange_handler.do_exchange(
-                target_view_id, pre_result
-            )
-            pre_result.free()
-
-            out_delta = plan.exchange_post_plan.execute_epoch(exchanged)
-            exchanged.free()
+            if plan.skip_exchange:
+                # Co-partitioned: master pre-sent the batch; stash hit in do_exchange,
+                # or skip entirely (worker already has correct partition).
+                out_delta = plan.exchange_post_plan.execute_epoch(pre_result)
+                pre_result.free()
+            else:
+                exchanged = exchange_handler.do_exchange(
+                    target_view_id, pre_result
+                )
+                pre_result.free()
+                out_delta = plan.exchange_post_plan.execute_epoch(exchanged)
+                exchanged.free()
         elif plan.exchange_post_plan is not None:
             # Single-process: pre-plan -> post-plan (no exchange needed)
             pre_result = plan.execute_epoch(incoming_delta, source_id=source_id)
@@ -146,13 +151,20 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
             # Multi-worker join: exchange raw delta by join key column
             # BEFORE running the circuit, so all rows with the same join
             # key land on the same worker (co-partitioning).
-            exchanged = exchange_handler.do_exchange(
-                target_view_id, incoming_delta,
-                source_id=source_id,
-            )
-            incoming_delta.free()
-            out_delta = plan.execute_epoch(exchanged, source_id=source_id)
-            exchanged.free()
+            copart = (plan.co_partitioned_join_sources is not None
+                      and source_id in plan.co_partitioned_join_sources)
+            if copart:
+                # Shard col == source PK: push routing already co-partitions data.
+                out_delta = plan.execute_epoch(incoming_delta, source_id=source_id)
+                incoming_delta.free()
+            else:
+                exchanged = exchange_handler.do_exchange(
+                    target_view_id, incoming_delta,
+                    source_id=source_id,
+                )
+                incoming_delta.free()
+                out_delta = plan.execute_epoch(exchanged, source_id=source_id)
+                exchanged.free()
         else:
             out_delta = plan.execute_epoch(incoming_delta, source_id=source_id)
             incoming_delta.free()

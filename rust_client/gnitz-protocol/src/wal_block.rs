@@ -40,9 +40,7 @@ fn wal_col_stride(tc: TypeCode) -> usize {
 }
 
 fn xxh3_64(data: &[u8]) -> u64 {
-    let mut h = twox_hash::xxh3::Hash64::with_seed(0);
-    h.write(data);
-    h.finish()
+    twox_hash::XxHash3_64::oneshot(data)
 }
 
 // ── German String encode/decode ───────────────────────────────────────────────
@@ -737,5 +735,33 @@ mod tests {
         // Note: checksum covers buf[48..] so changing header bytes does NOT invalidate checksum
         let res = decode_wal_block(&encoded, &schema);
         assert!(matches!(res, Err(ProtocolError::DecodeError(ref s)) if s.contains("version")));
+    }
+
+    #[test]
+    fn test_xxh3_matches_python_server() {
+        // Body bytes captured from a live Python server FLAG_ALLOCATE_SCHEMA_ID response.
+        // Python computes checksum 0x741C9E0BA1D8A9FD using XXH3_64bits (gnitz_xxh3_64 C FFI).
+        // This test verifies Rust twox_hash::xxh3 produces the same value.
+        let body_hex = concat!(
+            "9800000008000000a000000008000000a800000008000000",
+            "b000000008000000b800000008000000c000000008000000",
+            "c800000008000000d000000008000000d800000008000000",
+            "e000000008000000e800000008000000f0000000100000",
+            "0000100000000000000000000000000000000000000000000",
+            "1000000000000008000000000000000000000000000000001",
+            "00000000000000030000000000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000000000000000000000000"
+        );
+        // Use the raw hex instead
+        let body_hex = "9800000008000000a000000008000000a800000008000000b000000008000000b800000008000000c000000008000000c800000008000000d000000008000000d800000008000000e000000008000000e800000008000000f00000001000000000010000000000000000000000000000000000000000000001000000000000008000000000000000000000000000000001000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        let body: Vec<u8> = (0..body_hex.len()).step_by(2)
+            .map(|i| u8::from_str_radix(&body_hex[i..i+2], 16).unwrap())
+            .collect();
+        assert_eq!(body.len(), 208);
+        let computed = xxh3_64(&body);
+        eprintln!("Rust xxh3_64(body) = 0x{:016X}", computed);
+        eprintln!("Expected           = 0x741C9E0BA1D8A9FD");
+        assert_eq!(computed, 0x741C9E0BA1D8A9FD_u64,
+            "Rust and Python xxh3_64 disagree for same bytes!");
     }
 }

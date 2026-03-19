@@ -11,7 +11,7 @@ from gnitz import log
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch
-from gnitz.dbsp.ops.exchange import repartition_batch, worker_for_pk, relay_scatter, PartitionRouter
+from gnitz.dbsp.ops.exchange import repartition_batch, worker_for_pk, relay_scatter, PartitionRouter, multi_scatter
 
 WNOHANG = 1
 
@@ -34,31 +34,89 @@ class MasterDispatcher(object):
 
     def fan_out_push(self, target_id, batch, schema):
         """Split batch by worker partition, send sub-batches, collect ACKs.
-        Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE."""
+        Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE.
+        For trivial non-co-partitioned views, pre-sends repartitioned batches
+        as FLAG_PRELOADED_EXCHANGE before the push to eliminate the round-trip."""
         n = batch.length()
-        sub_batches = repartition_batch(batch, [schema.pk_index], self.num_workers, self.assignment)
-
-        # Record index routing for unique secondary indexes on this table.
+        preloadable = self.program_cache.get_preloadable_views(target_id)
         family = self.program_cache.registry.get_by_id(target_id)
-        for ci in range(len(family.index_circuits)):
-            circuit = family.index_circuits[ci]
-            if circuit.is_unique:
-                col_idx = circuit.source_col_idx
-                for w in range(self.num_workers):
-                    sb = sub_batches[w]
-                    if sb is not None and sb.length() > 0:
-                        self.router.record_routing(sb, target_id, col_idx, w)
 
-        # Send to ALL workers (even empty batches) so they all participate
-        # in potential exchange barriers
-        for w in range(self.num_workers):
-            sb = sub_batches[w]
-            ipc.send_batch(
-                self.worker_fds[w], target_id, sb, schema=schema,
-                flags=ipc.FLAG_PUSH,
+        # Skip preloaded exchange for batches containing retractions.
+        # Clients may zero non-PK columns in DELETE rows; ingest_to_family
+        # recovers the actual stored row values for weight<0 rows, but only
+        # after the push reaches the worker. Pre-routing by zeroed column
+        # values sends preloads to the wrong workers. Fall back to FLAG_EXCHANGE
+        # so workers ingest first and return correctly-valued deltas.
+        if len(preloadable) > 0:
+            has_retraction = False
+            for i in range(n):
+                if batch.get_weight(i) < r_int64(0):
+                    has_retraction = True
+                    break
+            if has_retraction:
+                preloadable = newlist_hint(0)
+
+        if len(preloadable) == 0:
+            # No trivial pre-plans: existing single-scatter path
+            sub_batches = repartition_batch(
+                batch, [schema.pk_index], self.num_workers, self.assignment
             )
-            if sb is not None:
-                sb.free()
+            # Record index routing for unique secondary indexes on this table.
+            for ci in range(len(family.index_circuits)):
+                circuit = family.index_circuits[ci]
+                if circuit.is_unique:
+                    col_idx = circuit.source_col_idx
+                    for w in range(self.num_workers):
+                        sb = sub_batches[w]
+                        if sb is not None and sb.length() > 0:
+                            self.router.record_routing(sb, target_id, col_idx, w)
+            # Send to ALL workers (even empty batches) so they all participate
+            # in potential exchange barriers.
+            for w in range(self.num_workers):
+                sb = sub_batches[w]
+                ipc.send_batch(
+                    self.worker_fds[w], target_id, sb, schema=schema,
+                    flags=ipc.FLAG_PUSH,
+                )
+                if sb is not None:
+                    sb.free()
+        else:
+            # Combined multi-scatter: PK routing + all preloadable shard routings.
+            # all_batches[0] = PK-partitioned sub-batches (for push + index routing).
+            # all_batches[1..] = shard-partitioned sub-batches for each preloadable view.
+            col_specs = newlist_hint(len(preloadable) + 1)
+            col_specs.append([schema.pk_index])
+            for i in range(len(preloadable)):
+                col_specs.append(preloadable[i][1])
+            all_batches = multi_scatter(batch, col_specs, self.num_workers, self.assignment)
+            pk_batches = all_batches[0]
+            # Record index routing for unique secondary indexes on this table.
+            for ci in range(len(family.index_circuits)):
+                circuit = family.index_circuits[ci]
+                if circuit.is_unique:
+                    col_idx = circuit.source_col_idx
+                    for w in range(self.num_workers):
+                        sb = pk_batches[w]
+                        if sb is not None and sb.length() > 0:
+                            self.router.record_routing(sb, target_id, col_idx, w)
+            # Send preloads first, then push, for each worker.
+            for w in range(self.num_workers):
+                for si in range(len(preloadable)):
+                    vid = preloadable[si][0]
+                    preload_sb = all_batches[si + 1][w]
+                    ipc.send_batch(
+                        self.worker_fds[w], vid, preload_sb,
+                        schema=schema, flags=ipc.FLAG_PRELOADED_EXCHANGE,
+                    )
+                    if preload_sb is not None:
+                        preload_sb.free()
+                sb = pk_batches[w]
+                ipc.send_batch(
+                    self.worker_fds[w], target_id, sb,
+                    schema=schema, flags=ipc.FLAG_PUSH,
+                )
+                if sb is not None:
+                    sb.free()
 
         # Message loop: handle both ACKs and exchange relays.
         # Build poll lists once; swap-remove on ACK (O(1) per worker).

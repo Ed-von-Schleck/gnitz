@@ -915,6 +915,75 @@ def test_reduce_sum(base_dir):
     log("  PASSED")
 
 
+def test_skip_exchange_copartitioned(base_dir):
+    """GROUP BY pk (shard col == pk): plan.skip_exchange must be True."""
+    log("[COMPILE] Testing skip_exchange=True for co-partitioned GROUP BY pk...")
+    db = engine.open_engine(base_dir)
+
+    db.create_schema("test")
+    # Table: pk(U64, PK), val(I64) — pk_index = 0
+    table_cols = _make_table_cols_i64(["val"])
+    table = db.create_table("test.src", table_cols, 0)
+
+    from gnitz.dbsp.functions import AGG_SUM
+    builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
+    src = builder.input_delta()
+    # GROUP BY col 0 (= pk_index) — shard col matches PK → co-partitioned
+    r = builder.reduce(src, agg_func_id=AGG_SUM, group_by_cols=[0], agg_col_idx=1)
+    builder.sink(r, target_table_id=0)
+    out_cols = [("pk", types.TYPE_U64.code), ("sum_val", types.TYPE_I64.code)]
+    graph = builder.build(out_cols)
+    db.create_view("test.v_copart", graph, "")
+
+    view = db.get_table("test.v_copart")
+    plan = db.program_cache.get_program(view.table_id)
+    assert_true(plan is not None, "co-partitioned plan is None")
+    assert_true(plan.exchange_post_plan is not None,
+                "co-partitioned plan should have exchange_post_plan")
+    assert_true(plan.skip_exchange, "co-partitioned GROUP BY pk should have skip_exchange=True")
+
+    db.drop_view("test.v_copart")
+    db.drop_table("test.src")
+    db.drop_schema("test")
+    db.close()
+    log("  PASSED")
+
+
+def test_skip_exchange_non_copartitioned(base_dir):
+    """GROUP BY grp (shard col != pk): plan.skip_exchange must be False."""
+    log("[COMPILE] Testing skip_exchange=False for non-co-partitioned GROUP BY grp...")
+    db = engine.open_engine(base_dir)
+
+    db.create_schema("test")
+    # Table: pk(U64, PK), grp(I64), val(I64) — pk_index = 0
+    table_cols = _make_table_cols_i64(["grp", "val"])
+    table = db.create_table("test.src", table_cols, 0)
+
+    from gnitz.dbsp.functions import AGG_SUM
+    builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
+    src = builder.input_delta()
+    # GROUP BY col 1 (= grp, not pk) — shard col != PK → not co-partitioned
+    r = builder.reduce(src, agg_func_id=AGG_SUM, group_by_cols=[1], agg_col_idx=2)
+    builder.sink(r, target_table_id=0)
+    out_cols = [("pk", types.TYPE_U64.code), ("sum_val", types.TYPE_I64.code)]
+    graph = builder.build(out_cols)
+    db.create_view("test.v_noncopart", graph, "")
+
+    view = db.get_table("test.v_noncopart")
+    plan = db.program_cache.get_program(view.table_id)
+    assert_true(plan is not None, "non-co-partitioned plan is None")
+    assert_true(plan.exchange_post_plan is not None,
+                "non-co-partitioned plan should have exchange_post_plan")
+    assert_true(not plan.skip_exchange,
+                "non-co-partitioned GROUP BY grp should have skip_exchange=False")
+
+    db.drop_view("test.v_noncopart")
+    db.drop_table("test.src")
+    db.drop_schema("test")
+    db.close()
+    log("  PASSED")
+
+
 def test_reduce_multi_agg(base_dir):
     """Multi-agg reduce via PARAM_AGG_COUNT: COUNT + SUM compiled from graph."""
     log("[COMPILE] Testing multi-agg reduce (COUNT + SUM)...")
@@ -1042,6 +1111,14 @@ def entry_point(argv):
         ensure_dir(base_dir)
 
         test_reduce_sum(base_dir)
+        cleanup(base_dir)
+        ensure_dir(base_dir)
+
+        test_skip_exchange_copartitioned(base_dir)
+        cleanup(base_dir)
+        ensure_dir(base_dir)
+
+        test_skip_exchange_non_copartitioned(base_dir)
         cleanup(base_dir)
         ensure_dir(base_dir)
 

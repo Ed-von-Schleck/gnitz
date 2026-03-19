@@ -611,10 +611,11 @@ fn execute_create_join_view(
         inner_merged
     };
 
-    cb.sink(merged, view_id);
-    let circuit = cb.build();
-
-    // Build output schema: U128 PK + all left cols + all right cols
+    // Build virtual combined output schema: U128 PK + all left cols + all right cols.
+    // After proj_ab/proj_ba, the UNION output has this layout (union col indices):
+    //   col 0: U128_pk (PK)
+    //   col 1..left_n: all A columns (in A schema order)
+    //   col left_n+1..left_n+right_n: all B columns (in B schema order)
     let mut out_cols: Vec<ColumnDef> = Vec::new();
     out_cols.push(ColumnDef {
         name: "_join_pk".into(),
@@ -630,29 +631,35 @@ fn execute_create_join_view(
         out_cols.push(c);
     }
 
-    // Now apply user-specified projection (SELECT columns)
+    // Compute user-specified projection and view schema.
+    // `combined_idx` is the 0-based index in [A_cols..B_cols]; union output col = combined_idx+1.
     let is_wildcard = select.projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_)));
-    let final_cols = if is_wildcard {
-        out_cols
+    let (final_cols, final_projection) = if is_wildcard {
+        let proj: Vec<usize> = (1..1 + left_n + right_n).collect();
+        (out_cols, proj)
     } else {
         let mut cols = Vec::new();
+        let mut proj = Vec::new();
         // Always include join PK as first column
         cols.push(out_cols[0].clone());
         for item in &select.projection {
             match item {
                 SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
                     let idx = resolve_unqualified_column(&ident.value, &alias_map)?;
-                    cols.push(out_cols[1 + idx].clone()); // +1 for join PK
+                    cols.push(out_cols[1 + idx].clone());
+                    proj.push(idx + 1); // union output col index = combined_idx + 1
                 }
                 SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
                     let idx = resolve_qualified_column(
                         &parts[0].value, &parts[1].value, &alias_map,
                     )?;
                     cols.push(out_cols[1 + idx].clone());
+                    proj.push(idx + 1);
                 }
                 SelectItem::Wildcard(_) => {
                     for i in 1..out_cols.len() {
                         cols.push(out_cols[i].clone());
+                        proj.push(i);
                     }
                 }
                 _ => return Err(GnitzSqlError::Unsupported(
@@ -660,8 +667,20 @@ fn execute_create_join_view(
                 )),
             }
         }
-        cols
+        (cols, proj)
     };
+
+    // Apply final column projection before sink when not identity.
+    // Identity = selecting all left+right cols in canonical order [1..left_n+right_n].
+    let is_identity = final_projection.len() == left_n + right_n
+        && final_projection.iter().enumerate().all(|(i, &p)| p == i + 1);
+    let sink_input = if is_identity {
+        merged
+    } else {
+        cb.map(merged, &final_projection)
+    };
+    cb.sink(sink_input, view_id);
+    let circuit = cb.build();
 
     client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols)
         .map_err(GnitzSqlError::Exec)?;

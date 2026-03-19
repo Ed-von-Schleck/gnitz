@@ -1,228 +1,201 @@
-# Plan: Wiring `combine` into Distributed Aggregation
+# Plan: Wire `combine` into the Partial-Agg + Gather Path
 
-## Context
+## Goal
 
-`UniversalAccumulator.combine` was implemented in `gnitz/dbsp/functions.py`. No caller
-exists yet. This plan describes what is needed to use it in query execution, validated
-against the actual codebase.
+`UniversalAccumulator.combine` exists in `functions.py` but has no caller.
+This plan adds the partial-agg + gather circuit topology so linear aggregates
+(COUNT, SUM, COUNT_NON_NULL) can be computed with a local pre-aggregate on
+each worker before exchange, instead of sending raw input rows through the
+exchange boundary.
+
+The existing exchange-before-aggregate path (`CircuitBuilder.reduce`) is
+unchanged and remains the default. This new path is opt-in.
 
 ---
 
-## Validation of prior design claims
+## Background
 
-Before describing the work, prior claims are audited against the code.
+Current topology (exchange-before-aggregate):
+```
+Scan → SHARD(group cols) → REDUCE → Integrate
+```
+Raw rows are repartitioned by group key. Each worker owns a disjoint set of
+groups and runs `op_reduce` against complete local history. Correct for all
+aggregate types including MIN/MAX.
 
-### Exchange-before-aggregate already exists and works
+New topology (partial-agg + gather):
+```
+Scan → REDUCE → SHARD(pk col 0) → GATHER_REDUCE → Integrate
+```
+Each worker runs `op_reduce` on its local input rows first, producing partial
+aggregate rows. These partial rows are repartitioned by group key (their PK is
+the group hash, col 0). Each worker then runs `op_gather_reduce`, which calls
+`combine` to merge all partial values for each group it owns and emits the
+correct global delta.
 
-**Claim (prior):** "currently no `op_reduce` with `exchange_post_plan` is generated"
-**Status: WRONG.**
+**Why this is correct only for linear aggregates:**
+`op_gather_reduce` receives only partial deltas from workers that had local
+changes that tick. Workers with no changes send nothing. For COUNT/SUM, the
+global delta is the sum of partial deltas — missing workers contribute zero,
+which is correct. For MIN/MAX this fails: the correct global minimum requires
+knowing all workers' current partial values, not just the ones that changed.
+MIN/MAX must use the exchange-before-aggregate path.
 
-`CircuitBuilder.reduce()` (helpers/circuit_builder.py:121-122) auto-inserts
-`OPCODE_EXCHANGE_SHARD` before every `OPCODE_REDUCE`:
+The master (`_relay_exchange`) already calls `relay_scatter` unconditionally,
+which repartitions exchange payloads by shard columns regardless of whether
+those payloads contain raw input rows or partial aggregate rows. No master
+changes are needed.
 
+---
+
+## What to build
+
+### 1. `OPCODE_GATHER_REDUCE` in `gnitz/core/opcodes.py`
+
+Add the constant after the existing opcodes (21 is free):
 ```python
-def reduce(self, input_handle, agg_func_id, group_by_cols, agg_col_idx=0):
-    # Auto-insert exchange shard by group columns for multi-worker correctness
-    sharded = self.shard(input_handle, group_by_cols)
-    handle = self._alloc_node(OPCODE_REDUCE)
-    self._connect(sharded, handle, PORT_IN_REDUCE)
+OPCODE_GATHER_REDUCE = 21
 ```
 
-`compile_from_graph` (program_cache.py:833-935) splits on `OPCODE_EXCHANGE_SHARD`:
-pre-plan = everything before the exchange; post-plan = everything after, which runs
-`op_reduce` on the repartitioned raw input rows. So `exchange_post_plan` is already set
-on every reduce circuit, and distributed GROUP BY already works correctly today.
-
-The current circuit topology is:
-
-```
-Input → [pre-plan: scan + filter/map] → EXCHANGE_SHARD (group key cols) → [post-plan: op_reduce]
-```
-
-Raw input rows are routed to the worker that owns each group key. Each worker's `op_reduce`
-runs against a complete local history for its groups. This is correct for all aggregate types.
-
----
-
-### The master does not need to run `combine`
-
-**Claim (prior):** "master-side gather in `master.py`: collect all per-worker partial-aggregate
-batches, run `combine` per group key, route final results to owning workers"
-**Status: WRONG.**
-
-`_relay_exchange` (master.py:134-156) calls `relay_scatter` to repartition exchange payloads
-by shard columns and routes sub-batches to workers. This is already the correct mechanism for
-the partial-agg + gather path:
-
-1. Workers send partial aggregate rows via `FLAG_EXCHANGE`
-2. Master calls `relay_scatter` — repartitions partial aggregate rows by group key column
-3. Each worker receives all partial aggregates for its groups
-4. Worker's post-plan runs `op_gather_reduce` (new), which calls `combine`
-
-The master needs **no changes**. It already repartitions correctly regardless of whether
-the exchange boundary contains raw input rows or partial aggregate rows.
-
----
-
-### `ExecutablePlan` does not need an `agg_funcs` field
-
-**Claim (prior):** "`compile_from_graph` needs to attach `agg_funcs` ... to `ExecutablePlan`
-so the master can instantiate accumulators"
-**Status: WRONG.**
-
-The master never runs `combine`. The workers do, inside `op_gather_reduce`. The agg funcs
-remain inside the compiled instruction (as they already do in `reduce_op`). `ExecutablePlan`'s
-fields (program_cache.py / runtime.py:117-134) — program, reg_file, out_schema, in_reg_idx,
-out_reg_idx, exchange_post_plan, source_reg_map, join_shard_map — are sufficient.
-
----
-
-### `evaluate_dag` needs no changes
-
-**Claim (prior):** "executor.py needs to distinguish combine-exchange from repartition-exchange"
-**Status: WRONG.**
-
-`evaluate_dag` (executor.py:121-133) already handles the exchange path uniformly:
-
+Also add the port constant (reuses the same port layout as REDUCE):
 ```python
-pre_result = plan.execute_epoch(incoming_delta, source_id=source_id)
-exchanged = exchange_handler.do_exchange(target_view_id, pre_result)
-out_delta = plan.exchange_post_plan.execute_epoch(exchanged)
+# PORT_IN_REDUCE, PORT_TRACE_IN, PORT_TRACE_OUT are already defined and shared
 ```
-
-This works for both topologies:
-- Pre-plan outputs raw rows → exchange → post-plan runs `op_reduce` (current)
-- Pre-plan outputs partial aggregates → exchange → post-plan runs `op_gather_reduce` (new)
-
-No `is_combine_exchange` flag is needed on `ExecutablePlan`.
+No new port constants are needed — `op_gather_reduce` uses the same port
+indices as `op_reduce`.
 
 ---
 
-### MIN/MAX constraint is correctly stated but requires fuller explanation
+### 2. `op_gather_reduce` in `gnitz/dbsp/ops/reduce.py`
 
-**Claim (prior):** "MIN/MAX must use exchange-before-aggregate; COUNT/SUM can use
-partial aggregation + combine"
-**Status: CORRECT**, but the mechanism was not spelled out.
-
-**Why the partial-agg + gather path is correct for COUNT/SUM/COUNT_NON_NULL:**
-
-`op_gather_reduce` (see §1 below) needs a `trace_out` to look up `old_global` for each
-group. With that in hand, the new global is:
-
-```
-new_global = old_global + Σ(+1 partial values) − Σ(−1 partial values)
-```
-
-This works because the operation is linear: the global delta equals the sum of per-worker
-partial deltas. Workers with no changes send no rows; their contribution is zero, which
-is correct. The formula holds regardless of how many workers sent deltas.
-
-**Why the partial-agg + gather path is WRONG for MIN/MAX:**
-
-The gather step receives only the partial deltas from workers that had local changes.
-Workers with unchanged partials send nothing. Computing the correct new global MIN/MAX
-requires:
-
-```
-new_global_MIN = min(current_partial_w for ALL workers w)
-```
-
-This depends on ALL workers' current partial values, not just the changed ones. The gather
-step has no way to know `current_partial_B` if worker B sent no delta that tick. Even with
-a `trace_out` for `old_global`, the formula `new_global = old_global + delta` does not
-hold — there is no additive delta formulation for non-linear aggregates.
-
-The only safe approach for MIN/MAX is exchange-before-aggregate: all rows for a group
-land on one worker, so `op_reduce` always has complete history and `combine` is never
-called across a group split. This is already what the current system does.
-
-Note: the current system uses exchange-before-aggregate for ALL aggregates uniformly
-(including COUNT/SUM/COUNT_NON_NULL), which is correct but less efficient for linear
-aggregates on large input tables.
-
----
-
-### `_relay_exchange` correctly stated as unconditional `relay_scatter`
-
-**Status: CONFIRMED.** master.py:146 always calls `relay_scatter`. No changes needed.
-
----
-
-## What is actually needed
-
-The partial-agg + gather path requires three new pieces. Nothing else.
-
----
-
-### 1. `op_gather_reduce` — new function in `reduce.py`
-
-The post-plan for the partial-agg circuit receives rows in the **reduce output schema**
-(group key + agg columns) with weights ±1. These are partial aggregate rows from multiple
-workers for the same set of groups, after repartition by group key.
-
-**This operator is stateful.** It must hold a `trace_out` (same schema and role as
-`op_reduce`'s trace_out) tracking the current global aggregate per group. This is
-necessary because the output must be expressed as `(−1, old_global), (+1, new_global)`,
-which requires `old_global` to be read from the trace. Directly passing partial deltas
-upstream would produce multiple rows per group in the view Z-set with conflicting weights,
-corrupting the view.
-
-The gather step algorithm for each group G in `partial_batch`:
-
-1. Sort rows by group key (same strategy as `_argsort_delta` but on output schema)
-2. Look up `old_global` for G from `trace_out` (or treat as zero/empty if absent)
-3. Accumulate the global delta:
-   - For each +1 row: `combine(row.agg_bits)` into a fresh accumulator (adds new partial)
-   - For each −1 row: subtract old partial value from the accumulator explicitly
-     (linear aggregates only — this is integer/float arithmetic, not a `combine` call)
-4. `new_global = old_global + accumulated_delta`
-5. If `new_global ≠ old_global`: emit `(−1, old_global)` and `(+1, new_global)`
-6. Update `trace_out` with `new_global`
-
-**Safety constraint:** `op_gather_reduce` is only correct for linear aggregates
-(COUNT, SUM, COUNT_NON_NULL). See the linearity argument in the validation section above.
-It must never be emitted for MIN/MAX agg functions.
+The function receives partial aggregate rows (in the reduce output schema)
+and a `trace_out` (also in reduce output schema) tracking the current global
+aggregate per group. It calls `combine` to merge partial values and emits
+retraction/insertion pairs exactly as `op_reduce` does.
 
 Signature:
 ```python
-def op_gather_reduce(partial_batch, trace_out_cursor, trace_out_table,
-                     group_col_indices, agg_funcs, out_schema, out_writer):
+def op_gather_reduce(
+    partial_batch,       # ArenaZSetBatch in reduce output schema
+    partial_schema,      # Schema of partial_batch
+    trace_out_cursor,    # cursor into trace_out (global agg state)
+    trace_out_table,     # table backing trace_out (for writes)
+    out_writer,          # output BatchWriter
+    group_col_indices,   # column indices of the group key in partial_schema
+    agg_funcs,           # list[AggregateFunction], one per agg column
+    output_schema,       # = partial_schema (same schema for output)
+):
 ```
 
-Where `partial_batch` has schema = reduce output schema, `group_col_indices` are the
-group column positions in the output schema, `trace_out_cursor`/`trace_out_table` track
-the current global aggregate (same as `op_reduce`'s tr_out), and `agg_funcs` hold the
-accumulators (reset between groups).
+Algorithm:
+1. Sort `partial_batch` by group columns using `_argsort_delta` (reuse
+   existing helper — it accepts any schema and column list).
+2. For each group G:
+   a. Look up `old_global` from `trace_out_cursor` (seek by group PK).
+   b. Reset each `agg_func`.
+   c. For each +1 partial row in `partial_batch` for G:
+      - Call `agg_func.combine(row.agg_bits)` for each agg column.
+   d. For each −1 partial row in `partial_batch` for G:
+      - Subtract: `agg_func.merge_accumulated(old_partial_bits, weight=-1)`.
+      - `old_partial_bits` is the agg column value read from that −1 row.
+   e. If `old_global` exists: `agg_func.merge_accumulated(old_global_bits, 1)`.
+      This adds the previous global value so that `new_global = old_global + delta`.
+   f. Emit `(−1, old_global)` if `old_global` existed.
+   g. Emit `(+1, new_global)` if `new_global` accumulator is non-zero.
+   h. Update `trace_out` with `new_global`.
+
+For output accessors, reuse `ReduceAccessor`. The group PK in the partial
+schema is already the group hash (col 0), so the accessor can emit it directly.
 
 ---
 
-### 2. A new opcode `OPCODE_GATHER_REDUCE` in `gnitz/core/opcodes.py`
+### 3. `gather_reduce_op` builder in `gnitz/vm/instructions.py`
 
-`op_gather_reduce` is emitted by a new opcode in `_emit_node`. It uses the same params
-as `OPCODE_REDUCE` (group cols, agg funcs) but:
-- Input register: reduce output schema (partial aggregates)
-- One trace register: `trace_out` in reduce output schema (for reading/writing old_global)
-- Output: merged aggregate delta in reduce output schema
+```python
+def gather_reduce_op(reg_in, reg_trace_out, reg_out,
+                     group_by_cols, agg_funcs, output_schema):
+    i = Instruction(op.OPCODE_GATHER_REDUCE)
+    i.reg_in = reg_in
+    i.reg_trace_out = reg_trace_out
+    i.reg_out = reg_out
+    i.group_by_cols = group_by_cols
+    i.agg_funcs = agg_funcs
+    i.output_schema = output_schema
+    return i
+```
 
-The existing `OPCODE_EXCHANGE_SHARD` (unchanged) is placed after `OPCODE_REDUCE` and
-before `OPCODE_GATHER_REDUCE` in the circuit graph.
+No new fields on `Instruction` are needed — `reg_trace_out`, `reg_out`,
+`group_by_cols`, `agg_funcs`, and `output_schema` are all already declared in
+`_immutable_fields_`.
 
 ---
 
-### 3. `CircuitBuilder.reduce_partial()` — new method in circuit_builder.py
+### 4. Dispatch in `gnitz/vm/interpreter.py`
+
+Add an `elif` branch for `OPCODE_GATHER_REDUCE` in the main dispatch loop,
+alongside the existing `OPCODE_REDUCE` case. Call:
+```python
+op_gather_reduce(
+    instr.reg_in.batch,
+    instr.reg_in.table_schema,
+    instr.reg_trace_out.cursor,
+    instr.reg_trace_out.table,
+    instr.reg_out.writer,
+    instr.group_by_cols,
+    instr.agg_funcs,
+    instr.output_schema,
+)
+```
+
+---
+
+### 5. `_emit_node` + extra_regs in `gnitz/catalog/program_cache.py`
+
+In `_emit_node`, add an `elif op == opcodes.OPCODE_GATHER_REDUCE:` branch.
+It is simpler than OPCODE_REDUCE:
+- No `trace_in` (input rows are already aggregated; full history replay is
+  not needed).
+- No AVI or group index (those are only for MIN/MAX, which never uses
+  this path).
+- Allocates one `TraceRegister` for `trace_out` (global agg state) and one
+  `DeltaRegister` for the output delta.
+- The `in_reg`'s schema is the reduce output schema (partial aggregates).
+  Reconstruct `agg_funcs` from the same PARAM_AGG_FUNC_ID / PARAM_AGG_COL_IDX
+  / PARAM_AGG_COUNT / PARAM_AGG_SPEC_BASE params as OPCODE_REDUCE — the
+  parameters are identical. The `col_type` lookup uses `in_reg.table_schema`
+  (the partial schema), targeting the agg column index within that schema.
+
+In both extra_regs counting loops (pre-plan and post-plan, lines ~804-875),
+add:
+```python
+elif pop == opcodes.OPCODE_GATHER_REDUCE:
+    extra_regs += 1  # trace_out only (no trace_in, no separate out_delta needed)
+```
+Wait — need to verify. `op_reduce` allocates: 1 `TraceRegister` for `tr_out`
+(at `reg_id`) and 1 extra `DeltaRegister` for `out_delta` (from
+`state[_ST_NEXT_EXTRA_REG]`), plus optionally 1 more for `tr_in`. So the
+"2" in `extra_regs += 2` covers `out_delta + auto trace_in` (the comment
+says so). For `OPCODE_GATHER_REDUCE`, there is no `tr_in`, only `out_delta`:
+```python
+elif pop == opcodes.OPCODE_GATHER_REDUCE:
+    extra_regs += 1  # out_delta register
+```
+
+---
+
+### 6. `reduce_partial` / `reduce_multi_partial` in `rpython_tests/helpers/circuit_builder.py`
 
 ```python
 def reduce_partial(self, input_handle, agg_func_id, group_by_cols, agg_col_idx=0):
-    """Partial-agg + gather path. Only correct when agg is linear
-    (COUNT, SUM, COUNT_NON_NULL). Must NOT be used with AGG_MIN or AGG_MAX.
-    Inserts EXCHANGE_SHARD after REDUCE, followed by GATHER_REDUCE."""
+    """Partial-agg + gather. Only for linear aggregates (COUNT, SUM,
+    COUNT_NON_NULL). Must NOT be used with AGG_MIN or AGG_MAX."""
     reduce_handle = self._alloc_node(OPCODE_REDUCE)
     self._connect(input_handle, reduce_handle, PORT_IN_REDUCE)
     self._params.append((reduce_handle.node_id, PARAM_AGG_FUNC_ID, agg_func_id))
     self._params.append((reduce_handle.node_id, PARAM_AGG_COL_IDX, agg_col_idx))
     for col_idx in group_by_cols:
         self._group_cols.append((reduce_handle.node_id, col_idx))
-    # Exchange by PK of reduce output (group hash), col index 0
+    # Exchange partial aggregate rows by group PK (col 0 = group hash)
     sharded = self.shard(reduce_handle, [0])
     gather = self._alloc_node(OPCODE_GATHER_REDUCE)
     self._connect(sharded, gather, PORT_IN_REDUCE)
@@ -231,36 +204,46 @@ def reduce_partial(self, input_handle, agg_func_id, group_by_cols, agg_col_idx=0
     for col_idx in group_by_cols:
         self._group_cols.append((gather.node_id, col_idx))
     return gather
+
+def reduce_multi_partial(self, input_handle, agg_specs, group_by_cols):
+    """Multi-agg variant. agg_specs: list of (agg_func_id, agg_col_idx).
+    All agg functions must be linear."""
+    reduce_handle = self._alloc_node(OPCODE_REDUCE)
+    self._connect(input_handle, reduce_handle, PORT_IN_REDUCE)
+    self._params.append((reduce_handle.node_id, PARAM_AGG_COUNT, len(agg_specs)))
+    for i in range(len(agg_specs)):
+        func_id, col_idx = agg_specs[i]
+        self._params.append((reduce_handle.node_id, PARAM_AGG_SPEC_BASE + i,
+                              (func_id << 32) | col_idx))
+    for col_idx in group_by_cols:
+        self._group_cols.append((reduce_handle.node_id, col_idx))
+    sharded = self.shard(reduce_handle, [0])
+    gather = self._alloc_node(OPCODE_GATHER_REDUCE)
+    self._connect(sharded, gather, PORT_IN_REDUCE)
+    self._params.append((gather.node_id, PARAM_AGG_COUNT, len(agg_specs)))
+    for i in range(len(agg_specs)):
+        func_id, col_idx = agg_specs[i]
+        self._params.append((gather.node_id, PARAM_AGG_SPEC_BASE + i,
+                              (func_id << 32) | col_idx))
+    for col_idx in group_by_cols:
+        self._group_cols.append((gather.node_id, col_idx))
+    return gather
 ```
 
-The existing `reduce()` method (exchange-before-aggregate) is unchanged and remains the
-default for all circuits. `reduce_partial()` is opt-in, and the caller is responsible
-for only using it when all aggregates are linear.
+The group_by_cols recorded against OPCODE_GATHER_REDUCE are the original
+input group columns. `_emit_node` for OPCODE_GATHER_REDUCE uses them only to
+recover the agg schema; the actual sort key inside `op_gather_reduce` is
+col 0 (the group PK hash), which is always the PK of the partial schema.
 
 ---
 
-## Circuit topology comparison
+## Schema note
 
-| Path | Circuit topology |
-|---|---|
-| Current (exchange-before-agg) | `Scan → SHARD(group cols) → REDUCE → Integrate` |
-| New (partial-agg + gather) | `Scan → REDUCE → SHARD(pk col 0) → GATHER_REDUCE → Integrate` |
-
-The pre-plan / post-plan split occurs at `OPCODE_EXCHANGE_SHARD` in both cases.
-`compile_from_graph` handles this uniformly (existing code at program_cache.py:833).
-
----
-
-## What does NOT need to change
-
-| Component | Status |
-|---|---|
-| `master.py` `_relay_exchange` | No changes — `relay_scatter` handles both paths |
-| `executor.py` `evaluate_dag` | No changes — pre/post exchange flow is topology-agnostic |
-| `ExecutablePlan` fields | No changes — no `agg_funcs` or exchange-type flag needed |
-| `ipc.py` / IPC flags | No changes — `FLAG_EXCHANGE` is sufficient for both paths |
-| `OPCODE_EXCHANGE_SHARD` | No changes — reused unchanged for both paths |
-| `get_shard_cols` | No changes — reads PARAM_SHARD_COL_BASE regardless of position in graph |
+The partial schema (output of OPCODE_REDUCE feeding into OPCODE_GATHER_REDUCE)
+is built by `_build_reduce_output_schema`. The global aggregate trace (`tr_out`
+of OPCODE_GATHER_REDUCE) uses the same schema. `op_gather_reduce` reads and
+writes group PK + agg columns from this schema, so no new schema builder is
+needed.
 
 ---
 
@@ -268,26 +251,34 @@ The pre-plan / post-plan split occurs at `OPCODE_EXCHANGE_SHARD` in both cases.
 
 | File | Change |
 |---|---|
-| `gnitz/core/opcodes.py` | Add `OPCODE_GATHER_REDUCE` constant |
-| `gnitz/dbsp/ops/reduce.py` | Add `op_gather_reduce` function |
-| `gnitz/vm/instructions.py` | Add `gather_reduce_op` instruction builder |
-| `gnitz/vm/interpreter.py` | Dispatch `OPCODE_GATHER_REDUCE` to `op_gather_reduce` |
-| `gnitz/catalog/program_cache.py` | Handle `OPCODE_GATHER_REDUCE` in `_emit_node`; count +1 extra reg (trace_out) in post-plan extra_regs loop (program_cache.py:864-875) |
-| `helpers/circuit_builder.py` | Add `reduce_partial()` and `reduce_multi_partial()` |
-| `rpython_tests/dbsp_comprehensive_test.py` | Tests for `op_gather_reduce` |
+| `gnitz/core/opcodes.py` | Add `OPCODE_GATHER_REDUCE = 21` |
+| `gnitz/dbsp/ops/reduce.py` | Add `op_gather_reduce` |
+| `gnitz/vm/instructions.py` | Add `gather_reduce_op` builder |
+| `gnitz/vm/interpreter.py` | Dispatch `OPCODE_GATHER_REDUCE` |
+| `gnitz/catalog/program_cache.py` | `_emit_node` branch + extra_regs counts (×2) |
+| `rpython_tests/helpers/circuit_builder.py` | `reduce_partial`, `reduce_multi_partial` |
+| `rpython_tests/dbsp_comprehensive_test.py` | Unit tests for `op_gather_reduce` |
 
 ---
 
-## Verification
+## Testing
 
-Run: `make run-dbsp_comprehensive_test-c` (covers `op_gather_reduce` unit tests)
-Run: `GNITZ_WORKERS=4 make run-server_test-c` (E2E with a linear-aggregate view using `reduce_partial`)
+Unit tests (`make run-dbsp_comprehensive_test-c`):
+- Single COUNT via `reduce_partial`: verify correct output on a 4-worker
+  simulation with 2 groups, multiple ticks.
+- Single SUM: same structure.
+- Multi-agg (COUNT + SUM) via `reduce_multi_partial`.
+- Retraction tick: insert rows, then delete some; verify output delta and trace.
+
+E2E (`GNITZ_WORKERS=4 make run-server_test-c`):
+- Add one test view using `reduce_partial` with COUNT or SUM.
+- Verify results match a reference single-worker execution.
 
 ---
 
 ## Out of scope
 
-- Using `reduce_partial` in `compile_from_graph` for auto-generated plans: requires a
-  linearity check at compile time and is a follow-on query planner decision.
-- Multi-agg partial path (`reduce_multi_partial`): same structure as `reduce_partial`
-  but uses `PARAM_AGG_COUNT` / `PARAM_AGG_SPEC_BASE`; straightforward extension.
+- Auto-selecting `reduce_partial` in `compile_from_graph` for query-planner-
+  generated circuits. This requires a linearity check at compile time and is a
+  separate planner decision.
+- Using `reduce_partial` for MIN/MAX. This is incorrect and must never be done.

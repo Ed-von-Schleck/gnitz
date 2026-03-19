@@ -434,6 +434,119 @@ def test_workers_reduce_incremental(client):
 
 
 # ---------------------------------------------------------------------------
+# Phase 4: Exchange round-trip elimination
+# ---------------------------------------------------------------------------
+
+@_NEEDS_MULTI
+def test_trivial_preplan_no_exchange(client):
+    """
+    4b+4c: Trivial non-co-partitioned pre-plan (GROUP BY grp, shard col != pk).
+    Master pre-sends FLAG_PRELOADED_EXCHANGE; worker uses stash instead of IPC round-trip.
+    Correct COUNT result verifies the preload mechanism works.
+    """
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "grp BIGINT NOT NULL, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT grp, COUNT(*) AS cnt FROM t GROUP BY grp",
+            schema_name=sn,
+        )
+        # Push 100 rows across 2 groups, multiple transactions
+        for batch_start in range(0, 100, 20):
+            vals = ",".join(
+                f"({batch_start + i + 1}, {(batch_start + i) % 2 + 1}, {batch_start + i})"
+                for i in range(20)
+            )
+            client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+
+        vid, _ = client.resolve_table(sn, "v")
+        rows = {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}
+        # 50 rows in each group
+        assert rows[1] == 50, f"group 1 count: expected 50, got {rows.get(1)}"
+        assert rows[2] == 50, f"group 2 count: expected 50, got {rows.get(2)}"
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_copartitioned_view_no_exchange(client):
+    """
+    4d: Co-partitioned view (GROUP BY id where id == pk).
+    skip_exchange=True: worker processes pre-result directly without IPC exchange.
+    Correct SUM result verifies co-partitioned elimination works.
+    """
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT id, SUM(val) AS total FROM t GROUP BY id",
+            schema_name=sn,
+        )
+        n = 50
+        vals = ",".join(f"({i}, {i * 10})" for i in range(1, n + 1))
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+
+        vid, _ = client.resolve_table(sn, "v")
+        rows = {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}
+        for i in range(1, n + 1):
+            assert rows.get(i) == i * 10, \
+                f"id={i}: expected {i * 10}, got {rows.get(i)}"
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_copartitioned_join(client):
+    """
+    4d: Co-partitioned join (join on PK column).
+    co_partitioned_join_sources eliminates exchange for PK-keyed join.
+    Correct join results across multiple pushes verifies the optimization.
+    """
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT a.id, a.x, b.y FROM a JOIN b ON a.id = b.id",
+            schema_name=sn,
+        )
+        n = 30
+        a_vals = ",".join(f"({i}, {i * 2})" for i in range(1, n + 1))
+        b_vals = ",".join(f"({i}, {i * 3})" for i in range(1, n + 1))
+        client.execute_sql(f"INSERT INTO a VALUES {a_vals}", schema_name=sn)
+        client.execute_sql(f"INSERT INTO b VALUES {b_vals}", schema_name=sn)
+
+        vid, _ = client.resolve_table(sn, "v")
+        rows = client.scan(vid)
+        live_rows = [r for r in rows if r.weight > 0]
+        assert len(live_rows) == n, f"expected {n} join rows, got {len(live_rows)}"
+        by_id = {r[1]: r for r in live_rows}
+        for i in range(1, n + 1):
+            r = by_id.get(i)
+            assert r is not None, f"id={i} missing from join result"
+            assert r[2] == i * 2, f"id={i} x: expected {i * 2}, got {r[2]}"
+            assert r[3] == i * 3, f"id={i} y: expected {i * 3}, got {r[3]}"
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+
+# ---------------------------------------------------------------------------
 # Concurrent push worker (module-level for pickling)
 # ---------------------------------------------------------------------------
 

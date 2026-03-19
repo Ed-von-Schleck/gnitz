@@ -5,4 +5,4 @@ edition = "2021"
 
 [dependencies]
 libc = "0.2"
-twox-hash = "1"
+twox-hash = { version = "2", features = ["xxhash3_64"] }

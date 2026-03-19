@@ -95,6 +95,7 @@ class ProgramCache(object):
         self.registry = registry
         self._cache = {}
         self._shard_cols_cache = {}
+        self._exchange_info_cache = {}
         self._dep_map = {}
         self._dep_map_valid = False
 
@@ -103,11 +104,14 @@ class ProgramCache(object):
             del self._cache[program_id]
         if program_id in self._shard_cols_cache:
             del self._shard_cols_cache[program_id]
+        if program_id in self._exchange_info_cache:
+            del self._exchange_info_cache[program_id]
         self._dep_map_valid = False
 
     def invalidate_all(self):
         self._cache.clear()
         self._shard_cols_cache.clear()
+        self._exchange_info_cache.clear()
         self._dep_map_valid = False
 
     def invalidate_dep_map(self):
@@ -334,6 +338,72 @@ class ProgramCache(object):
                 if reindex_col >= 0:
                     return [reindex_col]
         return []
+
+    def get_exchange_info(self, view_id):
+        """Returns (shard_cols, is_trivial, is_co_partitioned) for a view.
+
+        is_trivial: SHARD's direct input is the primary input (INPUT → SHARD).
+        is_co_partitioned: SHARD col == PK of the source table.
+        """
+        if view_id in self._exchange_info_cache:
+            return self._exchange_info_cache[view_id]
+        nodes = self._load_nodes(view_id)
+        edges = self._load_edges(view_id)
+        params, _str_params = self._load_params(view_id)
+        sources = self._load_sources(view_id)
+
+        # Compute in-degrees for each node in this view's circuit
+        in_deg = {}
+        for nid, _ in nodes:
+            in_deg[nid] = 0
+        for _eid, src, dst, _port in edges:
+            in_deg[dst] = in_deg.get(dst, 0) + 1
+
+        shard_cols = newlist_hint(2)
+        is_trivial = False
+        is_co_partitioned = False
+
+        for nid, op in nodes:
+            if op == opcodes.OPCODE_EXCHANGE_SHARD:
+                node_params = params.get(nid, {})
+                idx = 0
+                while (opcodes.PARAM_SHARD_COL_BASE + idx) in node_params:
+                    shard_cols.append(node_params[opcodes.PARAM_SHARD_COL_BASE + idx])
+                    idx += 1
+
+                # is_trivial: SHARD has exactly 1 incoming edge, and that source
+                # node has in-degree 0 (INPUT → SHARD, no transforms).
+                incoming_srcs = newlist_hint(2)
+                for _eid2, src2, dst2, _port2 in edges:
+                    if dst2 == nid:
+                        incoming_srcs.append(src2)
+                if len(incoming_srcs) == 1:
+                    src_nid = incoming_srcs[0]
+                    if in_deg.get(src_nid, 0) == 0:
+                        is_trivial = True
+                        src_tid = sources.get(src_nid, 0)
+                        if (src_tid > 0 and len(shard_cols) == 1
+                                and self.registry.has_id(src_tid)):
+                            family = self.registry.get_by_id(src_tid)
+                            if shard_cols[0] == family.schema.pk_index:
+                                is_co_partitioned = True
+                break  # only one EXCHANGE_SHARD per view
+
+        result = (shard_cols, is_trivial, is_co_partitioned)
+        self._exchange_info_cache[view_id] = result
+        # Keep _shard_cols_cache coherent
+        self._shard_cols_cache[view_id] = shard_cols
+        return result
+
+    def get_preloadable_views(self, source_table_id):
+        """Return [(view_id, shard_cols)] for trivial, non-co-partitioned views."""
+        dep_map = self.get_dep_map(self.registry)
+        result = newlist_hint(4)
+        for view_id in dep_map.get(source_table_id, []):
+            shard_cols, is_trivial, is_co_partitioned = self.get_exchange_info(view_id)
+            if is_trivial and not is_co_partitioned and len(shard_cols) > 0:
+                result.append((view_id, shard_cols))
+        return result
 
     def _resolve_primary_input_schema(self, program_id, fallback,
                                       circuit_sources, trace_side_sources):
@@ -794,6 +864,16 @@ class ProgramCache(object):
                     if reindex_col >= 0:
                         join_shard_map[source_tid] = [reindex_col]
 
+        # 2c. co_partitioned_join_sources: source_table_id → True
+        # when join shard col == source PK (exchange eliminable at runtime).
+        co_partitioned_join_sources = {}
+        for source_tid in join_shard_map:
+            cols = join_shard_map[source_tid]
+            if self.registry.has_id(source_tid):
+                src_pk = self.registry.get_by_id(source_tid).schema.pk_index
+                if len(cols) == 1 and cols[0] == src_pk:
+                    co_partitioned_join_sources[source_tid] = True
+
         # 3. Register assignment
         out_reg_of = {}
         next_reg = 0
@@ -926,11 +1006,19 @@ class ProgramCache(object):
 
                 # Finalize the pre-plan with exchange fields set at construction time
                 program.append(instructions.halt_op())
+                # skip_exchange: INPUT → SHARD (trivial) and shard col == PK
+                is_trivial = (in_reg_id_for_exchange == state[_ST_INPUT_DELTA_REG_ID])
+                skip_exchange = (
+                    is_trivial
+                    and len(shard_cols) == 1
+                    and shard_cols[0] == in_schema.pk_index
+                )
                 pre_plan = runtime.ExecutablePlan(
                     program, reg_file, exchange_in_schema,
                     in_reg_idx=state[_ST_INPUT_DELTA_REG_ID],
                     out_reg_idx=in_reg_id_for_exchange,
                     exchange_post_plan=post_plan,
+                    skip_exchange=skip_exchange,
                 )
                 return pre_plan
 
@@ -958,4 +1046,7 @@ class ProgramCache(object):
             in_reg_idx=input_delta_reg_id, out_reg_idx=sink_reg_id,
             source_reg_map=source_reg_map if source_reg_map else None,
             join_shard_map=join_shard_map if join_shard_map else None,
+            co_partitioned_join_sources=(
+                co_partitioned_join_sources if co_partitioned_join_sources else None
+            ),
         )

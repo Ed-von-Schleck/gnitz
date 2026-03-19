@@ -22,8 +22,20 @@ class WorkerExchangeHandler(object):
 
     def __init__(self, master_fd):
         self.master_fd = master_fd
+        self._stash = {}   # view_id (int) -> ArenaZSetBatch pre-sent by master
+
+    def stash_preloaded(self, view_id, batch):
+        """Store a pre-sent exchange batch so do_exchange can return it directly."""
+        if view_id in self._stash:
+            self._stash[view_id].free()
+        self._stash[view_id] = batch
 
     def do_exchange(self, view_id, batch, source_id=0):
+        # Co-partitioned / trivial pre-plan: master already sent this batch.
+        if view_id in self._stash:
+            result = self._stash[view_id]
+            del self._stash[view_id]
+            return result
         schema = batch._schema
         ipc.send_batch(
             self.master_fd, view_id, batch,
@@ -78,8 +90,22 @@ class WorkerProcess(object):
         payload = None
         try:
             payload = ipc.receive_payload(self.master_fd)
-            target_id = intmask(payload.target_id)
             flags = intmask(payload.flags)
+
+            # Drain all preloaded exchange frames sent before the actual push.
+            while flags & ipc.FLAG_PRELOADED_EXCHANGE:
+                vid = intmask(payload.target_id)
+                if payload.batch is not None and payload.batch.length() > 0:
+                    stashed = payload.batch.clone()
+                else:
+                    stashed = ArenaZSetBatch(payload.schema)
+                self.exchange_handler.stash_preloaded(vid, stashed)
+                payload.close()
+                payload = None
+                payload = ipc.receive_payload(self.master_fd)
+                flags = intmask(payload.flags)
+
+            target_id = intmask(payload.target_id)
 
             if flags & ipc.FLAG_SHUTDOWN:
                 self._shutdown()

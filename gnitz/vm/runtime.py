@@ -118,11 +118,13 @@ class ExecutablePlan(object):
         "program", "reg_file", "out_schema", "in_reg_idx", "out_reg_idx",
         "exchange_post_plan", "source_reg_map",
         "join_shard_map",
+        "skip_exchange", "co_partitioned_join_sources",
     ]
 
     def __init__(self, program, reg_file, out_schema, in_reg_idx=0, out_reg_idx=1,
                  exchange_post_plan=None,
-                 source_reg_map=None, join_shard_map=None):
+                 source_reg_map=None, join_shard_map=None,
+                 skip_exchange=False, co_partitioned_join_sources=None):
         self.program = program
         self.reg_file = reg_file
         self.out_schema = out_schema
@@ -132,6 +134,8 @@ class ExecutablePlan(object):
         self.exchange_post_plan = exchange_post_plan
         self.source_reg_map = source_reg_map   # dict {source_table_id: reg_id} or None
         self.join_shard_map = join_shard_map    # dict {source_table_id: [col_idx]} or None
+        self.skip_exchange = skip_exchange      # True if exchange round-trip can be skipped
+        self.co_partitioned_join_sources = co_partitioned_join_sources  # dict or None
 
     def execute_epoch(self, input_delta, source_id=0):
         """

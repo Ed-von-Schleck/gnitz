@@ -94,316 +94,175 @@ All five links must be in place before the redundant PK sort disappears.
 
 ---
 
-## Phase 3: Exchange relay synthesis
+## Phase 3: Exchange relay synthesis — DONE
 
-Replaces the current clone→merge→repartition pipeline with a no-clone k-way merge
-approach. Requires Phase 2c (`FLAG_BATCH_CONSOLIDATED` on `FLAG_EXCHANGE`).
-
-### The redundant sort problem
-
-With Phase 2c in place, the exchange path at the master carries full flag information:
-
-1. Workers' pre-plan seal: `to_consolidated()` on push sub-batch → output consolidated.
-2. Workers send `FLAG_EXCHANGE` with `FLAG_BATCH_CONSOLIDATED`.
-3. Master has N consolidated sorted runs — each worker's PK partition is disjoint, so
-   PKs across all N sources are globally unique.
-4. Master currently: **clones** each source → **merges** all N → **scatter**s
-   sequentially → sends unsorted relay with no flag.
-5. Workers' post-plan seal: `to_consolidated()` on unsorted relay →
-   **O((M/N) log(M/N)) PK sort** + O(M/N) consolidation pass.
-6. `op_reduce` `ConsolidatedScope`: short-circuits (already consolidated).
-7. `op_reduce` `_argsort_delta`: **O((M/N) log(M/N)) group-by sort** — unavoidable.
-
-Step 5 is a redundant PK sort: it satisfies the consolidated invariant before REDUCE,
-which immediately discards PK order to re-sort by group_by_cols.
-
-### Architecture
-
-**Key constraint:** to produce consolidated relay sub-batches, the master needs all N
-source batches simultaneously to iterate them in merged PK order. This requires
-deferring `payload.close()` until all N are collected — the mmap views must stay alive
-during the merge. This is incompatible with streaming scatter (close-immediately after
-each arrival). The choice is made here in favour of consolidated output.
-
-**Collect loop** (`fan_out_push`, exchange arm):
-
-Replace `exchange_buffers[vid][w] = payload.batch.clone()` + immediate
-`payload.close()` with deferred storage:
-
-```python
-# exchange_payloads: view_id -> [IPCPayload | None] * num_workers
-if vid not in exchange_payloads:
-    exchange_payloads[vid] = [None] * self.num_workers
-    exchange_counts[vid] = 0
-exchange_payloads[vid][w] = payload        # store; do NOT close
-exchange_counts[vid] += 1
-# (schema, source_id bookkeeping unchanged)
-
-if exchange_counts[vid] == self.num_workers:
-    self._relay_exchange(vid, exchange_payloads[vid], ex_schema, src_id)
-    del exchange_payloads[vid]
-    del exchange_counts[vid]
-    if vid in exchange_schemas: del exchange_schemas[vid]
-    if vid in exchange_source_ids: del exchange_source_ids[vid]
-    # payloads closed inside _relay_exchange
-```
-
-**`gnitz/dbsp/ops/exchange.py`** — two new functions (alongside `repartition_batch`):
-
-```python
-def repartition_batches(source_batches, shard_col_indices, num_workers, assignment):
-    """Scatter N source batches into N dest batches without an intermediate merge.
-    Sources are iterated sequentially. Output is NOT marked consolidated.
-    Fallback when sources are not all consolidated."""
-    ...
-
-def repartition_batches_merged(source_batches, shard_col_indices, num_workers,
-                                assignment):
-    """Scatter N consolidated source batches into N dest batches in merged PK order.
-
-    Requires all non-None source_batches to have _consolidated = True.
-    Produces consolidated dest batches because:
-      - Each source has unique PKs (pre-plan seal).
-      - PK partition ranges are disjoint across workers.
-      - Iterating in merged PK order within each dest sub-batch preserves monotonicity.
-
-    Marks dest_batches[w]._consolidated = True before returning.
-
-    For small fixed N (≤ 8): linear scan over N current-row pointers per output row —
-    O(M × N) total. No heap required; RPython-safe.
-    For larger N: tournament tree."""
-    ...
-```
-
-**`_relay_exchange`** (`master.py`) — after Phase 0 and Phase 3, this becomes 5 lines
-of orchestration with all routing logic in `relay_scatter` (exchange.py):
-
-```python
-def _relay_exchange(self, view_id, payloads, schema, source_id=0):
-    shard_cols = []
-    if source_id > 0:
-        shard_cols = self.program_cache.get_join_shard_cols(view_id, source_id)
-    if len(shard_cols) == 0:
-        shard_cols = self.program_cache.get_shard_cols(view_id)
-    sources = [p.batch if p is not None else None for p in payloads]
-    dest_batches = relay_scatter(sources, shard_cols, self.num_workers, self.assignment)
-    for p in payloads:
-        if p is not None: p.close()
-    for w in range(self.num_workers):
-        ipc.send_batch(self.worker_fds[w], view_id, dest_batches[w], schema=schema)
-        if dest_batches[w] is not None: dest_batches[w].free()
-```
-
-`shard_cols` is always non-empty here (GATHER deleted in Phase 0a; all exchange views
-use SHARD). `relay_scatter` has no GATHER fallback.
-
-### Memory profile
-
-| Approach | Peak exchange memory |
-|---|---|
-| Current | O(3M): N clones + 1 merged batch + N dest batches |
-| Phase 3 (this) | O(2M): N open mmap views + N dest batches |
-
-### Performance effect on the exchange cycle
-
-| Step | Before Phase 3 | After Phase 3 |
-|---|---|---|
-| Clone per exchange message | N allocs + N copies | 0 |
-| Merge all N into merged batch | O(M) copy | 0 |
-| Repartition | O(M) sequential scatter | O(M × N) merge-scatter ≈ O(4M) for N=4 |
-| Relay batch flag | no flag | `FLAG_BATCH_CONSOLIDATED` |
-| Post-plan seal per worker | O((M/N) log(M/N)) | O(1) short-circuit |
-| `op_reduce` `ConsolidatedScope` | O(1) (already consolidated) | O(1) |
-
-The master's repartition costs O(M × N) instead of O(M) — a factor of N overhead for
-the merge scan. For N=4 this is O(4M). This replaces N parallel worker seals at
-O((M/N) log(M/N)) wall-clock each. For M=10 000, N=4: master adds 4M ≈ 40 000 ops;
-workers save 4 × 25 000 × log(25 000)/2 ≈ 730 000 parallel ops (wall-clock ≈ 182 500).
-The merge overhead is recouped at M ≳ several hundred rows per push.
-
-For very small batches (M < ~50 per push), sequential scatter (`repartition_batches`
-without merge) is cheaper; `relay_scatter` provides the branch via the consolidated check.
+No-clone k-way merge relay. `repartition_batches` (sequential fallback) and
+`repartition_batches_merged` (linear-scan merge, N≤8) added to `exchange.py`.
+`relay_scatter` dispatches between them based on `_consolidated`. Collect loop in
+`fan_out_push` defers `payload.close()` until all N arrive; `_relay_exchange` reduced
+to 5-line orchestration calling `relay_scatter`. Peak exchange memory: O(2M) vs O(3M).
+Post-plan seal on consolidated relay sub-batches: O(1) short-circuit.
 
 ---
 
 ## Phase 4: Exchange round-trip elimination
 
 For `INPUT → SHARD → REDUCE` circuits (identity pre-plan), the entire exchange
-round-trip is eliminable. Depends on Phase 3 infrastructure; Phase 2c flag propagation
-is automatic after Phase 0d.
+round-trip is eliminable. Depends on Phase 3; Phase 2c flag propagation is automatic
+after Phase 0d.
 
-### The headline result
+### Infrastructure already done
 
-Phase 2c + Phase 4 compose to produce the maximum possible efficiency:
+- **`multi_scatter`** (`exchange.py`) — scatters one batch by multiple col-specs in one
+  pass; PK-spec sub-batches inherit `_consolidated`/`_sorted` from source. DONE.
+- **`join_shard_map`** (`runtime.py`) — `ExecutablePlan` carries `source_id →
+  [col_idx]` for join sharding, built in `compile_from_graph`. DONE.
+- **Multi-worker join executor branch** (`executor.py`) — detects `join_shard_map` and
+  exchanges before circuit execution. DONE.
 
-1. Client sends consolidated batch.
-2. `multi_scatter` with `[pk_index]` as first spec: sub-batches inherit `_consolidated`
-   (automatic in `multi_scatter`).
-3. `multi_scatter` with `shard_cols`: preloaded exchange sub-batches produced.
-4. Master sends `FLAG_PRELOADED_EXCHANGE` + `FLAG_PUSH` carrying consolidated flags.
-5. Worker's post-plan seal sees `_consolidated = True` → O(1) short-circuit.
-6. `op_reduce ConsolidatedScope` → O(1). `_argsort_delta` → O((M/N) log(M/N)) —
-   unavoidable group-by sort, the only remaining work.
+### Still to implement
 
-**For trivial pre-plan with consolidated input: zero extra sorts anywhere in the
-system.** Only the group-by sort in op_reduce remains.
+**4a — `get_exchange_info` + preloadable-view helper** (`program_cache.py`):
 
-This result depends on Phase 0b's PK guard establishing `hash_row_by_columns(batch, i,
-[pk_index])` ≡ `_partition_for_key(pk_lo, pk_hi)`. Without that structural identity,
-the co-partition condition below would require a separate correctness argument.
+Extend `get_shard_cols` to `get_exchange_info(view_id) → (shard_cols, is_trivial,
+is_co_partitioned)`. Add `_exchange_info_cache`; invalidate on `invalidate`/`invalidate_all`.
+`is_trivial` = SHARD has exactly 1 incoming edge from an in-degree-0 node.
+`is_co_partitioned` = `is_trivial and shard_cols == [source_pk_index]`.
 
-### Co-partitioned views: zero messages
+Add `get_preloadable_views(source_table_id) → [(view_id, shard_cols)]` — views where
+`is_trivial and not is_co_partitioned`. Co-partitioned views are excluded because their
+exchange is eliminated entirely on the worker side (4d); no master-side preload is needed
+or correct for them.
 
-A view V is **co-partitioned** with its source table T when `shard_cols == [pk_index]`
-(i.e., GROUP BY the primary key column). In this case PK routing and shard routing
-produce identical sub-batches — the preloaded exchange for worker w equals the push
-sub-batch for worker w.
-
-Detect in `get_exchange_info`: return `is_co_partitioned` flag alongside `is_trivial`.
-For co-partitioned views, master sends no `FLAG_PRELOADED_EXCHANGE`. Worker, on
-receiving `FLAG_PUSH` for table T, auto-stashes its push batch for each co-partitioned
-view depending on T:
+**4b — Combined `multi_scatter` `fan_out_push`** (`master.py`):
 
 ```python
-copart_views = self.program_cache.get_copartitioned_views(target_id)
-for vid in copart_views:
-    self.exchange_handler._stash[vid] = batch.clone()
-```
-
-When evaluate_dag calls `do_exchange` for that view, it returns the stash directly.
-No IPC at all: N fewer messages per push for each co-partitioned view.
-
-### Co-partitioned joins: same mechanism
-
-`plan.join_shard_map[source_id]` gives join shard cols. If
-`shard_cols == [source_schema.pk_index]`, the join rows are already on the correct
-worker (they arrived via PK routing, which equals join-key routing). In executor.py:
-
-```python
-shard_cols = plan.join_shard_map[source_id]
-if shard_cols == [incoming_delta._schema.pk_index]:
-    # Co-partitioned join: no exchange needed
-    out_delta = plan.execute_epoch(incoming_delta, source_id=source_id)
-else:
-    exchanged = exchange_handler.do_exchange(target_view_id, incoming_delta,
-                                             source_id=source_id)
-    out_delta = plan.execute_epoch(exchanged, source_id=source_id)
-```
-
-No new infrastructure. The same `shard_cols == [pk_index]` check handles both GROUP BY
-and JOIN co-partitioning.
-
-### Changes
-
-**`gnitz/catalog/program_cache.py`** — extend `get_shard_cols` to
-`get_exchange_info(view_id) → (shard_cols, is_trivial, is_co_partitioned)`:
-
-```python
-def get_exchange_info(self, view_id):
-    if view_id in self._exchange_info_cache:
-        return self._exchange_info_cache[view_id]
-    # load nodes, edges from system tables
-    # find SHARD node; collect shard_cols from params
-    # is_trivial = True iff SHARD has exactly 1 incoming edge from a node with in_degree 0
-    # is_co_partitioned = is_trivial and shard_cols == [source_pk_index]
-    result = (shard_cols, is_trivial, is_co_partitioned)
-    self._exchange_info_cache[view_id] = result
-    return result
-
-def get_shard_cols(self, view_id):
-    shard_cols, _, _ = self.get_exchange_info(view_id)
-    return shard_cols
-
-def get_trivial_exchange_views(self, source_table_id, registry):
-    """Returns (non_copartitioned, copartitioned) view lists."""
-    dep_map = self.get_dep_map(registry)
-    non_copart = []
-    copart = []
-    for vid in dep_map.get(source_table_id, []):
-        shard_cols, is_trivial, is_copart = self.get_exchange_info(vid)
-        if is_trivial and len(shard_cols) > 0:
-            if is_copart:
-                copart.append(vid)
-            else:
-                non_copart.append((vid, shard_cols))
-    return non_copart, copart
-
-def get_copartitioned_views(self, source_table_id, registry):
-    _, copart = self.get_trivial_exchange_views(source_table_id, registry)
-    return copart
-```
-
-Add `_exchange_info_cache = {}` to `__init__`; invalidate in `invalidate` /
-`invalidate_all`.
-
-**`gnitz/server/ipc.py`**:
-```python
-FLAG_PRELOADED_EXCHANGE = r_uint64(1 << 10)   # 1024
-```
-
-**`gnitz/server/master.py`** — `fan_out_push`: combined pass via `multi_scatter`:
-
-```python
-non_copart, copart = self.program_cache.get_trivial_exchange_views(target_id, registry)
-
-col_specs = [[schema.pk_index]] + [sc for _, sc in non_copart]
+preloadable = self.program_cache.get_preloadable_views(target_id)
+col_specs = [[schema.pk_index]] + [sc for _, sc in preloadable]
 all_batches = multi_scatter(batch, col_specs, self.num_workers, self.assignment)
 pk_batches = all_batches[0]
-
-# Send preloaded frames BEFORE FLAG_PUSH (FIFO ordering guarantees arrival order)
+# Send preloaded frames BEFORE FLAG_PUSH
 for w in range(self.num_workers):
-    for si, (vid, sc) in enumerate(non_copart):
-        ipc.send_batch(self.worker_fds[w], vid, all_batches[si + 1][w],
+    for si, (vid, sc) in enumerate(preloadable):
+        ipc.send_batch(self.worker_fds[w], vid, all_batches[si+1][w],
                        flags=ipc.FLAG_PRELOADED_EXCHANGE)
-    ipc.send_batch(self.worker_fds[w], target_id, pk_batches[w],
-                   flags=ipc.FLAG_PUSH)
+    ipc.send_batch(self.worker_fds[w], target_id, pk_batches[w], flags=ipc.FLAG_PUSH)
 ```
 
-Non-trivial views go through the Phase 3 relay path unchanged.
+Add `FLAG_PRELOADED_EXCHANGE = 1024` (plain int, consistent with `FLAG_PUSH = 32`,
+`FLAG_EXCHANGE = 16`, etc.) to `ipc.py`. Do NOT use `r_uint64(1 << 10)` — worker code
+does `flags = intmask(payload.flags)` and compares with plain-int flags; mixing with
+`r_uint64` would fail RPython annotation.
+Non-trivial views continue through the Phase 3 relay path.
 
-**`gnitz/server/worker.py`** — `WorkerExchangeHandler`:
+**4c — `WorkerExchangeHandler` stash + drain loop** (`worker.py`):
 
-```python
-class WorkerExchangeHandler(object):
-    def __init__(self, master_fd):
-        self.master_fd = master_fd
-        self._stash = {}   # view_id -> ArenaZSetBatch
-
-    def stash_preloaded(self, view_id, batch):
-        if batch is not None and batch.length() > 0:
-            self._stash[view_id] = batch.clone()
-
-    def do_exchange(self, view_id, batch, source_id=0):
-        if view_id in self._stash:
-            return self._stash.pop(view_id)
-        # Normal path (unchanged)
-        ...
-```
-
+Add `_stash = {}` dict and `stash_preloaded(view_id, batch)` to handler.
+`do_exchange`: check `_stash` first, pop and return if hit.
 `_handle_request`: drain all leading `FLAG_PRELOADED_EXCHANGE` frames before
-dispatching `FLAG_PUSH`:
+dispatching `FLAG_PUSH`.
+
+**4d — Co-partitioned exchange elimination (compile-time)** (`runtime.py`,
+`program_cache.py`, `executor.py`):
+
+The co-partition condition is fully knowable at compile time. Encoding it on
+`ExecutablePlan` keeps `evaluate_dag` O(1) and makes the plan self-describing.
+
+*`runtime.py`* — add two fields to `ExecutablePlan`:
 
 ```python
-while payload.flags & ipc.FLAG_PRELOADED_EXCHANGE:
-    self.exchange_handler.stash_preloaded(intmask(payload.target_id), payload.batch)
-    payload.close()
-    payload = ipc.receive_payload(self.master_fd)
-# continue with normal dispatch
+_immutable_fields_ = [..., "skip_exchange", "co_partitioned_join_sources"]
+
+def __init__(self, ..., skip_exchange=False, co_partitioned_join_sources=None):
+    ...
+    self.skip_exchange = skip_exchange
+    self.co_partitioned_join_sources = co_partitioned_join_sources
 ```
 
-### Impact
+*`program_cache.py` — `compile_from_graph`*, at the `OPCODE_EXCHANGE_SHARD` handler
+(already has `in_reg_id_for_exchange`, `state[_ST_INPUT_DELTA_REG_ID]`, `shard_cols`,
+`in_schema`):
 
-For `INPUT → SHARD → REDUCE` (every simple GROUP BY without WHERE or computed group
-expressions):
+```python
+is_trivial    = (in_reg_id_for_exchange == state[_ST_INPUT_DELTA_REG_ID])
+skip_exchange = (is_trivial and len(shard_cols) == 1
+                 and shard_cols[0] == in_schema.pk_index)
+pre_plan = runtime.ExecutablePlan(..., skip_exchange=skip_exchange)
+```
+
+At the `join_shard_map` build (already has `source_tid`, `reindex_col`):
+
+```python
+src_pk = self.registry.get_by_id(source_tid).schema.pk_index
+if reindex_col == src_pk:
+    co_partitioned_join_sources[source_tid] = True
+```
+
+Note: `shard_cols` does not exist in this scope — the local variable is `reindex_col`.
+`shard_cols` only exists inside the `OPCODE_EXCHANGE_SHARD` handler below.
+
+Pass `co_partitioned_join_sources` to the final `ExecutablePlan` constructor.
+
+*`executor.py` — `evaluate_dag`*: check both flags.
+
+For `exchange_post_plan` circuits — when `skip_exchange` is True, the pre-plan
+output is already correctly owned by this worker (trivial pre-plan + PK routing
+guarantee). No exchange is needed; use `pre_result` directly:
+
+```python
+if plan.exchange_post_plan is not None and exchange_handler is not None:
+    pre_result = plan.execute_epoch(incoming_delta, source_id=source_id)
+    incoming_delta.free()
+    if pre_result is None:
+        pre_result = ArenaZSetBatch(plan.out_schema)
+    if plan.skip_exchange:
+        out_delta = plan.exchange_post_plan.execute_epoch(pre_result)
+        pre_result.free()
+    else:
+        exchanged = exchange_handler.do_exchange(target_view_id, pre_result)
+        pre_result.free()
+        out_delta = plan.exchange_post_plan.execute_epoch(exchanged)
+        exchanged.free()
+```
+
+For join circuits — when `source_id` is in `co_partitioned_join_sources`, the
+incoming delta is already routed to the correct worker by `fan_out_push`:
+
+```python
+elif (plan.join_shard_map is not None and source_id in plan.join_shard_map
+      and exchange_handler is not None):
+    copart = (plan.co_partitioned_join_sources is not None
+              and source_id in plan.co_partitioned_join_sources)
+    if copart:
+        out_delta = plan.execute_epoch(incoming_delta, source_id=source_id)
+        incoming_delta.free()
+    else:
+        exchanged = exchange_handler.do_exchange(
+            target_view_id, incoming_delta, source_id=source_id)
+        incoming_delta.free()
+        out_delta = plan.execute_epoch(exchanged, source_id=source_id)
+        exchanged.free()
+```
+
+When `skip_exchange=True` or a co-partitioned join source is detected, the worker
+never sends `FLAG_EXCHANGE`. The master's poll loop in `fan_out_push` naturally
+receives an ACK for that worker without ever waiting for a `FLAG_EXCHANGE` from it —
+no master-side protocol change required.
+
+### Impact (after all 4 sub-items)
 
 | Metric | Before | After (non-copart) | After (co-partitioned) |
 |---|---|---|---|
-| IPC messages per push | 3N | N+1 (N preload + N push, pipelined) | N |
-| Round-trips | 2N | N | N |
-| Master work | O(2 × total_rows) | O(total_rows) one `multi_scatter` | O(total_rows) |
+| IPC messages per push | 3N | 2N (N preload + N push) | N (push only) |
+| `FLAG_PRELOADED_EXCHANGE` sent | no | yes | no |
+| `FLAG_EXCHANGE` sent | yes | no (stash hit) | no (skip_exchange) |
 | `_relay_exchange` called | yes | no | no |
-| Post-plan seal | O((M/N) log(M/N)) | O(1) short-circuit | O(1) short-circuit |
-| Extra sorts | 1 (redundant PK sort) | 0 | 0 |
+| Post-plan seal | O((M/N) log(M/N)) | O(1) | O(1) |
+| Extra sorts | 1 | 0 | 0 |
+
+The N-message co-partitioned result requires 4d's compile-time skip. A stash-based
+approach (sending `pk_batches[w]` as a preload for copart views) would be 2N — the
+same data sent twice — and cannot achieve N.
 
 ---
 
@@ -466,47 +325,22 @@ a per-worker WAL path with `truncate_before_lsn`.
 ## Implementation order
 
 ```
-Phase 0 ─── prerequisite for all phases ────────────────────────────────
-  [0a] Delete GATHER: OPCODE_EXCHANGE_GATHER, PARAM_GATHER_WORKER,
-       CircuitBuilder.gather(), GATHER arm in program_cache,
-       exchange_shard_cols from ExecutablePlan, shard_cols param from
-       do_exchange, else:_split_batch_by_pk from _relay_exchange
-       (opcodes.py, circuit_builder.py, program_cache.py, runtime.py,
-        executor.py, worker.py, master.py, ~-40 lines net)
-  [0b] Fix hash_row_by_columns + import _extract_group_key
-       delete _mix64 / _read_col_or_pk / _read_col_u128_parts / _hash_string_col
-       (exchange.py, linear.py, ~-50 lines net)
-  [0c] Move PartitionAssignment, add worker_for_pk, add relay_scatter,
-       delete _split_batch_by_pk, update all call sites
-       (exchange.py, master.py, main.py, ~-30 lines net)
-  [0d] Add multi_scatter              (exchange.py, ~30 lines)
-
+Phase 0 ─── DONE (cfbde4b..918d014) ────────────────────────────────────
 Phase 1 ─── DONE (b1641ce) ──────────────────────────────────────────────
-  [1a] Pre-allocation hints            DONE
-  [1b] Poll loop uniformity            DONE
-  [1c] Master-side index routing       DONE
-
 Phase 2 ─── DONE (0cdf59d) ──────────────────────────────────────────────
-  [2a] DDL ACK removal + broadcast_batch  DONE
-  [2b] Zero-copy WAL recovery             DONE
-  [2c] Batch property IPC flags           DONE
-       ↓ enables Phase 3
+Phase 3 ─── DONE ────────────────────────────────────────────────────────
 
-Phase 3 ─── sequential within phase ────────────────────────────────────
-  [3a] repartition_batches             (exchange.py, ~25 lines)
-  [3b] repartition_batches_merged + update relay_scatter to dispatch between
-       repartition_batches and repartition_batches_merged based on _consolidated
-                                       (exchange.py, ~45 lines)
-  [3c] Collect loop + _relay_exchange  (master.py, ~30 lines)
-       ↓ enables Phase 4
-
-Phase 4 ─── after Phase 3 ──────────────────────────────────────────────
-  [4a] get_exchange_info + co-partitioned detection
-                                       (program_cache.py, ~40 lines)
-  [4b] multi_scatter fan_out_push      (master.py, ~25 lines)
+Phase 4 ─── partial (multi_scatter + join_shard_map + executor branch done)
+  [4a] get_exchange_info + get_preloadable_views
+                                       (program_cache.py, ~30 lines)
+  [4b] FLAG_PRELOADED_EXCHANGE + multi_scatter fan_out_push
+                                       (ipc.py ~1 line, master.py ~20 lines)
   [4c] WorkerExchangeHandler stash +
        _handle_request drain loop      (worker.py, ~30 lines)
-  [4d] Co-partitioned join elimination (executor.py, ~8 lines)
+  [4d] Co-partitioned exchange elimination (compile-time skip_exchange +
+       co_partitioned_join_sources)    (runtime.py ~5 lines,
+                                        program_cache.py ~8 lines,
+                                        executor.py ~15 lines)
 
 Phase 5 ─── long-range ─────────────────────────────────────────────────
   [5a] Shared slot arena + scatter_to_slots
@@ -539,20 +373,19 @@ All tests run with `GNITZ_WORKERS=4`.
 **Phase 2:** DONE — `master_worker_test`, `storage_comprehensive_test`
 (`test_zero_copy_wal_recovery`), `exchange_test` (flag roundtrip + non-propagation).
 
-**Phase 3:**
-- `exchange_test` — `test_repartition_batches_merged`: N pre-sorted inputs with
-  disjoint PK ranges; assert dest sub-batches are consolidated.
-- `test_workers.py` — `test_exchange_relay_consolidated`: push rows to a GROUP BY
-  view; assert relay sub-batches arrive at workers with `_consolidated = True`.
+**Phase 3:** DONE — `exchange_test` (`test_repartition_batches_merged`),
+`test_workers.py` (`test_exchange_relay_consolidated`).
 
 **Phase 4:**
 - `test_workers.py` — `test_trivial_preplan_no_exchange`: create table T, view
   `SELECT group_col, COUNT(*) FROM T GROUP BY group_col`; push 100 rows across
   multiple transactions; assert correct COUNT per group; confirm `_relay_exchange`
   is never called for V (counter or log check).
-- `test_workers.py` — `test_copartitioned_view_no_preload`: create table T with PK
-  column `id`, view `SELECT id, COUNT(*) FROM T GROUP BY id`; verify no
-  `FLAG_PRELOADED_EXCHANGE` is sent (counter check); assert correct results.
+- `test_workers.py` — `test_copartitioned_view_no_exchange`: create table T with PK
+  column `id`, view `SELECT id, COUNT(*) FROM T GROUP BY id`; verify the compiled
+  plan has `skip_exchange=True`; verify no `FLAG_EXCHANGE` is ever sent (counter
+  check); assert correct results.
 - `test_workers.py` — `test_copartitioned_join`: JOIN on PK column; verify
-  `FLAG_EXCHANGE` is never sent; assert correct join results.
+  `co_partitioned_join_sources` contains the source table id; verify `FLAG_EXCHANGE`
+  is never sent; assert correct join results.
 - `test_workers.py::test_push_scan_multiworker` — regression for routing correctness.

@@ -34,6 +34,7 @@ FLAG_HAS_PK = 64
 FLAG_SEEK = 128
 FLAG_SEEK_BY_INDEX     = 256   # p4=col_idx, p5/p6=index_key; target_id=table_id
 FLAG_ALLOCATE_INDEX_ID = 512   # target_id=0; response carries new index_id in target_id
+FLAG_PRELOADED_EXCHANGE = 1024 # master pre-sends repartitioned batch before FLAG_PUSH
 FLAG_SCAN              = 0     # explicit name for "no flags" (no wire change)
 
 # --- New WAL-block wire format flags ---
