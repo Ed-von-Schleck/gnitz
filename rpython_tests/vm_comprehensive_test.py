@@ -1106,11 +1106,13 @@ def test_trace_register_refresh_compacts(base_dir):
         # refresh(): closes old cursor, calls compact_if_needed(), creates new cursor
         reg.refresh()
 
-        if len(tbl.index.handles) != 1:
+        if len(tbl.index.handles) != 0:
             raise Exception(
-                "refresh() must trigger compaction; expected 1 shard, got "
+                "refresh() must drain L0; expected 0 L0 handles after compaction, got "
                 + str(len(tbl.index.handles))
             )
+        if len(tbl.index.levels) == 0 or len(tbl.index.levels[0].guards) == 0:
+            raise Exception("refresh() must populate L1 guards after L0 compaction")
         if tbl.index.needs_compaction:
             raise Exception("needs_compaction must be False after refresh")
         if reg.cursor is None:
@@ -1127,11 +1129,11 @@ def test_trace_register_refresh_compacts(base_dir):
                 "Expected 5 rows via cursor after refresh, got " + str(row_count)
             )
 
-        # Second refresh: 1 shard (<= threshold 4) -> compact_if_needed() is no-op
+        # Second refresh: L0 empty -> compact_if_needed() is no-op
         reg.refresh()
-        if len(tbl.index.handles) != 1:
+        if len(tbl.index.handles) != 0:
             raise Exception(
-                "Second refresh must not re-compact; expected 1 shard, got "
+                "Second refresh must not re-compact; L0 must stay at 0, got "
                 + str(len(tbl.index.handles))
             )
         if reg.cursor is None:
