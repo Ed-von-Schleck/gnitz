@@ -42,11 +42,22 @@ def _copy_and_record(block_buf, src_ptr, size, offsets, sizes, idx):
     return idx + 1
 
 
-def encode_batch_to_buffer(block_buf, schema, lsn, table_id, batch):
+def encode_batch_append(block_buf, schema, lsn, table_id, batch):
+    """Append one WAL block to block_buf without resetting it.
+
+    Identical to encode_batch_to_buffer except:
+    - No block_buf.reset().
+    - block_start = block_buf.offset at entry; all directory offsets and
+      header pointers are relative to block_start, not to base_ptr.
+    - total_size stored in the header is the block's own byte count,
+      not block_buf.offset.
+
+    The sequential-scan decoder advances by the exact total_size from each
+    block's header, so no inter-block alignment is required.
     """
-    Serializes an ArenaZSetBatch into a WAL block buffer.
-    Layout: 48B header + column directory + 8-byte aligned data regions.
-    """
+    block_start = block_buf.offset                                   # capture first
+    block_buf.alloc(wal_layout.WAL_BLOCK_HEADER_SIZE, alignment=1)  # no gap before header
+
     count = batch.length()
 
     # Count data regions: pk_lo, pk_hi, weight, null, non-PK columns, blob
@@ -56,10 +67,6 @@ def encode_batch_to_buffer(block_buf, schema, lsn, table_id, batch):
         if i != schema.pk_index:
             num_non_pk += 1
     num_data_regions = 4 + num_non_pk + 1  # system + cols + blob
-
-    # Reset buffer and reserve header
-    block_buf.reset()
-    block_buf.alloc(wal_layout.WAL_BLOCK_HEADER_SIZE)
 
     # Reserve directory space
     dir_start = block_buf.offset
@@ -116,16 +123,18 @@ def encode_batch_to_buffer(block_buf, schema, lsn, table_id, batch):
         region_offsets, region_sizes, region_idx
     )
 
-    # Write directory entries (offset, size as u32 pairs)
+    # Write directory entries — block-relative offsets
     for ri in range(num_data_regions):
         dir_entry_ptr = rffi.ptradd(block_buf.base_ptr, dir_start + ri * 8)
         u32p = rffi.cast(rffi.UINTP, dir_entry_ptr)
-        u32p[0] = rffi.cast(rffi.UINT, region_offsets[ri])
+        u32p[0] = rffi.cast(rffi.UINT, region_offsets[ri] - block_start)
         u32p[1] = rffi.cast(rffi.UINT, region_sizes[ri])
 
     # Backfill header
-    total_size = block_buf.offset
-    header = wal_layout.WALBlockHeaderView(block_buf.base_ptr)
+    total_size = block_buf.offset - block_start
+    header = wal_layout.WALBlockHeaderView(
+        rffi.ptradd(block_buf.base_ptr, block_start)
+    )
     header.set_lsn(r_uint64(lsn))
     header.set_table_id(table_id)
     header.set_entry_count(count)
@@ -135,10 +144,20 @@ def encode_batch_to_buffer(block_buf, schema, lsn, table_id, batch):
     header.set_blob_size(r_uint64(blob_size))
 
     # Compute body checksum (everything after header)
-    body_ptr = rffi.ptradd(block_buf.base_ptr, wal_layout.WAL_BLOCK_HEADER_SIZE)
+    body_ptr = rffi.ptradd(block_buf.base_ptr,
+                           block_start + wal_layout.WAL_BLOCK_HEADER_SIZE)
     body_size = total_size - wal_layout.WAL_BLOCK_HEADER_SIZE
     if body_size > 0:
         header.set_checksum(xxh.compute_checksum(body_ptr, body_size))
+
+
+def encode_batch_to_buffer(block_buf, schema, lsn, table_id, batch):
+    """
+    Serializes an ArenaZSetBatch into a WAL block buffer.
+    Layout: 48B header + column directory + 8-byte aligned data regions.
+    """
+    block_buf.reset()
+    encode_batch_append(block_buf, schema, lsn, table_id, batch)
 
 
 def _parse_wal_block(ptr, total_size, schema):

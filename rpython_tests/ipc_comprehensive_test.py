@@ -461,6 +461,55 @@ def test_multi_string_column_roundtrip():
         s2.close()
 
 
+def test_long_column_name_roundtrip():
+    """Column names > 12 chars go to the blob arena (German String threshold).
+    The schema block may then end at a non-16-aligned offset, exercising the
+    schema->data block transition in encode_batch_append."""
+    os.write(1, "[IPC] Testing long column name roundtrip...\n")
+
+    schema = types.TableSchema(
+        [
+            types.ColumnDefinition(types.TYPE_U64,    name="primary_key_col"),   # 15 chars
+            types.ColumnDefinition(types.TYPE_I64,    name="measurement_value"), # 17 chars
+            types.ColumnDefinition(types.TYPE_STRING, name="description_text"),  # 16 chars
+        ],
+        pk_index=0,
+    )
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    try:
+        b = batch.ArenaZSetBatch(schema, initial_capacity=2)
+        rb = RowBuilder(schema, b)
+        rb.begin(r_uint128(r_uint64(1)), r_int64(1))
+        rb.put_int(r_int64(42))
+        rb.put_string("hello world!")
+        rb.commit()
+        rb.begin(r_uint128(r_uint64(2)), r_int64(1))
+        rb.put_int(r_int64(99))
+        rb.put_string("this is a longer string value")
+        rb.commit()
+
+        ipc.send_batch(s1.fd, 7, b, status=0)
+
+        payload = ipc.receive_payload(s2.fd)
+        assert_equal_i(0, payload.status, "Status mismatch")
+        assert_true(payload.batch is not None, "Batch should be present")
+        assert_equal_i(2, payload.batch.length(), "Row count mismatch")
+
+        acc = payload.batch.get_accessor(0)
+        assert_equal_i(42, intmask(r_uint64(acc.get_int(1))), "Row 0 col 1 mismatch")
+
+        acc = payload.batch.get_accessor(1)
+        length, prefix, sptr, hptr, py_s = acc.get_str_struct(2)
+        s = string_logic.resolve_string(sptr, hptr, py_s)
+        assert_true(s == "this is a longer string value", "Row 1 string mismatch")
+
+        payload.close()
+        b.free()
+    finally:
+        s1.close()
+        s2.close()
+
+
 def test_schema_mismatch():
     """Verifies that schema validation rejects mismatched schemas."""
     os.write(1, "[IPC] Testing V2 Schema Mismatch Detection...\n")
@@ -564,6 +613,7 @@ def entry_point(argv):
         test_string_roundtrip()
         test_null_strings()
         test_multi_string_column_roundtrip()
+        test_long_column_name_roundtrip()
         test_schema_mismatch()
         test_control_schema_roundtrip()
         os.write(1, "\nALL IPC TRANSPORT TESTS PASSED\n")

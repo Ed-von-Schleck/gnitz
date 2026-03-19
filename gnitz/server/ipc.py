@@ -35,6 +35,7 @@ FLAG_SEEK = 128
 FLAG_SEEK_BY_INDEX     = 256   # p4=col_idx, p5/p6=index_key; target_id=table_id
 FLAG_ALLOCATE_INDEX_ID = 512   # target_id=0; response carries new index_id in target_id
 FLAG_PRELOADED_EXCHANGE = 1024 # master pre-sends repartitioned batch before FLAG_PUSH
+FLAG_BACKFILL          = 2048  # master asks worker to scan source and backfill a view
 FLAG_SCAN              = 0     # explicit name for "no flags" (no wire change)
 
 # --- New WAL-block wire format flags ---
@@ -246,9 +247,7 @@ def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
         if zbatch._consolidated:
             ctrl_flags = ctrl_flags | FLAG_BATCH_CONSOLIDATED
 
-    ctrl_buf   = buffer_ops.Buffer(0)
-    schema_buf = buffer_ops.Buffer(0)
-    data_buf   = buffer_ops.Buffer(0)
+    wire_buf     = buffer_ops.Buffer(0)
     ctrl_batch   = None
     schema_batch = None
     try:
@@ -257,32 +256,27 @@ def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
             seek_pk_lo, seek_pk_hi, seek_col_idx,
             status, error_msg,
         )
-        wal_columnar.encode_batch_to_buffer(
-            ctrl_buf, CONTROL_SCHEMA, r_uint64(0), IPC_CONTROL_TID, ctrl_batch
+        wal_columnar.encode_batch_append(
+            wire_buf, CONTROL_SCHEMA, r_uint64(0), IPC_CONTROL_TID, ctrl_batch
         )
         ctrl_batch.free()
         ctrl_batch = None
-        ctrl_size = ctrl_buf.offset
 
-        schema_size = 0
         if has_schema:
             eff_schema = schema if schema is not None else zbatch._schema
             schema_batch = schema_to_batch(eff_schema)
-            wal_columnar.encode_batch_to_buffer(
-                schema_buf, META_SCHEMA, r_uint64(0), target_id, schema_batch
+            wal_columnar.encode_batch_append(
+                wire_buf, META_SCHEMA, r_uint64(0), target_id, schema_batch
             )
             schema_batch.free()
             schema_batch = None
-            schema_size = schema_buf.offset
 
-        data_size = 0
         if has_data:
-            wal_columnar.encode_batch_to_buffer(
-                data_buf, zbatch._schema, r_uint64(0), target_id, zbatch
+            wal_columnar.encode_batch_append(
+                wire_buf, zbatch._schema, r_uint64(0), target_id, zbatch
             )
-            data_size = data_buf.offset
 
-        total_size = ctrl_size + schema_size + data_size
+        total_size = wire_buf.offset
         if total_size == 0:
             total_size = wal_layout.WAL_BLOCK_HEADER_SIZE  # defensive floor
 
@@ -293,33 +287,18 @@ def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
             prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
             flags=mmap_posix.MAP_SHARED,
         )
-        if ctrl_size > 0:
-            buffer_ops.c_memmove(
-                rffi.cast(rffi.VOIDP, ptr),
-                rffi.cast(rffi.VOIDP, ctrl_buf.base_ptr),
-                rffi.cast(rffi.SIZE_T, ctrl_size),
-            )
-        if schema_size > 0:
-            buffer_ops.c_memmove(
-                rffi.cast(rffi.VOIDP, rffi.ptradd(ptr, ctrl_size)),
-                rffi.cast(rffi.VOIDP, schema_buf.base_ptr),
-                rffi.cast(rffi.SIZE_T, schema_size),
-            )
-        if data_size > 0:
-            buffer_ops.c_memmove(
-                rffi.cast(rffi.VOIDP, rffi.ptradd(ptr, ctrl_size + schema_size)),
-                rffi.cast(rffi.VOIDP, data_buf.base_ptr),
-                rffi.cast(rffi.SIZE_T, data_size),
-            )
+        buffer_ops.c_memmove(
+            rffi.cast(rffi.VOIDP, ptr),
+            rffi.cast(rffi.VOIDP, wire_buf.base_ptr),
+            rffi.cast(rffi.SIZE_T, total_size),
+        )
         mmap_posix.munmap_file(ptr, total_size)
     finally:
         if ctrl_batch is not None:
             ctrl_batch.free()
         if schema_batch is not None:
             schema_batch.free()
-        ctrl_buf.free()
-        schema_buf.free()
-        data_buf.free()
+        wire_buf.free()
 
     return fd, total_size
 
