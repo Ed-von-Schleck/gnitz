@@ -36,6 +36,8 @@ class Instruction(object):
         "group_idx",
         "agg_value_idx",
         "reindex_col",
+        "finalize_prog",
+        "fin_reg_out",
     ]
 
     def __init__(self, opcode):
@@ -62,6 +64,8 @@ class Instruction(object):
         self.group_idx = None
         self.agg_value_idx = None
         self.reindex_col = -1
+        self.finalize_prog = None
+        self.fin_reg_out = None
 
 
 # ── DBSP Algebraic Instructions ───────────────────────────────────────────
@@ -144,6 +148,8 @@ def reduce_op(
     group_by_cols, agg_funcs, output_schema,
     trace_in_group_idx=None,
     agg_value_idx=None,
+    finalize_prog=None,
+    fin_delta_reg=None,
 ):
     i = Instruction(op.OPCODE_REDUCE)
     i.reg_in = reg_in
@@ -155,6 +161,8 @@ def reduce_op(
     i.output_schema = output_schema
     i.trace_in_group_idx = trace_in_group_idx
     i.agg_value_idx = agg_value_idx
+    i.finalize_prog = finalize_prog
+    i.fin_reg_out = fin_delta_reg
     return i
 
 

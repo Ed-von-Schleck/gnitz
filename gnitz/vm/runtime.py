@@ -28,12 +28,12 @@ class BaseRegister(object):
 
 
 class DeltaRegister(BaseRegister):
-    """R_Delta: Holds transient Z-Set batches."""
+    """R_Delta: Holds transient Z-Set batches. Runtime-only; no compile-time
+    annotation fields permitted (see CircuitAnnotation for compile-time data)."""
     def __init__(self, reg_id, table_schema):
         BaseRegister.__init__(self, reg_id, table_schema)
         self._internal_batch = ArenaZSetBatch(table_schema)
         self.batch = self._internal_batch
-        self.is_distinct = False  # compile-time property; not used by RPython interpreter
 
     def is_delta(self): return True
 

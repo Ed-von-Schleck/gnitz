@@ -61,6 +61,6 @@ PARAM_JOIN_SOURCE_TABLE  = 11   # SCAN_TRACE: source table for multi-input circu
 PARAM_AGG_COUNT          = 12   # REDUCE: number of aggregate functions
 PARAM_AGG_SPEC_BASE      = 13   # REDUCE: packed (func_id << 32 | col_idx) per agg
 PARAM_PROJ_BASE      = 32  # MAP: slots 32..63 = source col index per output col
-PARAM_EXPR_BASE      = 64  # FILTER: slots 64..255 = expression bytecode words
+PARAM_EXPR_BASE      = 64  # FILTER, MAP: slots 64..255 = expression bytecode words
 PARAM_SHARD_COL_BASE = 128  # SHARD: slots 128..159 = shard column indices
 PARAM_CONST_STR_BASE = 160  # Slots 160-191: string constants for expressions

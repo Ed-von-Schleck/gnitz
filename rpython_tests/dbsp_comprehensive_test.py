@@ -2819,6 +2819,242 @@ def test_outer_join_delta_trace(base_dir):
 # ------------------------------------------------------------------------------
 
 
+def _make_avg_finalize_prog():
+    """ExprProgram: AVG = float(SUM) / float(COUNT).
+    Reads reduce_out cols: col0=grp(PK), col1=SUM(I64), col2=COUNT(I64).
+    Writes one F64 payload column to the finalized output.
+    """
+    from gnitz.dbsp.expr import (
+        ExprProgram,
+        EXPR_LOAD_COL_INT, EXPR_INT_TO_FLOAT, EXPR_FLOAT_DIV, EXPR_EMIT,
+    )
+    code = [
+        r_int64(EXPR_LOAD_COL_INT), r_int64(0), r_int64(1), r_int64(0),  # reg0 = col1 (SUM)
+        r_int64(EXPR_INT_TO_FLOAT), r_int64(1), r_int64(0), r_int64(0),  # reg1 = float(reg0)
+        r_int64(EXPR_LOAD_COL_INT), r_int64(2), r_int64(2), r_int64(0),  # reg2 = col2 (COUNT)
+        r_int64(EXPR_INT_TO_FLOAT), r_int64(3), r_int64(2), r_int64(0),  # reg3 = float(reg2)
+        r_int64(EXPR_FLOAT_DIV),    r_int64(4), r_int64(1), r_int64(3),  # reg4 = reg1 / reg3
+        r_int64(EXPR_EMIT),         r_int64(0), r_int64(4), r_int64(0),  # emit reg4
+    ]
+    return ExprProgram(code, 5, 0)
+
+
+def _make_finalized_schema():
+    """Output schema for AVG query: col0=grp(U64, PK), col1=avg(F64)."""
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="grp"))
+    cols.append(types.ColumnDefinition(types.TYPE_F64, name="avg"))
+    return types.TableSchema(cols, pk_index=0)
+
+
+def test_reduce_finalize_avg_incremental(base_dir):
+    """AVG finalize: retraction and re-emission on incremental inserts."""
+    log("[DBSP] Testing reduce finalize AVG incremental...")
+    in_schema = _make_reduce_schema()
+    fin_schema = _make_finalized_schema()
+    finalize_prog = _make_avg_finalize_prog()
+
+    sum_agg = functions.UniversalAccumulator(1, functions.AGG_SUM, types.TYPE_I64)
+    count_agg = functions.UniversalAccumulator(1, functions.AGG_COUNT, types.TYPE_I64)
+    agg_funcs = [sum_agg, count_agg]
+    out_schema = types._build_reduce_output_schema(in_schema, [0], agg_funcs)
+
+    t_in_path = os.path.join(base_dir, "avg_incr_in")
+    t_out_path = os.path.join(base_dir, "avg_incr_out")
+    trace_in = EphemeralTable(t_in_path, "in", in_schema)
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_raw = batch.ArenaZSetBatch(out_schema)
+    b_fin = batch.ArenaZSetBatch(fin_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+
+        # Tick 1: group 10, val=6 → SUM=6, COUNT=1, AVG=6.0
+        _add_row(rb, pk=1, grp=10, val=6, weight=1)
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(
+            b_in, in_schema, c_in, c_out,
+            b_raw,
+            [0], agg_funcs, out_schema,
+            finalize_prog=finalize_prog,
+            fin_out_writer=batch.BatchWriter(b_fin),
+        )
+
+        assert_equal_i(1, b_fin.length(), "T1: fin batch should have 1 row")
+        fin_acc = b_fin.get_accessor(0)
+        assert_equal_i64(r_int64(1), b_fin.get_weight(0), "T1: weight should be +1")
+        avg1 = fin_acc.get_float(1)
+        assert_true(avg1 == 6.0, "T1: AVG should be 6.0, got " + str(avg1))
+
+        trace_in.ingest_batch(b_in)
+        trace_out.ingest_batch(b_raw)
+        c_in.close()
+        c_out.close()
+
+        # Tick 2: group 10, val=4 → SUM=10, COUNT=2, AVG=5.0
+        b_in.clear()
+        b_raw.clear()
+        b_fin.clear()
+        sum_agg.reset()
+        count_agg.reset()
+        _add_row(rb, pk=2, grp=10, val=4, weight=1)
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(
+            b_in, in_schema, c_in, c_out,
+            b_raw,
+            [0], agg_funcs, out_schema,
+            finalize_prog=finalize_prog,
+            fin_out_writer=batch.BatchWriter(b_fin),
+        )
+        c_in.close()
+        c_out.close()
+
+        # Should have retraction (-1 for old AVG=6.0) and insertion (+1 for new AVG=5.0)
+        assert_equal_i(2, b_fin.length(), "T2: fin should have 2 rows")
+        found_retraction = False
+        found_new = False
+        for i in range(b_fin.length()):
+            w = b_fin.get_weight(i)
+            avg = b_fin.get_accessor(i).get_float(1)
+            if w == r_int64(-1):
+                assert_true(avg == 6.0, "T2: retraction AVG should be 6.0, got " + str(avg))
+                found_retraction = True
+            elif w == r_int64(1):
+                assert_true(avg == 5.0, "T2: new AVG should be 5.0, got " + str(avg))
+                found_new = True
+        assert_true(found_retraction, "T2: no retraction row found")
+        assert_true(found_new, "T2: no new-value row found")
+    finally:
+        b_in.free()
+        b_raw.free()
+        b_fin.free()
+        trace_in.close()
+        trace_out.close()
+    log("  PASSED")
+
+
+def test_reduce_finalize_avg_multi(base_dir):
+    """AVG finalize: two groups in one tick each produce correct AVG."""
+    log("[DBSP] Testing reduce finalize AVG multi-group...")
+    in_schema = _make_reduce_schema()
+    fin_schema = _make_finalized_schema()
+    finalize_prog = _make_avg_finalize_prog()
+
+    sum_agg = functions.UniversalAccumulator(1, functions.AGG_SUM, types.TYPE_I64)
+    count_agg = functions.UniversalAccumulator(1, functions.AGG_COUNT, types.TYPE_I64)
+    agg_funcs = [sum_agg, count_agg]
+    out_schema = types._build_reduce_output_schema(in_schema, [0], agg_funcs)
+
+    t_in_path = os.path.join(base_dir, "avg_multi_in")
+    t_out_path = os.path.join(base_dir, "avg_multi_out")
+    trace_in = EphemeralTable(t_in_path, "in", in_schema)
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_raw = batch.ArenaZSetBatch(out_schema)
+    b_fin = batch.ArenaZSetBatch(fin_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+        # Group 10: val=6, val=4 → SUM=10, COUNT=2, AVG=5.0
+        _add_row(rb, pk=1, grp=10, val=6, weight=1)
+        _add_row(rb, pk=2, grp=10, val=4, weight=1)
+        # Group 20: val=9 → SUM=9, COUNT=1, AVG=9.0
+        _add_row(rb, pk=3, grp=20, val=9, weight=1)
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        reduce.op_reduce(
+            b_in, in_schema, c_in, c_out,
+            b_raw,
+            [0], agg_funcs, out_schema,
+            finalize_prog=finalize_prog,
+            fin_out_writer=batch.BatchWriter(b_fin),
+        )
+        c_in.close()
+        c_out.close()
+
+        # Two groups → two insertions in fin_batch
+        assert_equal_i(2, b_fin.length(), "multi: expected 2 rows in fin batch")
+        found10 = False
+        found20 = False
+        for i in range(b_fin.length()):
+            w = b_fin.get_weight(i)
+            assert_equal_i64(r_int64(1), w, "multi: all weights should be +1")
+            grp_val = b_fin.get_pk(i)
+            avg = b_fin.get_accessor(i).get_float(1)
+            if grp_val == r_uint128(10):
+                assert_true(avg == 5.0, "multi: grp10 AVG should be 5.0, got " + str(avg))
+                found10 = True
+            elif grp_val == r_uint128(20):
+                assert_true(avg == 9.0, "multi: grp20 AVG should be 9.0, got " + str(avg))
+                found20 = True
+        assert_true(found10, "multi: grp10 row not found")
+        assert_true(found20, "multi: grp20 row not found")
+    finally:
+        b_in.free()
+        b_raw.free()
+        b_fin.free()
+        trace_in.close()
+        trace_out.close()
+    log("  PASSED")
+
+
+def test_reduce_finalize_fallback(base_dir):
+    """When finalize_prog=None, no rows go to fin_out_writer (fallback path)."""
+    log("[DBSP] Testing reduce finalize fallback (no finalize)...")
+    in_schema = _make_reduce_schema()
+    fin_schema = _make_finalized_schema()
+
+    sum_agg = functions.UniversalAccumulator(1, functions.AGG_SUM, types.TYPE_I64)
+    count_agg = functions.UniversalAccumulator(1, functions.AGG_COUNT, types.TYPE_I64)
+    agg_funcs = [sum_agg, count_agg]
+    out_schema = types._build_reduce_output_schema(in_schema, [0], agg_funcs)
+
+    t_in_path = os.path.join(base_dir, "avg_fallback_in")
+    t_out_path = os.path.join(base_dir, "avg_fallback_out")
+    trace_in = EphemeralTable(t_in_path, "in", in_schema)
+    trace_out = EphemeralTable(t_out_path, "out", out_schema)
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_raw = batch.ArenaZSetBatch(out_schema)
+    b_fin = batch.ArenaZSetBatch(fin_schema)
+
+    try:
+        rb = RowBuilder(in_schema, b_in)
+        _add_row(rb, pk=1, grp=10, val=6, weight=1)
+
+        c_in = trace_in.create_cursor()
+        c_out = trace_out.create_cursor()
+        # finalize_prog=None: only raw output produced, b_fin stays empty
+        reduce.op_reduce(
+            b_in, in_schema, c_in, c_out,
+            b_raw,
+            [0], agg_funcs, out_schema,
+        )
+        c_in.close()
+        c_out.close()
+
+        assert_equal_i(0, b_fin.length(), "fallback: fin batch should be empty")
+        assert_equal_i(1, b_raw.length(), "fallback: raw batch should have 1 row")
+        raw_acc = b_raw.get_accessor(0)
+        assert_equal_i64(r_int64(6), raw_acc.get_int_signed(1), "fallback: SUM=6")
+        assert_equal_i64(r_int64(1), raw_acc.get_int_signed(2), "fallback: COUNT=1")
+    finally:
+        b_in.free()
+        b_raw.free()
+        b_fin.free()
+        trace_in.close()
+        trace_out.close()
+    log("  PASSED")
+
+
 def entry_point(argv):
     ensure_jit_reachable()
     base_dir = "dbsp_test_data"
@@ -2873,6 +3109,9 @@ def entry_point(argv):
         test_clone_preserves_consolidated()
         test_union_sorted_merge()
         test_outer_join_delta_trace(base_dir)
+        test_reduce_finalize_avg_incremental(base_dir)
+        test_reduce_finalize_avg_multi(base_dir)
+        test_reduce_finalize_fallback(base_dir)
         log("\nALL DBSP TESTS PASSED")
     except Exception as e:
         os.write(2, "FAILURE\n")

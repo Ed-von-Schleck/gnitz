@@ -283,6 +283,9 @@ def run_vm(program, reg_file, context):
             reg_out = instr.reg_out
             assert reg_in is not None and reg_trace_out is not None and reg_out is not None
             trace_in_cursor = instr.reg_trace_in.cursor if instr.reg_trace_in else None
+            fin_out_writer = None
+            if instr.fin_reg_out is not None:
+                fin_out_writer = batch.BatchWriter(instr.fin_reg_out.batch)
             ops.op_reduce(
                 reg_in.batch,
                 reg_in.table_schema,
@@ -294,6 +297,8 @@ def run_vm(program, reg_file, context):
                 instr.output_schema,
                 instr.trace_in_group_idx,
                 instr.agg_value_idx,
+                instr.finalize_prog,
+                fin_out_writer,
             )
 
         pc += 1

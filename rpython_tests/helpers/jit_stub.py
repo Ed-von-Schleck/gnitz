@@ -18,9 +18,14 @@ from rpython.rlib import jit
 
 _stub_driver = jit.JitDriver(greens=[], reds=['n'])
 
-def ensure_jit_reachable():
-    """Satisfy warmspot's merge-point scan.  The loop body never executes."""
-    n = 0
+def _stub_loop(n):
+    # n is a parameter, so the flowspace cannot constant-fold the condition
+    # away — the loop body stays in the flow graph and warmspot finds the
+    # merge point.  At runtime n is always 0, so the body never executes.
     while n > 0:
         _stub_driver.jit_merge_point(n=n)
         n -= 1
+
+def ensure_jit_reachable():
+    """Satisfy warmspot's merge-point scan.  The loop body never executes."""
+    _stub_loop(0)

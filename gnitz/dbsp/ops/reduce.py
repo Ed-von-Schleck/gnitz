@@ -324,6 +324,19 @@ def _apply_agg_from_value_index(avi_cursor, gc_u64, for_max, agg_col_type, agg_f
     return False
 
 
+def _emit_reduce_row(out_writer, fin_out_writer, group_key, weight, reduce_acc,
+                     finalize_prog):
+    """Emit one raw row + optionally a finalized row (for AVG etc.)."""
+    out_writer.append_from_accessor(group_key, weight, reduce_acc)
+    if finalize_prog is not None and fin_out_writer is not None:
+        from gnitz.core.batch import RowBuilder
+        from gnitz.dbsp.expr import eval_expr_map
+        finalized_schema = fin_out_writer._batch._schema
+        builder = RowBuilder(finalized_schema, fin_out_writer._batch)
+        eval_expr_map(finalize_prog, reduce_acc, builder)
+        builder.commit_row(group_key, weight)
+
+
 def op_reduce(
     delta_in,
     input_schema,
@@ -335,11 +348,16 @@ def op_reduce(
     output_schema,
     trace_in_group_idx=None,
     agg_value_idx=None,
+    finalize_prog=None,
+    fin_out_writer=None,
 ):
     """
     Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
 
     agg_funcs: list of AggregateFunction (one per aggregate column).
+    finalize_prog: optional ExprProgram applied to reduce_acc at both emission
+                   sites, writing finalized rows to fin_out_writer.
+    fin_out_writer: BatchWriter for the finalized output register (or None).
     """
     if agg_funcs is None:
         return
@@ -438,7 +456,8 @@ def op_reduce(
                     old_vals_bits.append(trace_acc.get_int(agg_col_idx))
 
                 reduce_acc.set_context(acc_exemplar, agg_funcs, old_vals_bits, True)
-                out_writer.append_from_accessor(group_key, r_int64(-1), reduce_acc)
+                _emit_reduce_row(out_writer, fin_out_writer, group_key, r_int64(-1),
+                                 reduce_acc, finalize_prog)
 
             # 5. New Value Calculation: Agg(history + delta)
             if all_linear and has_old:
@@ -539,7 +558,8 @@ def op_reduce(
                     break
             if any_nonzero:
                 reduce_acc.set_context(acc_exemplar, agg_funcs, dummy_old_vals, False)
-                out_writer.append_from_accessor(group_key, r_int64(1), reduce_acc)
+                _emit_reduce_row(out_writer, fin_out_writer, group_key, r_int64(1),
+                                 reduce_acc, finalize_prog)
 
         if gi_cursor is not None:
             gi_cursor.close()

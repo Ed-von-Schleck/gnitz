@@ -969,12 +969,19 @@ class BatchWriter(object):
 
     def consolidate(self):
         """Consolidate the output batch in place, merging duplicate (PK, payload) pairs.
-        Frees the pre-consolidation batch if a new one was allocated."""
+
+        Compacts rows back into the same ArenaZSetBatch object so that the
+        register pointer (DeltaRegister.batch = DeltaRegister._internal_batch)
+        remains valid after the call.  Replacing self._batch would leave the
+        register with a dangling pointer to the freed old batch."""
         old = self._batch
+        if old._count == 0 or old._consolidated:
+            return
         new = old.to_consolidated()
-        if new is not old:
-            self._batch = new
-            old.free()
+        old.clear()
+        old.append_batch(new)
+        old.mark_consolidated(True)
+        new.free()
 
 
 # ---------------------------------------------------------------------------

@@ -48,20 +48,23 @@ def _open_system_scan(registry, table_id, view_id):
     return cursor, end_key
 
 def _topo_sort(nodes, edges):
-    """Kahn's algorithm. Returns (ordered, outgoing, incoming) or raises LayoutError on cycle."""
+    """Kahn's algorithm. Returns (ordered, outgoing, incoming, consumers) or raises LayoutError on cycle."""
     node_ids = newlist_hint(len(nodes))
     outgoing = {}
     incoming = {}
+    consumers = {}
     in_degree = {}
     for nid, _ in nodes:
         node_ids.append(nid)
         outgoing[nid] = []
         incoming[nid] = []
+        consumers[nid] = []
         in_degree[nid] = 0
 
     for _, src, dst, port in edges:
         outgoing[src].append((dst, port))
         incoming[dst].append(src)
+        consumers[src].append(dst)
         in_degree[dst] += 1
 
     queue = []
@@ -81,7 +84,277 @@ def _topo_sort(nodes, edges):
     if len(ordered) != len(node_ids):
         raise LayoutError("View graph contains cycles (not a DAG)")
 
-    return ordered, outgoing, incoming
+    return ordered, outgoing, incoming, consumers
+
+
+class CircuitGraph(object):
+    """Wraps circuit graph data with derived topology for compiler passes."""
+    def __init__(self, view_id, nodes, edges, sources, params,
+                 str_params, group_cols, out_schema):
+        self.view_id = view_id
+        self.nodes = nodes           # [(nid, opcode), ...]
+        self.edges = edges           # [(eid, src, dst, port), ...]
+        self.sources = sources       # {nid: table_id}
+        self.params = params         # {nid: {slot: int_value}}
+        self.str_params = str_params # {nid: {slot: str_value}}
+        self.group_cols = group_cols # {nid: [col_idx]}
+        self.out_schema = out_schema
+        self.opcode_of = {}
+        self.ordered = []
+        self.outgoing = {}
+        self.incoming = {}
+        self.consumers = {}
+
+
+def _build_circuit_graph(view_id, nodes, edges, sources, params,
+                         str_params, group_cols, out_schema):
+    graph = CircuitGraph(view_id, nodes, edges, sources, params,
+                         str_params, group_cols, out_schema)
+    for nid, op in nodes:
+        graph.opcode_of[nid] = op
+    (graph.ordered, graph.outgoing,
+     graph.incoming, graph.consumers) = _topo_sort(nodes, edges)
+    return graph
+
+
+class CircuitAnnotation(object):
+    """Consolidates all pre-pass results for a circuit graph."""
+    def __init__(self):
+        self.trace_side_sources = {}  # {nid: True}
+        self.in_schema = None
+        self.join_shard_map = {}
+        self.co_partitioned = {}
+        self.is_distinct_at = {}      # {nid: True}
+
+
+class Rewrites(object):
+    """Collects optimization decisions before instruction emission."""
+    def __init__(self):
+        self.skip_nodes = {}     # {nid: True} — emit nothing, alias output reg to input
+        self.fold_finalize = {}  # {reduce_nid: ExprProgram}
+        self.folded_maps = {}    # {map_nid: reduce_nid}
+
+
+def _compute_trace_sides(graph):
+    """Identify SCAN_TRACE nodes that feed trace ports of join/seek ops."""
+    trace_side_sources = {}
+    for _, src, dst, port in graph.edges:
+        if graph.opcode_of.get(src, -1) == opcodes.OPCODE_SCAN_TRACE:
+            if port == opcodes.PORT_TRACE:
+                dst_op = graph.opcode_of.get(dst, -1)
+                if (dst_op == opcodes.OPCODE_JOIN_DELTA_TRACE or
+                    dst_op == opcodes.OPCODE_JOIN_DELTA_TRACE_OUTER or
+                    dst_op == opcodes.OPCODE_ANTI_JOIN_DELTA_TRACE or
+                    dst_op == opcodes.OPCODE_SEMI_JOIN_DELTA_TRACE or
+                    dst_op == opcodes.OPCODE_SEEK_TRACE):
+                    trace_side_sources[src] = True
+    return trace_side_sources
+
+
+def _compute_join_shard_map(graph, trace_side_sources):
+    """Build source_table_id → [reindex_col] for multi-input join circuits."""
+    join_shard_map = {}
+    for _, src, dst, _port in graph.edges:
+        if graph.opcode_of.get(src, -1) == opcodes.OPCODE_SCAN_TRACE:
+            src_params = graph.params.get(src, {})
+            source_tid = src_params.get(opcodes.PARAM_JOIN_SOURCE_TABLE, 0)
+            if source_tid > 0 and graph.opcode_of.get(dst, -1) == opcodes.OPCODE_MAP:
+                dst_params = graph.params.get(dst, {})
+                reindex_col = dst_params.get(opcodes.PARAM_REINDEX_COL, -1)
+                if reindex_col >= 0:
+                    join_shard_map[source_tid] = [reindex_col]
+    return join_shard_map
+
+
+def _compute_co_partitioned(graph, registry, join_shard_map):
+    """Build source_table_id → True when join shard col == source PK."""
+    co_partitioned = {}
+    for source_tid in join_shard_map:
+        cols = join_shard_map[source_tid]
+        if registry.has_id(source_tid):
+            src_pk = registry.get_by_id(source_tid).schema.pk_index
+            if len(cols) == 1 and cols[0] == src_pk:
+                co_partitioned[source_tid] = True
+    return co_partitioned
+
+
+def _produces_distinct(op):
+    """True if this operator always outputs at-most-one-row-per-key."""
+    return op == opcodes.OPCODE_REDUCE or op == opcodes.OPCODE_DISTINCT
+
+
+def _preserves_distinct(op, node_params):
+    """True if this operator outputs a distinct batch when its single input is distinct."""
+    if op == opcodes.OPCODE_FILTER:
+        return True
+    if op == opcodes.OPCODE_MAP:
+        return node_params.get(opcodes.PARAM_REINDEX_COL, -1) < 0
+    return False
+
+
+def _propagate_distinct(graph, ann):
+    """Forward pass: mark nodes whose output is at-most-one-row-per-key."""
+    for nid in graph.ordered:
+        op = graph.opcode_of.get(nid, -1)
+        if _produces_distinct(op):
+            ann.is_distinct_at[nid] = True
+        elif _preserves_distinct(op, graph.params.get(nid, {})):
+            in_nids = graph.incoming.get(nid, [])
+            if in_nids and ann.is_distinct_at.get(in_nids[0], False):
+                ann.is_distinct_at[nid] = True
+
+
+def _resolve_primary_input_schema(registry, program_id, fallback,
+                                  circuit_sources, trace_side_sources):
+    """Resolve the schema of the primary input (delta) source for a view.
+
+    Uses CircuitSources + trace_side_sources to identify the primary
+    input table.  The primary input node has table_id==0 (sentinel),
+    so we find its actual table from DepTab — specifically, the
+    dependency that is NOT a trace-side source table.
+    """
+    # Collect table IDs that feed trace ports
+    trace_table_ids = {}
+    for nid in trace_side_sources:
+        tid = circuit_sources.get(nid, 0)
+        if tid > 0:
+            trace_table_ids[tid] = True
+
+    # DepTab uses (view_id << 64 | dep_tid) PK — range scan by view_id
+    cursor, end_key = _open_system_scan(registry, sys.DepTab.ID, program_id)
+    if cursor is None:
+        if fallback is not None:
+            return fallback
+        raise LayoutError("Cannot resolve primary input schema for view %d: "
+                          "no DepTab" % program_id)
+    any_dep_schema = None
+    try:
+        while cursor.is_valid() and cursor.key() < end_key:
+            if cursor.weight() > r_int64(0):
+                acc = cursor.get_accessor()
+                dep_tid = intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID))
+                if dep_tid > 0 and registry.has_id(dep_tid):
+                    dep_schema = registry.get_by_id(dep_tid).schema
+                    if any_dep_schema is None:
+                        any_dep_schema = dep_schema
+                    if dep_tid not in trace_table_ids:
+                        return dep_schema
+            cursor.advance()
+    finally:
+        cursor.close()
+
+    # Self-join fallback: primary and trace are the same table,
+    # so all deps are in trace_table_ids. Any dep works.
+    if any_dep_schema is not None:
+        return any_dep_schema
+    if fallback is not None:
+        return fallback
+    raise LayoutError("Cannot resolve primary input schema for view %d: "
+                      "no source found" % program_id)
+
+
+def _annotate(graph, registry):
+    """Run all pre-passes and return a CircuitAnnotation."""
+    ann = CircuitAnnotation()
+    ann.trace_side_sources = _compute_trace_sides(graph)
+    ann.in_schema = _resolve_primary_input_schema(
+        registry, graph.view_id, graph.out_schema,
+        graph.sources, ann.trace_side_sources)
+    ann.join_shard_map = _compute_join_shard_map(graph, ann.trace_side_sources)
+    ann.co_partitioned = _compute_co_partitioned(graph, registry, ann.join_shard_map)
+    _propagate_distinct(graph, ann)
+    return ann
+
+
+def _extract_map_code(node_params):
+    """Extract ExprProgram bytecode words from node params."""
+    code = []
+    idx = 0
+    while (opcodes.PARAM_EXPR_BASE + idx) in node_params:
+        code.append(r_int64(node_params[opcodes.PARAM_EXPR_BASE + idx]))
+        idx += 1
+    return code
+
+
+def _all_copy_col_sequential(code):
+    """True iff every instruction is COPY_COL with a1 = 1, 2, 3, ... in order.
+
+    COPY_COL layout: [op, dst=type_code, a1=src_col_idx, a2=payload_col_idx]
+    op_map inherits the PK from its input via commit_row(get_pk(i), ...);
+    the ExprProgram only writes payload columns. a1 must start at 1
+    (skipping PK at col 0) and increment by 1 per instruction.
+    """
+    from gnitz.dbsp.expr import EXPR_COPY_COL
+    n = len(code)
+    if n == 0 or n % 4 != 0:
+        return False
+    expected_src = 1
+    i = 0
+    while i < n:
+        if intmask(code[i]) != EXPR_COPY_COL:
+            return False
+        if intmask(code[i + 2]) != expected_src:
+            return False
+        expected_src += 1
+        i += 4
+    return True
+
+
+def _schemas_physically_identical(a, b):
+    """True if two schemas have the same column count, PK index, and column types."""
+    if len(a.columns) != len(b.columns):
+        return False
+    if a.pk_index != b.pk_index:
+        return False
+    for i in range(len(a.columns)):
+        if a.columns[i].field_type.code != b.columns[i].field_type.code:
+            return False
+    return True
+
+
+def _opt_distinct(graph, ann, rw):
+    """Mark DISTINCT nodes that can be skipped because input is already distinct."""
+    for nid, op in graph.nodes:
+        if op == opcodes.OPCODE_DISTINCT:
+            in_nids = graph.incoming.get(nid, [])
+            if in_nids and ann.is_distinct_at.get(in_nids[0], False):
+                rw.skip_nodes[nid] = True
+
+
+def _opt_fold_reduce_map(graph, ann, rw):
+    """Fold computed MAP nodes into their upstream REDUCE as a finalize ExprProgram."""
+    for nid, op in graph.nodes:
+        if op != opcodes.OPCODE_MAP:
+            continue
+        in_nids = graph.incoming.get(nid, [])
+        if len(in_nids) != 1:
+            continue
+        reduce_nid = in_nids[0]
+        if graph.opcode_of.get(reduce_nid, -1) != opcodes.OPCODE_REDUCE:
+            continue
+        if len(graph.consumers.get(reduce_nid, [])) != 1:
+            continue
+        node_params = graph.params.get(nid, {})
+        num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
+        has_code = num_regs > 0 or opcodes.PARAM_EXPR_BASE in node_params
+        if not has_code:
+            continue
+        code = _extract_map_code(node_params)
+        if _all_copy_col_sequential(code):
+            continue   # identity MAP handled inline in _emit_node
+        if len(code) <= 63:
+            from gnitz.dbsp.expr import ExprProgram
+            prog = ExprProgram(code, num_regs, 0)
+            rw.fold_finalize[reduce_nid] = prog
+            rw.folded_maps[nid] = reduce_nid
+
+
+def run_optimization_passes(graph, ann):
+    """Run all optimization passes. Returns a Rewrites object."""
+    rw = Rewrites()
+    _opt_distinct(graph, ann, rw)
+    _opt_fold_reduce_map(graph, ann, rw)
+    return rw
 
 
 class ProgramCache(object):
@@ -414,58 +687,10 @@ class ProgramCache(object):
                 result.append((view_id, shard_cols))
         return result
 
-    def _resolve_primary_input_schema(self, program_id, fallback,
-                                      circuit_sources, trace_side_sources):
-        """Resolve the schema of the primary input (delta) source for a view.
-
-        Uses CircuitSources + trace_side_sources to identify the primary
-        input table.  The primary input node has table_id==0 (sentinel),
-        so we find its actual table from DepTab — specifically, the
-        dependency that is NOT a trace-side source table.
-        """
-        # Collect table IDs that feed trace ports
-        trace_table_ids = {}
-        for nid in trace_side_sources:
-            tid = circuit_sources.get(nid, 0)
-            if tid > 0:
-                trace_table_ids[tid] = True
-
-        # DepTab uses (view_id << 64 | dep_tid) PK — range scan by view_id
-        cursor, end_key = _open_system_scan(self.registry, sys.DepTab.ID, program_id)
-        if cursor is None:
-            if fallback is not None:
-                return fallback
-            raise LayoutError("Cannot resolve primary input schema for view %d: "
-                              "no DepTab" % program_id)
-        any_dep_schema = None
-        try:
-            while cursor.is_valid() and cursor.key() < end_key:
-                if cursor.weight() > r_int64(0):
-                    acc = cursor.get_accessor()
-                    dep_tid = intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID))
-                    if dep_tid > 0 and self.registry.has_id(dep_tid):
-                        dep_schema = self.registry.get_by_id(dep_tid).schema
-                        if any_dep_schema is None:
-                            any_dep_schema = dep_schema
-                        if dep_tid not in trace_table_ids:
-                            return dep_schema
-                cursor.advance()
-        finally:
-            cursor.close()
-
-        # Self-join fallback: primary and trace are the same table,
-        # so all deps are in trace_table_ids. Any dep works.
-        if any_dep_schema is not None:
-            return any_dep_schema
-        if fallback is not None:
-            return fallback
-        raise LayoutError("Cannot resolve primary input schema for view %d: "
-                          "no source found" % program_id)
-
     def _emit_node(self, nid, op, reg_id, node_params, in_regs,
                    cur_reg_file, out_reg_of, sources, trace_side_sources,
                    group_cols, view_family, view_id, out_schema, in_schema,
-                   program, state, str_params, source_reg_map=None):
+                   program, state, str_params, rw, source_reg_map=None):
         """Emit a single operator node. Returns instruction or None.
 
         state: mutable list [next_extra_reg, sink_reg_id, input_delta_reg_id].
@@ -512,7 +737,6 @@ class ProgramCache(object):
         elif op == opcodes.OPCODE_FILTER:
             in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
             out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
-            out_reg.is_distinct = in_reg.is_distinct
             cur_reg_file.registers[reg_id] = out_reg
             num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
             if num_regs > 0:
@@ -538,8 +762,23 @@ class ProgramCache(object):
 
         elif op == opcodes.OPCODE_MAP:
             in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
+            reindex_col_check = node_params.get(opcodes.PARAM_REINDEX_COL, -1)
             num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
             has_expr_code = num_regs > 0 or opcodes.PARAM_EXPR_BASE in node_params
+
+            # Identity fast-path: schemas match physically and program is pure column copy.
+            if reindex_col_check < 0 and has_expr_code:
+                if _schemas_physically_identical(in_reg.table_schema, view_family.schema):
+                    code = _extract_map_code(node_params)
+                    if _all_copy_col_sequential(code):
+                        out_reg_of[nid] = in_regs[opcodes.PORT_IN]
+                        return None
+
+            # Folded MAP: computed MAP folded into REDUCE's finalize program.
+            if nid in rw.folded_maps:
+                reduce_nid = rw.folded_maps[nid]
+                out_reg_of[nid] = out_reg_of[reduce_nid]
+                return None
 
             if has_expr_code:
                 # Expr-map mode (Phase 4: computed projections)
@@ -632,7 +871,7 @@ class ProgramCache(object):
 
             # Compile-time elimination: skip when input is already at set semantics.
             # No history table is created; output aliases the input register.
-            if in_reg.is_distinct:
+            if nid in rw.skip_nodes:
                 out_reg_of[nid] = in_regs[opcodes.PORT_IN_DISTINCT]
                 return None
 
@@ -643,7 +882,6 @@ class ProgramCache(object):
             out_delta_id = state[_ST_NEXT_EXTRA_REG]
             state[_ST_NEXT_EXTRA_REG] += 1
             out_delta_reg = runtime.DeltaRegister(out_delta_id, in_reg.table_schema)
-            out_delta_reg.is_distinct = True
             cur_reg_file.registers[out_delta_id] = out_delta_reg
             out_reg_of[nid] = out_delta_id
             return instructions.distinct_op(in_reg, hist_reg, out_delta_reg)
@@ -678,12 +916,20 @@ class ProgramCache(object):
             trace_table = view_family.store.create_child("_reduce_%d_%d" % (view_id, nid), reduce_out_schema)
             tr_out_reg = runtime.TraceRegister(reg_id, reduce_out_schema, trace_table.create_cursor(), trace_table)
             cur_reg_file.registers[reg_id] = tr_out_reg
-            out_delta_id = state[_ST_NEXT_EXTRA_REG]
+            raw_delta_id = state[_ST_NEXT_EXTRA_REG]
             state[_ST_NEXT_EXTRA_REG] += 1
-            out_delta_reg = runtime.DeltaRegister(out_delta_id, reduce_out_schema)
-            out_delta_reg.is_distinct = True
-            cur_reg_file.registers[out_delta_id] = out_delta_reg
-            out_reg_of[nid] = out_delta_id
+            raw_delta_reg = runtime.DeltaRegister(raw_delta_id, reduce_out_schema)
+            cur_reg_file.registers[raw_delta_id] = raw_delta_reg
+            finalize_prog = rw.fold_finalize.get(nid, None)
+            fin_delta_reg = None
+            if finalize_prog is not None:
+                fin_delta_id = state[_ST_NEXT_EXTRA_REG]
+                state[_ST_NEXT_EXTRA_REG] += 1
+                fin_delta_reg = runtime.DeltaRegister(fin_delta_id, view_family.schema)
+                cur_reg_file.registers[fin_delta_id] = fin_delta_reg
+                out_reg_of[nid] = fin_delta_id
+            else:
+                out_reg_of[nid] = raw_delta_id
             tr_in_reg = None
             tr_in_table = None
             all_linear = True
@@ -744,17 +990,19 @@ class ProgramCache(object):
                 program.append(instructions.integrate_op(in_reg, None,
                                                          agg_value_idx=agg_val_idx))
             reduce_instr = instructions.reduce_op(
-                in_reg, tr_in_reg, tr_out_reg, out_delta_reg,
+                in_reg, tr_in_reg, tr_out_reg, raw_delta_reg,
                 gcols, agg_funcs, reduce_out_schema,
                 trace_in_group_idx=grp_idx,
                 agg_value_idx=agg_val_idx,
+                finalize_prog=finalize_prog,
+                fin_delta_reg=fin_delta_reg,
             )
             program.append(reduce_instr)
             if tr_in_table is not None:
                 program.append(instructions.integrate_op(in_reg, tr_in_table,
                                                          group_idx=grp_idx,
                                                          agg_value_idx=agg_val_idx))
-            return instructions.integrate_op(out_delta_reg, trace_table)
+            return instructions.integrate_op(raw_delta_reg, trace_table)
 
         elif op == opcodes.OPCODE_INTEGRATE:
             in_reg_id = in_regs[opcodes.PORT_IN]
@@ -838,62 +1086,27 @@ class ProgramCache(object):
         view_family = self.registry.get_by_id(view_id)
         out_schema = view_family.schema
 
-        # 1. Topological sort
-        opcode_of = {}
-        for nid, op in nodes:
-            opcode_of[nid] = op
-
+        # 1. Build circuit graph + topological sort
         try:
-            ordered, outgoing, incoming = _topo_sort(nodes, edges)
+            graph = _build_circuit_graph(view_id, nodes, edges, sources, params,
+                                         str_params, group_cols, out_schema)
         except LayoutError:
             return None
 
-        # 2. Identify trace-side source nodes (must be before schema resolution)
-        trace_side_sources = {}
-        for _, src, dst, port in edges:
-            if opcode_of.get(src, -1) == opcodes.OPCODE_SCAN_TRACE:
-                if port == opcodes.PORT_TRACE:
-                    # Only treat as trace-side if the destination actually
-                    # consumes a cursor (join/anti_join/semi_join delta_trace,
-                    # seek_trace).  PORT_TRACE == PORT_IN_B == 1, so without
-                    # this check, UNION's B input would be misidentified.
-                    dst_op = opcode_of.get(dst, -1)
-                    if (dst_op == opcodes.OPCODE_JOIN_DELTA_TRACE or
-                        dst_op == opcodes.OPCODE_JOIN_DELTA_TRACE_OUTER or
-                        dst_op == opcodes.OPCODE_ANTI_JOIN_DELTA_TRACE or
-                        dst_op == opcodes.OPCODE_SEMI_JOIN_DELTA_TRACE or
-                        dst_op == opcodes.OPCODE_SEEK_TRACE):
-                        trace_side_sources[src] = True
+        opcode_of = graph.opcode_of
+        ordered = graph.ordered
 
-        in_schema = self._resolve_primary_input_schema(view_id, out_schema,
-                                                       sources,
-                                                       trace_side_sources)
+        # 2. Annotate (trace sides, schemas, distinctness)
+        ann = _annotate(graph, self.registry)
+        in_schema = ann.in_schema
+        trace_side_sources = ann.trace_side_sources
+        join_shard_map = ann.join_shard_map
+        co_partitioned_join_sources = ann.co_partitioned
 
-        # 2b. Build join_shard_map: source_table_id → [reindex_col]
-        # For multi-input join circuits, this tells evaluate_dag which column
-        # to shard by when exchanging the raw source delta.
-        join_shard_map = {}
-        for _, src, dst, _port in edges:
-            if opcode_of.get(src, -1) == opcodes.OPCODE_SCAN_TRACE:
-                src_params = params.get(src, {})
-                source_tid = src_params.get(opcodes.PARAM_JOIN_SOURCE_TABLE, 0)
-                if source_tid > 0 and opcode_of.get(dst, -1) == opcodes.OPCODE_MAP:
-                    dst_params = params.get(dst, {})
-                    reindex_col = dst_params.get(opcodes.PARAM_REINDEX_COL, -1)
-                    if reindex_col >= 0:
-                        join_shard_map[source_tid] = [reindex_col]
+        # 3. Optimization passes
+        rw = run_optimization_passes(graph, ann)
 
-        # 2c. co_partitioned_join_sources: source_table_id → True
-        # when join shard col == source PK (exchange eliminable at runtime).
-        co_partitioned_join_sources = {}
-        for source_tid in join_shard_map:
-            cols = join_shard_map[source_tid]
-            if self.registry.has_id(source_tid):
-                src_pk = self.registry.get_by_id(source_tid).schema.pk_index
-                if len(cols) == 1 and cols[0] == src_pk:
-                    co_partitioned_join_sources[source_tid] = True
-
-        # 3. Register assignment
+        # 4. Register assignment
         out_reg_of = {}
         next_reg = 0
         for nid in ordered:
@@ -903,9 +1116,12 @@ class ProgramCache(object):
         extra_regs = 0
         for nid, op in nodes:
             if op == opcodes.OPCODE_DISTINCT:
-                extra_regs += 1
+                if nid not in rw.skip_nodes:
+                    extra_regs += 1
             elif op == opcodes.OPCODE_REDUCE:
-                extra_regs += 2  # out_delta + auto trace_in
+                extra_regs += 2  # raw_delta + auto trace_in
+                if nid in rw.fold_finalize:
+                    extra_regs += 1  # fin_delta
             elif op == opcodes.OPCODE_SCAN_TRACE:
                 table_id = sources.get(nid, 0)
                 if table_id > 0 and nid not in trace_side_sources:
@@ -913,7 +1129,7 @@ class ProgramCache(object):
 
         reg_file = runtime.RegisterFile(next_reg + extra_regs)
 
-        # 3. Instruction emission
+        # 5. Instruction emission
         program = newlist_hint(len(ordered) + 1)
         # state: [next_extra_reg, sink_reg_id, input_delta_reg_id]
         state = [next_reg, -1, -1]
@@ -965,9 +1181,12 @@ class ProgramCache(object):
                 for pnid in post_ordered:
                     pop = opcode_of[pnid]
                     if pop == opcodes.OPCODE_DISTINCT:
-                        post_extra_regs += 1
+                        if pnid not in rw.skip_nodes:
+                            post_extra_regs += 1
                     elif pop == opcodes.OPCODE_REDUCE:
-                        post_extra_regs += 2  # out_delta + auto trace_in
+                        post_extra_regs += 2  # raw_delta + auto trace_in
+                        if pnid in rw.fold_finalize:
+                            post_extra_regs += 1  # fin_delta
                     elif pop == opcodes.OPCODE_SCAN_TRACE:
                         ptid = sources.get(pnid, 0)
                         if ptid > 0 and pnid not in trace_side_sources:
@@ -1006,7 +1225,7 @@ class ProgramCache(object):
                         post_reg_file, post_out_reg_of, sources,
                         trace_side_sources, group_cols, view_family,
                         view_id, out_schema, exchange_in_schema,
-                        post_program, post_state, str_params,
+                        post_program, post_state, str_params, rw,
                         source_reg_map=None,
                     )
                     if pinstr is not None:
@@ -1045,7 +1264,7 @@ class ProgramCache(object):
                 nid, op, reg_id, node_params, in_regs,
                 reg_file, out_reg_of, sources, trace_side_sources,
                 group_cols, view_family, view_id, out_schema,
-                in_schema, program, state, str_params,
+                in_schema, program, state, str_params, rw,
                 source_reg_map=source_reg_map,
             )
             if instr is not None: program.append(instr)
