@@ -186,6 +186,47 @@ class TestBulkJoin:
         finally:
             _drop_all(client, sn, views=["v"], tables=["a", "b"])
 
+    def test_join_a_first_10k(self, client):
+        """Push a first (builds I(A)), then push b — exercises
+        join_delta_trace(ΔB, I(A)), a different code path than test_join_10k."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, a_val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, b_val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.pk, a.a_val, b.b_val FROM a JOIN b ON a.pk = b.pk",
+                schema_name=sn,
+            )
+            tid_a, schema_a = client.resolve_table(sn, "a")
+            tid_b, schema_b = client.resolve_table(sn, "b")
+            vid, _ = client.resolve_table(sn, "v")
+
+            N = 10_000
+            # push a first (builds trace I(A)), then b (delta → join_delta_trace(ΔB, I(A)))
+            _push_batch(client, tid_a, schema_a,
+                        ({"pk": i, "a_val": i * 2} for i in range(1, N + 1)))
+            _push_batch(client, tid_b, schema_b,
+                        ({"pk": i, "b_val": i * 3} for i in range(1, N + 1)))
+
+            live_rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(live_rows) == N, \
+                f"expected {N} join rows, got {len(live_rows)}"
+
+            by_pk = {r[1]: r for r in live_rows}
+            for pk in (1, 500, N):
+                r = by_pk[pk]
+                assert r[2] == pk * 2, f"pk={pk} a_val: expected {pk*2}, got {r[2]}"
+                assert r[3] == pk * 3, f"pk={pk} b_val: expected {pk*3}, got {r[3]}"
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
 
 # ---------------------------------------------------------------------------
 # Class 4: TestBulkAntiJoin
@@ -364,6 +405,59 @@ class TestBulkJoinReduce:
                     pass
             client.drop_schema(sn)
 
+    def test_join_reduce_flsm(self, client):
+        """250K rows per table — L0 flushes in all partitions (single-worker) or
+        partial flushes (multi-worker). Verifies join→reduce correctness when
+        source tables span L0 shards."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        a_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                  gnitz.ColumnDef("grp", gnitz.TypeCode.I64),
+                  gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        b_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                  gnitz.ColumnDef("extra", gnitz.TypeCode.I64)]
+        a_tid, a_schema, a_name = _make_table(client, sn, a_cols)
+        b_tid, b_schema, b_name = _make_table(client, sn, b_cols)
+        vname = "v_" + _uid()
+        try:
+            N = 250_000
+            _push_batch(client, b_tid, b_schema,
+                        ({"pk": i, "extra": 0} for i in range(1, N + 1)))
+
+            cb = client.circuit_builder(source_table_id=a_tid)
+            inp = cb.input_delta()
+            j = cb.join(inp, b_tid)
+            red = cb.reduce(j, group_by_cols=[1], agg_func_id=2, agg_col_idx=2)
+            cb.sink(red)
+            circuit = cb.build()
+
+            out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U128, primary_key=True),
+                        gnitz.ColumnDef("grp", gnitz.TypeCode.I64),
+                        gnitz.ColumnDef("agg", gnitz.TypeCode.I64)]
+            vid = client.create_view_with_circuit(sn, vname, circuit, out_cols)
+
+            _push_batch(client, a_tid, a_schema,
+                        ({"pk": i, "grp": i % 50, "val": 1} for i in range(1, N + 1)))
+
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 50, f"expected 50 groups, got {len(rows)}"
+            totals = {r[1]: r[2] for r in rows}
+            expected_per_group = N // 50  # 5000
+            for g in range(50):
+                assert totals[g] == expected_per_group, \
+                    f"group {g}: expected {expected_per_group}, got {totals.get(g)}"
+        finally:
+            try:
+                client.drop_view(sn, vname)
+            except Exception:
+                pass
+            for tname in [a_name, b_name]:
+                try:
+                    client.drop_table(sn, tname)
+                except Exception:
+                    pass
+            client.drop_schema(sn)
+
 
 # ---------------------------------------------------------------------------
 # Class 8: TestBulkExchange
@@ -397,9 +491,11 @@ class TestBulkExchange:
 # ---------------------------------------------------------------------------
 # Class 9: TestBulkStorage
 # 1 200 000 rows in 6 batches — triggers L0→L1 FLSM compaction in all 256
-# partitions and exercises multi-shard cursor merge during final scan.
+# partitions (single-worker) and exercises multi-shard cursor merge.
+# Requires multi-worker so exchange fan-out + compaction interact.
 # ---------------------------------------------------------------------------
 
+@_NEEDS_MULTI
 class TestBulkStorage:
 
     def test_storage_1_2m(self, client):
@@ -415,7 +511,110 @@ class TestBulkStorage:
                             ({"pk": b * BATCH_SIZE + i, "val": i % 1000}
                              for i in range(1, BATCH_SIZE + 1)))
 
-            assert _live_count(client, tid) == 1_200_000
+            # Verify count and spot-check values in one pass.
+            # expected val for a given pk: (pk - (pk-1)//BATCH_SIZE*BATCH_SIZE) % 1000
+            total = 0
+            errors = []
+            for r in client.scan(tid):
+                if r.weight <= 0:
+                    continue
+                total += 1
+                if total % 10_000 == 1:
+                    expected = (r.pk - (r.pk - 1) // BATCH_SIZE * BATCH_SIZE) % 1000
+                    if r.val != expected:
+                        errors.append(
+                            f"pk={r.pk}: expected val={expected}, got {r.val}"
+                        )
+            assert total == 1_200_000, f"expected 1200000 rows, got {total}"
+            assert not errors, f"value corruption after compaction: {errors[:5]}"
+        finally:
+            try:
+                client.drop_table(sn, tname)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# Class 10: TestBulkL0Reads
+# 250 000 rows — all 256 partitions receive at least one L0 flush (single-
+# worker). Verifies value correctness across multi-shard cursor reads, not
+# just row counts.
+# ---------------------------------------------------------------------------
+
+class TestBulkL0Reads:
+
+    def test_l0_values_250k(self, client):
+        """Push 250K rows (pk=i, val=i%1000); verify count and value sum after
+        multi-shard cursor merge — catches offset bugs that preserve count but
+        return values from the wrong shard."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        tid, schema, tname = _make_table(client, sn, cols)
+        try:
+            N = 250_000
+            _push_batch(client, tid, schema,
+                        ({"pk": i, "val": i % 1000} for i in range(1, N + 1)))
+
+            count = 0
+            total_val = 0
+            for r in client.scan(tid):
+                if r.weight <= 0:
+                    continue
+                count += 1
+                total_val += r.val
+                # spot-check periodically: val == pk % 1000
+                if r.pk % 5_000 == 0:
+                    assert r.val == r.pk % 1000, \
+                        f"pk={r.pk}: expected val={r.pk % 1000}, got {r.val}"
+
+            assert count == N, f"expected {N} rows, got {count}"
+            # sum(i%1000 for i=1..250000) = 250 complete cycles of 0..999
+            # each cycle sums to 0+1+...+999 = 499500
+            assert total_val == 250 * 499_500, \
+                f"expected val sum={250 * 499_500}, got {total_val}"
+        finally:
+            try:
+                client.drop_table(sn, tname)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# Class 11: TestBulkRetract
+# Insert at L0-flush scale, then retract half — verifies that retractions
+# applied against already-flushed L0 shard data are handled correctly.
+# ---------------------------------------------------------------------------
+
+class TestBulkRetract:
+
+    def test_retract_post_l0_flush(self, client):
+        """Push 100K rows (L0 flushes in ~50% of partitions), then retract the
+        first 50K. Verifies count and that surviving rows have correct values."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        # unique_pk=False: explicit weight=-1 retractions, no upsert semantics
+        tid, schema, tname = _make_table(client, sn, cols, unique_pk=False)
+        try:
+            N = 100_000
+            _push_batch(client, tid, schema,
+                        ({"pk": i, "val": i} for i in range(1, N + 1)))
+            _push_batch(client, tid, schema,
+                        ({"pk": i, "val": i, "weight": -1}
+                         for i in range(1, N // 2 + 1)))
+
+            live_rows = [r for r in client.scan(tid) if r.weight > 0]
+            assert len(live_rows) == N // 2, \
+                f"expected {N // 2} rows after retraction, got {len(live_rows)}"
+            # surviving rows are pk=50001..100000 with val=pk; spot-check every 500th
+            for r in live_rows[::500]:
+                assert r.val == r.pk, \
+                    f"pk={r.pk}: expected val={r.pk}, got {r.val}"
         finally:
             try:
                 client.drop_table(sn, tname)
