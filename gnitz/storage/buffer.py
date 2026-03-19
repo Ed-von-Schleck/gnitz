@@ -90,11 +90,29 @@ class Buffer(object):
     @staticmethod
     def from_external_ptr(ptr, capacity, item_size=1):
         """
-        Creates a Buffer wrapping externally managed memory (e.g. IPC memfd or mmap).
-        This buffer is strictly non-growable and will not free the pointer on disposal.
+        Creates a Buffer wrapping externally managed memory as a *write target*.
+        offset starts at 0 — caller writes into it with alloc()/put_*().
+        Use from_existing_data() instead when the memory is already populated
+        and will be read back (e.g. WAL decode, IPC receive).
         """
         buf = Buffer(capacity, growable=False, item_size=item_size, is_owned=False)
         buf.base_ptr = ptr
+        return buf
+
+    @staticmethod
+    def from_existing_data(ptr, size):
+        """
+        Creates a non-owning, non-growable Buffer that points to *already-written* data.
+        offset == size (== capacity), reflecting that all bytes are valid content.
+
+        Use this instead of from_external_ptr() whenever you are wrapping memory that
+        was written by someone else (WAL block decode, mmap region, IPC receive).
+        The key invariant: blob_arena.offset is read as blob_size by encode_batch_append;
+        a zero offset causes blob data to be silently dropped on re-encode.
+        """
+        buf = Buffer(size, growable=False, item_size=1, is_owned=False)
+        buf.base_ptr = ptr
+        buf.offset = size   # all bytes are already written
         return buf
 
     @property

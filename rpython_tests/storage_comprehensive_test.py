@@ -20,6 +20,7 @@ from gnitz.storage import (
     buffer,
     memtable,
     wal,
+    wal_columnar,
     wal_layout,
     writer_table,
     shard_table,
@@ -298,6 +299,65 @@ def test_wal_storage(base_dir):
     r_blob.close()
 
     os.write(1, "    [OK] Columnar Z-Set WAL passed.\n")
+
+
+def test_wal_reencode_round_trip(base_dir):
+    """
+    Regression: decode a WAL block containing heap-allocated strings (>12 chars),
+    then re-encode the decoded batch, then decode again.  All string values must
+    survive both round-trips unchanged.
+
+    This caught a bug where Buffer.from_external_ptr left offset=0 on the blob
+    buffer, causing encode_batch_append to read blob_size=0 and drop all heap
+    strings.  The decoded table name arrived as null bytes at the worker, C's
+    open() truncated at \\0, opened the partition directory, and returned EISDIR.
+    """
+    os.write(1, "[Storage] Testing WAL re-encode round-trip (heap strings)...\n")
+    schema = make_u64_str_schema()
+
+    # A string longer than 12 bytes forces heap (blob arena) allocation.
+    long_name = "orders_archive_2024"  # 19 chars > SHORT_STRING_THRESHOLD=12
+
+    # Step 1: encode original batch to a wire buffer.
+    orig = batch.ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, orig)
+    rb.begin(r_uint128(r_uint64(7)), r_int64(1))
+    rb.put_string(long_name)
+    rb.commit()
+
+    wire_buf = buffer.Buffer(4096)
+    wal_columnar.encode_batch_to_buffer(wire_buf, schema, 42, 1, orig)
+    orig.free()
+
+    # Step 2: non-owning decode (wire_buf owns the memory).
+    decoded = wal_columnar.decode_batch_from_ptr(wire_buf.base_ptr, wire_buf.offset, schema)
+
+    acc = ColumnarBatchAccessor(schema)
+    acc.bind(decoded, 0)
+    _, _, sp, hp, _ = acc.get_str_struct(1)
+    s1 = string_logic.unpack_string(sp, hp)
+    assert_equal_s(long_name, s1, "WAL decode: string mismatch after first decode")
+
+    # Step 3: re-encode the decoded batch (simulates DDL broadcast on master).
+    wire_buf2 = buffer.Buffer(4096)
+    wal_columnar.encode_batch_to_buffer(wire_buf2, schema, 42, 1, decoded)
+    decoded.free()
+    wire_buf.free()
+
+    # Step 4: decode the re-encoded buffer and verify strings survived.
+    decoded2 = wal_columnar.decode_batch_from_ptr(wire_buf2.base_ptr, wire_buf2.offset, schema)
+
+    assert_equal_i(1, decoded2.length(), "re-encoded WAL: wrong row count")
+    acc2 = ColumnarBatchAccessor(schema)
+    acc2.bind(decoded2, 0)
+    _, _, sp2, hp2, _ = acc2.get_str_struct(1)
+    s2 = string_logic.unpack_string(sp2, hp2)
+    assert_equal_s(long_name, s2, "WAL re-encode: heap string lost after second decode")
+
+    decoded2.free()
+    wire_buf2.free()
+
+    os.write(1, "    [OK] WAL re-encode round-trip passed.\n")
 
 
 def test_memtable(base_dir):
@@ -2726,6 +2786,7 @@ def entry_point(argv):
     try:
         test_integrity_and_lowlevel(base_dir)
         test_wal_storage(base_dir)
+        test_wal_reencode_round_trip(base_dir)
         test_memtable(base_dir)
         test_shards_and_columnar(base_dir)
         test_manifest_and_spine(base_dir)

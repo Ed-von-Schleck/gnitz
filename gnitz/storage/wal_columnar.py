@@ -190,22 +190,25 @@ def _parse_wal_block(ptr, total_size, schema):
 
     region_idx = 0
 
-    pk_lo_buf = buffer_ops.Buffer.from_external_ptr(
+    # All WAL region buffers wrap already-written memory.  Use from_existing_data
+    # so that offset == capacity for every buffer — critical for blob_buf, whose
+    # offset is read as blob_size by encode_batch_append during DDL re-broadcast.
+    pk_lo_buf = buffer_ops.Buffer.from_existing_data(
         rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
     region_idx += 1
 
-    pk_hi_buf = buffer_ops.Buffer.from_external_ptr(
+    pk_hi_buf = buffer_ops.Buffer.from_existing_data(
         rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
     region_idx += 1
 
-    weight_buf = buffer_ops.Buffer.from_external_ptr(
+    weight_buf = buffer_ops.Buffer.from_existing_data(
         rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
     region_idx += 1
 
-    null_buf = buffer_ops.Buffer.from_external_ptr(
+    null_buf = buffer_ops.Buffer.from_existing_data(
         rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
     region_idx += 1
@@ -220,19 +223,16 @@ def _parse_wal_block(ptr, total_size, schema):
         else:
             stride = schema.columns[ci].field_type.size
             col_bufs.append(
-                buffer_ops.Buffer.from_external_ptr(
+                buffer_ops.Buffer.from_existing_data(
                     rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
                 )
             )
             col_strides.append(stride)
             region_idx += 1
 
-    blob_buf = buffer_ops.Buffer.from_external_ptr(
+    blob_buf = buffer_ops.Buffer.from_existing_data(
         rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
-    # offset tracks "bytes written"; must equal capacity so that re-encoding
-    # (e.g. DDL broadcast) copies the full blob arena instead of 0 bytes.
-    blob_buf.offset = sizes[region_idx]
 
     result_batch = ArenaZSetBatch.from_buffers(
         schema, pk_lo_buf, pk_hi_buf, weight_buf, null_buf,
