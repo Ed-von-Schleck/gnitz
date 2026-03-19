@@ -158,11 +158,12 @@ fn test_create_drop_table() {
     let tid = client.create_table("s1", "t1", &cols, 0, true).unwrap();
     assert!(tid >= FIRST_USER_TABLE_ID, "table id too small: {}", tid);
 
-    // Scan user table — should be empty but return a schema
+    // Scan user table — should be empty but return a schema.
+    // Empty tables send no data block (FLAG_HAS_DATA requires non-empty batch),
+    // so data_batch is None; that is the correct "empty" signal.
     let (wire_schema, data) = client.scan(tid).unwrap();
     assert!(wire_schema.is_some(), "scan of new table must return schema");
-    let data = data.unwrap();
-    assert!(data.is_empty(), "new table must be empty");
+    assert!(data.is_none(), "new table must be empty (no data block)");
 
     // Drop
     client.drop_table("s1", "t1").unwrap();
@@ -383,7 +384,7 @@ fn test_filter_view() {
     let circuit = cb.build();
 
     let table_schema = Schema { columns: cols, pk_index: 0 };
-    client.create_view_with_circuit("sv1", "filter_v", circuit, &table_schema.columns).unwrap();
+    client.create_view_with_circuit("sv1", "filter_v", "", circuit, &table_schema.columns).unwrap();
 
     let mut batch = ZSetBatch::new(&table_schema);
     for &(pk, val) in &[(1u64, 10i64), (2, 30), (3, 50), (4, 70), (5, 90)] {
@@ -437,7 +438,7 @@ fn test_reduce_view() {
         ColumnDef { name: "group_id".into(),    type_code: TypeCode::I64,  is_nullable: false },
         ColumnDef { name: "agg".into(),         type_code: TypeCode::I64,  is_nullable: false },
     ];
-    client.create_view_with_circuit("sv2", "reduce_v", circuit, &out_cols).unwrap();
+    client.create_view_with_circuit("sv2", "reduce_v", "", circuit, &out_cols).unwrap();
 
     let table_schema = Schema { columns: cols, pk_index: 0 };
     let mut batch = ZSetBatch::new(&table_schema);
@@ -503,7 +504,7 @@ fn test_join_view() {
     cb.sink(joined, vid);
     let circuit = cb.build();
 
-    client.create_view_with_circuit("sv3", "join_v", circuit, &table_schema.columns).unwrap();
+    client.create_view_with_circuit("sv3", "join_v", "", circuit, &table_schema.columns).unwrap();
 
     // Push A rows: pk=1 (matches B), pk=4 (no match)
     let mut batch_a = ZSetBatch::new(&table_schema);
@@ -561,7 +562,7 @@ fn test_anti_join_view() {
     cb.sink(anti, vid);
     let circuit = cb.build();
 
-    client.create_view_with_circuit("sv4", "antijoin_v", circuit, &table_schema.columns).unwrap();
+    client.create_view_with_circuit("sv4", "antijoin_v", "", circuit, &table_schema.columns).unwrap();
 
     // Push A rows: pk=1,2,3; only pk=3 has no match in B
     let mut batch_a = ZSetBatch::new(&table_schema);
@@ -652,7 +653,7 @@ fn test_incremental_update() {
         ColumnDef { name: "group_id".into(),    type_code: TypeCode::I64,  is_nullable: false },
         ColumnDef { name: "agg".into(),         type_code: TypeCode::I64,  is_nullable: false },
     ];
-    client.create_view_with_circuit("sv6", "incr_v", circuit, &out_cols).unwrap();
+    client.create_view_with_circuit("sv6", "incr_v", "", circuit, &out_cols).unwrap();
 
     // Tick 1: push pk=1,2 (group=1, vals=10,20) and pk=3,4 (group=2, vals=30,40)
     let mut batch = ZSetBatch::new(&table_schema);
@@ -696,6 +697,98 @@ fn test_incremental_update() {
     }
     assert_eq!(g1, 20, "tick2 group1 should be 20 after retraction; got {}", g1);
     assert_eq!(g2, 70, "tick2 group2 should be 70 (unchanged); got {}", g2);
+
+    client.close();
+}
+
+// --- Bulk / large-scale tests ---
+
+#[test]
+fn test_bulk_filter() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+
+    client.create_schema("bf1").unwrap();
+    let cols = vec![
+        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
+        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+    ];
+    let tid = client.create_table("bf1", "bft1", &cols, 0, true).unwrap();
+    let table_schema = Schema { columns: cols, pk_index: 0 };
+
+    // Build filter: val > 50_000
+    let mut eb = ExprBuilder::new();
+    let r0 = eb.load_col_int(1);   // col 1 = val
+    let r1 = eb.load_const(50_000);
+    let r2 = eb.cmp_gt(r0, r1);
+    let expr = eb.build(r2);
+
+    let vid = client.alloc_table_id().unwrap();
+    let mut cb = CircuitBuilder::new(vid, tid);
+    let inp = cb.input_delta();
+    let f   = cb.filter(inp, Some(expr));
+    cb.sink(f, vid);
+    let circuit = cb.build();
+    client.create_view_with_circuit("bf1", "bfv1", "", circuit, &table_schema.columns).unwrap();
+
+    // Push 100 000 rows: pk=i, val=i
+    let mut batch = ZSetBatch::new(&table_schema);
+    for pk in 1u64..=100_000 {
+        batch.pk_lo.push(pk);
+        batch.pk_hi.push(0);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&(pk as i64).to_le_bytes());
+        }
+    }
+    client.push(tid, &table_schema, &batch).unwrap();
+
+    let (_, data) = client.scan(vid).unwrap();
+    let data = data.unwrap();
+    let positive: Vec<u64> = data.pk_lo.iter().copied()
+        .zip(data.weights.iter().copied())
+        .filter(|(_, w)| *w > 0)
+        .map(|(pk, _)| pk)
+        .collect();
+    assert_eq!(positive.len(), 50_000,
+        "filter val>50000 should keep 50000 rows; got {}", positive.len());
+
+    client.close();
+}
+
+#[test]
+#[ignore]
+fn test_bulk_exchange_multi_worker() {
+    let srv = match ServerHandle::start_n(4) { Some(s) => s, None => return };
+    let client = GnitzClient::connect(&srv.sock_path).unwrap();
+
+    client.create_schema("bem1").unwrap();
+    let cols = vec![
+        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
+        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+    ];
+    let tid = client.create_table("bem1", "bemt1", &cols, 0, true).unwrap();
+    let table_schema = Schema { columns: cols, pk_index: 0 };
+
+    // Push 500 000 rows in a single batch
+    let mut batch = ZSetBatch::new(&table_schema);
+    for pk in 1u64..=500_000 {
+        batch.pk_lo.push(pk);
+        batch.pk_hi.push(0);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&(pk as i64).to_le_bytes());
+        }
+    }
+    client.push(tid, &table_schema, &batch).unwrap();
+
+    let (_, data) = client.scan(tid).unwrap();
+    let data = data.unwrap();
+    let positive_count = data.weights.iter().filter(|&&w| w > 0).count();
+    assert_eq!(positive_count, 500_000,
+        "expected 500000 rows after exchange fan-out; got {}", positive_count);
 
     client.close();
 }
