@@ -1,7 +1,7 @@
 # gnitz/catalog/hooks.py
 
 import os
-from rpython.rlib.rarithmetic import r_uint64, intmask
+from rpython.rlib.rarithmetic import r_uint64, r_int64, r_ulonglonglong as r_uint128, intmask
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core.errors import LayoutError
@@ -27,30 +27,45 @@ from gnitz.catalog.index_circuit import (
 )
 
 
-def _compute_view_depth(vid, view_deps_store, registry):
-    """
-    Traverses the view dependency graph to determine the topological rank.
-    view_deps_store is a ZSetStore (PersistentTable).
-    """
-    from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_int64
-    start_key = r_uint128(r_uint64(vid)) << 64
-    end_key = r_uint128(r_uint64(vid + 1)) << 64
-    max_depth = 0
-    cursor = view_deps_store.create_cursor()
-    try:
-        cursor.seek(start_key)
-        while cursor.is_valid() and cursor.key() < end_key:
-            if cursor.weight() > r_int64(0):
-                acc = cursor.get_accessor()
-                dep_vid = intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID))
-                if dep_vid > 0 and registry.has_id(dep_vid):
-                    candidate = registry.get_by_id(dep_vid).depth + 1
-                    if candidate > max_depth:
-                        max_depth = candidate
-            cursor.advance()
-    finally:
-        cursor.close()
-    return max_depth
+def _view_needs_exchange(plan):
+    """True if the view requires worker exchange (join or reduce); local backfill is unsafe."""
+    return (plan.exchange_post_plan is not None
+            or plan.join_shard_map is not None)
+
+
+def _backfill_view(engine, vid):
+    """Scan each source family and feed all live rows through the view's plan."""
+    plan = engine.program_cache.get_program(vid)
+    if plan is None:
+        return
+    view_family = engine.registry.get_by_id(vid)
+    source_ids = engine.program_cache.get_source_ids(vid)
+    for source_id in source_ids:
+        if not engine.registry.has_id(source_id):
+            continue
+        src_family = engine.registry.get_by_id(source_id)
+        scan_batch = ArenaZSetBatch(src_family.schema)
+        cursor = src_family.store.create_cursor()
+        try:
+            while cursor.is_valid():
+                w = cursor.weight()
+                if w > r_int64(0):
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    scan_batch.append_from_accessor(r_uint128(pk), w, acc)
+                cursor.advance()
+        finally:
+            cursor.close()
+        if scan_batch.length() == 0:
+            scan_batch.free()
+            continue
+        result = plan.execute_epoch(scan_batch, source_id=source_id)
+        scan_batch.free()
+        if result is not None and result.length() > 0:
+            ingest_to_family(view_family, result)
+            view_family.store.flush()
+        if result is not None:
+            result.free()
 
 
 def _remove_circuit_from_family(circuit, family):
@@ -78,11 +93,10 @@ class DeltaHook(object):
 class SchemaEffectHook(DeltaHook):
     """Reacts to additions or removals of database schemas."""
 
-    _immutable_fields_ = ["registry", "base_dir"]
+    _immutable_fields_ = ["engine"]
 
-    def __init__(self, registry, base_dir):
-        self.registry = registry
-        self.base_dir = base_dir
+    def __init__(self, engine):
+        self.engine = engine
 
     def on_delta(self, batch):
         acc = batch.get_accessor(0)
@@ -94,32 +108,30 @@ class SchemaEffectHook(DeltaHook):
             name = sys.read_string(acc, sys.SchemaTab.COL_NAME)
 
             if weight > 0:
-                if self.registry.has_schema(name):
+                if self.engine.registry.has_schema(name):
                     continue
 
-                path = self.base_dir + "/" + name
+                path = self.engine.base_dir + "/" + name
                 ensure_dir(path)
-                mmap_posix.fsync_dir(self.base_dir)
+                mmap_posix.fsync_dir(self.engine.base_dir)
 
-                self.registry.register_schema(sid, name)
+                self.engine.registry.register_schema(sid, name)
             else:
-                if self.registry.has_schema(name):
+                if self.engine.registry.has_schema(name):
                     if name == "_system":
                         raise LayoutError("Forbidden: cannot drop system schema")
-                    if not self.registry.schema_is_empty(name):
+                    if not self.engine.registry.schema_is_empty(name):
                         raise LayoutError("Cannot drop non-empty schema: %s" % name)
-                    self.registry.unregister_schema(name, sid)
+                    self.engine.registry.unregister_schema(name, sid)
 
 
 class TableEffectHook(DeltaHook):
     """Reacts to additions or removals of persistent user tables."""
 
-    _immutable_fields_ = ["registry", "sys_tables", "base_dir"]
+    _immutable_fields_ = ["engine"]
 
-    def __init__(self, registry, sys_tables, base_dir):
-        self.registry = registry
-        self.sys_tables = sys_tables
-        self.base_dir = base_dir
+    def __init__(self, engine):
+        self.engine = engine
         self.cascade_enabled = False
 
     def on_delta(self, batch):
@@ -136,10 +148,10 @@ class TableEffectHook(DeltaHook):
             unique_pk = (flags & sys.TableTab.FLAG_UNIQUE_PK) != 0
 
             if weight > 0:
-                if self.registry.has_id(tid):
+                if self.engine.registry.has_id(tid):
                     continue
 
-                col_defs = read_column_defs(self.sys_tables.columns, tid)
+                col_defs = read_column_defs(self.engine.sys.columns, tid)
                 if len(col_defs) == 0:
                     os.write(
                         2,
@@ -148,34 +160,34 @@ class TableEffectHook(DeltaHook):
                     )
                     continue
 
-                schema_name = self.registry.get_schema_name(sid)
+                schema_name = self.engine.registry.get_schema_name(sid)
                 directory = (
-                    self.base_dir + "/" + schema_name + "/" + name + "_" + str(tid)
+                    self.engine.base_dir + "/" + schema_name + "/" + name + "_" + str(tid)
                 )
 
                 tbl_schema = TableSchema(col_defs, pk_col_idx)
                 n = get_num_partitions(tid)
                 pt = make_partitioned_persistent(
                     directory, name, tbl_schema, tid, n,
-                    part_start=self.registry.active_part_start,
-                    part_end=self.registry.active_part_end,
+                    part_start=self.engine.registry.active_part_start,
+                    part_end=self.engine.registry.active_part_end,
                 )
 
-                mmap_posix.fsync_dir(self.base_dir + "/" + schema_name)
+                mmap_posix.fsync_dir(self.engine.base_dir + "/" + schema_name)
 
                 family = TableFamily(
                     schema_name, name, tid, sid, directory, pk_col_idx, pt,
                     unique_pk=unique_pk,
                 )
-                self.registry.register(family)
-                wire_fk_constraints_for_family(family, self.registry)
+                self.engine.registry.register(family)
+                wire_fk_constraints_for_family(family, self.engine.registry)
 
                 if self.cascade_enabled:
                     self._create_fk_indices(family)
             else:
-                if self.registry.has_id(tid):
-                    family = self.registry.get_by_id(tid)
-                    for referencing in self.registry.iter_families():
+                if self.engine.registry.has_id(tid):
+                    family = self.engine.registry.get_by_id(tid)
+                    for referencing in self.engine.registry.iter_families():
                         if referencing.table_id == tid:
                             continue
                         for col in referencing.schema.columns:
@@ -190,7 +202,7 @@ class TableEffectHook(DeltaHook):
                                 )
 
                     family.close()
-                    self.registry.unregister(family.schema_name, family.table_name)
+                    self.engine.registry.unregister(family.schema_name, family.table_name)
 
     def _create_fk_indices(self, family):
         columns = family.schema.columns
@@ -201,39 +213,36 @@ class TableEffectHook(DeltaHook):
             index_name = make_fk_index_name(
                 family.schema_name, family.table_name, col.name
             )
-            if self.registry.has_index_by_name(index_name):
+            if self.engine.registry.has_index_by_name(index_name):
                 continue
-            index_id = self.registry.allocate_index_id()
-            s = self.sys_tables.indices.schema
+            index_id = self.engine.registry.allocate_index_id()
+            s = self.engine.sys.indices.schema
             idx_batch = ArenaZSetBatch(s)
             sys.IdxTab.append(
                 idx_batch, s, index_id, family.table_id,
                 sys.OWNER_KIND_TABLE, col_idx, index_name, 0, ""
             )
-            indices_family = self.registry.get("_system", sys.IdxTab.NAME)
+            indices_family = self.engine.registry.get("_system", sys.IdxTab.NAME)
             ingest_to_family(indices_family, idx_batch)
             idx_batch.free()
             self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
 
     def _advance_sequence(self, seq_id, old_val, new_val):
-        s = self.sys_tables.sequences.schema
+        s = self.engine.sys.sequences.schema
         batch = ArenaZSetBatch(s)
         sys.SeqTab.retract(batch, s, seq_id, old_val)
         sys.SeqTab.append(batch, s, seq_id, new_val)
-        self.sys_tables.sequences.ingest_batch(batch)
+        self.engine.sys.sequences.ingest_batch(batch)
         batch.free()
 
 
 class ViewEffectHook(DeltaHook):
     """Reacts to additions or removals of reactive views."""
 
-    _immutable_fields_ = ["registry", "sys_tables", "base_dir", "program_cache"]
+    _immutable_fields_ = ["engine"]
 
-    def __init__(self, registry, sys_tables, base_dir, program_cache):
-        self.registry = registry
-        self.sys_tables = sys_tables
-        self.base_dir = base_dir
-        self.program_cache = program_cache
+    def __init__(self, engine):
+        self.engine = engine
 
     def on_delta(self, batch):
         acc = batch.get_accessor(0)
@@ -246,10 +255,10 @@ class ViewEffectHook(DeltaHook):
             name = sys.read_string(acc, sys.ViewTab.COL_NAME)
 
             if weight > 0:
-                if self.registry.has_id(vid):
+                if self.engine.registry.has_id(vid):
                     continue
 
-                col_defs = read_column_defs(self.sys_tables.columns, vid)
+                col_defs = read_column_defs(self.engine.sys.columns, vid)
                 if len(col_defs) == 0:
                     os.write(
                         2,
@@ -258,54 +267,60 @@ class ViewEffectHook(DeltaHook):
                     )
                     continue
 
-                schema_name = self.registry.get_schema_name(sid)
+                schema_name = self.engine.registry.get_schema_name(sid)
                 directory = (
-                    self.base_dir + "/" + schema_name + "/view_" + name + "_" + str(vid)
+                    self.engine.base_dir + "/" + schema_name + "/view_" + name + "_" + str(vid)
                 )
 
                 tbl_schema = TableSchema(col_defs, pk_index=0)
                 n = get_num_partitions(vid)
                 et = make_partitioned_ephemeral(
                     directory, name, tbl_schema, vid, n,
-                    part_start=self.registry.active_part_start,
-                    part_end=self.registry.active_part_end,
+                    part_start=self.engine.registry.active_part_start,
+                    part_end=self.engine.registry.active_part_end,
                 )
 
                 family = TableFamily(schema_name, name, vid, sid, directory, 0, et)
 
-                family.depth = _compute_view_depth(
-                    vid, self.sys_tables.view_deps, self.registry
-                )
+                max_depth = 0
+                for src_id in self.engine.program_cache.get_source_ids(vid):
+                    if self.engine.registry.has_id(src_id):
+                        d = self.engine.registry.get_by_id(src_id).depth + 1
+                        if d > max_depth:
+                            max_depth = d
+                family.depth = max_depth
 
-                self.registry.register(family)
+                self.engine.registry.register(family)
+
+                plan = self.engine.program_cache.get_program(vid)
+                if plan is not None and not _view_needs_exchange(plan):
+                    _backfill_view(self.engine, vid)
             else:
-                if self.registry.has_id(vid):
-                    family = self.registry.get_by_id(vid)
+                if self.engine.registry.has_id(vid):
+                    family = self.engine.registry.get_by_id(vid)
                     family.close()
-                    self.registry.unregister(family.schema_name, family.table_name)
+                    self.engine.registry.unregister(family.schema_name, family.table_name)
 
 
 class DepTabEffectHook(DeltaHook):
     """Invalidates the cached dep_map whenever DepTab is modified."""
 
-    _immutable_fields_ = ["program_cache"]
+    _immutable_fields_ = ["engine"]
 
-    def __init__(self, program_cache):
-        self.program_cache = program_cache
+    def __init__(self, engine):
+        self.engine = engine
 
     def on_delta(self, batch):
-        self.program_cache.invalidate_dep_map()
+        self.engine.program_cache.invalidate_dep_map()
 
 
 class IndexEffectHook(DeltaHook):
     """Reacts to additions or removals of secondary index circuits."""
 
-    _immutable_fields_ = ["registry", "sys_tables", "base_dir"]
+    _immutable_fields_ = ["engine"]
 
-    def __init__(self, registry, sys_tables, base_dir):
-        self.registry = registry
-        self.sys_tables = sys_tables
-        self.base_dir = base_dir
+    def __init__(self, engine):
+        self.engine = engine
 
     def on_delta(self, batch):
         acc = batch.get_accessor(0)
@@ -321,10 +336,10 @@ class IndexEffectHook(DeltaHook):
             cache_dir = sys.read_string(acc, sys.IdxTab.COL_CACHE_DIRECTORY)
 
             if weight > 0:
-                if self.registry.has_index_by_name(name):
+                if self.engine.registry.has_index_by_name(name):
                     continue
 
-                family = self.registry.get_by_id(owner_id)
+                family = self.engine.registry.get_by_id(owner_id)
                 col = family.schema.columns[source_col_idx]
                 source_pk_type = family.schema.get_pk_column().field_type
                 idx_dir = family.directory + "/idx_" + str(idx_id)
@@ -343,45 +358,39 @@ class IndexEffectHook(DeltaHook):
 
                 _backfill_index(circuit, family)
                 family.index_circuits.append(circuit)
-                self.registry.register_index(idx_id, name, circuit)
+                self.engine.registry.register_index(idx_id, name, circuit)
             else:
-                if self.registry.has_index_by_name(name):
-                    circuit = self.registry.get_index_by_name(name)
+                if self.engine.registry.has_index_by_name(name):
+                    circuit = self.engine.registry.get_index_by_name(name)
                     if "__fk_" in name:
                         raise LayoutError("Forbidden: cannot drop internal FK index")
 
-                    family = self.registry.get_by_id(circuit.owner_id)
+                    family = self.engine.registry.get_by_id(circuit.owner_id)
                     _remove_circuit_from_family(circuit, family)
-                    self.registry.unregister_index(name, idx_id)
+                    self.engine.registry.unregister_index(name, idx_id)
                     circuit.close()
 
 
-def wire_catalog_hooks(registry, sys_tables, base_dir, program_cache):
+def wire_catalog_hooks(engine):
     """
     Attaches effect hooks to system table families.
     Must be called after recover_system_state (families exist)
     and before replay_catalog (hooks must be in place for replay).
     """
-    schemas_family = registry.get("_system", sys.SchemaTab.NAME)
-    schemas_family.post_ingest_hooks.append(
-        SchemaEffectHook(registry, base_dir)
-    )
+    schemas_family = engine.registry.get("_system", sys.SchemaTab.NAME)
+    schemas_family.post_ingest_hooks.append(SchemaEffectHook(engine))
 
-    tables_family = registry.get("_system", sys.TableTab.NAME)
-    table_hook = TableEffectHook(registry, sys_tables, base_dir)
+    tables_family = engine.registry.get("_system", sys.TableTab.NAME)
+    table_hook = TableEffectHook(engine)
     tables_family.post_ingest_hooks.append(table_hook)
 
-    views_family = registry.get("_system", sys.ViewTab.NAME)
-    views_family.post_ingest_hooks.append(
-        ViewEffectHook(registry, sys_tables, base_dir, program_cache)
-    )
+    views_family = engine.registry.get("_system", sys.ViewTab.NAME)
+    views_family.post_ingest_hooks.append(ViewEffectHook(engine))
 
-    indices_family = registry.get("_system", sys.IdxTab.NAME)
-    indices_family.post_ingest_hooks.append(
-        IndexEffectHook(registry, sys_tables, base_dir)
-    )
+    indices_family = engine.registry.get("_system", sys.IdxTab.NAME)
+    indices_family.post_ingest_hooks.append(IndexEffectHook(engine))
 
-    deps_family = registry.get("_system", sys.DepTab.NAME)
-    deps_family.post_ingest_hooks.append(DepTabEffectHook(program_cache))
+    deps_family = engine.registry.get("_system", sys.DepTab.NAME)
+    deps_family.post_ingest_hooks.append(DepTabEffectHook(engine))
 
     return table_hook

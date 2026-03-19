@@ -97,6 +97,7 @@ class ProgramCache(object):
         self._shard_cols_cache = {}
         self._exchange_info_cache = {}
         self._dep_map = {}
+        self._source_map = {}
         self._dep_map_valid = False
 
     def invalidate(self, program_id):
@@ -121,6 +122,7 @@ class ProgramCache(object):
         if self._dep_map_valid:
             return self._dep_map
         dep_map = {}
+        source_map = {}
         if registry.has_id(sys.DepTab.ID):
             deps_family = registry.get_by_id(sys.DepTab.ID)
             cursor = deps_family.store.create_cursor()
@@ -130,23 +132,30 @@ class ProgramCache(object):
                         acc = cursor.get_accessor()
                         v_id    = intmask(r_uint64(acc.get_int(sys.DepTab.COL_VIEW_ID)))
                         dep_tid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)))
-                        dep_vid = intmask(r_uint64(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)))
                         if dep_tid > 0:
                             if dep_tid not in dep_map:
                                 dep_map[dep_tid] = []
                             if v_id not in dep_map[dep_tid]:
                                 dep_map[dep_tid].append(v_id)
-                        if dep_vid > 0:
-                            if dep_vid not in dep_map:
-                                dep_map[dep_vid] = []
-                            if v_id not in dep_map[dep_vid]:
-                                dep_map[dep_vid].append(v_id)
+                            # inverse: view -> its sources
+                            if v_id not in source_map:
+                                source_map[v_id] = []
+                            if dep_tid not in source_map[v_id]:
+                                source_map[v_id].append(dep_tid)
                     cursor.advance()
             finally:
                 cursor.close()
         self._dep_map = dep_map
+        self._source_map = source_map
         self._dep_map_valid = True
         return dep_map
+
+    def get_source_ids(self, view_id):
+        """Return all direct source (table or view) IDs for this view."""
+        self.get_dep_map(self.registry)
+        if view_id in self._source_map:
+            return self._source_map[view_id]
+        return []
 
     def get_program(self, program_id):
         if program_id in self._cache:
@@ -1040,6 +1049,25 @@ class ProgramCache(object):
                 input_delta_reg_id = source_reg_map[_k]
                 break
         if input_delta_reg_id == -1 or sink_reg_id == -1: return None
+
+        # Fail-fast: verify the circuit's output schema matches the view family schema.
+        # A mismatch means the circuit computes a different column layout than what the
+        # view family store expects (e.g. join circuit missing final MAP projection,
+        # causing _direct_append_row to silently copy wrong columns positionally).
+        sink_schema = reg_file.registers[sink_reg_id].table_schema
+        if len(sink_schema.columns) != len(out_schema.columns):
+            raise LayoutError(
+                "view %d circuit output has %d columns but family schema has %d "
+                "(missing or wrong final projection node in circuit graph)"
+                % (view_id, len(sink_schema.columns), len(out_schema.columns))
+            )
+        for i in range(len(out_schema.columns)):
+            if sink_schema.columns[i].field_type.code != out_schema.columns[i].field_type.code:
+                raise LayoutError(
+                    "view %d circuit output col %d type=%d, family schema expects type=%d"
+                    % (view_id, i, sink_schema.columns[i].field_type.code,
+                       out_schema.columns[i].field_type.code)
+                )
 
         return runtime.ExecutablePlan(
             program, reg_file, out_schema,

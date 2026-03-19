@@ -349,11 +349,11 @@ def test_join_delta_trace(base_dir):
     src = builder.input_delta()
     j = builder.join(src, table_r.table_id)
     builder.sink(j, target_table_id=0)
-    # Join output schema: pk_l, val_l, pk_r, val_r -> merged
+    # Join output schema: pk (shared, left PK), val_l, val_r
+    # merge_schemas_for_join drops the right PK (it equals the left PK)
     out_cols = [
-        ("pk_l", types.TYPE_U64.code),
+        ("pk", types.TYPE_U64.code),
         ("val_l", types.TYPE_I64.code),
-        ("pk_r", types.TYPE_U64.code),
         ("val_r", types.TYPE_I64.code),
     ]
     graph = builder.build(out_cols)
@@ -555,10 +555,11 @@ def test_join_delta_delta(base_dir):
     src_b = builder.trace_scan(table_b.table_id)
     j = builder.join_delta_delta(src_a, src_b)
     builder.sink(j, target_table_id=0)
+    # Join output schema: pk (shared, left PK), val_a, val_b
+    # merge_schemas_for_join drops the right PK (it equals the left PK)
     out_cols = [
-        ("pk_a", types.TYPE_U64.code),
+        ("pk", types.TYPE_U64.code),
         ("val_a", types.TYPE_I64.code),
-        ("pk_b", types.TYPE_U64.code),
         ("val_b", types.TYPE_I64.code),
     ]
     graph = builder.build(out_cols)
@@ -1040,6 +1041,42 @@ def test_reduce_multi_agg(base_dir):
     log("  PASSED")
 
 
+def test_schema_mismatch_raises_layout_error(base_dir):
+    """compile_from_graph raises LayoutError when circuit output schema doesn't match view family schema."""
+    log("[COMPILE] Testing schema mismatch raises LayoutError...")
+    db = engine.open_engine(base_dir)
+
+    db.create_schema("test")
+    # Input schema: pk(U64), col_a(I64), col_b(I64)
+    table_cols = _make_table_cols_i64(["col_a", "col_b"])
+    table = db.create_table("test.src", table_cols, 0)
+
+    # Circuit: MAP projection selects only col_b -> 2-column output (pk + col_b)
+    builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
+    src = builder.input_delta()
+    m = builder.map(src, projection=[2])  # output: pk(U64) + col_b(I64) = 2 cols
+    builder.sink(m, target_table_id=0)
+    # Declare 3 columns — mismatches the circuit's 2-column output
+    out_cols = [("pk", types.TYPE_U64.code), ("col_a", types.TYPE_I64.code),
+                ("col_b", types.TYPE_I64.code)]
+    graph = builder.build(out_cols)
+    db.create_view("test.v_mismatch", graph, "")  # stores graph; no schema check yet
+
+    view = db.get_table("test.v_mismatch")
+    caught = False
+    try:
+        db.program_cache.get_program(view.table_id)  # compiles circuit; check fires here
+    except LayoutError:
+        caught = True
+    assert_true(caught, "expected LayoutError for schema column count mismatch")
+
+    db.drop_view("test.v_mismatch")
+    db.drop_table("test.src")
+    db.drop_schema("test")
+    db.close()
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -1123,6 +1160,10 @@ def entry_point(argv):
         ensure_dir(base_dir)
 
         test_reduce_multi_agg(base_dir)
+        cleanup(base_dir)
+        ensure_dir(base_dir)
+
+        test_schema_mismatch_raises_layout_error(base_dir)
 
         log("\nALL COMPILE_GRAPH TESTS PASSED")
     except Exception as e:

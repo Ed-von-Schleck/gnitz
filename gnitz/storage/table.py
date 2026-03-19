@@ -76,6 +76,9 @@ class PersistentTable(EphemeralTable):
         # 3. Replay WAL into MemTable to recover recent un-flushed writes
         self.recover_from_wal(wal_path)
 
+    def _erase_stale_shards(self):
+        """No-op: persistent shards are tracked by MANIFEST and must survive restarts."""
+
     # -- Cursor Interface Override --------------------------------------------
 
     def create_cursor(self):

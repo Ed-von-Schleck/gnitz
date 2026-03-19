@@ -27,6 +27,9 @@ from gnitz.storage import (
 )
 
 
+EPH_SHARD_PREFIX = "eph_shard_"
+
+
 def _name_to_tid(name):
     """
     Standardizes name-to-TID hashing for internal state tables.
@@ -78,12 +81,27 @@ class EphemeralTable(ZSetStore):
             if e.errno != errno.EEXIST:
                 raise
 
+        self._erase_stale_shards()
+
         self.index = flsm.FLSMIndex(table_id, schema, self.ref_counter,
                                     directory, validate_checksums)
         self.memtable = memtable.MemTable(schema, memtable_arena_size)
         self._flush_seq = 0
         self._retract_acc = ColumnarBatchAccessor(schema)
         self._retract_soa = storage_comparator.SoAAccessor(schema)
+
+    def _erase_stale_shards(self):
+        """Delete any leftover ephemeral shard files from a previous run."""
+        try:
+            entries = os.listdir(self.directory)
+        except OSError:
+            return
+        for name in entries:
+            if name.startswith(EPH_SHARD_PREFIX):
+                try:
+                    os.unlink(self.directory + "/" + name)
+                except OSError:
+                    pass
 
     # -- ZSetStore Interface Implementation -----------------------------------
 
@@ -247,7 +265,7 @@ class EphemeralTable(ZSetStore):
 
         # Avoid os.path.join (Appendix A §10)
         self._flush_seq += 1
-        shard_name = "eph_shard_%d_%d.db" % (self.table_id, self._flush_seq)
+        shard_name = EPH_SHARD_PREFIX + "%d_%d.db" % (self.table_id, self._flush_seq)
         shard_path = self.directory + "/" + shard_name
 
         self.memtable.flush(shard_path, self.table_id)

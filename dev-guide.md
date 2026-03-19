@@ -57,3 +57,32 @@ To watch all worker logs live:
 ```bash
 tail -f ~/git/gnitz/tmp/gnitz_*/worker_*.log
 ```
+
+## IPC optimization checklist
+
+When adding any optimization that modifies the IPC message flow (new flags,
+pre-routing, stashing, skipping round-trips):
+
+- [ ] State the optimization's preconditions explicitly in the plan doc. For every
+      column value the optimization reads (for routing, key lookup, etc.): does the
+      client guarantee that value is correctly filled for *all* message types, including
+      DELETE/retraction rows?
+- [ ] Is there an E2E test that pushes rows *and then retracts them* through this path?
+      Retraction tests (delete + re-query) are mandatory for any new IPC fast-path.
+- [ ] Did you test each IPC sub-phase in isolation before combining? E.g. for a 4-step
+      optimization: run tests after steps 1-2 before writing steps 3-4.
+- [ ] Add a comment to any guard/fallback code naming the invariant it protects.
+
+## Debugging multi-worker failures
+
+When a multi-worker test fails and the root cause is not immediately obvious:
+
+1. **Add logging before re-running.** If you don't know exactly what value is wrong
+   and where, you don't have enough information to re-run yet. Add targeted `log.debug()`
+   calls at the send side and receive side of the suspected path — at minimum log the
+   key column values and view_id. One instrumented run is worth more than ten blind
+   re-runs.
+2. **Isolate with 1 worker.** If the test passes with `GNITZ_WORKERS=1` and fails with
+   `GNITZ_WORKERS=4`, the bug is in the exchange/fanout/stash path, not in computation.
+3. **Bisect by sub-path.** Add a flag or env var to disable the new fast-path and force
+   the old path. If the test passes with the old path, the bug is in the new path only.

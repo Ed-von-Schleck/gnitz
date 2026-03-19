@@ -50,9 +50,9 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
 
     bootstrapper.recover_system_state()
 
-    table_hook = wire_catalog_hooks(registry, sys_tables, base_dir, program_cache)
-
     engine = Engine(base_dir, sys_tables, registry, program_cache)
+
+    table_hook = wire_catalog_hooks(engine)
 
     bootstrapper.replay_catalog()
 
@@ -319,8 +319,7 @@ class Engine(object):
             while cursor.is_valid():
                 if cursor.weight() > 0:
                     acc = cursor.get_accessor()
-                    if intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)) == tid or \
-                       intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)) == tid:
+                    if intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)) == tid:
                         raise LayoutError("View dependency: entity '%s'" % name)
                 cursor.advance()
         finally:

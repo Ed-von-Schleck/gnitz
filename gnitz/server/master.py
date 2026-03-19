@@ -41,12 +41,13 @@ class MasterDispatcher(object):
         preloadable = self.program_cache.get_preloadable_views(target_id)
         family = self.program_cache.registry.get_by_id(target_id)
 
-        # Skip preloaded exchange for batches containing retractions.
-        # Clients may zero non-PK columns in DELETE rows; ingest_to_family
-        # recovers the actual stored row values for weight<0 rows, but only
-        # after the push reaches the worker. Pre-routing by zeroed column
-        # values sends preloads to the wrong workers. Fall back to FLAG_EXCHANGE
-        # so workers ingest first and return correctly-valued deltas.
+        # INVARIANT: FLAG_PRELOADED_EXCHANGE requires all routing-column values in the
+        # push batch to be correctly filled at routing time.  Rust's delete() zeros
+        # non-PK columns in DELETE rows (only the PK is set; all other fields are 0).
+        # Pre-routing by those zeroed values sends preload batches to the wrong workers.
+        # Guard: any batch with weight<0 rows must skip the preload path entirely and
+        # fall back to FLAG_EXCHANGE so ingest_to_family recovers actual stored values
+        # before the delta is re-routed.
         if len(preloadable) > 0:
             has_retraction = False
             for i in range(n):
@@ -212,6 +213,70 @@ class MasterDispatcher(object):
             )
             if dest_batches[w] is not None:
                 dest_batches[w].free()
+
+    def fan_out_backfill(self, view_id, source_id, source_schema):
+        """Broadcast FLAG_BACKFILL; handle exchange relay; collect ACKs."""
+        for w in range(self.num_workers):
+            ipc.send_batch(
+                self.worker_fds[w], source_id, None,
+                schema=source_schema, flags=ipc.FLAG_BACKFILL,
+                seek_pk_lo=view_id,
+            )
+
+        poll_fds = newlist_hint(self.num_workers)
+        poll_events = newlist_hint(self.num_workers)
+        poll_wids = newlist_hint(self.num_workers)
+        for w in range(self.num_workers):
+            poll_fds.append(self.worker_fds[w])
+            poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
+            poll_wids.append(w)
+
+        exchange_payloads = {}
+        exchange_counts = {}
+        exchange_schemas = {}
+        exchange_source_ids = {}
+
+        while len(poll_fds) > 0:
+            revents = ipc_ffi.poll(poll_fds, poll_events, 10)
+            pi = len(poll_fds) - 1
+            while pi >= 0:
+                if revents[pi] & (ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP):
+                    w = poll_wids[pi]
+                    payload = ipc.receive_payload(self.worker_fds[w])
+                    if payload.flags & ipc.FLAG_EXCHANGE:
+                        vid = intmask(payload.target_id)
+                        ex_source_id = intmask(payload.seek_pk_lo)
+                        if vid not in exchange_payloads:
+                            exchange_payloads[vid] = [None] * self.num_workers
+                            exchange_counts[vid] = 0
+                        exchange_payloads[vid][w] = payload
+                        if payload.schema is not None:
+                            exchange_schemas[vid] = payload.schema
+                        if ex_source_id > 0:
+                            exchange_source_ids[vid] = ex_source_id
+                        exchange_counts[vid] += 1
+                        if exchange_counts[vid] == self.num_workers:
+                            ex_schema = exchange_schemas.get(vid, source_schema)
+                            src_id = exchange_source_ids.get(vid, 0)
+                            self._relay_exchange(vid, exchange_payloads[vid], ex_schema, src_id)
+                            del exchange_payloads[vid]
+                            del exchange_counts[vid]
+                            if vid in exchange_schemas:
+                                del exchange_schemas[vid]
+                            if vid in exchange_source_ids:
+                                del exchange_source_ids[vid]
+                    else:
+                        # ACK — swap-remove this worker from the poll set
+                        payload.close()
+                        last = len(poll_fds) - 1
+                        if pi != last:
+                            poll_fds[pi]    = poll_fds[last]
+                            poll_events[pi] = poll_events[last]
+                            poll_wids[pi]   = poll_wids[last]
+                        poll_fds.pop()
+                        poll_events.pop()
+                        poll_wids.pop()
+                pi -= 1
 
     def fan_out_scan(self, target_id, schema):
         """Send scan to all workers, concatenate result batches."""
