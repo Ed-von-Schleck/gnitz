@@ -2,8 +2,10 @@
 PYPY_PATH ?= ../pypy
 export PYTHONPATH := .:${PYPY_PATH}
 
-RPYTHON  := pypy2 ${PYPY_PATH}/rpython/bin/rpython
-RPYFLAGS := --opt=1 --gc=incminimark --lldebug
+RPYTHON          := pypy2 ${PYPY_PATH}/rpython/bin/rpython
+RPYFLAGS_DEV     := --opt=1 --gc=incminimark --lldebug
+RPYFLAGS_RELEASE := --opt=jit --gc=incminimark --lto
+RPYFLAGS         ?= $(RPYFLAGS_DEV)
 
 TEST_FILES := \
 	rpython_tests/core_comprehensive_test.py \
@@ -45,7 +47,7 @@ ALL_DATA_DIRS := storage_test_data dbsp_test_data zstore_test_data \
 
 LOG_DIR := .test_logs
 
-.PHONY: all test clean server pytest pytest-only e2e prove $(RUN_TARGETS)
+.PHONY: all test clean server pytest pytest-only e2e prove release-server release-test $(RUN_TARGETS)
 
 all: test
 
@@ -156,3 +158,9 @@ e2e: gnitz-server-c
 
 prove:
 	$(MAKE) -C proofs prove
+
+release-server:
+	$(MAKE) server RPYFLAGS="$(RPYFLAGS_RELEASE)"
+
+release-test:
+	$(MAKE) test RPYFLAGS="$(RPYFLAGS_RELEASE)"

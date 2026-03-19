@@ -49,9 +49,7 @@ def cleanup_dir(path):
         p = os.path.join(path, item)
         try:
             st = rposix_stat.stat(p)
-            import stat
-
-            if stat.S_ISDIR(st.st_mode):
+            if (st.st_mode & 0o170000) == 0o040000:
                 cleanup_dir(p)
             else:
                 os.unlink(p)

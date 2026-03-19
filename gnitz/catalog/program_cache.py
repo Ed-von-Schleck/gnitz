@@ -735,6 +735,14 @@ class ProgramCache(object):
                         agg_col_idx, agg_col_type, for_max,
                     )
 
+            # AVI must be integrated BEFORE op_reduce.  The AVI tracks
+            # (group || encoded_value) -> net weight for all historical rows,
+            # and op_reduce reads it to find the new min/max in O(log N).
+            # Updating after reduce would leave the AVI stale (pre-delta),
+            # causing wrong output on first push and on min/max retractions.
+            if agg_val_idx is not None:
+                program.append(instructions.integrate_op(in_reg, None,
+                                                         agg_value_idx=agg_val_idx))
             reduce_instr = instructions.reduce_op(
                 in_reg, tr_in_reg, tr_out_reg, out_delta_reg,
                 gcols, agg_funcs, reduce_out_schema,
@@ -745,10 +753,6 @@ class ProgramCache(object):
             if tr_in_table is not None:
                 program.append(instructions.integrate_op(in_reg, tr_in_table,
                                                          group_idx=grp_idx,
-                                                         agg_value_idx=agg_val_idx))
-            elif agg_val_idx is not None:
-                # Opt 2: no tr_in_table, but AVI must be updated each tick
-                program.append(instructions.integrate_op(in_reg, None,
                                                          agg_value_idx=agg_val_idx))
             return instructions.integrate_op(out_delta_reg, trace_table)
 

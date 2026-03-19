@@ -328,12 +328,16 @@ impl CircuitBuilder {
         if self.primary_source_id > 0 {
             deps.push(self.primary_source_id);
         }
-        for &(_, table_id) in &self.sources {
-            if table_id > 0 && !deps.contains(&table_id) {
-                deps.push(table_id);
-            }
-        }
-        // Include join source tables as dependencies
+        // Note: self.sources entries with table_id > 0 are trace-only SCAN_TRACE nodes
+        // (created via trace_scan()).  They act as read-only lookup tables and have no
+        // delta-input path in the circuit, so they must NOT appear in deps.  Changes to
+        // those tables do not trigger view recalculation, and backfilling them as if they
+        // were delta sources would bind their rows to the primary-input register, producing
+        // spurious output rows (e.g. a_val=0 when only B and C pre-existed in a chained join).
+        // True secondary delta sources are registered via input_delta_tagged(), which sets
+        // PARAM_JOIN_SOURCE_TABLE and appears in the params loop below.
+
+        // Include secondary delta-input sources (equijoin, multi-input circuits).
         for &(_, slot, value) in &self.params {
             if slot == PARAM_JOIN_SOURCE_TABLE && value > 0 && !deps.contains(&value) {
                 deps.push(value);

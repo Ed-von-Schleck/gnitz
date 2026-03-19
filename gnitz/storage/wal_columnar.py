@@ -230,6 +230,9 @@ def _parse_wal_block(ptr, total_size, schema):
     blob_buf = buffer_ops.Buffer.from_external_ptr(
         rffi.ptradd(ptr, offsets[region_idx]), sizes[region_idx]
     )
+    # offset tracks "bytes written"; must equal capacity so that re-encoding
+    # (e.g. DDL broadcast) copies the full blob arena instead of 0 bytes.
+    blob_buf.offset = sizes[region_idx]
 
     result_batch = ArenaZSetBatch.from_buffers(
         schema, pk_lo_buf, pk_hi_buf, weight_buf, null_buf,
