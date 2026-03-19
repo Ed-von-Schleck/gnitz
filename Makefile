@@ -66,7 +66,6 @@ all: test
 # ---------------------------------------------------------------------------
 
 test:
-	@$(MAKE) --no-print-directory clean
 	@mkdir -p $(LOG_DIR)
 	@$(MAKE) --no-print-directory -k $(RUN_TARGETS); \
 	 EXIT=$$?; \
@@ -110,10 +109,13 @@ $(TEST_BINS): %-c: rpython_tests/%.py
 	@$(RPYTHON) $(RPYFLAGS) $< 2>&1
 
 # Run: compile + execute, capture ALL output to log file.
+# Pre-clean: remove any stale binary, data dir, and previous log/pass for this test.
 # On success: create .pass marker, clean up binary + data.
 # On failure: leave binary + data for inspection.
 $(RUN_TARGETS): run-%-c: rpython_tests/%.py
 	@mkdir -p $(LOG_DIR)
+	@rm -f $*-c $(LOG_DIR)/$*-c.log $(LOG_DIR)/$*-c.pass
+	@rm -rf $(DATA_DIR_$*-c)
 	@( \
 	  echo "=== Compiling: $< ===" && \
 	  $(RPYTHON) $(RPYFLAGS) $< && \
