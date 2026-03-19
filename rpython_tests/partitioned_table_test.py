@@ -21,6 +21,7 @@ from gnitz.storage.partitioned_table import (
     NUM_PARTITIONS,
 )
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 
 # -- Helpers -------------------------------------------------------------------
@@ -388,6 +389,7 @@ def test_retract_pk_partitioned_absent(base_dir):
 
 
 def entry_point(argv):
+    ensure_jit_reachable()
     base_dir = "partitioned_table_test_data"
     if os.path.exists(base_dir):
         cleanup_dir(base_dir)

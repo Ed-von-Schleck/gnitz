@@ -9,6 +9,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import types, serialize, strings, comparator, batch, xxh, errors
 from gnitz.core import strings as string_logic
 from gnitz.core.batch import RowBuilder, ColumnarBatchAccessor
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 # ------------------------------------------------------------------------------
 # Helpers & Assertions
@@ -405,6 +406,7 @@ def test_batch_operations():
 
 
 def entry_point(argv):
+    ensure_jit_reachable()
     os.write(1, "--- GnitzDB Comprehensive Core Package Test ---\n")
 
     try:

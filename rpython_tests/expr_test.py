@@ -18,6 +18,7 @@ from gnitz.core import types, batch
 from gnitz.core.batch import RowBuilder
 from gnitz.dbsp.ops import linear
 from gnitz.dbsp.expr import ExprBuilder, ExprMapFunction, eval_expr
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 
 # ------------------------------------------------------------------------------
@@ -675,6 +676,7 @@ def test_emit_null():
 
 
 def entry_point(argv):
+    ensure_jit_reachable()
     try:
         test_int_comparisons()
         test_float_comparisons()

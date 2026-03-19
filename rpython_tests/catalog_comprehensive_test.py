@@ -13,6 +13,7 @@ from gnitz.core.strings import resolve_string
 from gnitz.catalog import identifiers
 from gnitz.catalog.engine import open_engine
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -816,6 +817,7 @@ def test_restart(base_dir):
 
 
 def entry_point(argv):
+    ensure_jit_reachable()
     os.write(1, "--- GnitzDB Comprehensive Catalog Test ---\n")
     base_dir = "catalog_test_data"
     cleanup_dir(base_dir)

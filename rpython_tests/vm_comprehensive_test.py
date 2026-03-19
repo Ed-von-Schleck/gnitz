@@ -11,6 +11,7 @@ from gnitz.core.batch import RowBuilder
 from gnitz.dbsp import functions
 from gnitz.vm import runtime, instructions, interpreter
 from gnitz.storage.ephemeral_table import EphemeralTable
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 # ------------------------------------------------------------------------------
 # RPython Debugging Helpers
@@ -1365,6 +1366,7 @@ def test_execute_epoch_evict():
 # ------------------------------------------------------------------------------
 
 def entry_point(argv):
+    ensure_jit_reachable()
     os.write(1, "--- GnitzDB Comprehensive VM Package Test ---\n")
     base_dir = "vm_test_data"
     cleanup_dir(base_dir)

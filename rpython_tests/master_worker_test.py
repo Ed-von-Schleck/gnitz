@@ -27,6 +27,7 @@ from gnitz.storage.partitioned_table import (
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID
 from gnitz.dbsp.ops.exchange import hash_row_by_columns
 from gnitz.dbsp.ops.group_index import _mix64
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 
 # -- Helpers -------------------------------------------------------------------
@@ -585,6 +586,7 @@ def test_empty_push_barrier(base_dir):
 
 
 def entry_point(argv):
+    ensure_jit_reachable()
     base_dir = "master_worker_test_data"
     if os.path.exists(base_dir):
         cleanup_dir(base_dir)

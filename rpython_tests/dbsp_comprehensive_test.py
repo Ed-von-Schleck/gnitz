@@ -19,6 +19,7 @@ from gnitz.core.batch import RowBuilder
 from gnitz.dbsp.ops import linear, join, anti_join, reduce, distinct, source, group_index
 from gnitz.dbsp import functions
 from gnitz.storage.ephemeral_table import EphemeralTable
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 
 # ------------------------------------------------------------------------------
@@ -2819,6 +2820,7 @@ def test_outer_join_delta_trace(base_dir):
 
 
 def entry_point(argv):
+    ensure_jit_reachable()
     base_dir = "dbsp_test_data"
     cleanup_dir(base_dir)
     os.mkdir(base_dir)

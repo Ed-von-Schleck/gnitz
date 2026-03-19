@@ -30,6 +30,7 @@ from gnitz.catalog.index_circuit import (
 from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.server.executor import evaluate_dag
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 # --- Diagnostic Helpers ---
 
@@ -729,6 +730,7 @@ def test_view_on_view_backfill_on_restart(base_dir):
 
 
 def entry_point(argv):
+    ensure_jit_reachable()
     os.write(1, "--- GnitzDB Additional Catalog Tests ---\n")
     base_dir = "catalog_additional_test_data"
     cleanup_dir(base_dir)

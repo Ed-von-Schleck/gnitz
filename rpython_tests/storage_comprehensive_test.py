@@ -38,6 +38,7 @@ from gnitz.storage.table import PersistentTable
 from gnitz.storage.partitioned_table import make_partitioned_ephemeral
 from gnitz.core.batch import ColumnarBatchAccessor, RowBuilder
 from gnitz.catalog.registry import _enforce_unique_pk, TableFamily
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -2778,6 +2779,7 @@ def test_flsm_guard_isolation(base_dir):
 
 
 def entry_point(argv):
+    ensure_jit_reachable()
     os.write(1, "--- GnitzDB Comprehensive Storage Test ---\n")
     base_dir = "storage_test_data"
     cleanup_dir(base_dir)

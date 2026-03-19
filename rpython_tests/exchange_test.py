@@ -30,6 +30,7 @@ from gnitz.dbsp.ops.exchange import (
 from gnitz.storage.partitioned_table import _partition_for_key
 from gnitz.server import ipc, ipc_ffi
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 
 # ------------------------------------------------------------------------------
@@ -705,6 +706,7 @@ def test_repartition_batches_merged():
 # ------------------------------------------------------------------------------
 
 def entry_point(argv):
+    ensure_jit_reachable()
     base_dir = "exchange_test_data"
     cleanup(base_dir)
     ensure_dir(base_dir)

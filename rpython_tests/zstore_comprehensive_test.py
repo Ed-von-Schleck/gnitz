@@ -19,6 +19,7 @@ from gnitz.catalog import engine, identifiers
 from gnitz.catalog.registry import ingest_to_family, validate_fk_inline
 from gnitz.catalog.metadata import ensure_dir
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 # -- RPython Safe Hex Formatting ----------------------------------------------
 
@@ -303,6 +304,7 @@ def test_programmable_zset_lifecycle():
 
 
 def entry_point(argv):
+    ensure_jit_reachable()
     rposix.write(1, "====================================================\n")
     rposix.write(1, "      GnitzDB Diagnostic Integration Suite          \n")
     rposix.write(1, "====================================================\n")

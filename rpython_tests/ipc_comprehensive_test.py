@@ -16,6 +16,7 @@ from gnitz.core.batch import RowBuilder
 from gnitz.storage import buffer, buffer as buffer_ops, mmap_posix
 from gnitz.storage import wal_columnar
 from gnitz.server import ipc, ipc_ffi
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 
 # ------------------------------------------------------------------------------
@@ -601,6 +602,7 @@ def test_control_schema_roundtrip():
 
 
 def entry_point(argv):
+    ensure_jit_reachable()
     os.write(1, "--- GnitzDB IPC Transport Test (WAL-block envelope) ---\n")
     try:
         test_unowned_buffer_lifecycle()

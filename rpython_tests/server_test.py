@@ -23,6 +23,7 @@ from gnitz.core.errors import LayoutError
 from gnitz.catalog import engine, system_tables as sys_tab
 from gnitz.catalog.metadata import ensure_dir
 from gnitz.server.executor import ServerExecutor
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 
 # ------------------------------------------------------------------------------
@@ -368,6 +369,7 @@ def test_reactive_view_via_push(srv, source_table_id):
 # ------------------------------------------------------------------------------
 
 def entry_point(argv):
+    ensure_jit_reachable()
     base_dir = "server_test_data"
     cleanup(base_dir)
     ensure_dir(base_dir)

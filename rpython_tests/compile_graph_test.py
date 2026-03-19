@@ -23,6 +23,7 @@ from gnitz.catalog import engine
 from gnitz.catalog.registry import ingest_to_family
 from gnitz.catalog.metadata import ensure_dir
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
+from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 
 # ------------------------------------------------------------------------------
@@ -1080,6 +1081,7 @@ def test_schema_mismatch_raises_layout_error(base_dir):
 # ------------------------------------------------------------------------------
 
 def entry_point(argv):
+    ensure_jit_reachable()
     base_dir = "compile_graph_test_data"
     cleanup(base_dir)
     ensure_dir(base_dir)
