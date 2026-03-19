@@ -292,9 +292,13 @@ class ViewEffectHook(DeltaHook):
 
                 self.engine.registry.register(family)
 
-                plan = self.engine.program_cache.get_program(vid)
-                if plan is not None and not _view_needs_exchange(plan):
-                    _backfill_view(self.engine, vid)
+                # Only compile and backfill on processes that own data partitions.
+                # The master in multi-worker mode sets active_part_end=0 and has no
+                # partition stores; view backfill is handled by workers via DDL sync.
+                if self.engine.registry.active_part_start != self.engine.registry.active_part_end:
+                    plan = self.engine.program_cache.get_program(vid)
+                    if plan is not None and not _view_needs_exchange(plan):
+                        _backfill_view(self.engine, vid)
             else:
                 if self.engine.registry.has_id(vid):
                     family = self.engine.registry.get_by_id(vid)

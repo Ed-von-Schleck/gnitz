@@ -813,6 +813,12 @@ class ProgramCache(object):
             # No register assignment — CLEAR_DELTAS resets all delta registers globally.
             return instructions.clear_deltas_op()
 
+        # Unknown opcode (e.g. obsolete opcode 21, old GATHER): treat as pass-through.
+        # Propagate the primary input register to the output slot so downstream nodes
+        # see a valid register instead of crashing on a null dereference.
+        in_reg_id_unk = in_regs.get(opcodes.PORT_IN, -1)
+        if in_reg_id_unk >= 0:
+            cur_reg_file.registers[reg_id] = cur_reg_file.registers[in_reg_id_unk]
         return None
 
     def compile_from_graph(self, view_id):

@@ -115,6 +115,13 @@ class WorkerProcess(object):
                 self._handle_ddl_sync(target_id, payload.batch)
                 return False
 
+            if flags & ipc.FLAG_BACKFILL:
+                source_tid = target_id
+                view_id = intmask(payload.seek_pk_lo)
+                self._handle_backfill(source_tid, view_id)
+                ipc.send_batch(self.master_fd, source_tid, None)
+                return False
+
             if flags & ipc.FLAG_HAS_PK:
                 self._handle_has_pk(target_id, payload.batch, intmask(payload.seek_col_idx))
                 return False
@@ -307,6 +314,28 @@ class WorkerProcess(object):
         finally:
             idx_cursor.close()
         return self._handle_seek(target_id, src_lo, src_hi)
+
+    def _handle_backfill(self, source_tid, view_id):
+        """Scan local partition of source, evaluate DAG (with exchange) for the view."""
+        if not self.engine.registry.has_id(source_tid):
+            return
+        family = self.engine.registry.get_by_id(source_tid)
+        schema = family.schema
+        local_batch = ArenaZSetBatch(schema)
+        cursor = family.store.create_cursor()
+        try:
+            while cursor.is_valid():
+                w = cursor.weight()
+                if w > r_int64(0):
+                    pk = cursor.key()
+                    acc = cursor.get_accessor()
+                    local_batch.append_from_accessor(r_uint128(pk), w, acc)
+                cursor.advance()
+        finally:
+            cursor.close()
+        evaluate_dag(self.engine, source_tid, local_batch,
+                     exchange_handler=self.exchange_handler)
+        local_batch.free()
 
     def _handle_ddl_sync(self, target_id, batch):
         """Replay a system-table delta to keep the local registry in sync.

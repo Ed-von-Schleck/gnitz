@@ -1042,12 +1042,11 @@ def test_reduce_multi_agg(base_dir):
 
 
 def test_schema_mismatch_raises_layout_error(base_dir):
-    """compile_from_graph raises LayoutError when circuit output schema doesn't match view family schema."""
+    """create_view raises LayoutError immediately when circuit output schema doesn't match declared columns."""
     log("[COMPILE] Testing schema mismatch raises LayoutError...")
     db = engine.open_engine(base_dir)
 
     db.create_schema("test")
-    # Input schema: pk(U64), col_a(I64), col_b(I64)
     table_cols = _make_table_cols_i64(["col_a", "col_b"])
     table = db.create_table("test.src", table_cols, 0)
 
@@ -1060,16 +1059,15 @@ def test_schema_mismatch_raises_layout_error(base_dir):
     out_cols = [("pk", types.TYPE_U64.code), ("col_a", types.TYPE_I64.code),
                 ("col_b", types.TYPE_I64.code)]
     graph = builder.build(out_cols)
-    db.create_view("test.v_mismatch", graph, "")  # stores graph; no schema check yet
 
-    view = db.get_table("test.v_mismatch")
     caught = False
     try:
-        db.program_cache.get_program(view.table_id)  # compiles circuit; check fires here
+        db.create_view("test.v_mismatch", graph, "")  # compiles on creation; schema check fires here
     except LayoutError:
         caught = True
     assert_true(caught, "expected LayoutError for schema column count mismatch")
 
+    # The family was registered before the schema check raised — drop it for clean teardown.
     db.drop_view("test.v_mismatch")
     db.drop_table("test.src")
     db.drop_schema("test")
@@ -1164,6 +1162,8 @@ def entry_point(argv):
         ensure_dir(base_dir)
 
         test_schema_mismatch_raises_layout_error(base_dir)
+        cleanup(base_dir)
+        ensure_dir(base_dir)
 
         log("\nALL COMPILE_GRAPH TESTS PASSED")
     except Exception as e:

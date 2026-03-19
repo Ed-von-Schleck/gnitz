@@ -16,6 +16,25 @@ from gnitz.server.master import MasterDispatcher
 from gnitz.dbsp.ops.exchange import PartitionAssignment
 from gnitz.server.worker import WorkerProcess
 
+
+def _backfill_exchange_views(engine, dispatcher):
+    """Issue fan_out_backfill for every exchange-requiring view."""
+    for family in engine.registry.iter_families():
+        vid = family.table_id
+        if vid < sys.FIRST_USER_TABLE_ID:
+            continue
+        plan = engine.program_cache.get_program(vid)
+        if plan is None:
+            continue
+        if plan.exchange_post_plan is None and plan.join_shard_map is None:
+            continue
+        source_ids = engine.program_cache.get_source_ids(vid)
+        for source_id in source_ids:
+            if not engine.registry.has_id(source_id):
+                continue
+            src_family = engine.registry.get_by_id(source_id)
+            dispatcher.fan_out_backfill(vid, source_id, src_family.schema)
+
 HELP_TEXT = (
     "gnitz-server — GnitzDB database server\n"
     "\n"
@@ -190,6 +209,8 @@ def entry_point(argv):
 
     dispatcher = MasterDispatcher(num_workers, parent_fds, worker_pids, assignment,
                                    engine.program_cache)
+
+    _backfill_exchange_views(engine, dispatcher)
 
     log.info("Listening on " + socket_path)
     os.write(1, "GnitzDB ready\n")

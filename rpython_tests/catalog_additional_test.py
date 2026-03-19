@@ -28,6 +28,8 @@ from gnitz.catalog.index_circuit import (
     make_secondary_index_name,
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
+from gnitz.server.executor import evaluate_dag
+from rpython_tests.helpers.circuit_builder import CircuitBuilder
 
 # --- Diagnostic Helpers ---
 
@@ -564,6 +566,167 @@ def test_fk_self_reference(base_dir):
     os.write(1, "    [OK] FK Self-reference verified.\n")
 
 
+def _make_passthrough_view(engine, view_name, source_family):
+    """Build a passthrough (SELECT *) view over source_family."""
+    schema = source_family.schema
+    out_cols = []
+    for col in schema.columns:
+        out_cols.append((col.name, col.field_type.code))
+    builder = CircuitBuilder(view_id=0, primary_source_id=source_family.table_id)
+    src = builder.input_delta()
+    builder.sink(src, target_table_id=0)
+    graph = builder.build(out_cols)
+    return engine.create_view(view_name, graph, "")
+
+
+def test_view_backfill_simple(base_dir):
+    os.write(1, "[Catalog+] Testing View Backfill on Creation...\n")
+    db_path = base_dir + "/view_backfill_simple"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+            core_types.ColumnDefinition(core_types.TYPE_I64, name="val"),
+        ]
+        family = engine.create_table("public.t", cols, 0)
+
+        b = batch.ArenaZSetBatch(family.schema)
+        rb = RowBuilder(family.schema, b)
+        for i in range(5):
+            rb.begin(r_uint128(r_uint64(i)), r_int64(1))
+            rb.put_int(r_int64(i * 10))
+            rb.commit()
+        ingest_to_family(family, b)
+        b.free()
+
+        view_family = _make_passthrough_view(engine, "public.v", family)
+
+        if _count_records(view_family.store) != 5:
+            raise Exception(
+                "View backfill on creation failed: expected 5, got %d"
+                % _count_records(view_family.store)
+            )
+
+        b2 = batch.ArenaZSetBatch(family.schema)
+        rb2 = RowBuilder(family.schema, b2)
+        rb2.begin(r_uint128(r_uint64(99)), r_int64(1))
+        rb2.put_int(r_int64(999))
+        rb2.commit()
+        effective2 = ingest_to_family(family, b2)
+        evaluate_dag(engine, family.table_id, effective2)
+        if effective2 is not b2:
+            effective2.free()
+        b2.free()
+
+        if _count_records(view_family.store) != 6:
+            raise Exception(
+                "Live view update failed: expected 6, got %d"
+                % _count_records(view_family.store)
+            )
+    finally:
+        engine.close()
+    os.write(1, "    [OK] View backfill on creation verified.\n")
+
+
+def test_view_backfill_on_restart(base_dir):
+    os.write(1, "[Catalog+] Testing View Backfill on Restart...\n")
+    db_path = base_dir + "/view_backfill_restart"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+            core_types.ColumnDefinition(core_types.TYPE_I64, name="val"),
+        ]
+        family = engine.create_table("public.t", cols, 0)
+        _make_passthrough_view(engine, "public.v", family)
+
+        b = batch.ArenaZSetBatch(family.schema)
+        rb = RowBuilder(family.schema, b)
+        for i in range(5):
+            rb.begin(r_uint128(r_uint64(i)), r_int64(1))
+            rb.put_int(r_int64(i * 10))
+            rb.commit()
+        ingest_to_family(family, b)
+        b.free()
+        family.store.flush()
+    finally:
+        engine.close()
+
+    engine2 = open_engine(db_path)
+    try:
+        view_family2 = engine2.registry.get("public", "v")
+        if _count_records(view_family2.store) != 5:
+            raise Exception(
+                "View backfill on restart failed: expected 5, got %d"
+                % _count_records(view_family2.store)
+            )
+    finally:
+        engine2.close()
+    os.write(1, "    [OK] View backfill on restart verified.\n")
+
+
+def test_view_on_view_backfill_on_restart(base_dir):
+    os.write(1, "[Catalog+] Testing View-on-View Backfill on Restart...\n")
+    db_path = base_dir + "/view_on_view_restart"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+            core_types.ColumnDefinition(core_types.TYPE_I64, name="val"),
+        ]
+        t = engine.create_table("public.t", cols, 0)
+
+        b = batch.ArenaZSetBatch(t.schema)
+        rb = RowBuilder(t.schema, b)
+        for val in [5, 20, 50, 80, 100]:
+            rb.begin(r_uint128(r_uint64(val)), r_int64(1))
+            rb.put_int(r_int64(val))
+            rb.commit()
+        ingest_to_family(t, b)
+        b.free()
+        t.store.flush()
+
+        v1_family = _make_passthrough_view(engine, "public.v1", t)
+        v2_family = _make_passthrough_view(engine, "public.v2", v1_family)
+
+        c1 = _count_records(v1_family.store)
+        if c1 != 5:
+            raise Exception("V1 backfill on creation: expected 5, got %d" % c1)
+        c2 = _count_records(v2_family.store)
+        if c2 != 5:
+            raise Exception("V2 backfill on creation: expected 5, got %d" % c2)
+
+        if v1_family.depth != 1:
+            raise Exception("V1 depth: expected 1, got %d" % v1_family.depth)
+        if v2_family.depth != 2:
+            raise Exception("V2 depth: expected 2, got %d" % v2_family.depth)
+    finally:
+        engine.close()
+
+    engine2 = open_engine(db_path)
+    try:
+        v1_f2 = engine2.registry.get("public", "v1")
+        v2_f2 = engine2.registry.get("public", "v2")
+        c1 = _count_records(v1_f2.store)
+        if c1 != 5:
+            raise Exception("V1 backfill on restart: expected 5, got %d" % c1)
+        c2 = _count_records(v2_f2.store)
+        if c2 != 5:
+            raise Exception("V2 backfill on restart: expected 5, got %d" % c2)
+    finally:
+        engine2.close()
+    os.write(1, "    [OK] View-on-view backfill on restart verified.\n")
+
+
 # --- Entry Point ---
 
 
@@ -588,7 +751,16 @@ def entry_point(argv):
         test_fk_invalid_targets(base_dir)
         test_fk_self_reference(base_dir)
 
+        # View backfill tests
+        test_view_backfill_simple(base_dir)
+        test_view_backfill_on_restart(base_dir)
+        test_view_on_view_backfill_on_restart(base_dir)
+
         os.write(1, "\nALL ADDITIONAL CATALOG TEST PATHS PASSED\n")
+    except GnitzError as e:
+        os.write(2, "\nADDITIONAL TEST FAILED\n")
+        os.write(2, "Error: " + e.msg + "\n")
+        return 1
     except Exception as e:
         os.write(2, "\nADDITIONAL TEST FAILED\n")
         os.write(2, "Error: " + str(e) + "\n")

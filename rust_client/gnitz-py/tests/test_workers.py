@@ -278,7 +278,7 @@ def test_workers_view_cascade(client):
 
 @_NEEDS_MULTI
 def test_workers_view_ddl_then_push(client):
-    """Push rows THEN create view; push more rows; scan view → only post-creation rows."""
+    """Push rows THEN create view; push more rows; scan view → all rows via backfill."""
     sn = "w" + _uid()
     client.create_schema(sn)
     try:
@@ -286,20 +286,46 @@ def test_workers_view_ddl_then_push(client):
             "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
             schema_name=sn,
         )
-        # Push rows BEFORE view creation — should NOT appear in view
+        # Push rows BEFORE view creation — should appear via backfill
         client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
 
         client.execute_sql("CREATE VIEW v AS SELECT * FROM t", schema_name=sn)
 
-        # Push rows AFTER view creation — should appear in view
+        # Push rows AFTER view creation — should also appear in view
         client.execute_sql("INSERT INTO t VALUES (2, 20), (3, 30)", schema_name=sn)
 
         vid, _ = client.resolve_table(sn, "v")
         pks = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
-        # Only post-creation rows (no backfill)
-        assert pks == [2, 3]
+        # Pre-creation row now visible via backfill
+        assert pks == [1, 2, 3]
     finally:
         _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+@_NEEDS_MULTI
+def test_workers_view_on_view_backfill(client):
+    """Insert rows, then create v1 then v2 (view on view); both get backfilled."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 30), (3, 100)", schema_name=sn)
+
+        client.execute_sql("CREATE VIEW v1 AS SELECT * FROM t WHERE val > 10", schema_name=sn)
+        client.execute_sql("CREATE VIEW v2 AS SELECT * FROM v1 WHERE val > 50", schema_name=sn)
+
+        v1_id, _ = client.resolve_table(sn, "v1")
+        v2_id, _ = client.resolve_table(sn, "v2")
+
+        v1_pks = sorted(r.pk for r in client.scan(v1_id) if r.weight > 0)
+        v2_pks = sorted(r.pk for r in client.scan(v2_id) if r.weight > 0)
+        assert v1_pks == [2, 3], "v1 backfill: expected [2,3] got %s" % v1_pks
+        assert v2_pks == [3], "v2 backfill: expected [3] got %s" % v2_pks
+    finally:
+        _drop_all(client, sn, views=["v2", "v1"], tables=["t"])
 
 
 @_NEEDS_MULTI

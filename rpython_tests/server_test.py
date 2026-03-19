@@ -353,10 +353,11 @@ def test_reactive_view_via_push(srv, source_table_id):
     srv.handle_push(source_table_id, b)
     b.free()
 
-    # Scan the view — should have the 2 passing rows
+    # Scan the view — should have 3 passing rows:
+    # pk=3 (val=300) backfilled from existing data + pk=11 (val=250) + pk=12 (val=500)
     view_result = srv.handle_push(vid, None)
     assert_true(view_result is not None, "view scan returned None")
-    assert_equal_i(2, view_result.length(), "view should have 2 rows")
+    assert_equal_i(3, view_result.length(), "view should have 3 rows")
     view_result.free()
 
     log("  PASSED")
