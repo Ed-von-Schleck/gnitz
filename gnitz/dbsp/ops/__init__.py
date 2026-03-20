@@ -13,6 +13,6 @@ from gnitz.dbsp.ops.anti_join import (
     op_anti_join_delta_trace, op_anti_join_delta_delta,
     op_semi_join_delta_trace, op_semi_join_delta_delta,
 )
-from gnitz.dbsp.ops.reduce import op_reduce
+from gnitz.dbsp.ops.reduce import op_reduce, op_gather_reduce
 from gnitz.dbsp.ops.distinct import op_distinct
 from gnitz.dbsp.ops.source import op_scan_trace, op_seek_trace, op_clear_deltas

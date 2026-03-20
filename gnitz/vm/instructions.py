@@ -143,6 +143,15 @@ def join_delta_delta_op(reg_a, reg_b, reg_out):
     return i
 
 
+def gather_reduce_op(reg_in, reg_trace_out, reg_out, agg_funcs):
+    i = Instruction(op.OPCODE_GATHER_REDUCE)
+    i.reg_in = reg_in
+    i.reg_trace_out = reg_trace_out
+    i.reg_out = reg_out
+    i.agg_funcs = agg_funcs
+    return i
+
+
 def reduce_op(
     reg_in, reg_trace_in, reg_trace_out, reg_out,
     group_by_cols, agg_funcs, output_schema,

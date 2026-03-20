@@ -25,6 +25,7 @@ OPCODE_SEMI_JOIN_DELTA_TRACE = 18
 OPCODE_SEMI_JOIN_DELTA_DELTA = 19
 OPCODE_JOIN_DELTA_TRACE_OUTER = 22
 # 23 reserved for OPCODE_JOIN_DELTA_DELTA_OUTER (future)
+OPCODE_GATHER_REDUCE = 24
 
 # Compile-time markers (not VM opcodes — never emitted as instructions)
 OPCODE_EXCHANGE_SHARD  = 20

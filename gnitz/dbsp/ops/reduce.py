@@ -5,12 +5,12 @@ from rpython.rlib.longlong2float import longlong2float
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
-from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 from gnitz.core import types, strings, errors
 from gnitz.core.comparator import RowAccessor
 from gnitz.core.batch import (
-    ArenaZSetBatch, ConsolidatedScope, BatchWriter, ColumnarBatchAccessor,
+    ArenaZSetBatch, SortedScope, BatchWriter, ColumnarBatchAccessor,
+    pk_lt, pk_eq,
 )
 from gnitz.dbsp.functions import NULL_AGGREGATE, AggregateFunction
 from gnitz.dbsp.ops.group_index import (
@@ -146,11 +146,18 @@ class ReduceAccessor(RowAccessor):
         return 0.0
 
     @jit.unroll_safe
-    def get_u128(self, col_idx):
+    def get_u128_lo(self, col_idx):
         src = self.mapping_to_input[col_idx]
         if src >= 0 and self.exemplar is not None:
-            return self.exemplar.get_u128(src)
-        return r_uint128(0)
+            return self.exemplar.get_u128_lo(src)
+        return r_uint64(0)
+
+    @jit.unroll_safe
+    def get_u128_hi(self, col_idx):
+        src = self.mapping_to_input[col_idx]
+        if src >= 0 and self.exemplar is not None:
+            return self.exemplar.get_u128_hi(src)
+        return r_uint64(0)
 
     @jit.unroll_safe
     def get_str_struct(self, col_idx):
@@ -194,10 +201,12 @@ def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):
             if va < vb: return -1
             if va > vb: return 1
         elif col_type == types.TYPE_U128.code:
-            va = accessor_a.get_u128(col_idx)
-            vb = accessor_b.get_u128(col_idx)
-            if va < vb: return -1
-            if va > vb: return 1
+            va_lo = accessor_a.get_u128_lo(col_idx)
+            va_hi = accessor_a.get_u128_hi(col_idx)
+            vb_lo = accessor_b.get_u128_lo(col_idx)
+            vb_hi = accessor_b.get_u128_hi(col_idx)
+            if pk_lt(va_lo, va_hi, vb_lo, vb_hi): return -1
+            if pk_lt(vb_lo, vb_hi, va_lo, va_hi): return 1
         elif (
             col_type == types.TYPE_I8.code or col_type == types.TYPE_I16.code or
             col_type == types.TYPE_I32.code or col_type == types.TYPE_I64.code
@@ -214,6 +223,49 @@ def _compare_by_cols(accessor_a, accessor_b, schema, col_indices):
     return 0
 
 
+def _insertion_sort_i64(indices, keys, lo, hi):
+    for i in range(lo + 1, hi):
+        key_idx = indices[i]
+        key_val = keys[key_idx]
+        j = i - 1
+        while j >= lo and keys[indices[j]] > key_val:
+            indices[j + 1] = indices[j]
+            j -= 1
+        indices[j + 1] = key_idx
+
+
+def _merge_i64(indices, keys, lo, mid, hi, scratch):
+    if keys[indices[mid - 1]] <= keys[indices[mid]]:
+        return
+    for k in range(lo, mid):
+        scratch[k] = indices[k]
+    i = lo
+    j = mid
+    k = lo
+    while i < mid and j < hi:
+        if keys[scratch[i]] <= keys[indices[j]]:
+            indices[k] = scratch[i]
+            i += 1
+        else:
+            indices[k] = indices[j]
+            j += 1
+        k += 1
+    while i < mid:
+        indices[k] = scratch[i]
+        i += 1
+        k += 1
+
+
+def _mergesort_i64(indices, keys, lo, hi, scratch):
+    if hi - lo <= 32:
+        _insertion_sort_i64(indices, keys, lo, hi)
+        return
+    mid = (lo + hi) >> 1
+    _mergesort_i64(indices, keys, lo, mid, scratch)
+    _mergesort_i64(indices, keys, mid, hi, scratch)
+    _merge_i64(indices, keys, lo, mid, hi, scratch)
+
+
 def _argsort_delta(batch, schema, col_indices):
     count = batch.length()
     indices = newlist_hint(count)
@@ -223,6 +275,26 @@ def _argsort_delta(batch, schema, col_indices):
     if count <= 1:
         return indices
 
+    # Fast path: single I64 group column — pre-extract keys, sort with direct int comparison
+    if len(col_indices) == 1:
+        ci = col_indices[0]
+        col_type = schema.columns[ci].field_type
+        if col_type.code == types.TYPE_I64.code:
+            col_base = batch.col_bufs[ci].base_ptr
+            keys = newlist_hint(count)
+            for i in range(count):
+                ptr = rffi.ptradd(col_base, i * 8)
+                keys.append(intmask(rffi.cast(rffi.LONGLONGP, ptr)[0]))
+            if count <= 32:
+                _insertion_sort_i64(indices, keys, 0, count)
+            else:
+                scratch = newlist_hint(count)
+                for _ in range(count):
+                    scratch.append(0)
+                _mergesort_i64(indices, keys, 0, count, scratch)
+            return indices
+
+    # General path: accessor dispatch (multi-column or non-integer types)
     acc_a = ColumnarBatchAccessor(schema)
     acc_b = ColumnarBatchAccessor(schema)
     if count <= 32:
@@ -299,13 +371,13 @@ def _apply_agg_from_value_index(avi_cursor, gc_u64, for_max, agg_col_type, agg_f
     Resets agg_func if the group is empty (no positive-weight entry found).
     Returns True if a value was found.
     """
-    avi_cursor.seek(r_uint128(gc_u64) << 64)
+    avi_cursor.seek(r_uint64(0), gc_u64)
     while avi_cursor.is_valid():
-        k = avi_cursor.key()
-        if r_uint64(intmask(k >> 64)) != gc_u64:
+        k_hi = avi_cursor.key_hi()
+        if k_hi != gc_u64:
             break
         if avi_cursor.weight() > r_int64(0):
-            encoded = r_uint64(intmask(k))
+            encoded = avi_cursor.key_lo()
             if for_max:
                 encoded = r_uint64(~intmask(encoded))
             code = agg_col_type.code
@@ -324,17 +396,17 @@ def _apply_agg_from_value_index(avi_cursor, gc_u64, for_max, agg_col_type, agg_f
     return False
 
 
-def _emit_reduce_row(out_writer, fin_out_writer, group_key, weight, reduce_acc,
+def _emit_reduce_row(out_writer, fin_out_writer, group_key_lo, group_key_hi, weight, reduce_acc,
                      finalize_prog):
     """Emit one raw row + optionally a finalized row (for AVG etc.)."""
-    out_writer.append_from_accessor(group_key, weight, reduce_acc)
+    out_writer.append_from_accessor(group_key_lo, group_key_hi, weight, reduce_acc)
     if finalize_prog is not None and fin_out_writer is not None:
         from gnitz.core.batch import RowBuilder
         from gnitz.dbsp.expr import eval_expr_map
         finalized_schema = fin_out_writer._batch._schema
         builder = RowBuilder(finalized_schema, fin_out_writer._batch)
         eval_expr_map(finalize_prog, reduce_acc, builder)
-        builder.commit_row(group_key, weight)
+        builder.commit_row(group_key_lo, group_key_hi, weight)
 
 
 def op_reduce(
@@ -370,187 +442,316 @@ def op_reduce(
     for _i in range(num_aggs):
         dummy_old_vals.append(r_uint64(0))
 
-    # 1. Obtain a consolidated view of the input delta
-    with ConsolidatedScope(delta_in) as b:
+    # Hoist linearity flags early: determines whether consolidation is needed.
+    # is_linear() is a compile-time constant per agg_func (Opt 5).
+    agg_lin_flags = newlist_hint(num_aggs)
+    all_linear = True
+    for af in agg_funcs:
+        lin = jit.promote(af.is_linear())
+        agg_lin_flags.append(lin)
+        if not lin:
+            all_linear = False
+    all_linear = jit.promote(all_linear)
+
+    # 1. Obtain a view of the input delta.
+    # For linear aggregates, consolidation is semantically unnecessary:
+    # Σ(w_i * f(x_i)) is weight-linear and order-independent, so PK merging
+    # gives the same result. Skipping it avoids an O(N log N) sort+copy.
+    if all_linear:
+        b = delta_in
+        b_to_free = None
+    else:
+        b = delta_in.to_consolidated()
+        b_to_free = b if b is not delta_in else None
+
+    n = b.length()
+    if n == 0:
+        if b_to_free is not None:
+            b_to_free.free()
+        return
+
+    # 2. Grouping
+    group_by_pk = (
+        len(group_by_cols) == 1
+        and group_by_cols[0] == input_schema.pk_index
+    )
+
+    if group_by_pk:
+        sorted_indices = newlist_hint(n)
+        for i in range(n):
+            sorted_indices.append(i)
+    else:
+        sorted_indices = _argsort_delta(b, input_schema, group_by_cols)
+
+    acc_in = ColumnarBatchAccessor(input_schema)
+    acc_exemplar = ColumnarBatchAccessor(input_schema)
+    reduce_acc = ReduceAccessor(input_schema, output_schema, group_by_cols, num_aggs)
+
+    # Hoist cursors: create once outside the per-group loop (Opt 3)
+    gi_cursor = None
+    avi_cursor = None
+    if trace_in_group_idx is not None:
+        gi_cursor = trace_in_group_idx.create_cursor()
+    if agg_value_idx is not None:
+        avi_cursor = agg_value_idx.create_cursor()
+
+    idx = 0
+    while idx < n:
+        # --- Start of Group ---
+        group_start_pos = idx
+        group_start_idx = sorted_indices[group_start_pos]
+
+        b.bind_accessor(group_start_idx, acc_exemplar)
+        if group_by_pk:
+            group_key_lo = b.get_pk_lo(group_start_idx)
+            group_key_hi = b.get_pk_hi(group_start_idx)
+        else:
+            group_key_lo, group_key_hi = _extract_group_key(acc_exemplar, input_schema, group_by_cols)
+
+        # 3. Calculate Delta contribution for this group
+        for af in agg_funcs:
+            af.reset()
+        while idx < n:
+            curr_idx = sorted_indices[idx]
+            b.bind_accessor(curr_idx, acc_in)
+
+            if group_by_pk:
+                if not pk_eq(b.get_pk_lo(curr_idx), b.get_pk_hi(curr_idx), group_key_lo, group_key_hi):
+                    break
+            else:
+                if _compare_by_cols(acc_in, acc_exemplar, input_schema, group_by_cols) != 0:
+                    break
+
+            w = b.get_weight(curr_idx)
+            for k in range(num_aggs):
+                if agg_lin_flags[k]:
+                    agg_funcs[k].step(acc_in, w)
+            idx += 1
+
+        # 4. Retraction: Agg(history)
+        trace_out_cursor.seek(group_key_lo, group_key_hi)
+        has_old = False
+        old_vals_bits = dummy_old_vals
+        if trace_out_cursor.is_valid() and pk_eq(trace_out_cursor.key_lo(), trace_out_cursor.key_hi(), group_key_lo, group_key_hi):
+            has_old = True
+            old_vals_bits = newlist_hint(num_aggs)
+            trace_acc = trace_out_cursor.get_accessor()
+            for k in range(num_aggs):
+                agg_col_idx = num_out_cols - num_aggs + k
+                old_vals_bits.append(trace_acc.get_int(agg_col_idx))
+
+            reduce_acc.set_context(acc_exemplar, agg_funcs, old_vals_bits, True)
+            _emit_reduce_row(out_writer, fin_out_writer, group_key_lo, group_key_hi, r_int64(-1),
+                             reduce_acc, finalize_prog)
+
+        # 5. New Value Calculation: Agg(history + delta)
+        if all_linear and has_old:
+            for k in range(num_aggs):
+                agg_funcs[k].merge_accumulated(old_vals_bits[k], r_int64(1))
+        else:
+            if not all_linear:
+                if avi_cursor is not None:
+                    # AVI path: O(log N + 1) — seed accumulator from index
+                    gc_u64 = _extract_gc_u64(
+                        acc_exemplar, agg_value_idx.input_schema,
+                        agg_value_idx.group_by_cols,
+                    )
+                    _apply_agg_from_value_index(
+                        avi_cursor, gc_u64, agg_value_idx.for_max,
+                        agg_value_idx.agg_col_type, agg_funcs[0],
+                    )
+                else:
+                    replay = ArenaZSetBatch(input_schema, initial_capacity=32)
+
+                    if trace_in_cursor is not None:
+                        if group_by_pk:
+                            trace_in_cursor.seek(group_key_lo, group_key_hi)
+                            while trace_in_cursor.is_valid() and pk_eq(trace_in_cursor.key_lo(), trace_in_cursor.key_hi(), group_key_lo, group_key_hi):
+                                replay.append_from_accessor(
+                                    trace_in_cursor.key_lo(), trace_in_cursor.key_hi(),
+                                    trace_in_cursor.weight(),
+                                    trace_in_cursor.get_accessor(),
+                                )
+                                trace_in_cursor.advance()
+                        else:
+                            if gi_cursor is not None:
+                                gc_u64 = _gi_promote(
+                                    acc_exemplar,
+                                    trace_in_group_idx.col_idx,
+                                    trace_in_group_idx.col_type,
+                                )
+                                gi_cursor.seek(r_uint64(0), gc_u64)
+                                while gi_cursor.is_valid():
+                                    gk_hi = gi_cursor.key_hi()
+                                    if gk_hi != gc_u64:
+                                        break
+                                    if gi_cursor.weight() > r_int64(0):
+                                        spk_lo_u64 = gi_cursor.key_lo()
+                                        spk_hi_u64 = r_uint64(rffi.cast(
+                                            rffi.ULONGLONG,
+                                            gi_cursor.get_accessor().get_int_signed(1),
+                                        ))
+                                        trace_in_cursor.seek(spk_lo_u64, spk_hi_u64)
+                                        if (trace_in_cursor.is_valid()
+                                                and pk_eq(trace_in_cursor.key_lo(), trace_in_cursor.key_hi(), spk_lo_u64, spk_hi_u64)):
+                                            replay.append_from_accessor(
+                                                trace_in_cursor.key_lo(),
+                                                trace_in_cursor.key_hi(),
+                                                trace_in_cursor.weight(),
+                                                trace_in_cursor.get_accessor(),
+                                            )
+                                    gi_cursor.advance()
+                            else:
+                                trace_in_cursor.seek(r_uint64(0), r_uint64(0))
+                                while trace_in_cursor.is_valid():
+                                    trace_acc = trace_in_cursor.get_accessor()
+                                    if _compare_by_cols(trace_acc, acc_exemplar,
+                                                        input_schema, group_by_cols) == 0:
+                                        replay.append_from_accessor(
+                                            trace_in_cursor.key_lo(),
+                                            trace_in_cursor.key_hi(),
+                                            trace_in_cursor.weight(),
+                                            trace_acc,
+                                        )
+                                    trace_in_cursor.advance()
+
+                    for k in range(group_start_pos, idx):
+                        d_idx = sorted_indices[k]
+                        b.bind_accessor(d_idx, acc_in)
+                        replay.append_from_accessor(
+                            b.get_pk_lo(d_idx), b.get_pk_hi(d_idx), b.get_weight(d_idx), acc_in,
+                        )
+
+                    merged = replay.to_consolidated()
+                    for af in agg_funcs:
+                        af.reset()
+                    replay_acc = ColumnarBatchAccessor(input_schema)
+                    for m in range(merged.length()):
+                        w = merged.get_weight(m)
+                        if w > r_int64(0):
+                            merged.bind_accessor(m, replay_acc)
+                            for af in agg_funcs:
+                                af.step(replay_acc, w)
+                    if merged is not replay:
+                        merged.free()
+                    replay.free()
+
+        # 6. Emission: +1 Agg(history + delta)
+        any_nonzero = False
+        for af in agg_funcs:
+            if not af.is_accumulator_zero():
+                any_nonzero = True
+                break
+        if any_nonzero:
+            reduce_acc.set_context(acc_exemplar, agg_funcs, dummy_old_vals, False)
+            _emit_reduce_row(out_writer, fin_out_writer, group_key_lo, group_key_hi, r_int64(1),
+                             reduce_acc, finalize_prog)
+
+    if gi_cursor is not None:
+        gi_cursor.close()
+    if avi_cursor is not None:
+        avi_cursor.close()
+
+    out_writer.mark_sorted(group_by_pk)
+
+    if b_to_free is not None:
+        b_to_free.free()
+
+
+def op_gather_reduce(
+    partial_batch,
+    partial_schema,
+    trace_out_cursor,
+    trace_out_table,
+    out_writer,
+    agg_funcs,
+):
+    """
+    Gather-reduce: merge partial aggregate deltas from workers that had local
+    changes this tick, fold with the old global value from trace_out, and emit
+    the net global delta.
+
+    Correct only for linear aggregates (COUNT, SUM, COUNT_NON_NULL).
+    trace_out_table is used by the integrate_op instruction that follows.
+    """
+    if agg_funcs is None:
+        return
+
+    num_aggs = len(agg_funcs)
+    num_out_cols = len(partial_schema.columns)
+
+    dummy_old_vals = newlist_hint(num_aggs)
+    for _i in range(num_aggs):
+        dummy_old_vals.append(r_uint64(0))
+
+    # Derive group_indices for ReduceAccessor from partial_schema layout.
+    # Agg cols = last num_aggs positions; non-agg non-PK cols = 1..K.
+    num_group_cols = num_out_cols - 1 - num_aggs
+    group_indices_in_partial = newlist_hint(1)
+    if num_group_cols == 0:
+        # use_natural_pk=True: group col IS the PK at col 0.
+        group_indices_in_partial.append(0)
+    else:
+        for _gi in range(num_group_cols):
+            group_indices_in_partial.append(1 + _gi)
+
+    reduce_acc = ReduceAccessor(partial_schema, partial_schema,
+                                group_indices_in_partial, num_aggs)
+
+    # SortedScope: sort by PK without merging rows — multiple workers may
+    # contribute rows with the same group PK and different agg column values.
+    with SortedScope(partial_batch) as b:
         n = b.length()
         if n == 0:
             return
 
-        # 2. Grouping
-        group_by_pk = (
-            len(group_by_cols) == 1
-            and group_by_cols[0] == input_schema.pk_index
-        )
-
-        if group_by_pk:
-            sorted_indices = newlist_hint(n)
-            for i in range(n):
-                sorted_indices.append(i)
-        else:
-            sorted_indices = _argsort_delta(b, input_schema, group_by_cols)
-
-        acc_in = ColumnarBatchAccessor(input_schema)
-        acc_exemplar = ColumnarBatchAccessor(input_schema)
-        reduce_acc = ReduceAccessor(input_schema, output_schema, group_by_cols, num_aggs)
-
-        # Hoist linearity flags: is_linear() is a compile-time constant per agg_func (Opt 5)
-        agg_lin_flags = newlist_hint(num_aggs)
-        all_linear = True
-        for af in agg_funcs:
-            lin = jit.promote(af.is_linear())
-            agg_lin_flags.append(lin)
-            if not lin:
-                all_linear = False
-        all_linear = jit.promote(all_linear)
-
-        # Hoist cursors: create once outside the per-group loop (Opt 3)
-        gi_cursor = None
-        avi_cursor = None
-        if trace_in_group_idx is not None:
-            gi_cursor = trace_in_group_idx.create_cursor()
-        if agg_value_idx is not None:
-            avi_cursor = agg_value_idx.create_cursor()
+        acc_in = ColumnarBatchAccessor(partial_schema)
+        acc_exemplar = ColumnarBatchAccessor(partial_schema)
 
         idx = 0
         while idx < n:
-            # --- Start of Group ---
-            group_start_pos = idx
-            group_start_idx = sorted_indices[group_start_pos]
+            group_key_lo = b.get_pk_lo(idx)
+            group_key_hi = b.get_pk_hi(idx)
+            b.bind_accessor(idx, acc_exemplar)
 
-            b.bind_accessor(group_start_idx, acc_exemplar)
-            if group_by_pk:
-                group_key = b.get_pk(group_start_idx)
-            else:
-                group_key = _extract_group_key(acc_exemplar, input_schema, group_by_cols)
-
-            # 3. Calculate Delta contribution for this group
             for af in agg_funcs:
                 af.reset()
-            while idx < n:
-                curr_idx = sorted_indices[idx]
-                b.bind_accessor(curr_idx, acc_in)
 
-                if group_by_pk:
-                    if b.get_pk(curr_idx) != group_key:
-                        break
-                else:
-                    if _compare_by_cols(acc_in, acc_exemplar, input_schema, group_by_cols) != 0:
-                        break
-
-                w = b.get_weight(curr_idx)
+            # Accumulate all partial deltas for this group.
+            while idx < n and pk_eq(b.get_pk_lo(idx), b.get_pk_hi(idx),
+                                    group_key_lo, group_key_hi):
+                b.bind_accessor(idx, acc_in)
+                w = b.get_weight(idx)
                 for k in range(num_aggs):
-                    if agg_lin_flags[k]:
-                        agg_funcs[k].step(acc_in, w)
+                    bits = acc_in.get_int(num_out_cols - num_aggs + k)
+                    if w > r_int64(0):
+                        agg_funcs[k].combine(bits)
+                    elif w < r_int64(0):
+                        agg_funcs[k].merge_accumulated(bits, r_int64(-1))
                 idx += 1
 
-            # 4. Retraction: Agg(history)
-            trace_out_cursor.seek(group_key)
-            has_old = False
+            # Read old global from trace_out and fold in.
+            trace_out_cursor.seek(group_key_lo, group_key_hi)
             old_vals_bits = dummy_old_vals
-            if trace_out_cursor.is_valid() and trace_out_cursor.key() == group_key:
-                has_old = True
+            if trace_out_cursor.is_valid() and pk_eq(trace_out_cursor.key_lo(),
+                                                     trace_out_cursor.key_hi(),
+                                                     group_key_lo, group_key_hi):
                 old_vals_bits = newlist_hint(num_aggs)
                 trace_acc = trace_out_cursor.get_accessor()
                 for k in range(num_aggs):
                     agg_col_idx = num_out_cols - num_aggs + k
                     old_vals_bits.append(trace_acc.get_int(agg_col_idx))
 
+                # Emit retraction of old global.
                 reduce_acc.set_context(acc_exemplar, agg_funcs, old_vals_bits, True)
-                _emit_reduce_row(out_writer, fin_out_writer, group_key, r_int64(-1),
-                                 reduce_acc, finalize_prog)
+                out_writer.append_from_accessor(group_key_lo, group_key_hi,
+                                                r_int64(-1), reduce_acc)
 
-            # 5. New Value Calculation: Agg(history + delta)
-            if all_linear and has_old:
+                # Fold old global into accumulator: new_global = delta + old_global.
                 for k in range(num_aggs):
                     agg_funcs[k].merge_accumulated(old_vals_bits[k], r_int64(1))
-            else:
-                if not all_linear:
-                    if avi_cursor is not None:
-                        # AVI path: O(log N + 1) — seed accumulator from index
-                        gc_u64 = _extract_gc_u64(
-                            acc_exemplar, agg_value_idx.input_schema,
-                            agg_value_idx.group_by_cols,
-                        )
-                        _apply_agg_from_value_index(
-                            avi_cursor, gc_u64, agg_value_idx.for_max,
-                            agg_value_idx.agg_col_type, agg_funcs[0],
-                        )
-                    else:
-                        replay = ArenaZSetBatch(input_schema, initial_capacity=32)
 
-                        if trace_in_cursor is not None:
-                            if group_by_pk:
-                                trace_in_cursor.seek(group_key)
-                                while trace_in_cursor.is_valid() and trace_in_cursor.key() == group_key:
-                                    replay.append_from_accessor(
-                                        trace_in_cursor.key(), trace_in_cursor.weight(),
-                                        trace_in_cursor.get_accessor(),
-                                    )
-                                    trace_in_cursor.advance()
-                            else:
-                                if gi_cursor is not None:
-                                    gc_u64 = _gi_promote(
-                                        acc_exemplar,
-                                        trace_in_group_idx.col_idx,
-                                        trace_in_group_idx.col_type,
-                                    )
-                                    target_prefix = r_uint128(gc_u64) << 64
-                                    gi_cursor.seek(target_prefix)
-                                    while gi_cursor.is_valid():
-                                        gk = gi_cursor.key()
-                                        if r_uint64(intmask(gk >> 64)) != gc_u64:
-                                            break
-                                        if gi_cursor.weight() > r_int64(0):
-                                            spk_lo = r_uint128(r_uint64(intmask(gk)))
-                                            spk_hi = r_uint128(rffi.cast(
-                                                rffi.ULONGLONG,
-                                                gi_cursor.get_accessor().get_int_signed(1),
-                                            ))
-                                            src_pk = (spk_hi << 64) | spk_lo
-                                            trace_in_cursor.seek(src_pk)
-                                            if (trace_in_cursor.is_valid()
-                                                    and trace_in_cursor.key() == src_pk):
-                                                replay.append_from_accessor(
-                                                    trace_in_cursor.key(),
-                                                    trace_in_cursor.weight(),
-                                                    trace_in_cursor.get_accessor(),
-                                                )
-                                        gi_cursor.advance()
-                                else:
-                                    trace_in_cursor.seek(r_uint128(0))
-                                    while trace_in_cursor.is_valid():
-                                        trace_acc = trace_in_cursor.get_accessor()
-                                        if _compare_by_cols(trace_acc, acc_exemplar,
-                                                            input_schema, group_by_cols) == 0:
-                                            replay.append_from_accessor(
-                                                trace_in_cursor.key(),
-                                                trace_in_cursor.weight(),
-                                                trace_acc,
-                                            )
-                                        trace_in_cursor.advance()
-
-                        for k in range(group_start_pos, idx):
-                            d_idx = sorted_indices[k]
-                            b.bind_accessor(d_idx, acc_in)
-                            replay.append_from_accessor(
-                                b.get_pk(d_idx), b.get_weight(d_idx), acc_in,
-                            )
-
-                        merged = replay.to_consolidated()
-                        for af in agg_funcs:
-                            af.reset()
-                        replay_acc = ColumnarBatchAccessor(input_schema)
-                        for m in range(merged.length()):
-                            w = merged.get_weight(m)
-                            if w > r_int64(0):
-                                merged.bind_accessor(m, replay_acc)
-                                for af in agg_funcs:
-                                    af.step(replay_acc, w)
-                        if merged is not replay:
-                            merged.free()
-                        replay.free()
-
-            # 6. Emission: +1 Agg(history + delta)
+            # Emit new global if non-zero.
             any_nonzero = False
             for af in agg_funcs:
                 if not af.is_accumulator_zero():
@@ -558,12 +759,7 @@ def op_reduce(
                     break
             if any_nonzero:
                 reduce_acc.set_context(acc_exemplar, agg_funcs, dummy_old_vals, False)
-                _emit_reduce_row(out_writer, fin_out_writer, group_key, r_int64(1),
-                                 reduce_acc, finalize_prog)
+                out_writer.append_from_accessor(group_key_lo, group_key_hi,
+                                                r_int64(1), reduce_acc)
 
-        if gi_cursor is not None:
-            gi_cursor.close()
-        if avi_cursor is not None:
-            avi_cursor.close()
-
-        out_writer.mark_sorted(group_by_pk)
+        out_writer.mark_sorted(True)

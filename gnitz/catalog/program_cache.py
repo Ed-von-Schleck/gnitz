@@ -42,9 +42,8 @@ def _open_system_scan(registry, table_id, view_id):
         return None, r_uint128(0)
     family = registry.get_by_id(table_id)
     cursor = family.store.create_cursor()
-    start_key = r_uint128(r_uint64(view_id)) << 64
     end_key = r_uint128(r_uint64(view_id + 1)) << 64
-    cursor.seek(start_key)
+    cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(view_id))))
     return cursor, end_key
 
 def _topo_sort(nodes, edges):
@@ -1065,6 +1064,52 @@ class ProgramCache(object):
             # No register assignment — CLEAR_DELTAS resets all delta registers globally.
             return instructions.clear_deltas_op()
 
+        elif op == opcodes.OPCODE_GATHER_REDUCE:
+            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN_REDUCE]]
+            partial_schema = in_reg.table_schema
+            num_out_cols = len(partial_schema.columns)
+
+            # Reconstruct agg_funcs using the tail formula for col_type.
+            # PARAM_AGG_COL_IDX is an index into the original input schema and
+            # must NOT be used here — it would be out of bounds for use_natural_pk=True.
+            agg_count = node_params.get(opcodes.PARAM_AGG_COUNT, 0)
+            if agg_count > 0:
+                agg_funcs = newlist_hint(agg_count)
+                for ai in range(agg_count):
+                    packed = node_params.get(opcodes.PARAM_AGG_SPEC_BASE + ai, 0)
+                    func_id = packed >> 32
+                    agg_col_in_partial = num_out_cols - agg_count + ai
+                    col_type = partial_schema.columns[agg_col_in_partial].field_type
+                    agg_funcs.append(functions.UniversalAccumulator(0, func_id, col_type))
+            else:
+                agg_func_id = node_params.get(opcodes.PARAM_AGG_FUNC_ID, 0)
+                if agg_func_id > 0:
+                    agg_col_in_partial = num_out_cols - 1
+                    col_type = partial_schema.columns[agg_col_in_partial].field_type
+                    agg_funcs = newlist_hint(1)
+                    agg_funcs.append(functions.UniversalAccumulator(0, agg_func_id, col_type))
+                else:
+                    agg_funcs = newlist_hint(1)
+                    agg_funcs.append(NULL_AGGREGATE)
+
+            # partial_schema IS the output schema — no _build_reduce_output_schema call.
+            trace_table = view_family.store.create_child(
+                "_gather_%d_%d" % (view_id, nid), partial_schema
+            )
+            tr_out_reg = runtime.TraceRegister(
+                reg_id, partial_schema, trace_table.create_cursor(), trace_table
+            )
+            cur_reg_file.registers[reg_id] = tr_out_reg
+            raw_delta_id = state[_ST_NEXT_EXTRA_REG]
+            state[_ST_NEXT_EXTRA_REG] += 1
+            raw_delta_reg = runtime.DeltaRegister(raw_delta_id, partial_schema)
+            cur_reg_file.registers[raw_delta_id] = raw_delta_reg
+            out_reg_of[nid] = raw_delta_id
+            program.append(instructions.gather_reduce_op(
+                in_reg, tr_out_reg, raw_delta_reg, agg_funcs
+            ))
+            return instructions.integrate_op(raw_delta_reg, trace_table)
+
         # Unknown opcode (e.g. obsolete opcode 21, old GATHER): treat as pass-through.
         # Propagate the primary input register to the output slot so downstream nodes
         # see a valid register instead of crashing on a null dereference.
@@ -1122,6 +1167,8 @@ class ProgramCache(object):
                 extra_regs += 2  # raw_delta + auto trace_in
                 if nid in rw.fold_finalize:
                     extra_regs += 1  # fin_delta
+            elif op == opcodes.OPCODE_GATHER_REDUCE:
+                extra_regs += 1  # raw_delta only (no trace_in, no AVI, no fin_delta)
             elif op == opcodes.OPCODE_SCAN_TRACE:
                 table_id = sources.get(nid, 0)
                 if table_id > 0 and nid not in trace_side_sources:
@@ -1187,6 +1234,8 @@ class ProgramCache(object):
                         post_extra_regs += 2  # raw_delta + auto trace_in
                         if pnid in rw.fold_finalize:
                             post_extra_regs += 1  # fin_delta
+                    elif pop == opcodes.OPCODE_GATHER_REDUCE:
+                        post_extra_regs += 1  # raw_delta only
                     elif pop == opcodes.OPCODE_SCAN_TRACE:
                         ptid = sources.get(pnid, 0)
                         if ptid > 0 and pnid not in trace_side_sources:

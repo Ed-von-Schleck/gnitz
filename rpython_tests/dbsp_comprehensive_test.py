@@ -93,12 +93,12 @@ def test_linear_ops(base_dir):
     try:
         # 1. Null handling in Filter/Map
         rb = RowBuilder(schema, b_in)
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_null()  # val_int is null
         rb.put_float(1.5)
         rb.commit()
 
-        rb.begin(r_uint128(2), r_int64(2))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(2))
         rb.put_int(r_int64(20))
         rb.put_float(15.5)
         rb.commit()
@@ -159,7 +159,7 @@ def test_linear_ops(base_dir):
         sink_path = os.path.join(base_dir, "sink")
         sink = EphemeralTable(sink_path, "sink", schema)
         linear.op_integrate(b_in, sink)
-        assert_true(sink.has_pk(r_uint128(1)), "Integrate failed to sink data")
+        assert_true(sink.has_pk(r_uint64(1), r_uint64(0)), "Integrate failed to sink data")
         sink.close()
 
     finally:
@@ -194,25 +194,25 @@ def test_join_ops(base_dir):
     try:
         # Left: 2 DISTINCT rows for PK 10
         rb_l = RowBuilder(schema_l, b_l)
-        rb_l.begin(r_uint128(10), r_int64(1))
+        rb_l.begin(r_uint64(10), r_uint64(0), r_int64(1))
         rb_l.put_int(r_int64(1))
         rb_l.commit()
 
-        rb_l.begin(r_uint128(10), r_int64(1))
+        rb_l.begin(r_uint64(10), r_uint64(0), r_int64(1))
         rb_l.put_int(r_int64(2))
         rb_l.commit()
 
         # Right: 3 DISTINCT rows for PK 10
         rb_r = RowBuilder(schema_r, b_r)
-        rb_r.begin(r_uint128(10), r_int64(1))
+        rb_r.begin(r_uint64(10), r_uint64(0), r_int64(1))
         rb_r.put_string("match1")
         rb_r.commit()
 
-        rb_r.begin(r_uint128(10), r_int64(1))
+        rb_r.begin(r_uint64(10), r_uint64(0), r_int64(1))
         rb_r.put_string("match2")
         rb_r.commit()
 
-        rb_r.begin(r_uint128(10), r_int64(1))
+        rb_r.begin(r_uint64(10), r_uint64(0), r_int64(1))
         rb_r.put_string("match3")
         rb_r.commit()
 
@@ -264,7 +264,7 @@ def test_distinct_op(base_dir):
         rb = RowBuilder(schema, b_in)
 
         # Tick 1: Weight 10 -> Should output Weight 1
-        rb.begin(r_uint128(1), r_int64(10))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(10))
         rb.put_int(r_int64(1))
         rb.commit()
 
@@ -276,7 +276,7 @@ def test_distinct_op(base_dir):
         # Tick 2: Weight -5 -> Should output Weight 0 (Total 5 is still > 0)
         b_in.clear()
         b_out.clear()
-        rb.begin(r_uint128(1), r_int64(-5))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(-5))
         rb.put_int(r_int64(1))
         rb.commit()
 
@@ -288,7 +288,7 @@ def test_distinct_op(base_dir):
         # Tick 3: Weight -5 -> Should output Weight -1 (Total 0)
         b_in.clear()
         b_out.clear()
-        rb.begin(r_uint128(1), r_int64(-5))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(-5))
         rb.put_int(r_int64(1))
         rb.commit()
 
@@ -313,7 +313,7 @@ def _make_reduce_schema():
 
 
 def _add_row(rb, pk, grp, val, weight):
-    rb.begin(r_uint128(pk), r_int64(weight))
+    rb.begin(r_uint64(pk), r_uint64(0), r_int64(weight))
     rb.put_int(r_int64(grp))
     rb.put_int(r_int64(val))
     rb.commit()
@@ -688,21 +688,21 @@ def test_anti_join_basic(base_dir):
 
     try:
         rb_a = RowBuilder(schema, b_a)
-        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(10))
         rb_a.commit()
-        rb_a.begin(r_uint128(2), r_int64(1))
+        rb_a.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(20))
         rb_a.commit()
-        rb_a.begin(r_uint128(3), r_int64(1))
+        rb_a.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(30))
         rb_a.commit()
 
         rb_b = RowBuilder(schema, b_b)
-        rb_b.begin(r_uint128(2), r_int64(1))
+        rb_b.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_b.put_int(r_int64(200))
         rb_b.commit()
-        rb_b.begin(r_uint128(3), r_int64(1))
+        rb_b.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb_b.put_int(r_int64(300))
         rb_b.commit()
 
@@ -748,10 +748,10 @@ def test_anti_join_empty_right(base_dir):
 
     try:
         rb_a = RowBuilder(schema, b_a)
-        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(10))
         rb_a.commit()
-        rb_a.begin(r_uint128(2), r_int64(1))
+        rb_a.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(20))
         rb_a.commit()
 
@@ -779,12 +779,12 @@ def test_anti_join_full_overlap(base_dir):
 
     try:
         rb_a = RowBuilder(schema, b_a)
-        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(10))
         rb_a.commit()
 
         rb_b = RowBuilder(schema, b_b)
-        rb_b.begin(r_uint128(1), r_int64(1))
+        rb_b.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_b.put_int(r_int64(99))
         rb_b.commit()
 
@@ -815,13 +815,13 @@ def test_anti_join_weight_semantics(base_dir):
 
     try:
         rb_a = RowBuilder(schema, b_a)
-        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(10))
         rb_a.commit()
 
         # B has key=1 but with negative weight (retraction)
         rb_b = RowBuilder(schema, b_b)
-        rb_b.begin(r_uint128(1), r_int64(-1))
+        rb_b.begin(r_uint64(1), r_uint64(0), r_int64(-1))
         rb_b.put_int(r_int64(99))
         rb_b.commit()
 
@@ -852,21 +852,21 @@ def test_semi_join_basic(base_dir):
 
     try:
         rb_a = RowBuilder(schema, b_a)
-        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(10))
         rb_a.commit()
-        rb_a.begin(r_uint128(2), r_int64(1))
+        rb_a.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(20))
         rb_a.commit()
-        rb_a.begin(r_uint128(3), r_int64(1))
+        rb_a.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(30))
         rb_a.commit()
 
         rb_b = RowBuilder(schema, b_b)
-        rb_b.begin(r_uint128(2), r_int64(1))
+        rb_b.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_b.put_int(r_int64(200))
         rb_b.commit()
-        rb_b.begin(r_uint128(3), r_int64(1))
+        rb_b.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb_b.put_int(r_int64(300))
         rb_b.commit()
 
@@ -929,13 +929,13 @@ def test_anti_semi_join_complement(base_dir):
     try:
         rb_a = RowBuilder(schema, b_a)
         for pk in range(1, 6):  # keys 1..5
-            rb_a.begin(r_uint128(pk), r_int64(1))
+            rb_a.begin(r_uint64(pk), r_uint64(0), r_int64(1))
             rb_a.put_int(r_int64(pk * 10))
             rb_a.commit()
 
         rb_b = RowBuilder(schema, b_b)
         for pk in [2, 4]:  # B has keys 2 and 4
-            rb_b.begin(r_uint128(pk), r_int64(1))
+            rb_b.begin(r_uint64(pk), r_uint64(0), r_int64(1))
             rb_b.put_int(r_int64(pk * 100))
             rb_b.commit()
 
@@ -979,15 +979,15 @@ def test_join_adaptive_swap(base_dir):
     try:
         rb_l = RowBuilder(schema_l, b_l)
         for pk in range(1, 11):  # 10 distinct delta rows
-            rb_l.begin(r_uint128(pk), r_int64(1))
+            rb_l.begin(r_uint64(pk), r_uint64(0), r_int64(1))
             rb_l.put_int(r_int64(pk * 10))
             rb_l.commit()
 
         rb_r = RowBuilder(schema_r, b_r)
-        rb_r.begin(r_uint128(3), r_int64(1))
+        rb_r.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb_r.put_int(r_int64(300))
         rb_r.commit()
-        rb_r.begin(r_uint128(7), r_int64(1))
+        rb_r.begin(r_uint64(7), r_uint64(0), r_int64(1))
         rb_r.put_int(r_int64(700))
         rb_r.commit()
 
@@ -1044,14 +1044,14 @@ def test_join_merge_walk(base_dir):
     try:
         rb_l = RowBuilder(schema_l, b_l)
         for pk in range(1, 6):  # 5 distinct consolidated delta rows
-            rb_l.begin(r_uint128(pk), r_int64(1))
+            rb_l.begin(r_uint64(pk), r_uint64(0), r_int64(1))
             rb_l.put_int(r_int64(pk * 10))
             rb_l.commit()
         b_l.mark_consolidated(True)
 
         rb_r = RowBuilder(schema_r, b_r)
         for pk in range(1, 9):  # 8 trace rows (superset of delta PKs)
-            rb_r.begin(r_uint128(pk), r_int64(1))
+            rb_r.begin(r_uint64(pk), r_uint64(0), r_int64(1))
             rb_r.put_int(r_int64(pk * 100))
             rb_r.commit()
 
@@ -1095,19 +1095,19 @@ def test_anti_join_merge_walk(base_dir):
     try:
         rb_a = RowBuilder(schema, b_a)
         for pk in range(1, 6):
-            rb_a.begin(r_uint128(pk), r_int64(1))
+            rb_a.begin(r_uint64(pk), r_uint64(0), r_int64(1))
             rb_a.put_int(r_int64(pk * 10))
             rb_a.commit()
         b_a.mark_consolidated(True)
 
         rb_t = RowBuilder(schema, b_t)
-        rb_t.begin(r_uint128(2), r_int64(1))   # positive: suppresses delta PK 2
+        rb_t.begin(r_uint64(2), r_uint64(0), r_int64(1))   # positive: suppresses delta PK 2
         rb_t.put_int(r_int64(200))
         rb_t.commit()
-        rb_t.begin(r_uint128(3), r_int64(1))   # positive: suppresses delta PK 3
+        rb_t.begin(r_uint64(3), r_uint64(0), r_int64(1))   # positive: suppresses delta PK 3
         rb_t.put_int(r_int64(300))
         rb_t.commit()
-        rb_t.begin(r_uint128(4), r_int64(-1))  # negative: does NOT suppress delta PK 4
+        rb_t.begin(r_uint64(4), r_uint64(0), r_int64(-1))  # negative: does NOT suppress delta PK 4
         rb_t.put_int(r_int64(400))
         rb_t.commit()
 
@@ -1166,25 +1166,25 @@ def test_semi_join_merge_walk(base_dir):
         # Delta: 3 rows (PKs 1, 2, 3) — consolidated, trace has 5 rows so no swap
         rb_a = RowBuilder(schema, b_a)
         for pk in range(1, 4):
-            rb_a.begin(r_uint128(pk), r_int64(1))
+            rb_a.begin(r_uint64(pk), r_uint64(0), r_int64(1))
             rb_a.put_int(r_int64(pk * 10))
             rb_a.commit()
         b_a.mark_consolidated(True)
 
         rb_t = RowBuilder(schema, b_t)
-        rb_t.begin(r_uint128(2), r_int64(1))   # positive: matches delta PK 2
+        rb_t.begin(r_uint64(2), r_uint64(0), r_int64(1))   # positive: matches delta PK 2
         rb_t.put_int(r_int64(200))
         rb_t.commit()
-        rb_t.begin(r_uint128(3), r_int64(1))   # positive: matches delta PK 3
+        rb_t.begin(r_uint64(3), r_uint64(0), r_int64(1))   # positive: matches delta PK 3
         rb_t.put_int(r_int64(300))
         rb_t.commit()
-        rb_t.begin(r_uint128(4), r_int64(-1))  # negative weight (extra trace entry)
+        rb_t.begin(r_uint64(4), r_uint64(0), r_int64(-1))  # negative weight (extra trace entry)
         rb_t.put_int(r_int64(400))
         rb_t.commit()
-        rb_t.begin(r_uint128(5), r_int64(1))
+        rb_t.begin(r_uint64(5), r_uint64(0), r_int64(1))
         rb_t.put_int(r_int64(500))
         rb_t.commit()
-        rb_t.begin(r_uint128(6), r_int64(1))
+        rb_t.begin(r_uint64(6), r_uint64(0), r_int64(1))
         rb_t.put_int(r_int64(600))
         rb_t.commit()
 
@@ -1243,23 +1243,23 @@ def test_semi_join_dt_nonconsolidated(base_dir):
     try:
         # Delta: 2 rows (PKs 1, 2), _consolidated explicitly False
         rb_a = RowBuilder(schema, b_a)
-        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(10))
         rb_a.commit()
-        rb_a.begin(r_uint128(2), r_int64(1))
+        rb_a.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(20))
         rb_a.commit()
         # leave _consolidated = False (default)
 
         # Trace: 3 rows (PKs 2, 3, 4) — all positive weight so delta_len (2) <= trace_len (3)
         rb_t = RowBuilder(schema, b_t)
-        rb_t.begin(r_uint128(2), r_int64(1))
+        rb_t.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_t.put_int(r_int64(200))
         rb_t.commit()
-        rb_t.begin(r_uint128(3), r_int64(1))
+        rb_t.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb_t.put_int(r_int64(300))
         rb_t.commit()
-        rb_t.begin(r_uint128(4), r_int64(1))
+        rb_t.begin(r_uint64(4), r_uint64(0), r_int64(1))
         rb_t.put_int(r_int64(400))
         rb_t.commit()
 
@@ -1299,7 +1299,7 @@ def test_source_ops(base_dir):
     b_in = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b_in)
     for i in range(10):
-        rb.begin(r_uint128(i), r_int64(1))
+        rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
         rb.commit()
     table.ingest_batch(b_in)
 
@@ -1307,7 +1307,7 @@ def test_source_ops(base_dir):
     cursor = table.create_cursor()
 
     # Per AbstractCursor protocol, cursors must be seeked before scanning.
-    source.op_seek_trace(cursor, r_uint128(0))
+    source.op_seek_trace(cursor, r_uint64(0), r_uint64(0))
 
     # Scan in chunks of 3
     n1 = source.op_scan_trace(cursor, b_out, 3)
@@ -1347,10 +1347,10 @@ def _update_group_idx(b_in, gi):
         gi_acc.spk_hi = r_int64(intmask(source_pk >> 64))
         weight = b_in.get_weight(i)
         try:
-            gi.table.memtable.upsert_single(ck, weight, gi_acc)
+            gi.table.memtable.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, gi_acc)
         except errors.MemTableFullError:
             gi.table.flush()
-            gi.table.memtable.upsert_single(ck, weight, gi_acc)
+            gi.table.memtable.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, gi_acc)
 
 
 def _find_min_for_dept(b_out, dept_id):
@@ -1407,7 +1407,7 @@ def test_reduce_group_idx(base_dir):
             for row in range(10):
                 actual_pk = dept * 10 + row + 1
                 salary = dept * 10 + row
-                rb.begin(r_uint128(actual_pk), r_int64(1))
+                rb.begin(r_uint64(actual_pk), r_uint64(0), r_int64(1))
                 rb.put_int(r_int64(dept))
                 rb.put_int(r_int64(salary))
                 rb.commit()
@@ -1438,7 +1438,7 @@ def test_reduce_group_idx(base_dir):
         for dept in range(10):
             actual_pk = dept * 10 + 1  # row=0 of each dept
             salary = dept * 10         # = d*10 + 0
-            rb.begin(r_uint128(actual_pk), r_int64(-1))
+            rb.begin(r_uint64(actual_pk), r_uint64(0), r_int64(-1))
             rb.put_int(r_int64(dept))
             rb.put_int(r_int64(salary))
             rb.commit()
@@ -1486,10 +1486,10 @@ def _update_avi(b_in, avi):
         ck = (r_uint128(gc_u64) << 64) | r_uint128(av_u64)
         weight = b_in.get_weight(i)
         try:
-            avi.table.memtable.upsert_single(ck, weight, group_index._UNIT_GI_ACC)
+            avi.table.memtable.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, group_index._UNIT_GI_ACC)
         except errors.MemTableFullError:
             avi.table.flush()
-            avi.table.memtable.upsert_single(ck, weight, group_index._UNIT_GI_ACC)
+            avi.table.memtable.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, group_index._UNIT_GI_ACC)
 
 
 def test_reduce_min_agg_value_idx(base_dir):
@@ -1530,7 +1530,7 @@ def test_reduce_min_agg_value_idx(base_dir):
             for row in range(10):
                 actual_pk = dept * 10 + row + 1
                 salary = dept * 10 + row
-                rb.begin(r_uint128(actual_pk), r_int64(1))
+                rb.begin(r_uint64(actual_pk), r_uint64(0), r_int64(1))
                 rb.put_int(r_int64(dept))
                 rb.put_int(r_int64(salary))
                 rb.commit()
@@ -1557,7 +1557,7 @@ def test_reduce_min_agg_value_idx(base_dir):
         for dept in range(10):
             actual_pk = dept * 10 + 1
             salary = dept * 10
-            rb.begin(r_uint128(actual_pk), r_int64(-1))
+            rb.begin(r_uint64(actual_pk), r_uint64(0), r_int64(-1))
             rb.put_int(r_int64(dept))
             rb.put_int(r_int64(salary))
             rb.commit()
@@ -1584,7 +1584,7 @@ def test_reduce_min_agg_value_idx(base_dir):
         for row in range(1, 10):   # row 0 already retracted in Tick 2
             actual_pk = 5 * 10 + row + 1
             salary = 5 * 10 + row
-            rb.begin(r_uint128(actual_pk), r_int64(-1))
+            rb.begin(r_uint64(actual_pk), r_uint64(0), r_int64(-1))
             rb.put_int(r_int64(5))
             rb.put_int(r_int64(salary))
             rb.commit()
@@ -1665,7 +1665,7 @@ def test_reduce_min_multi_col_group(base_dir):
             for year in range(3):
                 for s in range(5):
                     salary = dept * 30 + year * 5 + s
-                    rb.begin(r_uint128(pk), r_int64(1))
+                    rb.begin(r_uint64(pk), r_uint64(0), r_int64(1))
                     rb.put_int(r_int64(dept))
                     rb.put_int(r_int64(year))
                     rb.put_int(r_int64(salary))
@@ -1694,7 +1694,7 @@ def test_reduce_min_multi_col_group(base_dir):
         # Tick 2: Retract minimum-salary row for (dept=1, year=2); new MIN = 41.
         # dept=1, year=2, s=0: salary = 1*30 + 2*5 + 0 = 40; pk = 1*15 + 2*5 + 0 + 1 = 26
         log("  - MCG Tick 2: retract min-salary row for (dept=1, year=2)...")
-        rb.begin(r_uint128(26), r_int64(-1))
+        rb.begin(r_uint64(26), r_uint64(0), r_int64(-1))
         rb.put_int(r_int64(1))
         rb.put_int(r_int64(2))
         rb.put_int(r_int64(40))
@@ -1721,7 +1721,7 @@ def test_reduce_min_multi_col_group(base_dir):
         # (dept=0, year=0): pks 1..5, salaries 0..4
         for s in range(5):
             pk_r = s + 1
-            rb.begin(r_uint128(pk_r), r_int64(-1))
+            rb.begin(r_uint64(pk_r), r_uint64(0), r_int64(-1))
             rb.put_int(r_int64(0))
             rb.put_int(r_int64(0))
             rb.put_int(r_int64(s))
@@ -1791,7 +1791,7 @@ def test_reduce_max_string_group(base_dir):
         pk = 1
         for ci in range(4):
             for v in range(1, 6):
-                rb.begin(r_uint128(pk), r_int64(1))
+                rb.begin(r_uint64(pk), r_uint64(0), r_int64(1))
                 rb.put_string(categories[ci])
                 rb.put_int(r_int64(v))
                 rb.commit()
@@ -1824,7 +1824,7 @@ def test_reduce_max_string_group(base_dir):
         # value=5 rows are at pks 5, 10, 15, 20
         for ci in range(4):
             pk_r = ci * 5 + 5
-            rb.begin(r_uint128(pk_r), r_int64(-1))
+            rb.begin(r_uint64(pk_r), r_uint64(0), r_int64(-1))
             rb.put_string(categories[ci])
             rb.put_int(r_int64(5))
             rb.commit()
@@ -2078,17 +2078,17 @@ def test_count_non_null(base_dir):
         rb = RowBuilder(in_schema, b_in)
 
         # grp=10: val=5 (non-null), val=NULL, val=15 (non-null) => COUNT_NON_NULL=2
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(10))  # grp
         rb.put_int(r_int64(5))   # val (non-null)
         rb.commit()
 
-        rb.begin(r_uint128(2), r_int64(1))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(10))  # grp
         rb.put_null()             # val (NULL)
         rb.commit()
 
-        rb.begin(r_uint128(3), r_int64(1))
+        rb.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(10))  # grp
         rb.put_int(r_int64(15))  # val (non-null)
         rb.commit()
@@ -2251,7 +2251,7 @@ def test_compaction_through_ticks(base_dir):
             b_out.clear()
 
             # Each tick introduces a fresh unique PK
-            rb.begin(r_uint128(tick), r_int64(1))
+            rb.begin(r_uint64(tick), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(tick))
             rb.commit()
 
@@ -2282,7 +2282,7 @@ def test_compaction_through_ticks(base_dir):
         # All 10 inserted PKs must be present in trace
         i = 1
         while i <= 10:
-            if not trace.has_pk(r_uint128(i)):
+            if not trace.has_pk(r_uint64(i), r_uint64(0)):
                 fail("PK " + str(i) + " missing from trace after 10 ticks")
             i += 1
 
@@ -2310,13 +2310,13 @@ def test_consolidated_flag_basics():
     b = batch.ArenaZSetBatch(schema)
     try:
         rb = RowBuilder(schema, b)
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(10))
         rb.commit()
-        rb.begin(r_uint128(2), r_int64(2))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(2))
         rb.put_int(r_int64(20))
         rb.commit()
-        rb.begin(r_uint128(3), r_int64(1))
+        rb.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(30))
         rb.commit()
 
@@ -2366,13 +2366,13 @@ def test_consolidated_propagation_filter(base_dir):
 
     try:
         rb = RowBuilder(schema, b_in)
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(5))
         rb.commit()
-        rb.begin(r_uint128(2), r_int64(1))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(15))
         rb.commit()
-        rb.begin(r_uint128(3), r_int64(1))
+        rb.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(25))
         rb.commit()
         b_in.mark_consolidated(True)
@@ -2391,7 +2391,7 @@ def test_consolidated_propagation_filter(base_dir):
         # Case 3: sorted-but-not-consolidated input — _consolidated should stay False
         b_sorted = batch.ArenaZSetBatch(schema)
         rb2 = RowBuilder(schema, b_sorted)
-        rb2.begin(r_uint128(4), r_int64(1))
+        rb2.begin(r_uint64(4), r_uint64(0), r_int64(1))
         rb2.put_int(r_int64(40))
         rb2.commit()
         b_sorted.mark_sorted(True)
@@ -2424,10 +2424,10 @@ def test_consolidated_propagation_negate():
 
     try:
         rb = RowBuilder(schema, b_in)
-        rb.begin(r_uint128(1), r_int64(3))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(3))
         rb.put_int(r_int64(10))
         rb.commit()
-        rb.begin(r_uint128(2), r_int64(1))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(20))
         rb.commit()
         b_in.mark_consolidated(True)
@@ -2459,19 +2459,19 @@ def test_scan_trace_marks_consolidated(base_dir):
 
     try:
         rb = RowBuilder(schema, b_in)
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(10))
         rb.commit()
-        rb.begin(r_uint128(2), r_int64(1))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(20))
         rb.commit()
-        rb.begin(r_uint128(3), r_int64(1))
+        rb.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(30))
         rb.commit()
         table.ingest_batch(b_in)
 
         cursor = table.create_cursor()
-        source.op_seek_trace(cursor, r_uint128(0))
+        source.op_seek_trace(cursor, r_uint64(0), r_uint64(0))
         source.op_scan_trace(cursor, b_out, 0)
         cursor.close()
 
@@ -2501,10 +2501,10 @@ def test_distinct_marks_consolidated(base_dir):
 
     try:
         rb = RowBuilder(schema, b_in)
-        rb.begin(r_uint128(10), r_int64(2))
+        rb.begin(r_uint64(10), r_uint64(0), r_int64(2))
         rb.put_int(r_int64(100))
         rb.commit()
-        rb.begin(r_uint128(20), r_int64(1))
+        rb.begin(r_uint64(20), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(200))
         rb.commit()
 
@@ -2535,7 +2535,7 @@ def test_clone_preserves_consolidated():
 
     try:
         rb = RowBuilder(schema, b_cons)
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(10))
         rb.commit()
         b_cons.mark_consolidated(True)
@@ -2546,7 +2546,7 @@ def test_clone_preserves_consolidated():
         clone_cons.free()
 
         rb2 = RowBuilder(schema, b_sorted)
-        rb2.begin(r_uint128(2), r_int64(1))
+        rb2.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb2.put_int(r_int64(20))
         rb2.commit()
         b_sorted.mark_sorted(True)
@@ -2579,24 +2579,24 @@ def test_union_sorted_merge():
 
     try:
         rb_a = RowBuilder(schema, batch_a_raw)
-        rb_a.begin(r_uint128(1), r_int64(1))
+        rb_a.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(10))
         rb_a.commit()
-        rb_a.begin(r_uint128(2), r_int64(1))
+        rb_a.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(20))
         rb_a.commit()
-        rb_a.begin(r_uint128(3), r_int64(1))
+        rb_a.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb_a.put_int(r_int64(30))
         rb_a.commit()
 
         rb_b = RowBuilder(schema, batch_b_raw)
-        rb_b.begin(r_uint128(2), r_int64(1))
+        rb_b.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_b.put_int(r_int64(20))
         rb_b.commit()
-        rb_b.begin(r_uint128(4), r_int64(1))
+        rb_b.begin(r_uint64(4), r_uint64(0), r_int64(1))
         rb_b.put_int(r_int64(40))
         rb_b.commit()
-        rb_b.begin(r_uint128(5), r_int64(1))
+        rb_b.begin(r_uint64(5), r_uint64(0), r_int64(1))
         rb_b.put_int(r_int64(50))
         rb_b.commit()
 
@@ -2662,13 +2662,13 @@ def test_outer_join_delta_trace(base_dir):
     trace_r = EphemeralTable(trace_path, "tr", schema_r)
     try:
         rb_l = RowBuilder(schema_l, b_delta)
-        rb_l.begin(r_uint128(10), r_int64(1))
+        rb_l.begin(r_uint64(10), r_uint64(0), r_int64(1))
         rb_l.put_int(r_int64(100))
         rb_l.commit()
 
         rb_r_batch = batch.ArenaZSetBatch(schema_r)
         rb_r = RowBuilder(schema_r, rb_r_batch)
-        rb_r.begin(r_uint128(10), r_int64(1))
+        rb_r.begin(r_uint64(10), r_uint64(0), r_int64(1))
         rb_r.put_int(r_int64(200))
         rb_r.commit()
         trace_r.ingest_batch(rb_r_batch)
@@ -2695,7 +2695,7 @@ def test_outer_join_delta_trace(base_dir):
     trace_r2 = EphemeralTable(trace_path2, "tr", schema_r)
     try:
         rb_l2 = RowBuilder(schema_l, b_delta2)
-        rb_l2.begin(r_uint128(5), r_int64(1))
+        rb_l2.begin(r_uint64(5), r_uint64(0), r_int64(1))
         rb_l2.put_int(r_int64(50))
         rb_l2.commit()
 
@@ -2720,16 +2720,16 @@ def test_outer_join_delta_trace(base_dir):
     trace_r3 = EphemeralTable(trace_path3, "tr", schema_r)
     try:
         rb_l3 = RowBuilder(schema_l, b_delta3)
-        rb_l3.begin(r_uint128(1), r_int64(1))
+        rb_l3.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_l3.put_int(r_int64(10))
         rb_l3.commit()
-        rb_l3.begin(r_uint128(2), r_int64(1))
+        rb_l3.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_l3.put_int(r_int64(20))
         rb_l3.commit()
 
         rb_r3_batch = batch.ArenaZSetBatch(schema_r)
         rb_r3 = RowBuilder(schema_r, rb_r3_batch)
-        rb_r3.begin(r_uint128(1), r_int64(1))
+        rb_r3.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_r3.put_int(r_int64(100))
         rb_r3.commit()
         trace_r3.ingest_batch(rb_r3_batch)
@@ -2761,10 +2761,10 @@ def test_outer_join_delta_trace(base_dir):
     trace_r4 = EphemeralTable(trace_path4, "tr", schema_r)
     try:
         rb_l4 = RowBuilder(schema_l, b_delta4)
-        rb_l4.begin(r_uint128(7), r_int64(1))
+        rb_l4.begin(r_uint64(7), r_uint64(0), r_int64(1))
         rb_l4.put_int(r_int64(71))
         rb_l4.commit()
-        rb_l4.begin(r_uint128(7), r_int64(1))
+        rb_l4.begin(r_uint64(7), r_uint64(0), r_int64(1))
         rb_l4.put_int(r_int64(72))
         rb_l4.commit()
 
@@ -2787,13 +2787,13 @@ def test_outer_join_delta_trace(base_dir):
     trace_r5 = EphemeralTable(trace_path5, "tr", schema_r)
     try:
         rb_l5 = RowBuilder(schema_l, b_delta5)
-        rb_l5.begin(r_uint128(3), r_int64(1))
+        rb_l5.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb_l5.put_int(r_int64(30))
         rb_l5.commit()
 
         rb_r5_batch = batch.ArenaZSetBatch(schema_r)
         rb_r5 = RowBuilder(schema_r, rb_r5_batch)
-        rb_r5.begin(r_uint128(3), r_int64(-1))
+        rb_r5.begin(r_uint64(3), r_uint64(0), r_int64(-1))
         rb_r5.put_int(r_int64(300))
         rb_r5.commit()
         trace_r5.ingest_batch(rb_r5_batch)
@@ -3055,6 +3055,321 @@ def test_reduce_finalize_fallback(base_dir):
     log("  PASSED")
 
 
+def test_gather_reduce_count(base_dir):
+    """op_gather_reduce COUNT: multi-worker partial deltas folded into global."""
+    log("[DBSP] Testing op_gather_reduce COUNT...")
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="grp"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="cnt"))
+    partial_schema = types.TableSchema(cols, 0)
+
+    trace_path = os.path.join(base_dir, "gr_count")
+    trace_table = EphemeralTable(trace_path, "gr_count", partial_schema)
+    agg_funcs = newlist_hint(1)
+    agg_funcs.append(functions.UniversalAccumulator(0, functions.AGG_COUNT, types.TYPE_I64))
+
+    partial1 = batch.ArenaZSetBatch(partial_schema)
+    out1 = batch.ArenaZSetBatch(partial_schema)
+    partial2 = batch.ArenaZSetBatch(partial_schema)
+    out2 = batch.ArenaZSetBatch(partial_schema)
+    try:
+        rb = RowBuilder(partial_schema, partial1)
+        # Tick 1: Worker A contributes cnt=3 for group 1, Worker B contributes cnt=2.
+        # Worker A also contributes cnt=5 for group 2.
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(3))
+        rb.commit()
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(2))
+        rb.commit()
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(5))
+        rb.commit()
+
+        c1 = trace_table.create_cursor()
+        reduce.op_gather_reduce(partial1, partial_schema, c1, trace_table, out1, agg_funcs)
+        c1.close()
+
+        assert_equal_i(2, out1.length(), "tick1: should emit 2 rows")
+        found_g1 = False
+        found_g2 = False
+        acc = out1.get_accessor(0)
+        for i in range(out1.length()):
+            out1.bind_accessor(i, acc)
+            w = out1.get_weight(i)
+            pk_lo = out1.get_pk_lo(i)
+            cnt_val = acc.get_int_signed(1)
+            if w == r_int64(1) and pk_lo == r_uint64(1):
+                assert_equal_i64(r_int64(5), cnt_val, "tick1: group1 count=5")
+                found_g1 = True
+            if w == r_int64(1) and pk_lo == r_uint64(2):
+                assert_equal_i64(r_int64(5), cnt_val, "tick1: group2 count=5")
+                found_g2 = True
+        assert_true(found_g1, "tick1: group1 +1 row not found")
+        assert_true(found_g2, "tick1: group2 +1 row not found")
+        trace_table.ingest_batch(out1)
+
+        # Tick 2: Worker A retracts partial cnt=3 and emits new partial cnt=1 for group 1.
+        # Old global=5; net delta=-2; new global=3.
+        rb2 = RowBuilder(partial_schema, partial2)
+        rb2.begin(r_uint64(1), r_uint64(0), r_int64(-1))
+        rb2.put_int(r_int64(3))
+        rb2.commit()
+        rb2.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb2.put_int(r_int64(1))
+        rb2.commit()
+
+        c2 = trace_table.create_cursor()
+        reduce.op_gather_reduce(partial2, partial_schema, c2, trace_table, out2, agg_funcs)
+        c2.close()
+
+        assert_equal_i(2, out2.length(), "tick2: should emit retract+insert for group1")
+        found_retract = False
+        found_insert = False
+        acc2 = out2.get_accessor(0)
+        for i in range(out2.length()):
+            out2.bind_accessor(i, acc2)
+            w = out2.get_weight(i)
+            cnt_val = acc2.get_int_signed(1)
+            if w == r_int64(-1):
+                assert_equal_i64(r_int64(5), cnt_val, "tick2: retraction of old count=5")
+                found_retract = True
+            if w == r_int64(1):
+                assert_equal_i64(r_int64(3), cnt_val, "tick2: new count=3")
+                found_insert = True
+        assert_true(found_retract, "tick2: retraction not found")
+        assert_true(found_insert, "tick2: new row not found")
+    finally:
+        partial1.free()
+        out1.free()
+        partial2.free()
+        out2.free()
+        trace_table.close()
+    log("  PASSED")
+
+
+def test_gather_reduce_sum(base_dir):
+    """op_gather_reduce SUM: two workers sum values for the same group."""
+    log("[DBSP] Testing op_gather_reduce SUM...")
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="grp"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="s"))
+    partial_schema = types.TableSchema(cols, 0)
+
+    trace_path = os.path.join(base_dir, "gr_sum")
+    trace_table = EphemeralTable(trace_path, "gr_sum", partial_schema)
+    agg_funcs = newlist_hint(1)
+    agg_funcs.append(functions.UniversalAccumulator(0, functions.AGG_SUM, types.TYPE_I64))
+
+    partial1 = batch.ArenaZSetBatch(partial_schema)
+    out1 = batch.ArenaZSetBatch(partial_schema)
+    partial2 = batch.ArenaZSetBatch(partial_schema)
+    out2 = batch.ArenaZSetBatch(partial_schema)
+    try:
+        rb = RowBuilder(partial_schema, partial1)
+        # Tick 1: two workers contribute sum=100 and sum=200 for group 1.
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(100))
+        rb.commit()
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(200))
+        rb.commit()
+
+        c1 = trace_table.create_cursor()
+        reduce.op_gather_reduce(partial1, partial_schema, c1, trace_table, out1, agg_funcs)
+        c1.close()
+
+        assert_equal_i(1, out1.length(), "tick1: expected 1 output row")
+        assert_equal_i64(r_int64(1), out1.get_weight(0), "tick1: weight should be +1")
+        assert_equal_i64(r_int64(300), out1.get_accessor(0).get_int_signed(1), "tick1: sum=300")
+        trace_table.ingest_batch(out1)
+
+        # Tick 2: one worker retracts sum=100 and emits sum=50.
+        # Old global=300; net delta=-50; new global=250.
+        rb2 = RowBuilder(partial_schema, partial2)
+        rb2.begin(r_uint64(1), r_uint64(0), r_int64(-1))
+        rb2.put_int(r_int64(100))
+        rb2.commit()
+        rb2.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb2.put_int(r_int64(50))
+        rb2.commit()
+
+        c2 = trace_table.create_cursor()
+        reduce.op_gather_reduce(partial2, partial_schema, c2, trace_table, out2, agg_funcs)
+        c2.close()
+
+        assert_equal_i(2, out2.length(), "tick2: expected retract+insert")
+        found_retract = False
+        found_insert = False
+        acc = out2.get_accessor(0)
+        for i in range(out2.length()):
+            out2.bind_accessor(i, acc)
+            w = out2.get_weight(i)
+            s_val = acc.get_int_signed(1)
+            if w == r_int64(-1):
+                assert_equal_i64(r_int64(300), s_val, "tick2: retraction of old sum=300")
+                found_retract = True
+            if w == r_int64(1):
+                assert_equal_i64(r_int64(250), s_val, "tick2: new sum=250")
+                found_insert = True
+        assert_true(found_retract, "tick2: retraction not found")
+        assert_true(found_insert, "tick2: new row not found")
+    finally:
+        partial1.free()
+        out1.free()
+        partial2.free()
+        out2.free()
+        trace_table.close()
+    log("  PASSED")
+
+
+def test_gather_reduce_multi_agg(base_dir):
+    """op_gather_reduce multi-agg (COUNT + SUM): two workers, single tick."""
+    log("[DBSP] Testing op_gather_reduce multi-agg (COUNT + SUM)...")
+    cols = newlist_hint(3)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="grp"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="cnt"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="s"))
+    partial_schema = types.TableSchema(cols, 0)
+
+    trace_path = os.path.join(base_dir, "gr_multi")
+    trace_table = EphemeralTable(trace_path, "gr_multi", partial_schema)
+    agg_funcs = newlist_hint(2)
+    agg_funcs.append(functions.UniversalAccumulator(0, functions.AGG_COUNT, types.TYPE_I64))
+    agg_funcs.append(functions.UniversalAccumulator(0, functions.AGG_SUM, types.TYPE_I64))
+
+    partial1 = batch.ArenaZSetBatch(partial_schema)
+    out1 = batch.ArenaZSetBatch(partial_schema)
+    try:
+        rb = RowBuilder(partial_schema, partial1)
+        # Worker A: cnt=2, sum=100
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(2))
+        rb.put_int(r_int64(100))
+        rb.commit()
+        # Worker B: cnt=3, sum=200
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(3))
+        rb.put_int(r_int64(200))
+        rb.commit()
+
+        c1 = trace_table.create_cursor()
+        reduce.op_gather_reduce(partial1, partial_schema, c1, trace_table, out1, agg_funcs)
+        c1.close()
+
+        assert_equal_i(1, out1.length(), "multi-agg: expected 1 output row")
+        assert_equal_i64(r_int64(1), out1.get_weight(0), "multi-agg: weight should be +1")
+        acc = out1.get_accessor(0)
+        assert_equal_i64(r_int64(5), acc.get_int_signed(1), "multi-agg: cnt=5")
+        assert_equal_i64(r_int64(300), acc.get_int_signed(2), "multi-agg: sum=300")
+    finally:
+        partial1.free()
+        out1.free()
+        trace_table.close()
+    log("  PASSED")
+
+
+def test_gather_reduce_retraction(base_dir):
+    """op_gather_reduce full retraction: insert, retract partially, retract fully."""
+    log("[DBSP] Testing op_gather_reduce retraction sequence...")
+    cols = newlist_hint(2)
+    cols.append(types.ColumnDefinition(types.TYPE_U64, name="grp"))
+    cols.append(types.ColumnDefinition(types.TYPE_I64, name="cnt"))
+    partial_schema = types.TableSchema(cols, 0)
+
+    trace_path = os.path.join(base_dir, "gr_retract")
+    trace_table = EphemeralTable(trace_path, "gr_retract", partial_schema)
+    agg_funcs = newlist_hint(1)
+    agg_funcs.append(functions.UniversalAccumulator(0, functions.AGG_COUNT, types.TYPE_I64))
+
+    p1 = batch.ArenaZSetBatch(partial_schema)
+    o1 = batch.ArenaZSetBatch(partial_schema)
+    p2 = batch.ArenaZSetBatch(partial_schema)
+    o2 = batch.ArenaZSetBatch(partial_schema)
+    p3 = batch.ArenaZSetBatch(partial_schema)
+    o3 = batch.ArenaZSetBatch(partial_schema)
+    try:
+        rb = RowBuilder(partial_schema, p1)
+        # Tick 1: insert cnt=4
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(4))
+        rb.commit()
+
+        c1 = trace_table.create_cursor()
+        reduce.op_gather_reduce(p1, partial_schema, c1, trace_table, o1, agg_funcs)
+        c1.close()
+        assert_equal_i(1, o1.length(), "tick1: 1 output row")
+        assert_equal_i64(r_int64(1), o1.get_weight(0), "tick1: weight=+1")
+        assert_equal_i64(r_int64(4), o1.get_accessor(0).get_int_signed(1), "tick1: cnt=4")
+        trace_table.ingest_batch(o1)
+
+        # Tick 2: retract cnt=4 and insert cnt=2; old global=4; new=2
+        rb2 = RowBuilder(partial_schema, p2)
+        rb2.begin(r_uint64(1), r_uint64(0), r_int64(-1))
+        rb2.put_int(r_int64(4))
+        rb2.commit()
+        rb2.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb2.put_int(r_int64(2))
+        rb2.commit()
+
+        c2 = trace_table.create_cursor()
+        reduce.op_gather_reduce(p2, partial_schema, c2, trace_table, o2, agg_funcs)
+        c2.close()
+        assert_equal_i(2, o2.length(), "tick2: retract+insert")
+        found_neg = False
+        found_pos = False
+        acc2 = o2.get_accessor(0)
+        for i in range(o2.length()):
+            o2.bind_accessor(i, acc2)
+            w = o2.get_weight(i)
+            v = acc2.get_int_signed(1)
+            if w == r_int64(-1):
+                assert_equal_i64(r_int64(4), v, "tick2: retract old=4")
+                found_neg = True
+            if w == r_int64(1):
+                assert_equal_i64(r_int64(2), v, "tick2: new=2")
+                found_pos = True
+        assert_true(found_neg, "tick2: retraction not found")
+        assert_true(found_pos, "tick2: new row not found")
+        trace_table.ingest_batch(o2)
+
+        # Tick 3: fully retract cnt=2; old global=2; net delta=-2; new global=0.
+        # COUNT emits +1(count=0) as a tombstone (same as op_reduce linear behavior).
+        rb3 = RowBuilder(partial_schema, p3)
+        rb3.begin(r_uint64(1), r_uint64(0), r_int64(-1))
+        rb3.put_int(r_int64(2))
+        rb3.commit()
+
+        c3 = trace_table.create_cursor()
+        reduce.op_gather_reduce(p3, partial_schema, c3, trace_table, o3, agg_funcs)
+        c3.close()
+        assert_equal_i(2, o3.length(), "tick3: retract+zero tombstone")
+        found_neg3 = False
+        found_zero3 = False
+        acc3 = o3.get_accessor(0)
+        for i in range(o3.length()):
+            o3.bind_accessor(i, acc3)
+            w = o3.get_weight(i)
+            v = acc3.get_int_signed(1)
+            if w == r_int64(-1):
+                assert_equal_i64(r_int64(2), v, "tick3: retract old=2")
+                found_neg3 = True
+            if w == r_int64(1):
+                assert_equal_i64(r_int64(0), v, "tick3: zero tombstone")
+                found_zero3 = True
+        assert_true(found_neg3, "tick3: retraction not found")
+        assert_true(found_zero3, "tick3: zero tombstone not found")
+    finally:
+        p1.free()
+        o1.free()
+        p2.free()
+        o2.free()
+        p3.free()
+        o3.free()
+        trace_table.close()
+    log("  PASSED")
+
+
 def entry_point(argv):
     ensure_jit_reachable()
     base_dir = "dbsp_test_data"
@@ -3112,6 +3427,10 @@ def entry_point(argv):
         test_reduce_finalize_avg_incremental(base_dir)
         test_reduce_finalize_avg_multi(base_dir)
         test_reduce_finalize_fallback(base_dir)
+        test_gather_reduce_count(base_dir)
+        test_gather_reduce_sum(base_dir)
+        test_gather_reduce_multi_agg(base_dir)
+        test_gather_reduce_retraction(base_dir)
         log("\nALL DBSP TESTS PASSED")
     except Exception as e:
         os.write(2, "FAILURE\n")

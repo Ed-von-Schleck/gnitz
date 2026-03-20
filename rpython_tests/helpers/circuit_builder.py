@@ -146,6 +146,48 @@ class CircuitBuilder(object):
             self._group_cols.append((handle.node_id, col_idx))
         return handle
 
+    def reduce_partial(self, input_handle, agg_func_id, group_by_cols, agg_col_idx=0):
+        """Partial-agg + gather. Only for linear aggregates (COUNT, SUM,
+        COUNT_NON_NULL). Must NOT be used with AGG_MIN or AGG_MAX."""
+        reduce_handle = self._alloc_node(OPCODE_REDUCE)
+        self._connect(input_handle, reduce_handle, PORT_IN_REDUCE)
+        self._params.append((reduce_handle.node_id, PARAM_AGG_FUNC_ID, agg_func_id))
+        self._params.append((reduce_handle.node_id, PARAM_AGG_COL_IDX, agg_col_idx))
+        for col_idx in group_by_cols:
+            self._group_cols.append((reduce_handle.node_id, col_idx))
+        # Exchange partial aggregate rows by group PK (col 0 = group hash in all cases)
+        sharded = self.shard(reduce_handle, [0])
+        gather = self._alloc_node(OPCODE_GATHER_REDUCE)
+        self._connect(sharded, gather, PORT_IN_REDUCE)
+        # Only the function type is needed. PARAM_AGG_COL_IDX is an input-schema
+        # index and is not stored for the GATHER node — _emit_node uses the tail
+        # formula to find the agg col in the partial schema. No group cols either.
+        self._params.append((gather.node_id, PARAM_AGG_FUNC_ID, agg_func_id))
+        return gather
+
+    def reduce_multi_partial(self, input_handle, agg_specs, group_by_cols):
+        """Multi-agg variant. agg_specs: list of (agg_func_id, agg_col_idx).
+        All agg functions must be linear."""
+        reduce_handle = self._alloc_node(OPCODE_REDUCE)
+        self._connect(input_handle, reduce_handle, PORT_IN_REDUCE)
+        self._params.append((reduce_handle.node_id, PARAM_AGG_COUNT, len(agg_specs)))
+        for i in range(len(agg_specs)):
+            func_id, col_idx = agg_specs[i]
+            self._params.append((reduce_handle.node_id, PARAM_AGG_SPEC_BASE + i,
+                                  (func_id << 32) | col_idx))
+        for col_idx in group_by_cols:
+            self._group_cols.append((reduce_handle.node_id, col_idx))
+        sharded = self.shard(reduce_handle, [0])
+        gather = self._alloc_node(OPCODE_GATHER_REDUCE)
+        self._connect(sharded, gather, PORT_IN_REDUCE)
+        self._params.append((gather.node_id, PARAM_AGG_COUNT, len(agg_specs)))
+        for i in range(len(agg_specs)):
+            func_id, _ = agg_specs[i]
+            # col_idx is an input-schema index; store 0 to make clear it is unused.
+            self._params.append((gather.node_id, PARAM_AGG_SPEC_BASE + i,
+                                  func_id << 32))
+        return gather
+
     def anti_join(self, delta_handle, trace_table_id):
         trace_src = self.trace_scan(trace_table_id)
         handle = self._alloc_node(OPCODE_ANTI_JOIN_DELTA_TRACE)

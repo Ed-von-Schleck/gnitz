@@ -1,7 +1,7 @@
 # gnitz/vm/interpreter.py
 
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from gnitz.core import batch, errors
 from gnitz.core import opcodes as op
 from gnitz.dbsp import ops
@@ -72,8 +72,9 @@ def run_vm(program, reg_file, context):
             reg_k = instr.reg_key
             assert reg_t is not None and reg_k is not None
             if reg_k.batch.length() > 0:
-                key = reg_k.batch.get_pk(0)
-                ops.op_seek_trace(reg_t.cursor, key)
+                key_lo = reg_k.batch.get_pk_lo(0)
+                key_hi = reg_k.batch.get_pk_hi(0)
+                ops.op_seek_trace(reg_t.cursor, key_lo, key_hi)
 
         # ── DBSP Algebraic Opcodes (Stateless) ──────────────────────────
 
@@ -184,16 +185,17 @@ def run_vm(program, reg_file, context):
                         gc_u64 = _gi_promote(
                             acc, gi.col_idx, gi.col_type,
                         )
-                        source_pk = b.get_pk(idx)
-                        ck = ((r_uint128(gc_u64) << 64)
-                              | r_uint128(r_uint64(intmask(source_pk))))
-                        gi_acc.spk_hi = r_int64(intmask(source_pk >> 64))
+                        source_pk_lo = b.get_pk_lo(idx)
+                        source_pk_hi = b.get_pk_hi(idx)
+                        ck_lo = r_uint64(intmask(source_pk_lo))
+                        ck_hi = gc_u64
+                        gi_acc.spk_hi = r_int64(intmask(source_pk_hi))
                         weight = b.get_weight(idx)
                         try:
-                            gi.table.memtable.upsert_single(ck, weight, gi_acc)
+                            gi.table.memtable.upsert_single(ck_lo, ck_hi, weight, gi_acc)
                         except errors.MemTableFullError:
                             gi.table.flush()
-                            gi.table.memtable.upsert_single(ck, weight, gi_acc)
+                            gi.table.memtable.upsert_single(ck_lo, ck_hi, weight, gi_acc)
             if instr.agg_value_idx is not None:
                 avi = instr.agg_value_idx
                 b = reg_in.batch
@@ -208,13 +210,14 @@ def run_vm(program, reg_file, context):
                         av_u64 = _gi_agg_promote(
                             acc, avi.agg_col_idx, avi.agg_col_type, avi.for_max,
                         )
-                        ck = (r_uint128(gc_u64) << 64) | r_uint128(av_u64)
+                        ck_lo = av_u64
+                        ck_hi = gc_u64
                         weight = b.get_weight(idx)
                         try:
-                            avi.table.memtable.upsert_single(ck, weight, _UNIT_GI_ACC)
+                            avi.table.memtable.upsert_single(ck_lo, ck_hi, weight, _UNIT_GI_ACC)
                         except errors.MemTableFullError:
                             avi.table.flush()
-                            avi.table.memtable.upsert_single(ck, weight, _UNIT_GI_ACC)
+                            avi.table.memtable.upsert_single(ck_lo, ck_hi, weight, _UNIT_GI_ACC)
 
         elif opcode == op.OPCODE_ANTI_JOIN_DELTA_TRACE:
             reg_delta = instr.reg_delta
@@ -275,6 +278,20 @@ def run_vm(program, reg_file, context):
                 batch.BatchWriter(reg_out.batch),
                 reg_delta.table_schema,
                 reg_trace.table_schema,
+            )
+
+        elif opcode == op.OPCODE_GATHER_REDUCE:
+            reg_in = instr.reg_in
+            reg_trace_out = instr.reg_trace_out
+            reg_out = instr.reg_out
+            assert reg_in is not None and reg_trace_out is not None and reg_out is not None
+            ops.op_gather_reduce(
+                reg_in.batch,
+                reg_in.table_schema,
+                reg_trace_out.cursor,
+                reg_trace_out.table,
+                batch.BatchWriter(reg_out.batch),
+                instr.agg_funcs,
             )
 
         elif opcode == op.OPCODE_REDUCE:
