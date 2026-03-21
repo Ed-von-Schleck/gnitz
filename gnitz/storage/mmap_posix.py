@@ -3,6 +3,7 @@ import errno
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.translator.tool.cbuild import ExternalCompilationInfo
 from rpython.rlib import rposix, jit, rposix_stat
+from rpython.rlib.rarithmetic import intmask
 
 # ============================================================================
 # POSIX Constants
@@ -25,11 +26,12 @@ MFD_ALLOW_SEALING = 0x0002
 eci = ExternalCompilationInfo(
     # Use guards to prevent redefinition warnings/errors
     pre_include_bits=[
-        '#ifndef _GNU_SOURCE', 
-        '#define _GNU_SOURCE', 
+        '#ifndef _GNU_SOURCE',
+        '#define _GNU_SOURCE',
         '#endif'
     ],
-    includes=['sys/mman.h', 'unistd.h', 'sys/file.h', 'sys/stat.h']
+    includes=['sys/mman.h', 'unistd.h', 'sys/file.h', 'sys/stat.h',
+              'sys/resource.h']
 )
 
 # ============================================================================
@@ -103,12 +105,44 @@ _read = rffi.llexternal(
     _nowrapper=True
 )
 
+_rlimit_eci = ExternalCompilationInfo(
+    pre_include_bits=[
+        '#ifndef _GNU_SOURCE', '#define _GNU_SOURCE', '#endif'
+    ],
+    includes=['sys/resource.h'],
+    separate_module_sources=["""
+static long gnitz_raise_fd_limit(long target) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return -1;
+    if ((long)rl.rlim_cur >= target) return (long)rl.rlim_cur;
+    rl.rlim_cur = (rlim_t)target;
+    if (rl.rlim_cur > rl.rlim_max) rl.rlim_cur = rl.rlim_max;
+    if (setrlimit(RLIMIT_NOFILE, &rl) != 0) return -1;
+    return (long)rl.rlim_cur;
+}
+"""],
+)
+
+_raise_fd_limit_c = rffi.llexternal(
+    "gnitz_raise_fd_limit",
+    [rffi.LONG],
+    rffi.LONG,
+    compilation_info=_rlimit_eci,
+    _nowrapper=True,
+)
+
 # ============================================================================
 # Public High-Level Wrappers
 # ============================================================================
 
 class MMapError(Exception):
     pass
+
+
+def raise_fd_limit(target):
+    """Raise RLIMIT_NOFILE soft limit to target (capped by hard limit).
+    Returns the new soft limit, or -1 on failure."""
+    return intmask(_raise_fd_limit_c(rffi.cast(rffi.LONG, target)))
 
 
 @jit.dont_look_inside

@@ -9,6 +9,7 @@ from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz import log
 from gnitz.catalog.engine import open_engine
+from gnitz.storage.mmap_posix import raise_fd_limit
 from gnitz.catalog import system_tables as sys
 from gnitz.server.executor import ServerExecutor
 from gnitz.server import ipc_ffi
@@ -119,6 +120,10 @@ def entry_point(argv):
         os.write(2, "Error: missing required arguments\n")
         os.write(2, "Try 'gnitz-server --help' for usage information\n")
         return 1
+
+    # Each partitioned user table holds 256 WAL fds.  Raise the soft
+    # limit so the server doesn't hit EMFILE with a handful of tables.
+    raise_fd_limit(65536)
 
     log.info("Opening database at " + data_dir)
     engine = open_engine(data_dir)
