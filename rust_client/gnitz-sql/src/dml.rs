@@ -27,7 +27,7 @@ pub fn execute_insert(
     let mut batch = ZSetBatch::new(&schema);
     let n = rows.len();
 
-    for row in &rows {
+    for row in rows {
         let pk_val = extract_pk_value(row, &schema)?;
         batch.pk_lo.push(pk_val);
         batch.pk_hi.push(0);
@@ -64,7 +64,7 @@ pub fn execute_insert(
     Ok(SqlResult::RowsAffected { count: n })
 }
 
-fn extract_insert_parts(stmt: &Statement) -> Result<(String, Vec<Vec<Expr>>), GnitzSqlError> {
+fn extract_insert_parts(stmt: &Statement) -> Result<(String, &[Vec<Expr>]), GnitzSqlError> {
     match stmt {
         Statement::Insert(insert) => {
             let table_name = match &insert.table {
@@ -85,9 +85,9 @@ fn extract_insert_parts(stmt: &Statement) -> Result<(String, Vec<Vec<Expr>>), Gn
     }
 }
 
-fn extract_values_rows(query: &Query) -> Result<Vec<Vec<Expr>>, GnitzSqlError> {
+fn extract_values_rows(query: &Query) -> Result<&[Vec<Expr>], GnitzSqlError> {
     match query.body.as_ref() {
-        SetExpr::Values(Values { rows, .. }) => Ok(rows.clone()),
+        SetExpr::Values(Values { rows, .. }) => Ok(rows),
         _ => Err(GnitzSqlError::Unsupported(
             "INSERT only supports VALUES (not INSERT INTO ... SELECT)".to_string()
         )),
@@ -537,17 +537,18 @@ fn apply_projection(
     let new_pk_idx = col_indices.iter().position(|&i| i == schema.pk_index).unwrap_or(0);
     let new_schema = Schema { columns: new_cols, pk_index: new_pk_idx };
 
-    // Build new batch
+    // Destructure src_batch so system columns can be moved (not cloned)
+    let ZSetBatch { pk_lo, pk_hi, weights, nulls, columns: src_columns } = src_batch;
     let mut new_batch = ZSetBatch::new(&new_schema);
-    new_batch.pk_lo  = src_batch.pk_lo.clone();
-    new_batch.pk_hi  = src_batch.pk_hi.clone();
-    new_batch.weights = src_batch.weights.clone();
-    new_batch.nulls   = src_batch.nulls.clone();
+    new_batch.pk_lo   = pk_lo;
+    new_batch.pk_hi   = pk_hi;
+    new_batch.weights = weights;
+    new_batch.nulls   = nulls;
 
     for (new_ci, &old_ci) in col_indices.iter().enumerate() {
         if new_ci == new_pk_idx { continue; }
         if old_ci == schema.pk_index { continue; }
-        match (&src_batch.columns[old_ci], &mut new_batch.columns[new_ci]) {
+        match (&src_columns[old_ci], &mut new_batch.columns[new_ci]) {
             (ColData::Fixed(src), ColData::Fixed(dst)) => {
                 dst.extend_from_slice(src);
             }
@@ -564,33 +565,27 @@ fn apply_projection(
     Ok((new_schema, new_batch))
 }
 
-fn apply_limit(batch: ZSetBatch, schema: &Schema, limit: usize) -> ZSetBatch {
+fn apply_limit(mut batch: ZSetBatch, schema: &Schema, limit: usize) -> ZSetBatch {
     let n = batch.pk_lo.len();
     if n <= limit { return batch; }
 
-    let mut new_batch = ZSetBatch::new(schema);
-    new_batch.pk_lo  = batch.pk_lo[..limit].to_vec();
-    new_batch.pk_hi  = batch.pk_hi[..limit].to_vec();
-    new_batch.weights = batch.weights[..limit].to_vec();
-    new_batch.nulls   = batch.nulls[..limit].to_vec();
+    batch.pk_lo.truncate(limit);
+    batch.pk_hi.truncate(limit);
+    batch.weights.truncate(limit);
+    batch.nulls.truncate(limit);
 
     for (ci, col_def) in schema.columns.iter().enumerate() {
         if ci == schema.pk_index { continue; }
-        match (&batch.columns[ci], &mut new_batch.columns[ci]) {
-            (ColData::Fixed(src), ColData::Fixed(dst)) => {
+        match &mut batch.columns[ci] {
+            ColData::Fixed(buf) => {
                 let stride = col_def.type_code.wire_stride();
-                dst.extend_from_slice(&src[..limit * stride]);
+                buf.truncate(limit * stride);
             }
-            (ColData::Strings(src), ColData::Strings(dst)) => {
-                dst.extend(src[..limit].iter().cloned());
-            }
-            (ColData::U128s(src), ColData::U128s(dst)) => {
-                dst.extend(src[..limit].iter().copied());
-            }
-            _ => {}
+            ColData::Strings(v) => { v.truncate(limit); }
+            ColData::U128s(v) => { v.truncate(limit); }
         }
     }
-    new_batch
+    batch
 }
 
 // ---------------------------------------------------------------------------

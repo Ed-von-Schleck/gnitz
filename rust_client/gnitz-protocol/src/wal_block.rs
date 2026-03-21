@@ -28,6 +28,28 @@ fn append_region(buf: &mut Vec<u8>, data: &[u8]) -> (u32, u32) {
     (off, data.len() as u32)
 }
 
+/// Serialize a `&[u64]` directly into `buf` at 8-byte alignment. No temp Vec.
+fn append_u64_region(buf: &mut Vec<u8>, vals: &[u64]) -> (u32, u32) {
+    let aligned = align8(buf.len());
+    let sz = vals.len() * 8;
+    buf.resize(aligned + sz, 0);
+    for (i, &v) in vals.iter().enumerate() {
+        buf[aligned + i * 8..aligned + (i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+    }
+    (aligned as u32, sz as u32)
+}
+
+/// Serialize a `&[i64]` directly into `buf` at 8-byte alignment. No temp Vec.
+fn append_i64_region(buf: &mut Vec<u8>, vals: &[i64]) -> (u32, u32) {
+    let aligned = align8(buf.len());
+    let sz = vals.len() * 8;
+    buf.resize(aligned + sz, 0);
+    for (i, &v) in vals.iter().enumerate() {
+        buf[aligned + i * 8..aligned + (i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+    }
+    (aligned as u32, sz as u32)
+}
+
 /// WAL column stride: String and U128 each use 16 bytes (German String struct / lo+hi pair).
 fn wal_col_stride(tc: TypeCode) -> usize {
     match tc {
@@ -161,9 +183,17 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     let num_non_pk = schema.columns.len() - 1;
     let num_regions = 4 + num_non_pk + 1;
 
-    // --- Build column region data ---
+    // --- Pre-build String/U128 column region data (needs blob arena) ---
+    // Fixed columns are appended directly to buf later (no clone).
     let mut blob: Vec<u8> = Vec::new();
-    let mut col_region_data: Vec<Vec<u8>> = Vec::with_capacity(num_non_pk);
+
+    // ColRegion::Prebuilt holds String/U128 temp Vecs; ColRegion::FixedRef marks
+    // columns that will borrow from batch.columns directly.
+    enum ColRegion {
+        Prebuilt(Vec<u8>),
+        FixedRef(usize), // schema column index → borrow batch.columns[ci]
+    }
+    let mut col_regions: Vec<ColRegion> = Vec::with_capacity(num_non_pk);
 
     for (ci, col) in schema.columns.iter().enumerate() {
         if ci == schema.pk_index {
@@ -171,7 +201,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
         }
         let payload_idx = if ci < schema.pk_index { ci } else { ci - 1 };
 
-        let region = match col.type_code {
+        match col.type_code {
             TypeCode::String => {
                 let strings = match &batch.columns[ci] {
                     ColData::Strings(v) => v,
@@ -188,7 +218,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                         col_bytes.extend_from_slice(&st);
                     }
                 }
-                col_bytes
+                col_regions.push(ColRegion::Prebuilt(col_bytes));
             }
             TypeCode::U128 => {
                 let vals = match &batch.columns[ci] {
@@ -202,7 +232,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                     col_bytes.extend_from_slice(&lo.to_le_bytes());
                     col_bytes.extend_from_slice(&hi.to_le_bytes());
                 }
-                col_bytes
+                col_regions.push(ColRegion::Prebuilt(col_bytes));
             }
             _ => {
                 let stride = wal_col_stride(col.type_code);
@@ -212,10 +242,9 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                 };
                 debug_assert_eq!(fixed.len(), count * stride,
                     "col {} Fixed length {} != count*stride {}", ci, fixed.len(), count * stride);
-                fixed.clone()
+                col_regions.push(ColRegion::FixedRef(ci));
             }
-        };
-        col_region_data.push(region);
+        }
     }
 
     let blob_size = blob.len();
@@ -226,41 +255,26 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     let mut buf: Vec<u8> = vec![0u8; dir_start + dir_size];
     let mut dir_entries: Vec<(u32, u32)> = Vec::with_capacity(num_regions);
 
-    // pk_lo
-    let r = {
-        let mut v = Vec::with_capacity(count * 8);
-        for &x in &batch.pk_lo { v.extend_from_slice(&x.to_le_bytes()); }
-        v
-    };
-    dir_entries.push(append_region(&mut buf, &r));
+    // System regions — write directly into buf, no temp Vecs
+    dir_entries.push(append_u64_region(&mut buf, &batch.pk_lo));
+    dir_entries.push(append_u64_region(&mut buf, &batch.pk_hi));
+    dir_entries.push(append_i64_region(&mut buf, &batch.weights));
+    dir_entries.push(append_u64_region(&mut buf, &batch.nulls));
 
-    // pk_hi
-    let r = {
-        let mut v = Vec::with_capacity(count * 8);
-        for &x in &batch.pk_hi { v.extend_from_slice(&x.to_le_bytes()); }
-        v
-    };
-    dir_entries.push(append_region(&mut buf, &r));
-
-    // weight
-    let r = {
-        let mut v = Vec::with_capacity(count * 8);
-        for &x in &batch.weights { v.extend_from_slice(&x.to_le_bytes()); }
-        v
-    };
-    dir_entries.push(append_region(&mut buf, &r));
-
-    // null
-    let r = {
-        let mut v = Vec::with_capacity(count * 8);
-        for &x in &batch.nulls { v.extend_from_slice(&x.to_le_bytes()); }
-        v
-    };
-    dir_entries.push(append_region(&mut buf, &r));
-
-    // non-PK column regions
-    for region in &col_region_data {
-        dir_entries.push(append_region(&mut buf, region));
+    // Non-PK column regions
+    for cr in &col_regions {
+        match cr {
+            ColRegion::Prebuilt(data) => {
+                dir_entries.push(append_region(&mut buf, data));
+            }
+            ColRegion::FixedRef(ci) => {
+                let fixed = match &batch.columns[*ci] {
+                    ColData::Fixed(v) => v,
+                    _ => unreachable!(),
+                };
+                dir_entries.push(append_region(&mut buf, fixed));
+            }
+        }
     }
 
     // blob arena (always last region)

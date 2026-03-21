@@ -3,6 +3,53 @@ use std::mem::{size_of, zeroed};
 use std::os::unix::io::RawFd;
 use crate::error::ProtocolError;
 
+/// Zero-copy wrapper around an mmap'd memfd.
+/// Keeps the mapping and fd alive until dropped.
+pub struct MmapBuffer {
+    ptr: *const u8,
+    len: usize,
+    fd:  RawFd,
+}
+
+impl MmapBuffer {
+    /// An empty buffer (no mmap, no fd).
+    fn empty() -> Self {
+        Self { ptr: std::ptr::null(), len: 0, fd: -1 }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Drop for MmapBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            if self.len > 0 {
+                libc::munmap(self.ptr as *mut _, self.len);
+            }
+            if self.fd >= 0 {
+                libc::close(self.fd);
+            }
+        }
+    }
+}
+
+// SAFETY: MmapBuffer is read-only (PROT_READ) and the fd is private.
+unsafe impl Send for MmapBuffer {}
+
 fn io_err() -> ProtocolError {
     ProtocolError::IoError(std::io::Error::last_os_error())
 }
@@ -104,7 +151,7 @@ pub fn send_memfd(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
     }
 }
 
-pub fn recv_memfd(sock_fd: RawFd) -> Result<Vec<u8>, ProtocolError> {
+pub fn recv_memfd(sock_fd: RawFd) -> Result<MmapBuffer, ProtocolError> {
     unsafe {
         let cmsg_space = libc::CMSG_SPACE(size_of::<libc::c_int>() as libc::c_uint) as usize;
         let mut ctrl_buf = vec![0u8; cmsg_space];
@@ -153,7 +200,7 @@ pub fn recv_memfd(sock_fd: RawFd) -> Result<Vec<u8>, ProtocolError> {
         let size = stat_buf.st_size as usize;
         if size == 0 {
             libc::close(recv_fd);
-            return Ok(Vec::new());
+            return Ok(MmapBuffer::empty());
         }
 
         let ptr = libc::mmap(
@@ -169,11 +216,7 @@ pub fn recv_memfd(sock_fd: RawFd) -> Result<Vec<u8>, ProtocolError> {
             return Err(io_err());
         }
 
-        let result = std::slice::from_raw_parts(ptr as *const u8, size).to_vec();
-        libc::munmap(ptr, size);
-        libc::close(recv_fd);
-
-        Ok(result)
+        Ok(MmapBuffer { ptr: ptr as *const u8, len: size, fd: recv_fd })
     }
 }
 
@@ -198,7 +241,7 @@ mod tests {
         let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
         send_memfd(a, &data).unwrap();
         let received = recv_memfd(b).unwrap();
-        assert_eq!(received, data);
+        assert_eq!(received.as_slice(), &data[..]);
         unsafe { libc::close(a); libc::close(b); }
     }
 

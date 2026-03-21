@@ -42,7 +42,8 @@ impl RawClient {
     /// Returns (status, error_msg, raw_response).
     fn send_recv(&self, data: &[u8]) -> (u32, String, Vec<u8>) {
         send_memfd(self.fd, data).expect("send_memfd");
-        let resp = recv_memfd(self.fd).expect("recv_memfd");
+        let mmap = recv_memfd(self.fd).expect("recv_memfd");
+        let resp = mmap.as_slice().to_vec();
         if resp.len() < WAL_BLOCK_HEADER_SIZE {
             return (STATUS_ERROR, "response too small".into(), resp);
         }
@@ -659,7 +660,8 @@ fn test_empty_memfd_too_small() {
     }
 
     match recv_memfd(sock_fd) {
-        Ok(resp) if resp.len() >= WAL_BLOCK_HEADER_SIZE => {
+        Ok(mmap) if mmap.len() >= WAL_BLOCK_HEADER_SIZE => {
+            let resp = mmap.as_slice();
             let ctrl_size = u32::from_le_bytes(resp[16..20].try_into().unwrap()) as usize;
             if ctrl_size <= resp.len() {
                 if let Ok((hdr, _)) = decode_control_block(&resp[..ctrl_size]) {

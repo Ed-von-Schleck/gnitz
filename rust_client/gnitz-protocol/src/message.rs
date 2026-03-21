@@ -83,10 +83,15 @@ pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>,
         header.p4,
     ];
 
+    let mut ctrl_bytes = [0u8; 56];
+    for (i, &v) in u64_vals.iter().enumerate() {
+        ctrl_bytes[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+    }
+
     let mut columns: Vec<ColData> = Vec::with_capacity(9);
     columns.push(ColData::Fixed(vec![]));   // col 0: pk placeholder
-    for &v in &u64_vals {
-        columns.push(ColData::Fixed(v.to_le_bytes().to_vec()));
+    for i in 0..7 {
+        columns.push(ColData::Fixed(ctrl_bytes[i * 8..(i + 1) * 8].to_vec()));
     }
     columns.push(ColData::Strings(vec![
         if has_error { Some(error_msg.to_string()) } else { None }
@@ -184,21 +189,29 @@ pub fn send_message(
         status: STATUS_OK, target_id, client_id, flags: flags_out,
         seek_pk_lo, seek_pk_hi, p4: seek_col_idx,
     };
-    let mut buf = encode_control_block(&ctrl_hdr, "")?;
-
-    if has_schema {
+    let ctrl_block = encode_control_block(&ctrl_hdr, "")?;
+    let schema_block = if has_schema {
         let ms = meta_schema();
         let owned = schema_to_batch(schema.unwrap());
-        let schema_block = encode_wal_block(ms, target_id as u32, &owned);
-        buf.extend_from_slice(&schema_block);
-    }
-
-    if has_data {
-        let data_block = encode_wal_block(
+        Some(encode_wal_block(ms, target_id as u32, &owned))
+    } else {
+        None
+    };
+    let data_block = if has_data {
+        Some(encode_wal_block(
             schema.unwrap(), target_id as u32, data_batch.unwrap()
-        );
-        buf.extend_from_slice(&data_block);
-    }
+        ))
+    } else {
+        None
+    };
+
+    let total = ctrl_block.len()
+        + schema_block.as_ref().map_or(0, |b| b.len())
+        + data_block.as_ref().map_or(0, |b| b.len());
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(&ctrl_block);
+    if let Some(ref sb) = schema_block { buf.extend_from_slice(sb); }
+    if let Some(ref db) = data_block { buf.extend_from_slice(db); }
 
     send_memfd(sock_fd, &buf)
 }
@@ -208,6 +221,7 @@ pub fn recv_message(
     data_schema: Option<&Schema>,
 ) -> Result<Message, ProtocolError> {
     let buf = recv_memfd(sock_fd)?;
+    let buf = buf.as_slice();
 
     if buf.len() < WAL_BLOCK_HEADER_SIZE {
         return Err(ProtocolError::DecodeError("message too small".into()));
