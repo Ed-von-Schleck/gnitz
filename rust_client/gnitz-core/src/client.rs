@@ -1,4 +1,4 @@
-use gnitz_protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData};
+use gnitz_protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender};
 use crate::connection::Connection;
 use crate::error::ClientError;
 use crate::ops::{
@@ -18,29 +18,31 @@ use crate::types::{
 
 // --- Module-private helpers ---
 
-fn col_u64(col: &ColData, i: usize) -> u64 {
+fn col_u64(col: &ColData, i: usize) -> Result<u64, ClientError> {
     match col {
         ColData::Fixed(bytes) => {
-            let offset = i * 8;
-            u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+            let off = i * 8;
+            if off + 8 > bytes.len() {
+                return Err(ClientError::ServerError(
+                    format!("col_u64: row {} out of bounds (len {})", i, bytes.len())));
+            }
+            Ok(u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()))
         }
-        _ => panic!("col_u64: expected Fixed column"),
+        _ => Err(ClientError::ServerError("col_u64: expected Fixed column".into())),
     }
 }
 
-fn col_str(col: &ColData, i: usize) -> Option<&str> {
+fn col_str(col: &ColData, i: usize) -> Result<Option<&str>, ClientError> {
     match col {
-        ColData::Strings(v) => v[i].as_deref(),
-        _ => panic!("col_str: expected Strings column"),
+        ColData::Strings(v) => {
+            if i >= v.len() {
+                return Err(ClientError::ServerError(
+                    format!("col_str: row {} out of bounds (len {})", i, v.len())));
+            }
+            Ok(v[i].as_deref())
+        }
+        _ => Err(ClientError::ServerError("col_str: expected Strings column".into())),
     }
-}
-
-fn push_u64_bytes(buf: &mut Vec<u8>, val: u64) {
-    buf.extend_from_slice(&val.to_le_bytes());
-}
-
-fn push_str(col: &mut ColData, s: &str) {
-    if let ColData::Strings(v) = col { v.push(Some(s.to_string())); }
 }
 
 fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
@@ -84,8 +86,12 @@ fn copy_col_row(src: &ColData, row: usize, dst: &mut ColData, stride: usize) {
     }
 }
 
-fn pack_col_id(owner_id: u64, col_idx: usize) -> u64 {
-    (owner_id << 9) | col_idx as u64
+fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
+    if col_idx >= 512 {
+        return Err(ClientError::ServerError(
+            format!("column index {} exceeds maximum 511", col_idx)));
+    }
+    Ok((owner_id << 9) | col_idx as u64)
 }
 
 // --- Internal record types ---
@@ -168,10 +174,10 @@ impl GnitzClient {
         let idx_batch = match idx_batch { None => return Ok(None), Some(b) => b };
         for i in 0..idx_batch.len() {
             if idx_batch.weights[i] <= 0 { continue; }
-            let owner_id       = col_u64(&idx_batch.columns[1], i);
-            let source_col_idx = col_u64(&idx_batch.columns[3], i);
+            let owner_id       = col_u64(&idx_batch.columns[1], i)?;
+            let source_col_idx = col_u64(&idx_batch.columns[3], i)?;
             if owner_id == table_id && source_col_idx == col_idx as u64 {
-                let is_unique = col_u64(&idx_batch.columns[5], i) != 0;
+                let is_unique = col_u64(&idx_batch.columns[5], i)? != 0;
                 return Ok(Some((idx_batch.pk_lo[i], is_unique)));
             }
         }
@@ -193,16 +199,14 @@ impl GnitzClient {
 
         let idx_schema = idx_tab_schema();
         let mut batch = ZSetBatch::new(&idx_schema);
-        batch.pk_lo.push(index_id);
-        batch.pk_hi.push(0);
-        batch.weights.push(1);
-        batch.nulls.push(0);
-        if let ColData::Fixed(buf) = &mut batch.columns[1] { push_u64_bytes(buf, table_id); }
-        if let ColData::Fixed(buf) = &mut batch.columns[2] { push_u64_bytes(buf, 0u64); }
-        if let ColData::Fixed(buf) = &mut batch.columns[3] { push_u64_bytes(buf, col_idx as u64); }
-        push_str(&mut batch.columns[4], &index_name);
-        if let ColData::Fixed(buf) = &mut batch.columns[5] { push_u64_bytes(buf, is_unique as u64); }
-        push_str(&mut batch.columns[6], "");
+        BatchAppender::new(&mut batch, &idx_schema)
+            .add_row(index_id, 0, 1)
+            .u64_val(table_id)
+            .u64_val(0)
+            .u64_val(col_idx as u64)
+            .str_val(&index_name)
+            .u64_val(is_unique as u64)
+            .str_val("");
 
         self.push(IDX_TAB, &idx_schema, &batch)?;
         Ok(index_id)
@@ -215,28 +219,26 @@ impl GnitzClient {
         })?;
         for i in 0..idx_batch.len() {
             if idx_batch.weights[i] <= 0 { continue; }
-            let name = col_str(&idx_batch.columns[4], i).unwrap_or("");
+            let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
             if name != index_name { continue; }
 
             let index_id   = idx_batch.pk_lo[i];
-            let owner_id   = col_u64(&idx_batch.columns[1], i);
-            let owner_kind = col_u64(&idx_batch.columns[2], i);
-            let src_col    = col_u64(&idx_batch.columns[3], i);
-            let is_unique  = col_u64(&idx_batch.columns[5], i);
-            let cache_dir  = col_str(&idx_batch.columns[6], i).unwrap_or("").to_string();
+            let owner_id   = col_u64(&idx_batch.columns[1], i)?;
+            let owner_kind = col_u64(&idx_batch.columns[2], i)?;
+            let src_col    = col_u64(&idx_batch.columns[3], i)?;
+            let is_unique  = col_u64(&idx_batch.columns[5], i)?;
+            let cache_dir  = col_str(&idx_batch.columns[6], i)?.unwrap_or("").to_string();
 
             let idx_schema = idx_tab_schema();
             let mut batch = ZSetBatch::new(&idx_schema);
-            batch.pk_lo.push(index_id);
-            batch.pk_hi.push(0);
-            batch.weights.push(-1);
-            batch.nulls.push(0);
-            if let ColData::Fixed(buf) = &mut batch.columns[1] { push_u64_bytes(buf, owner_id); }
-            if let ColData::Fixed(buf) = &mut batch.columns[2] { push_u64_bytes(buf, owner_kind); }
-            if let ColData::Fixed(buf) = &mut batch.columns[3] { push_u64_bytes(buf, src_col); }
-            push_str(&mut batch.columns[4], index_name);
-            if let ColData::Fixed(buf) = &mut batch.columns[5] { push_u64_bytes(buf, is_unique); }
-            push_str(&mut batch.columns[6], &cache_dir);
+            BatchAppender::new(&mut batch, &idx_schema)
+                .add_row(index_id, 0, -1)
+                .u64_val(owner_id)
+                .u64_val(owner_kind)
+                .u64_val(src_col)
+                .str_val(index_name)
+                .u64_val(is_unique)
+                .str_val(&cache_dir);
             self.push(IDX_TAB, &idx_schema, &batch)?;
             return Ok(());
         }
@@ -244,26 +246,14 @@ impl GnitzClient {
     }
 
     pub fn delete(&self, table_id: u64, schema: &Schema, pks: &[(u64, u64)]) -> Result<(), ClientError> {
-        let n = pks.len();
         let mut batch = ZSetBatch::new(schema);
-        for &(pk_lo, pk_hi) in pks {
-            batch.pk_lo.push(pk_lo);
-            batch.pk_hi.push(pk_hi);
-            batch.weights.push(-1);
-            batch.nulls.push(0);
-        }
-        for (ci, col_def) in schema.columns.iter().enumerate() {
-            if ci == schema.pk_index { continue; }
-            match &mut batch.columns[ci] {
-                ColData::Fixed(buf) => {
-                    let stride = col_def.type_code.wire_stride();
-                    buf.extend(std::iter::repeat(0u8).take(n * stride));
-                }
-                ColData::Strings(v) => {
-                    for _ in 0..n { v.push(Some(String::new())); }
-                }
-                ColData::U128s(u) => {
-                    for _ in 0..n { u.push(0u128); }
+        {
+            let mut a = BatchAppender::new(&mut batch, schema);
+            let non_pk_count = schema.columns.len() - 1;
+            for &(pk_lo, pk_hi) in pks {
+                a.add_row(pk_lo, pk_hi, -1);
+                for _ in 0..non_pk_count {
+                    a.zero_val();
                 }
             }
         }
@@ -277,13 +267,9 @@ impl GnitzClient {
         let new_sid = ops::alloc_schema_id(&self.conn)?;
         let schema = schema_tab_schema();
         let mut batch = ZSetBatch::new(&schema);
-        batch.pk_lo.push(new_sid);
-        batch.pk_hi.push(0);
-        batch.weights.push(1);
-        batch.nulls.push(0);
-        if let ColData::Strings(v) = &mut batch.columns[1] {
-            v.push(Some(name.to_string()));
-        }
+        BatchAppender::new(&mut batch, &schema)
+            .add_row(new_sid, 0, 1)
+            .str_val(name);
         ops::push(&self.conn, SCHEMA_TAB, &schema, &batch)?;
         Ok(new_sid)
     }
@@ -297,13 +283,9 @@ impl GnitzClient {
 
         let schema = schema_tab_schema();
         let mut batch = ZSetBatch::new(&schema);
-        batch.pk_lo.push(schema_id);
-        batch.pk_hi.push(0);
-        batch.weights.push(-1);
-        batch.nulls.push(0);
-        if let ColData::Strings(v) = &mut batch.columns[1] {
-            v.push(Some(name.to_string()));
-        }
+        BatchAppender::new(&mut batch, &schema)
+            .add_row(schema_id, 0, -1)
+            .str_val(name);
         ops::push(&self.conn, SCHEMA_TAB, &schema, &batch)?;
         Ok(())
     }
@@ -330,16 +312,14 @@ impl GnitzClient {
         // TABLE_TAB last
         let tbl_schema = table_tab_schema();
         let mut tb = ZSetBatch::new(&tbl_schema);
-        tb.pk_lo.push(new_tid);
-        tb.pk_hi.push(0);
-        tb.weights.push(1);
-        tb.nulls.push(0);
-        if let ColData::Fixed(buf) = &mut tb.columns[1] { push_u64_bytes(buf, schema_id); }
-        if let ColData::Strings(v) = &mut tb.columns[2] { v.push(Some(table_name.to_string())); }
-        if let ColData::Strings(v) = &mut tb.columns[3] { v.push(Some(String::new())); }
-        if let ColData::Fixed(buf) = &mut tb.columns[4] { push_u64_bytes(buf, pk_col_idx as u64); }
-        if let ColData::Fixed(buf) = &mut tb.columns[5] { push_u64_bytes(buf, 0); }
-        if let ColData::Fixed(buf) = &mut tb.columns[6] { push_u64_bytes(buf, unique_pk as u64); }
+        BatchAppender::new(&mut tb, &tbl_schema)
+            .add_row(new_tid, 0, 1)
+            .u64_val(schema_id)
+            .str_val(table_name)
+            .str_val("")
+            .u64_val(pk_col_idx as u64)
+            .u64_val(0)
+            .u64_val(unique_pk as u64);
         ops::push(&self.conn, TABLE_TAB, &tbl_schema, &tb)?;
 
         Ok(new_tid)
@@ -365,16 +345,14 @@ impl GnitzClient {
 
         let tbl_schema = table_tab_schema();
         let mut tb = ZSetBatch::new(&tbl_schema);
-        tb.pk_lo.push(record.tid);
-        tb.pk_hi.push(0);
-        tb.weights.push(-1);
-        tb.nulls.push(0);
-        if let ColData::Fixed(buf) = &mut tb.columns[1] { push_u64_bytes(buf, record.schema_id); }
-        if let ColData::Strings(v) = &mut tb.columns[2] { v.push(Some(record.name.clone())); }
-        if let ColData::Strings(v) = &mut tb.columns[3] { v.push(Some(record.directory.clone())); }
-        if let ColData::Fixed(buf) = &mut tb.columns[4] { push_u64_bytes(buf, record.pk_col_idx); }
-        if let ColData::Fixed(buf) = &mut tb.columns[5] { push_u64_bytes(buf, record.created_lsn); }
-        if let ColData::Fixed(buf) = &mut tb.columns[6] { push_u64_bytes(buf, record.flags); }
+        BatchAppender::new(&mut tb, &tbl_schema)
+            .add_row(record.tid, 0, -1)
+            .u64_val(record.schema_id)
+            .str_val(&record.name)
+            .str_val(&record.directory)
+            .u64_val(record.pk_col_idx)
+            .u64_val(record.created_lsn)
+            .u64_val(record.flags);
         ops::push(&self.conn, TABLE_TAB, &tbl_schema, &tb)?;
 
         Ok(())
@@ -402,13 +380,11 @@ impl GnitzClient {
         {
             let dep_s = dep_tab_schema();
             let mut dep = ZSetBatch::new(&dep_s);
-            dep.pk_lo.push(source_table_id);
-            dep.pk_hi.push(vid);
-            dep.weights.push(1);
-            dep.nulls.push(0);
-            if let ColData::Fixed(buf) = &mut dep.columns[1] { push_u64_bytes(buf, vid); }
-            if let ColData::Fixed(buf) = &mut dep.columns[2] { push_u64_bytes(buf, 0); }
-            if let ColData::Fixed(buf) = &mut dep.columns[3] { push_u64_bytes(buf, source_table_id); }
+            BatchAppender::new(&mut dep, &dep_s)
+                .add_row(source_table_id, vid, 1)
+                .u64_val(vid)
+                .u64_val(0)
+                .u64_val(source_table_id);
             ops::push(&self.conn, DEP_TAB, &dep_s, &dep)?;
         }
 
@@ -416,15 +392,10 @@ impl GnitzClient {
         {
             let nodes_s = circuit_nodes_schema();
             let mut nodes = ZSetBatch::new(&nodes_s);
-            for (node_id, _) in [(0u64, ()), (1u64, ())] {
-                nodes.pk_lo.push(node_id);
-                nodes.pk_hi.push(vid);
-                nodes.weights.push(1);
-                nodes.nulls.push(0);
-            }
-            if let ColData::Fixed(buf) = &mut nodes.columns[1] {
-                push_u64_bytes(buf, OPCODE_SCAN_TRACE);
-                push_u64_bytes(buf, OPCODE_INTEGRATE);
+            {
+                let mut a = BatchAppender::new(&mut nodes, &nodes_s);
+                a.add_row(0, vid, 1).u64_val(OPCODE_SCAN_TRACE);
+                a.add_row(1, vid, 1).u64_val(OPCODE_INTEGRATE);
             }
             ops::push(&self.conn, CIRCUIT_NODES_TAB, &nodes_s, &nodes)?;
         }
@@ -433,13 +404,11 @@ impl GnitzClient {
         {
             let edges_s = circuit_edges_schema();
             let mut edges = ZSetBatch::new(&edges_s);
-            edges.pk_lo.push(0);
-            edges.pk_hi.push(vid);
-            edges.weights.push(1);
-            edges.nulls.push(0);
-            if let ColData::Fixed(buf) = &mut edges.columns[1] { push_u64_bytes(buf, 0); }
-            if let ColData::Fixed(buf) = &mut edges.columns[2] { push_u64_bytes(buf, 1); }
-            if let ColData::Fixed(buf) = &mut edges.columns[3] { push_u64_bytes(buf, PORT_IN); }
+            BatchAppender::new(&mut edges, &edges_s)
+                .add_row(0, vid, 1)
+                .u64_val(0)
+                .u64_val(1)
+                .u64_val(PORT_IN);
             ops::push(&self.conn, CIRCUIT_EDGES_TAB, &edges_s, &edges)?;
         }
 
@@ -447,11 +416,9 @@ impl GnitzClient {
         {
             let sources_s = circuit_sources_schema();
             let mut sources = ZSetBatch::new(&sources_s);
-            sources.pk_lo.push(0);
-            sources.pk_hi.push(vid);
-            sources.weights.push(1);
-            sources.nulls.push(0);
-            if let ColData::Fixed(buf) = &mut sources.columns[1] { push_u64_bytes(buf, 0); }
+            BatchAppender::new(&mut sources, &sources_s)
+                .add_row(0, vid, 1)
+                .u64_val(0);
             ops::push(&self.conn, CIRCUIT_SOURCES_TAB, &sources_s, &sources)?;
         }
 
@@ -488,14 +455,14 @@ impl GnitzClient {
         if !circuit.dependencies.is_empty() {
             let dep_s = dep_tab_schema();
             let mut dep = ZSetBatch::new(&dep_s);
-            for &dep_tid in &circuit.dependencies {
-                dep.pk_lo.push(dep_tid);
-                dep.pk_hi.push(vid);
-                dep.weights.push(1);
-                dep.nulls.push(0);
-                if let ColData::Fixed(buf) = &mut dep.columns[1] { push_u64_bytes(buf, vid); }
-                if let ColData::Fixed(buf) = &mut dep.columns[2] { push_u64_bytes(buf, 0); }
-                if let ColData::Fixed(buf) = &mut dep.columns[3] { push_u64_bytes(buf, dep_tid); }
+            {
+                let mut a = BatchAppender::new(&mut dep, &dep_s);
+                for &dep_tid in &circuit.dependencies {
+                    a.add_row(dep_tid, vid, 1)
+                        .u64_val(vid)
+                        .u64_val(0)
+                        .u64_val(dep_tid);
+                }
             }
             ops::push(&self.conn, DEP_TAB, &dep_s, &dep)?;
         }
@@ -504,12 +471,11 @@ impl GnitzClient {
         if !circuit.nodes.is_empty() {
             let nodes_s = circuit_nodes_schema();
             let mut nodes = ZSetBatch::new(&nodes_s);
-            for &(node_id, opcode) in &circuit.nodes {
-                nodes.pk_lo.push(node_id);
-                nodes.pk_hi.push(vid);
-                nodes.weights.push(1);
-                nodes.nulls.push(0);
-                if let ColData::Fixed(buf) = &mut nodes.columns[1] { push_u64_bytes(buf, opcode); }
+            {
+                let mut a = BatchAppender::new(&mut nodes, &nodes_s);
+                for &(node_id, opcode) in &circuit.nodes {
+                    a.add_row(node_id, vid, 1).u64_val(opcode);
+                }
             }
             ops::push(&self.conn, CIRCUIT_NODES_TAB, &nodes_s, &nodes)?;
         }
@@ -518,14 +484,14 @@ impl GnitzClient {
         if !circuit.edges.is_empty() {
             let edges_s = circuit_edges_schema();
             let mut edges = ZSetBatch::new(&edges_s);
-            for &(edge_id, src, dst, port) in &circuit.edges {
-                edges.pk_lo.push(edge_id);
-                edges.pk_hi.push(vid);
-                edges.weights.push(1);
-                edges.nulls.push(0);
-                if let ColData::Fixed(buf) = &mut edges.columns[1] { push_u64_bytes(buf, src); }
-                if let ColData::Fixed(buf) = &mut edges.columns[2] { push_u64_bytes(buf, dst); }
-                if let ColData::Fixed(buf) = &mut edges.columns[3] { push_u64_bytes(buf, port); }
+            {
+                let mut a = BatchAppender::new(&mut edges, &edges_s);
+                for &(edge_id, src, dst, port) in &circuit.edges {
+                    a.add_row(edge_id, vid, 1)
+                        .u64_val(src)
+                        .u64_val(dst)
+                        .u64_val(port);
+                }
             }
             ops::push(&self.conn, CIRCUIT_EDGES_TAB, &edges_s, &edges)?;
         }
@@ -534,12 +500,11 @@ impl GnitzClient {
         if !circuit.sources.is_empty() {
             let sources_s = circuit_sources_schema();
             let mut sources = ZSetBatch::new(&sources_s);
-            for &(node_id, table_id) in &circuit.sources {
-                sources.pk_lo.push(node_id);
-                sources.pk_hi.push(vid);
-                sources.weights.push(1);
-                sources.nulls.push(0);
-                if let ColData::Fixed(buf) = &mut sources.columns[1] { push_u64_bytes(buf, table_id); }
+            {
+                let mut a = BatchAppender::new(&mut sources, &sources_s);
+                for &(node_id, table_id) in &circuit.sources {
+                    a.add_row(node_id, vid, 1).u64_val(table_id);
+                }
             }
             ops::push(&self.conn, CIRCUIT_SOURCES_TAB, &sources_s, &sources)?;
         }
@@ -548,29 +513,24 @@ impl GnitzClient {
         if !circuit.params.is_empty() || !circuit.const_strings.is_empty() {
             let params_s = circuit_params_schema();
             let mut params = ZSetBatch::new(&params_s);
-
-            // Numeric params: str_value = NULL
-            for &(node_id, slot, value) in &circuit.params {
-                let param_lo = (node_id << 8) | slot;
-                params.pk_lo.push(param_lo);
-                params.pk_hi.push(vid);
-                params.weights.push(1);
-                params.nulls.push(1 << 1); // bit 1 = str_value (payload col idx 1) is null
-                if let ColData::Fixed(buf) = &mut params.columns[1] { push_u64_bytes(buf, value); }
-                if let ColData::Strings(v) = &mut params.columns[2] { v.push(None); }
+            {
+                let mut a = BatchAppender::new(&mut params, &params_s);
+                // Numeric params: str_value = NULL
+                for &(node_id, slot, value) in &circuit.params {
+                    let param_lo = (node_id << 8) | slot;
+                    a.add_row(param_lo, vid, 1)
+                        .null_mask(1 << 1)
+                        .u64_val(value)
+                        .str_null();
+                }
+                // String constant params: str_value = actual string
+                for (node_id, slot, ref value) in &circuit.const_strings {
+                    let param_lo = (node_id << 8) | slot;
+                    a.add_row(param_lo, vid, 1)
+                        .u64_val(0)
+                        .str_val(value);
+                }
             }
-
-            // String constant params: str_value = actual string
-            for (node_id, slot, ref value) in &circuit.const_strings {
-                let param_lo = (node_id << 8) | slot;
-                params.pk_lo.push(param_lo);
-                params.pk_hi.push(vid);
-                params.weights.push(1);
-                params.nulls.push(0); // no nulls
-                if let ColData::Fixed(buf) = &mut params.columns[1] { push_u64_bytes(buf, 0); }
-                if let ColData::Strings(v) = &mut params.columns[2] { v.push(Some(value.clone())); }
-            }
-
             ops::push(&self.conn, CIRCUIT_PARAMS_TAB, &params_s, &params)?;
         }
 
@@ -578,13 +538,12 @@ impl GnitzClient {
         if !circuit.group_cols.is_empty() {
             let gcols_s = circuit_group_cols_schema();
             let mut gcols = ZSetBatch::new(&gcols_s);
-            for &(node_id, col_idx) in &circuit.group_cols {
-                let gcol_lo = (node_id << 16) | col_idx;
-                gcols.pk_lo.push(gcol_lo);
-                gcols.pk_hi.push(vid);
-                gcols.weights.push(1);
-                gcols.nulls.push(0);
-                if let ColData::Fixed(buf) = &mut gcols.columns[1] { push_u64_bytes(buf, col_idx); }
+            {
+                let mut a = BatchAppender::new(&mut gcols, &gcols_s);
+                for &(node_id, col_idx) in &circuit.group_cols {
+                    let gcol_lo = (node_id << 16) | col_idx;
+                    a.add_row(gcol_lo, vid, 1).u64_val(col_idx);
+                }
             }
             ops::push(&self.conn, CIRCUIT_GROUP_COLS_TAB, &gcols_s, &gcols)?;
         }
@@ -612,15 +571,13 @@ impl GnitzClient {
         {
             let view_s = view_tab_schema();
             let mut vb = ZSetBatch::new(&view_s);
-            vb.pk_lo.push(vr.vid);
-            vb.pk_hi.push(0);
-            vb.weights.push(-1);
-            vb.nulls.push(0);
-            if let ColData::Fixed(buf) = &mut vb.columns[1] { push_u64_bytes(buf, vr.schema_id); }
-            if let ColData::Strings(v) = &mut vb.columns[2] { v.push(Some(vr.name.clone())); }
-            if let ColData::Strings(v) = &mut vb.columns[3] { v.push(Some(vr.sql_definition.clone())); }
-            if let ColData::Strings(v) = &mut vb.columns[4] { v.push(Some(vr.cache_directory.clone())); }
-            if let ColData::Fixed(buf) = &mut vb.columns[5] { push_u64_bytes(buf, vr.created_lsn); }
+            BatchAppender::new(&mut vb, &view_s)
+                .add_row(vr.vid, 0, -1)
+                .u64_val(vr.schema_id)
+                .str_val(&vr.name)
+                .str_val(&vr.sql_definition)
+                .str_val(&vr.cache_directory)
+                .u64_val(vr.created_lsn);
             ops::push(&self.conn, VIEW_TAB, &view_s, &vb)?;
         }
 
@@ -711,15 +668,15 @@ impl GnitzClient {
         let mut col_entries: Vec<(u64, String, TypeCode, bool)> = Vec::new();
         for i in 0..col_batch.len() {
             if col_batch.weights[i] <= 0 { continue; }
-            let row_owner_id   = col_u64(&col_batch.columns[1], i);
-            let row_owner_kind = col_u64(&col_batch.columns[2], i);
+            let row_owner_id   = col_u64(&col_batch.columns[1], i)?;
+            let row_owner_kind = col_u64(&col_batch.columns[2], i)?;
             if row_owner_id != owner_id || row_owner_kind != owner_kind { continue; }
 
-            let col_idx     = col_u64(&col_batch.columns[3], i);
-            let name        = col_str(&col_batch.columns[4], i).unwrap_or("").to_string();
-            let tc_val      = col_u64(&col_batch.columns[5], i);
+            let col_idx     = col_u64(&col_batch.columns[3], i)?;
+            let name        = col_str(&col_batch.columns[4], i)?.unwrap_or("").to_string();
+            let tc_val      = col_u64(&col_batch.columns[5], i)?;
             let type_code   = TypeCode::try_from_u64(tc_val).map_err(ClientError::Protocol)?;
-            let is_nullable = col_u64(&col_batch.columns[6], i) != 0;
+            let is_nullable = col_u64(&col_batch.columns[6], i)? != 0;
             col_entries.push((col_idx, name, type_code, is_nullable));
         }
         col_entries.sort_by_key(|e| e.0);
@@ -731,7 +688,7 @@ impl GnitzClient {
     fn find_schema_id(&self, batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
         for i in 0..batch.len() {
             if batch.weights[i] <= 0 { continue; }
-            if col_str(&batch.columns[1], i) == Some(name) {
+            if col_str(&batch.columns[1], i)? == Some(name) {
                 return Ok(batch.pk_lo[i]);
             }
         }
@@ -746,16 +703,16 @@ impl GnitzClient {
     ) -> Result<TableRecord, ClientError> {
         for i in 0..batch.len() {
             if batch.weights[i] <= 0 { continue; }
-            if col_u64(&batch.columns[1], i) != schema_id { continue; }
-            if col_str(&batch.columns[2], i) != Some(table_name) { continue; }
+            if col_u64(&batch.columns[1], i)? != schema_id { continue; }
+            if col_str(&batch.columns[2], i)? != Some(table_name) { continue; }
             return Ok(TableRecord {
                 tid:         batch.pk_lo[i],
                 schema_id,
                 name:        table_name.to_string(),
-                directory:   col_str(&batch.columns[3], i).unwrap_or("").to_string(),
-                pk_col_idx:  col_u64(&batch.columns[4], i),
-                created_lsn: col_u64(&batch.columns[5], i),
-                flags:       col_u64(&batch.columns[6], i),
+                directory:   col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
+                pk_col_idx:  col_u64(&batch.columns[4], i)?,
+                created_lsn: col_u64(&batch.columns[5], i)?,
+                flags:       col_u64(&batch.columns[6], i)?,
             });
         }
         Err(ClientError::ServerError(format!("Table '{}' not found", table_name)))
@@ -769,15 +726,15 @@ impl GnitzClient {
     ) -> Result<ViewRecord, ClientError> {
         for i in 0..batch.len() {
             if batch.weights[i] <= 0 { continue; }
-            if col_u64(&batch.columns[1], i) != schema_id { continue; }
-            if col_str(&batch.columns[2], i) != Some(view_name) { continue; }
+            if col_u64(&batch.columns[1], i)? != schema_id { continue; }
+            if col_str(&batch.columns[2], i)? != Some(view_name) { continue; }
             return Ok(ViewRecord {
                 vid:             batch.pk_lo[i],
                 schema_id,
                 name:            view_name.to_string(),
-                sql_definition:  col_str(&batch.columns[3], i).unwrap_or("").to_string(),
-                cache_directory: col_str(&batch.columns[4], i).unwrap_or("").to_string(),
-                created_lsn:     col_u64(&batch.columns[5], i),
+                sql_definition:  col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
+                cache_directory: col_str(&batch.columns[4], i)?.unwrap_or("").to_string(),
+                created_lsn:     col_u64(&batch.columns[5], i)?,
             });
         }
         Err(ClientError::ServerError(format!("View '{}' not found", view_name)))
@@ -791,19 +748,19 @@ impl GnitzClient {
     ) -> Result<(), ClientError> {
         let schema = col_tab_schema();
         let mut batch = ZSetBatch::new(&schema);
-        for i in 0..columns.len() {
-            batch.pk_lo.push(pack_col_id(owner_id, i));
-            batch.pk_hi.push(0);
-            batch.weights.push(1);
-            batch.nulls.push(0);
-            if let ColData::Fixed(buf) = &mut batch.columns[1] { push_u64_bytes(buf, owner_id); }
-            if let ColData::Fixed(buf) = &mut batch.columns[2] { push_u64_bytes(buf, owner_kind); }
-            if let ColData::Fixed(buf) = &mut batch.columns[3] { push_u64_bytes(buf, i as u64); }
-            if let ColData::Strings(v) = &mut batch.columns[4] { v.push(Some(columns[i].name.clone())); }
-            if let ColData::Fixed(buf) = &mut batch.columns[5] { push_u64_bytes(buf, columns[i].type_code as u64); }
-            if let ColData::Fixed(buf) = &mut batch.columns[6] { push_u64_bytes(buf, if columns[i].is_nullable { 1 } else { 0 }); }
-            if let ColData::Fixed(buf) = &mut batch.columns[7] { push_u64_bytes(buf, 0); }
-            if let ColData::Fixed(buf) = &mut batch.columns[8] { push_u64_bytes(buf, 0); }
+        {
+            let mut a = BatchAppender::new(&mut batch, &schema);
+            for i in 0..columns.len() {
+                a.add_row(pack_col_id(owner_id, i)?, 0, 1)
+                    .u64_val(owner_id)
+                    .u64_val(owner_kind)
+                    .u64_val(i as u64)
+                    .str_val(&columns[i].name)
+                    .u64_val(columns[i].type_code as u64)
+                    .u64_val(if columns[i].is_nullable { 1 } else { 0 })
+                    .u64_val(0)
+                    .u64_val(0);
+            }
         }
         ops::push(&self.conn, COL_TAB, &schema, &batch)?;
         Ok(())
@@ -816,24 +773,10 @@ impl GnitzClient {
         owner_kind: u64,
     ) -> Result<(), ClientError> {
         let schema = col_tab_schema();
-        let mut retract = ZSetBatch::new(&schema);
-        for i in 0..col_batch.len() {
-            if col_batch.weights[i] <= 0 { continue; }
-            if col_u64(&col_batch.columns[1], i) != owner_id { continue; }
-            if col_u64(&col_batch.columns[2], i) != owner_kind { continue; }
-            retract.pk_lo.push(col_batch.pk_lo[i]);
-            retract.pk_hi.push(0);
-            retract.weights.push(-1);
-            retract.nulls.push(0);
-            for ci in 0..schema.columns.len() {
-                if ci == schema.pk_index { continue; }
-                let stride = schema.columns[ci].type_code.wire_stride();
-                copy_col_row(&col_batch.columns[ci], i, &mut retract.columns[ci], stride);
-            }
-        }
-        if retract.is_empty() { return Ok(()); }
-        ops::push(&self.conn, COL_TAB, &schema, &retract)?;
-        Ok(())
+        self.retract_matching(COL_TAB, &schema, col_batch, |i| {
+            col_u64(&col_batch.columns[1], i).map_or(false, |v| v == owner_id) &&
+            col_u64(&col_batch.columns[2], i).map_or(false, |v| v == owner_kind)
+        })
     }
 
     fn retract_circuit_graph(&self, vid: u64) -> Result<(), ClientError> {
@@ -861,10 +804,29 @@ impl GnitzClient {
         batch: &ZSetBatch,
         vid: u64,
     ) -> Result<(), ClientError> {
+        self.retract_matching(table_id, schema, batch, |i| batch.pk_hi[i] == vid)
+    }
+
+    fn retract_deps_for_view(&self, vid: u64) -> Result<(), ClientError> {
+        let (_, dep_batch, _) = ops::scan(&self.conn, DEP_TAB)?;
+        let dep_batch = match dep_batch { Some(b) => b, None => return Ok(()) };
+        let dep_s = dep_tab_schema();
+        self.retract_matching(DEP_TAB, &dep_s, &dep_batch, |i| {
+            col_u64(&dep_batch.columns[1], i).map_or(false, |v| v == vid)
+        })
+    }
+
+    fn retract_matching(
+        &self,
+        table_id: u64,
+        schema: &Schema,
+        batch: &ZSetBatch,
+        matches: impl Fn(usize) -> bool,
+    ) -> Result<(), ClientError> {
         let mut retract = ZSetBatch::new(schema);
         for i in 0..batch.len() {
             if batch.weights[i] <= 0 { continue; }
-            if batch.pk_hi[i] != vid { continue; }
+            if !matches(i) { continue; }
             retract.pk_lo.push(batch.pk_lo[i]);
             retract.pk_hi.push(batch.pk_hi[i]);
             retract.weights.push(-1);
@@ -880,43 +842,16 @@ impl GnitzClient {
         Ok(())
     }
 
-    fn retract_deps_for_view(&self, vid: u64) -> Result<(), ClientError> {
-        let (_, dep_batch, _) = ops::scan(&self.conn, DEP_TAB)?;
-        let dep_batch = match dep_batch { Some(b) => b, None => return Ok(()) };
-
-        let dep_s = dep_tab_schema();
-        let mut retract = ZSetBatch::new(&dep_s);
-        for i in 0..dep_batch.len() {
-            if dep_batch.weights[i] <= 0 { continue; }
-            // columns[1] = view_id (the owning view)
-            if col_u64(&dep_batch.columns[1], i) != vid { continue; }
-            retract.pk_lo.push(dep_batch.pk_lo[i]);
-            retract.pk_hi.push(dep_batch.pk_hi[i]);
-            retract.weights.push(-1);
-            retract.nulls.push(0);
-            for ci in 0..dep_s.columns.len() {
-                if ci == dep_s.pk_index { continue; }
-                let stride = dep_s.columns[ci].type_code.wire_stride();
-                copy_col_row(&dep_batch.columns[ci], i, &mut retract.columns[ci], stride);
-            }
-        }
-        if retract.is_empty() { return Ok(()); }
-        ops::push(&self.conn, DEP_TAB, &dep_s, &retract)?;
-        Ok(())
-    }
-
     fn push_view_record(&self, vid: u64, schema_id: u64, view_name: &str, sql_text: &str) -> Result<(), ClientError> {
         let view_s = view_tab_schema();
         let mut vb = ZSetBatch::new(&view_s);
-        vb.pk_lo.push(vid);
-        vb.pk_hi.push(0);
-        vb.weights.push(1);
-        vb.nulls.push(0);
-        if let ColData::Fixed(buf) = &mut vb.columns[1] { push_u64_bytes(buf, schema_id); }
-        if let ColData::Strings(v) = &mut vb.columns[2] { v.push(Some(view_name.to_string())); }
-        if let ColData::Strings(v) = &mut vb.columns[3] { v.push(Some(sql_text.to_string())); }
-        if let ColData::Strings(v) = &mut vb.columns[4] { v.push(Some(String::new())); }
-        if let ColData::Fixed(buf) = &mut vb.columns[5] { push_u64_bytes(buf, 0); }
+        BatchAppender::new(&mut vb, &view_s)
+            .add_row(vid, 0, 1)
+            .u64_val(schema_id)
+            .str_val(view_name)
+            .str_val(sql_text)
+            .str_val("")
+            .u64_val(0);
         ops::push(&self.conn, VIEW_TAB, &view_s, &vb)?;
         Ok(())
     }

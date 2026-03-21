@@ -9,7 +9,7 @@ pub mod message;
 pub mod wal_block;
 
 pub use error::ProtocolError;
-pub use types::{TypeCode, ColumnDef, Schema, ColData, ZSetBatch, meta_schema};
+pub use types::{TypeCode, ColumnDef, Schema, ColData, ZSetBatch, BatchAppender, meta_schema};
 pub use header::{
     Header,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_SHUTDOWN,

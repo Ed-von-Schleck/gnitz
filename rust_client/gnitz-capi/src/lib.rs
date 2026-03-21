@@ -88,6 +88,13 @@ fn cstr<'a>(p: *const c_char) -> &'a str {
     unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
 }
 
+/// Convert a C string pointer to &str with UTF-8 validation.
+/// Returns Ok("") for null pointers, Err on invalid UTF-8.
+fn cstr_checked<'a>(p: *const c_char) -> Result<&'a str, std::str::Utf8Error> {
+    if p.is_null() { return Ok(""); }
+    unsafe { CStr::from_ptr(p) }.to_str()
+}
+
 // ---------------------------------------------------------------------------
 // Error query
 // ---------------------------------------------------------------------------
@@ -288,7 +295,17 @@ pub extern "C" fn gnitz_batch_set_string(
         }
     };
     match &mut b.batch.columns[col_idx] {
-        ColData::Strings(v) => { v.push(s); 0 }
+        ColData::Strings(v) => {
+            if v.len() >= b.batch.pk_lo.len() {
+                set_error(format!(
+                    "col {}: already has {} strings for {} rows",
+                    col_idx, v.len(), b.batch.pk_lo.len()
+                ));
+                return -1;
+            }
+            v.push(s);
+            0
+        }
         _                   => { set_error("column is not a String column"); -1 }
     }
 }
@@ -957,7 +974,10 @@ pub unsafe extern "C" fn gnitz_execute_sql(
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
-    let sql_str = cstr(sql);
+    let sql_str = match cstr_checked(sql) {
+        Ok(s) => s,
+        Err(e) => { set_error(e); return -1; }
+    };
     let schema_name = cstr(schema);
     let planner = SqlPlanner::new(&c.0, schema_name);
     match planner.execute(sql_str) {
@@ -992,4 +1012,87 @@ pub unsafe extern "C" fn gnitz_execute_sql(
 #[no_mangle]
 pub extern "C" fn gnitz_free_string(s: *mut c_char) {
     if !s.is_null() { unsafe { drop(CString::from_raw(s)); } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn test_set_string_alignment_ok() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: false },
+            ],
+            pk_index: 0,
+        };
+        let batch = ZSetBatch::new(&schema);
+        let b = Box::into_raw(Box::new(GnitzBatch { schema, batch }));
+
+        // Manually add row metadata (gnitz_batch_append_row errors on String columns)
+        unsafe {
+            (*b).batch.pk_lo.push(1);
+            (*b).batch.pk_hi.push(0);
+            (*b).batch.weights.push(1);
+            (*b).batch.nulls.push(0);
+        }
+
+        // set_string on column 1 — should succeed (1 row, 0 strings so far)
+        let val = CString::new("hello").unwrap();
+        assert_eq!(gnitz_batch_set_string(b, 1, val.as_ptr()), 0);
+
+        unsafe { drop(Box::from_raw(b)); }
+    }
+
+    #[test]
+    fn test_set_string_overflow() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: false },
+            ],
+            pk_index: 0,
+        };
+        let batch = ZSetBatch::new(&schema);
+        let b = Box::into_raw(Box::new(GnitzBatch { schema, batch }));
+
+        // Manually add row metadata
+        unsafe {
+            (*b).batch.pk_lo.push(1);
+            (*b).batch.pk_hi.push(0);
+            (*b).batch.weights.push(1);
+            (*b).batch.nulls.push(0);
+        }
+
+        // First set_string succeeds
+        let val = CString::new("hello").unwrap();
+        assert_eq!(gnitz_batch_set_string(b, 1, val.as_ptr()), 0);
+
+        // Second set_string on same col overflows (already has 1 string for 1 row)
+        let val2 = CString::new("world").unwrap();
+        assert_eq!(gnitz_batch_set_string(b, 1, val2.as_ptr()), -1);
+
+        unsafe { drop(Box::from_raw(b)); }
+    }
+
+    #[test]
+    fn test_cstr_checked_valid() {
+        let s = CString::new("hello").unwrap();
+        assert_eq!(cstr_checked(s.as_ptr()), Ok("hello"));
+    }
+
+    #[test]
+    fn test_cstr_checked_null() {
+        assert_eq!(cstr_checked(std::ptr::null()), Ok(""));
+    }
+
+    #[test]
+    fn test_cstr_checked_invalid() {
+        // 0xFF is not valid UTF-8, followed by null terminator
+        let bytes: [u8; 2] = [0xFF, 0x00];
+        let ptr = bytes.as_ptr() as *const c_char;
+        assert!(cstr_checked(ptr).is_err());
+    }
 }

@@ -28,6 +28,16 @@ pub fn alloc_index_id(conn: &Connection) -> Result<u64, ClientError> {
     Ok(msg.target_id)
 }
 
+fn decode_scan_response(msg: Message) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
+    let view_lsn = msg.seek_pk_lo;
+    let schema = msg.schema_batch
+        .as_ref()
+        .map(batch_to_schema)
+        .transpose()
+        .map_err(ClientError::Protocol)?;
+    Ok((schema, msg.data_batch, view_lsn))
+}
+
 pub fn seek_by_index(
     conn:     &Connection,
     table_id: u64,
@@ -36,13 +46,7 @@ pub fn seek_by_index(
     key_hi:   u64,
 ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
     let msg = conn.roundtrip_seek_by_index(table_id, col_idx, key_lo, key_hi)?;
-    let view_lsn = msg.seek_pk_lo;
-    let schema = msg.schema_batch
-        .as_ref()
-        .map(batch_to_schema)
-        .transpose()
-        .map_err(ClientError::Protocol)?;
-    Ok((schema, msg.data_batch, view_lsn))
+    decode_scan_response(msg)
 }
 
 pub fn push(
@@ -60,13 +64,7 @@ pub fn scan(
     target_id: u64,
 ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
     let msg = conn.roundtrip(target_id, 0, None, None)?;
-    let view_lsn = msg.seek_pk_lo;
-    let schema = msg.schema_batch
-        .as_ref()
-        .map(batch_to_schema)
-        .transpose()
-        .map_err(ClientError::Protocol)?;
-    Ok((schema, msg.data_batch, view_lsn))
+    decode_scan_response(msg)
 }
 
 pub fn seek(
@@ -76,11 +74,5 @@ pub fn seek(
     pk_hi:     u64,
 ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
     let msg = conn.roundtrip_seek(target_id, pk_lo, pk_hi)?;
-    let view_lsn = msg.seek_pk_lo;
-    let schema = msg.schema_batch
-        .as_ref()
-        .map(batch_to_schema)
-        .transpose()
-        .map_err(ClientError::Protocol)?;
-    Ok((schema, msg.data_batch, view_lsn))
+    decode_scan_response(msg)
 }
