@@ -137,14 +137,12 @@ class WALWriter(object):
     def truncate_before_lsn(self, lsn):
         if self.closed or self.fd == -1:
             return
-        mmap_posix.fsync_c(self.fd)
         rposix.ftruncate(self.fd, 0)
         rposix.lseek(self.fd, 0, 0)
 
     def close(self):
         if not self.closed:
             if self.fd != -1:
-                mmap_posix.fsync_c(self.fd)
                 mmap_posix.unlock_file(self.fd)
                 rposix.close(self.fd)
                 self.fd = -1

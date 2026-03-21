@@ -223,7 +223,6 @@ def save_xor8(xor_filter, filepath):
             xor_filter.fingerprints,
             rffi.cast(rffi.SIZE_T, xor_filter.total_size),
         )
-        mmap_posix.fsync_c(fd)
     finally:
         rposix.close(fd)
 
