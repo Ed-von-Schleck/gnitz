@@ -7,6 +7,7 @@
 import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi
 
 from gnitz import log
 from gnitz.server import ipc, ipc_ffi, eventfd_ffi
@@ -49,8 +50,8 @@ class WorkerExchangeHandler(object):
 
         while True:
             eventfd_ffi.eventfd_wait(self.wp.m2w_efd, 30000)
-            size = intmask(ipc._read_u64_raw(
-                self.wp.sal_ptr, self.wp.read_cursor))
+            size = intmask(ipc._atomic_load_u64(
+                rffi.ptradd(self.wp.sal_ptr, self.wp.read_cursor)))
             if size == 0:
                 continue
             msg = ipc.read_worker_message(
@@ -114,8 +115,8 @@ class WorkerProcess(object):
         while True:
             if self.read_cursor + 8 >= ipc.SAL_MMAP_SIZE:
                 break
-            size = intmask(ipc._read_u64_raw(
-                self.sal_ptr, self.read_cursor))
+            size = intmask(ipc._atomic_load_u64(
+                rffi.ptradd(self.sal_ptr, self.read_cursor)))
             if size == 0:
                 break
             msg = ipc.read_worker_message(
@@ -131,6 +132,10 @@ class WorkerProcess(object):
         flags = msg.flags
         target_id = msg.target_id
         payload = msg.payload  # IPCPayload or None
+
+        # Skip messages not targeted at this worker (unicast to another worker)
+        if payload is None and msg.advance > 0:
+            return False
 
         try:
             # Drain preloaded exchange groups before processing push

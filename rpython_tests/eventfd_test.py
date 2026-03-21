@@ -129,7 +129,7 @@ def test_fdatasync(base_dir):
 
 def test_w2m_cross_process():
     """Verify that volatile writes to a memfd mmap are visible across fork."""
-    from gnitz.server.ipc import W2MRegion, W2M_HEADER_SIZE, _volatile_read_u64, _volatile_write_u64
+    from gnitz.server.ipc import W2MRegion, W2M_HEADER_SIZE, _atomic_load_u64, _atomic_store_u64
     from rpython.rtyper.lltypesystem import rffi
 
     log("[w2m] test_w2m_cross_process...")
@@ -141,8 +141,8 @@ def test_w2m_cross_process():
         flags=mmap_posix.MAP_SHARED,
     )
     # Write initial value
-    _volatile_write_u64(ptr, rffi.cast(rffi.ULONGLONG, 42))
-    val = intmask(_volatile_read_u64(ptr))
+    _atomic_store_u64(ptr, rffi.cast(rffi.ULONGLONG, 42))
+    val = intmask(_atomic_load_u64(ptr))
     assert_equal_i(42, val, "initial volatile read")
 
     efd = eventfd_ffi.eventfd_create()
@@ -150,13 +150,13 @@ def test_w2m_cross_process():
     pid = os.fork()
     if pid == 0:
         # Child: write a new value and signal
-        _volatile_write_u64(ptr, rffi.cast(rffi.ULONGLONG, 9999))
+        _atomic_store_u64(ptr, rffi.cast(rffi.ULONGLONG, 9999))
         eventfd_ffi.eventfd_signal(efd)
         os._exit(0)
     else:
         # Parent: wait for signal then read
         eventfd_ffi.eventfd_wait(efd, 5000)
-        val2 = intmask(_volatile_read_u64(ptr))
+        val2 = intmask(_atomic_load_u64(ptr))
         os.waitpid(pid, 0)
         mmap_posix.munmap_file(ptr, 4096)
         rposix.close(fd)

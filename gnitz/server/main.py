@@ -190,10 +190,9 @@ def entry_point(argv):
 
     # --- Shared Append-Only Log (file-backed, master→all workers) ---
     sal_path = data_dir + "/wal.sal"
-    sal_fd = rposix.open(sal_path, os.O_RDWR | os.O_CREAT, 0o644)
+    sal_fd = rposix.open(sal_path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
     sal_ffi.try_set_nocow(sal_fd)
-    if intmask(mmap_posix.fget_size(sal_fd)) < ipc.SAL_MMAP_SIZE:
-        sal_ffi.fallocate_c(sal_fd, ipc.SAL_MMAP_SIZE)
+    sal_ffi.fallocate_c(sal_fd, ipc.SAL_MMAP_SIZE)
     sal_ptr = mmap_posix.mmap_file(
         sal_fd, ipc.SAL_MMAP_SIZE,
         prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,

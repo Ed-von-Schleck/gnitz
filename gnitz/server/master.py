@@ -48,18 +48,21 @@ class MasterDispatcher(object):
     # -----------------------------------------------------------------------
 
     def _write_group(self, target_id, flags, worker_batches, schema,
-                     seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
+                     seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0,
+                     unicast_worker=-1):
         """Encode per-worker data and write one SAL message group.
 
         Does NOT fdatasync or signal. worker_batches[w] is ArenaZSetBatch
-        or None. Schema is broadcast to all workers that have data.
+        or None. When unicast_worker >= 0, only that worker gets wire
+        data; others see offset/size 0 and skip on read.
         """
         wire_bufs = [None] * self.num_workers
         for w in range(self.num_workers):
+            if unicast_worker >= 0 and w != unicast_worker:
+                continue
             wb = worker_batches[w]
-            sch = schema if wb is not None else schema
             wire_bufs[w] = ipc._encode_wire(
-                target_id, 0, wb, sch, flags,
+                target_id, 0, wb, schema, flags,
                 seek_pk_lo, seek_pk_hi, seek_col_idx, 0, "")
 
         lsn = self.sal.lsn_counter
@@ -82,6 +85,15 @@ class MasterDispatcher(object):
         mmap_posix.fdatasync_c(self.sal.fd)
         eventfd_ffi.eventfd_signal(self.m2w_efds[worker])
 
+    def _write_unicast(self, worker, target_id, flags, schema,
+                       seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
+        """Write a SAL message targeted at a single worker."""
+        worker_batches = [None] * self.num_workers
+        self._write_group(target_id, flags, worker_batches, schema,
+                          seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi,
+                          seek_col_idx=seek_col_idx,
+                          unicast_worker=worker)
+
     def _send_to_workers(self, target_id, flags, worker_batches, schema,
                          seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
         """Write message group + fdatasync + signal all workers."""
@@ -94,29 +106,39 @@ class MasterDispatcher(object):
         for w in range(self.num_workers):
             self.w2m_regions[w].set_write_cursor(ipc.W2M_HEADER_SIZE)
 
-    def _collect_acks(self):
-        """Collect one ACK from each worker. Raises on error."""
+    def _wait_all_workers(self):
+        """Wait for one response from each worker. Returns list[IPCPayload].
+
+        ALWAYS resets W2M cursors before returning, even on exception.
+        """
+        results = [None] * self.num_workers
         remaining = self.num_workers
         collected = [False] * self.num_workers
         w2m_rcs = [ipc.W2M_HEADER_SIZE] * self.num_workers
+        try:
+            while remaining > 0:
+                eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
+                for w in range(self.num_workers):
+                    if collected[w]:
+                        continue
+                    wc = self.w2m_regions[w].get_write_cursor()
+                    if w2m_rcs[w] < wc:
+                        payload, w2m_rcs[w] = ipc.read_from_w2m(
+                            self.w2m_regions[w], w2m_rcs[w])
+                        if payload.status != 0:
+                            raise errors.StorageError(
+                                "Worker %d error: %s"
+                                % (w, payload.error_msg))
+                        results[w] = payload
+                        collected[w] = True
+                        remaining -= 1
+        finally:
+            self._reset_w2m_cursors()
+        return results
 
-        while remaining > 0:
-            eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
-            for w in range(self.num_workers):
-                if collected[w]:
-                    continue
-                wc = self.w2m_regions[w].get_write_cursor()
-                if w2m_rcs[w] < wc:
-                    payload, w2m_rcs[w] = ipc.read_from_w2m(
-                        self.w2m_regions[w], w2m_rcs[w])
-                    if payload.status != 0:
-                        err = payload.error_msg
-                        raise errors.StorageError(
-                            "Worker %d error: %s" % (w, err))
-                    collected[w] = True
-                    remaining -= 1
-
-        self._reset_w2m_cursors()
+    def _collect_acks(self):
+        """Collect one ACK from each worker. Raises on error."""
+        self._wait_all_workers()
 
     def _collect_acks_and_relay(self, schema):
         """Collect ACKs from all workers, relaying exchange messages."""
@@ -129,78 +151,63 @@ class MasterDispatcher(object):
         exchange_schemas = {}
         exchange_source_ids = {}
 
-        while remaining > 0:
-            eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
-            for w in range(self.num_workers):
-                if collected[w]:
-                    continue
-                wc = self.w2m_regions[w].get_write_cursor()
-                while w2m_rcs[w] < wc:
-                    payload, w2m_rcs[w] = ipc.read_from_w2m(
-                        self.w2m_regions[w], w2m_rcs[w])
-                    if payload.flags & ipc.FLAG_EXCHANGE:
-                        vid = intmask(payload.target_id)
-                        ex_source_id = intmask(payload.seek_pk_lo)
-                        if vid not in exchange_payloads:
-                            exchange_payloads[vid] = [None] * self.num_workers
-                            exchange_counts[vid] = 0
-                        exchange_payloads[vid][w] = payload
-                        if payload.schema is not None:
-                            exchange_schemas[vid] = payload.schema
-                        if ex_source_id > 0:
-                            exchange_source_ids[vid] = ex_source_id
-                        exchange_counts[vid] += 1
-                        if exchange_counts[vid] == self.num_workers:
-                            ex_schema = exchange_schemas.get(vid, schema)
-                            src_id = exchange_source_ids.get(vid, 0)
-                            self._relay_exchange(
-                                vid, exchange_payloads[vid],
-                                ex_schema, src_id)
-                            del exchange_payloads[vid]
-                            del exchange_counts[vid]
-                            if vid in exchange_schemas:
-                                del exchange_schemas[vid]
-                            if vid in exchange_source_ids:
-                                del exchange_source_ids[vid]
-                        break  # re-check write_cursor after relay
-                    else:
-                        if payload.status != 0:
-                            err = payload.error_msg
-                            raise errors.StorageError(
-                                "Worker %d error: %s" % (w, err))
-                        collected[w] = True
-                        remaining -= 1
-                        break
-
-        self._reset_w2m_cursors()
+        try:
+            while remaining > 0:
+                eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
+                for w in range(self.num_workers):
+                    if collected[w]:
+                        continue
+                    wc = self.w2m_regions[w].get_write_cursor()
+                    while w2m_rcs[w] < wc:
+                        payload, w2m_rcs[w] = ipc.read_from_w2m(
+                            self.w2m_regions[w], w2m_rcs[w])
+                        if payload.flags & ipc.FLAG_EXCHANGE:
+                            vid = intmask(payload.target_id)
+                            ex_source_id = intmask(payload.seek_pk_lo)
+                            if vid not in exchange_payloads:
+                                exchange_payloads[vid] = (
+                                    [None] * self.num_workers)
+                                exchange_counts[vid] = 0
+                            exchange_payloads[vid][w] = payload
+                            if payload.schema is not None:
+                                exchange_schemas[vid] = payload.schema
+                            if ex_source_id > 0:
+                                exchange_source_ids[vid] = ex_source_id
+                            exchange_counts[vid] += 1
+                            if exchange_counts[vid] == self.num_workers:
+                                ex_schema = exchange_schemas.get(
+                                    vid, schema)
+                                src_id = exchange_source_ids.get(vid, 0)
+                                self._relay_exchange(
+                                    vid, exchange_payloads[vid],
+                                    ex_schema, src_id)
+                                del exchange_payloads[vid]
+                                del exchange_counts[vid]
+                                if vid in exchange_schemas:
+                                    del exchange_schemas[vid]
+                                if vid in exchange_source_ids:
+                                    del exchange_source_ids[vid]
+                            break  # re-check write_cursor after relay
+                        else:
+                            if payload.status != 0:
+                                raise errors.StorageError(
+                                    "Worker %d error: %s"
+                                    % (w, payload.error_msg))
+                            collected[w] = True
+                            remaining -= 1
+                            break
+        finally:
+            self._reset_w2m_cursors()
 
     def _collect_responses(self, schema):
         """Collect data responses from all workers. Returns concatenated batch."""
+        results = self._wait_all_workers()
         result = ArenaZSetBatch(schema)
-        remaining = self.num_workers
-        collected = [False] * self.num_workers
-        w2m_rcs = [ipc.W2M_HEADER_SIZE] * self.num_workers
-
-        while remaining > 0:
-            eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
-            for w in range(self.num_workers):
-                if collected[w]:
-                    continue
-                wc = self.w2m_regions[w].get_write_cursor()
-                if w2m_rcs[w] < wc:
-                    payload, w2m_rcs[w] = ipc.read_from_w2m(
-                        self.w2m_regions[w], w2m_rcs[w])
-                    if payload.status != 0:
-                        err = payload.error_msg
-                        raise errors.StorageError(
-                            "Worker %d error: %s" % (w, err))
-                    if (payload.batch is not None
-                            and payload.batch.length() > 0):
-                        result.append_batch(payload.batch)
-                    collected[w] = True
-                    remaining -= 1
-
-        self._reset_w2m_cursors()
+        for w in range(self.num_workers):
+            payload = results[w]
+            if (payload is not None and payload.batch is not None
+                    and payload.batch.length() > 0):
+                result.append_batch(payload.batch)
         return result
 
     def _collect_one(self, worker):
@@ -363,9 +370,8 @@ class MasterDispatcher(object):
     def fan_out_seek(self, target_id, pk_lo, pk_hi, schema):
         """Route PK seek to the single worker that owns the partition."""
         worker = worker_for_pk(pk_lo, pk_hi, self.assignment)
-        worker_batches = [None] * self.num_workers
-        self._write_group(
-            target_id, ipc.FLAG_SEEK, worker_batches, schema,
+        self._write_unicast(
+            worker, target_id, ipc.FLAG_SEEK, schema,
             seek_pk_lo=pk_lo, seek_pk_hi=pk_hi)
         self._sync_and_signal_one(worker)
 
@@ -386,9 +392,8 @@ class MasterDispatcher(object):
         cached_worker = self.router.worker_for_index_key(
             target_id, col_idx, key_lo, key_hi)
         if cached_worker >= 0:
-            worker_batches = [None] * self.num_workers
-            self._write_group(
-                target_id, ipc.FLAG_SEEK_BY_INDEX, worker_batches, schema,
+            self._write_unicast(
+                cached_worker, target_id, ipc.FLAG_SEEK_BY_INDEX, schema,
                 seek_col_idx=col_idx, seek_pk_lo=key_lo, seek_pk_hi=key_hi)
             self._sync_and_signal_one(cached_worker)
             payload = self._collect_one(cached_worker)
@@ -408,29 +413,15 @@ class MasterDispatcher(object):
         self._send_to_workers(
             target_id, ipc.FLAG_SEEK_BY_INDEX, worker_batches, schema,
             seek_col_idx=col_idx, seek_pk_lo=key_lo, seek_pk_hi=key_hi)
+        results = self._wait_all_workers()
         result = None
-        remaining = self.num_workers
-        collected = [False] * self.num_workers
-        w2m_rcs = [ipc.W2M_HEADER_SIZE] * self.num_workers
-        while remaining > 0:
-            eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
-            for w in range(self.num_workers):
-                if collected[w]:
-                    continue
-                wc = self.w2m_regions[w].get_write_cursor()
-                if w2m_rcs[w] < wc:
-                    payload, w2m_rcs[w] = ipc.read_from_w2m(
-                        self.w2m_regions[w], w2m_rcs[w])
-                    if payload.status != 0:
-                        err = payload.error_msg
-                        raise errors.StorageError(
-                            "Worker %d seek_by_index error: %s" % (w, err))
-                    if (result is None and payload.batch is not None
-                            and payload.batch.length() > 0):
-                        result = ArenaZSetBatch(schema)
-                        result.append_batch(payload.batch)
-                    collected[w] = True
-                    remaining -= 1
+        for w in range(self.num_workers):
+            payload = results[w]
+            if (result is None and payload is not None
+                    and payload.batch is not None
+                    and payload.batch.length() > 0):
+                result = ArenaZSetBatch(schema)
+                result.append_batch(payload.batch)
         return result
 
     def broadcast_ddl(self, target_id, batch, schema):
@@ -455,29 +446,14 @@ class MasterDispatcher(object):
             if sb is not None:
                 sb.free()
 
+        results = self._wait_all_workers()
         any_missing = False
-        remaining = self.num_workers
-        collected = [False] * self.num_workers
-        w2m_rcs = [ipc.W2M_HEADER_SIZE] * self.num_workers
-        while remaining > 0:
-            eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
-            for w in range(self.num_workers):
-                if collected[w]:
-                    continue
-                wc = self.w2m_regions[w].get_write_cursor()
-                if w2m_rcs[w] < wc:
-                    payload, w2m_rcs[w] = ipc.read_from_w2m(
-                        self.w2m_regions[w], w2m_rcs[w])
-                    if payload.status != 0:
-                        err = payload.error_msg
-                        raise errors.StorageError(
-                            "Worker %d has_pk error: %s" % (w, err))
-                    if payload.batch is not None:
-                        for j in range(payload.batch.length()):
-                            if payload.batch.get_weight(j) == r_int64(0):
-                                any_missing = True
-                    collected[w] = True
-                    remaining -= 1
+        for w in range(self.num_workers):
+            payload = results[w]
+            if payload is not None and payload.batch is not None:
+                for j in range(payload.batch.length()):
+                    if payload.batch.get_weight(j) == r_int64(0):
+                        any_missing = True
         return any_missing
 
     def check_pk_exists_broadcast(self, owner_table_id, source_col_idx,
@@ -491,29 +467,14 @@ class MasterDispatcher(object):
             owner_table_id, ipc.FLAG_HAS_PK, worker_batches, schema,
             seek_col_idx=col_hint)
 
+        results = self._wait_all_workers()
         any_exists = False
-        remaining = self.num_workers
-        collected = [False] * self.num_workers
-        w2m_rcs = [ipc.W2M_HEADER_SIZE] * self.num_workers
-        while remaining > 0:
-            eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
-            for w in range(self.num_workers):
-                if collected[w]:
-                    continue
-                wc = self.w2m_regions[w].get_write_cursor()
-                if w2m_rcs[w] < wc:
-                    payload, w2m_rcs[w] = ipc.read_from_w2m(
-                        self.w2m_regions[w], w2m_rcs[w])
-                    if payload.status != 0:
-                        err = payload.error_msg
-                        raise errors.StorageError(
-                            "Worker %d has_pk error: %s" % (w, err))
-                    if payload.batch is not None:
-                        for j in range(payload.batch.length()):
-                            if payload.batch.get_weight(j) == r_int64(1):
-                                any_exists = True
-                    collected[w] = True
-                    remaining -= 1
+        for w in range(self.num_workers):
+            payload = results[w]
+            if payload is not None and payload.batch is not None:
+                for j in range(payload.batch.length()):
+                    if payload.batch.get_weight(j) == r_int64(1):
+                        any_exists = True
         return any_exists
 
     def check_pk_existence(self, target_id, check_batch, schema):
@@ -527,35 +488,20 @@ class MasterDispatcher(object):
             if sb is not None:
                 sb.free()
 
+        results = self._wait_all_workers()
         existing = {}
-        remaining = self.num_workers
-        collected = [False] * self.num_workers
-        w2m_rcs = [ipc.W2M_HEADER_SIZE] * self.num_workers
-        while remaining > 0:
-            eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
-            for w in range(self.num_workers):
-                if collected[w]:
-                    continue
-                wc = self.w2m_regions[w].get_write_cursor()
-                if w2m_rcs[w] < wc:
-                    payload, w2m_rcs[w] = ipc.read_from_w2m(
-                        self.w2m_regions[w], w2m_rcs[w])
-                    if payload.status != 0:
-                        err = payload.error_msg
-                        raise errors.StorageError(
-                            "Worker %d has_pk error: %s" % (w, err))
-                    if payload.batch is not None:
-                        for j in range(payload.batch.length()):
-                            if payload.batch.get_weight(j) == r_int64(1):
-                                lo = intmask(r_uint64(
-                                    payload.batch._read_pk_lo(j)))
-                                hi = intmask(r_uint64(
-                                    payload.batch._read_pk_hi(j)))
-                                if lo not in existing:
-                                    existing[lo] = {}
-                                existing[lo][hi] = 1
-                    collected[w] = True
-                    remaining -= 1
+        for w in range(self.num_workers):
+            payload = results[w]
+            if payload is not None and payload.batch is not None:
+                for j in range(payload.batch.length()):
+                    if payload.batch.get_weight(j) == r_int64(1):
+                        lo = intmask(r_uint64(
+                            payload.batch._read_pk_lo(j)))
+                        hi = intmask(r_uint64(
+                            payload.batch._read_pk_hi(j)))
+                        if lo not in existing:
+                            existing[lo] = {}
+                        existing[lo][hi] = 1
         return existing
 
     # -----------------------------------------------------------------------

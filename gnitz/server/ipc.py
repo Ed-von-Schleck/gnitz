@@ -15,36 +15,37 @@ from gnitz.core import errors, batch, types, strings as string_logic
 from gnitz.core.batch import RowBuilder
 from gnitz.catalog import system_tables
 
-# Volatile u64 read for cross-process shared memory.
-# Prevents GCC from caching the value in a register across loop iterations.
-_volatile_eci = ExternalCompilationInfo(
+# C11 atomic load/store for cross-process shared memory.
+# __ATOMIC_ACQUIRE on load ensures all subsequent reads see stores that
+# preceded the corresponding __ATOMIC_RELEASE store.  Portable to ARM/RISC-V.
+_atomic_eci = ExternalCompilationInfo(
     pre_include_bits=[
-        "unsigned long long gnitz_volatile_read_u64(const char *p);",
-        "void gnitz_volatile_write_u64(char *p, unsigned long long val);",
+        "unsigned long long gnitz_atomic_load_u64(const char *p);",
+        "void gnitz_atomic_store_u64(char *p, unsigned long long val);",
     ],
     separate_module_sources=["""
-unsigned long long gnitz_volatile_read_u64(const char *p) {
-    return *(volatile unsigned long long *)p;
+unsigned long long gnitz_atomic_load_u64(const char *p) {
+    return __atomic_load_n((const unsigned long long *)p, __ATOMIC_ACQUIRE);
 }
-void gnitz_volatile_write_u64(char *p, unsigned long long val) {
-    *(volatile unsigned long long *)p = val;
+void gnitz_atomic_store_u64(char *p, unsigned long long val) {
+    __atomic_store_n((unsigned long long *)p, val, __ATOMIC_RELEASE);
 }
 """],
 )
 
-_volatile_read_u64 = rffi.llexternal(
-    "gnitz_volatile_read_u64",
+_atomic_load_u64 = rffi.llexternal(
+    "gnitz_atomic_load_u64",
     [rffi.CCHARP],
     rffi.ULONGLONG,
-    compilation_info=_volatile_eci,
+    compilation_info=_atomic_eci,
     _nowrapper=True,
 )
 
-_volatile_write_u64 = rffi.llexternal(
-    "gnitz_volatile_write_u64",
+_atomic_store_u64 = rffi.llexternal(
+    "gnitz_atomic_store_u64",
     [rffi.CCHARP, rffi.ULONGLONG],
     lltype.Void,
-    compilation_info=_volatile_eci,
+    compilation_info=_atomic_eci,
     _nowrapper=True,
 )
 
@@ -302,13 +303,13 @@ class W2MRegion(object):
         self.fd = fd
         self.size = size
         # Initialize write_cursor to W2M_HEADER_SIZE (no messages)
-        _volatile_write_u64(ptr, rffi.cast(rffi.ULONGLONG, W2M_HEADER_SIZE))
+        _atomic_store_u64(ptr, rffi.cast(rffi.ULONGLONG, W2M_HEADER_SIZE))
 
     def get_write_cursor(self):
-        return intmask(_volatile_read_u64(self.ptr))
+        return intmask(_atomic_load_u64(self.ptr))
 
     def set_write_cursor(self, val):
-        _volatile_write_u64(self.ptr, rffi.cast(rffi.ULONGLONG, val))
+        _atomic_store_u64(self.ptr, rffi.cast(rffi.ULONGLONG, val))
 
 
 class SALMessage(object):
@@ -333,13 +334,9 @@ def _write_u64_raw(ptr, byte_offset, val):
 
 
 def _read_u64_raw(ptr, byte_offset):
-    """Read u64 from shared memory via volatile load.
-
-    Uses a C helper to ensure GCC does not cache the value in a register
-    across iterations — critical for cross-process shared memory.
-    """
+    """Read u64 from shared memory via atomic acquire load."""
     return rffi.cast(rffi.ULONGLONG,
-                     _volatile_read_u64(rffi.ptradd(ptr, byte_offset)))
+                     _atomic_load_u64(rffi.ptradd(ptr, byte_offset)))
 
 
 def _write_u32_raw(ptr, byte_offset, val):
@@ -648,10 +645,7 @@ def write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers):
 
     base = sal.write_cursor
 
-    # 8-byte size prefix
-    _write_u64_raw(sal.ptr, base, r_uint64(payload_size))
-
-    # Group header at base + 8
+    # Group header at base + 8 (size prefix written LAST as release fence)
     hdr_off = base + 8
     _write_u64_raw(sal.ptr, hdr_off + 0, r_uint64(payload_size))
     _write_u64_raw(sal.ptr, hdr_off + 8, r_uint64(lsn))
@@ -660,7 +654,7 @@ def write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers):
     _write_u32_raw(sal.ptr, hdr_off + 24, target_id)
     _write_u32_raw(sal.ptr, hdr_off + 28, 0)  # reserved
 
-    # Worker offsets and sizes
+    # Worker offsets and sizes + data copy
     data_offset = GROUP_HEADER_SIZE  # relative to group start (hdr_off)
     for w in range(MAX_WORKERS):
         if w < num_workers:
@@ -682,6 +676,13 @@ def write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers):
         else:
             _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, 0)
             _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0)
+
+    # Write size prefix LAST via volatile store: workers use this as
+    # the "data ready" sentinel, so all header+data must be visible
+    # before this becomes non-zero.
+    _atomic_store_u64(
+        rffi.ptradd(sal.ptr, base),
+        rffi.cast(rffi.ULONGLONG, payload_size))
 
     sal.write_cursor += total
 

@@ -17,7 +17,8 @@ TEST_FILES := \
 	rpython_tests/compile_graph_test.py \
 	rpython_tests/server_test.py \
 	rpython_tests/multicore_test.py \
-	rpython_tests/eventfd_test.py
+	rpython_tests/eventfd_test.py \
+	rpython_tests/ipc_transport_test.py
 
 # Derived names
 TEST_BINS := $(notdir $(TEST_FILES:.py=-c))
@@ -32,11 +33,13 @@ DATA_DIR_compile_graph_test-c := compile_graph_test_data
 DATA_DIR_server_test-c := server_test_data
 DATA_DIR_multicore_test-c := multicore_test_data
 DATA_DIR_eventfd_test-c := eventfd_test_data
+DATA_DIR_ipc_transport_test-c := ipc_transport_test_data
 
 ALL_DATA_DIRS := storage_test_data dbsp_test_data \
                  catalog_test_data zstore_test_data vm_test_data \
                  compile_graph_test_data server_test_data \
-                 multicore_test_data eventfd_test_data
+                 multicore_test_data eventfd_test_data \
+                 ipc_transport_test_data
 
 LOG_DIR := .test_logs
 
@@ -148,10 +151,10 @@ pytest-only:
 	cd py_client && GNITZ_WORKERS=4 uv run pytest tests/ -v
 
 e2e: gnitz-server-c
-	cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -v --tb=short
+	cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v --tb=short
 
 e2e-release: gnitz-server-release-c
-	cd rust_client/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release-c GNITZ_WORKERS=4 uv run pytest tests/ -v --tb=short
+	cd rust_client/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release-c GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v --tb=short
 
 prove:
 	$(MAKE) -C proofs prove
