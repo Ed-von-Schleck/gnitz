@@ -176,3 +176,15 @@ test_results.txt
 *.lock
 translate_test_db
 *.db
+
+# Test logs (make test output)
+.test_logs/
+
+# Local scratch / temp files
+tmp/
+
+# Generated Rust docs
+rust_client/doc/
+
+# Compiled C examples
+rust_client/gnitz-capi/examples/c_test
