@@ -183,6 +183,9 @@ translate_test_db
 # Local scratch / temp files
 tmp/
 
+# Benchmark history (local, not committed)
+bench_history/
+
 # Generated Rust docs
 rust_client/doc/
 

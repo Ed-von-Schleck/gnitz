@@ -341,6 +341,99 @@ class WorkloadError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Benchmark history — append-only JSONL log in tmp/bench_history/
+# ---------------------------------------------------------------------------
+HISTORY_DIR  = REPO_ROOT / "bench_history"
+HISTORY_FILE = HISTORY_DIR / "history.jsonl"
+
+
+def _git_commit_hash() -> str:
+    """Return the current HEAD short hash, or 'unknown'."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=REPO_ROOT, stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _git_dirty() -> bool:
+    """Return True if the working tree has uncommitted changes."""
+    try:
+        r = subprocess.run(
+            ["git", "diff", "--quiet", "HEAD"],
+            cwd=REPO_ROOT, stderr=subprocess.DEVNULL,
+        )
+        return r.returncode != 0
+    except Exception:
+        return False
+
+
+def save_to_history(timing: dict, *, mode: str, ticks: int, rows: int,
+                    workers: int, tool: str, **extra) -> Path:
+    """Append a benchmark record to the history JSONL file.
+
+    Returns the path to the history file.
+    """
+    from datetime import datetime, timezone
+
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+
+    commit = _git_commit_hash()
+    dirty = _git_dirty()
+
+    total_push  = sum(timing.get("tick_push", []))
+    total_scan  = sum(v["time_s"] for v in timing.get("scan", {}).values())
+    total_rows  = ticks * rows
+    throughput  = round(total_rows / total_push) if total_push > 0 else 0
+
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "commit": commit,
+        "dirty": dirty,
+        "mode": mode,
+        "tool": tool,
+        "ticks": ticks,
+        "rows_per_tick": rows,
+        "workers": workers,
+        "setup_s": timing.get("setup_s", 0),
+        "total_push_s": round(total_push, 4),
+        "total_scan_s": round(total_scan, 4),
+        "seek_s": timing.get("seek_s", 0),
+        "throughput_rows_per_sec": throughput,
+    }
+
+    # Include realistic stats if present
+    if "realistic" in timing:
+        r = timing["realistic"]
+        record["num_clients"] = r.get("num_clients", 0)
+        record["total_pushes"] = r.get("total_pushes", 0)
+        record["push_latency_ms"] = r.get("push_latency_ms", {})
+        record["concurrent_scan_latency_ms"] = r.get("concurrent_scan_latency_ms", {})
+
+    record.update(extra)
+
+    with open(HISTORY_FILE, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    return HISTORY_FILE
+
+
+def load_history() -> list[dict]:
+    """Load all records from the history JSONL file."""
+    if not HISTORY_FILE.exists():
+        return []
+    records = []
+    with open(HISTORY_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+# ---------------------------------------------------------------------------
 # Realistic multi-client workload
 # ---------------------------------------------------------------------------
 # Exercises realistic access patterns: multiple concurrent writer processes

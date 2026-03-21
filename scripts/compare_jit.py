@@ -60,7 +60,7 @@ from pathlib import Path
 
 from workload import (
     REPO_ROOT, CLIENT_DIR, start_server, stop_server, run_workload,
-    run_realistic_workload, VIEW_NOTES, WorkloadError,
+    run_realistic_workload, save_to_history, VIEW_NOTES, WorkloadError,
 )
 
 # ---------------------------------------------------------------------------
@@ -444,6 +444,14 @@ def main() -> None:
         "nojit_all_runs": nojit_results,
     }
     (out_dir / "report.json").write_text(json.dumps(report, indent=2))
+
+    # Save to benchmark history (one record per binary)
+    mode = "realistic" if args.realistic else "throughput"
+    save_to_history(jit_best, mode=mode, ticks=args.ticks, rows=args.rows,
+                    workers=args.workers, tool="compare", binary="jit")
+    save_to_history(nojit_best, mode=mode, ticks=args.ticks, rows=args.rows,
+                    workers=args.workers, tool="compare", binary="nojit")
+
     print()
     print(f"  {dim('Results saved to:')} {out_dir}")
     print()

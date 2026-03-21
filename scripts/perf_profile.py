@@ -198,7 +198,7 @@ from pathlib import Path
 
 from workload import (
     REPO_ROOT, CLIENT_DIR, start_server, stop_server, run_workload,
-    run_realistic_workload, VIEW_NOTES, WorkloadError,
+    run_realistic_workload, save_to_history, VIEW_NOTES, WorkloadError,
 )
 
 # ---------------------------------------------------------------------------
@@ -993,6 +993,11 @@ def main() -> None:
     if args.annotate:
         print_annotation(perf_data, args.annotate)
     print_next_steps(out_dir, rows, args.events)
+
+    # Save to benchmark history
+    mode = "realistic" if args.realistic else "throughput"
+    save_to_history(timing, mode=mode, ticks=args.ticks, rows=args.rows,
+                    workers=args.workers, tool="perf", events=args.events)
 
 
 if __name__ == "__main__":

@@ -73,6 +73,65 @@ pre-routing, stashing, skipping round-trips):
       optimization: run tests after steps 1-2 before writing steps 3-4.
 - [ ] Add a comment to any guard/fallback code naming the invariant it protects.
 
+## Benchmarking
+
+### Binaries
+
+Three server binaries, built via Makefile targets:
+
+| Binary | Make target | Flags | Use |
+|--------|-------------|-------|-----|
+| `gnitz-server-c` | `make server` | `--opt=1 --lldebug` | Dev/debug (has debug alloc) |
+| `gnitz-server-release-c` | `make release-server` | `--opt=jit --gc=incminimark --lto` | JIT release profiling |
+| `gnitz-server-nojit-c` | `make release-server-nojit` | `--opt=2 --gc=incminimark --lto` | Static-opt baseline |
+
+Rebuild release binaries before benchmarking if source has changed:
+
+```bash
+make release-server            # ~3 min
+make release-server-nojit      # ~2 min
+```
+
+### Benchmark scripts
+
+All scripts run from the repo root. They start a server, run a workload via
+`uv run python -c ...` (so the gnitz client is importable), then shut down.
+
+```bash
+# CPU profile with perf (requires perf, paranoid ≤ 1)
+python scripts/perf_profile.py --ticks 5 --rows 50000
+
+# Realistic multi-client latency profile
+python scripts/perf_profile.py --realistic --ticks 5 --rows 5000 --clients 4
+
+# JIT vs non-JIT comparison
+python scripts/compare_jit.py --ticks 5 --rows 50000
+
+# JIT vs non-JIT with realistic workload
+python scripts/compare_jit.py --realistic --ticks 5 --rows 10000 --clients 4
+```
+
+### Benchmark history
+
+Every benchmark run automatically appends a record to `bench_history/history.jsonl`
+(gitignored), keyed by commit hash and timestamp.
+
+```bash
+python scripts/bench_history.py                          # list all runs
+python scripts/bench_history.py --last 10                # last 10
+python scripts/bench_history.py --commit abc1234         # filter by commit
+python scripts/bench_history.py --compare abc1234 def5678  # side-by-side
+python scripts/bench_history.py --trend                  # throughput over time
+```
+
+### Typical workflow
+
+1. Rebuild binaries: `make release-server && make release-server-nojit`
+2. Run baselines (throughput + realistic) on the current commit
+3. Make changes, commit
+4. Rebuild and re-run
+5. `python scripts/bench_history.py --compare <old> <new>` to see the delta
+
 ## Debugging multi-worker failures
 
 When a multi-worker test fails and the root cause is not immediately obvious:
