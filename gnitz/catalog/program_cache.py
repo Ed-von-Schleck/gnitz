@@ -374,6 +374,7 @@ class ProgramCache(object):
 
     def invalidate(self, program_id):
         if program_id in self._cache:
+            self._cache[program_id].close()
             del self._cache[program_id]
         if program_id in self._shard_cols_cache:
             del self._shard_cols_cache[program_id]
@@ -382,6 +383,8 @@ class ProgramCache(object):
         self._dep_map_valid = False
 
     def invalidate_all(self):
+        for plan in self._cache.values():
+            plan.close()
         self._cache.clear()
         self._shard_cols_cache.clear()
         self._exchange_info_cache.clear()

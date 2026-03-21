@@ -59,6 +59,11 @@ class TraceRegister(BaseRegister):
 
     def is_trace(self): return True
 
+    def close(self):
+        if self.cursor is not None:
+            self.cursor.close()
+            self.cursor = None
+
     def refresh(self):
         if self.table is None:
             return
@@ -136,6 +141,11 @@ class ExecutablePlan(object):
         self.join_shard_map = join_shard_map    # dict {source_table_id: [col_idx]} or None
         self.skip_exchange = skip_exchange      # True if exchange round-trip can be skipped
         self.co_partitioned_join_sources = co_partitioned_join_sources  # dict or None
+
+    def close(self):
+        for reg in self.reg_file.registers:
+            if reg is not None and reg.is_trace():
+                reg.close()
 
     def execute_epoch(self, input_delta, source_id=0):
         """

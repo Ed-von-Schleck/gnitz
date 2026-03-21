@@ -300,6 +300,7 @@ class Engine(object):
         return self.registry.get(schema_name, table_name)
 
     def close(self):
+        self.program_cache.invalidate_all()
         for family in self.registry.iter_families():
             if family.table_id >= sys.FIRST_USER_TABLE_ID:
                 family.close()
