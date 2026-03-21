@@ -51,20 +51,21 @@ import argparse
 import json
 import os
 import re
-import shutil
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
+from workload import (
+    REPO_ROOT, CLIENT_DIR, start_server, stop_server, run_workload,
+    run_realistic_workload, VIEW_NOTES, WorkloadError,
+)
+
 # ---------------------------------------------------------------------------
 # Repository layout
 # ---------------------------------------------------------------------------
-REPO_ROOT      = Path(__file__).resolve().parent.parent
-CLIENT_DIR     = REPO_ROOT / "rust_client" / "gnitz-py"
 BINARY_JIT     = REPO_ROOT / "gnitz-server-release-c"
 BINARY_NOJIT   = REPO_ROOT / "gnitz-server-nojit-c"
 RUNS_DIR       = REPO_ROOT / "tmp" / "compare_runs"
@@ -84,263 +85,7 @@ def yellow(s: str)  -> str: return _c("33", s)
 def red(s: str)     -> str: return _c("31", s)
 def cyan(s: str)    -> str: return _c("36", s)
 
-# ---------------------------------------------------------------------------
-# Workload (identical to perf_profile.py _WORKLOAD)
-# ---------------------------------------------------------------------------
-_WORKLOAD = r"""
-import sys, time, json
-import gnitz
-
-sock_path     = sys.argv[1]
-ticks         = int(sys.argv[2])
-rows_per_tick = int(sys.argv[3])
-
-NUM_CUSTOMERS = 500
-NUM_PRODUCTS  = 100
-NUM_REGIONS   = 10
-NUM_BLOCKED   = 50
-
-AGG_COUNT = 1
-AGG_SUM   = 2
-
-act_cols = [
-    gnitz.ColumnDef("pk",         gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("product_id", gnitz.TypeCode.I64),
-    gnitz.ColumnDef("region_id",  gnitz.TypeCode.I64),
-    gnitz.ColumnDef("quantity",   gnitz.TypeCode.I64),
-    gnitz.ColumnDef("revenue",    gnitz.TypeCode.I64),
-]
-cust_cols = [
-    gnitz.ColumnDef("pk",        gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("region_id", gnitz.TypeCode.I64),
-    gnitz.ColumnDef("tier",      gnitz.TypeCode.I64),
-]
-attrs_cols = [
-    gnitz.ColumnDef("pk",     gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("budget", gnitz.TypeCode.I64),
-]
-blocked_cols = [
-    gnitz.ColumnDef("pk",     gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("reason", gnitz.TypeCode.I64),
-]
-
-act_schema     = gnitz.Schema(act_cols)
-cust_schema    = gnitz.Schema(cust_cols)
-attrs_schema   = gnitz.Schema(attrs_cols)
-blocked_schema = gnitz.Schema(blocked_cols)
-
-enriched_cols = [
-    gnitz.ColumnDef("pk",          gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("product_id",  gnitz.TypeCode.I64),
-    gnitz.ColumnDef("region_id",   gnitz.TypeCode.I64),
-    gnitz.ColumnDef("quantity",    gnitz.TypeCode.I64),
-    gnitz.ColumnDef("revenue",     gnitz.TypeCode.I64),
-    gnitz.ColumnDef("cust_region", gnitz.TypeCode.I64),
-    gnitz.ColumnDef("tier",        gnitz.TypeCode.I64),
-]
-enriched2_cols = enriched_cols + [gnitz.ColumnDef("budget", gnitz.TypeCode.I64)]
-
-def reduce2_cols(grp_name):
-    return [
-        gnitz.ColumnDef("pk",      gnitz.TypeCode.U128, primary_key=True),
-        gnitz.ColumnDef(grp_name,  gnitz.TypeCode.I64),
-        gnitz.ColumnDef("total",   gnitz.TypeCode.I64),
-    ]
-
-result = {"tick_build": [], "tick_push": [], "scan": {}}
-
-with gnitz.connect(sock_path) as conn:
-    t0 = time.perf_counter()
-    sn = "bench"
-    conn.create_schema(sn)
-
-    act_tid     = conn.create_table(sn, "activities", act_cols,     unique_pk=False)
-    cust_tid    = conn.create_table(sn, "customers",  cust_cols)
-    attrs_tid   = conn.create_table(sn, "cust_attrs", attrs_cols)
-    blocked_tid = conn.create_table(sn, "blocked",    blocked_cols)
-
-    conn.execute_sql("CREATE INDEX ON activities(product_id)", schema_name=sn)
-    conn.execute_sql("CREATE INDEX ON activities(region_id)",  schema_name=sn)
-
-    cb_batch = gnitz.ZSetBatch(cust_schema)
-    ab_batch = gnitz.ZSetBatch(attrs_schema)
-    for cid in range(NUM_CUSTOMERS):
-        cb_batch.append(pk=cid, region_id=cid % NUM_REGIONS, tier=cid % 3)
-        ab_batch.append(pk=cid, budget=1000 + (cid % 5) * 200)
-    conn.push(cust_tid,  cb_batch)
-    conn.push(attrs_tid, ab_batch)
-
-    bl_batch = gnitz.ZSetBatch(blocked_schema)
-    for cid in range(NUM_BLOCKED):
-        bl_batch.append(pk=cid, reason=1)
-    conn.push(blocked_tid, bl_batch)
-
-    eb = gnitz.ExprBuilder()
-    r1 = eb.load_col_int(4); r2 = eb.load_const(800)
-    pred_high_rev = eb.build(result_reg=eb.cmp_gt(r1, r2))
-
-    eb = gnitz.ExprBuilder()
-    r1 = eb.load_col_int(3); r2 = eb.load_const(7)
-    pred_high_qty = eb.build(result_reg=eb.cmp_gt(r1, r2))
-
-    eb = gnitz.ExprBuilder()
-    r1 = eb.load_col_int(6); r2 = eb.load_const(2)
-    pred_enterprise = eb.build(result_reg=eb.cmp_eq(r1, r2))
-
-    eb = gnitz.ExprBuilder()
-    r1 = eb.load_col_int(2); r2 = eb.load_const(5_000_000)
-    pred_hot = eb.build(result_reg=eb.cmp_gt(r1, r2))
-
-    cb = conn.circuit_builder(source_table_id=act_tid)
-    cb.sink(cb.join(cb.input_delta(), cust_tid))
-    vid_enriched = conn.create_view_with_circuit(sn, "v_enriched", cb.build(), enriched_cols)
-
-    cb = conn.circuit_builder(source_table_id=act_tid)
-    cb.sink(cb.join(cb.join(cb.input_delta(), cust_tid), attrs_tid))
-    vid_enriched2 = conn.create_view_with_circuit(sn, "v_enriched2", cb.build(), enriched2_cols)
-
-    cb = conn.circuit_builder(source_table_id=act_tid)
-    cb.sink(cb.semi_join(cb.input_delta(), cust_tid))
-    vid_active = conn.create_view_with_circuit(sn, "v_active", cb.build(), act_cols)
-
-    cb = conn.circuit_builder(source_table_id=act_tid)
-    cb.sink(cb.anti_join(cb.input_delta(), blocked_tid))
-    vid_unblocked = conn.create_view_with_circuit(sn, "v_unblocked", cb.build(), act_cols)
-
-    cb = conn.circuit_builder(source_table_id=vid_enriched)
-    cb.sink(cb.reduce(cb.input_delta(), group_by_cols=[2], agg_func_id=AGG_SUM, agg_col_idx=4))
-    vid_rev_region = conn.create_view_with_circuit(sn, "v_rev_region", cb.build(), reduce2_cols("region_id"))
-
-    cb = conn.circuit_builder(source_table_id=vid_enriched)
-    cb.sink(cb.reduce(cb.input_delta(), group_by_cols=[6], agg_func_id=AGG_SUM, agg_col_idx=4))
-    vid_rev_tier = conn.create_view_with_circuit(sn, "v_rev_tier", cb.build(), reduce2_cols("tier"))
-
-    cb = conn.circuit_builder(source_table_id=vid_enriched)
-    inp = cb.input_delta()
-    cb.sink(cb.reduce(cb.filter(inp, pred_enterprise), group_by_cols=[2], agg_func_id=AGG_COUNT, agg_col_idx=4))
-    vid_premium_cnt = conn.create_view_with_circuit(sn, "v_premium_cnt", cb.build(), reduce2_cols("region_id"))
-
-    cb = conn.circuit_builder(source_table_id=vid_rev_region)
-    cb.sink(cb.filter(cb.input_delta(), pred_hot))
-    vid_hot = conn.create_view_with_circuit(sn, "v_hot_regions", cb.build(), reduce2_cols("region_id"))
-
-    cb  = conn.circuit_builder(source_table_id=act_tid)
-    inp = cb.input_delta()
-    cb.sink(cb.distinct(cb.union(cb.filter(inp, pred_high_rev), cb.filter(inp, pred_high_qty))))
-    vid_flagged = conn.create_view_with_circuit(sn, "v_flagged", cb.build(), act_cols)
-
-    cb = conn.circuit_builder(source_table_id=act_tid)
-    cb.sink(cb.reduce(cb.input_delta(), group_by_cols=[2], agg_func_id=AGG_COUNT, agg_col_idx=4))
-    vid_region_cnt = conn.create_view_with_circuit(sn, "v_region_cnt", cb.build(), reduce2_cols("region_id"))
-
-    result["setup_s"] = time.perf_counter() - t0
-
-    for tick in range(ticks):
-        t_b0  = time.perf_counter()
-        batch = gnitz.ZSetBatch(act_schema)
-
-        if tick >= 5 and tick % 5 == 0:
-            base_r    = (tick - 5) * rows_per_tick
-            n_retract = max(1, rows_per_tick // 100)
-            for i in range(n_retract):
-                cid = (base_r + i) % NUM_CUSTOMERS
-                pid = (base_r + i) % NUM_PRODUCTS
-                rid = cid % NUM_REGIONS
-                batch.append(pk=cid, product_id=pid, region_id=rid,
-                             quantity=1 + (i % 10), revenue=100 + (i % 1000), weight=-1)
-
-        base = tick * rows_per_tick
-        for i in range(rows_per_tick):
-            cid = (base + i) % NUM_CUSTOMERS
-            pid = (base + i) % NUM_PRODUCTS
-            rid = cid % NUM_REGIONS
-            batch.append(pk=cid, product_id=pid, region_id=rid,
-                         quantity=1 + (i % 10), revenue=100 + (i % 1000))
-
-        result["tick_build"].append(round(time.perf_counter() - t_b0, 4))
-        t_p0 = time.perf_counter()
-        conn.push(act_tid, batch)
-        result["tick_push"].append(round(time.perf_counter() - t_p0, 4))
-
-    view_ids = {
-        "v_enriched":    vid_enriched,
-        "v_enriched2":   vid_enriched2,
-        "v_active":      vid_active,
-        "v_unblocked":   vid_unblocked,
-        "v_rev_region":  vid_rev_region,
-        "v_rev_tier":    vid_rev_tier,
-        "v_premium_cnt": vid_premium_cnt,
-        "v_hot_regions": vid_hot,
-        "v_flagged":     vid_flagged,
-        "v_region_cnt":  vid_region_cnt,
-    }
-    for vname, vid in view_ids.items():
-        t_s0     = time.perf_counter()
-        rows_out = list(conn.scan(vid))
-        t_scan   = time.perf_counter() - t_s0
-        live     = sum(1 for r in rows_out if r.weight > 0)
-        result["scan"][vname] = {"time_s": round(t_scan, 4), "groups": live}
-
-    t_s0 = time.perf_counter()
-    for cid in range(0, NUM_CUSTOMERS, 50):
-        conn.seek(cust_tid, pk=cid)
-    for pid in range(0, NUM_PRODUCTS, 10):
-        conn.seek_by_index(act_tid, col_idx=1, key=pid)
-    for rid in range(NUM_REGIONS):
-        conn.seek_by_index(act_tid, col_idx=2, key=rid)
-    result["seek_s"] = round(time.perf_counter() - t_s0, 4)
-
-print(json.dumps(result))
-"""
-
-
-# ---------------------------------------------------------------------------
-# Server lifecycle (same as perf_profile.py)
-# ---------------------------------------------------------------------------
-def start_server(binary: Path, workers: int):
-    tmpdir    = tempfile.mkdtemp(dir=REPO_ROOT / "tmp", prefix="compare_")
-    data_dir  = os.path.join(tmpdir, "data")
-    sock_path = os.path.join(tmpdir, "gnitz.sock")
-    log_path  = os.path.join(tmpdir, "server.log")
-
-    cmd   = [str(binary), data_dir, sock_path, f"--workers={workers}"]
-    log_f = open(log_path, "w")
-    proc  = subprocess.Popen(cmd, stdout=log_f, stderr=log_f)
-
-    for _ in range(100):
-        if os.path.exists(sock_path):
-            break
-        time.sleep(0.1)
-    else:
-        proc.kill(); proc.wait(); log_f.close()
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        sys.exit(f"Server {binary.name} did not start within 10s.  Log: {log_path}")
-
-    return proc, sock_path, tmpdir, log_f
-
-
-class WorkloadError(Exception):
-    def __init__(self, stderr: str, server_log: str):
-        self.stderr     = stderr
-        self.server_log = server_log
-    def __str__(self) -> str:
-        return self.stderr
-
-
-def stop_server(proc, tmpdir: str, log_f) -> None:
-    proc.kill(); proc.wait(); log_f.close()
-    shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def run_workload(sock_path: str, ticks: int, rows: int) -> dict:
-    proc = subprocess.run(
-        ["uv", "run", "python", "-c", _WORKLOAD, sock_path, str(ticks), str(rows)],
-        cwd=CLIENT_DIR,
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        raise WorkloadError(proc.stderr, "")   # server_log filled in by caller
-    return json.loads(proc.stdout.strip())
+# (workload, server lifecycle, and run_workload imported from workload.py)
 
 
 def _read_file(path: str) -> str:
@@ -378,7 +123,8 @@ def _save_and_print_logs(out_dir: Path, slug: str, run_idx: int,
 
 def run_server_trial(binary: Path, workers: int, ticks: int, rows: int,
                      label: str, run_idx: int, total_runs: int,
-                     out_dir: Path) -> dict:
+                     out_dir: Path, *,
+                     realistic: bool = False, clients: int = 4) -> dict:
     """Start server, run workload, stop server.
 
     Returns timing dict on success.
@@ -386,9 +132,13 @@ def run_server_trial(binary: Path, workers: int, ticks: int, rows: int,
     """
     print(f"  [{label}] run {run_idx}/{total_runs} …", end="", flush=True)
     slug = label.lower().replace(" ", "_").replace("-", "_")
-    proc, sock_path, tmpdir, log_f = start_server(binary, workers)
+    proc, sock_path, tmpdir, log_f = start_server(
+        binary, workers, tmpdir_prefix="compare_")
     try:
-        result = run_workload(sock_path, ticks, rows)
+        if realistic:
+            result = run_realistic_workload(sock_path, ticks, rows, clients)
+        else:
+            result = run_workload(sock_path, ticks, rows)
     except WorkloadError as e:
         # Read all logs before stop_server deletes tmpdir
         log_f.flush()
@@ -399,9 +149,8 @@ def run_server_trial(binary: Path, workers: int, ticks: int, rows: int,
             if wtext.strip():
                 worker_logs[n] = wtext
         stop_server(proc, tmpdir, log_f)
-        # Save to out_dir
-        _save_and_print_logs(out_dir, slug, run_idx, e.stderr, server_log, worker_logs)
-        raise WorkloadError(e.stderr, server_log)
+        _save_and_print_logs(out_dir, slug, run_idx, str(e), server_log, worker_logs)
+        raise
     else:
         stop_server(proc, tmpdir, log_f)
 
@@ -496,23 +245,11 @@ def print_comparison(jit: dict, nojit: dict, ticks: int, rows: int) -> None:
     _section("PER-VIEW SCAN TIME")
     print(f"  {'View':<20}  {'JIT':>8}  {'No-JIT':>8}  {'Speedup':>8}  Note")
     print(f"  {'----':<20}  {'---':>8}  {'------':>8}  {'-------':>8}  ----")
-    notes = {
-        "v_enriched":    "join",
-        "v_enriched2":   "chained join (3-table)",
-        "v_active":      "semi_join",
-        "v_unblocked":   "anti_join",
-        "v_rev_region":  "view-on-view reduce",
-        "v_rev_tier":    "reduce (fan-out)",
-        "v_premium_cnt": "filter+reduce",
-        "v_hot_regions": "3rd-hop filter",
-        "v_flagged":     "union+distinct",
-        "v_region_cnt":  "direct reduce",
-    }
     for vname in jit["scan"]:
         j_t = jit["scan"][vname]["time_s"]
         n_t = nojit["scan"][vname]["time_s"]
         sp  = n_t / j_t if j_t > 0 else float("inf")
-        note = notes.get(vname, "")
+        note = VIEW_NOTES.get(vname, "")
         print(f"  {vname:<20}  {j_t*1000:>7.0f}ms  {n_t*1000:>7.0f}ms  "
               f"{_speedup_colour(sp):>8}  {dim(note)}")
 
@@ -524,6 +261,25 @@ def print_comparison(jit: dict, nojit: dict, ticks: int, rows: int) -> None:
         print(f"  {yellow('Moderate JIT speedup — some hot code is already in C libraries.')}")
     else:
         print(f"  {dim('Minimal JIT speedup — hot path is dominated by library calls (memmove etc.).')}")
+
+    # Realistic workload stats
+    if "realistic" in jit and "realistic" in nojit:
+        _section("REALISTIC WORKLOAD LATENCY")
+        jp = jit["realistic"]["push_latency_ms"]
+        np_ = nojit["realistic"]["push_latency_ms"]
+        print(f"  {'Percentile':<14}  {'JIT (ms)':>10}  {'No-JIT (ms)':>12}  {'Speedup':>8}")
+        print(f"  {'-'*14:<14}  {'-'*10:>10}  {'-'*12:>12}  {'-'*8:>8}")
+        for key in ["p50", "p90", "p95", "p99", "mean"]:
+            jv, nv = jp[key], np_[key]
+            sp = nv / jv if jv > 0 else float("inf")
+            print(f"  {key:<14}  {jv:>9.1f}ms  {nv:>11.1f}ms  {_speedup_colour(sp):>8}")
+        js = jit["realistic"]["concurrent_scan_latency_ms"]
+        ns = nojit["realistic"]["concurrent_scan_latency_ms"]
+        print()
+        print(f"  Concurrent scans: JIT={js['count']}  No-JIT={ns['count']}")
+        if js["p50"] > 0 and ns["p50"] > 0:
+            sp = ns["p50"] / js["p50"]
+            print(f"  Scan p50: JIT={js['p50']:.1f}ms  No-JIT={ns['p50']:.1f}ms  ({_speedup_colour(sp)})")
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +329,10 @@ def main() -> None:
                     help="Rows per tick (default: 50,000).")
     ap.add_argument("--runs",     type=int, default=1,
                     help="Runs per binary; median is used (default: 1).  Use 3+ for stability.")
+    ap.add_argument("--realistic", action="store_true",
+                    help="Use realistic multi-client workload instead of throughput benchmark.")
+    ap.add_argument("--clients", type=int, default=4,
+                    help="Number of concurrent client processes (--realistic only, default: 4).")
     args = ap.parse_args()
 
     rebuild_jit   = args.rebuild or args.rebuild_jit
@@ -594,7 +354,9 @@ def main() -> None:
     nojit_mtime = datetime.fromtimestamp(BINARY_NOJIT.stat().st_mtime).strftime("%Y-%m-%d %H:%M") if BINARY_NOJIT.exists() else "?"
     print(f"  JIT     : {BINARY_JIT.name}   (--opt=jit --gc=incminimark --lto)  built {jit_mtime}")
     print(f"  No-JIT  : {BINARY_NOJIT.name}  (--opt=2   --gc=incminimark --lto)  built {nojit_mtime}")
+    mode_s = f"realistic ({args.clients} clients)" if args.realistic else "throughput"
     print(f"  Workers : {args.workers}")
+    print(f"  Mode    : {mode_s}")
     print(f"  Workload: {args.ticks} ticks × {args.rows:,} rows = {total_rows:,} rows total")
     print(f"  Runs    : {args.runs} per binary{'  (median reported)' if args.runs > 1 else ''}")
     print(f"  Output  : {out_dir}")
@@ -625,7 +387,8 @@ def main() -> None:
         try:
             jit_results.append(
                 run_server_trial(BINARY_JIT, args.workers, args.ticks, args.rows,
-                                 "JIT", i + 1, args.runs, out_dir)
+                                 "JIT", i + 1, args.runs, out_dir,
+                                 realistic=args.realistic, clients=args.clients)
             )
         except WorkloadError:
             jit_failed = True
@@ -639,7 +402,8 @@ def main() -> None:
         try:
             nojit_results.append(
                 run_server_trial(BINARY_NOJIT, args.workers, args.ticks, args.rows,
-                                 "No-JIT", i + 1, args.runs, out_dir)
+                                 "No-JIT", i + 1, args.runs, out_dir,
+                                 realistic=args.realistic, clients=args.clients)
             )
         except WorkloadError:
             nojit_failed = True

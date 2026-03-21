@@ -187,22 +187,23 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
+from workload import (
+    REPO_ROOT, CLIENT_DIR, start_server, stop_server, run_workload,
+    run_realistic_workload, VIEW_NOTES, WorkloadError,
+)
+
 # ---------------------------------------------------------------------------
 # Repository layout
 # ---------------------------------------------------------------------------
-REPO_ROOT   = Path(__file__).resolve().parent.parent
-CLIENT_DIR  = REPO_ROOT / "rust_client" / "gnitz-py"
 BINARY      = REPO_ROOT / "gnitz-server-release-c"
 RUNS_DIR    = REPO_ROOT / "tmp" / "perf_runs"
 PERF_TMP    = Path("/tmp/gnitz_perf.data")
@@ -478,36 +479,6 @@ def aggregate_categories(rows: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Server lifecycle
-# ---------------------------------------------------------------------------
-def start_server(binary: Path, workers: int) -> tuple:
-    tmpdir    = tempfile.mkdtemp(dir=REPO_ROOT / "tmp", prefix="perf_profile_")
-    data_dir  = os.path.join(tmpdir, "data")
-    sock_path = os.path.join(tmpdir, "gnitz.sock")
-    log_path  = os.path.join(tmpdir, "server.log")
-
-    cmd   = [str(binary), data_dir, sock_path, f"--workers={workers}"]
-    log_f = open(log_path, "w")
-    proc  = subprocess.Popen(cmd, stdout=log_f, stderr=log_f)
-
-    for _ in range(100):
-        if os.path.exists(sock_path):
-            break
-        time.sleep(0.1)
-    else:
-        proc.kill(); proc.wait(); log_f.close()
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        sys.exit(f"Server did not start within 10 s.  Log: {log_path}")
-
-    return proc, sock_path, tmpdir, log_f
-
-
-def stop_server(proc, tmpdir: str, log_f) -> None:
-    proc.kill(); proc.wait(); log_f.close()
-    shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
 # perf attachment
 # ---------------------------------------------------------------------------
 def attach_perf(server_pid: int, perf_data: Path, dwarf: bool) -> subprocess.Popen:
@@ -551,290 +522,8 @@ def stop_perf(perf_proc: subprocess.Popen) -> None:
     perf_proc.wait()
 
 
-# ---------------------------------------------------------------------------
-# Workload (run inside uv so gnitz is importable from rust_client/gnitz-py)
-# ---------------------------------------------------------------------------
-# This script is passed to `uv run python -c "..."` from CLIENT_DIR.
-# It connects to a running server via sock_path, runs the benchmark, and
-# prints a JSON timing report to stdout.
-
-_WORKLOAD = r"""
-import sys, time, json
-import gnitz
-
-sock_path     = sys.argv[1]
-ticks         = int(sys.argv[2])
-rows_per_tick = int(sys.argv[3])
-
-NUM_CUSTOMERS = 500    # dimension cardinality; also the FK domain for activities.pk
-NUM_PRODUCTS  = 100
-NUM_REGIONS   = 10
-NUM_BLOCKED   = 50     # first N customers are on the blocklist
-
-AGG_COUNT = 1
-AGG_SUM   = 2
-
-# ── schemas ────────────────────────────────────────────────────────────────────
-# activities: fact table, non-unique pk = customer_id (join key to customers)
-act_cols = [
-    gnitz.ColumnDef("pk",         gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("product_id", gnitz.TypeCode.I64),
-    gnitz.ColumnDef("region_id",  gnitz.TypeCode.I64),
-    gnitz.ColumnDef("quantity",   gnitz.TypeCode.I64),
-    gnitz.ColumnDef("revenue",    gnitz.TypeCode.I64),
-]
-# customers: dimension, unique pk = customer_id
-cust_cols = [
-    gnitz.ColumnDef("pk",        gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("region_id", gnitz.TypeCode.I64),
-    gnitz.ColumnDef("tier",      gnitz.TypeCode.I64),   # 0=std, 1=prem, 2=ent
-]
-# cust_attrs: second dimension for chained join, unique pk = customer_id
-attrs_cols = [
-    gnitz.ColumnDef("pk",     gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("budget", gnitz.TypeCode.I64),
-]
-# blocked: blocklist for anti-join, unique pk = customer_id
-blocked_cols = [
-    gnitz.ColumnDef("pk",     gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("reason", gnitz.TypeCode.I64),
-]
-
-act_schema     = gnitz.Schema(act_cols)
-cust_schema    = gnitz.Schema(cust_cols)
-attrs_schema   = gnitz.Schema(attrs_cols)
-blocked_schema = gnitz.Schema(blocked_cols)
-
-# join(activities, customers) output — pk kept from left, right non-pk cols appended
-# cols: pk[0] product_id[1] region_id[2] quantity[3] revenue[4] cust_region[5] tier[6]
-enriched_cols = [
-    gnitz.ColumnDef("pk",          gnitz.TypeCode.U64, primary_key=True),
-    gnitz.ColumnDef("product_id",  gnitz.TypeCode.I64),
-    gnitz.ColumnDef("region_id",   gnitz.TypeCode.I64),
-    gnitz.ColumnDef("quantity",    gnitz.TypeCode.I64),
-    gnitz.ColumnDef("revenue",     gnitz.TypeCode.I64),
-    gnitz.ColumnDef("cust_region", gnitz.TypeCode.I64),
-    gnitz.ColumnDef("tier",        gnitz.TypeCode.I64),
-]
-# chained join: enriched + budget[7]
-enriched2_cols = enriched_cols + [gnitz.ColumnDef("budget", gnitz.TypeCode.I64)]
-
-def reduce2_cols(grp_name):
-    return [
-        gnitz.ColumnDef("pk",      gnitz.TypeCode.U128, primary_key=True),
-        gnitz.ColumnDef(grp_name,  gnitz.TypeCode.I64),
-        gnitz.ColumnDef("total",   gnitz.TypeCode.I64),
-    ]
-
-result = {"tick_build": [], "tick_push": [], "scan": {}}
-
-with gnitz.connect(sock_path) as conn:
-    t0 = time.perf_counter()
-    sn = "bench"
-    conn.create_schema(sn)
-
-    # ── tables ──────────────────────────────────────────────────────────────
-    act_tid     = conn.create_table(sn, "activities", act_cols,     unique_pk=False)
-    cust_tid    = conn.create_table(sn, "customers",  cust_cols)
-    attrs_tid   = conn.create_table(sn, "cust_attrs", attrs_cols)
-    blocked_tid = conn.create_table(sn, "blocked",    blocked_cols)
-
-    # ── secondary indices (exercises seek_by_index path) ────────────────────
-    conn.execute_sql("CREATE INDEX ON activities(product_id)", schema_name=sn)
-    conn.execute_sql("CREATE INDEX ON activities(region_id)",  schema_name=sn)
-
-    # ── pre-populate dimension tables ────────────────────────────────────────
-    cb_batch = gnitz.ZSetBatch(cust_schema)
-    ab_batch = gnitz.ZSetBatch(attrs_schema)
-    for cid in range(NUM_CUSTOMERS):
-        cb_batch.append(pk=cid, region_id=cid % NUM_REGIONS, tier=cid % 3)
-        ab_batch.append(pk=cid, budget=1000 + (cid % 5) * 200)
-    conn.push(cust_tid,  cb_batch)
-    conn.push(attrs_tid, ab_batch)
-
-    bl_batch = gnitz.ZSetBatch(blocked_schema)
-    for cid in range(NUM_BLOCKED):
-        bl_batch.append(pk=cid, reason=1)
-    conn.push(blocked_tid, bl_batch)
-
-    # ── predicates ──────────────────────────────────────────────────────────
-    # pred_high_rev:   activities.revenue[4] > 800
-    eb = gnitz.ExprBuilder()
-    r1 = eb.load_col_int(4); r2 = eb.load_const(800)
-    pred_high_rev = eb.build(result_reg=eb.cmp_gt(r1, r2))
-
-    # pred_high_qty:   activities.quantity[3] > 7
-    eb = gnitz.ExprBuilder()
-    r1 = eb.load_col_int(3); r2 = eb.load_const(7)
-    pred_high_qty = eb.build(result_reg=eb.cmp_gt(r1, r2))
-
-    # pred_enterprise: enriched.tier[6] == 2
-    eb = gnitz.ExprBuilder()
-    r1 = eb.load_col_int(6); r2 = eb.load_const(2)
-    pred_enterprise = eb.build(result_reg=eb.cmp_eq(r1, r2))
-
-    # pred_hot:        v_rev_region.total[2] > 5_000_000
-    eb = gnitz.ExprBuilder()
-    r1 = eb.load_col_int(2); r2 = eb.load_const(5_000_000)
-    pred_hot = eb.build(result_reg=eb.cmp_gt(r1, r2))
-
-    # ── views ────────────────────────────────────────────────────────────────
-
-    # V1: join(activities_delta, customers_trace)
-    #     PK-equijoin on customer_id; appends tier + cust_region to each row
-    cb = conn.circuit_builder(source_table_id=act_tid)
-    cb.sink(cb.join(cb.input_delta(), cust_tid))
-    vid_enriched = conn.create_view_with_circuit(
-        sn, "v_enriched", cb.build(), enriched_cols)
-
-    # V2: join(activities, customers) → join(cust_attrs)  [3-table chained join]
-    cb = conn.circuit_builder(source_table_id=act_tid)
-    cb.sink(cb.join(cb.join(cb.input_delta(), cust_tid), attrs_tid))
-    vid_enriched2 = conn.create_view_with_circuit(
-        sn, "v_enriched2", cb.build(), enriched2_cols)
-
-    # V3: semi_join(activities_delta, customers_trace)  [only known-customer rows]
-    cb = conn.circuit_builder(source_table_id=act_tid)
-    cb.sink(cb.semi_join(cb.input_delta(), cust_tid))
-    vid_active = conn.create_view_with_circuit(
-        sn, "v_active", cb.build(), act_cols)
-
-    # V4: anti_join(activities_delta, blocked_trace)  [exclude blocklisted customers]
-    cb = conn.circuit_builder(source_table_id=act_tid)
-    cb.sink(cb.anti_join(cb.input_delta(), blocked_tid))
-    vid_unblocked = conn.create_view_with_circuit(
-        sn, "v_unblocked", cb.build(), act_cols)
-
-    # V5: view-on-view: v_enriched → reduce(group_by=region_id[2], SUM(revenue[4]))
-    cb = conn.circuit_builder(source_table_id=vid_enriched)
-    cb.sink(cb.reduce(cb.input_delta(), group_by_cols=[2],
-                      agg_func_id=AGG_SUM, agg_col_idx=4))
-    vid_rev_region = conn.create_view_with_circuit(
-        sn, "v_rev_region", cb.build(), reduce2_cols("region_id"))
-
-    # V6: view-on-view: v_enriched → reduce(group_by=tier[6], SUM(revenue[4]))
-    #     Fan-out from same parent as V5 — stresses multi-consumer delta dispatch
-    cb = conn.circuit_builder(source_table_id=vid_enriched)
-    cb.sink(cb.reduce(cb.input_delta(), group_by_cols=[6],
-                      agg_func_id=AGG_SUM, agg_col_idx=4))
-    vid_rev_tier = conn.create_view_with_circuit(
-        sn, "v_rev_tier", cb.build(), reduce2_cols("tier"))
-
-    # V7: view-on-view: v_enriched → filter(tier==2) → reduce(region_id[2], COUNT)
-    cb = conn.circuit_builder(source_table_id=vid_enriched)
-    inp = cb.input_delta()
-    cb.sink(cb.reduce(cb.filter(inp, pred_enterprise),
-                      group_by_cols=[2], agg_func_id=AGG_COUNT, agg_col_idx=4))
-    vid_premium_cnt = conn.create_view_with_circuit(
-        sn, "v_premium_cnt", cb.build(), reduce2_cols("region_id"))
-
-    # V8: 3rd-hop view-on-view: v_rev_region → filter(total[2] > 5M)
-    #     DAG depth = 3 (activities → v_enriched → v_rev_region → v_hot_regions)
-    cb = conn.circuit_builder(source_table_id=vid_rev_region)
-    cb.sink(cb.filter(cb.input_delta(), pred_hot))
-    vid_hot = conn.create_view_with_circuit(
-        sn, "v_hot_regions", cb.build(), reduce2_cols("region_id"))
-
-    # V9: filter(rev>800) UNION filter(qty>7) → distinct
-    #     Two filter branches from same delta; union + dedup exercises Z-set cancellation
-    cb  = conn.circuit_builder(source_table_id=act_tid)
-    inp = cb.input_delta()
-    cb.sink(cb.distinct(cb.union(cb.filter(inp, pred_high_rev),
-                                 cb.filter(inp, pred_high_qty))))
-    vid_flagged = conn.create_view_with_circuit(
-        sn, "v_flagged", cb.build(), act_cols)
-
-    # V10: direct reduce on activities: region_id[2], COUNT  [baseline; no join]
-    cb = conn.circuit_builder(source_table_id=act_tid)
-    cb.sink(cb.reduce(cb.input_delta(), group_by_cols=[2],
-                      agg_func_id=AGG_COUNT, agg_col_idx=4))
-    vid_region_cnt = conn.create_view_with_circuit(
-        sn, "v_region_cnt", cb.build(), reduce2_cols("region_id"))
-
-    result["setup_s"] = time.perf_counter() - t0
-
-    # ── tick loop ────────────────────────────────────────────────────────────
-    for tick in range(ticks):
-        t_b0  = time.perf_counter()
-        batch = gnitz.ZSetBatch(act_schema)
-
-        # Every 5th tick (tick >= 5): retract 1% of rows from 5 ticks back.
-        # Same deterministic formula as the original push → exact weight cancellation.
-        if tick >= 5 and tick % 5 == 0:
-            base_r    = (tick - 5) * rows_per_tick
-            n_retract = max(1, rows_per_tick // 100)
-            for i in range(n_retract):
-                cid = (base_r + i) % NUM_CUSTOMERS
-                pid = (base_r + i) % NUM_PRODUCTS
-                rid = cid % NUM_REGIONS
-                batch.append(pk=cid, product_id=pid, region_id=rid,
-                             quantity=1 + (i % 10), revenue=100 + (i % 1000),
-                             weight=-1)
-
-        base = tick * rows_per_tick
-        for i in range(rows_per_tick):
-            cid = (base + i) % NUM_CUSTOMERS
-            pid = (base + i) % NUM_PRODUCTS
-            rid = cid % NUM_REGIONS
-            batch.append(pk=cid, product_id=pid, region_id=rid,
-                         quantity=1 + (i % 10), revenue=100 + (i % 1000))
-
-        t_build = time.perf_counter() - t_b0
-
-        t_p0  = time.perf_counter()
-        conn.push(act_tid, batch)
-        t_push = time.perf_counter() - t_p0
-
-        result["tick_build"].append(round(t_build, 4))
-        result["tick_push"].append(round(t_push, 4))
-
-    # ── scan all views ────────────────────────────────────────────────────────
-    view_ids = {
-        "v_enriched":    vid_enriched,
-        "v_enriched2":   vid_enriched2,
-        "v_active":      vid_active,
-        "v_unblocked":   vid_unblocked,
-        "v_rev_region":  vid_rev_region,
-        "v_rev_tier":    vid_rev_tier,
-        "v_premium_cnt": vid_premium_cnt,
-        "v_hot_regions": vid_hot,
-        "v_flagged":     vid_flagged,
-        "v_region_cnt":  vid_region_cnt,
-    }
-    for vname, vid in view_ids.items():
-        t_s0     = time.perf_counter()
-        rows_out = list(conn.scan(vid))
-        t_scan   = time.perf_counter() - t_s0
-        live     = sum(1 for r in rows_out if r.weight > 0)
-        result["scan"][vname] = {"time_s": round(t_scan, 4), "groups": live}
-
-    # ── seek / seek_by_index ─────────────────────────────────────────────────
-    # Exercises the point-lookup and secondary-index read paths under load.
-    t_s0 = time.perf_counter()
-    for cid in range(0, NUM_CUSTOMERS, 50):   # 10 point lookups on customers
-        conn.seek(cust_tid, pk=cid)
-    for pid in range(0, NUM_PRODUCTS, 10):    # 10 index lookups on product_id
-        conn.seek_by_index(act_tid, col_idx=1, key=pid)
-    for rid in range(NUM_REGIONS):            # 10 index lookups on region_id
-        conn.seek_by_index(act_tid, col_idx=2, key=rid)
-    result["seek_s"] = round(time.perf_counter() - t_s0, 4)
-
-print(json.dumps(result))
-"""
 
 
-def run_workload(sock_path: str, ticks: int, rows: int) -> dict:
-    """Run the benchmark workload via uv and return parsed timing dict."""
-    proc = subprocess.run(
-        ["uv", "run", "python", "-c", _WORKLOAD, sock_path, str(ticks), str(rows)],
-        cwd=CLIENT_DIR,
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        print(red("\nWorkload subprocess failed:"), file=sys.stderr)
-        print(proc.stderr, file=sys.stderr)
-        sys.exit(1)
-    return json.loads(proc.stdout.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -892,21 +581,28 @@ def print_benchmark_timing(result: dict, ticks: int, rows: int) -> None:
     print()
     print(f"  {'View':<20}  {'Scan':>8}  {'Groups':>7}  Note")
     print(f"  {'----':<20}  {'--------':>8}  {'-------':>7}  ----")
-    notes = {
-        "v_enriched":    "join(act, customers)",
-        "v_enriched2":   "join×2 chained 3-table",
-        "v_active":      "semi_join(act, customers)",
-        "v_unblocked":   "anti_join(act, blocked)",
-        "v_rev_region":  "view-on-view reduce",
-        "v_rev_tier":    "view-on-view reduce (fan-out)",
-        "v_premium_cnt": "view-on-view filter+reduce",
-        "v_hot_regions": "3rd-hop filter",
-        "v_flagged":     "union+distinct",
-        "v_region_cnt":  "direct reduce",
-    }
+    notes = VIEW_NOTES
     for vname, v in result["scan"].items():
         note = notes.get(vname, "")
         print(f"  {vname:<20}  {v['time_s']*1000:>7.0f}ms  {v['groups']:>7}  {dim(note)}")
+
+
+def print_realistic_timing(result: dict) -> None:
+    """Print extended timing stats for the realistic multi-client workload."""
+    r = result["realistic"]
+    print()
+    print(bold("  Realistic workload stats"))
+    print(f"  Clients      : {r['num_clients']}")
+    print(f"  Total pushes : {r['total_pushes']:,}")
+    dist = r["batch_size_distribution"]
+    print(f"  Batch sizes  : 1-row={dist['1']}  2-50={dist['2_50']}  50-500={dist['50_500']}")
+    mix = r["operation_mix"]
+    print(f"  Op mix       : insert={mix['insert']}  update={mix['update']}  delete={mix['delete']}")
+    p = r["push_latency_ms"]
+    print(f"  Push latency : p50={p['p50']:.1f}ms  p90={p['p90']:.1f}ms  "
+          f"p95={p['p95']:.1f}ms  p99={p['p99']:.1f}ms  mean={p['mean']:.1f}ms")
+    s = r["concurrent_scan_latency_ms"]
+    print(f"  Scan latency : p50={s['p50']:.1f}ms  p90={s['p90']:.1f}ms  ({s['count']} scans)")
 
 
 def print_flat_profile(rows: list[dict], meta: dict, events: str = "cycles:u") -> None:
@@ -1137,6 +833,10 @@ def main() -> None:
                     help="After recording, print instruction-level annotation for SYMBOL.  "
                          "Uses the most recent run's perf.data if no new recording is made "
                          "(e.g. when combined with a run that already completed).")
+    ap.add_argument("--realistic", action="store_true",
+                    help="Use realistic multi-client workload instead of throughput benchmark.")
+    ap.add_argument("--clients", type=int, default=4,
+                    help="Number of concurrent client processes (--realistic only, default: 4).")
     args = ap.parse_args()
 
     # --annotate-only mode: annotate from most recent run, skip new recording
@@ -1162,8 +862,10 @@ def main() -> None:
     print(bold(cyan("═" * 70)))
     print(bold(cyan(f"  GnitzDB Perf Profile — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")))
     print(bold(cyan("═" * 70)))
+    mode_s = f"realistic ({args.clients} clients)" if args.realistic else "throughput"
     print(f"  Binary  : {BINARY.name}  (--opt=jit --gc=incminimark --lto)")
     print(f"  Workers : {args.workers}")
+    print(f"  Mode    : {mode_s}")
     print(f"  Workload: {args.ticks} ticks × {args.rows:,} rows = {total_rows:,} rows total")
     print(f"  Views   : 10 views — join/chained-join/semi-join/anti-join/union/distinct/reduce/view-on-view×3")
     print(f"  Events  : {args.events}")
@@ -1191,7 +893,8 @@ def main() -> None:
     try:
         # Step 2: Start server
         print(bold("[2/4] Starting server …"))
-        server_proc, sock_path, tmpdir, log_f = start_server(BINARY, args.workers)
+        server_proc, sock_path, tmpdir, log_f = start_server(
+            BINARY, args.workers, tmpdir_prefix="perf_profile_")
         print(f"  PID: {server_proc.pid}")
 
         # Step 3: Attach perf
@@ -1205,8 +908,13 @@ def main() -> None:
         print()
         print(bold("[4/4] Running benchmark …"))
         print()
-        timing = run_workload(sock_path, args.ticks, args.rows)
+        if args.realistic:
+            timing = run_realistic_workload(sock_path, args.ticks, args.rows, args.clients)
+        else:
+            timing = run_workload(sock_path, args.ticks, args.rows)
         print_benchmark_timing(timing, args.ticks, args.rows)
+        if "realistic" in timing:
+            print_realistic_timing(timing)
 
     finally:
         if perf_proc is not None:
