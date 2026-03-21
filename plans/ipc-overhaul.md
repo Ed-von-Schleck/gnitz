@@ -86,25 +86,26 @@ backing, and exchange relay as four separate concerns, each with its own
 format, buffer, and lifecycle. The plan unifies the first two and simplifies
 the third:
 
-1. A **shared append-only log** (SAL — mmap of a per-worker file) replaces
-   both the memfd+SCM_RIGHTS transport AND the per-partition WAL files. The
-   master gather-encodes partition-sorted batches directly into the SAL. The
-   worker calls `fdatasync()` on the backing file — one syscall makes all
-   partitions durable.
+1. A **single shared append-only log** (SAL — one file-backed mmap for all
+   workers) replaces both the memfd+SCM_RIGHTS transport AND the per-partition
+   WAL files. The master gather-encodes partition-sorted batches for all N
+   workers into the SAL as one contiguous append, calls `fdatasync()` once,
+   then signals all workers. One file, one fdatasync, one NVMe flush command.
 
-2. The worker **clones from the SAL** into owned memtable batches via the
-   existing `upsert_batch` path. The clone is one sequential memcpy per column
-   (~10 μs for typical batches). After the clone, the SAL offset advances.
-   No per-push `mmap()`/`munmap()`. No long-lived pinning. The memtable code
-   is completely unchanged.
+2. The worker **reads from the SAL** (mmap page-cache hit, zero syscalls) and
+   **clones into owned memtable batches** via the existing `upsert_batch`
+   path. The clone is one sequential memcpy per column (~10 μs for typical
+   batches). No per-push `mmap()`/`munmap()`. No long-lived pinning. No
+   worker-side fsync. The memtable code is completely unchanged.
 
 3. A **shared exchange arena** (pre-fork shared memory) replaces the
    master-as-relay exchange model. Workers scatter-encode exchange data
    directly into the arena; other workers read and clone with zero master
    involvement. The master coordinates barriers only.
 
-One `fdatasync`. Zero per-push `mmap`/`munmap`. Zero `write()`. The existing
-memtable and storage layer are oblivious to the SAL.
+One `fdatasync` (master-owned). Zero per-push `mmap`/`munmap`. Zero
+`write()`. Zero cross-process fsync assumptions. The existing memtable and
+storage layer are oblivious to the SAL.
 
 ### Why not a ring buffer?
 
@@ -135,7 +136,7 @@ append-only log. Investigation revealed three problems with a ring:
    complexity), or client-side splitting (pushes complexity outward).
 
 The SAL eliminates all three: append-only means no overwrites (full recovery
-correctness), file growth via `ftruncate` means no message size limit, and
+correctness), 1 GB pre-sized sparse file means no message size limit, and
 sequential append means no wrap/skip logic. The C code shrinks from ~200 lines
 (ring struct, skip markers, wrap detection) to ~20 lines (eventfd helpers).
 
@@ -149,13 +150,13 @@ External client (Rust/Python)
     │  io_uring multishot accept + recv on server [Step 5]
     ▼
   Master process
-    │  recv → classify → gather-encode (partition-sorted)
-    │  → append into per-worker file-backed SAL (mmap)
-    │  → signal via eventfd
+    │  recv → classify → gather-encode ALL workers' data (partition-sorted)
+    │  → append into SINGLE file-backed SAL (mmap)
+    │  → fdatasync(sal_fd)           ← 1 fsync, ALL workers, ALL partitions
+    │  → signal N workers via eventfd
     ▼
   Worker processes (forked, each owns partition range)
-    │  read SAL at current offset → (ptr, len)
-    │  fdatasync(wal_fd)             ← 1 fsync, ALL partitions
+    │  read SAL at current offset → (ptr, len)  ← mmap page-cache hit, 0 syscalls
     │  clone into owned batch        ← 1 memcpy, existing upsert_batch
     │  upsert_batch into memtable    ← existing code, unchanged
     │  advance read_cursor
@@ -251,18 +252,6 @@ def fdatasync_c(fd):
     if rffi.cast(lltype.Signed, res) < 0:
         raise MMapError()
 
-_fallocate = rffi.llexternal("posix_fallocate",
-    [rffi.INT, rffi.LONGLONG, rffi.LONGLONG], rffi.INT,
-    compilation_info=eci, _nowrapper=True)
-
-@jit.dont_look_inside
-def fallocate_c(fd, size):
-    res = _fallocate(rffi.cast(rffi.INT, fd),
-                     rffi.cast(rffi.LONGLONG, 0),
-                     rffi.cast(rffi.LONGLONG, size))
-    if rffi.cast(lltype.Signed, res) != 0:
-        raise MMapError()
-
 MAP_ANONYMOUS = 0x20
 
 @jit.dont_look_inside
@@ -295,27 +284,26 @@ def madvise_dontneed(ptr, size):
 
 ### SAL allocation (before fork, in `main.py`)
 
-Per worker: 1 file-backed SAL (master→worker) + 1 anonymous shared region
-(worker→master).
+One file-backed SAL (master→all workers) + per-worker anonymous shared
+regions (worker→master).
 
-**Master→worker SAL** (file-backed): one `fallocate` + one `mmap` of a
-pre-allocated file. The mmap is created at 1 GB virtual (far exceeding the
-initial file size) to allow growth without remapping. On Linux, `ftruncate`
-to grow a file makes new pages accessible through an existing MAP_SHARED
-mapping without remapping — the kernel checks file size at page-fault time.
-LMDB and SQLite WAL mode use the same technique.
+**Master→worker SAL** (file-backed, single file): one `ftruncate` + one
+`mmap`. The file is extended to the full mmap size (`SAL_MMAP_SIZE`, 1 GB)
+as a sparse file — `ftruncate` only modifies inode metadata (~1 μs on any
+POSIX filesystem), physical blocks are allocated on first write (demand
+paging by the filesystem). The master writes all workers' data into this
+single file and calls `fdatasync` once — no cross-process fsync assumption.
 
-**Worker→master region** (anonymous): one `mmap(MAP_SHARED|MAP_ANONYMOUS)`.
-This carries ACKs, scan results, exchange signals, and error responses.
+**Worker→master regions** (anonymous, per worker): one
+`mmap(MAP_SHARED|MAP_ANONYMOUS)` each. These carry ACKs, scan results,
+exchange signals, and error responses.
 
 ```python
-INITIAL_SAL_SIZE = 16 * 1024 * 1024    # 16 MB, file-backed
-SAL_MMAP_SIZE    = 1 << 30             # 1 GB virtual (demand-paged)
-W2M_REGION_SIZE  = 1 << 30             # 1 GB virtual, anonymous (demand-paged)
-# Total virtual: (SAL_MMAP_SIZE + W2M_REGION_SIZE) * num_workers
-# = 8 GB for 4 workers (0.006% of 128 TB x86-64 VA space)
-# Physical at rest: 16 MB * num_workers (SAL fallocate) + 0 (anonymous demand-paged)
-# = 64 MB for 4 workers
+SAL_MMAP_SIZE    = 1 << 30             # 1 GB virtual + file size (sparse)
+W2M_REGION_SIZE  = 1 << 30             # 1 GB virtual per worker, anonymous (demand-paged)
+# Total virtual: SAL_MMAP_SIZE + W2M_REGION_SIZE * num_workers
+# = 5 GB for 4 workers (0.004% of 128 TB x86-64 VA space)
+# Physical at rest: 0 (SAL sparse, W2M demand-paged)
 ```
 
 Create eventfds (one per direction, per worker) before fork.
@@ -323,28 +311,29 @@ Create eventfds (one per direction, per worker) before fork.
 ### SAL setup
 
 ```python
-for w in range(num_workers):
-    wal_path = base_dir + "/worker_" + str(w) + ".wal"
-    wal_fd = rposix.open(wal_path, O_RDWR | O_CREAT, 0o644)
-    fallocate_c(wal_fd, INITIAL_SAL_SIZE)
-    m2w_ptr = mmap_posix.mmap_file(
-        wal_fd, SAL_MMAP_SIZE,
-        prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
-        flags=mmap_posix.MAP_SHARED,
-    )
-    m2w_efd = eventfd_ffi.eventfd_create()
+sal_path = base_dir + "/wal.sal"
+sal_fd = rposix.open(sal_path, O_RDWR | O_CREAT, 0o644)
+mmap_posix.ftruncate_c(sal_fd, SAL_MMAP_SIZE)   # sparse — ~1 μs, any filesystem
+sal_ptr = mmap_posix.mmap_file(
+    sal_fd, SAL_MMAP_SIZE,
+    prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
+    flags=mmap_posix.MAP_SHARED,
+)
 
+for w in range(num_workers):
     w2m_ptr = mmap_posix.mmap_anonymous_shared(W2M_REGION_SIZE)
+    m2w_efd = eventfd_ffi.eventfd_create()
     w2m_efd = eventfd_ffi.eventfd_create()
     ...
 ```
 
-After fork: child closes eventfds of other workers.
+After fork: child closes eventfds of other workers. All processes (master +
+workers) inherit the SAL mmap — master writes, workers read.
 
 ### Files changed
 - New: `gnitz/server/eventfd_ffi.py` (~40 lines C, ~40 lines Python)
 - `gnitz/storage/mmap_posix.py`: add `mmap_anonymous_shared(size)`,
-  `fallocate_c(fd, size)`, `fdatasync_c(fd)`, `madvise_dontneed(ptr, size)`
+  `fdatasync_c(fd)`, `madvise_dontneed(ptr, size)`
 
 ### Test
 - New: `rpython_tests/eventfd_test.py` — eventfd create/signal/wait, wait_any
@@ -353,79 +342,106 @@ After fork: child closes eventfds of other workers.
 
 ---
 
-## Step 2: Internal IPC + Per-Worker Unified WAL
+## Step 2: Internal IPC + Unified WAL
 
 Replace the memfd+socket path in `master.py` and `worker.py` with the
-file-backed SAL transport. The SAL serves as both the IPC channel and
-the durable WAL.
+single file-backed SAL transport. The SAL serves as both the IPC channel
+and the durable WAL for all workers.
 
 ### 2a: SAL transport (master side)
 
 #### `main.py` changes
 
 SAL + eventfd allocation before fork (see Step 1 setup code). Pass SAL
-pointers, fds, eventfds, and file sizes to `WorkerProcess` and
+pointer, fd, and per-worker eventfds to `WorkerProcess` and
 `MasterDispatcher`.
 
 #### SAL state
 
 ```python
 class SharedAppendLog(object):
-    """Per-worker shared append-only log.
+    """Single shared append-only log for all workers.
 
-    Master appends messages at write_cursor. Worker reads at read_cursor.
-    Both cursors are in-process variables (not stored in the file) — they
-    stay in sync because the protocol is request/response.
+    Master appends message groups (containing all N workers' data) at
+    write_cursor. Each worker reads at its own read_cursor.
+    Cursors are in-process variables (not stored in the file).
     """
-    def __init__(self, ptr, fd, efd, file_size):
-        self.ptr = ptr                  # mmap base (1 GB virtual)
+    def __init__(self, ptr, fd):
+        self.ptr = ptr                  # mmap base (1 GB virtual = file size)
         self.fd = fd                    # backing file fd
-        self.efd = efd                  # eventfd for signaling
-        self.file_size = file_size      # current file size (grows on demand)
-        self.cursor = 0                 # write_cursor (master) or read_cursor (worker)
+        self.write_cursor = 0           # master only
 ```
 
-The master and worker each hold a `SharedAppendLog` for the same underlying
-file+mmap. The master uses `cursor` as the write position; the worker uses
-`cursor` as the read position. These stay in sync because the worker advances
-by exactly the bytes the master wrote.
+Each worker holds its own `read_cursor` (an integer, not a shared object).
+Read cursors advance by exactly the bytes the master wrote per message group.
 
 #### `ipc.py` changes
 
-New transport functions alongside existing `send_batch`/`receive_payload`:
+New transport functions alongside existing `send_batch`/`receive_payload`.
+
+**Message group layout** — the master writes one group per push, containing
+all N workers' data in a single contiguous append:
+
+```
+[group_header: 64 bytes, cache-line aligned]
+  u64  total_payload_size         // size of entire group (excl. 8-byte prefix)
+  u64  lsn
+  u32  num_workers
+  u32  flags                      // FLAG_PUSH, FLAG_DDL_SYNC, etc.
+  u32  target_id
+  u32  reserved
+  u32  worker_offsets[MAX_WORKERS] // byte offset of worker i's data within group
+  u32  worker_sizes[MAX_WORKERS]   // byte size of worker i's data (0 = no data)
+
+[worker_0_data: WAL-block encoded IPC message (control + schema + data)]
+[worker_1_data: ...]
+[worker_2_data: ...]
+[worker_3_data: ...]
+```
+
+MAX_WORKERS is a compile-time constant (e.g., 64). The header is fixed-size
+regardless of actual worker count to keep offset arithmetic simple.
 
 ```python
+GROUP_HEADER_SIZE = 64 + 4 * MAX_WORKERS * 2   # offsets + sizes
+
 @jit.dont_look_inside
-def send_to_sal(sal, target_id, zbatch, schema, flags,
-                seek_pk_lo, seek_pk_hi, seek_col_idx,
-                status, error_msg):
-    """Encode WAL blocks into wire_buf, append to SAL."""
-    wire_buf = _encode_wire(target_id, zbatch, schema, flags,
-                            seek_pk_lo, seek_pk_hi, seek_col_idx,
-                            status, error_msg)
-    try:
-        msg_size = wire_buf.offset
-        total = 8 + _align8(msg_size)      # 8-byte size prefix + aligned payload
+def write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers):
+    """Append a message group for all N workers into the SAL.
 
-        # Grow file on demand (rare — only for large pushes).
-        # ftruncate on MAP_SHARED: new pages accessible without remapping.
-        if sal.cursor + total > sal.file_size:
-            new_size = _next_power_of_2(sal.cursor + total)
-            rposix.ftruncate(sal.fd, new_size)
-            sal.file_size = new_size
+    worker_bufs[w] is a (base_ptr, size) pair or (NULL, 0) for empty.
+    Master calls fdatasync after this returns, before signaling workers.
+    """
+    payload_size = GROUP_HEADER_SIZE
+    for w in range(num_workers):
+        payload_size += _align8(worker_bufs[w][1])
 
-        # Write size prefix
-        _write_u64(sal.ptr, sal.cursor, r_uint64(msg_size))
-        # Write payload
-        buffer_ops.c_memmove(
-            rffi.cast(rffi.VOIDP, rffi.ptradd(sal.ptr, sal.cursor + 8)),
-            rffi.cast(rffi.VOIDP, wire_buf.base_ptr),
-            rffi.cast(rffi.SIZE_T, msg_size),
-        )
-        sal.cursor += total
-        eventfd_ffi.eventfd_signal(sal.efd)
-    finally:
-        wire_buf.free()
+    total = 8 + _align8(payload_size)   # 8-byte size prefix + aligned payload
+
+    # No growth check needed: file is ftruncate'd to SAL_MMAP_SIZE at
+    # startup (sparse — blocks allocated on write).  If write_cursor
+    # approaches SAL_MMAP_SIZE, master forces a coordinated checkpoint.
+
+    # Write size prefix
+    _write_u64(sal.ptr, sal.write_cursor, r_uint64(payload_size))
+
+    # Write group header
+    hdr_ptr = rffi.ptradd(sal.ptr, sal.write_cursor + 8)
+    _write_group_header(hdr_ptr, lsn, flags, target_id, num_workers, worker_bufs)
+
+    # Write per-worker data
+    data_offset = GROUP_HEADER_SIZE
+    for w in range(num_workers):
+        wptr, wsz = worker_bufs[w]
+        if wsz > 0:
+            buffer_ops.c_memmove(
+                rffi.cast(rffi.VOIDP, rffi.ptradd(hdr_ptr, data_offset)),
+                rffi.cast(rffi.VOIDP, wptr),
+                rffi.cast(rffi.SIZE_T, wsz),
+            )
+        data_offset += _align8(wsz)
+
+    sal.write_cursor += total
 ```
 
 `_encode_wire` is the encoding logic factored out of `serialize_to_memfd`:
@@ -437,53 +453,59 @@ wire format, no memfd.
 
 ```python
 @jit.dont_look_inside
-def receive_from_sal(sal):
-    """Read next message from SAL, decode into IPCPayload.
+def read_worker_message(sal_ptr, read_cursor, worker_id):
+    """Read this worker's data from the next message group in the SAL.
 
-    Returns None if no message ready (read_cursor == write position).
+    Returns (payload, group_advance) or (None, 0) if no message ready.
     The returned payload holds non-owning views into SAL memory.
-    Caller must call payload.close() when done, which advances
-    the SAL read cursor.
+    Caller advances read_cursor by group_advance when done.
     """
-    msg_size = _read_u64(sal.ptr, sal.cursor)
+    msg_size = _read_u64(sal_ptr, read_cursor)
     if msg_size == 0:
-        return None
-    msg_ptr = rffi.ptradd(sal.ptr, sal.cursor + 8)
-    payload = _parse_from_ptr(msg_ptr, intmask(msg_size))
-    payload._pending_sal = sal
-    payload._pending_sal_advance = 8 + _align8(intmask(msg_size))
-    return payload
-```
-
-In `IPCPayload.close()`:
-
-```python
-def close(self):
-    if self._pending_sal is not None:
-        self._pending_sal.cursor += self._pending_sal_advance
-        self._pending_sal = None
-    if self.ptr:
-        mmap_posix.munmap_file(self.ptr, intmask(self.total_size))
-        self.ptr = lltype.nullptr(rffi.CCHARP.TO)
-    if self.fd >= 0:
-        os.close(intmask(self.fd))
-        self.fd = -1
+        return None, 0
+    hdr_ptr = rffi.ptradd(sal_ptr, read_cursor + 8)
+    my_offset = _read_worker_offset(hdr_ptr, worker_id)
+    my_size = _read_worker_size(hdr_ptr, worker_id)
+    group_advance = 8 + _align8(intmask(msg_size))
+    if my_size == 0:
+        return None, group_advance
+    my_ptr = rffi.ptradd(hdr_ptr, my_offset)
+    payload = _parse_from_ptr(my_ptr, my_size)
+    return payload, group_advance
 ```
 
 #### `master.py` changes
 
-`MasterDispatcher.__init__` gains `m2w_sals` and `w2m_sals` arrays
-(SharedAppendLog per worker, per direction).
+`MasterDispatcher.__init__` gains `sal` (single SharedAppendLog),
+`w2m_sals` (per-worker anonymous regions), and per-worker eventfds.
 
-All fan_out methods switch from socket to SAL:
+All fan_out methods switch from socket to SAL. The critical change: the
+master encodes all workers' data into a single message group, fdatasyncs
+once, then signals all workers:
+
 ```python
-# Before:
-ipc.send_batch(self.worker_fds[w], target_id, sb, schema=schema, flags=ipc.FLAG_PUSH)
-# After:
-ipc.send_to_sal(self.m2w_sals[w], target_id, sb, schema=schema, flags=ipc.FLAG_PUSH)
+def fan_out_push(self, target_id, batch, schema):
+    # 1. Classify + encode per-worker data into buffers
+    worker_bufs = self._encode_per_worker(batch, schema, target_id)
+
+    # 2. Write message group to SAL (one contiguous append)
+    ipc.write_message_group(self.sal, target_id, self._next_lsn(),
+                            ipc.FLAG_PUSH, worker_bufs, self.num_workers)
+    for wb in worker_bufs:
+        wb.free()
+
+    # 3. Durability — one fdatasync, one NVMe flush command
+    mmap_posix.fdatasync_c(self.sal.fd)
+
+    # 4. Signal all workers (data is durable, safe to read)
+    for w in range(self.num_workers):
+        eventfd_ffi.eventfd_signal(self.m2w_efds[w])
+
+    # 5. Collect ACKs (+ exchange relay)
+    self._collect_acks_and_relay(schema)
 ```
 
-Poll+receive loops switch to SAL reads:
+Poll+receive loops use per-worker anonymous w2m regions:
 ```python
 for w in range(self.num_workers):
     if w not in acked:
@@ -495,49 +517,101 @@ if len(acked) < self.num_workers:
     eventfd_ffi.eventfd_wait_any(self.w2m_efds, timeout_ms=10)
 ```
 
-`broadcast_ddl` encodes once, writes to N SALs:
+`broadcast_ddl` encodes once into a message group with identical data for
+all workers, fdatasyncs, then signals.
+
+#### Streaming scan forwarding
+
+`fan_out_scan` is replaced by `fan_out_scan_stream(target_id, schema,
+client_fd)` which raw-forwards each worker's scan result directly to the
+client without decoding, accumulating, or re-encoding:
+
 ```python
-def broadcast_ddl(self, target_id, batch, schema):
-    wire_buf = ipc._encode_wire(target_id, batch, schema, flags=ipc.FLAG_DDL_SYNC)
+def fan_out_scan_stream(self, target_id, schema, client_fd):
+    """Stream scan results from workers directly to client.
+
+    Each worker's W2M output is already WAL-block encoded — the same
+    wire format the client expects. The master reads raw bytes from
+    each worker's W2M region and forwards them as separate framed
+    messages. No decode, no ArenaZSetBatch allocation, no re-encode.
+    """
+    # 1. Send scan request to all workers via SAL
+    ipc.write_message_group(self.sal, target_id, self._next_lsn(),
+                            ipc.FLAG_SCAN, [None] * self.num_workers,
+                            self.num_workers)
+    mmap_posix.fdatasync_c(self.sal.fd)
     for w in range(self.num_workers):
-        _sal_write_raw(self.m2w_sals[w], wire_buf.base_ptr, wire_buf.offset)
-        eventfd_ffi.eventfd_signal(self.m2w_sals[w].efd)
-    wire_buf.free()
+        eventfd_ffi.eventfd_signal(self.m2w_efds[w])
+
+    # 2. Forward each worker's raw result directly to client
+    remaining = self.num_workers
+    while remaining > 0:
+        for w in range(self.num_workers):
+            raw_ptr, raw_size = ipc.read_raw_from_sal(self.w2m_sals[w])
+            if raw_ptr:
+                # Raw forward: W2M bytes → client socket. Zero-copy.
+                ipc_ffi.send_framed(client_fd, raw_ptr, raw_size)
+                remaining -= 1
+
+    # 3. Send sentinel so client knows scan is complete
+    ipc.send_framed(client_fd, target_id, None, flags=ipc.FLAG_SCAN_DONE)
 ```
+
+The master handles scan results in **O(1) memory** regardless of result
+size. No `ArenaZSetBatch` allocation. No `append_batch`. No re-encode.
+
+Per-worker scan results are ~1/N of the total (hash partitioning ≈ uniform).
+For 10M total rows with 4 workers: ~260 MB per worker, well within the 1 GB
+W2M region. The W2M region sizing concern (original Open Issue 2) is
+eliminated: the per-worker share is always bounded, and the master never
+accumulates.
+
+Copy path comparison for a 10M-row scan:
+
+| | Current (accumulate) | Streaming raw-forward |
+|---|---|---|
+| Master decode | 4 × 260 MB | **0** |
+| Master accumulate | 1 × 1 GB | **0** |
+| Master re-encode | 1 × 1 GB | **0** |
+| Master peak memory | ~2 GB | **~0** |
+
+`fan_out_scan` (returning `ArenaZSetBatch`) is kept for internal use but
+is not called for client-facing scans when `dispatcher is not None`.
 
 #### `worker.py` changes
 
-`WorkerProcess.__init__` gains `m2w_sal` and `w2m_sal`.
+`WorkerProcess.__init__` gains `sal_ptr` (shared mmap, read-only access),
+`read_cursor` (integer), `w2m_sal`, and per-worker eventfds.
 
 Main poll loop in `run()`:
 ```python
 while True:
-    payload = ipc.receive_from_sal(self.m2w_sal)
+    payload, advance = ipc.read_worker_message(
+        self.sal_ptr, self.read_cursor, self.worker_id)
     if payload is not None:
         should_exit = self._handle_request_from_sal(payload)
-        # payload.close() called inside _handle_request_from_sal
+        self.read_cursor += advance
         if should_exit:
             return
     else:
-        eventfd_ffi.eventfd_wait(self.m2w_sal.efd, timeout_ms=1000)
+        eventfd_ffi.eventfd_wait(self.m2w_efd, timeout_ms=1000)
 ```
 
 Response sending via `ipc.send_to_sal(self.w2m_sal, ...)`.
 
 #### Worker push hot path
 
-The push handler calls `fdatasync()` on the SAL's backing fd to make the
-data durable, then clones the batch into the existing memtable via
-`upsert_batch`:
+The master has already called `fdatasync()` before signaling. The data is
+durable when the worker reads it. The push handler just clones into the
+existing memtable:
 
 ```python
 def _handle_push_from_sal(self, payload, target_id, batch):
-    """Ingest SAL data via unified WAL. One fdatasync, one clone."""
-    # Step 1: Durability — the SAL data is in the page cache (master wrote
-    # via mmap). fdatasync flushes dirty pages to disk.
-    mmap_posix.fdatasync_c(self.wal_sal_fd)
+    """Ingest from SAL. Data is already durable — just clone and ingest."""
+    # No fdatasync here. The master fsynced before signaling us.
+    # The SAL data is durable on disk and also in the page cache (fast read).
 
-    # Step 2: Ingest — clone from SAL mmap into owned memtable batch.
+    # Ingest — clone from SAL mmap into owned memtable batch.
     # upsert_batch calls to_sorted() which creates a new owned batch,
     # copying column data and relocating blob arena strings. After this,
     # the memtable has no references to the SAL.
@@ -545,16 +619,14 @@ def _handle_push_from_sal(self, payload, target_id, batch):
     effective = ingest_to_family(family, batch)
     family.store.flush()
 
-    # Step 3: Close payload — advances read cursor.
-    # Safe: the memtable holds only owned data; SAL memory is unreferenced.
-    payload.close()
+    # read_cursor is advanced by the caller after this returns.
 
     # ... rest of push handling (pending_deltas, evaluate_dag) unchanged ...
 ```
 
-There is no `slice_view`, no shared blob_arena, no per-push `mmap()`, and no
-mmap region tracking. The existing `MemTable`, `PersistentTable`, and storage
-layer are completely unchanged.
+There is no `slice_view`, no shared blob_arena, no per-push `mmap()`, no
+mmap region tracking, and no worker-side fsync. The existing `MemTable`,
+`PersistentTable`, and storage layer are completely unchanged.
 
 #### Why clone is the right trade-off
 
@@ -577,22 +649,22 @@ regions. Investigation revealed three problems with that approach:
 The clone approach trades one sequential memcpy (~10 μs for 1K rows, ~1 ms for
 100K rows) for zero mmap syscalls, zero accounting bugs, and zero changes to
 the storage layer. The file-backed SAL already eliminated `write()` and reduced
-fsyncs from 256 to 4 — the remaining clone is in L1/L2 cache and is negligible
+fsyncs from 256 to 1 — the remaining clone is in L1/L2 cache and is negligible
 compared to the disk fsync.
 
 #### Back-pressure
 
-The SAL grows on demand via `ftruncate`, so it cannot "fill up" in the ring
-sense. However, unbounded growth is prevented by protocol structure: the
-master sends one push (plus optional preloaded exchange messages) per
-fan_out_push, then blocks waiting for ACKs. The worker processes and advances
-before the master sends the next push. Between checkpoints, the SAL file
-grows by the total volume of unflushed data — the same total as the current
-64 per-partition WALs, just consolidated into one file.
+The SAL file is pre-sized to `SAL_MMAP_SIZE` (1 GB sparse). Unbounded
+cursor growth is prevented by protocol structure: the master sends one push
+(plus optional preloaded exchange messages) per fan_out_push, then blocks
+waiting for ACKs. Workers process and advance before the master sends the
+next push. Between checkpoints, physical block usage grows by the total
+volume of unflushed data — the same total as the current 64 per-partition
+WALs, just consolidated into one file.
 
-If SAL growth approaches the 1 GB mmap limit (which implies ~1 GB of
-unflushed WAL data — a pathological case), the worker forces a checkpoint:
-flush all memtables to shards, then truncate+reset the SAL.
+If `write_cursor` approaches `SAL_MMAP_SIZE` (which implies ~1 GB of
+unflushed WAL data — a pathological case), the master forces a checkpoint
+when all workers have flushed: reset cursor to 0 (see 2c).
 
 #### Socket keepalive
 
@@ -636,25 +708,23 @@ Source batch (SoA, M rows)
 
 ```python
 def sal_get_write_ptr(sal, max_size):
-    """Get raw pointer into SAL at write cursor. Grows file if needed."""
-    total = 8 + max_size   # size prefix + payload
-    if sal.cursor + total > sal.file_size:
-        new_size = _next_power_of_2(sal.cursor + total)
-        rposix.ftruncate(sal.fd, new_size)
-        sal.file_size = new_size
+    """Get raw pointer into SAL at write cursor."""
+    # No growth check: file is ftruncate'd to SAL_MMAP_SIZE at startup.
     # Return pointer past the 8-byte size prefix (caller writes payload)
-    return rffi.ptradd(sal.ptr, sal.cursor + 8)
+    return rffi.ptradd(sal.ptr, sal.write_cursor + 8)
 
 def sal_commit(sal, actual_size):
-    """Finalize a direct write. Backfills size prefix, advances cursor."""
-    _write_u64(sal.ptr, sal.cursor, r_uint64(actual_size))
-    sal.cursor += 8 + _align8(actual_size)
-    eventfd_ffi.eventfd_signal(sal.efd)
+    """Finalize a direct write. Backfills size prefix, advances cursor.
+    Does NOT signal or fsync — caller does that after committing all data."""
+    _write_u64(sal.ptr, sal.write_cursor, r_uint64(actual_size))
+    sal.write_cursor += 8 + _align8(actual_size)
 ```
 
 This is the SAL equivalent of the ring's `reserve`/`commit` — without wrap
 detection, skip markers, or contiguous-space checks. The SAL is append-only;
-space is always available (the file grows if needed).
+space is always available (the file is pre-sized to `SAL_MMAP_SIZE`). The
+master calls `fdatasync_c` after `sal_commit`, then signals workers via
+eventfd.
 
 #### `wal_columnar.py` new function
 
@@ -675,9 +745,9 @@ def encode_batch_gather(dest_ptr, max_size, schema, src_batch, indices,
 #### `ipc.py` / `exchange.py` new function
 
 ```python
-def scatter_to_sals(batch, sals, num_workers, assignment, schema,
-                    target_id, flags):
-    """Classify by partition + gather-encode directly into N SALs."""
+def scatter_encode_to_sal(sal, batch, num_workers, assignment, schema,
+                          target_id, lsn, flags):
+    """Classify by partition + gather-encode all workers into single SAL."""
     n = batch.length()
 
     # Pass 1: classify rows by partition (256-way)
@@ -686,7 +756,8 @@ def scatter_to_sals(batch, sals, num_workers, assignment, schema,
         p = _partition_for_key(batch._read_pk_lo(i), batch._read_pk_hi(i))
         part_lists[p].append(i)
 
-    # Pass 2: gather-encode per worker (partition-sorted with boundary table)
+    # Pass 2: encode per-worker data into temporary buffers
+    worker_bufs = []
     for w in range(num_workers):
         indices = newlist_hint(n // num_workers)
         boundaries = newlist_hint(65)  # up to 64 partitions + sentinel
@@ -697,14 +768,21 @@ def scatter_to_sals(batch, sals, num_workers, assignment, schema,
         boundaries.append(len(indices))  # sentinel
 
         if len(indices) == 0:
-            ipc.send_to_sal(sals[w], target_id, None, schema=schema, flags=flags)
+            worker_bufs.append((lltype.nullptr(rffi.CCHARP.TO), 0))
             continue
 
-        max_size = _estimate_encoded_size(schema, len(indices), batch)
-        dest_ptr = sal_get_write_ptr(sals[w], max_size)
-        actual = _encode_full_message(dest_ptr, max_size, target_id, schema,
-                                      batch, indices, boundaries, flags)
-        sal_commit(sals[w], actual)
+        buf = _encode_worker_data(schema, batch, indices, boundaries,
+                                  target_id, flags)
+        worker_bufs.append((buf.base_ptr, buf.offset))
+
+    # Pass 3: write single message group into SAL
+    ipc.write_message_group(sal, target_id, lsn, flags,
+                            worker_bufs, num_workers)
+
+    # Pass 4: free per-worker encode buffers
+    for wb in worker_bufs:
+        if wb[0]:
+            _free_buf(wb[0])
 ```
 
 `_estimate_encoded_size`: for fixed-width columns, exact. For string columns,
@@ -716,47 +794,49 @@ for partition-sorted data.
 
 #### `master.py` changes
 
-`fan_out_push` and `fan_out_ingest` call `scatter_to_sals` instead of
-`repartition_batch` + N × `send_to_sal`.
+`fan_out_push` and `fan_out_ingest` call `scatter_encode_to_sal` instead of
+`repartition_batch` + N × `send_batch`. After the encode, master calls
+`fdatasync_c(sal.fd)` once, then signals all workers via eventfd.
 
-### 2c: Per-worker unified WAL (file-backed SAL)
+### 2c: Single unified WAL (file-backed SAL)
 
-The SAL file IS the WAL. The master appends gather-encoded data into the
-file-backed mmap. The worker calls `fdatasync()` to flush dirty pages. On
-crash, the SAL file contains all messages since the last checkpoint.
+The single SAL file IS the WAL for all workers. The master appends
+gather-encoded message groups into the file-backed mmap and calls
+`fdatasync()` before signaling workers. On crash, the SAL file contains all
+message groups since the last checkpoint.
 
 No separate `WorkerWAL` class. No `append_and_map`. No per-push `mmap()`.
-The SAL and its backing file are the entire WAL implementation.
+No worker-side fsync. The SAL and its backing file are the entire WAL
+implementation.
 
 #### `mmap_posix.py` changes
 
-`fdatasync_c`, `fallocate_c`, `mmap_anonymous_shared`, `madvise_dontneed`
-(see Step 1).
+`fdatasync_c`, `mmap_anonymous_shared`, `madvise_dontneed` (see Step 1).
 
 #### `worker.py` changes
 
-`WorkerProcess.__init__` stores the SAL's backing fd:
-
-```python
-self.wal_sal_fd = wal_sal_fd  # for fdatasync
-```
-
-The hot path in `_handle_push` calls `fdatasync_c` then uses the existing
-`ingest_to_family` + `upsert_batch` path (see 2a worker push hot path above).
+No SAL fd stored — the worker doesn't fsync. It only reads from the
+inherited mmap.
 
 #### Recovery
 
-On worker startup (or crash recovery):
+On worker startup (or crash recovery), each worker scans the shared SAL
+file and extracts its own data from message group headers:
 
 ```python
-def recover_from_sal(wal_path, engine, assignment, worker_id):
+def recover_from_sal(sal_path, engine, assignment, worker_id):
     """Replay a file-backed SAL after crash.
 
-    The SAL is an append-only sequence of messages. Each message has an
-    8-byte size prefix followed by WAL-block encoded payload. Scan forward
-    from offset 0, replaying valid blocks with LSN > last flushed.
+    The SAL is an append-only sequence of message groups. Each group has an
+    8-byte size prefix followed by a group header (with per-worker offsets)
+    and per-worker WAL-block encoded payloads. Scan forward from offset 0,
+    extracting this worker's data and replaying blocks with LSN > last flushed.
+
+    After a cursor-reset checkpoint, old-epoch groups may exist at higher
+    offsets. These are skipped by the LSN filter (all old-epoch LSNs <=
+    last_flushed_lsn because checkpoint requires all partitions flushed).
     """
-    fd = rposix.open(wal_path, os.O_RDONLY, 0)
+    fd = rposix.open(sal_path, os.O_RDONLY, 0)
     try:
         file_size = intmask(mmap_posix.fget_size(fd))
         if file_size == 0:
@@ -773,50 +853,93 @@ def recover_from_sal(wal_path, engine, assignment, worker_id):
 
 
 def _scan_and_replay(ptr, file_size, engine, assignment, worker_id):
-    """Sequential scan of append-only SAL. O(data), not O(capacity)."""
+    """Sequential scan of append-only SAL. O(file_size) header reads."""
     offset = 0
+    flushed_lsn = _last_flushed_lsn(engine, assignment, worker_id)
     while offset + 8 <= file_size:
         msg_size = _read_u64(ptr, offset)
         if msg_size == 0:
-            break  # zero padding — end of valid data
+            break  # zero padding or end of valid data
         if offset + 8 + intmask(msg_size) > file_size:
-            break  # truncated message — crash during write
-        data_ptr = rffi.ptradd(ptr, offset + 8)
-        valid, lsn = _try_parse_and_validate(data_ptr, intmask(msg_size))
-        if not valid:
-            break  # corrupt block — crash during write, stop here
-        if lsn > _last_flushed_lsn(engine, assignment, worker_id):
-            _replay_block(data_ptr, intmask(msg_size), engine,
-                          assignment, worker_id)
+            break  # truncated group — crash during write
+
+        group_ptr = rffi.ptradd(ptr, offset + 8)
+
+        # Extract this worker's data from the message group
+        my_offset = _read_worker_offset(group_ptr, worker_id)
+        my_size = _read_worker_size(group_ptr, worker_id)
+
+        if my_size > 0:
+            my_ptr = rffi.ptradd(group_ptr, my_offset)
+            valid, lsn = _try_parse_and_validate(my_ptr, my_size)
+            if not valid:
+                break  # corrupt block — crash during write, stop here
+            if lsn > flushed_lsn:
+                _replay_block(my_ptr, my_size, engine,
+                              assignment, worker_id)
+            # else: old-epoch data (post cursor-reset) — skip
+
         offset += 8 + _align8(intmask(msg_size))
 ```
 
-Key difference from ring recovery: the scan is sequential, forward-only, and
-stops at the first invalid block. No circular scanning, no handling of
-partially overwritten regions, no sorting by LSN. The append-only invariant
-means all valid blocks are in order.
+Key properties:
+- Forward-only sequential scan. No circular scanning.
+- Each worker extracts its own data via group header offsets.
+- LSN filter handles cursor-reset epochs: after checkpoint, old groups
+  have LSN <= flushed_lsn and are skipped. New groups are replayed.
+- Scan cost: O(file_size) header reads. For 100 MB file: ~1 ms.
 
 #### Checkpoint / SAL reset
 
-The SAL can be reset when all partition memtables have flushed to shards.
-The worker tracks this via partition manifest LSNs:
+The SAL can be reset when ALL workers have flushed ALL partition memtables
+to shards. Checkpoint is cursor-reset only — no file operations.
+
+**Worker side**: after each flush cycle, the worker checks whether all its
+partitions have flushed since the last cursor reset. If so, it sets
+`FLAG_CHECKPOINT` on its next ACK:
 
 ```python
-def checkpoint_if_possible(self):
-    """Reset SAL when all partitions are flushed past all SAL entries."""
-    if self._all_partitions_flushed():
-        # Truncate to 0, then re-allocate initial size.
-        # Both master and worker reset their cursors to 0.
-        rposix.ftruncate(self.wal_sal_fd, 0)
-        mmap_posix.fallocate_c(self.wal_sal_fd, INITIAL_SAL_SIZE)
-        self.m2w_sal.cursor = 0
-        # Signal master to reset its write cursor for this worker.
-        ipc.send_to_sal(self.w2m_sal, 0, None,
-                        flags=ipc.FLAG_CHECKPOINT)
+# In worker ACK path:
+ack_flags = 0
+if self._all_partitions_flushed_since_reset():
+    ack_flags |= ipc.FLAG_CHECKPOINT
+    self.read_cursor = 0       # reset own read cursor
+    self._mark_checkpoint()    # record epoch boundary
+ipc.send_to_sal(self.w2m_sal, target_id, None, flags=ack_flags)
 ```
 
-On the master side, receiving `FLAG_CHECKPOINT` resets the corresponding
-`m2w_sal.cursor = 0` and `m2w_sal.file_size = INITIAL_SAL_SIZE`.
+**Master side**: in `_collect_acks_and_relay`, the master tracks which
+workers have checkpointed. When ALL N workers have sent `FLAG_CHECKPOINT`,
+the master resets its write cursor:
+
+```python
+# In _collect_acks_and_relay:
+if payload.flags & ipc.FLAG_CHECKPOINT:
+    checkpoint_count += 1
+# After all ACKs collected:
+if checkpoint_count == self.num_workers:
+    self.sal.write_cursor = 0    # reset — one integer assignment
+```
+
+**What this does NOT do:**
+- No `ftruncate`. No `fallocate`. No `punch_hole`. The file stays at
+  `SAL_MMAP_SIZE` (1 GB sparse). After cursor reset, the master overwrites
+  from offset 0.
+- No separate checkpoint message. The flag piggybacks on the existing ACK.
+- No coordination race. The master processes the ACK (with checkpoint flag)
+  before writing the next message group. By the time the master writes at
+  offset 0, all workers have already reset their read cursors to 0.
+
+**Disk space**: the SAL file is always `SAL_MMAP_SIZE` apparent size (sparse).
+Physical block usage equals the high-water mark of written data. For typical
+workloads: ~100 MB of physical blocks, matching the current 64 per-partition
+WALs. After cursor reset, subsequent writes reuse already-allocated blocks.
+
+**Recovery correctness after cursor reset**: new-epoch groups (written after
+reset at lower offsets) have LSN > flushed_lsn → replayed. Old-epoch groups
+(at higher offsets, not yet overwritten) have LSN <= flushed_lsn → skipped
+by LSN filter. No sentinel or epoch marker needed — the LSN is already in
+every WAL block header.
 
 #### `table.py` changes
 
@@ -1099,24 +1222,27 @@ Per exchange barrier, 4 workers, 10-column I64 schema, ~25 MB total:
 | Physical memory at rest | 256 MB (fixed alloc) | **0** (demand-paged + MADV_DONTNEED) |
 
 ### Files changed (Step 2, all sub-steps)
-- `gnitz/server/main.py`: SAL + eventfd + exchange arena allocation before
-  fork, pass to workers
-- `gnitz/server/ipc.py`: `send_to_sal`, `receive_from_sal`, `_parse_from_ptr`,
-  `_encode_wire`, `scatter_to_sals`, `_encode_full_message`, `_estimate_encoded_size`,
-  `FLAG_PARTITION_SORTED`, `FLAG_EXCHANGE_READY`, `FLAG_EXCHANGE_BARRIER`,
-  `FLAG_EXCHANGE_CONSUMED`, `FLAG_CHECKPOINT`; `IPCPayload._pending_sal` field +
-  cursor advance in `close()`; `SharedAppendLog` class
-- `gnitz/server/master.py`: fan_out/push methods use SAL send/recv;
-  `scatter_to_sals` for push; `_collect_acks_and_relay` replaced by
-  `_collect_and_barrier` (barrier coordination only, no data relay);
-  `_relay_exchange` deleted
-- `gnitz/server/worker.py`: main loop uses SAL; push path uses `fdatasync_c`
-  then existing `ingest_to_family` / `upsert_batch`;
+- `gnitz/server/main.py`: single SAL + per-worker w2m + eventfd + exchange
+  arena allocation before fork, pass to workers
+- `gnitz/server/ipc.py`: `write_message_group`, `read_worker_message`,
+  `_parse_from_ptr`, `_encode_wire`, `scatter_encode_to_sal`,
+  `_encode_worker_data`, `_estimate_encoded_size`, `FLAG_PARTITION_SORTED`,
+  `FLAG_EXCHANGE_READY`, `FLAG_EXCHANGE_BARRIER`, `FLAG_EXCHANGE_CONSUMED`,
+  `FLAG_CHECKPOINT`, `FLAG_SCAN_DONE`, `read_raw_from_sal`;
+  `SharedAppendLog` class (single file)
+- `gnitz/server/master.py`: fan_out/push methods use single SAL with
+  `scatter_encode_to_sal` + `fdatasync_c` + eventfd signal;
+  `fan_out_scan_stream` raw-forwards per-worker scan results to client;
+  `_collect_acks_and_relay` handles `FLAG_CHECKPOINT` (cursor reset when all
+  workers checkpointed); `_collect_and_barrier` replaces `_relay_exchange`
+  (barrier coordination only, no data relay); `_relay_exchange` deleted
+- `gnitz/server/worker.py`: main loop reads from shared SAL mmap; push path
+  uses existing `ingest_to_family` / `upsert_batch` (no worker-side fsync);
   `WorkerExchangeHandler` rewritten to use shared arena (local repartition +
   scatter-encode + barrier + clone-from-arena);
-  checkpoint logic (reset SAL on full flush)
+  checkpoint: set `FLAG_CHECKPOINT` on ACK when all partitions flushed
 - `gnitz/server/eventfd_ffi.py`: `eventfd_wait_any`
-- `gnitz/storage/mmap_posix.py`: `mmap_anonymous_shared`, `fallocate_c`,
+- `gnitz/storage/mmap_posix.py`: `mmap_anonymous_shared`,
   `fdatasync_c`, `madvise_dontneed`
 - `gnitz/storage/wal_columnar.py`: `encode_batch_gather`
 - `gnitz/storage/table.py`: `PersistentTable` no longer creates per-partition
@@ -1152,9 +1278,11 @@ per-chunk re-encoding — substantial complexity for what is fundamentally a
 "send big blob in pieces" problem.
 
 SOCK_STREAM has **no message size limit**. Adding a trivial 4-byte length
-prefix provides the same framing guarantee as SEQPACKET. The request/
-response protocol is strictly serial (one request, one response, no
-pipelining), so STREAM's lack of message boundaries is harmless.
+prefix provides the same framing guarantee as SEQPACKET. The protocol is
+strictly serial per connection. For scan results in multi-worker mode, the
+master streams N per-worker results as separate framed messages followed by
+a `FLAG_SCAN_DONE` sentinel (see Step 2a "Streaming scan forwarding"). The
+client reads framed messages in a loop until it sees the sentinel.
 
 This eliminates `slice_view`, `FLAG_MORE`, `_send_chunked`, per-chunk
 encoding, and client-side reassembly logic — replaced by 8 lines of C.
@@ -1333,9 +1461,12 @@ mixed-version support needed (gnitz is not yet released).
   from `serialize_to_memfd`)
 - `gnitz/server/ipc_ffi.py`: `gnitz_server_create_stream`, `gnitz_send_framed`,
   `gnitz_recv_framed`, `gnitz_send_all`, `gnitz_recv_all`
-- `gnitz/server/executor.py`: client handling switched to `send_framed`/`recv_framed`
+- `gnitz/server/executor.py`: client handling switched to `send_framed`/
+  `recv_framed`; multi-worker scans call `fan_out_scan_stream(client_fd)`
+  instead of `fan_out_scan` + `send_batch`
 - `rust_client/gnitz-protocol/src/transport.rs`: drop memfd, switch to
-  `SOCK_STREAM` + length-prefixed framing
+  `SOCK_STREAM` + length-prefixed framing; scan responses: read framed
+  messages in loop until `FLAG_SCAN_DONE` sentinel
 
 ### Deleted (vs. original plan)
 - `slice_view` in `batch.py` — not needed
@@ -1518,10 +1649,10 @@ Step 1   eventfd_ffi.py: eventfd helpers + mmap additions
          Changed: gnitz/storage/mmap_posix.py
          Test: make prove-eventfd
 
-Step 2   Internal IPC overhaul (SAL transport + file-backed WAL + exchange arena)
-  2a     SAL transport: master ↔ worker via shared append-only log + fdatasync
+Step 2   Internal IPC overhaul (single SAL + unified WAL + exchange arena)
+  2a     SAL transport: single file, master-owned fdatasync, eventfd signals
   2b     Gather-encode into SAL (SoA-aware scatter, partition-sorted)
-  2c     File-backed SAL (recovery, checkpoint, table.py changes)
+  2c     Unified WAL (recovery with LSN filter, cursor-reset checkpoint)
   2d     Shared exchange arena: demand-paged 1 GB slots, MADV_DONTNEED
          Changed: main.py, ipc.py, master.py, worker.py, eventfd_ffi.py
          Changed: mmap_posix.py, wal_columnar.py, table.py
@@ -1564,12 +1695,18 @@ Per `fan_out_push`, 10-column I64 schema, M=1000 rows, N=4 workers,
 
 | Step | Master | Worker | Total |
 |---|---|---|---|
-| Current | gather + encode + memmove-to-memfd (3×) | partition-split + WAL-encode + memtable-clone (3×) | 6× |
-| After Step 2a | gather + encode + SAL-write (3×) | fdatasync + clone into memtable (1×) | 4× |
-| After Step 2b | gather-encode into SAL (1×) | fdatasync + clone into memtable (1×) | **2×** |
+| Current | gather + encode + memmove-to-memfd (3×) | partition-split + WAL-encode + WAL-write + memtable-clone (4×) | 8× (see note) |
+| After Step 2a | gather + encode + SAL-write (3×) | clone into memtable (1×) | 4× |
+| After Step 2b | gather-encode into SAL (1×) | clone into memtable (1×) | **2×** |
 
 After Step 2 complete: **2 user-space copies**: the fused gather-encode into the
 SAL (master), and the clone from SAL mmap into owned memtable batch (worker).
+
+Note: current worker 4× = partition re-split (1×, re-hashing + per-column
+gather) + WAL encode (1×, encode_batch_to_buffer) + WAL write (1×, kernel
+copy) + memtable clone (1×, to_sorted or explicit clone in upsert_batch).
+Current master 3× = repartition gather (1×) + IPC encode into wire_buf (1×)
++ memmove wire_buf→memfd (1×). Client-side encode adds 1× on the client.
 
 ### Syscalls
 
@@ -1577,19 +1714,19 @@ Per round-trip (4 workers, no exchange):
 
 | | Current | After Step 2 | After Step 3 | After Step 5 |
 |---|---|---|---|---|
-| Master→Worker transport | 96 (4×11×2) | 8 (4×eventfd×2) | 8 | 8 |
+| Master→Worker transport | ~128 (send: 4×11, recv: 4×5, ×2 dirs) | 9 (4×eventfd_signal + 1×wait_any + 4×eventfd_signal) | 9 | 9 |
 | Client↔Server transport | 22 (2×11) | 22 (unchanged) | 4 (send+recv×2) | ~2 (io_uring) |
 | WAL write() | 256 | **0** (mmap writes) | 0 | 0 |
-| WAL fdatasync() | 256 | **4** | 4 | 4 |
-| **Total** | **~630** | **~34** | **~16** | **~14** |
+| WAL fdatasync() | 256 | **1** (master, single file) | 1 | 1 |
+| **Total** | **~662** | **~32** | **~14** | **~12** |
 
 ### Fsync reduction detail
 
 | | Current | After Step 2 |
 |---|---|---|
-| Fsyncs per worker per push | 64 (one per partition) | **1** (one per worker) |
-| Total fsyncs (4 workers) | 256 | **4** |
-| Wall-clock @ 0.5ms/fsync | 128ms (serial within worker) | **2ms** |
+| Fsyncs per push | 256 (64 per worker × 4 workers) | **1** (master, single SAL file) |
+| NVMe flush commands per push | 256 | **1** |
+| Wall-clock @ 0.5ms/fsync | 128ms (serial within each worker) | **0.5ms** |
 
 ---
 
@@ -1601,7 +1738,7 @@ The clone from SAL mmap into owned memtable batch is a sequential memcpy
 per column buffer plus string relocation for blob arenas. For typical push
 sizes (100–10K rows), this is 10 μs – 1 ms. For the largest pushes (100K+
 rows), it can reach a few milliseconds. This is negligible compared to the
-eliminated 64× fsync cost (128 ms → 2 ms).
+eliminated 256× fsync cost (128 ms → 0.5 ms).
 
 The clone also includes sorting (the batch arrives partition-sorted, not
 globally PK-sorted; `upsert_batch` calls `to_sorted()`). For N rows, this is
@@ -1625,34 +1762,45 @@ else:
 
 ### Recovery complexity
 
-SAL recovery scans one append-only file per worker. The scan is sequential
-from offset 0: read the 8-byte size prefix, validate the WAL block checksum,
-replay if LSN > last flushed. Stop at the first zero or invalid block.
-O(data), not O(capacity). No circular scanning, no handling of partially
-overwritten regions. A 100 MB SAL with 10 MB of valid data takes ~1 ms.
+SAL recovery scans one file (shared by all workers). Each worker reads
+message group headers, extracts its own data via `worker_offsets[my_id]`,
+and replays blocks with LSN > last_flushed_lsn. After a cursor-reset
+checkpoint, old-epoch groups at higher offsets are skipped by the LSN filter
+(all old-epoch LSNs <= flushed_lsn because checkpoint requires all
+partitions flushed). No circular scanning, no sentinel markers.
+
+Scan cost: O(file_size) header reads. For a 100 MB file: ~1 ms (reading
+~48 bytes per group header, jumping by total_size). Acceptable as a
+one-time startup cost.
 
 ### Checkpoint latency
 
-The SAL can be reset when all partitions have flushed past all SAL entries.
+The SAL can be reset when ALL workers have flushed ALL partition memtables.
 Unlike per-partition WALs (which truncate independently), this is
 all-or-nothing. A slow/idle partition holds the SAL from being reset.
 
-Mitigation: with hash-based partitioning, all 64 partitions receive roughly
-equal data and flush at roughly the same cadence. The SAL file grows by the
-total unflushed data volume — the same total as the current 64 per-partition
-WALs, just consolidated into one file. Checkpoint resets it to the initial
-16 MB.
+Mitigation: with hash-based partitioning, all partitions receive roughly
+equal data and flush at roughly the same cadence. Physical block usage in the
+SAL equals the total unflushed data volume — the same total as the current 64
+per-partition WALs per worker, just consolidated into one file. Checkpoint
+resets the cursor to 0 (no file operations).
 
-### SAL file growth
+### SAL file size
 
-The SAL file grows between checkpoints as messages accumulate. With 1000
-pushes of 100 KB each: 100 MB per worker. This matches the current 64
-per-partition WALs (64 × ~1.6 MB = ~102 MB). On checkpoint (all partitions
-flushed), the file is truncated and re-allocated to 16 MB.
+The SAL file is created at `SAL_MMAP_SIZE` (1 GB) via `ftruncate` — a sparse
+file where only written blocks consume physical disk space. `ls -l` shows
+1 GB; `du -h` shows actual usage (~100 MB for typical workloads). On
+checkpoint, the cursor resets to 0 and the same blocks are reused. No
+dynamic growth, no file operations, no size tracking.
 
-The 1 GB mmap virtual mapping accommodates growth without remapping. If
-growth exceeds 1 GB (pathological: 1 GB of unflushed data per worker), the
-worker forces a checkpoint (flush all memtables, truncate SAL).
+Physical block usage between checkpoints matches the current per-partition
+WALs (4 workers × 64 partitions × ~0.4 MB = ~102 MB), just consolidated
+into one file. After cursor reset, subsequent writes reuse already-allocated
+blocks — no new allocation overhead on fdatasync.
+
+If `write_cursor` approaches `SAL_MMAP_SIZE` (pathological: 1 GB of
+unflushed data), the master forces a coordinated checkpoint (signal all
+workers to flush, wait for `FLAG_CHECKPOINT` from all, reset cursor).
 
 ---
 
@@ -1702,11 +1850,11 @@ See Step 3 for full design.
 **Original problem**: a fixed-size ring buffer had ~15.5 MB effective capacity
 (16 MB minus skip-marker waste at the wrap point). Large pushes could not fit.
 
-**Solution**: the SAL is append-only with file growth on demand via
-`ftruncate`. The 1 GB virtual mmap covers growth without remapping (Linux
-`ftruncate` on a MAP_SHARED file makes new pages accessible at fault time —
-standard LMDB/SQLite technique). No message size limit. No skip markers.
-No wrap-around.
+**Solution**: the SAL file is `ftruncate`'d to `SAL_MMAP_SIZE` (1 GB) at
+startup as a sparse file. The mmap covers the full file. No growth path, no
+dynamic `ftruncate`, no size tracking. No message size limit. No skip
+markers. No wrap-around. If `write_cursor` approaches `SAL_MMAP_SIZE`, the
+master forces a coordinated checkpoint (reset cursor to 0).
 
 See "Why not a ring buffer?" in Key Insight.
 
@@ -1738,73 +1886,157 @@ only needs to validate the tail block (which may be partially written due to
 crash). False positives in overwritten regions are impossible because there
 are no overwritten regions.
 
+### 6. fdatasync cross-process ordering — RESOLVED
+
+**Original problem**: the initial design had workers calling `fdatasync` on
+the SAL to flush pages dirtied by the master (via the shared MAP_SHARED
+mmap). This relies on Linux page cache semantics (fdatasync on any fd for the
+same inode flushes all dirty pages for that inode) which is standard Linux
+behavior but not POSIX-guaranteed. The proposed startup self-test (kill -9 +
+restart) was also flawed — it tests persistence of the file, not cross-process
+flush ordering.
+
+**Solution**: single SAL file with master-owned fdatasync. The master writes
+all worker messages into one SAL file and calls `fdatasync` once — on its own
+writes, which is POSIX-guaranteed. Workers only read the SAL (via MAP_SHARED).
+The eventfd signal from master to worker provides the memory ordering guarantee
+(eventfd_read is a full memory barrier).
+
+This eliminates the cross-process fsync assumption entirely. It also reduces
+NVMe flush commands from N (one per worker) to 1 (one fdatasync on one file),
+and provides natural group commit — all workers' data is durable after one
+flush.
+
+### 7. Checkpoint coordination SIGBUS race — RESOLVED
+
+**Original problem**: the checkpoint sequence required the worker to truncate
+the SAL file, then signal the master to reset its write cursor. If the master
+sent a new message between the worker's truncation and receiving the
+checkpoint signal, the master would write beyond the file size into a
+truncated MAP_SHARED mapping → SIGBUS.
+
+**Solution**: cursor-reset only (no file operations). The SAL file is never
+truncated. On checkpoint:
+
+1. Worker detects all its partitions have flushed since the last cursor reset.
+2. Worker piggybacks `FLAG_CHECKPOINT` on its normal ACK (not a separate
+   message or phase).
+3. Master collects ACKs. When all N workers have sent `FLAG_CHECKPOINT`,
+   master resets `sal.write_cursor = 0`.
+4. Old-epoch data at higher offsets is harmless — recovery skips it via LSN
+   filtering (all old-epoch LSNs ≤ `last_flushed_lsn` because checkpoint
+   requires all partitions flushed).
+
+Zero file operations. Zero SIGBUS risk. Zero additional syscalls. The
+request/response structure provides natural coordination: when the worker
+sends its ACK, the master has not yet written the next message, so there is
+no race.
+
+### 8. SAL file pre-allocation on non-ext4/xfs — RESOLVED
+
+**Original problem**: `posix_fallocate` may fall back to a slow write-zeroes
+loop on filesystems that don't support `fallocate(2)` natively (e.g., ZFS,
+NFS). The proposed mitigation — "check return code for `EOPNOTSUPP`" — was
+wrong: `posix_fallocate` is a libc wrapper that silently falls back and
+returns 0 regardless of mechanism.
+
+**Solution**: eliminate `fallocate` entirely. The SAL file is `ftruncate`'d
+to `SAL_MMAP_SIZE` (1 GB) at startup as a sparse file. `ftruncate` is
+POSIX.1-2001 — works on every filesystem, takes ~1 μs regardless of file
+size (only modifies inode metadata). Physical blocks are allocated on first
+write by the filesystem (demand paging). Block allocation cost at fdatasync
+time is ~1-2 μs per 4 KB block (~50 μs for a 100 KB push) — negligible
+compared to the NVMe flush command (100-10,000 μs). After one cursor-reset
+cycle, all blocks below the high-water mark are already allocated, so
+subsequent writes never allocate.
+
+- **Deleted**: `fallocate_c` in `mmap_posix.py` (not needed anywhere)
+- **Deleted**: `INITIAL_SAL_SIZE` constant
+- **Deleted**: `SharedAppendLog.file_size` field
+- **Deleted**: growth conditional in `write_message_group`
+- **Deleted**: `_next_power_of_2` helper
+- **Works on ALL POSIX filesystems**: no `fallocate(2)` dependency
+
+### 9. W2M region sizing for large scan results — RESOLVED
+
+**Original problem**: the W2M region (1 GB demand-paged) might be exceeded
+by large scan results. With 10-column I64 schema and 10M rows: "~800 MB
+encoded."
+
+**The premise was wrong.** The W2M region carries ONE worker's result, not
+all workers combined. With hash partitioning and N workers, each worker's
+share is ~total/N. For 10M total rows with 4 workers: ~2.5M rows per worker
+= ~260 MB encoded — well within 1 GB. For the W2M region to overflow, a
+single worker would need >9.6M rows, implying >38M total rows (~4 GB of raw
+data). At that scale the system is memory-bound regardless.
+
+**The real constraint was the master's memory.** The master accumulated all
+workers' results into a combined `ArenaZSetBatch` (~1 GB) and re-encoded it
+into a `wire_buf` (~1 GB). Peak master memory for a 10M-row scan: ~2 GB.
+Every byte was decoded, copied, and re-encoded — 3 unnecessary passes over
+data the master never inspects.
+
+**Solution**: streaming scan forwarding (see Step 2a). The master
+raw-forwards each worker's W2M output directly to the client as a separate
+framed message. No decode, no accumulate, no re-encode. Master peak memory:
+O(1). The client receives N framed messages + 1 `FLAG_SCAN_DONE` sentinel
+and concatenates locally.
+
+- **W2M region stays at 1 GB**: sufficient for any in-memory workload
+- **Master memory for scans**: O(1) regardless of result size
+- **Copy reduction**: eliminates ~3 GB of unnecessary master-side copies for
+  a 10M-row scan (decode + accumulate + re-encode → 0)
+- **Client protocol change**: scan responses become N+1 framed messages
+  (per-worker result × N + sentinel), handled as part of Step 3
+
+See Step 2a "Streaming scan forwarding" for design.
+
 ---
 
 ## Open Issues
 
-### 1. `posix_fallocate` on all filesystems
+### 1. Worker-side partition boundary routing
 
-`posix_fallocate` may fall back to a slow write-zeroes loop on filesystems that
-don't support `fallocate(2)` natively (e.g., ZFS, some NFS mounts). The SAL
-file is created once at startup and grown rarely (only for oversized pushes),
-so this is not a hot-path concern, but it could cause a surprising
-multi-second delay on first server start.
-
-Mitigation: detect the fallback (check return code for `EOPNOTSUPP` from the
-underlying `fallocate(2)` syscall) and fall back to `ftruncate` + explicit
-`mmap(MAP_POPULATE)` to fault in pages eagerly. Or simply document that
-ext4/xfs/btrfs are the supported filesystems.
-
-### 2. Master fdatasync ordering guarantee
-
-The claim that `fdatasync(fd)` on the worker flushes pages dirtied by the
-master (via the shared MAP_SHARED mmap) relies on Linux page cache semantics:
-MAP_SHARED pages are in the page cache, and `fdatasync` on any fd referring to
-the same inode flushes all dirty pages for that inode.
-
-This is standard Linux behavior (used by LMDB, SQLite WAL mode, etc.) but is
-not POSIX-guaranteed. The implementation should include a startup self-test:
-master writes a known pattern to the SAL, worker fsyncs, both processes verify
-the pattern survives a simulated crash (kill -9 + restart).
-
-### 3. Checkpoint coordination protocol
-
-The checkpoint sequence (worker detects all partitions flushed → truncates SAL
-→ signals master to reset write cursor) requires both sides to agree on the
-reset atomically. If the master sends a new message between the worker's
-truncation and the master receiving the checkpoint signal, the master writes
-into a truncated file. The protocol must ensure no in-flight writes exist
-when the SAL resets.
-
-The request/response structure provides a natural coordination point: the
-worker only checkpoints between request processing (after ACK, before the
-next receive). At that moment, the master is blocked waiting for the ACK
-and has not yet written the next message. The checkpoint signal travels via
-the w2m SAL, which the master reads before writing the next m2w message.
-So the ordering is:
+Step 2b describes encoding partition boundary tables into the SAL message so
+workers can avoid re-hashing. The master's `scatter_encode_to_sal` pre-sorts
+rows by partition and writes per-worker sub-batches with a boundary region:
 
 ```
-Worker: process push → ACK → detect flush → truncate SAL → send CHECKPOINT
-Master: receive ACK → receive CHECKPOINT → reset write cursor → send next push
+[boundary_table: N_partitions × 8 bytes]
+  u32 partition_id
+  u32 row_offset
 ```
 
-This is safe because the master processes the CHECKPOINT before writing the
-next message. But the implementation must ensure the CHECKPOINT flag is
-checked in the ACK-receive loop (not a separate poll phase) so it's
-processed atomically with the ACK sequence.
+However, the worker-side code path is underspecified. Currently, worker
+`_handle_push` calls `ingest_to_family` → `PartitionedTable.ingest_batch`,
+which re-hashes every row to determine its partition. For the SAL's 2× copy
+claim to hold, the worker must use the boundary table to route rows directly
+to partition sub-stores without re-hashing.
 
-### 4. W2M region sizing for large scan results
+**Option A (recommended): Boundary-aware ingest method.** Add
+`PartitionedTable.ingest_batch_presorted(batch, boundaries)` that reads the
+boundary table and slices the batch into partition ranges:
 
-The worker→master region uses anonymous shared memory (1 GB demand-paged).
-Large scan results (full table scan with millions of rows) are written as
-a single message. With 10-column I64 schema and 10M rows: ~800 MB encoded.
-This fits within 1 GB but leaves little headroom.
+```python
+def ingest_batch_presorted(self, batch, boundaries):
+    for i in range(len(boundaries)):
+        part_id, start = boundaries[i]
+        end = boundaries[i+1][1] if i+1 < len(boundaries) else batch.length()
+        self.partitions[part_id].ingest_batch_range(batch, start, end)
+```
 
-For most schemas and workloads, 1 GB is generous. If a scan result exceeds
-the mapping: the worker could chunk the result into multiple messages (with a
-continuation flag), or the mapping could be sized larger (2 GB virtual is
-still negligible). The simplest approach is to document the limit and size
-the mapping to 2 GB.
+This avoids re-hashing but requires a new code path in PartitionedTable.
+The boundary table is small (64 entries × 8 bytes = 512 bytes) and already
+computed during master-side scatter-encode.
+
+**Option B (rejected): Single-partition messages.** Encoding one SAL message
+per worker per partition (64 messages per worker instead of 1) defeats the
+SAL's "one group per push" design. It inflates the message group header
+(64× more offset/size entries), increases SAL scan cost on recovery, and
+adds 64 header parses per worker per push. The complexity gain from
+eliminating boundary tables is not worth the throughput regression.
+
+Decision: Option A. Implementation deferred.
 
 ---
 
@@ -1812,7 +2044,8 @@ the mapping to 2 GB.
 
 - Linux kernel >= 6.0 (for io_uring multishot accept). Current target: 6.18.
   Steps 1–3 work on any Linux kernel; only Step 5 requires io_uring.
-- Filesystem: ext4, xfs, or btrfs recommended (for native `fallocate` support).
+- Filesystem: ext4, xfs, or btrfs recommended (for sparse file and fdatasync
+  semantics). `ftruncate` is POSIX — no filesystem-specific dependency.
 - No external library dependencies (no liburing).
 - No `sysctl` tuning required (Step 3 uses SOCK_STREAM, which has no
   per-message size limit; the old `wmem_max` requirement is eliminated).
@@ -1826,6 +2059,7 @@ the mapping to 2 GB.
 - Does not change the storage engine's mmap-based shard read path
 - Does not add io_uring for WAL writes or shard file I/O (separate concern)
 - Does not add TCP/remote transport (SOCK_STREAM is AF_UNIX only)
-- Does not change the Rust client's synchronous request/response model
-- Does not change the single-process WAL path
+- Does not change the single-process WAL path or single-process scan path
 - Does not change MemTable, compaction, or any storage layer code
+- Scan streaming changes the client protocol for multi-worker scans only
+  (N+1 framed messages instead of 1); single-process scans are unchanged
