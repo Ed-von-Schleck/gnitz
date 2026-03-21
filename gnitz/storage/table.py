@@ -111,7 +111,8 @@ class PersistentTable(EphemeralTable):
         self.current_lsn += r_uint64(1)
 
         # Step 1: Write to Write-Ahead Log (Durability)
-        self.wal_writer.append_batch(lsn, self.table_id, batch)
+        if self._has_wal:
+            self.wal_writer.append_batch(lsn, self.table_id, batch)
 
         # Step 2: Write to MemTable (Visibility)
         # Guard against MemTableFullError: the WAL write above has already

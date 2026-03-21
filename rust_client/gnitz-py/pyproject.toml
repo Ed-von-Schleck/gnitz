@@ -14,6 +14,10 @@ classifiers      = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "maturin>=1.0,<2.0"]
 
+[tool.pytest.ini_options]
+markers = ["slow: large-scale / bulk tests (deselect with -m 'not slow')"]
+xfail_strict = true
+
 [tool.maturin]
 features       = ["pyo3/extension-module"]
 module-name    = "gnitz._native"

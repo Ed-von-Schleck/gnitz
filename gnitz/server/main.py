@@ -8,11 +8,15 @@ from rpython.rlib.rarithmetic import intmask
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz import log
+from rpython.rlib import rposix
+from rpython.rlib.rarithmetic import r_uint64
+
 from gnitz.catalog.engine import open_engine
+from gnitz.storage import mmap_posix
 from gnitz.storage.mmap_posix import raise_fd_limit
 from gnitz.catalog import system_tables as sys
 from gnitz.server.executor import ServerExecutor
-from gnitz.server import ipc_ffi
+from gnitz.server import ipc, ipc_ffi, eventfd_ffi, sal_ffi
 from gnitz.server.master import MasterDispatcher
 from gnitz.dbsp.ops.exchange import PartitionAssignment
 from gnitz.server.worker import WorkerProcess
@@ -68,6 +72,51 @@ def _trim_worker_partitions(engine, part_start, part_end):
     for family in engine.registry.iter_families():
         if family.table_id >= sys.FIRST_USER_TABLE_ID:
             family.store.close_partitions_outside(part_start, part_end)
+
+
+def _disable_worker_wal(engine):
+    """Disable per-partition WAL for user tables (SAL handles durability)."""
+    for family in engine.registry.iter_families():
+        if family.table_id >= sys.FIRST_USER_TABLE_ID:
+            family.store.set_has_wal(False)
+
+
+def _recover_from_sal(sal_ptr, engine, worker_id):
+    """Replay unflushed SAL push blocks for this worker's partitions."""
+    # Build per-family max_flushed_lsn map
+    family_lsns = {}
+    for family in engine.registry.iter_families():
+        tid = family.table_id
+        if tid >= sys.FIRST_USER_TABLE_ID:
+            family_lsns[tid] = family.store.get_max_flushed_lsn()
+
+    offset = 0
+    replayed = 0
+    while offset + 8 < ipc.SAL_MMAP_SIZE:
+        size = intmask(ipc._read_u64_raw(sal_ptr, offset))
+        if size == 0:
+            break
+        msg = ipc.read_worker_message(sal_ptr, offset, worker_id)
+        offset += msg.advance
+        if msg.payload is None:
+            continue
+        if not (msg.flags & ipc.FLAG_PUSH):
+            continue
+        tid = msg.target_id
+        if tid not in family_lsns:
+            continue
+        if msg.lsn <= family_lsns[tid]:
+            continue
+        b = msg.payload.batch
+        if b is not None and b.length() > 0:
+            family = engine.registry.get_by_id(tid)
+            owned = b.clone()
+            family.store.ingest_batch(owned)
+            owned.free()
+            replayed += 1
+
+    if replayed > 0:
+        os.write(1, "SAL recovery: replayed " + str(replayed) + " blocks\n")
 
 
 def _parse_workers(arg):
@@ -134,11 +183,48 @@ def entry_point(argv):
         ServerExecutor(engine).run_socket_server(socket_path)
         return 0
 
-    # Multi-worker mode: create socketpairs, fork workers
+    # Multi-worker mode: allocate shared resources, fork workers
     os.write(1, "Starting " + str(num_workers) + " workers\n")
     os.write(1, "Worker logs: " + data_dir + "/worker_N.log (N=0.."
              + str(num_workers - 1) + ")\n")
 
+    # --- Shared Append-Only Log (file-backed, master→all workers) ---
+    sal_path = data_dir + "/wal.sal"
+    sal_fd = rposix.open(sal_path, os.O_RDWR | os.O_CREAT, 0o644)
+    sal_ffi.try_set_nocow(sal_fd)
+    if intmask(mmap_posix.fget_size(sal_fd)) < ipc.SAL_MMAP_SIZE:
+        sal_ffi.fallocate_c(sal_fd, ipc.SAL_MMAP_SIZE)
+    sal_ptr = mmap_posix.mmap_file(
+        sal_fd, ipc.SAL_MMAP_SIZE,
+        prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
+        flags=mmap_posix.MAP_SHARED,
+    )
+    sal = ipc.SharedAppendLog(sal_ptr, sal_fd, ipc.SAL_MMAP_SIZE)
+
+    # --- W2M regions (memfd-backed, one per worker→master) ---
+    w2m_regions = []
+    for w in range(num_workers):
+        wfd = mmap_posix.memfd_create_c("w2m_%d" % w)
+        mmap_posix.ftruncate_c(wfd, ipc.W2M_REGION_SIZE)
+        wptr = mmap_posix.mmap_file(
+            wfd, ipc.W2M_REGION_SIZE,
+            prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
+            flags=mmap_posix.MAP_SHARED,
+        )
+        w2m_regions.append(ipc.W2MRegion(wptr, wfd, ipc.W2M_REGION_SIZE))
+
+    # --- Eventfds (cross-process signaling) ---
+    m2w_efds = [0] * num_workers
+    w2m_efds = [0] * num_workers
+    for w in range(num_workers):
+        m2w_efds[w] = eventfd_ffi.eventfd_create()
+        w2m_efds[w] = eventfd_ffi.eventfd_create()
+
+    os.write(1, "SAL fd=" + str(sal_fd) + "\n")
+    for w in range(num_workers):
+        os.write(1, "W" + str(w) + " m2w_efd=" + str(m2w_efds[w]) + " w2m_efd=" + str(w2m_efds[w]) + " w2m_fd=" + str(w2m_regions[w].fd) + "\n")
+
+    # --- Socketpairs (crash detection only — no data flows) ---
     parent_fds = [0] * num_workers
     child_fds = [0] * num_workers
     for w in range(num_workers):
@@ -153,10 +239,6 @@ def entry_point(argv):
         pid = os.fork()
         if pid == 0:
             # --- Child process ---
-            # Redirect stderr and stdout to a per-worker log file.
-            # stdout MUST be redirected: the parent captures it via a pipe
-            # with a finite buffer. Any accumulated writes to fd 1 will
-            # eventually fill the pipe and deadlock the worker.
             log_path = data_dir + "/worker_" + str(w) + ".log"
             try:
                 log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -170,23 +252,27 @@ def entry_point(argv):
             for j in range(num_workers):
                 os.close(parent_fds[j])
 
-            # Close child-side fds of other workers' socketpairs
+            # Close child-side fds and eventfds of OTHER workers
             for j in range(num_workers):
                 if j != w:
                     os.close(child_fds[j])
+                    rposix.close(m2w_efds[j])
+                    rposix.close(w2m_efds[j])
 
             my_fd = child_fds[w]
 
-            # Set active partition range so hooks only create owned partitions
+            # Set active partition range
             part_start, part_end = assignment.range_for_worker(w)
             engine.registry.active_part_start = part_start
             engine.registry.active_part_end = part_end
-
-            # Trim existing partitions to only this worker's range
             _trim_worker_partitions(engine, part_start, part_end)
 
-            # Discard any plans compiled before fork — workers recompile
-            # lazily with their own partition stores
+            # Disable per-partition WAL (SAL handles durability)
+            _disable_worker_wal(engine)
+
+            # SAL recovery — replay unflushed push data
+            _recover_from_sal(sal_ptr, engine, w)
+
             engine.program_cache.invalidate_all()
 
             os.write(
@@ -197,23 +283,24 @@ def entry_point(argv):
             )
 
             log.set_process_tag("W" + str(w))
-            WorkerProcess(w, my_fd, engine, part_start, part_end).run()
+            WorkerProcess(w, my_fd, engine, part_start, part_end,
+                          sal_ptr, m2w_efds[w], w2m_regions[w],
+                          w2m_efds[w]).run()
             os._exit(0)
 
         worker_pids[w] = pid
 
     # --- Parent process ---
-    # Close child-side fds
     for w in range(num_workers):
         os.close(child_fds[w])
 
-    # Master doesn't own any user-table partitions
     _close_user_table_partitions(engine)
     engine.registry.active_part_start = 0
     engine.registry.active_part_end = 0
 
-    dispatcher = MasterDispatcher(num_workers, parent_fds, worker_pids, assignment,
-                                   engine.program_cache)
+    dispatcher = MasterDispatcher(num_workers, parent_fds, worker_pids,
+                                   assignment, engine.program_cache,
+                                   sal, w2m_regions, m2w_efds, w2m_efds)
 
     _backfill_exchange_views(engine, dispatcher)
 

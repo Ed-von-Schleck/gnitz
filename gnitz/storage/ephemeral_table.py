@@ -87,6 +87,8 @@ class EphemeralTable(ZSetStore):
                                     directory, validate_checksums)
         self.memtable = memtable.MemTable(schema, memtable_arena_size)
         self._flush_seq = 0
+        self._has_wal = True
+        self.current_lsn = r_uint64(0)
         self._retract_acc = ColumnarBatchAccessor(schema)
         self._retract_soa = storage_comparator.SoAAccessor(schema)
 

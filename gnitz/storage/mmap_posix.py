@@ -73,6 +73,14 @@ _fsync = rffi.llexternal(
     _nowrapper=True
 )
 
+_fdatasync = rffi.llexternal(
+    "fdatasync",
+    [rffi.INT],
+    rffi.INT,
+    compilation_info=eci,
+    _nowrapper=True
+)
+
 _flock = rffi.llexternal(
     "flock",
     [rffi.INT, rffi.INT],
@@ -107,11 +115,12 @@ _read = rffi.llexternal(
 
 _rlimit_eci = ExternalCompilationInfo(
     pre_include_bits=[
-        '#ifndef _GNU_SOURCE', '#define _GNU_SOURCE', '#endif'
+        '#ifndef _GNU_SOURCE', '#define _GNU_SOURCE', '#endif',
+        'long gnitz_raise_fd_limit(long target);',
     ],
     includes=['sys/resource.h'],
     separate_module_sources=["""
-static long gnitz_raise_fd_limit(long target) {
+long gnitz_raise_fd_limit(long target) {
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return -1;
     if ((long)rl.rlim_cur >= target) return (long)rl.rlim_cur;
@@ -193,6 +202,13 @@ def write_all(fd, ptr, length):
 def fsync_c(fd):
     res = _fsync(rffi.cast(rffi.INT, fd))
     return rffi.cast(lltype.Signed, res)
+
+@jit.dont_look_inside
+def fdatasync_c(fd):
+    """Flush file data (not metadata) to disk. Raises MMapError on failure."""
+    res = _fdatasync(rffi.cast(rffi.INT, fd))
+    if rffi.cast(lltype.Signed, res) < 0:
+        raise MMapError()
 
 @jit.dont_look_inside
 def fsync_dir(filepath):

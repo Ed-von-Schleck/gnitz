@@ -16,7 +16,8 @@ TEST_FILES := \
 	rpython_tests/vm_comprehensive_test.py \
 	rpython_tests/compile_graph_test.py \
 	rpython_tests/server_test.py \
-	rpython_tests/multicore_test.py
+	rpython_tests/multicore_test.py \
+	rpython_tests/eventfd_test.py
 
 # Derived names
 TEST_BINS := $(notdir $(TEST_FILES:.py=-c))
@@ -30,11 +31,12 @@ DATA_DIR_vm_comprehensive_test-c := vm_test_data
 DATA_DIR_compile_graph_test-c := compile_graph_test_data
 DATA_DIR_server_test-c := server_test_data
 DATA_DIR_multicore_test-c := multicore_test_data
+DATA_DIR_eventfd_test-c := eventfd_test_data
 
 ALL_DATA_DIRS := storage_test_data dbsp_test_data \
                  catalog_test_data zstore_test_data vm_test_data \
                  compile_graph_test_data server_test_data \
-                 multicore_test_data
+                 multicore_test_data eventfd_test_data
 
 LOG_DIR := .test_logs
 

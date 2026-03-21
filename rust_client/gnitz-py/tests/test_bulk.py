@@ -9,6 +9,8 @@ import random
 import pytest
 import gnitz
 
+pytestmark = pytest.mark.slow
+
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
 _NEEDS_MULTI = pytest.mark.skipif(
     _NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2"

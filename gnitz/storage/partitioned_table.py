@@ -91,6 +91,19 @@ class PartitionedTable(ZSetStore):
     def get_schema(self):
         return self.schema
 
+    def set_has_wal(self, flag):
+        """Propagate _has_wal to all partition sub-stores."""
+        for i in range(len(self.partitions)):
+            self.partitions[i]._has_wal = flag
+
+    def get_max_flushed_lsn(self):
+        """Max current_lsn across all partitions (for SAL recovery)."""
+        max_lsn = r_uint64(0)
+        for i in range(len(self.partitions)):
+            if self.partitions[i].current_lsn > max_lsn:
+                max_lsn = self.partitions[i].current_lsn
+        return max_lsn
+
     def ingest_batch_memonly(self, batch):
         """Delegates to the partition's ingest_batch_memonly (bypasses WAL).
         Only meaningful for num_partitions == 1 (system tables).

@@ -10,9 +10,43 @@ from gnitz.storage import mmap_posix
 from gnitz.storage import buffer as buffer_ops
 from gnitz.storage import wal_columnar, wal_layout
 from gnitz.server import ipc_ffi
+from rpython.translator.tool.cbuild import ExternalCompilationInfo
 from gnitz.core import errors, batch, types, strings as string_logic
 from gnitz.core.batch import RowBuilder
 from gnitz.catalog import system_tables
+
+# Volatile u64 read for cross-process shared memory.
+# Prevents GCC from caching the value in a register across loop iterations.
+_volatile_eci = ExternalCompilationInfo(
+    pre_include_bits=[
+        "unsigned long long gnitz_volatile_read_u64(const char *p);",
+        "void gnitz_volatile_write_u64(char *p, unsigned long long val);",
+    ],
+    separate_module_sources=["""
+unsigned long long gnitz_volatile_read_u64(const char *p) {
+    return *(volatile unsigned long long *)p;
+}
+void gnitz_volatile_write_u64(char *p, unsigned long long val) {
+    *(volatile unsigned long long *)p = val;
+}
+"""],
+)
+
+_volatile_read_u64 = rffi.llexternal(
+    "gnitz_volatile_read_u64",
+    [rffi.CCHARP],
+    rffi.ULONGLONG,
+    compilation_info=_volatile_eci,
+    _nowrapper=True,
+)
+
+_volatile_write_u64 = rffi.llexternal(
+    "gnitz_volatile_write_u64",
+    [rffi.CCHARP, rffi.ULONGLONG],
+    lltype.Void,
+    compilation_info=_volatile_eci,
+    _nowrapper=True,
+)
 
 # --- Status Codes ---
 STATUS_OK = 0
@@ -38,6 +72,15 @@ FLAG_PRELOADED_EXCHANGE = 1024 # master pre-sends repartitioned batch before FLA
 FLAG_BACKFILL          = 2048  # master asks worker to scan source and backfill a view
 FLAG_TICK              = 4096  # master asks workers to run evaluate_dag on accumulated pending_deltas
 FLAG_SCAN              = 0     # explicit name for "no flags" (no wire change)
+FLAG_CHECKPOINT        = 8192  # 1 << 13 — worker signals all partitions flushed
+
+# --- SAL constants ---
+MAX_WORKERS = 64
+# Group header: 32 fixed + MAX_WORKERS*4 offsets + MAX_WORKERS*4 sizes + 32 pad
+GROUP_HEADER_SIZE = 576    # cache-line aligned
+SAL_MMAP_SIZE   = 1 << 30  # 1 GB
+W2M_REGION_SIZE = 1 << 30  # 1 GB per worker
+W2M_HEADER_SIZE = 128      # 2 cache lines: write_cursor @ 0, padding to 64
 
 # --- New WAL-block wire format flags ---
 FLAG_HAS_SCHEMA         = r_uint64(1 << 48)  # schema block follows control block
@@ -227,14 +270,106 @@ class IPCPayload(object):
 
 
 # ---------------------------------------------------------------------------
+# SAL Data Structures
+# ---------------------------------------------------------------------------
+
+
+class SharedAppendLog(object):
+    """Master-side handle for the file-backed shared append-only log."""
+    _immutable_fields_ = ["ptr", "fd", "mmap_size"]
+
+    def __init__(self, ptr, fd, mmap_size):
+        self.ptr = ptr            # rffi.CCHARP — mmap base
+        self.fd = fd              # file fd for fdatasync
+        self.mmap_size = mmap_size
+        self.write_cursor = 0     # master writes here
+        self.lsn_counter = 0      # monotonic LSN
+
+
+class W2MRegion(object):
+    """Per-worker memfd-backed response channel (worker→master).
+
+    Cursors are stored at fixed offsets in the shared mmap so both
+    processes can see them. Layout:
+      offset 0:  u64 write_cursor (worker updates, master reads)
+      offset 64: padding (separate cache line)
+      offset 128+: message data
+    """
+    _immutable_fields_ = ["ptr", "fd", "size"]
+
+    def __init__(self, ptr, fd, size):
+        self.ptr = ptr
+        self.fd = fd
+        self.size = size
+        # Initialize write_cursor to W2M_HEADER_SIZE (no messages)
+        _volatile_write_u64(ptr, rffi.cast(rffi.ULONGLONG, W2M_HEADER_SIZE))
+
+    def get_write_cursor(self):
+        return intmask(_volatile_read_u64(self.ptr))
+
+    def set_write_cursor(self, val):
+        _volatile_write_u64(self.ptr, rffi.cast(rffi.ULONGLONG, val))
+
+
+class SALMessage(object):
+    """Return type for read_worker_message."""
+
+    def __init__(self):
+        self.payload = None       # IPCPayload or None
+        self.flags = 0            # group header flags (int)
+        self.target_id = 0        # int
+        self.lsn = r_uint64(0)
+        self.advance = 0          # bytes to advance read_cursor
+
+
+# ---------------------------------------------------------------------------
+# Raw u64/u32 read/write helpers for mmap regions
+# ---------------------------------------------------------------------------
+
+
+def _write_u64_raw(ptr, byte_offset, val):
+    p = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, byte_offset))
+    p[0] = rffi.cast(rffi.ULONGLONG, val)
+
+
+def _read_u64_raw(ptr, byte_offset):
+    """Read u64 from shared memory via volatile load.
+
+    Uses a C helper to ensure GCC does not cache the value in a register
+    across iterations — critical for cross-process shared memory.
+    """
+    return rffi.cast(rffi.ULONGLONG,
+                     _volatile_read_u64(rffi.ptradd(ptr, byte_offset)))
+
+
+def _write_u32_raw(ptr, byte_offset, val):
+    p = rffi.cast(rffi.UINTP, rffi.ptradd(ptr, byte_offset))
+    p[0] = rffi.cast(rffi.UINT, val)
+
+
+def _read_u32_raw(ptr, byte_offset):
+    p = rffi.cast(rffi.UINTP, rffi.ptradd(ptr, byte_offset))
+    return rffi.cast(rffi.UINT, p[0])
+
+
+def _align8(n):
+    return (n + 7) & ~7
+
+
+# ---------------------------------------------------------------------------
 # Serialize
 # ---------------------------------------------------------------------------
 
 
-@jit.dont_look_inside
-def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
-                       seek_pk_lo, seek_pk_hi, seek_col_idx,
-                       status, error_msg):
+def _encode_wire(target_id, client_id, zbatch, schema, flags,
+                 seek_pk_lo, seek_pk_hi, seek_col_idx,
+                 status, error_msg):
+    """Encode an IPC message into a Buffer (control + optional schema + data).
+
+    Returns a Buffer that the caller must free. Does NOT create a memfd.
+    Used by both the memfd transport (external clients) and the SAL
+    transport (internal master/worker).
+    """
     has_data   = zbatch is not None and zbatch.length() > 0
     has_schema = has_data or (schema is not None and status == STATUS_OK)
 
@@ -276,7 +411,30 @@ def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
             wal_columnar.encode_batch_append(
                 wire_buf, zbatch._schema, r_uint64(0), target_id, zbatch
             )
+    except:
+        if ctrl_batch is not None:
+            ctrl_batch.free()
+        if schema_batch is not None:
+            schema_batch.free()
+        wire_buf.free()
+        raise
 
+    if ctrl_batch is not None:
+        ctrl_batch.free()
+    if schema_batch is not None:
+        schema_batch.free()
+
+    return wire_buf
+
+
+@jit.dont_look_inside
+def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
+                       seek_pk_lo, seek_pk_hi, seek_col_idx,
+                       status, error_msg):
+    wire_buf = _encode_wire(target_id, client_id, zbatch, schema, flags,
+                            seek_pk_lo, seek_pk_hi, seek_col_idx,
+                            status, error_msg)
+    try:
         total_size = wire_buf.offset
         if total_size == 0:
             total_size = wal_layout.WAL_BLOCK_HEADER_SIZE  # defensive floor
@@ -295,10 +453,6 @@ def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
         )
         mmap_posix.munmap_file(ptr, total_size)
     finally:
-        if ctrl_batch is not None:
-            ctrl_batch.free()
-        if schema_batch is not None:
-            schema_batch.free()
         wire_buf.free()
 
     return fd, total_size
@@ -351,6 +505,64 @@ def broadcast_batch(sock_fds, target_id, zbatch, schema=None, flags=0,
 # ---------------------------------------------------------------------------
 
 
+def _parse_from_ptr(ptr, total_size):
+    """Parse an IPC message from a raw pointer + length.
+
+    Returns an IPCPayload with fd=-1 and ptr=nullptr (non-owning).
+    The batch (if any) holds non-owning Buffer views into the source
+    memory — caller must ensure the memory remains valid while the
+    payload is in use.
+    """
+    payload = IPCPayload()
+
+    if total_size < wal_layout.WAL_BLOCK_HEADER_SIZE:
+        raise errors.StorageError("IPC payload too small")
+
+    # Block 0: control — always present
+    ctrl_header = wal_layout.WALBlockHeaderView(ptr)
+    if ctrl_header.get_table_id() != IPC_CONTROL_TID:
+        raise errors.StorageError("IPC: bad control block TID")
+    ctrl_size  = ctrl_header.get_total_size()
+    ctrl_batch = wal_columnar.decode_batch_from_ptr(ptr, ctrl_size, CONTROL_SCHEMA)
+    _decode_control_batch(ctrl_batch, payload)
+    ctrl_batch.free()
+
+    off = ctrl_size
+
+    # Protocol invariant: FLAG_HAS_DATA requires FLAG_HAS_SCHEMA
+    if payload.flags & FLAG_HAS_DATA and not (payload.flags & FLAG_HAS_SCHEMA):
+        raise errors.StorageError("IPC: FLAG_HAS_DATA requires FLAG_HAS_SCHEMA")
+
+    # Block 1: schema — if FLAG_HAS_SCHEMA
+    if payload.flags & FLAG_HAS_SCHEMA:
+        if off + wal_layout.WAL_BLOCK_HEADER_SIZE > total_size:
+            raise errors.StorageError("IPC: truncated schema block")
+        schema_header = wal_layout.WALBlockHeaderView(rffi.ptradd(ptr, off))
+        schema_size = schema_header.get_total_size()
+        schema_batch = wal_columnar.decode_batch_from_ptr(
+            rffi.ptradd(ptr, off), schema_size, META_SCHEMA
+        )
+        payload.schema = batch_to_schema(schema_batch)
+        schema_batch.free()
+        off += schema_size
+
+    # Block 2: data — if FLAG_HAS_DATA
+    if payload.flags & FLAG_HAS_DATA:
+        if off + wal_layout.WAL_BLOCK_HEADER_SIZE > total_size:
+            raise errors.StorageError("IPC: truncated data block")
+        data_header = wal_layout.WALBlockHeaderView(rffi.ptradd(ptr, off))
+        data_size = data_header.get_total_size()
+        payload.batch = wal_columnar.decode_batch_from_ptr(
+            rffi.ptradd(ptr, off), data_size, payload.schema
+        )
+        if payload.flags & FLAG_BATCH_SORTED:
+            payload.batch.mark_sorted(True)
+        if payload.flags & FLAG_BATCH_CONSOLIDATED:
+            payload.batch.mark_consolidated(True)
+
+    return payload
+
+
 @jit.dont_look_inside
 def _recv_and_parse(fd):
     payload = IPCPayload()
@@ -369,50 +581,18 @@ def _recv_and_parse(fd):
     payload.ptr = ptr
 
     try:
-        # Block 0: control — always present
-        ctrl_header = wal_layout.WALBlockHeaderView(ptr)
-        if ctrl_header.get_table_id() != IPC_CONTROL_TID:
-            raise errors.StorageError("IPC: bad control block TID")
-        ctrl_size  = ctrl_header.get_total_size()
-        ctrl_batch = wal_columnar.decode_batch_from_ptr(ptr, ctrl_size, CONTROL_SCHEMA)
-        _decode_control_batch(ctrl_batch, payload)
-        ctrl_batch.free()
-
-        off = ctrl_size
-
-        # Protocol invariant: FLAG_HAS_DATA requires FLAG_HAS_SCHEMA
-        if payload.flags & FLAG_HAS_DATA and not (payload.flags & FLAG_HAS_SCHEMA):
-            raise errors.StorageError("IPC: FLAG_HAS_DATA requires FLAG_HAS_SCHEMA")
-
-        # Block 1: schema — if FLAG_HAS_SCHEMA
-        if payload.flags & FLAG_HAS_SCHEMA:
-            if off + wal_layout.WAL_BLOCK_HEADER_SIZE > total_size:
-                raise errors.StorageError("IPC: truncated schema block")
-            schema_header = wal_layout.WALBlockHeaderView(rffi.ptradd(ptr, off))
-            schema_size = schema_header.get_total_size()
-            schema_batch = wal_columnar.decode_batch_from_ptr(
-                rffi.ptradd(ptr, off), schema_size, META_SCHEMA
-            )
-            payload.schema = batch_to_schema(schema_batch)
-            schema_batch.free()
-            off += schema_size
-
-        # Block 2: data — if FLAG_HAS_DATA
-        if payload.flags & FLAG_HAS_DATA:
-            if off + wal_layout.WAL_BLOCK_HEADER_SIZE > total_size:
-                raise errors.StorageError("IPC: truncated data block")
-            data_header = wal_layout.WALBlockHeaderView(rffi.ptradd(ptr, off))
-            data_size = data_header.get_total_size()
-            payload.batch = wal_columnar.decode_batch_from_ptr(
-                rffi.ptradd(ptr, off), data_size, payload.schema
-            )
-            if payload.flags & FLAG_BATCH_SORTED:
-                payload.batch.mark_sorted(True)
-            if payload.flags & FLAG_BATCH_CONSOLIDATED:
-                payload.batch.mark_consolidated(True)
-            # batch holds non-owning Buffer views into ptr (the mmap).
-            # Must not be used after payload.close().
-
+        inner = _parse_from_ptr(ptr, total_size)
+        # Transfer parsed fields to the owning payload (which has fd + ptr)
+        payload.batch        = inner.batch
+        payload.schema       = inner.schema
+        payload.target_id    = inner.target_id
+        payload.client_id    = inner.client_id
+        payload.flags        = inner.flags
+        payload.seek_col_idx = inner.seek_col_idx
+        payload.seek_pk_lo   = inner.seek_pk_lo
+        payload.seek_pk_hi   = inner.seek_pk_hi
+        payload.status       = inner.status
+        payload.error_msg    = inner.error_msg
     except Exception as e:
         payload.close()
         raise e
@@ -440,3 +620,152 @@ def try_receive_payload(sock_fd):
     if fd < 0:
         raise errors.StorageError("Message received without file descriptor")
     return _recv_and_parse(fd)
+
+
+# ---------------------------------------------------------------------------
+# SAL Transport (master→workers via file-backed mmap)
+# ---------------------------------------------------------------------------
+
+
+@jit.dont_look_inside
+def write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers):
+    """Append a message group for all N workers into the SAL.
+
+    worker_bufs is a list of Buffer-or-None (one per worker). Each buffer
+    contains an _encode_wire result. The caller must free worker_bufs after
+    this returns. Does NOT fdatasync or signal — caller does that.
+    """
+    # Compute total size: 8-byte prefix + GROUP_HEADER_SIZE + per-worker data
+    payload_size = GROUP_HEADER_SIZE
+    for w in range(num_workers):
+        wb = worker_bufs[w]
+        if wb is not None and wb.offset > 0:
+            payload_size += _align8(wb.offset)
+
+    total = 8 + _align8(payload_size)
+    if sal.write_cursor + total > sal.mmap_size:
+        raise errors.StorageError("SAL full — checkpoint required")
+
+    base = sal.write_cursor
+
+    # 8-byte size prefix
+    _write_u64_raw(sal.ptr, base, r_uint64(payload_size))
+
+    # Group header at base + 8
+    hdr_off = base + 8
+    _write_u64_raw(sal.ptr, hdr_off + 0, r_uint64(payload_size))
+    _write_u64_raw(sal.ptr, hdr_off + 8, r_uint64(lsn))
+    _write_u32_raw(sal.ptr, hdr_off + 16, num_workers)
+    _write_u32_raw(sal.ptr, hdr_off + 20, flags)
+    _write_u32_raw(sal.ptr, hdr_off + 24, target_id)
+    _write_u32_raw(sal.ptr, hdr_off + 28, 0)  # reserved
+
+    # Worker offsets and sizes
+    data_offset = GROUP_HEADER_SIZE  # relative to group start (hdr_off)
+    for w in range(MAX_WORKERS):
+        if w < num_workers:
+            wb = worker_bufs[w]
+            if wb is not None and wb.offset > 0:
+                wsz = wb.offset
+                _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, data_offset)
+                _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz)
+                # Copy data
+                buffer_ops.c_memmove(
+                    rffi.cast(rffi.VOIDP, rffi.ptradd(sal.ptr, hdr_off + data_offset)),
+                    rffi.cast(rffi.VOIDP, wb.base_ptr),
+                    rffi.cast(rffi.SIZE_T, wsz),
+                )
+                data_offset += _align8(wsz)
+            else:
+                _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, 0)
+                _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0)
+        else:
+            _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, 0)
+            _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0)
+
+    sal.write_cursor += total
+
+
+@jit.dont_look_inside
+def read_worker_message(sal_ptr, read_cursor, worker_id):
+    """Read this worker's data from the next message group in the SAL.
+
+    Returns a SALMessage. If the worker has no data in this group,
+    msg.payload is None but msg.advance is still set (caller must
+    advance read_cursor).
+    """
+    msg = SALMessage()
+
+    # 8-byte size prefix
+    payload_size = intmask(_read_u64_raw(sal_ptr, read_cursor))
+    if payload_size == 0:
+        return msg  # no message (advance=0)
+
+    hdr_off = read_cursor + 8
+    msg.lsn = _read_u64_raw(sal_ptr, hdr_off + 8)
+    msg.flags = intmask(_read_u32_raw(sal_ptr, hdr_off + 20))
+    msg.target_id = intmask(_read_u32_raw(sal_ptr, hdr_off + 24))
+    msg.advance = 8 + _align8(payload_size)
+
+    # Extract this worker's offset and size
+    my_offset = intmask(_read_u32_raw(sal_ptr, hdr_off + 32 + worker_id * 4))
+    my_size = intmask(_read_u32_raw(sal_ptr, hdr_off + 32 + MAX_WORKERS * 4 + worker_id * 4))
+
+    if my_size > 0 and my_offset > 0:
+        data_ptr = rffi.ptradd(sal_ptr, hdr_off + my_offset)
+        msg.payload = _parse_from_ptr(data_ptr, my_size)
+
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# W2M Transport (worker→master via memfd-backed shared region)
+# ---------------------------------------------------------------------------
+
+
+@jit.dont_look_inside
+def write_to_w2m(region, target_id, zbatch, schema, flags,
+                 seek_pk_lo, seek_pk_hi, seek_col_idx, status, error_msg):
+    """Worker writes a response into its W2M region."""
+    wire_buf = _encode_wire(target_id, 0, zbatch, schema, flags,
+                            seek_pk_lo, seek_pk_hi, seek_col_idx,
+                            status, error_msg)
+    try:
+        size = wire_buf.offset
+        wc = region.get_write_cursor()
+
+        total = 8 + _align8(size)
+        if wc + total > region.size:
+            raise errors.StorageError("W2M region full")
+
+        # 8-byte size prefix
+        _write_u64_raw(region.ptr, wc, r_uint64(size))
+
+        # Copy wire data
+        if size > 0:
+            buffer_ops.c_memmove(
+                rffi.cast(rffi.VOIDP, rffi.ptradd(region.ptr, wc + 8)),
+                rffi.cast(rffi.VOIDP, wire_buf.base_ptr),
+                rffi.cast(rffi.SIZE_T, size),
+            )
+
+        region.set_write_cursor(wc + total)
+    finally:
+        wire_buf.free()
+
+
+@jit.dont_look_inside
+def read_from_w2m(region, read_cursor):
+    """Master reads the next response from a worker's W2M region.
+
+    Returns (IPCPayload, new_read_cursor). The payload is non-owning
+    (fd=-1, ptr=nullptr).
+    """
+    size = intmask(_read_u64_raw(region.ptr, read_cursor))
+    if size == 0:
+        raise errors.StorageError("W2M: unexpected zero-size message")
+
+    data_ptr = rffi.ptradd(region.ptr, read_cursor + 8)
+    payload = _parse_from_ptr(data_ptr, size)
+    new_rc = read_cursor + 8 + _align8(size)
+    return payload, new_rc
