@@ -1151,11 +1151,20 @@ def test_fk_referential_integrity(base_dir):
             raise Exception("Referential integrity failed to block invalid FK")
         cb2.free()
 
-        # 6. Test U128 FK (UUID style)
+    finally:
+        engine.close()
+
+    # 6. Test U128 FK (UUID style) — separate engine to stay under fd limit
+    db_path2 = base_dir + "/fk_integrity_u128"
+    if not os_path_exists(db_path2):
+        rposix.mkdir(db_path2, 0o755)
+
+    engine2 = open_engine(db_path2)
+    try:
         u_parent_cols = [
             core_types.ColumnDefinition(core_types.TYPE_U128, name="uuid")
         ]
-        u_parent = engine.create_table("public.uparents", u_parent_cols, 0)
+        u_parent = engine2.create_table("public.uparents", u_parent_cols, 0)
 
         u_child_cols = [
             core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
@@ -1166,7 +1175,7 @@ def test_fk_referential_integrity(base_dir):
                 fk_col_idx=0,
             ),
         ]
-        u_child = engine.create_table("public.uchildren", u_child_cols, 0)
+        u_child = engine2.create_table("public.uchildren", u_child_cols, 0)
 
         upb = batch.ArenaZSetBatch(u_parent.schema)
         rb_up = RowBuilder(u_parent.schema, upb)
@@ -1185,7 +1194,7 @@ def test_fk_referential_integrity(base_dir):
         ucb.free()
 
     finally:
-        engine.close()
+        engine2.close()
     os.write(1, "    [OK] FK Integrity verified.\n")
 
 
