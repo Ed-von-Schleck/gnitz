@@ -93,7 +93,7 @@ def _recover_from_sal(sal_ptr, engine, worker_id):
     offset = 0
     replayed = 0
     while offset + 8 < ipc.SAL_MMAP_SIZE:
-        size = intmask(ipc._read_u64_raw(sal_ptr, offset))
+        size = intmask(ipc.read_u64_raw(sal_ptr, offset))
         if size == 0:
             break
         msg = ipc.read_worker_message(sal_ptr, offset, worker_id)

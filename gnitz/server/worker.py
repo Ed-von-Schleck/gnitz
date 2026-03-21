@@ -50,7 +50,7 @@ class WorkerExchangeHandler(object):
 
         while True:
             eventfd_ffi.eventfd_wait(self.wp.m2w_efd, 30000)
-            size = intmask(ipc._atomic_load_u64(
+            size = intmask(ipc.atomic_load_u64(
                 rffi.ptradd(self.wp.sal_ptr, self.wp.read_cursor)))
             if size == 0:
                 continue
@@ -115,7 +115,7 @@ class WorkerProcess(object):
         while True:
             if self.read_cursor + 8 >= ipc.SAL_MMAP_SIZE:
                 break
-            size = intmask(ipc._atomic_load_u64(
+            size = intmask(ipc.atomic_load_u64(
                 rffi.ptradd(self.sal_ptr, self.read_cursor)))
             if size == 0:
                 break
@@ -143,15 +143,16 @@ class WorkerProcess(object):
                 vid = target_id
                 if payload is not None and payload.batch is not None and payload.batch.length() > 0:
                     stashed = payload.batch.clone()
+                elif payload is not None and payload.schema is not None:
+                    stashed = ArenaZSetBatch(payload.schema)
                 else:
-                    sch = payload.schema if payload is not None else None
-                    stashed = ArenaZSetBatch(sch) if sch is not None else None
+                    stashed = None
                 if stashed is not None:
                     self.exchange_handler.stash_preloaded(vid, stashed)
                 # Read next SAL group
                 if self.read_cursor + 8 >= ipc.SAL_MMAP_SIZE:
                     return False
-                size = intmask(ipc._read_u64_raw(
+                size = intmask(ipc.read_u64_raw(
                     self.sal_ptr, self.read_cursor))
                 if size == 0:
                     return False

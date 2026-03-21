@@ -197,7 +197,7 @@ def test_sal_multiple_groups():
     # Worker 0 reads all 3 sequentially
     rc = 0
     for i in range(3):
-        size = intmask(ipc._atomic_load_u64(rffi.ptradd(sal.ptr, rc)))
+        size = intmask(ipc.atomic_load_u64(rffi.ptradd(sal.ptr, rc)))
         assert_true(size > 0, "group %d size > 0" % i)
         msg = ipc.read_worker_message(sal.ptr, rc, 0)
         assert_equal_i(target_ids[i], msg.target_id,
@@ -205,7 +205,7 @@ def test_sal_multiple_groups():
         rc += msg.advance
 
     # After all 3, next read should be size=0
-    size = intmask(ipc._atomic_load_u64(rffi.ptradd(sal.ptr, rc)))
+    size = intmask(ipc.atomic_load_u64(rffi.ptradd(sal.ptr, rc)))
     assert_equal_i(0, size, "no more groups")
 
     _free_sal(sal)

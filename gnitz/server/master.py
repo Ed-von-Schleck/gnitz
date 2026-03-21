@@ -101,6 +101,22 @@ class MasterDispatcher(object):
                           seek_pk_lo, seek_pk_hi, seek_col_idx)
         self._sync_and_signal_all()
 
+    def _send_broadcast(self, target_id, flags, batch, schema,
+                        seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
+        """Encode batch once and broadcast identical data to all workers."""
+        wire_buf = ipc._encode_wire(
+            target_id, 0, batch, schema, flags,
+            seek_pk_lo, seek_pk_hi, seek_col_idx, 0, "")
+        wire_bufs = [None] * self.num_workers
+        for w in range(self.num_workers):
+            wire_bufs[w] = wire_buf
+        lsn = self.sal.lsn_counter
+        self.sal.lsn_counter += 1
+        ipc.write_message_group(self.sal, target_id, lsn, flags,
+                                wire_bufs, self.num_workers)
+        wire_buf.free()
+        self._sync_and_signal_all()
+
     def _reset_w2m_cursors(self):
         """Reset all workers' W2M write cursors after master has read all responses."""
         for w in range(self.num_workers):
@@ -213,15 +229,17 @@ class MasterDispatcher(object):
     def _collect_one(self, worker):
         """Collect a single response from one worker. Returns IPCPayload."""
         w2m_rc = ipc.W2M_HEADER_SIZE
-        while True:
-            eventfd_ffi.eventfd_wait(self.w2m_efds[worker], 1000)
-            wc = self.w2m_regions[worker].get_write_cursor()
-            if w2m_rc < wc:
-                payload, w2m_rc = ipc.read_from_w2m(
-                    self.w2m_regions[worker], w2m_rc)
-                self.w2m_regions[worker].set_write_cursor(
-                    ipc.W2M_HEADER_SIZE)
-                return payload
+        try:
+            while True:
+                eventfd_ffi.eventfd_wait(self.w2m_efds[worker], 1000)
+                wc = self.w2m_regions[worker].get_write_cursor()
+                if w2m_rc < wc:
+                    payload, w2m_rc = ipc.read_from_w2m(
+                        self.w2m_regions[worker], w2m_rc)
+                    return payload
+        finally:
+            self.w2m_regions[worker].set_write_cursor(
+                ipc.W2M_HEADER_SIZE)
 
     # -----------------------------------------------------------------------
     # Fan-out operations
@@ -426,11 +444,7 @@ class MasterDispatcher(object):
 
     def broadcast_ddl(self, target_id, batch, schema):
         """Send a system-table delta to all workers for registry sync."""
-        worker_batches = [None] * self.num_workers
-        for w in range(self.num_workers):
-            worker_batches[w] = batch  # same batch for all (not freed here)
-        self._send_to_workers(
-            target_id, ipc.FLAG_DDL_SYNC, worker_batches, schema)
+        self._send_broadcast(target_id, ipc.FLAG_DDL_SYNC, batch, schema)
         log.debug(
             "broadcast_ddl tid=" + str(target_id)
             + " rows=" + str(batch.length()))
@@ -460,11 +474,8 @@ class MasterDispatcher(object):
                                   check_batch, schema):
         """Broadcast PK existence check. Returns True if any key exists."""
         col_hint = source_col_idx + 1
-        worker_batches = [None] * self.num_workers
-        for w in range(self.num_workers):
-            worker_batches[w] = check_batch
-        self._send_to_workers(
-            owner_table_id, ipc.FLAG_HAS_PK, worker_batches, schema,
+        self._send_broadcast(
+            owner_table_id, ipc.FLAG_HAS_PK, check_batch, schema,
             seek_col_idx=col_hint)
 
         results = self._wait_all_workers()

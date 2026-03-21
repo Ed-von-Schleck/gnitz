@@ -33,7 +33,7 @@ void gnitz_atomic_store_u64(char *p, unsigned long long val) {
 """],
 )
 
-_atomic_load_u64 = rffi.llexternal(
+atomic_load_u64 = rffi.llexternal(
     "gnitz_atomic_load_u64",
     [rffi.CCHARP],
     rffi.ULONGLONG,
@@ -41,7 +41,7 @@ _atomic_load_u64 = rffi.llexternal(
     _nowrapper=True,
 )
 
-_atomic_store_u64 = rffi.llexternal(
+atomic_store_u64 = rffi.llexternal(
     "gnitz_atomic_store_u64",
     [rffi.CCHARP, rffi.ULONGLONG],
     lltype.Void,
@@ -303,13 +303,13 @@ class W2MRegion(object):
         self.fd = fd
         self.size = size
         # Initialize write_cursor to W2M_HEADER_SIZE (no messages)
-        _atomic_store_u64(ptr, rffi.cast(rffi.ULONGLONG, W2M_HEADER_SIZE))
+        atomic_store_u64(ptr, rffi.cast(rffi.ULONGLONG, W2M_HEADER_SIZE))
 
     def get_write_cursor(self):
-        return intmask(_atomic_load_u64(self.ptr))
+        return intmask(atomic_load_u64(self.ptr))
 
     def set_write_cursor(self, val):
-        _atomic_store_u64(self.ptr, rffi.cast(rffi.ULONGLONG, val))
+        atomic_store_u64(self.ptr, rffi.cast(rffi.ULONGLONG, val))
 
 
 class SALMessage(object):
@@ -333,10 +333,10 @@ def _write_u64_raw(ptr, byte_offset, val):
     p[0] = rffi.cast(rffi.ULONGLONG, val)
 
 
-def _read_u64_raw(ptr, byte_offset):
+def read_u64_raw(ptr, byte_offset):
     """Read u64 from shared memory via atomic acquire load."""
     return rffi.cast(rffi.ULONGLONG,
-                     _atomic_load_u64(rffi.ptradd(ptr, byte_offset)))
+                     atomic_load_u64(rffi.ptradd(ptr, byte_offset)))
 
 
 def _write_u32_raw(ptr, byte_offset, val):
@@ -481,20 +481,6 @@ def send_error(sock_fd, error_msg, target_id=0, client_id=0):
         sock_fd, target_id, None,
         status=STATUS_ERROR, error_msg=error_msg, client_id=client_id,
     )
-
-
-def broadcast_batch(sock_fds, target_id, zbatch, schema=None, flags=0,
-                    seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
-    """Encode once, send fd to N sockets via SCM_RIGHTS. No ACK expected."""
-    eff_schema = schema if schema is not None else (zbatch._schema if zbatch is not None else None)
-    fd, _ = serialize_to_memfd(target_id, 0, zbatch, eff_schema, flags,
-                               seek_pk_lo, seek_pk_hi, seek_col_idx, STATUS_OK, "")
-    try:
-        for i in range(len(sock_fds)):
-            if ipc_ffi.send_fd(sock_fds[i], fd) < 0:
-                raise errors.StorageError("broadcast_batch: send_fd failed")
-    finally:
-        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -656,23 +642,18 @@ def write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers):
 
     # Worker offsets and sizes + data copy
     data_offset = GROUP_HEADER_SIZE  # relative to group start (hdr_off)
-    for w in range(MAX_WORKERS):
-        if w < num_workers:
-            wb = worker_bufs[w]
-            if wb is not None and wb.offset > 0:
-                wsz = wb.offset
-                _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, data_offset)
-                _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz)
-                # Copy data
-                buffer_ops.c_memmove(
-                    rffi.cast(rffi.VOIDP, rffi.ptradd(sal.ptr, hdr_off + data_offset)),
-                    rffi.cast(rffi.VOIDP, wb.base_ptr),
-                    rffi.cast(rffi.SIZE_T, wsz),
-                )
-                data_offset += _align8(wsz)
-            else:
-                _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, 0)
-                _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0)
+    for w in range(num_workers):
+        wb = worker_bufs[w]
+        if wb is not None and wb.offset > 0:
+            wsz = wb.offset
+            _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, data_offset)
+            _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz)
+            buffer_ops.c_memmove(
+                rffi.cast(rffi.VOIDP, rffi.ptradd(sal.ptr, hdr_off + data_offset)),
+                rffi.cast(rffi.VOIDP, wb.base_ptr),
+                rffi.cast(rffi.SIZE_T, wsz),
+            )
+            data_offset += _align8(wsz)
         else:
             _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, 0)
             _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0)
@@ -680,7 +661,7 @@ def write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers):
     # Write size prefix LAST via volatile store: workers use this as
     # the "data ready" sentinel, so all header+data must be visible
     # before this becomes non-zero.
-    _atomic_store_u64(
+    atomic_store_u64(
         rffi.ptradd(sal.ptr, base),
         rffi.cast(rffi.ULONGLONG, payload_size))
 
@@ -698,12 +679,12 @@ def read_worker_message(sal_ptr, read_cursor, worker_id):
     msg = SALMessage()
 
     # 8-byte size prefix
-    payload_size = intmask(_read_u64_raw(sal_ptr, read_cursor))
+    payload_size = intmask(read_u64_raw(sal_ptr, read_cursor))
     if payload_size == 0:
         return msg  # no message (advance=0)
 
     hdr_off = read_cursor + 8
-    msg.lsn = _read_u64_raw(sal_ptr, hdr_off + 8)
+    msg.lsn = read_u64_raw(sal_ptr, hdr_off + 8)
     msg.flags = intmask(_read_u32_raw(sal_ptr, hdr_off + 20))
     msg.target_id = intmask(_read_u32_raw(sal_ptr, hdr_off + 24))
     msg.advance = 8 + _align8(payload_size)
@@ -742,7 +723,6 @@ def write_to_w2m(region, target_id, zbatch, schema, flags,
         # 8-byte size prefix
         _write_u64_raw(region.ptr, wc, r_uint64(size))
 
-        # Copy wire data
         if size > 0:
             buffer_ops.c_memmove(
                 rffi.cast(rffi.VOIDP, rffi.ptradd(region.ptr, wc + 8)),
@@ -762,7 +742,7 @@ def read_from_w2m(region, read_cursor):
     Returns (IPCPayload, new_read_cursor). The payload is non-owning
     (fd=-1, ptr=nullptr).
     """
-    size = intmask(_read_u64_raw(region.ptr, read_cursor))
+    size = intmask(read_u64_raw(region.ptr, read_cursor))
     if size == 0:
         raise errors.StorageError("W2M: unexpected zero-size message")
 
