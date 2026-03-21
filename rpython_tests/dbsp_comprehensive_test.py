@@ -3931,6 +3931,223 @@ def test_emit_null():
         b_out.free()
 
 
+def test_batch_map_projection_reorder():
+    """UniversalProjection batch path: column reorder with nullable columns."""
+    log("[BATCH-MAP] Testing UniversalProjection batch path (reorder + null)...")
+
+    # Input schema: pk(U64), a(I64 nullable), b(I64), c(F64)
+    in_cols = newlist_hint(4)
+    in_cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    in_cols.append(types.ColumnDefinition(types.TYPE_I64, name="a", is_nullable=True))
+    in_cols.append(types.ColumnDefinition(types.TYPE_I64, name="b"))
+    in_cols.append(types.ColumnDefinition(types.TYPE_F64, name="c"))
+    in_schema = types.TableSchema(in_cols, 0)
+
+    # Output schema: pk(U64), c(F64), b(I64), a(I64 nullable) — reversed payload
+    out_cols = newlist_hint(4)
+    out_cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    out_cols.append(types.ColumnDefinition(types.TYPE_F64, name="c"))
+    out_cols.append(types.ColumnDefinition(types.TYPE_I64, name="b"))
+    out_cols.append(types.ColumnDefinition(types.TYPE_I64, name="a", is_nullable=True))
+    out_schema = types.TableSchema(out_cols, 0)
+
+    mapper = functions.UniversalProjection(
+        [3, 2, 1],
+        [types.TYPE_F64.code, types.TYPE_I64.code, types.TYPE_I64.code])
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+    try:
+        rb = RowBuilder(in_schema, b_in)
+        # Row 0: a=NULL, b=10, c=1.5
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_null()
+        rb.put_int(r_int64(10))
+        rb.put_float(1.5)
+        rb.commit()
+        # Row 1: a=42, b=20, c=2.5
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(2))
+        rb.put_int(r_int64(42))
+        rb.put_int(r_int64(20))
+        rb.put_float(2.5)
+        rb.commit()
+
+        linear.op_map(b_in, batch.BatchWriter(b_out), mapper, out_schema)
+        assert_equal_i(2, b_out.length(), "Batch projection row count")
+
+        # Row 0: c=1.5, b=10, a=NULL
+        acc0 = b_out.get_accessor(0)
+        assert_true(abs(acc0.get_float(1) - 1.5) < 0.001, "Row 0 c")
+        assert_equal_i64(r_int64(10), acc0.get_int_signed(2), "Row 0 b")
+        assert_true(acc0.is_null(3), "Row 0 a should be NULL")
+
+        # Row 1: c=2.5, b=20, a=42
+        acc1 = b_out.get_accessor(1)
+        assert_true(abs(acc1.get_float(1) - 2.5) < 0.001, "Row 1 c")
+        assert_equal_i64(r_int64(20), acc1.get_int_signed(2), "Row 1 b")
+        assert_true(not acc1.is_null(3), "Row 1 a should not be NULL")
+        assert_equal_i64(r_int64(42), acc1.get_int_signed(3), "Row 1 a")
+
+        # Check PKs and weights preserved
+        assert_true(b_out.get_pk_lo(0) == r_uint64(1), "PK 0 preserved")
+        assert_true(b_out.get_pk_lo(1) == r_uint64(2), "PK 1 preserved")
+        assert_equal_i64(r_int64(1), b_out.get_weight(0), "Weight 0 preserved")
+        assert_equal_i64(r_int64(2), b_out.get_weight(1), "Weight 1 preserved")
+
+        log("  PASSED")
+    finally:
+        b_in.free()
+        b_out.free()
+
+
+def test_batch_map_expr_mixed():
+    """ExprMapFunction batch path: COPY_COL + arithmetic + EMIT."""
+    log("[BATCH-MAP] Testing ExprMapFunction batch path (mixed program)...")
+
+    # Input: pk(U64), x(I64), y(I64)
+    in_schema = _make_int_schema()
+
+    # Output: pk(U64), x_copy(I64), sum(I64)
+    out_cols = newlist_hint(3)
+    out_cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    out_cols.append(types.ColumnDefinition(types.TYPE_I64, name="x_copy"))
+    out_cols.append(types.ColumnDefinition(types.TYPE_I64, name="sum"))
+    out_schema = types.TableSchema(out_cols, 0)
+
+    # Program: COPY_COL col1->payload0, LOAD col1, LOAD col2, ADD, EMIT->payload1
+    eb = ExprBuilder()
+    eb.copy_col(types.TYPE_I64.code, 1, 0)  # copy col1 to payload 0
+    r_x = eb.load_col_int(1)
+    r_y = eb.load_col_int(2)
+    r_sum = eb.int_add(r_x, r_y)
+    eb.emit_col(r_sum, 1)  # emit sum to payload 1
+    prog = eb.build(0)
+    map_func = ExprMapFunction(prog)
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+    try:
+        rb = RowBuilder(in_schema, b_in)
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(10))
+        rb.put_int(r_int64(20))
+        rb.commit()
+
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(100))
+        rb.put_int(r_int64(200))
+        rb.commit()
+
+        rb.begin(r_uint64(3), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(-5))
+        rb.put_int(r_int64(3))
+        rb.commit()
+
+        linear.op_map(b_in, batch.BatchWriter(b_out), map_func, out_schema)
+        assert_equal_i(3, b_out.length(), "Mixed expr row count")
+
+        acc0 = b_out.get_accessor(0)
+        assert_equal_i64(r_int64(10), acc0.get_int_signed(1), "Row 0 x_copy")
+        assert_equal_i64(r_int64(30), acc0.get_int_signed(2), "Row 0 sum")
+
+        acc1 = b_out.get_accessor(1)
+        assert_equal_i64(r_int64(100), acc1.get_int_signed(1), "Row 1 x_copy")
+        assert_equal_i64(r_int64(300), acc1.get_int_signed(2), "Row 1 sum")
+
+        acc2 = b_out.get_accessor(2)
+        assert_equal_i64(r_int64(-5), acc2.get_int_signed(1), "Row 2 x_copy")
+        assert_equal_i64(r_int64(-2), acc2.get_int_signed(2), "Row 2 sum")
+
+        log("  PASSED")
+    finally:
+        b_in.free()
+        b_out.free()
+
+
+def test_batch_map_string_copy():
+    """Batch path: string column COPY_COL with blob relocation."""
+    log("[BATCH-MAP] Testing string COPY_COL batch path...")
+
+    # Input: pk(U64), name(STRING), val(I64)
+    in_cols = newlist_hint(3)
+    in_cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    in_cols.append(types.ColumnDefinition(types.TYPE_STRING, name="name"))
+    in_cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    in_schema = types.TableSchema(in_cols, 0)
+
+    # Output: pk(U64), val(I64), name(STRING) — swapped
+    out_cols = newlist_hint(3)
+    out_cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    out_cols.append(types.ColumnDefinition(types.TYPE_I64, name="val"))
+    out_cols.append(types.ColumnDefinition(types.TYPE_STRING, name="name"))
+    out_schema = types.TableSchema(out_cols, 0)
+
+    mapper = functions.UniversalProjection(
+        [2, 1],
+        [types.TYPE_I64.code, types.TYPE_STRING.code])
+
+    b_in = batch.ArenaZSetBatch(in_schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+    try:
+        rb = RowBuilder(in_schema, b_in)
+        # Short string (inline)
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_string("hello")
+        rb.put_int(r_int64(10))
+        rb.commit()
+        # Long string (heap-allocated, > 12 bytes)
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
+        rb.put_string("this is a long string value")
+        rb.put_int(r_int64(20))
+        rb.commit()
+
+        linear.op_map(b_in, batch.BatchWriter(b_out), mapper, out_schema)
+        assert_equal_i(2, b_out.length(), "String copy row count")
+
+        from gnitz.core import strings as _strings
+        # Row 0: val=10, name="hello"
+        acc0 = b_out.get_accessor(0)
+        assert_equal_i64(r_int64(10), acc0.get_int_signed(1), "Row 0 val")
+        res0 = acc0.get_str_struct(2)
+        s0 = _strings.resolve_string(res0[2], res0[3], res0[4])
+        assert_true(s0 == "hello", "Row 0 name mismatch")
+
+        # Row 1: val=20, name="this is a long string value"
+        acc1 = b_out.get_accessor(1)
+        assert_equal_i64(r_int64(20), acc1.get_int_signed(1), "Row 1 val")
+        res1 = acc1.get_str_struct(2)
+        s1 = _strings.resolve_string(res1[2], res1[3], res1[4])
+        assert_true(s1 == "this is a long string value", "Row 1 name mismatch")
+
+        log("  PASSED")
+    finally:
+        b_in.free()
+        b_out.free()
+
+
+def test_batch_map_empty():
+    """Batch path: empty input batch returns True immediately."""
+    log("[BATCH-MAP] Testing empty batch edge case...")
+
+    schema = _make_int_schema()
+    out_cols = newlist_hint(2)
+    out_cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
+    out_cols.append(types.ColumnDefinition(types.TYPE_I64, name="col1"))
+    out_schema = types.TableSchema(out_cols, 0)
+
+    mapper = functions.UniversalProjection([1], [types.TYPE_I64.code])
+
+    b_in = batch.ArenaZSetBatch(schema)
+    b_out = batch.ArenaZSetBatch(out_schema)
+    try:
+        linear.op_map(b_in, batch.BatchWriter(b_out), mapper, out_schema)
+        assert_equal_i(0, b_out.length(), "Empty batch should produce 0 rows")
+        log("  PASSED")
+    finally:
+        b_in.free()
+        b_out.free()
+
+
 def entry_point(argv):
     ensure_jit_reachable()
     base_dir = "dbsp_test_data"
@@ -3995,6 +4212,10 @@ def entry_point(argv):
         test_complex_predicate()
         test_integration_with_op_filter()
         test_emit_null()
+        test_batch_map_projection_reorder()
+        test_batch_map_expr_mixed()
+        test_batch_map_string_copy()
+        test_batch_map_empty()
         log("\nALL DBSP TESTS PASSED")
     except Exception as e:
         os.write(2, "FAILURE\n")

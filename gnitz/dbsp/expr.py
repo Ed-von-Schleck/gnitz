@@ -571,14 +571,473 @@ def eval_expr_map(program, accessor, builder):
         i += 1
 
 
+# ---------------------------------------------------------------------------
+# _eval_compute_row_direct — batch-path per-row compute (no RowBuilder)
+# ---------------------------------------------------------------------------
+
+@jit.unroll_safe
+def _eval_compute_row_direct(program, in_batch, row_idx,
+                              emit_bases, emit_strides, emit_payloads):
+    """Evaluate compute instructions for one row, writing EMIT results
+    directly to pre-allocated output column buffers.
+    COPY_COL and EMIT_NULL are noops (handled at batch level).
+    Returns null mask for EMIT columns."""
+    from gnitz.core import types as _types
+    from gnitz.core import strings as _strings
+
+    program = jit.promote(program)
+    code = program.code
+    pk_idx = in_batch._schema.pk_index
+    regs = [r_int64(0)] * program.num_regs
+    null = [False] * program.num_regs
+    emit_null_mask = r_uint64(0)
+    emit_idx = 0
+
+    i = 0
+    while i < program.num_instrs:
+        base = i * 4
+        op  = intmask(code[base])
+        dst = intmask(code[base + 1])
+        a1  = intmask(code[base + 2])
+        a2  = intmask(code[base + 3])
+
+        if op == EXPR_COPY_COL or op == EXPR_EMIT_NULL:
+            pass  # handled at batch level
+
+        elif op == EXPR_LOAD_COL_INT:
+            if a1 == pk_idx:
+                null[dst] = False
+                regs[dst] = rffi.cast(rffi.LONGLONG, in_batch._read_pk_lo(row_idx))
+            else:
+                pi = a1 if a1 < pk_idx else a1 - 1
+                nw = in_batch._read_null_word(row_idx)
+                null[dst] = bool(nw & (r_uint64(1) << pi))
+                regs[dst] = rffi.cast(rffi.LONGLONG, in_batch._read_col_int(row_idx, a1))
+
+        elif op == EXPR_LOAD_COL_FLOAT:
+            if a1 == pk_idx:
+                null[dst] = False
+                regs[dst] = float2longlong(0.0)
+            else:
+                pi = a1 if a1 < pk_idx else a1 - 1
+                nw = in_batch._read_null_word(row_idx)
+                null[dst] = bool(nw & (r_uint64(1) << pi))
+                regs[dst] = float2longlong(in_batch._read_col_float(row_idx, a1))
+
+        elif op == EXPR_LOAD_CONST:
+            null[dst] = False
+            regs[dst] = r_int64(intmask((a2 << 32) | (a1 & 0xFFFFFFFF)))
+
+        elif op == EXPR_INT_ADD:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(intmask(regs[a1] + regs[a2]))
+        elif op == EXPR_INT_SUB:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(intmask(regs[a1] - regs[a2]))
+        elif op == EXPR_INT_MUL:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(intmask(regs[a1] * regs[a2]))
+        elif op == EXPR_INT_DIV:
+            null[dst] = null[a1] or null[a2]
+            d = regs[a2]
+            regs[dst] = r_int64(intmask(regs[a1] / d)) if d != r_int64(0) else r_int64(0)
+        elif op == EXPR_INT_MOD:
+            null[dst] = null[a1] or null[a2]
+            d = regs[a2]
+            regs[dst] = r_int64(intmask(regs[a1] % d)) if d != r_int64(0) else r_int64(0)
+        elif op == EXPR_INT_NEG:
+            null[dst] = null[a1]
+            regs[dst] = r_int64(intmask(-regs[a1]))
+
+        elif op == EXPR_FLOAT_ADD:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = float2longlong(longlong2float(regs[a1]) + longlong2float(regs[a2]))
+        elif op == EXPR_FLOAT_SUB:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = float2longlong(longlong2float(regs[a1]) - longlong2float(regs[a2]))
+        elif op == EXPR_FLOAT_MUL:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = float2longlong(longlong2float(regs[a1]) * longlong2float(regs[a2]))
+        elif op == EXPR_FLOAT_DIV:
+            null[dst] = null[a1] or null[a2]
+            rhs = longlong2float(regs[a2])
+            if rhs != 0.0:
+                regs[dst] = float2longlong(longlong2float(regs[a1]) / rhs)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_FLOAT_NEG:
+            null[dst] = null[a1]
+            regs[dst] = float2longlong(-longlong2float(regs[a1]))
+
+        elif op == EXPR_CMP_EQ:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] == regs[a2] else r_int64(0)
+        elif op == EXPR_CMP_NE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] != regs[a2] else r_int64(0)
+        elif op == EXPR_CMP_GT:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] > regs[a2] else r_int64(0)
+        elif op == EXPR_CMP_GE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] >= regs[a2] else r_int64(0)
+        elif op == EXPR_CMP_LT:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] < regs[a2] else r_int64(0)
+        elif op == EXPR_CMP_LE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if regs[a1] <= regs[a2] else r_int64(0)
+
+        elif op == EXPR_FCMP_EQ:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) == longlong2float(regs[a2]) else r_int64(0)
+        elif op == EXPR_FCMP_NE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) != longlong2float(regs[a2]) else r_int64(0)
+        elif op == EXPR_FCMP_GT:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) > longlong2float(regs[a2]) else r_int64(0)
+        elif op == EXPR_FCMP_GE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) >= longlong2float(regs[a2]) else r_int64(0)
+        elif op == EXPR_FCMP_LT:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) < longlong2float(regs[a2]) else r_int64(0)
+        elif op == EXPR_FCMP_LE:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if longlong2float(regs[a1]) <= longlong2float(regs[a2]) else r_int64(0)
+
+        elif op == EXPR_BOOL_AND:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if (regs[a1] != r_int64(0) and regs[a2] != r_int64(0)) else r_int64(0)
+        elif op == EXPR_BOOL_OR:
+            null[dst] = null[a1] or null[a2]
+            regs[dst] = r_int64(1) if (regs[a1] != r_int64(0) or regs[a2] != r_int64(0)) else r_int64(0)
+        elif op == EXPR_BOOL_NOT:
+            null[dst] = null[a1]
+            regs[dst] = r_int64(1) if regs[a1] == r_int64(0) else r_int64(0)
+
+        elif op == EXPR_IS_NULL:
+            null[dst] = False
+            if a1 == pk_idx:
+                regs[dst] = r_int64(0)
+            else:
+                pi = a1 if a1 < pk_idx else a1 - 1
+                nw = in_batch._read_null_word(row_idx)
+                regs[dst] = r_int64(1) if bool(nw & (r_uint64(1) << pi)) else r_int64(0)
+        elif op == EXPR_IS_NOT_NULL:
+            null[dst] = False
+            if a1 == pk_idx:
+                regs[dst] = r_int64(1)
+            else:
+                pi = a1 if a1 < pk_idx else a1 - 1
+                nw = in_batch._read_null_word(row_idx)
+                regs[dst] = r_int64(0) if bool(nw & (r_uint64(1) << pi)) else r_int64(1)
+
+        elif op == EXPR_INT_TO_FLOAT:
+            null[dst] = null[a1]
+            regs[dst] = float2longlong(float(intmask(regs[a1])))
+
+        elif op == EXPR_EMIT:
+            base_ptr = emit_bases[emit_idx]
+            stride = emit_strides[emit_idx]
+            payload = emit_payloads[emit_idx]
+            ptr = rffi.ptradd(base_ptr, row_idx * stride)
+            if null[a1]:
+                rffi.cast(rffi.LONGLONGP, ptr)[0] = rffi.cast(rffi.LONGLONG, 0)
+                emit_null_mask |= r_uint64(1) << payload
+            else:
+                rffi.cast(rffi.LONGLONGP, ptr)[0] = rffi.cast(rffi.LONGLONG, regs[a1])
+            emit_idx += 1
+
+        elif op == EXPR_STR_COL_EQ_CONST:
+            if a1 == pk_idx:
+                null[dst] = False
+            else:
+                pi = a1 if a1 < pk_idx else a1 - 1
+                nw = in_batch._read_null_word(row_idx)
+                null[dst] = bool(nw & (r_uint64(1) << pi))
+            if not null[dst]:
+                _len, _pref, ptr, heap, pystr = in_batch._read_col_str_struct(row_idx, a1)
+                const_str = program.const_strings[a2]
+                regs[dst] = r_int64(1) if _strings.string_equals(
+                    ptr, heap, const_str, program.const_lengths[a2],
+                    r_uint64(program.const_prefixes[a2])
+                ) else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LT_CONST:
+            if a1 == pk_idx:
+                null[dst] = False
+            else:
+                pi = a1 if a1 < pk_idx else a1 - 1
+                nw = in_batch._read_null_word(row_idx)
+                null[dst] = bool(nw & (r_uint64(1) << pi))
+            if not null[dst]:
+                l_len, l_pref, l_ptr, l_heap, l_str = in_batch._read_col_str_struct(row_idx, a1)
+                const_str = program.const_strings[a2]
+                cmp = _strings.compare_structures(
+                    l_len, l_pref, l_ptr, l_heap, l_str,
+                    program.const_lengths[a2],
+                    rffi.cast(rffi.LONGLONG, r_uint64(program.const_prefixes[a2])),
+                    _strings.NULL_PTR, _strings.NULL_PTR, const_str
+                )
+                regs[dst] = r_int64(1) if cmp < 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LE_CONST:
+            if a1 == pk_idx:
+                null[dst] = False
+            else:
+                pi = a1 if a1 < pk_idx else a1 - 1
+                nw = in_batch._read_null_word(row_idx)
+                null[dst] = bool(nw & (r_uint64(1) << pi))
+            if not null[dst]:
+                l_len, l_pref, l_ptr, l_heap, l_str = in_batch._read_col_str_struct(row_idx, a1)
+                const_str = program.const_strings[a2]
+                cmp = _strings.compare_structures(
+                    l_len, l_pref, l_ptr, l_heap, l_str,
+                    program.const_lengths[a2],
+                    rffi.cast(rffi.LONGLONG, r_uint64(program.const_prefixes[a2])),
+                    _strings.NULL_PTR, _strings.NULL_PTR, const_str
+                )
+                regs[dst] = r_int64(1) if cmp <= 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_EQ_COL:
+            nw = in_batch._read_null_word(row_idx)
+            n_a1 = False if a1 == pk_idx else bool(nw & (r_uint64(1) << (a1 if a1 < pk_idx else a1 - 1)))
+            n_a2 = False if a2 == pk_idx else bool(nw & (r_uint64(1) << (a2 if a2 < pk_idx else a2 - 1)))
+            null[dst] = n_a1 or n_a2
+            if not null[dst]:
+                l1, p1, ptr1, h1, s1 = in_batch._read_col_str_struct(row_idx, a1)
+                l2, p2, ptr2, h2, s2 = in_batch._read_col_str_struct(row_idx, a2)
+                regs[dst] = r_int64(1) if _strings.compare_structures(
+                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+                ) == 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LT_COL:
+            nw = in_batch._read_null_word(row_idx)
+            n_a1 = False if a1 == pk_idx else bool(nw & (r_uint64(1) << (a1 if a1 < pk_idx else a1 - 1)))
+            n_a2 = False if a2 == pk_idx else bool(nw & (r_uint64(1) << (a2 if a2 < pk_idx else a2 - 1)))
+            null[dst] = n_a1 or n_a2
+            if not null[dst]:
+                l1, p1, ptr1, h1, s1 = in_batch._read_col_str_struct(row_idx, a1)
+                l2, p2, ptr2, h2, s2 = in_batch._read_col_str_struct(row_idx, a2)
+                regs[dst] = r_int64(1) if _strings.compare_structures(
+                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+                ) < 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+        elif op == EXPR_STR_COL_LE_COL:
+            nw = in_batch._read_null_word(row_idx)
+            n_a1 = False if a1 == pk_idx else bool(nw & (r_uint64(1) << (a1 if a1 < pk_idx else a1 - 1)))
+            n_a2 = False if a2 == pk_idx else bool(nw & (r_uint64(1) << (a2 if a2 < pk_idx else a2 - 1)))
+            null[dst] = n_a1 or n_a2
+            if not null[dst]:
+                l1, p1, ptr1, h1, s1 = in_batch._read_col_str_struct(row_idx, a1)
+                l2, p2, ptr2, h2, s2 = in_batch._read_col_str_struct(row_idx, a2)
+                regs[dst] = r_int64(1) if _strings.compare_structures(
+                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
+                ) <= 0 else r_int64(0)
+            else:
+                regs[dst] = r_int64(0)
+
+        i += 1
+
+    return emit_null_mask
+
+
+# ---------------------------------------------------------------------------
+# ExprMapFunction — plugs into op_map via ScalarFunction interface
+# ---------------------------------------------------------------------------
+
+
 class ExprMapFunction(ScalarFunction):
-    _immutable_fields_ = ['program']
+    _immutable_fields_ = ['program',
+                          '_copy_src_cols[*]', '_copy_out_payloads[*]',
+                          '_copy_type_codes[*]', '_null_payloads[*]',
+                          '_emit_out_payloads[*]', '_has_compute']
 
     def __init__(self, program):
         self.program = program
+        self._analyze()
+
+    def _analyze(self):
+        code = self.program.code
+        copy_src = []
+        copy_out = []
+        copy_tc = []
+        null_pl = []
+        emit_out = []
+        has_compute = False
+
+        i = 0
+        while i < self.program.num_instrs:
+            base = i * 4
+            op = intmask(code[base])
+            dst = intmask(code[base + 1])
+            a1 = intmask(code[base + 2])
+            a2 = intmask(code[base + 3])
+
+            if op == EXPR_COPY_COL:
+                copy_src.append(a1)
+                copy_out.append(a2)
+                copy_tc.append(dst)
+            elif op == EXPR_EMIT_NULL:
+                null_pl.append(a1)
+            else:
+                has_compute = True
+                if op == EXPR_EMIT:
+                    emit_out.append(a2)
+            i += 1
+
+        self._copy_src_cols = copy_src[:]
+        self._copy_out_payloads = copy_out[:]
+        self._copy_type_codes = copy_tc[:]
+        self._null_payloads = null_pl[:]
+        self._emit_out_payloads = emit_out[:]
+        self._has_compute = has_compute
 
     def evaluate_map(self, row_accessor, output_row):
         eval_expr_map(self.program, row_accessor, output_row)
+
+    @jit.unroll_safe
+    def evaluate_map_batch(self, in_batch, out_batch, out_schema):
+        from gnitz.core import types as _types
+        from gnitz.core import strings as _strings
+        from gnitz.storage import buffer as _buf
+        from rpython.rtyper.lltypesystem import lltype
+
+        n = in_batch.length()
+        if n == 0:
+            return True
+
+        in_schema = in_batch._schema
+
+        # Phase 1: structural columns — bulk memcpy
+        out_batch.pk_lo_buf.append_from_buffer(in_batch.pk_lo_buf, 0, n * 8)
+        out_batch.pk_hi_buf.append_from_buffer(in_batch.pk_hi_buf, 0, n * 8)
+        out_batch.weight_buf.append_from_buffer(in_batch.weight_buf, 0, n * 8)
+
+        # Phase 2: batch-level COPY_COL columns
+        copy_src = self._copy_src_cols
+        copy_out = self._copy_out_payloads
+        copy_tc = self._copy_type_codes
+
+        for k in range(len(copy_src)):
+            src_ci = copy_src[k]
+            out_payload = copy_out[k]
+            tc = copy_tc[k]
+            out_ci = out_payload if out_payload < out_schema.pk_index else out_payload + 1
+
+            if src_ci == in_schema.pk_index:
+                stride = out_batch.col_strides[out_ci]
+                col_type = out_schema.columns[out_ci].field_type
+                dest_base = out_batch.col_bufs[out_ci].alloc_n(
+                    n, stride, col_type.alignment)
+                dest_arr = rffi.cast(rffi.ULONGLONGP, dest_base)
+                for row in range(n):
+                    dest_arr[row] = rffi.cast(
+                        rffi.ULONGLONG, in_batch._read_pk_lo(row))
+            elif tc == _types.TYPE_STRING.code:
+                stride = in_batch.col_strides[src_ci]
+                col_type = out_schema.columns[out_ci].field_type
+                n_bytes = n * stride
+                dest_block = out_batch.col_bufs[out_ci].alloc(
+                    n_bytes, alignment=col_type.alignment)
+                src_block = in_batch.col_bufs[src_ci].base_ptr
+                _buf.c_memmove(
+                    rffi.cast(rffi.VOIDP, dest_block),
+                    rffi.cast(rffi.VOIDP, src_block),
+                    rffi.cast(rffi.SIZE_T, n_bytes),
+                )
+                src_blob_base = in_batch.blob_arena.base_ptr
+                for row in range(n):
+                    src_ptr = rffi.ptradd(src_block, row * stride)
+                    length = rffi.cast(
+                        lltype.Signed, rffi.cast(rffi.UINTP, src_ptr)[0])
+                    if length > _strings.SHORT_STRING_THRESHOLD:
+                        dest_ptr = rffi.ptradd(dest_block, row * stride)
+                        old_offset = rffi.cast(
+                            rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
+                        src_data_ptr = rffi.ptradd(
+                            src_blob_base,
+                            rffi.cast(lltype.Signed, old_offset))
+                        new_offset = out_batch.allocator.allocate_from_ptr(
+                            src_data_ptr, length)
+                        rffi.cast(
+                            rffi.ULONGLONGP,
+                            rffi.ptradd(dest_ptr, 8)
+                        )[0] = rffi.cast(rffi.ULONGLONG, new_offset)
+            else:
+                stride = in_batch.col_strides[src_ci]
+                out_batch.col_bufs[out_ci].append_from_buffer(
+                    in_batch.col_bufs[src_ci], 0, n * stride)
+
+        # Phase 3: EMIT_NULL columns — alloc + zero-fill
+        null_pls = self._null_payloads
+        for k in range(len(null_pls)):
+            out_payload = null_pls[k]
+            out_ci = out_payload if out_payload < out_schema.pk_index else out_payload + 1
+            stride = out_batch.col_strides[out_ci]
+            col_type = out_schema.columns[out_ci].field_type
+            dest_base = out_batch.col_bufs[out_ci].alloc_n(
+                n, stride, col_type.alignment)
+            total = n * stride
+            for b in range(total):
+                dest_base[b] = '\x00'
+
+        # Phase 4: EMIT columns + null bitmap
+        emit_pls = self._emit_out_payloads
+        emit_count = len(emit_pls)
+
+        # Pre-allocate EMIT target columns
+        emit_bases = [lltype.nullptr(rffi.CCHARP.TO)] * emit_count
+        emit_strides = [0] * emit_count
+        if self._has_compute:
+            for k in range(emit_count):
+                out_payload = emit_pls[k]
+                out_ci = out_payload if out_payload < out_schema.pk_index else out_payload + 1
+                stride = out_batch.col_strides[out_ci]
+                col_type = out_schema.columns[out_ci].field_type
+                emit_bases[k] = out_batch.col_bufs[out_ci].alloc_n(
+                    n, stride, col_type.alignment)
+                emit_strides[k] = stride
+
+        # Pre-allocate null_buf
+        null_base = out_batch.null_buf.alloc_n(n, 8, 8)
+        null_arr = rffi.cast(rffi.ULONGLONGP, null_base)
+
+        # Per-row null bitmap + compute
+        for row in range(n):
+            in_null = in_batch._read_null_word(row)
+            out_null = r_uint64(0)
+
+            # COPY_COL null bits — shuffle from input to output positions
+            for k in range(len(copy_src)):
+                src_ci = copy_src[k]
+                if src_ci == in_schema.pk_index:
+                    continue
+                in_pi = src_ci if src_ci < in_schema.pk_index else src_ci - 1
+                out_null |= ((in_null >> in_pi) & r_uint64(1)) << copy_out[k]
+
+            # EMIT_NULL bits
+            for k in range(len(null_pls)):
+                out_null |= r_uint64(1) << null_pls[k]
+
+            # Execute compute
+            if self._has_compute:
+                out_null |= _eval_compute_row_direct(
+                    self.program, in_batch, row,
+                    emit_bases, emit_strides, emit_pls)
+
+            null_arr[row] = rffi.cast(rffi.ULONGLONG, out_null)
+
+        out_batch._count += n
+        out_batch._invalidate_cache()
+        return True
 
 
 # ---------------------------------------------------------------------------

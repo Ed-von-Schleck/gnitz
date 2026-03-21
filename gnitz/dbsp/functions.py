@@ -3,7 +3,7 @@
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, intmask, r_uint64
 from rpython.rlib.longlong2float import float2longlong, longlong2float
-from rpython.rtyper.lltypesystem import rffi
+from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import types, strings
 
 # --- Function Opcodes ---
@@ -30,6 +30,10 @@ class ScalarFunction(object):
 
     def evaluate_map(self, row_accessor, output_row):
         pass
+
+    def evaluate_map_batch(self, in_batch, out_batch, out_schema):
+        """Batch-level map. Returns True if handled, False to fall back to per-row."""
+        return False
 
 
 class NullPredicate(ScalarFunction):
@@ -105,6 +109,91 @@ class UniversalProjection(ScalarFunction):
                 output_row.append_u128(row_accessor.get_u128_lo(src_idx), row_accessor.get_u128_hi(src_idx))
             else:
                 output_row.append_int(row_accessor.get_int_signed(src_idx))
+
+    @jit.unroll_safe
+    def evaluate_map_batch(self, in_batch, out_batch, out_schema):
+        from gnitz.storage import buffer as buf_mod
+
+        n = in_batch.length()
+        if n == 0:
+            return True
+
+        in_schema = in_batch._schema
+
+        # Structural columns — bulk memcpy
+        out_batch.pk_lo_buf.append_from_buffer(in_batch.pk_lo_buf, 0, n * 8)
+        out_batch.pk_hi_buf.append_from_buffer(in_batch.pk_hi_buf, 0, n * 8)
+        out_batch.weight_buf.append_from_buffer(in_batch.weight_buf, 0, n * 8)
+
+        # Payload columns — per-column memcpy or string relocation
+        for i in range(len(self.src_indices)):
+            src_ci = self.src_indices[i]
+            out_ci = i if i < out_schema.pk_index else i + 1
+            tc = self.src_types[i]
+
+            if src_ci == in_schema.pk_index:
+                # PK value lives in pk_lo_buf, not col_bufs
+                stride = out_batch.col_strides[out_ci]
+                col_type = out_schema.columns[out_ci].field_type
+                dest_base = out_batch.col_bufs[out_ci].alloc_n(
+                    n, stride, col_type.alignment)
+                dest_arr = rffi.cast(rffi.ULONGLONGP, dest_base)
+                for row in range(n):
+                    dest_arr[row] = rffi.cast(
+                        rffi.ULONGLONG, in_batch._read_pk_lo(row))
+            elif tc == types.TYPE_STRING.code:
+                stride = in_batch.col_strides[src_ci]
+                col_type = out_schema.columns[out_ci].field_type
+                n_bytes = n * stride
+                dest_block = out_batch.col_bufs[out_ci].alloc(
+                    n_bytes, alignment=col_type.alignment)
+                src_block = in_batch.col_bufs[src_ci].base_ptr
+                buf_mod.c_memmove(
+                    rffi.cast(rffi.VOIDP, dest_block),
+                    rffi.cast(rffi.VOIDP, src_block),
+                    rffi.cast(rffi.SIZE_T, n_bytes),
+                )
+                src_blob_base = in_batch.blob_arena.base_ptr
+                for row in range(n):
+                    src_ptr = rffi.ptradd(src_block, row * stride)
+                    length = rffi.cast(
+                        lltype.Signed, rffi.cast(rffi.UINTP, src_ptr)[0])
+                    if length > strings.SHORT_STRING_THRESHOLD:
+                        dest_ptr = rffi.ptradd(dest_block, row * stride)
+                        old_offset = rffi.cast(
+                            rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
+                        src_data_ptr = rffi.ptradd(
+                            src_blob_base,
+                            rffi.cast(lltype.Signed, old_offset))
+                        new_offset = out_batch.allocator.allocate_from_ptr(
+                            src_data_ptr, length)
+                        rffi.cast(
+                            rffi.ULONGLONGP,
+                            rffi.ptradd(dest_ptr, 8)
+                        )[0] = rffi.cast(rffi.ULONGLONG, new_offset)
+            else:
+                # Fixed-width: single memcpy
+                stride = in_batch.col_strides[src_ci]
+                out_batch.col_bufs[out_ci].append_from_buffer(
+                    in_batch.col_bufs[src_ci], 0, n * stride)
+
+        # Null bitmap — per-row bit shuffling
+        null_base = out_batch.null_buf.alloc_n(n, 8, 8)
+        null_arr = rffi.cast(rffi.ULONGLONGP, null_base)
+        for row in range(n):
+            in_null = in_batch._read_null_word(row)
+            out_null = r_uint64(0)
+            for i in range(len(self.src_indices)):
+                src_ci = self.src_indices[i]
+                if src_ci == in_schema.pk_index:
+                    continue  # PK is never null
+                in_pi = src_ci if src_ci < in_schema.pk_index else src_ci - 1
+                out_null |= ((in_null >> in_pi) & r_uint64(1)) << i
+            null_arr[row] = rffi.cast(rffi.ULONGLONG, out_null)
+
+        out_batch._count += n
+        out_batch._invalidate_cache()
+        return True
 
 
 # ---------------------------------------------------------------------------

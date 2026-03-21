@@ -85,7 +85,9 @@ def op_filter(in_batch, out_writer, func):
 def op_map(in_batch, out_writer, func, out_schema, reindex_col=-1):
     """
     Applies a transformation to every row.
-    Uses RowBuilder to validate row construction and commit to the batch.
+    Tries batch-level columnar map first (memcpy per column), falling back
+    to per-row RowBuilder when the batch path is not implemented or when
+    reindex_col requires per-row PK computation.
 
     in_batch:   ArenaZSetBatch
     out_writer: BatchWriter  (strictly write-only destination)
@@ -93,6 +95,13 @@ def op_map(in_batch, out_writer, func, out_schema, reindex_col=-1):
     out_schema: TableSchema for the output batch
     reindex_col: when >= 0, use this input column's value as the new PK
     """
+    # Batch path: bypass RowBuilder staging entirely
+    if reindex_col < 0 and func is not None:
+        if func.evaluate_map_batch(in_batch, out_writer._batch, out_schema):
+            out_writer.mark_sorted(in_batch._sorted)
+            return
+
+    # Per-row fallback
     builder = RowBuilder(out_schema, out_writer._batch)
 
     n = in_batch.length()
