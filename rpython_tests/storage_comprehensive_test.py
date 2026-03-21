@@ -35,9 +35,13 @@ from gnitz.storage import (
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.storage.table import PersistentTable
-from gnitz.storage.partitioned_table import make_partitioned_ephemeral
-from gnitz.core.batch import ColumnarBatchAccessor, RowBuilder
+from gnitz.storage.partitioned_table import (
+    PartitionedTable, make_partitioned_persistent, make_partitioned_ephemeral,
+    get_num_partitions, _partition_for_key, NUM_PARTITIONS,
+)
+from gnitz.core.batch import ArenaZSetBatch, ColumnarBatchAccessor, RowBuilder
 from gnitz.catalog.registry import _enforce_unique_pk, TableFamily
+from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 # ------------------------------------------------------------------------------
@@ -135,6 +139,18 @@ def corrupt_byte(filepath, offset):
         rposix.write(fd, chr(val ^ 0xFF))
     finally:
         rposix.close(fd)
+
+
+def log(msg):
+    os.write(1, "[TEST] " + msg + "\n")
+
+
+def _make_pt_schema():
+    cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
+    ]
+    return types.TableSchema(cols, 0)
 
 
 # ------------------------------------------------------------------------------
@@ -2775,6 +2791,327 @@ def test_flsm_guard_isolation(base_dir):
 
 
 # ------------------------------------------------------------------------------
+# Partitioned Table Tests
+# ------------------------------------------------------------------------------
+
+
+def test_get_num_partitions():
+    log("test_get_num_partitions")
+    # System tables (table_id < FIRST_USER_TABLE_ID) get 1 partition
+    for tid in range(1, FIRST_USER_TABLE_ID):
+        assert_equal_i(1, get_num_partitions(tid),
+                       "system table %d should have 1 partition" % tid)
+    # User tables get NUM_PARTITIONS
+    assert_equal_i(NUM_PARTITIONS, get_num_partitions(FIRST_USER_TABLE_ID),
+                   "first user table should have 256 partitions")
+    assert_equal_i(NUM_PARTITIONS, get_num_partitions(1000),
+                   "user table 1000 should have 256 partitions")
+    log("  PASSED")
+
+
+def test_partition_routing_determinism():
+    log("test_partition_routing_determinism")
+    # Same key always maps to the same partition
+    for i in range(100):
+        lo = r_uint64(i * 7 + 13)
+        hi = r_uint64(i * 11 + 37)
+        p1 = _partition_for_key(lo, hi)
+        p2 = _partition_for_key(lo, hi)
+        assert_equal_i(p1, p2, "partition must be deterministic for key %d" % i)
+        assert_true(0 <= p1 < 256, "partition must be in [0, 256)")
+    log("  PASSED")
+
+
+def test_n1_persistent(base_dir):
+    log("test_n1_persistent (system table behavior)")
+    d = base_dir + "/n1_persist"
+    os.mkdir(d)
+
+    schema = _make_pt_schema()
+    table_id = 5  # system table
+
+    store = make_partitioned_persistent(d, "sys_test", schema, table_id, 1)
+
+    # Ingest a few rows
+    b = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    for i in range(10):
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(i * 100))
+        rb.commit()
+
+    store.ingest_batch(b)
+    b.free()
+
+    # Scan and verify count
+    count = 0
+    cur = store.create_cursor()
+    while cur.is_valid():
+        count += 1
+        cur.advance()
+    cur.close()
+    assert_equal_i(10, count, "N=1 scan should see 10 rows")
+
+    # has_pk
+    assert_true(store.has_pk(r_uint64(1), r_uint64(0)), "pk=1 should exist")
+    assert_true(not store.has_pk(r_uint64(999), r_uint64(0)), "pk=999 should not exist")
+
+    # flush and re-scan
+    store.flush()
+    count = 0
+    cur = store.create_cursor()
+    while cur.is_valid():
+        count += 1
+        cur.advance()
+    cur.close()
+    assert_equal_i(10, count, "N=1 scan after flush should see 10 rows")
+
+    store.close()
+    log("  PASSED")
+
+
+def test_n256_persistent(base_dir):
+    log("test_n256_persistent (user table, 1000 rows)")
+    d = base_dir + "/n256_persist"
+    os.mkdir(d)
+
+    schema = _make_pt_schema()
+    table_id = FIRST_USER_TABLE_ID + 1
+
+    store = make_partitioned_persistent(d, "user_test", schema, table_id, NUM_PARTITIONS)
+
+    num_rows = 1000
+
+    # Ingest 1000 rows
+    b = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    for i in range(num_rows):
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(i * 10))
+        rb.commit()
+
+    store.ingest_batch(b)
+    b.free()
+
+    # Scan all — should see exactly 1000 rows
+    count = 0
+    cur = store.create_cursor()
+    while cur.is_valid():
+        count += 1
+        cur.advance()
+    cur.close()
+    assert_equal_i(num_rows, count, "N=256 scan should see 1000 rows")
+
+    # has_pk for each key
+    for i in range(num_rows):
+        assert_true(store.has_pk(r_uint64(i + 1), r_uint64(0)), "pk=%d should exist" % (i + 1))
+
+    assert_true(not store.has_pk(r_uint64(0), r_uint64(0)), "pk=0 should not exist")
+    assert_true(not store.has_pk(r_uint64(num_rows + 1), r_uint64(0)),
+                "pk=%d should not exist" % (num_rows + 1))
+
+    log("  PASSED")
+
+
+def test_n256_sorted_output(base_dir):
+    log("test_n256_sorted_output (cursor merge produces global sort)")
+    d = base_dir + "/n256_sorted"
+    os.mkdir(d)
+
+    schema = _make_pt_schema()
+    table_id = FIRST_USER_TABLE_ID + 2
+
+    store = make_partitioned_persistent(d, "sort_test", schema, table_id, NUM_PARTITIONS)
+
+    num_rows = 500
+
+    b = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    for i in range(num_rows):
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(i))
+        rb.commit()
+
+    store.ingest_batch(b)
+    b.free()
+
+    # Verify cursor output is sorted
+    cur = store.create_cursor()
+    prev_key = r_uint128(0)
+    count = 0
+    while cur.is_valid():
+        k = cur.key()
+        assert_true(k > prev_key, "cursor output must be globally sorted")
+        prev_key = k
+        count += 1
+        cur.advance()
+    cur.close()
+    assert_equal_i(num_rows, count, "sorted scan count")
+
+    store.close()
+    log("  PASSED")
+
+
+def test_n256_flush_and_rescan(base_dir):
+    log("test_n256_flush_and_rescan")
+    d = base_dir + "/n256_flush"
+    os.mkdir(d)
+
+    schema = _make_pt_schema()
+    table_id = FIRST_USER_TABLE_ID + 3
+
+    store = make_partitioned_persistent(d, "flush_test", schema, table_id, NUM_PARTITIONS)
+
+    # Ingest first batch
+    b = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    for i in range(100):
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(i))
+        rb.commit()
+    store.ingest_batch(b)
+    b.free()
+
+    # Flush
+    store.flush()
+
+    # Ingest second batch
+    b2 = ArenaZSetBatch(schema)
+    rb2 = RowBuilder(schema, b2)
+    for i in range(100, 200):
+        rb2.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
+        rb2.put_int(r_int64(i))
+        rb2.commit()
+    store.ingest_batch(b2)
+    b2.free()
+
+    # Should see all 200
+    count = 0
+    cur = store.create_cursor()
+    while cur.is_valid():
+        count += 1
+        cur.advance()
+    cur.close()
+    assert_equal_i(200, count, "after flush + second ingest should see 200 rows")
+
+    store.close()
+    log("  PASSED")
+
+
+def test_n256_ephemeral(base_dir):
+    log("test_n256_ephemeral")
+    d = base_dir + "/n256_eph"
+    os.mkdir(d)
+
+    schema = _make_pt_schema()
+    table_id = FIRST_USER_TABLE_ID + 4
+
+    store = make_partitioned_ephemeral(d, "eph_test", schema, table_id, NUM_PARTITIONS)
+
+    num_rows = 300
+
+    b = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    for i in range(num_rows):
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(i))
+        rb.commit()
+    store.ingest_batch(b)
+    b.free()
+
+    count = 0
+    cur = store.create_cursor()
+    while cur.is_valid():
+        count += 1
+        cur.advance()
+    cur.close()
+    assert_equal_i(num_rows, count, "ephemeral N=256 should see all rows")
+
+    store.close()
+    log("  PASSED")
+
+
+def test_create_child(base_dir):
+    log("test_create_child")
+    d = base_dir + "/n256_child"
+    os.mkdir(d)
+
+    schema = _make_pt_schema()
+    table_id = FIRST_USER_TABLE_ID + 5
+
+    store = make_partitioned_ephemeral(d, "child_test", schema, table_id, NUM_PARTITIONS)
+
+    child = store.create_child("scratch", schema)
+    # child should be usable as a store
+    b = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    rb.begin(r_uint64(42), r_uint64(0), r_int64(1))
+    rb.put_int(r_int64(99))
+    rb.commit()
+    child.ingest_batch(b)
+    b.free()
+
+    assert_true(child.has_pk(r_uint64(42), r_uint64(0)), "child should have pk=42")
+
+    child.close()
+    store.close()
+    log("  PASSED")
+
+
+def test_retract_pk_partitioned(base_dir):
+    log("test_retract_pk_partitioned")
+    d = base_dir + "/retract_part"
+    os.mkdir(d)
+
+    schema = _make_pt_schema()
+    table_id = FIRST_USER_TABLE_ID + 10
+
+    store = make_partitioned_persistent(d, "retract_test", schema, table_id, NUM_PARTITIONS)
+
+    # Insert rows
+    b = ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
+    for i in range(20):
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(i * 10))
+        rb.commit()
+    store.ingest_batch(b)
+    b.free()
+
+    # retract_pk for an existing key
+    out = ArenaZSetBatch(schema)
+    result = store.retract_pk(r_uint64(5), r_uint64(0), out)
+    assert_true(result, "retract_pk partitioned should return True for pk=5")
+    assert_equal_i(1, out.length(), "retract_pk partitioned should emit 1 row")
+    assert_true(out.get_weight(0) == r_int64(-1), "retract weight should be -1")
+    assert_true(out.get_pk(0) == r_uint128(5), "retract pk should be 5")
+    out.free()
+
+    store.close()
+    log("  PASSED")
+
+
+def test_retract_pk_partitioned_absent(base_dir):
+    log("test_retract_pk_partitioned_absent")
+    d = base_dir + "/retract_part_absent"
+    os.mkdir(d)
+
+    schema = _make_pt_schema()
+    table_id = FIRST_USER_TABLE_ID + 11
+
+    store = make_partitioned_persistent(d, "retract_absent", schema, table_id, NUM_PARTITIONS)
+
+    out = ArenaZSetBatch(schema)
+    result = store.retract_pk(r_uint64(12345), r_uint64(0), out)
+    assert_true(not result, "retract_pk partitioned absent should return False")
+    assert_equal_i(0, out.length(), "retract_pk partitioned absent out should be empty")
+    out.free()
+
+    store.close()
+    log("  PASSED")
+
+
+# ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
 
@@ -2818,6 +3155,16 @@ def entry_point(argv):
         test_flsm_lazy_leveling_lmax(base_dir)
         test_flsm_guard_isolation(base_dir)
         test_zero_copy_wal_recovery(base_dir)
+        test_get_num_partitions()
+        test_partition_routing_determinism()
+        test_n1_persistent(base_dir)
+        test_n256_persistent(base_dir)
+        test_n256_sorted_output(base_dir)
+        test_n256_flush_and_rescan(base_dir)
+        test_n256_ephemeral(base_dir)
+        test_create_child(base_dir)
+        test_retract_pk_partitioned(base_dir)
+        test_retract_pk_partitioned_absent(base_dir)
         os.write(1, "\nALL STORAGE TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

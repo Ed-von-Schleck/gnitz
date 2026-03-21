@@ -3,16 +3,40 @@
 import sys
 import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import rposix, rposix_stat
+from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core import types, batch
+core_types = types
 from gnitz.core.batch import RowBuilder
 from gnitz.core.types import _analyze_schema
-from gnitz.core.errors import LayoutError
+from gnitz.core.errors import LayoutError, GnitzError
 from gnitz.core.strings import resolve_string
 from gnitz.catalog import identifiers
 from gnitz.catalog.engine import open_engine
-from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID
+from gnitz.catalog import engine as engine_module
+from gnitz.catalog import system_tables as sys
+from gnitz.catalog.registry import ingest_to_family, validate_fk_inline
+from gnitz.catalog.system_tables import (
+    FIRST_USER_TABLE_ID,
+    FIRST_USER_SCHEMA_ID,
+    OWNER_KIND_TABLE,
+    pack_column_id,
+    IdxTab,
+    ColTab,
+)
+from gnitz.catalog.index_circuit import (
+    IndexCircuit,
+    get_index_key_type,
+    make_index_schema,
+    make_fk_index_name,
+    make_secondary_index_name,
+)
+from gnitz.catalog.metadata import ensure_dir
+from gnitz.storage.ephemeral_table import EphemeralTable
+from gnitz.server.executor import evaluate_dag
+from rpython_tests.helpers.circuit_builder import CircuitBuilder
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 # ------------------------------------------------------------------------------
@@ -59,8 +83,69 @@ def count_records(table):
     return count
 
 
+_count_records = count_records
+
+
+def _u64_to_hex_padded(val):
+    chars = "0123456789abcdef"
+    res = ["0"] * 16
+    temp = val
+    for i in range(15, -1, -1):
+        res[i] = chars[intmask(temp & r_uint64(0xF))]
+        temp >>= 4
+    return "".join(res)
+
+
+def log(msg):
+    os.write(1, "[TEST] " + msg + "\n")
+
+
+def log_step(name):
+    os.write(1, "\n[CHECKPOINT] " + name + "...\n")
+
+
+def fail(msg):
+    os.write(2, "\n!!! CRITICAL TEST FAILURE !!!\n")
+    os.write(2, msg + "\n")
+    raise Exception("Test Failure")
+
+
+def assert_true(cond, msg):
+    if not cond:
+        fail("Assertion Failed: " + msg)
+
+
+def assert_equal_i(expected, actual, msg):
+    if expected != actual:
+        fail(msg + " -> Expected: %d, Actual: %d" % (expected, actual))
+
+
+def assert_equal_u128(expected, actual, msg):
+    if expected != actual:
+        hi_e = r_uint64(expected >> 64)
+        lo_e = r_uint64(expected)
+        hi_a = r_uint64(actual >> 64)
+        lo_a = r_uint64(actual)
+        os.write(2, "   Expected: " + _u64_to_hex_padded(hi_e) + _u64_to_hex_padded(lo_e) + "\n")
+        os.write(2, "   Actual:   " + _u64_to_hex_padded(hi_a) + _u64_to_hex_padded(lo_a) + "\n")
+        fail(msg + " -> U128 Mismatch")
+
+
+def _make_passthrough_view(engine, view_name, source_family):
+    """Build a passthrough (SELECT *) view over source_family."""
+    schema = source_family.schema
+    out_cols = []
+    for col in schema.columns:
+        out_cols.append((col.name, col.field_type.code))
+    builder = CircuitBuilder(view_id=0, primary_source_id=source_family.table_id)
+    src = builder.input_delta()
+    builder.sink(src, target_table_id=0)
+    graph = builder.build(out_cols)
+    return engine.create_view(view_name, graph, "")
+
+
 # ------------------------------------------------------------------------------
-# Tests
+# Tests (original catalog)
 # ------------------------------------------------------------------------------
 
 
@@ -812,6 +897,843 @@ def test_restart(base_dir):
 
 
 # ------------------------------------------------------------------------------
+# Tests (from catalog_additional)
+# ------------------------------------------------------------------------------
+
+
+def test_index_functional_and_fanout(base_dir):
+    os.write(1, "[Catalog+] Testing Index Functional Fan-out...\n")
+    db_path = base_dir + "/index_func"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+            core_types.ColumnDefinition(core_types.TYPE_I64, name="val"),
+        ]
+
+        family = engine.create_table("public.tfanout", cols, 0)
+
+        # Ingest baseline
+        b = batch.ArenaZSetBatch(family.schema)
+        rb = RowBuilder(family.schema, b)
+        for i in range(5):
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
+            rb.put_int(r_int64(i * 100))
+            rb.commit()
+        ingest_to_family(family, b)
+        b.free()
+
+        # Create Index
+        circuit = engine.create_index("public.tfanout", "val")
+
+        if _count_records(circuit.table) != 5:
+            raise Exception("Index backfill count mismatch")
+
+        # Live fan-out test (Verify the 3-stage ingestion pipeline)
+        b2 = batch.ArenaZSetBatch(family.schema)
+        rb2 = RowBuilder(family.schema, b2)
+        rb2.begin(r_uint64(99), r_uint64(0), r_int64(1))
+        rb2.put_int(r_int64(777))
+        rb2.commit()
+        ingest_to_family(family, b2)
+        b2.free()
+
+        if _count_records(circuit.table) != 6:
+            raise Exception("Live index fan-out failed")
+
+        # Verify Standard Index Drop
+        engine.drop_index(circuit.name)
+        if engine.registry.has_index_by_name(circuit.name):
+            raise Exception("Standard index should have been dropped")
+
+    finally:
+        engine.close()
+    os.write(1, "    [OK] Index fan-out and drop verified.\n")
+
+
+def test_orphaned_metadata_recovery(base_dir):
+    os.write(1, "[Catalog+] Testing Orphaned Metadata Recovery...\n")
+    db_path = base_dir + "/orphaned"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        idx_sys = engine.sys.indices
+        b = batch.ArenaZSetBatch(idx_sys.schema)
+        # Manually inject index metadata pointing to a non-existent table ID 99999
+        IdxTab.append(
+            b,
+            idx_sys.schema,
+            888,
+            99999,
+            OWNER_KIND_TABLE,
+            1,
+            "orphaned_idx",
+            0,
+            "",
+        )
+        idx_sys.ingest_batch(b)
+        b.free()
+        idx_sys.flush()
+    finally:
+        engine.close()
+
+    # Re-open: The loader should fail because orphaned metadata is corruption
+    raised = False
+    try:
+        engine2 = open_engine(db_path)
+        engine2.close()
+    except LayoutError:
+        raised = True
+    if not raised:
+        raise Exception("Orphaned index should cause a LayoutError on reload")
+    os.write(1, "    [OK] Orphaned metadata correctly rejected.\n")
+
+
+def test_schema_mr_poisoning():
+    os.write(1, "[Catalog+] Testing Schema mr-poisoning...\n")
+    s1 = core_types.TableSchema(
+        [core_types.ColumnDefinition(core_types.TYPE_U64, name="pk")], 0
+    )
+    s2 = core_types.TableSchema(
+        [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="pk2"),
+            core_types.ColumnDefinition(core_types.TYPE_I64, name="val"),
+        ],
+        0,
+    )
+
+    s3 = core_types.merge_schemas_for_join(s1, s2)
+    b = batch.ArenaZSetBatch(s3)
+    rb = RowBuilder(s3, b)
+    rb.begin(r_uint64(0), r_uint64(0), r_int64(1))
+    rb.put_int(r_int64(123))
+    rb.commit()
+
+    acc = b.get_accessor(0)
+    if intmask(rffi.cast(rffi.LONGLONG, acc.get_int(1))) != 123:
+        raise Exception("Row interaction on joined schema failed")
+    b.free()
+    os.write(1, "    [OK] Joined schema resizability safe.\n")
+
+
+def test_identifier_boundary_slicing():
+    os.write(1, "[Catalog+] Testing Identifier Slicing...\n")
+    res = identifiers.parse_qualified_name(".table", "def")
+    if res[0] != "" or res[1] != "table":
+        raise Exception("Parse .table failed")
+    res = identifiers.parse_qualified_name("schema.", "def")
+    if res[0] != "schema" or res[1] != "":
+        raise Exception("Parse schema. failed")
+    os.write(1, "    [OK] Identifier slicing bounds safe.\n")
+
+
+def test_sequence_gap_recovery(base_dir):
+    os.write(1, "[Catalog+] Testing Sequence Gap Recovery...\n")
+    db_path = base_dir + "/seq_gap"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        cols = [core_types.ColumnDefinition(core_types.TYPE_U64, name="id")]
+        engine.create_table("public.t1", cols, 0)
+
+        # 1. Inject table record for tid 250
+        tbl_sys = engine.sys.tables
+        b = batch.ArenaZSetBatch(tbl_sys.schema)
+        rb = RowBuilder(tbl_sys.schema, b)
+        rb.begin(r_uint64(250), r_uint64(0), r_int64(1))
+        rb.put_int(r_int64(2))  # sid public
+        rb.put_string("gap_table")
+        rb.put_string(db_path + "/gap")
+        rb.put_int(r_int64(0))
+        rb.put_int(r_int64(0))
+        rb.commit()
+        tbl_sys.ingest_batch(b)
+        b.free()
+        tbl_sys.flush()
+
+        # 2. Inject column record for tid 250 (Required for reconstruction)
+        col_sys = engine.sys.columns
+        bc = batch.ArenaZSetBatch(col_sys.schema)
+        ColTab.append(
+            bc,
+            col_sys.schema,
+            250,
+            OWNER_KIND_TABLE,
+            0,
+            "id",
+            core_types.TYPE_U64.code,
+            0,
+            0,
+            0,
+        )
+        col_sys.ingest_batch(bc)
+        bc.free()
+        col_sys.flush()
+    finally:
+        engine.close()
+
+    # Engine re-open will rebuild registry. It should find table 250 and set next_id to 251.
+    engine2 = open_engine(db_path)
+    try:
+        t_new = engine2.create_table("public.tnext", cols, 0)
+        if t_new.table_id != 251:
+            raise Exception(
+                "Sequence recovery failed. Expected 251, got %d" % t_new.table_id
+            )
+    finally:
+        engine2.close()
+    os.write(1, "    [OK] Sequence gap recovery verified.\n")
+
+
+def test_fk_referential_integrity(base_dir):
+    os.write(1, "[Catalog+] Testing FK Referential Integrity...\n")
+    db_path = base_dir + "/fk_integrity"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        # 1. Create Parent (U64 PK)
+        parent_cols = [core_types.ColumnDefinition(core_types.TYPE_U64, name="pid")]
+        parent = engine.create_table("public.parents", parent_cols, 0)
+
+        # 2. Create Child (U64 FK referencing Parent)
+        child_cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="cid"),
+            core_types.ColumnDefinition(
+                core_types.TYPE_U64,
+                name="pid_fk",
+                fk_table_id=parent.table_id,
+                fk_col_idx=0,
+            ),
+        ]
+        child = engine.create_table("public.children", child_cols, 0)
+
+        # 3. Insert valid parent (PK-only schema, no payload columns)
+        pb = batch.ArenaZSetBatch(parent.schema)
+        rb_p = RowBuilder(parent.schema, pb)
+        rb_p.begin(r_uint64(10), r_uint64(0), r_int64(1))
+        rb_p.commit()
+        ingest_to_family(parent, pb)
+        pb.free()
+
+        # 4. Insert valid child
+        cb = batch.ArenaZSetBatch(child.schema)
+        rb_c = RowBuilder(child.schema, cb)
+        rb_c.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb_c.put_int(r_int64(10))  # Valid pid
+        rb_c.commit()
+        validate_fk_inline(child, cb)
+        ingest_to_family(child, cb)
+        cb.free()
+
+        # 5. Insert INVALID child (pid 99 does not exist)
+        cb2 = batch.ArenaZSetBatch(child.schema)
+        rb_c2 = RowBuilder(child.schema, cb2)
+        rb_c2.begin(r_uint64(2), r_uint64(0), r_int64(1))
+        rb_c2.put_int(r_int64(99))
+        rb_c2.commit()
+
+        raised = False
+        try:
+            validate_fk_inline(child, cb2)
+            ingest_to_family(child, cb2)
+        except LayoutError:
+            raised = True
+        if not raised:
+            raise Exception("Referential integrity failed to block invalid FK")
+        cb2.free()
+
+        # 6. Test U128 FK (UUID style)
+        u_parent_cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U128, name="uuid")
+        ]
+        u_parent = engine.create_table("public.uparents", u_parent_cols, 0)
+
+        u_child_cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+            core_types.ColumnDefinition(
+                core_types.TYPE_U128,
+                name="ufk",
+                fk_table_id=u_parent.table_id,
+                fk_col_idx=0,
+            ),
+        ]
+        u_child = engine.create_table("public.uchildren", u_child_cols, 0)
+
+        upb = batch.ArenaZSetBatch(u_parent.schema)
+        rb_up = RowBuilder(u_parent.schema, upb)
+        rb_up.begin(r_uint64(0xBBBB), r_uint64(0xAAAA), r_int64(1))
+        rb_up.commit()
+        ingest_to_family(u_parent, upb)
+        upb.free()
+
+        ucb = batch.ArenaZSetBatch(u_child.schema)
+        rb_uc = RowBuilder(u_child.schema, ucb)
+        rb_uc.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb_uc.put_u128(r_uint64(0xBBBB), r_uint64(0xAAAA))
+        rb_uc.commit()
+        validate_fk_inline(u_child, ucb)
+        ingest_to_family(u_child, ucb)
+        ucb.free()
+
+    finally:
+        engine.close()
+    os.write(1, "    [OK] FK Integrity verified.\n")
+
+
+def test_fk_nullability_and_retractions(base_dir):
+    os.write(1, "[Catalog+] Testing FK Nullability and Retractions...\n")
+    db_path = base_dir + "/fk_null"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        parent = engine.create_table(
+            "public.p",
+            [core_types.ColumnDefinition(core_types.TYPE_U64, name="id")],
+            0,
+        )
+        # Nullable FK
+        child = engine.create_table(
+            "public.c",
+            [
+                core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+                core_types.ColumnDefinition(
+                    core_types.TYPE_U64,
+                    is_nullable=True,
+                    name="pid_fk",
+                    fk_table_id=parent.table_id,
+                    fk_col_idx=0,
+                ),
+            ],
+            0,
+        )
+
+        # 1. Insert NULL FK (Should be allowed even if parent is empty)
+        cb = batch.ArenaZSetBatch(child.schema)
+        rb = RowBuilder(child.schema, cb)
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_null()
+        rb.commit()
+        validate_fk_inline(child, cb)
+        ingest_to_family(child, cb)
+        cb.free()
+
+        # 2. Test Retraction (Weight -1)
+        # Ingesting a retraction for a non-existent parent should NOT trigger FK check
+        cb2 = batch.ArenaZSetBatch(child.schema)
+        rb2 = RowBuilder(child.schema, cb2)
+        rb2.begin(r_uint64(2), r_uint64(0), r_int64(-1))
+        rb2.put_int(r_int64(999))  # Non-existent
+        rb2.commit()
+        validate_fk_inline(child, cb2)
+        ingest_to_family(child, cb2)  # Should succeed
+        cb2.free()
+
+    finally:
+        engine.close()
+    os.write(1, "    [OK] FK Nullability and Retractions verified.\n")
+
+
+def test_fk_protections(base_dir):
+    os.write(1, "[Catalog+] Testing FK Drop/Index Protections...\n")
+    db_path = base_dir + "/fk_prot"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        parent = engine.create_table(
+            "public.parent",
+            [core_types.ColumnDefinition(core_types.TYPE_U64, name="pid")],
+            0,
+        )
+        child = engine.create_table(
+            "public.child",
+            [
+                core_types.ColumnDefinition(core_types.TYPE_U64, name="cid"),
+                core_types.ColumnDefinition(
+                    core_types.TYPE_U64,
+                    name="pid_fk",
+                    fk_table_id=parent.table_id,
+                    fk_col_idx=0,
+                ),
+            ],
+            0,
+        )
+
+        # 1. Attempt to drop Parent (Should fail)
+        raised = False
+        try:
+            engine.drop_table("public.parent")
+        except LayoutError:
+            raised = True
+        if not raised:
+            raise Exception("Allowed to drop a referenced table")
+
+        # 2. Attempt to drop the auto-generated FK index (Should fail)
+        idx_name = make_fk_index_name("public", "child", "pid_fk")
+        raised = False
+        try:
+            engine.drop_index(idx_name)
+        except LayoutError:
+            raised = True
+        if not raised:
+            raise Exception("Allowed to drop auto-generated FK index")
+
+        # 3. Drop child, then parent (Should succeed)
+        engine.drop_table("public.child")
+        engine.drop_table("public.parent")
+
+    finally:
+        engine.close()
+    os.write(1, "    [OK] FK Drop protections verified.\n")
+
+
+def test_fk_invalid_targets(base_dir):
+    os.write(1, "[Catalog+] Testing Invalid FK Targets...\n")
+    db_path = base_dir + "/fk_invalid"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        p = engine.create_table(
+            "public.p",
+            [
+                core_types.ColumnDefinition(core_types.TYPE_U64, name="pk"),
+                core_types.ColumnDefinition(core_types.TYPE_I64, name="other"),
+            ],
+            0,
+        )
+
+        # Attempt to target column index 1 (not the PK)
+        raised = False
+        try:
+            engine.create_table(
+                "public.c_bad",
+                [
+                    core_types.ColumnDefinition(core_types.TYPE_U64, name="pk"),
+                    core_types.ColumnDefinition(
+                        core_types.TYPE_I64,
+                        name="fk",
+                        fk_table_id=p.table_id,
+                        fk_col_idx=1,
+                    ),
+                ],
+                0,
+            )
+        except LayoutError:
+            raised = True
+        if not raised:
+            raise Exception("Allowed to create FK targeting non-PK column")
+
+    finally:
+        engine.close()
+    os.write(1, "    [OK] Invalid FK targets blocked.\n")
+
+
+def test_fk_self_reference(base_dir):
+    os.write(1, "[Catalog+] Testing FK Self-Reference...\n")
+    db_path = base_dir + "/fk_self"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        # Predict the TID of the next table for self-reference
+        tid = engine.registry._next_table_id
+        cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="emp_id"),
+            core_types.ColumnDefinition(
+                core_types.TYPE_U64,
+                is_nullable=True,
+                name="mgr_id",
+                fk_table_id=tid,
+                fk_col_idx=0,
+            ),
+        ]
+        emp = engine.create_table("public.employees", cols, 0)
+
+        # 1. Ingest Manager first (Commit required for FK check)
+        b1 = batch.ArenaZSetBatch(emp.schema)
+        rb1 = RowBuilder(emp.schema, b1)
+        rb1.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb1.put_null()
+        rb1.commit()
+        ingest_to_family(emp, b1)
+        b1.free()
+
+        # 2. Ingest Subordinate referencing the Manager
+        b2 = batch.ArenaZSetBatch(emp.schema)
+        rb2 = RowBuilder(emp.schema, b2)
+        rb2.begin(r_uint64(2), r_uint64(0), r_int64(1))
+        rb2.put_int(r_int64(1))  # Refers to emp_id 1
+        rb2.commit()
+        ingest_to_family(emp, b2)
+        b2.free()
+
+        if _count_records(emp.store) != 2:
+            raise Exception("Self-referential ingestion failed")
+
+    finally:
+        engine.close()
+    os.write(1, "    [OK] FK Self-reference verified.\n")
+
+
+def test_view_backfill_simple(base_dir):
+    os.write(1, "[Catalog+] Testing View Backfill on Creation...\n")
+    db_path = base_dir + "/view_backfill_simple"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+            core_types.ColumnDefinition(core_types.TYPE_I64, name="val"),
+        ]
+        family = engine.create_table("public.t", cols, 0)
+
+        b = batch.ArenaZSetBatch(family.schema)
+        rb = RowBuilder(family.schema, b)
+        for i in range(5):
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
+            rb.put_int(r_int64(i * 10))
+            rb.commit()
+        ingest_to_family(family, b)
+        b.free()
+
+        view_family = _make_passthrough_view(engine, "public.v", family)
+
+        if _count_records(view_family.store) != 5:
+            raise Exception(
+                "View backfill on creation failed: expected 5, got %d"
+                % _count_records(view_family.store)
+            )
+
+        b2 = batch.ArenaZSetBatch(family.schema)
+        rb2 = RowBuilder(family.schema, b2)
+        rb2.begin(r_uint64(99), r_uint64(0), r_int64(1))
+        rb2.put_int(r_int64(999))
+        rb2.commit()
+        effective2 = ingest_to_family(family, b2)
+        evaluate_dag(engine, family.table_id, effective2)
+        if effective2 is not b2:
+            effective2.free()
+        b2.free()
+
+        if _count_records(view_family.store) != 6:
+            raise Exception(
+                "Live view update failed: expected 6, got %d"
+                % _count_records(view_family.store)
+            )
+    finally:
+        engine.close()
+    os.write(1, "    [OK] View backfill on creation verified.\n")
+
+
+def test_view_backfill_on_restart(base_dir):
+    os.write(1, "[Catalog+] Testing View Backfill on Restart...\n")
+    db_path = base_dir + "/view_backfill_restart"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+            core_types.ColumnDefinition(core_types.TYPE_I64, name="val"),
+        ]
+        family = engine.create_table("public.t", cols, 0)
+        _make_passthrough_view(engine, "public.v", family)
+
+        b = batch.ArenaZSetBatch(family.schema)
+        rb = RowBuilder(family.schema, b)
+        for i in range(5):
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
+            rb.put_int(r_int64(i * 10))
+            rb.commit()
+        ingest_to_family(family, b)
+        b.free()
+        family.store.flush()
+    finally:
+        engine.close()
+
+    engine2 = open_engine(db_path)
+    try:
+        view_family2 = engine2.registry.get("public", "v")
+        if _count_records(view_family2.store) != 5:
+            raise Exception(
+                "View backfill on restart failed: expected 5, got %d"
+                % _count_records(view_family2.store)
+            )
+    finally:
+        engine2.close()
+    os.write(1, "    [OK] View backfill on restart verified.\n")
+
+
+def test_view_on_view_backfill_on_restart(base_dir):
+    os.write(1, "[Catalog+] Testing View-on-View Backfill on Restart...\n")
+    db_path = base_dir + "/view_on_view_restart"
+    if not os_path_exists(db_path):
+        rposix.mkdir(db_path, 0o755)
+
+    engine = open_engine(db_path)
+    try:
+        cols = [
+            core_types.ColumnDefinition(core_types.TYPE_U64, name="id"),
+            core_types.ColumnDefinition(core_types.TYPE_I64, name="val"),
+        ]
+        t = engine.create_table("public.t", cols, 0)
+
+        b = batch.ArenaZSetBatch(t.schema)
+        rb = RowBuilder(t.schema, b)
+        for val in [5, 20, 50, 80, 100]:
+            rb.begin(r_uint64(val), r_uint64(0), r_int64(1))
+            rb.put_int(r_int64(val))
+            rb.commit()
+        ingest_to_family(t, b)
+        b.free()
+        t.store.flush()
+
+        v1_family = _make_passthrough_view(engine, "public.v1", t)
+        v2_family = _make_passthrough_view(engine, "public.v2", v1_family)
+
+        c1 = _count_records(v1_family.store)
+        if c1 != 5:
+            raise Exception("V1 backfill on creation: expected 5, got %d" % c1)
+        c2 = _count_records(v2_family.store)
+        if c2 != 5:
+            raise Exception("V2 backfill on creation: expected 5, got %d" % c2)
+
+        if v1_family.depth != 1:
+            raise Exception("V1 depth: expected 1, got %d" % v1_family.depth)
+        if v2_family.depth != 2:
+            raise Exception("V2 depth: expected 2, got %d" % v2_family.depth)
+    finally:
+        engine.close()
+
+    engine2 = open_engine(db_path)
+    try:
+        v1_f2 = engine2.registry.get("public", "v1")
+        v2_f2 = engine2.registry.get("public", "v2")
+        c1 = _count_records(v1_f2.store)
+        if c1 != 5:
+            raise Exception("V1 backfill on restart: expected 5, got %d" % c1)
+        c2 = _count_records(v2_f2.store)
+        if c2 != 5:
+            raise Exception("V2 backfill on restart: expected 5, got %d" % c2)
+    finally:
+        engine2.close()
+    os.write(1, "    [OK] View-on-view backfill on restart verified.\n")
+
+
+# ------------------------------------------------------------------------------
+# Tests (from zstore_comprehensive)
+# ------------------------------------------------------------------------------
+
+
+def test_programmable_zset_lifecycle():
+    log("Starting Comprehensive Programmable Z-Set Lifecycle Test...")
+
+    base_dir = "zstore_test_data"
+    cleanup_dir(base_dir)
+    ensure_dir(base_dir)
+
+    # 1. Bootstrapping
+    log_step("Phase 1: Bootstrapping Engine")
+    db = engine_module.open_engine(base_dir)
+    assert_true(db.registry.has_schema("public"), "Public schema missing")
+
+    # 2. Schema and 128-bit Table Creation
+    log_step("Phase 2: Creating 128-bit Relational Schema")
+    db.create_schema("app")
+
+    user_cols = newlist_hint(2)
+    user_cols.append(types.ColumnDefinition(types.TYPE_U128, name="uid"))
+    user_cols.append(types.ColumnDefinition(types.TYPE_STRING, name="username"))
+    users_family = db.create_table("app.users", user_cols, 0)
+
+    order_cols = newlist_hint(3)
+    order_cols.append(types.ColumnDefinition(types.TYPE_U64, name="oid"))
+    order_cols.append(
+        types.ColumnDefinition(
+            types.TYPE_U128,
+            name="uid",
+            fk_table_id=users_family.table_id,
+            fk_col_idx=0,
+        )
+    )
+    order_cols.append(types.ColumnDefinition(types.TYPE_I64, name="amount"))
+    orders_family = db.create_table("app.orders", order_cols, 0)
+
+    # 3. Referential Integrity Enforcement
+    log_step("Phase 3: Testing Foreign Key Enforcement")
+    # Synthetic 128-bit key using shifts to avoid prebuilt long literals
+    u128_val = (r_uint128(0xDEADBEEF) << 64) | r_uint128(0xCAFEBABE)
+
+    bad_batch = batch.ArenaZSetBatch(orders_family.schema)
+    rb_bad = RowBuilder(orders_family.schema, bad_batch)
+    rb_bad.begin(r_uint64(1), r_uint64(0), r_int64(1))
+    rb_bad.put_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
+    rb_bad.put_int(r_int64(500))
+    rb_bad.commit()
+
+    fk_raised = False
+    try:
+        validate_fk_inline(orders_family, bad_batch)
+        ingest_to_family(orders_family, bad_batch)
+    except LayoutError:
+        fk_raised = True
+        log("Caught expected FK violation (User not found)")
+    assert_true(fk_raised, "FK violation should have raised LayoutError")
+    bad_batch.free()
+
+    # 4. Valid Data Ingestion
+    log_step("Phase 4: Ingesting valid relational data")
+    u_batch = batch.ArenaZSetBatch(users_family.schema)
+    rb_u = RowBuilder(users_family.schema, u_batch)
+    rb_u.begin(r_uint64(u128_val), r_uint64(u128_val >> 64), r_int64(1))
+    rb_u.put_string("alice")
+    rb_u.commit()
+    ingest_to_family(users_family, u_batch)
+    u_batch.free()
+
+    assert_true(
+        users_family.store.has_pk(r_uint64(u128_val), r_uint64(u128_val >> 64)), "User ingestion visibility failed"
+    )
+
+    o_batch = batch.ArenaZSetBatch(orders_family.schema)
+    rb_o = RowBuilder(orders_family.schema, o_batch)
+    rb_o.begin(r_uint64(101), r_uint64(0), r_int64(1))
+    rb_o.put_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
+    rb_o.put_int(r_int64(1000))
+    rb_o.commit()
+    ingest_to_family(orders_family, o_batch)
+    o_batch.free()
+
+    # 5. Reactive View Construction (New Circuit API)
+    log_step("Phase 5: Creating Reactive View (Scan Users)")
+
+    # CircuitBuilder now requires the primary_source_id (users table)
+    builder = CircuitBuilder(
+        view_id=0, primary_source_id=users_family.table_id
+    )
+    # input_delta() represents the reactive delta stream for that source
+    users_src = builder.input_delta()
+    builder.sink(users_src, target_table_id=0)
+
+    out_cols = newlist_hint(2)
+    out_cols.append(("uid", types.TYPE_U128.code))
+    out_cols.append(("username", types.TYPE_STRING.code))
+
+    graph = builder.build(out_cols)
+
+    db.create_view("app.active_users", graph, "SELECT * FROM users")
+    view_family = db.get_table("app.active_users")
+
+    # 5.1 Relational Dependency Enforcement
+    log_step("Phase 5.1: Verifying Dependency Enforcement")
+    drop_denied = False
+    try:
+        db.drop_table("app.users")
+    except LayoutError:
+        drop_denied = True
+        log("Correctly blocked dropping table referenced by view")
+    assert_true(drop_denied, "Dropping table used by view should be blocked")
+
+    # 6. Persistence Audit
+    log_step("Phase 6: Persistence Audit (Close and Restart)")
+    db.close()
+
+    db2 = engine_module.open_engine(base_dir)
+    assert_true(
+        db2.registry.has("app", "users"), "Registry lost users table"
+    )
+    assert_true(
+        db2.registry.has("app", "active_users"), "Registry lost view"
+    )
+
+    # 7. Recovery Audit
+    log_step("Phase 7: Auditing recovered VM Program")
+    plan = db2.program_cache.get_program(view_family.table_id)
+    assert_true(plan is not None, "Failed to recover view plan")
+
+    # 8. View Execution (New View API)
+    log_step("Phase 8: Execution of Recovered View handle")
+    # Feed the actual alice record as a delta to the reactive view
+    in_batch = batch.ArenaZSetBatch(users_family.schema)
+    rb_in = RowBuilder(users_family.schema, in_batch)
+    rb_in.begin(r_uint64(u128_val), r_uint64(u128_val >> 64), r_int64(1))
+    rb_in.put_string("alice")
+    rb_in.commit()
+
+    out_batch = plan.execute_epoch(in_batch)
+    in_batch.free()
+
+    assert_true(out_batch is not None, "View should have produced Alice")
+    assert_equal_i(1, out_batch.length(), "View produced wrong row count")
+    assert_equal_u128(u128_val, out_batch.get_pk(0), "View data corrupted")
+    out_batch.free()
+
+    # 9. Edge Case: Graph Compilation Failures
+    log_step("Phase 9: Testing Graph Compilation Failures")
+
+    # A. Disconnected sink failure
+    bad_builder = CircuitBuilder(0, users_family.table_id)
+    bad_builder.input_delta()
+    # No sink
+    bad_graph = bad_builder.build(out_cols)
+
+    compilation_failed = False
+    try:
+        db2.create_view("app.bad_view", bad_graph, "")
+    except LayoutError:
+        compilation_failed = True
+        log("Correctly rejected view missing sink")
+    assert_true(compilation_failed, "Should fail compilation: missing sink")
+
+    # B. Cyclic Graph
+    cycle_builder = CircuitBuilder(0, users_family.table_id)
+    s1 = cycle_builder.input_delta()
+    d1 = cycle_builder.delay(s1)
+    # Manual connection to create a cycle (illegal for Kahn's)
+    cycle_builder._connect(d1, s1, 1)  # PORT_IN
+    cycle_graph = cycle_builder.build(out_cols)
+
+    compilation_failed = False
+    try:
+        db2.create_view("app.cycle_view", cycle_graph, "")
+    except LayoutError:
+        compilation_failed = True
+        log("Correctly rejected cyclic graph")
+    assert_true(
+        compilation_failed, "Should fail compilation: cycle detected"
+    )
+
+    # 10. Teardown
+    log_step("Phase 10: Full Teardown and Cleanup")
+    db2.drop_view("app.active_users")
+    db2.drop_table("app.orders")
+    db2.drop_table("app.users")
+    db2.drop_schema("app")
+
+    assert_true(not db2.registry.has_schema("app"), "Schema cleanup failed")
+    db2.close()
+    log("Full Programmable Z-Set lifecycle audit PASSED.")
+
+
+# ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
 
@@ -825,6 +1747,7 @@ def entry_point(argv):
         rposix.mkdir(base_dir, 0o755)
 
     try:
+        # Original catalog tests
         test_identifiers()
         test_bootstrap(base_dir)
         test_ddl(base_dir)
@@ -832,10 +1755,38 @@ def entry_point(argv):
         test_edge_cases(base_dir)
         test_enforce_unique_pk(base_dir)
         test_restart(base_dir)
+
+        # Catalog additional tests
+        test_index_functional_and_fanout(base_dir)
+        test_orphaned_metadata_recovery(base_dir)
+        test_schema_mr_poisoning()
+        test_identifier_boundary_slicing()
+        test_sequence_gap_recovery(base_dir)
+        test_fk_referential_integrity(base_dir)
+        test_fk_nullability_and_retractions(base_dir)
+        test_fk_protections(base_dir)
+        test_fk_invalid_targets(base_dir)
+        test_fk_self_reference(base_dir)
+        test_view_backfill_simple(base_dir)
+        test_view_backfill_on_restart(base_dir)
+        test_view_on_view_backfill_on_restart(base_dir)
+
+        # ZStore lifecycle test (self-contained)
+        test_programmable_zset_lifecycle()
+
         os.write(1, "\nALL CATALOG TEST PATHS PASSED\n")
+    except GnitzError as e:
+        os.write(2, "TEST FAILED (GnitzError): " + e.msg + "\n")
+        return 1
+    except OSError as e:
+        os.write(2, "TEST FAILED (OSError): errno=" + str(e.errno) + "\n")
+        return 1
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")
         return 1
+    finally:
+        cleanup_dir(base_dir)
+        cleanup_dir("zstore_test_data")
 
     return 0
 
