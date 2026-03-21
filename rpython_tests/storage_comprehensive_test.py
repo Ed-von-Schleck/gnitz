@@ -43,22 +43,15 @@ from gnitz.core.batch import ArenaZSetBatch, ColumnarBatchAccessor, RowBuilder
 from gnitz.catalog.registry import _enforce_unique_pk, TableFamily
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
+from rpython_tests.helpers.assertions import (
+    assert_true, assert_false, assert_equal_i, assert_equal_i64,
+    assert_equal_u64, assert_equal_s, assert_equal_u128,
+)
+from rpython_tests.helpers.fs import cleanup_dir
 
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
-
-
-def cleanup_dir(path):
-    if not os.path.exists(path):
-        return
-    for item in os.listdir(path):
-        p = os.path.join(path, item)
-        if os.path.isdir(p):
-            cleanup_dir(p)
-        else:
-            os.unlink(p)
-    os.rmdir(path)
 
 
 def make_u64_str_schema():
@@ -93,40 +86,6 @@ def make_u64_u128_str_schema():
     ]
     return types.TableSchema(cols, 0)
 
-
-def assert_true(condition, msg):
-    if not condition:
-        raise Exception("Assertion Failed: " + msg)
-
-
-def assert_false(condition, msg):
-    if condition:
-        raise Exception("Assertion Failed: " + msg)
-
-
-def assert_equal_i(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed: " + msg)
-
-
-def assert_equal_i64(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed (i64): " + msg)
-
-
-def assert_equal_u64(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed (u64): " + msg)
-
-
-def assert_equal_s(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed (str): " + msg)
-
-
-def assert_equal_u128(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed (U128): " + msg)
 
 
 def corrupt_byte(filepath, offset):
@@ -2795,8 +2754,8 @@ def test_flsm_guard_isolation(base_dir):
 # ------------------------------------------------------------------------------
 
 
-def test_get_num_partitions():
-    log("test_get_num_partitions")
+def test_partition_basics():
+    log("test_partition_basics (num_partitions + routing determinism)")
     # System tables (table_id < FIRST_USER_TABLE_ID) get 1 partition
     for tid in range(1, FIRST_USER_TABLE_ID):
         assert_equal_i(1, get_num_partitions(tid),
@@ -2806,11 +2765,6 @@ def test_get_num_partitions():
                    "first user table should have 256 partitions")
     assert_equal_i(NUM_PARTITIONS, get_num_partitions(1000),
                    "user table 1000 should have 256 partitions")
-    log("  PASSED")
-
-
-def test_partition_routing_determinism():
-    log("test_partition_routing_determinism")
     # Same key always maps to the same partition
     for i in range(100):
         lo = r_uint64(i * 7 + 13)
@@ -3155,8 +3109,7 @@ def entry_point(argv):
         test_flsm_lazy_leveling_lmax(base_dir)
         test_flsm_guard_isolation(base_dir)
         test_zero_copy_wal_recovery(base_dir)
-        test_get_num_partitions()
-        test_partition_routing_determinism()
+        test_partition_basics()
         test_n1_persistent(base_dir)
         test_n256_persistent(base_dir)
         test_n256_sorted_output(base_dir)

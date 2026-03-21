@@ -10,50 +10,10 @@ from gnitz.core import types, serialize, strings, comparator, batch, xxh, errors
 from gnitz.core import strings as string_logic
 from gnitz.core.batch import RowBuilder, ColumnarBatchAccessor
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
-
-# ------------------------------------------------------------------------------
-# Helpers & Assertions
-# ------------------------------------------------------------------------------
-
-
-def assert_true(condition, msg):
-    if not condition:
-        raise Exception("Assertion Failed: " + msg)
-
-
-def assert_false(condition, msg):
-    if condition:
-        raise Exception("Assertion Failed: " + msg)
-
-
-def assert_equal_i(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed (int): " + msg)
-
-
-def assert_equal_i64(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed (i64): " + msg)
-
-
-def assert_equal_u64(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed (u64): " + msg)
-
-
-def assert_equal_s(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed (str): " + msg)
-
-
-def assert_equal_u128(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed (U128): " + msg)
-
-
-def assert_equal_f(expected, actual, msg):
-    if expected != actual:
-        raise Exception("Assertion Failed (float): " + msg)
+from rpython_tests.helpers.assertions import (
+    assert_true, assert_false, assert_equal_i, assert_equal_i64,
+    assert_equal_u64, assert_equal_s, assert_equal_u128, assert_equal_f,
+)
 
 
 class DummyBlobAllocator(strings.BlobAllocator):

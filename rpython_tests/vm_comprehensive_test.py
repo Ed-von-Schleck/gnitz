@@ -13,6 +13,11 @@ from gnitz.dbsp.ops.group_index import AggValueIndex, make_agg_value_idx_schema,
 from gnitz.vm import runtime, instructions, interpreter
 from gnitz.storage.ephemeral_table import EphemeralTable
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
+from rpython_tests.helpers.assertions import (
+    fail, assert_true, assert_equal_i, assert_equal_i64,
+    assert_equal_u128, assert_equal_s,
+)
+from rpython_tests.helpers.fs import cleanup_dir
 
 # ------------------------------------------------------------------------------
 # RPython Debugging Helpers
@@ -20,41 +25,6 @@ from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 def log(msg):
     os.write(1, msg + "\n")
-
-def fail(msg):
-    os.write(2, "CRITICAL FAILURE: " + msg + "\n")
-    raise Exception(msg)
-
-def assert_true(condition, msg):
-    if not condition:
-        fail(msg)
-
-def assert_equal_i(expected, actual, msg):
-    if expected != actual:
-        fail(msg + " (Expected " + str(expected) + ", got " + str(actual) + ")")
-
-def assert_equal_i64(expected, actual, msg):
-    if expected != actual:
-        fail(msg + " (expected=" + str(expected) + " actual=" + str(actual) + ")")
-
-def assert_equal_u128(expected, actual, msg):
-    if expected != actual:
-        fail(msg + " (u128 mismatch)")
-
-def assert_equal_s(expected, actual, msg):
-    if expected != actual:
-        fail(msg + " (Expected '" + expected + "', got '" + actual + "')")
-
-def cleanup_dir(path):
-    if not os.path.exists(path):
-        return
-    for item in os.listdir(path):
-        p = os.path.join(path, item)
-        if os.path.isdir(p):
-            cleanup_dir(p)
-        else:
-            os.unlink(p)
-    os.rmdir(path)
 
 
 # ------------------------------------------------------------------------------

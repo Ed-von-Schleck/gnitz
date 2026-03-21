@@ -38,6 +38,9 @@ from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.server.executor import evaluate_dag
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
+from rpython_tests.helpers.assertions import (
+    fail, assert_true, assert_equal_i, assert_equal_u128,
+)
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -86,49 +89,12 @@ def count_records(table):
 _count_records = count_records
 
 
-def _u64_to_hex_padded(val):
-    chars = "0123456789abcdef"
-    res = ["0"] * 16
-    temp = val
-    for i in range(15, -1, -1):
-        res[i] = chars[intmask(temp & r_uint64(0xF))]
-        temp >>= 4
-    return "".join(res)
-
-
 def log(msg):
     os.write(1, "[TEST] " + msg + "\n")
 
 
 def log_step(name):
     os.write(1, "\n[CHECKPOINT] " + name + "...\n")
-
-
-def fail(msg):
-    os.write(2, "\n!!! CRITICAL TEST FAILURE !!!\n")
-    os.write(2, msg + "\n")
-    raise Exception("Test Failure")
-
-
-def assert_true(cond, msg):
-    if not cond:
-        fail("Assertion Failed: " + msg)
-
-
-def assert_equal_i(expected, actual, msg):
-    if expected != actual:
-        fail(msg + " -> Expected: %d, Actual: %d" % (expected, actual))
-
-
-def assert_equal_u128(expected, actual, msg):
-    if expected != actual:
-        hi_e = r_uint64(expected >> 64)
-        lo_e = r_uint64(expected)
-        hi_a = r_uint64(actual >> 64)
-        lo_a = r_uint64(actual)
-        os.write(2, "   Expected: " + _u64_to_hex_padded(hi_e) + _u64_to_hex_padded(lo_e) + "\n")
-        os.write(2, "   Actual:   " + _u64_to_hex_padded(hi_a) + _u64_to_hex_padded(lo_a) + "\n")
-        fail(msg + " -> U128 Mismatch")
 
 
 def _make_passthrough_view(engine, view_name, source_family):

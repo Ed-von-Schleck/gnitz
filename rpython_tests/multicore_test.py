@@ -6,7 +6,7 @@
 import sys
 import os
 
-from rpython.rlib import rposix, rsocket
+from rpython.rlib import rsocket
 from rpython.rtyper.lltypesystem import rffi
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rlib.objectmodel import newlist_hint
@@ -29,6 +29,8 @@ from gnitz.server import ipc, ipc_ffi
 from gnitz.server.master import MasterDispatcher
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
+from rpython_tests.helpers.assertions import fail, assert_true, assert_equal_i
+from rpython_tests.helpers.fs import cleanup
 
 
 # ------------------------------------------------------------------------------
@@ -37,39 +39,6 @@ from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 def log(msg):
     os.write(1, msg + "\n")
-
-def fail(msg):
-    os.write(2, "CRITICAL FAILURE: " + msg + "\n")
-    raise Exception(msg)
-
-def assert_true(condition, msg):
-    if not condition:
-        fail(msg)
-
-def assert_equal_i(expected, actual, msg):
-    if expected != actual:
-        fail(msg + " (Expected " + str(expected) + ", got " + str(actual) + ")")
-
-def _recursive_delete(path):
-    if not os.path.exists(path):
-        return
-    if os.path.isdir(path):
-        items = os.listdir(path)
-        for item in items:
-            _recursive_delete(path + "/" + item)
-        try:
-            rposix.rmdir(path)
-        except OSError:
-            pass
-    else:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-def cleanup(path):
-    if os.path.exists(path):
-        _recursive_delete(path)
 
 
 def make_u64_i64_schema():
@@ -509,10 +478,12 @@ def test_repartition_batch_pk_equals_split(base_dir):
     log("  PASSED")
 
 
-def test_batch_sorted_flag_roundtrip():
-    """FLAG_BATCH_SORTED preserved through serialize_to_memfd / _recv_and_parse."""
-    log("[EXCHANGE] Testing FLAG_BATCH_SORTED roundtrip...")
+def test_batch_flag_roundtrip():
+    """Batch property flags (sorted, consolidated, plain) preserved through IPC."""
+    log("[EXCHANGE] Testing batch flag roundtrip (sorted, consolidated, plain)...")
     schema = _make_simple_schema()
+
+    # Case 1: sorted-only flag
     s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
     try:
         b = _make_simple_batch(schema)
@@ -521,7 +492,7 @@ def test_batch_sorted_flag_roundtrip():
         b.free()
 
         payload = ipc.receive_payload(s2.fd)
-        assert_true(payload.batch is not None, "batch should be present")
+        assert_true(payload.batch is not None, "sorted: batch should be present")
         assert_true(payload.batch._sorted,
                     "FLAG_BATCH_SORTED: _sorted should be True after roundtrip")
         assert_true(not payload.batch._consolidated,
@@ -530,13 +501,8 @@ def test_batch_sorted_flag_roundtrip():
     finally:
         s1.close()
         s2.close()
-    log("  PASSED")
 
-
-def test_batch_consolidated_flag_roundtrip():
-    """FLAG_BATCH_CONSOLIDATED preserved through IPC; implies _sorted."""
-    log("[EXCHANGE] Testing FLAG_BATCH_CONSOLIDATED roundtrip...")
-    schema = _make_simple_schema()
+    # Case 2: consolidated flag (implies sorted)
     s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
     try:
         b = _make_simple_batch(schema)
@@ -545,7 +511,7 @@ def test_batch_consolidated_flag_roundtrip():
         b.free()
 
         payload = ipc.receive_payload(s2.fd)
-        assert_true(payload.batch is not None, "batch should be present")
+        assert_true(payload.batch is not None, "consolidated: batch should be present")
         assert_true(payload.batch._consolidated,
                     "FLAG_BATCH_CONSOLIDATED: _consolidated should be True")
         assert_true(payload.batch._sorted,
@@ -554,22 +520,16 @@ def test_batch_consolidated_flag_roundtrip():
     finally:
         s1.close()
         s2.close()
-    log("  PASSED")
 
-
-def test_batch_no_flags_roundtrip():
-    """Plain (unsorted) batch: neither _sorted nor _consolidated set after roundtrip."""
-    log("[EXCHANGE] Testing no batch property flags roundtrip...")
-    schema = _make_simple_schema()
+    # Case 3: plain batch (no flags)
     s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
     try:
         b = _make_simple_batch(schema)
-        # default: _sorted=False, _consolidated=False
         ipc.send_batch(s1.fd, 1, b, schema=schema)
         b.free()
 
         payload = ipc.receive_payload(s2.fd)
-        assert_true(payload.batch is not None, "batch should be present")
+        assert_true(payload.batch is not None, "plain: batch should be present")
         assert_true(not payload.batch._sorted,
                     "plain batch: _sorted should be False")
         assert_true(not payload.batch._consolidated,
@@ -578,6 +538,7 @@ def test_batch_no_flags_roundtrip():
     finally:
         s1.close()
         s2.close()
+
     log("  PASSED")
 
 
@@ -1253,9 +1214,7 @@ def entry_point(argv):
         test_repartition_batch_pk_equals_split(base_dir)
 
         # Exchange IPC flag tests (no engine)
-        test_batch_sorted_flag_roundtrip()
-        test_batch_consolidated_flag_roundtrip()
-        test_batch_no_flags_roundtrip()
+        test_batch_flag_roundtrip()
         test_repartition_does_not_propagate_consolidated()
         test_repartition_batches()
         test_repartition_batches_merged()

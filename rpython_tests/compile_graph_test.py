@@ -6,7 +6,6 @@
 import sys
 import os
 
-from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import (
     r_int64,
     r_uint64,
@@ -24,6 +23,10 @@ from gnitz.catalog.registry import ingest_to_family
 from gnitz.catalog.metadata import ensure_dir
 from rpython_tests.helpers.circuit_builder import CircuitBuilder
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
+from rpython_tests.helpers.assertions import (
+    fail, assert_true, assert_equal_i, assert_equal_i64, assert_equal_u128,
+)
+from rpython_tests.helpers.fs import cleanup
 
 
 # ------------------------------------------------------------------------------
@@ -32,47 +35,6 @@ from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 
 def log(msg):
     os.write(1, msg + "\n")
-
-def fail(msg):
-    os.write(2, "CRITICAL FAILURE: " + msg + "\n")
-    raise Exception(msg)
-
-def assert_true(condition, msg):
-    if not condition:
-        fail(msg)
-
-def assert_equal_i(expected, actual, msg):
-    if expected != actual:
-        fail(msg + " (Expected " + str(expected) + ", got " + str(actual) + ")")
-
-def assert_equal_i64(expected, actual, msg):
-    if expected != actual:
-        fail(msg + " (i64 mismatch)")
-
-def assert_equal_u128(expected, actual, msg):
-    if expected != actual:
-        fail(msg + " (u128 mismatch)")
-
-def _recursive_delete(path):
-    if not os.path.exists(path):
-        return
-    if os.path.isdir(path):
-        items = os.listdir(path)
-        for item in items:
-            _recursive_delete(path + "/" + item)
-        try:
-            rposix.rmdir(path)
-        except OSError:
-            pass
-    else:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-def cleanup(path):
-    if os.path.exists(path):
-        _recursive_delete(path)
 
 
 def _make_i64_cols(names):
