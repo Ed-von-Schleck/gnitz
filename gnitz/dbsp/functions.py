@@ -28,6 +28,10 @@ class ScalarFunction(object):
     def evaluate_predicate(self, row_accessor):
         return True
 
+    def evaluate_predicate_direct(self, in_batch, row_idx):
+        accessor = in_batch.get_accessor(row_idx)
+        return self.evaluate_predicate(accessor)
+
     def evaluate_map(self, row_accessor, output_row):
         pass
 

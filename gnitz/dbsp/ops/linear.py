@@ -65,8 +65,7 @@ def op_filter(in_batch, out_writer, func):
     n = in_batch.length()
     range_start = -1
     for i in range(n):
-        accessor = in_batch.get_accessor(i)
-        if func is not None and func.evaluate_predicate(accessor):
+        if func is not None and func.evaluate_predicate_direct(in_batch, i):
             if range_start < 0:
                 range_start = i
         else:

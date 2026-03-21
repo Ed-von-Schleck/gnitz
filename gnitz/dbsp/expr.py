@@ -9,7 +9,7 @@ from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rtyper.lltypesystem import rffi
+from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.dbsp.functions import ScalarFunction
 
@@ -121,232 +121,10 @@ class ExprProgram(object):
 # ---------------------------------------------------------------------------
 
 @jit.unroll_safe
-def eval_expr(program, accessor):
-    """Evaluate expression program against a row. Returns (value, is_null)."""
-    program = jit.promote(program)
-    code = program.code
-    regs = [r_int64(0)] * program.num_regs
-    null = [False] * program.num_regs
-
-    i = 0
-    while i < program.num_instrs:
-        base = i * 4
-        op  = intmask(code[base])
-        dst = intmask(code[base + 1])
-        a1  = intmask(code[base + 2])
-        a2  = intmask(code[base + 3])
-
-        if op == EXPR_LOAD_COL_INT:
-            null[dst] = accessor.is_null(a1)
-            regs[dst] = accessor.get_int_signed(a1)
-        elif op == EXPR_LOAD_COL_FLOAT:
-            null[dst] = accessor.is_null(a1)
-            regs[dst] = float2longlong(accessor.get_float(a1))
-        elif op == EXPR_LOAD_CONST:
-            null[dst] = False
-            regs[dst] = r_int64(intmask((a2 << 32) | (a1 & 0xFFFFFFFF)))
-
-        elif op == EXPR_INT_ADD:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(intmask(regs[a1] + regs[a2]))
-        elif op == EXPR_INT_SUB:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(intmask(regs[a1] - regs[a2]))
-        elif op == EXPR_INT_MUL:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(intmask(regs[a1] * regs[a2]))
-        elif op == EXPR_INT_DIV:
-            null[dst] = null[a1] or null[a2]
-            d = regs[a2]
-            regs[dst] = r_int64(intmask(regs[a1] / d)) if d != r_int64(0) else r_int64(0)
-        elif op == EXPR_INT_MOD:
-            null[dst] = null[a1] or null[a2]
-            d = regs[a2]
-            regs[dst] = r_int64(intmask(regs[a1] % d)) if d != r_int64(0) else r_int64(0)
-        elif op == EXPR_INT_NEG:
-            null[dst] = null[a1]
-            regs[dst] = r_int64(intmask(-regs[a1]))
-
-        elif op == EXPR_FLOAT_ADD:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = float2longlong(longlong2float(regs[a1]) + longlong2float(regs[a2]))
-        elif op == EXPR_FLOAT_SUB:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = float2longlong(longlong2float(regs[a1]) - longlong2float(regs[a2]))
-        elif op == EXPR_FLOAT_MUL:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = float2longlong(longlong2float(regs[a1]) * longlong2float(regs[a2]))
-        elif op == EXPR_FLOAT_DIV:
-            null[dst] = null[a1] or null[a2]
-            rhs = longlong2float(regs[a2])
-            if rhs != 0.0:
-                regs[dst] = float2longlong(longlong2float(regs[a1]) / rhs)
-            else:
-                regs[dst] = r_int64(0)
-        elif op == EXPR_FLOAT_NEG:
-            null[dst] = null[a1]
-            regs[dst] = float2longlong(-longlong2float(regs[a1]))
-
-        elif op == EXPR_CMP_EQ:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if regs[a1] == regs[a2] else r_int64(0)
-        elif op == EXPR_CMP_NE:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if regs[a1] != regs[a2] else r_int64(0)
-        elif op == EXPR_CMP_GT:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if regs[a1] > regs[a2] else r_int64(0)
-        elif op == EXPR_CMP_GE:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if regs[a1] >= regs[a2] else r_int64(0)
-        elif op == EXPR_CMP_LT:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if regs[a1] < regs[a2] else r_int64(0)
-        elif op == EXPR_CMP_LE:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if regs[a1] <= regs[a2] else r_int64(0)
-
-        elif op == EXPR_FCMP_EQ:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if longlong2float(regs[a1]) == longlong2float(regs[a2]) else r_int64(0)
-        elif op == EXPR_FCMP_NE:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if longlong2float(regs[a1]) != longlong2float(regs[a2]) else r_int64(0)
-        elif op == EXPR_FCMP_GT:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if longlong2float(regs[a1]) > longlong2float(regs[a2]) else r_int64(0)
-        elif op == EXPR_FCMP_GE:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if longlong2float(regs[a1]) >= longlong2float(regs[a2]) else r_int64(0)
-        elif op == EXPR_FCMP_LT:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if longlong2float(regs[a1]) < longlong2float(regs[a2]) else r_int64(0)
-        elif op == EXPR_FCMP_LE:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if longlong2float(regs[a1]) <= longlong2float(regs[a2]) else r_int64(0)
-
-        elif op == EXPR_BOOL_AND:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if (regs[a1] != r_int64(0) and regs[a2] != r_int64(0)) else r_int64(0)
-        elif op == EXPR_BOOL_OR:
-            null[dst] = null[a1] or null[a2]
-            regs[dst] = r_int64(1) if (regs[a1] != r_int64(0) or regs[a2] != r_int64(0)) else r_int64(0)
-        elif op == EXPR_BOOL_NOT:
-            null[dst] = null[a1]
-            regs[dst] = r_int64(1) if regs[a1] == r_int64(0) else r_int64(0)
-
-        elif op == EXPR_IS_NULL:
-            null[dst] = False
-            regs[dst] = r_int64(1) if accessor.is_null(a1) else r_int64(0)
-        elif op == EXPR_IS_NOT_NULL:
-            null[dst] = False
-            regs[dst] = r_int64(0) if accessor.is_null(a1) else r_int64(1)
-
-        elif op == EXPR_STR_COL_EQ_CONST:
-            from gnitz.core import strings
-            null[dst] = accessor.is_null(a1)
-            if not null[dst]:
-                _len, _pref, ptr, heap, pystr = accessor.get_str_struct(a1)
-                const_str = program.const_strings[a2]
-                regs[dst] = r_int64(1) if strings.string_equals(
-                    ptr, heap, const_str, program.const_lengths[a2],
-                    r_uint64(program.const_prefixes[a2])
-                ) else r_int64(0)
-            else:
-                regs[dst] = r_int64(0)
-        elif op == EXPR_STR_COL_LT_CONST:
-            from gnitz.core import strings
-            null[dst] = accessor.is_null(a1)
-            if not null[dst]:
-                l_len, l_pref, l_ptr, l_heap, l_str = accessor.get_str_struct(a1)
-                const_str = program.const_strings[a2]
-                cmp = strings.compare_structures(
-                    l_len, l_pref, l_ptr, l_heap, l_str,
-                    program.const_lengths[a2],
-                    rffi.cast(rffi.LONGLONG, r_uint64(program.const_prefixes[a2])),
-                    strings.NULL_PTR, strings.NULL_PTR, const_str
-                )
-                regs[dst] = r_int64(1) if cmp < 0 else r_int64(0)
-            else:
-                regs[dst] = r_int64(0)
-        elif op == EXPR_STR_COL_LE_CONST:
-            from gnitz.core import strings
-            null[dst] = accessor.is_null(a1)
-            if not null[dst]:
-                l_len, l_pref, l_ptr, l_heap, l_str = accessor.get_str_struct(a1)
-                const_str = program.const_strings[a2]
-                cmp = strings.compare_structures(
-                    l_len, l_pref, l_ptr, l_heap, l_str,
-                    program.const_lengths[a2],
-                    rffi.cast(rffi.LONGLONG, r_uint64(program.const_prefixes[a2])),
-                    strings.NULL_PTR, strings.NULL_PTR, const_str
-                )
-                regs[dst] = r_int64(1) if cmp <= 0 else r_int64(0)
-            else:
-                regs[dst] = r_int64(0)
-        elif op == EXPR_STR_COL_EQ_COL:
-            from gnitz.core import strings
-            null[dst] = accessor.is_null(a1) or accessor.is_null(a2)
-            if not null[dst]:
-                l1, p1, ptr1, h1, s1 = accessor.get_str_struct(a1)
-                l2, p2, ptr2, h2, s2 = accessor.get_str_struct(a2)
-                regs[dst] = r_int64(1) if strings.compare_structures(
-                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
-                ) == 0 else r_int64(0)
-            else:
-                regs[dst] = r_int64(0)
-        elif op == EXPR_STR_COL_LT_COL:
-            from gnitz.core import strings
-            null[dst] = accessor.is_null(a1) or accessor.is_null(a2)
-            if not null[dst]:
-                l1, p1, ptr1, h1, s1 = accessor.get_str_struct(a1)
-                l2, p2, ptr2, h2, s2 = accessor.get_str_struct(a2)
-                regs[dst] = r_int64(1) if strings.compare_structures(
-                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
-                ) < 0 else r_int64(0)
-            else:
-                regs[dst] = r_int64(0)
-        elif op == EXPR_STR_COL_LE_COL:
-            from gnitz.core import strings
-            null[dst] = accessor.is_null(a1) or accessor.is_null(a2)
-            if not null[dst]:
-                l1, p1, ptr1, h1, s1 = accessor.get_str_struct(a1)
-                l2, p2, ptr2, h2, s2 = accessor.get_str_struct(a2)
-                regs[dst] = r_int64(1) if strings.compare_structures(
-                    l1, p1, ptr1, h1, s1, l2, p2, ptr2, h2, s2
-                ) <= 0 else r_int64(0)
-            else:
-                regs[dst] = r_int64(0)
-
-        i += 1
-
-    return regs[program.result_reg], null[program.result_reg]
-
-
-# ---------------------------------------------------------------------------
-# ExprPredicate — plugs into op_filter via ScalarFunction interface
-# ---------------------------------------------------------------------------
-
-class ExprPredicate(ScalarFunction):
-    _immutable_fields_ = ['program']
-
-    def __init__(self, program):
-        self.program = program
-
-    def evaluate_predicate(self, row_accessor):
-        result, is_null = eval_expr(self.program, row_accessor)
-        return (not is_null) and (result != r_int64(0))
-
-
-# ---------------------------------------------------------------------------
-# eval_expr_map — expression VM for computed projections (Phase 4)
-# ---------------------------------------------------------------------------
-
-@jit.unroll_safe
-def eval_expr_map(program, accessor, builder):
-    """Evaluate expression map program: computes columns and writes to builder."""
+def eval_expr(program, accessor, builder=None):
+    """Evaluate expression program against a row. Returns (value, is_null).
+    When builder is not None, also handles EMIT/COPY_COL/EMIT_NULL opcodes."""
     from gnitz.core import types, strings
-    from rpython.rlib.rarithmetic import r_uint64
 
     program = jit.promote(program)
     code = program.code
@@ -472,31 +250,31 @@ def eval_expr_map(program, accessor, builder):
             regs[dst] = float2longlong(float(intmask(regs[a1])))
 
         elif op == EXPR_EMIT:
-            # a1 = src_reg, a2 = payload_col_idx
-            if null[a1]:
-                builder.append_null(a2)
-            else:
-                builder.append_int(regs[a1])
+            if builder is not None:
+                if null[a1]:
+                    builder.append_null(a2)
+                else:
+                    builder.append_int(regs[a1])
 
         elif op == EXPR_COPY_COL:
-            # dst = type_code, a1 = src_col_idx, a2 = payload_col_idx
-            tc = dst
-            if accessor.is_null(a1):
-                builder.append_null(a2)
-            elif tc == types.TYPE_STRING.code:
-                res = accessor.get_str_struct(a1)
-                s = strings.resolve_string(res[2], res[3], res[4])
-                builder.append_string(s)
-            elif tc == types.TYPE_F64.code or tc == types.TYPE_F32.code:
-                builder.append_float(accessor.get_float(a1))
-            elif tc == types.TYPE_U128.code:
-                builder.append_u128(accessor.get_u128_lo(a1), accessor.get_u128_hi(a1))
-            else:
-                builder.append_int(accessor.get_int_signed(a1))
+            if builder is not None:
+                tc = dst
+                if accessor.is_null(a1):
+                    builder.append_null(a2)
+                elif tc == types.TYPE_STRING.code:
+                    res = accessor.get_str_struct(a1)
+                    s = strings.resolve_string(res[2], res[3], res[4])
+                    builder.append_string(s)
+                elif tc == types.TYPE_F64.code or tc == types.TYPE_F32.code:
+                    builder.append_float(accessor.get_float(a1))
+                elif tc == types.TYPE_U128.code:
+                    builder.append_u128(accessor.get_u128_lo(a1), accessor.get_u128_hi(a1))
+                else:
+                    builder.append_int(accessor.get_int_signed(a1))
 
         elif op == EXPR_EMIT_NULL:
-            # a1 = payload_col_idx
-            builder.append_null(a1)
+            if builder is not None:
+                builder.append_null(a1)
 
         elif op == EXPR_STR_COL_EQ_CONST:
             null[dst] = accessor.is_null(a1)
@@ -570,13 +348,45 @@ def eval_expr_map(program, accessor, builder):
 
         i += 1
 
+    return regs[program.result_reg], null[program.result_reg]
+
 
 # ---------------------------------------------------------------------------
-# _eval_compute_row_direct — batch-path per-row compute (no RowBuilder)
+# ExprPredicate — plugs into op_filter via ScalarFunction interface
+# ---------------------------------------------------------------------------
+
+class ExprPredicate(ScalarFunction):
+    _immutable_fields_ = ['program']
+
+    def __init__(self, program):
+        self.program = program
+
+    def evaluate_predicate(self, row_accessor):
+        result, is_null = eval_expr(self.program, row_accessor)
+        return (not is_null) and (result != r_int64(0))
+
+    def evaluate_predicate_direct(self, in_batch, row_idx):
+        result, is_null, _ = _eval_row_direct(
+            self.program, in_batch, row_idx,
+            _NO_EMIT_BASES, _NO_EMIT_STRIDES, _NO_EMIT_PAYLOADS)
+        return (not is_null) and (result != r_int64(0))
+
+
+# ---------------------------------------------------------------------------
+# Empty sentinels for _eval_row_direct when used as predicate
+# ---------------------------------------------------------------------------
+
+_NO_EMIT_BASES = [lltype.nullptr(rffi.CCHARP.TO)][0:0]
+_NO_EMIT_STRIDES = [0][0:0]
+_NO_EMIT_PAYLOADS = [0][0:0]
+
+
+# ---------------------------------------------------------------------------
+# _eval_row_direct — batch-path per-row compute (no RowBuilder)
 # ---------------------------------------------------------------------------
 
 @jit.unroll_safe
-def _eval_compute_row_direct(program, in_batch, row_idx,
+def _eval_row_direct(program, in_batch, row_idx,
                               emit_bases, emit_strides, emit_payloads):
     """Evaluate compute instructions for one row, writing EMIT results
     directly to pre-allocated output column buffers.
@@ -846,7 +656,7 @@ def _eval_compute_row_direct(program, in_batch, row_idx,
 
         i += 1
 
-    return emit_null_mask
+    return regs[program.result_reg], null[program.result_reg], emit_null_mask
 
 
 # ---------------------------------------------------------------------------
@@ -901,7 +711,7 @@ class ExprMapFunction(ScalarFunction):
         self._has_compute = has_compute
 
     def evaluate_map(self, row_accessor, output_row):
-        eval_expr_map(self.program, row_accessor, output_row)
+        eval_expr(self.program, row_accessor, output_row)
 
     @jit.unroll_safe
     def evaluate_map_batch(self, in_batch, out_batch, out_schema):
@@ -1029,9 +839,10 @@ class ExprMapFunction(ScalarFunction):
 
             # Execute compute
             if self._has_compute:
-                out_null |= _eval_compute_row_direct(
+                _, _, mask = _eval_row_direct(
                     self.program, in_batch, row,
                     emit_bases, emit_strides, emit_pls)
+                out_null |= mask
 
             null_arr[row] = rffi.cast(rffi.ULONGLONG, out_null)
 

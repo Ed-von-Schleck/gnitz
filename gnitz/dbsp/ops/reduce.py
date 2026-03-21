@@ -402,10 +402,10 @@ def _emit_reduce_row(out_writer, fin_out_writer, group_key_lo, group_key_hi, wei
     out_writer.append_from_accessor(group_key_lo, group_key_hi, weight, reduce_acc)
     if finalize_prog is not None and fin_out_writer is not None:
         from gnitz.core.batch import RowBuilder
-        from gnitz.dbsp.expr import eval_expr_map
+        from gnitz.dbsp.expr import eval_expr
         finalized_schema = fin_out_writer._batch._schema
         builder = RowBuilder(finalized_schema, fin_out_writer._batch)
-        eval_expr_map(finalize_prog, reduce_acc, builder)
+        eval_expr(finalize_prog, reduce_acc, builder)
         builder.commit_row(group_key_lo, group_key_hi, weight)
 
 
