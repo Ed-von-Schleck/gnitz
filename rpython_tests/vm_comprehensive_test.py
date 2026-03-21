@@ -9,7 +9,7 @@ from rpython.rtyper.lltypesystem import rffi
 from gnitz.core import types, batch
 from gnitz.core.batch import RowBuilder
 from gnitz.dbsp import functions
-from gnitz.dbsp.ops.group_index import AggValueIndex, make_agg_value_idx_schema
+from gnitz.dbsp.ops.group_index import AggValueIndex, make_agg_value_idx_schema, ReduceGroupIndex, make_group_idx_schema
 from gnitz.vm import runtime, instructions, interpreter
 from gnitz.storage.ephemeral_table import EphemeralTable
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
@@ -1467,6 +1467,164 @@ def test_reduce_min_avi_group_elimination(base_dir):
     log("  PASSED")
 
 
+def test_reduce_min_group_idx_cross_tick(base_dir):
+    """
+    Regression test: ReduceGroupIndex (gi_cursor path) across tick boundaries.
+
+    Same bug class as the AVI _consolidated issue — the ReduceGroupIndex
+    EphemeralTable persists outside RegisterFile and is never refreshed by
+    prepare_for_tick().  This test verifies that the group index correctly
+    tracks insertions and retractions across multiple ticks.
+
+    Uses MIN(val) with a non-PK GROUP BY column (grp:I64) so the reduce
+    operator takes the gi_cursor branch (step 5, else-path).
+    """
+    log("[VM] Test 19: Reduce MIN group-index cross-tick consolidation...")
+
+    # Input schema: (pk:U64, grp:I64, val:I64)
+    in_cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_I64, name="grp"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
+    ]
+    in_schema = types.TableSchema(in_cols, pk_index=0)
+
+    # AGG_MIN on col 2 (val), group_by=[1] (grp — I64, non-pk)
+    agg_func = functions.UniversalAccumulator(2, functions.AGG_MIN, types.TYPE_I64)
+    group_by_cols = [1]
+    out_schema = types._build_reduce_output_schema(in_schema, group_by_cols, [agg_func])
+
+    # trace_in: stores history of input deltas
+    trace_in_dir = os.path.join(base_dir, "gi_trace_in")
+    trace_in_table = EphemeralTable(trace_in_dir, "trace_in", in_schema)
+
+    # trace_out: stores last emitted reduce output per group
+    trace_out_dir = os.path.join(base_dir, "gi_trace_out")
+    trace_out_table = EphemeralTable(trace_out_dir, "trace_out", out_schema)
+
+    # group index: secondary index on trace_in by group column
+    gi_dir = os.path.join(base_dir, "gi_idx")
+    gi_table = EphemeralTable(gi_dir, "_gidx", make_group_idx_schema())
+    group_idx = ReduceGroupIndex(gi_table, col_idx=1, col_type=types.TYPE_I64)
+
+    trace_in_cursor = trace_in_table.create_cursor()
+    trace_out_cursor = trace_out_table.create_cursor()
+
+    reg_file = runtime.RegisterFile(4)
+    reg_file.registers[0] = runtime.DeltaRegister(0, in_schema)
+    reg_file.registers[1] = runtime.TraceRegister(1, in_schema, trace_in_cursor, trace_in_table)
+    reg_file.registers[2] = runtime.TraceRegister(2, out_schema, trace_out_cursor, trace_out_table)
+    reg_file.registers[3] = runtime.DeltaRegister(3, out_schema)
+
+    program = [
+        instructions.reduce_op(
+            reg_file.registers[0],
+            reg_file.registers[1],       # trace_in
+            reg_file.registers[2],       # trace_out
+            reg_file.registers[3],       # output delta
+            group_by_cols,
+            [agg_func],
+            out_schema,
+            trace_in_group_idx=group_idx,  # enables gi_cursor path
+        ),
+        instructions.integrate_op(reg_file.registers[0], trace_in_table,
+                                  group_idx=group_idx),
+        instructions.integrate_op(reg_file.registers[3], trace_out_table),
+        instructions.halt_op(),
+    ]
+
+    plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=3)
+
+    # Tick 1: insert (pk=1, grp=10, val=50, w=+1)
+    # Expect: group 10 appears with MIN=50 → output (+1, grp=10, MIN=50)
+    in1 = batch.ArenaZSetBatch(in_schema)
+    rb = RowBuilder(in_schema, in1)
+    rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+    rb.put_int(r_int64(10))   # grp=10
+    rb.put_int(r_int64(50))   # val=50
+    rb.commit()
+
+    result1 = plan.execute_epoch(in1)
+    in1.free()
+
+    assert_true(result1 is not None, "Tick 1: expected output")
+    assert_equal_i(1, result1.length(), "Tick 1: one output row")
+    acc1 = result1.get_accessor(0)
+    assert_equal_i64(r_int64(1), result1.get_weight(0), "Tick 1: weight +1")
+    assert_equal_i64(r_int64(10), acc1.get_int_signed(1), "Tick 1: grp=10")
+    assert_equal_i64(r_int64(50), acc1.get_int_signed(2), "Tick 1: MIN=50")
+    result1.free()
+
+    # Tick 2: insert (pk=2, grp=10, val=20, w=+1)
+    # History has val=50 via gi_cursor replay. Delta adds val=20.
+    # New MIN = min(50, 20) = 20. Expect retraction of old MIN=50, insertion of MIN=20.
+    in2 = batch.ArenaZSetBatch(in_schema)
+    rb = RowBuilder(in_schema, in2)
+    rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
+    rb.put_int(r_int64(10))   # grp=10
+    rb.put_int(r_int64(20))   # val=20
+    rb.commit()
+
+    result2 = plan.execute_epoch(in2)
+    in2.free()
+
+    assert_true(result2 is not None, "Tick 2: expected output")
+    assert_equal_i(2, result2.length(), "Tick 2: retraction + insertion")
+
+    found_retract = False
+    found_insert = False
+    for i in range(result2.length()):
+        acc = result2.get_accessor(i)
+        w = result2.get_weight(i)
+        if w == r_int64(-1):
+            assert_equal_i64(r_int64(50), acc.get_int_signed(2),
+                             "Tick 2: retracted MIN=50")
+            found_retract = True
+        elif w == r_int64(1):
+            assert_equal_i64(r_int64(20), acc.get_int_signed(2),
+                             "Tick 2: new MIN=20")
+            found_insert = True
+    assert_true(found_retract, "Tick 2: missing retraction")
+    assert_true(found_insert, "Tick 2: missing insertion")
+    result2.free()
+
+    # Tick 3: retract both rows — group must vanish entirely.
+    # This is the critical cross-tick test: the gi_cursor must find both
+    # historical PKs (1 and 2) in the group index to replay them,
+    # compute MIN over them, and then emit a retraction when net weight = 0.
+    in3 = batch.ArenaZSetBatch(in_schema)
+    rb = RowBuilder(in_schema, in3)
+    rb.begin(r_uint64(1), r_uint64(0), r_int64(-1))
+    rb.put_int(r_int64(10))   # grp=10
+    rb.put_int(r_int64(50))   # val=50
+    rb.commit()
+    rb.begin(r_uint64(2), r_uint64(0), r_int64(-1))
+    rb.put_int(r_int64(10))   # grp=10
+    rb.put_int(r_int64(20))   # val=20
+    rb.commit()
+
+    result3 = plan.execute_epoch(in3)
+    in3.free()
+
+    assert_true(result3 is not None, "Tick 3: expected output (retraction)")
+    # Group is now empty (all rows retracted). Should get exactly 1 retraction row.
+    assert_equal_i(1, result3.length(),
+                   "Tick 3: one retraction (group vanishes)")
+    assert_equal_i64(r_int64(-1), result3.get_weight(0),
+                     "Tick 3: weight must be -1")
+    acc3 = result3.get_accessor(0)
+    assert_equal_i64(r_int64(10), acc3.get_int_signed(1),
+                     "Tick 3: retracted grp=10")
+    assert_equal_i64(r_int64(20), acc3.get_int_signed(2),
+                     "Tick 3: retracted MIN=20")
+    result3.free()
+
+    gi_table.close()
+    trace_in_table.close()
+    trace_out_table.close()
+    log("  PASSED")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -1497,6 +1655,7 @@ def entry_point(argv):
         test_execute_epoch_seal_free_on_consolidated(base_dir)
         test_execute_epoch_evict()
         test_reduce_min_avi_group_elimination(base_dir)
+        test_reduce_min_group_idx_cross_tick(base_dir)
         os.write(1, "\nALL VM TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

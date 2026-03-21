@@ -179,6 +179,7 @@ def _merge_runs_to_consolidated(runs, schema):
         consolidated = runs[0].to_consolidated()
         if consolidated is runs[0]:
             consolidated = runs[0].clone()
+        consolidated.mark_consolidated(True)
         return consolidated
 
     # Fused k-way merge + inline consolidation: one pass, one allocation.

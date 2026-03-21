@@ -452,6 +452,12 @@ class ArenaZSetBatch(object):
     def is_sorted(self):
         return self._sorted
 
+    def _invalidate_cache(self):
+        """Reset all cached flags after any content mutation.
+        Centralised so new flags only need adding in one place."""
+        self._sorted = False
+        self._consolidated = False
+
     def mark_sorted(self, value):
         self._sorted = value
 
@@ -472,8 +478,7 @@ class ArenaZSetBatch(object):
         for i in range(len(self.col_bufs)):
             self.col_bufs[i].offset = 0
         self._count = 0
-        self._sorted = False
-        self._consolidated = False
+        self._invalidate_cache()
 
     def free(self):
         if self._freed:
@@ -687,8 +692,7 @@ class ArenaZSetBatch(object):
                 )
 
         self._count += 1
-        self._sorted = False
-        self._consolidated = False
+        self._invalidate_cache()
 
     def compare_indices(self, idx_a, idx_b):
         ahi = self._read_pk_hi(idx_a)
@@ -779,8 +783,7 @@ class ArenaZSetBatch(object):
                             rffi.ULONGLONG, new_offset)
 
         self._count += n
-        self._sorted = False
-        self._consolidated = False
+        self._invalidate_cache()
 
     def append_batch_negated(self, other, start=0, end=-1):
         """
@@ -842,8 +845,7 @@ class ArenaZSetBatch(object):
                             rffi.ULONGLONG, new_offset)
 
         self._count += n
-        self._sorted = False
-        self._consolidated = False
+        self._invalidate_cache()
 
     def _direct_append_row(self, src, src_idx, weight_override):
         """
@@ -894,8 +896,7 @@ class ArenaZSetBatch(object):
                         rffi.ULONGLONG, new_offset)
 
         self._count += 1
-        self._sorted = False
-        self._consolidated = False
+        self._invalidate_cache()
 
     def _copy_rows_indexed(self, src, indices, weights):
         """Copy len(indices) rows from src, assigning weights[r] to each.
@@ -956,7 +957,7 @@ class ArenaZSetBatch(object):
                         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, 8))[0] = rffi.cast(
                             rffi.ULONGLONG, new_offset)
         self._count += n
-        self._sorted = False
+        self._invalidate_cache()
 
     def _copy_rows_indexed_src_weights(self, src, indices):
         """Like _copy_rows_indexed but reads weights from src row."""
@@ -1016,7 +1017,7 @@ class ArenaZSetBatch(object):
                         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, 8))[0] = rffi.cast(
                             rffi.ULONGLONG, new_offset)
         self._count += n
-        self._sorted = False
+        self._invalidate_cache()
 
     def to_sorted(self):
         """
@@ -1024,7 +1025,6 @@ class ArenaZSetBatch(object):
         otherwise returns self.
         """
         if self._count <= 1 or self._sorted:
-            self._sorted = True
             return self
 
         indices = _build_sorted_indices(self)
@@ -1032,7 +1032,9 @@ class ArenaZSetBatch(object):
         new_batch = ArenaZSetBatch(self._schema, initial_capacity=self._count)
         new_batch._copy_rows_indexed_src_weights(self, indices)
         new_batch._sorted = True
-        new_batch._consolidated = self._consolidated
+        # Do NOT propagate _consolidated: the caller should consolidate
+        # explicitly if needed.  Blindly copying this flag was the root
+        # cause of the AVI group-elimination bug.
         return new_batch
 
     def to_consolidated(self):
@@ -1078,8 +1080,12 @@ class ArenaZSetBatch(object):
 
         # Fast path: all rows survive without merging and batch is already
         # sorted — no new allocation or copy needed.
+        # NOTE: we do NOT set self._consolidated = True here.  This method
+        # may be called on a shared/live batch (e.g. a MemTable accumulator);
+        # mutating the flag would cause later appends to skip consolidation
+        # because append methods cannot know to clear a flag they didn't set.
+        # Callers that take ownership (clone) should mark_consolidated(True).
         if len(surviving_indices) == self._count and self._sorted:
-            self._consolidated = True
             return self
 
         res = ArenaZSetBatch(self._schema, initial_capacity=len(surviving_indices))
@@ -1148,6 +1154,10 @@ class BatchWriter(object):
         if old._count == 0 or old._consolidated:
             return
         new = old.to_consolidated()
+        if new is old:
+            # All rows survived — already consolidated, just mark it.
+            old.mark_consolidated(True)
+            return
         old.clear()
         old.append_batch(new)
         old.mark_consolidated(True)
