@@ -132,6 +132,29 @@ python scripts/bench_history.py --trend                  # throughput over time
 4. Rebuild and re-run
 5. `python scripts/bench_history.py --compare <old> <new>` to see the delta
 
+## Resource ownership: the close-chain rule
+
+RPython has no RAII, no release-on-scope-exit, and no reliable finalizers.
+The only defense against fd/mmap/buffer leaks is an explicit close chain.
+
+**Invariant:** Every class that holds a closeable sub-resource (cursor, fd,
+mmap, Buffer) MUST have a `close()` method, and its parent's `close()` MUST
+call it — all the way up to `Engine.close()`.
+
+When adding a field that stores a cursor, fd, or any resource with `close()`:
+
+- [ ] Does the containing class have `close()`?
+- [ ] Does `close()` close the new sub-resource?
+- [ ] Does the parent class's `close()` call this class's `close()`?
+- [ ] Trace the chain up to `Engine.close()` — is every link present?
+
+Cache eviction counts as a close site too: if a cache (`ProgramCache`,
+`_cache dict`) drops an entry, it must call `close()` on the evicted value
+before deleting it.
+
+Process exit is not a substitute for `close()`. Tests that run multiple
+engine lifecycles in one process will expose missing links.
+
 ## Debugging multi-worker failures
 
 When a multi-worker test fails and the root cause is not immediately obvious:
