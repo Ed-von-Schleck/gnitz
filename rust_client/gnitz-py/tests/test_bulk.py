@@ -621,3 +621,163 @@ class TestBulkRetract:
             except Exception:
                 pass
             client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# Class 12: TestHeavyAggregation
+# 500 K events × 7 concurrent reduce views (10 / 100 / 1000 groups).
+# Data pushed in 10 ticks of 50K rows each → JIT warm-up after tick 2-3.
+# One view adds a filter before the reduce to vary the circuit topology.
+#
+# Schema: events(pk U64, region_id I64, product_id I64, store_id I64,
+#                quantity I64, revenue I64)
+#   col indices: 0=pk  1=region_id  2=product_id  3=store_id
+#                4=quantity  5=revenue
+#
+# Views:
+#   v_region_qty   SUM(quantity) GROUP BY region_id    [10 groups]
+#   v_region_cnt   COUNT(*)      GROUP BY region_id    [10 groups]
+#   v_product_rev  SUM(revenue)  GROUP BY product_id  [100 groups]
+#   v_product_cnt  COUNT(*)      GROUP BY product_id  [100 groups]
+#   v_store_rev    SUM(revenue)  GROUP BY store_id   [1000 groups]
+#   v_store_cnt    COUNT(*)      GROUP BY store_id   [1000 groups]
+#   v_highrev      filter(rev>500) → SUM(rev) GROUP BY store_id [≤1000 groups]
+# ---------------------------------------------------------------------------
+
+@_NEEDS_MULTI
+class TestHeavyAggregation:
+
+    TICKS         = 10
+    ROWS_PER_TICK = 50_000
+    REGIONS       = 10
+    PRODUCTS      = 100
+    STORES        = 1_000
+    AGG_COUNT     = 1
+    AGG_SUM       = 2
+
+    def _events_cols(self):
+        return [
+            gnitz.ColumnDef("pk",         gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("region_id",  gnitz.TypeCode.I64),
+            gnitz.ColumnDef("product_id", gnitz.TypeCode.I64),
+            gnitz.ColumnDef("store_id",   gnitz.TypeCode.I64),
+            gnitz.ColumnDef("quantity",   gnitz.TypeCode.I64),
+            gnitz.ColumnDef("revenue",    gnitz.TypeCode.I64),
+        ]
+
+    def _reduce_out_cols(self, grp_name, agg_name):
+        return [
+            gnitz.ColumnDef("pk",      gnitz.TypeCode.U128, primary_key=True),
+            gnitz.ColumnDef(grp_name,  gnitz.TypeCode.I64),
+            gnitz.ColumnDef(agg_name,  gnitz.TypeCode.I64),
+        ]
+
+    def _make_view(self, client, sn, tid, vname,
+                   group_col, agg_func_id, agg_col,
+                   grp_name, agg_name, filter_expr=None):
+        cb = client.circuit_builder(source_table_id=tid)
+        node = cb.input_delta()
+        if filter_expr is not None:
+            node = cb.filter(node, filter_expr)
+        node = cb.reduce(node,
+                         group_by_cols=[group_col],
+                         agg_func_id=agg_func_id,
+                         agg_col_idx=agg_col)
+        cb.sink(node)
+        circuit = cb.build()
+        return client.create_view_with_circuit(
+            sn, vname, circuit,
+            self._reduce_out_cols(grp_name, agg_name),
+        )
+
+    def test_heavy_agg_500k(self, client):
+        sn = "hagg_" + _uid()
+        client.create_schema(sn)
+        events_cols = self._events_cols()
+        events_schema = gnitz.Schema(events_cols)
+        e_tid, _, e_name = _make_table(client, sn, events_cols)
+
+        # filter predicate: revenue (col 5) > 500
+        eb = gnitz.ExprBuilder()
+        r_rev  = eb.load_col_int(5)
+        r_thr  = eb.load_const(500)
+        r_cond = eb.cmp_gt(r_rev, r_thr)
+        highrev_pred = eb.build(result_reg=r_cond)
+
+        vnames = ("v_region_qty", "v_region_cnt",
+                  "v_product_rev", "v_product_cnt",
+                  "v_store_rev", "v_store_cnt", "v_highrev")
+        try:
+            v_region_qty  = self._make_view(client, sn, e_tid, "v_region_qty",
+                                            1, self.AGG_SUM,   4, "region_id",  "total_qty")
+            v_region_cnt  = self._make_view(client, sn, e_tid, "v_region_cnt",
+                                            1, self.AGG_COUNT, 4, "region_id",  "cnt")
+            v_product_rev = self._make_view(client, sn, e_tid, "v_product_rev",
+                                            2, self.AGG_SUM,   5, "product_id", "total_rev")
+            v_product_cnt = self._make_view(client, sn, e_tid, "v_product_cnt",
+                                            2, self.AGG_COUNT, 4, "product_id", "cnt")
+            v_store_rev   = self._make_view(client, sn, e_tid, "v_store_rev",
+                                            3, self.AGG_SUM,   5, "store_id",   "total_rev")
+            v_store_cnt   = self._make_view(client, sn, e_tid, "v_store_cnt",
+                                            3, self.AGG_COUNT, 4, "store_id",   "cnt")
+            v_highrev     = self._make_view(client, sn, e_tid, "v_highrev",
+                                            3, self.AGG_SUM,   5, "store_id",   "total_rev",
+                                            filter_expr=highrev_pred)
+
+            exp_region_qty  = {}
+            exp_region_cnt  = {}
+            exp_product_rev = {}
+            exp_product_cnt = {}
+            exp_store_rev   = {}
+            exp_store_cnt   = {}
+            exp_highrev     = {}
+
+            for tick in range(self.TICKS):
+                batch = gnitz.ZSetBatch(events_schema)
+                base = tick * self.ROWS_PER_TICK
+                for i in range(self.ROWS_PER_TICK):
+                    pk         = base + i
+                    region_id  = pk % self.REGIONS
+                    product_id = pk % self.PRODUCTS
+                    store_id   = pk % self.STORES
+                    quantity   = 1 + (pk % 10)
+                    revenue    = 100 + (pk % 1000)
+                    batch.append(pk=pk, region_id=region_id, product_id=product_id,
+                                 store_id=store_id, quantity=quantity, revenue=revenue)
+                    exp_region_qty[region_id]   = exp_region_qty.get(region_id, 0)   + quantity
+                    exp_region_cnt[region_id]   = exp_region_cnt.get(region_id, 0)   + 1
+                    exp_product_rev[product_id] = exp_product_rev.get(product_id, 0) + revenue
+                    exp_product_cnt[product_id] = exp_product_cnt.get(product_id, 0) + 1
+                    exp_store_rev[store_id]     = exp_store_rev.get(store_id, 0)     + revenue
+                    exp_store_cnt[store_id]     = exp_store_cnt.get(store_id, 0)     + 1
+                    if revenue > 500:
+                        exp_highrev[store_id] = exp_highrev.get(store_id, 0) + revenue
+                client.push(e_tid, batch)
+
+            def _check(vid, expected, label):
+                rows = {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}
+                assert len(rows) == len(expected), \
+                    f"{label}: expected {len(expected)} groups, got {len(rows)}"
+                for g, exp in expected.items():
+                    assert rows[g] == exp, \
+                        f"{label}[{g}]: expected {exp}, got {rows.get(g)}"
+
+            _check(v_region_qty,  exp_region_qty,  "v_region_qty")
+            _check(v_region_cnt,  exp_region_cnt,  "v_region_cnt")
+            _check(v_product_rev, exp_product_rev, "v_product_rev")
+            _check(v_product_cnt, exp_product_cnt, "v_product_cnt")
+            _check(v_store_rev,   exp_store_rev,   "v_store_rev")
+            _check(v_store_cnt,   exp_store_cnt,   "v_store_cnt")
+            _check(v_highrev,     exp_highrev,      "v_highrev")
+
+        finally:
+            for vname in vnames:
+                try:
+                    client.drop_view(sn, vname)
+                except Exception:
+                    pass
+            try:
+                client.drop_table(sn, e_name)
+            except Exception:
+                pass
+            client.drop_schema(sn)

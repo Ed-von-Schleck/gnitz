@@ -34,14 +34,15 @@ pub fn seek_by_index(
     col_idx:  u64,
     key_lo:   u64,
     key_hi:   u64,
-) -> Result<(Option<Schema>, Option<ZSetBatch>), ClientError> {
+) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
     let msg = conn.roundtrip_seek_by_index(table_id, col_idx, key_lo, key_hi)?;
+    let view_lsn = msg.seek_pk_lo;
     let schema = msg.schema_batch
         .as_ref()
         .map(batch_to_schema)
         .transpose()
         .map_err(ClientError::Protocol)?;
-    Ok((schema, msg.data_batch))
+    Ok((schema, msg.data_batch, view_lsn))
 }
 
 pub fn push(
@@ -49,21 +50,23 @@ pub fn push(
     target_id: u64,
     schema:    &Schema,
     batch:     &ZSetBatch,
-) -> Result<Message, ClientError> {
-    conn.roundtrip(target_id, 0, Some(schema), Some(batch))
+) -> Result<u64, ClientError> {
+    let msg = conn.roundtrip(target_id, 0, Some(schema), Some(batch))?;
+    Ok(msg.seek_pk_lo)   // ingest_lsn from server ACK
 }
 
 pub fn scan(
     conn:      &Connection,
     target_id: u64,
-) -> Result<(Option<Schema>, Option<ZSetBatch>), ClientError> {
+) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
     let msg = conn.roundtrip(target_id, 0, None, None)?;
+    let view_lsn = msg.seek_pk_lo;
     let schema = msg.schema_batch
         .as_ref()
         .map(batch_to_schema)
         .transpose()
         .map_err(ClientError::Protocol)?;
-    Ok((schema, msg.data_batch))
+    Ok((schema, msg.data_batch, view_lsn))
 }
 
 pub fn seek(
@@ -71,12 +74,13 @@ pub fn seek(
     target_id: u64,
     pk_lo:     u64,
     pk_hi:     u64,
-) -> Result<(Option<Schema>, Option<ZSetBatch>), ClientError> {
+) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
     let msg = conn.roundtrip_seek(target_id, pk_lo, pk_hi)?;
+    let view_lsn = msg.seek_pk_lo;
     let schema = msg.schema_batch
         .as_ref()
         .map(batch_to_schema)
         .transpose()
         .map_err(ClientError::Protocol)?;
-    Ok((schema, msg.data_batch))
+    Ok((schema, msg.data_batch, view_lsn))
 }

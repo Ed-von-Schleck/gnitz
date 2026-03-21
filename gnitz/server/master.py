@@ -32,6 +32,119 @@ class MasterDispatcher(object):
         self.program_cache = program_cache
         self.router = PartitionRouter(assignment)
 
+    def fan_out_ingest(self, target_id, batch, schema):
+        """Split batch by worker partition, send FLAG_PUSH, collect ACKs.
+        Workers only ingest — no evaluate_dag, no exchange relay."""
+        sub_batches = repartition_batch(
+            batch, [schema.pk_index], self.num_workers, self.assignment
+        )
+        for w in range(self.num_workers):
+            sb = sub_batches[w]
+            ipc.send_batch(self.worker_fds[w], target_id, sb,
+                           schema=schema, flags=ipc.FLAG_PUSH)
+            if sb is not None:
+                sb.free()
+
+        poll_fds    = newlist_hint(self.num_workers)
+        poll_events = newlist_hint(self.num_workers)
+        for w in range(self.num_workers):
+            poll_fds.append(self.worker_fds[w])
+            poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
+
+        while len(poll_fds) > 0:
+            revents = ipc_ffi.poll(poll_fds, poll_events, 10)
+            pi = len(poll_fds) - 1
+            while pi >= 0:
+                if revents[pi] & (ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP):
+                    payload = ipc.receive_payload(poll_fds[pi])
+                    if payload.status != 0:
+                        err = payload.error_msg
+                        payload.close()
+                        raise errors.StorageError("Worker ingest error: %s" % err)
+                    payload.close()
+                    last = len(poll_fds) - 1
+                    if pi != last:
+                        poll_fds[pi]    = poll_fds[last]
+                        poll_events[pi] = poll_events[last]
+                    poll_fds.pop()
+                    poll_events.pop()
+                pi -= 1
+
+        log.debug(
+            "fan_out_ingest tid=" + str(target_id)
+            + " rows=" + str(batch.length())
+        )
+
+    def _collect_acks_and_relay(self, schema):
+        """Collect ACKs from all workers, relaying exchange messages."""
+        poll_fds    = newlist_hint(self.num_workers)
+        poll_events = newlist_hint(self.num_workers)
+        poll_wids   = newlist_hint(self.num_workers)
+        for w in range(self.num_workers):
+            poll_fds.append(self.worker_fds[w])
+            poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
+            poll_wids.append(w)
+
+        exchange_payloads = {}
+        exchange_counts = {}
+        exchange_schemas = {}
+        exchange_source_ids = {}
+
+        while len(poll_fds) > 0:
+            revents = ipc_ffi.poll(poll_fds, poll_events, 10)
+            pi = len(poll_fds) - 1
+            while pi >= 0:
+                if revents[pi] & (ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP):
+                    w = poll_wids[pi]
+                    payload = ipc.receive_payload(self.worker_fds[w])
+                    if payload.flags & ipc.FLAG_EXCHANGE:
+                        vid = intmask(payload.target_id)
+                        ex_source_id = intmask(payload.seek_pk_lo)
+                        if vid not in exchange_payloads:
+                            exchange_payloads[vid] = [None] * self.num_workers
+                            exchange_counts[vid] = 0
+                        exchange_payloads[vid][w] = payload
+                        if payload.schema is not None:
+                            exchange_schemas[vid] = payload.schema
+                        if ex_source_id > 0:
+                            exchange_source_ids[vid] = ex_source_id
+                        exchange_counts[vid] += 1
+                        if exchange_counts[vid] == self.num_workers:
+                            ex_schema = exchange_schemas.get(vid, schema)
+                            src_id = exchange_source_ids.get(vid, 0)
+                            self._relay_exchange(vid, exchange_payloads[vid], ex_schema, src_id)
+                            del exchange_payloads[vid]
+                            del exchange_counts[vid]
+                            if vid in exchange_schemas:
+                                del exchange_schemas[vid]
+                            if vid in exchange_source_ids:
+                                del exchange_source_ids[vid]
+                    else:
+                        if payload.status != 0:
+                            err = payload.error_msg
+                            payload.close()
+                            raise errors.StorageError(
+                                "Worker %d error: %s" % (w, err)
+                            )
+                        payload.close()
+                        last = len(poll_fds) - 1
+                        if pi != last:
+                            poll_fds[pi]    = poll_fds[last]
+                            poll_events[pi] = poll_events[last]
+                            poll_wids[pi]   = poll_wids[last]
+                        poll_fds.pop()
+                        poll_events.pop()
+                        poll_wids.pop()
+                pi -= 1
+
+    def fan_out_tick(self, target_id, schema):
+        """Send FLAG_TICK to all workers; handle exchange relay; collect ACKs."""
+        for w in range(self.num_workers):
+            ipc.send_batch(self.worker_fds[w], target_id, None,
+                           schema=schema, flags=ipc.FLAG_TICK)
+        self._collect_acks_and_relay(schema)
+        log.debug("fan_out_tick tid=" + str(target_id))
+
     def fan_out_push(self, target_id, batch, schema):
         """Split batch by worker partition, send sub-batches, collect ACKs.
         Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE.
@@ -119,71 +232,7 @@ class MasterDispatcher(object):
                 if sb is not None:
                     sb.free()
 
-        # Message loop: handle both ACKs and exchange relays.
-        # Build poll lists once; swap-remove on ACK (O(1) per worker).
-        poll_fds    = newlist_hint(self.num_workers)
-        poll_events = newlist_hint(self.num_workers)
-        poll_wids   = newlist_hint(self.num_workers)
-        for w in range(self.num_workers):
-            poll_fds.append(self.worker_fds[w])
-            poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
-            poll_wids.append(w)
-
-        exchange_payloads = {}   # view_id -> [IPCPayload | None] * num_workers
-        exchange_counts = {}     # view_id -> int
-        exchange_schemas = {}    # view_id -> schema
-        exchange_source_ids = {} # view_id -> source_id (for join exchange)
-
-        while len(poll_fds) > 0:
-            revents = ipc_ffi.poll(poll_fds, poll_events, 10)
-            pi = len(poll_fds) - 1
-            while pi >= 0:
-                if revents[pi] & (ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP):
-                    w = poll_wids[pi]
-                    payload = ipc.receive_payload(self.worker_fds[w])
-                    if payload.flags & ipc.FLAG_EXCHANGE:
-                        vid = intmask(payload.target_id)
-                        ex_source_id = intmask(payload.seek_pk_lo)
-                        if vid not in exchange_payloads:
-                            exchange_payloads[vid] = [None] * self.num_workers
-                            exchange_counts[vid] = 0
-                        exchange_payloads[vid][w] = payload          # store; do NOT close
-                        if payload.schema is not None:
-                            exchange_schemas[vid] = payload.schema
-                        if ex_source_id > 0:
-                            exchange_source_ids[vid] = ex_source_id
-                        exchange_counts[vid] += 1
-                        # payload.close() is deferred to _relay_exchange
-
-                        if exchange_counts[vid] == self.num_workers:
-                            ex_schema = exchange_schemas.get(vid, schema)
-                            src_id = exchange_source_ids.get(vid, 0)
-                            self._relay_exchange(vid, exchange_payloads[vid], ex_schema, src_id)
-                            del exchange_payloads[vid]
-                            del exchange_counts[vid]
-                            if vid in exchange_schemas:
-                                del exchange_schemas[vid]
-                            if vid in exchange_source_ids:
-                                del exchange_source_ids[vid]
-                            # payloads closed inside _relay_exchange
-                    else:
-                        # Normal ACK — swap-remove this worker from the poll set
-                        if payload.status != 0:
-                            err = payload.error_msg
-                            payload.close()
-                            raise errors.StorageError(
-                                "Worker %d push error: %s" % (w, err)
-                            )
-                        payload.close()
-                        last = len(poll_fds) - 1
-                        if pi != last:
-                            poll_fds[pi]    = poll_fds[last]
-                            poll_events[pi] = poll_events[last]
-                            poll_wids[pi]   = poll_wids[last]
-                        poll_fds.pop()
-                        poll_events.pop()
-                        poll_wids.pop()
-                pi -= 1
+        self._collect_acks_and_relay(schema)
 
         log.debug(
             "fan_out_push tid=" + str(target_id)

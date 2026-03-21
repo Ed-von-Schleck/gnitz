@@ -3,7 +3,8 @@
 # Column-based hash for repartitioning batches across workers.
 # Single authority for all partition routing logic.
 
-from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import r_uint64, intmask
+from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core.batch import ArenaZSetBatch, ColumnarBatchAccessor
 from gnitz.storage.partitioned_table import _partition_for_key
 from gnitz.dbsp.ops.group_index import _extract_group_key
@@ -63,28 +64,39 @@ def hash_row_by_columns(batch, row_idx, col_indices):
                                   r_uint64(batch._read_pk_hi(row_idx)))
     acc = ColumnarBatchAccessor(schema)
     acc.bind(batch, row_idx)
-    group_key = _extract_group_key(acc, schema, col_indices)
-    return _partition_for_key(r_uint64(group_key), r_uint64(group_key >> 64))
+    group_key_lo, group_key_hi = _extract_group_key(acc, schema, col_indices)
+    return _partition_for_key(group_key_lo, group_key_hi)
 
 
 def repartition_batch(batch, shard_col_indices, num_workers, assignment):
     """Split a batch into N sub-batches by hashing shard columns.
-    Returns list[ArenaZSetBatch or None] of length num_workers."""
+    Returns list[ArenaZSetBatch or None] of length num_workers.
+    Two-pass: classify then bulk-copy to reduce alloc pressure."""
     sub_batches = [None] * num_workers
     schema = batch._schema
-    for i in range(batch.length()):
+    n = batch.length()
+    # Pass 1: classify rows into per-worker index lists
+    worker_indices = newlist_hint(num_workers)
+    for _w in range(num_workers):
+        worker_indices.append(newlist_hint(n // num_workers + 1))
+    for i in range(n):
         p = hash_row_by_columns(batch, i, shard_col_indices)
         w = assignment.worker_for_partition(p)
-        if sub_batches[w] is None:
-            sub_batches[w] = ArenaZSetBatch(schema, initial_capacity=batch.length() // num_workers)
-        sub_batches[w]._direct_append_row(batch, i, batch.get_weight(i))
+        worker_indices[w].append(i)
+    # Pass 2: bulk-copy each worker's rows
+    for w in range(num_workers):
+        wl = worker_indices[w]
+        if len(wl) > 0:
+            sub_batches[w] = ArenaZSetBatch(schema, initial_capacity=len(wl))
+            sub_batches[w]._copy_rows_indexed_src_weights(batch, wl)
     return sub_batches
 
 
 def repartition_batches(source_batches, shard_col_indices, num_workers, assignment):
     """Scatter N source batches into N dest batches without an intermediate merge.
     Sources are iterated sequentially. Output is NOT marked consolidated.
-    Fallback when sources are not all consolidated."""
+    Fallback when sources are not all consolidated.
+    Two-pass per source batch: classify then bulk-copy."""
     dest = [None] * num_workers
     schema = None
     total = 0
@@ -97,13 +109,26 @@ def repartition_batches(source_batches, shard_col_indices, num_workers, assignme
         return dest
     cap = total // num_workers
     for sb in source_batches:
-        if sb is not None:
-            for i in range(sb.length()):
-                p = hash_row_by_columns(sb, i, shard_col_indices)
-                w = assignment.worker_for_partition(p)
+        if sb is None:
+            continue
+        sb_len = sb.length()
+        if sb_len == 0:
+            continue
+        # Pass 1: classify this source batch's rows
+        worker_indices = newlist_hint(num_workers)
+        for _w in range(num_workers):
+            worker_indices.append(newlist_hint(sb_len // num_workers + 1))
+        for i in range(sb_len):
+            p = hash_row_by_columns(sb, i, shard_col_indices)
+            w = assignment.worker_for_partition(p)
+            worker_indices[w].append(i)
+        # Pass 2: bulk-copy
+        for w in range(num_workers):
+            wl = worker_indices[w]
+            if len(wl) > 0:
                 if dest[w] is None:
                     dest[w] = ArenaZSetBatch(schema, initial_capacity=cap)
-                dest[w]._direct_append_row(sb, i, sb.get_weight(i))
+                dest[w]._copy_rows_indexed_src_weights(sb, wl)
     return dest
 
 
@@ -220,20 +245,31 @@ class PartitionRouter(object):
 
 
 def multi_scatter(batch, col_spec_list, num_workers, assignment):
-    """Scatter one batch by multiple column specs in a single pass.
+    """Scatter one batch by multiple column specs.
     Returns list[list[ArenaZSetBatch|None]], one inner list per spec.
-    Used by Phase 4's combined push+preload pass."""
+    Two-pass: classify then bulk-copy via _copy_rows_indexed_src_weights."""
+    n = batch.length()
     n_specs = len(col_spec_list)
-    results = [[None] * num_workers for _ in range(n_specs)]
     schema = batch._schema
-    for i in range(batch.length()):
-        weight = batch.get_weight(i)
+    # Pass 1: classify rows into flat_indices[si * num_workers + w]
+    flat_indices = newlist_hint(n_specs * num_workers)
+    for _i in range(n_specs * num_workers):
+        flat_indices.append(newlist_hint(n // num_workers + 1))
+    for i in range(n):
         for si in range(n_specs):
             p = hash_row_by_columns(batch, i, col_spec_list[si])
             w = assignment.worker_for_partition(p)
-            if results[si][w] is None:
-                results[si][w] = ArenaZSetBatch(schema, initial_capacity=batch.length() // num_workers)
-            results[si][w]._direct_append_row(batch, i, weight)
+            flat_indices[si * num_workers + w].append(i)
+    # Pass 2: bulk-copy each (spec, worker) bucket
+    results = [None] * n_specs
+    for si in range(n_specs):
+        results[si] = [None] * num_workers
+    for si in range(n_specs):
+        for w in range(num_workers):
+            wl = flat_indices[si * num_workers + w]
+            if len(wl) > 0:
+                results[si][w] = ArenaZSetBatch(schema, initial_capacity=len(wl))
+                results[si][w]._copy_rows_indexed_src_weights(batch, wl)
     # Flag propagation: PK-spec sub-batches inherit consolidation from source
     for si in range(n_specs):
         spec = col_spec_list[si]

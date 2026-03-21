@@ -61,9 +61,10 @@ class Row:
 
 
 class ScanResult:
-    def __init__(self, schema, batch):
+    def __init__(self, schema, batch, lsn=0):
         self._schema = schema
         self._batch  = batch
+        self.lsn     = lsn
 
     @property
     def batch(self):

@@ -41,13 +41,13 @@ class Connection:
     # DML
 
     def push(self, target_id, batch):
-        self._client.push(target_id, _to_native_schema(batch._schema), batch._raw)
+        return self._client.push(target_id, _to_native_schema(batch._schema), batch._raw)
 
     def scan(self, target_id):
-        native_schema, batch = self._client.scan(target_id)
+        native_schema, batch, view_lsn = self._client.scan(target_id)
         if native_schema is None:
-            return ScanResult(None, None)
-        return ScanResult(_from_native_schema(native_schema), batch)
+            return ScanResult(None, None, view_lsn)
+        return ScanResult(_from_native_schema(native_schema), batch, view_lsn)
 
     def delete(self, target_id, schema, pks):
         self._client.delete(target_id, _to_native_schema(schema), pks)
@@ -85,18 +85,18 @@ class Connection:
     def seek(self, table_id: int, pk: int = 0) -> "ScanResult":
         pk_lo = pk & 0xFFFFFFFFFFFFFFFF
         pk_hi = (pk >> 64) & 0xFFFFFFFFFFFFFFFF
-        native_schema, batch = self._client.seek(table_id, pk_lo, pk_hi)
+        native_schema, batch, view_lsn = self._client.seek(table_id, pk_lo, pk_hi)
         if native_schema is None:
-            return ScanResult(None, None)
-        return ScanResult(_from_native_schema(native_schema), batch)
+            return ScanResult(None, None, view_lsn)
+        return ScanResult(_from_native_schema(native_schema), batch, view_lsn)
 
     def seek_by_index(self, table_id: int, col_idx: int, key: int = 0) -> "ScanResult":
         key_lo = key & 0xFFFFFFFFFFFFFFFF
         key_hi = (key >> 64) & 0xFFFFFFFFFFFFFFFF
-        native_schema, batch = self._client.seek_by_index(table_id, col_idx, key_lo, key_hi)
+        native_schema, batch, view_lsn = self._client.seek_by_index(table_id, col_idx, key_lo, key_hi)
         if native_schema is None:
-            return ScanResult(None, None)
-        return ScanResult(_from_native_schema(native_schema), batch)
+            return ScanResult(None, None, view_lsn)
+        return ScanResult(_from_native_schema(native_schema), batch, view_lsn)
 
     def execute_sql(self, sql: str, schema_name: str = "public") -> list:
         results = self._client.execute_sql(schema_name, sql)

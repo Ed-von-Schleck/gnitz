@@ -4,7 +4,7 @@ from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, intmask
 
 from gnitz.core.comparator import RowAccessor, NullAccessor
-from gnitz.core.batch import ConsolidatedScope, BatchWriter
+from gnitz.core.batch import ConsolidatedScope, BatchWriter, pk_lt, pk_eq
 from gnitz.storage.cursor import SortedBatchCursor
 
 """
@@ -99,10 +99,16 @@ class CompositeAccessor(RowAccessor):
         return self.right_acc.get_float(self.mapping_idx[col_idx])
 
     @jit.unroll_safe
-    def get_u128(self, col_idx):
+    def get_u128_lo(self, col_idx):
         if self.mapping_is_left[col_idx]:
-            return self.left_acc.get_u128(self.mapping_idx[col_idx])
-        return self.right_acc.get_u128(self.mapping_idx[col_idx])
+            return self.left_acc.get_u128_lo(self.mapping_idx[col_idx])
+        return self.right_acc.get_u128_lo(self.mapping_idx[col_idx])
+
+    @jit.unroll_safe
+    def get_u128_hi(self, col_idx):
+        if self.mapping_is_left[col_idx]:
+            return self.left_acc.get_u128_hi(self.mapping_idx[col_idx])
+        return self.right_acc.get_u128_hi(self.mapping_idx[col_idx])
 
     @jit.unroll_safe
     def get_str_struct(self, col_idx):
@@ -154,12 +160,12 @@ def _join_dt_swapped(delta_batch, trace_cursor, out_writer, composite_acc):
     with ConsolidatedScope(delta_batch) as sorted_delta:
         delta_cursor = SortedBatchCursor(sorted_delta)
         while trace_cursor.is_valid():
-            trace_key = trace_cursor.key()
-            if not delta_cursor.seek_key_exact(trace_key):
+            trace_key_lo, trace_key_hi = trace_cursor.key_lo(), trace_cursor.key_hi()
+            if not delta_cursor.seek_key_exact(trace_key_lo, trace_key_hi):
                 trace_cursor.advance()
                 continue
             w_trace = trace_cursor.weight()
-            while delta_cursor.is_valid() and delta_cursor.key() == trace_key:
+            while delta_cursor.is_valid() and pk_eq(delta_cursor.key_lo(), delta_cursor.key_hi(), trace_key_lo, trace_key_hi):
                 w_delta = delta_cursor.weight()
                 w_out = r_int64(intmask(w_delta * w_trace))
                 if w_out != r_int64(0):
@@ -167,7 +173,7 @@ def _join_dt_swapped(delta_batch, trace_cursor, out_writer, composite_acc):
                         delta_cursor.get_accessor(),
                         trace_cursor.get_accessor(),
                     )
-                    out_writer.append_from_accessor(trace_key, w_out, composite_acc)
+                    out_writer.append_from_accessor(trace_key_lo, trace_key_hi, w_out, composite_acc)
                 delta_cursor.advance()
             trace_cursor.advance()
     # Caller sets mark_sorted(True) — output is in trace key order.
@@ -178,19 +184,19 @@ def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
     if count == 0:
         out_writer.mark_sorted(True)
         return
-    trace_cursor.seek(delta_batch.get_pk(0))
+    trace_cursor.seek(delta_batch.get_pk_lo(0), delta_batch.get_pk_hi(0))
     for i in range(count):
-        d_key = delta_batch.get_pk(i)
+        d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
         w_delta = delta_batch.get_weight(i)
         # w_delta is non-zero by _consolidated invariant.
-        if i > 0 and delta_batch.get_pk(i - 1) == d_key:
+        if i > 0 and pk_eq(delta_batch.get_pk_lo(i - 1), delta_batch.get_pk_hi(i - 1), d_key_lo, d_key_hi):
             # Multiset delta: multiple rows with same PK → re-seek trace.
-            trace_cursor.seek(d_key)
+            trace_cursor.seek(d_key_lo, d_key_hi)
         else:
-            while trace_cursor.is_valid() and trace_cursor.key() < d_key:
+            while trace_cursor.is_valid() and pk_lt(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
                 trace_cursor.advance()
         # Iterate all trace records for d_key (trace may have multiple rows per PK).
-        while trace_cursor.is_valid() and trace_cursor.key() == d_key:
+        while trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
             w_trace = trace_cursor.weight()
             w_out = r_int64(intmask(w_delta * w_trace))
             if w_out != r_int64(0):
@@ -198,7 +204,7 @@ def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
                     delta_batch.get_accessor(i),
                     trace_cursor.get_accessor(),
                 )
-                out_writer.append_from_accessor(d_key, w_out, composite_acc)
+                out_writer.append_from_accessor(d_key_lo, d_key_hi, w_out, composite_acc)
             trace_cursor.advance()
     out_writer.mark_sorted(True)
 
@@ -227,21 +233,21 @@ def _join_dt_outer_merge_walk(delta_batch, trace_cursor, out_writer,
     if count == 0:
         out_writer.mark_sorted(True)
         return
-    trace_cursor.seek(delta_batch.get_pk(0))
+    trace_cursor.seek(delta_batch.get_pk_lo(0), delta_batch.get_pk_hi(0))
     for i in range(count):
-        d_key = delta_batch.get_pk(i)
+        d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
         w_delta = delta_batch.get_weight(i)
         # w_delta is non-zero by _consolidated invariant.
 
-        if i > 0 and delta_batch.get_pk(i - 1) == d_key:
+        if i > 0 and pk_eq(delta_batch.get_pk_lo(i - 1), delta_batch.get_pk_hi(i - 1), d_key_lo, d_key_hi):
             # Multiset delta: same PK, different payload — re-seek trace.
-            trace_cursor.seek(d_key)
+            trace_cursor.seek(d_key_lo, d_key_hi)
         else:
-            while trace_cursor.is_valid() and trace_cursor.key() < d_key:
+            while trace_cursor.is_valid() and pk_lt(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
                 trace_cursor.advance()
 
         matched = False
-        while trace_cursor.is_valid() and trace_cursor.key() == d_key:
+        while trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
             w_trace = trace_cursor.weight()
             w_out = r_int64(intmask(w_delta * w_trace))
             if w_out != r_int64(0):
@@ -249,14 +255,14 @@ def _join_dt_outer_merge_walk(delta_batch, trace_cursor, out_writer,
                     delta_batch.get_accessor(i),
                     trace_cursor.get_accessor(),
                 )
-                out_writer.append_from_accessor(d_key, w_out, composite_acc)
+                out_writer.append_from_accessor(d_key_lo, d_key_hi, w_out, composite_acc)
                 matched = True
             trace_cursor.advance()
 
         if not matched:
             # No inner-join output for this delta key — emit null-fill row.
             composite_acc.set_accessors(delta_batch.get_accessor(i), null_acc)
-            out_writer.append_from_accessor(d_key, w_delta, composite_acc)
+            out_writer.append_from_accessor(d_key_lo, d_key_hi, w_delta, composite_acc)
 
     out_writer.mark_sorted(True)
 
@@ -282,22 +288,22 @@ def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):
 
             rows_since_consolidation = 0
             while idx_a < n_a and idx_b < n_b:
-                key_a = b_a.get_pk(idx_a)
-                key_b = b_b.get_pk(idx_b)
+                key_a_lo, key_a_hi = b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a)
+                key_b_lo, key_b_hi = b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b)
 
-                if key_a < key_b:
+                if pk_lt(key_a_lo, key_a_hi, key_b_lo, key_b_hi):
                     idx_a += 1
-                elif key_b < key_a:
+                elif pk_lt(key_b_lo, key_b_hi, key_a_lo, key_a_hi):
                     idx_b += 1
                 else:
-                    match_key = key_a
+                    match_lo, match_hi = key_a_lo, key_a_hi
 
                     start_a = idx_a
-                    while idx_a < n_a and b_a.get_pk(idx_a) == match_key:
+                    while idx_a < n_a and pk_eq(b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a), match_lo, match_hi):
                         idx_a += 1
 
                     start_b = idx_b
-                    while idx_b < n_b and b_b.get_pk(idx_b) == match_key:
+                    while idx_b < n_b and pk_eq(b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b), match_lo, match_hi):
                         idx_b += 1
 
                     for i in range(start_a, idx_a):
@@ -313,7 +319,7 @@ def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):
                                     b_b.get_accessor(j),
                                 )
                                 out_writer.append_from_accessor(
-                                    match_key, w_out, composite_acc
+                                    match_lo, match_hi, w_out, composite_acc
                                 )
                                 rows_since_consolidation += 1
                                 if rows_since_consolidation >= CONSOLIDATE_INTERVAL_DD:

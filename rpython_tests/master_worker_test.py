@@ -135,8 +135,7 @@ def test_batch_splitting_by_worker():
     rb = RowBuilder(schema, batch)
     num_rows = 200
     for i in range(num_rows):
-        pk = r_uint128(i + 1)
-        rb.begin(pk, r_int64(1))
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i * 10))
         rb.commit()
 
@@ -174,7 +173,7 @@ def test_socketpair_ffi():
     schema = make_u64_i64_schema()
     batch = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, batch)
-    rb.begin(r_uint128(42), r_int64(1))
+    rb.begin(r_uint64(42), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(999))
     rb.commit()
 
@@ -217,7 +216,7 @@ def test_fork_ipc_push_round_trip(base_dir):
     batch = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, batch)
     for i in range(5):
-        rb.begin(r_uint128(i + 1), r_int64(1))
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i * 100))
         rb.commit()
 
@@ -255,7 +254,7 @@ def test_fork_ipc_scan_round_trip(base_dir):
         result = ArenaZSetBatch(schema)
         rb = RowBuilder(schema, result)
         for i in range(3):
-            rb.begin(r_uint128(i + 10), r_int64(1))
+            rb.begin(r_uint64(i + 10), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 50))
             rb.commit()
         ipc.send_batch(child_fd, 0, result, schema=schema)
@@ -339,7 +338,7 @@ def test_multi_worker_integration(base_dir):
     rb = RowBuilder(schema, batch)
     num_rows = 200
     for i in range(num_rows):
-        rb.begin(r_uint128(i + 1), r_int64(1))
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i))
         rb.commit()
 
@@ -417,7 +416,7 @@ def test_exchange_routing_contract():
     rb = RowBuilder(u64_schema, u64_batch)
     for i in range(256):
         v = r_uint64(i * 997 + 1)
-        rb.begin(r_uint128(r_uint64(i + 1)), r_int64(1))
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb.put_int(rffi.cast(rffi.LONGLONG, v))
         rb.commit()
 
@@ -443,7 +442,7 @@ def test_exchange_routing_contract():
     mc_batch = ArenaZSetBatch(mc_schema)
     rb2 = RowBuilder(mc_schema, mc_batch)
     for i in range(64):
-        rb2.begin(r_uint128(r_uint64(i + 1)), r_int64(1))
+        rb2.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb2.put_int(r_int64(i * 31 + 7))
         rb2.put_int(r_int64(i * 97 - 3))
         rb2.commit()
@@ -535,7 +534,7 @@ def test_empty_push_barrier(base_dir):
     src_batch = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, src_batch)
     for i in range(len(pk_vals)):
-        rb.begin(r_uint128(pk_vals[i]), r_int64(1))
+        rb.begin(r_uint64(pk_vals[i]), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(intmask(pk_vals[i]) * 10))
         rb.commit()
 

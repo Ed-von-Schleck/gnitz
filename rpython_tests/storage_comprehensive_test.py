@@ -209,7 +209,7 @@ def test_wal_storage(base_dir):
 
     b1 = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b1)
-    rb.begin(r_uint128(10), r_int64(1))
+    rb.begin(r_uint64(10), r_uint64(0), r_int64(1))
     rb.put_string("block1")
     rb.commit()
 
@@ -265,12 +265,12 @@ def test_wal_storage(base_dir):
 
     # Long string forces Blob allocation inside WAL block body
     long_str = "A" * 50
-    rb_blob.begin(r_uint128(1), r_int64(1))
+    rb_blob.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb_blob.put_string(long_str)
     rb_blob.commit()
 
     # Short string immediately follows
-    rb_blob.begin(r_uint128(2), r_int64(1))
+    rb_blob.begin(r_uint64(2), r_uint64(0), r_int64(1))
     rb_blob.put_string("short")
     rb_blob.commit()
 
@@ -322,7 +322,7 @@ def test_wal_reencode_round_trip(base_dir):
     # Step 1: encode original batch to a wire buffer.
     orig = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, orig)
-    rb.begin(r_uint128(r_uint64(7)), r_int64(1))
+    rb.begin(r_uint64(7), r_uint64(0), r_int64(1))
     rb.put_string(long_name)
     rb.commit()
 
@@ -372,26 +372,26 @@ def test_memtable(base_dir):
 
         b_add = batch.ArenaZSetBatch(schema_u128)
         rb = RowBuilder(schema_u128, b_add)
-        rb.begin(pk1, r_int64(1))
+        rb.begin(r_uint64(pk1), r_uint64(pk1 >> 64), r_int64(1))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(100)))
         rb.commit()
         mt.upsert_batch(b_add)
 
         assert_false(mt.is_empty(), "MemTable should not be empty after insert")
         assert_equal_i64(
-            r_int64(1), mt.lookup_pk(pk1)[0], "Weight should be 1 after insert"
+            r_int64(1), mt.lookup_pk(r_uint64(pk1), r_uint64(pk1 >> 64))[0], "Weight should be 1 after insert"
         )
 
         b_sub = batch.ArenaZSetBatch(schema_u128)
         rb_sub = RowBuilder(schema_u128, b_sub)
-        rb_sub.begin(pk1, r_int64(-1))
+        rb_sub.begin(r_uint64(pk1), r_uint64(pk1 >> 64), r_int64(-1))
         rb_sub.put_int(rffi.cast(rffi.LONGLONG, r_uint64(100)))
         rb_sub.commit()
         mt.upsert_batch(b_sub)
 
         assert_equal_i64(
             r_int64(0),
-            mt.lookup_pk(pk1)[0],
+            mt.lookup_pk(r_uint64(pk1), r_uint64(pk1 >> 64))[0],
             "Weight should be 0 after annihilation",
         )
 
@@ -412,19 +412,19 @@ def test_memtable(base_dir):
 
         b_d1 = batch.ArenaZSetBatch(schema_str)
         rb_d1 = RowBuilder(schema_str, b_d1)
-        rb_d1.begin(pk1, r_int64(1))
+        rb_d1.begin(r_uint64(pk1), r_uint64(pk1 >> 64), r_int64(1))
         rb_d1.put_string(dead_str)
         rb_d1.commit()
 
         b_d2 = batch.ArenaZSetBatch(schema_str)
         rb_d2 = RowBuilder(schema_str, b_d2)
-        rb_d2.begin(pk1, r_int64(-1))
+        rb_d2.begin(r_uint64(pk1), r_uint64(pk1 >> 64), r_int64(-1))
         rb_d2.put_string(dead_str)
         rb_d2.commit()
 
         b_l1 = batch.ArenaZSetBatch(schema_str)
         rb_l1 = RowBuilder(schema_str, b_l1)
-        rb_l1.begin(pk2, r_int64(1))
+        rb_l1.begin(r_uint64(pk2), r_uint64(pk2 >> 64), r_int64(1))
         rb_l1.put_string(live_str)
         rb_l1.commit()
 
@@ -454,7 +454,7 @@ def test_memtable(base_dir):
         for pk_val in [30, 10, 20]:
             b_c = batch.ArenaZSetBatch(schema_u128)
             rb_c = RowBuilder(schema_u128, b_c)
-            rb_c.begin(r_uint128(pk_val), r_int64(1))
+            rb_c.begin(r_uint64(pk_val), r_uint64(0), r_int64(1))
             rb_c.put_int(rffi.cast(rffi.LONGLONG, r_int64(pk_val)))
             rb_c.commit()
             mt3.upsert_batch(b_c)
@@ -472,7 +472,7 @@ def test_memtable(base_dir):
 
         # 4. Cursor seek
         mc2 = cursor.MemTableCursor(mt3)
-        mc2.seek(r_uint128(20))
+        mc2.seek(r_uint64(20), r_uint64(0))
         assert_true(mc2.is_valid(), "Cursor should be valid after seek")
         assert_equal_u128(r_uint128(20), mc2.key(), "Cursor should seek to PK 20")
         mc2.close()
@@ -487,7 +487,7 @@ def test_memtable(base_dir):
         for j in range(1000):
             b_f = batch.ArenaZSetBatch(schema_u128)
             rb_f = RowBuilder(schema_u128, b_f)
-            rb_f.begin(r_uint128(j), r_int64(1))
+            rb_f.begin(r_uint64(j), r_uint64(0), r_int64(1))
             rb_f.put_int(rffi.cast(rffi.LONGLONG, r_int64(j)))
             rb_f.commit()
             tiny_mt.upsert_batch(b_f)
@@ -510,7 +510,7 @@ def test_shards_and_columnar(base_dir):
 
     tmp1 = batch.ArenaZSetBatch(schema)
     rb1 = RowBuilder(schema, tmp1)
-    rb1.begin(r_uint128(10), r_int64(1))
+    rb1.begin(r_uint64(10), r_uint64(0), r_int64(1))
     rb1.put_string("test")
     rb1.commit()
     writer.add_row_from_accessor(r_uint128(10), r_int64(1), tmp1.get_accessor(0))
@@ -518,7 +518,7 @@ def test_shards_and_columnar(base_dir):
 
     tmp2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, tmp2)
-    rb2.begin(r_uint128(20), r_int64(1))
+    rb2.begin(r_uint64(20), r_uint64(0), r_int64(1))
     rb2.put_string("data_long_string_for_blob")
     rb2.commit()
     writer.add_row_from_accessor(r_uint128(20), r_int64(1), tmp2.get_accessor(0))
@@ -643,7 +643,7 @@ def test_manifest_and_spine(base_dir):
 
     tmp = batch.ArenaZSetBatch(schema)
     rb_idx = RowBuilder(schema, tmp)
-    rb_idx.begin(r_uint128(10), r_int64(1))
+    rb_idx.begin(r_uint64(10), r_uint64(0), r_int64(1))
     rb_idx.put_string("index")
     rb_idx.commit()
     w.add_row_from_accessor(r_uint128(10), r_int64(1), tmp.get_accessor(0))
@@ -679,7 +679,7 @@ def ingest_test_row(tbl, pk_val, weight, name_str, int_val):
     schema = tbl.get_schema()
     b = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
-    rb.begin(r_uint128(pk_val), r_int64(weight))
+    rb.begin(r_uint64(pk_val), r_uint64(0), r_int64(weight))
     rb.put_string(name_str)
     rb.put_int(r_int64(int_val))
     rb.commit()
@@ -762,11 +762,11 @@ def test_compaction(base_dir):
     if pk100_weight != r_int64(0):
         raise Exception("Ghost Property Violation: PK 100 net weight != 0")
 
-    if tbl.has_pk(r_uint128(100)):
+    if tbl.has_pk(r_uint64(100), r_uint64(0)):
         raise Exception("Ghost Property Violation: has_pk(100) should be False")
-    if not tbl.has_pk(r_uint128(200)):
+    if not tbl.has_pk(r_uint64(200), r_uint64(0)):
         raise Exception("PK 200 should survive compaction")
-    if not tbl.has_pk(r_uint128(300)):
+    if not tbl.has_pk(r_uint64(300), r_uint64(0)):
         raise Exception("PK 300 should survive compaction")
 
     # 6. Verify Cleanup: old L0 shard files should be deleted
@@ -792,26 +792,26 @@ def test_ephemeral_and_persistent_tables(base_dir):
 
     b_add = batch.ArenaZSetBatch(schema)
     rb_add = RowBuilder(schema, b_add)
-    rb_add.begin(pk1, r_int64(5))
+    rb_add.begin(r_uint64(pk1), r_uint64(pk1 >> 64), r_int64(5))
     rb_add.put_string("sum_test")
     rb_add.commit()
     t_eph.ingest_batch(b_add)
 
     b_sub = batch.ArenaZSetBatch(schema)
     rb_sub = RowBuilder(schema, b_sub)
-    rb_sub.begin(pk1, r_int64(-3))
+    rb_sub.begin(r_uint64(pk1), r_uint64(pk1 >> 64), r_int64(-3))
     rb_sub.put_string("sum_test")
     rb_sub.commit()
     t_eph.ingest_batch(b_sub)
 
     tmp_acc = batch.ArenaZSetBatch(schema)
     rb_acc = RowBuilder(schema, tmp_acc)
-    rb_acc.begin(pk1, r_int64(1))
+    rb_acc.begin(r_uint64(pk1), r_uint64(pk1 >> 64), r_int64(1))
     rb_acc.put_string("sum_test")
     rb_acc.commit()
     acc1 = tmp_acc.get_accessor(0)
 
-    net_w = t_eph.get_weight(pk1, acc1)
+    net_w = t_eph.get_weight(r_uint64(pk1), r_uint64(pk1 >> 64), acc1)
     assert_equal_i64(r_int64(2), net_w, "Ephemeral algebraic summation failed")
 
     # 2. Ephemeral Spill
@@ -820,7 +820,7 @@ def test_ephemeral_and_persistent_tables(base_dir):
         shard_path.find("eph_shard") >= 0, "Ephemeral shard naming convention failed"
     )
 
-    net_w2 = t_eph.get_weight(pk1, acc1)
+    net_w2 = t_eph.get_weight(r_uint64(pk1), r_uint64(pk1 >> 64), acc1)
     assert_equal_i64(
         r_int64(2), net_w2, "Summation visibility lost after ephemeral flush"
     )
@@ -837,7 +837,7 @@ def test_ephemeral_and_persistent_tables(base_dir):
     r_k2 = r_uint128(2)
     b2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, b2)
-    rb2.begin(r_k2, r_int64(1))
+    rb2.begin(r_uint64(r_k2), r_uint64(r_k2 >> 64), r_int64(1))
     rb2.put_string("mem_only")
     rb2.commit()
     t_eph.ingest_batch(b2)
@@ -873,7 +873,7 @@ def test_u128_payloads(base_dir):
 
     b = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
-    rb.begin(pk1, r_int64(1))
+    rb.begin(r_uint64(pk1), r_uint64(pk1 >> 64), r_int64(1))
     rb.put_u128(uuid_lo, uuid_hi)
     rb.put_string("a")
     rb.commit()
@@ -903,21 +903,21 @@ def test_bloom_filter(base_dir):
     # 1. No false negatives
     bf = BloomFilter(200)
     for i in range(100):
-        bf.add(r_uint128(i))
+        bf.add(r_uint64(i), r_uint64(0))
     for i in range(100):
-        assert_true(bf.may_contain(r_uint128(i)), "Bloom FN for key %d" % i)
+        assert_true(bf.may_contain(r_uint64(i), r_uint64(0)), "Bloom FN for key %d" % i)
 
     # 2. Low false positive rate
     fp_count = 0
     for i in range(1000, 2000):
-        if bf.may_contain(r_uint128(i)):
+        if bf.may_contain(r_uint64(i), r_uint64(0)):
             fp_count += 1
     assert_true(fp_count < 50, "Bloom FPR too high: %d/1000" % fp_count)
     bf.free()
 
     # 3. Empty filter returns False
     bf2 = BloomFilter(100)
-    assert_false(bf2.may_contain(r_uint128(42)), "Empty bloom should return False")
+    assert_false(bf2.may_contain(r_uint64(42), r_uint64(0)), "Empty bloom should return False")
     bf2.free()
 
     os.write(1, "    [OK] Bloom Filter passed.\n")
@@ -947,14 +947,14 @@ def test_xor8_filter(base_dir):
 
         for i in range(num_keys):
             assert_true(
-                xf.may_contain(r_uint128(i + 1)),
+                xf.may_contain(r_uint64(i + 1), r_uint64(0)),
                 "XOR8 FN for key %d" % (i + 1),
             )
 
         # 2. Low false positive rate
         fp_count = 0
         for i in range(5000, 7000):
-            if xf.may_contain(r_uint128(i)):
+            if xf.may_contain(r_uint64(i), r_uint64(0)):
                 fp_count += 1
         assert_true(fp_count < 40, "XOR8 FPR too high: %d/2000" % fp_count)
 
@@ -966,7 +966,7 @@ def test_xor8_filter(base_dir):
 
         for i in range(num_keys):
             assert_true(
-                xf2.may_contain(r_uint128(i + 1)),
+                xf2.may_contain(r_uint64(i + 1), r_uint64(0)),
                 "XOR8 serde FN for key %d" % (i + 1),
             )
         xf2.free()
@@ -993,8 +993,8 @@ def test_xor8_filter(base_dir):
         )
         xf3 = build_xor8(small_lo, small_hi, 2)
         assert_true(xf3 is not None, "XOR8 small set build failed")
-        assert_true(xf3.may_contain(r_uint128(999)), "XOR8 small FN key 999")
-        assert_true(xf3.may_contain(r_uint128(1000)), "XOR8 small FN key 1000")
+        assert_true(xf3.may_contain(r_uint64(999), r_uint64(0)), "XOR8 small FN key 999")
+        assert_true(xf3.may_contain(r_uint64(1000), r_uint64(0)), "XOR8 small FN key 1000")
         xf3.free()
     finally:
         lltype.free(small_lo, flavor="raw")
@@ -1017,7 +1017,7 @@ def test_filter_integration(base_dir):
         for i in range(1, 51):
             b = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, b)
-            rb.begin(r_uint128(i), r_int64(1))
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
             rb.put_string("v%d" % i)
             rb.commit()
             mt.upsert_batch(b)
@@ -1025,13 +1025,13 @@ def test_filter_integration(base_dir):
 
         for i in range(1, 51):
             assert_true(
-                mt.may_contain_pk(r_uint128(i)),
+                mt.may_contain_pk(r_uint64(i), r_uint64(0)),
                 "Bloom missed inserted key %d" % i,
             )
 
         fp_count = 0
         for i in range(1000, 1100):
-            if mt.may_contain_pk(r_uint128(i)):
+            if mt.may_contain_pk(r_uint64(i), r_uint64(0)):
                 fp_count += 1
         assert_true(fp_count < 20, "MemTable bloom FPR too high: %d/100" % fp_count)
     finally:
@@ -1043,7 +1043,7 @@ def test_filter_integration(base_dir):
     for i in range(1, 51):
         tmp = batch.ArenaZSetBatch(schema)
         rb_s = RowBuilder(schema, tmp)
-        rb_s.begin(r_uint128(i), r_int64(1))
+        rb_s.begin(r_uint64(i), r_uint64(0), r_int64(1))
         rb_s.put_string("shard_v%d" % i)
         rb_s.commit()
         sw.add_row_from_accessor(r_uint128(i), r_int64(1), tmp.get_accessor(0))
@@ -1060,7 +1060,7 @@ def test_filter_integration(base_dir):
 
     for i in range(1, 51):
         assert_true(
-            h.xor8_filter.may_contain(r_uint128(i)),
+            h.xor8_filter.may_contain(r_uint64(i), r_uint64(0)),
             "Shard XOR8 FN for key %d" % i,
         )
     h.close()
@@ -1070,15 +1070,15 @@ def test_filter_integration(base_dir):
     t_eph = EphemeralTable(eph_dir, "filter_test", schema)
     b = batch.ArenaZSetBatch(schema)
     rb_e = RowBuilder(schema, b)
-    rb_e.begin(r_uint128(42), r_int64(1))
+    rb_e.begin(r_uint64(42), r_uint64(0), r_int64(1))
     rb_e.put_string("test_val")
     rb_e.commit()
     t_eph.ingest_batch(b)
     b.free()
 
-    assert_true(t_eph.has_pk(r_uint128(42)), "EphemeralTable has_pk failed for 42")
+    assert_true(t_eph.has_pk(r_uint64(42), r_uint64(0)), "EphemeralTable has_pk failed for 42")
     assert_false(
-        t_eph.has_pk(r_uint128(9999)), "EphemeralTable has_pk FP for 9999"
+        t_eph.has_pk(r_uint64(9999), r_uint64(0)), "EphemeralTable has_pk FP for 9999"
     )
     t_eph.close()
 
@@ -1099,14 +1099,14 @@ def test_retract_pk(base_dir):
     t = EphemeralTable(eph_dir, "retract_mt", schema)
     b = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
-    rb.begin(r_uint128(10), r_int64(1))
+    rb.begin(r_uint64(10), r_uint64(0), r_int64(1))
     rb.put_string("hello")
     rb.commit()
     t.ingest_batch(b)
     b.free()
 
     out = batch.ArenaZSetBatch(schema)
-    result = t.retract_pk(r_uint128(10), out)
+    result = t.retract_pk(r_uint64(10), r_uint64(0), out)
     assert_true(result, "retract_pk memtable should return True")
     assert_equal_i(1, out.length(), "retract_pk memtable out should have 1 row")
     assert_true(out.get_weight(0) == r_int64(-1), "retract weight should be -1")
@@ -1119,7 +1119,7 @@ def test_retract_pk(base_dir):
     t2 = EphemeralTable(eph_dir2, "retract_shard", schema)
     b2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, b2)
-    rb2.begin(r_uint128(20), r_int64(1))
+    rb2.begin(r_uint64(20), r_uint64(0), r_int64(1))
     rb2.put_string("world")
     rb2.commit()
     t2.ingest_batch(b2)
@@ -1127,7 +1127,7 @@ def test_retract_pk(base_dir):
     t2.flush()  # moves to shard
 
     out2 = batch.ArenaZSetBatch(schema)
-    result2 = t2.retract_pk(r_uint128(20), out2)
+    result2 = t2.retract_pk(r_uint64(20), r_uint64(0), out2)
     assert_true(result2, "retract_pk shard should return True")
     assert_equal_i(1, out2.length(), "retract_pk shard out should have 1 row")
     assert_true(out2.get_weight(0) == r_int64(-1), "retract shard weight should be -1")
@@ -1138,7 +1138,7 @@ def test_retract_pk(base_dir):
     eph_dir3 = os.path.join(base_dir, "retract_absent")
     t3 = EphemeralTable(eph_dir3, "retract_absent", schema)
     out3 = batch.ArenaZSetBatch(schema)
-    result3 = t3.retract_pk(r_uint128(999), out3)
+    result3 = t3.retract_pk(r_uint64(999), r_uint64(0), out3)
     assert_false(result3, "retract_pk absent should return False")
     assert_equal_i(0, out3.length(), "retract_pk absent out should be empty")
     out3.free()
@@ -1149,21 +1149,21 @@ def test_retract_pk(base_dir):
     t4 = EphemeralTable(eph_dir4, "retract_net0", schema)
     b4a = batch.ArenaZSetBatch(schema)
     rb4a = RowBuilder(schema, b4a)
-    rb4a.begin(r_uint128(30), r_int64(1))
+    rb4a.begin(r_uint64(30), r_uint64(0), r_int64(1))
     rb4a.put_string("ins")
     rb4a.commit()
     t4.ingest_batch(b4a)
     b4a.free()
     b4b = batch.ArenaZSetBatch(schema)
     rb4b = RowBuilder(schema, b4b)
-    rb4b.begin(r_uint128(30), r_int64(-1))
+    rb4b.begin(r_uint64(30), r_uint64(0), r_int64(-1))
     rb4b.put_string("ins")
     rb4b.commit()
     t4.ingest_batch(b4b)
     b4b.free()
 
     out4 = batch.ArenaZSetBatch(schema)
-    result4 = t4.retract_pk(r_uint128(30), out4)
+    result4 = t4.retract_pk(r_uint64(30), r_uint64(0), out4)
     assert_false(result4, "retract_pk net=0 should return False")
     assert_equal_i(0, out4.length(), "retract_pk net=0 out should be empty")
     out4.free()
@@ -1174,7 +1174,7 @@ def test_retract_pk(base_dir):
     t5 = EphemeralTable(eph_dir5, "retract_split", schema)
     b5a = batch.ArenaZSetBatch(schema)
     rb5a = RowBuilder(schema, b5a)
-    rb5a.begin(r_uint128(40), r_int64(1))
+    rb5a.begin(r_uint64(40), r_uint64(0), r_int64(1))
     rb5a.put_string("split")
     rb5a.commit()
     t5.ingest_batch(b5a)
@@ -1182,14 +1182,14 @@ def test_retract_pk(base_dir):
     t5.flush()  # +1 in shard
     b5b = batch.ArenaZSetBatch(schema)
     rb5b = RowBuilder(schema, b5b)
-    rb5b.begin(r_uint128(40), r_int64(1))
+    rb5b.begin(r_uint64(40), r_uint64(0), r_int64(1))
     rb5b.put_string("split")
     rb5b.commit()
     t5.ingest_batch(b5b)
     b5b.free()  # +1 in memtable
 
     out5 = batch.ArenaZSetBatch(schema)
-    result5 = t5.retract_pk(r_uint128(40), out5)
+    result5 = t5.retract_pk(r_uint64(40), r_uint64(0), out5)
     assert_true(result5, "retract_pk split weight should return True")
     assert_equal_i(1, out5.length(), "retract_pk split should emit exactly 1 retraction")
     assert_true(out5.get_weight(0) == r_int64(-1), "retract split weight should be -1")
@@ -1201,7 +1201,7 @@ def test_retract_pk(base_dir):
     t6 = EphemeralTable(eph_dir6, "retract_cancel", schema)
     b6a = batch.ArenaZSetBatch(schema)
     rb6a = RowBuilder(schema, b6a)
-    rb6a.begin(r_uint128(50), r_int64(1))
+    rb6a.begin(r_uint64(50), r_uint64(0), r_int64(1))
     rb6a.put_string("cancel")
     rb6a.commit()
     t6.ingest_batch(b6a)
@@ -1209,14 +1209,14 @@ def test_retract_pk(base_dir):
     t6.flush()  # +1 in shard
     b6b = batch.ArenaZSetBatch(schema)
     rb6b = RowBuilder(schema, b6b)
-    rb6b.begin(r_uint128(50), r_int64(-1))
+    rb6b.begin(r_uint64(50), r_uint64(0), r_int64(-1))
     rb6b.put_string("cancel")
     rb6b.commit()
     t6.ingest_batch(b6b)
     b6b.free()  # -1 in memtable
 
     out6 = batch.ArenaZSetBatch(schema)
-    result6 = t6.retract_pk(r_uint128(50), out6)
+    result6 = t6.retract_pk(r_uint64(50), r_uint64(0), out6)
     assert_false(result6, "retract_pk canceled should return False")
     assert_equal_i(0, out6.length(), "retract_pk canceled out should be empty")
     out6.free()
@@ -1228,7 +1228,7 @@ def test_retract_pk(base_dir):
     test_str = "retract_string_payload"
     b7 = batch.ArenaZSetBatch(schema)
     rb7 = RowBuilder(schema, b7)
-    rb7.begin(r_uint128(60), r_int64(1))
+    rb7.begin(r_uint64(60), r_uint64(0), r_int64(1))
     rb7.put_string(test_str)
     rb7.commit()
     t7.ingest_batch(b7)
@@ -1236,12 +1236,12 @@ def test_retract_pk(base_dir):
     # Build a reference row for comparison
     ref = batch.ArenaZSetBatch(schema)
     rb_ref = RowBuilder(schema, ref)
-    rb_ref.begin(r_uint128(60), r_int64(-1))
+    rb_ref.begin(r_uint64(60), r_uint64(0), r_int64(-1))
     rb_ref.put_string(test_str)
     rb_ref.commit()
 
     out7 = batch.ArenaZSetBatch(schema)
-    result7 = t7.retract_pk(r_uint128(60), out7)
+    result7 = t7.retract_pk(r_uint64(60), r_uint64(0), out7)
     assert_true(result7, "retract_pk string should return True")
     assert_equal_i(1, out7.length(), "retract_pk string out should have 1 row")
     # Compare the retracted row's payload against the reference
@@ -1262,18 +1262,18 @@ def test_retract_pk(base_dir):
     t8 = EphemeralTable(eph_dir8, "retract_has", schema)
     b8 = batch.ArenaZSetBatch(schema)
     rb8 = RowBuilder(schema, b8)
-    rb8.begin(r_uint128(70), r_int64(1))
+    rb8.begin(r_uint64(70), r_uint64(0), r_int64(1))
     rb8.put_string("exists")
     rb8.commit()
     t8.ingest_batch(b8)
     b8.free()
 
-    assert_true(t8.has_pk(r_uint128(70)), "has_pk should find pk=70")
-    assert_false(t8.has_pk(r_uint128(71)), "has_pk should not find pk=71")
+    assert_true(t8.has_pk(r_uint64(70), r_uint64(0)), "has_pk should find pk=70")
+    assert_false(t8.has_pk(r_uint64(71), r_uint64(0)), "has_pk should not find pk=71")
 
     t8.flush()
-    assert_true(t8.has_pk(r_uint128(70)), "has_pk should find pk=70 after flush")
-    assert_false(t8.has_pk(r_uint128(71)), "has_pk should not find pk=71 after flush")
+    assert_true(t8.has_pk(r_uint64(70), r_uint64(0)), "has_pk should find pk=70 after flush")
+    assert_false(t8.has_pk(r_uint64(71), r_uint64(0)), "has_pk should not find pk=71 after flush")
     t8.close()
 
     os.write(1, "    [OK] retract_pk tests passed.\n")
@@ -1289,7 +1289,7 @@ def test_enforce_unique_pk(base_dir):
     family1 = TableFamily("s", "upk_t1", 1, 1, sub_dir1, 0, t1, unique_pk=True)
     b1 = batch.ArenaZSetBatch(schema)
     rb1 = RowBuilder(schema, b1)
-    rb1.begin(r_uint128(1), r_int64(1))
+    rb1.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb1.put_int(r_int64(10))
     rb1.commit()
     result1 = _enforce_unique_pk(family1, b1)
@@ -1305,14 +1305,14 @@ def test_enforce_unique_pk(base_dir):
     family2 = TableFamily("s", "upk_t2", 2, 1, sub_dir2, 0, t2, unique_pk=True)
     b2pre = batch.ArenaZSetBatch(schema)
     rb2pre = RowBuilder(schema, b2pre)
-    rb2pre.begin(r_uint128(1), r_int64(1))
+    rb2pre.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb2pre.put_int(r_int64(10))
     rb2pre.commit()
     t2.ingest_batch(b2pre)
     b2pre.free()
     b2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, b2)
-    rb2.begin(r_uint128(1), r_int64(1))
+    rb2.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb2.put_int(r_int64(20))
     rb2.commit()
     result2 = _enforce_unique_pk(family2, b2)
@@ -1329,14 +1329,14 @@ def test_enforce_unique_pk(base_dir):
     family3 = TableFamily("s", "upk_t3", 3, 1, sub_dir3, 0, t3, unique_pk=True)
     b3pre = batch.ArenaZSetBatch(schema)
     rb3pre = RowBuilder(schema, b3pre)
-    rb3pre.begin(r_uint128(1), r_int64(1))
+    rb3pre.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb3pre.put_int(r_int64(10))
     rb3pre.commit()
     t3.ingest_batch(b3pre)
     b3pre.free()
     b3 = batch.ArenaZSetBatch(schema)
     rb3 = RowBuilder(schema, b3)
-    rb3.begin(r_uint128(1), r_int64(-1))
+    rb3.begin(r_uint64(1), r_uint64(0), r_int64(-1))
     rb3.put_int(r_int64(0))
     rb3.commit()
     result3 = _enforce_unique_pk(family3, b3)
@@ -1353,7 +1353,7 @@ def test_enforce_unique_pk(base_dir):
     family4 = TableFamily("s", "upk_t4", 4, 1, sub_dir4, 0, t4, unique_pk=True)
     b4 = batch.ArenaZSetBatch(schema)
     rb4 = RowBuilder(schema, b4)
-    rb4.begin(r_uint128(99), r_int64(-1))
+    rb4.begin(r_uint64(99), r_uint64(0), r_int64(-1))
     rb4.put_int(r_int64(0))
     rb4.commit()
     result4 = _enforce_unique_pk(family4, b4)
@@ -1368,11 +1368,11 @@ def test_enforce_unique_pk(base_dir):
     family5 = TableFamily("s", "upk_t5", 5, 1, sub_dir5, 0, t5, unique_pk=True)
     b5 = batch.ArenaZSetBatch(schema)
     rb5a = RowBuilder(schema, b5)
-    rb5a.begin(r_uint128(1), r_int64(1))
+    rb5a.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb5a.put_int(r_int64(10))
     rb5a.commit()
     rb5b = RowBuilder(schema, b5)
-    rb5b.begin(r_uint128(1), r_int64(1))
+    rb5b.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb5b.put_int(r_int64(20))
     rb5b.commit()
     result5 = _enforce_unique_pk(family5, b5)
@@ -1387,11 +1387,11 @@ def test_enforce_unique_pk(base_dir):
     family6 = TableFamily("s", "upk_t6", 6, 1, sub_dir6, 0, t6, unique_pk=True)
     b6 = batch.ArenaZSetBatch(schema)
     rb6a = RowBuilder(schema, b6)
-    rb6a.begin(r_uint128(1), r_int64(1))
+    rb6a.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb6a.put_int(r_int64(10))
     rb6a.commit()
     rb6b = RowBuilder(schema, b6)
-    rb6b.begin(r_uint128(1), r_int64(-1))
+    rb6b.begin(r_uint64(1), r_uint64(0), r_int64(-1))
     rb6b.put_int(r_int64(0))
     rb6b.commit()
     result6 = _enforce_unique_pk(family6, b6)
@@ -1424,7 +1424,7 @@ def test_ephemeral_compaction(base_dir):
         while i <= 6:
             b = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, b)
-            rb.begin(r_uint128(i), r_int64(1))
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 10))
             rb.commit()
             tbl.ingest_batch(b)
@@ -1483,7 +1483,7 @@ def test_ephemeral_compaction(base_dir):
         # Phase 2: retract PK=3 + add PKs 7-10 -> 5 more L0 shards -> second compaction
         b = batch.ArenaZSetBatch(schema)
         rb = RowBuilder(schema, b)
-        rb.begin(r_uint128(3), r_int64(-1))
+        rb.begin(r_uint64(3), r_uint64(0), r_int64(-1))
         rb.put_int(r_int64(30))
         rb.commit()
         tbl.ingest_batch(b)
@@ -1494,7 +1494,7 @@ def test_ephemeral_compaction(base_dir):
         while i <= 10:
             b = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, b)
-            rb.begin(r_uint128(i), r_int64(1))
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 10))
             rb.commit()
             tbl.ingest_batch(b)
@@ -1517,7 +1517,7 @@ def test_ephemeral_compaction(base_dir):
         c.close()
 
         # Ghost property: PK=3 net weight = +1 - 1 = 0, must be absent
-        if tbl.has_pk(r_uint128(3)):
+        if tbl.has_pk(r_uint64(3), r_uint64(0)):
             raise Exception("Ghost property violation: PK=3 should be annihilated")
 
         # Row count: 6 original - 1 retracted + 4 new = 9
@@ -1567,7 +1567,7 @@ def test_compact_no_op_and_idempotent(base_dir):
         while i <= 4:
             b = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, b)
-            rb.begin(r_uint128(i), r_int64(1))
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 10))
             rb.commit()
             tbl.ingest_batch(b)
@@ -1589,7 +1589,7 @@ def test_compact_no_op_and_idempotent(base_dir):
         # Phase 2 (Gap A): one more flush pushes past threshold (5 > 4) -> compaction fires
         b = batch.ArenaZSetBatch(schema)
         rb = RowBuilder(schema, b)
-        rb.begin(r_uint128(5), r_int64(1))
+        rb.begin(r_uint64(5), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(50))
         rb.commit()
         tbl.ingest_batch(b)
@@ -1655,7 +1655,7 @@ def test_compact_preserves_memtable(base_dir):
         while i <= 5:
             b = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, b)
-            rb.begin(r_uint128(i), r_int64(1))
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 10))
             rb.commit()
             tbl.ingest_batch(b)
@@ -1669,7 +1669,7 @@ def test_compact_preserves_memtable(base_dir):
         # PK=99 written to memtable only — deliberately NOT flushed
         b = batch.ArenaZSetBatch(schema)
         rb = RowBuilder(schema, b)
-        rb.begin(r_uint128(99), r_int64(1))
+        rb.begin(r_uint64(99), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(990))
         rb.commit()
         tbl.ingest_batch(b)
@@ -1703,7 +1703,7 @@ def test_compact_preserves_memtable(base_dir):
             )
 
         # PK=99 (memtable-only row) must survive shard compaction
-        if not tbl.has_pk(r_uint128(99)):
+        if not tbl.has_pk(r_uint64(99), r_uint64(0)):
             raise Exception("PK=99 (memtable-only) must survive shard compaction")
 
     finally:
@@ -1730,7 +1730,7 @@ def test_persistent_compact_if_needed(base_dir):
         while i <= 5:
             b = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, b)
-            rb.begin(r_uint128(i), r_int64(1))
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 10))
             rb.commit()
             tbl.ingest_batch(b)
@@ -1810,7 +1810,7 @@ def test_compact_with_strings(base_dir):
         while i < 5:
             b = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, b)
-            rb.begin(r_uint128(i + 1), r_int64(1))
+            rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
             rb.put_string(strings[i])
             rb.commit()
             tbl.ingest_batch(b)
@@ -1851,7 +1851,7 @@ def test_compact_with_strings(base_dir):
         # PK lookups (which exercise the xor8 filter on the new shard) must all succeed
         i = 1
         while i <= 5:
-            if not tbl.has_pk(r_uint128(i)):
+            if not tbl.has_pk(r_uint64(i), r_uint64(0)):
                 raise Exception(
                     "PK=" + str(i) + " missing after string shard compaction"
                 )
@@ -1884,7 +1884,7 @@ def test_partitioned_compact_if_needed(base_dir):
             while i <= 5:
                 b = batch.ArenaZSetBatch(schema)
                 rb = RowBuilder(schema, b)
-                rb.begin(r_uint128(p * 100 + i), r_int64(1))
+                rb.begin(r_uint64(p * 100 + i), r_uint64(0), r_int64(1))
                 rb.put_int(r_int64(i * 10))
                 rb.commit()
                 part.ingest_batch(b)
@@ -1984,7 +1984,7 @@ def test_flsm_data_structures(base_dir):
         sw = writer_table.TableShardWriter(schema, table_id=99)
         tmp = batch.ArenaZSetBatch(schema)
         rb = RowBuilder(schema, tmp)
-        rb.begin(r_uint128(i * 10), r_int64(1))
+        rb.begin(r_uint64(i * 10), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i))
         rb.commit()
         sw.add_row_from_accessor(r_uint128(i * 10), r_int64(1), tmp.get_accessor(0))
@@ -2030,7 +2030,7 @@ def test_flsm_guard_read_path(base_dir):
         while row_in_batch < 4:
             pk = r_uint128(batch_num * 4 + row_in_batch)
             rb = RowBuilder(schema, b)
-            rb.begin(pk, r_int64(1))
+            rb.begin(r_uint64(pk), r_uint64(pk >> 64), r_int64(1))
             rb.put_int(r_int64(batch_num * 4 + row_in_batch))
             rb.commit()
             row_in_batch += 1
@@ -2077,12 +2077,12 @@ def test_flsm_guard_read_path(base_dir):
     # 5. has_pk for all k in 0..19 — assert True
     k = 0
     while k < 20:
-        if not tbl.has_pk(r_uint128(k)):
+        if not tbl.has_pk(r_uint64(k), r_uint64(0)):
             raise Exception("has_pk(%d) should be True" % k)
         k += 1
 
     # 6. has_pk(50) -> False (50 routes to guard1 but not in [12-15] or [16-19])
-    if tbl.has_pk(r_uint128(50)):
+    if tbl.has_pk(r_uint64(50), r_uint64(0)):
         raise Exception("has_pk(50) should be False")
 
     # 7. all_handles_for_cursor() -> exactly 5 handles
@@ -2106,7 +2106,7 @@ def test_zero_copy_wal_recovery(base_dir):
         b = batch.ArenaZSetBatch(schema)
         rb = RowBuilder(schema, b)
         for j in range(i + 1):
-            rb.begin(r_uint128(i * 10 + j), r_int64(1))
+            rb.begin(r_uint64(i * 10 + j), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 100 + j))
             rb.commit()
         lsn = r_uint64(i + 1)
@@ -2161,7 +2161,7 @@ def test_zero_copy_wal_recovery(base_dir):
     writer2 = wal.WALWriter(trunc_path, schema)
     b2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, b2)
-    rb2.begin(r_uint128(999), r_int64(1))
+    rb2.begin(r_uint64(999), r_uint64(0), r_int64(1))
     rb2.put_int(r_int64(42))
     rb2.commit()
     writer2.append_batch(r_uint64(10), 5, b2)
@@ -2198,7 +2198,7 @@ def test_flsm_l0_to_l1_compaction(base_dir):
     while pk <= 5:
         b = batch.ArenaZSetBatch(schema)
         rb = RowBuilder(schema, b)
-        rb.begin(r_uint128(pk), r_int64(1))
+        rb.begin(r_uint64(pk), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(pk * 10))
         rb.commit()
         tbl.ingest_batch(b)
@@ -2251,7 +2251,8 @@ def test_flsm_l0_to_l1_compaction(base_dir):
     while gi2 < 5:
         b = batch.ArenaZSetBatch(schema)
         rb = RowBuilder(schema, b)
-        rb.begin(ghost_pks[gi2], ghost_weights[gi2])
+        _gpk = ghost_pks[gi2]
+        rb.begin(r_uint64(_gpk), r_uint64(_gpk >> 64), ghost_weights[gi2])
         rb.put_int(ghost_vals[gi2])
         rb.commit()
         tbl2.ingest_batch(b)
@@ -2272,8 +2273,8 @@ def test_flsm_l0_to_l1_compaction(base_dir):
     c2.close()
 
     assert_false(found_pk1, "Ghost key A (pk=1) should be absent after compaction")
-    assert_true(tbl2.has_pk(r_uint128(2)), "key B (pk=2) should be present")
-    assert_true(tbl2.has_pk(r_uint128(3)), "key C (pk=3) should be present")
+    assert_true(tbl2.has_pk(r_uint64(2), r_uint64(0)), "key B (pk=2) should be present")
+    assert_true(tbl2.has_pk(r_uint64(3), r_uint64(0)), "key C (pk=3) should be present")
 
     tbl2.close()
     os.write(1, "    [OK] FLSM L0->L1 compaction passed.\n")
@@ -2292,7 +2293,7 @@ def test_flsm_manifest_persistence(base_dir):
     while i <= 5:
         b = batch.ArenaZSetBatch(schema)
         rb = RowBuilder(schema, b)
-        rb.begin(r_uint128(i), r_int64(1))
+        rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i * 10))
         rb.commit()
         tbl.ingest_batch(b)
@@ -2395,7 +2396,7 @@ def test_flsm_horizontal_compaction(base_dir):
             pk = r_uint128(i * 10 + row)
             tmp = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, tmp)
-            rb.begin(pk, r_int64(1))
+            rb.begin(r_uint64(pk), r_uint64(pk >> 64), r_int64(1))
             rb.put_int(r_int64(i * 10 + row))
             rb.commit()
             sw.add_row_from_accessor(pk, r_int64(1), tmp.get_accessor(0))
@@ -2459,7 +2460,7 @@ def test_flsm_horizontal_ghost_elimination(base_dir):
         for pk, w in shard_specs[s]:
             tmp = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, tmp)
-            rb.begin(pk, w)
+            rb.begin(r_uint64(pk), r_uint64(pk >> 64), w)
             rb.put_int(r_int64(intmask(pk)))
             rb.commit()
             sw.add_row_from_accessor(pk, w, tmp.get_accessor(0))
@@ -2492,7 +2493,7 @@ def _make_single_row_shard(path, schema, table_id, pk_val):
     sw = writer_table.TableShardWriter(schema, table_id=table_id)
     tmp = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, tmp)
-    rb.begin(r_uint128(pk_val), r_int64(1))
+    rb.begin(r_uint64(pk_val), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(pk_val))
     rb.commit()
     sw.add_row_from_accessor(r_uint128(pk_val), r_int64(1), tmp.get_accessor(0))

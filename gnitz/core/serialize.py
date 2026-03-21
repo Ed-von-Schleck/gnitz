@@ -86,11 +86,12 @@ def compute_hash(schema, accessor, hash_buf, hash_buf_cap):
             offset += length
         elif ft.code == types.TYPE_U128.code:
             offset = (offset + 7) & ~7
-            v = accessor.get_u128(i)
             target = rffi.ptradd(ptr, offset)
-            rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(v)))
+            rffi.cast(rffi.ULONGLONGP, target)[0] = rffi.cast(
+                rffi.ULONGLONG, accessor.get_u128_lo(i)
+            )
             rffi.cast(rffi.ULONGLONGP, rffi.ptradd(target, 8))[0] = rffi.cast(
-                rffi.ULONGLONG, r_uint64(intmask(v >> 64))
+                rffi.ULONGLONG, accessor.get_u128_hi(i)
             )
             offset += 16
         else:

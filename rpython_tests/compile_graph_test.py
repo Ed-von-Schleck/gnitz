@@ -94,7 +94,7 @@ def _make_table_cols_i64(col_names):
 
 def _add_int_row(rb, pk, vals, weight=1):
     """Add a row: pk(U64), vals(list of ints), weight."""
-    rb.begin(r_uint128(pk), r_int64(weight))
+    rb.begin(r_uint64(pk), r_uint64(0), r_int64(weight))
     for v in vals:
         rb.put_int(r_int64(v))
     rb.commit()

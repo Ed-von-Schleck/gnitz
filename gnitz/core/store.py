@@ -1,6 +1,6 @@
 # gnitz/core/store.py
 
-from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128
 from gnitz.core.comparator import RowAccessor
 
 
@@ -10,9 +10,8 @@ class AbstractCursor(object):
     Implementations (MemTable, Shard, Unified) must adhere to this protocol.
     """
 
-    def seek(self, key):
-        """Positions the cursor at the first record >= key."""
-        # key: r_uint128
+    def seek(self, key_lo, key_hi):
+        """Positions the cursor at the first record >= (key_hi, key_lo)."""
         raise NotImplementedError
 
     def advance(self):
@@ -28,14 +27,29 @@ class AbstractCursor(object):
         """Returns True if no more records remain."""
         return not self.is_valid()
 
-    def peek_key(self):
-        """Returns the key without consuming the record. Default: same as key()."""
-        return self.key()
+    def key_lo(self):
+        """Returns the low 64 bits of the Primary Key of the current record."""
+        raise NotImplementedError
+
+    def key_hi(self):
+        """Returns the high 64 bits of the Primary Key of the current record."""
+        raise NotImplementedError
 
     def key(self):
-        """Returns the Primary Key of the current record."""
-        # -> r_uint128
-        raise NotImplementedError
+        """Returns the Primary Key as r_uint128. Backward-compat assembler."""
+        return (r_uint128(self.key_hi()) << 64) | r_uint128(self.key_lo())
+
+    def peek_key_lo(self):
+        """Returns key_lo without consuming. Default: same as key_lo()."""
+        return self.key_lo()
+
+    def peek_key_hi(self):
+        """Returns key_hi without consuming. Default: same as key_hi()."""
+        return self.key_hi()
+
+    def peek_key(self):
+        """Returns the key without consuming the record. Default: same as key()."""
+        return (r_uint128(self.peek_key_hi()) << 64) | r_uint128(self.peek_key_lo())
 
     def weight(self):
         """Returns the net algebraic weight of the current record."""
@@ -51,10 +65,10 @@ class AbstractCursor(object):
         """Upper bound on live records. Permitted to over-count; must not under-count."""
         return 0
 
-    def seek_key_exact(self, key):
-        """Seek to key. Returns True iff cursor is now positioned exactly on key."""
-        self.seek(key)
-        return self.is_valid() and self.key() == key
+    def seek_key_exact(self, key_lo, key_hi):
+        """Seek to (key_lo, key_hi). Returns True iff cursor is now positioned exactly there."""
+        self.seek(key_lo, key_hi)
+        return self.is_valid() and self.key_lo() == key_lo and self.key_hi() == key_hi
 
     def close(self):
         """Releases any resources held by the cursor."""
@@ -85,17 +99,17 @@ class ZSetStore(object):
         # -> AbstractCursor
         raise NotImplementedError
 
-    def has_pk(self, key):
+    def has_pk(self, key_lo, key_hi):
         """
         Returns True if the Primary Key exists with a non-zero weight.
-        key: r_uint128 -> bool
+        key_lo, key_hi: r_uint64 -> bool
         """
         raise NotImplementedError
 
-    def get_weight(self, key, accessor):
+    def get_weight(self, key_lo, key_hi, accessor):
         """
         Returns the net algebraic weight for a specific record.
-        key: r_uint128, accessor: RowAccessor -> r_int64
+        key_lo, key_hi: r_uint64, accessor: RowAccessor -> r_int64
         """
         raise NotImplementedError
 
@@ -106,10 +120,10 @@ class ZSetStore(object):
         """
         raise NotImplementedError
 
-    def retract_pk(self, key, out_batch):
+    def retract_pk(self, key_lo, key_hi, out_batch):
         """If PK exists with positive net weight, append retraction to out_batch.
         Returns True if retraction was emitted.
-        key: r_uint128, out_batch: ArenaZSetBatch -> bool
+        key_lo, key_hi: r_uint64, out_batch: ArenaZSetBatch -> bool
         """
         raise NotImplementedError
 

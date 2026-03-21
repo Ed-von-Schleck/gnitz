@@ -469,7 +469,7 @@ pub extern "C" fn gnitz_push(
     let s = check_ptr!(schema, -1);
     let b = check_ptr!(batch, -1);
     match c.0.push(table_id, &s.0, &b.batch) {
-        Ok(()) => 0, Err(e) => { set_error(e); -1 }
+        Ok(_) => 0, Err(e) => { set_error(e); -1 }
     }
 }
 
@@ -488,7 +488,7 @@ pub extern "C" fn gnitz_scan(
     clear_error();
     let c = check_ptr_mut!(conn, std::ptr::null_mut());
     match c.0.scan(table_id) {
-        Ok((server_schema, data)) => {
+        Ok((server_schema, data, _)) => {
             let used_schema = if !schema.is_null() {
                 unsafe { (*schema).0.clone() }
             } else if let Some(ss) = server_schema {
@@ -903,7 +903,7 @@ pub unsafe extern "C" fn gnitz_seek(
     clear_error();
     let c = check_ptr_mut!(conn, -1);
     match c.0.seek(table_id, pk_lo, pk_hi) {
-        Ok((server_schema, data)) => {
+        Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
                 let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_index: 0 });
                 let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
@@ -933,7 +933,7 @@ pub unsafe extern "C" fn gnitz_seek_by_index(
     clear_error();
     let c = check_ptr_mut!(conn, -1);
     match c.0.seek_by_index(table_id, col_idx, key_lo, key_hi) {
-        Ok((server_schema, data)) => {
+        Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
                 let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_index: 0 });
                 let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));

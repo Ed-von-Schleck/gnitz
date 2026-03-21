@@ -36,6 +36,7 @@ FLAG_SEEK_BY_INDEX     = 256   # p4=col_idx, p5/p6=index_key; target_id=table_id
 FLAG_ALLOCATE_INDEX_ID = 512   # target_id=0; response carries new index_id in target_id
 FLAG_PRELOADED_EXCHANGE = 1024 # master pre-sends repartitioned batch before FLAG_PUSH
 FLAG_BACKFILL          = 2048  # master asks worker to scan source and backfill a view
+FLAG_TICK              = 4096  # master asks workers to run evaluate_dag on accumulated pending_deltas
 FLAG_SCAN              = 0     # explicit name for "no flags" (no wire change)
 
 # --- New WAL-block wire format flags ---
@@ -105,7 +106,7 @@ def schema_to_batch(schema):
             flags |= META_FLAG_NULLABLE
         if ci == schema.pk_index:
             flags |= META_FLAG_IS_PK
-        rb.begin(r_uint128(r_uint64(ci)), r_int64(1))
+        rb.begin(r_uint64(ci), r_uint64(0), r_int64(1))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(col.field_type.code)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(flags)))
         rb.put_string(col.name)
@@ -164,7 +165,7 @@ def _encode_control_batch(target_id, client_id, flags, seek_pk_lo, seek_pk_hi,
                           seek_col_idx, status, error_msg):
     ctrl = batch.ArenaZSetBatch(CONTROL_SCHEMA, initial_capacity=1)
     rb = RowBuilder(CONTROL_SCHEMA, ctrl)
-    rb.begin(r_uint128(r_uint64(0)), r_int64(1))          # msg_idx PK = 0
+    rb.begin(r_uint64(0), r_uint64(0), r_int64(1))          # msg_idx PK = 0
     rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(status)))
     rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(client_id)))
     rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(target_id)))

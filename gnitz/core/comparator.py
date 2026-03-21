@@ -2,7 +2,7 @@
 
 from rpython.rlib import jit
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_uint64
 from gnitz.core import strings as string_logic, types
 from gnitz.core.strings import NULL_PTR
 
@@ -17,7 +17,10 @@ class RowAccessor(object):
     def get_float(self, col_idx):
         raise NotImplementedError
 
-    def get_u128(self, col_idx):
+    def get_u128_lo(self, col_idx):
+        raise NotImplementedError
+
+    def get_u128_hi(self, col_idx):
         raise NotImplementedError
 
     def get_str_struct(self, col_idx):
@@ -44,8 +47,11 @@ class NullAccessor(RowAccessor):
     def get_float(self, col_idx):
         return 0.0
 
-    def get_u128(self, col_idx):
-        return r_uint128(0)
+    def get_u128_lo(self, col_idx):
+        return r_uint64(0)
+
+    def get_u128_hi(self, col_idx):
+        return r_uint64(0)
 
     def get_str_struct(self, col_idx):
         return (0, 0, NULL_PTR, NULL_PTR, None)
@@ -84,11 +90,17 @@ def compare_rows(schema, acc1, acc2):
             if res != 0:
                 return res
         elif col_type.code == types.TYPE_U128.code:
-            v1 = acc1.get_u128(i)
-            v2 = acc2.get_u128(i)
-            if v1 < v2:
+            v1_lo = acc1.get_u128_lo(i)
+            v1_hi = acc1.get_u128_hi(i)
+            v2_lo = acc2.get_u128_lo(i)
+            v2_hi = acc2.get_u128_hi(i)
+            if v1_hi < v2_hi:
                 return -1
-            if v1 > v2:
+            if v1_hi > v2_hi:
+                return 1
+            if v1_lo < v2_lo:
+                return -1
+            if v1_lo > v2_lo:
                 return 1
         elif col_type.code == types.TYPE_F64.code or col_type.code == types.TYPE_F32.code:
             v1 = acc1.get_float(i)

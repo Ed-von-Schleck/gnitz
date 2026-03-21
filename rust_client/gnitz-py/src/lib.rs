@@ -412,22 +412,22 @@ impl PyGnitzClient {
 
     // ----- DML -----
 
-    /// push(target_id, schema, batch)
+    /// push(target_id, schema, batch) -> ingest_lsn: int
     pub fn push(
         &self, py: Python<'_>,
         target_id: u64,
         schema: PyRef<'_, PySchema>,
         batch:  PyRef<'_, PyZSetBatch>,
-    ) -> PyResult<()> {
+    ) -> PyResult<u64> {
         let (rust_schema, rust_batch) = py_batch_to_rust(py, &schema, &batch)?;
         client!(self).push(target_id, &rust_schema, &rust_batch)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
-    /// scan(target_id) -> (Schema | None, ZSetBatch | None)
+    /// scan(target_id) -> (Schema | None, ZSetBatch | None, view_lsn: int)
     pub fn scan(&self, py: Python<'_>, target_id: u64) -> PyResult<PyObject> {
         match client!(self).scan(target_id) {
-            Ok((opt_schema, opt_batch)) => {
+            Ok((opt_schema, opt_batch, view_lsn)) => {
                 let (py_schema, py_batch) = match (opt_schema, opt_batch) {
                     (Some(s), Some(b)) => {
                         let ps = rust_schema_to_py(py, &s)?.into_any();
@@ -440,7 +440,8 @@ impl PyGnitzClient {
                     }
                     _ => (py.None(), py.None()),
                 };
-                Ok(PyTuple::new(py, [py_schema, py_batch])?.into_any().unbind())
+                let lsn_obj = view_lsn.into_pyobject(py)?.into_any().unbind();
+                Ok(PyTuple::new(py, [py_schema, py_batch, lsn_obj])?.into_any().unbind())
             }
             Err(e) => Err(GnitzError::new_err(e.to_string())),
         }
@@ -515,13 +516,13 @@ impl PyGnitzClient {
         client!(self).alloc_schema_id().map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
-    /// seek_by_index(table_id, col_idx, key_lo, key_hi) -> (Schema | None, ZSetBatch | None)
+    /// seek_by_index(table_id, col_idx, key_lo, key_hi) -> (Schema | None, ZSetBatch | None, view_lsn: int)
     pub fn seek_by_index(
         &self, py: Python<'_>, table_id: u64, col_idx: u64,
         key_lo: u64, key_hi: u64,
     ) -> PyResult<PyObject> {
         match client!(self).seek_by_index(table_id, col_idx, key_lo, key_hi) {
-            Ok((opt_schema, opt_batch)) => {
+            Ok((opt_schema, opt_batch, view_lsn)) => {
                 let (py_schema, py_batch) = match (opt_schema, opt_batch) {
                     (Some(s), Some(b)) => {
                         let ps = rust_schema_to_py(py, &s)?.into_any();
@@ -534,16 +535,17 @@ impl PyGnitzClient {
                     }
                     _ => (py.None(), py.None()),
                 };
-                Ok(PyTuple::new(py, [py_schema, py_batch])?.into_any().unbind())
+                let lsn_obj = view_lsn.into_pyobject(py)?.into_any().unbind();
+                Ok(PyTuple::new(py, [py_schema, py_batch, lsn_obj])?.into_any().unbind())
             }
             Err(e) => Err(GnitzError::new_err(e.to_string())),
         }
     }
 
-    /// seek(table_id, pk_lo, pk_hi) -> (Schema | None, ZSetBatch | None)
+    /// seek(table_id, pk_lo, pk_hi) -> (Schema | None, ZSetBatch | None, view_lsn: int)
     pub fn seek(&self, py: Python<'_>, table_id: u64, pk_lo: u64, pk_hi: u64) -> PyResult<PyObject> {
         match client!(self).seek(table_id, pk_lo, pk_hi) {
-            Ok((opt_schema, opt_batch)) => {
+            Ok((opt_schema, opt_batch, view_lsn)) => {
                 let (py_schema, py_batch) = match (opt_schema, opt_batch) {
                     (Some(s), Some(b)) => {
                         let ps = rust_schema_to_py(py, &s)?.into_any();
@@ -556,7 +558,8 @@ impl PyGnitzClient {
                     }
                     _ => (py.None(), py.None()),
                 };
-                Ok(PyTuple::new(py, [py_schema, py_batch])?.into_any().unbind())
+                let lsn_obj = view_lsn.into_pyobject(py)?.into_any().unbind();
+                Ok(PyTuple::new(py, [py_schema, py_batch, lsn_obj])?.into_any().unbind())
             }
             Err(e) => Err(GnitzError::new_err(e.to_string())),
         }

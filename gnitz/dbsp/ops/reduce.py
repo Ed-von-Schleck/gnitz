@@ -653,6 +653,8 @@ def op_reduce(
         avi_cursor.close()
 
     out_writer.mark_sorted(group_by_pk)
+    if group_by_pk:
+        out_writer.mark_consolidated(True)
 
     if b_to_free is not None:
         b_to_free.free()

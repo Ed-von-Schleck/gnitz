@@ -13,6 +13,20 @@ from gnitz.storage import buffer
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
 
+def pk_lt(a_lo, a_hi, b_lo, b_hi):
+    """Compare two 128-bit keys (hi/lo pairs) for less-than. JIT-friendly."""
+    if a_hi < b_hi:
+        return True
+    if a_hi > b_hi:
+        return False
+    return a_lo < b_lo
+
+
+def pk_eq(a_lo, a_hi, b_lo, b_hi):
+    """Compare two 128-bit keys (hi/lo pairs) for equality. JIT-friendly."""
+    return a_lo == b_lo and a_hi == b_hi
+
+
 class BatchBlobAllocator(string_logic.BlobAllocator):
     """Strategy for writing variable-length data into the batch's blob arena."""
 
@@ -95,10 +109,17 @@ class ColumnarBatchAccessor(core_comparator.RowAccessor):
         assert batch is not None
         return batch._read_col_float(self._row_idx, col_idx)
 
-    def get_u128(self, col_idx):
+    def get_u128_lo(self, col_idx):
         batch = self._batch
         assert batch is not None
-        return batch._read_col_u128(self._row_idx, col_idx)
+        ptr = batch._col_ptr(self._row_idx, col_idx)
+        return rffi.cast(rffi.ULONGLONGP, ptr)[0]
+
+    def get_u128_hi(self, col_idx):
+        batch = self._batch
+        assert batch is not None
+        ptr = batch._col_ptr(self._row_idx, col_idx)
+        return rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
 
     def get_str_struct(self, col_idx):
         batch = self._batch
@@ -141,10 +162,9 @@ class RowBuilder(core_comparator.RowAccessor):
         self._weight = r_int64(0)
         self._curr = 0
 
-    def begin(self, pk, weight):
-        pk_u128 = r_uint128(pk)
-        self._pk_lo = rffi.cast(rffi.ULONGLONG, pk_u128)
-        self._pk_hi = rffi.cast(rffi.ULONGLONG, pk_u128 >> 64)
+    def begin(self, pk_lo, pk_hi, weight):
+        self._pk_lo = rffi.cast(rffi.ULONGLONG, pk_lo)
+        self._pk_hi = rffi.cast(rffi.ULONGLONG, pk_hi)
         self._weight = weight
         self._curr = 0
         self._null_word = r_uint64(0)
@@ -177,8 +197,7 @@ class RowBuilder(core_comparator.RowAccessor):
         self._curr += 1
 
     def commit(self):
-        pk = (r_uint128(self._pk_hi) << 64) | r_uint128(self._pk_lo)
-        self._target.append_from_accessor(pk, self._weight, self)
+        self._target.append_from_accessor(self._pk_lo, self._pk_hi, self._weight, self)
 
     # -- append_* API (used by op_map via ScalarFunction.evaluate_map) --
 
@@ -225,13 +244,13 @@ class RowBuilder(core_comparator.RowAccessor):
         self._null_word |= r_uint64(1) << payload_col_idx
         self._curr += 1
 
-    def commit_row(self, pk, weight):
+    def commit_row(self, pk_lo, pk_hi, weight):
         if self._curr != self._n:
             raise errors.LayoutError(
                 "Map function failed to write all columns: "
                 "expected %d, wrote %d" % (self._n, self._curr)
             )
-        self._target.append_from_accessor(pk, weight, self)
+        self._target.append_from_accessor(pk_lo, pk_hi, weight, self)
         self._curr = 0
         self._null_word = r_uint64(0)
 
@@ -262,11 +281,13 @@ class RowBuilder(core_comparator.RowAccessor):
     def get_float(self, col_idx):
         return longlong2float(self._lo[self._payload_idx(col_idx)])
 
-    def get_u128(self, col_idx):
+    def get_u128_lo(self, col_idx):
         p_idx = self._payload_idx(col_idx)
-        lo = r_uint64(self._lo[p_idx])
-        hi = self._hi[p_idx] if self._hi is not None else r_uint64(0)
-        return (r_uint128(hi) << 64) | r_uint128(lo)
+        return r_uint64(self._lo[p_idx])
+
+    def get_u128_hi(self, col_idx):
+        p_idx = self._payload_idx(col_idx)
+        return self._hi[p_idx] if self._hi is not None else r_uint64(0)
 
     def get_str_struct(self, col_idx):
         s = self._strs[self._payload_idx(col_idx)] if self._strs is not None else ""
@@ -542,6 +563,14 @@ class ArenaZSetBatch(object):
         hi = self._read_pk_hi(i)
         return (r_uint128(hi) << 64) | r_uint128(lo)
 
+    def get_pk_lo(self, i):
+        assert 0 <= i < self._count
+        return self._read_pk_lo(i)
+
+    def get_pk_hi(self, i):
+        assert 0 <= i < self._count
+        return self._read_pk_hi(i)
+
     def get_weight(self, i):
         assert 0 <= i < self._count
         return self._read_weight(i)
@@ -555,14 +584,11 @@ class ArenaZSetBatch(object):
         out_accessor.bind(self, i)
 
     @jit.unroll_safe
-    def append_from_accessor(self, pk, weight, accessor):
+    def append_from_accessor(self, pk_lo, pk_hi, weight, accessor):
         assert not self._freed
-        pk_u128 = r_uint128(pk)
 
-        self.pk_lo_buf.put_u64(rffi.cast(rffi.ULONGLONG, pk_u128))
-        self.pk_hi_buf.put_u64(
-            rffi.cast(rffi.ULONGLONG, pk_u128 >> 64)
-        )
+        self.pk_lo_buf.put_u64(rffi.cast(rffi.ULONGLONG, pk_lo))
+        self.pk_hi_buf.put_u64(rffi.cast(rffi.ULONGLONG, pk_hi))
         self.weight_buf.put_i64(weight)
 
         # Compute null word
@@ -623,12 +649,11 @@ class ArenaZSetBatch(object):
                     rffi.FLOAT, accessor.get_float(ci)
                 )
             elif code == types.TYPE_U128.code:
-                v = accessor.get_u128(ci)
                 rffi.cast(rffi.ULONGLONGP, dest)[0] = rffi.cast(
-                    rffi.ULONGLONG, v
+                    rffi.ULONGLONG, accessor.get_u128_lo(ci)
                 )
                 rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = rffi.cast(
-                    rffi.ULONGLONG, v >> 64
+                    rffi.ULONGLONG, accessor.get_u128_hi(ci)
                 )
             elif code == types.TYPE_U64.code:
                 rffi.cast(rffi.ULONGLONGP, dest)[0] = rffi.cast(
@@ -663,6 +688,7 @@ class ArenaZSetBatch(object):
 
         self._count += 1
         self._sorted = False
+        self._consolidated = False
 
     def compare_indices(self, idx_a, idx_b):
         ahi = self._read_pk_hi(idx_a)
@@ -730,25 +756,31 @@ class ArenaZSetBatch(object):
                     other.col_bufs[ci], start * stride, n * stride
                 )
             else:
-                # Strings: per-row relocation (blob offsets differ between arenas)
-                for row in range(start, end):
-                    src_ptr = other._col_ptr(row, ci)
-                    dest = self.col_bufs[ci].alloc(stride, alignment=col_type.alignment)
-                    u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
-                    length = rffi.cast(lltype.Signed, u32_ptr[0])
-                    prefix = rffi.cast(lltype.Signed, u32_ptr[1])
-                    # RPython annotation: force str-or-None union type for relocate_string
-                    s = None
-                    if False:
-                        s = ""
-                    string_logic.relocate_string(
-                        dest, length, prefix,
-                        src_ptr, other.blob_arena.base_ptr,
-                        s, self.allocator,
-                    )
+                # Strings: bulk memmove the whole column block, then fixup long-string blob offsets.
+                n_bytes = n * stride
+                dest_block = self.col_bufs[ci].alloc(n_bytes, alignment=col_type.alignment)
+                src_block = rffi.ptradd(other.col_bufs[ci].base_ptr, start * stride)
+                buffer.c_memmove(
+                    rffi.cast(rffi.VOIDP, dest_block),
+                    rffi.cast(rffi.VOIDP, src_block),
+                    rffi.cast(rffi.SIZE_T, n_bytes),
+                )
+                src_blob_base = other.blob_arena.base_ptr
+                for row in range(n):
+                    src_ptr = rffi.ptradd(src_block, row * stride)
+                    length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, src_ptr)[0])
+                    if length > string_logic.SHORT_STRING_THRESHOLD:
+                        dest_ptr = rffi.ptradd(dest_block, row * stride)
+                        old_offset = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
+                        src_data_ptr = rffi.ptradd(src_blob_base,
+                                                   rffi.cast(lltype.Signed, old_offset))
+                        new_offset = self.allocator.allocate_from_ptr(src_data_ptr, length)
+                        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, 8))[0] = rffi.cast(
+                            rffi.ULONGLONG, new_offset)
 
         self._count += n
         self._sorted = False
+        self._consolidated = False
 
     def append_batch_negated(self, other, start=0, end=-1):
         """
@@ -787,24 +819,31 @@ class ArenaZSetBatch(object):
                     other.col_bufs[ci], start * stride, n * stride
                 )
             else:
-                for row in range(start, end):
-                    src_ptr = other._col_ptr(row, ci)
-                    dest = self.col_bufs[ci].alloc(stride, alignment=col_type.alignment)
-                    u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
-                    length = rffi.cast(lltype.Signed, u32_ptr[0])
-                    prefix = rffi.cast(lltype.Signed, u32_ptr[1])
-                    # RPython annotation: force str-or-None union type for relocate_string
-                    s = None
-                    if False:
-                        s = ""
-                    string_logic.relocate_string(
-                        dest, length, prefix,
-                        src_ptr, other.blob_arena.base_ptr,
-                        s, self.allocator,
-                    )
+                # Strings: bulk memmove then fixup long-string blob offsets.
+                n_bytes = n * stride
+                dest_block = self.col_bufs[ci].alloc(n_bytes, alignment=col_type.alignment)
+                src_block = rffi.ptradd(other.col_bufs[ci].base_ptr, start * stride)
+                buffer.c_memmove(
+                    rffi.cast(rffi.VOIDP, dest_block),
+                    rffi.cast(rffi.VOIDP, src_block),
+                    rffi.cast(rffi.SIZE_T, n_bytes),
+                )
+                src_blob_base = other.blob_arena.base_ptr
+                for row in range(n):
+                    src_ptr = rffi.ptradd(src_block, row * stride)
+                    length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, src_ptr)[0])
+                    if length > string_logic.SHORT_STRING_THRESHOLD:
+                        dest_ptr = rffi.ptradd(dest_block, row * stride)
+                        old_offset = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
+                        src_data_ptr = rffi.ptradd(src_blob_base,
+                                                   rffi.cast(lltype.Signed, old_offset))
+                        new_offset = self.allocator.allocate_from_ptr(src_data_ptr, length)
+                        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, 8))[0] = rffi.cast(
+                            rffi.ULONGLONG, new_offset)
 
         self._count += n
         self._sorted = False
+        self._consolidated = False
 
     def _direct_append_row(self, src, src_idx, weight_override):
         """
@@ -840,20 +879,143 @@ class ArenaZSetBatch(object):
                 dest = self.col_bufs[ci].alloc(
                     stride, alignment=col_type.alignment
                 )
-                u32_ptr = rffi.cast(rffi.UINTP, src_ptr)
-                length = rffi.cast(lltype.Signed, u32_ptr[0])
-                prefix = rffi.cast(lltype.Signed, u32_ptr[1])
-                # RPython annotation: force str-or-None union type for relocate_string
-                s = None
-                if False:
-                    s = ""
-                string_logic.relocate_string(
-                    dest, length, prefix,
-                    src_ptr, src.blob_arena.base_ptr,
-                    s, self.allocator,
+                buffer.c_memmove(
+                    rffi.cast(rffi.VOIDP, dest),
+                    rffi.cast(rffi.VOIDP, src_ptr),
+                    rffi.cast(rffi.SIZE_T, stride),
                 )
+                length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, src_ptr)[0])
+                if length > string_logic.SHORT_STRING_THRESHOLD:
+                    old_offset = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
+                    src_data_ptr = rffi.ptradd(src.blob_arena.base_ptr,
+                                               rffi.cast(lltype.Signed, old_offset))
+                    new_offset = self.allocator.allocate_from_ptr(src_data_ptr, length)
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest, 8))[0] = rffi.cast(
+                        rffi.ULONGLONG, new_offset)
 
         self._count += 1
+        self._sorted = False
+        self._consolidated = False
+
+    def _copy_rows_indexed(self, src, indices, weights):
+        """Copy len(indices) rows from src, assigning weights[r] to each.
+        O(cols) alloc_n calls instead of O(N*cols) alloc calls."""
+        assert not self._freed
+        n = len(indices)
+        if n == 0:
+            return
+        pk_lo_base  = self.pk_lo_buf.alloc_n(n, 8, 8)
+        pk_hi_base  = self.pk_hi_buf.alloc_n(n, 8, 8)
+        weight_base = self.weight_buf.alloc_n(n, 8, 8)
+        null_base   = self.null_buf.alloc_n(n, 8, 8)
+        pk_lo_arr  = rffi.cast(rffi.ULONGLONGP, pk_lo_base)
+        pk_hi_arr  = rffi.cast(rffi.ULONGLONGP, pk_hi_base)
+        weight_arr = rffi.cast(rffi.LONGLONGP,  weight_base)
+        null_arr   = rffi.cast(rffi.ULONGLONGP, null_base)
+        for r in range(n):
+            idx = indices[r]
+            pk_lo_arr[r]  = rffi.cast(rffi.ULONGLONG, src._read_pk_lo(idx))
+            pk_hi_arr[r]  = rffi.cast(rffi.ULONGLONG, src._read_pk_hi(idx))
+            weight_arr[r] = rffi.cast(rffi.LONGLONG, weights[r])
+            null_arr[r]   = rffi.cast(rffi.ULONGLONG, src._read_null_word(idx))
+        schema = src._schema
+        has_varlen = schema.has_varlen
+        num_cols = len(schema.columns)
+        for ci in range(num_cols):
+            if ci == schema.pk_index:
+                continue
+            col_type = schema.columns[ci].field_type
+            stride = col_type.size
+            dest_base = self.col_bufs[ci].alloc_n(n, stride, col_type.alignment)
+            src_base = src.col_bufs[ci].base_ptr
+            if not has_varlen or col_type.code != types.TYPE_STRING.code:
+                for r in range(n):
+                    src_ptr = rffi.ptradd(src_base, indices[r] * stride)
+                    dest = rffi.ptradd(dest_base, r * stride)
+                    buffer.c_memmove(
+                        rffi.cast(rffi.VOIDP, dest),
+                        rffi.cast(rffi.VOIDP, src_ptr),
+                        rffi.cast(rffi.SIZE_T, stride),
+                    )
+            else:
+                src_blob_base = src.blob_arena.base_ptr
+                for r in range(n):
+                    src_ptr = rffi.ptradd(src_base, indices[r] * stride)
+                    dest_ptr = rffi.ptradd(dest_base, r * stride)
+                    buffer.c_memmove(
+                        rffi.cast(rffi.VOIDP, dest_ptr),
+                        rffi.cast(rffi.VOIDP, src_ptr),
+                        rffi.cast(rffi.SIZE_T, stride),
+                    )
+                    length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, src_ptr)[0])
+                    if length > string_logic.SHORT_STRING_THRESHOLD:
+                        old_offset = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
+                        src_data_ptr = rffi.ptradd(src_blob_base,
+                                                   rffi.cast(lltype.Signed, old_offset))
+                        new_offset = self.allocator.allocate_from_ptr(src_data_ptr, length)
+                        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, 8))[0] = rffi.cast(
+                            rffi.ULONGLONG, new_offset)
+        self._count += n
+        self._sorted = False
+
+    def _copy_rows_indexed_src_weights(self, src, indices):
+        """Like _copy_rows_indexed but reads weights from src row."""
+        assert not self._freed
+        n = len(indices)
+        if n == 0:
+            return
+        pk_lo_base  = self.pk_lo_buf.alloc_n(n, 8, 8)
+        pk_hi_base  = self.pk_hi_buf.alloc_n(n, 8, 8)
+        weight_base = self.weight_buf.alloc_n(n, 8, 8)
+        null_base   = self.null_buf.alloc_n(n, 8, 8)
+        pk_lo_arr  = rffi.cast(rffi.ULONGLONGP, pk_lo_base)
+        pk_hi_arr  = rffi.cast(rffi.ULONGLONGP, pk_hi_base)
+        weight_arr = rffi.cast(rffi.LONGLONGP,  weight_base)
+        null_arr   = rffi.cast(rffi.ULONGLONGP, null_base)
+        for r in range(n):
+            idx = indices[r]
+            pk_lo_arr[r]  = rffi.cast(rffi.ULONGLONG, src._read_pk_lo(idx))
+            pk_hi_arr[r]  = rffi.cast(rffi.ULONGLONG, src._read_pk_hi(idx))
+            weight_arr[r] = rffi.cast(rffi.LONGLONG, src._read_weight(idx))
+            null_arr[r]   = rffi.cast(rffi.ULONGLONG, src._read_null_word(idx))
+        schema = src._schema
+        has_varlen = schema.has_varlen
+        num_cols = len(schema.columns)
+        for ci in range(num_cols):
+            if ci == schema.pk_index:
+                continue
+            col_type = schema.columns[ci].field_type
+            stride = col_type.size
+            dest_base = self.col_bufs[ci].alloc_n(n, stride, col_type.alignment)
+            src_base = src.col_bufs[ci].base_ptr
+            if not has_varlen or col_type.code != types.TYPE_STRING.code:
+                for r in range(n):
+                    src_ptr = rffi.ptradd(src_base, indices[r] * stride)
+                    dest = rffi.ptradd(dest_base, r * stride)
+                    buffer.c_memmove(
+                        rffi.cast(rffi.VOIDP, dest),
+                        rffi.cast(rffi.VOIDP, src_ptr),
+                        rffi.cast(rffi.SIZE_T, stride),
+                    )
+            else:
+                src_blob_base = src.blob_arena.base_ptr
+                for r in range(n):
+                    src_ptr = rffi.ptradd(src_base, indices[r] * stride)
+                    dest_ptr = rffi.ptradd(dest_base, r * stride)
+                    buffer.c_memmove(
+                        rffi.cast(rffi.VOIDP, dest_ptr),
+                        rffi.cast(rffi.VOIDP, src_ptr),
+                        rffi.cast(rffi.SIZE_T, stride),
+                    )
+                    length = rffi.cast(lltype.Signed, rffi.cast(rffi.UINTP, src_ptr)[0])
+                    if length > string_logic.SHORT_STRING_THRESHOLD:
+                        old_offset = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(src_ptr, 8))[0]
+                        src_data_ptr = rffi.ptradd(src_blob_base,
+                                                   rffi.cast(lltype.Signed, old_offset))
+                        new_offset = self.allocator.allocate_from_ptr(src_data_ptr, length)
+                        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(dest_ptr, 8))[0] = rffi.cast(
+                            rffi.ULONGLONG, new_offset)
+        self._count += n
         self._sorted = False
 
     def to_sorted(self):
@@ -868,9 +1030,7 @@ class ArenaZSetBatch(object):
         indices = _build_sorted_indices(self)
 
         new_batch = ArenaZSetBatch(self._schema, initial_capacity=self._count)
-        for i in range(self._count):
-            idx = indices[i]
-            new_batch._direct_append_row(self, idx, self._read_weight(idx))
+        new_batch._copy_rows_indexed_src_weights(self, indices)
         new_batch._sorted = True
         new_batch._consolidated = self._consolidated
         return new_batch
@@ -895,8 +1055,9 @@ class ArenaZSetBatch(object):
         else:
             indices = _build_sorted_indices(self)
 
-        # Single consolidation loop over sorted indices.
-        res = ArenaZSetBatch(self._schema, initial_capacity=self._count)
+        # Collect surviving rows and their merged weights.
+        surviving_indices = newlist_hint(self._count)
+        surviving_weights = newlist_hint(self._count)
 
         i = 0
         while i < self._count:
@@ -911,9 +1072,18 @@ class ArenaZSetBatch(object):
                 j += 1
 
             if weight_acc != 0:
-                res._direct_append_row(self, anchor, weight_acc)
+                surviving_indices.append(anchor)
+                surviving_weights.append(weight_acc)
             i = j
 
+        # Fast path: all rows survive without merging and batch is already
+        # sorted — no new allocation or copy needed.
+        if len(surviving_indices) == self._count and self._sorted:
+            self._consolidated = True
+            return self
+
+        res = ArenaZSetBatch(self._schema, initial_capacity=len(surviving_indices))
+        res._copy_rows_indexed(self, surviving_indices, surviving_weights)
         res._sorted = True
         res._consolidated = True
         return res
@@ -946,8 +1116,8 @@ class BatchWriter(object):
         return self._batch._schema
 
     @jit.unroll_safe
-    def append_from_accessor(self, pk, weight, accessor):
-        self._batch.append_from_accessor(pk, weight, accessor)
+    def append_from_accessor(self, pk_lo, pk_hi, weight, accessor):
+        self._batch.append_from_accessor(pk_lo, pk_hi, weight, accessor)
 
     def append_batch(self, other, start=0, end=-1):
         """Bulk column copy from another same-schema batch."""

@@ -60,8 +60,7 @@ def _enforce_unique_pk(family, batch):
                 seen_dict[lo_key][hi_key] = out.length()
             else:
                 # Retract any existing stored row for this PK
-                pk128 = (r_uint128(pk_hi) << 64) | r_uint128(pk_lo)
-                store.retract_pk(pk128, out)
+                store.retract_pk(pk_lo, pk_hi, out)
                 if lo_key not in seen_dict:
                     seen_dict[lo_key] = {}
                 seen_dict[lo_key][hi_key] = out.length()
@@ -79,8 +78,7 @@ def _enforce_unique_pk(family, batch):
                 del seen_dict[lo_key][hi_key]
             else:
                 # Delete from storage by PK (ignore incoming payload)
-                pk128 = (r_uint128(pk_hi) << 64) | r_uint128(pk_lo)
-                store.retract_pk(pk128, out)
+                store.retract_pk(pk_lo, pk_hi, out)
 
     return out
 
@@ -239,8 +237,10 @@ def validate_fk_inline(family, batch):
             fk_key = promote_to_index_key(
                 acc, col_idx, family.schema.columns[col_idx].field_type
             )
+            fk_key_lo = r_uint64(intmask(fk_key))
+            fk_key_hi = r_uint64(intmask(fk_key >> 64))
 
-            if not constraint.target_family.store.has_pk(fk_key):
+            if not constraint.target_family.store.has_pk(fk_key_lo, fk_key_hi):
                 raise LayoutError(
                     "Foreign Key violation in '%s.%s': value for column '%s' "
                     "not found in target '%s.%s'"
@@ -499,8 +499,9 @@ class TableFamily(object):
         try:
             while idx_cursor.is_valid():
                 if idx_cursor.weight() > 0:
-                    fk_val = idx_cursor.key()
-                    if not constraint.target_family.store.has_pk(fk_val):
+                    fk_val_lo = idx_cursor.key_lo()
+                    fk_val_hi = idx_cursor.key_hi()
+                    if not constraint.target_family.store.has_pk(fk_val_lo, fk_val_hi):
                         idx_cursor.close()
                         raise LayoutError(
                             "Referential integrity violation: value in '%s.%s' "

@@ -1,7 +1,7 @@
 # gnitz/dbsp/ops/group_index.py
 
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
 
@@ -61,8 +61,11 @@ class GroupIdxAccessor(RowAccessor):
     def get_int_signed(self, col_idx):
         return self.spk_hi
 
-    def get_u128(self, col_idx):
-        return r_uint128(rffi.cast(rffi.ULONGLONG, self.spk_hi))
+    def get_u128_lo(self, col_idx):
+        return r_uint64(0)
+
+    def get_u128_hi(self, col_idx):
+        return r_uint64(rffi.cast(rffi.ULONGLONG, self.spk_hi))
 
     def get_float(self, col_idx):
         return 0.0
@@ -120,14 +123,14 @@ def _mix64(v):
 
 @jit.unroll_safe
 def _extract_group_key(accessor, schema, col_indices):
-    """Computes a 128-bit key identifying the group."""
+    """Computes a 128-bit key identifying the group, returned as (lo, hi) pair."""
     if len(col_indices) == 1:
         c_idx = col_indices[0]
         t = schema.columns[c_idx].field_type.code
         if t == TYPE_U64.code or t == TYPE_I64.code:
-            return r_uint128(accessor.get_int(c_idx))
+            return r_uint64(accessor.get_int(c_idx)), r_uint64(0)
         if t == TYPE_U128.code:
-            return accessor.get_u128(c_idx)
+            return accessor.get_u128_lo(c_idx), accessor.get_u128_hi(c_idx)
 
     h = r_uint64(0x9E3779B97F4A7C15)  # golden ratio seed
     for i in range(len(col_indices)):
@@ -152,7 +155,7 @@ def _extract_group_key(accessor, schema, col_indices):
         h = _mix64(h ^ col_hash ^ r_uint64(i))
 
     h_hi = _mix64(h ^ r_uint64(len(col_indices)))
-    return (r_uint128(h_hi) << 64) | r_uint128(h)
+    return r_uint64(h), r_uint64(h_hi)
 
 
 def _ieee_order_bits(raw_bits):
@@ -202,7 +205,8 @@ def _extract_gc_u64(accessor, schema, group_by_cols):
                 and col_type.code != TYPE_F32.code
                 and col_type.code != TYPE_F64.code):
             return promote_group_col_to_u64(accessor, group_by_cols[0], col_type)
-    return r_uint64(intmask(_extract_group_key(accessor, schema, group_by_cols)))
+    lo, _hi = _extract_group_key(accessor, schema, group_by_cols)
+    return lo
 
 
 class AggValueIndex(object):

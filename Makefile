@@ -5,6 +5,7 @@ export PYTHONPATH := .:${PYPY_PATH}
 RPYTHON          := pypy2 ${PYPY_PATH}/rpython/bin/rpython
 RPYFLAGS_DEV     := --opt=1 --gc=incminimark --lldebug
 RPYFLAGS_RELEASE := --opt=jit --gc=incminimark --lto
+RPYFLAGS_NOJIT   := --opt=2   --gc=incminimark --lto
 RPYFLAGS         ?= $(RPYFLAGS_DEV)
 
 TEST_FILES := \
@@ -47,7 +48,7 @@ ALL_DATA_DIRS := storage_test_data dbsp_test_data zstore_test_data \
 
 LOG_DIR := .test_logs
 
-.PHONY: all test clean server pytest pytest-only e2e prove release-server release-test $(RUN_TARGETS)
+.PHONY: all test clean server pytest pytest-only e2e e2e-release prove release-server release-server-nojit release-test $(RUN_TARGETS)
 
 all: test
 
@@ -144,8 +145,7 @@ clean:
 	@rm -rf $(LOG_DIR)
 
 server:
-	$(RPYTHON) $(RPYFLAGS) gnitz/server/main.py
-	@mv main-c gnitz-server-c
+	$(RPYTHON) $(RPYFLAGS) --output=gnitz-server-c gnitz/server/main.py
 
 pytest: server
 	cd py_client && uv run pytest tests/ -v
@@ -158,11 +158,17 @@ pytest-only:
 e2e: gnitz-server-c
 	cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -v --tb=short
 
+e2e-release: gnitz-server-release-c
+	cd rust_client/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release-c GNITZ_WORKERS=4 uv run pytest tests/ -v --tb=short
+
 prove:
 	$(MAKE) -C proofs prove
 
 release-server:
-	$(MAKE) server RPYFLAGS="$(RPYFLAGS_RELEASE)"
+	$(RPYTHON) $(RPYFLAGS_RELEASE) --output=gnitz-server-release-c gnitz/server/main.py
+
+release-server-nojit:
+	$(RPYTHON) $(RPYFLAGS_NOJIT) --output=gnitz-server-nojit-c gnitz/server/main.py
 
 release-test:
 	$(MAKE) test RPYFLAGS="$(RPYFLAGS_RELEASE)"

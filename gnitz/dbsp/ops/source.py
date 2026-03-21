@@ -29,14 +29,14 @@ def op_scan_trace(cursor, out_writer, chunk_limit):
         if chunk_limit > 0 and scanned_count >= chunk_limit:
             break
             
-        key = cursor.key()
+        key_lo, key_hi = cursor.key_lo(), cursor.key_hi()
         weight = cursor.weight()
-        
+
         # In DBSP/Differential logic, we only process records with non-zero weight.
         # Zero-weight records logically do not exist in the Z-Set.
         if weight != r_int64(0):
             accessor = cursor.get_accessor()
-            out_writer.append_from_accessor(key, weight, accessor)
+            out_writer.append_from_accessor(key_lo, key_hi, weight, accessor)
             scanned_count += 1
             
         cursor.advance()
@@ -45,14 +45,12 @@ def op_scan_trace(cursor, out_writer, chunk_limit):
     return scanned_count
 
 
-def op_seek_trace(cursor, key):
+def op_seek_trace(cursor, key_lo, key_hi):
     """
     Positions a stateful cursor at the first record >= key.
     Used for index-nested-loop joins or targeted state lookups.
-    
-    key: r_uint128
     """
-    cursor.seek(key)
+    cursor.seek(key_lo, key_hi)
 
 
 def op_clear_deltas(reg_file):

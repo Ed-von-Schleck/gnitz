@@ -219,7 +219,7 @@ def test_serialize_and_hash():
     # Base Row — build into a batch and get an accessor
     b1 = batch.ArenaZSetBatch(schema, initial_capacity=4)
     rb1 = RowBuilder(schema, b1)
-    rb1.begin(r_uint128(1), r_int64(1))
+    rb1.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb1.put_int(rffi.cast(rffi.LONGLONG, 12345))
     rb1.put_string("Deterministic")
     rb1.commit()
@@ -239,7 +239,7 @@ def test_serialize_and_hash():
         # Prove alteration changes hash — build a mutated row in a new batch
         b2 = batch.ArenaZSetBatch(schema, initial_capacity=4)
         rb2 = RowBuilder(schema, b2)
-        rb2.begin(r_uint128(1), r_int64(1))
+        rb2.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb2.put_int(rffi.cast(rffi.LONGLONG, 12345))
         rb2.put_string("Mutated_Now_Invalidated")
         rb2.commit()
@@ -273,19 +273,19 @@ def test_comparator():
     rb = RowBuilder(schema, b)
 
     # Row A: null col 1, float -5.0 for col 2
-    rb.begin(r_uint128(1), r_int64(1))
+    rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb.put_null()
     rb.put_float(-5.0)
     rb.commit()
 
     # Row B: int 10 for col 1, float 5.0 for col 2
-    rb.begin(r_uint128(2), r_int64(1))
+    rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
     rb.put_int(rffi.cast(rffi.LONGLONG, 10))
     rb.put_float(5.0)
     rb.commit()
 
     # Row C: int 10 for col 1, float -5.0 for col 2
-    rb.begin(r_uint128(3), r_int64(1))
+    rb.begin(r_uint64(3), r_uint64(0), r_int64(1))
     rb.put_int(rffi.cast(rffi.LONGLONG, 10))
     rb.put_float(-5.0)
     rb.commit()
@@ -341,19 +341,19 @@ def test_batch_operations():
     rb = RowBuilder(schema, b)
 
     # Insert unordered mix
-    rb.begin(pk2, r_int64(5))
+    rb.begin(r_uint64(pk2), r_uint64(pk2 >> 64), r_int64(5))
     rb.put_string("Payload_B")
     rb.commit()
 
-    rb.begin(pk1, r_int64(10))
+    rb.begin(r_uint64(pk1), r_uint64(pk1 >> 64), r_int64(10))
     rb.put_string("Payload_A")
     rb.commit()
 
-    rb.begin(pk2, r_int64(-5))
+    rb.begin(r_uint64(pk2), r_uint64(pk2 >> 64), r_int64(-5))
     rb.put_string("Payload_B")
     rb.commit()
 
-    rb.begin(pk1, r_int64(5))
+    rb.begin(r_uint64(pk1), r_uint64(pk1 >> 64), r_int64(5))
     rb.put_string("Payload_A")
     rb.commit()
 

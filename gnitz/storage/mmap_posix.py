@@ -141,6 +141,21 @@ def write_c(fd, ptr, length):
     return _write(rffi.cast(rffi.INT, fd), ptr, rffi.cast(rffi.SIZE_T, length))
 
 @jit.dont_look_inside
+def write_all(fd, ptr, length):
+    """Write exactly length bytes to fd, looping on partial writes. Raises MMapError on error."""
+    total = 0
+    fd_c = rffi.cast(rffi.INT, fd)
+    while total < length:
+        n = rffi.cast(lltype.Signed, _write(
+            fd_c,
+            rffi.ptradd(ptr, total),
+            rffi.cast(rffi.SIZE_T, length - total),
+        ))
+        if n <= 0:
+            raise MMapError()
+        total += n
+
+@jit.dont_look_inside
 def fsync_c(fd):
     res = _fsync(rffi.cast(rffi.INT, fd))
     return rffi.cast(lltype.Signed, res)

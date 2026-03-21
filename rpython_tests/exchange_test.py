@@ -83,7 +83,7 @@ def _make_table_cols_i64(col_names):
 
 
 def _add_int_row(rb, pk, vals, weight=1):
-    rb.begin(r_uint128(pk), r_int64(weight))
+    rb.begin(r_uint64(pk), r_uint64(0), r_int64(weight))
     for v in vals:
         rb.put_int(r_int64(v))
     rb.commit()
@@ -185,16 +185,16 @@ def test_string_hash_consistency():
     rb = RowBuilder(schema, b)
 
     # Two rows with the same string "hello" but different PKs
-    rb.begin(r_uint128(1), r_int64(1))
+    rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb.put_string("hello")
     rb.commit()
 
-    rb.begin(r_uint128(2), r_int64(1))
+    rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
     rb.put_string("hello")
     rb.commit()
 
     # A row with a different string
-    rb.begin(r_uint128(3), r_int64(1))
+    rb.begin(r_uint64(3), r_uint64(0), r_int64(1))
     rb.put_string("world")
     rb.commit()
 
@@ -210,11 +210,11 @@ def test_string_hash_consistency():
     b2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, b2)
 
-    rb2.begin(r_uint128(10), r_int64(1))
+    rb2.begin(r_uint64(10), r_uint64(0), r_int64(1))
     rb2.put_string("this is a longer string for heap")
     rb2.commit()
 
-    rb2.begin(r_uint128(11), r_int64(1))
+    rb2.begin(r_uint64(11), r_uint64(0), r_int64(1))
     rb2.put_string("this is a longer string for heap")
     rb2.commit()
 
@@ -402,8 +402,7 @@ def test_hash_row_pk_col(base_dir):
     for i in range(len(pk_los)):
         pk_lo = pk_los[i]
         pk_hi = pk_his[i]
-        pk = r_uint128((r_uint128(r_uint64(pk_hi)) << 64) | r_uint128(r_uint64(pk_lo)))
-        rb.begin(pk, r_int64(1))
+        rb.begin(r_uint64(pk_lo), r_uint64(pk_hi), r_int64(1))
         rb.put_int(r_int64(42))
         rb.commit()
 

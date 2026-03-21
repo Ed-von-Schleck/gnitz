@@ -128,7 +128,7 @@ class WALWriter(object):
         wal_columnar.encode_batch_to_buffer(
             self.block_buf, self.schema, lsn, table_id, batch
         )
-        mmap_posix.write_c(
+        mmap_posix.write_all(
             self.fd, self.block_buf.base_ptr,
             rffi.cast(rffi.SIZE_T, self.block_buf.offset)
         )

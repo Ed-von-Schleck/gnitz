@@ -1,10 +1,10 @@
 # gnitz/dbsp/ops/linear.py
 
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128
+from rpython.rlib.rarithmetic import r_uint64
 from rpython.rlib.longlong2float import float2longlong
 
-from gnitz.core.batch import RowBuilder
+from gnitz.core.batch import RowBuilder, pk_lt, pk_eq
 from gnitz.core import types as core_types, xxh, strings as core_strings
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.dbsp.ops.group_index import _mix64
@@ -18,13 +18,13 @@ Each function now accepts a BatchWriter for the output register.
 """
 
 
-def _promote_col_to_u128(accessor, col_idx, schema):
-    """Promote a single column value to a U128 key for reindexing."""
+def _promote_col_to_pk(accessor, col_idx, schema):
+    """Promote a single column value to a (lo, hi) PK pair for reindexing."""
     t = schema.columns[col_idx].field_type.code
     if t == core_types.TYPE_U128.code:
-        return accessor.get_u128(col_idx)
+        return accessor.get_u128_lo(col_idx), accessor.get_u128_hi(col_idx)
     elif t == core_types.TYPE_U64.code or t == core_types.TYPE_I64.code:
-        return r_uint128(r_uint64(accessor.get_int(col_idx)))
+        return r_uint64(accessor.get_int(col_idx)), r_uint64(0)
     elif t == core_types.TYPE_STRING.code:
         length, _, struct_ptr, heap_ptr, py_string = accessor.get_str_struct(col_idx)
         if length == 0:
@@ -40,11 +40,11 @@ def _promote_col_to_u128(accessor, col_idx, schema):
                 target_ptr = rffi.ptradd(heap_ptr, heap_off)
             h = xxh.compute_checksum(target_ptr, length)
         h_hi = _mix64(h)
-        return (r_uint128(h_hi) << 64) | r_uint128(h)
+        return r_uint64(h), r_uint64(h_hi)
     elif t == core_types.TYPE_F64.code or t == core_types.TYPE_F32.code:
-        return r_uint128(r_uint64(float2longlong(accessor.get_float(col_idx))))
+        return r_uint64(float2longlong(accessor.get_float(col_idx))), r_uint64(0)
     else:
-        return r_uint128(r_uint64(accessor.get_int(col_idx)))
+        return r_uint64(accessor.get_int(col_idx)), r_uint64(0)
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +101,10 @@ def op_map(in_batch, out_writer, func, out_schema, reindex_col=-1):
         if func is not None:
             func.evaluate_map(in_acc, builder)
             if reindex_col >= 0:
-                new_pk = _promote_col_to_u128(in_acc, reindex_col, in_batch._schema)
-                builder.commit_row(new_pk, in_batch.get_weight(i))
+                new_pk_lo, new_pk_hi = _promote_col_to_pk(in_acc, reindex_col, in_batch._schema)
+                builder.commit_row(new_pk_lo, new_pk_hi, in_batch.get_weight(i))
             else:
-                builder.commit_row(in_batch.get_pk(i), in_batch.get_weight(i))
+                builder.commit_row(in_batch.get_pk_lo(i), in_batch.get_pk_hi(i), in_batch.get_weight(i))
     if reindex_col >= 0:
         out_writer.mark_sorted(False)
     else:
@@ -129,12 +129,14 @@ def _op_union_merge(batch_a, batch_b, out_writer):
     i = 0
     j = 0
     while i < n_a and j < n_b:
-        pk_a = batch_a.get_pk(i)
-        pk_b = batch_b.get_pk(j)
-        if pk_a < pk_b:
+        pk_a_lo = batch_a.get_pk_lo(i)
+        pk_a_hi = batch_a.get_pk_hi(i)
+        pk_b_lo = batch_b.get_pk_lo(j)
+        pk_b_hi = batch_b.get_pk_hi(j)
+        if pk_lt(pk_a_lo, pk_a_hi, pk_b_lo, pk_b_hi):
             out_writer.append_batch(batch_a, i, i + 1)
             i += 1
-        elif pk_b < pk_a:
+        elif pk_lt(pk_b_lo, pk_b_hi, pk_a_lo, pk_a_hi):
             out_writer.append_batch(batch_b, j, j + 1)
             j += 1
         else:

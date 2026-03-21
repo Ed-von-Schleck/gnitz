@@ -332,7 +332,7 @@ class Engine(object):
         cursor = self.sys.view_deps.create_cursor()
         res = newlist_hint(4)
         try:
-            cursor.seek(start_key)
+            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > r_int64(0):
                     acc = cursor.get_accessor()
@@ -384,7 +384,7 @@ class Engine(object):
         s, batch = self._begin_write(sys.CircuitNodesTab)
         cursor = self.sys.circuit_nodes.create_cursor()
         try:
-            cursor.seek(start_key)
+            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > 0:
                     pk = cursor.key()
@@ -401,7 +401,7 @@ class Engine(object):
         s, batch = self._begin_write(sys.CircuitEdgesTab)
         cursor = self.sys.circuit_edges.create_cursor()
         try:
-            cursor.seek(start_key)
+            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > 0:
                     pk = cursor.key()
@@ -420,7 +420,7 @@ class Engine(object):
         s, batch = self._begin_write(sys.CircuitSourcesTab)
         cursor = self.sys.circuit_sources.create_cursor()
         try:
-            cursor.seek(start_key)
+            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > 0:
                     pk = cursor.key()
@@ -437,7 +437,7 @@ class Engine(object):
         s, batch = self._begin_write(sys.CircuitParamsTab)
         cursor = self.sys.circuit_params.create_cursor()
         try:
-            cursor.seek(start_key)
+            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > 0:
                     pk = cursor.key()
@@ -459,7 +459,7 @@ class Engine(object):
         s, batch = self._begin_write(sys.CircuitGroupColsTab)
         cursor = self.sys.circuit_group_cols.create_cursor()
         try:
-            cursor.seek(start_key)
+            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
             while cursor.is_valid() and cursor.key() < end_key:
                 if cursor.weight() > 0:
                     pk = cursor.key()

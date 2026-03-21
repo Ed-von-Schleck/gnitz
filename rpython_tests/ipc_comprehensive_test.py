@@ -169,10 +169,10 @@ def test_ipc_roundtrip():
     try:
         zbatch = batch.ArenaZSetBatch(schema, initial_capacity=10)
         rb = RowBuilder(schema, zbatch)
-        rb.begin(r_uint128(42), r_int64(1))
+        rb.begin(r_uint64(42), r_uint64(0), r_int64(1))
         rb.put_string("Hello Zero-Copy World")
         rb.commit()
-        rb.begin(r_uint128(99), r_int64(1))
+        rb.begin(r_uint64(99), r_uint64(0), r_int64(1))
         rb.put_string("Short")
         rb.commit()
 
@@ -231,11 +231,11 @@ def test_int_only_roundtrip():
     try:
         zbatch = batch.ArenaZSetBatch(schema, initial_capacity=10)
         rb = RowBuilder(schema, zbatch)
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(42))
         rb.put_int(r_int64(7))
         rb.commit()
-        rb.begin(r_uint128(2), r_int64(1))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(-100))
         rb.put_int(r_int64(255))
         rb.commit()
@@ -331,7 +331,7 @@ def test_string_roundtrip():
         ]
 
         for i in range(len(test_strings)):
-            rb.begin(r_uint128(r_uint64(i + 1)), r_int64(1))
+            rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
             rb.put_string(test_strings[i])
             rb.commit()
 
@@ -372,12 +372,12 @@ def test_null_strings():
         rb = RowBuilder(schema, zbatch)
 
         # Row with non-null string
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_string("not null")
         rb.commit()
 
         # Row with null string
-        rb.begin(r_uint128(2), r_int64(1))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb.put_null()
         rb.commit()
 
@@ -426,7 +426,7 @@ def test_multi_string_column_roundtrip():
         descs = ["Short desc", "X" * 50, "Medium length description", "tiny"]
 
         for i in range(4):
-            rb.begin(r_uint128(r_uint64(i + 1)), r_int64(1))
+            rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
             rb.put_string(names[i])
             rb.put_string(descs[i])
             rb.commit()
@@ -480,11 +480,11 @@ def test_long_column_name_roundtrip():
     try:
         b = batch.ArenaZSetBatch(schema, initial_capacity=2)
         rb = RowBuilder(schema, b)
-        rb.begin(r_uint128(r_uint64(1)), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(42))
         rb.put_string("hello world!")
         rb.commit()
-        rb.begin(r_uint128(r_uint64(2)), r_int64(1))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(99))
         rb.put_string("this is a longer string value")
         rb.commit()

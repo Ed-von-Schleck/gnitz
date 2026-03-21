@@ -490,8 +490,7 @@ def eval_expr_map(program, accessor, builder):
             elif tc == types.TYPE_F64.code or tc == types.TYPE_F32.code:
                 builder.append_float(accessor.get_float(a1))
             elif tc == types.TYPE_U128.code:
-                val = accessor.get_u128(a1)
-                builder.append_u128(r_uint64(intmask(val)), r_uint64(intmask(val >> 64)))
+                builder.append_u128(accessor.get_u128_lo(a1), accessor.get_u128_hi(a1))
             else:
                 builder.append_int(accessor.get_int_signed(a1))
 

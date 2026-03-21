@@ -87,7 +87,7 @@ class SchemaTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, sid, name):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(sid)), weight)
+        rb.begin(r_uint64(sid), r_uint64(0), weight)
         rb.put_string(name)
         rb.commit()
 
@@ -121,7 +121,7 @@ class TableTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, tid, sid, name, directory, pk_idx, lsn, flags):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(tid)), weight)
+        rb.begin(r_uint64(tid), r_uint64(0), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
         rb.put_string(name)
         rb.put_string(directory)
@@ -157,7 +157,7 @@ class ViewTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, vid, sid, name, sql_def, cache_dir, lsn):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(vid)), weight)
+        rb.begin(r_uint64(vid), r_uint64(0), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(sid)))
         rb.put_string(name)
         rb.put_string(sql_def)
@@ -196,7 +196,7 @@ class ColTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, owner_id, kind, idx, name, code, null, fk_tid, fk_cid):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(pack_column_id(owner_id, idx)), weight)
+        rb.begin(pack_column_id(owner_id, idx), r_uint64(0), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(owner_id)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(kind)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(idx)))
@@ -242,7 +242,7 @@ class IdxTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, iid, oid, kind, src_idx, name, unique, cache_dir):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(iid)), weight)
+        rb.begin(r_uint64(iid), r_uint64(0), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(oid)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(kind)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(src_idx)))
@@ -276,7 +276,7 @@ class DepTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, view_id, dep_vid, dep_tid):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_dep_pk(view_id, dep_tid), weight)
+        rb.begin(r_uint64(dep_tid), r_uint64(view_id), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(view_id)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dep_vid)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dep_tid)))
@@ -305,7 +305,7 @@ class SeqTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, seq_id, val):
         rb = RowBuilder(schema, batch)
-        rb.begin(r_uint128(r_uint64(seq_id)), weight)
+        rb.begin(r_uint64(seq_id), r_uint64(0), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(val)))
         rb.commit()
 
@@ -337,7 +337,7 @@ class CircuitNodesTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, view_id, node_id, opcode):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_node_pk(view_id, node_id), weight)
+        rb.begin(r_uint64(node_id), r_uint64(view_id), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(opcode)))
         rb.commit()
 
@@ -374,7 +374,7 @@ class CircuitEdgesTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, view_id, edge_id, src_node, dst_node, dst_port):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_edge_pk(view_id, edge_id), weight)
+        rb.begin(r_uint64(edge_id), r_uint64(view_id), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(src_node)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dst_node)))
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(dst_port)))
@@ -409,7 +409,7 @@ class CircuitSourcesTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, view_id, node_id, table_id):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_node_pk(view_id, node_id), weight)
+        rb.begin(r_uint64(node_id), r_uint64(view_id), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(table_id)))
         rb.commit()
 
@@ -444,7 +444,7 @@ class CircuitParamsTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, view_id, node_id, slot, value, str_value=None):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_param_pk(view_id, node_id, slot), weight)
+        rb.begin((r_uint64(node_id) << 8) | r_uint64(slot), r_uint64(view_id), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(value)))
         if str_value is None:
             rb.put_null()
@@ -481,7 +481,7 @@ class CircuitGroupColsTab(BaseTab):
     @staticmethod
     def _emit(batch, schema, weight, view_id, node_id, col_idx):
         rb = RowBuilder(schema, batch)
-        rb.begin(pack_gcol_pk(view_id, node_id, col_idx), weight)
+        rb.begin((r_uint64(node_id) << 16) | r_uint64(col_idx), r_uint64(view_id), weight)
         rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(col_idx)))
         rb.commit()
 

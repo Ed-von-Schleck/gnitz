@@ -96,7 +96,7 @@ def test_int_comparisons():
         rb = RowBuilder(schema, b)
         for i in range(5):
             val = (i + 1) * 10
-            rb.begin(r_uint128(i + 1), r_int64(1))
+            rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(val))
             rb.put_int(r_int64(0))
             rb.commit()
@@ -176,7 +176,7 @@ def test_float_comparisons():
         rb = RowBuilder(schema, b)
         # rows with col1 values 1.5, 2.5, 3.5
         for i in range(3):
-            rb.begin(r_uint128(i + 1), r_int64(1))
+            rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
             rb.put_float(1.5 + float(i))
             rb.commit()
 
@@ -226,7 +226,7 @@ def test_int_arithmetic():
         # rows with col1 = 40, 50, 60
         for i in range(3):
             val = 40 + i * 10
-            rb.begin(r_uint128(i + 1), r_int64(1))
+            rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(val))
             rb.put_int(r_int64(0))
             rb.commit()
@@ -293,7 +293,7 @@ def test_float_arithmetic():
         rb = RowBuilder(schema, b)
         # rows with col1 = 1.0, 2.0, 3.0
         for i in range(3):
-            rb.begin(r_uint128(i + 1), r_int64(1))
+            rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
             rb.put_float(float(i + 1))
             rb.commit()
 
@@ -359,7 +359,7 @@ def test_boolean_combinators():
         rb = RowBuilder(schema, b)
         # col1 values: 5, 10, 50, 100
         for val in [5, 10, 50, 100]:
-            rb.begin(r_uint128(val), r_int64(1))
+            rb.begin(r_uint64(val), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(val))
             rb.put_int(r_int64(0))
             rb.commit()
@@ -417,15 +417,15 @@ def test_null_handling():
     try:
         rb = RowBuilder(schema, b)
         # Row 1: col1 = NULL
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_null()
         rb.commit()
         # Row 2: col1 = 42
-        rb.begin(r_uint128(2), r_int64(1))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(42))
         rb.commit()
         # Row 3: col1 = NULL
-        rb.begin(r_uint128(3), r_int64(1))
+        rb.begin(r_uint64(3), r_uint64(0), r_int64(1))
         rb.put_null()
         rb.commit()
 
@@ -459,7 +459,7 @@ def test_div_by_zero():
     b = batch.ArenaZSetBatch(schema)
     try:
         rb = RowBuilder(schema, b)
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(100))
         rb.put_int(r_int64(0))  # col2 = 0
         rb.commit()
@@ -492,7 +492,7 @@ def test_div_by_zero():
         fb = batch.ArenaZSetBatch(fschema)
         try:
             frb = RowBuilder(fschema, fb)
-            frb.begin(r_uint128(1), r_int64(1))
+            frb.begin(r_uint64(1), r_uint64(0), r_int64(1))
             frb.put_float(10.0)
             frb.put_float(0.0)
             frb.commit()
@@ -529,7 +529,7 @@ def test_complex_predicate():
         data = [(20, 50, 99), (5, 50, 42), (5, 50, 99), (20, 200, 42)]
         for i in range(len(data)):
             a, bb, c = data[i]
-            rb.begin(r_uint128(i + 1), r_int64(1))
+            rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(a))
             rb.put_int(r_int64(bb))
             rb.put_int(r_int64(c))
@@ -572,7 +572,7 @@ def test_integration_with_op_filter():
         rb = RowBuilder(schema, b)
         # 10 rows: col1 = 0..9, col2 = 90..81
         for i in range(10):
-            rb.begin(r_uint128(i + 1), r_int64(1))
+            rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i))
             rb.put_int(r_int64(90 - i))
             rb.commit()
@@ -630,12 +630,12 @@ def test_emit_null():
     b_out = batch.ArenaZSetBatch(out_schema)
     try:
         rb = RowBuilder(in_schema, b)
-        rb.begin(r_uint128(1), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(42))   # col1
         rb.put_int(r_int64(99))   # col2
         rb.commit()
 
-        rb.begin(r_uint128(2), r_int64(1))
+        rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(7))
         rb.put_int(r_int64(13))
         rb.commit()

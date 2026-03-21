@@ -154,7 +154,10 @@ class TableShardWriter(object):
             buf.put_bytes(self.scratch_val_buf, 4)
 
         elif type_code == types.TYPE_U128.code:
-            buf.put_u128(accessor.get_u128(col_idx))
+            buf.put_u128(
+                (r_uint128(accessor.get_u128_hi(col_idx)) << 64)
+                | r_uint128(accessor.get_u128_lo(col_idx))
+            )
 
         elif type_code == types.TYPE_U64.code:
             buf.put_u64(accessor.get_int(col_idx))
@@ -236,12 +239,13 @@ class TableShardWriter(object):
             lltype.free(self.scratch_val_buf, flavor="raw")
             self.scratch_val_buf = lltype.nullptr(rffi.CCHARP.TO)
 
-    def finalize(self, filename):
+    def finalize(self, filename, durable=True):
         regions = _build_writer_regions(self)
         try:
             _write_shard_file(
                 filename, self.table_id, self.count, regions,
                 self.pk_lo_buf.base_ptr, self.pk_hi_buf.base_ptr,
+                durable=durable,
             )
         finally:
             self.close()
@@ -268,17 +272,26 @@ def _build_writer_regions(writer):
     return regions
 
 
-def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr, pk_hi_ptr):
+def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr, pk_hi_ptr,
+                      durable=True):
     """
     Write a shard file from pre-built region buffers.
 
     region_list: list of (ptr, size) tuples in canonical region order:
         [pk_lo, pk_hi, weight, null, col0..colN, blob]
     pk_lo_ptr, pk_hi_ptr: raw pointers for XOR8 filter construction.
+
+    Always writes to a .tmp file first then atomically renames to filename.
+    This guarantees that the final file is either complete or absent — never
+    a partial write visible to concurrent readers (or readers after a crash).
+
+    durable=True  (PersistentTable): caller does one dir fsync after rename.
+    durable=False (EphemeralTable):  no fsync; crash durability is not a
+                  contract, but atomicity still prevents partial-read errors.
     """
     num_regions = len(region_list)
-    tmp_filename = filename + ".tmp"
-    fd = rposix.open(tmp_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    target_filename = filename + ".tmp"
+    fd = rposix.open(target_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
         dir_size = num_regions * layout.DIR_ENTRY_SIZE
         dir_offset = layout.HEADER_SIZE
@@ -317,7 +330,7 @@ def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr, pk_hi_p
             rffi.cast(
                 rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_TABLE_ID)
             )[0] = rffi.cast(rffi.ULONGLONG, table_id)
-            mmap_posix.write_c(
+            mmap_posix.write_all(
                 fd, header, rffi.cast(rffi.SIZE_T, layout.HEADER_SIZE)
             )
         finally:
@@ -340,7 +353,7 @@ def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr, pk_hi_p
                     rffi.ULONGLONG, cs
                 )
                 i += 1
-            mmap_posix.write_c(fd, dir_buf, rffi.cast(rffi.SIZE_T, dir_size_bytes))
+            mmap_posix.write_all(fd, dir_buf, rffi.cast(rffi.SIZE_T, dir_size_bytes))
         finally:
             lltype.free(dir_buf, flavor="raw")
 
@@ -357,15 +370,13 @@ def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr, pk_hi_p
                     while j < padding:
                         pad_buf[j] = "\x00"
                         j += 1
-                    mmap_posix.write_c(fd, pad_buf, rffi.cast(rffi.SIZE_T, padding))
+                    mmap_posix.write_all(fd, pad_buf, rffi.cast(rffi.SIZE_T, padding))
                 finally:
                     lltype.free(pad_buf, flavor="raw")
             if sz > 0:
-                mmap_posix.write_c(fd, buf_ptr, rffi.cast(rffi.SIZE_T, sz))
+                mmap_posix.write_all(fd, buf_ptr, rffi.cast(rffi.SIZE_T, sz))
             last_written_pos = off + sz
             i += 1
-
-        mmap_posix.fsync_c(fd)
 
         xor8_filter = None
         if count > 0:
@@ -375,8 +386,9 @@ def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr, pk_hi_p
     finally:
         rposix.close(fd)
 
-    os.rename(tmp_filename, filename)
-    mmap_posix.fsync_dir(filename)
+    os.rename(target_filename, filename)
+    # fsync_dir skipped here: EphemeralTable needs none;
+    # PersistentTable.flush() does one dir fsync after all shard writes.
 
     if xor8_filter is not None:
         from gnitz.storage.xor8 import save_xor8
@@ -385,7 +397,7 @@ def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr, pk_hi_p
         xor8_filter.free()
 
 
-def write_batch_to_shard(batch, filename, table_id):
+def write_batch_to_shard(batch, filename, table_id, durable=True):
     """
     Write a consolidated ArenaZSetBatch directly to a shard file.
     Bypasses TableShardWriter — no intermediate buffer copy.
@@ -410,4 +422,5 @@ def write_batch_to_shard(batch, filename, table_id):
     _write_shard_file(
         filename, table_id, count, regions,
         batch.pk_lo_buf.base_ptr, batch.pk_hi_buf.base_ptr,
+        durable=durable,
     )

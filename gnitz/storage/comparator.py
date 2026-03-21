@@ -76,6 +76,16 @@ class SoAAccessor(RowAccessor):
         hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))
         return (r_uint128(hi[0]) << 64) | r_uint128(lo[0])
 
+    def get_u128_lo(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        lo = rffi.cast(rffi.ULONGLONGP, ptr)
+        return r_uint64(lo[0])
+
+    def get_u128_hi(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))
+        return r_uint64(hi[0])
+
     def get_str_struct(self, col_idx):
         ptr = self._get_ptr(col_idx)
         blob_ptr = NULL_PTR

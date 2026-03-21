@@ -3,7 +3,6 @@
 from rpython.rlib.rarithmetic import (
     r_uint64,
     r_int64,
-    r_ulonglonglong as r_uint128,
     intmask,
 )
 from rpython.rlib.objectmodel import newlist_hint
@@ -53,9 +52,11 @@ class IndexPayloadAccessor(core_comparator.RowAccessor):
     def get_int_signed(self, col_idx):
         return rffi.cast(rffi.LONGLONG, self.pk_lo)
 
-    def get_u128(self, col_idx):
-        # Appendix A: Reconstruct dynamically only at point of use.
-        return (r_uint128(self.pk_hi) << 64) | r_uint128(self.pk_lo)
+    def get_u128_lo(self, col_idx):
+        return self.pk_lo
+
+    def get_u128_hi(self, col_idx):
+        return self.pk_hi
 
     def get_float(self, col_idx):
         return 0.0
@@ -209,24 +210,27 @@ def _backfill_index(circuit, source_family):
         weight = src_cursor.weight()
 
         if weight != r_int64(0) and not acc.is_null(circuit.source_col_idx):
-            source_pk = src_cursor.key()
+            source_pk_lo = src_cursor.key_lo()
+            source_pk_hi = src_cursor.key_hi()
             index_key = promote_to_index_key(
                 acc, circuit.source_col_idx, circuit.source_col_type
             )
+            index_key_lo = r_uint64(intmask(index_key))
+            index_key_hi = r_uint64(intmask(index_key >> 64))
 
-            if circuit.is_unique and circuit.table.has_pk(index_key):
+            if circuit.is_unique and circuit.table.has_pk(index_key_lo, index_key_hi):
                 src_cursor.close()
                 raise LayoutError(
                     "Unique index violation for '%s' during backfill" % circuit.name
                 )
 
-            # Extract PK components for the alignment-safe accessor
+            # Set PK components for the alignment-safe accessor
             acc_inj = circuit._index_payload_accessor
-            acc_inj.pk_lo = r_uint64(intmask(source_pk))
-            acc_inj.pk_hi = r_uint64(intmask(source_pk >> 64))
+            acc_inj.pk_lo = source_pk_lo
+            acc_inj.pk_hi = source_pk_hi
 
             # EphemeralTable.ingest_one handles MemTableFullError internally.
-            circuit.table.ingest_one(index_key, weight, acc_inj)
+            circuit.table.ingest_one(index_key_lo, index_key_hi, weight, acc_inj)
 
         src_cursor.advance()
 

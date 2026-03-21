@@ -29,7 +29,7 @@ def promote_to_index_key(accessor, col_idx, source_col_type):
     res = r_uint128(0)
 
     if code == TYPE_U128.code:
-        res = accessor.get_u128(col_idx)
+        res = (r_uint128(accessor.get_u128_hi(col_idx)) << 64) | r_uint128(accessor.get_u128_lo(col_idx))
 
     elif code == TYPE_U64.code:
         res = r_uint128(accessor.get_int(col_idx))

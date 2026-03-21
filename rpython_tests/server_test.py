@@ -211,7 +211,7 @@ def push_create_view(srv, schema_name, view_name, graph):
 
 
 def _add_int_row(rb, pk, vals, weight=1):
-    rb.begin(r_uint128(pk), r_int64(weight))
+    rb.begin(r_uint64(pk), r_uint64(0), r_int64(weight))
     for v in vals:
         rb.put_int(r_int64(v))
     rb.commit()

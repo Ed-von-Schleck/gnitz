@@ -1,6 +1,7 @@
 # gnitz/server/executor.py
 
 import os
+import time
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
@@ -16,7 +17,6 @@ from gnitz.catalog.registry import (
 )
 from gnitz.dbsp import ops
 from gnitz import log
-from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 
 
 def _sort_pending(pending):
@@ -40,7 +40,9 @@ def _sort_pending_desc(pending):
             j -= 1
         pending[j + 1] = item
 
-MAX_PENDING_ROWS = 100000
+MAX_PENDING_ROWS    = 100000
+TICK_COALESCE_ROWS  = 10000   # min rows before firing a tick
+TICK_DEADLINE_MS    = 20      # max ms to wait before firing regardless
 
 STATUS_OK = 0
 STATUS_ERROR = 1
@@ -256,6 +258,17 @@ class ServerExecutor(object):
         self._poll_events = newlist_hint(8)
         self._poll_dirty  = True
 
+        # Deferred tick tracking (multi-worker only)
+        self._tick_tids    = newlist_hint(8)  # [int] table_ids with pending ticks
+        self._tick_schemas = {}               # tid -> schema
+        self._tick_rows    = {}               # tid -> int (rows accumulated since last tick)
+        self._t_first_tick = 0.0             # wall-clock time of oldest pending tick
+
+        # LSN tracking
+        self._ingest_lsn        = 0  # global monotonic counter; increments per flush batch
+        self._last_tick_lsn     = 0  # ingest_lsn at time of last _fire_pending_ticks()
+        self._last_response_lsn = 0  # side-channel from handle_push → _drain_client
+
     def run_socket_server(self, socket_path):
         server_fd = ipc_ffi.server_create(socket_path)
         if server_fd < 0:
@@ -292,7 +305,13 @@ class ServerExecutor(object):
                     self._poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
                 self._poll_dirty = False
             fds = self._poll_fds
-            revents = ipc_ffi.poll(self._poll_fds, self._poll_events, 500)
+            timeout_ms = 500
+            if len(self._tick_tids) > 0 and self._t_first_tick > 0.0:
+                elapsed_ms = int((time.time() - self._t_first_tick) * 1000.0)
+                remaining  = TICK_DEADLINE_MS - elapsed_ms
+                if remaining < timeout_ms:
+                    timeout_ms = remaining if remaining > 0 else 0
+            revents = ipc_ffi.poll(self._poll_fds, self._poll_events, timeout_ms)
 
             # Phase 1: Drain all ready FDs
             pending_fds = newlist_hint(16)
@@ -364,6 +383,21 @@ class ServerExecutor(object):
                     pending_schemas,
                 )
 
+            # Phase 3: Fire deferred ticks if coalesce threshold or deadline reached
+            if len(self._tick_tids) > 0:
+                t_now = time.time()
+                should_fire = False
+                for tid in self._tick_tids:
+                    if self._tick_rows[tid] >= TICK_COALESCE_ROWS:
+                        should_fire = True
+                        break
+                if not should_fire and self._t_first_tick > 0.0:
+                    elapsed_ms = int((t_now - self._t_first_tick) * 1000.0)
+                    if elapsed_ms >= TICK_DEADLINE_MS:
+                        should_fire = True
+                if should_fire:
+                    self._fire_pending_ticks()
+
     # -- Unified Protocol ---------------------------------------------------
 
     def handle_push(self, target_id, in_batch):
@@ -386,9 +420,10 @@ class ServerExecutor(object):
                 validate_fk_distributed(family, in_batch, self.dispatcher)
                 validate_unique_indices_distributed(family, in_batch, self.dispatcher)
                 self.dispatcher.fan_out_push(target_id, in_batch, schema)
-                # No _evaluate_dag here — workers handle it
-                return None
+                return None  # (non-socket path; LSN not tracked here)
             else:
+                self._fire_pending_ticks()               # ensure views are current
+                self._last_response_lsn = self._last_tick_lsn
                 return self.dispatcher.fan_out_scan(target_id, schema)
 
         if in_batch is not None and in_batch.length() > 0:
@@ -399,8 +434,12 @@ class ServerExecutor(object):
             self._evaluate_dag(target_id, effective)
             if effective is not in_batch:
                 effective.free()
+            self._ingest_lsn += 1
+            self._last_tick_lsn = self._ingest_lsn
+            self._last_response_lsn = self._ingest_lsn
             return None
         else:
+            self._last_response_lsn = self._last_tick_lsn
             return self._scan_family(target_id)
 
     def _scan_family(self, target_id):
@@ -413,9 +452,8 @@ class ServerExecutor(object):
             while cursor.is_valid():
                 w = cursor.weight()
                 if w > r_int64(0):
-                    pk = cursor.key()
                     acc = cursor.get_accessor()
-                    result.append_from_accessor(r_uint128(pk), w, acc)
+                    result.append_from_accessor(cursor.key_lo(), cursor.key_hi(), w, acc)
                 cursor.advance()
         finally:
             cursor.close()
@@ -426,20 +464,17 @@ class ServerExecutor(object):
         family = self.engine.registry.get_by_id(target_id)
         cursor = family.store.create_cursor()
         try:
-            key = r_uint128(
-                (r_uint128(r_uint64(pk_hi_raw)) << 64) | r_uint128(r_uint64(pk_lo_raw))
-            )
-            cursor.seek(key)
+            cursor.seek(r_uint64(pk_lo_raw), r_uint64(pk_hi_raw))
             if not cursor.is_valid():
                 return None
-            if cursor.key() != key:
+            if cursor.key_lo() != r_uint64(pk_lo_raw) or cursor.key_hi() != r_uint64(pk_hi_raw):
                 return None
             w = cursor.weight()
             if w <= r_int64(0):
                 return None
             result = ArenaZSetBatch(family.schema, initial_capacity=1)
             acc = cursor.get_accessor()
-            result.append_from_accessor(key, w, acc)
+            result.append_from_accessor(r_uint64(pk_lo_raw), r_uint64(pk_hi_raw), w, acc)
             return result
         finally:
             cursor.close()
@@ -455,24 +490,21 @@ class ServerExecutor(object):
         if circuit is None:
             return None   # no index on this column
 
-        key = r_uint128(
-            (r_uint128(r_uint64(key_hi)) << 64) | r_uint128(r_uint64(key_lo))
-        )
         idx_cursor = circuit.table.create_cursor()
         try:
-            idx_cursor.seek(key)
-            if not idx_cursor.is_valid() or idx_cursor.key() != key:
+            idx_cursor.seek(r_uint64(key_lo), r_uint64(key_hi))
+            if not idx_cursor.is_valid() or idx_cursor.key_lo() != r_uint64(key_lo) or idx_cursor.key_hi() != r_uint64(key_hi):
                 return None
             # source_pk is at col 1 in the 2-col index schema.
             # Type dispatch needed: source_pk_type is U64 or U128.
             if circuit.source_pk_type.code == TYPE_U128.code:
-                source_pk = idx_cursor.get_accessor().get_u128(1)
+                source_pk_lo = idx_cursor.get_accessor().get_u128_lo(1)
+                source_pk_hi = idx_cursor.get_accessor().get_u128_hi(1)
             else:
-                source_pk = r_uint128(
-                    r_uint64(intmask(idx_cursor.get_accessor().get_int(1)))
-                )
-            src_lo = intmask(r_uint64(intmask(source_pk)))
-            src_hi = intmask(r_uint64(intmask(source_pk >> 64)))
+                source_pk_lo = r_uint64(intmask(idx_cursor.get_accessor().get_int(1)))
+                source_pk_hi = r_uint64(0)
+            src_lo = intmask(source_pk_lo)
+            src_hi = intmask(source_pk_hi)
         finally:
             idx_cursor.close()
         return self._seek_family(table_id, src_lo, src_hi)
@@ -593,6 +625,8 @@ class ServerExecutor(object):
 
             # Non-bufferable: process inline
             result = self.handle_push(target_id, payload.batch)
+            lsn = self._last_response_lsn
+            self._last_response_lsn = 0
 
             # Broadcast system-table deltas to workers for DDL sync
             if (
@@ -615,7 +649,7 @@ class ServerExecutor(object):
                 resp_schema = self.engine.registry.get_by_id(target_id).schema
             ipc.send_batch(
                 fd, target_id, result, STATUS_OK, "",
-                client_id, schema=resp_schema,
+                client_id, schema=resp_schema, seek_pk_lo=lsn,
             )
             if result is not None:
                 result.free()
@@ -666,11 +700,25 @@ class ServerExecutor(object):
 
             err_msg = ""
             try:
-                self.dispatcher.fan_out_push(target_id, merged, schema)
+                self.dispatcher.fan_out_ingest(target_id, merged, schema)
             except errors.GnitzError as ge:
                 err_msg = ge.msg
 
+            n_rows = merged.length()
             merged.free()
+
+            if len(err_msg) == 0:
+                self._ingest_lsn += 1
+                current_lsn = self._ingest_lsn
+                if target_id not in self._tick_schemas:
+                    self._tick_tids.append(target_id)
+                    self._tick_schemas[target_id] = schema
+                    self._tick_rows[target_id] = 0
+                    if self._t_first_tick == 0.0:
+                        self._t_first_tick = time.time()
+                self._tick_rows[target_id] = self._tick_rows[target_id] + n_rows
+            else:
+                current_lsn = 0
 
             for k in range(run_start, run_end):
                 try:
@@ -682,12 +730,32 @@ class ServerExecutor(object):
                     else:
                         ipc.send_batch(
                             p_fds[k], target_id, None, STATUS_OK, "",
-                            p_cids[k], schema=schema,
+                            p_cids[k], schema=schema, seek_pk_lo=current_lsn,
                         )
                 except Exception:
                     self._cleanup_client(p_fds[k])
 
             run_start = run_end
+
+    def _fire_pending_ticks(self):
+        """Fire all pending ticks unconditionally."""
+        if len(self._tick_tids) == 0:
+            return
+        tids = self._tick_tids
+        self._tick_tids = newlist_hint(8)
+        for tid in tids:
+            schema = self._tick_schemas[tid]
+            del self._tick_schemas[tid]
+            del self._tick_rows[tid]
+            # Table may have been dropped between ingest and tick; skip if gone.
+            if not self.engine.registry.has_id(tid):
+                continue
+            try:
+                self.dispatcher.fan_out_tick(tid, schema)
+            except errors.GnitzError as ge:
+                log.warn("fan_out_tick error tid=%d: %s" % (tid, ge.msg))
+        self._last_tick_lsn = self._ingest_lsn
+        self._t_first_tick = 0.0
 
     def _evaluate_dag(self, initial_source_id, initial_delta):
         evaluate_dag(self.engine, initial_source_id, initial_delta)

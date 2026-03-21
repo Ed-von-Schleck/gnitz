@@ -172,12 +172,14 @@ class FLSMIndex(object):
     # Read path: L0 + all levels
 
     def find_all_shards_and_indices(self, key):
+        key_lo = r_uint64(intmask(key))
+        key_hi = r_uint64(intmask(key >> 64))
         results = newlist_hint(8)
         for h in self.handles:
             if h.get_min_key() <= key <= h.get_max_key():
-                if h.xor8_filter is not None and not h.xor8_filter.may_contain(key):
+                if h.xor8_filter is not None and not h.xor8_filter.may_contain(key_lo, key_hi):
                     continue
-                row_idx = h.view.find_row_index(key)
+                row_idx = h.view.find_row_index(key_lo, key_hi)
                 if row_idx != -1:
                     results.append((h, row_idx))
         for level in self.levels:
@@ -187,9 +189,9 @@ class FLSMIndex(object):
             guard = level.guards[g_idx]
             for h in guard.handles:
                 if h.get_min_key() <= key <= h.get_max_key():
-                    if h.xor8_filter is not None and not h.xor8_filter.may_contain(key):
+                    if h.xor8_filter is not None and not h.xor8_filter.may_contain(key_lo, key_hi):
                         continue
-                    row_idx = h.view.find_row_index(key)
+                    row_idx = h.view.find_row_index(key_lo, key_hi)
                     if row_idx != -1:
                         results.append((h, row_idx))
         return results

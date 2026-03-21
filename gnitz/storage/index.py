@@ -128,15 +128,17 @@ class ShardIndex(object):
 
     def find_all_shards_and_indices(self, key):
         """Prunes shards via cached bounds before performing binary search."""
+        key_lo = r_uint64(intmask(key))
+        key_hi = r_uint64(intmask(key >> 64))
         num_h = len(self.handles)
         results = newlist_hint(num_h)
         for i in range(num_h):
             h = self.handles[i]
             if h.get_min_key() <= key <= h.get_max_key():
                 if h.xor8_filter is not None:
-                    if not h.xor8_filter.may_contain(key):
+                    if not h.xor8_filter.may_contain(key_lo, key_hi):
                         continue
-                row_idx = h.view.find_row_index(key)
+                row_idx = h.view.find_row_index(key_lo, key_hi)
                 if row_idx != -1:
                     results.append((h, row_idx))
         return results

@@ -11,6 +11,7 @@ from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from gnitz.core import errors
 from gnitz.storage import buffer, layout, mmap_posix
 from gnitz.core import strings as string_logic, types, xxh as checksum
+from gnitz.core.batch import pk_lt, pk_eq
 
 DUMMY_BUF = buffer.MappedBuffer(lltype.nullptr(rffi.CCHARP.TO), 0)
 
@@ -216,6 +217,12 @@ class TableShardView(object):
         hi = self.pk_hi_buf.read_u64(index * 8)
         return (r_uint128(hi) << 64) | r_uint128(lo)
 
+    def get_pk_lo(self, index):
+        return self.pk_lo_buf.read_u64(index * 8)
+
+    def get_pk_hi(self, index):
+        return self.pk_hi_buf.read_u64(index * 8)
+
     def get_weight(self, index):
         if self.count == 0 or index >= self.count or index < 0:
             return 0
@@ -274,20 +281,15 @@ class TableShardView(object):
             ptr, self.blob_buf.ptr, search_str, len(search_str), prefix
         )
 
-    def find_row_index(self, key):
+    def find_row_index(self, key_lo, key_hi):
         """Binary search for the FIRST occurrence of an exact primary key."""
-        idx = self.find_lower_bound(key)
+        idx = self.find_lower_bound(key_lo, key_hi)
         if idx < self.count:
-            mid_key = (
-                self.get_pk_u128(idx)
-                if self.schema.get_pk_column().field_type.size == 16
-                else r_uint128(self.get_pk_u64(idx))
-            )
-            if mid_key == key:
+            if pk_eq(self.get_pk_lo(idx), self.get_pk_hi(idx), key_lo, key_hi):
                 return idx
         return -1
 
-    def find_lower_bound(self, key):
+    def find_lower_bound(self, key_lo, key_hi):
         """
         Binary search for the first row index where ShardKey >= key.
         Returns self.count if no such key exists.
@@ -295,21 +297,14 @@ class TableShardView(object):
         low = 0
         high = self.count - 1
         res = self.count
-        is_u128 = self.schema.get_pk_column().field_type.size == 16
 
         while low <= high:
             mid = (low + high) // 2
-            mid_key = (
-                self.get_pk_u128(mid)
-                if is_u128
-                else r_uint128(self.get_pk_u64(mid))
-            )
-
-            if mid_key >= key:
+            if pk_lt(self.get_pk_lo(mid), self.get_pk_hi(mid), key_lo, key_hi):
+                low = mid + 1
+            else:
                 res = mid
                 high = mid - 1
-            else:
-                low = mid + 1
         return res
 
     def close(self):

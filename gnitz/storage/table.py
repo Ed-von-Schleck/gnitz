@@ -13,6 +13,7 @@ from gnitz.storage import (
     index,
     manifest,
     memtable,
+    mmap_posix,
 )
 from gnitz.storage.ephemeral_table import EphemeralTable
 
@@ -222,6 +223,10 @@ class PersistentTable(EphemeralTable):
             self.manifest_manager.publish_new_version(
                 self.index.get_metadata_list(), lsn_max
             )
+
+        # One dir fsync covers the shard rename + manifest update for this
+        # partition.  Replaces per-shard fsync_c + fsync_dir in _write_shard_file.
+        mmap_posix.fsync_dir(shard_path)
 
         # 4. Rotation: Swap MemTable
         max_bytes = self.memtable.max_bytes

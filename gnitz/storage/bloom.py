@@ -2,7 +2,6 @@
 
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, intmask
-from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rlib import jit
 
 from gnitz.core import xxh
@@ -37,14 +36,12 @@ class BloomFilter(object):
             i += 1
 
     @jit.elidable
-    def _hash_key(self, key):
-        lo = r_uint64(intmask(key))
-        hi = r_uint64(intmask(key >> 64))
-        return xxh.hash_u128_inline(lo, hi)
+    def _hash_key(self, key_lo, key_hi):
+        return xxh.hash_u128_inline(key_lo, key_hi)
 
     @jit.unroll_safe
-    def add(self, key):
-        h_val = r_uint64(self._hash_key(key))
+    def add(self, key_lo, key_hi):
+        h_val = r_uint64(self._hash_key(key_lo, key_hi))
         h1 = h_val
         h2 = (h_val >> 32) | r_uint64(1)
         num_bits_u = r_uint64(self.num_bits)
@@ -61,8 +58,8 @@ class BloomFilter(object):
             i += 1
 
     @jit.unroll_safe
-    def may_contain(self, key):
-        h_val = r_uint64(self._hash_key(key))
+    def may_contain(self, key_lo, key_hi):
+        h_val = r_uint64(self._hash_key(key_lo, key_hi))
         h1 = h_val
         h2 = (h_val >> 32) | r_uint64(1)
         num_bits_u = r_uint64(self.num_bits)

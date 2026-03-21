@@ -1,7 +1,7 @@
 # gnitz/dbsp/ops/distinct.py
 
 from rpython.rlib.rarithmetic import r_int64, intmask
-from gnitz.core.batch import ConsolidatedScope, BatchWriter
+from gnitz.core.batch import ConsolidatedScope, BatchWriter, pk_eq
 
 """
 Distinct Operator for the DBSP algebra.
@@ -45,13 +45,13 @@ def op_distinct(delta_batch, hist_cursor, hist_table, out_writer):
             return
 
         for i in range(n):
-            key = b.get_pk(i)
+            key_lo, key_hi = b.get_pk_lo(i), b.get_pk_hi(i)
             w_delta = b.get_weight(i)
             accessor = b.get_accessor(i)
 
-            hist_cursor.seek(key)
+            hist_cursor.seek(key_lo, key_hi)
             w_old = r_int64(0)
-            if hist_cursor.is_valid() and hist_cursor.key() == key:
+            if hist_cursor.is_valid() and pk_eq(hist_cursor.key_lo(), hist_cursor.key_hi(), key_lo, key_hi):
                 w_old = hist_cursor.weight()
 
             # DBSP distinct converts a multiset to a set.
@@ -74,7 +74,7 @@ def op_distinct(delta_batch, hist_cursor, hist_table, out_writer):
 
             out_w = s_new - s_old
             if out_w != 0:
-                out_writer.append_from_accessor(key, r_int64(out_w), accessor)
+                out_writer.append_from_accessor(key_lo, key_hi, r_int64(out_w), accessor)
 
         out_writer.mark_consolidated(True)
 

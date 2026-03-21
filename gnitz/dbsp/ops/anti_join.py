@@ -2,7 +2,7 @@
 
 from rpython.rlib.rarithmetic import r_int64, intmask
 
-from gnitz.core.batch import ConsolidatedScope
+from gnitz.core.batch import ConsolidatedScope, pk_lt, pk_eq
 from gnitz.storage.cursor import SortedBatchCursor
 
 ADAPTIVE_SWAP_THRESHOLD = 1   # swap when delta_len > trace_len
@@ -46,16 +46,17 @@ def _anti_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
     if count == 0:
         out_writer.mark_consolidated(True)
         return
-    trace_cursor.seek(delta_batch.get_pk(0))
+    trace_cursor.seek(delta_batch.get_pk_lo(0), delta_batch.get_pk_hi(0))
     for i in range(count):
-        d_key = delta_batch.get_pk(i)
-        while trace_cursor.is_valid() and trace_cursor.key() < d_key:
+        d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
+        while trace_cursor.is_valid() and pk_lt(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
             trace_cursor.advance()
-        in_trace = (trace_cursor.is_valid() and trace_cursor.key() == d_key
+        in_trace = (trace_cursor.is_valid()
+                    and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi)
                     and trace_cursor.weight() > r_int64(0))
         if not in_trace:
             out_writer.direct_append_row(delta_batch, i, delta_batch.get_weight(i))
-        if trace_cursor.is_valid() and trace_cursor.key() == d_key:
+        if trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
             trace_cursor.advance()   # advance past d_key even for negative-weight trace records
     out_writer.mark_consolidated(True)
 
@@ -78,17 +79,17 @@ def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
             n_b = b_b.length()
 
             while idx_a < n_a:
-                key_a = b_a.get_pk(idx_a)
+                key_a_lo, key_a_hi = b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a)
 
                 # Advance b pointer to first key >= key_a
-                while idx_b < n_b and b_b.get_pk(idx_b) < key_a:
+                while idx_b < n_b and pk_lt(b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b), key_a_lo, key_a_hi):
                     idx_b += 1
 
                 # Check if any b record at key_a has positive weight
                 has_match = False
-                if idx_b < n_b and b_b.get_pk(idx_b) == key_a:
+                if idx_b < n_b and pk_eq(b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b), key_a_lo, key_a_hi):
                     scan_b = idx_b
-                    while scan_b < n_b and b_b.get_pk(scan_b) == key_a:
+                    while scan_b < n_b and pk_eq(b_b.get_pk_lo(scan_b), b_b.get_pk_hi(scan_b), key_a_lo, key_a_hi):
                         if b_b.get_weight(scan_b) > r_int64(0):
                             has_match = True
                             break
@@ -96,7 +97,7 @@ def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
 
                 # Find end of key group in b_a
                 start_a = idx_a
-                while idx_a < n_a and b_a.get_pk(idx_a) == key_a:
+                while idx_a < n_a and pk_eq(b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a), key_a_lo, key_a_hi):
                     idx_a += 1
 
                 if not has_match:
@@ -131,14 +132,14 @@ def _semi_join_dt_swapped(delta_batch, trace_cursor, out_writer):
     with ConsolidatedScope(delta_batch) as sorted_delta:
         delta_cursor = SortedBatchCursor(sorted_delta)
         while trace_cursor.is_valid():
-            trace_key = trace_cursor.key()
+            trace_key_lo, trace_key_hi = trace_cursor.key_lo(), trace_cursor.key_hi()
             if trace_cursor.weight() <= r_int64(0):
                 trace_cursor.advance()
                 continue
-            if not delta_cursor.seek_key_exact(trace_key):
+            if not delta_cursor.seek_key_exact(trace_key_lo, trace_key_hi):
                 trace_cursor.advance()
                 continue
-            while delta_cursor.is_valid() and delta_cursor.key() == trace_key:
+            while delta_cursor.is_valid() and pk_eq(delta_cursor.key_lo(), delta_cursor.key_hi(), trace_key_lo, trace_key_hi):
                 w_delta = delta_cursor.weight()
                 out_writer.direct_append_row(sorted_delta, delta_cursor._pos, w_delta)
                 delta_cursor.advance()
@@ -151,16 +152,17 @@ def _semi_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
     if count == 0:
         out_writer.mark_consolidated(True)
         return
-    trace_cursor.seek(delta_batch.get_pk(0))
+    trace_cursor.seek(delta_batch.get_pk_lo(0), delta_batch.get_pk_hi(0))
     for i in range(count):
-        d_key = delta_batch.get_pk(i)
-        while trace_cursor.is_valid() and trace_cursor.key() < d_key:
+        d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
+        while trace_cursor.is_valid() and pk_lt(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
             trace_cursor.advance()
-        in_trace = (trace_cursor.is_valid() and trace_cursor.key() == d_key
+        in_trace = (trace_cursor.is_valid()
+                    and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi)
                     and trace_cursor.weight() > r_int64(0))
         if in_trace:
             out_writer.direct_append_row(delta_batch, i, delta_batch.get_weight(i))
-        if trace_cursor.is_valid() and trace_cursor.key() == d_key:
+        if trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
             trace_cursor.advance()
     out_writer.mark_consolidated(True)
 
@@ -185,17 +187,17 @@ def op_semi_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
             n_b = b_b.length()
 
             while idx_a < n_a:
-                key_a = b_a.get_pk(idx_a)
+                key_a_lo, key_a_hi = b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a)
 
                 # Advance b pointer to first key >= key_a
-                while idx_b < n_b and b_b.get_pk(idx_b) < key_a:
+                while idx_b < n_b and pk_lt(b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b), key_a_lo, key_a_hi):
                     idx_b += 1
 
                 # Check if any b record at key_a has positive weight
                 has_match = False
-                if idx_b < n_b and b_b.get_pk(idx_b) == key_a:
+                if idx_b < n_b and pk_eq(b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b), key_a_lo, key_a_hi):
                     scan_b = idx_b
-                    while scan_b < n_b and b_b.get_pk(scan_b) == key_a:
+                    while scan_b < n_b and pk_eq(b_b.get_pk_lo(scan_b), b_b.get_pk_hi(scan_b), key_a_lo, key_a_hi):
                         if b_b.get_weight(scan_b) > r_int64(0):
                             has_match = True
                             break
@@ -203,7 +205,7 @@ def op_semi_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
 
                 # Find end of key group in b_a
                 start_a = idx_a
-                while idx_a < n_a and b_a.get_pk(idx_a) == key_a:
+                while idx_a < n_a and pk_eq(b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a), key_a_lo, key_a_hi):
                     idx_a += 1
 
                 if has_match:

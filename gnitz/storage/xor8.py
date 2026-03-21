@@ -65,13 +65,11 @@ class Xor8Filter(object):
         return (r_uint128(self.seed_hi) << 64) | r_uint128(self.seed_lo)
 
     @jit.elidable
-    def _hash_key(self, key):
-        lo = r_uint64(intmask(key))
-        hi = r_uint64(intmask(key >> 64))
-        return xxh.hash_u128_inline(lo, hi, self.seed_lo, self.seed_hi)
+    def _hash_key(self, key_lo, key_hi):
+        return xxh.hash_u128_inline(key_lo, key_hi, self.seed_lo, self.seed_hi)
 
-    def may_contain(self, key):
-        h = self._hash_key(key)
+    def may_contain(self, key_lo, key_hi):
+        h = self._hash_key(key_lo, key_hi)
         f = intmask(r_uint64(h) >> 56) & 0xFF
 
         h0, h1, h2 = _get_h0_h1_h2(h, self.segment_length)

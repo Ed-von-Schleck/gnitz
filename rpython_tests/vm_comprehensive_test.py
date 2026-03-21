@@ -9,6 +9,7 @@ from rpython.rtyper.lltypesystem import rffi
 from gnitz.core import types, batch
 from gnitz.core.batch import RowBuilder
 from gnitz.dbsp import functions
+from gnitz.dbsp.ops.group_index import AggValueIndex, make_agg_value_idx_schema
 from gnitz.vm import runtime, instructions, interpreter
 from gnitz.storage.ephemeral_table import EphemeralTable
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
@@ -118,17 +119,17 @@ def test_filter_map_negate():
     in_batch = batch.ArenaZSetBatch(in_schema)
     rb = RowBuilder(in_schema, in_batch)
 
-    rb.begin(r_uint128(1), r_int64(1))
+    rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(5))
     rb.put_string("low")
     rb.commit()
 
-    rb.begin(r_uint128(2), r_int64(1))
+    rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(20))
     rb.put_string("mid")
     rb.commit()
 
-    rb.begin(r_uint128(3), r_int64(1))
+    rb.begin(r_uint64(3), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(42))
     rb.put_string("high")
     rb.commit()
@@ -182,7 +183,7 @@ def test_union():
     # Batch A: pk=1 val=10
     batch_a = batch.ArenaZSetBatch(schema)
     rb_a = RowBuilder(schema, batch_a)
-    rb_a.begin(r_uint128(1), r_int64(1))
+    rb_a.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb_a.put_int(r_int64(10))
     rb_a.commit()
 
@@ -190,7 +191,7 @@ def test_union():
     # We need to manually put data in R1 since execute_epoch only binds R0
     batch_b_data = batch.ArenaZSetBatch(schema)
     rb_b = RowBuilder(schema, batch_b_data)
-    rb_b.begin(r_uint128(2), r_int64(1))
+    rb_b.begin(r_uint64(2), r_uint64(0), r_int64(1))
     rb_b.put_int(r_int64(20))
     rb_b.commit()
 
@@ -254,11 +255,11 @@ def test_join_delta_trace(base_dir):
     batch_r = batch.ArenaZSetBatch(schema_r)
     rb_r = RowBuilder(schema_r, batch_r)
 
-    rb_r.begin(r_uint128(99), r_int64(2))
+    rb_r.begin(r_uint64(99), r_uint64(0), r_int64(2))
     rb_r.put_int(r_int64(50000))
     rb_r.commit()
 
-    rb_r.begin(r_uint128(100), r_int64(1))
+    rb_r.begin(r_uint64(100), r_uint64(0), r_int64(1))
     rb_r.put_int(r_int64(30000))
     rb_r.commit()
 
@@ -285,11 +286,11 @@ def test_join_delta_trace(base_dir):
     in_batch = batch.ArenaZSetBatch(schema_l)
     rb_l = RowBuilder(schema_l, in_batch)
 
-    rb_l.begin(r_uint128(99), r_int64(3))
+    rb_l.begin(r_uint64(99), r_uint64(0), r_int64(3))
     rb_l.put_int(r_int64(7))
     rb_l.commit()
 
-    rb_l.begin(r_uint128(101), r_int64(1))
+    rb_l.begin(r_uint64(101), r_uint64(0), r_int64(1))
     rb_l.put_int(r_int64(9))
     rb_l.commit()
 
@@ -353,7 +354,7 @@ def test_distinct_multi_tick(base_dir):
     # Tick 1: insert pk=1 w=3 => distinct output should be w=+1 (appeared)
     in_batch1 = batch.ArenaZSetBatch(schema)
     rb1 = RowBuilder(schema, in_batch1)
-    rb1.begin(r_uint128(1), r_int64(3))
+    rb1.begin(r_uint64(1), r_uint64(0), r_int64(3))
     rb1.put_int(r_int64(42))
     rb1.commit()
 
@@ -368,7 +369,7 @@ def test_distinct_multi_tick(base_dir):
     # Tick 2: retract pk=1 w=-3 => net becomes 0 => distinct output w=-1 (disappeared)
     in_batch2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, in_batch2)
-    rb2.begin(r_uint128(1), r_int64(-3))
+    rb2.begin(r_uint64(1), r_uint64(0), r_int64(-3))
     rb2.put_int(r_int64(42))
     rb2.commit()
 
@@ -444,17 +445,17 @@ def test_reduce_sum(base_dir):
     in_batch1 = batch.ArenaZSetBatch(in_schema)
     rb1 = RowBuilder(in_schema, in_batch1)
 
-    rb1.begin(r_uint128(1), r_int64(1))
+    rb1.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb1.put_int(rffi.cast(rffi.LONGLONG, r_uint64(10)))  # grp=10
     rb1.put_int(r_int64(100))
     rb1.commit()
 
-    rb1.begin(r_uint128(2), r_int64(1))
+    rb1.begin(r_uint64(2), r_uint64(0), r_int64(1))
     rb1.put_int(rffi.cast(rffi.LONGLONG, r_uint64(10)))  # grp=10
     rb1.put_int(r_int64(50))
     rb1.commit()
 
-    rb1.begin(r_uint128(3), r_int64(1))
+    rb1.begin(r_uint64(3), r_uint64(0), r_int64(1))
     rb1.put_int(rffi.cast(rffi.LONGLONG, r_uint64(20)))  # grp=20
     rb1.put_int(r_int64(200))
     rb1.commit()
@@ -485,7 +486,7 @@ def test_reduce_sum(base_dir):
     # Tick 2: retract one row from group 10 (pk=2, amount=50, w=-1)
     in_batch2 = batch.ArenaZSetBatch(in_schema)
     rb2 = RowBuilder(in_schema, in_batch2)
-    rb2.begin(r_uint128(2), r_int64(-1))
+    rb2.begin(r_uint64(2), r_uint64(0), r_int64(-1))
     rb2.put_int(rffi.cast(rffi.LONGLONG, r_uint64(10)))
     rb2.put_int(r_int64(50))
     rb2.commit()
@@ -554,11 +555,11 @@ def test_ghost_property():
     in_batch = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, in_batch)
 
-    rb.begin(r_uint128(1), r_int64(1))
+    rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(123))
     rb.commit()
 
-    rb.begin(r_uint128(1), r_int64(-1))
+    rb.begin(r_uint64(1), r_uint64(0), r_int64(-1))
     rb.put_int(r_int64(123))
     rb.commit()
 
@@ -633,7 +634,7 @@ def test_seek_trace_point_lookup(base_dir):
     rb = RowBuilder(schema, b)
     ids = [10, 20, 30, 40, 50]
     for pk_val in ids:
-        rb.begin(r_uint128(pk_val), r_int64(1))
+        rb.begin(r_uint64(pk_val), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(pk_val * 100))
         rb.commit()
     table.ingest_batch(b)
@@ -658,7 +659,7 @@ def test_seek_trace_point_lookup(base_dir):
     # Bind R1 with a batch containing pk=30
     seek_batch = batch.ArenaZSetBatch(schema)
     rb_seek = RowBuilder(schema, seek_batch)
-    rb_seek.begin(r_uint128(30), r_int64(1))
+    rb_seek.begin(r_uint64(30), r_uint64(0), r_int64(1))
     rb_seek.put_int(r_int64(0))
     rb_seek.commit()
 
@@ -760,20 +761,20 @@ def test_join_delta_delta():
     # Batch A: pk=5 w=1, pk=10 w=2
     batch_a = batch.ArenaZSetBatch(schema_a)
     rb_a = RowBuilder(schema_a, batch_a)
-    rb_a.begin(r_uint128(5), r_int64(1))
+    rb_a.begin(r_uint64(5), r_uint64(0), r_int64(1))
     rb_a.put_int(r_int64(55))
     rb_a.commit()
-    rb_a.begin(r_uint128(10), r_int64(2))
+    rb_a.begin(r_uint64(10), r_uint64(0), r_int64(2))
     rb_a.put_int(r_int64(100))
     rb_a.commit()
 
     # Batch B: pk=10 w=3, pk=20 w=1
     batch_b = batch.ArenaZSetBatch(schema_b)
     rb_b = RowBuilder(schema_b, batch_b)
-    rb_b.begin(r_uint128(10), r_int64(3))
+    rb_b.begin(r_uint64(10), r_uint64(0), r_int64(3))
     rb_b.put_int(r_int64(200))
     rb_b.commit()
-    rb_b.begin(r_uint128(20), r_int64(1))
+    rb_b.begin(r_uint64(20), r_uint64(0), r_int64(1))
     rb_b.put_int(r_int64(300))
     rb_b.commit()
 
@@ -829,11 +830,11 @@ def test_delay_op():
     in_batch = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, in_batch)
 
-    rb.begin(r_uint128(1), r_int64(1))
+    rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(111))
     rb.commit()
 
-    rb.begin(r_uint128(2), r_int64(3))
+    rb.begin(r_uint64(2), r_uint64(0), r_int64(3))
     rb.put_int(r_int64(222))
     rb.commit()
 
@@ -922,7 +923,7 @@ def test_reduce_min_nonlinear(base_dir):
     # Tick 1: pk=1 val=30 w=1 => MIN(val)=30
     in_batch1 = batch.ArenaZSetBatch(in_schema)
     rb1 = RowBuilder(in_schema, in_batch1)
-    rb1.begin(r_uint128(1), r_int64(1))
+    rb1.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb1.put_int(r_int64(30))
     rb1.commit()
 
@@ -943,7 +944,7 @@ def test_reduce_min_nonlinear(base_dir):
     # This forces the non-linear replay path since AGG_MIN.is_linear() is False.
     in_batch2 = batch.ArenaZSetBatch(in_schema)
     rb2 = RowBuilder(in_schema, in_batch2)
-    rb2.begin(r_uint128(1), r_int64(1))
+    rb2.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb2.put_int(r_int64(10))
     rb2.commit()
 
@@ -1010,7 +1011,7 @@ def test_join_delta_trace_multi_match(base_dir):
     for payload_val in [100, 200, 300]:
         tb = batch.ArenaZSetBatch(schema_r)
         rb_t = RowBuilder(schema_r, tb)
-        rb_t.begin(r_uint128(42), r_int64(1))
+        rb_t.begin(r_uint64(42), r_uint64(0), r_int64(1))
         rb_t.put_int(r_int64(payload_val))
         rb_t.commit()
         trace_table.ingest_batch(tb)
@@ -1035,11 +1036,11 @@ def test_join_delta_trace_multi_match(base_dir):
     in_batch = batch.ArenaZSetBatch(schema_l)
     rb_l = RowBuilder(schema_l, in_batch)
 
-    rb_l.begin(r_uint128(42), r_int64(2))
+    rb_l.begin(r_uint64(42), r_uint64(0), r_int64(2))
     rb_l.put_int(r_int64(7))
     rb_l.commit()
 
-    rb_l.begin(r_uint128(99), r_int64(0))
+    rb_l.begin(r_uint64(99), r_uint64(0), r_int64(0))
     rb_l.put_int(r_int64(9))
     rb_l.commit()
 
@@ -1093,7 +1094,7 @@ def test_trace_register_refresh_compacts(base_dir):
         while i <= 5:
             b = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, b)
-            rb.begin(r_uint128(i), r_int64(1))
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 10))
             rb.commit()
             tbl.ingest_batch(b)
@@ -1188,15 +1189,15 @@ def test_execute_epoch_seal_deduplicates(base_dir):
     in_batch = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, in_batch)
 
-    rb.begin(r_uint128(1), r_int64(2))
+    rb.begin(r_uint64(1), r_uint64(0), r_int64(2))
     rb.put_int(r_int64(42))
     rb.commit()
 
-    rb.begin(r_uint128(1), r_int64(-1))
+    rb.begin(r_uint64(1), r_uint64(0), r_int64(-1))
     rb.put_int(r_int64(42))
     rb.commit()
 
-    rb.begin(r_uint128(2), r_int64(1))
+    rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(99))
     rb.commit()
 
@@ -1258,7 +1259,7 @@ def test_execute_epoch_seal_free_on_consolidated(base_dir):
     in_batch = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, in_batch)
 
-    rb.begin(r_uint128(5), r_int64(1))
+    rb.begin(r_uint64(5), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(55))
     rb.commit()
 
@@ -1309,7 +1310,7 @@ def test_execute_epoch_evict():
     # Tick 1: pk=1
     in1 = batch.ArenaZSetBatch(schema)
     rb1 = RowBuilder(schema, in1)
-    rb1.begin(r_uint128(1), r_int64(1))
+    rb1.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb1.put_int(r_int64(100))
     rb1.commit()
     result1 = plan.execute_epoch(in1)
@@ -1322,7 +1323,7 @@ def test_execute_epoch_evict():
     # Tick 2: pk=2 — no bleed from tick 1
     in2 = batch.ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, in2)
-    rb2.begin(r_uint128(2), r_int64(1))
+    rb2.begin(r_uint64(2), r_uint64(0), r_int64(1))
     rb2.put_int(r_int64(200))
     rb2.commit()
     result2 = plan.execute_epoch(in2)
@@ -1335,7 +1336,7 @@ def test_execute_epoch_evict():
     # Tick 3: pk=3
     in3 = batch.ArenaZSetBatch(schema)
     rb3 = RowBuilder(schema, in3)
-    rb3.begin(r_uint128(3), r_int64(1))
+    rb3.begin(r_uint64(3), r_uint64(0), r_int64(1))
     rb3.put_int(r_int64(300))
     rb3.commit()
     result3 = plan.execute_epoch(in3)
@@ -1348,7 +1349,7 @@ def test_execute_epoch_evict():
     # Tick 4: pk=4 — confirm fresh internal batch is in place
     in4 = batch.ArenaZSetBatch(schema)
     rb4 = RowBuilder(schema, in4)
-    rb4.begin(r_uint128(4), r_int64(1))
+    rb4.begin(r_uint64(4), r_uint64(0), r_int64(1))
     rb4.put_int(r_int64(400))
     rb4.commit()
     result4 = plan.execute_epoch(in4)
@@ -1358,6 +1359,111 @@ def test_execute_epoch_evict():
     assert_equal_u128(r_uint128(4), result4.get_pk(0), "Evict tick-4: wrong PK")
     result4.free()
 
+    log("  PASSED")
+
+
+# ------------------------------------------------------------------------------
+# Test 18: Reduce MIN with AVI — full group elimination on retraction
+# ------------------------------------------------------------------------------
+
+def test_reduce_min_avi_group_elimination(base_dir):
+    log("[VM] Test 18: Reduce MIN AVI group elimination...")
+
+    # Input schema: (pk:U64, grp:I64, val:I64) — GROUP BY grp[1], MIN(val[2])
+    in_cols = [
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_I64, name="grp"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
+    ]
+    in_schema = types.TableSchema(in_cols, pk_index=0)
+
+    # AGG_MIN on col 2 (val), group_by=[1] (grp — I64, non-pk)
+    agg_func = functions.UniversalAccumulator(2, functions.AGG_MIN, types.TYPE_I64)
+    group_by_cols = [1]
+    # Output: (U128 synthetic PK, I64 grp, I64 agg_val)
+    out_schema = types._build_reduce_output_schema(in_schema, group_by_cols, [agg_func])
+
+    # AVI: EphemeralTable keyed by (av_u64=ordered_val, gc_u64=group_key)
+    avi_dir = os.path.join(base_dir, "min_avi_idx")
+    avi_table = EphemeralTable(avi_dir, "_avidx", make_agg_value_idx_schema())
+    avi = AggValueIndex(avi_table, group_by_cols, in_schema,
+                        agg_col_idx=2, agg_col_type=types.TYPE_I64, for_max=False)
+
+    # trace_out: records last emitted reduce output per group
+    trace_out_dir = os.path.join(base_dir, "min_avi_trace_out")
+    trace_out_table = EphemeralTable(trace_out_dir, "trace_out", out_schema)
+
+    trace_out_cursor = trace_out_table.create_cursor()
+    reg_file = runtime.RegisterFile(3)
+    reg_file.registers[0] = runtime.DeltaRegister(0, in_schema)
+    reg_file.registers[1] = runtime.TraceRegister(1, out_schema, trace_out_cursor, trace_out_table)
+    reg_file.registers[2] = runtime.DeltaRegister(2, out_schema)
+
+    # Program: integrate AVI → reduce (AVI path, no tr_in) → integrate trace_out
+    program = [
+        instructions.integrate_op(reg_file.registers[0], None, agg_value_idx=avi),
+        instructions.reduce_op(
+            reg_file.registers[0],
+            None,                       # no trace_in (AVI replaces it)
+            reg_file.registers[1],      # trace_out
+            reg_file.registers[2],      # output delta
+            group_by_cols,
+            [agg_func],
+            out_schema,
+            agg_value_idx=avi,
+        ),
+        instructions.integrate_op(reg_file.registers[2], trace_out_table),
+        instructions.halt_op(),
+    ]
+
+    plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=2)
+
+    # Tick 1: push (pk=1, grp=1, val=5, w=+1) — group appears with MIN=5
+    in1 = batch.ArenaZSetBatch(in_schema)
+    rb1 = RowBuilder(in_schema, in1)
+    rb1.begin(r_uint64(1), r_uint64(0), r_int64(1))
+    rb1.put_int(r_int64(1))   # grp=1
+    rb1.put_int(r_int64(5))   # val=5
+    rb1.commit()
+
+    result1 = plan.execute_epoch(in1)
+    in1.free()
+
+    assert_true(result1 is not None, "Tick 1: expected output")
+    assert_equal_i(1, result1.length(), "Tick 1: expected 1 output row")
+    acc1 = result1.get_accessor(0)
+    assert_equal_i64(r_int64(1), result1.get_weight(0), "Tick 1: weight should be +1")
+    assert_equal_i64(r_int64(1), acc1.get_int_signed(1), "Tick 1: grp col should be 1")
+    assert_equal_i64(r_int64(5), acc1.get_int_signed(2), "Tick 1: MIN should be 5")
+    result1.free()
+
+    # Tick 2: push (pk=1, grp=1, val=5, w=-1) — full retraction; group must vanish
+    in2 = batch.ArenaZSetBatch(in_schema)
+    rb2 = RowBuilder(in_schema, in2)
+    rb2.begin(r_uint64(1), r_uint64(0), r_int64(-1))
+    rb2.put_int(r_int64(1))   # grp=1
+    rb2.put_int(r_int64(5))   # val=5
+    rb2.commit()
+
+    result2 = plan.execute_epoch(in2)
+    in2.free()
+
+    assert_true(result2 is not None, "Tick 2: expected output (retraction)")
+    # Expect exactly 1 row: the retraction of (grp=1, MIN=5)
+    # NO insertion row (group is empty → agg_func.reset() → is_accumulator_zero())
+    assert_equal_i(1, result2.length(),
+                   "Tick 2: expected exactly 1 row (retraction only, no re-insertion)")
+    acc2 = result2.get_accessor(0)
+    assert_equal_i64(r_int64(-1), result2.get_weight(0),
+                     "Tick 2: only row must be the retraction (w=-1)")
+    assert_equal_i64(r_int64(1), acc2.get_int_signed(1),
+                     "Tick 2: retracted grp col should be 1")
+    assert_equal_i64(r_int64(5), acc2.get_int_signed(2),
+                     "Tick 2: retracted MIN should be 5")
+    result2.free()
+
+    avi_table.close()
+    trace_out_table.close()
     log("  PASSED")
 
 
@@ -1390,6 +1496,7 @@ def entry_point(argv):
         test_execute_epoch_seal_deduplicates(base_dir)
         test_execute_epoch_seal_free_on_consolidated(base_dir)
         test_execute_epoch_evict()
+        test_reduce_min_avi_group_elimination(base_dir)
         os.write(1, "\nALL VM TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

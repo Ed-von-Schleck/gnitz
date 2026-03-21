@@ -73,7 +73,7 @@ def _write_manifest_entry(fd, entry):
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, 192))[0] = rffi.cast(rffi.ULONGLONG, entry.guard_key_lo)
         rffi.cast(rffi.ULONGLONGP, rffi.ptradd(entry_buf, 200))[0] = rffi.cast(rffi.ULONGLONG, entry.guard_key_hi)
 
-        mmap_posix.write_c(fd, entry_buf, rffi.cast(rffi.SIZE_T, ENTRY_SIZE))
+        mmap_posix.write_all(fd, entry_buf, rffi.cast(rffi.SIZE_T, ENTRY_SIZE))
     finally:
         lltype.free(entry_buf, flavor='raw')
 

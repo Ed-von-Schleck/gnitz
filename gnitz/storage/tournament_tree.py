@@ -7,6 +7,8 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib import jit
 from gnitz.core import comparator as core_comparator
 
+MAX_U64 = r_uint64(0xFFFFFFFFFFFFFFFF)
+
 # Struct uses two 64-bit words for the key to avoid r_uint128 struct-alignment
 # bugs and SIGSEGV during property assignment in the translated C code.
 HEAP_NODE = lltype.Struct(
@@ -58,11 +60,8 @@ class TournamentTree(object):
             if cursor.is_valid():
                 idx = self.heap_size
                 self.heap_size += 1
-                key = cursor.peek_key()
-
-                # CRITICAL: Split u128 into u64 components to satisfy alignment.
-                self.heap[idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(key)))
-                self.heap[idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(key >> 64)))
+                self.heap[idx].key_low = rffi.cast(rffi.ULONGLONG, cursor.peek_key_lo())
+                self.heap[idx].key_high = rffi.cast(rffi.ULONGLONG, cursor.peek_key_hi())
                 self.heap[idx].cursor_idx = rffi.cast(rffi.INT, i)
                 self.pos_map[i] = idx
             else:
@@ -71,12 +70,6 @@ class TournamentTree(object):
         if self.heap_size > 1:
             for i in range((self.heap_size // 2) - 1, -1, -1):
                 self._sift_down(i)
-
-    def _get_key(self, idx):
-        """Reconstructs u128 PK from lo/hi storage for comparison."""
-        low = r_uint128(r_uint64(self.heap[idx].key_low))
-        high = r_uint128(r_uint64(self.heap[idx].key_high))
-        return (high << 64) | low
 
     @jit.unroll_safe
     def _compare_nodes(self, i, j):
@@ -149,11 +142,25 @@ class TournamentTree(object):
         self.pos_map[idx_i] = i
         self.pos_map[idx_j] = j
 
+    def get_min_key_lo(self):
+        """Returns the low 64 bits of the global minimum key. MAX_U64 when empty."""
+        if self.heap_size == 0:
+            return MAX_U64
+        return r_uint64(self.heap[0].key_low)
+
+    def get_min_key_hi(self):
+        """Returns the high 64 bits of the global minimum key. MAX_U64 when empty."""
+        if self.heap_size == 0:
+            return MAX_U64
+        return r_uint64(self.heap[0].key_high)
+
     def get_min_key(self):
-        """Returns the Primary Key of the global minimum node."""
+        """Returns the Primary Key of the global minimum node. Backward-compat."""
         if self.heap_size == 0:
             return r_uint128(-1)
-        return self._get_key(0)
+        low = r_uint128(r_uint64(self.heap[0].key_low))
+        high = r_uint128(r_uint64(self.heap[0].key_high))
+        return (high << 64) | low
 
     def get_all_indices_at_min(self):
         """
@@ -223,9 +230,8 @@ class TournamentTree(object):
                 self.heap_size -= 1
         else:
             # Update key and re-sift
-            nk = cursor.peek_key()
-            self.heap[heap_idx].key_low = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(nk)))
-            self.heap[heap_idx].key_high = rffi.cast(rffi.ULONGLONG, r_uint64(intmask(nk >> 64)))
+            self.heap[heap_idx].key_low = rffi.cast(rffi.ULONGLONG, cursor.peek_key_lo())
+            self.heap[heap_idx].key_high = rffi.cast(rffi.ULONGLONG, cursor.peek_key_hi())
             # Only sift_down: cursors yield strictly increasing PKs, so
             # new_key > old_key >= parent_key — the node can only move down.
             self._sift_down(heap_idx)

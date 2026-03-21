@@ -57,7 +57,7 @@ class TestIndexDdl:
             # Verify IdxTab row exists with correct owner_id and source_col_idx
             from gnitz.core import IDX_TAB
             raw = client._client.scan(IDX_TAB)
-            schema_obj, batch_obj = raw
+            schema_obj, batch_obj, _ = raw
             assert batch_obj is not None
             found = False
             tid, _ = client.resolve_table(sn, "t")
@@ -91,7 +91,7 @@ class TestIndexDdl:
             # is_unique flag should be 1 in IdxTab
             from gnitz.core import IDX_TAB
             raw = client._client.scan(IDX_TAB)
-            _, batch_obj = raw
+            _, batch_obj, _ = raw
             assert batch_obj is not None
             tid, _ = client.resolve_table(sn, "t")
             for i in range(len(batch_obj.pk_lo)):
@@ -122,7 +122,7 @@ class TestIndexDdl:
 
             # Verify row is gone from IdxTab
             from gnitz.core import IDX_TAB
-            _, batch_obj = client._client.scan(IDX_TAB)
+            _, batch_obj, _ = client._client.scan(IDX_TAB)
             if batch_obj is not None:
                 tid, _ = client.resolve_table(sn, "t")
                 for i in range(len(batch_obj.pk_lo)):

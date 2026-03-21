@@ -5,7 +5,6 @@ from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import (
     r_int64,
     r_uint64,
-    r_ulonglonglong as r_uint128,
     intmask,
 )
 from rpython.rlib.objectmodel import newlist_hint
@@ -25,7 +24,7 @@ NUM_PARTITIONS = 256
 class _EmptyCursor(AbstractCursor):
     """A cursor that is immediately exhausted. Used when all partitions are closed."""
 
-    def seek(self, key):
+    def seek(self, key_lo, key_hi):
         pass
 
     def advance(self):
@@ -37,8 +36,11 @@ class _EmptyCursor(AbstractCursor):
     def is_exhausted(self):
         return True
 
-    def key(self):
-        return r_uint128(0)
+    def key_lo(self):
+        return r_uint64(0)
+
+    def key_hi(self):
+        return r_uint64(0)
 
     def weight(self):
         return r_int64(0)
@@ -110,38 +112,35 @@ class PartitionedTable(ZSetStore):
             self.partitions[0].ingest_batch(batch)
             return
 
-        # Build per-partition sub-batches (indexed by global partition)
-        sub_batches = [None] * self.num_partitions
         schema = self.schema
+
+        # Pass 1: collect per-partition index lists
+        part_indices = newlist_hint(self.num_partitions)
+        for _p in range(self.num_partitions):
+            part_indices.append(newlist_hint(0))
 
         for i in range(n):
             pk_lo = r_uint64(batch._read_pk_lo(i))
             pk_hi = r_uint64(batch._read_pk_hi(i))
             p = _partition_for_key(pk_lo, pk_hi)
-            sb = sub_batches[p]
-            if sb is None:
-                sb = ArenaZSetBatch(schema)
-                sub_batches[p] = sb
-            sb._direct_append_row(batch, i, batch.get_weight(i))
+            part_indices[p].append(i)
 
-        # Propagate sortedness: subsequences of a sorted sequence are sorted
-        if batch._sorted:
-            p2 = 0
-            while p2 < self.num_partitions:
-                sb = sub_batches[p2]
-                if sb is not None:
-                    sb._sorted = True
-                p2 += 1
-
-        # Ingest owned sub-batches, free all sub-batches
+        # Pass 2: bulk-copy each partition's rows using _copy_rows_indexed_src_weights
+        sorted_flag = batch._sorted
         offset = self.part_offset
         for p in range(self.num_partitions):
-            sb = sub_batches[p]
-            if sb is not None:
-                local = p - offset
-                if 0 <= local < num_live:
-                    self.partitions[local].ingest_batch(sb)
-                sb.free()
+            pidx = part_indices[p]
+            if len(pidx) == 0:
+                continue
+            local = p - offset
+            if local < 0 or local >= num_live:
+                continue
+            sb = ArenaZSetBatch(schema, initial_capacity=len(pidx))
+            sb._copy_rows_indexed_src_weights(batch, pidx)
+            if sorted_flag:
+                sb._sorted = True
+            self.partitions[local].ingest_batch(sb)
+            sb.free()
 
     def create_cursor(self):
         num_live = len(self.partitions)
@@ -156,47 +155,38 @@ class PartitionedTable(ZSetStore):
             cursors.append(self.partitions[local].create_cursor())
         return UnifiedCursor(self.schema, cursors)
 
-    def retract_pk(self, key, out_batch):
+    def retract_pk(self, key_lo, key_hi, out_batch):
         if len(self.partitions) == 0:
             return False
         if self.num_partitions == 1:
-            return self.partitions[0].retract_pk(key, out_batch)
-        r_key = r_uint128(key)
-        pk_lo = r_uint64(intmask(r_key))
-        pk_hi = r_uint64(intmask(r_key >> 64))
-        p = _partition_for_key(pk_lo, pk_hi)
+            return self.partitions[0].retract_pk(key_lo, key_hi, out_batch)
+        p = _partition_for_key(key_lo, key_hi)
         local = p - self.part_offset
         if local < 0 or local >= len(self.partitions):
             return False
-        return self.partitions[local].retract_pk(key, out_batch)
+        return self.partitions[local].retract_pk(key_lo, key_hi, out_batch)
 
-    def has_pk(self, key):
+    def has_pk(self, key_lo, key_hi):
         if len(self.partitions) == 0:
             return False
         if self.num_partitions == 1:
-            return self.partitions[0].has_pk(key)
-        r_key = r_uint128(key)
-        pk_lo = r_uint64(intmask(r_key))
-        pk_hi = r_uint64(intmask(r_key >> 64))
-        p = _partition_for_key(pk_lo, pk_hi)
+            return self.partitions[0].has_pk(key_lo, key_hi)
+        p = _partition_for_key(key_lo, key_hi)
         local = p - self.part_offset
         if local < 0 or local >= len(self.partitions):
             return False
-        return self.partitions[local].has_pk(key)
+        return self.partitions[local].has_pk(key_lo, key_hi)
 
-    def get_weight(self, key, accessor):
+    def get_weight(self, key_lo, key_hi, accessor):
         if len(self.partitions) == 0:
             return r_int64(0)
         if self.num_partitions == 1:
-            return self.partitions[0].get_weight(key, accessor)
-        r_key = r_uint128(key)
-        pk_lo = r_uint64(intmask(r_key))
-        pk_hi = r_uint64(intmask(r_key >> 64))
-        p = _partition_for_key(pk_lo, pk_hi)
+            return self.partitions[0].get_weight(key_lo, key_hi, accessor)
+        p = _partition_for_key(key_lo, key_hi)
         local = p - self.part_offset
         if local < 0 or local >= len(self.partitions):
             return r_int64(0)
-        return self.partitions[local].get_weight(key, accessor)
+        return self.partitions[local].get_weight(key_lo, key_hi, accessor)
 
     def create_child(self, name, schema):
         return self.partitions[0].create_child(name, schema)

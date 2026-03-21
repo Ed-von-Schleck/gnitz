@@ -174,6 +174,16 @@ class Buffer(object):
         self.offset = start + nbytes
         return res
 
+    def alloc_n(self, n, stride, alignment=16):
+        """Pre-allocate n*stride bytes in one shot. Returns base pointer.
+        Converts O(N) Buffer.alloc calls to O(1) for bulk column scatter."""
+        start = self._align(self.offset, alignment)
+        total = n * stride
+        self.ensure_capacity((start - self.offset) + total)
+        res = rffi.ptradd(self.base_ptr, start)
+        self.offset = start + total
+        return res
+
     def put_u64(self, val):
         p = self.alloc(8, alignment=8)
         rffi.cast(rffi.ULONGLONGP, p)[0] = rffi.cast(rffi.ULONGLONG, val)

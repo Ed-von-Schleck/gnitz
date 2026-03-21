@@ -4,12 +4,13 @@
 # receives push/scan requests from the master via a socketpair.
 
 import os
-from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz import log
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
+from gnitz.storage import mmap_posix
 from gnitz.core.batch import ArenaZSetBatch
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import ingest_to_family
@@ -66,6 +67,7 @@ class WorkerProcess(object):
         self.part_start = part_start
         self.part_end = part_end
         self.exchange_handler = WorkerExchangeHandler(master_fd)
+        self.pending_deltas = {}   # table_id (int) -> ArenaZSetBatch
 
     def run(self):
         """Main poll loop. Blocks until master disconnects or sends shutdown."""
@@ -130,13 +132,9 @@ class WorkerProcess(object):
                 batch = payload.batch
                 if batch is not None and batch.length() > 0:
                     self._handle_push(target_id, batch)
-                else:
-                    # Empty push — still need to participate in exchange barriers
-                    family = self.engine.registry.get_by_id(target_id)
-                    empty = ArenaZSetBatch(family.schema)
-                    evaluate_dag(self.engine, target_id, empty,
-                                 exchange_handler=self.exchange_handler)
-                    empty.free()
+                ipc.send_batch(self.master_fd, target_id, None)
+            elif flags & ipc.FLAG_TICK:
+                self._handle_tick(target_id)
                 ipc.send_batch(self.master_fd, target_id, None)
             elif flags & ipc.FLAG_SEEK_BY_INDEX:
                 result = self._handle_seek_by_index(
@@ -169,6 +167,9 @@ class WorkerProcess(object):
         except errors.GnitzError as ge:
             ipc.send_error(self.master_fd, ge.msg)
             return False
+        except mmap_posix.MMapError:
+            ipc.send_error(self.master_fd, "I/O write error")
+            return False
         except OSError as oe:
             os.write(2,
                 "W" + str(self.worker_id) + " OSError errno=" + str(oe.errno) + "\n"
@@ -186,21 +187,50 @@ class WorkerProcess(object):
                 payload.close()
 
     def _handle_push(self, target_id, batch):
-        """Ingest batch into the local partition store, flush, and evaluate DAG."""
+        """Ingest batch into the local partition store and flush.
+        System tables (DDL) evaluate immediately; user tables accumulate until FLAG_TICK."""
         family = self.engine.registry.get_by_id(target_id)
-        # FK validation was done by the master before fan_out_push.
+        # FK validation was done by the master before fan_out_ingest.
         # ingest_to_family is partition-local ZSet algebra — correct for workers.
         effective = ingest_to_family(family, batch)
         family.store.flush()
-        evaluate_dag(self.engine, target_id, effective,
-                     exchange_handler=self.exchange_handler)
-        if effective is not batch:
-            effective.free()
+        if target_id < sys.FIRST_USER_TABLE_ID:
+            # System tables must fire DDL hooks (TableEffectHook) immediately so
+            # that newly created tables are registered before user pushes arrive.
+            evaluate_dag(self.engine, target_id, effective,
+                         exchange_handler=self.exchange_handler)
+            if effective is not batch:
+                effective.free()
+        else:
+            if target_id in self.pending_deltas:
+                self.pending_deltas[target_id].append_batch(effective)
+                if effective is not batch:
+                    effective.free()
+            else:
+                if effective is not batch:
+                    self.pending_deltas[target_id] = effective   # take ownership
+                else:
+                    self.pending_deltas[target_id] = effective.clone()  # must clone
         log.debug(
             "W" + str(self.worker_id)
             + " push tid=" + str(target_id)
             + " rows=" + str(batch.length())
         )
+
+    def _handle_tick(self, target_id):
+        """Pop accumulated delta and run evaluate_dag."""
+        if target_id in self.pending_deltas:
+            delta = self.pending_deltas[target_id]
+            del self.pending_deltas[target_id]
+        else:
+            if not self.engine.registry.has_id(target_id):
+                # Table was dropped before tick arrived; nothing to evaluate.
+                return
+            family = self.engine.registry.get_by_id(target_id)
+            delta = ArenaZSetBatch(family.schema)
+        evaluate_dag(self.engine, target_id, delta,
+                     exchange_handler=self.exchange_handler)
+        delta.free()
 
     def _handle_has_pk(self, target_id, batch, col_hint):
         """Check PK existence for FK / unique-index validation. Responds with weights 1/0.
@@ -231,8 +261,7 @@ class WorkerProcess(object):
         result = ArenaZSetBatch(schema)
         n = batch.length() if batch is not None else 0
         for i in range(n):
-            pk = batch.get_pk(i)
-            exists = store.has_pk(pk)
+            exists = store.has_pk(batch.get_pk_lo(i), batch.get_pk_hi(i))
             w = r_int64(1) if exists else r_int64(0)
             result._direct_append_row(batch, i, w)
         ipc.send_batch(self.master_fd, target_id, result, schema=schema)
@@ -248,9 +277,8 @@ class WorkerProcess(object):
             while cursor.is_valid():
                 w = cursor.weight()
                 if w > r_int64(0):
-                    pk = cursor.key()
                     acc = cursor.get_accessor()
-                    result.append_from_accessor(r_uint128(pk), w, acc)
+                    result.append_from_accessor(cursor.key_lo(), cursor.key_hi(), w, acc)
                 cursor.advance()
         finally:
             cursor.close()
@@ -265,21 +293,18 @@ class WorkerProcess(object):
         """Point lookup by primary key on this worker's local partitions."""
         family = self.engine.registry.get_by_id(target_id)
         cursor = family.store.create_cursor()
-        key = r_uint128(
-            (r_uint128(r_uint64(pk_hi_raw)) << 64) | r_uint128(r_uint64(pk_lo_raw))
-        )
         try:
-            cursor.seek(key)
+            cursor.seek(r_uint64(pk_lo_raw), r_uint64(pk_hi_raw))
             if not cursor.is_valid():
                 return None
-            if cursor.key() != key:
+            if cursor.key_lo() != r_uint64(pk_lo_raw) or cursor.key_hi() != r_uint64(pk_hi_raw):
                 return None
             w = cursor.weight()
             if w <= r_int64(0):
                 return None
             result = ArenaZSetBatch(family.schema, initial_capacity=1)
             acc = cursor.get_accessor()
-            result.append_from_accessor(key, w, acc)
+            result.append_from_accessor(r_uint64(pk_lo_raw), r_uint64(pk_hi_raw), w, acc)
             return result
         finally:
             cursor.close()
@@ -295,22 +320,19 @@ class WorkerProcess(object):
         if circuit is None:
             return None
 
-        key = r_uint128(
-            (r_uint128(r_uint64(key_hi)) << 64) | r_uint128(r_uint64(key_lo))
-        )
         idx_cursor = circuit.table.create_cursor()
         try:
-            idx_cursor.seek(key)
-            if not idx_cursor.is_valid() or idx_cursor.key() != key:
+            idx_cursor.seek(r_uint64(key_lo), r_uint64(key_hi))
+            if not idx_cursor.is_valid() or idx_cursor.key_lo() != r_uint64(key_lo) or idx_cursor.key_hi() != r_uint64(key_hi):
                 return None
             if circuit.source_pk_type.code == TYPE_U128.code:
-                source_pk = idx_cursor.get_accessor().get_u128(1)
+                source_pk_lo = idx_cursor.get_accessor().get_u128_lo(1)
+                source_pk_hi = idx_cursor.get_accessor().get_u128_hi(1)
             else:
-                source_pk = r_uint128(
-                    r_uint64(intmask(idx_cursor.get_accessor().get_int(1)))
-                )
-            src_lo = intmask(r_uint64(intmask(source_pk)))
-            src_hi = intmask(r_uint64(intmask(source_pk >> 64)))
+                source_pk_lo = r_uint64(intmask(idx_cursor.get_accessor().get_int(1)))
+                source_pk_hi = r_uint64(0)
+            src_lo = intmask(source_pk_lo)
+            src_hi = intmask(source_pk_hi)
         finally:
             idx_cursor.close()
         return self._handle_seek(target_id, src_lo, src_hi)
@@ -327,9 +349,8 @@ class WorkerProcess(object):
             while cursor.is_valid():
                 w = cursor.weight()
                 if w > r_int64(0):
-                    pk = cursor.key()
                     acc = cursor.get_accessor()
-                    local_batch.append_from_accessor(r_uint128(pk), w, acc)
+                    local_batch.append_from_accessor(cursor.key_lo(), cursor.key_hi(), w, acc)
                 cursor.advance()
         finally:
             cursor.close()

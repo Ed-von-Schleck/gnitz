@@ -211,14 +211,15 @@ pub fn execute_select(
     let (tid, schema) = binder.resolve(&table_name)?;
 
     // Check WHERE clause
-    let (schema_out, batch_opt) = if let Some(where_expr) = &select.selection {
+    let (schema_out, batch_opt, _) = if let Some(where_expr) = &select.selection {
         if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
             client.seek(tid, pk_lo, pk_hi)?
         } else if let Some((col_idx, key_lo, key_hi, residual)) =
             try_extract_index_seek(where_expr, &schema, binder, tid, false)?
         {
-            let result = client.seek_by_index(tid, col_idx as u64, key_lo, key_hi)?;
-            apply_residual_filter(result, residual.as_ref(), &schema)?
+            let (s, b, lsn) = client.seek_by_index(tid, col_idx as u64, key_lo, key_hi)?;
+            let (s2, b2) = apply_residual_filter((s, b), residual.as_ref(), &schema)?;
+            (s2, b2, lsn)
         } else {
             return Err(GnitzSqlError::Unsupported(
                 "WHERE on non-indexed column not supported in direct SELECT; \
@@ -779,7 +780,7 @@ pub fn execute_update(
     if let Some(where_expr) = selection {
         // Path 1: PK equality
         if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
-            let (schema_opt, batch_opt) = client.seek(table_id, pk_lo, pk_hi)?;
+            let (schema_opt, batch_opt, _) = client.seek(table_id, pk_lo, pk_hi)?;
             let current = match batch_opt {
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
                 Some(b) if b.pk_lo.is_empty() => return Ok(SqlResult::RowsAffected { count: 0 }),
@@ -796,7 +797,7 @@ pub fn execute_update(
         if let Some((col_idx, key_lo, key_hi, residual)) =
             try_extract_index_seek(where_expr, &schema, binder, table_id, true)?
         {
-            let (schema_opt, batch_opt) =
+            let (schema_opt, batch_opt, _) =
                 client.seek_by_index(table_id, col_idx as u64, key_lo, key_hi)?;
             let current = match batch_opt {
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
@@ -817,7 +818,7 @@ pub fn execute_update(
 
         // Path 3: Full scan with predicate
         let pred = binder.bind_expr(where_expr, &schema)?;
-        let (schema_opt, batch_opt) = client.scan(table_id)?;
+        let (schema_opt, batch_opt, _) = client.scan(table_id)?;
         let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
         let mut updates = ZSetBatch::new(actual_schema);
         let mut count = 0usize;
@@ -833,7 +834,7 @@ pub fn execute_update(
     }
 
     // Path 4: No WHERE — update all rows
-    let (schema_opt, batch_opt) = client.scan(table_id)?;
+    let (schema_opt, batch_opt, _) = client.scan(table_id)?;
     let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
     let mut updates = ZSetBatch::new(actual_schema);
     match batch_opt {
@@ -886,7 +887,7 @@ pub fn execute_delete(
     match &del.selection {
         None => {
             // DELETE all rows
-            let (schema_opt, batch_opt) = client.scan(table_id)?;
+            let (schema_opt, batch_opt, _) = client.scan(table_id)?;
             let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
             let batch = match batch_opt {
                 None => return Ok(SqlResult::RowsAffected { count: 0 }),
@@ -902,7 +903,7 @@ pub fn execute_delete(
         Some(where_expr) => {
             // Path 1: PK equality — seek first for accurate count
             if let Some((pk_lo, pk_hi)) = try_extract_pk_seek(where_expr, &schema) {
-                let (schema_opt, batch_opt) = client.seek(table_id, pk_lo, pk_hi)?;
+                let (schema_opt, batch_opt, _) = client.seek(table_id, pk_lo, pk_hi)?;
                 let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
                 let exists = batch_opt.map_or(false, |b| !b.pk_lo.is_empty());
                 if !exists { return Ok(SqlResult::RowsAffected { count: 0 }); }
@@ -921,7 +922,7 @@ pub fn execute_delete(
             if let Some((col_idx, key_lo, key_hi, residual)) =
                 try_extract_index_seek(where_expr, &schema, binder, table_id, true)?
             {
-                let (schema_opt, batch_opt) =
+                let (schema_opt, batch_opt, _) =
                     client.seek_by_index(table_id, col_idx as u64, key_lo, key_hi)?;
                 let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
                 let batch = match batch_opt {
@@ -940,7 +941,7 @@ pub fn execute_delete(
 
             // Path 4: Full scan with predicate
             let pred = binder.bind_expr(where_expr, &schema)?;
-            let (schema_opt, batch_opt) = client.scan(table_id)?;
+            let (schema_opt, batch_opt, _) = client.scan(table_id)?;
             let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
             let mut pks: Vec<(u64, u64)> = Vec::new();
             if let Some(ref scan_batch) = batch_opt {

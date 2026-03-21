@@ -100,7 +100,7 @@ def read_column_defs(cols_pt, owner_id):
     try:
         start_key = r_uint128(sys.pack_column_id(owner_id, 0))
         end_key = r_uint128(sys.pack_column_id(owner_id + 1, 0))
-        cursor.seek(start_key)
+        cursor.seek(r_uint64(intmask(sys.pack_column_id(owner_id, 0))), r_uint64(0))
 
         col_defs = newlist_hint(8)
         while cursor.is_valid() and cursor.key() < end_key:

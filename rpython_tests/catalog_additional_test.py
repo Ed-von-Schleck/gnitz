@@ -94,7 +94,7 @@ def test_index_functional_and_fanout(base_dir):
         b = batch.ArenaZSetBatch(family.schema)
         rb = RowBuilder(family.schema, b)
         for i in range(5):
-            rb.begin(r_uint128(r_uint64(i)), r_int64(1))
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 100))
             rb.commit()
         ingest_to_family(family, b)
@@ -109,7 +109,7 @@ def test_index_functional_and_fanout(base_dir):
         # Live fan-out test (Verify the 3-stage ingestion pipeline)
         b2 = batch.ArenaZSetBatch(family.schema)
         rb2 = RowBuilder(family.schema, b2)
-        rb2.begin(r_uint128(r_uint64(99)), r_int64(1))
+        rb2.begin(r_uint64(99), r_uint64(0), r_int64(1))
         rb2.put_int(r_int64(777))
         rb2.commit()
         ingest_to_family(family, b2)
@@ -184,7 +184,7 @@ def test_schema_mr_poisoning():
     s3 = core_types.merge_schemas_for_join(s1, s2)
     b = batch.ArenaZSetBatch(s3)
     rb = RowBuilder(s3, b)
-    rb.begin(r_uint128(r_uint64(0)), r_int64(1))
+    rb.begin(r_uint64(0), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(123))
     rb.commit()
 
@@ -221,7 +221,7 @@ def test_sequence_gap_recovery(base_dir):
         tbl_sys = engine.sys.tables
         b = batch.ArenaZSetBatch(tbl_sys.schema)
         rb = RowBuilder(tbl_sys.schema, b)
-        rb.begin(r_uint128(r_uint64(250)), r_int64(1))
+        rb.begin(r_uint64(250), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(2))  # sid public
         rb.put_string("gap_table")
         rb.put_string(db_path + "/gap")
@@ -293,7 +293,7 @@ def test_fk_referential_integrity(base_dir):
         # 3. Insert valid parent (PK-only schema, no payload columns)
         pb = batch.ArenaZSetBatch(parent.schema)
         rb_p = RowBuilder(parent.schema, pb)
-        rb_p.begin(r_uint128(r_uint64(10)), r_int64(1))
+        rb_p.begin(r_uint64(10), r_uint64(0), r_int64(1))
         rb_p.commit()
         ingest_to_family(parent, pb)
         pb.free()
@@ -301,7 +301,7 @@ def test_fk_referential_integrity(base_dir):
         # 4. Insert valid child
         cb = batch.ArenaZSetBatch(child.schema)
         rb_c = RowBuilder(child.schema, cb)
-        rb_c.begin(r_uint128(r_uint64(1)), r_int64(1))
+        rb_c.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_c.put_int(r_int64(10))  # Valid pid
         rb_c.commit()
         validate_fk_inline(child, cb)
@@ -311,7 +311,7 @@ def test_fk_referential_integrity(base_dir):
         # 5. Insert INVALID child (pid 99 does not exist)
         cb2 = batch.ArenaZSetBatch(child.schema)
         rb_c2 = RowBuilder(child.schema, cb2)
-        rb_c2.begin(r_uint128(r_uint64(2)), r_int64(1))
+        rb_c2.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_c2.put_int(r_int64(99))
         rb_c2.commit()
 
@@ -342,17 +342,16 @@ def test_fk_referential_integrity(base_dir):
         ]
         u_child = engine.create_table("public.uchildren", u_child_cols, 0)
 
-        uuid_val = (r_uint128(0xAAAA) << 64) | r_uint128(0xBBBB)
         upb = batch.ArenaZSetBatch(u_parent.schema)
         rb_up = RowBuilder(u_parent.schema, upb)
-        rb_up.begin(uuid_val, r_int64(1))
+        rb_up.begin(r_uint64(0xBBBB), r_uint64(0xAAAA), r_int64(1))
         rb_up.commit()
         ingest_to_family(u_parent, upb)
         upb.free()
 
         ucb = batch.ArenaZSetBatch(u_child.schema)
         rb_uc = RowBuilder(u_child.schema, ucb)
-        rb_uc.begin(r_uint128(r_uint64(1)), r_int64(1))
+        rb_uc.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_uc.put_u128(r_uint64(0xBBBB), r_uint64(0xAAAA))
         rb_uc.commit()
         validate_fk_inline(u_child, ucb)
@@ -396,7 +395,7 @@ def test_fk_nullability_and_retractions(base_dir):
         # 1. Insert NULL FK (Should be allowed even if parent is empty)
         cb = batch.ArenaZSetBatch(child.schema)
         rb = RowBuilder(child.schema, cb)
-        rb.begin(r_uint128(r_uint64(1)), r_int64(1))
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_null()
         rb.commit()
         validate_fk_inline(child, cb)
@@ -407,7 +406,7 @@ def test_fk_nullability_and_retractions(base_dir):
         # Ingesting a retraction for a non-existent parent should NOT trigger FK check
         cb2 = batch.ArenaZSetBatch(child.schema)
         rb2 = RowBuilder(child.schema, cb2)
-        rb2.begin(r_uint128(r_uint64(2)), r_int64(-1))
+        rb2.begin(r_uint64(2), r_uint64(0), r_int64(-1))
         rb2.put_int(r_int64(999))  # Non-existent
         rb2.commit()
         validate_fk_inline(child, cb2)
@@ -542,7 +541,7 @@ def test_fk_self_reference(base_dir):
         # 1. Ingest Manager first (Commit required for FK check)
         b1 = batch.ArenaZSetBatch(emp.schema)
         rb1 = RowBuilder(emp.schema, b1)
-        rb1.begin(r_uint128(r_uint64(1)), r_int64(1))
+        rb1.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb1.put_null()
         rb1.commit()
         ingest_to_family(emp, b1)
@@ -551,7 +550,7 @@ def test_fk_self_reference(base_dir):
         # 2. Ingest Subordinate referencing the Manager
         b2 = batch.ArenaZSetBatch(emp.schema)
         rb2 = RowBuilder(emp.schema, b2)
-        rb2.begin(r_uint128(r_uint64(2)), r_int64(1))
+        rb2.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb2.put_int(r_int64(1))  # Refers to emp_id 1
         rb2.commit()
         ingest_to_family(emp, b2)
@@ -595,7 +594,7 @@ def test_view_backfill_simple(base_dir):
         b = batch.ArenaZSetBatch(family.schema)
         rb = RowBuilder(family.schema, b)
         for i in range(5):
-            rb.begin(r_uint128(r_uint64(i)), r_int64(1))
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 10))
             rb.commit()
         ingest_to_family(family, b)
@@ -611,7 +610,7 @@ def test_view_backfill_simple(base_dir):
 
         b2 = batch.ArenaZSetBatch(family.schema)
         rb2 = RowBuilder(family.schema, b2)
-        rb2.begin(r_uint128(r_uint64(99)), r_int64(1))
+        rb2.begin(r_uint64(99), r_uint64(0), r_int64(1))
         rb2.put_int(r_int64(999))
         rb2.commit()
         effective2 = ingest_to_family(family, b2)
@@ -648,7 +647,7 @@ def test_view_backfill_on_restart(base_dir):
         b = batch.ArenaZSetBatch(family.schema)
         rb = RowBuilder(family.schema, b)
         for i in range(5):
-            rb.begin(r_uint128(r_uint64(i)), r_int64(1))
+            rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 10))
             rb.commit()
         ingest_to_family(family, b)
@@ -687,7 +686,7 @@ def test_view_on_view_backfill_on_restart(base_dir):
         b = batch.ArenaZSetBatch(t.schema)
         rb = RowBuilder(t.schema, b)
         for val in [5, 20, 50, 80, 100]:
-            rb.begin(r_uint128(r_uint64(val)), r_int64(1))
+            rb.begin(r_uint64(val), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(val))
             rb.commit()
         ingest_to_family(t, b)

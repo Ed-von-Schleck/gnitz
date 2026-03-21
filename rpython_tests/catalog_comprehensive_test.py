@@ -578,7 +578,7 @@ def _make_upk_row(schema, pk, val, w):
     from gnitz.core.batch import ArenaZSetBatch, RowBuilder
     b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
-    rb.begin(r_uint128(r_uint64(pk)), r_int64(w))
+    rb.begin(r_uint64(pk), r_uint64(0), r_int64(w))
     rb.put_int(r_int64(val))
     rb.commit()
     return b
@@ -667,10 +667,10 @@ def test_enforce_unique_pk(base_dir):
         # Sub-test 5: intra-batch duplicate insert → last value wins
         b5 = ArenaZSetBatch(schema)
         rb5 = RowBuilder(schema, b5)
-        rb5.begin(r_uint128(r_uint64(5)), r_int64(1))
+        rb5.begin(r_uint64(5), r_uint64(0), r_int64(1))
         rb5.put_int(r_int64(10))
         rb5.commit()
-        rb5.begin(r_uint128(r_uint64(5)), r_int64(1))
+        rb5.begin(r_uint64(5), r_uint64(0), r_int64(1))
         rb5.put_int(r_int64(20))
         rb5.commit()
         out5 = _enforce_unique_pk(family, b5)
@@ -694,10 +694,10 @@ def test_enforce_unique_pk(base_dir):
         # Sub-test 6: intra-batch insert then delete → cancel each other
         b6 = ArenaZSetBatch(schema)
         rb6 = RowBuilder(schema, b6)
-        rb6.begin(r_uint128(r_uint64(6)), r_int64(1))
+        rb6.begin(r_uint64(6), r_uint64(0), r_int64(1))
         rb6.put_int(r_int64(10))
         rb6.commit()
-        rb6.begin(r_uint128(r_uint64(6)), r_int64(-1))
+        rb6.begin(r_uint64(6), r_uint64(0), r_int64(-1))
         rb6.put_int(r_int64(10))
         rb6.commit()
         out6 = _enforce_unique_pk(family, b6)
@@ -745,7 +745,7 @@ def test_restart(base_dir):
     # Ingest data into the persistent table
     batch1 = batch.ArenaZSetBatch(table1.schema)
     rb = RowBuilder(table1.schema, batch1)
-    rb.begin(r_uint128(r_uint64(42)), r_int64(1))
+    rb.begin(r_uint64(42), r_uint64(0), r_int64(1))
     rb.put_string("Gnitz-O-Matic")
     rb.commit()
     table1.store.ingest_batch(batch1)

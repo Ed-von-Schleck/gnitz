@@ -8,7 +8,9 @@ from gnitz.core import types
 from gnitz.core.store import AbstractCursor
 from gnitz.storage import tournament_tree, comparator
 from gnitz.core import comparator as core_comparator
-from gnitz.core.batch import ColumnarBatchAccessor
+from gnitz.core.batch import ColumnarBatchAccessor, pk_lt
+
+MAX_U64 = r_uint64(0xFFFFFFFFFFFFFFFF)
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
@@ -22,13 +24,16 @@ class BaseCursor(AbstractCursor):
     def __init__(self):
         pass
 
-    def seek(self, target_key):
+    def seek(self, key_lo, key_hi):
         raise NotImplementedError
 
     def advance(self):
         raise NotImplementedError
 
-    def key(self):
+    def key_lo(self):
+        raise NotImplementedError
+
+    def key_hi(self):
         raise NotImplementedError
 
     def weight(self):
@@ -60,12 +65,12 @@ class SortedBatchCursor(BaseCursor):
         self._pos = 0
         self.accessor = ColumnarBatchAccessor(batch._schema)
 
-    def seek(self, target_key):
+    def seek(self, key_lo, key_hi):
         lo = 0
         hi = self._batch.length()
         while lo < hi:
             mid = (lo + hi) >> 1
-            if self._batch.get_pk(mid) < target_key:
+            if pk_lt(self._batch.get_pk_lo(mid), self._batch.get_pk_hi(mid), key_lo, key_hi):
                 lo = mid + 1
             else:
                 hi = mid
@@ -77,10 +82,25 @@ class SortedBatchCursor(BaseCursor):
     def is_valid(self):
         return self._pos < self._batch.length()
 
-    def key(self):
+    def key_lo(self):
         if self._pos >= self._batch.length():
-            return r_uint128(-1)
-        return self._batch.get_pk(self._pos)
+            return MAX_U64
+        return self._batch.get_pk_lo(self._pos)
+
+    def key_hi(self):
+        if self._pos >= self._batch.length():
+            return MAX_U64
+        return self._batch.get_pk_hi(self._pos)
+
+    def peek_key_lo(self):
+        if self._pos < self._batch.length():
+            return self._batch.get_pk_lo(self._pos)
+        return r_uint64(0)
+
+    def peek_key_hi(self):
+        if self._pos < self._batch.length():
+            return self._batch.get_pk_hi(self._pos)
+        return r_uint64(0)
 
     def weight(self):
         if self._pos >= self._batch.length():
@@ -90,11 +110,6 @@ class SortedBatchCursor(BaseCursor):
     def get_accessor(self):
         self.accessor.bind(self._batch, self._pos)
         return self.accessor
-
-    def peek_key(self):
-        if self._pos < self._batch.length():
-            return self._batch.get_pk(self._pos)
-        return r_uint128(0)
 
     def is_exhausted(self):
         return self._pos >= self._batch.length()
@@ -150,12 +165,12 @@ class MemTableCursor(BaseCursor):
         self._pos = 0
         self._accessor = ColumnarBatchAccessor(memtable.schema)
 
-    def seek(self, target_key):
+    def seek(self, key_lo, key_hi):
         lo = 0
         hi = self._snapshot.length()
         while lo < hi:
             mid = (lo + hi) >> 1
-            if self._snapshot.get_pk(mid) < target_key:
+            if pk_lt(self._snapshot.get_pk_lo(mid), self._snapshot.get_pk_hi(mid), key_lo, key_hi):
                 lo = mid + 1
             else:
                 hi = mid
@@ -167,10 +182,25 @@ class MemTableCursor(BaseCursor):
     def is_valid(self):
         return self._pos < self._snapshot.length()
 
-    def key(self):
+    def key_lo(self):
         if self._pos >= self._snapshot.length():
-            return r_uint128(-1)
-        return self._snapshot.get_pk(self._pos)
+            return MAX_U64
+        return self._snapshot.get_pk_lo(self._pos)
+
+    def key_hi(self):
+        if self._pos >= self._snapshot.length():
+            return MAX_U64
+        return self._snapshot.get_pk_hi(self._pos)
+
+    def peek_key_lo(self):
+        if self._pos < self._snapshot.length():
+            return self._snapshot.get_pk_lo(self._pos)
+        return r_uint64(0)
+
+    def peek_key_hi(self):
+        if self._pos < self._snapshot.length():
+            return self._snapshot.get_pk_hi(self._pos)
+        return r_uint64(0)
 
     def weight(self):
         if self._pos >= self._snapshot.length():
@@ -215,8 +245,8 @@ class ShardCursor(BaseCursor):
                 return
             self.position += 1
 
-    def seek(self, target_key):
-        self.position = self.view.find_lower_bound(target_key)
+    def seek(self, key_lo, key_hi):
+        self.position = self.view.find_lower_bound(key_lo, key_hi)
         self._skip_ghosts()
 
     def advance(self):
@@ -225,12 +255,25 @@ class ShardCursor(BaseCursor):
         self.position += 1
         self._skip_ghosts()
 
-    def key(self):
+    def key_lo(self):
         if not self.is_valid():
-            return r_uint128(-1)
-        if self.is_u128:
-            return self.view.get_pk_u128(self.position)
-        return r_uint128(self.view.get_pk_u64(self.position))
+            return MAX_U64
+        return self.view.get_pk_lo(self.position)
+
+    def key_hi(self):
+        if not self.is_valid():
+            return MAX_U64
+        return self.view.get_pk_hi(self.position)
+
+    def peek_key_lo(self):
+        if not self.is_valid():
+            return r_uint64(0)
+        return self.view.get_pk_lo(self.position)
+
+    def peek_key_hi(self):
+        if not self.is_valid():
+            return r_uint64(0)
+        return self.view.get_pk_hi(self.position)
 
     def weight(self):
         if not self.is_valid():
@@ -287,9 +330,8 @@ class UnifiedCursor(AbstractCursor):
         if self.is_single_source:
             cursor = self.cursors[0]
             if cursor.is_valid():
-                k = cursor.key()
-                self._current_key_lo = r_uint64(intmask(k))
-                self._current_key_hi = r_uint64(intmask(k >> 64))
+                self._current_key_lo = cursor.key_lo()
+                self._current_key_hi = cursor.key_hi()
                 self._current_weight = cursor.weight()
                 self._current_accessor = cursor.get_accessor()
                 self._valid = True
@@ -298,9 +340,10 @@ class UnifiedCursor(AbstractCursor):
             return
 
         while not self.tree.is_exhausted():
-            min_key = self.tree.get_min_key()
+            min_key_lo = self.tree.get_min_key_lo()
+            min_key_hi = self.tree.get_min_key_hi()
 
-            if min_key == r_uint128(-1):
+            if min_key_lo == MAX_U64 and min_key_hi == MAX_U64:
                 break
 
             num_candidates = self.tree.get_all_indices_at_min()
@@ -313,8 +356,8 @@ class UnifiedCursor(AbstractCursor):
                 idx += 1
 
             if net_weight != r_int64(0):
-                self._current_key_lo = r_uint64(intmask(min_key))
-                self._current_key_hi = r_uint64(intmask(min_key >> 64))
+                self._current_key_lo = min_key_lo
+                self._current_key_hi = min_key_hi
                 self._current_weight = net_weight
                 self._current_accessor = self.cursors[self.tree._min_indices[0]].get_accessor()
                 self._valid = True
@@ -327,9 +370,9 @@ class UnifiedCursor(AbstractCursor):
 
         self._valid = False
 
-    def seek(self, target_key):
+    def seek(self, key_lo, key_hi):
         for c in self.cursors:
-            c.seek(target_key)
+            c.seek(key_lo, key_hi)
         if not self.is_single_source:
             self.tree.rebuild()
         self._find_next_non_ghost()
@@ -352,8 +395,11 @@ class UnifiedCursor(AbstractCursor):
 
         self._find_next_non_ghost()
 
-    def key(self):
-        return (r_uint128(self._current_key_hi) << 64) | r_uint128(self._current_key_lo)
+    def key_lo(self):
+        return self._current_key_lo
+
+    def key_hi(self):
+        return self._current_key_hi
 
     def weight(self):
         return self._current_weight

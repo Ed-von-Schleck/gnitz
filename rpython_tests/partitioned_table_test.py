@@ -107,7 +107,7 @@ def test_n1_persistent(base_dir):
     b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     for i in range(10):
-        rb.begin(r_uint128(i + 1), r_int64(1))
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i * 100))
         rb.commit()
 
@@ -124,8 +124,8 @@ def test_n1_persistent(base_dir):
     assert_equal_i(10, count, "N=1 scan should see 10 rows")
 
     # has_pk
-    assert_true(store.has_pk(r_uint128(1)), "pk=1 should exist")
-    assert_true(not store.has_pk(r_uint128(999)), "pk=999 should not exist")
+    assert_true(store.has_pk(r_uint64(1), r_uint64(0)), "pk=1 should exist")
+    assert_true(not store.has_pk(r_uint64(999), r_uint64(0)), "pk=999 should not exist")
 
     # flush and re-scan
     store.flush()
@@ -157,8 +157,7 @@ def test_n256_persistent(base_dir):
     b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     for i in range(num_rows):
-        pk = r_uint128(i + 1)
-        rb.begin(pk, r_int64(1))
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i * 10))
         rb.commit()
 
@@ -176,11 +175,10 @@ def test_n256_persistent(base_dir):
 
     # has_pk for each key
     for i in range(num_rows):
-        pk = r_uint128(i + 1)
-        assert_true(store.has_pk(pk), "pk=%d should exist" % (i + 1))
+        assert_true(store.has_pk(r_uint64(i + 1), r_uint64(0)), "pk=%d should exist" % (i + 1))
 
-    assert_true(not store.has_pk(r_uint128(0)), "pk=0 should not exist")
-    assert_true(not store.has_pk(r_uint128(num_rows + 1)),
+    assert_true(not store.has_pk(r_uint64(0), r_uint64(0)), "pk=0 should not exist")
+    assert_true(not store.has_pk(r_uint64(num_rows + 1), r_uint64(0)),
                 "pk=%d should not exist" % (num_rows + 1))
 
     log("  PASSED")
@@ -201,8 +199,7 @@ def test_n256_sorted_output(base_dir):
     b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     for i in range(num_rows):
-        pk = r_uint128(i + 1)
-        rb.begin(pk, r_int64(1))
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i))
         rb.commit()
 
@@ -240,7 +237,7 @@ def test_n256_flush_and_rescan(base_dir):
     b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     for i in range(100):
-        rb.begin(r_uint128(i + 1), r_int64(1))
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i))
         rb.commit()
     store.ingest_batch(b)
@@ -253,7 +250,7 @@ def test_n256_flush_and_rescan(base_dir):
     b2 = ArenaZSetBatch(schema)
     rb2 = RowBuilder(schema, b2)
     for i in range(100, 200):
-        rb2.begin(r_uint128(i + 1), r_int64(1))
+        rb2.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb2.put_int(r_int64(i))
         rb2.commit()
     store.ingest_batch(b2)
@@ -287,7 +284,7 @@ def test_n256_ephemeral(base_dir):
     b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     for i in range(num_rows):
-        rb.begin(r_uint128(i + 1), r_int64(1))
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i))
         rb.commit()
     store.ingest_batch(b)
@@ -319,13 +316,13 @@ def test_create_child(base_dir):
     # child should be usable as a store
     b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
-    rb.begin(r_uint128(42), r_int64(1))
+    rb.begin(r_uint64(42), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(99))
     rb.commit()
     child.ingest_batch(b)
     b.free()
 
-    assert_true(child.has_pk(r_uint128(42)), "child should have pk=42")
+    assert_true(child.has_pk(r_uint64(42), r_uint64(0)), "child should have pk=42")
 
     child.close()
     store.close()
@@ -346,7 +343,7 @@ def test_retract_pk_partitioned(base_dir):
     b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     for i in range(20):
-        rb.begin(r_uint128(i + 1), r_int64(1))
+        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i * 10))
         rb.commit()
     store.ingest_batch(b)
@@ -354,7 +351,7 @@ def test_retract_pk_partitioned(base_dir):
 
     # retract_pk for an existing key
     out = ArenaZSetBatch(schema)
-    result = store.retract_pk(r_uint128(5), out)
+    result = store.retract_pk(r_uint64(5), r_uint64(0), out)
     assert_true(result, "retract_pk partitioned should return True for pk=5")
     assert_equal_i(1, out.length(), "retract_pk partitioned should emit 1 row")
     assert_true(out.get_weight(0) == r_int64(-1), "retract weight should be -1")
@@ -376,7 +373,7 @@ def test_retract_pk_partitioned_absent(base_dir):
     store = make_partitioned_persistent(d, "retract_absent", schema, table_id, NUM_PARTITIONS)
 
     out = ArenaZSetBatch(schema)
-    result = store.retract_pk(r_uint128(12345), out)
+    result = store.retract_pk(r_uint64(12345), r_uint64(0), out)
     assert_true(not result, "retract_pk partitioned absent should return False")
     assert_equal_i(0, out.length(), "retract_pk partitioned absent out should be empty")
     out.free()

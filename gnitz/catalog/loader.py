@@ -147,7 +147,8 @@ class CatalogBootstrapper(object):
                 while cursor.is_valid():
                     if cursor.weight() > 0:
                         batch.append_from_accessor(
-                            cursor.key(),
+                            cursor.key_lo(),
+                            cursor.key_hi(),
                             cursor.weight(),
                             cursor.get_accessor(),
                         )

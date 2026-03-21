@@ -1,7 +1,7 @@
 # gnitz/catalog/hooks.py
 
 import os
-from rpython.rlib.rarithmetic import r_uint64, r_int64, r_ulonglonglong as r_uint128, intmask
+from rpython.rlib.rarithmetic import r_uint64, r_int64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core.errors import LayoutError
@@ -50,9 +50,8 @@ def _backfill_view(engine, vid):
             while cursor.is_valid():
                 w = cursor.weight()
                 if w > r_int64(0):
-                    pk = cursor.key()
                     acc = cursor.get_accessor()
-                    scan_batch.append_from_accessor(r_uint128(pk), w, acc)
+                    scan_batch.append_from_accessor(cursor.key_lo(), cursor.key_hi(), w, acc)
                 cursor.advance()
         finally:
             cursor.close()
