@@ -6,7 +6,7 @@ use crate::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_D
 use crate::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, meta_schema};
 use crate::codec::{schema_to_batch, batch_to_schema};
 use crate::wal_block::{encode_wal_block, decode_wal_block, IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
-use crate::transport::{send_framed, recv_framed};
+use crate::transport::{send_framed_iov, recv_framed};
 
 pub struct Message {
     pub status:       u32,
@@ -206,15 +206,12 @@ pub fn send_message(
         None
     };
 
-    let total = ctrl_block.len()
-        + schema_block.as_ref().map_or(0, |b| b.len())
-        + data_block.as_ref().map_or(0, |b| b.len());
-    let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(&ctrl_block);
-    if let Some(ref sb) = schema_block { buf.extend_from_slice(sb); }
-    if let Some(ref db) = data_block { buf.extend_from_slice(db); }
+    let mut bufs: Vec<&[u8]> = Vec::with_capacity(3);
+    bufs.push(&ctrl_block);
+    if let Some(ref sb) = schema_block { bufs.push(sb); }
+    if let Some(ref db) = data_block { bufs.push(db); }
 
-    send_framed(sock_fd, &buf)
+    send_framed_iov(sock_fd, &bufs)
 }
 
 pub fn recv_message(

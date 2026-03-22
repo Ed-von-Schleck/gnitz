@@ -265,10 +265,6 @@ pub struct PyZSetBatch {
     pub(crate) batch:  ZSetBatch,
 }
 
-fn build_name_to_idx(schema: &Schema) -> HashMap<String, usize> {
-    schema.columns.iter().enumerate().map(|(i, c)| (c.name.clone(), i)).collect()
-}
-
 /// Private helpers — shared between append_row, append_dict, extend_from_dicts.
 impl PyZSetBatch {
     fn append_pk(&mut self, pk_val: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -343,7 +339,6 @@ impl PyZSetBatch {
         &mut self,
         dict: &Bound<'_, PyDict>,
         weight: i64,
-        name_to_idx: &HashMap<String, usize>,
     ) -> PyResult<()> {
         let pk_idx = self.schema.pk_index;
         let pk_name = &self.schema.columns[pk_idx].name;
@@ -369,9 +364,6 @@ impl PyZSetBatch {
             }
         }
         self.batch.nulls.push(nulls);
-
-        // Warn about unknown keys (only if dict has more keys than schema columns)
-        let _ = name_to_idx; // used for validation if needed; kept for future use
         Ok(())
     }
 }
@@ -422,8 +414,7 @@ impl PyZSetBatch {
         values: Bound<'_, PyDict>,
         weight: i64,
     ) -> PyResult<()> {
-        let name_to_idx = build_name_to_idx(&self.schema);
-        self.append_from_dict_inner(&values, weight, &name_to_idx)
+        self.append_from_dict_inner(&values, weight)
     }
 
     /// Append rows from an iterable of dicts. Processes entire batch in one
@@ -434,7 +425,6 @@ impl PyZSetBatch {
         rows: Bound<'_, PyAny>,
         weight: i64,
     ) -> PyResult<()> {
-        let name_to_idx = build_name_to_idx(&self.schema);
         for row_item in rows.try_iter()? {
             let row_item = row_item?;
             let dict: &Bound<'_, PyDict> = row_item.downcast()?;
@@ -442,7 +432,7 @@ impl PyZSetBatch {
                 Some(w) => w.extract::<i64>()?,
                 None => weight,
             };
-            self.append_from_dict_inner(dict, row_weight, &name_to_idx)?;
+            self.append_from_dict_inner(dict, row_weight)?;
         }
         Ok(())
     }
