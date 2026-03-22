@@ -40,7 +40,7 @@ class Connection:
     # DML
 
     def push(self, target_id, batch):
-        return self._client.push(target_id, batch._native_schema, batch._raw)
+        return self._client.push(target_id, batch._raw)
 
     def scan(self, target_id):
         return self._client.scan_lazy(target_id)

@@ -1,63 +1,8 @@
 import gnitz._native as _native
 from gnitz._types import TypeCode, _to_native_schema
 
-
-class Row:
-    __slots__ = ("_fields", "_values", "_weight")
-
-    def __init__(self, fields, values, weight):
-        object.__setattr__(self, "_fields",  fields)
-        object.__setattr__(self, "_values",  values)
-        object.__setattr__(self, "_weight",  weight)
-
-    @property
-    def weight(self):
-        return object.__getattribute__(self, "_weight")
-
-    def __getattr__(self, name):
-        fields = object.__getattribute__(self, "_fields")
-        values = object.__getattribute__(self, "_values")
-        try:
-            return values[fields.index(name)]
-        except ValueError:
-            raise AttributeError(f"Row has no field {name!r}")
-
-    def __getitem__(self, key):
-        fields = object.__getattribute__(self, "_fields")
-        values = object.__getattribute__(self, "_values")
-        if isinstance(key, int):
-            return values[key]
-        try:
-            return values[fields.index(key)]
-        except ValueError:
-            raise KeyError(key)
-
-    def __iter__(self):
-        return iter(object.__getattribute__(self, "_values"))
-
-    def __len__(self):
-        return len(object.__getattribute__(self, "_values"))
-
-    def __repr__(self):
-        fields = object.__getattribute__(self, "_fields")
-        values = object.__getattribute__(self, "_values")
-        weight = object.__getattribute__(self, "_weight")
-        pairs  = ", ".join(f"{f}={v!r}" for f, v in zip(fields, values))
-        return f"Row({pairs}, weight={weight})"
-
-    def __eq__(self, other):
-        if isinstance(other, Row):
-            return (object.__getattribute__(self, "_values") ==
-                    object.__getattribute__(other, "_values"))
-        return NotImplemented
-
-    def _asdict(self):
-        fields = object.__getattribute__(self, "_fields")
-        values = object.__getattribute__(self, "_values")
-        return dict(zip(fields, values))
-
-    def _tuple(self):
-        return tuple(object.__getattribute__(self, "_values"))
+# Row is now a Rust #[pyclass] in _native
+Row = _native.Row
 
 
 class ScanResult:
@@ -102,7 +47,7 @@ class ScanResult:
                     else:
                         values.append(batch.columns[ci][i])
                     payload_idx += 1
-            yield Row(fields, tuple(values), batch.weights[i])
+            yield Row(fields, tuple(values), weight=batch.weights[i])
 
     def __iter__(self):
         return self._iter_rows()
@@ -147,36 +92,8 @@ class ZSetBatch:
         self._raw    = _native.ZSetBatch(self._native_schema)
 
     def append(self, weight=1, **values):
-        schema  = self._schema
-        pk_idx  = schema.pk_index
-        pk_col  = schema.columns[pk_idx]
-        pk_val  = values.get(pk_col.name)
-
-        if pk_val is None:
-            raise ValueError(f"Missing primary key column {pk_col.name!r}")
-
-        if pk_col.type_code == TypeCode.U128:
-            self._raw.pk_lo.append(pk_val & 0xFFFFFFFFFFFFFFFF)
-            self._raw.pk_hi.append((pk_val >> 64) & 0xFFFFFFFFFFFFFFFF)
-        else:
-            self._raw.pk_lo.append(int(pk_val))
-            self._raw.pk_hi.append(0)
-
-        self._raw.weights.append(weight)
-
-        nulls = 0
-        for ci, col in enumerate(schema.columns):
-            if ci == pk_idx:
-                continue
-            payload_idx = ci if ci < pk_idx else ci - 1
-            val = values.get(col.name)
-            if val is None:
-                if not col.is_nullable:
-                    raise ValueError(f"Non-nullable column {col.name!r} cannot be None")
-                nulls |= (1 << payload_idx)
-            self._raw.columns[ci].append(val)
-
-        self._raw.nulls.append(nulls)
+        row = [values.get(col.name) for col in self._schema.columns]
+        self._raw.append_row(row, weight)
         return self
 
     def extend(self, rows, weight=1):
@@ -202,4 +119,4 @@ class ZSetBatch:
     def columns(self): return self._raw.columns
 
     def __len__(self):
-        return len(self._raw.pk_lo)
+        return len(self._raw)

@@ -127,60 +127,240 @@ fn rust_schema_to_py(py: Python<'_>, s: &Schema) -> PyResult<Py<PySchema>> {
 }
 
 // ---------------------------------------------------------------------------
-// ZSetBatch
+// Row — Rust-native row object (replaces the former pure-Python Row class)
 // ---------------------------------------------------------------------------
 
-/// All five fields are Python lists so Python can mutate them in-place,
-/// matching py_client's `batch.pk_lo.append(...)` pattern.
+#[pyclass(name = "Row")]
+pub struct PyRow {
+    fields: Py<PyTuple>,
+    values: Py<PyTuple>,
+    weight: i64,
+}
+
+#[pymethods]
+impl PyRow {
+    #[new]
+    #[pyo3(signature = (fields, values, weight=1))]
+    pub fn new(fields: Bound<'_, PyTuple>, values: Bound<'_, PyTuple>, weight: i64) -> Self {
+        PyRow { fields: fields.unbind(), values: values.unbind(), weight }
+    }
+
+    #[getter]
+    pub fn weight(&self) -> i64 { self.weight }
+
+    pub fn __getattr__(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+        let fields = self.fields.bind(py);
+        let values = self.values.bind(py);
+        for i in 0..fields.len() {
+            if fields.get_item(i)?.extract::<&str>()? == name {
+                return Ok(values.get_item(i)?.unbind());
+            }
+        }
+        Err(pyo3::exceptions::PyAttributeError::new_err(
+            format!("Row has no field {name:?}"),
+        ))
+    }
+
+    pub fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let values = self.values.bind(py);
+        if let Ok(idx) = key.extract::<isize>() {
+            let len = values.len() as isize;
+            let idx = if idx < 0 { idx + len } else { idx };
+            if idx < 0 || idx >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err("index out of range"));
+            }
+            return Ok(values.get_item(idx as usize)?.unbind());
+        }
+        if let Ok(name) = key.extract::<&str>() {
+            let fields = self.fields.bind(py);
+            for i in 0..fields.len() {
+                if fields.get_item(i)?.extract::<&str>()? == name {
+                    return Ok(values.get_item(i)?.unbind());
+                }
+            }
+            return Err(pyo3::exceptions::PyKeyError::new_err(name.to_string()));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err("key must be int or str"))
+    }
+
+    pub fn __iter__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        Ok(self.values.bind(py).as_any().call_method0("__iter__")?.unbind())
+    }
+
+    pub fn __len__(&self, py: Python<'_>) -> usize {
+        self.values.bind(py).len()
+    }
+
+    pub fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let fields = self.fields.bind(py);
+        let values = self.values.bind(py);
+        let mut parts = Vec::with_capacity(fields.len());
+        for i in 0..fields.len() {
+            let field_obj = fields.get_item(i)?;
+            let f: &str = field_obj.extract()?;
+            let v = values.get_item(i)?;
+            parts.push(format!("{}={}", f, v.repr()?));
+        }
+        Ok(format!("Row({}, weight={})", parts.join(", "), self.weight))
+    }
+
+    pub fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        if let Ok(other_row) = other.downcast::<PyRow>() {
+            let other_ref = other_row.borrow();
+            let eq: bool = self.values.bind(py).eq(other_ref.values.bind(py))?;
+            Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind())
+        } else {
+            Ok(py.NotImplemented().into_any())
+        }
+    }
+
+    pub fn _asdict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let fields = self.fields.bind(py);
+        let values = self.values.bind(py);
+        let dict = PyDict::new(py);
+        for i in 0..fields.len() {
+            dict.set_item(fields.get_item(i)?, values.get_item(i)?)?;
+        }
+        Ok(dict.unbind())
+    }
+
+    pub fn _tuple(&self, py: Python<'_>) -> Py<PyTuple> {
+        self.values.clone_ref(py)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZSetBatch — Rust-native storage (write path)
+// ---------------------------------------------------------------------------
+
+/// Stores batch data in Rust Vecs with a cached Schema.
+/// Python's `_batch.py` ZSetBatch.append() calls `append_row()` which writes
+/// directly into Rust storage. `push()` uses the cached schema and batch
+/// without any Python→Rust re-extraction.
 #[pyclass(name = "ZSetBatch")]
 pub struct PyZSetBatch {
-    pub(crate) pk_lo:   Py<PyList>,
-    pub(crate) pk_hi:   Py<PyList>,
-    pub(crate) weights: Py<PyList>,
-    pub(crate) nulls:   Py<PyList>,
-    pub(crate) columns: Py<PyList>,
+    pub(crate) schema: Schema,
+    pub(crate) batch:  ZSetBatch,
 }
 
 #[pymethods]
 impl PyZSetBatch {
-    /// ZSetBatch(schema)  — pre-populates columns with one empty list per column.
     #[new]
     #[pyo3(signature = (schema))]
     pub fn new(py: Python<'_>, schema: PyRef<'_, PySchema>) -> PyResult<Self> {
-        let n_cols = schema.columns.bind(py).len();
-        let col_lists: Vec<PyObject> = (0..n_cols)
-            .map(|_| Ok(PyList::empty(py).unbind().into_any()))
-            .collect::<PyResult<_>>()?;
-        let columns = PyList::new(py, col_lists)?;
-        Ok(PyZSetBatch {
-            pk_lo:   PyList::empty(py).unbind(),
-            pk_hi:   PyList::empty(py).unbind(),
-            weights: PyList::empty(py).unbind(),
-            nulls:   PyList::empty(py).unbind(),
-            columns: columns.unbind(),
-        })
+        let rust_schema = py_schema_to_rust(py, &schema)?;
+        let batch = ZSetBatch::new(&rust_schema);
+        Ok(PyZSetBatch { schema: rust_schema, batch })
     }
 
-    #[getter]
-    pub fn pk_lo<'py>(&self, py: Python<'py>)   -> Bound<'py, PyList> { self.pk_lo.bind(py).clone()   }
-    #[getter]
-    pub fn pk_hi<'py>(&self, py: Python<'py>)   -> Bound<'py, PyList> { self.pk_hi.bind(py).clone()   }
-    #[getter]
-    pub fn weights<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> { self.weights.bind(py).clone() }
-    #[getter]
-    pub fn nulls<'py>(&self, py: Python<'py>)   -> Bound<'py, PyList> { self.nulls.bind(py).clone()   }
-    #[getter]
-    pub fn columns<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> { self.columns.bind(py).clone() }
+    /// Append a row given column-ordered values and a weight.
+    /// Called from Python: `self._raw.append_row([val_per_col...], weight)`
+    /// All type extraction, null tracking, and PK handling happen here in Rust.
+    #[pyo3(signature = (values, weight = 1))]
+    pub fn append_row(
+        &mut self, _py: Python<'_>,
+        values: Bound<'_, PyList>,
+        weight: i64,
+    ) -> PyResult<()> {
+        let n_cols = self.schema.columns.len();
+        if values.len() != n_cols {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Expected {} values, got {}", n_cols, values.len(),
+            )));
+        }
+        let pk_idx = self.schema.pk_index;
+        let pk_item = values.get_item(pk_idx)?;
 
-    #[setter]
-    pub fn set_columns(&mut self, val: Bound<'_, PyList>) {
-        self.columns = val.unbind();
+        // Extract PK
+        if pk_item.is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Missing primary key column {:?}", self.schema.columns[pk_idx].name,
+            )));
+        }
+        if self.schema.columns[pk_idx].type_code == TypeCode::U128 {
+            let pk = pk_item.extract::<u128>()?;
+            self.batch.pk_lo.push(pk as u64);
+            self.batch.pk_hi.push((pk >> 64) as u64);
+        } else {
+            self.batch.pk_lo.push(pk_item.extract::<u64>()?);
+            self.batch.pk_hi.push(0);
+        }
+        self.batch.weights.push(weight);
+
+        // Non-PK columns
+        let mut nulls: u64 = 0;
+        for ci in 0..n_cols {
+            if ci == pk_idx { continue; }
+            let payload_idx = if ci < pk_idx { ci } else { ci - 1 };
+            let val = values.get_item(ci)?;
+
+            if val.is_none() {
+                if !self.schema.columns[ci].is_nullable {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Non-nullable column {:?} cannot be None",
+                        self.schema.columns[ci].name,
+                    )));
+                }
+                nulls |= 1u64 << payload_idx;
+                // Push placeholder for null
+                match &mut self.batch.columns[ci] {
+                    ColData::Fixed(buf) => {
+                        let stride = self.schema.columns[ci].type_code.wire_stride();
+                        buf.extend(std::iter::repeat(0u8).take(stride));
+                    }
+                    ColData::Strings(v) => v.push(None),
+                    ColData::U128s(v) => v.push(0),
+                }
+            } else {
+                match self.schema.columns[ci].type_code {
+                    TypeCode::String => {
+                        if let ColData::Strings(v) = &mut self.batch.columns[ci] {
+                            v.push(Some(val.extract::<String>()?));
+                        }
+                    }
+                    TypeCode::U128 => {
+                        if let ColData::U128s(v) = &mut self.batch.columns[ci] {
+                            v.push(val.extract::<u128>()?);
+                        }
+                    }
+                    tc => {
+                        if let ColData::Fixed(buf) = &mut self.batch.columns[ci] {
+                            write_fixed_le(buf, tc, &val)?;
+                        }
+                    }
+                }
+            }
+        }
+        self.batch.nulls.push(nulls);
+        Ok(())
     }
 
-    pub fn __len__(&self, py: Python<'_>) -> usize { self.pk_lo.bind(py).len() }
+    // Backward-compat getters — materialize Python lists from Rust Vecs on demand.
+    #[getter]
+    pub fn pk_lo(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        Ok(PyList::new(py, &self.batch.pk_lo)?.unbind())
+    }
+    #[getter]
+    pub fn pk_hi(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        Ok(PyList::new(py, &self.batch.pk_hi)?.unbind())
+    }
+    #[getter]
+    pub fn weights(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        Ok(PyList::new(py, &self.batch.weights)?.unbind())
+    }
+    #[getter]
+    pub fn nulls(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        Ok(PyList::new(py, &self.batch.nulls)?.unbind())
+    }
+    #[getter]
+    pub fn columns(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        rust_batch_columns_to_py(py, &self.schema, &self.batch, self.batch.len())
+    }
 
-    pub fn __repr__(&self, py: Python<'_>) -> String {
-        format!("ZSetBatch(len={})", self.pk_lo.bind(py).len())
+    pub fn __len__(&self) -> usize { self.batch.len() }
+
+    pub fn __repr__(&self) -> String {
+        format!("ZSetBatch(len={})", self.batch.len())
     }
 }
 
@@ -223,87 +403,15 @@ fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyObject {
     }
 }
 
-/// Convert a Python ZSetBatch + Schema into a Rust ZSetBatch.
-/// The schema is taken from the `schema` parameter (same as py_client: push takes schema separately).
-fn py_batch_to_rust(
-    py: Python<'_>,
-    py_schema: &PySchema,
-    py_batch:  &PyZSetBatch,
-) -> PyResult<(Schema, ZSetBatch)> {
-    let schema = py_schema_to_rust(py, py_schema)?;
-
-    let pk_lo: Vec<u64> = py_batch.pk_lo.bind(py).iter()
-        .map(|x| x.extract::<u64>()).collect::<PyResult<_>>()?;
-    let pk_hi: Vec<u64> = py_batch.pk_hi.bind(py).iter()
-        .map(|x| x.extract::<u64>()).collect::<PyResult<_>>()?;
-    let weights: Vec<i64> = py_batch.weights.bind(py).iter()
-        .map(|x| x.extract::<i64>()).collect::<PyResult<_>>()?;
-    let nulls: Vec<u64> = py_batch.nulls.bind(py).iter()
-        .map(|x| x.extract::<u64>()).collect::<PyResult<_>>()?;
-
-    let n = pk_lo.len();
-    let col_list = py_batch.columns.bind(py);
-    let mut columns = Vec::with_capacity(schema.columns.len());
-
-    for (ci, col_def) in schema.columns.iter().enumerate() {
-        if ci == schema.pk_index {
-            columns.push(ColData::Fixed(vec![]));
-            continue;
-        }
-        let inner: Bound<'_, PyList> = col_list.get_item(ci)?
-            .downcast_into()
-            .map_err(|_| pyo3::exceptions::PyTypeError::new_err(
-                format!("columns[{ci}] is not a list")))?;
-
-        match col_def.type_code {
-            TypeCode::String => {
-                let mut v = Vec::with_capacity(inner.len());
-                for item in inner.iter() {
-                    if item.is_none() {
-                        v.push(None);
-                    } else {
-                        v.push(Some(item.extract::<String>()?));
-                    }
-                }
-                columns.push(ColData::Strings(v));
-            }
-            TypeCode::U128 => {
-                let v: Vec<u128> = inner.iter()
-                    .map(|x| x.extract::<u128>()).collect::<PyResult<_>>()?;
-                columns.push(ColData::U128s(v));
-            }
-            _ => {
-                let stride = col_def.type_code.wire_stride();
-                let mut buf = Vec::with_capacity(n * stride);
-                for item in inner.iter() {
-                    write_fixed_le(&mut buf, col_def.type_code, &item)?;
-                }
-                columns.push(ColData::Fixed(buf));
-            }
-        }
-    }
-
-    Ok((schema, ZSetBatch { pk_lo, pk_hi, weights, nulls, columns }))
-}
-
-/// Convert a Rust ZSetBatch + Schema into a Python ZSetBatch.
+/// Convert a Rust ZSetBatch + Schema into a Python ZSetBatch (used by non-lazy scan/seek).
 fn rust_batch_to_py(
     py: Python<'_>,
     schema: &Schema,
     batch:  &ZSetBatch,
 ) -> PyResult<Py<PyZSetBatch>> {
-    let pk_lo   = PyList::new(py, &batch.pk_lo)?;
-    let pk_hi   = PyList::new(py, &batch.pk_hi)?;
-    let weights = PyList::new(py, &batch.weights)?;
-    let nulls   = PyList::new(py, &batch.nulls)?;
-    let columns = rust_batch_columns_to_py(py, schema, batch, batch.len())?;
-
     Py::new(py, PyZSetBatch {
-        pk_lo:   pk_lo.unbind(),
-        pk_hi:   pk_hi.unbind(),
-        weights: weights.unbind(),
-        nulls:   nulls.unbind(),
-        columns: columns.bind(py).clone().unbind(),
+        schema: schema.clone(),
+        batch:  batch.clone(),
     })
 }
 
@@ -541,7 +649,7 @@ impl PyScanResult {
             None => (None, PyTuple::empty(py).unbind(), 0),
             Some(d) => (Some(Arc::clone(d)), d.fields.clone_ref(py), d.batch.len()),
         };
-        Ok(PyRowIterator { data: data_clone, fields, row_class: None, row_buf: Vec::new(), pos: 0, len })
+        Ok(PyRowIterator { data: data_clone, fields, row_buf: Vec::new(), pos: 0, len })
     }
 
     fn __len__(&self) -> usize {
@@ -595,11 +703,21 @@ impl PyScanResult {
     }
 
     fn mappings(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let mut iter = self.__iter__(py)?;
+        let data = match &self.data {
+            None => return Ok(PyList::empty(py).unbind()),
+            Some(d) => d,
+        };
         let list = PyList::empty(py);
-        while let Some(row) = iter.__next__(py)? {
-            let dict = row.call_method0(py, "_asdict")?;
-            list.append(dict.bind(py))?;
+        let fields = data.fields.bind(py);
+        let mut row_buf = Vec::new();
+        for i in 0..data.batch.len() {
+            row_buf.clear();
+            build_row_values_into(py, &data.schema, &data.batch, i, &mut row_buf)?;
+            let dict = PyDict::new(py);
+            for (fi, val) in row_buf.iter().enumerate() {
+                dict.set_item(fields.get_item(fi)?, val)?;
+            }
+            list.append(dict)?;
         }
         Ok(list.unbind())
     }
@@ -701,12 +819,11 @@ impl PyScanResult {
 
 #[pyclass]
 pub struct PyRowIterator {
-    data:      Option<Arc<SharedBatchData>>,
-    fields:    Py<PyTuple>,
-    row_class: Option<PyObject>,
-    row_buf:   Vec<PyObject>,
-    pos:       usize,
-    len:       usize,
+    data:    Option<Arc<SharedBatchData>>,
+    fields:  Py<PyTuple>,
+    row_buf: Vec<PyObject>,
+    pos:     usize,
+    len:     usize,
 }
 
 #[pymethods]
@@ -718,21 +835,18 @@ impl PyRowIterator {
             return Ok(None);
         }
         let data = self.data.as_ref().unwrap();
-        // Reuse row_buf across iterations to avoid per-row allocation
         self.row_buf.clear();
         build_row_values_into(py, &data.schema, &data.batch, self.pos, &mut self.row_buf)?;
         let weight = data.batch.weights[self.pos];
         self.pos += 1;
 
-        if self.row_class.is_none() {
-            let batch_mod = py.import("gnitz._batch")?;
-            let cls = batch_mod.getattr("Row")?;
-            self.row_class = Some(cls.unbind());
-        }
-        let row_cls = self.row_class.as_ref().unwrap();
         let values_tuple = PyTuple::new(py, &self.row_buf)?;
-        let row = row_cls.call1(py, (&self.fields, values_tuple, weight))?;
-        Ok(Some(row))
+        let row = Py::new(py, PyRow {
+            fields: self.fields.clone_ref(py),
+            values: values_tuple.unbind(),
+            weight,
+        })?;
+        Ok(Some(row.into_any()))
     }
 }
 
@@ -846,15 +960,13 @@ impl PyGnitzClient {
 
     // ----- DML -----
 
-    /// push(target_id, schema, batch) -> ingest_lsn: int
+    /// push(target_id, batch) -> ingest_lsn: int
     pub fn push(
-        &self, py: Python<'_>,
+        &self, _py: Python<'_>,
         target_id: u64,
-        schema: PyRef<'_, PySchema>,
-        batch:  PyRef<'_, PyZSetBatch>,
+        batch: PyRef<'_, PyZSetBatch>,
     ) -> PyResult<u64> {
-        let (rust_schema, rust_batch) = py_batch_to_rust(py, &schema, &batch)?;
-        client!(self).push(target_id, &rust_schema, &rust_batch)
+        client!(self).push(target_id, &batch.schema, &batch.batch)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 
@@ -1191,6 +1303,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTypeCode>()?;
     m.add_class::<PyColumnDef>()?;
     m.add_class::<PySchema>()?;
+    m.add_class::<PyRow>()?;
     m.add_class::<PyZSetBatch>()?;
     m.add_class::<PyRustBatch>()?;
     m.add_class::<PyScanResult>()?;
