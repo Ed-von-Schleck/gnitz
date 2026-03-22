@@ -1,5 +1,6 @@
 # gnitz/dbsp/ops/distinct.py
 
+from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_int64, intmask
 from gnitz.core.batch import ConsolidatedScope, BatchWriter, pk_eq
 
@@ -44,10 +45,14 @@ def op_distinct(delta_batch, hist_cursor, hist_table, out_writer):
         if n == 0:
             return
 
+        # Pass 1: pure weight logic — only touches structural columns (pk, weight).
+        # No payload access.  Collect emitting row indices and their output weights.
+        emit_indices = newlist_hint(n)
+        emit_weights = newlist_hint(n)
+
         for i in range(n):
             key_lo, key_hi = b.get_pk_lo(i), b.get_pk_hi(i)
             w_delta = b.get_weight(i)
-            accessor = b.get_accessor(i)
 
             hist_cursor.seek(key_lo, key_hi)
             w_old = r_int64(0)
@@ -74,8 +79,14 @@ def op_distinct(delta_batch, hist_cursor, hist_table, out_writer):
 
             out_w = s_new - s_old
             if out_w != 0:
-                out_writer.append_from_accessor(key_lo, key_hi, r_int64(out_w), accessor)
+                emit_indices.append(i)
+                emit_weights.append(r_int64(out_w))
 
+        # Pass 2: column-major payload copy for the emitting rows.
+        # One alloc_n per column; inner loop stays within one source column buffer.
+        # The output is a PK-sorted, duplicate-free subset of a consolidated input,
+        # so it is itself consolidated.
+        out_writer.copy_rows_indexed(b, emit_indices, emit_weights)
         out_writer.mark_consolidated(True)
 
         # Update the history with the consolidated delta before the scope expires.

@@ -1137,6 +1137,28 @@ class BatchWriter(object):
         """Single-row direct column copy (no accessor dispatch)."""
         self._batch._direct_append_row(src_batch, src_idx, weight)
 
+    def copy_rows_indexed(self, src, indices, weights):
+        """Column-major subset copy with computed per-row weights.
+
+        Emit the rows at indices[r] from src with weights[r].  One alloc_n per
+        column replaces one alloc per (row, column) pair; the inner gather loop
+        stays within a single source column buffer per column iteration.
+
+        Prefer over repeated direct_append_row / append_from_accessor whenever
+        the emitting indices are collected before payload is touched (e.g.
+        distinct, where the decision is purely weight arithmetic).
+        """
+        self._batch._copy_rows_indexed(src, indices, weights)
+
+    def copy_rows_indexed_src_weights(self, src, indices):
+        """Column-major subset copy preserving source weights.
+
+        Like copy_rows_indexed but reads each row's weight directly from src,
+        avoiding a separate weights list.  Use when the emitted weight equals
+        the source weight verbatim (e.g. anti-join, semi-join filter passes).
+        """
+        self._batch._copy_rows_indexed_src_weights(src, indices)
+
     def mark_sorted(self, value):
         self._batch._sorted = value
 

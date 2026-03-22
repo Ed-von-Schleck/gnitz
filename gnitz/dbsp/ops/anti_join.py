@@ -1,5 +1,6 @@
 # gnitz/dbsp/ops/anti_join.py
 
+from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_int64, intmask
 
 from gnitz.core.batch import ConsolidatedScope, pk_lt, pk_eq
@@ -46,6 +47,7 @@ def _anti_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
     if count == 0:
         out_writer.mark_consolidated(True)
         return
+    emit_indices = newlist_hint(count)
     trace_cursor.seek(delta_batch.get_pk_lo(0), delta_batch.get_pk_hi(0))
     for i in range(count):
         d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
@@ -55,9 +57,10 @@ def _anti_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
                     and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi)
                     and trace_cursor.weight() > r_int64(0))
         if not in_trace:
-            out_writer.direct_append_row(delta_batch, i, delta_batch.get_weight(i))
+            emit_indices.append(i)
         if trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
             trace_cursor.advance()   # advance past d_key even for negative-weight trace records
+    out_writer.copy_rows_indexed_src_weights(delta_batch, emit_indices)
     out_writer.mark_consolidated(True)
 
 
@@ -131,6 +134,7 @@ def op_semi_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema)
 def _semi_join_dt_swapped(delta_batch, trace_cursor, out_writer):
     with ConsolidatedScope(delta_batch) as sorted_delta:
         delta_cursor = SortedBatchCursor(sorted_delta)
+        emit_indices = newlist_hint(sorted_delta.length())
         while trace_cursor.is_valid():
             trace_key_lo, trace_key_hi = trace_cursor.key_lo(), trace_cursor.key_hi()
             if trace_cursor.weight() <= r_int64(0):
@@ -140,10 +144,10 @@ def _semi_join_dt_swapped(delta_batch, trace_cursor, out_writer):
                 trace_cursor.advance()
                 continue
             while delta_cursor.is_valid() and pk_eq(delta_cursor.key_lo(), delta_cursor.key_hi(), trace_key_lo, trace_key_hi):
-                w_delta = delta_cursor.weight()
-                out_writer.direct_append_row(sorted_delta, delta_cursor._pos, w_delta)
+                emit_indices.append(delta_cursor._pos)
                 delta_cursor.advance()
             trace_cursor.advance()
+        out_writer.copy_rows_indexed_src_weights(sorted_delta, emit_indices)
     # Caller sets mark_sorted(True).
 
 
@@ -152,6 +156,7 @@ def _semi_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
     if count == 0:
         out_writer.mark_consolidated(True)
         return
+    emit_indices = newlist_hint(count)
     trace_cursor.seek(delta_batch.get_pk_lo(0), delta_batch.get_pk_hi(0))
     for i in range(count):
         d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
@@ -161,9 +166,10 @@ def _semi_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
                     and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi)
                     and trace_cursor.weight() > r_int64(0))
         if in_trace:
-            out_writer.direct_append_row(delta_batch, i, delta_batch.get_weight(i))
+            emit_indices.append(i)
         if trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
             trace_cursor.advance()
+    out_writer.copy_rows_indexed_src_weights(delta_batch, emit_indices)
     out_writer.mark_consolidated(True)
 
 

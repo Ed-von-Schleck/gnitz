@@ -136,28 +136,53 @@ def _op_union_merge(batch_a, batch_b, out_writer):
     n_b = batch_b.length()
     i = 0
     j = 0
+    # Accumulate consecutive rows from the same source into runs, then flush
+    # each run as a single append_batch call (one alloc_n + K memcpy per run
+    # instead of one alloc_n + K memcpy per row).
+    # run_src: 0=batch_a, 1=batch_b, -1=no current run
+    run_src = -1
+    run_a_start = 0
+    run_b_start = 0
     while i < n_a and j < n_b:
         pk_a_lo = batch_a.get_pk_lo(i)
         pk_a_hi = batch_a.get_pk_hi(i)
         pk_b_lo = batch_b.get_pk_lo(j)
         pk_b_hi = batch_b.get_pk_hi(j)
         if pk_lt(pk_a_lo, pk_a_hi, pk_b_lo, pk_b_hi):
-            out_writer.append_batch(batch_a, i, i + 1)
+            if run_src != 0:
+                if run_src == 1:
+                    out_writer.append_batch(batch_b, run_b_start, j)
+                run_src = 0
+                run_a_start = i
             i += 1
         elif pk_lt(pk_b_lo, pk_b_hi, pk_a_lo, pk_a_hi):
-            out_writer.append_batch(batch_b, j, j + 1)
+            if run_src != 1:
+                if run_src == 0:
+                    out_writer.append_batch(batch_a, run_a_start, i)
+                run_src = 1
+                run_b_start = j
             j += 1
         else:
+            # Equal keys: flush current run then emit one row from each source.
+            if run_src == 0:
+                out_writer.append_batch(batch_a, run_a_start, i)
+            elif run_src == 1:
+                out_writer.append_batch(batch_b, run_b_start, j)
+            run_src = -1
             out_writer.append_batch(batch_a, i, i + 1)
             out_writer.append_batch(batch_b, j, j + 1)
             i += 1
             j += 1
-    while i < n_a:
-        out_writer.append_batch(batch_a, i, i + 1)
-        i += 1
-    while j < n_b:
-        out_writer.append_batch(batch_b, j, j + 1)
-        j += 1
+    # Flush the final run from the main loop.
+    if run_src == 0:
+        out_writer.append_batch(batch_a, run_a_start, i)
+    elif run_src == 1:
+        out_writer.append_batch(batch_b, run_b_start, j)
+    # Bulk-copy any remaining rows from the non-exhausted batch.
+    if i < n_a:
+        out_writer.append_batch(batch_a, i, n_a)
+    if j < n_b:
+        out_writer.append_batch(batch_b, j, n_b)
     out_writer.mark_sorted(True)
 
 
