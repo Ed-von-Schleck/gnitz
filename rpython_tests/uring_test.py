@@ -186,6 +186,36 @@ def test_uring_accept_recv(base_dir):
     log("    [OK] accept + recv")
 
 
+def test_uring_submit_timeout():
+    log("[uring] test_uring_submit_timeout...")
+    ring = uring_ffi.uring_create(32)
+    try:
+        # With no pending SQEs and min_complete=1, the timeout path should
+        # return promptly (after timeout_ms) rather than blocking forever.
+        # Submit a NOP first so there's at least one CQE to potentially drain.
+        uring_ffi.uring_prep_nop(ring, r_uint64(0x99))
+        uring_ffi.uring_submit_and_wait_timeout(ring, 1, 100)
+        count, udata, res, flags = uring_ffi.uring_drain(ring, 16)
+        assert_equal_i(1, count, "timeout: NOP drained")
+        assert_equal_u64(r_uint64(0x99), udata[0], "timeout: NOP user_data")
+
+        # Now drain with nothing pending — should return after timeout
+        submitted = uring_ffi.uring_submit_and_wait_timeout(ring, 1, 50)
+        assert_equal_i(0, submitted, "timeout: no SQEs submitted")
+        count2, _, _, _ = uring_ffi.uring_drain(ring, 16)
+        assert_equal_i(0, count2, "timeout: no CQEs after timeout")
+
+        # Non-blocking (timeout_ms=0): should return immediately
+        uring_ffi.uring_prep_nop(ring, r_uint64(0xAA))
+        uring_ffi.uring_submit_and_wait_timeout(ring, 0, 0)
+        count3, udata3, _, _ = uring_ffi.uring_drain(ring, 16)
+        assert_equal_i(1, count3, "timeout: non-blocking NOP drained")
+        assert_equal_u64(r_uint64(0xAA), udata3[0], "timeout: NOP 0xAA")
+    finally:
+        uring_ffi.uring_destroy(ring)
+    log("    [OK] submit_and_wait_timeout")
+
+
 def test_uring_batch_submit():
     log("[uring] test_uring_batch_submit...")
     ring = uring_ffi.uring_create(32)
@@ -242,6 +272,7 @@ def entry_point(argv):
         test_uring_nop()
         test_uring_read_write(base_dir)
         test_uring_accept_recv(base_dir)
+        test_uring_submit_timeout()
         test_uring_batch_submit()
         os.write(1, "\nALL IO_URING FFI TESTS PASSED\n")
     except Exception as e:

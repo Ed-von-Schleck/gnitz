@@ -57,6 +57,7 @@ URING_C_CODE = """
 
 /* Enter flags */
 #define GNITZ_IORING_ENTER_GETEVENTS   (1U << 0)
+#define GNITZ_IORING_ENTER_EXT_ARG     (1U << 3)
 
 /* Feature flags (returned by kernel in params.features) */
 #define GNITZ_IORING_FEAT_SINGLE_MMAP  (1U << 0)
@@ -367,6 +368,61 @@ int gnitz_uring_drain(void *ring,
     store_release_u32(r->cq_head, head);
     return count;
 }
+
+/* ---- Timeout-aware submit (IORING_ENTER_EXT_ARG, kernel 5.11+) ---- */
+
+struct gnitz_kernel_timespec {
+    long long tv_sec;
+    long long tv_nsec;
+};
+
+struct gnitz_io_uring_getevents_arg {
+    uint64_t   sigmask;
+    uint32_t   sigmask_sz;
+    uint32_t   pad;
+    uint64_t   ts;
+};
+
+int gnitz_uring_submit_and_wait_timeout(void *ring, int min_complete,
+                                         int timeout_ms) {
+    struct gnitz_uring *r = (struct gnitz_uring *)ring;
+    uint32_t to_submit = *r->sq_tail - load_acquire_u32(r->sq_head);
+
+    if (min_complete <= 0 && to_submit == 0) return 0;
+
+    if (timeout_ms <= 0) {
+        /* Non-blocking: just submit, no wait */
+        unsigned flags = 0;
+        if (min_complete > 0) flags |= GNITZ_IORING_ENTER_GETEVENTS;
+        int ret;
+        do {
+            ret = (int)syscall(GNITZ_NR_IO_URING_ENTER,
+                               r->ring_fd, to_submit, (unsigned)min_complete,
+                               flags, (void *)0, (size_t)0);
+        } while (ret < 0 && errno == EINTR);
+        return ret < 0 ? -errno : ret;
+    }
+
+    /* Timeout path: use EXT_ARG */
+    struct gnitz_kernel_timespec ts;
+    ts.tv_sec  = timeout_ms / 1000;
+    ts.tv_nsec = (long long)(timeout_ms % 1000) * 1000000LL;
+
+    struct gnitz_io_uring_getevents_arg arg;
+    memset(&arg, 0, sizeof(arg));
+    arg.ts = (uint64_t)(uintptr_t)&ts;
+
+    unsigned flags = GNITZ_IORING_ENTER_GETEVENTS | GNITZ_IORING_ENTER_EXT_ARG;
+    int ret;
+    do {
+        ret = (int)syscall(GNITZ_NR_IO_URING_ENTER,
+                           r->ring_fd, to_submit, (unsigned)min_complete,
+                           flags, &arg, sizeof(arg));
+    } while (ret < 0 && errno == EINTR);
+
+    if (ret < 0 && errno == ETIME) return 0;
+    return ret < 0 ? -errno : ret;
+}
 """
 
 # ---------------------------------------------------------------------------
@@ -385,6 +441,7 @@ eci = ExternalCompilationInfo(
         "int gnitz_uring_prep_write(void *ring, int fd, const char *buf, unsigned int len, unsigned long long offset, unsigned long long user_data);",
         "int gnitz_uring_submit_and_wait(void *ring, int min_complete);",
         "int gnitz_uring_drain(void *ring, void *raw_udata, int *out_res, unsigned int *out_flags, int max);",
+        "int gnitz_uring_submit_and_wait_timeout(void *ring, int min_complete, int timeout_ms);",
     ],
     separate_module_sources=[URING_C_CODE],
     includes=[
@@ -456,6 +513,13 @@ _gnitz_uring_submit_and_wait = rffi.llexternal(
 _gnitz_uring_drain = rffi.llexternal(
     "gnitz_uring_drain",
     [rffi.VOIDP, rffi.VOIDP, rffi.INTP, rffi.UINTP, rffi.INT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_gnitz_uring_submit_and_wait_timeout = rffi.llexternal(
+    "gnitz_uring_submit_and_wait_timeout",
+    [rffi.VOIDP, rffi.INT, rffi.INT],
     rffi.INT,
     compilation_info=eci,
 )
@@ -594,3 +658,20 @@ def uring_drain(ring, max_cqes):
         lltype.free(c_flags, flavor='raw')
 
     return n, udata_list, res_list, flags_list
+
+
+@jit.dont_look_inside
+def uring_submit_and_wait_timeout(ring, min_complete, timeout_ms):
+    """Submit pending SQEs and wait for completions with a timeout.
+
+    Like uring_submit_and_wait but returns after timeout_ms if fewer than
+    min_complete CQEs are available.  Returns the number of SQEs submitted.
+    Returns 0 on timeout (ETIME).  Raises StorageError on real failure.
+    """
+    ret = _gnitz_uring_submit_and_wait_timeout(
+        ring, rffi.cast(rffi.INT, min_complete),
+        rffi.cast(rffi.INT, timeout_ms))
+    r = rffi.cast(lltype.Signed, ret)
+    if r < 0:
+        raise StorageError("io_uring_enter failed (timeout path)")
+    return intmask(r)

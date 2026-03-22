@@ -7,8 +7,9 @@ from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.server import ipc, ipc_ffi
+from gnitz.server import ipc, ipc_ffi, uring_ffi
 from gnitz.core import errors
+from gnitz.storage.buffer import c_memmove
 from gnitz.core.batch import ArenaZSetBatch, BatchWriter
 from gnitz.core.types import TYPE_U128
 from gnitz.catalog import system_tables as sys
@@ -47,6 +48,30 @@ TICK_DEADLINE_MS    = 20      # max ms to wait before firing regardless
 
 STATUS_OK = 0
 STATUS_ERROR = 1
+
+# io_uring user_data encoding: tag (8 bits) | fd (56 bits)
+_TAG_ACCEPT = r_uint64(0x01) << 56
+_TAG_RECV = r_uint64(0x02) << 56
+_TAG_SEND = r_uint64(0x03) << 56
+_TAG_MASK = r_uint64(0xFF) << 56
+_FD_MASK = r_uint64(0x00FFFFFFFFFFFFFF)
+
+# Per-connection state machine states
+_CONN_WAITING_HEADER = 0
+_CONN_WAITING_PAYLOAD = 1
+_CONN_SENDING = 2
+
+
+def _make_udata(tag, fd):
+    return tag | r_uint64(fd)
+
+
+def _udata_tag(udata):
+    return udata & _TAG_MASK
+
+
+def _udata_fd(udata):
+    return intmask(udata & _FD_MASK)
 
 
 def _sort_pending_by_tid(fds, cids, tids, batches, schemas):
@@ -274,16 +299,48 @@ class ServerExecutor(object):
         self._last_tick_lsn     = 0  # ingest_lsn at time of last _fire_pending_ticks()
         self._last_response_lsn = 0  # side-channel from handle_push → _drain_client
 
+        # io_uring state (unused in poll path)
+        self._use_uring = False
+        self._ring = lltype.nullptr(rffi.VOIDP.TO)
+        self._conn_state = {}       # fd -> int (_CONN_WAITING_*)
+        self._conn_hdr_buf = {}     # fd -> rffi.CCHARP (4 bytes, raw)
+        self._conn_hdr_pos = {}     # fd -> int (bytes of header received)
+        self._conn_payload_buf = {} # fd -> rffi.CCHARP (payload, raw)
+        self._conn_payload_len = {} # fd -> int (total expected)
+        self._conn_payload_pos = {} # fd -> int (bytes received)
+        self._send_bufs = {}        # fd -> rffi.CCHARP (framed wire data, raw)
+        self._send_lens = {}        # fd -> int (total bytes)
+        self._send_pos = {}         # fd -> int (bytes sent)
+
     def run_socket_server(self, socket_path):
         server_fd = ipc_ffi.server_create(socket_path)
         if server_fd < 0:
             raise errors.StorageError("Failed to create server socket")
         self.active_fds.append(server_fd)
 
+        ring = lltype.nullptr(rffi.VOIDP.TO)
+        if os.environ.get("GNITZ_FORCE_POLL") != "1":
+            try:
+                ring = uring_ffi.uring_create(256)
+            except errors.StorageError:
+                pass
+
+        if ring:
+            self._use_uring = True
+            self._ring = ring
+            try:
+                self._run_uring_server(ring, server_fd)
+            finally:
+                uring_ffi.uring_destroy(ring)
+                self._use_uring = False
+                self._ring = lltype.nullptr(rffi.VOIDP.TO)
+        else:
+            self._run_poll_server(server_fd)
+
+    def _run_poll_server(self, server_fd):
         while True:
             jit.promote(self.engine)
 
-            # Check for worker crashes (non-blocking)
             if self.dispatcher is not None:
                 crashed = self.dispatcher.check_workers()
                 if crashed >= 0:
@@ -318,7 +375,6 @@ class ServerExecutor(object):
                     timeout_ms = remaining if remaining > 0 else 0
             revents = ipc_ffi.poll(self._poll_fds, self._poll_events, timeout_ms)
 
-            # Phase 1: Drain all ready FDs
             pending_fds = newlist_hint(16)
             pending_cids = newlist_hint(16)
             pending_tids = newlist_hint(16)
@@ -327,10 +383,6 @@ class ServerExecutor(object):
             pending_row_count = 0
 
             # Pass 1: cleanup disconnected clients before accepting new ones.
-            # Without this, if a client disconnects and a new client connects
-            # in the same poll() call, server_fd is processed first (new fd
-            # accepted), then the old POLLHUP fires _cleanup_client on the
-            # same fd number, killing the newly accepted connection.
             for i in range(len(fds)):
                 fd = fds[i]
                 rev = revents[i]
@@ -347,7 +399,7 @@ class ServerExecutor(object):
                 if rev == 0:
                     continue
                 if rev & (ipc_ffi.POLLERR | ipc_ffi.POLLHUP | ipc_ffi.POLLNVAL):
-                    continue  # Already handled in pass 1
+                    continue
                 if rev & ipc_ffi.POLLIN:
                     if fd == server_fd:
                         while True:
@@ -385,7 +437,6 @@ class ServerExecutor(object):
                                 pending_schemas = newlist_hint(16)
                                 pending_row_count = 0
 
-            # Phase 2: Flush remaining buffered pushes
             if len(pending_fds) > 0:
                 self._flush_pending_pushes(
                     pending_fds, pending_cids,
@@ -393,7 +444,7 @@ class ServerExecutor(object):
                     pending_schemas,
                 )
 
-            # Phase 3: Fire deferred ticks if coalesce threshold or deadline reached
+            # Fire deferred ticks if coalesce threshold or deadline reached
             if len(self._tick_tids) > 0:
                 t_now = time.time()
                 should_fire = False
@@ -407,6 +458,421 @@ class ServerExecutor(object):
                         should_fire = True
                 if should_fire:
                     self._fire_pending_ticks()
+
+    # -- io_uring event loop ------------------------------------------------
+
+    def _run_uring_server(self, ring, server_fd):
+        uring_ffi.uring_prep_accept(
+            ring, server_fd, _make_udata(_TAG_ACCEPT, 0))
+
+        pending_fds = newlist_hint(16)
+        pending_cids = newlist_hint(16)
+        pending_tids = newlist_hint(16)
+        pending_batches = newlist_hint(16)
+        pending_schemas = newlist_hint(16)
+        pending_row_count = 0
+
+        while True:
+            jit.promote(self.engine)
+
+            if self.dispatcher is not None:
+                crashed = self.dispatcher.check_workers()
+                if crashed >= 0:
+                    log_path = (
+                        self.engine.base_dir
+                        + "/worker_"
+                        + str(crashed)
+                        + ".log"
+                    )
+                    os.write(
+                        2,
+                        "Worker %d crashed (log: %s), shutting down\n"
+                        % (crashed, log_path),
+                    )
+                    self.dispatcher.shutdown_workers()
+                    return
+
+            timeout_ms = 500
+            if len(self._tick_tids) > 0 and self._t_first_tick > 0.0:
+                elapsed_ms = int((time.time() - self._t_first_tick) * 1000.0)
+                remaining = TICK_DEADLINE_MS - elapsed_ms
+                if remaining < timeout_ms:
+                    timeout_ms = remaining if remaining > 0 else 0
+
+            uring_ffi.uring_submit_and_wait_timeout(ring, 1, timeout_ms)
+            count, udata_list, res_list, flags_list = uring_ffi.uring_drain(
+                ring, 256)
+
+            # Pass 1: cleanup disconnects/errors (fd reuse safety)
+            for i in range(count):
+                tag = _udata_tag(udata_list[i])
+                if tag == _TAG_ACCEPT:
+                    continue
+                if res_list[i] <= 0:
+                    fd = _udata_fd(udata_list[i])
+                    if fd in self._conn_state:
+                        self._cleanup_client(fd)
+
+            # Pass 2: process successful completions
+            for i in range(count):
+                tag = _udata_tag(udata_list[i])
+                res = res_list[i]
+                cqe_flags = flags_list[i]
+
+                if tag == _TAG_ACCEPT:
+                    self._handle_accept_cqe(ring, server_fd, res, cqe_flags)
+                elif tag == _TAG_RECV:
+                    fd = _udata_fd(udata_list[i])
+                    if fd not in self._conn_state:
+                        continue
+                    if res <= 0:
+                        continue
+                    rows = self._handle_recv_cqe(
+                        ring, fd, res,
+                        pending_fds, pending_cids, pending_tids,
+                        pending_batches, pending_schemas,
+                    )
+                    if rows > 0:
+                        pending_row_count += rows
+                        if pending_row_count >= MAX_PENDING_ROWS:
+                            self._flush_pending_pushes(
+                                pending_fds, pending_cids,
+                                pending_tids, pending_batches,
+                                pending_schemas,
+                            )
+                            pending_fds = newlist_hint(16)
+                            pending_cids = newlist_hint(16)
+                            pending_tids = newlist_hint(16)
+                            pending_batches = newlist_hint(16)
+                            pending_schemas = newlist_hint(16)
+                            pending_row_count = 0
+                elif tag == _TAG_SEND:
+                    fd = _udata_fd(udata_list[i])
+                    if fd not in self._conn_state:
+                        continue
+                    if res <= 0:
+                        continue
+                    self._handle_send_cqe(ring, fd, res)
+
+            if len(pending_fds) > 0:
+                self._flush_pending_pushes(
+                    pending_fds, pending_cids,
+                    pending_tids, pending_batches,
+                    pending_schemas,
+                )
+                pending_fds = newlist_hint(16)
+                pending_cids = newlist_hint(16)
+                pending_tids = newlist_hint(16)
+                pending_batches = newlist_hint(16)
+                pending_schemas = newlist_hint(16)
+                pending_row_count = 0
+
+            if len(self._tick_tids) > 0:
+                t_now = time.time()
+                should_fire = False
+                for tid in self._tick_tids:
+                    if self._tick_rows[tid] >= TICK_COALESCE_ROWS:
+                        should_fire = True
+                        break
+                if not should_fire and self._t_first_tick > 0.0:
+                    elapsed_ms = int((t_now - self._t_first_tick) * 1000.0)
+                    if elapsed_ms >= TICK_DEADLINE_MS:
+                        should_fire = True
+                if should_fire:
+                    self._fire_pending_ticks()
+
+    def _handle_accept_cqe(self, ring, server_fd, res, cqe_flags):
+        if res < 0:
+            if not (cqe_flags & uring_ffi.CQE_F_MORE):
+                uring_ffi.uring_prep_accept(
+                    ring, server_fd, _make_udata(_TAG_ACCEPT, 0))
+            return
+        c_fd = res
+        self.active_fds.append(c_fd)
+        self.client_fds[c_fd] = 1
+        self._poll_dirty = True
+
+        hdr_buf = lltype.malloc(rffi.CCHARP.TO, 4, flavor='raw')
+        self._conn_state[c_fd] = _CONN_WAITING_HEADER
+        self._conn_hdr_buf[c_fd] = hdr_buf
+        self._conn_hdr_pos[c_fd] = 0
+
+        uring_ffi.uring_prep_recv(
+            ring, c_fd, hdr_buf, 4, _make_udata(_TAG_RECV, c_fd))
+
+        if not (cqe_flags & uring_ffi.CQE_F_MORE):
+            uring_ffi.uring_prep_accept(
+                ring, server_fd, _make_udata(_TAG_ACCEPT, 0))
+
+    def _handle_recv_cqe(self, ring, fd, res,
+                         p_fds, p_cids, p_tids, p_batches, p_schemas):
+        state = self._conn_state.get(fd, -1)
+        if state == _CONN_WAITING_HEADER:
+            self._conn_hdr_pos[fd] = self._conn_hdr_pos[fd] + res
+            if self._conn_hdr_pos[fd] < 4:
+                pos = self._conn_hdr_pos[fd]
+                hdr_buf = self._conn_hdr_buf[fd]
+                uring_ffi.uring_prep_recv(
+                    ring, fd, rffi.ptradd(hdr_buf, pos), 4 - pos,
+                    _make_udata(_TAG_RECV, fd))
+                return 0
+
+            hdr_buf = self._conn_hdr_buf[fd]
+            payload_len = (
+                (ord(hdr_buf[0]) & 0xFF)
+                | ((ord(hdr_buf[1]) & 0xFF) << 8)
+                | ((ord(hdr_buf[2]) & 0xFF) << 16)
+                | ((ord(hdr_buf[3]) & 0xFF) << 24)
+            )
+
+            if payload_len == 0:
+                self._cleanup_client(fd)
+                return -1
+
+            payload_buf = lltype.malloc(
+                rffi.CCHARP.TO, payload_len, flavor='raw')
+            self._conn_state[fd] = _CONN_WAITING_PAYLOAD
+            self._conn_payload_buf[fd] = payload_buf
+            self._conn_payload_len[fd] = payload_len
+            self._conn_payload_pos[fd] = 0
+
+            uring_ffi.uring_prep_recv(
+                ring, fd, payload_buf, payload_len,
+                _make_udata(_TAG_RECV, fd))
+            return 0
+
+        elif state == _CONN_WAITING_PAYLOAD:
+            self._conn_payload_pos[fd] = self._conn_payload_pos[fd] + res
+            if self._conn_payload_pos[fd] < self._conn_payload_len[fd]:
+                pos = self._conn_payload_pos[fd]
+                payload_buf = self._conn_payload_buf[fd]
+                remaining = self._conn_payload_len[fd] - pos
+                uring_ffi.uring_prep_recv(
+                    ring, fd, rffi.ptradd(payload_buf, pos), remaining,
+                    _make_udata(_TAG_RECV, fd))
+                return 0
+
+            payload_buf = self._conn_payload_buf[fd]
+            payload_len = self._conn_payload_len[fd]
+            # Transfer ownership: remove from dict before passing to
+            # _process_complete_message (which frees via IPCPayload.close)
+            del self._conn_payload_buf[fd]
+            del self._conn_payload_len[fd]
+            del self._conn_payload_pos[fd]
+            return self._process_complete_message(
+                ring, fd, payload_buf, payload_len,
+                p_fds, p_cids, p_tids, p_batches, p_schemas)
+
+        return -1
+
+    def _process_complete_message(self, ring, fd, raw_ptr, raw_len,
+                                  p_fds, p_cids, p_tids, p_batches,
+                                  p_schemas):
+        payload = None
+        rows_buffered = 0
+        try:
+            payload = ipc._parse_from_ptr(raw_ptr, raw_len)
+            payload.raw_buf = raw_ptr
+            payload.raw_buf_size = raw_len
+            client_id = intmask(payload.client_id)
+            target_id = intmask(payload.target_id)
+
+            # ID allocation — immediate response
+            if target_id == 0:
+                if payload.flags & ipc.FLAG_ALLOCATE_TABLE_ID:
+                    new_id = self.engine.registry.allocate_table_id()
+                    self.engine._advance_sequence(
+                        sys.SEQ_ID_TABLES, new_id - 1, new_id)
+                    self._queue_async_send(
+                        ring, fd, new_id, None, STATUS_OK, "", client_id)
+                    return 0
+                if payload.flags & ipc.FLAG_ALLOCATE_SCHEMA_ID:
+                    new_id = self.engine.registry.allocate_schema_id()
+                    self.engine._advance_sequence(
+                        sys.SEQ_ID_SCHEMAS, new_id - 1, new_id)
+                    self._queue_async_send(
+                        ring, fd, new_id, None, STATUS_OK, "", client_id)
+                    return 0
+                if payload.flags & ipc.FLAG_ALLOCATE_INDEX_ID:
+                    new_id = self.engine.registry.allocate_index_id()
+                    self.engine._advance_sequence(
+                        sys.SEQ_ID_INDICES, new_id - 1, new_id)
+                    self._queue_async_send(
+                        ring, fd, new_id, None, STATUS_OK, "", client_id)
+                    return 0
+
+            if client_id > 0:
+                self.fd_to_client[fd] = client_id
+                self.client_to_fd[client_id] = fd
+
+            # Index seek
+            if payload.flags & ipc.FLAG_SEEK_BY_INDEX:
+                col_idx = intmask(payload.seek_col_idx)
+                schema = self.engine.registry.get_by_id(target_id).schema
+                if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
+                    result = self.dispatcher.fan_out_seek_by_index(
+                        target_id, col_idx,
+                        intmask(payload.seek_pk_lo),
+                        intmask(payload.seek_pk_hi), schema)
+                else:
+                    result = self._seek_by_index(
+                        target_id, col_idx,
+                        payload.seek_pk_lo, payload.seek_pk_hi)
+                resp_schema = result._schema if result is not None else schema
+                self._queue_async_send(
+                    ring, fd, target_id, result, STATUS_OK, "",
+                    client_id, schema=resp_schema)
+                if result is not None:
+                    result.free()
+                return 0
+
+            # PK seek
+            if payload.flags & ipc.FLAG_SEEK:
+                schema = self.engine.registry.get_by_id(target_id).schema
+                if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
+                    result = self.dispatcher.fan_out_seek(
+                        target_id,
+                        intmask(payload.seek_pk_lo),
+                        intmask(payload.seek_pk_hi), schema)
+                else:
+                    result = self._seek_family(
+                        target_id, payload.seek_pk_lo, payload.seek_pk_hi)
+                resp_schema = result._schema if result is not None else schema
+                self._queue_async_send(
+                    ring, fd, target_id, result, STATUS_OK, "",
+                    client_id, schema=resp_schema)
+                if result is not None:
+                    result.free()
+                return 0
+
+            family = None
+            if payload.batch is not None:
+                family = self.engine.registry.get_by_id(target_id)
+                if payload.schema is not None:
+                    _validate_schema_match(payload.schema, family.schema)
+
+            # Bufferable: multi-worker user-table DML with data
+            if (
+                self.dispatcher is not None
+                and target_id >= sys.FIRST_USER_TABLE_ID
+                and family is not None
+                and payload.batch.length() > 0
+            ):
+                validate_fk_distributed(
+                    family, payload.batch, self.dispatcher)
+                validate_unique_indices_distributed(
+                    family, payload.batch, self.dispatcher)
+                cloned = payload.batch.clone()
+                p_fds.append(fd)
+                p_cids.append(client_id)
+                p_tids.append(target_id)
+                p_batches.append(cloned)
+                p_schemas.append(family.schema)
+                rows_buffered = cloned.length()
+                return rows_buffered
+
+            # Non-bufferable: process inline
+            result = self.handle_push(target_id, payload.batch)
+            lsn = self._last_response_lsn
+            self._last_response_lsn = 0
+
+            if (
+                self.dispatcher is not None
+                and target_id < sys.FIRST_USER_TABLE_ID
+                and family is not None
+                and payload.batch.length() > 0
+            ):
+                self.dispatcher.broadcast_ddl(
+                    target_id, payload.batch, family.schema)
+
+            resp_schema = None
+            if result is not None:
+                resp_schema = result._schema
+            elif family is not None:
+                resp_schema = family.schema
+            else:
+                resp_schema = self.engine.registry.get_by_id(target_id).schema
+            self._queue_async_send(
+                ring, fd, target_id, result, STATUS_OK, "",
+                client_id, schema=resp_schema, seek_pk_lo=lsn)
+            if result is not None:
+                result.free()
+
+        except errors.ClientDisconnectedError:
+            self._cleanup_client(fd)
+            return -1
+        except errors.GnitzError as ge:
+            err_msg = ge.msg
+            tid = intmask(payload.target_id) if payload else 0
+            cid = intmask(payload.client_id) if payload else 0
+            try:
+                self._queue_async_send(
+                    ring, fd, tid, None, STATUS_ERROR, err_msg, cid)
+            except errors.GnitzError:
+                self._cleanup_client(fd)
+                return -1
+        except Exception as e:
+            os.write(2, "MASTER EXCEPTION: " + str(e) + "\n")
+            self._cleanup_client(fd)
+            return -1
+        finally:
+            if payload is not None:
+                payload.close()
+            else:
+                lltype.free(raw_ptr, flavor='raw')
+        return rows_buffered
+
+    def _queue_async_send(self, ring, fd, target_id, result, status,
+                          error_msg, client_id, schema=None, flags=0,
+                          seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
+        eff_schema = schema
+        if eff_schema is None and result is not None:
+            eff_schema = result._schema
+        eff_flags = r_uint64(flags)
+        wire_buf = ipc._encode_wire(
+            target_id, client_id, result, eff_schema, eff_flags,
+            seek_pk_lo, seek_pk_hi, seek_col_idx, status, error_msg)
+        payload_len = wire_buf.offset
+        total = 4 + payload_len
+        send_buf = lltype.malloc(rffi.CCHARP.TO, total, flavor='raw')
+        send_buf[0] = chr(payload_len & 0xFF)
+        send_buf[1] = chr((payload_len >> 8) & 0xFF)
+        send_buf[2] = chr((payload_len >> 16) & 0xFF)
+        send_buf[3] = chr((payload_len >> 24) & 0xFF)
+        c_memmove(
+            rffi.cast(rffi.VOIDP, rffi.ptradd(send_buf, 4)),
+            rffi.cast(rffi.VOIDP, wire_buf.base_ptr),
+            rffi.cast(rffi.SIZE_T, payload_len))
+        wire_buf.free()
+
+        self._send_bufs[fd] = send_buf
+        self._send_lens[fd] = total
+        self._send_pos[fd] = 0
+        self._conn_state[fd] = _CONN_SENDING
+
+        uring_ffi.uring_prep_send(
+            ring, fd, send_buf, total, _make_udata(_TAG_SEND, fd))
+
+    def _handle_send_cqe(self, ring, fd, res):
+        self._send_pos[fd] = self._send_pos[fd] + res
+        if self._send_pos[fd] < self._send_lens[fd]:
+            pos = self._send_pos[fd]
+            send_buf = self._send_bufs[fd]
+            remaining = self._send_lens[fd] - pos
+            uring_ffi.uring_prep_send(
+                ring, fd, rffi.ptradd(send_buf, pos), remaining,
+                _make_udata(_TAG_SEND, fd))
+            return
+        lltype.free(self._send_bufs[fd], flavor='raw')
+        del self._send_bufs[fd]
+        del self._send_lens[fd]
+        del self._send_pos[fd]
+
+        self._conn_state[fd] = _CONN_WAITING_HEADER
+        self._conn_hdr_pos[fd] = 0
+        hdr_buf = self._conn_hdr_buf[fd]
+        uring_ffi.uring_prep_recv(
+            ring, fd, hdr_buf, 4, _make_udata(_TAG_RECV, fd))
 
     # -- Unified Protocol ---------------------------------------------------
 
@@ -733,16 +1199,28 @@ class ServerExecutor(object):
 
             for k in range(run_start, run_end):
                 try:
-                    if len(err_msg) > 0:
-                        ipc.send_framed_error(
-                            p_fds[k], err_msg,
-                            target_id=target_id, client_id=p_cids[k],
-                        )
+                    if self._use_uring:
+                        if len(err_msg) > 0:
+                            self._queue_async_send(
+                                self._ring, p_fds[k], target_id, None,
+                                STATUS_ERROR, err_msg, p_cids[k])
+                        else:
+                            self._queue_async_send(
+                                self._ring, p_fds[k], target_id, None,
+                                STATUS_OK, "", p_cids[k], schema=schema,
+                                seek_pk_lo=current_lsn)
                     else:
-                        ipc.send_framed(
-                            p_fds[k], target_id, None, STATUS_OK, "",
-                            p_cids[k], schema=schema, seek_pk_lo=current_lsn,
-                        )
+                        if len(err_msg) > 0:
+                            ipc.send_framed_error(
+                                p_fds[k], err_msg,
+                                target_id=target_id, client_id=p_cids[k],
+                            )
+                        else:
+                            ipc.send_framed(
+                                p_fds[k], target_id, None, STATUS_OK, "",
+                                p_cids[k], schema=schema,
+                                seek_pk_lo=current_lsn,
+                            )
                 except Exception:
                     self._cleanup_client(p_fds[k])
 
@@ -772,6 +1250,30 @@ class ServerExecutor(object):
         evaluate_dag(self.engine, initial_source_id, initial_delta)
 
     def _cleanup_client(self, fd):
+        # io_uring state (no-op in poll path)
+        if fd in self._conn_hdr_buf:
+            lltype.free(self._conn_hdr_buf[fd], flavor='raw')
+            del self._conn_hdr_buf[fd]
+        if fd in self._conn_state:
+            del self._conn_state[fd]
+        if fd in self._conn_hdr_pos:
+            del self._conn_hdr_pos[fd]
+        if fd in self._conn_payload_buf:
+            lltype.free(self._conn_payload_buf[fd], flavor='raw')
+            del self._conn_payload_buf[fd]
+        if fd in self._conn_payload_len:
+            del self._conn_payload_len[fd]
+        if fd in self._conn_payload_pos:
+            del self._conn_payload_pos[fd]
+        if fd in self._send_bufs:
+            lltype.free(self._send_bufs[fd], flavor='raw')
+            del self._send_bufs[fd]
+        if fd in self._send_lens:
+            del self._send_lens[fd]
+        if fd in self._send_pos:
+            del self._send_pos[fd]
+
+        # Poll state (no-op in uring path)
         if fd in self._client_hdr_bufs:
             lltype.free(self._client_hdr_bufs[fd], flavor='raw')
             del self._client_hdr_bufs[fd]
@@ -779,6 +1281,7 @@ class ServerExecutor(object):
             lltype.free(self._client_hdr_pos[fd], flavor='raw')
             del self._client_hdr_pos[fd]
 
+        # Common: close fd, remove from registries
         if fd in self.client_fds:
             try:
                 os.close(intmask(fd))

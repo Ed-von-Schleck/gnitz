@@ -170,101 +170,74 @@ follow-up step when profiling shows scan materialization is a bottleneck.
 
 ---
 
-## Step 4: `uring_ffi.py` — io_uring FFI
+## Step 4 — DONE
 
-Raw syscalls (no liburing). Syscall numbers 425/426/427 (x86_64 stable ABI).
+Raw io_uring FFI via syscalls 425/426/427 (no liburing). All ring
+internals (memory barriers, SQE byte-offset writes) handled in C;
+RPython sees an opaque `rffi.VOIDP` ring handle.
 
-Follow the FFI pattern in `eventfd_ffi.py` and `ipc_ffi.py`:
-`ExternalCompilationInfo` with `separate_module_sources` for inline C,
-`rffi.llexternal` for each function. Use `releasegil=True` on blocking calls.
+### What was implemented
 
-### C API
+- `gnitz/server/uring_ffi.py`: self-contained inline C (~370 lines)
+  defining all io_uring structs/constants (no `<linux/io_uring.h>`
+  dependency). Uses `IORING_SETUP_NO_SQARRAY` (kernel 6.16+) and
+  `IORING_FEAT_SINGLE_MMAP` for 2-mmap ring setup.
+- C functions: `gnitz_uring_create`, `gnitz_uring_destroy`,
+  `gnitz_uring_prep_{nop,accept,recv,send,read,write}`,
+  `gnitz_uring_submit_and_wait`, `gnitz_uring_drain`.
+- RPython wrappers: `uring_create/destroy`, `uring_prep_*`,
+  `uring_submit_and_wait`, `uring_drain` (returns 4-tuple:
+  count, udata_list, res_list, flags_list).
+- `ipc_ffi.py`: added `gnitz_unix_connect` / `unix_connect()` for
+  client-side AF_UNIX SOCK_STREAM connect.
+- `rpython_tests/uring_test.py`: 5 tests (create/destroy, NOP,
+  file read/write, socket accept+recv, batch submit). Graceful skip
+  when io_uring unavailable.
 
-| Function | Description |
-|---|---|
-| `gnitz_uring_create(entries)` | `io_uring_setup` + mmap SQ/CQ/SQEs |
-| `gnitz_uring_destroy(ring)` | munmap + close |
-| `gnitz_uring_prep_accept(ring, fd, user_data)` | Multishot via `IORING_ACCEPT_MULTISHOT` in `sqe->ioprio` |
-| `gnitz_uring_prep_recv(ring, fd, buf, len, user_data)` | `IORING_OP_RECV` |
-| `gnitz_uring_prep_send(ring, fd, buf, len, user_data)` | `IORING_OP_SEND` |
-| `gnitz_uring_submit_and_wait(ring, min_complete)` | `io_uring_enter` with `IORING_ENTER_GETEVENTS` |
-| `gnitz_uring_drain(ring, out_arrays, max)` | Read CQEs → output arrays, advance `cq_head` |
-| `gnitz_uring_register_buffers(ring, iovecs, count)` | `IORING_REGISTER_BUFFERS` |
+### What was NOT implemented (deferred to Step 5)
 
-All memory barriers and SQE manipulation in C. RPython never touches ring
-internals. `releasegil=True` on `submit_and_wait` (blocking).
-All io_uring buffers must be raw-allocated (`flavor='raw'`).
-
-### Files
-
-- New: `gnitz/server/uring_ffi.py` (~300 lines C, ~100 lines Python)
-
-### Test
-
-- New: `rpython_tests/uring_test.py` — NOP submit/complete, tempfile
-  read/write, Unix socket accept+recv
-- `make run-uring_test-c`
+- `gnitz_uring_register_buffers` — needs recv buffer pool context.
+- No `releasegil=True` — codebase is single-threaded per process
+  (multi-process architecture); no RPython threading anywhere.
 
 ---
 
-## Step 5: io_uring Event Loop for External Clients
+## Step 5 — DONE
 
-Replace poll-based `run_socket_server` in `executor.py` with io_uring
-event loop. Current loop uses `ipc_ffi.poll()` + `try_recv_framed` (two-phase:
-non-blocking 4-byte header via `recv_header_nb`, then blocking payload via
-`recv_exact`). Per-connection state: `_client_hdr_bufs` (4-byte raw buffer)
-and `_client_hdr_pos` (1-element int array) dicts on `ServerExecutor`.
-Step 3 must land first (SOCK_STREAM framing) — DONE.
+Replaced poll-based `run_socket_server` in `executor.py` with io_uring
+event loop. Fully async recv (header + payload) and async send via
+`IORING_OP_SEND`. Falls back to poll if io_uring unavailable or
+`GNITZ_FORCE_POLL=1` env var set.
 
-```
-io_uring instance (256 SQ entries)
-  ├── 1 multishot IORING_OP_ACCEPT (user_data = ACCEPT_TAG)
-  ├── per-client IORING_OP_RECV (user_data = client_fd)
-  └── per-response IORING_OP_SEND (user_data = SEND_TAG | client_fd)
-```
+### What was implemented
 
-Per-connection state machine for length-prefix parsing (4-byte header →
-payload). Pre-allocated recv buffer pool (N × 8 MB, registered).
+- `uring_ffi.py`: `gnitz_uring_submit_and_wait_timeout` C function +
+  `uring_submit_and_wait_timeout` RPython wrapper. Uses `IORING_ENTER_EXT_ARG`
+  (kernel 5.11+) for timeout-aware submit. Returns 0 on ETIME.
+- `executor.py`: `run_socket_server` tries io_uring, falls back to poll.
+  `_run_poll_server` = unchanged original poll loop.
+  `_run_uring_server` = new io_uring event loop with:
+  - Per-connection state machine: `WAITING_HEADER` → `WAITING_PAYLOAD` → `SENDING`
+  - Multishot accept via `IORING_OP_ACCEPT`
+  - Async recv (both header and payload) via `IORING_OP_RECV`
+  - Async send via `IORING_OP_SEND` with raw buffer lifetime management
+  - Two-pass CQE processing (errors first) for fd reuse safety
+  - `_process_complete_message` mirrors `_drain_client` for uring path
+  - Unified `_cleanup_client` handles both poll and uring state
+  - `_flush_pending_pushes` branches on `_use_uring` for send paths
+- `GNITZ_FORCE_POLL=1` env var forces poll fallback for testing/debugging.
 
-Fallback to poll + `try_recv_framed` if `io_uring_setup` fails.
+### What was NOT implemented (deferred)
 
-### Key implementation notes
-
-The current poll loop is `executor.py:run_socket_server` (~lines 272-400).
-It calls `_drain_client` per ready fd, which calls `try_recv_framed`. The
-two-phase recv (non-blocking header, then blocking payload via `recv_exact`)
-means the server blocks on one client's payload while other clients wait.
-Step 5 must make the payload recv async too — submit an `IORING_OP_RECV`
-for the payload bytes instead of calling `recv_exact`. This requires a
-per-connection state machine: `WAITING_HEADER` → `WAITING_PAYLOAD` → parse.
-
-The existing per-connection `_client_hdr_bufs`/`_client_hdr_pos` dicts on
-`ServerExecutor` should be replaced by whatever per-connection struct the
-io_uring loop uses. The poll-based fallback path can keep them as-is.
-
-Response sends (`send_framed`) are currently blocking (`gnitz_send_framed`
-in C loops on `send()` with MSG_NOSIGNAL). Step 5 should submit
-`IORING_OP_SEND` for responses instead. The wire buffer from `_encode_wire`
-must stay alive until the send completion — either pin it or copy into a
-registered buffer.
-
-Available io_uring features on kernel 6.18:
-
-| Feature | Kernel | Relevance |
-|---|---|---|
-| Multishot recv | 6.0 | Eliminates recv re-submission |
-| Provided buffer rings + incremental consumption | 6.12 | Variable-size messages |
-| Receive bundles | 6.10 | Batches recv completions |
-| Ring resizing | 6.13 | Start small, grow under load |
+- `gnitz_uring_register_buffers` — recv buffer pool optimization.
+- Pre-allocated drain buffers — `uring_drain` per-call malloc is negligible.
+- Multishot recv / provided buffer rings — requires kernel 6.0+/6.12+ features.
 
 ### Files changed
 
-- `gnitz/server/executor.py`: `_run_uring_server` + `_run_poll_server` fallback
-
-### Test
-
-- `make run-server_test-c`
-- `GNITZ_WORKERS=4 pytest rust_client/gnitz-py/tests/`
+- `gnitz/server/uring_ffi.py`: `uring_submit_and_wait_timeout` (C + wrapper)
+- `gnitz/server/executor.py`: io_uring event loop, state machine, CQE handlers
+- `rpython_tests/uring_test.py`: timeout test added
 
 ---
 
@@ -277,8 +250,8 @@ Step 2b  DEFERRED — gather-encode optimization (pure perf, no functional gap)
 Step 2c  DONE — unified WAL, checkpoint/reset, crash recovery, epoch fencing
 Step 2d  DEFERRED — exchange arena (relay-through-master works, preload covers common case)
 Step 3   DONE — SOCK_STREAM + length-prefix framing (external IPC)
-Step 4   uring_ffi.py (independent of everything)
-Step 5   io_uring event loop (depends on 3 + 4)
+Step 4   DONE — raw io_uring FFI (no liburing)
+Step 5   DONE — io_uring event loop (depends on 3 + 4)
 ```
 
 ---
@@ -296,7 +269,7 @@ Per push, 4 workers, 64 partitions/worker:
 
 ---
 
-## Lessons Learned (Steps 1–3)
+## Lessons Learned (Steps 1–5)
 
 ### Two-phase recv for SOCK_STREAM non-blocking (Step 3)
 
@@ -396,6 +369,116 @@ sending the FLAG_CHECKPOINT ACK. Master resets `write_cursor=0` AFTER
 receiving all ACKs. This prevents a window where master overwrites data
 a worker hasn't finished reading.
 
+### RPython ULONGLONGP maps to `unsigned long *`, not `unsigned long long *` (Step 4)
+
+On x86_64, `rffi.ULONGLONGP` generates `size_t *` (`unsigned long *`) in
+the C backend — same width as `unsigned long long *` but a distinct type.
+GCC's `-Wincompatible-pointer-types` rejects the mismatch. Fix: declare
+the C function parameter as `void *` and cast to `uint64_t *` inside the
+C body. This applies to any FFI function that takes a `uint64_t *` output
+array.
+
+### Self-contained io_uring constants avoid header version skew (Step 4)
+
+`uring_ffi.py` defines all io_uring structs and constants inline
+(`GNITZ_IORING_*` prefixed) rather than `#include <linux/io_uring.h>`.
+This decouples build-time headers from runtime kernel version. The struct
+layouts are stable UAPI — safe to hardcode. Step 5 should follow the same
+pattern (no new kernel header includes).
+
+### IORING_SETUP_NO_SQARRAY eliminates SQ indirection (Step 4)
+
+With this flag (kernel 6.16+), `io_uring_enter` reads SQEs directly at
+`sqes[tail & mask]` — no need to write indices into the SQ array. This
+removes one pointer indirection and one memory write per submission. The
+`_get_sqe` / `_advance_sq_tail` helpers become trivially simple. If the
+kernel doesn't support the flag, `io_uring_setup` returns `-EINVAL` and
+the wrapper raises `StorageError`; Step 5's poll fallback handles this.
+
+### IORING_FEAT_SINGLE_MMAP reduces setup to 2 mmaps (Step 4)
+
+When the kernel reports `IORING_FEAT_SINGLE_MMAP` in `params.features`
+(kernel 5.4+, universal on any io_uring-capable kernel), both SQ and CQ
+rings share a single mmap at `IORING_OFF_SQ_RING`. Only the SQE array
+needs a separate mmap at `IORING_OFF_SQES`. The mmap size must be
+`max(sq_off.array + sq_entries*4, cq_off.cqes + cq_entries*16)` to cover
+whichever ring extends further.
+
+### Every prep function must advance the SQ tail (Step 4)
+
+`_get_sqe` reserves a slot but does NOT advance the tail — the caller
+must call `_advance_sq_tail` after filling the SQE. Missing this call
+means the SQE is invisible to the kernel: `io_uring_enter` sees
+`to_submit = 0` and blocks forever when `min_complete > 0`. This caused
+a hang in the accept test during development.
+
+### `releasegil` is unnecessary in this codebase (Step 4)
+
+The ipc-overhaul plan originally specified `releasegil=True` on blocking
+FFI calls. However, zero existing `rffi.llexternal` calls in the codebase
+use it. GnitzDB uses multi-process (not multi-thread) architecture — the
+RPython GIL is never contended. Adding `releasegil` would be inconsistent
+and potentially add overhead with no benefit. Step 5 should also omit it.
+
+### `unix_connect` added to ipc_ffi.py (Step 4)
+
+The uring accept+recv test needed a client-side AF_UNIX connect. Added
+`gnitz_unix_connect` C function + `unix_connect()` RPython wrapper to
+`ipc_ffi.py` (alongside existing `server_create`/`server_accept`). Step 5
+can reuse this for any test that needs a client connection.
+
+### uring_drain output: 3 parallel arrays via void* (Step 4)
+
+`uring_drain` returns CQE data via 3 C output arrays: `user_data[]`
+(uint64), `res[]` (int32), `flags[]` (uint32). The RPython wrapper
+allocates raw arrays, calls C, copies to RPython lists (`newlist_hint` +
+`append`), and frees in `finally`. The `user_data` array uses `void *` in
+the C signature (see ULONGLONGP lesson above). Step 5's hot event loop
+may want to pre-allocate and reuse the raw arrays instead of
+malloc/free per drain call.
+
+### `rffi.c_memcpy` requires const-correct source pointer (Step 5)
+
+RPython's `rffi.c_memcpy` declares the source parameter as `const void *`
+(`render_as_const`). Passing a regular `rffi.VOIDP` (non-const) causes an
+`AnnotatorError` at translation time. Use `c_memmove` from `buffer.py`
+instead — its declaration uses `(VOIDP, VOIDP, SIZE_T)` with no const
+qualifier, and `memmove` handles overlapping regions as a bonus.
+
+### Two-pass CQE processing mirrors poll's two-pass revents (Step 5)
+
+The poll loop processes disconnects (POLLHUP/POLLERR) in pass 1 before
+accepts and reads in pass 2, to prevent fd reuse races. The io_uring loop
+must do the same: process all `res <= 0` CQEs first (cleanup), then process
+`res > 0` CQEs (accept/recv/send). Without this, a new accept could reuse
+the fd number of a just-disconnected client in the same CQE batch.
+
+### Payload buffer ownership transfer prevents double-free (Step 5)
+
+When the uring loop receives a complete payload, the raw buffer is tracked
+in `_conn_payload_buf[fd]`. Before passing it to `_process_complete_message`,
+the dict entry must be **deleted** (not freed), transferring ownership to
+the `IPCPayload.raw_buf` field. `IPCPayload.close()` frees the buffer.
+If the dict entry weren't removed, `_cleanup_client` would free it again.
+
+### `IORING_ENTER_EXT_ARG` for timeout without burning an SQE slot (Step 5)
+
+The io_uring event loop needs a timeout (for crash checks and tick
+coalescing). Rather than submitting an `IORING_OP_TIMEOUT` SQE (wastes
+a slot, adds state), use the `IORING_ENTER_EXT_ARG` flag (kernel 5.11+)
+on `io_uring_enter` to pass a `__kernel_timespec` inline. Returns `ETIME`
+when the timeout fires — the C wrapper returns 0, which the RPython wrapper
+treats as "nothing submitted, no error." Clean and zero-overhead.
+
+### Unified `_cleanup_client` avoids wrong-path cleanup bugs (Step 5)
+
+Rather than separate `_cleanup_client` (poll) and `_cleanup_client_uring`
+methods, use a single method that handles both paths. The uring-specific
+dicts (`_conn_state`, `_conn_hdr_buf`, etc.) are empty in the poll path,
+so the `if fd in dict` checks are no-ops. This prevents accidentally
+calling the wrong cleanup method from shared code like
+`_flush_pending_pushes`.
+
 ---
 
 ## Open Issues
@@ -426,7 +509,8 @@ excluding SAL directory from snapshots (subvolume layout). Deployment doc.
 
 ## Deployment Requirements
 
-- Linux kernel >= 5.19 (Steps 1–3 any kernel; Step 5 needs io_uring)
+- Linux kernel >= 6.16 (Steps 1–3 any kernel; Steps 4–5 need io_uring
+  with `IORING_SETUP_NO_SQARRAY`; graceful fallback to poll if unavailable)
 - Filesystem: xfs or btrfs recommended (ext4 has higher first-fill overhead)
 - btrfs: SAL directory on subvolume excluded from snapshots
 - 1 GB disk for SAL file (pre-allocated)
