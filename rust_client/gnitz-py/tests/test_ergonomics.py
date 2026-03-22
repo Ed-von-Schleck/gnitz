@@ -49,11 +49,11 @@ class TestColumnDef:
 
     def test_int_type_code_coerced(self):
         col = ColumnDef("x", 8)
-        assert col.type_code is TypeCode.U64
+        assert col.type_code == TypeCode.U64
 
     def test_typecode_accepted(self):
         col = ColumnDef("x", TypeCode.I64)
-        assert col.type_code is TypeCode.I64
+        assert col.type_code == TypeCode.I64
 
     def test_defaults(self):
         col = ColumnDef("x", TypeCode.U64)

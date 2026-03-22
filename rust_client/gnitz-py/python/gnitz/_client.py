@@ -1,5 +1,4 @@
 import gnitz._native as _native
-from gnitz._types import Schema, _to_native_col, _to_native_schema, _from_native_schema
 from gnitz._builders import CircuitBuilder
 
 
@@ -29,7 +28,7 @@ class Connection:
         pk_idx = next((i for i, c in enumerate(columns) if c.primary_key), 0)
         return self._client.create_table(
             schema_name, table_name,
-            [_to_native_col(c) for c in columns],
+            list(columns),
             pk_col_idx=pk_idx,
             unique_pk=unique_pk,
         )
@@ -46,7 +45,7 @@ class Connection:
         return self._client.scan_lazy(target_id)
 
     def delete(self, target_id, schema, pks):
-        self._client.delete(target_id, _to_native_schema(schema), pks)
+        self._client.delete(target_id, schema, pks)
 
     # Views
 
@@ -56,16 +55,14 @@ class Connection:
     def create_view(self, schema_name, view_name, source_table_id, output_schema):
         return self._client.create_view(
             schema_name, view_name, source_table_id,
-            _to_native_schema(output_schema),
+            output_schema,
         )
 
     def create_view_with_circuit(self, schema_name, view_name, circuit, columns):
-        if isinstance(columns, Schema):
-            s = _to_native_schema(columns)
-        else:
-            s = _to_native_schema(Schema(columns))
+        if not isinstance(columns, _native.Schema):
+            columns = _native.Schema(list(columns))
         return self._client.create_view_with_circuit(
-            schema_name, view_name, circuit._graph, s,
+            schema_name, view_name, circuit._graph, columns,
         )
 
     def drop_view(self, schema_name, view_name):
@@ -73,7 +70,7 @@ class Connection:
 
     def resolve_table(self, schema_name, table_name):
         tid, ns = self._client.resolve_table_id(schema_name, table_name)
-        return tid, _from_native_schema(ns)
+        return tid, ns
 
     def resolve_table_id(self, schema_name, table_name):
         return self.resolve_table(schema_name, table_name)

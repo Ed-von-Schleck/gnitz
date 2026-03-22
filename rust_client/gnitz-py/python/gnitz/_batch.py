@@ -1,5 +1,5 @@
 import gnitz._native as _native
-from gnitz._types import TypeCode, _to_native_schema
+from gnitz._types import TypeCode
 
 # Row is now a Rust #[pyclass] in _native
 Row = _native.Row
@@ -88,19 +88,14 @@ class ScanResult:
 class ZSetBatch:
     def __init__(self, schema):
         self._schema = schema
-        self._native_schema = _to_native_schema(schema)
-        self._raw    = _native.ZSetBatch(self._native_schema)
+        self._raw    = _native.ZSetBatch(schema)
 
     def append(self, weight=1, **values):
-        row = [values.get(col.name) for col in self._schema.columns]
-        self._raw.append_row(row, weight)
+        self._raw.append_dict(values, weight)
         return self
 
     def extend(self, rows, weight=1):
-        for row in rows:
-            w  = row.get("_weight", weight)
-            kv = {k: v for k, v in row.items() if k != "_weight"}
-            self.append(weight=w, **kv)
+        self._raw.extend_from_dicts(rows, weight)
         return self
 
     @property
