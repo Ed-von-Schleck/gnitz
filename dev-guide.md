@@ -16,7 +16,7 @@ When adding a new server-side constraint, validation rule, or invariant:
       run `make e2e`.
 - [ ] Is there a multi-worker E2E test in `rust_client/gnitz-py/tests/test_workers.py`
       covering it?
-- [ ] Is there a unit test in `master_worker_test.py` covering the IPC path?
+- [ ] Is there a unit test in `multicore_test.py` covering the IPC path?
 - [ ] Does the feature use `hash_row_by_columns` for exchange routing across
       tables where the same logical value may have different column types
       (e.g., PK column = U64 vs regular column = I64)? The hash must produce
@@ -28,7 +28,7 @@ When adding a new server-side constraint, validation rule, or invariant:
 exchange/fanout paths and will miss bugs in distributed execution.
 
 ```bash
-cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -v --tb=short
+cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
 ```
 
 The Makefile `e2e` target already sets `GNITZ_WORKERS=4`. Never run
@@ -55,7 +55,7 @@ and level-gating. Remove debug calls before committing.
 To watch all worker logs live:
 
 ```bash
-tail -f ~/git/gnitz/tmp/gnitz_*/worker_*.log
+tail -f ~/git/gnitz/tmp/gnitz_py_*/data/worker_*.log
 ```
 
 ## IPC optimization checklist
@@ -81,7 +81,7 @@ Three server binaries, built via Makefile targets:
 
 | Binary | Make target | Flags | Use |
 |--------|-------------|-------|-----|
-| `gnitz-server-c` | `make server` | `--opt=1 --lldebug` | Dev/debug (has debug alloc) |
+| `gnitz-server-c` | `make server` | `--opt=1 --gc=incminimark --lldebug` | Dev/debug (has debug alloc) |
 | `gnitz-server-release-c` | `make release-server` | `--opt=jit --gc=incminimark --lto` | JIT release profiling |
 | `gnitz-server-nojit-c` | `make release-server-nojit` | `--opt=2 --gc=incminimark --lto` | Static-opt baseline |
 
