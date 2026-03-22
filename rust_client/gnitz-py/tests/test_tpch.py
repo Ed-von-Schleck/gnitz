@@ -7,7 +7,7 @@ latency for incremental batches.
 
 import time
 import random
-import pytest
+
 import gnitz
 
 from tpch_gen import (
@@ -557,7 +557,6 @@ class TestQ4MinScaling:
         finally:
             _cleanup(client, sn, views=[vname], tables=[li_tname, ord_tname])
 
-    @pytest.mark.xfail(strict=False, reason="join→reduce MIN retraction not fully implemented")
     def test_retraction_of_non_min(self, client):
         sn = "tpch_" + _uid()
         client.create_schema(sn)
@@ -585,7 +584,6 @@ class TestQ4MinScaling:
         finally:
             _cleanup(client, sn, views=[vname], tables=[li_tname, ord_tname])
 
-    @pytest.mark.xfail(strict=False, reason="join→reduce MIN retraction not fully implemented")
     def test_retraction_of_min(self, client):
         sn = "tpch_" + _uid()
         client.create_schema(sn)
@@ -637,7 +635,6 @@ class TestQ4MinScaling:
         finally:
             _cleanup(client, sn, views=[vname], tables=[li_tname, ord_tname])
 
-    @pytest.mark.xfail(strict=False, reason="join→reduce MIN retraction not fully implemented")
     def test_multi_tick_retraction(self, client):
         sn = "tpch_" + _uid()
         client.create_schema(sn)
@@ -717,7 +714,6 @@ class TestQ5MaxScaling:
         finally:
             _cleanup(client, sn, views=[vname], tables=[li_tname, ord_tname])
 
-    @pytest.mark.xfail(strict=False, reason="join→reduce MAX retraction not fully implemented")
     def test_retraction_of_non_max(self, client):
         sn = "tpch_" + _uid()
         client.create_schema(sn)
@@ -745,7 +741,6 @@ class TestQ5MaxScaling:
         finally:
             _cleanup(client, sn, views=[vname], tables=[li_tname, ord_tname])
 
-    @pytest.mark.xfail(strict=False, reason="join→reduce MAX retraction not fully implemented")
     def test_retraction_of_max(self, client):
         sn = "tpch_" + _uid()
         client.create_schema(sn)
