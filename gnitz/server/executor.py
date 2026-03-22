@@ -5,6 +5,7 @@ import time
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.server import ipc, ipc_ffi
 from gnitz.core import errors
@@ -264,6 +265,10 @@ class ServerExecutor(object):
         self._tick_rows    = {}               # tid -> int (rows accumulated since last tick)
         self._t_first_tick = 0.0             # wall-clock time of oldest pending tick
 
+        # Per-connection SOCK_STREAM header buffers (Step 3)
+        self._client_hdr_bufs = {}   # int(fd) -> rffi.CCHARP (4 raw bytes)
+        self._client_hdr_pos  = {}   # int(fd) -> rffi.INTP (1-element raw array)
+
         # LSN tracking
         self._ingest_lsn        = 0  # global monotonic counter; increments per flush batch
         self._last_tick_lsn     = 0  # ingest_lsn at time of last _fire_pending_ticks()
@@ -351,6 +356,11 @@ class ServerExecutor(object):
                                 break
                             self.active_fds.append(c_fd)
                             self.client_fds[c_fd] = 1
+                            hdr_buf = lltype.malloc(rffi.CCHARP.TO, 4, flavor='raw')
+                            hdr_pos = lltype.malloc(rffi.INTP.TO, 1, flavor='raw')
+                            hdr_pos[0] = rffi.cast(rffi.INT, 0)
+                            self._client_hdr_bufs[c_fd] = hdr_buf
+                            self._client_hdr_pos[c_fd] = hdr_pos
                             self._poll_dirty = True
                     else:
                         while True:
@@ -517,7 +527,8 @@ class ServerExecutor(object):
         payload = None
         rows_buffered = 0
         try:
-            payload = ipc.try_receive_payload(fd)
+            payload = ipc.try_recv_framed(
+                fd, self._client_hdr_bufs[fd], self._client_hdr_pos[fd])
             if payload is None:
                 return -1  # EAGAIN — no message ready on this FD
             client_id = intmask(payload.client_id)
@@ -530,21 +541,21 @@ class ServerExecutor(object):
                     self.engine._advance_sequence(
                         sys.SEQ_ID_TABLES, new_id - 1, new_id
                     )
-                    ipc.send_batch(fd, new_id, None, STATUS_OK, "", client_id)
+                    ipc.send_framed(fd, new_id, None, STATUS_OK, "", client_id)
                     return 0
                 if payload.flags & ipc.FLAG_ALLOCATE_SCHEMA_ID:
                     new_id = self.engine.registry.allocate_schema_id()
                     self.engine._advance_sequence(
                         sys.SEQ_ID_SCHEMAS, new_id - 1, new_id
                     )
-                    ipc.send_batch(fd, new_id, None, STATUS_OK, "", client_id)
+                    ipc.send_framed(fd, new_id, None, STATUS_OK, "", client_id)
                     return 0
                 if payload.flags & ipc.FLAG_ALLOCATE_INDEX_ID:
                     new_id = self.engine.registry.allocate_index_id()
                     self.engine._advance_sequence(
                         sys.SEQ_ID_INDICES, new_id - 1, new_id
                     )
-                    ipc.send_batch(fd, new_id, None, STATUS_OK, "", client_id)
+                    ipc.send_framed(fd, new_id, None, STATUS_OK, "", client_id)
                     return 0
 
             if client_id > 0:
@@ -567,7 +578,7 @@ class ServerExecutor(object):
                         payload.seek_pk_lo, payload.seek_pk_hi,
                     )
                 resp_schema = result._schema if result is not None else schema
-                ipc.send_batch(fd, target_id, result, STATUS_OK, "", client_id,
+                ipc.send_framed(fd, target_id, result, STATUS_OK, "", client_id,
                                schema=resp_schema)
                 if result is not None:
                     result.free()
@@ -587,7 +598,7 @@ class ServerExecutor(object):
                         target_id, payload.seek_pk_lo, payload.seek_pk_hi,
                     )
                 resp_schema = result._schema if result is not None else schema
-                ipc.send_batch(fd, target_id, result, STATUS_OK, "", client_id,
+                ipc.send_framed(fd, target_id, result, STATUS_OK, "", client_id,
                                schema=resp_schema)
                 if result is not None:
                     result.free()
@@ -647,7 +658,7 @@ class ServerExecutor(object):
                 resp_schema = family.schema
             else:
                 resp_schema = self.engine.registry.get_by_id(target_id).schema
-            ipc.send_batch(
+            ipc.send_framed(
                 fd, target_id, result, STATUS_OK, "",
                 client_id, schema=resp_schema, seek_pk_lo=lsn,
             )
@@ -663,7 +674,7 @@ class ServerExecutor(object):
             tid = intmask(payload.target_id) if payload else 0
             cid = intmask(payload.client_id) if payload else 0
             try:
-                ipc.send_error(fd, err_msg, target_id=tid, client_id=cid)
+                ipc.send_framed_error(fd, err_msg, target_id=tid, client_id=cid)
             except errors.GnitzError:
                 # Socket disconnected while sending error — clean up and stop
                 # draining this fd.
@@ -723,12 +734,12 @@ class ServerExecutor(object):
             for k in range(run_start, run_end):
                 try:
                     if len(err_msg) > 0:
-                        ipc.send_error(
+                        ipc.send_framed_error(
                             p_fds[k], err_msg,
                             target_id=target_id, client_id=p_cids[k],
                         )
                     else:
-                        ipc.send_batch(
+                        ipc.send_framed(
                             p_fds[k], target_id, None, STATUS_OK, "",
                             p_cids[k], schema=schema, seek_pk_lo=current_lsn,
                         )
@@ -761,6 +772,13 @@ class ServerExecutor(object):
         evaluate_dag(self.engine, initial_source_id, initial_delta)
 
     def _cleanup_client(self, fd):
+        if fd in self._client_hdr_bufs:
+            lltype.free(self._client_hdr_bufs[fd], flavor='raw')
+            del self._client_hdr_bufs[fd]
+        if fd in self._client_hdr_pos:
+            lltype.free(self._client_hdr_pos[fd], flavor='raw')
+            del self._client_hdr_pos[fd]
+
         if fd in self.client_fds:
             try:
                 os.close(intmask(fd))

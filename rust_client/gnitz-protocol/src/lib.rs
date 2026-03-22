@@ -24,5 +24,5 @@ pub use wal_block::{
     recompute_block_checksum, get_region_offset_size,
 };
 pub use codec::{schema_to_batch, batch_to_schema};
-pub use transport::{connect, send_memfd, recv_memfd, close_fd, MmapBuffer};
+pub use transport::{connect, send_framed, recv_framed, close_fd};
 pub use message::{Message, send_message, recv_message, encode_control_block, decode_control_block};

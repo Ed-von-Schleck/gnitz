@@ -21,7 +21,7 @@ use gnitz_protocol::{
     encode_wal_block,
     encode_control_block, decode_control_block,
     schema_to_batch, meta_schema,
-    connect, send_memfd, recv_memfd, close_fd,
+    connect, send_framed, recv_framed, close_fd,
     WAL_BLOCK_HEADER_SIZE,
 };
 use helpers::ServerHandle;
@@ -41,9 +41,8 @@ impl RawClient {
     /// Send raw bytes, receive a raw response buffer.
     /// Returns (status, error_msg, raw_response).
     fn send_recv(&self, data: &[u8]) -> (u32, String, Vec<u8>) {
-        send_memfd(self.fd, data).expect("send_memfd");
-        let mmap = recv_memfd(self.fd).expect("recv_memfd");
-        let resp = mmap.as_slice().to_vec();
+        send_framed(self.fd, data).expect("send_framed");
+        let resp = recv_framed(self.fd).expect("recv_framed");
         if resp.len() < WAL_BLOCK_HEADER_SIZE {
             return (STATUS_ERROR, "response too small".into(), resp);
         }
@@ -619,53 +618,25 @@ fn test_scan_echoes_client_id() {
 // ============================================================================
 
 #[test]
-fn test_empty_memfd_too_small() {
-    use std::ffi::CString;
+fn test_empty_payload_too_small() {
+    // Send a payload that's too small to contain a valid WAL block header.
+    // Server should respond with STATUS_ERROR or drop the connection.
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let sock_fd = connect(&srv.sock_path).expect("connect");
 
-    let result = unsafe {
-        let name = CString::new("gnitz_empty").unwrap();
-        let mem_fd = libc::memfd_create(name.as_ptr(), 0);
-        if mem_fd < 0 {
-            close_fd(sock_fd);
-            return; // skip if memfd_create fails
-        }
-
-        let mut dummy = [b'G'; 1];
-        let mut iov = libc::iovec {
-            iov_base: dummy.as_mut_ptr() as *mut libc::c_void,
-            iov_len:  1,
-        };
-        let cmsg_space = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as usize;
-        let mut ctrl = vec![0u8; cmsg_space];
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov        = &mut iov as *mut libc::iovec;
-        msg.msg_iovlen     = 1;
-        msg.msg_control    = ctrl.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cmsg_space as _;
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (*cmsg).cmsg_len   = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type  = libc::SCM_RIGHTS;
-        *(libc::CMSG_DATA(cmsg) as *mut libc::c_int) = mem_fd;
-        let ret = libc::sendmsg(sock_fd, &msg, 0);
-        libc::close(mem_fd);
-        ret
-    };
-
-    if result < 0 {
+    // Send a 4-byte garbage payload (smaller than WAL_BLOCK_HEADER_SIZE)
+    let garbage = [0u8; 4];
+    if send_framed(sock_fd, &garbage).is_err() {
         close_fd(sock_fd);
         return;
     }
 
-    match recv_memfd(sock_fd) {
-        Ok(mmap) if mmap.len() >= WAL_BLOCK_HEADER_SIZE => {
-            let resp = mmap.as_slice();
+    match recv_framed(sock_fd) {
+        Ok(resp) if resp.len() >= WAL_BLOCK_HEADER_SIZE => {
             let ctrl_size = u32::from_le_bytes(resp[16..20].try_into().unwrap()) as usize;
             if ctrl_size <= resp.len() {
                 if let Ok((hdr, _)) = decode_control_block(&resp[..ctrl_size]) {
-                    assert_eq!(hdr.status, STATUS_ERROR, "empty memfd should yield error");
+                    assert_eq!(hdr.status, STATUS_ERROR, "too-small payload should yield error");
                 }
             }
         }

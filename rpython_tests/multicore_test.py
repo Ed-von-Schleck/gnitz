@@ -484,14 +484,14 @@ def test_batch_flag_roundtrip():
     schema = _make_simple_schema()
 
     # Case 1: sorted-only flag
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
     try:
         b = _make_simple_batch(schema)
         b.mark_sorted(True)
-        ipc.send_batch(s1.fd, 1, b, schema=schema)
+        ipc.send_framed(s1.fd, 1, b, schema=schema)
         b.free()
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
         assert_true(payload.batch is not None, "sorted: batch should be present")
         assert_true(payload.batch._sorted,
                     "FLAG_BATCH_SORTED: _sorted should be True after roundtrip")
@@ -503,14 +503,14 @@ def test_batch_flag_roundtrip():
         s2.close()
 
     # Case 2: consolidated flag (implies sorted)
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
     try:
         b = _make_simple_batch(schema)
         b.mark_consolidated(True)
-        ipc.send_batch(s1.fd, 1, b, schema=schema)
+        ipc.send_framed(s1.fd, 1, b, schema=schema)
         b.free()
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
         assert_true(payload.batch is not None, "consolidated: batch should be present")
         assert_true(payload.batch._consolidated,
                     "FLAG_BATCH_CONSOLIDATED: _consolidated should be True")
@@ -522,13 +522,13 @@ def test_batch_flag_roundtrip():
         s2.close()
 
     # Case 3: plain batch (no flags)
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
     try:
         b = _make_simple_batch(schema)
-        ipc.send_batch(s1.fd, 1, b, schema=schema)
+        ipc.send_framed(s1.fd, 1, b, schema=schema)
         b.free()
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
         assert_true(payload.batch is not None, "plain: batch should be present")
         assert_true(not payload.batch._sorted,
                     "plain batch: _sorted should be False")
@@ -785,10 +785,10 @@ def test_socketpair_ffi():
     rb.put_int(r_int64(999))
     rb.commit()
 
-    ipc.send_batch(parent_fd, 100, b, schema=schema)
+    ipc.send_framed(parent_fd, 100, b, schema=schema)
     b.free()
 
-    payload = ipc.receive_payload(child_fd)
+    payload = ipc.recv_framed(child_fd)
     assert_equal_i(100, intmask(payload.target_id), "target_id round-trip")
     assert_true(payload.batch is not None, "batch must be received")
     assert_equal_i(1, payload.batch.length(), "batch must have 1 row")
@@ -811,11 +811,11 @@ def test_fork_ipc_push_round_trip(base_dir):
     if pid == 0:
         # Child: receive batch, send ACK
         os.close(parent_fd)
-        payload = ipc.receive_payload(child_fd)
+        payload = ipc.recv_framed(child_fd)
         assert_true(payload.batch is not None, "child: batch must be received")
         assert_equal_i(5, payload.batch.length(), "child: batch must have 5 rows")
         payload.close()
-        ipc.send_batch(child_fd, 0, None)
+        ipc.send_framed(child_fd, 0, None)
         os.close(child_fd)
         os._exit(0)
 
@@ -828,10 +828,10 @@ def test_fork_ipc_push_round_trip(base_dir):
         rb.put_int(r_int64(i * 100))
         rb.commit()
 
-    ipc.send_batch(parent_fd, 200, b, schema=schema)
+    ipc.send_framed(parent_fd, 200, b, schema=schema)
     b.free()
 
-    ack = ipc.receive_payload(parent_fd)
+    ack = ipc.recv_framed(parent_fd)
     ack.close()
 
     os.close(parent_fd)
@@ -852,7 +852,7 @@ def test_fork_ipc_scan_round_trip(base_dir):
     if pid == 0:
         # Child: receive scan request, send back a batch with 3 rows
         os.close(parent_fd)
-        payload = ipc.receive_payload(child_fd)
+        payload = ipc.recv_framed(child_fd)
         assert_true(
             payload.batch is None or payload.batch.length() == 0,
             "child: scan request should have empty batch",
@@ -865,16 +865,16 @@ def test_fork_ipc_scan_round_trip(base_dir):
             rb.begin(r_uint64(i + 10), r_uint64(0), r_int64(1))
             rb.put_int(r_int64(i * 50))
             rb.commit()
-        ipc.send_batch(child_fd, 0, result, schema=schema)
+        ipc.send_framed(child_fd, 0, result, schema=schema)
         result.free()
         os.close(child_fd)
         os._exit(0)
 
     # Parent: send scan, receive result
     os.close(child_fd)
-    ipc.send_batch(parent_fd, 300, None, schema=schema)
+    ipc.send_framed(parent_fd, 300, None, schema=schema)
 
-    payload = ipc.receive_payload(parent_fd)
+    payload = ipc.recv_framed(parent_fd)
     assert_true(payload.batch is not None, "parent: scan result must have batch")
     assert_equal_i(3, payload.batch.length(), "parent: scan result must have 3 rows")
     payload.close()
@@ -912,21 +912,21 @@ def test_multi_worker_integration(base_dir):
 
             # Simple worker loop: handle one push, one scan, then exit
             # Push
-            payload = ipc.receive_payload(my_fd)
+            payload = ipc.recv_framed(my_fd)
             if payload.batch is not None and payload.batch.length() > 0:
                 # Store rows in memory for scan response
                 stored = payload.batch.clone()
                 payload.close()
-                ipc.send_batch(my_fd, 0, None)
+                ipc.send_framed(my_fd, 0, None)
             else:
                 stored = ArenaZSetBatch(schema)
                 payload.close()
-                ipc.send_batch(my_fd, 0, None)
+                ipc.send_framed(my_fd, 0, None)
 
             # Scan
-            payload2 = ipc.receive_payload(my_fd)
+            payload2 = ipc.recv_framed(my_fd)
             payload2.close()
-            ipc.send_batch(my_fd, 0, stored, schema=schema)
+            ipc.send_framed(my_fd, 0, stored, schema=schema)
             stored.free()
 
             os.close(my_fd)
@@ -966,26 +966,26 @@ def test_multi_worker_integration(base_dir):
     for w in range(num_workers):
         sb = sub_batches[w]
         if sb is not None:
-            ipc.send_batch(worker_fds[w], 0, sb, schema=schema)
+            ipc.send_framed(worker_fds[w], 0, sb, schema=schema)
             sb.free()
             sent_workers.append(w)
         else:
             # Send empty batch so worker can proceed
-            ipc.send_batch(worker_fds[w], 0, None, schema=schema)
+            ipc.send_framed(worker_fds[w], 0, None, schema=schema)
             sent_workers.append(w)
 
     for i in range(len(sent_workers)):
         w = sent_workers[i]
-        ack = ipc.receive_payload(worker_fds[w])
+        ack = ipc.recv_framed(worker_fds[w])
         ack.close()
 
     # Send scan requests and collect responses
     for w in range(num_workers):
-        ipc.send_batch(worker_fds[w], 0, None, schema=schema)
+        ipc.send_framed(worker_fds[w], 0, None, schema=schema)
 
     total_scanned = 0
     for w in range(num_workers):
-        resp = ipc.receive_payload(worker_fds[w])
+        resp = ipc.recv_framed(worker_fds[w])
         if resp.batch is not None:
             total_scanned += resp.batch.length()
         resp.close()
@@ -1103,19 +1103,19 @@ def test_empty_push_barrier(base_dir):
             my_fd = pairs[w][1]
 
             # Receive push (may be empty), ACK
-            payload = ipc.receive_payload(my_fd)
+            payload = ipc.recv_framed(my_fd)
             if payload.batch is not None and payload.batch.length() > 0:
                 stored = payload.batch.clone()
                 payload.close()
             else:
                 stored = ArenaZSetBatch(schema)
                 payload.close()
-            ipc.send_batch(my_fd, 0, None)
+            ipc.send_framed(my_fd, 0, None)
 
             # Receive scan, respond
-            payload2 = ipc.receive_payload(my_fd)
+            payload2 = ipc.recv_framed(my_fd)
             payload2.close()
-            ipc.send_batch(my_fd, 0, stored, schema=schema)
+            ipc.send_framed(my_fd, 0, stored, schema=schema)
             stored.free()
 
             os.close(my_fd)
@@ -1150,22 +1150,22 @@ def test_empty_push_barrier(base_dir):
         sub_batches[w]._direct_append_row(src_batch, i, src_batch.get_weight(i))
 
     for w in range(num_workers):
-        ipc.send_batch(worker_fds[w], 0, sub_batches[w], schema=schema)
+        ipc.send_framed(worker_fds[w], 0, sub_batches[w], schema=schema)
         if sub_batches[w] is not None:
             sub_batches[w].free()
 
     # Collect ACKs from ALL workers -- deadlock if any worker doesn't respond
     for w in range(num_workers):
-        ack = ipc.receive_payload(worker_fds[w])
+        ack = ipc.recv_framed(worker_fds[w])
         ack.close()
 
     # Scan all workers, verify all 4 rows present
     for w in range(num_workers):
-        ipc.send_batch(worker_fds[w], 0, None, schema=schema)
+        ipc.send_framed(worker_fds[w], 0, None, schema=schema)
 
     total = 0
     for w in range(num_workers):
-        resp = ipc.receive_payload(worker_fds[w])
+        resp = ipc.recv_framed(worker_fds[w])
         if resp.batch is not None:
             total += resp.batch.length()
         resp.close()

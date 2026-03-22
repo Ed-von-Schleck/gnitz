@@ -6,7 +6,7 @@ use crate::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_D
 use crate::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, meta_schema};
 use crate::codec::{schema_to_batch, batch_to_schema};
 use crate::wal_block::{encode_wal_block, decode_wal_block, IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
-use crate::transport::{send_memfd, recv_memfd};
+use crate::transport::{send_framed, recv_framed};
 
 pub struct Message {
     pub status:       u32,
@@ -213,15 +213,14 @@ pub fn send_message(
     if let Some(ref sb) = schema_block { buf.extend_from_slice(sb); }
     if let Some(ref db) = data_block { buf.extend_from_slice(db); }
 
-    send_memfd(sock_fd, &buf)
+    send_framed(sock_fd, &buf)
 }
 
 pub fn recv_message(
     sock_fd:     RawFd,
     data_schema: Option<&Schema>,
 ) -> Result<Message, ProtocolError> {
-    let buf = recv_memfd(sock_fd)?;
-    let buf = buf.as_slice();
+    let buf = recv_framed(sock_fd)?;
 
     if buf.len() < WAL_BLOCK_HEADER_SIZE {
         return Err(ProtocolError::DecodeError("message too small".into()));
@@ -317,7 +316,7 @@ mod tests {
 
     fn make_socketpair() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];
-        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()); }
+        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()); }
         (fds[0], fds[1])
     }
 
@@ -535,7 +534,7 @@ mod tests {
         let (a, b) = make_socketpair();
         let err_hdr = Header { status: STATUS_ERROR, ..Header::default() };
         let encoded = encode_control_block(&err_hdr, "something broke").unwrap();
-        crate::transport::send_memfd(a, &encoded).unwrap();
+        crate::transport::send_framed(a, &encoded).unwrap();
         let msg = recv_message(b, None).unwrap();
         assert_eq!(msg.status, STATUS_ERROR);
         assert!(msg.error_text.is_some());

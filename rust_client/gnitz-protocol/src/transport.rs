@@ -1,62 +1,68 @@
-use std::ffi::CString;
 use std::mem::{size_of, zeroed};
 use std::os::unix::io::RawFd;
 use crate::error::ProtocolError;
-
-/// Zero-copy wrapper around an mmap'd memfd.
-/// Keeps the mapping and fd alive until dropped.
-pub struct MmapBuffer {
-    ptr: *const u8,
-    len: usize,
-    fd:  RawFd,
-}
-
-impl MmapBuffer {
-    /// An empty buffer (no mmap, no fd).
-    fn empty() -> Self {
-        Self { ptr: std::ptr::null(), len: 0, fd: -1 }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        if self.len == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl Drop for MmapBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            if self.len > 0 {
-                libc::munmap(self.ptr as *mut _, self.len);
-            }
-            if self.fd >= 0 {
-                libc::close(self.fd);
-            }
-        }
-    }
-}
-
-// SAFETY: MmapBuffer is read-only (PROT_READ) and the fd is private.
-unsafe impl Send for MmapBuffer {}
 
 fn io_err() -> ProtocolError {
     ProtocolError::IoError(std::io::Error::last_os_error())
 }
 
+/// Send all bytes, retrying on EINTR and handling partial writes.
+fn send_all(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
+    let mut sent = 0usize;
+    while sent < data.len() {
+        let n = unsafe {
+            libc::send(
+                sock_fd,
+                data[sent..].as_ptr() as *const libc::c_void,
+                data.len() - sent,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+            return Err(ProtocolError::IoError(e));
+        }
+        if n == 0 {
+            return Err(ProtocolError::IoError(
+                std::io::Error::new(std::io::ErrorKind::WriteZero, "send returned 0"),
+            ));
+        }
+        sent += n as usize;
+    }
+    Ok(())
+}
+
+/// Read exactly `buf.len()` bytes, retrying on EINTR and handling partial reads.
+fn recv_exact(sock_fd: RawFd, buf: &mut [u8]) -> Result<(), ProtocolError> {
+    let mut got = 0usize;
+    while got < buf.len() {
+        let n = unsafe {
+            libc::recv(
+                sock_fd,
+                buf[got..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - got,
+                0,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+            return Err(ProtocolError::IoError(e));
+        }
+        if n == 0 {
+            return Err(ProtocolError::IoError(
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed"),
+            ));
+        }
+        got += n as usize;
+    }
+    Ok(())
+}
+
 pub fn connect(socket_path: &str) -> Result<RawFd, ProtocolError> {
     unsafe {
-        let sock_fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0);
+        let sock_fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         if sock_fd < 0 {
             return Err(io_err());
         }
@@ -90,134 +96,27 @@ pub fn connect(socket_path: &str) -> Result<RawFd, ProtocolError> {
     }
 }
 
-pub fn send_memfd(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
-    unsafe {
-        let name = CString::new("gnitz_client").unwrap();
-        let mem_fd = libc::memfd_create(name.as_ptr(), 0);
-        if mem_fd < 0 {
-            return Err(io_err());
-        }
-
-        if !data.is_empty() {
-            if libc::ftruncate(mem_fd, data.len() as libc::off_t) < 0 {
-                libc::close(mem_fd);
-                return Err(io_err());
-            }
-            let ptr = libc::mmap(
-                std::ptr::null_mut(),
-                data.len(),
-                libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                mem_fd,
-                0,
-            );
-            if ptr == libc::MAP_FAILED {
-                libc::close(mem_fd);
-                return Err(io_err());
-            }
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
-            libc::munmap(ptr, data.len());
-        }
-
-        let mut dummy: [u8; 1] = [b'G'; 1];
-        let mut iov = libc::iovec {
-            iov_base: dummy.as_mut_ptr() as *mut libc::c_void,
-            iov_len:  1,
-        };
-
-        let cmsg_space = libc::CMSG_SPACE(size_of::<libc::c_int>() as libc::c_uint) as usize;
-        let mut ctrl_buf = vec![0u8; cmsg_space];
-
-        let mut msg: libc::msghdr = zeroed();
-        msg.msg_iov        = &mut iov as *mut libc::iovec;
-        msg.msg_iovlen     = 1;
-        msg.msg_control    = ctrl_buf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cmsg_space as _;
-
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (*cmsg).cmsg_len   = libc::CMSG_LEN(size_of::<libc::c_int>() as libc::c_uint) as _;
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type  = libc::SCM_RIGHTS;
-        *(libc::CMSG_DATA(cmsg) as *mut libc::c_int) = mem_fd;
-
-        let ret = libc::sendmsg(sock_fd, &msg, 0);
-        libc::close(mem_fd);
-
-        if ret < 0 {
-            return Err(io_err());
-        }
-
-        Ok(())
-    }
+/// Send a length-prefixed frame: [u32 LE payload_length][payload bytes].
+pub fn send_framed(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
+    let len = data.len() as u32;
+    let hdr = len.to_le_bytes();
+    send_all(sock_fd, &hdr)?;
+    send_all(sock_fd, data)
 }
 
-pub fn recv_memfd(sock_fd: RawFd) -> Result<MmapBuffer, ProtocolError> {
-    unsafe {
-        let cmsg_space = libc::CMSG_SPACE(size_of::<libc::c_int>() as libc::c_uint) as usize;
-        let mut ctrl_buf = vec![0u8; cmsg_space];
-        let mut recv_byte = [0u8; 1];
-
-        let mut iov = libc::iovec {
-            iov_base: recv_byte.as_mut_ptr() as *mut libc::c_void,
-            iov_len:  1,
-        };
-
-        let mut msg: libc::msghdr = zeroed();
-        msg.msg_iov        = &mut iov as *mut libc::iovec;
-        msg.msg_iovlen     = 1;
-        msg.msg_control    = ctrl_buf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cmsg_space as _;
-
-        let ret = libc::recvmsg(sock_fd, &mut msg, 0);
-        if ret < 0 {
-            return Err(io_err());
-        }
-
-        let mut recv_fd: libc::c_int = -1;
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let fd = *(libc::CMSG_DATA(cmsg) as *const libc::c_int);
-                if recv_fd == -1 {
-                    recv_fd = fd;
-                } else {
-                    libc::close(fd);
-                }
-            }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg as *const libc::cmsghdr);
-        }
-
-        if recv_fd < 0 {
-            return Err(ProtocolError::DecodeError("no file descriptor received".into()));
-        }
-
-        let mut stat_buf: libc::stat = zeroed();
-        if libc::fstat(recv_fd, &mut stat_buf) < 0 {
-            libc::close(recv_fd);
-            return Err(io_err());
-        }
-
-        let size = stat_buf.st_size as usize;
-        if size == 0 {
-            libc::close(recv_fd);
-            return Ok(MmapBuffer::empty());
-        }
-
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            recv_fd,
-            0,
-        );
-        if ptr == libc::MAP_FAILED {
-            libc::close(recv_fd);
-            return Err(io_err());
-        }
-
-        Ok(MmapBuffer { ptr: ptr as *const u8, len: size, fd: recv_fd })
+/// Receive a length-prefixed frame. Returns the payload bytes.
+pub fn recv_framed(sock_fd: RawFd) -> Result<Vec<u8>, ProtocolError> {
+    let mut hdr = [0u8; 4];
+    recv_exact(sock_fd, &mut hdr)?;
+    let payload_len = u32::from_le_bytes(hdr) as usize;
+    if payload_len == 0 {
+        return Err(ProtocolError::IoError(
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "zero-length close sentinel"),
+        ));
     }
+    let mut buf = vec![0u8; payload_len];
+    recv_exact(sock_fd, &mut buf)?;
+    Ok(buf)
 }
 
 pub fn close_fd(fd: RawFd) {
@@ -231,7 +130,7 @@ mod tests {
 
     fn make_socketpair() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];
-        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()); }
+        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()); }
         (fds[0], fds[1])
     }
 
@@ -239,18 +138,20 @@ mod tests {
     fn test_transport_loopback() {
         let (a, b) = make_socketpair();
         let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-        send_memfd(a, &data).unwrap();
-        let received = recv_memfd(b).unwrap();
-        assert_eq!(received.as_slice(), &data[..]);
+        send_framed(a, &data).unwrap();
+        let received = recv_framed(b).unwrap();
+        assert_eq!(&received[..], &data[..]);
         unsafe { libc::close(a); libc::close(b); }
     }
 
     #[test]
-    fn test_transport_empty() {
+    fn test_transport_medium() {
         let (a, b) = make_socketpair();
-        send_memfd(a, &[]).unwrap();
-        let received = recv_memfd(b).unwrap();
-        assert!(received.is_empty());
+        // 64 KB payload — fits in Unix socket buffer for single-threaded test
+        let data: Vec<u8> = (0u8..=255).cycle().take(64 * 1024).collect();
+        send_framed(a, &data).unwrap();
+        let received = recv_framed(b).unwrap();
+        assert_eq!(&received[..], &data[..]);
         unsafe { libc::close(a); libc::close(b); }
     }
 }

@@ -15,7 +15,7 @@ POLLERR  = 0x008
 POLLHUP  = 0x010
 POLLNVAL = 0x020
 
-# C implementation of FD passing using SCM_RIGHTS and safe polling.
+# C implementation of IPC primitives: poll, socketpair, SOCK_STREAM framing.
 IPC_C_CODE = """
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -23,7 +23,6 @@ IPC_C_CODE = """
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/uio.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -31,166 +30,13 @@ IPC_C_CODE = """
 #include <stdlib.h>
 #include <fcntl.h>
 
-/* MSG_NOSIGNAL prevents the kernel from sending SIGPIPE and killing the DB
-   when writing to a client that just abruptly disconnected. */
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
 
-int gnitz_ipc_send_fd(int sock_fd, int fd_to_send) {
-    struct msghdr msg = {0};
-    struct cmsghdr *cmsg;
-    char dummy_data[1] = {'G'};
-    struct iovec io = {
-        .iov_base = dummy_data,
-        .iov_len = 1
-    };
-    
-    // Union ensures alignment for the control message buffer.
-    union {
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct cmsghdr align;
-    } u;
-
-    // Zero out control message structure to prevent passing garbage 
-    // to the kernel, which strict kernels will reject.
-    memset(u.buf, 0, sizeof(u.buf));
-
-    msg.msg_iov = &io;
-    msg.msg_iovlen = 1;
-    msg.msg_control = u.buf;
-    msg.msg_controllen = sizeof(u.buf);
-
-    cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    *((int *) CMSG_DATA(cmsg)) = fd_to_send;
-
-    // We use a loop for sendmsg to handle EINTR.
-    ssize_t res;
-    do {
-        res = sendmsg(sock_fd, &msg, MSG_NOSIGNAL);
-    } while (res < 0 && errno == EINTR);
-
-    return (res < 0) ? -1 : 0;
-}
-
-int gnitz_ipc_recv_fd(int sock_fd) {
-    struct msghdr msg = {0};
-    char dummy_data[1];
-    struct iovec io = {
-        .iov_base = dummy_data,
-        .iov_len = 1
-    };
-    
-    // Buffer for one FD. Even if client sends more, we only want one.
-    union {
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct cmsghdr align;
-    } u;
-
-    memset(u.buf, 0, sizeof(u.buf));
-
-    msg.msg_iov = &io;
-    msg.msg_iovlen = 1;
-    msg.msg_control = u.buf;
-    msg.msg_controllen = sizeof(u.buf);
-
-    ssize_t n;
-    do {
-        n = recvmsg(sock_fd, &msg, 0);
-    } while (n < 0 && errno == EINTR);
-
-    if (n <= 0) {
-        return -1;
-    }
-
-    int received_fd = -1;
-    struct cmsghdr *cmsg;
-
-    // HARDENING: Iterate through all control headers. 
-    // If we find an FD, we keep the first one and CLOSE all others to prevent leaks.
-    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-            int *fd_ptr = (int *) CMSG_DATA(cmsg);
-            int payload_len = cmsg->cmsg_len - CMSG_LEN(0);
-            int num_fds = payload_len / sizeof(int);
-
-            for (int i = 0; i < num_fds; i++) {
-                int fd = fd_ptr[i];
-                if (received_fd == -1 && fd >= 0) {
-                    received_fd = fd;
-                } else if (fd >= 0) {
-                    // Close extraneous FDs immediately.
-                    close(fd);
-                }
-            }
-        }
-    }
-
-    return received_fd;
-}
-
-int gnitz_ipc_recv_fd_nb(int sock_fd) {
-    struct msghdr msg = {0};
-    char dummy_data[1];
-    struct iovec io = {
-        .iov_base = dummy_data,
-        .iov_len = 1
-    };
-
-    union {
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct cmsghdr align;
-    } u;
-
-    memset(u.buf, 0, sizeof(u.buf));
-
-    msg.msg_iov = &io;
-    msg.msg_iovlen = 1;
-    msg.msg_control = u.buf;
-    msg.msg_controllen = sizeof(u.buf);
-
-    ssize_t n;
-    do {
-        n = recvmsg(sock_fd, &msg, MSG_DONTWAIT);
-    } while (n < 0 && errno == EINTR);
-
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-        return -2;   /* sentinel: no message ready */
-    if (n <= 0)
-        return -1;   /* connection closed or hard error */
-
-    int received_fd = -1;
-    struct cmsghdr *cmsg;
-
-    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-            int *fd_ptr = (int *) CMSG_DATA(cmsg);
-            int payload_len = cmsg->cmsg_len - CMSG_LEN(0);
-            int num_fds = payload_len / sizeof(int);
-
-            for (int i = 0; i < num_fds; i++) {
-                int fd = fd_ptr[i];
-                if (received_fd == -1 && fd >= 0) {
-                    received_fd = fd;
-                } else if (fd >= 0) {
-                    close(fd);
-                }
-            }
-        }
-    }
-
-    /* Message was received but carried no SCM_RIGHTS fd — malformed protocol
-       frame, not a disconnect.  Caller should send an error response. */
-    return (received_fd == -1) ? -3 : received_fd;
-}
-
 int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int timeout_ms) {
     if (count <= 0) return 0;
 
-    // Stack allocation for small loads eliminates malloc overhead in the hot path.
     struct pollfd stack_pfds[64];
     struct pollfd *pfds = stack_pfds;
 
@@ -210,8 +56,6 @@ int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int ti
         res = poll(pfds, (nfds_t)count, timeout_ms);
     } while (res < 0 && errno == EINTR);
 
-    // Unconditionally copy back the revents, even if res == 0 (timeout),
-    // to ensure the caller's array is correctly zeroed out.
     for (int i = 0; i < count; i++) {
         revents[i] = (int)pfds[i].revents;
     }
@@ -228,7 +72,7 @@ int gnitz_socketpair(int fds_out[2]) {
 }
 
 int gnitz_server_create(const char *socket_path) {
-    int fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 
     struct sockaddr_un addr;
@@ -247,7 +91,7 @@ int gnitz_server_create(const char *socket_path) {
         return -3;
     }
 
-    /* Set non-blocking */
+    /* Set non-blocking for the listen socket (accept loop) */
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
@@ -261,42 +105,87 @@ int gnitz_server_accept(int server_fd) {
     } while (client_fd < 0 && errno == EINTR);
     return client_fd;
 }
+
+int gnitz_send_framed(int sock_fd, const char *buf, unsigned int len) {
+    /* Write [u32 LE length][payload] with partial-write + EINTR handling. */
+    unsigned char hdr[4];
+    hdr[0] = (unsigned char)(len & 0xFF);
+    hdr[1] = (unsigned char)((len >> 8) & 0xFF);
+    hdr[2] = (unsigned char)((len >> 16) & 0xFF);
+    hdr[3] = (unsigned char)((len >> 24) & 0xFF);
+
+    /* Send header */
+    unsigned int sent = 0;
+    while (sent < 4) {
+        ssize_t n = send(sock_fd, hdr + sent, 4 - sent, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        sent += (unsigned int)n;
+    }
+
+    /* Send payload */
+    sent = 0;
+    while (sent < len) {
+        ssize_t n = send(sock_fd, buf + sent, len - sent, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        sent += (unsigned int)n;
+    }
+    return 0;
+}
+
+int gnitz_recv_header_nb(int sock_fd, char *hdr_buf, int *hdr_pos) {
+    /* Non-blocking read of up to 4 header bytes.
+       Returns: 0 = header complete, -2 = EAGAIN, -1 = error/EOF. */
+    while (*hdr_pos < 4) {
+        ssize_t n = recv(sock_fd, hdr_buf + *hdr_pos, 4 - *hdr_pos, MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+            return -1;
+        }
+        if (n == 0) return -1;  /* EOF */
+        *hdr_pos += (int)n;
+    }
+    return 0;
+}
+
+int gnitz_recv_exact(int sock_fd, char *buf, unsigned int len) {
+    /* Blocking read of exactly len bytes. EINTR + partial-read handling.
+       Returns: 0 = success, -1 = error/EOF. */
+    unsigned int got = 0;
+    while (got < len) {
+        ssize_t n = recv(sock_fd, buf + got, len - got, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;  /* EOF */
+        got += (unsigned int)n;
+    }
+    return 0;
+}
 """
 
 
 eci = ExternalCompilationInfo(
     pre_include_bits=[
-        "int gnitz_ipc_send_fd(int sock_fd, int fd_to_send);",
-        "int gnitz_ipc_recv_fd(int sock_fd);",
-        "int gnitz_ipc_recv_fd_nb(int sock_fd);",
         "int gnitz_ipc_poll_simple(int* fds, int* events, int* revents, int count, int timeout_ms);",
         "int gnitz_socketpair(int fds_out[2]);",
         "int gnitz_server_create(const char *socket_path);",
         "int gnitz_server_accept(int server_fd);",
+        "int gnitz_send_framed(int sock_fd, const char *buf, unsigned int len);",
+        "int gnitz_recv_header_nb(int sock_fd, char *hdr_buf, int *hdr_pos);",
+        "int gnitz_recv_exact(int sock_fd, char *buf, unsigned int len);",
     ],
     separate_module_sources=[IPC_C_CODE],
-    includes=["sys/socket.h", "sys/un.h", "sys/uio.h", "string.h", "unistd.h", "errno.h", "poll.h", "stdlib.h", "fcntl.h"],
-)
-
-_gnitz_ipc_send_fd = rffi.llexternal(
-    "gnitz_ipc_send_fd",
-    [rffi.INT, rffi.INT],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_gnitz_ipc_recv_fd = rffi.llexternal(
-    "gnitz_ipc_recv_fd",
-    [rffi.INT],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_gnitz_ipc_recv_fd_nb = rffi.llexternal(
-    "gnitz_ipc_recv_fd_nb",
-    [rffi.INT],
-    rffi.INT,
-    compilation_info=eci,
+    includes=["sys/socket.h", "sys/un.h", "string.h", "unistd.h", "errno.h", "poll.h", "stdlib.h", "fcntl.h"],
 )
 
 _gnitz_ipc_poll_simple = rffi.llexternal(
@@ -306,72 +195,45 @@ _gnitz_ipc_poll_simple = rffi.llexternal(
 )
 
 
-def send_fd(sock_fd, fd_to_send):
-    """
-    Sends a file descriptor over a Unix Domain Socket.
-    Returns 0 on success, -1 on failure (e.g., EPIPE due to client disconnect).
-    """
-    return int(_gnitz_ipc_send_fd(rffi.cast(rffi.INT, sock_fd), rffi.cast(rffi.INT, fd_to_send)))
-
-
-def recv_fd(sock_fd):
-    """
-    Receives a file descriptor from a Unix Domain Socket.
-    Safely closes extraneous descriptors to prevent FD leaks.
-    Returns the file descriptor, or -1 on failure.
-    """
-    return int(_gnitz_ipc_recv_fd(rffi.cast(rffi.INT, sock_fd)))
-
-
-def recv_fd_nb(sock_fd):
-    """
-    Non-blocking receive of a file descriptor from a Unix Domain Socket.
-    Returns the file descriptor on success, -2 if no message is ready (EAGAIN),
-    -1 on connection close / hard error, or -3 if a message arrived but
-    contained no SCM_RIGHTS fd (malformed frame).
-    """
-    return int(_gnitz_ipc_recv_fd_nb(rffi.cast(rffi.INT, sock_fd)))
-
-
 @jit.dont_look_inside
 def poll(fds, events, timeout_ms):
     """
     High-performance event multiplexer for RPython.
-    
+
     fds: List[int] containing file descriptors.
     events: List[int] containing event masks (e.g., POLLIN).
     timeout_ms: int timeout in milliseconds.
-    
-    Returns: List[int] of `revents`, identically sized and ordered 
+
+    Returns: List[int] of `revents`, identically sized and ordered
              as the input lists.
     """
     count = len(fds)
     revents = newlist_hint(count)
     if count == 0:
         return revents
-        
+
     c_fds = lltype.malloc(rffi.INTP.TO, count, flavor='raw')
     c_events = lltype.malloc(rffi.INTP.TO, count, flavor='raw')
     c_revents = lltype.malloc(rffi.INTP.TO, count, flavor='raw')
-    
+
     try:
         for i in range(count):
             c_fds[i] = rffi.cast(rffi.INT, fds[i])
             c_events[i] = rffi.cast(rffi.INT, events[i])
             c_revents[i] = rffi.cast(rffi.INT, 0)
-            
+
         _gnitz_ipc_poll_simple(
-            c_fds, 
-            c_events, 
-            c_revents, 
-            rffi.cast(rffi.INT, count), 
+            c_fds,
+            c_events,
+            c_revents,
+            rffi.cast(rffi.INT, count),
             rffi.cast(rffi.INT, timeout_ms)
         )
-        
+
         # Iteratively append to avoid RPython mr-poisoning
         for i in range(count):
             revents.append(int(c_revents[i]))
-            
+
     finally:
         lltype.free(c_fds, flavor='raw')
         lltype.free(c_events, flavor='raw')
@@ -420,7 +282,7 @@ _gnitz_server_accept = rffi.llexternal(
 
 
 def server_create(socket_path):
-    """Creates a Unix SEQPACKET server socket, binds, and listens.
+    """Creates a Unix SOCK_STREAM server socket, binds, and listens.
     Returns the server fd, or a negative value on error."""
     buf = rffi.str2charp(socket_path)
     try:
@@ -432,3 +294,62 @@ def server_create(socket_path):
 def server_accept(server_fd):
     """Accepts a new client connection. Returns client fd or -1."""
     return int(_gnitz_server_accept(rffi.cast(rffi.INT, server_fd)))
+
+
+# ---------------------------------------------------------------------------
+# SOCK_STREAM framed transport
+# ---------------------------------------------------------------------------
+
+_gnitz_send_framed = rffi.llexternal(
+    "gnitz_send_framed",
+    [rffi.INT, rffi.CCHARP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_gnitz_recv_header_nb = rffi.llexternal(
+    "gnitz_recv_header_nb",
+    [rffi.INT, rffi.CCHARP, rffi.INTP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_gnitz_recv_exact = rffi.llexternal(
+    "gnitz_recv_exact",
+    [rffi.INT, rffi.CCHARP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+
+@jit.dont_look_inside
+def send_framed(sock_fd, buf_ptr, buf_len):
+    """Send a length-prefixed frame: [u32 LE length][payload].
+    Returns 0 on success, -1 on error."""
+    return int(_gnitz_send_framed(
+        rffi.cast(rffi.INT, sock_fd),
+        buf_ptr,
+        rffi.cast(rffi.UINT, buf_len),
+    ))
+
+
+@jit.dont_look_inside
+def recv_header_nb(sock_fd, hdr_buf, hdr_pos_ptr):
+    """Non-blocking read of up to 4 header bytes.
+    Returns: 0 = header complete, -2 = EAGAIN, -1 = error/EOF."""
+    return int(_gnitz_recv_header_nb(
+        rffi.cast(rffi.INT, sock_fd),
+        hdr_buf,
+        hdr_pos_ptr,
+    ))
+
+
+@jit.dont_look_inside
+def recv_exact(sock_fd, buf_ptr, buf_len):
+    """Blocking read of exactly buf_len bytes.
+    Returns: 0 = success, -1 = error/EOF."""
+    return int(_gnitz_recv_exact(
+        rffi.cast(rffi.INT, sock_fd),
+        buf_ptr,
+        rffi.cast(rffi.UINT, buf_len),
+    ))

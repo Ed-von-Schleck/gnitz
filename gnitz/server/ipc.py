@@ -251,6 +251,8 @@ class IPCPayload(object):
         self.fd           = -1
         self.ptr          = lltype.nullptr(rffi.CCHARP.TO)
         self.total_size   = r_uint64(0)
+        self.raw_buf      = lltype.nullptr(rffi.CCHARP.TO)
+        self.raw_buf_size = 0
         self.batch        = None
         self.schema       = None
         self.target_id    = 0
@@ -263,6 +265,10 @@ class IPCPayload(object):
         self.error_msg    = ""
 
     def close(self):
+        if self.raw_buf:
+            lltype.free(self.raw_buf, flavor='raw')
+            self.raw_buf = lltype.nullptr(rffi.CCHARP.TO)
+            self.raw_buf_size = 0
         if self.ptr:
             mmap_posix.munmap_file(self.ptr, intmask(self.total_size))
             self.ptr = lltype.nullptr(rffi.CCHARP.TO)
@@ -428,62 +434,127 @@ def _encode_wire(target_id, client_id, zbatch, schema, flags,
 
 
 @jit.dont_look_inside
-def serialize_to_memfd(target_id, client_id, zbatch, schema, flags,
-                       seek_pk_lo, seek_pk_hi, seek_col_idx,
-                       status, error_msg):
-    wire_buf = _encode_wire(target_id, client_id, zbatch, schema, flags,
-                            seek_pk_lo, seek_pk_hi, seek_col_idx,
-                            status, error_msg)
-    try:
-        total_size = wire_buf.offset
-        if total_size == 0:
-            total_size = wal_layout.WAL_BLOCK_HEADER_SIZE  # defensive floor
-
-        fd = mmap_posix.memfd_create_c("gnitz_ipc")
-        mmap_posix.ftruncate_c(fd, total_size)
-        ptr = mmap_posix.mmap_file(
-            fd, total_size,
-            prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
-            flags=mmap_posix.MAP_SHARED,
-        )
-        buffer_ops.c_memmove(
-            rffi.cast(rffi.VOIDP, ptr),
-            rffi.cast(rffi.VOIDP, wire_buf.base_ptr),
-            rffi.cast(rffi.SIZE_T, total_size),
-        )
-        mmap_posix.munmap_file(ptr, total_size)
-    finally:
-        wire_buf.free()
-
-    return fd, total_size
-
-
-@jit.dont_look_inside
-def send_batch(sock_fd, target_id, zbatch, status=0, error_msg="",
-               client_id=0, schema=None, flags=0,
-               seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
-    """Synchronous send: Serializes and transmits a single IPC batch."""
+def send_framed(sock_fd, target_id, zbatch, status=0, error_msg="",
+                client_id=0, schema=None, flags=0,
+                seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
+    """Send a length-prefixed IPC message over SOCK_STREAM."""
     eff_schema = schema
     if eff_schema is None and zbatch is not None:
         eff_schema = zbatch._schema
-    memfd, _total = serialize_to_memfd(
-        target_id, client_id, zbatch,
-        eff_schema, flags, seek_pk_lo, seek_pk_hi, seek_col_idx,
-        status, error_msg,
-    )
+    wire_buf = _encode_wire(target_id, client_id, zbatch,
+                            eff_schema, flags, seek_pk_lo, seek_pk_hi,
+                            seek_col_idx, status, error_msg)
     try:
-        if ipc_ffi.send_fd(sock_fd, memfd) < 0:
-            raise errors.StorageError("Failed to transmit IPC segment (Disconnected)")
+        if ipc_ffi.send_framed(sock_fd, wire_buf.base_ptr, wire_buf.offset) < 0:
+            raise errors.StorageError("Failed to send framed IPC message (Disconnected)")
     finally:
-        os.close(memfd)
+        wire_buf.free()
 
 
-def send_error(sock_fd, error_msg, target_id=0, client_id=0):
-    """Convenience helper to send an error response."""
-    send_batch(
+def send_framed_error(sock_fd, error_msg, target_id=0, client_id=0):
+    """Convenience helper to send an error response over SOCK_STREAM."""
+    send_framed(
         sock_fd, target_id, None,
         status=STATUS_ERROR, error_msg=error_msg, client_id=client_id,
     )
+
+
+@jit.dont_look_inside
+def recv_framed(sock_fd):
+    """Blocking receive of a length-prefixed IPC message.
+    Returns an IPCPayload owning the raw buffer."""
+    hdr_buf = lltype.malloc(rffi.CCHARP.TO, 4, flavor='raw')
+    try:
+        if ipc_ffi.recv_exact(sock_fd, hdr_buf, 4) < 0:
+            raise errors.ClientDisconnectedError("recv_framed: header read failed")
+        payload_len = (
+            (ord(hdr_buf[0]) & 0xFF)
+            | ((ord(hdr_buf[1]) & 0xFF) << 8)
+            | ((ord(hdr_buf[2]) & 0xFF) << 16)
+            | ((ord(hdr_buf[3]) & 0xFF) << 24)
+        )
+    finally:
+        lltype.free(hdr_buf, flavor='raw')
+
+    if payload_len == 0:
+        raise errors.ClientDisconnectedError("recv_framed: zero-length (close sentinel)")
+
+    raw = lltype.malloc(rffi.CCHARP.TO, payload_len, flavor='raw')
+    if ipc_ffi.recv_exact(sock_fd, raw, payload_len) < 0:
+        lltype.free(raw, flavor='raw')
+        raise errors.ClientDisconnectedError("recv_framed: payload read failed")
+
+    try:
+        inner = _parse_from_ptr(raw, payload_len)
+    except Exception as e:
+        lltype.free(raw, flavor='raw')
+        raise e
+
+    payload = IPCPayload()
+    payload.raw_buf = raw
+    payload.raw_buf_size = payload_len
+    payload.batch        = inner.batch
+    payload.schema       = inner.schema
+    payload.target_id    = inner.target_id
+    payload.client_id    = inner.client_id
+    payload.flags        = inner.flags
+    payload.seek_col_idx = inner.seek_col_idx
+    payload.seek_pk_lo   = inner.seek_pk_lo
+    payload.seek_pk_hi   = inner.seek_pk_hi
+    payload.status       = inner.status
+    payload.error_msg    = inner.error_msg
+    return payload
+
+
+@jit.dont_look_inside
+def try_recv_framed(sock_fd, hdr_buf, hdr_pos_ptr):
+    """Non-blocking receive of a length-prefixed IPC message.
+    Returns IPCPayload on success, None on EAGAIN.
+    Raises ClientDisconnectedError on error/EOF."""
+    rc = ipc_ffi.recv_header_nb(sock_fd, hdr_buf, hdr_pos_ptr)
+    if rc == -2:
+        return None  # EAGAIN
+    if rc < 0:
+        raise errors.ClientDisconnectedError("Client disconnected")
+
+    # Header complete — decode payload length
+    payload_len = (
+        (ord(hdr_buf[0]) & 0xFF)
+        | ((ord(hdr_buf[1]) & 0xFF) << 8)
+        | ((ord(hdr_buf[2]) & 0xFF) << 16)
+        | ((ord(hdr_buf[3]) & 0xFF) << 24)
+    )
+    # Reset header position for next message
+    hdr_pos_ptr[0] = rffi.cast(rffi.INT, 0)
+
+    if payload_len == 0:
+        raise errors.ClientDisconnectedError("Client sent close sentinel")
+
+    raw = lltype.malloc(rffi.CCHARP.TO, payload_len, flavor='raw')
+    if ipc_ffi.recv_exact(sock_fd, raw, payload_len) < 0:
+        lltype.free(raw, flavor='raw')
+        raise errors.ClientDisconnectedError("Payload read failed")
+
+    try:
+        inner = _parse_from_ptr(raw, payload_len)
+    except Exception as e:
+        lltype.free(raw, flavor='raw')
+        raise e
+
+    payload = IPCPayload()
+    payload.raw_buf = raw
+    payload.raw_buf_size = payload_len
+    payload.batch        = inner.batch
+    payload.schema       = inner.schema
+    payload.target_id    = inner.target_id
+    payload.client_id    = inner.client_id
+    payload.flags        = inner.flags
+    payload.seek_col_idx = inner.seek_col_idx
+    payload.seek_pk_lo   = inner.seek_pk_lo
+    payload.seek_pk_hi   = inner.seek_pk_hi
+    payload.status       = inner.status
+    payload.error_msg    = inner.error_msg
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -547,65 +618,6 @@ def _parse_from_ptr(ptr, total_size):
             payload.batch.mark_consolidated(True)
 
     return payload
-
-
-@jit.dont_look_inside
-def _recv_and_parse(fd):
-    payload = IPCPayload()
-    payload.fd = fd
-
-    total_size = intmask(r_uint64(mmap_posix.fget_size(fd)))
-    if total_size < wal_layout.WAL_BLOCK_HEADER_SIZE:
-        raise errors.StorageError("IPC payload too small")
-    payload.total_size = r_uint64(total_size)
-
-    ptr = mmap_posix.mmap_file(
-        fd, total_size,
-        prot=mmap_posix.PROT_READ,
-        flags=mmap_posix.MAP_SHARED,
-    )
-    payload.ptr = ptr
-
-    try:
-        inner = _parse_from_ptr(ptr, total_size)
-        # Transfer parsed fields to the owning payload (which has fd + ptr)
-        payload.batch        = inner.batch
-        payload.schema       = inner.schema
-        payload.target_id    = inner.target_id
-        payload.client_id    = inner.client_id
-        payload.flags        = inner.flags
-        payload.seek_col_idx = inner.seek_col_idx
-        payload.seek_pk_lo   = inner.seek_pk_lo
-        payload.seek_pk_hi   = inner.seek_pk_hi
-        payload.status       = inner.status
-        payload.error_msg    = inner.error_msg
-    except Exception as e:
-        payload.close()
-        raise e
-
-    return payload
-
-
-@jit.dont_look_inside
-def receive_payload(sock_fd):
-    """Receives an IPC segment. Self-describing — no registry needed."""
-    fd = ipc_ffi.recv_fd(sock_fd)
-    if fd < 0:
-        raise errors.StorageError("Failed to receive IPC descriptor (Socket closed)")
-    return _recv_and_parse(fd)
-
-
-@jit.dont_look_inside
-def try_receive_payload(sock_fd):
-    """Non-blocking receive. Returns None if no message ready (EAGAIN)."""
-    fd = ipc_ffi.recv_fd_nb(sock_fd)
-    if fd == -2:
-        return None
-    if fd == -1:
-        raise errors.ClientDisconnectedError("Client disconnected")
-    if fd < 0:
-        raise errors.StorageError("Message received without file descriptor")
-    return _recv_and_parse(fd)
 
 
 # ---------------------------------------------------------------------------

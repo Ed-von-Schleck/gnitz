@@ -250,30 +250,30 @@ def test_unowned_buffer_lifecycle():
         lltype.free(raw_mem, flavor="raw")
 
 
-def test_ipc_fd_hardening():
-    """Verifies that the C-FFI layer handles FD passing and prevents leaks."""
-    os.write(1, "[IPC] Testing Hardened FD Passing (SCM_RIGHTS)...\n")
+def test_ipc_framed_transport():
+    """Verifies the SOCK_STREAM length-prefixed framed transport layer."""
+    os.write(1, "[IPC] Testing Framed Transport (SOCK_STREAM)...\n")
 
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
 
     try:
-        fd_to_send = mmap_posix.memfd_create_c("test_fd")
-        mmap_posix.ftruncate_c(fd_to_send, 1024)
+        # Build a wire payload with _encode_wire
+        schema = make_test_schema()
+        zbatch = batch.ArenaZSetBatch(schema, initial_capacity=1)
+        rb = RowBuilder(schema, zbatch)
+        rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
+        rb.put_string("framed_test")
+        rb.commit()
 
-        res = ipc_ffi.send_fd(s1.fd, fd_to_send)
-        assert_equal_i(0, res, "Failed to send FD")
+        ipc.send_framed(s1.fd, 42, zbatch, status=0, error_msg="")
+        payload = ipc.recv_framed(s2.fd)
 
-        received_fd = ipc_ffi.recv_fd(s2.fd)
-        assert_true(received_fd >= 0, "Failed to receive FD")
+        assert_equal_i(0, payload.status, "Status mismatch")
+        assert_true(payload.batch is not None, "Batch should be present")
+        assert_equal_i(1, payload.batch.length(), "Batch count mismatch")
 
-        assert_equal_i(
-            1024,
-            mmap_posix.fget_size(received_fd),
-            "FD content mismatch",
-        )
-
-        os.close(fd_to_send)
-        os.close(received_fd)
+        payload.close()
+        zbatch.free()
     finally:
         s1.close()
         s2.close()
@@ -312,7 +312,7 @@ def test_ipc_roundtrip():
     os.write(1, "[IPC] Testing IPC Roundtrip...\n")
 
     schema = make_test_schema()
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
 
     try:
         zbatch = batch.ArenaZSetBatch(schema, initial_capacity=10)
@@ -324,9 +324,9 @@ def test_ipc_roundtrip():
         rb.put_string("Short")
         rb.commit()
 
-        ipc.send_batch(s1.fd, 42, zbatch, status=0, error_msg="")
+        ipc.send_framed(s1.fd, 42, zbatch, status=0, error_msg="")
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
 
         assert_equal_i(0, payload.status, "Status mismatch")
         assert_true(payload.schema is not None, "Schema should be present")
@@ -374,7 +374,7 @@ def test_int_only_roundtrip():
     os.write(1, "[IPC] Testing Int-Only Roundtrip...\n")
 
     schema = make_int_only_schema()
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
 
     try:
         zbatch = batch.ArenaZSetBatch(schema, initial_capacity=10)
@@ -388,9 +388,9 @@ def test_int_only_roundtrip():
         rb.put_int(r_int64(255))
         rb.commit()
 
-        ipc.send_batch(s1.fd, 10, zbatch, status=0)
+        ipc.send_framed(s1.fd, 10, zbatch, status=0)
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
 
         assert_equal_i(0, payload.status, "Status mismatch")
         assert_true(payload.batch is not None, "Batch should be present")
@@ -414,12 +414,12 @@ def test_error_path():
     """Verifies that error responses work."""
     os.write(1, "[IPC] Testing Error Path...\n")
 
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
 
     try:
-        ipc.send_error(s1.fd, "Fatal VM Crash")
+        ipc.send_framed_error(s1.fd, "Fatal VM Crash")
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
         assert_equal_i(1, payload.status, "Error status mismatch")
         assert_true(
             payload.error_msg == "Fatal VM Crash", "Error string mismatch"
@@ -441,13 +441,13 @@ def test_scan_request():
     """Verifies empty push (scan request) has no schema or data."""
     os.write(1, "[IPC] Testing Scan Request...\n")
 
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
 
     try:
         # Send empty push (scan request): no data, no schema
-        ipc.send_batch(s1.fd, 42, None, status=0)
+        ipc.send_framed(s1.fd, 42, None, status=0)
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
         assert_equal_i(0, payload.status, "Status mismatch")
         assert_true(payload.batch is None, "Scan request should have no batch")
         assert_equal_i(42, payload.target_id, "Target ID mismatch")
@@ -463,7 +463,7 @@ def test_string_roundtrip():
     os.write(1, "[IPC] Testing String Roundtrip...\n")
 
     schema = make_test_schema()
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
 
     try:
         zbatch = batch.ArenaZSetBatch(schema, initial_capacity=10)
@@ -483,9 +483,9 @@ def test_string_roundtrip():
             rb.put_string(test_strings[i])
             rb.commit()
 
-        ipc.send_batch(s1.fd, 42, zbatch, status=0)
+        ipc.send_framed(s1.fd, 42, zbatch, status=0)
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
         assert_equal_i(len(test_strings), payload.batch.length(), "Row count mismatch")
 
         for i in range(len(test_strings)):
@@ -513,7 +513,7 @@ def test_null_strings():
         types.ColumnDefinition(types.TYPE_STRING, is_nullable=True, name="data"),
     ]
     schema = types.TableSchema(cols, 0)
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
 
     try:
         zbatch = batch.ArenaZSetBatch(schema, initial_capacity=10)
@@ -529,9 +529,9 @@ def test_null_strings():
         rb.put_null()
         rb.commit()
 
-        ipc.send_batch(s1.fd, 42, zbatch, status=0)
+        ipc.send_framed(s1.fd, 42, zbatch, status=0)
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
         assert_equal_i(2, payload.batch.length(), "Row count mismatch")
 
         # Row 0: non-null
@@ -562,7 +562,7 @@ def test_multi_string_column_roundtrip():
         types.ColumnDefinition(types.TYPE_STRING, name="description"),
     ]
     schema = types.TableSchema(cols, 0)
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
 
     try:
         zbatch = batch.ArenaZSetBatch(schema, initial_capacity=4)
@@ -579,9 +579,9 @@ def test_multi_string_column_roundtrip():
             rb.put_string(descs[i])
             rb.commit()
 
-        ipc.send_batch(s1.fd, 77, zbatch, status=0)
+        ipc.send_framed(s1.fd, 77, zbatch, status=0)
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
         assert_equal_i(0, payload.status, "Status mismatch")
         assert_true(payload.batch is not None, "Batch should be present")
         assert_equal_i(4, payload.batch.length(), "Row count mismatch")
@@ -624,7 +624,7 @@ def test_long_column_name_roundtrip():
         ],
         pk_index=0,
     )
-    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_SEQPACKET)
+    s1, s2 = rsocket.socketpair(rsocket.AF_UNIX, rsocket.SOCK_STREAM)
     try:
         b = batch.ArenaZSetBatch(schema, initial_capacity=2)
         rb = RowBuilder(schema, b)
@@ -637,9 +637,9 @@ def test_long_column_name_roundtrip():
         rb.put_string("this is a longer string value")
         rb.commit()
 
-        ipc.send_batch(s1.fd, 7, b, status=0)
+        ipc.send_framed(s1.fd, 7, b, status=0)
 
-        payload = ipc.receive_payload(s2.fd)
+        payload = ipc.recv_framed(s2.fd)
         assert_equal_i(0, payload.status, "Status mismatch")
         assert_true(payload.batch is not None, "Batch should be present")
         assert_equal_i(2, payload.batch.length(), "Row count mismatch")
@@ -904,7 +904,7 @@ def entry_point(argv):
     try:
         # IPC tests (no engine needed)
         test_unowned_buffer_lifecycle()
-        test_ipc_fd_hardening()
+        test_ipc_framed_transport()
         test_meta_schema_roundtrip()
         test_ipc_roundtrip()
         test_int_only_roundtrip()
