@@ -238,7 +238,10 @@ def load_xor8(filepath):
     if file_size < 16:
         return None
 
-    fd = rposix.open(filepath, os.O_RDONLY, 0)
+    try:
+        fd = rposix.open(filepath, os.O_RDONLY, 0)
+    except OSError:
+        return None
     try:
         header_data = rposix.read(fd, 16)
         if len(header_data) < 16:

@@ -45,7 +45,10 @@ class TableShardView(object):
         self.ptr = lltype.nullptr(rffi.CCHARP.TO)
         self.size = 0 # lltype.Signed
 
-        fd = rposix.open(filename, os.O_RDONLY, 0)
+        try:
+            fd = rposix.open(filename, os.O_RDONLY, 0)
+        except OSError:
+            raise errors.StorageError("shard file missing: " + filename)
         try:
             st = rposix_stat.fstat(fd)
             # Authoritatively cast file size to Signed and guard non-negativity

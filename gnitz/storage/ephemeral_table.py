@@ -257,7 +257,7 @@ class EphemeralTable(ZSetStore):
 
         # Avoid os.path.join (Appendix A §10)
         self._flush_seq += 1
-        shard_name = EPH_SHARD_PREFIX + "%d_%d.db" % (self.table_id, self._flush_seq)
+        shard_name = EPH_SHARD_PREFIX + "%d_%d_%d.db" % (self.table_id, os.getpid(), self._flush_seq)
         shard_path = self.directory + "/" + shard_name
 
         self.memtable.flush(shard_path, self.table_id, durable=False)

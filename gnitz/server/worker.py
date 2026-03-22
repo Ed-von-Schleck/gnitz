@@ -261,7 +261,8 @@ class WorkerProcess(object):
         except OSError as oe:
             os.write(2,
                 "W" + str(self.worker_id) + " OSError errno="
-                + str(oe.errno) + "\n")
+                + str(oe.errno) + " strerror="
+                + os.strerror(oe.errno) + "\n")
             self._shutdown()
             return True
         except Exception as e:
