@@ -25,6 +25,7 @@ jitdriver = jit.JitDriver(
     greens=["pc", "program"],
     reds=["context", "reg_file"],
     get_printable_location=get_printable_location,
+    vectorize=True,
 )
 
 def run_vm(program, reg_file, context):

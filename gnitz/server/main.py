@@ -58,6 +58,7 @@ HELP_TEXT = (
     "\n"
     "Environment:\n"
     "  GNITZ_LOG_LEVEL    Same as --log-level; CLI flag takes precedence\n"
+    "  GNITZ_JIT          JIT tuning (e.g. 'vec=1'); ignored on nojit builds\n"
 )
 
 
@@ -172,6 +173,11 @@ def entry_point(argv):
         i += 1
 
     log.init(level)
+
+    jit_params = os.environ.get("GNITZ_JIT")
+    if jit_params is not None:
+        from rpython.rlib.jit import set_user_param
+        set_user_param(None, jit_params)
 
     if pos < 2:
         os.write(2, "Error: missing required arguments\n")

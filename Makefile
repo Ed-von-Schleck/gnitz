@@ -7,6 +7,7 @@ RPYFLAGS_DEV     := --opt=1 --gc=incminimark --lldebug
 RPYFLAGS_RELEASE := --opt=jit --gc=incminimark --lto
 RPYFLAGS_NOJIT   := --opt=2   --gc=incminimark --lto
 RPYFLAGS         ?= $(RPYFLAGS_DEV)
+RELEASE_CFLAGS   ?= -march=native
 
 TEST_FILES := \
 	rpython_tests/core_comprehensive_test.py \
@@ -162,10 +163,10 @@ prove:
 	$(MAKE) -C proofs prove
 
 release-server:
-	$(RPYTHON) $(RPYFLAGS_RELEASE) --output=gnitz-server-release-c gnitz/server/main.py
+	CFLAGS="$(RELEASE_CFLAGS)" $(RPYTHON) $(RPYFLAGS_RELEASE) --output=gnitz-server-release-c gnitz/server/main.py
 
 release-server-nojit:
-	$(RPYTHON) $(RPYFLAGS_NOJIT) --output=gnitz-server-nojit-c gnitz/server/main.py
+	CFLAGS="$(RELEASE_CFLAGS)" $(RPYTHON) $(RPYFLAGS_NOJIT) --output=gnitz-server-nojit-c gnitz/server/main.py
 
 release-test:
-	$(MAKE) test RPYFLAGS="$(RPYFLAGS_RELEASE)"
+	CFLAGS="$(RELEASE_CFLAGS)" $(MAKE) test RPYFLAGS="$(RPYFLAGS_RELEASE)"
