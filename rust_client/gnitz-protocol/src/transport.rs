@@ -10,6 +10,8 @@ fn io_err() -> ProtocolError {
 fn send_all(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
     let mut sent = 0usize;
     while sent < data.len() {
+        // SAFETY: sock_fd validity is the caller's invariant; pointer/len come from
+        // a valid &[u8] sub-slice so they are always in-bounds and aligned.
         let n = unsafe {
             libc::send(
                 sock_fd,
@@ -37,6 +39,7 @@ fn send_all(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
 fn recv_exact(sock_fd: RawFd, buf: &mut [u8]) -> Result<(), ProtocolError> {
     let mut got = 0usize;
     while got < buf.len() {
+        // SAFETY: same as send_all — pointer/len from a valid &mut [u8] sub-slice.
         let n = unsafe {
             libc::recv(
                 sock_fd,
@@ -61,6 +64,8 @@ fn recv_exact(sock_fd: RawFd, buf: &mut [u8]) -> Result<(), ProtocolError> {
 }
 
 pub fn connect(socket_path: &str) -> Result<RawFd, ProtocolError> {
+    // SAFETY: All libc calls operate on kernel-managed resources; addr is zeroed
+    // then partially filled with the path (length-checked against sun_path capacity).
     unsafe {
         let sock_fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         if sock_fd < 0 {
@@ -97,14 +102,11 @@ pub fn connect(socket_path: &str) -> Result<RawFd, ProtocolError> {
 }
 
 /// Send a length-prefixed frame: [u32 LE payload_length][payload bytes].
-/// Combines header + payload into one syscall via writev to halve syscall count.
+/// Two send_all calls avoid allocating a combined buffer for large payloads.
 pub fn send_framed(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
-    let len = data.len() as u32;
-    let hdr = len.to_le_bytes();
-    let mut combined = Vec::with_capacity(4 + data.len());
-    combined.extend_from_slice(&hdr);
-    combined.extend_from_slice(data);
-    send_all(sock_fd, &combined)
+    let hdr = (data.len() as u32).to_le_bytes();
+    send_all(sock_fd, &hdr)?;
+    send_all(sock_fd, data)
 }
 
 /// Receive a length-prefixed frame. Returns the payload bytes.

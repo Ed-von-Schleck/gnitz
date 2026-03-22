@@ -27,12 +27,14 @@ fn append_region(buf: &mut Vec<u8>, data: &[u8]) -> (u32, u32) {
 }
 
 /// Serialize a `&[T]` (T = u64 or i64) directly into `buf` at 8-byte alignment via bulk memcpy.
-/// SAFETY: Correct on little-endian (x86_64) — matches to_le_bytes() output.
+/// Correct on little-endian (x86_64) — native layout matches to_le_bytes() output.
 fn append_64bit_region<T: Copy>(buf: &mut Vec<u8>, vals: &[T]) -> (u32, u32) {
     debug_assert_eq!(std::mem::size_of::<T>(), 8);
     let aligned = align8(buf.len());
     let sz = vals.len() * 8;
     buf.resize(aligned, 0);
+    // SAFETY: T is 8 bytes (asserted above); reinterpreting as &[u8] is valid
+    // because the output is consumed as opaque bytes, not as typed values.
     let src = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, sz) };
     buf.extend_from_slice(src);
     (aligned as u32, sz as u32)
@@ -128,6 +130,8 @@ fn read_64bit_region<T: Copy + Default>(
     }
     let src = &data[off..off + expected];
     let mut v: Vec<T> = vec![T::default(); count];
+    // SAFETY: src is `expected` bytes (bounds-checked above); v has room for
+    // `count` Ts = `expected` bytes.  Both are valid, non-overlapping regions.
     unsafe {
         std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr() as *mut u8, expected);
     }
@@ -172,12 +176,10 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                 let mut col_bytes = Vec::with_capacity(count * 16);
                 for (row, val) in strings.iter().enumerate() {
                     let is_null = (batch.nulls[row] & (1u64 << payload_idx)) != 0;
-                    if is_null || val.is_none() {
-                        col_bytes.extend_from_slice(&[0u8; 16]);
+                    if let (false, Some(s)) = (is_null, val.as_deref()) {
+                        col_bytes.extend_from_slice(&encode_german_string(s, &mut blob));
                     } else {
-                        let s = val.as_ref().unwrap();
-                        let st = encode_german_string(s, &mut blob);
-                        col_bytes.extend_from_slice(&st);
+                        col_bytes.extend_from_slice(&[0u8; 16]);
                     }
                 }
                 col_regions.push(ColRegion::Prebuilt(col_bytes));
