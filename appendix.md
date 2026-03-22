@@ -76,7 +76,8 @@
 10. **Slicing Proof Failure:** Using `s[:i]` or `s[i:]` where `i` is derived from arithmetic or `rfind`. The annotator fails with `AnnotatorError: slicing: not proven to have non-negative stop` because it cannot statically prove `i >= 0`.
     *   **Fix:** Avoid `os.path` (which slices internally) in favor of `rpython.rlib.rposix` functions. For manual slicing, use an explicit `assert i >= 0` immediately before the slice to guide the annotator's type inference.
 11. **Signedness UnionError:** Occurs when a single function or method (e.g., `Buffer.put_i64`) is called in different places with both signed (`r_int64`) and unsigned (`r_uint64`) integers. RPython cannot unify these into a single type. **Fix:** Use `rffi.cast(rffi.LONGLONG, ...)` at the call site to ensure all inputs are consistently treated as signed machine words.
-12. **Unsigned Logical Comparison:** Comparing unsigned bit patterns (retrieved via `get_int()`) for columns that are logically signed (`TYPE_I64`, etc.). This causes negative numbers to sort as larger than positive numbers. **Fix:** Always cast to `r_int64` (using 
+12. **Unsigned Logical Comparison:** Comparing unsigned bit patterns (retrieved via `get_int()`) for columns that are logically signed (`TYPE_I64`, etc.). This causes negative numbers to sort as larger than positive numbers. **Fix:** Always cast to `r_int64` (using `rffi.cast`).
+13. **`rffi.c_memcpy` Const-Correctness:** `rffi.c_memcpy`'s source parameter is declared `const void *` (`render_as_const`). Passing a regular `rffi.VOIDP` causes an `AnnotatorError`. **Fix:** Use `c_memmove` from `gnitz/storage/buffer.py` — it accepts `(VOIDP, VOIDP, SIZE_T)` without const qualifiers.
 
 # Appendix B: Coding practices
 
