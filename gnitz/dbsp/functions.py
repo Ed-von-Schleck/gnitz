@@ -79,6 +79,23 @@ class UniversalPredicate(ScalarFunction):
             if op == OP_LT: return val < const
         return True
 
+    def evaluate_predicate_direct(self, in_batch, row_idx):
+        op = jit.promote(self.op)
+        is_float = jit.promote(self.is_float)
+        if is_float:
+            val = in_batch._read_col_float(row_idx, self.col_idx)
+            const = longlong2float(rffi.cast(rffi.LONGLONG, self.val_bits))
+            if op == OP_EQ: return val == const
+            if op == OP_GT: return val > const
+            if op == OP_LT: return val < const
+        else:
+            val = rffi.cast(rffi.LONGLONG, in_batch._read_col_int(row_idx, self.col_idx))
+            const = rffi.cast(rffi.LONGLONG, self.val_bits)
+            if op == OP_EQ: return val == const
+            if op == OP_GT: return val > const
+            if op == OP_LT: return val < const
+        return True
+
 
 class UniversalProjection(ScalarFunction):
     """

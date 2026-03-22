@@ -368,8 +368,9 @@ class ExprPredicate(ScalarFunction):
         return (not is_null) and (result != r_int64(0))
 
     def evaluate_predicate_direct(self, in_batch, row_idx):
+        row_null_word = in_batch._read_null_word(row_idx)
         result, is_null, _ = _eval_row_direct(
-            self.program, in_batch, row_idx,
+            self.program, in_batch, row_idx, row_null_word,
             _NO_EMIT_BASES, _NO_EMIT_STRIDES, _NO_EMIT_PAYLOADS)
         return (not is_null) and (result != r_int64(0))
 
@@ -388,7 +389,7 @@ _NO_EMIT_PAYLOADS = [0][0:0]
 # ---------------------------------------------------------------------------
 
 @jit.unroll_safe
-def _eval_row_direct(program, in_batch, row_idx,
+def _eval_row_direct(program, in_batch, row_idx, row_null_word,
                               emit_bases, emit_strides, emit_payloads):
     """Evaluate compute instructions for one row, writing EMIT results
     directly to pre-allocated output column buffers.
@@ -422,7 +423,7 @@ def _eval_row_direct(program, in_batch, row_idx,
                 regs[dst] = rffi.cast(rffi.LONGLONG, in_batch._read_pk_lo(row_idx))
             else:
                 pi = a1 if a1 < pk_idx else a1 - 1
-                nw = in_batch._read_null_word(row_idx)
+                nw = row_null_word
                 null[dst] = bool(nw & (r_uint64(1) << pi))
                 regs[dst] = rffi.cast(rffi.LONGLONG, in_batch._read_col_int(row_idx, a1))
 
@@ -432,7 +433,7 @@ def _eval_row_direct(program, in_batch, row_idx,
                 regs[dst] = float2longlong(0.0)
             else:
                 pi = a1 if a1 < pk_idx else a1 - 1
-                nw = in_batch._read_null_word(row_idx)
+                nw = row_null_word
                 null[dst] = bool(nw & (r_uint64(1) << pi))
                 regs[dst] = float2longlong(in_batch._read_col_float(row_idx, a1))
 
@@ -799,9 +800,11 @@ class ExprMapFunction(ScalarFunction):
             col_type = out_schema.columns[out_ci].field_type
             dest_base = out_batch.col_bufs[out_ci].alloc_n(
                 n, stride, col_type.alignment)
-            total = n * stride
-            for b in range(total):
-                dest_base[b] = '\x00'
+            _buf.c_memset(
+                rffi.cast(rffi.VOIDP, dest_base),
+                rffi.cast(rffi.INT, 0),
+                rffi.cast(rffi.SIZE_T, n * stride),
+            )
 
         # Phase 4: EMIT columns + null bitmap
         emit_pls = self._emit_out_payloads
@@ -844,7 +847,7 @@ class ExprMapFunction(ScalarFunction):
             # Execute compute
             if self._has_compute:
                 _, _, mask = _eval_row_direct(
-                    self.program, in_batch, row,
+                    self.program, in_batch, row, in_null,
                     emit_bases, emit_strides, emit_pls)
                 out_null |= mask
 
