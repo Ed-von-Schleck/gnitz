@@ -171,6 +171,20 @@ int gnitz_recv_exact(int sock_fd, char *buf, unsigned int len) {
     }
     return 0;
 }
+
+int gnitz_unix_connect(const char *path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
 """
 
 
@@ -183,6 +197,7 @@ eci = ExternalCompilationInfo(
         "int gnitz_send_framed(int sock_fd, const char *buf, unsigned int len);",
         "int gnitz_recv_header_nb(int sock_fd, char *hdr_buf, int *hdr_pos);",
         "int gnitz_recv_exact(int sock_fd, char *buf, unsigned int len);",
+        "int gnitz_unix_connect(const char *path);",
     ],
     separate_module_sources=[IPC_C_CODE],
     includes=["sys/socket.h", "sys/un.h", "string.h", "unistd.h", "errno.h", "poll.h", "stdlib.h", "fcntl.h"],
@@ -353,3 +368,24 @@ def recv_exact(sock_fd, buf_ptr, buf_len):
         buf_ptr,
         rffi.cast(rffi.UINT, buf_len),
     ))
+
+
+# ---------------------------------------------------------------------------
+# Unix domain socket connect
+# ---------------------------------------------------------------------------
+
+_gnitz_unix_connect = rffi.llexternal(
+    "gnitz_unix_connect",
+    [rffi.CCHARP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+
+def unix_connect(socket_path):
+    """Connect to a Unix SOCK_STREAM socket. Returns client fd or -1."""
+    buf = rffi.str2charp(socket_path)
+    try:
+        return int(_gnitz_unix_connect(buf))
+    finally:
+        rffi.free_charp(buf)
