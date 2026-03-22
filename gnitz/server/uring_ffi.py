@@ -17,7 +17,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core.errors import StorageError
 
 # ---------------------------------------------------------------------------
-# CQE flag constants (exported for Step 5)
+# CQE flag constants
 # ---------------------------------------------------------------------------
 
 CQE_F_MORE = 1 << 1  # Multishot: parent SQE will generate more CQEs

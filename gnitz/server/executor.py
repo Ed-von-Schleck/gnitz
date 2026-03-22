@@ -290,7 +290,7 @@ class ServerExecutor(object):
         self._tick_rows    = {}               # tid -> int (rows accumulated since last tick)
         self._t_first_tick = 0.0             # wall-clock time of oldest pending tick
 
-        # Per-connection SOCK_STREAM header buffers (Step 3)
+        # Per-connection SOCK_STREAM header buffers
         self._client_hdr_bufs = {}   # int(fd) -> rffi.CCHARP (4 raw bytes)
         self._client_hdr_pos  = {}   # int(fd) -> rffi.INTP (1-element raw array)
 
@@ -444,20 +444,7 @@ class ServerExecutor(object):
                     pending_schemas,
                 )
 
-            # Fire deferred ticks if coalesce threshold or deadline reached
-            if len(self._tick_tids) > 0:
-                t_now = time.time()
-                should_fire = False
-                for tid in self._tick_tids:
-                    if self._tick_rows[tid] >= TICK_COALESCE_ROWS:
-                        should_fire = True
-                        break
-                if not should_fire and self._t_first_tick > 0.0:
-                    elapsed_ms = int((t_now - self._t_first_tick) * 1000.0)
-                    if elapsed_ms >= TICK_DEADLINE_MS:
-                        should_fire = True
-                if should_fire:
-                    self._fire_pending_ticks()
+            self._check_and_fire_pending_ticks()
 
     # -- io_uring event loop ------------------------------------------------
 
@@ -567,19 +554,7 @@ class ServerExecutor(object):
                 pending_schemas = newlist_hint(16)
                 pending_row_count = 0
 
-            if len(self._tick_tids) > 0:
-                t_now = time.time()
-                should_fire = False
-                for tid in self._tick_tids:
-                    if self._tick_rows[tid] >= TICK_COALESCE_ROWS:
-                        should_fire = True
-                        break
-                if not should_fire and self._t_first_tick > 0.0:
-                    elapsed_ms = int((t_now - self._t_first_tick) * 1000.0)
-                    if elapsed_ms >= TICK_DEADLINE_MS:
-                        should_fire = True
-                if should_fire:
-                    self._fire_pending_ticks()
+            self._check_and_fire_pending_ticks()
 
     def _handle_accept_cqe(self, ring, server_fd, res, cqe_flags):
         if res < 0:
@@ -618,12 +593,7 @@ class ServerExecutor(object):
                 return 0
 
             hdr_buf = self._conn_hdr_buf[fd]
-            payload_len = (
-                (ord(hdr_buf[0]) & 0xFF)
-                | ((ord(hdr_buf[1]) & 0xFF) << 8)
-                | ((ord(hdr_buf[2]) & 0xFF) << 16)
-                | ((ord(hdr_buf[3]) & 0xFF) << 24)
-            )
+            payload_len = ipc._decode_u32_le(hdr_buf)
 
             if payload_len == 0:
                 self._cleanup_client(fd)
@@ -674,130 +644,8 @@ class ServerExecutor(object):
             payload = ipc._parse_from_ptr(raw_ptr, raw_len)
             payload.raw_buf = raw_ptr
             payload.raw_buf_size = raw_len
-            client_id = intmask(payload.client_id)
-            target_id = intmask(payload.target_id)
-
-            # ID allocation — immediate response
-            if target_id == 0:
-                if payload.flags & ipc.FLAG_ALLOCATE_TABLE_ID:
-                    new_id = self.engine.registry.allocate_table_id()
-                    self.engine._advance_sequence(
-                        sys.SEQ_ID_TABLES, new_id - 1, new_id)
-                    self._queue_async_send(
-                        ring, fd, new_id, None, STATUS_OK, "", client_id)
-                    return 0
-                if payload.flags & ipc.FLAG_ALLOCATE_SCHEMA_ID:
-                    new_id = self.engine.registry.allocate_schema_id()
-                    self.engine._advance_sequence(
-                        sys.SEQ_ID_SCHEMAS, new_id - 1, new_id)
-                    self._queue_async_send(
-                        ring, fd, new_id, None, STATUS_OK, "", client_id)
-                    return 0
-                if payload.flags & ipc.FLAG_ALLOCATE_INDEX_ID:
-                    new_id = self.engine.registry.allocate_index_id()
-                    self.engine._advance_sequence(
-                        sys.SEQ_ID_INDICES, new_id - 1, new_id)
-                    self._queue_async_send(
-                        ring, fd, new_id, None, STATUS_OK, "", client_id)
-                    return 0
-
-            if client_id > 0:
-                self.fd_to_client[fd] = client_id
-                self.client_to_fd[client_id] = fd
-
-            # Index seek
-            if payload.flags & ipc.FLAG_SEEK_BY_INDEX:
-                col_idx = intmask(payload.seek_col_idx)
-                schema = self.engine.registry.get_by_id(target_id).schema
-                if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
-                    result = self.dispatcher.fan_out_seek_by_index(
-                        target_id, col_idx,
-                        intmask(payload.seek_pk_lo),
-                        intmask(payload.seek_pk_hi), schema)
-                else:
-                    result = self._seek_by_index(
-                        target_id, col_idx,
-                        payload.seek_pk_lo, payload.seek_pk_hi)
-                resp_schema = result._schema if result is not None else schema
-                self._queue_async_send(
-                    ring, fd, target_id, result, STATUS_OK, "",
-                    client_id, schema=resp_schema)
-                if result is not None:
-                    result.free()
-                return 0
-
-            # PK seek
-            if payload.flags & ipc.FLAG_SEEK:
-                schema = self.engine.registry.get_by_id(target_id).schema
-                if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
-                    result = self.dispatcher.fan_out_seek(
-                        target_id,
-                        intmask(payload.seek_pk_lo),
-                        intmask(payload.seek_pk_hi), schema)
-                else:
-                    result = self._seek_family(
-                        target_id, payload.seek_pk_lo, payload.seek_pk_hi)
-                resp_schema = result._schema if result is not None else schema
-                self._queue_async_send(
-                    ring, fd, target_id, result, STATUS_OK, "",
-                    client_id, schema=resp_schema)
-                if result is not None:
-                    result.free()
-                return 0
-
-            family = None
-            if payload.batch is not None:
-                family = self.engine.registry.get_by_id(target_id)
-                if payload.schema is not None:
-                    _validate_schema_match(payload.schema, family.schema)
-
-            # Bufferable: multi-worker user-table DML with data
-            if (
-                self.dispatcher is not None
-                and target_id >= sys.FIRST_USER_TABLE_ID
-                and family is not None
-                and payload.batch.length() > 0
-            ):
-                validate_fk_distributed(
-                    family, payload.batch, self.dispatcher)
-                validate_unique_indices_distributed(
-                    family, payload.batch, self.dispatcher)
-                cloned = payload.batch.clone()
-                p_fds.append(fd)
-                p_cids.append(client_id)
-                p_tids.append(target_id)
-                p_batches.append(cloned)
-                p_schemas.append(family.schema)
-                rows_buffered = cloned.length()
-                return rows_buffered
-
-            # Non-bufferable: process inline
-            result = self.handle_push(target_id, payload.batch)
-            lsn = self._last_response_lsn
-            self._last_response_lsn = 0
-
-            if (
-                self.dispatcher is not None
-                and target_id < sys.FIRST_USER_TABLE_ID
-                and family is not None
-                and payload.batch.length() > 0
-            ):
-                self.dispatcher.broadcast_ddl(
-                    target_id, payload.batch, family.schema)
-
-            resp_schema = None
-            if result is not None:
-                resp_schema = result._schema
-            elif family is not None:
-                resp_schema = family.schema
-            else:
-                resp_schema = self.engine.registry.get_by_id(target_id).schema
-            self._queue_async_send(
-                ring, fd, target_id, result, STATUS_OK, "",
-                client_id, schema=resp_schema, seek_pk_lo=lsn)
-            if result is not None:
-                result.free()
-
+            rows_buffered = self._dispatch_payload(
+                fd, payload, p_fds, p_cids, p_tids, p_batches, p_schemas)
         except errors.ClientDisconnectedError:
             self._cleanup_client(fd)
             return -1
@@ -806,8 +654,8 @@ class ServerExecutor(object):
             tid = intmask(payload.target_id) if payload else 0
             cid = intmask(payload.client_id) if payload else 0
             try:
-                self._queue_async_send(
-                    ring, fd, tid, None, STATUS_ERROR, err_msg, cid)
+                self._send_error_response(fd, err_msg, target_id=tid,
+                                          client_id=cid)
             except errors.GnitzError:
                 self._cleanup_client(fd)
                 return -1
@@ -821,6 +669,160 @@ class ServerExecutor(object):
             else:
                 lltype.free(raw_ptr, flavor='raw')
         return rows_buffered
+
+    def _dispatch_payload(self, fd, payload, p_fds, p_cids, p_tids,
+                          p_batches, p_schemas):
+        """Core message dispatch. Returns rows buffered (0 = immediate)."""
+        client_id = intmask(payload.client_id)
+        target_id = intmask(payload.target_id)
+
+        # ID allocation — immediate response
+        if target_id == 0:
+            if payload.flags & ipc.FLAG_ALLOCATE_TABLE_ID:
+                new_id = self.engine.registry.allocate_table_id()
+                self.engine._advance_sequence(
+                    sys.SEQ_ID_TABLES, new_id - 1, new_id)
+                self._send_response(
+                    fd, new_id, None, STATUS_OK, "", client_id)
+                return 0
+            if payload.flags & ipc.FLAG_ALLOCATE_SCHEMA_ID:
+                new_id = self.engine.registry.allocate_schema_id()
+                self.engine._advance_sequence(
+                    sys.SEQ_ID_SCHEMAS, new_id - 1, new_id)
+                self._send_response(
+                    fd, new_id, None, STATUS_OK, "", client_id)
+                return 0
+            if payload.flags & ipc.FLAG_ALLOCATE_INDEX_ID:
+                new_id = self.engine.registry.allocate_index_id()
+                self.engine._advance_sequence(
+                    sys.SEQ_ID_INDICES, new_id - 1, new_id)
+                self._send_response(
+                    fd, new_id, None, STATUS_OK, "", client_id)
+                return 0
+
+        if client_id > 0:
+            self.fd_to_client[fd] = client_id
+            self.client_to_fd[client_id] = fd
+
+        # Index seek
+        if payload.flags & ipc.FLAG_SEEK_BY_INDEX:
+            col_idx = intmask(payload.seek_col_idx)
+            schema = self.engine.registry.get_by_id(target_id).schema
+            if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
+                result = self.dispatcher.fan_out_seek_by_index(
+                    target_id, col_idx,
+                    intmask(payload.seek_pk_lo),
+                    intmask(payload.seek_pk_hi), schema)
+            else:
+                result = self._seek_by_index(
+                    target_id, col_idx,
+                    payload.seek_pk_lo, payload.seek_pk_hi)
+            resp_schema = result._schema if result is not None else schema
+            self._send_response(
+                fd, target_id, result, STATUS_OK, "",
+                client_id, schema=resp_schema)
+            if result is not None:
+                result.free()
+            return 0
+
+        # PK seek
+        if payload.flags & ipc.FLAG_SEEK:
+            schema = self.engine.registry.get_by_id(target_id).schema
+            if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
+                result = self.dispatcher.fan_out_seek(
+                    target_id,
+                    intmask(payload.seek_pk_lo),
+                    intmask(payload.seek_pk_hi), schema)
+            else:
+                result = self._seek_family(
+                    target_id, payload.seek_pk_lo, payload.seek_pk_hi)
+            resp_schema = result._schema if result is not None else schema
+            self._send_response(
+                fd, target_id, result, STATUS_OK, "",
+                client_id, schema=resp_schema)
+            if result is not None:
+                result.free()
+            return 0
+
+        family = None
+        if payload.batch is not None:
+            family = self.engine.registry.get_by_id(target_id)
+            if payload.schema is not None:
+                _validate_schema_match(payload.schema, family.schema)
+
+        # Bufferable: multi-worker user-table DML with data
+        if (
+            self.dispatcher is not None
+            and target_id >= sys.FIRST_USER_TABLE_ID
+            and family is not None
+            and payload.batch.length() > 0
+        ):
+            validate_fk_distributed(
+                family, payload.batch, self.dispatcher)
+            validate_unique_indices_distributed(
+                family, payload.batch, self.dispatcher)
+            cloned = payload.batch.clone()
+            p_fds.append(fd)
+            p_cids.append(client_id)
+            p_tids.append(target_id)
+            p_batches.append(cloned)
+            p_schemas.append(family.schema)
+            return cloned.length()
+
+        # Non-bufferable: process inline
+        result = self.handle_push(target_id, payload.batch)
+        lsn = self._last_response_lsn
+        self._last_response_lsn = 0
+
+        if (
+            self.dispatcher is not None
+            and target_id < sys.FIRST_USER_TABLE_ID
+            and family is not None
+            and payload.batch.length() > 0
+        ):
+            self.dispatcher.broadcast_ddl(
+                target_id, payload.batch, family.schema)
+
+        resp_schema = None
+        if result is not None:
+            resp_schema = result._schema
+        elif family is not None:
+            resp_schema = family.schema
+        else:
+            resp_schema = self.engine.registry.get_by_id(target_id).schema
+        self._send_response(
+            fd, target_id, result, STATUS_OK, "",
+            client_id, schema=resp_schema, seek_pk_lo=lsn)
+        if result is not None:
+            result.free()
+        return 0
+
+    def _send_response(self, fd, target_id, result, status, error_msg,
+                       client_id, schema=None, flags=0,
+                       seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
+        """Send a response via the active I/O backend (uring or poll)."""
+        if self._use_uring:
+            self._queue_async_send(
+                self._ring, fd, target_id, result, status, error_msg,
+                client_id, schema=schema, flags=flags,
+                seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi,
+                seek_col_idx=seek_col_idx)
+        else:
+            ipc.send_framed(
+                fd, target_id, result, status=status, error_msg=error_msg,
+                client_id=client_id, schema=schema, flags=flags,
+                seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi,
+                seek_col_idx=seek_col_idx)
+
+    def _send_error_response(self, fd, error_msg, target_id=0, client_id=0):
+        """Send an error response via the active I/O backend."""
+        if self._use_uring:
+            self._queue_async_send(
+                self._ring, fd, target_id, None,
+                STATUS_ERROR, error_msg, client_id)
+        else:
+            ipc.send_framed_error(
+                fd, error_msg, target_id=target_id, client_id=client_id)
 
     def _queue_async_send(self, ring, fd, target_id, result, status,
                           error_msg, client_id, schema=None, flags=0,
@@ -996,143 +998,10 @@ class ServerExecutor(object):
             payload = ipc.try_recv_framed(
                 fd, self._client_hdr_bufs[fd], self._client_hdr_pos[fd])
             if payload is None:
-                return -1  # EAGAIN — no message ready on this FD
-            client_id = intmask(payload.client_id)
-            target_id = intmask(payload.target_id)
-
-            # ID allocation — immediate response
-            if target_id == 0:
-                if payload.flags & ipc.FLAG_ALLOCATE_TABLE_ID:
-                    new_id = self.engine.registry.allocate_table_id()
-                    self.engine._advance_sequence(
-                        sys.SEQ_ID_TABLES, new_id - 1, new_id
-                    )
-                    ipc.send_framed(fd, new_id, None, STATUS_OK, "", client_id)
-                    return 0
-                if payload.flags & ipc.FLAG_ALLOCATE_SCHEMA_ID:
-                    new_id = self.engine.registry.allocate_schema_id()
-                    self.engine._advance_sequence(
-                        sys.SEQ_ID_SCHEMAS, new_id - 1, new_id
-                    )
-                    ipc.send_framed(fd, new_id, None, STATUS_OK, "", client_id)
-                    return 0
-                if payload.flags & ipc.FLAG_ALLOCATE_INDEX_ID:
-                    new_id = self.engine.registry.allocate_index_id()
-                    self.engine._advance_sequence(
-                        sys.SEQ_ID_INDICES, new_id - 1, new_id
-                    )
-                    ipc.send_framed(fd, new_id, None, STATUS_OK, "", client_id)
-                    return 0
-
-            if client_id > 0:
-                self.fd_to_client[fd] = client_id
-                self.client_to_fd[client_id] = fd
-
-            # Index seek — O(log n) lookup via secondary index
-            if payload.flags & ipc.FLAG_SEEK_BY_INDEX:
-                col_idx = intmask(payload.seek_col_idx)
-                schema = self.engine.registry.get_by_id(target_id).schema
-                if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
-                    result = self.dispatcher.fan_out_seek_by_index(
-                        target_id, col_idx,
-                        intmask(payload.seek_pk_lo), intmask(payload.seek_pk_hi),
-                        schema,
-                    )
-                else:
-                    result = self._seek_by_index(
-                        target_id, col_idx,
-                        payload.seek_pk_lo, payload.seek_pk_hi,
-                    )
-                resp_schema = result._schema if result is not None else schema
-                ipc.send_framed(fd, target_id, result, STATUS_OK, "", client_id,
-                               schema=resp_schema)
-                if result is not None:
-                    result.free()
-                return 0
-
-            # PK seek — O(log n) point lookup
-            if payload.flags & ipc.FLAG_SEEK:
-                schema = self.engine.registry.get_by_id(target_id).schema
-                if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
-                    result = self.dispatcher.fan_out_seek(
-                        target_id,
-                        intmask(payload.seek_pk_lo), intmask(payload.seek_pk_hi),
-                        schema,
-                    )
-                else:
-                    result = self._seek_family(
-                        target_id, payload.seek_pk_lo, payload.seek_pk_hi,
-                    )
-                resp_schema = result._schema if result is not None else schema
-                ipc.send_framed(fd, target_id, result, STATUS_OK, "", client_id,
-                               schema=resp_schema)
-                if result is not None:
-                    result.free()
-                return 0
-
-            # Hoist family lookup: used by schema validation, buffering, broadcast,
-            # and response — look it up once when a batch is present.
-            family = None
-            if payload.batch is not None:
-                family = self.engine.registry.get_by_id(target_id)
-                if payload.schema is not None:
-                    _validate_schema_match(payload.schema, family.schema)
-
-            # Bufferable: multi-worker user-table DML with data
-            if (
-                self.dispatcher is not None
-                and target_id >= sys.FIRST_USER_TABLE_ID
-                and family is not None
-                and payload.batch.length() > 0
-            ):
-                validate_fk_distributed(
-                    family, payload.batch, self.dispatcher
-                )
-                validate_unique_indices_distributed(
-                    family, payload.batch, self.dispatcher
-                )
-                cloned = payload.batch.clone()
-                p_fds.append(fd)
-                p_cids.append(client_id)
-                p_tids.append(target_id)
-                p_batches.append(cloned)
-                p_schemas.append(family.schema)
-                rows_buffered = cloned.length()
-                return rows_buffered
-
-            # Non-bufferable: process inline
-            result = self.handle_push(target_id, payload.batch)
-            lsn = self._last_response_lsn
-            self._last_response_lsn = 0
-
-            # Broadcast system-table deltas to workers for DDL sync
-            if (
-                self.dispatcher is not None
-                and target_id < sys.FIRST_USER_TABLE_ID
-                and family is not None
-                and payload.batch.length() > 0
-            ):
-                self.dispatcher.broadcast_ddl(
-                    target_id, payload.batch, family.schema
-                )
-
-            # Response always includes schema
-            resp_schema = None
-            if result is not None:
-                resp_schema = result._schema
-            elif family is not None:
-                resp_schema = family.schema
-            else:
-                resp_schema = self.engine.registry.get_by_id(target_id).schema
-            ipc.send_framed(
-                fd, target_id, result, STATUS_OK, "",
-                client_id, schema=resp_schema, seek_pk_lo=lsn,
-            )
-            if result is not None:
-                result.free()
-
+                return -1  # EAGAIN
+            rows_buffered = self._dispatch_payload(
+                fd, payload, p_fds, p_cids, p_tids, p_batches, p_schemas)
         except errors.ClientDisconnectedError:
-            # Peer closed before or during message read — normal, no response needed.
             self._cleanup_client(fd)
             return -1
         except errors.GnitzError as ge:
@@ -1140,10 +1009,9 @@ class ServerExecutor(object):
             tid = intmask(payload.target_id) if payload else 0
             cid = intmask(payload.client_id) if payload else 0
             try:
-                ipc.send_framed_error(fd, err_msg, target_id=tid, client_id=cid)
+                self._send_error_response(fd, err_msg, target_id=tid,
+                                          client_id=cid)
             except errors.GnitzError:
-                # Socket disconnected while sending error — clean up and stop
-                # draining this fd.
                 self._cleanup_client(fd)
                 return -1
         except Exception as e:
@@ -1199,32 +1067,32 @@ class ServerExecutor(object):
 
             for k in range(run_start, run_end):
                 try:
-                    if self._use_uring:
-                        if len(err_msg) > 0:
-                            self._queue_async_send(
-                                self._ring, p_fds[k], target_id, None,
-                                STATUS_ERROR, err_msg, p_cids[k])
-                        else:
-                            self._queue_async_send(
-                                self._ring, p_fds[k], target_id, None,
-                                STATUS_OK, "", p_cids[k], schema=schema,
-                                seek_pk_lo=current_lsn)
+                    if len(err_msg) > 0:
+                        self._send_error_response(
+                            p_fds[k], err_msg,
+                            target_id=target_id, client_id=p_cids[k])
                     else:
-                        if len(err_msg) > 0:
-                            ipc.send_framed_error(
-                                p_fds[k], err_msg,
-                                target_id=target_id, client_id=p_cids[k],
-                            )
-                        else:
-                            ipc.send_framed(
-                                p_fds[k], target_id, None, STATUS_OK, "",
-                                p_cids[k], schema=schema,
-                                seek_pk_lo=current_lsn,
-                            )
+                        self._send_response(
+                            p_fds[k], target_id, None, STATUS_OK, "",
+                            p_cids[k], schema=schema,
+                            seek_pk_lo=current_lsn)
                 except Exception:
                     self._cleanup_client(p_fds[k])
 
             run_start = run_end
+
+    def _check_and_fire_pending_ticks(self):
+        """Fire pending ticks if coalesce threshold or deadline reached."""
+        if len(self._tick_tids) == 0:
+            return
+        for tid in self._tick_tids:
+            if self._tick_rows[tid] >= TICK_COALESCE_ROWS:
+                self._fire_pending_ticks()
+                return
+        if self._t_first_tick > 0.0:
+            elapsed_ms = int((time.time() - self._t_first_tick) * 1000.0)
+            if elapsed_ms >= TICK_DEADLINE_MS:
+                self._fire_pending_ticks()
 
     def _fire_pending_ticks(self):
         """Fire all pending ticks unconditionally."""

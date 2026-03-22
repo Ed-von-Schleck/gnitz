@@ -358,6 +358,39 @@ def _read_u32_raw(ptr, byte_offset):
     return rffi.cast(rffi.UINT, p[0])
 
 
+def _decode_u32_le(buf):
+    """Decode a little-endian u32 from a 4-byte char buffer."""
+    return (
+        (ord(buf[0]) & 0xFF)
+        | ((ord(buf[1]) & 0xFF) << 8)
+        | ((ord(buf[2]) & 0xFF) << 16)
+        | ((ord(buf[3]) & 0xFF) << 24)
+    )
+
+
+def _make_payload_from_raw(raw, raw_len):
+    """Parse raw wire bytes into an IPCPayload that owns the buffer."""
+    try:
+        inner = _parse_from_ptr(raw, raw_len)
+    except Exception as e:
+        lltype.free(raw, flavor='raw')
+        raise e
+    payload = IPCPayload()
+    payload.raw_buf      = raw
+    payload.raw_buf_size = raw_len
+    payload.batch        = inner.batch
+    payload.schema       = inner.schema
+    payload.target_id    = inner.target_id
+    payload.client_id    = inner.client_id
+    payload.flags        = inner.flags
+    payload.seek_col_idx = inner.seek_col_idx
+    payload.seek_pk_lo   = inner.seek_pk_lo
+    payload.seek_pk_hi   = inner.seek_pk_hi
+    payload.status       = inner.status
+    payload.error_msg    = inner.error_msg
+    return payload
+
+
 def _align8(n):
     return (n + 7) & ~7
 
@@ -467,12 +500,7 @@ def recv_framed(sock_fd):
     try:
         if ipc_ffi.recv_exact(sock_fd, hdr_buf, 4) < 0:
             raise errors.ClientDisconnectedError("recv_framed: header read failed")
-        payload_len = (
-            (ord(hdr_buf[0]) & 0xFF)
-            | ((ord(hdr_buf[1]) & 0xFF) << 8)
-            | ((ord(hdr_buf[2]) & 0xFF) << 16)
-            | ((ord(hdr_buf[3]) & 0xFF) << 24)
-        )
+        payload_len = _decode_u32_le(hdr_buf)
     finally:
         lltype.free(hdr_buf, flavor='raw')
 
@@ -483,27 +511,7 @@ def recv_framed(sock_fd):
     if ipc_ffi.recv_exact(sock_fd, raw, payload_len) < 0:
         lltype.free(raw, flavor='raw')
         raise errors.ClientDisconnectedError("recv_framed: payload read failed")
-
-    try:
-        inner = _parse_from_ptr(raw, payload_len)
-    except Exception as e:
-        lltype.free(raw, flavor='raw')
-        raise e
-
-    payload = IPCPayload()
-    payload.raw_buf = raw
-    payload.raw_buf_size = payload_len
-    payload.batch        = inner.batch
-    payload.schema       = inner.schema
-    payload.target_id    = inner.target_id
-    payload.client_id    = inner.client_id
-    payload.flags        = inner.flags
-    payload.seek_col_idx = inner.seek_col_idx
-    payload.seek_pk_lo   = inner.seek_pk_lo
-    payload.seek_pk_hi   = inner.seek_pk_hi
-    payload.status       = inner.status
-    payload.error_msg    = inner.error_msg
-    return payload
+    return _make_payload_from_raw(raw, payload_len)
 
 
 @jit.dont_look_inside
@@ -517,14 +525,7 @@ def try_recv_framed(sock_fd, hdr_buf, hdr_pos_ptr):
     if rc < 0:
         raise errors.ClientDisconnectedError("Client disconnected")
 
-    # Header complete — decode payload length
-    payload_len = (
-        (ord(hdr_buf[0]) & 0xFF)
-        | ((ord(hdr_buf[1]) & 0xFF) << 8)
-        | ((ord(hdr_buf[2]) & 0xFF) << 16)
-        | ((ord(hdr_buf[3]) & 0xFF) << 24)
-    )
-    # Reset header position for next message
+    payload_len = _decode_u32_le(hdr_buf)
     hdr_pos_ptr[0] = rffi.cast(rffi.INT, 0)
 
     if payload_len == 0:
@@ -534,27 +535,7 @@ def try_recv_framed(sock_fd, hdr_buf, hdr_pos_ptr):
     if ipc_ffi.recv_exact(sock_fd, raw, payload_len) < 0:
         lltype.free(raw, flavor='raw')
         raise errors.ClientDisconnectedError("Payload read failed")
-
-    try:
-        inner = _parse_from_ptr(raw, payload_len)
-    except Exception as e:
-        lltype.free(raw, flavor='raw')
-        raise e
-
-    payload = IPCPayload()
-    payload.raw_buf = raw
-    payload.raw_buf_size = payload_len
-    payload.batch        = inner.batch
-    payload.schema       = inner.schema
-    payload.target_id    = inner.target_id
-    payload.client_id    = inner.client_id
-    payload.flags        = inner.flags
-    payload.seek_col_idx = inner.seek_col_idx
-    payload.seek_pk_lo   = inner.seek_pk_lo
-    payload.seek_pk_hi   = inner.seek_pk_hi
-    payload.status       = inner.status
-    payload.error_msg    = inner.error_msg
-    return payload
+    return _make_payload_from_raw(raw, payload_len)
 
 
 # ---------------------------------------------------------------------------
