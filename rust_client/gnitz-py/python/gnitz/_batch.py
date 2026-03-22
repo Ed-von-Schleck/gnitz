@@ -143,7 +143,8 @@ class ScanResult:
 class ZSetBatch:
     def __init__(self, schema):
         self._schema = schema
-        self._raw    = _native.ZSetBatch(_to_native_schema(schema))
+        self._native_schema = _to_native_schema(schema)
+        self._raw    = _native.ZSetBatch(self._native_schema)
 
     def append(self, weight=1, **values):
         schema  = self._schema

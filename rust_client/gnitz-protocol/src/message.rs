@@ -16,9 +16,10 @@ pub struct Message {
     pub seek_pk_lo:   u64,
     pub seek_pk_hi:   u64,
     pub seek_col_idx: u64,
+    pub schema:       Option<Schema>,     // derived from schema_batch (avoids re-deriving)
     pub schema_batch: Option<ZSetBatch>,
     pub data_batch:   Option<ZSetBatch>,
-    pub error_text:   Option<String>,   // Some(_) when status == STATUS_ERROR
+    pub error_text:   Option<String>,     // Some(_) when status == STATUS_ERROR
 }
 
 // ── CONTROL_SCHEMA ────────────────────────────────────────────────────────────
@@ -287,6 +288,7 @@ pub fn recv_message(
             seek_pk_lo:   ctrl_header.seek_pk_lo,
             seek_pk_hi:   ctrl_header.seek_pk_hi,
             seek_col_idx: ctrl_header.p4,
+            schema:       None,
             schema_batch: None,
             data_batch:   None,
             error_text:   Some(error_msg),
@@ -301,6 +303,7 @@ pub fn recv_message(
         seek_pk_lo:   ctrl_header.seek_pk_lo,
         seek_pk_hi:   ctrl_header.seek_pk_hi,
         seek_col_idx: ctrl_header.p4,
+        schema:       wire_schema,
         schema_batch,
         data_batch,
         error_text:   None,

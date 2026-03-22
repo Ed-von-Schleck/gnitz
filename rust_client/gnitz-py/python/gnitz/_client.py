@@ -1,6 +1,5 @@
 import gnitz._native as _native
 from gnitz._types import Schema, _to_native_col, _to_native_schema, _from_native_schema
-from gnitz._batch import ScanResult, ZSetBatch
 from gnitz._builders import CircuitBuilder
 
 
@@ -41,13 +40,10 @@ class Connection:
     # DML
 
     def push(self, target_id, batch):
-        return self._client.push(target_id, _to_native_schema(batch._schema), batch._raw)
+        return self._client.push(target_id, batch._native_schema, batch._raw)
 
     def scan(self, target_id):
-        native_schema, batch, view_lsn = self._client.scan(target_id)
-        if native_schema is None:
-            return ScanResult(None, None, view_lsn)
-        return ScanResult(_from_native_schema(native_schema), batch, view_lsn)
+        return self._client.scan_lazy(target_id)
 
     def delete(self, target_id, schema, pks):
         self._client.delete(target_id, _to_native_schema(schema), pks)
@@ -82,28 +78,18 @@ class Connection:
     def resolve_table_id(self, schema_name, table_name):
         return self.resolve_table(schema_name, table_name)
 
-    def seek(self, table_id: int, pk: int = 0) -> "ScanResult":
+    def seek(self, table_id: int, pk: int = 0):
         pk_lo = pk & 0xFFFFFFFFFFFFFFFF
         pk_hi = (pk >> 64) & 0xFFFFFFFFFFFFFFFF
-        native_schema, batch, view_lsn = self._client.seek(table_id, pk_lo, pk_hi)
-        if native_schema is None:
-            return ScanResult(None, None, view_lsn)
-        return ScanResult(_from_native_schema(native_schema), batch, view_lsn)
+        return self._client.seek_lazy(table_id, pk_lo, pk_hi)
 
-    def seek_by_index(self, table_id: int, col_idx: int, key: int = 0) -> "ScanResult":
+    def seek_by_index(self, table_id: int, col_idx: int, key: int = 0):
         key_lo = key & 0xFFFFFFFFFFFFFFFF
         key_hi = (key >> 64) & 0xFFFFFFFFFFFFFFFF
-        native_schema, batch, view_lsn = self._client.seek_by_index(table_id, col_idx, key_lo, key_hi)
-        if native_schema is None:
-            return ScanResult(None, None, view_lsn)
-        return ScanResult(_from_native_schema(native_schema), batch, view_lsn)
+        return self._client.seek_by_index_lazy(table_id, col_idx, key_lo, key_hi)
 
     def execute_sql(self, sql: str, schema_name: str = "public") -> list:
-        results = self._client.execute_sql(schema_name, sql)
-        for r in results:
-            if isinstance(r, dict) and r.get("type") == "Rows":
-                r["rows"] = ScanResult(_from_native_schema(r.pop("schema")), r.pop("batch"))
-        return results
+        return self._client.execute_sql(schema_name, sql)
 
     # Low-level
 

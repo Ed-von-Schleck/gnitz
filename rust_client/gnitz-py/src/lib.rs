@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyDict, PyTuple};
 
@@ -306,29 +308,25 @@ fn rust_batch_to_py(
         match &batch.columns[ci] {
             ColData::Fixed(buf) => {
                 let stride = col_def.type_code.wire_stride();
-                let list = PyList::empty(py);
-                for i in 0..n {
-                    let val = read_fixed_le(py, col_def.type_code, &buf[i*stride..(i+1)*stride]);
-                    list.append(val)?;
-                }
-                col_lists.push(list.into_any().unbind());
+                let items: Vec<PyObject> = (0..n)
+                    .map(|i| read_fixed_le(py, col_def.type_code, &buf[i*stride..(i+1)*stride]))
+                    .collect();
+                col_lists.push(PyList::new(py, items)?.into_any().unbind());
             }
             ColData::Strings(v) => {
-                let list = PyList::empty(py);
-                for s in v {
-                    match s {
-                        Some(s) => list.append(s.into_pyobject(py)?)?,
-                        None    => list.append(py.None())?,
-                    }
-                }
-                col_lists.push(list.into_any().unbind());
+                let items: Vec<PyObject> = v.iter()
+                    .map(|s| match s {
+                        Some(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
+                        None    => Ok(py.None().into()),
+                    })
+                    .collect::<PyResult<_>>()?;
+                col_lists.push(PyList::new(py, items)?.into_any().unbind());
             }
             ColData::U128s(v) => {
-                let list = PyList::empty(py);
-                for &x in v {
-                    list.append(x.into_pyobject(py)?)?;
-                }
-                col_lists.push(list.into_any().unbind());
+                let items: Vec<PyObject> = v.iter()
+                    .map(|&x| Ok(x.into_pyobject(py)?.into_any().unbind()))
+                    .collect::<PyResult<_>>()?;
+                col_lists.push(PyList::new(py, items)?.into_any().unbind());
             }
         }
     }
@@ -341,6 +339,415 @@ fn rust_batch_to_py(
         nulls:   nulls.unbind(),
         columns: columns.unbind(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Lazy batch infrastructure (Phase 2)
+// ---------------------------------------------------------------------------
+
+struct SharedBatchData {
+    schema: Schema,
+    batch:  ZSetBatch,
+}
+
+/// Build Python values for a single row from Rust data.
+fn build_row_values(
+    py: Python<'_>, schema: &Schema, batch: &ZSetBatch, row: usize,
+) -> PyResult<Vec<PyObject>> {
+    let pk_idx = schema.pk_index;
+    let null_word = batch.nulls[row];
+    let mut values = Vec::with_capacity(schema.columns.len());
+    let mut payload_idx = 0usize;
+
+    for ci in 0..schema.columns.len() {
+        if ci == pk_idx {
+            let pk_lo = batch.pk_lo[row];
+            let pk_hi = batch.pk_hi[row];
+            if schema.columns[ci].type_code == TypeCode::U128 {
+                let val = (pk_lo as u128) | ((pk_hi as u128) << 64);
+                values.push(val.into_pyobject(py)?.into_any().unbind());
+            } else {
+                values.push(pk_lo.into_pyobject(py)?.into_any().unbind());
+            }
+        } else {
+            if null_word & (1u64 << payload_idx) != 0 {
+                values.push(py.None().into());
+            } else {
+                match &batch.columns[ci] {
+                    ColData::Fixed(buf) => {
+                        let stride = schema.columns[ci].type_code.wire_stride();
+                        values.push(read_fixed_le(
+                            py, schema.columns[ci].type_code,
+                            &buf[row * stride..(row + 1) * stride],
+                        ));
+                    }
+                    ColData::Strings(v) => match &v[row] {
+                        Some(s) => values.push(s.into_pyobject(py)?.into_any().unbind()),
+                        None    => values.push(py.None().into()),
+                    },
+                    ColData::U128s(v) => {
+                        values.push(v[row].into_pyobject(py)?.into_any().unbind());
+                    }
+                }
+            }
+            payload_idx += 1;
+        }
+    }
+    Ok(values)
+}
+
+/// Read a single column value from a row (used by scalars()).
+fn read_row_value(
+    py: Python<'_>, schema: &Schema, batch: &ZSetBatch, row: usize, col: usize,
+) -> PyResult<PyObject> {
+    let pk_idx = schema.pk_index;
+    if col == pk_idx {
+        let pk_lo = batch.pk_lo[row];
+        let pk_hi = batch.pk_hi[row];
+        if schema.columns[col].type_code == TypeCode::U128 {
+            let val = (pk_lo as u128) | ((pk_hi as u128) << 64);
+            Ok(val.into_pyobject(py)?.into_any().unbind())
+        } else {
+            Ok(pk_lo.into_pyobject(py)?.into_any().unbind())
+        }
+    } else {
+        let payload_idx = if col < pk_idx { col } else { col - 1 };
+        let null_word = batch.nulls[row];
+        if null_word & (1u64 << payload_idx) != 0 {
+            Ok(py.None().into())
+        } else {
+            match &batch.columns[col] {
+                ColData::Fixed(buf) => {
+                    let stride = schema.columns[col].type_code.wire_stride();
+                    Ok(read_fixed_le(
+                        py, schema.columns[col].type_code,
+                        &buf[row * stride..(row + 1) * stride],
+                    ))
+                }
+                ColData::Strings(v) => match &v[row] {
+                    Some(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
+                    None    => Ok(py.None().into()),
+                },
+                ColData::U128s(v) => Ok(v[row].into_pyobject(py)?.into_any().unbind()),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PyRustBatch — lazy batch wrapper (read path only)
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "RustBatch")]
+pub struct PyRustBatch {
+    data: Arc<SharedBatchData>,
+    cached_pk_lo:   Option<Py<PyList>>,
+    cached_pk_hi:   Option<Py<PyList>>,
+    cached_weights: Option<Py<PyList>>,
+    cached_nulls:   Option<Py<PyList>>,
+    cached_columns: Option<Py<PyList>>,
+}
+
+#[pymethods]
+impl PyRustBatch {
+    #[getter]
+    fn pk_lo(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        if let Some(ref cached) = self.cached_pk_lo {
+            return Ok(cached.clone_ref(py));
+        }
+        let list = PyList::new(py, &self.data.batch.pk_lo)?.unbind();
+        self.cached_pk_lo = Some(list.clone_ref(py));
+        Ok(list)
+    }
+
+    #[getter]
+    fn pk_hi(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        if let Some(ref cached) = self.cached_pk_hi {
+            return Ok(cached.clone_ref(py));
+        }
+        let list = PyList::new(py, &self.data.batch.pk_hi)?.unbind();
+        self.cached_pk_hi = Some(list.clone_ref(py));
+        Ok(list)
+    }
+
+    #[getter]
+    fn weights(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        if let Some(ref cached) = self.cached_weights {
+            return Ok(cached.clone_ref(py));
+        }
+        let list = PyList::new(py, &self.data.batch.weights)?.unbind();
+        self.cached_weights = Some(list.clone_ref(py));
+        Ok(list)
+    }
+
+    #[getter]
+    fn nulls(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        if let Some(ref cached) = self.cached_nulls {
+            return Ok(cached.clone_ref(py));
+        }
+        let list = PyList::new(py, &self.data.batch.nulls)?.unbind();
+        self.cached_nulls = Some(list.clone_ref(py));
+        Ok(list)
+    }
+
+    #[getter]
+    fn columns(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        if let Some(ref cached) = self.cached_columns {
+            return Ok(cached.clone_ref(py));
+        }
+        let schema = &self.data.schema;
+        let batch = &self.data.batch;
+        let n = batch.len();
+        let list = rust_batch_columns_to_py(py, schema, batch, n)?;
+        self.cached_columns = Some(list.clone_ref(py));
+        Ok(list)
+    }
+
+    fn __len__(&self) -> usize { self.data.batch.len() }
+
+    fn __repr__(&self) -> String {
+        format!("RustBatch(len={})", self.data.batch.len())
+    }
+}
+
+/// Materialize column lists for PyRustBatch.columns (same format as PyZSetBatch).
+fn rust_batch_columns_to_py(
+    py: Python<'_>, schema: &Schema, batch: &ZSetBatch, n: usize,
+) -> PyResult<Py<PyList>> {
+    let mut col_lists: Vec<PyObject> = Vec::with_capacity(schema.columns.len());
+    for (ci, col_def) in schema.columns.iter().enumerate() {
+        if ci == schema.pk_index {
+            col_lists.push(PyList::empty(py).into_any().unbind());
+            continue;
+        }
+        match &batch.columns[ci] {
+            ColData::Fixed(buf) => {
+                let stride = col_def.type_code.wire_stride();
+                let items: Vec<PyObject> = (0..n)
+                    .map(|i| read_fixed_le(py, col_def.type_code, &buf[i*stride..(i+1)*stride]))
+                    .collect();
+                col_lists.push(PyList::new(py, items)?.into_any().unbind());
+            }
+            ColData::Strings(v) => {
+                let items: Vec<PyObject> = v.iter()
+                    .map(|s| match s {
+                        Some(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
+                        None    => Ok(py.None().into()),
+                    })
+                    .collect::<PyResult<_>>()?;
+                col_lists.push(PyList::new(py, items)?.into_any().unbind());
+            }
+            ColData::U128s(v) => {
+                let items: Vec<PyObject> = v.iter()
+                    .map(|&x| Ok(x.into_pyobject(py)?.into_any().unbind()))
+                    .collect::<PyResult<_>>()?;
+                col_lists.push(PyList::new(py, items)?.into_any().unbind());
+            }
+        }
+    }
+    Ok(PyList::new(py, col_lists)?.unbind())
+}
+
+// ---------------------------------------------------------------------------
+// PyScanResult — Rust-backed ScanResult
+// ---------------------------------------------------------------------------
+
+#[pyclass(name = "ScanResult")]
+pub struct PyScanResult {
+    data:          Option<Arc<SharedBatchData>>,
+    #[pyo3(get)]
+    lsn:           u64,
+    cached_schema: Option<PyObject>,
+    cached_batch:  Option<PyObject>,  // PyRustBatch or py.None()
+}
+
+#[pymethods]
+impl PyScanResult {
+    #[getter]
+    fn schema(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        if let Some(ref cached) = self.cached_schema {
+            return Ok(cached.clone_ref(py));
+        }
+        let obj = match &self.data {
+            None => py.None().into(),
+            Some(d) => {
+                let py_native_schema = rust_schema_to_py(py, &d.schema)?;
+                let types_mod = py.import("gnitz._types")?;
+                let from_native = types_mod.getattr("_from_native_schema")?;
+                from_native.call1((py_native_schema,))?.unbind()
+            }
+        };
+        self.cached_schema = Some(obj.clone_ref(py));
+        Ok(obj)
+    }
+
+    #[getter]
+    fn batch(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        if let Some(ref cached) = self.cached_batch {
+            return Ok(cached.clone_ref(py));
+        }
+        let obj = match &self.data {
+            None => py.None().into(),
+            Some(d) => {
+                let rb = Py::new(py, PyRustBatch {
+                    data: Arc::clone(d),
+                    cached_pk_lo:   None,
+                    cached_pk_hi:   None,
+                    cached_weights: None,
+                    cached_nulls:   None,
+                    cached_columns: None,
+                })?;
+                rb.into_bound(py).into_any().unbind()
+            }
+        };
+        self.cached_batch = Some(obj.clone_ref(py));
+        Ok(obj)
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<PyRowIterator> {
+        let (data_clone, fields, len) = match &self.data {
+            None => (None, PyTuple::empty(py).unbind(), 0),
+            Some(d) => {
+                let names: Vec<PyObject> = d.schema.columns.iter()
+                    .map(|c| Ok(c.name.as_str().into_pyobject(py)?.into_any().unbind()))
+                    .collect::<PyResult<_>>()?;
+                let fields = PyTuple::new(py, names)?.unbind();
+                (Some(Arc::clone(d)), fields, d.batch.len())
+            }
+        };
+        Ok(PyRowIterator { data: data_clone, fields, row_class: None, pos: 0, len })
+    }
+
+    fn __len__(&self) -> usize {
+        self.data.as_ref().map_or(0, |d| d.batch.len())
+    }
+
+    fn __bool__(&self) -> bool {
+        self.__len__() > 0
+    }
+
+    fn all(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let mut iter = self.__iter__(py)?;
+        let list = PyList::empty(py);
+        while let Some(row) = iter.__next__(py)? {
+            list.append(row)?;
+        }
+        Ok(list.unbind())
+    }
+
+    fn first(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let mut iter = self.__iter__(py)?;
+        match iter.__next__(py)? {
+            Some(row) => Ok(row),
+            None => Ok(py.None().into()),
+        }
+    }
+
+    fn one(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let n = self.__len__();
+        if n != 1 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Expected exactly 1 row, got {}", n),
+            ));
+        }
+        let mut iter = self.__iter__(py)?;
+        Ok(iter.__next__(py)?.unwrap())
+    }
+
+    fn one_or_none(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let n = self.__len__();
+        if n > 1 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Expected at most 1 row, got {}", n),
+            ));
+        }
+        let mut iter = self.__iter__(py)?;
+        match iter.__next__(py)? {
+            Some(row) => Ok(row),
+            None => Ok(py.None().into()),
+        }
+    }
+
+    fn mappings(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let mut iter = self.__iter__(py)?;
+        let list = PyList::empty(py);
+        while let Some(row) = iter.__next__(py)? {
+            let dict = row.call_method0(py, "_asdict")?;
+            list.append(dict.bind(py))?;
+        }
+        Ok(list.unbind())
+    }
+
+    #[pyo3(signature = (col=None))]
+    fn scalars(&self, py: Python<'_>, col: Option<PyObject>) -> PyResult<Py<PyList>> {
+        let data = match &self.data {
+            None => return Ok(PyList::empty(py).unbind()),
+            Some(d) => d,
+        };
+        // Resolve col: None→0, int→index, str→name lookup
+        let col_idx = match col {
+            None => 0usize,
+            Some(ref obj) => {
+                if let Ok(idx) = obj.extract::<usize>(py) {
+                    idx
+                } else if let Ok(name) = obj.extract::<String>(py) {
+                    data.schema.columns.iter().position(|c| c.name == name)
+                        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(name))?
+                } else {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "col must be int or str",
+                    ));
+                }
+            }
+        };
+        let n = data.batch.len();
+        if col_idx >= data.schema.columns.len() {
+            return Err(pyo3::exceptions::PyIndexError::new_err("column index out of range"));
+        }
+        let items: Vec<PyObject> = (0..n)
+            .map(|i| read_row_value(py, &data.schema, &data.batch, i, col_idx))
+            .collect::<PyResult<_>>()?;
+        Ok(PyList::new(py, items)?.unbind())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PyRowIterator
+// ---------------------------------------------------------------------------
+
+#[pyclass]
+pub struct PyRowIterator {
+    data:      Option<Arc<SharedBatchData>>,
+    fields:    Py<PyTuple>,
+    row_class: Option<PyObject>,
+    pos:       usize,
+    len:       usize,
+}
+
+#[pymethods]
+impl PyRowIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        if self.pos >= self.len {
+            return Ok(None);
+        }
+        let data = self.data.as_ref().unwrap();
+        let values = build_row_values(py, &data.schema, &data.batch, self.pos)?;
+        let weight = data.batch.weights[self.pos];
+        self.pos += 1;
+
+        // Lazily import Row class
+        if self.row_class.is_none() {
+            let batch_mod = py.import("gnitz._batch")?;
+            let cls = batch_mod.getattr("Row")?;
+            self.row_class = Some(cls.unbind());
+        }
+        let row_cls = self.row_class.as_ref().unwrap();
+        let values_tuple = PyTuple::new(py, values)?;
+        let row = row_cls.call1(py, (&self.fields, values_tuple, weight))?;
+        Ok(Some(row))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +972,45 @@ impl PyGnitzClient {
         }
     }
 
+    // ----- Lazy scan/seek (Phase 2) — skip rust_batch_to_py entirely -----
+
+    /// scan_lazy(target_id) -> ScanResult (native)
+    pub fn scan_lazy(&self, py: Python<'_>, target_id: u64) -> PyResult<Py<PyScanResult>> {
+        let (opt_schema, opt_batch, view_lsn) = client!(self).scan(target_id)
+            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        let data = match (opt_schema, opt_batch) {
+            (Some(s), Some(b)) => Some(Arc::new(SharedBatchData { schema: s, batch: b })),
+            _ => None,
+        };
+        Py::new(py, PyScanResult { data, lsn: view_lsn, cached_schema: None, cached_batch: None })
+    }
+
+    /// seek_lazy(table_id, pk_lo, pk_hi) -> ScanResult (native)
+    pub fn seek_lazy(&self, py: Python<'_>, table_id: u64, pk_lo: u64, pk_hi: u64) -> PyResult<Py<PyScanResult>> {
+        let (opt_schema, opt_batch, view_lsn) = client!(self).seek(table_id, pk_lo, pk_hi)
+            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        let data = match (opt_schema, opt_batch) {
+            (Some(s), Some(b)) => Some(Arc::new(SharedBatchData { schema: s, batch: b })),
+            _ => None,
+        };
+        Py::new(py, PyScanResult { data, lsn: view_lsn, cached_schema: None, cached_batch: None })
+    }
+
+    /// seek_by_index_lazy(table_id, col_idx, key_lo, key_hi) -> ScanResult (native)
+    pub fn seek_by_index_lazy(
+        &self, py: Python<'_>, table_id: u64, col_idx: u64,
+        key_lo: u64, key_hi: u64,
+    ) -> PyResult<Py<PyScanResult>> {
+        let (opt_schema, opt_batch, view_lsn) = client!(self)
+            .seek_by_index(table_id, col_idx, key_lo, key_hi)
+            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        let data = match (opt_schema, opt_batch) {
+            (Some(s), Some(b)) => Some(Arc::new(SharedBatchData { schema: s, batch: b })),
+            _ => None,
+        };
+        Py::new(py, PyScanResult { data, lsn: view_lsn, cached_schema: None, cached_batch: None })
+    }
+
     /// execute_sql(schema_name, sql) -> list of result dicts
     pub fn execute_sql(&self, py: Python<'_>, schema_name: &str, sql: &str) -> PyResult<PyObject> {
         let client_ref = client!(self);
@@ -597,10 +1043,12 @@ impl PyGnitzClient {
                 }
                 SqlResult::Rows { schema, batch } => {
                     d.set_item("type", "Rows")?;
-                    let py_schema = rust_schema_to_py(py, &schema)?.into_any();
-                    let py_batch  = rust_batch_to_py(py, &schema, &batch)?.into_any();
-                    d.set_item("schema", py_schema)?;
-                    d.set_item("batch", py_batch)?;
+                    let data = Arc::new(SharedBatchData { schema, batch });
+                    let scan_result = Py::new(py, PyScanResult {
+                        data: Some(data), lsn: 0,
+                        cached_schema: None, cached_batch: None,
+                    })?;
+                    d.set_item("rows", scan_result)?;
                 }
             }
             py_list.append(d)?;
@@ -788,6 +1236,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyColumnDef>()?;
     m.add_class::<PySchema>()?;
     m.add_class::<PyZSetBatch>()?;
+    m.add_class::<PyRustBatch>()?;
+    m.add_class::<PyScanResult>()?;
+    m.add_class::<PyRowIterator>()?;
     m.add_class::<PyGnitzClient>()?;
     m.add_class::<PyExprBuilder>()?;
     m.add_class::<PyExprProgram>()?;

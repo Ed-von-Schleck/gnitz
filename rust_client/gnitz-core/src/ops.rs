@@ -1,4 +1,4 @@
-use gnitz_protocol::{Schema, ZSetBatch, FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID, batch_to_schema};
+use gnitz_protocol::{Schema, ZSetBatch, FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID};
 use crate::connection::Connection;
 use crate::error::ClientError;
 use gnitz_protocol::Message;
@@ -30,12 +30,7 @@ pub fn alloc_index_id(conn: &Connection) -> Result<u64, ClientError> {
 
 fn decode_scan_response(msg: Message) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
     let view_lsn = msg.seek_pk_lo;
-    let schema = msg.schema_batch
-        .as_ref()
-        .map(batch_to_schema)
-        .transpose()
-        .map_err(ClientError::Protocol)?;
-    Ok((schema, msg.data_batch, view_lsn))
+    Ok((msg.schema, msg.data_batch, view_lsn))
 }
 
 pub fn seek_by_index(

@@ -1,7 +1,5 @@
 // gnitz-protocol/src/wal_block.rs — WAL-block encode/decode (Python wal_columnar.py port)
 
-use std::hash::Hasher;
-
 use crate::error::ProtocolError;
 use crate::types::{ColData, Schema, TypeCode, ZSetBatch};
 
@@ -28,25 +26,26 @@ fn append_region(buf: &mut Vec<u8>, data: &[u8]) -> (u32, u32) {
     (off, data.len() as u32)
 }
 
-/// Serialize a `&[u64]` directly into `buf` at 8-byte alignment. No temp Vec.
+/// Serialize a `&[u64]` directly into `buf` at 8-byte alignment via bulk memcpy.
 fn append_u64_region(buf: &mut Vec<u8>, vals: &[u64]) -> (u32, u32) {
     let aligned = align8(buf.len());
     let sz = vals.len() * 8;
-    buf.resize(aligned + sz, 0);
-    for (i, &v) in vals.iter().enumerate() {
-        buf[aligned + i * 8..aligned + (i + 1) * 8].copy_from_slice(&v.to_le_bytes());
-    }
+    buf.resize(aligned, 0); // pad to alignment only
+    // SAFETY: vals is a valid &[u64]; reinterpreting as &[u8] with len*8 bytes is sound.
+    // Correct on little-endian (x86_64) — matches to_le_bytes() output.
+    let src = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, sz) };
+    buf.extend_from_slice(src);
     (aligned as u32, sz as u32)
 }
 
-/// Serialize a `&[i64]` directly into `buf` at 8-byte alignment. No temp Vec.
+/// Serialize a `&[i64]` directly into `buf` at 8-byte alignment via bulk memcpy.
 fn append_i64_region(buf: &mut Vec<u8>, vals: &[i64]) -> (u32, u32) {
     let aligned = align8(buf.len());
     let sz = vals.len() * 8;
-    buf.resize(aligned + sz, 0);
-    for (i, &v) in vals.iter().enumerate() {
-        buf[aligned + i * 8..aligned + (i + 1) * 8].copy_from_slice(&v.to_le_bytes());
-    }
+    buf.resize(aligned, 0); // pad to alignment only
+    // SAFETY: same as append_u64_region.
+    let src = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, sz) };
+    buf.extend_from_slice(src);
     (aligned as u32, sz as u32)
 }
 
@@ -147,10 +146,11 @@ fn read_u64_region(
             "u64 region size mismatch: expected {}, got {}", expected, sz
         )));
     }
-    let mut v = Vec::with_capacity(count);
-    for i in 0..count {
-        let base = off + i * 8;
-        v.push(u64::from_le_bytes(data[base..base + 8].try_into().unwrap()));
+    let src = &data[off..off + expected];
+    let mut v: Vec<u64> = vec![0u64; count];
+    // SAFETY: bulk copy from wire bytes into Vec<u64>. Correct on little-endian.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr() as *mut u8, expected);
     }
     Ok(v)
 }
@@ -164,10 +164,11 @@ fn read_i64_region(
             "i64 region size mismatch: expected {}, got {}", expected, sz
         )));
     }
-    let mut v = Vec::with_capacity(count);
-    for i in 0..count {
-        let base = off + i * 8;
-        v.push(i64::from_le_bytes(data[base..base + 8].try_into().unwrap()));
+    let src = &data[off..off + expected];
+    let mut v: Vec<i64> = vec![0i64; count];
+    // SAFETY: bulk copy from wire bytes into Vec<i64>. Correct on little-endian.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr() as *mut u8, expected);
     }
     Ok(v)
 }
