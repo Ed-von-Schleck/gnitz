@@ -348,6 +348,8 @@ def eval_expr(program, accessor, builder=None):
 
         i += 1
 
+    if program.num_regs == 0:
+        return r_int64(0), True
     return regs[program.result_reg], null[program.result_reg]
 
 
@@ -656,6 +658,8 @@ def _eval_row_direct(program, in_batch, row_idx,
 
         i += 1
 
+    if program.num_regs == 0:
+        return r_int64(0), True, emit_null_mask
     return regs[program.result_reg], null[program.result_reg], emit_null_mask
 
 

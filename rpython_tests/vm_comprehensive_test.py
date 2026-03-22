@@ -1595,6 +1595,58 @@ def test_reduce_min_group_idx_cross_tick(base_dir):
     log("  PASSED")
 
 
+def test_eval_expr_zero_regs():
+    """ExprProgram with num_regs=0 (pure COPY_COL) must not crash."""
+    os.write(1, "[vm] test_eval_expr_zero_regs...\n")
+    from gnitz.dbsp.expr import ExprProgram, ExprMapFunction, EXPR_COPY_COL, eval_expr
+
+    in_schema = types.TableSchema([
+        types.ColumnDefinition(types.TYPE_U64, name="pk"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
+    ], pk_index=0)
+
+    out_schema = types.TableSchema([
+        types.ColumnDefinition(types.TYPE_U128, name="__pk"),
+        types.ColumnDefinition(types.TYPE_I64, name="val"),
+    ], pk_index=0)
+
+    # Bytecode: one COPY_COL instruction (copy col 1 → payload 0, type I64=9)
+    code = [r_int64(EXPR_COPY_COL), r_int64(types.TYPE_I64.code),
+            r_int64(1), r_int64(0)]
+    prog = ExprProgram(code, 0, 0)  # num_regs=0, result_reg=0
+
+    # eval_expr with builder: should execute COPY_COL without crashing
+    in_batch = batch.ArenaZSetBatch(in_schema)
+    rb = RowBuilder(in_schema, in_batch)
+    rb.begin(r_uint64(42), r_uint64(0), r_int64(1))
+    rb.put_int(r_int64(100))
+    rb.commit()
+
+    out_batch = batch.ArenaZSetBatch(out_schema)
+    builder = RowBuilder(out_schema, out_batch)
+    builder.begin(r_uint64(99), r_uint64(0), r_int64(1))
+
+    acc = in_batch.get_accessor(0)
+    result, is_null = eval_expr(prog, acc, builder)
+    # With num_regs=0, result should be (0, True) — sentinel
+    assert_true(is_null, "num_regs=0 returns null sentinel")
+
+    builder.commit()
+
+    # Also test ExprMapFunction.evaluate_map path
+    func = ExprMapFunction(prog)
+    out_batch2 = batch.ArenaZSetBatch(out_schema)
+    builder2 = RowBuilder(out_schema, out_batch2)
+    builder2.begin(r_uint64(99), r_uint64(0), r_int64(1))
+    func.evaluate_map(acc, builder2)
+    builder2.commit()
+
+    in_batch.free()
+    out_batch.free()
+    out_batch2.free()
+    os.write(1, "    [OK] zero-regs ExprProgram\n")
+
+
 # ------------------------------------------------------------------------------
 # Entry Point
 # ------------------------------------------------------------------------------
@@ -1626,6 +1678,7 @@ def entry_point(argv):
         test_execute_epoch_evict()
         test_reduce_min_avi_group_elimination(base_dir)
         test_reduce_min_group_idx_cross_tick(base_dir)
+        test_eval_expr_zero_regs()
         os.write(1, "\nALL VM TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")
