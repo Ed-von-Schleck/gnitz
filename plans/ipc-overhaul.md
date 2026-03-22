@@ -131,72 +131,42 @@ already eliminates the relay for trivial (direct INPUT→SHARD) views.
 
 ---
 
-## Step 3: Length-Prefixed SOCK_STREAM (External IPC)
+## Step 3 — DONE
 
-Drop memfd+SCM_RIGHTS from external client path. Switch to `SOCK_STREAM`
-with 4-byte length-prefix framing. No message size limit.
-
-### Current state (what to change)
-
-External client ↔ master uses SOCK_SEQPACKET + SCM_RIGHTS fd passing:
-- **Server side**: `ipc_ffi.py` has `gnitz_server_create` (SEQPACKET),
-  `gnitz_ipc_send_fd`/`gnitz_ipc_recv_fd`/`gnitz_ipc_recv_fd_nb` (SCM_RIGHTS).
-  `ipc.py` has `serialize_to_memfd` → `send_batch` and `receive_payload` /
-  `try_receive_payload` (memfd mmap + parse). `executor.py:_drain_client`
-  calls `try_receive_payload` for recv, `send_batch` for responses.
-- **Rust client**: `rust_client/gnitz-protocol/src/transport.rs` — SEQPACKET
-  connect + SCM_RIGHTS send/recv.
-- **Python client**: `py_client/gnitz_client/` — wraps the Rust client via
-  PyO3 bindings; transport changes are Rust-only.
-
-Key insight: `_encode_wire` / `_parse_from_ptr` (factored in Step 2a)
-already produce/consume the WAL-block wire format as raw bytes. Step 3 only
-replaces the transport layer (memfd+SCM_RIGHTS → length-prefixed TCP-style
-framing). The wire payload format is unchanged.
-
-Internal master ↔ worker IPC (SAL + W2M) is completely unaffected.
+Replaced memfd+SCM_RIGHTS external IPC with SOCK_STREAM + 4-byte LE
+length-prefix framing. Wire payload format unchanged (`_encode_wire` /
+`_parse_from_ptr`). Internal SAL + W2M unaffected.
 
 ### Wire protocol
 
 ```
 Both directions: [u32 payload_length (LE)][payload bytes]
-payload_length = 0: connection close
-payload bytes: same WAL-block wire format as today
+payload_length = 0: connection close sentinel
+payload bytes: same 3-block WAL-columnar format
 ```
 
-### `ipc_ffi.py` changes
+### What was implemented
 
-`gnitz_server_create_stream`: AF_UNIX SOCK_STREAM listen socket.
-`gnitz_send_framed` / `gnitz_recv_framed`: length-prefixed send/recv with
-`send_all` / `recv_all` loops handling partial I/O and EINTR.
+- `ipc_ffi.py`: `gnitz_server_create` now SOCK_STREAM; added
+  `gnitz_send_framed`, `gnitz_recv_header_nb`, `gnitz_recv_exact` C FFI.
+  Deleted all SCM_RIGHTS C code (`gnitz_ipc_send_fd/recv_fd/recv_fd_nb`).
+- `ipc.py`: `send_framed`/`recv_framed`/`try_recv_framed` replace
+  `serialize_to_memfd`/`send_batch`/`receive_payload`/`try_receive_payload`.
+  `IPCPayload` now owns a raw buffer (`raw_buf`) instead of mmap+fd.
+- `executor.py`: Per-connection `hdr_buf[4]` + `hdr_pos` for non-blocking
+  SOCK_STREAM header reads. `_drain_client` uses `try_recv_framed`.
+- `transport.rs`: `send_framed`/`recv_framed` replace `send_memfd`/`recv_memfd`.
+  `MmapBuffer` deleted. `connect` uses SOCK_STREAM.
+- `message.rs`: `send_message`/`recv_message` use framed transport.
 
-### `ipc.py` new functions
+### What was NOT implemented (deferred from original plan)
 
-`send_framed(sock_fd, target_id, zbatch, ...)`: encode via `_encode_wire` +
-framed send.
-`recv_framed(sock_fd)`: receive framed → `_parse_from_ptr`.
+- `fan_out_scan_stream(client_fd)` — streaming scans over SOCK_STREAM.
+  Current scans materialize full results in a single framed message.
+- `FLAG_SCAN_DONE` sentinel — not needed without streaming scans.
 
-### `executor.py` changes
-
-`_handle_client`: `recv_framed` / `send_framed`. Multi-worker scans call
-`fan_out_scan_stream(client_fd)`.
-
-### Rust client changes
-
-`transport.rs`: SOCK_STREAM + length-prefixed framing. Scan responses: read
-framed messages in loop until `FLAG_SCAN_DONE` sentinel.
-
-Breaking change. Version both sides together.
-
-### Files changed
-
-- `gnitz/server/ipc.py`, `gnitz/server/ipc_ffi.py`, `gnitz/server/executor.py`
-- `rust_client/gnitz-protocol/src/transport.rs`
-
-### Test
-
-- `make run-server_test-c`
-- `GNITZ_WORKERS=4 pytest rust_client/gnitz-py/tests/`
+These are pure optimizations for large scan results. Can be added as a
+follow-up step when profiling shows scan materialization is a bottleneck.
 
 ---
 
@@ -240,8 +210,11 @@ All io_uring buffers must be raw-allocated (`flavor='raw'`).
 ## Step 5: io_uring Event Loop for External Clients
 
 Replace poll-based `run_socket_server` in `executor.py` with io_uring
-event loop. Current loop uses `ipc_ffi.poll()` + non-blocking accept/recv.
-Step 3 must land first (SOCK_STREAM framing).
+event loop. Current loop uses `ipc_ffi.poll()` + `try_recv_framed` (two-phase:
+non-blocking 4-byte header via `recv_header_nb`, then blocking payload via
+`recv_exact`). Per-connection state: `_client_hdr_bufs` (4-byte raw buffer)
+and `_client_hdr_pos` (1-element int array) dicts on `ServerExecutor`.
+Step 3 must land first (SOCK_STREAM framing) — DONE.
 
 ```
 io_uring instance (256 SQ entries)
@@ -283,7 +256,7 @@ Step 2a  DONE — SAL transport, W2M, master/worker SAL integration
 Step 2b  DEFERRED — gather-encode optimization (pure perf, no functional gap)
 Step 2c  DONE — unified WAL, checkpoint/reset, crash recovery, epoch fencing
 Step 2d  DEFERRED — exchange arena (relay-through-master works, preload covers common case)
-Step 3   External IPC (independent of Step 2)
+Step 3   DONE — SOCK_STREAM + length-prefix framing (external IPC)
 Step 4   uring_ffi.py (independent of everything)
 Step 5   io_uring event loop (depends on 3 + 4)
 ```
@@ -303,7 +276,45 @@ Per push, 4 workers, 64 partitions/worker:
 
 ---
 
-## Lessons Learned (Steps 1–2)
+## Lessons Learned (Steps 1–3)
+
+### Two-phase recv for SOCK_STREAM non-blocking (Step 3)
+
+SOCK_STREAM requires per-connection state for partial reads. The design uses
+a two-phase approach: `recv_header_nb` (non-blocking, MSG_DONTWAIT) reads
+up to 4 header bytes into a per-connection `hdr_buf[4]`/`hdr_pos` pair.
+Once the header is complete, `recv_exact` (blocking) reads the payload.
+This works because in a request-response protocol, once the client has
+committed the 4-byte header, the payload follows immediately. Blocking for
+the payload is safe — same as SEQPACKET's blocking recvmsg.
+
+The per-connection state is allocated as raw buffers (`lltype.malloc(...,
+flavor='raw')`) keyed by fd in dicts on `ServerExecutor`. Freed in
+`_cleanup_client`.
+
+### SOCK_STREAM socketpair tests deadlock on large payloads (Step 3)
+
+Single-threaded tests that send large payloads (> kernel socket buffer, ~200KB
+for Unix domain) over a socketpair will deadlock: `send_all` blocks when the
+buffer is full, but nobody is reading yet. Keep test payloads under 64KB for
+loopback socketpair tests. Large payloads are exercised by the E2E tests
+where client and server run in separate processes.
+
+### IPCPayload needs dual ownership paths (Step 3)
+
+After Step 3, `IPCPayload.close()` must handle two memory ownership modes:
+(1) raw buffer from `recv_framed` (`raw_buf` field, freed with
+`lltype.free(..., flavor='raw')`), and (2) mmap+fd from SAL internal paths
+(`ptr`/`fd` fields, freed with `munmap_file`/`os.close`). The `raw_buf`
+check comes first in `close()` to avoid double-free if both are set.
+
+### Rebuild both server and client binaries after transport change (Step 3)
+
+SOCK_STREAM framing is a breaking wire protocol change. The server binary
+(`make server`) and Rust client wheel (`maturin develop --release` in
+`rust_client/gnitz-py/`) must both be rebuilt before running E2E tests.
+Running old client against new server produces immediate "protocol error"
+on every request.
 
 ### Epoch fencing beats zeroing
 
