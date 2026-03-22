@@ -165,14 +165,12 @@ def _join_dt_swapped(delta_batch, trace_cursor, out_writer, composite_acc):
                 trace_cursor.advance()
                 continue
             w_trace = trace_cursor.weight()
+            composite_acc.right_acc = trace_cursor.get_accessor()
             while delta_cursor.is_valid() and pk_eq(delta_cursor.key_lo(), delta_cursor.key_hi(), trace_key_lo, trace_key_hi):
                 w_delta = delta_cursor.weight()
                 w_out = r_int64(intmask(w_delta * w_trace))
                 if w_out != r_int64(0):
-                    composite_acc.set_accessors(
-                        delta_cursor.get_accessor(),
-                        trace_cursor.get_accessor(),
-                    )
+                    composite_acc.left_acc = delta_cursor.get_accessor()
                     out_writer.append_from_accessor(trace_key_lo, trace_key_hi, w_out, composite_acc)
                 delta_cursor.advance()
             trace_cursor.advance()
@@ -196,14 +194,12 @@ def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
             while trace_cursor.is_valid() and pk_lt(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
                 trace_cursor.advance()
         # Iterate all trace records for d_key (trace may have multiple rows per PK).
+        composite_acc.left_acc = delta_batch.get_accessor(i)
         while trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
             w_trace = trace_cursor.weight()
             w_out = r_int64(intmask(w_delta * w_trace))
             if w_out != r_int64(0):
-                composite_acc.set_accessors(
-                    delta_batch.get_accessor(i),
-                    trace_cursor.get_accessor(),
-                )
+                composite_acc.right_acc = trace_cursor.get_accessor()
                 out_writer.append_from_accessor(d_key_lo, d_key_hi, w_out, composite_acc)
             trace_cursor.advance()
     out_writer.mark_sorted(True)
@@ -246,22 +242,20 @@ def _join_dt_outer_merge_walk(delta_batch, trace_cursor, out_writer,
             while trace_cursor.is_valid() and pk_lt(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
                 trace_cursor.advance()
 
+        composite_acc.left_acc = delta_batch.get_accessor(i)
         matched = False
         while trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
             w_trace = trace_cursor.weight()
             w_out = r_int64(intmask(w_delta * w_trace))
             if w_out != r_int64(0):
-                composite_acc.set_accessors(
-                    delta_batch.get_accessor(i),
-                    trace_cursor.get_accessor(),
-                )
+                composite_acc.right_acc = trace_cursor.get_accessor()
                 out_writer.append_from_accessor(d_key_lo, d_key_hi, w_out, composite_acc)
                 matched = True
             trace_cursor.advance()
 
         if not matched:
             # No inner-join output for this delta key — emit null-fill row.
-            composite_acc.set_accessors(delta_batch.get_accessor(i), null_acc)
+            composite_acc.right_acc = null_acc
             out_writer.append_from_accessor(d_key_lo, d_key_hi, w_delta, composite_acc)
 
     out_writer.mark_sorted(True)
@@ -310,14 +304,12 @@ def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):
                         wa = b_a.get_weight(i)
                         if wa == r_int64(0):
                             continue
+                        composite_acc.left_acc = b_a.get_accessor(i)
                         for j in range(start_b, idx_b):
                             wb = b_b.get_weight(j)
                             w_out = r_int64(intmask(wa * wb))
                             if w_out != r_int64(0):
-                                composite_acc.set_accessors(
-                                    b_a.get_accessor(i),
-                                    b_b.get_accessor(j),
-                                )
+                                composite_acc.right_acc = b_b.get_accessor(j)
                                 out_writer.append_from_accessor(
                                     match_lo, match_hi, w_out, composite_acc
                                 )
