@@ -2,8 +2,7 @@
 
 mod helpers;
 
-use gnitz_core::{Connection, alloc_table_id, alloc_schema_id, push, scan,
-                 SCHEMA_TAB, FIRST_USER_TABLE_ID};
+use gnitz_core::{Connection, SCHEMA_TAB, FIRST_USER_TABLE_ID};
 use gnitz_core::{GnitzClient, ExprBuilder, CircuitBuilder};
 use gnitz_protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData};
 use helpers::ServerHandle;
@@ -22,7 +21,7 @@ fn test_alloc_ids() {
 
     let mut ids = Vec::new();
     for _ in 0..10 {
-        ids.push(alloc_table_id(&conn).unwrap());
+        ids.push(conn.alloc_table_id().unwrap());
     }
 
     // All >= FIRST_USER_TABLE_ID
@@ -54,7 +53,7 @@ fn test_push_scan_roundtrip() {
     };
 
     // Allocate 5 unique IDs to use as schema record PKs
-    let pks: Vec<u64> = (0..5).map(|_| alloc_schema_id(&conn).unwrap()).collect();
+    let pks: Vec<u64> = (0..5).map(|_| conn.alloc_schema_id().unwrap()).collect();
 
     let batch = ZSetBatch {
         pk_lo:   pks.clone(),
@@ -66,9 +65,9 @@ fn test_push_scan_roundtrip() {
             ColData::Strings((0..5usize).map(|i| Some(format!("test_{}", i))).collect()),
         ],
     };
-    push(&conn, SCHEMA_TAB, &schema_tab_schema, &batch).unwrap();
+    conn.push(SCHEMA_TAB, &schema_tab_schema, &batch).unwrap();
 
-    let (wire_schema, data) = scan(&conn, SCHEMA_TAB).unwrap();
+    let (wire_schema, data, _) = conn.scan(SCHEMA_TAB).unwrap();
     assert!(wire_schema.is_some(), "scan must return schema");
     let data = data.unwrap();
 
@@ -94,7 +93,7 @@ fn test_scan_system_tables() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let client = GnitzClient::connect(&srv.sock_path).unwrap();
 
-    let (_, data) = client.scan(SCHEMA_TAB).unwrap();
+    let (_, data, _) = client.scan(SCHEMA_TAB).unwrap();
     let data = data.expect("SCHEMA_TAB must return rows");
     assert!(!data.is_empty(), "expected at least one schema row");
 
@@ -123,7 +122,7 @@ fn test_create_drop_schema() {
     assert!(sid >= gnitz_core::FIRST_USER_SCHEMA_ID, "schema id too small: {}", sid);
 
     // Verify it appears in scan
-    let (_, data) = client.scan(SCHEMA_TAB).unwrap();
+    let (_, data, _) = client.scan(SCHEMA_TAB).unwrap();
     let data = data.unwrap();
     let found = (0..data.len()).any(|i| {
         data.weights[i] > 0 && data.pk_lo[i] == sid
@@ -134,7 +133,7 @@ fn test_create_drop_schema() {
     client.drop_schema("myapp").unwrap();
 
     // Verify it no longer has positive weight
-    let (_, data2) = client.scan(SCHEMA_TAB).unwrap();
+    let (_, data2, _) = client.scan(SCHEMA_TAB).unwrap();
     let data2 = data2.unwrap();
     let still_present = (0..data2.len()).any(|i| {
         data2.weights[i] > 0 && data2.pk_lo[i] == sid
@@ -161,7 +160,7 @@ fn test_create_drop_table() {
     // Scan user table — should be empty but return a schema.
     // Empty tables send no data block (FLAG_HAS_DATA requires non-empty batch),
     // so data_batch is None; that is the correct "empty" signal.
-    let (wire_schema, data) = client.scan(tid).unwrap();
+    let (wire_schema, data, _) = client.scan(tid).unwrap();
     assert!(wire_schema.is_some(), "scan of new table must return schema");
     assert!(data.is_none(), "new table must be empty (no data block)");
 
@@ -202,7 +201,7 @@ fn test_push_and_scan() {
     }
     client.push(tid, &table_schema, &batch).unwrap();
 
-    let (_, data) = client.scan(tid).unwrap();
+    let (_, data, _) = client.scan(tid).unwrap();
     let data = data.unwrap();
     assert_eq!(data.len(), 3, "expected 3 rows; got {}", data.len());
 
@@ -247,7 +246,7 @@ fn test_delete_rows() {
     // Delete middle row (pk=11)
     client.delete(tid, &table_schema, &[(11u64, 0u64)]).unwrap();
 
-    let (_, data) = client.scan(tid).unwrap();
+    let (_, data, _) = client.scan(tid).unwrap();
     let data = data.unwrap();
     let positive: Vec<u64> = data.pk_lo.iter().copied()
         .zip(data.weights.iter().copied())
@@ -297,7 +296,7 @@ fn test_string_columns() {
     batch.nulls[1] |= 1u64 << 1;
     client.push(tid, &table_schema, &batch).unwrap();
 
-    let (_, data) = client.scan(tid).unwrap();
+    let (_, data, _) = client.scan(tid).unwrap();
     let data = data.unwrap();
     assert_eq!(data.len(), 2, "expected 2 rows");
 
@@ -398,7 +397,7 @@ fn test_filter_view() {
     }
     client.push(tid, &table_schema, &batch).unwrap();
 
-    let (_, data) = client.scan(vid).unwrap();
+    let (_, data, _) = client.scan(vid).unwrap();
     let data = data.unwrap();
     let mut positive_pks: Vec<u64> = data.pk_lo.iter().copied()
         .zip(data.weights.iter().copied())
@@ -454,7 +453,7 @@ fn test_reduce_view() {
     }
     client.push(tid, &table_schema, &batch).unwrap();
 
-    let (_, data) = client.scan(vid).unwrap();
+    let (_, data, _) = client.scan(vid).unwrap();
     let data = data.unwrap();
 
     let mut group1_sum: i64 = 0;
@@ -517,7 +516,7 @@ fn test_join_view() {
     }
     client.push(tid_a, &table_schema, &batch_a).unwrap();
 
-    let (_, data) = client.scan(vid).unwrap();
+    let (_, data, _) = client.scan(vid).unwrap();
     let data = data.unwrap();
     let positive_pks: Vec<u64> = data.pk_lo.iter().copied()
         .zip(data.weights.iter().copied())
@@ -575,7 +574,7 @@ fn test_anti_join_view() {
     }
     client.push(tid_a, &table_schema, &batch_a).unwrap();
 
-    let (_, data) = client.scan(vid).unwrap();
+    let (_, data, _) = client.scan(vid).unwrap();
     let data = data.unwrap();
     let positive_pks: Vec<u64> = data.pk_lo.iter().copied()
         .zip(data.weights.iter().copied())
@@ -610,7 +609,7 @@ fn test_exchange_multi_worker() {
     }
     client.push(tid, &table_schema, &batch).unwrap();
 
-    let (_, data) = client.scan(tid).unwrap();
+    let (_, data, _) = client.scan(tid).unwrap();
     let data = data.unwrap();
     let mut pks: Vec<u64> = data.pk_lo.iter().copied()
         .zip(data.weights.iter().copied())
@@ -668,7 +667,7 @@ fn test_incremental_update() {
     client.push(tid, &table_schema, &batch).unwrap();
 
     // Verify tick 1: group1=30, group2=70
-    let (_, data1) = client.scan(vid).unwrap();
+    let (_, data1, _) = client.scan(vid).unwrap();
     let data1 = data1.unwrap();
     let (mut g1, mut g2) = (0i64, 0i64);
     for i in 0..data1.len() {
@@ -685,7 +684,7 @@ fn test_incremental_update() {
     client.delete(tid, &table_schema, &[(1u64, 0u64)]).unwrap();
 
     // Verify tick 2: group1=20, group2=70 (unchanged)
-    let (_, data2) = client.scan(vid).unwrap();
+    let (_, data2, _) = client.scan(vid).unwrap();
     let data2 = data2.unwrap();
     let (mut g1, mut g2) = (0i64, 0i64);
     for i in 0..data2.len() {
@@ -744,7 +743,7 @@ fn test_bulk_filter() {
     }
     client.push(tid, &table_schema, &batch).unwrap();
 
-    let (_, data) = client.scan(vid).unwrap();
+    let (_, data, _) = client.scan(vid).unwrap();
     let data = data.unwrap();
     let positive: Vec<u64> = data.pk_lo.iter().copied()
         .zip(data.weights.iter().copied())
@@ -784,7 +783,7 @@ fn test_bulk_exchange_multi_worker() {
     }
     client.push(tid, &table_schema, &batch).unwrap();
 
-    let (_, data) = client.scan(tid).unwrap();
+    let (_, data, _) = client.scan(tid).unwrap();
     let data = data.unwrap();
     let positive_count = data.weights.iter().filter(|&&w| w > 0).count();
     assert_eq!(positive_count, 500_000,

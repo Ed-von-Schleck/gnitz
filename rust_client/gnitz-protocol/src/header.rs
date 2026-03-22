@@ -29,26 +29,22 @@ pub struct Header {
     pub flags:      u64,
     pub seek_pk_lo: u64,
     pub seek_pk_hi: u64,
-    pub p4:         u64,   // seek_col_idx for FLAG_SEEK_BY_INDEX
+    pub seek_col_idx: u64,
 }
 
 impl Header {
-    /// Set p4/seek_pk_lo/seek_pk_hi for FLAG_SEEK_BY_INDEX requests.
     pub fn set_seek_by_index(&mut self, col_idx: u64, key_lo: u64, key_hi: u64) {
-        self.p4         = col_idx;
-        self.seek_pk_lo = key_lo;
-        self.seek_pk_hi = key_hi;
+        self.seek_col_idx = col_idx;
+        self.seek_pk_lo   = key_lo;
+        self.seek_pk_hi   = key_hi;
     }
-    pub fn seek_col_idx(&self)    -> u64 { self.p4 }
-    pub fn seek_idx_key_lo(&self) -> u64 { self.seek_pk_lo }
-    pub fn seek_idx_key_hi(&self) -> u64 { self.seek_pk_hi }
 }
 
 impl Default for Header {
     fn default() -> Self {
         Header {
             status: 0, target_id: 0, client_id: 0, flags: 0,
-            seek_pk_lo: 0, seek_pk_hi: 0, p4: 0,
+            seek_pk_lo: 0, seek_pk_hi: 0, seek_col_idx: 0,
         }
     }
 }

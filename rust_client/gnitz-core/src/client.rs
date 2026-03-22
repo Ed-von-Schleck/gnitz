@@ -1,9 +1,6 @@
 use gnitz_protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender};
-use crate::connection::Connection;
+use crate::connection::{Connection, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB};
 use crate::error::ClientError;
-use crate::ops::{
-    self, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB,
-};
 use crate::types::{
     CircuitGraph,
     CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_SOURCES_TAB,
@@ -133,23 +130,23 @@ impl GnitzClient {
     // --- Raw ops ---
 
     pub fn alloc_table_id(&self) -> Result<u64, ClientError> {
-        ops::alloc_table_id(&self.conn)
+        self.conn.alloc_table_id()
     }
 
     pub fn alloc_schema_id(&self) -> Result<u64, ClientError> {
-        ops::alloc_schema_id(&self.conn)
+        self.conn.alloc_schema_id()
     }
 
     pub fn alloc_index_id(&self) -> Result<u64, ClientError> {
-        ops::alloc_index_id(&self.conn)
+        self.conn.alloc_index_id()
     }
 
     pub fn push(&self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
-        ops::push(&self.conn, table_id, schema, batch)
+        self.conn.push(table_id, schema, batch)
     }
 
     pub fn scan(&self, table_id: u64) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
-        ops::scan(&self.conn, table_id)
+        self.conn.scan(table_id)
     }
 
     pub fn seek(
@@ -158,19 +155,19 @@ impl GnitzClient {
         pk_lo:    u64,
         pk_hi:    u64,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
-        ops::seek(&self.conn, table_id, pk_lo, pk_hi)
+        self.conn.seek(table_id, pk_lo, pk_hi)
     }
 
     pub fn seek_by_index(
         &self, table_id: u64, col_idx: u64, key_lo: u64, key_hi: u64,
     ) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {
-        ops::seek_by_index(&self.conn, table_id, col_idx, key_lo, key_hi)
+        self.conn.seek_by_index(table_id, col_idx, key_lo, key_hi)
     }
 
     pub fn find_index_for_column(
         &self, table_id: u64, col_idx: usize,
     ) -> Result<Option<(u64, bool)>, ClientError> {
-        let (_, idx_batch, _) = ops::scan(&self.conn, IDX_TAB)?;
+        let (_, idx_batch, _) = self.conn.scan(IDX_TAB)?;
         let idx_batch = match idx_batch { None => return Ok(None), Some(b) => b };
         for i in 0..idx_batch.len() {
             if idx_batch.weights[i] <= 0 { continue; }
@@ -213,7 +210,7 @@ impl GnitzClient {
     }
 
     pub fn drop_index_by_name(&self, index_name: &str) -> Result<(), ClientError> {
-        let (_, idx_batch, _) = ops::scan(&self.conn, IDX_TAB)?;
+        let (_, idx_batch, _) = self.conn.scan(IDX_TAB)?;
         let idx_batch = idx_batch.ok_or_else(|| {
             ClientError::ServerError(format!("index '{}' not found", index_name))
         })?;
@@ -257,36 +254,36 @@ impl GnitzClient {
                 }
             }
         }
-        ops::push(&self.conn, table_id, schema, &batch)?;
+        self.conn.push(table_id, schema, &batch)?;
         Ok(())
     }
 
     // --- DDL ---
 
     pub fn create_schema(&self, name: &str) -> Result<u64, ClientError> {
-        let new_sid = ops::alloc_schema_id(&self.conn)?;
+        let new_sid = self.conn.alloc_schema_id()?;
         let schema = schema_tab_schema();
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
             .add_row(new_sid, 0, 1)
             .str_val(name);
-        ops::push(&self.conn, SCHEMA_TAB, &schema, &batch)?;
+        self.conn.push(SCHEMA_TAB, &schema, &batch)?;
         Ok(new_sid)
     }
 
     pub fn drop_schema(&self, name: &str) -> Result<(), ClientError> {
-        let (_, data, _) = ops::scan(&self.conn, SCHEMA_TAB)?;
+        let (_, data, _) = self.conn.scan(SCHEMA_TAB)?;
         let data = data.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", name))
         })?;
-        let schema_id = self.find_schema_id(&data, name)?;
+        let schema_id = find_schema_id(&data, name)?;
 
         let schema = schema_tab_schema();
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
             .add_row(schema_id, 0, -1)
             .str_val(name);
-        ops::push(&self.conn, SCHEMA_TAB, &schema, &batch)?;
+        self.conn.push(SCHEMA_TAB, &schema, &batch)?;
         Ok(())
     }
 
@@ -298,13 +295,13 @@ impl GnitzClient {
         pk_col_idx: usize,
         unique_pk: bool,
     ) -> Result<u64, ClientError> {
-        let new_tid = ops::alloc_table_id(&self.conn)?;
+        let new_tid = self.conn.alloc_table_id()?;
 
-        let (_, schema_batch, _) = ops::scan(&self.conn, SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
-        let schema_id = self.find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         // COL_TAB first — server hook fires on TABLE_TAB insert and reads COL_TAB
         self.push_col_tab_records(new_tid, OWNER_KIND_TABLE, columns)?;
@@ -320,25 +317,25 @@ impl GnitzClient {
             .u64_val(pk_col_idx as u64)
             .u64_val(0)
             .u64_val(unique_pk as u64);
-        ops::push(&self.conn, TABLE_TAB, &tbl_schema, &tb)?;
+        self.conn.push(TABLE_TAB, &tbl_schema, &tb)?;
 
         Ok(new_tid)
     }
 
     pub fn drop_table(&self, schema_name: &str, table_name: &str) -> Result<(), ClientError> {
-        let (_, schema_batch, _) = ops::scan(&self.conn, SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
-        let schema_id = self.find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
-        let (_, tbl_batch, _) = ops::scan(&self.conn, TABLE_TAB)?;
+        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB)?;
         let tbl_batch = tbl_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Table '{}.{}' not found", schema_name, table_name))
         })?;
-        let record = self.find_table_record(&tbl_batch, schema_id, table_name)?;
+        let record = find_table_record(&tbl_batch, schema_id, table_name)?;
 
-        let (_, col_batch, _) = ops::scan(&self.conn, COL_TAB)?;
+        let (_, col_batch, _) = self.conn.scan(COL_TAB)?;
         if let Some(col_batch) = col_batch {
             self.retract_col_tab_records(&col_batch, record.tid, OWNER_KIND_TABLE)?;
         }
@@ -353,7 +350,7 @@ impl GnitzClient {
             .u64_val(record.pk_col_idx)
             .u64_val(record.created_lsn)
             .u64_val(record.flags);
-        ops::push(&self.conn, TABLE_TAB, &tbl_schema, &tb)?;
+        self.conn.push(TABLE_TAB, &tbl_schema, &tb)?;
 
         Ok(())
     }
@@ -365,13 +362,13 @@ impl GnitzClient {
         source_table_id: u64,
         output_columns: &[ColumnDef],
     ) -> Result<u64, ClientError> {
-        let vid = ops::alloc_table_id(&self.conn)?;
+        let vid = self.conn.alloc_table_id()?;
 
-        let (_, schema_batch, _) = ops::scan(&self.conn, SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
-        let schema_id = self.find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         // 1. Column records
         self.push_col_tab_records(vid, OWNER_KIND_VIEW, output_columns)?;
@@ -385,7 +382,7 @@ impl GnitzClient {
                 .u64_val(vid)
                 .u64_val(0)
                 .u64_val(source_table_id);
-            ops::push(&self.conn, DEP_TAB, &dep_s, &dep)?;
+            self.conn.push(DEP_TAB, &dep_s, &dep)?;
         }
 
         // 3. Circuit nodes: SCAN_TRACE (node 0) + INTEGRATE (node 1)
@@ -397,7 +394,7 @@ impl GnitzClient {
                 a.add_row(0, vid, 1).u64_val(OPCODE_SCAN_TRACE);
                 a.add_row(1, vid, 1).u64_val(OPCODE_INTEGRATE);
             }
-            ops::push(&self.conn, CIRCUIT_NODES_TAB, &nodes_s, &nodes)?;
+            self.conn.push(CIRCUIT_NODES_TAB, &nodes_s, &nodes)?;
         }
 
         // 4. Circuit edge: node 0 -> node 1, port PORT_IN
@@ -409,7 +406,7 @@ impl GnitzClient {
                 .u64_val(0)
                 .u64_val(1)
                 .u64_val(PORT_IN);
-            ops::push(&self.conn, CIRCUIT_EDGES_TAB, &edges_s, &edges)?;
+            self.conn.push(CIRCUIT_EDGES_TAB, &edges_s, &edges)?;
         }
 
         // 5. Circuit source: node 0, table_id=0 (primary input resolved from deps)
@@ -419,7 +416,7 @@ impl GnitzClient {
             BatchAppender::new(&mut sources, &sources_s)
                 .add_row(0, vid, 1)
                 .u64_val(0);
-            ops::push(&self.conn, CIRCUIT_SOURCES_TAB, &sources_s, &sources)?;
+            self.conn.push(CIRCUIT_SOURCES_TAB, &sources_s, &sources)?;
         }
 
         // 6. View record — must be last (triggers server-side hook + circuit compilation)
@@ -437,16 +434,16 @@ impl GnitzClient {
         output_columns: &[ColumnDef],
     ) -> Result<u64, ClientError> {
         let vid = if circuit.view_id == 0 {
-            ops::alloc_table_id(&self.conn)?
+            self.conn.alloc_table_id()?
         } else {
             circuit.view_id
         };
 
-        let (_, schema_batch, _) = ops::scan(&self.conn, SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
-        let schema_id = self.find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         // 1. Column records
         self.push_col_tab_records(vid, OWNER_KIND_VIEW, output_columns)?;
@@ -464,7 +461,7 @@ impl GnitzClient {
                         .u64_val(dep_tid);
                 }
             }
-            ops::push(&self.conn, DEP_TAB, &dep_s, &dep)?;
+            self.conn.push(DEP_TAB, &dep_s, &dep)?;
         }
 
         // 3. Circuit nodes
@@ -477,7 +474,7 @@ impl GnitzClient {
                     a.add_row(node_id, vid, 1).u64_val(opcode);
                 }
             }
-            ops::push(&self.conn, CIRCUIT_NODES_TAB, &nodes_s, &nodes)?;
+            self.conn.push(CIRCUIT_NODES_TAB, &nodes_s, &nodes)?;
         }
 
         // 4. Circuit edges
@@ -493,7 +490,7 @@ impl GnitzClient {
                         .u64_val(port);
                 }
             }
-            ops::push(&self.conn, CIRCUIT_EDGES_TAB, &edges_s, &edges)?;
+            self.conn.push(CIRCUIT_EDGES_TAB, &edges_s, &edges)?;
         }
 
         // 5. Circuit sources
@@ -506,7 +503,7 @@ impl GnitzClient {
                     a.add_row(node_id, vid, 1).u64_val(table_id);
                 }
             }
-            ops::push(&self.conn, CIRCUIT_SOURCES_TAB, &sources_s, &sources)?;
+            self.conn.push(CIRCUIT_SOURCES_TAB, &sources_s, &sources)?;
         }
 
         // 6. Circuit params (3-column schema: param_pk, value, str_value)
@@ -531,7 +528,7 @@ impl GnitzClient {
                         .str_val(value);
                 }
             }
-            ops::push(&self.conn, CIRCUIT_PARAMS_TAB, &params_s, &params)?;
+            self.conn.push(CIRCUIT_PARAMS_TAB, &params_s, &params)?;
         }
 
         // 7. Circuit group cols
@@ -545,7 +542,7 @@ impl GnitzClient {
                     a.add_row(gcol_lo, vid, 1).u64_val(col_idx);
                 }
             }
-            ops::push(&self.conn, CIRCUIT_GROUP_COLS_TAB, &gcols_s, &gcols)?;
+            self.conn.push(CIRCUIT_GROUP_COLS_TAB, &gcols_s, &gcols)?;
         }
 
         // 8. View record — must be last
@@ -555,17 +552,17 @@ impl GnitzClient {
     }
 
     pub fn drop_view(&self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
-        let (_, schema_batch, _) = ops::scan(&self.conn, SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
-        let schema_id = self.find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
-        let (_, view_batch, _) = ops::scan(&self.conn, VIEW_TAB)?;
+        let (_, view_batch, _) = self.conn.scan(VIEW_TAB)?;
         let view_batch = view_batch.ok_or_else(|| {
             ClientError::ServerError(format!("View '{}.{}' not found", schema_name, view_name))
         })?;
-        let vr = self.find_view_record(&view_batch, schema_id, view_name)?;
+        let vr = find_view_record(&view_batch, schema_id, view_name)?;
 
         // Retract view record first — triggers teardown
         {
@@ -578,13 +575,13 @@ impl GnitzClient {
                 .str_val(&vr.sql_definition)
                 .str_val(&vr.cache_directory)
                 .u64_val(vr.created_lsn);
-            ops::push(&self.conn, VIEW_TAB, &view_s, &vb)?;
+            self.conn.push(VIEW_TAB, &view_s, &vb)?;
         }
 
         self.retract_circuit_graph(vr.vid)?;
         self.retract_deps_for_view(vr.vid)?;
 
-        let (_, col_batch, _) = ops::scan(&self.conn, COL_TAB)?;
+        let (_, col_batch, _) = self.conn.scan(COL_TAB)?;
         if let Some(col_batch) = col_batch {
             self.retract_col_tab_records(&col_batch, vr.vid, OWNER_KIND_VIEW)?;
         }
@@ -597,24 +594,24 @@ impl GnitzClient {
         schema_name: &str,
         table_name: &str,
     ) -> Result<(u64, Schema), ClientError> {
-        let (_, schema_batch, _) = ops::scan(&self.conn, SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
-        let schema_id = self.find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
-        let (_, tbl_batch, _) = ops::scan(&self.conn, TABLE_TAB)?;
+        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB)?;
         let tbl_batch = tbl_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Table '{}.{}' not found", schema_name, table_name))
         })?;
-        let record = self.find_table_record(&tbl_batch, schema_id, table_name)?;
+        let record = find_table_record(&tbl_batch, schema_id, table_name)?;
 
-        let (_, col_batch, _) = ops::scan(&self.conn, COL_TAB)?;
+        let (_, col_batch, _) = self.conn.scan(COL_TAB)?;
         let col_batch = col_batch.ok_or_else(|| {
             ClientError::ServerError("COL_TAB is empty".to_string())
         })?;
 
-        let columns = self.extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
+        let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
         Ok((record.tid, Schema { columns, pk_index: record.pk_col_idx as usize }))
     }
 
@@ -623,123 +620,122 @@ impl GnitzClient {
         schema_name: &str,
         name: &str,
     ) -> Result<(u64, Schema), ClientError> {
-        let (_, schema_batch, _) = ops::scan(&self.conn, SCHEMA_TAB)?;
+        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB)?;
         let schema_batch = schema_batch.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{}' not found", schema_name))
         })?;
-        let schema_id = self.find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         // Scan COL_TAB once — shared by both the table and view branches below
-        let (_, col_batch, _) = ops::scan(&self.conn, COL_TAB)?;
+        let (_, col_batch, _) = self.conn.scan(COL_TAB)?;
         let col_batch = col_batch.ok_or_else(|| {
             ClientError::ServerError("COL_TAB is empty".to_string())
         })?;
 
         // Try TABLE_TAB first (most common path)
-        let (_, tbl_batch, _) = ops::scan(&self.conn, TABLE_TAB)?;
+        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB)?;
         if let Some(ref tbl_batch) = tbl_batch {
-            if let Ok(record) = self.find_table_record(tbl_batch, schema_id, name) {
-                let columns = self.extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
+            if let Ok(record) = find_table_record(tbl_batch, schema_id, name) {
+                let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
                 return Ok((record.tid, Schema { columns, pk_index: record.pk_col_idx as usize }));
             }
         }
 
         // Fall back to VIEW_TAB
-        let (_, view_batch, _) = ops::scan(&self.conn, VIEW_TAB)?;
+        let (_, view_batch, _) = self.conn.scan(VIEW_TAB)?;
         let view_batch = view_batch.ok_or_else(|| {
             ClientError::ServerError(
                 format!("Table or view '{}.{}' not found", schema_name, name)
             )
         })?;
-        let record = self.find_view_record(&view_batch, schema_id, name)?;
-        let columns = self.extract_col_entries(&col_batch, record.vid, OWNER_KIND_VIEW)?;
+        let record = find_view_record(&view_batch, schema_id, name)?;
+        let columns = extract_col_entries(&col_batch, record.vid, OWNER_KIND_VIEW)?;
         // View PK is always the U128 hash column at index 0
         Ok((record.vid, Schema { columns, pk_index: 0 }))
     }
 
-    // --- Private helpers ---
+    // --- Private helpers (delegating to module-level functions) ---
+}
 
-    fn extract_col_entries(
-        &self,
-        col_batch:  &ZSetBatch,
-        owner_id:   u64,
-        owner_kind: u64,
-    ) -> Result<Vec<ColumnDef>, ClientError> {
-        let mut col_entries: Vec<(u64, String, TypeCode, bool)> = Vec::new();
-        for i in 0..col_batch.len() {
-            if col_batch.weights[i] <= 0 { continue; }
-            let row_owner_id   = col_u64(&col_batch.columns[1], i)?;
-            let row_owner_kind = col_u64(&col_batch.columns[2], i)?;
-            if row_owner_id != owner_id || row_owner_kind != owner_kind { continue; }
+fn extract_col_entries(
+    col_batch:  &ZSetBatch,
+    owner_id:   u64,
+    owner_kind: u64,
+) -> Result<Vec<ColumnDef>, ClientError> {
+    let mut col_entries: Vec<(u64, String, TypeCode, bool)> = Vec::new();
+    for i in 0..col_batch.len() {
+        if col_batch.weights[i] <= 0 { continue; }
+        let row_owner_id   = col_u64(&col_batch.columns[1], i)?;
+        let row_owner_kind = col_u64(&col_batch.columns[2], i)?;
+        if row_owner_id != owner_id || row_owner_kind != owner_kind { continue; }
 
-            let col_idx     = col_u64(&col_batch.columns[3], i)?;
-            let name        = col_str(&col_batch.columns[4], i)?.unwrap_or("").to_string();
-            let tc_val      = col_u64(&col_batch.columns[5], i)?;
-            let type_code   = TypeCode::try_from_u64(tc_val).map_err(ClientError::Protocol)?;
-            let is_nullable = col_u64(&col_batch.columns[6], i)? != 0;
-            col_entries.push((col_idx, name, type_code, is_nullable));
-        }
-        col_entries.sort_by_key(|e| e.0);
-        Ok(col_entries.into_iter().map(|(_, name, type_code, is_nullable)| {
-            ColumnDef { name, type_code, is_nullable }
-        }).collect())
+        let col_idx     = col_u64(&col_batch.columns[3], i)?;
+        let name        = col_str(&col_batch.columns[4], i)?.unwrap_or("").to_string();
+        let tc_val      = col_u64(&col_batch.columns[5], i)?;
+        let type_code   = TypeCode::try_from_u64(tc_val).map_err(ClientError::Protocol)?;
+        let is_nullable = col_u64(&col_batch.columns[6], i)? != 0;
+        col_entries.push((col_idx, name, type_code, is_nullable));
     }
+    col_entries.sort_by_key(|e| e.0);
+    Ok(col_entries.into_iter().map(|(_, name, type_code, is_nullable)| {
+        ColumnDef { name, type_code, is_nullable }
+    }).collect())
+}
 
-    fn find_schema_id(&self, batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
-        for i in 0..batch.len() {
-            if batch.weights[i] <= 0 { continue; }
-            if col_str(&batch.columns[1], i)? == Some(name) {
-                return Ok(batch.pk_lo[i]);
-            }
+fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
+    for i in 0..batch.len() {
+        if batch.weights[i] <= 0 { continue; }
+        if col_str(&batch.columns[1], i)? == Some(name) {
+            return Ok(batch.pk_lo[i]);
         }
-        Err(ClientError::ServerError(format!("Schema '{}' not found", name)))
     }
+    Err(ClientError::ServerError(format!("Schema '{}' not found", name)))
+}
 
-    fn find_table_record(
-        &self,
-        batch: &ZSetBatch,
-        schema_id: u64,
-        table_name: &str,
-    ) -> Result<TableRecord, ClientError> {
-        for i in 0..batch.len() {
-            if batch.weights[i] <= 0 { continue; }
-            if col_u64(&batch.columns[1], i)? != schema_id { continue; }
-            if col_str(&batch.columns[2], i)? != Some(table_name) { continue; }
-            return Ok(TableRecord {
-                tid:         batch.pk_lo[i],
-                schema_id,
-                name:        table_name.to_string(),
-                directory:   col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
-                pk_col_idx:  col_u64(&batch.columns[4], i)?,
-                created_lsn: col_u64(&batch.columns[5], i)?,
-                flags:       col_u64(&batch.columns[6], i)?,
-            });
-        }
-        Err(ClientError::ServerError(format!("Table '{}' not found", table_name)))
+fn find_table_record(
+    batch: &ZSetBatch,
+    schema_id: u64,
+    table_name: &str,
+) -> Result<TableRecord, ClientError> {
+    for i in 0..batch.len() {
+        if batch.weights[i] <= 0 { continue; }
+        if col_u64(&batch.columns[1], i)? != schema_id { continue; }
+        if col_str(&batch.columns[2], i)? != Some(table_name) { continue; }
+        return Ok(TableRecord {
+            tid:         batch.pk_lo[i],
+            schema_id,
+            name:        table_name.to_string(),
+            directory:   col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
+            pk_col_idx:  col_u64(&batch.columns[4], i)?,
+            created_lsn: col_u64(&batch.columns[5], i)?,
+            flags:       col_u64(&batch.columns[6], i)?,
+        });
     }
+    Err(ClientError::ServerError(format!("Table '{}' not found", table_name)))
+}
 
-    fn find_view_record(
-        &self,
-        batch: &ZSetBatch,
-        schema_id: u64,
-        view_name: &str,
-    ) -> Result<ViewRecord, ClientError> {
-        for i in 0..batch.len() {
-            if batch.weights[i] <= 0 { continue; }
-            if col_u64(&batch.columns[1], i)? != schema_id { continue; }
-            if col_str(&batch.columns[2], i)? != Some(view_name) { continue; }
-            return Ok(ViewRecord {
-                vid:             batch.pk_lo[i],
-                schema_id,
-                name:            view_name.to_string(),
-                sql_definition:  col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
-                cache_directory: col_str(&batch.columns[4], i)?.unwrap_or("").to_string(),
-                created_lsn:     col_u64(&batch.columns[5], i)?,
-            });
-        }
-        Err(ClientError::ServerError(format!("View '{}' not found", view_name)))
+fn find_view_record(
+    batch: &ZSetBatch,
+    schema_id: u64,
+    view_name: &str,
+) -> Result<ViewRecord, ClientError> {
+    for i in 0..batch.len() {
+        if batch.weights[i] <= 0 { continue; }
+        if col_u64(&batch.columns[1], i)? != schema_id { continue; }
+        if col_str(&batch.columns[2], i)? != Some(view_name) { continue; }
+        return Ok(ViewRecord {
+            vid:             batch.pk_lo[i],
+            schema_id,
+            name:            view_name.to_string(),
+            sql_definition:  col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
+            cache_directory: col_str(&batch.columns[4], i)?.unwrap_or("").to_string(),
+            created_lsn:     col_u64(&batch.columns[5], i)?,
+        });
     }
+    Err(ClientError::ServerError(format!("View '{}' not found", view_name)))
+}
 
+impl GnitzClient {
     fn push_col_tab_records(
         &self,
         owner_id: u64,
@@ -762,7 +758,7 @@ impl GnitzClient {
                     .u64_val(0);
             }
         }
-        ops::push(&self.conn, COL_TAB, &schema, &batch)?;
+        self.conn.push(COL_TAB, &schema, &batch)?;
         Ok(())
     }
 
@@ -789,7 +785,7 @@ impl GnitzClient {
         ];
         for &(tab_id, schema_fn) in circuit_tables {
             let schema = schema_fn();
-            let (_, batch, _) = ops::scan(&self.conn, tab_id)?;
+            let (_, batch, _) = self.conn.scan(tab_id)?;
             if let Some(batch) = batch {
                 self.retract_records_for_view_u128(tab_id, &schema, &batch, vid)?;
             }
@@ -808,7 +804,7 @@ impl GnitzClient {
     }
 
     fn retract_deps_for_view(&self, vid: u64) -> Result<(), ClientError> {
-        let (_, dep_batch, _) = ops::scan(&self.conn, DEP_TAB)?;
+        let (_, dep_batch, _) = self.conn.scan(DEP_TAB)?;
         let dep_batch = match dep_batch { Some(b) => b, None => return Ok(()) };
         let dep_s = dep_tab_schema();
         self.retract_matching(DEP_TAB, &dep_s, &dep_batch, |i| {
@@ -838,7 +834,7 @@ impl GnitzClient {
             }
         }
         if retract.is_empty() { return Ok(()); }
-        ops::push(&self.conn, table_id, schema, &retract)?;
+        self.conn.push(table_id, schema, &retract)?;
         Ok(())
     }
 
@@ -852,7 +848,7 @@ impl GnitzClient {
             .str_val(sql_text)
             .str_val("")
             .u64_val(0);
-        ops::push(&self.conn, VIEW_TAB, &view_s, &vb)?;
+        self.conn.push(VIEW_TAB, &view_s, &vb)?;
         Ok(())
     }
 }

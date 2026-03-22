@@ -201,18 +201,6 @@ mod tests {
 
     // ── schema/meta roundtrip ────────────────────────────────────────────────
 
-    fn schemas_equal(a: &Schema, b: &Schema) -> bool {
-        if a.pk_index != b.pk_index || a.columns.len() != b.columns.len() {
-            return false;
-        }
-        for (ca, cb) in a.columns.iter().zip(b.columns.iter()) {
-            if ca.name != cb.name || ca.type_code != cb.type_code || ca.is_nullable != cb.is_nullable {
-                return false;
-            }
-        }
-        true
-    }
-
     #[test]
     fn test_schema_meta_roundtrip() {
         let original = Schema {
@@ -232,7 +220,6 @@ mod tests {
         let (decoded_batch, _, _) = decode_wal_block(&encoded, ms).unwrap();
         let reconstructed = batch_to_schema(&decoded_batch).unwrap();
 
-        assert!(schemas_equal(&original, &reconstructed),
-            "schema mismatch after meta roundtrip");
+        assert_eq!(original, reconstructed, "schema mismatch after meta roundtrip");
     }
 }

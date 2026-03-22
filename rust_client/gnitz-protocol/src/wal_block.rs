@@ -49,17 +49,6 @@ fn append_i64_region(buf: &mut Vec<u8>, vals: &[i64]) -> (u32, u32) {
     (aligned as u32, sz as u32)
 }
 
-/// WAL column stride: String and U128 each use 16 bytes (German String struct / lo+hi pair).
-fn wal_col_stride(tc: TypeCode) -> usize {
-    match tc {
-        TypeCode::U8  | TypeCode::I8  => 1,
-        TypeCode::U16 | TypeCode::I16 => 2,
-        TypeCode::U32 | TypeCode::I32 | TypeCode::F32 => 4,
-        TypeCode::U64 | TypeCode::I64 | TypeCode::F64 => 8,
-        TypeCode::String | TypeCode::U128 => 16,
-    }
-}
-
 fn xxh3_64(data: &[u8]) -> u64 {
     twox_hash::XxHash3_64::oneshot(data)
 }
@@ -236,7 +225,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                 col_regions.push(ColRegion::Prebuilt(col_bytes));
             }
             _ => {
-                let stride = wal_col_stride(col.type_code);
+                let stride = col.type_code.wire_stride();
                 let fixed = match &batch.columns[ci] {
                     ColData::Fixed(v) => v,
                     _ => panic!("encode_wal_block: expected Fixed for column {}", ci),
@@ -474,7 +463,7 @@ pub fn decode_wal_block(
                 columns.push(ColData::U128s(vals));
             }
             _ => {
-                let stride = wal_col_stride(col.type_code);
+                let stride = col.type_code.wire_stride();
                 let expected_sz = count * stride;
                 if reg_sz != expected_sz {
                     return Err(ProtocolError::DecodeError(format!(

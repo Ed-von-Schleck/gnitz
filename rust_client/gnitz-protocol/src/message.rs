@@ -81,7 +81,7 @@ pub fn encode_control_block(header: &Header, error_msg: &str) -> Result<Vec<u8>,
         header.flags,
         header.seek_pk_lo,
         header.seek_pk_hi,
-        header.p4,
+        header.seek_col_idx,
     ];
 
     let mut ctrl_bytes = [0u8; 56];
@@ -146,7 +146,7 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String), ProtocolErr
     let flags      = read_u64_col(&batch, CTRL_COL_FLAGS)?;
     let seek_pk_lo = read_u64_col(&batch, CTRL_COL_SEEK_PK_LO)?;
     let seek_pk_hi = read_u64_col(&batch, CTRL_COL_SEEK_PK_HI)?;
-    let p4         = read_u64_col(&batch, CTRL_COL_SEEK_COL)?;
+    let seek_col_idx = read_u64_col(&batch, CTRL_COL_SEEK_COL)?;
 
     // payload_idx for col 8 = 7; null bit set → no error string
     let is_null = (batch.nulls[0] & (1u64 << 7)) != 0;
@@ -164,7 +164,7 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String), ProtocolErr
         }
     };
 
-    let header = Header { status, target_id, client_id, flags, seek_pk_lo, seek_pk_hi, p4 };
+    let header = Header { status, target_id, client_id, flags, seek_pk_lo, seek_pk_hi, seek_col_idx };
     Ok((header, error_msg))
 }
 
@@ -188,7 +188,7 @@ pub fn send_message(
 
     let ctrl_hdr = Header {
         status: STATUS_OK, target_id, client_id, flags: flags_out,
-        seek_pk_lo, seek_pk_hi, p4: seek_col_idx,
+        seek_pk_lo, seek_pk_hi, seek_col_idx,
     };
     let ctrl_block = encode_control_block(&ctrl_hdr, "")?;
     let schema_block = if has_schema {
@@ -287,7 +287,7 @@ pub fn recv_message(
             flags:        ctrl_header.flags,
             seek_pk_lo:   ctrl_header.seek_pk_lo,
             seek_pk_hi:   ctrl_header.seek_pk_hi,
-            seek_col_idx: ctrl_header.p4,
+            seek_col_idx: ctrl_header.seek_col_idx,
             schema:       None,
             schema_batch: None,
             data_batch:   None,
@@ -302,7 +302,7 @@ pub fn recv_message(
         flags:        ctrl_header.flags,
         seek_pk_lo:   ctrl_header.seek_pk_lo,
         seek_pk_hi:   ctrl_header.seek_pk_hi,
-        seek_col_idx: ctrl_header.p4,
+        seek_col_idx: ctrl_header.seek_col_idx,
         schema:       wire_schema,
         schema_batch,
         data_batch,
@@ -334,7 +334,7 @@ mod tests {
             flags:      FLAG_PUSH | FLAG_HAS_SCHEMA,
             seek_pk_lo: 42,
             seek_pk_hi: 99,
-            p4:         7,
+            seek_col_idx: 7,
         };
 
         let encoded = encode_control_block(&h, "test error").unwrap();
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(decoded.flags,      h.flags);
         assert_eq!(decoded.seek_pk_lo, h.seek_pk_lo);
         assert_eq!(decoded.seek_pk_hi, h.seek_pk_hi);
-        assert_eq!(decoded.p4,         h.p4);
+        assert_eq!(decoded.seek_col_idx, h.seek_col_idx);
         assert_eq!(err, "test error");
     }
 
