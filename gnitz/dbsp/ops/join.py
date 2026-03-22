@@ -182,12 +182,14 @@ def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
     if count == 0:
         out_writer.mark_sorted(True)
         return
-    trace_cursor.seek(delta_batch.get_pk_lo(0), delta_batch.get_pk_hi(0))
+    prev_lo = delta_batch.get_pk_lo(0)
+    prev_hi = delta_batch.get_pk_hi(0)
+    trace_cursor.seek(prev_lo, prev_hi)
     for i in range(count):
         d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
         w_delta = delta_batch.get_weight(i)
         # w_delta is non-zero by _consolidated invariant.
-        if i > 0 and pk_eq(delta_batch.get_pk_lo(i - 1), delta_batch.get_pk_hi(i - 1), d_key_lo, d_key_hi):
+        if i > 0 and pk_eq(prev_lo, prev_hi, d_key_lo, d_key_hi):
             # Multiset delta: multiple rows with same PK → re-seek trace.
             trace_cursor.seek(d_key_lo, d_key_hi)
         else:
@@ -202,6 +204,8 @@ def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
                 composite_acc.right_acc = trace_cursor.get_accessor()
                 out_writer.append_from_accessor(d_key_lo, d_key_hi, w_out, composite_acc)
             trace_cursor.advance()
+        prev_lo = d_key_lo
+        prev_hi = d_key_hi
     out_writer.mark_sorted(True)
 
 
@@ -229,13 +233,15 @@ def _join_dt_outer_merge_walk(delta_batch, trace_cursor, out_writer,
     if count == 0:
         out_writer.mark_sorted(True)
         return
-    trace_cursor.seek(delta_batch.get_pk_lo(0), delta_batch.get_pk_hi(0))
+    prev_lo = delta_batch.get_pk_lo(0)
+    prev_hi = delta_batch.get_pk_hi(0)
+    trace_cursor.seek(prev_lo, prev_hi)
     for i in range(count):
         d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
         w_delta = delta_batch.get_weight(i)
         # w_delta is non-zero by _consolidated invariant.
 
-        if i > 0 and pk_eq(delta_batch.get_pk_lo(i - 1), delta_batch.get_pk_hi(i - 1), d_key_lo, d_key_hi):
+        if i > 0 and pk_eq(prev_lo, prev_hi, d_key_lo, d_key_hi):
             # Multiset delta: same PK, different payload — re-seek trace.
             trace_cursor.seek(d_key_lo, d_key_hi)
         else:
@@ -257,6 +263,9 @@ def _join_dt_outer_merge_walk(delta_batch, trace_cursor, out_writer,
             # No inner-join output for this delta key — emit null-fill row.
             composite_acc.right_acc = null_acc
             out_writer.append_from_accessor(d_key_lo, d_key_hi, w_delta, composite_acc)
+
+        prev_lo = d_key_lo
+        prev_hi = d_key_hi
 
     out_writer.mark_sorted(True)
 
@@ -293,10 +302,12 @@ def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):
                     match_lo, match_hi = key_a_lo, key_a_hi
 
                     start_a = idx_a
+                    idx_a += 1  # b_a[start_a] already known to match
                     while idx_a < n_a and pk_eq(b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a), match_lo, match_hi):
                         idx_a += 1
 
                     start_b = idx_b
+                    idx_b += 1  # b_b[start_b] already known to match
                     while idx_b < n_b and pk_eq(b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b), match_lo, match_hi):
                         idx_b += 1
 
