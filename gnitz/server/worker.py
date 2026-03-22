@@ -54,6 +54,12 @@ class WorkerExchangeHandler(object):
                 rffi.ptradd(self.wp.sal_ptr, self.wp.read_cursor)))
             if size == 0:
                 continue
+            # Epoch fence: skip stale data from previous epoch
+            hdr_off = self.wp.read_cursor + 8
+            epoch = intmask(ipc._read_u32_raw(
+                self.wp.sal_ptr, hdr_off + 28))
+            if epoch != self.wp._expected_epoch:
+                continue
             msg = ipc.read_worker_message(
                 self.wp.sal_ptr, self.wp.read_cursor, self.wp.worker_id)
             self.wp.read_cursor += msg.advance
@@ -87,9 +93,12 @@ class WorkerProcess(object):
         self.exchange_handler = WorkerExchangeHandler(self)
         self.pending_deltas = {}       # table_id (int) -> ArenaZSetBatch
         self.read_cursor = 0           # SAL read position (worker-local)
+        self._expected_epoch = 1       # epoch for checkpoint fencing
 
     def run(self):
         """Main event loop. Waits for SAL signals or master crash."""
+        # Signal master that recovery is complete and we are ready
+        self._send_ack(0)
         while True:
             ready = eventfd_ffi.eventfd_wait(self.m2w_efd, 1000)
             if ready == 0:
@@ -118,6 +127,11 @@ class WorkerProcess(object):
             size = intmask(ipc.atomic_load_u64(
                 rffi.ptradd(self.sal_ptr, self.read_cursor)))
             if size == 0:
+                break
+            # Epoch fence: skip stale groups from previous epoch
+            hdr_off = self.read_cursor + 8
+            epoch = intmask(ipc._read_u32_raw(self.sal_ptr, hdr_off + 28))
+            if epoch != self._expected_epoch:
                 break
             msg = ipc.read_worker_message(
                 self.sal_ptr, self.read_cursor, self.worker_id)
@@ -166,6 +180,14 @@ class WorkerProcess(object):
             if flags & ipc.FLAG_SHUTDOWN:
                 self._shutdown()
                 return True
+
+            if flags & ipc.FLAG_FLUSH:
+                self._handle_flush_all()
+                # Reset BEFORE sending ACK (ordering invariant)
+                self.read_cursor = 0
+                self._expected_epoch += 1
+                self._send_ack(0, flags=ipc.FLAG_CHECKPOINT)
+                return False
 
             if flags & ipc.FLAG_DDL_SYNC:
                 batch = payload.batch if payload is not None else None
@@ -454,9 +476,13 @@ class WorkerProcess(object):
             + " rows=" + str(batch.length())
         )
 
-    def _shutdown(self):
-        """Flush all families and exit."""
+    def _handle_flush_all(self):
+        """Flush all user-table families to ensure memtable data is durable."""
         for family in self.engine.registry.iter_families():
             if family.table_id >= sys.FIRST_USER_TABLE_ID:
                 family.store.flush()
+
+    def _shutdown(self):
+        """Flush all families and exit."""
+        self._handle_flush_all()
         os._exit(0)

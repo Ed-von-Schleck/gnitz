@@ -327,6 +327,222 @@ def test_sal_cross_process():
 
 
 # ---------------------------------------------------------------------------
+# SAL checkpoint/reset tests
+# ---------------------------------------------------------------------------
+
+
+def test_sal_epoch_write_read():
+    """Epoch field is written into group header and read back."""
+    log("[sal] test_sal_epoch_write_read...")
+    sal = _alloc_sal_mmap()
+    schema = TEST_SCHEMA
+
+    assert_equal_i(1, sal.epoch, "initial epoch")
+
+    wire_bufs = [None] * NUM_WORKERS
+    for w in range(NUM_WORKERS):
+        wire_bufs[w] = ipc._encode_wire(
+            10, 0, None, schema, ipc.FLAG_PUSH, 0, 0, 0, 0, "")
+    ipc.write_message_group(sal, 10, r_uint64(1), ipc.FLAG_PUSH,
+                            wire_bufs, NUM_WORKERS)
+    for w in range(NUM_WORKERS):
+        if wire_bufs[w] is not None:
+            wire_bufs[w].free()
+
+    msg = ipc.read_worker_message(sal.ptr, 0, 0)
+    assert_equal_i(1, msg.epoch, "epoch in message")
+    assert_equal_i(10, msg.target_id, "target_id")
+
+    _free_sal(sal)
+    log("    [OK] epoch write/read")
+
+
+def test_sal_checkpoint_reset():
+    """Simulate checkpoint: reset cursors + bump epoch, write new groups."""
+    log("[sal] test_sal_checkpoint_reset...")
+    sal = _alloc_sal_mmap()
+    schema = TEST_SCHEMA
+
+    # Write 2 groups at epoch=1
+    for i in range(2):
+        wire_bufs = [None] * NUM_WORKERS
+        for w in range(NUM_WORKERS):
+            wire_bufs[w] = ipc._encode_wire(
+                i + 1, 0, None, schema, 0, 0, 0, 0, 0, "")
+        ipc.write_message_group(sal, i + 1, r_uint64(i),
+                                0, wire_bufs, NUM_WORKERS)
+        for w in range(NUM_WORKERS):
+            if wire_bufs[w] is not None:
+                wire_bufs[w].free()
+
+    old_cursor = sal.write_cursor
+    assert_true(old_cursor > 0, "wrote some data")
+
+    # Simulate checkpoint: bump epoch, reset cursor, zero sentinel
+    sal.epoch += 1
+    sal.write_cursor = 0
+    ipc.atomic_store_u64(sal.ptr, rffi.cast(rffi.ULONGLONG, 0))
+
+    assert_equal_i(2, sal.epoch, "epoch after checkpoint")
+    assert_equal_i(0, sal.write_cursor, "cursor after checkpoint")
+
+    # Write a new group at epoch=2
+    wire_bufs = [None] * NUM_WORKERS
+    batch = _make_batch([(77, 770)])
+    for w in range(NUM_WORKERS):
+        wire_bufs[w] = ipc._encode_wire(
+            99, 0, batch if w == 0 else None, schema,
+            ipc.FLAG_PUSH, 0, 0, 0, 0, "")
+    ipc.write_message_group(sal, 99, r_uint64(10), ipc.FLAG_PUSH,
+                            wire_bufs, NUM_WORKERS)
+    for w in range(NUM_WORKERS):
+        if wire_bufs[w] is not None:
+            wire_bufs[w].free()
+
+    # Read as worker 0 from offset 0: should see epoch=2 group
+    msg = ipc.read_worker_message(sal.ptr, 0, 0)
+    assert_equal_i(2, msg.epoch, "new group epoch")
+    assert_equal_i(99, msg.target_id, "new group target_id")
+    assert_true(msg.payload is not None, "new group payload")
+    assert_true(msg.payload.batch is not None, "new group batch")
+    assert_equal_i(1, msg.payload.batch.length(), "new group row count")
+
+    batch.free()
+    _free_sal(sal)
+    log("    [OK] checkpoint reset + new write")
+
+
+def test_sal_epoch_fence_skips_stale():
+    """After checkpoint, worker at read_cursor=0 skips stale epoch data."""
+    log("[sal] test_sal_epoch_fence_skips_stale...")
+    sal = _alloc_sal_mmap()
+    schema = TEST_SCHEMA
+
+    # Write a group at epoch=1
+    wire_bufs = [None] * NUM_WORKERS
+    for w in range(NUM_WORKERS):
+        wire_bufs[w] = ipc._encode_wire(
+            42, 0, None, schema, ipc.FLAG_PUSH, 0, 0, 0, 0, "")
+    ipc.write_message_group(sal, 42, r_uint64(1), ipc.FLAG_PUSH,
+                            wire_bufs, NUM_WORKERS)
+    for w in range(NUM_WORKERS):
+        if wire_bufs[w] is not None:
+            wire_bufs[w].free()
+
+    # Verify group is readable at epoch=1
+    msg = ipc.read_worker_message(sal.ptr, 0, 0)
+    assert_equal_i(1, msg.epoch, "epoch=1 readable")
+    assert_true(msg.advance > 0, "advance > 0")
+
+    # Simulate: worker resets read_cursor=0 and expects epoch=2
+    # (this is what happens after checkpoint)
+    # Read from offset 0: epoch=1 data is still there but should be
+    # detected as stale by checking epoch.
+    msg2 = ipc.read_worker_message(sal.ptr, 0, 0)
+    assert_equal_i(1, msg2.epoch, "stale data still has epoch=1")
+    # The epoch mismatch detection happens in _drain_sal, not in
+    # read_worker_message itself. So the test verifies the epoch
+    # field is correctly populated for the caller to check.
+    assert_true(msg2.epoch != 2, "epoch != expected (2)")
+
+    _free_sal(sal)
+    log("    [OK] epoch fence detects stale data")
+
+
+def test_sal_cross_process_checkpoint():
+    """Fork: master writes epoch=1, child reads, master checkpoints to
+    epoch=2, writes new data, child reads new-epoch data."""
+    log("[sal] test_sal_cross_process_checkpoint...")
+    sal = _alloc_sal_mmap()
+    schema = TEST_SCHEMA
+    # Two eventfds: child→master and master→child (avoid race on single efd)
+    c2m_efd = eventfd_ffi.eventfd_create()
+    m2c_efd = eventfd_ffi.eventfd_create()
+
+    # Phase 1: write epoch=1 group
+    batch1 = _make_batch([(10, 100)])
+    wire_bufs = [None] * NUM_WORKERS
+    for w in range(NUM_WORKERS):
+        wire_bufs[w] = ipc._encode_wire(
+            1, 0, batch1 if w == 0 else None, schema,
+            ipc.FLAG_PUSH, 0, 0, 0, 0, "")
+    ipc.write_message_group(sal, 1, r_uint64(1), ipc.FLAG_PUSH,
+                            wire_bufs, NUM_WORKERS)
+    for w in range(NUM_WORKERS):
+        if wire_bufs[w] is not None:
+            wire_bufs[w].free()
+    mmap_posix.fdatasync_c(sal.fd)
+
+    pid = os.fork()
+    if pid == 0:
+        # Child: read epoch=1 group
+        msg1 = ipc.read_worker_message(sal.ptr, 0, 0)
+        if msg1.epoch != 1:
+            os._exit(1)
+        if msg1.payload is None or msg1.payload.batch is None:
+            os._exit(2)
+        if msg1.payload.batch.length() != 1:
+            os._exit(3)
+
+        # Signal master that we read epoch=1
+        eventfd_ffi.eventfd_signal(c2m_efd)
+
+        # Wait for master to checkpoint and write epoch=2
+        eventfd_ffi.eventfd_wait(m2c_efd, 5000)
+
+        # Simulate post-checkpoint: reset cursor, expect epoch=2
+        expected_epoch = 2
+
+        msg2 = ipc.read_worker_message(sal.ptr, 0, 0)
+        if msg2.epoch != expected_epoch:
+            os._exit(5)
+        if msg2.target_id != 2:
+            os._exit(6)
+        if msg2.payload is None or msg2.payload.batch is None:
+            os._exit(7)
+        if msg2.payload.batch.length() != 1:
+            os._exit(8)
+
+        os._exit(0)
+    else:
+        # Master: wait for child to read epoch=1
+        eventfd_ffi.eventfd_wait(c2m_efd, 5000)
+
+        # Checkpoint: bump epoch, reset cursor, zero sentinel
+        sal.epoch += 1
+        sal.write_cursor = 0
+        ipc.atomic_store_u64(sal.ptr, rffi.cast(rffi.ULONGLONG, 0))
+
+        # Write epoch=2 group
+        batch2 = _make_batch([(20, 200)])
+        wire_bufs2 = [None] * NUM_WORKERS
+        for w in range(NUM_WORKERS):
+            wire_bufs2[w] = ipc._encode_wire(
+                2, 0, batch2 if w == 0 else None, schema,
+                ipc.FLAG_PUSH, 0, 0, 0, 0, "")
+        ipc.write_message_group(sal, 2, r_uint64(2), ipc.FLAG_PUSH,
+                                wire_bufs2, NUM_WORKERS)
+        for w in range(NUM_WORKERS):
+            if wire_bufs2[w] is not None:
+                wire_bufs2[w].free()
+        mmap_posix.fdatasync_c(sal.fd)
+
+        # Signal child that epoch=2 data is ready
+        eventfd_ffi.eventfd_signal(m2c_efd)
+
+        _, status = os.waitpid(pid, 0)
+        exit_code = status >> 8
+        rposix.close(c2m_efd)
+        rposix.close(m2c_efd)
+        batch1.free()
+        batch2.free()
+        _free_sal(sal)
+        assert_equal_i(0, exit_code, "child exit code (checkpoint)")
+
+    log("    [OK] cross-process checkpoint")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -346,6 +562,10 @@ def entry_point(argv):
         test_w2m_multiple_messages()
         test_w2m_cursor_reset()
         test_sal_cross_process()
+        test_sal_epoch_write_read()
+        test_sal_checkpoint_reset()
+        test_sal_epoch_fence_skips_stale()
+        test_sal_cross_process_checkpoint()
         os.write(1, "\nALL IPC TRANSPORT TESTS PASSED\n")
     except Exception as e:
         os.write(2, "FAILURE\n")

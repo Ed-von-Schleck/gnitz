@@ -7,6 +7,7 @@
 import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi
 
 from gnitz import log
 from gnitz.server import ipc, ipc_ffi, eventfd_ffi
@@ -42,6 +43,7 @@ class MasterDispatcher(object):
         self.w2m_regions = w2m_regions     # list[W2MRegion]
         self.m2w_efds = m2w_efds           # list[int] — master→worker eventfds
         self.w2m_efds = w2m_efds           # list[int] — worker→master eventfds
+        self._checkpoint_threshold = (sal.mmap_size * 3) >> 2  # 75%
 
     # -----------------------------------------------------------------------
     # Core send/receive helpers
@@ -242,12 +244,60 @@ class MasterDispatcher(object):
                 ipc.W2M_HEADER_SIZE)
 
     # -----------------------------------------------------------------------
+    # SAL Checkpoint
+    # -----------------------------------------------------------------------
+
+    def _maybe_checkpoint(self):
+        """Proactive checkpoint when SAL fill exceeds 75%."""
+        if self.sal.write_cursor < self._checkpoint_threshold:
+            return
+        self._do_checkpoint()
+
+    def _do_checkpoint(self):
+        """Flush all workers, collect checkpoint ACKs, reset SAL."""
+        # Step 1: Ask all workers to flush
+        worker_batches = [None] * self.num_workers
+        self._send_to_workers(0, ipc.FLAG_FLUSH, worker_batches, None)
+
+        # Step 2: Collect checkpoint ACKs from all workers
+        remaining = self.num_workers
+        collected = [False] * self.num_workers
+        w2m_rcs = [ipc.W2M_HEADER_SIZE] * self.num_workers
+        try:
+            while remaining > 0:
+                eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
+                for w in range(self.num_workers):
+                    if collected[w]:
+                        continue
+                    wc = self.w2m_regions[w].get_write_cursor()
+                    if w2m_rcs[w] < wc:
+                        payload, w2m_rcs[w] = ipc.read_from_w2m(
+                            self.w2m_regions[w], w2m_rcs[w])
+                        if payload.status != 0:
+                            raise errors.StorageError(
+                                "Worker %d checkpoint error: %s"
+                                % (w, payload.error_msg))
+                        collected[w] = True
+                        remaining -= 1
+        finally:
+            self._reset_w2m_cursors()
+
+        # Step 3: All workers flushed. Reset SAL.
+        self.sal.epoch += 1
+        self.sal.write_cursor = 0
+        # Zero sentinel at offset 0 (release fence — visible to workers)
+        ipc.atomic_store_u64(
+            self.sal.ptr, rffi.cast(rffi.ULONGLONG, 0))
+        log.info("SAL checkpoint epoch=" + str(self.sal.epoch))
+
+    # -----------------------------------------------------------------------
     # Fan-out operations
     # -----------------------------------------------------------------------
 
     def fan_out_ingest(self, target_id, batch, schema):
         """Split batch by worker partition, send FLAG_PUSH, collect ACKs.
         Workers only ingest — no evaluate_dag, no exchange relay."""
+        self._maybe_checkpoint()
         sub_batches = repartition_batch(
             batch, [schema.pk_index], self.num_workers, self.assignment)
         self._send_to_workers(target_id, ipc.FLAG_PUSH, sub_batches, schema)
@@ -262,6 +312,7 @@ class MasterDispatcher(object):
 
     def fan_out_tick(self, target_id, schema):
         """Send FLAG_TICK to all workers; handle exchange relay; collect ACKs."""
+        self._maybe_checkpoint()
         worker_batches = [None] * self.num_workers
         self._send_to_workers(target_id, ipc.FLAG_TICK, worker_batches, schema)
         self._collect_acks_and_relay(schema)
@@ -270,6 +321,7 @@ class MasterDispatcher(object):
     def fan_out_push(self, target_id, batch, schema):
         """Split batch by worker partition, send sub-batches, collect ACKs.
         Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE."""
+        self._maybe_checkpoint()
         n = batch.length()
         preloadable = self.program_cache.get_preloadable_views(target_id)
         family = self.program_cache.registry.get_by_id(target_id)
@@ -344,6 +396,12 @@ class MasterDispatcher(object):
 
     def _relay_exchange(self, view_id, payloads, schema, source_id=0):
         """Repartition collected exchange payloads and relay to workers."""
+        # Guard: error if SAL space is critically low during relay
+        remaining = self.sal.mmap_size - self.sal.write_cursor
+        if remaining < (self.sal.mmap_size >> 3):  # < 12.5% (128 MB)
+            raise errors.StorageError(
+                "SAL space exhausted during exchange relay (%d bytes left)"
+                % remaining)
         shard_cols = []
         if source_id > 0:
             shard_cols = self.program_cache.get_join_shard_cols(
@@ -369,6 +427,7 @@ class MasterDispatcher(object):
 
     def fan_out_backfill(self, view_id, source_id, source_schema):
         """Broadcast FLAG_BACKFILL; handle exchange relay; collect ACKs."""
+        self._maybe_checkpoint()
         worker_batches = [None] * self.num_workers
         self._send_to_workers(
             source_id, ipc.FLAG_BACKFILL, worker_batches, source_schema,
@@ -377,6 +436,7 @@ class MasterDispatcher(object):
 
     def fan_out_scan(self, target_id, schema):
         """Send scan to all workers, concatenate result batches."""
+        self._maybe_checkpoint()
         worker_batches = [None] * self.num_workers
         self._send_to_workers(target_id, 0, worker_batches, schema)
         result = self._collect_responses(schema)
@@ -387,6 +447,7 @@ class MasterDispatcher(object):
 
     def fan_out_seek(self, target_id, pk_lo, pk_hi, schema):
         """Route PK seek to the single worker that owns the partition."""
+        self._maybe_checkpoint()
         worker = worker_for_pk(pk_lo, pk_hi, self.assignment)
         self._write_unicast(
             worker, target_id, ipc.FLAG_SEEK, schema,
@@ -407,6 +468,7 @@ class MasterDispatcher(object):
     def fan_out_seek_by_index(self, target_id, col_idx, key_lo, key_hi,
                               schema):
         """Index seek: unicast on cache hit, broadcast on cache miss."""
+        self._maybe_checkpoint()
         cached_worker = self.router.worker_for_index_key(
             target_id, col_idx, key_lo, key_hi)
         if cached_worker >= 0:
@@ -444,6 +506,7 @@ class MasterDispatcher(object):
 
     def broadcast_ddl(self, target_id, batch, schema):
         """Send a system-table delta to all workers for registry sync."""
+        self._maybe_checkpoint()
         self._send_broadcast(target_id, ipc.FLAG_DDL_SYNC, batch, schema)
         log.debug(
             "broadcast_ddl tid=" + str(target_id)
@@ -451,6 +514,7 @@ class MasterDispatcher(object):
 
     def check_fk_batch(self, target_id, check_batch, schema):
         """Check PK existence across workers. Returns True if any key missing."""
+        self._maybe_checkpoint()
         sub_batches = repartition_batch(
             check_batch, [schema.pk_index], self.num_workers, self.assignment)
         self._send_to_workers(
@@ -473,6 +537,7 @@ class MasterDispatcher(object):
     def check_pk_exists_broadcast(self, owner_table_id, source_col_idx,
                                   check_batch, schema):
         """Broadcast PK existence check. Returns True if any key exists."""
+        self._maybe_checkpoint()
         col_hint = source_col_idx + 1
         self._send_broadcast(
             owner_table_id, ipc.FLAG_HAS_PK, check_batch, schema,
@@ -490,6 +555,7 @@ class MasterDispatcher(object):
 
     def check_pk_existence(self, target_id, check_batch, schema):
         """Split-route PK check. Returns {lo: {hi: 1}} dict of existing PKs."""
+        self._maybe_checkpoint()
         sub_batches = repartition_batch(
             check_batch, [schema.pk_index], self.num_workers, self.assignment)
         self._send_to_workers(

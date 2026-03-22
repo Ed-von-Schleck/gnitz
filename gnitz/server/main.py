@@ -6,6 +6,7 @@
 import os
 from rpython.rlib.rarithmetic import intmask
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi
 
 from gnitz import log
 from rpython.rlib import rposix
@@ -92,10 +93,17 @@ def _recover_from_sal(sal_ptr, engine, worker_id):
 
     offset = 0
     replayed = 0
+    last_epoch = 0
     while offset + 8 < ipc.SAL_MMAP_SIZE:
         size = intmask(ipc.read_u64_raw(sal_ptr, offset))
         if size == 0:
             break
+        # Epoch fence: decreasing epoch = stale data from before checkpoint
+        hdr_off = offset + 8
+        epoch = intmask(ipc._read_u32_raw(sal_ptr, hdr_off + 28))
+        if last_epoch > 0 and epoch < last_epoch:
+            break
+        last_epoch = epoch
         msg = ipc.read_worker_message(sal_ptr, offset, worker_id)
         offset += msg.advance
         if msg.payload is None:
@@ -190,9 +198,11 @@ def entry_point(argv):
 
     # --- Shared Append-Only Log (file-backed, master→all workers) ---
     sal_path = data_dir + "/wal.sal"
-    sal_fd = rposix.open(sal_path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    sal_fd = rposix.open(sal_path, os.O_RDWR | os.O_CREAT, 0o644)
     sal_ffi.try_set_nocow(sal_fd)
-    sal_ffi.fallocate_c(sal_fd, ipc.SAL_MMAP_SIZE)
+    existing_size = intmask(mmap_posix.fget_size(sal_fd))
+    if existing_size < ipc.SAL_MMAP_SIZE:
+        sal_ffi.fallocate_c(sal_fd, ipc.SAL_MMAP_SIZE)
     sal_ptr = mmap_posix.mmap_file(
         sal_fd, ipc.SAL_MMAP_SIZE,
         prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
@@ -300,6 +310,15 @@ def entry_point(argv):
     dispatcher = MasterDispatcher(num_workers, parent_fds, worker_pids,
                                    assignment, engine.program_cache,
                                    sal, w2m_regions, m2w_efds, w2m_efds)
+
+    # Wait for all workers to complete recovery and signal readiness
+    dispatcher._collect_acks()
+
+    # Reset SAL for fresh use (all workers have recovered)
+    ipc.atomic_store_u64(sal.ptr, rffi.cast(rffi.ULONGLONG, 0))
+    sal.write_cursor = 0
+    sal.epoch = 1
+    # Do NOT reset lsn_counter — must stay monotonic for recovery correctness
 
     _backfill_exchange_views(engine, dispatcher)
 

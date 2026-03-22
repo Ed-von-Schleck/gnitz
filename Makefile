@@ -151,10 +151,10 @@ pytest-only:
 	cd py_client && GNITZ_WORKERS=4 uv run pytest tests/ -v
 
 e2e: gnitz-server-c
-	cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v --tb=short
+	cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
 
 e2e-release: gnitz-server-release-c
-	cd rust_client/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release-c GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v --tb=short
+	cd rust_client/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release-c GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
 
 prove:
 	$(MAKE) -C proofs prove

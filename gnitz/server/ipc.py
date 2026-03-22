@@ -74,6 +74,7 @@ FLAG_BACKFILL          = 2048  # master asks worker to scan source and backfill 
 FLAG_TICK              = 4096  # master asks workers to run evaluate_dag on accumulated pending_deltas
 FLAG_SCAN              = 0     # explicit name for "no flags" (no wire change)
 FLAG_CHECKPOINT        = 8192  # 1 << 13 — worker signals all partitions flushed
+FLAG_FLUSH             = 16384 # 1 << 14 — master asks workers to flush all families
 
 # --- SAL constants ---
 MAX_WORKERS = 64
@@ -285,6 +286,7 @@ class SharedAppendLog(object):
         self.mmap_size = mmap_size
         self.write_cursor = 0     # master writes here
         self.lsn_counter = 0      # monotonic LSN
+        self.epoch = 1            # bumped on each checkpoint reset
 
 
 class W2MRegion(object):
@@ -321,6 +323,7 @@ class SALMessage(object):
         self.target_id = 0        # int
         self.lsn = r_uint64(0)
         self.advance = 0          # bytes to advance read_cursor
+        self.epoch = 0            # group header epoch (for checkpoint fencing)
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +641,7 @@ def write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers):
     _write_u32_raw(sal.ptr, hdr_off + 16, num_workers)
     _write_u32_raw(sal.ptr, hdr_off + 20, flags)
     _write_u32_raw(sal.ptr, hdr_off + 24, target_id)
-    _write_u32_raw(sal.ptr, hdr_off + 28, 0)  # reserved
+    _write_u32_raw(sal.ptr, hdr_off + 28, sal.epoch)
 
     # Worker offsets and sizes + data copy
     data_offset = GROUP_HEADER_SIZE  # relative to group start (hdr_off)
@@ -687,6 +690,7 @@ def read_worker_message(sal_ptr, read_cursor, worker_id):
     msg.lsn = read_u64_raw(sal_ptr, hdr_off + 8)
     msg.flags = intmask(_read_u32_raw(sal_ptr, hdr_off + 20))
     msg.target_id = intmask(_read_u32_raw(sal_ptr, hdr_off + 24))
+    msg.epoch = intmask(_read_u32_raw(sal_ptr, hdr_off + 28))
     msg.advance = 8 + _align8(payload_size)
 
     # Extract this worker's offset and size
