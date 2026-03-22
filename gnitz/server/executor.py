@@ -279,28 +279,18 @@ class ServerExecutor(object):
         self.fd_to_client = {}  # int(fd) -> int(client_id)
         self.client_to_fd = {}  # int(client_id) -> int(fd)
 
-        # Poll-cache: rebuilt only when active_fds changes (Fix N2)
-        self._poll_fds    = newlist_hint(8)
-        self._poll_events = newlist_hint(8)
-        self._poll_dirty  = True
-
         # Deferred tick tracking (multi-worker only)
         self._tick_tids    = newlist_hint(8)  # [int] table_ids with pending ticks
         self._tick_schemas = {}               # tid -> schema
         self._tick_rows    = {}               # tid -> int (rows accumulated since last tick)
         self._t_first_tick = 0.0             # wall-clock time of oldest pending tick
 
-        # Per-connection SOCK_STREAM header buffers
-        self._client_hdr_bufs = {}   # int(fd) -> rffi.CCHARP (4 raw bytes)
-        self._client_hdr_pos  = {}   # int(fd) -> rffi.INTP (1-element raw array)
-
         # LSN tracking
         self._ingest_lsn        = 0  # global monotonic counter; increments per flush batch
         self._last_tick_lsn     = 0  # ingest_lsn at time of last _fire_pending_ticks()
-        self._last_response_lsn = 0  # side-channel from handle_push → _drain_client
+        self._last_response_lsn = 0  # side-channel from handle_push → response dispatch
 
-        # io_uring state (unused in poll path)
-        self._use_uring = False
+        # io_uring per-connection state
         self._ring = lltype.nullptr(rffi.VOIDP.TO)
         self._conn_state = {}       # fd -> int (_CONN_WAITING_*)
         self._conn_hdr_buf = {}     # fd -> rffi.CCHARP (4 bytes, raw)
@@ -318,133 +308,20 @@ class ServerExecutor(object):
             raise errors.StorageError("Failed to create server socket")
         self.active_fds.append(server_fd)
 
-        ring = lltype.nullptr(rffi.VOIDP.TO)
-        if os.environ.get("GNITZ_FORCE_POLL") != "1":
-            try:
-                ring = uring_ffi.uring_create(256)
-            except errors.StorageError:
-                pass
+        try:
+            ring = uring_ffi.uring_create(256)
+        except errors.StorageError:
+            os.write(2,
+                "FATAL: io_uring_setup failed. "
+                "gnitz requires a modern Linux kernel with io_uring enabled.\n")
+            raise
 
-        if ring:
-            self._use_uring = True
-            self._ring = ring
-            try:
-                self._run_uring_server(ring, server_fd)
-            finally:
-                uring_ffi.uring_destroy(ring)
-                self._use_uring = False
-                self._ring = lltype.nullptr(rffi.VOIDP.TO)
-        else:
-            self._run_poll_server(server_fd)
-
-    def _run_poll_server(self, server_fd):
-        while True:
-            jit.promote(self.engine)
-
-            if self.dispatcher is not None:
-                crashed = self.dispatcher.check_workers()
-                if crashed >= 0:
-                    log_path = (
-                        self.engine.base_dir
-                        + "/worker_"
-                        + str(crashed)
-                        + ".log"
-                    )
-                    os.write(
-                        2,
-                        "Worker %d crashed (log: %s), shutting down\n"
-                        % (crashed, log_path),
-                    )
-                    self.dispatcher.shutdown_workers()
-                    return
-
-            if self._poll_dirty:
-                count = len(self.active_fds)
-                self._poll_fds = newlist_hint(count)
-                self._poll_events = newlist_hint(count)
-                for i in range(count):
-                    self._poll_fds.append(self.active_fds[i])
-                    self._poll_events.append(ipc_ffi.POLLIN | ipc_ffi.POLLERR | ipc_ffi.POLLHUP)
-                self._poll_dirty = False
-            fds = self._poll_fds
-            timeout_ms = 500
-            if len(self._tick_tids) > 0 and self._t_first_tick > 0.0:
-                elapsed_ms = int((time.time() - self._t_first_tick) * 1000.0)
-                remaining  = TICK_DEADLINE_MS - elapsed_ms
-                if remaining < timeout_ms:
-                    timeout_ms = remaining if remaining > 0 else 0
-            revents = ipc_ffi.poll(self._poll_fds, self._poll_events, timeout_ms)
-
-            pending_fds = newlist_hint(16)
-            pending_cids = newlist_hint(16)
-            pending_tids = newlist_hint(16)
-            pending_batches = newlist_hint(16)
-            pending_schemas = newlist_hint(16)
-            pending_row_count = 0
-
-            # Pass 1: cleanup disconnected clients before accepting new ones.
-            for i in range(len(fds)):
-                fd = fds[i]
-                rev = revents[i]
-                if rev == 0:
-                    continue
-                if rev & (ipc_ffi.POLLERR | ipc_ffi.POLLHUP | ipc_ffi.POLLNVAL):
-                    if fd != server_fd:
-                        self._cleanup_client(fd)
-
-            # Pass 2: accept new connections and drain existing clients.
-            for i in range(len(fds)):
-                fd = fds[i]
-                rev = revents[i]
-                if rev == 0:
-                    continue
-                if rev & (ipc_ffi.POLLERR | ipc_ffi.POLLHUP | ipc_ffi.POLLNVAL):
-                    continue
-                if rev & ipc_ffi.POLLIN:
-                    if fd == server_fd:
-                        while True:
-                            c_fd = ipc_ffi.server_accept(server_fd)
-                            if c_fd < 0:
-                                break
-                            self.active_fds.append(c_fd)
-                            self.client_fds[c_fd] = 1
-                            hdr_buf = lltype.malloc(rffi.CCHARP.TO, 4, flavor='raw')
-                            hdr_pos = lltype.malloc(rffi.INTP.TO, 1, flavor='raw')
-                            hdr_pos[0] = rffi.cast(rffi.INT, 0)
-                            self._client_hdr_bufs[c_fd] = hdr_buf
-                            self._client_hdr_pos[c_fd] = hdr_pos
-                            self._poll_dirty = True
-                    else:
-                        while True:
-                            rows = self._drain_client(
-                                fd, pending_fds, pending_cids,
-                                pending_tids, pending_batches,
-                                pending_schemas,
-                            )
-                            if rows < 0:
-                                break
-                            pending_row_count += rows
-                            if pending_row_count >= MAX_PENDING_ROWS:
-                                self._flush_pending_pushes(
-                                    pending_fds, pending_cids,
-                                    pending_tids, pending_batches,
-                                    pending_schemas,
-                                )
-                                pending_fds = newlist_hint(16)
-                                pending_cids = newlist_hint(16)
-                                pending_tids = newlist_hint(16)
-                                pending_batches = newlist_hint(16)
-                                pending_schemas = newlist_hint(16)
-                                pending_row_count = 0
-
-            if len(pending_fds) > 0:
-                self._flush_pending_pushes(
-                    pending_fds, pending_cids,
-                    pending_tids, pending_batches,
-                    pending_schemas,
-                )
-
-            self._check_and_fire_pending_ticks()
+        self._ring = ring
+        try:
+            self._run_uring_server(ring, server_fd)
+        finally:
+            uring_ffi.uring_destroy(ring)
+            self._ring = lltype.nullptr(rffi.VOIDP.TO)
 
     # -- io_uring event loop ------------------------------------------------
 
@@ -565,7 +442,6 @@ class ServerExecutor(object):
         c_fd = res
         self.active_fds.append(c_fd)
         self.client_fds[c_fd] = 1
-        self._poll_dirty = True
 
         hdr_buf = lltype.malloc(rffi.CCHARP.TO, 4, flavor='raw')
         self._conn_state[c_fd] = _CONN_WAITING_HEADER
@@ -800,29 +676,18 @@ class ServerExecutor(object):
     def _send_response(self, fd, target_id, result, status, error_msg,
                        client_id, schema=None, flags=0,
                        seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
-        """Send a response via the active I/O backend (uring or poll)."""
-        if self._use_uring:
-            self._queue_async_send(
-                self._ring, fd, target_id, result, status, error_msg,
-                client_id, schema=schema, flags=flags,
-                seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi,
-                seek_col_idx=seek_col_idx)
-        else:
-            ipc.send_framed(
-                fd, target_id, result, status=status, error_msg=error_msg,
-                client_id=client_id, schema=schema, flags=flags,
-                seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi,
-                seek_col_idx=seek_col_idx)
+        """Send a response via io_uring async send."""
+        self._queue_async_send(
+            self._ring, fd, target_id, result, status, error_msg,
+            client_id, schema=schema, flags=flags,
+            seek_pk_lo=seek_pk_lo, seek_pk_hi=seek_pk_hi,
+            seek_col_idx=seek_col_idx)
 
     def _send_error_response(self, fd, error_msg, target_id=0, client_id=0):
-        """Send an error response via the active I/O backend."""
-        if self._use_uring:
-            self._queue_async_send(
-                self._ring, fd, target_id, None,
-                STATUS_ERROR, error_msg, client_id)
-        else:
-            ipc.send_framed_error(
-                fd, error_msg, target_id=target_id, client_id=client_id)
+        """Send an error response via io_uring async send."""
+        self._queue_async_send(
+            self._ring, fd, target_id, None,
+            STATUS_ERROR, error_msg, client_id)
 
     def _queue_async_send(self, ring, fd, target_id, result, status,
                           error_msg, client_id, schema=None, flags=0,
@@ -987,42 +852,6 @@ class ServerExecutor(object):
             idx_cursor.close()
         return self._seek_family(table_id, src_lo, src_hi)
 
-    # -- Socket Layer (delegates to handle_push) ---------------------------
-
-    def _drain_client(self, fd, p_fds, p_cids, p_tids, p_batches, p_schemas):
-        """Receive one IPC message. Buffer multi-worker user-table pushes;
-        process everything else inline. Returns rows buffered, or -1 (EAGAIN)."""
-        payload = None
-        rows_buffered = 0
-        try:
-            payload = ipc.try_recv_framed(
-                fd, self._client_hdr_bufs[fd], self._client_hdr_pos[fd])
-            if payload is None:
-                return -1  # EAGAIN
-            rows_buffered = self._dispatch_payload(
-                fd, payload, p_fds, p_cids, p_tids, p_batches, p_schemas)
-        except errors.ClientDisconnectedError:
-            self._cleanup_client(fd)
-            return -1
-        except errors.GnitzError as ge:
-            err_msg = ge.msg
-            tid = intmask(payload.target_id) if payload else 0
-            cid = intmask(payload.client_id) if payload else 0
-            try:
-                self._send_error_response(fd, err_msg, target_id=tid,
-                                          client_id=cid)
-            except errors.GnitzError:
-                self._cleanup_client(fd)
-                return -1
-        except Exception as e:
-            os.write(2, "MASTER EXCEPTION: " + str(e) + "\n")
-            self._cleanup_client(fd)
-            return -1
-        finally:
-            if payload is not None:
-                payload.close()
-        return rows_buffered
-
     def _flush_pending_pushes(self, p_fds, p_cids, p_tids, p_batches,
                               p_schemas):
         """Merge same-target pushes and fan out once per target."""
@@ -1118,7 +947,7 @@ class ServerExecutor(object):
         evaluate_dag(self.engine, initial_source_id, initial_delta)
 
     def _cleanup_client(self, fd):
-        # io_uring state (no-op in poll path)
+        # Per-connection state
         if fd in self._conn_hdr_buf:
             lltype.free(self._conn_hdr_buf[fd], flavor='raw')
             del self._conn_hdr_buf[fd]
@@ -1141,15 +970,7 @@ class ServerExecutor(object):
         if fd in self._send_pos:
             del self._send_pos[fd]
 
-        # Poll state (no-op in uring path)
-        if fd in self._client_hdr_bufs:
-            lltype.free(self._client_hdr_bufs[fd], flavor='raw')
-            del self._client_hdr_bufs[fd]
-        if fd in self._client_hdr_pos:
-            lltype.free(self._client_hdr_pos[fd], flavor='raw')
-            del self._client_hdr_pos[fd]
-
-        # Common: close fd, remove from registries
+        # Close fd, remove from registries
         if fd in self.client_fds:
             try:
                 os.close(intmask(fd))
@@ -1169,4 +990,3 @@ class ServerExecutor(object):
                 self.active_fds[i] = self.active_fds[last]
                 del self.active_fds[last]
                 break
-        self._poll_dirty = True

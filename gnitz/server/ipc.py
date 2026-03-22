@@ -514,30 +514,6 @@ def recv_framed(sock_fd):
     return _make_payload_from_raw(raw, payload_len)
 
 
-@jit.dont_look_inside
-def try_recv_framed(sock_fd, hdr_buf, hdr_pos_ptr):
-    """Non-blocking receive of a length-prefixed IPC message.
-    Returns IPCPayload on success, None on EAGAIN.
-    Raises ClientDisconnectedError on error/EOF."""
-    rc = ipc_ffi.recv_header_nb(sock_fd, hdr_buf, hdr_pos_ptr)
-    if rc == -2:
-        return None  # EAGAIN
-    if rc < 0:
-        raise errors.ClientDisconnectedError("Client disconnected")
-
-    payload_len = _decode_u32_le(hdr_buf)
-    hdr_pos_ptr[0] = rffi.cast(rffi.INT, 0)
-
-    if payload_len == 0:
-        raise errors.ClientDisconnectedError("Client sent close sentinel")
-
-    raw = lltype.malloc(rffi.CCHARP.TO, payload_len, flavor='raw')
-    if ipc_ffi.recv_exact(sock_fd, raw, payload_len) < 0:
-        lltype.free(raw, flavor='raw')
-        raise errors.ClientDisconnectedError("Payload read failed")
-    return _make_payload_from_raw(raw, payload_len)
-
-
 # ---------------------------------------------------------------------------
 # Receive
 # ---------------------------------------------------------------------------

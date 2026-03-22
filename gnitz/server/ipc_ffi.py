@@ -140,22 +140,6 @@ int gnitz_send_framed(int sock_fd, const char *buf, unsigned int len) {
     return 0;
 }
 
-int gnitz_recv_header_nb(int sock_fd, char *hdr_buf, int *hdr_pos) {
-    /* Non-blocking read of up to 4 header bytes.
-       Returns: 0 = header complete, -2 = EAGAIN, -1 = error/EOF. */
-    while (*hdr_pos < 4) {
-        ssize_t n = recv(sock_fd, hdr_buf + *hdr_pos, 4 - *hdr_pos, MSG_DONTWAIT);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
-            return -1;
-        }
-        if (n == 0) return -1;  /* EOF */
-        *hdr_pos += (int)n;
-    }
-    return 0;
-}
-
 int gnitz_recv_exact(int sock_fd, char *buf, unsigned int len) {
     /* Blocking read of exactly len bytes. EINTR + partial-read handling.
        Returns: 0 = success, -1 = error/EOF. */
@@ -195,7 +179,6 @@ eci = ExternalCompilationInfo(
         "int gnitz_server_create(const char *socket_path);",
         "int gnitz_server_accept(int server_fd);",
         "int gnitz_send_framed(int sock_fd, const char *buf, unsigned int len);",
-        "int gnitz_recv_header_nb(int sock_fd, char *hdr_buf, int *hdr_pos);",
         "int gnitz_recv_exact(int sock_fd, char *buf, unsigned int len);",
         "int gnitz_unix_connect(const char *path);",
     ],
@@ -322,13 +305,6 @@ _gnitz_send_framed = rffi.llexternal(
     compilation_info=eci,
 )
 
-_gnitz_recv_header_nb = rffi.llexternal(
-    "gnitz_recv_header_nb",
-    [rffi.INT, rffi.CCHARP, rffi.INTP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
 _gnitz_recv_exact = rffi.llexternal(
     "gnitz_recv_exact",
     [rffi.INT, rffi.CCHARP, rffi.UINT],
@@ -345,17 +321,6 @@ def send_framed(sock_fd, buf_ptr, buf_len):
         rffi.cast(rffi.INT, sock_fd),
         buf_ptr,
         rffi.cast(rffi.UINT, buf_len),
-    ))
-
-
-@jit.dont_look_inside
-def recv_header_nb(sock_fd, hdr_buf, hdr_pos_ptr):
-    """Non-blocking read of up to 4 header bytes.
-    Returns: 0 = header complete, -2 = EAGAIN, -1 = error/EOF."""
-    return int(_gnitz_recv_header_nb(
-        rffi.cast(rffi.INT, sock_fd),
-        hdr_buf,
-        hdr_pos_ptr,
     ))
 
 
