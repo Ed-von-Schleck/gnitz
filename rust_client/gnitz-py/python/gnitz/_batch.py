@@ -87,6 +87,8 @@ class ScanResult:
 
 class ZSetBatch:
     def __init__(self, schema):
+        if isinstance(schema, type) and hasattr(schema, '_schema'):
+            schema = schema._schema
         self._schema = schema
         self._raw    = _native.ZSetBatch(schema)
 

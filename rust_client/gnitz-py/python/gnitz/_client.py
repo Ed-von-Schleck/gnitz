@@ -25,6 +25,8 @@ class Connection:
         self._client.drop_schema(name)
 
     def create_table(self, schema_name, table_name, columns, unique_pk=True):
+        if isinstance(columns, type) and hasattr(columns, '_columns'):
+            columns = columns._columns
         pk_idx = next((i for i, c in enumerate(columns) if c.primary_key), 0)
         return self._client.create_table(
             schema_name, table_name,
@@ -59,7 +61,9 @@ class Connection:
         )
 
     def create_view_with_circuit(self, schema_name, view_name, circuit, columns):
-        if not isinstance(columns, _native.Schema):
+        if isinstance(columns, type) and hasattr(columns, '_schema'):
+            columns = columns._schema
+        elif not isinstance(columns, _native.Schema):
             columns = _native.Schema(list(columns))
         return self._client.create_view_with_circuit(
             schema_name, view_name, circuit._graph, columns,
