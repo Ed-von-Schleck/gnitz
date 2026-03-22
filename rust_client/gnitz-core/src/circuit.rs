@@ -146,31 +146,30 @@ impl CircuitBuilder {
         nid
     }
 
-    /// Join: delta→port 0, internal trace_scan(trace_table_id)→port 1.
+    /// Binary join primitive: delta→port A, trace_node→port TRACE.
+    fn binary_join(&mut self, opcode: u64, delta: NodeId, trace_node: NodeId) -> NodeId {
+        let nid = self.alloc_node(opcode);
+        self.connect(delta, nid, PORT_IN_A);
+        self.connect(trace_node, nid, PORT_TRACE);
+        nid
+    }
+
+    /// Binary join with internal trace_scan(trace_table_id).
+    fn binary_join_scan(&mut self, opcode: u64, delta: NodeId, trace_table_id: u64) -> NodeId {
+        let trace = self.trace_scan(trace_table_id);
+        self.binary_join(opcode, delta, trace)
+    }
+
     pub fn join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
-        let trace = self.trace_scan(trace_table_id);
-        let nid = self.alloc_node(OPCODE_JOIN_DELTA_TRACE);
-        self.connect(delta, nid, PORT_IN_A);
-        self.connect(trace, nid, PORT_TRACE);
-        nid
+        self.binary_join_scan(OPCODE_JOIN_DELTA_TRACE, delta, trace_table_id)
     }
 
-    /// Anti-join: delta→port 0, internal trace_scan(trace_table_id)→port 1.
     pub fn anti_join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
-        let trace = self.trace_scan(trace_table_id);
-        let nid = self.alloc_node(OPCODE_ANTI_JOIN_DELTA_TRACE);
-        self.connect(delta, nid, PORT_IN_A);
-        self.connect(trace, nid, PORT_TRACE);
-        nid
+        self.binary_join_scan(OPCODE_ANTI_JOIN_DELTA_TRACE, delta, trace_table_id)
     }
 
-    /// Semi-join: delta→port 0, internal trace_scan(trace_table_id)→port 1.
     pub fn semi_join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
-        let trace = self.trace_scan(trace_table_id);
-        let nid = self.alloc_node(OPCODE_SEMI_JOIN_DELTA_TRACE);
-        self.connect(delta, nid, PORT_IN_A);
-        self.connect(trace, nid, PORT_TRACE);
-        nid
+        self.binary_join_scan(OPCODE_SEMI_JOIN_DELTA_TRACE, delta, trace_table_id)
     }
 
     /// Reduce with automatic shard insertion (required for multi-worker correctness).
@@ -267,45 +266,24 @@ impl CircuitBuilder {
         nid
     }
 
-    /// Join delta with a trace node (e.g. an INTEGRATE node providing a TraceRegister).
     pub fn join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        let nid = self.alloc_node(OPCODE_JOIN_DELTA_TRACE);
-        self.connect(delta, nid, PORT_IN_A);
-        self.connect(trace_node, nid, PORT_TRACE);
-        nid
+        self.binary_join(OPCODE_JOIN_DELTA_TRACE, delta, trace_node)
     }
 
-    /// Anti-join delta with a trace node.
     pub fn anti_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        let nid = self.alloc_node(OPCODE_ANTI_JOIN_DELTA_TRACE);
-        self.connect(delta, nid, PORT_IN_A);
-        self.connect(trace_node, nid, PORT_TRACE);
-        nid
+        self.binary_join(OPCODE_ANTI_JOIN_DELTA_TRACE, delta, trace_node)
     }
 
-    /// Left outer join: delta→port 0, internal trace_scan(trace_table_id)→port 1.
     pub fn left_join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
-        let trace = self.trace_scan(trace_table_id);
-        let nid = self.alloc_node(OPCODE_JOIN_DELTA_TRACE_OUTER);
-        self.connect(delta, nid, PORT_IN_A);
-        self.connect(trace, nid, PORT_TRACE);
-        nid
+        self.binary_join_scan(OPCODE_JOIN_DELTA_TRACE_OUTER, delta, trace_table_id)
     }
 
-    /// Left outer join delta with a trace node.
     pub fn left_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        let nid = self.alloc_node(OPCODE_JOIN_DELTA_TRACE_OUTER);
-        self.connect(delta, nid, PORT_IN_A);
-        self.connect(trace_node, nid, PORT_TRACE);
-        nid
+        self.binary_join(OPCODE_JOIN_DELTA_TRACE_OUTER, delta, trace_node)
     }
 
-    /// Semi-join delta with a trace node.
     pub fn semi_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        let nid = self.alloc_node(OPCODE_SEMI_JOIN_DELTA_TRACE);
-        self.connect(delta, nid, PORT_IN_A);
-        self.connect(trace_node, nid, PORT_TRACE);
-        nid
+        self.binary_join(OPCODE_SEMI_JOIN_DELTA_TRACE, delta, trace_node)
     }
 
     /// Add a string constant associated with a node (for expr programs).
@@ -316,7 +294,7 @@ impl CircuitBuilder {
 
     /// Integrate (sink) operator. Does NOT emit PARAM_TABLE_ID — evaluate_dag
     /// is the sole write path on the server side.
-    pub fn sink(&mut self, input: NodeId, _view_id: u64) -> NodeId {
+    pub fn sink(&mut self, input: NodeId) -> NodeId {
         let nid = self.alloc_node(OPCODE_INTEGRATE);
         self.connect(input, nid, PORT_IN);
         nid

@@ -1,11 +1,11 @@
 use sqlparser::ast::{
     Query, SetExpr, Values, Expr, Value, SelectItem,
-    TableFactor, Statement, TableObject, BinaryOperator,
+    Statement, TableObject, BinaryOperator,
     FromTable, Assignment, AssignmentTarget,
 };
 use gnitz_protocol::{Schema, ZSetBatch, ColData, TypeCode};
 use gnitz_core::GnitzClient;
-use crate::error::GnitzSqlError;
+use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
 use crate::binder::Binder;
 use crate::logical_plan::BoundExpr;
 use crate::SqlResult;
@@ -68,10 +68,7 @@ fn extract_insert_parts(stmt: &Statement) -> Result<(String, &[Vec<Expr>]), Gnit
     match stmt {
         Statement::Insert(insert) => {
             let table_name = match &insert.table {
-                TableObject::TableName(obj_name) => obj_name.0.last()
-                    .and_then(|p| p.as_ident())
-                    .map(|i| i.value.clone())
-                    .ok_or_else(|| GnitzSqlError::Bind("empty table name in INSERT".to_string()))?,
+                TableObject::TableName(obj_name) => extract_name(obj_name, "INSERT")?,
                 _ => return Err(GnitzSqlError::Unsupported("INSERT with table function not supported".to_string())),
             };
 
@@ -200,13 +197,7 @@ pub fn execute_select(
     if !from.joins.is_empty() {
         return Err(GnitzSqlError::Unsupported("JOINs not supported in direct SELECT".to_string()));
     }
-    let table_name = match &from.relation {
-        TableFactor::Table { name, .. } => name.0.last()
-            .and_then(|p| p.as_ident())
-            .map(|i| i.value.clone())
-            .ok_or_else(|| GnitzSqlError::Bind("empty table name in FROM".to_string()))?,
-        _ => return Err(GnitzSqlError::Unsupported("only simple table references supported in FROM".to_string())),
-    };
+    let table_name = extract_table_factor_name(&from.relation, "FROM")?;
 
     let (tid, schema) = binder.resolve(&table_name)?;
 
@@ -263,30 +254,8 @@ fn extract_limit(query: &Query) -> Option<usize> {
 
 /// Returns Some((pk_lo, pk_hi)) if the expression is `pk_col = literal`, else None.
 fn try_extract_pk_seek(expr: &Expr, schema: &Schema) -> Option<(u64, u64)> {
-    match expr {
-        Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::Eq, right } => {
-            // left = col_name, right = number literal (or swapped)
-            let is_num = |e: &Expr| matches!(e, Expr::Value(vws) if matches!(vws.value, Value::Number(_, _)));
-            let (col_expr, lit_expr) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Identifier(_), r) if is_num(r) => (left.as_ref(), right.as_ref()),
-                (l, Expr::Identifier(_)) if is_num(l) => (right.as_ref(), left.as_ref()),
-                _ => return None,
-            };
-            let col_name = if let Expr::Identifier(ident) = col_expr { &ident.value } else { return None; };
-            let n_str = if let Expr::Value(vws) = lit_expr {
-                if let Value::Number(n, _) = &vws.value { n } else { return None; }
-            } else { return None; };
-
-            // Check that col_name is the PK column
-            let pk_col = &schema.columns[schema.pk_index];
-            if !pk_col.name.eq_ignore_ascii_case(col_name) { return None; }
-
-            // Parse literal as u64 (pk_lo), pk_hi = 0
-            let pk_lo = n_str.parse::<u64>().ok()?;
-            Some((pk_lo, 0u64))
-        }
-        _ => None,
-    }
+    let (col_idx, key_lo, key_hi) = try_col_eq_literal(expr, schema)?;
+    if col_idx == schema.pk_index { Some((key_lo, key_hi)) } else { None }
 }
 
 /// Extracts (col_idx, key_lo, key_hi) from `col = integer_literal`. Does NOT check index existence.
@@ -376,9 +345,7 @@ fn apply_residual_filter(
     Ok((schema_opt, Some(new_batch)))
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
-enum ColumnValue { Int(i64), Float(f64), Str(String), Null }
+enum ColumnValue { Int(i64), #[allow(dead_code)] Float(f64), Str(String), Null }
 
 fn eval_pred_row(
     pred:   &BoundExpr,
@@ -457,13 +424,14 @@ fn eval_expr(
             })
         }
         BoundExpr::IsNull(c) => {
-            // nulls are stored as a bitmask per row; simplified: always false for now
-            let _ = c;
-            Ok(0)
+            let payload_idx = if *c < schema.pk_index { *c } else { *c - 1 };
+            let is_null = (batch.nulls[i] & (1u64 << payload_idx)) != 0;
+            Ok(is_null as i64)
         }
         BoundExpr::IsNotNull(c) => {
-            let _ = c;
-            Ok(1)
+            let payload_idx = if *c < schema.pk_index { *c } else { *c - 1 };
+            let is_null = (batch.nulls[i] & (1u64 << payload_idx)) != 0;
+            Ok(!is_null as i64)
         }
         BoundExpr::AggCall { .. } => Err(GnitzSqlError::Unsupported(
             "aggregate functions not allowed in this context".to_string()
@@ -661,10 +629,7 @@ fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Resu
 
 fn extract_assignment_col_name(assignment: &Assignment) -> Result<String, GnitzSqlError> {
     match &assignment.target {
-        AssignmentTarget::ColumnName(obj_name) => obj_name.0.last()
-            .and_then(|p| p.as_ident())
-            .map(|i| i.value.clone())
-            .ok_or_else(|| GnitzSqlError::Bind("empty column name in SET".to_string())),
+        AssignmentTarget::ColumnName(obj_name) => extract_name(obj_name, "UPDATE SET"),
         _ => Err(GnitzSqlError::Unsupported(
             "only simple column assignments supported in UPDATE SET".to_string()
         )),
@@ -743,14 +708,7 @@ pub fn execute_update(
         _ => return Err(GnitzSqlError::Bind("not an UPDATE statement".to_string())),
     };
 
-    let table_name = match &table.relation {
-        TableFactor::Table { name, .. } => name.0.last()
-            .and_then(|p| p.as_ident()).map(|i| i.value.clone())
-            .ok_or_else(|| GnitzSqlError::Bind("empty table name in UPDATE".to_string()))?,
-        _ => return Err(GnitzSqlError::Unsupported(
-            "UPDATE: only simple table references supported".to_string()
-        )),
-    };
+    let table_name = extract_table_factor_name(&table.relation, "UPDATE")?;
 
     let (table_id, schema) = binder.resolve(&table_name)?;
 
@@ -868,14 +826,7 @@ pub fn execute_delete(
             "DELETE: exactly one simple FROM table required".to_string()
         ));
     }
-    let table_name = match &tables[0].relation {
-        TableFactor::Table { name, .. } => name.0.last()
-            .and_then(|p| p.as_ident()).map(|i| i.value.clone())
-            .ok_or_else(|| GnitzSqlError::Bind("empty table name in DELETE".to_string()))?,
-        _ => return Err(GnitzSqlError::Unsupported(
-            "DELETE: only simple table references supported".to_string()
-        )),
-    };
+    let table_name = extract_table_factor_name(&tables[0].relation, "DELETE")?;
 
     let (table_id, schema) = binder.resolve(&table_name)?;
 

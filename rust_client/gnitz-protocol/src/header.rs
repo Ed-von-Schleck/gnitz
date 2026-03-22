@@ -22,6 +22,7 @@ pub const META_FLAG_IS_PK:    u64 = 2;
 /// Logical header decoded from the IPC control WAL block.
 ///
 /// Fields align with CONTROL_SCHEMA column indices; no wire-format struct.
+#[derive(Clone, Debug)]
 pub struct Header {
     pub status:     u32,
     pub target_id:  u64,

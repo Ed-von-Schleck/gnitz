@@ -292,52 +292,18 @@ fn rust_batch_to_py(
     schema: &Schema,
     batch:  &ZSetBatch,
 ) -> PyResult<Py<PyZSetBatch>> {
-    let n = batch.pk_lo.len();
-
     let pk_lo   = PyList::new(py, &batch.pk_lo)?;
     let pk_hi   = PyList::new(py, &batch.pk_hi)?;
     let weights = PyList::new(py, &batch.weights)?;
     let nulls   = PyList::new(py, &batch.nulls)?;
+    let columns = rust_batch_columns_to_py(py, schema, batch, batch.len())?;
 
-    let mut col_lists: Vec<PyObject> = Vec::with_capacity(schema.columns.len());
-    for (ci, col_def) in schema.columns.iter().enumerate() {
-        if ci == schema.pk_index {
-            col_lists.push(PyList::empty(py).into_any().unbind());
-            continue;
-        }
-        match &batch.columns[ci] {
-            ColData::Fixed(buf) => {
-                let stride = col_def.type_code.wire_stride();
-                let items: Vec<PyObject> = (0..n)
-                    .map(|i| read_fixed_le(py, col_def.type_code, &buf[i*stride..(i+1)*stride]))
-                    .collect();
-                col_lists.push(PyList::new(py, items)?.into_any().unbind());
-            }
-            ColData::Strings(v) => {
-                let items: Vec<PyObject> = v.iter()
-                    .map(|s| match s {
-                        Some(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
-                        None    => Ok(py.None().into()),
-                    })
-                    .collect::<PyResult<_>>()?;
-                col_lists.push(PyList::new(py, items)?.into_any().unbind());
-            }
-            ColData::U128s(v) => {
-                let items: Vec<PyObject> = v.iter()
-                    .map(|&x| Ok(x.into_pyobject(py)?.into_any().unbind()))
-                    .collect::<PyResult<_>>()?;
-                col_lists.push(PyList::new(py, items)?.into_any().unbind());
-            }
-        }
-    }
-
-    let columns = PyList::new(py, col_lists)?;
     Py::new(py, PyZSetBatch {
         pk_lo:   pk_lo.unbind(),
         pk_hi:   pk_hi.unbind(),
         weights: weights.unbind(),
         nulls:   nulls.unbind(),
-        columns: columns.unbind(),
+        columns: columns.bind(py).clone().unbind(),
     })
 }
 
@@ -350,13 +316,13 @@ struct SharedBatchData {
     batch:  ZSetBatch,
 }
 
-/// Build Python values for a single row from Rust data.
-fn build_row_values(
+/// Build Python values for a single row from Rust data, appending to `out`.
+fn build_row_values_into(
     py: Python<'_>, schema: &Schema, batch: &ZSetBatch, row: usize,
-) -> PyResult<Vec<PyObject>> {
+    out: &mut Vec<PyObject>,
+) -> PyResult<()> {
     let pk_idx = schema.pk_index;
     let null_word = batch.nulls[row];
-    let mut values = Vec::with_capacity(schema.columns.len());
     let mut payload_idx = 0usize;
 
     for ci in 0..schema.columns.len() {
@@ -365,36 +331,37 @@ fn build_row_values(
             let pk_hi = batch.pk_hi[row];
             if schema.columns[ci].type_code == TypeCode::U128 {
                 let val = (pk_lo as u128) | ((pk_hi as u128) << 64);
-                values.push(val.into_pyobject(py)?.into_any().unbind());
+                out.push(val.into_pyobject(py)?.into_any().unbind());
             } else {
-                values.push(pk_lo.into_pyobject(py)?.into_any().unbind());
+                out.push(pk_lo.into_pyobject(py)?.into_any().unbind());
             }
         } else {
             if null_word & (1u64 << payload_idx) != 0 {
-                values.push(py.None().into());
+                out.push(py.None().into());
             } else {
                 match &batch.columns[ci] {
                     ColData::Fixed(buf) => {
                         let stride = schema.columns[ci].type_code.wire_stride();
-                        values.push(read_fixed_le(
+                        out.push(read_fixed_le(
                             py, schema.columns[ci].type_code,
                             &buf[row * stride..(row + 1) * stride],
                         ));
                     }
                     ColData::Strings(v) => match &v[row] {
-                        Some(s) => values.push(s.into_pyobject(py)?.into_any().unbind()),
-                        None    => values.push(py.None().into()),
+                        Some(s) => out.push(s.into_pyobject(py)?.into_any().unbind()),
+                        None    => out.push(py.None().into()),
                     },
                     ColData::U128s(v) => {
-                        values.push(v[row].into_pyobject(py)?.into_any().unbind());
+                        out.push(v[row].into_pyobject(py)?.into_any().unbind());
                     }
                 }
             }
             payload_idx += 1;
         }
     }
-    Ok(values)
+    Ok(())
 }
+
 
 /// Read a single column value from a row (used by scalars()).
 fn read_row_value(
@@ -615,7 +582,7 @@ impl PyScanResult {
                 (Some(Arc::clone(d)), fields, d.batch.len())
             }
         };
-        Ok(PyRowIterator { data: data_clone, fields, row_class: None, pos: 0, len })
+        Ok(PyRowIterator { data: data_clone, fields, row_class: None, row_buf: Vec::new(), pos: 0, len })
     }
 
     fn __len__(&self) -> usize {
@@ -720,6 +687,7 @@ pub struct PyRowIterator {
     data:      Option<Arc<SharedBatchData>>,
     fields:    Py<PyTuple>,
     row_class: Option<PyObject>,
+    row_buf:   Vec<PyObject>,
     pos:       usize,
     len:       usize,
 }
@@ -733,18 +701,19 @@ impl PyRowIterator {
             return Ok(None);
         }
         let data = self.data.as_ref().unwrap();
-        let values = build_row_values(py, &data.schema, &data.batch, self.pos)?;
+        // Reuse row_buf across iterations to avoid per-row allocation
+        self.row_buf.clear();
+        build_row_values_into(py, &data.schema, &data.batch, self.pos, &mut self.row_buf)?;
         let weight = data.batch.weights[self.pos];
         self.pos += 1;
 
-        // Lazily import Row class
         if self.row_class.is_none() {
             let batch_mod = py.import("gnitz._batch")?;
             let cls = batch_mod.getattr("Row")?;
             self.row_class = Some(cls.unbind());
         }
         let row_cls = self.row_class.as_ref().unwrap();
-        let values_tuple = PyTuple::new(py, values)?;
+        let values_tuple = PyTuple::new(py, &self.row_buf)?;
         let row = row_cls.call1(py, (&self.fields, values_tuple, weight))?;
         Ok(Some(row))
     }
@@ -753,6 +722,43 @@ impl PyRowIterator {
 // ---------------------------------------------------------------------------
 // GnitzClient
 // ---------------------------------------------------------------------------
+
+/// Shared helper: convert a (Option<Schema>, Option<ZSetBatch>, u64) response into a Python tuple.
+fn response_to_py_tuple(
+    py: Python<'_>,
+    result: Result<(Option<Schema>, Option<ZSetBatch>, u64), gnitz_core::ClientError>,
+) -> PyResult<PyObject> {
+    let (opt_schema, opt_batch, view_lsn) = result
+        .map_err(|e| GnitzError::new_err(e.to_string()))?;
+    let (py_schema, py_batch) = match (opt_schema, opt_batch) {
+        (Some(s), Some(b)) => {
+            let ps = rust_schema_to_py(py, &s)?.into_any();
+            let pb = rust_batch_to_py(py, &s, &b)?.into_any();
+            (ps, pb)
+        }
+        (Some(s), None) => {
+            let ps = rust_schema_to_py(py, &s)?.into_any();
+            (ps, py.None())
+        }
+        _ => (py.None(), py.None()),
+    };
+    let lsn_obj = view_lsn.into_pyobject(py)?.into_any().unbind();
+    Ok(PyTuple::new(py, [py_schema, py_batch, lsn_obj])?.into_any().unbind())
+}
+
+/// Shared helper: wrap a (Option<Schema>, Option<ZSetBatch>, u64) into a lazy PyScanResult.
+fn response_to_lazy(
+    py: Python<'_>,
+    result: Result<(Option<Schema>, Option<ZSetBatch>, u64), gnitz_core::ClientError>,
+) -> PyResult<Py<PyScanResult>> {
+    let (opt_schema, opt_batch, view_lsn) = result
+        .map_err(|e| GnitzError::new_err(e.to_string()))?;
+    let data = match (opt_schema, opt_batch) {
+        (Some(s), Some(b)) => Some(Arc::new(SharedBatchData { schema: s, batch: b })),
+        _ => None,
+    };
+    Py::new(py, PyScanResult { data, lsn: view_lsn, cached_schema: None, cached_batch: None })
+}
 
 /// Macro to borrow the live inner client or raise GnitzError.
 macro_rules! client {
@@ -833,25 +839,7 @@ impl PyGnitzClient {
 
     /// scan(target_id) -> (Schema | None, ZSetBatch | None, view_lsn: int)
     pub fn scan(&self, py: Python<'_>, target_id: u64) -> PyResult<PyObject> {
-        match client!(self).scan(target_id) {
-            Ok((opt_schema, opt_batch, view_lsn)) => {
-                let (py_schema, py_batch) = match (opt_schema, opt_batch) {
-                    (Some(s), Some(b)) => {
-                        let ps = rust_schema_to_py(py, &s)?.into_any();
-                        let pb = rust_batch_to_py(py, &s, &b)?.into_any();
-                        (ps, pb)
-                    }
-                    (Some(s), None) => {
-                        let ps = rust_schema_to_py(py, &s)?.into_any();
-                        (ps, py.None())
-                    }
-                    _ => (py.None(), py.None()),
-                };
-                let lsn_obj = view_lsn.into_pyobject(py)?.into_any().unbind();
-                Ok(PyTuple::new(py, [py_schema, py_batch, lsn_obj])?.into_any().unbind())
-            }
-            Err(e) => Err(GnitzError::new_err(e.to_string())),
-        }
+        response_to_py_tuple(py, client!(self).scan(target_id))
     }
 
     /// delete(target_id, schema, pks: list[int]) — pks are full U128 primary keys.
@@ -928,72 +916,24 @@ impl PyGnitzClient {
         &self, py: Python<'_>, table_id: u64, col_idx: u64,
         key_lo: u64, key_hi: u64,
     ) -> PyResult<PyObject> {
-        match client!(self).seek_by_index(table_id, col_idx, key_lo, key_hi) {
-            Ok((opt_schema, opt_batch, view_lsn)) => {
-                let (py_schema, py_batch) = match (opt_schema, opt_batch) {
-                    (Some(s), Some(b)) => {
-                        let ps = rust_schema_to_py(py, &s)?.into_any();
-                        let pb = rust_batch_to_py(py, &s, &b)?.into_any();
-                        (ps, pb)
-                    }
-                    (Some(s), None) => {
-                        let ps = rust_schema_to_py(py, &s)?.into_any();
-                        (ps, py.None())
-                    }
-                    _ => (py.None(), py.None()),
-                };
-                let lsn_obj = view_lsn.into_pyobject(py)?.into_any().unbind();
-                Ok(PyTuple::new(py, [py_schema, py_batch, lsn_obj])?.into_any().unbind())
-            }
-            Err(e) => Err(GnitzError::new_err(e.to_string())),
-        }
+        response_to_py_tuple(py, client!(self).seek_by_index(table_id, col_idx, key_lo, key_hi))
     }
 
     /// seek(table_id, pk_lo, pk_hi) -> (Schema | None, ZSetBatch | None, view_lsn: int)
     pub fn seek(&self, py: Python<'_>, table_id: u64, pk_lo: u64, pk_hi: u64) -> PyResult<PyObject> {
-        match client!(self).seek(table_id, pk_lo, pk_hi) {
-            Ok((opt_schema, opt_batch, view_lsn)) => {
-                let (py_schema, py_batch) = match (opt_schema, opt_batch) {
-                    (Some(s), Some(b)) => {
-                        let ps = rust_schema_to_py(py, &s)?.into_any();
-                        let pb = rust_batch_to_py(py, &s, &b)?.into_any();
-                        (ps, pb)
-                    }
-                    (Some(s), None) => {
-                        let ps = rust_schema_to_py(py, &s)?.into_any();
-                        (ps, py.None())
-                    }
-                    _ => (py.None(), py.None()),
-                };
-                let lsn_obj = view_lsn.into_pyobject(py)?.into_any().unbind();
-                Ok(PyTuple::new(py, [py_schema, py_batch, lsn_obj])?.into_any().unbind())
-            }
-            Err(e) => Err(GnitzError::new_err(e.to_string())),
-        }
+        response_to_py_tuple(py, client!(self).seek(table_id, pk_lo, pk_hi))
     }
 
     // ----- Lazy scan/seek (Phase 2) — skip rust_batch_to_py entirely -----
 
     /// scan_lazy(target_id) -> ScanResult (native)
     pub fn scan_lazy(&self, py: Python<'_>, target_id: u64) -> PyResult<Py<PyScanResult>> {
-        let (opt_schema, opt_batch, view_lsn) = client!(self).scan(target_id)
-            .map_err(|e| GnitzError::new_err(e.to_string()))?;
-        let data = match (opt_schema, opt_batch) {
-            (Some(s), Some(b)) => Some(Arc::new(SharedBatchData { schema: s, batch: b })),
-            _ => None,
-        };
-        Py::new(py, PyScanResult { data, lsn: view_lsn, cached_schema: None, cached_batch: None })
+        response_to_lazy(py, client!(self).scan(target_id))
     }
 
     /// seek_lazy(table_id, pk_lo, pk_hi) -> ScanResult (native)
     pub fn seek_lazy(&self, py: Python<'_>, table_id: u64, pk_lo: u64, pk_hi: u64) -> PyResult<Py<PyScanResult>> {
-        let (opt_schema, opt_batch, view_lsn) = client!(self).seek(table_id, pk_lo, pk_hi)
-            .map_err(|e| GnitzError::new_err(e.to_string()))?;
-        let data = match (opt_schema, opt_batch) {
-            (Some(s), Some(b)) => Some(Arc::new(SharedBatchData { schema: s, batch: b })),
-            _ => None,
-        };
-        Py::new(py, PyScanResult { data, lsn: view_lsn, cached_schema: None, cached_batch: None })
+        response_to_lazy(py, client!(self).seek(table_id, pk_lo, pk_hi))
     }
 
     /// seek_by_index_lazy(table_id, col_idx, key_lo, key_hi) -> ScanResult (native)
@@ -1001,14 +941,7 @@ impl PyGnitzClient {
         &self, py: Python<'_>, table_id: u64, col_idx: u64,
         key_lo: u64, key_hi: u64,
     ) -> PyResult<Py<PyScanResult>> {
-        let (opt_schema, opt_batch, view_lsn) = client!(self)
-            .seek_by_index(table_id, col_idx, key_lo, key_hi)
-            .map_err(|e| GnitzError::new_err(e.to_string()))?;
-        let data = match (opt_schema, opt_batch) {
-            (Some(s), Some(b)) => Some(Arc::new(SharedBatchData { schema: s, batch: b })),
-            _ => None,
-        };
-        Py::new(py, PyScanResult { data, lsn: view_lsn, cached_schema: None, cached_batch: None })
+        response_to_lazy(py, client!(self).seek_by_index(table_id, col_idx, key_lo, key_hi))
     }
 
     /// execute_sql(schema_name, sql) -> list of result dicts
@@ -1196,7 +1129,7 @@ impl PyCircuitBuilder {
     }
 
     pub fn sink(&mut self, input: u64) -> PyResult<u64> {
-        Ok(circuit_builder!(self).sink(input, 0))
+        Ok(circuit_builder!(self).sink(input))
     }
 
     pub fn map_expr(&mut self, input: u64, expr: PyRef<'_, PyExprProgram>) -> PyResult<u64> {

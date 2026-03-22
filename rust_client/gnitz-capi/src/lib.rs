@@ -36,6 +36,9 @@ pub struct GnitzSchema(Schema);
 pub struct GnitzBatch {
     schema: Schema,
     batch:  ZSetBatch,
+    /// Cached CStrings for gnitz_batch_get_string — ensures null-terminated
+    /// pointers that live until the batch is freed.
+    cstring_cache: std::cell::RefCell<Vec<CString>>,
 }
 
 pub struct GnitzExprBuilder(ExprBuilder);
@@ -195,7 +198,7 @@ pub extern "C" fn gnitz_batch_new(schema: *const GnitzSchema) -> *mut GnitzBatch
     let s = check_ptr!(schema, std::ptr::null_mut());
     let schema_clone = s.0.clone();
     let batch = ZSetBatch::new(&schema_clone);
-    Box::into_raw(Box::new(GnitzBatch { schema: schema_clone, batch }))
+    Box::into_raw(Box::new(GnitzBatch { schema: schema_clone, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }))
 }
 
 /// Append one row. col_data is a flat buffer of all non-PK column values in
@@ -380,7 +383,13 @@ pub extern "C" fn gnitz_batch_get_string(
     let b = check_ptr!(batch, std::ptr::null());
     match b.batch.columns.get(col_idx) {
         Some(ColData::Strings(v)) => match v.get(row) {
-            Some(Some(s)) => s.as_bytes().as_ptr() as *const c_char,
+            Some(Some(s)) => {
+                // Cache a null-terminated CString; pointer valid until batch is freed.
+                let cstr = CString::new(s.as_str()).unwrap_or_default();
+                let mut cache = b.cstring_cache.borrow_mut();
+                cache.push(cstr);
+                cache.last().unwrap().as_ptr()
+            }
             Some(None)    => std::ptr::null(),
             None          => { set_error("row out of range"); std::ptr::null() }
         },
@@ -515,7 +524,7 @@ pub extern "C" fn gnitz_scan(
                 return std::ptr::null_mut();
             };
             let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
-            Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch }))
+            Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }))
         }
         Err(e) => { set_error(e); std::ptr::null_mut() }
     }
@@ -871,14 +880,13 @@ pub extern "C" fn gnitz_circuit_gather(
     check_ptr_mut!(cb, 0).0.gather(input, worker_id)
 }
 
-/// Add the integrate (sink) node. view_id is informational only.
+/// Add the integrate (sink) node.
 #[no_mangle]
 pub extern "C" fn gnitz_circuit_sink(
     cb:      *mut GnitzCircuitBuilder,
     input:   u64,
-    view_id: u64,
 ) -> u64 {
-    check_ptr_mut!(cb, 0).0.sink(input, view_id)
+    check_ptr_mut!(cb, 0).0.sink(input)
 }
 
 /// Consume the builder and return a GnitzCircuit for gnitz_create_view_with_circuit.
@@ -924,7 +932,7 @@ pub unsafe extern "C" fn gnitz_seek(
             if !out_batch.is_null() {
                 let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_index: 0 });
                 let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
-                *out_batch = Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch }));
+                *out_batch = Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }));
             }
             0
         }
@@ -954,7 +962,7 @@ pub unsafe extern "C" fn gnitz_seek_by_index(
             if !out_batch.is_null() {
                 let used_schema = server_schema.unwrap_or_else(|| Schema { columns: vec![], pk_index: 0 });
                 let batch = data.unwrap_or_else(|| ZSetBatch::new(&used_schema));
-                *out_batch = Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch }));
+                *out_batch = Box::into_raw(Box::new(GnitzBatch { schema: used_schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }));
             }
             0
         }
@@ -1029,7 +1037,7 @@ mod tests {
             pk_index: 0,
         };
         let batch = ZSetBatch::new(&schema);
-        let b = Box::into_raw(Box::new(GnitzBatch { schema, batch }));
+        let b = Box::into_raw(Box::new(GnitzBatch { schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }));
 
         // Manually add row metadata (gnitz_batch_append_row errors on String columns)
         unsafe {
@@ -1056,7 +1064,7 @@ mod tests {
             pk_index: 0,
         };
         let batch = ZSetBatch::new(&schema);
-        let b = Box::into_raw(Box::new(GnitzBatch { schema, batch }));
+        let b = Box::into_raw(Box::new(GnitzBatch { schema, batch, cstring_cache: std::cell::RefCell::new(Vec::new()) }));
 
         // Manually add row metadata
         unsafe {

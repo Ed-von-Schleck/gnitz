@@ -26,24 +26,13 @@ fn append_region(buf: &mut Vec<u8>, data: &[u8]) -> (u32, u32) {
     (off, data.len() as u32)
 }
 
-/// Serialize a `&[u64]` directly into `buf` at 8-byte alignment via bulk memcpy.
-fn append_u64_region(buf: &mut Vec<u8>, vals: &[u64]) -> (u32, u32) {
+/// Serialize a `&[T]` (T = u64 or i64) directly into `buf` at 8-byte alignment via bulk memcpy.
+/// SAFETY: Correct on little-endian (x86_64) — matches to_le_bytes() output.
+fn append_64bit_region<T: Copy>(buf: &mut Vec<u8>, vals: &[T]) -> (u32, u32) {
+    debug_assert_eq!(std::mem::size_of::<T>(), 8);
     let aligned = align8(buf.len());
     let sz = vals.len() * 8;
-    buf.resize(aligned, 0); // pad to alignment only
-    // SAFETY: vals is a valid &[u64]; reinterpreting as &[u8] with len*8 bytes is sound.
-    // Correct on little-endian (x86_64) — matches to_le_bytes() output.
-    let src = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, sz) };
-    buf.extend_from_slice(src);
-    (aligned as u32, sz as u32)
-}
-
-/// Serialize a `&[i64]` directly into `buf` at 8-byte alignment via bulk memcpy.
-fn append_i64_region(buf: &mut Vec<u8>, vals: &[i64]) -> (u32, u32) {
-    let aligned = align8(buf.len());
-    let sz = vals.len() * 8;
-    buf.resize(aligned, 0); // pad to alignment only
-    // SAFETY: same as append_u64_region.
+    buf.resize(aligned, 0);
     let src = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, sz) };
     buf.extend_from_slice(src);
     (aligned as u32, sz as u32)
@@ -126,36 +115,19 @@ fn decode_german_string(st: [u8; 16], blob: &[u8]) -> Result<String, ProtocolErr
 
 // ── Region read helpers ───────────────────────────────────────────────────────
 
-fn read_u64_region(
-    data: &[u8], off: usize, sz: usize, count: usize,
-) -> Result<Vec<u64>, ProtocolError> {
+/// Read a region of 64-bit values (u64 or i64) via bulk memcpy. Correct on little-endian.
+fn read_64bit_region<T: Copy + Default>(
+    data: &[u8], off: usize, sz: usize, count: usize, label: &str,
+) -> Result<Vec<T>, ProtocolError> {
+    debug_assert_eq!(std::mem::size_of::<T>(), 8);
     let expected = count * 8;
     if sz != expected {
         return Err(ProtocolError::DecodeError(format!(
-            "u64 region size mismatch: expected {}, got {}", expected, sz
+            "{} region size mismatch: expected {}, got {}", label, expected, sz
         )));
     }
     let src = &data[off..off + expected];
-    let mut v: Vec<u64> = vec![0u64; count];
-    // SAFETY: bulk copy from wire bytes into Vec<u64>. Correct on little-endian.
-    unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr() as *mut u8, expected);
-    }
-    Ok(v)
-}
-
-fn read_i64_region(
-    data: &[u8], off: usize, sz: usize, count: usize,
-) -> Result<Vec<i64>, ProtocolError> {
-    let expected = count * 8;
-    if sz != expected {
-        return Err(ProtocolError::DecodeError(format!(
-            "i64 region size mismatch: expected {}, got {}", expected, sz
-        )));
-    }
-    let src = &data[off..off + expected];
-    let mut v: Vec<i64> = vec![0i64; count];
-    // SAFETY: bulk copy from wire bytes into Vec<i64>. Correct on little-endian.
+    let mut v: Vec<T> = vec![T::default(); count];
     unsafe {
         std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr() as *mut u8, expected);
     }
@@ -246,10 +218,10 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
     let mut dir_entries: Vec<(u32, u32)> = Vec::with_capacity(num_regions);
 
     // System regions — write directly into buf, no temp Vecs
-    dir_entries.push(append_u64_region(&mut buf, &batch.pk_lo));
-    dir_entries.push(append_u64_region(&mut buf, &batch.pk_hi));
-    dir_entries.push(append_i64_region(&mut buf, &batch.weights));
-    dir_entries.push(append_u64_region(&mut buf, &batch.nulls));
+    dir_entries.push(append_64bit_region(&mut buf, &batch.pk_lo));
+    dir_entries.push(append_64bit_region(&mut buf, &batch.pk_hi));
+    dir_entries.push(append_64bit_region(&mut buf, &batch.weights));
+    dir_entries.push(append_64bit_region(&mut buf, &batch.nulls));
 
     // Non-PK column regions
     for cr in &col_regions {
@@ -369,20 +341,8 @@ pub fn decode_wal_block(
 
     let count = entry_count;
 
-    // Empty batch: build typed placeholder columns
     if count == 0 {
-        let columns = schema.columns.iter().enumerate().map(|(ci, col)| {
-            if ci == schema.pk_index {
-                ColData::Fixed(vec![])
-            } else {
-                match col.type_code {
-                    TypeCode::String => ColData::Strings(vec![]),
-                    TypeCode::U128   => ColData::U128s(vec![]),
-                    _                => ColData::Fixed(vec![]),
-                }
-            }
-        }).collect();
-        return Ok((ZSetBatch { pk_lo: vec![], pk_hi: vec![], weights: vec![], nulls: vec![], columns }, table_id, lsn));
+        return Ok((ZSetBatch::new(schema), table_id, lsn));
     }
 
     // Read system regions
@@ -393,10 +353,10 @@ pub fn decode_wal_block(
     let (wt_off,     wt_sz)     = dir[region_idx]; region_idx += 1;
     let (null_off,   null_sz)   = dir[region_idx]; region_idx += 1;
 
-    let pk_lo   = read_u64_region(data, pk_lo_off, pk_lo_sz, count)?;
-    let pk_hi   = read_u64_region(data, pk_hi_off, pk_hi_sz, count)?;
-    let weights = read_i64_region(data, wt_off,    wt_sz,    count)?;
-    let nulls   = read_u64_region(data, null_off,  null_sz,  count)?;
+    let pk_lo: Vec<u64>   = read_64bit_region(data, pk_lo_off, pk_lo_sz, count, "pk_lo")?;
+    let pk_hi: Vec<u64>   = read_64bit_region(data, pk_hi_off, pk_hi_sz, count, "pk_hi")?;
+    let weights: Vec<i64> = read_64bit_region(data, wt_off,    wt_sz,    count, "weights")?;
+    let nulls: Vec<u64>   = read_64bit_region(data, null_off,  null_sz,  count, "nulls")?;
 
     // Blob region (always last)
     let (blob_off, blob_sz) = dir[num_regions - 1];

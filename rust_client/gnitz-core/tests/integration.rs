@@ -379,7 +379,7 @@ fn test_filter_view() {
     let mut cb = CircuitBuilder::new(vid, tid);
     let inp = cb.input_delta();
     let f   = cb.filter(inp, Some(expr));
-    cb.sink(f, vid);
+    cb.sink(f);
     let circuit = cb.build();
 
     let table_schema = Schema { columns: cols, pk_index: 0 };
@@ -429,7 +429,7 @@ fn test_reduce_view() {
     let inp = cb.input_delta();
     // group by col 1, SUM col 2; agg_func_id=2 (SUM)
     let red = cb.reduce(inp, &[1], 2, 2);
-    cb.sink(red, vid);
+    cb.sink(red);
     let circuit = cb.build();
 
     let out_cols = vec![
@@ -500,7 +500,7 @@ fn test_join_view() {
     let mut cb = CircuitBuilder::new(vid, tid_a);
     let inp    = cb.input_delta();
     let joined = cb.join(inp, tid_b);
-    cb.sink(joined, vid);
+    cb.sink(joined);
     let circuit = cb.build();
 
     client.create_view_with_circuit("sv3", "join_v", "", circuit, &table_schema.columns).unwrap();
@@ -558,7 +558,7 @@ fn test_anti_join_view() {
     let mut cb = CircuitBuilder::new(vid, tid_a);
     let inp  = cb.input_delta();
     let anti = cb.anti_join(inp, tid_b);
-    cb.sink(anti, vid);
+    cb.sink(anti);
     let circuit = cb.build();
 
     client.create_view_with_circuit("sv4", "antijoin_v", "", circuit, &table_schema.columns).unwrap();
@@ -644,7 +644,7 @@ fn test_incremental_update() {
     let mut cb = CircuitBuilder::new(vid, tid);
     let inp = cb.input_delta();
     let red = cb.reduce(inp, &[1], 2, 2);
-    cb.sink(red, vid);
+    cb.sink(red);
     let circuit = cb.build();
 
     let out_cols = vec![
@@ -726,7 +726,7 @@ fn test_bulk_filter() {
     let mut cb = CircuitBuilder::new(vid, tid);
     let inp = cb.input_delta();
     let f   = cb.filter(inp, Some(expr));
-    cb.sink(f, vid);
+    cb.sink(f);
     let circuit = cb.build();
     client.create_view_with_circuit("bf1", "bfv1", "", circuit, &table_schema.columns).unwrap();
 

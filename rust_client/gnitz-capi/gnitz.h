@@ -204,7 +204,7 @@ uint64_t gnitz_circuit_shard(GnitzCircuitBuilder *cb,
 
 uint64_t gnitz_circuit_gather(GnitzCircuitBuilder *cb, uint64_t input, uint64_t worker_id);
 
-uint64_t gnitz_circuit_sink(GnitzCircuitBuilder *cb, uint64_t input, uint64_t view_id);
+uint64_t gnitz_circuit_sink(GnitzCircuitBuilder *cb, uint64_t input);
 
 GnitzCircuit *gnitz_circuit_build(GnitzCircuitBuilder *cb);
 

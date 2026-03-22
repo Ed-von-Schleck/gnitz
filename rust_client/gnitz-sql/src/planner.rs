@@ -10,7 +10,7 @@ use gnitz_core::{
     GnitzClient, CircuitBuilder, ExprBuilder,
     AGG_COUNT, AGG_COUNT_NON_NULL, AGG_SUM, AGG_MIN, AGG_MAX,
 };
-use crate::error::GnitzSqlError;
+use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
 use crate::binder::{Binder, resolve_qualified_column, resolve_unqualified_column};
 use crate::types::sql_type_to_typecode;
 use crate::expr::compile_bound_expr;
@@ -58,10 +58,7 @@ fn execute_create_table(
     create:      &sqlparser::ast::CreateTable,
     _binder:     &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let table_name = create.name.0.last()
-        .and_then(|p| p.as_ident())
-        .map(|i| i.value.clone())
-        .ok_or_else(|| GnitzSqlError::Bind("empty table name in CREATE TABLE".to_string()))?;
+    let table_name = extract_name(&create.name, "CREATE TABLE")?;
 
     let sql_cols = &create.columns;
     let mut pk_idx = 0usize;
@@ -119,10 +116,7 @@ fn execute_drop(
     names:       &[sqlparser::ast::ObjectName],
 ) -> Result<SqlResult, GnitzSqlError> {
     for obj_name in names {
-        let name = obj_name.0.last()
-            .and_then(|p| p.as_ident())
-            .map(|i| i.value.clone())
-            .ok_or_else(|| GnitzSqlError::Bind("empty name in DROP".to_string()))?;
+        let name = extract_name(obj_name, "DROP")?;
 
         match object_type {
             ObjectType::Table => {
@@ -150,10 +144,7 @@ fn execute_create_view(
     stmt:        &Statement,
     binder:      &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let view_name = view_name_obj.0.last()
-        .and_then(|p| p.as_ident())
-        .map(|i| i.value.clone())
-        .ok_or_else(|| GnitzSqlError::Bind("empty view name in CREATE VIEW".to_string()))?;
+    let view_name = extract_name(view_name_obj, "CREATE VIEW")?;
 
     let sql_text = format!("{}", stmt);
 
@@ -178,16 +169,10 @@ fn execute_create_view(
                     format!("CTE '{}': only single table without JOINs", cte_name)
                 ));
             }
-            let cte_table_name = match &cte_select.from[0].relation {
-                TableFactor::Table { name, .. } => name.0.last()
-                    .and_then(|p| p.as_ident()).map(|i| i.value.clone())
-                    .ok_or_else(|| GnitzSqlError::Bind(
-                        format!("CTE '{}': empty source table name", cte_name)
-                    ))?,
-                _ => return Err(GnitzSqlError::Unsupported(
-                    format!("CTE '{}': only simple table in FROM", cte_name)
-                )),
-            };
+            let cte_table_name = extract_table_factor_name(
+                &cte_select.from[0].relation,
+                &format!("CTE '{}'", cte_name),
+            )?;
             // Resolve the CTE's source table and cache the CTE name as an alias
             let resolved = binder.resolve(&cte_table_name)?;
             binder.cache_alias(cte_name, resolved);
@@ -239,13 +224,7 @@ fn execute_create_view(
         );
     }
 
-    let table_name = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => name.0.last()
-            .and_then(|p| p.as_ident())
-            .map(|i| i.value.clone())
-            .ok_or_else(|| GnitzSqlError::Bind("empty source table name".to_string()))?,
-        _ => return Err(GnitzSqlError::Unsupported("CREATE VIEW: only simple table in FROM".to_string())),
-    };
+    let table_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW")?;
 
     let (source_tid, source_schema) = binder.resolve(&table_name)?;
 
@@ -314,7 +293,7 @@ fn execute_create_view(
         filtered
     };
 
-    cb.sink(out_node, view_id);
+    cb.sink(out_node);
     let circuit = cb.build();
 
     client.create_view_with_circuit(schema_name, &view_name, &sql_text, circuit, &out_cols)
@@ -328,10 +307,7 @@ fn execute_create_index(
     schema_name: &str,
     ci:          &sqlparser::ast::CreateIndex,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let table_name = ci.table_name.0.last()
-        .and_then(|p| p.as_ident())
-        .map(|i| i.value.clone())
-        .ok_or_else(|| GnitzSqlError::Bind("empty table name in CREATE INDEX".to_string()))?;
+    let table_name = extract_name(&ci.table_name, "CREATE INDEX")?;
 
     if ci.columns.len() != 1 {
         return Err(GnitzSqlError::Unsupported(
@@ -354,7 +330,7 @@ fn execute_create_index(
 
 enum ProjectionItem {
     PassThrough { src_col: usize },
-    Computed { bound_expr: BoundExpr, #[allow(dead_code)] out_type: TypeCode },
+    Computed { bound_expr: BoundExpr, _out_type: TypeCode },
 }
 
 fn is_pk_item(item: &ProjectionItem, schema: &Schema) -> bool {
@@ -431,7 +407,7 @@ fn build_projection(
             SelectItem::ExprWithAlias { expr, alias } => {
                 let bound = binder.bind_expr(expr, source_schema)?;
                 let out_type = infer_expr_type(&bound, source_schema);
-                items.push(ProjectionItem::Computed { bound_expr: bound, out_type });
+                items.push(ProjectionItem::Computed { bound_expr: bound, _out_type: out_type });
                 out_cols.push(ColumnDef {
                     name: alias.value.clone(),
                     type_code: out_type,
@@ -444,7 +420,7 @@ fn build_projection(
                 let bound = binder.bind_expr(expr, source_schema)?;
                 let out_type = infer_expr_type(&bound, source_schema);
                 let col_name = format!("_expr{}", idx);
-                items.push(ProjectionItem::Computed { bound_expr: bound, out_type });
+                items.push(ProjectionItem::Computed { bound_expr: bound, _out_type: out_type });
                 out_cols.push(ColumnDef {
                     name: col_name,
                     type_code: out_type,
@@ -503,14 +479,7 @@ fn execute_create_join_view(
     _query:      &Query,
 ) -> Result<SqlResult, GnitzSqlError> {
     // Extract left table
-    let left_name = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => name.0.last()
-            .and_then(|p| p.as_ident()).map(|i| i.value.clone())
-            .ok_or_else(|| GnitzSqlError::Bind("empty left table name".to_string()))?,
-        _ => return Err(GnitzSqlError::Unsupported(
-            "CREATE VIEW JOIN: only simple table in FROM".to_string()
-        )),
-    };
+    let left_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW JOIN")?;
     let left_alias = match &select.from[0].relation {
         TableFactor::Table { alias: Some(a), .. } => a.name.value.clone(),
         _ => left_name.clone(),
@@ -679,7 +648,7 @@ fn execute_create_join_view(
     } else {
         cb.map(merged, &final_projection)
     };
-    cb.sink(sink_input, view_id);
+    cb.sink(sink_input);
     let circuit = cb.build();
 
     client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols)
@@ -777,12 +746,7 @@ fn execute_create_group_by_view(
     binder:      &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     // 1. Resolve source table
-    let table_name = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => name.0.last()
-            .and_then(|p| p.as_ident()).map(|i| i.value.clone())
-            .ok_or_else(|| GnitzSqlError::Bind("empty source table name".to_string()))?,
-        _ => return Err(GnitzSqlError::Unsupported("GROUP BY: only simple table in FROM".to_string())),
-    };
+    let table_name = extract_table_factor_name(&select.from[0].relation, "GROUP BY")?;
     let (source_tid, source_schema) = binder.resolve(&table_name)?;
 
     // 2. Parse GROUP BY → group column indices
@@ -1014,7 +978,7 @@ fn execute_create_group_by_view(
     };
 
     // 8. Sink
-    cb.sink(having_input, view_id);
+    cb.sink(having_input);
     let circuit = cb.build();
 
     client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols)
@@ -1166,12 +1130,7 @@ fn compile_set_op_side(
             "set operation: each side must be a simple SELECT from one table".to_string()
         ));
     }
-    let table_name = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => name.0.last()
-            .and_then(|p| p.as_ident()).map(|i| i.value.clone())
-            .ok_or_else(|| GnitzSqlError::Bind("empty table name in set operation".to_string()))?,
-        _ => return Err(GnitzSqlError::Unsupported("set operation: only simple table in FROM".to_string())),
-    };
+    let table_name = extract_table_factor_name(&select.from[0].relation, "set operation")?;
     let (source_tid, source_schema) = binder.resolve(&table_name)?;
 
     let inp = cb.input_delta_tagged(source_tid);
@@ -1257,7 +1216,7 @@ fn execute_create_set_op_view(
         )),
     };
 
-    cb.sink(out_node, view_id);
+    cb.sink(out_node);
     let circuit = cb.build();
 
     // Output schema: U128 PK + all payload columns
@@ -1292,12 +1251,7 @@ fn execute_create_distinct_view(
             "SELECT DISTINCT: only single table without JOINs".to_string()
         ));
     }
-    let table_name = match &select.from[0].relation {
-        TableFactor::Table { name, .. } => name.0.last()
-            .and_then(|p| p.as_ident()).map(|i| i.value.clone())
-            .ok_or_else(|| GnitzSqlError::Bind("empty source table name".to_string()))?,
-        _ => return Err(GnitzSqlError::Unsupported("SELECT DISTINCT: only simple table in FROM".to_string())),
-    };
+    let table_name = extract_table_factor_name(&select.from[0].relation, "SELECT DISTINCT")?;
     let (source_tid, source_schema) = binder.resolve(&table_name)?;
 
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
@@ -1320,7 +1274,7 @@ fn execute_create_distinct_view(
     let reindexed = cb.map_reindex(filtered, source_schema.pk_index, prog);
     let distinct_node = cb.distinct(reindexed);
 
-    cb.sink(distinct_node, view_id);
+    cb.sink(distinct_node);
     let circuit = cb.build();
 
     // Output schema: U128 PK + all source columns

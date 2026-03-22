@@ -279,21 +279,11 @@ pub fn recv_message(
         None
     };
 
-    if ctrl_header.status == STATUS_ERROR {
-        return Ok(Message {
-            status:       ctrl_header.status,
-            target_id:    ctrl_header.target_id,
-            client_id:    ctrl_header.client_id,
-            flags:        ctrl_header.flags,
-            seek_pk_lo:   ctrl_header.seek_pk_lo,
-            seek_pk_hi:   ctrl_header.seek_pk_hi,
-            seek_col_idx: ctrl_header.seek_col_idx,
-            schema:       None,
-            schema_batch: None,
-            data_batch:   None,
-            error_text:   Some(error_msg),
-        });
-    }
+    let (schema, schema_batch, data_batch, error_text) = if ctrl_header.status == STATUS_ERROR {
+        (None, None, None, Some(error_msg))
+    } else {
+        (wire_schema, schema_batch, data_batch, None)
+    };
 
     Ok(Message {
         status:       ctrl_header.status,
@@ -303,10 +293,10 @@ pub fn recv_message(
         seek_pk_lo:   ctrl_header.seek_pk_lo,
         seek_pk_hi:   ctrl_header.seek_pk_hi,
         seek_col_idx: ctrl_header.seek_col_idx,
-        schema:       wire_schema,
+        schema,
         schema_batch,
         data_batch,
-        error_text:   None,
+        error_text,
     })
 }
 

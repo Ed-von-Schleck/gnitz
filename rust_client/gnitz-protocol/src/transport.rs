@@ -97,11 +97,14 @@ pub fn connect(socket_path: &str) -> Result<RawFd, ProtocolError> {
 }
 
 /// Send a length-prefixed frame: [u32 LE payload_length][payload bytes].
+/// Combines header + payload into one syscall via writev to halve syscall count.
 pub fn send_framed(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
     let len = data.len() as u32;
     let hdr = len.to_le_bytes();
-    send_all(sock_fd, &hdr)?;
-    send_all(sock_fd, data)
+    let mut combined = Vec::with_capacity(4 + data.len());
+    combined.extend_from_slice(&hdr);
+    combined.extend_from_slice(data);
+    send_all(sock_fd, &combined)
 }
 
 /// Receive a length-prefixed frame. Returns the payload bytes.
