@@ -58,268 +58,103 @@ Key decisions:
 
 ---
 
-## Step 1: `eventfd_ffi.py` + `sal_ffi.py` + `fdatasync_c` — DONE
+## Step 1 — DONE
 
-- `gnitz/server/eventfd_ffi.py`: eventfd create/signal/wait/wait_any (C FFI)
-- `gnitz/server/sal_ffi.py`: try_set_nocow + fallocate_c (C FFI)
-- `gnitz/storage/mmap_posix.py`: added `fdatasync_c(fd)` (raises MMapError)
-- `rpython_tests/eventfd_test.py`: 7 tests, all pass
-- `Makefile`: test registered as `make run-eventfd_test-c`
-
-### SAL allocation (before fork, in `main.py`) — reference for Step 2
-
-```python
-SAL_MMAP_SIZE    = 1 << 30             # 1 GB, pre-allocated via fallocate
-W2M_REGION_SIZE  = 1 << 30             # 1 GB virtual per worker, memfd-backed
-# Total virtual: 5 GB for 4 workers (0.004% of 128 TB VA space)
-
-sal_path = base_dir + "/wal.sal"
-sal_fd = rposix.open(sal_path, O_RDWR | O_CREAT, 0o644)
-sal_ffi.try_set_nocow(sal_fd)          # btrfs in-place overwrites; silent on other FS
-if intmask(mmap_posix.fget_size(sal_fd)) < SAL_MMAP_SIZE:
-    sal_ffi.fallocate_c(sal_fd, SAL_MMAP_SIZE)
-sal_ptr = mmap_posix.mmap_file(sal_fd, SAL_MMAP_SIZE,
-    prot=PROT_READ | PROT_WRITE, flags=MAP_SHARED)
-
-for w in range(num_workers):
-    w2m_fd = mmap_posix.memfd_create_c("w2m_%d" % w)
-    mmap_posix.ftruncate_c(w2m_fd, W2M_REGION_SIZE)
-    w2m_ptr = mmap_posix.mmap_file(w2m_fd, W2M_REGION_SIZE, ...)
-    m2w_efd = eventfd_ffi.eventfd_create()
-    w2m_efd = eventfd_ffi.eventfd_create()
-```
-
-After fork: child closes eventfds of other workers. Master writes SAL,
-workers read.
+FFI primitives: `eventfd_ffi.py`, `sal_ffi.py`, `fdatasync_c` in
+`mmap_posix.py`. Tests in `rpython_tests/eventfd_test.py`.
 
 ---
 
-## Step 2: Internal IPC + Unified WAL
+## Step 2 — DONE (2a, 2c complete; 2b, 2d deferred)
 
-Replace memfd+socket in `master.py` / `worker.py` with single file-backed
-SAL transport. The SAL serves as both IPC channel and durable WAL.
+### 2a: SAL transport — DONE
 
-### 2a: SAL transport (master side)
+- `SharedAppendLog(ptr, fd, mmap_size)` with `write_cursor`, `lsn_counter`,
+  `epoch` (u32, bumped on checkpoint)
+- `W2MRegion` with atomic cursor for worker→master responses
+- `write_message_group` / `read_worker_message`: 576-byte group header,
+  MAX_WORKERS=64, size prefix written last (atomic release fence)
+- `_encode_wire` / `_parse_from_ptr`: factored from memfd transport
+- `write_to_w2m` / `read_from_w2m`: W2M response channel
+- Master: `_write_group`, `_send_to_workers`, `_send_broadcast`,
+  `_sync_and_signal_all`, `_wait_all_workers`, `_collect_acks_and_relay`
+- Worker: `_drain_sal` loop with epoch fence, `_dispatch_message`,
+  W2M ACK/response, initial ready ACK on startup
+- SAL allocation in `main.py`: fallocate + NOCOW, W2M memfd regions,
+  eventfds, socketpair crash detection
+- Tests: `rpython_tests/ipc_transport_test.py` (11 tests incl. cross-process
+  checkpoint)
 
-#### `SharedAppendLog` class
+### 2b: Gather-encode into SAL — DEFERRED
 
-```python
-class SharedAppendLog(object):
-    def __init__(self, ptr, fd):
-        self.ptr = ptr           # mmap base (1 GB)
-        self.fd = fd             # backing file fd
-        self.write_cursor = 0    # master only
-```
+Not yet implemented. Current code uses `repartition_batch` + per-worker
+`_encode_wire` (3-copy scatter). Pure optimization — functional behavior
+identical. Implement when profiling shows scatter is a bottleneck.
 
-Each worker holds its own `read_cursor` (integer).
+Planned API:
+- `encode_batch_gather(dest_ptr, ...)` in `wal_columnar.py`
+- `scatter_encode_to_sal(sal, ...)` in `ipc.py`
+- `FLAG_PARTITION_SORTED = r_uint64(1 << 53)`
+- Worker-side `ingest_batch_presorted(batch, boundaries)`
 
-#### Message group layout
+### 2c: Unified WAL + checkpoint/reset — DONE
 
-```
-[8-byte size prefix]
-[group_header: 64 bytes, cache-line aligned]
-  u64  total_payload_size
-  u64  lsn
-  u32  num_workers
-  u32  flags                      // FLAG_PUSH, FLAG_DDL_SYNC, etc.
-  u32  target_id
-  u32  reserved
-  u32  worker_offsets[MAX_WORKERS] // byte offset of worker i's data
-  u32  worker_sizes[MAX_WORKERS]   // byte size (0 = no data)
+- `_has_wal` flag on `EphemeralTable` / `PartitionedTable.set_has_wal()`;
+  disabled in multi-worker mode (SAL handles durability)
+- Crash recovery: `_recover_from_sal()` scans SAL from offset 0, replays
+  FLAG_PUSH groups with `lsn > max_flushed_lsn`, epoch-aware (stops at
+  epoch decrease)
+- SAL preserved across restarts (no O_TRUNC); conditionalized fallocate
+- Epoch-based fencing: group header offset 28 carries epoch (u32); workers
+  compare against `_expected_epoch` to skip stale data after cursor reset
+- Cooperative checkpoint: master sends FLAG_FLUSH (1<<14), workers flush
+  all user-table families, reset `read_cursor=0`, bump `_expected_epoch`,
+  ACK with FLAG_CHECKPOINT (1<<13); master resets `write_cursor=0`, bumps
+  `sal.epoch`, zeros size prefix at offset 0 (atomic release)
+- Proactive trigger: `_maybe_checkpoint()` at start of every `fan_out_*`
+  method when `write_cursor >= 75%` of `SAL_MMAP_SIZE`
+- SAL space guard in `_relay_exchange()` errors at < 12.5% remaining
+- Post-fork synchronization: workers send ready ACK, master collects all
+  before resetting SAL and starting backfill
 
-[worker_0_data: WAL-block encoded IPC message (control + schema + data)]
-[worker_1_data: ...]
-...
-```
+### 2d: Shared Exchange Arena — DEFERRED
 
-MAX_WORKERS = 64 (compile-time). Header fixed-size regardless of actual count.
+Current implementation uses relay-through-master: workers send exchange
+data via W2M, master repartitions via `relay_scatter()`, sends result
+back via SAL. Partially compensated by preloaded exchange optimization
+(`FLAG_PRELOADED_EXCHANGE`).
 
-#### `ipc.py` new functions
-
-- `write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers)`:
-  append all workers' data as one contiguous group
-- `read_worker_message(sal_ptr, read_cursor, worker_id)`:
-  extract this worker's data → `(payload, group_advance)` or `(None, 0)`
-- `_encode_wire(...)`: factored from `serialize_to_memfd` (control + schema + data blocks)
-- `_parse_from_ptr(ptr, length)`: factored from `_recv_and_parse`
-- `send_to_sal` / `receive_from_sal`: for W2M anonymous regions
-
-#### `master.py` changes
-
-`fan_out_push`: encode all workers → single message group → fdatasync once →
-signal all workers via eventfd → collect ACKs from W2M regions.
-
-`broadcast_ddl`: encode once → message group with identical data for all workers.
-
-#### Streaming scan forwarding
-
-`fan_out_scan_stream(target_id, schema, client_fd)`: raw-forward each
-worker's W2M scan result directly to client. O(1) master memory. No decode,
-no accumulate, no re-encode. N+1 framed messages (N results + FLAG_SCAN_DONE
-sentinel).
-
-#### `worker.py` changes
-
-Main loop: `read_worker_message` from SAL → handle → advance `read_cursor` →
-ACK via W2M. No worker-side fsync. Push handler: `ingest_to_family` +
-`upsert_batch` (existing code, unchanged).
-
-#### Socket keepalive
-
-SEQPACKET socketpair kept for crash detection only (POLLHUP). No data in
-steady state.
-
-#### Back-pressure
-
-Protocol is request/response: master blocks on ACKs before next push.
-If `write_cursor` approaches `SAL_MMAP_SIZE`, master forces checkpoint.
-
-### 2b: Gather-encode into SAL (SoA-aware scatter)
-
-Replace 3-copy scatter (gather → encode → memcpy) with single
-gather-encode pass writing directly into SAL. Classify by partition
-(256-way), group by worker, sort indices by partition within each worker.
-
-#### SAL direct-write API
-
-```python
-def sal_get_write_ptr(sal, max_size):
-    return rffi.ptradd(sal.ptr, sal.write_cursor + 8)
-
-def sal_commit(sal, actual_size):
-    _write_u64(sal.ptr, sal.write_cursor, r_uint64(actual_size))
-    sal.write_cursor += 8 + _align8(actual_size)
-```
-
-#### `wal_columnar.py` new function
-
-`encode_batch_gather(dest_ptr, max_size, schema, src_batch, indices,
-boundaries, lsn, table_id)`: gather-encode selected rows into dest.
-Extra region: `u32[num_boundaries]` partition boundary table.
-
-#### `ipc.py` new function
-
-`scatter_encode_to_sal(sal, batch, num_workers, assignment, schema,
-target_id, lsn, flags)`: classify by partition → gather per-worker indices
-with boundaries → encode → write single message group.
-
-New IPC flag: `FLAG_PARTITION_SORTED = r_uint64(1 << 53)`.
-
-### 2c: Single unified WAL (file-backed SAL)
-
-The SAL file IS the WAL. No separate `WorkerWAL`. No `append_and_map`.
-No per-push `mmap()`. No worker-side fsync.
-
-#### Recovery
-
-```python
-def recover_from_sal(sal_path, engine, assignment, worker_id):
-    # Sequential forward scan from offset 0.
-    # Extract this worker's data via group header offsets.
-    # Replay blocks with LSN > last_flushed_lsn.
-    # After cursor-reset: old-epoch groups (higher offsets, lower LSN) skipped.
-    # Cost: O(file_size) header reads. ~1 ms for 100 MB.
-```
-
-#### Checkpoint / SAL reset
-
-Worker: after all partitions flushed since last reset, set `FLAG_CHECKPOINT`
-on ACK, reset own `read_cursor = 0`.
-
-Master: when ALL workers checkpointed, `sal.write_cursor = 0`. No file
-operations. Overwrites from offset 0 (blocks already allocated).
-
-#### `table.py` changes
-
-```python
-if self._has_wal:
-    self.wal_writer.append_batch(lsn, self.table_id, batch)  # single-process
-    self.memtable.upsert_batch(batch)
-else:
-    self.memtable.upsert_batch(batch)  # multi-worker: SAL handles durability
-```
-
-### 2d: Shared Exchange Arena
-
-Per-worker memfd slots (1 GB virtual each, demand-paged). Workers
-scatter-encode directly into their slot; other workers read and clone.
-Master coordinates barriers only — never touches exchange data.
-
-#### Allocation (before fork)
-
-```python
-EXCHANGE_SLOT_SIZE = 1 << 30   # 1 GB virtual per worker
-for w in range(num_workers):
-    fd = mmap_posix.memfd_create_c("xchg_%d" % w)
-    mmap_posix.ftruncate_c(fd, EXCHANGE_SLOT_SIZE)
-    exchange_ptrs[w] = mmap_posix.mmap_file(fd, EXCHANGE_SLOT_SIZE, ...)
-```
-
-#### Slot layout
-
-```
-Slot header (64 bytes):
-  u32 sub_batch_count, u32 total_bytes_written
-  u32 offsets[MAX_WORKERS], u32 sizes[MAX_WORKERS]
-Sub-batch for W0: [WAL block]
-Sub-batch for W1: [WAL block]
-...
-```
-
-#### Protocol flags
-
-```python
-FLAG_EXCHANGE_READY    = r_uint64(1 << 54)  # worker → master: slot written
-FLAG_EXCHANGE_BARRIER  = r_uint64(1 << 55)  # master → workers: all ready
-FLAG_EXCHANGE_CONSUMED = r_uint64(1 << 56)  # worker → master: reads done
-```
-
-#### Exchange flow
-
-1. Worker repartitions → encodes sub-batches into own slot
-2. Signals `FLAG_EXCHANGE_READY` to master
-3. Master collects N ready → broadcasts `FLAG_EXCHANGE_BARRIER`
-4. Workers read from all slots, clone into owned batches
-5. Workers signal `FLAG_EXCHANGE_CONSUMED`
-6. Next exchange: `ftruncate(fd,0)` + `ftruncate(fd,SIZE)` releases pages
-
-Consumed barrier guarantees no readers remain → no double-buffering needed.
-SIGBUS safety: ftruncate window is between consumed and next write.
-
-#### `WorkerExchangeHandler` rewrite
-
-`do_exchange`: ftruncate release → local repartition → encode to slot →
-signal ready → wait barrier → read all slots → clone → signal consumed.
-
-#### `master.py` changes
-
-`_collect_and_barrier` replaces `_relay_exchange`: barrier coordination
-only, no data relay. `_relay_exchange` and `relay_scatter` deleted.
-
-### Files changed (Step 2)
-
-- `gnitz/server/main.py`: SAL + W2M + eventfd + exchange arena before fork
-- `gnitz/server/ipc.py`: message group read/write, SAL transport, new flags
-- `gnitz/server/master.py`: SAL fan_out, streaming scan, exchange barrier
-- `gnitz/server/worker.py`: SAL read loop, exchange arena handler
-- `gnitz/storage/wal_columnar.py`: `encode_batch_gather`
-- `gnitz/storage/table.py`: `_has_wal` flag for multi-worker mode
-- `gnitz/dbsp/ops/exchange.py`: unchanged (repartition_batch reused)
-
-### Test (Step 2)
-
-- `make run-eventfd_test-c`
-- `make run-storage_comprehensive_test-c`
-- `make run-multicore_test-c` (covers master/worker + exchange)
-- `GNITZ_WORKERS=4 pytest rust_client/gnitz-py/tests/`
+Implement arena when exchange relay becomes a measured bottleneck. The
+relay adds one data copy + master CPU for repartition, but avoids the
+complexity of inter-worker shared memory coordination. Preloaded exchange
+already eliminates the relay for trivial (direct INPUT→SHARD) views.
 
 ---
 
 ## Step 3: Length-Prefixed SOCK_STREAM (External IPC)
 
 Drop memfd+SCM_RIGHTS from external client path. Switch to `SOCK_STREAM`
-with 4-byte length-prefix framing. No message size limit. No `slice_view`,
-`FLAG_MORE`, or `_send_chunked`.
+with 4-byte length-prefix framing. No message size limit.
+
+### Current state (what to change)
+
+External client ↔ master uses SOCK_SEQPACKET + SCM_RIGHTS fd passing:
+- **Server side**: `ipc_ffi.py` has `gnitz_server_create` (SEQPACKET),
+  `gnitz_ipc_send_fd`/`gnitz_ipc_recv_fd`/`gnitz_ipc_recv_fd_nb` (SCM_RIGHTS).
+  `ipc.py` has `serialize_to_memfd` → `send_batch` and `receive_payload` /
+  `try_receive_payload` (memfd mmap + parse). `executor.py:_drain_client`
+  calls `try_receive_payload` for recv, `send_batch` for responses.
+- **Rust client**: `rust_client/gnitz-protocol/src/transport.rs` — SEQPACKET
+  connect + SCM_RIGHTS send/recv.
+- **Python client**: `py_client/gnitz_client/` — wraps the Rust client via
+  PyO3 bindings; transport changes are Rust-only.
+
+Key insight: `_encode_wire` / `_parse_from_ptr` (factored in Step 2a)
+already produce/consume the WAL-block wire format as raw bytes. Step 3 only
+replaces the transport layer (memfd+SCM_RIGHTS → length-prefixed TCP-style
+framing). The wire payload format is unchanged.
+
+Internal master ↔ worker IPC (SAL + W2M) is completely unaffected.
 
 ### Wire protocol
 
@@ -369,6 +204,10 @@ Breaking change. Version both sides together.
 
 Raw syscalls (no liburing). Syscall numbers 425/426/427 (x86_64 stable ABI).
 
+Follow the FFI pattern in `eventfd_ffi.py` and `ipc_ffi.py`:
+`ExternalCompilationInfo` with `separate_module_sources` for inline C,
+`rffi.llexternal` for each function. Use `releasegil=True` on blocking calls.
+
 ### C API
 
 | Function | Description |
@@ -400,7 +239,9 @@ All io_uring buffers must be raw-allocated (`flavor='raw'`).
 
 ## Step 5: io_uring Event Loop for External Clients
 
-Replace poll-based `run_socket_server` with io_uring event loop.
+Replace poll-based `run_socket_server` in `executor.py` with io_uring
+event loop. Current loop uses `ipc_ffi.poll()` + non-blocking accept/recv.
+Step 3 must land first (SOCK_STREAM framing).
 
 ```
 io_uring instance (256 SQ entries)
@@ -437,9 +278,11 @@ Available io_uring features on kernel 6.18:
 ## Implementation Order
 
 ```
-Step 1   DONE — eventfd_ffi.py, sal_ffi.py, fdatasync_c
-Step 2   Internal IPC overhaul (2a → 2b → 2c → 2d)
-         2a-2c can land with existing master-relay exchange as fallback
+Step 1   DONE
+Step 2a  DONE — SAL transport, W2M, master/worker SAL integration
+Step 2b  DEFERRED — gather-encode optimization (pure perf, no functional gap)
+Step 2c  DONE — unified WAL, checkpoint/reset, crash recovery, epoch fencing
+Step 2d  DEFERRED — exchange arena (relay-through-master works, preload covers common case)
 Step 3   External IPC (independent of Step 2)
 Step 4   uring_ffi.py (independent of everything)
 Step 5   io_uring event loop (depends on 3 + 4)
@@ -457,6 +300,70 @@ Per push, 4 workers, 64 partitions/worker:
 | WAL fdatasync() | 256 | **1** | 1 | 1 |
 | Transport syscalls | ~120 | 9 | 4 | ~2 |
 | Total syscalls | ~632 | ~32 | ~14 | ~12 |
+
+---
+
+## Lessons Learned (Steps 1–2)
+
+### Epoch fencing beats zeroing
+
+After checkpoint, old data at offset 0 still has non-zero size prefixes.
+Zeroing 1 GB is expensive and creates a visibility window. Instead, each
+group header carries an epoch (u32 at offset 28). Workers compare against
+`_expected_epoch` — stale groups are skipped without any bulk memory
+operation. Recovery uses epoch-decrease detection to find the stale
+boundary.
+
+### Worker ready ACK is required for startup synchronization
+
+Workers must signal the master after recovery completes (before entering
+the main loop). Without this, the master could reset the SAL or start
+backfill before workers have finished replaying. The ready ACK uses the
+existing W2M + eventfd channel — no new mechanism needed.
+
+### Checkpoint can't happen mid-exchange
+
+`_maybe_checkpoint()` must only trigger at `fan_out_*` entry points,
+never inside `_collect_acks_and_relay()`. Workers inside `do_exchange()`
+are blocked waiting for a relay response; they can't process FLAG_FLUSH
+until the exchange completes. The 75% threshold leaves 256 MB headroom
+for one full operation (push + exchange relay).
+
+### SAL space guard in _relay_exchange
+
+A complex DAG with many exchanges can fill the SAL faster than expected.
+The relay guard at < 12.5% remaining gives a clear error instead of the
+generic "SAL full" crash. Future work: if this fires in practice, consider
+mid-operation checkpoint or increasing SAL_MMAP_SIZE.
+
+### Cross-process eventfd tests need two eventfds
+
+Using a single eventfd for bidirectional parent↔child signaling causes
+races: either process can consume the initial signal. Use one eventfd per
+direction (c2m_efd, m2c_efd) for deterministic synchronization in tests.
+
+### ExprProgram num_regs=0 is valid for pure COPY_COL MAP programs
+
+The per-row `evaluate_map` fallback (used when `reindex_col >= 0`) calls
+`eval_expr` which returns `regs[result_reg]`. When the MAP bytecode
+contains only COPY_COL instructions, `num_regs=0` and `regs` is empty —
+accessing `regs[0]` crashes with "fixed getitem out of bounds". Both
+`eval_expr` and `_eval_row_direct` must guard the return with
+`if program.num_regs == 0: return sentinel`.
+
+### SAL file must not be truncated on startup
+
+The original `O_TRUNC` flag zeroed the SAL before recovery could read it.
+In multi-worker mode, per-partition WAL is disabled (`_has_wal=False`), so
+the SAL is the durability layer. Use `O_CREAT` without `O_TRUNC`;
+conditionalize `fallocate_c` on `fget_size < SAL_MMAP_SIZE`.
+
+### Worker ordering invariant for checkpoint
+
+Workers must reset `read_cursor=0` and bump `_expected_epoch` BEFORE
+sending the FLAG_CHECKPOINT ACK. Master resets `write_cursor=0` AFTER
+receiving all ACKs. This prevents a window where master overwrites data
+a worker hasn't finished reading.
 
 ---
 
@@ -493,17 +400,6 @@ excluding SAL directory from snapshots (subvolume layout). Deployment doc.
 - btrfs: SAL directory on subvolume excluded from snapshots
 - 1 GB disk for SAL file (pre-allocated)
 - No liburing, no sysctl tuning
-
----
-
-## Validated Claims
-
-All claims validated against kernel 6.18/6.19 docs, headers, and man pages.
-See git history for the full validation report.
-
-One unverifiable claim: XFS commit `fc0561ce` (fdatasync skips log force for
-timestamp-only changes) — not in kernel docs, requires XFS git history.
-Behavior is consistent with XFS architecture regardless.
 
 ---
 
