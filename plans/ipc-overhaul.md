@@ -226,7 +226,27 @@ io_uring instance (256 SQ entries)
 Per-connection state machine for length-prefix parsing (4-byte header →
 payload). Pre-allocated recv buffer pool (N × 8 MB, registered).
 
-Fallback to poll + `recv_framed` if `io_uring_setup` fails.
+Fallback to poll + `try_recv_framed` if `io_uring_setup` fails.
+
+### Key implementation notes
+
+The current poll loop is `executor.py:run_socket_server` (~lines 272-400).
+It calls `_drain_client` per ready fd, which calls `try_recv_framed`. The
+two-phase recv (non-blocking header, then blocking payload via `recv_exact`)
+means the server blocks on one client's payload while other clients wait.
+Step 5 must make the payload recv async too — submit an `IORING_OP_RECV`
+for the payload bytes instead of calling `recv_exact`. This requires a
+per-connection state machine: `WAITING_HEADER` → `WAITING_PAYLOAD` → parse.
+
+The existing per-connection `_client_hdr_bufs`/`_client_hdr_pos` dicts on
+`ServerExecutor` should be replaced by whatever per-connection struct the
+io_uring loop uses. The poll-based fallback path can keep them as-is.
+
+Response sends (`send_framed`) are currently blocking (`gnitz_send_framed`
+in C loops on `send()` with MSG_NOSIGNAL). Step 5 should submit
+`IORING_OP_SEND` for responses instead. The wire buffer from `_encode_wire`
+must stay alive until the send completion — either pin it or copy into a
+registered buffer.
 
 Available io_uring features on kernel 6.18:
 
