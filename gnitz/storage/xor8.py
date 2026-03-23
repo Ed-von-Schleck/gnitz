@@ -8,6 +8,7 @@ from rpython.rlib import rposix, rposix_stat, jit, objectmodel
 
 from gnitz.core import xxh
 from gnitz.storage import mmap_posix
+from gnitz import log
 
 MAX_CONSTRUCTION_ATTEMPTS = 64
 
@@ -199,61 +200,56 @@ def build_xor8(pk_lo_ptr, pk_hi_ptr, num_keys):
 
 
 def save_xor8(xor_filter, filepath):
-    """Write XOR8 filter to a sidecar file."""
-    fd = rposix.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    """Write XOR8 filter to a sidecar file. Best-effort -- errors silently ignored."""
     try:
-        header = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
-        try:
-            seed = xor_filter._get_seed()
-            rffi.cast(rffi.ULONGLONGP, header)[0] = rffi.cast(
-                rffi.ULONGLONG, r_uint64(intmask(seed))
-            )
-            rffi.cast(rffi.UINTP, rffi.ptradd(header, 8))[0] = rffi.cast(
-                rffi.UINT, xor_filter.segment_length
-            )
-            rffi.cast(rffi.UINTP, rffi.ptradd(header, 12))[0] = rffi.cast(
-                rffi.UINT, xor_filter.total_size
-            )
-            mmap_posix.write_c(fd, header, rffi.cast(rffi.SIZE_T, 16))
-        finally:
-            lltype.free(header, flavor="raw")
-
-        mmap_posix.write_c(
+        fd = rposix.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    except OSError:
+        log.warn("xor8: cannot create " + filepath)
+        return
+    header = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
+    seed = xor_filter._get_seed()
+    rffi.cast(rffi.ULONGLONGP, header)[0] = rffi.cast(
+        rffi.ULONGLONG, r_uint64(intmask(seed))
+    )
+    rffi.cast(rffi.UINTP, rffi.ptradd(header, 8))[0] = rffi.cast(
+        rffi.UINT, xor_filter.segment_length
+    )
+    rffi.cast(rffi.UINTP, rffi.ptradd(header, 12))[0] = rffi.cast(
+        rffi.UINT, xor_filter.total_size
+    )
+    try:
+        mmap_posix.write_all(fd, header, rffi.cast(rffi.SIZE_T, 16))
+        mmap_posix.write_all(
             fd,
             xor_filter.fingerprints,
             rffi.cast(rffi.SIZE_T, xor_filter.total_size),
         )
-    finally:
-        rposix.close(fd)
+    except mmap_posix.MMapError:
+        log.warn("xor8: write failed for " + filepath)
+    lltype.free(header, flavor="raw")
+    rposix.close(fd)
 
 
 def load_xor8(filepath):
     """Load XOR8 filter from a sidecar file. Returns None if file doesn't exist."""
     try:
-        st = rposix_stat.stat(filepath)
-    except OSError:
-        return None
-
-    file_size = intmask(st.st_size)
-    if file_size < 16:
-        return None
-
-    try:
         fd = rposix.open(filepath, os.O_RDONLY, 0)
     except OSError:
         return None
     try:
-        header_data = rposix.read(fd, 16)
-        if len(header_data) < 16:
+        try:
+            st = rposix_stat.fstat(fd)
+        except OSError:
+            return None
+        file_size = intmask(st.st_size)
+        if file_size < 16:
             return None
 
         header = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
         try:
-            i = 0
-            while i < 16:
-                header[i] = header_data[i]
-                i += 1
-
+            bytes_read = mmap_posix.read_into_ptr(fd, header, 16)
+            if bytes_read < 16:
+                return None
             seed_val = r_uint64(rffi.cast(rffi.ULONGLONGP, header)[0])
             segment_length = intmask(
                 rffi.cast(rffi.UINTP, rffi.ptradd(header, 8))[0]
