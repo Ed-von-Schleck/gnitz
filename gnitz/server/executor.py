@@ -396,6 +396,22 @@ class ServerExecutor(object):
                         pending_fds, pending_cids, pending_tids,
                         pending_batches, pending_schemas,
                     )
+                    if rows == 0 and len(pending_fds) > 0:
+                        # Read op (scan/seek) arrived while pushes are
+                        # pending — flush pushes first so the read sees
+                        # them.  Fixes race when push and scan CQEs
+                        # land in the same io_uring drain batch.
+                        self._flush_pending_pushes(
+                            pending_fds, pending_cids,
+                            pending_tids, pending_batches,
+                            pending_schemas,
+                        )
+                        pending_fds = newlist_hint(16)
+                        pending_cids = newlist_hint(16)
+                        pending_tids = newlist_hint(16)
+                        pending_batches = newlist_hint(16)
+                        pending_schemas = newlist_hint(16)
+                        pending_row_count = 0
                     if rows > 0:
                         pending_row_count += rows
                         if pending_row_count >= MAX_PENDING_ROWS:
