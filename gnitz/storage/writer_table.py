@@ -10,6 +10,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import errors
 from gnitz.storage import layout, mmap_posix, buffer
 from gnitz.storage.buffer import align_64, c_memmove, c_memset
+from gnitz.storage.mmap_posix import AT_FDCWD
 from gnitz.core import (
     types,
     strings as string_logic,
@@ -272,27 +273,10 @@ def _build_writer_regions(writer):
     return regions
 
 
-def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr, pk_hi_ptr,
-                      durable=True):
-    """
-    Write a shard file from pre-built region buffers.
-
-    region_list: list of (ptr, size) tuples in canonical region order:
-        [pk_lo, pk_hi, weight, null, col0..colN, blob]
-    pk_lo_ptr, pk_hi_ptr: raw pointers for XOR8 filter construction.
-
-    Always writes to a .tmp file first then atomically renames to filename.
-    This guarantees that the final file is either complete or absent — never
-    a partial write visible to concurrent readers (or readers after a crash).
-
-    durable=True  (PersistentTable): caller does one dir fsync after rename.
-    durable=False (EphemeralTable):  no fsync; crash durability is not a
-                  contract, but atomicity still prevents partial-read errors.
-    """
+def _build_shard_image(table_id, count, region_list):
+    """Build the shard file image in a single contiguous buffer.
+    Returns (file_buf, total_file_size). Caller must free file_buf."""
     num_regions = len(region_list)
-    target_filename = filename + ".tmp"
-
-    # Phase 1: Compute layout (no I/O, no allocation)
     dir_size = num_regions * layout.DIR_ENTRY_SIZE
     dir_offset = layout.HEADER_SIZE
     current_pos = align_64(dir_offset + dir_size)
@@ -315,83 +299,109 @@ def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr, pk_hi_p
     else:
         total_file_size = layout.HEADER_SIZE
 
-    # Phase 2: Build file image in a single contiguous buffer
     file_buf = lltype.malloc(rffi.CCHARP.TO, total_file_size, flavor="raw")
-    try:
-        c_memset(
-            rffi.cast(rffi.VOIDP, file_buf),
-            rffi.cast(rffi.INT, 0),
-            rffi.cast(rffi.SIZE_T, total_file_size),
+    c_memset(
+        rffi.cast(rffi.VOIDP, file_buf),
+        rffi.cast(rffi.INT, 0),
+        rffi.cast(rffi.SIZE_T, total_file_size),
+    )
+
+    rffi.cast(rffi.ULONGLONGP, file_buf)[0] = layout.MAGIC_NUMBER
+    rffi.cast(
+        rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_VERSION)
+    )[0] = rffi.cast(rffi.ULONGLONG, layout.VERSION)
+    rffi.cast(
+        rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_ROW_COUNT)
+    )[0] = rffi.cast(rffi.ULONGLONG, count)
+    rffi.cast(
+        rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_DIR_OFFSET)
+    )[0] = rffi.cast(rffi.ULONGLONG, dir_offset)
+    rffi.cast(
+        rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_TABLE_ID)
+    )[0] = rffi.cast(rffi.ULONGLONG, table_id)
+
+    i = 0
+    while i < num_regions:
+        buf_ptr, off, sz = final_regions[i]
+        cs = checksum.compute_checksum(buf_ptr, sz)
+        base = rffi.ptradd(file_buf, dir_offset + i * layout.DIR_ENTRY_SIZE)
+        rffi.cast(rffi.ULONGLONGP, base)[0] = rffi.cast(rffi.ULONGLONG, off)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0] = rffi.cast(
+            rffi.ULONGLONG, sz
         )
-
-        # Header
-        rffi.cast(rffi.ULONGLONGP, file_buf)[0] = layout.MAGIC_NUMBER
-        rffi.cast(
-            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_VERSION)
-        )[0] = rffi.cast(rffi.ULONGLONG, layout.VERSION)
-        rffi.cast(
-            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_ROW_COUNT)
-        )[0] = rffi.cast(rffi.ULONGLONG, count)
-        rffi.cast(
-            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_DIR_OFFSET)
-        )[0] = rffi.cast(rffi.ULONGLONG, dir_offset)
-        rffi.cast(
-            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_TABLE_ID)
-        )[0] = rffi.cast(rffi.ULONGLONG, table_id)
-
-        # Directory entries + region data in one pass
-        i = 0
-        while i < num_regions:
-            buf_ptr, off, sz = final_regions[i]
-            cs = checksum.compute_checksum(buf_ptr, sz)
-            base = rffi.ptradd(file_buf, dir_offset + i * layout.DIR_ENTRY_SIZE)
-            rffi.cast(rffi.ULONGLONGP, base)[0] = rffi.cast(rffi.ULONGLONG, off)
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0] = rffi.cast(
-                rffi.ULONGLONG, sz
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0] = rffi.cast(
+            rffi.ULONGLONG, cs
+        )
+        if sz > 0:
+            c_memmove(
+                rffi.cast(rffi.VOIDP, rffi.ptradd(file_buf, off)),
+                rffi.cast(rffi.VOIDP, buf_ptr),
+                rffi.cast(rffi.SIZE_T, sz),
             )
-            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0] = rffi.cast(
-                rffi.ULONGLONG, cs
-            )
-            if sz > 0:
-                c_memmove(
-                    rffi.cast(rffi.VOIDP, rffi.ptradd(file_buf, off)),
-                    rffi.cast(rffi.VOIDP, buf_ptr),
-                    rffi.cast(rffi.SIZE_T, sz),
-                )
-            i += 1
+        i += 1
 
-        # Phase 3: Single write syscall
-        fd = rposix.open(target_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    return file_buf, total_file_size
+
+
+def _xor8_after_write(pk_lo_ptr, pk_hi_ptr, count, dirfd, name):
+    """Build and save xor8 sidecar. dirfd+name locate the sidecar file."""
+    if count > 0:
+        from gnitz.storage.xor8 import build_xor8, save_xor8
+
+        xor8_filter = build_xor8(pk_lo_ptr, pk_hi_ptr, count)
+        if xor8_filter is not None:
+            save_xor8(xor8_filter, dirfd, name + ".xor8")
+            xor8_filter.free()
+
+
+def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr,
+                      pk_hi_ptr, durable=True):
+    """Write a shard file using absolute paths (compactor path)."""
+    file_buf, total_size = _build_shard_image(table_id, count, region_list)
+    try:
+        tmp = filename + ".tmp"
+        fd = rposix.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
             mmap_posix.write_all(
-                fd, file_buf, rffi.cast(rffi.SIZE_T, total_file_size)
+                fd, file_buf, rffi.cast(rffi.SIZE_T, total_size)
             )
         finally:
             rposix.close(fd)
     finally:
         lltype.free(file_buf, flavor="raw")
 
-    os.rename(target_filename, filename)
-    # fsync_dir skipped here: EphemeralTable needs none;
-    # PersistentTable.flush() does one dir fsync after all shard writes.
-
-    if count > 0:
-        from gnitz.storage.xor8 import build_xor8, save_xor8
-
-        xor8_filter = build_xor8(pk_lo_ptr, pk_hi_ptr, count)
-        if xor8_filter is not None:
-            save_xor8(xor8_filter, filename + ".xor8")
-            xor8_filter.free()
+    os.rename(tmp, filename)
+    _xor8_after_write(pk_lo_ptr, pk_hi_ptr, count, AT_FDCWD, filename)
 
 
-def write_batch_to_shard(batch, filename, table_id, durable=True):
-    """
-    Write a consolidated ArenaZSetBatch directly to a shard file.
-    Bypasses TableShardWriter — no intermediate buffer copy.
-    """
+def write_shard_at(dirfd, basename, table_id, count, region_list, pk_lo_ptr,
+                   pk_hi_ptr):
+    """Write a shard file using openat/renameat with a directory fd (flush path)."""
+    file_buf, total_size = _build_shard_image(table_id, count, region_list)
+    try:
+        tmp_name = basename + ".tmp"
+        fd = mmap_posix.openat_c(
+            dirfd, tmp_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644
+        )
+        try:
+            mmap_posix.write_all(
+                fd, file_buf, rffi.cast(rffi.SIZE_T, total_size)
+            )
+        finally:
+            rposix.close(fd)
+    finally:
+        lltype.free(file_buf, flavor="raw")
+
+    mmap_posix.renameat_c(dirfd, tmp_name, basename)
+    _xor8_after_write(pk_lo_ptr, pk_hi_ptr, count, dirfd, basename)
+
+
+def write_batch_to_shard(batch, dirfd, basename, table_id):
+    """Write a consolidated ArenaZSetBatch directly to a shard file.
+    Returns True if a file was written, False if the batch was empty."""
     count = batch.length()
     if count == 0:
-        return
+        return False
 
     schema = batch._schema
     num_cols = len(schema.columns)
@@ -406,8 +416,8 @@ def write_batch_to_shard(batch, filename, table_id, durable=True):
             regions.append((batch.col_bufs[ci].base_ptr, batch.col_bufs[ci].offset))
     regions.append((batch.blob_arena.base_ptr, batch.blob_arena.offset))
 
-    _write_shard_file(
-        filename, table_id, count, regions,
+    write_shard_at(
+        dirfd, basename, table_id, count, regions,
         batch.pk_lo_buf.base_ptr, batch.pk_hi_buf.base_ptr,
-        durable=durable,
     )
+    return True

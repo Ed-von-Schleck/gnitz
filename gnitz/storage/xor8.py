@@ -199,12 +199,14 @@ def build_xor8(pk_lo_ptr, pk_hi_ptr, num_keys):
             lltype.free(fingerprints, flavor="raw")
 
 
-def save_xor8(xor_filter, filepath):
+def save_xor8(xor_filter, dirfd, basename):
     """Write XOR8 filter to a sidecar file. Best-effort -- errors silently ignored."""
     try:
-        fd = rposix.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    except OSError:
-        log.warn("xor8: cannot create " + filepath)
+        fd = mmap_posix.openat_c(
+            dirfd, basename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644
+        )
+    except mmap_posix.MMapError:
+        log.warn("xor8: cannot create " + basename)
         return
     header = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
     seed = xor_filter._get_seed()
@@ -225,7 +227,7 @@ def save_xor8(xor_filter, filepath):
             rffi.cast(rffi.SIZE_T, xor_filter.total_size),
         )
     except mmap_posix.MMapError:
-        log.warn("xor8: write failed for " + filepath)
+        log.warn("xor8: write failed for " + basename)
     lltype.free(header, flavor="raw")
     rposix.close(fd)
 

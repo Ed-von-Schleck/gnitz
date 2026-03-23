@@ -31,7 +31,7 @@ eci = ExternalCompilationInfo(
         '#endif'
     ],
     includes=['sys/mman.h', 'unistd.h', 'sys/file.h', 'sys/stat.h',
-              'sys/resource.h']
+              'sys/resource.h', 'fcntl.h']
 )
 
 # ============================================================================
@@ -113,6 +113,32 @@ _read = rffi.llexternal(
     _nowrapper=True
 )
 
+_openat = rffi.llexternal(
+    "openat",
+    [rffi.INT, rffi.CCHARP, rffi.INT, rffi.INT],
+    rffi.INT,
+    compilation_info=eci,
+    _nowrapper=True,
+)
+
+_renameat = rffi.llexternal(
+    "renameat",
+    [rffi.INT, rffi.CCHARP, rffi.INT, rffi.CCHARP],
+    rffi.INT,
+    compilation_info=eci,
+    _nowrapper=True,
+)
+
+_unlinkat = rffi.llexternal(
+    "unlinkat",
+    [rffi.INT, rffi.CCHARP, rffi.INT],
+    rffi.INT,
+    compilation_info=eci,
+    _nowrapper=True,
+)
+
+AT_FDCWD = -100
+
 _rlimit_eci = ExternalCompilationInfo(
     pre_include_bits=[
         '#ifndef _GNU_SOURCE', '#define _GNU_SOURCE', '#endif',
@@ -188,6 +214,39 @@ def try_set_nocow_dir(path):
         return
     _try_set_nocow_c(rffi.cast(rffi.INT, fd))
     rposix.close(fd)
+
+
+@jit.dont_look_inside
+def openat_c(dirfd, path, flags, mode):
+    """openat(2) — resolve path relative to dirfd. Use AT_FDCWD for absolute paths."""
+    with rffi.scoped_str2charp(path) as p:
+        fd = rffi.cast(lltype.Signed, _openat(
+            rffi.cast(rffi.INT, dirfd), p,
+            rffi.cast(rffi.INT, flags), rffi.cast(rffi.INT, mode)))
+    if fd < 0:
+        raise MMapError()
+    return fd
+
+
+@jit.dont_look_inside
+def renameat_c(dirfd, old_name, new_name):
+    """renameat(2) — rename within the directory referenced by dirfd."""
+    with rffi.scoped_str2charp(old_name) as old_p:
+        with rffi.scoped_str2charp(new_name) as new_p:
+            res = _renameat(
+                rffi.cast(rffi.INT, dirfd), old_p,
+                rffi.cast(rffi.INT, dirfd), new_p)
+    if rffi.cast(lltype.Signed, res) < 0:
+        raise MMapError()
+
+
+@jit.dont_look_inside
+def unlinkat_c(dirfd, path):
+    """unlinkat(2) — unlink a file relative to dirfd."""
+    with rffi.scoped_str2charp(path) as p:
+        res = _unlinkat(rffi.cast(rffi.INT, dirfd), p, rffi.cast(rffi.INT, 0))
+    if rffi.cast(lltype.Signed, res) < 0:
+        raise MMapError()
 
 
 @jit.dont_look_inside

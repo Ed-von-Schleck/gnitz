@@ -408,7 +408,7 @@ def test_memtable(base_dir):
         mt2.upsert_batch(b_l1)
 
         shard_path = os.path.join(base_dir, "survivor.db")
-        mt2.flush(shard_path, 1)
+        mt2.flush(mmap_posix.AT_FDCWD, shard_path, 1)
 
         view = shard_table.TableShardView(shard_path, schema_str)
         assert_equal_i(1, view.count, "Annihilated row was flushed to shard")
@@ -901,6 +901,7 @@ def test_bloom_filter(base_dir):
 def test_xor8_filter(base_dir):
     os.write(1, "[Storage] Testing XOR8 Filter...\n")
     from gnitz.storage.xor8 import build_xor8, save_xor8, load_xor8
+    from gnitz.storage import mmap_posix
 
     num_keys = 200
     pk_lo_buf = lltype.malloc(rffi.CCHARP.TO, num_keys * 8, flavor="raw")
@@ -935,7 +936,7 @@ def test_xor8_filter(base_dir):
 
         # 3. Serde roundtrip
         xor_path = os.path.join(base_dir, "test.xor8")
-        save_xor8(xf, xor_path)
+        save_xor8(xf, mmap_posix.AT_FDCWD, xor_path)
         xf2 = load_xor8(xor_path)
         assert_true(xf2 is not None, "XOR8 load returned None")
 

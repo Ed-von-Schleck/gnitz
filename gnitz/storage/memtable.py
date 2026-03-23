@@ -152,11 +152,14 @@ class MemTable(object):
     def may_contain_pk(self, key_lo, key_hi):
         return self.bloom.may_contain(key_lo, key_hi)
 
-    def flush(self, filename, table_id=0, durable=True):
+    def flush(self, dirfd, basename, table_id=0):
         self._flush_accumulator()
         consolidated = _merge_runs_to_consolidated(self.runs, self.schema)
-        writer_table.write_batch_to_shard(consolidated, filename, table_id, durable=durable)
+        wrote = writer_table.write_batch_to_shard(
+            consolidated, dirfd, basename, table_id
+        )
         consolidated.free()
+        return wrote
 
     def is_empty(self):
         return self._total_row_count == 0

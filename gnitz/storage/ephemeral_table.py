@@ -82,6 +82,7 @@ class EphemeralTable(ZSetStore):
             if e.errno != errno.EEXIST:
                 raise
         mmap_posix.try_set_nocow_dir(directory)
+        self._dirfd = rposix.open(directory, os.O_RDONLY, 0)
 
         self._erase_stale_shards()
 
@@ -257,16 +258,15 @@ class EphemeralTable(ZSetStore):
         if self.is_closed:
             raise errors.StorageError("Table is closed")
 
-        # Avoid os.path.join (Appendix A §10)
         self._flush_seq += 1
         shard_name = EPH_SHARD_PREFIX + "%d_%d_%d.db" % (self.table_id, os.getpid(), self._flush_seq)
-        shard_path = self.directory + "/" + shard_name
 
-        self.memtable.flush(shard_path, self.table_id, durable=False)
+        wrote = self.memtable.flush(self._dirfd, shard_name, self.table_id)
 
-        if not os.path.exists(shard_path):
+        if not wrote:
             return ""
 
+        shard_path = self.directory + "/" + shard_name
         h = index.ShardHandle(
             shard_path,
             self.schema,
@@ -280,8 +280,8 @@ class EphemeralTable(ZSetStore):
         else:
             h.close()
             try:
-                os.unlink(shard_path)
-            except OSError:
+                mmap_posix.unlinkat_c(self._dirfd, shard_name)
+            except mmap_posix.MMapError:
                 pass
 
         max_bytes = self.memtable.max_bytes
@@ -297,6 +297,9 @@ class EphemeralTable(ZSetStore):
             self.memtable.free()
         if self.index:
             self.index.close_all()
+        if self._dirfd != -1:
+            rposix.close(self._dirfd)
+            self._dirfd = -1
         self.is_closed = True
 
     # -- Internal / Index Specific APIs ---------------------------------------

@@ -187,21 +187,20 @@ class PersistentTable(EphemeralTable):
         if mt.is_empty():
             return ""
 
-        # Avoid os.path.join (Appendix A §10)
         shard_name = "shard_%d_%d.db" % (self.table_id, intmask(self.current_lsn))
-        shard_path = self.directory + "/" + shard_name
 
         # 1. Physical: Build and sync the columnar file
-        self.memtable.flush(shard_path, self.table_id)
+        wrote = self.memtable.flush(self._dirfd, shard_name, self.table_id)
 
-        if not os.path.exists(shard_path):
+        if not wrote:
             return ""
 
+        shard_path = self.directory + "/" + shard_name
         lsn_max = self.current_lsn - r_uint64(1)
         h = index.ShardHandle(
             shard_path,
             self.schema,
-            r_uint64(0),  # We keep min_lsn=0 for base shards
+            r_uint64(0),
             lsn_max,
             validate_checksums=self.validate_checksums,
         )
@@ -218,16 +217,15 @@ class PersistentTable(EphemeralTable):
             # Ghost Shard cleanup
             h.close()
             try:
-                os.unlink(shard_path)
-            except OSError:
+                mmap_posix.unlinkat_c(self._dirfd, shard_name)
+            except mmap_posix.MMapError:
                 pass
             self.manifest_manager.publish_new_version(
                 self.index.get_metadata_list(), lsn_max
             )
 
-        # One dir fsync covers the shard rename + manifest update for this
-        # partition.  Replaces per-shard fsync_c + fsync_dir in _write_shard_file.
-        mmap_posix.fsync_dir(shard_path)
+        # One dir fsync via cached dirfd — no open/close needed.
+        mmap_posix.fsync_c(self._dirfd)
 
         # 4. Rotation: Swap MemTable
         max_bytes = self.memtable.max_bytes
