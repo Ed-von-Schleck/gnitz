@@ -1026,9 +1026,6 @@ def test_filter_integration(base_dir):
         tmp.free()
     sw.finalize(shard_path)
 
-    xor8_path = shard_path + ".xor8"
-    assert_true(os.path.exists(xor8_path), "XOR8 sidecar file not created")
-
     h = index.ShardHandle(
         shard_path, schema, r_uint64(0), r_uint64(0)
     )

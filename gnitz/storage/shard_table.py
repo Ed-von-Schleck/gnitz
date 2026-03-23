@@ -37,6 +37,7 @@ class TableShardView(object):
         "dir_checksums",
         "col_to_reg_map",
         "blob_reg_idx",
+        "xor8_filter",
     ]
 
     def __init__(self, filename, schema, validate_checksums=False):
@@ -136,6 +137,23 @@ class TableShardView(object):
                 # Initialize final region (Blob Heap)
                 self.blob_buf = self._init_region(reg_idx)
                 self.blob_reg_idx = reg_idx
+
+                # Parse embedded XOR8 filter from reserved header bytes
+                xor8_off = rffi.cast(
+                    lltype.Signed,
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, layout.OFF_XOR8_OFFSET))[0],
+                )
+                xor8_sz = rffi.cast(
+                    lltype.Signed,
+                    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, layout.OFF_XOR8_SIZE))[0],
+                )
+                if xor8_off > 0 and xor8_sz >= 16 and xor8_off + xor8_sz <= self.size:
+                    from gnitz.storage.xor8 import parse_xor8_from_ptr
+                    self.xor8_filter = parse_xor8_from_ptr(
+                        rffi.ptradd(ptr, xor8_off), xor8_sz
+                    )
+                else:
+                    self.xor8_filter = None
 
             except Exception:
                 mmap_posix.munmap_file(ptr, self.size)

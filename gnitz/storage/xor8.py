@@ -85,6 +85,24 @@ class Xor8Filter(object):
             self.fingerprints = lltype.nullptr(rffi.CCHARP.TO)
 
 
+def parse_xor8_from_ptr(ptr, block_size):
+    """Parse an XOR8 filter from a memory-mapped region. Non-owning."""
+    if block_size < 16:
+        return None
+    seed_val = r_uint64(rffi.cast(rffi.ULONGLONGP, ptr)[0])
+    segment_length = intmask(rffi.cast(rffi.UINTP, rffi.ptradd(ptr, 8))[0])
+    total_size = intmask(rffi.cast(rffi.UINTP, rffi.ptradd(ptr, 12))[0])
+    if total_size <= 0 or segment_length <= 0:
+        return None
+    if block_size < 16 + total_size:
+        return None
+    fingerprints = rffi.ptradd(ptr, 16)
+    return Xor8Filter(
+        fingerprints, segment_length, r_uint128(seed_val), total_size,
+        owned=False,
+    )
+
+
 def build_xor8(pk_lo_ptr, pk_hi_ptr, num_keys):
     if num_keys == 0:
         return None

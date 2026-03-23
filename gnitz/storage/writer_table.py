@@ -242,13 +242,17 @@ class TableShardWriter(object):
 
     def finalize(self, filename, durable=True):
         regions = _build_writer_regions(self)
+        xor8_filter = _build_xor8(
+            self.pk_lo_buf.base_ptr, self.pk_hi_buf.base_ptr, self.count
+        )
         try:
             _write_shard_file(
                 filename, self.table_id, self.count, regions,
-                self.pk_lo_buf.base_ptr, self.pk_hi_buf.base_ptr,
-                durable=durable,
+                xor8_filter, durable=durable,
             )
         finally:
+            if xor8_filter is not None:
+                xor8_filter.free()
             self.close()
 
 
@@ -273,8 +277,9 @@ def _build_writer_regions(writer):
     return regions
 
 
-def _build_shard_image(table_id, count, region_list):
+def _build_shard_image(table_id, count, region_list, xor8_filter):
     """Build the shard file image in a single contiguous buffer.
+    If xor8_filter is not None, embeds the filter data after the last region.
     Returns (file_buf, total_file_size). Caller must free file_buf."""
     num_regions = len(region_list)
     dir_size = num_regions * layout.DIR_ENTRY_SIZE
@@ -295,9 +300,19 @@ def _build_shard_image(table_id, count, region_list):
 
     if num_regions > 0:
         _, last_off, last_sz = final_regions[num_regions - 1]
-        total_file_size = last_off + last_sz
+        data_end = last_off + last_sz
     else:
-        total_file_size = layout.HEADER_SIZE
+        data_end = layout.HEADER_SIZE
+
+    # Compute xor8 footer position (after data regions, 64-byte aligned)
+    xor8_offset = 0
+    xor8_block_size = 0
+    if xor8_filter is not None:
+        xor8_offset = align_64(data_end)
+        xor8_block_size = 16 + xor8_filter.total_size
+        total_file_size = xor8_offset + xor8_block_size
+    else:
+        total_file_size = data_end
 
     file_buf = lltype.malloc(rffi.CCHARP.TO, total_file_size, flavor="raw")
     c_memset(
@@ -320,6 +335,16 @@ def _build_shard_image(table_id, count, region_list):
         rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_TABLE_ID)
     )[0] = rffi.cast(rffi.ULONGLONG, table_id)
 
+    # XOR8 location in header (0 = not present)
+    if xor8_filter is not None:
+        rffi.cast(
+            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_XOR8_OFFSET)
+        )[0] = rffi.cast(rffi.ULONGLONG, xor8_offset)
+        rffi.cast(
+            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_XOR8_SIZE)
+        )[0] = rffi.cast(rffi.ULONGLONG, xor8_block_size)
+
+    # Directory entries + region data
     i = 0
     while i < num_regions:
         buf_ptr, off, sz = final_regions[i]
@@ -340,24 +365,43 @@ def _build_shard_image(table_id, count, region_list):
             )
         i += 1
 
+    # XOR8 footer: [seed u64 | segment_length u32 | total_size u32 | fingerprints]
+    if xor8_filter is not None:
+        xor8_ptr = rffi.ptradd(file_buf, xor8_offset)
+        seed = xor8_filter._get_seed()
+        rffi.cast(rffi.ULONGLONGP, xor8_ptr)[0] = rffi.cast(
+            rffi.ULONGLONG, r_uint64(intmask(seed))
+        )
+        rffi.cast(rffi.UINTP, rffi.ptradd(xor8_ptr, 8))[0] = rffi.cast(
+            rffi.UINT, xor8_filter.segment_length
+        )
+        rffi.cast(rffi.UINTP, rffi.ptradd(xor8_ptr, 12))[0] = rffi.cast(
+            rffi.UINT, xor8_filter.total_size
+        )
+        if xor8_filter.total_size > 0:
+            c_memmove(
+                rffi.cast(rffi.VOIDP, rffi.ptradd(xor8_ptr, 16)),
+                rffi.cast(rffi.VOIDP, xor8_filter.fingerprints),
+                rffi.cast(rffi.SIZE_T, xor8_filter.total_size),
+            )
+
     return file_buf, total_file_size
 
 
-def _xor8_after_write(pk_lo_ptr, pk_hi_ptr, count, dirfd, name):
-    """Build and save xor8 sidecar. dirfd+name locate the sidecar file."""
-    if count > 0:
-        from gnitz.storage.xor8 import build_xor8, save_xor8
-
-        xor8_filter = build_xor8(pk_lo_ptr, pk_hi_ptr, count)
-        if xor8_filter is not None:
-            save_xor8(xor8_filter, dirfd, name + ".xor8")
-            xor8_filter.free()
+def _build_xor8(pk_lo_ptr, pk_hi_ptr, count):
+    """Build xor8 filter from PK pointers. Returns Xor8Filter or None."""
+    if count <= 0:
+        return None
+    from gnitz.storage.xor8 import build_xor8
+    return build_xor8(pk_lo_ptr, pk_hi_ptr, count)
 
 
-def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr,
-                      pk_hi_ptr, durable=True):
+def _write_shard_file(filename, table_id, count, region_list, xor8_filter,
+                      durable=True):
     """Write a shard file using absolute paths (compactor path)."""
-    file_buf, total_size = _build_shard_image(table_id, count, region_list)
+    file_buf, total_size = _build_shard_image(
+        table_id, count, region_list, xor8_filter
+    )
     try:
         tmp = filename + ".tmp"
         fd = rposix.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -371,13 +415,17 @@ def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr,
         lltype.free(file_buf, flavor="raw")
 
     os.rename(tmp, filename)
-    _xor8_after_write(pk_lo_ptr, pk_hi_ptr, count, AT_FDCWD, filename)
 
 
 def write_shard_at(dirfd, basename, table_id, count, region_list, pk_lo_ptr,
                    pk_hi_ptr):
     """Write a shard file using openat/renameat with a directory fd (flush path)."""
-    file_buf, total_size = _build_shard_image(table_id, count, region_list)
+    xor8_filter = _build_xor8(pk_lo_ptr, pk_hi_ptr, count)
+    file_buf, total_size = _build_shard_image(
+        table_id, count, region_list, xor8_filter
+    )
+    if xor8_filter is not None:
+        xor8_filter.free()
     try:
         tmp_name = basename + ".tmp"
         fd = mmap_posix.openat_c(
@@ -393,7 +441,6 @@ def write_shard_at(dirfd, basename, table_id, count, region_list, pk_lo_ptr,
         lltype.free(file_buf, flavor="raw")
 
     mmap_posix.renameat_c(dirfd, tmp_name, basename)
-    _xor8_after_write(pk_lo_ptr, pk_hi_ptr, count, dirfd, basename)
 
 
 def write_batch_to_shard(batch, dirfd, basename, table_id):
