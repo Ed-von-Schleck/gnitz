@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 use sqlparser::ast::{
     Expr, BinaryOperator, UnaryOperator, Value,
     FunctionArguments, FunctionArg, FunctionArgExpr,
@@ -51,7 +52,7 @@ pub fn resolve_unqualified_column(
 pub struct Binder<'a> {
     client:      &'a GnitzClient,
     schema_name: &'a str,
-    cache:       HashMap<String, (u64, Schema)>,
+    cache:       HashMap<String, (u64, Rc<Schema>)>,
     index_cache: HashMap<(u64, usize), Option<(u64, bool)>>,
 }
 
@@ -60,18 +61,19 @@ impl<'a> Binder<'a> {
         Binder { client, schema_name, cache: HashMap::new(), index_cache: HashMap::new() }
     }
 
-    pub fn resolve(&mut self, name: &str) -> Result<(u64, Schema), GnitzSqlError> {
+    pub fn resolve(&mut self, name: &str) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
         if let Some(entry) = self.cache.get(name) {
-            return Ok(entry.clone());
+            return Ok((entry.0, Rc::clone(&entry.1)));
         }
-        let result = self.client.resolve_table_or_view_id(self.schema_name, name)
+        let (tid, schema) = self.client.resolve_table_or_view_id(self.schema_name, name)
             .map_err(GnitzSqlError::Exec)?;
-        self.cache.insert(name.to_string(), result.clone());
-        Ok(result)
+        let rc = Rc::new(schema);
+        self.cache.insert(name.to_string(), (tid, Rc::clone(&rc)));
+        Ok((tid, rc))
     }
 
     /// Cache a CTE or alias name as resolving to the given (table_id, schema).
-    pub fn cache_alias(&mut self, name: String, resolved: (u64, Schema)) {
+    pub fn cache_alias(&mut self, name: String, resolved: (u64, Rc<Schema>)) {
         self.cache.insert(name, resolved);
     }
 

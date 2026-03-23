@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use gnitz_protocol::{Schema, ColumnDef, TypeCode};
 
 // Circuit system table IDs
@@ -63,18 +64,20 @@ pub const AGG_COUNT_NON_NULL: u64 = 5;
 
 // --- Schema constructor functions ---
 
-pub fn schema_tab_schema() -> Schema {
-    Schema {
+pub fn schema_tab_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "schema_id".into(), type_code: TypeCode::U64,    is_nullable: false },
             ColumnDef { name: "name".into(),      type_code: TypeCode::String, is_nullable: false },
         ],
         pk_index: 0,
-    }
+    })
 }
 
-pub fn table_tab_schema() -> Schema {
-    Schema {
+pub fn table_tab_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "table_id".into(),    type_code: TypeCode::U64,    is_nullable: false },
             ColumnDef { name: "schema_id".into(),   type_code: TypeCode::U64,    is_nullable: false },
@@ -85,11 +88,12 @@ pub fn table_tab_schema() -> Schema {
             ColumnDef { name: "flags".into(),       type_code: TypeCode::U64,    is_nullable: false },
         ],
         pk_index: 0,
-    }
+    })
 }
 
-pub fn col_tab_schema() -> Schema {
-    Schema {
+pub fn col_tab_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "column_id".into(),   type_code: TypeCode::U64,    is_nullable: false },
             ColumnDef { name: "owner_id".into(),    type_code: TypeCode::U64,    is_nullable: false },
@@ -102,11 +106,12 @@ pub fn col_tab_schema() -> Schema {
             ColumnDef { name: "fk_col_idx".into(),  type_code: TypeCode::U64,    is_nullable: false },
         ],
         pk_index: 0,
-    }
+    })
 }
 
-pub fn view_tab_schema() -> Schema {
-    Schema {
+pub fn view_tab_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "view_id".into(),          type_code: TypeCode::U64,    is_nullable: false },
             ColumnDef { name: "schema_id".into(),        type_code: TypeCode::U64,    is_nullable: false },
@@ -116,11 +121,12 @@ pub fn view_tab_schema() -> Schema {
             ColumnDef { name: "created_lsn".into(),      type_code: TypeCode::U64,    is_nullable: false },
         ],
         pk_index: 0,
-    }
+    })
 }
 
-pub fn dep_tab_schema() -> Schema {
-    Schema {
+pub fn dep_tab_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "dep_pk".into(),       type_code: TypeCode::U128, is_nullable: false },
             ColumnDef { name: "view_id".into(),      type_code: TypeCode::U64,  is_nullable: false },
@@ -128,21 +134,23 @@ pub fn dep_tab_schema() -> Schema {
             ColumnDef { name: "dep_table_id".into(), type_code: TypeCode::U64,  is_nullable: false },
         ],
         pk_index: 0,
-    }
+    })
 }
 
-pub fn circuit_nodes_schema() -> Schema {
-    Schema {
+pub fn circuit_nodes_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "node_pk".into(), type_code: TypeCode::U128, is_nullable: false },
             ColumnDef { name: "opcode".into(),  type_code: TypeCode::U64,  is_nullable: false },
         ],
         pk_index: 0,
-    }
+    })
 }
 
-pub fn circuit_edges_schema() -> Schema {
-    Schema {
+pub fn circuit_edges_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "edge_pk".into(),  type_code: TypeCode::U128, is_nullable: false },
             ColumnDef { name: "src_node".into(), type_code: TypeCode::U64,  is_nullable: false },
@@ -150,38 +158,41 @@ pub fn circuit_edges_schema() -> Schema {
             ColumnDef { name: "dst_port".into(), type_code: TypeCode::U64,  is_nullable: false },
         ],
         pk_index: 0,
-    }
+    })
 }
 
-pub fn circuit_sources_schema() -> Schema {
-    Schema {
+pub fn circuit_sources_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "source_pk".into(), type_code: TypeCode::U128, is_nullable: false },
             ColumnDef { name: "table_id".into(),  type_code: TypeCode::U64,  is_nullable: false },
         ],
         pk_index: 0,
-    }
+    })
 }
 
-pub fn circuit_params_schema() -> Schema {
-    Schema {
+pub fn circuit_params_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "param_pk".into(),  type_code: TypeCode::U128,   is_nullable: false },
             ColumnDef { name: "value".into(),     type_code: TypeCode::U64,    is_nullable: false },
             ColumnDef { name: "str_value".into(), type_code: TypeCode::String, is_nullable: true },
         ],
         pk_index: 0,
-    }
+    })
 }
 
-pub fn circuit_group_cols_schema() -> Schema {
-    Schema {
+pub fn circuit_group_cols_schema() -> &'static Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "gcol_pk".into(), type_code: TypeCode::U128, is_nullable: false },
             ColumnDef { name: "col_idx".into(), type_code: TypeCode::U64,  is_nullable: false },
         ],
         pk_index: 0,
-    }
+    })
 }
 
 // --- CircuitGraph ---

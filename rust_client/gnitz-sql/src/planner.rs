@@ -14,7 +14,7 @@ use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
 use crate::binder::{Binder, resolve_qualified_column, resolve_unqualified_column};
 use crate::types::sql_type_to_typecode;
 use crate::expr::compile_bound_expr;
-use crate::logical_plan::{BoundExpr, BinOp, UnaryOp, AggFunc};
+use crate::logical_plan::{BoundExpr, BinOp, AggFunc};
 use crate::dml;
 use crate::SqlResult;
 
@@ -145,6 +145,10 @@ fn execute_create_view(
     binder:      &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     let view_name = extract_name(view_name_obj, "CREATE VIEW")?;
+
+    if query.order_by.is_some() {
+        return Err(GnitzSqlError::Unsupported("ORDER BY not supported".to_string()));
+    }
 
     let sql_text = format!("{}", stmt);
 
@@ -337,39 +341,6 @@ fn is_pk_item(item: &ProjectionItem, schema: &Schema) -> bool {
     matches!(item, ProjectionItem::PassThrough { src_col } if *src_col == schema.pk_index)
 }
 
-fn infer_expr_type(expr: &BoundExpr, schema: &Schema) -> TypeCode {
-    match expr {
-        BoundExpr::ColRef(idx) => schema.columns[*idx].type_code,
-        BoundExpr::LitInt(_) => TypeCode::I64,
-        BoundExpr::LitFloat(_) => TypeCode::F64,
-        BoundExpr::LitStr(_) => TypeCode::String,
-        BoundExpr::BinOp(l, op, r) => {
-            let lt = infer_expr_type(l, schema);
-            let rt = infer_expr_type(r, schema);
-            match op {
-                BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Ge |
-                BinOp::Lt | BinOp::Le | BinOp::And | BinOp::Or => TypeCode::I64,
-                _ => if matches!(lt, TypeCode::F32 | TypeCode::F64)
-                     || matches!(rt, TypeCode::F32 | TypeCode::F64)
-                     { TypeCode::F64 } else { TypeCode::I64 },
-            }
-        }
-        BoundExpr::UnaryOp(UnaryOp::Neg, inner) => infer_expr_type(inner, schema),
-        BoundExpr::UnaryOp(UnaryOp::Not, _) => TypeCode::I64,
-        BoundExpr::IsNull(_) | BoundExpr::IsNotNull(_) => TypeCode::I64,
-        BoundExpr::AggCall { func, arg } => match func {
-            AggFunc::Avg => TypeCode::F64,
-            AggFunc::Min | AggFunc::Max => {
-                if let Some(inner) = arg {
-                    infer_expr_type(inner, schema)
-                } else {
-                    TypeCode::I64
-                }
-            }
-            _ => TypeCode::I64,
-        },
-    }
-}
 
 fn build_projection(
     projection:    &[SelectItem],
@@ -406,7 +377,7 @@ fn build_projection(
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 let bound = binder.bind_expr(expr, source_schema)?;
-                let out_type = infer_expr_type(&bound, source_schema);
+                let out_type = bound.infer_type(source_schema);
                 items.push(ProjectionItem::Computed { bound_expr: bound, _out_type: out_type });
                 out_cols.push(ColumnDef {
                     name: alias.value.clone(),
@@ -418,7 +389,7 @@ fn build_projection(
                 // Try as column reference first (already handled above for Identifier),
                 // otherwise treat as computed expression
                 let bound = binder.bind_expr(expr, source_schema)?;
-                let out_type = infer_expr_type(&bound, source_schema);
+                let out_type = bound.infer_type(source_schema);
                 let col_name = format!("_expr{}", idx);
                 items.push(ProjectionItem::Computed { bound_expr: bound, _out_type: out_type });
                 out_cols.push(ColumnDef {
@@ -523,8 +494,8 @@ fn execute_create_join_view(
 
     // Build alias map for qualified column resolution
     let mut alias_map: HashMap<String, (u64, Schema, usize)> = HashMap::new();
-    alias_map.insert(left_alias.to_lowercase(), (left_tid, left_schema.clone(), 0));
-    alias_map.insert(right_alias.to_lowercase(), (right_tid, right_schema.clone(), left_schema.columns.len()));
+    alias_map.insert(left_alias.to_lowercase(), (left_tid, (*left_schema).clone(), 0));
+    alias_map.insert(right_alias.to_lowercase(), (right_tid, (*right_schema).clone(), left_schema.columns.len()));
 
     // Extract equijoin keys
     let (left_join_col, right_join_col) = extract_equijoin_keys(

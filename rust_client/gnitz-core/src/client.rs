@@ -51,9 +51,11 @@ fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
     }
 }
 
-fn idx_tab_schema() -> Schema {
+fn idx_tab_schema() -> &'static Schema {
+    use std::sync::OnceLock;
     use gnitz_protocol::ColumnDef;
-    Schema {
+    static INSTANCE: OnceLock<Schema> = OnceLock::new();
+    INSTANCE.get_or_init(|| Schema {
         columns: vec![
             ColumnDef { name: "index_id".into(),       type_code: TypeCode::U64,    is_nullable: false },
             ColumnDef { name: "owner_id".into(),        type_code: TypeCode::U64,    is_nullable: false },
@@ -64,7 +66,7 @@ fn idx_tab_schema() -> Schema {
             ColumnDef { name: "cache_directory".into(), type_code: TypeCode::String, is_nullable: false },
         ],
         pk_index: 0,
-    }
+    })
 }
 
 fn copy_col_row(src: &ColData, row: usize, dst: &mut ColData, stride: usize) {
@@ -776,18 +778,18 @@ impl GnitzClient {
     }
 
     fn retract_circuit_graph(&self, vid: u64) -> Result<(), ClientError> {
-        let circuit_tables: &[(u64, fn() -> Schema)] = &[
-            (CIRCUIT_NODES_TAB,      circuit_nodes_schema      as fn() -> Schema),
-            (CIRCUIT_EDGES_TAB,      circuit_edges_schema      as fn() -> Schema),
-            (CIRCUIT_SOURCES_TAB,    circuit_sources_schema    as fn() -> Schema),
-            (CIRCUIT_PARAMS_TAB,     circuit_params_schema     as fn() -> Schema),
-            (CIRCUIT_GROUP_COLS_TAB, circuit_group_cols_schema as fn() -> Schema),
+        let circuit_tables: &[(u64, fn() -> &'static Schema)] = &[
+            (CIRCUIT_NODES_TAB,      circuit_nodes_schema      as fn() -> &'static Schema),
+            (CIRCUIT_EDGES_TAB,      circuit_edges_schema      as fn() -> &'static Schema),
+            (CIRCUIT_SOURCES_TAB,    circuit_sources_schema    as fn() -> &'static Schema),
+            (CIRCUIT_PARAMS_TAB,     circuit_params_schema     as fn() -> &'static Schema),
+            (CIRCUIT_GROUP_COLS_TAB, circuit_group_cols_schema as fn() -> &'static Schema),
         ];
         for &(tab_id, schema_fn) in circuit_tables {
             let schema = schema_fn();
             let (_, batch, _) = self.conn.scan(tab_id)?;
             if let Some(batch) = batch {
-                self.retract_records_for_view_u128(tab_id, &schema, &batch, vid)?;
+                self.retract_records_for_view_u128(tab_id, schema, &batch, vid)?;
             }
         }
         Ok(())

@@ -182,6 +182,9 @@ pub fn execute_select(
     query:        &Query,
     binder:       &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
+    if query.order_by.is_some() {
+        return Err(GnitzSqlError::Unsupported("ORDER BY not supported".to_string()));
+    }
     let limit = extract_limit(query);
 
     let select = match query.body.as_ref() {
@@ -222,7 +225,7 @@ pub fn execute_select(
     };
 
     // Use the resolved schema for column metadata
-    let actual_schema = schema_out.unwrap_or(schema);
+    let actual_schema = schema_out.unwrap_or_else(|| (*schema).clone());
 
     // Apply projection
     let (proj_schema, proj_batch) = apply_projection(
