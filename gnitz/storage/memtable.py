@@ -164,6 +164,14 @@ class MemTable(object):
     def is_empty(self):
         return self._total_row_count == 0
 
+    def reset(self):
+        """Reset for reuse after flush. Frees run data, keeps accumulator and bloom buffers."""
+        for r in self.runs:
+            r.free()
+        self.runs = newlist_hint(8)
+        self._total_row_count = 0
+        self.bloom.reset()
+
     def free(self):
         for r in self.runs:
             r.free()

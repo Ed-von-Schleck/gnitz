@@ -284,9 +284,7 @@ class EphemeralTable(ZSetStore):
             except mmap_posix.MMapError:
                 pass
 
-        max_bytes = self.memtable.max_bytes
-        self.memtable.free()
-        self.memtable = memtable.MemTable(self.schema, max_bytes)
+        self.memtable.reset()
 
         return shard_path
 

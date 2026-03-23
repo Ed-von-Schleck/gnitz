@@ -5,6 +5,7 @@ from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib import jit
 
 from gnitz.core import xxh
+from gnitz.storage.buffer import c_memset
 
 
 BITS_PER_KEY = 10
@@ -75,6 +76,14 @@ class BloomFilter(object):
             i += 1
             
         return True
+
+    def reset(self):
+        """Zero all bits without reallocating."""
+        c_memset(
+            rffi.cast(rffi.VOIDP, self.bits),
+            rffi.cast(rffi.INT, 0),
+            rffi.cast(rffi.SIZE_T, self.num_bytes),
+        )
 
     def free(self):
         if self.bits:

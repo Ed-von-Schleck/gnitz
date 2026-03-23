@@ -227,10 +227,8 @@ class PersistentTable(EphemeralTable):
         # One dir fsync via cached dirfd — no open/close needed.
         mmap_posix.fsync_c(self._dirfd)
 
-        # 4. Rotation: Swap MemTable
-        max_bytes = self.memtable.max_bytes
-        self.memtable.free()
-        self.memtable = memtable.MemTable(self.schema, max_bytes)
+        # 4. Rotation: reset MemTable (keeps accumulator + bloom buffers)
+        self.memtable.reset()
 
         # Bump generation to notify UnifiedCursors that sources have changed
         self._cursor_generation += 1
