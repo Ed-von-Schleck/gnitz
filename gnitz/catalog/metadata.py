@@ -11,6 +11,7 @@ from gnitz.core.types import ColumnDefinition, TYPE_U64, TYPE_STRING, TYPE_U128
 from gnitz.core.errors import LayoutError
 from gnitz.core.batch import ArenaZSetBatch
 from gnitz.storage.table import PersistentTable
+from gnitz.storage import mmap_posix
 from gnitz.catalog import system_tables as sys
 
 # -----------------------------------------------------------------------------
@@ -90,6 +91,7 @@ def ensure_dir(path):
     except OSError as e:
         if e.errno != errno.EEXIST:
             raise e
+    mmap_posix.try_set_nocow_dir(path)
 
 
 def read_column_defs(cols_pt, owner_id):

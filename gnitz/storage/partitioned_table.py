@@ -16,6 +16,7 @@ from gnitz.core.store import AbstractCursor
 from gnitz.storage.cursor import UnifiedCursor
 from gnitz.storage.table import PersistentTable
 from gnitz.storage.ephemeral_table import EphemeralTable
+from gnitz.storage import mmap_posix
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID
 
 NUM_PARTITIONS = 256
@@ -266,6 +267,7 @@ def _ensure_dir(path):
     except OSError as e:
         if e.errno != errno.EEXIST:
             raise
+    mmap_posix.try_set_nocow_dir(path)
 
 
 def make_partitioned_persistent(directory, name, schema, table_id, num_partitions,

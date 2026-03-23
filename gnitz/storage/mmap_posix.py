@@ -140,6 +140,30 @@ _raise_fd_limit_c = rffi.llexternal(
     _nowrapper=True,
 )
 
+_nocow_eci = ExternalCompilationInfo(
+    pre_include_bits=[
+        '#ifndef _GNU_SOURCE', '#define _GNU_SOURCE', '#endif',
+        'int gnitz_storage_try_set_nocow(int fd);',
+    ],
+    includes=['sys/ioctl.h', 'linux/fs.h'],
+    separate_module_sources=["""
+int gnitz_storage_try_set_nocow(int fd) {
+    int flags = 0;
+    if (ioctl(fd, FS_IOC_GETFLAGS, &flags) < 0) return -1;
+    flags |= FS_NOCOW_FL;
+    return ioctl(fd, FS_IOC_SETFLAGS, &flags);
+}
+"""],
+)
+
+_try_set_nocow_c = rffi.llexternal(
+    "gnitz_storage_try_set_nocow",
+    [rffi.INT],
+    rffi.INT,
+    compilation_info=_nocow_eci,
+    _nowrapper=True,
+)
+
 # ============================================================================
 # Public High-Level Wrappers
 # ============================================================================
@@ -152,6 +176,18 @@ def raise_fd_limit(target):
     """Raise RLIMIT_NOFILE soft limit to target (capped by hard limit).
     Returns the new soft limit, or -1 on failure."""
     return intmask(_raise_fd_limit_c(rffi.cast(rffi.LONG, target)))
+
+
+@jit.dont_look_inside
+def try_set_nocow_dir(path):
+    """Set FS_NOCOW_FL on a directory so new files inherit NOCOW.
+    Silently ignored on non-btrfs filesystems."""
+    try:
+        fd = rposix.open(path, os.O_RDONLY, 0)
+    except OSError:
+        return
+    _try_set_nocow_c(rffi.cast(rffi.INT, fd))
+    rposix.close(fd)
 
 
 @jit.dont_look_inside

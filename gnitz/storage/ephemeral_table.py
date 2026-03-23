@@ -21,6 +21,7 @@ from gnitz.storage import (
     index,
     flsm,
     memtable,
+    mmap_posix,
     refcount,
     comparator as storage_comparator,
     cursor,
@@ -80,6 +81,7 @@ class EphemeralTable(ZSetStore):
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
+        mmap_posix.try_set_nocow_dir(directory)
 
         self._erase_stale_shards()
 
