@@ -9,7 +9,7 @@ from rpython.rlib.longlong2float import float2longlong
 from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import errors
 from gnitz.storage import layout, mmap_posix, buffer
-from gnitz.storage.buffer import align_64
+from gnitz.storage.buffer import align_64, c_memmove, c_memset
 from gnitz.core import (
     types,
     strings as string_logic,
@@ -291,110 +291,97 @@ def _write_shard_file(filename, table_id, count, region_list, pk_lo_ptr, pk_hi_p
     """
     num_regions = len(region_list)
     target_filename = filename + ".tmp"
-    fd = rposix.open(target_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+
+    # Phase 1: Compute layout (no I/O, no allocation)
+    dir_size = num_regions * layout.DIR_ENTRY_SIZE
+    dir_offset = layout.HEADER_SIZE
+    current_pos = align_64(dir_offset + dir_size)
+
+    dummy_final = (lltype.nullptr(rffi.CCHARP.TO), 0, 0)
+    final_regions = newlist_hint(num_regions)
+    for _ in range(num_regions):
+        final_regions.append(dummy_final)
+
+    i = 0
+    while i < num_regions:
+        buf_ptr, sz = region_list[i]
+        final_regions[i] = (buf_ptr, current_pos, sz)
+        current_pos = align_64(current_pos + sz)
+        i += 1
+
+    if num_regions > 0:
+        _, last_off, last_sz = final_regions[num_regions - 1]
+        total_file_size = last_off + last_sz
+    else:
+        total_file_size = layout.HEADER_SIZE
+
+    # Phase 2: Build file image in a single contiguous buffer
+    file_buf = lltype.malloc(rffi.CCHARP.TO, total_file_size, flavor="raw")
     try:
-        dir_size = num_regions * layout.DIR_ENTRY_SIZE
-        dir_offset = layout.HEADER_SIZE
-        current_pos = align_64(dir_offset + dir_size)
+        c_memset(
+            rffi.cast(rffi.VOIDP, file_buf),
+            rffi.cast(rffi.INT, 0),
+            rffi.cast(rffi.SIZE_T, total_file_size),
+        )
 
-        # Compute file offsets for each region
-        dummy_final = (lltype.nullptr(rffi.CCHARP.TO), 0, 0)
-        final_regions = newlist_hint(num_regions)
-        for _ in range(num_regions):
-            final_regions.append(dummy_final)
+        # Header
+        rffi.cast(rffi.ULONGLONGP, file_buf)[0] = layout.MAGIC_NUMBER
+        rffi.cast(
+            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_VERSION)
+        )[0] = rffi.cast(rffi.ULONGLONG, layout.VERSION)
+        rffi.cast(
+            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_ROW_COUNT)
+        )[0] = rffi.cast(rffi.ULONGLONG, count)
+        rffi.cast(
+            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_DIR_OFFSET)
+        )[0] = rffi.cast(rffi.ULONGLONG, dir_offset)
+        rffi.cast(
+            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_TABLE_ID)
+        )[0] = rffi.cast(rffi.ULONGLONG, table_id)
 
-        i = 0
-        while i < num_regions:
-            buf_ptr, sz = region_list[i]
-            final_regions[i] = (buf_ptr, current_pos, sz)
-            current_pos = align_64(current_pos + sz)
-            i += 1
-
-        # 1. Write Header
-        header = lltype.malloc(rffi.CCHARP.TO, layout.HEADER_SIZE, flavor="raw")
-        try:
-            i = 0
-            while i < layout.HEADER_SIZE:
-                header[i] = "\x00"
-                i += 1
-            rffi.cast(rffi.ULONGLONGP, header)[0] = layout.MAGIC_NUMBER
-            rffi.cast(
-                rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_VERSION)
-            )[0] = rffi.cast(rffi.ULONGLONG, layout.VERSION)
-            rffi.cast(
-                rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_ROW_COUNT)
-            )[0] = rffi.cast(rffi.ULONGLONG, count)
-            rffi.cast(
-                rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_DIR_OFFSET)
-            )[0] = rffi.cast(rffi.ULONGLONG, dir_offset)
-            rffi.cast(
-                rffi.ULONGLONGP, rffi.ptradd(header, layout.OFF_TABLE_ID)
-            )[0] = rffi.cast(rffi.ULONGLONG, table_id)
-            mmap_posix.write_all(
-                fd, header, rffi.cast(rffi.SIZE_T, layout.HEADER_SIZE)
-            )
-        finally:
-            lltype.free(header, flavor="raw")
-
-        # 2. Write Directory
-        dir_size_bytes = dir_size
-        dir_buf = lltype.malloc(rffi.CCHARP.TO, dir_size_bytes, flavor="raw")
-        try:
-            i = 0
-            while i < num_regions:
-                buf_ptr, off, sz = final_regions[i]
-                cs = checksum.compute_checksum(buf_ptr, sz)
-                base = rffi.ptradd(dir_buf, i * layout.DIR_ENTRY_SIZE)
-                rffi.cast(rffi.ULONGLONGP, base)[0] = rffi.cast(rffi.ULONGLONG, off)
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0] = rffi.cast(
-                    rffi.ULONGLONG, sz
-                )
-                rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0] = rffi.cast(
-                    rffi.ULONGLONG, cs
-                )
-                i += 1
-            mmap_posix.write_all(fd, dir_buf, rffi.cast(rffi.SIZE_T, dir_size_bytes))
-        finally:
-            lltype.free(dir_buf, flavor="raw")
-
-        # 3. Write Padded Regions
-        last_written_pos = dir_offset + dir_size
+        # Directory entries + region data in one pass
         i = 0
         while i < num_regions:
             buf_ptr, off, sz = final_regions[i]
-            padding = off - last_written_pos
-            if padding > 0:
-                pad_buf = lltype.malloc(rffi.CCHARP.TO, padding, flavor="raw")
-                try:
-                    j = 0
-                    while j < padding:
-                        pad_buf[j] = "\x00"
-                        j += 1
-                    mmap_posix.write_all(fd, pad_buf, rffi.cast(rffi.SIZE_T, padding))
-                finally:
-                    lltype.free(pad_buf, flavor="raw")
+            cs = checksum.compute_checksum(buf_ptr, sz)
+            base = rffi.ptradd(file_buf, dir_offset + i * layout.DIR_ENTRY_SIZE)
+            rffi.cast(rffi.ULONGLONGP, base)[0] = rffi.cast(rffi.ULONGLONG, off)
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0] = rffi.cast(
+                rffi.ULONGLONG, sz
+            )
+            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0] = rffi.cast(
+                rffi.ULONGLONG, cs
+            )
             if sz > 0:
-                mmap_posix.write_all(fd, buf_ptr, rffi.cast(rffi.SIZE_T, sz))
-            last_written_pos = off + sz
+                c_memmove(
+                    rffi.cast(rffi.VOIDP, rffi.ptradd(file_buf, off)),
+                    rffi.cast(rffi.VOIDP, buf_ptr),
+                    rffi.cast(rffi.SIZE_T, sz),
+                )
             i += 1
 
-        xor8_filter = None
-        if count > 0:
-            from gnitz.storage.xor8 import build_xor8
-
-            xor8_filter = build_xor8(pk_lo_ptr, pk_hi_ptr, count)
+        # Phase 3: Single write syscall
+        fd = rposix.open(target_filename, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            mmap_posix.write_all(
+                fd, file_buf, rffi.cast(rffi.SIZE_T, total_file_size)
+            )
+        finally:
+            rposix.close(fd)
     finally:
-        rposix.close(fd)
+        lltype.free(file_buf, flavor="raw")
 
     os.rename(target_filename, filename)
     # fsync_dir skipped here: EphemeralTable needs none;
     # PersistentTable.flush() does one dir fsync after all shard writes.
 
-    if xor8_filter is not None:
-        from gnitz.storage.xor8 import save_xor8
+    if count > 0:
+        from gnitz.storage.xor8 import build_xor8, save_xor8
 
-        save_xor8(xor8_filter, filename + ".xor8")
-        xor8_filter.free()
+        xor8_filter = build_xor8(pk_lo_ptr, pk_hi_ptr, count)
+        if xor8_filter is not None:
+            save_xor8(xor8_filter, filename + ".xor8")
+            xor8_filter.free()
 
 
 def write_batch_to_shard(batch, filename, table_id, durable=True):
