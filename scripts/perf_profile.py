@@ -817,10 +817,10 @@ def main() -> None:
                          "adds ~20%% overhead).")
     ap.add_argument("--workers",  type=int, default=4,
                     help="Number of server worker processes (default: 4).")
-    ap.add_argument("--ticks",    type=int, default=10,
-                    help="Number of push ticks (default: 10).  Use 20+ for more stable samples.")
-    ap.add_argument("--rows",     type=int, default=50_000,
-                    help="Rows per tick (default: 50,000).")
+    ap.add_argument("--ticks",    type=int, default=2,
+                    help="Number of push ticks (default: 2).  Use 10+ for more stable samples.")
+    ap.add_argument("--rows",     type=int, default=10_000,
+                    help="Rows per tick (default: 10,000).")
     ap.add_argument("--percent-limit", type=float, default=0.2, dest="percent_limit",
                     help="Minimum %% to include in flat profile (default: 0.2).")
     ap.add_argument("--events",   default="cycles",

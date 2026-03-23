@@ -443,6 +443,7 @@ def load_history() -> list[dict]:
 
 WORKLOAD_REALISTIC_SCRIPT = r"""
 import sys, os, time, json, random, multiprocessing
+multiprocessing.set_start_method('fork')
 
 sock_path     = sys.argv[1]
 ticks         = int(sys.argv[2])

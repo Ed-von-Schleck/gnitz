@@ -257,7 +257,7 @@ def _partition_arena_size(num_partitions):
     if num_partitions <= 1:
         return 1 * 1024 * 1024  # 1MB for single partition
     # 64KB per partition (256 * 64KB = 16MB total)
-    return 64 * 1024
+    return 256 * 1024
 
 
 def _ensure_dir(path):

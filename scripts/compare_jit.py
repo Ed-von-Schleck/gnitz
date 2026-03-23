@@ -323,10 +323,10 @@ def main() -> None:
                     help="Rebuild only the non-JIT binary (make release-server-nojit).")
     ap.add_argument("--workers",  type=int, default=4,
                     help="Worker processes (default: 4).")
-    ap.add_argument("--ticks",    type=int, default=10,
-                    help="Push ticks per run (default: 10).")
-    ap.add_argument("--rows",     type=int, default=50_000,
-                    help="Rows per tick (default: 50,000).")
+    ap.add_argument("--ticks",    type=int, default=2,
+                    help="Push ticks per run (default: 2).")
+    ap.add_argument("--rows",     type=int, default=10_000,
+                    help="Rows per tick (default: 10,000).")
     ap.add_argument("--runs",     type=int, default=1,
                     help="Runs per binary; median is used (default: 1).  Use 3+ for stability.")
     ap.add_argument("--realistic", action="store_true",

@@ -283,7 +283,7 @@ class ServerExecutor(object):
         self._tick_tids    = newlist_hint(8)  # [int] table_ids with pending ticks
         self._tick_schemas = {}               # tid -> schema
         self._tick_rows    = {}               # tid -> int (rows accumulated since last tick)
-        self._t_first_tick = 0.0             # wall-clock time of oldest pending tick
+        self._t_last_push = 0.0             # wall-clock time of most recent buffered push
 
         # LSN tracking
         self._ingest_lsn        = 0  # global monotonic counter; increments per flush batch
@@ -357,8 +357,8 @@ class ServerExecutor(object):
                     return
 
             timeout_ms = 500
-            if len(self._tick_tids) > 0 and self._t_first_tick > 0.0:
-                elapsed_ms = int((time.time() - self._t_first_tick) * 1000.0)
+            if len(self._tick_tids) > 0 and self._t_last_push > 0.0:
+                elapsed_ms = int((time.time() - self._t_last_push) * 1000.0)
                 remaining = TICK_DEADLINE_MS - elapsed_ms
                 if remaining < timeout_ms:
                     timeout_ms = remaining if remaining > 0 else 0
@@ -888,8 +888,7 @@ class ServerExecutor(object):
                     self._tick_tids.append(target_id)
                     self._tick_schemas[target_id] = schema
                     self._tick_rows[target_id] = 0
-                    if self._t_first_tick == 0.0:
-                        self._t_first_tick = time.time()
+                self._t_last_push = time.time()
                 self._tick_rows[target_id] = self._tick_rows[target_id] + n_rows
             else:
                 current_lsn = 0
@@ -918,8 +917,8 @@ class ServerExecutor(object):
             if self._tick_rows[tid] >= TICK_COALESCE_ROWS:
                 self._fire_pending_ticks()
                 return
-        if self._t_first_tick > 0.0:
-            elapsed_ms = int((time.time() - self._t_first_tick) * 1000.0)
+        if self._t_last_push > 0.0:
+            elapsed_ms = int((time.time() - self._t_last_push) * 1000.0)
             if elapsed_ms >= TICK_DEADLINE_MS:
                 self._fire_pending_ticks()
 
@@ -941,7 +940,7 @@ class ServerExecutor(object):
             except errors.GnitzError as ge:
                 log.warn("fan_out_tick error tid=%d: %s" % (tid, ge.msg))
         self._last_tick_lsn = self._ingest_lsn
-        self._t_first_tick = 0.0
+        self._t_last_push = 0.0
 
     def _evaluate_dag(self, initial_source_id, initial_delta):
         evaluate_dag(self.engine, initial_source_id, initial_delta)
