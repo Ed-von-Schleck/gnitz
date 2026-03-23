@@ -160,7 +160,7 @@ pub struct PyRow {
 impl PyRow {
     #[new]
     #[pyo3(signature = (fields, values, weight=1))]
-    pub fn new(py: Python<'_>, fields: Bound<'_, PyTuple>, values: Bound<'_, PyTuple>, weight: i64) -> PyResult<Self> {
+    pub fn new(_py: Python<'_>, fields: Bound<'_, PyTuple>, values: Bound<'_, PyTuple>, weight: i64) -> PyResult<Self> {
         let mut map = HashMap::with_capacity(fields.len());
         for i in 0..fields.len() {
             let name: String = fields.get_item(i)?.extract()?;

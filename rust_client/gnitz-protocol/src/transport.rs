@@ -6,40 +6,11 @@ fn io_err() -> ProtocolError {
     ProtocolError::IoError(std::io::Error::last_os_error())
 }
 
-/// Send all bytes, retrying on EINTR and handling partial writes.
-fn send_all(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
-    let mut sent = 0usize;
-    while sent < data.len() {
-        // SAFETY: sock_fd validity is the caller's invariant; pointer/len come from
-        // a valid &[u8] sub-slice so they are always in-bounds and aligned.
-        let n = unsafe {
-            libc::send(
-                sock_fd,
-                data[sent..].as_ptr() as *const libc::c_void,
-                data.len() - sent,
-                libc::MSG_NOSIGNAL,
-            )
-        };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
-            return Err(ProtocolError::IoError(e));
-        }
-        if n == 0 {
-            return Err(ProtocolError::IoError(
-                std::io::Error::new(std::io::ErrorKind::WriteZero, "send returned 0"),
-            ));
-        }
-        sent += n as usize;
-    }
-    Ok(())
-}
-
 /// Read exactly `buf.len()` bytes, retrying on EINTR and handling partial reads.
 fn recv_exact(sock_fd: RawFd, buf: &mut [u8]) -> Result<(), ProtocolError> {
     let mut got = 0usize;
     while got < buf.len() {
-        // SAFETY: same as send_all — pointer/len from a valid &mut [u8] sub-slice.
+        // SAFETY: pointer/len come from a valid &mut [u8] sub-slice.
         let n = unsafe {
             libc::recv(
                 sock_fd,
