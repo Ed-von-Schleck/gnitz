@@ -67,10 +67,11 @@ class ColumnarBatchAccessor(core_comparator.RowAccessor):
     Implements the full RowAccessor interface.
     """
 
-    _immutable_fields_ = ["_schema"]
+    _immutable_fields_ = ["_schema", "_has_nullable"]
 
     def __init__(self, schema):
         self._schema = schema
+        self._has_nullable = schema.has_nullable
         self._batch = None
         self._row_idx = 0
 
@@ -88,6 +89,8 @@ class ColumnarBatchAccessor(core_comparator.RowAccessor):
     def is_null(self, col_idx):
         if col_idx == self._schema.pk_index:
             return False  # PKs are never null
+        if not self._has_nullable:
+            return False
         batch = self._batch
         assert batch is not None
         payload_idx = self._payload_idx(col_idx)

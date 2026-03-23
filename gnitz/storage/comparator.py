@@ -14,6 +14,8 @@ class SoAAccessor(RowAccessor):
     Accesses data from a column-oriented (SoA) Table Shard View in raw memory.
     """
 
+    _immutable_fields_ = ["schema"]
+
     def __init__(self, schema):
         self.schema = schema
         self.view = None
@@ -25,7 +27,7 @@ class SoAAccessor(RowAccessor):
         self.row_idx = row_idx
 
     def is_null(self, col_idx):
-        schema = self.view.schema
+        schema = self.schema
         if col_idx == schema.pk_index:
             return False
         if not schema.has_nullable:

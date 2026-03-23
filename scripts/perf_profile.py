@@ -247,6 +247,8 @@ CATEGORIES: list[tuple[str, str, bool, list[tuple[str, str]]]] = [
         (r"_int_free|cfree@|free@|malloc_consolidate"
          r"|unlink_chunk|_int_free_(create|merge)_chunk", "glibc heap free"),
         (r"ArenaCollection_malloc",                   "RPython arena allocator"),
+        (r"ArenaZSetBatch___init__",                  "batch arena allocation"),
+        (r"MemTable___init__",                        "memtable allocation on flush"),
     ]),
     ("gc", "GC overhead", False, [
         (r"IncrementalMiniMarkGC",                    "RPython incremental GC"),
@@ -255,12 +257,15 @@ CATEGORIES: list[tuple[str, str, bool, list[tuple[str, str]]]] = [
     ]),
     ("io", "Disk I/O", False, [
         (r"_write_shard_file",                        "shard WAL write"),
+        (r"_build_shard_image",                       "shard image serialization before write"),
+        (r"_copy_and_record",                         "record copy during shard write"),
         (r"publish_new_version",                      "manifest flush to disk"),
         (r"ShardHandle___init__",                     "shard file open"),
         (r"TableShardView___init__",                  "shard view construction"),
         (r"open__str",                                "file open syscall wrapper"),
         (r"fsync|__syscall_cancel",                   "blocking kernel I/O syscall"),
         (r"EphemeralTable__scan_shards",              "shard scan during pk lookup"),
+        (r"FLSMIndex_run_compact",                    "FLSM compaction run"),
     ]),
     ("sort", "Sort / argsort", False, [
         (r"_mergesort_i64",                           "merge sort of I64 column"),
@@ -272,12 +277,13 @@ CATEGORIES: list[tuple[str, str, bool, list[tuple[str, str]]]] = [
     ("hash", "Hashing", False, [
         (r"XXH3|xxhash",                              "XXH3 content hash for group keys"),
         (r"_get_h0_h1_h2",                            "XOR-8 filter hash expansion"),
+        (r"build_xor8",                               "XOR-8 filter construction on shard flush"),
         (r"BloomFilter",                              "bloom filter probe"),
     ]),
     ("accessor", "Column accessors", False, [
         (r"_read_col_int\b",                          "direct column int read"),
-        (r"ColumnarBatchAccessor_get_int",            "columnar accessor (virtual dispatch)"),
-        (r"SoAAccessor_get_int",                      "SoA accessor (virtual dispatch)"),
+        (r"ColumnarBatchAccessor",                    "columnar accessor (virtual dispatch)"),
+        (r"SoAAccessor",                              "SoA accessor (virtual dispatch)"),
         (r"ll_call_lookup_function",                  "RPython virtual dispatch trampoline"),
     ]),
     ("operators", "DBSP operators", False, [
@@ -294,6 +300,14 @@ CATEGORIES: list[tuple[str, str, bool, list[tuple[str, str]]]] = [
         (r"PartitionedTable_ingest_batch",            "partition scatter loop"),
         (r"TableShard.*(?:add|upsert)|upsert_batch",  "shard-level ingest"),
         (r"MemTable.*(?:upsert|flush)",               "memtable upsert / flush"),
+        (r"MemTable__total_bytes",                    "memtable size check (flush decision, per-row)"),
+    ]),
+    ("scan", "Scan / merge", False, [
+        (r"TournamentTree__compare_nodes",            "tournament tree node comparison"),
+        (r"TournamentTree__sift_down",                "tournament tree heapify"),
+        (r"TournamentTree_advance_cursor",            "tournament tree cursor advance"),
+        (r"SortedBatchCursor|ShardCursor",             "sorted shard / shard cursor"),
+        (r"EphemeralTable__build_cursor",             "ephemeral table cursor construction"),
     ]),
 ]
 
@@ -407,6 +421,28 @@ GUIDANCE: dict[str, dict] = {
                 "    If XXH3 ≥2%: verify that the hash is only computed once per delta row\n"
                 "    (not re-hashed during lookup).  Consider caching the hash alongside pk.\n"
                 "    File: gnitz/dbsp/ops/reduce.py, gnitz/storage/bloom.py, gnitz/storage/xor8.py"
+            ),
+        },
+    },
+    "scan": {
+        "threshold": 3.0,
+        "targets": {
+            r"TournamentTree": (
+                "TournamentTree drives every multi-shard view scan.  High % here means\n"
+                "    the scan is bottlenecked on comparison/heapify, not I/O.\n"
+                "    Fix 1: If compare_nodes ≥1%: pass a concrete batch type into the\n"
+                "            comparator so RPython can inline the column read (avoids\n"
+                "            virtual dispatch inside the tight comparison loop).\n"
+                "    Fix 2: If sift_down ≥1%: ensure the tournament-tree arity matches\n"
+                "            the typical shard fan-in; too large an arity amplifies sift_down cost.\n"
+                "    File: gnitz/dbsp/tournament.py  (TournamentTree)\n"
+                "          gnitz/storage/flsm.py     (scan path that builds the tree)"
+            ),
+            r"SortedBatchCursor|EphemeralTable__build_cursor": (
+                "Cursor construction or column-read overhead on the shard scan path.\n"
+                "    Fix: cache cursor objects across ticks instead of rebuilding per scan.\n"
+                "    File: gnitz/storage/flsm.py  (SortedBatchCursor)\n"
+                "          gnitz/storage/ephemeral_table.py  (EphemeralTable)"
             ),
         },
     },
