@@ -44,6 +44,17 @@ class MasterDispatcher(object):
         self.w2m_efds = w2m_efds           # list[int] — worker→master eventfds
         self._checkpoint_threshold = (sal.mmap_size * 3) >> 2  # 75%
 
+        # Async tick state (non-blocking tick processing)
+        self._async_remaining = 0
+        self._async_collected = [False] * num_workers
+        self._async_w2m_rcs = [ipc.W2M_HEADER_SIZE] * num_workers
+        self._async_exchange_payloads = {}     # vid -> [IPCPayload|None] * N
+        self._async_exchange_counts = {}       # vid -> int
+        self._async_exchange_schemas = {}      # vid -> Schema
+        self._async_exchange_source_ids = {}   # vid -> int
+        self._async_schema = None              # Schema for current tick
+        self._async_active = False
+
     # -----------------------------------------------------------------------
     # Core send/receive helpers
     # -----------------------------------------------------------------------
@@ -316,6 +327,100 @@ class MasterDispatcher(object):
         self._send_to_workers(target_id, ipc.FLAG_TICK, worker_batches, schema)
         self._collect_acks_and_relay(schema)
         log.debug("fan_out_tick tid=" + str(target_id))
+
+    # -----------------------------------------------------------------------
+    # Async (non-blocking) tick API
+    # -----------------------------------------------------------------------
+
+    def start_tick_async(self, target_id, schema):
+        """Write FLAG_TICK to SAL, signal workers, init async tracking state.
+
+        Does NOT block.  Caller must poll poll_tick_progress() until True.
+        """
+        self._maybe_checkpoint()
+        worker_batches = [None] * self.num_workers
+        self._send_to_workers(target_id, ipc.FLAG_TICK, worker_batches, schema)
+
+        self._async_remaining = self.num_workers
+        for w in range(self.num_workers):
+            self._async_collected[w] = False
+            self._async_w2m_rcs[w] = ipc.W2M_HEADER_SIZE
+        self._async_exchange_payloads.clear()
+        self._async_exchange_counts.clear()
+        self._async_exchange_schemas.clear()
+        self._async_exchange_source_ids.clear()
+        self._async_schema = schema
+        self._async_active = True
+
+    def poll_tick_progress(self):
+        """Non-blocking progress check for an async tick.
+
+        Returns True when the tick is complete (all workers sent final ACK).
+        Handles exchange relay inline when all workers have reported for a
+        given view_id.  Raises StorageError on worker error.
+        """
+        if not self._async_active:
+            return True
+
+        # Non-blocking: timeout=0
+        eventfd_ffi.eventfd_wait_any(self.w2m_efds, 0)
+
+        for w in range(self.num_workers):
+            if self._async_collected[w]:
+                continue
+            wc = self.w2m_regions[w].get_write_cursor()
+            while self._async_w2m_rcs[w] < wc:
+                payload, self._async_w2m_rcs[w] = ipc.read_from_w2m(
+                    self.w2m_regions[w], self._async_w2m_rcs[w])
+                if payload.flags & ipc.FLAG_EXCHANGE:
+                    vid = intmask(payload.target_id)
+                    ex_source_id = intmask(payload.seek_pk_lo)
+                    if vid not in self._async_exchange_payloads:
+                        self._async_exchange_payloads[vid] = (
+                            [None] * self.num_workers)
+                        self._async_exchange_counts[vid] = 0
+                    self._async_exchange_payloads[vid][w] = payload
+                    if payload.schema is not None:
+                        self._async_exchange_schemas[vid] = payload.schema
+                    if ex_source_id > 0:
+                        self._async_exchange_source_ids[vid] = ex_source_id
+                    self._async_exchange_counts[vid] += 1
+                    if self._async_exchange_counts[vid] == self.num_workers:
+                        ex_schema = self._async_exchange_schemas.get(
+                            vid, self._async_schema)
+                        src_id = self._async_exchange_source_ids.get(vid, 0)
+                        self._relay_exchange(
+                            vid, self._async_exchange_payloads[vid],
+                            ex_schema, src_id)
+                        del self._async_exchange_payloads[vid]
+                        del self._async_exchange_counts[vid]
+                        if vid in self._async_exchange_schemas:
+                            del self._async_exchange_schemas[vid]
+                        if vid in self._async_exchange_source_ids:
+                            del self._async_exchange_source_ids[vid]
+                    break  # re-check write_cursor after relay
+                else:
+                    if payload.status != 0:
+                        self._finish_async_tick()
+                        raise errors.StorageError(
+                            "Worker %d error: %s"
+                            % (w, payload.error_msg))
+                    self._async_collected[w] = True
+                    self._async_remaining -= 1
+                    break
+
+        if self._async_remaining == 0:
+            self._finish_async_tick()
+            return True
+        return False
+
+    def _finish_async_tick(self):
+        """Clean up async tick state.  Resets W2M cursors."""
+        self._reset_w2m_cursors()
+        self._async_active = False
+        self._async_schema = None
+
+    # -----------------------------------------------------------------------
 
     def fan_out_push(self, target_id, batch, schema):
         """Split batch by worker partition, send sub-batches, collect ACKs.

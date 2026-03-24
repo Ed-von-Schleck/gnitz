@@ -48,6 +48,24 @@ TICK_DEADLINE_MS    = 20      # max ms to wait before firing regardless
 STATUS_OK = 0
 STATUS_ERROR = 1
 
+# Tick state machine
+_TICK_IDLE = 0
+_TICK_ACTIVE = 1
+
+
+class DeferredRequest(object):
+    """A scan/seek request deferred while an async tick is in-flight."""
+
+    def __init__(self, fd, client_id, target_id, flags,
+                 seek_pk_lo, seek_pk_hi, seek_col_idx):
+        self.fd = fd
+        self.client_id = client_id
+        self.target_id = target_id
+        self.flags = flags
+        self.seek_pk_lo = seek_pk_lo
+        self.seek_pk_hi = seek_pk_hi
+        self.seek_col_idx = seek_col_idx
+
 
 def _sort_pending_by_tid(fds, cids, tids, batches, schemas):
     """Insertion sort parallel lists by target_id. RPython-safe."""
@@ -293,6 +311,12 @@ class ServerExecutor(object):
         # Transport handle (set by run_socket_server)
         self._transport = lltype.nullptr(rffi.VOIDP.TO)
 
+        # Non-blocking tick state machine
+        self._tick_state = _TICK_IDLE
+        self._tick_queue_tids = newlist_hint(8)
+        self._tick_queue_schemas = {}             # tid -> Schema
+        self._deferred_requests = newlist_hint(8) # [DeferredRequest]
+
     def run_socket_server(self, socket_path):
         server_fd = ipc_ffi.server_create(socket_path)
         if server_fd < 0:
@@ -336,13 +360,16 @@ class ServerExecutor(object):
                         self.dispatcher.shutdown_workers()
                         return
 
-                timeout_ms = 500
-                if len(self._tick_tids) > 0 and self._t_last_push > 0.0:
-                    elapsed_ms = int(
-                        (time.time() - self._t_last_push) * 1000.0)
-                    remaining = TICK_DEADLINE_MS - elapsed_ms
-                    if remaining < timeout_ms:
-                        timeout_ms = remaining if remaining > 0 else 0
+                if self._tick_state == _TICK_ACTIVE:
+                    timeout_ms = 0  # stay responsive during async tick
+                else:
+                    timeout_ms = 500
+                    if len(self._tick_tids) > 0 and self._t_last_push > 0.0:
+                        elapsed_ms = int(
+                            (time.time() - self._t_last_push) * 1000.0)
+                        remaining = TICK_DEADLINE_MS - elapsed_ms
+                        if remaining < timeout_ms:
+                            timeout_ms = remaining if remaining > 0 else 0
 
                 n = rust_ffi.poll(
                     transport, timeout_ms,
@@ -356,24 +383,29 @@ class ServerExecutor(object):
                         self._dispatch_message(
                             transport, fd, ptr, length, pending)
                         if pending.row_count >= MAX_PENDING_ROWS:
-                            self._flush_pending_pushes(
-                                transport, pending.fds, pending.cids,
-                                pending.tids, pending.batches,
-                                pending.schemas,
-                            )
-                            pending.clear()
+                            if self._tick_state != _TICK_ACTIVE:
+                                self._flush_pending_pushes(
+                                    transport, pending.fds, pending.cids,
+                                    pending.tids, pending.batches,
+                                    pending.schemas,
+                                )
+                                pending.clear()
                     finally:
                         rust_ffi.free_recv(transport, ptr)
 
                 if not pending.is_empty():
-                    self._flush_pending_pushes(
-                        transport, pending.fds, pending.cids,
-                        pending.tids, pending.batches,
-                        pending.schemas,
-                    )
-                    pending.clear()
+                    if self._tick_state != _TICK_ACTIVE:
+                        self._flush_pending_pushes(
+                            transport, pending.fds, pending.cids,
+                            pending.tids, pending.batches,
+                            pending.schemas,
+                        )
+                        pending.clear()
 
-                self._check_and_fire_pending_ticks()
+                if self._tick_state == _TICK_ACTIVE:
+                    self._poll_tick_active(transport, pending)
+                else:
+                    self._check_and_fire_pending_ticks_async()
         finally:
             lltype.free(out_fds, flavor='raw')
             lltype.free(out_ptrs, flavor='raw')
@@ -432,6 +464,32 @@ class ServerExecutor(object):
                     sys.SEQ_ID_INDICES, new_id - 1, new_id)
                 self._send_response(
                     transport, fd, new_id, None, STATUS_OK, "", client_id)
+                return
+
+        # During TICK_ACTIVE, defer reads that need consistent view state
+        if self._tick_state == _TICK_ACTIVE:
+            if payload.flags & ipc.FLAG_SEEK_BY_INDEX:
+                self._deferred_requests.append(DeferredRequest(
+                    fd, client_id, target_id,
+                    intmask(payload.flags),
+                    intmask(payload.seek_pk_lo),
+                    intmask(payload.seek_pk_hi),
+                    intmask(payload.seek_col_idx)))
+                return
+            if payload.flags & ipc.FLAG_SEEK:
+                self._deferred_requests.append(DeferredRequest(
+                    fd, client_id, target_id,
+                    intmask(payload.flags),
+                    intmask(payload.seek_pk_lo),
+                    intmask(payload.seek_pk_hi), 0))
+                return
+            # Scans (empty-batch push to user table with dispatcher)
+            if (self.dispatcher is not None
+                    and target_id >= sys.FIRST_USER_TABLE_ID
+                    and (payload.batch is None
+                         or payload.batch.length() == 0)):
+                self._deferred_requests.append(DeferredRequest(
+                    fd, client_id, target_id, 0, 0, 0, 0))
                 return
 
         # Index seek — flush pushes for this table + fire ticks
@@ -795,3 +853,169 @@ class ServerExecutor(object):
 
     def _evaluate_dag(self, initial_source_id, initial_delta):
         evaluate_dag(self.engine, initial_source_id, initial_delta)
+
+    # -- Non-blocking tick state machine ------------------------------------
+
+    def _check_and_fire_pending_ticks_async(self):
+        """Check tick deadline/threshold; transition to TICK_ACTIVE if ready.
+
+        Falls through to the synchronous path in single-process mode.
+        """
+        if self.dispatcher is None:
+            self._check_and_fire_pending_ticks()
+            return
+        if len(self._tick_tids) == 0:
+            return
+        should_fire = False
+        for tid in self._tick_tids:
+            if self._tick_rows[tid] >= TICK_COALESCE_ROWS:
+                should_fire = True
+                break
+        if not should_fire and self._t_last_push > 0.0:
+            elapsed_ms = int((time.time() - self._t_last_push) * 1000.0)
+            if elapsed_ms >= TICK_DEADLINE_MS:
+                should_fire = True
+        if not should_fire:
+            return
+
+        # Move pending ticks to the async queue
+        self._tick_queue_tids = self._tick_tids
+        self._tick_queue_schemas = self._tick_schemas
+        self._tick_tids = newlist_hint(8)
+        self._tick_schemas = {}
+        self._tick_rows.clear()
+        self._t_last_push = 0.0
+
+        self._start_next_async_tick()
+
+    def _start_next_async_tick(self):
+        """Pop the next queued tid and start its async tick."""
+        if len(self._tick_queue_tids) == 0:
+            return
+        tid = self._tick_queue_tids[0]
+        del self._tick_queue_tids[0]
+        schema = self._tick_queue_schemas.get(tid, None)
+        if tid in self._tick_queue_schemas:
+            del self._tick_queue_schemas[tid]
+
+        if schema is None or not self.engine.registry.has_id(tid):
+            # Table dropped or schema missing; skip to next
+            if len(self._tick_queue_tids) > 0:
+                self._start_next_async_tick()
+            return
+
+        self._tick_state = _TICK_ACTIVE
+        try:
+            self.dispatcher.start_tick_async(tid, schema)
+        except errors.GnitzError as ge:
+            log.warn("start_tick_async error tid=%d: %s" % (tid, ge.msg))
+            self._tick_state = _TICK_IDLE
+            if len(self._tick_queue_tids) > 0:
+                self._start_next_async_tick()
+
+    def _poll_tick_active(self, transport, pending):
+        """Non-blocking progress on the current async tick."""
+        try:
+            done = self.dispatcher.poll_tick_progress()
+        except errors.GnitzError as ge:
+            log.warn("poll_tick_progress error: %s" % ge.msg)
+            done = True
+
+        if not done:
+            return
+
+        log.debug("async tick complete")
+        self._last_tick_lsn = self._ingest_lsn
+
+        # More tids queued?
+        if len(self._tick_queue_tids) > 0:
+            self._start_next_async_tick()
+            return
+
+        # All ticks complete — transition to IDLE
+        self._tick_state = _TICK_IDLE
+
+        # Flush pushes accumulated during the tick
+        if not pending.is_empty():
+            self._flush_pending_pushes(
+                transport, pending.fds, pending.cids,
+                pending.tids, pending.batches,
+                pending.schemas,
+            )
+            pending.clear()
+
+        # Process deferred scan/seek requests
+        self._process_deferred_requests(transport)
+
+    def _process_deferred_requests(self, transport):
+        """Replay scan/seek requests that were deferred during TICK_ACTIVE."""
+        deferred = self._deferred_requests
+        self._deferred_requests = newlist_hint(8)
+
+        for i in range(len(deferred)):
+            req = deferred[i]
+            try:
+                if req.flags & ipc.FLAG_SEEK_BY_INDEX:
+                    schema = self.engine.registry.get_by_id(
+                        req.target_id).schema
+                    if (self.dispatcher is not None
+                            and req.target_id >= sys.FIRST_USER_TABLE_ID):
+                        result = self.dispatcher.fan_out_seek_by_index(
+                            req.target_id, req.seek_col_idx,
+                            req.seek_pk_lo, req.seek_pk_hi, schema)
+                    else:
+                        result = self._seek_by_index(
+                            req.target_id, req.seek_col_idx,
+                            req.seek_pk_lo, req.seek_pk_hi)
+                    resp_schema = (result._schema
+                                   if result is not None else schema)
+                    self._send_response(
+                        transport, req.fd, req.target_id, result,
+                        STATUS_OK, "", req.client_id, schema=resp_schema)
+                    if result is not None:
+                        result.free()
+                elif req.flags & ipc.FLAG_SEEK:
+                    schema = self.engine.registry.get_by_id(
+                        req.target_id).schema
+                    if (self.dispatcher is not None
+                            and req.target_id >= sys.FIRST_USER_TABLE_ID):
+                        result = self.dispatcher.fan_out_seek(
+                            req.target_id, req.seek_pk_lo,
+                            req.seek_pk_hi, schema)
+                    else:
+                        result = self._seek_family(
+                            req.target_id, req.seek_pk_lo, req.seek_pk_hi)
+                    resp_schema = (result._schema
+                                   if result is not None else schema)
+                    self._send_response(
+                        transport, req.fd, req.target_id, result,
+                        STATUS_OK, "", req.client_id, schema=resp_schema)
+                    if result is not None:
+                        result.free()
+                else:
+                    # Deferred scan (empty-batch push)
+                    self._last_response_lsn = self._last_tick_lsn
+                    schema = self.engine.registry.get_by_id(
+                        req.target_id).schema
+                    if self.dispatcher is not None:
+                        result = self.dispatcher.fan_out_scan(
+                            req.target_id, schema)
+                    else:
+                        result = self._scan_family(req.target_id)
+                    resp_schema = (result._schema
+                                   if result is not None else schema)
+                    self._send_response(
+                        transport, req.fd, req.target_id, result,
+                        STATUS_OK, "", req.client_id, schema=resp_schema,
+                        seek_pk_lo=self._last_response_lsn)
+                    if result is not None:
+                        result.free()
+            except errors.GnitzError as ge:
+                try:
+                    self._send_error_response(
+                        transport, req.fd, ge.msg,
+                        target_id=req.target_id, client_id=req.client_id)
+                except errors.GnitzError:
+                    rust_ffi.close_fd(transport, req.fd)
+            except Exception:
+                rust_ffi.close_fd(transport, req.fd)
