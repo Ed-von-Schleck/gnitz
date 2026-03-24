@@ -46,7 +46,7 @@ ALL_DATA_DIRS := storage_test_data dbsp_test_data \
 
 LOG_DIR := .test_logs
 
-.PHONY: all test clean server pytest pytest-only e2e e2e-release prove release-server release-server-nojit release-test $(RUN_TARGETS)
+.PHONY: all test clean rust-transport server pytest pytest-only e2e e2e-release prove release-server release-server-nojit release-test $(RUN_TARGETS)
 
 all: test
 
@@ -142,7 +142,11 @@ clean:
 	@rm -rf $(ALL_DATA_DIRS)
 	@rm -rf $(LOG_DIR)
 
-server:
+rust-transport:
+	cd rust_client && cargo build --release -p gnitz-transport
+
+server: rust-transport
+	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/release \
 	$(RPYTHON) $(RPYFLAGS) --output=gnitz-server-c gnitz/server/main.py
 
 pytest: server
@@ -162,10 +166,12 @@ e2e-release: gnitz-server-release-c
 prove:
 	$(MAKE) -C proofs prove
 
-release-server:
+release-server: rust-transport
+	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/release \
 	CFLAGS="$(RELEASE_CFLAGS)" $(RPYTHON) $(RPYFLAGS_RELEASE) --output=gnitz-server-release-c gnitz/server/main.py
 
-release-server-nojit:
+release-server-nojit: rust-transport
+	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/release \
 	CFLAGS="$(RELEASE_CFLAGS)" $(RPYTHON) $(RPYFLAGS_NOJIT) --output=gnitz-server-nojit-c gnitz/server/main.py
 
 release-test:

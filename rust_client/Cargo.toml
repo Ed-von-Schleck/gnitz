@@ -6,4 +6,5 @@ members = [
     "gnitz-sql",
     "gnitz-capi",
     "gnitz-py",
+    "gnitz-transport",
 ]
