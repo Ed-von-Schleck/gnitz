@@ -309,7 +309,7 @@ def _build_shard_image(table_id, count, region_list, xor8_filter):
     xor8_block_size = 0
     if xor8_filter is not None:
         xor8_offset = align_64(data_end)
-        xor8_block_size = 16 + xor8_filter.total_size
+        xor8_block_size = xor8_filter.serialized_size()
         total_file_size = xor8_offset + xor8_block_size
     else:
         total_file_size = data_end
@@ -365,25 +365,10 @@ def _build_shard_image(table_id, count, region_list, xor8_filter):
             )
         i += 1
 
-    # XOR8 footer: [seed u64 | segment_length u32 | total_size u32 | fingerprints]
+    # XOR8 footer: serialized by Rust via engine_ffi
     if xor8_filter is not None:
         xor8_ptr = rffi.ptradd(file_buf, xor8_offset)
-        seed = xor8_filter._get_seed()
-        rffi.cast(rffi.ULONGLONGP, xor8_ptr)[0] = rffi.cast(
-            rffi.ULONGLONG, r_uint64(intmask(seed))
-        )
-        rffi.cast(rffi.UINTP, rffi.ptradd(xor8_ptr, 8))[0] = rffi.cast(
-            rffi.UINT, xor8_filter.segment_length
-        )
-        rffi.cast(rffi.UINTP, rffi.ptradd(xor8_ptr, 12))[0] = rffi.cast(
-            rffi.UINT, xor8_filter.total_size
-        )
-        if xor8_filter.total_size > 0:
-            c_memmove(
-                rffi.cast(rffi.VOIDP, rffi.ptradd(xor8_ptr, 16)),
-                rffi.cast(rffi.VOIDP, xor8_filter.fingerprints),
-                rffi.cast(rffi.SIZE_T, xor8_filter.total_size),
-            )
+        xor8_filter.serialize_into(xor8_ptr, xor8_block_size)
 
     return file_buf, total_file_size
 

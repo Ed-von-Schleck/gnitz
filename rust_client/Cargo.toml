@@ -7,4 +7,5 @@ members = [
     "gnitz-capi",
     "gnitz-py",
     "gnitz-transport",
+    "gnitz-engine",
 ]

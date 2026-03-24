@@ -46,7 +46,7 @@ ALL_DATA_DIRS := storage_test_data dbsp_test_data \
 
 LOG_DIR := .test_logs
 
-.PHONY: all test clean rust-transport-debug rust-transport-release server pytest pytest-only e2e e2e-release prove release-server release-server-nojit release-test $(RUN_TARGETS)
+.PHONY: all test clean rust-transport-debug rust-transport-release rust-engine-debug rust-engine-release rust-engine-test server pytest pytest-only e2e e2e-release prove release-server release-server-nojit release-test $(RUN_TARGETS)
 
 all: test
 
@@ -64,7 +64,7 @@ all: test
 # platform.compile() step is not safe for concurrent calls on a cold cache.
 # ---------------------------------------------------------------------------
 
-test:
+test: | rust-engine-debug
 	@mkdir -p $(LOG_DIR)
 	@$(MAKE) --no-print-directory -k $(RUN_TARGETS); \
 	 EXIT=$$?; \
@@ -117,7 +117,7 @@ $(RUN_TARGETS): run-%-c: rpython_tests/%.py
 	@rm -rf $(DATA_DIR_$*-c)
 	@( \
 	  echo "=== Compiling: $< ===" && \
-	  $(RPYTHON) $(RPYFLAGS) $< && \
+	  GNITZ_ENGINE_LIB=$(PWD)/rust_client/target/debug $(RPYTHON) $(RPYFLAGS) $< && \
 	  echo "=== Running: $*-c ===" && \
 	  ./$*-c && \
 	  echo "=== PASSED: $*-c ===" \
@@ -148,8 +148,18 @@ rust-transport-debug:
 rust-transport-release:
 	cd rust_client && cargo build --release -p gnitz-transport
 
-server: rust-transport-debug
+rust-engine-debug:
+	cd rust_client && cargo build -p gnitz-engine
+
+rust-engine-release:
+	cd rust_client && cargo build --release -p gnitz-engine
+
+rust-engine-test:
+	cd rust_client && cargo test -p gnitz-engine
+
+server: rust-transport-debug rust-engine-debug
 	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/debug \
+	GNITZ_ENGINE_LIB=$(PWD)/rust_client/target/debug \
 	$(RPYTHON) $(RPYFLAGS) --output=gnitz-server-c gnitz/server/main.py
 
 pytest: server
@@ -169,12 +179,14 @@ e2e-release: gnitz-server-release-c
 prove:
 	$(MAKE) -C proofs prove
 
-release-server: rust-transport-release
+release-server: rust-transport-release rust-engine-release
 	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/release \
+	GNITZ_ENGINE_LIB=$(PWD)/rust_client/target/release \
 	CFLAGS="$(RELEASE_CFLAGS)" $(RPYTHON) $(RPYFLAGS_RELEASE) --output=gnitz-server-release-c gnitz/server/main.py
 
-release-server-nojit: rust-transport-release
+release-server-nojit: rust-transport-release rust-engine-release
 	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/release \
+	GNITZ_ENGINE_LIB=$(PWD)/rust_client/target/release \
 	CFLAGS="$(RELEASE_CFLAGS)" $(RPYTHON) $(RPYFLAGS_NOJIT) --output=gnitz-server-nojit-c gnitz/server/main.py
 
 release-test:
