@@ -7,7 +7,6 @@ from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import errors
 from gnitz.storage import shard_table
 from gnitz.storage.metadata import ManifestEntry
-from gnitz.storage import manifest
 
 
 class ShardHandle(object):
