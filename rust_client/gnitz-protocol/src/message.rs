@@ -6,7 +6,7 @@ use crate::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_D
 use crate::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, meta_schema};
 use crate::codec::{schema_to_batch, batch_to_schema};
 use crate::wal_block::{encode_wal_block, decode_wal_block, IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
-use crate::transport::{send_framed_iov, recv_framed};
+use crate::transport::{send_framed, recv_framed};
 
 pub struct Message {
     pub status:       u32,
@@ -168,8 +168,10 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String), ProtocolErr
     Ok((header, error_msg))
 }
 
-pub fn send_message(
-    sock_fd:      RawFd,
+/// Encode a request/response into wire bytes (without the 4-byte frame header).
+/// The returned `Vec<u8>` contains concatenated WAL blocks: control + optional
+/// schema + optional data.  Pass to `send_framed()` to add framing and send.
+pub fn encode_message(
     target_id:    u64,
     client_id:    u64,
     flags:        u64,
@@ -178,7 +180,7 @@ pub fn send_message(
     seek_col_idx: u64,
     schema:       Option<&Schema>,
     data_batch:   Option<&ZSetBatch>,
-) -> Result<(), ProtocolError> {
+) -> Result<Vec<u8>, ProtocolError> {
     let has_data   = data_batch.map(|b| !b.is_empty()).unwrap_or(false);
     let has_schema = has_data || schema.is_some();
 
@@ -206,20 +208,34 @@ pub fn send_message(
         None
     };
 
-    let mut bufs: Vec<&[u8]> = Vec::with_capacity(3);
-    bufs.push(&ctrl_block);
-    if let Some(ref sb) = schema_block { bufs.push(sb); }
-    if let Some(ref db) = data_block { bufs.push(db); }
-
-    send_framed_iov(sock_fd, &bufs)
+    let mut out = ctrl_block;
+    if let Some(sb) = schema_block { out.extend_from_slice(&sb); }
+    if let Some(db) = data_block { out.extend_from_slice(&db); }
+    Ok(out)
 }
 
-pub fn recv_message(
-    sock_fd:     RawFd,
-    data_schema: Option<&Schema>,
-) -> Result<Message, ProtocolError> {
-    let buf = recv_framed(sock_fd)?;
+pub fn send_message(
+    sock_fd:      RawFd,
+    target_id:    u64,
+    client_id:    u64,
+    flags:        u64,
+    seek_pk_lo:   u64,
+    seek_pk_hi:   u64,
+    seek_col_idx: u64,
+    schema:       Option<&Schema>,
+    data_batch:   Option<&ZSetBatch>,
+) -> Result<(), ProtocolError> {
+    let payload = encode_message(
+        target_id, client_id, flags,
+        seek_pk_lo, seek_pk_hi, seek_col_idx,
+        schema, data_batch,
+    )?;
+    send_framed(sock_fd, &payload)
+}
 
+/// Parse a wire payload (without 4-byte frame header) into a `Message`.
+/// The payload is what `recv_framed()` returns.
+pub fn parse_response(buf: &[u8]) -> Result<Message, ProtocolError> {
     if buf.len() < WAL_BLOCK_HEADER_SIZE {
         return Err(ProtocolError::DecodeError("message too small".into()));
     }
@@ -261,7 +277,7 @@ pub fn recv_message(
     }
 
     let data_batch = if has_data {
-        let eff = wire_schema.as_ref().or(data_schema)
+        let eff = wire_schema.as_ref()
             .ok_or_else(|| ProtocolError::DecodeError("no schema for data block".into()))?;
         if off + WAL_BLOCK_HEADER_SIZE > buf.len() {
             return Err(ProtocolError::DecodeError("data block header truncated".into()));
@@ -295,6 +311,18 @@ pub fn recv_message(
         data_batch,
         error_text,
     })
+}
+
+pub fn recv_message(
+    sock_fd:     RawFd,
+    data_schema: Option<&Schema>,
+) -> Result<Message, ProtocolError> {
+    let buf = recv_framed(sock_fd)?;
+    // data_schema fallback: only needed when server sends data without schema.
+    // The server always sends FLAG_HAS_SCHEMA with FLAG_HAS_DATA, so
+    // parse_response() works without it.  Keep the parameter for API compat.
+    let _ = data_schema;
+    parse_response(&buf)
 }
 
 #[cfg(test)]
@@ -529,5 +557,81 @@ mod tests {
         assert_eq!(msg.status, STATUS_ERROR);
         assert!(msg.error_text.is_some());
         unsafe { libc::close(a); libc::close(b); }
+    }
+
+    // ── encode_message + parse_response roundtrips (no sockets) ─────────
+
+    #[test]
+    fn test_encode_parse_control_only() {
+        let payload = encode_message(
+            0xDEAD, 0xBEEF, FLAG_PUSH,
+            42, 99, 7,
+            None, None,
+        ).unwrap();
+        let msg = parse_response(&payload).unwrap();
+        assert_eq!(msg.target_id, 0xDEAD);
+        assert_eq!(msg.client_id, 0xBEEF);
+        assert_eq!(msg.seek_pk_lo, 42);
+        assert_eq!(msg.seek_pk_hi, 99);
+        assert_eq!(msg.seek_col_idx, 7);
+        assert!(msg.schema.is_none());
+        assert!(msg.data_batch.is_none());
+    }
+
+    #[test]
+    fn test_encode_parse_with_data() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+            ],
+            pk_index: 0,
+        };
+
+        let mut val_bytes = Vec::new();
+        for &v in &[100i64, 200, 300] {
+            val_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let batch = ZSetBatch {
+            pk_lo:   vec![1, 2, 3],
+            pk_hi:   vec![0, 0, 0],
+            weights: vec![1, 1, 1],
+            nulls:   vec![0, 0, 0],
+            columns: vec![
+                ColData::Fixed(vec![]),
+                ColData::Fixed(val_bytes),
+            ],
+        };
+
+        let payload = encode_message(
+            42, 1, 0, 0, 0, 0,
+            Some(&schema), Some(&batch),
+        ).unwrap();
+        let msg = parse_response(&payload).unwrap();
+        assert_eq!(msg.target_id, 42);
+        assert!(msg.schema.is_some());
+        let data = msg.data_batch.unwrap();
+        assert_eq!(data.pk_lo, vec![1, 2, 3]);
+        assert_eq!(data.weights, vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn test_encode_parse_empty_batch() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
+            ],
+            pk_index: 0,
+        };
+        let empty = ZSetBatch::new(&schema);
+
+        let payload = encode_message(
+            10, 1, 0, 0, 0, 0,
+            Some(&schema), Some(&empty),
+        ).unwrap();
+        let msg = parse_response(&payload).unwrap();
+        // Schema sent, but no data (empty batch)
+        assert!(msg.schema.is_some());
+        assert!(msg.data_batch.is_none());
     }
 }

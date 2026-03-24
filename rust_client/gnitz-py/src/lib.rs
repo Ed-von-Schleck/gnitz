@@ -1402,6 +1402,292 @@ impl PyCircuitGraph {
 }
 
 // ---------------------------------------------------------------------------
+// Shared DML encode helpers — single source of truth for argument mapping.
+// Both PyGnitzClient (sync, via send_message) and PyAsyncTransport (async)
+// use encode_message() with these same patterns.
+// ---------------------------------------------------------------------------
+
+fn encode_push_payload(
+    client_id: u64, target_id: u64, schema: &Schema, batch: &ZSetBatch,
+) -> Result<Vec<u8>, gnitz_protocol::ProtocolError> {
+    gnitz_protocol::encode_message(target_id, client_id, 0, 0, 0, 0, Some(schema), Some(batch))
+}
+
+fn encode_scan_payload(
+    client_id: u64, target_id: u64,
+) -> Result<Vec<u8>, gnitz_protocol::ProtocolError> {
+    gnitz_protocol::encode_message(target_id, client_id, 0, 0, 0, 0, None, None)
+}
+
+fn encode_seek_payload(
+    client_id: u64, target_id: u64, pk_lo: u64, pk_hi: u64,
+) -> Result<Vec<u8>, gnitz_protocol::ProtocolError> {
+    gnitz_protocol::encode_message(
+        target_id, client_id, gnitz_protocol::FLAG_SEEK, pk_lo, pk_hi, 0, None, None,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// AsyncTransport — background I/O thread for async pipelining
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum ResponseKind {
+    Push,  // resolve with u64 (seek_pk_lo = ingest LSN)
+    Scan,  // resolve with PyScanResult
+}
+
+struct IoRequest {
+    payload: Vec<u8>,
+    future:  Py<PyAny>,
+    kind:    ResponseKind,
+}
+
+#[pyclass(name = "AsyncTransport")]
+struct PyAsyncTransport {
+    tx:               Option<std::sync::mpsc::Sender<IoRequest>>,
+    event_loop:       Py<PyAny>,
+    client_id:        u64,
+    thread:           Option<std::thread::JoinHandle<()>>,
+    // Kept alive so GC doesn't collect the Python callables while the I/O thread
+    // holds clones of them.
+    #[allow(dead_code)] set_result_fn:    Py<PyAny>,
+    #[allow(dead_code)] set_exception_fn: Py<PyAny>,
+}
+
+impl PyAsyncTransport {
+    fn enqueue(
+        &self, py: Python<'_>, payload: Vec<u8>, kind: ResponseKind,
+    ) -> PyResult<PyObject> {
+        let tx = self.tx.as_ref().ok_or_else(|| {
+            GnitzError::new_err("connection closed")
+        })?;
+        let fut = self.event_loop.call_method0(py, "create_future")?;
+        tx.send(IoRequest {
+            payload,
+            future: fut.clone_ref(py),
+            kind,
+        }).map_err(|_| GnitzError::new_err("I/O thread exited"))?;
+        Ok(fut.into())
+    }
+}
+
+#[pymethods]
+impl PyAsyncTransport {
+    #[new]
+    fn new(
+        py: Python<'_>,
+        socket_path: &str,
+        event_loop: PyObject,
+        set_result_fn: PyObject,
+        set_exception_fn: PyObject,
+    ) -> PyResult<Self> {
+        let sock_fd = gnitz_protocol::connect(socket_path)
+            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        let client_id = std::process::id() as u64;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_ref: Py<PyAny> = event_loop.clone_ref(py).into();
+        let sr_fn: Py<PyAny> = set_result_fn.clone_ref(py).into();
+        let se_fn: Py<PyAny> = set_exception_fn.clone_ref(py).into();
+
+        let handle = std::thread::spawn(move || {
+            async_io_loop(sock_fd, rx, loop_ref, sr_fn, se_fn);
+        });
+
+        Ok(PyAsyncTransport {
+            tx:               Some(tx),
+            event_loop:       event_loop.into(),
+            client_id,
+            thread:           Some(handle),
+            set_result_fn:    set_result_fn.into(),
+            set_exception_fn: set_exception_fn.into(),
+        })
+    }
+
+    fn push(
+        &self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>,
+    ) -> PyResult<PyObject> {
+        let payload = encode_push_payload(self.client_id, target_id, &batch.schema, &batch.batch)
+            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        self.enqueue(py, payload, ResponseKind::Push)
+    }
+
+    fn scan(&self, py: Python<'_>, target_id: u64) -> PyResult<PyObject> {
+        let payload = encode_scan_payload(self.client_id, target_id)
+            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        self.enqueue(py, payload, ResponseKind::Scan)
+    }
+
+    fn seek(
+        &self, py: Python<'_>, target_id: u64, pk_lo: u64, pk_hi: u64,
+    ) -> PyResult<PyObject> {
+        let payload = encode_seek_payload(self.client_id, target_id, pk_lo, pk_hi)
+            .map_err(|e| GnitzError::new_err(e.to_string()))?;
+        self.enqueue(py, payload, ResponseKind::Scan)
+    }
+
+    fn close(&mut self, _py: Python<'_>) {
+        self.tx.take(); // drop sender → I/O thread exits
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for PyAsyncTransport {
+    fn drop(&mut self) {
+        // Drop the sender so the I/O thread can exit.
+        // Do NOT join here — may deadlock during GC.
+        self.tx.take();
+    }
+}
+
+fn async_io_loop(
+    sock_fd:  std::os::unix::io::RawFd,
+    rx:       std::sync::mpsc::Receiver<IoRequest>,
+    loop_ref: Py<PyAny>,
+    sr_fn:    Py<PyAny>,
+    se_fn:    Py<PyAny>,
+) {
+    use std::collections::VecDeque;
+
+    let mut pending_futures: VecDeque<(Py<PyAny>, ResponseKind)> = VecDeque::new();
+
+    loop {
+        // Block until at least one request
+        let first = match rx.recv() {
+            Ok(req) => req,
+            Err(_)  => break, // sender dropped → clean shutdown
+        };
+
+        // Drain all additional queued requests (natural batching)
+        let mut batch = vec![first];
+        while let Ok(req) = rx.try_recv() {
+            batch.push(req);
+        }
+
+        // Send all requests (blocking, existing code)
+        let send_ok = true;
+        for req in &batch {
+            if send_ok {
+                if let Err(e) = gnitz_protocol::send_framed(sock_fd, &req.payload) {
+                    // Fatal send error — fail all futures and exit
+                    for req2 in &batch {
+                        fail_future(&loop_ref, &se_fn, &req2.future, &e.to_string());
+                    }
+                    for (fut, _) in pending_futures.drain(..) {
+                        fail_future(&loop_ref, &se_fn, &fut, &e.to_string());
+                    }
+                    gnitz_protocol::close_fd(sock_fd);
+                    return;
+                }
+            }
+            Python::with_gil(|py| {
+                pending_futures.push_back((req.future.clone_ref(py), req.kind));
+            });
+        }
+        // Note: req.future refs are consumed into pending_futures above.
+        // The IoRequest batch is dropped here; the Py<PyAny> in req.future
+        // may still be alive via pending_futures.
+
+        // Recv all responses for this batch (pure Rust, no GIL)
+        let n = batch.len();
+        let mut results: Vec<Result<gnitz_protocol::Message, String>> = Vec::with_capacity(n);
+        let mut recv_failed = false;
+        for _ in 0..n {
+            if recv_failed {
+                results.push(Err("connection lost".to_string()));
+                continue;
+            }
+            match gnitz_protocol::recv_framed(sock_fd) {
+                Ok(buf) => match gnitz_protocol::parse_response(&buf) {
+                    Ok(msg) => results.push(Ok(msg)),
+                    Err(e)  => {
+                        results.push(Err(e.to_string()));
+                        recv_failed = true;
+                    }
+                },
+                Err(e) => {
+                    results.push(Err(e.to_string()));
+                    recv_failed = true;
+                }
+            }
+        }
+
+        // Single GIL acquisition to resolve all futures
+        Python::with_gil(|py| {
+            for result in results {
+                let (fut, kind) = pending_futures.pop_front().unwrap();
+                match result {
+                    Ok(msg) => {
+                        if msg.status == gnitz_protocol::STATUS_ERROR {
+                            let err_text = msg.error_text.unwrap_or_default();
+                            let exc = GnitzError::new_err(err_text);
+                            let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                                (&se_fn, &fut, exc));
+                        } else {
+                            let py_val = match kind {
+                                ResponseKind::Push => {
+                                    msg.seek_pk_lo.into_pyobject(py).unwrap().into_any().unbind()
+                                }
+                                ResponseKind::Scan => {
+                                    let lsn = msg.seek_pk_lo;
+                                    let data = match (msg.schema, msg.data_batch) {
+                                        (Some(s), Some(b)) => {
+                                            let names: Vec<&str> = s.columns.iter()
+                                                .map(|c| c.name.as_str()).collect();
+                                            let fields = PyTuple::new(py, names).unwrap().unbind();
+                                            let field_index = build_field_index(&s);
+                                            Some(Arc::new(SharedBatchData {
+                                                schema: s, batch: b, fields, field_index
+                                            }))
+                                        }
+                                        _ => None,
+                                    };
+                                    Py::new(py, PyScanResult {
+                                        data, lsn, cached_schema: None, cached_batch: None,
+                                    }).unwrap().into_any()
+                                }
+                            };
+                            let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                                (&sr_fn, &fut, py_val));
+                        }
+                    }
+                    Err(e) => {
+                        let exc = GnitzError::new_err(e);
+                        let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                            (&se_fn, &fut, exc));
+                    }
+                }
+            }
+        });
+
+        if recv_failed {
+            // Connection is broken — fail any remaining pending futures and exit
+            Python::with_gil(|py| {
+                for (fut, _) in pending_futures.drain(..) {
+                    let exc = GnitzError::new_err("connection lost");
+                    let _ = loop_ref.call_method1(py, "call_soon_threadsafe",
+                        (&se_fn, &fut, exc));
+                }
+            });
+            gnitz_protocol::close_fd(sock_fd);
+            return;
+        }
+    }
+
+    gnitz_protocol::close_fd(sock_fd);
+}
+
+fn fail_future(loop_ref: &Py<PyAny>, se_fn: &Py<PyAny>, fut: &Py<PyAny>, msg: &str) {
+    Python::with_gil(|py| {
+        let exc = GnitzError::new_err(msg.to_string());
+        let _ = loop_ref.call_method1(py, "call_soon_threadsafe", (se_fn, fut, exc));
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1420,6 +1706,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyExprProgram>()?;
     m.add_class::<PyCircuitBuilder>()?;
     m.add_class::<PyCircuitGraph>()?;
+    m.add_class::<PyAsyncTransport>()?;
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
     Ok(())
 }
