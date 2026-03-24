@@ -1,7 +1,6 @@
 # gnitz/server/rust_ffi.py
 #
-# RPython FFI bindings for libgnitz_transport (Rust cdylib).
-# Follows the same pattern as uring_ffi.py.
+# RPython FFI bindings for libgnitz_transport (Rust staticlib).
 
 import os
 from rpython.rlib import jit
@@ -12,6 +11,7 @@ from rpython.translator.tool.cbuild import ExternalCompilationInfo
 from gnitz.core.errors import StorageError
 
 _lib_dir = os.environ.get("GNITZ_TRANSPORT_LIB", "")
+_lib_path = os.path.join(_lib_dir, "libgnitz_transport.a") if _lib_dir else ""
 
 eci = ExternalCompilationInfo(
     pre_include_bits=[
@@ -25,9 +25,7 @@ eci = ExternalCompilationInfo(
         "void transport_free_recv(void *t, void *ptr);",
         "void transport_close_fd(void *t, int fd);",
     ],
-    libraries=["gnitz_transport"],
-    library_dirs=[_lib_dir] if _lib_dir else [],
-    link_extra=["-Wl,-rpath," + _lib_dir] if _lib_dir else [],
+    link_files=[_lib_path] if _lib_path else [],
 )
 
 # ---------------------------------------------------------------------------
