@@ -10,7 +10,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi
 
 from gnitz import log
-from gnitz.server import ipc, ipc_ffi, eventfd_ffi
+from gnitz.server import ipc, eventfd_ffi
 from gnitz.core import errors
 from gnitz.storage import mmap_posix
 from gnitz.core.batch import ArenaZSetBatch
@@ -75,14 +75,14 @@ class WorkerProcess(object):
     responses to a W2M region (worker→master).
     """
 
-    _immutable_fields_ = ["worker_id", "crash_fd", "engine",
+    _immutable_fields_ = ["worker_id", "master_pid", "engine",
                           "part_start", "part_end",
                           "sal_ptr", "m2w_efd", "w2m_region", "w2m_efd"]
 
-    def __init__(self, worker_id, crash_fd, engine, part_start, part_end,
+    def __init__(self, worker_id, master_pid, engine, part_start, part_end,
                  sal_ptr, m2w_efd, w2m_region, w2m_efd):
         self.worker_id = worker_id
-        self.crash_fd = crash_fd       # socketpair for POLLHUP crash detection
+        self.master_pid = master_pid
         self.engine = engine
         self.part_start = part_start
         self.part_end = part_end
@@ -102,13 +102,8 @@ class WorkerProcess(object):
         while True:
             ready = eventfd_ffi.eventfd_wait(self.m2w_efd, 1000)
             if ready == 0:
-                # Timeout — check for master crash via POLLHUP
-                revents = ipc_ffi.poll(
-                    [self.crash_fd],
-                    [ipc_ffi.POLLHUP | ipc_ffi.POLLERR], 0)
-                if (len(revents) > 0
-                        and (revents[0]
-                             & (ipc_ffi.POLLHUP | ipc_ffi.POLLERR))):
+                # Timeout — check for master crash via getppid
+                if os.getppid() != self.master_pid:
                     self._shutdown()
                     return
                 continue

@@ -17,7 +17,7 @@ from gnitz.storage import mmap_posix
 from gnitz.storage.mmap_posix import raise_fd_limit
 from gnitz.catalog import system_tables as sys
 from gnitz.server.executor import ServerExecutor
-from gnitz.server import ipc, ipc_ffi, eventfd_ffi, sal_ffi
+from gnitz.server import ipc, eventfd_ffi, sal_ffi
 from gnitz.server.master import MasterDispatcher
 from gnitz.dbsp.ops.exchange import PartitionAssignment
 from gnitz.server.worker import WorkerProcess
@@ -239,13 +239,7 @@ def entry_point(argv):
     for w in range(num_workers):
         os.write(1, "W" + str(w) + " m2w_efd=" + str(m2w_efds[w]) + " w2m_efd=" + str(w2m_efds[w]) + " w2m_fd=" + str(w2m_regions[w].fd) + "\n")
 
-    # --- Socketpairs (crash detection only — no data flows) ---
-    parent_fds = [0] * num_workers
-    child_fds = [0] * num_workers
-    for w in range(num_workers):
-        p_fd, c_fd = ipc_ffi.create_socketpair()
-        parent_fds[w] = p_fd
-        child_fds[w] = c_fd
+    master_pid = os.getpid()
 
     assignment = PartitionAssignment(num_workers)
     worker_pids = [0] * num_workers
@@ -263,18 +257,11 @@ def entry_point(argv):
             except OSError:
                 pass
 
-            # Close parent-side fds of all socketpairs
-            for j in range(num_workers):
-                os.close(parent_fds[j])
-
-            # Close child-side fds and eventfds of OTHER workers
+            # Close eventfds of OTHER workers
             for j in range(num_workers):
                 if j != w:
-                    os.close(child_fds[j])
                     rposix.close(m2w_efds[j])
                     rposix.close(w2m_efds[j])
-
-            my_fd = child_fds[w]
 
             # Set active partition range
             part_start, part_end = assignment.range_for_worker(w)
@@ -298,7 +285,7 @@ def entry_point(argv):
             )
 
             log.set_process_tag("W" + str(w))
-            WorkerProcess(w, my_fd, engine, part_start, part_end,
+            WorkerProcess(w, master_pid, engine, part_start, part_end,
                           sal_ptr, m2w_efds[w], w2m_regions[w],
                           w2m_efds[w]).run()
             os._exit(0)
@@ -306,14 +293,11 @@ def entry_point(argv):
         worker_pids[w] = pid
 
     # --- Parent process ---
-    for w in range(num_workers):
-        os.close(child_fds[w])
-
     _close_user_table_partitions(engine)
     engine.registry.active_part_start = 0
     engine.registry.active_part_end = 0
 
-    dispatcher = MasterDispatcher(num_workers, parent_fds, worker_pids,
+    dispatcher = MasterDispatcher(num_workers, worker_pids,
                                    assignment, engine.program_cache,
                                    sal, w2m_regions, m2w_efds, w2m_efds)
 

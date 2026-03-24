@@ -690,3 +690,35 @@ def test_workers_concurrent_push_multi_table(client, server):
             )
     finally:
         _drop_all(client, sn, tables=[f"t{i}" for i in range(n_tables)])
+
+
+def test_cross_table_push_scan_isolation(client):
+    """Push to table A while scanning table B — scan should not
+    cause unnecessary flush of table A's pending pushes.  Per-table
+    read barriers ensure cross-table isolation."""
+    sn = "w" + _uid()
+    client.create_schema(sn)
+    try:
+        cols = [
+            gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("val", gnitz.TypeCode.I64),
+        ]
+        schema = gnitz.Schema(cols)
+        tid_a = client.create_table(sn, "a", cols)
+        tid_b = client.create_table(sn, "b", cols)
+
+        batch_a = gnitz.ZSetBatch(schema)
+        for i in range(10):
+            batch_a.append(pk=i + 1, val=i * 10)
+        client.push(tid_a, batch_a)
+
+        # Scan table B (empty) — must succeed without affecting table A
+        result_b = client.scan(tid_b)
+        assert len(result_b) == 0
+
+        # Scan table A — all 10 rows must be present
+        result_a = client.scan(tid_a)
+        pks = sorted(row.pk for row in result_a if row.weight > 0)
+        assert len(pks) == 10
+    finally:
+        _drop_all(client, sn, tables=["a", "b"])

@@ -657,3 +657,69 @@ class TestIndexIntegrity:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_a", f"{sn}__t__idx_b"],
                       tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestIndexReadBarrier
+# ---------------------------------------------------------------------------
+
+class TestIndexReadBarrier:
+    """Validates that index seeks after pushes see fresh data.
+
+    The server fires pending ticks before index seeks to ensure derived
+    index views are up-to-date.
+    """
+
+    def test_index_seek_immediately_after_push(self, client):
+        """Push a row, then immediately seek by index — must find it."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY,"
+                " val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            results = client.execute_sql(
+                "SELECT * FROM t WHERE val = 42", schema_name=sn)
+            assert results[0]["type"] == "Rows"
+            rows = results[0]["rows"]
+            assert len(rows.batch.pk_lo) == 1
+            assert rows.batch.pk_lo[0] == 1
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])
+
+    def test_index_seek_multiple_pushes(self, client):
+        """Push several rows, seek by index for each — all found."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY,"
+                " val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
+            for i in range(5):
+                client.execute_sql(
+                    f"INSERT INTO t VALUES ({i + 1}, {(i + 1) * 100})",
+                    schema_name=sn,
+                )
+            for i in range(5):
+                results = client.execute_sql(
+                    f"SELECT * FROM t WHERE val = {(i + 1) * 100}",
+                    schema_name=sn,
+                )
+                assert results[0]["type"] == "Rows"
+                rows = results[0]["rows"]
+                assert len(rows.batch.pk_lo) == 1
+                assert rows.batch.pk_lo[0] == i + 1
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_val"],
+                      tables=["t"])

@@ -235,6 +235,37 @@ def _validate_schema_match(wire_schema, expected_schema):
             )
 
 
+class PendingBatch(object):
+    """Accumulates bufferable pushes for batch flush to workers."""
+
+    def __init__(self):
+        self.fds = newlist_hint(16)
+        self.cids = newlist_hint(16)
+        self.tids = newlist_hint(16)
+        self.batches = newlist_hint(16)
+        self.schemas = newlist_hint(16)
+        self.row_count = 0
+
+    def add(self, fd, cid, tid, batch, schema):
+        self.fds.append(fd)
+        self.cids.append(cid)
+        self.tids.append(tid)
+        self.batches.append(batch)
+        self.schemas.append(schema)
+        self.row_count += batch.length()
+
+    def is_empty(self):
+        return len(self.fds) == 0
+
+    def clear(self):
+        del self.fds[:]
+        del self.cids[:]
+        del self.tids[:]
+        del self.batches[:]
+        del self.schemas[:]
+        self.row_count = 0
+
+
 class ServerExecutor(object):
     """
     Coordinates IPC sessions and the Reactive DAG.
@@ -282,13 +313,7 @@ class ServerExecutor(object):
         out_fds = lltype.malloc(rffi.INTP.TO, 256, flavor='raw')
         out_ptrs = lltype.malloc(rffi.VOIDPP.TO, 256, flavor='raw')
         out_lens = lltype.malloc(rffi.UINTP.TO, 256, flavor='raw')
-
-        pending_fds = newlist_hint(16)
-        pending_cids = newlist_hint(16)
-        pending_tids = newlist_hint(16)
-        pending_batches = newlist_hint(16)
-        pending_schemas = newlist_hint(16)
-        pending_row_count = 0
+        pending = PendingBatch()
 
         try:
             while True:
@@ -328,42 +353,25 @@ class ServerExecutor(object):
                     ptr = out_ptrs[i]
                     length = intmask(out_lens[i])
                     try:
-                        rows = self._dispatch_message(
-                            transport, fd, ptr, length,
-                            pending_fds, pending_cids, pending_tids,
-                            pending_batches, pending_schemas,
-                        )
-                        if rows > 0:
-                            pending_row_count += rows
-                            if pending_row_count >= MAX_PENDING_ROWS:
-                                self._flush_pending_pushes(
-                                    transport,
-                                    pending_fds, pending_cids,
-                                    pending_tids, pending_batches,
-                                    pending_schemas,
-                                )
-                                pending_fds = newlist_hint(16)
-                                pending_cids = newlist_hint(16)
-                                pending_tids = newlist_hint(16)
-                                pending_batches = newlist_hint(16)
-                                pending_schemas = newlist_hint(16)
-                                pending_row_count = 0
+                        self._dispatch_message(
+                            transport, fd, ptr, length, pending)
+                        if pending.row_count >= MAX_PENDING_ROWS:
+                            self._flush_pending_pushes(
+                                transport, pending.fds, pending.cids,
+                                pending.tids, pending.batches,
+                                pending.schemas,
+                            )
+                            pending.clear()
                     finally:
                         rust_ffi.free_recv(transport, ptr)
 
-                if len(pending_fds) > 0:
+                if not pending.is_empty():
                     self._flush_pending_pushes(
-                        transport,
-                        pending_fds, pending_cids,
-                        pending_tids, pending_batches,
-                        pending_schemas,
+                        transport, pending.fds, pending.cids,
+                        pending.tids, pending.batches,
+                        pending.schemas,
                     )
-                    pending_fds = newlist_hint(16)
-                    pending_cids = newlist_hint(16)
-                    pending_tids = newlist_hint(16)
-                    pending_batches = newlist_hint(16)
-                    pending_schemas = newlist_hint(16)
-                    pending_row_count = 0
+                    pending.clear()
 
                 self._check_and_fire_pending_ticks()
         finally:
@@ -371,19 +379,16 @@ class ServerExecutor(object):
             lltype.free(out_ptrs, flavor='raw')
             lltype.free(out_lens, flavor='raw')
 
-    def _dispatch_message(self, transport, fd, ptr, length,
-                          p_fds, p_cids, p_tids, p_batches, p_schemas):
-        """Parse and dispatch a complete message. Returns rows buffered."""
+    def _dispatch_message(self, transport, fd, ptr, length, pending):
+        """Parse and dispatch a complete message."""
         payload = None
-        rows_buffered = 0
         try:
             payload = ipc._parse_from_ptr(
                 rffi.cast(rffi.CCHARP, ptr), length)
             # NOTE: do NOT set payload.raw_buf — Rust owns the recv buffer.
             # It is freed via rust_ffi.free_recv in the caller's finally block.
-            rows_buffered = self._dispatch_payload(
-                transport, fd, payload, p_fds, p_cids, p_tids,
-                p_batches, p_schemas)
+            self._dispatch_payload(
+                transport, fd, payload, pending)
         except errors.GnitzError as ge:
             cid = 0
             tid = 0
@@ -396,15 +401,11 @@ class ServerExecutor(object):
                     client_id=cid)
             except errors.GnitzError:
                 rust_ffi.close_fd(transport, fd)
-                return -1
         except Exception as e:
             os.write(2, "MASTER EXCEPTION: " + str(e) + "\n")
             rust_ffi.close_fd(transport, fd)
-            return -1
-        return rows_buffered
 
-    def _dispatch_payload(self, transport, fd, payload, p_fds, p_cids,
-                          p_tids, p_batches, p_schemas):
+    def _dispatch_payload(self, transport, fd, payload, pending):
         """Core message dispatch. Returns rows buffered (0 = immediate)."""
         client_id = intmask(payload.client_id)
         target_id = intmask(payload.target_id)
@@ -417,32 +418,26 @@ class ServerExecutor(object):
                     sys.SEQ_ID_TABLES, new_id - 1, new_id)
                 self._send_response(
                     transport, fd, new_id, None, STATUS_OK, "", client_id)
-                return 0
+                return
             if payload.flags & ipc.FLAG_ALLOCATE_SCHEMA_ID:
                 new_id = self.engine.registry.allocate_schema_id()
                 self.engine._advance_sequence(
                     sys.SEQ_ID_SCHEMAS, new_id - 1, new_id)
                 self._send_response(
                     transport, fd, new_id, None, STATUS_OK, "", client_id)
-                return 0
+                return
             if payload.flags & ipc.FLAG_ALLOCATE_INDEX_ID:
                 new_id = self.engine.registry.allocate_index_id()
                 self.engine._advance_sequence(
                     sys.SEQ_ID_INDICES, new_id - 1, new_id)
                 self._send_response(
                     transport, fd, new_id, None, STATUS_OK, "", client_id)
-                return 0
+                return
 
-        # Index seek — flush pushes + fire ticks (derived view needs evaluate_dag)
+        # Index seek — flush pushes for this table + fire ticks
         if payload.flags & ipc.FLAG_SEEK_BY_INDEX:
-            if len(p_fds) > 0:
-                self._flush_pending_pushes(
-                    transport, p_fds, p_cids, p_tids, p_batches, p_schemas)
-                del p_fds[:]
-                del p_cids[:]
-                del p_tids[:]
-                del p_batches[:]
-                del p_schemas[:]
+            self._flush_pending_for_tid(
+                transport, target_id, pending)
             self._fire_pending_ticks()
             col_idx = intmask(payload.seek_col_idx)
             schema = self.engine.registry.get_by_id(target_id).schema
@@ -461,18 +456,12 @@ class ServerExecutor(object):
                 client_id, schema=resp_schema)
             if result is not None:
                 result.free()
-            return 0
+            return
 
-        # PK seek — flush pushes (base table, no tick needed)
+        # PK seek — flush pushes for this table (no tick needed)
         if payload.flags & ipc.FLAG_SEEK:
-            if len(p_fds) > 0:
-                self._flush_pending_pushes(
-                    transport, p_fds, p_cids, p_tids, p_batches, p_schemas)
-                del p_fds[:]
-                del p_cids[:]
-                del p_tids[:]
-                del p_batches[:]
-                del p_schemas[:]
+            self._flush_pending_for_tid(
+                transport, target_id, pending)
             schema = self.engine.registry.get_by_id(target_id).schema
             if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
                 result = self.dispatcher.fan_out_seek(
@@ -488,7 +477,7 @@ class ServerExecutor(object):
                 client_id, schema=resp_schema)
             if result is not None:
                 result.free()
-            return 0
+            return
 
         family = None
         if payload.batch is not None:
@@ -508,22 +497,11 @@ class ServerExecutor(object):
             validate_unique_indices_distributed(
                 family, payload.batch, self.dispatcher)
             cloned = payload.batch.clone()
-            p_fds.append(fd)
-            p_cids.append(client_id)
-            p_tids.append(target_id)
-            p_batches.append(cloned)
-            p_schemas.append(family.schema)
-            return cloned.length()
+            pending.add(fd, client_id, target_id, cloned, family.schema)
+            return
 
-        # Non-bufferable: flush pending pushes, then process inline
-        if len(p_fds) > 0:
-            self._flush_pending_pushes(
-                transport, p_fds, p_cids, p_tids, p_batches, p_schemas)
-            del p_fds[:]
-            del p_cids[:]
-            del p_tids[:]
-            del p_batches[:]
-            del p_schemas[:]
+        # Non-bufferable: flush pushes for this table, then process inline
+        self._flush_pending_for_tid(transport, target_id, pending)
 
         result = self.handle_push(target_id, payload.batch)
         lsn = self._last_response_lsn
@@ -550,7 +528,6 @@ class ServerExecutor(object):
             client_id, schema=resp_schema, seek_pk_lo=lsn)
         if result is not None:
             result.free()
-        return 0
 
     def _send_response(self, transport, fd, target_id, result, status,
                        error_msg, client_id, schema=None, flags=0,
@@ -685,6 +662,45 @@ class ServerExecutor(object):
         finally:
             idx_cursor.close()
         return self._seek_family(table_id, src_lo, src_hi)
+
+    def _flush_pending_for_tid(self, transport, target_id, pending):
+        """Flush only pending pushes for a specific target_id."""
+        if pending.is_empty():
+            return
+        flush_fds = newlist_hint(4)
+        flush_cids = newlist_hint(4)
+        flush_tids = newlist_hint(4)
+        flush_batches = newlist_hint(4)
+        flush_schemas = newlist_hint(4)
+        keep = 0
+        for i in range(len(pending.fds)):
+            if pending.tids[i] == target_id:
+                flush_fds.append(pending.fds[i])
+                flush_cids.append(pending.cids[i])
+                flush_tids.append(pending.tids[i])
+                flush_batches.append(pending.batches[i])
+                flush_schemas.append(pending.schemas[i])
+            else:
+                pending.fds[keep] = pending.fds[i]
+                pending.cids[keep] = pending.cids[i]
+                pending.tids[keep] = pending.tids[i]
+                pending.batches[keep] = pending.batches[i]
+                pending.schemas[keep] = pending.schemas[i]
+                keep += 1
+        # Trim lists to kept entries
+        while len(pending.fds) > keep:
+            del pending.fds[-1]
+            del pending.cids[-1]
+            del pending.tids[-1]
+            del pending.batches[-1]
+            del pending.schemas[-1]
+        pending.row_count = 0
+        for i in range(len(pending.batches)):
+            pending.row_count += pending.batches[i].length()
+        if len(flush_fds) > 0:
+            self._flush_pending_pushes(
+                transport, flush_fds, flush_cids, flush_tids,
+                flush_batches, flush_schemas)
 
     def _flush_pending_pushes(self, transport, p_fds, p_cids, p_tids,
                               p_batches, p_schemas):

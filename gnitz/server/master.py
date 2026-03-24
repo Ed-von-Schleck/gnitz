@@ -28,13 +28,12 @@ class MasterDispatcher(object):
     Collects ACKs/responses synchronously via per-worker W2M regions.
     """
 
-    _immutable_fields_ = ["num_workers", "worker_fds[*]", "assignment",
+    _immutable_fields_ = ["num_workers", "assignment",
                           "sal", "m2w_efds[*]", "w2m_efds[*]"]
 
-    def __init__(self, num_workers, worker_fds, worker_pids, assignment,
+    def __init__(self, num_workers, worker_pids, assignment,
                  program_cache, sal, w2m_regions, m2w_efds, w2m_efds):
         self.num_workers = num_workers
-        self.worker_fds = worker_fds       # kept for crash detection (POLLHUP)
         self.worker_pids = worker_pids
         self.assignment = assignment
         self.program_cache = program_cache
@@ -614,7 +613,3 @@ class MasterDispatcher(object):
                     os.waitpid(pid, 0)
                 except OSError:
                     pass
-            try:
-                os.close(intmask(self.worker_fds[w]))
-            except OSError:
-                pass
