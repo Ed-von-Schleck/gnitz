@@ -13,6 +13,17 @@ from gnitz.storage.bloom import BloomFilter
 ACCUMULATOR_THRESHOLD = 64
 
 
+def _batch_bytes(batch):
+    """Sum all buffer offsets for a single ArenaZSetBatch."""
+    total = (batch.pk_lo_buf.offset + batch.pk_hi_buf.offset +
+             batch.weight_buf.offset + batch.null_buf.offset +
+             batch.blob_arena.offset)
+    col_bufs = batch.col_bufs
+    for i in range(len(col_bufs)):
+        total += col_bufs[i].offset
+    return total
+
+
 class MemTable(object):
     """
     Mutable, in-memory Z-Set storage.
@@ -31,6 +42,48 @@ class MemTable(object):
         self._total_row_count = 0
         self.max_bytes = arena_size
         self.bloom = BloomFilter(initial_capacity)
+        self._runs_bytes = 0
+        self._cached_consolidated = None
+
+    def _invalidate_runs_cache(self):
+        if self._cached_consolidated is not None:
+            self._cached_consolidated.free()
+            self._cached_consolidated = None
+
+    def get_consolidated_snapshot(self):
+        """Return an owned, consolidated snapshot of runs + accumulator.
+
+        Caches the N-way merge of sorted runs.  If accumulator is non-empty,
+        does a cheap 2-way merge of [cached_runs, sorted_acc].
+        Caller owns the returned batch and must free it.
+        """
+        if self._cached_consolidated is None and len(self.runs) > 0:
+            self._cached_consolidated = _merge_runs_to_consolidated(
+                self.runs, self.schema
+            )
+
+        has_acc = self._accumulator.length() > 0
+
+        if self._cached_consolidated is None:
+            if has_acc:
+                sorted_acc = self._accumulator.to_sorted()
+                result = sorted_acc.to_consolidated()
+                if result is sorted_acc:
+                    result = sorted_acc.clone()
+                if sorted_acc is not self._accumulator:
+                    sorted_acc.free()
+                return result
+            return ArenaZSetBatch(self.schema)
+
+        if not has_acc:
+            return self._cached_consolidated.clone()
+
+        sorted_acc = self._accumulator.to_sorted()
+        two = [self._cached_consolidated, sorted_acc]
+        result = _merge_runs_to_consolidated(two, self.schema)
+        if sorted_acc is not self._accumulator:
+            sorted_acc.free()
+        return result
 
     def upsert_batch(self, batch):
         self._check_capacity()
@@ -42,6 +95,8 @@ class MemTable(object):
         if sorted_batch is batch:
             sorted_batch = batch.clone()
         self.runs.append(sorted_batch)
+        self._runs_bytes += _batch_bytes(sorted_batch)
+        self._invalidate_runs_cache()
         self._total_row_count += sorted_batch.length()
         num_records = batch.length()
         for i in range(num_records):
@@ -69,30 +124,11 @@ class MemTable(object):
             self._accumulator.free()
         self._accumulator = ArenaZSetBatch(self.schema)
         self.runs.append(sorted_acc)
+        self._runs_bytes += _batch_bytes(sorted_acc)
+        self._invalidate_runs_cache()
 
     def _total_bytes(self):
-        total = (
-            self._accumulator.pk_lo_buf.offset
-            + self._accumulator.pk_hi_buf.offset
-            + self._accumulator.weight_buf.offset
-            + self._accumulator.null_buf.offset
-            + self._accumulator.blob_arena.offset
-        )
-        col_bufs = self._accumulator.col_bufs
-        for i in range(len(col_bufs)):
-            total += col_bufs[i].offset
-        for r in self.runs:
-            total += (
-                r.pk_lo_buf.offset
-                + r.pk_hi_buf.offset
-                + r.weight_buf.offset
-                + r.null_buf.offset
-                + r.blob_arena.offset
-            )
-            rc = r.col_bufs
-            for j in range(len(rc)):
-                total += rc[j].offset
-        return total
+        return self._runs_bytes + _batch_bytes(self._accumulator)
 
     def _check_capacity(self):
         if self._total_bytes() > self.max_bytes:
@@ -154,7 +190,7 @@ class MemTable(object):
 
     def flush(self, dirfd, basename, table_id=0):
         self._flush_accumulator()
-        consolidated = _merge_runs_to_consolidated(self.runs, self.schema)
+        consolidated = self.get_consolidated_snapshot()
         wrote = writer_table.write_batch_to_shard(
             consolidated, dirfd, basename, table_id
         )
@@ -169,6 +205,8 @@ class MemTable(object):
         for r in self.runs:
             r.free()
         self.runs = newlist_hint(8)
+        self._runs_bytes = 0
+        self._invalidate_runs_cache()
         self._total_row_count = 0
         self.bloom.reset()
 
@@ -176,6 +214,8 @@ class MemTable(object):
         for r in self.runs:
             r.free()
         self.runs = newlist_hint(8)
+        self._runs_bytes = 0
+        self._invalidate_runs_cache()
         self._accumulator.free()
         self._total_row_count = 0
         self.bloom.free()

@@ -140,28 +140,9 @@ class MemTableCursor(BaseCursor):
     _immutable_fields_ = ["schema", "_snapshot", "_accessor"]
 
     def __init__(self, memtable):
-        from gnitz.storage.memtable import _merge_runs_to_consolidated
-
         BaseCursor.__init__(self)
         self.schema = memtable.schema
-
-        # Build list of all sorted runs (including sorted accumulator).
-        num_runs = len(memtable.runs)
-        has_acc = memtable._accumulator.length() > 0
-        all_runs = newlist_hint(num_runs + 1)
-        for ri in range(num_runs):
-            all_runs.append(memtable.runs[ri])
-        temp_sorted_acc = None
-        if has_acc:
-            temp_sorted_acc = memtable._accumulator.to_sorted()
-            all_runs.append(temp_sorted_acc)
-
-        self._snapshot = _merge_runs_to_consolidated(all_runs, memtable.schema)
-
-        # Free temporary sorted accumulator if to_sorted() created a new batch
-        if temp_sorted_acc is not None and temp_sorted_acc is not memtable._accumulator:
-            temp_sorted_acc.free()
-
+        self._snapshot = memtable.get_consolidated_snapshot()
         self._pos = 0
         self._accessor = ColumnarBatchAccessor(memtable.schema)
 
