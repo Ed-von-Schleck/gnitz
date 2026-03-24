@@ -2444,6 +2444,7 @@ def test_flsm_horizontal_ghost_elimination(base_dir):
         s += 1
 
     idx.compact_guards_if_needed()
+    rc.try_cleanup()
 
     assert_equal_i(1, len(guard.handles), "Expected 1 handle after ghost elimination")
 

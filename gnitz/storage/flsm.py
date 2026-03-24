@@ -340,7 +340,6 @@ class FLSMIndex(object):
                 h.close()
                 self.ref_counter.release(h.filename)
                 self.ref_counter.mark_for_deletion(h.filename)
-            self.ref_counter.try_cleanup()
         except Exception as e:
             if os.path.exists(out_path):
                 try:
@@ -468,7 +467,6 @@ class FLSMIndex(object):
             dest_level.guards[g_idx].add_handle(self.ref_counter, new_handle)
             i += 1
 
-        self.ref_counter.try_cleanup()
         self._update_flags()
 
         # Lazy Leveling safety net: Z=1 at Lmax (each L2 guard holds exactly one file)
@@ -505,7 +503,6 @@ class FLSMIndex(object):
             self.commit_l0_to_l1(l0_input_files, guard_outputs, l0_max_lsn)
             for fn in l0_input_files:
                 self.ref_counter.mark_for_deletion(fn)
-            self.ref_counter.try_cleanup()
         except Exception as e:
             i = 0
             while i < len(guard_outputs):

@@ -191,7 +191,7 @@ class ManifestManager(object):
                 mmap_posix.write_all(
                     fd, file_buf, rffi.cast(rffi.SIZE_T, total_size)
                 )
-                mmap_posix.fsync_c(fd)
+                mmap_posix.fdatasync_c(fd)
             finally:
                 rposix.close(fd)
         finally:

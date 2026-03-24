@@ -92,6 +92,8 @@ class PersistentTable(EphemeralTable):
         self.manifest_manager.publish_new_version(
             self.index.get_metadata_list(), self.index.max_lsn()
         )
+        mmap_posix.fsync_c(self._dirfd)
+        self.index.ref_counter.try_cleanup()
 
     # -- Mutations ------------------------------------------------------------
 
@@ -206,13 +208,12 @@ class PersistentTable(EphemeralTable):
         )
 
         # 2. Logic: Update the Manifest (The Authority)
-        if h.view.count > 0:
+        has_data = h.view.count > 0
+        if has_data:
             self.index.add_handle(h)
             self.manifest_manager.publish_new_version(
                 self.index.get_metadata_list(), lsn_max
             )
-            # 3. Cleanup: WAL is no longer needed for recovered data
-            self.wal_writer.truncate_before_lsn(self.current_lsn)
         else:
             # Ghost Shard cleanup
             h.close()
@@ -224,10 +225,14 @@ class PersistentTable(EphemeralTable):
                 self.index.get_metadata_list(), lsn_max
             )
 
-        # One dir fsync via cached dirfd — no open/close needed.
+        # 3. Dir fsync — makes shard rename + manifest rename durable.
         mmap_posix.fsync_c(self._dirfd)
 
-        # 4. Rotation: reset MemTable (keeps accumulator + bloom buffers)
+        # 4. WAL truncation — safe because manifest is now durable.
+        if has_data:
+            self.wal_writer.truncate_before_lsn(self.current_lsn)
+
+        # 5. Rotation: reset MemTable (keeps accumulator + bloom buffers)
         self.memtable.reset()
 
         # Bump generation to notify UnifiedCursors that sources have changed

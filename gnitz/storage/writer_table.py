@@ -409,6 +409,8 @@ def _write_shard_file(filename, table_id, count, region_list, xor8_filter,
             mmap_posix.write_all(
                 fd, file_buf, rffi.cast(rffi.SIZE_T, total_size)
             )
+            if durable:
+                mmap_posix.fdatasync_c(fd)
         finally:
             rposix.close(fd)
     finally:
@@ -435,6 +437,7 @@ def write_shard_at(dirfd, basename, table_id, count, region_list, pk_lo_ptr,
             mmap_posix.write_all(
                 fd, file_buf, rffi.cast(rffi.SIZE_T, total_size)
             )
+            mmap_posix.fdatasync_c(fd)
         finally:
             rposix.close(fd)
     finally:

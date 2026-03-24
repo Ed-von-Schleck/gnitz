@@ -145,6 +145,7 @@ class EphemeralTable(ZSetStore):
 
     def _compact(self):
         self.index.run_compact()
+        self.index.ref_counter.try_cleanup()
 
     def _scan_shards_for_pk(self, key_lo, key_hi):
         """Walk shards for a PK via the shard index.

@@ -132,7 +132,7 @@ class WALWriter(object):
             self.fd, self.block_buf.base_ptr,
             rffi.cast(rffi.SIZE_T, self.block_buf.offset)
         )
-        mmap_posix.fsync_c(self.fd)
+        mmap_posix.fdatasync_c(self.fd)
 
     def truncate_before_lsn(self, lsn):
         if self.closed or self.fd == -1:
