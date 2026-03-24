@@ -479,8 +479,9 @@ def generate_batch_sizes(total_rows, rng):
 
 
 def writer_worker(sock_path, act_tid, worker_id, num_workers,
-                  rows_per_tick, ticks, barrier, queue):
+                  rows_per_tick, ticks, queue):
     # Each writer pushes its share of rows per tick with realistic op mix.
+    # Writers run independently — no barriers — each at its own pace.
     import gnitz as _gnitz
 
     act_cols = [
@@ -500,58 +501,59 @@ def writer_worker(sock_path, act_tid, worker_id, num_workers,
     seen_pks = []
     pk_counter = worker_id  # strided by num_workers
 
-    with _gnitz.connect(sock_path) as conn:
-        for tick in range(ticks):
-            barrier.wait()  # tick start
+    try:
+        with _gnitz.connect(sock_path) as conn:
+            for tick in range(ticks):
+                batch_sizes = generate_batch_sizes(my_rows, rng)
+                push_latencies = []
+                t_build_total = 0.0
+                t_push_total = 0.0
 
-            batch_sizes = generate_batch_sizes(my_rows, rng)
-            push_latencies = []
-            t_build_total = 0.0
-            t_push_total = 0.0
+                row_idx = 0
+                for bsz in batch_sizes:
+                    t_b0 = time.perf_counter()
+                    batch = _gnitz.ZSetBatch(act_schema)
 
-            row_idx = 0
-            for bsz in batch_sizes:
-                t_b0 = time.perf_counter()
-                batch = _gnitz.ZSetBatch(act_schema)
+                    for _ in range(bsz):
+                        r = rng.random()
+                        if len(seen_pks) == 0 or r < 0.50:
+                            # Insert
+                            pk = pk_counter
+                            pk_counter += num_workers
+                            weight = 1
+                            seen_pks.append(pk)
+                        elif r < 0.80:
+                            # Update (new values, weight=+1)
+                            pk = rng.choice(seen_pks)
+                            weight = 1
+                        else:
+                            # Delete (weight=-1)
+                            pk = rng.choice(seen_pks)
+                            weight = -1
 
-                for _ in range(bsz):
-                    r = rng.random()
-                    if len(seen_pks) == 0 or r < 0.50:
-                        # Insert
-                        pk = pk_counter
-                        pk_counter += num_workers
-                        weight = 1
-                        seen_pks.append(pk)
-                    elif r < 0.80:
-                        # Update (new values, weight=+1)
-                        pk = rng.choice(seen_pks)
-                        weight = 1
-                    else:
-                        # Delete (weight=-1)
-                        pk = rng.choice(seen_pks)
-                        weight = -1
+                        cid = pk % NUM_CUSTOMERS
+                        pid = pk % NUM_PRODUCTS
+                        rid = cid % NUM_REGIONS
+                        batch.append(pk=pk, product_id=pid, region_id=rid,
+                                     quantity=1 + (pk % 10),
+                                     revenue=100 + (pk % 1000),
+                                     weight=weight)
+                        row_idx += 1
 
-                    cid = pk % NUM_CUSTOMERS
-                    pid = pk % NUM_PRODUCTS
-                    rid = cid % NUM_REGIONS
-                    batch.append(pk=pk, product_id=pid, region_id=rid,
-                                 quantity=1 + (pk % 10),
-                                 revenue=100 + (pk % 1000),
-                                 weight=weight)
-                    row_idx += 1
+                    t_build = time.perf_counter() - t_b0
+                    t_build_total += t_build
 
-                t_build = time.perf_counter() - t_b0
-                t_build_total += t_build
+                    t_p0 = time.perf_counter()
+                    conn.push(act_tid, batch)
+                    t_push = time.perf_counter() - t_p0
 
-                t_p0 = time.perf_counter()
-                conn.push(act_tid, batch)
-                t_push = time.perf_counter() - t_p0
+                    t_push_total += t_push
+                    push_latencies.append((bsz, t_push))
 
-                t_push_total += t_push
-                push_latencies.append((bsz, t_push))
-
-            barrier.wait()  # tick end
-            queue.put((tick, worker_id, t_build_total, t_push_total, push_latencies))
+                queue.put((tick, worker_id, t_build_total, t_push_total, push_latencies))
+    except Exception as e:
+        sys.stderr.write("writer %d: %s\\n" % (worker_id, e))
+        sys.stderr.flush()
 
 
 def reader_worker(sock_path, view_ids_tuple, stop_event, queue):
@@ -744,19 +746,23 @@ with gnitz.connect(sock_path) as conn:
     }
 
 # ── Spawn workers ─────────────────────────────────────────────────────────
-barrier     = multiprocessing.Barrier(num_clients)
 timing_q    = multiprocessing.Queue()
 scan_q      = multiprocessing.Queue()
 stop_event  = multiprocessing.Event()
 
 view_ids_tuple = tuple(view_ids.items())
 
+# Per-tick timeout: generous upper bound (seconds).  If a writer hasn't
+# finished all its ticks within this window, it is killed to prevent hangs.
+per_tick_budget = 30  # seconds
+writer_timeout  = ticks * per_tick_budget
+
 writers = []
 for wid in range(num_clients):
     p = multiprocessing.Process(
         target=writer_worker,
         args=(sock_path, act_tid, wid, num_clients,
-              rows_per_tick, ticks, barrier, timing_q),
+              rows_per_tick, ticks, timing_q),
     )
     p.start()
     writers.append(p)
@@ -768,7 +774,11 @@ reader = multiprocessing.Process(
 reader.start()
 
 for p in writers:
-    p.join()
+    p.join(timeout=writer_timeout)
+    if p.is_alive():
+        sys.stderr.write("writer pid=%d stuck, killing\\n" % p.pid)
+        p.kill()
+        p.join()
 
 stop_event.set()
 reader.join(timeout=5)
