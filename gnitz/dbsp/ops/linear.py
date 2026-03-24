@@ -52,7 +52,6 @@ def _promote_col_to_pk(accessor, col_idx, schema):
 # ---------------------------------------------------------------------------
 
 
-@jit.unroll_safe
 def op_filter(in_batch, out_writer, func):
     """
     Retains only records for which the predicate returns True.
@@ -80,7 +79,6 @@ def op_filter(in_batch, out_writer, func):
         out_writer.mark_sorted(in_batch._sorted)
 
 
-@jit.unroll_safe
 def op_map(in_batch, out_writer, func, out_schema, reindex_col=-1):
     """
     Applies a transformation to every row.
