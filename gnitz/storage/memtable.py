@@ -188,11 +188,11 @@ class MemTable(object):
     def may_contain_pk(self, key_lo, key_hi):
         return self.bloom.may_contain(key_lo, key_hi)
 
-    def flush(self, dirfd, basename, table_id=0):
+    def flush(self, dirfd, basename, table_id=0, durable=True):
         self._flush_accumulator()
         consolidated = self.get_consolidated_snapshot()
         wrote = writer_table.write_batch_to_shard(
-            consolidated, dirfd, basename, table_id
+            consolidated, dirfd, basename, table_id, durable=durable
         )
         consolidated.free()
         return wrote

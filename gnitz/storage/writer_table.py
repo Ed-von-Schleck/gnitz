@@ -420,7 +420,7 @@ def _write_shard_file(filename, table_id, count, region_list, xor8_filter,
 
 
 def write_shard_at(dirfd, basename, table_id, count, region_list, pk_lo_ptr,
-                   pk_hi_ptr):
+                   pk_hi_ptr, durable=True):
     """Write a shard file using openat/renameat with a directory fd (flush path)."""
     xor8_filter = _build_xor8(pk_lo_ptr, pk_hi_ptr, count)
     file_buf, total_size = _build_shard_image(
@@ -437,7 +437,8 @@ def write_shard_at(dirfd, basename, table_id, count, region_list, pk_lo_ptr,
             mmap_posix.write_all(
                 fd, file_buf, rffi.cast(rffi.SIZE_T, total_size)
             )
-            mmap_posix.fdatasync_c(fd)
+            if durable:
+                mmap_posix.fdatasync_c(fd)
         finally:
             rposix.close(fd)
     finally:
@@ -446,7 +447,7 @@ def write_shard_at(dirfd, basename, table_id, count, region_list, pk_lo_ptr,
     mmap_posix.renameat_c(dirfd, tmp_name, basename)
 
 
-def write_batch_to_shard(batch, dirfd, basename, table_id):
+def write_batch_to_shard(batch, dirfd, basename, table_id, durable=True):
     """Write a consolidated ArenaZSetBatch directly to a shard file.
     Returns True if a file was written, False if the batch was empty."""
     count = batch.length()
@@ -469,5 +470,6 @@ def write_batch_to_shard(batch, dirfd, basename, table_id):
     write_shard_at(
         dirfd, basename, table_id, count, regions,
         batch.pk_lo_buf.base_ptr, batch.pk_hi_buf.base_ptr,
+        durable=durable,
     )
     return True

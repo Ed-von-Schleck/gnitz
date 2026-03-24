@@ -262,7 +262,8 @@ class EphemeralTable(ZSetStore):
         self._flush_seq += 1
         shard_name = EPH_SHARD_PREFIX + "%d_%d_%d.db" % (self.table_id, os.getpid(), self._flush_seq)
 
-        wrote = self.memtable.flush(self._dirfd, shard_name, self.table_id)
+        wrote = self.memtable.flush(self._dirfd, shard_name, self.table_id,
+                                    durable=False)
 
         if not wrote:
             return ""
