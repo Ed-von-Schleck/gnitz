@@ -1,7 +1,7 @@
 # gnitz/storage/engine_ffi.py
 #
 # RPython FFI bindings for libgnitz_engine (Rust staticlib).
-# Provides xor8 filter and bloom filter operations.
+# Provides xor8 filter, bloom filter, WAL encode/decode, and xxh3 checksum.
 
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
@@ -25,6 +25,20 @@ eci = ExternalCompilationInfo(
         "int gnitz_bloom_may_contain(const void *handle, uint64_t key_lo, uint64_t key_hi);",
         "void gnitz_bloom_reset(void *handle);",
         "void gnitz_bloom_free(void *handle);",
+        # xxh3 checksum
+        "uint64_t gnitz_xxh3_checksum(const uint8_t *data, int64_t len);",
+        # wal encode/decode
+        "int64_t gnitz_wal_encode("
+        "  uint8_t *out_buf, int64_t out_offset, int64_t out_capacity,"
+        "  uint64_t lsn, uint32_t table_id, uint32_t entry_count,"
+        "  void **region_ptrs, uint32_t *region_sizes,"
+        "  uint32_t num_regions, uint64_t blob_size);",
+        "int32_t gnitz_wal_validate_and_parse("
+        "  uint8_t *block, int64_t block_len,"
+        "  uint64_t *out_lsn, uint32_t *out_tid, uint32_t *out_count,"
+        "  uint32_t *out_num_regions, uint64_t *out_blob_size,"
+        "  uint32_t *out_region_offsets, uint32_t *out_region_sizes,"
+        "  uint32_t max_regions);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -104,5 +118,41 @@ _bloom_free = rffi.llexternal(
     "gnitz_bloom_free",
     [rffi.VOIDP],
     lltype.Void,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# XXH3 checksum
+# ---------------------------------------------------------------------------
+
+_xxh3_checksum = rffi.llexternal(
+    "gnitz_xxh3_checksum",
+    [rffi.CCHARP, rffi.LONGLONG],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# WAL encode/decode
+# ---------------------------------------------------------------------------
+
+_wal_encode = rffi.llexternal(
+    "gnitz_wal_encode",
+    [rffi.CCHARP, rffi.LONGLONG, rffi.LONGLONG,
+     rffi.ULONGLONG, rffi.UINT, rffi.UINT,
+     rffi.VOIDPP, rffi.UINTP,
+     rffi.UINT, rffi.ULONGLONG],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_wal_validate_and_parse = rffi.llexternal(
+    "gnitz_wal_validate_and_parse",
+    [rffi.CCHARP, rffi.LONGLONG,
+     rffi.ULONGLONGP, rffi.UINTP, rffi.UINTP,
+     rffi.UINTP, rffi.ULONGLONGP,
+     rffi.UINTP, rffi.UINTP,
+     rffi.UINT],
+    rffi.INT,
     compilation_info=eci,
 )

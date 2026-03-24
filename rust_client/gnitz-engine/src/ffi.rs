@@ -174,6 +174,109 @@ pub extern "C" fn gnitz_bloom_free(handle: *mut c_void) {
 }
 
 // ---------------------------------------------------------------------------
+// XXH3 checksum
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_xxh3_checksum(data: *const u8, len: i64) -> u64 {
+    let result = panic::catch_unwind(|| {
+        if data.is_null() || len <= 0 {
+            return 0u64;
+        }
+        let buf = unsafe { slice::from_raw_parts(data, len as usize) };
+        crate::xxh::checksum(buf)
+    });
+    result.unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// WAL encode/decode
+// ---------------------------------------------------------------------------
+
+/// Encode a WAL block from region data into out_buf at out_offset.
+/// Returns new offset, or -1 on error (buffer too small).
+#[no_mangle]
+pub extern "C" fn gnitz_wal_encode(
+    out_buf: *mut u8,
+    out_offset: i64,
+    out_capacity: i64,
+    lsn: u64,
+    table_id: u32,
+    entry_count: u32,
+    region_ptrs: *const *const u8,
+    region_sizes: *const u32,
+    num_regions: u32,
+    blob_size: u64,
+) -> i64 {
+    let result = panic::catch_unwind(|| {
+        if out_buf.is_null() || out_capacity <= 0 {
+            return -1i64;
+        }
+        let n = num_regions as usize;
+        let buf = unsafe { slice::from_raw_parts_mut(out_buf, out_capacity as usize) };
+        let ptrs = if n > 0 && !region_ptrs.is_null() {
+            unsafe { slice::from_raw_parts(region_ptrs, n) }
+        } else {
+            &[]
+        };
+        let sizes = if n > 0 && !region_sizes.is_null() {
+            unsafe { slice::from_raw_parts(region_sizes, n) }
+        } else {
+            &[]
+        };
+        crate::wal::encode(
+            buf, out_offset as usize, lsn, table_id, entry_count,
+            ptrs, sizes, blob_size,
+        )
+    });
+    result.unwrap_or(-1)
+}
+
+/// Validate a WAL block and extract header + directory.
+/// Returns 0=ok, -1=bad version, -2=bad checksum, -3=truncated.
+#[no_mangle]
+pub extern "C" fn gnitz_wal_validate_and_parse(
+    block: *const u8,
+    block_len: i64,
+    out_lsn: *mut u64,
+    out_tid: *mut u32,
+    out_count: *mut u32,
+    out_num_regions: *mut u32,
+    out_blob_size: *mut u64,
+    out_region_offsets: *mut u32,
+    out_region_sizes: *mut u32,
+    max_regions: u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if block.is_null() || block_len <= 0 {
+            return crate::wal::WAL_ERR_TRUNCATED;
+        }
+        let data = unsafe { slice::from_raw_parts(block, block_len as usize) };
+        let lsn = unsafe { &mut *out_lsn };
+        let tid = unsafe { &mut *out_tid };
+        let count = unsafe { &mut *out_count };
+        let num_regions = unsafe { &mut *out_num_regions };
+        let blob_size = unsafe { &mut *out_blob_size };
+        let max = max_regions as usize;
+        let offsets = if max > 0 && !out_region_offsets.is_null() {
+            unsafe { slice::from_raw_parts_mut(out_region_offsets, max) }
+        } else {
+            &mut []
+        };
+        let sizes = if max > 0 && !out_region_sizes.is_null() {
+            unsafe { slice::from_raw_parts_mut(out_region_sizes, max) }
+        } else {
+            &mut []
+        };
+        crate::wal::validate_and_parse(
+            data, lsn, tid, count, num_regions, blob_size,
+            offsets, sizes, max_regions,
+        )
+    });
+    result.unwrap_or(crate::wal::WAL_ERR_TRUNCATED)
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 
