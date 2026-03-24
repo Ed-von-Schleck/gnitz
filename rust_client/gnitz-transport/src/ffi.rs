@@ -67,12 +67,7 @@ pub extern "C" fn transport_poll(
             std::slice::from_raw_parts_mut(out_ptrs as *mut *mut u8, max)
         };
         let lens = unsafe { std::slice::from_raw_parts_mut(out_lens, max) };
-        let mut out = OutputSlots {
-            fds,
-            ptrs,
-            lens,
-            max,
-        };
+        let mut out = OutputSlots { fds, ptrs, lens };
         transport.poll(timeout_ms, &mut out)
     }));
     match result {

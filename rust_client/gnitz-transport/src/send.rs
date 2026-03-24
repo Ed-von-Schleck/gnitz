@@ -8,21 +8,31 @@ pub struct SendQueue {
     front: Vec<u8>,
     back: Vec<u8>,
     front_pos: usize,
-    pub inflight: bool,
+    pub(crate) inflight: bool,
 }
 
 impl SendQueue {
     pub fn new() -> Self {
         SendQueue {
-            front: Vec::with_capacity(8192),
-            back: Vec::with_capacity(8192),
+            front: Vec::new(),
+            back: Vec::new(),
             front_pos: 0,
             inflight: false,
         }
     }
 
+    pub fn is_inflight(&self) -> bool {
+        self.inflight
+    }
+
+    /// Mark an in-flight send as cancelled (error path).
+    pub fn cancel_inflight(&mut self) {
+        self.inflight = false;
+    }
+
     /// Append a framed response (4-byte header + payload) to the staging buffer.
     pub fn push(&mut self, header: &[u8; 4], payload: &[u8]) {
+        self.back.reserve(4 + payload.len());
         self.back.extend_from_slice(header);
         self.back.extend_from_slice(payload);
     }
@@ -35,20 +45,17 @@ impl SendQueue {
         }
 
         if self.front_pos == self.front.len() {
-            // front fully consumed — rotate back in
             if self.back.is_empty() {
                 return None;
             }
             self.front.clear();
-            debug_assert!(!self.inflight);
             self.front_pos = 0;
             std::mem::swap(&mut self.front, &mut self.back);
         }
 
-        let ptr = unsafe { self.front.as_ptr().add(self.front_pos) };
-        let len = self.front.len() - self.front_pos;
+        let remaining = &self.front[self.front_pos..];
         self.inflight = true;
-        Some((ptr, len))
+        Some((remaining.as_ptr(), remaining.len()))
     }
 
     /// Handle SEND CQE — advance position by bytes acknowledged.

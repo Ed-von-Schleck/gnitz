@@ -26,7 +26,7 @@ impl Conn {
 
     /// Returns true if there are outstanding SQEs for this connection.
     pub fn has_outstanding(&self) -> bool {
-        self.recv_armed || self.send_queue.inflight
+        self.recv_armed || self.send_queue.is_inflight()
     }
 }
 

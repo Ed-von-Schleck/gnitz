@@ -6,21 +6,13 @@ use crate::ring::{make_udata, cqe_fd, cqe_tag, Cqe, Ring, CQE_F_MORE, TAG_ACCEPT
 
 /// Maximum payload size accepted from a client (64 MB).
 const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
-
-/// A complete message ready for delivery to the caller.
-#[derive(Clone, Copy)]
-pub struct Message {
-    pub fd: i32,
-    pub ptr: *mut u8,
-    pub len: usize,
-}
+const ACCEPT_UDATA: u64 = make_udata(TAG_ACCEPT, 0);
 
 /// Output slot array — typed view over caller-provided C arrays.
 pub struct OutputSlots<'a> {
     pub fds: &'a mut [i32],
     pub ptrs: &'a mut [*mut u8],
     pub lens: &'a mut [u32],
-    pub max: usize,
 }
 
 /// The core transport state machine, generic over the Ring implementation.
@@ -38,7 +30,6 @@ pub struct Transport<R: Ring> {
     pending_delivery: Vec<i32>,
     cqe_buf: Vec<Cqe>,
     server_fd: i32,
-    accept_udata: u64,
 }
 
 impl<R: Ring> Transport<R> {
@@ -50,20 +41,18 @@ impl<R: Ring> Transport<R> {
             pending_delivery: Vec::new(),
             cqe_buf: vec![Cqe::default(); buf_size],
             server_fd: -1,
-            accept_udata: make_udata(TAG_ACCEPT, 0),
         }
     }
 
     /// Start accepting connections on `server_fd`.
     pub fn accept_conn(&mut self, server_fd: i32) {
         self.server_fd = server_fd;
-        self.ring.prep_accept(server_fd, self.accept_udata);
+        self.ring.prep_accept(server_fd, ACCEPT_UDATA);
     }
 
     /// Register a new client connection: create Conn, arm header recv.
     fn accept_new(&mut self, fd: i32) {
-        self.conns.insert(fd, Box::new(Conn::new()));
-        let conn = self.conns.get_mut(&fd).unwrap();
+        let conn = self.conns.entry(fd).or_insert_with(|| Box::new(Conn::new()));
         let hdr_ptr = conn.recv_state.hdr_buf_ptr();
         self.ring
             .prep_recv(fd, hdr_ptr, 4, make_udata(TAG_RECV, fd));
@@ -129,7 +118,7 @@ impl<R: Ring> Transport<R> {
         if !self.pending_delivery.is_empty() {
             let mut delivered = 0;
             for i in 0..self.pending_delivery.len() {
-                if msg_count >= out.max {
+                if msg_count >= out.fds.len() {
                     break;
                 }
                 let fd = self.pending_delivery[i];
@@ -154,7 +143,7 @@ impl<R: Ring> Transport<R> {
             }
             self.pending_delivery.drain(..delivered);
 
-            if msg_count >= out.max {
+            if msg_count >= out.fds.len() {
                 let _ = self.ring.submit_and_wait_timeout(0, 0);
                 self.reap_closing();
                 return msg_count as i32;
@@ -167,7 +156,7 @@ impl<R: Ring> Transport<R> {
             let Some(conn) = self.conns.get_mut(&fd) else {
                 continue;
             };
-            if conn.closing || conn.send_queue.inflight || !conn.send_queue.has_pending() {
+            if conn.closing || conn.send_queue.is_inflight() || !conn.send_queue.has_pending() {
                 continue;
             }
             let (ptr, len) = conn.send_queue.prepare().unwrap();
@@ -239,7 +228,7 @@ impl<R: Ring> Transport<R> {
                                 new_recv_sqes = true;
                             }
                             RecvAdvance::MessageDone => {
-                                if msg_count >= out.max {
+                                if msg_count >= out.fds.len() {
                                     // Output full — leave message in RecvState,
                                     // deliver in Phase -1 of next poll.
                                     self.pending_delivery.push(fd);
@@ -283,7 +272,7 @@ impl<R: Ring> Transport<R> {
                                 );
                             }
                         } else {
-                            conn.send_queue.inflight = false;
+                            conn.send_queue.cancel_inflight();
                             conn.closing = true;
                         }
                     }
@@ -293,14 +282,14 @@ impl<R: Ring> Transport<R> {
                         }
                         if cqe.flags & CQE_F_MORE == 0 {
                             self.ring
-                                .prep_accept(self.server_fd, self.accept_udata);
+                                .prep_accept(self.server_fd, ACCEPT_UDATA);
                         }
                     }
                     _ => {}
                 }
             }
 
-            if !new_recv_sqes || msg_count >= out.max {
+            if !new_recv_sqes || msg_count >= out.fds.len() {
                 break;
             }
 
@@ -337,8 +326,7 @@ mod tests {
         ptrs: &'a mut [*mut u8],
         lens: &'a mut [u32],
     ) -> OutputSlots<'a> {
-        let max = fds.len();
-        OutputSlots { fds, ptrs, lens, max }
+        OutputSlots { fds, ptrs, lens }
     }
 
     // ── Inner drain loop tests ──
@@ -768,7 +756,7 @@ mod tests {
         transport.poll(0, &mut slots(&mut fds, &mut ptrs, &mut lens));
 
         let conn = &transport.conns[&10];
-        assert!(!conn.send_queue.inflight);
+        assert!(!conn.send_queue.is_inflight());
         assert!(!conn.send_queue.has_pending());
     }
 

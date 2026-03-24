@@ -19,7 +19,7 @@ const FD_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 pub const CQE_F_MORE: u32 = 1 << 1;
 
 #[inline]
-pub fn make_udata(tag: u64, fd: i32) -> u64 {
+pub const fn make_udata(tag: u64, fd: i32) -> u64 {
     tag | (fd as u32 as u64)
 }
 
