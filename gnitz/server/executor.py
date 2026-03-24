@@ -361,7 +361,7 @@ class ServerExecutor(object):
                         return
 
                 if self._tick_state == _TICK_ACTIVE:
-                    timeout_ms = 0  # stay responsive during async tick
+                    timeout_ms = 1  # short poll: yield CPU to workers
                 else:
                     timeout_ms = 500
                     if len(self._tick_tids) > 0 and self._t_last_push > 0.0:

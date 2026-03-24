@@ -362,8 +362,8 @@ class MasterDispatcher(object):
         if not self._async_active:
             return True
 
-        # Non-blocking: timeout=0
-        eventfd_ffi.eventfd_wait_any(self.w2m_efds, 0)
+        # Short timeout: yield CPU to workers while still polling client I/O
+        eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1)
 
         for w in range(self.num_workers):
             if self._async_collected[w]:
