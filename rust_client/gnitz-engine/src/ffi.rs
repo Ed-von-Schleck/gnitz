@@ -277,6 +277,72 @@ pub extern "C" fn gnitz_wal_validate_and_parse(
 }
 
 // ---------------------------------------------------------------------------
+// Manifest
+// ---------------------------------------------------------------------------
+
+/// Serialize manifest entries to buffer.
+/// Returns bytes written, or -1 if buffer too small.
+#[no_mangle]
+pub extern "C" fn gnitz_manifest_serialize(
+    out_buf: *mut u8,
+    out_capacity: i64,
+    entries: *const u8,
+    count: u32,
+    global_max_lsn: u64,
+) -> i64 {
+    let result = panic::catch_unwind(|| {
+        if out_buf.is_null() || out_capacity <= 0 {
+            return -1i64;
+        }
+        let buf = unsafe { slice::from_raw_parts_mut(out_buf, out_capacity as usize) };
+        let n = count as usize;
+        let entry_slice = if n > 0 && !entries.is_null() {
+            unsafe {
+                slice::from_raw_parts(
+                    entries as *const crate::manifest::ManifestEntryRaw,
+                    n,
+                )
+            }
+        } else {
+            &[]
+        };
+        crate::manifest::serialize(buf, entry_slice, global_max_lsn)
+    });
+    result.unwrap_or(-1)
+}
+
+/// Parse manifest buffer. Returns entry count, or negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_manifest_parse(
+    buf: *const u8,
+    buf_len: i64,
+    out_entries: *mut u8,
+    max_entries: u32,
+    out_global_max_lsn: *mut u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if buf.is_null() || buf_len <= 0 || out_global_max_lsn.is_null() {
+            return crate::manifest::MANIFEST_ERR_TRUNCATED;
+        }
+        let data = unsafe { slice::from_raw_parts(buf, buf_len as usize) };
+        let lsn = unsafe { &mut *out_global_max_lsn };
+        let max = max_entries as usize;
+        let entries = if max > 0 && !out_entries.is_null() {
+            unsafe {
+                slice::from_raw_parts_mut(
+                    out_entries as *mut crate::manifest::ManifestEntryRaw,
+                    max,
+                )
+            }
+        } else {
+            &mut []
+        };
+        crate::manifest::parse(data, entries, max_entries, lsn)
+    });
+    result.unwrap_or(crate::manifest::MANIFEST_ERR_TRUNCATED)
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 

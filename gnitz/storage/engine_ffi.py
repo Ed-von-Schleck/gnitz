@@ -39,6 +39,15 @@ eci = ExternalCompilationInfo(
         "  uint32_t *out_num_regions, uint64_t *out_blob_size,"
         "  uint32_t *out_region_offsets, uint32_t *out_region_sizes,"
         "  uint32_t max_regions);",
+        # manifest
+        "int64_t gnitz_manifest_serialize("
+        "  uint8_t *out_buf, int64_t out_capacity,"
+        "  const uint8_t *entries, uint32_t count,"
+        "  uint64_t global_max_lsn);",
+        "int32_t gnitz_manifest_parse("
+        "  const uint8_t *buf, int64_t buf_len,"
+        "  uint8_t *out_entries, uint32_t max_entries,"
+        "  uint64_t *out_global_max_lsn);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -153,6 +162,28 @@ _wal_validate_and_parse = rffi.llexternal(
      rffi.UINTP, rffi.ULONGLONGP,
      rffi.UINTP, rffi.UINTP,
      rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Manifest
+# ---------------------------------------------------------------------------
+
+_manifest_serialize = rffi.llexternal(
+    "gnitz_manifest_serialize",
+    [rffi.CCHARP, rffi.LONGLONG,
+     rffi.CCHARP, rffi.UINT,
+     rffi.ULONGLONG],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_manifest_parse = rffi.llexternal(
+    "gnitz_manifest_parse",
+    [rffi.CCHARP, rffi.LONGLONG,
+     rffi.CCHARP, rffi.UINT,
+     rffi.ULONGLONGP],
     rffi.INT,
     compilation_info=eci,
 )
