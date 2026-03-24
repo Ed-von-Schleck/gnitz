@@ -196,7 +196,9 @@ class MemTableCursor(BaseCursor):
         return self._snapshot.length()
 
     def close(self):
-        self._snapshot.free()
+        if self._snapshot is not None:
+            self._snapshot.release()
+            self._snapshot = None
 
 
 # ---------------------------------------------------------------------------

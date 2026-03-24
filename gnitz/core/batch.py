@@ -420,6 +420,18 @@ class ArenaZSetBatch(object):
         self._sorted = False
         self._consolidated = False
         self._freed = False
+        self._ref_count = 1
+
+    def acquire(self):
+        """Increment reference count. Caller must later call release()."""
+        self._ref_count += 1
+        return self
+
+    def release(self):
+        """Decrement reference count. Frees when count reaches 0."""
+        self._ref_count -= 1
+        if self._ref_count <= 0:
+            self.free()
 
     @staticmethod
     def from_buffers(

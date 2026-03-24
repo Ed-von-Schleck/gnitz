@@ -47,15 +47,15 @@ class MemTable(object):
 
     def _invalidate_runs_cache(self):
         if self._cached_consolidated is not None:
-            self._cached_consolidated.free()
+            self._cached_consolidated.release()
             self._cached_consolidated = None
 
     def get_consolidated_snapshot(self):
-        """Return an owned, consolidated snapshot of runs + accumulator.
+        """Return a refcounted snapshot of runs + accumulator.
 
         Caches the N-way merge of sorted runs.  If accumulator is non-empty,
         does a cheap 2-way merge of [cached_runs, sorted_acc].
-        Caller owns the returned batch and must free it.
+        Caller must call release() when done (not free()).
         """
         if self._cached_consolidated is None and len(self.runs) > 0:
             self._cached_consolidated = _merge_runs_to_consolidated(
@@ -76,7 +76,7 @@ class MemTable(object):
             return ArenaZSetBatch(self.schema)
 
         if not has_acc:
-            return self._cached_consolidated.clone()
+            return self._cached_consolidated.acquire()
 
         sorted_acc = self._accumulator.to_sorted()
         two = [self._cached_consolidated, sorted_acc]
@@ -194,7 +194,7 @@ class MemTable(object):
         wrote = writer_table.write_batch_to_shard(
             consolidated, dirfd, basename, table_id, durable=durable
         )
-        consolidated.free()
+        consolidated.release()
         return wrote
 
     def is_empty(self):
