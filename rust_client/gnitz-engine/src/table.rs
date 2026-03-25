@@ -817,3 +817,153 @@ mod view_retraction_test {
         assert_eq!(rows[0], (10, 1), "expected (pk=10, weight=1)");
     }
 }
+
+#[cfg(test)]
+mod multi_cycle_test {
+    use super::*;
+
+    #[test]
+    fn ingest_retract_reingest_scan() {
+        let mut cols = [crate::compact::SchemaColumn { type_code: 8, size: 8, nullable: 0, _pad: 0 }; 64];
+        cols[1] = crate::compact::SchemaColumn { type_code: 9, size: 8, nullable: 0, _pad: 0 };
+        let schema = crate::compact::SchemaDescriptor { num_columns: 2, pk_index: 0, columns: cols };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = RustTable::create_ephemeral(
+            dir.path().to_str().unwrap(), "col_tab", schema.clone(), 4, 1 << 20,
+        ).unwrap();
+
+        // Cycle 1: insert rows 1,2,3 for owner=16
+        let pk1 = vec![1u64, 2, 3];
+        let hi1 = vec![0u64; 3];
+        let w1 = vec![1i64; 3];
+        let n1 = vec![0u64; 3];
+        let c1 = vec![16i64, 16, 16]; // owner_id = 16
+        let s1 = MappedShard::from_buffers(
+            pk1.as_ptr() as *const u8, hi1.as_ptr() as *const u8,
+            w1.as_ptr() as *const u8, n1.as_ptr() as *const u8,
+            &[c1.as_ptr() as *const u8], &[24],
+            std::ptr::null(), 0, 3, &schema,
+        );
+        table.ingest_batch_memonly(&s1);
+        let _ = table.flush();
+
+        // Retract rows 1,2,3 (owner=16 dropped)
+        let w1r = vec![-1i64; 3];
+        let s1r = MappedShard::from_buffers(
+            pk1.as_ptr() as *const u8, hi1.as_ptr() as *const u8,
+            w1r.as_ptr() as *const u8, n1.as_ptr() as *const u8,
+            &[c1.as_ptr() as *const u8], &[24],
+            std::ptr::null(), 0, 3, &schema,
+        );
+        table.ingest_batch_memonly(&s1r);
+        let _ = table.flush();
+
+        // Cycle 2: insert rows 4,5,6 for owner=18
+        let pk2 = vec![4u64, 5, 6];
+        let c2 = vec![18i64, 18, 18];
+        let s2 = MappedShard::from_buffers(
+            pk2.as_ptr() as *const u8, hi1.as_ptr() as *const u8,
+            w1.as_ptr() as *const u8, n1.as_ptr() as *const u8,
+            &[c2.as_ptr() as *const u8], &[24],
+            std::ptr::null(), 0, 3, &schema,
+        );
+        table.ingest_batch_memonly(&s2);
+        let _ = table.flush();
+
+        // Retract rows 4,5,6 (owner=18 dropped)
+        let s2r = MappedShard::from_buffers(
+            pk2.as_ptr() as *const u8, hi1.as_ptr() as *const u8,
+            w1r.as_ptr() as *const u8, n1.as_ptr() as *const u8,
+            &[c2.as_ptr() as *const u8], &[24],
+            std::ptr::null(), 0, 3, &schema,
+        );
+        table.ingest_batch_memonly(&s2r);
+        let _ = table.flush();
+
+        // Cycle 3: insert rows 7,8,9 for owner=20
+        let pk3 = vec![7u64, 8, 9];
+        let c3 = vec![20i64, 20, 20];
+        let s3 = MappedShard::from_buffers(
+            pk3.as_ptr() as *const u8, hi1.as_ptr() as *const u8,
+            w1.as_ptr() as *const u8, n1.as_ptr() as *const u8,
+            &[c3.as_ptr() as *const u8], &[24],
+            std::ptr::null(), 0, 3, &schema,
+        );
+        table.ingest_batch_memonly(&s3);
+
+        // Scan: should see rows 7,8,9 (w=+1) only
+        let mut cursor = table.create_cursor();
+        let mut visible: Vec<(u64, i64)> = Vec::new();
+        while cursor.is_valid() {
+            if cursor.weight() > 0 {
+                visible.push((cursor.key_lo(), cursor.weight()));
+            }
+            cursor.advance();
+        }
+        eprintln!("Visible rows: {:?}", visible);
+        assert_eq!(visible.len(), 3, "expected 3 rows for owner=20, got {:?}", visible);
+    }
+}
+
+#[cfg(test)]
+mod many_cycles_test {
+    use super::*;
+
+    #[test]
+    fn ten_ingest_retract_cycles() {
+        let mut cols = [crate::compact::SchemaColumn { type_code: 8, size: 8, nullable: 0, _pad: 0 }; 64];
+        cols[1] = crate::compact::SchemaColumn { type_code: 9, size: 8, nullable: 0, _pad: 0 };
+        let schema = crate::compact::SchemaDescriptor { num_columns: 2, pk_index: 0, columns: cols };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = RustTable::create_persistent(
+            dir.path().to_str().unwrap(), "sys_col_tab", schema.clone(), 4, 1 << 20,
+        ).unwrap();
+
+        let hi = vec![0u64; 4];
+        let n = vec![0u64; 4];
+
+        for cycle in 0..10u64 {
+            let owner = 16 + cycle * 2;
+            let pks: Vec<u64> = (cycle * 100..cycle * 100 + 4).collect();
+            let vals: Vec<i64> = vec![owner as i64; 4];
+            let w_pos = vec![1i64; 4];
+            let w_neg = vec![-1i64; 4];
+
+            // Insert 4 columns
+            let s = MappedShard::from_buffers(
+                pks.as_ptr() as *const u8, hi.as_ptr() as *const u8,
+                w_pos.as_ptr() as *const u8, n.as_ptr() as *const u8,
+                &[vals.as_ptr() as *const u8], &[32],
+                std::ptr::null(), 0, 4, &schema,
+            );
+            table.ingest_batch(&s, cycle * 2);
+            let _ = table.flush();
+
+            // Retract (except last cycle)
+            if cycle < 9 {
+                let sr = MappedShard::from_buffers(
+                    pks.as_ptr() as *const u8, hi.as_ptr() as *const u8,
+                    w_neg.as_ptr() as *const u8, n.as_ptr() as *const u8,
+                    &[vals.as_ptr() as *const u8], &[32],
+                    std::ptr::null(), 0, 4, &schema,
+                );
+                table.ingest_batch(&sr, cycle * 2 + 1);
+                let _ = table.flush();
+            }
+        }
+
+        // Scan: should see only cycle 9's 4 rows
+        let mut cursor = table.create_cursor();
+        let mut pos = 0;
+        let mut neg = 0;
+        while cursor.is_valid() {
+            if cursor.weight() > 0 { pos += 1; } else { neg += 1; }
+            cursor.advance();
+        }
+        eprintln!("pos={} neg={}", pos, neg);
+        assert_eq!(pos, 4, "expected 4 visible rows, got pos={} neg={}", pos, neg);
+        assert_eq!(neg, 0, "expected 0 negative rows");
+    }
+}

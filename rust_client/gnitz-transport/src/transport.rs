@@ -52,7 +52,9 @@ impl<R: Ring> Transport<R> {
 
     /// Register a new client connection: create Conn, arm header recv.
     fn accept_new(&mut self, fd: i32) {
-        let conn = self.conns.entry(fd).or_insert_with(|| Box::new(Conn::new()));
+        // Always reset: fd may have been reused after close.
+        self.conns.insert(fd, Box::new(Conn::new()));
+        let conn = self.conns.get_mut(&fd).unwrap();
         let hdr_ptr = conn.recv_state.hdr_buf_ptr();
         self.ring
             .prep_recv(fd, hdr_ptr, 4, make_udata(TAG_RECV, fd));

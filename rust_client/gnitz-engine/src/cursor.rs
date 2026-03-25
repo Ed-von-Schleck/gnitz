@@ -59,7 +59,7 @@ impl UnifiedCursor {
         for i in 0..n {
             cursors.push(ShardCursor::new(i, shards_view[i]));
         }
-        let tree = TournamentTree::build(&cursors, &shards_view);
+        let tree = TournamentTree::build(&cursors, &shards_view, &schema);
 
         let mut c = UnifiedCursor {
             shard_refs,
@@ -81,7 +81,7 @@ impl UnifiedCursor {
         for i in 0..self.cursors.len() {
             self.cursors[i].seek(shards[i], key_lo, key_hi);
         }
-        self.tree = TournamentTree::build(&self.cursors, &shards);
+        self.tree = TournamentTree::build(&self.cursors, &shards, &self.schema);
         self.find_next();
     }
 
@@ -93,7 +93,7 @@ impl UnifiedCursor {
         let num_min = self.advance_buf.len();
         for i in 0..num_min {
             let ci = self.advance_buf[i];
-            self.tree.advance_cursor(ci, &mut self.cursors, &shards);
+            self.tree.advance_cursor(ci, &mut self.cursors, &shards, &self.schema);
         }
         self.find_next();
     }
@@ -127,7 +127,7 @@ impl UnifiedCursor {
 
             for i in 0..num_min {
                 let ci = self.advance_buf[i];
-                self.tree.advance_cursor(ci, &mut self.cursors, &shards);
+                self.tree.advance_cursor(ci, &mut self.cursors, &shards, &self.schema);
             }
         }
     }
@@ -194,7 +194,7 @@ pub(crate) fn merge_to_writer(
     for i in 0..shards.len() {
         cursors.push(ShardCursor::new(i, shards[i]));
     }
-    let mut tree = TournamentTree::build(&cursors, &shards);
+    let mut tree = TournamentTree::build(&cursors, &shards, schema);
     let mut writer = ShardWriter::new(schema);
 
     let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
@@ -218,7 +218,7 @@ pub(crate) fn merge_to_writer(
         advance_buf.clear();
         advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
         for &ci in &advance_buf {
-            tree.advance_cursor(ci, &mut cursors, &shards);
+            tree.advance_cursor(ci, &mut cursors, &shards, schema);
         }
     }
 
