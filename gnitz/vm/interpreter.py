@@ -192,11 +192,7 @@ def run_vm(program, reg_file, context):
                         ck_hi = gc_u64
                         gi_acc.spk_hi = r_int64(intmask(source_pk_hi))
                         weight = b.get_weight(idx)
-                        try:
-                            gi.table.memtable.upsert_single(ck_lo, ck_hi, weight, gi_acc)
-                        except errors.MemTableFullError:
-                            gi.table.flush()
-                            gi.table.memtable.upsert_single(ck_lo, ck_hi, weight, gi_acc)
+                        gi.table.ingest_one(ck_lo, ck_hi, weight, gi_acc)
             if instr.agg_value_idx is not None:
                 avi = instr.agg_value_idx
                 b = reg_in.batch
@@ -214,11 +210,7 @@ def run_vm(program, reg_file, context):
                         ck_lo = av_u64
                         ck_hi = gc_u64
                         weight = b.get_weight(idx)
-                        try:
-                            avi.table.memtable.upsert_single(ck_lo, ck_hi, weight, _UNIT_GI_ACC)
-                        except errors.MemTableFullError:
-                            avi.table.flush()
-                            avi.table.memtable.upsert_single(ck_lo, ck_hi, weight, _UNIT_GI_ACC)
+                        avi.table.ingest_one(ck_lo, ck_hi, weight, _UNIT_GI_ACC)
 
         elif opcode == op.OPCODE_ANTI_JOIN_DELTA_TRACE:
             reg_delta = instr.reg_delta

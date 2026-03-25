@@ -339,6 +339,48 @@ class RustUnifiedCursor(AbstractCursor):
             self._snapshot = None
 
 
+class RustUnifiedCursorFromHandle(AbstractCursor):
+    """Wraps a pre-created Rust cursor handle (from gnitz_table_create_cursor)."""
+
+    def __init__(self, schema, handle):
+        self.schema = schema
+        self._handle = handle
+        self._accessor = RustCursorAccessor(schema, handle)
+
+    def seek(self, key_lo, key_hi):
+        engine_ffi._cursor_seek(
+            self._handle,
+            rffi.cast(rffi.ULONGLONG, key_lo),
+            rffi.cast(rffi.ULONGLONG, key_hi),
+        )
+
+    def advance(self):
+        engine_ffi._cursor_advance(self._handle)
+
+    def is_valid(self):
+        return bool(intmask(engine_ffi._cursor_is_valid(self._handle)))
+
+    def key_lo(self):
+        return r_uint64(engine_ffi._cursor_key_lo(self._handle))
+
+    def key_hi(self):
+        return r_uint64(engine_ffi._cursor_key_hi(self._handle))
+
+    def weight(self):
+        return intmask(engine_ffi._cursor_weight(self._handle))
+
+    def get_accessor(self):
+        return self._accessor
+
+    def estimated_length(self):
+        return 0
+
+    def close(self):
+        if self._handle:
+            engine_ffi._cursor_close(self._handle)
+            self._handle = NULL_HANDLE
+
+
 def _pack_batch_desc(base, batch, schema, num_payload, col_ptrs, col_sizes):
     """Write a GnitzBatchDesc at base for one ArenaZSetBatch."""
     off = 0

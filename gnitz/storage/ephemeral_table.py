@@ -1,8 +1,8 @@
 # gnitz/storage/ephemeral_table.py
+#
+# Thin FFI wrapper around Rust RustTable (ephemeral mode).
 
-import errno
 import os
-from rpython.rlib import rposix
 from rpython.rlib.rarithmetic import (
     r_int64,
     r_uint64,
@@ -13,361 +13,263 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, errors
-from gnitz.core import comparator as core_comparator
 from gnitz.core.store import ZSetStore
-from gnitz.core.keys import promote_to_index_key
 from gnitz.core.batch import pk_eq
 from gnitz.storage import (
-    index,
     engine_ffi,
-    flsm,
-    memtable,
-    mmap_posix,
-    refcount,
+    shard_table,
     comparator as storage_comparator,
     cursor,
 )
 
-
-EPH_SHARD_PREFIX = "eph_shard_"
-
-
-def _wrap_shard_handle(handle, schema):
-    """Wrap a raw shard handle as a TableShardView without opening a file."""
-    from gnitz.storage.shard_table import TableShardView
-    view = TableShardView("", schema)
-    view._handle = handle
-    view._blob_ptr = engine_ffi._shard_blob_ptr(handle)
-    view.count = intmask(engine_ffi._shard_row_count(handle))
-    return view
-
-
-def _name_to_tid(name):
-    """
-    Standardizes name-to-TID hashing for internal state tables.
-    """
-    tid = 0
-    for char in name:
-        tid = (tid * 31 + ord(char)) & 0x7FFFFFFF
-    if tid == 0:
-        tid = 1
-    return tid
+NULL_HANDLE = lltype.nullptr(rffi.VOIDP.TO)
 
 
 class EphemeralTable(ZSetStore):
-    """
-    Scratch Z-Set storage for internal VM state or Secondary Indices.
-    Bypasses the Write-Ahead Log to maximize throughput.
-    Inherits directly from ZSetStore; PersistentTable inherits from this.
-    """
 
-    _immutable_fields_ = [
-        "schema",
-        "table_id",
-        "directory",
-        "name",
-        "ref_counter",
-    ]
+    _immutable_fields_ = ["schema", "table_id", "directory", "name"]
 
-    def __init__(
-        self,
-        directory,
-        name,
-        schema,
-        table_id=0,
-        memtable_arena_size=1 * 1024 * 1024,
-        validate_checksums=False,
-    ):
-        self.directory = directory
-        self.name = name
+    def __init__(self, directory, name, schema, table_id=1,
+                 memtable_arena_size=1 * 1024 * 1024, validate_checksums=False):
         self.schema = schema
         self.table_id = table_id
+        self.directory = directory
+        self.name = name
         self.validate_checksums = validate_checksums
         self.is_closed = False
-
-        self.ref_counter = refcount.RefCounter()
-
-        try:
-            rposix.mkdir(directory, 0o755)
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                raise
-        mmap_posix.try_set_nocow_dir(directory)
-        self._dirfd = rposix.open(directory, os.O_RDONLY, 0)
-
-        self._erase_stale_shards()
-
-        self.index = flsm.FLSMIndex(table_id, schema, self.ref_counter,
-                                    directory, validate_checksums)
-        self.memtable = memtable.MemTable(schema, memtable_arena_size)
-        self._flush_seq = 0
-        self._has_wal = True
         self.current_lsn = r_uint64(0)
+        self._handle = NULL_HANDLE
         self._retract_soa = storage_comparator.SoAAccessor(schema)
 
-    def _erase_stale_shards(self):
-        """Delete any leftover ephemeral shard files from a previous run."""
-        try:
-            entries = os.listdir(self.directory)
-        except OSError:
+        if len(directory) == 0:
             return
-        for name in entries:
-            if name.startswith(EPH_SHARD_PREFIX):
-                try:
-                    os.unlink(self.directory + "/" + name)
-                except OSError:
-                    pass
 
-    # -- ZSetStore Interface Implementation -----------------------------------
+        schema_buf = engine_ffi.pack_schema(schema)
+        try:
+            with rffi.scoped_str2charp(directory) as dir_p:
+                with rffi.scoped_str2charp(name) as name_p:
+                    handle = engine_ffi._table_create_ephemeral(
+                        dir_p, name_p,
+                        rffi.cast(rffi.VOIDP, schema_buf),
+                        rffi.cast(rffi.UINT, table_id),
+                        rffi.cast(rffi.ULONGLONG, memtable_arena_size),
+                    )
+            if not handle:
+                raise errors.StorageError("table_create_ephemeral failed")
+            self._handle = handle
+        finally:
+            lltype.free(schema_buf, flavor="raw")
 
     def get_schema(self):
         return self.schema
 
-    def create_child(self, name, schema):
-        """Returns another EphemeralTable instance for recursive state."""
-        # Avoid os.path.join (Appendix A §10 slicing proof failure)
-        scratch_dir = self.directory + "/scratch_" + name
-        tid = _name_to_tid(name)
-
-        return EphemeralTable(
-            scratch_dir,
-            name,
-            schema,
-            table_id=tid,
-            memtable_arena_size=self.memtable.max_bytes,
-        )
-
     def _build_cursor(self):
-        all_handles = self.index.all_handles_for_cursor()
-        borrowed = newlist_hint(len(all_handles))
-        for h in all_handles:
-            borrowed.append(h.view._handle)
-        snapshot = self.memtable.get_consolidated_snapshot()
-        return cursor.RustUnifiedCursor(self.schema, borrowed, snapshot)
+        handle = engine_ffi._table_create_cursor(self._handle)
+        if not handle:
+            raise errors.StorageError("table_create_cursor failed")
+        return cursor.RustUnifiedCursorFromHandle(self.schema, handle)
 
     def compact_if_needed(self):
-        if self.index.needs_compaction:
-            self._compact()
+        engine_ffi._table_compact_if_needed(self._handle)
 
     def create_cursor(self):
         self.compact_if_needed()
         return self._build_cursor()
 
-    def _compact(self):
-        self.index.run_compact()
-        self.index.ref_counter.try_cleanup()
+    def create_child(self, name, child_schema):
+        schema_buf = engine_ffi.pack_schema(child_schema)
+        try:
+            with rffi.scoped_str2charp(name) as name_p:
+                child_handle = engine_ffi._table_create_child(
+                    self._handle, name_p,
+                    rffi.cast(rffi.VOIDP, schema_buf),
+                )
+            if not child_handle:
+                raise errors.StorageError("table_create_child failed")
+        finally:
+            lltype.free(schema_buf, flavor="raw")
 
-    def _scan_shards_for_pk(self, key_lo, key_hi):
-        """Walk shards for a PK via the shard index.
-
-        Returns (net_weight_from_shards, view_or_None, first_row_idx).
-        """
-        total_w = r_int64(0)
-        found_view = None
-        found_idx = -1
-        r_key = (r_uint128(key_hi) << 64) | r_uint128(key_lo)
-        shard_matches = self.index.find_all_shards_and_indices(r_key)
-        if shard_matches:
-            for handle, row_idx in shard_matches:
-                view = handle.view
-                idx = row_idx
-                while idx < view.count:
-                    if not pk_eq(view.get_pk_lo(idx), view.get_pk_hi(idx), key_lo, key_hi):
-                        break
-                    total_w += view.get_weight(idx)
-                    if found_view is None:
-                        found_view = view
-                        found_idx = idx
-                    idx += 1
-        return total_w, found_view, found_idx
+        child = EphemeralTable("", name, child_schema, self.table_id)
+        child.directory = self.directory + "/scratch_" + name
+        child._handle = child_handle
+        return child
 
     def has_pk(self, key_lo, key_hi):
-        """
-        Fast-path existence check for a Primary Key.
-        Returns True if the net algebraic weight across MemTable and Shards is > 0.
-        """
-        total_w = r_int64(0)
-        if self.memtable.may_contain_pk(key_lo, key_hi):
-            mt_w, mt_handle, _ = self.memtable.lookup_pk(key_lo, key_hi)
-            total_w = mt_w
-            if mt_handle:
-                engine_ffi._shard_close(mt_handle)
-        shard_w, _, _ = self._scan_shards_for_pk(key_lo, key_hi)
-        total_w += shard_w
-        return total_w > 0
+        return bool(intmask(engine_ffi._table_has_pk(
+            self._handle,
+            rffi.cast(rffi.ULONGLONG, key_lo),
+            rffi.cast(rffi.ULONGLONG, key_hi),
+        )))
 
     def retract_pk(self, key_lo, key_hi, out_batch):
-        """If PK exists with positive net weight, append a retraction
-        (weight=-1) of the current row to out_batch.
+        out_shard = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+        out_row = lltype.malloc(rffi.INTP.TO, 1, flavor="raw")
+        out_weight = lltype.malloc(rffi.LONGLONGP.TO, 1, flavor="raw")
+        try:
+            out_shard[0] = NULL_HANDLE
+            out_row[0] = rffi.cast(rffi.INT, -1)
+            out_weight[0] = rffi.cast(rffi.LONGLONG, 0)
+            found = engine_ffi._table_retract_pk(
+                self._handle,
+                rffi.cast(rffi.ULONGLONG, key_lo),
+                rffi.cast(rffi.ULONGLONG, key_hi),
+                rffi.cast(rffi.VOIDPP, out_shard),
+                out_row, out_weight,
+            )
+            if intmask(found) == 0:
+                return False
+            shard_handle = out_shard[0]
+            row_idx = intmask(out_row[0])
+        finally:
+            lltype.free(out_shard, flavor="raw")
+            lltype.free(out_row, flavor="raw")
+            lltype.free(out_weight, flavor="raw")
 
-        Returns True if a retraction was emitted, False if PK was absent
-        or had non-positive net weight.
-        """
-        total_w = r_int64(0)
-        mt_shard_handle = lltype.nullptr(rffi.VOIDP.TO)
-        mt_row_idx = -1
-        if self.memtable.may_contain_pk(key_lo, key_hi):
-            mt_w, mt_shard_handle, mt_row_idx = self.memtable.lookup_pk(key_lo, key_hi)
-            total_w = mt_w
-        shard_w, shard_view, shard_idx = self._scan_shards_for_pk(key_lo, key_hi)
-        total_w += shard_w
-        if total_w <= r_int64(0):
-            if mt_shard_handle:
-                engine_ffi._shard_close(mt_shard_handle)
-            return False
-        if mt_shard_handle:
-            mt_view = _wrap_shard_handle(mt_shard_handle, self.schema)
-            self._retract_soa.set_row(mt_view, mt_row_idx)
+        if shard_handle:
+            view = shard_table.TableShardView("", self.schema)
+            view._handle = shard_handle
+            view._blob_ptr = engine_ffi._shard_blob_ptr(shard_handle)
+            view.count = intmask(engine_ffi._shard_row_count(shard_handle))
+            self._retract_soa.set_row(view, row_idx)
             out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_soa)
-            engine_ffi._shard_close(mt_shard_handle)
-        elif shard_view is not None:
-            self._retract_soa.set_row(shard_view, shard_idx)
-            out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_soa)
+            engine_ffi._shard_close(shard_handle)
         return True
 
     def get_weight(self, key_lo, key_hi, accessor):
-        """
-        Returns the net algebraic weight for a specific record.
-        """
-        total_w = r_int64(0)
+        num_payload = len(self.schema.columns) - 1
+        col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
+        col_sizes = lltype.malloc(rffi.ULONGLONGP.TO, num_payload, flavor="raw")
+        try:
+            pi = 0
+            pk_index = self.schema.pk_index
+            ci = 0
+            num_cols = len(self.schema.columns)
+            while ci < num_cols:
+                if ci != pk_index:
+                    col_ptrs[pi] = rffi.cast(rffi.VOIDP, accessor.get_col_ptr(ci))
+                    col_sizes[pi] = rffi.cast(
+                        rffi.ULONGLONG,
+                        self.schema.columns[ci].field_type.size,
+                    )
+                    pi += 1
+                ci += 1
 
-        # 1. Check MemTable (Bloom-filtered)
-        if self.memtable.may_contain_pk(key_lo, key_hi):
-            total_w += self.memtable.find_weight_for_row(key_lo, key_hi, accessor)
+            null_word = r_uint64(0)
+            for i in range(num_cols):
+                if i == pk_index:
+                    continue
+                if accessor.is_null(i):
+                    payload_idx = i if i < pk_index else i - 1
+                    null_word |= r_uint64(1) << payload_idx
 
-        # 2. Check Columnar Shards via Index
-        r_key = (r_uint128(key_hi) << 64) | r_uint128(key_lo)
-        shard_matches = self.index.find_all_shards_and_indices(r_key)
-        if shard_matches:
-            soa = storage_comparator.SoAAccessor(self.schema)
+            blob_ptr = lltype.nullptr(rffi.CCHARP.TO)
+            blob_len = 0
+            from gnitz.core.batch import ColumnarBatchAccessor
+            if isinstance(accessor, ColumnarBatchAccessor):
+                if accessor._batch is not None:
+                    blob_ptr = accessor._batch.blob_arena.base_ptr
+                    blob_len = accessor._batch.blob_arena.offset
 
-            for handle, row_idx in shard_matches:
-                view = handle.view
-                idx = row_idx
-                while idx < view.count:
-                    if not pk_eq(view.get_pk_lo(idx), view.get_pk_hi(idx), key_lo, key_hi):
-                        break
-
-                    soa.set_row(view, idx)
-                    if core_comparator.compare_rows(self.schema, soa, accessor) == 0:
-                        total_w += view.get_weight(idx)
-                    idx += 1
-
-        return total_w
+            w = engine_ffi._table_get_weight(
+                self._handle,
+                rffi.cast(rffi.ULONGLONG, key_lo),
+                rffi.cast(rffi.ULONGLONG, key_hi),
+                rffi.cast(rffi.ULONGLONG, null_word),
+                col_ptrs, col_sizes,
+                rffi.cast(rffi.UINT, num_payload),
+                rffi.cast(rffi.CCHARP, blob_ptr),
+                rffi.cast(rffi.ULONGLONG, blob_len),
+            )
+            return rffi.cast(lltype.Signed, w)
+        finally:
+            lltype.free(col_ptrs, flavor="raw")
+            lltype.free(col_sizes, flavor="raw")
 
     def ingest_batch(self, batch):
         if self.is_closed:
             raise errors.StorageError("Table is closed")
-
         if batch.length() == 0:
             return
-
+        num_payload = len(self.schema.columns) - 1
+        desc_buf = lltype.malloc(
+            rffi.CCHARP.TO, engine_ffi.BATCH_DESC_SIZE, flavor="raw"
+        )
+        col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
+        col_sizes = lltype.malloc(rffi.ULONGLONGP.TO, num_payload, flavor="raw")
         try:
-            self.memtable.upsert_batch(batch)
-            if self.memtable.should_flush():
-                self.flush()
-        except errors.MemTableFullError:
-            self.flush()
-            self.memtable.upsert_batch(batch)
+            from gnitz.storage.memtable import _pack_batch_desc
+            _pack_batch_desc(desc_buf, batch, self.schema, num_payload, col_ptrs, col_sizes)
+            rc = engine_ffi._table_ingest_batch_memonly(
+                self._handle, rffi.cast(rffi.VOIDP, desc_buf),
+            )
+            if intmask(rc) < 0:
+                raise errors.StorageError("table_ingest_batch failed (%d)" % intmask(rc))
+        finally:
+            lltype.free(col_ptrs, flavor="raw")
+            lltype.free(col_sizes, flavor="raw")
+            lltype.free(desc_buf, flavor="raw")
 
-    def flush(self):
-        """Transitions MemTable state to a temporary columnar shard."""
+    def ingest_one(self, key_lo, key_hi, weight, accessor):
         if self.is_closed:
             raise errors.StorageError("Table is closed")
+        num_payload = len(self.schema.columns) - 1
+        col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
+        try:
+            pi = 0
+            pk_index = self.schema.pk_index
+            ci = 0
+            num_cols = len(self.schema.columns)
+            while ci < num_cols:
+                if ci != pk_index:
+                    col_ptrs[pi] = rffi.cast(rffi.VOIDP, accessor.get_col_ptr(ci))
+                    pi += 1
+                ci += 1
 
-        self._flush_seq += 1
-        shard_name = EPH_SHARD_PREFIX + "%d_%d_%d.db" % (self.table_id, os.getpid(), self._flush_seq)
+            null_word = r_uint64(0)
+            for i in range(num_cols):
+                if i == pk_index:
+                    continue
+                if accessor.is_null(i):
+                    payload_idx = i if i < pk_index else i - 1
+                    null_word |= r_uint64(1) << payload_idx
 
-        wrote = self.memtable.flush(self._dirfd, shard_name, self.table_id,
-                                    durable=False)
+            blob_ptr = lltype.nullptr(rffi.CCHARP.TO)
+            blob_len = 0
+            from gnitz.core.batch import ColumnarBatchAccessor
+            if isinstance(accessor, ColumnarBatchAccessor):
+                if accessor._batch is not None:
+                    blob_ptr = accessor._batch.blob_arena.base_ptr
+                    blob_len = accessor._batch.blob_arena.offset
 
-        if not wrote:
-            return ""
+            rc = engine_ffi._table_ingest_one(
+                self._handle,
+                rffi.cast(rffi.ULONGLONG, key_lo),
+                rffi.cast(rffi.ULONGLONG, key_hi),
+                rffi.cast(rffi.LONGLONG, weight),
+                rffi.cast(rffi.ULONGLONG, null_word),
+                col_ptrs,
+                rffi.cast(rffi.UINT, num_payload),
+                rffi.cast(rffi.CCHARP, blob_ptr),
+                rffi.cast(rffi.ULONGLONG, blob_len),
+            )
+            if intmask(rc) < 0:
+                raise errors.StorageError("table_ingest_one failed (%d)" % intmask(rc))
+        finally:
+            lltype.free(col_ptrs, flavor="raw")
 
-        shard_path = self.directory + "/" + shard_name
-        h = index.ShardHandle(
-            shard_path,
-            self.schema,
-            r_uint64(0),
-            r_uint64(0),
-            validate_checksums=self.validate_checksums,
-        )
-
-        if h.view.count > 0:
-            self.index.add_handle(h)
-        else:
-            h.close()
-            try:
-                mmap_posix.unlinkat_c(self._dirfd, shard_name)
-            except mmap_posix.MMapError:
-                pass
-
-        self.memtable.reset()
-
-        return shard_path
+    def flush(self):
+        if self.is_closed:
+            raise errors.StorageError("Table is closed")
+        rc = engine_ffi._table_flush(self._handle)
+        rc_int = intmask(rc)
+        if rc_int < 0:
+            raise errors.StorageError("table_flush failed (%d)" % rc_int)
+        return "" if rc_int == 0 else self.directory
 
     def close(self):
         if self.is_closed:
             return
-        if self.memtable:
-            self.memtable.free()
-        if self.index:
-            self.index.close_all()
-        if self._dirfd != -1:
-            rposix.close(self._dirfd)
-            self._dirfd = -1
         self.is_closed = True
-
-    # -- Internal / Index Specific APIs ---------------------------------------
-
-    def ingest_projection(
-        self, source_batch, source_col_idx, source_col_type, payload_accessor, is_unique
-    ):
-        """
-        Hot-path projection kernel for secondary indices.
-        Extracts index keys from source_batch and injects them into the local store.
-        """
-        n = source_batch.length()
-        if n == 0:
-            return
-
-        acc = source_batch.get_accessor(0)
-
-        for i in range(n):
-            source_batch.bind_accessor(i, acc)
-
-            if acc.is_null(source_col_idx):
-                continue
-
-            weight = source_batch.get_weight(i)
-            if weight == r_int64(0):
-                continue
-
-            index_key = promote_to_index_key(acc, source_col_idx, source_col_type)
-            index_key_lo = r_uint64(intmask(index_key))
-            index_key_hi = r_uint64(intmask(index_key >> 64))
-
-            if is_unique and weight > r_int64(0):
-                if self.has_pk(index_key_lo, index_key_hi):
-                    raise errors.LayoutError(
-                        "Unique index violation on column index %d" % source_col_idx
-                    )
-
-            source_pk = source_batch.get_pk(i)
-            # Alignment-safe u128 assignment (Appendix A §4)
-            payload_accessor.pk_lo = r_uint64(intmask(source_pk))
-            payload_accessor.pk_hi = r_uint64(intmask(source_pk >> 64))
-
-            try:
-                self.memtable.upsert_single(index_key_lo, index_key_hi, weight, payload_accessor)
-            except errors.MemTableFullError:
-                self.flush()
-                self.memtable.upsert_single(index_key_lo, index_key_hi, weight, payload_accessor)
-
-    def ingest_one(self, key_lo, key_hi, weight, accessor):
-        """Cold-path injection for index backfills."""
-        try:
-            self.memtable.upsert_single(key_lo, key_hi, weight, accessor)
-        except errors.MemTableFullError:
-            self.flush()
-            self.memtable.upsert_single(key_lo, key_hi, weight, accessor)
+        if self._handle:
+            engine_ffi._table_close(self._handle)
+            self._handle = NULL_HANDLE
