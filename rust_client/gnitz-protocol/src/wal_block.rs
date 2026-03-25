@@ -146,7 +146,8 @@ fn read_64bit_region<T: Copy + Default>(
 /// num_regions = 4 + (ncols - 1) + 1.
 pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
     let count = batch.len();
-    let num_non_pk = schema.columns.len() - 1;
+    let ncols = schema.columns.len();
+    let num_non_pk = if ncols > 0 { ncols - 1 } else { 0 };
     let num_regions = 4 + num_non_pk + 1;
 
     // --- Pre-build String/U128 column region data (needs blob arena) ---
