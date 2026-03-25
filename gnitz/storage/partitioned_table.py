@@ -159,8 +159,24 @@ class PartitionedTable(ZSetStore):
         num_live = len(self.partitions)
         if num_live == 0:
             return _EmptyCursor()
+        if num_live == 1:
+            return self.partitions[0].create_cursor()
 
-        return self.partitions[0].create_cursor()
+        # Merge cursors from all partitions into a single sorted batch,
+        # then return a cursor over that batch.
+        merged = ArenaZSetBatch(self.schema)
+        for i in range(num_live):
+            cur = self.partitions[i].create_cursor()
+            try:
+                while cur.is_valid():
+                    acc = cur.get_accessor()
+                    merged.append_from_accessor(
+                        cur.key_lo(), cur.key_hi(), cur.weight(), acc)
+                    cur.advance()
+            finally:
+                cur.close()
+        from gnitz.storage.cursor import SortedBatchCursor
+        return SortedBatchCursor(merged)
 
     def retract_pk(self, key_lo, key_hi, out_batch):
         if len(self.partitions) == 0:

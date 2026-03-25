@@ -10,13 +10,16 @@ pub fn build(pk_lo: &[u64], pk_hi: &[u64]) -> Option<Xor8> {
     if n == 0 {
         return None;
     }
-    let keys: Vec<u64> = pk_lo[..n]
+    let mut keys: Vec<u64> = pk_lo[..n]
         .iter()
         .zip(pk_hi[..n].iter())
         .map(|(&lo, &hi)| xxh::hash_u128(lo, hi))
         .collect();
-    // Xor8::from is infallible for deduplicated keys.
-    // Primary keys are unique by definition.
+    // Dedup hash keys for xor8 construction only — the xorf crate panics
+    // on duplicate inputs. Z-Set shards can contain the same PK multiple
+    // times (different weights), but the filter only needs distinct keys.
+    keys.sort_unstable();
+    keys.dedup();
     Some(Xor8::from(keys.as_slice()))
 }
 

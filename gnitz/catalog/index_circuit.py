@@ -32,16 +32,24 @@ from gnitz.storage.ephemeral_table import EphemeralTable
 
 class IndexPayloadAccessor(core_comparator.RowAccessor):
     """
-    Internal zero-allocation accessor for index projection.
-    Mocks a row where the payload is simply a Source PK.
-
-    Appendix A: Uses split u64 components to avoid C-level struct alignment 
-    segfaults on u128 assignment.
+    Internal accessor for index projection.
+    Mocks a row where the single payload column is a Source PK.
+    Stores the PK in a small raw buffer so get_col_ptr can return a pointer.
     """
 
     def __init__(self):
         self.pk_lo = r_uint64(0)
         self.pk_hi = r_uint64(0)
+        # 16-byte buffer: room for u128 (or u64 in first 8 bytes)
+        self._buf = lltype.malloc(rffi.CCHARP.TO, 16, flavor="raw")
+
+    def set_pk(self, pk_lo, pk_hi):
+        self.pk_lo = pk_lo
+        self.pk_hi = pk_hi
+        rffi.cast(rffi.ULONGLONGP, self._buf)[0] = rffi.cast(
+            rffi.ULONGLONG, pk_lo)
+        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(self._buf, 8))[0] = rffi.cast(
+            rffi.ULONGLONG, pk_hi)
 
     def is_null(self, col_idx):
         return False
@@ -63,6 +71,9 @@ class IndexPayloadAccessor(core_comparator.RowAccessor):
 
     def get_str_struct(self, col_idx):
         return (0, r_int64(0), lltype.nullptr(rffi.CCHARP.TO), lltype.nullptr(rffi.CCHARP.TO), "")
+
+    def get_col_ptr(self, col_idx):
+        return self._buf
 
 
 def get_index_key_type(field_type):
@@ -226,8 +237,7 @@ def _backfill_index(circuit, source_family):
 
             # Set PK components for the alignment-safe accessor
             acc_inj = circuit._index_payload_accessor
-            acc_inj.pk_lo = source_pk_lo
-            acc_inj.pk_hi = source_pk_hi
+            acc_inj.set_pk(source_pk_lo, source_pk_hi)
 
             # EphemeralTable.ingest_one handles MemTableFullError internally.
             circuit.table.ingest_one(index_key_lo, index_key_hi, weight, acc_inj)

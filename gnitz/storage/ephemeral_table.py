@@ -289,8 +289,7 @@ class EphemeralTable(ZSetStore):
                 raise errors.LayoutError(
                     "Unique index violation during projection")
 
-            index_payload_accessor.pk_lo = source_pk_lo
-            index_payload_accessor.pk_hi = source_pk_hi
+            index_payload_accessor.set_pk(source_pk_lo, source_pk_hi)
             self.ingest_one(index_key_lo, index_key_hi, weight, index_payload_accessor)
 
     def flush(self):
