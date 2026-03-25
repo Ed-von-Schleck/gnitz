@@ -458,3 +458,61 @@ mod tests {
         assert_eq!(read_back.get_pk_lo(2), 15);
     }
 }
+
+#[cfg(test)]
+mod retraction_test {
+    use super::*;
+    use crate::compact::SchemaDescriptor;
+
+    fn make_schema() -> SchemaDescriptor {
+        let mut cols = [crate::compact::SchemaColumn { type_code: 8, size: 8, nullable: 0, _pad: 0 }; 64];
+        cols[1] = crate::compact::SchemaColumn { type_code: 9, size: 8, nullable: 0, _pad: 0 };
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns: cols }
+    }
+
+    #[test]
+    fn retraction_across_shards() {
+        let schema = make_schema();
+        // Shard 1: (pk=10, val=300, w=+1)
+        let s1 = crate::shard_reader::MappedShard::from_buffers(
+            &10u64.to_le_bytes() as *const _ as *const u8,
+            &0u64.to_le_bytes() as *const _ as *const u8,
+            &1i64.to_le_bytes() as *const _ as *const u8,
+            &0u64.to_le_bytes() as *const _ as *const u8,
+            &[&300i64.to_le_bytes() as *const _ as *const u8],
+            &[8usize],
+            std::ptr::null(), 0, 1, &schema,
+        );
+        // Shard 2: (pk=10, val=300, w=-1) and (pk=10, val=200, w=+1)
+        let pk2 = [10u64, 10];
+        let hi2 = [0u64, 0];
+        let w2 = [-1i64, 1];
+        let n2 = [0u64, 0];
+        let c2 = [300i64, 200]; // val=300 (retract), val=200 (insert)
+        let s2 = crate::shard_reader::MappedShard::from_buffers(
+            pk2.as_ptr() as *const u8,
+            hi2.as_ptr() as *const u8,
+            w2.as_ptr() as *const u8,
+            n2.as_ptr() as *const u8,
+            &[c2.as_ptr() as *const u8],
+            &[16usize],
+            std::ptr::null(), 0, 2, &schema,
+        );
+
+        let refs = vec![ShardRef::Owned(s1), ShardRef::Owned(s2)];
+        let mut cursor = UnifiedCursor::new(refs, schema);
+
+        assert!(cursor.is_valid(), "cursor should have at least one row");
+        // Should see (pk=10, val=200, w=+1) only — (pk=10, val=300) cancels
+        let shards: Vec<&MappedShard> = cursor.shard_refs.iter().map(|r| r.as_ref()).collect();
+        let col_ptr = shards[cursor.current_shard_idx].col_ptrs[0];
+        let val = unsafe { *(col_ptr.add(cursor.current_row * 8) as *const i64) };
+        eprintln!("Row 1: pk={}, val={}, weight={}", cursor.key_lo(), val, cursor.current_weight);
+        assert_eq!(cursor.key_lo(), 10);
+        assert_eq!(val, 200);
+        assert_eq!(cursor.current_weight, 1);
+
+        cursor.advance();
+        assert!(!cursor.is_valid(), "should have no more rows after consolidation");
+    }
+}

@@ -342,34 +342,45 @@ impl TournamentTree {
         if self.heap.is_empty() {
             return 0;
         }
-        self.collect_equal(0, shards, cursors, schema);
+        // Collect all heap entries with the minimum PK
+        let min_pk = self.heap[0].key;
+        let mut pk_matches: Vec<usize> = Vec::new();
+        for i in 0..self.heap.len() {
+            if self.heap[i].key == min_pk {
+                pk_matches.push(i);
+            }
+        }
+        // Among those with the same PK, find the smallest by full-row comparison
+        let mut best = pk_matches[0];
+        for &idx in &pk_matches[1..] {
+            let ca = &cursors[self.heap[idx].cursor_idx];
+            let cb = &cursors[self.heap[best].cursor_idx];
+            let ord = compare_rows(
+                schema, shards,
+                ca.shard_idx, ca.position,
+                cb.shard_idx, cb.position,
+            );
+            if ord == std::cmp::Ordering::Less {
+                best = idx;
+            }
+        }
+        // Collect all entries equal to the best (by full row)
+        let best_ci = self.heap[best].cursor_idx;
+        for &idx in &pk_matches {
+            let ci = self.heap[idx].cursor_idx;
+            if ci == best_ci {
+                self.min_indices.push(ci);
+                continue;
+            }
+            let ca = &cursors[ci];
+            let cb = &cursors[best_ci];
+            if compare_rows(schema, shards, ca.shard_idx, ca.position, cb.shard_idx, cb.position)
+                == std::cmp::Ordering::Equal
+            {
+                self.min_indices.push(ci);
+            }
+        }
         self.min_indices.len()
-    }
-
-    fn collect_equal(
-        &mut self,
-        idx: usize,
-        shards: &[&MappedShard],
-        cursors: &[ShardCursor],
-        schema: &SchemaDescriptor,
-    ) {
-        if idx >= self.heap.len() {
-            return;
-        }
-        // Compare this node to root (node 0)
-        if idx == 0 || self.compare_to_root(idx, shards, cursors, schema) == std::cmp::Ordering::Equal {
-            self.min_indices.push(self.heap[idx].cursor_idx);
-            let left = 2 * idx + 1;
-            let right = 2 * idx + 2;
-            // Must call with concrete indices to avoid borrow issues
-            if left < self.heap.len() {
-                self.collect_equal(left, shards, cursors, schema);
-            }
-            if right < self.heap.len() {
-                self.collect_equal(right, shards, cursors, schema);
-            }
-        }
-        // If > root, prune entire subtree
     }
 
     fn compare_to_root(

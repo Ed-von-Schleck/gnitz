@@ -98,14 +98,96 @@ fn sort_batch(src: &MappedShard, schema: &SchemaDescriptor) -> OwnedBatch {
         return OwnedBatch::new(schema);
     }
 
+    // Sort by full row (PK + payload) for Z-Set consolidation.
+    let shards: Vec<&MappedShard> = vec![src];
     let mut indices: Vec<usize> = (0..n).collect();
     indices.sort_unstable_by(|&a, &b| {
         let ka = src.get_pk(a);
         let kb = src.get_pk(b);
-        ka.cmp(&kb)
+        let pk_ord = ka.cmp(&kb);
+        if pk_ord != std::cmp::Ordering::Equal {
+            return pk_ord;
+        }
+        crate::compact::compare_rows(schema, &shards, 0, a, 0, b)
     });
 
-    scatter_copy(src, &indices, schema)
+    // Consolidate: merge consecutive rows with identical (PK + payload)
+    // by summing weights, drop zero-weight results.
+    let mut consolidated: Vec<usize> = Vec::with_capacity(n);
+    let mut weights: Vec<i64> = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let row = indices[i];
+        let mut w = src.get_weight(row);
+        let mut j = i + 1;
+        while j < n {
+            let next = indices[j];
+            if src.get_pk(row) != src.get_pk(next) {
+                break;
+            }
+            if crate::compact::compare_rows(schema, &shards, 0, row, 0, next)
+                != std::cmp::Ordering::Equal
+            {
+                break;
+            }
+            w += src.get_weight(next);
+            j += 1;
+        }
+        if w != 0 {
+            consolidated.push(row);
+            weights.push(w);
+        }
+        i = j;
+    }
+
+    scatter_copy_weighted(src, &consolidated, &weights, schema)
+}
+
+/// Like scatter_copy but uses provided weights instead of source weights.
+fn scatter_copy_weighted(
+    src: &MappedShard, indices: &[usize], weights: &[i64],
+    schema: &SchemaDescriptor,
+) -> OwnedBatch {
+    let n = indices.len();
+    let pk_index = schema.pk_index as usize;
+    let num_cols = schema.num_columns as usize;
+
+    let mut out = OwnedBatch::new(schema);
+    out.pk_lo.reserve(n * 8);
+    out.pk_hi.reserve(n * 8);
+    out.weight.reserve(n * 8);
+    out.null_bm.reserve(n * 8);
+    out.count = n;
+
+    for (ri, &idx) in indices.iter().enumerate() {
+        out.pk_lo.extend_from_slice(&src.get_pk_lo(idx).to_le_bytes());
+        out.pk_hi.extend_from_slice(&src.get_pk_hi(idx).to_le_bytes());
+        out.weight.extend_from_slice(&weights[ri].to_le_bytes());
+        out.null_bm.extend_from_slice(&src.get_null_word(idx).to_le_bytes());
+    }
+
+    let mut payload_idx = 0usize;
+    for ci in 0..num_cols {
+        if ci == pk_index { continue; }
+        let col = &schema.columns[ci];
+        let col_size = col.size as usize;
+        let is_string = col.type_code == 11;
+        out.cols[ci].reserve(n * col_size);
+        if is_string {
+            let src_blob = src.blob_slice();
+            for &idx in indices {
+                let src_struct = src.get_col_ptr(idx, payload_idx, 16);
+                relocate_string_into(&mut out.cols[ci], &mut out.blob, src_struct, src_blob);
+            }
+        } else {
+            for &idx in indices {
+                let data = src.get_col_ptr(idx, payload_idx, col_size);
+                out.cols[ci].extend_from_slice(data);
+            }
+        }
+        payload_idx += 1;
+    }
+    out
 }
 
 /// Copy rows from src in the order given by indices, producing a new OwnedBatch.
@@ -744,11 +826,15 @@ mod tests {
         let schema = make_schema();
         let mut mt = RustMemTable::new(schema.clone(), 100);
 
-        let tb = TestBatch::new(vec![1; 100], vec![1; 100], vec![10; 100]);
+        // Use distinct PKs so consolidation doesn't reduce the batch
+        let pks: Vec<u64> = (1..=100).collect();
+        let vals: Vec<i64> = vec![10; 100];
+        let tb = TestBatch::new(pks.clone(), vec![1; 100], vals);
         let rc = mt.upsert_batch(&tb.as_shard(&schema));
         assert_eq!(rc, 0);
 
-        let rc2 = mt.upsert_batch(&tb.as_shard(&schema));
+        let tb2 = TestBatch::new(pks, vec![1; 100], vec![20; 100]);
+        let rc2 = mt.upsert_batch(&tb2.as_shard(&schema));
         assert_eq!(rc2, ERR_MEMTABLE_FULL);
     }
 }

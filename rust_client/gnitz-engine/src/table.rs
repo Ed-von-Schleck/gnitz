@@ -761,3 +761,59 @@ mod tests {
         table.close();
     }
 }
+
+#[cfg(test)]
+mod view_retraction_test {
+    use super::*;
+
+    #[test]
+    fn retract_via_table_cursor() {
+        let mut cols = [crate::compact::SchemaColumn { type_code: 8, size: 8, nullable: 0, _pad: 0 }; 64];
+        cols[1] = crate::compact::SchemaColumn { type_code: 9, size: 8, nullable: 0, _pad: 0 };
+        let schema = crate::compact::SchemaDescriptor { num_columns: 2, pk_index: 0, columns: cols };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = RustTable::create_ephemeral(
+            dir.path().to_str().unwrap(), "view_trace", schema.clone(), 99, 1 << 20,
+        ).unwrap();
+
+        // Batch 1: initial aggregate output (category=10, total=300, w=+1)
+        let pk1 = vec![10u64];
+        let hi1 = vec![0u64];
+        let w1 = vec![1i64];
+        let n1 = vec![0u64];
+        let c1 = vec![300i64];
+        let s1 = MappedShard::from_buffers(
+            pk1.as_ptr() as *const u8, hi1.as_ptr() as *const u8,
+            w1.as_ptr() as *const u8, n1.as_ptr() as *const u8,
+            &[c1.as_ptr() as *const u8], &[8],
+            std::ptr::null(), 0, 1, &schema,
+        );
+        table.ingest_batch_memonly(&s1);
+
+        // Batch 2: retraction + new value
+        let pk2: Vec<u64> = vec![10, 10];
+        let hi2: Vec<u64> = vec![0, 0];
+        let w2: Vec<i64> = vec![-1, 1];
+        let n2: Vec<u64> = vec![0, 0];
+        let c2: Vec<i64> = vec![300, 200];
+        let s2 = MappedShard::from_buffers(
+            pk2.as_ptr() as *const u8, hi2.as_ptr() as *const u8,
+            w2.as_ptr() as *const u8, n2.as_ptr() as *const u8,
+            &[c2.as_ptr() as *const u8], &[16],
+            std::ptr::null(), 0, 2, &schema,
+        );
+        table.ingest_batch_memonly(&s2);
+
+        // Create cursor — should consolidate (10,300,+1) with (10,300,-1) → gone
+        let mut cursor = table.create_cursor();
+        let mut rows: Vec<(u64, i64)> = Vec::new();
+        while cursor.is_valid() {
+            rows.push((cursor.key_lo(), cursor.weight()));
+            cursor.advance();
+        }
+        eprintln!("Rows: {:?}", rows);
+        assert_eq!(rows.len(), 1, "expected 1 row after retraction, got {:?}", rows);
+        assert_eq!(rows[0], (10, 1), "expected (pk=10, weight=1)");
+    }
+}
