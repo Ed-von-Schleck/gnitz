@@ -1036,6 +1036,250 @@ pub extern "C" fn gnitz_merged_batch_free(batch: *mut GnitzMergedBatch) {
 }
 
 // ---------------------------------------------------------------------------
+// MemTable FFI
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_create(
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    max_bytes: u64,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if schema_desc.is_null() { return ptr::null_mut(); }
+        let schema = unsafe { &*schema_desc };
+        let mt = crate::memtable::RustMemTable::new(schema.clone(), max_bytes as usize);
+        Box::into_raw(Box::new(mt)) as *mut c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_free(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let _ = unsafe { Box::from_raw(handle as *mut crate::memtable::RustMemTable) };
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_upsert_batch(
+    handle: *mut c_void,
+    desc: *const GnitzBatchDesc,
+) -> i32 {
+    if handle.is_null() || desc.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::RustMemTable) };
+        let d = unsafe { &*desc };
+        let schema = mt.schema_ref();
+        let n_cols = d.num_payload_cols as usize;
+        let (col_ptrs, col_sizes) = if n_cols > 0 && !d.col_ptrs.is_null() && !d.col_sizes.is_null() {
+            let ptrs = unsafe { slice::from_raw_parts(d.col_ptrs, n_cols) };
+            let raw_sizes = unsafe { slice::from_raw_parts(d.col_sizes, n_cols) };
+            let sizes: Vec<usize> = raw_sizes.iter().map(|&s| s as usize).collect();
+            (ptrs.to_vec(), sizes)
+        } else {
+            (vec![ptr::null(); n_cols], vec![0usize; n_cols])
+        };
+        let shard = crate::shard_reader::MappedShard::from_buffers(
+            d.pk_lo, d.pk_hi, d.weight, d.null_bm,
+            &col_ptrs, &col_sizes,
+            d.blob_ptr, d.blob_len as usize,
+            d.count as usize, schema,
+        );
+        mt.upsert_batch(&shard)
+    }));
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_append_row(
+    handle: *mut c_void,
+    key_lo: u64, key_hi: u64, weight: i64,
+    null_word: u64,
+    col_ptrs: *const *const u8,
+    num_payload_cols: u32,
+    source_blob: *const u8,
+    source_blob_len: u64,
+) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::RustMemTable) };
+        let n = num_payload_cols as usize;
+        let ptrs = if n > 0 && !col_ptrs.is_null() {
+            unsafe { slice::from_raw_parts(col_ptrs, n) }
+        } else {
+            &[]
+        };
+        mt.append_row(
+            key_lo, key_hi, weight, null_word,
+            ptrs, source_blob, source_blob_len as usize,
+        )
+    }));
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_flush(
+    handle: *mut c_void,
+    dirfd: i32,
+    filename: *const libc::c_char,
+    table_id: u32,
+    durable: i32,
+) -> i32 {
+    if handle.is_null() || filename.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::RustMemTable) };
+        let cname = unsafe { CStr::from_ptr(filename) };
+        match mt.flush(dirfd, cname, table_id, durable != 0) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(e) => e,
+        }
+    }));
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_get_snapshot(
+    handle: *mut c_void,
+    out: *mut GnitzMergedBatch,
+) -> i32 {
+    if handle.is_null() || out.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::RustMemTable) };
+        let mut snapshot = mt.get_snapshot();
+        let schema = mt.schema_ref().clone();
+        let pk_index = schema.pk_index as usize;
+
+        let out_ref = unsafe { &mut *out };
+        *out_ref = GnitzMergedBatch::zeroed();
+        out_ref.count = snapshot.count as u32;
+
+        fn vec_to_ptr(v: Vec<u8>, out_ptr: &mut *mut u8, out_len: &mut u64) {
+            *out_len = v.len() as u64;
+            *out_ptr = Box::into_raw(v.into_boxed_slice()) as *mut u8;
+        }
+
+        vec_to_ptr(std::mem::take(&mut snapshot.pk_lo), &mut out_ref.pk_lo, &mut out_ref.pk_lo_len);
+        vec_to_ptr(std::mem::take(&mut snapshot.pk_hi), &mut out_ref.pk_hi, &mut out_ref.pk_hi_len);
+        vec_to_ptr(std::mem::take(&mut snapshot.weight), &mut out_ref.weight, &mut out_ref.weight_len);
+        vec_to_ptr(std::mem::take(&mut snapshot.null_bm), &mut out_ref.null_bm, &mut out_ref.null_bm_len);
+
+        let mut ci = 0u32;
+        for col_idx in 0..schema.num_columns as usize {
+            if col_idx == pk_index { continue; }
+            let buf = std::mem::take(&mut snapshot.cols[col_idx]);
+            out_ref.col_lens[ci as usize] = buf.len() as u64;
+            out_ref.col_ptrs[ci as usize] = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
+            ci += 1;
+        }
+        out_ref.num_cols = ci;
+
+        vec_to_ptr(std::mem::take(&mut snapshot.blob), &mut out_ref.blob, &mut out_ref.blob_len);
+        0
+    }));
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_lookup_pk(
+    handle: *mut c_void,
+    key_lo: u64, key_hi: u64,
+    out_weight: *mut i64,
+    out_shard: *mut *const c_void,
+    out_row: *mut i32,
+) -> i32 {
+    if handle.is_null() || out_weight.is_null() { return 0; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mt = unsafe { &*(handle as *const crate::memtable::RustMemTable) };
+        let (weight, found) = mt.lookup_pk(key_lo, key_hi);
+        unsafe { *out_weight = weight; }
+        if let Some((shard, row)) = found {
+            // Store the shard as a boxed handle so caller can read via gnitz_shard_* FFI
+            if !out_shard.is_null() {
+                unsafe { *out_shard = Box::into_raw(Box::new(shard)) as *const c_void; }
+            }
+            if !out_row.is_null() {
+                unsafe { *out_row = row as i32; }
+            }
+            1
+        } else {
+            if !out_shard.is_null() { unsafe { *out_shard = ptr::null(); } }
+            if !out_row.is_null() { unsafe { *out_row = -1; } }
+            0
+        }
+    }));
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_find_weight(
+    handle: *mut c_void,
+    key_lo: u64, key_hi: u64,
+    null_word: u64,
+    col_ptrs: *const *const u8,
+    col_sizes: *const u64,
+    num_payload_cols: u32,
+    blob_ptr: *const u8, blob_len: u64,
+) -> i64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mt = unsafe { &*(handle as *const crate::memtable::RustMemTable) };
+        let n = num_payload_cols as usize;
+        let (ptrs, sizes) = if n > 0 && !col_ptrs.is_null() && !col_sizes.is_null() {
+            let p = unsafe { slice::from_raw_parts(col_ptrs, n) };
+            let s: Vec<usize> = unsafe { slice::from_raw_parts(col_sizes, n) }
+                .iter().map(|&v| v as usize).collect();
+            (p.to_vec(), s)
+        } else {
+            (vec![], vec![])
+        };
+        mt.find_weight_for_row(
+            key_lo, key_hi, &ptrs, &sizes, null_word,
+            blob_ptr, blob_len as usize,
+        )
+    }));
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_may_contain(handle: *const c_void, key_lo: u64, key_hi: u64) -> i32 {
+    if handle.is_null() { return 0; }
+    let mt = unsafe { &*(handle as *const crate::memtable::RustMemTable) };
+    if mt.may_contain_pk(key_lo, key_hi) { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_should_flush(handle: *const c_void) -> i32 {
+    if handle.is_null() { return 0; }
+    let mt = unsafe { &*(handle as *const crate::memtable::RustMemTable) };
+    if mt.should_flush() { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_is_empty(handle: *const c_void) -> i32 {
+    if handle.is_null() { return 1; }
+    let mt = unsafe { &*(handle as *const crate::memtable::RustMemTable) };
+    if mt.is_empty() { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_total_rows(handle: *const c_void) -> u32 {
+    if handle.is_null() { return 0; }
+    let mt = unsafe { &*(handle as *const crate::memtable::RustMemTable) };
+    mt.total_rows() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_reset(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::RustMemTable) };
+        mt.reset();
+    }));
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 

@@ -176,13 +176,14 @@ class PartitionedTable(ZSetStore):
             snap = p.memtable.get_consolidated_snapshot()
             snapshots.append(snap)
 
-        # Merge all snapshots into one via Rust bulk merge, then pass as
-        # a single batch descriptor. This avoids multiple batch descriptors
-        # (the cursor FFI takes exactly one).
-        from gnitz.storage.memtable import _merge_runs_to_consolidated
-        merged_snap = _merge_runs_to_consolidated(snapshots, self.schema)
-        for s in snapshots:
-            s.release()
+        # Merge all snapshots into one consolidated batch.
+        if len(snapshots) == 1:
+            merged_snap = snapshots[0]
+        else:
+            from gnitz.storage.memtable import _rust_merge_batches
+            merged_snap = _rust_merge_batches(snapshots, self.schema)
+            for s in snapshots:
+                s.release()
 
         return RustUnifiedCursor(self.schema, all_handles, merged_snap)
 

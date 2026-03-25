@@ -30,6 +30,9 @@ class TableShardView(object):
         self.xor8_filter = None
         self.count = 0
 
+        if len(filename) == 0:
+            return
+
         schema_buf = engine_ffi.pack_schema(schema)
         fn_str = rffi.str2charp(filename)
         try:

@@ -511,6 +511,10 @@ impl RustMemTable {
         self.total_bytes() > self.max_bytes * 3 / 4
     }
 
+    pub fn schema_ref(&self) -> &SchemaDescriptor {
+        &self.schema
+    }
+
     pub fn is_empty(&self) -> bool {
         self.total_row_count == 0
     }

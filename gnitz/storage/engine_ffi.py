@@ -124,6 +124,31 @@ eci = ExternalCompilationInfo(
         "  GnitzBatchDesc *batch_descs, uint32_t num_batches,"
         "  void *schema_desc, GnitzMergedBatch *out);",
         "void gnitz_merged_batch_free(GnitzMergedBatch *batch);",
+        # memtable
+        "void *gnitz_memtable_create(void *schema_desc, uint64_t max_bytes);",
+        "void gnitz_memtable_free(void *handle);",
+        "int32_t gnitz_memtable_upsert_batch(void *handle, GnitzBatchDesc *desc);",
+        "int32_t gnitz_memtable_append_row("
+        "  void *handle, uint64_t key_lo, uint64_t key_hi, int64_t weight,"
+        "  uint64_t null_word, void **col_ptrs, uint32_t num_payload_cols,"
+        "  uint8_t *source_blob, uint64_t source_blob_len);",
+        "int32_t gnitz_memtable_flush("
+        "  void *handle, int32_t dirfd, const char *filename,"
+        "  uint32_t table_id, int32_t durable);",
+        "int32_t gnitz_memtable_get_snapshot(void *handle, GnitzMergedBatch *out);",
+        "int32_t gnitz_memtable_lookup_pk("
+        "  void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  int64_t *out_weight, void **out_shard, int32_t *out_row);",
+        "int64_t gnitz_memtable_find_weight("
+        "  void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  uint64_t null_word, void **col_ptrs, uint64_t *col_sizes,"
+        "  uint32_t num_payload_cols,"
+        "  uint8_t *blob_ptr, uint64_t blob_len);",
+        "int32_t gnitz_memtable_may_contain(void *handle, uint64_t key_lo, uint64_t key_hi);",
+        "int32_t gnitz_memtable_should_flush(void *handle);",
+        "int32_t gnitz_memtable_is_empty(void *handle);",
+        "uint32_t gnitz_memtable_total_rows(void *handle);",
+        "void gnitz_memtable_reset(void *handle);",
         # shard file write
         "int32_t gnitz_write_shard("
         "  int32_t dirfd, const char *filename,"
@@ -561,6 +586,112 @@ _merge_to_batch = rffi.llexternal(
 
 _merged_batch_free = rffi.llexternal(
     "gnitz_merged_batch_free",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Shard file write
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# MemTable
+# ---------------------------------------------------------------------------
+
+_memtable_create = rffi.llexternal(
+    "gnitz_memtable_create",
+    [rffi.VOIDP, rffi.ULONGLONG],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_memtable_free = rffi.llexternal(
+    "gnitz_memtable_free",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_memtable_upsert_batch = rffi.llexternal(
+    "gnitz_memtable_upsert_batch",
+    [rffi.VOIDP, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_append_row = rffi.llexternal(
+    "gnitz_memtable_append_row",
+    [rffi.VOIDP,
+     rffi.ULONGLONG, rffi.ULONGLONG, rffi.LONGLONG,
+     rffi.ULONGLONG,
+     rffi.VOIDPP, rffi.UINT,
+     rffi.CCHARP, rffi.ULONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_flush = rffi.llexternal(
+    "gnitz_memtable_flush",
+    [rffi.VOIDP, rffi.INT, rffi.CCHARP, rffi.UINT, rffi.INT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_get_snapshot = rffi.llexternal(
+    "gnitz_memtable_get_snapshot",
+    [rffi.VOIDP, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_lookup_pk = rffi.llexternal(
+    "gnitz_memtable_lookup_pk",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG,
+     rffi.LONGLONGP, rffi.VOIDPP, rffi.INTP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_find_weight = rffi.llexternal(
+    "gnitz_memtable_find_weight",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG,
+     rffi.ULONGLONG, rffi.VOIDPP, rffi.ULONGLONGP, rffi.UINT,
+     rffi.CCHARP, rffi.ULONGLONG],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_memtable_may_contain = rffi.llexternal(
+    "gnitz_memtable_may_contain",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_should_flush = rffi.llexternal(
+    "gnitz_memtable_should_flush",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_is_empty = rffi.llexternal(
+    "gnitz_memtable_is_empty",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_total_rows = rffi.llexternal(
+    "gnitz_memtable_total_rows",
+    [rffi.VOIDP],
+    rffi.UINT,
+    compilation_info=eci,
+)
+
+_memtable_reset = rffi.llexternal(
+    "gnitz_memtable_reset",
     [rffi.VOIDP],
     lltype.Void,
     compilation_info=eci,

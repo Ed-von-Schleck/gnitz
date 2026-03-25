@@ -16,9 +16,10 @@ from gnitz.core import types, errors
 from gnitz.core import comparator as core_comparator
 from gnitz.core.store import ZSetStore
 from gnitz.core.keys import promote_to_index_key
-from gnitz.core.batch import ColumnarBatchAccessor, pk_eq
+from gnitz.core.batch import pk_eq
 from gnitz.storage import (
     index,
+    engine_ffi,
     flsm,
     memtable,
     mmap_posix,
@@ -29,6 +30,16 @@ from gnitz.storage import (
 
 
 EPH_SHARD_PREFIX = "eph_shard_"
+
+
+def _wrap_shard_handle(handle, schema):
+    """Wrap a raw shard handle as a TableShardView without opening a file."""
+    from gnitz.storage.shard_table import TableShardView
+    view = TableShardView("", schema)
+    view._handle = handle
+    view._blob_ptr = engine_ffi._shard_blob_ptr(handle)
+    view.count = intmask(engine_ffi._shard_row_count(handle))
+    return view
 
 
 def _name_to_tid(name):
@@ -92,7 +103,6 @@ class EphemeralTable(ZSetStore):
         self._flush_seq = 0
         self._has_wal = True
         self.current_lsn = r_uint64(0)
-        self._retract_acc = ColumnarBatchAccessor(schema)
         self._retract_soa = storage_comparator.SoAAccessor(schema)
 
     def _erase_stale_shards(self):
@@ -178,8 +188,10 @@ class EphemeralTable(ZSetStore):
         """
         total_w = r_int64(0)
         if self.memtable.may_contain_pk(key_lo, key_hi):
-            mt_w, _, _ = self.memtable.lookup_pk(key_lo, key_hi)
+            mt_w, mt_handle, _ = self.memtable.lookup_pk(key_lo, key_hi)
             total_w = mt_w
+            if mt_handle:
+                engine_ffi._shard_close(mt_handle)
         shard_w, _, _ = self._scan_shards_for_pk(key_lo, key_hi)
         total_w += shard_w
         return total_w > 0
@@ -192,18 +204,22 @@ class EphemeralTable(ZSetStore):
         or had non-positive net weight.
         """
         total_w = r_int64(0)
-        mt_batch = None
-        mt_idx = -1
+        mt_shard_handle = lltype.nullptr(rffi.VOIDP.TO)
+        mt_row_idx = -1
         if self.memtable.may_contain_pk(key_lo, key_hi):
-            mt_w, mt_batch, mt_idx = self.memtable.lookup_pk(key_lo, key_hi)
+            mt_w, mt_shard_handle, mt_row_idx = self.memtable.lookup_pk(key_lo, key_hi)
             total_w = mt_w
         shard_w, shard_view, shard_idx = self._scan_shards_for_pk(key_lo, key_hi)
         total_w += shard_w
         if total_w <= r_int64(0):
+            if mt_shard_handle:
+                engine_ffi._shard_close(mt_shard_handle)
             return False
-        if mt_batch is not None:
-            self._retract_acc.bind(mt_batch, mt_idx)
-            out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_acc)
+        if mt_shard_handle:
+            mt_view = _wrap_shard_handle(mt_shard_handle, self.schema)
+            self._retract_soa.set_row(mt_view, mt_row_idx)
+            out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_soa)
+            engine_ffi._shard_close(mt_shard_handle)
         elif shard_view is not None:
             self._retract_soa.set_row(shard_view, shard_idx)
             out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_soa)
