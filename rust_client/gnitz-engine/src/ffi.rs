@@ -1,3 +1,4 @@
+use std::ffi::CStr;
 use std::panic;
 use std::ptr;
 use std::slice;
@@ -340,6 +341,94 @@ pub extern "C" fn gnitz_manifest_parse(
         crate::manifest::parse(data, entries, max_entries, lsn)
     });
     result.unwrap_or(crate::manifest::MANIFEST_ERR_TRUNCATED)
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+/// N-way merge compaction: merge input shards into one output shard.
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_compact_shards(
+    input_files: *const *const libc::c_char,
+    num_inputs: u32,
+    output_file: *const libc::c_char,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    table_id: u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if input_files.is_null() || output_file.is_null() || schema_desc.is_null() {
+            return -1;
+        }
+        let n = num_inputs as usize;
+        let schema = unsafe { &*schema_desc };
+        let out = unsafe { CStr::from_ptr(output_file) };
+
+        let file_ptrs = unsafe { slice::from_raw_parts(input_files, n) };
+        let inputs: Vec<&CStr> = file_ptrs
+            .iter()
+            .map(|&p| unsafe { CStr::from_ptr(p) })
+            .collect();
+
+        crate::compact::compact_shards(&inputs, out, schema, table_id)
+    });
+    result.unwrap_or(-99)
+}
+
+/// Guarded N-way merge: merge input shards, routing rows to guard-bounded outputs.
+/// Returns number of non-empty guard outputs on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_merge_and_route(
+    input_files: *const *const libc::c_char,
+    num_inputs: u32,
+    output_dir: *const libc::c_char,
+    guard_keys: *const u64,  // flat array: [lo0, hi0, lo1, hi1, ...]
+    num_guards: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    table_id: u32,
+    level_num: u32,
+    lsn_tag: u64,
+    out_results: *mut crate::compact::GuardResult,
+    max_results: u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if input_files.is_null() || output_dir.is_null() || schema_desc.is_null() {
+            return -1;
+        }
+        let n_inputs = num_inputs as usize;
+        let n_guards = num_guards as usize;
+        let schema = unsafe { &*schema_desc };
+        let out_dir = unsafe { CStr::from_ptr(output_dir) };
+
+        let file_ptrs = unsafe { slice::from_raw_parts(input_files, n_inputs) };
+        let inputs: Vec<&CStr> = file_ptrs
+            .iter()
+            .map(|&p| unsafe { CStr::from_ptr(p) })
+            .collect();
+
+        // Parse guard keys from flat array
+        let gk_flat = if n_guards > 0 && !guard_keys.is_null() {
+            unsafe { slice::from_raw_parts(guard_keys, n_guards * 2) }
+        } else {
+            &[]
+        };
+        let guards: Vec<(u64, u64)> = (0..n_guards)
+            .map(|i| (gk_flat[i * 2], gk_flat[i * 2 + 1]))
+            .collect();
+
+        let results = if max_results > 0 && !out_results.is_null() {
+            unsafe { slice::from_raw_parts_mut(out_results, max_results as usize) }
+        } else {
+            &mut []
+        };
+
+        crate::compact::merge_and_route(
+            &inputs, out_dir, &guards, schema,
+            table_id, level_num, lsn_tag, results,
+        )
+    });
+    result.unwrap_or(-99)
 }
 
 // ---------------------------------------------------------------------------

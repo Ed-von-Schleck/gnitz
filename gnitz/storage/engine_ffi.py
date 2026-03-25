@@ -48,6 +48,18 @@ eci = ExternalCompilationInfo(
         "  const uint8_t *buf, int64_t buf_len,"
         "  uint8_t *out_entries, uint32_t max_entries,"
         "  uint64_t *out_global_max_lsn);",
+        # compaction
+        "int32_t gnitz_compact_shards("
+        "  char **input_files, uint32_t num_inputs,"
+        "  char *output_file,"
+        "  void *schema_desc, uint32_t table_id);",
+        "int32_t gnitz_merge_and_route("
+        "  char **input_files, uint32_t num_inputs,"
+        "  char *output_dir,"
+        "  uint64_t *guard_keys, uint32_t num_guards,"
+        "  void *schema_desc,"
+        "  uint32_t table_id, uint32_t level_num, uint64_t lsn_tag,"
+        "  void *out_results, uint32_t max_results);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -184,6 +196,34 @@ _manifest_parse = rffi.llexternal(
     [rffi.CCHARP, rffi.LONGLONG,
      rffi.CCHARP, rffi.UINT,
      rffi.ULONGLONGP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Compaction
+# ---------------------------------------------------------------------------
+
+# SchemaDescriptor layout: 4 (num_columns) + 4 (pk_index) + 64*4 (columns) = 264 bytes
+SCHEMA_DESC_SIZE = 264
+
+_compact_shards = rffi.llexternal(
+    "gnitz_compact_shards",
+    [rffi.CCHARPP, rffi.UINT, rffi.CCHARP, rffi.VOIDP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# GuardResult: 8 (lo) + 8 (hi) + 256 (filename) = 272 bytes
+GUARD_RESULT_SIZE = 272
+
+_merge_and_route = rffi.llexternal(
+    "gnitz_merge_and_route",
+    [rffi.CCHARPP, rffi.UINT, rffi.CCHARP,
+     rffi.ULONGLONGP, rffi.UINT,
+     rffi.VOIDP,
+     rffi.UINT, rffi.UINT, rffi.ULONGLONG,
+     rffi.VOIDP, rffi.UINT],
     rffi.INT,
     compilation_info=eci,
 )

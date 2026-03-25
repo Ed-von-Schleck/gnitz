@@ -1,74 +1,160 @@
 # gnitz/storage/compactor.py
+#
+# Shard compaction backed by Rust (libgnitz_engine).
 
 import os
+from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rlib.rarithmetic import r_int64, intmask
-from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
-from gnitz.storage import shard_table, writer_table, tournament_tree, cursor
+
+from gnitz.core import errors
+from gnitz.storage import engine_ffi
+
+
+def _pack_schema(schema):
+    """Pack a TableSchema into a flat C buffer matching Rust SchemaDescriptor."""
+    buf = lltype.malloc(rffi.CCHARP.TO, engine_ffi.SCHEMA_DESC_SIZE, flavor="raw")
+    # Zero it
+    i = 0
+    while i < engine_ffi.SCHEMA_DESC_SIZE:
+        buf[i] = '\x00'
+        i += 1
+    # num_columns (u32 at offset 0)
+    num_cols = len(schema.columns)
+    rffi.cast(rffi.UINTP, buf)[0] = rffi.cast(rffi.UINT, num_cols)
+    # pk_index (u32 at offset 4)
+    rffi.cast(rffi.UINTP, rffi.ptradd(buf, 4))[0] = rffi.cast(rffi.UINT, schema.pk_index)
+    # columns: 4 bytes each (type_code, size, nullable, pad) starting at offset 8
+    ci = 0
+    while ci < num_cols:
+        col = schema.columns[ci]
+        base = 8 + ci * 4
+        buf[base] = chr(col.field_type.code)
+        buf[base + 1] = chr(col.field_type.size)
+        buf[base + 2] = chr(1 if col.is_nullable else 0)
+        ci += 1
+    return buf
+
+
+def _pack_filenames(file_list):
+    """Pack a list of RPython strings into a C array of char pointers."""
+    n = len(file_list)
+    ptrs = lltype.malloc(rffi.CCHARPP.TO, n, flavor="raw")
+    strs = newlist_hint(n)
+    i = 0
+    while i < n:
+        s = rffi.str2charp(file_list[i])
+        strs.append(s)
+        ptrs[i] = s
+        i += 1
+    return ptrs, strs, n
+
+
+def _free_filenames(ptrs, strs, n):
+    """Free the packed filename arrays."""
+    i = 0
+    while i < n:
+        rffi.free_charp(strs[i])
+        i += 1
+    lltype.free(ptrs, flavor="raw")
 
 
 def compact_shards(
     input_files, output_file, schema, table_id=0, validate_checksums=False
 ):
-    """
-    Executes an N-way merge compaction of overlapping shards.
-    """
-    num_inputs = len(input_files)
-    views = newlist_hint(num_inputs)
-    cursors = newlist_hint(num_inputs)
+    """Executes an N-way merge compaction of overlapping shards."""
+    schema_buf = _pack_schema(schema)
+    in_ptrs, in_strs, n_inputs = _pack_filenames(input_files)
+    out_str = rffi.str2charp(output_file)
+    try:
+        rc = engine_ffi._compact_shards(
+            in_ptrs,
+            rffi.cast(rffi.UINT, n_inputs),
+            out_str,
+            rffi.cast(rffi.VOIDP, schema_buf),
+            rffi.cast(rffi.UINT, table_id),
+        )
+        rc_int = intmask(rc)
+        if rc_int < 0:
+            raise errors.StorageError("Compaction failed (error %d)" % rc_int)
+    finally:
+        rffi.free_charp(out_str)
+        _free_filenames(in_ptrs, in_strs, n_inputs)
+        lltype.free(schema_buf, flavor="raw")
 
-    tree = None
-    writer = None
+
+def _merge_and_route(input_files, guard_keys, output_dir, table_id, level_num, lsn_tag,
+                     schema, validate_checksums=False):
+    """N-way merge of input_files, routing each row to the appropriate guard writer."""
+    num_guards = len(guard_keys)
+    schema_buf = _pack_schema(schema)
+    in_ptrs, in_strs, n_inputs = _pack_filenames(input_files)
+    dir_str = rffi.str2charp(output_dir)
+
+    # Pack guard keys into flat u64 array: [lo0, hi0, lo1, hi1, ...]
+    gk_buf = lltype.malloc(rffi.ULONGLONGP.TO, num_guards * 2, flavor="raw")
+    i = 0
+    while i < num_guards:
+        gk_lo, gk_hi = guard_keys[i]
+        gk_buf[i * 2] = rffi.cast(rffi.ULONGLONG, gk_lo)
+        gk_buf[i * 2 + 1] = rffi.cast(rffi.ULONGLONG, gk_hi)
+        i += 1
+
+    # Allocate output results buffer
+    max_results = num_guards
+    results_buf = lltype.malloc(
+        rffi.CCHARP.TO, max_results * engine_ffi.GUARD_RESULT_SIZE, flavor="raw"
+    )
 
     try:
-        idx = 0
-        while idx < num_inputs:
-            filename = input_files[idx]
-            view = shard_table.TableShardView(
-                filename, schema, validate_checksums=validate_checksums
-            )
-            views.append(view)
-            cursors.append(cursor.ShardCursor(view))
-            idx += 1
+        rc = engine_ffi._merge_and_route(
+            in_ptrs,
+            rffi.cast(rffi.UINT, n_inputs),
+            dir_str,
+            gk_buf,
+            rffi.cast(rffi.UINT, num_guards),
+            rffi.cast(rffi.VOIDP, schema_buf),
+            rffi.cast(rffi.UINT, table_id),
+            rffi.cast(rffi.UINT, level_num),
+            rffi.cast(rffi.ULONGLONG, lsn_tag),
+            rffi.cast(rffi.VOIDP, results_buf),
+            rffi.cast(rffi.UINT, max_results),
+        )
+        rc_int = intmask(rc)
+        if rc_int < 0:
+            raise errors.StorageError("Merge and route failed (error %d)" % rc_int)
 
-        tree = tournament_tree.TournamentTree(cursors, schema)
-        writer = writer_table.TableShardWriter(schema, table_id)
-
-        while not tree.is_exhausted():
-            min_key = tree.get_min_key()
-            num_indices = tree.get_all_indices_at_min()
-
-            net_weight = r_int64(0)
-            i = 0
-            while i < num_indices:
-                net_weight += cursors[tree._min_indices[i]].weight()
-                i += 1
-
-            if net_weight != 0:
-                exemplar_cursor = cursors[tree._min_indices[0]]
-                acc = exemplar_cursor.get_accessor()
-                writer.add_row_from_accessor(min_key, net_weight, acc)
-
-            i = 0
-            while i < num_indices:
-                tree.advance_cursor_by_index(tree._min_indices[i])
-                i += 1
-
-        writer.finalize(output_file)
+        # Unpack results
+        guard_outputs = newlist_hint(rc_int)
+        ri = 0
+        while ri < rc_int:
+            base = rffi.ptradd(results_buf, ri * engine_ffi.GUARD_RESULT_SIZE)
+            gk_lo = r_uint64(rffi.cast(rffi.ULONGLONGP, base)[0])
+            gk_hi = r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0])
+            # Read filename (null-terminated, starting at offset 16)
+            fn_chars = newlist_hint(256)
+            j = 0
+            while j < 256:
+                ch = base[16 + j]
+                if ch == '\x00':
+                    break
+                fn_chars.append(ch)
+                j += 1
+            guard_outputs.append((gk_lo, gk_hi, "".join(fn_chars)))
+            ri += 1
+        return guard_outputs
     finally:
-        if tree:
-            tree.close()
-        v_idx = 0
-        while v_idx < len(views):
-            v = views[v_idx]
-            if v:
-                v.close()
-            v_idx += 1
+        rffi.free_charp(dir_str)
+        _free_filenames(in_ptrs, in_strs, n_inputs)
+        lltype.free(schema_buf, flavor="raw")
+        lltype.free(gk_buf, flavor="raw")
+        lltype.free(results_buf, flavor="raw")
 
 
 def _find_guard_for_key(guard_keys, key):
     """Binary search: index of the rightmost guard with guard_key <= key.
     Rows below the first guard key always map to index 0."""
+    from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
     n = len(guard_keys)
     lo, hi = 0, n - 1
     while lo < hi:
@@ -80,83 +166,6 @@ def _find_guard_for_key(guard_keys, key):
         else:
             hi = mid - 1
     return lo
-
-
-def _merge_and_route(input_files, guard_keys, output_dir, table_id, level_num, lsn_tag,
-                     schema, validate_checksums=False):
-    """N-way merge of input_files, routing each row to the appropriate guard writer."""
-    num_inputs = len(input_files)
-    num_guards = len(guard_keys)
-
-    views = newlist_hint(num_inputs)
-    cursors_list = newlist_hint(num_inputs)
-    writers = newlist_hint(num_guards)
-    out_filenames = newlist_hint(num_guards)
-
-    i = 0
-    while i < num_guards:
-        fn = output_dir + "/shard_%d_%d_L%d_G%d.db" % (table_id, lsn_tag, level_num, i)
-        out_filenames.append(fn)
-        writers.append(writer_table.TableShardWriter(schema, table_id))
-        i += 1
-
-    tree = None
-    try:
-        i = 0
-        while i < num_inputs:
-            view = shard_table.TableShardView(
-                input_files[i], schema, validate_checksums=validate_checksums
-            )
-            views.append(view)
-            cursors_list.append(cursor.ShardCursor(view))
-            i += 1
-
-        tree = tournament_tree.TournamentTree(cursors_list, schema)
-
-        while not tree.is_exhausted():
-            min_key = tree.get_min_key()
-            num_indices = tree.get_all_indices_at_min()
-
-            net_weight = r_int64(0)
-            i = 0
-            while i < num_indices:
-                net_weight += cursors_list[tree._min_indices[i]].weight()
-                i += 1
-
-            if net_weight != 0:
-                guard_idx = _find_guard_for_key(guard_keys, min_key)
-                exemplar_cursor = cursors_list[tree._min_indices[0]]
-                acc = exemplar_cursor.get_accessor()
-                writers[guard_idx].add_row_from_accessor(min_key, net_weight, acc)
-
-            i = 0
-            while i < num_indices:
-                tree.advance_cursor_by_index(tree._min_indices[i])
-                i += 1
-    finally:
-        if tree is not None:
-            tree.close()
-        v_idx = 0
-        while v_idx < len(views):
-            v = views[v_idx]
-            if v:
-                v.close()
-            v_idx += 1
-
-    guard_outputs = newlist_hint(num_guards)
-    i = 0
-    while i < num_guards:
-        w = writers[i]
-        if w.count > 0:
-            w.finalize(out_filenames[i])
-            if os.path.exists(out_filenames[i]):
-                gk_lo, gk_hi = guard_keys[i]
-                guard_outputs.append((gk_lo, gk_hi, out_filenames[i]))
-        else:
-            w.close()
-        i += 1
-
-    return guard_outputs
 
 
 def compact_guard_horizontal(guard, output_path, schema, table_id, validate_checksums=False):
@@ -182,7 +191,6 @@ def compact_guard_vertical(src_guard, dest_guards, output_dir, schema, table_id,
         for dg in dest_guards:
             guard_keys.append((dg.guard_key_lo, dg.guard_key_hi))
     else:
-        # First L1→L2: L2 is empty; use src_guard's range as the single output guard
         guard_keys = newlist_hint(1)
         guard_keys.append((src_guard.guard_key_lo, src_guard.guard_key_hi))
 
