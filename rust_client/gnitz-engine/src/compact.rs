@@ -1316,4 +1316,237 @@ mod tests {
         assert_eq!(find_guard_for_key(&[(0, 0), (100, 0), (200, 0)], 200), 2);
         assert_eq!(find_guard_for_key(&[(0, 0), (100, 0), (200, 0)], 999), 2);
     }
+
+    #[test]
+    fn test_guard_routing_empty() {
+        assert_eq!(find_guard_for_key(&[], 42), 0);
+    }
+
+    #[test]
+    fn test_guard_routing_single() {
+        assert_eq!(find_guard_for_key(&[(0, 0)], 0), 0);
+        assert_eq!(find_guard_for_key(&[(0, 0)], 999), 0);
+    }
+
+    #[test]
+    fn test_compact_empty_input() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_empty");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_test_schema();
+        let output = dir.join("merged.db");
+        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
+
+        let inputs: [&CStr; 0] = [];
+        let rc = compact_shards(&inputs, &cout, &schema, 0);
+        assert_eq!(rc, 0);
+
+        // Output shard should exist with 0 rows
+        let merged = MappedShard::open(&cout, &schema).unwrap();
+        assert_eq!(merged.count, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compact_all_cancel() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_cancel");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_test_schema();
+
+        // Shard 1: insert keys 1, 2, 3
+        let s1 = dir.join("s1.db");
+        write_test_shard(s1.to_str().unwrap(), &[1, 2, 3], &[1, 1, 1], &schema);
+
+        // Shard 2: delete all
+        let s2 = dir.join("s2.db");
+        write_test_shard(s2.to_str().unwrap(), &[1, 2, 3], &[-1, -1, -1], &schema);
+
+        let output = dir.join("merged.db");
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
+
+        let inputs = [cs1.as_c_str(), cs2.as_c_str()];
+        let rc = compact_shards(&inputs, &cout, &schema, 0);
+        assert_eq!(rc, 0);
+
+        let merged = MappedShard::open(&cout, &schema).unwrap();
+        assert_eq!(merged.count, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_and_route_basic() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_route");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_test_schema();
+
+        // Shard with keys 10, 50, 150, 250
+        let s1 = dir.join("s1.db");
+        write_test_shard(s1.to_str().unwrap(), &[10, 50, 150, 250], &[1, 1, 1, 1], &schema);
+
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let inputs = [cs1.as_c_str()];
+
+        // Two guards: [0, 100)  and [100, ∞)
+        let guards = [(0u64, 0u64), (100u64, 0u64)];
+        let mut results = [
+            GuardResult { guard_key_lo: 0, guard_key_hi: 0, filename: [0u8; 256] },
+            GuardResult { guard_key_lo: 0, guard_key_hi: 0, filename: [0u8; 256] },
+        ];
+
+        let rc = merge_and_route(
+            &inputs, &cdir, &guards, &schema,
+            0, 1, 99, &mut results,
+        );
+        assert_eq!(rc, 2); // both guards should have rows
+
+        // Guard 0 should have keys 10, 50
+        let fn0_end = results[0].filename.iter().position(|&b| b == 0).unwrap_or(256);
+        let fn0 = std::str::from_utf8(&results[0].filename[..fn0_end]).unwrap();
+        let cfn0 = std::ffi::CString::new(fn0).unwrap();
+        let g0 = MappedShard::open(&cfn0, &schema).unwrap();
+        assert_eq!(g0.count, 2);
+        assert_eq!(g0.get_pk(0), 10);
+        assert_eq!(g0.get_pk(1), 50);
+
+        // Guard 1 should have keys 150, 250
+        let fn1_end = results[1].filename.iter().position(|&b| b == 0).unwrap_or(256);
+        let fn1 = std::str::from_utf8(&results[1].filename[..fn1_end]).unwrap();
+        let cfn1 = std::ffi::CString::new(fn1).unwrap();
+        let g1 = MappedShard::open(&cfn1, &schema).unwrap();
+        assert_eq!(g1.count, 2);
+        assert_eq!(g1.get_pk(0), 150);
+        assert_eq!(g1.get_pk(1), 250);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compact_string_column() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_string");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Schema: u64 PK + STRING payload
+        let mut schema = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        schema.columns[0] = SchemaColumn { type_code: TYPE_U64, size: 8, nullable: 0, _pad: 0 };
+        schema.columns[1] = SchemaColumn { type_code: TYPE_STRING, size: 16, nullable: 0, _pad: 0 };
+
+        // Build shard with short strings
+        let mut writer = ShardWriter::new(&schema);
+        for pk in [1u64, 2, 3] {
+            writer.count += 1;
+            writer.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            writer.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            writer.weight.extend_from_slice(&1i64.to_le_bytes());
+            writer.null_bitmap.extend_from_slice(&0u64.to_le_bytes());
+
+            // Write a short string: "hi" (2 bytes, inline)
+            let mut str_struct = [0u8; 16];
+            str_struct[0..4].copy_from_slice(&2u32.to_le_bytes()); // length=2
+            str_struct[4] = b'h'; str_struct[5] = b'i'; // prefix
+            writer.col_bufs[1].extend_from_slice(&str_struct);
+        }
+        let s1 = dir.join("s1.db");
+        let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        writer.finalize(&cpath, 0, &schema).unwrap();
+
+        // Compact it (single shard, should roundtrip)
+        let output = dir.join("merged.db");
+        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
+        let inputs = [cpath.as_c_str()];
+        let rc = compact_shards(&inputs, &cout, &schema, 0);
+        assert_eq!(rc, 0);
+
+        let merged = MappedShard::open(&cout, &schema).unwrap();
+        assert_eq!(merged.count, 3);
+
+        // Verify string data survived
+        for row in 0..3 {
+            let col_data = merged.get_col_ptr(row, 0, 16);
+            let str_len = read_u32_le(col_data, 0);
+            assert_eq!(str_len, 2);
+            assert_eq!(col_data[4], b'h');
+            assert_eq!(col_data[5], b'i');
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compact_nullable_column() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_nullable");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Schema: u64 PK + nullable i64 payload
+        let mut schema = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        schema.columns[0] = SchemaColumn { type_code: TYPE_U64, size: 8, nullable: 0, _pad: 0 };
+        schema.columns[1] = SchemaColumn { type_code: TYPE_I64, size: 8, nullable: 1, _pad: 0 };
+
+        // Build shard: key 1 = non-null (42), key 2 = null
+        let mut writer = ShardWriter::new(&schema);
+        // Row 1: non-null
+        writer.count += 1;
+        writer.pk_lo.extend_from_slice(&1u64.to_le_bytes());
+        writer.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+        writer.weight.extend_from_slice(&1i64.to_le_bytes());
+        writer.null_bitmap.extend_from_slice(&0u64.to_le_bytes()); // no nulls
+        writer.col_bufs[1].extend_from_slice(&42i64.to_le_bytes());
+
+        // Row 2: null column
+        writer.count += 1;
+        writer.pk_lo.extend_from_slice(&2u64.to_le_bytes());
+        writer.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+        writer.weight.extend_from_slice(&1i64.to_le_bytes());
+        // null bit for col_idx=1, pk_index=0 → payload_idx = 0 → bit 0
+        writer.null_bitmap.extend_from_slice(&1u64.to_le_bytes());
+        writer.col_bufs[1].extend_from_slice(&0i64.to_le_bytes());
+
+        let s1 = dir.join("s1.db");
+        let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        writer.finalize(&cpath, 0, &schema).unwrap();
+
+        // Compact
+        let output = dir.join("merged.db");
+        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
+        let inputs = [cpath.as_c_str()];
+        let rc = compact_shards(&inputs, &cout, &schema, 0);
+        assert_eq!(rc, 0);
+
+        let merged = MappedShard::open(&cout, &schema).unwrap();
+        assert_eq!(merged.count, 2);
+
+        // Row 0: not null
+        assert!(!is_null(&merged, 0, 1, 0));
+        let val = read_i64_le(merged.get_col_ptr(0, 0, 8), 0);
+        assert_eq!(val, 42);
+
+        // Row 1: null
+        assert!(is_null(&merged, 1, 1, 0));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

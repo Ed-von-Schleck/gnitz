@@ -514,4 +514,146 @@ mod tests {
         let handle = gnitz_xor8_build(ptr::null(), ptr::null(), 0);
         assert!(handle.is_null());
     }
+
+    // -----------------------------------------------------------------------
+    // WAL FFI null safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wal_encode_null_safety() {
+        assert_eq!(gnitz_wal_encode(ptr::null_mut(), 0, 0, 0, 0, 0, ptr::null(), ptr::null(), 0, 0), -1);
+    }
+
+    #[test]
+    fn wal_parse_null_safety() {
+        // All output pointers null
+        assert_eq!(
+            gnitz_wal_validate_and_parse(
+                ptr::null(), 0,
+                ptr::null_mut(), ptr::null_mut(), ptr::null_mut(),
+                ptr::null_mut(), ptr::null_mut(),
+                ptr::null_mut(), ptr::null_mut(), 0,
+            ),
+            crate::wal::WAL_ERR_TRUNCATED,
+        );
+
+        // Block valid but output pointers null
+        let mut buf = vec![0u8; 256];
+        // Write a minimal valid WAL block
+        let ptrs: Vec<*const u8> = vec![];
+        let sizes: Vec<u32> = vec![];
+        let new_off = crate::wal::encode(&mut buf, 0, 1, 1, 0, &ptrs, &sizes, 0);
+        assert!(new_off > 0);
+
+        assert_eq!(
+            gnitz_wal_validate_and_parse(
+                buf.as_ptr(), new_off,
+                ptr::null_mut(), ptr::null_mut(), ptr::null_mut(),
+                ptr::null_mut(), ptr::null_mut(),
+                ptr::null_mut(), ptr::null_mut(), 0,
+            ),
+            crate::wal::WAL_ERR_TRUNCATED,
+        );
+    }
+
+    #[test]
+    fn wal_ffi_roundtrip() {
+        let r0 = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let ptrs = vec![r0.as_ptr()];
+        let sizes = vec![8u32];
+        let mut buf = vec![0u8; 4096];
+
+        let new_off = gnitz_wal_encode(
+            buf.as_mut_ptr(), 0, 4096,
+            42, 7, 1,
+            ptrs.as_ptr() as *const *const u8, sizes.as_ptr(), 1, 0,
+        );
+        assert!(new_off > 0);
+
+        let mut lsn = 0u64;
+        let mut tid = 0u32;
+        let mut count = 0u32;
+        let mut num_regions = 0u32;
+        let mut blob_size = 0u64;
+        let mut offsets = [0u32; 4];
+        let mut rsizes = [0u32; 4];
+
+        let rc = gnitz_wal_validate_and_parse(
+            buf.as_ptr(), new_off,
+            &mut lsn, &mut tid, &mut count,
+            &mut num_regions, &mut blob_size,
+            offsets.as_mut_ptr(), rsizes.as_mut_ptr(), 4,
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(lsn, 42);
+        assert_eq!(tid, 7);
+        assert_eq!(count, 1);
+        assert_eq!(num_regions, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Manifest FFI null safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn manifest_serialize_null_safety() {
+        assert_eq!(gnitz_manifest_serialize(ptr::null_mut(), 0, ptr::null(), 0, 0), -1);
+    }
+
+    #[test]
+    fn manifest_parse_null_safety() {
+        assert_eq!(
+            gnitz_manifest_parse(ptr::null(), 0, ptr::null_mut(), 0, ptr::null_mut()),
+            crate::manifest::MANIFEST_ERR_TRUNCATED,
+        );
+    }
+
+    #[test]
+    fn manifest_ffi_roundtrip() {
+        let mut entry = crate::manifest::ManifestEntryRaw::zeroed();
+        entry.table_id = 42;
+        entry.pk_min_lo = 1;
+        entry.min_lsn = 10;
+        entry.max_lsn = 20;
+        entry.filename[..6].copy_from_slice(b"t.db\x00\x00");
+
+        let entries = [entry];
+        let mut buf = vec![0u8; 512];
+        let written = gnitz_manifest_serialize(
+            buf.as_mut_ptr(), 512,
+            entries.as_ptr() as *const u8, 1, 99,
+        );
+        assert!(written > 0);
+
+        let mut out = [crate::manifest::ManifestEntryRaw::zeroed()];
+        let mut lsn = 0u64;
+        let count = gnitz_manifest_parse(
+            buf.as_ptr(), written,
+            out.as_mut_ptr() as *mut u8, 1, &mut lsn,
+        );
+        assert_eq!(count, 1);
+        assert_eq!(lsn, 99);
+        assert_eq!(out[0].table_id, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Compact FFI null safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compact_null_safety() {
+        assert_eq!(gnitz_compact_shards(ptr::null(), 0, ptr::null(), ptr::null(), 0), -1);
+    }
+
+    #[test]
+    fn merge_and_route_null_safety() {
+        assert_eq!(
+            gnitz_merge_and_route(
+                ptr::null(), 0, ptr::null(),
+                ptr::null(), 0, ptr::null(),
+                0, 0, 0, ptr::null_mut(), 0,
+            ),
+            -1,
+        );
+    }
 }
