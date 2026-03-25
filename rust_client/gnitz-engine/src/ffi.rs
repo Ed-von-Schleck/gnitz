@@ -249,7 +249,10 @@ pub extern "C" fn gnitz_wal_validate_and_parse(
     max_regions: u32,
 ) -> i32 {
     let result = panic::catch_unwind(|| {
-        if block.is_null() || block_len <= 0 {
+        if block.is_null() || block_len <= 0
+            || out_lsn.is_null() || out_tid.is_null() || out_count.is_null()
+            || out_num_regions.is_null() || out_blob_size.is_null()
+        {
             return crate::wal::WAL_ERR_TRUNCATED;
         }
         let data = unsafe { slice::from_raw_parts(block, block_len as usize) };

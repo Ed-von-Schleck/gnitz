@@ -921,6 +921,9 @@ impl ShardWriter {
 
 fn find_guard_for_key(guard_keys: &[(u64, u64)], key: u128) -> usize {
     let n = guard_keys.len();
+    if n == 0 {
+        return 0;
+    }
     let mut lo = 0usize;
     let mut hi = n - 1;
     while lo < hi {
