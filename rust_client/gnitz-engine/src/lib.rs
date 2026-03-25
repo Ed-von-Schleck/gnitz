@@ -6,5 +6,6 @@ pub mod wal;
 pub mod manifest;
 pub mod layout;
 pub mod shard_reader;
+pub mod shard_file;
 pub mod compact;
 pub mod ffi;

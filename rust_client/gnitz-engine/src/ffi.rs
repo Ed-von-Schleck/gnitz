@@ -594,6 +594,84 @@ pub extern "C" fn gnitz_merge_and_route(
 }
 
 // ---------------------------------------------------------------------------
+// Shard file write
+// ---------------------------------------------------------------------------
+
+/// Write a shard file atomically from pre-built column region buffers.
+/// Returns 0 on success, negative error code on failure.
+#[no_mangle]
+pub extern "C" fn gnitz_write_shard(
+    dirfd: i32,
+    filename: *const libc::c_char,
+    table_id: u32,
+    row_count: u32,
+    region_ptrs: *const *const u8,
+    region_sizes: *const u64,
+    num_regions: u32,
+    pk_lo_ptr: *const u64,
+    pk_hi_ptr: *const u64,
+    durable: i32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if filename.is_null() {
+            return crate::shard_file::ERR_BAD_ARGS;
+        }
+        let cfilename = unsafe { CStr::from_ptr(filename) };
+        let n_regions = num_regions as usize;
+        let n_rows = row_count as usize;
+
+        // Reconstruct region slices
+        let mut regions: Vec<&[u8]> = Vec::with_capacity(n_regions);
+        if n_regions > 0 {
+            if region_ptrs.is_null() || region_sizes.is_null() {
+                return crate::shard_file::ERR_BAD_ARGS;
+            }
+            let ptrs = unsafe { slice::from_raw_parts(region_ptrs, n_regions) };
+            let sizes = unsafe { slice::from_raw_parts(region_sizes, n_regions) };
+            for i in 0..n_regions {
+                let sz = sizes[i] as usize;
+                if sz > 0 && ptrs[i].is_null() {
+                    return crate::shard_file::ERR_BAD_ARGS;
+                }
+                let data = if sz > 0 {
+                    unsafe { slice::from_raw_parts(ptrs[i], sz) }
+                } else {
+                    &[]
+                };
+                regions.push(data);
+            }
+        }
+
+        // Reconstruct PK slices
+        let pk_lo = if n_rows > 0 {
+            if pk_lo_ptr.is_null() {
+                return crate::shard_file::ERR_BAD_ARGS;
+            }
+            unsafe { slice::from_raw_parts(pk_lo_ptr, n_rows) }
+        } else {
+            &[]
+        };
+        let pk_hi = if n_rows > 0 {
+            if pk_hi_ptr.is_null() {
+                return crate::shard_file::ERR_BAD_ARGS;
+            }
+            unsafe { slice::from_raw_parts(pk_hi_ptr, n_rows) }
+        } else {
+            &[]
+        };
+
+        match crate::shard_file::write_shard(
+            dirfd, cfilename, table_id, n_rows,
+            &regions, pk_lo, pk_hi, durable != 0,
+        ) {
+            Ok(()) => 0,
+            Err(e) => e,
+        }
+    });
+    result.unwrap_or(crate::shard_file::ERR_BAD_ARGS)
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 
@@ -825,5 +903,81 @@ mod tests {
             ),
             -1,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Write shard FFI
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_shard_null_safety() {
+        assert_eq!(
+            gnitz_write_shard(
+                libc::AT_FDCWD, ptr::null(), 0, 0,
+                ptr::null(), ptr::null(), 0,
+                ptr::null(), ptr::null(), 0,
+            ),
+            crate::shard_file::ERR_BAD_ARGS,
+        );
+    }
+
+    #[test]
+    fn write_shard_ffi_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ffi_rt.db");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        let pk_lo: Vec<u64> = vec![5, 10];
+        let pk_hi: Vec<u64> = vec![0, 0];
+        let weights: Vec<i64> = vec![1, 1];
+        let nulls: Vec<u64> = vec![0, 0];
+        let col1: Vec<i64> = vec![50, 100];
+
+        let region_ptrs: Vec<*const u8> = vec![
+            pk_lo.as_ptr() as *const u8,
+            pk_hi.as_ptr() as *const u8,
+            weights.as_ptr() as *const u8,
+            nulls.as_ptr() as *const u8,
+            col1.as_ptr() as *const u8,
+            ptr::null(), // empty blob
+        ];
+        let region_sizes: Vec<u64> = vec![16, 16, 16, 16, 16, 0];
+
+        let rc = gnitz_write_shard(
+            libc::AT_FDCWD,
+            cpath.as_ptr(),
+            99, 2,
+            region_ptrs.as_ptr(), region_sizes.as_ptr(), 6,
+            pk_lo.as_ptr(), pk_hi.as_ptr(),
+            0,
+        );
+        assert_eq!(rc, 0);
+
+        // Read back via shard reader FFI
+        let schema = crate::compact::SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: {
+                let mut cols = [crate::compact::SchemaColumn {
+                    type_code: 8, size: 8, nullable: 0, _pad: 0,
+                }; 64];
+                cols[1] = crate::compact::SchemaColumn {
+                    type_code: 9, size: 8, nullable: 0, _pad: 0,
+                };
+                cols
+            },
+        };
+        let handle = gnitz_shard_open(
+            cpath.as_ptr(),
+            &schema as *const crate::compact::SchemaDescriptor,
+            1,
+        );
+        assert!(!handle.is_null());
+        assert_eq!(gnitz_shard_row_count(handle), 2);
+        assert_eq!(gnitz_shard_get_pk_lo(handle, 0), 5);
+        assert_eq!(gnitz_shard_get_pk_lo(handle, 1), 10);
+        assert_eq!(gnitz_shard_has_xor8(handle), 1);
+        assert_eq!(gnitz_shard_xor8_may_contain(handle, 5, 0), 1);
+        gnitz_shard_close(handle);
     }
 }

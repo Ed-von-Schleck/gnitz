@@ -1,15 +1,12 @@
 # gnitz/storage/writer_table.py
 
-import os
-from rpython.rlib import rposix, jit
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rlib.longlong2float import float2longlong
 from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import errors
-from gnitz.storage import layout, mmap_posix, buffer
-from gnitz.storage.buffer import align_64, c_memmove, c_memset
+from gnitz.storage import buffer, engine_ffi
 from gnitz.storage.mmap_posix import AT_FDCWD
 from gnitz.core import (
     types,
@@ -242,17 +239,12 @@ class TableShardWriter(object):
 
     def finalize(self, filename, durable=True):
         regions = _build_writer_regions(self)
-        xor8_filter = _build_xor8(
-            self.pk_lo_buf.base_ptr, self.pk_hi_buf.base_ptr, self.count
-        )
         try:
-            _write_shard_file(
-                filename, self.table_id, self.count, regions,
-                xor8_filter, durable=durable,
+            _call_write_shard(
+                AT_FDCWD, filename, self.table_id, self.count, regions,
+                self.pk_lo_buf.base_ptr, self.pk_hi_buf.base_ptr, durable,
             )
         finally:
-            if xor8_filter is not None:
-                xor8_filter.free()
             self.close()
 
 
@@ -277,159 +269,39 @@ def _build_writer_regions(writer):
     return regions
 
 
-def _build_shard_image(table_id, count, region_list, xor8_filter):
-    """Build the shard file image in a single contiguous buffer.
-    If xor8_filter is not None, embeds the filter data after the last region.
-    Returns (file_buf, total_file_size). Caller must free file_buf."""
+def _call_write_shard(dirfd, filename, table_id, count, region_list,
+                      pk_lo_ptr, pk_hi_ptr, durable):
+    """Pack region list into C arrays and call the Rust shard writer."""
     num_regions = len(region_list)
-    dir_size = num_regions * layout.DIR_ENTRY_SIZE
-    dir_offset = layout.HEADER_SIZE
-    current_pos = align_64(dir_offset + dir_size)
-
-    dummy_final = (lltype.nullptr(rffi.CCHARP.TO), 0, 0)
-    final_regions = newlist_hint(num_regions)
-    for _ in range(num_regions):
-        final_regions.append(dummy_final)
-
-    i = 0
-    while i < num_regions:
-        buf_ptr, sz = region_list[i]
-        final_regions[i] = (buf_ptr, current_pos, sz)
-        current_pos = align_64(current_pos + sz)
-        i += 1
-
-    if num_regions > 0:
-        _, last_off, last_sz = final_regions[num_regions - 1]
-        data_end = last_off + last_sz
-    else:
-        data_end = layout.HEADER_SIZE
-
-    # Compute xor8 footer position (after data regions, 64-byte aligned)
-    xor8_offset = 0
-    xor8_block_size = 0
-    if xor8_filter is not None:
-        xor8_offset = align_64(data_end)
-        xor8_block_size = xor8_filter.serialized_size()
-        total_file_size = xor8_offset + xor8_block_size
-    else:
-        total_file_size = data_end
-
-    file_buf = lltype.malloc(rffi.CCHARP.TO, total_file_size, flavor="raw")
-    c_memset(
-        rffi.cast(rffi.VOIDP, file_buf),
-        rffi.cast(rffi.INT, 0),
-        rffi.cast(rffi.SIZE_T, total_file_size),
-    )
-
-    rffi.cast(rffi.ULONGLONGP, file_buf)[0] = layout.MAGIC_NUMBER
-    rffi.cast(
-        rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_VERSION)
-    )[0] = rffi.cast(rffi.ULONGLONG, layout.VERSION)
-    rffi.cast(
-        rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_ROW_COUNT)
-    )[0] = rffi.cast(rffi.ULONGLONG, count)
-    rffi.cast(
-        rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_DIR_OFFSET)
-    )[0] = rffi.cast(rffi.ULONGLONG, dir_offset)
-    rffi.cast(
-        rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_TABLE_ID)
-    )[0] = rffi.cast(rffi.ULONGLONG, table_id)
-
-    # XOR8 location in header (0 = not present)
-    if xor8_filter is not None:
-        rffi.cast(
-            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_XOR8_OFFSET)
-        )[0] = rffi.cast(rffi.ULONGLONG, xor8_offset)
-        rffi.cast(
-            rffi.ULONGLONGP, rffi.ptradd(file_buf, layout.OFF_XOR8_SIZE)
-        )[0] = rffi.cast(rffi.ULONGLONG, xor8_block_size)
-
-    # Directory entries + region data
-    i = 0
-    while i < num_regions:
-        buf_ptr, off, sz = final_regions[i]
-        cs = checksum.compute_checksum(buf_ptr, sz)
-        base = rffi.ptradd(file_buf, dir_offset + i * layout.DIR_ENTRY_SIZE)
-        rffi.cast(rffi.ULONGLONGP, base)[0] = rffi.cast(rffi.ULONGLONG, off)
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 8))[0] = rffi.cast(
-            rffi.ULONGLONG, sz
-        )
-        rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, 16))[0] = rffi.cast(
-            rffi.ULONGLONG, cs
-        )
-        if sz > 0:
-            c_memmove(
-                rffi.cast(rffi.VOIDP, rffi.ptradd(file_buf, off)),
-                rffi.cast(rffi.VOIDP, buf_ptr),
-                rffi.cast(rffi.SIZE_T, sz),
-            )
-        i += 1
-
-    # XOR8 footer: serialized by Rust via engine_ffi
-    if xor8_filter is not None:
-        xor8_ptr = rffi.ptradd(file_buf, xor8_offset)
-        xor8_filter.serialize_into(xor8_ptr, xor8_block_size)
-
-    return file_buf, total_file_size
-
-
-def _build_xor8(pk_lo_ptr, pk_hi_ptr, count):
-    """Build xor8 filter from PK pointers. Returns Xor8Filter or None."""
-    if count <= 0:
-        return None
-    from gnitz.storage.xor8 import build_xor8
-    return build_xor8(pk_lo_ptr, pk_hi_ptr, count)
-
-
-def _write_shard_file(filename, table_id, count, region_list, xor8_filter,
-                      durable=True):
-    """Write a shard file using absolute paths (compactor path)."""
-    file_buf, total_size = _build_shard_image(
-        table_id, count, region_list, xor8_filter
-    )
+    ptrs = lltype.malloc(rffi.VOIDPP.TO, num_regions, flavor="raw")
+    sizes = lltype.malloc(rffi.ULONGLONGP.TO, num_regions, flavor="raw")
     try:
-        tmp = filename + ".tmp"
-        fd = rposix.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        try:
-            mmap_posix.write_all(
-                fd, file_buf, rffi.cast(rffi.SIZE_T, total_size)
+        ri = 0
+        while ri < num_regions:
+            buf_ptr, sz = region_list[ri]
+            ptrs[ri] = rffi.cast(rffi.VOIDP, buf_ptr)
+            sizes[ri] = rffi.cast(rffi.ULONGLONG, sz)
+            ri += 1
+        with rffi.scoped_str2charp(filename) as name_p:
+            rc = engine_ffi._write_shard(
+                rffi.cast(rffi.INT, dirfd),
+                name_p,
+                rffi.cast(rffi.UINT, table_id),
+                rffi.cast(rffi.UINT, count),
+                ptrs, sizes,
+                rffi.cast(rffi.UINT, num_regions),
+                rffi.cast(rffi.ULONGLONGP, pk_lo_ptr),
+                rffi.cast(rffi.ULONGLONGP, pk_hi_ptr),
+                rffi.cast(rffi.INT, 1 if durable else 0),
             )
-            if durable:
-                mmap_posix.fdatasync_c(fd)
-        finally:
-            rposix.close(fd)
-    finally:
-        lltype.free(file_buf, flavor="raw")
-
-    os.rename(tmp, filename)
-
-
-def write_shard_at(dirfd, basename, table_id, count, region_list, pk_lo_ptr,
-                   pk_hi_ptr, durable=True):
-    """Write a shard file using openat/renameat with a directory fd (flush path)."""
-    xor8_filter = _build_xor8(pk_lo_ptr, pk_hi_ptr, count)
-    file_buf, total_size = _build_shard_image(
-        table_id, count, region_list, xor8_filter
-    )
-    if xor8_filter is not None:
-        xor8_filter.free()
-    try:
-        tmp_name = basename + ".tmp"
-        fd = mmap_posix.openat_c(
-            dirfd, tmp_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644
-        )
-        try:
-            mmap_posix.write_all(
-                fd, file_buf, rffi.cast(rffi.SIZE_T, total_size)
+        rc_int = intmask(rc)
+        if rc_int != 0:
+            raise errors.StorageError(
+                "write_shard failed (error %d)" % rc_int
             )
-            if durable:
-                mmap_posix.fdatasync_c(fd)
-        finally:
-            rposix.close(fd)
     finally:
-        lltype.free(file_buf, flavor="raw")
-
-    mmap_posix.renameat_c(dirfd, tmp_name, basename)
+        lltype.free(ptrs, flavor="raw")
+        lltype.free(sizes, flavor="raw")
 
 
 def write_batch_to_shard(batch, dirfd, basename, table_id, durable=True):
@@ -452,9 +324,8 @@ def write_batch_to_shard(batch, dirfd, basename, table_id, durable=True):
             regions.append((batch.col_bufs[ci].base_ptr, batch.col_bufs[ci].offset))
     regions.append((batch.blob_arena.base_ptr, batch.blob_arena.offset))
 
-    write_shard_at(
+    _call_write_shard(
         dirfd, basename, table_id, count, regions,
-        batch.pk_lo_buf.base_ptr, batch.pk_hi_buf.base_ptr,
-        durable=durable,
+        batch.pk_lo_buf.base_ptr, batch.pk_hi_buf.base_ptr, durable,
     )
     return True

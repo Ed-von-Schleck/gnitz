@@ -5,15 +5,14 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
+#[cfg(test)]
 use std::fs;
 
-use crate::layout::*;
 use crate::shard_reader::MappedShard;
-use crate::util::{read_u32_le, read_u64_le, write_u64_le};
+use crate::util::{read_u32_le, read_u64_le};
 #[cfg(test)]
 use crate::util::read_i64_le;
 use crate::xxh;
-use crate::xor8;
 
 // Type codes (from core/types.py). All defined for completeness;
 // the compare_rows dispatch only uses F32/F64/STRING/U128 explicitly.
@@ -67,14 +66,6 @@ pub struct GuardResult {
     pub guard_key_lo: u64,
     pub guard_key_hi: u64,
     pub filename: [u8; 256], // null-terminated
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn align64(val: usize) -> usize {
-    (val + ALIGNMENT - 1) & !(ALIGNMENT - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -642,7 +633,6 @@ impl ShardWriter {
         table_id: u32,
         schema: &SchemaDescriptor,
     ) -> Result<(), i32> {
-        // Build region list: pk_lo, pk_hi, weight, null, non-PK cols, blob
         let pk_index = schema.pk_index as usize;
         let mut regions: Vec<&[u8]> = Vec::new();
         regions.push(&self.pk_lo);
@@ -657,84 +647,19 @@ impl ShardWriter {
         }
         regions.push(&self.blob_heap);
 
-        let num_regions = regions.len();
-        let dir_size = num_regions * DIR_ENTRY_SIZE;
-        let dir_offset = HEADER_SIZE;
-
-        // Compute total file size
-        let mut pos = align64(dir_offset + dir_size);
-        let mut region_offsets = Vec::with_capacity(num_regions);
-        for r in &regions {
-            region_offsets.push(pos);
-            pos = align64(pos + r.len());
-        }
-        let data_end = if regions.is_empty() { HEADER_SIZE } else {
-            region_offsets[num_regions - 1] + regions[num_regions - 1].len()
-        };
-
-        // Build XOR8 filter
-        let xor8_filter = if self.count > 0 {
-            xor8::build(
-                unsafe { std::slice::from_raw_parts(self.pk_lo.as_ptr() as *const u64, self.count) },
-                unsafe { std::slice::from_raw_parts(self.pk_hi.as_ptr() as *const u64, self.count) },
-            )
+        let (pk_lo_s, pk_hi_s) = if self.count > 0 {
+            unsafe {(
+                std::slice::from_raw_parts(self.pk_lo.as_ptr() as *const u64, self.count),
+                std::slice::from_raw_parts(self.pk_hi.as_ptr() as *const u64, self.count),
+            )}
         } else {
-            None
+            (&[][..], &[][..])
         };
 
-        let xor8_data = xor8_filter.as_ref().map(|f| xor8::serialize(f));
-        let xor8_offset = if xor8_data.is_some() { align64(data_end) } else { 0 };
-        let xor8_size = xor8_data.as_ref().map_or(0, |d| d.len());
-        let total_size = if xor8_data.is_some() {
-            xor8_offset + xor8_size
-        } else {
-            data_end
-        };
-
-        // Build file image
-        let mut image = vec![0u8; total_size];
-
-        // Header
-        write_u64_le(&mut image, OFF_MAGIC, SHARD_MAGIC);
-        write_u64_le(&mut image, OFF_VERSION, SHARD_VERSION);
-        write_u64_le(&mut image, OFF_ROW_COUNT, self.count as u64);
-        write_u64_le(&mut image, OFF_DIR_OFFSET, dir_offset as u64);
-        write_u64_le(&mut image, OFF_TABLE_ID, table_id as u64);
-        write_u64_le(&mut image, OFF_XOR8_OFFSET, xor8_offset as u64);
-        write_u64_le(&mut image, OFF_XOR8_SIZE, xor8_size as u64);
-
-        // Directory + regions
-        for i in 0..num_regions {
-            let r_off = region_offsets[i];
-            let r_sz = regions[i].len();
-            // Copy region data
-            image[r_off..r_off + r_sz].copy_from_slice(regions[i]);
-            // Compute checksum
-            let cs = if r_sz > 0 { xxh::checksum(&image[r_off..r_off + r_sz]) } else { 0 };
-            // Write directory entry
-            let d = dir_offset + i * DIR_ENTRY_SIZE;
-            write_u64_le(&mut image, d, r_off as u64);
-            write_u64_le(&mut image, d + 8, r_sz as u64);
-            write_u64_le(&mut image, d + 16, cs);
-        }
-
-        // XOR8 filter
-        if let Some(ref data) = xor8_data {
-            image[xor8_offset..xor8_offset + data.len()].copy_from_slice(data);
-        }
-
-        // Atomic write: .tmp → fsync → rename
-        let path_str = path.to_str().unwrap_or("");
-        let tmp_path = format!("{}.tmp", path_str);
-
-        let file = fs::File::create(&tmp_path).map_err(|_| -3)?;
-        use std::io::Write;
-        (&file).write_all(&image).map_err(|_| -3)?;
-        file.sync_all().map_err(|_| -3)?;
-        drop(file);
-
-        fs::rename(&tmp_path, path_str).map_err(|_| -3)?;
-        Ok(())
+        crate::shard_file::write_shard(
+            libc::AT_FDCWD, path, table_id, self.count,
+            &regions, pk_lo_s, pk_hi_s, true,
+        )
     }
 }
 

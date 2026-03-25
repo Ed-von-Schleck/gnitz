@@ -76,6 +76,14 @@ eci = ExternalCompilationInfo(
         "  void *schema_desc,"
         "  uint32_t table_id, uint32_t level_num, uint64_t lsn_tag,"
         "  void *out_results, uint32_t max_results);",
+        # shard file write
+        "int32_t gnitz_write_shard("
+        "  int32_t dirfd, const char *filename,"
+        "  uint32_t table_id, uint32_t row_count,"
+        "  void **region_ptrs, uint64_t *region_sizes,"
+        "  uint32_t num_regions,"
+        "  uint64_t *pk_lo_ptr, uint64_t *pk_hi_ptr,"
+        "  int32_t durable);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -376,6 +384,22 @@ _merge_and_route = rffi.llexternal(
      rffi.VOIDP,
      rffi.UINT, rffi.UINT, rffi.ULONGLONG,
      rffi.VOIDP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Shard file write
+# ---------------------------------------------------------------------------
+
+_write_shard = rffi.llexternal(
+    "gnitz_write_shard",
+    [rffi.INT, rffi.CCHARP,
+     rffi.UINT, rffi.UINT,
+     rffi.VOIDPP, rffi.ULONGLONGP,
+     rffi.UINT,
+     rffi.ULONGLONGP, rffi.ULONGLONGP,
+     rffi.INT],
     rffi.INT,
     compilation_info=eci,
 )
