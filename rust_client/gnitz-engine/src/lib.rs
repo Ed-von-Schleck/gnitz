@@ -1,3 +1,4 @@
+pub mod util;
 pub mod xxh;
 pub mod bloom;
 pub mod xor8;

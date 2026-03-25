@@ -1,5 +1,6 @@
 use std::ptr;
 
+use crate::util::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use crate::xxh;
 
 // ---------------------------------------------------------------------------
@@ -31,21 +32,7 @@ fn align8(val: usize) -> usize {
     (val + 7) & !7
 }
 
-fn write_u32_le(buf: &mut [u8], offset: usize, val: u32) {
-    buf[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
-}
-
-fn write_u64_le(buf: &mut [u8], offset: usize, val: u64) {
-    buf[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
-}
-
-fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
-}
-
-fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
-}
+// Local helpers removed — using crate::util::{read_u32_le, read_u64_le, ...}
 
 // ---------------------------------------------------------------------------
 // Encode

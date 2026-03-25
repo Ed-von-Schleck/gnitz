@@ -6,9 +6,9 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
-use std::os::unix::io::AsRawFd;
 use std::ptr;
 
+use crate::util::{read_u32_le, read_u64_le, read_i64_le, write_u64_le};
 use crate::xxh;
 use crate::xor8;
 
@@ -30,19 +30,24 @@ const OFF_TABLE_ID: usize = 32;
 const OFF_XOR8_OFFSET: usize = 40;
 const OFF_XOR8_SIZE: usize = 48;
 
-// Type codes (from core/types.py)
-const TYPE_U8: u8 = 1;
-const TYPE_I8: u8 = 2;
-const TYPE_U16: u8 = 3;
-const TYPE_I16: u8 = 4;
-const TYPE_U32: u8 = 5;
-const TYPE_I32: u8 = 6;
-const TYPE_F32: u8 = 7;
-const TYPE_U64: u8 = 8;
-const TYPE_I64: u8 = 9;
-const TYPE_F64: u8 = 10;
-const TYPE_STRING: u8 = 11;
-const TYPE_U128: u8 = 12;
+// Type codes (from core/types.py). All defined for completeness;
+// the compare_rows dispatch only uses F32/F64/STRING/U128 explicitly.
+#[allow(dead_code)]
+mod type_code {
+    pub const U8: u8 = 1;
+    pub const I8: u8 = 2;
+    pub const U16: u8 = 3;
+    pub const I16: u8 = 4;
+    pub const U32: u8 = 5;
+    pub const I32: u8 = 6;
+    pub const F32: u8 = 7;
+    pub const U64: u8 = 8;
+    pub const I64: u8 = 9;
+    pub const F64: u8 = 10;
+    pub const STRING: u8 = 11;
+    pub const U128: u8 = 12;
+}
+use type_code::{F32 as TYPE_F32, F64 as TYPE_F64, STRING as TYPE_STRING, U128 as TYPE_U128, I64 as TYPE_I64, U64 as TYPE_U64};
 
 const SHORT_STRING_THRESHOLD: usize = 12;
 
@@ -85,25 +90,7 @@ fn align64(val: usize) -> usize {
     (val + ALIGNMENT - 1) & !(ALIGNMENT - 1)
 }
 
-fn read_u64_le(buf: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
-}
-
-fn read_i64_le(buf: &[u8], off: usize) -> i64 {
-    i64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
-}
-
-fn read_u32_le(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
-}
-
-fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
-    buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
-}
-
-fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
-    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
-}
+// Local helpers removed — using crate::util::{read_u32_le, read_u64_le, ...}
 
 // ---------------------------------------------------------------------------
 // Shard reader (mmap-based)
@@ -112,17 +99,12 @@ fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
 struct MappedShard {
     mmap_ptr: *mut u8,
     mmap_len: usize,
-    data: &'static [u8], // slice over mmap — valid for struct lifetime
     count: usize,
-    // Region slices (offsets into data)
+    // Region offsets into the mmap'd data
     pk_lo_off: usize,
-    pk_lo_len: usize,
     pk_hi_off: usize,
-    pk_hi_len: usize,
     weight_off: usize,
-    weight_len: usize,
     null_off: usize,
-    null_len: usize,
     // Non-PK column regions: (offset, size) indexed by payload position
     col_regions: Vec<(usize, usize)>,
     // Blob heap
@@ -162,6 +144,8 @@ impl MappedShard {
             return Err(-1);
         }
         let mmap_ptr = mmap_ptr as *mut u8;
+        // SAFETY: mmap_ptr is valid for file_size bytes. We borrow it only while
+        // the MappedShard is alive; Drop calls munmap.
         let data = unsafe { std::slice::from_raw_parts(mmap_ptr, file_size) };
 
         // Validate header
@@ -179,8 +163,8 @@ impl MappedShard {
 
         // Parse region directory
         let num_cols = schema.num_columns as usize;
-        let num_non_pk = num_cols - 1; // PK column excluded from payload regions
-        let num_regions = 4 + num_non_pk + 1; // pk_lo, pk_hi, weight, null, cols, blob
+        let num_non_pk = num_cols - 1;
+        let num_regions = 4 + num_non_pk + 1;
 
         let mut regions: Vec<(usize, usize)> = Vec::with_capacity(num_regions);
         for i in 0..num_regions {
@@ -191,8 +175,7 @@ impl MappedShard {
             }
             let r_off = read_u64_le(data, entry_off) as usize;
             let r_sz = read_u64_le(data, entry_off + 8) as usize;
-            // Bounds check
-            if r_off + r_sz > file_size {
+            if r_off.saturating_add(r_sz) > file_size {
                 unsafe { libc::munmap(mmap_ptr as *mut libc::c_void, file_size); }
                 return Err(-2);
             }
@@ -201,7 +184,7 @@ impl MappedShard {
 
         // Map non-PK column regions (skip PK column)
         let mut col_regions = Vec::with_capacity(num_non_pk);
-        let mut reg_idx = 4; // after pk_lo, pk_hi, weight, null
+        let mut reg_idx = 4;
         for ci in 0..num_cols {
             if ci == schema.pk_index as usize {
                 continue;
@@ -214,52 +197,49 @@ impl MappedShard {
         Ok(MappedShard {
             mmap_ptr,
             mmap_len: file_size,
-            data,
             count,
             pk_lo_off: regions[0].0,
-            pk_lo_len: regions[0].1,
             pk_hi_off: regions[1].0,
-            pk_hi_len: regions[1].1,
             weight_off: regions[2].0,
-            weight_len: regions[2].1,
             null_off: regions[3].0,
-            null_len: regions[3].1,
             col_regions,
             blob_off: blob_region.0,
             blob_len: blob_region.1,
         })
     }
 
+    /// Returns a borrowed slice over the mmap'd data.
+    /// SAFETY: valid as long as `self` is alive (Drop calls munmap).
+    #[inline]
+    fn data(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.mmap_ptr, self.mmap_len) }
+    }
+
     fn get_pk(&self, row: usize) -> u128 {
-        let lo = read_u64_le(self.data, self.pk_lo_off + row * 8);
-        let hi = read_u64_le(self.data, self.pk_hi_off + row * 8);
+        let d = self.data();
+        let lo = read_u64_le(d, self.pk_lo_off + row * 8);
+        let hi = read_u64_le(d, self.pk_hi_off + row * 8);
         ((hi as u128) << 64) | (lo as u128)
     }
 
-    fn get_pk_lo(&self, row: usize) -> u64 {
-        read_u64_le(self.data, self.pk_lo_off + row * 8)
-    }
-
-    fn get_pk_hi(&self, row: usize) -> u64 {
-        read_u64_le(self.data, self.pk_hi_off + row * 8)
-    }
-
     fn get_weight(&self, row: usize) -> i64 {
-        read_i64_le(self.data, self.weight_off + row * 8)
+        read_i64_le(self.data(), self.weight_off + row * 8)
     }
 
     fn get_null_word(&self, row: usize) -> u64 {
-        read_u64_le(self.data, self.null_off + row * 8)
+        read_u64_le(self.data(), self.null_off + row * 8)
     }
 
     fn get_col_ptr(&self, row: usize, payload_col_idx: usize, col_size: usize) -> &[u8] {
-        let (off, _) = self.col_regions[payload_col_idx];
+        let (off, region_len) = self.col_regions[payload_col_idx];
         let start = off + row * col_size;
-        &self.data[start..start + col_size]
+        let end = start + col_size;
+        debug_assert!(end <= off + region_len, "get_col_ptr out of bounds");
+        &self.data()[start..end]
     }
 
     fn blob_slice(&self) -> &[u8] {
-        &self.data[self.blob_off..self.blob_off + self.blob_len]
+        &self.data()[self.blob_off..self.blob_off + self.blob_len]
     }
 }
 
@@ -441,12 +421,10 @@ fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> s
     let min_len = len_a.min(len_b);
 
     // Compare prefix bytes (bytes 4..8 of the 16-byte struct)
-    let pref_a = &a[4..8];
-    let pref_b = &b[4..8];
     let limit = min_len.min(4);
     for i in 0..limit {
-        if pref_a[i] != pref_b[i] {
-            return pref_a[i].cmp(&pref_b[i]);
+        if a[4 + i] != b[4 + i] {
+            return a[4 + i].cmp(&b[4 + i]);
         }
     }
 
@@ -454,13 +432,10 @@ fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> s
         return len_a.cmp(&len_b);
     }
 
-    // Compare remaining bytes (after first 4)
-    let data_a = string_data_ptr(a, blob_a, len_a);
-    let data_b = string_data_ptr(b, blob_b, len_b);
-
+    // Compare remaining bytes (after first 4) — inline access, no heap allocation
     for i in 4..min_len {
-        let ca = data_a(i);
-        let cb = data_b(i);
+        let ca = string_byte(a, blob_a, len_a, i);
+        let cb = string_byte(b, blob_b, len_b, i);
         if ca != cb {
             return ca.cmp(&cb);
         }
@@ -468,21 +443,16 @@ fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> s
     len_a.cmp(&len_b)
 }
 
-/// Returns a closure that reads byte `i` of the string.
-/// Short strings (≤12 bytes): bytes 4..12 are in the struct at offset 8.
-/// Long strings (>12 bytes): bytes are in the blob heap at the stored offset.
-fn string_data_ptr<'a>(
-    struct_bytes: &'a [u8],
-    blob: &'a [u8],
-    length: usize,
-) -> Box<dyn Fn(usize) -> u8 + 'a> {
+/// Read byte `i` of a German string (zero-alloc).
+/// Short strings (≤12 bytes): suffix bytes are inline at struct offset 8.
+/// Long strings (>12 bytes): data is in the blob heap at the stored offset.
+#[inline]
+fn string_byte(struct_bytes: &[u8], blob: &[u8], length: usize, i: usize) -> u8 {
     if length <= SHORT_STRING_THRESHOLD {
-        // Inline: bytes 4+ are at struct offset 8, starting from byte 4 of the string
-        Box::new(move |i: usize| struct_bytes[8 + (i - 4)])
+        struct_bytes[8 + (i - 4)]
     } else {
-        // Heap: offset stored as u64 at struct offset 8
         let heap_offset = read_u64_le(struct_bytes, 8) as usize;
-        Box::new(move |i: usize| blob[heap_offset + i])
+        blob[heap_offset + i]
     }
 }
 
@@ -527,7 +497,7 @@ impl TournamentTree {
         let size = tree.heap.len();
         if size > 1 {
             for i in (0..size / 2).rev() {
-                tree.sift_down(i, shards, cursors);
+                tree.sift_down(i);
             }
         }
         tree
@@ -610,7 +580,6 @@ impl TournamentTree {
         cursor_idx: usize,
         cursors: &mut [ShardCursor],
         shards: &[MappedShard],
-        schema: &SchemaDescriptor,
     ) {
         let heap_idx = self.pos_map[cursor_idx];
         if heap_idx < 0 {
@@ -634,8 +603,8 @@ impl TournamentTree {
                 self.pos_map[last_cursor] = heap_idx as i32;
                 self.heap.pop();
                 if !self.heap.is_empty() && heap_idx < self.heap.len() {
-                    self.sift_down(heap_idx, shards, &*cursors);
-                    self.sift_up(heap_idx, shards, &*cursors);
+                    self.sift_down(heap_idx);
+                    self.sift_up(heap_idx);
                 }
             } else {
                 self.heap.pop();
@@ -644,44 +613,28 @@ impl TournamentTree {
             // Update key and sift down (new key > old key, can only move down)
             let shard = &shards[cursors[cursor_idx].shard_idx];
             self.heap[heap_idx].key = cursors[cursor_idx].peek_key(shard);
-            self.sift_down(heap_idx, shards, &*cursors);
+            self.sift_down(heap_idx);
         }
     }
 
-    fn compare_nodes(
-        &self,
-        i: usize,
-        j: usize,
-        shards: &[MappedShard],
-        cursors: &[ShardCursor],
-    ) -> std::cmp::Ordering {
-        let a = &self.heap[i];
-        let b = &self.heap[j];
-        let key_ord = a.key.cmp(&b.key);
-        if key_ord != std::cmp::Ordering::Equal {
-            return key_ord;
-        }
-        // For sift operations, we only compare by key — not payload.
-        // Payload comparison is only needed for collect_min_indices.
-        // This matches the RPython behavior where _compare_nodes does
-        // compare payloads, but for correctness of the heap property
-        // only key ordering matters.
-        std::cmp::Ordering::Equal
+    /// Key-only comparison for heap ordering. Payload comparison is separate
+    /// (only needed in collect_min_indices for deduplication).
+    fn key_less(&self, i: usize, j: usize) -> bool {
+        self.heap[i].key < self.heap[j].key
     }
 
-    fn sift_down(&mut self, mut idx: usize, shards: &[MappedShard], cursors: &[ShardCursor]) {
+    fn sift_down(&mut self, mut idx: usize) {
         loop {
             let mut smallest = idx;
             let left = 2 * idx + 1;
             let right = 2 * idx + 2;
-            if left < self.heap.len() && self.compare_nodes(left, smallest, shards, cursors) == std::cmp::Ordering::Less {
+            if left < self.heap.len() && self.key_less(left, smallest) {
                 smallest = left;
             }
-            if right < self.heap.len() && self.compare_nodes(right, smallest, shards, cursors) == std::cmp::Ordering::Less {
+            if right < self.heap.len() && self.key_less(right, smallest) {
                 smallest = right;
             }
             if smallest != idx {
-                // Swap
                 let ci = self.heap[idx].cursor_idx;
                 let cs = self.heap[smallest].cursor_idx;
                 self.heap.swap(idx, smallest);
@@ -694,10 +647,10 @@ impl TournamentTree {
         }
     }
 
-    fn sift_up(&mut self, mut idx: usize, shards: &[MappedShard], cursors: &[ShardCursor]) {
+    fn sift_up(&mut self, mut idx: usize) {
         while idx > 0 {
             let parent = (idx - 1) / 2;
-            if self.compare_nodes(idx, parent, shards, cursors) == std::cmp::Ordering::Less {
+            if self.key_less(idx, parent) {
                 let ci = self.heap[idx].cursor_idx;
                 let cp = self.heap[parent].cursor_idx;
                 self.heap.swap(idx, parent);
@@ -1014,7 +967,8 @@ pub fn compact_shards(
     // Create writer
     let mut writer = ShardWriter::new(schema);
 
-    // Merge loop
+    // Merge loop — reusable buffer to avoid per-iteration allocation
+    let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
     while !tree.is_empty() {
         let min_key = tree.min_key();
         let num_min = tree.collect_min_indices(&shards, &cursors, schema);
@@ -1032,10 +986,11 @@ pub fn compact_shards(
             writer.add_row(min_key, net_weight, &shards[shard_idx], row, schema);
         }
 
-        // Advance all cursors at min — collect indices first to avoid borrow issues
-        let indices: Vec<usize> = tree.min_indices[..num_min].to_vec();
-        for ci in indices {
-            tree.advance_cursor(ci, &mut cursors, &shards, schema);
+        // Copy indices to reusable buffer to avoid borrow conflict
+        advance_buf.clear();
+        advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
+        for &ci in &advance_buf {
+            tree.advance_cursor(ci, &mut cursors, &shards);
         }
     }
 
@@ -1092,7 +1047,8 @@ pub fn merge_and_route(
         ));
     }
 
-    // Merge loop with routing
+    // Merge loop with routing — reusable buffer
+    let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
     while !tree.is_empty() {
         let min_key = tree.min_key();
         let num_min = tree.collect_min_indices(&shards, &cursors, schema);
@@ -1111,9 +1067,10 @@ pub fn merge_and_route(
             writers[guard_idx].add_row(min_key, net_weight, &shards[shard_idx], row, schema);
         }
 
-        let indices: Vec<usize> = tree.min_indices[..num_min].to_vec();
-        for ci in indices {
-            tree.advance_cursor(ci, &mut cursors, &shards, schema);
+        advance_buf.clear();
+        advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
+        for &ci in &advance_buf {
+            tree.advance_cursor(ci, &mut cursors, &shards);
         }
     }
 
@@ -1165,14 +1122,14 @@ mod tests {
         // For simplicity, create a mock MappedShard-like approach:
         // We'll build the shard using the writer directly
         for i in 0..count {
-            let key = pks[i] as u128; // lo only, hi = 0
+            let _key = pks[i] as u128;
             writer.count += 1;
             writer.pk_lo.extend_from_slice(&pks[i].to_le_bytes());
             writer.pk_hi.extend_from_slice(&0u64.to_le_bytes());
             writer.weight.extend_from_slice(&weights[i].to_le_bytes());
 
             // Write non-PK columns with dummy data
-            let mut null_word: u64 = 0;
+            let null_word: u64 = 0;
             for ci in 0..num_cols {
                 if ci == pk_index {
                     continue;
@@ -1205,7 +1162,7 @@ mod tests {
 
     #[test]
     fn test_compact_basic() {
-        let dir = std::env::temp_dir().join("gnitz_compact_test_basic");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_basic");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -1245,7 +1202,7 @@ mod tests {
 
     #[test]
     fn test_compact_weight_elimination() {
-        let dir = std::env::temp_dir().join("gnitz_compact_test_weight");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_weight");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -1279,7 +1236,7 @@ mod tests {
 
     #[test]
     fn test_compact_single_shard() {
-        let dir = std::env::temp_dir().join("gnitz_compact_test_single");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_single");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -1303,7 +1260,7 @@ mod tests {
 
     #[test]
     fn test_compact_ghost_rows() {
-        let dir = std::env::temp_dir().join("gnitz_compact_test_ghost");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_ghost");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 

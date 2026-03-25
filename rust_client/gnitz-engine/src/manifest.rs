@@ -1,5 +1,7 @@
 use std::mem;
 
+use crate::util::{read_u64_le, write_u64_le};
+
 // ---------------------------------------------------------------------------
 // Manifest file format
 // ---------------------------------------------------------------------------
@@ -56,14 +58,6 @@ impl ManifestEntryRaw {
 pub const MANIFEST_OK: i32 = 0;
 pub const MANIFEST_ERR_MAGIC: i32 = -1;
 pub const MANIFEST_ERR_TRUNCATED: i32 = -2;
-
-fn read_u64_le(buf: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
-}
-
-fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
-    buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
-}
 
 /// Serialize manifest entries into `out_buf`.
 /// Returns bytes written, or -1 if buffer too small.
