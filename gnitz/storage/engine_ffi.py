@@ -124,6 +124,36 @@ eci = ExternalCompilationInfo(
         "  GnitzBatchDesc *batch_descs, uint32_t num_batches,"
         "  void *schema_desc, GnitzMergedBatch *out);",
         "void gnitz_merged_batch_free(GnitzMergedBatch *batch);",
+        # table
+        "void *gnitz_table_create_ephemeral("
+        "  char *directory, char *name, void *schema_desc,"
+        "  uint32_t table_id, uint64_t memtable_arena);",
+        "void *gnitz_table_create_persistent("
+        "  char *directory, char *name, void *schema_desc,"
+        "  uint32_t table_id, uint64_t memtable_arena);",
+        "void gnitz_table_close(void *handle);",
+        "int32_t gnitz_table_ingest_batch(void *handle, GnitzBatchDesc *desc, uint64_t lsn);",
+        "int32_t gnitz_table_ingest_batch_memonly(void *handle, GnitzBatchDesc *desc);",
+        "int32_t gnitz_table_ingest_one("
+        "  void *handle, uint64_t key_lo, uint64_t key_hi, int64_t weight,"
+        "  uint64_t null_word, void **col_ptrs, uint32_t num_payload_cols,"
+        "  uint8_t *source_blob, uint64_t source_blob_len);",
+        "int32_t gnitz_table_flush(void *handle);",
+        "void *gnitz_table_create_cursor(void *handle);",
+        "int32_t gnitz_table_has_pk(void *handle, uint64_t key_lo, uint64_t key_hi);",
+        "int64_t gnitz_table_get_weight("
+        "  void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  uint64_t null_word, void **col_ptrs, uint64_t *col_sizes,"
+        "  uint32_t num_payload_cols, uint8_t *blob_ptr, uint64_t blob_len);",
+        "int32_t gnitz_table_retract_pk("
+        "  void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  void **out_shard, int32_t *out_row, int64_t *out_weight);",
+        "void *gnitz_table_create_child(void *handle, char *name, void *schema_desc);",
+        "int32_t gnitz_table_should_flush(void *handle);",
+        "int32_t gnitz_table_is_empty(void *handle);",
+        "int32_t gnitz_table_compact_if_needed(void *handle);",
+        "uint64_t gnitz_table_current_lsn(void *handle);",
+        "void gnitz_table_set_lsn(void *handle, uint64_t lsn);",
         # memtable
         "void *gnitz_memtable_create(void *schema_desc, uint64_t max_bytes);",
         "void gnitz_memtable_free(void *handle);",
@@ -695,6 +725,101 @@ _memtable_reset = rffi.llexternal(
     [rffi.VOIDP],
     lltype.Void,
     compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Table
+# ---------------------------------------------------------------------------
+
+_table_create_ephemeral = rffi.llexternal(
+    "gnitz_table_create_ephemeral",
+    [rffi.CCHARP, rffi.CCHARP, rffi.VOIDP, rffi.UINT, rffi.ULONGLONG],
+    rffi.VOIDP, compilation_info=eci,
+)
+
+_table_create_persistent = rffi.llexternal(
+    "gnitz_table_create_persistent",
+    [rffi.CCHARP, rffi.CCHARP, rffi.VOIDP, rffi.UINT, rffi.ULONGLONG],
+    rffi.VOIDP, compilation_info=eci,
+)
+
+_table_close = rffi.llexternal(
+    "gnitz_table_close", [rffi.VOIDP], lltype.Void, compilation_info=eci,
+)
+
+_table_ingest_batch = rffi.llexternal(
+    "gnitz_table_ingest_batch",
+    [rffi.VOIDP, rffi.VOIDP, rffi.ULONGLONG],
+    rffi.INT, compilation_info=eci,
+)
+
+_table_ingest_batch_memonly = rffi.llexternal(
+    "gnitz_table_ingest_batch_memonly",
+    [rffi.VOIDP, rffi.VOIDP],
+    rffi.INT, compilation_info=eci,
+)
+
+_table_ingest_one = rffi.llexternal(
+    "gnitz_table_ingest_one",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG, rffi.LONGLONG,
+     rffi.ULONGLONG, rffi.VOIDPP, rffi.UINT,
+     rffi.CCHARP, rffi.ULONGLONG],
+    rffi.INT, compilation_info=eci,
+)
+
+_table_flush = rffi.llexternal(
+    "gnitz_table_flush", [rffi.VOIDP], rffi.INT, compilation_info=eci,
+)
+
+_table_create_cursor = rffi.llexternal(
+    "gnitz_table_create_cursor", [rffi.VOIDP], rffi.VOIDP, compilation_info=eci,
+)
+
+_table_has_pk = rffi.llexternal(
+    "gnitz_table_has_pk",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.INT, compilation_info=eci,
+)
+
+_table_get_weight = rffi.llexternal(
+    "gnitz_table_get_weight",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG,
+     rffi.ULONGLONG, rffi.VOIDPP, rffi.ULONGLONGP, rffi.UINT,
+     rffi.CCHARP, rffi.ULONGLONG],
+    rffi.LONGLONG, compilation_info=eci,
+)
+
+_table_retract_pk = rffi.llexternal(
+    "gnitz_table_retract_pk",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG,
+     rffi.VOIDPP, rffi.INTP, rffi.LONGLONGP],
+    rffi.INT, compilation_info=eci,
+)
+
+_table_create_child = rffi.llexternal(
+    "gnitz_table_create_child",
+    [rffi.VOIDP, rffi.CCHARP, rffi.VOIDP],
+    rffi.VOIDP, compilation_info=eci,
+)
+
+_table_should_flush = rffi.llexternal(
+    "gnitz_table_should_flush", [rffi.VOIDP], rffi.INT, compilation_info=eci,
+)
+
+_table_is_empty = rffi.llexternal(
+    "gnitz_table_is_empty", [rffi.VOIDP], rffi.INT, compilation_info=eci,
+)
+
+_table_compact_if_needed = rffi.llexternal(
+    "gnitz_table_compact_if_needed", [rffi.VOIDP], rffi.INT, compilation_info=eci,
+)
+
+_table_current_lsn = rffi.llexternal(
+    "gnitz_table_current_lsn", [rffi.VOIDP], rffi.ULONGLONG, compilation_info=eci,
+)
+
+_table_set_lsn = rffi.llexternal(
+    "gnitz_table_set_lsn", [rffi.VOIDP, rffi.ULONGLONG], lltype.Void, compilation_info=eci,
 )
 
 # ---------------------------------------------------------------------------
