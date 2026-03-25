@@ -9,4 +9,5 @@ pub mod shard_reader;
 pub mod shard_file;
 pub mod compact;
 pub mod cursor;
+pub mod memtable;
 pub mod ffi;
