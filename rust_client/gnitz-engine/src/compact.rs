@@ -63,6 +63,7 @@ pub struct SchemaDescriptor {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct GuardResult {
     pub guard_key_lo: u64,
     pub guard_key_hi: u64,

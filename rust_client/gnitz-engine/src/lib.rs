@@ -10,4 +10,6 @@ pub mod shard_file;
 pub mod compact;
 pub mod cursor;
 pub mod memtable;
+pub mod refcount;
+pub mod rust_index;
 pub mod ffi;
