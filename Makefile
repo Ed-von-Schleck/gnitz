@@ -46,7 +46,7 @@ ALL_DATA_DIRS := storage_test_data dbsp_test_data \
 
 LOG_DIR := .test_logs
 
-.PHONY: all test clean rust-transport-debug rust-transport-release rust-engine-debug rust-engine-release rust-engine-test server pytest pytest-only e2e e2e-release prove release-server release-server-nojit release-test $(RUN_TARGETS)
+.PHONY: all test clean rust-transport-debug rust-transport-release rust-engine-debug rust-engine-release rust-engine-test server pytest pytest-only e2e e2e-release release-server release-server-nojit release-test $(RUN_TARGETS)
 
 all: test
 
@@ -175,9 +175,6 @@ e2e: gnitz-server-c
 
 e2e-release: gnitz-server-release-c
 	cd rust_client/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release-c GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
-
-prove:
-	$(MAKE) -C proofs prove
 
 release-server: rust-transport-release rust-engine-release
 	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/release \
