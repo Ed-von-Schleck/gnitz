@@ -229,6 +229,62 @@ pub extern "C" fn gnitz_shard_open(
     result.unwrap_or(ptr::null_mut())
 }
 
+/// Create a buffer-backed shard from raw column pointers.
+/// Returns an opaque handle usable with all gnitz_shard_* functions, or null on error.
+/// The caller must keep the buffer memory alive until gnitz_shard_close is called.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_open_from_buffers(
+    pk_lo: *const u8,
+    pk_hi: *const u8,
+    weight: *const u8,
+    null_bm: *const u8,
+    col_ptrs: *const *const u8,
+    col_sizes: *const u64,
+    num_payload_cols: u32,
+    blob_ptr: *const u8,
+    blob_len: u64,
+    count: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if schema_desc.is_null() {
+            return ptr::null_mut();
+        }
+        let schema = unsafe { &*schema_desc };
+        let n_rows = count as usize;
+        let n_cols = num_payload_cols as usize;
+
+        if n_cols != (schema.num_columns as usize).saturating_sub(1) {
+            return ptr::null_mut();
+        }
+
+        if n_rows > 0 && (pk_lo.is_null() || pk_hi.is_null() || weight.is_null() || null_bm.is_null()) {
+            return ptr::null_mut();
+        }
+
+        let (payload_ptrs, payload_sizes) = if n_cols > 0 {
+            if col_ptrs.is_null() || col_sizes.is_null() {
+                return ptr::null_mut();
+            }
+            let ptrs = unsafe { slice::from_raw_parts(col_ptrs, n_cols) };
+            let raw_sizes = unsafe { slice::from_raw_parts(col_sizes, n_cols) };
+            let sizes: Vec<usize> = raw_sizes.iter().map(|&s| s as usize).collect();
+            (ptrs.to_vec(), sizes)
+        } else {
+            (vec![], vec![])
+        };
+
+        let shard = crate::shard_reader::MappedShard::from_buffers(
+            pk_lo, pk_hi, weight, null_bm,
+            &payload_ptrs, &payload_sizes,
+            blob_ptr, blob_len as usize,
+            n_rows, schema,
+        );
+        Box::into_raw(Box::new(shard)) as *mut c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
 #[no_mangle]
 pub extern "C" fn gnitz_shard_close(handle: *mut c_void) {
     if handle.is_null() {
@@ -903,6 +959,77 @@ mod tests {
             ),
             -1,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Buffer-backed shard FFI
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_buffers_ffi_null_schema() {
+        let handle = gnitz_shard_open_from_buffers(
+            ptr::null(), ptr::null(), ptr::null(), ptr::null(),
+            ptr::null(), ptr::null(), 0,
+            ptr::null(), 0, 0, ptr::null(),
+        );
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn from_buffers_ffi_roundtrip() {
+        let pk_lo: Vec<u64> = vec![5, 10, 15];
+        let pk_hi: Vec<u64> = vec![0, 0, 0];
+        let weights: Vec<i64> = vec![1, 2, 3];
+        let nulls: Vec<u64> = vec![0, 0, 0];
+        let col1: Vec<i64> = vec![50, 100, 150];
+
+        let schema = crate::compact::SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: {
+                let mut cols = [crate::compact::SchemaColumn {
+                    type_code: 8, size: 8, nullable: 0, _pad: 0,
+                }; 64];
+                cols[1] = crate::compact::SchemaColumn {
+                    type_code: 9, size: 8, nullable: 0, _pad: 0,
+                };
+                cols
+            },
+        };
+
+        let col_ptrs_arr: Vec<*const u8> = vec![col1.as_ptr() as *const u8];
+        let col_sizes_arr: Vec<u64> = vec![24]; // 3 * 8
+
+        let handle = gnitz_shard_open_from_buffers(
+            pk_lo.as_ptr() as *const u8,
+            pk_hi.as_ptr() as *const u8,
+            weights.as_ptr() as *const u8,
+            nulls.as_ptr() as *const u8,
+            col_ptrs_arr.as_ptr(),
+            col_sizes_arr.as_ptr(),
+            1, // 1 payload column
+            ptr::null(), 0,
+            3,
+            &schema as *const crate::compact::SchemaDescriptor,
+        );
+        assert!(!handle.is_null());
+
+        assert_eq!(gnitz_shard_row_count(handle), 3);
+        assert_eq!(gnitz_shard_get_pk_lo(handle, 0), 5);
+        assert_eq!(gnitz_shard_get_pk_lo(handle, 2), 15);
+        assert_eq!(gnitz_shard_get_weight(handle, 1), 2);
+        assert_eq!(gnitz_shard_has_xor8(handle), 0);
+        assert_eq!(gnitz_shard_xor8_may_contain(handle, 5, 0), 1); // conservative
+
+        assert_eq!(gnitz_shard_find_row(handle, 10, 0), 1);
+        assert_eq!(gnitz_shard_find_row(handle, 7, 0), -1);
+        assert_eq!(gnitz_shard_lower_bound(handle, 12, 0), 2);
+
+        let col_ptr = gnitz_shard_col_ptr(handle, 1, 1, 8);
+        assert!(!col_ptr.is_null());
+        assert_eq!(unsafe { *(col_ptr as *const i64) }, 100);
+
+        gnitz_shard_close(handle);
     }
 
     // -----------------------------------------------------------------------

@@ -30,6 +30,13 @@ eci = ExternalCompilationInfo(
         "uint64_t gnitz_xxh3_hash_u128(uint64_t lo, uint64_t hi, uint64_t seed_lo, uint64_t seed_hi);",
         # shard reader
         "void *gnitz_shard_open(const char *path, const void *schema_desc, int32_t validate_checksums);",
+        "void *gnitz_shard_open_from_buffers("
+        "  uint8_t *pk_lo, uint8_t *pk_hi,"
+        "  uint8_t *weight, uint8_t *null_bm,"
+        "  void **col_ptrs, uint64_t *col_sizes,"
+        "  uint32_t num_payload_cols,"
+        "  uint8_t *blob_ptr, uint64_t blob_len,"
+        "  uint32_t count, void *schema_desc);",
         "void gnitz_shard_close(void *handle);",
         "int32_t gnitz_shard_row_count(const void *handle);",
         "int32_t gnitz_shard_has_xor8(const void *handle);",
@@ -264,6 +271,18 @@ def pack_schema(schema):
 _shard_open = rffi.llexternal(
     "gnitz_shard_open",
     [rffi.CCHARP, rffi.VOIDP, rffi.INT],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_shard_open_from_buffers = rffi.llexternal(
+    "gnitz_shard_open_from_buffers",
+    [rffi.CCHARP, rffi.CCHARP,
+     rffi.CCHARP, rffi.CCHARP,
+     rffi.VOIDPP, rffi.ULONGLONGP,
+     rffi.UINT,
+     rffi.CCHARP, rffi.ULONGLONG,
+     rffi.UINT, rffi.VOIDP],
     rffi.VOIDP,
     compilation_info=eci,
 )
