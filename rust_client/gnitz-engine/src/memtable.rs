@@ -69,7 +69,7 @@ impl OwnedBatch {
         self.count = 0;
     }
 
-    fn as_shard(&self, schema: &SchemaDescriptor) -> MappedShard {
+    pub(crate) fn as_shard(&self, schema: &SchemaDescriptor) -> MappedShard {
         let pk_index = schema.pk_index as usize;
         let mut col_ptrs = Vec::new();
         let mut col_sizes = Vec::new();
@@ -188,7 +188,7 @@ fn relocate_string_into(
 
 pub struct RustMemTable {
     schema: SchemaDescriptor,
-    max_bytes: usize,
+    pub(crate) max_bytes: usize,
     runs: Vec<OwnedBatch>,
     runs_bytes: usize,
     acc: OwnedBatch,

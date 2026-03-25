@@ -47,6 +47,17 @@ fn align8(val: usize) -> usize {
 ///   [48B header][directory: num_regions * 8B][data regions, 8B-aligned]
 ///
 /// Directory entries store offsets relative to block start (not buffer start).
+pub fn estimate_block_size(entry_count: u32, region_sizes: &[u32], _blob_size: u64) -> usize {
+    let num_regions = region_sizes.len();
+    let dir_size = num_regions * 8;
+    let mut pos = HEADER_SIZE + dir_size;
+    for i in 0..num_regions {
+        pos = align8(pos);
+        pos += region_sizes[i] as usize;
+    }
+    pos
+}
+
 pub fn encode(
     out_buf: &mut [u8],
     out_offset: usize,

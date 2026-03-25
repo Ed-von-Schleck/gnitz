@@ -12,4 +12,6 @@ pub mod cursor;
 pub mod memtable;
 pub mod refcount;
 pub mod rust_index;
+pub mod wal_writer;
+pub mod table;
 pub mod ffi;
