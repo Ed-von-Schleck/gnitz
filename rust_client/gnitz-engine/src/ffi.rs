@@ -728,6 +728,314 @@ pub extern "C" fn gnitz_write_shard(
 }
 
 // ---------------------------------------------------------------------------
+// Batch descriptor (for passing ArenaZSetBatch buffers across FFI)
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct GnitzBatchDesc {
+    pub pk_lo: *const u8,
+    pub pk_hi: *const u8,
+    pub weight: *const u8,
+    pub null_bm: *const u8,
+    pub col_ptrs: *const *const u8,
+    pub col_sizes: *const u64,
+    pub num_payload_cols: u32,
+    pub blob_ptr: *const u8,
+    pub blob_len: u64,
+    pub count: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Merged batch result (Rust-allocated output from merge)
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct GnitzMergedBatch {
+    pub count: u32,
+    pub pk_lo: *mut u8,
+    pub pk_lo_len: u64,
+    pub pk_hi: *mut u8,
+    pub pk_hi_len: u64,
+    pub weight: *mut u8,
+    pub weight_len: u64,
+    pub null_bm: *mut u8,
+    pub null_bm_len: u64,
+    pub num_cols: u32,
+    pub col_ptrs: [*mut u8; 64],
+    pub col_lens: [u64; 64],
+    pub blob: *mut u8,
+    pub blob_len: u64,
+}
+
+impl GnitzMergedBatch {
+    fn zeroed() -> Self {
+        GnitzMergedBatch {
+            count: 0,
+            pk_lo: ptr::null_mut(), pk_lo_len: 0,
+            pk_hi: ptr::null_mut(), pk_hi_len: 0,
+            weight: ptr::null_mut(), weight_len: 0,
+            null_bm: ptr::null_mut(), null_bm_len: 0,
+            num_cols: 0,
+            col_ptrs: [ptr::null_mut(); 64],
+            col_lens: [0u64; 64],
+            blob: ptr::null_mut(), blob_len: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build ShardRef vec from FFI inputs
+// ---------------------------------------------------------------------------
+
+fn build_shard_refs(
+    borrowed_handles: *const *const c_void,
+    num_borrowed: u32,
+    batch_descs: *const GnitzBatchDesc,
+    num_batches: u32,
+    schema: &crate::compact::SchemaDescriptor,
+) -> Option<Vec<crate::cursor::ShardRef>> {
+    let n_borrowed = num_borrowed as usize;
+    let n_batches = num_batches as usize;
+    let mut refs = Vec::with_capacity(n_borrowed + n_batches);
+
+    if n_borrowed > 0 {
+        if borrowed_handles.is_null() { return None; }
+        let handles = unsafe { slice::from_raw_parts(borrowed_handles, n_borrowed) };
+        for &h in handles {
+            if h.is_null() { return None; }
+            let shard = unsafe { &*(h as *const crate::shard_reader::MappedShard) };
+            refs.push(crate::cursor::ShardRef::Borrowed(shard as *const _));
+        }
+    }
+
+    if n_batches > 0 {
+        if batch_descs.is_null() { return None; }
+        let descs = unsafe { slice::from_raw_parts(batch_descs, n_batches) };
+        for desc in descs {
+            let n_cols = desc.num_payload_cols as usize;
+            let (col_ptrs, col_sizes) = if n_cols > 0 && !desc.col_ptrs.is_null() && !desc.col_sizes.is_null() {
+                let ptrs = unsafe { slice::from_raw_parts(desc.col_ptrs, n_cols) };
+                let raw_sizes = unsafe { slice::from_raw_parts(desc.col_sizes, n_cols) };
+                let sizes: Vec<usize> = raw_sizes.iter().map(|&s| s as usize).collect();
+                (ptrs.to_vec(), sizes)
+            } else {
+                (vec![ptr::null(); n_cols], vec![0usize; n_cols])
+            };
+
+            let shard = crate::shard_reader::MappedShard::from_buffers(
+                desc.pk_lo, desc.pk_hi, desc.weight, desc.null_bm,
+                &col_ptrs, &col_sizes,
+                desc.blob_ptr, desc.blob_len as usize,
+                desc.count as usize, schema,
+            );
+            refs.push(crate::cursor::ShardRef::Owned(shard));
+        }
+    }
+
+    Some(refs)
+}
+
+// ---------------------------------------------------------------------------
+// Cursor FFI
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_create(
+    borrowed_handles: *const *const c_void,
+    num_borrowed: u32,
+    batch_descs: *const GnitzBatchDesc,
+    num_batches: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if schema_desc.is_null() { return ptr::null_mut(); }
+        let schema = unsafe { &*schema_desc };
+
+        let refs = match build_shard_refs(borrowed_handles, num_borrowed, batch_descs, num_batches, schema) {
+            Some(r) => r,
+            None => return ptr::null_mut(),
+        };
+
+        let cursor = crate::cursor::UnifiedCursor::new(refs, schema.clone());
+        Box::into_raw(Box::new(cursor)) as *mut c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_seek(handle: *mut c_void, key_lo: u64, key_hi: u64) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let cursor = unsafe { &mut *(handle as *mut crate::cursor::UnifiedCursor) };
+        cursor.seek(key_lo, key_hi);
+    }));
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_advance(handle: *mut c_void) -> i32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let cursor = unsafe { &mut *(handle as *mut crate::cursor::UnifiedCursor) };
+        cursor.advance();
+        if cursor.is_valid() { 1 } else { 0 }
+    }));
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_is_valid(handle: *const c_void) -> i32 {
+    if handle.is_null() { return 0; }
+    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
+    if cursor.is_valid() { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_key_lo(handle: *const c_void) -> u64 {
+    if handle.is_null() { return 0; }
+    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
+    cursor.key_lo()
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_key_hi(handle: *const c_void) -> u64 {
+    if handle.is_null() { return 0; }
+    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
+    cursor.key_hi()
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_weight(handle: *const c_void) -> i64 {
+    if handle.is_null() { return 0; }
+    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
+    cursor.weight()
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_null_word(handle: *const c_void) -> u64 {
+    if handle.is_null() { return 0; }
+    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
+    cursor.null_word()
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_col_ptr(
+    handle: *const c_void,
+    col_idx: u32,
+    col_size: u32,
+) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
+    cursor.col_ptr(col_idx as usize, col_size as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_blob_ptr(handle: *const c_void) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
+    cursor.blob_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_blob_len(handle: *const c_void) -> i64 {
+    if handle.is_null() { return 0; }
+    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
+    cursor.blob_len() as i64
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_cursor_close(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let _ = unsafe { Box::from_raw(handle as *mut crate::cursor::UnifiedCursor) };
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Bulk merge FFI
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_merge_to_batch(
+    batch_descs: *const GnitzBatchDesc,
+    num_batches: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    out: *mut GnitzMergedBatch,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if schema_desc.is_null() || out.is_null() { return -1; }
+        let schema = unsafe { &*schema_desc };
+
+        let refs = match build_shard_refs(ptr::null(), 0, batch_descs, num_batches, schema) {
+            Some(r) => r,
+            None => return -1,
+        };
+
+        let writer = crate::cursor::merge_to_writer(&refs, schema);
+        let pk_index = schema.pk_index as usize;
+
+        let out_ref = unsafe { &mut *out };
+        *out_ref = GnitzMergedBatch::zeroed();
+        out_ref.count = writer.count as u32;
+
+        // Transfer ownership of Vec buffers to the output struct.
+        // The caller must call gnitz_merged_batch_free to deallocate.
+        let mut w = writer;
+        let pk_lo = std::mem::take(&mut w.pk_lo);
+        out_ref.pk_lo_len = pk_lo.len() as u64;
+        out_ref.pk_lo = Box::into_raw(pk_lo.into_boxed_slice()) as *mut u8;
+
+        let pk_hi = std::mem::take(&mut w.pk_hi);
+        out_ref.pk_hi_len = pk_hi.len() as u64;
+        out_ref.pk_hi = Box::into_raw(pk_hi.into_boxed_slice()) as *mut u8;
+
+        let weight = std::mem::take(&mut w.weight);
+        out_ref.weight_len = weight.len() as u64;
+        out_ref.weight = Box::into_raw(weight.into_boxed_slice()) as *mut u8;
+
+        let null_bm = std::mem::take(&mut w.null_bitmap);
+        out_ref.null_bm_len = null_bm.len() as u64;
+        out_ref.null_bm = Box::into_raw(null_bm.into_boxed_slice()) as *mut u8;
+
+        let mut ci = 0u32;
+        for col_idx in 0..schema.num_columns as usize {
+            if col_idx == pk_index { continue; }
+            let buf = std::mem::take(&mut w.col_bufs[col_idx]);
+            out_ref.col_lens[ci as usize] = buf.len() as u64;
+            out_ref.col_ptrs[ci as usize] = Box::into_raw(buf.into_boxed_slice()) as *mut u8;
+            ci += 1;
+        }
+        out_ref.num_cols = ci;
+
+        let blob = std::mem::take(&mut w.blob_heap);
+        out_ref.blob_len = blob.len() as u64;
+        out_ref.blob = Box::into_raw(blob.into_boxed_slice()) as *mut u8;
+
+        0
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_merged_batch_free(batch: *mut GnitzMergedBatch) {
+    if batch.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let b = unsafe { &mut *batch };
+        unsafe {
+            if !b.pk_lo.is_null() { let _ = Box::from_raw(slice::from_raw_parts_mut(b.pk_lo, b.pk_lo_len as usize)); }
+            if !b.pk_hi.is_null() { let _ = Box::from_raw(slice::from_raw_parts_mut(b.pk_hi, b.pk_hi_len as usize)); }
+            if !b.weight.is_null() { let _ = Box::from_raw(slice::from_raw_parts_mut(b.weight, b.weight_len as usize)); }
+            if !b.null_bm.is_null() { let _ = Box::from_raw(slice::from_raw_parts_mut(b.null_bm, b.null_bm_len as usize)); }
+            for i in 0..b.num_cols as usize {
+                if !b.col_ptrs[i].is_null() {
+                    let _ = Box::from_raw(slice::from_raw_parts_mut(b.col_ptrs[i], b.col_lens[i] as usize));
+                }
+            }
+            if !b.blob.is_null() { let _ = Box::from_raw(slice::from_raw_parts_mut(b.blob, b.blob_len as usize)); }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 
