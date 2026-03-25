@@ -38,7 +38,7 @@ class PersistentTable(EphemeralTable):
             lltype.free(schema_buf, flavor="raw")
 
         from gnitz.storage import comparator as storage_comparator
-        self._retract_soa = storage_comparator.SoAAccessor(schema)
+        self._retract_accessor = storage_comparator.RetractRowAccessor(schema)
         self.current_lsn = r_uint64(engine_ffi._table_current_lsn(self._handle))
 
     def ingest_batch(self, batch):
@@ -56,8 +56,7 @@ class PersistentTable(EphemeralTable):
         col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
         col_sizes = lltype.malloc(rffi.ULONGLONGP.TO, num_payload, flavor="raw")
         try:
-            from gnitz.storage.memtable import _pack_batch_desc
-            _pack_batch_desc(desc_buf, batch, self.schema, num_payload, col_ptrs, col_sizes)
+            engine_ffi.pack_batch_desc(desc_buf, batch, self.schema, num_payload, col_ptrs, col_sizes)
             rc = engine_ffi._table_ingest_batch(
                 self._handle,
                 rffi.cast(rffi.VOIDP, desc_buf),
@@ -82,8 +81,7 @@ class PersistentTable(EphemeralTable):
         col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
         col_sizes = lltype.malloc(rffi.ULONGLONGP.TO, num_payload, flavor="raw")
         try:
-            from gnitz.storage.memtable import _pack_batch_desc
-            _pack_batch_desc(desc_buf, batch, self.schema, num_payload, col_ptrs, col_sizes)
+            engine_ffi.pack_batch_desc(desc_buf, batch, self.schema, num_payload, col_ptrs, col_sizes)
             rc = engine_ffi._table_ingest_batch_memonly(
                 self._handle,
                 rffi.cast(rffi.VOIDP, desc_buf),

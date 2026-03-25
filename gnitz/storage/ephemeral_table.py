@@ -17,7 +17,6 @@ from gnitz.core.store import ZSetStore
 from gnitz.core.batch import pk_eq
 from gnitz.storage import (
     engine_ffi,
-    shard_table,
     comparator as storage_comparator,
     cursor,
 )
@@ -39,7 +38,7 @@ class EphemeralTable(ZSetStore):
         self.is_closed = False
         self.current_lsn = r_uint64(0)
         self._handle = NULL_HANDLE
-        self._retract_soa = storage_comparator.SoAAccessor(schema)
+        self._retract_accessor = storage_comparator.RetractRowAccessor(schema)
 
         if len(directory) == 0:
             return
@@ -102,37 +101,41 @@ class EphemeralTable(ZSetStore):
         )))
 
     def retract_pk(self, key_lo, key_hi, out_batch):
-        out_shard = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
-        out_row = lltype.malloc(rffi.INTP.TO, 1, flavor="raw")
+        num_payload = len(self.schema.columns) - 1
+        out_col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
+        out_null = lltype.malloc(rffi.ULONGLONGP.TO, 1, flavor="raw")
+        out_blob_ptr = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+        out_blob_len = lltype.malloc(rffi.ULONGLONGP.TO, 1, flavor="raw")
         out_weight = lltype.malloc(rffi.LONGLONGP.TO, 1, flavor="raw")
+        out_cleanup = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
         try:
-            out_shard[0] = NULL_HANDLE
-            out_row[0] = rffi.cast(rffi.INT, -1)
-            out_weight[0] = rffi.cast(rffi.LONGLONG, 0)
-            found = engine_ffi._table_retract_pk(
+            out_cleanup[0] = NULL_HANDLE
+            found = engine_ffi._table_retract_pk_row(
                 self._handle,
                 rffi.cast(rffi.ULONGLONG, key_lo),
                 rffi.cast(rffi.ULONGLONG, key_hi),
-                rffi.cast(rffi.VOIDPP, out_shard),
-                out_row, out_weight,
+                out_col_ptrs,
+                rffi.cast(rffi.UINT, num_payload),
+                out_null, out_blob_ptr, out_blob_len,
+                out_weight, out_cleanup,
             )
             if intmask(found) == 0:
                 return False
-            shard_handle = out_shard[0]
-            row_idx = intmask(out_row[0])
+            null_word = r_uint64(out_null[0])
+            blob_ptr = rffi.cast(rffi.CCHARP, out_blob_ptr[0])
+            self._retract_accessor.set_ptrs(out_col_ptrs, null_word, blob_ptr)
+            out_batch.append_from_accessor(
+                key_lo, key_hi, r_int64(-1), self._retract_accessor)
         finally:
-            lltype.free(out_shard, flavor="raw")
-            lltype.free(out_row, flavor="raw")
+            cleanup = out_cleanup[0]
+            if cleanup:
+                engine_ffi._retract_row_free(cleanup)
+            lltype.free(out_col_ptrs, flavor="raw")
+            lltype.free(out_null, flavor="raw")
+            lltype.free(out_blob_ptr, flavor="raw")
+            lltype.free(out_blob_len, flavor="raw")
             lltype.free(out_weight, flavor="raw")
-
-        if shard_handle:
-            view = shard_table.TableShardView("", self.schema)
-            view._handle = shard_handle
-            view._blob_ptr = engine_ffi._shard_blob_ptr(shard_handle)
-            view.count = intmask(engine_ffi._shard_row_count(shard_handle))
-            self._retract_soa.set_row(view, row_idx)
-            out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_soa)
-            engine_ffi._shard_close(shard_handle)
+            lltype.free(out_cleanup, flavor="raw")
         return True
 
     def get_weight(self, key_lo, key_hi, accessor):
@@ -197,8 +200,7 @@ class EphemeralTable(ZSetStore):
         col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
         col_sizes = lltype.malloc(rffi.ULONGLONGP.TO, num_payload, flavor="raw")
         try:
-            from gnitz.storage.memtable import _pack_batch_desc
-            _pack_batch_desc(desc_buf, batch, self.schema, num_payload, col_ptrs, col_sizes)
+            engine_ffi.pack_batch_desc(desc_buf, batch, self.schema, num_payload, col_ptrs, col_sizes)
             rc = engine_ffi._table_ingest_batch_memonly(
                 self._handle, rffi.cast(rffi.VOIDP, desc_buf),
             )
