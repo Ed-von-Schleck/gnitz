@@ -6,29 +6,14 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
-use std::ptr;
 
-use crate::util::{read_u32_le, read_u64_le, read_i64_le, write_u64_le};
+use crate::layout::*;
+use crate::shard_reader::MappedShard;
+use crate::util::{read_u32_le, read_u64_le, write_u64_le};
+#[cfg(test)]
+use crate::util::read_i64_le;
 use crate::xxh;
 use crate::xor8;
-
-// ---------------------------------------------------------------------------
-// Constants (from layout.py)
-// ---------------------------------------------------------------------------
-
-const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
-const SHARD_VERSION: u64 = 3;
-const HEADER_SIZE: usize = 64;
-const DIR_ENTRY_SIZE: usize = 24;
-const ALIGNMENT: usize = 64;
-
-const OFF_MAGIC: usize = 0;
-const OFF_VERSION: usize = 8;
-const OFF_ROW_COUNT: usize = 16;
-const OFF_DIR_OFFSET: usize = 24;
-const OFF_TABLE_ID: usize = 32;
-const OFF_XOR8_OFFSET: usize = 40;
-const OFF_XOR8_SIZE: usize = 48;
 
 // Type codes (from core/types.py). All defined for completeness;
 // the compare_rows dispatch only uses F32/F64/STRING/U128 explicitly.
@@ -47,7 +32,9 @@ mod type_code {
     pub const STRING: u8 = 11;
     pub const U128: u8 = 12;
 }
-use type_code::{F32 as TYPE_F32, F64 as TYPE_F64, STRING as TYPE_STRING, U128 as TYPE_U128, I64 as TYPE_I64, U64 as TYPE_U64};
+use type_code::{F32 as TYPE_F32, F64 as TYPE_F64, STRING as TYPE_STRING, U128 as TYPE_U128};
+#[cfg(test)]
+use type_code::{I64 as TYPE_I64, U64 as TYPE_U64};
 
 const SHORT_STRING_THRESHOLD: usize = 12;
 
@@ -88,170 +75,6 @@ pub struct GuardResult {
 
 fn align64(val: usize) -> usize {
     (val + ALIGNMENT - 1) & !(ALIGNMENT - 1)
-}
-
-// Local helpers removed — using crate::util::{read_u32_le, read_u64_le, ...}
-
-// ---------------------------------------------------------------------------
-// Shard reader (mmap-based)
-// ---------------------------------------------------------------------------
-
-struct MappedShard {
-    mmap_ptr: *mut u8,
-    mmap_len: usize,
-    count: usize,
-    // Region offsets into the mmap'd data
-    pk_lo_off: usize,
-    pk_hi_off: usize,
-    weight_off: usize,
-    null_off: usize,
-    // Non-PK column regions: (offset, size) indexed by payload position
-    col_regions: Vec<(usize, usize)>,
-    // Blob heap
-    blob_off: usize,
-    blob_len: usize,
-}
-
-impl MappedShard {
-    fn open(path: &CStr, schema: &SchemaDescriptor) -> Result<Self, i32> {
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
-        if fd < 0 {
-            return Err(-1);
-        }
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st) } < 0 {
-            unsafe { libc::close(fd); }
-            return Err(-1);
-        }
-        let file_size = st.st_size as usize;
-        if file_size < HEADER_SIZE {
-            unsafe { libc::close(fd); }
-            return Err(-2);
-        }
-
-        let mmap_ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                file_size,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        unsafe { libc::close(fd); }
-        if mmap_ptr == libc::MAP_FAILED {
-            return Err(-1);
-        }
-        let mmap_ptr = mmap_ptr as *mut u8;
-        // SAFETY: mmap_ptr is valid for file_size bytes. We borrow it only while
-        // the MappedShard is alive; Drop calls munmap.
-        let data = unsafe { std::slice::from_raw_parts(mmap_ptr, file_size) };
-
-        // Validate header
-        if read_u64_le(data, OFF_MAGIC) != SHARD_MAGIC {
-            unsafe { libc::munmap(mmap_ptr as *mut libc::c_void, file_size); }
-            return Err(-2);
-        }
-        if read_u64_le(data, OFF_VERSION) != SHARD_VERSION {
-            unsafe { libc::munmap(mmap_ptr as *mut libc::c_void, file_size); }
-            return Err(-2);
-        }
-
-        let count = read_u64_le(data, OFF_ROW_COUNT) as usize;
-        let dir_off = read_u64_le(data, OFF_DIR_OFFSET) as usize;
-
-        // Parse region directory
-        let num_cols = schema.num_columns as usize;
-        let num_non_pk = num_cols - 1;
-        let num_regions = 4 + num_non_pk + 1;
-
-        let mut regions: Vec<(usize, usize)> = Vec::with_capacity(num_regions);
-        for i in 0..num_regions {
-            let entry_off = dir_off + i * DIR_ENTRY_SIZE;
-            if entry_off + DIR_ENTRY_SIZE > file_size {
-                unsafe { libc::munmap(mmap_ptr as *mut libc::c_void, file_size); }
-                return Err(-2);
-            }
-            let r_off = read_u64_le(data, entry_off) as usize;
-            let r_sz = read_u64_le(data, entry_off + 8) as usize;
-            if r_off.saturating_add(r_sz) > file_size {
-                unsafe { libc::munmap(mmap_ptr as *mut libc::c_void, file_size); }
-                return Err(-2);
-            }
-            regions.push((r_off, r_sz));
-        }
-
-        // Map non-PK column regions (skip PK column)
-        let mut col_regions = Vec::with_capacity(num_non_pk);
-        let mut reg_idx = 4;
-        for ci in 0..num_cols {
-            if ci == schema.pk_index as usize {
-                continue;
-            }
-            col_regions.push(regions[reg_idx]);
-            reg_idx += 1;
-        }
-        let blob_region = regions[reg_idx];
-
-        Ok(MappedShard {
-            mmap_ptr,
-            mmap_len: file_size,
-            count,
-            pk_lo_off: regions[0].0,
-            pk_hi_off: regions[1].0,
-            weight_off: regions[2].0,
-            null_off: regions[3].0,
-            col_regions,
-            blob_off: blob_region.0,
-            blob_len: blob_region.1,
-        })
-    }
-
-    /// Returns a borrowed slice over the mmap'd data.
-    /// SAFETY: valid as long as `self` is alive (Drop calls munmap).
-    #[inline]
-    fn data(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.mmap_ptr, self.mmap_len) }
-    }
-
-    fn get_pk(&self, row: usize) -> u128 {
-        let d = self.data();
-        let lo = read_u64_le(d, self.pk_lo_off + row * 8);
-        let hi = read_u64_le(d, self.pk_hi_off + row * 8);
-        ((hi as u128) << 64) | (lo as u128)
-    }
-
-    fn get_weight(&self, row: usize) -> i64 {
-        read_i64_le(self.data(), self.weight_off + row * 8)
-    }
-
-    fn get_null_word(&self, row: usize) -> u64 {
-        read_u64_le(self.data(), self.null_off + row * 8)
-    }
-
-    fn get_col_ptr(&self, row: usize, payload_col_idx: usize, col_size: usize) -> &[u8] {
-        let (off, region_len) = self.col_regions[payload_col_idx];
-        let start = off + row * col_size;
-        let end = start + col_size;
-        debug_assert!(end <= off + region_len, "get_col_ptr out of bounds");
-        &self.data()[start..end]
-    }
-
-    fn blob_slice(&self) -> &[u8] {
-        &self.data()[self.blob_off..self.blob_off + self.blob_len]
-    }
-}
-
-impl Drop for MappedShard {
-    fn drop(&mut self) {
-        if !self.mmap_ptr.is_null() {
-            unsafe {
-                libc::munmap(self.mmap_ptr as *mut libc::c_void, self.mmap_len);
-            }
-            self.mmap_ptr = ptr::null_mut();
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -952,7 +775,7 @@ pub fn compact_shards(
     // Open all input shards
     let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
     for f in input_files {
-        match MappedShard::open(f, schema) {
+        match MappedShard::open(f, schema, false) {
             Ok(s) => shards.push(s),
             Err(e) => return e,
         }
@@ -1019,7 +842,7 @@ pub fn merge_and_route(
     // Open all input shards
     let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
     for f in input_files {
-        match MappedShard::open(f, schema) {
+        match MappedShard::open(f, schema, false) {
             Ok(s) => shards.push(s),
             Err(e) => return e,
         }
@@ -1189,7 +1012,7 @@ mod tests {
         assert_eq!(rc, 0);
 
         // Read back merged shard
-        let merged = MappedShard::open(&cout, &schema).unwrap();
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 6);
 
         // Verify sorted order
@@ -1229,7 +1052,7 @@ mod tests {
         assert_eq!(rc, 0);
 
         // Key 2 should be eliminated (net weight = 0)
-        let merged = MappedShard::open(&cout, &schema).unwrap();
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 2);
         assert_eq!(merged.get_pk(0), 1);
         assert_eq!(merged.get_pk(1), 3);
@@ -1255,7 +1078,7 @@ mod tests {
         let rc = compact_shards(&inputs, &cout, &schema, 0);
         assert_eq!(rc, 0);
 
-        let merged = MappedShard::open(&cout, &schema).unwrap();
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 3);
 
         let _ = fs::remove_dir_all(&dir);
@@ -1280,7 +1103,7 @@ mod tests {
         let rc = compact_shards(&inputs, &cout, &schema, 0);
         assert_eq!(rc, 0);
 
-        let merged = MappedShard::open(&cout, &schema).unwrap();
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 3); // only keys 1, 3, 5
 
         let _ = fs::remove_dir_all(&dir);
@@ -1344,7 +1167,7 @@ mod tests {
         assert_eq!(rc, 0);
 
         // Output shard should exist with 0 rows
-        let merged = MappedShard::open(&cout, &schema).unwrap();
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 0);
 
         let _ = fs::remove_dir_all(&dir);
@@ -1376,7 +1199,7 @@ mod tests {
         let rc = compact_shards(&inputs, &cout, &schema, 0);
         assert_eq!(rc, 0);
 
-        let merged = MappedShard::open(&cout, &schema).unwrap();
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 0);
 
         let _ = fs::remove_dir_all(&dir);
@@ -1416,7 +1239,7 @@ mod tests {
         let fn0_end = results[0].filename.iter().position(|&b| b == 0).unwrap_or(256);
         let fn0 = std::str::from_utf8(&results[0].filename[..fn0_end]).unwrap();
         let cfn0 = std::ffi::CString::new(fn0).unwrap();
-        let g0 = MappedShard::open(&cfn0, &schema).unwrap();
+        let g0 = MappedShard::open(&cfn0, &schema, false).unwrap();
         assert_eq!(g0.count, 2);
         assert_eq!(g0.get_pk(0), 10);
         assert_eq!(g0.get_pk(1), 50);
@@ -1425,7 +1248,7 @@ mod tests {
         let fn1_end = results[1].filename.iter().position(|&b| b == 0).unwrap_or(256);
         let fn1 = std::str::from_utf8(&results[1].filename[..fn1_end]).unwrap();
         let cfn1 = std::ffi::CString::new(fn1).unwrap();
-        let g1 = MappedShard::open(&cfn1, &schema).unwrap();
+        let g1 = MappedShard::open(&cfn1, &schema, false).unwrap();
         assert_eq!(g1.count, 2);
         assert_eq!(g1.get_pk(0), 150);
         assert_eq!(g1.get_pk(1), 250);
@@ -1475,7 +1298,7 @@ mod tests {
         let rc = compact_shards(&inputs, &cout, &schema, 0);
         assert_eq!(rc, 0);
 
-        let merged = MappedShard::open(&cout, &schema).unwrap();
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 3);
 
         // Verify string data survived
@@ -1536,7 +1359,7 @@ mod tests {
         let rc = compact_shards(&inputs, &cout, &schema, 0);
         assert_eq!(rc, 0);
 
-        let merged = MappedShard::open(&cout, &schema).unwrap();
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 2);
 
         // Row 0: not null

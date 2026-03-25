@@ -1,13 +1,21 @@
 use xxhash_rust::xxh3::xxh3_64;
 
+/// Hash a 128-bit key (lo, hi) with optional seeds to a 64-bit hash.
+/// XORs inputs with seeds, lays out as [lo^seed_lo LE, hi^seed_hi LE],
+/// then hashes the 16 bytes with XXH3-64.
+#[inline]
+pub fn hash_u128_seeded(lo: u64, hi: u64, seed_lo: u64, seed_hi: u64) -> u64 {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&(lo ^ seed_lo).to_le_bytes());
+    buf[8..].copy_from_slice(&(hi ^ seed_hi).to_le_bytes());
+    xxh3_64(&buf)
+}
+
 /// Hash a 128-bit key (lo, hi) to a 64-bit hash.
 /// Lays out [lo:u64 LE, hi:u64 LE] as 16 bytes and hashes with XXH3-64.
 #[inline]
 pub fn hash_u128(lo: u64, hi: u64) -> u64 {
-    let mut buf = [0u8; 16];
-    buf[..8].copy_from_slice(&lo.to_le_bytes());
-    buf[8..].copy_from_slice(&hi.to_le_bytes());
-    xxh3_64(&buf)
+    hash_u128_seeded(lo, hi, 0, 0)
 }
 
 /// Compute XXH3-64 checksum over arbitrary bytes.
@@ -36,6 +44,18 @@ mod tests {
     fn zero_key() {
         let h = hash_u128(0, 0);
         let _ = h;
+    }
+
+    #[test]
+    fn seeded_with_zero_equals_unseeded() {
+        assert_eq!(hash_u128_seeded(42, 99, 0, 0), hash_u128(42, 99));
+        assert_eq!(hash_u128_seeded(0, 0, 0, 0), hash_u128(0, 0));
+    }
+
+    #[test]
+    fn seeded_with_nonzero_differs() {
+        assert_ne!(hash_u128_seeded(42, 99, 1, 0), hash_u128(42, 99));
+        assert_ne!(hash_u128_seeded(42, 99, 0, 1), hash_u128(42, 99));
     }
 
     #[test]

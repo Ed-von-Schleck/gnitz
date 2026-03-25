@@ -4,5 +4,7 @@ pub mod bloom;
 pub mod xor8;
 pub mod wal;
 pub mod manifest;
+pub mod layout;
+pub mod shard_reader;
 pub mod compact;
 pub mod ffi;

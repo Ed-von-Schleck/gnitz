@@ -13,27 +13,7 @@ from gnitz.storage import engine_ffi
 
 def _pack_schema(schema):
     """Pack a TableSchema into a flat C buffer matching Rust SchemaDescriptor."""
-    buf = lltype.malloc(rffi.CCHARP.TO, engine_ffi.SCHEMA_DESC_SIZE, flavor="raw")
-    # Zero it
-    i = 0
-    while i < engine_ffi.SCHEMA_DESC_SIZE:
-        buf[i] = '\x00'
-        i += 1
-    # num_columns (u32 at offset 0)
-    num_cols = len(schema.columns)
-    rffi.cast(rffi.UINTP, buf)[0] = rffi.cast(rffi.UINT, num_cols)
-    # pk_index (u32 at offset 4)
-    rffi.cast(rffi.UINTP, rffi.ptradd(buf, 4))[0] = rffi.cast(rffi.UINT, schema.pk_index)
-    # columns: 4 bytes each (type_code, size, nullable, pad) starting at offset 8
-    ci = 0
-    while ci < num_cols:
-        col = schema.columns[ci]
-        base = 8 + ci * 4
-        buf[base] = chr(col.field_type.code)
-        buf[base + 1] = chr(col.field_type.size)
-        buf[base + 2] = chr(1 if col.is_nullable else 0)
-        ci += 1
-    return buf
+    return engine_ffi.pack_schema(schema)
 
 
 def _pack_filenames(file_list):

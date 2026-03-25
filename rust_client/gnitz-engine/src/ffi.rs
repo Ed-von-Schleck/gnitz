@@ -190,6 +190,165 @@ pub extern "C" fn gnitz_xxh3_checksum(data: *const u8, len: i64) -> u64 {
     result.unwrap_or(0)
 }
 
+/// Hash a 128-bit key (lo, hi) with seeds to a 64-bit hash.
+/// XORs inputs with seeds before hashing.
+#[no_mangle]
+pub extern "C" fn gnitz_xxh3_hash_u128(
+    lo: u64,
+    hi: u64,
+    seed_lo: u64,
+    seed_hi: u64,
+) -> u64 {
+    let result = panic::catch_unwind(|| {
+        crate::xxh::hash_u128_seeded(lo, hi, seed_lo, seed_hi)
+    });
+    result.unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Shard reader
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_open(
+    path: *const libc::c_char,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    validate_checksums: i32,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if path.is_null() || schema_desc.is_null() {
+            return ptr::null_mut();
+        }
+        let cpath = unsafe { CStr::from_ptr(path) };
+        let schema = unsafe { &*schema_desc };
+        match crate::shard_reader::MappedShard::open(cpath, schema, validate_checksums != 0) {
+            Ok(shard) => Box::into_raw(Box::new(shard)) as *mut c_void,
+            Err(_) => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_close(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = panic::catch_unwind(|| {
+        let _ = unsafe { Box::from_raw(handle as *mut crate::shard_reader::MappedShard) };
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_row_count(handle: *const c_void) -> i32 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.count as i32
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_has_xor8(handle: *const c_void) -> i32 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    if shard.has_xor8() { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_xor8_may_contain(
+    handle: *const c_void,
+    key_lo: u64,
+    key_hi: u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() { return 1; }
+        let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+        if shard.xor8_may_contain(key_lo, key_hi) { 1 } else { 0 }
+    });
+    result.unwrap_or(1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_find_row(
+    handle: *const c_void,
+    key_lo: u64,
+    key_hi: u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() { return -1; }
+        let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+        shard.find_row_index(key_lo, key_hi)
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_lower_bound(
+    handle: *const c_void,
+    key_lo: u64,
+    key_hi: u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() { return 0; }
+        let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+        shard.find_lower_bound(key_lo, key_hi) as i32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_get_pk_lo(handle: *const c_void, row: i32) -> u64 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.get_pk_lo(row as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_get_pk_hi(handle: *const c_void, row: i32) -> u64 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.get_pk_hi(row as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_get_weight(handle: *const c_void, row: i32) -> i64 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.get_weight(row as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_get_null_word(handle: *const c_void, row: i32) -> u64 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.get_null_word(row as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_col_ptr(
+    handle: *const c_void,
+    row: i32,
+    col_idx: i32,
+    col_size: i32,
+) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.col_ptr_by_logical(row as usize, col_idx as usize, col_size as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_blob_ptr(handle: *const c_void) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.blob_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_blob_len(handle: *const c_void) -> i64 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.blob_len() as i64
+}
+
 // ---------------------------------------------------------------------------
 // WAL encode/decode
 // ---------------------------------------------------------------------------
@@ -507,6 +666,17 @@ mod tests {
         gnitz_bloom_add(ptr::null_mut(), 1, 2); // should not crash
         gnitz_bloom_reset(ptr::null_mut());
         gnitz_bloom_free(ptr::null_mut());
+    }
+
+    #[test]
+    fn xxh3_hash_u128_ffi() {
+        let h1 = gnitz_xxh3_hash_u128(42, 99, 0, 0);
+        let h2 = gnitz_xxh3_hash_u128(42, 99, 0, 0);
+        assert_eq!(h1, h2);
+        // Matches internal hash_u128
+        assert_eq!(h1, crate::xxh::hash_u128(42, 99));
+        // Non-zero seeds differ
+        assert_ne!(gnitz_xxh3_hash_u128(42, 99, 1, 0), h1);
     }
 
     #[test]

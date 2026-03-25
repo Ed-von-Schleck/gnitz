@@ -412,8 +412,9 @@ def test_memtable(base_dir):
 
         view = shard_table.TableShardView(shard_path, schema_str)
         assert_equal_i(1, view.count, "Annihilated row was flushed to shard")
+        blob_len = view.blob_len()
         assert_equal_i(
-            len(live_str), view.blob_buf.size, "Dead blob was not pruned during flush"
+            len(live_str), blob_len, "Dead blob was not pruned during flush"
         )
         view.close()
 
@@ -500,7 +501,6 @@ def test_shards_and_columnar(base_dir):
     tmp2.free()
 
     writer.finalize(fn)
-
     view1 = shard_table.TableShardView(fn, schema, validate_checksums=True)
     assert_equal_i(2, view1.count, "Row count mismatch")
     assert_equal_u64(r_uint64(10), view1.get_pk_u64(0), "PK columnar access failed")
@@ -510,22 +510,33 @@ def test_shards_and_columnar(base_dir):
         "String blob access failed",
     )
 
-    # Calculate absolute file offsets via pointer arithmetic on the mmap
-    # Offset = (Region Pointer) - (File Base Pointer)
-    off_pk = rffi.cast(lltype.Signed, view1.pk_lo_buf.ptr) - rffi.cast(
-        lltype.Signed, view1.ptr
-    )
-    off_blob = rffi.cast(lltype.Signed, view1.blob_buf.ptr) - rffi.cast(
-        lltype.Signed, view1.ptr
-    )
     view1.close()
+
+    # Calculate region offsets from the file's directory block.
+    # Header: dir_offset at byte 24. Each dir entry is 24 bytes (off u64, sz u64, cs u64).
+    # Region 0 = pk_lo, last region = blob.
+    dir_fd = rposix.open(fn, os.O_RDONLY, 0)
+    hdr_buf = lltype.malloc(rffi.CCHARP.TO, 64, flavor="raw")
+    mmap_posix.read_into_ptr(dir_fd, hdr_buf, 64)
+    dir_off = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(hdr_buf, 24))[0])
+    lltype.free(hdr_buf, flavor="raw")
+    # Read first dir entry (pk_lo region offset) and last (blob region offset)
+    num_regions = 4 + (len(schema.columns) - 1) + 1
+    dir_buf = lltype.malloc(rffi.CCHARP.TO, num_regions * 24, flavor="raw")
+    rposix.lseek(dir_fd, dir_off, 0)
+    mmap_posix.read_into_ptr(dir_fd, dir_buf, num_regions * 24)
+    off_pk = intmask(rffi.cast(rffi.ULONGLONGP, dir_buf)[0])
+    blob_entry = rffi.ptradd(dir_buf, (num_regions - 1) * 24)
+    off_blob = intmask(rffi.cast(rffi.ULONGLONGP, blob_entry)[0])
+    lltype.free(dir_buf, flavor="raw")
+    rposix.close(dir_fd)
 
     # 2. Corrupt Region PK (Eager Validation)
     corrupt_byte(fn, off_pk)
     raised = False
     try:
         shard_table.TableShardView(fn, schema, validate_checksums=True)
-    except errors.CorruptShardError:
+    except errors.StorageError:
         raised = True
     assert_true(raised, "Eager PK checksum validation failed")
 
@@ -537,18 +548,18 @@ def test_shards_and_columnar(base_dir):
     # Restore PK byte
     corrupt_byte(fn, off_pk)
 
-    # 4. Lazy Checksum Validation (Blob Region)
+    # 4. Blob Checksum Validation (all regions validated at open)
     corrupt_byte(fn, off_blob)
-    view3 = shard_table.TableShardView(fn, schema, validate_checksums=True)
-    # Eager regions pass.
-    assert_equal_u64(r_uint64(10), view3.get_pk_u64(0), "PK should still be readable")
-
     raised = False
     try:
-        view3.string_field_equals(1, 1, "data_long_string_for_blob")
-    except errors.CorruptShardError:
+        shard_table.TableShardView(fn, schema, validate_checksums=True)
+    except errors.StorageError:
         raised = True
-    assert_true(raised, "Lazy Blob checksum validation failed")
+    assert_true(raised, "Blob checksum validation failed")
+
+    # Without validation, corrupt blob shard should still open
+    view3 = shard_table.TableShardView(fn, schema, validate_checksums=False)
+    assert_equal_i(2, view3.count, "Skip validation failed on blob-corrupt shard")
     view3.close()
 
     os.write(1, "    [OK] N-Partition Columnar Shards passed.\n")

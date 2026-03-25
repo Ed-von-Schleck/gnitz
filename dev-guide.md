@@ -73,6 +73,23 @@ pre-routing, stashing, skipping round-trips):
       optimization: run tests after steps 1-2 before writing steps 3-4.
 - [ ] Add a comment to any guard/fallback code naming the invariant it protects.
 
+## Rust static lib rebuild rule
+
+Individual test targets (`make run-<name>-c`) do **not** rebuild the Rust
+static libraries. Only the top-level `make test` has `rust-engine-debug` as
+a prerequisite. After changing any Rust code in `rust_client/gnitz-engine/`
+or `rust_client/gnitz-transport/`, always rebuild before running RPython
+tests:
+
+```bash
+make rust-engine-debug          # after gnitz-engine changes
+make rust-transport-debug       # after gnitz-transport changes
+```
+
+Forgetting this causes linker errors (`undefined reference`) for new symbols,
+or silent use of stale code for changed symbols — the RPython binary links
+the old `.a` and passes or fails for the wrong reasons.
+
 ## Benchmarking
 
 ### Binaries

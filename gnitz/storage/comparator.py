@@ -32,7 +32,7 @@ class SoAAccessor(RowAccessor):
             return False
         if not schema.has_nullable:
             return False
-        null_word = self.view.null_buf.read_u64(self.row_idx * 8)
+        null_word = self.view.get_null_word(self.row_idx)
         payload_idx = col_idx if col_idx < schema.pk_index else col_idx - 1
         return bool(r_uint64(null_word) & (r_uint64(1) << payload_idx))
 
@@ -90,9 +90,7 @@ class SoAAccessor(RowAccessor):
 
     def get_str_struct(self, col_idx):
         ptr = self._get_ptr(col_idx)
-        blob_ptr = NULL_PTR
-        if self.view.blob_buf:
-            blob_ptr = self.view.blob_buf.ptr
+        blob_ptr = self.view.get_blob_ptr()
 
         if not ptr:
             return (0, 0, NULL_PTR, blob_ptr, None)

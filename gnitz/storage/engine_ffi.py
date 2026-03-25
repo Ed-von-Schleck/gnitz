@@ -25,8 +25,24 @@ eci = ExternalCompilationInfo(
         "int gnitz_bloom_may_contain(const void *handle, uint64_t key_lo, uint64_t key_hi);",
         "void gnitz_bloom_reset(void *handle);",
         "void gnitz_bloom_free(void *handle);",
-        # xxh3 checksum
+        # xxh3 checksum + hash
         "uint64_t gnitz_xxh3_checksum(const uint8_t *data, int64_t len);",
+        "uint64_t gnitz_xxh3_hash_u128(uint64_t lo, uint64_t hi, uint64_t seed_lo, uint64_t seed_hi);",
+        # shard reader
+        "void *gnitz_shard_open(const char *path, const void *schema_desc, int32_t validate_checksums);",
+        "void gnitz_shard_close(void *handle);",
+        "int32_t gnitz_shard_row_count(const void *handle);",
+        "int32_t gnitz_shard_has_xor8(const void *handle);",
+        "int32_t gnitz_shard_xor8_may_contain(const void *handle, uint64_t key_lo, uint64_t key_hi);",
+        "int32_t gnitz_shard_find_row(const void *handle, uint64_t key_lo, uint64_t key_hi);",
+        "int32_t gnitz_shard_lower_bound(const void *handle, uint64_t key_lo, uint64_t key_hi);",
+        "uint64_t gnitz_shard_get_pk_lo(const void *handle, int32_t row);",
+        "uint64_t gnitz_shard_get_pk_hi(const void *handle, int32_t row);",
+        "int64_t gnitz_shard_get_weight(const void *handle, int32_t row);",
+        "uint64_t gnitz_shard_get_null_word(const void *handle, int32_t row);",
+        "const uint8_t *gnitz_shard_col_ptr(const void *handle, int32_t row, int32_t col_idx, int32_t col_size);",
+        "const uint8_t *gnitz_shard_blob_ptr(const void *handle);",
+        "int64_t gnitz_shard_blob_len(const void *handle);",
         # wal encode/decode
         "int64_t gnitz_wal_encode("
         "  uint8_t *out_buf, int64_t out_offset, int64_t out_capacity,"
@@ -153,6 +169,14 @@ _xxh3_checksum = rffi.llexternal(
     compilation_info=eci,
 )
 
+_xxh3_hash_u128 = rffi.llexternal(
+    "gnitz_xxh3_hash_u128",
+    [rffi.ULONGLONG, rffi.ULONGLONG, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+    _nowrapper=True,
+)
+
 # ---------------------------------------------------------------------------
 # WAL encode/decode
 # ---------------------------------------------------------------------------
@@ -199,6 +223,134 @@ _manifest_parse = rffi.llexternal(
     rffi.INT,
     compilation_info=eci,
 )
+
+# ---------------------------------------------------------------------------
+# Schema packing (shared between shard reader and compaction)
+# ---------------------------------------------------------------------------
+
+def pack_schema(schema):
+    """Pack a TableSchema into a flat C buffer matching Rust SchemaDescriptor."""
+    buf = lltype.malloc(rffi.CCHARP.TO, SCHEMA_DESC_SIZE, flavor="raw")
+    i = 0
+    while i < SCHEMA_DESC_SIZE:
+        buf[i] = '\x00'
+        i += 1
+    num_cols = len(schema.columns)
+    rffi.cast(rffi.UINTP, buf)[0] = rffi.cast(rffi.UINT, num_cols)
+    rffi.cast(rffi.UINTP, rffi.ptradd(buf, 4))[0] = rffi.cast(rffi.UINT, schema.pk_index)
+    ci = 0
+    while ci < num_cols:
+        col = schema.columns[ci]
+        base = 8 + ci * 4
+        buf[base] = chr(col.field_type.code)
+        buf[base + 1] = chr(col.field_type.size)
+        buf[base + 2] = chr(1 if col.is_nullable else 0)
+        ci += 1
+    return buf
+
+
+# ---------------------------------------------------------------------------
+# Shard reader
+# ---------------------------------------------------------------------------
+
+_shard_open = rffi.llexternal(
+    "gnitz_shard_open",
+    [rffi.CCHARP, rffi.VOIDP, rffi.INT],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_shard_close = rffi.llexternal(
+    "gnitz_shard_close",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_shard_row_count = rffi.llexternal(
+    "gnitz_shard_row_count",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_has_xor8 = rffi.llexternal(
+    "gnitz_shard_has_xor8",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_xor8_may_contain = rffi.llexternal(
+    "gnitz_shard_xor8_may_contain",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_find_row = rffi.llexternal(
+    "gnitz_shard_find_row",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_lower_bound = rffi.llexternal(
+    "gnitz_shard_lower_bound",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_get_pk_lo = rffi.llexternal(
+    "gnitz_shard_get_pk_lo",
+    [rffi.VOIDP, rffi.INT],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+_shard_get_pk_hi = rffi.llexternal(
+    "gnitz_shard_get_pk_hi",
+    [rffi.VOIDP, rffi.INT],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+_shard_get_weight = rffi.llexternal(
+    "gnitz_shard_get_weight",
+    [rffi.VOIDP, rffi.INT],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_shard_get_null_word = rffi.llexternal(
+    "gnitz_shard_get_null_word",
+    [rffi.VOIDP, rffi.INT],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+_shard_col_ptr = rffi.llexternal(
+    "gnitz_shard_col_ptr",
+    [rffi.VOIDP, rffi.INT, rffi.INT, rffi.INT],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_shard_blob_ptr = rffi.llexternal(
+    "gnitz_shard_blob_ptr",
+    [rffi.VOIDP],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_shard_blob_len = rffi.llexternal(
+    "gnitz_shard_blob_len",
+    [rffi.VOIDP],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
 
 # ---------------------------------------------------------------------------
 # Compaction
