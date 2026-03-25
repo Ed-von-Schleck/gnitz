@@ -13,7 +13,7 @@ from gnitz.core import xxh
 from gnitz.core.store import ZSetStore
 from gnitz.core.batch import ArenaZSetBatch
 from gnitz.core.store import AbstractCursor
-from gnitz.storage.cursor import UnifiedCursor
+from gnitz.storage.cursor import RustUnifiedCursor
 from gnitz.storage.table import PersistentTable
 from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.storage import mmap_posix
@@ -161,13 +161,30 @@ class PartitionedTable(ZSetStore):
         if num_live == 0:
             return _EmptyCursor()
 
-        if self.num_partitions == 1:
+        if num_live == 1:
             return self.partitions[0].create_cursor()
 
-        cursors = newlist_hint(num_live)
+        # Flatten all partitions into a single Rust cursor: collect all shard
+        # handles + memtable snapshots and merge in one pass.
+        all_handles = newlist_hint(16)
+        snapshots = newlist_hint(num_live)
         for local in range(num_live):
-            cursors.append(self.partitions[local].create_cursor())
-        return UnifiedCursor(self.schema, cursors)
+            p = self.partitions[local]
+            p.compact_if_needed()
+            for h in p.index.all_handles_for_cursor():
+                all_handles.append(h.view._handle)
+            snap = p.memtable.get_consolidated_snapshot()
+            snapshots.append(snap)
+
+        # Merge all snapshots into one via Rust bulk merge, then pass as
+        # a single batch descriptor. This avoids multiple batch descriptors
+        # (the cursor FFI takes exactly one).
+        from gnitz.storage.memtable import _merge_runs_to_consolidated
+        merged_snap = _merge_runs_to_consolidated(snapshots, self.schema)
+        for s in snapshots:
+            s.release()
+
+        return RustUnifiedCursor(self.schema, all_handles, merged_snap)
 
     def retract_pk(self, key_lo, key_hi, out_batch):
         if len(self.partitions) == 0:

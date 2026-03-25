@@ -129,11 +129,11 @@ class EphemeralTable(ZSetStore):
 
     def _build_cursor(self):
         all_handles = self.index.all_handles_for_cursor()
-        cs = newlist_hint(1 + len(all_handles))
-        cs.append(cursor.MemTableCursor(self.memtable))
+        borrowed = newlist_hint(len(all_handles))
         for h in all_handles:
-            cs.append(cursor.ShardCursor(h.view))
-        return cursor.UnifiedCursor(self.schema, cs)
+            borrowed.append(h.view._handle)
+        snapshot = self.memtable.get_consolidated_snapshot()
+        return cursor.RustUnifiedCursor(self.schema, borrowed, snapshot)
 
     def compact_if_needed(self):
         if self.index.needs_compaction:

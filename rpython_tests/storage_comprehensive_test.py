@@ -25,7 +25,6 @@ from gnitz.storage import (
     writer_table,
     shard_table,
     compactor,
-    tournament_tree,
     cursor,
     manifest,
     refcount,
@@ -436,8 +435,9 @@ def test_memtable(base_dir):
             mt3.upsert_batch(b_c)
             b_c.free()
 
-        mc = cursor.MemTableCursor(mt3)
-        assert_true(mc.is_valid(), "MemTableCursor should be valid")
+        snap = mt3.get_consolidated_snapshot()
+        mc = cursor.RustUnifiedCursor(schema_u128, [], snap)
+        assert_true(mc.is_valid(), "Cursor should be valid")
         assert_equal_u128(r_uint128(10), mc.key(), "Cursor should start at PK 10")
         mc.advance()
         assert_equal_u128(r_uint128(20), mc.key(), "Cursor should advance to PK 20")
@@ -447,12 +447,12 @@ def test_memtable(base_dir):
         assert_true(mc.is_exhausted(), "Cursor should be exhausted")
 
         # 4. Cursor seek
-        mc2 = cursor.MemTableCursor(mt3)
+        snap2 = mt3.get_consolidated_snapshot()
+        mc2 = cursor.RustUnifiedCursor(schema_u128, [], snap2)
         mc2.seek(r_uint64(20), r_uint64(0))
         assert_true(mc2.is_valid(), "Cursor should be valid after seek")
         assert_equal_u128(r_uint128(20), mc2.key(), "Cursor should seek to PK 20")
         mc2.close()
-        mc.close()
     finally:
         mt3.free()
 
