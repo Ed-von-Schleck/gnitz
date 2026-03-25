@@ -76,8 +76,8 @@ eci = ExternalCompilationInfo(
         "  uint32_t num_payload_cols, uint8_t *blob_ptr, uint64_t blob_len);",
         "int32_t gnitz_table_retract_pk_row("
         "  const void *handle, uint64_t key_lo, uint64_t key_hi,"
-        "  const uint8_t **out_col_ptrs, uint32_t n_payload,"
-        "  uint64_t *out_null_word, const uint8_t **out_blob_ptr,"
+        "  void **out_col_ptrs, uint32_t n_payload,"
+        "  uint64_t *out_null_word, void **out_blob_ptr,"
         "  uint64_t *out_blob_len, int64_t *out_weight,"
         "  void **out_cleanup);",
         "void gnitz_retract_row_free(void *cleanup);",

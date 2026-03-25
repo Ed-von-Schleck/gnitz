@@ -259,6 +259,40 @@ class EphemeralTable(ZSetStore):
         finally:
             lltype.free(col_ptrs, flavor="raw")
 
+    def ingest_projection(self, source_batch, source_col_idx, source_col_type,
+                          index_payload_accessor, is_unique):
+        """Project a source batch column into this index table.
+
+        For each row in source_batch with weight != 0 and non-null indexed
+        column, extracts (index_key -> source_pk) and ingests into this table.
+        """
+        from gnitz.core.keys import promote_to_index_key
+
+        n = source_batch.length()
+        if n == 0:
+            return
+        for ri in range(n):
+            weight = source_batch.get_weight(ri)
+            if weight == r_int64(0):
+                continue
+            acc = source_batch.get_accessor(ri)
+            if acc.is_null(source_col_idx):
+                continue
+
+            source_pk_lo = source_batch.get_pk_lo(ri)
+            source_pk_hi = source_batch.get_pk_hi(ri)
+            index_key = promote_to_index_key(acc, source_col_idx, source_col_type)
+            index_key_lo = r_uint64(intmask(index_key))
+            index_key_hi = r_uint64(intmask(index_key >> 64))
+
+            if is_unique and weight > 0 and self.has_pk(index_key_lo, index_key_hi):
+                raise errors.LayoutError(
+                    "Unique index violation during projection")
+
+            index_payload_accessor.pk_lo = source_pk_lo
+            index_payload_accessor.pk_hi = source_pk_hi
+            self.ingest_one(index_key_lo, index_key_hi, weight, index_payload_accessor)
+
     def flush(self):
         if self.is_closed:
             raise errors.StorageError("Table is closed")
