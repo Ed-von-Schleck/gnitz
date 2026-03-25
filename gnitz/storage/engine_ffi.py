@@ -83,6 +83,47 @@ eci = ExternalCompilationInfo(
         "  void *schema_desc,"
         "  uint32_t table_id, uint32_t level_num, uint64_t lsn_tag,"
         "  void *out_results, uint32_t max_results);",
+        # batch descriptor struct (matches Rust GnitzBatchDesc)
+        "typedef struct {"
+        "  uint8_t *pk_lo; uint8_t *pk_hi;"
+        "  uint8_t *weight; uint8_t *null_bm;"
+        "  void **col_ptrs; uint64_t *col_sizes;"
+        "  uint32_t num_payload_cols;"
+        "  uint8_t *blob_ptr; uint64_t blob_len;"
+        "  uint32_t count;"
+        "} GnitzBatchDesc;",
+        # merged batch result struct (matches Rust GnitzMergedBatch)
+        "typedef struct {"
+        "  uint32_t count;"
+        "  uint8_t *pk_lo; uint64_t pk_lo_len;"
+        "  uint8_t *pk_hi; uint64_t pk_hi_len;"
+        "  uint8_t *weight; uint64_t weight_len;"
+        "  uint8_t *null_bm; uint64_t null_bm_len;"
+        "  uint32_t num_cols;"
+        "  uint8_t *col_ptrs[64]; uint64_t col_lens[64];"
+        "  uint8_t *blob; uint64_t blob_len;"
+        "} GnitzMergedBatch;",
+        # cursor
+        "void *gnitz_cursor_create("
+        "  void **borrowed_handles, uint32_t num_borrowed,"
+        "  GnitzBatchDesc *batch_descs, uint32_t num_batches,"
+        "  void *schema_desc);",
+        "void gnitz_cursor_seek(void *cursor, uint64_t key_lo, uint64_t key_hi);",
+        "int32_t gnitz_cursor_advance(void *cursor);",
+        "int32_t gnitz_cursor_is_valid(void *cursor);",
+        "uint64_t gnitz_cursor_key_lo(void *cursor);",
+        "uint64_t gnitz_cursor_key_hi(void *cursor);",
+        "int64_t gnitz_cursor_weight(void *cursor);",
+        "uint64_t gnitz_cursor_null_word(void *cursor);",
+        "uint8_t *gnitz_cursor_col_ptr(void *cursor, uint32_t col_idx, uint32_t col_size);",
+        "uint8_t *gnitz_cursor_blob_ptr(void *cursor);",
+        "int64_t gnitz_cursor_blob_len(void *cursor);",
+        "void gnitz_cursor_close(void *cursor);",
+        # bulk merge
+        "int32_t gnitz_merge_to_batch("
+        "  GnitzBatchDesc *batch_descs, uint32_t num_batches,"
+        "  void *schema_desc, GnitzMergedBatch *out);",
+        "void gnitz_merged_batch_free(GnitzMergedBatch *batch);",
         # shard file write
         "int32_t gnitz_write_shard("
         "  int32_t dirfd, const char *filename,"
@@ -404,6 +445,124 @@ _merge_and_route = rffi.llexternal(
      rffi.UINT, rffi.UINT, rffi.ULONGLONG,
      rffi.VOIDP, rffi.UINT],
     rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Shard file write
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Cursor
+# ---------------------------------------------------------------------------
+
+_cursor_create = rffi.llexternal(
+    "gnitz_cursor_create",
+    [rffi.VOIDPP, rffi.UINT,
+     rffi.VOIDP, rffi.UINT,
+     rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_cursor_seek = rffi.llexternal(
+    "gnitz_cursor_seek",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_cursor_advance = rffi.llexternal(
+    "gnitz_cursor_advance",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_cursor_is_valid = rffi.llexternal(
+    "gnitz_cursor_is_valid",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_cursor_key_lo = rffi.llexternal(
+    "gnitz_cursor_key_lo",
+    [rffi.VOIDP],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+_cursor_key_hi = rffi.llexternal(
+    "gnitz_cursor_key_hi",
+    [rffi.VOIDP],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+_cursor_weight = rffi.llexternal(
+    "gnitz_cursor_weight",
+    [rffi.VOIDP],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_cursor_null_word = rffi.llexternal(
+    "gnitz_cursor_null_word",
+    [rffi.VOIDP],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+_cursor_col_ptr = rffi.llexternal(
+    "gnitz_cursor_col_ptr",
+    [rffi.VOIDP, rffi.UINT, rffi.UINT],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_cursor_blob_ptr = rffi.llexternal(
+    "gnitz_cursor_blob_ptr",
+    [rffi.VOIDP],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_cursor_blob_len = rffi.llexternal(
+    "gnitz_cursor_blob_len",
+    [rffi.VOIDP],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_cursor_close = rffi.llexternal(
+    "gnitz_cursor_close",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Bulk merge
+# ---------------------------------------------------------------------------
+
+# GnitzBatchDesc: 80 bytes on 64-bit (must match Rust #[repr(C)])
+BATCH_DESC_SIZE = 80
+# GnitzMergedBatch: 1120 bytes on 64-bit (must match Rust #[repr(C)])
+MERGED_BATCH_SIZE = 1120
+
+_merge_to_batch = rffi.llexternal(
+    "gnitz_merge_to_batch",
+    [rffi.VOIDP, rffi.UINT,
+     rffi.VOIDP, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_merged_batch_free = rffi.llexternal(
+    "gnitz_merged_batch_free",
+    [rffi.VOIDP],
+    lltype.Void,
     compilation_info=eci,
 )
 

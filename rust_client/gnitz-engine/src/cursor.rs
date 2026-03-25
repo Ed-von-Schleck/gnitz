@@ -51,7 +51,7 @@ pub struct UnifiedCursor {
 }
 
 impl UnifiedCursor {
-    pub fn new(shard_refs: Vec<ShardRef>, schema: SchemaDescriptor) -> Self {
+    pub(crate) fn new(shard_refs: Vec<ShardRef>, schema: SchemaDescriptor) -> Self {
         let n = shard_refs.len();
         let shards_view = Self::build_shards_vec(&shard_refs);
 
@@ -184,7 +184,7 @@ impl UnifiedCursor {
 /// Reuses the exact merge loop from compact_shards. The caller can then
 /// read the ShardWriter's buffer fields directly or call finalize() to
 /// write a shard file.
-pub fn merge_to_writer(
+pub(crate) fn merge_to_writer(
     shard_refs: &[ShardRef],
     schema: &SchemaDescriptor,
 ) -> ShardWriter {

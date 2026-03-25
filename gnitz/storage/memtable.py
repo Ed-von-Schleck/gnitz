@@ -1,13 +1,14 @@
 # gnitz/storage/memtable.py
 
-from rpython.rlib.rarithmetic import r_int64, r_uint64
+from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import errors
 from gnitz.core import comparator as core_comparator
 from gnitz.core.batch import ArenaZSetBatch, ColumnarBatchAccessor, pk_lt, pk_eq
-from gnitz.storage import writer_table
+from gnitz.storage import buffer as buffer_mod, engine_ffi, writer_table
+from gnitz.storage.buffer import c_memmove
 from gnitz.storage.bloom import BloomFilter
 
 ACCUMULATOR_THRESHOLD = 64
@@ -233,64 +234,192 @@ def _merge_runs_to_consolidated(runs, schema):
         consolidated.mark_consolidated(True)
         return consolidated
 
-    # Fused k-way merge + inline consolidation: one pass, one allocation.
-    from gnitz.storage.cursor import SortedBatchCursor
-    from gnitz.storage import tournament_tree
+    return _rust_merge_runs(runs, schema)
 
-    cursors = newlist_hint(len(runs))
-    for r in runs:
-        cursors.append(SortedBatchCursor(r))
-    tree = tournament_tree.TournamentTree(cursors, schema)
 
-    consolidated = ArenaZSetBatch(schema)
+def _rust_merge_runs(runs, schema):
+    """N-way merge via Rust gnitz_merge_to_batch."""
+    num_runs = len(runs)
+    num_cols = len(schema.columns)
+    pk_index = schema.pk_index
+    num_payload = num_cols - 1
 
-    has_pending = False
-    pending_pk_lo = r_uint64(0)
-    pending_pk_hi = r_uint64(0)
-    pending_weight_acc = r_int64(0)
-    pending_acc = ColumnarBatchAccessor(schema)
-    cur_acc = ColumnarBatchAccessor(schema)
+    desc_buf = lltype.malloc(
+        rffi.CCHARP.TO, num_runs * engine_ffi.BATCH_DESC_SIZE, flavor="raw"
+    )
+    schema_buf = engine_ffi.pack_schema(schema)
+    out_buf = lltype.malloc(
+        rffi.CCHARP.TO, engine_ffi.MERGED_BATCH_SIZE, flavor="raw"
+    )
+    # Zero the output struct
+    i = 0
+    while i < engine_ffi.MERGED_BATCH_SIZE:
+        out_buf[i] = '\x00'
+        i += 1
 
-    while not tree.is_exhausted():
-        ci = rffi.cast(lltype.Signed, tree.heap[0].cursor_idx)
-        cur = cursors[ci]
-        cur_pk_lo = cur.key_lo()
-        cur_pk_hi = cur.key_hi()
-        cur_weight = cur.weight()
+    # Per-run col_ptrs/col_sizes arrays (needed for lifetime — must outlive the FFI call)
+    all_col_ptrs = newlist_hint(num_runs)
+    all_col_sizes = newlist_hint(num_runs)
 
-        if not has_pending:
-            pending_pk_lo = cur_pk_lo
-            pending_pk_hi = cur_pk_hi
-            pending_weight_acc = cur_weight
-            cur.bind_to(pending_acc)
-            has_pending = True
-        elif not pk_eq(cur_pk_lo, cur_pk_hi, pending_pk_lo, pending_pk_hi):
-            if pending_weight_acc != r_int64(0):
-                consolidated.append_from_accessor(pending_pk_lo, pending_pk_hi, pending_weight_acc, pending_acc)
-            pending_pk_lo = cur_pk_lo
-            pending_pk_hi = cur_pk_hi
-            pending_weight_acc = cur_weight
-            cur.bind_to(pending_acc)
+    try:
+        for ri in range(num_runs):
+            run = runs[ri]
+            base = rffi.ptradd(desc_buf, ri * engine_ffi.BATCH_DESC_SIZE)
+            _pack_batch_desc(base, run, schema, pk_index, num_payload,
+                             all_col_ptrs, all_col_sizes)
+
+        rc = engine_ffi._merge_to_batch(
+            rffi.cast(rffi.VOIDP, desc_buf),
+            rffi.cast(rffi.UINT, num_runs),
+            rffi.cast(rffi.VOIDP, schema_buf),
+            rffi.cast(rffi.VOIDP, out_buf),
+        )
+        rc_int = intmask(rc)
+        if rc_int < 0:
+            raise errors.StorageError("merge_to_batch failed (%d)" % rc_int)
+
+        result = _unpack_merged_batch(out_buf, schema, pk_index, num_payload)
+    finally:
+        engine_ffi._merged_batch_free(rffi.cast(rffi.VOIDP, out_buf))
+        _free_col_arrays(all_col_ptrs, all_col_sizes)
+        lltype.free(out_buf, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")
+        lltype.free(desc_buf, flavor="raw")
+
+    return result
+
+
+def _pack_batch_desc(base, run, schema, pk_index, num_payload,
+                     all_col_ptrs, all_col_sizes):
+    """Write a GnitzBatchDesc struct at `base` for one ArenaZSetBatch."""
+    # Allocate col_ptrs and col_sizes C arrays for this run
+    col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
+    col_sizes = lltype.malloc(rffi.ULONGLONGP.TO, num_payload, flavor="raw")
+    all_col_ptrs.append(col_ptrs)
+    all_col_sizes.append(col_sizes)
+
+    pi = 0
+    num_cols = len(schema.columns)
+    ci = 0
+    while ci < num_cols:
+        if ci != pk_index:
+            col_ptrs[pi] = rffi.cast(rffi.VOIDP, run.col_bufs[ci].base_ptr)
+            col_sizes[pi] = rffi.cast(rffi.ULONGLONG, run.col_bufs[ci].offset)
+            pi += 1
+        ci += 1
+
+    # Write struct fields at known offsets (must match Rust GnitzBatchDesc #[repr(C)])
+    off = 0
+    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
+        rffi.VOIDP, run.pk_lo_buf.base_ptr)
+    off += 8
+    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
+        rffi.VOIDP, run.pk_hi_buf.base_ptr)
+    off += 8
+    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
+        rffi.VOIDP, run.weight_buf.base_ptr)
+    off += 8
+    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
+        rffi.VOIDP, run.null_buf.base_ptr)
+    off += 8
+    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
+        rffi.VOIDP, col_ptrs)
+    off += 8
+    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
+        rffi.VOIDP, col_sizes)
+    off += 8
+    rffi.cast(rffi.UINTP, rffi.ptradd(base, off))[0] = rffi.cast(
+        rffi.UINT, num_payload)
+    off += 4
+    off += 4  # padding
+    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
+        rffi.VOIDP, run.blob_arena.base_ptr)
+    off += 8
+    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, off))[0] = rffi.cast(
+        rffi.ULONGLONG, run.blob_arena.offset)
+    off += 8
+    rffi.cast(rffi.UINTP, rffi.ptradd(base, off))[0] = rffi.cast(
+        rffi.UINT, run.length())
+
+
+def _free_col_arrays(all_col_ptrs, all_col_sizes):
+    for p in all_col_ptrs:
+        lltype.free(p, flavor="raw")
+    for s in all_col_sizes:
+        lltype.free(s, flavor="raw")
+
+
+def _read_merged_ptr(out_buf, off):
+    p = rffi.cast(rffi.VOIDPP, rffi.ptradd(out_buf, off))[0]
+    ln = intmask(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(out_buf, off + 8))[0])
+    return rffi.cast(rffi.CCHARP, p), ln
+
+
+def _unpack_merged_batch(out_buf, schema, pk_index, num_payload):
+    """Read a GnitzMergedBatch struct and build an ArenaZSetBatch from copies."""
+    count = intmask(rffi.cast(rffi.UINTP, out_buf)[0])
+    off = 8  # skip count(4) + padding(4)
+
+    pk_lo_ptr, pk_lo_len = _read_merged_ptr(out_buf, off); off += 16
+    pk_hi_ptr, pk_hi_len = _read_merged_ptr(out_buf, off); off += 16
+    w_ptr, w_len = _read_merged_ptr(out_buf, off); off += 16
+    n_ptr, n_len = _read_merged_ptr(out_buf, off); off += 16
+
+    off += 8  # num_cols(4) + pad(4)
+
+    col_ptrs_off = off
+    col_lens_off = off + 64 * 8
+    off = col_lens_off + 64 * 8
+
+    blob_ptr, blob_len = _read_merged_ptr(out_buf, off)
+
+    # Copy into RPython-owned Buffers
+    pk_lo_b = _copy_to_buffer(pk_lo_ptr, pk_lo_len)
+    pk_hi_b = _copy_to_buffer(pk_hi_ptr, pk_hi_len)
+    w_b = _copy_to_buffer(w_ptr, w_len)
+    n_b = _copy_to_buffer(n_ptr, n_len)
+
+    num_cols = len(schema.columns)
+    col_bufs = newlist_hint(num_cols)
+    col_strides = newlist_hint(num_cols)
+    pi = 0
+    ci = 0
+    while ci < num_cols:
+        if ci == pk_index:
+            col_bufs.append(buffer_mod.Buffer(0))
+            col_strides.append(0)
         else:
-            cur.bind_to(cur_acc)
-            if core_comparator.compare_rows(schema, pending_acc, cur_acc) == 0:
-                pending_weight_acc += cur_weight
-            else:
-                if pending_weight_acc != r_int64(0):
-                    consolidated.append_from_accessor(pending_pk_lo, pending_pk_hi, pending_weight_acc, pending_acc)
-                pending_pk_lo = cur_pk_lo
-                pending_pk_hi = cur_pk_hi
-                pending_weight_acc = cur_weight
-                cur.bind_to(pending_acc)
+            sz = schema.columns[ci].field_type.size
+            c_ptr = rffi.cast(rffi.CCHARP, rffi.cast(
+                rffi.VOIDPP, rffi.ptradd(out_buf, col_ptrs_off + pi * 8))[0])
+            c_len = intmask(rffi.cast(
+                rffi.ULONGLONGP, rffi.ptradd(out_buf, col_lens_off + pi * 8))[0])
+            col_bufs.append(_copy_to_buffer(c_ptr, c_len))
+            col_strides.append(sz)
+            pi += 1
+        ci += 1
 
-        tree.advance_cursor_by_index(ci)
+    blob_b = _copy_to_buffer(blob_ptr, blob_len)
 
-    if has_pending and pending_weight_acc != r_int64(0):
-        consolidated.append_from_accessor(pending_pk_lo, pending_pk_hi, pending_weight_acc, pending_acc)
+    result = ArenaZSetBatch.from_buffers(
+        schema, pk_lo_b, pk_hi_b, w_b, n_b,
+        col_bufs, col_strides, blob_b, count, is_sorted=True,
+    )
+    result._consolidated = True
+    return result
 
-    tree.close()
-    consolidated._sorted = True
-    return consolidated
+
+def _copy_to_buffer(src_ptr, size):
+    """Copy Rust-allocated data into a new RPython-owned Buffer."""
+    buf = buffer_mod.Buffer(max(size, 1))
+    if size > 0 and src_ptr:
+        c_memmove(
+            rffi.cast(rffi.VOIDP, buf.base_ptr),
+            rffi.cast(rffi.VOIDP, src_ptr),
+            rffi.cast(rffi.SIZE_T, size),
+        )
+    buf.offset = size
+    return buf
 
 
 def _lower_bound(run, key_lo, key_hi):
