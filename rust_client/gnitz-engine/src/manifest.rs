@@ -53,6 +53,15 @@ impl ManifestEntryRaw {
     pub fn zeroed() -> Self {
         unsafe { mem::zeroed() }
     }
+
+    pub fn filename_str(&self) -> &str {
+        let end = self
+            .filename
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.filename.len());
+        std::str::from_utf8(&self.filename[..end]).unwrap_or("")
+    }
 }
 
 pub const MANIFEST_OK: i32 = 0;

@@ -67,6 +67,25 @@ pub struct GuardResult {
     pub filename: [u8; 256], // null-terminated
 }
 
+impl GuardResult {
+    pub fn zeroed() -> Self {
+        GuardResult {
+            guard_key_lo: 0,
+            guard_key_hi: 0,
+            filename: [0u8; 256],
+        }
+    }
+
+    pub fn filename_str(&self) -> &str {
+        let end = self
+            .filename
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.filename.len());
+        std::str::from_utf8(&self.filename[..end]).unwrap_or("")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

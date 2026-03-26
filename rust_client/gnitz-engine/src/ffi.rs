@@ -1466,21 +1466,27 @@ pub extern "C" fn gnitz_shard_index_try_cleanup(handle: *mut c_void) -> i32 {
 /// Returns 1 if yes, 0 if no.
 #[no_mangle]
 pub extern "C" fn gnitz_shard_index_needs_compaction(handle: *const c_void) -> i32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let idx = unsafe { &*(handle as *const crate::shard_index::ShardIndex) };
-    if idx.needs_compaction { 1 } else { 0 }
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() {
+            return 0;
+        }
+        let idx = unsafe { &*(handle as *const crate::shard_index::ShardIndex) };
+        if idx.needs_compaction { 1 } else { 0 }
+    });
+    result.unwrap_or(0)
 }
 
 /// Return the maximum LSN across all shards.
 #[no_mangle]
 pub extern "C" fn gnitz_shard_index_max_lsn(handle: *const c_void) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let idx = unsafe { &*(handle as *const crate::shard_index::ShardIndex) };
-    idx.max_lsn()
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() {
+            return 0;
+        }
+        let idx = unsafe { &*(handle as *const crate::shard_index::ShardIndex) };
+        idx.max_lsn()
+    });
+    result.unwrap_or(0)
 }
 
 /// Fill out_ptrs with pointers to all MappedShard objects.

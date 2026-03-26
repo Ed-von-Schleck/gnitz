@@ -5,7 +5,6 @@
 
 use std::ffi::CStr;
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use crate::compact::{self, SchemaDescriptor};
 use crate::manifest::{self, ManifestEntryRaw};
@@ -159,6 +158,19 @@ impl FLSMLevel {
     fn total_file_count(&self) -> usize {
         self.guards.iter().map(|g| g.entries.len()).sum()
     }
+
+    fn get_or_create_guard(&mut self, gk_lo: u64, gk_hi: u64) -> &mut LevelGuard {
+        let gk = ((gk_hi as u128) << 64) | (gk_lo as u128);
+        let needs_new = match self.find_guard_idx(gk) {
+            Some(idx) => self.guards[idx].guard_key() != gk,
+            None => true,
+        };
+        if needs_new {
+            self.insert_guard_sorted(LevelGuard::new(gk_lo, gk_hi));
+        }
+        let idx = self.find_guard_idx(gk).unwrap();
+        &mut self.guards[idx]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +229,8 @@ impl ShardIndex {
     // -------------------------------------------------------------------
 
     pub fn all_shard_ptrs(&self) -> Vec<*const MappedShard> {
-        let mut result = Vec::new();
+        let cap = self.l0.len() + self.levels.iter().map(|l| l.total_file_count()).sum::<usize>();
+        let mut result = Vec::with_capacity(cap);
         for e in &self.l0 {
             result.push(&e.shard as *const MappedShard);
         }
@@ -237,7 +250,7 @@ impl ShardIndex {
 
     pub fn find_pk(&self, key_lo: u64, key_hi: u64) -> Vec<(*const MappedShard, usize)> {
         let key = ((key_hi as u128) << 64) | (key_lo as u128);
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(2);
 
         for e in &self.l0 {
             if e.pk_min <= key && key <= e.pk_max {
@@ -370,27 +383,14 @@ impl ShardIndex {
 
             if raw.level == 0 {
                 self.l0.push(entry);
-                self.sort_l0();
-                self.update_flags();
             } else {
                 let level_num = raw.level as usize;
                 let level = self.get_or_create_level(level_num);
-                let gk = ((raw.guard_key_hi as u128) << 64) | (raw.guard_key_lo as u128);
-                let g_idx = level.find_guard_idx(gk);
-                let needs_new = match g_idx {
-                    Some(idx) => level.guards[idx].guard_key() != gk,
-                    None => true,
-                };
-                if needs_new {
-                    level.insert_guard_sorted(LevelGuard::new(
-                        raw.guard_key_lo,
-                        raw.guard_key_hi,
-                    ));
-                }
-                let g_idx = level.find_guard_idx(gk).unwrap();
-                level.guards[g_idx].entries.push(entry);
+                level.get_or_create_guard(raw.guard_key_lo, raw.guard_key_hi).entries.push(entry);
             }
         }
+        self.sort_l0();
+        self.update_flags();
         Ok(())
     }
 
@@ -431,15 +431,8 @@ impl ShardIndex {
         }
 
         self.compact_seq += 1;
-        let mut l0_max_lsn = 0u64;
-        let l0_filenames: Vec<String> = self.l0.iter().map(|e| {
-            if e.max_lsn > l0_max_lsn {
-                l0_max_lsn = e.max_lsn;
-            }
-            e.filename.clone()
-        }).collect();
-        // Re-read max_lsn after collecting (borrow issue)
-        l0_max_lsn = self.l0.iter().map(|e| e.max_lsn).max().unwrap_or(0);
+        let l0_filenames: Vec<String> = self.l0.iter().map(|e| e.filename.clone()).collect();
+        let l0_max_lsn = self.l0.iter().map(|e| e.max_lsn).max().unwrap_or(0);
 
         let lsn_tag = if l0_max_lsn > 0 {
             l0_max_lsn
@@ -478,7 +471,6 @@ impl ShardIndex {
             return Err(num_results);
         }
 
-        // Parse guard outputs
         let guard_outputs: Vec<(u64, u64, String)> = results[..num_results as usize]
             .iter()
             .map(|r| {
@@ -487,10 +479,8 @@ impl ShardIndex {
             })
             .collect();
 
-        // Commit: remove L0 entries, install L1 entries
         self.commit_l0_to_l1(&l0_filenames, &guard_outputs, l0_max_lsn)?;
 
-        // Mark old L0 files for deletion
         for fn_ in &l0_filenames {
             self.pending_deletions.push(fn_.clone());
         }
@@ -547,17 +537,7 @@ impl ShardIndex {
         let schema_copy = self.schema;
         for (gk_lo, gk_hi, filename) in guard_outputs {
             let entry = ShardEntry::open(filename, &schema_copy, 0, max_lsn)?;
-            let gk = ((*gk_hi as u128) << 64) | (*gk_lo as u128);
-            let level = &mut self.levels[0]; // L1 = index 0
-            let needs_new = match level.find_guard_idx(gk) {
-                Some(idx) => level.guards[idx].guard_key() != gk,
-                None => true,
-            };
-            if needs_new {
-                level.insert_guard_sorted(LevelGuard::new(*gk_lo, *gk_hi));
-            }
-            let g_idx = level.find_guard_idx(gk).unwrap();
-            level.guards[g_idx].entries.push(entry);
+            self.levels[0].get_or_create_guard(*gk_lo, *gk_hi).entries.push(entry);
         }
 
         self.update_flags();
@@ -616,13 +596,10 @@ impl ShardIndex {
 
         let new_entry = ShardEntry::open(&out_path, &self.schema, 0, guard_max_lsn)?;
 
-        // Mark old files for deletion
-        let old_filenames: Vec<String> = self.levels[level_idx].guards[guard_idx].filenames();
-        for fn_ in &old_filenames {
+        for fn_ in &input_filenames {
             self.pending_deletions.push(fn_.clone());
         }
 
-        // Atomic swap: replace guard entries
         self.levels[level_idx].guards[guard_idx].entries = vec![new_entry];
 
         Ok(())
@@ -774,19 +751,7 @@ impl ShardIndex {
         let schema_copy = self.schema;
         for (gk_lo, gk_hi, filename) in &guard_outputs {
             let entry = ShardEntry::open(filename, &schema_copy, 0, vert_max_lsn)?;
-            let gk = ((*gk_hi as u128) << 64) | (*gk_lo as u128);
-            {
-                let dest = &mut self.levels[dest_idx];
-                let needs_new = match dest.find_guard_idx(gk) {
-                    Some(idx) => dest.guards[idx].guard_key() != gk,
-                    None => true,
-                };
-                if needs_new {
-                    dest.insert_guard_sorted(LevelGuard::new(*gk_lo, *gk_hi));
-                }
-                let g_idx = dest.find_guard_idx(gk).unwrap();
-                dest.guards[g_idx].entries.push(entry);
-            }
+            self.levels[dest_idx].get_or_create_guard(*gk_lo, *gk_hi).entries.push(entry);
         }
 
         self.update_flags();
@@ -815,15 +780,10 @@ impl ShardIndex {
         let mut remaining = Vec::new();
 
         for path in self.pending_deletions.drain(..) {
-            if Path::new(&path).exists() {
-                match fs::remove_file(&path) {
-                    Ok(()) => {
-                        deleted += 1;
-                    }
-                    Err(_) => {
-                        remaining.push(path);
-                    }
-                }
+            match fs::remove_file(&path) {
+                Ok(()) => { deleted += 1; }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { deleted += 1; }
+                Err(_) => { remaining.push(path); }
             }
         }
 
@@ -832,36 +792,3 @@ impl ShardIndex {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helper: GuardResult and ManifestEntryRaw need zeroed() and filename_str()
-// ---------------------------------------------------------------------------
-
-impl compact::GuardResult {
-    pub fn zeroed() -> Self {
-        compact::GuardResult {
-            guard_key_lo: 0,
-            guard_key_hi: 0,
-            filename: [0u8; 256],
-        }
-    }
-
-    pub fn filename_str(&self) -> &str {
-        let end = self
-            .filename
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.filename.len());
-        std::str::from_utf8(&self.filename[..end]).unwrap_or("")
-    }
-}
-
-impl ManifestEntryRaw {
-    pub fn filename_str(&self) -> &str {
-        let end = self
-            .filename
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.filename.len());
-        std::str::from_utf8(&self.filename[..end]).unwrap_or("")
-    }
-}
