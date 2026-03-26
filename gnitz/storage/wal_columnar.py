@@ -33,53 +33,63 @@ class WALColumnarBlock(object):
         self.batch.free()
 
 
-def encode_batch_append(block_buf, schema, lsn, table_id, batch):
-    """Append one WAL block to block_buf without resetting it."""
+def gather_batch_regions(schema, batch):
+    """Allocate C arrays of region pointers/sizes from batch SoA buffers.
+
+    Returns (region_ptrs, region_sizes, num_regions, blob_size).
+    Caller MUST free region_ptrs and region_sizes via lltype.free(..., flavor="raw").
+    """
     count = batch.length()
     num_cols = len(schema.columns)
 
-    # Count data regions: pk_lo, pk_hi, weight, null, non-PK columns, blob
     num_non_pk = 0
     for i in range(num_cols):
         if i != schema.pk_index:
             num_non_pk += 1
     num_regions = 4 + num_non_pk + 1
 
-    # Gather region pointers and sizes into C arrays
     region_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_regions, flavor="raw")
     region_sizes = lltype.malloc(rffi.UINTP.TO, num_regions, flavor="raw")
 
-    try:
-        ri = 0
-        # pk_lo
-        region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.pk_lo_buf.base_ptr)
-        region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
+    ri = 0
+    # pk_lo
+    region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.pk_lo_buf.base_ptr)
+    region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
+    ri += 1
+    # pk_hi
+    region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.pk_hi_buf.base_ptr)
+    region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
+    ri += 1
+    # weight
+    region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.weight_buf.base_ptr)
+    region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
+    ri += 1
+    # null
+    region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.null_buf.base_ptr)
+    region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
+    ri += 1
+    # non-PK columns
+    for ci in range(num_cols):
+        if ci == schema.pk_index:
+            continue
+        col_sz = count * batch.col_strides[ci]
+        region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.col_bufs[ci].base_ptr)
+        region_sizes[ri] = rffi.cast(rffi.UINT, col_sz)
         ri += 1
-        # pk_hi
-        region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.pk_hi_buf.base_ptr)
-        region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
-        ri += 1
-        # weight
-        region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.weight_buf.base_ptr)
-        region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
-        ri += 1
-        # null
-        region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.null_buf.base_ptr)
-        region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
-        ri += 1
-        # non-PK columns
-        for ci in range(num_cols):
-            if ci == schema.pk_index:
-                continue
-            col_sz = count * batch.col_strides[ci]
-            region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.col_bufs[ci].base_ptr)
-            region_sizes[ri] = rffi.cast(rffi.UINT, col_sz)
-            ri += 1
-        # blob arena
-        blob_size = batch.blob_arena.offset
-        region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.blob_arena.base_ptr)
-        region_sizes[ri] = rffi.cast(rffi.UINT, blob_size)
+    # blob arena
+    blob_size = batch.blob_arena.offset
+    region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.blob_arena.base_ptr)
+    region_sizes[ri] = rffi.cast(rffi.UINT, blob_size)
 
+    return region_ptrs, region_sizes, num_regions, blob_size
+
+
+def encode_batch_append(block_buf, schema, lsn, table_id, batch):
+    """Append one WAL block to block_buf without resetting it."""
+    region_ptrs, region_sizes, num_regions, blob_size = gather_batch_regions(
+        schema, batch
+    )
+    try:
         # Compute exact block size from actual region sizes
         needed = 48 + num_regions * 8  # header + directory
         ri2 = 0
@@ -95,7 +105,7 @@ def encode_batch_append(block_buf, schema, lsn, table_id, batch):
             rffi.cast(rffi.LONGLONG, block_buf.capacity * block_buf.item_size),
             rffi.cast(rffi.ULONGLONG, lsn),
             rffi.cast(rffi.UINT, table_id),
-            rffi.cast(rffi.UINT, count),
+            rffi.cast(rffi.UINT, batch.length()),
             region_ptrs,
             region_sizes,
             rffi.cast(rffi.UINT, num_regions),

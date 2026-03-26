@@ -506,6 +506,166 @@ pub extern "C" fn gnitz_manifest_parse(
 }
 
 // ---------------------------------------------------------------------------
+// WAL writer lifecycle
+// ---------------------------------------------------------------------------
+
+/// Open a WAL file for writing (O_WRONLY | O_CREAT | O_APPEND) with exclusive flock.
+/// Returns handle on success, null on error. Error code written to *out_error:
+///   0 = success, -2 = lock contention, -3 = I/O error.
+#[no_mangle]
+pub extern "C" fn gnitz_wal_writer_open(
+    path: *const libc::c_char,
+    out_error: *mut i32,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if path.is_null() || out_error.is_null() {
+            return ptr::null_mut();
+        }
+        let cpath = unsafe { CStr::from_ptr(path) };
+        match crate::wal::WalWriter::open(cpath) {
+            Ok(writer) => {
+                unsafe { *out_error = 0; }
+                Box::into_raw(Box::new(writer)) as *mut c_void
+            }
+            Err(code) => {
+                unsafe { *out_error = code; }
+                ptr::null_mut()
+            }
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Append an encoded WAL block (encode + write + fdatasync).
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_wal_writer_append(
+    handle: *mut c_void,
+    lsn: u64,
+    table_id: u32,
+    count: u32,
+    region_ptrs: *const *const u8,
+    region_sizes: *const u32,
+    num_regions: u32,
+    blob_size: u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() || region_ptrs.is_null() || region_sizes.is_null() {
+            return -1;
+        }
+        let writer = unsafe { &mut *(handle as *mut crate::wal::WalWriter) };
+        let n = num_regions as usize;
+        let ptrs = unsafe { slice::from_raw_parts(region_ptrs, n) };
+        let sizes = unsafe { slice::from_raw_parts(region_sizes, n) };
+        writer.append_batch(lsn, table_id, count, ptrs, sizes, blob_size)
+    });
+    result.unwrap_or(-99)
+}
+
+/// Truncate the WAL file to zero length.
+/// Returns 0 on success, -3 on I/O error.
+#[no_mangle]
+pub extern "C" fn gnitz_wal_writer_truncate(handle: *mut c_void) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() { return -1; }
+        let writer = unsafe { &mut *(handle as *mut crate::wal::WalWriter) };
+        writer.truncate()
+    });
+    result.unwrap_or(-99)
+}
+
+/// Close and free a WAL writer handle (unlocks, closes fd).
+#[no_mangle]
+pub extern "C" fn gnitz_wal_writer_close(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        unsafe { drop(Box::from_raw(handle as *mut crate::wal::WalWriter)); }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// WAL reader lifecycle
+// ---------------------------------------------------------------------------
+
+/// Open a WAL file for reading (mmap, read-only).
+/// Returns handle on success, null on error.
+/// *out_base_ptr receives the mmap base pointer (for Buffer.from_existing_data).
+/// *out_file_size receives the file size in bytes.
+#[no_mangle]
+pub extern "C" fn gnitz_wal_reader_open(
+    path: *const libc::c_char,
+    out_base_ptr: *mut *const u8,
+    out_file_size: *mut i64,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if path.is_null() || out_base_ptr.is_null() || out_file_size.is_null() {
+            return ptr::null_mut();
+        }
+        let cpath = unsafe { CStr::from_ptr(path) };
+        match crate::wal::WalReader::open(cpath) {
+            Ok(reader) => {
+                unsafe {
+                    *out_base_ptr = reader.base_ptr();
+                    *out_file_size = reader.file_size() as i64;
+                }
+                Box::into_raw(Box::new(reader)) as *mut c_void
+            }
+            Err(_) => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Read the next WAL block from the reader.
+/// Returns 0=success, 1=EOF, -4=corrupt.
+/// Region offsets are absolute (relative to mmap base), so RPython can use
+/// rffi.ptradd(base_ptr, out_offsets[i]) directly.
+#[no_mangle]
+pub extern "C" fn gnitz_wal_reader_next(
+    handle: *mut c_void,
+    out_lsn: *mut u64,
+    out_tid: *mut u32,
+    out_count: *mut u32,
+    out_num_regions: *mut u32,
+    out_blob_size: *mut u64,
+    out_offsets: *mut u32,
+    out_sizes: *mut u32,
+    max_regions: u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() {
+            return -1;
+        }
+        let reader = unsafe { &mut *(handle as *mut crate::wal::WalReader) };
+        let n = max_regions as usize;
+        let offsets = if out_offsets.is_null() { &mut [] } else {
+            unsafe { slice::from_raw_parts_mut(out_offsets, n) }
+        };
+        let sizes = if out_sizes.is_null() { &mut [] } else {
+            unsafe { slice::from_raw_parts_mut(out_sizes, n) }
+        };
+        reader.read_next_block(
+            unsafe { &mut *out_lsn },
+            unsafe { &mut *out_tid },
+            unsafe { &mut *out_count },
+            unsafe { &mut *out_num_regions },
+            unsafe { &mut *out_blob_size },
+            offsets, sizes, max_regions,
+        )
+    });
+    result.unwrap_or(-99)
+}
+
+/// Close and free a WAL reader handle (munmap, close fd).
+#[no_mangle]
+pub extern "C" fn gnitz_wal_reader_close(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        unsafe { drop(Box::from_raw(handle as *mut crate::wal::WalReader)); }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Shard file writing
 // ---------------------------------------------------------------------------
 
@@ -853,6 +1013,35 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(lsn, 99);
         assert_eq!(out[0].table_id, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL lifecycle FFI null safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wal_writer_close_null_safety() {
+        gnitz_wal_writer_close(ptr::null_mut());
+    }
+
+    #[test]
+    fn wal_reader_close_null_safety() {
+        gnitz_wal_reader_close(ptr::null_mut());
+    }
+
+    #[test]
+    fn wal_writer_append_null_handle() {
+        assert_eq!(gnitz_wal_writer_append(ptr::null_mut(), 0, 0, 0, ptr::null(), ptr::null(), 0, 0), -1);
+    }
+
+    #[test]
+    fn wal_writer_truncate_null_handle() {
+        assert_eq!(gnitz_wal_writer_truncate(ptr::null_mut()), -1);
+    }
+
+    #[test]
+    fn wal_reader_next_null_handle() {
+        assert_eq!(gnitz_wal_reader_next(ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0), -1);
     }
 
     // -----------------------------------------------------------------------

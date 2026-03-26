@@ -64,6 +64,24 @@ eci = ExternalCompilationInfo(
         "  const uint8_t *buf, int64_t buf_len,"
         "  uint8_t *out_entries, uint32_t max_entries,"
         "  uint64_t *out_global_max_lsn);",
+        # WAL writer lifecycle
+        "void *gnitz_wal_writer_open(const char *path, int32_t *out_error);",
+        "int32_t gnitz_wal_writer_append("
+        "  void *handle, uint64_t lsn, uint32_t table_id, uint32_t count,"
+        "  void **region_ptrs, uint32_t *region_sizes,"
+        "  uint32_t num_regions, uint64_t blob_size);",
+        "int32_t gnitz_wal_writer_truncate(void *handle);",
+        "void gnitz_wal_writer_close(void *handle);",
+        # WAL reader lifecycle
+        "void *gnitz_wal_reader_open("
+        "  const char *path, char **out_base_ptr, int64_t *out_file_size);",
+        "int32_t gnitz_wal_reader_next("
+        "  void *handle,"
+        "  uint64_t *out_lsn, uint32_t *out_tid, uint32_t *out_count,"
+        "  uint32_t *out_num_regions, uint64_t *out_blob_size,"
+        "  uint32_t *out_offsets, uint32_t *out_sizes,"
+        "  uint32_t max_regions);",
+        "void gnitz_wal_reader_close(void *handle);",
         # shard file writing
         "int32_t gnitz_write_shard("
         "  int32_t dirfd, const char *basename,"
@@ -357,6 +375,70 @@ _shard_blob_len = rffi.llexternal(
     compilation_info=eci,
 )
 
+
+# ---------------------------------------------------------------------------
+# WAL writer lifecycle
+# ---------------------------------------------------------------------------
+
+_wal_writer_open = rffi.llexternal(
+    "gnitz_wal_writer_open",
+    [rffi.CCHARP, rffi.INTP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_wal_writer_append = rffi.llexternal(
+    "gnitz_wal_writer_append",
+    [rffi.VOIDP,
+     rffi.ULONGLONG, rffi.UINT, rffi.UINT,
+     rffi.VOIDPP, rffi.UINTP,
+     rffi.UINT, rffi.ULONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_wal_writer_truncate = rffi.llexternal(
+    "gnitz_wal_writer_truncate",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_wal_writer_close = rffi.llexternal(
+    "gnitz_wal_writer_close",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# WAL reader lifecycle
+# ---------------------------------------------------------------------------
+
+_wal_reader_open = rffi.llexternal(
+    "gnitz_wal_reader_open",
+    [rffi.CCHARP, rffi.CCHARPP, rffi.LONGLONGP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_wal_reader_next = rffi.llexternal(
+    "gnitz_wal_reader_next",
+    [rffi.VOIDP,
+     rffi.ULONGLONGP, rffi.UINTP, rffi.UINTP,
+     rffi.UINTP, rffi.ULONGLONGP,
+     rffi.UINTP, rffi.UINTP,
+     rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_wal_reader_close = rffi.llexternal(
+    "gnitz_wal_reader_close",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
 
 # ---------------------------------------------------------------------------
 # Shard file writing
