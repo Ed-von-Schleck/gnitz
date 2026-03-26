@@ -1087,6 +1087,78 @@ pub extern "C" fn gnitz_sort_batch(
 }
 
 // ---------------------------------------------------------------------------
+// Scatter-copy (indexed row subset)
+// ---------------------------------------------------------------------------
+
+/// Copy rows from a source batch at the given indices.
+/// If `weights` is non-NULL, uses weights[i] for output row i.
+/// If `weights` is NULL, reads weights from the source batch.
+#[no_mangle]
+pub extern "C" fn gnitz_scatter_copy(
+    in_region_ptrs: *const *const u8,
+    in_region_sizes: *const u32,
+    in_row_count: u32,
+    regions_per_batch: u32,
+    indices: *const u32,
+    num_indices: u32,
+    weights: *const i64,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    out_region_ptrs: *const *mut u8,
+    out_region_sizes: *mut u32,
+    out_row_count: *mut u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if schema_desc.is_null() || out_region_sizes.is_null() || out_row_count.is_null() {
+            return -1;
+        }
+        let ni = num_indices as usize;
+        if ni == 0 {
+            unsafe { *out_row_count = 0; }
+            return 0;
+        }
+        if in_region_ptrs.is_null() || in_region_sizes.is_null()
+            || indices.is_null() || out_region_ptrs.is_null()
+        {
+            return -1;
+        }
+
+        let rpb = regions_per_batch as usize;
+        let schema = unsafe { &*schema_desc };
+        let in_ptrs = unsafe { slice::from_raw_parts(in_region_ptrs, rpb) };
+        let in_sizes = unsafe { slice::from_raw_parts(in_region_sizes, rpb) };
+        let out_ptrs = unsafe { slice::from_raw_parts(out_region_ptrs, rpb) };
+        let out_szs = unsafe { slice::from_raw_parts_mut(out_region_sizes, rpb) };
+        let idx_slice = unsafe { slice::from_raw_parts(indices, ni) };
+        let weight_slice = if weights.is_null() {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(weights, ni) }
+        };
+
+        let num_payload_cols = schema.num_columns as usize - 1;
+        let batch = unsafe {
+            crate::merge::parse_single_batch_from_regions(
+                in_ptrs, in_sizes, in_row_count as usize, num_payload_cols,
+            )
+        };
+        let total_blob = batch.blob.len();
+        let blob_cap = if total_blob > 0 { total_blob } else { 1 };
+        let mut writer = unsafe {
+            crate::merge::create_writer_from_regions(
+                out_ptrs, rpb, schema, ni, blob_cap,
+            )
+        };
+
+        crate::merge::scatter_copy(&batch, idx_slice, weight_slice, &mut writer);
+
+        crate::merge::fill_output_sizes(&writer, schema, out_szs);
+        unsafe { *out_row_count = writer.row_count() as u32; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
 // Read cursor (opaque N-way merge cursor)
 // ---------------------------------------------------------------------------
 

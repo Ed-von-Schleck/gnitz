@@ -758,6 +758,28 @@ pub fn sort_and_consolidate(
     }
 }
 
+/// Scatter-copy rows from a batch at the given indices.
+/// Indices are NOT sorted — rows are written in the order given.
+/// If `weights` is non-empty, uses weights[i] for row i; otherwise reads
+/// the weight from the source batch at indices[i].
+pub fn scatter_copy(
+    batch: &MemBatch,
+    indices: &[u32],
+    weights: &[i64],
+    writer: &mut DirectWriter,
+) {
+    let use_explicit_weights = !weights.is_empty();
+    for (i, &idx) in indices.iter().enumerate() {
+        let row = idx as usize;
+        let w = if use_explicit_weights {
+            weights[i]
+        } else {
+            batch.get_weight(row)
+        };
+        writer.write_row(batch, row, w);
+    }
+}
+
 /// Sort a single batch by (PK, payload) WITHOUT consolidation.
 /// All N input rows produce N output rows — no weight merging, no ghost elimination.
 /// Duplicate (PK, payload) entries are preserved as separate rows.
@@ -1469,5 +1491,93 @@ mod tests {
         let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
         let result = run_sort(&b, &schema);
         assert_eq!(result, vec![(1, 0, 1, 10), (2, 0, 1, 20)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // scatter_copy tests
+    // -----------------------------------------------------------------------
+
+    fn run_scatter(
+        batch: &MemBatch,
+        indices: &[u32],
+        weights: &[i64],
+        schema: &SchemaDescriptor,
+    ) -> Vec<(u64, u64, i64, i64)> {
+        let n = indices.len();
+        let total_blob = batch.blob.len();
+        let mut out_pk_lo = vec![0u8; n * 8];
+        let mut out_pk_hi = vec![0u8; n * 8];
+        let mut out_weight = vec![0u8; n * 8];
+        let mut out_null = vec![0u8; n * 8];
+        let mut out_col0 = vec![0u8; n * 8];
+        let blob_cap = if total_blob > 0 { total_blob } else { 1 };
+        let mut out_blob = vec![0u8; blob_cap];
+
+        let count;
+        {
+            let mut writer = DirectWriter {
+                pk_lo: &mut out_pk_lo,
+                pk_hi: &mut out_pk_hi,
+                weight: &mut out_weight,
+                null_bmp: &mut out_null,
+                col_bufs: vec![&mut out_col0],
+                blob: &mut out_blob,
+                blob_offset: 0,
+                blob_cache: HashMap::new(),
+                count: 0,
+                schema: *schema,
+            };
+            scatter_copy(batch, indices, weights, &mut writer);
+            count = writer.row_count();
+        }
+
+        let mut result = Vec::new();
+        for i in 0..count {
+            let lo = read_u64_le(&out_pk_lo, i * 8);
+            let hi = read_u64_le(&out_pk_hi, i * 8);
+            let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
+            let val = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
+            result.push((lo, hi, w, val));
+        }
+        result
+    }
+
+    #[test]
+    fn test_scatter_basic() {
+        let schema = make_schema_i64();
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+            (1, 0, 1, 10),
+            (2, 0, 1, 20),
+            (3, 0, 1, 30),
+        ]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 3);
+        // Pick rows 2 and 0 (out of order)
+        let result = run_scatter(&b, &[2, 0], &[], &schema);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], (3, 0, 1, 30));
+        assert_eq!(result[1], (1, 0, 1, 10));
+    }
+
+    #[test]
+    fn test_scatter_empty_indices() {
+        let schema = make_schema_i64();
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[(1, 0, 1, 10)]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 1);
+        let result = run_scatter(&b, &[], &[], &schema);
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_scatter_with_explicit_weights() {
+        let schema = make_schema_i64();
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+            (1, 0, 1, 10),
+            (2, 0, 1, 20),
+        ]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
+        // Override weights: row 1 gets w=5, row 0 gets w=-1
+        let result = run_scatter(&b, &[1, 0], &[5, -1], &schema);
+        assert_eq!(result[0], (2, 0, 5, 20));
+        assert_eq!(result[1], (1, 0, -1, 10));
     }
 }

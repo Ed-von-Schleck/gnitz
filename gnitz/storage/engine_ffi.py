@@ -131,6 +131,15 @@ eci = ExternalCompilationInfo(
         "  void *schema_desc,"
         "  void **out_region_ptrs, uint32_t *out_region_sizes,"
         "  uint32_t *out_row_count);",
+        # scatter-copy (indexed row subset)
+        "int32_t gnitz_scatter_copy("
+        "  void **in_region_ptrs, uint32_t *in_region_sizes,"
+        "  uint32_t in_row_count, uint32_t regions_per_batch,"
+        "  uint32_t *indices, uint32_t num_indices,"
+        "  int64_t *weights,"
+        "  void *schema_desc,"
+        "  void **out_region_ptrs, uint32_t *out_region_sizes,"
+        "  uint32_t *out_row_count);",
         # read cursor (opaque N-way merge cursor)
         "void *gnitz_read_cursor_create("
         "  void **batch_region_ptrs, uint32_t *batch_region_sizes,"
@@ -593,6 +602,23 @@ _sort_batch = rffi.llexternal(
     "gnitz_sort_batch",
     [rffi.VOIDPP, rffi.UINTP,
      rffi.UINT, rffi.UINT,
+     rffi.VOIDP,
+     rffi.VOIDPP, rffi.UINTP,
+     rffi.UINTP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Scatter-copy (indexed row subset)
+# ---------------------------------------------------------------------------
+
+_scatter_copy = rffi.llexternal(
+    "gnitz_scatter_copy",
+    [rffi.VOIDPP, rffi.UINTP,
+     rffi.UINT, rffi.UINT,
+     rffi.UINTP, rffi.UINT,
+     rffi.LONGLONGP,
      rffi.VOIDP,
      rffi.VOIDPP, rffi.UINTP,
      rffi.UINTP],
