@@ -3,18 +3,15 @@
 //! via `gnitz_memtable_*` FFI functions.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::Arc;
 
 use crate::bloom::BloomFilter;
 use crate::columnar::{self, ColumnarSource};
-use crate::compact::{SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
+use crate::compact::SchemaDescriptor;
 use crate::merge::{self, MemBatch};
 use crate::shard_file;
-use crate::util::{read_u32_le, read_u64_le};
-
-use type_code::STRING as TYPE_STRING;
+use crate::util::read_u64_le;
 
 /// Error code returned when the MemTable exceeds its capacity.
 pub const ERR_CAPACITY: i32 = -2;
@@ -139,8 +136,38 @@ impl OwnedBatch {
         (hi << 64) | lo
     }
 
+    #[inline]
+    pub fn get_weight(&self, row: usize) -> i64 {
+        i64::from_le_bytes(self.weight[row * 8..row * 8 + 8].try_into().unwrap())
+    }
+
+    #[inline]
+    pub fn get_null_word(&self, row: usize) -> u64 {
+        read_u64_le(&self.null_bmp, row * 8)
+    }
+
+    #[inline]
+    pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        let off = row * col_size;
+        &self.col_data[payload_col][off..off + col_size]
+    }
+
+    pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
+        let target = ((key_hi as u128) << 64) | (key_lo as u128);
+        let mut lo = 0usize;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.get_pk(mid) < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     /// Build the region pointer/size pairs used by `build_shard_image`.
-    /// Order: pk_lo, pk_hi, weight, null_bmp, payload cols, blob.
     pub fn regions(&self) -> Vec<(*const u8, usize)> {
         let mut r = Vec::with_capacity(4 + self.col_data.len() + 1);
         r.push((self.pk_lo.as_ptr(), self.pk_lo.len()));
@@ -152,6 +179,21 @@ impl OwnedBatch {
         }
         r.push((self.blob.as_ptr(), self.blob.len()));
         r
+    }
+}
+
+impl ColumnarSource for OwnedBatch {
+    #[inline]
+    fn get_null_word(&self, row: usize) -> u64 {
+        OwnedBatch::get_null_word(self, row)
+    }
+    #[inline]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        OwnedBatch::get_col_ptr(self, row, payload_col, col_size)
+    }
+    #[inline]
+    fn blob_slice(&self) -> &[u8] {
+        &self.blob
     }
 }
 
@@ -252,31 +294,6 @@ fn consolidate_batches(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Binary search helpers
-// ---------------------------------------------------------------------------
-
-/// Lower bound: first row with PK >= (key_lo, key_hi) in a sorted batch.
-fn lower_bound_pk(batch: &MemBatch, key_lo: u64, key_hi: u64) -> usize {
-    let target = ((key_hi as u128) << 64) | (key_lo as u128);
-    let mut lo = 0usize;
-    let mut hi = batch.count;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let mid_pk = batch.get_pk(mid);
-        if mid_pk < target {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
-
-#[inline]
-fn pk_eq(batch: &MemBatch, row: usize, key_lo: u64, key_hi: u64) -> bool {
-    batch.get_pk_lo(row) == key_lo && batch.get_pk_hi(row) == key_hi
-}
 
 // ---------------------------------------------------------------------------
 // MemTableSnapshot
@@ -389,10 +406,9 @@ impl MemTable {
         self.has_found = false;
 
         for (ri, run) in self.runs.iter().enumerate() {
-            let batch = run.as_mem_batch();
-            let mut lo = lower_bound_pk(&batch, key_lo, key_hi);
-            while lo < batch.count && pk_eq(&batch, lo, key_lo, key_hi) {
-                total_w += batch.get_weight(lo);
+            let mut lo = run.find_lower_bound(key_lo, key_hi);
+            while lo < run.count && run.get_pk_lo(lo) == key_lo && run.get_pk_hi(lo) == key_hi {
+                total_w += run.get_weight(lo);
                 if !self.has_found {
                     self.found_run = ri;
                     self.found_row = lo;
@@ -411,21 +427,17 @@ impl MemTable {
         if !self.has_found || self.found_run >= self.runs.len() {
             return std::ptr::null();
         }
-        let batch = self.runs[self.found_run].as_mem_batch();
-        let slice = batch.get_col_ptr(self.found_row, payload_col, col_size);
-        slice.as_ptr()
+        let run = &self.runs[self.found_run];
+        run.get_col_ptr(self.found_row, payload_col, col_size).as_ptr()
     }
 
-    /// Get null word for the last-found row.
     pub fn found_null_word(&self) -> u64 {
         if !self.has_found || self.found_run >= self.runs.len() {
             return 0;
         }
-        let batch = self.runs[self.found_run].as_mem_batch();
-        batch.get_null_word(self.found_row)
+        self.runs[self.found_run].get_null_word(self.found_row)
     }
 
-    /// Get blob arena base pointer for the last-found row's run.
     pub fn found_blob_ptr(&self) -> *const u8 {
         if !self.has_found || self.found_run >= self.runs.len() {
             return std::ptr::null();
@@ -444,14 +456,13 @@ impl MemTable {
         let mut total_w: i64 = 0;
 
         for run in &self.runs {
-            let batch = run.as_mem_batch();
-            let mut lo = lower_bound_pk(&batch, key_lo, key_hi);
-            while lo < batch.count && pk_eq(&batch, lo, key_lo, key_hi) {
+            let mut lo = run.find_lower_bound(key_lo, key_hi);
+            while lo < run.count && run.get_pk_lo(lo) == key_lo && run.get_pk_hi(lo) == key_hi {
                 let ord = columnar::compare_rows(
-                    &self.schema, &batch, lo, ref_batch, ref_row,
+                    &self.schema, run, lo, ref_batch, ref_row,
                 );
                 if ord == Ordering::Equal {
-                    total_w += batch.get_weight(lo);
+                    total_w += run.get_weight(lo);
                 }
                 lo += 1;
             }
@@ -491,6 +502,7 @@ impl MemTable {
         self.runs_bytes = 0;
         self.total_row_count = 0;
         self.cached_consolidated = None;
+        self.has_found = false;
         self.bloom.reset();
     }
 

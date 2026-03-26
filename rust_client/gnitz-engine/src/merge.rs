@@ -59,6 +59,27 @@ impl<'a> MemBatch<'a> {
         let off = row * col_size;
         &self.col_data[payload_col][off..off + col_size]
     }
+
+    /// Binary search for the first row where PK >= (key_lo, key_hi).
+    pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
+        let target = ((key_hi as u128) << 64) | (key_lo as u128);
+        let mut lo = 0usize;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.get_pk(mid) < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    #[inline]
+    pub fn pk_matches(&self, row: usize, key_lo: u64, key_hi: u64) -> bool {
+        self.get_pk_lo(row) == key_lo && self.get_pk_hi(row) == key_hi
+    }
 }
 
 impl<'a> ColumnarSource for MemBatch<'a> {
