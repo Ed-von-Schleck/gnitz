@@ -124,6 +124,25 @@ eci = ExternalCompilationInfo(
         "  void *schema_desc,"
         "  void **out_region_ptrs, uint32_t *out_region_sizes,"
         "  uint32_t *out_row_count);",
+        # read cursor (opaque N-way merge cursor)
+        "void *gnitz_read_cursor_create("
+        "  void **batch_region_ptrs, uint32_t *batch_region_sizes,"
+        "  uint32_t *batch_row_counts, uint32_t num_batches,"
+        "  uint32_t regions_per_batch,"
+        "  void **shard_handles, uint32_t num_shards,"
+        "  void *schema_desc);",
+        "void gnitz_read_cursor_seek("
+        "  void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  int32_t *out_valid, uint64_t *out_key_lo, uint64_t *out_key_hi,"
+        "  int64_t *out_weight, uint64_t *out_null_word);",
+        "void gnitz_read_cursor_next("
+        "  void *handle,"
+        "  int32_t *out_valid, uint64_t *out_key_lo, uint64_t *out_key_hi,"
+        "  int64_t *out_weight, uint64_t *out_null_word);",
+        "const uint8_t *gnitz_read_cursor_col_ptr("
+        "  const void *handle, int32_t col_idx, int32_t col_size);",
+        "const uint8_t *gnitz_read_cursor_blob_ptr(const void *handle);",
+        "void gnitz_read_cursor_close(void *handle);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -556,5 +575,59 @@ _consolidate_batch = rffi.llexternal(
      rffi.VOIDPP, rffi.UINTP,
      rffi.UINTP],
     rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Read cursor (opaque N-way merge cursor)
+# ---------------------------------------------------------------------------
+
+_read_cursor_create = rffi.llexternal(
+    "gnitz_read_cursor_create",
+    [rffi.VOIDPP, rffi.UINTP,
+     rffi.UINTP, rffi.UINT,
+     rffi.UINT,
+     rffi.VOIDPP, rffi.UINT,
+     rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_read_cursor_seek = rffi.llexternal(
+    "gnitz_read_cursor_seek",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG,
+     rffi.INTP, rffi.ULONGLONGP, rffi.ULONGLONGP,
+     rffi.LONGLONGP, rffi.ULONGLONGP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_read_cursor_next = rffi.llexternal(
+    "gnitz_read_cursor_next",
+    [rffi.VOIDP,
+     rffi.INTP, rffi.ULONGLONGP, rffi.ULONGLONGP,
+     rffi.LONGLONGP, rffi.ULONGLONGP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_read_cursor_col_ptr = rffi.llexternal(
+    "gnitz_read_cursor_col_ptr",
+    [rffi.VOIDP, rffi.INT, rffi.INT],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_read_cursor_blob_ptr = rffi.llexternal(
+    "gnitz_read_cursor_blob_ptr",
+    [rffi.VOIDP],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_read_cursor_close = rffi.llexternal(
+    "gnitz_read_cursor_close",
+    [rffi.VOIDP],
+    lltype.Void,
     compilation_info=eci,
 )

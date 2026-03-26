@@ -1027,6 +1027,159 @@ pub extern "C" fn gnitz_consolidate_batch(
 }
 
 // ---------------------------------------------------------------------------
+// Read cursor (opaque N-way merge cursor)
+// ---------------------------------------------------------------------------
+
+/// Create a read cursor from batch regions + shard handles.
+/// Batch regions follow the standard layout (pk_lo, pk_hi, weight, null, cols..., blob).
+/// Shard handles are opaque void* from gnitz_shard_open (NOT owned by cursor).
+/// Returns opaque handle or null on error.
+#[no_mangle]
+pub extern "C" fn gnitz_read_cursor_create(
+    batch_region_ptrs: *const *const u8,
+    batch_region_sizes: *const u32,
+    batch_row_counts: *const u32,
+    num_batches: u32,
+    regions_per_batch: u32,
+    shard_handles: *const *const libc::c_void,
+    num_shards: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+) -> *mut libc::c_void {
+    let result = panic::catch_unwind(|| {
+        if schema_desc.is_null() {
+            return ptr::null_mut();
+        }
+        let schema = unsafe { *schema_desc };
+        let nb = num_batches as usize;
+        let ns = num_shards as usize;
+        let rpb = regions_per_batch as usize;
+        let num_payload_cols = schema.num_columns as usize - 1;
+
+        // Parse batch sources
+        let mut batches: Vec<crate::merge::MemBatch> = Vec::new();
+        if nb > 0 && !batch_region_ptrs.is_null() && !batch_region_sizes.is_null()
+            && !batch_row_counts.is_null()
+        {
+            let in_ptrs = unsafe { slice::from_raw_parts(batch_region_ptrs, nb * rpb) };
+            let in_sizes = unsafe { slice::from_raw_parts(batch_region_sizes, nb * rpb) };
+            let counts = unsafe { slice::from_raw_parts(batch_row_counts, nb) };
+            batches = unsafe {
+                crate::merge::parse_batches_from_regions(
+                    in_ptrs, in_sizes, counts, nb, rpb, num_payload_cols,
+                )
+            };
+        }
+
+        // Parse shard sources
+        let mut shard_ptrs: Vec<*const crate::shard_reader::MappedShard> = Vec::new();
+        if ns > 0 && !shard_handles.is_null() {
+            let handles = unsafe { slice::from_raw_parts(shard_handles, ns) };
+            for &h in handles {
+                if !h.is_null() {
+                    shard_ptrs.push(h as *const crate::shard_reader::MappedShard);
+                }
+            }
+        }
+
+        let cursor = unsafe {
+            crate::read_cursor::create_read_cursor(&batches, &shard_ptrs, schema)
+        };
+        Box::into_raw(Box::new(cursor)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Seek cursor to first row >= (key_lo, key_hi).
+/// Populates out_ params with current row state.
+#[no_mangle]
+pub extern "C" fn gnitz_read_cursor_seek(
+    handle: *mut libc::c_void,
+    key_lo: u64,
+    key_hi: u64,
+    out_valid: *mut i32,
+    out_key_lo: *mut u64,
+    out_key_hi: *mut u64,
+    out_weight: *mut i64,
+    out_null_word: *mut u64,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let cursor = unsafe { &mut *(handle as *mut crate::read_cursor::ReadCursor) };
+    cursor.seek(key_lo, key_hi);
+    unsafe {
+        if !out_valid.is_null() { *out_valid = cursor.valid as i32; }
+        if !out_key_lo.is_null() { *out_key_lo = cursor.current_key_lo; }
+        if !out_key_hi.is_null() { *out_key_hi = cursor.current_key_hi; }
+        if !out_weight.is_null() { *out_weight = cursor.current_weight; }
+        if !out_null_word.is_null() { *out_null_word = cursor.current_null_word; }
+    }
+}
+
+/// Advance to next non-ghost row. Populates out_ params.
+#[no_mangle]
+pub extern "C" fn gnitz_read_cursor_next(
+    handle: *mut libc::c_void,
+    out_valid: *mut i32,
+    out_key_lo: *mut u64,
+    out_key_hi: *mut u64,
+    out_weight: *mut i64,
+    out_null_word: *mut u64,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let cursor = unsafe { &mut *(handle as *mut crate::read_cursor::ReadCursor) };
+    cursor.advance();
+    unsafe {
+        if !out_valid.is_null() { *out_valid = cursor.valid as i32; }
+        if !out_key_lo.is_null() { *out_key_lo = cursor.current_key_lo; }
+        if !out_key_hi.is_null() { *out_key_hi = cursor.current_key_hi; }
+        if !out_weight.is_null() { *out_weight = cursor.current_weight; }
+        if !out_null_word.is_null() { *out_null_word = cursor.current_null_word; }
+    }
+}
+
+/// Get column data pointer for current row (schema-indexed).
+/// Returns NULL if cursor exhausted or col_idx out of range.
+#[no_mangle]
+pub extern "C" fn gnitz_read_cursor_col_ptr(
+    handle: *const libc::c_void,
+    col_idx: i32,
+    col_size: i32,
+) -> *const u8 {
+    if handle.is_null() {
+        return ptr::null();
+    }
+    let cursor = unsafe { &*(handle as *const crate::read_cursor::ReadCursor) };
+    cursor.col_ptr(col_idx as usize, col_size as usize)
+}
+
+/// Get blob arena base pointer for current row's source.
+#[no_mangle]
+pub extern "C" fn gnitz_read_cursor_blob_ptr(
+    handle: *const libc::c_void,
+) -> *const u8 {
+    if handle.is_null() {
+        return ptr::null();
+    }
+    let cursor = unsafe { &*(handle as *const crate::read_cursor::ReadCursor) };
+    cursor.blob_ptr()
+}
+
+/// Close cursor and free Rust-side state.
+/// Does NOT close/free shard handles (RPython owns those).
+#[no_mangle]
+pub extern "C" fn gnitz_read_cursor_close(handle: *mut libc::c_void) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(handle as *mut crate::read_cursor::ReadCursor);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 
