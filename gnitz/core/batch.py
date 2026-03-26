@@ -307,70 +307,6 @@ class RowBuilder(core_comparator.RowAccessor):
         return lltype.nullptr(rffi.CCHARP.TO)
 
 
-# ---------------------------------------------------------------------------
-# Mergesort Support (Raw Indices)
-# ---------------------------------------------------------------------------
-
-
-def _insertion_sort_indices(indices, batch, lo, hi):
-    for i in range(lo + 1, hi):
-        key = indices[i]
-        j = i - 1
-        while j >= lo and batch.compare_indices(indices[j], key) > 0:
-            indices[j + 1] = indices[j]
-            j -= 1
-        indices[j + 1] = key
-
-
-def _mergesort_indices(indices, batch, lo, hi, scratch):
-    if hi - lo <= 32:
-        _insertion_sort_indices(indices, batch, lo, hi)
-        return
-    mid = (lo + hi) >> 1
-    _mergesort_indices(indices, batch, lo, mid, scratch)
-    _mergesort_indices(indices, batch, mid, hi, scratch)
-    _merge_indices(indices, batch, lo, mid, hi, scratch)
-
-
-def _build_sorted_indices(batch):
-    """Build an index array [0..N) and mergesort it by batch row order."""
-    n = batch._count
-    indices = newlist_hint(n)
-    for i in range(n):
-        indices.append(i)
-    if n <= 32:
-        _insertion_sort_indices(indices, batch, 0, n)
-    else:
-        scratch = newlist_hint(n)
-        for i in range(n):
-            scratch.append(0)
-        _mergesort_indices(indices, batch, 0, n, scratch)
-    return indices
-
-
-def _merge_indices(indices, batch, lo, mid, hi, scratch):
-    if batch.compare_indices(indices[mid - 1], indices[mid]) <= 0:
-        return
-    for k in range(lo, mid):
-        scratch[k] = indices[k]
-
-    i = lo
-    j = mid
-    k = lo
-
-    while i < mid and j < hi:
-        if batch.compare_indices(scratch[i], indices[j]) <= 0:
-            indices[k] = scratch[i]
-            i += 1
-        else:
-            indices[k] = indices[j]
-            j += 1
-        k += 1
-
-    while i < mid:
-        indices[k] = scratch[i]
-        i += 1
-        k += 1
 
 
 # ---------------------------------------------------------------------------
@@ -413,8 +349,6 @@ class ArenaZSetBatch(object):
         self.allocator = BatchBlobAllocator(self.blob_arena)
 
         self._raw_accessor = ColumnarBatchAccessor(schema)
-        self._cmp_acc_a = ColumnarBatchAccessor(schema)
-        self._cmp_acc_b = ColumnarBatchAccessor(schema)
 
         self._count = 0
         self._sorted = False
@@ -708,28 +642,6 @@ class ArenaZSetBatch(object):
 
         self._count += 1
         self._invalidate_cache()
-
-    def compare_indices(self, idx_a, idx_b):
-        ahi = self._read_pk_hi(idx_a)
-        bhi = self._read_pk_hi(idx_b)
-        if ahi < bhi:
-            return -1
-        if ahi > bhi:
-            return 1
-
-        alo = self._read_pk_lo(idx_a)
-        blo = self._read_pk_lo(idx_b)
-        if alo < blo:
-            return -1
-        if alo > blo:
-            return 1
-
-        self._cmp_acc_a.bind(self, idx_a)
-        self._cmp_acc_b.bind(self, idx_b)
-
-        return core_comparator.compare_rows(
-            self._schema, self._cmp_acc_a, self._cmp_acc_b
-        )
 
     def clone(self):
         """Creates a deep copy of the batch."""
@@ -1036,21 +948,13 @@ class ArenaZSetBatch(object):
 
     def to_sorted(self):
         """
-        Functional sort. Returns a new batch if sorting is needed,
-        otherwise returns self.
+        Functional sort via Rust FFI. Returns a new sorted batch,
+        or self if count <= 1 or already sorted.
+        Does NOT consolidate — all rows preserved including duplicates.
         """
         if self._count <= 1 or self._sorted:
             return self
-
-        indices = _build_sorted_indices(self)
-
-        new_batch = ArenaZSetBatch(self._schema, initial_capacity=self._count)
-        new_batch._copy_rows_indexed_src_weights(self, indices)
-        new_batch._sorted = True
-        # Do NOT propagate _consolidated: the caller should consolidate
-        # explicitly if needed.  Blindly copying this flag was the root
-        # cause of the AVI group-elimination bug.
-        return new_batch
+        return _sort_via_ffi(self)
 
     def to_consolidated(self):
         """
@@ -1212,6 +1116,146 @@ def _consolidate_via_ffi(batch):
             is_sorted=True,
         )
         result.mark_consolidated(True)
+        return result
+    finally:
+        lltype.free(in_ptrs, flavor="raw")
+        lltype.free(in_sizes, flavor="raw")
+        lltype.free(out_ptrs, flavor="raw")
+        lltype.free(out_sizes_arr, flavor="raw")
+        lltype.free(out_count_arr, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")
+
+
+def _sort_via_ffi(batch):
+    """Sort a single batch via Rust FFI (gnitz_sort_batch).
+
+    Returns a new sorted ArenaZSetBatch. Does NOT consolidate — all rows
+    preserved including duplicates. Output count == input count.
+    """
+    from gnitz.storage import engine_ffi
+
+    schema = batch._schema
+    count = batch._count
+    num_cols = len(schema.columns)
+    pk_index = schema.pk_index
+    num_payload_cols = num_cols - 1
+    regions_per_batch = 4 + num_payload_cols + 1
+
+    in_ptrs = lltype.malloc(rffi.VOIDPP.TO, regions_per_batch, flavor="raw")
+    in_sizes = lltype.malloc(rffi.UINTP.TO, regions_per_batch, flavor="raw")
+
+    idx = 0
+    in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.pk_lo_buf.base_ptr)
+    in_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
+    idx += 1
+    in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.pk_hi_buf.base_ptr)
+    in_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
+    idx += 1
+    in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.weight_buf.base_ptr)
+    in_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
+    idx += 1
+    in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.null_buf.base_ptr)
+    in_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
+    idx += 1
+    for ci in range(num_cols):
+        if ci == pk_index:
+            continue
+        col_sz = count * batch.col_strides[ci]
+        in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.col_bufs[ci].base_ptr)
+        in_sizes[idx] = rffi.cast(rffi.UINT, col_sz)
+        idx += 1
+    in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.blob_arena.base_ptr)
+    in_sizes[idx] = rffi.cast(rffi.UINT, batch.blob_arena.offset)
+
+    out_pk_lo = buffer.Buffer(count * 8)
+    out_pk_hi = buffer.Buffer(count * 8)
+    out_weight = buffer.Buffer(count * 8)
+    out_null = buffer.Buffer(count * 8)
+
+    out_cols = newlist_hint(num_payload_cols)
+    for ci in range(num_cols):
+        if ci == pk_index:
+            continue
+        stride = schema.columns[ci].field_type.size
+        out_cols.append(buffer.Buffer(count * stride))
+
+    blob_cap = batch.blob_arena.offset if batch.blob_arena.offset > 0 else 1
+    out_blob = buffer.Buffer(blob_cap)
+
+    out_ptrs = lltype.malloc(rffi.VOIDPP.TO, regions_per_batch, flavor="raw")
+    out_sizes_arr = lltype.malloc(rffi.UINTP.TO, regions_per_batch, flavor="raw")
+    out_count_arr = lltype.malloc(rffi.UINTP.TO, 1, flavor="raw")
+
+    ori = 0
+    out_ptrs[ori] = rffi.cast(rffi.VOIDP, out_pk_lo.base_ptr)
+    ori += 1
+    out_ptrs[ori] = rffi.cast(rffi.VOIDP, out_pk_hi.base_ptr)
+    ori += 1
+    out_ptrs[ori] = rffi.cast(rffi.VOIDP, out_weight.base_ptr)
+    ori += 1
+    out_ptrs[ori] = rffi.cast(rffi.VOIDP, out_null.base_ptr)
+    ori += 1
+    for col_buf in out_cols:
+        out_ptrs[ori] = rffi.cast(rffi.VOIDP, col_buf.base_ptr)
+        ori += 1
+    out_ptrs[ori] = rffi.cast(rffi.VOIDP, out_blob.base_ptr)
+
+    schema_buf = engine_ffi.pack_schema(schema)
+
+    try:
+        rc = engine_ffi._sort_batch(
+            in_ptrs,
+            in_sizes,
+            rffi.cast(rffi.UINT, count),
+            rffi.cast(rffi.UINT, regions_per_batch),
+            rffi.cast(rffi.VOIDP, schema_buf),
+            out_ptrs,
+            out_sizes_arr,
+            out_count_arr,
+        )
+        rc_int = intmask(rc)
+        if rc_int < 0:
+            raise errors.StorageError(
+                "sort_batch failed (error %d)" % rc_int
+            )
+
+        result_count = intmask(out_count_arr[0])
+
+        out_pk_lo.offset = intmask(out_sizes_arr[0])
+        out_pk_hi.offset = intmask(out_sizes_arr[1])
+        out_weight.offset = intmask(out_sizes_arr[2])
+        out_null.offset = intmask(out_sizes_arr[3])
+        oci = 4
+        for col_buf in out_cols:
+            col_buf.offset = intmask(out_sizes_arr[oci])
+            oci += 1
+        out_blob.offset = intmask(out_sizes_arr[oci])
+
+        col_bufs_full = newlist_hint(num_cols)
+        col_strides_full = newlist_hint(num_cols)
+        payload_idx = 0
+        for ci in range(num_cols):
+            if ci == pk_index:
+                col_bufs_full.append(buffer.Buffer(0))
+                col_strides_full.append(0)
+            else:
+                col_bufs_full.append(out_cols[payload_idx])
+                col_strides_full.append(schema.columns[ci].field_type.size)
+                payload_idx += 1
+
+        result = ArenaZSetBatch.from_buffers(
+            schema,
+            out_pk_lo,
+            out_pk_hi,
+            out_weight,
+            out_null,
+            col_bufs_full,
+            col_strides_full,
+            out_blob,
+            result_count,
+            is_sorted=True,
+        )
+        # Do NOT set _consolidated — callers consolidate explicitly
         return result
     finally:
         lltype.free(in_ptrs, flavor="raw")

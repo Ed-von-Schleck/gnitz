@@ -1027,6 +1027,66 @@ pub extern "C" fn gnitz_consolidate_batch(
 }
 
 // ---------------------------------------------------------------------------
+// Single-batch sort (no consolidation)
+// ---------------------------------------------------------------------------
+
+/// Sort a batch by (PK, payload) WITHOUT consolidation.
+/// All input rows are preserved — no weight merging, no ghost elimination.
+#[no_mangle]
+pub extern "C" fn gnitz_sort_batch(
+    in_region_ptrs: *const *const u8,
+    in_region_sizes: *const u32,
+    row_count: u32,
+    regions_per_batch: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    out_region_ptrs: *const *mut u8,
+    out_region_sizes: *mut u32,
+    out_row_count: *mut u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if schema_desc.is_null() || out_region_sizes.is_null() || out_row_count.is_null() {
+            return -1;
+        }
+        let count = row_count as usize;
+        if count == 0 {
+            unsafe { *out_row_count = 0; }
+            return 0;
+        }
+        if in_region_ptrs.is_null() || in_region_sizes.is_null() || out_region_ptrs.is_null() {
+            return -1;
+        }
+
+        let rpb = regions_per_batch as usize;
+        let schema = unsafe { &*schema_desc };
+        let in_ptrs = unsafe { slice::from_raw_parts(in_region_ptrs, rpb) };
+        let in_sizes = unsafe { slice::from_raw_parts(in_region_sizes, rpb) };
+        let out_ptrs = unsafe { slice::from_raw_parts(out_region_ptrs, rpb) };
+        let out_szs = unsafe { slice::from_raw_parts_mut(out_region_sizes, rpb) };
+        let num_payload_cols = schema.num_columns as usize - 1;
+
+        let batch = unsafe {
+            crate::merge::parse_single_batch_from_regions(
+                in_ptrs, in_sizes, count, num_payload_cols,
+            )
+        };
+        let total_blob = batch.blob.len();
+        let blob_cap = if total_blob > 0 { total_blob } else { 1 };
+        let mut writer = unsafe {
+            crate::merge::create_writer_from_regions(
+                out_ptrs, rpb, schema, count, blob_cap,
+            )
+        };
+
+        crate::merge::sort_only(&batch, schema, &mut writer);
+
+        crate::merge::fill_output_sizes(&writer, schema, out_szs);
+        unsafe { *out_row_count = writer.row_count() as u32; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
 // Read cursor (opaque N-way merge cursor)
 // ---------------------------------------------------------------------------
 
