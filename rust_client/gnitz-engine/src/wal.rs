@@ -189,33 +189,6 @@ pub fn validate_and_parse(
 }
 
 // ---------------------------------------------------------------------------
-// Shared I/O helper
-// ---------------------------------------------------------------------------
-
-/// Write all bytes to fd, handling partial writes and EINTR.
-/// Returns 0 on success, -3 on error.
-unsafe fn write_all_fd(fd: c_int, data: &[u8]) -> i32 {
-    let mut written: usize = 0;
-    let total = data.len();
-    while written < total {
-        let ret = libc::write(
-            fd,
-            data[written..].as_ptr() as *const libc::c_void,
-            total - written,
-        );
-        if ret < 0 {
-            let e = *libc::__errno_location();
-            if e == libc::EINTR {
-                continue;
-            }
-            return -3;
-        }
-        written += ret as usize;
-    }
-    0
-}
-
-// ---------------------------------------------------------------------------
 // WAL Writer (file lifecycle)
 // ---------------------------------------------------------------------------
 
@@ -282,7 +255,7 @@ impl WalWriter {
         let block_size = new_offset as usize;
 
         unsafe {
-            let rc = write_all_fd(self.fd, &self.buf[..block_size]);
+            let rc = crate::util::write_all_fd(self.fd, &self.buf[..block_size]);
             if rc < 0 {
                 return rc;
             }

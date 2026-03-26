@@ -1,11 +1,11 @@
 import os
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib import rposix, rposix_stat
+from rpython.rlib import rposix_stat
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128
 from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core import errors
-from gnitz.storage import mmap_posix, engine_ffi
+from gnitz.storage import engine_ffi
 from gnitz.storage.metadata import ManifestEntry
 
 # On-disk entry size (must match Rust ManifestEntryRaw: 208 bytes)
@@ -87,62 +87,54 @@ def _unpack_entries_from_buf(buf, count):
 class ManifestReader(object):
     def __init__(self, filename):
         self.filename = filename
-        self.fd = -1
         self.last_inode = rffi.cast(rffi.ULONGLONG, 0)
         self.last_mtime = 0.0
-        self.version = 0
         self.entry_count = 0
         self.global_max_lsn = r_uint64(0)
+        self._cached_entries = []
         self.reload()
 
     def reload(self):
-        new_fd = rposix.open(self.filename, os.O_RDONLY, 0)
+        out_lsn = lltype.malloc(rffi.ULONGLONGP.TO, 1, flavor="raw")
+        out_entries = lltype.malloc(
+            rffi.CCHARP.TO, MAX_ENTRIES * ENTRY_SIZE, flavor="raw"
+        )
         try:
-            st = rposix_stat.fstat(new_fd)
-            file_size = intmask(st.st_size)
-            if file_size < 64:
-                raise errors.CorruptShardError("Manifest file too small")
-
-            # Read entire file into buffer
-            file_buf = lltype.malloc(rffi.CCHARP.TO, file_size, flavor="raw")
-            try:
-                bytes_read = mmap_posix.read_into_ptr(new_fd, file_buf, file_size)
-                if bytes_read < file_size:
-                    raise errors.CorruptShardError("Manifest read truncated")
-
-                # Parse via Rust
-                out_lsn = lltype.malloc(rffi.ULONGLONGP.TO, 1, flavor="raw")
-                out_entries = lltype.malloc(rffi.CCHARP.TO, MAX_ENTRIES * ENTRY_SIZE, flavor="raw")
-                try:
-                    rc = engine_ffi._manifest_parse(
-                        file_buf, rffi.cast(rffi.LONGLONG, file_size),
-                        out_entries, rffi.cast(rffi.UINT, MAX_ENTRIES),
-                        out_lsn,
-                    )
-                    rc_int = intmask(rc)
-                    if rc_int == -1:
-                        raise errors.CorruptShardError("Manifest magic number mismatch")
-                    elif rc_int < 0:
-                        raise errors.CorruptShardError("Manifest file truncated or corrupt")
-                    self._cached_entries = _unpack_entries_from_buf(out_entries, rc_int)
-                    self.entry_count = rc_int
-                    self.global_max_lsn = r_uint64(out_lsn[0])
-                finally:
-                    lltype.free(out_lsn, flavor="raw")
-                    lltype.free(out_entries, flavor="raw")
-            finally:
-                lltype.free(file_buf, flavor="raw")
-
-            if self.fd != -1:
-                rposix.close(self.fd)
-
-            self.fd = new_fd
+            with rffi.scoped_str2charp(self.filename) as path_c:
+                rc = engine_ffi._manifest_read_file(
+                    path_c,
+                    out_entries,
+                    rffi.cast(rffi.UINT, MAX_ENTRIES),
+                    out_lsn,
+                )
+            rc_int = intmask(rc)
+            if rc_int == -1:
+                raise errors.CorruptShardError(
+                    "Manifest magic number mismatch"
+                )
+            elif rc_int == -2:
+                raise errors.CorruptShardError(
+                    "Manifest file truncated or corrupt"
+                )
+            elif rc_int < 0:
+                raise errors.StorageError(
+                    "Manifest I/O error (error %d)" % rc_int
+                )
+            self._cached_entries = _unpack_entries_from_buf(
+                out_entries, rc_int
+            )
+            self.entry_count = rc_int
+            self.global_max_lsn = r_uint64(out_lsn[0])
+        finally:
+            lltype.free(out_lsn, flavor="raw")
+            lltype.free(out_entries, flavor="raw")
+        # Update stat cache for has_changed()
+        try:
+            st = rposix_stat.stat(self.filename)
             self.last_inode = rffi.cast(rffi.ULONGLONG, st.st_ino)
             self.last_mtime = st.st_mtime
-        except Exception:
-            if new_fd != -1:
-                rposix.close(new_fd)
-            raise
+        except OSError:
+            pass
 
     def has_changed(self):
         try:
@@ -157,9 +149,7 @@ class ManifestReader(object):
             yield e
 
     def close(self):
-        if self.fd != -1:
-            rposix.close(self.fd)
-            self.fd = -1
+        pass
 
 
 class ManifestManager(object):
@@ -173,39 +163,22 @@ class ManifestManager(object):
         return ManifestReader(self.path)
 
     def publish_new_version(self, entries, global_max_lsn=r_uint64(0)):
-        tmp = self.path + ".tmp"
-        count = len(entries)
-
-        # Pack entries into flat C buffer
-        entries_buf, _ = _pack_entries_to_buf(entries)
+        entries_buf, count = _pack_entries_to_buf(entries)
         try:
-            # Compute total size and allocate output
-            total_size = 64 + count * ENTRY_SIZE
-            file_buf = lltype.malloc(rffi.CCHARP.TO, total_size, flavor="raw")
-            try:
-                written = engine_ffi._manifest_serialize(
-                    file_buf, rffi.cast(rffi.LONGLONG, total_size),
-                    entries_buf, rffi.cast(rffi.UINT, count),
+            with rffi.scoped_str2charp(self.path) as path_c:
+                rc = engine_ffi._manifest_write_file(
+                    path_c,
+                    entries_buf,
+                    rffi.cast(rffi.UINT, count),
                     rffi.cast(rffi.ULONGLONG, global_max_lsn),
                 )
-                written_int = intmask(written)
-                if written_int < 0:
-                    raise errors.StorageError("Manifest serialize failed")
-
-                fd = rposix.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-                try:
-                    mmap_posix.write_all(
-                        fd, file_buf, rffi.cast(rffi.SIZE_T, written_int)
-                    )
-                    mmap_posix.fdatasync_c(fd)
-                finally:
-                    rposix.close(fd)
-            finally:
-                lltype.free(file_buf, flavor="raw")
+            rc_int = intmask(rc)
+            if rc_int < 0:
+                raise errors.StorageError(
+                    "Manifest write failed (error %d)" % rc_int
+                )
         finally:
             lltype.free(entries_buf, flavor="raw")
-
-        os.rename(tmp, self.path)
 
 
 class ManifestWriter(object):

@@ -169,6 +169,110 @@ pub fn serialized_size(count: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// File I/O (read + atomic write)
+// ---------------------------------------------------------------------------
+
+/// Read a manifest file from disk, parse it, write entries into `out_entries`.
+///
+/// Returns entry count on success (>= 0), negative on error:
+///   -1 = bad magic (corrupt)
+///   -2 = truncated (corrupt)
+///   -3 = I/O error
+pub fn read_file(
+    path: &std::ffi::CStr,
+    out_entries: &mut [ManifestEntryRaw],
+    max_entries: u32,
+    out_global_max_lsn: &mut u64,
+) -> i32 {
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY, 0);
+        if fd < 0 {
+            return MANIFEST_ERR_IO;
+        }
+
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) < 0 {
+            libc::close(fd);
+            return MANIFEST_ERR_IO;
+        }
+        let file_size = st.st_size as usize;
+
+        if file_size < HEADER_SIZE {
+            libc::close(fd);
+            return MANIFEST_ERR_TRUNCATED;
+        }
+
+        let mut buf = vec![0u8; file_size];
+        let bytes_read = crate::util::read_all_fd(fd, &mut buf);
+        libc::close(fd);
+
+        if bytes_read < 0 || (bytes_read as usize) < file_size {
+            return MANIFEST_ERR_IO;
+        }
+
+        parse(&buf, out_entries, max_entries, out_global_max_lsn)
+    }
+}
+
+/// Serialize entries and write atomically (write .tmp, fdatasync, rename).
+///
+/// Returns 0 on success, negative on error:
+///   -1 = serialize error
+///   -3 = I/O error
+pub fn write_file(
+    path: &std::ffi::CStr,
+    entries: &[ManifestEntryRaw],
+    global_max_lsn: u64,
+) -> i32 {
+    let count = entries.len();
+    let total = serialized_size(count);
+
+    let mut buf = vec![0u8; total];
+    let written = serialize(&mut buf, entries, global_max_lsn);
+    if written < 0 {
+        return -1;
+    }
+
+    let path_bytes = path.to_bytes();
+    let mut tmp_path = Vec::with_capacity(path_bytes.len() + 5);
+    tmp_path.extend_from_slice(path_bytes);
+    tmp_path.extend_from_slice(b".tmp\0");
+    let tmp_cstr = tmp_path.as_ptr() as *const libc::c_char;
+
+    unsafe {
+        let fd = libc::open(
+            tmp_cstr,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644 as libc::mode_t,
+        );
+        if fd < 0 {
+            return MANIFEST_ERR_IO;
+        }
+
+        let rc = crate::util::write_all_fd(fd, &buf[..written as usize]);
+        if rc < 0 {
+            libc::close(fd);
+            return MANIFEST_ERR_IO;
+        }
+
+        if libc::fdatasync(fd) < 0 {
+            libc::close(fd);
+            return MANIFEST_ERR_IO;
+        }
+
+        libc::close(fd);
+
+        if libc::rename(tmp_cstr, path.as_ptr()) < 0 {
+            return MANIFEST_ERR_IO;
+        }
+    }
+
+    0
+}
+
+pub const MANIFEST_ERR_IO: i32 = -3;
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -307,5 +411,63 @@ mod tests {
         let end = out[0].filename.iter().position(|&b| b == 0).unwrap_or(128);
         let name = std::str::from_utf8(&out[0].filename[..end]).unwrap();
         assert_eq!(name, "hello.db");
+    }
+
+    // --- File I/O tests ---
+
+    #[test]
+    fn write_read_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        let entries = vec![
+            make_entry(1, "shard_1.db"),
+            make_entry(2, "shard_2.db"),
+            make_entry(3, "shard_3.db"),
+        ];
+
+        let rc = write_file(&cpath, &entries, 99);
+        assert_eq!(rc, 0);
+        assert!(path.exists());
+
+        let mut out = vec![ManifestEntryRaw::zeroed(); 8];
+        let mut lsn = 0u64;
+        let count = read_file(&cpath, &mut out, 8, &mut lsn);
+        assert_eq!(count, 3);
+        assert_eq!(lsn, 99);
+        assert_eq!(out[0].table_id, 1);
+        assert_eq!(out[1].table_id, 2);
+        assert_eq!(out[2].table_id, 3);
+        assert_eq!(out[0].level, 1);
+        assert_eq!(out[0].guard_key_lo, 42);
+    }
+
+    #[test]
+    fn read_file_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("DOES_NOT_EXIST");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        let mut out = vec![ManifestEntryRaw::zeroed(); 1];
+        let mut lsn = 0u64;
+        let rc = read_file(&cpath, &mut out, 1, &mut lsn);
+        assert_eq!(rc, MANIFEST_ERR_IO);
+    }
+
+    #[test]
+    fn write_file_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST_EMPTY");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        let rc = write_file(&cpath, &[], 42);
+        assert_eq!(rc, 0);
+
+        let mut out = vec![ManifestEntryRaw::zeroed(); 1];
+        let mut lsn = 0u64;
+        let count = read_file(&cpath, &mut out, 1, &mut lsn);
+        assert_eq!(count, 0);
+        assert_eq!(lsn, 42);
     }
 }

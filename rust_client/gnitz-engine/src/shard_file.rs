@@ -153,24 +153,11 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
             return -3;
         }
 
-        // Write all bytes (loop handles partial writes / EINTR)
-        let mut written: usize = 0;
-        let total = image.len();
-        while written < total {
-            let ret = libc::write(
-                fd,
-                image[written..].as_ptr() as *const libc::c_void,
-                total - written,
-            );
-            if ret < 0 {
-                let e = *libc::__errno_location();
-                if e == libc::EINTR {
-                    continue;
-                }
-                libc::close(fd);
-                return -3;
-            }
-            written += ret as usize;
+        // Write all bytes
+        let rc = crate::util::write_all_fd(fd, image);
+        if rc < 0 {
+            libc::close(fd);
+            return -3;
         }
 
         // Durability: fdatasync (data-only, no metadata sync)

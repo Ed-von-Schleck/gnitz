@@ -88,6 +88,15 @@ eci = ExternalCompilationInfo(
         "  uint32_t table_id, uint32_t row_count,"
         "  void **region_ptrs, uint32_t *region_sizes,"
         "  uint32_t num_regions, int32_t durable);",
+        # manifest file I/O
+        "int32_t gnitz_manifest_read_file("
+        "  const char *path,"
+        "  uint8_t *out_entries, uint32_t max_entries,"
+        "  uint64_t *out_global_max_lsn);",
+        "int32_t gnitz_manifest_write_file("
+        "  const char *path,"
+        "  const uint8_t *entries_buf, uint32_t count,"
+        "  uint64_t global_max_lsn);",
         # compaction
         "int32_t gnitz_compact_shards("
         "  char **input_files, uint32_t num_inputs,"
@@ -437,6 +446,28 @@ _wal_reader_close = rffi.llexternal(
     "gnitz_wal_reader_close",
     [rffi.VOIDP],
     lltype.Void,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Manifest file I/O
+# ---------------------------------------------------------------------------
+
+_manifest_read_file = rffi.llexternal(
+    "gnitz_manifest_read_file",
+    [rffi.CCHARP,
+     rffi.CCHARP, rffi.UINT,
+     rffi.ULONGLONGP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_manifest_write_file = rffi.llexternal(
+    "gnitz_manifest_write_file",
+    [rffi.CCHARP,
+     rffi.CCHARP, rffi.UINT,
+     rffi.ULONGLONG],
+    rffi.INT,
     compilation_info=eci,
 )
 

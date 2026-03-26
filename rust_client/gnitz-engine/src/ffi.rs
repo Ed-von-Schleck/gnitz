@@ -506,6 +506,71 @@ pub extern "C" fn gnitz_manifest_parse(
 }
 
 // ---------------------------------------------------------------------------
+// Manifest file I/O
+// ---------------------------------------------------------------------------
+
+/// Read a manifest file from disk. Returns entry count (>= 0) on success,
+/// negative on error: -1 = bad magic, -2 = truncated, -3 = I/O error.
+#[no_mangle]
+pub extern "C" fn gnitz_manifest_read_file(
+    path: *const libc::c_char,
+    out_entries: *mut u8,
+    max_entries: u32,
+    out_global_max_lsn: *mut u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if path.is_null() || out_global_max_lsn.is_null() {
+            return -1;
+        }
+        let cpath = unsafe { CStr::from_ptr(path) };
+        let lsn = unsafe { &mut *out_global_max_lsn };
+        let max = max_entries as usize;
+        let entries = if max > 0 && !out_entries.is_null() {
+            unsafe {
+                slice::from_raw_parts_mut(
+                    out_entries as *mut crate::manifest::ManifestEntryRaw,
+                    max,
+                )
+            }
+        } else {
+            &mut []
+        };
+        crate::manifest::read_file(cpath, entries, max_entries, lsn)
+    });
+    result.unwrap_or(crate::manifest::MANIFEST_ERR_IO)
+}
+
+/// Write manifest entries atomically (serialize + .tmp + fdatasync + rename).
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_manifest_write_file(
+    path: *const libc::c_char,
+    entries_buf: *const u8,
+    count: u32,
+    global_max_lsn: u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if path.is_null() {
+            return -1;
+        }
+        let cpath = unsafe { CStr::from_ptr(path) };
+        let n = count as usize;
+        let entries = if n > 0 && !entries_buf.is_null() {
+            unsafe {
+                slice::from_raw_parts(
+                    entries_buf as *const crate::manifest::ManifestEntryRaw,
+                    n,
+                )
+            }
+        } else {
+            &[]
+        };
+        crate::manifest::write_file(cpath, entries, global_max_lsn)
+    });
+    result.unwrap_or(crate::manifest::MANIFEST_ERR_IO)
+}
+
+// ---------------------------------------------------------------------------
 // WAL writer lifecycle
 // ---------------------------------------------------------------------------
 
@@ -1013,6 +1078,20 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(lsn, 99);
         assert_eq!(out[0].table_id, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Manifest file I/O null safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn manifest_read_file_null_safety() {
+        assert_eq!(gnitz_manifest_read_file(ptr::null(), ptr::null_mut(), 0, ptr::null_mut()), -1);
+    }
+
+    #[test]
+    fn manifest_write_file_null_safety() {
+        assert_eq!(gnitz_manifest_write_file(ptr::null(), ptr::null(), 0, 0), -1);
     }
 
     // -----------------------------------------------------------------------
