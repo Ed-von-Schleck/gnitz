@@ -5,10 +5,6 @@
 
 use std::cmp::Ordering;
 
-// ---------------------------------------------------------------------------
-// HeapNode + MergeHeap
-// ---------------------------------------------------------------------------
-
 pub struct HeapNode {
     pub key: u128,
     pub idx: usize,
@@ -18,6 +14,15 @@ pub struct MergeHeap {
     pub heap: Vec<HeapNode>,
     pub pos_map: Vec<i32>,
     pub min_indices: Vec<usize>,
+}
+
+#[inline]
+fn swap_entries(heap: &mut [HeapNode], pos_map: &mut [i32], a: usize, b: usize) {
+    let ai = heap[a].idx;
+    let bi = heap[b].idx;
+    heap.swap(a, b);
+    pos_map[ai] = b as i32;
+    pos_map[bi] = a as i32;
 }
 
 impl MergeHeap {
@@ -44,13 +49,11 @@ impl MergeHeap {
         let mut h = MergeHeap {
             heap,
             pos_map,
-            min_indices: Vec::with_capacity(n),
+            min_indices: Vec::with_capacity(8),
         };
         let size = h.heap.len();
-        if size > 1 {
-            for i in (0..size / 2).rev() {
-                Self::sift_down_static(&mut h.heap, &mut h.pos_map, i, &less);
-            }
+        for i in (0..size / 2).rev() {
+            Self::sift_down_static(&mut h.heap, &mut h.pos_map, i, &less);
         }
         h
     }
@@ -75,50 +78,42 @@ impl MergeHeap {
     }
 
     /// Sift down operating on heap/pos_map directly — avoids &mut self borrow conflicts.
+    #[inline]
     pub fn sift_down_static(
-        heap: &mut Vec<HeapNode>,
-        pos_map: &mut Vec<i32>,
+        heap: &mut [HeapNode],
+        pos_map: &mut [i32],
         mut idx: usize,
         less: &impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
+        let len = heap.len();
         loop {
-            let mut smallest = idx;
             let left = 2 * idx + 1;
-            let right = 2 * idx + 2;
-            if left < heap.len() && less(&heap[left], &heap[smallest]) {
-                smallest = left;
-            }
-            if right < heap.len() && less(&heap[right], &heap[smallest]) {
-                smallest = right;
-            }
-            if smallest != idx {
-                let ci = heap[idx].idx;
-                let cs = heap[smallest].idx;
-                heap.swap(idx, smallest);
-                pos_map[ci] = smallest as i32;
-                pos_map[cs] = idx as i32;
-                idx = smallest;
-            } else {
+            if left >= len {
                 break;
             }
+            let right = left + 1;
+            let child =
+                if right < len && less(&heap[right], &heap[left]) { right } else { left };
+            if !less(&heap[child], &heap[idx]) {
+                break;
+            }
+            swap_entries(heap, pos_map, idx, child);
+            idx = child;
         }
     }
 
     /// Sift up operating on heap/pos_map directly.
+    #[inline]
     pub fn sift_up_static(
-        heap: &mut Vec<HeapNode>,
-        pos_map: &mut Vec<i32>,
+        heap: &mut [HeapNode],
+        pos_map: &mut [i32],
         mut idx: usize,
         less: &impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
         while idx > 0 {
             let parent = (idx - 1) / 2;
             if less(&heap[idx], &heap[parent]) {
-                let ci = heap[idx].idx;
-                let cp = heap[parent].idx;
-                heap.swap(idx, parent);
-                pos_map[ci] = parent as i32;
-                pos_map[cp] = idx as i32;
+                swap_entries(heap, pos_map, idx, parent);
                 idx = parent;
             } else {
                 break;
@@ -128,7 +123,11 @@ impl MergeHeap {
 
     /// Advance a cursor/entry.  If `new_key` is `None` the entry is
     /// exhausted and removed from the heap; otherwise its key is updated
-    /// and the heap re-established.
+    /// and sifted down.
+    ///
+    /// Only sift-down is needed on the `Some` path: all callers are merge
+    /// cursors advancing through sorted input, so the new key is always
+    /// >= the old key.  Do NOT add sift-up here.
     pub fn advance(
         &mut self,
         entry_idx: usize,
@@ -143,7 +142,9 @@ impl MergeHeap {
 
         match new_key {
             None => {
-                // Remove from heap
+                // Removal: move last element into the vacated slot.  The
+                // replacement has no ordering relationship to its new
+                // neighbors, so both sift-down and sift-up are needed.
                 self.pos_map[entry_idx] = -1;
                 let last = self.heap.len() - 1;
                 if heap_idx != last {
@@ -180,30 +181,27 @@ impl MergeHeap {
         if self.heap.is_empty() {
             return 0;
         }
-        Self::collect_equal_static(&mut self.min_indices, &self.heap, 0, eq_root);
+        let heap = &self.heap;
+        let mut stack = [0usize; 64];
+        let mut sp = 1;
+        stack[0] = 0;
+        while sp > 0 {
+            sp -= 1;
+            let idx = stack[sp];
+            if idx == 0 || eq_root(&heap[idx], &heap[0]) == Ordering::Equal {
+                self.min_indices.push(heap[idx].idx);
+                let right = 2 * idx + 2;
+                if right < heap.len() {
+                    stack[sp] = right;
+                    sp += 1;
+                }
+                let left = 2 * idx + 1;
+                if left < heap.len() {
+                    stack[sp] = left;
+                    sp += 1;
+                }
+            }
+        }
         self.min_indices.len()
-    }
-
-    fn collect_equal_static(
-        min_indices: &mut Vec<usize>,
-        heap: &[HeapNode],
-        idx: usize,
-        eq_root: &impl Fn(&HeapNode, &HeapNode) -> Ordering,
-    ) {
-        if idx >= heap.len() {
-            return;
-        }
-        if idx == 0 || eq_root(&heap[idx], &heap[0]) == Ordering::Equal {
-            min_indices.push(heap[idx].idx);
-            let left = 2 * idx + 1;
-            let right = 2 * idx + 2;
-            if left < heap.len() {
-                Self::collect_equal_static(min_indices, heap, left, eq_root);
-            }
-            if right < heap.len() {
-                Self::collect_equal_static(min_indices, heap, right, eq_root);
-            }
-        }
-        // If > root, prune entire subtree
     }
 }
