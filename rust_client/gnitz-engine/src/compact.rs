@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 
+use crate::columnar;
+use crate::heap::MergeHeap;
 use crate::shard_reader::MappedShard;
 use crate::util::{read_u32_le, read_u64_le};
 use crate::xxh;
@@ -29,7 +31,7 @@ pub(crate) mod type_code {
     pub const STRING: u8 = 11;
     pub const U128: u8 = 12;
 }
-use type_code::{F32 as TYPE_F32, F64 as TYPE_F64, STRING as TYPE_STRING, U128 as TYPE_U128};
+use type_code::STRING as TYPE_STRING;
 #[cfg(test)]
 use type_code::{I64 as TYPE_I64, U64 as TYPE_U64};
 
@@ -149,93 +151,6 @@ impl ShardCursor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Row comparison
-// ---------------------------------------------------------------------------
-
-fn compare_rows(
-    schema: &SchemaDescriptor,
-    shards: &[MappedShard],
-    shard_a: usize,
-    row_a: usize,
-    shard_b: usize,
-    row_b: usize,
-) -> std::cmp::Ordering {
-    let sa = &shards[shard_a];
-    let sb = &shards[shard_b];
-    let pk_index = schema.pk_index as usize;
-    let mut payload_col_a: usize = 0;
-    let mut payload_col_b: usize = 0;
-
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_index {
-            continue;
-        }
-
-        // Null comparison: null < non-null, null == null
-        let null_a = is_null(sa, row_a, ci, pk_index);
-        let null_b = is_null(sb, row_b, ci, pk_index);
-        if null_a && null_b {
-            payload_col_a += 1;
-            payload_col_b += 1;
-            continue;
-        }
-        if null_a {
-            return std::cmp::Ordering::Less;
-        }
-        if null_b {
-            return std::cmp::Ordering::Greater;
-        }
-
-        let col = &schema.columns[ci];
-        let col_size = col.size as usize;
-
-        let ord = match col.type_code {
-            TYPE_STRING => {
-                let ptr_a = sa.get_col_ptr(row_a, payload_col_a, 16);
-                let ptr_b = sb.get_col_ptr(row_b, payload_col_b, 16);
-                compare_german_strings(ptr_a, sa.blob_slice(), ptr_b, sb.blob_slice())
-            }
-            TYPE_U128 => {
-                let ba = sa.get_col_ptr(row_a, payload_col_a, 16);
-                let bb = sb.get_col_ptr(row_b, payload_col_b, 16);
-                let va = ((read_u64_le(ba, 8) as u128) << 64) | (read_u64_le(ba, 0) as u128);
-                let vb = ((read_u64_le(bb, 8) as u128) << 64) | (read_u64_le(bb, 0) as u128);
-                va.cmp(&vb)
-            }
-            TYPE_F64 => {
-                let ba = sa.get_col_ptr(row_a, payload_col_a, 8);
-                let bb = sb.get_col_ptr(row_b, payload_col_b, 8);
-                let va = f64::from_bits(read_u64_le(ba, 0));
-                let vb = f64::from_bits(read_u64_le(bb, 0));
-                va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
-            }
-            TYPE_F32 => {
-                let ba = sa.get_col_ptr(row_a, payload_col_a, 4);
-                let bb = sb.get_col_ptr(row_b, payload_col_b, 4);
-                let va = f32::from_bits(read_u32_le(ba, 0));
-                let vb = f32::from_bits(read_u32_le(bb, 0));
-                va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
-            }
-            _ => {
-                // Signed integer comparison for all int types
-                let va = read_signed(sa.get_col_ptr(row_a, payload_col_a, col_size), col_size);
-                let vb = read_signed(sb.get_col_ptr(row_b, payload_col_b, col_size), col_size);
-                va.cmp(&vb)
-            }
-        };
-
-        payload_col_a += 1;
-        payload_col_b += 1;
-
-        if ord != std::cmp::Ordering::Equal {
-            return ord;
-        }
-    }
-
-    std::cmp::Ordering::Equal
-}
-
 fn is_null(shard: &MappedShard, row: usize, col_idx: usize, pk_index: usize) -> bool {
     let null_word = shard.get_null_word(row);
     let payload_idx = if col_idx < pk_index { col_idx } else { col_idx - 1 };
@@ -295,213 +210,6 @@ pub(crate) fn string_byte(struct_bytes: &[u8], blob: &[u8], length: usize, i: us
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tournament tree (min-heap with u128 keys)
-// ---------------------------------------------------------------------------
-
-struct HeapNode {
-    key: u128,
-    cursor_idx: usize,
-}
-
-struct TournamentTree {
-    heap: Vec<HeapNode>,
-    pos_map: Vec<i32>,       // cursor_idx → heap position (-1 if not in heap)
-    min_indices: Vec<usize>,  // reusable buffer for collect_min results
-}
-
-impl TournamentTree {
-    fn build(cursors: &[ShardCursor], shards: &[MappedShard]) -> Self {
-        let n = cursors.len();
-        let mut heap = Vec::with_capacity(n);
-        let mut pos_map = vec![-1i32; n];
-
-        for i in 0..n {
-            if cursors[i].is_valid() {
-                let idx = heap.len();
-                pos_map[i] = idx as i32;
-                heap.push(HeapNode {
-                    key: cursors[i].peek_key(&shards[cursors[i].shard_idx]),
-                    cursor_idx: i,
-                });
-            }
-        }
-
-        let mut tree = TournamentTree {
-            heap,
-            pos_map,
-            min_indices: Vec::with_capacity(n),
-        };
-        // Build heap (bottom-up)
-        let size = tree.heap.len();
-        if size > 1 {
-            for i in (0..size / 2).rev() {
-                tree.sift_down(i);
-            }
-        }
-        tree
-    }
-
-    fn is_empty(&self) -> bool {
-        self.heap.is_empty()
-    }
-
-    fn min_key(&self) -> u128 {
-        if self.heap.is_empty() { u128::MAX } else { self.heap[0].key }
-    }
-
-    fn collect_min_indices(
-        &mut self,
-        shards: &[MappedShard],
-        cursors: &[ShardCursor],
-        schema: &SchemaDescriptor,
-    ) -> usize {
-        self.min_indices.clear();
-        if self.heap.is_empty() {
-            return 0;
-        }
-        self.collect_equal(0, shards, cursors, schema);
-        self.min_indices.len()
-    }
-
-    fn collect_equal(
-        &mut self,
-        idx: usize,
-        shards: &[MappedShard],
-        cursors: &[ShardCursor],
-        schema: &SchemaDescriptor,
-    ) {
-        if idx >= self.heap.len() {
-            return;
-        }
-        // Compare this node to root (node 0)
-        if idx == 0 || self.compare_to_root(idx, shards, cursors, schema) == std::cmp::Ordering::Equal {
-            self.min_indices.push(self.heap[idx].cursor_idx);
-            let left = 2 * idx + 1;
-            let right = 2 * idx + 2;
-            // Must call with concrete indices to avoid borrow issues
-            if left < self.heap.len() {
-                self.collect_equal(left, shards, cursors, schema);
-            }
-            if right < self.heap.len() {
-                self.collect_equal(right, shards, cursors, schema);
-            }
-        }
-        // If > root, prune entire subtree
-    }
-
-    fn compare_to_root(
-        &self,
-        idx: usize,
-        shards: &[MappedShard],
-        cursors: &[ShardCursor],
-        schema: &SchemaDescriptor,
-    ) -> std::cmp::Ordering {
-        let a = &self.heap[idx];
-        let b = &self.heap[0];
-        // Primary key comparison
-        let key_ord = a.key.cmp(&b.key);
-        if key_ord != std::cmp::Ordering::Equal {
-            return key_ord;
-        }
-        // Payload comparison
-        let ca = &cursors[a.cursor_idx];
-        let cb = &cursors[b.cursor_idx];
-        compare_rows(
-            schema, shards,
-            ca.shard_idx, ca.position,
-            cb.shard_idx, cb.position,
-        )
-    }
-
-    fn advance_cursor(
-        &mut self,
-        cursor_idx: usize,
-        cursors: &mut [ShardCursor],
-        shards: &[MappedShard],
-    ) {
-        let heap_idx = self.pos_map[cursor_idx];
-        if heap_idx < 0 {
-            return;
-        }
-        let heap_idx = heap_idx as usize;
-
-        let shard = &shards[cursors[cursor_idx].shard_idx];
-        cursors[cursor_idx].advance(shard);
-
-        if !cursors[cursor_idx].is_valid() {
-            // Remove from heap
-            self.pos_map[cursor_idx] = -1;
-            let last = self.heap.len() - 1;
-            if heap_idx != last {
-                let last_cursor = self.heap[last].cursor_idx;
-                self.heap[heap_idx] = HeapNode {
-                    key: self.heap[last].key,
-                    cursor_idx: last_cursor,
-                };
-                self.pos_map[last_cursor] = heap_idx as i32;
-                self.heap.pop();
-                if !self.heap.is_empty() && heap_idx < self.heap.len() {
-                    self.sift_down(heap_idx);
-                    self.sift_up(heap_idx);
-                }
-            } else {
-                self.heap.pop();
-            }
-        } else {
-            // Update key and sift down (new key > old key, can only move down)
-            let shard = &shards[cursors[cursor_idx].shard_idx];
-            self.heap[heap_idx].key = cursors[cursor_idx].peek_key(shard);
-            self.sift_down(heap_idx);
-        }
-    }
-
-    /// Key-only comparison for heap ordering. Payload comparison is separate
-    /// (only needed in collect_min_indices for deduplication).
-    fn key_less(&self, i: usize, j: usize) -> bool {
-        self.heap[i].key < self.heap[j].key
-    }
-
-    fn sift_down(&mut self, mut idx: usize) {
-        loop {
-            let mut smallest = idx;
-            let left = 2 * idx + 1;
-            let right = 2 * idx + 2;
-            if left < self.heap.len() && self.key_less(left, smallest) {
-                smallest = left;
-            }
-            if right < self.heap.len() && self.key_less(right, smallest) {
-                smallest = right;
-            }
-            if smallest != idx {
-                let ci = self.heap[idx].cursor_idx;
-                let cs = self.heap[smallest].cursor_idx;
-                self.heap.swap(idx, smallest);
-                self.pos_map[ci] = smallest as i32;
-                self.pos_map[cs] = idx as i32;
-                idx = smallest;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn sift_up(&mut self, mut idx: usize) {
-        while idx > 0 {
-            let parent = (idx - 1) / 2;
-            if self.key_less(idx, parent) {
-                let ci = self.heap[idx].cursor_idx;
-                let cp = self.heap[parent].cursor_idx;
-                self.heap.swap(idx, parent);
-                self.pos_map[ci] = parent as i32;
-                self.pos_map[cp] = idx as i32;
-                idx = parent;
-            } else {
-                break;
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Shard writer (compaction-internal, row-at-a-time from MappedShard)
@@ -716,8 +424,23 @@ pub fn compact_shards(
         cursors.push(ShardCursor::new(i, &shards[i]));
     }
 
-    // Build tournament tree
-    let mut tree = TournamentTree::build(&cursors, &shards);
+    // Key-only comparison for heap ordering
+    let key_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> bool {
+        a.key < b.key
+    };
+
+    // Build heap (key-only ordering for compact)
+    let mut tree = MergeHeap::build(
+        cursors.len(),
+        |i| {
+            if cursors[i].is_valid() {
+                Some(cursors[i].peek_key(&shards[cursors[i].shard_idx]))
+            } else {
+                None
+            }
+        },
+        &key_less,
+    );
 
     // Create writer
     let mut writer = ShardWriter::new(schema);
@@ -726,7 +449,23 @@ pub fn compact_shards(
     let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
     while !tree.is_empty() {
         let min_key = tree.min_key();
-        let num_min = tree.collect_min_indices(&shards, &cursors, schema);
+
+        // collect_min_indices: compare (key, payload) to root
+        let num_min = tree.collect_min_indices(
+            &|a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> std::cmp::Ordering {
+                let key_ord = a.key.cmp(&b.key);
+                if key_ord != std::cmp::Ordering::Equal {
+                    return key_ord;
+                }
+                let ca = &cursors[a.idx];
+                let cb = &cursors[b.idx];
+                columnar::compare_rows(
+                    schema,
+                    &shards[ca.shard_idx], ca.position,
+                    &shards[cb.shard_idx], cb.position,
+                )
+            },
+        );
 
         let mut net_weight: i64 = 0;
         for i in 0..num_min {
@@ -745,7 +484,14 @@ pub fn compact_shards(
         advance_buf.clear();
         advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
         for &ci in &advance_buf {
-            tree.advance_cursor(ci, &mut cursors, &shards);
+            let shard = &shards[cursors[ci].shard_idx];
+            cursors[ci].advance(shard);
+            let new_key = if cursors[ci].is_valid() {
+                Some(cursors[ci].peek_key(&shards[cursors[ci].shard_idx]))
+            } else {
+                None
+            };
+            tree.advance(ci, new_key, &key_less);
         }
     }
 
@@ -784,8 +530,23 @@ pub fn merge_and_route(
         cursors.push(ShardCursor::new(i, &shards[i]));
     }
 
-    // Build tournament tree
-    let mut tree = TournamentTree::build(&cursors, &shards);
+    // Key-only comparison for heap ordering
+    let key_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> bool {
+        a.key < b.key
+    };
+
+    // Build heap
+    let mut tree = MergeHeap::build(
+        cursors.len(),
+        |i| {
+            if cursors[i].is_valid() {
+                Some(cursors[i].peek_key(&shards[cursors[i].shard_idx]))
+            } else {
+                None
+            }
+        },
+        &key_less,
+    );
 
     // Create writers (one per guard)
     let mut writers: Vec<ShardWriter> = Vec::with_capacity(num_guards);
@@ -807,7 +568,22 @@ pub fn merge_and_route(
     let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
     while !tree.is_empty() {
         let min_key = tree.min_key();
-        let num_min = tree.collect_min_indices(&shards, &cursors, schema);
+
+        let num_min = tree.collect_min_indices(
+            &|a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> std::cmp::Ordering {
+                let key_ord = a.key.cmp(&b.key);
+                if key_ord != std::cmp::Ordering::Equal {
+                    return key_ord;
+                }
+                let ca = &cursors[a.idx];
+                let cb = &cursors[b.idx];
+                columnar::compare_rows(
+                    schema,
+                    &shards[ca.shard_idx], ca.position,
+                    &shards[cb.shard_idx], cb.position,
+                )
+            },
+        );
 
         let mut net_weight: i64 = 0;
         for i in 0..num_min {
@@ -826,7 +602,14 @@ pub fn merge_and_route(
         advance_buf.clear();
         advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
         for &ci in &advance_buf {
-            tree.advance_cursor(ci, &mut cursors, &shards);
+            let shard = &shards[cursors[ci].shard_idx];
+            cursors[ci].advance(shard);
+            let new_key = if cursors[ci].is_valid() {
+                Some(cursors[ci].peek_key(&shards[cursors[ci].shard_idx]))
+            } else {
+                None
+            };
+            tree.advance(ci, new_key, &key_less);
         }
     }
 

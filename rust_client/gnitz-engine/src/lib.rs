@@ -7,6 +7,8 @@ pub mod manifest;
 pub mod layout;
 pub mod shard_reader;
 pub mod shard_file;
+pub mod columnar;
+pub mod heap;
 pub mod compact;
 pub mod merge;
 pub mod read_cursor;

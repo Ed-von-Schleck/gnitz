@@ -7,13 +7,11 @@
 use std::cmp::Ordering;
 use std::ptr;
 
-use crate::compact::{
-    compare_german_strings, read_signed, SchemaDescriptor,
-    type_code::{F32 as TYPE_F32, F64 as TYPE_F64, STRING as TYPE_STRING, U128 as TYPE_U128},
-};
+use crate::columnar::{self, ColumnarSource};
+use crate::compact::SchemaDescriptor;
+use crate::heap::MergeHeap;
 use crate::merge::MemBatch;
 use crate::shard_reader::MappedShard;
-use crate::util::{read_u32_le, read_u64_le};
 
 // ---------------------------------------------------------------------------
 // CursorSource — unified access to batch buffers or shard mmap
@@ -129,6 +127,21 @@ impl<'a> CursorSource<'a> {
     }
 }
 
+impl<'a> ColumnarSource for CursorSource<'a> {
+    #[inline]
+    fn get_null_word(&self, row: usize) -> u64 {
+        CursorSource::get_null_word(self, row)
+    }
+    #[inline]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        CursorSource::get_col_ptr(self, row, payload_col, col_size)
+    }
+    #[inline]
+    fn blob_slice(&self) -> &[u8] {
+        CursorSource::blob_slice(self)
+    }
+}
+
 #[inline]
 fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
     if a_hi != b_hi {
@@ -136,93 +149,6 @@ fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
     } else {
         a_lo < b_lo
     }
-}
-
-// ---------------------------------------------------------------------------
-// Row comparison across CursorSources
-// ---------------------------------------------------------------------------
-
-fn compare_cursor_rows(
-    schema: &SchemaDescriptor,
-    src_a: &CursorSource,
-    row_a: usize,
-    src_b: &CursorSource,
-    row_b: usize,
-) -> Ordering {
-    let pk_index = schema.pk_index as usize;
-    let null_word_a = src_a.get_null_word(row_a);
-    let null_word_b = src_b.get_null_word(row_b);
-    let mut payload_col: usize = 0;
-
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_index {
-            continue;
-        }
-
-        let null_a = (null_word_a >> payload_col) & 1 != 0;
-        let null_b = (null_word_b >> payload_col) & 1 != 0;
-        if null_a && null_b {
-            payload_col += 1;
-            continue;
-        }
-        if null_a {
-            return Ordering::Less;
-        }
-        if null_b {
-            return Ordering::Greater;
-        }
-
-        let col = &schema.columns[ci];
-        let col_size = col.size as usize;
-
-        let ord = match col.type_code {
-            TYPE_STRING => {
-                let ptr_a = src_a.get_col_ptr(row_a, payload_col, 16);
-                let ptr_b = src_b.get_col_ptr(row_b, payload_col, 16);
-                compare_german_strings(ptr_a, src_a.blob_slice(), ptr_b, src_b.blob_slice())
-            }
-            TYPE_U128 => {
-                let ba = src_a.get_col_ptr(row_a, payload_col, 16);
-                let bb = src_b.get_col_ptr(row_b, payload_col, 16);
-                let va = ((read_u64_le(ba, 8) as u128) << 64) | (read_u64_le(ba, 0) as u128);
-                let vb = ((read_u64_le(bb, 8) as u128) << 64) | (read_u64_le(bb, 0) as u128);
-                va.cmp(&vb)
-            }
-            TYPE_F64 => {
-                let ba = src_a.get_col_ptr(row_a, payload_col, 8);
-                let bb = src_b.get_col_ptr(row_b, payload_col, 8);
-                let va = f64::from_bits(read_u64_le(ba, 0));
-                let vb = f64::from_bits(read_u64_le(bb, 0));
-                va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
-            }
-            TYPE_F32 => {
-                let ba = src_a.get_col_ptr(row_a, payload_col, 4);
-                let bb = src_b.get_col_ptr(row_b, payload_col, 4);
-                let va = f32::from_bits(read_u32_le(ba, 0));
-                let vb = f32::from_bits(read_u32_le(bb, 0));
-                va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
-            }
-            _ => {
-                let va = read_signed(
-                    src_a.get_col_ptr(row_a, payload_col, col_size),
-                    col_size,
-                );
-                let vb = read_signed(
-                    src_b.get_col_ptr(row_b, payload_col, col_size),
-                    col_size,
-                );
-                va.cmp(&vb)
-            }
-        };
-
-        payload_col += 1;
-
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-
-    Ordering::Equal
 }
 
 // ---------------------------------------------------------------------------
@@ -309,239 +235,12 @@ impl<'a> ReadCursorEntry<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// CursorTree — min-heap for N-way merge (payload-aware ordering)
-// ---------------------------------------------------------------------------
-
-struct HeapNode {
-    key: u128,
-    entry_idx: usize,
-}
-
-struct CursorTree {
-    heap: Vec<HeapNode>,
-    pos_map: Vec<i32>,
-    min_indices: Vec<usize>,
-}
-
-impl CursorTree {
-    fn build(
-        entries: &[ReadCursorEntry],
-        schema: &SchemaDescriptor,
-    ) -> Self {
-        let n = entries.len();
-        let mut heap = Vec::with_capacity(n);
-        let mut pos_map = vec![-1i32; n];
-
-        for i in 0..n {
-            if entries[i].is_valid() {
-                let idx = heap.len();
-                pos_map[i] = idx as i32;
-                heap.push(HeapNode {
-                    key: entries[i].peek_key(),
-                    entry_idx: i,
-                });
-            }
-        }
-
-        let mut tree = CursorTree {
-            heap,
-            pos_map,
-            min_indices: Vec::with_capacity(n),
-        };
-        let size = tree.heap.len();
-        if size > 1 {
-            for i in (0..size / 2).rev() {
-                tree.sift_down(i, entries, schema);
-            }
-        }
-        tree
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.heap.is_empty()
-    }
-
-    #[inline]
-    fn node_less(
-        &self,
-        i: usize,
-        j: usize,
-        entries: &[ReadCursorEntry],
-        schema: &SchemaDescriptor,
-    ) -> bool {
-        let ki = self.heap[i].key;
-        let kj = self.heap[j].key;
-        if ki != kj {
-            return ki < kj;
-        }
-        let ei = self.heap[i].entry_idx;
-        let ej = self.heap[j].entry_idx;
-        compare_cursor_rows(
-            schema,
-            &entries[ei].source,
-            entries[ei].position,
-            &entries[ej].source,
-            entries[ej].position,
-        ) == Ordering::Less
-    }
-
-    fn sift_down(
-        &mut self,
-        mut idx: usize,
-        entries: &[ReadCursorEntry],
-        schema: &SchemaDescriptor,
-    ) {
-        loop {
-            let mut smallest = idx;
-            let left = 2 * idx + 1;
-            let right = 2 * idx + 2;
-            if left < self.heap.len() && self.node_less(left, smallest, entries, schema) {
-                smallest = left;
-            }
-            if right < self.heap.len() && self.node_less(right, smallest, entries, schema) {
-                smallest = right;
-            }
-            if smallest != idx {
-                let ci = self.heap[idx].entry_idx;
-                let cs = self.heap[smallest].entry_idx;
-                self.heap.swap(idx, smallest);
-                self.pos_map[ci] = smallest as i32;
-                self.pos_map[cs] = idx as i32;
-                idx = smallest;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn sift_up(
-        &mut self,
-        mut idx: usize,
-        entries: &[ReadCursorEntry],
-        schema: &SchemaDescriptor,
-    ) {
-        while idx > 0 {
-            let parent = (idx - 1) / 2;
-            if self.node_less(idx, parent, entries, schema) {
-                let ci = self.heap[idx].entry_idx;
-                let cp = self.heap[parent].entry_idx;
-                self.heap.swap(idx, parent);
-                self.pos_map[ci] = parent as i32;
-                self.pos_map[cp] = idx as i32;
-                idx = parent;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn collect_min_indices(
-        &mut self,
-        entries: &[ReadCursorEntry],
-        schema: &SchemaDescriptor,
-    ) -> usize {
-        self.min_indices.clear();
-        if self.heap.is_empty() {
-            return 0;
-        }
-        self.collect_equal(0, entries, schema);
-        self.min_indices.len()
-    }
-
-    fn collect_equal(
-        &mut self,
-        idx: usize,
-        entries: &[ReadCursorEntry],
-        schema: &SchemaDescriptor,
-    ) {
-        if idx >= self.heap.len() {
-            return;
-        }
-        if idx == 0
-            || self.compare_to_root(idx, entries, schema) == Ordering::Equal
-        {
-            self.min_indices.push(self.heap[idx].entry_idx);
-            let left = 2 * idx + 1;
-            let right = 2 * idx + 2;
-            if left < self.heap.len() {
-                self.collect_equal(left, entries, schema);
-            }
-            if right < self.heap.len() {
-                self.collect_equal(right, entries, schema);
-            }
-        }
-    }
-
-    fn compare_to_root(
-        &self,
-        idx: usize,
-        entries: &[ReadCursorEntry],
-        schema: &SchemaDescriptor,
-    ) -> Ordering {
-        let a = &self.heap[idx];
-        let b = &self.heap[0];
-        let key_ord = a.key.cmp(&b.key);
-        if key_ord != Ordering::Equal {
-            return key_ord;
-        }
-        let ea = a.entry_idx;
-        let eb = b.entry_idx;
-        compare_cursor_rows(
-            schema,
-            &entries[ea].source,
-            entries[ea].position,
-            &entries[eb].source,
-            entries[eb].position,
-        )
-    }
-
-    fn advance_entry(
-        &mut self,
-        entry_idx: usize,
-        entries: &mut [ReadCursorEntry],
-        schema: &SchemaDescriptor,
-    ) {
-        let heap_idx = self.pos_map[entry_idx];
-        if heap_idx < 0 {
-            return;
-        }
-        let heap_idx = heap_idx as usize;
-
-        entries[entry_idx].advance();
-
-        if !entries[entry_idx].is_valid() {
-            self.pos_map[entry_idx] = -1;
-            let last = self.heap.len() - 1;
-            if heap_idx != last {
-                let last_entry = self.heap[last].entry_idx;
-                self.heap[heap_idx] = HeapNode {
-                    key: self.heap[last].key,
-                    entry_idx: last_entry,
-                };
-                self.pos_map[last_entry] = heap_idx as i32;
-                self.heap.pop();
-                if !self.heap.is_empty() && heap_idx < self.heap.len() {
-                    self.sift_down(heap_idx, entries, schema);
-                    self.sift_up(heap_idx, entries, schema);
-                }
-            } else {
-                self.heap.pop();
-            }
-        } else {
-            self.heap[heap_idx].key = entries[entry_idx].peek_key();
-            self.sift_down(heap_idx, entries, schema);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ReadCursor — the opaque handle exposed via FFI
 // ---------------------------------------------------------------------------
 
 pub struct ReadCursor<'a> {
     entries: Vec<ReadCursorEntry<'a>>,
-    tree: Option<CursorTree>,
+    tree: Option<MergeHeap>,
     schema: SchemaDescriptor,
     // Current row state
     pub valid: bool,
@@ -551,15 +250,41 @@ pub struct ReadCursor<'a> {
     pub current_null_word: u64,
     current_entry_idx: usize,
     current_row: usize,
-    // Reusable buffer for advance_entry indices
+    // Reusable buffer for advance indices
     advance_buf: Vec<usize>,
 }
 
 impl<'a> ReadCursor<'a> {
+    fn build_tree(entries: &[ReadCursorEntry<'a>], schema: &SchemaDescriptor) -> MergeHeap {
+        let node_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> bool {
+            if a.key != b.key {
+                return a.key < b.key;
+            }
+            columnar::compare_rows(
+                schema,
+                &entries[a.idx].source,
+                entries[a.idx].position,
+                &entries[b.idx].source,
+                entries[b.idx].position,
+            ) == Ordering::Less
+        };
+        MergeHeap::build(
+            entries.len(),
+            |i| {
+                if entries[i].is_valid() {
+                    Some(entries[i].peek_key())
+                } else {
+                    None
+                }
+            },
+            &node_less,
+        )
+    }
+
     pub fn new(entries: Vec<ReadCursorEntry<'a>>, schema: SchemaDescriptor) -> Self {
         let n = entries.len();
         let tree = if n > 1 {
-            Some(CursorTree::build(&entries, &schema))
+            Some(Self::build_tree(&entries, &schema))
         } else {
             None
         };
@@ -584,9 +309,8 @@ impl<'a> ReadCursor<'a> {
         for e in &mut self.entries {
             e.seek(key_lo, key_hi);
         }
-        if let Some(ref mut tree) = self.tree {
-            // Rebuild tree from new positions
-            *tree = CursorTree::build(&self.entries, &self.schema);
+        if self.tree.is_some() {
+            self.tree = Some(Self::build_tree(&self.entries, &self.schema));
         }
         self.find_next_non_ghost();
     }
@@ -608,7 +332,25 @@ impl<'a> ReadCursor<'a> {
             self.advance_buf.clear();
             self.advance_buf.extend_from_slice(&tree.min_indices);
             for &ei in &self.advance_buf {
-                tree.advance_entry(ei, &mut self.entries, &self.schema);
+                self.entries[ei].advance();
+                let new_key = if self.entries[ei].is_valid() {
+                    Some(self.entries[ei].peek_key())
+                } else {
+                    None
+                };
+                let node_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> bool {
+                    if a.key != b.key {
+                        return a.key < b.key;
+                    }
+                    columnar::compare_rows(
+                        &self.schema,
+                        &self.entries[a.idx].source,
+                        self.entries[a.idx].position,
+                        &self.entries[b.idx].source,
+                        self.entries[b.idx].position,
+                    ) == Ordering::Less
+                };
+                tree.advance(ei, new_key, &node_less);
             }
         }
 
@@ -642,7 +384,20 @@ impl<'a> ReadCursor<'a> {
         let schema = &self.schema;
 
         while !tree.is_empty() {
-            let num_min = tree.collect_min_indices(&self.entries, schema);
+            let eq_root = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> Ordering {
+                let key_ord = a.key.cmp(&b.key);
+                if key_ord != Ordering::Equal {
+                    return key_ord;
+                }
+                columnar::compare_rows(
+                    schema,
+                    &self.entries[a.idx].source,
+                    self.entries[a.idx].position,
+                    &self.entries[b.idx].source,
+                    self.entries[b.idx].position,
+                )
+            };
+            let num_min = tree.collect_min_indices(&eq_root);
             if num_min == 0 {
                 break;
             }
@@ -675,7 +430,25 @@ impl<'a> ReadCursor<'a> {
             self.advance_buf
                 .extend_from_slice(&tree.min_indices[..num_min]);
             for &ei in &self.advance_buf {
-                tree.advance_entry(ei, &mut self.entries, schema);
+                self.entries[ei].advance();
+                let new_key = if self.entries[ei].is_valid() {
+                    Some(self.entries[ei].peek_key())
+                } else {
+                    None
+                };
+                let node_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> bool {
+                    if a.key != b.key {
+                        return a.key < b.key;
+                    }
+                    columnar::compare_rows(
+                        schema,
+                        &self.entries[a.idx].source,
+                        self.entries[a.idx].position,
+                        &self.entries[b.idx].source,
+                        self.entries[b.idx].position,
+                    ) == Ordering::Less
+                };
+                tree.advance(ei, new_key, &node_less);
             }
         }
 

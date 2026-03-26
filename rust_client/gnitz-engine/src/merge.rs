@@ -9,14 +9,13 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::compact::{
-    compare_german_strings, read_signed, SchemaDescriptor,
-    type_code, SHORT_STRING_THRESHOLD,
-};
+use crate::columnar::{self, ColumnarSource};
+use crate::compact::{SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
+use crate::heap::MergeHeap;
 use crate::util::{read_u32_le, read_u64_le};
 use crate::xxh;
 
-use type_code::{F32 as TYPE_F32, F64 as TYPE_F64, STRING as TYPE_STRING, U128 as TYPE_U128};
+use type_code::STRING as TYPE_STRING;
 
 // ---------------------------------------------------------------------------
 // MemBatch: a view over flat columnar buffers (one batch / sorted run)
@@ -62,6 +61,21 @@ impl<'a> MemBatch<'a> {
     }
 }
 
+impl<'a> ColumnarSource for MemBatch<'a> {
+    #[inline]
+    fn get_null_word(&self, row: usize) -> u64 {
+        self.get_null_word(row)
+    }
+    #[inline]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        MemBatch::get_col_ptr(self, row, payload_col, col_size)
+    }
+    #[inline]
+    fn blob_slice(&self) -> &[u8] {
+        self.blob
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MemBatchCursor: position within a MemBatch
 // ---------------------------------------------------------------------------
@@ -99,138 +113,6 @@ impl MemBatchCursor {
             batches[self.batch_idx].get_pk(self.position)
         } else {
             u128::MAX
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TournamentTree (min-heap by PK)
-// ---------------------------------------------------------------------------
-
-struct HeapNode {
-    key: u128,
-    cursor_idx: usize,
-}
-
-pub struct TournamentTree {
-    heap: Vec<HeapNode>,
-    pos_map: Vec<i32>,
-}
-
-impl TournamentTree {
-    pub fn build(
-        cursors: &[MemBatchCursor],
-        batches: &[MemBatch],
-        schema: &SchemaDescriptor,
-    ) -> Self {
-        let n = cursors.len();
-        let mut heap = Vec::with_capacity(n);
-        let mut pos_map = vec![-1i32; n];
-
-        for i in 0..n {
-            if cursors[i].is_valid() {
-                let idx = heap.len();
-                pos_map[i] = idx as i32;
-                heap.push(HeapNode {
-                    key: cursors[i].peek_key(batches),
-                    cursor_idx: i,
-                });
-            }
-        }
-
-        let mut tree = TournamentTree { heap, pos_map };
-        let size = tree.heap.len();
-        if size > 1 {
-            for i in (0..size / 2).rev() {
-                tree.sift_down(i, cursors, batches, schema);
-            }
-        }
-        tree
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
-    }
-
-    #[inline]
-    pub fn min_cursor_idx(&self) -> usize {
-        self.heap[0].cursor_idx
-    }
-
-    /// Full comparison: PK first, then payload columns via compare_rows.
-    /// Returns true if node i < node j in (PK, payload) order.
-    fn node_less(
-        &self,
-        i: usize,
-        j: usize,
-        cursors: &[MemBatchCursor],
-        batches: &[MemBatch],
-        schema: &SchemaDescriptor,
-    ) -> bool {
-        let ki = self.heap[i].key;
-        let kj = self.heap[j].key;
-        if ki != kj {
-            return ki < kj;
-        }
-        let ci = self.heap[i].cursor_idx;
-        let cj = self.heap[j].cursor_idx;
-        let bi = cursors[ci].batch_idx;
-        let bj = cursors[cj].batch_idx;
-        let ri = cursors[ci].position;
-        let rj = cursors[cj].position;
-        compare_rows(schema, &batches[bi], ri, &batches[bj], rj) == Ordering::Less
-    }
-
-    fn sift_down(
-        &mut self,
-        mut idx: usize,
-        cursors: &[MemBatchCursor],
-        batches: &[MemBatch],
-        schema: &SchemaDescriptor,
-    ) {
-        loop {
-            let mut smallest = idx;
-            let left = 2 * idx + 1;
-            let right = 2 * idx + 2;
-            if left < self.heap.len() && self.node_less(left, smallest, cursors, batches, schema) {
-                smallest = left;
-            }
-            if right < self.heap.len() && self.node_less(right, smallest, cursors, batches, schema) {
-                smallest = right;
-            }
-            if smallest != idx {
-                let ci = self.heap[idx].cursor_idx;
-                let cs = self.heap[smallest].cursor_idx;
-                self.heap.swap(idx, smallest);
-                self.pos_map[ci] = smallest as i32;
-                self.pos_map[cs] = idx as i32;
-                idx = smallest;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn sift_up(
-        &mut self,
-        mut idx: usize,
-        cursors: &[MemBatchCursor],
-        batches: &[MemBatch],
-        schema: &SchemaDescriptor,
-    ) {
-        while idx > 0 {
-            let parent = (idx - 1) / 2;
-            if self.node_less(idx, parent, cursors, batches, schema) {
-                let ci = self.heap[idx].cursor_idx;
-                let cp = self.heap[parent].cursor_idx;
-                self.heap.swap(idx, parent);
-                self.pos_map[ci] = parent as i32;
-                self.pos_map[cp] = idx as i32;
-                idx = parent;
-            } else {
-                break;
-            }
         }
     }
 }
@@ -363,93 +245,6 @@ impl<'a> DirectWriter<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Row comparison (MemBatch variant)
-// ---------------------------------------------------------------------------
-
-pub fn compare_rows(
-    schema: &SchemaDescriptor,
-    batch_a: &MemBatch,
-    row_a: usize,
-    batch_b: &MemBatch,
-    row_b: usize,
-) -> Ordering {
-    let pk_index = schema.pk_index as usize;
-    let null_word_a = batch_a.get_null_word(row_a);
-    let null_word_b = batch_b.get_null_word(row_b);
-    let mut payload_col: usize = 0;
-
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_index {
-            continue;
-        }
-
-        let null_a = (null_word_a >> payload_col) & 1 != 0;
-        let null_b = (null_word_b >> payload_col) & 1 != 0;
-        if null_a && null_b {
-            payload_col += 1;
-            continue;
-        }
-        if null_a {
-            return Ordering::Less;
-        }
-        if null_b {
-            return Ordering::Greater;
-        }
-
-        let col = &schema.columns[ci];
-        let col_size = col.size as usize;
-
-        let ord = match col.type_code {
-            TYPE_STRING => {
-                let ptr_a = batch_a.get_col_ptr(row_a, payload_col, 16);
-                let ptr_b = batch_b.get_col_ptr(row_b, payload_col, 16);
-                compare_german_strings(ptr_a, batch_a.blob, ptr_b, batch_b.blob)
-            }
-            TYPE_U128 => {
-                let ba = batch_a.get_col_ptr(row_a, payload_col, 16);
-                let bb = batch_b.get_col_ptr(row_b, payload_col, 16);
-                let va = ((read_u64_le(ba, 8) as u128) << 64) | (read_u64_le(ba, 0) as u128);
-                let vb = ((read_u64_le(bb, 8) as u128) << 64) | (read_u64_le(bb, 0) as u128);
-                va.cmp(&vb)
-            }
-            TYPE_F64 => {
-                let ba = batch_a.get_col_ptr(row_a, payload_col, 8);
-                let bb = batch_b.get_col_ptr(row_b, payload_col, 8);
-                let va = f64::from_bits(read_u64_le(ba, 0));
-                let vb = f64::from_bits(read_u64_le(bb, 0));
-                va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
-            }
-            TYPE_F32 => {
-                let ba = batch_a.get_col_ptr(row_a, payload_col, 4);
-                let bb = batch_b.get_col_ptr(row_b, payload_col, 4);
-                let va = f32::from_bits(read_u32_le(ba, 0));
-                let vb = f32::from_bits(read_u32_le(bb, 0));
-                va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
-            }
-            _ => {
-                let va = read_signed(
-                    batch_a.get_col_ptr(row_a, payload_col, col_size),
-                    col_size,
-                );
-                let vb = read_signed(
-                    batch_b.get_col_ptr(row_b, payload_col, col_size),
-                    col_size,
-                );
-                va.cmp(&vb)
-            }
-        };
-
-        payload_col += 1;
-
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-
-    Ordering::Equal
-}
-
-// ---------------------------------------------------------------------------
 // merge_batches: the main entry point
 // ---------------------------------------------------------------------------
 
@@ -472,7 +267,38 @@ pub fn merge_batches(
         cursors.push(MemBatchCursor::new(i, batches[i].count));
     }
 
-    let mut tree = TournamentTree::build(&cursors, batches, schema);
+    // Helper: PK + payload comparison for heap ordering.
+    // Uses a macro-like inline closure pattern to avoid long-lived borrows of `cursors`.
+    fn make_less<'c>(
+        cursors: &'c [MemBatchCursor],
+        batches: &'c [MemBatch],
+        schema: &'c SchemaDescriptor,
+    ) -> impl Fn(&crate::heap::HeapNode, &crate::heap::HeapNode) -> bool + 'c {
+        move |a, b| {
+            if a.key != b.key {
+                return a.key < b.key;
+            }
+            let ci = a.idx;
+            let cj = b.idx;
+            let bi = cursors[ci].batch_idx;
+            let bj = cursors[cj].batch_idx;
+            let ri = cursors[ci].position;
+            let rj = cursors[cj].position;
+            columnar::compare_rows(schema, &batches[bi], ri, &batches[bj], rj) == Ordering::Less
+        }
+    }
+
+    let mut tree = MergeHeap::build(
+        cursors.len(),
+        |i| {
+            if cursors[i].is_valid() {
+                Some(cursors[i].peek_key(batches))
+            } else {
+                None
+            }
+        },
+        &make_less(&cursors, batches, schema),
+    );
 
     let mut has_pending = false;
     let mut pending_batch: usize = 0;
@@ -481,10 +307,9 @@ pub fn merge_batches(
     let mut pending_weight: i64 = 0;
 
     while !tree.is_empty() {
-        let ci = tree.min_cursor_idx();
-        let cur = &cursors[ci];
-        let bi = cur.batch_idx;
-        let ri = cur.position;
+        let ci = tree.min_idx();
+        let bi = cursors[ci].batch_idx;
+        let ri = cursors[ci].position;
         let cur_pk = batches[bi].get_pk(ri);
         let cur_weight = batches[bi].get_weight(ri);
 
@@ -503,7 +328,7 @@ pub fn merge_batches(
             pending_pk = cur_pk;
             pending_weight = cur_weight;
         } else {
-            let ord = compare_rows(
+            let ord = columnar::compare_rows(
                 schema,
                 &batches[pending_batch],
                 pending_row,
@@ -523,53 +348,18 @@ pub fn merge_batches(
             }
         }
 
-        tree.advance_cursor(&mut cursors, batches, schema);
+        // Advance the min cursor, then re-create the less closure
+        cursors[ci].advance();
+        let new_key = if cursors[ci].is_valid() {
+            Some(cursors[ci].peek_key(batches))
+        } else {
+            None
+        };
+        tree.advance(ci, new_key, &make_less(&cursors, batches, schema));
     }
 
     if has_pending && pending_weight != 0 {
         writer.write_row(&batches[pending_batch], pending_row, pending_weight);
-    }
-}
-
-/// Convenience: advance the cursor at the given index in the tree.
-impl TournamentTree {
-    pub fn advance_cursor(
-        &mut self,
-        cursors: &mut [MemBatchCursor],
-        batches: &[MemBatch],
-        schema: &SchemaDescriptor,
-    ) {
-        let ci = self.min_cursor_idx();
-        let heap_idx = self.pos_map[ci];
-        if heap_idx < 0 {
-            return;
-        }
-        let heap_idx = heap_idx as usize;
-
-        cursors[ci].advance();
-
-        if !cursors[ci].is_valid() {
-            self.pos_map[ci] = -1;
-            let last = self.heap.len() - 1;
-            if heap_idx != last {
-                let last_cursor = self.heap[last].cursor_idx;
-                self.heap[heap_idx] = HeapNode {
-                    key: self.heap[last].key,
-                    cursor_idx: last_cursor,
-                };
-                self.pos_map[last_cursor] = heap_idx as i32;
-                self.heap.pop();
-                if !self.heap.is_empty() && heap_idx < self.heap.len() {
-                    self.sift_down(heap_idx, cursors, batches, schema);
-                    self.sift_up(heap_idx, cursors, batches, schema);
-                }
-            } else {
-                self.heap.pop();
-            }
-        } else {
-            self.heap[heap_idx].key = cursors[ci].peek_key(batches);
-            self.sift_down(heap_idx, cursors, batches, schema);
-        }
     }
 }
 
@@ -717,7 +507,7 @@ pub fn sort_and_consolidate(
     let mut indices: Vec<usize> = (0..n).collect();
     indices.sort_by(|&a, &b| {
         match pks[a].cmp(&pks[b]) {
-            Ordering::Equal => compare_rows(schema, batch, a, batch, b),
+            Ordering::Equal => columnar::compare_rows(schema, batch, a, batch, b),
             ord => ord,
         }
     });
@@ -738,7 +528,7 @@ pub fn sort_and_consolidate(
             pending_pk = cur_pk;
             pending_weight = batch.get_weight(cur_idx);
         } else {
-            let ord = compare_rows(schema, batch, pending_idx, batch, cur_idx);
+            let ord = columnar::compare_rows(schema, batch, pending_idx, batch, cur_idx);
             if ord == Ordering::Equal {
                 pending_weight += batch.get_weight(cur_idx);
             } else {
@@ -796,7 +586,7 @@ pub fn sort_only(
     let pks: Vec<u128> = (0..n).map(|i| batch.get_pk(i)).collect();
     let mut indices: Vec<usize> = (0..n).collect();
     indices.sort_by(|&a, &b| match pks[a].cmp(&pks[b]) {
-        Ordering::Equal => compare_rows(schema, batch, a, batch, b),
+        Ordering::Equal => columnar::compare_rows(schema, batch, a, batch, b),
         ord => ord,
     });
 

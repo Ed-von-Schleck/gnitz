@@ -302,6 +302,21 @@ fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
     (a_hi, a_lo) < (b_hi, b_lo)
 }
 
+impl crate::columnar::ColumnarSource for MappedShard {
+    #[inline]
+    fn get_null_word(&self, row: usize) -> u64 {
+        self.get_null_word(row)
+    }
+    #[inline]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        self.get_col_ptr(row, payload_col, col_size)
+    }
+    #[inline]
+    fn blob_slice(&self) -> &[u8] {
+        self.blob_slice()
+    }
+}
+
 impl Drop for MappedShard {
     fn drop(&mut self) {
         if !self.mmap_ptr.is_null() {
