@@ -133,7 +133,7 @@ class EphemeralTable(ZSetStore):
         shard_views = newlist_hint(len(all_handles))
         for h in all_handles:
             shard_views.append(h.view)
-        return cursor.RustUnifiedCursor(self.schema, shard_views, snapshot)
+        return cursor.RustUnifiedCursor(self.schema, shard_views, [snapshot])
 
     def compact_if_needed(self):
         if self.index.needs_compaction:

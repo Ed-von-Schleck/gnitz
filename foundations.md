@@ -6,7 +6,17 @@ definitions. Bugs almost always trace to violating an invariant stated here.
 ## 1. Z-Sets
 
 A **Z-Set** over domain *D* is a function *Z: D → ℤ* mapping each element
-to an integer **weight** (multiplicity), with finite support.
+to an integer **weight** (multiplicity), with finite support. Z-Sets form
+an **abelian group** `(ℤ[D], +, 0, -)` under pointwise addition — this
+group structure is the prerequisite for the entire DBSP theory (I, D, and
+all incrementalization theorems depend on it).
+
+An **indexed Z-Set** `ℤ[V][K]` maps keys to Z-Sets: `K → (V → ℤ)`.
+GROUP BY produces indexed Z-Sets via the grouping function `G_p`, which
+is **linear** — GROUP BY itself needs no state and is incrementally free.
+Only the aggregation within each group requires the integral. In GnitzDB,
+`map_reindex` (repartitioning by group/join key) is the physical
+implementation of `G_p`.
 
 In GnitzDB, *D* is the set of rows for a table schema. A row is identified
 by **(PK, payload)** — the primary key plus all non-PK column values.
@@ -56,6 +66,18 @@ GnitzDB implements the DBSP model (Budiu et al., VLDB 2023). Instead of
 recomputing queries from scratch, it processes only the **delta** and
 produces the **output delta**.
 
+**Lifting.** Every Z-Set operator (filter, join, distinct, ...) is first
+a scalar function on Z-Sets, then **lifted** to a stream operator:
+`(↑f)(s)[t] = f(s[t])` (DBSP Definition 2.3). Lifting distributes over
+composition: `↑(f ∘ g) = ↑f ∘ ↑g`. The incrementalized version is then
+`Q^Δ = D ∘ ↑Q ∘ I`.
+
+**D and I are inverses** (DBSP Theorem 2.20): `D(I(s)) = s` and
+`I(D(s)) = s`. This identity enables the **chain rule**:
+`(Q₁ ∘ Q₂)^Δ = Q₁^Δ ∘ Q₂^Δ` — each sub-operator can be
+incrementalized independently. This is why GnitzDB can compile circuits
+in incremental form without wrapping the entire query in D/I.
+
 ### Streams and Deltas
 
 A **stream** is a sequence of Z-Sets indexed by time (tick). Each tick:
@@ -95,6 +117,17 @@ Only non-linear and bilinear operators need the integral. The output of
   Both sides use old-state cursors. Correct under single-source-per-epoch
   (dA ⋈ dB = 0). Must be revised if batched multi-source epochs are added.
 - Require integral of both operands. Consolidation required.
+
+**Left outer join** — extends bilinear join with null-fill:
+- For each delta row, if inner-join matches exist: emit them (weight =
+  `w_delta × w_trace`, same as inner join). If no match: emit one
+  null-filled row (weight = `w_delta`, right columns = NULL via
+  `NullAccessor`).
+- **Not bilinear**: the null-fill path breaks the weight-product property
+  (output weight depends on match existence, not just weight arithmetic).
+- Implemented as `OPCODE_JOIN_DELTA_TRACE_OUTER` (`join.py:212-270`).
+  Feldera uses a different approach: a "saturate" operator injects ghost
+  `(k, NULL)` tuples, then runs a standard inner join.
 
 **Non-linear operators** — require access to the accumulated integral:
 

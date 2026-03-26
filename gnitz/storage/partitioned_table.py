@@ -13,7 +13,7 @@ from gnitz.core import xxh
 from gnitz.core.store import ZSetStore
 from gnitz.core.batch import ArenaZSetBatch
 from gnitz.core.store import AbstractCursor
-from gnitz.storage.cursor import UnifiedCursor
+from gnitz.storage.cursor import RustUnifiedCursor
 from gnitz.storage.table import PersistentTable
 from gnitz.storage.ephemeral_table import EphemeralTable
 from gnitz.storage import mmap_posix
@@ -164,10 +164,17 @@ class PartitionedTable(ZSetStore):
         if self.num_partitions == 1:
             return self.partitions[0].create_cursor()
 
-        cursors = newlist_hint(num_live)
+        # Collect ALL data sources across ALL partitions into one flat cursor
+        snapshots = newlist_hint(num_live)
+        all_shard_views = newlist_hint(num_live * 4)
         for local in range(num_live):
-            cursors.append(self.partitions[local].create_cursor())
-        return UnifiedCursor(self.schema, cursors)
+            part = self.partitions[local]
+            part.compact_if_needed()
+            snap = part.memtable.get_consolidated_snapshot()
+            snapshots.append(snap)
+            for h in part.index.all_handles_for_cursor():
+                all_shard_views.append(h.view)
+        return RustUnifiedCursor(self.schema, all_shard_views, snapshots)
 
     def retract_pk(self, key_lo, key_hi, out_batch):
         if len(self.partitions) == 0:
