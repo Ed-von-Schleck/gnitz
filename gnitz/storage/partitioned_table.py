@@ -172,8 +172,8 @@ class PartitionedTable(ZSetStore):
             part.compact_if_needed()
             snap = part.memtable.get_consolidated_snapshot()
             snapshots.append(snap)
-            for h in part.index.all_handles_for_cursor():
-                all_shard_views.append(h.view)
+            for sv in part.all_shard_views_for_cursor():
+                all_shard_views.append(sv)
         return RustUnifiedCursor(self.schema, all_shard_views, snapshots)
 
     def retract_pk(self, key_lo, key_hi, out_batch):

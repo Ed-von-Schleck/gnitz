@@ -14,21 +14,26 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, errors
 from gnitz.core import comparator as core_comparator
+from gnitz.core.comparator import RowAccessor
 from gnitz.core.store import ZSetStore
 from gnitz.core.keys import promote_to_index_key
 from gnitz.core.batch import ColumnarBatchAccessor, pk_eq
 from gnitz.storage import (
-    index,
-    flsm,
+    engine_ffi,
     memtable,
     mmap_posix,
-    refcount,
-    comparator as storage_comparator,
     cursor,
 )
+from gnitz.core import strings as string_logic
 
 
 EPH_SHARD_PREFIX = "eph_shard_"
+
+# Maximum number of shards to return from all_shard_ptrs / find_pk
+_MAX_SHARDS = 4096
+_MAX_PK_RESULTS = 256
+
+NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
 
 def _name_to_tid(name):
@@ -43,6 +48,130 @@ def _name_to_tid(name):
     return tid
 
 
+class _ShardPtrView(object):
+    """Thin wrapper around a raw MappedShard pointer from the Rust ShardIndex.
+
+    Presents the same ``_handle`` and ``count`` attributes that
+    RustUnifiedCursor expects so that shard pointers obtained from
+    gnitz_shard_index_all_shard_ptrs can be passed directly to
+    gnitz_read_cursor_create.
+    """
+
+    _immutable_fields_ = ["_handle", "count"]
+
+    def __init__(self, raw_ptr):
+        self._handle = raw_ptr
+        self.count = intmask(engine_ffi._shard_row_count(raw_ptr))
+
+
+class ShardRowAccessor(RowAccessor):
+    """Accesses a single row from a Rust MappedShard via the existing
+    gnitz_shard_col_ptr / gnitz_shard_blob_ptr / etc. FFI functions.
+
+    The caller must ensure the shard pointer remains valid for the
+    lifetime of this accessor.
+    """
+
+    _immutable_fields_ = ["schema"]
+
+    def __init__(self, schema):
+        self.schema = schema
+        self._shard_ptr = lltype.nullptr(rffi.VOIDP.TO)
+        self._row_idx = 0
+
+    def set_row(self, shard_ptr, row_idx):
+        self._shard_ptr = shard_ptr
+        self._row_idx = row_idx
+
+    def is_null(self, col_idx):
+        schema = self.schema
+        if col_idx == schema.pk_index:
+            return False
+        if not schema.has_nullable:
+            return False
+        null_word = r_uint64(engine_ffi._shard_get_null_word(
+            self._shard_ptr, rffi.cast(rffi.INT, self._row_idx)))
+        payload_idx = col_idx if col_idx < schema.pk_index else col_idx - 1
+        return bool(r_uint64(null_word) & (r_uint64(1) << payload_idx))
+
+    def _get_ptr(self, col_idx):
+        stride = self.schema.columns[col_idx].field_type.size
+        return engine_ffi._shard_col_ptr(
+            self._shard_ptr,
+            rffi.cast(rffi.INT, self._row_idx),
+            rffi.cast(rffi.INT, col_idx),
+            rffi.cast(rffi.INT, stride),
+        )
+
+    def get_int(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        sz = self.schema.columns[col_idx].field_type.size
+        if sz == 8:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        elif sz == 4:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UINTP, ptr)[0])
+        elif sz == 2:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.USHORTP, ptr)[0])
+        elif sz == 1:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr)[0])
+        return r_uint64(0)
+
+    def get_int_signed(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        sz = self.schema.columns[col_idx].field_type.size
+        if sz == 8:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        elif sz == 4:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.INTP, ptr)[0])
+        elif sz == 2:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SHORTP, ptr)[0])
+        elif sz == 1:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SIGNEDCHARP, ptr)[0])
+        return r_int64(0)
+
+    def get_float(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        sz = self.schema.columns[col_idx].field_type.size
+        if sz == 4:
+            return float(rffi.cast(rffi.FLOATP, ptr)[0])
+        return float(rffi.cast(rffi.DOUBLEP, ptr)[0])
+
+    def get_u128(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        lo = rffi.cast(rffi.ULONGLONGP, ptr)
+        hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))
+        return (r_uint128(hi[0]) << 64) | r_uint128(lo[0])
+
+    def get_u128_lo(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        lo = rffi.cast(rffi.ULONGLONGP, ptr)
+        return r_uint64(lo[0])
+
+    def get_u128_hi(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))
+        return r_uint64(hi[0])
+
+    def get_str_struct(self, col_idx):
+        ptr = self._get_ptr(col_idx)
+        blob_ptr = engine_ffi._shard_blob_ptr(self._shard_ptr)
+
+        if not ptr:
+            return (0, 0, NULL_PTR, blob_ptr, None)
+
+        u32_ptr = rffi.cast(rffi.UINTP, ptr)
+        length = rffi.cast(lltype.Signed, u32_ptr[0])
+        prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+
+        s = None
+        if False:
+            s = ""
+        return (length, prefix, ptr, blob_ptr, s)
+
+    def get_col_ptr(self, col_idx):
+        return self._get_ptr(col_idx)
+
+
 class EphemeralTable(ZSetStore):
     """
     Scratch Z-Set storage for internal VM state or Secondary Indices.
@@ -55,7 +184,6 @@ class EphemeralTable(ZSetStore):
         "table_id",
         "directory",
         "name",
-        "ref_counter",
     ]
 
     def __init__(
@@ -74,8 +202,6 @@ class EphemeralTable(ZSetStore):
         self.validate_checksums = validate_checksums
         self.is_closed = False
 
-        self.ref_counter = refcount.RefCounter()
-
         try:
             rposix.mkdir(directory, 0o755)
         except OSError as e:
@@ -86,14 +212,24 @@ class EphemeralTable(ZSetStore):
 
         self._erase_stale_shards()
 
-        self.index = flsm.FLSMIndex(table_id, schema, self.ref_counter,
-                                    directory, validate_checksums)
+        # Create Rust ShardIndex handle
+        self._schema_buf = engine_ffi.pack_schema(schema)
+        dir_c = rffi.str2charp(directory)
+        try:
+            self._index_handle = engine_ffi._shard_index_create(
+                rffi.cast(rffi.UINT, table_id),
+                dir_c,
+                rffi.cast(rffi.VOIDP, self._schema_buf),
+            )
+        finally:
+            rffi.free_charp(dir_c)
+
         self.memtable = memtable.MemTable(schema, memtable_arena_size)
         self._flush_seq = 0
         self._has_wal = True
         self.current_lsn = r_uint64(0)
         self._retract_acc = ColumnarBatchAccessor(schema)
-        self._retract_soa = storage_comparator.SoAAccessor(schema)
+        self._retract_soa = ShardRowAccessor(schema)
 
     def _erase_stale_shards(self):
         """Delete any leftover ephemeral shard files from a previous run."""
@@ -128,15 +264,44 @@ class EphemeralTable(ZSetStore):
         )
 
     def _build_cursor(self):
-        all_handles = self.index.all_handles_for_cursor()
         snapshot = self.memtable.get_consolidated_snapshot()
-        shard_views = newlist_hint(len(all_handles))
-        for h in all_handles:
-            shard_views.append(h.view)
+        # Get all shard pointers from the Rust ShardIndex
+        out_ptrs = lltype.malloc(rffi.VOIDPP.TO, _MAX_SHARDS, flavor="raw")
+        try:
+            n_shards = intmask(engine_ffi._shard_index_all_shard_ptrs(
+                self._index_handle,
+                out_ptrs,
+                rffi.cast(rffi.UINT, _MAX_SHARDS),
+            ))
+            shard_views = newlist_hint(n_shards)
+            for i in range(n_shards):
+                shard_views.append(_ShardPtrView(out_ptrs[i]))
+        finally:
+            lltype.free(out_ptrs, flavor="raw")
         return cursor.RustUnifiedCursor(self.schema, shard_views, [snapshot])
 
+    def all_shard_views_for_cursor(self):
+        """Return a list of _ShardPtrView wrappers for all shards in the index.
+
+        Used by PartitionedTable.create_cursor() to gather shard pointers
+        across multiple partitions.
+        """
+        out_ptrs = lltype.malloc(rffi.VOIDPP.TO, _MAX_SHARDS, flavor="raw")
+        try:
+            n_shards = intmask(engine_ffi._shard_index_all_shard_ptrs(
+                self._index_handle,
+                out_ptrs,
+                rffi.cast(rffi.UINT, _MAX_SHARDS),
+            ))
+            result = newlist_hint(n_shards)
+            for i in range(n_shards):
+                result.append(_ShardPtrView(out_ptrs[i]))
+        finally:
+            lltype.free(out_ptrs, flavor="raw")
+        return result
+
     def compact_if_needed(self):
-        if self.index.needs_compaction:
+        if intmask(engine_ffi._shard_index_needs_compaction(self._index_handle)):
             self._compact()
 
     def create_cursor(self):
@@ -144,32 +309,57 @@ class EphemeralTable(ZSetStore):
         return self._build_cursor()
 
     def _compact(self):
-        self.index.run_compact()
-        self.index.ref_counter.try_cleanup()
+        rc = intmask(engine_ffi._shard_index_compact(self._index_handle))
+        if rc < 0:
+            raise errors.StorageError("ShardIndex compact failed (error %d)" % rc)
+        engine_ffi._shard_index_try_cleanup(self._index_handle)
 
     def _scan_shards_for_pk(self, key_lo, key_hi):
-        """Walk shards for a PK via the shard index.
+        """Walk shards for a PK via the Rust shard index.
 
-        Returns (net_weight_from_shards, view_or_None, first_row_idx).
+        Returns (net_weight_from_shards, shard_ptr_or_None, first_row_idx).
+        shard_ptr_or_None is a rffi.VOIDP pointing to the MappedShard.
         """
         total_w = r_int64(0)
-        found_view = None
+        found_ptr = lltype.nullptr(rffi.VOIDP.TO)
         found_idx = -1
-        r_key = (r_uint128(key_hi) << 64) | r_uint128(key_lo)
-        shard_matches = self.index.find_all_shards_and_indices(r_key)
-        if shard_matches:
-            for handle, row_idx in shard_matches:
-                view = handle.view
+
+        out_shard_ptrs = lltype.malloc(rffi.VOIDPP.TO, _MAX_PK_RESULTS, flavor="raw")
+        out_row_indices = lltype.malloc(rffi.INTP.TO, _MAX_PK_RESULTS, flavor="raw")
+        try:
+            n_matches = intmask(engine_ffi._shard_index_find_pk(
+                self._index_handle,
+                rffi.cast(rffi.ULONGLONG, key_lo),
+                rffi.cast(rffi.ULONGLONG, key_hi),
+                out_shard_ptrs,
+                out_row_indices,
+                rffi.cast(rffi.UINT, _MAX_PK_RESULTS),
+            ))
+            for mi in range(n_matches):
+                shard_ptr = out_shard_ptrs[mi]
+                row_idx = intmask(out_row_indices[mi])
+                # Read row count from shard to iterate duplicates
+                shard_count = intmask(engine_ffi._shard_row_count(shard_ptr))
                 idx = row_idx
-                while idx < view.count:
-                    if not pk_eq(view.get_pk_lo(idx), view.get_pk_hi(idx), key_lo, key_hi):
+                while idx < shard_count:
+                    s_pk_lo = r_uint64(engine_ffi._shard_get_pk_lo(
+                        shard_ptr, rffi.cast(rffi.INT, idx)))
+                    s_pk_hi = r_uint64(engine_ffi._shard_get_pk_hi(
+                        shard_ptr, rffi.cast(rffi.INT, idx)))
+                    if not pk_eq(s_pk_lo, s_pk_hi, key_lo, key_hi):
                         break
-                    total_w += view.get_weight(idx)
-                    if found_view is None:
-                        found_view = view
+                    w = intmask(engine_ffi._shard_get_weight(
+                        shard_ptr, rffi.cast(rffi.INT, idx)))
+                    total_w += r_int64(w)
+                    if not found_ptr:
+                        found_ptr = shard_ptr
                         found_idx = idx
                     idx += 1
-        return total_w, found_view, found_idx
+        finally:
+            lltype.free(out_shard_ptrs, flavor="raw")
+            lltype.free(out_row_indices, flavor="raw")
+
+        return total_w, found_ptr, found_idx
 
     def has_pk(self, key_lo, key_hi):
         """
@@ -197,15 +387,15 @@ class EphemeralTable(ZSetStore):
         if self.memtable.may_contain_pk(key_lo, key_hi):
             mt_w, mt_batch, mt_idx = self.memtable.lookup_pk(key_lo, key_hi)
             total_w = mt_w
-        shard_w, shard_view, shard_idx = self._scan_shards_for_pk(key_lo, key_hi)
+        shard_w, shard_ptr, shard_idx = self._scan_shards_for_pk(key_lo, key_hi)
         total_w += shard_w
         if total_w <= r_int64(0):
             return False
         if mt_batch is not None:
             self._retract_acc.bind(mt_batch, mt_idx)
             out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_acc)
-        elif shard_view is not None:
-            self._retract_soa.set_row(shard_view, shard_idx)
+        elif shard_ptr:
+            self._retract_soa.set_row(shard_ptr, shard_idx)
             out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_soa)
         return True
 
@@ -219,23 +409,41 @@ class EphemeralTable(ZSetStore):
         if self.memtable.may_contain_pk(key_lo, key_hi):
             total_w += self.memtable.find_weight_for_row(key_lo, key_hi, accessor)
 
-        # 2. Check Columnar Shards via Index
-        r_key = (r_uint128(key_hi) << 64) | r_uint128(key_lo)
-        shard_matches = self.index.find_all_shards_and_indices(r_key)
-        if shard_matches:
-            soa = storage_comparator.SoAAccessor(self.schema)
-
-            for handle, row_idx in shard_matches:
-                view = handle.view
-                idx = row_idx
-                while idx < view.count:
-                    if not pk_eq(view.get_pk_lo(idx), view.get_pk_hi(idx), key_lo, key_hi):
-                        break
-
-                    soa.set_row(view, idx)
-                    if core_comparator.compare_rows(self.schema, soa, accessor) == 0:
-                        total_w += view.get_weight(idx)
-                    idx += 1
+        # 2. Check Columnar Shards via Rust ShardIndex
+        out_shard_ptrs = lltype.malloc(rffi.VOIDPP.TO, _MAX_PK_RESULTS, flavor="raw")
+        out_row_indices = lltype.malloc(rffi.INTP.TO, _MAX_PK_RESULTS, flavor="raw")
+        try:
+            n_matches = intmask(engine_ffi._shard_index_find_pk(
+                self._index_handle,
+                rffi.cast(rffi.ULONGLONG, key_lo),
+                rffi.cast(rffi.ULONGLONG, key_hi),
+                out_shard_ptrs,
+                out_row_indices,
+                rffi.cast(rffi.UINT, _MAX_PK_RESULTS),
+            ))
+            if n_matches > 0:
+                soa = ShardRowAccessor(self.schema)
+                for mi in range(n_matches):
+                    shard_ptr = out_shard_ptrs[mi]
+                    row_idx = intmask(out_row_indices[mi])
+                    shard_count = intmask(engine_ffi._shard_row_count(shard_ptr))
+                    idx = row_idx
+                    while idx < shard_count:
+                        s_pk_lo = r_uint64(engine_ffi._shard_get_pk_lo(
+                            shard_ptr, rffi.cast(rffi.INT, idx)))
+                        s_pk_hi = r_uint64(engine_ffi._shard_get_pk_hi(
+                            shard_ptr, rffi.cast(rffi.INT, idx)))
+                        if not pk_eq(s_pk_lo, s_pk_hi, key_lo, key_hi):
+                            break
+                        soa.set_row(shard_ptr, idx)
+                        if core_comparator.compare_rows(self.schema, soa, accessor) == 0:
+                            w = intmask(engine_ffi._shard_get_weight(
+                                shard_ptr, rffi.cast(rffi.INT, idx)))
+                            total_w += r_int64(w)
+                        idx += 1
+        finally:
+            lltype.free(out_shard_ptrs, flavor="raw")
+            lltype.free(out_row_indices, flavor="raw")
 
         return total_w
 
@@ -269,18 +477,23 @@ class EphemeralTable(ZSetStore):
             return ""
 
         shard_path = self.directory + "/" + shard_name
-        h = index.ShardHandle(
-            shard_path,
-            self.schema,
-            r_uint64(0),
-            r_uint64(0),
-            validate_checksums=self.validate_checksums,
-        )
 
-        if h.view.count > 0:
-            self.index.add_handle(h)
+        # Check row count via a temporary shard open
+        shard_count = self._check_shard_row_count(shard_path)
+        if shard_count > 0:
+            path_c = rffi.str2charp(shard_path)
+            try:
+                rc = intmask(engine_ffi._shard_index_add_shard(
+                    self._index_handle,
+                    path_c,
+                    rffi.cast(rffi.ULONGLONG, r_uint64(0)),
+                    rffi.cast(rffi.ULONGLONG, r_uint64(0)),
+                ))
+            finally:
+                rffi.free_charp(path_c)
+            if rc < 0:
+                raise errors.StorageError("ShardIndex add_shard failed (error %d)" % rc)
         else:
-            h.close()
             try:
                 mmap_posix.unlinkat_c(self._dirfd, shard_name)
             except mmap_posix.MMapError:
@@ -290,13 +503,34 @@ class EphemeralTable(ZSetStore):
 
         return shard_path
 
+    def _check_shard_row_count(self, shard_path):
+        """Open a shard temporarily to check its row count, then close it."""
+        fn_c = rffi.str2charp(shard_path)
+        try:
+            handle = engine_ffi._shard_open(
+                fn_c,
+                rffi.cast(rffi.VOIDP, self._schema_buf),
+                rffi.cast(rffi.INT, 0),
+            )
+            if not handle:
+                return 0
+            count = intmask(engine_ffi._shard_row_count(handle))
+            engine_ffi._shard_close(handle)
+            return count
+        finally:
+            rffi.free_charp(fn_c)
+
     def close(self):
         if self.is_closed:
             return
         if self.memtable:
             self.memtable.free()
-        if self.index:
-            self.index.close_all()
+        if self._index_handle:
+            engine_ffi._shard_index_close(self._index_handle)
+            self._index_handle = lltype.nullptr(rffi.VOIDP.TO)
+        if self._schema_buf:
+            lltype.free(self._schema_buf, flavor="raw")
+            self._schema_buf = lltype.nullptr(rffi.CCHARP.TO)
         if self._dirfd != -1:
             rposix.close(self._dirfd)
             self._dirfd = -1

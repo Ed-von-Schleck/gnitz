@@ -140,6 +140,20 @@ eci = ExternalCompilationInfo(
         "  void *schema_desc,"
         "  void **out_region_ptrs, uint32_t *out_region_sizes,"
         "  uint32_t *out_row_count);",
+        # shard index (opaque FLSM lifecycle handle)
+        "void *gnitz_shard_index_create(uint32_t table_id, char *output_dir, void *schema_desc);",
+        "void gnitz_shard_index_close(void *handle);",
+        "int32_t gnitz_shard_index_load_manifest(void *handle, char *manifest_path);",
+        "int32_t gnitz_shard_index_add_shard(void *handle, char *shard_path, uint64_t min_lsn, uint64_t max_lsn);",
+        "int32_t gnitz_shard_index_compact(void *handle);",
+        "int32_t gnitz_shard_index_publish_manifest(void *handle, char *manifest_path);",
+        "int32_t gnitz_shard_index_try_cleanup(void *handle);",
+        "int32_t gnitz_shard_index_needs_compaction(void *handle);",
+        "uint64_t gnitz_shard_index_max_lsn(void *handle);",
+        "int32_t gnitz_shard_index_all_shard_ptrs(void *handle, void **out_ptrs, uint32_t max_ptrs);",
+        "int32_t gnitz_shard_index_find_pk("
+        "  void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  void **out_shard_ptrs, int32_t *out_row_indices, uint32_t max_results);",
         # read cursor (opaque N-way merge cursor)
         "void *gnitz_read_cursor_create("
         "  void **batch_region_ptrs, uint32_t *batch_region_sizes,"
@@ -622,6 +636,88 @@ _scatter_copy = rffi.llexternal(
      rffi.VOIDP,
      rffi.VOIDPP, rffi.UINTP,
      rffi.UINTP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Shard Index (opaque FLSM lifecycle handle)
+# ---------------------------------------------------------------------------
+
+_shard_index_create = rffi.llexternal(
+    "gnitz_shard_index_create",
+    [rffi.UINT, rffi.CCHARP, rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_shard_index_close = rffi.llexternal(
+    "gnitz_shard_index_close",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_shard_index_load_manifest = rffi.llexternal(
+    "gnitz_shard_index_load_manifest",
+    [rffi.VOIDP, rffi.CCHARP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_index_add_shard = rffi.llexternal(
+    "gnitz_shard_index_add_shard",
+    [rffi.VOIDP, rffi.CCHARP, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_index_compact = rffi.llexternal(
+    "gnitz_shard_index_compact",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_index_publish_manifest = rffi.llexternal(
+    "gnitz_shard_index_publish_manifest",
+    [rffi.VOIDP, rffi.CCHARP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_index_try_cleanup = rffi.llexternal(
+    "gnitz_shard_index_try_cleanup",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_index_needs_compaction = rffi.llexternal(
+    "gnitz_shard_index_needs_compaction",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_index_max_lsn = rffi.llexternal(
+    "gnitz_shard_index_max_lsn",
+    [rffi.VOIDP],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+_shard_index_all_shard_ptrs = rffi.llexternal(
+    "gnitz_shard_index_all_shard_ptrs",
+    [rffi.VOIDP, rffi.VOIDPP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_index_find_pk = rffi.llexternal(
+    "gnitz_shard_index_find_pk",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG,
+     rffi.VOIDPP, rffi.INTP, rffi.UINT],
     rffi.INT,
     compilation_info=eci,
 )

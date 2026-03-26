@@ -6,12 +6,12 @@ from rpython.rlib.rarithmetic import (
     r_uint64,
     intmask,
 )
+from rpython.rtyper.lltypesystem import rffi
 
 from gnitz.core import errors
 from gnitz.storage import (
     wal,
-    index,
-    manifest,
+    engine_ffi,
     memtable,
     mmap_posix,
 )
@@ -21,7 +21,7 @@ from gnitz.storage.ephemeral_table import EphemeralTable
 class PersistentTable(EphemeralTable):
     """
     Coordinator for a single durable Z-Set table.
-    Extends EphemeralTable by adding a Write-Ahead Log (WAL) and 
+    Extends EphemeralTable by adding a Write-Ahead Log (WAL) and
     a Manifest for persistent columnar shards.
     """
 
@@ -30,8 +30,6 @@ class PersistentTable(EphemeralTable):
         "table_id",
         "directory",
         "name",
-        "ref_counter",
-        "manifest_manager",
         "wal_writer",
     ]
 
@@ -44,10 +42,10 @@ class PersistentTable(EphemeralTable):
         memtable_arena_size=1 * 1024 * 1024,
         validate_checksums=False,
     ):
-        # EphemeralTable.__init__ handles directory creation, ref_counter,
-        # index, and memtable initialization.
+        # EphemeralTable.__init__ handles directory creation,
+        # ShardIndex handle, and memtable initialization.
         EphemeralTable.__init__(
-            self, directory, name, schema, table_id, 
+            self, directory, name, schema, table_id,
             memtable_arena_size, validate_checksums
         )
 
@@ -56,17 +54,22 @@ class PersistentTable(EphemeralTable):
         self._cursor_generation = 0
 
         # Avoid os.path.join (Appendix A §10 slicing proof failure)
-        manifest_path = directory + "/MANIFEST"
-        self.manifest_manager = manifest.ManifestManager(manifest_path)
+        self._manifest_path = directory + "/MANIFEST"
 
         # 1. Recover Shard Index from Manifest
-        if self.manifest_manager.exists():
-            reader = self.manifest_manager.load_current()
+        if os.path.exists(self._manifest_path):
+            path_c = rffi.str2charp(self._manifest_path)
             try:
-                self.index.populate_from_reader(self.table_id, reader)
-                self.current_lsn = reader.global_max_lsn + r_uint64(1)
+                rc = intmask(engine_ffi._shard_index_load_manifest(
+                    self._index_handle, path_c))
             finally:
-                reader.close()
+                rffi.free_charp(path_c)
+            if rc < 0:
+                raise errors.StorageError(
+                    "Manifest load failed (error %d)" % rc)
+            max_lsn = r_uint64(engine_ffi._shard_index_max_lsn(
+                self._index_handle))
+            self.current_lsn = max_lsn + r_uint64(1)
         else:
             self.current_lsn = r_uint64(1)
 
@@ -86,14 +89,26 @@ class PersistentTable(EphemeralTable):
         return self._build_cursor()
 
     def compact_if_needed(self):
-        if not self.index.needs_compaction:
+        if not intmask(engine_ffi._shard_index_needs_compaction(self._index_handle)):
             return
-        self.index.run_compact()
-        self.manifest_manager.publish_new_version(
-            self.index.get_metadata_list(), self.index.max_lsn()
-        )
+        rc = intmask(engine_ffi._shard_index_compact(self._index_handle))
+        if rc < 0:
+            raise errors.StorageError("ShardIndex compact failed (error %d)" % rc)
+        self._publish_manifest()
         mmap_posix.fsync_c(self._dirfd)
-        self.index.ref_counter.try_cleanup()
+        engine_ffi._shard_index_try_cleanup(self._index_handle)
+
+    def _publish_manifest(self):
+        """Publish current ShardIndex state as a manifest file."""
+        path_c = rffi.str2charp(self._manifest_path)
+        try:
+            rc = intmask(engine_ffi._shard_index_publish_manifest(
+                self._index_handle, path_c))
+        finally:
+            rffi.free_charp(path_c)
+        if rc < 0:
+            raise errors.StorageError(
+                "Manifest publish failed (error %d)" % rc)
 
     # -- Mutations ------------------------------------------------------------
 
@@ -199,31 +214,34 @@ class PersistentTable(EphemeralTable):
 
         shard_path = self.directory + "/" + shard_name
         lsn_max = self.current_lsn - r_uint64(1)
-        h = index.ShardHandle(
-            shard_path,
-            self.schema,
-            r_uint64(0),
-            lsn_max,
-            validate_checksums=self.validate_checksums,
-        )
+
+        # Check row count
+        shard_count = self._check_shard_row_count(shard_path)
+        has_data = shard_count > 0
 
         # 2. Logic: Update the Manifest (The Authority)
-        has_data = h.view.count > 0
         if has_data:
-            self.index.add_handle(h)
-            self.manifest_manager.publish_new_version(
-                self.index.get_metadata_list(), lsn_max
-            )
+            path_c = rffi.str2charp(shard_path)
+            try:
+                rc = intmask(engine_ffi._shard_index_add_shard(
+                    self._index_handle,
+                    path_c,
+                    rffi.cast(rffi.ULONGLONG, r_uint64(0)),
+                    rffi.cast(rffi.ULONGLONG, lsn_max),
+                ))
+            finally:
+                rffi.free_charp(path_c)
+            if rc < 0:
+                raise errors.StorageError(
+                    "ShardIndex add_shard failed (error %d)" % rc)
+            self._publish_manifest()
         else:
             # Ghost Shard cleanup
-            h.close()
             try:
                 mmap_posix.unlinkat_c(self._dirfd, shard_name)
             except mmap_posix.MMapError:
                 pass
-            self.manifest_manager.publish_new_version(
-                self.index.get_metadata_list(), lsn_max
-            )
+            self._publish_manifest()
 
         # 3. Dir fsync — makes shard rename + manifest rename durable.
         mmap_posix.fsync_c(self._dirfd)
@@ -250,7 +268,7 @@ class PersistentTable(EphemeralTable):
 
         if self.wal_writer:
             self.wal_writer.close()
-        
-        # Delegates to EphemeralTable to handle memtable.free(), 
-        # index.close_all(), and setting is_closed = True.
+
+        # Delegates to EphemeralTable to handle memtable.free(),
+        # ShardIndex close, and setting is_closed = True.
         EphemeralTable.close(self)

@@ -1331,6 +1331,213 @@ pub extern "C" fn gnitz_read_cursor_close(handle: *mut libc::c_void) {
 }
 
 // ---------------------------------------------------------------------------
+// Shard Index (opaque handle for FLSM lifecycle, compaction, manifest I/O)
+// ---------------------------------------------------------------------------
+
+/// Create a new ShardIndex handle.
+/// Caller owns the handle; free with gnitz_shard_index_close.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_create(
+    table_id: u32,
+    output_dir: *const libc::c_char,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if output_dir.is_null() || schema_desc.is_null() {
+            return ptr::null_mut();
+        }
+        let dir = unsafe { CStr::from_ptr(output_dir) }.to_str().unwrap_or("");
+        let schema = unsafe { *schema_desc };
+        let idx = crate::shard_index::ShardIndex::new(table_id, dir, schema);
+        Box::into_raw(Box::new(idx)) as *mut c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Close and free a ShardIndex handle.
+/// Drops all owned MappedShards (unmaps them).
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_close(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = panic::catch_unwind(|| {
+        unsafe { drop(Box::from_raw(handle as *mut crate::shard_index::ShardIndex)); }
+    });
+}
+
+/// Load manifest entries into the index.
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_load_manifest(
+    handle: *mut c_void,
+    manifest_path: *const libc::c_char,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() || manifest_path.is_null() {
+            return -1;
+        }
+        let idx = unsafe { &mut *(handle as *mut crate::shard_index::ShardIndex) };
+        let path = unsafe { CStr::from_ptr(manifest_path) }.to_str().unwrap_or("");
+        match idx.load_manifest(path) {
+            Ok(()) => 0,
+            Err(code) => code,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+/// Add a shard file to L0.
+/// Returns 1 if needs_compaction, 0 if not, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_add_shard(
+    handle: *mut c_void,
+    shard_path: *const libc::c_char,
+    min_lsn: u64,
+    max_lsn: u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() || shard_path.is_null() {
+            return -1;
+        }
+        let idx = unsafe { &mut *(handle as *mut crate::shard_index::ShardIndex) };
+        let path = unsafe { CStr::from_ptr(shard_path) }.to_str().unwrap_or("");
+        match idx.add_shard(path, min_lsn, max_lsn) {
+            Ok(()) => if idx.needs_compaction { 1 } else { 0 },
+            Err(code) => code,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+/// Run compaction (L0 → L1, horizontal, vertical).
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_compact(handle: *mut c_void) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() {
+            return -1;
+        }
+        let idx = unsafe { &mut *(handle as *mut crate::shard_index::ShardIndex) };
+        match idx.run_compact() {
+            Ok(()) => 0,
+            Err(code) => code,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+/// Publish current index state as a manifest file.
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_publish_manifest(
+    handle: *mut c_void,
+    manifest_path: *const libc::c_char,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() || manifest_path.is_null() {
+            return -1;
+        }
+        let idx = unsafe { &*(handle as *const crate::shard_index::ShardIndex) };
+        let path = unsafe { CStr::from_ptr(manifest_path) }.to_str().unwrap_or("");
+        match idx.publish_manifest(path) {
+            Ok(()) => 0,
+            Err(code) => code,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+/// Try to delete pending shard files.
+/// Returns count of successfully deleted files, or negative on panic.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_try_cleanup(handle: *mut c_void) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() {
+            return 0;
+        }
+        let idx = unsafe { &mut *(handle as *mut crate::shard_index::ShardIndex) };
+        idx.try_cleanup() as i32
+    });
+    result.unwrap_or(0)
+}
+
+/// Check if compaction is needed.
+/// Returns 1 if yes, 0 if no.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_needs_compaction(handle: *const c_void) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let idx = unsafe { &*(handle as *const crate::shard_index::ShardIndex) };
+    if idx.needs_compaction { 1 } else { 0 }
+}
+
+/// Return the maximum LSN across all shards.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_max_lsn(handle: *const c_void) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let idx = unsafe { &*(handle as *const crate::shard_index::ShardIndex) };
+    idx.max_lsn()
+}
+
+/// Fill out_ptrs with pointers to all MappedShard objects.
+/// Returns count of shards written, capped at max_ptrs.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_all_shard_ptrs(
+    handle: *const c_void,
+    out_ptrs: *mut *const c_void,
+    max_ptrs: u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() || out_ptrs.is_null() {
+            return 0;
+        }
+        let idx = unsafe { &*(handle as *const crate::shard_index::ShardIndex) };
+        let ptrs = idx.all_shard_ptrs();
+        let n = ptrs.len().min(max_ptrs as usize);
+        let out = unsafe { slice::from_raw_parts_mut(out_ptrs, n) };
+        for i in 0..n {
+            out[i] = ptrs[i] as *const c_void;
+        }
+        n as i32
+    });
+    result.unwrap_or(0)
+}
+
+/// Point lookup: find all shards containing key (key_lo, key_hi).
+/// Fills out_shard_ptrs and out_row_indices arrays.
+/// Returns count of matches, capped at max_results, or negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_shard_index_find_pk(
+    handle: *const c_void,
+    key_lo: u64,
+    key_hi: u64,
+    out_shard_ptrs: *mut *const c_void,
+    out_row_indices: *mut i32,
+    max_results: u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() || out_shard_ptrs.is_null() || out_row_indices.is_null() {
+            return 0;
+        }
+        let idx = unsafe { &*(handle as *const crate::shard_index::ShardIndex) };
+        let results = idx.find_pk(key_lo, key_hi);
+        let n = results.len().min(max_results as usize);
+        let ptrs = unsafe { slice::from_raw_parts_mut(out_shard_ptrs, n) };
+        let indices = unsafe { slice::from_raw_parts_mut(out_row_indices, n) };
+        for i in 0..n {
+            ptrs[i] = results[i].0 as *const c_void;
+            indices[i] = results[i].1 as i32;
+        }
+        n as i32
+    });
+    result.unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 

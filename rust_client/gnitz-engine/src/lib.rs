@@ -10,4 +10,5 @@ pub mod shard_file;
 pub mod compact;
 pub mod merge;
 pub mod read_cursor;
+pub mod shard_index;
 pub mod ffi;
