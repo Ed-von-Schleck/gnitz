@@ -33,23 +33,29 @@ pub struct MemBatch<'a> {
 }
 
 impl<'a> MemBatch<'a> {
+    #[inline]
     pub fn get_pk_lo(&self, row: usize) -> u64 {
         read_u64_le(self.pk_lo, row * 8)
     }
+    #[inline]
     pub fn get_pk_hi(&self, row: usize) -> u64 {
         read_u64_le(self.pk_hi, row * 8)
     }
+    #[inline]
     pub fn get_pk(&self, row: usize) -> u128 {
         let lo = self.get_pk_lo(row) as u128;
         let hi = self.get_pk_hi(row) as u128;
         (hi << 64) | lo
     }
+    #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
         i64::from_le_bytes(self.weight[row * 8..row * 8 + 8].try_into().unwrap())
     }
+    #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
         read_u64_le(self.null_bmp, row * 8)
     }
+    #[inline]
     pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &'a [u8] {
         let off = row * col_size;
         &self.col_data[payload_col][off..off + col_size]
@@ -75,16 +81,19 @@ impl MemBatchCursor {
         }
     }
 
+    #[inline]
     pub fn is_valid(&self) -> bool {
         self.position < self.count
     }
 
+    #[inline]
     pub fn advance(&mut self) {
         if self.position < self.count {
             self.position += 1;
         }
     }
 
+    #[inline]
     pub fn peek_key(&self, batches: &[MemBatch]) -> u128 {
         if self.is_valid() {
             batches[self.batch_idx].get_pk(self.position)
@@ -139,10 +148,12 @@ impl TournamentTree {
         tree
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
 
+    #[inline]
     pub fn min_cursor_idx(&self) -> usize {
         self.heap[0].cursor_idx
     }
@@ -363,6 +374,8 @@ pub fn compare_rows(
     row_b: usize,
 ) -> Ordering {
     let pk_index = schema.pk_index as usize;
+    let null_word_a = batch_a.get_null_word(row_a);
+    let null_word_b = batch_b.get_null_word(row_b);
     let mut payload_col: usize = 0;
 
     for ci in 0..schema.num_columns as usize {
@@ -370,9 +383,8 @@ pub fn compare_rows(
             continue;
         }
 
-        // Null comparison
-        let null_a = (batch_a.get_null_word(row_a) >> payload_col) & 1 != 0;
-        let null_b = (batch_b.get_null_word(row_b) >> payload_col) & 1 != 0;
+        let null_a = (null_word_a >> payload_col) & 1 != 0;
+        let null_b = (null_word_b >> payload_col) & 1 != 0;
         if null_a && null_b {
             payload_col += 1;
             continue;
@@ -462,7 +474,6 @@ pub fn merge_batches(
 
     let mut tree = TournamentTree::build(&cursors, batches, schema);
 
-    // Pending row state for consolidation
     let mut has_pending = false;
     let mut pending_batch: usize = 0;
     let mut pending_row: usize = 0;
@@ -484,7 +495,6 @@ pub fn merge_batches(
             pending_weight = cur_weight;
             has_pending = true;
         } else if cur_pk != pending_pk {
-            // Different PK: flush pending
             if pending_weight != 0 {
                 writer.write_row(&batches[pending_batch], pending_row, pending_weight);
             }
@@ -493,7 +503,6 @@ pub fn merge_batches(
             pending_pk = cur_pk;
             pending_weight = cur_weight;
         } else {
-            // Same PK: compare payload
             let ord = compare_rows(
                 schema,
                 &batches[pending_batch],
@@ -502,10 +511,8 @@ pub fn merge_batches(
                 ri,
             );
             if ord == Ordering::Equal {
-                // Same row: accumulate weight
                 pending_weight += cur_weight;
             } else {
-                // Same PK, different payload: flush pending, start new
                 if pending_weight != 0 {
                     writer.write_row(&batches[pending_batch], pending_row, pending_weight);
                 }
@@ -519,7 +526,6 @@ pub fn merge_batches(
         tree.advance_cursor(&mut cursors, batches, schema);
     }
 
-    // Flush last pending row
     if has_pending && pending_weight != 0 {
         writer.write_row(&batches[pending_batch], pending_row, pending_weight);
     }
@@ -706,28 +712,25 @@ pub fn sort_and_consolidate(
         return;
     }
 
-    // Build index array and sort by (PK, payload)
+    let pks: Vec<u128> = (0..n).map(|i| batch.get_pk(i)).collect();
+
     let mut indices: Vec<usize> = (0..n).collect();
     indices.sort_by(|&a, &b| {
-        let pk_a = batch.get_pk(a);
-        let pk_b = batch.get_pk(b);
-        match pk_a.cmp(&pk_b) {
+        match pks[a].cmp(&pks[b]) {
             Ordering::Equal => compare_rows(schema, batch, a, batch, b),
             ord => ord,
         }
     });
 
-    // Walk sorted indices with pending-group consolidation
     let mut pending_idx = indices[0];
-    let mut pending_pk = batch.get_pk(pending_idx);
+    let mut pending_pk = pks[pending_idx];
     let mut pending_weight = batch.get_weight(pending_idx);
 
     for pos in 1..n {
         let cur_idx = indices[pos];
-        let cur_pk = batch.get_pk(cur_idx);
+        let cur_pk = pks[cur_idx];
 
         if cur_pk != pending_pk {
-            // Different PK: flush pending
             if pending_weight != 0 {
                 writer.write_row(batch, pending_idx, pending_weight);
             }
@@ -735,7 +738,6 @@ pub fn sort_and_consolidate(
             pending_pk = cur_pk;
             pending_weight = batch.get_weight(cur_idx);
         } else {
-            // Same PK: compare payload
             let ord = compare_rows(schema, batch, pending_idx, batch, cur_idx);
             if ord == Ordering::Equal {
                 pending_weight += batch.get_weight(cur_idx);

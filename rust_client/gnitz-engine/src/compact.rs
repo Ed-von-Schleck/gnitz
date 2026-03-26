@@ -223,6 +223,7 @@ fn is_null(shard: &MappedShard, row: usize, col_idx: usize, pk_index: usize) -> 
     (null_word >> payload_idx) & 1 != 0
 }
 
+#[inline]
 pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
     match size {
         1 => bytes[0] as i8 as i64,
@@ -233,6 +234,7 @@ pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
     }
 }
 
+#[inline]
 pub(crate) fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> std::cmp::Ordering {
     let len_a = read_u32_le(a, 0) as usize;
     let len_b = read_u32_le(b, 0) as usize;

@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::ptr;
 
 use crate::compact::{
-    compare_german_strings, read_signed, SchemaDescriptor, SHORT_STRING_THRESHOLD,
+    compare_german_strings, read_signed, SchemaDescriptor,
     type_code::{F32 as TYPE_F32, F64 as TYPE_F64, STRING as TYPE_STRING, U128 as TYPE_U128},
 };
 use crate::merge::MemBatch;
@@ -82,30 +82,6 @@ impl<'a> CursorSource<'a> {
         }
     }
 
-    /// Column data as a raw pointer, indexed by LOGICAL (schema) column index.
-    /// Returns null for PK column or out of range.
-    #[inline]
-    fn col_ptr_by_logical(&self, row: usize, col_idx: usize, col_size: usize) -> *const u8 {
-        match self {
-            CursorSource::Batch(b) => {
-                // MemBatch uses payload indexing. Convert logical → payload.
-                let pk_index = 0; // batch always has pk at index 0 in col_data
-                // Actually, MemBatch.col_data is indexed by payload position.
-                // We need the schema pk_index to convert. But we don't have it here.
-                // Instead, return the raw pointer from the batch data.
-                // For PK column: return pk_lo pointer.
-                // This requires knowing pk_index, which we'll receive from the caller.
-                // For now, this method is not used on CursorSource directly.
-                // The ReadCursor.col_ptr() handles the mapping.
-                let _ = (b, row, col_idx, col_size, pk_index);
-                ptr::null()
-            }
-            CursorSource::Shard(s) => unsafe {
-                (**s).col_ptr_by_logical(row, col_idx, col_size)
-            },
-        }
-    }
-
     #[inline]
     fn blob_ptr(&self) -> *const u8 {
         match self {
@@ -166,12 +142,6 @@ fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
 // Row comparison across CursorSources
 // ---------------------------------------------------------------------------
 
-fn is_null_src(src: &CursorSource, row: usize, col_idx: usize, pk_index: usize) -> bool {
-    let null_word = src.get_null_word(row);
-    let payload_idx = if col_idx < pk_index { col_idx } else { col_idx - 1 };
-    (null_word >> payload_idx) & 1 != 0
-}
-
 fn compare_cursor_rows(
     schema: &SchemaDescriptor,
     src_a: &CursorSource,
@@ -180,19 +150,19 @@ fn compare_cursor_rows(
     row_b: usize,
 ) -> Ordering {
     let pk_index = schema.pk_index as usize;
-    let mut payload_col_a: usize = 0;
-    let mut payload_col_b: usize = 0;
+    let null_word_a = src_a.get_null_word(row_a);
+    let null_word_b = src_b.get_null_word(row_b);
+    let mut payload_col: usize = 0;
 
     for ci in 0..schema.num_columns as usize {
         if ci == pk_index {
             continue;
         }
 
-        let null_a = is_null_src(src_a, row_a, ci, pk_index);
-        let null_b = is_null_src(src_b, row_b, ci, pk_index);
+        let null_a = (null_word_a >> payload_col) & 1 != 0;
+        let null_b = (null_word_b >> payload_col) & 1 != 0;
         if null_a && null_b {
-            payload_col_a += 1;
-            payload_col_b += 1;
+            payload_col += 1;
             continue;
         }
         if null_a {
@@ -207,46 +177,45 @@ fn compare_cursor_rows(
 
         let ord = match col.type_code {
             TYPE_STRING => {
-                let ptr_a = src_a.get_col_ptr(row_a, payload_col_a, 16);
-                let ptr_b = src_b.get_col_ptr(row_b, payload_col_b, 16);
+                let ptr_a = src_a.get_col_ptr(row_a, payload_col, 16);
+                let ptr_b = src_b.get_col_ptr(row_b, payload_col, 16);
                 compare_german_strings(ptr_a, src_a.blob_slice(), ptr_b, src_b.blob_slice())
             }
             TYPE_U128 => {
-                let ba = src_a.get_col_ptr(row_a, payload_col_a, 16);
-                let bb = src_b.get_col_ptr(row_b, payload_col_b, 16);
+                let ba = src_a.get_col_ptr(row_a, payload_col, 16);
+                let bb = src_b.get_col_ptr(row_b, payload_col, 16);
                 let va = ((read_u64_le(ba, 8) as u128) << 64) | (read_u64_le(ba, 0) as u128);
                 let vb = ((read_u64_le(bb, 8) as u128) << 64) | (read_u64_le(bb, 0) as u128);
                 va.cmp(&vb)
             }
             TYPE_F64 => {
-                let ba = src_a.get_col_ptr(row_a, payload_col_a, 8);
-                let bb = src_b.get_col_ptr(row_b, payload_col_b, 8);
+                let ba = src_a.get_col_ptr(row_a, payload_col, 8);
+                let bb = src_b.get_col_ptr(row_b, payload_col, 8);
                 let va = f64::from_bits(read_u64_le(ba, 0));
                 let vb = f64::from_bits(read_u64_le(bb, 0));
                 va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
             }
             TYPE_F32 => {
-                let ba = src_a.get_col_ptr(row_a, payload_col_a, 4);
-                let bb = src_b.get_col_ptr(row_b, payload_col_b, 4);
+                let ba = src_a.get_col_ptr(row_a, payload_col, 4);
+                let bb = src_b.get_col_ptr(row_b, payload_col, 4);
                 let va = f32::from_bits(read_u32_le(ba, 0));
                 let vb = f32::from_bits(read_u32_le(bb, 0));
                 va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
             }
             _ => {
                 let va = read_signed(
-                    src_a.get_col_ptr(row_a, payload_col_a, col_size),
+                    src_a.get_col_ptr(row_a, payload_col, col_size),
                     col_size,
                 );
                 let vb = read_signed(
-                    src_b.get_col_ptr(row_b, payload_col_b, col_size),
+                    src_b.get_col_ptr(row_b, payload_col, col_size),
                     col_size,
                 );
                 va.cmp(&vb)
             }
         };
 
-        payload_col_a += 1;
-        payload_col_b += 1;
+        payload_col += 1;
 
         if ord != Ordering::Equal {
             return ord;
@@ -393,6 +362,7 @@ impl CursorTree {
         self.heap.is_empty()
     }
 
+    #[inline]
     fn node_less(
         &self,
         i: usize,
@@ -701,7 +671,6 @@ impl<'a> ReadCursor<'a> {
                 return;
             }
 
-            // Ghost: advance all min entries
             self.advance_buf.clear();
             self.advance_buf
                 .extend_from_slice(&tree.min_indices[..num_min]);

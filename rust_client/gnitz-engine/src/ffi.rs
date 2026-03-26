@@ -1089,6 +1089,21 @@ pub extern "C" fn gnitz_read_cursor_create(
     result.unwrap_or(ptr::null_mut())
 }
 
+unsafe fn write_cursor_state(
+    cursor: &crate::read_cursor::ReadCursor,
+    out_valid: *mut i32,
+    out_key_lo: *mut u64,
+    out_key_hi: *mut u64,
+    out_weight: *mut i64,
+    out_null_word: *mut u64,
+) {
+    if !out_valid.is_null() { *out_valid = cursor.valid as i32; }
+    if !out_key_lo.is_null() { *out_key_lo = cursor.current_key_lo; }
+    if !out_key_hi.is_null() { *out_key_hi = cursor.current_key_hi; }
+    if !out_weight.is_null() { *out_weight = cursor.current_weight; }
+    if !out_null_word.is_null() { *out_null_word = cursor.current_null_word; }
+}
+
 /// Seek cursor to first row >= (key_lo, key_hi).
 /// Populates out_ params with current row state.
 #[no_mangle]
@@ -1105,15 +1120,13 @@ pub extern "C" fn gnitz_read_cursor_seek(
     if handle.is_null() {
         return;
     }
-    let cursor = unsafe { &mut *(handle as *mut crate::read_cursor::ReadCursor) };
-    cursor.seek(key_lo, key_hi);
-    unsafe {
-        if !out_valid.is_null() { *out_valid = cursor.valid as i32; }
-        if !out_key_lo.is_null() { *out_key_lo = cursor.current_key_lo; }
-        if !out_key_hi.is_null() { *out_key_hi = cursor.current_key_hi; }
-        if !out_weight.is_null() { *out_weight = cursor.current_weight; }
-        if !out_null_word.is_null() { *out_null_word = cursor.current_null_word; }
-    }
+    let _ = panic::catch_unwind(|| {
+        let cursor = unsafe { &mut *(handle as *mut crate::read_cursor::ReadCursor) };
+        cursor.seek(key_lo, key_hi);
+        unsafe {
+            write_cursor_state(cursor, out_valid, out_key_lo, out_key_hi, out_weight, out_null_word);
+        }
+    });
 }
 
 /// Advance to next non-ghost row. Populates out_ params.
@@ -1129,15 +1142,13 @@ pub extern "C" fn gnitz_read_cursor_next(
     if handle.is_null() {
         return;
     }
-    let cursor = unsafe { &mut *(handle as *mut crate::read_cursor::ReadCursor) };
-    cursor.advance();
-    unsafe {
-        if !out_valid.is_null() { *out_valid = cursor.valid as i32; }
-        if !out_key_lo.is_null() { *out_key_lo = cursor.current_key_lo; }
-        if !out_key_hi.is_null() { *out_key_hi = cursor.current_key_hi; }
-        if !out_weight.is_null() { *out_weight = cursor.current_weight; }
-        if !out_null_word.is_null() { *out_null_word = cursor.current_null_word; }
-    }
+    let _ = panic::catch_unwind(|| {
+        let cursor = unsafe { &mut *(handle as *mut crate::read_cursor::ReadCursor) };
+        cursor.advance();
+        unsafe {
+            write_cursor_state(cursor, out_valid, out_key_lo, out_key_hi, out_weight, out_null_word);
+        }
+    });
 }
 
 /// Get column data pointer for current row (schema-indexed).
@@ -1151,8 +1162,11 @@ pub extern "C" fn gnitz_read_cursor_col_ptr(
     if handle.is_null() {
         return ptr::null();
     }
-    let cursor = unsafe { &*(handle as *const crate::read_cursor::ReadCursor) };
-    cursor.col_ptr(col_idx as usize, col_size as usize)
+    let result = panic::catch_unwind(|| {
+        let cursor = unsafe { &*(handle as *const crate::read_cursor::ReadCursor) };
+        cursor.col_ptr(col_idx as usize, col_size as usize)
+    });
+    result.unwrap_or(ptr::null())
 }
 
 /// Get blob arena base pointer for current row's source.
@@ -1163,8 +1177,11 @@ pub extern "C" fn gnitz_read_cursor_blob_ptr(
     if handle.is_null() {
         return ptr::null();
     }
-    let cursor = unsafe { &*(handle as *const crate::read_cursor::ReadCursor) };
-    cursor.blob_ptr()
+    let result = panic::catch_unwind(|| {
+        let cursor = unsafe { &*(handle as *const crate::read_cursor::ReadCursor) };
+        cursor.blob_ptr()
+    });
+    result.unwrap_or(ptr::null())
 }
 
 /// Close cursor and free Rust-side state.
@@ -1174,9 +1191,11 @@ pub extern "C" fn gnitz_read_cursor_close(handle: *mut libc::c_void) {
     if handle.is_null() {
         return;
     }
-    unsafe {
-        let _ = Box::from_raw(handle as *mut crate::read_cursor::ReadCursor);
-    }
+    let _ = panic::catch_unwind(|| {
+        unsafe {
+            let _ = Box::from_raw(handle as *mut crate::read_cursor::ReadCursor);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
