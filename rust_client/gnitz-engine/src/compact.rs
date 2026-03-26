@@ -5,8 +5,6 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
-#[cfg(test)]
-use std::fs;
 
 use crate::shard_reader::MappedShard;
 use crate::util::{read_u32_le, read_u64_le};
@@ -51,7 +49,6 @@ pub struct SchemaColumn {
 }
 
 #[repr(C)]
-#[derive(Clone)]
 pub struct SchemaDescriptor {
     pub num_columns: u32,
     pub pk_index: u32,
@@ -63,7 +60,6 @@ pub struct SchemaDescriptor {
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-#[derive(Clone)]
 pub struct GuardResult {
     pub guard_key_lo: u64,
     pub guard_key_hi: u64,
@@ -71,17 +67,22 @@ pub struct GuardResult {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
 // Shard cursor (position + ghost skip)
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ShardCursor {
-    pub(crate) shard_idx: usize,
-    pub(crate) position: usize,
-    pub(crate) count: usize,
+struct ShardCursor {
+    shard_idx: usize,
+    position: usize,
+    count: usize,
 }
 
 impl ShardCursor {
-    pub(crate) fn new(shard_idx: usize, shard: &MappedShard) -> Self {
+    fn new(shard_idx: usize, shard: &MappedShard) -> Self {
         let mut c = ShardCursor {
             shard_idx,
             position: 0,
@@ -91,20 +92,15 @@ impl ShardCursor {
         c
     }
 
-    pub(crate) fn is_valid(&self) -> bool {
+    fn is_valid(&self) -> bool {
         self.position < self.count
     }
 
-    pub(crate) fn advance(&mut self, shard: &MappedShard) {
+    fn advance(&mut self, shard: &MappedShard) {
         if self.is_valid() {
             self.position += 1;
             self.skip_ghosts(shard);
         }
-    }
-
-    pub(crate) fn seek(&mut self, shard: &MappedShard, key_lo: u64, key_hi: u64) {
-        self.position = shard.find_lower_bound(key_lo, key_hi);
-        self.skip_ghosts(shard);
     }
 
     fn skip_ghosts(&mut self, shard: &MappedShard) {
@@ -116,7 +112,7 @@ impl ShardCursor {
         }
     }
 
-    pub(crate) fn peek_key(&self, shard: &MappedShard) -> u128 {
+    fn peek_key(&self, shard: &MappedShard) -> u128 {
         if self.is_valid() {
             shard.get_pk(self.position)
         } else {
@@ -124,7 +120,7 @@ impl ShardCursor {
         }
     }
 
-    pub(crate) fn weight(&self, shard: &MappedShard) -> i64 {
+    fn weight(&self, shard: &MappedShard) -> i64 {
         if self.is_valid() {
             shard.get_weight(self.position)
         } else {
@@ -137,9 +133,9 @@ impl ShardCursor {
 // Row comparison
 // ---------------------------------------------------------------------------
 
-pub(crate) fn compare_rows(
+fn compare_rows(
     schema: &SchemaDescriptor,
-    shards: &[&MappedShard],
+    shards: &[MappedShard],
     shard_a: usize,
     row_a: usize,
     shard_b: usize,
@@ -220,7 +216,7 @@ pub(crate) fn compare_rows(
     std::cmp::Ordering::Equal
 }
 
-pub(crate) fn is_null(shard: &MappedShard, row: usize, col_idx: usize, pk_index: usize) -> bool {
+fn is_null(shard: &MappedShard, row: usize, col_idx: usize, pk_index: usize) -> bool {
     let null_word = shard.get_null_word(row);
     let payload_idx = if col_idx < pk_index { col_idx } else { col_idx - 1 };
     (null_word >> payload_idx) & 1 != 0
@@ -281,22 +277,19 @@ fn string_byte(struct_bytes: &[u8], blob: &[u8], length: usize, i: usize) -> u8 
 // Tournament tree (min-heap with u128 keys)
 // ---------------------------------------------------------------------------
 
-pub(crate) struct HeapNode {
-    pub(crate) key: u128,
-    pub(crate) cursor_idx: usize,
+struct HeapNode {
+    key: u128,
+    cursor_idx: usize,
 }
 
-pub(crate) struct TournamentTree {
-    pub(crate) heap: Vec<HeapNode>,
-    pub(crate) pos_map: Vec<i32>,
-    pub(crate) min_indices: Vec<usize>,
+struct TournamentTree {
+    heap: Vec<HeapNode>,
+    pos_map: Vec<i32>,       // cursor_idx → heap position (-1 if not in heap)
+    min_indices: Vec<usize>,  // reusable buffer for collect_min results
 }
 
 impl TournamentTree {
-    /// Build the heap. Requires shards/cursors/schema for full-row comparison.
-    pub(crate) fn build(
-        cursors: &[ShardCursor], shards: &[&MappedShard], schema: &SchemaDescriptor,
-    ) -> Self {
+    fn build(cursors: &[ShardCursor], shards: &[MappedShard]) -> Self {
         let n = cursors.len();
         let mut heap = Vec::with_capacity(n);
         let mut pos_map = vec![-1i32; n];
@@ -317,28 +310,27 @@ impl TournamentTree {
             pos_map,
             min_indices: Vec::with_capacity(n),
         };
+        // Build heap (bottom-up)
         let size = tree.heap.len();
         if size > 1 {
             for i in (0..size / 2).rev() {
-                tree.sift_down(i, shards, cursors, schema);
+                tree.sift_down(i);
             }
         }
         tree
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
 
-    pub(crate) fn min_key(&self) -> u128 {
+    fn min_key(&self) -> u128 {
         if self.heap.is_empty() { u128::MAX } else { self.heap[0].key }
     }
 
-    /// Collect all cursor indices whose (PK, payload) equals the root.
-    /// Uses heap pruning: if a node > root, skip its entire subtree.
-    pub(crate) fn collect_min_indices(
+    fn collect_min_indices(
         &mut self,
-        shards: &[&MappedShard],
+        shards: &[MappedShard],
         cursors: &[ShardCursor],
         schema: &SchemaDescriptor,
     ) -> usize {
@@ -351,14 +343,21 @@ impl TournamentTree {
     }
 
     fn collect_equal(
-        &mut self, idx: usize,
-        shards: &[&MappedShard], cursors: &[ShardCursor], schema: &SchemaDescriptor,
+        &mut self,
+        idx: usize,
+        shards: &[MappedShard],
+        cursors: &[ShardCursor],
+        schema: &SchemaDescriptor,
     ) {
-        if idx >= self.heap.len() { return; }
+        if idx >= self.heap.len() {
+            return;
+        }
+        // Compare this node to root (node 0)
         if idx == 0 || self.compare_to_root(idx, shards, cursors, schema) == std::cmp::Ordering::Equal {
             self.min_indices.push(self.heap[idx].cursor_idx);
             let left = 2 * idx + 1;
             let right = 2 * idx + 2;
+            // Must call with concrete indices to avoid borrow issues
             if left < self.heap.len() {
                 self.collect_equal(left, shards, cursors, schema);
             }
@@ -370,33 +369,46 @@ impl TournamentTree {
     }
 
     fn compare_to_root(
-        &self, idx: usize,
-        shards: &[&MappedShard], cursors: &[ShardCursor], schema: &SchemaDescriptor,
+        &self,
+        idx: usize,
+        shards: &[MappedShard],
+        cursors: &[ShardCursor],
+        schema: &SchemaDescriptor,
     ) -> std::cmp::Ordering {
         let a = &self.heap[idx];
         let b = &self.heap[0];
+        // Primary key comparison
         let key_ord = a.key.cmp(&b.key);
-        if key_ord != std::cmp::Ordering::Equal { return key_ord; }
+        if key_ord != std::cmp::Ordering::Equal {
+            return key_ord;
+        }
+        // Payload comparison
         let ca = &cursors[a.cursor_idx];
         let cb = &cursors[b.cursor_idx];
-        compare_rows(schema, shards, ca.shard_idx, ca.position, cb.shard_idx, cb.position)
+        compare_rows(
+            schema, shards,
+            ca.shard_idx, ca.position,
+            cb.shard_idx, cb.position,
+        )
     }
 
-    pub(crate) fn advance_cursor(
+    fn advance_cursor(
         &mut self,
         cursor_idx: usize,
         cursors: &mut [ShardCursor],
-        shards: &[&MappedShard],
-        schema: &SchemaDescriptor,
+        shards: &[MappedShard],
     ) {
         let heap_idx = self.pos_map[cursor_idx];
-        if heap_idx < 0 { return; }
+        if heap_idx < 0 {
+            return;
+        }
         let heap_idx = heap_idx as usize;
 
         let shard = &shards[cursors[cursor_idx].shard_idx];
         cursors[cursor_idx].advance(shard);
 
         if !cursors[cursor_idx].is_valid() {
+            // Remove from heap
             self.pos_map[cursor_idx] = -1;
             let last = self.heap.len() - 1;
             if heap_idx != last {
@@ -408,45 +420,35 @@ impl TournamentTree {
                 self.pos_map[last_cursor] = heap_idx as i32;
                 self.heap.pop();
                 if !self.heap.is_empty() && heap_idx < self.heap.len() {
-                    self.sift_down(heap_idx, shards, &*cursors, schema);
-                    self.sift_up(heap_idx, shards, &*cursors, schema);
+                    self.sift_down(heap_idx);
+                    self.sift_up(heap_idx);
                 }
             } else {
                 self.heap.pop();
             }
         } else {
+            // Update key and sift down (new key > old key, can only move down)
             let shard = &shards[cursors[cursor_idx].shard_idx];
             self.heap[heap_idx].key = cursors[cursor_idx].peek_key(shard);
-            self.sift_down(heap_idx, shards, &*cursors, schema);
+            self.sift_down(heap_idx);
         }
     }
 
-    /// Full-row comparison: (PK, then payload). Matches RPython _compare_nodes.
-    fn node_less(
-        &self, i: usize, j: usize,
-        shards: &[&MappedShard], cursors: &[ShardCursor], schema: &SchemaDescriptor,
-    ) -> bool {
-        let ki = self.heap[i].key;
-        let kj = self.heap[j].key;
-        if ki != kj { return ki < kj; }
-        let ci = &cursors[self.heap[i].cursor_idx];
-        let cj = &cursors[self.heap[j].cursor_idx];
-        compare_rows(schema, shards, ci.shard_idx, ci.position, cj.shard_idx, cj.position)
-            == std::cmp::Ordering::Less
+    /// Key-only comparison for heap ordering. Payload comparison is separate
+    /// (only needed in collect_min_indices for deduplication).
+    fn key_less(&self, i: usize, j: usize) -> bool {
+        self.heap[i].key < self.heap[j].key
     }
 
-    fn sift_down(
-        &mut self, mut idx: usize,
-        shards: &[&MappedShard], cursors: &[ShardCursor], schema: &SchemaDescriptor,
-    ) {
+    fn sift_down(&mut self, mut idx: usize) {
         loop {
             let mut smallest = idx;
             let left = 2 * idx + 1;
             let right = 2 * idx + 2;
-            if left < self.heap.len() && self.node_less(left, smallest, shards, cursors, schema) {
+            if left < self.heap.len() && self.key_less(left, smallest) {
                 smallest = left;
             }
-            if right < self.heap.len() && self.node_less(right, smallest, shards, cursors, schema) {
+            if right < self.heap.len() && self.key_less(right, smallest) {
                 smallest = right;
             }
             if smallest != idx {
@@ -462,13 +464,10 @@ impl TournamentTree {
         }
     }
 
-    fn sift_up(
-        &mut self, mut idx: usize,
-        shards: &[&MappedShard], cursors: &[ShardCursor], schema: &SchemaDescriptor,
-    ) {
+    fn sift_up(&mut self, mut idx: usize) {
         while idx > 0 {
             let parent = (idx - 1) / 2;
-            if self.node_less(idx, parent, shards, cursors, schema) {
+            if self.key_less(idx, parent) {
                 let ci = self.heap[idx].cursor_idx;
                 let cp = self.heap[parent].cursor_idx;
                 self.heap.swap(idx, parent);
@@ -486,19 +485,19 @@ impl TournamentTree {
 // Shard writer
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ShardWriter {
-    pub(crate) pk_lo: Vec<u8>,
-    pub(crate) pk_hi: Vec<u8>,
-    pub(crate) weight: Vec<u8>,
-    pub(crate) null_bitmap: Vec<u8>,
-    pub(crate) col_bufs: Vec<Vec<u8>>,
-    pub(crate) blob_heap: Vec<u8>,
+struct ShardWriter {
+    pk_lo: Vec<u8>,
+    pk_hi: Vec<u8>,
+    weight: Vec<u8>,
+    null_bitmap: Vec<u8>,
+    col_bufs: Vec<Vec<u8>>,
+    blob_heap: Vec<u8>,
     blob_cache: HashMap<(u64, usize), usize>,
-    pub(crate) count: usize,
+    count: usize,
 }
 
 impl ShardWriter {
-    pub(crate) fn new(schema: &SchemaDescriptor) -> Self {
+    fn new(schema: &SchemaDescriptor) -> Self {
         let mut col_bufs = Vec::with_capacity(schema.num_columns as usize);
         for ci in 0..schema.num_columns as usize {
             if ci == schema.pk_index as usize {
@@ -519,7 +518,7 @@ impl ShardWriter {
         }
     }
 
-    pub(crate) fn add_row(
+    fn add_row(
         &mut self,
         key: u128,
         weight: i64,
@@ -638,32 +637,26 @@ impl ShardWriter {
         schema: &SchemaDescriptor,
     ) -> Result<(), i32> {
         let pk_index = schema.pk_index as usize;
-        let mut regions: Vec<&[u8]> = Vec::new();
-        regions.push(&self.pk_lo);
-        regions.push(&self.pk_hi);
-        regions.push(&self.weight);
-        regions.push(&self.null_bitmap);
+        let mut regions: Vec<(*const u8, usize)> = Vec::new();
+        regions.push((self.pk_lo.as_ptr(), self.pk_lo.len()));
+        regions.push((self.pk_hi.as_ptr(), self.pk_hi.len()));
+        regions.push((self.weight.as_ptr(), self.weight.len()));
+        regions.push((self.null_bitmap.as_ptr(), self.null_bitmap.len()));
         for ci in 0..schema.num_columns as usize {
             if ci == pk_index {
                 continue;
             }
-            regions.push(&self.col_bufs[ci]);
+            regions.push((self.col_bufs[ci].as_ptr(), self.col_bufs[ci].len()));
         }
-        regions.push(&self.blob_heap);
+        regions.push((self.blob_heap.as_ptr(), self.blob_heap.len()));
 
-        let (pk_lo_s, pk_hi_s) = if self.count > 0 {
-            unsafe {(
-                std::slice::from_raw_parts(self.pk_lo.as_ptr() as *const u64, self.count),
-                std::slice::from_raw_parts(self.pk_hi.as_ptr() as *const u64, self.count),
-            )}
-        } else {
-            (&[][..], &[][..])
-        };
-
-        crate::shard_file::write_shard(
-            libc::AT_FDCWD, path, table_id, self.count,
-            &regions, pk_lo_s, pk_hi_s, true,
-        )
+        let image = crate::shard_file::build_shard_image(
+            table_id, self.count as u32, &regions,
+        );
+        let rc = crate::shard_file::write_shard_at(
+            libc::AT_FDCWD, path, &image, true,
+        );
+        if rc < 0 { Err(rc) } else { Ok(()) }
     }
 }
 
@@ -702,23 +695,27 @@ pub fn compact_shards(
     table_id: u32,
 ) -> i32 {
     // Open all input shards
-    let mut owned_shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
+    let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
     for f in input_files {
         match MappedShard::open(f, schema, false) {
-            Ok(s) => owned_shards.push(s),
+            Ok(s) => shards.push(s),
             Err(e) => return e,
         }
     }
-    let shards: Vec<&MappedShard> = owned_shards.iter().collect();
 
+    // Create cursors
     let mut cursors: Vec<ShardCursor> = Vec::with_capacity(shards.len());
     for i in 0..shards.len() {
-        cursors.push(ShardCursor::new(i, shards[i]));
+        cursors.push(ShardCursor::new(i, &shards[i]));
     }
 
-    let mut tree = TournamentTree::build(&cursors, &shards, schema);
+    // Build tournament tree
+    let mut tree = TournamentTree::build(&cursors, &shards);
+
+    // Create writer
     let mut writer = ShardWriter::new(schema);
 
+    // Merge loop — reusable buffer to avoid per-iteration allocation
     let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
     while !tree.is_empty() {
         let min_key = tree.min_key();
@@ -727,23 +724,25 @@ pub fn compact_shards(
         let mut net_weight: i64 = 0;
         for i in 0..num_min {
             let ci = tree.min_indices[i];
-            net_weight += cursors[ci].weight(shards[cursors[ci].shard_idx]);
+            net_weight += cursors[ci].weight(&shards[cursors[ci].shard_idx]);
         }
 
         if net_weight != 0 {
             let exemplar = tree.min_indices[0];
             let shard_idx = cursors[exemplar].shard_idx;
             let row = cursors[exemplar].position;
-            writer.add_row(min_key, net_weight, shards[shard_idx], row, schema);
+            writer.add_row(min_key, net_weight, &shards[shard_idx], row, schema);
         }
 
+        // Copy indices to reusable buffer to avoid borrow conflict
         advance_buf.clear();
         advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
         for &ci in &advance_buf {
-            tree.advance_cursor(ci, &mut cursors, &shards, schema);
+            tree.advance_cursor(ci, &mut cursors, &shards);
         }
     }
 
+    // Finalize output
     match writer.finalize(output_file, table_id, schema) {
         Ok(()) => 0,
         Err(e) => e,
@@ -763,22 +762,24 @@ pub fn merge_and_route(
     let num_guards = guard_keys.len();
 
     // Open all input shards
-    let mut owned_shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
+    let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
     for f in input_files {
         match MappedShard::open(f, schema, false) {
-            Ok(s) => owned_shards.push(s),
+            Ok(s) => shards.push(s),
             Err(e) => return e,
         }
     }
-    let shards: Vec<&MappedShard> = owned_shards.iter().collect();
 
+    // Create cursors
     let mut cursors: Vec<ShardCursor> = Vec::with_capacity(shards.len());
     for i in 0..shards.len() {
-        cursors.push(ShardCursor::new(i, shards[i]));
+        cursors.push(ShardCursor::new(i, &shards[i]));
     }
 
-    let mut tree = TournamentTree::build(&cursors, &shards, schema);
+    // Build tournament tree
+    let mut tree = TournamentTree::build(&cursors, &shards);
 
+    // Create writers (one per guard)
     let mut writers: Vec<ShardWriter> = Vec::with_capacity(num_guards);
     let out_dir_str = output_dir.to_str().unwrap_or("");
     let mut out_filenames: Vec<String> = Vec::with_capacity(num_guards);
@@ -786,10 +787,15 @@ pub fn merge_and_route(
         writers.push(ShardWriter::new(schema));
         out_filenames.push(format!(
             "{}/shard_{}_{}_{}_G{}.db",
-            out_dir_str, table_id, lsn_tag, format!("L{}", level_num), i
+            out_dir_str,
+            table_id,
+            lsn_tag,
+            format!("L{}", level_num),
+            i
         ));
     }
 
+    // Merge loop with routing — reusable buffer
     let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
     while !tree.is_empty() {
         let min_key = tree.min_key();
@@ -798,7 +804,7 @@ pub fn merge_and_route(
         let mut net_weight: i64 = 0;
         for i in 0..num_min {
             let ci = tree.min_indices[i];
-            net_weight += cursors[ci].weight(shards[cursors[ci].shard_idx]);
+            net_weight += cursors[ci].weight(&shards[cursors[ci].shard_idx]);
         }
 
         if net_weight != 0 {
@@ -806,13 +812,13 @@ pub fn merge_and_route(
             let exemplar = tree.min_indices[0];
             let shard_idx = cursors[exemplar].shard_idx;
             let row = cursors[exemplar].position;
-            writers[guard_idx].add_row(min_key, net_weight, shards[shard_idx], row, schema);
+            writers[guard_idx].add_row(min_key, net_weight, &shards[shard_idx], row, schema);
         }
 
         advance_buf.clear();
         advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
         for &ci in &advance_buf {
-            tree.advance_cursor(ci, &mut cursors, &shards, schema);
+            tree.advance_cursor(ci, &mut cursors, &shards);
         }
     }
 
@@ -852,6 +858,7 @@ pub fn merge_and_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     // Helper: build a minimal shard file in memory and write to disk
     fn write_test_shard(path: &str, pks: &[u64], weights: &[i64], schema: &SchemaDescriptor) {

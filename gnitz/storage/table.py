@@ -1,107 +1,256 @@
 # gnitz/storage/table.py
-#
-# Thin FFI wrapper around Rust RustTable (persistent mode).
 
-from rpython.rlib.rarithmetic import r_uint64, intmask
-from rpython.rtyper.lltypesystem import rffi, lltype
+import os
+from rpython.rlib.rarithmetic import (
+    r_int64,
+    r_uint64,
+    intmask,
+)
 
 from gnitz.core import errors
-from gnitz.storage import engine_ffi
+from gnitz.storage import (
+    wal,
+    index,
+    manifest,
+    memtable,
+    mmap_posix,
+)
 from gnitz.storage.ephemeral_table import EphemeralTable
 
 
 class PersistentTable(EphemeralTable):
+    """
+    Coordinator for a single durable Z-Set table.
+    Extends EphemeralTable by adding a Write-Ahead Log (WAL) and 
+    a Manifest for persistent columnar shards.
+    """
 
-    def __init__(self, directory, name, schema, table_id=1,
-                 memtable_arena_size=1 * 1024 * 1024, validate_checksums=False):
-        self.schema = schema
-        self.table_id = table_id
-        self.directory = directory
-        self.name = name
-        self.validate_checksums = validate_checksums
-        self.is_closed = False
+    _immutable_fields_ = [
+        "schema",
+        "table_id",
+        "directory",
+        "name",
+        "ref_counter",
+        "manifest_manager",
+        "wal_writer",
+    ]
 
-        schema_buf = engine_ffi.pack_schema(schema)
-        try:
-            with rffi.scoped_str2charp(directory) as dir_p:
-                with rffi.scoped_str2charp(name) as name_p:
-                    handle = engine_ffi._table_create_persistent(
-                        dir_p, name_p,
-                        rffi.cast(rffi.VOIDP, schema_buf),
-                        rffi.cast(rffi.UINT, table_id),
-                        rffi.cast(rffi.ULONGLONG, memtable_arena_size),
-                    )
-            if not handle:
-                raise errors.StorageError("table_create_persistent failed")
-            self._handle = handle
-        finally:
-            lltype.free(schema_buf, flavor="raw")
+    def __init__(
+        self,
+        directory,
+        name,
+        schema,
+        table_id=1,
+        memtable_arena_size=1 * 1024 * 1024,
+        validate_checksums=False,
+    ):
+        # EphemeralTable.__init__ handles directory creation, ref_counter,
+        # index, and memtable initialization.
+        EphemeralTable.__init__(
+            self, directory, name, schema, table_id, 
+            memtable_arena_size, validate_checksums
+        )
 
-        from gnitz.storage import comparator as storage_comparator
-        self._retract_accessor = storage_comparator.RetractRowAccessor(schema)
-        self.current_lsn = r_uint64(engine_ffi._table_current_lsn(self._handle))
+        # Monotonic counter incremented on every flush().
+        # Used by cursors to detect when the MemTable has been rotated.
+        self._cursor_generation = 0
+
+        # Avoid os.path.join (Appendix A §10 slicing proof failure)
+        manifest_path = directory + "/MANIFEST"
+        self.manifest_manager = manifest.ManifestManager(manifest_path)
+
+        # 1. Recover Shard Index from Manifest
+        if self.manifest_manager.exists():
+            reader = self.manifest_manager.load_current()
+            try:
+                self.index.populate_from_reader(self.table_id, reader)
+                self.current_lsn = reader.global_max_lsn + r_uint64(1)
+            finally:
+                reader.close()
+        else:
+            self.current_lsn = r_uint64(1)
+
+        # 2. Initialize Durability Layer
+        wal_path = directory + "/" + name + ".wal"
+        self.wal_writer = wal.WALWriter(wal_path, self.schema)
+
+        # 3. Replay WAL into MemTable to recover recent un-flushed writes
+        self.recover_from_wal(wal_path)
+
+    def _erase_stale_shards(self):
+        """No-op: persistent shards are tracked by MANIFEST and must survive restarts."""
+
+    # -- Cursor Interface Override --------------------------------------------
+
+    def create_cursor(self):
+        return self._build_cursor()
+
+    def compact_if_needed(self):
+        if not self.index.needs_compaction:
+            return
+        self.index.run_compact()
+        self.manifest_manager.publish_new_version(
+            self.index.get_metadata_list(), self.index.max_lsn()
+        )
+        mmap_posix.fsync_c(self._dirfd)
+        self.index.ref_counter.try_cleanup()
+
+    # -- Mutations ------------------------------------------------------------
 
     def ingest_batch(self, batch):
+        """
+        Durable Z-Set batch update.
+        Atomicity: Batch is committed to WAL before it becomes visible in the
+        MemTable.
+        """
         if self.is_closed:
             raise errors.StorageError("Table '%s' is closed" % self.name)
+
         if batch.length() == 0:
             return
+
         lsn = self.current_lsn
         self.current_lsn += r_uint64(1)
 
-        num_payload = len(self.schema.columns) - 1
-        desc_buf = lltype.malloc(
-            rffi.CCHARP.TO, engine_ffi.BATCH_DESC_SIZE, flavor="raw"
-        )
-        col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
-        col_sizes = lltype.malloc(rffi.ULONGLONGP.TO, num_payload, flavor="raw")
+        # Step 1: Write to Write-Ahead Log (Durability)
+        if self._has_wal:
+            self.wal_writer.append_batch(lsn, self.table_id, batch)
+
+        # Step 2: Write to MemTable (Visibility)
+        # Guard against MemTableFullError: the WAL write above has already
+        # committed, so the data is durable. Flush the MemTable to a shard
+        # and retry so that the batch also becomes visible in memory.
         try:
-            engine_ffi.pack_batch_desc(desc_buf, batch, self.schema, num_payload, col_ptrs, col_sizes)
-            rc = engine_ffi._table_ingest_batch(
-                self._handle,
-                rffi.cast(rffi.VOIDP, desc_buf),
-                rffi.cast(rffi.ULONGLONG, lsn),
-            )
-            if intmask(rc) < 0:
-                raise errors.StorageError("table_ingest_batch failed (%d)" % intmask(rc))
-        finally:
-            lltype.free(col_ptrs, flavor="raw")
-            lltype.free(col_sizes, flavor="raw")
-            lltype.free(desc_buf, flavor="raw")
+            self.memtable.upsert_batch(batch)
+            if self.memtable.should_flush():
+                self.flush()
+        except errors.MemTableFullError:
+            self.flush()
+            self.memtable.upsert_batch(batch)
 
     def ingest_batch_memonly(self, batch):
+        """Ingest into memtable only, bypassing the WAL.
+
+        Used by workers for DDL sync: the master owns the system-table WAL,
+        so workers must never touch it. This method uses the EphemeralTable
+        flush path (no WAL, no manifest) if the memtable overflows.
+        """
         if self.is_closed:
             raise errors.StorageError("Table '%s' is closed" % self.name)
         if batch.length() == 0:
             return
-        num_payload = len(self.schema.columns) - 1
-        desc_buf = lltype.malloc(
-            rffi.CCHARP.TO, engine_ffi.BATCH_DESC_SIZE, flavor="raw"
-        )
-        col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
-        col_sizes = lltype.malloc(rffi.ULONGLONGP.TO, num_payload, flavor="raw")
         try:
-            engine_ffi.pack_batch_desc(desc_buf, batch, self.schema, num_payload, col_ptrs, col_sizes)
-            rc = engine_ffi._table_ingest_batch_memonly(
-                self._handle,
-                rffi.cast(rffi.VOIDP, desc_buf),
-            )
-            if intmask(rc) < 0:
-                raise errors.StorageError("table_ingest_batch_memonly failed (%d)" % intmask(rc))
+            self.memtable.upsert_batch(batch)
+            if self.memtable.should_flush():
+                EphemeralTable.flush(self)
+        except errors.MemTableFullError:
+            EphemeralTable.flush(self)
+            self.memtable.upsert_batch(batch)
+
+    def recover_from_wal(self, wal_path):
+        """
+        Synchronizes the MemTable state with the persistent WAL during startup.
+        """
+        if not os.path.exists(wal_path):
+            return
+
+        boundary = self.current_lsn
+        reader = wal.WALReader(wal_path, self.schema)
+
+        try:
+            while True:
+                block = reader.read_next_block()
+                if block is None:
+                    break
+
+                try:
+                    if block.tid != self.table_id or block.lsn < boundary:
+                        continue
+
+                    self.memtable.upsert_batch(block.batch)
+
+                    if block.lsn >= self.current_lsn:
+                        self.current_lsn = block.lsn + r_uint64(1)
+                finally:
+                    block.free()
         finally:
-            lltype.free(col_ptrs, flavor="raw")
-            lltype.free(col_sizes, flavor="raw")
-            lltype.free(desc_buf, flavor="raw")
+            reader.close()
+
+    # -- Maintenance ----------------------------------------------------------
 
     def flush(self):
+        """
+        Transitions MemTable state to a permanent shard and updates the manifest.
+        """
         if self.is_closed:
             raise errors.StorageError("Table '%s' is closed" % self.name)
-        rc = engine_ffi._table_flush(self._handle)
-        rc_int = intmask(rc)
-        if rc_int < 0:
-            raise errors.StorageError("table_flush failed (%d)" % rc_int)
-        shard_name = "shard_%d_%d.db" % (self.table_id, intmask(self.current_lsn))
-        return "" if rc_int == 0 else self.directory + "/" + shard_name
 
-    def compact_if_needed(self):
-        engine_ffi._table_compact_if_needed(self._handle)
+        mt = self.memtable
+        if mt.is_empty():
+            return ""
+
+        shard_name = "shard_%d_%d.db" % (self.table_id, intmask(self.current_lsn))
+
+        # 1. Physical: Build and sync the columnar file
+        wrote = self.memtable.flush(self._dirfd, shard_name, self.table_id)
+
+        if not wrote:
+            return ""
+
+        shard_path = self.directory + "/" + shard_name
+        lsn_max = self.current_lsn - r_uint64(1)
+        h = index.ShardHandle(
+            shard_path,
+            self.schema,
+            r_uint64(0),
+            lsn_max,
+            validate_checksums=self.validate_checksums,
+        )
+
+        # 2. Logic: Update the Manifest (The Authority)
+        has_data = h.view.count > 0
+        if has_data:
+            self.index.add_handle(h)
+            self.manifest_manager.publish_new_version(
+                self.index.get_metadata_list(), lsn_max
+            )
+        else:
+            # Ghost Shard cleanup
+            h.close()
+            try:
+                mmap_posix.unlinkat_c(self._dirfd, shard_name)
+            except mmap_posix.MMapError:
+                pass
+            self.manifest_manager.publish_new_version(
+                self.index.get_metadata_list(), lsn_max
+            )
+
+        # 3. Dir fsync — makes shard rename + manifest rename durable.
+        mmap_posix.fsync_c(self._dirfd)
+
+        # 4. WAL truncation — safe because manifest is now durable.
+        if has_data:
+            self.wal_writer.truncate_before_lsn(self.current_lsn)
+
+        # 5. Rotation: reset MemTable (keeps accumulator + bloom buffers)
+        self.memtable.reset()
+
+        # Bump generation to notify UnifiedCursors that sources have changed
+        self._cursor_generation += 1
+
+        return shard_path
+
+    def close(self):
+        """
+        Idempotent closure. The WAL writer must be closed before the parent
+        frees the memory arenas to ensure consistent teardown if a crash occurs.
+        """
+        if self.is_closed:
+            return
+
+        if self.wal_writer:
+            self.wal_writer.close()
+        
+        # Delegates to EphemeralTable to handle memtable.free(), 
+        # index.close_all(), and setting is_closed = True.
+        EphemeralTable.close(self)

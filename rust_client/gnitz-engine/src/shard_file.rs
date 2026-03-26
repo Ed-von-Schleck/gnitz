@@ -1,71 +1,79 @@
-//! Shared shard file serialization and atomic write.
+//! Shard file image building and atomic writing.
 //!
-//! Both the compaction path (`compact.rs`) and the RPython flush path
-//! (via FFI) call `write_shard` to produce identical shard files.
+//! Shared by both the compaction path (`compact.rs`) and the RPython flush
+//! path (via `gnitz_write_shard` FFI).
 
 use std::ffi::CStr;
+use std::ptr;
+
+use libc::c_int;
 
 use crate::layout::*;
 use crate::util::write_u64_le;
-use crate::{xor8, xxh};
+use crate::xor8;
+use crate::xxh;
 
-// Error codes returned to callers (including FFI).
-pub const ERR_BAD_ARGS: i32 = -1;
-pub const ERR_OPENAT: i32 = -2;
-pub const ERR_WRITE: i32 = -3;
-pub const ERR_FDATASYNC: i32 = -4;
-pub const ERR_CLOSE: i32 = -5;
-pub const ERR_RENAMEAT: i32 = -6;
-pub const ERR_XOR8: i32 = -7;
-
-#[inline]
-pub fn align64(val: usize) -> usize {
+fn align64(val: usize) -> usize {
     (val + ALIGNMENT - 1) & !(ALIGNMENT - 1)
 }
 
-/// Write a complete shard file atomically via openat/fdatasync/renameat.
+/// Build a complete shard file image from pre-built region buffers.
 ///
-/// - `dirfd`:      directory fd, or `libc::AT_FDCWD` (-100) for absolute/CWD paths
-/// - `filename`:   basename (relative to dirfd) or absolute path
-/// - `table_id`:   table identifier embedded in the shard header
-/// - `row_count`:  number of rows (0 is valid — produces an empty shard)
-/// - `regions`:    ordered slice of column data regions
-/// - `pk_lo`, `pk_hi`: PK arrays for xor8 construction (each `row_count` elements)
-/// - `durable`:    if false, skip fdatasync
-pub fn write_shard(
-    dirfd: i32,
-    filename: &CStr,
+/// `regions` is an array of (pointer, size) pairs in the canonical order:
+///   pk_lo, pk_hi, weight, null_bitmap, [non-PK columns...], blob_arena.
+///
+/// The XOR8 filter is built internally from the first two regions (pk_lo,
+/// pk_hi) when `row_count > 0`.
+///
+/// Returns the complete file image ready for writing.
+pub fn build_shard_image(
     table_id: u32,
-    row_count: usize,
-    regions: &[&[u8]],
-    pk_lo: &[u64],
-    pk_hi: &[u64],
-    durable: bool,
-) -> Result<(), i32> {
-    let xor8_data = if row_count > 0 {
-        let filter = xor8::build(pk_lo, pk_hi).ok_or(ERR_XOR8)?;
-        Some(xor8::serialize(&filter))
-    } else {
-        None
-    };
-
+    row_count: u32,
+    regions: &[(*const u8, usize)],
+) -> Vec<u8> {
     let num_regions = regions.len();
-    let dir_offset = HEADER_SIZE;
     let dir_size = num_regions * DIR_ENTRY_SIZE;
+    let dir_offset = HEADER_SIZE;
 
+    // Compute region offsets with 64-byte alignment
     let mut pos = align64(dir_offset + dir_size);
     let mut region_offsets = Vec::with_capacity(num_regions);
-    for r in regions {
+    for &(_ptr, sz) in regions {
         region_offsets.push(pos);
-        pos = align64(pos + r.len());
+        pos = align64(pos + sz);
     }
     let data_end = if num_regions == 0 {
         HEADER_SIZE
     } else {
-        region_offsets[num_regions - 1] + regions[num_regions - 1].len()
+        region_offsets[num_regions - 1] + regions[num_regions - 1].1
     };
 
-    let xor8_offset = xor8_data.as_ref().map_or(0, |_| align64(data_end));
+    // Build XOR8 filter from pk_lo (region 0) and pk_hi (region 1)
+    let xor8_filter = if row_count > 0 && num_regions >= 2 {
+        let (pk_lo_ptr, pk_lo_sz) = regions[0];
+        let (pk_hi_ptr, pk_hi_sz) = regions[1];
+        let n = row_count as usize;
+        if !pk_lo_ptr.is_null()
+            && !pk_hi_ptr.is_null()
+            && pk_lo_sz >= n * 8
+            && pk_hi_sz >= n * 8
+        {
+            let lo = unsafe { std::slice::from_raw_parts(pk_lo_ptr as *const u64, n) };
+            let hi = unsafe { std::slice::from_raw_parts(pk_hi_ptr as *const u64, n) };
+            xor8::build(lo, hi)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let xor8_data = xor8_filter.as_ref().map(|f| xor8::serialize(f));
+    let xor8_offset = if xor8_data.is_some() {
+        align64(data_end)
+    } else {
+        0
+    };
     let xor8_size = xor8_data.as_ref().map_or(0, |d| d.len());
     let total_size = if xor8_data.is_some() {
         xor8_offset + xor8_size
@@ -73,8 +81,10 @@ pub fn write_shard(
         data_end
     };
 
+    // Build file image
     let mut image = vec![0u8; total_size];
 
+    // Header
     write_u64_le(&mut image, OFF_MAGIC, SHARD_MAGIC);
     write_u64_le(&mut image, OFF_VERSION, SHARD_VERSION);
     write_u64_le(&mut image, OFF_ROW_COUNT, row_count as u64);
@@ -83,97 +93,103 @@ pub fn write_shard(
     write_u64_le(&mut image, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut image, OFF_XOR8_SIZE, xor8_size as u64);
 
+    // Directory entries + region data
     for i in 0..num_regions {
         let r_off = region_offsets[i];
-        let r_sz = regions[i].len();
-        image[r_off..r_off + r_sz].copy_from_slice(regions[i]);
+        let (src_ptr, r_sz) = regions[i];
+
+        // Copy region data
+        if r_sz > 0 && !src_ptr.is_null() {
+            unsafe {
+                ptr::copy_nonoverlapping(src_ptr, image[r_off..].as_mut_ptr(), r_sz);
+            }
+        }
+
+        // Compute checksum over the copied data in the image
         let cs = if r_sz > 0 {
             xxh::checksum(&image[r_off..r_off + r_sz])
         } else {
             0
         };
+
+        // Write directory entry: (offset, size, checksum)
         let d = dir_offset + i * DIR_ENTRY_SIZE;
         write_u64_le(&mut image, d, r_off as u64);
         write_u64_le(&mut image, d + 8, r_sz as u64);
         write_u64_le(&mut image, d + 16, cs);
     }
 
+    // XOR8 footer
     if let Some(ref data) = xor8_data {
         image[xor8_offset..xor8_offset + data.len()].copy_from_slice(data);
     }
 
-    atomic_write(dirfd, filename, &image, durable)
+    image
 }
 
-fn atomic_write(
-    dirfd: i32,
-    filename: &CStr,
-    data: &[u8],
-    durable: bool,
-) -> Result<(), i32> {
-    let name_bytes = filename.to_bytes();
-    let mut tmp_path: Vec<u8> = Vec::with_capacity(name_bytes.len() + 5);
-    tmp_path.extend_from_slice(name_bytes);
-    tmp_path.extend_from_slice(b".tmp\0");
+/// Write `image` atomically using openat/fdatasync/renameat.
+///
+/// `dirfd`: directory fd for openat/renameat.  Use `libc::AT_FDCWD` (-100)
+/// for absolute paths.
+///
+/// Returns 0 on success, -3 on I/O error.
+pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool) -> i32 {
+    // Construct ".tmp" name
+    let base_bytes = basename.to_bytes();
+    let mut tmp_buf = Vec::with_capacity(base_bytes.len() + 5);
+    tmp_buf.extend_from_slice(base_bytes);
+    tmp_buf.extend_from_slice(b".tmp\0");
+    let tmp_name = tmp_buf.as_ptr() as *const libc::c_char;
 
-    let fd = unsafe {
-        libc::openat(
+    unsafe {
+        // Open temporary file
+        let fd = libc::openat(
             dirfd,
-            tmp_path.as_ptr() as *const libc::c_char,
+            tmp_name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
             0o644,
-        )
-    };
-    if fd < 0 {
-        return Err(ERR_OPENAT);
-    }
+        );
+        if fd < 0 {
+            return -3;
+        }
 
-    let mut written: usize = 0;
-    while written < data.len() {
-        let n = unsafe {
-            libc::write(
+        // Write all bytes (loop handles partial writes / EINTR)
+        let mut written: usize = 0;
+        let total = image.len();
+        while written < total {
+            let ret = libc::write(
                 fd,
-                data[written..].as_ptr() as *const libc::c_void,
-                data.len() - written,
-            )
-        };
-        if n < 0 {
-            let e = unsafe { *libc::__errno_location() };
-            if e == libc::EINTR { continue; }
-            unsafe { libc::close(fd); }
-            return Err(ERR_WRITE);
+                image[written..].as_ptr() as *const libc::c_void,
+                total - written,
+            );
+            if ret < 0 {
+                let e = *libc::__errno_location();
+                if e == libc::EINTR {
+                    continue;
+                }
+                libc::close(fd);
+                return -3;
+            }
+            written += ret as usize;
         }
-        if n == 0 {
-            unsafe { libc::close(fd); }
-            return Err(ERR_WRITE);
+
+        // Durability: fdatasync (data-only, no metadata sync)
+        if durable {
+            if libc::fdatasync(fd) < 0 {
+                libc::close(fd);
+                return -3;
+            }
         }
-        written += n as usize;
-    }
 
-    if durable {
-        if unsafe { libc::fdatasync(fd) } < 0 {
-            unsafe { libc::close(fd); }
-            return Err(ERR_FDATASYNC);
+        libc::close(fd);
+
+        // Atomic rename
+        if libc::renameat(dirfd, tmp_name, dirfd, basename.as_ptr()) < 0 {
+            return -3;
         }
     }
 
-    if unsafe { libc::close(fd) } < 0 {
-        return Err(ERR_CLOSE);
-    }
-
-    let rc = unsafe {
-        libc::renameat(
-            dirfd,
-            tmp_path.as_ptr() as *const libc::c_char,
-            dirfd,
-            filename.as_ptr(),
-        )
-    };
-    if rc < 0 {
-        return Err(ERR_RENAMEAT);
-    }
-
-    Ok(())
+    0
 }
 
 #[cfg(test)]
@@ -182,166 +198,152 @@ mod tests {
     use crate::shard_reader::MappedShard;
     use crate::compact::SchemaDescriptor;
 
-    fn make_schema_1col() -> SchemaDescriptor {
+    fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
         let mut sd = SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
+            num_columns: num_cols,
+            pk_index,
             columns: [crate::compact::SchemaColumn {
-                type_code: 8, // U64
-                size: 8,
+                type_code: 0,
+                size: 0,
                 nullable: 0,
                 _pad: 0,
             }; 64],
         };
-        sd.columns[1] = crate::compact::SchemaColumn {
-            type_code: 9, // I64
+        // col 0: U64 PK (code=8, size=8)
+        sd.columns[0] = crate::compact::SchemaColumn {
+            type_code: 8,
             size: 8,
             nullable: 0,
             _pad: 0,
         };
+        // col 1: I64 payload (code=9, size=8)
+        if num_cols > 1 {
+            sd.columns[1] = crate::compact::SchemaColumn {
+                type_code: 9,
+                size: 8,
+                nullable: 0,
+                _pad: 0,
+            };
+        }
         sd
     }
 
     #[test]
-    fn write_and_read_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-
+    fn build_image_roundtrip() {
+        let row_count = 3u32;
         let pk_lo: Vec<u64> = vec![10, 20, 30];
         let pk_hi: Vec<u64> = vec![0, 0, 0];
         let weights: Vec<i64> = vec![1, 1, 1];
         let nulls: Vec<u64> = vec![0, 0, 0];
-        let col1: Vec<i64> = vec![100, 200, 300];
+        let vals: Vec<i64> = vec![100, 200, 300];
 
-        let regions: Vec<&[u8]> = vec![
-            as_bytes(&pk_lo), as_bytes(&pk_hi),
-            as_bytes(&weights), as_bytes(&nulls),
-            as_bytes(&col1), &[],
+        let pk_lo_bytes = unsafe {
+            std::slice::from_raw_parts(pk_lo.as_ptr() as *const u8, pk_lo.len() * 8)
+        };
+        let pk_hi_bytes = unsafe {
+            std::slice::from_raw_parts(pk_hi.as_ptr() as *const u8, pk_hi.len() * 8)
+        };
+        let weight_bytes = unsafe {
+            std::slice::from_raw_parts(weights.as_ptr() as *const u8, weights.len() * 8)
+        };
+        let null_bytes = unsafe {
+            std::slice::from_raw_parts(nulls.as_ptr() as *const u8, nulls.len() * 8)
+        };
+        let val_bytes = unsafe {
+            std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 8)
+        };
+        let blob: Vec<u8> = vec![];
+
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_lo_bytes.as_ptr(), pk_lo_bytes.len()),
+            (pk_hi_bytes.as_ptr(), pk_hi_bytes.len()),
+            (weight_bytes.as_ptr(), weight_bytes.len()),
+            (null_bytes.as_ptr(), null_bytes.len()),
+            (val_bytes.as_ptr(), val_bytes.len()),
+            (blob.as_ptr(), blob.len()),
         ];
 
-        let result = write_shard(
-            libc::AT_FDCWD, &cpath, 42, 3,
-            &regions, &pk_lo, &pk_hi, false,
-        );
-        assert!(result.is_ok(), "write_shard failed: {:?}", result);
+        let image = build_shard_image(42, row_count, &regions);
 
-        // Read back via MappedShard
-        let schema = make_schema_1col();
-        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-        assert_eq!(shard.count, 3);
-        assert_eq!(shard.get_pk_lo(0), 10);
-        assert_eq!(shard.get_pk_lo(1), 20);
-        assert_eq!(shard.get_pk_lo(2), 30);
-        assert_eq!(shard.get_weight(0), 1);
-        assert!(shard.has_xor8());
-        assert!(shard.xor8_may_contain(10, 0));
-        assert!(shard.xor8_may_contain(20, 0));
-        assert!(shard.xor8_may_contain(30, 0));
+        // Verify header
+        assert_eq!(
+            crate::util::read_u64_le(&image, OFF_MAGIC),
+            SHARD_MAGIC
+        );
+        assert_eq!(
+            crate::util::read_u64_le(&image, OFF_VERSION),
+            SHARD_VERSION
+        );
+        assert_eq!(crate::util::read_u64_le(&image, OFF_ROW_COUNT), 3);
+        assert_eq!(crate::util::read_u64_le(&image, OFF_TABLE_ID), 42);
+        // XOR8 should be present
+        assert!(crate::util::read_u64_le(&image, OFF_XOR8_OFFSET) > 0);
+        assert!(crate::util::read_u64_le(&image, OFF_XOR8_SIZE) > 0);
     }
 
     #[test]
-    fn write_empty_shard() {
+    fn write_and_read_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("empty.db");
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let shard_path = dir.path().join("test.db");
+        let path_cstr =
+            std::ffi::CString::new(shard_path.to_str().unwrap()).unwrap();
 
-        let regions: Vec<&[u8]> = vec![&[], &[], &[], &[], &[], &[]];
-        let result = write_shard(
-            libc::AT_FDCWD, &cpath, 1, 0,
-            &regions, &[], &[], false,
-        );
-        assert!(result.is_ok());
-
-        let schema = make_schema_1col();
-        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-        assert_eq!(shard.count, 0);
-        assert!(!shard.has_xor8());
-    }
-
-    #[test]
-    fn write_with_dirfd() {
-        let dir = tempfile::tempdir().unwrap();
-        let dirfd = unsafe {
-            let dp = std::ffi::CString::new(dir.path().to_str().unwrap()).unwrap();
-            libc::open(dp.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-        };
-        assert!(dirfd >= 0);
-
-        let basename = std::ffi::CString::new("dirfd_test.db").unwrap();
-        let count = 2usize;
+        let row_count = 2u32;
         let pk_lo: Vec<u64> = vec![1, 2];
         let pk_hi: Vec<u64> = vec![0, 0];
         let weights: Vec<i64> = vec![1, 1];
         let nulls: Vec<u64> = vec![0, 0];
-        let col1: Vec<i64> = vec![10, 20];
+        let vals: Vec<i64> = vec![42, 99];
+        let blob: Vec<u8> = vec![];
 
-        let regions: Vec<&[u8]> = vec![
-            as_bytes(&pk_lo), as_bytes(&pk_hi),
-            as_bytes(&weights), as_bytes(&nulls),
-            as_bytes(&col1), &[],
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_lo.as_ptr() as *const u8, pk_lo.len() * 8),
+            (pk_hi.as_ptr() as *const u8, pk_hi.len() * 8),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (nulls.as_ptr() as *const u8, nulls.len() * 8),
+            (vals.as_ptr() as *const u8, vals.len() * 8),
+            (blob.as_ptr(), 0),
         ];
 
-        let result = write_shard(
-            dirfd, &basename, 5, count,
-            &regions, &pk_lo, &pk_hi, false,
-        );
-        assert!(result.is_ok());
-        unsafe { libc::close(dirfd); }
+        let image = build_shard_image(7, row_count, &regions);
+        let rc = write_shard_at(libc::AT_FDCWD, &path_cstr, &image, true);
+        assert_eq!(rc, 0);
+        assert!(shard_path.exists());
 
-        // Verify via absolute path
-        let full_path = dir.path().join("dirfd_test.db");
-        let cpath = std::ffi::CString::new(full_path.to_str().unwrap()).unwrap();
-        let schema = make_schema_1col();
-        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        // Read back via shard_reader
+        let schema = make_schema_desc(2, 0);
+        let shard = MappedShard::open(&path_cstr, &schema, true).unwrap();
         assert_eq!(shard.count, 2);
         assert_eq!(shard.get_pk_lo(0), 1);
         assert_eq!(shard.get_pk_lo(1), 2);
+        assert_eq!(shard.get_weight(0), 1);
+        assert_eq!(shard.get_weight(1), 1);
+        assert!(shard.has_xor8());
+        assert!(shard.xor8_may_contain(1, 0));
+        assert!(shard.xor8_may_contain(2, 0));
     }
 
     #[test]
-    fn non_durable_skips_fsync() {
-        // Just verify it doesn't error — we can't easily verify fdatasync was skipped.
+    fn empty_shard() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nondurable.db");
+        let path = dir.path().join("empty.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
-        let pk_lo: Vec<u64> = vec![1];
-        let pk_hi: Vec<u64> = vec![0];
-        let w: Vec<i64> = vec![1];
-        let n: Vec<u64> = vec![0];
-        let c: Vec<i64> = vec![99];
-
-        let regions: Vec<&[u8]> = vec![
-            as_bytes(&pk_lo), as_bytes(&pk_hi),
-            as_bytes(&w), as_bytes(&n),
-            as_bytes(&c), &[],
+        let regions: Vec<(*const u8, usize)> = vec![
+            (std::ptr::null(), 0), // pk_lo
+            (std::ptr::null(), 0), // pk_hi
+            (std::ptr::null(), 0), // weight
+            (std::ptr::null(), 0), // null
+            (std::ptr::null(), 0), // blob
         ];
 
-        assert!(write_shard(
-            libc::AT_FDCWD, &cpath, 1, 1,
-            &regions, &pk_lo, &pk_hi, false,
-        ).is_ok());
+        let image = build_shard_image(1, 0, &regions);
+        let rc = write_shard_at(libc::AT_FDCWD, &cpath, &image, false);
+        assert_eq!(rc, 0);
 
-        assert!(write_shard(
-            libc::AT_FDCWD, &cpath, 1, 1,
-            &regions, &pk_lo, &pk_hi, true,
-        ).is_ok());
-    }
-
-    #[test]
-    fn openat_bad_dirfd_returns_error() {
-        let cpath = std::ffi::CString::new("nope.db").unwrap();
-        let result = write_shard(
-            9999, &cpath, 1, 0,
-            &[&[], &[], &[], &[], &[], &[]], &[], &[], false,
-        );
-        assert_eq!(result, Err(ERR_OPENAT));
-    }
-
-    fn as_bytes<T>(v: &[T]) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * std::mem::size_of::<T>())
-        }
+        let schema = make_schema_desc(1, 0);
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        assert_eq!(shard.count, 0);
+        assert!(!shard.has_xor8());
     }
 }

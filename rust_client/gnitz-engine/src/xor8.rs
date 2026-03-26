@@ -5,6 +5,9 @@ const MAGIC: &[u8; 4] = b"GXF1";
 
 /// Build an Xor8 filter from parallel arrays of (pk_lo, pk_hi).
 /// Returns None if the input is empty.
+///
+/// Duplicate PKs are deduplicated before building — shard files may contain
+/// retraction rows where the same PK appears with different payloads/weights.
 pub fn build(pk_lo: &[u64], pk_hi: &[u64]) -> Option<Xor8> {
     let n = pk_lo.len().min(pk_hi.len());
     if n == 0 {
@@ -15,11 +18,11 @@ pub fn build(pk_lo: &[u64], pk_hi: &[u64]) -> Option<Xor8> {
         .zip(pk_hi[..n].iter())
         .map(|(&lo, &hi)| xxh::hash_u128(lo, hi))
         .collect();
-    // Dedup hash keys for xor8 construction only — the xorf crate panics
-    // on duplicate inputs. Z-Set shards can contain the same PK multiple
-    // times (different weights), but the filter only needs distinct keys.
     keys.sort_unstable();
     keys.dedup();
+    if keys.is_empty() {
+        return None;
+    }
     Some(Xor8::from(keys.as_slice()))
 }
 

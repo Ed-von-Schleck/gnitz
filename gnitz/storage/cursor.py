@@ -1,18 +1,18 @@
 # gnitz/storage/cursor.py
 
+from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128, r_uint64, intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.objectmodel import newlist_hint
+from gnitz.core import types
 from gnitz.core.store import AbstractCursor
-from gnitz.core.comparator import RowAccessor
+from gnitz.storage import tournament_tree, comparator
+from gnitz.core import comparator as core_comparator
 from gnitz.core.batch import ColumnarBatchAccessor, pk_lt
-from gnitz.storage import engine_ffi
-from gnitz.storage.buffer import c_memmove
 
 MAX_U64 = r_uint64(0xFFFFFFFFFFFFFFFF)
 
 NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
-NULL_HANDLE = lltype.nullptr(rffi.VOIDP.TO)
 
 
 # ---------------------------------------------------------------------------
@@ -50,11 +50,12 @@ class BaseCursor(AbstractCursor):
 
 
 # ---------------------------------------------------------------------------
-# SortedBatchCursor (used by DBSP anti_join + join operators)
+# SortedBatchCursor
 # ---------------------------------------------------------------------------
 
 
 class SortedBatchCursor(BaseCursor):
+    """Sequential iterator over a sorted ArenaZSetBatch."""
 
     _immutable_fields_ = ["_batch", "accessor"]
 
@@ -117,6 +118,7 @@ class SortedBatchCursor(BaseCursor):
         return self._batch.length()
 
     def bind_to(self, acc):
+        """Bind an external ColumnarBatchAccessor to this cursor's current position."""
         acc.bind(self._batch, self._pos)
 
     def close(self):
@@ -124,293 +126,281 @@ class SortedBatchCursor(BaseCursor):
 
 
 # ---------------------------------------------------------------------------
-# RustCursorAccessor
+# MemTableCursor
 # ---------------------------------------------------------------------------
 
 
-class RustCursorAccessor(RowAccessor):
-    """Reads column data from a Rust UnifiedCursor's current position via FFI."""
+class MemTableCursor(BaseCursor):
+    """
+    Cursor over a consolidated snapshot of a MemTable's sorted runs.
+    Creates an independent snapshot to avoid use-after-free when flush()
+    frees runs while the cursor is live.
+    """
 
-    _immutable_fields_ = ["schema"]
+    _immutable_fields_ = ["schema", "_snapshot", "_accessor"]
 
-    def __init__(self, schema, cursor_handle):
-        self.schema = schema
-        self._handle = cursor_handle
-
-    def _get_ptr(self, col_idx):
-        return engine_ffi._cursor_col_ptr(
-            self._handle,
-            rffi.cast(rffi.UINT, col_idx),
-            rffi.cast(rffi.UINT, self.schema.columns[col_idx].field_type.size),
-        )
-
-    def is_null(self, col_idx):
-        schema = self.schema
-        if col_idx == schema.pk_index:
-            return False
-        if not schema.has_nullable:
-            return False
-        null_word = r_uint64(engine_ffi._cursor_null_word(self._handle))
-        payload_idx = col_idx if col_idx < schema.pk_index else col_idx - 1
-        return bool(null_word & (r_uint64(1) << payload_idx))
-
-    def get_int(self, col_idx):
-        ptr = self._get_ptr(col_idx)
-        sz = self.schema.columns[col_idx].field_type.size
-        if sz == 8:
-            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
-        elif sz == 4:
-            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UINTP, ptr)[0])
-        elif sz == 2:
-            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.USHORTP, ptr)[0])
-        elif sz == 1:
-            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr)[0])
-        return r_uint64(0)
-
-    def get_int_signed(self, col_idx):
-        ptr = self._get_ptr(col_idx)
-        sz = self.schema.columns[col_idx].field_type.size
-        if sz == 8:
-            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
-        elif sz == 4:
-            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.INTP, ptr)[0])
-        elif sz == 2:
-            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SHORTP, ptr)[0])
-        elif sz == 1:
-            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SIGNEDCHARP, ptr)[0])
-        return r_int64(0)
-
-    def get_float(self, col_idx):
-        ptr = self._get_ptr(col_idx)
-        sz = self.schema.columns[col_idx].field_type.size
-        if sz == 4:
-            return float(rffi.cast(rffi.FLOATP, ptr)[0])
-        return float(rffi.cast(rffi.DOUBLEP, ptr)[0])
-
-    def get_u128(self, col_idx):
-        ptr = self._get_ptr(col_idx)
-        lo = rffi.cast(rffi.ULONGLONGP, ptr)
-        hi = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))
-        return (r_uint128(hi[0]) << 64) | r_uint128(lo[0])
-
-    def get_u128_lo(self, col_idx):
-        ptr = self._get_ptr(col_idx)
-        return r_uint64(rffi.cast(rffi.ULONGLONGP, ptr)[0])
-
-    def get_u128_hi(self, col_idx):
-        ptr = self._get_ptr(col_idx)
-        return r_uint64(rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0])
-
-    def get_str_struct(self, col_idx):
-        ptr = self._get_ptr(col_idx)
-        blob_ptr = engine_ffi._cursor_blob_ptr(self._handle)
-
-        if not ptr:
-            return (0, 0, NULL_PTR, blob_ptr, None)
-
-        u32_ptr = rffi.cast(rffi.UINTP, ptr)
-        length = rffi.cast(lltype.Signed, u32_ptr[0])
-        prefix = rffi.cast(lltype.Signed, u32_ptr[1])
-
-        s = None
-        if False:
-            s = ""
-        return (length, prefix, ptr, blob_ptr, s)
-
-    def get_col_ptr(self, col_idx):
-        return self._get_ptr(col_idx)
-
-
-# ---------------------------------------------------------------------------
-# RustUnifiedCursor
-# ---------------------------------------------------------------------------
-
-
-class RustUnifiedCursor(AbstractCursor):
-    """N-way merge cursor backed by Rust's UnifiedCursor via FFI."""
-
-    def __init__(self, schema, borrowed_handles, memtable_snapshot):
-        self.schema = schema
-        self._handle = NULL_HANDLE
-        self._snapshot = memtable_snapshot
-
-        num_borrowed = len(borrowed_handles)
-        has_batch = memtable_snapshot is not None and memtable_snapshot.length() > 0
-        num_batches = 1 if has_batch else 0
-        num_payload = len(schema.columns) - 1
-
-        # Pack borrowed shard handles
-        if num_borrowed > 0:
-            c_handles = lltype.malloc(rffi.VOIDPP.TO, num_borrowed, flavor="raw")
-            i = 0
-            while i < num_borrowed:
-                c_handles[i] = borrowed_handles[i]
-                i += 1
-        else:
-            c_handles = lltype.nullptr(rffi.VOIDPP.TO)
-
-        # Pack batch descriptor for memtable snapshot
-        if has_batch:
-            desc_buf = lltype.malloc(
-                rffi.CCHARP.TO, engine_ffi.BATCH_DESC_SIZE, flavor="raw"
-            )
-            col_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_payload, flavor="raw")
-            col_sizes = lltype.malloc(rffi.ULONGLONGP.TO, num_payload, flavor="raw")
-            pi = 0
-            ci = 0
-            while ci < len(schema.columns):
-                if ci != schema.pk_index:
-                    col_ptrs[pi] = rffi.cast(
-                        rffi.VOIDP, memtable_snapshot.col_bufs[ci].base_ptr
-                    )
-                    col_sizes[pi] = rffi.cast(
-                        rffi.ULONGLONG, memtable_snapshot.col_bufs[ci].offset
-                    )
-                    pi += 1
-                ci += 1
-            _pack_batch_desc(
-                desc_buf, memtable_snapshot, schema, num_payload, col_ptrs, col_sizes
-            )
-        else:
-            desc_buf = lltype.nullptr(rffi.CCHARP.TO)
-            col_ptrs = lltype.nullptr(rffi.VOIDPP.TO)
-            col_sizes = lltype.nullptr(rffi.ULONGLONGP.TO)
-
-        schema_buf = engine_ffi.pack_schema(schema)
-
-        try:
-            handle = engine_ffi._cursor_create(
-                c_handles,
-                rffi.cast(rffi.UINT, num_borrowed),
-                rffi.cast(rffi.VOIDP, desc_buf),
-                rffi.cast(rffi.UINT, num_batches),
-                rffi.cast(rffi.VOIDP, schema_buf),
-            )
-            if not handle:
-                raise Exception("gnitz_cursor_create failed")
-            self._handle = handle
-        finally:
-            lltype.free(schema_buf, flavor="raw")
-            if col_ptrs:
-                lltype.free(col_ptrs, flavor="raw")
-            if col_sizes:
-                lltype.free(col_sizes, flavor="raw")
-            if desc_buf:
-                lltype.free(desc_buf, flavor="raw")
-            if c_handles:
-                lltype.free(c_handles, flavor="raw")
-
-        self._accessor = RustCursorAccessor(schema, self._handle)
+    def __init__(self, memtable):
+        BaseCursor.__init__(self)
+        self.schema = memtable.schema
+        self._snapshot = memtable.get_consolidated_snapshot()
+        self._pos = 0
+        self._accessor = ColumnarBatchAccessor(memtable.schema)
 
     def seek(self, key_lo, key_hi):
-        engine_ffi._cursor_seek(
-            self._handle,
-            rffi.cast(rffi.ULONGLONG, key_lo),
-            rffi.cast(rffi.ULONGLONG, key_hi),
-        )
+        lo = 0
+        hi = self._snapshot.length()
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if pk_lt(self._snapshot.get_pk_lo(mid), self._snapshot.get_pk_hi(mid), key_lo, key_hi):
+                lo = mid + 1
+            else:
+                hi = mid
+        self._pos = lo
 
     def advance(self):
-        engine_ffi._cursor_advance(self._handle)
+        self._pos += 1
 
     def is_valid(self):
-        return bool(intmask(engine_ffi._cursor_is_valid(self._handle)))
+        return self._pos < self._snapshot.length()
 
     def key_lo(self):
-        return r_uint64(engine_ffi._cursor_key_lo(self._handle))
+        if self._pos >= self._snapshot.length():
+            return MAX_U64
+        return self._snapshot.get_pk_lo(self._pos)
 
     def key_hi(self):
-        return r_uint64(engine_ffi._cursor_key_hi(self._handle))
+        if self._pos >= self._snapshot.length():
+            return MAX_U64
+        return self._snapshot.get_pk_hi(self._pos)
+
+    def peek_key_lo(self):
+        if self._pos < self._snapshot.length():
+            return self._snapshot.get_pk_lo(self._pos)
+        return r_uint64(0)
+
+    def peek_key_hi(self):
+        if self._pos < self._snapshot.length():
+            return self._snapshot.get_pk_hi(self._pos)
+        return r_uint64(0)
 
     def weight(self):
-        return intmask(engine_ffi._cursor_weight(self._handle))
+        if self._pos >= self._snapshot.length():
+            return r_int64(0)
+        return self._snapshot.get_weight(self._pos)
 
     def get_accessor(self):
+        self._accessor.bind(self._snapshot, self._pos)
         return self._accessor
 
     def estimated_length(self):
-        return 0
+        return self._snapshot.length()
 
     def close(self):
-        if self._handle:
-            engine_ffi._cursor_close(self._handle)
-            self._handle = NULL_HANDLE
         if self._snapshot is not None:
             self._snapshot.release()
             self._snapshot = None
 
 
-class RustUnifiedCursorFromHandle(AbstractCursor):
-    """Wraps a pre-created Rust cursor handle (from gnitz_table_create_cursor)."""
+# ---------------------------------------------------------------------------
+# ShardCursor
+# ---------------------------------------------------------------------------
 
-    def __init__(self, schema, handle):
-        self.schema = schema
-        self._handle = handle
-        self._accessor = RustCursorAccessor(schema, handle)
 
-    def seek(self, key_lo, key_hi):
-        engine_ffi._cursor_seek(
-            self._handle,
-            rffi.cast(rffi.ULONGLONG, key_lo),
-            rffi.cast(rffi.ULONGLONG, key_hi),
-        )
+class ShardCursor(BaseCursor):
+    _immutable_fields_ = ["view", "schema", "is_u128", "accessor"]
 
-    def advance(self):
-        engine_ffi._cursor_advance(self._handle)
-
-    def is_valid(self):
-        return bool(intmask(engine_ffi._cursor_is_valid(self._handle)))
-
-    def key_lo(self):
-        return r_uint64(engine_ffi._cursor_key_lo(self._handle))
-
-    def key_hi(self):
-        return r_uint64(engine_ffi._cursor_key_hi(self._handle))
-
-    def weight(self):
-        return intmask(engine_ffi._cursor_weight(self._handle))
+    def __init__(self, shard_view):
+        BaseCursor.__init__(self)
+        self.view = shard_view
+        self.schema = shard_view.schema
+        self.is_u128 = self.schema.get_pk_column().field_type.code == types.TYPE_U128.code
+        self.position = 0
+        self.accessor = comparator.SoAAccessor(self.schema)
+        self._skip_ghosts()
 
     def get_accessor(self):
-        return self._accessor
+        return self.accessor
+
+    def _skip_ghosts(self):
+        while self.position < self.view.count:
+            if self.view.get_weight(self.position) != 0:
+                self.accessor.set_row(self.view, self.position)
+                return
+            self.position += 1
+
+    def seek(self, key_lo, key_hi):
+        self.position = self.view.find_lower_bound(key_lo, key_hi)
+        self._skip_ghosts()
+
+    def advance(self):
+        if not self.is_valid():
+            return
+        self.position += 1
+        self._skip_ghosts()
+
+    def key_lo(self):
+        if not self.is_valid():
+            return MAX_U64
+        return self.view.get_pk_lo(self.position)
+
+    def key_hi(self):
+        if not self.is_valid():
+            return MAX_U64
+        return self.view.get_pk_hi(self.position)
+
+    def peek_key_lo(self):
+        if not self.is_valid():
+            return r_uint64(0)
+        return self.view.get_pk_lo(self.position)
+
+    def peek_key_hi(self):
+        if not self.is_valid():
+            return r_uint64(0)
+        return self.view.get_pk_hi(self.position)
+
+    def weight(self):
+        if not self.is_valid():
+            return r_int64(0)
+        return self.view.get_weight(self.position)
+
+    def is_valid(self):
+        return self.position < self.view.count
 
     def estimated_length(self):
-        return 0
+        return self.view.count
+
+
+def _copy_cursors(cursors):
+    res = newlist_hint(len(cursors))
+    for c in cursors:
+        res.append(c)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# UnifiedCursor
+# ---------------------------------------------------------------------------
+
+
+class UnifiedCursor(AbstractCursor):
+    """
+    N-way merge cursor over one or more sub-cursors (MemTable + shards).
+    """
+
+    _immutable_fields_ = ["schema", "is_single_source", "tree"]
+
+    def __init__(self, schema, cursors):
+        self.schema = schema
+        self.cursors = cursors
+        self.num_cursors = len(cursors)
+        self.is_single_source = self.num_cursors == 1
+
+        if not self.is_single_source:
+            self.tree = tournament_tree.TournamentTree(_copy_cursors(self.cursors), schema)
+        else:
+            self.tree = None
+
+        # Appendix A: Split u128 into lo/hi components for alignment safety.
+        self._current_key_lo = r_uint64(0)
+        self._current_key_hi = r_uint64(0)
+        self._current_weight = r_int64(0)
+
+        self._current_accessor = None
+        self._valid = False
+        self._find_next_non_ghost()
+
+    def _find_next_non_ghost(self):
+        if self.is_single_source:
+            cursor = self.cursors[0]
+            if cursor.is_valid():
+                self._current_key_lo = cursor.key_lo()
+                self._current_key_hi = cursor.key_hi()
+                self._current_weight = cursor.weight()
+                self._current_accessor = cursor.get_accessor()
+                self._valid = True
+            else:
+                self._valid = False
+            return
+
+        while not self.tree.is_exhausted():
+            min_key_lo = self.tree.get_min_key_lo()
+            min_key_hi = self.tree.get_min_key_hi()
+
+            if min_key_lo == MAX_U64 and min_key_hi == MAX_U64:
+                break
+
+            num_candidates = self.tree.get_all_indices_at_min()
+
+            net_weight = r_int64(0)
+            idx = 0
+            while idx < num_candidates:
+                c_idx = self.tree._min_indices[idx]
+                net_weight += self.cursors[c_idx].weight()
+                idx += 1
+
+            if net_weight != r_int64(0):
+                self._current_key_lo = min_key_lo
+                self._current_key_hi = min_key_hi
+                self._current_weight = net_weight
+                self._current_accessor = self.cursors[self.tree._min_indices[0]].get_accessor()
+                self._valid = True
+                return
+            else:
+                idx = 0
+                while idx < num_candidates:
+                    self.tree.advance_cursor_by_index(self.tree._min_indices[idx])
+                    idx += 1
+
+        self._valid = False
+
+    def seek(self, key_lo, key_hi):
+        for c in self.cursors:
+            c.seek(key_lo, key_hi)
+        if not self.is_single_source:
+            self.tree.rebuild()
+        self._find_next_non_ghost()
+
+    def advance(self):
+        if not self._valid:
+            return
+        if self.is_single_source:
+            self.cursors[0].advance()
+            self._find_next_non_ghost()
+            return
+
+        # Reuse cached indices from the last _find_next_non_ghost() call
+        # instead of traversing the heap again.
+        count = self.tree._min_count
+        idx = 0
+        while idx < count:
+            self.tree.advance_cursor_by_index(self.tree._min_indices[idx])
+            idx += 1
+
+        self._find_next_non_ghost()
+
+    def key_lo(self):
+        return self._current_key_lo
+
+    def key_hi(self):
+        return self._current_key_hi
+
+    def weight(self):
+        return self._current_weight
+
+    def is_valid(self):
+        return self._valid
+
+    def get_accessor(self):
+        return self._current_accessor
+
+    def estimated_length(self):
+        total = 0
+        for c in self.cursors:
+            total += c.estimated_length()
+        return total
 
     def close(self):
-        if self._handle:
-            engine_ffi._cursor_close(self._handle)
-            self._handle = NULL_HANDLE
-
-
-def _pack_batch_desc(base, batch, schema, num_payload, col_ptrs, col_sizes):
-    """Write a GnitzBatchDesc at base for one ArenaZSetBatch."""
-    off = 0
-    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
-        rffi.VOIDP, batch.pk_lo_buf.base_ptr)
-    off += 8
-    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
-        rffi.VOIDP, batch.pk_hi_buf.base_ptr)
-    off += 8
-    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
-        rffi.VOIDP, batch.weight_buf.base_ptr)
-    off += 8
-    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
-        rffi.VOIDP, batch.null_buf.base_ptr)
-    off += 8
-    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
-        rffi.VOIDP, col_ptrs)
-    off += 8
-    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
-        rffi.VOIDP, col_sizes)
-    off += 8
-    rffi.cast(rffi.UINTP, rffi.ptradd(base, off))[0] = rffi.cast(
-        rffi.UINT, num_payload)
-    off += 4
-    off += 4  # padding
-    rffi.cast(rffi.VOIDPP, rffi.ptradd(base, off))[0] = rffi.cast(
-        rffi.VOIDP, batch.blob_arena.base_ptr)
-    off += 8
-    rffi.cast(rffi.ULONGLONGP, rffi.ptradd(base, off))[0] = rffi.cast(
-        rffi.ULONGLONG, batch.blob_arena.offset)
-    off += 8
-    rffi.cast(rffi.UINTP, rffi.ptradd(base, off))[0] = rffi.cast(
-        rffi.UINT, batch.length())
+        if self.tree is not None:
+            self.tree.close()
+        for c in self.cursors:
+            c.close()

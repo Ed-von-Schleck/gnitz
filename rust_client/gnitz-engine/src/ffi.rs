@@ -3,7 +3,176 @@ use std::panic;
 use std::ptr;
 use std::slice;
 
-use libc::{c_void};
+use libc::{c_int, c_void};
+use xorf::Xor8;
+
+use crate::{bloom::BloomFilter, xor8};
+
+// ---------------------------------------------------------------------------
+// XOR8
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_xor8_build(
+    pk_lo: *const u64,
+    pk_hi: *const u64,
+    count: u32,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if pk_lo.is_null() || pk_hi.is_null() || count == 0 {
+            return ptr::null_mut();
+        }
+        let n = count as usize;
+        let lo = unsafe { slice::from_raw_parts(pk_lo, n) };
+        let hi = unsafe { slice::from_raw_parts(pk_hi, n) };
+        match xor8::build(lo, hi) {
+            Some(filter) => Box::into_raw(Box::new(filter)) as *mut c_void,
+            None => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_xor8_may_contain(
+    handle: *const c_void,
+    key_lo: u64,
+    key_hi: u64,
+) -> c_int {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() {
+            return 0;
+        }
+        let filter = unsafe { &*(handle as *const Xor8) };
+        if xor8::may_contain(filter, key_lo, key_hi) {
+            1
+        } else {
+            0
+        }
+    });
+    result.unwrap_or(0)
+}
+
+/// Serialize an Xor8 filter.
+/// If out is NULL, returns the required buffer size.
+/// If out is non-NULL, writes at most cap bytes and returns bytes written, or -1 on error.
+#[no_mangle]
+pub extern "C" fn gnitz_xor8_serialize(
+    handle: *const c_void,
+    out: *mut u8,
+    cap: i64,
+) -> i64 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() {
+            return -1i64;
+        }
+        let filter = unsafe { &*(handle as *const Xor8) };
+        if out.is_null() {
+            // Query size mode
+            return xor8::serialized_size(filter) as i64;
+        }
+        let bytes = xor8::serialize(filter);
+        let cap = cap as usize;
+        if bytes.len() > cap {
+            return -1i64;
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+        }
+        bytes.len() as i64
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_xor8_deserialize(buf: *const u8, len: i64) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if buf.is_null() || len <= 0 {
+            return ptr::null_mut();
+        }
+        let data = unsafe { slice::from_raw_parts(buf, len as usize) };
+        match xor8::deserialize(data) {
+            Some(filter) => Box::into_raw(Box::new(filter)) as *mut c_void,
+            None => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_xor8_free(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = panic::catch_unwind(|| {
+        let _ = unsafe { Box::from_raw(handle as *mut Xor8) };
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Bloom
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_bloom_create(expected_n: u32) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        let bf = BloomFilter::new(expected_n);
+        Box::into_raw(Box::new(bf)) as *mut c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_bloom_add(handle: *mut c_void, key_lo: u64, key_hi: u64) {
+    let _ = panic::catch_unwind(|| {
+        if handle.is_null() {
+            return;
+        }
+        let bf = unsafe { &mut *(handle as *mut BloomFilter) };
+        bf.add(key_lo, key_hi);
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_bloom_may_contain(
+    handle: *const c_void,
+    key_lo: u64,
+    key_hi: u64,
+) -> c_int {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() {
+            return 0;
+        }
+        let bf = unsafe { &*(handle as *const BloomFilter) };
+        if bf.may_contain(key_lo, key_hi) {
+            1
+        } else {
+            0
+        }
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_bloom_reset(handle: *mut c_void) {
+    let _ = panic::catch_unwind(|| {
+        if handle.is_null() {
+            return;
+        }
+        let bf = unsafe { &mut *(handle as *mut BloomFilter) };
+        bf.reset();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_bloom_free(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = panic::catch_unwind(|| {
+        let _ = unsafe { Box::from_raw(handle as *mut BloomFilter) };
+    });
+}
 
 // ---------------------------------------------------------------------------
 // XXH3 checksum
@@ -34,6 +203,150 @@ pub extern "C" fn gnitz_xxh3_hash_u128(
         crate::xxh::hash_u128_seeded(lo, hi, seed_lo, seed_hi)
     });
     result.unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Shard reader
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_open(
+    path: *const libc::c_char,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    validate_checksums: i32,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if path.is_null() || schema_desc.is_null() {
+            return ptr::null_mut();
+        }
+        let cpath = unsafe { CStr::from_ptr(path) };
+        let schema = unsafe { &*schema_desc };
+        match crate::shard_reader::MappedShard::open(cpath, schema, validate_checksums != 0) {
+            Ok(shard) => Box::into_raw(Box::new(shard)) as *mut c_void,
+            Err(_) => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_close(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = panic::catch_unwind(|| {
+        let _ = unsafe { Box::from_raw(handle as *mut crate::shard_reader::MappedShard) };
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_row_count(handle: *const c_void) -> i32 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.count as i32
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_has_xor8(handle: *const c_void) -> i32 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    if shard.has_xor8() { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_xor8_may_contain(
+    handle: *const c_void,
+    key_lo: u64,
+    key_hi: u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() { return 1; }
+        let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+        if shard.xor8_may_contain(key_lo, key_hi) { 1 } else { 0 }
+    });
+    result.unwrap_or(1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_find_row(
+    handle: *const c_void,
+    key_lo: u64,
+    key_hi: u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() { return -1; }
+        let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+        shard.find_row_index(key_lo, key_hi)
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_lower_bound(
+    handle: *const c_void,
+    key_lo: u64,
+    key_hi: u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if handle.is_null() { return 0; }
+        let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+        shard.find_lower_bound(key_lo, key_hi) as i32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_get_pk_lo(handle: *const c_void, row: i32) -> u64 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.get_pk_lo(row as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_get_pk_hi(handle: *const c_void, row: i32) -> u64 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.get_pk_hi(row as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_get_weight(handle: *const c_void, row: i32) -> i64 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.get_weight(row as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_get_null_word(handle: *const c_void, row: i32) -> u64 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.get_null_word(row as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_col_ptr(
+    handle: *const c_void,
+    row: i32,
+    col_idx: i32,
+    col_size: i32,
+) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.col_ptr_by_logical(row as usize, col_idx as usize, col_size as usize)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_blob_ptr(handle: *const c_void) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.blob_ptr()
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_shard_blob_len(handle: *const c_void) -> i64 {
+    if handle.is_null() { return 0; }
+    let shard = unsafe { &*(handle as *const crate::shard_reader::MappedShard) };
+    shard.blob_len() as i64
 }
 
 // ---------------------------------------------------------------------------
@@ -127,498 +440,206 @@ pub extern "C" fn gnitz_wal_validate_and_parse(
 }
 
 // ---------------------------------------------------------------------------
-// Batch descriptor (for passing ArenaZSetBatch buffers across FFI)
+// Manifest
 // ---------------------------------------------------------------------------
 
-#[repr(C)]
-pub struct GnitzBatchDesc {
-    pub pk_lo: *const u8,
-    pub pk_hi: *const u8,
-    pub weight: *const u8,
-    pub null_bm: *const u8,
-    pub col_ptrs: *const *const u8,
-    pub col_sizes: *const u64,
-    pub num_payload_cols: u32,
-    pub blob_ptr: *const u8,
-    pub blob_len: u64,
-    pub count: u32,
-}
-
-// ---------------------------------------------------------------------------
-// Helper: build ShardRef vec from FFI inputs
-// ---------------------------------------------------------------------------
-
-fn build_shard_refs(
-    borrowed_handles: *const *const c_void,
-    num_borrowed: u32,
-    batch_descs: *const GnitzBatchDesc,
-    num_batches: u32,
-    schema: &crate::compact::SchemaDescriptor,
-) -> Option<Vec<crate::cursor::ShardRef>> {
-    let n_borrowed = num_borrowed as usize;
-    let n_batches = num_batches as usize;
-    let mut refs = Vec::with_capacity(n_borrowed + n_batches);
-
-    if n_borrowed > 0 {
-        if borrowed_handles.is_null() { return None; }
-        let handles = unsafe { slice::from_raw_parts(borrowed_handles, n_borrowed) };
-        for &h in handles {
-            if h.is_null() { return None; }
-            let shard = unsafe { &*(h as *const crate::shard_reader::MappedShard) };
-            refs.push(crate::cursor::ShardRef::Borrowed(shard as *const _));
-        }
-    }
-
-    if n_batches > 0 {
-        if batch_descs.is_null() { return None; }
-        let descs = unsafe { slice::from_raw_parts(batch_descs, n_batches) };
-        for desc in descs {
-            let n_cols = desc.num_payload_cols as usize;
-            let (col_ptrs, col_sizes) = if n_cols > 0 && !desc.col_ptrs.is_null() && !desc.col_sizes.is_null() {
-                let ptrs = unsafe { slice::from_raw_parts(desc.col_ptrs, n_cols) };
-                let raw_sizes = unsafe { slice::from_raw_parts(desc.col_sizes, n_cols) };
-                let sizes: Vec<usize> = raw_sizes.iter().map(|&s| s as usize).collect();
-                (ptrs.to_vec(), sizes)
-            } else {
-                (vec![ptr::null(); n_cols], vec![0usize; n_cols])
-            };
-
-            let shard = crate::shard_reader::MappedShard::from_buffers(
-                desc.pk_lo, desc.pk_hi, desc.weight, desc.null_bm,
-                &col_ptrs, &col_sizes,
-                desc.blob_ptr, desc.blob_len as usize,
-                desc.count as usize, schema,
-            );
-            refs.push(crate::cursor::ShardRef::Owned(shard));
-        }
-    }
-
-    Some(refs)
-}
-
-// ---------------------------------------------------------------------------
-// Cursor FFI
-// ---------------------------------------------------------------------------
-
+/// Serialize manifest entries to buffer.
+/// Returns bytes written, or -1 if buffer too small.
 #[no_mangle]
-pub extern "C" fn gnitz_cursor_create(
-    borrowed_handles: *const *const c_void,
-    num_borrowed: u32,
-    batch_descs: *const GnitzBatchDesc,
-    num_batches: u32,
-    schema_desc: *const crate::compact::SchemaDescriptor,
-) -> *mut c_void {
+pub extern "C" fn gnitz_manifest_serialize(
+    out_buf: *mut u8,
+    out_capacity: i64,
+    entries: *const u8,
+    count: u32,
+    global_max_lsn: u64,
+) -> i64 {
     let result = panic::catch_unwind(|| {
-        if schema_desc.is_null() { return ptr::null_mut(); }
-        let schema = unsafe { &*schema_desc };
+        if out_buf.is_null() || out_capacity <= 0 {
+            return -1i64;
+        }
+        let buf = unsafe { slice::from_raw_parts_mut(out_buf, out_capacity as usize) };
+        let n = count as usize;
+        let entry_slice = if n > 0 && !entries.is_null() {
+            unsafe {
+                slice::from_raw_parts(
+                    entries as *const crate::manifest::ManifestEntryRaw,
+                    n,
+                )
+            }
+        } else {
+            &[]
+        };
+        crate::manifest::serialize(buf, entry_slice, global_max_lsn)
+    });
+    result.unwrap_or(-1)
+}
 
-        let refs = match build_shard_refs(borrowed_handles, num_borrowed, batch_descs, num_batches, schema) {
-            Some(r) => r,
-            None => return ptr::null_mut(),
+/// Parse manifest buffer. Returns entry count, or negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_manifest_parse(
+    buf: *const u8,
+    buf_len: i64,
+    out_entries: *mut u8,
+    max_entries: u32,
+    out_global_max_lsn: *mut u64,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if buf.is_null() || buf_len <= 0 || out_global_max_lsn.is_null() {
+            return crate::manifest::MANIFEST_ERR_TRUNCATED;
+        }
+        let data = unsafe { slice::from_raw_parts(buf, buf_len as usize) };
+        let lsn = unsafe { &mut *out_global_max_lsn };
+        let max = max_entries as usize;
+        let entries = if max > 0 && !out_entries.is_null() {
+            unsafe {
+                slice::from_raw_parts_mut(
+                    out_entries as *mut crate::manifest::ManifestEntryRaw,
+                    max,
+                )
+            }
+        } else {
+            &mut []
+        };
+        crate::manifest::parse(data, entries, max_entries, lsn)
+    });
+    result.unwrap_or(crate::manifest::MANIFEST_ERR_TRUNCATED)
+}
+
+// ---------------------------------------------------------------------------
+// Shard file writing
+// ---------------------------------------------------------------------------
+
+/// Write a shard file atomically from pre-built region buffers.
+///
+/// dirfd: directory fd for openat/renameat. Use AT_FDCWD (-100) for absolute paths.
+/// basename: null-terminated filename (relative to dirfd).
+/// table_id: table identifier stored in shard header.
+/// row_count: number of rows in the shard.
+/// region_ptrs: array of pointers to region data.
+/// region_sizes: array of sizes (bytes) for each region.
+/// num_regions: length of region_ptrs and region_sizes arrays.
+/// durable: if nonzero, fdatasync before rename.
+///
+/// Returns 0 on success, negative on failure:
+///   -1: null/invalid arguments
+///   -3: I/O error (open/write/sync/rename)
+#[no_mangle]
+pub extern "C" fn gnitz_write_shard(
+    dirfd: c_int,
+    basename: *const libc::c_char,
+    table_id: u32,
+    row_count: u32,
+    region_ptrs: *const *const u8,
+    region_sizes: *const u32,
+    num_regions: u32,
+    durable: c_int,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if basename.is_null() || region_ptrs.is_null() || region_sizes.is_null() {
+            return -1;
+        }
+        let n = num_regions as usize;
+        let ptrs = unsafe { slice::from_raw_parts(region_ptrs, n) };
+        let sizes = unsafe { slice::from_raw_parts(region_sizes, n) };
+
+        let mut regions: Vec<(*const u8, usize)> = Vec::with_capacity(n);
+        for i in 0..n {
+            regions.push((ptrs[i], sizes[i] as usize));
+        }
+
+        let image = crate::shard_file::build_shard_image(table_id, row_count, &regions);
+        let basename_cstr = unsafe { CStr::from_ptr(basename) };
+        crate::shard_file::write_shard_at(dirfd, basename_cstr, &image, durable != 0)
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+/// N-way merge compaction: merge input shards into one output shard.
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_compact_shards(
+    input_files: *const *const libc::c_char,
+    num_inputs: u32,
+    output_file: *const libc::c_char,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    table_id: u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if input_files.is_null() || output_file.is_null() || schema_desc.is_null() {
+            return -1;
+        }
+        let n = num_inputs as usize;
+        let schema = unsafe { &*schema_desc };
+        let out = unsafe { CStr::from_ptr(output_file) };
+
+        let file_ptrs = unsafe { slice::from_raw_parts(input_files, n) };
+        let inputs: Vec<&CStr> = file_ptrs
+            .iter()
+            .map(|&p| unsafe { CStr::from_ptr(p) })
+            .collect();
+
+        crate::compact::compact_shards(&inputs, out, schema, table_id)
+    });
+    result.unwrap_or(-99)
+}
+
+/// Guarded N-way merge: merge input shards, routing rows to guard-bounded outputs.
+/// Returns number of non-empty guard outputs on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_merge_and_route(
+    input_files: *const *const libc::c_char,
+    num_inputs: u32,
+    output_dir: *const libc::c_char,
+    guard_keys: *const u64,  // flat array: [lo0, hi0, lo1, hi1, ...]
+    num_guards: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    table_id: u32,
+    level_num: u32,
+    lsn_tag: u64,
+    out_results: *mut crate::compact::GuardResult,
+    max_results: u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if input_files.is_null() || output_dir.is_null() || schema_desc.is_null() {
+            return -1;
+        }
+        let n_inputs = num_inputs as usize;
+        let n_guards = num_guards as usize;
+        let schema = unsafe { &*schema_desc };
+        let out_dir = unsafe { CStr::from_ptr(output_dir) };
+
+        let file_ptrs = unsafe { slice::from_raw_parts(input_files, n_inputs) };
+        let inputs: Vec<&CStr> = file_ptrs
+            .iter()
+            .map(|&p| unsafe { CStr::from_ptr(p) })
+            .collect();
+
+        // Parse guard keys from flat array
+        let gk_flat = if n_guards > 0 && !guard_keys.is_null() {
+            unsafe { slice::from_raw_parts(guard_keys, n_guards * 2) }
+        } else {
+            &[]
+        };
+        let guards: Vec<(u64, u64)> = (0..n_guards)
+            .map(|i| (gk_flat[i * 2], gk_flat[i * 2 + 1]))
+            .collect();
+
+        let results = if max_results > 0 && !out_results.is_null() {
+            unsafe { slice::from_raw_parts_mut(out_results, max_results as usize) }
+        } else {
+            &mut []
         };
 
-        let cursor = crate::cursor::UnifiedCursor::new(refs, schema.clone());
-        Box::into_raw(Box::new(cursor)) as *mut c_void
+        crate::compact::merge_and_route(
+            &inputs, out_dir, &guards, schema,
+            table_id, level_num, lsn_tag, results,
+        )
     });
-    result.unwrap_or(ptr::null_mut())
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_seek(handle: *mut c_void, key_lo: u64, key_hi: u64) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let cursor = unsafe { &mut *(handle as *mut crate::cursor::UnifiedCursor) };
-        cursor.seek(key_lo, key_hi);
-    }));
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_advance(handle: *mut c_void) -> i32 {
-    if handle.is_null() { return 0; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let cursor = unsafe { &mut *(handle as *mut crate::cursor::UnifiedCursor) };
-        cursor.advance();
-        if cursor.is_valid() { 1 } else { 0 }
-    }));
-    result.unwrap_or(0)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_is_valid(handle: *const c_void) -> i32 {
-    if handle.is_null() { return 0; }
-    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
-    if cursor.is_valid() { 1 } else { 0 }
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_key_lo(handle: *const c_void) -> u64 {
-    if handle.is_null() { return 0; }
-    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
-    cursor.key_lo()
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_key_hi(handle: *const c_void) -> u64 {
-    if handle.is_null() { return 0; }
-    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
-    cursor.key_hi()
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_weight(handle: *const c_void) -> i64 {
-    if handle.is_null() { return 0; }
-    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
-    cursor.weight()
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_null_word(handle: *const c_void) -> u64 {
-    if handle.is_null() { return 0; }
-    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
-    cursor.null_word()
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_col_ptr(
-    handle: *const c_void,
-    col_idx: u32,
-    col_size: u32,
-) -> *const u8 {
-    if handle.is_null() { return ptr::null(); }
-    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
-    cursor.col_ptr(col_idx as usize, col_size as usize)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_blob_ptr(handle: *const c_void) -> *const u8 {
-    if handle.is_null() { return ptr::null(); }
-    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
-    cursor.blob_ptr()
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_blob_len(handle: *const c_void) -> i64 {
-    if handle.is_null() { return 0; }
-    let cursor = unsafe { &*(handle as *const crate::cursor::UnifiedCursor) };
-    cursor.blob_len() as i64
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_cursor_close(handle: *mut c_void) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let _ = unsafe { Box::from_raw(handle as *mut crate::cursor::UnifiedCursor) };
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Table FFI
-// ---------------------------------------------------------------------------
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_create_ephemeral(
-    directory: *const libc::c_char,
-    name: *const libc::c_char,
-    schema_desc: *const crate::compact::SchemaDescriptor,
-    table_id: u32,
-    memtable_arena: u64,
-) -> *mut c_void {
-    let result = panic::catch_unwind(|| {
-        if directory.is_null() || name.is_null() || schema_desc.is_null() { return ptr::null_mut(); }
-        let dir = unsafe { CStr::from_ptr(directory) }.to_str().unwrap_or("");
-        let n = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("");
-        let schema = unsafe { &*schema_desc };
-        match crate::table::RustTable::create_ephemeral(dir, n, schema.clone(), table_id, memtable_arena as usize) {
-            Ok(t) => Box::into_raw(Box::new(t)) as *mut c_void,
-            Err(_) => ptr::null_mut(),
-        }
-    });
-    result.unwrap_or(ptr::null_mut())
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_create_persistent(
-    directory: *const libc::c_char,
-    name: *const libc::c_char,
-    schema_desc: *const crate::compact::SchemaDescriptor,
-    table_id: u32,
-    memtable_arena: u64,
-) -> *mut c_void {
-    let result = panic::catch_unwind(|| {
-        if directory.is_null() || name.is_null() || schema_desc.is_null() { return ptr::null_mut(); }
-        let dir = unsafe { CStr::from_ptr(directory) }.to_str().unwrap_or("");
-        let n = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("");
-        let schema = unsafe { &*schema_desc };
-        match crate::table::RustTable::create_persistent(dir, n, schema.clone(), table_id, memtable_arena as usize) {
-            Ok(t) => Box::into_raw(Box::new(t)) as *mut c_void,
-            Err(_) => ptr::null_mut(),
-        }
-    });
-    result.unwrap_or(ptr::null_mut())
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_close(handle: *mut c_void) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let _ = unsafe { Box::from_raw(handle as *mut crate::table::RustTable) };
-    });
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_ingest_batch(
-    handle: *mut c_void,
-    desc: *const GnitzBatchDesc,
-    lsn: u64,
-) -> i32 {
-    if handle.is_null() || desc.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { &mut *(handle as *mut crate::table::RustTable) };
-        let d = unsafe { &*desc };
-        let n_cols = d.num_payload_cols as usize;
-        let (col_ptrs, col_sizes) = if n_cols > 0 && !d.col_ptrs.is_null() && !d.col_sizes.is_null() {
-            (unsafe { slice::from_raw_parts(d.col_ptrs, n_cols) }.to_vec(),
-             unsafe { slice::from_raw_parts(d.col_sizes, n_cols) }.iter().map(|&s| s as usize).collect::<Vec<_>>())
-        } else { (vec![], vec![]) };
-        let shard = crate::shard_reader::MappedShard::from_buffers(
-            d.pk_lo, d.pk_hi, d.weight, d.null_bm,
-            &col_ptrs, &col_sizes,
-            d.blob_ptr, d.blob_len as usize,
-            d.count as usize, &table.schema,
-        );
-        table.ingest_batch(&shard, lsn)
-    }));
-    result.unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_ingest_batch_memonly(
-    handle: *mut c_void,
-    desc: *const GnitzBatchDesc,
-) -> i32 {
-    if handle.is_null() || desc.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { &mut *(handle as *mut crate::table::RustTable) };
-        let d = unsafe { &*desc };
-        let n_cols = d.num_payload_cols as usize;
-        let (col_ptrs, col_sizes) = if n_cols > 0 && !d.col_ptrs.is_null() && !d.col_sizes.is_null() {
-            (unsafe { slice::from_raw_parts(d.col_ptrs, n_cols) }.to_vec(),
-             unsafe { slice::from_raw_parts(d.col_sizes, n_cols) }.iter().map(|&s| s as usize).collect::<Vec<_>>())
-        } else { (vec![], vec![]) };
-        let shard = crate::shard_reader::MappedShard::from_buffers(
-            d.pk_lo, d.pk_hi, d.weight, d.null_bm,
-            &col_ptrs, &col_sizes,
-            d.blob_ptr, d.blob_len as usize,
-            d.count as usize, &table.schema,
-        );
-        table.ingest_batch_memonly(&shard)
-    }));
-    result.unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_ingest_one(
-    handle: *mut c_void,
-    key_lo: u64, key_hi: u64, weight: i64,
-    null_word: u64,
-    col_ptrs: *const *const u8,
-    num_payload_cols: u32,
-    source_blob: *const u8, source_blob_len: u64,
-) -> i32 {
-    if handle.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { &mut *(handle as *mut crate::table::RustTable) };
-        let n = num_payload_cols as usize;
-        let ptrs = if n > 0 && !col_ptrs.is_null() {
-            unsafe { slice::from_raw_parts(col_ptrs, n) }
-        } else { &[] };
-        table.ingest_one(key_lo, key_hi, weight, null_word, ptrs, source_blob, source_blob_len as usize)
-    }));
-    result.unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_flush(handle: *mut c_void) -> i32 {
-    if handle.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { &mut *(handle as *mut crate::table::RustTable) };
-        match table.flush() {
-            Ok(true) => 1,
-            Ok(false) => 0,
-            Err(e) => e,
-        }
-    }));
-    result.unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_create_cursor(handle: *mut c_void) -> *mut c_void {
-    if handle.is_null() { return ptr::null_mut(); }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { &mut *(handle as *mut crate::table::RustTable) };
-        let cursor = table.create_cursor();
-        Box::into_raw(Box::new(cursor)) as *mut c_void
-    }));
-    result.unwrap_or(ptr::null_mut())
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_has_pk(handle: *const c_void, key_lo: u64, key_hi: u64) -> i32 {
-    if handle.is_null() { return 0; }
-    let table = unsafe { &*(handle as *const crate::table::RustTable) };
-    if table.has_pk(key_lo, key_hi) { 1 } else { 0 }
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_get_weight(
-    handle: *const c_void,
-    key_lo: u64, key_hi: u64,
-    null_word: u64,
-    col_ptrs: *const *const u8,
-    col_sizes: *const u64,
-    num_payload_cols: u32,
-    blob_ptr: *const u8, blob_len: u64,
-) -> i64 {
-    if handle.is_null() { return 0; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { &*(handle as *const crate::table::RustTable) };
-        let n = num_payload_cols as usize;
-        let (ptrs, sizes) = if n > 0 && !col_ptrs.is_null() && !col_sizes.is_null() {
-            (unsafe { slice::from_raw_parts(col_ptrs, n) }.to_vec(),
-             unsafe { slice::from_raw_parts(col_sizes, n) }.iter().map(|&s| s as usize).collect::<Vec<_>>())
-        } else { (vec![], vec![]) };
-        table.get_weight_for_row(key_lo, key_hi, &ptrs, &sizes, null_word, blob_ptr, blob_len as usize)
-    }));
-    result.unwrap_or(0)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_create_child(
-    handle: *const c_void,
-    name: *const libc::c_char,
-    schema_desc: *const crate::compact::SchemaDescriptor,
-) -> *mut c_void {
-    if handle.is_null() || name.is_null() || schema_desc.is_null() { return ptr::null_mut(); }
-    let result = panic::catch_unwind(|| {
-        let table = unsafe { &*(handle as *const crate::table::RustTable) };
-        let n = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("");
-        let schema = unsafe { &*schema_desc };
-        match table.create_child(n, schema.clone()) {
-            Ok(t) => Box::into_raw(Box::new(t)) as *mut c_void,
-            Err(_) => ptr::null_mut(),
-        }
-    });
-    result.unwrap_or(ptr::null_mut())
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_should_flush(handle: *const c_void) -> i32 {
-    if handle.is_null() { return 0; }
-    let table = unsafe { &*(handle as *const crate::table::RustTable) };
-    if table.should_flush() { 1 } else { 0 }
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_is_empty(handle: *const c_void) -> i32 {
-    if handle.is_null() { return 1; }
-    let table = unsafe { &*(handle as *const crate::table::RustTable) };
-    if table.is_empty() { 1 } else { 0 }
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_compact_if_needed(handle: *mut c_void) -> i32 {
-    if handle.is_null() { return -1; }
-    let _ = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { &mut *(handle as *mut crate::table::RustTable) };
-        table.compact_if_needed();
-    }));
-    0
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_current_lsn(handle: *const c_void) -> u64 {
-    if handle.is_null() { return 0; }
-    let table = unsafe { &*(handle as *const crate::table::RustTable) };
-    table.current_lsn
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_table_set_lsn(handle: *mut c_void, lsn: u64) {
-    if handle.is_null() { return; }
-    let table = unsafe { &mut *(handle as *mut crate::table::RustTable) };
-    table.current_lsn = lsn;
-}
-
-// ---------------------------------------------------------------------------
-// Retract PK row — returns column pointers directly (no shard handle leak)
-// ---------------------------------------------------------------------------
-
-/// Find a PK and return per-column pointers for the found row.
-/// The returned `out_cleanup` handle MUST be freed via `gnitz_retract_row_free`
-/// after the caller is done reading column data.
-#[no_mangle]
-pub extern "C" fn gnitz_table_retract_pk_row(
-    handle: *const c_void,
-    key_lo: u64,
-    key_hi: u64,
-    out_col_ptrs: *mut *const u8,
-    n_payload: u32,
-    out_null_word: *mut u64,
-    out_blob_ptr: *mut *const u8,
-    out_blob_len: *mut u64,
-    out_weight: *mut i64,
-    out_cleanup: *mut *mut c_void,
-) -> i32 {
-    if handle.is_null() || out_col_ptrs.is_null() || out_cleanup.is_null() {
-        return 0;
-    }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let table = unsafe { &*(handle as *const crate::table::RustTable) };
-        let (total_w, found) = table.retract_pk_find(key_lo, key_hi);
-        if let Some((shard, row)) = found {
-            let np = n_payload as usize;
-            let pk_idx = table.schema.pk_index as usize;
-
-            // Fill per-payload-column pointers for this row
-            for pi in 0..np.min(shard.col_ptrs.len()) {
-                let logical_ci = if pi < pk_idx { pi } else { pi + 1 };
-                let elem_size = table.schema.columns[logical_ci].size as usize;
-                unsafe {
-                    *out_col_ptrs.add(pi) = shard.col_ptrs[pi].add(row * elem_size);
-                }
-            }
-            if !out_null_word.is_null() {
-                unsafe { *out_null_word = shard.get_null_word(row); }
-            }
-            if !out_blob_ptr.is_null() {
-                unsafe { *out_blob_ptr = shard.blob_ptr(); }
-            }
-            if !out_blob_len.is_null() {
-                unsafe { *out_blob_len = shard.blob_len() as u64; }
-            }
-            if !out_weight.is_null() {
-                unsafe { *out_weight = total_w; }
-            }
-            // Keep shard alive — caller frees via gnitz_retract_row_free
-            unsafe { *out_cleanup = Box::into_raw(Box::new(shard)) as *mut c_void; }
-            1
-        } else {
-            if !out_weight.is_null() {
-                unsafe { *out_weight = total_w; }
-            }
-            0
-        }
-    }));
-    result.unwrap_or(0)
-}
-
-/// Free the cleanup handle returned by `gnitz_table_retract_pk_row`.
-#[no_mangle]
-pub extern "C" fn gnitz_retract_row_free(cleanup: *mut c_void) {
-    if cleanup.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let _ = unsafe { Box::from_raw(cleanup as *mut crate::shard_reader::MappedShard) };
-    });
+    result.unwrap_or(-99)
 }
 
 // ---------------------------------------------------------------------------
@@ -630,9 +651,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn xor8_ffi_roundtrip() {
+        let lo: Vec<u64> = (0..100).collect();
+        let hi: Vec<u64> = vec![0; 100];
+
+        let handle = gnitz_xor8_build(lo.as_ptr(), hi.as_ptr(), 100);
+        assert!(!handle.is_null());
+
+        // Query
+        for i in 0..100u64 {
+            assert_eq!(gnitz_xor8_may_contain(handle, i, 0), 1);
+        }
+
+        // Serialize
+        let size = gnitz_xor8_serialize(handle, ptr::null_mut(), 0);
+        assert!(size > 0);
+        let mut buf = vec![0u8; size as usize];
+        let written = gnitz_xor8_serialize(handle, buf.as_mut_ptr(), size);
+        assert_eq!(written, size);
+
+        // Deserialize
+        let handle2 = gnitz_xor8_deserialize(buf.as_ptr(), written);
+        assert!(!handle2.is_null());
+        for i in 0..100u64 {
+            assert_eq!(gnitz_xor8_may_contain(handle2, i, 0), 1);
+        }
+
+        gnitz_xor8_free(handle);
+        gnitz_xor8_free(handle2);
+    }
+
+    #[test]
+    fn bloom_ffi_roundtrip() {
+        let handle = gnitz_bloom_create(100);
+        assert!(!handle.is_null());
+
+        for i in 0..100u64 {
+            gnitz_bloom_add(handle, i, 0);
+        }
+        for i in 0..100u64 {
+            assert_eq!(gnitz_bloom_may_contain(handle, i, 0), 1);
+        }
+
+        gnitz_bloom_reset(handle);
+        // After reset, should not contain anything
+        let mut found = 0;
+        for i in 0..100u64 {
+            found += gnitz_bloom_may_contain(handle, i, 0);
+        }
+        assert_eq!(found, 0);
+
+        gnitz_bloom_free(handle);
+    }
+
+    #[test]
     fn null_handle_safety() {
-        // XXH3 null safety
-        assert_eq!(gnitz_xxh3_checksum(ptr::null(), 0), 0);
+        assert_eq!(gnitz_xor8_may_contain(ptr::null(), 1, 2), 0);
+        assert_eq!(gnitz_xor8_serialize(ptr::null(), ptr::null_mut(), 0), -1);
+        assert!(gnitz_xor8_deserialize(ptr::null(), 0).is_null());
+        gnitz_xor8_free(ptr::null_mut());
+
+        assert_eq!(gnitz_bloom_may_contain(ptr::null(), 1, 2), 0);
+        gnitz_bloom_add(ptr::null_mut(), 1, 2); // should not crash
+        gnitz_bloom_reset(ptr::null_mut());
+        gnitz_bloom_free(ptr::null_mut());
     }
 
     #[test]
@@ -647,87 +729,159 @@ mod tests {
     }
 
     #[test]
-    fn retract_pk_row_ffi() {
-        let dir = tempfile::tempdir().unwrap();
-        let schema = crate::compact::SchemaDescriptor {
-            num_columns: 2,
-            pk_index: 0,
-            columns: {
-                let mut cols = [crate::compact::SchemaColumn {
-                    type_code: 8, size: 8, nullable: 0, _pad: 0,
-                }; 64];
-                // col 1: signed i64 (type_code 9, size 8)
-                cols[1] = crate::compact::SchemaColumn {
-                    type_code: 9, size: 8, nullable: 0, _pad: 0,
-                };
-                cols
-            },
-        };
+    fn xor8_build_empty() {
+        let handle = gnitz_xor8_build(ptr::null(), ptr::null(), 0);
+        assert!(handle.is_null());
+    }
 
-        let cdir = std::ffi::CString::new(dir.path().to_str().unwrap()).unwrap();
-        let cname = std::ffi::CString::new("retract_test").unwrap();
-        let handle = gnitz_table_create_ephemeral(
-            cdir.as_ptr(),
-            cname.as_ptr(),
-            &schema as *const _,
-            1, 1 << 20,
+    // -----------------------------------------------------------------------
+    // WAL FFI null safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wal_encode_null_safety() {
+        assert_eq!(gnitz_wal_encode(ptr::null_mut(), 0, 0, 0, 0, 0, ptr::null(), ptr::null(), 0, 0), -1);
+    }
+
+    #[test]
+    fn wal_parse_null_safety() {
+        // All output pointers null
+        assert_eq!(
+            gnitz_wal_validate_and_parse(
+                ptr::null(), 0,
+                ptr::null_mut(), ptr::null_mut(), ptr::null_mut(),
+                ptr::null_mut(), ptr::null_mut(),
+                ptr::null_mut(), ptr::null_mut(), 0,
+            ),
+            crate::wal::WAL_ERR_TRUNCATED,
         );
-        assert!(!handle.is_null());
 
-        // Ingest a row: PK=42, value=999
-        let val: i64 = 999;
-        let col_ptr = &val as *const i64 as *const u8;
-        let col_ptrs_arr: [*const u8; 1] = [col_ptr];
-        let rc = gnitz_table_ingest_one(
-            handle, 42, 0, 1, 0,
-            col_ptrs_arr.as_ptr(), 1,
-            ptr::null(), 0,
+        // Block valid but output pointers null
+        let mut buf = vec![0u8; 256];
+        // Write a minimal valid WAL block
+        let ptrs: Vec<*const u8> = vec![];
+        let sizes: Vec<u32> = vec![];
+        let new_off = crate::wal::encode(&mut buf, 0, 1, 1, 0, &ptrs, &sizes, 0);
+        assert!(new_off > 0);
+
+        assert_eq!(
+            gnitz_wal_validate_and_parse(
+                buf.as_ptr(), new_off,
+                ptr::null_mut(), ptr::null_mut(), ptr::null_mut(),
+                ptr::null_mut(), ptr::null_mut(),
+                ptr::null_mut(), ptr::null_mut(), 0,
+            ),
+            crate::wal::WAL_ERR_TRUNCATED,
+        );
+    }
+
+    #[test]
+    fn wal_ffi_roundtrip() {
+        let r0 = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let ptrs = vec![r0.as_ptr()];
+        let sizes = vec![8u32];
+        let mut buf = vec![0u8; 4096];
+
+        let new_off = gnitz_wal_encode(
+            buf.as_mut_ptr(), 0, 4096,
+            42, 7, 1,
+            ptrs.as_ptr() as *const *const u8, sizes.as_ptr(), 1, 0,
+        );
+        assert!(new_off > 0);
+
+        let mut lsn = 0u64;
+        let mut tid = 0u32;
+        let mut count = 0u32;
+        let mut num_regions = 0u32;
+        let mut blob_size = 0u64;
+        let mut offsets = [0u32; 4];
+        let mut rsizes = [0u32; 4];
+
+        let rc = gnitz_wal_validate_and_parse(
+            buf.as_ptr(), new_off,
+            &mut lsn, &mut tid, &mut count,
+            &mut num_regions, &mut blob_size,
+            offsets.as_mut_ptr(), rsizes.as_mut_ptr(), 4,
         );
         assert_eq!(rc, 0);
+        assert_eq!(lsn, 42);
+        assert_eq!(tid, 7);
+        assert_eq!(count, 1);
+        assert_eq!(num_regions, 1);
+    }
 
-        // Now retract via the new row API
-        let mut out_col_ptrs: [*const u8; 1] = [ptr::null()];
-        let mut null_word: u64 = 0;
-        let mut blob_ptr: *const u8 = ptr::null();
-        let mut blob_len: u64 = 0;
-        let mut weight: i64 = 0;
-        let mut cleanup: *mut c_void = ptr::null_mut();
+    // -----------------------------------------------------------------------
+    // Manifest FFI null safety
+    // -----------------------------------------------------------------------
 
-        let found = gnitz_table_retract_pk_row(
-            handle, 42, 0,
-            out_col_ptrs.as_mut_ptr(),
-            1, // n_payload
-            &mut null_word,
-            &mut blob_ptr,
-            &mut blob_len,
-            &mut weight,
-            &mut cleanup,
+    #[test]
+    fn manifest_serialize_null_safety() {
+        assert_eq!(gnitz_manifest_serialize(ptr::null_mut(), 0, ptr::null(), 0, 0), -1);
+    }
+
+    #[test]
+    fn manifest_parse_null_safety() {
+        assert_eq!(
+            gnitz_manifest_parse(ptr::null(), 0, ptr::null_mut(), 0, ptr::null_mut()),
+            crate::manifest::MANIFEST_ERR_TRUNCATED,
         );
-        assert_eq!(found, 1);
-        assert_eq!(weight, 1);
-        assert_eq!(null_word, 0);
-        assert!(!out_col_ptrs[0].is_null());
+    }
 
-        // Read the column value
-        let val = unsafe { *(out_col_ptrs[0] as *const i64) };
-        assert_eq!(val, 999);
+    #[test]
+    fn manifest_ffi_roundtrip() {
+        let mut entry = crate::manifest::ManifestEntryRaw::zeroed();
+        entry.table_id = 42;
+        entry.pk_min_lo = 1;
+        entry.min_lsn = 10;
+        entry.max_lsn = 20;
+        entry.filename[..6].copy_from_slice(b"t.db\x00\x00");
 
-        // Cleanup
-        gnitz_retract_row_free(cleanup);
-
-        // Not found case
-        let found2 = gnitz_table_retract_pk_row(
-            handle, 999, 0,
-            out_col_ptrs.as_mut_ptr(),
-            1,
-            &mut null_word,
-            &mut blob_ptr,
-            &mut blob_len,
-            &mut weight,
-            &mut cleanup,
+        let entries = [entry];
+        let mut buf = vec![0u8; 512];
+        let written = gnitz_manifest_serialize(
+            buf.as_mut_ptr(), 512,
+            entries.as_ptr() as *const u8, 1, 99,
         );
-        assert_eq!(found2, 0);
+        assert!(written > 0);
 
-        gnitz_table_close(handle);
+        let mut out = [crate::manifest::ManifestEntryRaw::zeroed()];
+        let mut lsn = 0u64;
+        let count = gnitz_manifest_parse(
+            buf.as_ptr(), written,
+            out.as_mut_ptr() as *mut u8, 1, &mut lsn,
+        );
+        assert_eq!(count, 1);
+        assert_eq!(lsn, 99);
+        assert_eq!(out[0].table_id, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Shard file FFI null safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_shard_null_safety() {
+        assert_eq!(gnitz_write_shard(-100, ptr::null(), 0, 0, ptr::null(), ptr::null(), 0, 0), -1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Compact FFI null safety
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compact_null_safety() {
+        assert_eq!(gnitz_compact_shards(ptr::null(), 0, ptr::null(), ptr::null(), 0), -1);
+    }
+
+    #[test]
+    fn merge_and_route_null_safety() {
+        assert_eq!(
+            gnitz_merge_and_route(
+                ptr::null(), 0, ptr::null(),
+                ptr::null(), 0, ptr::null(),
+                0, 0, 0, ptr::null_mut(), 0,
+            ),
+            -1,
+        );
     }
 }
