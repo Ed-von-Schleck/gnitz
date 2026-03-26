@@ -22,7 +22,7 @@ from gnitz.storage import (
     wal,
     wal_columnar,
     wal_layout,
-    writer_table,
+    shard_writer,
     shard_table,
     compactor,
     cursor,
@@ -479,7 +479,7 @@ def test_shards_and_columnar(base_dir):
     fn = os.path.join(base_dir, "test_shard.db")
 
     # 1. Write and Validate Checksums
-    writer = writer_table.TableShardWriter(schema, 1)
+    writer = shard_writer.ShardWriter(schema, 1)
 
     tmp1 = batch.ArenaZSetBatch(schema)
     rb1 = RowBuilder(schema, tmp1)
@@ -622,7 +622,7 @@ def test_manifest_and_spine(base_dir):
 
     # 4. Index Resolution
     idx_db = os.path.join(base_dir, "shard_idx.db")
-    w = writer_table.TableShardWriter(schema, table_id=1)
+    w = shard_writer.ShardWriter(schema, table_id=1)
 
     tmp = batch.ArenaZSetBatch(schema)
     rb_idx = RowBuilder(schema, tmp)
@@ -1023,7 +1023,7 @@ def test_filter_integration(base_dir):
 
     # 2. Shard XOR8 integration
     shard_path = os.path.join(base_dir, "xor8_shard.db")
-    sw = writer_table.TableShardWriter(schema, table_id=1)
+    sw = shard_writer.ShardWriter(schema, table_id=1)
     for i in range(1, 51):
         tmp = batch.ArenaZSetBatch(schema)
         rb_s = RowBuilder(schema, tmp)
@@ -1962,7 +1962,7 @@ def test_flsm_data_structures(base_dir):
     i = 0
     while i < 5:
         shard_path = shard_dir + "/ds_shard_%d.db" % i
-        sw = writer_table.TableShardWriter(schema, table_id=99)
+        sw = shard_writer.ShardWriter(schema, table_id=99)
         tmp = batch.ArenaZSetBatch(schema)
         rb = RowBuilder(schema, tmp)
         rb.begin(r_uint64(i * 10), r_uint64(0), r_int64(1))
@@ -2371,7 +2371,7 @@ def test_flsm_horizontal_compaction(base_dir):
     i = 0
     while i < 6:
         shard_path = shard_dir + "/hcomp_src_%d.db" % i
-        sw = writer_table.TableShardWriter(schema, table_id=77)
+        sw = shard_writer.ShardWriter(schema, table_id=77)
         row = 0
         while row < 10:
             pk = r_uint128(i * 10 + row)
@@ -2437,7 +2437,7 @@ def test_flsm_horizontal_ghost_elimination(base_dir):
     while s < 5:
         shard_path = shard_dir + "/ghost_src_%d.db" % s
         original_paths.append(shard_path)
-        sw = writer_table.TableShardWriter(schema, table_id=78)
+        sw = shard_writer.ShardWriter(schema, table_id=78)
         for pk, w in shard_specs[s]:
             tmp = batch.ArenaZSetBatch(schema)
             rb = RowBuilder(schema, tmp)
@@ -2472,7 +2472,7 @@ def test_flsm_horizontal_ghost_elimination(base_dir):
 
 
 def _make_single_row_shard(path, schema, table_id, pk_val):
-    sw = writer_table.TableShardWriter(schema, table_id=table_id)
+    sw = shard_writer.ShardWriter(schema, table_id=table_id)
     tmp = batch.ArenaZSetBatch(schema)
     rb = RowBuilder(schema, tmp)
     rb.begin(r_uint64(pk_val), r_uint64(0), r_int64(1))

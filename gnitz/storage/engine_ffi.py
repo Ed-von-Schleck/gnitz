@@ -82,6 +82,18 @@ eci = ExternalCompilationInfo(
         "  uint32_t *out_offsets, uint32_t *out_sizes,"
         "  uint32_t max_regions);",
         "void gnitz_wal_reader_close(void *handle);",
+        # shard writer (row-at-a-time builder)
+        "void *gnitz_shard_writer_new(const void *schema_desc);",
+        "int32_t gnitz_shard_writer_add_row("
+        "  void *handle,"
+        "  uint64_t key_lo, uint64_t key_hi, int64_t weight,"
+        "  uint64_t null_word,"
+        "  void **col_ptrs, uint32_t *col_sizes, uint32_t num_cols,"
+        "  const uint8_t *blob_base, uint32_t blob_len);",
+        "int32_t gnitz_shard_writer_finalize("
+        "  void *handle, const char *path,"
+        "  uint32_t table_id, int32_t durable);",
+        "void gnitz_shard_writer_close(void *handle);",
         # shard file writing
         "int32_t gnitz_write_shard("
         "  int32_t dirfd, const char *basename,"
@@ -468,6 +480,42 @@ _manifest_write_file = rffi.llexternal(
      rffi.CCHARP, rffi.UINT,
      rffi.ULONGLONG],
     rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Shard writer (row-at-a-time builder)
+# ---------------------------------------------------------------------------
+
+_shard_writer_new = rffi.llexternal(
+    "gnitz_shard_writer_new",
+    [rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_shard_writer_add_row = rffi.llexternal(
+    "gnitz_shard_writer_add_row",
+    [rffi.VOIDP,
+     rffi.ULONGLONG, rffi.ULONGLONG, rffi.LONGLONG,
+     rffi.ULONGLONG,
+     rffi.VOIDPP, rffi.UINTP, rffi.UINT,
+     rffi.CCHARP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_writer_finalize = rffi.llexternal(
+    "gnitz_shard_writer_finalize",
+    [rffi.VOIDP, rffi.CCHARP, rffi.UINT, rffi.INT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_shard_writer_close = rffi.llexternal(
+    "gnitz_shard_writer_close",
+    [rffi.VOIDP],
+    lltype.Void,
     compilation_info=eci,
 )
 

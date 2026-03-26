@@ -117,7 +117,7 @@ class Buffer(object):
 
     @property
     def ptr(self):
-        """Legacy alias for base_ptr used by writer_table and wal_format."""
+        """Legacy alias for base_ptr."""
         return self.base_ptr
 
     @property
@@ -127,7 +127,7 @@ class Buffer(object):
 
     @property
     def count(self):
-        """Returns number of items currently stored, used by writer_table."""
+        """Returns number of items currently stored."""
         return self.offset // self.item_size
 
     def _align(self, offset, alignment):

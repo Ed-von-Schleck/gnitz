@@ -7,7 +7,7 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import errors
 from gnitz.core import comparator as core_comparator
 from gnitz.core.batch import ArenaZSetBatch, ColumnarBatchAccessor, pk_lt, pk_eq
-from gnitz.storage import writer_table
+from gnitz.storage import shard_writer
 from gnitz.storage.bloom import BloomFilter
 
 ACCUMULATOR_THRESHOLD = 64
@@ -191,7 +191,7 @@ class MemTable(object):
     def flush(self, dirfd, basename, table_id=0, durable=True):
         self._flush_accumulator()
         consolidated = self.get_consolidated_snapshot()
-        wrote = writer_table.write_batch_to_shard(
+        wrote = shard_writer.write_batch_to_shard(
             consolidated, dirfd, basename, table_id, durable=durable
         )
         consolidated.release()
