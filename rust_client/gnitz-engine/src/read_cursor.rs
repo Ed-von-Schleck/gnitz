@@ -535,6 +535,67 @@ pub unsafe fn create_read_cursor<'a>(
 }
 
 // ---------------------------------------------------------------------------
+// CursorHandle — wraps ReadCursor + optional owned snapshot data
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+use crate::memtable::OwnedBatch;
+
+/// FFI-visible cursor handle.  Owns the ReadCursor and, when created from
+/// snapshots, keeps the `Arc<OwnedBatch>` references alive so the cursor's
+/// borrowed `MemBatch` slices remain valid.
+///
+/// Field order matters: `cursor` is dropped before `_owned_snapshots`,
+/// ensuring the cursor's borrowed slices are invalidated before the backing
+/// data is freed.
+pub struct CursorHandle<'a> {
+    pub cursor: ReadCursor<'a>,
+    _owned_snapshots: Vec<Arc<OwnedBatch>>,
+}
+
+impl<'a> CursorHandle<'a> {
+    /// Wrap a cursor that borrows from FFI region pointers (RPython memory).
+    /// No owned snapshot data.
+    pub fn from_cursor(cursor: ReadCursor<'a>) -> Self {
+        CursorHandle {
+            cursor,
+            _owned_snapshots: Vec::new(),
+        }
+    }
+}
+
+/// Build a CursorHandle from Rust-owned snapshots + shard handles.
+///
+/// Each snapshot's `Arc<OwnedBatch>` is cloned into the handle to keep the
+/// data alive.  `MemBatch` views are created with transmuted `'static`
+/// lifetime — sound because the `Arc` clones in `_owned_snapshots` guarantee
+/// the data outlives the cursor (dropped after it).
+///
+/// # Safety
+/// `shard_ptrs` must point to valid `MappedShard` objects that outlive the
+/// returned handle.
+pub unsafe fn create_cursor_from_snapshots(
+    snapshots: &[Arc<OwnedBatch>],
+    shard_ptrs: &[*const MappedShard],
+    schema: SchemaDescriptor,
+) -> CursorHandle<'static> {
+    // Build MemBatch views with 'static lifetime.
+    // Safety: we store Arc clones in the CursorHandle, keeping data alive.
+    let batches: Vec<MemBatch<'static>> = snapshots
+        .iter()
+        .filter(|s| s.count > 0)
+        .map(|s| std::mem::transmute::<MemBatch<'_>, MemBatch<'static>>(s.as_mem_batch()))
+        .collect();
+
+    let cursor = create_read_cursor(&batches, shard_ptrs, schema);
+
+    CursorHandle {
+        cursor,
+        _owned_snapshots: snapshots.to_vec(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

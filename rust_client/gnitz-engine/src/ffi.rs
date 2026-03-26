@@ -1216,7 +1216,8 @@ pub extern "C" fn gnitz_read_cursor_create(
         let cursor = unsafe {
             crate::read_cursor::create_read_cursor(&batches, &shard_ptrs, schema)
         };
-        Box::into_raw(Box::new(cursor)) as *mut libc::c_void
+        let handle = crate::read_cursor::CursorHandle::from_cursor(cursor);
+        Box::into_raw(Box::new(handle)) as *mut libc::c_void
     });
     result.unwrap_or(ptr::null_mut())
 }
@@ -1253,10 +1254,10 @@ pub extern "C" fn gnitz_read_cursor_seek(
         return;
     }
     let _ = panic::catch_unwind(|| {
-        let cursor = unsafe { &mut *(handle as *mut crate::read_cursor::ReadCursor) };
-        cursor.seek(key_lo, key_hi);
+        let ch = unsafe { &mut *(handle as *mut crate::read_cursor::CursorHandle) };
+        ch.cursor.seek(key_lo, key_hi);
         unsafe {
-            write_cursor_state(cursor, out_valid, out_key_lo, out_key_hi, out_weight, out_null_word);
+            write_cursor_state(&ch.cursor, out_valid, out_key_lo, out_key_hi, out_weight, out_null_word);
         }
     });
 }
@@ -1275,10 +1276,10 @@ pub extern "C" fn gnitz_read_cursor_next(
         return;
     }
     let _ = panic::catch_unwind(|| {
-        let cursor = unsafe { &mut *(handle as *mut crate::read_cursor::ReadCursor) };
-        cursor.advance();
+        let ch = unsafe { &mut *(handle as *mut crate::read_cursor::CursorHandle) };
+        ch.cursor.advance();
         unsafe {
-            write_cursor_state(cursor, out_valid, out_key_lo, out_key_hi, out_weight, out_null_word);
+            write_cursor_state(&ch.cursor, out_valid, out_key_lo, out_key_hi, out_weight, out_null_word);
         }
     });
 }
@@ -1295,8 +1296,8 @@ pub extern "C" fn gnitz_read_cursor_col_ptr(
         return ptr::null();
     }
     let result = panic::catch_unwind(|| {
-        let cursor = unsafe { &*(handle as *const crate::read_cursor::ReadCursor) };
-        cursor.col_ptr(col_idx as usize, col_size as usize)
+        let ch = unsafe { &*(handle as *const crate::read_cursor::CursorHandle) };
+        ch.cursor.col_ptr(col_idx as usize, col_size as usize)
     });
     result.unwrap_or(ptr::null())
 }
@@ -1310,8 +1311,8 @@ pub extern "C" fn gnitz_read_cursor_blob_ptr(
         return ptr::null();
     }
     let result = panic::catch_unwind(|| {
-        let cursor = unsafe { &*(handle as *const crate::read_cursor::ReadCursor) };
-        cursor.blob_ptr()
+        let ch = unsafe { &*(handle as *const crate::read_cursor::CursorHandle) };
+        ch.cursor.blob_ptr()
     });
     result.unwrap_or(ptr::null())
 }
@@ -1325,9 +1326,383 @@ pub extern "C" fn gnitz_read_cursor_close(handle: *mut libc::c_void) {
     }
     let _ = panic::catch_unwind(|| {
         unsafe {
-            let _ = Box::from_raw(handle as *mut crate::read_cursor::ReadCursor);
+            let _ = Box::from_raw(handle as *mut crate::read_cursor::CursorHandle);
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// MemTable (opaque handle)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_create(
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    max_bytes: u64,
+) -> *mut libc::c_void {
+    let result = panic::catch_unwind(|| {
+        if schema_desc.is_null() {
+            return ptr::null_mut();
+        }
+        let schema = unsafe { *schema_desc };
+        let mt = crate::memtable::MemTable::new(schema, max_bytes as usize);
+        Box::into_raw(Box::new(mt)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_close(handle: *mut libc::c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = panic::catch_unwind(|| {
+        unsafe {
+            let _ = Box::from_raw(handle as *mut crate::memtable::MemTable);
+        }
+    });
+}
+
+/// Upsert a pre-sorted batch into the MemTable.  Copies data from the
+/// provided region pointers.  Returns 0 on success, ERR_CAPACITY (-2) if
+/// the MemTable is over capacity.
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_upsert_batch(
+    handle: *mut libc::c_void,
+    in_ptrs: *const *const u8,
+    in_sizes: *const u32,
+    row_count: u32,
+    regions_per_batch: u32,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::MemTable) };
+        let rpb = regions_per_batch as usize;
+        let num_payload_cols = mt.schema().num_columns as usize - 1;
+
+        let ptrs = unsafe { slice::from_raw_parts(in_ptrs, rpb) };
+        let sizes = unsafe { slice::from_raw_parts(in_sizes, rpb) };
+
+        let batch = unsafe {
+            crate::memtable::OwnedBatch::from_regions(
+                ptrs, sizes, row_count as usize, num_payload_cols,
+            )
+        };
+
+        match mt.upsert_sorted_batch(batch) {
+            Ok(()) => 0,
+            Err(code) => code,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_bloom_add(
+    handle: *mut libc::c_void,
+    key_lo: u64,
+    key_hi: u64,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = panic::catch_unwind(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::MemTable) };
+        mt.bloom_add(key_lo, key_hi);
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_may_contain_pk(
+    handle: *const libc::c_void,
+    key_lo: u64,
+    key_hi: u64,
+) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &*(handle as *const crate::memtable::MemTable) };
+        mt.may_contain_pk(key_lo, key_hi) as i32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_should_flush(handle: *const libc::c_void) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &*(handle as *const crate::memtable::MemTable) };
+        mt.should_flush() as i32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_is_empty(handle: *const libc::c_void) -> i32 {
+    if handle.is_null() {
+        return 1;
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &*(handle as *const crate::memtable::MemTable) };
+        mt.is_empty() as i32
+    });
+    result.unwrap_or(1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_total_row_count(handle: *const libc::c_void) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &*(handle as *const crate::memtable::MemTable) };
+        mt.total_row_count() as i32
+    });
+    result.unwrap_or(0)
+}
+
+/// Get a consolidated snapshot.  Returns an opaque MemTableSnapshot handle.
+/// Caller must free with gnitz_memtable_snapshot_free.
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_get_snapshot(
+    handle: *mut libc::c_void,
+) -> *mut libc::c_void {
+    if handle.is_null() {
+        return ptr::null_mut();
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::MemTable) };
+        let arc = mt.get_snapshot();
+        let snap = crate::memtable::MemTableSnapshot { inner: arc };
+        Box::into_raw(Box::new(snap)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_snapshot_count(
+    snap_handle: *const libc::c_void,
+) -> u32 {
+    if snap_handle.is_null() {
+        return 0;
+    }
+    let result = panic::catch_unwind(|| {
+        let snap = unsafe { &*(snap_handle as *const crate::memtable::MemTableSnapshot) };
+        snap.inner.count as u32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_snapshot_free(snap_handle: *mut libc::c_void) {
+    if snap_handle.is_null() {
+        return;
+    }
+    let _ = panic::catch_unwind(|| {
+        unsafe {
+            let _ = Box::from_raw(snap_handle as *mut crate::memtable::MemTableSnapshot);
+        }
+    });
+}
+
+/// Look up a PK in the MemTable.  Returns net weight (i64).
+/// Sets `*out_found = 1` if any row was found.
+/// After a successful find, use gnitz_memtable_found_* functions to access
+/// the row data.
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_lookup_pk(
+    handle: *mut libc::c_void,
+    key_lo: u64,
+    key_hi: u64,
+    out_found: *mut i32,
+) -> i64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::MemTable) };
+        let (weight, found) = mt.lookup_pk(key_lo, key_hi);
+        unsafe {
+            if !out_found.is_null() { *out_found = found as i32; }
+        }
+        weight
+    });
+    result.unwrap_or(0)
+}
+
+/// Get null word for the last-found row (after gnitz_memtable_lookup_pk).
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_found_null_word(
+    handle: *const libc::c_void,
+) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &*(handle as *const crate::memtable::MemTable) };
+        mt.found_null_word()
+    });
+    result.unwrap_or(0)
+}
+
+/// Get column data pointer for the last-found row.
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_found_col_ptr(
+    handle: *const libc::c_void,
+    payload_col: i32,
+    col_size: i32,
+) -> *const u8 {
+    if handle.is_null() {
+        return ptr::null();
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &*(handle as *const crate::memtable::MemTable) };
+        mt.found_col_ptr(payload_col as usize, col_size as usize)
+    });
+    result.unwrap_or(ptr::null())
+}
+
+/// Get blob arena pointer for the last-found row's source run.
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_found_blob_ptr(
+    handle: *const libc::c_void,
+) -> *const u8 {
+    if handle.is_null() {
+        return ptr::null();
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &*(handle as *const crate::memtable::MemTable) };
+        mt.found_blob_ptr()
+    });
+    result.unwrap_or(ptr::null())
+}
+
+/// Find net weight for rows matching PK + full payload.
+/// The reference row is passed as a 1-row batch in region format.
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_find_weight_for_row(
+    handle: *const libc::c_void,
+    key_lo: u64,
+    key_hi: u64,
+    ref_ptrs: *const *const u8,
+    ref_sizes: *const u32,
+    ref_count: u32,
+    regions_per_batch: u32,
+) -> i64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &*(handle as *const crate::memtable::MemTable) };
+        let rpb = regions_per_batch as usize;
+        let num_payload_cols = mt.schema().num_columns as usize - 1;
+
+        let ptrs = unsafe { slice::from_raw_parts(ref_ptrs, rpb) };
+        let sizes = unsafe { slice::from_raw_parts(ref_sizes, rpb) };
+
+        let ref_batch = unsafe {
+            crate::merge::parse_single_batch_from_regions(
+                ptrs, sizes, ref_count as usize, num_payload_cols,
+            )
+        };
+
+        mt.find_weight_for_row(key_lo, key_hi, &ref_batch, 0)
+    });
+    result.unwrap_or(0)
+}
+
+/// Consolidate all runs and write to a shard file.
+/// Returns 0 on success, -1 if empty (no file written), or negative error code.
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_flush(
+    handle: *mut libc::c_void,
+    dirfd: libc::c_int,
+    basename: *const libc::c_char,
+    table_id: u32,
+    durable: i32,
+) -> i32 {
+    if handle.is_null() || basename.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::MemTable) };
+        let name = unsafe { CStr::from_ptr(basename) };
+        mt.flush(dirfd, name, table_id, durable != 0)
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_memtable_reset(handle: *mut libc::c_void) {
+    if handle.is_null() {
+        return;
+    }
+    let _ = panic::catch_unwind(|| {
+        let mt = unsafe { &mut *(handle as *mut crate::memtable::MemTable) };
+        mt.reset();
+    });
+}
+
+/// Create a read cursor from Rust-owned snapshot handles + shard handles.
+/// Snapshot handles are opaque MemTableSnapshot pointers from
+/// gnitz_memtable_get_snapshot.
+/// The cursor clones their Arc references internally.
+/// Caller must still free snapshots after closing the cursor.
+#[no_mangle]
+pub extern "C" fn gnitz_read_cursor_create_from_snapshots(
+    snap_handles: *const *mut libc::c_void,
+    num_snapshots: u32,
+    shard_handles: *const *const libc::c_void,
+    num_shards: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+) -> *mut libc::c_void {
+    let result = panic::catch_unwind(|| {
+        if schema_desc.is_null() {
+            return ptr::null_mut();
+        }
+        let schema = unsafe { *schema_desc };
+        let ns = num_snapshots as usize;
+        let nsh = num_shards as usize;
+
+        // Extract Arc<OwnedBatch> from snapshot handles
+        let mut snapshot_arcs: Vec<std::sync::Arc<crate::memtable::OwnedBatch>> = Vec::new();
+        if ns > 0 && !snap_handles.is_null() {
+            let handles = unsafe { slice::from_raw_parts(snap_handles, ns) };
+            for &h in handles {
+                if !h.is_null() {
+                    let snap = unsafe {
+                        &*(h as *const crate::memtable::MemTableSnapshot)
+                    };
+                    snapshot_arcs.push(std::sync::Arc::clone(&snap.inner));
+                }
+            }
+        }
+
+        // Parse shard handles
+        let mut shard_ptrs: Vec<*const crate::shard_reader::MappedShard> = Vec::new();
+        if nsh > 0 && !shard_handles.is_null() {
+            let handles = unsafe { slice::from_raw_parts(shard_handles, nsh) };
+            for &h in handles {
+                if !h.is_null() {
+                    shard_ptrs.push(h as *const crate::shard_reader::MappedShard);
+                }
+            }
+        }
+
+        let cursor_handle = unsafe {
+            crate::read_cursor::create_cursor_from_snapshots(
+                &snapshot_arcs, &shard_ptrs, schema,
+            )
+        };
+
+        Box::into_raw(Box::new(cursor_handle)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
 }
 
 // ---------------------------------------------------------------------------

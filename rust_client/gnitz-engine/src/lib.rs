@@ -13,4 +13,5 @@ pub mod compact;
 pub mod merge;
 pub mod read_cursor;
 pub mod shard_index;
+pub mod memtable;
 pub mod ffi;

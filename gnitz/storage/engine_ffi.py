@@ -173,6 +173,38 @@ eci = ExternalCompilationInfo(
         "  const void *handle, int32_t col_idx, int32_t col_size);",
         "const uint8_t *gnitz_read_cursor_blob_ptr(const void *handle);",
         "void gnitz_read_cursor_close(void *handle);",
+        "void *gnitz_read_cursor_create_from_snapshots("
+        "  void **snap_handles, uint32_t num_snapshots,"
+        "  void **shard_handles, uint32_t num_shards,"
+        "  void *schema_desc);",
+        # memtable (opaque handle)
+        "void *gnitz_memtable_create(void *schema_desc, uint64_t max_bytes);",
+        "void gnitz_memtable_close(void *handle);",
+        "int32_t gnitz_memtable_upsert_batch("
+        "  void *handle, void **in_ptrs, uint32_t *in_sizes,"
+        "  uint32_t row_count, uint32_t regions_per_batch);",
+        "void gnitz_memtable_bloom_add(void *handle, uint64_t key_lo, uint64_t key_hi);",
+        "int32_t gnitz_memtable_may_contain_pk(void *handle, uint64_t key_lo, uint64_t key_hi);",
+        "int32_t gnitz_memtable_should_flush(void *handle);",
+        "int32_t gnitz_memtable_is_empty(void *handle);",
+        "int32_t gnitz_memtable_total_row_count(void *handle);",
+        "void *gnitz_memtable_get_snapshot(void *handle);",
+        "uint32_t gnitz_memtable_snapshot_count(void *snap);",
+        "void gnitz_memtable_snapshot_free(void *snap);",
+        "int64_t gnitz_memtable_lookup_pk("
+        "  void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  int32_t *out_found);",
+        "uint64_t gnitz_memtable_found_null_word(void *handle);",
+        "const uint8_t *gnitz_memtable_found_col_ptr(void *handle, int32_t payload_col, int32_t col_size);",
+        "const uint8_t *gnitz_memtable_found_blob_ptr(void *handle);",
+        "int64_t gnitz_memtable_find_weight_for_row("
+        "  void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  void **ref_ptrs, uint32_t *ref_sizes,"
+        "  uint32_t ref_count, uint32_t regions_per_batch);",
+        "int32_t gnitz_memtable_flush("
+        "  void *handle, int32_t dirfd, const char *basename,"
+        "  uint32_t table_id, int32_t durable);",
+        "void gnitz_memtable_reset(void *handle);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -771,6 +803,146 @@ _read_cursor_blob_ptr = rffi.llexternal(
 
 _read_cursor_close = rffi.llexternal(
     "gnitz_read_cursor_close",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_read_cursor_create_from_snapshots = rffi.llexternal(
+    "gnitz_read_cursor_create_from_snapshots",
+    [rffi.VOIDPP, rffi.UINT,
+     rffi.VOIDPP, rffi.UINT,
+     rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# MemTable (opaque handle)
+# ---------------------------------------------------------------------------
+
+_memtable_create = rffi.llexternal(
+    "gnitz_memtable_create",
+    [rffi.VOIDP, rffi.ULONGLONG],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_memtable_close = rffi.llexternal(
+    "gnitz_memtable_close",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_memtable_upsert_batch = rffi.llexternal(
+    "gnitz_memtable_upsert_batch",
+    [rffi.VOIDP, rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_bloom_add = rffi.llexternal(
+    "gnitz_memtable_bloom_add",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_memtable_may_contain_pk = rffi.llexternal(
+    "gnitz_memtable_may_contain_pk",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_should_flush = rffi.llexternal(
+    "gnitz_memtable_should_flush",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_is_empty = rffi.llexternal(
+    "gnitz_memtable_is_empty",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_total_row_count = rffi.llexternal(
+    "gnitz_memtable_total_row_count",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_get_snapshot = rffi.llexternal(
+    "gnitz_memtable_get_snapshot",
+    [rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_memtable_snapshot_count = rffi.llexternal(
+    "gnitz_memtable_snapshot_count",
+    [rffi.VOIDP],
+    rffi.UINT,
+    compilation_info=eci,
+)
+
+_memtable_snapshot_free = rffi.llexternal(
+    "gnitz_memtable_snapshot_free",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_memtable_lookup_pk = rffi.llexternal(
+    "gnitz_memtable_lookup_pk",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG, rffi.INTP],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_memtable_found_null_word = rffi.llexternal(
+    "gnitz_memtable_found_null_word",
+    [rffi.VOIDP],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+_memtable_found_col_ptr = rffi.llexternal(
+    "gnitz_memtable_found_col_ptr",
+    [rffi.VOIDP, rffi.INT, rffi.INT],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_memtable_found_blob_ptr = rffi.llexternal(
+    "gnitz_memtable_found_blob_ptr",
+    [rffi.VOIDP],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_memtable_find_weight_for_row = rffi.llexternal(
+    "gnitz_memtable_find_weight_for_row",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG,
+     rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_memtable_flush = rffi.llexternal(
+    "gnitz_memtable_flush",
+    [rffi.VOIDP, rffi.INT, rffi.CCHARP, rffi.UINT, rffi.INT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_memtable_reset = rffi.llexternal(
+    "gnitz_memtable_reset",
     [rffi.VOIDP],
     lltype.Void,
     compilation_info=eci,

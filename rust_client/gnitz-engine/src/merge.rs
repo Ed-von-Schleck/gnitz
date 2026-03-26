@@ -135,6 +135,29 @@ pub struct DirectWriter<'a> {
 }
 
 impl<'a> DirectWriter<'a> {
+    pub fn new(
+        pk_lo: &'a mut [u8],
+        pk_hi: &'a mut [u8],
+        weight: &'a mut [u8],
+        null_bmp: &'a mut [u8],
+        col_bufs: Vec<&'a mut [u8]>,
+        blob: &'a mut [u8],
+        schema: SchemaDescriptor,
+    ) -> Self {
+        DirectWriter {
+            pk_lo,
+            pk_hi,
+            weight,
+            null_bmp,
+            col_bufs,
+            blob,
+            blob_offset: 0,
+            blob_cache: HashMap::new(),
+            count: 0,
+            schema,
+        }
+    }
+
     pub fn write_row(
         &mut self,
         batch: &MemBatch,

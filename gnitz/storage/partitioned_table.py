@@ -165,16 +165,18 @@ class PartitionedTable(ZSetStore):
             return self.partitions[0].create_cursor()
 
         # Collect ALL data sources across ALL partitions into one flat cursor
-        snapshots = newlist_hint(num_live)
+        snapshot_handles = newlist_hint(num_live)
         all_shard_views = newlist_hint(num_live * 4)
         for local in range(num_live):
             part = self.partitions[local]
             part.compact_if_needed()
-            snap = part.memtable.get_consolidated_snapshot()
-            snapshots.append(snap)
+            snap_handle = part.memtable.get_consolidated_snapshot()
+            snapshot_handles.append(snap_handle)
             for sv in part.all_shard_views_for_cursor():
                 all_shard_views.append(sv)
-        return RustUnifiedCursor(self.schema, all_shard_views, snapshots)
+        return RustUnifiedCursor.from_snapshots(
+            self.schema, all_shard_views, snapshot_handles
+        )
 
     def retract_pk(self, key_lo, key_hi, out_batch):
         if len(self.partitions) == 0:

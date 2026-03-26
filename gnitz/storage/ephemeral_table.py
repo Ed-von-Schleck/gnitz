@@ -17,7 +17,7 @@ from gnitz.core import comparator as core_comparator
 from gnitz.core.comparator import RowAccessor
 from gnitz.core.store import ZSetStore
 from gnitz.core.keys import promote_to_index_key
-from gnitz.core.batch import ColumnarBatchAccessor, pk_eq
+from gnitz.core.batch import pk_eq
 from gnitz.storage import (
     engine_ffi,
     memtable,
@@ -228,8 +228,10 @@ class EphemeralTable(ZSetStore):
         self._flush_seq = 0
         self._has_wal = True
         self.current_lsn = r_uint64(0)
-        self._retract_acc = ColumnarBatchAccessor(schema)
         self._retract_soa = ShardRowAccessor(schema)
+        self._retract_mt_acc = cursor.MemTableRowAccessor(
+            schema, self.memtable._handle
+        )
 
     def _erase_stale_shards(self):
         """Delete any leftover ephemeral shard files from a previous run."""
@@ -264,21 +266,11 @@ class EphemeralTable(ZSetStore):
         )
 
     def _build_cursor(self):
-        snapshot = self.memtable.get_consolidated_snapshot()
-        # Get all shard pointers from the Rust ShardIndex
-        out_ptrs = lltype.malloc(rffi.VOIDPP.TO, _MAX_SHARDS, flavor="raw")
-        try:
-            n_shards = intmask(engine_ffi._shard_index_all_shard_ptrs(
-                self._index_handle,
-                out_ptrs,
-                rffi.cast(rffi.UINT, _MAX_SHARDS),
-            ))
-            shard_views = newlist_hint(n_shards)
-            for i in range(n_shards):
-                shard_views.append(_ShardPtrView(out_ptrs[i]))
-        finally:
-            lltype.free(out_ptrs, flavor="raw")
-        return cursor.RustUnifiedCursor(self.schema, shard_views, [snapshot])
+        snap_handle = self.memtable.get_consolidated_snapshot()
+        shard_views = self.all_shard_views_for_cursor()
+        return cursor.RustUnifiedCursor.from_snapshots(
+            self.schema, shard_views, [snap_handle]
+        )
 
     def all_shard_views_for_cursor(self):
         """Return a list of _ShardPtrView wrappers for all shards in the index.
@@ -368,7 +360,7 @@ class EphemeralTable(ZSetStore):
         """
         total_w = r_int64(0)
         if self.memtable.may_contain_pk(key_lo, key_hi):
-            mt_w, _, _ = self.memtable.lookup_pk(key_lo, key_hi)
+            mt_w, _ = self.memtable.lookup_pk(key_lo, key_hi)
             total_w = mt_w
         shard_w, _, _ = self._scan_shards_for_pk(key_lo, key_hi)
         total_w += shard_w
@@ -382,18 +374,19 @@ class EphemeralTable(ZSetStore):
         or had non-positive net weight.
         """
         total_w = r_int64(0)
-        mt_batch = None
-        mt_idx = -1
+        mt_found = False
         if self.memtable.may_contain_pk(key_lo, key_hi):
-            mt_w, mt_batch, mt_idx = self.memtable.lookup_pk(key_lo, key_hi)
+            mt_w, mt_found = self.memtable.lookup_pk(key_lo, key_hi)
             total_w = mt_w
         shard_w, shard_ptr, shard_idx = self._scan_shards_for_pk(key_lo, key_hi)
         total_w += shard_w
         if total_w <= r_int64(0):
             return False
-        if mt_batch is not None:
-            self._retract_acc.bind(mt_batch, mt_idx)
-            out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_acc)
+        if mt_found:
+            self._retract_mt_acc.refresh_null_word()
+            out_batch.append_from_accessor(
+                key_lo, key_hi, r_int64(-1), self._retract_mt_acc
+            )
         elif shard_ptr:
             self._retract_soa.set_row(shard_ptr, shard_idx)
             out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_soa)
