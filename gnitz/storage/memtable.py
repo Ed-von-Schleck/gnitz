@@ -222,75 +222,178 @@ class MemTable(object):
 
 
 def _merge_runs_to_consolidated(runs, schema):
-    """Merge N sorted runs into one owned, consolidated ArenaZSetBatch."""
-    if len(runs) == 0:
+    """Merge N sorted runs into one owned, consolidated ArenaZSetBatch via Rust FFI."""
+    from rpython.rlib.rarithmetic import intmask
+    from gnitz.storage import buffer as buffer_ops, engine_ffi
+
+    num_batches = len(runs)
+    if num_batches == 0:
         return ArenaZSetBatch(schema)
 
-    if len(runs) == 1:
+    if num_batches == 1:
         consolidated = runs[0].to_consolidated()
         if consolidated is runs[0]:
             consolidated = runs[0].clone()
         consolidated.mark_consolidated(True)
         return consolidated
 
-    # Fused k-way merge + inline consolidation: one pass, one allocation.
-    from gnitz.storage.cursor import SortedBatchCursor
-    from gnitz.storage import tournament_tree
+    num_cols = len(schema.columns)
+    pk_index = schema.pk_index
+    num_payload_cols = num_cols - 1
+    regions_per_batch = 4 + num_payload_cols + 1
 
-    cursors = newlist_hint(len(runs))
-    for r in runs:
-        cursors.append(SortedBatchCursor(r))
-    tree = tournament_tree.TournamentTree(cursors, schema)
+    total_rows = 0
+    total_blob = 0
+    for ri in range(num_batches):
+        total_rows += runs[ri].length()
+        total_blob += runs[ri].blob_arena.offset
 
-    consolidated = ArenaZSetBatch(schema)
+    if total_rows == 0:
+        return ArenaZSetBatch(schema)
 
-    has_pending = False
-    pending_pk_lo = r_uint64(0)
-    pending_pk_hi = r_uint64(0)
-    pending_weight_acc = r_int64(0)
-    pending_acc = ColumnarBatchAccessor(schema)
-    cur_acc = ColumnarBatchAccessor(schema)
+    total_regions = num_batches * regions_per_batch
 
-    while not tree.is_exhausted():
-        ci = rffi.cast(lltype.Signed, tree.heap[0].cursor_idx)
-        cur = cursors[ci]
-        cur_pk_lo = cur.key_lo()
-        cur_pk_hi = cur.key_hi()
-        cur_weight = cur.weight()
+    in_ptrs = lltype.malloc(rffi.VOIDPP.TO, total_regions, flavor="raw")
+    in_sizes = lltype.malloc(rffi.UINTP.TO, total_regions, flavor="raw")
+    in_counts = lltype.malloc(rffi.UINTP.TO, num_batches, flavor="raw")
 
-        if not has_pending:
-            pending_pk_lo = cur_pk_lo
-            pending_pk_hi = cur_pk_hi
-            pending_weight_acc = cur_weight
-            cur.bind_to(pending_acc)
-            has_pending = True
-        elif not pk_eq(cur_pk_lo, cur_pk_hi, pending_pk_lo, pending_pk_hi):
-            if pending_weight_acc != r_int64(0):
-                consolidated.append_from_accessor(pending_pk_lo, pending_pk_hi, pending_weight_acc, pending_acc)
-            pending_pk_lo = cur_pk_lo
-            pending_pk_hi = cur_pk_hi
-            pending_weight_acc = cur_weight
-            cur.bind_to(pending_acc)
-        else:
-            cur.bind_to(cur_acc)
-            if core_comparator.compare_rows(schema, pending_acc, cur_acc) == 0:
-                pending_weight_acc += cur_weight
+    idx = 0
+    for bi in range(num_batches):
+        batch = runs[bi]
+        count = batch.length()
+        in_counts[bi] = rffi.cast(rffi.UINT, count)
+        # pk_lo
+        in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.pk_lo_buf.base_ptr)
+        in_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
+        idx += 1
+        # pk_hi
+        in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.pk_hi_buf.base_ptr)
+        in_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
+        idx += 1
+        # weight
+        in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.weight_buf.base_ptr)
+        in_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
+        idx += 1
+        # null
+        in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.null_buf.base_ptr)
+        in_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
+        idx += 1
+        # payload columns (skip pk_index)
+        for ci in range(num_cols):
+            if ci == pk_index:
+                continue
+            col_sz = count * batch.col_strides[ci]
+            in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.col_bufs[ci].base_ptr)
+            in_sizes[idx] = rffi.cast(rffi.UINT, col_sz)
+            idx += 1
+        # blob arena
+        in_ptrs[idx] = rffi.cast(rffi.VOIDP, batch.blob_arena.base_ptr)
+        in_sizes[idx] = rffi.cast(rffi.UINT, batch.blob_arena.offset)
+        idx += 1
+
+    # Pre-allocate output buffers (upper bound)
+    out_pk_lo = buffer_ops.Buffer(total_rows * 8)
+    out_pk_hi = buffer_ops.Buffer(total_rows * 8)
+    out_weight = buffer_ops.Buffer(total_rows * 8)
+    out_null = buffer_ops.Buffer(total_rows * 8)
+
+    out_cols = newlist_hint(num_payload_cols)
+    for ci in range(num_cols):
+        if ci == pk_index:
+            continue
+        stride = schema.columns[ci].field_type.size
+        out_cols.append(buffer_ops.Buffer(total_rows * stride))
+
+    blob_cap = total_blob if total_blob > 0 else 1
+    out_blob = buffer_ops.Buffer(blob_cap)
+
+    # Pack output region pointers
+    out_ptrs = lltype.malloc(rffi.VOIDPP.TO, regions_per_batch, flavor="raw")
+    out_sizes_arr = lltype.malloc(rffi.UINTP.TO, regions_per_batch, flavor="raw")
+    out_count_arr = lltype.malloc(rffi.UINTP.TO, 1, flavor="raw")
+
+    ori = 0
+    out_ptrs[ori] = rffi.cast(rffi.VOIDP, out_pk_lo.base_ptr)
+    ori += 1
+    out_ptrs[ori] = rffi.cast(rffi.VOIDP, out_pk_hi.base_ptr)
+    ori += 1
+    out_ptrs[ori] = rffi.cast(rffi.VOIDP, out_weight.base_ptr)
+    ori += 1
+    out_ptrs[ori] = rffi.cast(rffi.VOIDP, out_null.base_ptr)
+    ori += 1
+    for col_buf in out_cols:
+        out_ptrs[ori] = rffi.cast(rffi.VOIDP, col_buf.base_ptr)
+        ori += 1
+    out_ptrs[ori] = rffi.cast(rffi.VOIDP, out_blob.base_ptr)
+
+    schema_buf = engine_ffi.pack_schema(schema)
+
+    try:
+        rc = engine_ffi._merge_batches(
+            in_ptrs,
+            in_sizes,
+            in_counts,
+            rffi.cast(rffi.UINT, num_batches),
+            rffi.cast(rffi.UINT, regions_per_batch),
+            rffi.cast(rffi.VOIDP, schema_buf),
+            out_ptrs,
+            out_sizes_arr,
+            out_count_arr,
+        )
+        rc_int = intmask(rc)
+        if rc_int < 0:
+            raise errors.StorageError(
+                "merge_batches failed (error %d)" % rc_int
+            )
+
+        result_count = intmask(out_count_arr[0])
+
+        # Update buffer offsets to reflect actual data written
+        out_pk_lo.offset = intmask(out_sizes_arr[0])
+        out_pk_hi.offset = intmask(out_sizes_arr[1])
+        out_weight.offset = intmask(out_sizes_arr[2])
+        out_null.offset = intmask(out_sizes_arr[3])
+        oci = 4
+        for col_buf in out_cols:
+            col_buf.offset = intmask(out_sizes_arr[oci])
+            oci += 1
+        out_blob.offset = intmask(out_sizes_arr[oci])
+
+        # Build result batch: reconstruct col_bufs with PK slot
+        col_bufs_full = newlist_hint(num_cols)
+        col_strides_full = newlist_hint(num_cols)
+        payload_idx = 0
+        for ci in range(num_cols):
+            if ci == pk_index:
+                col_bufs_full.append(buffer_ops.Buffer(0))
+                col_strides_full.append(0)
             else:
-                if pending_weight_acc != r_int64(0):
-                    consolidated.append_from_accessor(pending_pk_lo, pending_pk_hi, pending_weight_acc, pending_acc)
-                pending_pk_lo = cur_pk_lo
-                pending_pk_hi = cur_pk_hi
-                pending_weight_acc = cur_weight
-                cur.bind_to(pending_acc)
+                col_bufs_full.append(out_cols[payload_idx])
+                col_strides_full.append(schema.columns[ci].field_type.size)
+                payload_idx += 1
 
-        tree.advance_cursor_by_index(ci)
-
-    if has_pending and pending_weight_acc != r_int64(0):
-        consolidated.append_from_accessor(pending_pk_lo, pending_pk_hi, pending_weight_acc, pending_acc)
-
-    tree.close()
-    consolidated._sorted = True
-    return consolidated
+        result = ArenaZSetBatch.from_buffers(
+            schema,
+            out_pk_lo,
+            out_pk_hi,
+            out_weight,
+            out_null,
+            col_bufs_full,
+            col_strides_full,
+            out_blob,
+            result_count,
+            is_sorted=True,
+        )
+        result.mark_consolidated(True)
+        return result
+    finally:
+        lltype.free(in_ptrs, flavor="raw")
+        lltype.free(in_sizes, flavor="raw")
+        lltype.free(in_counts, flavor="raw")
+        lltype.free(out_ptrs, flavor="raw")
+        lltype.free(out_sizes_arr, flavor="raw")
+        lltype.free(out_count_arr, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")
 
 
 def _lower_bound(run, key_lo, key_hi):

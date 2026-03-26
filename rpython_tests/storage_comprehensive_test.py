@@ -433,7 +433,7 @@ def test_memtable(base_dir):
             b_c.free()
 
         snap = mt3.get_consolidated_snapshot()
-        mc = cursor.RustUnifiedCursor(schema_u128, [], snap)
+        mc = cursor.SortedBatchCursor(snap)
         assert_true(mc.is_valid(), "Cursor should be valid")
         assert_equal_u128(r_uint128(10), mc.key(), "Cursor should start at PK 10")
         mc.advance()
@@ -445,7 +445,7 @@ def test_memtable(base_dir):
 
         # 4. Cursor seek
         snap2 = mt3.get_consolidated_snapshot()
-        mc2 = cursor.RustUnifiedCursor(schema_u128, [], snap2)
+        mc2 = cursor.SortedBatchCursor(snap2)
         mc2.seek(r_uint64(20), r_uint64(0))
         assert_true(mc2.is_valid(), "Cursor should be valid after seek")
         assert_equal_u128(r_uint128(20), mc2.key(), "Cursor should seek to PK 20")

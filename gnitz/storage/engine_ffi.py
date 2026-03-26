@@ -109,6 +109,14 @@ eci = ExternalCompilationInfo(
         "  void *schema_desc,"
         "  uint32_t table_id, uint32_t level_num, uint64_t lsn_tag,"
         "  void *out_results, uint32_t max_results);",
+        # batch merge (memtable consolidation)
+        "int32_t gnitz_merge_batches("
+        "  void **in_region_ptrs, uint32_t *in_region_sizes,"
+        "  uint32_t *in_row_counts, uint32_t num_batches,"
+        "  uint32_t regions_per_batch,"
+        "  void *schema_desc,"
+        "  void **out_region_ptrs, uint32_t *out_region_sizes,"
+        "  uint32_t *out_row_count);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -509,6 +517,22 @@ _merge_and_route = rffi.llexternal(
      rffi.VOIDP,
      rffi.UINT, rffi.UINT, rffi.ULONGLONG,
      rffi.VOIDP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Batch merge (memtable consolidation)
+# ---------------------------------------------------------------------------
+
+_merge_batches = rffi.llexternal(
+    "gnitz_merge_batches",
+    [rffi.VOIDPP, rffi.UINTP,
+     rffi.UINTP, rffi.UINT,
+     rffi.UINT,
+     rffi.VOIDP,
+     rffi.VOIDPP, rffi.UINTP,
+     rffi.UINTP],
     rffi.INT,
     compilation_info=eci,
 )

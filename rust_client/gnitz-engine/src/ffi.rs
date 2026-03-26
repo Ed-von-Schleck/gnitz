@@ -868,6 +868,96 @@ pub extern "C" fn gnitz_merge_and_route(
 }
 
 // ---------------------------------------------------------------------------
+// Batch merge (memtable consolidation)
+// ---------------------------------------------------------------------------
+
+/// N-way merge + consolidation of in-memory batches.
+///
+/// Each batch is described by `regions_per_batch` consecutive regions in the
+/// `in_region_ptrs`/`in_region_sizes` arrays (layout: pk_lo, pk_hi, weight,
+/// null_bmp, payload_col_0..N-1, blob). `in_row_counts[i]` gives the row count
+/// of batch `i`.
+///
+/// The caller pre-allocates output buffers (same region layout, one set) and
+/// passes them via `out_region_ptrs`. On success, `out_region_sizes` is filled
+/// with actual bytes written and `out_row_count` with the result row count.
+///
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_merge_batches(
+    in_region_ptrs: *const *const u8,
+    in_region_sizes: *const u32,
+    in_row_counts: *const u32,
+    num_batches: u32,
+    regions_per_batch: u32,
+    schema_desc: *const u8,
+    out_region_ptrs: *const *mut u8,
+    out_region_sizes: *mut u32,
+    out_row_count: *mut u32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        if in_region_ptrs.is_null()
+            || in_region_sizes.is_null()
+            || in_row_counts.is_null()
+            || schema_desc.is_null()
+            || out_region_ptrs.is_null()
+            || out_region_sizes.is_null()
+            || out_row_count.is_null()
+        {
+            return -1;
+        }
+        if num_batches == 0 || regions_per_batch < 5 {
+            unsafe { *out_row_count = 0; }
+            return 0;
+        }
+
+        let nb = num_batches as usize;
+        let rpb = regions_per_batch as usize;
+        let num_payload_cols = rpb - 5; // 4 fixed + blob
+        let total_regions = nb * rpb;
+
+        let schema = unsafe { &*(schema_desc as *const crate::compact::SchemaDescriptor) };
+        let in_ptrs = unsafe { slice::from_raw_parts(in_region_ptrs, total_regions) };
+        let in_sizes = unsafe { slice::from_raw_parts(in_region_sizes, total_regions) };
+        let in_counts = unsafe { slice::from_raw_parts(in_row_counts, nb) };
+        let out_ptrs = unsafe { slice::from_raw_parts(out_region_ptrs, rpb) };
+        let out_sizes = unsafe { slice::from_raw_parts_mut(out_region_sizes, rpb) };
+
+        // Compute totals for writer allocation
+        let mut total_rows: usize = 0;
+        let mut total_blob: usize = 0;
+        for bi in 0..nb {
+            total_rows += in_counts[bi] as usize;
+            let blob_ri = bi * rpb + 4 + num_payload_cols;
+            total_blob += in_sizes[blob_ri] as usize;
+        }
+        if total_blob == 0 {
+            total_blob = 1;
+        }
+
+        let batches = unsafe {
+            crate::merge::parse_batches_from_regions(
+                in_ptrs, in_sizes, in_counts, nb, rpb, num_payload_cols,
+            )
+        };
+
+        let mut writer = unsafe {
+            crate::merge::create_writer_from_regions(
+                out_ptrs, rpb, schema, total_rows, total_blob,
+            )
+        };
+
+        crate::merge::merge_batches(&batches, schema, &mut writer);
+
+        let count = writer.row_count();
+        crate::merge::fill_output_sizes(&writer, schema, out_sizes);
+        unsafe { *out_row_count = count as u32; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 

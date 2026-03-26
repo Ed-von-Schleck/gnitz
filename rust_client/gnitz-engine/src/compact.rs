@@ -15,7 +15,7 @@ use crate::util::read_i64_le;
 // Type codes (from core/types.py). All defined for completeness;
 // the compare_rows dispatch only uses F32/F64/STRING/U128 explicitly.
 #[allow(dead_code)]
-mod type_code {
+pub(crate) mod type_code {
     pub const U8: u8 = 1;
     pub const I8: u8 = 2;
     pub const U16: u8 = 3;
@@ -33,7 +33,7 @@ use type_code::{F32 as TYPE_F32, F64 as TYPE_F64, STRING as TYPE_STRING, U128 as
 #[cfg(test)]
 use type_code::{I64 as TYPE_I64, U64 as TYPE_U64};
 
-const SHORT_STRING_THRESHOLD: usize = 12;
+pub(crate) const SHORT_STRING_THRESHOLD: usize = 12;
 
 // ---------------------------------------------------------------------------
 // Schema descriptor (passed from RPython via FFI)
@@ -223,7 +223,7 @@ fn is_null(shard: &MappedShard, row: usize, col_idx: usize, pk_index: usize) -> 
     (null_word >> payload_idx) & 1 != 0
 }
 
-fn read_signed(bytes: &[u8], size: usize) -> i64 {
+pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
     match size {
         1 => bytes[0] as i8 as i64,
         2 => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64,
@@ -233,7 +233,7 @@ fn read_signed(bytes: &[u8], size: usize) -> i64 {
     }
 }
 
-fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> std::cmp::Ordering {
+pub(crate) fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> std::cmp::Ordering {
     let len_a = read_u32_le(a, 0) as usize;
     let len_b = read_u32_le(b, 0) as usize;
     let min_len = len_a.min(len_b);
@@ -265,7 +265,7 @@ fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> s
 /// Short strings (≤12 bytes): suffix bytes are inline at struct offset 8.
 /// Long strings (>12 bytes): data is in the blob heap at the stored offset.
 #[inline]
-fn string_byte(struct_bytes: &[u8], blob: &[u8], length: usize, i: usize) -> u8 {
+pub(crate) fn string_byte(struct_bytes: &[u8], blob: &[u8], length: usize, i: usize) -> u8 {
     if length <= SHORT_STRING_THRESHOLD {
         struct_bytes[8 + (i - 4)]
     } else {
