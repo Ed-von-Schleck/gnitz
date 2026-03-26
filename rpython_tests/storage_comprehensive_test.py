@@ -479,25 +479,16 @@ def test_shards_and_columnar(base_dir):
     fn = os.path.join(base_dir, "test_shard.db")
 
     # 1. Write and Validate Checksums
-    writer = shard_writer.ShardWriter(schema, 1)
-
-    tmp1 = batch.ArenaZSetBatch(schema)
-    rb1 = RowBuilder(schema, tmp1)
+    b = batch.ArenaZSetBatch(schema)
+    rb1 = RowBuilder(schema, b)
     rb1.begin(r_uint64(10), r_uint64(0), r_int64(1))
     rb1.put_string("test")
     rb1.commit()
-    writer.add_row_from_accessor(r_uint128(10), r_int64(1), tmp1.get_accessor(0))
-    tmp1.free()
-
-    tmp2 = batch.ArenaZSetBatch(schema)
-    rb2 = RowBuilder(schema, tmp2)
-    rb2.begin(r_uint64(20), r_uint64(0), r_int64(1))
-    rb2.put_string("data_long_string_for_blob")
-    rb2.commit()
-    writer.add_row_from_accessor(r_uint128(20), r_int64(1), tmp2.get_accessor(0))
-    tmp2.free()
-
-    writer.finalize(fn)
+    rb1.begin(r_uint64(20), r_uint64(0), r_int64(1))
+    rb1.put_string("data_long_string_for_blob")
+    rb1.commit()
+    shard_writer.write_batch_to_file(b, fn, 1)
+    b.free()
     view1 = shard_table.TableShardView(fn, schema, validate_checksums=True)
     assert_equal_i(2, view1.count, "Row count mismatch")
     assert_equal_u64(r_uint64(10), view1.get_pk_u64(0), "PK columnar access failed")
@@ -622,17 +613,13 @@ def test_manifest_and_spine(base_dir):
 
     # 4. Index Resolution
     idx_db = os.path.join(base_dir, "shard_idx.db")
-    w = shard_writer.ShardWriter(schema, table_id=1)
-
-    tmp = batch.ArenaZSetBatch(schema)
-    rb_idx = RowBuilder(schema, tmp)
+    b_idx = batch.ArenaZSetBatch(schema)
+    rb_idx = RowBuilder(schema, b_idx)
     rb_idx.begin(r_uint64(10), r_uint64(0), r_int64(1))
     rb_idx.put_string("index")
     rb_idx.commit()
-    w.add_row_from_accessor(r_uint128(10), r_int64(1), tmp.get_accessor(0))
-    tmp.free()
-
-    w.finalize(idx_db)
+    shard_writer.write_batch_to_file(b_idx, idx_db, 1)
+    b_idx.free()
 
     mgr.publish_new_version(
         [manifest.ManifestEntry(1, idx_db, r_uint128(10), r_uint128(10), 0, 1)],
@@ -1023,16 +1010,14 @@ def test_filter_integration(base_dir):
 
     # 2. Shard XOR8 integration
     shard_path = os.path.join(base_dir, "xor8_shard.db")
-    sw = shard_writer.ShardWriter(schema, table_id=1)
+    b_xor = batch.ArenaZSetBatch(schema)
+    rb_s = RowBuilder(schema, b_xor)
     for i in range(1, 51):
-        tmp = batch.ArenaZSetBatch(schema)
-        rb_s = RowBuilder(schema, tmp)
         rb_s.begin(r_uint64(i), r_uint64(0), r_int64(1))
         rb_s.put_string("shard_v%d" % i)
         rb_s.commit()
-        sw.add_row_from_accessor(r_uint128(i), r_int64(1), tmp.get_accessor(0))
-        tmp.free()
-    sw.finalize(shard_path)
+    shard_writer.write_batch_to_file(b_xor, shard_path, 1)
+    b_xor.free()
 
     h = index.ShardHandle(
         shard_path, schema, r_uint64(0), r_uint64(0)
@@ -1962,15 +1947,13 @@ def test_flsm_data_structures(base_dir):
     i = 0
     while i < 5:
         shard_path = shard_dir + "/ds_shard_%d.db" % i
-        sw = shard_writer.ShardWriter(schema, table_id=99)
-        tmp = batch.ArenaZSetBatch(schema)
-        rb = RowBuilder(schema, tmp)
+        b = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, b)
         rb.begin(r_uint64(i * 10), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(i))
         rb.commit()
-        sw.add_row_from_accessor(r_uint128(i * 10), r_int64(1), tmp.get_accessor(0))
-        tmp.free()
-        sw.finalize(shard_path)
+        shard_writer.write_batch_to_file(b, shard_path, 99)
+        b.free()
         shard_paths.append(shard_path)
         i += 1
 
@@ -2371,19 +2354,17 @@ def test_flsm_horizontal_compaction(base_dir):
     i = 0
     while i < 6:
         shard_path = shard_dir + "/hcomp_src_%d.db" % i
-        sw = shard_writer.ShardWriter(schema, table_id=77)
+        b = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, b)
         row = 0
         while row < 10:
             pk = r_uint128(i * 10 + row)
-            tmp = batch.ArenaZSetBatch(schema)
-            rb = RowBuilder(schema, tmp)
             rb.begin(r_uint64(pk), r_uint64(pk >> 64), r_int64(1))
             rb.put_int(r_int64(i * 10 + row))
             rb.commit()
-            sw.add_row_from_accessor(pk, r_int64(1), tmp.get_accessor(0))
-            tmp.free()
             row += 1
-        sw.finalize(shard_path)
+        shard_writer.write_batch_to_file(b, shard_path, 77)
+        b.free()
         h = index.ShardHandle(shard_path, schema, r_uint64(0), r_uint64(0))
         guard.add_handle(rc, h)
         i += 1
@@ -2437,16 +2418,14 @@ def test_flsm_horizontal_ghost_elimination(base_dir):
     while s < 5:
         shard_path = shard_dir + "/ghost_src_%d.db" % s
         original_paths.append(shard_path)
-        sw = shard_writer.ShardWriter(schema, table_id=78)
+        b = batch.ArenaZSetBatch(schema)
+        rb = RowBuilder(schema, b)
         for pk, w in shard_specs[s]:
-            tmp = batch.ArenaZSetBatch(schema)
-            rb = RowBuilder(schema, tmp)
             rb.begin(r_uint64(pk), r_uint64(pk >> 64), w)
             rb.put_int(r_int64(intmask(pk)))
             rb.commit()
-            sw.add_row_from_accessor(pk, w, tmp.get_accessor(0))
-            tmp.free()
-        sw.finalize(shard_path)
+        shard_writer.write_batch_to_file(b, shard_path, 78)
+        b.free()
         h = index.ShardHandle(shard_path, schema, r_uint64(0), r_uint64(0))
         guard.add_handle(rc, h)
         s += 1
@@ -2472,15 +2451,13 @@ def test_flsm_horizontal_ghost_elimination(base_dir):
 
 
 def _make_single_row_shard(path, schema, table_id, pk_val):
-    sw = shard_writer.ShardWriter(schema, table_id=table_id)
-    tmp = batch.ArenaZSetBatch(schema)
-    rb = RowBuilder(schema, tmp)
+    b = batch.ArenaZSetBatch(schema)
+    rb = RowBuilder(schema, b)
     rb.begin(r_uint64(pk_val), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(pk_val))
     rb.commit()
-    sw.add_row_from_accessor(r_uint128(pk_val), r_int64(1), tmp.get_accessor(0))
-    tmp.free()
-    sw.finalize(path)
+    shard_writer.write_batch_to_file(b, path, table_id)
+    b.free()
 
 
 def test_flsm_lmax_horizontal_threshold(base_dir):

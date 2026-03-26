@@ -506,97 +506,6 @@ pub extern "C" fn gnitz_manifest_parse(
 }
 
 // ---------------------------------------------------------------------------
-// Shard writer (row-at-a-time builder)
-// ---------------------------------------------------------------------------
-
-/// Create a new shard writer for accumulating rows.
-#[no_mangle]
-pub extern "C" fn gnitz_shard_writer_new(
-    schema_desc: *const crate::compact::SchemaDescriptor,
-) -> *mut c_void {
-    let result = panic::catch_unwind(|| {
-        if schema_desc.is_null() {
-            return ptr::null_mut();
-        }
-        let schema = unsafe { &*schema_desc };
-        let writer = crate::shard_writer::ShardWriter::new(schema);
-        Box::into_raw(Box::new(writer)) as *mut c_void
-    });
-    result.unwrap_or(ptr::null_mut())
-}
-
-/// Add a row to the shard writer from flat column data.
-/// col_ptrs/col_sizes: one entry per non-PK column (payload order).
-/// blob_base/blob_len: source blob heap for string relocation.
-/// Returns 0 on success, -1 on invalid args.
-#[no_mangle]
-pub extern "C" fn gnitz_shard_writer_add_row(
-    handle: *mut c_void,
-    key_lo: u64,
-    key_hi: u64,
-    weight: i64,
-    null_word: u64,
-    col_ptrs: *const *const u8,
-    col_sizes: *const u32,
-    num_cols: u32,
-    blob_base: *const u8,
-    blob_len: u32,
-) -> i32 {
-    let result = panic::catch_unwind(|| {
-        if handle.is_null() {
-            return -1;
-        }
-        let writer = unsafe { &mut *(handle as *mut crate::shard_writer::ShardWriter) };
-        let n = num_cols as usize;
-        let ptrs = if n > 0 && !col_ptrs.is_null() {
-            unsafe { slice::from_raw_parts(col_ptrs, n) }
-        } else {
-            &[]
-        };
-        let sizes = if n > 0 && !col_sizes.is_null() {
-            unsafe { slice::from_raw_parts(col_sizes, n) }
-        } else {
-            &[]
-        };
-        writer.add_row_flat(
-            key_lo, key_hi, weight, null_word,
-            ptrs, sizes, blob_base, blob_len as usize,
-        );
-        0
-    });
-    result.unwrap_or(-99)
-}
-
-/// Finalize the shard writer: build shard image and write atomically.
-/// Returns 0 on success, negative on error.
-#[no_mangle]
-pub extern "C" fn gnitz_shard_writer_finalize(
-    handle: *mut c_void,
-    path: *const libc::c_char,
-    table_id: u32,
-    durable: c_int,
-) -> i32 {
-    let result = panic::catch_unwind(|| {
-        if handle.is_null() || path.is_null() {
-            return -1;
-        }
-        let writer = unsafe { &*(handle as *const crate::shard_writer::ShardWriter) };
-        let cpath = unsafe { CStr::from_ptr(path) };
-        writer.finalize(cpath, table_id, durable != 0)
-    });
-    result.unwrap_or(-99)
-}
-
-/// Close and free a shard writer handle without writing.
-#[no_mangle]
-pub extern "C" fn gnitz_shard_writer_close(handle: *mut c_void) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        unsafe { drop(Box::from_raw(handle as *mut crate::shard_writer::ShardWriter)); }
-    });
-}
-
-// ---------------------------------------------------------------------------
 // Manifest file I/O
 // ---------------------------------------------------------------------------
 
@@ -1171,29 +1080,6 @@ mod tests {
         assert_eq!(out[0].table_id, 42);
     }
 
-    // -----------------------------------------------------------------------
-    // Shard writer FFI null safety
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn shard_writer_new_null_safety() {
-        assert!(gnitz_shard_writer_new(ptr::null()).is_null());
-    }
-
-    #[test]
-    fn shard_writer_add_row_null_handle() {
-        assert_eq!(gnitz_shard_writer_add_row(ptr::null_mut(), 0, 0, 0, 0, ptr::null(), ptr::null(), 0, ptr::null(), 0), -1);
-    }
-
-    #[test]
-    fn shard_writer_finalize_null_handle() {
-        assert_eq!(gnitz_shard_writer_finalize(ptr::null_mut(), ptr::null(), 0, 0), -1);
-    }
-
-    #[test]
-    fn shard_writer_close_null_safety() {
-        gnitz_shard_writer_close(ptr::null_mut());
-    }
 
     // -----------------------------------------------------------------------
     // Manifest file I/O null safety

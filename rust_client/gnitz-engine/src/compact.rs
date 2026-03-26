@@ -3,10 +3,12 @@
 //! Replaces the RPython compactor.py + tournament_tree.py + shard_table.py (read) +
 //! writer_table.py (write) + comparator.py for the compaction path.
 
+use std::collections::HashMap;
 use std::ffi::CStr;
 
 use crate::shard_reader::MappedShard;
 use crate::util::{read_u32_le, read_u64_le};
+use crate::xxh;
 #[cfg(test)]
 use crate::util::read_i64_le;
 
@@ -480,8 +482,169 @@ impl TournamentTree {
     }
 }
 
-// ShardWriter is in shard_writer.rs
-use crate::shard_writer::ShardWriter;
+// ---------------------------------------------------------------------------
+// Shard writer (compaction-internal, row-at-a-time from MappedShard)
+// ---------------------------------------------------------------------------
+
+struct ShardWriter {
+    pk_lo: Vec<u8>,
+    pk_hi: Vec<u8>,
+    weight: Vec<u8>,
+    null_bitmap: Vec<u8>,
+    col_bufs: Vec<Vec<u8>>,
+    blob_heap: Vec<u8>,
+    blob_cache: HashMap<(u64, usize), usize>,
+    count: usize,
+    schema: SchemaDescriptor,
+}
+
+impl ShardWriter {
+    fn new(schema: &SchemaDescriptor) -> Self {
+        let mut col_bufs = Vec::with_capacity(schema.num_columns as usize);
+        for ci in 0..schema.num_columns as usize {
+            if ci == schema.pk_index as usize {
+                col_bufs.push(Vec::new());
+            } else {
+                col_bufs.push(Vec::with_capacity(1024 * schema.columns[ci].size as usize));
+            }
+        }
+        ShardWriter {
+            pk_lo: Vec::with_capacity(8 * 1024),
+            pk_hi: Vec::with_capacity(8 * 1024),
+            weight: Vec::with_capacity(8 * 1024),
+            null_bitmap: Vec::with_capacity(8 * 1024),
+            col_bufs,
+            blob_heap: Vec::with_capacity(4096),
+            blob_cache: HashMap::new(),
+            count: 0,
+            schema: *schema,
+        }
+    }
+
+    fn add_row_from_shard(
+        &mut self,
+        key: u128,
+        weight: i64,
+        shard: &MappedShard,
+        row: usize,
+    ) {
+        if weight == 0 {
+            return;
+        }
+        self.count += 1;
+        let key_lo = key as u64;
+        let key_hi = (key >> 64) as u64;
+        self.pk_lo.extend_from_slice(&key_lo.to_le_bytes());
+        self.pk_hi.extend_from_slice(&key_hi.to_le_bytes());
+        self.weight.extend_from_slice(&weight.to_le_bytes());
+
+        let pk_index = self.schema.pk_index as usize;
+        let mut null_word: u64 = 0;
+        let mut payload_idx: usize = 0;
+
+        for ci in 0..self.schema.num_columns as usize {
+            if ci == pk_index {
+                continue;
+            }
+            let is_null = is_null(shard, row, ci, pk_index);
+            if is_null {
+                let null_bit_pos = if ci < pk_index { ci } else { ci - 1 };
+                null_word |= 1u64 << null_bit_pos;
+            }
+            self.write_column(ci, payload_idx, is_null, shard, row);
+            payload_idx += 1;
+        }
+        self.null_bitmap.extend_from_slice(&null_word.to_le_bytes());
+    }
+
+    fn write_column(
+        &mut self,
+        col_idx: usize,
+        payload_col_idx: usize,
+        is_null: bool,
+        shard: &MappedShard,
+        row: usize,
+    ) {
+        let col = &self.schema.columns[col_idx];
+        let col_size = col.size as usize;
+
+        if is_null {
+            self.col_bufs[col_idx].extend(std::iter::repeat(0u8).take(col_size));
+            return;
+        }
+
+        let src = shard.get_col_ptr(row, payload_col_idx, col_size);
+
+        if col.type_code == TYPE_STRING {
+            self.write_string_column(col_idx, src, shard.blob_slice());
+        } else {
+            self.col_bufs[col_idx].extend_from_slice(src);
+        }
+    }
+
+    fn write_string_column(&mut self, col_idx: usize, src_struct: &[u8], src_blob: &[u8]) {
+        let length = read_u32_le(src_struct, 0) as usize;
+
+        let mut dest = [0u8; 16];
+        dest[0..4].copy_from_slice(&(length as u32).to_le_bytes());
+        dest[4..8].copy_from_slice(&src_struct[4..8]);
+
+        if length <= SHORT_STRING_THRESHOLD {
+            let suffix_len = if length > 4 { length - 4 } else { 0 };
+            if suffix_len > 0 {
+                dest[8..8 + suffix_len].copy_from_slice(&src_struct[8..8 + suffix_len]);
+            }
+        } else {
+            let old_offset = read_u64_le(src_struct, 8) as usize;
+            let src_data = &src_blob[old_offset..old_offset + length];
+            let new_offset = self.get_or_append_blob(src_data);
+            dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
+        }
+
+        self.col_bufs[col_idx].extend_from_slice(&dest);
+    }
+
+    fn get_or_append_blob(&mut self, data: &[u8]) -> usize {
+        if data.is_empty() {
+            return 0;
+        }
+        let h = xxh::checksum(data);
+        let cache_key = (h, data.len());
+        if let Some(&existing_offset) = self.blob_cache.get(&cache_key) {
+            let existing = &self.blob_heap[existing_offset..existing_offset + data.len()];
+            if existing == data {
+                return existing_offset;
+            }
+        }
+        let new_offset = self.blob_heap.len();
+        self.blob_heap.extend_from_slice(data);
+        self.blob_cache.insert(cache_key, new_offset);
+        new_offset
+    }
+
+    fn finalize(&self, path: &CStr, table_id: u32) -> i32 {
+        let pk_index = self.schema.pk_index as usize;
+        let mut regions: Vec<(*const u8, usize)> = Vec::new();
+        regions.push((self.pk_lo.as_ptr(), self.pk_lo.len()));
+        regions.push((self.pk_hi.as_ptr(), self.pk_hi.len()));
+        regions.push((self.weight.as_ptr(), self.weight.len()));
+        regions.push((self.null_bitmap.as_ptr(), self.null_bitmap.len()));
+        for ci in 0..self.schema.num_columns as usize {
+            if ci == pk_index {
+                continue;
+            }
+            regions.push((self.col_bufs[ci].as_ptr(), self.col_bufs[ci].len()));
+        }
+        regions.push((self.blob_heap.as_ptr(), self.blob_heap.len()));
+
+        let image = crate::shard_file::build_shard_image(
+            table_id, self.count as u32, &regions,
+        );
+        crate::shard_file::write_shard_at(
+            libc::AT_FDCWD, path, &image, true,
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Guard key routing (binary search)
@@ -566,7 +729,7 @@ pub fn compact_shards(
     }
 
     // Finalize output
-    let rc = writer.finalize(output_file, table_id, true);
+    let rc = writer.finalize(output_file, table_id);
     match rc {
         0 => 0,
         e => e,
@@ -651,7 +814,7 @@ pub fn merge_and_route(
     for i in 0..num_guards {
         if writers[i].count > 0 {
             let cpath = std::ffi::CString::new(out_filenames[i].as_str()).unwrap();
-            let frc = writers[i].finalize(&cpath, table_id, true);
+            let frc = writers[i].finalize(&cpath, table_id);
             match frc {
                 0 => {
                     // Check file exists
@@ -720,7 +883,7 @@ mod tests {
         }
 
         let cpath = std::ffi::CString::new(path).unwrap();
-        assert_eq!(writer.finalize(&cpath, 0, true), 0);
+        assert_eq!(writer.finalize(&cpath, 0), 0);
     }
 
     fn make_test_schema() -> SchemaDescriptor {
@@ -1037,7 +1200,7 @@ mod tests {
         }
         let s1 = dir.join("s1.db");
         let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-        assert_eq!(writer.finalize(&cpath, 0, true), 0);
+        assert_eq!(writer.finalize(&cpath, 0), 0);
 
         // Compact it (single shard, should roundtrip)
         let output = dir.join("merged.db");
@@ -1098,7 +1261,7 @@ mod tests {
 
         let s1 = dir.join("s1.db");
         let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-        assert_eq!(writer.finalize(&cpath, 0, true), 0);
+        assert_eq!(writer.finalize(&cpath, 0), 0);
 
         // Compact
         let output = dir.join("merged.db");
