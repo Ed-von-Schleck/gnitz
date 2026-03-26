@@ -39,10 +39,17 @@ Implemented by `op_negate` (flips all weights).
 payload appearing multiple times), consolidation groups them and sums their
 weights. Elements whose net weight is zero are dropped ("ghost elimination").
 
-> **Consolidation is the only operation that changes the number of rows.**
-> It must be correct for the entire system to function.
+> **In GnitzDB's physical batch representation, consolidation is the only
+> operation that merges rows with identical (PK, payload) and sums their
+> weights.** (In Z-Set algebra generally, filter, projection, and join also
+> change element count — but those operate on the mathematical Z-Set, not
+> on unconsolidated physical batches with duplicate entries.)
+> Consolidation must be correct for the entire system to function.
 
-**Consolidation requires a total order on elements.** GnitzDB sorts by
+**GnitzDB's consolidation requires a total order on elements.** (This is an
+implementation choice — hash-based grouping is equally valid in theory, but
+sort-merge is preferred for a storage engine because sorted runs enable
+efficient N-way merging, range scans, and on-disk compaction.) GnitzDB sorts by
 PK first (u128 comparison: high 64 bits, then low 64 bits), then by
 payload columns in schema order (the `compare_rows` function). This
 ensures that all rows with identical (PK, payload) are adjacent in the
@@ -71,19 +78,44 @@ the input delta *dA* arrives and the circuit produces output delta *dO*.
 Operators are classified by linearity:
 
 **Linear operators** satisfy `L(A + B) = L(A) + L(B)`:
-- Filter, Map, Negate, Union, Delay (z^-1)
-- These are stateless — they transform the current delta without history.
-- Consolidation is optional before a linear operator (an optimization).
+- Filter, Map, Negate, Union All (Z-Set addition), Delay (z^-1)
+- These need no additional state for incremental evaluation (Theorem 3.3:
+  Q^delta = Q for linear Q). Note: Delay holds one tick of state by
+  definition, but incrementalization adds no *extra* state.
+- Consolidation is optional before a linear operator (an optimization,
+  not a theorem — but safe because linearity preserves structure).
 
-**Bilinear operators** satisfy `L(A, B+C) = L(A, B) + L(A, C)`:
-- Join: `d(A join B) = dA join I(B) + I(A) join dB` (incremental expansion)
-- These require the **integral** (accumulated history) of one operand.
+**Bilinear operators** are linear separately in each argument:
+`L(A+B, C) = L(A,C) + L(B,C)` and `L(A, C+D) = L(A,C) + L(A,D)`:
+- Join is bilinear (weight of a joined tuple = product of input weights,
+  and integer multiplication distributes over addition).
+- The general DBSP incremental expansion (Theorem 3.4) has three terms:
+  `d(A ⋈ B) = dA ⋈ dB + z⁻¹(I(A)) ⋈ dB + dA ⋈ z⁻¹(I(B))`
+  where `z⁻¹(I(X))` is the accumulated state *before* the current tick.
+  The paper's collapsed 2-term form `I(A) ⋈ dB + dA ⋈ z⁻¹(I(B))` uses
+  an asymmetric timestamp (A new, B old) to absorb the `dA ⋈ dB` term.
+- **GnitzDB uses a symmetric 2-term form:**
+  `d(A ⋈ B) = dA ⋈ z⁻¹(I(B)) + dB ⋈ z⁻¹(I(A))`
+  Both sides use old-state trace cursors (snapshotted in
+  `prepare_for_tick` before the VM runs). This is correct because
+  `execute_epoch` processes **one source at a time** — dA and dB are
+  never both non-zero in the same epoch, so the `dA ⋈ dB` term is
+  always zero. If batched multi-source epochs are ever added, this
+  formula must be revised to include the cross-delta term.
+- These require the **integral** (accumulated history) of both operands.
 - Consolidation of the delta input is required for correctness.
 
-**Non-linear operators** have no algebraic shortcut:
+**Non-linear operators** require access to the accumulated integral, not
+just the current delta:
 - Distinct, Reduce with MIN/MAX
-- These must replay the full accumulated state to compute the new value.
-- Consolidation of the delta input is mandatory.
+- `distinct` does NOT require full-state replay. DBSP Proposition 4.7
+  gives an O(|delta|) incremental circuit: it only needs point lookups
+  into the integral to detect sign transitions (negative→positive or
+  positive→negative). The work is bounded by the size of the delta.
+- MIN/MAX aggregates need auxiliary sorted state and may scan more than
+  the delta, but still do not require a full replay in the general case.
+- Consolidation of the delta input is mandatory — the operator must see
+  true net weights to make correct decisions.
 - The `ConsolidatedScope` context manager enforces this.
 
 ### The Integral (Trace)

@@ -117,6 +117,13 @@ eci = ExternalCompilationInfo(
         "  void *schema_desc,"
         "  void **out_region_ptrs, uint32_t *out_region_sizes,"
         "  uint32_t *out_row_count);",
+        # single-batch sort + consolidation
+        "int32_t gnitz_consolidate_batch("
+        "  void **in_region_ptrs, uint32_t *in_region_sizes,"
+        "  uint32_t row_count, uint32_t regions_per_batch,"
+        "  void *schema_desc,"
+        "  void **out_region_ptrs, uint32_t *out_region_sizes,"
+        "  uint32_t *out_row_count);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -530,6 +537,21 @@ _merge_batches = rffi.llexternal(
     [rffi.VOIDPP, rffi.UINTP,
      rffi.UINTP, rffi.UINT,
      rffi.UINT,
+     rffi.VOIDP,
+     rffi.VOIDPP, rffi.UINTP,
+     rffi.UINTP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Single-batch sort + consolidation
+# ---------------------------------------------------------------------------
+
+_consolidate_batch = rffi.llexternal(
+    "gnitz_consolidate_batch",
+    [rffi.VOIDPP, rffi.UINTP,
+     rffi.UINT, rffi.UINT,
      rffi.VOIDP,
      rffi.VOIDPP, rffi.UINTP,
      rffi.UINTP],

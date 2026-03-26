@@ -688,6 +688,106 @@ pub fn fill_output_sizes(
     out_sizes[blob_idx] = writer.blob_written() as u32;
 }
 
+// ---------------------------------------------------------------------------
+// Single-batch sort + consolidation
+// ---------------------------------------------------------------------------
+
+/// Sort a single batch by (PK, payload) and consolidate: sum weights for
+/// identical (PK, payload) rows, drop ghosts (net weight == 0).
+///
+/// Uses Rust's stable sort on an index array — no tournament tree needed.
+pub fn sort_and_consolidate(
+    batch: &MemBatch,
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+) {
+    let n = batch.count;
+    if n == 0 {
+        return;
+    }
+
+    // Build index array and sort by (PK, payload)
+    let mut indices: Vec<usize> = (0..n).collect();
+    indices.sort_by(|&a, &b| {
+        let pk_a = batch.get_pk(a);
+        let pk_b = batch.get_pk(b);
+        match pk_a.cmp(&pk_b) {
+            Ordering::Equal => compare_rows(schema, batch, a, batch, b),
+            ord => ord,
+        }
+    });
+
+    // Walk sorted indices with pending-group consolidation
+    let mut pending_idx = indices[0];
+    let mut pending_pk = batch.get_pk(pending_idx);
+    let mut pending_weight = batch.get_weight(pending_idx);
+
+    for pos in 1..n {
+        let cur_idx = indices[pos];
+        let cur_pk = batch.get_pk(cur_idx);
+
+        if cur_pk != pending_pk {
+            // Different PK: flush pending
+            if pending_weight != 0 {
+                writer.write_row(batch, pending_idx, pending_weight);
+            }
+            pending_idx = cur_idx;
+            pending_pk = cur_pk;
+            pending_weight = batch.get_weight(cur_idx);
+        } else {
+            // Same PK: compare payload
+            let ord = compare_rows(schema, batch, pending_idx, batch, cur_idx);
+            if ord == Ordering::Equal {
+                pending_weight += batch.get_weight(cur_idx);
+            } else {
+                if pending_weight != 0 {
+                    writer.write_row(batch, pending_idx, pending_weight);
+                }
+                pending_idx = cur_idx;
+                pending_pk = cur_pk;
+                pending_weight = batch.get_weight(cur_idx);
+            }
+        }
+    }
+
+    // Flush last pending
+    if pending_weight != 0 {
+        writer.write_row(batch, pending_idx, pending_weight);
+    }
+}
+
+/// Parse a single batch from flat region arrays (single-batch FFI variant).
+pub unsafe fn parse_single_batch_from_regions<'a>(
+    in_ptrs: &[*const u8],
+    in_sizes: &[u32],
+    count: usize,
+    num_payload_cols: usize,
+) -> MemBatch<'a> {
+    let pk_lo = std::slice::from_raw_parts(in_ptrs[0], in_sizes[0] as usize);
+    let pk_hi = std::slice::from_raw_parts(in_ptrs[1], in_sizes[1] as usize);
+    let weight = std::slice::from_raw_parts(in_ptrs[2], in_sizes[2] as usize);
+    let null_bmp = std::slice::from_raw_parts(in_ptrs[3], in_sizes[3] as usize);
+
+    let mut col_data = Vec::with_capacity(num_payload_cols);
+    for ci in 0..num_payload_cols {
+        let ri = 4 + ci;
+        col_data.push(std::slice::from_raw_parts(in_ptrs[ri], in_sizes[ri] as usize));
+    }
+
+    let blob_ri = 4 + num_payload_cols;
+    let blob = std::slice::from_raw_parts(in_ptrs[blob_ri], in_sizes[blob_ri] as usize);
+
+    MemBatch {
+        pk_lo,
+        pk_hi,
+        weight,
+        null_bmp,
+        col_data,
+        blob,
+        count,
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1078,5 +1178,179 @@ mod tests {
         assert_eq!(result[0], (10, 0, 1, 100));
         assert_eq!(result[1], (10, 0, 1, 200));
         assert_eq!(result[2], (20, 0, 1, 300));
+    }
+
+    // -----------------------------------------------------------------------
+    // sort_and_consolidate tests
+    // -----------------------------------------------------------------------
+
+    fn run_consolidate(batch: &MemBatch, schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
+        let n = batch.count;
+        let total_blob = batch.blob.len();
+
+        let mut out_pk_lo = vec![0u8; n * 8];
+        let mut out_pk_hi = vec![0u8; n * 8];
+        let mut out_weight = vec![0u8; n * 8];
+        let mut out_null = vec![0u8; n * 8];
+        let mut out_col0 = vec![0u8; n * 8];
+        let blob_cap = if total_blob > 0 { total_blob } else { 1 };
+        let mut out_blob = vec![0u8; blob_cap];
+
+        let count;
+        {
+            let mut writer = DirectWriter {
+                pk_lo: &mut out_pk_lo,
+                pk_hi: &mut out_pk_hi,
+                weight: &mut out_weight,
+                null_bmp: &mut out_null,
+                col_bufs: vec![&mut out_col0],
+                blob: &mut out_blob,
+                blob_offset: 0,
+                blob_cache: HashMap::new(),
+                count: 0,
+                schema: *schema,
+            };
+            sort_and_consolidate(batch, schema, &mut writer);
+            count = writer.row_count();
+        }
+
+        let mut result = Vec::new();
+        for i in 0..count {
+            let lo = read_u64_le(&out_pk_lo, i * 8);
+            let hi = read_u64_le(&out_pk_hi, i * 8);
+            let w = i64::from_le_bytes(out_weight[i * 8..i * 8 + 8].try_into().unwrap());
+            let val = i64::from_le_bytes(out_col0[i * 8..i * 8 + 8].try_into().unwrap());
+            result.push((lo, hi, w, val));
+        }
+        result
+    }
+
+    #[test]
+    fn test_consolidate_empty() {
+        let schema = make_schema_i64();
+        let b = MemBatch {
+            pk_lo: &[], pk_hi: &[], weight: &[], null_bmp: &[],
+            col_data: vec![&[]], blob: &[], count: 0,
+        };
+        let result = run_consolidate(&b, &schema);
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_consolidate_single_row() {
+        let schema = make_schema_i64();
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[(5, 0, 1, 42)]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 1);
+        let result = run_consolidate(&b, &schema);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], (5, 0, 1, 42));
+    }
+
+    #[test]
+    fn test_consolidate_already_sorted_no_dups() {
+        let schema = make_schema_i64();
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+            (1, 0, 1, 10),
+            (2, 0, 1, 20),
+            (3, 0, 1, 30),
+        ]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 3);
+        let result = run_consolidate(&b, &schema);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], (1, 0, 1, 10));
+        assert_eq!(result[1], (2, 0, 1, 20));
+        assert_eq!(result[2], (3, 0, 1, 30));
+    }
+
+    #[test]
+    fn test_consolidate_unsorted_no_dups() {
+        let schema = make_schema_i64();
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+            (3, 0, 1, 30),
+            (1, 0, 1, 10),
+            (2, 0, 1, 20),
+        ]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 3);
+        let result = run_consolidate(&b, &schema);
+        assert_eq!(result.len(), 3);
+        // Should be sorted by PK
+        assert_eq!(result[0], (1, 0, 1, 10));
+        assert_eq!(result[1], (2, 0, 1, 20));
+        assert_eq!(result[2], (3, 0, 1, 30));
+    }
+
+    #[test]
+    fn test_consolidate_dup_weight_accumulation() {
+        let schema = make_schema_i64();
+        // Same (PK, payload) with +1 and +1 → merged to +2
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+            (5, 0, 1, 42),
+            (5, 0, 1, 42),
+        ]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
+        let result = run_consolidate(&b, &schema);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], (5, 0, 2, 42));
+    }
+
+    #[test]
+    fn test_consolidate_ghost_elimination() {
+        let schema = make_schema_i64();
+        // Same (PK, payload) with +1 and -1 → ghost, eliminated
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+            (5, 0, 1, 42),
+            (5, 0, -1, 42),
+        ]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
+        let result = run_consolidate(&b, &schema);
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_consolidate_same_pk_different_payload() {
+        let schema = make_schema_i64();
+        // Same PK but different payloads → both survive, sorted by payload
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+            (5, 0, 1, 200),
+            (5, 0, 1, 100),
+        ]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 2);
+        let result = run_consolidate(&b, &schema);
+        assert_eq!(result.len(), 2);
+        // Sorted by payload (I64 signed comparison: 100 < 200)
+        assert_eq!(result[0], (5, 0, 1, 100));
+        assert_eq!(result[1], (5, 0, 1, 200));
+    }
+
+    #[test]
+    fn test_consolidate_unsorted_mixed() {
+        let schema = make_schema_i64();
+        // Unsorted: insert + retract + different PKs
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+            (10, 0, 1, 100),   // insert pk=10 val=100
+            (5, 0, 1, 50),     // insert pk=5 val=50
+            (10, 0, -1, 100),  // retract pk=10 val=100
+            (5, 0, 1, 50),     // duplicate insert pk=5 val=50
+        ]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 4);
+        let result = run_consolidate(&b, &schema);
+        // pk=10 val=100: +1-1=0 → ghost
+        // pk=5 val=50: +1+1=+2
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], (5, 0, 2, 50));
+    }
+
+    #[test]
+    fn test_consolidate_all_cancel() {
+        let schema = make_schema_i64();
+        let (pk_lo, pk_hi, w, n, c) = make_batch_i64(&[
+            (1, 0, 1, 10),
+            (1, 0, -1, 10),
+            (2, 0, 3, 20),
+            (2, 0, -3, 20),
+        ]);
+        let b = to_mem_batch(&pk_lo, &pk_hi, &w, &n, &c, 4);
+        let result = run_consolidate(&b, &schema);
+        assert_eq!(result.len(), 0);
     }
 }
