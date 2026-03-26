@@ -73,6 +73,28 @@ pre-routing, stashing, skipping round-trips):
       optimization: run tests after steps 1-2 before writing steps 3-4.
 - [ ] Add a comment to any guard/fallback code naming the invariant it protects.
 
+## Consolidation and merge correctness
+
+Any code that merges or consolidates Z-Set batches must respect the
+invariants in `foundations.md`. The critical rule:
+
+> **All merge/consolidation paths must produce output sorted by
+> (PK, payload), not just PK.**
+
+When adding or modifying a merge path (tournament tree, sort, compaction):
+
+- [ ] Does the comparison function include payload columns after PK?
+      Both `sift_down` / `sift_up` in the heap AND any sequential
+      pending-group accumulation depend on (PK, payload) adjacency.
+- [ ] Does the path handle within-cursor duplicates? MemTable runs are
+      sorted but NOT consolidated — the same (PK, payload) can appear
+      multiple times in one run (e.g., +1 then -1 for the same key).
+- [ ] Is `compare_rows` identical between RPython and Rust? Column order,
+      null handling (null < non-null), and sign-extension must match.
+- [ ] Test with non-linear aggregates (MIN/MAX). These use secondary
+      index tables with matching PKs but different payloads — the exact
+      pattern where PK-only ordering silently breaks consolidation.
+
 ## Rust static lib rebuild rule
 
 Individual test targets (`make run-<name>-c`) do **not** rebuild the Rust
