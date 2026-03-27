@@ -19,10 +19,6 @@ from gnitz.core import strings as string_logic
 from gnitz.storage import (
     buffer,
     memtable,
-    wal,
-    wal_columnar,
-    wal_layout,
-    shard_writer,
     cursor,
     mmap_posix,
 )
@@ -166,167 +162,6 @@ def test_integrity_and_lowlevel(base_dir):
 
     os.write(1, "    [OK] Integrity & Low-Level passed.\n")
 
-
-def test_wal_storage(base_dir):
-    os.write(1, "[Storage] Testing Columnar Z-Set WAL...\n")
-    schema = make_u64_str_schema()
-    wal_path = os.path.join(base_dir, "test.wal")
-
-    # 1. WAL Columnar Roundtrip
-    writer = wal.WALWriter(wal_path, schema)
-
-    b1 = batch.ArenaZSetBatch(schema)
-    rb = RowBuilder(schema, b1)
-    rb.begin(r_uint64(10), r_uint64(0), r_int64(1))
-    rb.put_string("block1")
-    rb.commit()
-
-    writer.append_batch(r_uint64(1), 1, b1)
-    writer.close()
-    b1.free()
-
-    reader = wal.WALReader(wal_path, schema)
-    blocks = newlist_hint(1)
-    for block in reader.iterate_blocks():
-        blocks.append(block)
-
-    assert_equal_i(1, len(blocks), "WALReader didn't read exactly 1 block")
-    assert_equal_u64(r_uint64(1), blocks[0].lsn, "WAL LSN mismatch")
-
-    read_batch = blocks[0].batch
-    assert_equal_i(1, read_batch.length(), "WAL batch length mismatch")
-    assert_equal_u128(r_uint128(10), read_batch.get_pk(0), "WAL PK mismatch")
-    assert_equal_i64(r_int64(1), read_batch.get_weight(0), "WAL weight mismatch")
-
-    # Read string value via ColumnarBatchAccessor
-    acc = ColumnarBatchAccessor(schema)
-    acc.bind(read_batch, 0)
-    length, prefix, struct_ptr, heap_ptr, py_str = acc.get_str_struct(1)
-    recovered_str = string_logic.unpack_string(struct_ptr, heap_ptr)
-    assert_equal_s("block1", recovered_str, "WAL string deserialization mismatch")
-
-    blocks[0].free()
-    reader.close()
-
-    # 2. Single Writer Lock
-    writer1 = wal.WALWriter(wal_path, schema)
-    raised = False
-    try:
-        wal.WALWriter(wal_path, schema)
-    except errors.StorageError:
-        raised = True
-    assert_true(raised, "WAL single-writer lock failed")
-    writer1.close()
-
-    # 3. Truncation
-    writer2 = wal.WALWriter(wal_path, schema)
-    writer2.truncate_before_lsn(r_uint64(2))
-    assert_equal_i(0, os.path.getsize(wal_path), "WAL physical truncation failed")
-    writer2.close()
-
-    # 4. Multi-Record Blob Alignment (Critical Bug Repro)
-    wal_blob_path = os.path.join(base_dir, "blob.wal")
-    writer_blob = wal.WALWriter(wal_blob_path, schema)
-
-    b_blob = batch.ArenaZSetBatch(schema)
-    rb_blob = RowBuilder(schema, b_blob)
-
-    # Long string forces Blob allocation inside WAL block body
-    long_str = "A" * 50
-    rb_blob.begin(r_uint64(1), r_uint64(0), r_int64(1))
-    rb_blob.put_string(long_str)
-    rb_blob.commit()
-
-    # Short string immediately follows
-    rb_blob.begin(r_uint64(2), r_uint64(0), r_int64(1))
-    rb_blob.put_string("short")
-    rb_blob.commit()
-
-    writer_blob.append_batch(r_uint64(100), 1, b_blob)
-    writer_blob.close()
-    b_blob.free()
-
-    r_blob = wal.WALReader(wal_blob_path, schema)
-    block_b = r_blob.read_next_block()
-    assert_true(block_b is not None, "Failed to read blob WAL block")
-
-    rb_blob_batch = block_b.batch
-    assert_equal_i(2, rb_blob_batch.length(), "Multi-record WAL decode failed")
-
-    acc_b = ColumnarBatchAccessor(schema)
-    acc_b.bind(rb_blob_batch, 0)
-    _, _, sp1, hp1, _ = acc_b.get_str_struct(1)
-    s1 = string_logic.unpack_string(sp1, hp1)
-    assert_equal_s(long_str, s1, "WAL long string alignment mismatch")
-
-    acc_b.bind(rb_blob_batch, 1)
-    _, _, sp2, hp2, _ = acc_b.get_str_struct(1)
-    s2 = string_logic.unpack_string(sp2, hp2)
-    assert_equal_s("short", s2, "WAL short string alignment mismatch")
-
-    block_b.free()
-    r_blob.close()
-
-    os.write(1, "    [OK] Columnar Z-Set WAL passed.\n")
-
-
-def test_wal_reencode_round_trip(base_dir):
-    """
-    Regression: decode a WAL block containing heap-allocated strings (>12 chars),
-    then re-encode the decoded batch, then decode again.  All string values must
-    survive both round-trips unchanged.
-
-    This caught a bug where Buffer.from_external_ptr left offset=0 on the blob
-    buffer, causing encode_batch_append to read blob_size=0 and drop all heap
-    strings.  The decoded table name arrived as null bytes at the worker, C's
-    open() truncated at \\0, opened the partition directory, and returned EISDIR.
-    """
-    os.write(1, "[Storage] Testing WAL re-encode round-trip (heap strings)...\n")
-    schema = make_u64_str_schema()
-
-    # A string longer than 12 bytes forces heap (blob arena) allocation.
-    long_name = "orders_archive_2024"  # 19 chars > SHORT_STRING_THRESHOLD=12
-
-    # Step 1: encode original batch to a wire buffer.
-    orig = batch.ArenaZSetBatch(schema)
-    rb = RowBuilder(schema, orig)
-    rb.begin(r_uint64(7), r_uint64(0), r_int64(1))
-    rb.put_string(long_name)
-    rb.commit()
-
-    wire_buf = buffer.Buffer(4096)
-    wal_columnar.encode_batch_to_buffer(wire_buf, schema, 42, 1, orig)
-    orig.free()
-
-    # Step 2: non-owning decode (wire_buf owns the memory).
-    decoded = wal_columnar.decode_batch_from_ptr(wire_buf.base_ptr, wire_buf.offset, schema)
-
-    acc = ColumnarBatchAccessor(schema)
-    acc.bind(decoded, 0)
-    _, _, sp, hp, _ = acc.get_str_struct(1)
-    s1 = string_logic.unpack_string(sp, hp)
-    assert_equal_s(long_name, s1, "WAL decode: string mismatch after first decode")
-
-    # Step 3: re-encode the decoded batch (simulates DDL broadcast on master).
-    wire_buf2 = buffer.Buffer(4096)
-    wal_columnar.encode_batch_to_buffer(wire_buf2, schema, 42, 1, decoded)
-    decoded.free()
-    wire_buf.free()
-
-    # Step 4: decode the re-encoded buffer and verify strings survived.
-    decoded2 = wal_columnar.decode_batch_from_ptr(wire_buf2.base_ptr, wire_buf2.offset, schema)
-
-    assert_equal_i(1, decoded2.length(), "re-encoded WAL: wrong row count")
-    acc2 = ColumnarBatchAccessor(schema)
-    acc2.bind(decoded2, 0)
-    _, _, sp2, hp2, _ = acc2.get_str_struct(1)
-    s2 = string_logic.unpack_string(sp2, hp2)
-    assert_equal_s(long_name, s2, "WAL re-encode: heap string lost after second decode")
-
-    decoded2.free()
-    wire_buf2.free()
-
-    os.write(1, "    [OK] WAL re-encode round-trip passed.\n")
 
 
 
@@ -479,10 +314,7 @@ def test_ephemeral_and_persistent_tables(base_dir):
     assert_equal_i64(r_int64(2), net_w, "Ephemeral algebraic summation failed")
 
     # 2. Ephemeral Spill
-    shard_path = t_eph.flush()
-    assert_true(
-        shard_path.find("eph_shard") >= 0, "Ephemeral shard naming convention failed"
-    )
+    t_eph.flush()
 
     net_w2 = t_eph.get_weight(r_uint64(pk1), r_uint64(pk1 >> 64), acc1)
     assert_equal_i64(
@@ -1740,8 +1572,6 @@ def entry_point(argv):
 
     try:
         test_integrity_and_lowlevel(base_dir)
-        test_wal_storage(base_dir)
-        test_wal_reencode_round_trip(base_dir)
         test_ephemeral_and_persistent_tables(base_dir)
         test_u128_payloads(base_dir)
         test_retract_pk(base_dir)

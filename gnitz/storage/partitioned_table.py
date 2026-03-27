@@ -95,7 +95,7 @@ class PartitionedTable(ZSetStore):
     def set_has_wal(self, flag):
         """Propagate _has_wal to all partition sub-stores."""
         for i in range(len(self.partitions)):
-            self.partitions[i]._has_wal = flag
+            self.partitions[i].set_has_wal(flag)
 
     def get_max_flushed_lsn(self):
         """Max current_lsn across all partitions (for SAL recovery)."""
@@ -170,7 +170,8 @@ class PartitionedTable(ZSetStore):
         for local in range(num_live):
             part = self.partitions[local]
             part.compact_if_needed()
-            snap_handle = part.memtable.get_consolidated_snapshot()
+            part._flush_accumulator()
+            snap_handle = part.get_consolidated_snapshot()
             snapshot_handles.append(snap_handle)
             for sv in part.all_shard_views_for_cursor():
                 all_shard_views.append(sv)

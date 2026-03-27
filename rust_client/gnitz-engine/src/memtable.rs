@@ -496,6 +496,10 @@ impl MemTable {
         shard_file::write_shard_at(dirfd, basename, &image, durable)
     }
 
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
     /// Clear all runs, bloom filter, and cache.  Ready for reuse.
     pub fn reset(&mut self) {
         self.runs.clear();

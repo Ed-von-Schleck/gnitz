@@ -1706,6 +1706,354 @@ pub extern "C" fn gnitz_read_cursor_create_from_snapshots(
 }
 
 // ---------------------------------------------------------------------------
+// Table (unified opaque handle: MemTable + ShardIndex + optional WAL)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_create(
+    dir: *const libc::c_char,
+    name: *const libc::c_char,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    table_id: u32,
+    arena_size: u64,
+    durable: i32,
+) -> *mut libc::c_void {
+    let result = panic::catch_unwind(|| {
+        if dir.is_null() || name.is_null() || schema_desc.is_null() {
+            return ptr::null_mut();
+        }
+        let dir_s = unsafe { CStr::from_ptr(dir) }.to_str().unwrap_or("");
+        let name_s = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("");
+        let schema = unsafe { *schema_desc };
+        match crate::table::Table::new(dir_s, name_s, schema, table_id, arena_size, durable != 0) {
+            Ok(t) => Box::into_raw(Box::new(t)) as *mut libc::c_void,
+            Err(_) => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_close(handle: *mut libc::c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        unsafe { let _ = Box::from_raw(handle as *mut crate::table::Table); }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_ingest_batch(
+    handle: *mut libc::c_void,
+    in_ptrs: *const *const u8,
+    in_sizes: *const u32,
+    row_count: u32,
+    regions_per_batch: u32,
+) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        let rpb = regions_per_batch as usize;
+        let npc = t.schema().num_columns as usize - 1;
+        let ptrs = unsafe { slice::from_raw_parts(in_ptrs, rpb) };
+        let sizes = unsafe { slice::from_raw_parts(in_sizes, rpb) };
+        match t.ingest_batch_from_regions(ptrs, sizes, row_count, npc) {
+            Ok(()) => 0,
+            Err(e) => e,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_ingest_batch_memonly(
+    handle: *mut libc::c_void,
+    in_ptrs: *const *const u8,
+    in_sizes: *const u32,
+    row_count: u32,
+    regions_per_batch: u32,
+) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        let rpb = regions_per_batch as usize;
+        let npc = t.schema().num_columns as usize - 1;
+        let ptrs = unsafe { slice::from_raw_parts(in_ptrs, rpb) };
+        let sizes = unsafe { slice::from_raw_parts(in_sizes, rpb) };
+        match t.ingest_batch_memonly_from_regions(ptrs, sizes, row_count, npc) {
+            Ok(()) => 0,
+            Err(e) => e,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_create_cursor(
+    handle: *mut libc::c_void,
+) -> *mut libc::c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        match t.create_cursor() {
+            Ok(ch) => Box::into_raw(Box::new(ch)) as *mut libc::c_void,
+            Err(_) => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_has_pk(
+    handle: *mut libc::c_void,
+    key_lo: u64, key_hi: u64,
+) -> i32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        t.has_pk(key_lo, key_hi) as i32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_retract_pk(
+    handle: *mut libc::c_void,
+    key_lo: u64, key_hi: u64,
+    out_found: *mut i32,
+) -> i64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        let (weight, found) = t.retract_pk(key_lo, key_hi);
+        unsafe { if !out_found.is_null() { *out_found = found as i32; } }
+        weight
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_get_weight(
+    handle: *mut libc::c_void,
+    key_lo: u64, key_hi: u64,
+    ref_ptrs: *const *const u8,
+    ref_sizes: *const u32,
+    ref_count: u32,
+    regions_per_batch: u32,
+) -> i64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        let rpb = regions_per_batch as usize;
+        let npc = t.schema().num_columns as usize - 1;
+        let ptrs = unsafe { slice::from_raw_parts(ref_ptrs, rpb) };
+        let sizes = unsafe { slice::from_raw_parts(ref_sizes, rpb) };
+        let ref_batch = unsafe {
+            crate::merge::parse_single_batch_from_regions(
+                ptrs, sizes, ref_count as usize, npc,
+            )
+        };
+        t.get_weight_for_row(key_lo, key_hi, &ref_batch, 0)
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_flush(handle: *mut libc::c_void) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        match t.flush() {
+            Ok(true) => 0,
+            Ok(false) => -1, // empty, nothing written
+            Err(e) => e,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_compact_if_needed(handle: *mut libc::c_void) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        match t.compact_if_needed() {
+            Ok(()) => 0,
+            Err(e) => e,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_set_has_wal(handle: *mut libc::c_void, flag: i32) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        t.set_has_wal(flag != 0);
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_current_lsn(handle: *const libc::c_void) -> u64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &*(handle as *const crate::table::Table) };
+        t.current_lsn
+    });
+    result.unwrap_or(0)
+}
+
+// Table: accumulator support
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_bloom_add(
+    handle: *mut libc::c_void, key_lo: u64, key_hi: u64,
+) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        t.bloom_add(key_lo, key_hi);
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_memtable_upsert_batch(
+    handle: *mut libc::c_void,
+    in_ptrs: *const *const u8,
+    in_sizes: *const u32,
+    row_count: u32,
+    regions_per_batch: u32,
+) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        let rpb = regions_per_batch as usize;
+        let npc = t.schema().num_columns as usize - 1;
+        let ptrs = unsafe { slice::from_raw_parts(in_ptrs, rpb) };
+        let sizes = unsafe { slice::from_raw_parts(in_sizes, rpb) };
+        let batch = unsafe {
+            crate::memtable::OwnedBatch::from_regions(ptrs, sizes, row_count as usize, npc)
+        };
+        match t.memtable_upsert_sorted_batch(batch) {
+            Ok(()) => 0,
+            Err(e) => e,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_memtable_should_flush(handle: *const libc::c_void) -> i32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &*(handle as *const crate::table::Table) };
+        t.memtable_should_flush() as i32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_memtable_is_empty(handle: *const libc::c_void) -> i32 {
+    if handle.is_null() { return 1; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &*(handle as *const crate::table::Table) };
+        t.memtable_is_empty() as i32
+    });
+    result.unwrap_or(1)
+}
+
+// Table: found-row accessors
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_found_null_word(handle: *const libc::c_void) -> u64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &*(handle as *const crate::table::Table) };
+        t.found_null_word()
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_found_col_ptr(
+    handle: *const libc::c_void, payload_col: i32, col_size: i32,
+) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &*(handle as *const crate::table::Table) };
+        t.found_col_ptr(payload_col as usize, col_size as usize)
+    });
+    result.unwrap_or(ptr::null())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_found_blob_ptr(handle: *const libc::c_void) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &*(handle as *const crate::table::Table) };
+        t.found_blob_ptr()
+    });
+    result.unwrap_or(ptr::null())
+}
+
+// Table: PartitionedTable support
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_get_snapshot(handle: *mut libc::c_void) -> *mut libc::c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &mut *(handle as *mut crate::table::Table) };
+        let arc = t.get_snapshot();
+        let snap = crate::memtable::MemTableSnapshot { inner: arc };
+        Box::into_raw(Box::new(snap)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_all_shard_ptrs(
+    handle: *const libc::c_void,
+    out_ptrs: *mut *const libc::c_void,
+    max_ptrs: u32,
+) -> i32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &*(handle as *const crate::table::Table) };
+        let ptrs = t.all_shard_ptrs();
+        let n = ptrs.len().min(max_ptrs as usize);
+        let out = unsafe { slice::from_raw_parts_mut(out_ptrs, n) };
+        for i in 0..n {
+            out[i] = ptrs[i] as *const libc::c_void;
+        }
+        n as i32
+    });
+    result.unwrap_or(0)
+}
+
+// Table: child table creation
+
+#[no_mangle]
+pub extern "C" fn gnitz_table_create_child(
+    handle: *const libc::c_void,
+    child_name: *const libc::c_char,
+    child_schema: *const crate::compact::SchemaDescriptor,
+) -> *mut libc::c_void {
+    if handle.is_null() || child_name.is_null() || child_schema.is_null() {
+        return ptr::null_mut();
+    }
+    let result = panic::catch_unwind(|| {
+        let t = unsafe { &*(handle as *const crate::table::Table) };
+        let name_s = unsafe { CStr::from_ptr(child_name) }.to_str().unwrap_or("");
+        let schema = unsafe { *child_schema };
+        match t.create_child(name_s, schema) {
+            Ok(child) => Box::into_raw(Box::new(child)) as *mut libc::c_void,
+            Err(_) => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+// ---------------------------------------------------------------------------
 // Shard Index (opaque handle for FLSM lifecycle, compaction, manifest I/O)
 // ---------------------------------------------------------------------------
 

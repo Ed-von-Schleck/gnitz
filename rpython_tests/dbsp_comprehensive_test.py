@@ -1314,10 +1314,10 @@ def _update_group_idx(b_in, gi):
         gi_acc.spk_hi = r_int64(intmask(source_pk >> 64))
         weight = b_in.get_weight(i)
         try:
-            gi.table.memtable.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, gi_acc)
+            gi.table.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, gi_acc)
         except errors.MemTableFullError:
             gi.table.flush()
-            gi.table.memtable.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, gi_acc)
+            gi.table.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, gi_acc)
 
 
 def _find_min_for_dept(b_out, dept_id):
@@ -1453,10 +1453,10 @@ def _update_avi(b_in, avi):
         ck = (r_uint128(gc_u64) << 64) | r_uint128(av_u64)
         weight = b_in.get_weight(i)
         try:
-            avi.table.memtable.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, group_index._UNIT_GI_ACC)
+            avi.table.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, group_index._UNIT_GI_ACC)
         except errors.MemTableFullError:
             avi.table.flush()
-            avi.table.memtable.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, group_index._UNIT_GI_ACC)
+            avi.table.upsert_single(r_uint64(ck), r_uint64(ck >> 64), weight, group_index._UNIT_GI_ACC)
 
 
 def test_reduce_min_agg_value_idx(base_dir):

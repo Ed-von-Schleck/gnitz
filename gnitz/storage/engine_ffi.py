@@ -205,6 +205,39 @@ eci = ExternalCompilationInfo(
         "  void *handle, int32_t dirfd, const char *basename,"
         "  uint32_t table_id, int32_t durable);",
         "void gnitz_memtable_reset(void *handle);",
+        # table (unified opaque handle)
+        "void *gnitz_table_create(const char *dir, const char *name,"
+        "  const void *schema_desc, uint32_t table_id,"
+        "  uint64_t arena_size, int32_t durable);",
+        "void gnitz_table_close(void *handle);",
+        "int32_t gnitz_table_ingest_batch("
+        "  void *handle, void **ptrs, uint32_t *sizes,"
+        "  uint32_t count, uint32_t rpb);",
+        "int32_t gnitz_table_ingest_batch_memonly("
+        "  void *handle, void **ptrs, uint32_t *sizes,"
+        "  uint32_t count, uint32_t rpb);",
+        "void *gnitz_table_create_cursor(void *handle);",
+        "int32_t gnitz_table_has_pk(void *handle, uint64_t key_lo, uint64_t key_hi);",
+        "int64_t gnitz_table_retract_pk(void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  int32_t *out_found);",
+        "int64_t gnitz_table_get_weight(void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  void **ref_ptrs, uint32_t *ref_sizes, uint32_t ref_count, uint32_t rpb);",
+        "int32_t gnitz_table_flush(void *handle);",
+        "int32_t gnitz_table_compact_if_needed(void *handle);",
+        "void gnitz_table_set_has_wal(void *handle, int32_t flag);",
+        "uint64_t gnitz_table_current_lsn(void *handle);",
+        "void gnitz_table_bloom_add(void *handle, uint64_t key_lo, uint64_t key_hi);",
+        "int32_t gnitz_table_memtable_upsert_batch("
+        "  void *handle, void **ptrs, uint32_t *sizes,"
+        "  uint32_t count, uint32_t rpb);",
+        "int32_t gnitz_table_memtable_should_flush(void *handle);",
+        "int32_t gnitz_table_memtable_is_empty(void *handle);",
+        "uint64_t gnitz_table_found_null_word(void *handle);",
+        "const uint8_t *gnitz_table_found_col_ptr(void *handle, int32_t payload_col, int32_t col_size);",
+        "const uint8_t *gnitz_table_found_blob_ptr(void *handle);",
+        "void *gnitz_table_get_snapshot(void *handle);",
+        "int32_t gnitz_table_all_shard_ptrs(void *handle, void **out_ptrs, uint32_t max_ptrs);",
+        "void *gnitz_table_create_child(void *handle, const char *name, const void *schema_desc);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -945,5 +978,164 @@ _memtable_reset = rffi.llexternal(
     "gnitz_memtable_reset",
     [rffi.VOIDP],
     lltype.Void,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Table (unified opaque handle)
+# ---------------------------------------------------------------------------
+
+_table_create = rffi.llexternal(
+    "gnitz_table_create",
+    [rffi.CCHARP, rffi.CCHARP, rffi.VOIDP, rffi.UINT, rffi.ULONGLONG, rffi.INT],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_table_close = rffi.llexternal(
+    "gnitz_table_close",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_table_ingest_batch = rffi.llexternal(
+    "gnitz_table_ingest_batch",
+    [rffi.VOIDP, rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_table_ingest_batch_memonly = rffi.llexternal(
+    "gnitz_table_ingest_batch_memonly",
+    [rffi.VOIDP, rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_table_create_cursor = rffi.llexternal(
+    "gnitz_table_create_cursor",
+    [rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_table_has_pk = rffi.llexternal(
+    "gnitz_table_has_pk",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_table_retract_pk = rffi.llexternal(
+    "gnitz_table_retract_pk",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG, rffi.INTP],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_table_get_weight = rffi.llexternal(
+    "gnitz_table_get_weight",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG,
+     rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_table_flush = rffi.llexternal(
+    "gnitz_table_flush",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_table_compact_if_needed = rffi.llexternal(
+    "gnitz_table_compact_if_needed",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_table_set_has_wal = rffi.llexternal(
+    "gnitz_table_set_has_wal",
+    [rffi.VOIDP, rffi.INT],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_table_current_lsn = rffi.llexternal(
+    "gnitz_table_current_lsn",
+    [rffi.VOIDP],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+_table_bloom_add = rffi.llexternal(
+    "gnitz_table_bloom_add",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_table_memtable_upsert_batch = rffi.llexternal(
+    "gnitz_table_memtable_upsert_batch",
+    [rffi.VOIDP, rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_table_memtable_should_flush = rffi.llexternal(
+    "gnitz_table_memtable_should_flush",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_table_memtable_is_empty = rffi.llexternal(
+    "gnitz_table_memtable_is_empty",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_table_found_null_word = rffi.llexternal(
+    "gnitz_table_found_null_word",
+    [rffi.VOIDP],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+_table_found_col_ptr = rffi.llexternal(
+    "gnitz_table_found_col_ptr",
+    [rffi.VOIDP, rffi.INT, rffi.INT],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_table_found_blob_ptr = rffi.llexternal(
+    "gnitz_table_found_blob_ptr",
+    [rffi.VOIDP],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_table_get_snapshot = rffi.llexternal(
+    "gnitz_table_get_snapshot",
+    [rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_table_all_shard_ptrs = rffi.llexternal(
+    "gnitz_table_all_shard_ptrs",
+    [rffi.VOIDP, rffi.VOIDPP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_table_create_child = rffi.llexternal(
+    "gnitz_table_create_child",
+    [rffi.VOIDP, rffi.CCHARP, rffi.VOIDP],
+    rffi.VOIDP,
     compilation_info=eci,
 )

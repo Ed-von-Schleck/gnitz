@@ -481,6 +481,43 @@ class RustUnifiedCursor(AbstractCursor):
             lltype.free(out_null, flavor="raw")
 
     @staticmethod
+    def from_handle(schema, cursor_handle):
+        """Wrap a CursorHandle from gnitz_table_create_cursor.
+
+        The cursor_handle is a void* directly from the Rust Table.
+        No snapshot/shard marshaling needed.
+        """
+        from gnitz.storage import engine_ffi
+
+        cur = RustUnifiedCursor(schema, [], [])
+        engine_ffi._read_cursor_close(cur._handle)
+        cur._handle = cursor_handle
+        cur._accessor = RustCursorAccessor(schema, cursor_handle, cur)
+        cur._estimated_len = 1000000  # conservative: forces merge-walk over swap
+
+        out_valid = lltype.malloc(rffi.INTP.TO, 1, flavor="raw")
+        out_key_lo = lltype.malloc(rffi.ULONGLONGP.TO, 1, flavor="raw")
+        out_key_hi = lltype.malloc(rffi.ULONGLONGP.TO, 1, flavor="raw")
+        out_weight = lltype.malloc(rffi.LONGLONGP.TO, 1, flavor="raw")
+        out_null = lltype.malloc(rffi.ULONGLONGP.TO, 1, flavor="raw")
+        try:
+            engine_ffi._read_cursor_seek(
+                cursor_handle,
+                rffi.cast(rffi.ULONGLONG, r_uint64(0)),
+                rffi.cast(rffi.ULONGLONG, r_uint64(0)),
+                out_valid, out_key_lo, out_key_hi, out_weight, out_null,
+            )
+            cur._update_state(out_valid, out_key_lo, out_key_hi, out_weight, out_null)
+        finally:
+            lltype.free(out_valid, flavor="raw")
+            lltype.free(out_key_lo, flavor="raw")
+            lltype.free(out_key_hi, flavor="raw")
+            lltype.free(out_weight, flavor="raw")
+            lltype.free(out_null, flavor="raw")
+
+        return cur
+
+    @staticmethod
     def from_snapshots(schema, shard_views, snapshot_handles):
         """Create a cursor from Rust-owned MemTable snapshot handles.
 
