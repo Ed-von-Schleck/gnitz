@@ -1842,6 +1842,35 @@ pub extern "C" fn gnitz_batch_blob_ptr(handle: *const libc::c_void) -> *const u8
     result.unwrap_or(ptr::null())
 }
 
+/// Append a single row from flat column data.
+/// col_ptrs[i] → payload column i data, col_sizes[i] → byte size.
+/// blob_src/blob_len → source blob arena for string relocation.
+#[no_mangle]
+pub extern "C" fn gnitz_batch_append_row(
+    handle: *mut libc::c_void,
+    pk_lo: u64, pk_hi: u64, weight: i64, null_word: u64,
+    col_ptrs: *const *const u8,
+    col_sizes: *const u32,
+    num_cols: u32,
+    blob_src: *const u8,
+    blob_len: u32,
+) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let ptrs = unsafe { slice::from_raw_parts(col_ptrs, num_cols as usize) };
+        let sizes = unsafe { slice::from_raw_parts(col_sizes, num_cols as usize) };
+        let blob = if blob_src.is_null() || blob_len == 0 {
+            &[] as &[u8]
+        } else {
+            unsafe { slice::from_raw_parts(blob_src, blob_len as usize) }
+        };
+        unsafe { b.append_row(pk_lo, pk_hi, weight, null_word, ptrs, sizes, blob); }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
 #[no_mangle]
 pub extern "C" fn gnitz_batch_append_batch(
     handle: *mut libc::c_void, src: *const libc::c_void,

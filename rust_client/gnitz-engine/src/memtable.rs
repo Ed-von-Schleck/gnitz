@@ -216,6 +216,93 @@ impl OwnedBatch {
     }
 
     /// Build the region pointer/size pairs used by `build_shard_image`.
+    /// Append a single row from flat column data.
+    ///
+    /// `col_ptrs[i]` points to the i-th payload column's value (size = col_sizes[i]).
+    /// For string columns (16-byte German String struct), long strings reference
+    /// `blob_src[offset..offset+len]` which is copied into the batch's own blob arena.
+    ///
+    /// # Safety
+    /// `col_ptrs[i]` must be valid for `col_sizes[i]` bytes.
+    pub unsafe fn append_row(
+        &mut self,
+        pk_lo: u64,
+        pk_hi: u64,
+        weight: i64,
+        null_word: u64,
+        col_ptrs: &[*const u8],
+        col_sizes: &[u32],
+        blob_src: &[u8],
+    ) {
+        self.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
+        self.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
+        self.weight.extend_from_slice(&weight.to_le_bytes());
+        self.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+
+        let schema = self.schema;
+        let pk_index = schema.map_or(usize::MAX, |s| s.pk_index as usize);
+        let mut pi = 0;
+
+        for (ci_raw, (ptr, &sz)) in col_ptrs.iter().zip(col_sizes.iter()).enumerate() {
+            // Map raw column index to schema column index (skip PK)
+            let ci = if pk_index == usize::MAX {
+                ci_raw
+            } else if ci_raw < pk_index {
+                ci_raw
+            } else {
+                ci_raw + 1
+            };
+
+            let is_string = schema.map_or(false, |s| {
+                ci < s.num_columns as usize
+                    && s.columns[ci].type_code == crate::compact::type_code::STRING
+            });
+            let is_null = (null_word >> pi) & 1 != 0;
+            let col_size = sz as usize;
+
+            if is_null {
+                let cur_len = self.col_data[pi].len();
+                self.col_data[pi].resize(cur_len + col_size, 0);
+            } else if is_string && col_size == 16 {
+                // German String struct: handle blob relocation
+                let src = std::slice::from_raw_parts(*ptr, 16);
+                let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
+                let mut dest = [0u8; 16];
+                dest[0..8].copy_from_slice(&src[0..8]); // length + prefix
+
+                if length <= crate::compact::SHORT_STRING_THRESHOLD {
+                    let sfx = if length > 4 { length - 4 } else { 0 };
+                    if sfx > 0 {
+                        dest[8..8 + sfx].copy_from_slice(&src[8..8 + sfx]);
+                    }
+                } else {
+                    let old_off = u64::from_le_bytes(src[8..16].try_into().unwrap()) as usize;
+                    if old_off + length <= blob_src.len() {
+                        let str_data = &blob_src[old_off..old_off + length];
+                        let new_off = self.blob.len();
+                        self.blob.extend_from_slice(str_data);
+                        dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
+                    } else {
+                        // Inline string data (from RowBuilder with Python strings)
+                        // The blob_src contains the raw string bytes
+                        let new_off = self.blob.len();
+                        self.blob.extend_from_slice(&blob_src[..length.min(blob_src.len())]);
+                        dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
+                    }
+                }
+                self.col_data[pi].extend_from_slice(&dest);
+            } else {
+                let src = std::slice::from_raw_parts(*ptr, col_size);
+                self.col_data[pi].extend_from_slice(src);
+            }
+            pi += 1;
+        }
+
+        self.count += 1;
+        self.sorted = false;
+        self.consolidated = false;
+    }
+
     /// Bulk-copy rows [start, end) from another OwnedBatch (same schema).
     pub fn append_batch(&mut self, src: &OwnedBatch, start: usize, end: usize) {
         let end = if end > src.count { src.count } else { end };

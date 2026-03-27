@@ -264,6 +264,35 @@ eci = ExternalCompilationInfo(
         "const uint8_t *gnitz_ptable_found_blob_ptr(void *handle);",
         "void *gnitz_ptable_create_child(void *handle, const char *name, const void *schema_desc);",
         "void gnitz_ptable_bloom_add(void *handle, uint64_t key_lo, uint64_t key_hi);",
+        # batch (OwnedBatch as first-class FFI handle)
+        "void *gnitz_batch_create(const void *schema_desc, uint32_t initial_capacity);",
+        "void gnitz_batch_free(void *handle);",
+        "void *gnitz_batch_clone(const void *handle);",
+        "void gnitz_batch_clear(void *handle);",
+        "uint32_t gnitz_batch_length(const void *handle);",
+        "int32_t gnitz_batch_is_sorted(const void *handle);",
+        "int32_t gnitz_batch_is_consolidated(const void *handle);",
+        "void gnitz_batch_set_sorted(void *handle, int32_t val);",
+        "void gnitz_batch_set_consolidated(void *handle, int32_t val);",
+        "uint64_t gnitz_batch_get_pk_lo(const void *handle, uint32_t row);",
+        "uint64_t gnitz_batch_get_pk_hi(const void *handle, uint32_t row);",
+        "int64_t gnitz_batch_get_weight(const void *handle, uint32_t row);",
+        "uint64_t gnitz_batch_get_null_word(const void *handle, uint32_t row);",
+        "const uint8_t *gnitz_batch_col_ptr(const void *handle, uint32_t row, uint32_t payload_col, uint32_t col_size);",
+        "const uint8_t *gnitz_batch_blob_ptr(const void *handle);",
+        "int32_t gnitz_batch_append_row("
+        "  void *handle, uint64_t pk_lo, uint64_t pk_hi, int64_t weight, uint64_t null_word,"
+        "  void **col_ptrs, uint32_t *col_sizes, uint32_t num_cols,"
+        "  const uint8_t *blob_src, uint32_t blob_len);",
+        "int32_t gnitz_batch_append_batch(void *handle, const void *src, uint32_t start, uint32_t end);",
+        "int32_t gnitz_batch_append_batch_negated(void *handle, const void *src, uint32_t start, uint32_t end);",
+        "void *gnitz_batch_to_sorted(const void *handle, const void *schema_desc);",
+        "void *gnitz_batch_to_consolidated(const void *handle, const void *schema_desc);",
+        "void *gnitz_batch_scatter_copy(const void *src, const uint32_t *indices, uint32_t num_indices, const void *schema_desc);",
+        "const uint8_t *gnitz_batch_region_ptr(const void *handle, uint32_t idx);",
+        "uint32_t gnitz_batch_region_size(const void *handle, uint32_t idx);",
+        "uint32_t gnitz_batch_num_regions(const void *handle);",
+        "void *gnitz_batch_from_regions(const void *schema_desc, void **ptrs, uint32_t *sizes, uint32_t count, uint32_t rpb);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -1245,4 +1274,92 @@ _ptable_bloom_add = rffi.llexternal(
     "gnitz_ptable_bloom_add",
     [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
     lltype.Void, compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Batch (OwnedBatch as first-class FFI handle)
+# ---------------------------------------------------------------------------
+
+_batch_create = rffi.llexternal(
+    "gnitz_batch_create", [rffi.VOIDP, rffi.UINT], rffi.VOIDP, compilation_info=eci,
+)
+_batch_free = rffi.llexternal(
+    "gnitz_batch_free", [rffi.VOIDP], lltype.Void, compilation_info=eci,
+)
+_batch_clone = rffi.llexternal(
+    "gnitz_batch_clone", [rffi.VOIDP], rffi.VOIDP, compilation_info=eci,
+)
+_batch_clear = rffi.llexternal(
+    "gnitz_batch_clear", [rffi.VOIDP], lltype.Void, compilation_info=eci,
+)
+_batch_length = rffi.llexternal(
+    "gnitz_batch_length", [rffi.VOIDP], rffi.UINT, compilation_info=eci,
+)
+_batch_is_sorted = rffi.llexternal(
+    "gnitz_batch_is_sorted", [rffi.VOIDP], rffi.INT, compilation_info=eci,
+)
+_batch_is_consolidated = rffi.llexternal(
+    "gnitz_batch_is_consolidated", [rffi.VOIDP], rffi.INT, compilation_info=eci,
+)
+_batch_set_sorted = rffi.llexternal(
+    "gnitz_batch_set_sorted", [rffi.VOIDP, rffi.INT], lltype.Void, compilation_info=eci,
+)
+_batch_set_consolidated = rffi.llexternal(
+    "gnitz_batch_set_consolidated", [rffi.VOIDP, rffi.INT], lltype.Void, compilation_info=eci,
+)
+_batch_get_pk_lo = rffi.llexternal(
+    "gnitz_batch_get_pk_lo", [rffi.VOIDP, rffi.UINT], rffi.ULONGLONG, compilation_info=eci,
+)
+_batch_get_pk_hi = rffi.llexternal(
+    "gnitz_batch_get_pk_hi", [rffi.VOIDP, rffi.UINT], rffi.ULONGLONG, compilation_info=eci,
+)
+_batch_get_weight = rffi.llexternal(
+    "gnitz_batch_get_weight", [rffi.VOIDP, rffi.UINT], rffi.LONGLONG, compilation_info=eci,
+)
+_batch_get_null_word = rffi.llexternal(
+    "gnitz_batch_get_null_word", [rffi.VOIDP, rffi.UINT], rffi.ULONGLONG, compilation_info=eci,
+)
+_batch_col_ptr = rffi.llexternal(
+    "gnitz_batch_col_ptr", [rffi.VOIDP, rffi.UINT, rffi.UINT, rffi.UINT],
+    rffi.CCHARP, compilation_info=eci,
+)
+_batch_blob_ptr = rffi.llexternal(
+    "gnitz_batch_blob_ptr", [rffi.VOIDP], rffi.CCHARP, compilation_info=eci,
+)
+_batch_append_row = rffi.llexternal(
+    "gnitz_batch_append_row",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG, rffi.LONGLONG, rffi.ULONGLONG,
+     rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.CCHARP, rffi.UINT],
+    rffi.INT, compilation_info=eci,
+)
+_batch_append_batch = rffi.llexternal(
+    "gnitz_batch_append_batch", [rffi.VOIDP, rffi.VOIDP, rffi.UINT, rffi.UINT],
+    rffi.INT, compilation_info=eci,
+)
+_batch_append_batch_negated = rffi.llexternal(
+    "gnitz_batch_append_batch_negated", [rffi.VOIDP, rffi.VOIDP, rffi.UINT, rffi.UINT],
+    rffi.INT, compilation_info=eci,
+)
+_batch_to_sorted = rffi.llexternal(
+    "gnitz_batch_to_sorted", [rffi.VOIDP, rffi.VOIDP], rffi.VOIDP, compilation_info=eci,
+)
+_batch_to_consolidated = rffi.llexternal(
+    "gnitz_batch_to_consolidated", [rffi.VOIDP, rffi.VOIDP], rffi.VOIDP, compilation_info=eci,
+)
+_batch_scatter_copy = rffi.llexternal(
+    "gnitz_batch_scatter_copy", [rffi.VOIDP, rffi.UINTP, rffi.UINT, rffi.VOIDP],
+    rffi.VOIDP, compilation_info=eci,
+)
+_batch_region_ptr = rffi.llexternal(
+    "gnitz_batch_region_ptr", [rffi.VOIDP, rffi.UINT], rffi.CCHARP, compilation_info=eci,
+)
+_batch_region_size = rffi.llexternal(
+    "gnitz_batch_region_size", [rffi.VOIDP, rffi.UINT], rffi.UINT, compilation_info=eci,
+)
+_batch_num_regions = rffi.llexternal(
+    "gnitz_batch_num_regions", [rffi.VOIDP], rffi.UINT, compilation_info=eci,
+)
+_batch_from_regions = rffi.llexternal(
+    "gnitz_batch_from_regions", [rffi.VOIDP, rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
+    rffi.VOIDP, compilation_info=eci,
 )
