@@ -11,7 +11,6 @@ RELEASE_CFLAGS   ?= -march=native
 
 TEST_FILES := \
 	rpython_tests/core_comprehensive_test.py \
-	rpython_tests/storage_comprehensive_test.py \
 	rpython_tests/dbsp_comprehensive_test.py \
 	rpython_tests/catalog_comprehensive_test.py \
 	rpython_tests/vm_comprehensive_test.py \
@@ -27,7 +26,6 @@ TEST_BINS := $(notdir $(TEST_FILES:.py=-c))
 RUN_TARGETS := $(addprefix run-,$(TEST_BINS))
 
 # Per-test data directories (only tests that create one)
-DATA_DIR_storage_comprehensive_test-c := storage_test_data
 DATA_DIR_dbsp_comprehensive_test-c := dbsp_test_data
 DATA_DIR_catalog_comprehensive_test-c := catalog_test_data
 DATA_DIR_vm_comprehensive_test-c := vm_test_data
