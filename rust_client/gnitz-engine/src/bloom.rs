@@ -20,25 +20,13 @@ impl BloomFilter {
     }
 
     pub fn add(&mut self, key_lo: u64, key_hi: u64) {
-        let h = xxh::hash_u128(key_lo, key_hi);
-        let h1 = h;
-        let h2 = (h >> 32) | 1;
-        for i in 0..NUM_PROBES as u64 {
-            let pos = (h1.wrapping_add(i.wrapping_mul(h2))) % self.num_bits;
-            let byte_idx = (pos >> 3) as usize;
-            let bit_mask = 1u8 << (pos & 7);
+        for (byte_idx, bit_mask) in self.probe_positions(key_lo, key_hi) {
             self.bits[byte_idx] |= bit_mask;
         }
     }
 
     pub fn may_contain(&self, key_lo: u64, key_hi: u64) -> bool {
-        let h = xxh::hash_u128(key_lo, key_hi);
-        let h1 = h;
-        let h2 = (h >> 32) | 1;
-        for i in 0..NUM_PROBES as u64 {
-            let pos = (h1.wrapping_add(i.wrapping_mul(h2))) % self.num_bits;
-            let byte_idx = (pos >> 3) as usize;
-            let bit_mask = 1u8 << (pos & 7);
+        for (byte_idx, bit_mask) in self.probe_positions(key_lo, key_hi) {
             if self.bits[byte_idx] & bit_mask == 0 {
                 return false;
             }
@@ -46,8 +34,34 @@ impl BloomFilter {
         true
     }
 
+    fn probe_positions(&self, key_lo: u64, key_hi: u64) -> ProbeIter {
+        let h = xxh::hash_u128(key_lo, key_hi);
+        ProbeIter { h1: h, h2: (h >> 32) | 1, num_bits: self.num_bits, i: 0 }
+    }
+
     pub fn reset(&mut self) {
         self.bits.fill(0);
+    }
+}
+
+struct ProbeIter {
+    h1: u64,
+    h2: u64,
+    num_bits: u64,
+    i: u64,
+}
+
+impl Iterator for ProbeIter {
+    type Item = (usize, u8);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= NUM_PROBES as u64 {
+            return None;
+        }
+        let pos = (self.h1.wrapping_add(self.i.wrapping_mul(self.h2))) % self.num_bits;
+        self.i += 1;
+        Some(((pos >> 3) as usize, 1u8 << (pos & 7)))
     }
 }
 

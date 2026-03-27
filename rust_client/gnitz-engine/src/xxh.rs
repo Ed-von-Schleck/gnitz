@@ -1,8 +1,6 @@
 use xxhash_rust::xxh3::xxh3_64;
 
-/// Hash a 128-bit key (lo, hi) with optional seeds to a 64-bit hash.
-/// XORs inputs with seeds, lays out as [lo^seed_lo LE, hi^seed_hi LE],
-/// then hashes the 16 bytes with XXH3-64.
+/// Hash a 128-bit key (lo, hi) with optional seeds to a 64-bit hash via XXH3-64.
 #[inline]
 pub fn hash_u128_seeded(lo: u64, hi: u64, seed_lo: u64, seed_hi: u64) -> u64 {
     let mut buf = [0u8; 16];
@@ -11,15 +9,13 @@ pub fn hash_u128_seeded(lo: u64, hi: u64, seed_lo: u64, seed_hi: u64) -> u64 {
     xxh3_64(&buf)
 }
 
-/// Hash a 128-bit key (lo, hi) to a 64-bit hash.
-/// Lays out [lo:u64 LE, hi:u64 LE] as 16 bytes and hashes with XXH3-64.
+/// Hash a 128-bit key (lo, hi) to a 64-bit hash via XXH3-64.
 #[inline]
 pub fn hash_u128(lo: u64, hi: u64) -> u64 {
     hash_u128_seeded(lo, hi, 0, 0)
 }
 
-/// Compute XXH3-64 checksum over arbitrary bytes.
-/// Compatible with C `XXH3_64bits(data, len)` (no seed).
+/// Compute XXH3-64 checksum over arbitrary bytes (no seed).
 #[inline]
 pub fn checksum(data: &[u8]) -> u64 {
     xxh3_64(data)
@@ -38,12 +34,6 @@ mod tests {
     fn different_keys_differ() {
         assert_ne!(hash_u128(1, 2), hash_u128(2, 1));
         assert_ne!(hash_u128(0, 0), hash_u128(0, 1));
-    }
-
-    #[test]
-    fn zero_key() {
-        let h = hash_u128(0, 0);
-        let _ = h;
     }
 
     #[test]

@@ -2,6 +2,7 @@ use crate::xxh;
 use xorf::{Filter, Xor8};
 
 const MAGIC: &[u8; 4] = b"GXF1";
+const HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + seed + block_length + fp_count
 
 /// Build an Xor8 filter from parallel arrays of (pk_lo, pk_hi).
 /// Returns None if the input is empty.
@@ -36,8 +37,7 @@ pub fn may_contain(filter: &Xor8, key_lo: u64, key_hi: u64) -> bool {
 /// Format: [magic:4B "GXF1"][seed:u64 LE][block_length:u32 LE][fp_count:u32 LE][fingerprints]
 pub fn serialize(filter: &Xor8) -> Vec<u8> {
     let fp_count = filter.fingerprints.len() as u32;
-    let total = 4 + 8 + 4 + 4 + filter.fingerprints.len();
-    let mut buf = Vec::with_capacity(total);
+    let mut buf = Vec::with_capacity(serialized_size(filter));
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&filter.seed.to_le_bytes());
     buf.extend_from_slice(&(filter.block_length as u32).to_le_bytes());
@@ -49,8 +49,7 @@ pub fn serialize(filter: &Xor8) -> Vec<u8> {
 /// Deserialize an Xor8 filter from bytes.
 /// Returns None if the buffer is too short, has wrong magic, or is internally inconsistent.
 pub fn deserialize(buf: &[u8]) -> Option<Xor8> {
-    // Minimum: 4 (magic) + 8 (seed) + 4 (block_length) + 4 (fp_count) = 20 bytes
-    if buf.len() < 20 {
+    if buf.len() < HEADER_SIZE {
         return None;
     }
     if &buf[..4] != MAGIC {
@@ -67,10 +66,10 @@ pub fn deserialize(buf: &[u8]) -> Option<Xor8> {
     if fp_count != 3 * block_length {
         return None;
     }
-    if buf.len() < 20 + fp_count {
+    if buf.len() < HEADER_SIZE + fp_count {
         return None;
     }
-    let fingerprints = buf[20..20 + fp_count].to_vec().into_boxed_slice();
+    let fingerprints = buf[HEADER_SIZE..HEADER_SIZE + fp_count].to_vec().into_boxed_slice();
     Some(Xor8 {
         seed,
         block_length,
@@ -80,7 +79,7 @@ pub fn deserialize(buf: &[u8]) -> Option<Xor8> {
 
 /// Returns the serialized size of a filter.
 pub fn serialized_size(filter: &Xor8) -> usize {
-    4 + 8 + 4 + 4 + filter.fingerprints.len()
+    HEADER_SIZE + filter.fingerprints.len()
 }
 
 #[cfg(test)]
