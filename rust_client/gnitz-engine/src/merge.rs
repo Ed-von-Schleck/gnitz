@@ -495,10 +495,8 @@ pub fn fill_output_sizes(
     let count = writer.row_count();
     let pk_index = schema.pk_index as usize;
 
-    out_sizes[0] = (count * 8) as u32; // pk_lo
-    out_sizes[1] = (count * 8) as u32; // pk_hi
-    out_sizes[2] = (count * 8) as u32; // weight
-    out_sizes[3] = (count * 8) as u32; // null_bmp
+    let system_size = (count * 8) as u32;
+    out_sizes[..4].fill(system_size);
 
     let mut payload_idx = 0usize;
     for ci in 0..schema.num_columns as usize {

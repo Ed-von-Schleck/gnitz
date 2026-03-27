@@ -268,22 +268,18 @@ impl ShardWriter {
         self.weight.extend_from_slice(&weight.to_le_bytes());
 
         let pk_index = self.schema.pk_index as usize;
-        let mut null_word: u64 = 0;
-        let mut payload_idx: usize = 0;
+        let null_word = shard.get_null_word(row);
+        self.null_bitmap.extend_from_slice(&null_word.to_le_bytes());
 
+        let mut payload_idx: usize = 0;
         for ci in 0..self.schema.num_columns as usize {
             if ci == pk_index {
                 continue;
             }
-            let is_null = is_null(shard, row, ci, pk_index);
-            if is_null {
-                let null_bit_pos = if ci < pk_index { ci } else { ci - 1 };
-                null_word |= 1u64 << null_bit_pos;
-            }
-            self.write_column(ci, payload_idx, is_null, shard, row);
+            let col_is_null = (null_word >> payload_idx) & 1 != 0;
+            self.write_column(ci, payload_idx, col_is_null, shard, row);
             payload_idx += 1;
         }
-        self.null_bitmap.extend_from_slice(&null_word.to_le_bytes());
     }
 
     fn write_column(
@@ -298,7 +294,8 @@ impl ShardWriter {
         let col_size = col.size as usize;
 
         if is_null {
-            self.col_bufs[col_idx].extend(std::iter::repeat(0u8).take(col_size));
+            let len = self.col_bufs[col_idx].len();
+            self.col_bufs[col_idx].resize(len + col_size, 0);
             return;
         }
 
@@ -353,11 +350,12 @@ impl ShardWriter {
 
     fn finalize(&self, path: &CStr, table_id: u32) -> i32 {
         let pk_index = self.schema.pk_index as usize;
-        let mut regions: Vec<(*const u8, usize)> = Vec::new();
-        regions.push((self.pk_lo.as_ptr(), self.pk_lo.len()));
-        regions.push((self.pk_hi.as_ptr(), self.pk_hi.len()));
-        regions.push((self.weight.as_ptr(), self.weight.len()));
-        regions.push((self.null_bitmap.as_ptr(), self.null_bitmap.len()));
+        let mut regions: Vec<(*const u8, usize)> = vec![
+            (self.pk_lo.as_ptr(), self.pk_lo.len()),
+            (self.pk_hi.as_ptr(), self.pk_hi.len()),
+            (self.weight.as_ptr(), self.weight.len()),
+            (self.null_bitmap.as_ptr(), self.null_bitmap.len()),
+        ];
         for ci in 0..self.schema.num_columns as usize {
             if ci == pk_index {
                 continue;
@@ -400,36 +398,31 @@ fn find_guard_for_key(guard_keys: &[(u64, u64)], key: u128) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Entry points
+// Shared merge infrastructure
 // ---------------------------------------------------------------------------
 
-pub fn compact_shards(
+/// Open input shards, build cursors and heap, run N-way merge loop.
+/// Calls `emit(key, net_weight, shard, row)` for each non-ghost consolidated row.
+fn open_and_merge(
     input_files: &[&CStr],
-    output_file: &CStr,
     schema: &SchemaDescriptor,
-    table_id: u32,
-) -> i32 {
-    // Open all input shards
+    mut emit: impl FnMut(u128, i64, &MappedShard, usize),
+) -> Result<(), i32> {
     let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
     for f in input_files {
         match MappedShard::open(f, schema, false) {
             Ok(s) => shards.push(s),
-            Err(e) => return e,
+            Err(e) => return Err(e),
         }
     }
 
-    // Create cursors
     let mut cursors: Vec<ShardCursor> = Vec::with_capacity(shards.len());
     for i in 0..shards.len() {
         cursors.push(ShardCursor::new(i, &shards[i]));
     }
 
-    // Key-only comparison for heap ordering
-    let key_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> bool {
-        a.key < b.key
-    };
+    let key_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| a.key < b.key;
 
-    // Build heap (key-only ordering for compact)
     let mut tree = MergeHeap::build(
         cursors.len(),
         |i| {
@@ -442,15 +435,10 @@ pub fn compact_shards(
         &key_less,
     );
 
-    // Create writer
-    let mut writer = ShardWriter::new(schema);
-
-    // Merge loop — reusable buffer to avoid per-iteration allocation
     let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
     while !tree.is_empty() {
         let min_key = tree.min_key();
 
-        // collect_min_indices: compare (key, payload) to root
         let num_min = tree.collect_min_indices(
             &|a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> std::cmp::Ordering {
                 let key_ord = a.key.cmp(&b.key);
@@ -477,10 +465,9 @@ pub fn compact_shards(
             let exemplar = tree.min_indices[0];
             let shard_idx = cursors[exemplar].shard_idx;
             let row = cursors[exemplar].position;
-            writer.add_row_from_shard(min_key, net_weight, &shards[shard_idx], row);
+            emit(min_key, net_weight, &shards[shard_idx], row);
         }
 
-        // Copy indices to reusable buffer to avoid borrow conflict
         advance_buf.clear();
         advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
         for &ci in &advance_buf {
@@ -495,12 +482,26 @@ pub fn compact_shards(
         }
     }
 
-    // Finalize output
-    let rc = writer.finalize(output_file, table_id);
-    match rc {
-        0 => 0,
-        e => e,
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
+pub fn compact_shards(
+    input_files: &[&CStr],
+    output_file: &CStr,
+    schema: &SchemaDescriptor,
+    table_id: u32,
+) -> i32 {
+    let mut writer = ShardWriter::new(schema);
+    if let Err(e) = open_and_merge(input_files, schema, |key, weight, shard, row| {
+        writer.add_row_from_shard(key, weight, shard, row);
+    }) {
+        return e;
     }
+    writer.finalize(output_file, table_id)
 }
 
 pub fn merge_and_route(
@@ -514,130 +515,48 @@ pub fn merge_and_route(
     out_results: &mut [GuardResult],
 ) -> i32 {
     let num_guards = guard_keys.len();
-
-    // Open all input shards
-    let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
-    for f in input_files {
-        match MappedShard::open(f, schema, false) {
-            Ok(s) => shards.push(s),
-            Err(e) => return e,
-        }
-    }
-
-    // Create cursors
-    let mut cursors: Vec<ShardCursor> = Vec::with_capacity(shards.len());
-    for i in 0..shards.len() {
-        cursors.push(ShardCursor::new(i, &shards[i]));
-    }
-
-    // Key-only comparison for heap ordering
-    let key_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> bool {
-        a.key < b.key
-    };
-
-    // Build heap
-    let mut tree = MergeHeap::build(
-        cursors.len(),
-        |i| {
-            if cursors[i].is_valid() {
-                Some(cursors[i].peek_key(&shards[cursors[i].shard_idx]))
-            } else {
-                None
-            }
-        },
-        &key_less,
-    );
-
-    // Create writers (one per guard)
-    let mut writers: Vec<ShardWriter> = Vec::with_capacity(num_guards);
     let out_dir_str = output_dir.to_str().unwrap_or("");
+
+    let mut writers: Vec<ShardWriter> = Vec::with_capacity(num_guards);
     let mut out_filenames: Vec<String> = Vec::with_capacity(num_guards);
     for i in 0..num_guards {
         writers.push(ShardWriter::new(schema));
         out_filenames.push(format!(
-            "{}/shard_{}_{}_{}_G{}.db",
-            out_dir_str,
-            table_id,
-            lsn_tag,
-            format!("L{}", level_num),
-            i
+            "{}/shard_{}_{}_L{}_G{}.db",
+            out_dir_str, table_id, lsn_tag, level_num, i
         ));
     }
 
-    // Merge loop with routing — reusable buffer
-    let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
-    while !tree.is_empty() {
-        let min_key = tree.min_key();
-
-        let num_min = tree.collect_min_indices(
-            &|a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> std::cmp::Ordering {
-                let key_ord = a.key.cmp(&b.key);
-                if key_ord != std::cmp::Ordering::Equal {
-                    return key_ord;
-                }
-                let ca = &cursors[a.idx];
-                let cb = &cursors[b.idx];
-                columnar::compare_rows(
-                    schema,
-                    &shards[ca.shard_idx], ca.position,
-                    &shards[cb.shard_idx], cb.position,
-                )
-            },
-        );
-
-        let mut net_weight: i64 = 0;
-        for i in 0..num_min {
-            let ci = tree.min_indices[i];
-            net_weight += cursors[ci].weight(&shards[cursors[ci].shard_idx]);
-        }
-
-        if net_weight != 0 {
-            let guard_idx = find_guard_for_key(guard_keys, min_key);
-            let exemplar = tree.min_indices[0];
-            let shard_idx = cursors[exemplar].shard_idx;
-            let row = cursors[exemplar].position;
-            writers[guard_idx].add_row_from_shard(min_key, net_weight, &shards[shard_idx], row);
-        }
-
-        advance_buf.clear();
-        advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
-        for &ci in &advance_buf {
-            let shard = &shards[cursors[ci].shard_idx];
-            cursors[ci].advance(shard);
-            let new_key = if cursors[ci].is_valid() {
-                Some(cursors[ci].peek_key(&shards[cursors[ci].shard_idx]))
-            } else {
-                None
-            };
-            tree.advance(ci, new_key, &key_less);
-        }
+    if let Err(e) = open_and_merge(input_files, schema, |key, weight, shard, row| {
+        let guard_idx = find_guard_for_key(guard_keys, key);
+        writers[guard_idx].add_row_from_shard(key, weight, shard, row);
+    }) {
+        return e;
     }
 
-    // Finalize non-empty writers, build results
     let mut result_count: i32 = 0;
     for i in 0..num_guards {
-        if writers[i].count > 0 {
-            let cpath = std::ffi::CString::new(out_filenames[i].as_str()).unwrap();
-            let frc = writers[i].finalize(&cpath, table_id);
-            match frc {
-                0 => {
-                    // Check file exists
-                    if std::path::Path::new(&out_filenames[i]).exists() {
-                        let ri = result_count as usize;
-                        if ri < out_results.len() {
-                            out_results[ri].guard_key_lo = guard_keys[i].0;
-                            out_results[ri].guard_key_hi = guard_keys[i].1;
-                            let name_bytes = out_filenames[i].as_bytes();
-                            let len = name_bytes.len().min(255);
-                            out_results[ri].filename[..len].copy_from_slice(&name_bytes[..len]);
-                            out_results[ri].filename[len] = 0;
-                        }
-                        result_count += 1;
-                    }
-                }
-                e => return e,
-            }
+        if writers[i].count == 0 {
+            continue;
         }
+        let cpath = std::ffi::CString::new(out_filenames[i].as_str()).unwrap();
+        let frc = writers[i].finalize(&cpath, table_id);
+        if frc != 0 {
+            return frc;
+        }
+        if !std::path::Path::new(&out_filenames[i]).exists() {
+            continue;
+        }
+        let ri = result_count as usize;
+        if ri < out_results.len() {
+            out_results[ri].guard_key_lo = guard_keys[i].0;
+            out_results[ri].guard_key_hi = guard_keys[i].1;
+            let name_bytes = out_filenames[i].as_bytes();
+            let len = name_bytes.len().min(255);
+            out_results[ri].filename[..len].copy_from_slice(&name_bytes[..len]);
+            out_results[ri].filename[len] = 0;
+        }
+        result_count += 1;
     }
 
     result_count
