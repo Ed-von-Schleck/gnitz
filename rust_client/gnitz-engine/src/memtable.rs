@@ -11,14 +11,10 @@ use crate::columnar::{self, ColumnarSource};
 use crate::compact::SchemaDescriptor;
 use crate::merge::{self, MemBatch};
 use crate::shard_file;
-use crate::util::read_u64_le;
+use crate::util::{read_i64_le, read_u64_le};
 
 /// Error code returned when the MemTable exceeds its capacity.
 pub const ERR_CAPACITY: i32 = -2;
-
-// ---------------------------------------------------------------------------
-// OwnedBatch: the Rust-owned equivalent of MemBatch<'a>
-// ---------------------------------------------------------------------------
 
 /// Owned columnar batch.  Stores the same SoA layout as RPython's
 /// `ArenaZSetBatch` but in Rust `Vec<u8>` buffers.
@@ -138,7 +134,7 @@ impl OwnedBatch {
 
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
-        i64::from_le_bytes(self.weight[row * 8..row * 8 + 8].try_into().unwrap())
+        read_i64_le(&self.weight, row * 8)
     }
 
     #[inline]
@@ -150,6 +146,74 @@ impl OwnedBatch {
     pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         let off = row * col_size;
         &self.col_data[payload_col][off..off + col_size]
+    }
+
+    /// Scatter-copy selected rows from a MemBatch into a new OwnedBatch.
+    pub fn from_indexed_rows(
+        batch: &MemBatch,
+        indices: &[u32],
+        schema: &SchemaDescriptor,
+    ) -> Self {
+        let n = indices.len();
+        if n == 0 {
+            let npc = schema.num_columns as usize - 1;
+            return Self::empty(npc);
+        }
+
+        let npc = schema.num_columns as usize - 1;
+        let pk_index = schema.pk_index as usize;
+        let blob_cap = batch.blob.len().max(1);
+
+        let mut out_pk_lo = vec![0u8; n * 8];
+        let mut out_pk_hi = vec![0u8; n * 8];
+        let mut out_weight = vec![0u8; n * 8];
+        let mut out_null = vec![0u8; n * 8];
+        let mut out_cols: Vec<Vec<u8>> = Vec::with_capacity(npc);
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index { continue; }
+            let cs = schema.columns[ci].size as usize;
+            out_cols.push(vec![0u8; n * cs]);
+        }
+        let mut out_blob = vec![0u8; blob_cap];
+
+        let col_slices: Vec<&mut [u8]> = unsafe {
+            out_cols.iter_mut()
+                .map(|v| std::slice::from_raw_parts_mut(v.as_mut_ptr(), v.len()))
+                .collect()
+        };
+
+        let mut writer = merge::DirectWriter::new(
+            &mut out_pk_lo, &mut out_pk_hi, &mut out_weight, &mut out_null,
+            col_slices, &mut out_blob, *schema,
+        );
+
+        merge::scatter_copy(batch, indices, &[], &mut writer);
+
+        let actual_rows = writer.row_count();
+        let actual_blob = writer.blob_written();
+
+        out_pk_lo.truncate(actual_rows * 8);
+        out_pk_hi.truncate(actual_rows * 8);
+        out_weight.truncate(actual_rows * 8);
+        out_null.truncate(actual_rows * 8);
+        let mut pi = 0;
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index { continue; }
+            let cs = schema.columns[ci].size as usize;
+            out_cols[pi].truncate(actual_rows * cs);
+            pi += 1;
+        }
+        out_blob.truncate(actual_blob);
+
+        OwnedBatch {
+            pk_lo: out_pk_lo,
+            pk_hi: out_pk_hi,
+            weight: out_weight,
+            null_bmp: out_null,
+            col_data: out_cols,
+            blob: out_blob,
+            count: actual_rows,
+        }
     }
 
     pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
@@ -197,10 +261,6 @@ impl ColumnarSource for OwnedBatch {
     }
 }
 
-// ---------------------------------------------------------------------------
-// consolidate helpers: merge N runs → single OwnedBatch
-// ---------------------------------------------------------------------------
-
 /// Merge N sorted MemBatch views into a single consolidated OwnedBatch.
 /// Uses the existing `merge::merge_batches` infrastructure.
 fn consolidate_batches(
@@ -220,7 +280,7 @@ fn consolidate_batches(
         return OwnedBatch::empty(num_payload_cols);
     }
 
-    let blob_cap = total_blob.max(1);
+    let blob_cap = total_blob;
 
     // Allocate output Vecs with upper-bound capacity, filled to len
     let mut out_pk_lo = vec![0u8; total_rows * 8];
@@ -295,18 +355,10 @@ fn consolidate_batches(
 }
 
 
-// ---------------------------------------------------------------------------
-// MemTableSnapshot
-// ---------------------------------------------------------------------------
-
-/// Opaque snapshot handle returned to RPython.
+/// Snapshot handle returned to RPython.
 pub struct MemTableSnapshot {
     pub inner: Arc<OwnedBatch>,
 }
-
-// ---------------------------------------------------------------------------
-// MemTable
-// ---------------------------------------------------------------------------
 
 pub struct MemTable {
     runs: Vec<OwnedBatch>,
@@ -525,10 +577,6 @@ impl MemTable {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

@@ -6,9 +6,7 @@ use libc::c_int;
 use crate::util::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use crate::xxh;
 
-// ---------------------------------------------------------------------------
-// WAL block header layout (48 bytes)
-// ---------------------------------------------------------------------------
+//  WAL block header layout (48 bytes):
 //  [0,8)   LSN        u64
 //  [8,12)  TID        u32
 //  [12,16) COUNT      u32
@@ -35,11 +33,15 @@ fn align8(val: usize) -> usize {
     (val + 7) & !7
 }
 
-// Local helpers removed — using crate::util::{read_u32_le, read_u64_le, ...}
-
-// ---------------------------------------------------------------------------
-// Encode
-// ---------------------------------------------------------------------------
+/// Compute the total byte size of a WAL block with the given regions.
+fn block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
+    let mut pos = HEADER_SIZE + num_regions * 8;
+    for i in 0..num_regions {
+        pos = align8(pos);
+        pos += region_sizes[i] as usize;
+    }
+    pos
+}
 
 /// Encode a WAL block from region data into `out_buf` starting at `out_offset`.
 ///
@@ -62,25 +64,15 @@ pub fn encode(
 ) -> i64 {
     let num_regions = region_ptrs.len().min(region_sizes.len());
     let dir_size = num_regions * 8;
-
-    // First pass: compute total block size
-    let mut pos = HEADER_SIZE + dir_size;
-    for i in 0..num_regions {
-        pos = align8(pos);
-        pos += region_sizes[i] as usize;
-    }
-    let total_size = pos;
+    let total_size = block_size(num_regions, region_sizes);
 
     if out_offset + total_size > out_buf.len() {
         return -1;
     }
 
     let block = &mut out_buf[out_offset..out_offset + total_size];
-
-    // Zero the header
     block[..HEADER_SIZE].fill(0);
 
-    // Write region data + directory entries
     let mut pos = HEADER_SIZE + dir_size;
     for i in 0..num_regions {
         pos = align8(pos);
@@ -90,14 +82,12 @@ pub fn encode(
                 ptr::copy_nonoverlapping(region_ptrs[i], block[pos..].as_mut_ptr(), sz);
             }
         }
-        // Directory entry: (offset_u32, size_u32) relative to block start
         let dir_off = HEADER_SIZE + i * 8;
         write_u32_le(block, dir_off, pos as u32);
         write_u32_le(block, dir_off + 4, sz as u32);
         pos += sz;
     }
 
-    // Backfill header
     write_u64_le(block, OFF_LSN, lsn);
     write_u32_le(block, OFF_TID, table_id);
     write_u32_le(block, OFF_COUNT, entry_count);
@@ -106,7 +96,6 @@ pub fn encode(
     write_u32_le(block, OFF_NUM_REGIONS, num_regions as u32);
     write_u64_le(block, OFF_BLOB_SIZE, blob_size);
 
-    // Checksum over body (everything after header)
     if total_size > HEADER_SIZE {
         let cs = xxh::checksum(&block[HEADER_SIZE..total_size]);
         write_u64_le(block, OFF_CHECKSUM, cs);
@@ -114,10 +103,6 @@ pub fn encode(
 
     (out_offset + total_size) as i64
 }
-
-// ---------------------------------------------------------------------------
-// Decode (validate + parse)
-// ---------------------------------------------------------------------------
 
 /// Error codes for validate_and_parse.
 pub const WAL_OK: i32 = 0;
@@ -157,7 +142,6 @@ pub fn validate_and_parse(
         return WAL_ERR_TRUNCATED;
     }
 
-    // Verify checksum
     let expected_cs = read_u64_le(block, OFF_CHECKSUM);
     if total_size > HEADER_SIZE {
         let actual_cs = xxh::checksum(&block[HEADER_SIZE..total_size]);
@@ -166,7 +150,6 @@ pub fn validate_and_parse(
         }
     }
 
-    // Extract header fields
     *out_lsn = read_u64_le(block, OFF_LSN);
     *out_tid = read_u32_le(block, OFF_TID);
     *out_count = read_u32_le(block, OFF_COUNT);
@@ -174,7 +157,6 @@ pub fn validate_and_parse(
     *out_num_regions = num_regions;
     *out_blob_size = read_u64_le(block, OFF_BLOB_SIZE);
 
-    // Parse directory entries
     let n = (num_regions as usize).min(max_regions as usize);
     for i in 0..n {
         let dir_off = HEADER_SIZE + i * 8;
@@ -187,10 +169,6 @@ pub fn validate_and_parse(
 
     WAL_OK
 }
-
-// ---------------------------------------------------------------------------
-// WAL Writer (file lifecycle)
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct WalWriter {
@@ -231,31 +209,23 @@ impl WalWriter {
             return 0;
         }
         let num_regions = region_ptrs.len().min(region_sizes.len());
+        let needed = block_size(num_regions, region_sizes);
 
-        // Compute needed buffer size
-        let dir_size = num_regions * 8;
-        let mut needed = HEADER_SIZE + dir_size;
-        for i in 0..num_regions {
-            needed = (needed + 7) & !7; // 8-byte align
-            needed += region_sizes[i] as usize;
-        }
-
-        // Grow scratch buffer if needed (stays at high-water mark)
         if self.buf.len() < needed {
             self.buf.resize(needed, 0);
         }
 
-        let new_offset = encode(
+        let written = encode(
             &mut self.buf, 0, lsn, table_id, count,
             region_ptrs, region_sizes, blob_size,
         );
-        if new_offset < 0 {
+        if written < 0 {
             return -3;
         }
-        let block_size = new_offset as usize;
+        let written = written as usize;
 
         unsafe {
-            let rc = crate::util::write_all_fd(self.fd, &self.buf[..block_size]);
+            let rc = crate::util::write_all_fd(self.fd, &self.buf[..written]);
             if rc < 0 {
                 return rc;
             }
@@ -287,10 +257,6 @@ impl Drop for WalWriter {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// WAL Reader (file lifecycle)
-// ---------------------------------------------------------------------------
 
 pub struct WalReader {
     fd: c_int,
@@ -368,7 +334,6 @@ impl WalReader {
             std::slice::from_raw_parts(self.ptr.add(block_start), self.file_size - block_start)
         };
 
-        // Read total_size from header
         let total_size = read_u32_le(block, OFF_SIZE) as usize;
         if total_size < HEADER_SIZE {
             return -4;
@@ -386,7 +351,6 @@ impl WalReader {
             return -4; // map all validation errors to -4
         }
 
-        // Adjust region offsets to absolute (relative to mmap base)
         let n = (*out_num_regions as usize).min(max_regions as usize);
         for i in 0..n {
             out_offsets[i] += block_start as u32;
@@ -407,10 +371,6 @@ impl Drop for WalReader {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
