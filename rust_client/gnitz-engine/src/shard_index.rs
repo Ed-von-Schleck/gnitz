@@ -3,16 +3,12 @@
 //! Replaces 6 RPython modules: flsm.py, index.py, compactor.py, manifest.py,
 //! metadata.py, refcount.py. Exposed as an opaque handle via FFI.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::fs;
 
 use crate::compact::{self, SchemaDescriptor};
 use crate::manifest::{self, ManifestEntryRaw};
 use crate::shard_reader::MappedShard;
-
-// ---------------------------------------------------------------------------
-// Constants (from flsm.py)
-// ---------------------------------------------------------------------------
 
 const MAX_LEVELS: usize = 3;
 const L0_COMPACT_THRESHOLD: usize = 4;
@@ -20,9 +16,22 @@ const GUARD_FILE_THRESHOLD: usize = 4;
 const LMAX_FILE_THRESHOLD: usize = 1;
 const L1_TARGET_FILES: usize = 16;
 
-// ---------------------------------------------------------------------------
-// ShardEntry: owns a MappedShard + cached metadata
-// ---------------------------------------------------------------------------
+#[inline]
+fn make_pk(lo: u64, hi: u64) -> u128 {
+    ((hi as u128) << 64) | (lo as u128)
+}
+
+#[inline]
+fn split_pk(pk: u128) -> (u64, u64) {
+    (pk as u64, (pk >> 64) as u64)
+}
+
+fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, i32> {
+    strings
+        .iter()
+        .map(|f| CString::new(f.as_str()).map_err(|_| -1))
+        .collect()
+}
 
 struct ShardEntry {
     shard: MappedShard,
@@ -40,8 +49,9 @@ impl ShardEntry {
         min_lsn: u64,
         max_lsn: u64,
     ) -> Result<Self, i32> {
-        let cpath = std::ffi::CString::new(path).map_err(|_| -1)?;
+        let cpath = CString::new(path).map_err(|_| -1)?;
         let shard = MappedShard::open(&cpath, schema, false)?;
+        // Empty shard: pk_min > pk_max so range checks always fail
         let (pk_min, pk_max) = if shard.count > 0 {
             (shard.get_pk(0), shard.get_pk(shard.count - 1))
         } else {
@@ -56,11 +66,20 @@ impl ShardEntry {
             pk_max,
         })
     }
-}
 
-// ---------------------------------------------------------------------------
-// LevelGuard: key-range-bounded group of shard entries
-// ---------------------------------------------------------------------------
+    fn probe_pk(&self, key: u128, key_lo: u64, key_hi: u64) -> Option<(*const MappedShard, usize)> {
+        if self.pk_min <= key && key <= self.pk_max {
+            if self.shard.has_xor8() && !self.shard.xor8_may_contain(key_lo, key_hi) {
+                return None;
+            }
+            let row = self.shard.find_row_index(key_lo, key_hi);
+            if row >= 0 {
+                return Some((&self.shard as *const MappedShard, row as usize));
+            }
+        }
+        None
+    }
+}
 
 struct LevelGuard {
     guard_key_lo: u64,
@@ -79,29 +98,17 @@ impl LevelGuard {
 
     #[inline]
     fn guard_key(&self) -> u128 {
-        ((self.guard_key_hi as u128) << 64) | (self.guard_key_lo as u128)
-    }
-
-    fn filenames(&self) -> Vec<String> {
-        self.entries.iter().map(|e| e.filename.clone()).collect()
+        make_pk(self.guard_key_lo, self.guard_key_hi)
     }
 }
 
-// ---------------------------------------------------------------------------
-// FLSMLevel: one level in the LSM hierarchy (L1..L3)
-// ---------------------------------------------------------------------------
-
 struct FLSMLevel {
-    level_num: usize,
     guards: Vec<LevelGuard>,
 }
 
 impl FLSMLevel {
-    fn new(level_num: usize) -> Self {
-        FLSMLevel {
-            level_num,
-            guards: Vec::new(),
-        }
+    fn new() -> Self {
+        FLSMLevel { guards: Vec::new() }
     }
 
     fn find_guard_idx(&self, key: u128) -> Option<usize> {
@@ -127,8 +134,12 @@ impl FLSMLevel {
     }
 
     fn find_guards_for_range(&self, range_min: u128, range_max: u128) -> Vec<usize> {
+        let start = match self.guards.partition_point(|g| g.guard_key() <= range_min) {
+            0 => 0,
+            n => n - 1,
+        };
         let mut result = Vec::new();
-        for i in 0..self.guards.len() {
+        for i in start..self.guards.len() {
             let gk = self.guards[i].guard_key();
             if gk > range_max {
                 break;
@@ -145,37 +156,20 @@ impl FLSMLevel {
         result
     }
 
-    fn insert_guard_sorted(&mut self, guard: LevelGuard) {
-        let gk = guard.guard_key();
-        let pos = self
-            .guards
-            .iter()
-            .position(|g| g.guard_key() > gk)
-            .unwrap_or(self.guards.len());
-        self.guards.insert(pos, guard);
-    }
-
     fn total_file_count(&self) -> usize {
         self.guards.iter().map(|g| g.entries.len()).sum()
     }
 
     fn get_or_create_guard(&mut self, gk_lo: u64, gk_hi: u64) -> &mut LevelGuard {
-        let gk = ((gk_hi as u128) << 64) | (gk_lo as u128);
-        let needs_new = match self.find_guard_idx(gk) {
-            Some(idx) => self.guards[idx].guard_key() != gk,
-            None => true,
-        };
-        if needs_new {
-            self.insert_guard_sorted(LevelGuard::new(gk_lo, gk_hi));
+        let gk = make_pk(gk_lo, gk_hi);
+        let pos = self.guards.partition_point(|g| g.guard_key() < gk);
+        if pos < self.guards.len() && self.guards[pos].guard_key() == gk {
+            return &mut self.guards[pos];
         }
-        let idx = self.find_guard_idx(gk).unwrap();
-        &mut self.guards[idx]
+        self.guards.insert(pos, LevelGuard::new(gk_lo, gk_hi));
+        &mut self.guards[pos]
     }
 }
-
-// ---------------------------------------------------------------------------
-// ShardIndex: the opaque handle
-// ---------------------------------------------------------------------------
 
 pub struct ShardIndex {
     table_id: u32,
@@ -204,9 +198,17 @@ impl ShardIndex {
         }
     }
 
-    // -------------------------------------------------------------------
-    // L0 management
-    // -------------------------------------------------------------------
+    fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
+        self.l0.iter().chain(
+            self.levels
+                .iter()
+                .flat_map(|l| l.guards.iter().flat_map(|g| g.entries.iter())),
+        )
+    }
+
+    fn level_num(level_idx: usize) -> usize {
+        level_idx + 1
+    }
 
     pub fn add_shard(&mut self, path: &str, min_lsn: u64, max_lsn: u64) -> Result<(), i32> {
         let entry = ShardEntry::open(path, &self.schema, min_lsn, max_lsn)?;
@@ -224,58 +226,27 @@ impl ShardIndex {
         self.needs_compaction = self.l0.len() > L0_COMPACT_THRESHOLD;
     }
 
-    // -------------------------------------------------------------------
-    // Query: all shard pointers for cursor
-    // -------------------------------------------------------------------
-
     pub fn all_shard_ptrs(&self) -> Vec<*const MappedShard> {
-        let cap = self.l0.len() + self.levels.iter().map(|l| l.total_file_count()).sum::<usize>();
-        let mut result = Vec::with_capacity(cap);
-        for e in &self.l0 {
-            result.push(&e.shard as *const MappedShard);
-        }
-        for level in &self.levels {
-            for guard in &level.guards {
-                for e in &guard.entries {
-                    result.push(&e.shard as *const MappedShard);
-                }
-            }
-        }
-        result
+        self.all_entries()
+            .map(|e| &e.shard as *const MappedShard)
+            .collect()
     }
 
-    // -------------------------------------------------------------------
-    // Query: point lookup
-    // -------------------------------------------------------------------
-
     pub fn find_pk(&self, key_lo: u64, key_hi: u64) -> Vec<(*const MappedShard, usize)> {
-        let key = ((key_hi as u128) << 64) | (key_lo as u128);
+        let key = make_pk(key_lo, key_hi);
         let mut results = Vec::with_capacity(2);
 
         for e in &self.l0 {
-            if e.pk_min <= key && key <= e.pk_max {
-                if e.shard.has_xor8() && !e.shard.xor8_may_contain(key_lo, key_hi) {
-                    continue;
-                }
-                let row = e.shard.find_row_index(key_lo, key_hi);
-                if row >= 0 {
-                    results.push((&e.shard as *const MappedShard, row as usize));
-                }
+            if let Some(hit) = e.probe_pk(key, key_lo, key_hi) {
+                results.push(hit);
             }
         }
 
         for level in &self.levels {
             if let Some(g_idx) = level.find_guard_idx(key) {
-                let guard = &level.guards[g_idx];
-                for e in &guard.entries {
-                    if e.pk_min <= key && key <= e.pk_max {
-                        if e.shard.has_xor8() && !e.shard.xor8_may_contain(key_lo, key_hi) {
-                            continue;
-                        }
-                        let row = e.shard.find_row_index(key_lo, key_hi);
-                        if row >= 0 {
-                            results.push((&e.shard as *const MappedShard, row as usize));
-                        }
+                for e in &level.guards[g_idx].entries {
+                    if let Some(hit) = e.probe_pk(key, key_lo, key_hi) {
+                        results.push(hit);
                     }
                 }
             }
@@ -284,27 +255,8 @@ impl ShardIndex {
         results
     }
 
-    // -------------------------------------------------------------------
-    // Metadata
-    // -------------------------------------------------------------------
-
     pub fn max_lsn(&self) -> u64 {
-        let mut result = 0u64;
-        for e in &self.l0 {
-            if e.max_lsn > result {
-                result = e.max_lsn;
-            }
-        }
-        for level in &self.levels {
-            for guard in &level.guards {
-                for e in &guard.entries {
-                    if e.max_lsn > result {
-                        result = e.max_lsn;
-                    }
-                }
-            }
-        }
-        result
+        self.all_entries().map(|e| e.max_lsn).max().unwrap_or(0)
     }
 
     fn build_manifest_entries(&self) -> Vec<ManifestEntryRaw> {
@@ -312,12 +264,12 @@ impl ShardIndex {
         for e in &self.l0 {
             entries.push(self.entry_to_raw(e, 0, 0, 0));
         }
-        for level in &self.levels {
+        for (li, level) in self.levels.iter().enumerate() {
             for guard in &level.guards {
                 for e in &guard.entries {
                     entries.push(self.entry_to_raw(
                         e,
-                        level.level_num as u64,
+                        Self::level_num(li) as u64,
                         guard.guard_key_lo,
                         guard.guard_key_hi,
                     ));
@@ -336,10 +288,12 @@ impl ShardIndex {
     ) -> ManifestEntryRaw {
         let mut raw = ManifestEntryRaw::zeroed();
         raw.table_id = self.table_id as u64;
-        raw.pk_min_lo = e.pk_min as u64;
-        raw.pk_min_hi = (e.pk_min >> 64) as u64;
-        raw.pk_max_lo = e.pk_max as u64;
-        raw.pk_max_hi = (e.pk_max >> 64) as u64;
+        let (min_lo, min_hi) = split_pk(e.pk_min);
+        let (max_lo, max_hi) = split_pk(e.pk_max);
+        raw.pk_min_lo = min_lo;
+        raw.pk_min_hi = min_hi;
+        raw.pk_max_lo = max_lo;
+        raw.pk_max_hi = max_hi;
         raw.min_lsn = e.min_lsn;
         raw.max_lsn = e.max_lsn;
         raw.level = level;
@@ -351,18 +305,13 @@ impl ShardIndex {
         raw
     }
 
-    // -------------------------------------------------------------------
-    // Manifest I/O
-    // -------------------------------------------------------------------
-
     pub fn load_manifest(&mut self, path: &str) -> Result<(), i32> {
-        let cpath = std::ffi::CString::new(path).map_err(|_| -1)?;
+        let cpath = CString::new(path).map_err(|_| -1)?;
         let mut entries = vec![ManifestEntryRaw::zeroed(); 4096];
         let mut global_lsn = 0u64;
         let count = manifest::read_file(&cpath, &mut entries, 4096, &mut global_lsn);
         if count < 0 {
             if count == manifest::MANIFEST_ERR_IO {
-                // File doesn't exist yet — empty index is fine
                 return Ok(());
             }
             return Err(count);
@@ -374,19 +323,17 @@ impl ShardIndex {
                 continue;
             }
             let filename = raw.filename_str().to_string();
-            let entry = ShardEntry::open(
-                &filename,
-                &self.schema,
-                raw.min_lsn,
-                raw.max_lsn,
-            )?;
+            let entry = ShardEntry::open(&filename, &self.schema, raw.min_lsn, raw.max_lsn)?;
 
             if raw.level == 0 {
                 self.l0.push(entry);
             } else {
                 let level_num = raw.level as usize;
                 let level = self.get_or_create_level(level_num);
-                level.get_or_create_guard(raw.guard_key_lo, raw.guard_key_hi).entries.push(entry);
+                level
+                    .get_or_create_guard(raw.guard_key_lo, raw.guard_key_hi)
+                    .entries
+                    .push(entry);
             }
         }
         self.sort_l0();
@@ -397,17 +344,13 @@ impl ShardIndex {
     pub fn publish_manifest(&self, path: &str) -> Result<(), i32> {
         let entries = self.build_manifest_entries();
         let global_lsn = self.max_lsn();
-        let cpath = std::ffi::CString::new(path).map_err(|_| -1)?;
+        let cpath = CString::new(path).map_err(|_| -1)?;
         let rc = manifest::write_file(&cpath, &entries, global_lsn);
         if rc != 0 {
             return Err(rc);
         }
         Ok(())
     }
-
-    // -------------------------------------------------------------------
-    // Level management
-    // -------------------------------------------------------------------
 
     fn get_or_create_level(&mut self, level_num: usize) -> &mut FLSMLevel {
         self.ensure_level(level_num);
@@ -417,13 +360,9 @@ impl ShardIndex {
     fn ensure_level(&mut self, level_num: usize) {
         let idx = level_num - 1;
         while self.levels.len() <= idx {
-            self.levels.push(FLSMLevel::new(self.levels.len() + 1));
+            self.levels.push(FLSMLevel::new());
         }
     }
-
-    // -------------------------------------------------------------------
-    // Compaction: L0 → L1
-    // -------------------------------------------------------------------
 
     pub fn run_compact(&mut self) -> Result<(), i32> {
         if !self.needs_compaction {
@@ -440,21 +379,15 @@ impl ShardIndex {
             self.compact_seq
         };
 
-        // Determine guard keys for routing
         let guard_keys = self.l1_guard_keys();
 
-        // Collect L0 file paths as CStrings
-        let l0_cstrings: Vec<std::ffi::CString> = l0_filenames
-            .iter()
-            .map(|f| std::ffi::CString::new(f.as_str()).unwrap())
-            .collect();
+        let l0_cstrings = to_cstrings(&l0_filenames)?;
         let l0_cstrs: Vec<&CStr> = l0_cstrings.iter().map(|c| c.as_c_str()).collect();
 
-        let out_dir = std::ffi::CString::new(self.output_dir.as_str()).unwrap();
+        let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| -1)?;
         let result_cap = guard_keys.len().max(l0_filenames.len());
-        let mut results: Vec<compact::GuardResult> = (0..result_cap)
-            .map(|_| compact::GuardResult::zeroed())
-            .collect();
+        let mut results: Vec<compact::GuardResult> =
+            (0..result_cap).map(|_| compact::GuardResult::zeroed()).collect();
 
         let num_results = compact::merge_and_route(
             &l0_cstrs,
@@ -462,7 +395,7 @@ impl ShardIndex {
             &guard_keys,
             &self.schema,
             self.table_id,
-            1, // level 1
+            1,
             lsn_tag,
             &mut results,
         );
@@ -473,22 +406,15 @@ impl ShardIndex {
 
         let guard_outputs: Vec<(u64, u64, String)> = results[..num_results as usize]
             .iter()
-            .map(|r| {
-                let fname = r.filename_str().to_string();
-                (r.guard_key_lo, r.guard_key_hi, fname)
-            })
+            .map(|r| (r.guard_key_lo, r.guard_key_hi, r.filename_str().to_string()))
             .collect();
 
-        self.commit_l0_to_l1(&l0_filenames, &guard_outputs, l0_max_lsn)?;
+        self.commit_l0_to_l1(&guard_outputs, l0_max_lsn)?;
 
-        for fn_ in &l0_filenames {
-            self.pending_deletions.push(fn_.clone());
-        }
+        self.pending_deletions.extend(l0_filenames);
 
-        // Phase 3: horizontal compaction
         self.compact_guards_if_needed()?;
 
-        // Phase 4: vertical L1→L2 if overfull
         if !self.levels.is_empty() {
             let l1_count = self.levels[0].total_file_count();
             if l1_count > L1_TARGET_FILES {
@@ -507,11 +433,9 @@ impl ShardIndex {
                 .map(|g| (g.guard_key_lo, g.guard_key_hi))
                 .collect()
         } else {
-            // No L1 guards: derive from L0 min keys
             let mut keys: Vec<(u64, u64)> = Vec::new();
             for e in &self.l0 {
-                let lo = e.pk_min as u64;
-                let hi = (e.pk_min >> 64) as u64;
+                let (lo, hi) = split_pk(e.pk_min);
                 if keys.is_empty() || keys.last().map(|k| *k != (lo, hi)).unwrap_or(true) {
                     keys.push((lo, hi));
                 }
@@ -525,32 +449,28 @@ impl ShardIndex {
 
     fn commit_l0_to_l1(
         &mut self,
-        l0_filenames: &[String],
         guard_outputs: &[(u64, u64, String)],
         max_lsn: u64,
     ) -> Result<(), i32> {
-        // Remove compacted L0 entries
-        self.l0.retain(|e| !l0_filenames.contains(&e.filename));
+        self.l0.clear();
 
-        // Install output handles into L1 guards
         self.ensure_level(1);
         let schema_copy = self.schema;
         for (gk_lo, gk_hi, filename) in guard_outputs {
             let entry = ShardEntry::open(filename, &schema_copy, 0, max_lsn)?;
-            self.levels[0].get_or_create_guard(*gk_lo, *gk_hi).entries.push(entry);
+            self.levels[0]
+                .get_or_create_guard(*gk_lo, *gk_hi)
+                .entries
+                .push(entry);
         }
 
         self.update_flags();
         Ok(())
     }
 
-    // -------------------------------------------------------------------
-    // Horizontal compaction (within guard)
-    // -------------------------------------------------------------------
-
     fn compact_guards_if_needed(&mut self) -> Result<(), i32> {
         for li in 0..self.levels.len() {
-            let threshold = if self.levels[li].level_num == MAX_LEVELS - 1 {
+            let threshold = if Self::level_num(li) == MAX_LEVELS - 1 {
                 LMAX_FILE_THRESHOLD
             } else {
                 GUARD_FILE_THRESHOLD
@@ -575,18 +495,16 @@ impl ShardIndex {
             "{}/hcomp_{}_L{}_G{}_{}.db",
             self.output_dir,
             self.table_id,
-            self.levels[level_idx].level_num,
+            Self::level_num(level_idx),
             guard.guard_key_lo,
             self.compact_seq,
         );
 
-        let input_filenames = guard.filenames();
-        let input_cstrings: Vec<std::ffi::CString> = input_filenames
-            .iter()
-            .map(|f| std::ffi::CString::new(f.as_str()).unwrap())
-            .collect();
+        let input_filenames: Vec<String> =
+            guard.entries.iter().map(|e| e.filename.clone()).collect();
+        let input_cstrings = to_cstrings(&input_filenames)?;
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
-        let out_cstr = std::ffi::CString::new(out_path.as_str()).unwrap();
+        let out_cstr = CString::new(out_path.as_str()).map_err(|_| -1)?;
 
         let rc = compact::compact_shards(&input_cstrs, &out_cstr, &self.schema, self.table_id);
         if rc != 0 {
@@ -596,18 +514,12 @@ impl ShardIndex {
 
         let new_entry = ShardEntry::open(&out_path, &self.schema, 0, guard_max_lsn)?;
 
-        for fn_ in &input_filenames {
-            self.pending_deletions.push(fn_.clone());
-        }
+        self.pending_deletions.extend(input_filenames);
 
         self.levels[level_idx].guards[guard_idx].entries = vec![new_entry];
 
         Ok(())
     }
-
-    // -------------------------------------------------------------------
-    // Vertical compaction (L_n → L_n+1)
-    // -------------------------------------------------------------------
 
     fn compact_guard_vertical(&mut self, src_level_num: usize) -> Result<(), i32> {
         if src_level_num < 1 || src_level_num >= MAX_LEVELS {
@@ -615,7 +527,6 @@ impl ShardIndex {
         }
         let src_idx = src_level_num - 1;
 
-        // Phase A: select worst guard
         let worst_idx = {
             let src = &self.levels[src_idx];
             let mut worst = None;
@@ -632,7 +543,6 @@ impl ShardIndex {
             }
         };
 
-        // Phase B: gather inputs
         let src_guard_key = self.levels[src_idx].guards[worst_idx].guard_key();
         let src_max_bound = if worst_idx + 1 < self.levels[src_idx].guards.len() {
             self.levels[src_idx].guards[worst_idx + 1].guard_key() - 1
@@ -641,16 +551,18 @@ impl ShardIndex {
         };
 
         self.compact_seq += 1;
-        let dest_idx = src_level_num; // dest level index in self.levels
+        let dest_idx = src_level_num;
         self.ensure_level(src_level_num + 1);
 
-        // Collect all input files (src guard + overlapping dest guards)
-        let mut all_input_files: Vec<String> = Vec::new();
-        let src_filenames: Vec<String> = self.levels[src_idx].guards[worst_idx].filenames();
-        all_input_files.extend(src_filenames.iter().cloned());
+        let mut all_input_files: Vec<String> = self.levels[src_idx].guards[worst_idx]
+            .entries
+            .iter()
+            .map(|e| e.filename.clone())
+            .collect();
 
-        let dest_guard_indices = self.levels[dest_idx].find_guards_for_range(src_guard_key, src_max_bound);
-        let mut dest_guard_filenames: Vec<Vec<String>> = Vec::new();
+        let dest_guard_indices =
+            self.levels[dest_idx].find_guards_for_range(src_guard_key, src_max_bound);
+        let mut dest_file_start_indices: Vec<usize> = Vec::new();
         let mut vert_max_lsn = self.levels[src_idx].guards[worst_idx]
             .entries
             .iter()
@@ -660,10 +572,9 @@ impl ShardIndex {
 
         for &di in &dest_guard_indices {
             let dg = &self.levels[dest_idx].guards[di];
-            let fns = dg.filenames();
-            all_input_files.extend(fns.iter().cloned());
-            dest_guard_filenames.push(fns);
+            dest_file_start_indices.push(all_input_files.len());
             for e in &dg.entries {
+                all_input_files.push(e.filename.clone());
                 if e.max_lsn > vert_max_lsn {
                     vert_max_lsn = e.max_lsn;
                 }
@@ -676,7 +587,6 @@ impl ShardIndex {
             self.compact_seq
         };
 
-        // Determine guard keys for routing
         let guard_keys: Vec<(u64, u64)> = if !dest_guard_indices.is_empty() {
             dest_guard_indices
                 .iter()
@@ -692,17 +602,12 @@ impl ShardIndex {
             )]
         };
 
-        // Phase C: compact
-        let input_cstrings: Vec<std::ffi::CString> = all_input_files
-            .iter()
-            .map(|f| std::ffi::CString::new(f.as_str()).unwrap())
-            .collect();
+        let input_cstrings = to_cstrings(&all_input_files)?;
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
-        let out_dir = std::ffi::CString::new(self.output_dir.as_str()).unwrap();
+        let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| -1)?;
         let result_cap = guard_keys.len().max(1);
-        let mut results: Vec<compact::GuardResult> = (0..result_cap)
-            .map(|_| compact::GuardResult::zeroed())
-            .collect();
+        let mut results: Vec<compact::GuardResult> =
+            (0..result_cap).map(|_| compact::GuardResult::zeroed()).collect();
 
         let num_results = compact::merge_and_route(
             &input_cstrs,
@@ -724,45 +629,37 @@ impl ShardIndex {
             .map(|r| (r.guard_key_lo, r.guard_key_hi, r.filename_str().to_string()))
             .collect();
 
-        // Phase D: tear down old handles
-        // Mark src guard files for deletion
-        for fn_ in &src_filenames {
-            self.pending_deletions.push(fn_.clone());
-        }
-        // Mark dest guard files for deletion
-        for fns in &dest_guard_filenames {
-            for fn_ in fns {
-                self.pending_deletions.push(fn_.clone());
-            }
-        }
+        // Mark all input files for deletion (moves, no cloning)
+        self.pending_deletions.extend(all_input_files);
 
-        // Remove src guard
         self.levels[src_idx].guards.remove(worst_idx);
 
-        // Remove old dest guards (by key match)
         {
-            let old_keys: Vec<u128> = guard_keys.iter().map(|&(lo, hi)| ((hi as u128) << 64) | (lo as u128)).collect();
+            let old_keys: Vec<u128> = guard_keys
+                .iter()
+                .map(|&(lo, hi)| make_pk(lo, hi))
+                .collect();
             self.levels[dest_idx]
                 .guards
                 .retain(|g| !old_keys.contains(&g.guard_key()));
         }
 
-        // Phase E: install outputs
         let schema_copy = self.schema;
         for (gk_lo, gk_hi, filename) in &guard_outputs {
             let entry = ShardEntry::open(filename, &schema_copy, 0, vert_max_lsn)?;
-            self.levels[dest_idx].get_or_create_guard(*gk_lo, *gk_hi).entries.push(entry);
+            self.levels[dest_idx]
+                .get_or_create_guard(*gk_lo, *gk_hi)
+                .entries
+                .push(entry);
         }
 
         self.update_flags();
 
-        // Lazy leveling: Z=1 at Lmax
-        if self.levels[dest_idx].level_num == MAX_LEVELS - 1 {
-            let di = dest_idx;
+        if Self::level_num(dest_idx) == MAX_LEVELS - 1 {
             let mut gi = 0;
-            while gi < self.levels[di].guards.len() {
-                if self.levels[di].guards[gi].entries.len() > LMAX_FILE_THRESHOLD {
-                    self.compact_one_guard(di, gi)?;
+            while gi < self.levels[dest_idx].guards.len() {
+                if self.levels[dest_idx].guards[gi].entries.len() > LMAX_FILE_THRESHOLD {
+                    self.compact_one_guard(dest_idx, gi)?;
                 }
                 gi += 1;
             }
@@ -771,19 +668,15 @@ impl ShardIndex {
         Ok(())
     }
 
-    // -------------------------------------------------------------------
-    // Cleanup: delete unreferenced shard files
-    // -------------------------------------------------------------------
-
     pub fn try_cleanup(&mut self) -> usize {
         let mut deleted = 0;
         let mut remaining = Vec::new();
 
         for path in self.pending_deletions.drain(..) {
             match fs::remove_file(&path) {
-                Ok(()) => { deleted += 1; }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { deleted += 1; }
-                Err(_) => { remaining.push(path); }
+                Ok(()) => deleted += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => deleted += 1,
+                Err(_) => remaining.push(path),
             }
         }
 
@@ -791,4 +684,3 @@ impl ShardIndex {
         deleted
     }
 }
-
