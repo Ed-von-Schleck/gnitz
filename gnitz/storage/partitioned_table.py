@@ -1,324 +1,327 @@
 # gnitz/storage/partitioned_table.py
+#
+# Thin RPython wrapper over the Rust PartitionedTable opaque handle.
+# Hash routing, batch splitting, and multi-partition cursor assembly
+# all happen in Rust.
 
-import errno
-from rpython.rlib import rposix
-from rpython.rlib.rarithmetic import (
-    r_int64,
-    r_uint64,
-    intmask,
-)
-from rpython.rlib.objectmodel import newlist_hint
+from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
+from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.core import xxh
+from gnitz.core import errors
 from gnitz.core.store import ZSetStore
 from gnitz.core.batch import ArenaZSetBatch
-from gnitz.core.store import AbstractCursor
-from gnitz.storage.cursor import RustUnifiedCursor
-from gnitz.storage.table import PersistentTable
+from gnitz.storage import engine_ffi, cursor
+from gnitz.storage.memtable import _pack_batch_regions
+from gnitz.core.comparator import RowAccessor
 from gnitz.storage.ephemeral_table import EphemeralTable
-from gnitz.storage import mmap_posix
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID
 
 NUM_PARTITIONS = 256
 
 
-class _EmptyCursor(AbstractCursor):
-    """A cursor that is immediately exhausted. Used when all partitions are closed."""
-
-    def seek(self, key_lo, key_hi):
-        pass
-
-    def advance(self):
-        pass
-
-    def is_valid(self):
-        return False
-
-    def is_exhausted(self):
-        return True
-
-    def key_lo(self):
-        return r_uint64(0)
-
-    def key_hi(self):
-        return r_uint64(0)
-
-    def weight(self):
-        return r_int64(0)
-
-    def get_accessor(self):
-        return None
-
-    def close(self):
-        pass
-
-
 def get_num_partitions(table_id):
-    """Returns 1 for system tables, NUM_PARTITIONS for user tables."""
     if table_id < FIRST_USER_TABLE_ID:
         return 1
     return NUM_PARTITIONS
 
 
-def _partition_for_key(pk_lo, pk_hi):
-    """Compute partition index from a PK's lo/hi components."""
-    h = xxh.hash_u128_inline(pk_lo, pk_hi)
-    return intmask(r_uint64(h) & r_uint64(0xFF))
+class PTableFoundAccessor(RowAccessor):
+    """Reads from last-found row of a Rust PartitionedTable handle."""
+
+    _immutable_fields_ = ["_schema", "_has_nullable"]
+
+    def __init__(self, schema, handle):
+        self._schema = schema
+        self._has_nullable = schema.has_nullable
+        self._handle = handle
+        self._null_word = r_uint64(0)
+
+    def refresh_null_word(self):
+        self._null_word = r_uint64(
+            engine_ffi._ptable_found_null_word(self._handle)
+        )
+
+    def _col_ptr(self, col_idx):
+        pk_index = self._schema.pk_index
+        payload_col = col_idx if col_idx < pk_index else col_idx - 1
+        stride = self._schema.columns[col_idx].field_type.size
+        return engine_ffi._ptable_found_col_ptr(
+            self._handle,
+            rffi.cast(rffi.INT, payload_col),
+            rffi.cast(rffi.INT, stride),
+        )
+
+    def is_null(self, col_idx):
+        if col_idx == self._schema.pk_index:
+            return False
+        if not self._has_nullable:
+            return False
+        payload_idx = col_idx if col_idx < self._schema.pk_index else col_idx - 1
+        return bool(self._null_word & (r_uint64(1) << payload_idx))
+
+    def get_int(self, col_idx):
+        ptr = self._col_ptr(col_idx)
+        sz = self._schema.columns[col_idx].field_type.size
+        if sz == 8:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        elif sz == 4:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UINTP, ptr)[0])
+        elif sz == 2:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.USHORTP, ptr)[0])
+        elif sz == 1:
+            return rffi.cast(rffi.ULONGLONG, rffi.cast(rffi.UCHARP, ptr)[0])
+        return r_uint64(0)
+
+    def get_int_signed(self, col_idx):
+        ptr = self._col_ptr(col_idx)
+        sz = self._schema.columns[col_idx].field_type.size
+        if sz == 8:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.LONGLONGP, ptr)[0])
+        elif sz == 4:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.INTP, ptr)[0])
+        elif sz == 2:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SHORTP, ptr)[0])
+        elif sz == 1:
+            return rffi.cast(rffi.LONGLONG, rffi.cast(rffi.SIGNEDCHARP, ptr)[0])
+        return r_int64(0)
+
+    def get_float(self, col_idx):
+        ptr = self._col_ptr(col_idx)
+        sz = self._schema.columns[col_idx].field_type.size
+        if sz == 4:
+            return float(rffi.cast(rffi.FLOATP, ptr)[0])
+        return float(rffi.cast(rffi.DOUBLEP, ptr)[0])
+
+    def get_u128_lo(self, col_idx):
+        ptr = self._col_ptr(col_idx)
+        return rffi.cast(rffi.ULONGLONGP, ptr)[0]
+
+    def get_u128_hi(self, col_idx):
+        ptr = self._col_ptr(col_idx)
+        return rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, 8))[0]
+
+    def get_str_struct(self, col_idx):
+        ptr = self._col_ptr(col_idx)
+        blob_ptr = engine_ffi._ptable_found_blob_ptr(self._handle)
+        u32_ptr = rffi.cast(rffi.UINTP, ptr)
+        length = rffi.cast(lltype.Signed, u32_ptr[0])
+        prefix = rffi.cast(lltype.Signed, u32_ptr[1])
+        s = None
+        if False:
+            s = ""
+        return (length, prefix, ptr, blob_ptr, s)
 
 
 class PartitionedTable(ZSetStore):
-    """
-    A ZSetStore wrapping N partition-level stores (PersistentTable or
-    EphemeralTable). Routes rows by hash(PK) % N.
+    _immutable_fields_ = ["schema", "num_partitions"]
 
-    partitions is a dense list containing only live stores.
-    part_offset is the global partition index of partitions[0].
-    num_partitions is the total global count (256 for user tables, 1 for system).
-    """
-
-    _immutable_fields_ = [
-        "schema", "num_partitions",
-        "directory", "name",
-    ]
-
-    def __init__(self, directory, name, schema, num_partitions, partitions, part_offset):
-        self.directory = directory
-        self.name = name
+    def __init__(self, handle, schema, table_id, num_partitions):
+        self._handle = handle
         self.schema = schema
+        self.table_id = table_id
         self.num_partitions = num_partitions
-        self.partitions = partitions
-        self.part_offset = part_offset
+        self._retract_acc = PTableFoundAccessor(schema, handle)
+        self._lookup_found_buf = lltype.malloc(rffi.INTP.TO, 1, flavor="raw")
+        self.is_closed = False
 
     def get_schema(self):
         return self.schema
 
-    def set_has_wal(self, flag):
-        """Propagate _has_wal to all partition sub-stores."""
-        for i in range(len(self.partitions)):
-            self.partitions[i].set_has_wal(flag)
-
-    def get_max_flushed_lsn(self):
-        """Max current_lsn across all partitions (for SAL recovery)."""
-        max_lsn = r_uint64(0)
-        for i in range(len(self.partitions)):
-            if self.partitions[i].current_lsn > max_lsn:
-                max_lsn = self.partitions[i].current_lsn
-        return max_lsn
+    def ingest_batch(self, batch):
+        if batch.length() == 0:
+            return
+        sorted_batch = batch.to_sorted()
+        ptrs, sizes, count, rpb = _pack_batch_regions(sorted_batch, self.schema)
+        try:
+            rc = intmask(engine_ffi._ptable_ingest_batch(
+                self._handle, ptrs, sizes,
+                rffi.cast(rffi.UINT, count),
+                rffi.cast(rffi.UINT, rpb),
+            ))
+        finally:
+            lltype.free(ptrs, flavor="raw")
+            lltype.free(sizes, flavor="raw")
+            if sorted_batch is not batch:
+                sorted_batch.free()
+        if rc < 0:
+            raise errors.StorageError("ptable ingest failed (%d)" % rc)
 
     def ingest_batch_memonly(self, batch):
-        """Delegates to the partition's ingest_batch_memonly (bypasses WAL).
-        Only meaningful for num_partitions == 1 (system tables).
-        """
-        if batch.length() == 0 or len(self.partitions) == 0:
+        if batch.length() == 0:
             return
-        self.partitions[0].ingest_batch_memonly(batch)
-
-    def ingest_batch(self, batch):
-        n = batch.length()
-        if n == 0:
-            return
-
-        num_live = len(self.partitions)
-        if num_live == 0:
-            return
-
-        if self.num_partitions == 1:
-            self.partitions[0].ingest_batch(batch)
-            return
-
-        schema = self.schema
-
-        # Pass 1: collect per-partition index lists
-        part_indices = newlist_hint(self.num_partitions)
-        for _p in range(self.num_partitions):
-            part_indices.append(newlist_hint(0))
-
-        for i in range(n):
-            pk_lo = r_uint64(batch._read_pk_lo(i))
-            pk_hi = r_uint64(batch._read_pk_hi(i))
-            p = _partition_for_key(pk_lo, pk_hi)
-            part_indices[p].append(i)
-
-        # Pass 2: bulk-copy each partition's rows using _copy_rows_indexed_src_weights
-        sorted_flag = batch._sorted
-        offset = self.part_offset
-        for p in range(self.num_partitions):
-            pidx = part_indices[p]
-            if len(pidx) == 0:
-                continue
-            local = p - offset
-            if local < 0 or local >= num_live:
-                continue
-            sb = ArenaZSetBatch(schema, initial_capacity=len(pidx))
-            sb._copy_rows_indexed_src_weights(batch, pidx)
-            if sorted_flag:
-                sb._sorted = True
-            self.partitions[local].ingest_batch(sb)
-            sb.free()
+        sorted_batch = batch.to_sorted()
+        ptrs, sizes, count, rpb = _pack_batch_regions(sorted_batch, self.schema)
+        try:
+            rc = intmask(engine_ffi._ptable_ingest_batch_memonly(
+                self._handle, ptrs, sizes,
+                rffi.cast(rffi.UINT, count),
+                rffi.cast(rffi.UINT, rpb),
+            ))
+        finally:
+            lltype.free(ptrs, flavor="raw")
+            lltype.free(sizes, flavor="raw")
+            if sorted_batch is not batch:
+                sorted_batch.free()
+        if rc < 0:
+            raise errors.StorageError("ptable ingest_memonly failed (%d)" % rc)
 
     def create_cursor(self):
-        num_live = len(self.partitions)
-        if num_live == 0:
-            return _EmptyCursor()
-
-        if self.num_partitions == 1:
-            return self.partitions[0].create_cursor()
-
-        # Collect ALL data sources across ALL partitions into one flat cursor
-        snapshot_handles = newlist_hint(num_live)
-        all_shard_views = newlist_hint(num_live * 4)
-        for local in range(num_live):
-            part = self.partitions[local]
-            part.compact_if_needed()
-            part._flush_accumulator()
-            snap_handle = part.get_consolidated_snapshot()
-            snapshot_handles.append(snap_handle)
-            for sv in part.all_shard_views_for_cursor():
-                all_shard_views.append(sv)
-        return RustUnifiedCursor.from_snapshots(
-            self.schema, all_shard_views, snapshot_handles
-        )
-
-    def retract_pk(self, key_lo, key_hi, out_batch):
-        if len(self.partitions) == 0:
-            return False
-        if self.num_partitions == 1:
-            return self.partitions[0].retract_pk(key_lo, key_hi, out_batch)
-        p = _partition_for_key(key_lo, key_hi)
-        local = p - self.part_offset
-        if local < 0 or local >= len(self.partitions):
-            return False
-        return self.partitions[local].retract_pk(key_lo, key_hi, out_batch)
+        handle = engine_ffi._ptable_create_cursor(self._handle)
+        return cursor.RustUnifiedCursor.from_handle(self.schema, handle)
 
     def has_pk(self, key_lo, key_hi):
-        if len(self.partitions) == 0:
+        return intmask(engine_ffi._ptable_has_pk(
+            self._handle,
+            rffi.cast(rffi.ULONGLONG, key_lo),
+            rffi.cast(rffi.ULONGLONG, key_hi),
+        )) != 0
+
+    def retract_pk(self, key_lo, key_hi, out_batch):
+        weight = engine_ffi._ptable_retract_pk(
+            self._handle,
+            rffi.cast(rffi.ULONGLONG, key_lo),
+            rffi.cast(rffi.ULONGLONG, key_hi),
+            self._lookup_found_buf,
+        )
+        found = intmask(self._lookup_found_buf[0]) != 0
+        if not found:
             return False
-        if self.num_partitions == 1:
-            return self.partitions[0].has_pk(key_lo, key_hi)
-        p = _partition_for_key(key_lo, key_hi)
-        local = p - self.part_offset
-        if local < 0 or local >= len(self.partitions):
-            return False
-        return self.partitions[local].has_pk(key_lo, key_hi)
+        self._retract_acc.refresh_null_word()
+        out_batch.append_from_accessor(key_lo, key_hi, r_int64(-1), self._retract_acc)
+        return True
 
     def get_weight(self, key_lo, key_hi, accessor):
-        if len(self.partitions) == 0:
-            return r_int64(0)
-        if self.num_partitions == 1:
-            return self.partitions[0].get_weight(key_lo, key_hi, accessor)
-        p = _partition_for_key(key_lo, key_hi)
-        local = p - self.part_offset
-        if local < 0 or local >= len(self.partitions):
-            return r_int64(0)
-        return self.partitions[local].get_weight(key_lo, key_hi, accessor)
-
-    def create_child(self, name, schema):
-        return self.partitions[0].create_child(name, schema)
+        ref_batch = ArenaZSetBatch(self.schema, initial_capacity=1)
+        ref_batch.append_from_accessor(key_lo, key_hi, r_int64(1), accessor)
+        ptrs, sizes, count, rpb = _pack_batch_regions(ref_batch, self.schema)
+        try:
+            w = engine_ffi._ptable_get_weight(
+                self._handle,
+                rffi.cast(rffi.ULONGLONG, key_lo),
+                rffi.cast(rffi.ULONGLONG, key_hi),
+                ptrs, sizes,
+                rffi.cast(rffi.UINT, count),
+                rffi.cast(rffi.UINT, rpb),
+            )
+        finally:
+            lltype.free(ptrs, flavor="raw")
+            lltype.free(sizes, flavor="raw")
+            ref_batch.free()
+        return r_int64(w)
 
     def flush(self):
-        last = ""
-        for local in range(len(self.partitions)):
-            result = self.partitions[local].flush()
-            if result:
-                last = result
-        return last
+        engine_ffi._ptable_flush(self._handle)
+        return ""
 
     def compact_if_needed(self):
-        for local in range(len(self.partitions)):
-            self.partitions[local].compact_if_needed()
+        engine_ffi._ptable_compact_if_needed(self._handle)
+
+    def set_has_wal(self, flag):
+        engine_ffi._ptable_set_has_wal(
+            self._handle,
+            rffi.cast(rffi.INT, 1 if flag else 0),
+        )
+
+    @property
+    def current_lsn(self):
+        return r_uint64(engine_ffi._ptable_current_lsn(self._handle))
+
+    def get_max_flushed_lsn(self):
+        return self.current_lsn
 
     def close_partitions_outside(self, start, end):
-        """Close partitions not in [start, end). Rebuilds the dense list."""
-        old_offset = self.part_offset
-        old_parts = self.partitions
-
-        # Close partitions outside [start, end)
-        for local in range(len(old_parts)):
-            p = local + old_offset
-            if p < start or p >= end:
-                old_parts[local].close()
-
-        # Rebuild dense list for the new range
-        new_len = end - start
-        if new_len <= 0:
-            self.partitions = newlist_hint(0)
-            self.part_offset = 0
-            return
-        base = start - old_offset
-        new_parts = newlist_hint(new_len)
-        for i in range(new_len):
-            new_parts.append(old_parts[base + i])
-        self.partitions = new_parts
-        self.part_offset = start
+        engine_ffi._ptable_close_partitions_outside(
+            self._handle,
+            rffi.cast(rffi.UINT, start),
+            rffi.cast(rffi.UINT, end),
+        )
 
     def close_all_partitions(self):
-        """Close all partitions. Master use after fork."""
-        for local in range(len(self.partitions)):
-            self.partitions[local].close()
-        self.partitions = newlist_hint(0)
-        self.part_offset = 0
+        engine_ffi._ptable_close_all_partitions(self._handle)
+
+    def create_child(self, name, schema):
+        schema_buf = engine_ffi.pack_schema(schema)
+        try:
+            with rffi.scoped_str2charp(name) as name_c:
+                child_handle = engine_ffi._ptable_create_child(
+                    self._handle, name_c,
+                    rffi.cast(rffi.VOIDP, schema_buf),
+                )
+        finally:
+            lltype.free(schema_buf, flavor="raw")
+        return EphemeralTable.from_handle(child_handle, schema, self.table_id)
 
     def close(self):
-        for local in range(len(self.partitions)):
-            self.partitions[local].close()
+        if self.is_closed:
+            return
+        self.is_closed = True
+        lltype.free(self._lookup_found_buf, flavor="raw")
+        engine_ffi._ptable_close(self._handle)
+
+    def is_empty(self):
+        return False  # conservative; partitioned tables are never "empty" in a meaningful sense
 
 
 def _partition_arena_size(num_partitions):
-    """Scales per-partition memtable arena inversely with partition count."""
     if num_partitions <= 1:
-        return 1 * 1024 * 1024  # 1MB for single partition
-    # 64KB per partition (256 * 64KB = 16MB total)
+        return 1 * 1024 * 1024
     return 256 * 1024
 
 
-def _ensure_dir(path):
+def make_partitioned_persistent(
+    directory, name, schema, table_id, num_partitions,
+    part_start=0, part_end=-1,
+):
+    if part_end == -1:
+        part_end = num_partitions
+    arena_size = _partition_arena_size(num_partitions)
+    schema_buf = engine_ffi.pack_schema(schema)
     try:
-        rposix.mkdir(path, 0o755)
-    except OSError as e:
-        if e.errno != errno.EEXIST:
-            raise
-    mmap_posix.try_set_nocow_dir(path)
+        with rffi.scoped_str2charp(directory) as dir_c:
+            with rffi.scoped_str2charp(name) as name_c:
+                handle = engine_ffi._ptable_create(
+                    dir_c, name_c,
+                    rffi.cast(rffi.VOIDP, schema_buf),
+                    rffi.cast(rffi.UINT, table_id),
+                    rffi.cast(rffi.UINT, num_partitions),
+                    rffi.cast(rffi.INT, 1),
+                    rffi.cast(rffi.UINT, part_start),
+                    rffi.cast(rffi.UINT, part_end),
+                    rffi.cast(rffi.ULONGLONG, arena_size),
+                )
+    finally:
+        lltype.free(schema_buf, flavor="raw")
+    return PartitionedTable(handle, schema, table_id, num_partitions)
 
 
-def make_partitioned_persistent(directory, name, schema, table_id, num_partitions,
-                                part_start=0, part_end=-1):
-    """Creates a PartitionedTable backed by PersistentTable partitions.
-    Only partitions in [part_start, part_end) are created.
-    """
+def make_partitioned_ephemeral(
+    directory, name, schema, table_id, num_partitions,
+    part_start=0, part_end=-1,
+):
     if part_end == -1:
         part_end = num_partitions
-    _ensure_dir(directory)
     arena_size = _partition_arena_size(num_partitions)
-    partitions = newlist_hint(part_end - part_start)
-    for p in range(part_start, part_end):
-        if num_partitions == 1:
-            part_dir = directory + "/part_0"
-        else:
-            part_dir = directory + "/part_" + str(p)
-        partitions.append(PersistentTable(
-            part_dir, name, schema, table_id=table_id,
-            memtable_arena_size=arena_size,
-        ))
-    return PartitionedTable(directory, name, schema, num_partitions, partitions, part_start)
+    schema_buf = engine_ffi.pack_schema(schema)
+    try:
+        with rffi.scoped_str2charp(directory) as dir_c:
+            with rffi.scoped_str2charp(name) as name_c:
+                handle = engine_ffi._ptable_create(
+                    dir_c, name_c,
+                    rffi.cast(rffi.VOIDP, schema_buf),
+                    rffi.cast(rffi.UINT, table_id),
+                    rffi.cast(rffi.UINT, num_partitions),
+                    rffi.cast(rffi.INT, 0),
+                    rffi.cast(rffi.UINT, part_start),
+                    rffi.cast(rffi.UINT, part_end),
+                    rffi.cast(rffi.ULONGLONG, arena_size),
+                )
+    finally:
+        lltype.free(schema_buf, flavor="raw")
+    return PartitionedTable(handle, schema, table_id, num_partitions)
 
 
-def make_partitioned_ephemeral(directory, name, schema, table_id, num_partitions,
-                               part_start=0, part_end=-1):
-    """Creates a PartitionedTable backed by EphemeralTable partitions.
-    Only partitions in [part_start, part_end) are created.
-    """
-    if part_end == -1:
-        part_end = num_partitions
-    _ensure_dir(directory)
-    arena_size = _partition_arena_size(num_partitions)
-    partitions = newlist_hint(part_end - part_start)
-    for p in range(part_start, part_end):
-        if num_partitions == 1:
-            part_dir = directory + "/part_0"
-        else:
-            part_dir = directory + "/part_" + str(p)
-        partitions.append(EphemeralTable(
-            part_dir, name, schema, table_id=table_id,
-            memtable_arena_size=arena_size,
-        ))
-    return PartitionedTable(directory, name, schema, num_partitions, partitions, part_start)
+def _partition_for_key(pk_lo, pk_hi):
+    """Compute partition index. Kept for test_partition_basics."""
+    from gnitz.core import xxh
+    h = xxh.hash_u128_inline(pk_lo, pk_hi)
+    return intmask(r_uint64(h) & r_uint64(0xFF))

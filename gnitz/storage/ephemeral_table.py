@@ -185,6 +185,23 @@ class EphemeralTable(ZSetStore):
         self.is_closed = False
         self._has_wal = durable
 
+    @staticmethod
+    def from_handle(handle, schema, table_id):
+        """Wrap an existing Rust Table handle (e.g., from create_child).
+
+        Creates a thin wrapper without constructing a new Rust Table.
+        We use a regular __init__ call with a dummy directory, then replace
+        the handle.  The dummy __init__ creates a Rust Table in /tmp that
+        is immediately closed and replaced.
+        """
+        import os
+        dummy_dir = "/tmp/_gnitz_dummy_%d" % os.getpid()
+        obj = EphemeralTable(dummy_dir, "dummy", schema, table_id=table_id)
+        engine_ffi._table_close(obj._handle)
+        obj._handle = handle
+        obj._retract_acc = TableFoundAccessor(schema, handle)
+        return obj
+
     def get_schema(self):
         return self.schema
 

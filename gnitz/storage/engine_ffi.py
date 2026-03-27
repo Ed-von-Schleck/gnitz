@@ -238,6 +238,32 @@ eci = ExternalCompilationInfo(
         "void *gnitz_table_get_snapshot(void *handle);",
         "int32_t gnitz_table_all_shard_ptrs(void *handle, void **out_ptrs, uint32_t max_ptrs);",
         "void *gnitz_table_create_child(void *handle, const char *name, const void *schema_desc);",
+        # partitioned table (hash-routed N-way handle)
+        "void *gnitz_ptable_create(const char *dir, const char *name,"
+        "  const void *schema_desc, uint32_t table_id, uint32_t num_partitions,"
+        "  int32_t durable, uint32_t part_start, uint32_t part_end, uint64_t arena_size);",
+        "void gnitz_ptable_close(void *handle);",
+        "int32_t gnitz_ptable_ingest_batch(void *handle, void **ptrs, uint32_t *sizes,"
+        "  uint32_t count, uint32_t rpb);",
+        "int32_t gnitz_ptable_ingest_batch_memonly(void *handle, void **ptrs, uint32_t *sizes,"
+        "  uint32_t count, uint32_t rpb);",
+        "void *gnitz_ptable_create_cursor(void *handle);",
+        "int32_t gnitz_ptable_has_pk(void *handle, uint64_t key_lo, uint64_t key_hi);",
+        "int64_t gnitz_ptable_retract_pk(void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  int32_t *out_found);",
+        "int64_t gnitz_ptable_get_weight(void *handle, uint64_t key_lo, uint64_t key_hi,"
+        "  void **ref_ptrs, uint32_t *ref_sizes, uint32_t ref_count, uint32_t rpb);",
+        "int32_t gnitz_ptable_flush(void *handle);",
+        "int32_t gnitz_ptable_compact_if_needed(void *handle);",
+        "void gnitz_ptable_set_has_wal(void *handle, int32_t flag);",
+        "uint64_t gnitz_ptable_current_lsn(void *handle);",
+        "void gnitz_ptable_close_partitions_outside(void *handle, uint32_t start, uint32_t end);",
+        "void gnitz_ptable_close_all_partitions(void *handle);",
+        "uint64_t gnitz_ptable_found_null_word(void *handle);",
+        "const uint8_t *gnitz_ptable_found_col_ptr(void *handle, int32_t payload_col, int32_t col_size);",
+        "const uint8_t *gnitz_ptable_found_blob_ptr(void *handle);",
+        "void *gnitz_ptable_create_child(void *handle, const char *name, const void *schema_desc);",
+        "void gnitz_ptable_bloom_add(void *handle, uint64_t key_lo, uint64_t key_hi);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -1138,4 +1164,85 @@ _table_create_child = rffi.llexternal(
     [rffi.VOIDP, rffi.CCHARP, rffi.VOIDP],
     rffi.VOIDP,
     compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# PartitionedTable (hash-routed N-way handle)
+# ---------------------------------------------------------------------------
+
+_ptable_create = rffi.llexternal(
+    "gnitz_ptable_create",
+    [rffi.CCHARP, rffi.CCHARP, rffi.VOIDP, rffi.UINT, rffi.UINT,
+     rffi.INT, rffi.UINT, rffi.UINT, rffi.ULONGLONG],
+    rffi.VOIDP, compilation_info=eci,
+)
+_ptable_close = rffi.llexternal(
+    "gnitz_ptable_close", [rffi.VOIDP], lltype.Void, compilation_info=eci,
+)
+_ptable_ingest_batch = rffi.llexternal(
+    "gnitz_ptable_ingest_batch",
+    [rffi.VOIDP, rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
+    rffi.INT, compilation_info=eci,
+)
+_ptable_ingest_batch_memonly = rffi.llexternal(
+    "gnitz_ptable_ingest_batch_memonly",
+    [rffi.VOIDP, rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
+    rffi.INT, compilation_info=eci,
+)
+_ptable_create_cursor = rffi.llexternal(
+    "gnitz_ptable_create_cursor", [rffi.VOIDP], rffi.VOIDP, compilation_info=eci,
+)
+_ptable_has_pk = rffi.llexternal(
+    "gnitz_ptable_has_pk",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.INT, compilation_info=eci,
+)
+_ptable_retract_pk = rffi.llexternal(
+    "gnitz_ptable_retract_pk",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG, rffi.INTP],
+    rffi.LONGLONG, compilation_info=eci,
+)
+_ptable_get_weight = rffi.llexternal(
+    "gnitz_ptable_get_weight",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG,
+     rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
+    rffi.LONGLONG, compilation_info=eci,
+)
+_ptable_flush = rffi.llexternal(
+    "gnitz_ptable_flush", [rffi.VOIDP], rffi.INT, compilation_info=eci,
+)
+_ptable_compact_if_needed = rffi.llexternal(
+    "gnitz_ptable_compact_if_needed", [rffi.VOIDP], rffi.INT, compilation_info=eci,
+)
+_ptable_set_has_wal = rffi.llexternal(
+    "gnitz_ptable_set_has_wal", [rffi.VOIDP, rffi.INT], lltype.Void, compilation_info=eci,
+)
+_ptable_current_lsn = rffi.llexternal(
+    "gnitz_ptable_current_lsn", [rffi.VOIDP], rffi.ULONGLONG, compilation_info=eci,
+)
+_ptable_close_partitions_outside = rffi.llexternal(
+    "gnitz_ptable_close_partitions_outside",
+    [rffi.VOIDP, rffi.UINT, rffi.UINT], lltype.Void, compilation_info=eci,
+)
+_ptable_close_all_partitions = rffi.llexternal(
+    "gnitz_ptable_close_all_partitions", [rffi.VOIDP], lltype.Void, compilation_info=eci,
+)
+_ptable_found_null_word = rffi.llexternal(
+    "gnitz_ptable_found_null_word", [rffi.VOIDP], rffi.ULONGLONG, compilation_info=eci,
+)
+_ptable_found_col_ptr = rffi.llexternal(
+    "gnitz_ptable_found_col_ptr", [rffi.VOIDP, rffi.INT, rffi.INT],
+    rffi.CCHARP, compilation_info=eci,
+)
+_ptable_found_blob_ptr = rffi.llexternal(
+    "gnitz_ptable_found_blob_ptr", [rffi.VOIDP], rffi.CCHARP, compilation_info=eci,
+)
+_ptable_create_child = rffi.llexternal(
+    "gnitz_ptable_create_child", [rffi.VOIDP, rffi.CCHARP, rffi.VOIDP],
+    rffi.VOIDP, compilation_info=eci,
+)
+_ptable_bloom_add = rffi.llexternal(
+    "gnitz_ptable_bloom_add",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG],
+    lltype.Void, compilation_info=eci,
 )

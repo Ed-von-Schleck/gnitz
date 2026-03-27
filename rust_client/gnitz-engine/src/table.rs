@@ -137,6 +137,43 @@ impl Table {
     // Ingest
     // ------------------------------------------------------------------
 
+    /// Ingest an already-constructed OwnedBatch.  Writes WAL (if durable),
+    /// then memtable.  Used by PartitionedTable after hash-routing.
+    pub fn ingest_owned_batch(&mut self, batch: OwnedBatch) -> Result<(), i32> {
+        if batch.count == 0 {
+            return Ok(());
+        }
+        self.found_source = FoundSource::None;
+
+        if let Some(ref mut wal) = self.wal_writer {
+            let regions = batch.regions();
+            let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
+            let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
+            let blob_size = *sizes.last().unwrap_or(&0) as u64;
+            let rc = wal.append_batch(
+                self.current_lsn, self.table_id, batch.count as u32,
+                &ptrs, &sizes, blob_size,
+            );
+            if rc < 0 {
+                return Err(rc);
+            }
+            self.current_lsn += 1;
+        }
+
+        match self.memtable.upsert_sorted_batch(batch) {
+            Ok(()) => {
+                if self.memtable.should_flush() { self.flush()?; }
+                Ok(())
+            }
+            Err(code) if code == memtable::ERR_CAPACITY => {
+                self.flush()?;
+                // Batch was consumed by the failed upsert; caller must handle retry
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Ingest a pre-sorted batch.  Writes WAL first (if durable), then memtable.
     pub fn ingest_batch_from_regions(
         &mut self,
