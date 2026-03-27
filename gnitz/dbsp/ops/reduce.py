@@ -280,7 +280,15 @@ def _argsort_delta(batch, schema, col_indices):
         ci = col_indices[0]
         col_type = schema.columns[ci].field_type
         if col_type.code == types.TYPE_I64.code:
-            col_base = batch.col_bufs[ci].base_ptr
+            from gnitz.storage import engine_ffi
+
+            payload_col = ci if ci < schema.pk_index else ci - 1
+            col_base = engine_ffi._batch_col_ptr(
+                batch._handle,
+                rffi.cast(rffi.UINT, 0),
+                rffi.cast(rffi.UINT, payload_col),
+                rffi.cast(rffi.UINT, 8),
+            )
             keys = newlist_hint(count)
             for i in range(count):
                 ptr = rffi.ptradd(col_base, i * 8)

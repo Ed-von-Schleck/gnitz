@@ -106,27 +106,16 @@ def wire_fk_constraints_for_family(family, registry):
 
 def _build_pk_check_batch(schema, lo_list, hi_list):
     """Build a batch containing the given PK (lo,hi) pairs, columns zeroed."""
+    from gnitz.core.batch import RowBuilder
+
     n = len(lo_list)
     batch = ArenaZSetBatch(schema, initial_capacity=max(n, 1))
-    num_cols = len(schema.columns)
+    builder = RowBuilder(schema, batch)
     for k in range(n):
-        batch.pk_lo_buf.put_u64(lo_list[k])
-        batch.pk_hi_buf.put_u64(hi_list[k])
-        batch.weight_buf.put_i64(r_int64(1))
-        # Payload columns are intentionally null-masked. This batch is PK-only:
-        # only pk_lo_buf / pk_hi_buf matter for has_pk() checks. All null bits are
-        # set so that accidental column reads return NULL instead of garbage bytes.
-        batch.null_buf.put_u64(r_uint64(0xFFFFFFFFFFFFFFFF))
-        for ci in range(num_cols):
-            if ci == schema.pk_index:
-                continue
-            stride = schema.columns[ci].field_type.size
-            dest = batch.col_bufs[ci].alloc(
-                stride, alignment=schema.columns[ci].field_type.alignment
-            )
-            for b in range(stride):
-                dest[b] = "\x00"
-        batch._count += 1
+        builder.begin(lo_list[k], hi_list[k], r_int64(1))
+        for pi in range(schema.n_payload):
+            builder.put_null()
+        builder.commit()
     return batch
 
 

@@ -2270,7 +2270,7 @@ def test_consolidated_flag_basics():
         # to_consolidated() should short-circuit and return self
         result = b.to_consolidated()
         assert_true(result is b, "to_consolidated() on consolidated batch should return self")
-        assert_equal_i(3, result._count, "count unchanged after short-circuit")
+        assert_equal_i(3, result.length(), "count unchanged after short-circuit")
 
     finally:
         b.free()
@@ -2288,7 +2288,7 @@ def test_consolidated_short_circuit_empty():
     try:
         result = b.to_consolidated()
         assert_true(result is b, "Empty batch: to_consolidated() should return self")
-        assert_equal_i(0, result._count, "Empty batch count should be 0")
+        assert_equal_i(0, result.length(), "Empty batch count should be 0")
     finally:
         b.free()
     log("  PASSED")
@@ -2329,7 +2329,7 @@ def test_consolidated_propagation_filter(base_dir):
         filter_func = functions.UniversalPredicate(1, functions.OP_GT, r_uint64(10))
         linear.op_filter(b_in, b_out2, filter_func)
         assert_true(b_out2._consolidated, "Filter subset: output should be consolidated")
-        assert_equal_i(2, b_out2._count, "Filter should keep 2 rows (val>10)")
+        assert_equal_i(2, b_out2.length(), "Filter should keep 2 rows (val>10)")
 
         # Case 3: sorted-but-not-consolidated input — _consolidated should stay False
         b_sorted = batch.ArenaZSetBatch(schema)
@@ -2377,7 +2377,7 @@ def test_consolidated_propagation_negate():
 
         linear.op_negate(b_in, b_out)
         assert_true(b_out._consolidated, "Negate of consolidated: output should be consolidated")
-        assert_equal_i(2, b_out._count, "Negate should preserve row count")
+        assert_equal_i(2, b_out.length(), "Negate should preserve row count")
         assert_equal_i64(r_int64(-3), b_out.get_weight(0), "Negate: weight should be flipped")
 
     finally:
@@ -2419,7 +2419,7 @@ def test_scan_trace_marks_consolidated(base_dir):
         cursor.close()
 
         assert_true(b_out._consolidated, "scan_trace should mark output consolidated")
-        assert_equal_i(3, b_out._count, "scan_trace should emit 3 rows")
+        assert_equal_i(3, b_out.length(), "scan_trace should emit 3 rows")
 
     finally:
         b_in.free()
@@ -2456,7 +2456,7 @@ def test_distinct_marks_consolidated(base_dir):
         cursor.close()
 
         assert_true(b_out._consolidated, "op_distinct should mark output consolidated")
-        assert_equal_i(2, b_out._count, "distinct should emit 2 rows")
+        assert_equal_i(2, b_out.length(), "distinct should emit 2 rows")
 
     finally:
         b_in.free()

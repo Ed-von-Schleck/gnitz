@@ -3,15 +3,13 @@
 # WAL block encode/decode backed by Rust (libgnitz_engine).
 
 from rpython.rlib.rarithmetic import r_uint64, intmask
-from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch
-from gnitz.storage import buffer as buffer_ops, engine_ffi
+from gnitz.storage import engine_ffi
 
 # Maximum regions per WAL block (4 system + columns + blob).
-# 128 is generous — supports schemas with up to ~120 columns.
 MAX_REGIONS = 128
 
 
@@ -34,53 +32,28 @@ class WALColumnarBlock(object):
 
 
 def gather_batch_regions(schema, batch):
-    """Allocate C arrays of region pointers/sizes from batch SoA buffers.
+    """Allocate C arrays of region pointers/sizes from batch handle.
 
     Returns (region_ptrs, region_sizes, num_regions, blob_size).
     Caller MUST free region_ptrs and region_sizes via lltype.free(..., flavor="raw").
     """
-    count = batch.length()
-    num_cols = len(schema.columns)
-
-    num_non_pk = 0
-    for i in range(num_cols):
-        if i != schema.pk_index:
-            num_non_pk += 1
-    num_regions = 4 + num_non_pk + 1
+    num_regions = intmask(engine_ffi._batch_num_regions(batch._handle))
 
     region_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_regions, flavor="raw")
     region_sizes = lltype.malloc(rffi.UINTP.TO, num_regions, flavor="raw")
 
-    ri = 0
-    # pk_lo
-    region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.pk_lo_buf.base_ptr)
-    region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
-    ri += 1
-    # pk_hi
-    region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.pk_hi_buf.base_ptr)
-    region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
-    ri += 1
-    # weight
-    region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.weight_buf.base_ptr)
-    region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
-    ri += 1
-    # null
-    region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.null_buf.base_ptr)
-    region_sizes[ri] = rffi.cast(rffi.UINT, count * 8)
-    ri += 1
-    # non-PK columns
-    for ci in range(num_cols):
-        if ci == schema.pk_index:
-            continue
-        col_sz = count * batch.col_strides[ci]
-        region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.col_bufs[ci].base_ptr)
-        region_sizes[ri] = rffi.cast(rffi.UINT, col_sz)
-        ri += 1
-    # blob arena
-    blob_size = batch.blob_arena.offset
-    region_ptrs[ri] = rffi.cast(rffi.VOIDP, batch.blob_arena.base_ptr)
-    region_sizes[ri] = rffi.cast(rffi.UINT, blob_size)
+    for i in range(num_regions):
+        region_ptrs[i] = rffi.cast(
+            rffi.VOIDP,
+            engine_ffi._batch_region_ptr(batch._handle, rffi.cast(rffi.UINT, i)),
+        )
+        region_sizes[i] = rffi.cast(
+            rffi.UINT,
+            engine_ffi._batch_region_size(batch._handle, rffi.cast(rffi.UINT, i)),
+        )
 
+    # Blob is the last region
+    blob_size = intmask(region_sizes[num_regions - 1])
     return region_ptrs, region_sizes, num_regions, blob_size
 
 
@@ -90,11 +63,10 @@ def encode_batch_append(block_buf, schema, lsn, table_id, batch):
         schema, batch
     )
     try:
-        # Compute exact block size from actual region sizes
-        needed = 48 + num_regions * 8  # header + directory
+        needed = 48 + num_regions * 8
         ri2 = 0
         while ri2 < num_regions:
-            needed = (needed + 7) & ~7  # 8-byte alignment
+            needed = (needed + 7) & ~7
             needed += intmask(region_sizes[ri2])
             ri2 += 1
         block_buf.ensure_capacity(needed)
@@ -127,8 +99,7 @@ def encode_batch_to_buffer(block_buf, schema, lsn, table_id, batch):
 
 
 def _parse_wal_block(ptr, total_size, schema):
-    """Non-owning parse. ptr must remain valid while the returned batch is in use.
-    Returns (batch, lsn, tid). Raises CorruptShardError on bad version/checksum."""
+    """Non-owning parse. ptr must remain valid while the returned batch is in use."""
     num_cols = len(schema.columns)
     num_non_pk = 0
     for i in range(num_cols):
@@ -136,7 +107,6 @@ def _parse_wal_block(ptr, total_size, schema):
             num_non_pk += 1
     max_regions = 4 + num_non_pk + 1
 
-    # Allocate output arrays for header fields and directory
     out_lsn = lltype.malloc(rffi.ULONGLONGP.TO, 1, flavor="raw")
     out_tid = lltype.malloc(rffi.UINTP.TO, 1, flavor="raw")
     out_count = lltype.malloc(rffi.UINTP.TO, 1, flavor="raw")
@@ -167,59 +137,22 @@ def _parse_wal_block(ptr, total_size, schema):
         count = intmask(out_count[0])
         num_regions = intmask(out_num_regions[0])
 
-        # Reconstruct batch from region offsets (same as before but using Rust-parsed directory)
-        region_idx = 0
+        region_ptrs = lltype.malloc(rffi.VOIDPP.TO, num_regions, flavor="raw")
+        region_sizes = lltype.malloc(rffi.UINTP.TO, num_regions, flavor="raw")
+        for ri in range(num_regions):
+            region_ptrs[ri] = rffi.cast(
+                rffi.VOIDP, rffi.ptradd(ptr, intmask(out_offsets[ri]))
+            )
+            region_sizes[ri] = out_sizes[ri]
+        try:
+            result_batch = ArenaZSetBatch.from_regions(
+                schema, region_ptrs, region_sizes, count, num_regions,
+                is_sorted=False,
+            )
+        finally:
+            lltype.free(region_ptrs, flavor="raw")
+            lltype.free(region_sizes, flavor="raw")
 
-        pk_lo_buf = buffer_ops.Buffer.from_existing_data(
-            rffi.ptradd(ptr, intmask(out_offsets[region_idx])),
-            intmask(out_sizes[region_idx]),
-        )
-        region_idx += 1
-
-        pk_hi_buf = buffer_ops.Buffer.from_existing_data(
-            rffi.ptradd(ptr, intmask(out_offsets[region_idx])),
-            intmask(out_sizes[region_idx]),
-        )
-        region_idx += 1
-
-        weight_buf = buffer_ops.Buffer.from_existing_data(
-            rffi.ptradd(ptr, intmask(out_offsets[region_idx])),
-            intmask(out_sizes[region_idx]),
-        )
-        region_idx += 1
-
-        null_buf = buffer_ops.Buffer.from_existing_data(
-            rffi.ptradd(ptr, intmask(out_offsets[region_idx])),
-            intmask(out_sizes[region_idx]),
-        )
-        region_idx += 1
-
-        col_bufs = newlist_hint(num_cols)
-        col_strides = newlist_hint(num_cols)
-        for ci in range(num_cols):
-            if ci == schema.pk_index:
-                col_bufs.append(buffer_ops.Buffer(0, is_owned=True))
-                col_strides.append(0)
-            else:
-                stride = schema.columns[ci].field_type.size
-                col_bufs.append(
-                    buffer_ops.Buffer.from_existing_data(
-                        rffi.ptradd(ptr, intmask(out_offsets[region_idx])),
-                        intmask(out_sizes[region_idx]),
-                    )
-                )
-                col_strides.append(stride)
-                region_idx += 1
-
-        blob_buf = buffer_ops.Buffer.from_existing_data(
-            rffi.ptradd(ptr, intmask(out_offsets[region_idx])),
-            intmask(out_sizes[region_idx]),
-        )
-
-        result_batch = ArenaZSetBatch.from_buffers(
-            schema, pk_lo_buf, pk_hi_buf, weight_buf, null_buf,
-            col_bufs, col_strides, blob_buf, count, is_sorted=False,
-        )
         return result_batch, lsn, tid
     finally:
         lltype.free(out_lsn, flavor="raw")
@@ -232,14 +165,10 @@ def _parse_wal_block(ptr, total_size, schema):
 
 
 def decode_batch_from_buffer(buf, total_size, schema):
-    """Decodes a columnar WAL block from a raw buffer into a WALColumnarBlock.
-    The returned block owns the raw buffer; call block.free() when done."""
     result_batch, lsn, tid = _parse_wal_block(buf, total_size, schema)
     return WALColumnarBlock(lsn, tid, result_batch, raw_buf=buf)
 
 
 def decode_batch_from_ptr(ptr, total_size, schema):
-    """Non-owning decode. ptr must remain valid while the batch is in use.
-    Caller owns the memory; batch Buffers do NOT free the regions."""
     result_batch, _lsn, _tid = _parse_wal_block(ptr, total_size, schema)
     return result_batch

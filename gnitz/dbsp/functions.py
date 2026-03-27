@@ -133,7 +133,7 @@ class UniversalProjection(ScalarFunction):
 
     @jit.unroll_safe
     def evaluate_map_batch(self, in_batch, out_batch, out_schema):
-        from gnitz.storage import buffer as buf_mod
+        from gnitz.storage import engine_ffi, buffer as buf_mod
 
         n = in_batch.length()
         if n == 0:
@@ -141,40 +141,63 @@ class UniversalProjection(ScalarFunction):
 
         in_schema = in_batch._schema
 
-        # Structural columns — bulk memcpy
-        out_batch.pk_lo_buf.append_from_buffer(in_batch.pk_lo_buf, 0, n * 8)
-        out_batch.pk_hi_buf.append_from_buffer(in_batch.pk_hi_buf, 0, n * 8)
-        out_batch.weight_buf.append_from_buffer(in_batch.weight_buf, 0, n * 8)
+        # Allocate system columns (pk_lo, pk_hi, weight, null) in output
+        engine_ffi._batch_alloc_system(out_batch._handle, rffi.cast(rffi.UINT, n))
+        out_count = out_batch.length()
+        sys_off = (out_count - n) * 8
+
+        # Copy pk_lo, pk_hi, weight from input
+        for ri in range(3):  # 0=pk_lo, 1=pk_hi, 2=weight
+            src_ptr = engine_ffi._batch_region_ptr(
+                in_batch._handle, rffi.cast(rffi.UINT, ri))
+            dst_ptr = engine_ffi._batch_region_ptr(
+                out_batch._handle, rffi.cast(rffi.UINT, ri))
+            buf_mod.c_memmove(
+                rffi.cast(rffi.VOIDP, rffi.ptradd(dst_ptr, sys_off)),
+                rffi.cast(rffi.VOIDP, src_ptr),
+                rffi.cast(rffi.SIZE_T, n * 8),
+            )
 
         # Payload columns — per-column memcpy or string relocation
         for i in range(len(self.src_indices)):
             src_ci = self.src_indices[i]
-            out_ci = i if i < out_schema.pk_index else i + 1
+            out_pi = i  # output payload index
             tc = self.src_types[i]
 
             if src_ci == in_schema.pk_index:
-                # PK value lives in pk_lo_buf, not col_bufs
-                stride = out_batch.col_strides[out_ci]
-                col_type = out_schema.columns[out_ci].field_type
-                dest_base = out_batch.col_bufs[out_ci].alloc_n(
-                    n, stride, col_type.alignment)
+                stride = out_schema.columns[
+                    out_pi if out_pi < out_schema.pk_index else out_pi + 1
+                ].field_type.size
+                dest_base = engine_ffi._batch_col_extend(
+                    out_batch._handle,
+                    rffi.cast(rffi.UINT, out_pi),
+                    rffi.cast(rffi.UINT, n * stride),
+                )
                 dest_arr = rffi.cast(rffi.ULONGLONGP, dest_base)
                 for row in range(n):
                     dest_arr[row] = rffi.cast(
                         rffi.ULONGLONG, in_batch._read_pk_lo(row))
             elif tc == types.TYPE_STRING.code:
-                stride = in_batch.col_strides[src_ci]
-                col_type = out_schema.columns[out_ci].field_type
+                in_pi = src_ci if src_ci < in_schema.pk_index else src_ci - 1
+                stride = in_schema.columns[src_ci].field_type.size
                 n_bytes = n * stride
-                dest_block = out_batch.col_bufs[out_ci].alloc(
-                    n_bytes, alignment=col_type.alignment)
-                src_block = in_batch.col_bufs[src_ci].base_ptr
+                dest_block = engine_ffi._batch_col_extend(
+                    out_batch._handle,
+                    rffi.cast(rffi.UINT, out_pi),
+                    rffi.cast(rffi.UINT, n_bytes),
+                )
+                src_block = engine_ffi._batch_col_ptr(
+                    in_batch._handle,
+                    rffi.cast(rffi.UINT, 0),
+                    rffi.cast(rffi.UINT, in_pi),
+                    rffi.cast(rffi.UINT, stride),
+                )
                 buf_mod.c_memmove(
                     rffi.cast(rffi.VOIDP, dest_block),
                     rffi.cast(rffi.VOIDP, src_block),
                     rffi.cast(rffi.SIZE_T, n_bytes),
                 )
-                src_blob_base = in_batch.blob_arena.base_ptr
+                src_blob_base = engine_ffi._batch_blob_ptr(in_batch._handle)
                 for row in range(n):
                     src_ptr = rffi.ptradd(src_block, row * stride)
                     length = rffi.cast(
@@ -186,21 +209,49 @@ class UniversalProjection(ScalarFunction):
                         src_data_ptr = rffi.ptradd(
                             src_blob_base,
                             rffi.cast(lltype.Signed, old_offset))
-                        new_offset = out_batch.allocator.allocate_from_ptr(
-                            src_data_ptr, length)
+                        new_blob_off = engine_ffi._batch_blob_extend(
+                            out_batch._handle,
+                            rffi.cast(rffi.UINT, length),
+                        )
+                        out_blob_ptr = engine_ffi._batch_blob_ptr(out_batch._handle)
+                        buf_mod.c_memmove(
+                            rffi.cast(rffi.VOIDP, rffi.ptradd(
+                                out_blob_ptr,
+                                rffi.cast(lltype.Signed, new_blob_off))),
+                            rffi.cast(rffi.VOIDP, src_data_ptr),
+                            rffi.cast(rffi.SIZE_T, length),
+                        )
                         rffi.cast(
                             rffi.ULONGLONGP,
                             rffi.ptradd(dest_ptr, 8)
-                        )[0] = rffi.cast(rffi.ULONGLONG, new_offset)
+                        )[0] = rffi.cast(rffi.ULONGLONG, new_blob_off)
             else:
-                # Fixed-width: single memcpy
-                stride = in_batch.col_strides[src_ci]
-                out_batch.col_bufs[out_ci].append_from_buffer(
-                    in_batch.col_bufs[src_ci], 0, n * stride)
+                in_pi = src_ci if src_ci < in_schema.pk_index else src_ci - 1
+                stride = in_schema.columns[src_ci].field_type.size
+                dest_block = engine_ffi._batch_col_extend(
+                    out_batch._handle,
+                    rffi.cast(rffi.UINT, out_pi),
+                    rffi.cast(rffi.UINT, n * stride),
+                )
+                src_block = engine_ffi._batch_col_ptr(
+                    in_batch._handle,
+                    rffi.cast(rffi.UINT, 0),
+                    rffi.cast(rffi.UINT, in_pi),
+                    rffi.cast(rffi.UINT, stride),
+                )
+                buf_mod.c_memmove(
+                    rffi.cast(rffi.VOIDP, dest_block),
+                    rffi.cast(rffi.VOIDP, src_block),
+                    rffi.cast(rffi.SIZE_T, n * stride),
+                )
 
         # Null bitmap — per-row bit shuffling
-        null_base = out_batch.null_buf.alloc_n(n, 8, 8)
-        null_arr = rffi.cast(rffi.ULONGLONGP, null_base)
+        null_dst = rffi.ptradd(
+            engine_ffi._batch_region_ptr(
+                out_batch._handle, rffi.cast(rffi.UINT, 3)),
+            sys_off,
+        )
+        null_arr = rffi.cast(rffi.ULONGLONGP, null_dst)
         for row in range(n):
             in_null = in_batch._read_null_word(row)
             out_null = r_uint64(0)
@@ -212,7 +263,6 @@ class UniversalProjection(ScalarFunction):
                 out_null |= ((in_null >> in_pi) & r_uint64(1)) << i
             null_arr[row] = rffi.cast(rffi.ULONGLONG, out_null)
 
-        out_batch._count += n
         out_batch._invalidate_cache()
         return True
 

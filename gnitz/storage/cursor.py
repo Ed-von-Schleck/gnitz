@@ -286,28 +286,18 @@ class RustUnifiedCursor(AbstractCursor):
             count = snap.length()
             batch_counts[bi] = rffi.cast(rffi.UINT, count)
             bi += 1
-            batch_ptrs[idx] = rffi.cast(rffi.VOIDP, snap.pk_lo_buf.base_ptr)
-            batch_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
-            idx += 1
-            batch_ptrs[idx] = rffi.cast(rffi.VOIDP, snap.pk_hi_buf.base_ptr)
-            batch_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
-            idx += 1
-            batch_ptrs[idx] = rffi.cast(rffi.VOIDP, snap.weight_buf.base_ptr)
-            batch_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
-            idx += 1
-            batch_ptrs[idx] = rffi.cast(rffi.VOIDP, snap.null_buf.base_ptr)
-            batch_sizes[idx] = rffi.cast(rffi.UINT, count * 8)
-            idx += 1
-            for ci in range(num_cols):
-                if ci == pk_index:
-                    continue
-                col_sz = count * snap.col_strides[ci]
-                batch_ptrs[idx] = rffi.cast(rffi.VOIDP, snap.col_bufs[ci].base_ptr)
-                batch_sizes[idx] = rffi.cast(rffi.UINT, col_sz)
+            for ri in range(regions_per_batch):
+                batch_ptrs[idx] = rffi.cast(
+                    rffi.VOIDP,
+                    engine_ffi._batch_region_ptr(
+                        snap._handle, rffi.cast(rffi.UINT, ri)
+                    ),
+                )
+                batch_sizes[idx] = rffi.cast(
+                    rffi.UINT,
+                    engine_ffi._batch_region_size(snap._handle, rffi.cast(rffi.UINT, ri)),
+                )
                 idx += 1
-            batch_ptrs[idx] = rffi.cast(rffi.VOIDP, snap.blob_arena.base_ptr)
-            batch_sizes[idx] = rffi.cast(rffi.UINT, snap.blob_arena.offset)
-            idx += 1
 
         # Pack shard handles
         num_shards = len(shard_views)

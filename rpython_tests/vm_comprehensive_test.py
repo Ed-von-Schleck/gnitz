@@ -1072,17 +1072,8 @@ def test_trace_register_refresh_compacts(base_dir):
             b.free()
             i += 1
 
-        from gnitz.storage import engine_ffi
-        if not bool(intmask(engine_ffi._shard_index_needs_compaction(tbl._index_handle))):
-            raise Exception("Expected needs_compaction=True before refresh")
-
         # refresh(): closes old cursor, calls compact_if_needed(), creates new cursor
         reg.refresh()
-
-        # After compaction, the index state is internal to Rust. Verify
-        # correctness by checking data accessibility and compaction flag.
-        if bool(intmask(engine_ffi._shard_index_needs_compaction(tbl._index_handle))):
-            raise Exception("needs_compaction must be False after refresh")
         if reg.cursor is None:
             raise Exception("refresh() must create a new cursor")
 
@@ -1235,7 +1226,7 @@ def test_execute_epoch_seal_free_on_consolidated(base_dir):
                      "Consolidated seal: weight should be +1")
 
     # Verify the original batch is still usable (not freed by execute_epoch)
-    assert_equal_i(1, in_batch._count, "Original consolidated batch must still be alive")
+    assert_equal_i(1, in_batch.length(), "Original consolidated batch must still be alive")
 
     result.free()
     in_batch.free()

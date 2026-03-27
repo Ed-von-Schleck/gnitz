@@ -722,7 +722,7 @@ class ExprMapFunction(ScalarFunction):
     def evaluate_map_batch(self, in_batch, out_batch, out_schema):
         from gnitz.core import types as _types
         from gnitz.core import strings as _strings
-        from gnitz.storage import buffer as _buf
+        from gnitz.storage import engine_ffi, buffer as _buf
         from rpython.rtyper.lltypesystem import lltype
 
         n = in_batch.length()
@@ -731,10 +731,21 @@ class ExprMapFunction(ScalarFunction):
 
         in_schema = in_batch._schema
 
-        # Phase 1: structural columns — bulk memcpy
-        out_batch.pk_lo_buf.append_from_buffer(in_batch.pk_lo_buf, 0, n * 8)
-        out_batch.pk_hi_buf.append_from_buffer(in_batch.pk_hi_buf, 0, n * 8)
-        out_batch.weight_buf.append_from_buffer(in_batch.weight_buf, 0, n * 8)
+        # Phase 1: allocate system columns and bulk memcpy pk_lo, pk_hi, weight
+        engine_ffi._batch_alloc_system(out_batch._handle, rffi.cast(rffi.UINT, n))
+        out_count = out_batch.length()
+        sys_off = (out_count - n) * 8
+
+        for ri in range(3):  # 0=pk_lo, 1=pk_hi, 2=weight
+            src_ptr = engine_ffi._batch_region_ptr(
+                in_batch._handle, rffi.cast(rffi.UINT, ri))
+            dst_ptr = engine_ffi._batch_region_ptr(
+                out_batch._handle, rffi.cast(rffi.UINT, ri))
+            _buf.c_memmove(
+                rffi.cast(rffi.VOIDP, rffi.ptradd(dst_ptr, sys_off)),
+                rffi.cast(rffi.VOIDP, src_ptr),
+                rffi.cast(rffi.SIZE_T, n * 8),
+            )
 
         # Phase 2: batch-level COPY_COL columns
         copy_src = self._copy_src_cols
@@ -745,30 +756,41 @@ class ExprMapFunction(ScalarFunction):
             src_ci = copy_src[k]
             out_payload = copy_out[k]
             tc = copy_tc[k]
-            out_ci = out_payload if out_payload < out_schema.pk_index else out_payload + 1
 
             if src_ci == in_schema.pk_index:
-                stride = out_batch.col_strides[out_ci]
-                col_type = out_schema.columns[out_ci].field_type
-                dest_base = out_batch.col_bufs[out_ci].alloc_n(
-                    n, stride, col_type.alignment)
+                stride = out_schema.columns[
+                    out_payload if out_payload < out_schema.pk_index else out_payload + 1
+                ].field_type.size
+                dest_base = engine_ffi._batch_col_extend(
+                    out_batch._handle,
+                    rffi.cast(rffi.UINT, out_payload),
+                    rffi.cast(rffi.UINT, n * stride),
+                )
                 dest_arr = rffi.cast(rffi.ULONGLONGP, dest_base)
                 for row in range(n):
                     dest_arr[row] = rffi.cast(
                         rffi.ULONGLONG, in_batch._read_pk_lo(row))
             elif tc == _types.TYPE_STRING.code:
-                stride = in_batch.col_strides[src_ci]
-                col_type = out_schema.columns[out_ci].field_type
+                in_pi = src_ci if src_ci < in_schema.pk_index else src_ci - 1
+                stride = in_schema.columns[src_ci].field_type.size
                 n_bytes = n * stride
-                dest_block = out_batch.col_bufs[out_ci].alloc(
-                    n_bytes, alignment=col_type.alignment)
-                src_block = in_batch.col_bufs[src_ci].base_ptr
+                dest_block = engine_ffi._batch_col_extend(
+                    out_batch._handle,
+                    rffi.cast(rffi.UINT, out_payload),
+                    rffi.cast(rffi.UINT, n_bytes),
+                )
+                src_block = engine_ffi._batch_col_ptr(
+                    in_batch._handle,
+                    rffi.cast(rffi.UINT, 0),
+                    rffi.cast(rffi.UINT, in_pi),
+                    rffi.cast(rffi.UINT, stride),
+                )
                 _buf.c_memmove(
                     rffi.cast(rffi.VOIDP, dest_block),
                     rffi.cast(rffi.VOIDP, src_block),
                     rffi.cast(rffi.SIZE_T, n_bytes),
                 )
-                src_blob_base = in_batch.blob_arena.base_ptr
+                src_blob_base = engine_ffi._batch_blob_ptr(in_batch._handle)
                 for row in range(n):
                     src_ptr = rffi.ptradd(src_block, row * stride)
                     length = rffi.cast(
@@ -780,26 +802,54 @@ class ExprMapFunction(ScalarFunction):
                         src_data_ptr = rffi.ptradd(
                             src_blob_base,
                             rffi.cast(lltype.Signed, old_offset))
-                        new_offset = out_batch.allocator.allocate_from_ptr(
-                            src_data_ptr, length)
+                        new_blob_off = engine_ffi._batch_blob_extend(
+                            out_batch._handle,
+                            rffi.cast(rffi.UINT, length),
+                        )
+                        out_blob_ptr = engine_ffi._batch_blob_ptr(out_batch._handle)
+                        _buf.c_memmove(
+                            rffi.cast(rffi.VOIDP, rffi.ptradd(
+                                out_blob_ptr,
+                                rffi.cast(lltype.Signed, new_blob_off))),
+                            rffi.cast(rffi.VOIDP, src_data_ptr),
+                            rffi.cast(rffi.SIZE_T, length),
+                        )
                         rffi.cast(
                             rffi.ULONGLONGP,
                             rffi.ptradd(dest_ptr, 8)
-                        )[0] = rffi.cast(rffi.ULONGLONG, new_offset)
+                        )[0] = rffi.cast(rffi.ULONGLONG, new_blob_off)
             else:
-                stride = in_batch.col_strides[src_ci]
-                out_batch.col_bufs[out_ci].append_from_buffer(
-                    in_batch.col_bufs[src_ci], 0, n * stride)
+                in_pi = src_ci if src_ci < in_schema.pk_index else src_ci - 1
+                stride = in_schema.columns[src_ci].field_type.size
+                dest_block = engine_ffi._batch_col_extend(
+                    out_batch._handle,
+                    rffi.cast(rffi.UINT, out_payload),
+                    rffi.cast(rffi.UINT, n * stride),
+                )
+                src_block = engine_ffi._batch_col_ptr(
+                    in_batch._handle,
+                    rffi.cast(rffi.UINT, 0),
+                    rffi.cast(rffi.UINT, in_pi),
+                    rffi.cast(rffi.UINT, stride),
+                )
+                _buf.c_memmove(
+                    rffi.cast(rffi.VOIDP, dest_block),
+                    rffi.cast(rffi.VOIDP, src_block),
+                    rffi.cast(rffi.SIZE_T, n * stride),
+                )
 
         # Phase 3: EMIT_NULL columns — alloc + zero-fill
         null_pls = self._null_payloads
         for k in range(len(null_pls)):
             out_payload = null_pls[k]
-            out_ci = out_payload if out_payload < out_schema.pk_index else out_payload + 1
-            stride = out_batch.col_strides[out_ci]
-            col_type = out_schema.columns[out_ci].field_type
-            dest_base = out_batch.col_bufs[out_ci].alloc_n(
-                n, stride, col_type.alignment)
+            stride = out_schema.columns[
+                out_payload if out_payload < out_schema.pk_index else out_payload + 1
+            ].field_type.size
+            dest_base = engine_ffi._batch_col_extend(
+                out_batch._handle,
+                rffi.cast(rffi.UINT, out_payload),
+                rffi.cast(rffi.UINT, n * stride),
+            )
             _buf.c_memset(
                 rffi.cast(rffi.VOIDP, dest_base),
                 rffi.cast(rffi.INT, 0),
@@ -816,16 +866,23 @@ class ExprMapFunction(ScalarFunction):
         if self._has_compute:
             for k in range(emit_count):
                 out_payload = emit_pls[k]
-                out_ci = out_payload if out_payload < out_schema.pk_index else out_payload + 1
-                stride = out_batch.col_strides[out_ci]
-                col_type = out_schema.columns[out_ci].field_type
-                emit_bases[k] = out_batch.col_bufs[out_ci].alloc_n(
-                    n, stride, col_type.alignment)
+                stride = out_schema.columns[
+                    out_payload if out_payload < out_schema.pk_index else out_payload + 1
+                ].field_type.size
+                emit_bases[k] = engine_ffi._batch_col_extend(
+                    out_batch._handle,
+                    rffi.cast(rffi.UINT, out_payload),
+                    rffi.cast(rffi.UINT, n * stride),
+                )
                 emit_strides[k] = stride
 
-        # Pre-allocate null_buf
-        null_base = out_batch.null_buf.alloc_n(n, 8, 8)
-        null_arr = rffi.cast(rffi.ULONGLONGP, null_base)
+        # Write null bitmap via region 3
+        null_dst = rffi.ptradd(
+            engine_ffi._batch_region_ptr(
+                out_batch._handle, rffi.cast(rffi.UINT, 3)),
+            sys_off,
+        )
+        null_arr = rffi.cast(rffi.ULONGLONGP, null_dst)
 
         # Per-row null bitmap + compute
         for row in range(n):
@@ -853,7 +910,6 @@ class ExprMapFunction(ScalarFunction):
 
             null_arr[row] = rffi.cast(rffi.ULONGLONG, out_null)
 
-        out_batch._count += n
         out_batch._invalidate_cache()
         return True
 
