@@ -18,6 +18,9 @@ pub const ERR_CAPACITY: i32 = -2;
 
 /// Owned columnar batch.  Stores the same SoA layout as RPython's
 /// `ArenaZSetBatch` but in Rust `Vec<u8>` buffers.
+///
+/// Used as the primary FFI batch handle (`gnitz_batch_*`), as well as
+/// internally by MemTable, Table, and PartitionedTable.
 pub struct OwnedBatch {
     pub pk_lo: Vec<u8>,
     pub pk_hi: Vec<u8>,
@@ -26,6 +29,9 @@ pub struct OwnedBatch {
     pub col_data: Vec<Vec<u8>>,
     pub blob: Vec<u8>,
     pub count: usize,
+    pub sorted: bool,
+    pub consolidated: bool,
+    pub schema: Option<SchemaDescriptor>,
 }
 
 impl OwnedBatch {
@@ -39,6 +45,34 @@ impl OwnedBatch {
             col_data: (0..num_payload_cols).map(|_| Vec::new()).collect(),
             blob: Vec::new(),
             count: 0,
+            sorted: true,
+            consolidated: true,
+            schema: None,
+        }
+    }
+
+    /// Create an empty batch with schema for append operations.
+    pub fn with_schema(schema: SchemaDescriptor, initial_capacity: usize) -> Self {
+        let npc = schema.num_columns as usize - 1;
+        let pk_index = schema.pk_index as usize;
+        let cap = initial_capacity.max(1);
+        let mut col_data = Vec::with_capacity(npc);
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index { continue; }
+            let cs = schema.columns[ci].size as usize;
+            col_data.push(Vec::with_capacity(cap * cs));
+        }
+        OwnedBatch {
+            pk_lo: Vec::with_capacity(cap * 8),
+            pk_hi: Vec::with_capacity(cap * 8),
+            weight: Vec::with_capacity(cap * 8),
+            null_bmp: Vec::with_capacity(cap * 8),
+            col_data,
+            blob: Vec::with_capacity(64),
+            count: 0,
+            sorted: true,
+            consolidated: true,
+            schema: Some(schema),
         }
     }
 
@@ -89,6 +123,9 @@ impl OwnedBatch {
             col_data,
             blob,
             count,
+            sorted: false,
+            consolidated: false,
+            schema: None,
         }
     }
 
@@ -179,6 +216,132 @@ impl OwnedBatch {
     }
 
     /// Build the region pointer/size pairs used by `build_shard_image`.
+    /// Bulk-copy rows [start, end) from another OwnedBatch (same schema).
+    pub fn append_batch(&mut self, src: &OwnedBatch, start: usize, end: usize) {
+        let end = if end > src.count { src.count } else { end };
+        if start >= end { return; }
+        self.append_rows_inner(src, start, end, false);
+    }
+
+    /// Bulk-copy rows with negated weights.
+    pub fn append_batch_negated(&mut self, src: &OwnedBatch, start: usize, end: usize) {
+        let end = if end > src.count { src.count } else { end };
+        if start >= end { return; }
+        self.append_rows_inner(src, start, end, true);
+    }
+
+    fn append_rows_inner(&mut self, src: &OwnedBatch, start: usize, end: usize, negate: bool) {
+        let n = end - start;
+        self.pk_lo.extend_from_slice(&src.pk_lo[start * 8..end * 8]);
+        self.pk_hi.extend_from_slice(&src.pk_hi[start * 8..end * 8]);
+        if negate {
+            for i in start..end {
+                self.weight.extend_from_slice(&(-src.get_weight(i)).to_le_bytes());
+            }
+        } else {
+            self.weight.extend_from_slice(&src.weight[start * 8..end * 8]);
+        }
+        self.null_bmp.extend_from_slice(&src.null_bmp[start * 8..end * 8]);
+
+        // Payload columns: per-column bulk copy with string blob relocation
+        let has_schema = self.schema.is_some();
+        let schema_copy = self.schema;
+        let pk_index = schema_copy.map_or(usize::MAX, |s| s.pk_index as usize);
+
+        let mut pi = 0;
+        let num_cols = schema_copy.map_or(self.col_data.len(), |s| s.num_columns as usize);
+        for ci in 0..num_cols {
+            if ci == pk_index { continue; }
+            let is_string = has_schema
+                && schema_copy.unwrap().columns[ci].type_code == crate::compact::type_code::STRING;
+            let cs = if has_schema {
+                schema_copy.unwrap().columns[ci].size as usize
+            } else if src.count > 0 {
+                src.col_data[pi].len() / src.count
+            } else {
+                0
+            };
+
+            if is_string && cs == 16 {
+                // String column: per-row struct copy with blob relocation
+                for row in start..end {
+                    let off = row * 16;
+                    let src_struct = &src.col_data[pi][off..off + 16];
+                    let length = u32::from_le_bytes(src_struct[0..4].try_into().unwrap()) as usize;
+                    let mut dest = [0u8; 16];
+                    dest[0..8].copy_from_slice(&src_struct[0..8]);
+
+                    if length <= crate::compact::SHORT_STRING_THRESHOLD {
+                        let sfx = if length > 4 { length - 4 } else { 0 };
+                        if sfx > 0 {
+                            dest[8..8 + sfx].copy_from_slice(&src_struct[8..8 + sfx]);
+                        }
+                    } else {
+                        let old_off = u64::from_le_bytes(src_struct[8..16].try_into().unwrap()) as usize;
+                        let str_data = &src.blob[old_off..old_off + length];
+                        let new_off = self.blob.len();
+                        self.blob.extend_from_slice(str_data);
+                        dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
+                    }
+                    self.col_data[pi].extend_from_slice(&dest);
+                }
+            } else if cs > 0 {
+                self.col_data[pi].extend_from_slice(&src.col_data[pi][start * cs..end * cs]);
+            }
+            pi += 1;
+            if pi >= self.col_data.len() { break; }
+        }
+
+        self.count += n;
+        self.sorted = false;
+        self.consolidated = false;
+    }
+
+    /// Reset to empty without freeing buffer allocations.
+    pub fn clear(&mut self) {
+        self.pk_lo.clear();
+        self.pk_hi.clear();
+        self.weight.clear();
+        self.null_bmp.clear();
+        for col in &mut self.col_data {
+            col.clear();
+        }
+        self.blob.clear();
+        self.count = 0;
+        self.sorted = true;
+        self.consolidated = true;
+    }
+
+    /// Number of regions in the standard layout.
+    pub fn num_regions(&self) -> usize {
+        4 + self.col_data.len() + 1
+    }
+
+    /// Get region pointer by index. Order: pk_lo(0), pk_hi(1), weight(2),
+    /// null(3), payload cols(4..), blob(last).
+    pub fn region_ptr(&self, idx: usize) -> *const u8 {
+        match idx {
+            0 => self.pk_lo.as_ptr(),
+            1 => self.pk_hi.as_ptr(),
+            2 => self.weight.as_ptr(),
+            3 => self.null_bmp.as_ptr(),
+            i if i < 4 + self.col_data.len() => self.col_data[i - 4].as_ptr(),
+            _ => self.blob.as_ptr(), // last = blob
+        }
+    }
+
+    /// Get region size by index.
+    pub fn region_size(&self, idx: usize) -> usize {
+        match idx {
+            0 => self.pk_lo.len(),
+            1 => self.pk_hi.len(),
+            2 => self.weight.len(),
+            3 => self.null_bmp.len(),
+            i if i < 4 + self.col_data.len() => self.col_data[i - 4].len(),
+            _ => self.blob.len(),
+        }
+    }
+
     pub fn regions(&self) -> Vec<(*const u8, usize)> {
         let mut r = vec![
             (self.pk_lo.as_ptr(), self.pk_lo.len()),
@@ -211,7 +374,7 @@ impl ColumnarSource for OwnedBatch {
 
 /// Allocate output buffers, run a merge/copy operation via DirectWriter,
 /// truncate to actual size, and return the result as an OwnedBatch.
-fn write_to_owned_batch(
+pub fn write_to_owned_batch(
     schema: &SchemaDescriptor,
     max_rows: usize,
     max_blob: usize,
@@ -269,6 +432,9 @@ fn write_to_owned_batch(
         col_data: out_cols,
         blob: out_blob,
         count: actual_rows,
+        sorted: false,
+        consolidated: false,
+        schema: None,
     }
 }
 
@@ -585,6 +751,9 @@ mod tests {
             col_data: vec![col0],
             blob: Vec::new(),
             count: n,
+            sorted: true,
+            consolidated: false,
+            schema: Some(*schema),
         }
     }
 
@@ -800,5 +969,63 @@ mod tests {
         let rc = mt.flush(dirfd, &name, 42, false);
         assert_eq!(rc, -1);
         unsafe { libc::close(dirfd); }
+    }
+
+    #[test]
+    fn batch_append_batch() {
+        let schema = make_u64_i64_schema();
+        let src = make_batch(&schema, &[(10, 1, 100), (20, 1, 200), (30, 1, 300)]);
+        let mut dst = OwnedBatch::with_schema(schema, 8);
+
+        // Append all rows
+        dst.append_batch(&src, 0, 3);
+        assert_eq!(dst.count, 3);
+        assert_eq!(dst.get_pk_lo(0), 10);
+        assert_eq!(dst.get_pk_lo(2), 30);
+        assert_eq!(dst.get_weight(1), 1);
+
+        // Append subset
+        dst.clear();
+        dst.append_batch(&src, 1, 2);
+        assert_eq!(dst.count, 1);
+        assert_eq!(dst.get_pk_lo(0), 20);
+    }
+
+    #[test]
+    fn batch_append_batch_negated() {
+        let schema = make_u64_i64_schema();
+        let src = make_batch(&schema, &[(10, 1, 100), (20, 2, 200)]);
+        let mut dst = OwnedBatch::with_schema(schema, 8);
+
+        dst.append_batch_negated(&src, 0, 2);
+        assert_eq!(dst.count, 2);
+        assert_eq!(dst.get_weight(0), -1);
+        assert_eq!(dst.get_weight(1), -2);
+        assert_eq!(dst.get_pk_lo(0), 10);
+    }
+
+    #[test]
+    fn batch_region_access() {
+        let schema = make_u64_i64_schema();
+        let batch = make_batch(&schema, &[(10, 1, 100)]);
+
+        // Schema has 2 columns: PK (U64) + payload (I64)
+        // Regions: pk_lo(0), pk_hi(1), weight(2), null(3), col0(4), blob(5)
+        assert_eq!(batch.num_regions(), 6);
+        assert_eq!(batch.region_size(0), 8); // pk_lo: 1 row * 8 bytes
+        assert_eq!(batch.region_size(4), 8); // col0: 1 row * 8 bytes
+        assert!(!batch.region_ptr(0).is_null());
+    }
+
+    #[test]
+    fn batch_clear() {
+        let schema = make_u64_i64_schema();
+        let mut batch = make_batch(&schema, &[(10, 1, 100)]);
+        assert_eq!(batch.count, 1);
+
+        batch.clear();
+        assert_eq!(batch.count, 0);
+        assert!(batch.sorted);
+        assert!(batch.consolidated);
     }
 }

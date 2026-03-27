@@ -1706,6 +1706,329 @@ pub extern "C" fn gnitz_read_cursor_create_from_snapshots(
 }
 
 // ---------------------------------------------------------------------------
+// Batch (OwnedBatch as first-class FFI handle)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_create(
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    initial_capacity: u32,
+) -> *mut libc::c_void {
+    let result = panic::catch_unwind(|| {
+        if schema_desc.is_null() { return ptr::null_mut(); }
+        let schema = unsafe { *schema_desc };
+        let b = crate::memtable::OwnedBatch::with_schema(schema, initial_capacity as usize);
+        Box::into_raw(Box::new(b)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_free(handle: *mut libc::c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        unsafe { let _ = Box::from_raw(handle as *mut crate::memtable::OwnedBatch); }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_length(handle: *const libc::c_void) -> u32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.count as u32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_is_sorted(handle: *const libc::c_void) -> i32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.sorted as i32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_is_consolidated(handle: *const libc::c_void) -> i32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.consolidated as i32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_set_sorted(handle: *mut libc::c_void, val: i32) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        b.sorted = val != 0;
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_set_consolidated(handle: *mut libc::c_void, val: i32) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        b.consolidated = val != 0;
+        if b.consolidated { b.sorted = true; }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_get_pk_lo(handle: *const libc::c_void, row: u32) -> u64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.get_pk_lo(row as usize)
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_get_pk_hi(handle: *const libc::c_void, row: u32) -> u64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.get_pk_hi(row as usize)
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_get_weight(handle: *const libc::c_void, row: u32) -> i64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.get_weight(row as usize)
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_get_null_word(handle: *const libc::c_void, row: u32) -> u64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.get_null_word(row as usize)
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_col_ptr(
+    handle: *const libc::c_void, row: u32, payload_col: u32, col_size: u32,
+) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.get_col_ptr(row as usize, payload_col as usize, col_size as usize).as_ptr()
+    });
+    result.unwrap_or(ptr::null())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_blob_ptr(handle: *const libc::c_void) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.blob.as_ptr()
+    });
+    result.unwrap_or(ptr::null())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_append_batch(
+    handle: *mut libc::c_void, src: *const libc::c_void,
+    start: u32, end: u32,
+) -> i32 {
+    if handle.is_null() || src.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let dst = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let src = unsafe { &*(src as *const crate::memtable::OwnedBatch) };
+        dst.append_batch(src, start as usize, end as usize);
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_append_batch_negated(
+    handle: *mut libc::c_void, src: *const libc::c_void,
+    start: u32, end: u32,
+) -> i32 {
+    if handle.is_null() || src.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let dst = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let src = unsafe { &*(src as *const crate::memtable::OwnedBatch) };
+        dst.append_batch_negated(src, start as usize, end as usize);
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_to_sorted(
+    handle: *const libc::c_void, schema_desc: *const crate::compact::SchemaDescriptor,
+) -> *mut libc::c_void {
+    if handle.is_null() || schema_desc.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let src = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        if src.sorted || src.count <= 1 {
+            return handle as *mut libc::c_void; // return same handle
+        }
+        let schema = unsafe { *schema_desc };
+        let mb = src.as_mem_batch();
+        let sorted = crate::memtable::write_to_owned_batch(&schema, src.count, src.blob.len().max(1), |w| {
+            crate::merge::sort_only(&mb, &schema, w);
+        });
+        let mut sorted = sorted;
+        sorted.sorted = true;
+        sorted.schema = Some(schema);
+        Box::into_raw(Box::new(sorted)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_to_consolidated(
+    handle: *const libc::c_void, schema_desc: *const crate::compact::SchemaDescriptor,
+) -> *mut libc::c_void {
+    if handle.is_null() || schema_desc.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let src = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        if src.consolidated || src.count == 0 {
+            return handle as *mut libc::c_void;
+        }
+        let schema = unsafe { *schema_desc };
+        let mb = src.as_mem_batch();
+        let consolidated = crate::memtable::write_to_owned_batch(&schema, src.count, src.blob.len().max(1), |w| {
+            crate::merge::sort_and_consolidate(&mb, &schema, w);
+        });
+        let mut consolidated = consolidated;
+        consolidated.sorted = true;
+        consolidated.consolidated = true;
+        consolidated.schema = Some(schema);
+        // If output count == input count and was already sorted, return original
+        if consolidated.count == src.count && src.sorted {
+            return handle as *mut libc::c_void;
+        }
+        Box::into_raw(Box::new(consolidated)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_scatter_copy(
+    src: *const libc::c_void,
+    indices: *const u32, num_indices: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+) -> *mut libc::c_void {
+    if src.is_null() || indices.is_null() || schema_desc.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let src_batch = unsafe { &*(src as *const crate::memtable::OwnedBatch) };
+        let schema = unsafe { *schema_desc };
+        let idx = unsafe { slice::from_raw_parts(indices, num_indices as usize) };
+        let result = crate::memtable::OwnedBatch::from_indexed_rows(
+            &src_batch.as_mem_batch(), idx, &schema,
+        );
+        Box::into_raw(Box::new(result)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_clone(handle: *const libc::c_void) -> *mut libc::c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let src = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        let mut cloned = crate::memtable::OwnedBatch {
+            pk_lo: src.pk_lo.clone(),
+            pk_hi: src.pk_hi.clone(),
+            weight: src.weight.clone(),
+            null_bmp: src.null_bmp.clone(),
+            col_data: src.col_data.clone(),
+            blob: src.blob.clone(),
+            count: src.count,
+            sorted: src.sorted,
+            consolidated: src.consolidated,
+            schema: src.schema,
+        };
+        Box::into_raw(Box::new(cloned)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_clear(handle: *mut libc::c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        b.clear();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_region_ptr(handle: *const libc::c_void, idx: u32) -> *const u8 {
+    if handle.is_null() { return ptr::null(); }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.region_ptr(idx as usize)
+    });
+    result.unwrap_or(ptr::null())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_region_size(handle: *const libc::c_void, idx: u32) -> u32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.region_size(idx as usize) as u32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_num_regions(handle: *const libc::c_void) -> u32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.num_regions() as u32
+    });
+    result.unwrap_or(0)
+}
+
+/// Construct a batch from FFI region pointers (used by IPC decode / from_buffers).
+#[no_mangle]
+pub extern "C" fn gnitz_batch_from_regions(
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    ptrs: *const *const u8,
+    sizes: *const u32,
+    count: u32,
+    regions_per_batch: u32,
+) -> *mut libc::c_void {
+    if schema_desc.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let schema = unsafe { *schema_desc };
+        let npc = schema.num_columns as usize - 1;
+        let rpb = regions_per_batch as usize;
+        let p = unsafe { slice::from_raw_parts(ptrs, rpb) };
+        let s = unsafe { slice::from_raw_parts(sizes, rpb) };
+        let mut batch = unsafe {
+            crate::memtable::OwnedBatch::from_regions(p, s, count as usize, npc)
+        };
+        batch.schema = Some(schema);
+        Box::into_raw(Box::new(batch)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+// ---------------------------------------------------------------------------
 // PartitionedTable (hash-routed N-way table handle)
 // ---------------------------------------------------------------------------
 
