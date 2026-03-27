@@ -229,8 +229,8 @@ impl Table {
             OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
         };
         let flush_fn = |s: &mut Self| -> Result<(), i32> {
-            if force_ephemeral { s.flush_ephemeral().map(|_| ()) }
-            else { s.flush().map(|_| ()) }
+            let durable = !force_ephemeral && s.wal_writer.is_some();
+            s.flush_inner(durable).map(|_| ())
         };
         match self.memtable.upsert_sorted_batch(batch) {
             Ok(()) => {
@@ -256,82 +256,56 @@ impl Table {
     /// Flush memtable to shard.  Persistent tables also update manifest and
     /// truncate WAL.
     pub fn flush(&mut self) -> Result<bool, i32> {
+        self.flush_inner(self.wal_writer.is_some())
+    }
+
+    fn flush_inner(&mut self, durable: bool) -> Result<bool, i32> {
         self.found_source = FoundSource::None;
         if self.memtable.is_empty() {
             return Ok(false);
         }
-
-        if self.wal_writer.is_some() {
-            self.flush_persistent()
+        let (shard_name, lsn_max) = if durable {
+            (
+                format!("shard_{}_{}.db", self.table_id, self.current_lsn),
+                self.current_lsn.saturating_sub(1),
+            )
         } else {
-            self.flush_ephemeral()
-        }
-    }
-
-    fn flush_ephemeral(&mut self) -> Result<bool, i32> {
-        self.flush_seq += 1;
-        let pid = unsafe { libc::getpid() };
-        let shard_name = format!(
-            "eph_shard_{}_{}_{}_{}.db",
-            self.table_id, pid, self.flush_seq,
-            self.current_lsn
-        );
-        let shard_path = format!("{}/{}", self.directory, shard_name);
-        let name_c = CString::new(shard_name.as_str()).map_err(|_| -1)?;
-
-        let rc = self.memtable.flush(self.dirfd, &name_c, self.table_id, false);
-        if rc < 0 && rc != -1 {
-            return Err(rc);
-        }
-
-        let wrote = rc >= 0;
-        if wrote {
-            self.shard_index.add_shard(&shard_path, 0, 0)?;
-        } else {
-            // Ghost shard — delete
-            let _ = unlinkat(self.dirfd, &name_c);
-        }
-
-        self.memtable.reset();
-        Ok(wrote)
-    }
-
-    fn flush_persistent(&mut self) -> Result<bool, i32> {
-        let shard_name = format!("shard_{}_{}.db", self.table_id, self.current_lsn);
-        let shard_path = format!("{}/{}", self.directory, shard_name);
-        let name_c = CString::new(shard_name.as_str()).map_err(|_| -1)?;
-
-        let rc = self.memtable.flush(self.dirfd, &name_c, self.table_id, true);
-        if rc < 0 && rc != -1 {
-            return Err(rc);
-        }
-
-        let wrote = rc >= 0;
-        let lsn_max = if self.current_lsn > 0 {
-            self.current_lsn - 1
-        } else {
-            0
+            self.flush_seq += 1;
+            let pid = unsafe { libc::getpid() };
+            (
+                format!(
+                    "eph_shard_{}_{}_{}_{}.db",
+                    self.table_id, pid, self.flush_seq, self.current_lsn
+                ),
+                0,
+            )
         };
 
+        let shard_path = format!("{}/{}", self.directory, shard_name);
+        let name_c = CString::new(shard_name.as_str()).map_err(|_| -1)?;
+
+        let rc = self.memtable.flush(self.dirfd, &name_c, self.table_id, durable);
+        if rc < 0 && rc != -1 {
+            return Err(rc);
+        }
+
+        let wrote = rc >= 0;
         if wrote {
             self.shard_index.add_shard(&shard_path, 0, lsn_max)?;
         } else {
             let _ = unlinkat(self.dirfd, &name_c);
         }
 
-        if let Some(ref path) = self.manifest_path {
-            self.shard_index.publish_manifest(path)?;
-        }
-
-        // fsync makes shard + manifest rename durable; WAL truncation
-        // below is only safe after this succeeds.
-        let fsync_rc = unsafe { libc::fsync(self.dirfd) };
-        if fsync_rc < 0 {
-            return Err(-3);
-        }
-
-        if let Some(ref mut wal) = self.wal_writer {
-            wal.truncate();
+        if durable {
+            if let Some(ref path) = self.manifest_path {
+                self.shard_index.publish_manifest(path)?;
+            }
+            if unsafe { libc::fsync(self.dirfd) } < 0 {
+                return Err(-3);
+            }
+            if let Some(ref mut wal) = self.wal_writer {
+                wal.truncate();
+            }
         }
 
         self.memtable.reset();

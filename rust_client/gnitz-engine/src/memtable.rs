@@ -154,66 +154,13 @@ impl OwnedBatch {
         indices: &[u32],
         schema: &SchemaDescriptor,
     ) -> Self {
-        let n = indices.len();
-        if n == 0 {
-            let npc = schema.num_columns as usize - 1;
-            return Self::empty(npc);
+        if indices.is_empty() {
+            return Self::empty(schema.num_columns as usize - 1);
         }
-
-        let npc = schema.num_columns as usize - 1;
-        let pk_index = schema.pk_index as usize;
         let blob_cap = batch.blob.len().max(1);
-
-        let mut out_pk_lo = vec![0u8; n * 8];
-        let mut out_pk_hi = vec![0u8; n * 8];
-        let mut out_weight = vec![0u8; n * 8];
-        let mut out_null = vec![0u8; n * 8];
-        let mut out_cols: Vec<Vec<u8>> = Vec::with_capacity(npc);
-        for ci in 0..schema.num_columns as usize {
-            if ci == pk_index { continue; }
-            let cs = schema.columns[ci].size as usize;
-            out_cols.push(vec![0u8; n * cs]);
-        }
-        let mut out_blob = vec![0u8; blob_cap];
-
-        let col_slices: Vec<&mut [u8]> = unsafe {
-            out_cols.iter_mut()
-                .map(|v| std::slice::from_raw_parts_mut(v.as_mut_ptr(), v.len()))
-                .collect()
-        };
-
-        let mut writer = merge::DirectWriter::new(
-            &mut out_pk_lo, &mut out_pk_hi, &mut out_weight, &mut out_null,
-            col_slices, &mut out_blob, *schema,
-        );
-
-        merge::scatter_copy(batch, indices, &[], &mut writer);
-
-        let actual_rows = writer.row_count();
-        let actual_blob = writer.blob_written();
-
-        out_pk_lo.truncate(actual_rows * 8);
-        out_pk_hi.truncate(actual_rows * 8);
-        out_weight.truncate(actual_rows * 8);
-        out_null.truncate(actual_rows * 8);
-        let mut pi = 0;
-        for ci in 0..schema.num_columns as usize {
-            if ci == pk_index { continue; }
-            let cs = schema.columns[ci].size as usize;
-            out_cols[pi].truncate(actual_rows * cs);
-            pi += 1;
-        }
-        out_blob.truncate(actual_blob);
-
-        OwnedBatch {
-            pk_lo: out_pk_lo,
-            pk_hi: out_pk_hi,
-            weight: out_weight,
-            null_bmp: out_null,
-            col_data: out_cols,
-            blob: out_blob,
-            count: actual_rows,
-        }
+        write_to_owned_batch(schema, indices.len(), blob_cap, |writer| {
+            merge::scatter_copy(batch, indices, &[], writer);
+        })
     }
 
     pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
@@ -233,11 +180,12 @@ impl OwnedBatch {
 
     /// Build the region pointer/size pairs used by `build_shard_image`.
     pub fn regions(&self) -> Vec<(*const u8, usize)> {
-        let mut r = Vec::with_capacity(4 + self.col_data.len() + 1);
-        r.push((self.pk_lo.as_ptr(), self.pk_lo.len()));
-        r.push((self.pk_hi.as_ptr(), self.pk_hi.len()));
-        r.push((self.weight.as_ptr(), self.weight.len()));
-        r.push((self.null_bmp.as_ptr(), self.null_bmp.len()));
+        let mut r = vec![
+            (self.pk_lo.as_ptr(), self.pk_lo.len()),
+            (self.pk_hi.as_ptr(), self.pk_hi.len()),
+            (self.weight.as_ptr(), self.weight.len()),
+            (self.null_bmp.as_ptr(), self.null_bmp.len()),
+        ];
         for col in &self.col_data {
             r.push((col.as_ptr(), col.len()));
         }
@@ -261,82 +209,52 @@ impl ColumnarSource for OwnedBatch {
     }
 }
 
-/// Merge N sorted MemBatch views into a single consolidated OwnedBatch.
-/// Uses the existing `merge::merge_batches` infrastructure.
-fn consolidate_batches(
-    batches: &[MemBatch],
+/// Allocate output buffers, run a merge/copy operation via DirectWriter,
+/// truncate to actual size, and return the result as an OwnedBatch.
+fn write_to_owned_batch(
     schema: &SchemaDescriptor,
+    max_rows: usize,
+    max_blob: usize,
+    write_fn: impl FnOnce(&mut merge::DirectWriter),
 ) -> OwnedBatch {
+    let pk_index = schema.pk_index as usize;
     let num_payload_cols = schema.num_columns as usize - 1;
 
-    if batches.is_empty() {
-        return OwnedBatch::empty(num_payload_cols);
-    }
-
-    // Upper-bound on output size
-    let total_rows: usize = batches.iter().map(|b| b.count).sum();
-    let total_blob: usize = batches.iter().map(|b| b.blob.len()).sum();
-    if total_rows == 0 {
-        return OwnedBatch::empty(num_payload_cols);
-    }
-
-    let blob_cap = total_blob;
-
-    // Allocate output Vecs with upper-bound capacity, filled to len
-    let mut out_pk_lo = vec![0u8; total_rows * 8];
-    let mut out_pk_hi = vec![0u8; total_rows * 8];
-    let mut out_weight = vec![0u8; total_rows * 8];
-    let mut out_null = vec![0u8; total_rows * 8];
+    let mut out_pk_lo = vec![0u8; max_rows * 8];
+    let mut out_pk_hi = vec![0u8; max_rows * 8];
+    let mut out_weight = vec![0u8; max_rows * 8];
+    let mut out_null = vec![0u8; max_rows * 8];
     let mut out_cols: Vec<Vec<u8>> = Vec::with_capacity(num_payload_cols);
-    let pk_index = schema.pk_index as usize;
     for ci in 0..schema.num_columns as usize {
-        if ci == pk_index {
-            continue;
-        }
+        if ci == pk_index { continue; }
         let cs = schema.columns[ci].size as usize;
-        out_cols.push(vec![0u8; total_rows * cs]);
+        out_cols.push(vec![0u8; max_rows * cs]);
     }
-    let mut out_blob = vec![0u8; blob_cap];
+    let mut out_blob = vec![0u8; max_blob];
 
-    // Build DirectWriter from mutable slices into the Vecs.
-    // Safety: slices borrow from the Vecs above which are alive until end of function.
     let col_slices: Vec<&mut [u8]> = unsafe {
-        out_cols
-            .iter_mut()
+        out_cols.iter_mut()
             .map(|v| std::slice::from_raw_parts_mut(v.as_mut_ptr(), v.len()))
             .collect()
     };
 
     let mut writer = merge::DirectWriter::new(
-        &mut out_pk_lo,
-        &mut out_pk_hi,
-        &mut out_weight,
-        &mut out_null,
-        col_slices,
-        &mut out_blob,
-        *schema,
+        &mut out_pk_lo, &mut out_pk_hi, &mut out_weight, &mut out_null,
+        col_slices, &mut out_blob, *schema,
     );
 
-    if batches.len() == 1 {
-        merge::sort_and_consolidate(&batches[0], schema, &mut writer);
-    } else {
-        merge::merge_batches(batches, schema, &mut writer);
-    }
+    write_fn(&mut writer);
 
     let actual_rows = writer.row_count();
     let actual_blob = writer.blob_written();
 
-    // Truncate Vecs to actual sizes
     out_pk_lo.truncate(actual_rows * 8);
     out_pk_hi.truncate(actual_rows * 8);
     out_weight.truncate(actual_rows * 8);
     out_null.truncate(actual_rows * 8);
-
     let mut pi = 0;
     for ci in 0..schema.num_columns as usize {
-        if ci == pk_index {
-            continue;
-        }
+        if ci == pk_index { continue; }
         let cs = schema.columns[ci].size as usize;
         out_cols[pi].truncate(actual_rows * cs);
         pi += 1;
@@ -352,6 +270,31 @@ fn consolidate_batches(
         blob: out_blob,
         count: actual_rows,
     }
+}
+
+/// Merge N sorted MemBatch views into a single consolidated OwnedBatch.
+fn consolidate_batches(
+    batches: &[MemBatch],
+    schema: &SchemaDescriptor,
+) -> OwnedBatch {
+    let num_payload_cols = schema.num_columns as usize - 1;
+    if batches.is_empty() {
+        return OwnedBatch::empty(num_payload_cols);
+    }
+
+    let total_rows: usize = batches.iter().map(|b| b.count).sum();
+    let total_blob: usize = batches.iter().map(|b| b.blob.len()).sum();
+    if total_rows == 0 {
+        return OwnedBatch::empty(num_payload_cols);
+    }
+
+    write_to_owned_batch(schema, total_rows, total_blob, |writer| {
+        if batches.len() == 1 {
+            merge::sort_and_consolidate(&batches[0], schema, writer);
+        } else {
+            merge::merge_batches(batches, schema, writer);
+        }
+    })
 }
 
 
@@ -473,28 +416,33 @@ impl MemTable {
         (total_w, self.has_found)
     }
 
-    /// Get column data pointer for the last-found row.
-    /// Only valid after `lookup_pk` returned found=true and before any mutation.
-    pub fn found_col_ptr(&self, payload_col: usize, col_size: usize) -> *const u8 {
-        if !self.has_found || self.found_run >= self.runs.len() {
-            return std::ptr::null();
+    fn found_entry(&self) -> Option<(&OwnedBatch, usize)> {
+        if self.has_found && self.found_run < self.runs.len() {
+            Some((&self.runs[self.found_run], self.found_row))
+        } else {
+            None
         }
-        let run = &self.runs[self.found_run];
-        run.get_col_ptr(self.found_row, payload_col, col_size).as_ptr()
+    }
+
+    pub fn found_col_ptr(&self, payload_col: usize, col_size: usize) -> *const u8 {
+        match self.found_entry() {
+            Some((run, row)) => run.get_col_ptr(row, payload_col, col_size).as_ptr(),
+            None => std::ptr::null(),
+        }
     }
 
     pub fn found_null_word(&self) -> u64 {
-        if !self.has_found || self.found_run >= self.runs.len() {
-            return 0;
+        match self.found_entry() {
+            Some((run, row)) => run.get_null_word(row),
+            None => 0,
         }
-        self.runs[self.found_run].get_null_word(self.found_row)
     }
 
     pub fn found_blob_ptr(&self) -> *const u8 {
-        if !self.has_found || self.found_run >= self.runs.len() {
-            return std::ptr::null();
+        match self.found_entry() {
+            Some((run, _)) => run.blob.as_ptr(),
+            None => std::ptr::null(),
         }
-        self.runs[self.found_run].blob.as_ptr()
     }
 
     /// Find the net weight for rows matching both PK and full payload.
