@@ -103,26 +103,8 @@ impl<'a> CursorSource<'a> {
 
     fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
         match self {
-            CursorSource::Batch(b) => {
-                // Binary search on batch pk arrays
-                let count = b.count;
-                let mut lo = 0usize;
-                let mut hi = count;
-                while lo < hi {
-                    let mid = (lo + hi) >> 1;
-                    let mid_lo = b.get_pk_lo(mid);
-                    let mid_hi = b.get_pk_hi(mid);
-                    if pk_lt(mid_lo, mid_hi, key_lo, key_hi) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                lo
-            }
-            CursorSource::Shard(s) => unsafe {
-                (**s).find_lower_bound(key_lo, key_hi)
-            },
+            CursorSource::Batch(b) => b.find_lower_bound(key_lo, key_hi),
+            CursorSource::Shard(s) => unsafe { (**s).find_lower_bound(key_lo, key_hi) },
         }
     }
 }
@@ -142,13 +124,25 @@ impl<'a> ColumnarSource for CursorSource<'a> {
     }
 }
 
+/// Compare two heap nodes by (PK, payload) for ReadCursorEntry-based heaps.
 #[inline]
-fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
-    if a_hi != b_hi {
-        a_hi < b_hi
-    } else {
-        a_lo < b_lo
+fn entry_cmp(
+    entries: &[ReadCursorEntry],
+    schema: &SchemaDescriptor,
+    a: &crate::heap::HeapNode,
+    b: &crate::heap::HeapNode,
+) -> Ordering {
+    let key_ord = a.key.cmp(&b.key);
+    if key_ord != Ordering::Equal {
+        return key_ord;
     }
+    columnar::compare_rows(
+        schema,
+        &entries[a.idx].source,
+        entries[a.idx].position,
+        &entries[b.idx].source,
+        entries[b.idx].position,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -256,17 +250,8 @@ pub struct ReadCursor<'a> {
 
 impl<'a> ReadCursor<'a> {
     fn build_tree(entries: &[ReadCursorEntry<'a>], schema: &SchemaDescriptor) -> MergeHeap {
-        let node_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> bool {
-            if a.key != b.key {
-                return a.key < b.key;
-            }
-            columnar::compare_rows(
-                schema,
-                &entries[a.idx].source,
-                entries[a.idx].position,
-                &entries[b.idx].source,
-                entries[b.idx].position,
-            ) == Ordering::Less
+        let less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| {
+            entry_cmp(entries, schema, a, b).is_lt()
         };
         MergeHeap::build(
             entries.len(),
@@ -277,7 +262,7 @@ impl<'a> ReadCursor<'a> {
                     None
                 }
             },
-            &node_less,
+            &less,
         )
     }
 
@@ -326,8 +311,6 @@ impl<'a> ReadCursor<'a> {
             return;
         }
 
-        // Advance all entries that were at the minimum (PK, payload).
-        // Reuse cached min_indices from the last find_next_non_ghost.
         if let Some(ref mut tree) = self.tree {
             self.advance_buf.clear();
             self.advance_buf.extend_from_slice(&tree.min_indices);
@@ -338,19 +321,10 @@ impl<'a> ReadCursor<'a> {
                 } else {
                     None
                 };
-                let node_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> bool {
-                    if a.key != b.key {
-                        return a.key < b.key;
-                    }
-                    columnar::compare_rows(
-                        &self.schema,
-                        &self.entries[a.idx].source,
-                        self.entries[a.idx].position,
-                        &self.entries[b.idx].source,
-                        self.entries[b.idx].position,
-                    ) == Ordering::Less
+                let less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| {
+                    entry_cmp(&self.entries, &self.schema, a, b).is_lt()
                 };
-                tree.advance(ei, new_key, &node_less);
+                tree.advance(ei, new_key, &less);
             }
         }
 
@@ -361,13 +335,14 @@ impl<'a> ReadCursor<'a> {
         if self.entries.len() == 1 {
             let e = &self.entries[0];
             if e.is_valid() {
+                let pos = e.position;
                 self.valid = true;
-                self.current_key_lo = e.source.get_pk_lo(e.position);
-                self.current_key_hi = e.source.get_pk_hi(e.position);
-                self.current_weight = e.source.get_weight(e.position);
-                self.current_null_word = e.source.get_null_word(e.position);
+                self.current_key_lo = e.source.get_pk_lo(pos);
+                self.current_key_hi = e.source.get_pk_hi(pos);
+                self.current_weight = e.source.get_weight(pos);
+                self.current_null_word = e.source.get_null_word(pos);
                 self.current_entry_idx = 0;
-                self.current_row = e.position;
+                self.current_row = pos;
             } else {
                 self.valid = false;
             }
@@ -385,17 +360,7 @@ impl<'a> ReadCursor<'a> {
 
         while !tree.is_empty() {
             let eq_root = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> Ordering {
-                let key_ord = a.key.cmp(&b.key);
-                if key_ord != Ordering::Equal {
-                    return key_ord;
-                }
-                columnar::compare_rows(
-                    schema,
-                    &self.entries[a.idx].source,
-                    self.entries[a.idx].position,
-                    &self.entries[b.idx].source,
-                    self.entries[b.idx].position,
-                )
+                entry_cmp(&self.entries, schema, a, b)
             };
             let num_min = tree.collect_min_indices(&eq_root);
             if num_min == 0 {
@@ -404,25 +369,19 @@ impl<'a> ReadCursor<'a> {
 
             let mut net_weight: i64 = 0;
             for i in 0..num_min {
-                let ei = tree.min_indices[i];
-                net_weight += self.entries[ei].weight();
+                net_weight += self.entries[tree.min_indices[i]].weight();
             }
 
             if net_weight != 0 {
                 let exemplar = tree.min_indices[0];
+                let pos = self.entries[exemplar].position;
                 self.valid = true;
-                self.current_key_lo = self.entries[exemplar].source.get_pk_lo(
-                    self.entries[exemplar].position,
-                );
-                self.current_key_hi = self.entries[exemplar].source.get_pk_hi(
-                    self.entries[exemplar].position,
-                );
+                self.current_key_lo = self.entries[exemplar].source.get_pk_lo(pos);
+                self.current_key_hi = self.entries[exemplar].source.get_pk_hi(pos);
                 self.current_weight = net_weight;
-                self.current_null_word = self.entries[exemplar].source.get_null_word(
-                    self.entries[exemplar].position,
-                );
+                self.current_null_word = self.entries[exemplar].source.get_null_word(pos);
                 self.current_entry_idx = exemplar;
-                self.current_row = self.entries[exemplar].position;
+                self.current_row = pos;
                 return;
             }
 
@@ -436,19 +395,10 @@ impl<'a> ReadCursor<'a> {
                 } else {
                     None
                 };
-                let node_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> bool {
-                    if a.key != b.key {
-                        return a.key < b.key;
-                    }
-                    columnar::compare_rows(
-                        schema,
-                        &self.entries[a.idx].source,
-                        self.entries[a.idx].position,
-                        &self.entries[b.idx].source,
-                        self.entries[b.idx].position,
-                    ) == Ordering::Less
+                let less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| {
+                    entry_cmp(&self.entries, schema, a, b).is_lt()
                 };
-                tree.advance(ei, new_key, &node_less);
+                tree.advance(ei, new_key, &less);
             }
         }
 

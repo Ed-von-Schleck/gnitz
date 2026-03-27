@@ -213,9 +213,7 @@ impl<'a> DirectWriter<'a> {
 
             if is_null {
                 let off = out_row * col_size;
-                for b in &mut self.col_bufs[payload_idx][off..off + col_size] {
-                    *b = 0;
-                }
+                self.col_bufs[payload_idx][off..off + col_size].fill(0);
             } else if col.type_code == TYPE_STRING {
                 self.write_string(payload_idx, batch, row, out_row);
             } else {
@@ -357,39 +355,27 @@ pub fn merge_batches(
         let cur_pk = batches[bi].get_pk(ri);
         let cur_weight = batches[bi].get_weight(ri);
 
-        if !has_pending {
-            pending_batch = bi;
-            pending_row = ri;
-            pending_pk = cur_pk;
-            pending_weight = cur_weight;
-            has_pending = true;
-        } else if cur_pk != pending_pk {
-            if pending_weight != 0 {
+        let same_group = has_pending
+            && cur_pk == pending_pk
+            && columnar::compare_rows(
+                schema,
+                &batches[pending_batch],
+                pending_row,
+                &batches[bi],
+                ri,
+            ) == Ordering::Equal;
+
+        if same_group {
+            pending_weight += cur_weight;
+        } else {
+            if has_pending && pending_weight != 0 {
                 writer.write_row(&batches[pending_batch], pending_row, pending_weight);
             }
             pending_batch = bi;
             pending_row = ri;
             pending_pk = cur_pk;
             pending_weight = cur_weight;
-        } else {
-            let ord = columnar::compare_rows(
-                schema,
-                &batches[pending_batch],
-                pending_row,
-                &batches[bi],
-                ri,
-            );
-            if ord == Ordering::Equal {
-                pending_weight += cur_weight;
-            } else {
-                if pending_weight != 0 {
-                    writer.write_row(&batches[pending_batch], pending_row, pending_weight);
-                }
-                pending_batch = bi;
-                pending_row = ri;
-                pending_pk = cur_pk;
-                pending_weight = cur_weight;
-            }
+            has_pending = true;
         }
 
         // Advance the min cursor, then re-create the less closure
@@ -564,25 +550,19 @@ pub fn sort_and_consolidate(
         let cur_idx = indices[pos];
         let cur_pk = pks[cur_idx];
 
-        if cur_pk != pending_pk {
+        let same_group = cur_pk == pending_pk
+            && columnar::compare_rows(schema, batch, pending_idx, batch, cur_idx)
+                == Ordering::Equal;
+
+        if same_group {
+            pending_weight += batch.get_weight(cur_idx);
+        } else {
             if pending_weight != 0 {
                 writer.write_row(batch, pending_idx, pending_weight);
             }
             pending_idx = cur_idx;
             pending_pk = cur_pk;
             pending_weight = batch.get_weight(cur_idx);
-        } else {
-            let ord = columnar::compare_rows(schema, batch, pending_idx, batch, cur_idx);
-            if ord == Ordering::Equal {
-                pending_weight += batch.get_weight(cur_idx);
-            } else {
-                if pending_weight != 0 {
-                    writer.write_row(batch, pending_idx, pending_weight);
-                }
-                pending_idx = cur_idx;
-                pending_pk = cur_pk;
-                pending_weight = batch.get_weight(cur_idx);
-            }
         }
     }
 
