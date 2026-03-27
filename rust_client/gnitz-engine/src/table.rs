@@ -10,14 +10,13 @@ use std::sync::Arc;
 
 use crate::columnar::{self, ColumnarSource};
 use crate::compact::SchemaDescriptor;
-use crate::memtable::{MemTable, MemTableSnapshot, OwnedBatch};
+use crate::memtable::{self, MemTable, OwnedBatch};
 use crate::merge::MemBatch;
 use crate::read_cursor::{self, CursorHandle};
 use crate::shard_index::ShardIndex;
 use crate::shard_reader::MappedShard;
 use crate::wal::{WalReader, WalWriter};
 
-const ERR_CAPACITY: i32 = -2;
 const MAX_REGIONS: usize = 70; // 4 core + up to 63 payload cols + 1 blob
 
 // ---------------------------------------------------------------------------
@@ -45,13 +44,11 @@ pub struct Table {
 
     wal_writer: Option<WalWriter>,
     manifest_path: Option<String>,
-    has_wal: bool,
 
     flush_seq: u32,
     pub current_lsn: u64,
 
     found_source: FoundSource,
-    shard_prefix: String,
 }
 
 impl Table {
@@ -92,12 +89,6 @@ impl Table {
         let memtable = MemTable::new(schema, arena_size as usize);
         let shard_index = ShardIndex::new(table_id, dir, schema);
 
-        let shard_prefix = if durable {
-            format!("shard_{}_", table_id)
-        } else {
-            format!("eph_shard_{}_", table_id)
-        };
-
         let mut table = Table {
             memtable,
             shard_index,
@@ -108,16 +99,13 @@ impl Table {
             dirfd,
             wal_writer: None,
             manifest_path: None,
-            has_wal: durable,
             flush_seq: 0,
             current_lsn: 1,
             found_source: FoundSource::None,
-            shard_prefix,
         };
 
         if durable {
             let manifest_path = format!("{}/manifest.bin", dir);
-            // Load manifest if exists
             let _ = table.shard_index.load_manifest(&manifest_path);
             table.current_lsn = table.shard_index.max_lsn() + 1;
             if table.current_lsn == 0 {
@@ -125,13 +113,9 @@ impl Table {
             }
             table.manifest_path = Some(manifest_path);
 
-            // Open WAL and recover
             let wal_path = format!("{}/{}.wal", dir, name);
             let wal_c = CString::new(wal_path.as_str()).map_err(|_| -1)?;
-            match WalWriter::open(&wal_c) {
-                Ok(w) => table.wal_writer = Some(w),
-                Err(_) => {} // WAL open failure is not fatal for initial creation
-            }
+            table.wal_writer = Some(WalWriter::open(&wal_c)?);
             table.recover_from_wal()?;
         }
 
@@ -142,15 +126,18 @@ impl Table {
         &self.schema
     }
 
+    /// Enable or disable WAL writes.  Disabling drops the WAL writer.
     pub fn set_has_wal(&mut self, flag: bool) {
-        self.has_wal = flag;
+        if !flag {
+            self.wal_writer = None;
+        }
     }
 
     // ------------------------------------------------------------------
     // Ingest
     // ------------------------------------------------------------------
 
-    /// Ingest a pre-sorted batch.  Writes WAL first (if has_wal), then memtable.
+    /// Ingest a pre-sorted batch.  Writes WAL first (if durable), then memtable.
     pub fn ingest_batch_from_regions(
         &mut self,
         ptrs: &[*const u8],
@@ -161,55 +148,24 @@ impl Table {
         if count == 0 {
             return Ok(());
         }
+        self.found_source = FoundSource::None;
 
-        // WAL write (durability) before memtable (visibility)
-        if self.has_wal {
-            if let Some(ref mut wal) = self.wal_writer {
-                let blob_idx = 4 + num_payload_cols;
-                let blob_size = if blob_idx < sizes.len() {
-                    sizes[blob_idx] as u64
-                } else {
-                    0
-                };
-                let rc = wal.append_batch(
-                    self.current_lsn,
-                    self.table_id,
-                    count,
-                    ptrs,
-                    sizes,
-                    blob_size,
-                );
-                if rc < 0 {
-                    return Err(rc);
-                }
-                self.current_lsn += 1;
+        if let Some(ref mut wal) = self.wal_writer {
+            let blob_idx = 4 + num_payload_cols;
+            let blob_size = if blob_idx < sizes.len() { sizes[blob_idx] as u64 } else { 0 };
+            let rc = wal.append_batch(
+                self.current_lsn, self.table_id, count, ptrs, sizes, blob_size,
+            );
+            if rc < 0 {
+                return Err(rc);
             }
+            self.current_lsn += 1;
         }
 
-        let batch = unsafe {
-            OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
-        };
-        match self.memtable.upsert_sorted_batch(batch) {
-            Ok(()) => {
-                if self.memtable.should_flush() {
-                    self.flush()?;
-                }
-                Ok(())
-            }
-            Err(ERR_CAPACITY) => {
-                self.flush()?;
-                // Retry: re-parse regions (original batch was moved into first upsert)
-                let batch2 = unsafe {
-                    OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
-                };
-                self.memtable.upsert_sorted_batch(batch2).map_err(|e| e)?;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        self.upsert_and_maybe_flush(ptrs, sizes, count, num_payload_cols, false)
     }
 
-    /// Ingest without WAL (worker DDL sync path).
+    /// Ingest without WAL (worker DDL sync path).  Uses ephemeral flush on overflow.
     pub fn ingest_batch_memonly_from_regions(
         &mut self,
         ptrs: &[*const u8],
@@ -220,22 +176,36 @@ impl Table {
         if count == 0 {
             return Ok(());
         }
+        self.found_source = FoundSource::None;
+        self.upsert_and_maybe_flush(ptrs, sizes, count, num_payload_cols, true)
+    }
+
+    fn upsert_and_maybe_flush(
+        &mut self,
+        ptrs: &[*const u8],
+        sizes: &[u32],
+        count: u32,
+        num_payload_cols: usize,
+        force_ephemeral: bool,
+    ) -> Result<(), i32> {
         let batch = unsafe {
             OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
         };
+        let flush_fn = |s: &mut Self| -> Result<(), i32> {
+            if force_ephemeral { s.flush_ephemeral().map(|_| ()) }
+            else { s.flush().map(|_| ()) }
+        };
         match self.memtable.upsert_sorted_batch(batch) {
             Ok(()) => {
-                if self.memtable.should_flush() {
-                    self.flush_ephemeral()?;
-                }
+                if self.memtable.should_flush() { flush_fn(self)?; }
                 Ok(())
             }
-            Err(ERR_CAPACITY) => {
-                self.flush_ephemeral()?;
+            Err(code) if code == memtable::ERR_CAPACITY => {
+                flush_fn(self)?;
                 let batch2 = unsafe {
                     OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
                 };
-                self.memtable.upsert_sorted_batch(batch2).map_err(|e| e)?;
+                self.memtable.upsert_sorted_batch(batch2)?;
                 Ok(())
             }
             Err(e) => Err(e),
@@ -249,6 +219,7 @@ impl Table {
     /// Flush memtable to shard.  Persistent tables also update manifest and
     /// truncate WAL.
     pub fn flush(&mut self) -> Result<bool, i32> {
+        self.found_source = FoundSource::None;
         if self.memtable.is_empty() {
             return Ok(false);
         }
@@ -311,15 +282,17 @@ impl Table {
             let _ = unlinkat(self.dirfd, &name_c);
         }
 
-        // Publish manifest
         if let Some(ref path) = self.manifest_path {
             self.shard_index.publish_manifest(path)?;
         }
 
-        // fsync directory
-        unsafe { libc::fsync(self.dirfd); }
+        // fsync makes shard + manifest rename durable; WAL truncation
+        // below is only safe after this succeeds.
+        let fsync_rc = unsafe { libc::fsync(self.dirfd) };
+        if fsync_rc < 0 {
+            return Err(-3);
+        }
 
-        // Truncate WAL (safe after manifest is durable)
         if let Some(ref mut wal) = self.wal_writer {
             wal.truncate();
         }
@@ -482,10 +455,13 @@ impl Table {
         if !self.shard_index.needs_compaction {
             return Ok(());
         }
+        self.found_source = FoundSource::None;
         self.shard_index.run_compact()?;
         if let Some(ref path) = self.manifest_path {
             self.shard_index.publish_manifest(path)?;
-            unsafe { libc::fsync(self.dirfd); }
+            if unsafe { libc::fsync(self.dirfd) } < 0 {
+                return Err(-3);
+            }
         }
         self.shard_index.try_cleanup();
         Ok(())
