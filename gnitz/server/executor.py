@@ -121,6 +121,11 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
     pending = []
     pending_pos = {}   # _pending_key(view_id, source_id) -> index in pending
     for v_id in first_layer:
+        if not registry.has_id(v_id):
+            # dep_map can lag behind the registry: the async tick (b8baedd) may
+            # fire after VIEW_TAB retraction but before DEP_TAB retraction, so
+            # the dep_map still lists views that are no longer registered.
+            continue
         d = registry.get_depth(v_id)
         pending.append((d, v_id, initial_source_id, initial_delta.clone()))
     _sort_pending_desc(pending)
@@ -192,9 +197,12 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
 
         has_output = out_delta is not None and out_delta.length() > 0
         if has_output:
-            view_family = registry.get_by_id(target_view_id)
-            ingest_to_family(view_family, out_delta)
-            view_family.store.flush()
+            if registry.has_id(target_view_id):
+                view_family = registry.get_by_id(target_view_id)
+                ingest_to_family(view_family, out_delta)
+                view_family.store.flush()
+            else:
+                has_output = False
 
         # In multi-worker mode, downstream views must always be queued
         # even with empty deltas, so every worker participates in
@@ -214,6 +222,8 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                         pending[found] = (existing_d, existing_id, existing_sid, merged)
                         # pending_pos[dep_pk] unchanged — in-place update
                 else:
+                    if not registry.has_id(dep_id):
+                        continue
                     d = registry.get_depth(dep_id)
                     if has_output:
                         pending.append((d, dep_id, target_view_id, out_delta.clone()))

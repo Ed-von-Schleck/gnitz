@@ -35,7 +35,6 @@ pub fn build_shard_image(
     let dir_size = num_regions * DIR_ENTRY_SIZE;
     let dir_offset = HEADER_SIZE;
 
-    // Compute region offsets with 64-byte alignment
     let mut pos = align64(dir_offset + dir_size);
     let mut region_offsets = Vec::with_capacity(num_regions);
     for &(_ptr, sz) in regions {
@@ -48,7 +47,6 @@ pub fn build_shard_image(
         region_offsets[num_regions - 1] + regions[num_regions - 1].1
     };
 
-    // Build XOR8 filter from pk_lo (region 0) and pk_hi (region 1)
     let xor8_filter = if row_count > 0 && num_regions >= 2 {
         let (pk_lo_ptr, pk_lo_sz) = regions[0];
         let (pk_hi_ptr, pk_hi_sz) = regions[1];
@@ -81,10 +79,8 @@ pub fn build_shard_image(
         data_end
     };
 
-    // Build file image
     let mut image = vec![0u8; total_size];
 
-    // Header
     write_u64_le(&mut image, OFF_MAGIC, SHARD_MAGIC);
     write_u64_le(&mut image, OFF_VERSION, SHARD_VERSION);
     write_u64_le(&mut image, OFF_ROW_COUNT, row_count as u64);
@@ -93,33 +89,28 @@ pub fn build_shard_image(
     write_u64_le(&mut image, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut image, OFF_XOR8_SIZE, xor8_size as u64);
 
-    // Directory entries + region data
     for i in 0..num_regions {
         let r_off = region_offsets[i];
         let (src_ptr, r_sz) = regions[i];
 
-        // Copy region data
         if r_sz > 0 && !src_ptr.is_null() {
             unsafe {
                 ptr::copy_nonoverlapping(src_ptr, image[r_off..].as_mut_ptr(), r_sz);
             }
         }
 
-        // Compute checksum over the copied data in the image
         let cs = if r_sz > 0 {
             xxh::checksum(&image[r_off..r_off + r_sz])
         } else {
             0
         };
 
-        // Write directory entry: (offset, size, checksum)
         let d = dir_offset + i * DIR_ENTRY_SIZE;
         write_u64_le(&mut image, d, r_off as u64);
         write_u64_le(&mut image, d + 8, r_sz as u64);
         write_u64_le(&mut image, d + 16, cs);
     }
 
-    // XOR8 footer
     if let Some(ref data) = xor8_data {
         image[xor8_offset..xor8_offset + data.len()].copy_from_slice(data);
     }
@@ -134,7 +125,6 @@ pub fn build_shard_image(
 ///
 /// Returns 0 on success, -3 on I/O error.
 pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool) -> i32 {
-    // Construct ".tmp" name
     let base_bytes = basename.to_bytes();
     let mut tmp_buf = Vec::with_capacity(base_bytes.len() + 5);
     tmp_buf.extend_from_slice(base_bytes);
@@ -142,7 +132,6 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
     let tmp_name = tmp_buf.as_ptr() as *const libc::c_char;
 
     unsafe {
-        // Open temporary file
         let fd = libc::openat(
             dirfd,
             tmp_name,
@@ -153,24 +142,23 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
             return -3;
         }
 
-        // Write all bytes
         let rc = crate::util::write_all_fd(fd, image);
         if rc < 0 {
             libc::close(fd);
+            libc::unlinkat(dirfd, tmp_name, 0);
             return -3;
         }
 
-        // Durability: fdatasync (data-only, no metadata sync)
         if durable {
             if libc::fdatasync(fd) < 0 {
                 libc::close(fd);
+                libc::unlinkat(dirfd, tmp_name, 0);
                 return -3;
             }
         }
 
         libc::close(fd);
 
-        // Atomic rename
         if libc::renameat(dirfd, tmp_name, dirfd, basename.as_ptr()) < 0 {
             return -3;
         }
@@ -196,14 +184,12 @@ mod tests {
                 _pad: 0,
             }; 64],
         };
-        // col 0: U64 PK (code=8, size=8)
         sd.columns[0] = crate::compact::SchemaColumn {
             type_code: 8,
             size: 8,
             nullable: 0,
             _pad: 0,
         };
-        // col 1: I64 payload (code=9, size=8)
         if num_cols > 1 {
             sd.columns[1] = crate::compact::SchemaColumn {
                 type_code: 9,
@@ -252,7 +238,6 @@ mod tests {
 
         let image = build_shard_image(42, row_count, &regions);
 
-        // Verify header
         assert_eq!(
             crate::util::read_u64_le(&image, OFF_MAGIC),
             SHARD_MAGIC
@@ -263,7 +248,6 @@ mod tests {
         );
         assert_eq!(crate::util::read_u64_le(&image, OFF_ROW_COUNT), 3);
         assert_eq!(crate::util::read_u64_le(&image, OFF_TABLE_ID), 42);
-        // XOR8 should be present
         assert!(crate::util::read_u64_le(&image, OFF_XOR8_OFFSET) > 0);
         assert!(crate::util::read_u64_le(&image, OFF_XOR8_SIZE) > 0);
     }
@@ -297,7 +281,6 @@ mod tests {
         assert_eq!(rc, 0);
         assert!(shard_path.exists());
 
-        // Read back via shard_reader
         let schema = make_schema_desc(2, 0);
         let shard = MappedShard::open(&path_cstr, &schema, true).unwrap();
         assert_eq!(shard.count, 2);
@@ -317,11 +300,11 @@ mod tests {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
         let regions: Vec<(*const u8, usize)> = vec![
-            (std::ptr::null(), 0), // pk_lo
-            (std::ptr::null(), 0), // pk_hi
-            (std::ptr::null(), 0), // weight
-            (std::ptr::null(), 0), // null
-            (std::ptr::null(), 0), // blob
+            (std::ptr::null(), 0),
+            (std::ptr::null(), 0),
+            (std::ptr::null(), 0),
+            (std::ptr::null(), 0),
+            (std::ptr::null(), 0),
         ];
 
         let image = build_shard_image(1, 0, &regions);

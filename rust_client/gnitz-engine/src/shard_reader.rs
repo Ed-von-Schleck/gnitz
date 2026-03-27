@@ -13,9 +13,29 @@ use crate::util::{read_u64_le, read_i64_le};
 use crate::xxh;
 use crate::xor8;
 
-// ---------------------------------------------------------------------------
-// MappedShard
-// ---------------------------------------------------------------------------
+/// RAII guard for mmap'd memory.  Calls `munmap` on drop unless disarmed.
+struct MmapGuard {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl MmapGuard {
+    fn disarm(mut self) -> *mut u8 {
+        let p = self.ptr;
+        self.ptr = ptr::null_mut();
+        p
+    }
+}
+
+impl Drop for MmapGuard {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            }
+        }
+    }
+}
 
 pub struct MappedShard {
     pub(crate) mmap_ptr: *mut u8,
@@ -71,23 +91,23 @@ impl MappedShard {
         if mmap_ptr == libc::MAP_FAILED {
             return Err(-1);
         }
-        let mmap_ptr = mmap_ptr as *mut u8;
-        let data = unsafe { std::slice::from_raw_parts(mmap_ptr, file_size) };
 
-        // Validate header
+        let guard = MmapGuard {
+            ptr: mmap_ptr as *mut u8,
+            len: file_size,
+        };
+        let data = unsafe { std::slice::from_raw_parts(guard.ptr, file_size) };
+
         if read_u64_le(data, OFF_MAGIC) != SHARD_MAGIC {
-            unsafe { libc::munmap(mmap_ptr as *mut libc::c_void, file_size); }
             return Err(-2);
         }
         if read_u64_le(data, OFF_VERSION) != SHARD_VERSION {
-            unsafe { libc::munmap(mmap_ptr as *mut libc::c_void, file_size); }
             return Err(-2);
         }
 
         let count = read_u64_le(data, OFF_ROW_COUNT) as usize;
         let dir_off = read_u64_le(data, OFF_DIR_OFFSET) as usize;
 
-        // Parse region directory
         let num_cols = schema.num_columns as usize;
         let pk_index = schema.pk_index as usize;
         let num_non_pk = num_cols - 1;
@@ -97,31 +117,26 @@ impl MappedShard {
         for i in 0..num_regions {
             let entry_off = dir_off + i * DIR_ENTRY_SIZE;
             if entry_off + DIR_ENTRY_SIZE > file_size {
-                unsafe { libc::munmap(mmap_ptr as *mut libc::c_void, file_size); }
                 return Err(-2);
             }
             let r_off = read_u64_le(data, entry_off) as usize;
             let r_sz = read_u64_le(data, entry_off + 8) as usize;
             let r_cs = read_u64_le(data, entry_off + 16);
             if r_off.saturating_add(r_sz) > file_size {
-                unsafe { libc::munmap(mmap_ptr as *mut libc::c_void, file_size); }
                 return Err(-2);
             }
             regions.push((r_off, r_sz, r_cs));
         }
 
-        // Validate checksums for all regions if requested
         if validate_checksums {
             for i in 0..num_regions {
                 let (r_off, r_sz, r_cs) = regions[i];
                 if r_sz > 0 && xxh::checksum(&data[r_off..r_off + r_sz]) != r_cs {
-                    unsafe { libc::munmap(mmap_ptr as *mut libc::c_void, file_size); }
                     return Err(-3);
                 }
             }
         }
 
-        // Build column-to-payload mapping
         let mut col_to_payload = Vec::with_capacity(num_cols);
         let mut col_regions = Vec::with_capacity(num_non_pk);
         let mut reg_idx = 4;
@@ -137,7 +152,6 @@ impl MappedShard {
         let blob_off = regions[reg_idx].0;
         let blob_len = regions[reg_idx].1;
 
-        // Load embedded XOR8 filter
         let xor8_off = read_u64_le(data, OFF_XOR8_OFFSET) as usize;
         let xor8_sz = read_u64_le(data, OFF_XOR8_SIZE) as usize;
         let xor8_filter = if xor8_off > 0 && xor8_sz >= 16 && xor8_off + xor8_sz <= file_size {
@@ -146,6 +160,7 @@ impl MappedShard {
             None
         };
 
+        let mmap_ptr = guard.disarm();
         Ok(MappedShard {
             mmap_ptr,
             mmap_len: file_size,
@@ -162,7 +177,6 @@ impl MappedShard {
         })
     }
 
-    /// Returns a borrowed slice over the mmap'd data.
     #[inline]
     pub(crate) fn data(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.mmap_ptr, self.mmap_len) }
@@ -196,7 +210,6 @@ impl MappedShard {
         read_u64_le(self.data(), self.null_off + row * 8)
     }
 
-    /// Get a slice for a column value at the given row, indexed by payload position.
     #[inline]
     pub fn get_col_ptr(&self, row: usize, payload_col_idx: usize, col_size: usize) -> &[u8] {
         let (off, region_len) = self.col_regions[payload_col_idx];
@@ -215,7 +228,6 @@ impl MappedShard {
         }
         let payload_idx = self.col_to_payload[col_idx];
         if payload_idx == usize::MAX {
-            // PK column — return pointer into pk_lo region
             let off = self.pk_lo_off + row * 8;
             if off + 8 > self.mmap_len {
                 return ptr::null();
@@ -255,7 +267,7 @@ impl MappedShard {
     pub fn xor8_may_contain(&self, key_lo: u64, key_hi: u64) -> bool {
         match &self.xor8_filter {
             Some(filter) => xor8::may_contain(filter, key_lo, key_hi),
-            None => true, // No filter — conservatively return true
+            None => true,
         }
     }
 
@@ -264,21 +276,18 @@ impl MappedShard {
     pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
         let d = self.data();
         let mut lo = 0usize;
-        let mut hi = self.count.wrapping_sub(1) as isize; // -1 if count==0
-        let mut result = self.count;
-
-        while (lo as isize) <= hi {
-            let mid = lo + ((hi as usize - lo) >> 1);
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
             let mid_lo = read_u64_le(d, self.pk_lo_off + mid * 8);
             let mid_hi = read_u64_le(d, self.pk_hi_off + mid * 8);
             if pk_lt(mid_lo, mid_hi, key_lo, key_hi) {
                 lo = mid + 1;
             } else {
-                result = mid;
-                hi = mid as isize - 1;
+                hi = mid;
             }
         }
-        result
+        lo
     }
 
     /// Binary search for an exact PK match. Returns row index or -1.
@@ -294,7 +303,6 @@ impl MappedShard {
         }
         -1
     }
-
 }
 
 #[inline]
@@ -345,7 +353,6 @@ mod tests {
         let dir_offset = HEADER_SIZE;
         let alignment = 64;
 
-        // Build region data
         let mut pk_lo = Vec::new();
         let mut pk_hi = Vec::new();
         let mut weights = Vec::new();
@@ -363,7 +370,6 @@ mod tests {
 
         let regions_data: Vec<&[u8]> = vec![&pk_lo, &pk_hi, &weights, &null_bm, &col1_data, &blob];
 
-        // Compute offsets
         fn align(v: usize, a: usize) -> usize { (v + a - 1) & !(a - 1) }
         let mut pos = align(dir_offset + dir_size, alignment);
         let mut offsets = Vec::new();
@@ -411,13 +417,9 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         assert_eq!(shard.count, 10);
-
-        // Read PKs
         assert_eq!(shard.get_pk_lo(0), 1);
         assert_eq!(shard.get_pk_lo(9), 10);
         assert_eq!(shard.get_pk_hi(0), 0);
-
-        // Read weights
         assert_eq!(shard.get_weight(0), 1);
     }
 
@@ -431,19 +433,16 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
 
-        // Exact match
-        assert_eq!(shard.find_row_index(10, 0), 4); // PK=10 is at index 4 (PKs: 2,4,6,8,10)
-        assert_eq!(shard.find_row_index(200, 0), 99); // last row
+        assert_eq!(shard.find_row_index(10, 0), 4);
+        assert_eq!(shard.find_row_index(200, 0), 99);
 
-        // Not found
-        assert_eq!(shard.find_row_index(3, 0), -1); // odd, not present
-        assert_eq!(shard.find_row_index(0, 0), -1); // below range
-        assert_eq!(shard.find_row_index(201, 0), -1); // above range
+        assert_eq!(shard.find_row_index(3, 0), -1);
+        assert_eq!(shard.find_row_index(0, 0), -1);
+        assert_eq!(shard.find_row_index(201, 0), -1);
 
-        // Lower bound
-        assert_eq!(shard.find_lower_bound(3, 0), 1); // first row >= 3 is PK=4 at idx 1
-        assert_eq!(shard.find_lower_bound(1, 0), 0); // first row >= 1 is PK=2 at idx 0
-        assert_eq!(shard.find_lower_bound(201, 0), 100); // returns count
+        assert_eq!(shard.find_lower_bound(3, 0), 1);
+        assert_eq!(shard.find_lower_bound(1, 0), 0);
+        assert_eq!(shard.find_lower_bound(201, 0), 100);
     }
 
     #[test]
@@ -456,13 +455,11 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
 
-        // col 0 is PK → returns pk_lo pointer
         let ptr = shard.col_ptr_by_logical(0, 0, 8);
         assert!(!ptr.is_null());
         let val = unsafe { *(ptr as *const u64) };
         assert_eq!(val, 1);
 
-        // col 1 is payload → returns payload region pointer
         let ptr = shard.col_ptr_by_logical(0, 1, 8);
         assert!(!ptr.is_null());
         let val = unsafe { *(ptr as *const i64) };
@@ -477,11 +474,9 @@ mod tests {
         let schema = test_schema();
         let cpath = std::ffi::CString::new(path).unwrap();
 
-        // Should succeed with validation enabled
         let shard = MappedShard::open(&cpath, &schema, true);
         assert!(shard.is_ok());
 
-        // Corrupt a PK byte and verify checksum fails
         let path_str = cpath.to_str().unwrap();
         let mut data = std::fs::read(path_str).unwrap();
         let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
