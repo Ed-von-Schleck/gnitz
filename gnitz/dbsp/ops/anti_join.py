@@ -1,12 +1,9 @@
 # gnitz/dbsp/ops/anti_join.py
 
-from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_int64, intmask
 
-from gnitz.core.batch import ConsolidatedScope, pk_lt, pk_eq
-from gnitz.storage.cursor import SortedBatchCursor
-
-ADAPTIVE_SWAP_THRESHOLD = 1   # swap when delta_len > trace_len
+from gnitz.core.batch import ArenaZSetBatch, ConsolidatedScope, pk_lt, pk_eq
 
 """
 Anti-Join and Semi-Join Operators for the DBSP algebra.
@@ -31,48 +28,38 @@ where D = distinct(B).
 def op_anti_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema):
     """
     Delta-Trace Anti-Join: emit ΔA rows with NO positive-weight match in I(B).
-
-    delta_batch:   ArenaZSetBatch  — the in-flight delta (ΔA)
-    trace_cursor:  AbstractCursor  — seekable cursor over the persistent trace (I(B))
-    out_writer:    BatchWriter     — strictly write-only destination
-    left_schema:   TableSchema     — schema of delta_batch (= output schema)
+    Single FFI call into Rust.
     """
-    with ConsolidatedScope(delta_batch) as consolidated:
-        _anti_join_dt_merge_walk(consolidated, trace_cursor, out_writer)
-    # mark_consolidated(True) called inside _anti_join_dt_merge_walk
+    from gnitz.storage import engine_ffi
 
+    schema = delta_batch._schema
+    schema_buf = engine_ffi.pack_schema(schema)
+    out_result = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+    try:
+        rc = engine_ffi._op_anti_join_dt(
+            delta_batch._handle,
+            trace_cursor._handle,
+            rffi.cast(rffi.VOIDP, schema_buf),
+            out_result,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_op_anti_join_dt failed: %d" % intmask(rc))
 
-def _anti_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
-    count = delta_batch.length()
-    if count == 0:
+        result_handle = out_result[0]
+        result_batch = ArenaZSetBatch._wrap_handle(schema, result_handle, True, True)
+        if result_batch.length() > 0:
+            out_writer.append_batch(result_batch)
         out_writer.mark_consolidated(True)
-        return
-    emit_indices = newlist_hint(count)
-    trace_cursor.seek(delta_batch.get_pk_lo(0), delta_batch.get_pk_hi(0))
-    for i in range(count):
-        d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
-        while trace_cursor.is_valid() and pk_lt(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
-            trace_cursor.advance()
-        in_trace = (trace_cursor.is_valid()
-                    and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi)
-                    and trace_cursor.weight() > r_int64(0))
-        if not in_trace:
-            emit_indices.append(i)
-        if trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
-            trace_cursor.advance()   # advance past d_key even for negative-weight trace records
-    out_writer.copy_rows_indexed_src_weights(delta_batch, emit_indices)
-    out_writer.mark_consolidated(True)
+        result_batch.free()
+    finally:
+        lltype.free(out_result, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")
 
 
 def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
     """
     Delta-Delta Anti-Join (Sort-Merge): emit ΔA rows whose keys have
     NO positive-weight match in ΔB.
-
-    batch_a:    ArenaZSetBatch  — left delta (ΔA)
-    batch_b:    ArenaZSetBatch  — right delta (ΔB)
-    out_writer: BatchWriter     — strictly write-only destination
-    left_schema: TableSchema    — schema of batch_a (= output schema)
     """
     with ConsolidatedScope(batch_a) as b_a:
         with ConsolidatedScope(batch_b) as b_b:
@@ -84,11 +71,9 @@ def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
             while idx_a < n_a:
                 key_a_lo, key_a_hi = b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a)
 
-                # Advance b pointer to first key >= key_a
                 while idx_b < n_b and pk_lt(b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b), key_a_lo, key_a_hi):
                     idx_b += 1
 
-                # Check if any b record at key_a has positive weight
                 has_match = False
                 if idx_b < n_b and pk_eq(b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b), key_a_lo, key_a_hi):
                     scan_b = idx_b
@@ -98,7 +83,6 @@ def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
                             break
                         scan_b += 1
 
-                # Find end of key group in b_a
                 start_a = idx_a
                 while idx_a < n_a and pk_eq(b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a), key_a_lo, key_a_hi):
                     idx_a += 1
@@ -111,79 +95,43 @@ def op_anti_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
 def op_semi_join_delta_trace(delta_batch, trace_cursor, out_writer, left_schema):
     """
     Delta-Trace Semi-Join: emit ΔA rows whose key HAS a positive-weight
-    match in I(B). Weight is preserved from the delta row.
-
-    This is the complement of op_anti_join_delta_trace.
-
-    delta_batch:   ArenaZSetBatch  — the in-flight delta
-    trace_cursor:  AbstractCursor  — seekable cursor over the persistent trace
-    out_writer:    BatchWriter     — strictly write-only destination
-    left_schema:   TableSchema     — schema of delta_batch (= output schema)
+    match in I(B). Single FFI call into Rust.
     """
-    delta_len = delta_batch.length()
-    trace_len = trace_cursor.estimated_length()
-    if delta_len > trace_len * ADAPTIVE_SWAP_THRESHOLD:
-        _semi_join_dt_swapped(delta_batch, trace_cursor, out_writer)
-        out_writer.mark_sorted(True)
-    else:
-        with ConsolidatedScope(delta_batch) as consolidated:
-            _semi_join_dt_merge_walk(consolidated, trace_cursor, out_writer)
-        # mark_consolidated(True) called inside _semi_join_dt_merge_walk
+    from gnitz.storage import engine_ffi
 
+    schema = delta_batch._schema
+    schema_buf = engine_ffi.pack_schema(schema)
+    out_result = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+    try:
+        rc = engine_ffi._op_semi_join_dt(
+            delta_batch._handle,
+            trace_cursor._handle,
+            rffi.cast(rffi.VOIDP, schema_buf),
+            out_result,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_op_semi_join_dt failed: %d" % intmask(rc))
 
-def _semi_join_dt_swapped(delta_batch, trace_cursor, out_writer):
-    with ConsolidatedScope(delta_batch) as sorted_delta:
-        delta_cursor = SortedBatchCursor(sorted_delta)
-        emit_indices = newlist_hint(sorted_delta.length())
-        while trace_cursor.is_valid():
-            trace_key_lo, trace_key_hi = trace_cursor.key_lo(), trace_cursor.key_hi()
-            if trace_cursor.weight() <= r_int64(0):
-                trace_cursor.advance()
-                continue
-            if not delta_cursor.seek_key_exact(trace_key_lo, trace_key_hi):
-                trace_cursor.advance()
-                continue
-            while delta_cursor.is_valid() and pk_eq(delta_cursor.key_lo(), delta_cursor.key_hi(), trace_key_lo, trace_key_hi):
-                emit_indices.append(delta_cursor._pos)
-                delta_cursor.advance()
-            trace_cursor.advance()
-        out_writer.copy_rows_indexed_src_weights(sorted_delta, emit_indices)
-    # Caller sets mark_sorted(True).
-
-
-def _semi_join_dt_merge_walk(delta_batch, trace_cursor, out_writer):
-    count = delta_batch.length()
-    if count == 0:
-        out_writer.mark_consolidated(True)
-        return
-    emit_indices = newlist_hint(count)
-    trace_cursor.seek(delta_batch.get_pk_lo(0), delta_batch.get_pk_hi(0))
-    for i in range(count):
-        d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
-        while trace_cursor.is_valid() and pk_lt(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
-            trace_cursor.advance()
-        in_trace = (trace_cursor.is_valid()
-                    and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi)
-                    and trace_cursor.weight() > r_int64(0))
-        if in_trace:
-            emit_indices.append(i)
-        if trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
-            trace_cursor.advance()
-    out_writer.copy_rows_indexed_src_weights(delta_batch, emit_indices)
-    out_writer.mark_consolidated(True)
+        result_handle = out_result[0]
+        is_sorted = intmask(engine_ffi._batch_is_sorted(result_handle)) != 0
+        is_consolidated = intmask(engine_ffi._batch_is_consolidated(result_handle)) != 0
+        result_batch = ArenaZSetBatch._wrap_handle(schema, result_handle, is_sorted, is_consolidated)
+        if result_batch.length() > 0:
+            out_writer.append_batch(result_batch)
+        if is_consolidated:
+            out_writer.mark_consolidated(True)
+        else:
+            out_writer.mark_sorted(True)
+        result_batch.free()
+    finally:
+        lltype.free(out_result, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")
 
 
 def op_semi_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
     """
     Delta-Delta Semi-Join (Sort-Merge): emit ΔA rows whose keys DO have
     a positive-weight match in ΔB. Weight is preserved from batch_a.
-
-    This is the complement of op_anti_join_delta_delta.
-
-    batch_a:    ArenaZSetBatch  — left delta (ΔA)
-    batch_b:    ArenaZSetBatch  — right delta (ΔB)
-    out_writer: BatchWriter     — strictly write-only destination
-    left_schema: TableSchema    — schema of batch_a (= output schema)
     """
     with ConsolidatedScope(batch_a) as b_a:
         with ConsolidatedScope(batch_b) as b_b:
@@ -195,11 +143,9 @@ def op_semi_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
             while idx_a < n_a:
                 key_a_lo, key_a_hi = b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a)
 
-                # Advance b pointer to first key >= key_a
                 while idx_b < n_b and pk_lt(b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b), key_a_lo, key_a_hi):
                     idx_b += 1
 
-                # Check if any b record at key_a has positive weight
                 has_match = False
                 if idx_b < n_b and pk_eq(b_b.get_pk_lo(idx_b), b_b.get_pk_hi(idx_b), key_a_lo, key_a_hi):
                     scan_b = idx_b
@@ -209,7 +155,6 @@ def op_semi_join_delta_delta(batch_a, batch_b, out_writer, left_schema):
                             break
                         scan_b += 1
 
-                # Find end of key group in b_a
                 start_a = idx_a
                 while idx_a < n_a and pk_eq(b_a.get_pk_lo(idx_a), b_a.get_pk_hi(idx_a), key_a_lo, key_a_hi):
                     idx_a += 1

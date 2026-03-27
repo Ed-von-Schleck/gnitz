@@ -812,347 +812,136 @@ pub extern "C" fn gnitz_compact_shards(
     result.unwrap_or(-99)
 }
 
-/// Guarded N-way merge: merge input shards, routing rows to guard-bounded outputs.
-/// Returns number of non-empty guard outputs on success, negative on error.
-#[no_mangle]
-pub extern "C" fn gnitz_merge_and_route(
-    input_files: *const *const libc::c_char,
-    num_inputs: u32,
-    output_dir: *const libc::c_char,
-    guard_keys: *const u64,  // flat array: [lo0, hi0, lo1, hi1, ...]
-    num_guards: u32,
-    schema_desc: *const crate::compact::SchemaDescriptor,
-    table_id: u32,
-    level_num: u32,
-    lsn_tag: u64,
-    out_results: *mut crate::compact::GuardResult,
-    max_results: u32,
-) -> i32 {
-    let result = panic::catch_unwind(|| {
-        if input_files.is_null() || output_dir.is_null() || schema_desc.is_null() {
-            return -1;
-        }
-        let n_inputs = num_inputs as usize;
-        let n_guards = num_guards as usize;
-        let schema = unsafe { &*schema_desc };
-        let out_dir = unsafe { CStr::from_ptr(output_dir) };
-
-        let file_ptrs = unsafe { slice::from_raw_parts(input_files, n_inputs) };
-        let inputs: Vec<&CStr> = file_ptrs
-            .iter()
-            .map(|&p| unsafe { CStr::from_ptr(p) })
-            .collect();
-
-        // Parse guard keys from flat array
-        let gk_flat = if n_guards > 0 && !guard_keys.is_null() {
-            unsafe { slice::from_raw_parts(guard_keys, n_guards * 2) }
-        } else {
-            &[]
-        };
-        let guards: Vec<(u64, u64)> = (0..n_guards)
-            .map(|i| (gk_flat[i * 2], gk_flat[i * 2 + 1]))
-            .collect();
-
-        let results = if max_results > 0 && !out_results.is_null() {
-            unsafe { slice::from_raw_parts_mut(out_results, max_results as usize) }
-        } else {
-            &mut []
-        };
-
-        crate::compact::merge_and_route(
-            &inputs, out_dir, &guards, schema,
-            table_id, level_num, lsn_tag, results,
-        )
-    });
-    result.unwrap_or(-99)
-}
 
 // ---------------------------------------------------------------------------
-// Batch merge (memtable consolidation)
+// DBSP operator FFI
 // ---------------------------------------------------------------------------
 
-/// N-way merge + consolidation of in-memory batches.
-///
-/// Each batch is described by `regions_per_batch` consecutive regions in the
-/// `in_region_ptrs`/`in_region_sizes` arrays (layout: pk_lo, pk_hi, weight,
-/// null_bmp, payload_col_0..N-1, blob). `in_row_counts[i]` gives the row count
-/// of batch `i`.
-///
-/// The caller pre-allocates output buffers (same region layout, one set) and
-/// passes them via `out_region_ptrs`. On success, `out_region_sizes` is filled
-/// with actual bytes written and `out_row_count` with the result row count.
-///
+/// Distinct operator: returns output batch + consolidated delta.
+/// Both out handles must be freed by the caller.
 /// Returns 0 on success, negative on error.
 #[no_mangle]
-pub extern "C" fn gnitz_merge_batches(
-    in_region_ptrs: *const *const u8,
-    in_region_sizes: *const u32,
-    in_row_counts: *const u32,
-    num_batches: u32,
-    regions_per_batch: u32,
-    schema_desc: *const u8,
-    out_region_ptrs: *const *mut u8,
-    out_region_sizes: *mut u32,
-    out_row_count: *mut u32,
+pub extern "C" fn gnitz_op_distinct(
+    delta_handle: *const libc::c_void,
+    cursor_handle: *mut libc::c_void,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    out_result: *mut *mut libc::c_void,
+    out_consolidated: *mut *mut libc::c_void,
 ) -> i32 {
+    if delta_handle.is_null() || cursor_handle.is_null() || schema_desc.is_null()
+        || out_result.is_null() || out_consolidated.is_null()
+    {
+        return -1;
+    }
     let result = panic::catch_unwind(|| {
-        if in_region_ptrs.is_null()
-            || in_region_sizes.is_null()
-            || in_row_counts.is_null()
-            || schema_desc.is_null()
-            || out_region_ptrs.is_null()
-            || out_region_sizes.is_null()
-            || out_row_count.is_null()
-        {
-            return -1;
+        let delta = unsafe { &*(delta_handle as *const crate::memtable::OwnedBatch) };
+        let ch = unsafe { &mut *(cursor_handle as *mut crate::read_cursor::CursorHandle) };
+        let schema = unsafe { &*schema_desc };
+        let (output, consolidated) = crate::ops::op_distinct(delta, &mut ch.cursor, schema);
+        unsafe {
+            *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void;
+            *out_consolidated = Box::into_raw(Box::new(consolidated)) as *mut libc::c_void;
         }
-        if num_batches == 0 || regions_per_batch < 5 {
-            unsafe { *out_row_count = 0; }
-            return 0;
-        }
-
-        let nb = num_batches as usize;
-        let rpb = regions_per_batch as usize;
-        let num_payload_cols = rpb - 5; // 4 fixed + blob
-        let total_regions = nb * rpb;
-
-        let schema = unsafe { &*(schema_desc as *const crate::compact::SchemaDescriptor) };
-        let in_ptrs = unsafe { slice::from_raw_parts(in_region_ptrs, total_regions) };
-        let in_sizes = unsafe { slice::from_raw_parts(in_region_sizes, total_regions) };
-        let in_counts = unsafe { slice::from_raw_parts(in_row_counts, nb) };
-        let out_ptrs = unsafe { slice::from_raw_parts(out_region_ptrs, rpb) };
-        let out_sizes = unsafe { slice::from_raw_parts_mut(out_region_sizes, rpb) };
-
-        // Compute totals for writer allocation
-        let mut total_rows: usize = 0;
-        let mut total_blob: usize = 0;
-        for bi in 0..nb {
-            total_rows += in_counts[bi] as usize;
-            let blob_ri = bi * rpb + 4 + num_payload_cols;
-            total_blob += in_sizes[blob_ri] as usize;
-        }
-        if total_blob == 0 {
-            total_blob = 1;
-        }
-
-        let batches = unsafe {
-            crate::merge::parse_batches_from_regions(
-                in_ptrs, in_sizes, in_counts, nb, rpb, num_payload_cols,
-            )
-        };
-
-        let mut writer = unsafe {
-            crate::merge::create_writer_from_regions(
-                out_ptrs, rpb, schema, total_rows, total_blob,
-            )
-        };
-
-        crate::merge::merge_batches(&batches, schema, &mut writer);
-
-        let count = writer.row_count();
-        crate::merge::fill_output_sizes(&writer, schema, out_sizes);
-        unsafe { *out_row_count = count as u32; }
         0
     });
     result.unwrap_or(-99)
 }
 
-// ---------------------------------------------------------------------------
-// Single-batch sort + consolidation
-// ---------------------------------------------------------------------------
-
-/// Sort and consolidate a single batch. Rows with the same (PK, payload)
-/// have their weights summed; zero-weight rows are dropped.
-/// RPython pre-allocates output buffers; Rust writes into them.
-///
-/// Returns 0 on success, -1 on invalid args, -99 on Rust panic.
+/// Anti-join delta-trace: returns output batch.
 #[no_mangle]
-pub extern "C" fn gnitz_consolidate_batch(
-    in_region_ptrs: *const *const u8,
-    in_region_sizes: *const u32,
-    row_count: u32,
-    regions_per_batch: u32,
+pub extern "C" fn gnitz_op_anti_join_dt(
+    delta_handle: *const libc::c_void,
+    cursor_handle: *mut libc::c_void,
     schema_desc: *const crate::compact::SchemaDescriptor,
-    out_region_ptrs: *const *mut u8,
-    out_region_sizes: *mut u32,
-    out_row_count: *mut u32,
+    out_result: *mut *mut libc::c_void,
 ) -> i32 {
+    if delta_handle.is_null() || cursor_handle.is_null() || schema_desc.is_null()
+        || out_result.is_null()
+    {
+        return -1;
+    }
     let result = panic::catch_unwind(|| {
-        if schema_desc.is_null() || out_region_sizes.is_null() || out_row_count.is_null() {
-            return -1;
-        }
-
-        let count = row_count as usize;
-        if count == 0 {
-            unsafe { *out_row_count = 0; }
-            return 0;
-        }
-
-        if in_region_ptrs.is_null() || in_region_sizes.is_null() || out_region_ptrs.is_null() {
-            return -1;
-        }
-
-        let rpb = regions_per_batch as usize;
+        let delta = unsafe { &*(delta_handle as *const crate::memtable::OwnedBatch) };
+        let ch = unsafe { &mut *(cursor_handle as *mut crate::read_cursor::CursorHandle) };
         let schema = unsafe { &*schema_desc };
-        let in_ptrs = unsafe { slice::from_raw_parts(in_region_ptrs, rpb) };
-        let in_sizes = unsafe { slice::from_raw_parts(in_region_sizes, rpb) };
-        let out_ptrs = unsafe { slice::from_raw_parts(out_region_ptrs, rpb) };
-        let out_szs = unsafe { slice::from_raw_parts_mut(out_region_sizes, rpb) };
-
-        let num_payload_cols = schema.num_columns as usize - 1;
-
-        let batch = unsafe {
-            crate::merge::parse_single_batch_from_regions(
-                in_ptrs, in_sizes, count, num_payload_cols,
-            )
-        };
-
-        let total_blob = batch.blob.len();
-        let blob_cap = if total_blob > 0 { total_blob } else { 1 };
-
-        let mut writer = unsafe {
-            crate::merge::create_writer_from_regions(
-                out_ptrs, rpb, schema, count, blob_cap,
-            )
-        };
-
-        crate::merge::sort_and_consolidate(&batch, schema, &mut writer);
-
-        crate::merge::fill_output_sizes(&writer, schema, out_szs);
-        unsafe { *out_row_count = writer.row_count() as u32; }
-
+        let output = crate::ops::op_anti_join_delta_trace(delta, &mut ch.cursor, schema);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
         0
     });
     result.unwrap_or(-99)
 }
 
-// ---------------------------------------------------------------------------
-// Single-batch sort (no consolidation)
-// ---------------------------------------------------------------------------
-
-/// Sort a batch by (PK, payload) WITHOUT consolidation.
-/// All input rows are preserved — no weight merging, no ghost elimination.
+/// Semi-join delta-trace: returns output batch.
 #[no_mangle]
-pub extern "C" fn gnitz_sort_batch(
-    in_region_ptrs: *const *const u8,
-    in_region_sizes: *const u32,
-    row_count: u32,
-    regions_per_batch: u32,
+pub extern "C" fn gnitz_op_semi_join_dt(
+    delta_handle: *const libc::c_void,
+    cursor_handle: *mut libc::c_void,
     schema_desc: *const crate::compact::SchemaDescriptor,
-    out_region_ptrs: *const *mut u8,
-    out_region_sizes: *mut u32,
-    out_row_count: *mut u32,
+    out_result: *mut *mut libc::c_void,
 ) -> i32 {
+    if delta_handle.is_null() || cursor_handle.is_null() || schema_desc.is_null()
+        || out_result.is_null()
+    {
+        return -1;
+    }
     let result = panic::catch_unwind(|| {
-        if schema_desc.is_null() || out_region_sizes.is_null() || out_row_count.is_null() {
-            return -1;
-        }
-        let count = row_count as usize;
-        if count == 0 {
-            unsafe { *out_row_count = 0; }
-            return 0;
-        }
-        if in_region_ptrs.is_null() || in_region_sizes.is_null() || out_region_ptrs.is_null() {
-            return -1;
-        }
-
-        let rpb = regions_per_batch as usize;
+        let delta = unsafe { &*(delta_handle as *const crate::memtable::OwnedBatch) };
+        let ch = unsafe { &mut *(cursor_handle as *mut crate::read_cursor::CursorHandle) };
         let schema = unsafe { &*schema_desc };
-        let in_ptrs = unsafe { slice::from_raw_parts(in_region_ptrs, rpb) };
-        let in_sizes = unsafe { slice::from_raw_parts(in_region_sizes, rpb) };
-        let out_ptrs = unsafe { slice::from_raw_parts(out_region_ptrs, rpb) };
-        let out_szs = unsafe { slice::from_raw_parts_mut(out_region_sizes, rpb) };
-        let num_payload_cols = schema.num_columns as usize - 1;
-
-        let batch = unsafe {
-            crate::merge::parse_single_batch_from_regions(
-                in_ptrs, in_sizes, count, num_payload_cols,
-            )
-        };
-        let total_blob = batch.blob.len();
-        let blob_cap = if total_blob > 0 { total_blob } else { 1 };
-        let mut writer = unsafe {
-            crate::merge::create_writer_from_regions(
-                out_ptrs, rpb, schema, count, blob_cap,
-            )
-        };
-
-        crate::merge::sort_only(&batch, schema, &mut writer);
-
-        crate::merge::fill_output_sizes(&writer, schema, out_szs);
-        unsafe { *out_row_count = writer.row_count() as u32; }
+        let output = crate::ops::op_semi_join_delta_trace(delta, &mut ch.cursor, schema);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
         0
     });
     result.unwrap_or(-99)
 }
 
-// ---------------------------------------------------------------------------
-// Scatter-copy (indexed row subset)
-// ---------------------------------------------------------------------------
-
-/// Copy rows from a source batch at the given indices.
-/// If `weights` is non-NULL, uses weights[i] for output row i.
-/// If `weights` is NULL, reads weights from the source batch.
+/// Inner join delta-trace: returns output batch with composite schema.
 #[no_mangle]
-pub extern "C" fn gnitz_scatter_copy(
-    in_region_ptrs: *const *const u8,
-    in_region_sizes: *const u32,
-    in_row_count: u32,
-    regions_per_batch: u32,
-    indices: *const u32,
-    num_indices: u32,
-    weights: *const i64,
-    schema_desc: *const crate::compact::SchemaDescriptor,
-    out_region_ptrs: *const *mut u8,
-    out_region_sizes: *mut u32,
-    out_row_count: *mut u32,
+pub extern "C" fn gnitz_op_join_dt(
+    delta_handle: *const libc::c_void,
+    cursor_handle: *mut libc::c_void,
+    left_schema: *const crate::compact::SchemaDescriptor,
+    right_schema: *const crate::compact::SchemaDescriptor,
+    out_result: *mut *mut libc::c_void,
 ) -> i32 {
+    if delta_handle.is_null() || cursor_handle.is_null()
+        || left_schema.is_null() || right_schema.is_null() || out_result.is_null()
+    {
+        return -1;
+    }
     let result = panic::catch_unwind(|| {
-        if schema_desc.is_null() || out_region_sizes.is_null() || out_row_count.is_null() {
-            return -1;
-        }
-        let ni = num_indices as usize;
-        if ni == 0 {
-            unsafe { *out_row_count = 0; }
-            return 0;
-        }
-        if in_region_ptrs.is_null() || in_region_sizes.is_null()
-            || indices.is_null() || out_region_ptrs.is_null()
-        {
-            return -1;
-        }
+        let delta = unsafe { &*(delta_handle as *const crate::memtable::OwnedBatch) };
+        let ch = unsafe { &mut *(cursor_handle as *mut crate::read_cursor::CursorHandle) };
+        let ls = unsafe { &*left_schema };
+        let rs = unsafe { &*right_schema };
+        let output = crate::ops::op_join_delta_trace(delta, &mut ch.cursor, ls, rs);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+        0
+    });
+    result.unwrap_or(-99)
+}
 
-        let rpb = regions_per_batch as usize;
-        let schema = unsafe { &*schema_desc };
-        let in_ptrs = unsafe { slice::from_raw_parts(in_region_ptrs, rpb) };
-        let in_sizes = unsafe { slice::from_raw_parts(in_region_sizes, rpb) };
-        let out_ptrs = unsafe { slice::from_raw_parts(out_region_ptrs, rpb) };
-        let out_szs = unsafe { slice::from_raw_parts_mut(out_region_sizes, rpb) };
-        let idx_slice = unsafe { slice::from_raw_parts(indices, ni) };
-        let weight_slice = if weights.is_null() {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(weights, ni) }
-        };
-
-        let num_payload_cols = schema.num_columns as usize - 1;
-        let batch = unsafe {
-            crate::merge::parse_single_batch_from_regions(
-                in_ptrs, in_sizes, in_row_count as usize, num_payload_cols,
-            )
-        };
-        let total_blob = batch.blob.len();
-        let blob_cap = if total_blob > 0 { total_blob } else { 1 };
-        let mut writer = unsafe {
-            crate::merge::create_writer_from_regions(
-                out_ptrs, rpb, schema, ni, blob_cap,
-            )
-        };
-
-        crate::merge::scatter_copy(&batch, idx_slice, weight_slice, &mut writer);
-
-        crate::merge::fill_output_sizes(&writer, schema, out_szs);
-        unsafe { *out_row_count = writer.row_count() as u32; }
+/// Left outer join delta-trace: returns output batch with composite schema.
+#[no_mangle]
+pub extern "C" fn gnitz_op_join_dt_outer(
+    delta_handle: *const libc::c_void,
+    cursor_handle: *mut libc::c_void,
+    left_schema: *const crate::compact::SchemaDescriptor,
+    right_schema: *const crate::compact::SchemaDescriptor,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if delta_handle.is_null() || cursor_handle.is_null()
+        || left_schema.is_null() || right_schema.is_null() || out_result.is_null()
+    {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let delta = unsafe { &*(delta_handle as *const crate::memtable::OwnedBatch) };
+        let ch = unsafe { &mut *(cursor_handle as *mut crate::read_cursor::CursorHandle) };
+        let ls = unsafe { &*left_schema };
+        let rs = unsafe { &*right_schema };
+        let output = crate::ops::op_join_delta_trace_outer(delta, &mut ch.cursor, ls, rs);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
         0
     });
     result.unwrap_or(-99)
@@ -1969,6 +1758,151 @@ pub extern "C" fn gnitz_batch_scatter_copy(
         Box::into_raw(Box::new(result)) as *mut libc::c_void
     });
     result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_batch_scatter_copy_weighted(
+    src: *const libc::c_void,
+    indices: *const u32,
+    weights: *const i64,
+    num_indices: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+) -> *mut libc::c_void {
+    if src.is_null() || indices.is_null() || weights.is_null() || schema_desc.is_null() {
+        return ptr::null_mut();
+    }
+    let result = panic::catch_unwind(|| {
+        let src_batch = unsafe { &*(src as *const crate::memtable::OwnedBatch) };
+        let schema = unsafe { *schema_desc };
+        let ni = num_indices as usize;
+        let idx = unsafe { slice::from_raw_parts(indices, ni) };
+        let w = unsafe { slice::from_raw_parts(weights, ni) };
+        let mb = src_batch.as_mem_batch();
+        let blob_cap = mb.blob.len().max(1);
+        let result = crate::memtable::write_to_owned_batch(&schema, ni, blob_cap, |writer| {
+            crate::merge::scatter_copy(&mb, idx, w, writer);
+        });
+        Box::into_raw(Box::new(result)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Append a single row from another batch, with a given weight.
+#[no_mangle]
+pub extern "C" fn gnitz_batch_append_row_from_batch(
+    handle: *mut libc::c_void,
+    src: *const libc::c_void,
+    row: u32,
+    weight: i64,
+) -> i32 {
+    if handle.is_null() || src.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let dst = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let src_batch = unsafe { &*(src as *const crate::memtable::OwnedBatch) };
+        let r = row as usize;
+        if r >= src_batch.count { return -1; }
+        let null_word = src_batch.get_null_word(r);
+        dst.pk_lo.extend_from_slice(&src_batch.get_pk_lo(r).to_le_bytes());
+        dst.pk_hi.extend_from_slice(&src_batch.get_pk_hi(r).to_le_bytes());
+        dst.weight.extend_from_slice(&weight.to_le_bytes());
+        dst.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+        let schema = dst.schema.unwrap_or_else(|| src_batch.schema.unwrap());
+        let pk_index = schema.pk_index as usize;
+        let mut pi = 0usize;
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index { continue; }
+            let col = &src_batch.col_data[pi];
+            let col_desc = &schema.columns[ci];
+            let cs = col_desc.size as usize;
+            let is_null = (null_word >> pi) & 1 != 0;
+            let off = r * cs;
+            if is_null {
+                let new_len = dst.col_data[pi].len() + cs;
+                dst.col_data[pi].resize(new_len, 0);
+            } else if col_desc.type_code == crate::compact::type_code::STRING {
+                crate::ops::write_string_from_raw(
+                    &mut dst.col_data[pi], &mut dst.blob,
+                    &col[off..off + cs],
+                    if src_batch.blob.is_empty() { std::ptr::null() } else { src_batch.blob.as_ptr() },
+                );
+            } else {
+                dst.col_data[pi].extend_from_slice(&col[off..off + cs]);
+            }
+            pi += 1;
+        }
+        dst.count += 1;
+        dst.sorted = false;
+        dst.consolidated = false;
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+/// Extend system column buffers by n rows (pk_lo, pk_hi, weight, null_bmp)
+/// and increment the count. The caller fills the new space via region_ptr + memcpy.
+#[no_mangle]
+pub extern "C" fn gnitz_batch_alloc_system(handle: *mut libc::c_void, n: u32) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let extra = n as usize * 8;
+        b.pk_lo.resize(b.pk_lo.len() + extra, 0);
+        b.pk_hi.resize(b.pk_hi.len() + extra, 0);
+        b.weight.resize(b.weight.len() + extra, 0);
+        b.null_bmp.resize(b.null_bmp.len() + extra, 0);
+        b.count += n as usize;
+    });
+}
+
+/// Extend a payload column buffer by n_bytes, returning a pointer to the start of the new region.
+#[no_mangle]
+pub extern "C" fn gnitz_batch_col_extend(
+    handle: *mut libc::c_void, payload_col: u32, n_bytes: u32,
+) -> *mut u8 {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let pi = payload_col as usize;
+        if pi >= b.col_data.len() { return ptr::null_mut(); }
+        let start = b.col_data[pi].len();
+        b.col_data[pi].resize(start + n_bytes as usize, 0);
+        unsafe { b.col_data[pi].as_mut_ptr().add(start) }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Extend the blob arena by n_bytes, returning the offset of the newly allocated region.
+#[no_mangle]
+pub extern "C" fn gnitz_batch_blob_extend(handle: *mut libc::c_void, n_bytes: u32) -> u64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let offset = b.blob.len();
+        b.blob.resize(offset + n_bytes as usize, 0);
+        offset as u64
+    });
+    result.unwrap_or(0)
+}
+
+/// Return the current length of the blob arena.
+#[no_mangle]
+pub extern "C" fn gnitz_batch_blob_len(handle: *const libc::c_void) -> u64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
+        b.blob.len() as u64
+    });
+    result.unwrap_or(0)
+}
+
+/// Set the row count (used by RPython after bulk appends via alloc_system + col_extend).
+#[no_mangle]
+pub extern "C" fn gnitz_batch_set_count(handle: *mut libc::c_void, count: u32) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        b.count = count as usize;
+    });
 }
 
 #[no_mangle]
@@ -3158,15 +3092,4 @@ mod tests {
         assert_eq!(gnitz_compact_shards(ptr::null(), 0, ptr::null(), ptr::null(), 0), -1);
     }
 
-    #[test]
-    fn merge_and_route_null_safety() {
-        assert_eq!(
-            gnitz_merge_and_route(
-                ptr::null(), 0, ptr::null(),
-                ptr::null(), 0, ptr::null(),
-                0, 0, 0, ptr::null_mut(), 0,
-            ),
-            -1,
-        );
-    }
 }

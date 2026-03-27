@@ -1,8 +1,9 @@
 # gnitz/dbsp/ops/distinct.py
 
-from rpython.rlib.objectmodel import newlist_hint
-from rpython.rlib.rarithmetic import r_int64, intmask
-from gnitz.core.batch import ConsolidatedScope, BatchWriter, pk_eq
+from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import intmask
+
+from gnitz.core.batch import ArenaZSetBatch
 
 """
 Distinct Operator for the DBSP algebra.
@@ -35,60 +36,39 @@ def op_distinct(delta_batch, hist_cursor, hist_table, out_writer):
     hist_table:  ZSetStore       — persistent trace holding the running sum
                                    I(δ_in) accumulated over all past ticks
     out_writer:  BatchWriter     — strictly write-only destination
-
-    The delta batch is processed in PK order; hist_cursor is advanced
-    monotonically via seek(), giving O((|Δ|+|H|)·log K) amortised cost
-    instead of O(|Δ|·K) independent per-key probes.
     """
-    with ConsolidatedScope(delta_batch) as b:
-        n = b.length()
-        if n == 0:
-            return
+    from gnitz.storage import engine_ffi
 
-        # Pass 1: pure weight logic — only touches structural columns (pk, weight).
-        # No payload access.  Collect emitting row indices and their output weights.
-        emit_indices = newlist_hint(n)
-        emit_weights = newlist_hint(n)
+    schema = delta_batch._schema
+    schema_buf = engine_ffi.pack_schema(schema)
+    out_result = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+    out_consolidated = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+    try:
+        rc = engine_ffi._op_distinct(
+            delta_batch._handle,
+            hist_cursor._handle,
+            rffi.cast(rffi.VOIDP, schema_buf),
+            out_result,
+            out_consolidated,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_op_distinct failed: %d" % intmask(rc))
 
-        for i in range(n):
-            key_lo, key_hi = b.get_pk_lo(i), b.get_pk_hi(i)
-            w_delta = b.get_weight(i)
+        result_handle = out_result[0]
+        consolidated_handle = out_consolidated[0]
 
-            hist_cursor.seek(key_lo, key_hi)
-            w_old = r_int64(0)
-            if hist_cursor.is_valid() and pk_eq(hist_cursor.key_lo(), hist_cursor.key_hi(), key_lo, key_hi):
-                w_old = hist_cursor.weight()
+        result_batch = ArenaZSetBatch._wrap_handle(schema, result_handle, True, True)
+        consolidated_batch = ArenaZSetBatch._wrap_handle(schema, consolidated_handle, True, True)
 
-            # DBSP distinct converts a multiset to a set.
-            # An element is in the set (weight 1) if its accumulated weight is > 0, else 0.
-            # In intermediate nodes, weights can be negative, so we use sign logic.
-            s_old = 0
-            if w_old > r_int64(0):
-                s_old = 1
-            elif w_old < r_int64(0):
-                s_old = -1
+        if result_batch.length() > 0:
+            out_writer.append_batch(result_batch)
+            out_writer.mark_consolidated(True)
 
-            # Algebraic summation with RPython machine-word truncation
-            w_new = r_int64(intmask(w_old + w_delta))
+        hist_table.ingest_batch(consolidated_batch)
 
-            s_new = 0
-            if w_new > r_int64(0):
-                s_new = 1
-            elif w_new < r_int64(0):
-                s_new = -1
-
-            out_w = s_new - s_old
-            if out_w != 0:
-                emit_indices.append(i)
-                emit_weights.append(r_int64(out_w))
-
-        # Pass 2: column-major payload copy for the emitting rows.
-        # One alloc_n per column; inner loop stays within one source column buffer.
-        # The output is a PK-sorted, duplicate-free subset of a consolidated input,
-        # so it is itself consolidated.
-        out_writer.copy_rows_indexed(b, emit_indices, emit_weights)
-        out_writer.mark_consolidated(True)
-
-        # Update the history with the consolidated delta before the scope expires.
-        # This reflects hist_table = I(δ_in)
-        hist_table.ingest_batch(b)
+        result_batch.free()
+        consolidated_batch.free()
+    finally:
+        lltype.free(out_result, flavor="raw")
+        lltype.free(out_consolidated, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")

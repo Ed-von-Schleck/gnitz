@@ -102,44 +102,24 @@ eci = ExternalCompilationInfo(
         "  char **input_files, uint32_t num_inputs,"
         "  char *output_file,"
         "  void *schema_desc, uint32_t table_id);",
-        "int32_t gnitz_merge_and_route("
-        "  char **input_files, uint32_t num_inputs,"
-        "  char *output_dir,"
-        "  uint64_t *guard_keys, uint32_t num_guards,"
-        "  void *schema_desc,"
-        "  uint32_t table_id, uint32_t level_num, uint64_t lsn_tag,"
-        "  void *out_results, uint32_t max_results);",
-        # batch merge (memtable consolidation)
-        "int32_t gnitz_merge_batches("
-        "  void **in_region_ptrs, uint32_t *in_region_sizes,"
-        "  uint32_t *in_row_counts, uint32_t num_batches,"
-        "  uint32_t regions_per_batch,"
-        "  void *schema_desc,"
-        "  void **out_region_ptrs, uint32_t *out_region_sizes,"
-        "  uint32_t *out_row_count);",
-        # single-batch sort + consolidation
-        "int32_t gnitz_consolidate_batch("
-        "  void **in_region_ptrs, uint32_t *in_region_sizes,"
-        "  uint32_t row_count, uint32_t regions_per_batch,"
-        "  void *schema_desc,"
-        "  void **out_region_ptrs, uint32_t *out_region_sizes,"
-        "  uint32_t *out_row_count);",
-        # single-batch sort (no consolidation)
-        "int32_t gnitz_sort_batch("
-        "  void **in_region_ptrs, uint32_t *in_region_sizes,"
-        "  uint32_t row_count, uint32_t regions_per_batch,"
-        "  void *schema_desc,"
-        "  void **out_region_ptrs, uint32_t *out_region_sizes,"
-        "  uint32_t *out_row_count);",
-        # scatter-copy (indexed row subset)
-        "int32_t gnitz_scatter_copy("
-        "  void **in_region_ptrs, uint32_t *in_region_sizes,"
-        "  uint32_t in_row_count, uint32_t regions_per_batch,"
-        "  uint32_t *indices, uint32_t num_indices,"
-        "  int64_t *weights,"
-        "  void *schema_desc,"
-        "  void **out_region_ptrs, uint32_t *out_region_sizes,"
-        "  uint32_t *out_row_count);",
+        # DBSP operators (single-call, Rust-side)
+        "int32_t gnitz_op_distinct("
+        "  const void *delta, void *cursor, const void *schema,"
+        "  void **out_result, void **out_consolidated);",
+        "int32_t gnitz_op_anti_join_dt("
+        "  const void *delta, void *cursor, const void *schema,"
+        "  void **out_result);",
+        "int32_t gnitz_op_semi_join_dt("
+        "  const void *delta, void *cursor, const void *schema,"
+        "  void **out_result);",
+        "int32_t gnitz_op_join_dt("
+        "  const void *delta, void *cursor,"
+        "  const void *left_schema, const void *right_schema,"
+        "  void **out_result);",
+        "int32_t gnitz_op_join_dt_outer("
+        "  const void *delta, void *cursor,"
+        "  const void *left_schema, const void *right_schema,"
+        "  void **out_result);",
         # shard index (opaque FLSM lifecycle handle)
         "void *gnitz_shard_index_create(uint32_t table_id, char *output_dir, void *schema_desc);",
         "void gnitz_shard_index_close(void *handle);",
@@ -690,79 +670,41 @@ _compact_shards = rffi.llexternal(
     compilation_info=eci,
 )
 
-# GuardResult: 8 (lo) + 8 (hi) + 256 (filename) = 272 bytes
-GUARD_RESULT_SIZE = 272
+# ---------------------------------------------------------------------------
+# DBSP operators (single-call, Rust-side)
+# ---------------------------------------------------------------------------
 
-_merge_and_route = rffi.llexternal(
-    "gnitz_merge_and_route",
-    [rffi.CCHARPP, rffi.UINT, rffi.CCHARP,
-     rffi.ULONGLONGP, rffi.UINT,
-     rffi.VOIDP,
-     rffi.UINT, rffi.UINT, rffi.ULONGLONG,
-     rffi.VOIDP, rffi.UINT],
+_op_distinct = rffi.llexternal(
+    "gnitz_op_distinct",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP, rffi.VOIDPP],
     rffi.INT,
     compilation_info=eci,
 )
 
-# ---------------------------------------------------------------------------
-# Batch merge (memtable consolidation)
-# ---------------------------------------------------------------------------
-
-_merge_batches = rffi.llexternal(
-    "gnitz_merge_batches",
-    [rffi.VOIDPP, rffi.UINTP,
-     rffi.UINTP, rffi.UINT,
-     rffi.UINT,
-     rffi.VOIDP,
-     rffi.VOIDPP, rffi.UINTP,
-     rffi.UINTP],
+_op_anti_join_dt = rffi.llexternal(
+    "gnitz_op_anti_join_dt",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
     rffi.INT,
     compilation_info=eci,
 )
 
-# ---------------------------------------------------------------------------
-# Single-batch sort + consolidation
-# ---------------------------------------------------------------------------
-
-_consolidate_batch = rffi.llexternal(
-    "gnitz_consolidate_batch",
-    [rffi.VOIDPP, rffi.UINTP,
-     rffi.UINT, rffi.UINT,
-     rffi.VOIDP,
-     rffi.VOIDPP, rffi.UINTP,
-     rffi.UINTP],
+_op_semi_join_dt = rffi.llexternal(
+    "gnitz_op_semi_join_dt",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
     rffi.INT,
     compilation_info=eci,
 )
 
-# ---------------------------------------------------------------------------
-# Single-batch sort (no consolidation)
-# ---------------------------------------------------------------------------
-
-_sort_batch = rffi.llexternal(
-    "gnitz_sort_batch",
-    [rffi.VOIDPP, rffi.UINTP,
-     rffi.UINT, rffi.UINT,
-     rffi.VOIDP,
-     rffi.VOIDPP, rffi.UINTP,
-     rffi.UINTP],
+_op_join_dt = rffi.llexternal(
+    "gnitz_op_join_dt",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
     rffi.INT,
     compilation_info=eci,
 )
 
-# ---------------------------------------------------------------------------
-# Scatter-copy (indexed row subset)
-# ---------------------------------------------------------------------------
-
-_scatter_copy = rffi.llexternal(
-    "gnitz_scatter_copy",
-    [rffi.VOIDPP, rffi.UINTP,
-     rffi.UINT, rffi.UINT,
-     rffi.UINTP, rffi.UINT,
-     rffi.LONGLONGP,
-     rffi.VOIDP,
-     rffi.VOIDPP, rffi.UINTP,
-     rffi.UINTP],
+_op_join_dt_outer = rffi.llexternal(
+    "gnitz_op_join_dt_outer",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
     rffi.INT,
     compilation_info=eci,
 )

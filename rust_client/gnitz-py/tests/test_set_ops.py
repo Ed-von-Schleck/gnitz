@@ -262,3 +262,36 @@ class TestSetOps:
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
             client.drop_schema(sn)
+
+    def test_distinct_retraction(self, client):
+        """DISTINCT view retracts correctly when a row is deleted."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT DISTINCT * FROM t",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+                schema_name=sn,
+            )
+            rows = client.scan(vid)
+            assert len(rows) == 3
+
+            # Delete one row — DISTINCT view should drop it
+            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+            rows = client.scan(vid)
+            vals = sorted(r["val"] for r in rows)
+            assert vals == [10, 30], f"expected [10, 30] after delete, got {vals}"
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)

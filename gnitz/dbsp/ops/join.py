@@ -1,11 +1,11 @@
 # gnitz/dbsp/ops/join.py
 
 from rpython.rlib import jit
+from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib.rarithmetic import r_int64, intmask
 
 from gnitz.core.comparator import RowAccessor, NullAccessor
-from gnitz.core.batch import ConsolidatedScope, BatchWriter, pk_lt, pk_eq
-from gnitz.storage.cursor import SortedBatchCursor
+from gnitz.core.batch import ArenaZSetBatch, ConsolidatedScope, BatchWriter, pk_lt, pk_eq
 
 """
 Bilinear Join Operators for the DBSP algebra.
@@ -14,7 +14,7 @@ Implements the incremental bilinear expansion:
     Δ(A ⋈ B) = ΔA ⋈ I(B) + I(A) ⋈ ΔB
 
 The VM compiles joins into one or two instructions depending on whether
-the operand is a persistent trace (JoinDeltaTrace) or another in-flight 
+the operand is a persistent trace (JoinDeltaTrace) or another in-flight
 delta (JoinDeltaDelta).
 """
 
@@ -125,8 +125,6 @@ class CompositeAccessor(RowAccessor):
 
 CONSOLIDATE_INTERVAL_DD = 16384   # output rows written before each consolidation (delta-delta)
 
-ADAPTIVE_SWAP_THRESHOLD = 1   # swap when delta_len > trace_len
-
 # ---------------------------------------------------------------------------
 # Join operator implementations
 # ---------------------------------------------------------------------------
@@ -134,140 +132,68 @@ ADAPTIVE_SWAP_THRESHOLD = 1   # swap when delta_len > trace_len
 
 def op_join_delta_trace(delta_batch, trace_cursor, out_writer, d_schema, t_schema):
     """
-    Delta-Trace Join (Index-Nested-Loop): ΔA ⋈ I(B).
-
-    delta_batch:   ArenaZSetBatch  — the in-flight delta (ΔA)
-    trace_cursor:  AbstractCursor  — seekable cursor over the persistent trace (I(B))
-    out_writer:    BatchWriter     — strictly write-only destination
-    d_schema:      TableSchema     — schema of delta_batch
-    t_schema:      TableSchema     — schema of the trace
+    Delta-Trace Join: ΔA ⋈ I(B). Single FFI call into Rust.
     """
-    composite_acc = CompositeAccessor(d_schema, t_schema)
-    delta_len = delta_batch.length()
-    trace_len = trace_cursor.estimated_length()
+    from gnitz.storage import engine_ffi
 
-    if delta_len > trace_len * ADAPTIVE_SWAP_THRESHOLD:
-        _join_dt_swapped(delta_batch, trace_cursor, out_writer, composite_acc)
+    out_schema = out_writer.get_schema()
+    left_buf = engine_ffi.pack_schema(d_schema)
+    right_buf = engine_ffi.pack_schema(t_schema)
+    out_result = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+    try:
+        rc = engine_ffi._op_join_dt(
+            delta_batch._handle,
+            trace_cursor._handle,
+            rffi.cast(rffi.VOIDP, left_buf),
+            rffi.cast(rffi.VOIDP, right_buf),
+            out_result,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_op_join_dt failed: %d" % intmask(rc))
+
+        result_handle = out_result[0]
+        result_batch = ArenaZSetBatch._wrap_handle(out_schema, result_handle, True, False)
+        if result_batch.length() > 0:
+            out_writer.append_batch(result_batch)
         out_writer.mark_sorted(True)
-    else:
-        with ConsolidatedScope(delta_batch) as consolidated:
-            _join_dt_merge_walk(consolidated, trace_cursor, out_writer, composite_acc)
-        # mark_sorted(True) called inside _join_dt_merge_walk
-
-
-
-def _join_dt_swapped(delta_batch, trace_cursor, out_writer, composite_acc):
-    with ConsolidatedScope(delta_batch) as sorted_delta:
-        delta_cursor = SortedBatchCursor(sorted_delta)
-        while trace_cursor.is_valid():
-            trace_key_lo, trace_key_hi = trace_cursor.key_lo(), trace_cursor.key_hi()
-            if not delta_cursor.seek_key_exact(trace_key_lo, trace_key_hi):
-                trace_cursor.advance()
-                continue
-            w_trace = trace_cursor.weight()
-            composite_acc.right_acc = trace_cursor.get_accessor()
-            while delta_cursor.is_valid() and pk_eq(delta_cursor.key_lo(), delta_cursor.key_hi(), trace_key_lo, trace_key_hi):
-                w_delta = delta_cursor.weight()
-                w_out = r_int64(intmask(w_delta * w_trace))
-                if w_out != r_int64(0):
-                    composite_acc.left_acc = delta_cursor.get_accessor()
-                    out_writer.append_from_accessor(trace_key_lo, trace_key_hi, w_out, composite_acc)
-                delta_cursor.advance()
-            trace_cursor.advance()
-    # Caller sets mark_sorted(True) — output is in trace key order.
-
-
-def _join_dt_merge_walk(delta_batch, trace_cursor, out_writer, composite_acc):
-    count = delta_batch.length()
-    if count == 0:
-        out_writer.mark_sorted(True)
-        return
-    prev_lo = delta_batch.get_pk_lo(0)
-    prev_hi = delta_batch.get_pk_hi(0)
-    trace_cursor.seek(prev_lo, prev_hi)
-    for i in range(count):
-        d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
-        w_delta = delta_batch.get_weight(i)
-        # w_delta is non-zero by _consolidated invariant.
-        if i > 0 and pk_eq(prev_lo, prev_hi, d_key_lo, d_key_hi):
-            # Multiset delta: multiple rows with same PK → re-seek trace.
-            trace_cursor.seek(d_key_lo, d_key_hi)
-        else:
-            while trace_cursor.is_valid() and pk_lt(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
-                trace_cursor.advance()
-        # Iterate all trace records for d_key (trace may have multiple rows per PK).
-        composite_acc.left_acc = delta_batch.get_accessor(i)
-        while trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
-            w_trace = trace_cursor.weight()
-            w_out = r_int64(intmask(w_delta * w_trace))
-            if w_out != r_int64(0):
-                composite_acc.right_acc = trace_cursor.get_accessor()
-                out_writer.append_from_accessor(d_key_lo, d_key_hi, w_out, composite_acc)
-            trace_cursor.advance()
-        prev_lo = d_key_lo
-        prev_hi = d_key_hi
-    out_writer.mark_sorted(True)
+        result_batch.free()
+    finally:
+        lltype.free(out_result, flavor="raw")
+        lltype.free(left_buf, flavor="raw")
+        lltype.free(right_buf, flavor="raw")
 
 
 def op_join_delta_trace_outer(delta_batch, trace_cursor, out_writer, d_schema, t_schema):
     """
-    Delta-Trace Left Outer Join (single-pass): ΔA LEFT⋈ I(B).
-
-    For each consolidated delta row:
-      - If ANY inner-join output is produced (w_delta * w_trace != 0): emit those rows.
-      - Otherwise: emit one null-fill row (left cols intact, right cols NULL).
-
-    No adaptive swap: we must iterate delta to identify no-match rows.
+    Delta-Trace Left Outer Join: ΔA LEFT⋈ I(B). Single FFI call into Rust.
     """
-    composite_acc = CompositeAccessor(d_schema, t_schema)
-    null_acc = NullAccessor()
-    with ConsolidatedScope(delta_batch) as consolidated:
-        _join_dt_outer_merge_walk(consolidated, trace_cursor, out_writer,
-                                  composite_acc, null_acc)
-    # mark_sorted(True) called inside helper
+    from gnitz.storage import engine_ffi
 
+    out_schema = out_writer.get_schema()
+    left_buf = engine_ffi.pack_schema(d_schema)
+    right_buf = engine_ffi.pack_schema(t_schema)
+    out_result = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+    try:
+        rc = engine_ffi._op_join_dt_outer(
+            delta_batch._handle,
+            trace_cursor._handle,
+            rffi.cast(rffi.VOIDP, left_buf),
+            rffi.cast(rffi.VOIDP, right_buf),
+            out_result,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_op_join_dt_outer failed: %d" % intmask(rc))
 
-def _join_dt_outer_merge_walk(delta_batch, trace_cursor, out_writer,
-                               composite_acc, null_acc):
-    count = delta_batch.length()
-    if count == 0:
+        result_handle = out_result[0]
+        result_batch = ArenaZSetBatch._wrap_handle(out_schema, result_handle, True, False)
+        if result_batch.length() > 0:
+            out_writer.append_batch(result_batch)
         out_writer.mark_sorted(True)
-        return
-    prev_lo = delta_batch.get_pk_lo(0)
-    prev_hi = delta_batch.get_pk_hi(0)
-    trace_cursor.seek(prev_lo, prev_hi)
-    for i in range(count):
-        d_key_lo, d_key_hi = delta_batch.get_pk_lo(i), delta_batch.get_pk_hi(i)
-        w_delta = delta_batch.get_weight(i)
-        # w_delta is non-zero by _consolidated invariant.
-
-        if i > 0 and pk_eq(prev_lo, prev_hi, d_key_lo, d_key_hi):
-            # Multiset delta: same PK, different payload — re-seek trace.
-            trace_cursor.seek(d_key_lo, d_key_hi)
-        else:
-            while trace_cursor.is_valid() and pk_lt(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
-                trace_cursor.advance()
-
-        composite_acc.left_acc = delta_batch.get_accessor(i)
-        matched = False
-        while trace_cursor.is_valid() and pk_eq(trace_cursor.key_lo(), trace_cursor.key_hi(), d_key_lo, d_key_hi):
-            w_trace = trace_cursor.weight()
-            w_out = r_int64(intmask(w_delta * w_trace))
-            if w_out != r_int64(0):
-                composite_acc.right_acc = trace_cursor.get_accessor()
-                out_writer.append_from_accessor(d_key_lo, d_key_hi, w_out, composite_acc)
-                matched = True
-            trace_cursor.advance()
-
-        if not matched:
-            # No inner-join output for this delta key — emit null-fill row.
-            composite_acc.right_acc = null_acc
-            out_writer.append_from_accessor(d_key_lo, d_key_hi, w_delta, composite_acc)
-
-        prev_lo = d_key_lo
-        prev_hi = d_key_hi
-
-    out_writer.mark_sorted(True)
+        result_batch.free()
+    finally:
+        lltype.free(out_result, flavor="raw")
+        lltype.free(left_buf, flavor="raw")
+        lltype.free(right_buf, flavor="raw")
 
 
 def op_join_delta_delta(batch_a, batch_b, out_writer, schema_a, schema_b):

@@ -722,3 +722,69 @@ def test_cross_table_push_scan_isolation(client):
         assert len(pks) == 10
     finally:
         _drop_all(client, sn, tables=["a", "b"])
+
+
+@_NEEDS_MULTI
+def test_workers_distinct_view(client):
+    """SELECT DISTINCT view with GNITZ_WORKERS=4."""
+    sn = "s" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT DISTINCT * FROM t",
+            schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "v")[0]
+        # Insert enough rows to spread across workers
+        vals = ", ".join(f"({i}, {i * 10})" for i in range(1, 51))
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+        rows = client.scan(vid)
+        assert len(rows) == 50, f"expected 50, got {len(rows)}"
+
+        # Delete a subset and verify retraction
+        client.execute_sql("DELETE FROM t WHERE pk = 10", schema_name=sn)
+        client.execute_sql("DELETE FROM t WHERE pk = 25", schema_name=sn)
+        rows = client.scan(vid)
+        assert len(rows) == 48, f"expected 48 after deletes, got {len(rows)}"
+    finally:
+        _drop_all(client, sn, tables=["t"], views=["v"])
+
+
+@_NEEDS_MULTI
+def test_workers_except_multiworker(client):
+    """EXCEPT (anti-join) with multi-worker distribution."""
+    sn = "s" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM a EXCEPT SELECT * FROM b",
+            schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "v")[0]
+
+        # Insert b first (exclusion set)
+        b_vals = ", ".join(f"({i}, {i * 10})" for i in [5, 10, 15, 20])
+        client.execute_sql(f"INSERT INTO b VALUES {b_vals}", schema_name=sn)
+
+        # Insert a (full set) — 20 rows, 4 overlap with b
+        a_vals = ", ".join(f"({i}, {i * 10})" for i in range(1, 21))
+        client.execute_sql(f"INSERT INTO a VALUES {a_vals}", schema_name=sn)
+
+        rows = client.scan(vid)
+        pks = sorted(r["pk"] for r in rows)
+        expected = sorted(set(range(1, 21)) - {5, 10, 15, 20})
+        assert pks == expected, f"expected {expected}, got {pks}"
+    finally:
+        _drop_all(client, sn, tables=["a", "b"], views=["v"])

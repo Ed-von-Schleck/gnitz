@@ -405,6 +405,12 @@ impl<'a> ReadCursor<'a> {
         self.valid = false;
     }
 
+    /// Approximate the total number of rows accessible via this cursor.
+    /// Used by the adaptive-swap heuristic in join/semi-join operators.
+    pub fn estimated_length(&self) -> usize {
+        self.entries.iter().map(|e| e.count).sum()
+    }
+
     /// Raw column pointer for the current row, indexed by LOGICAL column index.
     pub fn col_ptr(&self, col_idx: usize, col_size: usize) -> *const u8 {
         if !self.valid {

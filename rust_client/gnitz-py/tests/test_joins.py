@@ -230,3 +230,43 @@ class TestJoins:
                 )
         finally:
             _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
+
+    def test_inner_join_string_payload(self, client):
+        """Join with VARCHAR payload columns: verify blob data correct in output."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE items (id BIGINT NOT NULL PRIMARY KEY, "
+                "cat_id BIGINT NOT NULL, label VARCHAR(200) NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE categories (id BIGINT NOT NULL PRIMARY KEY, "
+                "name VARCHAR(200) NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM items "
+                "JOIN categories ON items.cat_id = categories.id",
+                schema_name=sn,
+            )
+            # Insert categories first
+            client.execute_sql(
+                "INSERT INTO categories VALUES (100, 'Electronics'), (200, 'Books')",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO items VALUES (1, 100, 'Laptop'), (2, 200, 'Novel'), "
+                "(3, 100, 'Phone')",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            rows = _scan_dicts(client, vid)
+            assert len(rows) == 3, f"expected 3 rows, got {len(rows)}"
+            labels = sorted([r["label"] for r in rows])
+            assert labels == ["Laptop", "Novel", "Phone"]
+            cats = sorted([r["name"] for r in rows])
+            assert cats == ["Books", "Electronics", "Electronics"]
+        finally:
+            _cleanup(client, sn, tables=["items", "categories"], views=["v"])

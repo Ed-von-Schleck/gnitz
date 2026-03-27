@@ -200,6 +200,22 @@ impl OwnedBatch {
         })
     }
 
+    /// Clone all buffers into a new independent OwnedBatch.
+    pub fn clone_batch(&self) -> Self {
+        OwnedBatch {
+            pk_lo: self.pk_lo.clone(),
+            pk_hi: self.pk_hi.clone(),
+            weight: self.weight.clone(),
+            null_bmp: self.null_bmp.clone(),
+            col_data: self.col_data.clone(),
+            blob: self.blob.clone(),
+            count: self.count,
+            sorted: self.sorted,
+            consolidated: self.consolidated,
+            schema: self.schema,
+        }
+    }
+
     pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
         let target = ((key_hi as u128) << 64) | (key_lo as u128);
         let mut lo = 0usize;
