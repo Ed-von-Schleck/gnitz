@@ -11,7 +11,6 @@ from rpython.rlib.rarithmetic import (
     r_ulonglonglong as r_uint128,
     intmask,
 )
-from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import types, errors
@@ -21,8 +20,6 @@ from gnitz.core.keys import promote_to_index_key
 from gnitz.core.batch import ArenaZSetBatch
 from gnitz.storage import engine_ffi, cursor
 from gnitz.storage.memtable import _pack_batch_regions, ACCUMULATOR_THRESHOLD
-
-_MAX_SHARDS = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -118,19 +115,6 @@ class TableFoundAccessor(RowAccessor):
         if False:
             s = ""
         return (length, prefix, ptr, blob_ptr, s)
-
-
-# ---------------------------------------------------------------------------
-# _ShardPtrView — lightweight wrapper for shard handle + count
-# ---------------------------------------------------------------------------
-
-
-class _ShardPtrView(object):
-    """Non-owning view of a MappedShard for cursor construction."""
-
-    def __init__(self, raw_ptr):
-        self._handle = raw_ptr
-        self.count = intmask(engine_ffi._shard_row_count(raw_ptr))
 
 
 # ---------------------------------------------------------------------------
@@ -401,29 +385,6 @@ class EphemeralTable(ZSetStore):
         self._accumulator.free()
         lltype.free(self._lookup_found_buf, flavor="raw")
         engine_ffi._table_close(self._handle)
-
-    # ------------------------------------------------------------------
-    # PartitionedTable support
-    # ------------------------------------------------------------------
-
-    def get_consolidated_snapshot(self):
-        """Return an opaque Rust snapshot handle (void*)."""
-        self._flush_accumulator()
-        return engine_ffi._table_get_snapshot(self._handle)
-
-    def all_shard_views_for_cursor(self):
-        out_ptrs = lltype.malloc(rffi.VOIDPP.TO, _MAX_SHARDS, flavor="raw")
-        try:
-            n = intmask(engine_ffi._table_all_shard_ptrs(
-                self._handle, out_ptrs,
-                rffi.cast(rffi.UINT, _MAX_SHARDS),
-            ))
-            views = newlist_hint(n)
-            for i in range(n):
-                views.append(_ShardPtrView(out_ptrs[i]))
-        finally:
-            lltype.free(out_ptrs, flavor="raw")
-        return views
 
     @property
     def current_lsn(self):
