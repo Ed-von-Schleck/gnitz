@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use crate::columnar::{self, ColumnarSource};
+use crate::columnar;
 use crate::compact::SchemaDescriptor;
 use crate::memtable::{self, MemTable, OwnedBatch};
 use crate::merge::MemBatch;
@@ -61,14 +61,7 @@ impl Table {
         arena_size: u64,
         durable: bool,
     ) -> Result<Self, i32> {
-        // mkdir -p (ignore EEXIST)
-        let dir_c = CString::new(dir).map_err(|_| -1)?;
-        unsafe {
-            let rc = libc::mkdir(dir_c.as_ptr(), 0o755);
-            if rc < 0 && *libc::__errno_location() != libc::EEXIST {
-                return Err(-3);
-            }
-        }
+        let dir_c = ensure_dir(dir)?;
 
         // Try to set NOCOW (btrfs; silently ignored on other fs)
         set_nocow_dir(&dir_c);
@@ -160,18 +153,14 @@ impl Table {
             self.current_lsn += 1;
         }
 
-        match self.memtable.upsert_sorted_batch(batch) {
-            Ok(()) => {
-                if self.memtable.should_flush() { self.flush()?; }
-                Ok(())
-            }
-            Err(code) if code == memtable::ERR_CAPACITY => {
-                self.flush()?;
-                // Batch was consumed by the failed upsert; caller must handle retry
-                Ok(())
-            }
-            Err(e) => Err(e),
+        if self.memtable.should_flush() {
+            self.flush()?;
         }
+        self.memtable.upsert_sorted_batch(batch)?;
+        if self.memtable.should_flush() {
+            self.flush()?;
+        }
+        Ok(())
     }
 
     /// Ingest a pre-sorted batch.  Writes WAL first (if durable), then memtable.
@@ -228,17 +217,16 @@ impl Table {
         let batch = unsafe {
             OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
         };
-        let flush_fn = |s: &mut Self| -> Result<(), i32> {
-            let durable = !force_ephemeral && s.wal_writer.is_some();
-            s.flush_inner(durable).map(|_| ())
-        };
+        let durable = !force_ephemeral && self.wal_writer.is_some();
         match self.memtable.upsert_sorted_batch(batch) {
             Ok(()) => {
-                if self.memtable.should_flush() { flush_fn(self)?; }
+                if self.memtable.should_flush() {
+                    self.flush_inner(durable)?;
+                }
                 Ok(())
             }
             Err(code) if code == memtable::ERR_CAPACITY => {
-                flush_fn(self)?;
+                self.flush_inner(durable)?;
                 let batch2 = unsafe {
                     OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
                 };
@@ -588,7 +576,7 @@ impl Table {
             child_schema,
             self.table_id,
             // Use same arena size — rough estimate from schema stride
-            (self.memtable.max_bytes() as u64),
+            self.memtable.max_bytes() as u64,
             false, // children are always ephemeral
         )
     }
@@ -649,6 +637,17 @@ impl Drop for Table {
 // ---------------------------------------------------------------------------
 // OS helpers
 // ---------------------------------------------------------------------------
+
+pub(crate) fn ensure_dir(dir: &str) -> Result<CString, i32> {
+    let dir_c = CString::new(dir).map_err(|_| -1)?;
+    unsafe {
+        let rc = libc::mkdir(dir_c.as_ptr(), 0o755);
+        if rc < 0 && *libc::__errno_location() != libc::EEXIST {
+            return Err(-3);
+        }
+    }
+    Ok(dir_c)
+}
 
 fn set_nocow_dir(dir_c: &CStr) {
     unsafe {

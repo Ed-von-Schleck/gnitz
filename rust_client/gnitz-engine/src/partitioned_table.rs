@@ -3,7 +3,6 @@
 //! User tables have 256 partitions; system tables have 1.  The partition
 //! index is `xxh3(pk_lo, pk_hi) & 0xFF`.
 
-use std::ffi::CString;
 use std::sync::Arc;
 
 use crate::compact::SchemaDescriptor;
@@ -11,7 +10,7 @@ use crate::memtable::OwnedBatch;
 use crate::merge::{self, MemBatch};
 use crate::read_cursor::{self, CursorHandle};
 use crate::shard_reader::MappedShard;
-use crate::table::Table;
+use crate::table::{self, Table};
 use crate::xxh;
 
 // ---------------------------------------------------------------------------
@@ -23,8 +22,6 @@ pub struct PartitionedTable {
     num_partitions: u32,
     part_offset: u32,
     schema: SchemaDescriptor,
-    directory: String,
-    name: String,
     last_found_partition: Option<usize>,
 }
 
@@ -40,13 +37,7 @@ impl PartitionedTable {
         part_end: u32,
         arena_size: u64,
     ) -> Result<Self, i32> {
-        let dir_c = CString::new(dir).map_err(|_| -1)?;
-        unsafe {
-            let rc = libc::mkdir(dir_c.as_ptr(), 0o755);
-            if rc < 0 && *libc::__errno_location() != libc::EEXIST {
-                return Err(-3);
-            }
-        }
+        table::ensure_dir(dir)?;
 
         let mut tables = Vec::with_capacity((part_end - part_start) as usize);
         for p in part_start..part_end {
@@ -64,8 +55,6 @@ impl PartitionedTable {
             num_partitions,
             part_offset: part_start,
             schema,
-            directory: dir.to_string(),
-            name: name.to_string(),
             last_found_partition: None,
         })
     }
