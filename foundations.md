@@ -195,11 +195,18 @@ Merges N sorted batches via min-heap (tournament tree) ordered by
 > aggregates (MIN/MAX) whose secondary index tables have entries with
 > matching PKs but varying payloads.
 
-### 4c. Shard compaction: `compact_shards()` (Rust)
+### 4c. Shard compaction: `compact_shards()` / `open_and_merge()` (Rust)
 
-Merges N sorted shard files. Same tournament tree with payload-aware
-comparison (`compare_to_root` calls `compare_rows`). Per-shard data is
-already consolidated; cross-shard duplicates are not.
+Merges N sorted shard files via min-heap ordered by **(PK, payload)**.
+Pending-group drain: pops one entry at a time, accumulates weight while
+(PK, payload) matches, flushes on differ — same algorithm as 4b.
+Per-shard data is already consolidated; cross-shard duplicates are not.
+
+Historical bug (fixed 2026-03): the heap used PK-only ordering.
+`collect_min_indices` used full comparison but its tree walk stopped at
+non-equal nodes, missing matching entries deeper in the heap. This
+corrupted any table flushed between ticks where retractions and
+insertions for the same (PK, payload) ended up in different shards.
 
 ## 5. Row Comparison: `compare_rows`
 

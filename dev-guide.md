@@ -91,9 +91,22 @@ When adding or modifying a merge path (tournament tree, sort, compaction):
       multiple times in one run (e.g., +1 then -1 for the same key).
 - [ ] Is `compare_rows` identical between RPython and Rust? Column order,
       null handling (null < non-null), and sign-extension must match.
-- [ ] Test with non-linear aggregates (MIN/MAX). These use secondary
-      index tables with matching PKs but different payloads — the exact
-      pattern where PK-only ordering silently breaks consolidation.
+- [ ] Test with entries that share the same PK but differ in payload
+      columns. This pattern arises in: reduce output (retraction of old
+      aggregate + insertion of new), non-linear aggregates (MIN/MAX)
+      with secondary index tables, and any Z-Set where multiple logical
+      values share a key. PK-only ordering silently breaks consolidation
+      for these cases.
+- [ ] Is there a Rust unit test with **same-PK, different-payload**
+      entries across multiple input sources? This is the pattern that
+      PK-only ordering silently breaks. Test with ≥3 inputs so entries
+      span multiple heap rounds (existing: `test_compact_same_pk_*`,
+      `test_compact_10_tick_*` in `compact.rs`).
+- [ ] For view stores: does the test cover the flush-between-ticks
+      scenario? `evaluate_dag` calls `view_family.store.flush()` after
+      every tick, creating one shard per non-empty partition per tick.
+      After L0_COMPACT_THRESHOLD (4) ticks, compaction merges these
+      shards — the exact path where the heap ordering matters.
 
 ## Rust static lib rebuild rule
 
