@@ -187,7 +187,7 @@ impl MappedShard {
         let d = self.data();
         let lo = read_u64_le(d, self.pk_lo_off + row * 8);
         let hi = read_u64_le(d, self.pk_hi_off + row * 8);
-        ((hi as u128) << 64) | (lo as u128)
+        crate::util::make_pk(lo, hi)
     }
 
     #[inline]

@@ -164,9 +164,7 @@ impl OwnedBatch {
 
     #[inline]
     pub fn get_pk(&self, row: usize) -> u128 {
-        let lo = self.get_pk_lo(row) as u128;
-        let hi = self.get_pk_hi(row) as u128;
-        (hi << 64) | lo
+        crate::util::make_pk(self.get_pk_lo(row), self.get_pk_hi(row))
     }
 
     #[inline]
@@ -217,7 +215,7 @@ impl OwnedBatch {
     }
 
     pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
-        let target = ((key_hi as u128) << 64) | (key_lo as u128);
+        let target = crate::util::make_pk(key_lo, key_hi);
         let mut lo = 0usize;
         let mut hi = self.count;
         while lo < hi {
@@ -649,6 +647,7 @@ impl MemTable {
         let num_payload_cols = self.schema.num_columns as usize - 1;
 
         if self.cached_consolidated.is_none() && !self.runs.is_empty() {
+            let total_rows: usize = self.runs.iter().map(|r| r.count).sum();
             let batches: Vec<MemBatch> =
                 self.runs.iter().map(|r| r.as_mem_batch()).collect();
             let consolidated = consolidate_batches(&batches, &self.schema);
@@ -1132,4 +1131,83 @@ mod tests {
         assert!(batch.consolidated);
     }
 
+    /// Schema matching reduce output: U128 PK (pk_index=0) + I64 group_val + I64 agg_val
+    fn make_reduce_schema() -> SchemaDescriptor {
+        let mut sd = SchemaDescriptor {
+            num_columns: 3,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        sd.columns[0] = SchemaColumn { type_code: 12, size: 16, nullable: 0, _pad: 0 }; // U128 PK
+        sd.columns[1] = SchemaColumn { type_code: 9, size: 8, nullable: 0, _pad: 0 };   // I64 group_val
+        sd.columns[2] = SchemaColumn { type_code: 9, size: 8, nullable: 0, _pad: 0 };   // I64 agg_val
+        sd
+    }
+
+    /// Build a 3-column OwnedBatch from (pk_lo, pk_hi, weight, group_val, agg_val) tuples.
+    fn make_reduce_batch(rows: &[(u64, u64, i64, i64, i64)]) -> OwnedBatch {
+        let n = rows.len();
+        let mut pk_lo = vec![0u8; n * 8];
+        let mut pk_hi = vec![0u8; n * 8];
+        let mut weight = vec![0u8; n * 8];
+        let mut null_bmp = vec![0u8; n * 8];
+        let mut col0 = vec![0u8; n * 8]; // group_val (I64)
+        let mut col1 = vec![0u8; n * 8]; // agg_val (I64)
+        for (i, &(plo, phi, w, gv, av)) in rows.iter().enumerate() {
+            pk_lo[i*8..i*8+8].copy_from_slice(&plo.to_le_bytes());
+            pk_hi[i*8..i*8+8].copy_from_slice(&phi.to_le_bytes());
+            weight[i*8..i*8+8].copy_from_slice(&w.to_le_bytes());
+            // null_bmp stays zero (no nulls)
+            col0[i*8..i*8+8].copy_from_slice(&gv.to_le_bytes());
+            col1[i*8..i*8+8].copy_from_slice(&av.to_le_bytes());
+        }
+        let mut batch = OwnedBatch {
+            pk_lo, pk_hi, weight, null_bmp,
+            col_data: vec![col0, col1],
+            blob: Vec::new(),
+            count: n,
+            sorted: true,
+            consolidated: false,
+            schema: None,
+        };
+        batch
+    }
+
+    /// Reproduce the reduce output pattern: insertion + retraction across ticks.
+    /// After consolidation, only the LAST tick's aggregate should survive.
+    #[test]
+    fn test_reduce_output_consolidation_3col() {
+        let schema = make_reduce_schema();
+
+        // Tick 1: insert (PK=0, group=0, sum=5000, w=+1)
+        let run1 = make_reduce_batch(&[(0, 0, 1, 0, 5000)]);
+        // Tick 2: retract old, insert new
+        let run2 = make_reduce_batch(&[
+            (0, 0, -1, 0, 5000),   // retract sum=5000
+            (0, 0,  1, 0, 10000),  // insert sum=10000
+        ]);
+        // Tick 3: retract old, insert new
+        let run3 = make_reduce_batch(&[
+            (0, 0, -1, 0, 10000),  // retract sum=10000
+            (0, 0,  1, 0, 15000),  // insert sum=15000
+        ]);
+
+        let batches: Vec<crate::merge::MemBatch> = vec![
+            run1.as_mem_batch(),
+            run2.as_mem_batch(),
+            run3.as_mem_batch(),
+        ];
+
+        let consolidated = consolidate_batches(&batches, &schema);
+
+        // After consolidation: only (PK=0, group=0, sum=15000, w=+1) should remain
+        assert_eq!(consolidated.count, 1,
+            "expected 1 row after consolidation, got {}", consolidated.count);
+        assert_eq!(consolidated.get_pk_lo(0), 0);
+        assert_eq!(consolidated.get_weight(0), 1);
+        // Check agg_val (payload column 1) = 15000
+        let agg_bytes = consolidated.get_col_ptr(0, 1, 8);
+        let agg_val = i64::from_le_bytes(agg_bytes.try_into().unwrap());
+        assert_eq!(agg_val, 15000, "expected agg_val=15000, got {}", agg_val);
+    }
 }

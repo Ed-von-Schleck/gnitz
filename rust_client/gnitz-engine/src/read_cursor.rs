@@ -50,9 +50,7 @@ impl<'a> CursorSource<'a> {
 
     #[inline]
     fn get_pk(&self, row: usize) -> u128 {
-        let lo = self.get_pk_lo(row) as u128;
-        let hi = self.get_pk_hi(row) as u128;
-        (hi << 64) | lo
+        crate::util::make_pk(self.get_pk_lo(row), self.get_pk_hi(row))
     }
 
     #[inline]

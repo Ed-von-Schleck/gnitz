@@ -9,22 +9,13 @@ use std::fs;
 use crate::compact::{self, SchemaDescriptor};
 use crate::manifest::{self, ManifestEntryRaw};
 use crate::shard_reader::MappedShard;
+use crate::util::{make_pk, split_pk};
 
 const MAX_LEVELS: usize = 3;
 const L0_COMPACT_THRESHOLD: usize = 4;
 const GUARD_FILE_THRESHOLD: usize = 4;
 const LMAX_FILE_THRESHOLD: usize = 1;
 const L1_TARGET_FILES: usize = 16;
-
-#[inline]
-fn make_pk(lo: u64, hi: u64) -> u128 {
-    ((hi as u128) << 64) | (lo as u128)
-}
-
-#[inline]
-fn split_pk(pk: u128) -> (u64, u64) {
-    (pk as u64, (pk >> 64) as u64)
-}
 
 fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, i32> {
     strings
@@ -232,27 +223,24 @@ impl ShardIndex {
             .collect()
     }
 
-    pub fn find_pk(&self, key_lo: u64, key_hi: u64) -> Vec<(*const MappedShard, usize)> {
+    pub fn find_pk(&self, key_lo: u64, key_hi: u64, visitor: &mut impl FnMut(*const MappedShard, usize)) {
         let key = make_pk(key_lo, key_hi);
-        let mut results = Vec::with_capacity(2);
 
         for e in &self.l0 {
-            if let Some(hit) = e.probe_pk(key, key_lo, key_hi) {
-                results.push(hit);
+            if let Some((ptr, idx)) = e.probe_pk(key, key_lo, key_hi) {
+                visitor(ptr, idx);
             }
         }
 
         for level in &self.levels {
             if let Some(g_idx) = level.find_guard_idx(key) {
                 for e in &level.guards[g_idx].entries {
-                    if let Some(hit) = e.probe_pk(key, key_lo, key_hi) {
-                        results.push(hit);
+                    if let Some((ptr, idx)) = e.probe_pk(key, key_lo, key_hi) {
+                        visitor(ptr, idx);
                     }
                 }
             }
         }
-
-        results
     }
 
     pub fn max_lsn(&self) -> u64 {
@@ -307,9 +295,17 @@ impl ShardIndex {
 
     pub fn load_manifest(&mut self, path: &str) -> Result<(), i32> {
         let cpath = CString::new(path).map_err(|_| -1)?;
-        let mut entries = vec![ManifestEntryRaw::zeroed(); 4096];
+        let cap = manifest::entry_count(&cpath);
+        if cap < 0 {
+            if cap == manifest::MANIFEST_ERR_IO {
+                return Ok(());
+            }
+            return Err(cap);
+        }
+        let cap = (cap as usize).max(1);
+        let mut entries = vec![ManifestEntryRaw::zeroed(); cap];
         let mut global_lsn = 0u64;
-        let count = manifest::read_file(&cpath, &mut entries, 4096, &mut global_lsn);
+        let count = manifest::read_file(&cpath, &mut entries, cap as u32, &mut global_lsn);
         if count < 0 {
             if count == manifest::MANIFEST_ERR_IO {
                 return Ok(());
@@ -682,5 +678,279 @@ impl ShardIndex {
 
         self.pending_deletions = remaining;
         deleted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compact::{SchemaColumn, SchemaDescriptor};
+    use crate::shard_file;
+
+    fn test_schema() -> SchemaDescriptor {
+        let mut sd = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn {
+                type_code: 0,
+                size: 0,
+                nullable: 0,
+                _pad: 0,
+            }; 64],
+        };
+        // col 0 = PK (U64, size 8)
+        sd.columns[0] = SchemaColumn {
+            type_code: 8,
+            size: 8,
+            nullable: 0,
+            _pad: 0,
+        };
+        // col 1 = payload (I64, size 8)
+        sd.columns[1] = SchemaColumn {
+            type_code: 9,
+            size: 8,
+            nullable: 0,
+            _pad: 0,
+        };
+        sd
+    }
+
+    /// Build and write a shard file with the given PK/value pairs. All pk_hi = 0.
+    fn write_test_shard(
+        dir: &std::path::Path,
+        name: &str,
+        pk_los: &[u64],
+        values: &[i64],
+    ) -> String {
+        let n = pk_los.len();
+        let pk_hi = vec![0u64; n];
+        let weights = vec![1i64; n];
+        let nulls = vec![0u64; n];
+        let blob: Vec<u8> = Vec::new();
+
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_los.as_ptr() as *const u8, n * 8),
+            (pk_hi.as_ptr() as *const u8, n * 8),
+            (weights.as_ptr() as *const u8, n * 8),
+            (nulls.as_ptr() as *const u8, n * 8),
+            (values.as_ptr() as *const u8, n * 8),
+            (blob.as_ptr(), 0),
+        ];
+
+        let image = shard_file::build_shard_image(42, n as u32, &regions);
+        let path = dir.join(name);
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let rc = shard_file::write_shard_at(libc::AT_FDCWD, &cpath, &image, false);
+        assert_eq!(rc, 0);
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_add_shard_and_find_pk() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        let path1 = write_test_shard(dir.path(), "s1.db", &[10, 20, 30], &[100, 200, 300]);
+        let path2 = write_test_shard(dir.path(), "s2.db", &[25, 35, 40], &[250, 350, 400]);
+
+        idx.add_shard(&path1, 1, 10).unwrap();
+        idx.add_shard(&path2, 11, 20).unwrap();
+
+        // Find existing keys
+        let mut hits = Vec::new();
+        idx.find_pk(10, 0, &mut |ptr, row| hits.push((ptr, row)));
+        assert_eq!(hits.len(), 1);
+
+        hits.clear();
+        idx.find_pk(25, 0, &mut |ptr, row| hits.push((ptr, row)));
+        assert_eq!(hits.len(), 1);
+
+        // Missing key returns nothing
+        hits.clear();
+        idx.find_pk(99, 0, &mut |ptr, row| hits.push((ptr, row)));
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_roundtrip_with_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        // Add enough shards to trigger compaction to L1
+        for i in 0..5u64 {
+            let name = format!("s{}.db", i);
+            let pk = i * 10 + 1;
+            let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 100]);
+            idx.add_shard(&path, i, i + 1).unwrap();
+        }
+        idx.run_compact().unwrap();
+
+        // Publish manifest
+        let manifest_path = dir.path().join("MANIFEST");
+        idx.publish_manifest(manifest_path.to_str().unwrap()).unwrap();
+
+        // Load into a fresh index
+        let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+
+        // Verify all keys are findable in the new index
+        for i in 0..5u64 {
+            let pk = i * 10 + 1;
+            let mut found = false;
+            idx2.find_pk(pk, 0, &mut |_, _| found = true);
+            assert!(found, "key {} not found after manifest roundtrip", pk);
+        }
+
+        assert_eq!(idx.max_lsn(), idx2.max_lsn());
+    }
+
+    #[test]
+    fn test_run_compact_l0_to_l1() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        // Add > L0_COMPACT_THRESHOLD shards
+        let mut all_pks = Vec::new();
+        for i in 0..5u64 {
+            let name = format!("s{}.db", i);
+            let pk = (i + 1) * 10;
+            let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64]);
+            idx.add_shard(&path, i, i + 1).unwrap();
+            all_pks.push(pk);
+        }
+
+        assert!(idx.needs_compaction);
+        idx.run_compact().unwrap();
+
+        // L0 should be empty after compaction
+        assert!(idx.l0.is_empty());
+        // L1 should have entries
+        assert!(!idx.levels.is_empty());
+        assert!(idx.levels[0].total_file_count() > 0);
+
+        // All keys still findable
+        for pk in &all_pks {
+            let mut found = false;
+            idx.find_pk(*pk, 0, &mut |_, _| found = true);
+            assert!(found, "key {} lost after compaction", pk);
+        }
+    }
+
+    #[test]
+    fn test_compact_guards_if_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        // Manually populate L1 with > GUARD_FILE_THRESHOLD entries in one guard
+        idx.ensure_level(1);
+        let guard = idx.levels[0].get_or_create_guard(0, 0);
+        let mut all_pks = Vec::new();
+        for i in 0..6u64 {
+            let name = format!("guard_s{}.db", i);
+            let pk = i + 1;
+            let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
+            let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
+            guard.entries.push(entry);
+            all_pks.push(pk);
+        }
+        assert!(idx.levels[0].guards[0].entries.len() > GUARD_FILE_THRESHOLD);
+
+        idx.compact_guards_if_needed().unwrap();
+
+        // After compaction the guard should have 1 file
+        assert_eq!(idx.levels[0].guards[0].entries.len(), 1);
+
+        // All keys still findable
+        for pk in &all_pks {
+            let mut found = false;
+            idx.find_pk(*pk, 0, &mut |_, _| found = true);
+            assert!(found, "key {} lost after guard compaction", pk);
+        }
+    }
+
+    #[test]
+    fn test_find_guards_for_range() {
+        let mut level = FLSMLevel::new();
+        // Guards at keys 0, 100, 200, 300
+        for gk in [0u64, 100, 200, 300] {
+            level.guards.push(LevelGuard::new(gk, 0));
+        }
+
+        // Range entirely within guard 0
+        let r = level.find_guards_for_range(make_pk(10, 0), make_pk(50, 0));
+        assert_eq!(r, vec![0]);
+
+        // Range spanning guards 1 and 2
+        let r = level.find_guards_for_range(make_pk(100, 0), make_pk(250, 0));
+        assert_eq!(r, vec![1, 2]);
+
+        // Range spanning all guards
+        let r = level.find_guards_for_range(make_pk(0, 0), make_pk(999, 0));
+        assert_eq!(r, vec![0, 1, 2, 3]);
+
+        // Point query at exact guard boundary
+        let r = level.find_guards_for_range(make_pk(200, 0), make_pk(200, 0));
+        assert_eq!(r, vec![2]);
+
+        // Range below all guards still hits guard 0 (partition_point - 1)
+        let r = level.find_guards_for_range(make_pk(0, 0), make_pk(0, 0));
+        assert_eq!(r, vec![0]);
+
+        // No guards at all
+        let empty = FLSMLevel::new();
+        let r = empty.find_guards_for_range(make_pk(0, 0), make_pk(100, 0));
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_try_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        // Create real files
+        let path1 = write_test_shard(dir.path(), "cleanup1.db", &[1], &[10]);
+        let path2 = write_test_shard(dir.path(), "cleanup2.db", &[2], &[20]);
+        assert!(std::path::Path::new(&path1).exists());
+        assert!(std::path::Path::new(&path2).exists());
+
+        // Add real + nonexistent to pending deletions
+        idx.pending_deletions.push(path1.clone());
+        idx.pending_deletions.push(path2.clone());
+        idx.pending_deletions
+            .push(dir.path().join("nonexistent.db").to_str().unwrap().to_string());
+
+        let deleted = idx.try_cleanup();
+        // All 3 should count as deleted (2 real + 1 NotFound)
+        assert_eq!(deleted, 3);
+        assert!(idx.pending_deletions.is_empty());
+        assert!(!std::path::Path::new(&path1).exists());
+        assert!(!std::path::Path::new(&path2).exists());
+    }
+
+    #[test]
+    fn test_max_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        assert_eq!(idx.max_lsn(), 0);
+
+        let path1 = write_test_shard(dir.path(), "lsn1.db", &[10], &[100]);
+        idx.add_shard(&path1, 5, 50).unwrap();
+        assert_eq!(idx.max_lsn(), 50);
+
+        let path2 = write_test_shard(dir.path(), "lsn2.db", &[20], &[200]);
+        idx.add_shard(&path2, 100, 200).unwrap();
+        assert_eq!(idx.max_lsn(), 200);
+
+        let path3 = write_test_shard(dir.path(), "lsn3.db", &[30], &[300]);
+        idx.add_shard(&path3, 10, 75).unwrap();
+        // max_lsn should still be 200 (from second shard)
+        assert_eq!(idx.max_lsn(), 200);
     }
 }

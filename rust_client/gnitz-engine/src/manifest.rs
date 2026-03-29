@@ -55,12 +55,7 @@ impl ManifestEntryRaw {
     }
 
     pub fn filename_str(&self) -> &str {
-        let end = self
-            .filename
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.filename.len());
-        std::str::from_utf8(&self.filename[..end]).unwrap_or("")
+        crate::util::cstr_from_buf(&self.filename)
     }
 }
 
@@ -261,17 +256,20 @@ pub fn write_file(
         let rc = crate::util::write_all_fd(fd, &buf[..written as usize]);
         if rc < 0 {
             libc::close(fd);
+            libc::unlink(tmp_cstr);
             return MANIFEST_ERR_IO;
         }
 
         if libc::fdatasync(fd) < 0 {
             libc::close(fd);
+            libc::unlink(tmp_cstr);
             return MANIFEST_ERR_IO;
         }
 
         libc::close(fd);
 
         if libc::rename(tmp_cstr, path.as_ptr()) < 0 {
+            libc::unlink(tmp_cstr);
             return MANIFEST_ERR_IO;
         }
     }
@@ -280,6 +278,29 @@ pub fn write_file(
 }
 
 pub const MANIFEST_ERR_IO: i32 = -3;
+
+/// Read just the entry count from a manifest file header.
+/// Returns the count (>= 0) on success, or MANIFEST_ERR_IO if the file
+/// cannot be opened (e.g. does not exist).
+pub fn entry_count(path: &std::ffi::CStr) -> i32 {
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY, 0);
+        if fd < 0 {
+            return MANIFEST_ERR_IO;
+        }
+        let mut hdr = [0u8; HEADER_SIZE];
+        let n = crate::util::read_all_fd(fd, &mut hdr);
+        libc::close(fd);
+        if n < HEADER_SIZE as i64 {
+            return MANIFEST_ERR_IO;
+        }
+        let magic = read_u64_le(&hdr, 0);
+        if magic != MAGIC {
+            return MANIFEST_ERR_MAGIC;
+        }
+        read_u64_le(&hdr, 16) as i32
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests

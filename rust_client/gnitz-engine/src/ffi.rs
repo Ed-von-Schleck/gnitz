@@ -3076,14 +3076,17 @@ pub extern "C" fn gnitz_shard_index_find_pk(
             return 0;
         }
         let idx = unsafe { &*(handle as *const crate::shard_index::ShardIndex) };
-        let results = idx.find_pk(key_lo, key_hi);
-        let n = results.len().min(max_results as usize);
-        let ptrs = unsafe { slice::from_raw_parts_mut(out_shard_ptrs, n) };
-        let indices = unsafe { slice::from_raw_parts_mut(out_row_indices, n) };
-        for i in 0..n {
-            ptrs[i] = results[i].0 as *const c_void;
-            indices[i] = results[i].1 as i32;
-        }
+        let max = max_results as usize;
+        let ptrs = unsafe { slice::from_raw_parts_mut(out_shard_ptrs, max) };
+        let indices = unsafe { slice::from_raw_parts_mut(out_row_indices, max) };
+        let mut n = 0usize;
+        idx.find_pk(key_lo, key_hi, &mut |shard_ptr, row_idx| {
+            if n < max {
+                ptrs[n] = shard_ptr as *const c_void;
+                indices[n] = row_idx as i32;
+                n += 1;
+            }
+        });
         n as i32
     });
     result.unwrap_or(0)

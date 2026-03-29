@@ -79,19 +79,9 @@ impl GuardResult {
     }
 
     pub fn filename_str(&self) -> &str {
-        let end = self
-            .filename
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.filename.len());
-        std::str::from_utf8(&self.filename[..end]).unwrap_or("")
+        crate::util::cstr_from_buf(&self.filename)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Shard cursor (position + ghost skip)
@@ -387,8 +377,7 @@ fn find_guard_for_key(guard_keys: &[(u64, u64)], key: u128) -> usize {
     while lo < hi {
         let mid = (lo + hi + 1) / 2;
         let (gk_lo, gk_hi) = guard_keys[mid];
-        let gk = ((gk_hi as u128) << 64) | (gk_lo as u128);
-        if gk <= key {
+        if crate::util::make_pk(gk_lo, gk_hi) <= key {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -435,41 +424,69 @@ fn open_and_merge(
         &key_less,
     );
 
+    // Pending-group algorithm: accumulate weight while (PK, payload) matches,
+    // flush on change. This replaces collect_min_indices with a sequential
+    // drain of all cursors at the minimum PK, processing one (PK, payload)
+    // group at a time.  Correct regardless of heap ordering granularity.
+    let mut has_pending = false;
+    let mut pending_shard_idx: usize = 0;
+    let mut pending_row: usize = 0;
+    let mut pending_key: u128 = 0;
+    let mut pending_weight: i64 = 0;
+
     let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
     while !tree.is_empty() {
         let min_key = tree.min_key();
 
+        // Collect ALL cursors at min PK (same as before — PK-equal)
         let num_min = tree.collect_min_indices(
             &|a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> std::cmp::Ordering {
-                let key_ord = a.key.cmp(&b.key);
-                if key_ord != std::cmp::Ordering::Equal {
-                    return key_ord;
-                }
-                let ca = &cursors[a.idx];
-                let cb = &cursors[b.idx];
-                columnar::compare_rows(
-                    schema,
-                    &shards[ca.shard_idx], ca.position,
-                    &shards[cb.shard_idx], cb.position,
-                )
+                a.key.cmp(&b.key)
             },
         );
 
-        let mut net_weight: i64 = 0;
+        // Sort collected indices by (PK, payload) so matching entries are adjacent
+        let min_slice = &mut tree.min_indices[..num_min];
+        min_slice.sort_by(|&ai, &bi| {
+            columnar::compare_rows(
+                schema,
+                &shards[cursors[ai].shard_idx], cursors[ai].position,
+                &shards[cursors[bi].shard_idx], cursors[bi].position,
+            )
+        });
+
+        // Walk sorted entries, accumulating weight for matching (PK, payload)
         for i in 0..num_min {
-            let ci = tree.min_indices[i];
-            net_weight += cursors[ci].weight(&shards[cursors[ci].shard_idx]);
+            let ci = min_slice[i];
+            let si = cursors[ci].shard_idx;
+            let row = cursors[ci].position;
+            let w = cursors[ci].weight(&shards[si]);
+
+            let same_group = has_pending
+                && min_key == pending_key
+                && columnar::compare_rows(
+                    schema,
+                    &shards[pending_shard_idx], pending_row,
+                    &shards[si], row,
+                ) == std::cmp::Ordering::Equal;
+
+            if same_group {
+                pending_weight += w;
+            } else {
+                if has_pending && pending_weight != 0 {
+                    emit(pending_key, pending_weight, &shards[pending_shard_idx], pending_row);
+                }
+                pending_shard_idx = si;
+                pending_row = row;
+                pending_key = min_key;
+                pending_weight = w;
+                has_pending = true;
+            }
         }
 
-        if net_weight != 0 {
-            let exemplar = tree.min_indices[0];
-            let shard_idx = cursors[exemplar].shard_idx;
-            let row = cursors[exemplar].position;
-            emit(min_key, net_weight, &shards[shard_idx], row);
-        }
-
+        // Advance all collected cursors
         advance_buf.clear();
-        advance_buf.extend_from_slice(&tree.min_indices[..num_min]);
+        advance_buf.extend_from_slice(min_slice);
         for &ci in &advance_buf {
             let shard = &shards[cursors[ci].shard_idx];
             cursors[ci].advance(shard);
@@ -480,6 +497,11 @@ fn open_and_merge(
             };
             tree.advance(ci, new_key, &key_less);
         }
+    }
+
+    // Flush last pending group
+    if has_pending && pending_weight != 0 {
+        emit(pending_key, pending_weight, &shards[pending_shard_idx], pending_row);
     }
 
     Ok(())

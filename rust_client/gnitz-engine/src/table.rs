@@ -388,10 +388,9 @@ impl Table {
         }
 
         // Shards
-        let results = self.shard_index.find_pk(key_lo, key_hi);
-        for (shard_ptr, start_idx) in &results {
-            let shard = unsafe { &**shard_ptr };
-            let mut idx = *start_idx;
+        self.shard_index.find_pk(key_lo, key_hi, &mut |shard_ptr, start_idx| {
+            let shard = unsafe { &*shard_ptr };
+            let mut idx = start_idx;
             while idx < shard.count {
                 if shard.get_pk_lo(idx) != key_lo || shard.get_pk_hi(idx) != key_hi {
                     break;
@@ -404,7 +403,7 @@ impl Table {
                 }
                 idx += 1;
             }
-        }
+        });
 
         total_w
     }
@@ -605,24 +604,23 @@ impl Table {
         key_lo: u64,
         key_hi: u64,
     ) -> (i64, Option<(*const MappedShard, usize)>) {
-        let results = self.shard_index.find_pk(key_lo, key_hi);
         let mut total_w: i64 = 0;
         let mut first_found: Option<(*const MappedShard, usize)> = None;
 
-        for (shard_ptr, start_idx) in &results {
-            let shard = unsafe { &**shard_ptr };
-            let mut idx = *start_idx;
+        self.shard_index.find_pk(key_lo, key_hi, &mut |shard_ptr, start_idx| {
+            let shard = unsafe { &*shard_ptr };
+            let mut idx = start_idx;
             while idx < shard.count {
                 if shard.get_pk_lo(idx) != key_lo || shard.get_pk_hi(idx) != key_hi {
                     break;
                 }
                 total_w += shard.get_weight(idx);
                 if first_found.is_none() {
-                    first_found = Some((*shard_ptr, idx));
+                    first_found = Some((shard_ptr, idx));
                 }
                 idx += 1;
             }
-        }
+        });
 
         (total_w, first_found)
     }

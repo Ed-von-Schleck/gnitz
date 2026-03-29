@@ -160,6 +160,7 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
         libc::close(fd);
 
         if libc::renameat(dirfd, tmp_name, dirfd, basename.as_ptr()) < 0 {
+            libc::unlinkat(dirfd, tmp_name, 0);
             return -3;
         }
     }

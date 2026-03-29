@@ -42,9 +42,7 @@ impl<'a> MemBatch<'a> {
     }
     #[inline]
     pub fn get_pk(&self, row: usize) -> u128 {
-        let lo = self.get_pk_lo(row) as u128;
-        let hi = self.get_pk_hi(row) as u128;
-        (hi << 64) | lo
+        crate::util::make_pk(self.get_pk_lo(row), self.get_pk_hi(row))
     }
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
@@ -62,7 +60,7 @@ impl<'a> MemBatch<'a> {
 
     /// Binary search for the first row where PK >= (key_lo, key_hi).
     pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
-        let target = ((key_hi as u128) << 64) | (key_lo as u128);
+        let target = crate::util::make_pk(key_lo, key_hi);
         let mut lo = 0usize;
         let mut hi = self.count;
         while lo < hi {

@@ -376,11 +376,6 @@ class WorkerProcess(object):
                 cursor.advance()
         finally:
             cursor.close()
-        log.debug(
-            "W" + str(self.worker_id)
-            + " scan tid=" + str(target_id)
-            + " rows=" + str(result.length())
-        )
         return result
 
     def _handle_seek(self, target_id, pk_lo_raw, pk_hi_raw):

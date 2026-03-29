@@ -74,3 +74,18 @@ pub fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
 pub fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
     buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
 }
+
+#[inline]
+pub fn make_pk(lo: u64, hi: u64) -> u128 {
+    ((hi as u128) << 64) | (lo as u128)
+}
+
+#[inline]
+pub fn split_pk(pk: u128) -> (u64, u64) {
+    (pk as u64, (pk >> 64) as u64)
+}
+
+pub fn cstr_from_buf(buf: &[u8]) -> &str {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end]).unwrap_or("")
+}
