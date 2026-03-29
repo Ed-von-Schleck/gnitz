@@ -447,6 +447,37 @@ pub fn op_join_delta_trace_outer(
 // Join row writer helpers
 // ---------------------------------------------------------------------------
 
+/// Copy left-side payload columns from a MemBatch into the output.
+/// Shared by all join row writers (inner, outer, DD).
+fn write_left_payload(
+    output: &mut OwnedBatch,
+    left_batch: &MemBatch,
+    left_row: usize,
+    left_null: u64,
+    left_schema: &SchemaDescriptor,
+) {
+    let left_pk_index = left_schema.pk_index as usize;
+    let mut pi = 0;
+    for ci in 0..left_schema.num_columns as usize {
+        if ci == left_pk_index {
+            continue;
+        }
+        let col = &left_schema.columns[ci];
+        let cs = col.size as usize;
+        let is_null = (left_null >> pi) & 1 != 0;
+        if is_null {
+            let new_len = output.col_data[pi].len() + cs;
+            output.col_data[pi].resize(new_len, 0);
+        } else if col.type_code == TYPE_STRING {
+            write_string_from_batch(&mut output.col_data[pi], &mut output.blob, left_batch, left_row, pi);
+        } else {
+            let src = left_batch.get_col_ptr(left_row, pi, cs);
+            output.col_data[pi].extend_from_slice(src);
+        }
+        pi += 1;
+    }
+}
+
 /// Write one composite join output row: [left_PK, left_payload..., right_payload...].
 ///
 /// Left columns come from the delta MemBatch. Right columns come from the
@@ -473,31 +504,10 @@ fn write_join_row(
     output.weight.extend_from_slice(&weight.to_le_bytes());
     output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
 
-    let left_pk_index = left_schema.pk_index as usize;
-    let right_pk_index = right_schema.pk_index as usize;
-
-    // Left payload columns
-    let mut pi = 0;
-    for ci in 0..left_schema.num_columns as usize {
-        if ci == left_pk_index {
-            continue;
-        }
-        let col = &left_schema.columns[ci];
-        let cs = col.size as usize;
-        let is_null = (left_null >> pi) & 1 != 0;
-        if is_null {
-            let new_len = output.col_data[pi].len() + cs;
-            output.col_data[pi].resize(new_len, 0);
-        } else if col.type_code == TYPE_STRING {
-            write_string_from_batch(&mut output.col_data[pi], &mut output.blob, left_batch, left_row, pi);
-        } else {
-            let src = left_batch.get_col_ptr(left_row, pi, cs);
-            output.col_data[pi].extend_from_slice(src);
-        }
-        pi += 1;
-    }
+    write_left_payload(output, left_batch, left_row, left_null, left_schema);
 
     // Right payload columns (from cursor public API)
+    let right_pk_index = right_schema.pk_index as usize;
     let right_blob = right_cursor.blob_ptr();
     let mut rpi = 0;
     for ci in 0..right_schema.num_columns as usize {
@@ -512,7 +522,6 @@ fn write_join_row(
             let new_len = output.col_data[out_pi].len() + cs;
             output.col_data[out_pi].resize(new_len, 0);
         } else if col.type_code == TYPE_STRING {
-            // Read the 16-byte German String struct from cursor
             let ptr = right_cursor.col_ptr(ci, 16);
             if ptr.is_null() {
                 let new_len = output.col_data[out_pi].len() + 16;
@@ -554,7 +563,6 @@ fn write_join_row_null_right(
 
     let left_npc = left_schema.num_columns as usize - 1;
     let right_npc = right_schema.num_columns as usize - 1;
-    // All right payload columns are NULL
     let right_null_bits = if right_npc < 64 {
         (1u64 << right_npc) - 1
     } else {
@@ -567,31 +575,10 @@ fn write_join_row_null_right(
     output.weight.extend_from_slice(&weight.to_le_bytes());
     output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
 
-    let left_pk_index = left_schema.pk_index as usize;
-    let right_pk_index = right_schema.pk_index as usize;
-
-    // Left payload columns
-    let mut pi = 0;
-    for ci in 0..left_schema.num_columns as usize {
-        if ci == left_pk_index {
-            continue;
-        }
-        let col = &left_schema.columns[ci];
-        let cs = col.size as usize;
-        let is_null = (left_null >> pi) & 1 != 0;
-        if is_null {
-            let new_len = output.col_data[pi].len() + cs;
-            output.col_data[pi].resize(new_len, 0);
-        } else if col.type_code == TYPE_STRING {
-            write_string_from_batch(&mut output.col_data[pi], &mut output.blob, left_batch, left_row, pi);
-        } else {
-            let src = left_batch.get_col_ptr(left_row, pi, cs);
-            output.col_data[pi].extend_from_slice(src);
-        }
-        pi += 1;
-    }
+    write_left_payload(output, left_batch, left_row, left_null, left_schema);
 
     // Right payload columns: all zeros (null)
+    let right_pk_index = right_schema.pk_index as usize;
     let mut rpi = 0;
     for ci in 0..right_schema.num_columns as usize {
         if ci == right_pk_index {
@@ -999,5 +986,512 @@ fn promote_col_to_pk(
             let val = u64::from_le_bytes(ptr.try_into().unwrap());
             (val, 0)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anti-join / Semi-join delta-delta
+// ---------------------------------------------------------------------------
+
+/// Emit batch_a rows whose PK has NO positive-weight match in batch_b.
+pub fn op_anti_join_delta_delta(
+    batch_a: &OwnedBatch,
+    batch_b: &OwnedBatch,
+    schema: &SchemaDescriptor,
+) -> OwnedBatch {
+    filter_join_dd(batch_a, batch_b, schema, false)
+}
+
+/// Emit batch_a rows whose PK HAS a positive-weight match in batch_b.
+pub fn op_semi_join_delta_delta(
+    batch_a: &OwnedBatch,
+    batch_b: &OwnedBatch,
+    schema: &SchemaDescriptor,
+) -> OwnedBatch {
+    filter_join_dd(batch_a, batch_b, schema, true)
+}
+
+/// Shared merge-walk for anti-join and semi-join DD.
+/// `emit_on_match=false` → anti-join, `emit_on_match=true` → semi-join.
+fn filter_join_dd(
+    batch_a: &OwnedBatch,
+    batch_b: &OwnedBatch,
+    schema: &SchemaDescriptor,
+    emit_on_match: bool,
+) -> OwnedBatch {
+    let npc = schema.num_columns as usize - 1;
+    let ca = consolidate_owned(batch_a, schema);
+    let cb = consolidate_owned(batch_b, schema);
+    let n_a = ca.count;
+    let n_b = cb.count;
+
+    if n_a == 0 {
+        return OwnedBatch::empty(npc);
+    }
+    if n_b == 0 {
+        if emit_on_match {
+            gnitz_debug!("op_semi_join_dd: a={} b=0 out=0", n_a);
+            return OwnedBatch::empty(npc);
+        } else {
+            gnitz_debug!("op_anti_join_dd: a={} b=0 out={}", n_a, n_a);
+            return ca;
+        }
+    }
+
+    let mut idx_a = 0usize;
+    let mut idx_b = 0usize;
+    let mut output = OwnedBatch::empty(npc);
+
+    while idx_a < n_a {
+        let key_a_lo = ca.get_pk_lo(idx_a);
+        let key_a_hi = ca.get_pk_hi(idx_a);
+
+        while idx_b < n_b && pk_lt(cb.get_pk_lo(idx_b), cb.get_pk_hi(idx_b), key_a_lo, key_a_hi) {
+            idx_b += 1;
+        }
+
+        let mut has_match = false;
+        if idx_b < n_b && cb.get_pk_lo(idx_b) == key_a_lo && cb.get_pk_hi(idx_b) == key_a_hi {
+            let mut scan_b = idx_b;
+            while scan_b < n_b
+                && cb.get_pk_lo(scan_b) == key_a_lo
+                && cb.get_pk_hi(scan_b) == key_a_hi
+            {
+                if cb.get_weight(scan_b) > 0 {
+                    has_match = true;
+                    break;
+                }
+                scan_b += 1;
+            }
+        }
+
+        let start_a = idx_a;
+        while idx_a < n_a
+            && ca.get_pk_lo(idx_a) == key_a_lo
+            && ca.get_pk_hi(idx_a) == key_a_hi
+        {
+            idx_a += 1;
+        }
+
+        if has_match == emit_on_match {
+            output.append_batch(&ca, start_a, idx_a);
+        }
+    }
+
+    output.sorted = true;
+    output.consolidated = true;
+    let tag = if emit_on_match { "semi" } else { "anti" };
+    gnitz_debug!("op_{}_join_dd: a={} b={} out={}", tag, n_a, n_b, output.count);
+    output
+}
+
+// ---------------------------------------------------------------------------
+// Inner join delta-delta
+// ---------------------------------------------------------------------------
+
+/// Delta-Delta inner join: ΔA ⋈ ΔB. Cartesian product per matching PK group.
+/// Output schema: [left_PK, left_payload..., right_payload...].
+/// Weight = w_a * w_b (wrapping). Zero-weight pairs are skipped.
+pub fn op_join_delta_delta(
+    batch_a: &OwnedBatch,
+    batch_b: &OwnedBatch,
+    left_schema: &SchemaDescriptor,
+    right_schema: &SchemaDescriptor,
+) -> OwnedBatch {
+    let left_npc = left_schema.num_columns as usize - 1;
+    let right_npc = right_schema.num_columns as usize - 1;
+    let out_npc = left_npc + right_npc;
+
+    let ca = consolidate_owned(batch_a, left_schema);
+    let cb = consolidate_owned(batch_b, right_schema);
+    let n_a = ca.count;
+    let n_b = cb.count;
+
+    if n_a == 0 || n_b == 0 {
+        gnitz_debug!("op_join_dd: a={} b={} out=0", n_a, n_b);
+        return OwnedBatch::empty(out_npc);
+    }
+
+    let mb_a = ca.as_mem_batch();
+    let mb_b = cb.as_mem_batch();
+    let mut output = OwnedBatch::empty(out_npc);
+
+    let mut idx_a = 0usize;
+    let mut idx_b = 0usize;
+
+    while idx_a < n_a && idx_b < n_b {
+        let key_a_lo = ca.get_pk_lo(idx_a);
+        let key_a_hi = ca.get_pk_hi(idx_a);
+        let key_b_lo = cb.get_pk_lo(idx_b);
+        let key_b_hi = cb.get_pk_hi(idx_b);
+
+        if pk_lt(key_a_lo, key_a_hi, key_b_lo, key_b_hi) {
+            idx_a += 1;
+        } else if pk_lt(key_b_lo, key_b_hi, key_a_lo, key_a_hi) {
+            idx_b += 1;
+        } else {
+            let match_lo = key_a_lo;
+            let match_hi = key_a_hi;
+
+            let start_a = idx_a;
+            idx_a += 1;
+            while idx_a < n_a
+                && ca.get_pk_lo(idx_a) == match_lo
+                && ca.get_pk_hi(idx_a) == match_hi
+            {
+                idx_a += 1;
+            }
+
+            let start_b = idx_b;
+            idx_b += 1;
+            while idx_b < n_b
+                && cb.get_pk_lo(idx_b) == match_lo
+                && cb.get_pk_hi(idx_b) == match_hi
+            {
+                idx_b += 1;
+            }
+
+            for i in start_a..idx_a {
+                let wa = ca.get_weight(i);
+                if wa == 0 {
+                    continue;
+                }
+                for j in start_b..idx_b {
+                    let wb = cb.get_weight(j);
+                    let w_out = wa.wrapping_mul(wb);
+                    if w_out != 0 {
+                        write_join_row_from_batches(
+                            &mut output,
+                            &mb_a, i, &mb_b, j,
+                            w_out,
+                            left_schema, right_schema,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    output.sorted = true;
+    gnitz_debug!("op_join_dd: a={} b={} out={}", n_a, n_b, output.count);
+    output
+}
+
+/// Write one composite join output row where both sides come from MemBatch.
+fn write_join_row_from_batches(
+    output: &mut OwnedBatch,
+    left_batch: &MemBatch,
+    left_row: usize,
+    right_batch: &MemBatch,
+    right_row: usize,
+    weight: i64,
+    left_schema: &SchemaDescriptor,
+    right_schema: &SchemaDescriptor,
+) {
+    let pk_lo = left_batch.get_pk_lo(left_row);
+    let pk_hi = left_batch.get_pk_hi(left_row);
+    let left_null = left_batch.get_null_word(left_row);
+    let right_null = right_batch.get_null_word(right_row);
+
+    let left_npc = left_schema.num_columns as usize - 1;
+    let null_word = left_null | (right_null << left_npc);
+
+    output.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
+    output.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
+    output.weight.extend_from_slice(&weight.to_le_bytes());
+    output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+
+    write_left_payload(output, left_batch, left_row, left_null, left_schema);
+
+    // Right payload columns (from right MemBatch)
+    let right_pk_index = right_schema.pk_index as usize;
+    let mut rpi = 0;
+    for ci in 0..right_schema.num_columns as usize {
+        if ci == right_pk_index {
+            continue;
+        }
+        let col = &right_schema.columns[ci];
+        let cs = col.size as usize;
+        let is_null = (right_null >> rpi) & 1 != 0;
+        let out_pi = left_npc + rpi;
+        if is_null {
+            let new_len = output.col_data[out_pi].len() + cs;
+            output.col_data[out_pi].resize(new_len, 0);
+        } else if col.type_code == TYPE_STRING {
+            write_string_from_batch(
+                &mut output.col_data[out_pi],
+                &mut output.blob,
+                right_batch,
+                right_row,
+                rpi,
+            );
+        } else {
+            let src = right_batch.get_col_ptr(right_row, rpi, cs);
+            output.col_data[out_pi].extend_from_slice(src);
+        }
+        rpi += 1;
+    }
+
+    output.count += 1;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+
+    fn make_schema_u64_i64() -> SchemaDescriptor {
+        let mut columns = [SchemaColumn {
+            type_code: 0, size: 0, nullable: 0, _pad: 0,
+        }; 64];
+        columns[0] = SchemaColumn {
+            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
+        };
+        columns[1] = SchemaColumn {
+            type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
+        };
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    fn make_schema_u64_string() -> SchemaDescriptor {
+        let mut columns = [SchemaColumn {
+            type_code: 0, size: 0, nullable: 0, _pad: 0,
+        }; 64];
+        columns[0] = SchemaColumn {
+            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
+        };
+        columns[1] = SchemaColumn {
+            type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0,
+        };
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    /// Build a sorted OwnedBatch from (pk, weight, payload) triples.
+    fn make_batch(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, i64, i64)],
+    ) -> OwnedBatch {
+        let n = rows.len();
+        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        b.count = 0;
+        for &(pk, w, val) in rows {
+            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            b.weight.extend_from_slice(&w.to_le_bytes());
+            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    /// Build a sorted OwnedBatch with STRING payload from (pk, weight, string) triples.
+    fn make_batch_str(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, i64, &str)],
+    ) -> OwnedBatch {
+        let n = rows.len();
+        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        b.count = 0;
+        for &(pk, w, s) in rows {
+            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            b.weight.extend_from_slice(&w.to_le_bytes());
+            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+
+            let bytes = s.as_bytes();
+            let length = bytes.len() as u32;
+            let mut gs = [0u8; 16];
+            gs[0..4].copy_from_slice(&length.to_le_bytes());
+            if bytes.len() <= SHORT_STRING_THRESHOLD {
+                let copy_len = bytes.len().min(12);
+                gs[4..4 + copy_len].copy_from_slice(&bytes[..copy_len]);
+            } else {
+                gs[4..8].copy_from_slice(&bytes[..4]);
+                let offset = b.blob.len() as u64;
+                gs[8..16].copy_from_slice(&offset.to_le_bytes());
+                b.blob.extend_from_slice(bytes);
+            }
+            b.col_data[0].extend_from_slice(&gs);
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    fn read_str_payload(batch: &OwnedBatch, col: usize, row: usize) -> String {
+        let off = row * 16;
+        let gs = &batch.col_data[col][off..off + 16];
+        let length = u32::from_le_bytes(gs[0..4].try_into().unwrap()) as usize;
+        if length == 0 {
+            return String::new();
+        }
+        if length <= SHORT_STRING_THRESHOLD {
+            String::from_utf8_lossy(&gs[4..4 + length]).to_string()
+        } else {
+            let blob_offset = u64::from_le_bytes(gs[8..16].try_into().unwrap()) as usize;
+            String::from_utf8_lossy(&batch.blob[blob_offset..blob_offset + length]).to_string()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Anti-join DD tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_anti_join_dd_basic() {
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+        let b = make_batch(&schema, &[(2, 1, 200)]);
+        let out = op_anti_join_delta_delta(&a, &b, &schema);
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_pk_lo(0), 1);
+        assert_eq!(out.get_pk_lo(1), 3);
+        assert!(out.consolidated);
+    }
+
+    #[test]
+    fn test_anti_join_dd_empty_right() {
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+        let b = make_batch(&schema, &[]);
+        let out = op_anti_join_delta_delta(&a, &b, &schema);
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_pk_lo(0), 1);
+        assert_eq!(out.get_pk_lo(1), 2);
+    }
+
+    #[test]
+    fn test_anti_join_dd_full_overlap() {
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+        let b = make_batch(&schema, &[(1, 1, 100), (2, 1, 200)]);
+        let out = op_anti_join_delta_delta(&a, &b, &schema);
+        assert_eq!(out.count, 0);
+    }
+
+    #[test]
+    fn test_anti_join_dd_negative_weight_b() {
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+        // PK=1 has negative weight in b — should NOT suppress a rows
+        let b = make_batch(&schema, &[(1, -1, 100), (2, 1, 200)]);
+        let out = op_anti_join_delta_delta(&a, &b, &schema);
+        assert_eq!(out.count, 1);
+        assert_eq!(out.get_pk_lo(0), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Semi-join DD tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_semi_join_dd_basic() {
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+        let b = make_batch(&schema, &[(2, 1, 200), (3, 1, 300)]);
+        let out = op_semi_join_delta_delta(&a, &b, &schema);
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_pk_lo(0), 2);
+        assert_eq!(out.get_pk_lo(1), 3);
+        assert!(out.consolidated);
+    }
+
+    #[test]
+    fn test_anti_semi_complement() {
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
+        let b = make_batch(&schema, &[(2, 1, 200), (4, 1, 400)]);
+        let anti = op_anti_join_delta_delta(&a, &b, &schema);
+        let semi = op_semi_join_delta_delta(&a, &b, &schema);
+        assert_eq!(anti.count + semi.count, a.count);
+    }
+
+    // -----------------------------------------------------------------------
+    // Join DD tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_join_dd_cartesian() {
+        let left_schema = make_schema_u64_i64();
+        let right_schema = make_schema_u64_i64();
+        // PK=1: 2 rows in a, 3 rows in b → 6 output rows
+        let a = make_batch(&left_schema, &[(1, 1, 10), (1, 2, 20)]);
+        let b = make_batch(&right_schema, &[(1, 1, 100), (1, 3, 300), (1, -1, 500)]);
+        let out = op_join_delta_delta(&a, &b, &left_schema, &right_schema);
+        // 2 × 3 = 6, but check for zero-weight elimination:
+        // (w=1*1=1), (w=1*3=3), (w=1*-1=-1), (w=2*1=2), (w=2*3=6), (w=2*-1=-2)
+        // All non-zero → 6 rows
+        assert_eq!(out.count, 6);
+        assert!(out.sorted);
+
+        // Check weights: row 0 = (a[0] × b[0]) = 1*1 = 1
+        assert_eq!(out.get_weight(0), 1);
+        // row 1 = (a[0] × b[1]) = 1*3 = 3
+        assert_eq!(out.get_weight(1), 3);
+    }
+
+    #[test]
+    fn test_join_dd_string_columns() {
+        let left_schema = make_schema_u64_string();
+        let right_schema = make_schema_u64_string();
+        let a = make_batch_str(&left_schema, &[(1, 1, "hello")]);
+        let b = make_batch_str(&right_schema, &[(1, 1, "world_longer_than_twelve")]);
+        let out = op_join_delta_delta(&a, &b, &left_schema, &right_schema);
+        assert_eq!(out.count, 1);
+        // Left payload = col 0, right payload = col 1
+        let left_str = read_str_payload(&out, 0, 0);
+        let right_str = read_str_payload(&out, 1, 0);
+        assert_eq!(left_str, "hello");
+        assert_eq!(right_str, "world_longer_than_twelve");
+    }
+
+    #[test]
+    fn test_join_dd_empty_inputs() {
+        let ls = make_schema_u64_i64();
+        let rs = make_schema_u64_i64();
+        let empty = make_batch(&ls, &[]);
+        let nonempty = make_batch(&rs, &[(1, 1, 100)]);
+
+        let out1 = op_join_delta_delta(&empty, &nonempty, &ls, &rs);
+        assert_eq!(out1.count, 0);
+
+        let out2 = op_join_delta_delta(&nonempty, &empty, &ls, &rs);
+        assert_eq!(out2.count, 0);
+
+        let out3 = op_join_delta_delta(&empty, &empty, &ls, &rs);
+        assert_eq!(out3.count, 0);
+    }
+
+    #[test]
+    fn test_join_dd_zero_weight_skip() {
+        let ls = make_schema_u64_i64();
+        let rs = make_schema_u64_i64();
+        // a has weight=0 after consolidation wouldn't happen, but test the skip
+        let a = make_batch(&ls, &[(1, 2, 10)]);
+        // b has a pair that nets to zero weight after consolidation
+        let mut b = OwnedBatch::with_schema(rs, 2);
+        b.count = 0;
+        for &(pk, w, val) in &[(1u64, 1i64, 100i64), (1u64, -1i64, 100i64)] {
+            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            b.weight.extend_from_slice(&w.to_le_bytes());
+            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = false;
+
+        let out = op_join_delta_delta(&a, &b, &ls, &rs);
+        // b consolidates to empty (1 + -1 = 0 for same pk+payload) → no match
+        assert_eq!(out.count, 0);
     }
 }

@@ -122,6 +122,16 @@ eci = ExternalCompilationInfo(
         "  const void *delta, void *cursor,"
         "  const void *left_schema, const void *right_schema,"
         "  void **out_result);",
+        "int32_t gnitz_op_anti_join_dd("
+        "  const void *a, const void *b, const void *schema,"
+        "  void **out_result);",
+        "int32_t gnitz_op_semi_join_dd("
+        "  const void *a, const void *b, const void *schema,"
+        "  void **out_result);",
+        "int32_t gnitz_op_join_dd("
+        "  const void *a, const void *b,"
+        "  const void *left_schema, const void *right_schema,"
+        "  void **out_result);",
         # expression programs and scalar functions
         "void *gnitz_expr_program_create("
         "  const int64_t *code, uint32_t code_len,"
@@ -757,6 +767,27 @@ _op_join_dt = rffi.llexternal(
 
 _op_join_dt_outer = rffi.llexternal(
     "gnitz_op_join_dt_outer",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_op_anti_join_dd = rffi.llexternal(
+    "gnitz_op_anti_join_dd",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_op_semi_join_dd = rffi.llexternal(
+    "gnitz_op_semi_join_dd",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_op_join_dd = rffi.llexternal(
+    "gnitz_op_join_dd",
     [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
     rffi.INT,
     compilation_info=eci,

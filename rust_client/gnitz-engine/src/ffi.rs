@@ -963,6 +963,80 @@ pub extern "C" fn gnitz_op_join_dt_outer(
     result.unwrap_or(-99)
 }
 
+/// Anti-join delta-delta: returns output batch.
+#[no_mangle]
+pub extern "C" fn gnitz_op_anti_join_dd(
+    batch_a: *const libc::c_void,
+    batch_b: *const libc::c_void,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if batch_a.is_null() || batch_b.is_null() || schema_desc.is_null()
+        || out_result.is_null()
+    {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let a = unsafe { &*(batch_a as *const crate::memtable::OwnedBatch) };
+        let b = unsafe { &*(batch_b as *const crate::memtable::OwnedBatch) };
+        let schema = unsafe { &*schema_desc };
+        let output = crate::ops::op_anti_join_delta_delta(a, b, schema);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+/// Semi-join delta-delta: returns output batch.
+#[no_mangle]
+pub extern "C" fn gnitz_op_semi_join_dd(
+    batch_a: *const libc::c_void,
+    batch_b: *const libc::c_void,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if batch_a.is_null() || batch_b.is_null() || schema_desc.is_null()
+        || out_result.is_null()
+    {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let a = unsafe { &*(batch_a as *const crate::memtable::OwnedBatch) };
+        let b = unsafe { &*(batch_b as *const crate::memtable::OwnedBatch) };
+        let schema = unsafe { &*schema_desc };
+        let output = crate::ops::op_semi_join_delta_delta(a, b, schema);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+/// Inner join delta-delta: returns output batch with composite schema.
+#[no_mangle]
+pub extern "C" fn gnitz_op_join_dd(
+    batch_a: *const libc::c_void,
+    batch_b: *const libc::c_void,
+    left_schema: *const crate::compact::SchemaDescriptor,
+    right_schema: *const crate::compact::SchemaDescriptor,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if batch_a.is_null() || batch_b.is_null()
+        || left_schema.is_null() || right_schema.is_null() || out_result.is_null()
+    {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let a = unsafe { &*(batch_a as *const crate::memtable::OwnedBatch) };
+        let b = unsafe { &*(batch_b as *const crate::memtable::OwnedBatch) };
+        let ls = unsafe { &*left_schema };
+        let rs = unsafe { &*right_schema };
+        let output = crate::ops::op_join_delta_delta(a, b, ls, rs);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
 // ---------------------------------------------------------------------------
 // Expression programs and scalar functions
 // ---------------------------------------------------------------------------
