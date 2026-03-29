@@ -479,7 +479,6 @@ fn open_and_merge(
             has_pending = true;
         }
 
-        // Advance this cursor
         cursors[ci].advance(&shards[si]);
         let new_key = if cursors[ci].is_valid() {
             Some(cursors[ci].peek_key(&shards[cursors[ci].shard_idx]))
@@ -1046,8 +1045,6 @@ mod tests {
             writer.pk_hi.extend_from_slice(&0u64.to_le_bytes());
             writer.weight.extend_from_slice(&w.to_le_bytes());
             writer.null_bitmap.extend_from_slice(&0u64.to_le_bytes());
-            // col_bufs[0] is PK (skipped in finalize), [1] = col1, [2] = col2
-            writer.col_bufs[0].extend_from_slice(&pk.to_le_bytes());
             writer.col_bufs[1].extend_from_slice(&c1.to_le_bytes());
             writer.col_bufs[2].extend_from_slice(&c2.to_le_bytes());
         }
