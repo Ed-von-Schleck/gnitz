@@ -1,3 +1,5 @@
+#[macro_use]
+pub mod log;
 pub mod util;
 pub mod xxh;
 pub mod bloom;
@@ -16,5 +18,7 @@ pub mod shard_index;
 pub mod memtable;
 pub mod table;
 pub mod partitioned_table;
+pub mod expr;
+pub mod scalar_func;
 pub mod ops;
 pub mod ffi;

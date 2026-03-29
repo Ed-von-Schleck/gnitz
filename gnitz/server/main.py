@@ -173,6 +173,8 @@ def entry_point(argv):
         i += 1
 
     log.init(level)
+    from gnitz.storage import engine_ffi
+    engine_ffi.log_init(level, "M")
 
     jit_params = os.environ.get("GNITZ_JIT")
     if jit_params is not None:
@@ -284,7 +286,9 @@ def entry_point(argv):
                 + ")\n",
             )
 
-            log.set_process_tag("W" + str(w))
+            wtag = "W" + str(w)
+            log.set_process_tag(wtag)
+            engine_ffi.log_init(level, wtag)
             WorkerProcess(w, master_pid, engine, part_start, part_end,
                           sal_ptr, m2w_efds[w], w2m_regions[w],
                           w2m_efds[w]).run()

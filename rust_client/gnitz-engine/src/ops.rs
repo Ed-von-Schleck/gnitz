@@ -7,6 +7,8 @@ use crate::compact::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
 use crate::memtable::{write_to_owned_batch, OwnedBatch};
 use crate::merge::{self, MemBatch};
 use crate::read_cursor::ReadCursor;
+use crate::scalar_func::ScalarFuncKind;
+use crate::xxh;
 
 use type_code::STRING as TYPE_STRING;
 
@@ -679,4 +681,316 @@ fn signum(x: i64) -> i64 {
 #[inline]
 fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
     (a_hi, a_lo) < (b_hi, b_lo)
+}
+
+// ---------------------------------------------------------------------------
+// Linear operators
+// ---------------------------------------------------------------------------
+
+/// Filter: retain rows where predicate returns true.
+/// Uses contiguous-range bulk copy for efficiency.
+pub fn op_filter(
+    batch: &OwnedBatch,
+    func: &ScalarFuncKind,
+    schema: &SchemaDescriptor,
+) -> OwnedBatch {
+    let n = batch.count;
+    if n == 0 {
+        let npc = schema.num_columns as usize - 1;
+        return OwnedBatch::empty(npc);
+    }
+
+    let mb = batch.as_mem_batch();
+    let mut output = OwnedBatch::with_schema(*schema, n);
+    output.count = 0;
+
+    let mut range_start: isize = -1;
+    for i in 0..n {
+        if func.evaluate_predicate(&mb, i, schema) {
+            if range_start < 0 {
+                range_start = i as isize;
+            }
+        } else {
+            if range_start >= 0 {
+                output.append_batch(batch, range_start as usize, i);
+                range_start = -1;
+            }
+        }
+    }
+    if range_start >= 0 {
+        output.append_batch(batch, range_start as usize, n);
+    }
+
+    if batch.consolidated {
+        output.sorted = true;
+        output.consolidated = true;
+    } else {
+        output.sorted = batch.sorted;
+        output.consolidated = false;
+    }
+
+    gnitz_debug!("op_filter: in={} out={} func={}", n, output.count, func.kind_name());
+    output
+}
+
+/// Map: transform batch via scalar function.
+/// If reindex_col >= 0, computes new PK from that column value (GROUP BY).
+pub fn op_map(
+    batch: &OwnedBatch,
+    func: &ScalarFuncKind,
+    in_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
+    reindex_col: i32,
+) -> OwnedBatch {
+    if batch.count == 0 {
+        let out_npc = out_schema.num_columns as usize - 1;
+        return OwnedBatch::empty(out_npc);
+    }
+
+    if reindex_col < 0 {
+        // Batch path
+        let mut result = func.evaluate_map_batch(batch, in_schema, out_schema);
+        result.sorted = batch.sorted;
+        gnitz_debug!("op_map: in={} out={} reindex=-1 func={}", batch.count, result.count, func.kind_name());
+        return result;
+    }
+
+    // Per-row path with reindex
+    let in_mb = batch.as_mem_batch();
+    let ri_col = reindex_col as usize;
+    let mut output = OwnedBatch::with_schema(*out_schema, batch.count);
+    output.count = 0;
+
+    // First evaluate the map batch (without reindex) to get column data
+    let mapped = func.evaluate_map_batch(batch, in_schema, out_schema);
+
+    // Then overwrite PK with promoted values from reindex column
+    output.pk_hi = vec![0u8; mapped.count * 8]; // will be overwritten
+    output.pk_lo = vec![0u8; mapped.count * 8];
+    output.weight = mapped.weight;
+    output.null_bmp = mapped.null_bmp;
+    output.col_data = mapped.col_data;
+    output.blob = mapped.blob;
+    output.count = mapped.count;
+
+    for row in 0..batch.count {
+        let (pk_lo, pk_hi) = promote_col_to_pk(&in_mb, row, ri_col, in_schema);
+        output.pk_lo[row * 8..row * 8 + 8].copy_from_slice(&pk_lo.to_le_bytes());
+        output.pk_hi[row * 8..row * 8 + 8].copy_from_slice(&pk_hi.to_le_bytes());
+    }
+
+    output.sorted = false;
+    output.consolidated = false;
+    gnitz_debug!("op_map: in={} out={} reindex={} func={}", batch.count, output.count, reindex_col, func.kind_name());
+    output
+}
+
+/// Negate: flip the sign of every weight.
+pub fn op_negate(batch: &OwnedBatch) -> OwnedBatch {
+    if batch.count == 0 {
+        return OwnedBatch::empty(batch.col_data.len());
+    }
+
+    let mut output = OwnedBatch::empty(batch.col_data.len());
+    output.schema = batch.schema;
+    output.append_batch_negated(batch, 0, batch.count);
+
+    if batch.consolidated {
+        output.sorted = true;
+        output.consolidated = true;
+    } else {
+        output.sorted = batch.sorted;
+        output.consolidated = false;
+    }
+    gnitz_debug!("op_negate: count={}", batch.count);
+    output
+}
+
+/// Union: algebraic addition of two Z-Set streams.
+/// When both inputs are sorted, performs O(N) merge preserving sort order.
+pub fn op_union(
+    batch_a: &OwnedBatch,
+    batch_b: Option<&OwnedBatch>,
+    schema: &SchemaDescriptor,
+) -> OwnedBatch {
+    let b = match batch_b {
+        Some(b) if b.count > 0 => b,
+        _ => {
+            // Identity copy of batch_a
+            let mut output = batch_a.clone_batch();
+            if batch_a.consolidated {
+                output.sorted = true;
+                output.consolidated = true;
+            } else {
+                output.sorted = batch_a.sorted;
+            }
+            gnitz_debug!("op_union: a={} b=0 identity", batch_a.count);
+            return output;
+        }
+    };
+
+    if batch_a.sorted && b.sorted {
+        return op_union_merge(batch_a, b, schema);
+    }
+
+    // Unsorted: concatenate
+    let mut output = OwnedBatch::with_schema(*schema, batch_a.count + b.count);
+    output.count = 0;
+    output.append_batch(batch_a, 0, batch_a.count);
+    output.append_batch(b, 0, b.count);
+    output.sorted = false;
+    output.consolidated = false;
+    gnitz_debug!("op_union: a={} b={} out={} concat", batch_a.count, b.count, output.count);
+    output
+}
+
+/// Sorted merge of two sorted batches with contiguous-run batching.
+fn op_union_merge(
+    batch_a: &OwnedBatch,
+    batch_b: &OwnedBatch,
+    schema: &SchemaDescriptor,
+) -> OwnedBatch {
+    let n_a = batch_a.count;
+    let n_b = batch_b.count;
+    let mut output = OwnedBatch::with_schema(*schema, n_a + n_b);
+    output.count = 0;
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    // run_src: 0=batch_a, 1=batch_b, -1=no current run
+    let mut run_src: i32 = -1;
+    let mut run_a_start = 0usize;
+    let mut run_b_start = 0usize;
+
+    while i < n_a && j < n_b {
+        let a_lo = batch_a.get_pk_lo(i);
+        let a_hi = batch_a.get_pk_hi(i);
+        let b_lo = batch_b.get_pk_lo(j);
+        let b_hi = batch_b.get_pk_hi(j);
+
+        if pk_lt(a_lo, a_hi, b_lo, b_hi) {
+            if run_src != 0 {
+                if run_src == 1 {
+                    output.append_batch(batch_b, run_b_start, j);
+                }
+                run_src = 0;
+                run_a_start = i;
+            }
+            i += 1;
+        } else if pk_lt(b_lo, b_hi, a_lo, a_hi) {
+            if run_src != 1 {
+                if run_src == 0 {
+                    output.append_batch(batch_a, run_a_start, i);
+                }
+                run_src = 1;
+                run_b_start = j;
+            }
+            j += 1;
+        } else {
+            // Equal keys: flush current run then emit one from each
+            if run_src == 0 {
+                output.append_batch(batch_a, run_a_start, i);
+            } else if run_src == 1 {
+                output.append_batch(batch_b, run_b_start, j);
+            }
+            run_src = -1;
+            output.append_batch(batch_a, i, i + 1);
+            output.append_batch(batch_b, j, j + 1);
+            i += 1;
+            j += 1;
+        }
+    }
+
+    // Flush final run
+    if run_src == 0 {
+        output.append_batch(batch_a, run_a_start, i);
+    } else if run_src == 1 {
+        output.append_batch(batch_b, run_b_start, j);
+    }
+
+    // Remaining
+    if i < n_a {
+        output.append_batch(batch_a, i, n_a);
+    }
+    if j < n_b {
+        output.append_batch(batch_b, j, n_b);
+    }
+
+    output.sorted = true;
+    output.consolidated = false;
+    gnitz_debug!("op_union: a={} b={} out={} sorted_merge", n_a, n_b, output.count);
+    output
+}
+
+// ---------------------------------------------------------------------------
+// PK promotion for reindex (GROUP BY)
+// ---------------------------------------------------------------------------
+
+/// Murmur3 64-bit finalizer.
+#[inline]
+fn mix64(mut v: u64) -> u64 {
+    v ^= v >> 33;
+    v = v.wrapping_mul(0xFF51AFD7ED558CCD);
+    v ^= v >> 33;
+    v = v.wrapping_mul(0xC4CEB9FE1A85EC53);
+    v ^= v >> 33;
+    v
+}
+
+/// Promote a column value to a (lo, hi) PK pair for reindexing.
+fn promote_col_to_pk(
+    batch: &MemBatch,
+    row: usize,
+    col_idx: usize,
+    schema: &SchemaDescriptor,
+) -> (u64, u64) {
+    let tc = schema.columns[col_idx].type_code;
+    let pki = schema.pk_index as usize;
+
+    match tc {
+        type_code::U128 => {
+            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
+            let ptr = batch.get_col_ptr(row, pi, 16);
+            let lo = u64::from_le_bytes(ptr[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(ptr[8..16].try_into().unwrap());
+            (lo, hi)
+        }
+        type_code::U64 | type_code::I64 => {
+            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
+            let ptr = batch.get_col_ptr(row, pi, 8);
+            let val = u64::from_le_bytes(ptr.try_into().unwrap());
+            (val, 0)
+        }
+        type_code::STRING => {
+            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
+            let struct_bytes = batch.get_col_ptr(row, pi, 16);
+            let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
+            if length == 0 {
+                return (0, 0);
+            }
+            // Hash the string bytes
+            let h = if length <= SHORT_STRING_THRESHOLD {
+                // Inline: prefix bytes at struct[4..4+length]
+                xxh::checksum(&struct_bytes[4..4 + length])
+            } else {
+                let heap_offset =
+                    u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
+                xxh::checksum(&batch.blob[heap_offset..heap_offset + length])
+            };
+            let h_hi = mix64(h);
+            (h, h_hi)
+        }
+        type_code::F64 | type_code::F32 => {
+            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
+            let ptr = batch.get_col_ptr(row, pi, 8);
+            let bits = u64::from_le_bytes(ptr.try_into().unwrap());
+            (bits, 0)
+        }
+        _ => {
+            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
+            let ptr = batch.get_col_ptr(row, pi, 8);
+            let val = u64::from_le_bytes(ptr.try_into().unwrap());
+            (val, 0)
+        }
+    }
 }

@@ -1,13 +1,10 @@
 # gnitz/dbsp/ops/linear.py
 
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_uint64
-from rpython.rlib.longlong2float import float2longlong
-
-from gnitz.core.batch import RowBuilder, pk_lt, pk_eq
-from gnitz.core import types as core_types, xxh, strings as core_strings
+from rpython.rlib.rarithmetic import intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.dbsp.ops.group_index import _mix64
+
+from gnitz.core.batch import ArenaZSetBatch
 
 """
 Linear Operators for the DBSP algebra.
@@ -18,35 +15,6 @@ Each function now accepts a BatchWriter for the output register.
 """
 
 
-def _promote_col_to_pk(accessor, col_idx, schema):
-    """Promote a single column value to a (lo, hi) PK pair for reindexing."""
-    t = schema.columns[col_idx].field_type.code
-    if t == core_types.TYPE_U128.code:
-        return accessor.get_u128_lo(col_idx), accessor.get_u128_hi(col_idx)
-    elif t == core_types.TYPE_U64.code or t == core_types.TYPE_I64.code:
-        return r_uint64(accessor.get_int(col_idx)), r_uint64(0)
-    elif t == core_types.TYPE_STRING.code:
-        length, _, struct_ptr, heap_ptr, py_string = accessor.get_str_struct(col_idx)
-        if length == 0:
-            h = r_uint64(0)
-        elif py_string is not None:
-            h = xxh.compute_checksum_bytes(py_string)
-        else:
-            if length <= core_strings.SHORT_STRING_THRESHOLD:
-                target_ptr = rffi.ptradd(struct_ptr, 4)
-            else:
-                u64_p = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(struct_ptr, 8))
-                heap_off = rffi.cast(lltype.Signed, u64_p[0])
-                target_ptr = rffi.ptradd(heap_ptr, heap_off)
-            h = xxh.compute_checksum(target_ptr, length)
-        h_hi = _mix64(h)
-        return r_uint64(h), r_uint64(h_hi)
-    elif t == core_types.TYPE_F64.code or t == core_types.TYPE_F32.code:
-        return r_uint64(float2longlong(accessor.get_float(col_idx))), r_uint64(0)
-    else:
-        return r_uint64(accessor.get_int(col_idx)), r_uint64(0)
-
-
 # ---------------------------------------------------------------------------
 # Linear operator implementations
 # ---------------------------------------------------------------------------
@@ -55,36 +23,47 @@ def _promote_col_to_pk(accessor, col_idx, schema):
 def op_filter(in_batch, out_writer, func):
     """
     Retains only records for which the predicate returns True.
-    Uses contiguous-range bulk copy to bypass per-row accessor dispatch.
+    Delegates to Rust via single FFI call.
 
     in_batch:   ArenaZSetBatch
     out_writer: BatchWriter  (strictly write-only destination)
     func:       ScalarFunction  (evaluate_predicate)
     """
-    n = in_batch.length()
-    range_start = -1
-    for i in range(n):
-        if func is not None and func.evaluate_predicate_direct(in_batch, i):
-            if range_start < 0:
-                range_start = i
+    from gnitz.storage import engine_ffi
+
+    schema = in_batch._schema
+    schema_buf = engine_ffi.pack_schema(schema)
+    out_result = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+    try:
+        func_handle = func.get_func_handle() if func is not None else lltype.nullptr(rffi.VOIDP.TO)
+        rc = engine_ffi._op_filter(
+            in_batch._handle,
+            func_handle,
+            rffi.cast(rffi.VOIDP, schema_buf),
+            out_result,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_op_filter failed: %d" % intmask(rc))
+        result_handle = out_result[0]
+        is_sorted = intmask(engine_ffi._batch_is_sorted(result_handle)) != 0
+        is_consolidated = intmask(engine_ffi._batch_is_consolidated(result_handle)) != 0
+        result_batch = ArenaZSetBatch._wrap_handle(schema, result_handle, is_sorted, is_consolidated)
+        if result_batch.length() > 0:
+            out_writer.append_batch(result_batch)
+        if is_consolidated:
+            out_writer.mark_consolidated(True)
         else:
-            if range_start >= 0:
-                out_writer.append_batch(in_batch, range_start, i)
-                range_start = -1
-    if range_start >= 0:
-        out_writer.append_batch(in_batch, range_start, n)
-    if in_batch._consolidated:
-        out_writer.mark_consolidated(True)
-    else:
-        out_writer.mark_sorted(in_batch._sorted)
+            out_writer.mark_sorted(is_sorted)
+        result_batch.free()
+    finally:
+        lltype.free(out_result, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")
 
 
 def op_map(in_batch, out_writer, func, out_schema, reindex_col=-1):
     """
     Applies a transformation to every row.
-    Tries batch-level columnar map first (memcpy per column), falling back
-    to per-row RowBuilder when the batch path is not implemented or when
-    reindex_col requires per-row PK computation.
+    Delegates to Rust via single FFI call.
 
     in_batch:   ArenaZSetBatch
     out_writer: BatchWriter  (strictly write-only destination)
@@ -92,116 +71,106 @@ def op_map(in_batch, out_writer, func, out_schema, reindex_col=-1):
     out_schema: TableSchema for the output batch
     reindex_col: when >= 0, use this input column's value as the new PK
     """
-    # Batch path: bypass RowBuilder staging entirely
-    if reindex_col < 0 and func is not None:
-        if func.evaluate_map_batch(in_batch, out_writer._batch, out_schema):
-            out_writer.mark_sorted(in_batch._sorted)
-            return
+    from gnitz.storage import engine_ffi
 
-    # Per-row fallback
-    builder = RowBuilder(out_schema, out_writer._batch)
-
-    n = in_batch.length()
-    for i in range(n):
-        in_acc = in_batch.get_accessor(i)
-        if func is not None:
-            func.evaluate_map(in_acc, builder)
-            if reindex_col >= 0:
-                new_pk_lo, new_pk_hi = _promote_col_to_pk(in_acc, reindex_col, in_batch._schema)
-                builder.commit_row(new_pk_lo, new_pk_hi, in_batch.get_weight(i))
-            else:
-                builder.commit_row(in_batch.get_pk_lo(i), in_batch.get_pk_hi(i), in_batch.get_weight(i))
-    if reindex_col >= 0:
-        out_writer.mark_sorted(False)
-    else:
-        out_writer.mark_sorted(in_batch._sorted)
+    in_schema = in_batch._schema
+    in_schema_buf = engine_ffi.pack_schema(in_schema)
+    out_schema_buf = engine_ffi.pack_schema(out_schema)
+    out_result = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+    try:
+        func_handle = func.get_func_handle() if func is not None else lltype.nullptr(rffi.VOIDP.TO)
+        rc = engine_ffi._op_map(
+            in_batch._handle,
+            func_handle,
+            rffi.cast(rffi.VOIDP, in_schema_buf),
+            rffi.cast(rffi.VOIDP, out_schema_buf),
+            rffi.cast(rffi.INT, reindex_col),
+            out_result,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_op_map failed: %d" % intmask(rc))
+        result_handle = out_result[0]
+        is_sorted = intmask(engine_ffi._batch_is_sorted(result_handle)) != 0
+        result_batch = ArenaZSetBatch._wrap_handle(out_schema, result_handle, is_sorted, False)
+        if result_batch.length() > 0:
+            out_writer.append_batch(result_batch)
+        if reindex_col >= 0:
+            out_writer.mark_sorted(False)
+        else:
+            out_writer.mark_sorted(is_sorted)
+        result_batch.free()
+    finally:
+        lltype.free(out_result, flavor="raw")
+        lltype.free(in_schema_buf, flavor="raw")
+        lltype.free(out_schema_buf, flavor="raw")
 
 
 def op_negate(in_batch, out_writer):
     """
     DBSP negation: flips the sign of every weight.
-    Uses bulk column copy with negated weight write.
+    Delegates to Rust via single FFI call.
     """
-    out_writer.append_batch_negated(in_batch)
-    if in_batch._consolidated:
-        out_writer.mark_consolidated(True)
-    else:
-        out_writer.mark_sorted(in_batch._sorted)
+    from gnitz.storage import engine_ffi
 
-
-def _op_union_merge(batch_a, batch_b, out_writer):
-    n_a = batch_a.length()
-    n_b = batch_b.length()
-    i = 0
-    j = 0
-    # Accumulate consecutive rows from the same source into runs, then flush
-    # each run as a single append_batch call (one alloc_n + K memcpy per run
-    # instead of one alloc_n + K memcpy per row).
-    # run_src: 0=batch_a, 1=batch_b, -1=no current run
-    run_src = -1
-    run_a_start = 0
-    run_b_start = 0
-    while i < n_a and j < n_b:
-        pk_a_lo = batch_a.get_pk_lo(i)
-        pk_a_hi = batch_a.get_pk_hi(i)
-        pk_b_lo = batch_b.get_pk_lo(j)
-        pk_b_hi = batch_b.get_pk_hi(j)
-        if pk_lt(pk_a_lo, pk_a_hi, pk_b_lo, pk_b_hi):
-            if run_src != 0:
-                if run_src == 1:
-                    out_writer.append_batch(batch_b, run_b_start, j)
-                run_src = 0
-                run_a_start = i
-            i += 1
-        elif pk_lt(pk_b_lo, pk_b_hi, pk_a_lo, pk_a_hi):
-            if run_src != 1:
-                if run_src == 0:
-                    out_writer.append_batch(batch_a, run_a_start, i)
-                run_src = 1
-                run_b_start = j
-            j += 1
+    out_result = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+    try:
+        rc = engine_ffi._op_negate(
+            in_batch._handle,
+            out_result,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_op_negate failed: %d" % intmask(rc))
+        result_handle = out_result[0]
+        schema = in_batch._schema
+        is_sorted = intmask(engine_ffi._batch_is_sorted(result_handle)) != 0
+        is_consolidated = intmask(engine_ffi._batch_is_consolidated(result_handle)) != 0
+        result_batch = ArenaZSetBatch._wrap_handle(schema, result_handle, is_sorted, is_consolidated)
+        if result_batch.length() > 0:
+            out_writer.append_batch(result_batch)
+        if is_consolidated:
+            out_writer.mark_consolidated(True)
         else:
-            # Equal keys: flush current run then emit one row from each source.
-            if run_src == 0:
-                out_writer.append_batch(batch_a, run_a_start, i)
-            elif run_src == 1:
-                out_writer.append_batch(batch_b, run_b_start, j)
-            run_src = -1
-            out_writer.append_batch(batch_a, i, i + 1)
-            out_writer.append_batch(batch_b, j, j + 1)
-            i += 1
-            j += 1
-    # Flush the final run from the main loop.
-    if run_src == 0:
-        out_writer.append_batch(batch_a, run_a_start, i)
-    elif run_src == 1:
-        out_writer.append_batch(batch_b, run_b_start, j)
-    # Bulk-copy any remaining rows from the non-exhausted batch.
-    if i < n_a:
-        out_writer.append_batch(batch_a, i, n_a)
-    if j < n_b:
-        out_writer.append_batch(batch_b, j, n_b)
-    out_writer.mark_sorted(True)
+            out_writer.mark_sorted(is_sorted)
+        result_batch.free()
+    finally:
+        lltype.free(out_result, flavor="raw")
 
 
 def op_union(batch_a, batch_b, out_writer):
     """
     Algebraic addition of two Z-Set streams.
     batch_b may be None or empty, in which case this is an identity copy of batch_a.
-    When both inputs are sorted, performs an O(N) merge preserving sort order.
+    Delegates to Rust via single FFI call.
     """
-    if batch_b is None or batch_b.length() == 0:
-        out_writer.append_batch(batch_a)
-        if batch_a._consolidated:
+    from gnitz.storage import engine_ffi
+
+    schema = batch_a._schema
+    schema_buf = engine_ffi.pack_schema(schema)
+    out_result = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
+    try:
+        batch_b_handle = batch_b._handle if (batch_b is not None and batch_b.length() > 0) else lltype.nullptr(rffi.VOIDP.TO)
+        rc = engine_ffi._op_union(
+            batch_a._handle,
+            batch_b_handle,
+            rffi.cast(rffi.VOIDP, schema_buf),
+            out_result,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_op_union failed: %d" % intmask(rc))
+        result_handle = out_result[0]
+        is_sorted = intmask(engine_ffi._batch_is_sorted(result_handle)) != 0
+        is_consolidated = intmask(engine_ffi._batch_is_consolidated(result_handle)) != 0
+        result_batch = ArenaZSetBatch._wrap_handle(schema, result_handle, is_sorted, is_consolidated)
+        if result_batch.length() > 0:
+            out_writer.append_batch(result_batch)
+        if is_consolidated:
             out_writer.mark_consolidated(True)
         else:
-            out_writer.mark_sorted(batch_a._sorted)
-        return
-    if batch_a._sorted and batch_b._sorted:
-        _op_union_merge(batch_a, batch_b, out_writer)
-        return
-    out_writer.append_batch(batch_a)
-    out_writer.append_batch(batch_b)
+            out_writer.mark_sorted(is_sorted)
+        result_batch.free()
+    finally:
+        lltype.free(out_result, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")
 
 
 def op_delay(in_batch, out_writer):

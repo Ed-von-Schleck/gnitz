@@ -13,6 +13,8 @@ _lib_path = os.path.join(_lib_dir, "libgnitz_engine.a") if _lib_dir else ""
 eci = ExternalCompilationInfo(
     pre_include_bits=[
         "#include <stdint.h>",
+        # logging
+        "void gnitz_log_init(uint32_t level, const uint8_t *tag, uint32_t tag_len);",
         # xor8
         "void *gnitz_xor8_build(const uint64_t *pk_lo, const uint64_t *pk_hi, uint32_t count);",
         "int gnitz_xor8_may_contain(const void *handle, uint64_t key_lo, uint64_t key_hi);",
@@ -120,6 +122,34 @@ eci = ExternalCompilationInfo(
         "  const void *delta, void *cursor,"
         "  const void *left_schema, const void *right_schema,"
         "  void **out_result);",
+        # expression programs and scalar functions
+        "void *gnitz_expr_program_create("
+        "  const int64_t *code, uint32_t code_len,"
+        "  uint32_t num_regs, uint32_t result_reg,"
+        "  const uint8_t *const_string_data,"
+        "  const uint32_t *const_string_offsets,"
+        "  const uint32_t *const_string_lengths,"
+        "  uint32_t num_const_strings);",
+        "void gnitz_expr_program_free(void *handle);",
+        "void *gnitz_scalar_func_create_expr_predicate(void *program);",
+        "void *gnitz_scalar_func_create_expr_map(void *program);",
+        "void *gnitz_scalar_func_create_universal_predicate("
+        "  uint32_t col_idx, uint8_t op, uint64_t val_bits, int32_t is_float);",
+        "void *gnitz_scalar_func_create_universal_projection("
+        "  const uint32_t *src_indices, const uint8_t *src_types, uint32_t count);",
+        "void gnitz_scalar_func_free(void *handle);",
+        # linear operators
+        "int32_t gnitz_op_filter("
+        "  const void *batch, const void *func, const void *schema,"
+        "  void **out_result);",
+        "int32_t gnitz_op_map("
+        "  const void *batch, const void *func,"
+        "  const void *in_schema, const void *out_schema,"
+        "  int32_t reindex_col, void **out_result);",
+        "int32_t gnitz_op_negate(const void *batch, void **out_result);",
+        "int32_t gnitz_op_union("
+        "  const void *batch_a, const void *batch_b,"
+        "  const void *schema, void **out_result);",
         # shard index (opaque FLSM lifecycle handle)
         "void *gnitz_shard_index_create(uint32_t table_id, char *output_dir, void *schema_desc);",
         "void gnitz_shard_index_close(void *handle);",
@@ -283,6 +313,28 @@ eci = ExternalCompilationInfo(
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+_log_init = rffi.llexternal(
+    "gnitz_log_init",
+    [rffi.UINT, rffi.CCHARP, rffi.UINT],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+
+def log_init(level, tag):
+    """Initialize Rust-side logging. Call after log.init() in main.py."""
+    n = len(tag)
+    tag_buf = lltype.malloc(rffi.CCHARP.TO, max(n, 1), flavor="raw")
+    for i in range(n):
+        tag_buf[i] = tag[i]
+    _log_init(rffi.cast(rffi.UINT, level), tag_buf, rffi.cast(rffi.UINT, n))
+    lltype.free(tag_buf, flavor="raw")
+
 
 # ---------------------------------------------------------------------------
 # XOR8
@@ -705,6 +757,92 @@ _op_join_dt = rffi.llexternal(
 _op_join_dt_outer = rffi.llexternal(
     "gnitz_op_join_dt_outer",
     [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Expression programs and scalar functions
+# ---------------------------------------------------------------------------
+
+_expr_program_create = rffi.llexternal(
+    "gnitz_expr_program_create",
+    [rffi.LONGLONGP, rffi.UINT, rffi.UINT, rffi.UINT,
+     rffi.CCHARP, rffi.UINTP, rffi.UINTP, rffi.UINT],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_expr_program_free = rffi.llexternal(
+    "gnitz_expr_program_free",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_scalar_func_create_expr_predicate = rffi.llexternal(
+    "gnitz_scalar_func_create_expr_predicate",
+    [rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_scalar_func_create_expr_map = rffi.llexternal(
+    "gnitz_scalar_func_create_expr_map",
+    [rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_scalar_func_create_universal_predicate = rffi.llexternal(
+    "gnitz_scalar_func_create_universal_predicate",
+    [rffi.UINT, rffi.UCHAR, rffi.ULONGLONG, rffi.INT],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_scalar_func_create_universal_projection = rffi.llexternal(
+    "gnitz_scalar_func_create_universal_projection",
+    [rffi.UINTP, rffi.CCHARP, rffi.UINT],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_scalar_func_free = rffi.llexternal(
+    "gnitz_scalar_func_free",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Linear operators (single-call, Rust-side)
+# ---------------------------------------------------------------------------
+
+_op_filter = rffi.llexternal(
+    "gnitz_op_filter",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_op_map = rffi.llexternal(
+    "gnitz_op_map",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.INT, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_op_negate = rffi.llexternal(
+    "gnitz_op_negate",
+    [rffi.VOIDP, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_op_union = rffi.llexternal(
+    "gnitz_op_union",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
     rffi.INT,
     compilation_info=eci,
 )

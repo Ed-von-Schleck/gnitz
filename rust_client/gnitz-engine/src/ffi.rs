@@ -9,6 +9,22 @@ use xorf::Xor8;
 use crate::{bloom::BloomFilter, xor8};
 
 // ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+/// Initialize the Rust logging subsystem.
+/// level: 0=QUIET, 1=NORMAL, 2=DEBUG. tag: process tag bytes (e.g. "M", "W0").
+#[no_mangle]
+pub extern "C" fn gnitz_log_init(level: u32, tag_ptr: *const u8, tag_len: u32) {
+    let tag = if tag_ptr.is_null() || tag_len == 0 {
+        &[] as &[u8]
+    } else {
+        unsafe { slice::from_raw_parts(tag_ptr, tag_len.min(3) as usize) }
+    };
+    crate::log::init(level, tag);
+}
+
+// ---------------------------------------------------------------------------
 // XOR8
 // ---------------------------------------------------------------------------
 
@@ -941,6 +957,248 @@ pub extern "C" fn gnitz_op_join_dt_outer(
         let ls = unsafe { &*left_schema };
         let rs = unsafe { &*right_schema };
         let output = crate::ops::op_join_delta_trace_outer(delta, &mut ch.cursor, ls, rs);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
+// Expression programs and scalar functions
+// ---------------------------------------------------------------------------
+
+/// Create an ExprProgram from a flat i64 code array + string constants.
+/// Returns opaque handle or null on error.
+#[no_mangle]
+pub extern "C" fn gnitz_expr_program_create(
+    code: *const i64,
+    code_len: u32,
+    num_regs: u32,
+    result_reg: u32,
+    const_string_data: *const u8,
+    const_string_offsets: *const u32,
+    const_string_lengths: *const u32,
+    num_const_strings: u32,
+) -> *mut libc::c_void {
+    let result = panic::catch_unwind(|| {
+        if code.is_null() || code_len == 0 {
+            return ptr::null_mut();
+        }
+        let code_slice = unsafe { slice::from_raw_parts(code, code_len as usize) };
+        let code_vec = code_slice.to_vec();
+
+        let mut const_strings = Vec::new();
+        if num_const_strings > 0 && !const_string_data.is_null()
+            && !const_string_offsets.is_null() && !const_string_lengths.is_null()
+        {
+            let offsets = unsafe { slice::from_raw_parts(const_string_offsets, num_const_strings as usize) };
+            let lengths = unsafe { slice::from_raw_parts(const_string_lengths, num_const_strings as usize) };
+            let total_len: usize = offsets.last().map_or(0, |&o| o as usize)
+                + lengths.last().map_or(0, |&l| l as usize);
+            let data = unsafe { slice::from_raw_parts(const_string_data, total_len) };
+            for i in 0..num_const_strings as usize {
+                let off = offsets[i] as usize;
+                let len = lengths[i] as usize;
+                const_strings.push(data[off..off + len].to_vec());
+            }
+        }
+
+        let prog = crate::expr::ExprProgram::new(code_vec, num_regs, result_reg, const_strings);
+        Box::into_raw(Box::new(prog)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_expr_program_free(handle: *mut libc::c_void) {
+    if !handle.is_null() {
+        unsafe { drop(Box::from_raw(handle as *mut crate::expr::ExprProgram)); }
+    }
+}
+
+/// Create a ScalarFuncKind::ExprPredicate from an ExprProgram handle.
+/// Takes ownership of the program (caller must not free it separately).
+#[no_mangle]
+pub extern "C" fn gnitz_scalar_func_create_expr_predicate(
+    program_handle: *mut libc::c_void,
+) -> *mut libc::c_void {
+    let result = panic::catch_unwind(|| {
+        if program_handle.is_null() {
+            return ptr::null_mut();
+        }
+        let prog = unsafe { *Box::from_raw(program_handle as *mut crate::expr::ExprProgram) };
+        let func = crate::scalar_func::ScalarFuncKind::ExprPredicate(prog);
+        Box::into_raw(Box::new(func)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Create a ScalarFuncKind::ExprMap from an ExprProgram handle.
+/// Takes ownership of the program.
+#[no_mangle]
+pub extern "C" fn gnitz_scalar_func_create_expr_map(
+    program_handle: *mut libc::c_void,
+) -> *mut libc::c_void {
+    let result = panic::catch_unwind(|| {
+        if program_handle.is_null() {
+            return ptr::null_mut();
+        }
+        let prog = unsafe { *Box::from_raw(program_handle as *mut crate::expr::ExprProgram) };
+        let analysis = crate::scalar_func::MapAnalysis::from_program(&prog);
+        let func = crate::scalar_func::ScalarFuncKind::ExprMap { program: prog, analysis };
+        Box::into_raw(Box::new(func)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Create a ScalarFuncKind::UniversalPredicate.
+#[no_mangle]
+pub extern "C" fn gnitz_scalar_func_create_universal_predicate(
+    col_idx: u32,
+    op: u8,
+    val_bits: u64,
+    is_float: i32,
+) -> *mut libc::c_void {
+    let result = panic::catch_unwind(|| {
+        let func = crate::scalar_func::ScalarFuncKind::UniversalPredicate {
+            col_idx,
+            op,
+            val_bits,
+            is_float: is_float != 0,
+        };
+        Box::into_raw(Box::new(func)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Create a ScalarFuncKind::UniversalProjection.
+#[no_mangle]
+pub extern "C" fn gnitz_scalar_func_create_universal_projection(
+    src_indices: *const u32,
+    src_types: *const u8,
+    count: u32,
+) -> *mut libc::c_void {
+    let result = panic::catch_unwind(|| {
+        if src_indices.is_null() || src_types.is_null() || count == 0 {
+            return ptr::null_mut();
+        }
+        let indices = unsafe { slice::from_raw_parts(src_indices, count as usize) }.to_vec();
+        let types = unsafe { slice::from_raw_parts(src_types, count as usize) }.to_vec();
+        let func = crate::scalar_func::ScalarFuncKind::UniversalProjection {
+            src_indices: indices,
+            src_types: types,
+        };
+        Box::into_raw(Box::new(func)) as *mut libc::c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_scalar_func_free(handle: *mut libc::c_void) {
+    if !handle.is_null() {
+        unsafe { drop(Box::from_raw(handle as *mut crate::scalar_func::ScalarFuncKind)); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linear operators
+// ---------------------------------------------------------------------------
+
+/// Filter: returns output batch with rows matching predicate.
+#[no_mangle]
+pub extern "C" fn gnitz_op_filter(
+    batch_handle: *const libc::c_void,
+    func_handle: *const libc::c_void,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if batch_handle.is_null() || schema_desc.is_null() || out_result.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let batch = unsafe { &*(batch_handle as *const crate::memtable::OwnedBatch) };
+        let schema = unsafe { &*schema_desc };
+        let func = if func_handle.is_null() {
+            &crate::scalar_func::ScalarFuncKind::Null
+        } else {
+            unsafe { &*(func_handle as *const crate::scalar_func::ScalarFuncKind) }
+        };
+        let output = crate::ops::op_filter(batch, func, schema);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+/// Map: returns transformed output batch.
+#[no_mangle]
+pub extern "C" fn gnitz_op_map(
+    batch_handle: *const libc::c_void,
+    func_handle: *const libc::c_void,
+    in_schema: *const crate::compact::SchemaDescriptor,
+    out_schema: *const crate::compact::SchemaDescriptor,
+    reindex_col: i32,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if batch_handle.is_null() || in_schema.is_null() || out_schema.is_null()
+        || out_result.is_null()
+    {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let batch = unsafe { &*(batch_handle as *const crate::memtable::OwnedBatch) };
+        let is = unsafe { &*in_schema };
+        let os = unsafe { &*out_schema };
+        let func = if func_handle.is_null() {
+            &crate::scalar_func::ScalarFuncKind::Null
+        } else {
+            unsafe { &*(func_handle as *const crate::scalar_func::ScalarFuncKind) }
+        };
+        let output = crate::ops::op_map(batch, func, is, os, reindex_col);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+/// Negate: returns batch with all weights negated.
+#[no_mangle]
+pub extern "C" fn gnitz_op_negate(
+    batch_handle: *const libc::c_void,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if batch_handle.is_null() || out_result.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let batch = unsafe { &*(batch_handle as *const crate::memtable::OwnedBatch) };
+        let output = crate::ops::op_negate(batch);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+/// Union: returns merged output batch.
+#[no_mangle]
+pub extern "C" fn gnitz_op_union(
+    batch_a_handle: *const libc::c_void,
+    batch_b_handle: *const libc::c_void,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if batch_a_handle.is_null() || schema_desc.is_null() || out_result.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let batch_a = unsafe { &*(batch_a_handle as *const crate::memtable::OwnedBatch) };
+        let schema = unsafe { &*schema_desc };
+        let batch_b = if batch_b_handle.is_null() {
+            None
+        } else {
+            Some(unsafe { &*(batch_b_handle as *const crate::memtable::OwnedBatch) })
+        };
+        let output = crate::ops::op_union(batch_a, batch_b, schema);
         unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
         0
     });

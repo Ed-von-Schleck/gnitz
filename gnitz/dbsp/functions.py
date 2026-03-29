@@ -6,6 +6,8 @@ from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core import types, strings
 
+_NULL_HANDLE = lltype.nullptr(rffi.VOIDP.TO)
+
 # --- Function Opcodes ---
 OP_EQ = 1
 OP_GT = 2
@@ -39,6 +41,12 @@ class ScalarFunction(object):
         """Batch-level map. Returns True if handled, False to fall back to per-row."""
         return False
 
+    def get_func_handle(self):
+        return _NULL_HANDLE
+
+    def close(self):
+        pass
+
 
 class NullPredicate(ScalarFunction):
     """The Null Object for ScalarFunction."""
@@ -48,16 +56,32 @@ class NullPredicate(ScalarFunction):
 
 class UniversalPredicate(ScalarFunction):
     """
-    Unified logic for filtering. 
+    Unified logic for filtering.
     Handles EQ, GT, LT for all numeric types.
     """
     _immutable_fields_ = ['col_idx', 'op', 'val_bits', 'is_float']
 
     def __init__(self, col_idx, op, val_bits, is_float=False):
+        from gnitz.storage import engine_ffi
         self.col_idx = col_idx
         self.op = op
         self.val_bits = val_bits # Constant stored as raw u64 bits
         self.is_float = is_float
+        self._func_handle = engine_ffi._scalar_func_create_universal_predicate(
+            rffi.cast(rffi.UINT, col_idx),
+            rffi.cast(rffi.UCHAR, op),
+            rffi.cast(rffi.ULONGLONG, val_bits),
+            rffi.cast(rffi.INT, 1 if is_float else 0),
+        )
+
+    def get_func_handle(self):
+        return self._func_handle
+
+    def close(self):
+        from gnitz.storage import engine_ffi
+        if self._func_handle:
+            engine_ffi._scalar_func_free(self._func_handle)
+            self._func_handle = _NULL_HANDLE
 
     def evaluate_predicate(self, row_accessor):
         # Promoting the op/type allows the JIT to compile a specialized 
@@ -105,9 +129,30 @@ class UniversalProjection(ScalarFunction):
     _immutable_fields_ = ['src_indices[*]', 'src_types[*]']
 
     def __init__(self, indices, types_list):
+        from gnitz.storage import engine_ffi
         # copy: [*] requires never-resized lists for JIT unrolling
         self.src_indices = indices[:]
         self.src_types = types_list[:]
+        n = len(indices)
+        idx_arr = lltype.malloc(rffi.UINTP.TO, n, flavor="raw")
+        typ_arr = lltype.malloc(rffi.CCHARP.TO, n, flavor="raw")
+        for i in range(n):
+            idx_arr[i] = rffi.cast(rffi.UINT, indices[i])
+            typ_arr[i] = chr(types_list[i])
+        self._func_handle = engine_ffi._scalar_func_create_universal_projection(
+            idx_arr, typ_arr, rffi.cast(rffi.UINT, n),
+        )
+        lltype.free(idx_arr, flavor="raw")
+        lltype.free(typ_arr, flavor="raw")
+
+    def get_func_handle(self):
+        return self._func_handle
+
+    def close(self):
+        from gnitz.storage import engine_ffi
+        if self._func_handle:
+            engine_ffi._scalar_func_free(self._func_handle)
+            self._func_handle = _NULL_HANDLE
 
     @jit.unroll_safe
     def evaluate_map(self, row_accessor, output_row):

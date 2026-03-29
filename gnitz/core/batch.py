@@ -337,12 +337,20 @@ class ArenaZSetBatch(object):
         self._consolidated = False
 
     def mark_sorted(self, value):
+        from gnitz.storage import engine_ffi
         self._sorted = value
+        engine_ffi._batch_set_sorted(
+            self._handle, rffi.cast(rffi.INT, 1 if value else 0))
 
     def mark_consolidated(self, value):
+        from gnitz.storage import engine_ffi
         self._consolidated = value
         if value:
             self._sorted = True
+        engine_ffi._batch_set_sorted(
+            self._handle, rffi.cast(rffi.INT, 1 if self._sorted else 0))
+        engine_ffi._batch_set_consolidated(
+            self._handle, rffi.cast(rffi.INT, 1 if value else 0))
 
     def is_empty(self):
         return self.length() == 0
