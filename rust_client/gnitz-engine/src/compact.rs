@@ -410,7 +410,25 @@ fn open_and_merge(
         cursors.push(ShardCursor::new(i, &shards[i]));
     }
 
-    let key_less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| a.key < b.key;
+    // Payload-aware heap ordering ensures matching (PK, payload) entries
+    // are adjacent in the tournament tree, which is required for correct
+    // weight accumulation in the pending-group drain below.
+    fn make_shard_less<'a>(
+        cursors: &'a [ShardCursor],
+        shards: &'a [MappedShard],
+        schema: &'a SchemaDescriptor,
+    ) -> impl Fn(&crate::heap::HeapNode, &crate::heap::HeapNode) -> bool + 'a {
+        move |a, b| {
+            if a.key != b.key {
+                return a.key < b.key;
+            }
+            columnar::compare_rows(
+                schema,
+                &shards[cursors[a.idx].shard_idx], cursors[a.idx].position,
+                &shards[cursors[b.idx].shard_idx], cursors[b.idx].position,
+            ) == std::cmp::Ordering::Less
+        }
+    }
 
     let mut tree = MergeHeap::build(
         cursors.len(),
@@ -421,82 +439,54 @@ fn open_and_merge(
                 None
             }
         },
-        &key_less,
+        &make_shard_less(&cursors, &shards, schema),
     );
 
-    // Pending-group algorithm: accumulate weight while (PK, payload) matches,
-    // flush on change. This replaces collect_min_indices with a sequential
-    // drain of all cursors at the minimum PK, processing one (PK, payload)
-    // group at a time.  Correct regardless of heap ordering granularity.
+    // Pending-group drain: pop one entry at a time, accumulate weight while
+    // (PK, payload) matches the pending group, flush on change.  The payload-
+    // aware heap ensures matching entries are delivered consecutively.
     let mut has_pending = false;
     let mut pending_shard_idx: usize = 0;
     let mut pending_row: usize = 0;
     let mut pending_key: u128 = 0;
     let mut pending_weight: i64 = 0;
 
-    let mut advance_buf: Vec<usize> = Vec::with_capacity(shards.len());
     while !tree.is_empty() {
-        let min_key = tree.min_key();
+        let ci = tree.min_idx();
+        let si = cursors[ci].shard_idx;
+        let row = cursors[ci].position;
+        let cur_key = shards[si].get_pk(row);
+        let cur_weight = shards[si].get_weight(row);
 
-        // Collect ALL cursors at min PK (same as before — PK-equal)
-        let num_min = tree.collect_min_indices(
-            &|a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> std::cmp::Ordering {
-                a.key.cmp(&b.key)
-            },
-        );
-
-        // Sort collected indices by (PK, payload) so matching entries are adjacent
-        let min_slice = &mut tree.min_indices[..num_min];
-        min_slice.sort_by(|&ai, &bi| {
-            columnar::compare_rows(
+        let same_group = has_pending
+            && cur_key == pending_key
+            && columnar::compare_rows(
                 schema,
-                &shards[cursors[ai].shard_idx], cursors[ai].position,
-                &shards[cursors[bi].shard_idx], cursors[bi].position,
-            )
-        });
+                &shards[pending_shard_idx], pending_row,
+                &shards[si], row,
+            ) == std::cmp::Ordering::Equal;
 
-        // Walk sorted entries, accumulating weight for matching (PK, payload)
-        for i in 0..num_min {
-            let ci = min_slice[i];
-            let si = cursors[ci].shard_idx;
-            let row = cursors[ci].position;
-            let w = cursors[ci].weight(&shards[si]);
-
-            let same_group = has_pending
-                && min_key == pending_key
-                && columnar::compare_rows(
-                    schema,
-                    &shards[pending_shard_idx], pending_row,
-                    &shards[si], row,
-                ) == std::cmp::Ordering::Equal;
-
-            if same_group {
-                pending_weight += w;
-            } else {
-                if has_pending && pending_weight != 0 {
-                    emit(pending_key, pending_weight, &shards[pending_shard_idx], pending_row);
-                }
-                pending_shard_idx = si;
-                pending_row = row;
-                pending_key = min_key;
-                pending_weight = w;
-                has_pending = true;
+        if same_group {
+            pending_weight += cur_weight;
+        } else {
+            if has_pending && pending_weight != 0 {
+                emit(pending_key, pending_weight, &shards[pending_shard_idx], pending_row);
             }
+            pending_shard_idx = si;
+            pending_row = row;
+            pending_key = cur_key;
+            pending_weight = cur_weight;
+            has_pending = true;
         }
 
-        // Advance all collected cursors
-        advance_buf.clear();
-        advance_buf.extend_from_slice(min_slice);
-        for &ci in &advance_buf {
-            let shard = &shards[cursors[ci].shard_idx];
-            cursors[ci].advance(shard);
-            let new_key = if cursors[ci].is_valid() {
-                Some(cursors[ci].peek_key(&shards[cursors[ci].shard_idx]))
-            } else {
-                None
-            };
-            tree.advance(ci, new_key, &key_less);
-        }
+        // Advance this cursor
+        cursors[ci].advance(&shards[si]);
+        let new_key = if cursors[ci].is_valid() {
+            Some(cursors[ci].peek_key(&shards[cursors[ci].shard_idx]))
+        } else {
+            None
+        };
+        tree.advance(ci, new_key, &make_shard_less(&cursors, &shards, schema));
     }
 
     // Flush last pending group
@@ -1025,6 +1015,241 @@ mod tests {
 
         // Row 1: null
         assert!(is_null(&merged, 1, 1, 0));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- 3-column helpers for reduce-output-pattern tests --------------------
+
+    fn make_3col_schema() -> SchemaDescriptor {
+        let mut s = SchemaDescriptor {
+            num_columns: 3,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        s.columns[0] = SchemaColumn { type_code: TYPE_U64, size: 8, nullable: 0, _pad: 0 };
+        s.columns[1] = SchemaColumn { type_code: TYPE_I64, size: 8, nullable: 0, _pad: 0 };
+        s.columns[2] = SchemaColumn { type_code: TYPE_I64, size: 8, nullable: 0, _pad: 0 };
+        s
+    }
+
+    /// Write a shard with 3-column rows: (pk, weight, col1_val, col2_val).
+    fn write_3col_shard(
+        path: &str,
+        rows: &[(u64, i64, i64, i64)],
+        schema: &SchemaDescriptor,
+    ) {
+        let mut writer = ShardWriter::new(schema);
+        for &(pk, w, c1, c2) in rows {
+            writer.count += 1;
+            writer.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            writer.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            writer.weight.extend_from_slice(&w.to_le_bytes());
+            writer.null_bitmap.extend_from_slice(&0u64.to_le_bytes());
+            // col_bufs[0] is PK (skipped in finalize), [1] = col1, [2] = col2
+            writer.col_bufs[0].extend_from_slice(&pk.to_le_bytes());
+            writer.col_bufs[1].extend_from_slice(&c1.to_le_bytes());
+            writer.col_bufs[2].extend_from_slice(&c2.to_le_bytes());
+        }
+        let cpath = std::ffi::CString::new(path).unwrap();
+        assert_eq!(writer.finalize(&cpath, 0), 0);
+    }
+
+    /// Read all rows from a 3-col shard as (pk, weight, col1, col2).
+    fn read_3col_shard(path: &str, schema: &SchemaDescriptor) -> Vec<(u64, i64, i64, i64)> {
+        let cpath = std::ffi::CString::new(path).unwrap();
+        let shard = MappedShard::open(&cpath, schema, false).unwrap();
+        let mut rows = Vec::new();
+        for i in 0..shard.count {
+            let pk = shard.get_pk_lo(i);
+            let w = shard.get_weight(i);
+            let c1 = read_i64_le(shard.get_col_ptr(i, 0, 8), 0);
+            let c2 = read_i64_le(shard.get_col_ptr(i, 1, 8), 0);
+            rows.push((pk, w, c1, c2));
+        }
+        rows
+    }
+
+    /// The exact pattern that triggered the bug: same PK, different payload
+    /// (different agg_val column) across shards. Retractions must cancel
+    /// with matching insertions from earlier shards.
+    #[test]
+    fn test_compact_same_pk_different_payload_cancels() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_3col_cancel");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_3col_schema();
+
+        // Shard 1 (tick 1): insert (pk=1, group=0, sum=5000)
+        let s1 = dir.join("s1.db");
+        write_3col_shard(s1.to_str().unwrap(), &[(1, 1, 0, 5000)], &schema);
+
+        // Shard 2 (tick 2): retract sum=5000, insert sum=10000
+        let s2 = dir.join("s2.db");
+        write_3col_shard(s2.to_str().unwrap(), &[
+            (1, -1, 0, 5000),
+            (1,  1, 0, 10000),
+        ], &schema);
+
+        // Shard 3 (tick 3): retract sum=10000, insert sum=15000
+        let s3 = dir.join("s3.db");
+        write_3col_shard(s3.to_str().unwrap(), &[
+            (1, -1, 0, 10000),
+            (1,  1, 0, 15000),
+        ], &schema);
+
+        let output = dir.join("merged.db");
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cs3 = std::ffi::CString::new(s3.to_str().unwrap()).unwrap();
+        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
+
+        let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
+        let rc = compact_shards(&inputs, &cout, &schema, 0);
+        assert_eq!(rc, 0);
+
+        let rows = read_3col_shard(output.to_str().unwrap(), &schema);
+        assert_eq!(rows.len(), 1, "expected 1 surviving row, got {:?}", rows);
+        assert_eq!(rows[0], (1, 1, 0, 15000));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Multiple groups with interleaved shards: ensures the pending-group
+    /// algorithm handles group boundaries correctly across PKs.
+    #[test]
+    fn test_compact_multi_group_reduce_pattern() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_3col_multi");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_3col_schema();
+
+        // Group A (pk=1) and Group B (pk=2), 3 ticks each
+        let s1 = dir.join("s1.db");
+        write_3col_shard(s1.to_str().unwrap(), &[
+            (1, 1, 0, 100),
+            (2, 1, 1, 200),
+        ], &schema);
+
+        let s2 = dir.join("s2.db");
+        write_3col_shard(s2.to_str().unwrap(), &[
+            (1, -1, 0, 100), (1, 1, 0, 300),
+            (2, -1, 1, 200), (2, 1, 1, 400),
+        ], &schema);
+
+        let s3 = dir.join("s3.db");
+        write_3col_shard(s3.to_str().unwrap(), &[
+            (1, -1, 0, 300), (1, 1, 0, 600),
+            (2, -1, 1, 400), (2, 1, 1, 800),
+        ], &schema);
+
+        let output = dir.join("merged.db");
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cs3 = std::ffi::CString::new(s3.to_str().unwrap()).unwrap();
+        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
+
+        let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
+        let rc = compact_shards(&inputs, &cout, &schema, 0);
+        assert_eq!(rc, 0);
+
+        let rows = read_3col_shard(output.to_str().unwrap(), &schema);
+        assert_eq!(rows.len(), 2, "expected 2 surviving rows, got {:?}", rows);
+        assert_eq!(rows[0], (1, 1, 0, 600));
+        assert_eq!(rows[1], (2, 1, 1, 800));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 10 shards simulating 10 reduce ticks for 1 group — the exact scenario
+    /// from the test_heavy_agg_500k failure.
+    #[test]
+    fn test_compact_10_tick_reduce_single_group() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_3col_10tick");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_3col_schema();
+        let mut shard_paths = Vec::new();
+
+        // Tick 1: insert sum=5000
+        let p = dir.join("t1.db");
+        write_3col_shard(p.to_str().unwrap(), &[(1, 1, 0, 5000)], &schema);
+        shard_paths.push(p);
+
+        // Ticks 2-10: retract old, insert new
+        for tick in 2..=10u64 {
+            let old_sum = (tick - 1) * 5000;
+            let new_sum = tick * 5000;
+            let p = dir.join(format!("t{}.db", tick));
+            write_3col_shard(p.to_str().unwrap(), &[
+                (1, -1, 0, old_sum as i64),
+                (1,  1, 0, new_sum as i64),
+            ], &schema);
+            shard_paths.push(p);
+        }
+
+        let output = dir.join("merged.db");
+        let cstrs: Vec<_> = shard_paths.iter()
+            .map(|p| std::ffi::CString::new(p.to_str().unwrap()).unwrap())
+            .collect();
+        let inputs: Vec<_> = cstrs.iter().map(|c| c.as_c_str()).collect();
+        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
+
+        let rc = compact_shards(&inputs, &cout, &schema, 0);
+        assert_eq!(rc, 0);
+
+        let rows = read_3col_shard(output.to_str().unwrap(), &schema);
+        assert_eq!(rows.len(), 1, "expected 1 row after 10-tick consolidation, got {}", rows.len());
+        assert_eq!(rows[0], (1, 1, 0, 50000), "expected final sum=50000");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// merge_and_route with same-PK-different-payload entries: verifies the
+    /// fix applies to the guard-routed path too (shares open_and_merge).
+    #[test]
+    fn test_merge_and_route_same_pk_different_payload() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_3col_route");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_3col_schema();
+
+        let s1 = dir.join("s1.db");
+        write_3col_shard(s1.to_str().unwrap(), &[
+            (10, 1, 0, 100),
+            (20, 1, 1, 200),
+        ], &schema);
+
+        let s2 = dir.join("s2.db");
+        write_3col_shard(s2.to_str().unwrap(), &[
+            (10, -1, 0, 100), (10, 1, 0, 300),
+            (20, -1, 1, 200), (20, 1, 1, 400),
+        ], &schema);
+
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let inputs = [cs1.as_c_str(), cs2.as_c_str()];
+
+        let guard_keys = vec![(0u64, 0u64)]; // single guard
+        let mut results = vec![GuardResult::zeroed()];
+
+        let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 99, 1, 1, &mut results);
+        assert!(n > 0, "merge_and_route should produce output");
+
+        let fn0 = crate::util::cstr_from_buf(&results[0].filename);
+        let rows = read_3col_shard(fn0, &schema);
+        assert_eq!(rows.len(), 2, "expected 2 rows, got {:?}", rows);
+        assert_eq!(rows[0], (10, 1, 0, 300));
+        assert_eq!(rows[1], (20, 1, 1, 400));
 
         let _ = fs::remove_dir_all(&dir);
     }
