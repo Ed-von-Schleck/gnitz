@@ -194,15 +194,50 @@ before deleting it.
 Process exit is not a substitute for `close()`. Tests that run multiple
 engine lifecycles in one process will expose missing links.
 
-## Debugging multi-worker failures
+## German String blob passthrough contract
 
-When a multi-worker test fails and the root cause is not immediately obvious:
+Any `RowAccessor` subclass that reads from a Rust-backed blob arena
+(OwnedBatch, ReadCursor, MappedShard) **must** override `get_blob_source()`
+to return `(blob_ptr, blob_len)`. Without this, `append_from_accessor` passes
+NULL as the blob source to `gnitz_batch_append_row`, and long strings
+(> 12 bytes) are silently zeroed — no error, no assertion, just corrupt data
+on the wire.
+
+The failure mode is insidious: short strings (≤ 12 bytes) inline their data
+and work fine. Only strings exceeding `SHORT_STRING_THRESHOLD` (12) need the
+blob arena. System table column names like `"sql_definition"` (14 bytes) or
+`"cache_directory"` (15 bytes) are the typical first casualties.
+
+When adding a new `RowAccessor` subclass backed by Rust storage:
+
+- [ ] Does `get_str_struct()` return a non-NULL `heap_ptr` (4th element)?
+      If yes, `get_blob_source()` **must** be overridden.
+- [ ] Does the override return the correct `(ptr, len)` for the backing
+      blob arena? The ptr must remain valid until `append_from_accessor`
+      returns (no reallocation between `get_blob_source()` and the FFI call).
+- [ ] Test with a table that has a STRING column containing a value > 12
+      bytes, then SCAN the table back. If the blob passthrough is missing,
+      the scan result will have empty blobs and the client decode will fail
+      with "German String blob arena out of bounds".
+
+Current implementations: `RustCursorAccessor` (cursor.py),
+`ColumnarBatchAccessor` (batch.py — uses dedicated fast-path, not
+`get_blob_source`). Known gap: `PTableFoundAccessor` and
+`EphemeralTableFoundAccessor` do not yet override `get_blob_source()`;
+these are used only in `retract_pk`, which currently only retracts by PK
+lookup — but will break if a retracted row contains a long string.
+
+## Debugging failures
+
+When any test fails (single-worker or multi-worker) and the root cause is
+not immediately obvious:
 
 1. **Add logging before re-running.** If you don't know exactly what value is wrong
    and where, you don't have enough information to re-run yet. Add targeted `log.debug()`
    calls at the send side and receive side of the suspected path — at minimum log the
    key column values and view_id. One instrumented run is worth more than ten blind
-   re-runs.
+   re-runs. For cross-boundary bugs (RPython ↔ Rust FFI), add `eprintln!` on the
+   Rust side — rebuild is ~55s and the output goes to `~/git/gnitz/tmp/server_debug.log`.
 2. **Isolate with 1 worker.** If the test passes with `GNITZ_WORKERS=1` and fails with
    `GNITZ_WORKERS=4`, the bug is in the exchange/fanout/stash path, not in computation.
 3. **Bisect by sub-path.** Add a flag or env var to disable the new fast-path and force
