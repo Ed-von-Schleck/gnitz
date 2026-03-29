@@ -222,6 +222,12 @@ class RustCursorAccessor(core_comparator.RowAccessor):
             s = ""
         return (length, prefix, ptr, blob_ptr, s)
 
+    def get_blob_source(self):
+        from gnitz.storage import engine_ffi
+        blob_ptr = engine_ffi._read_cursor_blob_ptr(self._handle)
+        blob_len = intmask(engine_ffi._read_cursor_blob_len(self._handle))
+        return blob_ptr, blob_len
+
     def get_col_ptr(self, col_idx):
         return self._col_ptr(col_idx)
 

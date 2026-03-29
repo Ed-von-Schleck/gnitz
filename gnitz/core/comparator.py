@@ -32,6 +32,15 @@ class RowAccessor(object):
     def is_null(self, col_idx):
         return False
 
+    def get_blob_source(self):
+        """Return (blob_ptr, blob_len) for the backing blob arena.
+
+        Default returns (NULL, 0).  Subclasses backed by a Rust batch or
+        cursor override this so that append_from_accessor can pass the
+        blob to gnitz_batch_append_row for German-string relocation.
+        """
+        return NULL_PTR, 0
+
 
 class NullAccessor(RowAccessor):
     """Right-side placeholder for outer join null-fill rows.

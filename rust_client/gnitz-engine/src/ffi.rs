@@ -1364,6 +1364,20 @@ pub extern "C" fn gnitz_read_cursor_blob_ptr(
     result.unwrap_or(ptr::null())
 }
 
+#[no_mangle]
+pub extern "C" fn gnitz_read_cursor_blob_len(
+    handle: *const libc::c_void,
+) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let result = panic::catch_unwind(|| {
+        let ch = unsafe { &*(handle as *const crate::read_cursor::CursorHandle) };
+        ch.cursor.blob_len() as u64
+    });
+    result.unwrap_or(0)
+}
+
 /// Close cursor and free Rust-side state.
 /// Does NOT close/free shard handles (RPython owns those).
 #[no_mangle]

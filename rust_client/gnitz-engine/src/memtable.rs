@@ -1131,4 +1131,5 @@ mod tests {
         assert!(batch.sorted);
         assert!(batch.consolidated);
     }
+
 }

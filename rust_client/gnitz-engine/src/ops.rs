@@ -947,6 +947,13 @@ fn promote_col_to_pk(
     let tc = schema.columns[col_idx].type_code;
     let pki = schema.pk_index as usize;
 
+    // If reindexing by the PK column itself, read from pk_lo/pk_hi directly.
+    if col_idx == pki {
+        let lo = crate::util::read_u64_le(batch.pk_lo, row * 8);
+        let hi = crate::util::read_u64_le(batch.pk_hi, row * 8);
+        return (lo, hi);
+    }
+
     match tc {
         type_code::U128 => {
             let pi = if col_idx < pki { col_idx } else { col_idx - 1 };

@@ -623,8 +623,7 @@ class ArenaZSetBatch(object):
                 actual_blob_src = blob_data
                 actual_blob_len = blob_len
             else:
-                actual_blob_src = NULL_PTR
-                actual_blob_len = 0
+                actual_blob_src, actual_blob_len = accessor.get_blob_source()
 
             rc = engine_ffi._batch_append_row(
                 self._handle,

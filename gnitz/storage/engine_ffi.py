@@ -182,6 +182,7 @@ eci = ExternalCompilationInfo(
         "const uint8_t *gnitz_read_cursor_col_ptr("
         "  const void *handle, int32_t col_idx, int32_t col_size);",
         "const uint8_t *gnitz_read_cursor_blob_ptr(const void *handle);",
+        "uint64_t gnitz_read_cursor_blob_len(const void *handle);",
         "void gnitz_read_cursor_close(void *handle);",
         "void *gnitz_read_cursor_create_from_snapshots("
         "  void **snap_handles, uint32_t num_snapshots,"
@@ -973,6 +974,13 @@ _read_cursor_blob_ptr = rffi.llexternal(
     "gnitz_read_cursor_blob_ptr",
     [rffi.VOIDP],
     rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_read_cursor_blob_len = rffi.llexternal(
+    "gnitz_read_cursor_blob_len",
+    [rffi.VOIDP],
+    rffi.ULONGLONG,
     compilation_info=eci,
 )
 

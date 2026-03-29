@@ -452,6 +452,14 @@ impl<'a> ReadCursor<'a> {
         }
         self.entries[self.current_entry_idx].source.blob_ptr()
     }
+
+    /// Blob arena length for the current row's source.
+    pub fn blob_len(&self) -> usize {
+        if !self.valid {
+            return 0;
+        }
+        self.entries[self.current_entry_idx].source.blob_slice().len()
+    }
 }
 
 // ---------------------------------------------------------------------------
