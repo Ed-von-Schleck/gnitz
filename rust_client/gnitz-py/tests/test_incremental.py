@@ -282,7 +282,7 @@ class TestReduceSumRetraction:
             client.drop_schema(sn)
 
     def test_sum_multi_tick(self, client):
-        """3 ticks: push 3 rows (sum=60), push 2 more (sum=110), retract 4 (sum=10)."""
+        """7 ticks: exercises view store L0 compaction (fires at tick 5)."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -297,10 +297,26 @@ class TestReduceSumRetraction:
             _push_grp(client, tid, schema, [(4, 1, 25), (5, 1, 25)])
             assert _scan_reduce(client, vid) == {1: 110}
 
-            # Tick 3: retract pk=2,3,4,5 (sum reduction = 20+30+25+25=100); final sum=10
+            # Tick 3: retract pk=2,3,4,5 (sum reduction = 20+30+25+25=100); sum=10
             _push_grp(client, tid, schema,
                       [(2, 1, 20), (3, 1, 30), (4, 1, 25), (5, 1, 25)], weight=-1)
             assert _scan_reduce(client, vid) == {1: 10}
+
+            # Tick 4: push (6,1,15),(7,1,5) → sum = 10+15+5 = 30
+            _push_grp(client, tid, schema, [(6, 1, 15), (7, 1, 5)])
+            assert _scan_reduce(client, vid) == {1: 30}
+
+            # Tick 5: retract (1,1,10) → sum = 20  [compaction fires here]
+            _push_grp(client, tid, schema, [(1, 1, 10)], weight=-1)
+            assert _scan_reduce(client, vid) == {1: 20}
+
+            # Tick 6: push (8,1,50) → sum = 70
+            _push_grp(client, tid, schema, [(8, 1, 50)])
+            assert _scan_reduce(client, vid) == {1: 70}
+
+            # Tick 7: retract (6,1,15),(8,1,50) → sum = 5
+            _push_grp(client, tid, schema, [(6, 1, 15), (8, 1, 50)], weight=-1)
+            assert _scan_reduce(client, vid) == {1: 5}
         finally:
             try:
                 client.drop_view(sn, vname)
@@ -416,6 +432,52 @@ class TestReduceMinRetraction:
                 pass
             client.drop_schema(sn)
 
+    def test_min_evolving_minimum(self, client):
+        """7 ticks, each pushing a strictly lower value: exercises view store L0 compaction."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid, schema, tname = _make_grp_table(client, sn)
+            vid, vname = _make_reduce_view(client, sn, tid, agg_func_id=3)  # MIN
+
+            # Tick 1: min=100
+            _push_grp(client, tid, schema, [(1, 1, 100)])
+            assert _scan_reduce(client, vid) == {1: 100}
+
+            # Tick 2: min=90
+            _push_grp(client, tid, schema, [(2, 1, 90)])
+            assert _scan_reduce(client, vid) == {1: 90}
+
+            # Tick 3: min=80
+            _push_grp(client, tid, schema, [(3, 1, 80)])
+            assert _scan_reduce(client, vid) == {1: 80}
+
+            # Tick 4: min=70
+            _push_grp(client, tid, schema, [(4, 1, 70)])
+            assert _scan_reduce(client, vid) == {1: 70}
+
+            # Tick 5: min=60  [compaction fires here]
+            _push_grp(client, tid, schema, [(5, 1, 60)])
+            assert _scan_reduce(client, vid) == {1: 60}
+
+            # Tick 6: min=50
+            _push_grp(client, tid, schema, [(6, 1, 50)])
+            assert _scan_reduce(client, vid) == {1: 50}
+
+            # Tick 7: min=40
+            _push_grp(client, tid, schema, [(7, 1, 40)])
+            assert _scan_reduce(client, vid) == {1: 40}
+        finally:
+            try:
+                client.drop_view(sn, vname)
+            except Exception:
+                pass
+            try:
+                client.drop_table(sn, tname)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
 
 # ---------------------------------------------------------------------------
 # TestReduceMaxRetraction (CircuitBuilder)
@@ -485,6 +547,52 @@ class TestReduceMaxRetraction:
             _push_grp(client, tid, schema, [(1, 1, 5)], weight=-1)
             result = _scan_reduce(client, vid)
             assert 1 not in result or result[1] == 0
+        finally:
+            try:
+                client.drop_view(sn, vname)
+            except Exception:
+                pass
+            try:
+                client.drop_table(sn, tname)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+    def test_max_evolving_maximum(self, client):
+        """7 ticks, each pushing a strictly higher value: exercises view store L0 compaction."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid, schema, tname = _make_grp_table(client, sn)
+            vid, vname = _make_reduce_view(client, sn, tid, agg_func_id=4)  # MAX
+
+            # Tick 1: max=10
+            _push_grp(client, tid, schema, [(1, 1, 10)])
+            assert _scan_reduce(client, vid) == {1: 10}
+
+            # Tick 2: max=20
+            _push_grp(client, tid, schema, [(2, 1, 20)])
+            assert _scan_reduce(client, vid) == {1: 20}
+
+            # Tick 3: max=30
+            _push_grp(client, tid, schema, [(3, 1, 30)])
+            assert _scan_reduce(client, vid) == {1: 30}
+
+            # Tick 4: max=40
+            _push_grp(client, tid, schema, [(4, 1, 40)])
+            assert _scan_reduce(client, vid) == {1: 40}
+
+            # Tick 5: max=50  [compaction fires here]
+            _push_grp(client, tid, schema, [(5, 1, 50)])
+            assert _scan_reduce(client, vid) == {1: 50}
+
+            # Tick 6: max=60
+            _push_grp(client, tid, schema, [(6, 1, 60)])
+            assert _scan_reduce(client, vid) == {1: 60}
+
+            # Tick 7: max=70
+            _push_grp(client, tid, schema, [(7, 1, 70)])
+            assert _scan_reduce(client, vid) == {1: 70}
         finally:
             try:
                 client.drop_view(sn, vname)
@@ -865,6 +973,47 @@ class TestAntiJoinSemantics:
         finally:
             try:
                 client.drop_view(sn, "vaj")
+            except Exception:
+                pass
+            for tname in (d_tname, t_tname):
+                try:
+                    client.drop_table(sn, tname)
+                except Exception:
+                    pass
+            client.drop_schema(sn)
+
+    def test_anti_join_compacts_after_many_ticks(self, client):
+        """7 ticks, one new delta row per tick, empty trace: exercises view store L0 compaction."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            delta_tid, d_schema, d_tname = _make_pk_val_table(client, sn)
+            trace_tid, _t_schema, t_tname = _make_pk_val_table(client, sn)
+
+            cb = client.circuit_builder(source_table_id=delta_tid)
+            inp = cb.input_delta()
+            out = cb.anti_join(inp, trace_tid)
+            cb.sink(out)
+            circuit = cb.build()
+            out_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                        gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+            vid = client.create_view_with_circuit(sn, "vaj2", circuit, out_cols)
+
+            # Push one row per tick; trace stays empty so every row passes through.
+            for pk in range(1, 8):
+                batch = gnitz.ZSetBatch(d_schema)
+                batch.append(pk=pk, val=pk)
+                client.push(delta_tid, batch)
+
+                positive = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
+                assert pk in positive, f"tick {pk}: pk={pk} missing from anti-join output"
+
+            # After 7 ticks, all PKs 1–7 must be present (compaction fired at tick 5).
+            positive_final = sorted(r.pk for r in client.scan(vid) if r.weight > 0)
+            assert positive_final == list(range(1, 8))
+        finally:
+            try:
+                client.drop_view(sn, "vaj2")
             except Exception:
                 pass
             for tname in (d_tname, t_tname):

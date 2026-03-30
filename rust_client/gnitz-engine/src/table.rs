@@ -214,9 +214,22 @@ impl Table {
         num_payload_cols: usize,
         force_ephemeral: bool,
     ) -> Result<(), i32> {
-        let batch = unsafe {
+        let mut batch = unsafe {
             OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
         };
+        // Defensive sort: from_regions always has sorted=false.  If the
+        // batch has >1 row, re-sort by (PK, payload) so that memtable
+        // runs are always in canonical order for merge_batches.
+        if !batch.sorted && batch.count > 1 {
+            let mb = batch.as_mem_batch();
+            let mut sorted = memtable::write_to_owned_batch(
+                &self.schema, batch.count, batch.blob.len().max(1),
+                |w| crate::merge::sort_only(&mb, &self.schema, w),
+            );
+            sorted.sorted = true;
+            sorted.schema = Some(self.schema);
+            batch = sorted;
+        }
         let durable = !force_ephemeral && self.wal_writer.is_some();
         match self.memtable.upsert_sorted_batch(batch) {
             Ok(()) => {

@@ -809,7 +809,7 @@ class BatchWriter(object):
         self._batch._copy_rows_indexed_src_weights(src, indices)
 
     def mark_sorted(self, value):
-        self._batch._sorted = value
+        self._batch.mark_sorted(value)
 
     def mark_consolidated(self, value):
         self._batch.mark_consolidated(value)

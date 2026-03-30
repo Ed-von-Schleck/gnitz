@@ -324,7 +324,8 @@ pub fn merge_batches(
             let bj = cursors[cj].batch_idx;
             let ri = cursors[ci].position;
             let rj = cursors[cj].position;
-            columnar::compare_rows(schema, &batches[bi], ri, &batches[bj], rj) == Ordering::Less
+            let cmp_result = columnar::compare_rows(schema, &batches[bi], ri, &batches[bj], rj);
+            cmp_result == Ordering::Less
         }
     }
 

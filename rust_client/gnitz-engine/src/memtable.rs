@@ -321,6 +321,8 @@ impl OwnedBatch {
     pub fn append_batch(&mut self, src: &OwnedBatch, start: usize, end: usize) {
         let end = if end > src.count { src.count } else { end };
         if start >= end { return; }
+        self.sorted = false;
+        self.consolidated = false;
         self.append_rows_inner(src, start, end, false);
     }
 
@@ -328,6 +330,8 @@ impl OwnedBatch {
     pub fn append_batch_negated(&mut self, src: &OwnedBatch, start: usize, end: usize) {
         let end = if end > src.count { src.count } else { end };
         if start >= end { return; }
+        self.sorted = false;
+        self.consolidated = false;
         self.append_rows_inner(src, start, end, true);
     }
 
@@ -555,13 +559,14 @@ fn consolidate_batches(
         return OwnedBatch::empty(num_payload_cols);
     }
 
-    write_to_owned_batch(schema, total_rows, total_blob, |writer| {
+    let result = write_to_owned_batch(schema, total_rows, total_blob, |writer| {
         if batches.len() == 1 {
             merge::sort_and_consolidate(&batches[0], schema, writer);
         } else {
             merge::merge_batches(batches, schema, writer);
         }
-    })
+    });
+    result
 }
 
 
@@ -1210,4 +1215,5 @@ mod tests {
         let agg_val = i64::from_le_bytes(agg_bytes.try_into().unwrap());
         assert_eq!(agg_val, 15000, "expected agg_val=15000, got {}", agg_val);
     }
+
 }

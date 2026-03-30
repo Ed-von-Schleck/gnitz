@@ -1892,7 +1892,6 @@ pub fn op_reduce(
                     old_vals[k] = 0;
                 }
             }
-
             // Emit retraction row (weight=-1)
             emit_reduce_row(
                 &mut raw_output, &mb, group_start_idx,
@@ -2505,6 +2504,7 @@ pub fn op_gather_reduce(
             for k in 0..num_aggs {
                 accs[k].merge_accumulated(old_vals[k], 1);
             }
+
         }
 
         // Emit new global if non-zero

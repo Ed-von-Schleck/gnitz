@@ -189,6 +189,14 @@ Merges N sorted batches via min-heap (tournament tree) ordered by
 **(PK, payload)**. Pending-group algorithm accumulates weight when
 (PK, payload) matches, flushes on differ.
 
+> **Precondition: each input batch MUST be sorted by (PK, payload).**
+> `merge_batches` iterates each batch linearly via `MemBatchCursor`.
+> If a batch is unsorted, the cursor produces entries out of order,
+> the heap delivers non-adjacent duplicates, and the pending-group
+> algorithm silently produces wrong weights. The Rust
+> `Table::upsert_and_maybe_flush` defensively re-sorts batches
+> as a safety net.
+
 > **The heap MUST use payload-aware comparison.** PK-only ordering
 > interleaves rows with same PK but different payloads across cursors,
 > preventing weight accumulation. This specifically affects non-linear

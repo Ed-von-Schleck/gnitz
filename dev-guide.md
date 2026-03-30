@@ -107,6 +107,13 @@ When adding or modifying a merge path (tournament tree, sort, compaction):
       every tick, creating one shard per non-empty partition per tick.
       After L0_COMPACT_THRESHOLD (4) ticks, compaction merges these
       shards — the exact path where the heap ordering matters.
+- [ ] Are memtable runs actually sorted? `merge_batches` assumes each
+      run is sorted by (PK, payload). If a run is unsorted (e.g., due
+      to a stale `sorted` flag on the Python/Rust boundary), entries
+      appear out of order and the pending-group algorithm silently
+      produces wrong weights. The Rust `upsert_and_maybe_flush`
+      defensively re-sorts as a safety net, but the caller should also
+      ensure the batch is sorted before ingestion.
 
 ## Rust static lib rebuild rule
 
@@ -124,6 +131,49 @@ make rust-transport-debug       # after gnitz-transport changes
 Forgetting this causes linker errors (`undefined reference`) for new symbols,
 or silent use of stale code for changed symbols — the RPython binary links
 the old `.a` and passes or fails for the wrong reasons.
+
+## RPython server rebuild for E2E tests
+
+`make server` is a `.PHONY` target that depends only on the Rust lib targets.
+**It does NOT track changes to Python source files.** RPython caches its
+intermediate C files in `/tmp/usession-main-*`. If the generated C is
+up-to-date (by RPython's internal hashing), `make server` only re-links
+(~55s) without re-translating (~25s extra for annotate + rtype).
+
+After changing any `.py` file under `gnitz/`, force a full re-translation:
+
+```bash
+rm -rf /tmp/usession-main-* && rm -f gnitz-server-c && make server
+```
+
+**How to verify the rebuild included your changes:** look for `annotate`
+and `rtype_lltype` in the build output. If you only see `database_c`,
+`source_c`, `compile_c` — translation was skipped and the old Python
+code is still baked in.
+
+## RPython–Rust flag synchronization
+
+`ArenaZSetBatch` (Python) wraps a Rust `OwnedBatch`. Both have `sorted`
+and `consolidated` flags. These can desync:
+
+- `ArenaZSetBatch._invalidate_cache()` sets Python `_sorted = False` but
+  does NOT call `_batch_set_sorted` on the Rust side.
+- `OwnedBatch::append_batch` / `append_batch_negated` clear Rust
+  `sorted` and `consolidated`, but the Python wrapper's `_invalidate_cache`
+  is what the caller relies on.
+- `BatchWriter.mark_sorted(value)` delegates to `ArenaZSetBatch.mark_sorted`
+  which syncs both sides. Always use `mark_sorted` / `mark_consolidated`
+  for explicit flag changes — never assign `_sorted` directly.
+
+The Rust `Table::upsert_and_maybe_flush` defensively re-sorts batches
+whose `sorted` flag is false (batches from `OwnedBatch::from_regions`
+always start with `sorted = false`). This catches any desync from the
+Python side.
+
+When adding new Rust-side batch mutation functions (append, copy, filter):
+
+- [ ] Does the function clear `self.sorted` and `self.consolidated`?
+- [ ] Is there a corresponding Python-side `_invalidate_cache()` call?
 
 ## Benchmarking
 
@@ -255,3 +305,6 @@ not immediately obvious:
    `GNITZ_WORKERS=4`, the bug is in the exchange/fanout/stash path, not in computation.
 3. **Bisect by sub-path.** Add a flag or env var to disable the new fast-path and force
    the old path. If the test passes with the old path, the bug is in the new path only.
+4. **Verify your fix is in the binary.** See "RPython server rebuild" below. If the
+   build output does not show `annotate` and `rtype_lltype` timer lines, the RPython
+   translation was skipped and your Python changes are NOT in the binary.

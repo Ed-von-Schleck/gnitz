@@ -2062,7 +2062,9 @@ pub extern "C" fn gnitz_batch_set_consolidated(handle: *mut libc::c_void, val: i
     let _ = panic::catch_unwind(|| {
         let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
         b.consolidated = val != 0;
-        if b.consolidated { b.sorted = true; }
+        if b.consolidated {
+            b.sorted = true;
+        }
     });
 }
 

@@ -431,7 +431,7 @@ def test_workers_reduce_sum(client):
 
 @_NEEDS_MULTI
 def test_workers_reduce_incremental(client):
-    """Retract rows through reduce SUM view; verify sum decreases."""
+    """7 ticks of inserts/deletes through reduce SUM view: exercises view store L0 compaction."""
     sn = "w" + _uid()
     client.create_schema(sn)
     try:
@@ -444,17 +444,37 @@ def test_workers_reduce_incremental(client):
             "CREATE VIEW v AS SELECT grp, SUM(val) AS total FROM t GROUP BY grp",
             schema_name=sn,
         )
+        vid, _ = client.resolve_table(sn, "v")
+
+        # Tick 1: sum=300
         client.execute_sql(
             "INSERT INTO t VALUES (1, 1, 100), (2, 1, 200)", schema_name=sn
         )
-        vid, _ = client.resolve_table(sn, "v")
+        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 300
 
-        rows_before = {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}
-        assert rows_before[1] == 300
-
+        # Tick 2: delete pk=2 → sum=100
         client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-        rows_after = {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}
-        assert rows_after[1] == 100
+        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 100
+
+        # Tick 3: insert (3,1,50) → sum=150
+        client.execute_sql("INSERT INTO t VALUES (3, 1, 50)", schema_name=sn)
+        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 150
+
+        # Tick 4: insert (4,1,75) → sum=225
+        client.execute_sql("INSERT INTO t VALUES (4, 1, 75)", schema_name=sn)
+        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 225
+
+        # Tick 5: delete pk=1 → sum=125  [compaction fires here]
+        client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 125
+
+        # Tick 6: insert (5,1,30) → sum=155
+        client.execute_sql("INSERT INTO t VALUES (5, 1, 30)", schema_name=sn)
+        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 155
+
+        # Tick 7: delete pk=3 → sum=105
+        client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 105
     finally:
         _drop_all(client, sn, views=["v"], tables=["t"])
 

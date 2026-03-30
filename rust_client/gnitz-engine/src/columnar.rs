@@ -90,14 +90,10 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
                 va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
             }
             _ => {
-                let va = read_signed(
-                    src_a.get_col_ptr(row_a, payload_col, col_size),
-                    col_size,
-                );
-                let vb = read_signed(
-                    src_b.get_col_ptr(row_b, payload_col, col_size),
-                    col_size,
-                );
+                let raw_a = src_a.get_col_ptr(row_a, payload_col, col_size);
+                let raw_b = src_b.get_col_ptr(row_b, payload_col, col_size);
+                let va = read_signed(raw_a, col_size);
+                let vb = read_signed(raw_b, col_size);
                 va.cmp(&vb)
             }
         };
