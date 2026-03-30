@@ -318,7 +318,12 @@ class UniversalProjection(ScalarFunction):
 
 class AggregateFunction(object):
     """Base class for incremental aggregators."""
-    _immutable_fields_ = []
+    _immutable_fields_ = ['col_idx', 'agg_op', 'col_type_code']
+
+    def __init__(self):
+        self.col_idx = 0
+        self.agg_op = 0
+        self.col_type_code = 0
 
     def reset(self): pass
     def step(self, row_accessor, weight): pass
@@ -334,7 +339,8 @@ class AggregateFunction(object):
 
 class NullAggregate(AggregateFunction):
     """The Null Object for AggregateFunction."""
-    pass
+    def __init__(self):
+        AggregateFunction.__init__(self)
 
 
 class UniversalAccumulator(AggregateFunction):

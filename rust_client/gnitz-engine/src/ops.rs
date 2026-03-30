@@ -1236,6 +1236,1365 @@ fn write_join_row_from_batches(
 }
 
 // ---------------------------------------------------------------------------
+// Reduce operator: accumulator, group key, argsort, AVI, op_reduce,
+// op_gather_reduce
+// ---------------------------------------------------------------------------
+
+// Aggregate opcodes (matches gnitz/dbsp/functions.py)
+const AGG_COUNT: u8 = 1;
+const AGG_SUM: u8 = 2;
+const AGG_MIN: u8 = 3;
+const AGG_MAX: u8 = 4;
+const AGG_COUNT_NON_NULL: u8 = 5;
+
+/// Descriptor for one aggregate function, passed across FFI.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AggDescriptor {
+    pub col_idx: u32,
+    pub agg_op: u8,
+    pub col_type_code: u8,
+    pub _pad: [u8; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<AggDescriptor>() == 8);
+const _: () = assert!(std::mem::align_of::<AggDescriptor>() == 4);
+
+/// Map logical column index to payload column index (skipping the PK column).
+#[inline]
+fn payload_idx(col_idx: usize, pk_index: usize) -> usize {
+    if col_idx < pk_index { col_idx } else { col_idx - 1 }
+}
+
+/// Accumulator: internal state for one aggregate column.
+struct Accumulator {
+    acc: i64,
+    has_value: bool,
+    agg_op: u8,
+    col_type_code: u8,
+    col_idx: u32,
+}
+
+impl Accumulator {
+    fn new(desc: &AggDescriptor) -> Self {
+        Accumulator {
+            acc: 0,
+            has_value: false,
+            agg_op: desc.agg_op,
+            col_type_code: desc.col_type_code,
+            col_idx: desc.col_idx,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.acc = 0;
+        self.has_value = false;
+    }
+
+    fn is_linear(&self) -> bool {
+        self.agg_op == AGG_COUNT || self.agg_op == AGG_SUM || self.agg_op == AGG_COUNT_NON_NULL
+    }
+
+    fn is_zero(&self) -> bool {
+        !self.has_value
+    }
+
+    fn get_value_bits(&self) -> u64 {
+        self.acc as u64
+    }
+
+    fn seed_from_raw_bits(&mut self, bits: u64) {
+        self.acc = bits as i64;
+        self.has_value = true;
+    }
+
+    fn is_float(&self) -> bool {
+        self.col_type_code == type_code::F64 || self.col_type_code == type_code::F32
+    }
+
+    /// Step: incorporate one input row into the accumulator.
+    fn step_from_batch(
+        &mut self,
+        mb: &MemBatch,
+        row: usize,
+        schema: &SchemaDescriptor,
+        weight: i64,
+    ) {
+        let col_idx = self.col_idx as usize;
+        let pk_index = schema.pk_index as usize;
+
+        // COUNT ignores nulls entirely
+        if self.agg_op != AGG_COUNT {
+            let payload_idx = payload_idx(col_idx, pk_index);
+            let null_word = mb.get_null_word(row);
+            if (null_word >> payload_idx) & 1 != 0 {
+                return; // null value — skip
+            }
+        }
+
+        let first = !self.has_value;
+        self.has_value = true;
+        let is_f = self.is_float();
+
+        match self.agg_op {
+            AGG_COUNT => {
+                self.acc = self.acc.wrapping_add(weight);
+            }
+            AGG_COUNT_NON_NULL => {
+                // Already checked null above
+                self.acc = self.acc.wrapping_add(weight);
+            }
+            AGG_SUM => {
+                let val = read_col_value(mb, row, col_idx, pk_index);
+                if is_f {
+                    let cur_f = f64::from_bits(self.acc as u64);
+                    let val_f = f64::from_bits(val as u64);
+                    let w_f = weight as f64;
+                    self.acc = f64::to_bits(cur_f + val_f * w_f) as i64;
+                } else {
+                    let val_s = val as i64;
+                    self.acc = self.acc.wrapping_add(val_s.wrapping_mul(weight));
+                }
+            }
+            AGG_MIN => {
+                let val = read_col_value(mb, row, col_idx, pk_index);
+                if is_f {
+                    let v = f64::from_bits(val as u64);
+                    if first || v < f64::from_bits(self.acc as u64) {
+                        self.acc = f64::to_bits(v) as i64;
+                    }
+                } else {
+                    let v = val as i64;
+                    if first || v < self.acc {
+                        self.acc = v;
+                    }
+                }
+            }
+            AGG_MAX => {
+                let val = read_col_value(mb, row, col_idx, pk_index);
+                if is_f {
+                    let v = f64::from_bits(val as u64);
+                    if first || v > f64::from_bits(self.acc as u64) {
+                        self.acc = f64::to_bits(v) as i64;
+                    }
+                } else {
+                    let v = val as i64;
+                    if first || v > self.acc {
+                        self.acc = v;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Merge an already-accumulated value (from trace_out) into this accumulator.
+    /// Only valid for linear aggregates.
+    fn merge_accumulated(&mut self, value_bits: u64, weight: i64) {
+        let is_f = self.is_float();
+        match self.agg_op {
+            AGG_COUNT | AGG_COUNT_NON_NULL => {
+                let prev = value_bits as i64;
+                self.acc = self.acc.wrapping_add(prev.wrapping_mul(weight));
+                self.has_value = true;
+            }
+            AGG_SUM => {
+                if is_f {
+                    let prev_f = f64::from_bits(value_bits);
+                    let w_f = weight as f64;
+                    let cur_f = f64::from_bits(self.acc as u64);
+                    self.acc = f64::to_bits(cur_f + prev_f * w_f) as i64;
+                } else {
+                    let prev = value_bits as i64;
+                    self.acc = self.acc.wrapping_add(prev.wrapping_mul(weight));
+                }
+                self.has_value = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Combine a partial aggregate from another shard.
+    fn combine(&mut self, other_bits: u64) {
+        let is_f = self.is_float();
+        match self.agg_op {
+            AGG_COUNT | AGG_COUNT_NON_NULL => {
+                let prev = other_bits as i64;
+                self.acc = self.acc.wrapping_add(prev);
+                self.has_value = true;
+            }
+            AGG_SUM => {
+                if is_f {
+                    let prev_f = f64::from_bits(other_bits);
+                    let cur_f = f64::from_bits(self.acc as u64);
+                    self.acc = f64::to_bits(cur_f + prev_f) as i64;
+                } else {
+                    let prev = other_bits as i64;
+                    self.acc = self.acc.wrapping_add(prev);
+                }
+                self.has_value = true;
+            }
+            AGG_MIN => {
+                let first = !self.has_value;
+                self.has_value = true;
+                if is_f {
+                    let other_f = f64::from_bits(other_bits);
+                    if first || other_f < f64::from_bits(self.acc as u64) {
+                        self.acc = f64::to_bits(other_f) as i64;
+                    }
+                } else {
+                    let other_v = other_bits as i64;
+                    if first || other_v < self.acc {
+                        self.acc = other_v;
+                    }
+                }
+            }
+            AGG_MAX => {
+                let first = !self.has_value;
+                self.has_value = true;
+                if is_f {
+                    let other_f = f64::from_bits(other_bits);
+                    if first || other_f > f64::from_bits(self.acc as u64) {
+                        self.acc = f64::to_bits(other_f) as i64;
+                    }
+                } else {
+                    let other_v = other_bits as i64;
+                    if first || other_v > self.acc {
+                        self.acc = other_v;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Read a signed i64 column value from a MemBatch.
+#[inline]
+fn read_col_value(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize) -> i64 {
+    let payload_idx = payload_idx(col_idx, pk_index);
+    let ptr = mb.get_col_ptr(row, payload_idx, 8);
+    i64::from_le_bytes(ptr.try_into().unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Group key extraction
+// ---------------------------------------------------------------------------
+
+/// Extract 128-bit group key from a batch row.
+fn extract_group_key(
+    mb: &MemBatch,
+    row: usize,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> (u64, u64) {
+    let pki = schema.pk_index as usize;
+
+    if group_by_cols.len() == 1 {
+        let c_idx = group_by_cols[0] as usize;
+        let tc = schema.columns[c_idx].type_code;
+        if tc == type_code::U64 || tc == type_code::I64 {
+            let pi = payload_idx(c_idx, pki);
+            let ptr = mb.get_col_ptr(row, pi, 8);
+            let v = u64::from_le_bytes(ptr.try_into().unwrap());
+            return (v, 0);
+        }
+        if tc == type_code::U128 {
+            let pi = payload_idx(c_idx, pki);
+            let ptr = mb.get_col_ptr(row, pi, 16);
+            let lo = u64::from_le_bytes(ptr[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(ptr[8..16].try_into().unwrap());
+            return (lo, hi);
+        }
+    }
+
+    let mut h: u64 = 0x9E3779B97F4A7C15; // golden ratio seed
+    for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
+        let c_idx = c_idx_u32 as usize;
+        let tc = schema.columns[c_idx].type_code;
+        let col_hash = if tc == TYPE_STRING {
+            let pi = payload_idx(c_idx, pki);
+            let struct_bytes = mb.get_col_ptr(row, pi, 16);
+            let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
+            if length == 0 {
+                0u64
+            } else if length <= SHORT_STRING_THRESHOLD {
+                xxh::checksum(&struct_bytes[4..4 + length])
+            } else {
+                let heap_offset = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
+                xxh::checksum(&mb.blob[heap_offset..heap_offset + length])
+            }
+        } else {
+            let pi = payload_idx(c_idx, pki);
+            let ptr = mb.get_col_ptr(row, pi, 8);
+            let v = u64::from_le_bytes(ptr.try_into().unwrap());
+            mix64(v)
+        };
+        h = mix64(h ^ col_hash ^ (i as u64));
+    }
+    let h_hi = mix64(h ^ (group_by_cols.len() as u64));
+    (h, h_hi)
+}
+
+/// Extract 64-bit group key for AVI composite keys.
+fn extract_gc_u64(
+    mb: &MemBatch,
+    row: usize,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> u64 {
+    let pki = schema.pk_index as usize;
+    if group_by_cols.len() == 1 {
+        let c_idx = group_by_cols[0] as usize;
+        let tc = schema.columns[c_idx].type_code;
+        if tc != type_code::U128 && tc != TYPE_STRING
+            && tc != type_code::F32 && tc != type_code::F64
+        {
+            let pi = payload_idx(c_idx, pki);
+            let ptr = mb.get_col_ptr(row, pi, 8);
+            return u64::from_le_bytes(ptr.try_into().unwrap());
+        }
+    }
+    let (lo, _hi) = extract_group_key(mb, row, schema, group_by_cols);
+    lo
+}
+
+/// IEEE 754 order-preserving encoding.
+fn ieee_order_bits(raw_bits: u64) -> u64 {
+    if raw_bits >> 63 != 0 {
+        !raw_bits
+    } else {
+        raw_bits ^ (1u64 << 63)
+    }
+}
+
+/// Reverse IEEE order-preserving encoding.
+fn ieee_order_bits_reverse(encoded: u64) -> u64 {
+    if encoded >> 63 != 0 {
+        encoded ^ (1u64 << 63)
+    } else {
+        !encoded
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Argsort
+// ---------------------------------------------------------------------------
+
+/// Compare two rows by group columns.
+fn compare_by_group_cols(
+    mb: &MemBatch,
+    row_a: usize,
+    row_b: usize,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> std::cmp::Ordering {
+    let pki = schema.pk_index as usize;
+    for &c_idx_u32 in group_by_cols {
+        let c_idx = c_idx_u32 as usize;
+        let tc = schema.columns[c_idx].type_code;
+        let pi = payload_idx(c_idx, pki);
+
+        let ord = if tc == TYPE_STRING {
+            let a_bytes = mb.get_col_ptr(row_a, pi, 16);
+            let b_bytes = mb.get_col_ptr(row_b, pi, 16);
+            use crate::compact::compare_german_strings;
+            compare_german_strings(a_bytes, mb.blob, b_bytes, mb.blob)
+        } else if tc == type_code::F64 || tc == type_code::F32 {
+            let cs = schema.columns[c_idx].size as usize;
+            let a_ptr = mb.get_col_ptr(row_a, pi, cs);
+            let b_ptr = mb.get_col_ptr(row_b, pi, cs);
+            let a_f = f64::from_bits(u64::from_le_bytes(a_ptr[0..8].try_into().unwrap()));
+            let b_f = f64::from_bits(u64::from_le_bytes(b_ptr[0..8].try_into().unwrap()));
+            a_f.partial_cmp(&b_f).unwrap_or(std::cmp::Ordering::Equal)
+        } else if tc == type_code::U128 {
+            let a_ptr = mb.get_col_ptr(row_a, pi, 16);
+            let b_ptr = mb.get_col_ptr(row_b, pi, 16);
+            let a_lo = u64::from_le_bytes(a_ptr[0..8].try_into().unwrap());
+            let a_hi = u64::from_le_bytes(a_ptr[8..16].try_into().unwrap());
+            let b_lo = u64::from_le_bytes(b_ptr[0..8].try_into().unwrap());
+            let b_hi = u64::from_le_bytes(b_ptr[8..16].try_into().unwrap());
+            (a_hi, a_lo).cmp(&(b_hi, b_lo))
+        } else if tc == type_code::I64 || tc == type_code::I32
+            || tc == type_code::I16 || tc == type_code::I8
+        {
+            let a_ptr = mb.get_col_ptr(row_a, pi, 8);
+            let b_ptr = mb.get_col_ptr(row_b, pi, 8);
+            let a_v = i64::from_le_bytes(a_ptr.try_into().unwrap());
+            let b_v = i64::from_le_bytes(b_ptr.try_into().unwrap());
+            a_v.cmp(&b_v)
+        } else {
+            let a_ptr = mb.get_col_ptr(row_a, pi, 8);
+            let b_ptr = mb.get_col_ptr(row_b, pi, 8);
+            let a_v = u64::from_le_bytes(a_ptr.try_into().unwrap());
+            let b_v = u64::from_le_bytes(b_ptr.try_into().unwrap());
+            a_v.cmp(&b_v)
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Argsort delta batch by group columns.
+fn argsort_delta(
+    batch: &OwnedBatch,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> Vec<u32> {
+    let mb = batch.as_mem_batch();
+    let n = batch.count;
+    let mut indices: Vec<u32> = (0..n as u32).collect();
+    if n <= 1 {
+        return indices;
+    }
+
+    // Fast path: single I64 column
+    let pki = schema.pk_index as usize;
+    if group_by_cols.len() == 1 {
+        let ci = group_by_cols[0] as usize;
+        let tc = schema.columns[ci].type_code;
+        if tc == type_code::I64 {
+            let pi = payload_idx(ci, pki);
+            let keys: Vec<i64> = (0..n)
+                .map(|i| {
+                    let ptr = mb.get_col_ptr(i, pi, 8);
+                    i64::from_le_bytes(ptr.try_into().unwrap())
+                })
+                .collect();
+            indices.sort_unstable_by_key(|&i| keys[i as usize]);
+            return indices;
+        }
+    }
+
+    indices.sort_unstable_by(|&a, &b| {
+        compare_by_group_cols(&mb, a as usize, b as usize, schema, group_by_cols)
+    });
+    indices
+}
+
+/// Sort batch by (PK, payload) without consolidation.
+/// Used by op_gather_reduce where we need to see each partial separately.
+fn sort_owned(batch: &OwnedBatch, schema: &SchemaDescriptor) -> OwnedBatch {
+    let n = batch.count;
+    if n <= 1 || batch.sorted {
+        return batch.clone_batch();
+    }
+
+    let mb = batch.as_mem_batch();
+    let pks: Vec<u128> = (0..n).map(|i| mb.get_pk(i)).collect();
+    let mut indices: Vec<u32> = (0..n as u32).collect();
+    indices.sort_unstable_by(|&a, &b| {
+        let ai = a as usize;
+        let bi = b as usize;
+        match pks[ai].cmp(&pks[bi]) {
+            std::cmp::Ordering::Equal => {
+                crate::columnar::compare_rows(schema, &mb, ai, &mb, bi)
+            }
+            ord => ord,
+        }
+    });
+
+    // Scatter-copy in sorted order
+    let mut output = OwnedBatch::with_schema(*schema, n);
+    output.count = 0;
+    for &idx in &indices {
+        output.append_batch(batch, idx as usize, idx as usize + 1);
+    }
+    output.sorted = true;
+    output
+}
+
+// ---------------------------------------------------------------------------
+// AVI lookup
+// ---------------------------------------------------------------------------
+
+/// Seek AVI cursor to group, apply decoded min/max to accumulator.
+fn apply_agg_from_value_index(
+    avi_cursor: &mut ReadCursor,
+    gc_u64: u64,
+    for_max: bool,
+    agg_col_type_code: u8,
+    acc: &mut Accumulator,
+) -> bool {
+    avi_cursor.seek(0, gc_u64);
+    while avi_cursor.valid {
+        let k_hi = avi_cursor.current_key_hi;
+        if k_hi != gc_u64 {
+            break;
+        }
+        if avi_cursor.current_weight > 0 {
+            let mut encoded = avi_cursor.current_key_lo;
+            if for_max {
+                encoded = !encoded;
+            }
+            let tc = agg_col_type_code;
+            if tc == type_code::I64 || tc == type_code::I32
+                || tc == type_code::I16 || tc == type_code::I8
+            {
+                encoded = (encoded as i64).wrapping_sub(1i64 << 63) as u64;
+            } else if tc == type_code::F64 || tc == type_code::F32 {
+                encoded = ieee_order_bits_reverse(encoded);
+            }
+            acc.seed_from_raw_bits(encoded);
+            return true;
+        }
+        avi_cursor.advance();
+    }
+    acc.reset();
+    false
+}
+
+// ---------------------------------------------------------------------------
+// op_reduce
+// ---------------------------------------------------------------------------
+
+/// Incremental DBSP REDUCE: δ_out = Agg(history + δ_in) - Agg(history).
+pub fn op_reduce(
+    delta: &OwnedBatch,
+    trace_in_cursor: Option<&mut ReadCursor>,
+    trace_out_cursor: &mut ReadCursor,
+    input_schema: &SchemaDescriptor,
+    output_schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+    agg_descs: &[AggDescriptor],
+    avi_cursor: Option<&mut ReadCursor>,
+    avi_for_max: bool,
+    avi_agg_col_type_code: u8,
+    avi_group_by_cols: &[u32],
+    avi_input_schema: Option<&SchemaDescriptor>,
+    gi_cursor: Option<&mut ReadCursor>,
+    gi_col_idx: u32,
+    _gi_col_type_code: u8,
+    finalize_prog: Option<&crate::expr::ExprProgram>,
+    finalize_out_schema: Option<&SchemaDescriptor>,
+) -> (OwnedBatch, Option<OwnedBatch>) {
+    let num_aggs = agg_descs.len();
+    let num_out_cols = output_schema.num_columns as usize;
+    let out_npc = num_out_cols - 1;
+    let in_pki = input_schema.pk_index as usize;
+
+    // Linearity check
+    let all_linear = agg_descs.iter().all(|d| {
+        d.agg_op == AGG_COUNT || d.agg_op == AGG_SUM || d.agg_op == AGG_COUNT_NON_NULL
+    });
+
+    // Consolidate only for non-linear aggregates; linear aggregates work on raw delta.
+    let consolidated;
+    let working: &OwnedBatch = if all_linear {
+        delta
+    } else {
+        consolidated = consolidate_owned(delta, input_schema);
+        &consolidated
+    };
+
+    let n = working.count;
+    if n == 0 {
+        let empty_fin = finalize_out_schema.map(|fs| {
+            OwnedBatch::empty(fs.num_columns as usize - 1)
+        });
+        return (OwnedBatch::empty(out_npc), empty_fin);
+    }
+
+    // group_by_pk detection
+    let group_by_pk = group_by_cols.len() == 1
+        && group_by_cols[0] as usize == in_pki;
+
+    // Argsort
+    let sorted_indices = if group_by_pk {
+        (0..n as u32).collect()
+    } else {
+        argsort_delta(&working, input_schema, group_by_cols)
+    };
+
+    let mb = working.as_mem_batch();
+
+    // Determine output mapping: use_natural_pk
+    let use_natural_pk = if group_by_cols.len() == 1 {
+        let grp_tc = input_schema.columns[group_by_cols[0] as usize].type_code;
+        grp_tc == type_code::U64 || grp_tc == type_code::U128
+    } else {
+        false
+    };
+
+    let mut raw_output = OwnedBatch::empty(out_npc);
+    let mut fin_output = finalize_out_schema.map(|fs| {
+        OwnedBatch::empty(fs.num_columns as usize - 1)
+    });
+
+    let mut accs: Vec<Accumulator> = agg_descs.iter().map(Accumulator::new).collect();
+    let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
+
+    // We need mutable access to optional cursors. Take ownership via Option::take pattern.
+    // The caller passes these as Option<&mut ReadCursor>, but we need to use them
+    // multiple times in the loop. They're already &mut so we can use them directly.
+    let mut trace_in = trace_in_cursor;
+    let mut avi = avi_cursor;
+    let mut gi = gi_cursor;
+
+    let mut idx = 0usize;
+    let mut num_groups = 0usize;
+    while idx < n {
+        let group_start_pos = idx;
+        let group_start_idx = sorted_indices[group_start_pos] as usize;
+
+        let (group_key_lo, group_key_hi) = if group_by_pk {
+            (mb.get_pk_lo(group_start_idx), mb.get_pk_hi(group_start_idx))
+        } else {
+            extract_group_key(&mb, group_start_idx, input_schema, group_by_cols)
+        };
+
+        // Step linear accumulators over delta rows in this group
+        for acc in accs.iter_mut() {
+            acc.reset();
+        }
+        while idx < n {
+            let curr_idx = sorted_indices[idx] as usize;
+            if group_by_pk {
+                if mb.get_pk_lo(curr_idx) != group_key_lo
+                    || mb.get_pk_hi(curr_idx) != group_key_hi
+                {
+                    break;
+                }
+            } else {
+                if compare_by_group_cols(&mb, curr_idx, group_start_idx, input_schema, group_by_cols)
+                    != std::cmp::Ordering::Equal
+                {
+                    break;
+                }
+            }
+
+            let w = mb.get_weight(curr_idx);
+            for (_k, acc) in accs.iter_mut().enumerate() {
+                if acc.is_linear() {
+                    acc.step_from_batch(&mb, curr_idx, input_schema, w);
+                }
+            }
+            idx += 1;
+        }
+
+        // Retraction: read old value from trace_out
+        trace_out_cursor.seek(group_key_lo, group_key_hi);
+        let has_old = trace_out_cursor.valid
+            && trace_out_cursor.current_key_lo == group_key_lo
+            && trace_out_cursor.current_key_hi == group_key_hi;
+
+        if has_old {
+            // Read old agg values from trace_out
+            for k in 0..num_aggs {
+                let agg_col_idx = num_out_cols - num_aggs + k;
+                let ptr = trace_out_cursor.col_ptr(agg_col_idx, 8);
+                if !ptr.is_null() {
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr, 8) };
+                    old_vals[k] = u64::from_le_bytes(bytes.try_into().unwrap());
+                } else {
+                    old_vals[k] = 0;
+                }
+            }
+
+            // Emit retraction row (weight=-1)
+            emit_reduce_row(
+                &mut raw_output, &mb, group_start_idx,
+                group_key_lo, group_key_hi, -1,
+                &old_vals, true, // use_old_val=true
+                &accs, input_schema, output_schema,
+                group_by_cols, use_natural_pk, num_aggs,
+            );
+            if let (Some(prog), Some(fin_schema), Some(ref mut fin_out)) =
+                (finalize_prog, finalize_out_schema, &mut fin_output)
+            {
+                emit_finalized_row(
+                    fin_out, &raw_output, raw_output.count - 1,
+                    group_key_lo, group_key_hi, -1,
+                    prog, output_schema, fin_schema,
+                );
+            }
+        }
+
+        // New value calculation
+        if all_linear && has_old {
+            for k in 0..num_aggs {
+                accs[k].merge_accumulated(old_vals[k], 1);
+            }
+        } else if !all_linear {
+            if let Some(ref mut avi_c) = avi {
+                // AVI path
+                let avi_schema = avi_input_schema.unwrap_or(input_schema);
+                let gc_u64 = extract_gc_u64(&mb, group_start_idx, avi_schema, avi_group_by_cols);
+                apply_agg_from_value_index(
+                    avi_c, gc_u64, avi_for_max, avi_agg_col_type_code,
+                    &mut accs[0],
+                );
+            } else {
+                // Full replay path: build replay batch from trace_in + delta
+                let mut replay = OwnedBatch::with_schema(*input_schema, 32);
+                replay.count = 0;
+                replay.sorted = false;
+                replay.consolidated = false;
+
+                if let Some(ref mut ti_cursor) = trace_in {
+                    if group_by_pk {
+                        ti_cursor.seek(group_key_lo, group_key_hi);
+                        while ti_cursor.valid
+                            && ti_cursor.current_key_lo == group_key_lo
+                            && ti_cursor.current_key_hi == group_key_hi
+                        {
+                            append_cursor_row_to_batch(&mut replay, ti_cursor, input_schema);
+                            ti_cursor.advance();
+                        }
+                    } else if let Some(ref mut gi_c) = gi {
+                        // GI path
+                        let pki = input_schema.pk_index as usize;
+                        let gi_ci = gi_col_idx as usize;
+                        let pi = if gi_ci < pki { gi_ci } else { gi_ci - 1 };
+                        let ptr = mb.get_col_ptr(group_start_idx, pi, 8);
+                        let gc_u64_val = u64::from_le_bytes(ptr.try_into().unwrap());
+                        gi_c.seek(0, gc_u64_val);
+                        while gi_c.valid {
+                            let gk_hi = gi_c.current_key_hi;
+                            if gk_hi != gc_u64_val {
+                                break;
+                            }
+                            if gi_c.current_weight > 0 {
+                                let spk_lo = gi_c.current_key_lo;
+                                // spk_hi is in payload col 1 (first payload col = col index 1)
+                                let spk_hi_ptr = gi_c.col_ptr(1, 8);
+                                let spk_hi = if !spk_hi_ptr.is_null() {
+                                    let bytes = unsafe { std::slice::from_raw_parts(spk_hi_ptr, 8) };
+                                    u64::from_le_bytes(bytes.try_into().unwrap())
+                                } else {
+                                    0
+                                };
+                                if let Some(ref mut ti) = trace_in {
+                                    ti.seek(spk_lo, spk_hi);
+                                    if ti.valid
+                                        && ti.current_key_lo == spk_lo
+                                        && ti.current_key_hi == spk_hi
+                                    {
+                                        append_cursor_row_to_batch(&mut replay, ti, input_schema);
+                                    }
+                                }
+                            }
+                            gi_c.advance();
+                        }
+                    } else {
+                        // Fallback: full trace scan
+                        ti_cursor.seek(0, 0);
+                        let ti_mb_exemplar_row = group_start_idx;
+                        while ti_cursor.valid {
+                            // Compare group columns between cursor row and exemplar
+                            if cursor_matches_group(
+                                ti_cursor, &mb, ti_mb_exemplar_row,
+                                input_schema, group_by_cols,
+                            ) {
+                                append_cursor_row_to_batch(&mut replay, ti_cursor, input_schema);
+                            }
+                            ti_cursor.advance();
+                        }
+                    }
+                }
+
+                // Append delta rows to replay
+                for k in group_start_pos..idx {
+                    let d_idx = sorted_indices[k] as usize;
+                    append_membatch_row_to_batch(&mut replay, &mb, d_idx, input_schema);
+                }
+
+                // Consolidate replay and step all accumulators
+                let merged = consolidate_owned(&replay, input_schema);
+                for acc in accs.iter_mut() {
+                    acc.reset();
+                }
+                let merged_mb = merged.as_mem_batch();
+                for m in 0..merged.count {
+                    let w = merged_mb.get_weight(m);
+                    if w > 0 {
+                        for acc in accs.iter_mut() {
+                            acc.step_from_batch(&merged_mb, m, input_schema, w);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Emission: +1 for new value
+        let any_nonzero = accs.iter().any(|a| !a.is_zero());
+        if any_nonzero {
+            emit_reduce_row(
+                &mut raw_output, &mb, group_start_idx,
+                group_key_lo, group_key_hi, 1,
+                &old_vals, false, // use_old_val=false
+                &accs, input_schema, output_schema,
+                group_by_cols, use_natural_pk, num_aggs,
+            );
+            if let (Some(prog), Some(fin_schema), Some(ref mut fin_out)) =
+                (finalize_prog, finalize_out_schema, &mut fin_output)
+            {
+                emit_finalized_row(
+                    fin_out, &raw_output, raw_output.count - 1,
+                    group_key_lo, group_key_hi, 1,
+                    prog, output_schema, fin_schema,
+                );
+            }
+        }
+
+        num_groups += 1;
+    }
+
+    // Output flags
+    raw_output.sorted = group_by_pk;
+    if group_by_pk {
+        raw_output.consolidated = true;
+    }
+
+    gnitz_debug!(
+        "op_reduce: in={} groups={} out={} fin={}",
+        n, num_groups, raw_output.count,
+        fin_output.as_ref().map_or(0, |b| b.count)
+    );
+
+    (raw_output, fin_output)
+}
+
+/// Emit one reduce output row.
+fn emit_reduce_row(
+    output: &mut OwnedBatch,
+    input_mb: &MemBatch,
+    exemplar_row: usize,
+    group_key_lo: u64,
+    group_key_hi: u64,
+    weight: i64,
+    old_vals: &[u64],
+    use_old_val: bool,
+    accs: &[Accumulator],
+    input_schema: &SchemaDescriptor,
+    output_schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+    use_natural_pk: bool,
+    num_aggs: usize,
+) {
+    let out_pki = output_schema.pk_index as usize;
+    let in_pki = input_schema.pk_index as usize;
+    let num_out_cols = output_schema.num_columns as usize;
+
+    output.pk_lo.extend_from_slice(&group_key_lo.to_le_bytes());
+    output.pk_hi.extend_from_slice(&group_key_hi.to_le_bytes());
+    output.weight.extend_from_slice(&weight.to_le_bytes());
+
+    // Build null word and payload columns
+    let mut null_word: u64 = 0;
+    let mut out_pi = 0usize;
+
+    for ci in 0..num_out_cols {
+        if ci == out_pki {
+            continue;
+        }
+        let col = &output_schema.columns[ci];
+        let cs = col.size as usize;
+
+        // Determine if this is an agg column or a group exemplar column
+        let agg_base = num_out_cols - num_aggs;
+        if ci >= agg_base {
+            // Aggregate column
+            let agg_idx = ci - agg_base;
+            let bits = if use_old_val {
+                old_vals[agg_idx]
+            } else {
+                accs[agg_idx].get_value_bits()
+            };
+            // Null if accumulator is zero (no value) and not using old val
+            if !use_old_val && accs[agg_idx].is_zero() {
+                null_word |= 1u64 << out_pi;
+                { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+            } else {
+                output.col_data[out_pi].extend_from_slice(&bits.to_le_bytes()[..cs]);
+            }
+        } else if use_natural_pk {
+            // use_natural_pk: no group exemplar columns in output (PK IS the group)
+            // This shouldn't happen — with use_natural_pk, non-agg non-PK cols don't exist
+            { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+        } else {
+            // Group exemplar column: ci=1..N maps to group_by_cols[ci-1]
+            let grp_idx = ci - 1; // skip PK at 0
+            if grp_idx < group_by_cols.len() {
+                let src_ci = group_by_cols[grp_idx] as usize;
+                let src_pi = payload_idx(src_ci, in_pki);
+                // Check null from input
+                let in_null = input_mb.get_null_word(exemplar_row);
+                if (in_null >> src_pi) & 1 != 0 {
+                    null_word |= 1u64 << out_pi;
+                    { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+                } else if col.type_code == TYPE_STRING {
+                    write_string_from_batch(
+                        &mut output.col_data[out_pi],
+                        &mut output.blob,
+                        input_mb, exemplar_row, src_pi,
+                    );
+                } else {
+                    let src = input_mb.get_col_ptr(exemplar_row, src_pi, cs);
+                    output.col_data[out_pi].extend_from_slice(src);
+                }
+            } else {
+                { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+            }
+        }
+        out_pi += 1;
+    }
+
+    output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+    output.count += 1;
+}
+
+/// Emit a finalized row by evaluating the finalize ExprProgram on the raw output.
+///
+/// Handles COPY_COL (copy column from raw→finalized), EMIT (computed value),
+/// and EMIT_NULL (null column) instructions by pre-scanning the bytecode.
+fn emit_finalized_row(
+    fin_output: &mut OwnedBatch,
+    raw_output: &OwnedBatch,
+    raw_row: usize,
+    group_key_lo: u64,
+    group_key_hi: u64,
+    weight: i64,
+    prog: &crate::expr::ExprProgram,
+    raw_schema: &SchemaDescriptor,
+    fin_schema: &SchemaDescriptor,
+) {
+    use crate::expr::{EXPR_COPY_COL, EXPR_EMIT, EXPR_EMIT_NULL};
+
+    let raw_mb = raw_output.as_mem_batch();
+    let raw_pki = raw_schema.pk_index as usize;
+    let fin_pki = fin_schema.pk_index as usize;
+    let null_word = raw_mb.get_null_word(raw_row);
+
+    // Pre-scan bytecode: classify each output column as COPY_COL, EMIT, or EMIT_NULL
+    #[derive(Clone, Copy)]
+    enum OutCol {
+        CopyCol(usize), // source logical col in raw schema
+        Emit(usize),     // index in the eval emit sequence
+        EmitNull,
+    }
+
+    let mut out_cols: Vec<OutCol> = Vec::new();
+    let mut emit_count = 0usize;
+    for i in 0..prog.num_instrs as usize {
+        let base = i * 4;
+        let op = prog.code[base];
+        if op == EXPR_COPY_COL {
+            let src_col = prog.code[base + 2] as usize;
+            out_cols.push(OutCol::CopyCol(src_col));
+        } else if op == EXPR_EMIT {
+            out_cols.push(OutCol::Emit(emit_count));
+            emit_count += 1;
+        } else if op == EXPR_EMIT_NULL {
+            out_cols.push(OutCol::EmitNull);
+        }
+    }
+
+    // Create emit targets only for EMIT columns
+    let buf_rows = raw_row + 1;
+    let mut emit_bufs: Vec<Vec<u8>> = Vec::with_capacity(emit_count);
+    for _ in 0..emit_count {
+        emit_bufs.push(vec![0u8; buf_rows * 8]); // 8 bytes max per column
+    }
+
+    let emit_targets: Vec<crate::expr::EmitTarget> = emit_bufs
+        .iter_mut()
+        .enumerate()
+        .map(|(i, buf)| crate::expr::EmitTarget {
+            base: buf.as_mut_ptr(),
+            stride: 8,
+            payload_col: i,
+        })
+        .collect();
+
+    // Evaluate (only EMIT instructions write to targets)
+    let (_result, _is_null, eval_emit_mask) = crate::expr::eval_with_emit(
+        prog, &raw_mb, raw_row, raw_schema.pk_index, null_word, &emit_targets,
+    );
+
+    // Build the finalized output row
+    fin_output.pk_lo.extend_from_slice(&group_key_lo.to_le_bytes());
+    fin_output.pk_hi.extend_from_slice(&group_key_hi.to_le_bytes());
+    fin_output.weight.extend_from_slice(&weight.to_le_bytes());
+
+    let mut fin_null_mask: u64 = 0;
+    let mut fpi = 0usize;
+    let mut out_col_idx = 0usize;
+
+    for ci in 0..fin_schema.num_columns as usize {
+        if ci == fin_pki {
+            continue;
+        }
+        let cs = fin_schema.columns[ci].size as usize;
+
+        if out_col_idx < out_cols.len() {
+            match out_cols[out_col_idx] {
+                OutCol::CopyCol(src_col) => {
+                    if src_col == raw_pki {
+                        // Source is the PK column — read from pk_lo
+                        let pk_lo = raw_mb.get_pk_lo(raw_row);
+                        fin_output.col_data[fpi].extend_from_slice(&pk_lo.to_le_bytes()[..cs]);
+                    } else {
+                        let src_pi = payload_idx(src_col, raw_pki);
+                        if (null_word >> src_pi) & 1 != 0 {
+                            fin_null_mask |= 1u64 << fpi;
+                            { let cur = fin_output.col_data[fpi].len(); fin_output.col_data[fpi].resize(cur + cs, 0); }
+                        } else if raw_schema.columns[src_col].type_code == TYPE_STRING {
+                            write_string_from_batch(
+                                &mut fin_output.col_data[fpi],
+                                &mut fin_output.blob,
+                                &raw_mb, raw_row, src_pi,
+                            );
+                        } else {
+                            let src = raw_mb.get_col_ptr(raw_row, src_pi, cs);
+                            fin_output.col_data[fpi].extend_from_slice(src);
+                        }
+                    }
+                }
+                OutCol::Emit(eidx) => {
+                    if (eval_emit_mask >> eidx) & 1 != 0 {
+                        fin_null_mask |= 1u64 << fpi;
+                        { let cur = fin_output.col_data[fpi].len(); fin_output.col_data[fpi].resize(cur + cs, 0); }
+                    } else {
+                        let off = raw_row * 8;
+                        fin_output.col_data[fpi].extend_from_slice(
+                            &emit_bufs[eidx][off..off + cs],
+                        );
+                    }
+                }
+                OutCol::EmitNull => {
+                    fin_null_mask |= 1u64 << fpi;
+                    { let cur = fin_output.col_data[fpi].len(); fin_output.col_data[fpi].resize(cur + cs, 0); }
+                }
+            }
+        } else {
+            { let cur = fin_output.col_data[fpi].len(); fin_output.col_data[fpi].resize(cur + cs, 0); }
+        }
+
+        fpi += 1;
+        out_col_idx += 1;
+    }
+
+    fin_output.null_bmp.extend_from_slice(&fin_null_mask.to_le_bytes());
+    fin_output.count += 1;
+}
+
+/// Append a row from a ReadCursor to an OwnedBatch.
+fn append_cursor_row_to_batch(
+    output: &mut OwnedBatch,
+    cursor: &ReadCursor,
+    schema: &SchemaDescriptor,
+) {
+    let pki = schema.pk_index as usize;
+    output.pk_lo.extend_from_slice(&cursor.current_key_lo.to_le_bytes());
+    output.pk_hi.extend_from_slice(&cursor.current_key_hi.to_le_bytes());
+    output.weight.extend_from_slice(&cursor.current_weight.to_le_bytes());
+    output.null_bmp.extend_from_slice(&cursor.current_null_word.to_le_bytes());
+
+    let blob_base = cursor.blob_ptr();
+    let mut pi = 0;
+    for ci in 0..schema.num_columns as usize {
+        if ci == pki {
+            continue;
+        }
+        let col = &schema.columns[ci];
+        let cs = col.size as usize;
+        let is_null = (cursor.current_null_word >> pi) & 1 != 0;
+        if is_null {
+            let new_len = output.col_data[pi].len() + cs;
+            output.col_data[pi].resize(new_len, 0);
+        } else if col.type_code == TYPE_STRING {
+            let ptr = cursor.col_ptr(ci, 16);
+            if ptr.is_null() {
+                let new_len = output.col_data[pi].len() + 16;
+                output.col_data[pi].resize(new_len, 0);
+            } else {
+                let src = unsafe { std::slice::from_raw_parts(ptr, 16) };
+                write_string_from_raw(
+                    &mut output.col_data[pi],
+                    &mut output.blob,
+                    src, blob_base,
+                );
+            }
+        } else {
+            let ptr = cursor.col_ptr(ci, cs);
+            if ptr.is_null() {
+                let new_len = output.col_data[pi].len() + cs;
+                output.col_data[pi].resize(new_len, 0);
+            } else {
+                let src = unsafe { std::slice::from_raw_parts(ptr, cs) };
+                output.col_data[pi].extend_from_slice(src);
+            }
+        }
+        pi += 1;
+    }
+    output.count += 1;
+}
+
+/// Append a row from a MemBatch to an OwnedBatch.
+fn append_membatch_row_to_batch(
+    output: &mut OwnedBatch,
+    mb: &MemBatch,
+    row: usize,
+    schema: &SchemaDescriptor,
+) {
+    let pki = schema.pk_index as usize;
+    output.pk_lo.extend_from_slice(&mb.get_pk_lo(row).to_le_bytes());
+    output.pk_hi.extend_from_slice(&mb.get_pk_hi(row).to_le_bytes());
+    output.weight.extend_from_slice(&mb.get_weight(row).to_le_bytes());
+    let null_word = mb.get_null_word(row);
+    output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+
+    let mut pi = 0;
+    for ci in 0..schema.num_columns as usize {
+        if ci == pki {
+            continue;
+        }
+        let col = &schema.columns[ci];
+        let cs = col.size as usize;
+        let is_null = (null_word >> pi) & 1 != 0;
+        if is_null {
+            let new_len = output.col_data[pi].len() + cs;
+            output.col_data[pi].resize(new_len, 0);
+        } else if col.type_code == TYPE_STRING {
+            write_string_from_batch(
+                &mut output.col_data[pi],
+                &mut output.blob,
+                mb, row, pi,
+            );
+        } else {
+            let src = mb.get_col_ptr(row, pi, cs);
+            output.col_data[pi].extend_from_slice(src);
+        }
+        pi += 1;
+    }
+    output.count += 1;
+}
+
+/// Check if a cursor's current row matches the group columns of an exemplar row.
+fn cursor_matches_group(
+    cursor: &ReadCursor,
+    exemplar_mb: &MemBatch,
+    exemplar_row: usize,
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> bool {
+    let pki = schema.pk_index as usize;
+    for &c_idx_u32 in group_by_cols {
+        let c_idx = c_idx_u32 as usize;
+        let col = &schema.columns[c_idx];
+        let cs = col.size as usize;
+        let pi = payload_idx(c_idx, pki);
+
+        let cursor_ptr = cursor.col_ptr(c_idx, cs);
+        if cursor_ptr.is_null() {
+            return false;
+        }
+        let cursor_bytes = unsafe { std::slice::from_raw_parts(cursor_ptr, cs) };
+        let exemplar_bytes = exemplar_mb.get_col_ptr(exemplar_row, pi, cs);
+
+        if col.type_code == TYPE_STRING {
+            let cursor_blob = cursor.blob_ptr();
+            let cmp = crate::compact::compare_german_strings(
+                cursor_bytes, if cursor_blob.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(cursor_blob, cursor.blob_len()) } },
+                exemplar_bytes, exemplar_mb.blob,
+            );
+            if cmp != std::cmp::Ordering::Equal {
+                return false;
+            }
+        } else {
+            if cursor_bytes != exemplar_bytes {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// op_gather_reduce
+// ---------------------------------------------------------------------------
+
+/// Gather-reduce: merge partial aggregate deltas from workers.
+pub fn op_gather_reduce(
+    partial_batch: &OwnedBatch,
+    trace_out_cursor: &mut ReadCursor,
+    partial_schema: &SchemaDescriptor,
+    agg_descs: &[AggDescriptor],
+) -> OwnedBatch {
+    let num_aggs = agg_descs.len();
+    let num_out_cols = partial_schema.num_columns as usize;
+    let out_npc = num_out_cols - 1;
+
+    // Sort without consolidation
+    let sorted = sort_owned(partial_batch, partial_schema);
+    let n = sorted.count;
+    if n == 0 {
+        return OwnedBatch::empty(out_npc);
+    }
+
+    let smb = sorted.as_mem_batch();
+
+    // Derive group_indices layout
+    let num_group_cols = num_out_cols - 1 - num_aggs; // -1 for PK
+    let _use_natural_pk_gather = num_group_cols == 0;
+
+    let mut output = OwnedBatch::empty(out_npc);
+    let mut accs: Vec<Accumulator> = agg_descs.iter().map(Accumulator::new).collect();
+    let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
+
+    let mut idx = 0usize;
+    while idx < n {
+        let group_key_lo = smb.get_pk_lo(idx);
+        let group_key_hi = smb.get_pk_hi(idx);
+        let exemplar_row = idx;
+
+        for acc in accs.iter_mut() {
+            acc.reset();
+        }
+
+        // Accumulate all partial deltas for this group
+        while idx < n
+            && smb.get_pk_lo(idx) == group_key_lo
+            && smb.get_pk_hi(idx) == group_key_hi
+        {
+            let w = smb.get_weight(idx);
+            for k in 0..num_aggs {
+                let agg_col_idx = num_out_cols - num_aggs + k;
+                let pi = agg_col_idx - 1; // -1 for PK (pk_index=0 always in output schema)
+                let ptr = smb.get_col_ptr(idx, pi, 8);
+                let bits = u64::from_le_bytes(ptr.try_into().unwrap());
+                if w > 0 {
+                    accs[k].combine(bits);
+                } else if w < 0 {
+                    accs[k].merge_accumulated(bits, -1);
+                }
+            }
+            idx += 1;
+        }
+
+        // Read old global from trace_out
+        trace_out_cursor.seek(group_key_lo, group_key_hi);
+        let has_old = trace_out_cursor.valid
+            && trace_out_cursor.current_key_lo == group_key_lo
+            && trace_out_cursor.current_key_hi == group_key_hi;
+
+        if has_old {
+            for k in 0..num_aggs {
+                let agg_col_idx = num_out_cols - num_aggs + k;
+                let ptr = trace_out_cursor.col_ptr(agg_col_idx, 8);
+                if !ptr.is_null() {
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr, 8) };
+                    old_vals[k] = u64::from_le_bytes(bytes.try_into().unwrap());
+                } else {
+                    old_vals[k] = 0;
+                }
+            }
+
+            // Emit retraction
+            emit_gather_row(
+                &mut output, &smb, exemplar_row,
+                group_key_lo, group_key_hi, -1,
+                &old_vals, true,
+                &accs, partial_schema, num_aggs,
+            );
+
+            // Fold old global into accumulators
+            for k in 0..num_aggs {
+                accs[k].merge_accumulated(old_vals[k], 1);
+            }
+        }
+
+        // Emit new global if non-zero
+        let any_nonzero = accs.iter().any(|a| !a.is_zero());
+        if any_nonzero {
+            emit_gather_row(
+                &mut output, &smb, exemplar_row,
+                group_key_lo, group_key_hi, 1,
+                &old_vals, false,
+                &accs, partial_schema, num_aggs,
+            );
+        }
+    }
+
+    output.sorted = true;
+    gnitz_debug!("op_gather_reduce: in={} out={}", n, output.count);
+    output
+}
+
+/// Emit one gather-reduce output row.
+fn emit_gather_row(
+    output: &mut OwnedBatch,
+    input_mb: &MemBatch,
+    exemplar_row: usize,
+    group_key_lo: u64,
+    group_key_hi: u64,
+    weight: i64,
+    old_vals: &[u64],
+    use_old_val: bool,
+    accs: &[Accumulator],
+    schema: &SchemaDescriptor,
+    num_aggs: usize,
+) {
+    let pki = schema.pk_index as usize;
+    let num_cols = schema.num_columns as usize;
+
+    output.pk_lo.extend_from_slice(&group_key_lo.to_le_bytes());
+    output.pk_hi.extend_from_slice(&group_key_hi.to_le_bytes());
+    output.weight.extend_from_slice(&weight.to_le_bytes());
+
+    let mut null_word: u64 = 0;
+    let in_null = input_mb.get_null_word(exemplar_row);
+    let mut out_pi = 0usize;
+
+    for ci in 0..num_cols {
+        if ci == pki {
+            continue;
+        }
+        let col = &schema.columns[ci];
+        let cs = col.size as usize;
+
+        let agg_base = num_cols - num_aggs;
+        if ci >= agg_base {
+            let agg_idx = ci - agg_base;
+            let bits = if use_old_val {
+                old_vals[agg_idx]
+            } else {
+                accs[agg_idx].get_value_bits()
+            };
+            if !use_old_val && accs[agg_idx].is_zero() {
+                null_word |= 1u64 << out_pi;
+                { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+            } else {
+                output.col_data[out_pi].extend_from_slice(&bits.to_le_bytes()[..cs]);
+            }
+        } else {
+            // Group exemplar column: copy from input
+            let src_pi = out_pi; // same position
+            if (in_null >> src_pi) & 1 != 0 {
+                null_word |= 1u64 << out_pi;
+                { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+            } else if col.type_code == TYPE_STRING {
+                write_string_from_batch(
+                    &mut output.col_data[out_pi],
+                    &mut output.blob,
+                    input_mb, exemplar_row, src_pi,
+                );
+            } else {
+                let src = input_mb.get_col_ptr(exemplar_row, src_pi, cs);
+                output.col_data[out_pi].extend_from_slice(src);
+            }
+        }
+        out_pi += 1;
+    }
+
+    output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+    output.count += 1;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

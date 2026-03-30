@@ -160,6 +160,23 @@ eci = ExternalCompilationInfo(
         "int32_t gnitz_op_union("
         "  const void *batch_a, const void *batch_b,"
         "  const void *schema, void **out_result);",
+        # reduce operators
+        "int32_t gnitz_op_reduce("
+        "  const void *delta, void *trace_in_cursor, void *trace_out_cursor,"
+        "  const void *input_schema, const void *output_schema,"
+        "  const uint32_t *group_by_cols, uint32_t num_group_by_cols,"
+        "  const void *agg_descs, uint32_t num_aggs,"
+        "  void *avi_cursor, int32_t avi_for_max, uint8_t avi_agg_col_type_code,"
+        "  const uint32_t *avi_group_by_cols, uint32_t avi_num_group_by_cols,"
+        "  const void *avi_input_schema,"
+        "  void *gi_cursor, uint32_t gi_col_idx, uint8_t gi_col_type_code,"
+        "  const void *finalize_prog, const void *finalize_out_schema,"
+        "  void **out_result, void **out_finalized);",
+        "int32_t gnitz_op_gather_reduce("
+        "  const void *partial, void *trace_out_cursor,"
+        "  const void *partial_schema,"
+        "  const void *agg_descs, uint32_t num_aggs,"
+        "  void **out_result);",
         # shard index (opaque FLSM lifecycle handle)
         "void *gnitz_shard_index_create(uint32_t table_id, char *output_dir, void *schema_desc);",
         "void gnitz_shard_index_close(void *handle);",
@@ -878,6 +895,31 @@ _op_union = rffi.llexternal(
     rffi.INT,
     compilation_info=eci,
 )
+
+_op_reduce = rffi.llexternal(
+    "gnitz_op_reduce",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,           # delta, trace_in, trace_out
+     rffi.VOIDP, rffi.VOIDP,                         # input_schema, output_schema
+     rffi.UINTP, rffi.UINT,                           # group_by_cols, num_gcols
+     rffi.VOIDP, rffi.UINT,                           # agg_descs, num_aggs
+     rffi.VOIDP, rffi.INT, rffi.UCHAR,               # avi_cursor, for_max, agg_type
+     rffi.UINTP, rffi.UINT, rffi.VOIDP,              # avi_gcols, num, avi_schema
+     rffi.VOIDP, rffi.UINT, rffi.UCHAR,              # gi_cursor, col_idx, col_type
+     rffi.VOIDP, rffi.VOIDP,                         # finalize_prog, fin_schema
+     rffi.VOIDPP, rffi.VOIDPP],                       # out_result, out_finalized
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_op_gather_reduce = rffi.llexternal(
+    "gnitz_op_gather_reduce",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,
+     rffi.VOIDP, rffi.UINT, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+AGG_DESC_SIZE = 8  # sizeof(AggDescriptor) = 8 bytes
 
 # ---------------------------------------------------------------------------
 # Shard Index (opaque FLSM lifecycle handle)

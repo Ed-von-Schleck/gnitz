@@ -1038,6 +1038,157 @@ pub extern "C" fn gnitz_op_join_dd(
 }
 
 // ---------------------------------------------------------------------------
+// Reduce operators
+// ---------------------------------------------------------------------------
+
+/// Reduce operator: incremental GROUP BY + aggregation.
+/// Returns (raw_output, optional finalized_output).
+#[no_mangle]
+pub extern "C" fn gnitz_op_reduce(
+    delta_handle: *const libc::c_void,
+    trace_in_cursor: *mut libc::c_void,
+    trace_out_cursor: *mut libc::c_void,
+    input_schema: *const crate::compact::SchemaDescriptor,
+    output_schema: *const crate::compact::SchemaDescriptor,
+    group_by_cols: *const u32,
+    num_group_by_cols: u32,
+    agg_descs: *const crate::ops::AggDescriptor,
+    num_aggs: u32,
+    avi_cursor: *mut libc::c_void,
+    avi_for_max: i32,
+    avi_agg_col_type_code: u8,
+    avi_group_by_cols: *const u32,
+    avi_num_group_by_cols: u32,
+    avi_input_schema: *const crate::compact::SchemaDescriptor,
+    gi_cursor: *mut libc::c_void,
+    gi_col_idx: u32,
+    gi_col_type_code: u8,
+    finalize_prog: *const libc::c_void,
+    finalize_out_schema: *const crate::compact::SchemaDescriptor,
+    out_result: *mut *mut libc::c_void,
+    out_finalized: *mut *mut libc::c_void,
+) -> i32 {
+    if delta_handle.is_null() || trace_out_cursor.is_null()
+        || input_schema.is_null() || output_schema.is_null()
+        || group_by_cols.is_null() || agg_descs.is_null()
+        || out_result.is_null() || out_finalized.is_null()
+    {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let delta = unsafe { &*(delta_handle as *const crate::memtable::OwnedBatch) };
+        let to_ch = unsafe { &mut *(trace_out_cursor as *mut crate::read_cursor::CursorHandle) };
+        let in_schema = unsafe { &*input_schema };
+        let out_schema = unsafe { &*output_schema };
+        let gcols = unsafe { slice::from_raw_parts(group_by_cols, num_group_by_cols as usize) };
+        let aggs = unsafe { slice::from_raw_parts(agg_descs, num_aggs as usize) };
+
+        let mut ti_cursor_opt: Option<&mut crate::read_cursor::ReadCursor> = if trace_in_cursor.is_null() {
+            None
+        } else {
+            let ch = unsafe { &mut *(trace_in_cursor as *mut crate::read_cursor::CursorHandle) };
+            Some(&mut ch.cursor)
+        };
+
+        let mut avi_cursor_opt: Option<&mut crate::read_cursor::ReadCursor> = if avi_cursor.is_null() {
+            None
+        } else {
+            let ch = unsafe { &mut *(avi_cursor as *mut crate::read_cursor::CursorHandle) };
+            Some(&mut ch.cursor)
+        };
+
+        let avi_gcols = if avi_group_by_cols.is_null() || avi_num_group_by_cols == 0 {
+            &[] as &[u32]
+        } else {
+            unsafe { slice::from_raw_parts(avi_group_by_cols, avi_num_group_by_cols as usize) }
+        };
+
+        let avi_in_schema_opt: Option<&crate::compact::SchemaDescriptor> = if avi_input_schema.is_null() {
+            None
+        } else {
+            Some(unsafe { &*avi_input_schema })
+        };
+
+        let mut gi_cursor_opt: Option<&mut crate::read_cursor::ReadCursor> = if gi_cursor.is_null() {
+            None
+        } else {
+            let ch = unsafe { &mut *(gi_cursor as *mut crate::read_cursor::CursorHandle) };
+            Some(&mut ch.cursor)
+        };
+
+        let fin_prog_opt: Option<&crate::expr::ExprProgram> = if finalize_prog.is_null() {
+            None
+        } else {
+            Some(unsafe { &*(finalize_prog as *const crate::expr::ExprProgram) })
+        };
+
+        let fin_schema_opt: Option<&crate::compact::SchemaDescriptor> = if finalize_out_schema.is_null() {
+            None
+        } else {
+            Some(unsafe { &*finalize_out_schema })
+        };
+
+        let (raw_out, fin_out) = crate::ops::op_reduce(
+            delta,
+            ti_cursor_opt.as_deref_mut(),
+            &mut to_ch.cursor,
+            in_schema,
+            out_schema,
+            gcols,
+            aggs,
+            avi_cursor_opt.as_deref_mut(),
+            avi_for_max != 0,
+            avi_agg_col_type_code,
+            avi_gcols,
+            avi_in_schema_opt,
+            gi_cursor_opt.as_deref_mut(),
+            gi_col_idx,
+            gi_col_type_code,
+            fin_prog_opt,
+            fin_schema_opt,
+        );
+
+        unsafe {
+            *out_result = Box::into_raw(Box::new(raw_out)) as *mut libc::c_void;
+            match fin_out {
+                Some(batch) => *out_finalized = Box::into_raw(Box::new(batch)) as *mut libc::c_void,
+                None => *out_finalized = ptr::null_mut(),
+            }
+        }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+/// Gather-reduce: merge partial aggregate deltas from workers.
+#[no_mangle]
+pub extern "C" fn gnitz_op_gather_reduce(
+    partial_handle: *const libc::c_void,
+    trace_out_cursor: *mut libc::c_void,
+    partial_schema: *const crate::compact::SchemaDescriptor,
+    agg_descs: *const crate::ops::AggDescriptor,
+    num_aggs: u32,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if partial_handle.is_null() || trace_out_cursor.is_null()
+        || partial_schema.is_null() || agg_descs.is_null() || out_result.is_null()
+    {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let partial = unsafe { &*(partial_handle as *const crate::memtable::OwnedBatch) };
+        let to_ch = unsafe { &mut *(trace_out_cursor as *mut crate::read_cursor::CursorHandle) };
+        let schema = unsafe { &*partial_schema };
+        let aggs = unsafe { slice::from_raw_parts(agg_descs, num_aggs as usize) };
+
+        let output = crate::ops::op_gather_reduce(partial, &mut to_ch.cursor, schema, aggs);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
 // Expression programs and scalar functions
 // ---------------------------------------------------------------------------
 
