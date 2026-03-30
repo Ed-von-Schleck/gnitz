@@ -65,7 +65,7 @@ class TestSqlDdl:
 
             # Scan view (rows with val > 10 should be there: val=15, val=25)
             scan_res = client.scan(vid)
-            assert len(scan_res) >= 1  # at least rows with val 15, 25
+            assert len(scan_res) == 2  # val=15 and val=25 pass filter
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
             client.execute_sql("DROP TABLE t", schema_name=sn)
@@ -161,8 +161,8 @@ class TestSqlSelect:
             results = client.execute_sql("SELECT * FROM v", schema_name=sn)
             assert results[0]["type"] == "Rows"
             batch = results[0]["rows"]
-            # View contains rows with val 30, 40, 50 after processing
-            assert len(batch) >= 0  # view may or may not have rows yet depending on ordering
+            # SELECT * FROM v scans the view — rows with val 30, 40, 50 pass filter
+            assert len(batch) == 3
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
             client.execute_sql("DROP TABLE t", schema_name=sn)
@@ -178,7 +178,7 @@ class TestSqlSelect:
             assert results[0]["type"] == "Rows"
             batch = results[0]["rows"]
             # Should find row with pk=3
-            assert len(batch) <= 1  # point lookup returns at most one row
+            assert len(batch) == 1  # point lookup returns exactly one row
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
             client.drop_schema(sn)
@@ -258,7 +258,7 @@ class TestSqlCreateView:
 
             # Scan the view — rows with val > 10 should be there (val=15, val=25)
             scan_res = client.scan(vid)
-            assert len(scan_res) >= 1
+            assert len(scan_res) == 2  # val=15 and val=25 pass filter
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
             client.execute_sql("DROP TABLE t", schema_name=sn)

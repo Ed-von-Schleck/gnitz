@@ -53,7 +53,7 @@ class TestLeftJoin:
 
             rows = client.scan(vid)
             # Order 1 matches customer 100
-            assert len(rows) >= 1
+            assert len(rows) == 1
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
             client.execute_sql("DROP TABLE orders", schema_name=sn)
@@ -81,7 +81,10 @@ class TestLeftJoin:
 
             rows = client.scan(vid)
             # Should still get the order row, with NULL customer columns
-            assert len(rows) >= 1
+            assert len(rows) == 1
+            row = next(iter(rows))
+            # Right-side column "name" from customers should be NULL (no match)
+            assert row["name"] is None
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
             client.execute_sql("DROP TABLE orders", schema_name=sn)

@@ -65,7 +65,12 @@ class TestSetOps:
             )
             vid = client.resolve_table(sn, "v")[0]
 
-            # Insert rows with overlapping values (different PKs)
+            # Insert rows with overlapping values but different PKs.
+            # NOTE: This test does not truly exercise UNION vs UNION ALL dedup
+            # because dedup is by (PK, payload) — since all 4 rows have different
+            # PKs, they are all distinct regardless. A true dedup test would require
+            # projection-based UNION (e.g., SELECT val FROM a UNION SELECT val FROM b)
+            # which is not yet supported.
             client.execute_sql(
                 "INSERT INTO a VALUES (1, 10), (2, 20)",
                 schema_name=sn,
@@ -76,8 +81,6 @@ class TestSetOps:
             )
 
             rows = client.scan(vid)
-            # UNION deduplicates — but dedup is by PK+content. Since PKs differ,
-            # all 4 rows are distinct and should appear.
             assert len(rows) == 4
 
             client.execute_sql("DROP VIEW v", schema_name=sn)

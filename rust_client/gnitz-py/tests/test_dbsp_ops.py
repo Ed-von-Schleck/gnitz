@@ -110,6 +110,9 @@ class TestReduceView:
         assert len(result) > 0
         # Should have 2 groups
         assert len(result) == 2
+        by_group = {row[1]: row[2] for row in result if row.weight > 0}
+        assert by_group[1] == 2
+        assert by_group[2] == 2
 
         client.drop_view(sn, "vr")
         client.drop_table(sn, tname)
@@ -266,6 +269,9 @@ class TestJoinOperator:
 
             rows = [r for r in client.scan(vid) if r.weight > 0]
             assert len(rows) == 1
+            row = rows[0]  # schema: _join_pk (U128), pk, a_val, b_val
+            assert row[2] == 10  # a_val from table a
+            assert row[3] == 20  # b_val from table b
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE a", "DROP TABLE b"]:
                 try:
@@ -467,5 +473,123 @@ class TestOperatorCombinations:
 
         client.drop_view(sn, "v1")
         client.drop_view(sn, "v2")
+        client.drop_table(sn, tname)
+        client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# TestFilterRetraction
+# ---------------------------------------------------------------------------
+
+class TestFilterRetraction:
+
+    def test_filter_retraction(self, client):
+        """Push rows, verify filter, retract a passing row, verify it disappears."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        schema = gnitz.Schema(cols)
+        tname = "t_" + _uid()
+        tid = client.create_table(sn, tname, cols, unique_pk=False)
+
+        eb = gnitz.ExprBuilder()
+        r0 = eb.load_col_int(1)
+        r1 = eb.load_const(50)
+        cond = eb.cmp_gt(r0, r1)
+        prog = eb.build(result_reg=cond)
+
+        cb = client.circuit_builder(source_table_id=tid)
+        inp = cb.input_delta()
+        filt = cb.filter(inp, prog)
+        cb.sink(filt)
+        circuit = cb.build()
+
+        vid = client.create_view_with_circuit(sn, "vfr", circuit, cols)
+
+        batch = gnitz.ZSetBatch(schema)
+        batch.append(pk=1, val=30, weight=1)
+        batch.append(pk=2, val=70, weight=1)
+        batch.append(pk=3, val=100, weight=1)
+        client.push(tid, batch)
+
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        pks = sorted(r.pk for r in rows)
+        assert pks == [2, 3]
+
+        # Retract pk=2 (val=70) — should disappear from the view
+        batch2 = gnitz.ZSetBatch(schema)
+        batch2.append(pk=2, val=70, weight=-1)
+        client.push(tid, batch2)
+
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        pks = sorted(r.pk for r in rows)
+        assert pks == [3]
+
+        client.drop_view(sn, "vfr")
+        client.drop_table(sn, tname)
+        client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# TestDistinctOperator
+# ---------------------------------------------------------------------------
+
+class TestDistinctOperator:
+
+    def test_distinct_operator(self, client):
+        """Push row with weight=1 twice, verify distinct output has weight=1.
+        Retract once, verify still positive. Retract again, verify gone."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        schema = gnitz.Schema(cols)
+        tname = "t_" + _uid()
+        # unique_pk=False so pushes accumulate weight instead of upserting
+        tid = client.create_table(sn, tname, cols, unique_pk=False)
+
+        cb = client.circuit_builder(source_table_id=tid)
+        inp = cb.input_delta()
+        out = cb.distinct(inp)
+        cb.sink(out)
+        circuit = cb.build()
+
+        vid = client.create_view_with_circuit(sn, "vd", circuit, cols)
+
+        # Push weight=+1
+        batch = gnitz.ZSetBatch(schema)
+        batch.append(pk=1, val=10, weight=1)
+        client.push(tid, batch)
+
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert len(rows) == 1
+
+        # Push another weight=+1 (same row, accumulates to w=2 in base)
+        batch2 = gnitz.ZSetBatch(schema)
+        batch2.append(pk=1, val=10, weight=1)
+        client.push(tid, batch2)
+
+        # Distinct still shows weight=1
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert len(rows) == 1
+
+        # Retract once (base goes to w=1, distinct still positive)
+        batch3 = gnitz.ZSetBatch(schema)
+        batch3.append(pk=1, val=10, weight=-1)
+        client.push(tid, batch3)
+
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert len(rows) == 1
+
+        # Retract again (base goes to w=0, distinct should vanish)
+        batch4 = gnitz.ZSetBatch(schema)
+        batch4.append(pk=1, val=10, weight=-1)
+        client.push(tid, batch4)
+
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert len(rows) == 0
+
+        client.drop_view(sn, "vd")
         client.drop_table(sn, tname)
         client.drop_schema(sn)

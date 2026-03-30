@@ -30,7 +30,7 @@ def _cleanup(client, sn, tables=None, views=None):
 
 
 def _scan_dicts(client, tid):
-    return client.scan(tid).mappings()
+    return [r._asdict() for r in client.scan(tid) if r.weight > 0]
 
 
 class TestJoins:
@@ -175,6 +175,8 @@ class TestJoins:
             client.execute_sql("DELETE FROM t1 WHERE id = 1", schema_name=sn)
             rows = _scan_dicts(client, vid)
             assert len(rows) == 1, f"expected 1 row after left-side delete, got {rows}"
+            # The remaining row should have val=100 from t2 (both t1 rows matched t2 pk=10)
+            assert rows[0]["val"] == 100
         finally:
             _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
 
@@ -270,3 +272,36 @@ class TestJoins:
             assert cats == ["Books", "Electronics", "Electronics"]
         finally:
             _cleanup(client, sn, tables=["items", "categories"], views=["v"])
+
+    def test_many_to_many_join(self, client):
+        """Both sides have multiple rows matching same key — verify cross-product."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, a BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM t1 JOIN t2 ON t1.fk = t2.fk",
+                schema_name=sn,
+            )
+            # 2 left rows with fk=10, 3 right rows with fk=10
+            client.execute_sql(
+                "INSERT INTO t2 VALUES (101, 10, 1), (102, 10, 2), (103, 10, 3)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO t1 VALUES (1, 10, 100), (2, 10, 200)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            rows = _scan_dicts(client, vid)
+            # 2 left x 3 right = 6 output rows
+            assert len(rows) == 6, f"expected 6 cross-product rows, got {len(rows)}"
+        finally:
+            _cleanup(client, sn, tables=["t1", "t2"], views=["v"])

@@ -12,8 +12,17 @@ def test_create_drop_view(client):
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
     tid = client.create_table(sn, "src", cols)
-    vid = client.create_view(sn, "v", tid, gnitz.Schema(cols))
+    schema = gnitz.Schema(cols)
+    vid = client.create_view(sn, "v", tid, schema)
     assert vid > 0
+
+    batch = gnitz.ZSetBatch(schema)
+    batch.append(pk=1, val=42)
+    client.push(tid, batch)
+    rows = [r for r in client.scan(vid) if r.weight > 0]
+    assert len(rows) == 1
+    assert rows[0].val == 42
+
     client.drop_view(sn, "v")
     client.drop_table(sn, "src")
     client.drop_schema(sn)
@@ -74,6 +83,8 @@ def test_view_scan_propagates_inserts(client):
 
     result = client.scan(vid)
     assert len(result) == 3
+    vals = sorted(r.val for r in result if r.weight > 0)
+    assert vals == [10, 20, 30]
 
     client.drop_view(sn, "v")
     client.drop_table(sn, "src")

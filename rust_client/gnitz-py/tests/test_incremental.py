@@ -269,7 +269,7 @@ class TestReduceSumRetraction:
 
             _push_grp(client, tid, schema, [(1, 1, 10)], weight=-1)
             result = _scan_reduce(client, vid)
-            assert result.get(1, 0) == 0 or 1 not in result
+            assert 1 not in result or result[1] == 0
         finally:
             try:
                 client.drop_view(sn, vname)
@@ -404,7 +404,7 @@ class TestReduceMinRetraction:
 
             _push_grp(client, tid, schema, [(1, 1, 5)], weight=-1)
             result = _scan_reduce(client, vid)
-            assert result.get(1, 0) == 0 or 1 not in result
+            assert 1 not in result or result[1] == 0
         finally:
             try:
                 client.drop_view(sn, vname)
@@ -484,7 +484,7 @@ class TestReduceMaxRetraction:
 
             _push_grp(client, tid, schema, [(1, 1, 5)], weight=-1)
             result = _scan_reduce(client, vid)
-            assert result.get(1, 0) == 0 or 1 not in result
+            assert 1 not in result or result[1] == 0
         finally:
             try:
                 client.drop_view(sn, vname)
@@ -637,6 +637,7 @@ class TestNullThroughOperators:
 
             positive = [r for r in client.scan(vid) if r.weight > 0]
             assert len(positive) == 1
+            assert positive[0]["val"] is None
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE a", "DROP TABLE b"]:
                 try:
@@ -1274,4 +1275,95 @@ class TestLargeBatch:
                     client.execute_sql(sql, schema_name=sn)
                 except Exception:
                     pass
+            client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# TestReduceRetraction (additional coverage via SQL)
+# ---------------------------------------------------------------------------
+
+class TestReduceRetraction:
+
+    def test_count_retraction(self, client):
+        """Push rows in a group, retract one, verify COUNT decrements."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid, schema, tname = _make_grp_table(client, sn)
+            vid, vname = _make_reduce_view(client, sn, tid, agg_func_id=1)  # COUNT
+
+            _push_grp(client, tid, schema, [(1, 1, 10), (2, 1, 20), (3, 1, 30)])
+            assert _scan_reduce(client, vid) == {1: 3}
+
+            _push_grp(client, tid, schema, [(2, 1, 20)], weight=-1)
+            assert _scan_reduce(client, vid) == {1: 2}
+        finally:
+            try:
+                client.drop_view(sn, vname)
+            except Exception:
+                pass
+            try:
+                client.drop_table(sn, tname)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+    def test_multi_group_reduce(self, client):
+        """Two groups, retract from group 1, verify group 2 unaffected."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid, schema, tname = _make_grp_table(client, sn)
+            vid, vname = _make_reduce_view(client, sn, tid, agg_func_id=2)  # SUM
+
+            _push_grp(client, tid, schema, [
+                (1, 1, 10), (2, 1, 20),
+                (3, 2, 100), (4, 2, 200),
+            ])
+            result = _scan_reduce(client, vid)
+            assert result == {1: 30, 2: 300}
+
+            # Retract from group 1 only
+            _push_grp(client, tid, schema, [(1, 1, 10)], weight=-1)
+            result = _scan_reduce(client, vid)
+            assert result[1] == 20
+            assert result[2] == 300  # group 2 unaffected
+        finally:
+            try:
+                client.drop_view(sn, vname)
+            except Exception:
+                pass
+            try:
+                client.drop_table(sn, tname)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+    def test_reinsertion_restores_aggregate(self, client):
+        """Push, retract, re-push same row, verify SUM returns to original."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid, schema, tname = _make_grp_table(client, sn)
+            vid, vname = _make_reduce_view(client, sn, tid, agg_func_id=2)  # SUM
+
+            _push_grp(client, tid, schema, [(1, 1, 10), (2, 1, 20)])
+            assert _scan_reduce(client, vid) == {1: 30}
+
+            # Retract pk=2
+            _push_grp(client, tid, schema, [(2, 1, 20)], weight=-1)
+            assert _scan_reduce(client, vid) == {1: 10}
+
+            # Re-push pk=2
+            _push_grp(client, tid, schema, [(2, 1, 20)])
+            assert _scan_reduce(client, vid) == {1: 30}
+        finally:
+            try:
+                client.drop_view(sn, vname)
+            except Exception:
+                pass
+            try:
+                client.drop_table(sn, tname)
+            except Exception:
+                pass
             client.drop_schema(sn)

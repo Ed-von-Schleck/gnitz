@@ -131,6 +131,8 @@ def test_delete_multiple_pks(client):
 def test_upsert_intra_batch_insert_then_delete(client):
     """Single batch: insert pk=1 then retract pk=1; scan shows empty."""
     tid, schema, sn = _make_table(client)
+    # val=0 in the retraction differs from the inserted val=10, but unique_pk
+    # tables retract by PK match regardless of payload values.
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=10, weight=1)
     batch.append(pk=1, val=0, weight=-1)
@@ -144,6 +146,8 @@ def test_upsert_intra_batch_delete_then_insert(client):
     """Pre-insert pk=1 val=10; single batch: retract pk=1 then insert pk=1 val=99."""
     tid, schema, sn = _make_table(client)
     _push(client, tid, schema, [(1, 10)])
+    # val=0 in the retraction differs from the inserted val=10, but unique_pk
+    # tables retract by PK match regardless of payload values.
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=0, weight=-1)
     batch.append(pk=1, val=99, weight=1)

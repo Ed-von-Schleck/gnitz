@@ -325,3 +325,73 @@ class TestGroupBy:
             client.execute_sql("DROP TABLE orders", schema_name=sn)
         finally:
             client.drop_schema(sn)
+
+    def test_group_elimination(self, client):
+        """Insert rows in 2 groups, delete all rows from group A,
+        verify group A vanishes while group B remains."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt FROM orders GROUP BY category",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60), (3, 20, 300, 70)",
+                schema_name=sn,
+            )
+            rows = client.scan(vid)
+            assert len(rows) == 2
+
+            # Delete all rows from category 10
+            client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
+            client.execute_sql("DELETE FROM orders WHERE pk = 2", schema_name=sn)
+
+            by_cat = {r["category"]: r["cnt"] for r in client.scan(vid) if r.weight > 0}
+            # Category 10 should have cnt=0 or be absent; category 20 should have cnt=1
+            assert by_cat.get(10, 0) == 0
+            assert by_cat[20] == 1
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE orders", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_reinsertion_after_deletion(self, client):
+        """Insert row, delete it, re-insert it, verify aggregate restores."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT category, SUM(amount) AS total FROM orders GROUP BY category",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 10, 100, 50)",
+                schema_name=sn,
+            )
+            rows = client.scan(vid)
+            assert next(iter(rows))["total"] == 100
+
+            client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
+            totals = {r["category"]: r["total"] for r in client.scan(vid) if r.weight > 0}
+            assert totals.get(10, 0) == 0
+
+            # Re-insert and verify aggregate restores
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 10, 100, 50)",
+                schema_name=sn,
+            )
+            totals = {r["category"]: r["total"] for r in client.scan(vid) if r.weight > 0}
+            assert totals[10] == 100
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE orders", schema_name=sn)
+        finally:
+            client.drop_schema(sn)

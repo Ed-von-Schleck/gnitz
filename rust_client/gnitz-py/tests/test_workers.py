@@ -742,13 +742,13 @@ def test_workers_distinct_view(client):
         # Insert enough rows to spread across workers
         vals = ", ".join(f"({i}, {i * 10})" for i in range(1, 51))
         client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
-        rows = client.scan(vid)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
         assert len(rows) == 50, f"expected 50, got {len(rows)}"
 
         # Delete a subset and verify retraction
         client.execute_sql("DELETE FROM t WHERE pk = 10", schema_name=sn)
         client.execute_sql("DELETE FROM t WHERE pk = 25", schema_name=sn)
-        rows = client.scan(vid)
+        rows = [r for r in client.scan(vid) if r.weight > 0]
         assert len(rows) == 48, f"expected 48 after deletes, got {len(rows)}"
     finally:
         _drop_all(client, sn, tables=["t"], views=["v"])
