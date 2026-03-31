@@ -593,3 +593,60 @@ class TestDistinctOperator:
         client.drop_view(sn, "vd")
         client.drop_table(sn, tname)
         client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# TestUnionOperator
+# ---------------------------------------------------------------------------
+
+
+class TestUnionOperator:
+
+    def test_union_same_pk_different_payload(self, client):
+        """Union must preserve (PK, payload) sort order when same PK appears in both branches."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [
+            gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("a", gnitz.TypeCode.I64),
+            gnitz.ColumnDef("b", gnitz.TypeCode.I64),
+        ]
+        schema = gnitz.Schema(cols)
+        tname = "t_" + _uid()
+        # Multiple rows with same PK but different payloads are needed to exercise the bug.
+        tid = client.create_table(sn, tname, cols, unique_pk=False)
+
+        cb = client.circuit_builder(source_table_id=tid)
+        inp = cb.input_delta()
+        left = cb.map(inp, projection=[2, 1])  # (pk, b, a) — swapped payloads
+        unioned = cb.union(left, inp)
+        cb.sink(unioned)
+        circuit = cb.build()
+
+        out_cols = [
+            gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("a", gnitz.TypeCode.I64),
+            gnitz.ColumnDef("b", gnitz.TypeCode.I64),
+        ]
+        vid = client.create_view_with_circuit(sn, "vu", circuit, out_cols)
+
+        batch = gnitz.ZSetBatch(schema)
+        batch.append(pk=1, a=10, b=20, weight=1)
+        client.push(tid, batch)
+
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert len(rows) == 2
+        payloads = {(r[1], r[2]) for r in rows}
+        assert (10, 20) in payloads
+        assert (20, 10) in payloads
+
+        retract = gnitz.ZSetBatch(schema)
+        retract.append(pk=1, a=10, b=20, weight=-1)
+        client.push(tid, retract)
+
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert len(rows) == 0
+
+        client.drop_view(sn, "vu")
+        client.drop_table(sn, tname)
+        client.drop_schema(sn)

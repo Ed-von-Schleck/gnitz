@@ -1097,6 +1097,9 @@ fn op_union_merge(
     let mut output = OwnedBatch::with_schema(*schema, n_a + n_b);
     output.count = 0;
 
+    let mb_a = batch_a.as_mem_batch();
+    let mb_b = batch_b.as_mem_batch();
+
     let mut i = 0usize;
     let mut j = 0usize;
     // run_src: 0=batch_a, 1=batch_b, -1=no current run
@@ -1129,17 +1132,54 @@ fn op_union_merge(
             }
             j += 1;
         } else {
-            // Equal keys: flush current run then emit one from each
+            // Equal PKs: flush pending run, then merge-sort the equal-PK
+            // sub-ranges from both batches by payload to preserve (PK, payload)
+            // sort order.
             if run_src == 0 {
                 output.append_batch(batch_a, run_a_start, i);
             } else if run_src == 1 {
                 output.append_batch(batch_b, run_b_start, j);
             }
             run_src = -1;
-            output.append_batch(batch_a, i, i + 1);
-            output.append_batch(batch_b, j, j + 1);
-            i += 1;
-            j += 1;
+
+            // Find the end of the equal-PK run in each batch.
+            let mut i_end = i + 1;
+            while i_end < n_a
+                && batch_a.get_pk_lo(i_end) == a_lo
+                && batch_a.get_pk_hi(i_end) == a_hi
+            {
+                i_end += 1;
+            }
+            let mut j_end = j + 1;
+            while j_end < n_b
+                && batch_b.get_pk_lo(j_end) == b_lo
+                && batch_b.get_pk_hi(j_end) == b_hi
+            {
+                j_end += 1;
+            }
+
+            // Merge the two sub-ranges by payload order.
+            let (mut ia, mut jb) = (i, j);
+            while ia < i_end && jb < j_end {
+                if crate::columnar::compare_rows(schema, &mb_a, ia, &mb_b, jb)
+                    != std::cmp::Ordering::Greater
+                {
+                    output.append_batch(batch_a, ia, ia + 1);
+                    ia += 1;
+                } else {
+                    output.append_batch(batch_b, jb, jb + 1);
+                    jb += 1;
+                }
+            }
+            if ia < i_end {
+                output.append_batch(batch_a, ia, i_end);
+            }
+            if jb < j_end {
+                output.append_batch(batch_b, jb, j_end);
+            }
+
+            i = i_end;
+            j = j_end;
         }
     }
 
@@ -3112,5 +3152,74 @@ mod tests {
         let out = op_join_delta_delta(&a, &b, &ls, &rs);
         // b consolidates to empty (1 + -1 = 0 for same pk+payload) → no match
         assert_eq!(out.count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Union merge sort-invariant tests
+    // -----------------------------------------------------------------------
+
+    fn get_payload_i64(b: &OwnedBatch, row: usize) -> i64 {
+        crate::util::read_i64_le(&b.col_data[0], row * 8)
+    }
+
+    #[test]
+    fn test_union_merge_same_pk_payload_order() {
+        // batch_a has val=20, batch_b has val=10 — output must be [10, 20]
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 20)]);
+        let b = make_batch(&schema, &[(1, 1, 10)]);
+        let out = op_union(&a, Some(&b), &schema);
+        assert_eq!(out.count, 2);
+        assert!(out.sorted);
+        assert_eq!(get_payload_i64(&out, 0), 10);
+        assert_eq!(get_payload_i64(&out, 1), 20);
+    }
+
+    #[test]
+    fn test_union_merge_same_pk_multiple_entries() {
+        // a: [(1,1,20),(1,1,30)], b: [(1,1,10),(1,1,25)] → payloads [10,20,25,30]
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 20), (1, 1, 30)]);
+        let b = make_batch(&schema, &[(1, 1, 10), (1, 1, 25)]);
+        let out = op_union(&a, Some(&b), &schema);
+        assert_eq!(out.count, 4);
+        assert!(out.sorted);
+        assert_eq!(get_payload_i64(&out, 0), 10);
+        assert_eq!(get_payload_i64(&out, 1), 20);
+        assert_eq!(get_payload_i64(&out, 2), 25);
+        assert_eq!(get_payload_i64(&out, 3), 30);
+    }
+
+    #[test]
+    fn test_union_merge_mixed_same_diff_pk() {
+        // a: [(1,1,20),(3,1,300)], b: [(1,1,10),(2,1,200)]
+        // output PKs [1,1,2,3], vals [10,20,200,300]
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 20), (3, 1, 300)]);
+        let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 200)]);
+        let out = op_union(&a, Some(&b), &schema);
+        assert_eq!(out.count, 4);
+        assert!(out.sorted);
+        assert_eq!(out.get_pk_lo(0), 1);
+        assert_eq!(get_payload_i64(&out, 0), 10);
+        assert_eq!(out.get_pk_lo(1), 1);
+        assert_eq!(get_payload_i64(&out, 1), 20);
+        assert_eq!(out.get_pk_lo(2), 2);
+        assert_eq!(get_payload_i64(&out, 2), 200);
+        assert_eq!(out.get_pk_lo(3), 3);
+        assert_eq!(get_payload_i64(&out, 3), 300);
+    }
+
+    #[test]
+    fn test_union_merge_same_pk_equal_payload() {
+        // Same (PK, payload), opposite weights — must be adjacent for consolidation
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10)]);
+        let b = make_batch(&schema, &[(1, -1, 10)]);
+        let out = op_union(&a, Some(&b), &schema);
+        assert_eq!(out.count, 2);
+        assert!(out.sorted);
+        assert_eq!(get_payload_i64(&out, 0), 10);
+        assert_eq!(get_payload_i64(&out, 1), 10);
     }
 }
