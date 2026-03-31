@@ -366,6 +366,22 @@ eci = ExternalCompilationInfo(
         "uint64_t gnitz_batch_blob_extend(void *handle, uint32_t n_bytes);",
         "uint64_t gnitz_batch_blob_len(const void *handle);",
         "void gnitz_batch_set_count(void *handle, uint32_t count);",
+        # exchange batch repartitioning
+        "int32_t gnitz_repartition_batch("
+        "  const void *src_batch,"
+        "  const uint32_t *col_indices, uint32_t num_col_indices,"
+        "  const void *schema_desc, uint32_t num_workers,"
+        "  void **out_handles);",
+        "int32_t gnitz_relay_scatter("
+        "  void *const *source_handles, uint32_t num_sources,"
+        "  const uint32_t *col_indices, uint32_t num_col_indices,"
+        "  const void *schema_desc, uint32_t num_workers,"
+        "  void **out_handles);",
+        "int32_t gnitz_multi_scatter("
+        "  const void *src_batch,"
+        "  const uint32_t *col_specs_flat, const uint32_t *spec_lengths,"
+        "  uint32_t num_specs, const void *schema_desc, uint32_t num_workers,"
+        "  void **out_handles);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -1634,4 +1650,29 @@ _batch_blob_len = rffi.llexternal(
 )
 _batch_set_count = rffi.llexternal(
     "gnitz_batch_set_count", [rffi.VOIDP, rffi.UINT], lltype.Void, compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Exchange repartitioning
+# ---------------------------------------------------------------------------
+
+_repartition_batch = rffi.llexternal(
+    "gnitz_repartition_batch",
+    [rffi.VOIDP, rffi.UINTP, rffi.UINT, rffi.VOIDP, rffi.UINT, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_relay_scatter = rffi.llexternal(
+    "gnitz_relay_scatter",
+    [rffi.VOIDPP, rffi.UINT, rffi.UINTP, rffi.UINT, rffi.VOIDP, rffi.UINT, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_multi_scatter = rffi.llexternal(
+    "gnitz_multi_scatter",
+    [rffi.VOIDP, rffi.UINTP, rffi.UINTP, rffi.UINT, rffi.VOIDP, rffi.UINT, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
 )

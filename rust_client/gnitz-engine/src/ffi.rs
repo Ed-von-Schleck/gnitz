@@ -3803,6 +3803,158 @@ pub extern "C" fn gnitz_shard_index_find_pk(
 }
 
 // ---------------------------------------------------------------------------
+// Exchange repartitioning FFI
+// ---------------------------------------------------------------------------
+
+/// Repartition a single batch across N workers by hashing on col_indices.
+/// out_handles must be caller-allocated with num_workers slots, pre-filled
+/// with NULL. Non-empty sub-batch handles are stored in out_handles[w].
+/// Empty workers leave their slot as NULL.
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_repartition_batch(
+    src_batch: *const libc::c_void,
+    col_indices: *const u32,
+    num_col_indices: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    num_workers: u32,
+    out_handles: *mut *mut libc::c_void,
+) -> i32 {
+    if src_batch.is_null() || schema_desc.is_null() || out_handles.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let batch = unsafe { &*(src_batch as *const crate::memtable::OwnedBatch) };
+        let schema = unsafe { &*schema_desc };
+        let nw = num_workers as usize;
+        let col_idx: &[u32] = if col_indices.is_null() || num_col_indices == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(col_indices, num_col_indices as usize) }
+        };
+        let sub_batches = crate::ops::op_repartition_batch(batch, col_idx, schema, nw);
+        for (w, sb) in sub_batches.into_iter().enumerate() {
+            if sb.count > 0 {
+                unsafe {
+                    *out_handles.add(w) = Box::into_raw(Box::new(sb)) as *mut libc::c_void;
+                }
+            }
+        }
+        0i32
+    });
+    result.unwrap_or(-99)
+}
+
+/// Scatter N source batches across num_workers, choosing the merged
+/// (consolidated) or fallback path based on source flags.
+/// source_handles[i] may be NULL (absent worker). out_handles must be
+/// caller-allocated with num_workers slots, pre-filled with NULL.
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_relay_scatter(
+    source_handles: *const *mut libc::c_void,
+    num_sources: u32,
+    col_indices: *const u32,
+    num_col_indices: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    num_workers: u32,
+    out_handles: *mut *mut libc::c_void,
+) -> i32 {
+    if schema_desc.is_null() || out_handles.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let schema = unsafe { &*schema_desc };
+        let nw = num_workers as usize;
+        let ns = num_sources as usize;
+        let col_idx: &[u32] = if col_indices.is_null() || num_col_indices == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(col_indices, num_col_indices as usize) }
+        };
+        let mut sources: Vec<Option<&crate::memtable::OwnedBatch>> = Vec::with_capacity(ns);
+        for i in 0..ns {
+            let h = if source_handles.is_null() {
+                ptr::null_mut()
+            } else {
+                unsafe { *source_handles.add(i) }
+            };
+            if h.is_null() {
+                sources.push(None);
+            } else {
+                sources.push(Some(unsafe { &*(h as *const crate::memtable::OwnedBatch) }));
+            }
+        }
+        let sub_batches = crate::ops::op_relay_scatter(&sources, col_idx, schema, nw);
+        for (w, sb) in sub_batches.into_iter().enumerate() {
+            if sb.count > 0 {
+                unsafe {
+                    *out_handles.add(w) = Box::into_raw(Box::new(sb)) as *mut libc::c_void;
+                }
+            }
+        }
+        0i32
+    });
+    result.unwrap_or(-99)
+}
+
+/// Scatter one batch by M column specs simultaneously.
+/// col_specs_flat: concatenation of all spec arrays.
+/// spec_lengths[i]: length of spec i.
+/// out_handles: caller-allocated [num_specs * num_workers], pre-filled NULL.
+/// Result stored at out_handles[si * num_workers + w].
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_multi_scatter(
+    src_batch: *const libc::c_void,
+    col_specs_flat: *const u32,
+    spec_lengths: *const u32,
+    num_specs: u32,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    num_workers: u32,
+    out_handles: *mut *mut libc::c_void,
+) -> i32 {
+    if src_batch.is_null() || schema_desc.is_null() || out_handles.is_null()
+        || (num_specs > 0 && spec_lengths.is_null())
+    {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let batch = unsafe { &*(src_batch as *const crate::memtable::OwnedBatch) };
+        let schema = unsafe { &*schema_desc };
+        let nw = num_workers as usize;
+        let ns = num_specs as usize;
+
+        let mut col_specs: Vec<&[u32]> = Vec::with_capacity(ns);
+        let mut offset = 0usize;
+        for si in 0..ns {
+            let len = unsafe { *spec_lengths.add(si) } as usize;
+            let spec: &[u32] = if len == 0 || col_specs_flat.is_null() {
+                &[]
+            } else {
+                unsafe { slice::from_raw_parts(col_specs_flat.add(offset), len) }
+            };
+            col_specs.push(spec);
+            offset += len;
+        }
+
+        let results = crate::ops::op_multi_scatter(batch, &col_specs, schema, nw);
+        for (si, worker_batches) in results.into_iter().enumerate() {
+            for (w, sb) in worker_batches.into_iter().enumerate() {
+                if sb.count > 0 {
+                    unsafe {
+                        *out_handles.add(si * nw + w) =
+                            Box::into_raw(Box::new(sb)) as *mut libc::c_void;
+                    }
+                }
+            }
+        }
+        0i32
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 

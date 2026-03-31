@@ -5,9 +5,9 @@
 
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core.batch import ArenaZSetBatch, ColumnarBatchAccessor
 from gnitz.storage.partitioned_table import _partition_for_key
-from gnitz.dbsp.ops.group_index import _extract_group_key
 
 
 class PartitionAssignment(object):
@@ -50,162 +50,103 @@ def worker_for_pk(pk_lo, pk_hi, assignment):
     return assignment.worker_for_partition(_partition_for_key(r_uint64(pk_lo), r_uint64(pk_hi)))
 
 
-def hash_row_by_columns(batch, row_idx, col_indices):
-    """Compute destination partition for a row using group-key semantics.
-
-    For single-column shards on the PK column, reads pk_lo/pk_hi directly
-    (col_bufs[pk_index] has stride=0 and cannot be used for routing).
-    All other cases delegate to _extract_group_key for consistency with
-    the reduce output PK partition routing.
-    """
-    schema = batch._schema
-    if len(col_indices) == 1 and col_indices[0] == schema.pk_index:
-        return _partition_for_key(r_uint64(batch._read_pk_lo(row_idx)),
-                                  r_uint64(batch._read_pk_hi(row_idx)))
-    acc = ColumnarBatchAccessor(schema)
-    acc.bind(batch, row_idx)
-    group_key_lo, group_key_hi = _extract_group_key(acc, schema, col_indices)
-    return _partition_for_key(group_key_lo, group_key_hi)
+def _unpack_handles(out_arr, num_workers, schema):
+    """Build list[ArenaZSetBatch|None] from a filled out_handles array."""
+    from gnitz.storage import engine_ffi
+    result = [None] * num_workers
+    for w in range(num_workers):
+        h = out_arr[w]
+        if h:
+            is_s = intmask(engine_ffi._batch_is_sorted(h)) != 0
+            is_c = intmask(engine_ffi._batch_is_consolidated(h)) != 0
+            result[w] = ArenaZSetBatch._wrap_handle(schema, h, is_s, is_c)
+    return result
 
 
 def repartition_batch(batch, shard_col_indices, num_workers, assignment):
     """Split a batch into N sub-batches by hashing shard columns.
-    Returns list[ArenaZSetBatch or None] of length num_workers.
-    Two-pass: classify then bulk-copy to reduce alloc pressure."""
-    sub_batches = [None] * num_workers
+    Returns list[ArenaZSetBatch or None] of length num_workers."""
+    from gnitz.storage import engine_ffi
     schema = batch._schema
-    n = batch.length()
-    # Pass 1: classify rows into per-worker index lists
-    worker_indices = newlist_hint(num_workers)
-    for _w in range(num_workers):
-        worker_indices.append(newlist_hint(n // num_workers + 1))
-    for i in range(n):
-        p = hash_row_by_columns(batch, i, shard_col_indices)
-        w = assignment.worker_for_partition(p)
-        worker_indices[w].append(i)
-    # Pass 2: bulk-copy each worker's rows
+    n = len(shard_col_indices)
+    col_arr = lltype.malloc(rffi.UINTP.TO, max(n, 1), flavor="raw")
+    out = lltype.malloc(rffi.VOIDPP.TO, max(num_workers, 1), flavor="raw")
+    schema_buf = engine_ffi.pack_schema(schema)
     for w in range(num_workers):
-        wl = worker_indices[w]
-        if len(wl) > 0:
-            sub_batches[w] = ArenaZSetBatch(schema, initial_capacity=len(wl))
-            sub_batches[w]._copy_rows_indexed_src_weights(batch, wl)
-    return sub_batches
+        out[w] = lltype.nullptr(rffi.VOIDP.TO)
+    try:
+        for i in range(n):
+            col_arr[i] = rffi.cast(rffi.UINT, shard_col_indices[i])
+        rc = engine_ffi._repartition_batch(
+            batch._handle,
+            col_arr, rffi.cast(rffi.UINT, n),
+            rffi.cast(rffi.VOIDP, schema_buf),
+            rffi.cast(rffi.UINT, num_workers),
+            out,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_repartition_batch failed: %d" % intmask(rc))
+        return _unpack_handles(out, num_workers, schema)
+    finally:
+        lltype.free(col_arr, flavor="raw")
+        lltype.free(out, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")
 
 
 def repartition_batches(source_batches, shard_col_indices, num_workers, assignment):
-    """Scatter N source batches into N dest batches without an intermediate merge.
-    Sources are iterated sequentially. Output is NOT marked consolidated.
-    Fallback when sources are not all consolidated.
-    Two-pass per source batch: classify then bulk-copy."""
-    dest = [None] * num_workers
-    schema = None
-    total = 0
-    for sb in source_batches:
-        if sb is not None and sb.length() > 0:
-            if schema is None:
-                schema = sb._schema
-            total += sb.length()
-    if schema is None:
-        return dest
-    cap = total // num_workers
-    for sb in source_batches:
-        if sb is None:
-            continue
-        sb_len = sb.length()
-        if sb_len == 0:
-            continue
-        # Pass 1: classify this source batch's rows
-        worker_indices = newlist_hint(num_workers)
-        for _w in range(num_workers):
-            worker_indices.append(newlist_hint(sb_len // num_workers + 1))
-        for i in range(sb_len):
-            p = hash_row_by_columns(sb, i, shard_col_indices)
-            w = assignment.worker_for_partition(p)
-            worker_indices[w].append(i)
-        # Pass 2: bulk-copy
-        for w in range(num_workers):
-            wl = worker_indices[w]
-            if len(wl) > 0:
-                if dest[w] is None:
-                    dest[w] = ArenaZSetBatch(schema, initial_capacity=cap)
-                dest[w]._copy_rows_indexed_src_weights(sb, wl)
-    return dest
+    """Scatter N source batches into N dest batches. Delegates to relay_scatter."""
+    return relay_scatter(source_batches, shard_col_indices, num_workers, assignment)
 
 
-def repartition_batches_merged(source_batches, shard_col_indices, num_workers,
-                                assignment):
+def repartition_batches_merged(source_batches, shard_col_indices, num_workers, assignment):
     """K-way merge of N consolidated source batches in merged PK order.
-    Produces consolidated dest batches. source_batches must all have
-    _consolidated=True and have globally unique PKs."""
-    dest = [None] * num_workers
-    schema = None
-    total = 0
-    for sb in source_batches:
-        if sb is not None and sb.length() > 0:
-            if schema is None:
-                schema = sb._schema
-            total += sb.length()
-    if schema is None:
-        return dest
-    cap = total // num_workers
-    n = len(source_batches)
-    cursors = [0] * n
-
-    while True:
-        # Linear scan: find source with minimum current PK
-        min_w = -1
-        for w in range(n):
-            sb = source_batches[w]
-            if sb is None:
-                continue
-            idx = cursors[w]
-            if idx >= sb.length():
-                continue
-            if min_w == -1:
-                min_w = w
-            else:
-                min_sb = source_batches[min_w]
-                min_idx = cursors[min_w]
-                cur_hi = sb._read_pk_hi(idx)
-                min_hi = min_sb._read_pk_hi(min_idx)
-                if cur_hi < min_hi:
-                    min_w = w
-                elif cur_hi == min_hi:
-                    if sb._read_pk_lo(idx) < min_sb._read_pk_lo(min_idx):
-                        min_w = w
-        if min_w == -1:
-            break
-        src = source_batches[min_w]
-        src_idx = cursors[min_w]
-        p = hash_row_by_columns(src, src_idx, shard_col_indices)
-        dw = assignment.worker_for_partition(p)
-        if dest[dw] is None:
-            dest[dw] = ArenaZSetBatch(schema, initial_capacity=cap)
-        dest[dw]._direct_append_row(src, src_idx, src.get_weight(src_idx))
-        cursors[min_w] += 1
-
-    for w in range(num_workers):
-        if dest[w] is not None:
-            dest[w].mark_consolidated(True)
-    return dest
+    Delegates to relay_scatter (which selects merged path when all sources
+    are consolidated)."""
+    return relay_scatter(source_batches, shard_col_indices, num_workers, assignment)
 
 
 def relay_scatter(source_batches, shard_cols, num_workers, assignment):
     """Scatter N exchange results. Sources must remain alive during call."""
-    all_consolidated = True
-    has_any = False
+    schema = None
     for sb in source_batches:
         if sb is not None and sb.length() > 0:
-            has_any = True
-            if not sb._consolidated:
-                all_consolidated = False
-                break
-    if not has_any:
+            schema = sb._schema
+            break
+    if schema is None:
         return [None] * num_workers
-    if all_consolidated:
-        return repartition_batches_merged(source_batches, shard_cols,
-                                          num_workers, assignment)
-    return repartition_batches(source_batches, shard_cols, num_workers, assignment)
+    from gnitz.storage import engine_ffi
+    n_src = len(source_batches)
+    n_cols = len(shard_cols)
+    src_ptrs = lltype.malloc(rffi.VOIDPP.TO, max(n_src, 1), flavor="raw")
+    col_arr = lltype.malloc(rffi.UINTP.TO, max(n_cols, 1), flavor="raw")
+    out = lltype.malloc(rffi.VOIDPP.TO, max(num_workers, 1), flavor="raw")
+    schema_buf = engine_ffi.pack_schema(schema)
+    for w in range(num_workers):
+        out[w] = lltype.nullptr(rffi.VOIDP.TO)
+    try:
+        for i in range(n_src):
+            sb = source_batches[i]
+            if sb is not None and sb.length() > 0:
+                src_ptrs[i] = sb._handle
+            else:
+                src_ptrs[i] = lltype.nullptr(rffi.VOIDP.TO)
+        for i in range(n_cols):
+            col_arr[i] = rffi.cast(rffi.UINT, shard_cols[i])
+        rc = engine_ffi._relay_scatter(
+            src_ptrs, rffi.cast(rffi.UINT, n_src),
+            col_arr, rffi.cast(rffi.UINT, n_cols),
+            rffi.cast(rffi.VOIDP, schema_buf),
+            rffi.cast(rffi.UINT, num_workers),
+            out,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_relay_scatter failed: %d" % intmask(rc))
+        return _unpack_handles(out, num_workers, schema)
+    finally:
+        lltype.free(src_ptrs, flavor="raw")
+        lltype.free(col_arr, flavor="raw")
+        lltype.free(out, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")
 
 
 class PartitionRouter(object):
@@ -246,40 +187,61 @@ class PartitionRouter(object):
 
 def multi_scatter(batch, col_spec_list, num_workers, assignment):
     """Scatter one batch by multiple column specs.
-    Returns list[list[ArenaZSetBatch|None]], one inner list per spec.
-    Two-pass: classify then bulk-copy via _copy_rows_indexed_src_weights."""
-    n = batch.length()
-    n_specs = len(col_spec_list)
+    Returns list[list[ArenaZSetBatch|None]], one inner list per spec."""
+    from gnitz.storage import engine_ffi
     schema = batch._schema
-    # Pass 1: classify rows into flat_indices[si * num_workers + w]
-    flat_indices = newlist_hint(n_specs * num_workers)
-    for _i in range(n_specs * num_workers):
-        flat_indices.append(newlist_hint(n // num_workers + 1))
-    for i in range(n):
-        for si in range(n_specs):
-            p = hash_row_by_columns(batch, i, col_spec_list[si])
-            w = assignment.worker_for_partition(p)
-            flat_indices[si * num_workers + w].append(i)
-    # Pass 2: bulk-copy each (spec, worker) bucket
-    results = [None] * n_specs
+    n_specs = len(col_spec_list)
+    flat = newlist_hint(0)
+    lengths = newlist_hint(n_specs)
+    for spec in col_spec_list:
+        for ci in spec:
+            flat.append(ci)
+        lengths.append(len(spec))
+    n_flat = len(flat)
+    flat_arr = lltype.malloc(rffi.UINTP.TO, max(n_flat, 1), flavor="raw")
+    len_arr = lltype.malloc(rffi.UINTP.TO, max(n_specs, 1), flavor="raw")
+    total_out = n_specs * num_workers
+    out = lltype.malloc(rffi.VOIDPP.TO, max(total_out, 1), flavor="raw")
+    schema_buf = engine_ffi.pack_schema(schema)
+    for i in range(total_out):
+        out[i] = lltype.nullptr(rffi.VOIDP.TO)
+    # Flat handle list: save pointers before freeing the C array
+    handles = newlist_hint(total_out)
+    for i in range(total_out):
+        handles.append(lltype.nullptr(rffi.VOIDP.TO))
+    try:
+        for i in range(n_flat):
+            flat_arr[i] = rffi.cast(rffi.UINT, flat[i])
+        for i in range(n_specs):
+            len_arr[i] = rffi.cast(rffi.UINT, lengths[i])
+        rc = engine_ffi._multi_scatter(
+            batch._handle,
+            flat_arr, len_arr, rffi.cast(rffi.UINT, n_specs),
+            rffi.cast(rffi.VOIDP, schema_buf),
+            rffi.cast(rffi.UINT, num_workers),
+            out,
+        )
+        if intmask(rc) < 0:
+            raise Exception("gnitz_multi_scatter failed: %d" % intmask(rc))
+        for i in range(total_out):
+            handles[i] = out[i]
+    finally:
+        lltype.free(flat_arr, flavor="raw")
+        lltype.free(len_arr, flavor="raw")
+        lltype.free(out, flavor="raw")
+        lltype.free(schema_buf, flavor="raw")
+    # Build nested results outside try/finally to avoid RPython annotation
+    # issues with nested list construction in exception-handling blocks
+    results = newlist_hint(n_specs)
     for si in range(n_specs):
-        results[si] = [None] * num_workers
-    for si in range(n_specs):
+        inner = newlist_hint(num_workers)
         for w in range(num_workers):
-            wl = flat_indices[si * num_workers + w]
-            if len(wl) > 0:
-                results[si][w] = ArenaZSetBatch(schema, initial_capacity=len(wl))
-                results[si][w]._copy_rows_indexed_src_weights(batch, wl)
-    # Flag propagation: PK-spec sub-batches inherit consolidation from source
-    for si in range(n_specs):
-        spec = col_spec_list[si]
-        if len(spec) == 1 and spec[0] == schema.pk_index:
-            if batch._sorted or batch._consolidated:
-                for w in range(num_workers):
-                    sb = results[si][w]
-                    if sb is not None:
-                        if batch._sorted:
-                            sb.mark_sorted(True)
-                        if batch._consolidated:
-                            sb.mark_consolidated(True)
+            h = handles[si * num_workers + w]
+            if h:
+                is_s = intmask(engine_ffi._batch_is_sorted(h)) != 0
+                is_c = intmask(engine_ffi._batch_is_consolidated(h)) != 0
+                inner.append(ArenaZSetBatch._wrap_handle(schema, h, is_s, is_c))
+            else:
+                inner.append(None)
+        results.append(inner)
     return results

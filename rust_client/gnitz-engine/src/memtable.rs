@@ -16,6 +16,33 @@ use crate::util::{read_i64_le, read_u64_le};
 /// Error code returned when the MemTable exceeds its capacity.
 pub const ERR_CAPACITY: i32 = -2;
 
+/// Copy a 16-byte German String struct from source to destination, relocating
+/// long-string blob data into `dst_blob`. Used by `append_rows_inner` and
+/// `append_indexed_rows` to avoid duplicating the blob relocation logic.
+fn relocate_string_cell(
+    src_struct: &[u8],
+    src_blob: &[u8],
+    dst_col: &mut Vec<u8>,
+    dst_blob: &mut Vec<u8>,
+) {
+    let length = u32::from_le_bytes(src_struct[0..4].try_into().unwrap()) as usize;
+    let mut dest = [0u8; 16];
+    dest[0..8].copy_from_slice(&src_struct[0..8]);
+    if length <= crate::compact::SHORT_STRING_THRESHOLD {
+        let sfx = if length > 4 { length - 4 } else { 0 };
+        if sfx > 0 {
+            dest[8..8 + sfx].copy_from_slice(&src_struct[8..8 + sfx]);
+        }
+    } else {
+        let old_off = u64::from_le_bytes(src_struct[8..16].try_into().unwrap()) as usize;
+        let str_data = &src_blob[old_off..old_off + length];
+        let new_off = dst_blob.len();
+        dst_blob.extend_from_slice(str_data);
+        dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
+    }
+    dst_col.extend_from_slice(&dest);
+}
+
 /// Owned columnar batch.  Stores the same SoA layout as RPython's
 /// `ArenaZSetBatch` but in Rust `Vec<u8>` buffers.
 ///
@@ -368,27 +395,10 @@ impl OwnedBatch {
             };
 
             if is_string && cs == 16 {
-                // String column: per-row struct copy with blob relocation
                 for row in start..end {
                     let off = row * 16;
                     let src_struct = &src.col_data[pi][off..off + 16];
-                    let length = u32::from_le_bytes(src_struct[0..4].try_into().unwrap()) as usize;
-                    let mut dest = [0u8; 16];
-                    dest[0..8].copy_from_slice(&src_struct[0..8]);
-
-                    if length <= crate::compact::SHORT_STRING_THRESHOLD {
-                        let sfx = if length > 4 { length - 4 } else { 0 };
-                        if sfx > 0 {
-                            dest[8..8 + sfx].copy_from_slice(&src_struct[8..8 + sfx]);
-                        }
-                    } else {
-                        let old_off = u64::from_le_bytes(src_struct[8..16].try_into().unwrap()) as usize;
-                        let str_data = &src.blob[old_off..old_off + length];
-                        let new_off = self.blob.len();
-                        self.blob.extend_from_slice(str_data);
-                        dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
-                    }
-                    self.col_data[pi].extend_from_slice(&dest);
+                    relocate_string_cell(src_struct, &src.blob, &mut self.col_data[pi], &mut self.blob);
                 }
             } else if cs > 0 {
                 self.col_data[pi].extend_from_slice(&src.col_data[pi][start * cs..end * cs]);
@@ -398,6 +408,57 @@ impl OwnedBatch {
         }
 
         self.count += n;
+        self.sorted = false;
+        self.consolidated = false;
+    }
+
+    /// Scatter-copy selected rows from a MemBatch directly into this batch.
+    /// Avoids the intermediate allocation of `from_indexed_rows` + `append_batch`.
+    /// Requires `self.schema` to be set (use `with_schema` to create the batch).
+    pub fn append_indexed_rows(
+        &mut self,
+        src: &merge::MemBatch,
+        indices: &[u32],
+        schema: &crate::compact::SchemaDescriptor,
+    ) {
+        if indices.is_empty() {
+            return;
+        }
+        // Pre-compute payload column metadata to avoid per-row schema scanning
+        let pki = schema.pk_index as usize;
+        let mut col_meta: Vec<(usize, bool)> = Vec::with_capacity(schema.num_columns as usize - 1);
+        for ci in 0..schema.num_columns as usize {
+            if ci == pki {
+                continue;
+            }
+            let col = &schema.columns[ci];
+            let is_string = col.type_code == crate::compact::type_code::STRING
+                && col.size == 16;
+            col_meta.push((col.size as usize, is_string));
+        }
+
+        for &idx in indices {
+            let row = idx as usize;
+            self.pk_lo.extend_from_slice(&src.get_pk_lo(row).to_le_bytes());
+            self.pk_hi.extend_from_slice(&src.get_pk_hi(row).to_le_bytes());
+            self.weight.extend_from_slice(&src.get_weight(row).to_le_bytes());
+            let null_word = src.get_null_word(row);
+            self.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+
+            for (pi, &(cs, is_string)) in col_meta.iter().enumerate() {
+                let is_null = (null_word >> pi) & 1 != 0;
+                if is_null {
+                    let prev_len = self.col_data[pi].len();
+                    self.col_data[pi].resize(prev_len + cs, 0);
+                } else if is_string {
+                    let src_struct = src.get_col_ptr(row, pi, 16);
+                    relocate_string_cell(src_struct, src.blob, &mut self.col_data[pi], &mut self.blob);
+                } else if cs > 0 {
+                    self.col_data[pi].extend_from_slice(src.get_col_ptr(row, pi, cs));
+                }
+            }
+            self.count += 1;
+        }
         self.sorted = false;
         self.consolidated = false;
     }

@@ -18,10 +18,9 @@ from gnitz.catalog.registry import ingest_to_family
 from gnitz.catalog.metadata import ensure_dir
 from gnitz.catalog.system_tables import FIRST_USER_TABLE_ID
 from gnitz.dbsp.ops.exchange import (
-    hash_row_by_columns, repartition_batch, repartition_batches,
+    repartition_batch, repartition_batches,
     repartition_batches_merged, PartitionAssignment,
 )
-from gnitz.dbsp.ops.group_index import _mix64
 from gnitz.storage.partitioned_table import (
     _partition_for_key, make_partitioned_persistent, NUM_PARTITIONS,
 )
@@ -99,41 +98,6 @@ def _add_int_row(rb, pk, vals, weight=1):
 # ------------------------------------------------------------------------------
 
 
-def test_hash_distribution():
-    """hash_row_by_columns should produce a reasonable distribution across 256 buckets."""
-    log("[EXCHANGE] Testing hash_row_by_columns distribution...")
-
-    schema = types.TableSchema(
-        _make_table_cols_i64(["val"]),
-        pk_index=0,
-    )
-    b = batch.ArenaZSetBatch(schema)
-    rb = RowBuilder(schema, b)
-
-    # Insert 1000 rows with distinct PKs
-    for i in range(1000):
-        _add_int_row(rb, i, [i * 7])
-
-    # Hash each row by column 1 (val)
-    col_indices = [1]
-    buckets = [0] * 256
-    for i in range(b.length()):
-        p = hash_row_by_columns(b, i, col_indices)
-        assert_true(p >= 0 and p < 256, "hash out of range")
-        buckets[p] += 1
-
-    # Check distribution: at least 100 distinct buckets should be hit
-    non_empty = 0
-    for i in range(256):
-        if buckets[i] > 0:
-            non_empty += 1
-    assert_true(non_empty >= 100,
-                "hash distribution too skewed: only " + str(non_empty) + " of 256 buckets hit")
-
-    b.free()
-    log("  PASSED")
-
-
 def test_repartition_batch():
     """repartition_batch should split rows correctly across workers."""
     log("[EXCHANGE] Testing repartition_batch...")
@@ -173,62 +137,6 @@ def test_repartition_batch():
         if sub_batches[w] is not None:
             sub_batches[w].free()
     b.free()
-    log("  PASSED")
-
-
-def test_string_hash_consistency():
-    """Two rows with the same string value should hash to the same partition."""
-    log("[EXCHANGE] Testing string hash consistency...")
-
-    cols = newlist_hint(2)
-    cols.append(types.ColumnDefinition(types.TYPE_U64, name="pk"))
-    cols.append(types.ColumnDefinition(types.TYPE_STRING, name="name"))
-    schema = types.TableSchema(cols, pk_index=0)
-
-    b = batch.ArenaZSetBatch(schema)
-    from gnitz.core.batch import RowBuilder
-    rb = RowBuilder(schema, b)
-
-    # Two rows with the same string "hello" but different PKs
-    rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
-    rb.put_string("hello")
-    rb.commit()
-
-    rb.begin(r_uint64(2), r_uint64(0), r_int64(1))
-    rb.put_string("hello")
-    rb.commit()
-
-    # A row with a different string
-    rb.begin(r_uint64(3), r_uint64(0), r_int64(1))
-    rb.put_string("world")
-    rb.commit()
-
-    col_indices = [1]
-    p0 = hash_row_by_columns(b, 0, col_indices)
-    p1 = hash_row_by_columns(b, 1, col_indices)
-    p2 = hash_row_by_columns(b, 2, col_indices)
-
-    assert_equal_i(p0, p1, "same string 'hello' should hash to same partition")
-    # p2 may or may not differ, but at least the same-string case must match
-
-    # Also test a longer string (> 12 bytes, heap-allocated)
-    b2 = batch.ArenaZSetBatch(schema)
-    rb2 = RowBuilder(schema, b2)
-
-    rb2.begin(r_uint64(10), r_uint64(0), r_int64(1))
-    rb2.put_string("this is a longer string for heap")
-    rb2.commit()
-
-    rb2.begin(r_uint64(11), r_uint64(0), r_int64(1))
-    rb2.put_string("this is a longer string for heap")
-    rb2.commit()
-
-    q0 = hash_row_by_columns(b2, 0, col_indices)
-    q1 = hash_row_by_columns(b2, 1, col_indices)
-    assert_equal_i(q0, q1, "same long string should hash to same partition")
-
-    b.free()
-    b2.free()
     log("  PASSED")
 
 
@@ -1002,70 +910,6 @@ def test_multi_worker_integration(base_dir):
     log("  PASSED")
 
 
-def test_exchange_routing_contract():
-    """Verify exchange.hash_row_by_columns agrees with _partition_for_key on
-    the same inputs, for both the single-U64 fast path and the general
-    Murmur3 path."""
-    log("test_exchange_routing_contract")
-
-    # --- Single U64 group-by column (fast path) ---
-    # exchange: _partition_for_key(val, 0)
-    # reduce:   PK = r_uint128(val) -> lo=val, hi=0 -> _partition_for_key(val, 0)
-    u64_schema = make_u64_u64_schema()
-    u64_batch = ArenaZSetBatch(u64_schema)
-    rb = RowBuilder(u64_schema, u64_batch)
-    for i in range(256):
-        v = r_uint64(i * 997 + 1)
-        rb.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, v))
-        rb.commit()
-
-    for i in range(256):
-        val = r_uint64(u64_batch._read_col_int(i, 1))
-        expected = _partition_for_key(val, r_uint64(0))
-        got = hash_row_by_columns(u64_batch, i, [1])
-        assert_equal_i(
-            expected, got,
-            "single-U64 routing mismatch at row %d" % i,
-        )
-
-    u64_batch.free()
-
-    # --- Multi-column (I64 + I64) general Murmur3 path ---
-    # Build a 3-col schema: pk U64, a I64, b I64
-    cols = [
-        types.ColumnDefinition(types.TYPE_U64, name="pk"),
-        types.ColumnDefinition(types.TYPE_I64, name="a"),
-        types.ColumnDefinition(types.TYPE_I64, name="b"),
-    ]
-    mc_schema = types.TableSchema(cols, 0)
-    mc_batch = ArenaZSetBatch(mc_schema)
-    rb2 = RowBuilder(mc_schema, mc_batch)
-    for i in range(64):
-        rb2.begin(r_uint64(i + 1), r_uint64(0), r_int64(1))
-        rb2.put_int(r_int64(i * 31 + 7))
-        rb2.put_int(r_int64(i * 97 - 3))
-        rb2.commit()
-
-    col_indices = [1, 2]
-    for i in range(64):
-        # Replicate the general Murmur3 formula to compute expected partition.
-        h = r_uint64(0x9E3779B97F4A7C15)
-        for j in range(len(col_indices)):
-            col_hash = _mix64(mc_batch._read_col_int(i, col_indices[j]))
-            h = _mix64(h ^ col_hash ^ r_uint64(j))
-        h_hi = _mix64(h ^ r_uint64(len(col_indices)))
-        expected = _partition_for_key(h, h_hi)
-        got = hash_row_by_columns(mc_batch, i, col_indices)
-        assert_equal_i(
-            expected, got,
-            "multi-col routing mismatch at row %d" % i,
-        )
-
-    mc_batch.free()
-    log("  PASSED")
-
-
 def test_empty_push_barrier(base_dir):
     """Fork 4 workers. Push a batch where all rows hash to worker 0.
     Workers 1-3 receive empty batches but must still ACK (barrier participation).
@@ -1193,9 +1037,7 @@ def entry_point(argv):
 
     try:
         # Exchange tests (no engine)
-        test_hash_distribution()
         test_repartition_batch()
-        test_string_hash_consistency()
 
         # Exchange tests (need engine, cleanup between)
         test_compile_split_plan(base_dir)
@@ -1227,7 +1069,6 @@ def entry_point(argv):
         test_fork_ipc_push_round_trip(base_dir)
         test_fork_ipc_scan_round_trip(base_dir)
         test_multi_worker_integration(base_dir)
-        test_exchange_routing_contract()
         test_empty_push_barrier(base_dir)
 
         log("\nALL MULTICORE TESTS PASSED")
