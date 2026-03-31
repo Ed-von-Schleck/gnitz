@@ -38,19 +38,39 @@ pub fn op_distinct(
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
     let mut emit_weights: Vec<i64> = Vec::with_capacity(n);
 
+    let consolidated_mb = consolidated.as_mem_batch();
+    let mut prev_lo = u64::MAX;
+    let mut prev_hi = u64::MAX;
+
     for i in 0..n {
         let key_lo = consolidated.get_pk_lo(i);
         let key_hi = consolidated.get_pk_hi(i);
         let w_delta = consolidated.get_weight(i);
 
-        cursor.seek(key_lo, key_hi);
-        let w_old: i64 = if cursor.valid
-            && cursor.current_key_lo == key_lo
-            && cursor.current_key_hi == key_hi
-        {
-            cursor.current_weight
-        } else {
-            0
+        if key_lo != prev_lo || key_hi != prev_hi {
+            cursor.seek(key_lo, key_hi);
+        }
+        prev_lo = key_lo;
+        prev_hi = key_hi;
+
+        let w_old: i64 = loop {
+            if !cursor.valid
+                || cursor.current_key_lo != key_lo
+                || cursor.current_key_hi != key_hi
+            {
+                break 0;
+            }
+            match compare_cursor_payload_to_batch_row(cursor, &consolidated_mb, i, schema) {
+                std::cmp::Ordering::Less => {
+                    cursor.advance();
+                }
+                std::cmp::Ordering::Equal => {
+                    let w = cursor.current_weight;
+                    cursor.advance();
+                    break w;
+                }
+                std::cmp::Ordering::Greater => break 0,
+            }
         };
 
         let s_old = signum(w_old);
@@ -59,7 +79,7 @@ pub fn op_distinct(
         let out_w = s_new - s_old;
         if out_w != 0 {
             emit_indices.push(i as u32);
-            emit_weights.push(out_w as i64);
+            emit_weights.push(out_w);
         }
     }
 
@@ -2713,6 +2733,91 @@ fn cursor_matches_group(
     true
 }
 
+/// Compare a cursor's current payload to a batch row's payload, returning their ordering.
+///
+/// Iterates payload columns in schema order (skipping pk_index). Null ordering:
+/// null < non-null, null == null. Type dispatch follows `compare_by_group_cols`.
+fn compare_cursor_payload_to_batch_row(
+    cursor: &ReadCursor,
+    batch: &MemBatch,
+    row: usize,
+    schema: &SchemaDescriptor,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let pki = schema.pk_index as usize;
+    let cursor_blob = cursor.blob_ptr();
+    let cursor_blob_slice: &[u8] = if cursor_blob.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(cursor_blob, cursor.blob_len()) }
+    };
+
+    let mut pi = 0usize;
+    for ci in 0..schema.num_columns as usize {
+        if ci == pki {
+            continue;
+        }
+        let col = &schema.columns[ci];
+        let cs = col.size as usize;
+
+        let cursor_null = (cursor.current_null_word >> pi) & 1 != 0;
+        let batch_null = (batch.get_null_word(row) >> pi) & 1 != 0;
+
+        let ord = match (cursor_null, batch_null) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => {
+                let c_ptr = cursor.col_ptr(ci, cs);
+                let c_bytes = unsafe { std::slice::from_raw_parts(c_ptr, cs) };
+                let b_bytes = batch.get_col_ptr(row, pi, cs);
+
+                if col.type_code == TYPE_STRING {
+                    crate::compact::compare_german_strings(
+                        c_bytes,
+                        cursor_blob_slice,
+                        b_bytes,
+                        batch.blob,
+                    )
+                } else if col.type_code == type_code::U128 {
+                    let c_lo = u64::from_le_bytes(c_bytes[0..8].try_into().unwrap());
+                    let c_hi = u64::from_le_bytes(c_bytes[8..16].try_into().unwrap());
+                    let b_lo = u64::from_le_bytes(b_bytes[0..8].try_into().unwrap());
+                    let b_hi = u64::from_le_bytes(b_bytes[8..16].try_into().unwrap());
+                    (c_hi, c_lo).cmp(&(b_hi, b_lo))
+                } else if col.type_code == type_code::F64 || col.type_code == type_code::F32 {
+                    let c_f = f64::from_bits(u64::from_le_bytes(
+                        c_bytes[0..8].try_into().unwrap(),
+                    ));
+                    let b_f = f64::from_bits(u64::from_le_bytes(
+                        b_bytes[0..8].try_into().unwrap(),
+                    ));
+                    c_f.partial_cmp(&b_f).unwrap_or(Ordering::Equal)
+                } else if col.type_code == type_code::I64
+                    || col.type_code == type_code::I32
+                    || col.type_code == type_code::I16
+                    || col.type_code == type_code::I8
+                {
+                    let c_v = i64::from_le_bytes(c_bytes.try_into().unwrap());
+                    let b_v = i64::from_le_bytes(b_bytes.try_into().unwrap());
+                    c_v.cmp(&b_v)
+                } else {
+                    let c_v = u64::from_le_bytes(c_bytes.try_into().unwrap());
+                    let b_v = u64::from_le_bytes(b_bytes.try_into().unwrap());
+                    c_v.cmp(&b_v)
+                }
+            }
+        };
+
+        if ord != Ordering::Equal {
+            return ord;
+        }
+        pi += 1;
+    }
+    Ordering::Equal
+}
+
 // ---------------------------------------------------------------------------
 // op_gather_reduce
 // ---------------------------------------------------------------------------
@@ -3898,6 +4003,44 @@ mod tests {
 
         let sub_batches = op_repartition_batch(&b, &[0u32], &schema, 4);
         assert_eq!(total_rows(&sub_batches), 100, "total rows must equal input count");
+    }
+
+    // -----------------------------------------------------------------------
+    // op_distinct: same-PK update regression
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_distinct_update_same_pk() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+
+        // Trace: (PK=1, val=100, w=+1) — a row inserted in a previous tick.
+        let trace_batch = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
+        let mut cursor_handle =
+            unsafe { create_cursor_from_snapshots(&[trace_batch], &[], schema) };
+
+        // Delta: UPDATE PK=1 sets val=100 → 200.
+        // _enforce_unique_pk emits (PK=1, val=100, w=-1) and (PK=1, val=200, w=+1).
+        // Both rows have the same PK but different payloads; sorted by payload ascending.
+        let delta = make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]);
+
+        let (out, _consolidated) = op_distinct(&delta, &mut cursor_handle.cursor, &schema);
+
+        assert_eq!(
+            out.count, 2,
+            "expected 2 output rows after same-PK update, got {}",
+            out.count
+        );
+
+        assert_eq!(out.get_pk_lo(0), 1);
+        assert_eq!(get_payload_i64(&out, 0), 100);
+        assert_eq!(out.get_weight(0), -1);
+
+        assert_eq!(out.get_pk_lo(1), 1);
+        assert_eq!(get_payload_i64(&out, 1), 200);
+        assert_eq!(out.get_weight(1), 1);
     }
 
     #[test]

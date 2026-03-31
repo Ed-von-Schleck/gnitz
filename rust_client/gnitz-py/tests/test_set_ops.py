@@ -298,3 +298,35 @@ class TestSetOps:
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
             client.drop_schema(sn)
+
+    def test_distinct_update_view(self, client):
+        """UPDATE on a table with a SELECT DISTINCT view reflects the new value."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT DISTINCT * FROM t",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20)", schema_name=sn)
+            rows = client.scan(vid)
+            assert len(rows) == 2
+
+            # Update pk=1: old value should retract, new value should appear
+            client.execute_sql("UPDATE t SET val = 99 WHERE pk = 1", schema_name=sn)
+            rows = client.scan(vid)
+            vals = sorted(r["val"] for r in rows)
+            assert vals == [20, 99], f"expected [20, 99] after update, got {vals}"
+        finally:
+            for sql in ["DROP VIEW v", "DROP TABLE t"]:
+                try:
+                    client.execute_sql(sql, schema_name=sn)
+                except Exception:
+                    pass
+            client.drop_schema(sn)
