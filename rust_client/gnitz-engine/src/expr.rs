@@ -65,6 +65,29 @@ pub const EXPR_STR_COL_LE_COL: i64 = 45;
 pub const EXPR_EMIT_NULL: i64 = 46;
 
 // ---------------------------------------------------------------------------
+// Register file constants and null-mask helpers
+// ---------------------------------------------------------------------------
+
+pub const MAX_REGS: usize = 64;
+
+#[inline]
+fn set_null_bit(mask: u64, bit: usize, val: bool) -> u64 {
+    (mask & !(1u64 << bit)) | ((val as u64) << bit)
+}
+
+#[inline]
+fn prop_null1(mask: u64, dst: usize, a1: usize) -> u64 {
+    let n = (mask >> a1) & 1;
+    (mask & !(1u64 << dst)) | (n << dst)
+}
+
+#[inline]
+fn prop_null2(mask: u64, dst: usize, a1: usize, a2: usize) -> u64 {
+    let n = ((mask >> a1) | (mask >> a2)) & 1;
+    (mask & !(1u64 << dst)) | (n << dst)
+}
+
+// ---------------------------------------------------------------------------
 // ExprProgram — immutable bytecode container
 // ---------------------------------------------------------------------------
 
@@ -86,6 +109,18 @@ impl ExprProgram {
         const_strings: Vec<Vec<u8>>,
     ) -> Self {
         let num_instrs = code.len() as u32 / 4;
+        assert!(
+            num_regs as usize <= MAX_REGS,
+            "ExprProgram: num_regs={} exceeds MAX_REGS={}",
+            num_regs,
+            MAX_REGS
+        );
+        assert!(
+            num_regs == 0 || result_reg < num_regs,
+            "ExprProgram: result_reg={} >= num_regs={}",
+            result_reg,
+            num_regs
+        );
         let mut const_prefixes = Vec::with_capacity(const_strings.len());
         let mut const_lengths = Vec::with_capacity(const_strings.len());
         for s in &const_strings {
@@ -268,8 +303,8 @@ pub fn eval_predicate(
 ) -> (i64, bool) {
     let pki = pk_index as usize;
     let null_word = batch.get_null_word(row);
-    let mut regs = vec![0i64; prog.num_regs as usize];
-    let mut null = vec![false; prog.num_regs as usize];
+    let mut regs = [0i64; MAX_REGS];
+    let mut null_mask: u64 = 0;
 
     for i in 0..prog.num_instrs as usize {
         let base = i * 4;
@@ -281,68 +316,68 @@ pub fn eval_predicate(
         match op {
             EXPR_LOAD_COL_INT => {
                 let ci = a1 as usize;
-                null[dst] = is_col_null(null_word, ci, pki);
+                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, ci, pki));
                 regs[dst] = read_col_int(batch, row, ci, pki);
             }
             EXPR_LOAD_COL_FLOAT => {
                 let ci = a1 as usize;
-                null[dst] = is_col_null(null_word, ci, pki);
+                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, ci, pki));
                 regs[dst] = read_col_float(batch, row, ci, pki);
             }
             EXPR_LOAD_CONST => {
-                null[dst] = false;
+                null_mask &= !(1u64 << dst);
                 regs[dst] = (a2 << 32) | (a1 & 0xFFFF_FFFF);
             }
             EXPR_INT_ADD => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = regs[a1 as usize].wrapping_add(regs[a2 as usize]);
             }
             EXPR_INT_SUB => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = regs[a1 as usize].wrapping_sub(regs[a2 as usize]);
             }
             EXPR_INT_MUL => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = regs[a1 as usize].wrapping_mul(regs[a2 as usize]);
             }
             EXPR_INT_DIV => {
                 let d = regs[a2 as usize];
                 if d == 0 {
-                    null[dst] = true;
+                    null_mask |= 1u64 << dst;
                     regs[dst] = 0;
                 } else {
-                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                     regs[dst] = regs[a1 as usize].wrapping_div(d);
                 }
             }
             EXPR_INT_MOD => {
                 let d = regs[a2 as usize];
                 if d == 0 {
-                    null[dst] = true;
+                    null_mask |= 1u64 << dst;
                     regs[dst] = 0;
                 } else {
-                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                     regs[dst] = regs[a1 as usize].wrapping_rem(d);
                 }
             }
             EXPR_INT_NEG => {
-                null[dst] = null[a1 as usize];
+                null_mask = prop_null1(null_mask, dst, a1 as usize);
                 regs[dst] = regs[a1 as usize].wrapping_neg();
             }
             EXPR_FLOAT_ADD => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = float_to_bits(
                     bits_to_float(regs[a1 as usize]) + bits_to_float(regs[a2 as usize]),
                 );
             }
             EXPR_FLOAT_SUB => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = float_to_bits(
                     bits_to_float(regs[a1 as usize]) - bits_to_float(regs[a2 as usize]),
                 );
             }
             EXPR_FLOAT_MUL => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = float_to_bits(
                     bits_to_float(regs[a1 as usize]) * bits_to_float(regs[a2 as usize]),
                 );
@@ -350,43 +385,43 @@ pub fn eval_predicate(
             EXPR_FLOAT_DIV => {
                 let rhs = bits_to_float(regs[a2 as usize]);
                 if rhs == 0.0 {
-                    null[dst] = true;
+                    null_mask |= 1u64 << dst;
                     regs[dst] = 0;
                 } else {
-                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                     regs[dst] = float_to_bits(bits_to_float(regs[a1 as usize]) / rhs);
                 }
             }
             EXPR_FLOAT_NEG => {
-                null[dst] = null[a1 as usize];
+                null_mask = prop_null1(null_mask, dst, a1 as usize);
                 regs[dst] = float_to_bits(-bits_to_float(regs[a1 as usize]));
             }
             EXPR_CMP_EQ => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] == regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_CMP_NE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] != regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_CMP_GT => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] > regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_CMP_GE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] >= regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_CMP_LT => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] < regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_CMP_LE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] <= regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_FCMP_EQ => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     == bits_to_float(regs[a2 as usize])
                 {
@@ -396,7 +431,7 @@ pub fn eval_predicate(
                 };
             }
             EXPR_FCMP_NE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     != bits_to_float(regs[a2 as usize])
                 {
@@ -406,7 +441,7 @@ pub fn eval_predicate(
                 };
             }
             EXPR_FCMP_GT => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     > bits_to_float(regs[a2 as usize])
                 {
@@ -416,7 +451,7 @@ pub fn eval_predicate(
                 };
             }
             EXPR_FCMP_GE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     >= bits_to_float(regs[a2 as usize])
                 {
@@ -426,7 +461,7 @@ pub fn eval_predicate(
                 };
             }
             EXPR_FCMP_LT => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     < bits_to_float(regs[a2 as usize])
                 {
@@ -436,7 +471,7 @@ pub fn eval_predicate(
                 };
             }
             EXPR_FCMP_LE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     <= bits_to_float(regs[a2 as usize])
                 {
@@ -446,7 +481,7 @@ pub fn eval_predicate(
                 };
             }
             EXPR_BOOL_AND => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] != 0 && regs[a2 as usize] != 0 {
                     1
                 } else {
@@ -454,7 +489,7 @@ pub fn eval_predicate(
                 };
             }
             EXPR_BOOL_OR => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] != 0 || regs[a2 as usize] != 0 {
                     1
                 } else {
@@ -462,11 +497,11 @@ pub fn eval_predicate(
                 };
             }
             EXPR_BOOL_NOT => {
-                null[dst] = null[a1 as usize];
+                null_mask = prop_null1(null_mask, dst, a1 as usize);
                 regs[dst] = if regs[a1 as usize] == 0 { 1 } else { 0 };
             }
             EXPR_IS_NULL => {
-                null[dst] = false;
+                null_mask &= !(1u64 << dst);
                 regs[dst] = if is_col_null(null_word, a1 as usize, pki) {
                     1
                 } else {
@@ -474,7 +509,7 @@ pub fn eval_predicate(
                 };
             }
             EXPR_IS_NOT_NULL => {
-                null[dst] = false;
+                null_mask &= !(1u64 << dst);
                 regs[dst] = if is_col_null(null_word, a1 as usize, pki) {
                     0
                 } else {
@@ -482,12 +517,12 @@ pub fn eval_predicate(
                 };
             }
             EXPR_INT_TO_FLOAT => {
-                null[dst] = null[a1 as usize];
+                null_mask = prop_null1(null_mask, dst, a1 as usize);
                 regs[dst] = float_to_bits(regs[a1 as usize] as f64);
             }
             EXPR_STR_COL_EQ_CONST => {
-                null[dst] = is_col_null(null_word, a1 as usize, pki);
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                if (null_mask >> dst) & 1 == 0 {
                     let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
                     let ci = a2 as usize;
                     regs[dst] = if col_string_equals_const(
@@ -506,8 +541,8 @@ pub fn eval_predicate(
                 }
             }
             EXPR_STR_COL_LT_CONST => {
-                null[dst] = is_col_null(null_word, a1 as usize, pki);
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                if (null_mask >> dst) & 1 == 0 {
                     let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
                     let ci = a2 as usize;
                     let cmp = compare_col_string_vs_const(
@@ -523,8 +558,8 @@ pub fn eval_predicate(
                 }
             }
             EXPR_STR_COL_LE_CONST => {
-                null[dst] = is_col_null(null_word, a1 as usize, pki);
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                if (null_mask >> dst) & 1 == 0 {
                     let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
                     let ci = a2 as usize;
                     let cmp = compare_col_string_vs_const(
@@ -546,8 +581,8 @@ pub fn eval_predicate(
             EXPR_STR_COL_EQ_COL => {
                 let n_a1 = is_col_null(null_word, a1 as usize, pki);
                 let n_a2 = is_col_null(null_word, a2 as usize, pki);
-                null[dst] = n_a1 || n_a2;
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
+                if (null_mask >> dst) & 1 == 0 {
                     let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
                     let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
@@ -564,8 +599,8 @@ pub fn eval_predicate(
             EXPR_STR_COL_LT_COL => {
                 let n_a1 = is_col_null(null_word, a1 as usize, pki);
                 let n_a2 = is_col_null(null_word, a2 as usize, pki);
-                null[dst] = n_a1 || n_a2;
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
+                if (null_mask >> dst) & 1 == 0 {
                     let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
                     let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
@@ -582,8 +617,8 @@ pub fn eval_predicate(
             EXPR_STR_COL_LE_COL => {
                 let n_a1 = is_col_null(null_word, a1 as usize, pki);
                 let n_a2 = is_col_null(null_word, a2 as usize, pki);
-                null[dst] = n_a1 || n_a2;
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
+                if (null_mask >> dst) & 1 == 0 {
                     let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
                     let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
@@ -597,7 +632,6 @@ pub fn eval_predicate(
                     regs[dst] = 0;
                 }
             }
-            // EMIT, COPY_COL, EMIT_NULL: no-ops in predicate mode
             _ => {}
         }
     }
@@ -605,7 +639,10 @@ pub fn eval_predicate(
     if prog.num_regs == 0 {
         return (0, true);
     }
-    (regs[prog.result_reg as usize], null[prog.result_reg as usize])
+    (
+        regs[prog.result_reg as usize],
+        (null_mask >> prog.result_reg) & 1 != 0,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -631,8 +668,8 @@ pub fn eval_with_emit(
     emit_targets: &[EmitTarget],
 ) -> (i64, bool, u64) {
     let pki = pk_index as usize;
-    let mut regs = vec![0i64; prog.num_regs as usize];
-    let mut null = vec![false; prog.num_regs as usize];
+    let mut regs = [0i64; MAX_REGS];
+    let mut null_mask: u64 = 0;
     let mut emit_null_mask: u64 = 0;
     let mut emit_idx: usize = 0;
 
@@ -649,68 +686,68 @@ pub fn eval_with_emit(
             }
             EXPR_LOAD_COL_INT => {
                 let ci = a1 as usize;
-                null[dst] = is_col_null(null_word, ci, pki);
+                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, ci, pki));
                 regs[dst] = read_col_int(batch, row, ci, pki);
             }
             EXPR_LOAD_COL_FLOAT => {
                 let ci = a1 as usize;
-                null[dst] = is_col_null(null_word, ci, pki);
+                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, ci, pki));
                 regs[dst] = read_col_float(batch, row, ci, pki);
             }
             EXPR_LOAD_CONST => {
-                null[dst] = false;
+                null_mask &= !(1u64 << dst);
                 regs[dst] = (a2 << 32) | (a1 & 0xFFFF_FFFF);
             }
             EXPR_INT_ADD => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = regs[a1 as usize].wrapping_add(regs[a2 as usize]);
             }
             EXPR_INT_SUB => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = regs[a1 as usize].wrapping_sub(regs[a2 as usize]);
             }
             EXPR_INT_MUL => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = regs[a1 as usize].wrapping_mul(regs[a2 as usize]);
             }
             EXPR_INT_DIV => {
                 let d = regs[a2 as usize];
                 if d == 0 {
-                    null[dst] = true;
+                    null_mask |= 1u64 << dst;
                     regs[dst] = 0;
                 } else {
-                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                     regs[dst] = regs[a1 as usize].wrapping_div(d);
                 }
             }
             EXPR_INT_MOD => {
                 let d = regs[a2 as usize];
                 if d == 0 {
-                    null[dst] = true;
+                    null_mask |= 1u64 << dst;
                     regs[dst] = 0;
                 } else {
-                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                     regs[dst] = regs[a1 as usize].wrapping_rem(d);
                 }
             }
             EXPR_INT_NEG => {
-                null[dst] = null[a1 as usize];
+                null_mask = prop_null1(null_mask, dst, a1 as usize);
                 regs[dst] = regs[a1 as usize].wrapping_neg();
             }
             EXPR_FLOAT_ADD => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = float_to_bits(
                     bits_to_float(regs[a1 as usize]) + bits_to_float(regs[a2 as usize]),
                 );
             }
             EXPR_FLOAT_SUB => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = float_to_bits(
                     bits_to_float(regs[a1 as usize]) - bits_to_float(regs[a2 as usize]),
                 );
             }
             EXPR_FLOAT_MUL => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = float_to_bits(
                     bits_to_float(regs[a1 as usize]) * bits_to_float(regs[a2 as usize]),
                 );
@@ -718,43 +755,43 @@ pub fn eval_with_emit(
             EXPR_FLOAT_DIV => {
                 let rhs = bits_to_float(regs[a2 as usize]);
                 if rhs == 0.0 {
-                    null[dst] = true;
+                    null_mask |= 1u64 << dst;
                     regs[dst] = 0;
                 } else {
-                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                     regs[dst] = float_to_bits(bits_to_float(regs[a1 as usize]) / rhs);
                 }
             }
             EXPR_FLOAT_NEG => {
-                null[dst] = null[a1 as usize];
+                null_mask = prop_null1(null_mask, dst, a1 as usize);
                 regs[dst] = float_to_bits(-bits_to_float(regs[a1 as usize]));
             }
             EXPR_CMP_EQ => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] == regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_CMP_NE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] != regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_CMP_GT => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] > regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_CMP_GE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] >= regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_CMP_LT => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] < regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_CMP_LE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] <= regs[a2 as usize] { 1 } else { 0 };
             }
             EXPR_FCMP_EQ => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     == bits_to_float(regs[a2 as usize])
                 {
@@ -764,7 +801,7 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_FCMP_NE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     != bits_to_float(regs[a2 as usize])
                 {
@@ -774,7 +811,7 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_FCMP_GT => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     > bits_to_float(regs[a2 as usize])
                 {
@@ -784,7 +821,7 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_FCMP_GE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     >= bits_to_float(regs[a2 as usize])
                 {
@@ -794,7 +831,7 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_FCMP_LT => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     < bits_to_float(regs[a2 as usize])
                 {
@@ -804,7 +841,7 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_FCMP_LE => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if bits_to_float(regs[a1 as usize])
                     <= bits_to_float(regs[a2 as usize])
                 {
@@ -814,7 +851,7 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_BOOL_AND => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] != 0 && regs[a2 as usize] != 0 {
                     1
                 } else {
@@ -822,7 +859,7 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_BOOL_OR => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
+                null_mask = prop_null2(null_mask, dst, a1 as usize, a2 as usize);
                 regs[dst] = if regs[a1 as usize] != 0 || regs[a2 as usize] != 0 {
                     1
                 } else {
@@ -830,11 +867,11 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_BOOL_NOT => {
-                null[dst] = null[a1 as usize];
+                null_mask = prop_null1(null_mask, dst, a1 as usize);
                 regs[dst] = if regs[a1 as usize] == 0 { 1 } else { 0 };
             }
             EXPR_IS_NULL => {
-                null[dst] = false;
+                null_mask &= !(1u64 << dst);
                 regs[dst] = if is_col_null(null_word, a1 as usize, pki) {
                     1
                 } else {
@@ -842,7 +879,7 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_IS_NOT_NULL => {
-                null[dst] = false;
+                null_mask &= !(1u64 << dst);
                 regs[dst] = if is_col_null(null_word, a1 as usize, pki) {
                     0
                 } else {
@@ -850,14 +887,14 @@ pub fn eval_with_emit(
                 };
             }
             EXPR_INT_TO_FLOAT => {
-                null[dst] = null[a1 as usize];
+                null_mask = prop_null1(null_mask, dst, a1 as usize);
                 regs[dst] = float_to_bits(regs[a1 as usize] as f64);
             }
             EXPR_EMIT => {
                 if emit_idx < emit_targets.len() {
                     let et = &emit_targets[emit_idx];
                     let ptr = unsafe { et.base.add(row * et.stride) };
-                    if null[a1 as usize] {
+                    if (null_mask >> a1) & 1 != 0 {
                         unsafe {
                             std::ptr::write_unaligned(ptr as *mut i64, 0);
                         }
@@ -871,8 +908,8 @@ pub fn eval_with_emit(
                 }
             }
             EXPR_STR_COL_EQ_CONST => {
-                null[dst] = is_col_null(null_word, a1 as usize, pki);
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                if (null_mask >> dst) & 1 == 0 {
                     let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
                     let ci = a2 as usize;
                     regs[dst] = if col_string_equals_const(
@@ -891,8 +928,8 @@ pub fn eval_with_emit(
                 }
             }
             EXPR_STR_COL_LT_CONST => {
-                null[dst] = is_col_null(null_word, a1 as usize, pki);
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                if (null_mask >> dst) & 1 == 0 {
                     let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
                     let ci = a2 as usize;
                     let cmp = compare_col_string_vs_const(
@@ -908,8 +945,8 @@ pub fn eval_with_emit(
                 }
             }
             EXPR_STR_COL_LE_CONST => {
-                null[dst] = is_col_null(null_word, a1 as usize, pki);
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, is_col_null(null_word, a1 as usize, pki));
+                if (null_mask >> dst) & 1 == 0 {
                     let (s, blob) = get_str_struct(batch, row, a1 as usize, pki);
                     let ci = a2 as usize;
                     let cmp = compare_col_string_vs_const(
@@ -931,8 +968,8 @@ pub fn eval_with_emit(
             EXPR_STR_COL_EQ_COL => {
                 let n_a1 = is_col_null(null_word, a1 as usize, pki);
                 let n_a2 = is_col_null(null_word, a2 as usize, pki);
-                null[dst] = n_a1 || n_a2;
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
+                if (null_mask >> dst) & 1 == 0 {
                     let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
                     let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
@@ -949,8 +986,8 @@ pub fn eval_with_emit(
             EXPR_STR_COL_LT_COL => {
                 let n_a1 = is_col_null(null_word, a1 as usize, pki);
                 let n_a2 = is_col_null(null_word, a2 as usize, pki);
-                null[dst] = n_a1 || n_a2;
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
+                if (null_mask >> dst) & 1 == 0 {
                     let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
                     let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
@@ -967,8 +1004,8 @@ pub fn eval_with_emit(
             EXPR_STR_COL_LE_COL => {
                 let n_a1 = is_col_null(null_word, a1 as usize, pki);
                 let n_a2 = is_col_null(null_word, a2 as usize, pki);
-                null[dst] = n_a1 || n_a2;
-                if !null[dst] {
+                null_mask = set_null_bit(null_mask, dst, n_a1 || n_a2);
+                if (null_mask >> dst) & 1 == 0 {
                     let (s1, blob1) = get_str_struct(batch, row, a1 as usize, pki);
                     let (s2, blob2) = get_str_struct(batch, row, a2 as usize, pki);
                     regs[dst] = if compare_german_strings(s1, blob1, s2, blob2)
@@ -991,7 +1028,7 @@ pub fn eval_with_emit(
     }
     (
         regs[prog.result_reg as usize],
-        null[prog.result_reg as usize],
+        (null_mask >> prog.result_reg) & 1 != 0,
         emit_null_mask,
     )
 }
