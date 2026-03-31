@@ -1516,3 +1516,108 @@ class TestReduceRetraction:
             except Exception:
                 pass
             client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# TestReduceStringGIPath (CircuitBuilder) — GI-path regression
+# ---------------------------------------------------------------------------
+
+def _make_grp_str_table(client, sn):
+    """Create (pk U64 PK, grp I64, val STRING nullable) table. unique_pk=False."""
+    cols = [
+        gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+        gnitz.ColumnDef("grp", gnitz.TypeCode.I64),
+        gnitz.ColumnDef("val", gnitz.TypeCode.STRING, is_nullable=True),
+    ]
+    schema = gnitz.Schema(cols)
+    tname = "t_" + _uid()
+    tid = client.create_table(sn, tname, cols, unique_pk=False)
+    return tid, schema, tname
+
+
+def _make_reduce_str_view(client, sn, tid, agg_func_id, vname=None):
+    """Reduce view: group_by=[1](grp), agg=[2](val STRING). Returns (vid, vname).
+
+    The output agg column is I64 (not STRING): the accumulator stores only the
+    first 8 bytes of the German string as a comparison key (output_column_type()
+    returns TYPE_I64 for MIN/MAX regardless of the input column type).
+    """
+    if vname is None:
+        vname = "v_" + _uid()
+    cb = client.circuit_builder(source_table_id=tid)
+    inp = cb.input_delta()
+    red = cb.reduce(inp, group_by_cols=[1], agg_func_id=agg_func_id, agg_col_idx=2)
+    cb.sink(red)
+    circuit = cb.build()
+    out_cols = [
+        gnitz.ColumnDef("pk", gnitz.TypeCode.U128, primary_key=True),
+        gnitz.ColumnDef("grp", gnitz.TypeCode.I64),
+        gnitz.ColumnDef("agg", gnitz.TypeCode.I64, is_nullable=True),
+    ]
+    vid = client.create_view_with_circuit(sn, vname, circuit, out_cols)
+    return vid, vname
+
+
+def _push_str_grp(client, tid, schema, rows, weight=1):
+    """Push [(pk, grp, val_str), ...] with given weight."""
+    batch = gnitz.ZSetBatch(schema)
+    for pk, grp, val in rows:
+        batch.append(pk=pk, grp=grp, val=val, weight=weight)
+    client.push(tid, batch)
+
+
+def _scan_str_reduce(client, vid):
+    """Scan reduce view; return {grp_val: agg_str} for positive-weight rows."""
+    return {row[1]: row[2] for row in client.scan(vid) if row.weight > 0}
+
+
+class TestReduceStringGIPath:
+
+    def test_max_string_gi_path_same_pk_multiple_payloads(self, client):
+        """MAX on STRING col (GI path): history replay must loop over all payloads at each PK.
+
+        unique_pk=False allows (PK=1, grp=1, val="apple") and
+        (PK=1, grp=1, val="zebra") to coexist.  On tick 2 we retract
+        "apple" from PK=1.  The GI path must seek trace_in to PK=1 and
+        advance past ALL matching (PK, payload) entries — not just the first.
+
+        Bug (if instead of while): only "apple" is collected from PK=1;
+        replay = {apple+1, apple−1} → empty → MAX changes to "mango"'s
+        compare key (from PK=2).
+
+        Fix (while + advance): both "apple" and "zebra" are collected;
+        replay = {apple+1, zebra+1, apple−1} → {zebra+1} → MAX unchanged.
+        """
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid, schema, tname = _make_grp_str_table(client, sn)
+            vid, vname = _make_reduce_str_view(client, sn, tid, agg_func_id=4)  # MAX
+
+            # Tick 1: push apple and zebra at PK=1, mango at PK=2.
+            # The output agg is the I64 compare key of whichever string wins MAX.
+            _push_str_grp(client, tid, schema,
+                          [(1, 1, "apple"), (1, 1, "zebra"), (2, 1, "mango")])
+            r1 = _scan_str_reduce(client, vid)
+            assert 1 in r1, "group 1 must have an aggregate after tick 1"
+
+            # Tick 2: retract "apple" from PK=1.
+            # GI loop must collect both apple and zebra from trace_in at PK=1,
+            # then subtract apple (from delta), leaving zebra as the new MAX.
+            # The MAX compare key must NOT change vs. tick 1.
+            _push_str_grp(client, tid, schema, [(1, 1, "apple")], weight=-1)
+            r2 = _scan_str_reduce(client, vid)
+            assert r1 == r2, (
+                "MAX must be unchanged after retracting apple: "
+                "zebra still present at PK=1 but GI bug drops it from replay"
+            )
+        finally:
+            try:
+                client.execute_sql("DROP VIEW " + vname, schema_name=sn)
+            except Exception:
+                pass
+            try:
+                client.execute_sql("DROP TABLE " + tname, schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)

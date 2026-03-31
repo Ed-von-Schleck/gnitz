@@ -2267,11 +2267,12 @@ pub fn op_reduce(
                                 };
                                 if let Some(ref mut ti) = trace_in {
                                     ti.seek(spk_lo, spk_hi);
-                                    if ti.valid
+                                    while ti.valid
                                         && ti.current_key_lo == spk_lo
                                         && ti.current_key_hi == spk_hi
                                     {
                                         append_cursor_row_to_batch(&mut replay, ti, input_schema);
+                                        ti.advance();
                                     }
                                 }
                             }
@@ -3221,5 +3222,179 @@ mod tests {
         assert!(out.sorted);
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!(get_payload_i64(&out, 1), 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reduce GI-path regression: same PK, multiple payloads
+    // -----------------------------------------------------------------------
+
+    /// 3-column source schema: U64 pk (pk_index=0), I64 grp, STRING val (nullable).
+    fn make_schema_3col_grp_str() -> SchemaDescriptor {
+        let mut s = SchemaDescriptor {
+            num_columns: 3,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        s.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        s.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+        s.columns[2] = SchemaColumn {
+            type_code: type_code::STRING, size: 16, nullable: 1, _pad: 0,
+        };
+        s
+    }
+
+    /// 3-column reduce output schema: U128 pk (pk_index=0), I64 grp, I64 agg (nullable).
+    ///
+    /// The accumulator stores only the first 8 bytes of the German string as i64
+    /// (UniversalAccumulator.output_column_type() returns TYPE_I64 for STRING MAX).
+    fn make_reduce_str_out_schema() -> SchemaDescriptor {
+        let mut s = SchemaDescriptor {
+            num_columns: 3,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        s.columns[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
+        s.columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+        s.columns[2] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
+        s
+    }
+
+    /// Build a 3-column OwnedBatch (U64 pk, I64 grp, STRING val) from tuples.
+    /// All strings must be <= 12 bytes (inline, no blob needed).
+    fn make_batch_3col_grp_str(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, i64, i64, &str)],
+    ) -> OwnedBatch {
+        let n = rows.len();
+        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        b.count = 0;
+        for &(pk, w, grp, val) in rows {
+            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            b.weight.extend_from_slice(&w.to_le_bytes());
+            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            b.col_data[0].extend_from_slice(&grp.to_le_bytes());
+            let bytes = val.as_bytes();
+            assert!(bytes.len() <= SHORT_STRING_THRESHOLD, "use inline strings only");
+            let mut gs = [0u8; 16];
+            gs[0..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            gs[4..4 + bytes.len()].copy_from_slice(bytes);
+            b.col_data[1].extend_from_slice(&gs);
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    /// Build a GI OwnedBatch (U128 pk: ck_lo=source_pk_lo, ck_hi=gc_u64; I64 payload: spk_hi).
+    fn make_gi_batch(rows: &[(u64, u64, i64)]) -> OwnedBatch {
+        let gi_schema = make_gi_schema();
+        let n = rows.len();
+        let mut b = OwnedBatch::with_schema(gi_schema, n.max(1));
+        b.count = 0;
+        for &(ck_lo, gc_u64, spk_hi) in rows {
+            b.pk_lo.extend_from_slice(&ck_lo.to_le_bytes());
+            b.pk_hi.extend_from_slice(&gc_u64.to_le_bytes());
+            b.weight.extend_from_slice(&1i64.to_le_bytes());
+            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            b.col_data[0].extend_from_slice(&spk_hi.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    /// GI path bug: same PK, two different string payloads — the `if` must be `while`.
+    ///
+    /// Scenario (simulates tick 2 of a reduce):
+    ///   trace_in = {(pk=1,grp=1,val="apple",w=+1), (pk=1,grp=1,val="zebra",w=+1)}
+    ///   trace_out = empty (no prior aggregate)
+    ///   delta     = {(pk=1,grp=1,val="apple",w=-1)}
+    ///   GI        = {(ck_lo=1, ck_hi=group=1)}
+    ///
+    /// With the fix, the GI loop reads both apple and zebra from trace_in.
+    /// The replay is {apple+1, zebra+1, apple−1} → consolidated {zebra+1}.
+    /// MAX = zebra's 8-byte compare key (first 8 bytes of the German string).
+    ///
+    /// With the bug (if instead of while), only apple is read from trace_in.
+    /// Replay = {apple+1, apple−1} → consolidated {} → empty → no output row.
+    #[test]
+    fn test_reduce_gi_same_pk_multiple_payloads() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let input_schema = make_schema_3col_grp_str();
+        let output_schema = make_reduce_str_out_schema();
+        let gi_schema = make_gi_schema();
+
+        // trace_in: apple and zebra both at PK=1 (apple sorts first by payload)
+        let ti_batch = Arc::new(make_batch_3col_grp_str(
+            &input_schema,
+            &[(1, 1, 1, "apple"), (1, 1, 1, "zebra")],
+        ));
+
+        // GI: only PK=1 → group gc_u64=1
+        let gi_batch = Arc::new(make_gi_batch(&[(1, 1, 0)]));
+
+        // trace_out: empty (no previous aggregate, no retraction emitted)
+        let to_batch = Arc::new(OwnedBatch::empty(output_schema.num_columns as usize - 1));
+
+        // delta: retract apple at PK=1
+        let delta = make_batch_3col_grp_str(&input_schema, &[(1, -1, 1, "apple")]);
+
+        let mut ti_handle =
+            unsafe { create_cursor_from_snapshots(&[ti_batch], &[], input_schema) };
+        let mut gi_handle =
+            unsafe { create_cursor_from_snapshots(&[gi_batch], &[], gi_schema) };
+        let mut to_handle =
+            unsafe { create_cursor_from_snapshots(&[to_batch], &[], output_schema) };
+
+        // MAX on STRING agg col (col_idx=2, type=STRING); no AVI
+        let agg_desc = AggDescriptor {
+            col_idx: 2,
+            agg_op: AGG_MAX,
+            col_type_code: type_code::STRING,
+            _pad: [0; 2],
+        };
+
+        let (out, _fin) = op_reduce(
+            &delta,
+            Some(&mut ti_handle.cursor),
+            &mut to_handle.cursor,
+            &input_schema,
+            &output_schema,
+            &[1u32],            // group_by_cols: col 1 (grp)
+            &[agg_desc],
+            None,               // avi_cursor
+            false,              // avi_for_max
+            type_code::STRING,  // avi_agg_col_type_code (unused; no AVI)
+            &[1u32],            // avi_group_by_cols (unused)
+            None,               // avi_input_schema
+            Some(&mut gi_handle.cursor), // gi_cursor
+            1u32,               // gi_col_idx: grp column
+            type_code::I64,     // gi_col_type_code
+            None,               // finalize_prog
+            None,               // finalize_out_schema
+        );
+
+        // The accumulator stores the first 8 bytes of the German string as i64.
+        // "zebra" first 8 bytes: [len=5, 'z'=122, 'e'=101, 'b'=98, 'r'=114]
+        // "apple" first 8 bytes: [len=5, 'a'=97,  'p'=112, 'p'=112, 'l'=108]
+        let zebra_ck = i64::from_le_bytes([5, 0, 0, 0, 122, 101, 98, 114]);
+        let apple_ck = i64::from_le_bytes([5, 0, 0, 0, 97, 112, 112, 108]);
+        assert!(zebra_ck > apple_ck, "test invariant: zebra_ck > apple_ck");
+
+        // With fix: replay = {apple+1, zebra+1, apple−1} → {zebra+1}; one output row.
+        // With bug: replay = {apple+1, apple−1} → {}; no output row.
+        assert_eq!(out.count, 1,
+            "GI loop must be `while` to include zebra after apple is retracted; \
+             `if` leaves replay empty → no output");
+
+        // Output payload layout: col_data[0]=grp(I64), col_data[1]=agg(I64)
+        let agg = crate::util::read_i64_le(&out.col_data[1], 0);
+        assert_eq!(agg, zebra_ck,
+            "MAX of {{zebra+1}} must be zebra_ck; got {agg} (apple_ck={apple_ck})");
     }
 }
