@@ -177,6 +177,34 @@ eci = ExternalCompilationInfo(
         "  const void *partial_schema,"
         "  const void *agg_descs, uint32_t num_aggs,"
         "  void **out_result);",
+        # VM program lifecycle
+        "void *gnitz_vm_program_create("
+        "  const uint8_t *instr_data, uint32_t instr_data_len,"
+        "  const void *reg_schemas, const uint8_t *reg_kinds,"
+        "  uint32_t num_registers,"
+        "  void **func_handles, uint32_t num_funcs,"
+        "  void **table_handles, uint32_t num_tables,"
+        "  void **expr_handles, uint32_t num_exprs,"
+        "  const void *agg_descs_buf, uint32_t num_agg_descs,"
+        "  const uint32_t *group_cols_buf, uint32_t num_group_cols,"
+        "  const void *extra_schemas, uint32_t num_extra_schemas);",
+        "int32_t gnitz_vm_execute_epoch("
+        "  void *handle, void *input_batch,"
+        "  uint16_t input_reg_idx, uint16_t output_reg_idx,"
+        "  void **cursor_handles, uint32_t num_cursors,"
+        "  void **out_result);",
+        "void gnitz_vm_program_free(void *handle);",
+        # scan trace
+        "int32_t gnitz_op_scan_trace("
+        "  void *cursor, const void *schema, int32_t chunk_limit,"
+        "  void **out_result);",
+        # integrate with indexes
+        "int32_t gnitz_op_integrate_with_indexes("
+        "  const void *batch, void *target_table, const void *input_schema,"
+        "  void *gi_table, uint32_t gi_col_idx, uint8_t gi_col_type_code,"
+        "  void *avi_table, int32_t avi_for_max, uint8_t avi_agg_col_type_code,"
+        "  const uint32_t *avi_group_by_cols, uint32_t avi_num_group_by_cols,"
+        "  const void *avi_input_schema, uint32_t avi_agg_col_idx);",
         # shard index (opaque FLSM lifecycle handle)
         "void *gnitz_shard_index_create(uint32_t table_id, char *output_dir, void *schema_desc);",
         "void gnitz_shard_index_close(void *handle);",
@@ -806,6 +834,56 @@ _op_semi_join_dd = rffi.llexternal(
 _op_join_dd = rffi.llexternal(
     "gnitz_op_join_dd",
     [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_vm_program_create = rffi.llexternal(
+    "gnitz_vm_program_create",
+    [rffi.CCHARP, rffi.UINT,             # instr_data, instr_data_len
+     rffi.VOIDP, rffi.CCHARP,            # reg_schemas, reg_kinds
+     rffi.UINT,                           # num_registers
+     rffi.VOIDPP, rffi.UINT,             # func_handles, num_funcs
+     rffi.VOIDPP, rffi.UINT,             # table_handles, num_tables
+     rffi.VOIDPP, rffi.UINT,             # expr_handles, num_exprs
+     rffi.VOIDP, rffi.UINT,              # agg_descs_buf, num_agg_descs
+     rffi.UINTP, rffi.UINT,              # group_cols_buf, num_group_cols
+     rffi.VOIDP, rffi.UINT],             # extra_schemas, num_extra_schemas
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_vm_execute_epoch = rffi.llexternal(
+    "gnitz_vm_execute_epoch",
+    [rffi.VOIDP, rffi.VOIDP,             # handle, input_batch
+     rffi.USHORT, rffi.USHORT,           # input_reg_idx, output_reg_idx
+     rffi.VOIDPP, rffi.UINT,             # cursor_handles, num_cursors
+     rffi.VOIDPP],                        # out_result
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_vm_program_free = rffi.llexternal(
+    "gnitz_vm_program_free",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_op_scan_trace = rffi.llexternal(
+    "gnitz_op_scan_trace",
+    [rffi.VOIDP, rffi.VOIDP, rffi.INT, rffi.VOIDPP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_op_integrate_with_indexes = rffi.llexternal(
+    "gnitz_op_integrate_with_indexes",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,
+     rffi.VOIDP, rffi.UINT, rffi.UCHAR,
+     rffi.VOIDP, rffi.INT, rffi.UCHAR,
+     rffi.UINTP, rffi.UINT,
+     rffi.VOIDP, rffi.UINT],
     rffi.INT,
     compilation_info=eci,
 )

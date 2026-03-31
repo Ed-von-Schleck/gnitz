@@ -21,4 +21,5 @@ pub mod partitioned_table;
 pub mod expr;
 pub mod scalar_func;
 pub mod ops;
+pub mod vm;
 pub mod ffi;

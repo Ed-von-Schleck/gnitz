@@ -1189,6 +1189,489 @@ pub extern "C" fn gnitz_op_gather_reduce(
 }
 
 // ---------------------------------------------------------------------------
+// Scan trace
+// ---------------------------------------------------------------------------
+
+/// Scan rows from a cursor into a new OwnedBatch.
+#[no_mangle]
+pub extern "C" fn gnitz_op_scan_trace(
+    cursor_handle: *mut libc::c_void,
+    schema_desc: *const crate::compact::SchemaDescriptor,
+    chunk_limit: i32,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if cursor_handle.is_null() || schema_desc.is_null() || out_result.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let ch = unsafe { &mut *(cursor_handle as *mut crate::read_cursor::CursorHandle) };
+        let schema = unsafe { &*schema_desc };
+        let output = crate::ops::op_scan_trace(&mut ch.cursor, schema, chunk_limit);
+        unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
+// Integrate with indexes
+// ---------------------------------------------------------------------------
+
+/// Integrate a batch into a table with optional GI/AVI index population.
+#[no_mangle]
+pub extern "C" fn gnitz_op_integrate_with_indexes(
+    batch_handle: *const libc::c_void,
+    target_table: *mut libc::c_void,
+    input_schema: *const crate::compact::SchemaDescriptor,
+    // GI params (all null/0 if no GI)
+    gi_table: *mut libc::c_void,
+    gi_col_idx: u32,
+    gi_col_type_code: u8,
+    // AVI params (all null/0 if no AVI)
+    avi_table: *mut libc::c_void,
+    avi_for_max: i32,
+    avi_agg_col_type_code: u8,
+    avi_group_by_cols: *const u32,
+    avi_num_group_by_cols: u32,
+    avi_input_schema: *const crate::compact::SchemaDescriptor,
+    avi_agg_col_idx: u32,
+) -> i32 {
+    if batch_handle.is_null() || input_schema.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let batch = unsafe { &*(batch_handle as *const crate::memtable::OwnedBatch) };
+        let schema = unsafe { &*input_schema };
+
+        let target = if target_table.is_null() {
+            None
+        } else {
+            Some(unsafe { &mut *(target_table as *mut crate::table::Table) })
+        };
+
+        let gi = if gi_table.is_null() {
+            None
+        } else {
+            Some(crate::ops::GiDesc {
+                table: gi_table as *mut crate::table::Table,
+                col_idx: gi_col_idx,
+                col_type_code: gi_col_type_code,
+            })
+        };
+
+        let avi = if avi_table.is_null() {
+            None
+        } else {
+            let gcols = if avi_group_by_cols.is_null() || avi_num_group_by_cols == 0 {
+                Vec::new()
+            } else {
+                unsafe { slice::from_raw_parts(avi_group_by_cols, avi_num_group_by_cols as usize) }.to_vec()
+            };
+            let avi_schema = if avi_input_schema.is_null() {
+                *schema
+            } else {
+                unsafe { *avi_input_schema }
+            };
+            Some(crate::ops::AviDesc {
+                table: avi_table as *mut crate::table::Table,
+                for_max: avi_for_max != 0,
+                agg_col_type_code: avi_agg_col_type_code,
+                group_by_cols: gcols,
+                input_schema: avi_schema,
+                agg_col_idx: avi_agg_col_idx,
+            })
+        };
+
+        crate::ops::op_integrate_with_indexes(batch, target, schema, gi.as_ref(), avi.as_ref())
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
+// VM: program lifecycle and execution
+// ---------------------------------------------------------------------------
+
+/// Packed instruction format (little-endian, per instruction):
+///   [u8  opcode]
+///   [u16 slot0] [u16 slot1] [u16 slot2] [u16 slot3] [u16 slot4] [u16 slot5]
+///   [u32 inline_data_len]
+///   [u8... inline_data]
+///
+/// Opcode encoding matches gnitz/core/opcodes.py:
+///   0=HALT, 1=FILTER, 2=MAP, 3=NEGATE, 4=UNION, 5=JOIN_DT, 6=JOIN_DD,
+///   7=INTEGRATE, 8=DELAY, 9=REDUCE, 10=DISTINCT, 11=SCAN_TRACE,
+///   12=SEEK_TRACE, 15=CLEAR_DELTAS, 16=ANTI_JOIN_DT, 17=ANTI_JOIN_DD,
+///   18=SEMI_JOIN_DT, 19=SEMI_JOIN_DD, 22=JOIN_DT_OUTER, 24=GATHER_REDUCE
+///
+/// Slot assignments per opcode (0xFFFF = unused):
+///   HALT:           no slots
+///   CLEAR_DELTAS:   no slots
+///   DELAY:          s0=src, s1=dst
+///   SCAN_TRACE:     s0=trace_reg, s1=out_reg; inline: [i32 chunk_limit]
+///   SEEK_TRACE:     s0=trace_reg, s1=key_reg
+///   FILTER:         s0=in_reg, s1=out_reg, s2=func_idx
+///   MAP:            s0=in_reg, s1=out_reg, s2=func_idx, s3=out_schema_idx; inline: [i32 reindex_col]
+///   NEGATE:         s0=in_reg, s1=out_reg
+///   UNION:          s0=in_a, s1=in_b, s2=out_reg; inline: [u8 has_b]
+///   DISTINCT:       s0=in_reg, s1=hist_reg, s2=out_reg
+///   JOIN_DT:        s0=delta_reg, s1=trace_reg, s2=out_reg, s3=right_schema_idx
+///   JOIN_DD:        s0=a_reg, s1=b_reg, s2=out_reg, s3=right_schema_idx
+///   JOIN_DT_OUTER:  s0=delta_reg, s1=trace_reg, s2=out_reg, s3=right_schema_idx
+///   ANTI_JOIN_DT:   s0=delta_reg, s1=trace_reg, s2=out_reg
+///   ANTI_JOIN_DD:   s0=a_reg, s1=b_reg, s2=out_reg
+///   SEMI_JOIN_DT:   s0=delta_reg, s1=trace_reg, s2=out_reg
+///   SEMI_JOIN_DD:   s0=a_reg, s1=b_reg, s2=out_reg
+///   INTEGRATE:      s0=in_reg; inline: [i32 table_idx, u8 has_gi, u8 has_avi,
+///                     if has_gi: u16 gi_table_idx, u32 gi_col_idx, u8 gi_col_type_code,
+///                     if has_avi: u16 avi_table_idx, u8 avi_for_max, u8 avi_agg_col_type_code,
+///                       u32 avi_group_cols_offset, u16 avi_group_cols_count,
+///                       u16 avi_input_schema_idx, u32 avi_agg_col_idx]
+///   REDUCE:         s0=in_reg, s1=trace_out_reg, s2=out_reg, s3=output_schema_idx;
+///                   inline: [i16 trace_in_reg, i16 fin_out_reg,
+///                     u32 agg_descs_offset, u16 agg_descs_count,
+///                     u32 group_cols_offset, u16 group_cols_count,
+///                     i16 avi_trace_reg, u8 avi_for_max, u8 avi_agg_col_type_code,
+///                     u32 avi_group_cols_offset, u16 avi_group_cols_count,
+///                     i16 avi_input_schema_idx, u32 avi_agg_col_idx,
+///                     i16 gi_trace_reg, u32 gi_col_idx, u8 gi_col_type_code,
+///                     i16 finalize_func_idx, i16 finalize_schema_idx]
+///   GATHER_REDUCE:  s0=in_reg, s1=trace_out_reg, s2=out_reg;
+///                   inline: [u32 agg_descs_offset, u16 agg_descs_count]
+
+fn read_u8(data: &[u8], pos: &mut usize) -> u8 {
+    let v = data[*pos];
+    *pos += 1;
+    v
+}
+fn read_u16(data: &[u8], pos: &mut usize) -> u16 {
+    let v = u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap());
+    *pos += 2;
+    v
+}
+fn read_i16(data: &[u8], pos: &mut usize) -> i16 {
+    let v = i16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap());
+    *pos += 2;
+    v
+}
+fn read_u32(data: &[u8], pos: &mut usize) -> u32 {
+    let v = u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap());
+    *pos += 4;
+    v
+}
+fn read_i32(data: &[u8], pos: &mut usize) -> i32 {
+    let v = i32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap());
+    *pos += 4;
+    v
+}
+
+fn deserialize_instructions(data: &[u8]) -> Vec<crate::vm::Instr> {
+    let mut instrs = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let opcode = read_u8(data, &mut pos);
+        let s0 = read_u16(data, &mut pos);
+        let s1 = read_u16(data, &mut pos);
+        let s2 = read_u16(data, &mut pos);
+        let s3 = read_u16(data, &mut pos);
+        let _s4 = read_u16(data, &mut pos);
+        let _s5 = read_u16(data, &mut pos);
+        let inline_len = read_u32(data, &mut pos) as usize;
+        let inline_start = pos;
+        let mut ipos = pos; // position within inline data
+
+        let instr = match opcode {
+            0 => crate::vm::Instr::Halt,
+            15 => crate::vm::Instr::ClearDeltas,
+            8 => crate::vm::Instr::Delay { src: s0, dst: s1 },
+            11 => { // SCAN_TRACE
+                let chunk_limit = read_i32(data, &mut ipos);
+                crate::vm::Instr::ScanTrace { trace_reg: s0, out_reg: s1, chunk_limit }
+            }
+            12 => crate::vm::Instr::SeekTrace { trace_reg: s0, key_reg: s1 },
+            1 => crate::vm::Instr::Filter { in_reg: s0, out_reg: s1, func_idx: s2 },
+            2 => { // MAP
+                let reindex_col = read_i32(data, &mut ipos);
+                crate::vm::Instr::Map { in_reg: s0, out_reg: s1, func_idx: s2, out_schema_idx: s3, reindex_col }
+            }
+            3 => crate::vm::Instr::Negate { in_reg: s0, out_reg: s1 },
+            4 => { // UNION
+                let has_b = if inline_len > 0 { read_u8(data, &mut ipos) != 0 } else { s1 != 0xFFFF };
+                crate::vm::Instr::Union { in_a: s0, in_b: s1, has_b, out_reg: s2 }
+            }
+            10 => {
+                let hist_table_idx = if inline_len > 0 { read_i16(data, &mut ipos) } else { -1 };
+                crate::vm::Instr::Distinct { in_reg: s0, hist_reg: s1, out_reg: s2, hist_table_idx }
+            }
+            5 => crate::vm::Instr::JoinDT { delta_reg: s0, trace_reg: s1, out_reg: s2, right_schema_idx: s3 },
+            6 => crate::vm::Instr::JoinDD { a_reg: s0, b_reg: s1, out_reg: s2, right_schema_idx: s3 },
+            22 => crate::vm::Instr::JoinDTOuter { delta_reg: s0, trace_reg: s1, out_reg: s2, right_schema_idx: s3 },
+            16 => crate::vm::Instr::AntiJoinDT { delta_reg: s0, trace_reg: s1, out_reg: s2 },
+            17 => crate::vm::Instr::AntiJoinDD { a_reg: s0, b_reg: s1, out_reg: s2 },
+            18 => crate::vm::Instr::SemiJoinDT { delta_reg: s0, trace_reg: s1, out_reg: s2 },
+            19 => crate::vm::Instr::SemiJoinDD { a_reg: s0, b_reg: s1, out_reg: s2 },
+            7 => { // INTEGRATE
+                let table_idx = read_i32(data, &mut ipos);
+                let has_gi = read_u8(data, &mut ipos) != 0;
+                let has_avi = read_u8(data, &mut ipos) != 0;
+                let gi = if has_gi {
+                    let gi_table_idx = read_u16(data, &mut ipos);
+                    let gi_col_idx = read_u32(data, &mut ipos);
+                    let gi_col_type_code = read_u8(data, &mut ipos);
+                    Some(crate::vm::IntegrateGi { table_idx: gi_table_idx, col_idx: gi_col_idx, col_type_code: gi_col_type_code })
+                } else { None };
+                let avi = if has_avi {
+                    let avi_table_idx = read_u16(data, &mut ipos);
+                    let avi_for_max = read_u8(data, &mut ipos) != 0;
+                    let avi_agg_col_type_code = read_u8(data, &mut ipos);
+                    let avi_group_cols_offset = read_u32(data, &mut ipos);
+                    let avi_group_cols_count = read_u16(data, &mut ipos);
+                    let avi_input_schema_idx = read_u16(data, &mut ipos);
+                    let avi_agg_col_idx = read_u32(data, &mut ipos);
+                    Some(crate::vm::IntegrateAvi {
+                        table_idx: avi_table_idx, for_max: avi_for_max,
+                        agg_col_type_code: avi_agg_col_type_code,
+                        group_cols_offset: avi_group_cols_offset,
+                        group_cols_count: avi_group_cols_count,
+                        input_schema_idx: avi_input_schema_idx,
+                        agg_col_idx: avi_agg_col_idx,
+                    })
+                } else { None };
+                crate::vm::Instr::Integrate { in_reg: s0, table_idx, gi, avi }
+            }
+            9 => { // REDUCE
+                let trace_in_reg = read_i16(data, &mut ipos);
+                let fin_out_reg = read_i16(data, &mut ipos);
+                let agg_descs_offset = read_u32(data, &mut ipos);
+                let agg_descs_count = read_u16(data, &mut ipos);
+                let group_cols_offset = read_u32(data, &mut ipos);
+                let group_cols_count = read_u16(data, &mut ipos);
+                let avi_table_idx = read_i16(data, &mut ipos);
+                let avi_for_max = read_u8(data, &mut ipos) != 0;
+                let avi_agg_col_type_code = read_u8(data, &mut ipos);
+                let avi_group_cols_offset = read_u32(data, &mut ipos);
+                let avi_group_cols_count = read_u16(data, &mut ipos);
+                let avi_input_schema_idx = read_i16(data, &mut ipos);
+                let avi_agg_col_idx = read_u32(data, &mut ipos);
+                let gi_table_idx = read_i16(data, &mut ipos);
+                let gi_col_idx = read_u32(data, &mut ipos);
+                let gi_col_type_code = read_u8(data, &mut ipos);
+                let finalize_func_idx = read_i16(data, &mut ipos);
+                let finalize_schema_idx = read_i16(data, &mut ipos);
+                crate::vm::Instr::Reduce {
+                    in_reg: s0, trace_in_reg, trace_out_reg: s1, out_reg: s2, fin_out_reg,
+                    agg_descs_offset, agg_descs_count,
+                    group_cols_offset, group_cols_count,
+                    output_schema_idx: s3,
+                    avi_table_idx, avi_for_max, avi_agg_col_type_code,
+                    avi_group_cols_offset, avi_group_cols_count,
+                    avi_input_schema_idx, avi_agg_col_idx,
+                    gi_table_idx, gi_col_idx, gi_col_type_code,
+                    finalize_func_idx, finalize_schema_idx,
+                }
+            }
+            24 => { // GATHER_REDUCE
+                let agg_descs_offset = read_u32(data, &mut ipos);
+                let agg_descs_count = read_u16(data, &mut ipos);
+                crate::vm::Instr::GatherReduce {
+                    in_reg: s0, trace_out_reg: s1, out_reg: s2,
+                    agg_descs_offset, agg_descs_count,
+                }
+            }
+            _ => crate::vm::Instr::Halt, // unknown opcode → halt
+        };
+
+        pos = inline_start + inline_len;
+        instrs.push(instr);
+    }
+    instrs
+}
+
+/// Persistent VM state: owns the Program + RegisterFile.
+struct VmHandle {
+    program: crate::vm::Program,
+    regfile: crate::vm::RegisterFile,
+}
+
+/// Create a VM program from packed instruction data + resource handles.
+///
+/// Returns opaque handle or null on error.
+#[no_mangle]
+pub extern "C" fn gnitz_vm_program_create(
+    // Packed instruction data
+    instr_data: *const u8,
+    instr_data_len: u32,
+    // Register metadata: parallel arrays
+    reg_schemas: *const crate::compact::SchemaDescriptor,
+    reg_kinds: *const u8,     // 0=Delta, 1=Trace
+    num_registers: u32,
+    // Handle arrays indexed by instruction slots
+    func_handles: *mut *mut libc::c_void,
+    num_funcs: u32,
+    table_handles: *mut *mut libc::c_void,
+    num_tables: u32,
+    expr_handles: *mut *mut libc::c_void,
+    num_exprs: u32,
+    // Auxiliary data
+    agg_descs_buf: *const crate::ops::AggDescriptor,
+    num_agg_descs: u32,
+    group_cols_buf: *const u32,
+    num_group_cols: u32,
+    // Extra schemas
+    extra_schemas: *const crate::compact::SchemaDescriptor,
+    num_extra_schemas: u32,
+) -> *mut libc::c_void {
+    gnitz_debug!("vm_program_create: instr_len={} num_regs={} num_funcs={} num_tables={} num_exprs={}",
+        instr_data_len, num_registers, num_funcs, num_tables, num_exprs);
+    let result = panic::catch_unwind(|| {
+        if instr_data.is_null() || instr_data_len == 0
+            || reg_schemas.is_null() || reg_kinds.is_null() || num_registers == 0
+        {
+            gnitz_debug!("vm_program_create: null args, returning null");
+            return ptr::null_mut();
+        }
+
+        let data = unsafe { slice::from_raw_parts(instr_data, instr_data_len as usize) };
+        let instructions = deserialize_instructions(data);
+        gnitz_debug!("vm_program_create: deserialized {} instructions", instructions.len());
+
+        // Build register metadata
+        let nr = num_registers as usize;
+        let schemas_slice = unsafe { slice::from_raw_parts(reg_schemas, nr) };
+        let kinds_slice = unsafe { slice::from_raw_parts(reg_kinds, nr) };
+
+        let mut reg_meta = Vec::with_capacity(nr);
+        for i in 0..nr {
+            reg_meta.push(crate::vm::RegisterMeta {
+                schema: schemas_slice[i],
+                kind: if kinds_slice[i] == 0 { crate::vm::RegisterKind::Delta } else { crate::vm::RegisterKind::Trace },
+            });
+        }
+
+        // Collect resource handles
+        let funcs: Vec<*const crate::scalar_func::ScalarFuncKind> = if func_handles.is_null() || num_funcs == 0 {
+            Vec::new()
+        } else {
+            let fh = unsafe { slice::from_raw_parts(func_handles, num_funcs as usize) };
+            fh.iter().map(|&h| h as *const crate::scalar_func::ScalarFuncKind).collect()
+        };
+
+        let tables: Vec<*mut crate::table::Table> = if table_handles.is_null() || num_tables == 0 {
+            Vec::new()
+        } else {
+            let th = unsafe { slice::from_raw_parts(table_handles, num_tables as usize) };
+            th.iter().map(|&h| h as *mut crate::table::Table).collect()
+        };
+
+        let expr_progs: Vec<*const crate::expr::ExprProgram> = if expr_handles.is_null() || num_exprs == 0 {
+            Vec::new()
+        } else {
+            let eh = unsafe { slice::from_raw_parts(expr_handles, num_exprs as usize) };
+            eh.iter().map(|&h| h as *const crate::expr::ExprProgram).collect()
+        };
+
+        let agg_descs: Vec<crate::ops::AggDescriptor> = if agg_descs_buf.is_null() || num_agg_descs == 0 {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(agg_descs_buf, num_agg_descs as usize) }.to_vec()
+        };
+
+        let group_cols: Vec<u32> = if group_cols_buf.is_null() || num_group_cols == 0 {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(group_cols_buf, num_group_cols as usize) }.to_vec()
+        };
+
+        let schemas: Vec<crate::compact::SchemaDescriptor> = if extra_schemas.is_null() || num_extra_schemas == 0 {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(extra_schemas, num_extra_schemas as usize) }.to_vec()
+        };
+
+        let program = crate::vm::Program {
+            instructions,
+            reg_meta: Vec::new(), // stored separately in regfile
+            funcs,
+            tables,
+            schemas,
+            agg_descs,
+            group_cols,
+            expr_progs,
+        };
+
+        let regfile = crate::vm::RegisterFile::new(&reg_meta);
+
+        gnitz_debug!("vm_program_create: built program, creating regfile with {} regs", reg_meta.len());
+        let handle = VmHandle { program, regfile };
+        gnitz_debug!("vm_program_create: success");
+        Box::into_raw(Box::new(handle)) as *mut libc::c_void
+    });
+    match result {
+        Ok(ptr) => ptr,
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                s.as_str()
+            } else if let Some(s) = e.downcast_ref::<&str>() {
+                s
+            } else {
+                "<unknown panic>"
+            };
+            gnitz_debug!("vm_program_create: PANIC: {}", msg);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Execute one epoch of the VM program.
+///
+/// Takes ownership of input_batch (frees it).
+/// On success, writes result batch to *out_result (or null if no output).
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_vm_execute_epoch(
+    handle: *mut libc::c_void,
+    input_batch: *mut libc::c_void,
+    input_reg_idx: u16,
+    output_reg_idx: u16,
+    cursor_handles: *const *mut libc::c_void,
+    num_cursors: u32,
+    out_result: *mut *mut libc::c_void,
+) -> i32 {
+    if handle.is_null() || input_batch.is_null() || out_result.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let vm = unsafe { &mut *(handle as *mut VmHandle) };
+        let batch = unsafe { *Box::from_raw(input_batch as *mut crate::memtable::OwnedBatch) };
+        let cursors = if cursor_handles.is_null() || num_cursors == 0 {
+            &[] as &[*mut libc::c_void]
+        } else {
+            unsafe { slice::from_raw_parts(cursor_handles, num_cursors as usize) }
+        };
+
+        match crate::vm::execute_epoch(&vm.program, &mut vm.regfile, batch, input_reg_idx, output_reg_idx, cursors) {
+            Ok(Some(output)) => {
+                unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
+                0
+            }
+            Ok(None) => {
+                unsafe { *out_result = ptr::null_mut(); }
+                0
+            }
+            Err(rc) => rc,
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+/// Free a VM program handle.
+#[no_mangle]
+pub extern "C" fn gnitz_vm_program_free(handle: *mut libc::c_void) {
+    if !handle.is_null() {
+        unsafe { drop(Box::from_raw(handle as *mut VmHandle)); }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Expression programs and scalar functions
 // ---------------------------------------------------------------------------
 

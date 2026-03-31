@@ -671,6 +671,261 @@ fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Scan trace (source operator)
+// ---------------------------------------------------------------------------
+
+/// Scan rows from a ReadCursor into an OwnedBatch.
+///
+/// Faithfully ports source.py:14-45.  Skips zero-weight rows (defense-in-depth:
+/// individual shard entries may carry non-zero weights that cancel at merge level).
+/// The cursor is left at the next unscanned position.
+///
+/// `chunk_limit <= 0` means scan everything until cursor exhaustion.
+pub fn op_scan_trace(
+    cursor: &mut ReadCursor,
+    schema: &SchemaDescriptor,
+    chunk_limit: i32,
+) -> OwnedBatch {
+    let cap = if chunk_limit > 0 { chunk_limit as usize } else { 64 };
+    let mut output = OwnedBatch::with_schema(*schema, cap);
+    output.sorted = true;       // cursor produces sorted order
+    output.consolidated = true; // cursor merges → consolidated
+
+    let mut scanned: i32 = 0;
+    while cursor.valid {
+        if chunk_limit > 0 && scanned >= chunk_limit {
+            break;
+        }
+        // Skip zero-weight rows (source.py:37)
+        if cursor.current_weight != 0 {
+            append_cursor_row_to_batch(&mut output, cursor, schema);
+            scanned += 1;
+        }
+        cursor.advance();
+    }
+
+    output
+}
+
+// ---------------------------------------------------------------------------
+// Integrate with secondary indexes
+// ---------------------------------------------------------------------------
+
+/// Promote a column value to u64 for GroupIndex composite keys.
+/// Ports group_index.py:26-42.
+fn promote_col_to_u64(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize, type_code: u8) -> u64 {
+    let pi = payload_idx(col_idx, pk_index);
+    let ptr = mb.get_col_ptr(row, pi, 8);
+    u64::from_le_bytes(ptr.try_into().unwrap())
+}
+
+/// Promote an aggregate column value to an order-preserving u64 for AVI keys.
+/// Ports group_index.py:169-192.
+fn promote_agg_col_to_u64_ordered(
+    mb: &MemBatch,
+    row: usize,
+    col_idx: usize,
+    pk_index: usize,
+    col_type_code: u8,
+    for_max: bool,
+) -> u64 {
+    let pi = payload_idx(col_idx, pk_index);
+    let ptr = mb.get_col_ptr(row, pi, 8);
+    let raw = u64::from_le_bytes(ptr.try_into().unwrap());
+
+    let val = match col_type_code {
+        type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => raw,
+        type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => {
+            // Offset-binary: reinterpret as signed then add 2^63
+            let signed = raw as i64;
+            (signed as u64).wrapping_add(1u64 << 63)
+        }
+        type_code::F64 => ieee_order_bits(raw),
+        type_code::F32 => ieee_order_bits(raw & 0xFFFF_FFFF),
+        _ => raw,
+    };
+
+    if for_max { !val } else { val }
+}
+
+/// GI/AVI descriptor for integrate_with_indexes.
+pub struct GiDesc {
+    pub table: *mut crate::table::Table,
+    pub col_idx: u32,
+    pub col_type_code: u8,
+}
+
+pub struct AviDesc {
+    pub table: *mut crate::table::Table,
+    pub for_max: bool,
+    pub agg_col_type_code: u8,
+    pub group_by_cols: Vec<u32>,
+    pub input_schema: SchemaDescriptor,
+    pub agg_col_idx: u32,
+}
+
+/// GI schema: U128 PK + I64 payload (spk_hi).
+fn make_gi_schema() -> SchemaDescriptor {
+    let mut s = SchemaDescriptor {
+        num_columns: 2,
+        pk_index: 0,
+        columns: [crate::compact::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+    };
+    s.columns[0] = crate::compact::SchemaColumn {
+        type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
+    };
+    s.columns[1] = crate::compact::SchemaColumn {
+        type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
+    };
+    s
+}
+
+/// AVI schema: U128 PK only, no payload.
+fn make_avi_schema() -> SchemaDescriptor {
+    let mut s = SchemaDescriptor {
+        num_columns: 1,
+        pk_index: 0,
+        columns: [crate::compact::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+    };
+    s.columns[0] = crate::compact::SchemaColumn {
+        type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
+    };
+    s
+}
+
+/// Integrate a delta batch into a target table, optionally populating
+/// GroupIndex and AggValueIndex secondary indexes.
+///
+/// Ports interpreter.py:171-221.  The Rust Table handles memtable capacity
+/// internally (flush-on-overflow), so no explicit MemTableFullError retry.
+pub fn op_integrate_with_indexes(
+    batch: &OwnedBatch,
+    target_table: Option<&mut crate::table::Table>,
+    input_schema: &SchemaDescriptor,
+    gi: Option<&GiDesc>,
+    avi: Option<&AviDesc>,
+) -> i32 {
+    if batch.count == 0 {
+        return 0;
+    }
+
+    // Phase 1: ingest into target table
+    if let Some(table) = target_table {
+        let regions = batch.regions();
+        let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
+        let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
+        let npc = input_schema.num_columns as usize - 1;
+        if let Err(rc) = table.ingest_batch_memonly_from_regions(&ptrs, &sizes, batch.count as u32, npc) {
+            return rc;
+        }
+    }
+
+    let mb = batch.as_mem_batch();
+    let pki = input_schema.pk_index as usize;
+
+    // Phase 2: GroupIndex population (interpreter.py:175-199)
+    if let Some(gi_desc) = gi {
+        let gi_schema = make_gi_schema();
+        let mut gi_batch = OwnedBatch::with_schema(gi_schema, batch.count);
+        gi_batch.sorted = false;
+        gi_batch.consolidated = false;
+
+        let gi_col = gi_desc.col_idx as usize;
+        let gi_pi = payload_idx(gi_col, pki);
+
+        for row in 0..batch.count {
+            // Skip null group column (interpreter.py:184)
+            let null_word = mb.get_null_word(row);
+            if (null_word >> gi_pi) & 1 != 0 {
+                continue;
+            }
+
+            let gc_u64 = promote_col_to_u64(&mb, row, gi_col, pki, gi_desc.col_type_code);
+            let source_pk_lo = mb.get_pk_lo(row);
+            let source_pk_hi = mb.get_pk_hi(row);
+            let weight = mb.get_weight(row);
+
+            // Composite key: ck_lo = source_pk_lo, ck_hi = gc_u64
+            gi_batch.pk_lo.extend_from_slice(&source_pk_lo.to_le_bytes());
+            gi_batch.pk_hi.extend_from_slice(&gc_u64.to_le_bytes());
+            gi_batch.weight.extend_from_slice(&weight.to_le_bytes());
+            gi_batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            // Payload: spk_hi (source pk high 64 bits) as I64
+            gi_batch.col_data[0].extend_from_slice(&(source_pk_hi as i64).to_le_bytes());
+            gi_batch.count += 1;
+        }
+
+        if gi_batch.count > 0 {
+            let gi_table = unsafe { &mut *gi_desc.table };
+            let gi_schema = gi_table.schema();
+            let regions = gi_batch.regions();
+            let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
+            let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
+            let _ = gi_table.ingest_batch_memonly_from_regions(
+                &ptrs, &sizes, gi_batch.count as u32,
+                gi_schema.num_columns as usize - 1,
+            );
+        }
+    }
+
+    // Phase 3: AggValueIndex population (interpreter.py:200-221)
+    if let Some(avi_desc) = avi {
+        let avi_schema = make_avi_schema();
+        let mut avi_batch = OwnedBatch::with_schema(avi_schema, batch.count);
+        avi_batch.sorted = false;
+        avi_batch.consolidated = false;
+
+        let avi_col = avi_desc.agg_col_idx as usize;
+        let avi_pi = payload_idx(avi_col, pki);
+
+        for row in 0..batch.count {
+            // Skip null agg column (interpreter.py:208)
+            let null_word = mb.get_null_word(row);
+            if (null_word >> avi_pi) & 1 != 0 {
+                continue;
+            }
+
+            let gc_u64 = extract_gc_u64(&mb, row, &avi_desc.input_schema, &avi_desc.group_by_cols);
+            let av_u64 = promote_agg_col_to_u64_ordered(
+                &mb, row, avi_col, pki,
+                avi_desc.agg_col_type_code, avi_desc.for_max,
+            );
+            let weight = mb.get_weight(row);
+
+            // Composite key: ck_lo = av_u64, ck_hi = gc_u64
+            avi_batch.pk_lo.extend_from_slice(&av_u64.to_le_bytes());
+            avi_batch.pk_hi.extend_from_slice(&gc_u64.to_le_bytes());
+            avi_batch.weight.extend_from_slice(&weight.to_le_bytes());
+            avi_batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            // No payload columns (AVI schema is U128 PK only)
+            avi_batch.count += 1;
+        }
+
+        if avi_batch.count > 0 {
+            gnitz_debug!("integrate_avi: ingesting {} rows, for_max={}, agg_col_idx={}, agg_type={}",
+                avi_batch.count, avi_desc.for_max, avi_desc.agg_col_idx, avi_desc.agg_col_type_code);
+            for i in 0..avi_batch.count {
+                let lo = u64::from_le_bytes(avi_batch.pk_lo[i*8..(i+1)*8].try_into().unwrap());
+                let hi = u64::from_le_bytes(avi_batch.pk_hi[i*8..(i+1)*8].try_into().unwrap());
+                let w = i64::from_le_bytes(avi_batch.weight[i*8..(i+1)*8].try_into().unwrap());
+                gnitz_debug!("  avi[{}]: pk_lo={:#x} pk_hi={:#x} w={}", i, lo, hi, w);
+            }
+            let avi_table = unsafe { &mut *avi_desc.table };
+            let avi_schema = avi_table.schema();
+            let regions = avi_batch.regions();
+            let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
+            let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
+            let _ = avi_table.ingest_batch_memonly_from_regions(
+                &ptrs, &sizes, avi_batch.count as u32,
+                avi_schema.num_columns as usize - 1,
+            );
+        }
+    }
+
+    0
+}
+
+// ---------------------------------------------------------------------------
 // Linear operators
 // ---------------------------------------------------------------------------
 
@@ -1719,8 +1974,12 @@ fn apply_agg_from_value_index(
     acc: &mut Accumulator,
 ) -> bool {
     avi_cursor.seek(0, gc_u64);
+    gnitz_debug!("avi_lookup: seek(0, {:#x}) valid={}", gc_u64, avi_cursor.valid);
     while avi_cursor.valid {
         let k_hi = avi_cursor.current_key_hi;
+        let k_lo = avi_cursor.current_key_lo;
+        let w = avi_cursor.current_weight;
+        gnitz_debug!("avi_lookup: at pk_lo={:#x} pk_hi={:#x} w={}", k_lo, k_hi, w);
         if k_hi != gc_u64 {
             break;
         }
@@ -1921,10 +2180,11 @@ pub fn op_reduce(
                 // AVI path
                 let avi_schema = avi_input_schema.unwrap_or(input_schema);
                 let gc_u64 = extract_gc_u64(&mb, group_start_idx, avi_schema, avi_group_by_cols);
-                apply_agg_from_value_index(
+                let found = apply_agg_from_value_index(
                     avi_c, gc_u64, avi_for_max, avi_agg_col_type_code,
                     &mut accs[0],
                 );
+                gnitz_debug!("reduce: AVI lookup gc={:#x} found={}", gc_u64, found);
             } else {
                 // Full replay path: build replay batch from trace_in + delta
                 let mut replay = OwnedBatch::with_schema(*input_schema, 32);
