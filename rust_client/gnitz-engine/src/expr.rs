@@ -306,22 +306,24 @@ pub fn eval_predicate(
                 regs[dst] = regs[a1 as usize].wrapping_mul(regs[a2 as usize]);
             }
             EXPR_INT_DIV => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
                 let d = regs[a2 as usize];
-                regs[dst] = if d != 0 {
-                    regs[a1 as usize].wrapping_div(d)
+                if d == 0 {
+                    null[dst] = true;
+                    regs[dst] = 0;
                 } else {
-                    0
-                };
+                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    regs[dst] = regs[a1 as usize].wrapping_div(d);
+                }
             }
             EXPR_INT_MOD => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
                 let d = regs[a2 as usize];
-                regs[dst] = if d != 0 {
-                    regs[a1 as usize].wrapping_rem(d)
+                if d == 0 {
+                    null[dst] = true;
+                    regs[dst] = 0;
                 } else {
-                    0
-                };
+                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    regs[dst] = regs[a1 as usize].wrapping_rem(d);
+                }
             }
             EXPR_INT_NEG => {
                 null[dst] = null[a1 as usize];
@@ -346,13 +348,14 @@ pub fn eval_predicate(
                 );
             }
             EXPR_FLOAT_DIV => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
                 let rhs = bits_to_float(regs[a2 as usize]);
-                regs[dst] = if rhs != 0.0 {
-                    float_to_bits(bits_to_float(regs[a1 as usize]) / rhs)
+                if rhs == 0.0 {
+                    null[dst] = true;
+                    regs[dst] = 0;
                 } else {
-                    0
-                };
+                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    regs[dst] = float_to_bits(bits_to_float(regs[a1 as usize]) / rhs);
+                }
             }
             EXPR_FLOAT_NEG => {
                 null[dst] = null[a1 as usize];
@@ -671,22 +674,24 @@ pub fn eval_with_emit(
                 regs[dst] = regs[a1 as usize].wrapping_mul(regs[a2 as usize]);
             }
             EXPR_INT_DIV => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
                 let d = regs[a2 as usize];
-                regs[dst] = if d != 0 {
-                    regs[a1 as usize].wrapping_div(d)
+                if d == 0 {
+                    null[dst] = true;
+                    regs[dst] = 0;
                 } else {
-                    0
-                };
+                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    regs[dst] = regs[a1 as usize].wrapping_div(d);
+                }
             }
             EXPR_INT_MOD => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
                 let d = regs[a2 as usize];
-                regs[dst] = if d != 0 {
-                    regs[a1 as usize].wrapping_rem(d)
+                if d == 0 {
+                    null[dst] = true;
+                    regs[dst] = 0;
                 } else {
-                    0
-                };
+                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    regs[dst] = regs[a1 as usize].wrapping_rem(d);
+                }
             }
             EXPR_INT_NEG => {
                 null[dst] = null[a1 as usize];
@@ -711,13 +716,14 @@ pub fn eval_with_emit(
                 );
             }
             EXPR_FLOAT_DIV => {
-                null[dst] = null[a1 as usize] || null[a2 as usize];
                 let rhs = bits_to_float(regs[a2 as usize]);
-                regs[dst] = if rhs != 0.0 {
-                    float_to_bits(bits_to_float(regs[a1 as usize]) / rhs)
+                if rhs == 0.0 {
+                    null[dst] = true;
+                    regs[dst] = 0;
                 } else {
-                    0
-                };
+                    null[dst] = null[a1 as usize] || null[a2 as usize];
+                    regs[dst] = float_to_bits(bits_to_float(regs[a1 as usize]) / rhs);
+                }
             }
             EXPR_FLOAT_NEG => {
                 null[dst] = null[a1 as usize];
@@ -853,12 +859,12 @@ pub fn eval_with_emit(
                     let ptr = unsafe { et.base.add(row * et.stride) };
                     if null[a1 as usize] {
                         unsafe {
-                            *(ptr as *mut i64) = 0;
+                            std::ptr::write_unaligned(ptr as *mut i64, 0);
                         }
                         emit_null_mask |= 1u64 << et.payload_col;
                     } else {
                         unsafe {
-                            *(ptr as *mut i64) = regs[a1 as usize];
+                            std::ptr::write_unaligned(ptr as *mut i64, regs[a1 as usize]);
                         }
                     }
                     emit_idx += 1;
@@ -1104,25 +1110,25 @@ mod tests {
         let (val, _) = eval_predicate(&prog, &mb, 0, 0);
         assert_eq!(val, 13);
 
-        // DIV by zero → 0
+        // DIV by zero → NULL
         let code = vec![
             EXPR_LOAD_COL_INT, 0, 1, 0,
             EXPR_LOAD_CONST, 1, 0, 0,
             EXPR_INT_DIV, 2, 0, 1,
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let (val, _) = eval_predicate(&prog, &mb, 0, 0);
-        assert_eq!(val, 0);
+        let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+        assert!(is_null);
 
-        // MOD by zero → 0
+        // MOD by zero → NULL
         let code = vec![
             EXPR_LOAD_COL_INT, 0, 1, 0,
             EXPR_LOAD_CONST, 1, 0, 0,
             EXPR_INT_MOD, 2, 0, 1,
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let (val, _) = eval_predicate(&prog, &mb, 0, 0);
-        assert_eq!(val, 0);
+        let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+        assert!(is_null);
 
         // NEG: -10
         let code = vec![
@@ -1154,15 +1160,15 @@ mod tests {
         let result = bits_to_float(val);
         assert!((result - 5.14).abs() < 1e-10);
 
-        // FLOAT_DIV by zero → 0
+        // FLOAT_DIV by zero → NULL
         let code = vec![
             EXPR_LOAD_COL_FLOAT, 0, 1, 0,
             EXPR_LOAD_CONST, 1, 0, 0, // zero bits
             EXPR_FLOAT_DIV, 2, 0, 1,
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let (val, _) = eval_predicate(&prog, &mb, 0, 0);
-        assert_eq!(val, 0);
+        let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+        assert!(is_null);
 
         // FCMP_GT: 3.14 > 2.0
         let code = vec![
@@ -1357,5 +1363,89 @@ mod tests {
         assert_eq!(mask, 0);
         let written = i64::from_le_bytes(out_buf);
         assert_eq!(written, 30);
+    }
+
+    #[test]
+    fn test_div_by_zero_null_semantics() {
+        // Schema: pk(u64), col1(i64), col2(i64)
+        let schema = make_schema(3, 0, &[(8, 8), (9, 8), (9, 8)]);
+        // Row: pk=1, col1=10, col2=3; null_word=0 (no nulls)
+        let batch = make_int_batch(&schema, &[(1, 1, 0, &[10, 3])]);
+        let mb = batch.as_mem_batch();
+
+        // 1. INT_DIV by literal 0 → NULL
+        let code = vec![
+            EXPR_LOAD_COL_INT, 0, 1, 0,
+            EXPR_LOAD_CONST, 1, 0, 0,
+            EXPR_INT_DIV, 2, 0, 1,
+        ];
+        let prog = ExprProgram::new(code, 3, 2, vec![]);
+        let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+        assert!(is_null);
+
+        // 2. INT_MOD by literal 0 → NULL
+        let code = vec![
+            EXPR_LOAD_COL_INT, 0, 1, 0,
+            EXPR_LOAD_CONST, 1, 0, 0,
+            EXPR_INT_MOD, 2, 0, 1,
+        ];
+        let prog = ExprProgram::new(code, 3, 2, vec![]);
+        let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+        assert!(is_null);
+
+        // 3. FLOAT_DIV by 0.0 bits → NULL
+        let code = vec![
+            EXPR_LOAD_COL_INT, 0, 1, 0,
+            EXPR_LOAD_CONST, 1, 0, 0,
+            EXPR_FLOAT_DIV, 2, 0, 1,
+        ];
+        let prog = ExprProgram::new(code, 3, 2, vec![]);
+        let (_, is_null) = eval_predicate(&prog, &mb, 0, 0);
+        assert!(is_null);
+
+        // 4. INT_DIV by non-null non-zero → correct quotient, not null
+        let code = vec![
+            EXPR_LOAD_COL_INT, 0, 1, 0,
+            EXPR_LOAD_COL_INT, 1, 2, 0,
+            EXPR_INT_DIV, 2, 0, 1,
+        ];
+        let prog = ExprProgram::new(code, 3, 2, vec![]);
+        let (val, is_null) = eval_predicate(&prog, &mb, 0, 0);
+        assert!(!is_null);
+        assert_eq!(val, 3); // 10 / 3 = 3
+
+        // 5. INT_DIV where divisor column is null → NULL (null propagation)
+        // null_word bit 0 = col1 null; use col2 (bit 1) as divisor with col1 null
+        // Schema col indices: col1=payload_idx 0, col2=payload_idx 1
+        // Build a row where col2 is null (null_word bit 1 set)
+        let batch_null_div = make_int_batch(&schema, &[(1, 1, 2, &[10, 3])]);
+        let mb_null_div = batch_null_div.as_mem_batch();
+        let code = vec![
+            EXPR_LOAD_COL_INT, 0, 1, 0,
+            EXPR_LOAD_COL_INT, 1, 2, 0,
+            EXPR_INT_DIV, 2, 0, 1,
+        ];
+        let prog = ExprProgram::new(code, 3, 2, vec![]);
+        let (_, is_null) = eval_predicate(&prog, &mb_null_div, 0, 0);
+        assert!(is_null);
+
+        // 6. EMIT of INT_DIV-by-zero result → emit_null_mask bit set, buffer contains 0
+        let code = vec![
+            EXPR_LOAD_COL_INT, 0, 1, 0,
+            EXPR_LOAD_CONST, 1, 0, 0,
+            EXPR_INT_DIV, 2, 0, 1,
+            EXPR_EMIT, 0, 2, 0,
+        ];
+        let prog = ExprProgram::new(code, 3, 2, vec![]);
+        let mut out_buf = [0xffu8; 8];
+        let targets = [EmitTarget {
+            base: out_buf.as_mut_ptr(),
+            stride: 8,
+            payload_col: 0,
+        }];
+        let (_, _, mask) = eval_with_emit(&prog, &mb, 0, 0, 0, &targets);
+        assert_eq!(mask & 1, 1); // bit 0 set → null
+        let written = i64::from_le_bytes(out_buf);
+        assert_eq!(written, 0);
     }
 }

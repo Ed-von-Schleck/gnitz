@@ -310,9 +310,21 @@ pub fn execute_epoch(
             }
 
             Instr::Filter { in_reg, out_reg, func_idx } => {
-                let func = unsafe { &*program.funcs[*func_idx as usize] };
+                let func_ptr = program.funcs[*func_idx as usize];
+                let in_batch = &reg!(*in_reg).batch;
                 let schema = reg!(*in_reg).schema;
-                let result = ops::op_filter(&reg!(*in_reg).batch, func, &schema);
+                let result = if func_ptr.is_null() {
+                    // NullPredicate: pass all rows unchanged
+                    let mut out = OwnedBatch::empty(in_batch.col_data.len());
+                    out.schema = Some(schema);
+                    out.append_batch(in_batch, 0, in_batch.count);
+                    out.sorted = in_batch.sorted;
+                    out.consolidated = in_batch.consolidated;
+                    out
+                } else {
+                    let func = unsafe { &*func_ptr };
+                    ops::op_filter(in_batch, func, &schema)
+                };
                 reg_mut!(*out_reg).batch = result;
             }
 

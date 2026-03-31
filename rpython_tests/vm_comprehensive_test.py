@@ -148,8 +148,6 @@ def test_union():
         instructions.halt_op(),
     ]
 
-    plan = make_plan(program, reg_file, schema, in_reg=0, out_reg=2)
-
     # Batch A: pk=1 val=10
     batch_a = batch.ArenaZSetBatch(schema)
     rb_a = RowBuilder(schema, batch_a)
@@ -157,21 +155,25 @@ def test_union():
     rb_a.put_int(r_int64(10))
     rb_a.commit()
 
-    # Pre-load R1 with batch B data before execute_epoch
-    # We need to manually put data in R1 since execute_epoch only binds R0
+    # Batch B: pk=2 val=20
     batch_b_data = batch.ArenaZSetBatch(schema)
     rb_b = RowBuilder(schema, batch_b_data)
     rb_b.begin(r_uint64(2), r_uint64(0), r_int64(1))
     rb_b.put_int(r_int64(20))
     rb_b.commit()
 
-    # Manually load R1 with batch B before execution
-    # We'll use bind to set R1's batch
+    # Bind both input registers and run the interpreter directly.
+    # execute_epoch is not used here because it calls prepare_for_tick which
+    # clears delta registers, and the Rust VM path does not forward pre-bound
+    # delta batches to non-input registers.
+    reg_file.registers[0].bind(batch_a)
     reg_file.registers[1].bind(batch_b_data)
 
-    result = plan.execute_epoch(batch_a)
+    context = runtime.ExecutionContext()
+    context.reset()
+    interpreter.run_vm(program, reg_file, context)
 
-    assert_true(result is not None, "Union should produce output")
+    result = reg_file.registers[2].batch
     assert_equal_i(2, result.length(), "Union should have 2 rows (A + B)")
 
     found_pk1 = False
@@ -185,8 +187,8 @@ def test_union():
     assert_true(found_pk1, "Union output missing pk=1 from batch A")
     assert_true(found_pk2, "Union output missing pk=2 from batch B")
 
+    reg_file.registers[0].unbind()
     reg_file.registers[1].unbind()
-    result.free()
     batch_a.free()
     batch_b_data.free()
     log("  PASSED")
@@ -726,8 +728,6 @@ def test_join_delta_delta():
         instructions.halt_op(),
     ]
 
-    plan = make_plan(program, reg_file, out_schema, in_reg=0, out_reg=2)
-
     # Batch A: pk=5 w=1, pk=10 w=2
     batch_a = batch.ArenaZSetBatch(schema_a)
     rb_a = RowBuilder(schema_a, batch_a)
@@ -748,12 +748,17 @@ def test_join_delta_delta():
     rb_b.put_int(r_int64(300))
     rb_b.commit()
 
-    # Pre-load R1 with batch B
+    # Bind both input registers and run the interpreter directly.
+    # execute_epoch is not used here because the Rust VM path does not forward
+    # pre-bound delta batches to non-input registers.
+    reg_file.registers[0].bind(batch_a)
     reg_file.registers[1].bind(batch_b)
 
-    result = plan.execute_epoch(batch_a)
+    context = runtime.ExecutionContext()
+    context.reset()
+    interpreter.run_vm(program, reg_file, context)
 
-    assert_true(result is not None, "Delta-delta join should produce output")
+    result = reg_file.registers[2].batch
     assert_equal_i(1, result.length(), "Only pk=10 matches both sides")
     assert_equal_u128(r_uint128(10), result.get_pk(0), "Joined PK should be 10")
     assert_equal_i64(r_int64(6), result.get_weight(0), "Weight should be 2*3=6")
@@ -764,8 +769,8 @@ def test_join_delta_delta():
     assert_equal_i64(r_int64(100), acc.get_int_signed(1), "val_a mismatch")
     assert_equal_i64(r_int64(200), acc.get_int_signed(2), "val_b mismatch")
 
+    reg_file.registers[0].unbind()
     reg_file.registers[1].unbind()
-    result.free()
     batch_a.free()
     batch_b.free()
     log("  PASSED")

@@ -254,13 +254,21 @@ def eval_expr(program, accessor, builder=None):
             null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(intmask(regs[a1] * regs[a2]))
         elif op == EXPR_INT_DIV:
-            null[dst] = null[a1] or null[a2]
             d = regs[a2]
-            regs[dst] = r_int64(intmask(regs[a1] / d)) if d != r_int64(0) else r_int64(0)
+            if d == r_int64(0):
+                null[dst] = True
+                regs[dst] = r_int64(0)
+            else:
+                null[dst] = null[a1] or null[a2]
+                regs[dst] = r_int64(intmask(regs[a1] / d))
         elif op == EXPR_INT_MOD:
-            null[dst] = null[a1] or null[a2]
             d = regs[a2]
-            regs[dst] = r_int64(intmask(regs[a1] % d)) if d != r_int64(0) else r_int64(0)
+            if d == r_int64(0):
+                null[dst] = True
+                regs[dst] = r_int64(0)
+            else:
+                null[dst] = null[a1] or null[a2]
+                regs[dst] = r_int64(intmask(regs[a1] % d))
         elif op == EXPR_INT_NEG:
             null[dst] = null[a1]
             regs[dst] = r_int64(intmask(-regs[a1]))
@@ -275,12 +283,13 @@ def eval_expr(program, accessor, builder=None):
             null[dst] = null[a1] or null[a2]
             regs[dst] = float2longlong(longlong2float(regs[a1]) * longlong2float(regs[a2]))
         elif op == EXPR_FLOAT_DIV:
-            null[dst] = null[a1] or null[a2]
             rhs = longlong2float(regs[a2])
-            if rhs != 0.0:
-                regs[dst] = float2longlong(longlong2float(regs[a1]) / rhs)
-            else:
+            if rhs == 0.0:
+                null[dst] = True
                 regs[dst] = r_int64(0)
+            else:
+                null[dst] = null[a1] or null[a2]
+                regs[dst] = float2longlong(longlong2float(regs[a1]) / rhs)
         elif op == EXPR_FLOAT_NEG:
             null[dst] = null[a1]
             regs[dst] = float2longlong(-longlong2float(regs[a1]))
@@ -559,13 +568,21 @@ def _eval_row_direct(program, in_batch, row_idx, row_null_word,
             null[dst] = null[a1] or null[a2]
             regs[dst] = r_int64(intmask(regs[a1] * regs[a2]))
         elif op == EXPR_INT_DIV:
-            null[dst] = null[a1] or null[a2]
             d = regs[a2]
-            regs[dst] = r_int64(intmask(regs[a1] / d)) if d != r_int64(0) else r_int64(0)
+            if d == r_int64(0):
+                null[dst] = True
+                regs[dst] = r_int64(0)
+            else:
+                null[dst] = null[a1] or null[a2]
+                regs[dst] = r_int64(intmask(regs[a1] / d))
         elif op == EXPR_INT_MOD:
-            null[dst] = null[a1] or null[a2]
             d = regs[a2]
-            regs[dst] = r_int64(intmask(regs[a1] % d)) if d != r_int64(0) else r_int64(0)
+            if d == r_int64(0):
+                null[dst] = True
+                regs[dst] = r_int64(0)
+            else:
+                null[dst] = null[a1] or null[a2]
+                regs[dst] = r_int64(intmask(regs[a1] % d))
         elif op == EXPR_INT_NEG:
             null[dst] = null[a1]
             regs[dst] = r_int64(intmask(-regs[a1]))
@@ -580,12 +597,13 @@ def _eval_row_direct(program, in_batch, row_idx, row_null_word,
             null[dst] = null[a1] or null[a2]
             regs[dst] = float2longlong(longlong2float(regs[a1]) * longlong2float(regs[a2]))
         elif op == EXPR_FLOAT_DIV:
-            null[dst] = null[a1] or null[a2]
             rhs = longlong2float(regs[a2])
-            if rhs != 0.0:
-                regs[dst] = float2longlong(longlong2float(regs[a1]) / rhs)
-            else:
+            if rhs == 0.0:
+                null[dst] = True
                 regs[dst] = r_int64(0)
+            else:
+                null[dst] = null[a1] or null[a2]
+                regs[dst] = float2longlong(longlong2float(regs[a1]) / rhs)
         elif op == EXPR_FLOAT_NEG:
             null[dst] = null[a1]
             regs[dst] = float2longlong(-longlong2float(regs[a1]))
