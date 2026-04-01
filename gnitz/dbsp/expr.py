@@ -5,9 +5,6 @@
 from rpython.rlib.rarithmetic import r_int64, intmask
 from rpython.rlib.longlong2float import float2longlong
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rtyper.lltypesystem import rffi, lltype
-
-from gnitz.dbsp.functions import ScalarFunction
 
 # ---------------------------------------------------------------------------
 # Expression Opcodes (separate namespace from DBSP VM opcodes)
@@ -86,7 +83,6 @@ class ExprProgram(object):
 
     def __init__(self, code, num_regs, result_reg, const_strings=None):
         from gnitz.core import strings as _strings
-        from gnitz.storage import engine_ffi
         self.code = code[:]         # copy: [*] requires a never-resized list
         self.num_regs = num_regs
         self.result_reg = result_reg
@@ -105,153 +101,12 @@ class ExprProgram(object):
             self.const_strings = [""][0:0]
             self.const_prefixes = [0][0:0]
             self.const_lengths = [0][0:0]
-        # Build Rust ExprProgram handle
-        n = len(self.code)
-        code_arr = lltype.malloc(rffi.LONGLONGP.TO, n, flavor="raw")
-        for _i in range(n):
-            code_arr[_i] = rffi.cast(rffi.LONGLONG, self.code[_i])
-        n_consts = len(self.const_strings)
-        if n_consts > 0:
-            total_len = 0
-            for _i in range(n_consts):
-                total_len += len(self.const_strings[_i])
-            const_data = lltype.malloc(rffi.CCHARP.TO, max(total_len, 1), flavor="raw")
-            offsets_arr = lltype.malloc(rffi.UINTP.TO, n_consts, flavor="raw")
-            lengths_arr = lltype.malloc(rffi.UINTP.TO, n_consts, flavor="raw")
-            off = 0
-            for _i in range(n_consts):
-                s = self.const_strings[_i]
-                offsets_arr[_i] = rffi.cast(rffi.UINT, off)
-                lengths_arr[_i] = rffi.cast(rffi.UINT, len(s))
-                for _j in range(len(s)):
-                    const_data[off + _j] = s[_j]
-                off += len(s)
-            self._rust_handle = engine_ffi._expr_program_create(
-                code_arr, rffi.cast(rffi.UINT, n),
-                rffi.cast(rffi.UINT, num_regs), rffi.cast(rffi.UINT, result_reg),
-                const_data, offsets_arr, lengths_arr,
-                rffi.cast(rffi.UINT, n_consts),
-            )
-            lltype.free(const_data, flavor="raw")
-            lltype.free(offsets_arr, flavor="raw")
-            lltype.free(lengths_arr, flavor="raw")
-        else:
-            self._rust_handle = engine_ffi._expr_program_create(
-                code_arr, rffi.cast(rffi.UINT, n),
-                rffi.cast(rffi.UINT, num_regs), rffi.cast(rffi.UINT, result_reg),
-                lltype.nullptr(rffi.CCHARP.TO),
-                lltype.nullptr(rffi.UINTP.TO),
-                lltype.nullptr(rffi.UINTP.TO),
-                rffi.cast(rffi.UINT, 0),
-            )
-        lltype.free(code_arr, flavor="raw")
-
-    def close(self):
-        from gnitz.storage import engine_ffi
-        if self._rust_handle:
-            engine_ffi._expr_program_free(self._rust_handle)
-            self._rust_handle = lltype.nullptr(rffi.VOIDP.TO)
 
     def code_as_ints(self):
         result = []
         for w in self.code:
             result.append(intmask(w))
         return result
-
-
-def _clone_program_handle(program):
-    """Create a fresh Rust ExprProgram handle from RPython ExprProgram data.
-    The handle is intended to be consumed by scalar func creation (which takes ownership)."""
-    from gnitz.storage import engine_ffi
-    n = len(program.code)
-    code_arr = lltype.malloc(rffi.LONGLONGP.TO, n, flavor="raw")
-    for _i in range(n):
-        code_arr[_i] = rffi.cast(rffi.LONGLONG, program.code[_i])
-    n_consts = len(program.const_strings)
-    if n_consts > 0:
-        total_len = 0
-        for _i in range(n_consts):
-            total_len += len(program.const_strings[_i])
-        const_data = lltype.malloc(rffi.CCHARP.TO, max(total_len, 1), flavor="raw")
-        offsets_arr = lltype.malloc(rffi.UINTP.TO, n_consts, flavor="raw")
-        lengths_arr = lltype.malloc(rffi.UINTP.TO, n_consts, flavor="raw")
-        off = 0
-        for _i in range(n_consts):
-            s = program.const_strings[_i]
-            offsets_arr[_i] = rffi.cast(rffi.UINT, off)
-            lengths_arr[_i] = rffi.cast(rffi.UINT, len(s))
-            for _j in range(len(s)):
-                const_data[off + _j] = s[_j]
-            off += len(s)
-        handle = engine_ffi._expr_program_create(
-            code_arr, rffi.cast(rffi.UINT, n),
-            rffi.cast(rffi.UINT, program.num_regs),
-            rffi.cast(rffi.UINT, program.result_reg),
-            const_data, offsets_arr, lengths_arr,
-            rffi.cast(rffi.UINT, n_consts),
-        )
-        lltype.free(const_data, flavor="raw")
-        lltype.free(offsets_arr, flavor="raw")
-        lltype.free(lengths_arr, flavor="raw")
-    else:
-        handle = engine_ffi._expr_program_create(
-            code_arr, rffi.cast(rffi.UINT, n),
-            rffi.cast(rffi.UINT, program.num_regs),
-            rffi.cast(rffi.UINT, program.result_reg),
-            lltype.nullptr(rffi.CCHARP.TO),
-            lltype.nullptr(rffi.UINTP.TO),
-            lltype.nullptr(rffi.UINTP.TO),
-            rffi.cast(rffi.UINT, 0),
-        )
-    lltype.free(code_arr, flavor="raw")
-    return handle
-
-
-# ---------------------------------------------------------------------------
-# ExprPredicate -- plugs into op_filter via ScalarFunction interface
-# ---------------------------------------------------------------------------
-
-class ExprPredicate(ScalarFunction):
-    _immutable_fields_ = ['program']
-
-    def __init__(self, program):
-        from gnitz.storage import engine_ffi
-        self.program = program
-        prog_handle = _clone_program_handle(program)
-        self._func_handle = engine_ffi._scalar_func_create_expr_predicate(
-            prog_handle)
-
-    def get_func_handle(self):
-        return self._func_handle
-
-    def close(self):
-        from gnitz.storage import engine_ffi
-        if self._func_handle:
-            engine_ffi._scalar_func_free(self._func_handle)
-            self._func_handle = lltype.nullptr(rffi.VOIDP.TO)
-
-
-# ---------------------------------------------------------------------------
-# ExprMapFunction -- plugs into op_map via ScalarFunction interface
-# ---------------------------------------------------------------------------
-
-class ExprMapFunction(ScalarFunction):
-    _immutable_fields_ = ['program']
-
-    def __init__(self, program):
-        from gnitz.storage import engine_ffi
-        self.program = program
-        prog_handle = _clone_program_handle(program)
-        self._func_handle = engine_ffi._scalar_func_create_expr_map(prog_handle)
-
-    def get_func_handle(self):
-        return self._func_handle
-
-    def close(self):
-        from gnitz.storage import engine_ffi
-        if self._func_handle:
-            engine_ffi._scalar_func_free(self._func_handle)
-            self._func_handle = lltype.nullptr(rffi.VOIDP.TO)
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +364,3 @@ class ExprBuilder(object):
     def build(self, result_reg, const_strings=None):
         return ExprProgram(self._code, self._next_reg, result_reg,
                            const_strings=const_strings)
-
-    def build_predicate(self, result_reg, const_strings=None):
-        return ExprPredicate(self.build(result_reg, const_strings=const_strings))

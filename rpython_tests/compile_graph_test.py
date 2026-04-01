@@ -834,7 +834,7 @@ def test_reduce_sum(base_dir):
     table_cols = _make_table_cols_i64(["val"])
     table = db.create_table("test.src", table_cols, 0)
 
-    from gnitz.dbsp.functions import AGG_SUM
+    from gnitz.core.opcodes import AGG_SUM
     builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
     src = builder.input_delta()
     r = builder.reduce(src, agg_func_id=AGG_SUM, group_by_cols=[0], agg_col_idx=1)
@@ -889,7 +889,7 @@ def test_skip_exchange_copartitioned(base_dir):
     table_cols = _make_table_cols_i64(["val"])
     table = db.create_table("test.src", table_cols, 0)
 
-    from gnitz.dbsp.functions import AGG_SUM
+    from gnitz.core.opcodes import AGG_SUM
     builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
     src = builder.input_delta()
     # GROUP BY col 0 (= pk_index) — shard col matches PK → co-partitioned
@@ -923,7 +923,7 @@ def test_skip_exchange_non_copartitioned(base_dir):
     table_cols = _make_table_cols_i64(["grp", "val"])
     table = db.create_table("test.src", table_cols, 0)
 
-    from gnitz.dbsp.functions import AGG_SUM
+    from gnitz.core.opcodes import AGG_SUM
     builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
     src = builder.input_delta()
     # GROUP BY col 1 (= grp, not pk) — shard col != PK → not co-partitioned
@@ -959,7 +959,7 @@ def test_reduce_multi_agg(base_dir):
     table_cols = _make_table_cols_i64(["val"])
     table = db.create_table("test.src", table_cols, 0)
 
-    from gnitz.dbsp.functions import AGG_COUNT, AGG_SUM
+    from gnitz.core.opcodes import AGG_COUNT, AGG_SUM
     builder = CircuitBuilder(view_id=0, primary_source_id=table.table_id)
     src = builder.input_delta()
     # Multi-agg: COUNT(col=1), SUM(col=1)

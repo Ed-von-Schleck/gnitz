@@ -104,79 +104,10 @@ eci = ExternalCompilationInfo(
         "  char **input_files, uint32_t num_inputs,"
         "  char *output_file,"
         "  void *schema_desc, uint32_t table_id);",
-        # DBSP operators (single-call, Rust-side)
-        "int32_t gnitz_op_distinct("
-        "  const void *delta, void *cursor, const void *schema,"
-        "  void **out_result, void **out_consolidated);",
-        "int32_t gnitz_op_anti_join_dt("
-        "  const void *delta, void *cursor, const void *schema,"
-        "  void **out_result);",
-        "int32_t gnitz_op_semi_join_dt("
-        "  const void *delta, void *cursor, const void *schema,"
-        "  void **out_result);",
-        "int32_t gnitz_op_join_dt("
-        "  const void *delta, void *cursor,"
-        "  const void *left_schema, const void *right_schema,"
-        "  void **out_result);",
-        "int32_t gnitz_op_join_dt_outer("
-        "  const void *delta, void *cursor,"
-        "  const void *left_schema, const void *right_schema,"
-        "  void **out_result);",
-        "int32_t gnitz_op_anti_join_dd("
-        "  const void *a, const void *b, const void *schema,"
-        "  void **out_result);",
-        "int32_t gnitz_op_semi_join_dd("
-        "  const void *a, const void *b, const void *schema,"
-        "  void **out_result);",
-        "int32_t gnitz_op_join_dd("
-        "  const void *a, const void *b,"
-        "  const void *left_schema, const void *right_schema,"
-        "  void **out_result);",
-        # expression programs and scalar functions
-        "void *gnitz_expr_program_create("
-        "  const int64_t *code, uint32_t code_len,"
-        "  uint32_t num_regs, uint32_t result_reg,"
-        "  const uint8_t *const_string_data,"
-        "  const uint32_t *const_string_offsets,"
-        "  const uint32_t *const_string_lengths,"
-        "  uint32_t num_const_strings);",
-        "void gnitz_expr_program_free(void *handle);",
-        "void *gnitz_scalar_func_create_expr_predicate(void *program);",
-        "void *gnitz_scalar_func_create_expr_map(void *program);",
-        "void *gnitz_scalar_func_create_universal_predicate("
-        "  uint32_t col_idx, uint8_t op, uint64_t val_bits, int32_t is_float);",
-        "void *gnitz_scalar_func_create_universal_projection("
-        "  const uint32_t *src_indices, const uint8_t *src_types, uint32_t count);",
-        "void gnitz_scalar_func_free(void *handle);",
         # linear operators
-        "int32_t gnitz_op_filter("
-        "  const void *batch, const void *func, const void *schema,"
-        "  void **out_result);",
-        "int32_t gnitz_op_map("
-        "  const void *batch, const void *func,"
-        "  const void *in_schema, const void *out_schema,"
-        "  int32_t reindex_col, void **out_result);",
-        "int32_t gnitz_op_negate(const void *batch, void **out_result);",
         "int32_t gnitz_op_union("
         "  const void *batch_a, const void *batch_b,"
         "  const void *schema, void **out_result);",
-        # reduce operators
-        "int32_t gnitz_op_reduce("
-        "  const void *delta, void *trace_in_cursor, void *trace_out_cursor,"
-        "  const void *input_schema, const void *output_schema,"
-        "  const uint32_t *group_by_cols, uint32_t num_group_by_cols,"
-        "  const void *agg_descs, uint32_t num_aggs,"
-        "  void *avi_cursor, int32_t avi_for_max, uint8_t avi_agg_col_type_code,"
-        "  const uint32_t *avi_group_by_cols, uint32_t avi_num_group_by_cols,"
-        "  const void *avi_input_schema,"
-        "  void *gi_cursor, uint32_t gi_col_idx, uint8_t gi_col_type_code,"
-        "  const void *finalize_prog, const void *finalize_out_schema,"
-        "  void **out_result, void **out_finalized);",
-        "int32_t gnitz_op_gather_reduce("
-        "  const void *partial, void *trace_out_cursor,"
-        "  const void *partial_schema,"
-        "  const void *agg_descs, uint32_t num_aggs,"
-        "  void **out_result);",
         # VM execution
         "int32_t gnitz_vm_execute_epoch("
         "  void *handle, void *input_batch,"
@@ -244,13 +175,6 @@ eci = ExternalCompilationInfo(
         "int32_t gnitz_op_scan_trace("
         "  void *cursor, const void *schema, int32_t chunk_limit,"
         "  void **out_result);",
-        # integrate with indexes
-        "int32_t gnitz_op_integrate_with_indexes("
-        "  const void *batch, void *target_table, const void *input_schema,"
-        "  void *gi_table, uint32_t gi_col_idx, uint8_t gi_col_type_code,"
-        "  void *avi_table, int32_t avi_for_max, uint8_t avi_agg_col_type_code,"
-        "  const uint32_t *avi_group_by_cols, uint32_t avi_num_group_by_cols,"
-        "  const void *avi_input_schema, uint32_t avi_agg_col_idx);",
         # shard index (opaque FLSM lifecycle handle)
         "void *gnitz_shard_index_create(uint32_t table_id, char *output_dir, void *schema_desc);",
         "void gnitz_shard_index_close(void *handle);",
@@ -842,64 +766,8 @@ _compact_shards = rffi.llexternal(
 )
 
 # ---------------------------------------------------------------------------
-# DBSP operators (single-call, Rust-side)
+# VM execution
 # ---------------------------------------------------------------------------
-
-_op_distinct = rffi.llexternal(
-    "gnitz_op_distinct",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_anti_join_dt = rffi.llexternal(
-    "gnitz_op_anti_join_dt",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_semi_join_dt = rffi.llexternal(
-    "gnitz_op_semi_join_dt",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_join_dt = rffi.llexternal(
-    "gnitz_op_join_dt",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_join_dt_outer = rffi.llexternal(
-    "gnitz_op_join_dt_outer",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_anti_join_dd = rffi.llexternal(
-    "gnitz_op_anti_join_dd",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_semi_join_dd = rffi.llexternal(
-    "gnitz_op_semi_join_dd",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_join_dd = rffi.llexternal(
-    "gnitz_op_join_dd",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
 
 _vm_execute_epoch = rffi.llexternal(
     "gnitz_vm_execute_epoch",
@@ -1109,122 +977,9 @@ _op_scan_trace = rffi.llexternal(
     compilation_info=eci,
 )
 
-_op_integrate_with_indexes = rffi.llexternal(
-    "gnitz_op_integrate_with_indexes",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,
-     rffi.VOIDP, rffi.UINT, rffi.UCHAR,
-     rffi.VOIDP, rffi.INT, rffi.UCHAR,
-     rffi.UINTP, rffi.UINT,
-     rffi.VOIDP, rffi.UINT],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-# ---------------------------------------------------------------------------
-# Expression programs and scalar functions
-# ---------------------------------------------------------------------------
-
-_expr_program_create = rffi.llexternal(
-    "gnitz_expr_program_create",
-    [rffi.LONGLONGP, rffi.UINT, rffi.UINT, rffi.UINT,
-     rffi.CCHARP, rffi.UINTP, rffi.UINTP, rffi.UINT],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_expr_program_free = rffi.llexternal(
-    "gnitz_expr_program_free",
-    [rffi.VOIDP],
-    lltype.Void,
-    compilation_info=eci,
-)
-
-_scalar_func_create_expr_predicate = rffi.llexternal(
-    "gnitz_scalar_func_create_expr_predicate",
-    [rffi.VOIDP],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_scalar_func_create_expr_map = rffi.llexternal(
-    "gnitz_scalar_func_create_expr_map",
-    [rffi.VOIDP],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_scalar_func_create_universal_predicate = rffi.llexternal(
-    "gnitz_scalar_func_create_universal_predicate",
-    [rffi.UINT, rffi.UCHAR, rffi.ULONGLONG, rffi.INT],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_scalar_func_create_universal_projection = rffi.llexternal(
-    "gnitz_scalar_func_create_universal_projection",
-    [rffi.UINTP, rffi.CCHARP, rffi.UINT],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_scalar_func_free = rffi.llexternal(
-    "gnitz_scalar_func_free",
-    [rffi.VOIDP],
-    lltype.Void,
-    compilation_info=eci,
-)
-
-# ---------------------------------------------------------------------------
-# Linear operators (single-call, Rust-side)
-# ---------------------------------------------------------------------------
-
-_op_filter = rffi.llexternal(
-    "gnitz_op_filter",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_map = rffi.llexternal(
-    "gnitz_op_map",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.INT, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_negate = rffi.llexternal(
-    "gnitz_op_negate",
-    [rffi.VOIDP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
 _op_union = rffi.llexternal(
     "gnitz_op_union",
     [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.VOIDPP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_reduce = rffi.llexternal(
-    "gnitz_op_reduce",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,           # delta, trace_in, trace_out
-     rffi.VOIDP, rffi.VOIDP,                         # input_schema, output_schema
-     rffi.UINTP, rffi.UINT,                           # group_by_cols, num_gcols
-     rffi.VOIDP, rffi.UINT,                           # agg_descs, num_aggs
-     rffi.VOIDP, rffi.INT, rffi.UCHAR,               # avi_cursor, for_max, agg_type
-     rffi.UINTP, rffi.UINT, rffi.VOIDP,              # avi_gcols, num, avi_schema
-     rffi.VOIDP, rffi.UINT, rffi.UCHAR,              # gi_cursor, col_idx, col_type
-     rffi.VOIDP, rffi.VOIDP,                         # finalize_prog, fin_schema
-     rffi.VOIDPP, rffi.VOIDPP],                       # out_result, out_finalized
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_op_gather_reduce = rffi.llexternal(
-    "gnitz_op_gather_reduce",
-    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,
-     rffi.VOIDP, rffi.UINT, rffi.VOIDPP],
     rffi.INT,
     compilation_info=eci,
 )

@@ -65,3 +65,10 @@ PARAM_PROJ_BASE      = 32  # MAP: slots 32..63 = source col index per output col
 PARAM_EXPR_BASE      = 64  # FILTER, MAP: slots 64..255 = expression bytecode words
 PARAM_SHARD_COL_BASE = 128  # SHARD: slots 128..159 = shard column indices
 PARAM_CONST_STR_BASE = 160  # Slots 160-191: string constants for expressions
+
+# --- Aggregate opcodes (match compiler.rs AGG_* constants) ---
+AGG_COUNT          = 1
+AGG_SUM            = 2
+AGG_MIN            = 3
+AGG_MAX            = 4
+AGG_COUNT_NON_NULL = 5
