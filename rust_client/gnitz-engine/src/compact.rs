@@ -158,45 +158,47 @@ pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
     }
 }
 
+/// Returns bytes [4..end] of a German string as a contiguous slice.
+/// Short strings (len ≤ SHORT_STRING_THRESHOLD): inline at struct[8..4+end].
+/// Long strings: full string is in blob at heap_offset; skip first 4 bytes
+/// (they duplicate the prefix, already compared by the caller).
 #[inline]
-pub(crate) fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> std::cmp::Ordering {
+pub(crate) fn german_string_tail<'a>(
+    s: &'a [u8], blob: &'a [u8], length: usize, end: usize,
+) -> &'a [u8] {
+    if length <= SHORT_STRING_THRESHOLD {
+        &s[8..4 + end]
+    } else {
+        let heap_offset = read_u64_le(s, 8) as usize;
+        &blob[heap_offset + 4..heap_offset + end]
+    }
+}
+
+#[inline]
+pub(crate) fn compare_german_strings(
+    a: &[u8], blob_a: &[u8],
+    b: &[u8], blob_b: &[u8],
+) -> std::cmp::Ordering {
     let len_a = read_u32_le(a, 0) as usize;
     let len_b = read_u32_le(b, 0) as usize;
     let min_len = len_a.min(len_b);
+    let prefix_cmp = min_len.min(4);
 
-    // Compare prefix bytes (bytes 4..8 of the 16-byte struct)
-    let limit = min_len.min(4);
-    for i in 0..limit {
-        if a[4 + i] != b[4 + i] {
-            return a[4 + i].cmp(&b[4 + i]);
-        }
+    // Bulk prefix comparison — single 32-bit compare for the common case.
+    let ord = a[4..4 + prefix_cmp].cmp(&b[4..4 + prefix_cmp]);
+    if ord != std::cmp::Ordering::Equal {
+        return ord;
     }
-
     if min_len <= 4 {
         return len_a.cmp(&len_b);
     }
 
-    // Compare remaining bytes (after first 4) — inline access, no heap allocation
-    for i in 4..min_len {
-        let ca = string_byte(a, blob_a, len_a, i);
-        let cb = string_byte(b, blob_b, len_b, i);
-        if ca != cb {
-            return ca.cmp(&cb);
-        }
-    }
-    len_a.cmp(&len_b)
-}
-
-/// Read byte `i` of a German string (zero-alloc).
-/// Short strings (≤12 bytes): suffix bytes are inline at struct offset 8.
-/// Long strings (>12 bytes): data is in the blob heap at the stored offset.
-#[inline]
-pub(crate) fn string_byte(struct_bytes: &[u8], blob: &[u8], length: usize, i: usize) -> u8 {
-    if length <= SHORT_STRING_THRESHOLD {
-        struct_bytes[8 + (i - 4)]
-    } else {
-        let heap_offset = read_u64_le(struct_bytes, 8) as usize;
-        blob[heap_offset + i]
+    // Bulk suffix comparison — vectorised memcmp via [u8]::cmp.
+    let tail_a = german_string_tail(a, blob_a, len_a, min_len);
+    let tail_b = german_string_tail(b, blob_b, len_b, min_len);
+    match tail_a.cmp(tail_b) {
+        std::cmp::Ordering::Equal => len_a.cmp(&len_b),
+        ord => ord,
     }
 }
 
@@ -764,6 +766,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // Build a long German string struct (len > 12) and backing blob.
+    // The full `length` bytes are stored at blob[heap_offset..heap_offset+length].
+    // Bytes [0..4] of the string → prefix field at struct[4..8].
+    // Bytes [4..length] → blob[heap_offset+4..heap_offset+length].
+    fn make_long_string(data: &[u8]) -> ([u8; 16], Vec<u8>) {
+        assert!(data.len() > SHORT_STRING_THRESHOLD);
+        let mut s = [0u8; 16];
+        s[0..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        s[4..8].copy_from_slice(&data[0..4]);
+        // heap_offset = 0
+        s[8..16].copy_from_slice(&0u64.to_le_bytes());
+        let blob = data.to_vec();
+        (s, blob)
+    }
+
     #[test]
     fn test_string_comparison() {
         // Short strings
@@ -784,6 +801,45 @@ mod tests {
         b[0..4].copy_from_slice(&4u32.to_le_bytes());
         b[7] = b'z';
         assert_eq!(compare_german_strings(&a, &[], &b, &[]), std::cmp::Ordering::Less);
+
+        // Long strings — equal except last byte (regression: off-by-4 in blob offset)
+        let data_a: Vec<u8> = b"hello_world_long_A".to_vec(); // len=18
+        let data_b_lt: Vec<u8> = b"hello_world_long_B".to_vec();
+        let (sa, blob_a) = make_long_string(&data_a);
+        let (sb_lt, blob_b_lt) = make_long_string(&data_b_lt);
+        assert_eq!(
+            compare_german_strings(&sa, &blob_a, &sb_lt, &blob_b_lt),
+            std::cmp::Ordering::Less,
+        );
+
+        // Long strings — equal (common same_group path)
+        let (sb_eq, blob_b_eq) = make_long_string(&data_a);
+        assert_eq!(
+            compare_german_strings(&sa, &blob_a, &sb_eq, &blob_b_eq),
+            std::cmp::Ordering::Equal,
+        );
+
+        // Long strings — prefix difference (early exit)
+        let data_b_prefix: Vec<u8> = b"aello_world_long_A".to_vec();
+        let (sb_prefix, blob_b_prefix) = make_long_string(&data_b_prefix);
+        assert_eq!(
+            compare_german_strings(&sb_prefix, &blob_b_prefix, &sa, &blob_a),
+            std::cmp::Ordering::Less,
+        );
+
+        // Mixed short (len=10) vs long (len=20) with same prefix
+        let short_data = b"0123456789"; // len=10, ≤ 12 → short
+        let mut s_short = [0u8; 16];
+        s_short[0..4].copy_from_slice(&10u32.to_le_bytes());
+        s_short[4..8].copy_from_slice(&short_data[0..4]);
+        s_short[8..14].copy_from_slice(&short_data[4..]);
+        let long_data: Vec<u8> = b"01234567890123456789".to_vec(); // len=20
+        let (s_long, blob_long) = make_long_string(&long_data);
+        // short ("0123456789") < long ("01234567890123456789") — same prefix, shorter len
+        assert_eq!(
+            compare_german_strings(&s_short, &[], &s_long, &blob_long),
+            std::cmp::Ordering::Less,
+        );
     }
 
     #[test]

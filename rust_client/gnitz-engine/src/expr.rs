@@ -4,7 +4,7 @@
 //! Port of gnitz/dbsp/expr.py — same bytecode format, same semantics.
 
 use crate::compact::{
-    compare_german_strings, string_byte,
+    compare_german_strings, german_string_tail,
 };
 use crate::merge::MemBatch;
 use crate::util::read_u32_le;
@@ -248,15 +248,12 @@ fn compare_col_string_vs_const(
         return col_len.cmp(&c_len);
     }
 
-    // Compare remaining bytes
-    for i in 4..min_len {
-        let ca = string_byte(struct_bytes, blob, col_len, i);
-        let cb = const_bytes[i];
-        if ca != cb {
-            return ca.cmp(&cb);
-        }
+    // Bulk suffix comparison — vectorised memcmp via [u8]::cmp.
+    let col_tail = german_string_tail(struct_bytes, blob, col_len, min_len);
+    match col_tail.cmp(&const_bytes[4..min_len]) {
+        std::cmp::Ordering::Equal => col_len.cmp(&c_len),
+        ord => ord,
     }
-    col_len.cmp(&c_len)
 }
 
 /// Check equality of a German String column value against a constant byte string.
@@ -280,13 +277,7 @@ fn col_string_equals_const(
     if col_len <= 4 {
         return true;
     }
-    // Compare remaining bytes
-    for i in 4..col_len {
-        if string_byte(struct_bytes, blob, col_len, i) != const_bytes[i] {
-            return false;
-        }
-    }
-    true
+    german_string_tail(struct_bytes, blob, col_len, col_len) == &const_bytes[4..col_len]
 }
 
 // ---------------------------------------------------------------------------
