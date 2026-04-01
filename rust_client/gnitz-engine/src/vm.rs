@@ -597,7 +597,6 @@ pub struct Program {
 // that owns the plan).  Raw pointers into RPython-managed ScalarFuncKind,
 // Table, and ExprProgram are stable for the lifetime of the plan.
 unsafe impl Send for Program {}
-unsafe impl Sync for Program {}
 
 // ---------------------------------------------------------------------------
 // Register file (runtime state)
@@ -722,10 +721,10 @@ pub fn execute_epoch(
 
     // Helper macros for safe indexed access via raw pointer.
     macro_rules! reg {
-        ($i:expr) => {{ debug_assert!(($i as usize) < nregs); unsafe { &*regs.add($i as usize) } }};
+        ($i:expr) => {{ assert!(($i as usize) < nregs, "register index {} out of bounds (nregs={})", $i, nregs); unsafe { &*regs.add($i as usize) } }};
     }
     macro_rules! reg_mut {
-        ($i:expr) => {{ debug_assert!(($i as usize) < nregs); unsafe { &mut *regs.add($i as usize) } }};
+        ($i:expr) => {{ assert!(($i as usize) < nregs, "register index {} out of bounds (nregs={})", $i, nregs); unsafe { &mut *regs.add($i as usize) } }};
     }
     macro_rules! cursor_mut {
         ($i:expr) => {{
@@ -1429,8 +1428,32 @@ mod tests {
         assert_eq!(rows1.len(), 1);
         assert_eq!(rows1[0], (1, 1, 42)); // clamped to +1
 
-        // Cleanup cursor
         unsafe { drop(Box::from_raw(ch1 as *mut crate::read_cursor::CursorHandle)); }
+
+        // Tick 2: delta w=-1, integral before tick = +3, after = +2 (still positive).
+        // No boundary crossing → output should be empty.
+        let cursor2 = table.create_cursor().unwrap();
+        let ch2 = Box::into_raw(Box::new(cursor2)) as *mut libc::c_void;
+        let cursors2 = vec![std::ptr::null_mut(), ch2, std::ptr::null_mut()];
+        let input2 = make_batch(schema, &[(1, 0, -1, 42)]);
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors2).unwrap();
+        assert!(r2.is_none(), "no boundary crossing: output should be empty");
+        unsafe { drop(Box::from_raw(ch2 as *mut crate::read_cursor::CursorHandle)); }
+
+        // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
+        // Positive→non-positive boundary crossed → retraction: output pk=1 w=-1.
+        let cursor3 = table.create_cursor().unwrap();
+        let ch3 = Box::into_raw(Box::new(cursor3)) as *mut libc::c_void;
+        let cursors3 = vec![std::ptr::null_mut(), ch3, std::ptr::null_mut()];
+        let input3 = make_batch(schema, &[(1, 0, -2, 42)]);
+        let r3 = execute_epoch(&vm.program, &mut vm.regfile, input3, 0, 2, &cursors3)
+            .unwrap()
+            .unwrap();
+        let rows3 = extract_rows(&r3);
+        assert_eq!(rows3.len(), 1);
+        assert_eq!(rows3[0], (1, -1, 42)); // retraction
+        unsafe { drop(Box::from_raw(ch3 as *mut crate::read_cursor::CursorHandle)); }
+
         table.close();
     }
 

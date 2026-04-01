@@ -238,11 +238,17 @@ class Engine(object):
         self.sys.circuit_params.flush()
         self.sys.circuit_group_cols.flush()
 
-        # 4. View record (Invokes reactive handler)
+        # 4. View record (registers the view family in the registry)
         self._write_view_record(vid, sid, view_name, sql_definition, directory, 0)
         self.sys.views.flush()
 
         self._advance_sequence(sys.SEQ_ID_TABLES, vid - 1, vid)
+
+        # 5. Eagerly compile to catch schema errors at creation time.
+        # The view family is already registered; the caller must drop it on failure.
+        if self.program_cache.compile_from_graph(vid) is None:
+            raise LayoutError("View circuit schema does not match declared output columns")
+
         return self.registry.get(schema_name, view_name)
 
     def drop_view(self, qualified_name):

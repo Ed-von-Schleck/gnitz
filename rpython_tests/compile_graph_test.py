@@ -929,7 +929,8 @@ def test_skip_exchange_non_copartitioned(base_dir):
     # GROUP BY col 1 (= grp, not pk) — shard col != PK → not co-partitioned
     r = builder.reduce(src, agg_func_id=AGG_SUM, group_by_cols=[1], agg_col_idx=2)
     builder.sink(r, target_table_id=0)
-    out_cols = [("pk", types.TYPE_U64.code), ("sum_val", types.TYPE_I64.code)]
+    # GROUP BY I64 col → synthetic U128 PK + group col + agg col (3 columns)
+    out_cols = [("pk", types.TYPE_U128.code), ("grp", types.TYPE_I64.code), ("sum_val", types.TYPE_I64.code)]
     graph = builder.build(out_cols)
     db.create_view("test.v_noncopart", graph, "")
 
