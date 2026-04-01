@@ -655,6 +655,11 @@ pub fn write_string_from_raw(
         let new_offset = blob.len();
         blob.extend_from_slice(src_data);
         dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
+    } else {
+        panic!(
+            "write_string_from_raw: string length {} exceeds SHORT_STRING_THRESHOLD but src_blob_ptr is null",
+            length
+        );
     }
 
     col_buf.extend_from_slice(&dest);
