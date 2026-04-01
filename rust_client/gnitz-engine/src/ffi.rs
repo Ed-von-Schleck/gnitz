@@ -2899,7 +2899,7 @@ pub extern "C" fn gnitz_batch_clone(handle: *const libc::c_void) -> *mut libc::c
     if handle.is_null() { return ptr::null_mut(); }
     let result = panic::catch_unwind(|| {
         let src = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
-        let mut cloned = crate::memtable::OwnedBatch {
+        let cloned = crate::memtable::OwnedBatch {
             pk_lo: src.pk_lo.clone(),
             pk_hi: src.pk_hi.clone(),
             weight: src.weight.clone(),

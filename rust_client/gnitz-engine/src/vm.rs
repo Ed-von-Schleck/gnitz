@@ -6,11 +6,10 @@
 use crate::compact::SchemaDescriptor;
 use crate::memtable::OwnedBatch;
 use crate::ops::{self, AggDescriptor, GiDesc, AviDesc};
-use crate::read_cursor::{self, CursorHandle, ReadCursor};
+use crate::read_cursor::{CursorHandle, ReadCursor};
 use crate::scalar_func::ScalarFuncKind;
 use crate::table::Table;
 
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Instruction set
@@ -546,7 +545,7 @@ impl VmHandle {
             // because owned_trace_regs is not modified here, and the table is
             // accessed through owned_tables which is a separate field.
             let table: &mut Table = unsafe { &mut *(&mut *self.owned_tables[table_idx] as *mut Table) };
-            table.compact_if_needed();
+            let _ = table.compact_if_needed();
             match table.create_cursor() {
                 Ok(ch) => {
                     let mut boxed = Box::new(ch);

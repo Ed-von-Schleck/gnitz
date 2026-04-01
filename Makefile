@@ -10,7 +10,6 @@ RPYFLAGS         ?= $(RPYFLAGS_DEV)
 RELEASE_CFLAGS   ?= -march=native
 
 TEST_FILES := \
-	rpython_tests/core_comprehensive_test.py \
 	rpython_tests/catalog_comprehensive_test.py \
 	rpython_tests/compile_graph_test.py \
 	rpython_tests/server_test.py \

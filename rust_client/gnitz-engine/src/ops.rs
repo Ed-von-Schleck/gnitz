@@ -4197,7 +4197,7 @@ mod tests {
         use crate::scalar_func::ScalarFuncKind;
 
         let schema = make_schema_u64_i64();
-        let batch = OwnedBatch::with_schema(schema, 1);
+        let _batch = OwnedBatch::with_schema(schema, 1);
         // count=0 by default after with_schema
         let empty_batch = OwnedBatch::empty(1);
 

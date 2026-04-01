@@ -74,12 +74,19 @@ const AGG_MIN: u8 = 3;
 const AGG_MAX: u8 = 4;
 const AGG_COUNT_NON_NULL: u8 = 5;
 
-// System table IDs
+// System table IDs (reserved for future use when the compiler reads circuit
+// definitions from the catalog's system tables instead of the FFI builder API).
+#[allow(dead_code)]
 const SYS_CIRCUIT_NODES: u32 = 11;
+#[allow(dead_code)]
 const SYS_CIRCUIT_EDGES: u32 = 12;
+#[allow(dead_code)]
 const SYS_CIRCUIT_SOURCES: u32 = 13;
+#[allow(dead_code)]
 const SYS_CIRCUIT_PARAMS: u32 = 14;
+#[allow(dead_code)]
 const SYS_CIRCUIT_GROUP_COLS: u32 = 15;
+#[allow(dead_code)]
 const SYS_DEP_TAB: u32 = 6;
 
 // System table column indices (after PK column)
@@ -833,6 +840,7 @@ fn col(tc: u8, sz: u8, nullable: bool) -> SchemaColumn {
     SchemaColumn { type_code: tc, size: sz, nullable: if nullable { 1 } else { 0 }, _pad: 0 }
 }
 
+#[allow(dead_code)]
 fn type_size(tc: u8) -> u8 {
     match tc {
         type_code::U8 | type_code::I8 => 1,
@@ -1822,7 +1830,7 @@ fn build_plan(
 
     // For post-exchange plans: add an extra input register for the exchange output
     let mut exchange_input_reg_id: i32 = -1;
-    if let Some((ex_nid, ex_schema)) = exchange_input {
+    if exchange_input.is_some() {
         exchange_input_reg_id = next_reg;
         next_reg += 1;
         extra_regs += 0; // already counted in next_reg
@@ -1959,8 +1967,6 @@ pub unsafe fn compile_view(
     if nodes.is_empty() {
         return CompileResult::error(-1);
     }
-    for n in &nodes {
-    }
     let edges = load_edges(sys_edges, view_id, sys_edges_schema);
     let sources = load_sources(sys_sources, view_id, sys_sources_schema);
     let (params, str_params) = load_params(sys_params, view_id, sys_params_schema);
@@ -1985,11 +1991,6 @@ pub unsafe fn compile_view(
     if topo_sort(&mut graph).is_err() {
         return CompileResult::error(-2); // cycle
     }
-    for e in &graph.edges {
-    }
-    for (nid, params) in &graph.params {
-    }
-
     // 3. Annotate
     let ann = annotate(&graph, sys_dep, sys_dep_schema, ext_tables);
 

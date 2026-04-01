@@ -132,6 +132,7 @@ impl ShardCursor {
         }
     }
 
+    #[allow(dead_code)]
     fn weight(&self, shard: &MappedShard) -> i64 {
         if self.is_valid() {
             shard.get_weight(self.position)

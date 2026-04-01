@@ -25,6 +25,7 @@ enum CursorSource<'a> {
 }
 
 impl<'a> CursorSource<'a> {
+    #[allow(dead_code)]
     fn count(&self) -> usize {
         match self {
             CursorSource::Batch(b) => b.count,
@@ -147,7 +148,7 @@ fn entry_cmp(
 // ReadCursorEntry — per-source position tracker
 // ---------------------------------------------------------------------------
 
-struct ReadCursorEntry<'a> {
+pub(crate) struct ReadCursorEntry<'a> {
     source: CursorSource<'a>,
     position: usize,
     count: usize,
@@ -264,7 +265,7 @@ impl<'a> ReadCursor<'a> {
         )
     }
 
-    pub fn new(entries: Vec<ReadCursorEntry<'a>>, schema: SchemaDescriptor) -> Self {
+    pub(crate) fn new(entries: Vec<ReadCursorEntry<'a>>, schema: SchemaDescriptor) -> Self {
         let n = entries.len();
         let tree = if n > 1 {
             Some(Self::build_tree(&entries, &schema))

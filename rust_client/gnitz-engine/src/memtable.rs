@@ -713,7 +713,6 @@ impl MemTable {
         let num_payload_cols = self.schema.num_columns as usize - 1;
 
         if self.cached_consolidated.is_none() && !self.runs.is_empty() {
-            let total_rows: usize = self.runs.iter().map(|r| r.count).sum();
             let batches: Vec<MemBatch> =
                 self.runs.iter().map(|r| r.as_mem_batch()).collect();
             let consolidated = consolidate_batches(&batches, &self.schema);
@@ -1216,7 +1215,7 @@ mod tests {
         let mut pk_lo = vec![0u8; n * 8];
         let mut pk_hi = vec![0u8; n * 8];
         let mut weight = vec![0u8; n * 8];
-        let mut null_bmp = vec![0u8; n * 8];
+        let null_bmp = vec![0u8; n * 8];
         let mut col0 = vec![0u8; n * 8]; // group_val (I64)
         let mut col1 = vec![0u8; n * 8]; // agg_val (I64)
         for (i, &(plo, phi, w, gv, av)) in rows.iter().enumerate() {
@@ -1227,7 +1226,7 @@ mod tests {
             col0[i*8..i*8+8].copy_from_slice(&gv.to_le_bytes());
             col1[i*8..i*8+8].copy_from_slice(&av.to_le_bytes());
         }
-        let mut batch = OwnedBatch {
+        let batch = OwnedBatch {
             pk_lo, pk_hi, weight, null_bmp,
             col_data: vec![col0, col1],
             blob: Vec::new(),
