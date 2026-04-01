@@ -710,6 +710,57 @@ fn schemas_physically_identical(a: &SchemaDescriptor, b: &SchemaDescriptor) -> b
     true
 }
 
+/// Split fold programs and rewrite state between pre- and post-exchange plans.
+///
+/// `opt_fold_reduce_map` records programs for ALL REDUCE nodes in the graph.
+/// When the graph is split at EXCHANGE_SHARD, only the programs for REDUCE
+/// nodes in each plan half are valid for that half. This function partitions
+/// `progs` and re-indexes `fold_finalize` so each plan half gets zero-based
+/// indices into its own program slice.
+fn split_fold_programs(
+    rw: Rewrites,
+    progs: Vec<Box<ExprProgram>>,
+    pre_nids: &HashSet<i32>,
+) -> (Rewrites, Vec<Box<ExprProgram>>, Rewrites, Vec<Box<ExprProgram>>) {
+    // Invert fold_finalize: old program index → reduce_nid
+    let mut idx_to_nid: HashMap<usize, i32> = HashMap::new();
+    for (&nid, &idx) in &rw.fold_finalize {
+        idx_to_nid.insert(idx, nid);
+    }
+
+    let mut pre_progs: Vec<Box<ExprProgram>> = Vec::new();
+    let mut post_progs: Vec<Box<ExprProgram>> = Vec::new();
+    let mut pre_fold: HashMap<i32, usize> = HashMap::new();
+    let mut post_fold: HashMap<i32, usize> = HashMap::new();
+
+    for (old_idx, prog) in progs.into_iter().enumerate() {
+        if let Some(&nid) = idx_to_nid.get(&old_idx) {
+            if pre_nids.contains(&nid) {
+                let new_idx = pre_progs.len();
+                pre_progs.push(prog);
+                pre_fold.insert(nid, new_idx);
+            } else {
+                let new_idx = post_progs.len();
+                post_progs.push(prog);
+                post_fold.insert(nid, new_idx);
+            }
+        }
+    }
+
+    let rw_pre = Rewrites {
+        skip_nodes: rw.skip_nodes.clone(),
+        fold_finalize: pre_fold,
+        folded_maps: rw.folded_maps.clone(),
+    };
+    let rw_post = Rewrites {
+        skip_nodes: rw.skip_nodes,
+        fold_finalize: post_fold,
+        folded_maps: rw.folded_maps,
+    };
+
+    (rw_pre, pre_progs, rw_post, post_progs)
+}
+
 fn opt_distinct(graph: &CircuitGraph, ann: &Annotation, rw: &mut Rewrites) {
     for n in &graph.nodes {
         if n.opcode == OPCODE_DISTINCT {
@@ -1660,6 +1711,13 @@ fn emit_gather_reduce(
     let mut agg_descs: Vec<AggDescriptor> = Vec::new();
 
     if agg_count > 0 {
+        assert!(
+            num_out_cols >= agg_count as usize,
+            "GATHER_REDUCE node {}: agg_count ({}) exceeds partial schema column count ({})",
+            nid,
+            agg_count,
+            num_out_cols
+        );
         for ai in 0..agg_count as i32 {
             let packed = node_params.get(&(PARAM_AGG_SPEC_BASE + ai)).copied().unwrap_or(0);
             let func_id = (packed >> 32) as u8;
@@ -1990,13 +2048,19 @@ pub unsafe fn compile_view(
             }
         }
 
+        // Split fold programs between pre and post plans so each half gets
+        // only the ExprPrograms for REDUCE nodes in its own ordered slice.
+        let pre_nids: HashSet<i32> = pre_ordered.iter().copied().collect();
+        let (rw_pre, pre_progs, rw_post, post_progs) =
+            split_fold_programs(rw, owned_expr_progs_for_rw, &pre_nids);
+
         // Build pre-plan (output is the exchange input node's register)
         let pre_result = build_plan(
-            &graph, &ann, &rw, &pre_ordered, ext_tables,
+            &graph, &ann, &rw_pre, &pre_ordered, ext_tables,
             view_dir, view_table_id, view_id, &ann.in_schema,
             if exchange_input_nid >= 0 { Some(exchange_input_nid) } else { None },
             None, // no exchange_input (this IS the pre-plan)
-            Vec::new(), // no pre-built expr progs for pre-plan
+            pre_progs,
         );
         let pre = match pre_result {
             Some(p) => p,
@@ -2020,11 +2084,11 @@ pub unsafe fn compile_view(
         // Post-plan needs a fresh register namespace — re-assign registers
         // starting from 0 for post_ordered nodes, plus an input register
         let post_result = build_plan(
-            &graph, &ann, &rw, &post_ordered, ext_tables,
+            &graph, &ann, &rw_post, &post_ordered, ext_tables,
             view_dir, view_table_id, view_id, &exchange_schema,
             None, // output_node_id: post-plan has an explicit INTEGRATE sink
             Some((ex_nid, exchange_schema)), // exchange_input: map exchange → input reg
-            owned_expr_progs_for_rw, // fold_reduce_map expr progs for post-plan
+            post_progs, // fold_reduce_map expr progs for post-plan
         );
         let post = match post_result {
             Some(p) => p,
@@ -2339,5 +2403,48 @@ mod tests {
         assert_eq!(out.columns[0].type_code, type_code::U128);
         assert_eq!(out.columns[1].type_code, type_code::STRING);
         assert_eq!(out.columns[2].type_code, type_code::I64);
+    }
+
+    /// Verify that split_fold_programs correctly routes each ExprProgram to the
+    /// plan half that owns its REDUCE node, and re-indexes fold_finalize to
+    /// zero-based indices within each half.
+    ///
+    /// Graph: SCAN(0) → REDUCE(1) → MAP(2) → EXCHANGE_SHARD(3) → GATHER_REDUCE(4)
+    /// REDUCE(1) is in pre_ordered; MAP(2) is folded into REDUCE(1).
+    /// After split: pre_progs has 1 program (for REDUCE 1), post_progs is empty.
+    #[test]
+    fn test_split_fold_programs_routes_to_pre() {
+        let code = vec![0i64; 4]; // minimal non-identity code
+        let prog = ExprProgram::new(code, 1, 0, Vec::new());
+        let progs: Vec<Box<ExprProgram>> = vec![Box::new(prog)];
+
+        let mut fold_finalize = HashMap::new();
+        fold_finalize.insert(1i32, 0usize); // REDUCE node 1 → program index 0
+
+        let mut folded_maps = HashMap::new();
+        folded_maps.insert(2i32, 1i32); // MAP node 2 folded into REDUCE node 1
+
+        let rw = Rewrites {
+            skip_nodes: HashSet::new(),
+            fold_finalize,
+            folded_maps,
+        };
+
+        // pre_ordered contains only the REDUCE node (1)
+        let mut pre_nids = HashSet::new();
+        pre_nids.insert(1i32);
+
+        let (rw_pre, pre_progs, rw_post, post_progs) =
+            split_fold_programs(rw, progs, &pre_nids);
+
+        // The program must land in pre_progs with re-indexed entry 0
+        assert_eq!(pre_progs.len(), 1);
+        assert_eq!(post_progs.len(), 0);
+        assert_eq!(rw_pre.fold_finalize.get(&1), Some(&0usize));
+        assert!(!rw_post.fold_finalize.contains_key(&1));
+
+        // folded_maps and skip_nodes are cloned to both halves
+        assert!(rw_pre.folded_maps.contains_key(&2));
+        assert!(rw_post.folded_maps.contains_key(&2));
     }
 }
