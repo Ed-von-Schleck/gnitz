@@ -22,4 +22,5 @@ pub mod expr;
 pub mod scalar_func;
 pub mod ops;
 pub mod vm;
+pub mod compiler;
 pub mod ffi;

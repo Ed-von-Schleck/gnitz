@@ -13,7 +13,7 @@
 *   **Dead Code:** Elimination occurs *after* annotation. Unreachable code that violates type constraints will still cause translation failure.
 
 ## 2. Language Subset & Restrictions
-*   **Banned:** `eval`, `exec`, dynamic class/function creation, runtime metaprogramming, `**kwargs`, `set` (use `dict` keys), multiple inheritance (mostly), re-binding globals.
+*   **Banned:** `eval`, `exec`, dynamic class/function creation, runtime metaprogramming, `**kwargs`, `set` (use `dict` keys), multiple inheritance (mostly), re-binding globals, **closures** (nested `def` that captures outer variables).
 *   **Restricted:** Generators (simple iteration only), Recursion (avoid in hot paths), Exceptions (expensive in JIT).
 *   **Globals:** Treated as immutable `const` after initialization. Do not mutate global module state; use a Singleton `State` class instance passed via `entry_point`.
 
@@ -77,7 +77,8 @@
     *   **Fix:** Avoid `os.path` (which slices internally) in favor of `rpython.rlib.rposix` functions. For manual slicing, use an explicit `assert i >= 0` immediately before the slice to guide the annotator's type inference.
 11. **Signedness UnionError:** Occurs when a single function or method (e.g., `Buffer.put_i64`) is called in different places with both signed (`r_int64`) and unsigned (`r_uint64`) integers. RPython cannot unify these into a single type. **Fix:** Use `rffi.cast(rffi.LONGLONG, ...)` at the call site to ensure all inputs are consistently treated as signed machine words.
 12. **Unsigned Logical Comparison:** Comparing unsigned bit patterns (retrieved via `get_int()`) for columns that are logically signed (`TYPE_I64`, etc.). This causes negative numbers to sort as larger than positive numbers. **Fix:** Always cast to `r_int64` (using `rffi.cast`).
-13. **`rffi.c_memcpy` Const-Correctness:** `rffi.c_memcpy`'s source parameter is declared `const void *` (`render_as_const`). Passing a regular `rffi.VOIDP` causes an `AnnotatorError`. **Fix:** Use `c_memmove` from `gnitz/storage/buffer.py` — it accepts `(VOIDP, VOIDP, SIZE_T)` without const qualifiers.
+13. **Closures:** Defining `def helper(x):` inside a method that captures `self` or local variables. RPython raises `ValueError: RPython functions cannot create closures`. **Fix:** Move the helper to module scope and pass captured values as explicit parameters.
+14. **`rffi.c_memcpy` Const-Correctness:** `rffi.c_memcpy`'s source parameter is declared `const void *` (`render_as_const`). Passing a regular `rffi.VOIDP` causes an `AnnotatorError`. **Fix:** Use `c_memmove` from `gnitz/storage/buffer.py` — it accepts `(VOIDP, VOIDP, SIZE_T)` without const qualifiers.
 
 # Appendix B: Coding practices
 

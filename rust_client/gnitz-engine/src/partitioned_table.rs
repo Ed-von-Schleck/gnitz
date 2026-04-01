@@ -314,6 +314,14 @@ impl PartitionedTable {
         self.tables.clear();
     }
 
+    /// Get the base directory for child table creation (partition 0's directory).
+    pub fn child_base_dir(&self) -> String {
+        if self.tables.is_empty() {
+            return String::new();
+        }
+        self.tables[0].directory().to_string()
+    }
+
     pub fn create_child(
         &self,
         child_name: &str,

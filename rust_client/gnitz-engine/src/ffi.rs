@@ -1322,6 +1322,12 @@ pub extern "C" fn gnitz_vm_execute_epoch(
             unsafe { slice::from_raw_parts(cursor_handles, num_cursors as usize) }
         };
 
+        // Refresh owned-table cursors BEFORE execute_epoch.
+        // bind_cursors (inside execute_epoch) preserves already-set cursors.
+        if !vm.owned_trace_regs.is_empty() {
+            vm.refresh_owned_cursors();
+        }
+
         match crate::vm::execute_epoch(&vm.program, &mut vm.regfile, batch, input_reg_idx, output_reg_idx, cursors) {
             Ok(Some(output)) => {
                 unsafe { *out_result = Box::into_raw(Box::new(output)) as *mut libc::c_void; }
@@ -3207,6 +3213,29 @@ pub extern "C" fn gnitz_ptable_found_blob_ptr(handle: *const libc::c_void) -> *c
     result.unwrap_or(ptr::null())
 }
 
+/// Get the child base directory for a PartitionedTable (partition 0's directory).
+#[no_mangle]
+pub extern "C" fn gnitz_ptable_get_child_dir(
+    handle: *const libc::c_void,
+    buf: *mut libc::c_char,
+    buf_len: u32,
+) -> i32 {
+    if handle.is_null() || buf.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        let pt = unsafe { &*(handle as *const crate::partitioned_table::PartitionedTable) };
+        let dir = pt.child_base_dir();
+        let bytes = dir.as_bytes();
+        let n = bytes.len().min(buf_len as usize - 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+        }
+        n as i32
+    });
+    result.unwrap_or(-1)
+}
+
 #[no_mangle]
 pub extern "C" fn gnitz_ptable_create_child(
     handle: *const libc::c_void,
@@ -3951,6 +3980,100 @@ pub extern "C" fn gnitz_multi_scatter(
             }
         }
         0i32
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
+// Circuit compiler FFI
+// ---------------------------------------------------------------------------
+
+/// Compile a view circuit entirely in Rust.
+///
+/// Takes system table handles + external registry and returns a CompileResult
+/// containing VmHandle(s) + metadata.
+///
+/// Returns 0 on success (result populated), negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_compile_view(
+    view_id: u64,
+    // 6 system table handles (NULL if absent)
+    sys_nodes: *mut libc::c_void,
+    sys_edges: *mut libc::c_void,
+    sys_sources: *mut libc::c_void,
+    sys_params: *mut libc::c_void,
+    sys_gcols: *mut libc::c_void,
+    sys_dep: *mut libc::c_void,
+    // 6 system table schemas (packed SchemaDescriptor pointers)
+    sys_nodes_schema: *const crate::compact::SchemaDescriptor,
+    sys_edges_schema: *const crate::compact::SchemaDescriptor,
+    sys_sources_schema: *const crate::compact::SchemaDescriptor,
+    sys_params_schema: *const crate::compact::SchemaDescriptor,
+    sys_gcols_schema: *const crate::compact::SchemaDescriptor,
+    sys_dep_schema: *const crate::compact::SchemaDescriptor,
+    // View family directory, table_id, and schema
+    view_dir: *const libc::c_char,
+    view_table_id: u32,
+    view_schema: *const crate::compact::SchemaDescriptor,
+    // External table registry: parallel arrays
+    reg_tids: *const i64,
+    reg_handles: *const *mut libc::c_void,
+    reg_schemas: *const crate::compact::SchemaDescriptor,
+    reg_count: u32,
+    // Output: flat i64 buffer of COMPILE_RESULT_SLOTS entries
+    out_result: *mut i64,
+) -> i32 {
+    if out_result.is_null() || view_schema.is_null() {
+        return -1;
+    }
+    let result = panic::catch_unwind(|| {
+        // Build external tables array
+        let ext_tables: Vec<crate::compiler::ExternalTable> = if reg_count > 0 && !reg_tids.is_null() && !reg_handles.is_null() && !reg_schemas.is_null() {
+            (0..reg_count as usize).map(|i| unsafe {
+                crate::compiler::ExternalTable {
+                    table_id: *reg_tids.add(i),
+                    handle: *reg_handles.add(i) as *mut crate::table::Table,
+                    schema: *reg_schemas.add(i),
+                }
+            }).collect()
+        } else {
+            Vec::new()
+        };
+
+        let view_dir_str = if view_dir.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(view_dir) }.to_string_lossy().into_owned()
+        };
+
+        let cr = unsafe {
+            crate::compiler::compile_view(
+                view_id,
+                sys_nodes as *mut crate::table::Table,
+                sys_edges as *mut crate::table::Table,
+                sys_sources as *mut crate::table::Table,
+                sys_params as *mut crate::table::Table,
+                sys_gcols as *mut crate::table::Table,
+                sys_dep as *mut crate::table::Table,
+                &*sys_nodes_schema,
+                &*sys_edges_schema,
+                &*sys_sources_schema,
+                &*sys_params_schema,
+                &*sys_gcols_schema,
+                &*sys_dep_schema,
+                &view_dir_str,
+                view_table_id,
+                &*view_schema,
+                &ext_tables,
+            )
+        };
+
+        let out_slice = unsafe {
+            slice::from_raw_parts_mut(out_result, crate::compiler::COMPILE_RESULT_SLOTS)
+        };
+        out_slice.copy_from_slice(&cr.buf);
+        let error_code = cr.buf[230]; // CR_ERROR_CODE
+        if error_code != 0 { error_code as i32 } else { 0 }
     });
     result.unwrap_or(-99)
 }

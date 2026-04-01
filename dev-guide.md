@@ -115,6 +115,63 @@ When adding or modifying a merge path (tournament tree, sort, compaction):
       defensively re-sorts as a safety net, but the caller should also
       ensure the batch is sorted before ingestion.
 
+## FFI handle type safety
+
+RPython wraps two distinct Rust handle types for table storage:
+
+- `EphemeralTable._handle` → `*mut Table` (Rust `Table` struct)
+- `PartitionedTable._handle` → `*mut PartitionedTable` (Rust `PartitionedTable` struct)
+
+Both are stored as `rffi.VOIDP` in Python. **They are NOT interchangeable.**
+Casting a `PartitionedTable*` to `Table*` and dereferencing it reads garbage
+(different struct layout). Any Rust FFI function that expects a `Table*` will
+corrupt memory if given a `PartitionedTable*`.
+
+When writing FFI code that operates on "the view's store":
+
+- [ ] Does the code distinguish `EphemeralTable` from `PartitionedTable`?
+      Use `isinstance()` on the Python side, or pass a type tag.
+- [ ] If you need a `Table*` from a `PartitionedTable`, use
+      `gnitz_ptable_create_child` or `gnitz_ptable_get_child_dir` — never
+      cast the PartitionedTable handle to `Table*`.
+- [ ] For child table creation in multi-worker mode, each worker's
+      `PartitionedTable` has different partition directories. Use
+      `PartitionedTable.get_child_base_dir()` (→ partition 0's directory)
+      to get a worker-unique base path. Using `TableFamily.directory`
+      gives the SAME path for all workers, causing data corruption.
+
+## Exchange schema contract
+
+The exchange (OPCODE_EXCHANGE_SHARD) serializes batches using the
+**pre-plan's `out_schema`** attribute on `ExecutablePlan`. This schema
+determines column sizes during batch packing/unpacking.
+
+> **The pre-plan's `out_schema` MUST match the physical layout of the
+> batch at the exchange output register.** It is NOT the view's final
+> output schema — it is the intermediate schema at the exchange point.
+
+For a view `INPUT → FILTER → EXCHANGE → REDUCE → INTEGRATE`:
+- Pre-plan out_schema = FILTER output schema (= input table schema)
+- Post-plan out_schema = view output schema (= REDUCE output schema)
+
+If the pre-plan's `out_schema` is set to the view's final schema instead
+of the exchange intermediate schema, STRING columns (16 bytes) may be
+serialized as I64 (8 bytes), causing silent data corruption at workers.
+
+## Aggregate output type contract
+
+`UniversalAccumulator.output_column_type()` (RPython) determines the
+column type in the REDUCE output schema. The rule is simple:
+
+- COUNT, COUNT_NON_NULL → **I64** (always)
+- SUM/MIN/MAX on F32/F64 → **F64**
+- SUM/MIN/MAX on anything else → **I64** (including STRING, I32, U32, etc.)
+
+The accumulator stores values as `u64` bit patterns (8 bytes). The output
+column is ALWAYS 8 bytes. MIN/MAX on STRING stores the German String
+compare key (first 8 bytes), not the full 16-byte string struct. Any Rust
+code that builds REDUCE output schemas must follow this rule exactly.
+
 ## Rust static lib rebuild rule
 
 Individual test targets (`make run-<name>-c`) do **not** rebuild the Rust
@@ -295,16 +352,37 @@ lookup — but will break if a retracted row contains a long string.
 When any test fails (single-worker or multi-worker) and the root cause is
 not immediately obvious:
 
-1. **Add logging before re-running.** If you don't know exactly what value is wrong
-   and where, you don't have enough information to re-run yet. Add targeted `log.debug()`
-   calls at the send side and receive side of the suspected path — at minimum log the
-   key column values and view_id. One instrumented run is worth more than ten blind
-   re-runs. For cross-boundary bugs (RPython ↔ Rust FFI), add `eprintln!` on the
-   Rust side — rebuild is ~55s and the output goes to `~/git/gnitz/tmp/server_debug.log`.
-2. **Isolate with 1 worker.** If the test passes with `GNITZ_WORKERS=1` and fails with
-   `GNITZ_WORKERS=4`, the bug is in the exchange/fanout/stash path, not in computation.
-3. **Bisect by sub-path.** Add a flag or env var to disable the new fast-path and force
-   the old path. If the test passes with the old path, the bug is in the new path only.
-4. **Verify your fix is in the binary.** See "RPython server rebuild" below. If the
-   build output does not show `annotate` and `rtype_lltype` timer lines, the RPython
-   translation was skipped and your Python changes are NOT in the binary.
+1. **Add COMPREHENSIVE logging before re-running — never guess.** If you
+   don't know exactly what value is wrong and where, you don't have enough
+   information to re-run yet. Each rebuild cycle costs ~50s. A guess that's
+   wrong wastes that entire cycle. One well-instrumented run reveals more
+   than ten speculative fix attempts.
+   - Log EVERY key variable at EVERY decision point in the suspected path.
+   - Log full data structures (HashMaps, Vecs, schemas), not just single values.
+   - For batch/schema mismatches: log `col_data.len()` per column, `count`,
+     `blob.len()`, AND the schema's column types/sizes. Compare them.
+   - For cross-boundary bugs (RPython ↔ Rust FFI): add `eprintln!` on the
+     Rust side AND `log.warn()` on the Python side. Know where each goes:
+     - `eprintln!` in the server process → worker log files
+       (`~/git/gnitz/tmp/gnitz_py_*/data/worker_N.log`)
+     - `eprintln!` in the master process → `~/git/gnitz/tmp/server_debug.log`
+       (only if the test harness redirects stderr there)
+     - `log.debug()`/`log.warn()` in RPython → worker or master log file
+       (requires `GNITZ_LOG_LEVEL=debug` for debug-level messages)
+   - For panics: use `RUST_BACKTRACE=1` to get the full call chain.
+2. **Isolate with 1 worker first.** If the test passes with `GNITZ_WORKERS=1`
+   and fails with `GNITZ_WORKERS=4`, the bug is in the exchange/fanout/stash
+   path, not in computation. Common exchange bugs:
+   - Schema mismatch: pre-plan `out_schema` != actual batch layout
+     (see "Exchange schema contract" above).
+   - Child table directory collision: all workers creating tables at the
+     same path (see "FFI handle type safety" above).
+   - ext_trace_regs assigned to the wrong plan (pre vs post).
+3. **Bisect by sub-path.** Add a flag or env var to disable the new fast-path
+   and force the old path. If the test passes with the old path, the bug is
+   in the new path only.
+4. **Verify your fix is in the binary.** See "RPython server rebuild" below.
+   If the build output does not show `annotate` and `rtype_lltype` timer
+   lines, the RPython translation was skipped and your Python changes are
+   NOT in the binary. This is the single most common reason a "fix" appears
+   to not work.

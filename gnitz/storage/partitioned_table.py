@@ -243,6 +243,18 @@ class PartitionedTable(ZSetStore):
     def close_all_partitions(self):
         engine_ffi._ptable_close_all_partitions(self._handle)
 
+    def get_child_base_dir(self):
+        """Return the directory under which child tables should be created.
+        Uses partition 0's directory as the base."""
+        buf = lltype.malloc(rffi.CCHARP.TO, 4096, flavor="raw")
+        n = intmask(engine_ffi._ptable_get_child_dir(self._handle, buf, rffi.cast(rffi.UINT, 4096)))
+        if n <= 0:
+            lltype.free(buf, flavor="raw")
+            return ""
+        result = rffi.charpsize2str(buf, n)
+        lltype.free(buf, flavor="raw")
+        return result
+
     def create_child(self, name, schema):
         schema_buf = engine_ffi.pack_schema(schema)
         try:

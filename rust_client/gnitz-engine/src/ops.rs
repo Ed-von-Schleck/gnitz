@@ -628,7 +628,8 @@ fn write_string_from_batch(
     payload_col: usize,
 ) {
     let src = batch.get_col_ptr(row, payload_col, 16);
-    write_string_from_raw(col_buf, blob, src, if batch.blob.is_empty() { std::ptr::null() } else { batch.blob.as_ptr() });
+    let blob_ptr = if batch.blob.is_empty() { std::ptr::null() } else { batch.blob.as_ptr() };
+    write_string_from_raw(col_buf, blob, src, blob_ptr);
 }
 
 /// Copy a German String from raw 16-byte struct + blob base ptr into the output.

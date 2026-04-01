@@ -440,14 +440,126 @@ impl ProgramBuilder {
             expr_progs: self.expr_progs,
         };
 
-        Box::new(VmHandle { program, regfile })
+        Box::new(VmHandle {
+            program,
+            regfile,
+            owned_tables: Vec::new(),
+            owned_funcs: Vec::new(),
+            owned_expr_progs: Vec::new(),
+            owned_trace_regs: Vec::new(),
+            owned_cursor_handles: Vec::new(),
+        })
+    }
+
+    /// Consume the builder, producing a VmHandle that owns child tables,
+    /// scalar functions, and expression programs created by the compiler.
+    pub fn build_with_owned(
+        self,
+        reg_schemas: &[SchemaDescriptor],
+        reg_kinds: &[u8],
+        owned_tables: Vec<Box<Table>>,
+        owned_funcs: Vec<Box<ScalarFuncKind>>,
+        owned_expr_progs: Vec<Box<crate::expr::ExprProgram>>,
+        owned_trace_regs: Vec<(u16, usize)>,
+    ) -> Box<VmHandle> {
+        assert_eq!(reg_schemas.len(), self.num_registers as usize);
+        assert_eq!(reg_kinds.len(), self.num_registers as usize);
+
+        let mut reg_meta = Vec::with_capacity(self.num_registers as usize);
+        for i in 0..self.num_registers as usize {
+            reg_meta.push(RegisterMeta {
+                schema: reg_schemas[i],
+                kind: if reg_kinds[i] == 1 { RegisterKind::Trace } else { RegisterKind::Delta },
+            });
+        }
+
+        let regfile = RegisterFile::new(&reg_meta);
+
+        let program = Program {
+            instructions: self.instructions,
+            reg_meta,
+            funcs: self.funcs,
+            tables: self.tables,
+            schemas: self.schemas,
+            agg_descs: self.agg_descs,
+            group_cols: self.group_cols,
+            expr_progs: self.expr_progs,
+        };
+
+        let num_owned = owned_trace_regs.len();
+        Box::new(VmHandle {
+            program,
+            regfile,
+            owned_tables,
+            owned_funcs,
+            owned_expr_progs,
+            owned_trace_regs,
+            owned_cursor_handles: Vec::with_capacity(num_owned),
+        })
     }
 }
 
 /// Opaque handle owning a compiled program and its register file.
+///
+/// When produced by the Rust compiler (`compile_view`), `owned_tables`,
+/// `owned_funcs`, and `owned_expr_progs` hold heap resources that
+/// `program.tables` / `program.funcs` / `program.expr_progs` borrow via
+/// raw pointers.  Rust drop order (declaration order) ensures `program`
+/// drops before the owned vecs, so dangling pointers are never chased.
 pub struct VmHandle {
     pub program: Program,
     pub regfile: RegisterFile,
+    /// Child tables created during compilation (history, reduce-in, GI, AVI).
+    /// `program.tables` may point into these.  Dropped AFTER `program`.
+    pub owned_tables: Vec<Box<Table>>,
+    /// Scalar functions created during compilation.
+    /// `program.funcs` may point into these.  Dropped AFTER `program`.
+    pub owned_funcs: Vec<Box<ScalarFuncKind>>,
+    /// Expression programs created during compilation.
+    /// `program.expr_progs` may point into these.  Dropped AFTER `program`.
+    pub owned_expr_progs: Vec<Box<crate::expr::ExprProgram>>,
+    /// Trace registers backed by owned tables: `(reg_id, index into owned_tables)`.
+    /// `execute_epoch` creates cursors from these before dispatch.
+    pub owned_trace_regs: Vec<(u16, usize)>,
+    /// Cursor handles for owned trace registers, kept alive across the epoch.
+    /// Indexed in parallel with `owned_trace_regs`.
+    owned_cursor_handles: Vec<Option<Box<CursorHandle<'static>>>>,
+}
+
+impl VmHandle {
+    /// Compact owned tables and create fresh cursors for owned trace registers.
+    /// Must be called before `execute_epoch` for compiler-produced plans.
+    /// The cursor handles are stored in `owned_cursor_handles` and their
+    /// raw pointers bound into the register file.
+    pub fn refresh_owned_cursors(&mut self) {
+        gnitz_debug!("vm: refresh_owned_cursors, {} owned trace regs", self.owned_trace_regs.len());
+        // Resize storage if needed
+        if self.owned_cursor_handles.len() < self.owned_trace_regs.len() {
+            self.owned_cursor_handles.resize_with(self.owned_trace_regs.len(), || None);
+        }
+        for (slot, &(reg_id, table_idx)) in self.owned_trace_regs.iter().enumerate() {
+            // Drop previous cursor before creating new one (releases shard refs etc.)
+            self.owned_cursor_handles[slot] = None;
+
+            // SAFETY: table_idx is valid (set during compilation). We need &mut
+            // to the table, but we also hold &self.owned_trace_regs. This is safe
+            // because owned_trace_regs is not modified here, and the table is
+            // accessed through owned_tables which is a separate field.
+            let table: &mut Table = unsafe { &mut *(&mut *self.owned_tables[table_idx] as *mut Table) };
+            table.compact_if_needed();
+            match table.create_cursor() {
+                Ok(ch) => {
+                    let mut boxed = Box::new(ch);
+                    let ptr = &mut *boxed as *mut CursorHandle<'static>;
+                    self.regfile.registers[reg_id as usize].cursor_ptr = ptr;
+                    self.owned_cursor_handles[slot] = Some(boxed);
+                }
+                Err(_) => {
+                    self.regfile.registers[reg_id as usize].cursor_ptr = std::ptr::null_mut();
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -534,10 +646,19 @@ impl RegisterFile {
 
     /// Bind cursor handles from RPython into trace registers.
     /// Each non-null handle is borrowed for the duration of the epoch.
+    /// Trace registers that already have a non-null cursor (e.g., from
+    /// `refresh_owned_cursors`) are NOT overwritten.
     pub fn bind_cursors(&mut self, handles: &[*mut libc::c_void]) {
         for (i, reg) in self.registers.iter_mut().enumerate() {
-            if reg.kind == RegisterKind::Trace && i < handles.len() && !handles[i].is_null() {
-                reg.cursor_ptr = handles[i] as *mut CursorHandle<'static>;
+            if reg.kind == RegisterKind::Trace {
+                if i < handles.len() && !handles[i].is_null() {
+                    reg.cursor_ptr = handles[i] as *mut CursorHandle<'static>;
+                } else if reg.cursor_ptr.is_null() {
+                    // Only null out if not already set (by refresh_owned_cursors)
+                    reg.cursor_ptr = std::ptr::null_mut();
+                }
+                // If handles[i] is null but cursor_ptr is already non-null
+                // (from owned cursor), keep the owned cursor.
             } else {
                 reg.cursor_ptr = std::ptr::null_mut();
             }

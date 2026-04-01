@@ -227,6 +227,19 @@ eci = ExternalCompilationInfo(
         "void *gnitz_program_builder_build("
         "  void *handle, const void *reg_schemas, const uint8_t *reg_kinds,"
         "  uint32_t num_registers);",
+        # circuit compiler
+        "int32_t gnitz_compile_view("
+        "  uint64_t view_id,"
+        "  void *sys_nodes, void *sys_edges, void *sys_sources,"
+        "  void *sys_params, void *sys_gcols, void *sys_dep,"
+        "  const void *sys_nodes_schema, const void *sys_edges_schema,"
+        "  const void *sys_sources_schema, const void *sys_params_schema,"
+        "  const void *sys_gcols_schema, const void *sys_dep_schema,"
+        "  const char *view_dir, uint32_t view_table_id,"
+        "  const void *view_schema,"
+        "  const int64_t *reg_tids, void **reg_handles,"
+        "  const void *reg_schemas, uint32_t reg_count,"
+        "  int64_t *out_result);",
         # scan trace
         "int32_t gnitz_op_scan_trace("
         "  void *cursor, const void *schema, int32_t chunk_limit,"
@@ -361,6 +374,7 @@ eci = ExternalCompilationInfo(
         "uint64_t gnitz_ptable_found_null_word(void *handle);",
         "const uint8_t *gnitz_ptable_found_col_ptr(void *handle, int32_t payload_col, int32_t col_size);",
         "const uint8_t *gnitz_ptable_found_blob_ptr(void *handle);",
+        "int32_t gnitz_ptable_get_child_dir(void *handle, char *buf, uint32_t buf_len);",
         "void *gnitz_ptable_create_child(void *handle, const char *name, const void *schema_desc);",
         "void gnitz_ptable_bloom_add(void *handle, uint64_t key_lo, uint64_t key_hi);",
         # batch (OwnedBatch as first-class FFI handle)
@@ -1061,6 +1075,33 @@ _program_builder_build = rffi.llexternal(
     compilation_info=eci,
 )
 
+# ---------------------------------------------------------------------------
+# Circuit compiler (Rust-side)
+# ---------------------------------------------------------------------------
+
+# CompileResult is a flat i64 buffer. Slot layout defined in compiler.rs CR_* constants.
+COMPILE_RESULT_SLOTS = 297
+COMPILE_RESULT_SIZE = COMPILE_RESULT_SLOTS * 8
+
+_compile_view = rffi.llexternal(
+    "gnitz_compile_view",
+    [rffi.ULONGLONG,        # view_id
+     rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,  # sys_nodes, edges, sources
+     rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,  # sys_params, gcols, dep
+     rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,  # schemas: nodes, edges, sources
+     rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,  # schemas: params, gcols, dep
+     rffi.CCHARP,           # view_dir
+     rffi.UINT,             # view_table_id
+     rffi.VOIDP,            # view_schema
+     rffi.LONGLONGP,        # reg_tids
+     rffi.VOIDPP,           # reg_handles
+     rffi.VOIDP,            # reg_schemas
+     rffi.UINT,             # reg_count
+     rffi.LONGLONGP],       # out_result (flat i64 buffer)
+    rffi.INT,
+    compilation_info=eci,
+)
+
 _op_scan_trace = rffi.llexternal(
     "gnitz_op_scan_trace",
     [rffi.VOIDP, rffi.VOIDP, rffi.INT, rffi.VOIDPP],
@@ -1702,6 +1743,10 @@ _ptable_found_col_ptr = rffi.llexternal(
 )
 _ptable_found_blob_ptr = rffi.llexternal(
     "gnitz_ptable_found_blob_ptr", [rffi.VOIDP], rffi.CCHARP, compilation_info=eci,
+)
+_ptable_get_child_dir = rffi.llexternal(
+    "gnitz_ptable_get_child_dir", [rffi.VOIDP, rffi.CCHARP, rffi.UINT],
+    rffi.INT, compilation_info=eci,
 )
 _ptable_create_child = rffi.llexternal(
     "gnitz_ptable_create_child", [rffi.VOIDP, rffi.CCHARP, rffi.VOIDP],

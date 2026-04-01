@@ -32,7 +32,7 @@ class ExecutablePlan(object):
         self.out_schema = out_schema
         self.in_reg_idx = in_reg_idx
         self.out_reg_idx = out_reg_idx
-        self._trace_regs = trace_reg_tables if trace_reg_tables is not None else []
+        self._ext_trace_regs = trace_reg_tables if trace_reg_tables is not None else []
         self._cursors = {}  # {reg_id: RustUnifiedCursor}
         self.exchange_post_plan = exchange_post_plan
         self.source_reg_map = source_reg_map
@@ -60,10 +60,11 @@ class ExecutablePlan(object):
         return self._execute_epoch_rust(input_delta, source_id)
 
     def _execute_epoch_rust(self, input_delta, source_id):
-        # 1. Refresh trace cursors (z⁻¹(I(X)) — before current delta)
-        for i in range(len(self._trace_regs)):
-            reg_id = self._trace_regs[i][0]
-            store = self._trace_regs[i][1]
+        # 1. Refresh external trace cursors (z⁻¹(I(X)) — before current delta)
+        #    Owned trace cursors are refreshed by Rust in VmHandle::refresh_owned_cursors.
+        for i in range(len(self._ext_trace_regs)):
+            reg_id = self._ext_trace_regs[i][0]
+            store = self._ext_trace_regs[i][1]
             old = self._cursors.get(reg_id, None)
             if old is not None:
                 old.close()
