@@ -247,15 +247,20 @@ class EphemeralTable(ZSetStore):
             return
         sorted_acc = self._accumulator.to_sorted()
         ptrs, sizes, count, rpb = _pack_batch_regions(sorted_acc, self.schema)
+        rc = 0
         try:
-            engine_ffi._table_memtable_upsert_batch(
+            rc = intmask(engine_ffi._table_memtable_upsert_batch(
                 self._handle, ptrs, sizes,
                 rffi.cast(rffi.UINT, count),
                 rffi.cast(rffi.UINT, rpb),
-            )
+            ))
         finally:
             lltype.free(ptrs, flavor="raw")
             lltype.free(sizes, flavor="raw")
+        if rc == -2:
+            raise errors.MemTableFullError()
+        elif rc < 0:
+            raise errors.StorageError("table upsert_batch failed (%d)" % rc)
         if sorted_acc is not self._accumulator:
             sorted_acc.free()
         self._accumulator.free()
@@ -358,11 +363,15 @@ class EphemeralTable(ZSetStore):
 
     def flush(self):
         self._flush_accumulator()
-        engine_ffi._table_flush(self._handle)
+        rc = intmask(engine_ffi._table_flush(self._handle))
+        if rc < -1:
+            raise errors.StorageError("table flush failed (%d)" % rc)
         return ""
 
     def compact_if_needed(self):
-        engine_ffi._table_compact_if_needed(self._handle)
+        rc = intmask(engine_ffi._table_compact_if_needed(self._handle))
+        if rc < 0:
+            raise errors.StorageError("table compact_if_needed failed (%d)" % rc)
 
     def create_child(self, name, schema):
         child_dir = os.path.join(self.directory, "scratch_" + name)

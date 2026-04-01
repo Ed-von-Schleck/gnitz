@@ -210,11 +210,15 @@ class PartitionedTable(ZSetStore):
         return r_int64(w)
 
     def flush(self):
-        engine_ffi._ptable_flush(self._handle)
+        rc = intmask(engine_ffi._ptable_flush(self._handle))
+        if rc < 0:
+            raise errors.StorageError("ptable flush failed (%d)" % rc)
         return ""
 
     def compact_if_needed(self):
-        engine_ffi._ptable_compact_if_needed(self._handle)
+        rc = intmask(engine_ffi._ptable_compact_if_needed(self._handle))
+        if rc < 0:
+            raise errors.StorageError("ptable compact_if_needed failed (%d)" % rc)
 
     def set_has_wal(self, flag):
         engine_ffi._ptable_set_has_wal(

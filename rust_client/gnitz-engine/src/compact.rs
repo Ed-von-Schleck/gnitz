@@ -553,6 +553,9 @@ pub fn merge_and_route(
         let cpath = std::ffi::CString::new(out_filenames[i].as_str()).unwrap();
         let frc = writers[i].finalize(&cpath, table_id);
         if frc != 0 {
+            for j in 0..i {
+                let _ = std::fs::remove_file(&out_filenames[j]);
+            }
             return frc;
         }
         if !std::path::Path::new(&out_filenames[i]).exists() {
@@ -897,6 +900,41 @@ mod tests {
         assert_eq!(g1.count, 2);
         assert_eq!(g1.get_pk(0), 150);
         assert_eq!(g1.get_pk(1), 250);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_and_route_cleanup_on_partial_finalize_failure() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_route_cleanup");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_test_schema();
+
+        let s1 = dir.join("in1.db");
+        let s2 = dir.join("in2.db");
+        write_test_shard(s1.to_str().unwrap(), &[10, 50], &[1, 1], &schema);
+        write_test_shard(s2.to_str().unwrap(), &[150, 250], &[1, 1], &schema);
+
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let inputs = [cs1.as_c_str(), cs2.as_c_str()];
+        let guards = [(0u64, 0u64), (100u64, 0u64)];
+
+        // table_id=0, level_num=1, lsn_tag=99 → second output is shard_0_99_L1_G1.db
+        // Block it with a directory so finalize fails for guard 1.
+        let blocker = dir.join("shard_0_99_L1_G1.db");
+        fs::create_dir_all(&blocker).unwrap();
+
+        let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let mut results = [GuardResult::zeroed(), GuardResult::zeroed()];
+        let rc = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, &mut results);
+
+        assert!(rc < 0, "expected failure, got {}", rc);
+        let guard0_file = dir.join("shard_0_99_L1_G0.db");
+        assert!(!guard0_file.exists(), "guard 0 output should have been cleaned up");
 
         let _ = fs::remove_dir_all(&dir);
     }

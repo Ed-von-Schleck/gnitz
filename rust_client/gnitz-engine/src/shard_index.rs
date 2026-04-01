@@ -625,11 +625,22 @@ impl ShardIndex {
             .map(|r| (r.guard_key_lo, r.guard_key_hi, r.filename_str().to_string()))
             .collect();
 
-        // Mark all input files for deletion (moves, no cloning)
+        let schema_copy = self.schema;
+        let mut opened: Vec<(u64, u64, ShardEntry)> = Vec::with_capacity(guard_outputs.len());
+        for (gk_lo, gk_hi, filename) in &guard_outputs {
+            match ShardEntry::open(filename, &schema_copy, 0, vert_max_lsn) {
+                Ok(entry) => opened.push((*gk_lo, *gk_hi, entry)),
+                Err(e) => {
+                    for (_, _, f) in &guard_outputs {
+                        let _ = fs::remove_file(f);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
         self.pending_deletions.extend(all_input_files);
-
         self.levels[src_idx].guards.remove(worst_idx);
-
         {
             let old_keys: Vec<u128> = guard_keys
                 .iter()
@@ -639,12 +650,9 @@ impl ShardIndex {
                 .guards
                 .retain(|g| !old_keys.contains(&g.guard_key()));
         }
-
-        let schema_copy = self.schema;
-        for (gk_lo, gk_hi, filename) in &guard_outputs {
-            let entry = ShardEntry::open(filename, &schema_copy, 0, vert_max_lsn)?;
+        for (gk_lo, gk_hi, entry) in opened {
             self.levels[dest_idx]
-                .get_or_create_guard(*gk_lo, *gk_hi)
+                .get_or_create_guard(gk_lo, gk_hi)
                 .entries
                 .push(entry);
         }
@@ -870,6 +878,53 @@ mod tests {
             idx.find_pk(*pk, 0, &mut |_, _| found = true);
             assert!(found, "key {} lost after guard compaction", pk);
         }
+    }
+
+    #[test]
+    fn test_compact_guard_vertical_failure_leaves_index_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        idx.ensure_level(1);
+
+        // Build a guard at key 0 with 3 entries (max_lsn=100 → lsn_tag=100)
+        for i in 0..3u64 {
+            let path = write_test_shard(
+                dir.path(),
+                &format!("src_{}.db", i),
+                &[i + 1],
+                &[(i as i64 + 1) * 10],
+            );
+            let e = ShardEntry::open(&path, &schema, 0, 100).unwrap();
+            idx.levels[0].get_or_create_guard(0, 0).entries.push(e);
+        }
+        // Second guard so worst_count > 1 condition is met in compact_guard_vertical
+        {
+            let path = write_test_shard(dir.path(), "other.db", &[9999], &[42]);
+            let e = ShardEntry::open(&path, &schema, 0, 50).unwrap();
+            idx.levels[0].get_or_create_guard(5000, 0).entries.push(e);
+        }
+
+        // Block the output path: shard_42_100_L2_G0.db must fail to finalize
+        let blocker = dir.path().join("shard_42_100_L2_G0.db");
+        std::fs::create_dir_all(&blocker).unwrap();
+
+        let pre_guard_count = idx.levels[0].guards.len();
+        let pre_entries = idx.levels[0].guards[0].entries.len();
+
+        let result = idx.compact_guard_vertical(1);
+        assert!(result.is_err(), "expected Err when output path is blocked");
+        assert_eq!(idx.pending_deletions.len(), 0, "no input files should be queued on failure");
+        assert_eq!(
+            idx.levels[0].guards.len(),
+            pre_guard_count,
+            "src guards must be unchanged on failure"
+        );
+        assert_eq!(
+            idx.levels[0].guards[0].entries.len(),
+            pre_entries,
+            "src entries must be unchanged on failure"
+        );
     }
 
     #[test]
