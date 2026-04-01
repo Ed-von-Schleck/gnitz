@@ -12,7 +12,6 @@ RELEASE_CFLAGS   ?= -march=native
 TEST_FILES := \
 	rpython_tests/core_comprehensive_test.py \
 	rpython_tests/catalog_comprehensive_test.py \
-	rpython_tests/vm_comprehensive_test.py \
 	rpython_tests/compile_graph_test.py \
 	rpython_tests/server_test.py \
 	rpython_tests/multicore_test.py \
@@ -26,7 +25,6 @@ RUN_TARGETS := $(addprefix run-,$(TEST_BINS))
 
 # Per-test data directories (only tests that create one)
 DATA_DIR_catalog_comprehensive_test-c := catalog_test_data
-DATA_DIR_vm_comprehensive_test-c := vm_test_data
 DATA_DIR_compile_graph_test-c := compile_graph_test_data
 DATA_DIR_server_test-c := server_test_data
 DATA_DIR_multicore_test-c := multicore_test_data
@@ -35,7 +33,7 @@ DATA_DIR_ipc_transport_test-c := ipc_transport_test_data
 DATA_DIR_uring_test-c := uring_test_data
 
 ALL_DATA_DIRS := storage_test_data \
-                 catalog_test_data zstore_test_data vm_test_data \
+                 catalog_test_data zstore_test_data \
                  compile_graph_test_data server_test_data \
                  multicore_test_data eventfd_test_data \
                  ipc_transport_test_data uring_test_data

@@ -3,18 +3,76 @@
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_uint64, r_ulonglonglong as r_uint128, intmask, r_int64
 
+from rpython.rtyper.lltypesystem import rffi, lltype
+
 from gnitz.core import opcodes
-from gnitz.core.types import merge_schemas_for_join, merge_schemas_for_join_outer, _build_map_output_schema, _build_reduce_output_schema
-from gnitz.core.types import TYPE_U128, TYPE_STRING, TYPE_F32, TYPE_F64
+from gnitz.core.types import (
+    merge_schemas_for_join, merge_schemas_for_join_outer,
+    _build_map_output_schema, _build_reduce_output_schema,
+    ColumnDefinition, TableSchema,
+    TYPE_U128, TYPE_I64, TYPE_STRING, TYPE_F32, TYPE_F64,
+)
 from gnitz.core.errors import LayoutError
 from gnitz.catalog import system_tables as sys
-from gnitz.vm import instructions, runtime
+from gnitz.vm import runtime
 from gnitz.dbsp import functions
-from gnitz.dbsp.ops import group_index
+from gnitz.storage import engine_ffi
 from gnitz.storage.ephemeral_table import EphemeralTable
 
 NULL_PREDICATE = functions.NullPredicate()
 NULL_AGGREGATE = functions.NullAggregate()
+
+_NULL_HANDLE = lltype.nullptr(rffi.VOIDP.TO)
+SCHEMA_DESC_SIZE = engine_ffi.SCHEMA_DESC_SIZE
+
+
+def _make_group_idx_schema():
+    """Schema for the reduce group secondary index: (ck: U128 [PK], spk_hi: I64)."""
+    cols = newlist_hint(2)
+    cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="ck"))
+    cols.append(ColumnDefinition(TYPE_I64, is_nullable=False, name="spk_hi"))
+    return TableSchema(cols, pk_index=0)
+
+
+def _make_agg_value_idx_schema():
+    """Schema for AggValueIndex: U128 PK only, no payload."""
+    cols = newlist_hint(1)
+    cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="ck"))
+    return TableSchema(cols, pk_index=0)
+
+
+def _pack_agg_descs(agg_funcs):
+    """Pack agg_funcs into an 8-byte-per-entry C buffer matching Rust AggDescriptor.
+    Returns (buf_ptr, count). Caller must free buf_ptr."""
+    num_aggs = len(agg_funcs)
+    buf_size = max(num_aggs * 8, 8)
+    buf = lltype.malloc(rffi.CCHARP.TO, buf_size, flavor="raw")
+    for ai in range(num_aggs):
+        base = ai * 8
+        v = agg_funcs[ai].col_idx
+        buf[base] = chr(v & 0xFF)
+        buf[base + 1] = chr((v >> 8) & 0xFF)
+        buf[base + 2] = chr((v >> 16) & 0xFF)
+        buf[base + 3] = chr((v >> 24) & 0xFF)
+        buf[base + 4] = chr(agg_funcs[ai].agg_op & 0xFF)
+        buf[base + 5] = chr(agg_funcs[ai].col_type_code & 0xFF)
+        buf[base + 6] = chr(0)
+        buf[base + 7] = chr(0)
+    return buf, num_aggs
+
+
+def _emit_simple_integrate(builder, in_reg_id, table_handle):
+    """Emit an INTEGRATE with no GI or AVI."""
+    engine_ffi._program_builder_add_integrate(
+        builder,
+        rffi.cast(rffi.USHORT, in_reg_id),
+        table_handle,
+        _NULL_HANDLE, rffi.cast(rffi.UINT, 0), rffi.cast(rffi.UCHAR, 0),
+        _NULL_HANDLE, rffi.cast(rffi.INT, 0), rffi.cast(rffi.UCHAR, 0),
+        lltype.nullptr(rffi.UINTP.TO), rffi.cast(rffi.UINT, 0),
+        _NULL_HANDLE, rffi.cast(rffi.UINT, 0),
+    )
+
 
 # Indices into the mutable state list passed to _emit_node
 _ST_NEXT_EXTRA_REG = 0
@@ -690,56 +748,60 @@ class ProgramCache(object):
         return result
 
     def _emit_node(self, nid, op, reg_id, node_params, in_regs,
-                   cur_reg_file, out_reg_of, sources, trace_side_sources,
+                   reg_schemas, reg_kinds, trace_reg_tables,
+                   out_reg_of, sources, trace_side_sources,
                    group_cols, view_family, view_id, out_schema, in_schema,
-                   program, state, str_params, rw, source_reg_map=None):
-        """Emit a single operator node. Returns instruction or None.
+                   builder, state, str_params, rw, source_reg_map=None):
+        """Emit a single operator node via ProgramBuilder.
 
+        Adds instructions directly to builder and populates reg_schemas/reg_kinds.
         state: mutable list [next_extra_reg, sink_reg_id, input_delta_reg_id].
-        Mutates cur_reg_file, out_reg_of, and state in-place.
-        REDUCE appends its reduce pre-instruction to program directly.
-        source_reg_map: dict {source_table_id: reg_id} for multi-input circuits.
         """
         if op == opcodes.OPCODE_SCAN_TRACE:
             table_id = sources.get(nid, 0)
             chunk_limit = node_params.get(opcodes.PARAM_CHUNK_LIMIT, 0)
 
             if table_id == 0:
-                # Check for multi-input: PARAM_JOIN_SOURCE_TABLE > 0
                 join_source_table = node_params.get(opcodes.PARAM_JOIN_SOURCE_TABLE, 0)
                 if join_source_table > 0:
-                    # Secondary input delta for multi-input circuits
                     src_family = self.registry.get_by_id(join_source_table)
-                    reg = runtime.DeltaRegister(reg_id, src_family.schema)
-                    cur_reg_file.registers[reg_id] = reg
+                    reg_schemas[reg_id] = src_family.schema
+                    reg_kinds[reg_id] = 0
                     if source_reg_map is not None:
                         source_reg_map[join_source_table] = reg_id
-                    return None
-                # Primary input (delta): bind external batch at execution time
-                reg = runtime.DeltaRegister(reg_id, in_schema)
-                cur_reg_file.registers[reg_id] = reg
+                    return
+                reg_schemas[reg_id] = in_schema
+                reg_kinds[reg_id] = 0
                 state[_ST_INPUT_DELTA_REG_ID] = reg_id
-                return None
+                return
             elif nid in trace_side_sources:
                 family = self.registry.get_by_id(table_id)
-                reg = runtime.TraceRegister(reg_id, family.schema, family.store.create_cursor(), family.store)
-                cur_reg_file.registers[reg_id] = reg
-                return None
+                reg_schemas[reg_id] = family.schema
+                reg_kinds[reg_id] = 1
+                trace_reg_tables.append((reg_id, family.store))
+                return
             else:
                 family = self.registry.get_by_id(table_id)
-                trace_reg = runtime.TraceRegister(reg_id, family.schema, family.store.create_cursor(), family.store)
-                cur_reg_file.registers[reg_id] = trace_reg
+                reg_schemas[reg_id] = family.schema
+                reg_kinds[reg_id] = 1
+                trace_reg_tables.append((reg_id, family.store))
                 out_delta_id = state[_ST_NEXT_EXTRA_REG]
                 state[_ST_NEXT_EXTRA_REG] += 1
-                out_delta_reg = runtime.DeltaRegister(out_delta_id, family.schema)
-                cur_reg_file.registers[out_delta_id] = out_delta_reg
+                reg_schemas[out_delta_id] = family.schema
+                reg_kinds[out_delta_id] = 0
                 out_reg_of[nid] = out_delta_id
-                return instructions.scan_trace_op(trace_reg, out_delta_reg, chunk_limit)
+                engine_ffi._program_builder_add_scan_trace(
+                    builder,
+                    rffi.cast(rffi.USHORT, reg_id),
+                    rffi.cast(rffi.USHORT, out_delta_id),
+                    rffi.cast(rffi.INT, chunk_limit),
+                )
+                return
 
         elif op == opcodes.OPCODE_FILTER:
-            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
-            out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
-            cur_reg_file.registers[reg_id] = out_reg
+            in_schema_f = reg_schemas[in_regs[opcodes.PORT_IN]]
+            reg_schemas[reg_id] = in_schema_f
+            reg_kinds[reg_id] = 0
             num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
             if num_regs > 0:
                 result_reg = node_params.get(opcodes.PARAM_EXPR_RESULT_REG, 0)
@@ -760,30 +822,33 @@ class ProgramCache(object):
                 func = ExprPredicate(prog)
             else:
                 func = NULL_PREDICATE
-            return instructions.filter_op(in_reg, out_reg, func)
+            engine_ffi._program_builder_add_filter(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN]),
+                rffi.cast(rffi.USHORT, reg_id),
+                func.get_func_handle(),
+            )
+            return
 
         elif op == opcodes.OPCODE_MAP:
-            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
+            in_reg_schema = reg_schemas[in_regs[opcodes.PORT_IN]]
             reindex_col_check = node_params.get(opcodes.PARAM_REINDEX_COL, -1)
             num_regs = node_params.get(opcodes.PARAM_EXPR_NUM_REGS, 0)
             has_expr_code = num_regs > 0 or opcodes.PARAM_EXPR_BASE in node_params
 
-            # Identity fast-path: schemas match physically and program is pure column copy.
             if reindex_col_check < 0 and has_expr_code:
-                if _schemas_physically_identical(in_reg.table_schema, view_family.schema):
+                if _schemas_physically_identical(in_reg_schema, view_family.schema):
                     code = _extract_map_code(node_params)
                     if _all_copy_col_sequential(code):
                         out_reg_of[nid] = in_regs[opcodes.PORT_IN]
-                        return None
+                        return
 
-            # Folded MAP: computed MAP folded into REDUCE's finalize program.
             if nid in rw.folded_maps:
                 reduce_nid = rw.folded_maps[nid]
                 out_reg_of[nid] = out_reg_of[reduce_nid]
-                return None
+                return
 
             if has_expr_code:
-                # Expr-map mode (Phase 4: computed projections)
                 code = []
                 idx = 0
                 while (opcodes.PARAM_EXPR_BASE + idx) in node_params:
@@ -797,20 +862,18 @@ class ProgramCache(object):
                         const_strings.append(node_str[opcodes.PARAM_CONST_STR_BASE + sidx])
                         sidx += 1
                 from gnitz.dbsp.expr import ExprProgram, ExprMapFunction
-                prog = ExprProgram(code, num_regs, 0, const_strings if const_strings else None)  # result_reg=0 unused
+                prog = ExprProgram(code, num_regs, 0, const_strings if const_strings else None)
                 func = ExprMapFunction(prog)
                 reindex_check = node_params.get(opcodes.PARAM_REINDEX_COL, -1)
                 if reindex_check >= 0:
-                    # Reindex MAP: output = [U128 PK, all input cols as payload]
-                    from gnitz.core.types import TableSchema, ColumnDefinition
-                    in_cols = in_reg.table_schema.columns
+                    in_cols = in_reg_schema.columns
                     reindex_cols = newlist_hint(len(in_cols) + 1)
                     reindex_cols.append(ColumnDefinition(TYPE_U128, is_nullable=False, name="__pk"))
                     for ci in range(len(in_cols)):
                         reindex_cols.append(in_cols[ci])
                     node_schema = TableSchema(reindex_cols, pk_index=0)
                 else:
-                    node_schema = out_schema   # view's registered schema
+                    node_schema = out_schema
             elif opcodes.PARAM_PROJ_BASE in node_params:
                 src_indices = []
                 src_types = []
@@ -818,80 +881,135 @@ class ProgramCache(object):
                 while (opcodes.PARAM_PROJ_BASE + idx) in node_params:
                     src_col = node_params[opcodes.PARAM_PROJ_BASE + idx]
                     src_indices.append(src_col)
-                    src_types.append(in_reg.table_schema.columns[src_col].field_type.code)
+                    src_types.append(in_reg_schema.columns[src_col].field_type.code)
                     idx += 1
                 func = functions.UniversalProjection(src_indices, src_types)
-                node_schema = _build_map_output_schema(in_reg.table_schema, src_indices)
+                node_schema = _build_map_output_schema(in_reg_schema, src_indices)
             else:
                 func = NULL_PREDICATE
-                node_schema = in_reg.table_schema
+                node_schema = in_reg_schema
             reindex_col = node_params.get(opcodes.PARAM_REINDEX_COL, -1)
-            out_reg = runtime.DeltaRegister(reg_id, node_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.map_op(in_reg, out_reg, func, reindex_col=reindex_col)
+            reg_schemas[reg_id] = node_schema
+            reg_kinds[reg_id] = 0
+            packed_out = engine_ffi.pack_schema(node_schema)
+            engine_ffi._program_builder_add_map(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN]),
+                rffi.cast(rffi.USHORT, reg_id),
+                func.get_func_handle(),
+                rffi.cast(rffi.VOIDP, packed_out),
+                rffi.cast(rffi.INT, reindex_col),
+            )
+            lltype.free(packed_out, flavor="raw")
+            return
 
         elif op == opcodes.OPCODE_NEGATE:
-            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
-            out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.negate_op(in_reg, out_reg)
+            in_reg_schema = reg_schemas[in_regs[opcodes.PORT_IN]]
+            reg_schemas[reg_id] = in_reg_schema
+            reg_kinds[reg_id] = 0
+            engine_ffi._program_builder_add_negate(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN]),
+                rffi.cast(rffi.USHORT, reg_id),
+            )
+            return
 
         elif op == opcodes.OPCODE_UNION:
-            in_a = cur_reg_file.registers[in_regs[opcodes.PORT_IN_A]]
-            in_b = cur_reg_file.registers[in_regs[opcodes.PORT_IN_B]]
-            out_reg = runtime.DeltaRegister(reg_id, in_a.table_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.union_op(in_a, in_b, out_reg)
+            in_a_schema = reg_schemas[in_regs[opcodes.PORT_IN_A]]
+            reg_schemas[reg_id] = in_a_schema
+            reg_kinds[reg_id] = 0
+            has_b = 1 if opcodes.PORT_IN_B in in_regs else 0
+            in_b_id = in_regs.get(opcodes.PORT_IN_B, 0)
+            engine_ffi._program_builder_add_union(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN_A]),
+                rffi.cast(rffi.USHORT, in_b_id),
+                rffi.cast(rffi.INT, has_b),
+                rffi.cast(rffi.USHORT, reg_id),
+            )
+            return
 
         elif op == opcodes.OPCODE_JOIN_DELTA_TRACE:
-            delta_reg = cur_reg_file.registers[in_regs[opcodes.PORT_DELTA]]
-            trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
-            join_schema = merge_schemas_for_join(delta_reg.table_schema, trace_reg.table_schema)
-            out_reg = runtime.DeltaRegister(reg_id, join_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.join_delta_trace_op(delta_reg, trace_reg, out_reg)
+            delta_schema = reg_schemas[in_regs[opcodes.PORT_DELTA]]
+            trace_schema = reg_schemas[in_regs[opcodes.PORT_TRACE]]
+            join_schema = merge_schemas_for_join(delta_schema, trace_schema)
+            reg_schemas[reg_id] = join_schema
+            reg_kinds[reg_id] = 0
+            packed_right = engine_ffi.pack_schema(trace_schema)
+            engine_ffi._program_builder_add_join_dt(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_DELTA]),
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_TRACE]),
+                rffi.cast(rffi.USHORT, reg_id),
+                rffi.cast(rffi.VOIDP, packed_right),
+            )
+            lltype.free(packed_right, flavor="raw")
+            return
 
         elif op == opcodes.OPCODE_JOIN_DELTA_TRACE_OUTER:
-            delta_reg = cur_reg_file.registers[in_regs[opcodes.PORT_DELTA]]
-            trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
-            outer_schema = merge_schemas_for_join_outer(delta_reg.table_schema,
-                                                        trace_reg.table_schema)
-            out_reg = runtime.DeltaRegister(reg_id, outer_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.join_delta_trace_outer_op(delta_reg, trace_reg, out_reg)
+            delta_schema = reg_schemas[in_regs[opcodes.PORT_DELTA]]
+            trace_schema = reg_schemas[in_regs[opcodes.PORT_TRACE]]
+            outer_schema = merge_schemas_for_join_outer(delta_schema, trace_schema)
+            reg_schemas[reg_id] = outer_schema
+            reg_kinds[reg_id] = 0
+            packed_right = engine_ffi.pack_schema(trace_schema)
+            engine_ffi._program_builder_add_join_dt_outer(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_DELTA]),
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_TRACE]),
+                rffi.cast(rffi.USHORT, reg_id),
+                rffi.cast(rffi.VOIDP, packed_right),
+            )
+            lltype.free(packed_right, flavor="raw")
+            return
 
         elif op == opcodes.OPCODE_JOIN_DELTA_DELTA:
-            reg_a = cur_reg_file.registers[in_regs[opcodes.PORT_IN_A]]
-            reg_b = cur_reg_file.registers[in_regs[opcodes.PORT_IN_B]]
-            join_schema = merge_schemas_for_join(reg_a.table_schema, reg_b.table_schema)
-            out_reg = runtime.DeltaRegister(reg_id, join_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.join_delta_delta_op(reg_a, reg_b, out_reg)
+            a_schema = reg_schemas[in_regs[opcodes.PORT_IN_A]]
+            b_schema = reg_schemas[in_regs[opcodes.PORT_IN_B]]
+            join_schema = merge_schemas_for_join(a_schema, b_schema)
+            reg_schemas[reg_id] = join_schema
+            reg_kinds[reg_id] = 0
+            packed_right = engine_ffi.pack_schema(b_schema)
+            engine_ffi._program_builder_add_join_dd(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN_A]),
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN_B]),
+                rffi.cast(rffi.USHORT, reg_id),
+                rffi.cast(rffi.VOIDP, packed_right),
+            )
+            lltype.free(packed_right, flavor="raw")
+            return
 
         elif op == opcodes.OPCODE_DISTINCT:
-            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN_DISTINCT]]
+            in_reg_schema = reg_schemas[in_regs[opcodes.PORT_IN_DISTINCT]]
 
-            # Compile-time elimination: skip when input is already at set semantics.
-            # No history table is created; output aliases the input register.
             if nid in rw.skip_nodes:
                 out_reg_of[nid] = in_regs[opcodes.PORT_IN_DISTINCT]
-                return None
+                return
 
-            hist_schema = in_reg.table_schema
+            hist_schema = in_reg_schema
             history_table = view_family.store.create_child("_hist_%d_%d" % (view_id, nid), hist_schema)
-            hist_reg = runtime.TraceRegister(reg_id, hist_schema, history_table.create_cursor(), history_table)
-            cur_reg_file.registers[reg_id] = hist_reg
+            reg_schemas[reg_id] = hist_schema
+            reg_kinds[reg_id] = 1
+            trace_reg_tables.append((reg_id, history_table))
             out_delta_id = state[_ST_NEXT_EXTRA_REG]
             state[_ST_NEXT_EXTRA_REG] += 1
-            out_delta_reg = runtime.DeltaRegister(out_delta_id, in_reg.table_schema)
-            cur_reg_file.registers[out_delta_id] = out_delta_reg
+            reg_schemas[out_delta_id] = in_reg_schema
+            reg_kinds[out_delta_id] = 0
             out_reg_of[nid] = out_delta_id
-            return instructions.distinct_op(in_reg, hist_reg, out_delta_reg)
+            engine_ffi._program_builder_add_distinct(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN_DISTINCT]),
+                rffi.cast(rffi.USHORT, reg_id),
+                rffi.cast(rffi.USHORT, out_delta_id),
+                history_table._handle,
+            )
+            return
 
         elif op == opcodes.OPCODE_REDUCE:
-            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN_REDUCE]]
-            # Multi-agg path: PARAM_AGG_COUNT > 0
-            agg_func_id = 0   # sentinel: not single-agg
+            in_reg_id = in_regs[opcodes.PORT_IN_REDUCE]
+            in_reg_schema = reg_schemas[in_reg_id]
+            agg_func_id = 0
             agg_col_idx = 0
             agg_count = node_params.get(opcodes.PARAM_AGG_COUNT, 0)
             if agg_count > 0:
@@ -900,39 +1018,40 @@ class ProgramCache(object):
                     packed = node_params.get(opcodes.PARAM_AGG_SPEC_BASE + ai, 0)
                     func_id = packed >> 32
                     col_idx = packed & 0xFFFFFFFF
-                    col_type = in_reg.table_schema.columns[col_idx].field_type
+                    col_type = in_reg_schema.columns[col_idx].field_type
                     agg_funcs.append(functions.UniversalAccumulator(col_idx, func_id, col_type))
             else:
-                # Backward compat: single-agg path
                 agg_func_id = node_params.get(opcodes.PARAM_AGG_FUNC_ID, 0)
                 agg_col_idx = node_params.get(opcodes.PARAM_AGG_COL_IDX, 0)
                 if agg_func_id > 0:
-                    col_type = in_reg.table_schema.columns[agg_col_idx].field_type
+                    col_type = in_reg_schema.columns[agg_col_idx].field_type
                     agg_funcs = newlist_hint(1)
                     agg_funcs.append(functions.UniversalAccumulator(agg_col_idx, agg_func_id, col_type))
                 else:
                     agg_funcs = newlist_hint(1)
                     agg_funcs.append(NULL_AGGREGATE)
             gcols = group_cols.get(nid, [])
-            reduce_out_schema = _build_reduce_output_schema(in_reg.table_schema, gcols, agg_funcs)
+            reduce_out_schema = _build_reduce_output_schema(in_reg_schema, gcols, agg_funcs)
             trace_table = view_family.store.create_child("_reduce_%d_%d" % (view_id, nid), reduce_out_schema)
-            tr_out_reg = runtime.TraceRegister(reg_id, reduce_out_schema, trace_table.create_cursor(), trace_table)
-            cur_reg_file.registers[reg_id] = tr_out_reg
+            reg_schemas[reg_id] = reduce_out_schema
+            reg_kinds[reg_id] = 1
+            trace_reg_tables.append((reg_id, trace_table))
             raw_delta_id = state[_ST_NEXT_EXTRA_REG]
             state[_ST_NEXT_EXTRA_REG] += 1
-            raw_delta_reg = runtime.DeltaRegister(raw_delta_id, reduce_out_schema)
-            cur_reg_file.registers[raw_delta_id] = raw_delta_reg
+            reg_schemas[raw_delta_id] = reduce_out_schema
+            reg_kinds[raw_delta_id] = 0
             finalize_prog = rw.fold_finalize.get(nid, None)
-            fin_delta_reg = None
+            fin_delta_id = -1
             if finalize_prog is not None:
                 fin_delta_id = state[_ST_NEXT_EXTRA_REG]
                 state[_ST_NEXT_EXTRA_REG] += 1
-                fin_delta_reg = runtime.DeltaRegister(fin_delta_id, view_family.schema)
-                cur_reg_file.registers[fin_delta_id] = fin_delta_reg
+                reg_schemas[fin_delta_id] = view_family.schema
+                reg_kinds[fin_delta_id] = 0
                 out_reg_of[nid] = fin_delta_id
             else:
                 out_reg_of[nid] = raw_delta_id
-            tr_in_reg = None
+
+            tr_in_reg_id = -1
             tr_in_table = None
             all_linear = True
             for af in agg_funcs:
@@ -940,23 +1059,24 @@ class ProgramCache(object):
                     all_linear = False
                     break
             if opcodes.PORT_TRACE_IN in in_regs:
-                tr_in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE_IN]]
+                tr_in_reg_id = in_regs[opcodes.PORT_TRACE_IN]
             elif not all_linear and not _will_use_agg_value_idx(
-                    agg_func_id, agg_col_idx, in_reg.table_schema):
+                    agg_func_id, agg_col_idx, in_reg_schema):
                 tr_in_table = view_family.store.create_child(
-                    "_reduce_in_%d_%d" % (view_id, nid), in_reg.table_schema
+                    "_reduce_in_%d_%d" % (view_id, nid), in_reg_schema
                 )
                 tr_in_reg_id = state[_ST_NEXT_EXTRA_REG]
                 state[_ST_NEXT_EXTRA_REG] += 1
-                tr_in_reg = runtime.TraceRegister(
-                    tr_in_reg_id, in_reg.table_schema,
-                    tr_in_table.create_cursor(), tr_in_table
-                )
-                cur_reg_file.registers[tr_in_reg_id] = tr_in_reg
-            grp_idx = None
+                reg_schemas[tr_in_reg_id] = in_reg_schema
+                reg_kinds[tr_in_reg_id] = 1
+                trace_reg_tables.append((tr_in_reg_id, tr_in_table))
+
+            gi_table_handle = _NULL_HANDLE
+            gi_col_idx = 0
+            gi_col_type_code = 0
             if tr_in_table is not None and len(gcols) == 1:
                 gc_col_idx = gcols[0]
-                gc_type = in_reg.table_schema.columns[gc_col_idx].field_type
+                gc_type = in_reg_schema.columns[gc_col_idx].field_type
                 if (gc_type.code != TYPE_U128.code
                         and gc_type.code != TYPE_STRING.code
                         and gc_type.code != TYPE_F32.code
@@ -964,117 +1084,217 @@ class ProgramCache(object):
                     gi_table = EphemeralTable(
                         tr_in_table.directory + "_gidx",
                         "_gidx",
-                        group_index.make_group_idx_schema(),
+                        _make_group_idx_schema(),
                         table_id=0,
                     )
-                    grp_idx = group_index.ReduceGroupIndex(gi_table, gc_col_idx, gc_type)
+                    gi_table_handle = gi_table._handle
+                    gi_col_idx = gc_col_idx
+                    gi_col_type_code = gc_type.code
 
-            agg_val_idx = None
+            avi_table_handle = _NULL_HANDLE
+            avi_for_max = 0
+            avi_agg_col_type_code = 0
+            avi_input_schema_packed = _NULL_HANDLE
+            avi_agg_col_idx = 0
+            avi_group_cols_buf = lltype.nullptr(rffi.UINTP.TO)
+            avi_num_group_cols = 0
             if agg_func_id == functions.AGG_MIN or agg_func_id == functions.AGG_MAX:
-                agg_col_type = in_reg.table_schema.columns[agg_col_idx].field_type
+                agg_col_type = in_reg_schema.columns[agg_col_idx].field_type
                 if _agg_value_idx_eligible(agg_col_type):
                     for_max = (agg_func_id == functions.AGG_MAX)
                     av_table = view_family.store.create_child(
                         "_avidx_%d_%d" % (view_id, nid),
-                        group_index.make_agg_value_idx_schema(),
+                        _make_agg_value_idx_schema(),
                     )
-                    agg_val_idx = group_index.AggValueIndex(
-                        av_table, gcols, in_reg.table_schema,
-                        agg_col_idx, agg_col_type, for_max,
-                    )
+                    avi_table_handle = av_table._handle
+                    avi_for_max = 1 if for_max else 0
+                    avi_agg_col_type_code = agg_col_type.code
+                    avi_agg_col_idx = agg_col_idx
+                    avi_num_group_cols = len(gcols)
+                    avi_group_cols_buf = lltype.malloc(rffi.UINTP.TO, max(len(gcols), 1), flavor="raw")
+                    for gi in range(len(gcols)):
+                        avi_group_cols_buf[gi] = rffi.cast(rffi.UINT, gcols[gi])
+                    avi_input_schema_packed = rffi.cast(rffi.VOIDP, engine_ffi.pack_schema(in_reg_schema))
 
-            # AVI must be integrated BEFORE op_reduce.  The AVI tracks
-            # (group || encoded_value) -> net weight for all historical rows,
-            # and op_reduce reads it to find the new min/max in O(log N).
-            # Updating after reduce would leave the AVI stale (pre-delta),
-            # causing wrong output on first push and on min/max retractions.
-            if agg_val_idx is not None:
-                program.append(instructions.integrate_op(in_reg, None,
-                                                         agg_value_idx=agg_val_idx))
-            reduce_instr = instructions.reduce_op(
-                in_reg, tr_in_reg, tr_out_reg, raw_delta_reg,
-                gcols, agg_funcs, reduce_out_schema,
-                trace_in_group_idx=grp_idx,
-                agg_value_idx=agg_val_idx,
-                finalize_prog=finalize_prog,
-                fin_delta_reg=fin_delta_reg,
+            # AVI INTEGRATE must precede REDUCE
+            if avi_table_handle != _NULL_HANDLE:
+                engine_ffi._program_builder_add_integrate(
+                    builder,
+                    rffi.cast(rffi.USHORT, in_reg_id),
+                    _NULL_HANDLE,  # no target table (AVI-only integrate)
+                    _NULL_HANDLE, rffi.cast(rffi.UINT, 0), rffi.cast(rffi.UCHAR, 0),
+                    avi_table_handle,
+                    rffi.cast(rffi.INT, avi_for_max),
+                    rffi.cast(rffi.UCHAR, avi_agg_col_type_code),
+                    avi_group_cols_buf,
+                    rffi.cast(rffi.UINT, avi_num_group_cols),
+                    avi_input_schema_packed,
+                    rffi.cast(rffi.UINT, avi_agg_col_idx),
+                )
+
+            agg_buf, num_aggs = _pack_agg_descs(agg_funcs)
+
+            gc_buf = lltype.malloc(rffi.UINTP.TO, max(len(gcols), 1), flavor="raw")
+            for gi in range(len(gcols)):
+                gc_buf[gi] = rffi.cast(rffi.UINT, gcols[gi])
+
+            packed_out_schema = engine_ffi.pack_schema(reduce_out_schema)
+
+            fin_prog_handle = _NULL_HANDLE
+            fin_schema_packed = _NULL_HANDLE
+            if finalize_prog is not None:
+                fin_prog_handle = finalize_prog._rust_handle
+                fin_schema_packed = rffi.cast(rffi.VOIDP, engine_ffi.pack_schema(view_family.schema))
+
+            engine_ffi._program_builder_add_reduce(
+                builder,
+                rffi.cast(rffi.USHORT, in_reg_id),
+                rffi.cast(rffi.SHORT, tr_in_reg_id),
+                rffi.cast(rffi.USHORT, reg_id),
+                rffi.cast(rffi.USHORT, raw_delta_id),
+                rffi.cast(rffi.SHORT, fin_delta_id),
+                rffi.cast(rffi.VOIDP, agg_buf), rffi.cast(rffi.UINT, num_aggs),
+                gc_buf, rffi.cast(rffi.UINT, len(gcols)),
+                rffi.cast(rffi.VOIDP, packed_out_schema),
+                avi_table_handle,
+                rffi.cast(rffi.INT, avi_for_max),
+                rffi.cast(rffi.UCHAR, avi_agg_col_type_code),
+                avi_group_cols_buf if avi_table_handle != _NULL_HANDLE else lltype.nullptr(rffi.UINTP.TO),
+                rffi.cast(rffi.UINT, avi_num_group_cols),
+                avi_input_schema_packed,
+                rffi.cast(rffi.UINT, avi_agg_col_idx),
+                gi_table_handle,
+                rffi.cast(rffi.UINT, gi_col_idx),
+                rffi.cast(rffi.UCHAR, gi_col_type_code),
+                fin_prog_handle,
+                fin_schema_packed,
             )
-            program.append(reduce_instr)
+
+            # INTEGRATE input → trace_in (after REDUCE)
             if tr_in_table is not None:
-                program.append(instructions.integrate_op(in_reg, tr_in_table,
-                                                         group_idx=grp_idx,
-                                                         agg_value_idx=agg_val_idx))
-            return instructions.integrate_op(raw_delta_reg, trace_table)
+                engine_ffi._program_builder_add_integrate(
+                    builder,
+                    rffi.cast(rffi.USHORT, in_reg_id),
+                    tr_in_table._handle,
+                    gi_table_handle,
+                    rffi.cast(rffi.UINT, gi_col_idx),
+                    rffi.cast(rffi.UCHAR, gi_col_type_code),
+                    avi_table_handle,
+                    rffi.cast(rffi.INT, avi_for_max),
+                    rffi.cast(rffi.UCHAR, avi_agg_col_type_code),
+                    avi_group_cols_buf if avi_table_handle != _NULL_HANDLE else lltype.nullptr(rffi.UINTP.TO),
+                    rffi.cast(rffi.UINT, avi_num_group_cols),
+                    avi_input_schema_packed,
+                    rffi.cast(rffi.UINT, avi_agg_col_idx),
+                )
+
+            # Cleanup temp buffers
+            lltype.free(agg_buf, flavor="raw")
+            lltype.free(gc_buf, flavor="raw")
+            lltype.free(packed_out_schema, flavor="raw")
+            if avi_group_cols_buf != lltype.nullptr(rffi.UINTP.TO):
+                lltype.free(avi_group_cols_buf, flavor="raw")
+            if avi_input_schema_packed != _NULL_HANDLE:
+                lltype.free(rffi.cast(rffi.CCHARP, avi_input_schema_packed), flavor="raw")
+            if fin_schema_packed != _NULL_HANDLE:
+                lltype.free(rffi.cast(rffi.CCHARP, fin_schema_packed), flavor="raw")
+
+            _emit_simple_integrate(builder, raw_delta_id, trace_table._handle)
+            return
 
         elif op == opcodes.OPCODE_INTEGRATE:
             in_reg_id = in_regs[opcodes.PORT_IN]
-            in_reg = cur_reg_file.registers[in_reg_id]
+            in_reg_schema = reg_schemas[in_reg_id]
             int_table_id = node_params.get(opcodes.PARAM_TABLE_ID, 0)
             if int_table_id > 0 and int_table_id != view_id:
-                # Intermediate INTEGRATE: create child table + TraceRegister
                 int_table = view_family.store.create_child(
-                    "_int_%d_%d" % (view_id, nid), in_reg.table_schema
+                    "_int_%d_%d" % (view_id, nid), in_reg_schema
                 )
-                int_trace_reg = runtime.TraceRegister(
-                    reg_id, in_reg.table_schema,
-                    int_table.create_cursor(), int_table
-                )
-                cur_reg_file.registers[reg_id] = int_trace_reg
-                return instructions.integrate_op(in_reg, int_table)
+                reg_schemas[reg_id] = in_reg_schema
+                reg_kinds[reg_id] = 1
+                trace_reg_tables.append((reg_id, int_table))
+                _emit_simple_integrate(builder, in_reg_id, int_table._handle)
+                return
             state[_ST_SINK_REG_ID] = in_reg_id
-            return instructions.integrate_op(in_reg, None)
+            _emit_simple_integrate(builder, in_reg_id, _NULL_HANDLE)
+            return
 
         elif op == opcodes.OPCODE_DELAY:
-            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
-            out_reg = runtime.DeltaRegister(reg_id, in_reg.table_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.delay_op(in_reg, out_reg)
+            in_reg_schema = reg_schemas[in_regs[opcodes.PORT_IN]]
+            reg_schemas[reg_id] = in_reg_schema
+            reg_kinds[reg_id] = 0
+            engine_ffi._program_builder_add_delay(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN]),
+                rffi.cast(rffi.USHORT, reg_id),
+            )
+            return
 
         elif op == opcodes.OPCODE_ANTI_JOIN_DELTA_TRACE:
-            delta_reg = cur_reg_file.registers[in_regs[opcodes.PORT_DELTA]]
-            trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
-            out_reg = runtime.DeltaRegister(reg_id, delta_reg.table_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.anti_join_delta_trace_op(delta_reg, trace_reg, out_reg)
+            delta_schema = reg_schemas[in_regs[opcodes.PORT_DELTA]]
+            reg_schemas[reg_id] = delta_schema
+            reg_kinds[reg_id] = 0
+            engine_ffi._program_builder_add_anti_join_dt(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_DELTA]),
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_TRACE]),
+                rffi.cast(rffi.USHORT, reg_id),
+            )
+            return
 
         elif op == opcodes.OPCODE_ANTI_JOIN_DELTA_DELTA:
-            reg_a = cur_reg_file.registers[in_regs[opcodes.PORT_IN_A]]
-            reg_b = cur_reg_file.registers[in_regs[opcodes.PORT_IN_B]]
-            out_reg = runtime.DeltaRegister(reg_id, reg_a.table_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.anti_join_delta_delta_op(reg_a, reg_b, out_reg)
+            a_schema = reg_schemas[in_regs[opcodes.PORT_IN_A]]
+            reg_schemas[reg_id] = a_schema
+            reg_kinds[reg_id] = 0
+            engine_ffi._program_builder_add_anti_join_dd(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN_A]),
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN_B]),
+                rffi.cast(rffi.USHORT, reg_id),
+            )
+            return
 
         elif op == opcodes.OPCODE_SEMI_JOIN_DELTA_TRACE:
-            delta_reg = cur_reg_file.registers[in_regs[opcodes.PORT_DELTA]]
-            trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
-            out_reg = runtime.DeltaRegister(reg_id, delta_reg.table_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.semi_join_delta_trace_op(delta_reg, trace_reg, out_reg)
+            delta_schema = reg_schemas[in_regs[opcodes.PORT_DELTA]]
+            reg_schemas[reg_id] = delta_schema
+            reg_kinds[reg_id] = 0
+            engine_ffi._program_builder_add_semi_join_dt(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_DELTA]),
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_TRACE]),
+                rffi.cast(rffi.USHORT, reg_id),
+            )
+            return
 
         elif op == opcodes.OPCODE_SEMI_JOIN_DELTA_DELTA:
-            reg_a = cur_reg_file.registers[in_regs[opcodes.PORT_IN_A]]
-            reg_b = cur_reg_file.registers[in_regs[opcodes.PORT_IN_B]]
-            out_reg = runtime.DeltaRegister(reg_id, reg_a.table_schema)
-            cur_reg_file.registers[reg_id] = out_reg
-            return instructions.semi_join_delta_delta_op(reg_a, reg_b, out_reg)
+            a_schema = reg_schemas[in_regs[opcodes.PORT_IN_A]]
+            reg_schemas[reg_id] = a_schema
+            reg_kinds[reg_id] = 0
+            engine_ffi._program_builder_add_semi_join_dd(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN_A]),
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN_B]),
+                rffi.cast(rffi.USHORT, reg_id),
+            )
+            return
 
         elif op == opcodes.OPCODE_SEEK_TRACE:
-            trace_reg = cur_reg_file.registers[in_regs[opcodes.PORT_TRACE]]
-            key_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN]]
-            return instructions.seek_trace_op(trace_reg, key_reg)
+            engine_ffi._program_builder_add_seek_trace(
+                builder,
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_TRACE]),
+                rffi.cast(rffi.USHORT, in_regs[opcodes.PORT_IN]),
+            )
+            return
 
         elif op == opcodes.OPCODE_CLEAR_DELTAS:
-            # No register assignment — CLEAR_DELTAS resets all delta registers globally.
-            return instructions.clear_deltas_op()
+            engine_ffi._program_builder_add_clear_deltas(builder)
+            return
 
         elif op == opcodes.OPCODE_GATHER_REDUCE:
-            in_reg = cur_reg_file.registers[in_regs[opcodes.PORT_IN_REDUCE]]
-            partial_schema = in_reg.table_schema
+            in_reg_id = in_regs[opcodes.PORT_IN_REDUCE]
+            partial_schema = reg_schemas[in_reg_id]
             num_out_cols = len(partial_schema.columns)
 
-            # Reconstruct agg_funcs using the tail formula for col_type.
-            # PARAM_AGG_COL_IDX is an index into the original input schema and
-            # must NOT be used here — it would be out of bounds for use_natural_pk=True.
             agg_count = node_params.get(opcodes.PARAM_AGG_COUNT, 0)
             if agg_count > 0:
                 agg_funcs = newlist_hint(agg_count)
@@ -1095,33 +1315,73 @@ class ProgramCache(object):
                     agg_funcs = newlist_hint(1)
                     agg_funcs.append(NULL_AGGREGATE)
 
-            # partial_schema IS the output schema — no _build_reduce_output_schema call.
             trace_table = view_family.store.create_child(
                 "_gather_%d_%d" % (view_id, nid), partial_schema
             )
-            tr_out_reg = runtime.TraceRegister(
-                reg_id, partial_schema, trace_table.create_cursor(), trace_table
-            )
-            cur_reg_file.registers[reg_id] = tr_out_reg
+            reg_schemas[reg_id] = partial_schema
+            reg_kinds[reg_id] = 1
+            trace_reg_tables.append((reg_id, trace_table))
             raw_delta_id = state[_ST_NEXT_EXTRA_REG]
             state[_ST_NEXT_EXTRA_REG] += 1
-            raw_delta_reg = runtime.DeltaRegister(raw_delta_id, partial_schema)
-            cur_reg_file.registers[raw_delta_id] = raw_delta_reg
+            reg_schemas[raw_delta_id] = partial_schema
+            reg_kinds[raw_delta_id] = 0
             out_reg_of[nid] = raw_delta_id
-            program.append(instructions.gather_reduce_op(
-                in_reg, tr_out_reg, raw_delta_reg, agg_funcs
-            ))
-            return instructions.integrate_op(raw_delta_reg, trace_table)
 
-        # Unknown opcode (e.g. obsolete opcode 21, old GATHER): treat as pass-through.
-        # Propagate the primary input register to the output slot so downstream nodes
-        # see a valid register instead of crashing on a null dereference.
+            num_aggs = len(agg_funcs)
+            agg_buf, num_aggs = _pack_agg_descs(agg_funcs)
+
+            engine_ffi._program_builder_add_gather_reduce(
+                builder,
+                rffi.cast(rffi.USHORT, in_reg_id),
+                rffi.cast(rffi.USHORT, reg_id),
+                rffi.cast(rffi.USHORT, raw_delta_id),
+                rffi.cast(rffi.VOIDP, agg_buf),
+                rffi.cast(rffi.UINT, num_aggs),
+            )
+            lltype.free(agg_buf, flavor="raw")
+
+            _emit_simple_integrate(builder, raw_delta_id, trace_table._handle)
+            return
+
+        # Unknown opcode: pass-through
         in_reg_id_unk = in_regs.get(opcodes.PORT_IN, -1)
         if in_reg_id_unk >= 0:
-            cur_reg_file.registers[reg_id] = cur_reg_file.registers[in_reg_id_unk]
-        return None
+            reg_schemas[reg_id] = reg_schemas[in_reg_id_unk]
+            reg_kinds[reg_id] = reg_kinds[in_reg_id_unk]
+        return
+
+    def _build_vm_handle(self, builder, num_regs, reg_schemas, reg_kinds):
+        """Pack register metadata and call ProgramBuilder.build(). Returns VmHandle."""
+        from gnitz import log
+        reg_schemas_buf = lltype.malloc(rffi.CCHARP.TO, max(num_regs * SCHEMA_DESC_SIZE, 1), flavor="raw")
+        reg_kinds_buf = lltype.malloc(rffi.CCHARP.TO, max(num_regs, 1), flavor="raw")
+        for ri in range(num_regs):
+            schema = reg_schemas[ri]
+            if schema is not None:
+                tmp = engine_ffi.pack_schema(schema)
+                offset = ri * SCHEMA_DESC_SIZE
+                for bi in range(SCHEMA_DESC_SIZE):
+                    reg_schemas_buf[offset + bi] = tmp[bi]
+                lltype.free(tmp, flavor="raw")
+            else:
+                offset = ri * SCHEMA_DESC_SIZE
+                for bi in range(SCHEMA_DESC_SIZE):
+                    reg_schemas_buf[offset + bi] = '\x00'
+            reg_kinds_buf[ri] = chr(reg_kinds[ri])
+        handle = engine_ffi._program_builder_build(
+            builder,
+            rffi.cast(rffi.VOIDP, reg_schemas_buf),
+            reg_kinds_buf,
+            rffi.cast(rffi.UINT, num_regs),
+        )
+        lltype.free(reg_schemas_buf, flavor="raw")
+        lltype.free(reg_kinds_buf, flavor="raw")
+        if not handle:
+            log.debug("program_builder_build returned NULL")
+        return handle
 
     def compile_from_graph(self, view_id):
+        from gnitz import log
         nodes = self._load_nodes(view_id)
         if not nodes: return None
         if not self.registry.has_id(view_id): return None
@@ -1167,21 +1427,24 @@ class ProgramCache(object):
                 if nid not in rw.skip_nodes:
                     extra_regs += 1
             elif op == opcodes.OPCODE_REDUCE:
-                extra_regs += 2  # raw_delta + auto trace_in
+                extra_regs += 2
                 if nid in rw.fold_finalize:
-                    extra_regs += 1  # fin_delta
+                    extra_regs += 1
             elif op == opcodes.OPCODE_GATHER_REDUCE:
-                extra_regs += 1  # raw_delta only (no trace_in, no AVI, no fin_delta)
+                extra_regs += 1
             elif op == opcodes.OPCODE_SCAN_TRACE:
                 table_id = sources.get(nid, 0)
                 if table_id > 0 and nid not in trace_side_sources:
                     extra_regs += 1
 
-        reg_file = runtime.RegisterFile(next_reg + extra_regs)
+        num_regs = next_reg + extra_regs
+        reg_schemas = [None] * num_regs
+        reg_kinds = [0] * num_regs
+        trace_reg_tables = []  # [(reg_id, ZSetStore)]
+
+        builder = engine_ffi._program_builder_new(rffi.cast(rffi.USHORT, num_regs))
 
         # 5. Instruction emission
-        program = newlist_hint(len(ordered) + 1)
-        # state: [next_extra_reg, sink_reg_id, input_delta_reg_id]
         state = [next_reg, -1, -1]
         source_reg_map = {}
 
@@ -1196,20 +1459,17 @@ class ProgramCache(object):
                     in_regs[port] = out_reg_of[src]
 
             if op == opcodes.OPCODE_EXCHANGE_SHARD:
-                # Exchange marker: split the plan into pre and post.
                 in_reg_id_for_exchange = in_regs[opcodes.PORT_EXCHANGE_IN]
 
-                # Extract shard column indices from params
                 shard_cols = []
                 idx = 0
                 while (opcodes.PARAM_SHARD_COL_BASE + idx) in node_params:
                     shard_cols.append(node_params[opcodes.PARAM_SHARD_COL_BASE + idx])
                     idx += 1
 
-                # The pre-plan output schema is the schema at the exchange boundary
-                exchange_in_schema = reg_file.registers[in_reg_id_for_exchange].table_schema
+                exchange_in_schema = reg_schemas[in_reg_id_for_exchange]
 
-                # Build the post-plan: fresh register file, continue with remaining nodes
+                # Build post-plan
                 post_ordered = []
                 found_exchange = False
                 for post_nid in ordered:
@@ -1219,14 +1479,12 @@ class ProgramCache(object):
                     if found_exchange:
                         post_ordered.append(post_nid)
 
-                # Count registers needed for post-plan
                 post_next_reg = 0
                 post_out_reg_of = {}
                 for pnid in post_ordered:
                     post_out_reg_of[pnid] = post_next_reg
                     post_next_reg += 1
 
-                # Count extra registers for distinct/reduce/scan_trace in post-plan
                 post_extra_regs = 0
                 for pnid in post_ordered:
                     pop = opcode_of[pnid]
@@ -1234,31 +1492,30 @@ class ProgramCache(object):
                         if pnid not in rw.skip_nodes:
                             post_extra_regs += 1
                     elif pop == opcodes.OPCODE_REDUCE:
-                        post_extra_regs += 2  # raw_delta + auto trace_in
+                        post_extra_regs += 2
                         if pnid in rw.fold_finalize:
-                            post_extra_regs += 1  # fin_delta
+                            post_extra_regs += 1
                     elif pop == opcodes.OPCODE_GATHER_REDUCE:
-                        post_extra_regs += 1  # raw_delta only
+                        post_extra_regs += 1
                     elif pop == opcodes.OPCODE_SCAN_TRACE:
                         ptid = sources.get(pnid, 0)
                         if ptid > 0 and pnid not in trace_side_sources:
                             post_extra_regs += 1
 
-                # +1 for the post-plan input register (exchanged data)
                 post_input_reg_id = post_next_reg
                 post_next_reg += 1
 
-                post_reg_file = runtime.RegisterFile(post_next_reg + post_extra_regs)
+                post_num_regs = post_next_reg + post_extra_regs
+                post_reg_schemas = [None] * post_num_regs
+                post_reg_kinds = [0] * post_num_regs
+                post_trace_reg_tables = []
 
-                # Create the input delta register for exchanged data
-                post_in_reg = runtime.DeltaRegister(post_input_reg_id, exchange_in_schema)
-                post_reg_file.registers[post_input_reg_id] = post_in_reg
-
-                # Map the exchange node's output to the post input register
+                post_reg_schemas[post_input_reg_id] = exchange_in_schema
+                post_reg_kinds[post_input_reg_id] = 0
                 post_out_reg_of[nid] = post_input_reg_id
 
-                post_program = newlist_hint(len(post_ordered) + 1)
-                # state: [next_extra_reg, sink_reg_id, input_delta_reg_id]
+                post_builder = engine_ffi._program_builder_new(
+                    rffi.cast(rffi.USHORT, post_num_regs))
                 post_state = [post_next_reg, -1, -1]
 
                 for pnid in post_ordered:
@@ -1272,87 +1529,101 @@ class ProgramCache(object):
                             if src in post_out_reg_of:
                                 pin_regs[port] = post_out_reg_of[src]
 
-                    pinstr = self._emit_node(
+                    self._emit_node(
                         pnid, pop, preg_id, pnode_params, pin_regs,
-                        post_reg_file, post_out_reg_of, sources,
+                        post_reg_schemas, post_reg_kinds,
+                        post_trace_reg_tables,
+                        post_out_reg_of, sources,
                         trace_side_sources, group_cols, view_family,
                         view_id, out_schema, exchange_in_schema,
-                        post_program, post_state, str_params, rw,
+                        post_builder, post_state, str_params, rw,
                         source_reg_map=None,
                     )
-                    if pinstr is not None:
-                        post_program.append(pinstr)
 
-                post_program.append(instructions.halt_op())
+                engine_ffi._program_builder_add_halt(post_builder)
                 post_sink_reg_id = post_state[_ST_SINK_REG_ID]
                 if post_sink_reg_id == -1:
+                    engine_ffi._program_builder_free(post_builder)
+                    engine_ffi._program_builder_free(builder)
                     return None
 
+                post_vm_handle = self._build_vm_handle(
+                    post_builder, post_num_regs,
+                    post_reg_schemas, post_reg_kinds)
+
                 post_plan = runtime.ExecutablePlan(
-                    post_program, post_reg_file, out_schema,
+                    post_vm_handle, post_num_regs, out_schema,
                     in_reg_idx=post_input_reg_id,
                     out_reg_idx=post_sink_reg_id,
+                    trace_reg_tables=post_trace_reg_tables,
                 )
 
-                # Finalize the pre-plan with exchange fields set at construction time
-                program.append(instructions.halt_op())
-                # skip_exchange: INPUT → SHARD (trivial) and shard col == PK
+                # Finalize pre-plan
+                engine_ffi._program_builder_add_halt(builder)
                 is_trivial = (in_reg_id_for_exchange == state[_ST_INPUT_DELTA_REG_ID])
                 skip_exchange = (
                     is_trivial
                     and len(shard_cols) == 1
                     and shard_cols[0] == in_schema.pk_index
                 )
+                pre_vm_handle = self._build_vm_handle(
+                    builder, num_regs, reg_schemas, reg_kinds)
+
                 pre_plan = runtime.ExecutablePlan(
-                    program, reg_file, exchange_in_schema,
+                    pre_vm_handle, num_regs, exchange_in_schema,
                     in_reg_idx=state[_ST_INPUT_DELTA_REG_ID],
                     out_reg_idx=in_reg_id_for_exchange,
+                    trace_reg_tables=trace_reg_tables,
                     exchange_post_plan=post_plan,
                     skip_exchange=skip_exchange,
                 )
                 return pre_plan
 
-            instr = self._emit_node(
+            self._emit_node(
                 nid, op, reg_id, node_params, in_regs,
-                reg_file, out_reg_of, sources, trace_side_sources,
+                reg_schemas, reg_kinds, trace_reg_tables,
+                out_reg_of, sources, trace_side_sources,
                 group_cols, view_family, view_id, out_schema,
-                in_schema, program, state, str_params, rw,
+                in_schema, builder, state, str_params, rw,
                 source_reg_map=source_reg_map,
             )
-            if instr is not None: program.append(instr)
 
-        program.append(instructions.halt_op())
+        engine_ffi._program_builder_add_halt(builder)
         input_delta_reg_id = state[_ST_INPUT_DELTA_REG_ID]
         sink_reg_id = state[_ST_SINK_REG_ID]
-        # Multi-input circuits (joins): no single primary input, use first source register
         if input_delta_reg_id == -1 and source_reg_map:
             for _k in source_reg_map:
                 input_delta_reg_id = source_reg_map[_k]
                 break
-        if input_delta_reg_id == -1 or sink_reg_id == -1: return None
+        if input_delta_reg_id == -1 or sink_reg_id == -1:
+            engine_ffi._program_builder_free(builder)
+            return None
 
         # Fail-fast: verify the circuit's output schema matches the view family schema.
-        # A mismatch means the circuit computes a different column layout than what the
-        # view family store expects (e.g. join circuit missing final MAP projection,
-        # causing _direct_append_row to silently copy wrong columns positionally).
-        sink_schema = reg_file.registers[sink_reg_id].table_schema
-        if len(sink_schema.columns) != len(out_schema.columns):
+        sink_schema = reg_schemas[sink_reg_id]
+        if sink_schema is not None and len(sink_schema.columns) != len(out_schema.columns):
+            engine_ffi._program_builder_free(builder)
             raise LayoutError(
                 "view %d circuit output has %d columns but family schema has %d "
                 "(missing or wrong final projection node in circuit graph)"
                 % (view_id, len(sink_schema.columns), len(out_schema.columns))
             )
-        for i in range(len(out_schema.columns)):
-            if sink_schema.columns[i].field_type.code != out_schema.columns[i].field_type.code:
-                raise LayoutError(
-                    "view %d circuit output col %d type=%d, family schema expects type=%d"
-                    % (view_id, i, sink_schema.columns[i].field_type.code,
-                       out_schema.columns[i].field_type.code)
-                )
+        if sink_schema is not None:
+            for i in range(len(out_schema.columns)):
+                if sink_schema.columns[i].field_type.code != out_schema.columns[i].field_type.code:
+                    engine_ffi._program_builder_free(builder)
+                    raise LayoutError(
+                        "view %d circuit output col %d type=%d, family schema expects type=%d"
+                        % (view_id, i, sink_schema.columns[i].field_type.code,
+                           out_schema.columns[i].field_type.code)
+                    )
+
+        vm_handle = self._build_vm_handle(builder, num_regs, reg_schemas, reg_kinds)
 
         return runtime.ExecutablePlan(
-            program, reg_file, out_schema,
+            vm_handle, num_regs, out_schema,
             in_reg_idx=input_delta_reg_id, out_reg_idx=sink_reg_id,
+            trace_reg_tables=trace_reg_tables,
             source_reg_map=source_reg_map if source_reg_map else None,
             join_shard_map=join_shard_map if join_shard_map else None,
             co_partitioned_join_sources=(
