@@ -740,8 +740,16 @@ pub fn op_scan_trace(
 /// Ports group_index.py:26-42.
 fn promote_col_to_u64(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize, type_code: u8) -> u64 {
     let pi = payload_idx(col_idx, pk_index);
-    let ptr = mb.get_col_ptr(row, pi, 8);
-    u64::from_le_bytes(ptr.try_into().unwrap())
+    let cs = match type_code {
+        type_code::U8 | type_code::I8 => 1,
+        type_code::U16 | type_code::I16 => 2,
+        type_code::U32 | type_code::I32 | type_code::F32 => 4,
+        _ => 8, // U64, I64, F64; U128 excluded by caller
+    };
+    let ptr = mb.get_col_ptr(row, pi, cs);
+    let mut buf = [0u8; 8];
+    buf[..cs].copy_from_slice(ptr);
+    u64::from_le_bytes(buf)
 }
 
 /// Promote an aggregate column value to an order-preserving u64 for AVI keys.
@@ -755,6 +763,14 @@ fn promote_agg_col_to_u64_ordered(
     for_max: bool,
 ) -> u64 {
     let pi = payload_idx(col_idx, pk_index);
+
+    if col_type_code == type_code::F32 {
+        let ptr = mb.get_col_ptr(row, pi, 4);
+        let raw32 = u32::from_le_bytes(ptr.try_into().unwrap());
+        let val = ieee_order_bits_f32(raw32);
+        return if for_max { !val } else { val };
+    }
+
     let ptr = mb.get_col_ptr(row, pi, 8);
     let raw = u64::from_le_bytes(ptr.try_into().unwrap());
 
@@ -766,7 +782,6 @@ fn promote_agg_col_to_u64_ordered(
             (signed as u64).wrapping_add(1u64 << 63)
         }
         type_code::F64 => ieee_order_bits(raw),
-        type_code::F32 => ieee_order_bits(raw & 0xFFFF_FFFF),
         _ => raw,
     };
 
@@ -1294,10 +1309,16 @@ fn promote_col_to_pk(
             let h_hi = mix64(h);
             (h, h_hi)
         }
-        type_code::F64 | type_code::F32 => {
+        type_code::F64 => {
             let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
             let ptr = batch.get_col_ptr(row, pi, 8);
             let bits = u64::from_le_bytes(ptr.try_into().unwrap());
+            (bits, 0)
+        }
+        type_code::F32 => {
+            let pi = if col_idx < pki { col_idx } else { col_idx - 1 };
+            let ptr = batch.get_col_ptr(row, pi, 4);
+            let bits = u32::from_le_bytes(ptr.try_into().unwrap()) as u64;
             (bits, 0)
         }
         _ => {
@@ -1846,9 +1867,11 @@ fn extract_group_key(
             }
         } else {
             let pi = payload_idx(c_idx, pki);
-            let ptr = mb.get_col_ptr(row, pi, 8);
-            let v = u64::from_le_bytes(ptr.try_into().unwrap());
-            mix64(v)
+            let cs = schema.columns[c_idx].size as usize;
+            let ptr = mb.get_col_ptr(row, pi, cs);
+            let mut buf = [0u8; 8];
+            buf[..cs].copy_from_slice(ptr);
+            mix64(u64::from_le_bytes(buf))
         };
         h = mix64(h ^ col_hash ^ (i as u64));
     }
@@ -1897,6 +1920,18 @@ fn ieee_order_bits_reverse(encoded: u64) -> u64 {
     }
 }
 
+/// IEEE 754 order-preserving encoding for 32-bit floats, returning u64.
+/// Checks the F32 sign bit (bit 31), not bit 63.
+fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
+    (if raw_bits >> 31 != 0 { !raw_bits } else { raw_bits ^ (1u32 << 31) }) as u64
+}
+
+/// Reverse of ieee_order_bits_f32.
+fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
+    let e = encoded as u32;
+    if e >> 31 != 0 { e ^ (1u32 << 31) } else { !e }
+}
+
 // ---------------------------------------------------------------------------
 // Argsort
 // ---------------------------------------------------------------------------
@@ -1920,12 +1955,17 @@ fn compare_by_group_cols(
             let b_bytes = mb.get_col_ptr(row_b, pi, 16);
             use crate::compact::compare_german_strings;
             compare_german_strings(a_bytes, mb.blob, b_bytes, mb.blob)
-        } else if tc == type_code::F64 || tc == type_code::F32 {
-            let cs = schema.columns[c_idx].size as usize;
-            let a_ptr = mb.get_col_ptr(row_a, pi, cs);
-            let b_ptr = mb.get_col_ptr(row_b, pi, cs);
-            let a_f = f64::from_bits(u64::from_le_bytes(a_ptr[0..8].try_into().unwrap()));
-            let b_f = f64::from_bits(u64::from_le_bytes(b_ptr[0..8].try_into().unwrap()));
+        } else if tc == type_code::F64 {
+            let a_ptr = mb.get_col_ptr(row_a, pi, 8);
+            let b_ptr = mb.get_col_ptr(row_b, pi, 8);
+            let a_f = f64::from_bits(crate::util::read_u64_le(a_ptr, 0));
+            let b_f = f64::from_bits(crate::util::read_u64_le(b_ptr, 0));
+            a_f.partial_cmp(&b_f).unwrap_or(std::cmp::Ordering::Equal)
+        } else if tc == type_code::F32 {
+            let a_ptr = mb.get_col_ptr(row_a, pi, 4);
+            let b_ptr = mb.get_col_ptr(row_b, pi, 4);
+            let a_f = f32::from_bits(crate::util::read_u32_le(a_ptr, 0));
+            let b_f = f32::from_bits(crate::util::read_u32_le(b_ptr, 0));
             a_f.partial_cmp(&b_f).unwrap_or(std::cmp::Ordering::Equal)
         } else if tc == type_code::U128 {
             let a_ptr = mb.get_col_ptr(row_a, pi, 16);
@@ -2058,8 +2098,10 @@ fn apply_agg_from_value_index(
                 || tc == type_code::I16 || tc == type_code::I8
             {
                 encoded = (encoded as i64).wrapping_sub(1i64 << 63) as u64;
-            } else if tc == type_code::F64 || tc == type_code::F32 {
+            } else if tc == type_code::F64 {
                 encoded = ieee_order_bits_reverse(encoded);
+            } else if tc == type_code::F32 {
+                encoded = ieee_order_bits_f32_reverse(encoded) as u64;
             }
             acc.seed_from_raw_bits(encoded);
             return true;
@@ -2791,13 +2833,13 @@ fn compare_cursor_payload_to_batch_row(
                     let b_lo = u64::from_le_bytes(b_bytes[0..8].try_into().unwrap());
                     let b_hi = u64::from_le_bytes(b_bytes[8..16].try_into().unwrap());
                     (c_hi, c_lo).cmp(&(b_hi, b_lo))
-                } else if col.type_code == type_code::F64 || col.type_code == type_code::F32 {
-                    let c_f = f64::from_bits(u64::from_le_bytes(
-                        c_bytes[0..8].try_into().unwrap(),
-                    ));
-                    let b_f = f64::from_bits(u64::from_le_bytes(
-                        b_bytes[0..8].try_into().unwrap(),
-                    ));
+                } else if col.type_code == type_code::F64 {
+                    let c_f = f64::from_bits(u64::from_le_bytes(c_bytes[0..8].try_into().unwrap()));
+                    let b_f = f64::from_bits(u64::from_le_bytes(b_bytes[0..8].try_into().unwrap()));
+                    c_f.partial_cmp(&b_f).unwrap_or(Ordering::Equal)
+                } else if col.type_code == type_code::F32 {
+                    let c_f = f32::from_bits(u32::from_le_bytes(c_bytes[0..4].try_into().unwrap()));
+                    let b_f = f32::from_bits(u32::from_le_bytes(b_bytes[0..4].try_into().unwrap()));
                     c_f.partial_cmp(&b_f).unwrap_or(Ordering::Equal)
                 } else if col.type_code == type_code::I64
                     || col.type_code == type_code::I32
@@ -4578,5 +4620,109 @@ mod tests {
         let out2 = op_gather_reduce(&partial2, &mut to_ch2.cursor, &schema, &[agg]);
         // Should have 2 rows: retract old (4, w=-1) + insert new (2, w=+1)
         assert_eq!(out2.count, 2);
+    }
+
+    fn make_schema_u64_f32() -> SchemaDescriptor {
+        let mut columns = [SchemaColumn {
+            type_code: 0, size: 0, nullable: 0, _pad: 0,
+        }; 64];
+        columns[0] = SchemaColumn {
+            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
+        };
+        columns[1] = SchemaColumn {
+            type_code: type_code::F32, size: 4, nullable: 0, _pad: 0,
+        };
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> OwnedBatch {
+        let n = rows.len();
+        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        b.count = 0;
+        for &(pk, w, val) in rows {
+            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            b.weight.extend_from_slice(&w.to_le_bytes());
+            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            b.col_data[0].extend_from_slice(&val.to_bits().to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    #[test]
+    fn test_argsort_delta_f32_group() {
+        let schema = make_schema_u64_f32();
+        let batch = make_batch_f32(&schema, &[
+            (1, 1, 2.0f32),
+            (2, 1, -1.0f32),
+            (3, 1, 0.5f32),
+        ]);
+        let indices = argsort_delta(&batch, &schema, &[1]);
+        // Sorted order by F32: -1.0 < 0.5 < 2.0
+        assert_eq!(indices.len(), 3);
+        let mb = batch.as_mem_batch();
+        let vals: Vec<f32> = indices.iter().map(|&i| {
+            let ptr = mb.get_col_ptr(i as usize, 0, 4);
+            f32::from_bits(u32::from_le_bytes(ptr.try_into().unwrap()))
+        }).collect();
+        assert_eq!(vals, vec![-1.0f32, 0.5f32, 2.0f32]);
+    }
+
+    #[test]
+    fn test_compare_by_group_cols_f32_negative() {
+        let schema = make_schema_u64_f32();
+        let batch = make_batch_f32(&schema, &[
+            (1, 1, -5.0f32),
+            (2, 1, 3.0f32),
+        ]);
+        let mb = batch.as_mem_batch();
+        let ord = compare_by_group_cols(&mb, 0, 1, &schema, &[1]);
+        assert_eq!(ord, std::cmp::Ordering::Less);
+        let ord2 = compare_by_group_cols(&mb, 1, 0, &schema, &[1]);
+        assert_eq!(ord2, std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_promote_agg_col_f32_ordering() {
+        let schema = make_schema_u64_f32();
+        let vals = [-2.0f32, -1.0f32, 0.0f32, 1.0f32, 2.0f32];
+        let batch = make_batch_f32(
+            &schema,
+            &vals.iter().enumerate().map(|(i, &v)| (i as u64 + 1, 1, v)).collect::<Vec<_>>(),
+        );
+        let mb = batch.as_mem_batch();
+        let encoded: Vec<u64> = (0..vals.len()).map(|row| {
+            promote_agg_col_to_u64_ordered(&mb, row, 1, 0, type_code::F32, false)
+        }).collect();
+        // Encoded values must be strictly ascending (order-preserving)
+        for w in encoded.windows(2) {
+            assert!(w[0] < w[1], "order-preserving invariant violated: {} >= {}", w[0], w[1]);
+        }
+        // Round-trip invariant
+        for &v in &vals {
+            let bits = v.to_bits();
+            assert_eq!(
+                ieee_order_bits_f32_reverse(ieee_order_bits_f32(bits)),
+                bits,
+                "round-trip failed for {:?}",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_group_key_f32() {
+        let schema = make_schema_u64_f32();
+        let batch = make_batch_f32(&schema, &[
+            (1, 1, 1.5f32),
+            (2, 1, 2.5f32),
+        ]);
+        let mb = batch.as_mem_batch();
+        let key0 = extract_group_key(&mb, 0, &schema, &[1]);
+        let key1 = extract_group_key(&mb, 1, &schema, &[1]);
+        assert_ne!(key0, key1, "different F32 values must produce different group keys");
     }
 }
