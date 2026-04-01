@@ -4082,4 +4082,501 @@ mod tests {
             assert!(found, "val={v} should be in worker {expected_worker}");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // op_filter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_op_filter_basic() {
+        use crate::scalar_func::ScalarFuncKind;
+        use crate::expr::ExprProgram;
+
+        let schema = make_schema_u64_i64();
+        // 3 rows: pk=1 val=5, pk=2 val=15, pk=3 val=25
+        let batch = make_batch(&schema, &[(1, 1, 5), (2, 1, 15), (3, 1, 25)]);
+
+        // Predicate: col1 > 10
+        let code = vec![
+            1i64, 0, 1, 0,  // LOAD_COL_INT r0 = col[1]
+            3, 1, 10, 0,    // LOAD_CONST r1 = 10
+            17, 2, 0, 1,    // CMP_GT r2 = (r0 > r1)
+        ];
+        let prog = ExprProgram::new(code, 3, 2, vec![]);
+        let func = ScalarFuncKind::ExprPredicate(prog);
+
+        let out = op_filter(&batch, &func, &schema);
+        assert_eq!(out.count, 2, "only pk=2 and pk=3 pass val>10");
+        assert_eq!(out.get_pk_lo(0), 2);
+        assert_eq!(out.get_pk_lo(1), 3);
+    }
+
+    #[test]
+    fn test_op_filter_consolidated_flag() {
+        use crate::scalar_func::ScalarFuncKind;
+
+        // Null func passes everything
+        let schema = make_schema_u64_i64();
+        let mut batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+        batch.consolidated = true;
+
+        let func = ScalarFuncKind::Null;
+        let out = op_filter(&batch, &func, &schema);
+        assert_eq!(out.count, 2);
+        assert!(out.consolidated, "consolidated input + pass-all → consolidated output");
+        assert!(out.sorted);
+    }
+
+    // -----------------------------------------------------------------------
+    // op_negate tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_op_negate_weights() {
+        let schema = make_schema_u64_i64();
+        let batch = make_batch(&schema, &[(1, 3, 10), (2, -1, 20)]);
+        let out = op_negate(&batch);
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_weight(0), -3);
+        assert_eq!(out.get_weight(1), 1);
+        // Payload preserved
+        assert_eq!(get_payload_i64(&out, 0), 10);
+        assert_eq!(get_payload_i64(&out, 1), 20);
+        assert!(out.consolidated);
+    }
+
+    // -----------------------------------------------------------------------
+    // op_map tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_op_map_empty_batch() {
+        use crate::scalar_func::ScalarFuncKind;
+
+        let schema = make_schema_u64_i64();
+        let batch = OwnedBatch::with_schema(schema, 1);
+        // count=0 by default after with_schema
+        let empty_batch = OwnedBatch::empty(1);
+
+        let func = ScalarFuncKind::Null;
+        let out = op_map(&empty_batch, &func, &schema, &schema, -1);
+        assert_eq!(out.count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // op_distinct tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_op_distinct_boundary() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+
+        // Empty trace → all positive deltas emit +1
+        let empty = Arc::new(OwnedBatch::empty(1));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[empty.clone()], &[], schema) };
+
+        // Delta: pk=1 w=+3, pk=2 w=+1
+        let delta = make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]);
+        let (out, _) = op_distinct(&delta, &mut ch.cursor, &schema);
+        // 0→positive: both emit +1
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_weight(0), 1);
+        assert_eq!(out.get_weight(1), 1);
+
+        // Now trace has pk=1 w=3 and pk=2 w=1
+        // Delta: pk=1 w=-2 (3→1, still positive, no output), pk=2 w=-1 (1→0, emit -1)
+        let trace_batch = Arc::new(make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]));
+        let mut ch2 = unsafe { create_cursor_from_snapshots(&[trace_batch], &[], schema) };
+        let delta2 = make_batch(&schema, &[(1, -2, 10), (2, -1, 20)]);
+        let (out2, _) = op_distinct(&delta2, &mut ch2.cursor, &schema);
+        // pk=1: 3→1, positive→positive, no change
+        // pk=2: 1→0, positive→non-positive, emit -1
+        assert_eq!(out2.count, 1);
+        assert_eq!(out2.get_pk_lo(0), 2);
+        assert_eq!(out2.get_weight(0), -1);
+    }
+
+    #[test]
+    fn test_op_distinct_consolidated_flag() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+        let empty = Arc::new(OwnedBatch::empty(1));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[empty], &[], schema) };
+
+        let delta = make_batch(&schema, &[(1, 1, 10)]);
+        let (out, consolidated) = op_distinct(&delta, &mut ch.cursor, &schema);
+        assert!(out.consolidated, "distinct output must be consolidated");
+        assert!(out.sorted, "distinct output must be sorted");
+        assert!(consolidated.consolidated, "consolidated output must be consolidated");
+    }
+
+    // -----------------------------------------------------------------------
+    // op_scan_trace tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_op_scan_trace_chunked() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+        // 5 rows in trace
+        let trace = Arc::new(make_batch(&schema, &[
+            (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50),
+        ]));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+
+        // First scan: chunk_limit=3 → get 3 rows
+        let out1 = op_scan_trace(&mut ch.cursor, &schema, 3);
+        assert_eq!(out1.count, 3);
+        assert_eq!(out1.get_pk_lo(0), 1);
+        assert_eq!(out1.get_pk_lo(2), 3);
+        assert!(out1.sorted);
+        assert!(out1.consolidated);
+
+        // Second scan: remaining 2 rows
+        let out2 = op_scan_trace(&mut ch.cursor, &schema, 3);
+        assert_eq!(out2.count, 2);
+        assert_eq!(out2.get_pk_lo(0), 4);
+        assert_eq!(out2.get_pk_lo(1), 5);
+    }
+
+    #[test]
+    fn test_op_scan_trace_empty() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+        let empty = Arc::new(OwnedBatch::empty(1));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[empty], &[], schema) };
+
+        let out = op_scan_trace(&mut ch.cursor, &schema, 10);
+        assert_eq!(out.count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // op_reduce tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reduce_sum_retraction() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::compact::type_code;
+
+        // Input: pk(U64), grp(I64), val(I64)
+        let mut in_schema = make_schema_u64_i64();
+        in_schema.num_columns = 3;
+        in_schema.columns[2] = crate::compact::SchemaColumn {
+            type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
+        };
+
+        // Output: pk(U128), grp(I64), sum(I64)
+        let mut out_schema = crate::compact::SchemaDescriptor {
+            num_columns: 3,
+            pk_index: 0,
+            columns: [crate::compact::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        out_schema.columns[0] = crate::compact::SchemaColumn {
+            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
+        };
+        out_schema.columns[1] = crate::compact::SchemaColumn {
+            type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
+        };
+        out_schema.columns[2] = crate::compact::SchemaColumn {
+            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
+        };
+
+        // Empty trace_out
+        let empty_out = Arc::new(OwnedBatch::empty(2));
+        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
+
+        // Tick 1: insert 3 rows in group 10: val=100, val=200, val=300
+        let mut delta1 = OwnedBatch::with_schema(in_schema, 3);
+        delta1.count = 0;
+        for (pk, val) in [(1u64, 100i64), (2, 200), (3, 300)] {
+            delta1.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            delta1.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            delta1.weight.extend_from_slice(&1i64.to_le_bytes());
+            delta1.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            delta1.col_data[0].extend_from_slice(&10i64.to_le_bytes()); // grp=10
+            delta1.col_data[1].extend_from_slice(&val.to_le_bytes());
+            delta1.count += 1;
+        }
+        delta1.sorted = true;
+        delta1.consolidated = true;
+
+        let agg = AggDescriptor {
+            col_idx: 2, agg_op: AGG_SUM, col_type_code: type_code::I64, _pad: [0; 2],
+        };
+
+        let (out1, _) = op_reduce(
+            &delta1, None, &mut to_ch.cursor,
+            &in_schema, &out_schema, &[1u32], &[agg],
+            None, false, 0, &[], None, None, 0, 0, None, None,
+        );
+        // SUM of (100+200+300) = 600
+        assert_eq!(out1.count, 1);
+        let sum1 = crate::util::read_i64_le(&out1.col_data[1], 0);
+        assert_eq!(sum1, 600);
+
+        // Tick 2: retract pk=2 (val=200) → SUM should go from 600 to 400
+        // Need trace_out with previous aggregate
+        let prev_out = Arc::new(out1);
+        let mut to_ch2 = unsafe { create_cursor_from_snapshots(&[prev_out], &[], out_schema) };
+
+        let mut delta2 = OwnedBatch::with_schema(in_schema, 1);
+        delta2.count = 0;
+        delta2.pk_lo.extend_from_slice(&2u64.to_le_bytes());
+        delta2.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+        delta2.weight.extend_from_slice(&(-1i64).to_le_bytes());
+        delta2.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        delta2.col_data[0].extend_from_slice(&10i64.to_le_bytes());
+        delta2.col_data[1].extend_from_slice(&200i64.to_le_bytes());
+        delta2.count += 1;
+        delta2.sorted = true;
+        delta2.consolidated = true;
+
+        let (out2, _) = op_reduce(
+            &delta2, None, &mut to_ch2.cursor,
+            &in_schema, &out_schema, &[1u32], &[agg],
+            None, false, 0, &[], None, None, 0, 0, None, None,
+        );
+        // Output: retract old sum (600, w=-1) + insert new sum (400, w=+1) = 2 rows
+        assert_eq!(out2.count, 2);
+    }
+
+    #[test]
+    fn test_reduce_count() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::compact::type_code;
+
+        // Input: pk(U64), val(I64)
+        let in_schema = make_schema_u64_i64();
+
+        // Output: pk(U128), count(I64)
+        let mut out_schema = crate::compact::SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [crate::compact::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        out_schema.columns[0] = crate::compact::SchemaColumn {
+            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
+        };
+        out_schema.columns[1] = crate::compact::SchemaColumn {
+            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
+        };
+
+        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
+
+        // 3 rows: pk=1,2,3 all GROUP BY pk (single group using pk as group)
+        let delta = make_batch(&in_schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+
+        let agg = AggDescriptor {
+            col_idx: 0, agg_op: AGG_COUNT, col_type_code: type_code::I64, _pad: [0; 2],
+        };
+
+        // GROUP BY pk → each row is its own group
+        let (out, _) = op_reduce(
+            &delta, None, &mut to_ch.cursor,
+            &in_schema, &out_schema, &[0u32], &[agg],
+            None, false, 0, &[], None, None, 0, 0, None, None,
+        );
+        // Each pk forms its own group, COUNT=1 for each
+        assert_eq!(out.count, 3);
+        for i in 0..3 {
+            let count = crate::util::read_i64_le(&out.col_data[0], i * 8);
+            assert_eq!(count, 1, "each single-row group has count=1");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // op_anti_join_delta_trace / op_semi_join_delta_trace
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_anti_join_dt_basic() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+
+        // Trace: pk=2 and pk=4 exist
+        let trace = Arc::new(make_batch(&schema, &[(2, 1, 200), (4, 1, 400)]));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+
+        // Delta: pk=1,2,3
+        let delta = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+
+        let out = op_anti_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        // pk=2 is in trace, so output should be pk=1 and pk=3
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_pk_lo(0), 1);
+        assert_eq!(out.get_pk_lo(1), 3);
+        assert!(out.consolidated);
+    }
+
+    #[test]
+    fn test_semi_join_dt_basic() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+
+        // Trace: pk=2 and pk=3 exist with positive weight
+        let trace = Arc::new(make_batch(&schema, &[(2, 1, 200), (3, 1, 300)]));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+
+        // Delta: pk=1,2,3,4
+        let delta = make_batch(&schema, &[
+            (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40),
+        ]);
+
+        let out = op_semi_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        // Only pk=2 and pk=3 have trace matches
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_pk_lo(0), 2);
+        assert_eq!(out.get_pk_lo(1), 3);
+    }
+
+    #[test]
+    fn test_semi_join_dt_nonconsolidated() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+
+        // Trace: pk=1 exists
+        let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+
+        // Non-consolidated delta: pk=1 appears twice (w=2 and w=3)
+        let mut delta = OwnedBatch::with_schema(schema, 2);
+        delta.count = 0;
+        for (pk, w, val) in [(1u64, 2i64, 10i64), (1u64, 3i64, 10i64)] {
+            delta.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            delta.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            delta.weight.extend_from_slice(&w.to_le_bytes());
+            delta.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            delta.col_data[0].extend_from_slice(&val.to_le_bytes());
+            delta.count += 1;
+        }
+        delta.sorted = true;
+        delta.consolidated = false;
+
+        let out = op_semi_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        // After consolidation of delta: pk=1 w=5 → matches trace → 1 row
+        assert_eq!(out.count, 1);
+        assert_eq!(out.get_pk_lo(0), 1);
+        assert_eq!(out.get_weight(0), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // op_join_delta_trace_outer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_outer_join_null_fill() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let left_schema = make_schema_u64_i64();
+        let right_schema = make_schema_u64_i64();
+
+        // Right trace: pk=1 val=100
+        let trace = Arc::new(make_batch(&right_schema, &[(1, 1, 100)]));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], right_schema) };
+
+        // Delta (left): pk=1 val=10 (matches), pk=2 val=20 (no match → null fill)
+        let delta = make_batch(&left_schema, &[(1, 1, 10), (2, 1, 20)]);
+
+        let out = op_join_delta_trace_outer(&delta, &mut ch.cursor, &left_schema, &right_schema);
+
+        assert_eq!(out.count, 2);
+        // pk=1: matched, left payload=10, right payload=100
+        assert_eq!(out.get_pk_lo(0), 1);
+        assert_eq!(get_payload_i64(&out, 0), 10); // left val
+
+        // pk=2: no match, left payload=20, right columns null-filled
+        assert_eq!(out.get_pk_lo(1), 2);
+        assert_eq!(get_payload_i64(&out, 1), 20); // left val
+        // Right column (payload col 1) should be null
+        let null_word = u64::from_le_bytes(out.null_bmp[1 * 8..2 * 8].try_into().unwrap());
+        assert!(null_word & 2 != 0, "right payload column (bit 1) should be null for non-matching row");
+    }
+
+    // -----------------------------------------------------------------------
+    // op_gather_reduce
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gather_reduce_retraction() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::compact::type_code;
+
+        // Schema: pk(U128), count(I64) — same as partial/output schema
+        let mut schema = crate::compact::SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [crate::compact::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        schema.columns[0] = crate::compact::SchemaColumn {
+            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
+        };
+        schema.columns[1] = crate::compact::SchemaColumn {
+            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
+        };
+
+        // Tick 1: two partial COUNT=2 from different workers → global COUNT=4
+        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], schema) };
+
+        let mut partial1 = OwnedBatch::with_schema(schema, 2);
+        partial1.count = 0;
+        // Two entries for same group key (pk=1), count=2 each
+        for count in [2i64, 2] {
+            partial1.pk_lo.extend_from_slice(&1u64.to_le_bytes());
+            partial1.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            partial1.weight.extend_from_slice(&1i64.to_le_bytes());
+            partial1.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            partial1.col_data[0].extend_from_slice(&count.to_le_bytes());
+            partial1.count += 1;
+        }
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AGG_SUM, col_type_code: type_code::I64, _pad: [0; 2],
+        };
+
+        let out1 = op_gather_reduce(&partial1, &mut to_ch.cursor, &schema, &[agg]);
+        assert_eq!(out1.count, 1);
+        let global_count = crate::util::read_i64_le(&out1.col_data[0], 0);
+        assert_eq!(global_count, 4);
+
+        // Tick 2: retract 1 from each worker → partial counts are -1 each → global delta = -2
+        let prev_out = Arc::new(out1);
+        let mut to_ch2 = unsafe { create_cursor_from_snapshots(&[prev_out], &[], schema) };
+
+        let mut partial2 = OwnedBatch::with_schema(schema, 2);
+        partial2.count = 0;
+        for count in [-1i64, -1] {
+            partial2.pk_lo.extend_from_slice(&1u64.to_le_bytes());
+            partial2.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            partial2.weight.extend_from_slice(&1i64.to_le_bytes());
+            partial2.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            partial2.col_data[0].extend_from_slice(&count.to_le_bytes());
+            partial2.count += 1;
+        }
+
+        let out2 = op_gather_reduce(&partial2, &mut to_ch2.cursor, &schema, &[agg]);
+        // Should have 2 rows: retract old (4, w=-1) + insert new (2, w=+1)
+        assert_eq!(out2.count, 2);
+    }
 }

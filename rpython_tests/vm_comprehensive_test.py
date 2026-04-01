@@ -10,7 +10,7 @@ from gnitz.core import types, batch
 from gnitz.core.batch import RowBuilder
 from gnitz.dbsp import functions
 from gnitz.dbsp.ops.group_index import AggValueIndex, make_agg_value_idx_schema, ReduceGroupIndex, make_group_idx_schema
-from gnitz.vm import runtime, instructions, interpreter
+from gnitz.vm import runtime, instructions
 from gnitz.storage.ephemeral_table import EphemeralTable
 from rpython_tests.helpers.jit_stub import ensure_jit_reachable
 from rpython_tests.helpers.assertions import (
@@ -121,76 +121,6 @@ def test_filter_map_negate():
 
     result.free()
     in_batch.free()
-    log("  PASSED")
-
-# ------------------------------------------------------------------------------
-# Test 2: Union — algebraic addition
-# ------------------------------------------------------------------------------
-
-def test_union():
-    log("[VM] Test 2: Union — algebraic addition...")
-
-    cols = [
-        types.ColumnDefinition(types.TYPE_U64, name="pk"),
-        types.ColumnDefinition(types.TYPE_I64, name="val"),
-    ]
-    schema = types.TableSchema(cols, 0)
-    vm_schema = schema
-
-    # R0=input A, R1=input B, R2=output
-    reg_file = runtime.RegisterFile(3)
-    reg_file.registers[0] = runtime.DeltaRegister(0, vm_schema)
-    reg_file.registers[1] = runtime.DeltaRegister(1, vm_schema)
-    reg_file.registers[2] = runtime.DeltaRegister(2, vm_schema)
-
-    program = [
-        instructions.union_op(reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]),
-        instructions.halt_op(),
-    ]
-
-    # Batch A: pk=1 val=10
-    batch_a = batch.ArenaZSetBatch(schema)
-    rb_a = RowBuilder(schema, batch_a)
-    rb_a.begin(r_uint64(1), r_uint64(0), r_int64(1))
-    rb_a.put_int(r_int64(10))
-    rb_a.commit()
-
-    # Batch B: pk=2 val=20
-    batch_b_data = batch.ArenaZSetBatch(schema)
-    rb_b = RowBuilder(schema, batch_b_data)
-    rb_b.begin(r_uint64(2), r_uint64(0), r_int64(1))
-    rb_b.put_int(r_int64(20))
-    rb_b.commit()
-
-    # Bind both input registers and run the interpreter directly.
-    # execute_epoch is not used here because it calls prepare_for_tick which
-    # clears delta registers, and the Rust VM path does not forward pre-bound
-    # delta batches to non-input registers.
-    reg_file.registers[0].bind(batch_a)
-    reg_file.registers[1].bind(batch_b_data)
-
-    context = runtime.ExecutionContext()
-    context.reset()
-    interpreter.run_vm(program, reg_file, context)
-
-    result = reg_file.registers[2].batch
-    assert_equal_i(2, result.length(), "Union should have 2 rows (A + B)")
-
-    found_pk1 = False
-    found_pk2 = False
-    for i in range(result.length()):
-        pk = result.get_pk(i)
-        if pk == r_uint128(1):
-            found_pk1 = True
-        if pk == r_uint128(2):
-            found_pk2 = True
-    assert_true(found_pk1, "Union output missing pk=1 from batch A")
-    assert_true(found_pk2, "Union output missing pk=2 from batch B")
-
-    reg_file.registers[0].unbind()
-    reg_file.registers[1].unbind()
-    batch_a.free()
-    batch_b_data.free()
     log("  PASSED")
 
 # ------------------------------------------------------------------------------
@@ -648,131 +578,6 @@ def test_seek_trace_point_lookup(base_dir):
     result.free()
     seek_batch.free()
     table.close()
-    log("  PASSED")
-
-# ------------------------------------------------------------------------------
-# Test 10: Empty table scan
-# ------------------------------------------------------------------------------
-
-def test_empty_table_scan(base_dir):
-    log("[VM] Test 10: Empty table scan...")
-
-    cols = [
-        types.ColumnDefinition(types.TYPE_U64, name="pk"),
-        types.ColumnDefinition(types.TYPE_I64, name="val"),
-    ]
-    schema = types.TableSchema(cols, 0)
-    vm_schema = schema
-
-    table_path = os.path.join(base_dir, "empty_table")
-    table = EphemeralTable(table_path, "empty", schema)
-
-    # R0=trace cursor (empty), R1=output
-    trace_cursor = table.create_cursor()
-    reg_file = runtime.RegisterFile(2)
-    reg_file.registers[0] = runtime.TraceRegister(0, vm_schema, trace_cursor, table)
-    reg_file.registers[1] = runtime.DeltaRegister(1, vm_schema)
-
-    # Program: ScanTrace(R0, R1, chunk=10) -> Halt
-    program = [
-        instructions.scan_trace_op(reg_file.registers[0], reg_file.registers[1], 10),
-        instructions.halt_op(),
-    ]
-
-    context = runtime.ExecutionContext()
-    context.reset()
-    interpreter.run_vm(program, reg_file, context)
-
-    assert_equal_i(runtime.STATUS_HALTED, context.status, "Empty scan should halt")
-    assert_equal_i(0, reg_file.registers[1].batch.length(), "Output should be empty")
-
-    table.close()
-    log("  PASSED")
-
-# ------------------------------------------------------------------------------
-# Test 11: Join delta-delta (sort-merge)
-# ------------------------------------------------------------------------------
-
-def test_join_delta_delta():
-    log("[VM] Test 11: JoinDeltaDelta (sort-merge join)...")
-
-    # Schema A: (pk:U64, val_a:I64)
-    cols_a = [
-        types.ColumnDefinition(types.TYPE_U64, name="pk"),
-        types.ColumnDefinition(types.TYPE_I64, name="val_a"),
-    ]
-    schema_a = types.TableSchema(cols_a, 0)
-    vm_a = schema_a
-
-    # Schema B: (pk:U64, val_b:I64)
-    cols_b = [
-        types.ColumnDefinition(types.TYPE_U64, name="pk"),
-        types.ColumnDefinition(types.TYPE_I64, name="val_b"),
-    ]
-    schema_b = types.TableSchema(cols_b, 0)
-    vm_b = schema_b
-
-    out_schema = types.merge_schemas_for_join(schema_a, schema_b)
-    out_vm = out_schema
-
-    # R0=delta A, R1=delta B, R2=output
-    reg_file = runtime.RegisterFile(3)
-    reg_file.registers[0] = runtime.DeltaRegister(0, vm_a)
-    reg_file.registers[1] = runtime.DeltaRegister(1, vm_b)
-    reg_file.registers[2] = runtime.DeltaRegister(2, out_vm)
-
-    program = [
-        instructions.join_delta_delta_op(
-            reg_file.registers[0], reg_file.registers[1], reg_file.registers[2]
-        ),
-        instructions.halt_op(),
-    ]
-
-    # Batch A: pk=5 w=1, pk=10 w=2
-    batch_a = batch.ArenaZSetBatch(schema_a)
-    rb_a = RowBuilder(schema_a, batch_a)
-    rb_a.begin(r_uint64(5), r_uint64(0), r_int64(1))
-    rb_a.put_int(r_int64(55))
-    rb_a.commit()
-    rb_a.begin(r_uint64(10), r_uint64(0), r_int64(2))
-    rb_a.put_int(r_int64(100))
-    rb_a.commit()
-
-    # Batch B: pk=10 w=3, pk=20 w=1
-    batch_b = batch.ArenaZSetBatch(schema_b)
-    rb_b = RowBuilder(schema_b, batch_b)
-    rb_b.begin(r_uint64(10), r_uint64(0), r_int64(3))
-    rb_b.put_int(r_int64(200))
-    rb_b.commit()
-    rb_b.begin(r_uint64(20), r_uint64(0), r_int64(1))
-    rb_b.put_int(r_int64(300))
-    rb_b.commit()
-
-    # Bind both input registers and run the interpreter directly.
-    # execute_epoch is not used here because the Rust VM path does not forward
-    # pre-bound delta batches to non-input registers.
-    reg_file.registers[0].bind(batch_a)
-    reg_file.registers[1].bind(batch_b)
-
-    context = runtime.ExecutionContext()
-    context.reset()
-    interpreter.run_vm(program, reg_file, context)
-
-    result = reg_file.registers[2].batch
-    assert_equal_i(1, result.length(), "Only pk=10 matches both sides")
-    assert_equal_u128(r_uint128(10), result.get_pk(0), "Joined PK should be 10")
-    assert_equal_i64(r_int64(6), result.get_weight(0), "Weight should be 2*3=6")
-
-    # Check merged payload: val_a=100, val_b=200
-    # get_accessor uses schema col indices; pk is col 0, so val_a=1, val_b=2
-    acc = result.get_accessor(0)
-    assert_equal_i64(r_int64(100), acc.get_int_signed(1), "val_a mismatch")
-    assert_equal_i64(r_int64(200), acc.get_int_signed(2), "val_b mismatch")
-
-    reg_file.registers[0].unbind()
-    reg_file.registers[1].unbind()
-    batch_a.free()
-    batch_b.free()
     log("  PASSED")
 
 # ------------------------------------------------------------------------------
@@ -1582,57 +1387,6 @@ def test_reduce_min_group_idx_cross_tick(base_dir):
     log("  PASSED")
 
 
-def test_eval_expr_zero_regs():
-    """ExprProgram with num_regs=0 (pure COPY_COL) must not crash."""
-    os.write(1, "[vm] test_eval_expr_zero_regs...\n")
-    from gnitz.dbsp.expr import ExprProgram, ExprMapFunction, EXPR_COPY_COL, eval_expr
-
-    in_schema = types.TableSchema([
-        types.ColumnDefinition(types.TYPE_U64, name="pk"),
-        types.ColumnDefinition(types.TYPE_I64, name="val"),
-    ], pk_index=0)
-
-    out_schema = types.TableSchema([
-        types.ColumnDefinition(types.TYPE_U128, name="__pk"),
-        types.ColumnDefinition(types.TYPE_I64, name="val"),
-    ], pk_index=0)
-
-    # Bytecode: one COPY_COL instruction (copy col 1 → payload 0, type I64=9)
-    code = [r_int64(EXPR_COPY_COL), r_int64(types.TYPE_I64.code),
-            r_int64(1), r_int64(0)]
-    prog = ExprProgram(code, 0, 0)  # num_regs=0, result_reg=0
-
-    # eval_expr with builder: should execute COPY_COL without crashing
-    in_batch = batch.ArenaZSetBatch(in_schema)
-    rb = RowBuilder(in_schema, in_batch)
-    rb.begin(r_uint64(42), r_uint64(0), r_int64(1))
-    rb.put_int(r_int64(100))
-    rb.commit()
-
-    out_batch = batch.ArenaZSetBatch(out_schema)
-    builder = RowBuilder(out_schema, out_batch)
-    builder.begin(r_uint64(99), r_uint64(0), r_int64(1))
-
-    acc = in_batch.get_accessor(0)
-    result, is_null = eval_expr(prog, acc, builder)
-    # With num_regs=0, result should be (0, True) — sentinel
-    assert_true(is_null, "num_regs=0 returns null sentinel")
-
-    builder.commit()
-
-    # Also test ExprMapFunction.evaluate_map path
-    func = ExprMapFunction(prog)
-    out_batch2 = batch.ArenaZSetBatch(out_schema)
-    builder2 = RowBuilder(out_schema, out_batch2)
-    builder2.begin(r_uint64(99), r_uint64(0), r_int64(1))
-    func.evaluate_map(acc, builder2)
-    builder2.commit()
-
-    in_batch.free()
-    out_batch.free()
-    out_batch2.free()
-    os.write(1, "    [OK] zero-regs ExprProgram\n")
-
 
 # ------------------------------------------------------------------------------
 # Entry Point
@@ -1647,15 +1401,12 @@ def entry_point(argv):
 
     try:
         test_filter_map_negate()
-        test_union()
         test_join_delta_trace(base_dir)
         test_distinct_multi_tick(base_dir)
         test_reduce_sum(base_dir)
         test_ghost_property()
         test_empty_input()
         test_seek_trace_point_lookup(base_dir)
-        test_empty_table_scan(base_dir)
-        test_join_delta_delta()
         test_delay_op()
         test_reduce_min_nonlinear(base_dir)
         test_join_delta_trace_multi_match(base_dir)
@@ -1665,7 +1416,6 @@ def entry_point(argv):
         test_execute_epoch_evict()
         test_reduce_min_avi_group_elimination(base_dir)
         test_reduce_min_group_idx_cross_tick(base_dir)
-        test_eval_expr_zero_regs()
         os.write(1, "\nALL VM TEST PATHS PASSED\n")
     except Exception as e:
         os.write(2, "TEST FAILED: " + str(e) + "\n")

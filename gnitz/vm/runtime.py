@@ -624,12 +624,11 @@ class ExecutablePlan(object):
 
     def execute_epoch(self, input_delta, source_id=0):
         """
-        Executes the plan for one epoch/tick.
-        Uses the Rust VM if available, otherwise falls back to RPython interpreter.
+        Executes the plan for one epoch/tick via the Rust VM.
         """
-        if self._rust_vm:
-            return self._execute_epoch_rust(input_delta, source_id)
-        return self._execute_epoch_rpython(input_delta, source_id)
+        if not self._rust_vm:
+            raise Exception("Rust VM program creation failed")
+        return self._execute_epoch_rust(input_delta, source_id)
 
     def _execute_epoch_rust(self, input_delta, source_id):
         """Execute via the Rust VM (single FFI call per epoch)."""
@@ -679,42 +678,3 @@ class ExecutablePlan(object):
                 sealed.free()
         return result
 
-    def _execute_epoch_rpython(self, input_delta, source_id):
-        """Execute via the RPython interpreter (fallback path)."""
-        from gnitz.vm.interpreter import run_vm
-
-        self.reg_file.prepare_for_tick()
-        self.context.reset()
-
-        sealed = input_delta.to_consolidated()
-
-        target_reg_idx = self.in_reg_idx
-        if self.source_reg_map is not None and source_id in self.source_reg_map:
-            target_reg_idx = self.source_reg_map[source_id]
-        in_reg = self.reg_file.get_register(target_reg_idx)
-        assert in_reg.is_delta()
-        in_reg.bind(sealed)
-
-        run_vm(self.program, self.reg_file, self.context)
-
-        result = None
-        if self.context.status == STATUS_HALTED:
-            out_reg = self.reg_file.get_register(self.out_reg_idx)
-            assert out_reg.is_delta()
-            if out_reg.batch is out_reg._internal_batch:
-                if out_reg.batch.length() > 0:
-                    result = out_reg._internal_batch
-                    out_reg._internal_batch = ArenaZSetBatch(
-                        out_reg.table_schema, initial_capacity=0
-                    )
-                    out_reg.batch = out_reg._internal_batch
-            else:
-                if out_reg.batch.length() > 0:
-                    result = out_reg.batch.clone()
-                out_reg.unbind()
-
-        in_reg.unbind()
-        if sealed is not input_delta:
-            sealed.free()
-
-        return result
