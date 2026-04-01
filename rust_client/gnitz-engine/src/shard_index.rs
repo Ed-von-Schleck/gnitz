@@ -448,18 +448,26 @@ impl ShardIndex {
         guard_outputs: &[(u64, u64, String)],
         max_lsn: u64,
     ) -> Result<(), i32> {
-        self.l0.clear();
-
         self.ensure_level(1);
         let schema_copy = self.schema;
+
+        // Open all new entries before touching self.l0.
+        // If any open fails, l0 is still intact and the caller can retry.
+        let mut new_entries: Vec<(u64, u64, ShardEntry)> =
+            Vec::with_capacity(guard_outputs.len());
         for (gk_lo, gk_hi, filename) in guard_outputs {
             let entry = ShardEntry::open(filename, &schema_copy, 0, max_lsn)?;
+            new_entries.push((*gk_lo, *gk_hi, entry));
+        }
+
+        // All opens succeeded — safe to mutate state.
+        self.l0.clear();
+        for (gk_lo, gk_hi, entry) in new_entries {
             self.levels[0]
-                .get_or_create_guard(*gk_lo, *gk_hi)
+                .get_or_create_guard(gk_lo, gk_hi)
                 .entries
                 .push(entry);
         }
-
         self.update_flags();
         Ok(())
     }
@@ -1007,5 +1015,54 @@ mod tests {
         idx.add_shard(&path3, 10, 75).unwrap();
         // max_lsn should still be 200 (from second shard)
         assert_eq!(idx.max_lsn(), 200);
+    }
+
+    #[test]
+    fn test_run_compact_fails_on_long_path_l0_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+
+        // Build an output dir long enough that output filenames exceed 255 bytes.
+        // Filename overhead: "/shard_42_N_L1_GN.db" ≈ 20 bytes, so out_dir >= 236 bytes.
+        // A 240-char subdir is within NAME_MAX (255) and guarantees the total overflows.
+        let long_subdir = "a".repeat(240);
+        let long_out_dir = dir.path().join(&long_subdir);
+        std::fs::create_dir_all(&long_out_dir).unwrap();
+        let long_out_str = long_out_dir.to_str().unwrap();
+        assert!(
+            long_out_str.len() >= 236,
+            "test setup: out_dir too short ({})",
+            long_out_str.len()
+        );
+
+        let mut idx = ShardIndex::new(42, long_out_str, schema);
+
+        // Add L0_COMPACT_THRESHOLD + 1 shards (triggers compaction).
+        let mut all_pks = Vec::new();
+        for i in 0..5u64 {
+            let pk = (i + 1) * 10;
+            let path = write_test_shard(dir.path(), &format!("s{}.db", i), &[pk], &[pk as i64]);
+            idx.add_shard(&path, i, i + 1).unwrap();
+            all_pks.push(pk);
+        }
+
+        assert!(idx.needs_compaction);
+        let l0_before = idx.l0.len();
+
+        let result = idx.run_compact();
+        assert!(result.is_err(), "expected Err when output path exceeds 255 bytes");
+
+        // L0 must be unchanged — atomicity fix ensures this.
+        assert_eq!(idx.l0.len(), l0_before, "L0 must not be modified on failure");
+
+        // needs_compaction must still be true (update_flags was not called).
+        assert!(idx.needs_compaction, "needs_compaction must remain true after failure");
+
+        // All original keys must still be findable via L0.
+        for pk in &all_pks {
+            let mut found = false;
+            idx.find_pk(*pk, 0, &mut |_, _| found = true);
+            assert!(found, "pk {} lost from L0 after failed run_compact", pk);
+        }
     }
 }

@@ -545,6 +545,13 @@ pub fn merge_and_route(
         return e;
     }
 
+    // Validate all output paths fit in GuardResult.filename before writing anything.
+    for i in 0..num_guards {
+        if writers[i].count > 0 && out_filenames[i].len() >= 256 {
+            return -(libc::ENAMETOOLONG as i32);
+        }
+    }
+
     let mut result_count: i32 = 0;
     for i in 0..num_guards {
         if writers[i].count == 0 {
