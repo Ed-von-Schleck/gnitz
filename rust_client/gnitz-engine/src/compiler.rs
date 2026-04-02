@@ -840,17 +840,6 @@ fn col(tc: u8, sz: u8, nullable: bool) -> SchemaColumn {
     SchemaColumn { type_code: tc, size: sz, nullable: if nullable { 1 } else { 0 }, _pad: 0 }
 }
 
-#[allow(dead_code)]
-fn type_size(tc: u8) -> u8 {
-    match tc {
-        type_code::U8 | type_code::I8 => 1,
-        type_code::U16 | type_code::I16 => 2,
-        type_code::U32 | type_code::I32 | type_code::F32 => 4,
-        type_code::U64 | type_code::I64 | type_code::F64 => 8,
-        type_code::STRING | type_code::U128 => 16,
-        _ => 8,
-    }
-}
 
 fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
     let mut out = empty_schema();

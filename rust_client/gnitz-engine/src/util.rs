@@ -89,3 +89,8 @@ pub fn cstr_from_buf(buf: &[u8]) -> &str {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     std::str::from_utf8(&buf[..end]).unwrap_or("")
 }
+
+#[inline]
+pub fn align8(val: usize) -> usize {
+    (val + 7) & !7
+}

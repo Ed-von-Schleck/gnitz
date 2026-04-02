@@ -511,8 +511,7 @@ def _parse_from_ptr(ptr, total_size):
     out_seek_col   = lltype.malloc(rffi.ULONGLONGP.TO, 1, flavor='raw')
     out_err_ptr    = lltype.malloc(rffi.CCHARPP.TO, 1, flavor='raw')
     out_err_len    = lltype.malloc(rffi.UINTP.TO, 1, flavor='raw')
-    out_schema_buf = engine_ffi.pack_schema(types.TableSchema(
-        [types.ColumnDefinition(types.TYPE_U64, name="dummy")], pk_index=0))
+    out_schema_buf = lltype.malloc(rffi.CCHARP.TO, engine_ffi.SCHEMA_DESC_SIZE, flavor='raw')
     out_has_schema = lltype.malloc(rffi.INTP.TO, 1, flavor='raw')
     out_batch      = lltype.malloc(rffi.VOIDPP.TO, 1, flavor='raw')
     out_num_names  = lltype.malloc(rffi.UINTP.TO, 1, flavor='raw')
@@ -539,14 +538,9 @@ def _parse_from_ptr(ptr, total_size):
         payload.seek_pk_hi   = intmask(out_seek_pk_hi[0])
         payload.seek_col_idx = intmask(out_seek_col[0])
 
-        # Error message
         err_len = intmask(rffi.cast(lltype.Signed, out_err_len[0]))
         if err_len > 0 and out_err_ptr[0]:
-            chars = []
-            ep = out_err_ptr[0]
-            for i in range(err_len):
-                chars.append(ep[i])
-            payload.error_msg = "".join(chars)
+            payload.error_msg = rffi.charpsize2str(out_err_ptr[0], err_len)
 
         # Schema
         has_schema = intmask(rffi.cast(lltype.Signed, out_has_schema[0]))
@@ -576,11 +570,7 @@ def _parse_from_ptr(ptr, total_size):
                         cn_ptr, cn_len)
                     nlen = intmask(rffi.cast(lltype.Signed, cn_len[0]))
                     if nlen > 0 and cn_ptr[0]:
-                        chars = []
-                        np = cn_ptr[0]
-                        for j in range(nlen):
-                            chars.append(np[j])
-                        name = "".join(chars)
+                        name = rffi.charpsize2str(cn_ptr[0], nlen)
                     lltype.free(cn_ptr, flavor='raw')
                     lltype.free(cn_len, flavor='raw')
 
@@ -633,73 +623,50 @@ def write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers):
     contains an _encode_wire result. The caller must free worker_bufs after
     this returns. Does NOT fdatasync or signal — caller does that.
 
-    Delegates the mmap write to Rust (gnitz_sal_write_group).
     """
-    c_ptrs = lltype.malloc(rffi.CCHARPP.TO, num_workers, flavor='raw')
-    c_sizes = lltype.malloc(rffi.UINTP.TO, num_workers, flavor='raw')
-    try:
-        for w in range(num_workers):
-            wb = worker_bufs[w]
-            if wb is not None and wb.offset > 0:
-                c_ptrs[w] = wb.base_ptr
-                c_sizes[w] = rffi.cast(rffi.UINT, wb.offset)
-            else:
-                c_ptrs[w] = lltype.nullptr(rffi.CCHARP.TO)
-                c_sizes[w] = rffi.cast(rffi.UINT, 0)
+    payload_size = GROUP_HEADER_SIZE
+    for w in range(num_workers):
+        wb = worker_bufs[w]
+        if wb is not None and wb.offset > 0:
+            payload_size += _align8(wb.offset)
 
-        # Rust returns SalWriteResult {status: i32, new_cursor: u64} but
-        # since RPython doesn't support returning structs, we use a 16-byte
-        # output buffer. Actually the FFI declaration uses the first field
-        # (i32) as the return value. We need to use the raw function call.
-        # For now: keep the Python implementation but use Rust atomics.
-        # TODO(step3): once wire encode is in Rust, pass handles directly.
+    total = 8 + _align8(payload_size)
+    if sal.write_cursor + total > sal.mmap_size:
+        raise errors.StorageError("SAL full — checkpoint required")
 
-        # Compute total size: 8-byte prefix + GROUP_HEADER_SIZE + per-worker data
-        payload_size = GROUP_HEADER_SIZE
-        for w in range(num_workers):
-            wb = worker_bufs[w]
-            if wb is not None and wb.offset > 0:
-                payload_size += _align8(wb.offset)
+    base = sal.write_cursor
+    hdr_off = base + 8
+    _write_u64_raw(sal.ptr, hdr_off + 0, r_uint64(payload_size))
+    _write_u64_raw(sal.ptr, hdr_off + 8, r_uint64(lsn))
+    _write_u32_raw(sal.ptr, hdr_off + 16, num_workers)
+    _write_u32_raw(sal.ptr, hdr_off + 20, flags)
+    _write_u32_raw(sal.ptr, hdr_off + 24, target_id)
+    _write_u32_raw(sal.ptr, hdr_off + 28, sal.epoch)
 
-        total = 8 + _align8(payload_size)
-        if sal.write_cursor + total > sal.mmap_size:
-            raise errors.StorageError("SAL full — checkpoint required")
+    data_offset = GROUP_HEADER_SIZE
+    for w in range(num_workers):
+        wb = worker_bufs[w]
+        if wb is not None and wb.offset > 0:
+            wsz = wb.offset
+            _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, data_offset)
+            _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz)
+            buffer_ops.c_memmove(
+                rffi.cast(rffi.VOIDP, rffi.ptradd(sal.ptr, hdr_off + data_offset)),
+                rffi.cast(rffi.VOIDP, wb.base_ptr),
+                rffi.cast(rffi.SIZE_T, wsz),
+            )
+            data_offset += _align8(wsz)
+        else:
+            _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, 0)
+            _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0)
 
-        base = sal.write_cursor
-        hdr_off = base + 8
-        _write_u64_raw(sal.ptr, hdr_off + 0, r_uint64(payload_size))
-        _write_u64_raw(sal.ptr, hdr_off + 8, r_uint64(lsn))
-        _write_u32_raw(sal.ptr, hdr_off + 16, num_workers)
-        _write_u32_raw(sal.ptr, hdr_off + 20, flags)
-        _write_u32_raw(sal.ptr, hdr_off + 24, target_id)
-        _write_u32_raw(sal.ptr, hdr_off + 28, sal.epoch)
+    # Size prefix written LAST via atomic release store — workers use this
+    # as the "data ready" sentinel.
+    atomic_store_u64(
+        rffi.ptradd(sal.ptr, base),
+        rffi.cast(rffi.ULONGLONG, payload_size))
 
-        data_offset = GROUP_HEADER_SIZE
-        for w in range(num_workers):
-            wb = worker_bufs[w]
-            if wb is not None and wb.offset > 0:
-                wsz = wb.offset
-                _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, data_offset)
-                _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz)
-                buffer_ops.c_memmove(
-                    rffi.cast(rffi.VOIDP, rffi.ptradd(sal.ptr, hdr_off + data_offset)),
-                    rffi.cast(rffi.VOIDP, wb.base_ptr),
-                    rffi.cast(rffi.SIZE_T, wsz),
-                )
-                data_offset += _align8(wsz)
-            else:
-                _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, 0)
-                _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0)
-
-        # Write size prefix LAST via atomic release store
-        atomic_store_u64(
-            rffi.ptradd(sal.ptr, base),
-            rffi.cast(rffi.ULONGLONG, payload_size))
-
-        sal.write_cursor += total
-    finally:
-        lltype.free(c_ptrs, flavor='raw')
-        lltype.free(c_sizes, flavor='raw')
+    sal.write_cursor += total
 
 
 @jit.dont_look_inside

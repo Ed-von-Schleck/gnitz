@@ -29,12 +29,10 @@ const OFF_CHECKSUM: usize = 24;
 const OFF_NUM_REGIONS: usize = 32;
 const OFF_BLOB_SIZE: usize = 40;
 
-fn align8(val: usize) -> usize {
-    (val + 7) & !7
-}
+use crate::util::align8;
 
 /// Compute the total byte size of a WAL block with the given regions.
-fn block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
+pub(crate) fn block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
     let mut pos = HEADER_SIZE + num_regions * 8;
     for i in 0..num_regions {
         pos = align8(pos);

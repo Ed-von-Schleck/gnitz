@@ -5,9 +5,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::compact::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD};
+use crate::compact::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_size};
 use crate::compact::type_code;
 use crate::memtable::OwnedBatch;
+use crate::util::align8;
 use crate::wal;
 
 // ---------------------------------------------------------------------------
@@ -42,33 +43,29 @@ pub const META_FLAG_IS_PK: u64 = 2;
 // Wire protocol: schema ↔ batch conversion
 // ---------------------------------------------------------------------------
 
-/// Build a META_SCHEMA SchemaDescriptor (4 columns: col_idx, type_code, flags, name).
-fn meta_schema_desc() -> SchemaDescriptor {
-    let mut sd = SchemaDescriptor {
-        num_columns: 4,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
-    };
-    sd.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 }; // col_idx (PK)
-    sd.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 }; // type_code
-    sd.columns[2] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 }; // flags
-    sd.columns[3] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 }; // name
-    sd
-}
+const ZERO_COL: SchemaColumn = SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 };
+const U64_COL: SchemaColumn = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+const STR_COL: SchemaColumn = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
+const STR_COL_NULL: SchemaColumn = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 1, _pad: 0 };
 
-/// Build a CONTROL_SCHEMA SchemaDescriptor (9 columns).
-fn control_schema_desc() -> SchemaDescriptor {
-    let mut sd = SchemaDescriptor {
-        num_columns: 9,
-        pk_index: 0,
-        columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
-    };
-    for i in 0..8 {
-        sd.columns[i] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-    }
-    sd.columns[8] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 1, _pad: 0 }; // error_msg
+/// META_SCHEMA: col_idx(PK), type_code, flags, name.
+const META_SCHEMA_DESC: SchemaDescriptor = {
+    let mut sd = SchemaDescriptor { num_columns: 4, pk_index: 0, columns: [ZERO_COL; 64] };
+    sd.columns[0] = U64_COL;
+    sd.columns[1] = U64_COL;
+    sd.columns[2] = U64_COL;
+    sd.columns[3] = STR_COL;
     sd
-}
+};
+
+/// CONTROL_SCHEMA: 8 U64 cols + 1 nullable String.
+const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
+    let mut sd = SchemaDescriptor { num_columns: 9, pk_index: 0, columns: [ZERO_COL; 64] };
+    sd.columns[0] = U64_COL; sd.columns[1] = U64_COL; sd.columns[2] = U64_COL;
+    sd.columns[3] = U64_COL; sd.columns[4] = U64_COL; sd.columns[5] = U64_COL;
+    sd.columns[6] = U64_COL; sd.columns[7] = U64_COL; sd.columns[8] = STR_COL_NULL;
+    sd
+};
 
 /// Encode a German string into a 16-byte struct + optional blob append.
 fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
@@ -115,7 +112,7 @@ fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
 /// Convert a SchemaDescriptor + column names into a META_SCHEMA OwnedBatch.
 fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) -> OwnedBatch {
     let ncols = schema.num_columns as usize;
-    let meta = meta_schema_desc();
+    let meta = META_SCHEMA_DESC;
     let mut batch = OwnedBatch::with_schema(meta, ncols);
 
     for ci in 0..ncols {
@@ -179,15 +176,7 @@ fn batch_to_schema(batch: &OwnedBatch) -> Result<(SchemaDescriptor, Vec<Vec<u8>>
         let is_nullable = (flags_val & META_FLAG_NULLABLE) != 0;
         let is_pk = (flags_val & META_FLAG_IS_PK) != 0;
 
-        let col_size = match type_code_val {
-            type_code::U8 | type_code::I8 => 1,
-            type_code::U16 | type_code::I16 => 2,
-            type_code::U32 | type_code::I32 | type_code::F32 => 4,
-            type_code::U64 | type_code::I64 | type_code::F64 => 8,
-            type_code::STRING => 16,
-            type_code::U128 => 16,
-            _ => 8, // default
-        };
+        let col_size = type_size(type_code_val);
 
         sd.columns[i] = SchemaColumn {
             type_code: type_code_val,
@@ -225,7 +214,7 @@ fn encode_control_block(
     status: u32,
     error_msg: &[u8],
 ) -> Vec<u8> {
-    let cs = control_schema_desc();
+    let cs = CONTROL_SCHEMA_DESC;
     let mut batch = OwnedBatch::with_schema(cs, 1);
 
     let has_error = !error_msg.is_empty();
@@ -235,8 +224,6 @@ fn encode_control_block(
     batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
     batch.weight.extend_from_slice(&1i64.to_le_bytes());
     batch.null_bmp.extend_from_slice(&null_word.to_le_bytes());
-
-    // Payload cols 0-6: status, client_id, target_id, flags, seek_pk_lo, seek_pk_hi, seek_col_idx
     batch.col_data[0].extend_from_slice(&(status as u64).to_le_bytes());
     batch.col_data[1].extend_from_slice(&client_id.to_le_bytes());
     batch.col_data[2].extend_from_slice(&target_id.to_le_bytes());
@@ -245,7 +232,6 @@ fn encode_control_block(
     batch.col_data[5].extend_from_slice(&seek_pk_hi.to_le_bytes());
     batch.col_data[6].extend_from_slice(&seek_col_idx.to_le_bytes());
 
-    // Payload col 7: error_msg (German string, nullable)
     let error_st = if has_error {
         encode_german_string(error_msg, &mut batch.blob)
     } else {
@@ -267,13 +253,7 @@ fn encode_batch_to_wal(batch: &OwnedBatch, lsn: u64, table_id: u32) -> Vec<u8> {
         sizes.push(batch.region_size(i) as u32);
     }
     let blob_size = batch.blob.len() as u64;
-
-    // Compute required size
-    let mut total = wal::HEADER_SIZE + nr * 8;
-    for s in &sizes {
-        total = align8(total);
-        total += *s as usize;
-    }
+    let total = wal::block_size(nr, &sizes);
     let mut buf = vec![0u8; total];
     let result = wal::encode(
         &mut buf, 0, lsn, table_id, batch.count as u32,
@@ -407,7 +387,6 @@ fn decode_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<OwnedBatch
     let mut batch = unsafe {
         OwnedBatch::from_regions(&ptrs, &region_sizes, count as usize, npc)
     };
-    let _ = lsn;
     batch.schema = Some(*schema);
     Ok(batch)
 }
@@ -426,7 +405,7 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
         return Err("control block truncated");
     }
 
-    let cs = control_schema_desc();
+    let cs = CONTROL_SCHEMA_DESC;
     let ctrl_batch = decode_wal_block(&data[..ctrl_size], &cs)?;
 
     // Extract control fields
@@ -476,7 +455,7 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
             return Err("schema block truncated");
         }
 
-        let meta = meta_schema_desc();
+        let meta = META_SCHEMA_DESC;
         let schema_batch = decode_wal_block(&data[off..off + schema_size], &meta)?;
         let (sd, names) = batch_to_schema(&schema_batch)?;
         wire_schema = Some(sd);
@@ -561,11 +540,6 @@ unsafe fn read_u32_raw(base: *const u8, offset: usize) -> u32 {
     p.read_unaligned()
 }
 
-#[inline]
-fn align8(n: usize) -> usize {
-    (n + 7) & !7
-}
-
 // ---------------------------------------------------------------------------
 // SAL write (master→workers)
 // ---------------------------------------------------------------------------
@@ -604,6 +578,9 @@ pub unsafe fn sal_write_group(
     worker_sizes: *const u32,
 ) -> SalWriteResult {
     let nw = num_workers as usize;
+    if nw > MAX_WORKERS {
+        return SalWriteResult { status: -1, new_cursor: write_cursor };
+    }
     let wc = write_cursor as usize;
 
     // Compute total size: 8-byte prefix + GROUP_HEADER_SIZE + per-worker data
@@ -901,6 +878,7 @@ pub extern "C" fn gnitz_ipc_encode_wire(
 }
 
 /// Free a wire buffer allocated by `gnitz_ipc_encode_wire`.
+/// Safety: `into_boxed_slice` in the encoder shrinks capacity to len, so len == capacity.
 #[no_mangle]
 pub extern "C" fn gnitz_ipc_wire_free(ptr: *mut u8, len: u32) {
     if ptr.is_null() { return; }
@@ -972,12 +950,11 @@ pub extern "C" fn gnitz_ipc_decode_wire(
                 }
             }
 
+            let batch_ptr = decoded.data_batch.as_ref()
+                .map(|b| &**b as *const OwnedBatch as *mut libc::c_void)
+                .unwrap_or(std::ptr::null_mut());
             if !out_batch_handle.is_null() {
-                if decoded.data_batch.is_some() {
-                    *out_batch_handle = std::ptr::null_mut(); // set below after Box::into_raw
-                } else {
-                    *out_batch_handle = std::ptr::null_mut();
-                }
+                *out_batch_handle = batch_ptr;
             }
 
             if !out_num_col_names.is_null() {
@@ -985,19 +962,7 @@ pub extern "C" fn gnitz_ipc_decode_wire(
             }
         }
 
-        let handle = Box::new(IpcDecodeResult { decoded });
-        let raw = Box::into_raw(handle);
-
-        // Now set batch handle if present
-        unsafe {
-            if !out_batch_handle.is_null() {
-                if let Some(ref batch) = (*raw).decoded.data_batch {
-                    *out_batch_handle = &**batch as *const OwnedBatch as *mut libc::c_void;
-                }
-            }
-        }
-
-        raw
+        Box::into_raw(Box::new(IpcDecodeResult { decoded }))
     });
     result.unwrap_or(std::ptr::null_mut())
 }
@@ -1110,15 +1075,6 @@ pub extern "C" fn gnitz_sal_read_group_header(
         };
     }
     unsafe { sal_read_group_header(sal_ptr, read_cursor, worker_id) }
-}
-
-/// W2M read result for FFI.
-#[repr(C)]
-pub struct W2mReadResult {
-    pub new_cursor: u64,
-    pub data_size: u32,
-    pub _pad: u32,
-    pub data_ptr: *const u8,
 }
 
 #[no_mangle]
@@ -1754,17 +1710,8 @@ mod tests {
 
     #[test]
     fn test_flag_has_data_requires_schema() {
-        // Manually create wire bytes with FLAG_HAS_DATA but not FLAG_HAS_SCHEMA
-        let wire = encode_wire(
-            0, 0, 0, 0, 0, 0,
-            STATUS_OK, b"",
-            None, None, None,
-        );
-        // The encoder won't set FLAG_HAS_DATA without data. Manually corrupt:
-        // We need to find the flags field in the control batch and set FLAG_HAS_DATA.
-        // The flags are in payload col 3 (0-indexed) at the WAL region for that column.
-        // Instead, just test the decoder with a known bad condition.
-        // Actually, let's test it properly by encoding with data, then stripping the schema block.
+        // Encode with data, then truncate after control block to remove schema+data.
+        // Flags still has FLAG_HAS_SCHEMA set, so decode should fail with truncation.
         let sd = simple_schema();
         let batch = make_simple_batch(1, 2);
         let names: Vec<&[u8]> = vec![b"a", b"b"];

@@ -58,6 +58,18 @@ pub struct SchemaDescriptor {
     pub columns: [SchemaColumn; 64],
 }
 
+/// Map a type code to its fixed column byte size.
+pub(crate) fn type_size(tc: u8) -> u8 {
+    match tc {
+        type_code::U8 | type_code::I8 => 1,
+        type_code::U16 | type_code::I16 => 2,
+        type_code::U32 | type_code::I32 | type_code::F32 => 4,
+        type_code::U64 | type_code::I64 | type_code::F64 => 8,
+        type_code::STRING | type_code::U128 => 16,
+        _ => 8,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Guard output result (returned from merge_and_route)
 // ---------------------------------------------------------------------------
