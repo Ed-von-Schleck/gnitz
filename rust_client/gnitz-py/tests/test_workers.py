@@ -808,3 +808,26 @@ def test_workers_except_multiworker(client):
         assert pks == expected, f"expected {expected}, got {pks}"
     finally:
         _drop_all(client, sn, tables=["a", "b"], views=["v"])
+
+
+@_NEEDS_MULTI
+def test_empty_batch_barrier(client):
+    """With multiple workers, inserting 1 row means all but one worker get an
+    empty batch.  The barrier must still complete without deadlock."""
+    sn = "eb" + _uid()
+    client.create_schema(sn)
+    try:
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        schema = gnitz.Schema(cols)
+        tid = client.create_table(sn, "t", cols)
+
+        batch = gnitz.ZSetBatch(schema)
+        batch.append(pk=1, val=10)
+        client.push(tid, batch)
+
+        result = client.scan(tid)
+        pks = sorted(row.pk for row in result if row.weight > 0)
+        assert pks == [1]
+    finally:
+        _drop_all(client, sn, tables=["t"])

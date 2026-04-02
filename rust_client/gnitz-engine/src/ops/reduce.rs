@@ -273,15 +273,6 @@ pub(super) fn extract_gc_u64(
     lo
 }
 
-/// IEEE 754 order-preserving encoding.
-fn ieee_order_bits(raw_bits: u64) -> u64 {
-    if raw_bits >> 63 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u64 << 63)
-    }
-}
-
 /// Reverse IEEE order-preserving encoding.
 fn ieee_order_bits_reverse(encoded: u64) -> u64 {
     if encoded >> 63 != 0 {
@@ -293,6 +284,7 @@ fn ieee_order_bits_reverse(encoded: u64) -> u64 {
 
 /// IEEE 754 order-preserving encoding for 32-bit floats, returning u64.
 /// Checks the F32 sign bit (bit 31), not bit 63.
+#[cfg(test)]
 fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
     (if raw_bits >> 31 != 0 { !raw_bits } else { raw_bits ^ (1u32 << 31) }) as u64
 }

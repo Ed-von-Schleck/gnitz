@@ -1,15 +1,12 @@
 # gnitz/core/batch.py
 
 from rpython.rlib import jit
-from rpython.rlib.objectmodel import newlist_hint
 from rpython.rlib.rarithmetic import r_int64, r_uint64, r_ulonglonglong as r_uint128, intmask
 from rpython.rlib.longlong2float import float2longlong, longlong2float
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import strings as string_logic, errors, types
 from gnitz.core import comparator as core_comparator
-
-NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
 
 
 def pk_lt(a_lo, a_hi, b_lo, b_hi):
@@ -205,16 +202,6 @@ class RowBuilder(core_comparator.RowAccessor):
         self._lo[self._curr] = r_int64(0)
         self._null_word |= r_uint64(1) << payload_col_idx
         self._curr += 1
-
-    def commit_row(self, pk_lo, pk_hi, weight):
-        if self._curr != self._n:
-            raise errors.LayoutError(
-                "Map function failed to write all columns: "
-                "expected %d, wrote %d" % (self._n, self._curr)
-            )
-        self._target.append_from_accessor(pk_lo, pk_hi, weight, self)
-        self._curr = 0
-        self._null_word = r_uint64(0)
 
     # RowAccessor read interface
 
@@ -493,6 +480,97 @@ class ArenaZSetBatch(object):
                 self._invalidate_cache()
                 return
 
+        if isinstance(accessor, RowBuilder):
+            from gnitz.storage import engine_ffi
+            n = accessor._n
+            lo_arr = lltype.malloc(rffi.LONGLONGP.TO, max(n, 1), flavor="raw")
+            hi_arr = lltype.malloc(rffi.ULONGLONGP.TO, max(n, 1), flavor="raw")
+            str_ptrs_arr = lltype.malloc(rffi.CCHARPP.TO, max(n, 1), flavor="raw")
+            str_lens_arr = lltype.malloc(rffi.UINTP.TO, max(n, 1), flavor="raw")
+            str_bufs = lltype.malloc(rffi.CCHARPP.TO, max(n, 1), flavor="raw")
+            for pi in range(max(n, 1)):
+                str_bufs[pi] = lltype.nullptr(rffi.CCHARP.TO)
+            try:
+                for pi in range(n):
+                    lo_arr[pi] = accessor._lo[pi]
+                    hi_arr[pi] = rffi.cast(rffi.ULONGLONG,
+                        accessor._hi[pi] if accessor._hi is not None else r_uint64(0))
+                    if accessor._strs is not None:
+                        s = accessor._strs[pi]
+                        slen = len(s)
+                        if slen > 0:
+                            buf = rffi.str2charp(s)
+                            str_bufs[pi] = buf
+                            str_ptrs_arr[pi] = buf
+                            str_lens_arr[pi] = rffi.cast(rffi.UINT, slen)
+                        else:
+                            str_ptrs_arr[pi] = lltype.nullptr(rffi.CCHARP.TO)
+                            str_lens_arr[pi] = rffi.cast(rffi.UINT, 0)
+                    else:
+                        str_ptrs_arr[pi] = lltype.nullptr(rffi.CCHARP.TO)
+                        str_lens_arr[pi] = rffi.cast(rffi.UINT, 0)
+                rc = engine_ffi._batch_append_row_simple(
+                    self._handle,
+                    rffi.cast(rffi.ULONGLONG, pk_lo),
+                    rffi.cast(rffi.ULONGLONG, pk_hi),
+                    rffi.cast(rffi.LONGLONG, weight),
+                    rffi.cast(rffi.ULONGLONG, accessor._null_word),
+                    lo_arr, hi_arr, str_ptrs_arr, str_lens_arr,
+                    rffi.cast(rffi.UINT, n),
+                )
+                if intmask(rc) < 0:
+                    raise errors.StorageError("batch_append_row_simple failed")
+            finally:
+                lltype.free(lo_arr, flavor="raw")
+                lltype.free(hi_arr, flavor="raw")
+                for pi in range(n):
+                    if str_bufs[pi]:
+                        rffi.free_charp(str_bufs[pi])
+                lltype.free(str_bufs, flavor="raw")
+                lltype.free(str_ptrs_arr, flavor="raw")
+                lltype.free(str_lens_arr, flavor="raw")
+            self._invalidate_cache()
+            return
+
+        from gnitz.storage.cursor import RustCursorAccessor
+        from gnitz.storage.ephemeral_table import TableFoundAccessor
+        from gnitz.storage.partitioned_table import PTableFoundAccessor
+
+        if isinstance(accessor, RustCursorAccessor):
+            rc = engine_ffi._batch_append_row_from_cursor(
+                self._handle, accessor._handle,
+                rffi.cast(rffi.LONGLONG, weight),
+            )
+            if intmask(rc) < 0:
+                raise errors.StorageError("append_row_from_cursor failed")
+            self._invalidate_cache()
+            return
+
+        if isinstance(accessor, TableFoundAccessor):
+            rc = engine_ffi._batch_append_row_from_table_found(
+                self._handle, accessor._handle,
+                rffi.cast(rffi.ULONGLONG, pk_lo),
+                rffi.cast(rffi.ULONGLONG, pk_hi),
+                rffi.cast(rffi.LONGLONG, weight),
+            )
+            if intmask(rc) < 0:
+                raise errors.StorageError("append_row_from_table_found failed")
+            self._invalidate_cache()
+            return
+
+        if isinstance(accessor, PTableFoundAccessor):
+            rc = engine_ffi._batch_append_row_from_ptable_found(
+                self._handle, accessor._handle,
+                rffi.cast(rffi.ULONGLONG, pk_lo),
+                rffi.cast(rffi.ULONGLONG, pk_hi),
+                rffi.cast(rffi.LONGLONG, weight),
+            )
+            if intmask(rc) < 0:
+                raise errors.StorageError("append_row_from_ptable_found failed")
+            self._invalidate_cache()
+            return
+
+        # Generic path: only IndexPayloadAccessor reaches here
         schema = self._schema
         num_payload = schema.n_payload
         col_ptrs = lltype.malloc(rffi.VOIDPP.TO, max(num_payload, 1), flavor="raw")
@@ -500,33 +578,14 @@ class ArenaZSetBatch(object):
         val_bufs = lltype.malloc(rffi.CCHARP.TO, max(num_payload * 16, 1), flavor="raw")
 
         null_word = r_uint64(0)
-        if isinstance(accessor, RowBuilder):
-            null_word = accessor._null_word
-        else:
-            for i in range(len(schema.columns)):
-                if i == schema.pk_index:
-                    continue
-                if accessor.is_null(i):
-                    payload_idx = i if i < schema.pk_index else i - 1
-                    null_word |= r_uint64(1) << payload_idx
-
-        blob_data = lltype.nullptr(rffi.CCHARP.TO)
-        blob_len = 0
-        py_strs = None
-        if isinstance(accessor, RowBuilder) and accessor._strs is not None:
-            py_strs = newlist_hint(num_payload)
-            total_blob = 0
-            for pi in range(num_payload):
-                s = accessor._strs[pi]
-                py_strs.append(s)
-                if len(s) > string_logic.SHORT_STRING_THRESHOLD:
-                    total_blob += len(s)
-            if total_blob > 0:
-                blob_data = lltype.malloc(rffi.CCHARP.TO, total_blob, flavor="raw")
-                blob_len = total_blob
+        for i in range(len(schema.columns)):
+            if i == schema.pk_index:
+                continue
+            if accessor.is_null(i):
+                payload_idx = i if i < schema.pk_index else i - 1
+                null_word |= r_uint64(1) << payload_idx
 
         try:
-            blob_offset = 0
             pi = 0
             for ci in range(len(schema.columns)):
                 if ci == schema.pk_index:
@@ -545,51 +604,27 @@ class ArenaZSetBatch(object):
 
                 code = col_type.code
                 if code == types.TYPE_STRING.code:
-                    if isinstance(accessor, RowBuilder) and py_strs is not None:
-                        s = py_strs[pi]
-                        length = len(s)
-                        prefix = rffi.cast(lltype.Signed, string_logic.compute_prefix(s))
-                        rffi.cast(rffi.UINTP, vbuf)[0] = rffi.cast(rffi.UINT, length)
-                        rffi.cast(rffi.UINTP, rffi.ptradd(vbuf, 4))[0] = rffi.cast(
-                            rffi.UINT, prefix
-                        )
-                        if length <= string_logic.SHORT_STRING_THRESHOLD:
-                            sfx = length - 4 if length > 4 else 0
-                            if sfx > 0:
-                                for k in range(sfx):
-                                    vbuf[8 + k] = s[4 + k]
-                            for k in range(sfx, 8):
-                                vbuf[8 + k] = "\x00"
-                        else:
-                            rffi.cast(rffi.ULONGLONGP, rffi.ptradd(vbuf, 8))[0] = rffi.cast(
-                                rffi.ULONGLONG, blob_offset
-                            )
-                            assert blob_data != lltype.nullptr(rffi.CCHARP.TO)
-                            for k in range(length):
-                                blob_data[blob_offset + k] = s[k]
-                            blob_offset += length
+                    length, prefix, src_struct_ptr, src_heap_ptr, py_string = (
+                        accessor.get_str_struct(ci)
+                    )
+                    rffi.cast(rffi.UINTP, vbuf)[0] = rffi.cast(rffi.UINT, length)
+                    rffi.cast(rffi.UINTP, rffi.ptradd(vbuf, 4))[0] = rffi.cast(
+                        rffi.UINT, prefix
+                    )
+                    if length <= string_logic.SHORT_STRING_THRESHOLD:
+                        sfx = length - 4 if length > 4 else 0
+                        if sfx > 0 and src_struct_ptr != lltype.nullptr(rffi.CCHARP.TO):
+                            for k in range(sfx):
+                                vbuf[8 + k] = src_struct_ptr[8 + k]
+                        for k in range(sfx, 8):
+                            vbuf[8 + k] = "\x00"
                     else:
-                        length, prefix, src_struct_ptr, src_heap_ptr, py_string = (
-                            accessor.get_str_struct(ci)
-                        )
-                        rffi.cast(rffi.UINTP, vbuf)[0] = rffi.cast(rffi.UINT, length)
-                        rffi.cast(rffi.UINTP, rffi.ptradd(vbuf, 4))[0] = rffi.cast(
-                            rffi.UINT, prefix
-                        )
-                        if length <= string_logic.SHORT_STRING_THRESHOLD:
-                            sfx = length - 4 if length > 4 else 0
-                            if sfx > 0 and src_struct_ptr != lltype.nullptr(rffi.CCHARP.TO):
-                                for k in range(sfx):
-                                    vbuf[8 + k] = src_struct_ptr[8 + k]
-                            for k in range(sfx, 8):
-                                vbuf[8 + k] = "\x00"
+                        if src_struct_ptr != lltype.nullptr(rffi.CCHARP.TO):
+                            for k in range(8):
+                                vbuf[8 + k] = src_struct_ptr[8 + k]
                         else:
-                            if src_struct_ptr != lltype.nullptr(rffi.CCHARP.TO):
-                                for k in range(8):
-                                    vbuf[8 + k] = src_struct_ptr[8 + k]
-                            else:
-                                for k in range(8):
-                                    vbuf[8 + k] = "\x00"
+                            for k in range(8):
+                                vbuf[8 + k] = "\x00"
                 elif code == types.TYPE_F64.code:
                     rffi.cast(rffi.DOUBLEP, vbuf)[0] = rffi.cast(
                         rffi.DOUBLE, accessor.get_float(ci)
@@ -611,19 +646,7 @@ class ArenaZSetBatch(object):
                     )
                 pi += 1
 
-            if isinstance(accessor, ColumnarBatchAccessor):
-                src_batch = accessor._batch
-                if src_batch is not None:
-                    actual_blob_src = engine_ffi._batch_blob_ptr(src_batch._handle)
-                    actual_blob_len = intmask(engine_ffi._batch_blob_len(src_batch._handle))
-                else:
-                    actual_blob_src = NULL_PTR
-                    actual_blob_len = 0
-            elif blob_data != lltype.nullptr(rffi.CCHARP.TO):
-                actual_blob_src = blob_data
-                actual_blob_len = blob_len
-            else:
-                actual_blob_src, actual_blob_len = accessor.get_blob_source()
+            actual_blob_src, actual_blob_len = accessor.get_blob_source()
 
             rc = engine_ffi._batch_append_row(
                 self._handle,
@@ -642,8 +665,6 @@ class ArenaZSetBatch(object):
             lltype.free(col_ptrs, flavor="raw")
             lltype.free(col_sizes, flavor="raw")
             lltype.free(val_bufs, flavor="raw")
-            if blob_data != lltype.nullptr(rffi.CCHARP.TO):
-                lltype.free(blob_data, flavor="raw")
         self._invalidate_cache()
 
     def clone(self):

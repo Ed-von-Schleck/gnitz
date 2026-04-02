@@ -139,10 +139,6 @@ mod tests {
         b
     }
 
-    fn get_payload_i64(b: &OwnedBatch, row: usize) -> i64 {
-        crate::util::read_i64_le(&b.col_data[0], row * 8)
-    }
-
     #[test]
     fn test_op_distinct_boundary() {
         use std::sync::Arc;

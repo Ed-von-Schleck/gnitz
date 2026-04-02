@@ -154,6 +154,7 @@ impl ShardCursor {
     }
 }
 
+#[cfg(test)]
 fn is_null(shard: &MappedShard, row: usize, col_idx: usize, pk_index: usize) -> bool {
     let null_word = shard.get_null_word(row);
     let payload_idx = if col_idx < pk_index { col_idx } else { col_idx - 1 };

@@ -3,15 +3,12 @@
 import os
 from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_uint64, intmask
-from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_int64
 from gnitz.storage import mmap_posix
 from gnitz.storage import buffer as buffer_ops
 from gnitz.storage import engine_ffi
 from gnitz.server import ipc_ffi
-from gnitz.core import errors, batch, types, strings as string_logic
-from gnitz.core.batch import RowBuilder
+from gnitz.core import errors, batch, types
 from gnitz.catalog import system_tables
 
 # Atomics from Rust (ipc.rs via engine_ffi)
@@ -62,21 +59,6 @@ FLAG_BATCH_CONSOLIDATED = r_uint64(1 << 51)  # batch is consolidated (unique PKs
 # --- Control block TID ---
 IPC_CONTROL_TID = 0xFFFFFFFF   # max uint32; never a real table ID; get_table_id() returns 4294967295
 
-# --- Meta-Schema Constants ---
-# The Schema ZSet has this fixed 4-column layout.
-META_FLAG_NULLABLE = 1
-META_FLAG_IS_PK = 2
-
-META_SCHEMA = types.TableSchema(
-    [
-        types.ColumnDefinition(types.TYPE_U64, name="col_idx"),
-        types.ColumnDefinition(types.TYPE_U64, name="type_code"),
-        types.ColumnDefinition(types.TYPE_U64, name="flags"),
-        types.ColumnDefinition(types.TYPE_STRING, name="name"),
-    ],
-    pk_index=0,
-)
-
 # --- Control Schema ---
 CONTROL_SCHEMA = types.TableSchema(
     [
@@ -101,73 +83,6 @@ CTRL_COL_SEEK_PK_LO  = 5
 CTRL_COL_SEEK_PK_HI  = 6
 CTRL_COL_SEEK_COL    = 7
 CTRL_COL_ERROR_MSG   = 8
-
-
-# ---------------------------------------------------------------------------
-# Schema <-> Batch conversion
-# ---------------------------------------------------------------------------
-
-
-def schema_to_batch(schema):
-    """Converts a TableSchema into a META_SCHEMA batch (one row per column)."""
-    num_cols = len(schema.columns)
-    result = batch.ArenaZSetBatch(META_SCHEMA, initial_capacity=num_cols)
-    rb = RowBuilder(META_SCHEMA, result)
-    for ci in range(num_cols):
-        col = schema.columns[ci]
-        flags = 0
-        if col.is_nullable:
-            flags |= META_FLAG_NULLABLE
-        if ci == schema.pk_index:
-            flags |= META_FLAG_IS_PK
-        rb.begin(r_uint64(ci), r_uint64(0), r_int64(1))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(col.field_type.code)))
-        rb.put_int(rffi.cast(rffi.LONGLONG, r_uint64(flags)))
-        rb.put_string(col.name)
-        rb.commit()
-    return result
-
-
-def batch_to_schema(schema_batch):
-    """Reconstructs a TableSchema from a META_SCHEMA batch."""
-    count = schema_batch.length()
-    if count == 0:
-        raise errors.StorageError("Empty schema batch")
-
-    acc = batch.ColumnarBatchAccessor(META_SCHEMA)
-    pk_index = -1
-    columns = newlist_hint(count)
-
-    for i in range(count):
-        acc.bind(schema_batch, i)
-        col_idx = intmask(r_uint64(acc.get_int(0)))
-        type_code = intmask(r_uint64(acc.get_int(1)))
-        flags = intmask(r_uint64(acc.get_int(2)))
-
-        length, prefix, struct_ptr, heap_ptr, py_string = acc.get_str_struct(3)
-        name = string_logic.resolve_string(struct_ptr, heap_ptr, py_string)
-
-        if col_idx != i:
-            raise errors.StorageError(
-                "Schema batch col_idx out of order: expected %d, got %d"
-                % (i, col_idx)
-            )
-
-        field_type = system_tables.type_code_to_field_type(type_code)
-        is_nullable = bool(flags & META_FLAG_NULLABLE)
-        is_pk = bool(flags & META_FLAG_IS_PK)
-
-        columns.append(types.ColumnDefinition(field_type, is_nullable=is_nullable, name=name))
-
-        if is_pk:
-            if pk_index >= 0:
-                raise errors.StorageError("Multiple PK columns in schema batch")
-            pk_index = i
-
-    if pk_index < 0:
-        raise errors.StorageError("No PK column found in schema batch")
-
-    return types.TableSchema(columns, pk_index=pk_index)
 
 
 # ---------------------------------------------------------------------------

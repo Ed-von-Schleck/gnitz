@@ -344,6 +344,86 @@ impl OwnedBatch {
         self.consolidated = false;
     }
 
+    /// Append a row from RowBuilder-style value arrays.
+    ///
+    /// `lo_values[i]`: i64 for INT types (float-as-bits for F64/F32, lo half for U128)
+    /// `hi_values[i]`: u64 hi half for U128, 0 for all other types
+    /// `str_ptrs[i]`: raw string bytes for STRING, null for non-STRING
+    /// `str_lens[i]`: string byte length for STRING, 0 for non-STRING
+    ///
+    /// Schema MUST be set on the batch (panics if None).
+    ///
+    /// # Safety
+    /// For STRING columns, `str_ptrs[i]` must be valid for `str_lens[i]` bytes
+    /// (or null with len 0).
+    pub unsafe fn append_row_simple(
+        &mut self,
+        pk_lo: u64, pk_hi: u64, weight: i64, null_word: u64,
+        lo_values: &[i64],
+        hi_values: &[u64],
+        str_ptrs: &[*const u8],
+        str_lens: &[u32],
+    ) {
+        self.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
+        self.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
+        self.weight.extend_from_slice(&weight.to_le_bytes());
+        self.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+
+        let schema = self.schema.expect("append_row_simple requires schema");
+        let pk_index = schema.pk_index as usize;
+
+        let mut pi = 0usize;
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index { continue; }
+            let col = &schema.columns[ci];
+            let col_size = col.size as usize;
+            let is_null = (null_word >> pi) & 1 != 0;
+
+            if is_null {
+                let cur_len = self.col_data[pi].len();
+                self.col_data[pi].resize(cur_len + col_size, 0);
+            } else {
+                match col.type_code {
+                    crate::compact::type_code::STRING => {
+                        let ptr = str_ptrs[pi];
+                        let slen = str_lens[pi] as usize;
+                        let bytes: &[u8] = if ptr.is_null() || slen == 0 {
+                            &[]
+                        } else {
+                            std::slice::from_raw_parts(ptr, slen)
+                        };
+                        let gs = crate::ipc::encode_german_string(bytes, &mut self.blob);
+                        self.col_data[pi].extend_from_slice(&gs);
+                    }
+                    crate::compact::type_code::F64 => {
+                        // lo_values[pi] already contains f64 bit pattern
+                        self.col_data[pi].extend_from_slice(&lo_values[pi].to_le_bytes());
+                    }
+                    crate::compact::type_code::F32 => {
+                        // RPython stores f32 via float2longlong(f64_val) which gives f64 bits
+                        let f64_val = f64::from_bits(lo_values[pi] as u64);
+                        let f32_val = f64_val as f32;
+                        self.col_data[pi].extend_from_slice(&f32_val.to_le_bytes());
+                    }
+                    crate::compact::type_code::U128 => {
+                        self.col_data[pi].extend_from_slice(&(lo_values[pi] as u64).to_le_bytes());
+                        self.col_data[pi].extend_from_slice(&hi_values[pi].to_le_bytes());
+                    }
+                    _ => {
+                        // All integer types: write lo_values[pi] truncated to col_size bytes
+                        let bytes = lo_values[pi].to_le_bytes();
+                        self.col_data[pi].extend_from_slice(&bytes[..col_size]);
+                    }
+                }
+            }
+            pi += 1;
+        }
+
+        self.count += 1;
+        self.sorted = false;
+        self.consolidated = false;
+    }
+
     /// Bulk-copy rows [start, end) from another OwnedBatch (same schema).
     pub fn append_batch(&mut self, src: &OwnedBatch, start: usize, end: usize) {
         let end = if end > src.count { src.count } else { end };
@@ -1274,6 +1354,185 @@ mod tests {
         let agg_bytes = consolidated.get_col_ptr(0, 1, 8);
         let agg_val = i64::from_le_bytes(agg_bytes.try_into().unwrap());
         assert_eq!(agg_val, 15000, "expected agg_val=15000, got {}", agg_val);
+    }
+
+    // ── append_row_simple tests ──────────────────────────────────────────
+
+    use crate::compact::type_code;
+
+    fn make_schema_cols(cols: &[(u8, u8, u8)], pk_index: u32) -> SchemaDescriptor {
+        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+        for (i, &(tc, sz, nullable)) in cols.iter().enumerate() {
+            columns[i] = SchemaColumn { type_code: tc, size: sz, nullable, _pad: 0 };
+        }
+        SchemaDescriptor { num_columns: cols.len() as u32, pk_index, columns }
+    }
+
+    fn decode_str(batch: &OwnedBatch, row: usize, payload_col: usize) -> Vec<u8> {
+        let raw = batch.get_col_ptr(row, payload_col, 16);
+        let st: [u8; 16] = raw.try_into().unwrap();
+        crate::ipc::decode_german_string(&st, &batch.blob)
+    }
+
+    #[test]
+    fn test_append_row_simple_nullable_string() {
+        // Schema: U64(pk=0), STRING(nullable)
+        let schema = make_schema_cols(&[
+            (type_code::U64, 8, 0),
+            (type_code::STRING, 16, 1),
+        ], 0);
+        let mut batch = OwnedBatch::with_schema(schema, 4);
+
+        // Row 0: non-null string "not null"
+        let s = b"not null";
+        let lo = [0i64]; // not used for STRING
+        let hi = [0u64];
+        let ptrs = [s.as_ptr()];
+        let lens = [s.len() as u32];
+        unsafe {
+            batch.append_row_simple(1, 0, 1, 0, &lo, &hi, &ptrs, &lens);
+        }
+
+        // Row 1: null string (null_word bit 0 set)
+        let null_ptr: *const u8 = std::ptr::null();
+        let ptrs2 = [null_ptr];
+        let lens2 = [0u32];
+        unsafe {
+            batch.append_row_simple(2, 0, 1, 1, &[0i64], &[0u64], &ptrs2, &lens2);
+        }
+
+        assert_eq!(batch.count, 2);
+        // Row 0: string decodes correctly
+        assert_eq!(decode_str(&batch, 0, 0), b"not null");
+        // Row 0: not null
+        assert_eq!(batch.get_null_word(0) & 1, 0);
+        // Row 1: null bit set
+        assert_eq!(batch.get_null_word(1) & 1, 1);
+        // Row 1: col data is zeroed
+        let raw = batch.get_col_ptr(1, 0, 16);
+        assert!(raw.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_append_row_simple_multi_string() {
+        // Schema: U64(pk=0), STRING(name), STRING(desc)
+        let schema = make_schema_cols(&[
+            (type_code::U64, 8, 0),
+            (type_code::STRING, 16, 0),
+            (type_code::STRING, 16, 0),
+        ], 0);
+        let mut batch = OwnedBatch::with_schema(schema, 4);
+
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"Alice", b"short"),
+            (b"Bob has a long name!", b"Also quite a long description"),
+            (b"", b"nonempty"),
+            (b"mix", b"another long one for blob storage"),
+        ];
+
+        for (pk, (name, desc)) in cases.iter().enumerate() {
+            let lo = [0i64, 0i64];
+            let hi = [0u64, 0u64];
+            let ptrs = [name.as_ptr(), desc.as_ptr()];
+            let lens = [name.len() as u32, desc.len() as u32];
+            unsafe {
+                batch.append_row_simple(pk as u64, 0, 1, 0, &lo, &hi, &ptrs, &lens);
+            }
+        }
+
+        assert_eq!(batch.count, 4);
+        for (i, (name, desc)) in cases.iter().enumerate() {
+            assert_eq!(decode_str(&batch, i, 0), *name, "row {i} name mismatch");
+            assert_eq!(decode_str(&batch, i, 1), *desc, "row {i} desc mismatch");
+        }
+    }
+
+    #[test]
+    fn test_append_row_simple_all_types() {
+        // Schema: U64(pk=0), then one of each remaining type
+        // Payload cols (pi): U8(0), I8(1), U16(2), I16(3), U32(4), I32(5),
+        //                     F32(6), U64(7), I64(8), F64(9), STRING(10), U128(11)
+        let schema = make_schema_cols(&[
+            (type_code::U64, 8, 0),   // pk
+            (type_code::U8, 1, 0),    // pi 0
+            (type_code::I8, 1, 0),    // pi 1
+            (type_code::U16, 2, 0),   // pi 2
+            (type_code::I16, 2, 0),   // pi 3
+            (type_code::U32, 4, 0),   // pi 4
+            (type_code::I32, 4, 0),   // pi 5
+            (type_code::F32, 4, 0),   // pi 6
+            (type_code::U64, 8, 0),   // pi 7
+            (type_code::I64, 8, 0),   // pi 8
+            (type_code::F64, 8, 0),   // pi 9
+            (type_code::STRING, 16, 0), // pi 10
+            (type_code::U128, 16, 0), // pi 11
+        ], 0);
+        let mut batch = OwnedBatch::with_schema(schema, 1);
+
+        let n = 12;
+        let mut lo = vec![0i64; n];
+        let mut hi = vec![0u64; n];
+        let mut ptrs = vec![std::ptr::null::<u8>(); n];
+        let mut lens = vec![0u32; n];
+
+        lo[0] = 42;        // U8: 42
+        lo[1] = -7;        // I8: -7
+        lo[2] = 1000;      // U16: 1000
+        lo[3] = -500;      // I16: -500
+        lo[4] = 70000;     // U32: 70000
+        lo[5] = -12345;    // I32: -12345
+        // F32: 3.14 → store as f64 bit pattern (RPython convention)
+        lo[6] = f64::to_bits(3.14f64) as i64;
+        lo[7] = 0x1234_5678_9ABC_DEF0u64 as i64;  // U64
+        lo[8] = -99999;    // I64
+        // F64: 2.718281828 → store as bit pattern
+        lo[9] = f64::to_bits(2.718281828f64) as i64;
+        // STRING: "hello world!"
+        let s = b"hello world!";
+        ptrs[10] = s.as_ptr();
+        lens[10] = s.len() as u32;
+        // U128: lo=0xDEADBEEF, hi=0xCAFEBABE
+        lo[11] = 0xDEADBEEFu64 as i64;
+        hi[11] = 0xCAFEBABE;
+
+        unsafe {
+            batch.append_row_simple(100, 0, 1, 0, &lo, &hi, &ptrs, &lens);
+        }
+
+        assert_eq!(batch.count, 1);
+
+        // U8
+        assert_eq!(batch.get_col_ptr(0, 0, 1), &[42]);
+        // I8
+        assert_eq!(batch.get_col_ptr(0, 1, 1), &[(-7i8) as u8]);
+        // U16
+        assert_eq!(batch.get_col_ptr(0, 2, 2), &1000u16.to_le_bytes());
+        // I16
+        assert_eq!(batch.get_col_ptr(0, 3, 2), &(-500i16).to_le_bytes());
+        // U32
+        assert_eq!(batch.get_col_ptr(0, 4, 4), &70000u32.to_le_bytes());
+        // I32
+        assert_eq!(batch.get_col_ptr(0, 5, 4), &(-12345i32).to_le_bytes());
+        // F32: 3.14f64 as f32
+        let f32_bytes = batch.get_col_ptr(0, 6, 4);
+        let f32_val = f32::from_le_bytes(f32_bytes.try_into().unwrap());
+        assert!((f32_val - 3.14f32).abs() < 1e-5, "f32: {f32_val}");
+        // U64
+        assert_eq!(batch.get_col_ptr(0, 7, 8), &0x1234_5678_9ABC_DEF0u64.to_le_bytes());
+        // I64
+        assert_eq!(batch.get_col_ptr(0, 8, 8), &(-99999i64).to_le_bytes());
+        // F64
+        let f64_bytes = batch.get_col_ptr(0, 9, 8);
+        let f64_val = f64::from_le_bytes(f64_bytes.try_into().unwrap());
+        assert!((f64_val - 2.718281828).abs() < 1e-9, "f64: {f64_val}");
+        // STRING
+        assert_eq!(decode_str(&batch, 0, 10), b"hello world!");
+        // U128
+        let u128_bytes = batch.get_col_ptr(0, 11, 16);
+        let u128_lo = u64::from_le_bytes(u128_bytes[0..8].try_into().unwrap());
+        let u128_hi = u64::from_le_bytes(u128_bytes[8..16].try_into().unwrap());
+        assert_eq!(u128_lo, 0xDEADBEEF);
+        assert_eq!(u128_hi, 0xCAFEBABE);
     }
 
 }

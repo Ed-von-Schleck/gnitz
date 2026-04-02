@@ -321,12 +321,25 @@ eci = ExternalCompilationInfo(
         "  void *handle, uint64_t pk_lo, uint64_t pk_hi, int64_t weight, uint64_t null_word,"
         "  void **col_ptrs, uint32_t *col_sizes, uint32_t num_cols,"
         "  const uint8_t *blob_src, uint32_t blob_len);",
+        "int32_t gnitz_batch_append_row_simple("
+        "  void *handle, uint64_t pk_lo, uint64_t pk_hi, int64_t weight, uint64_t null_word,"
+        "  const int64_t *lo_values, const uint64_t *hi_values,"
+        "  char **str_ptrs, const uint32_t *str_lens,"
+        "  uint32_t n_payload);",
         "int32_t gnitz_batch_append_batch(void *handle, const void *src, uint32_t start, uint32_t end);",
         "int32_t gnitz_batch_append_batch_negated(void *handle, const void *src, uint32_t start, uint32_t end);",
         "void *gnitz_batch_to_sorted(const void *handle, const void *schema_desc);",
         "void *gnitz_batch_to_consolidated(const void *handle, const void *schema_desc);",
         "void *gnitz_batch_scatter_copy(const void *src, const uint32_t *indices, uint32_t num_indices, const void *schema_desc);",
         "int32_t gnitz_batch_append_row_from_batch(void *handle, const void *src, uint32_t row, int64_t weight);",
+        "int32_t gnitz_batch_append_row_from_cursor("
+        "  void *handle, const void *cursor_handle, int64_t weight);",
+        "int32_t gnitz_batch_append_row_from_table_found("
+        "  void *handle, const void *table_handle,"
+        "  uint64_t pk_lo, uint64_t pk_hi, int64_t weight);",
+        "int32_t gnitz_batch_append_row_from_ptable_found("
+        "  void *handle, const void *ptable_handle,"
+        "  uint64_t pk_lo, uint64_t pk_hi, int64_t weight);",
         "void *gnitz_batch_scatter_copy_weighted(const void *src, const uint32_t *indices, const int64_t *weights, uint32_t num_indices, const void *schema_desc);",
         "const uint8_t *gnitz_batch_region_ptr(const void *handle, uint32_t idx);",
         "uint32_t gnitz_batch_region_size(const void *handle, uint32_t idx);",
@@ -1635,6 +1648,12 @@ _batch_append_row = rffi.llexternal(
      rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.CCHARP, rffi.UINT],
     rffi.INT, compilation_info=eci,
 )
+_batch_append_row_simple = rffi.llexternal(
+    "gnitz_batch_append_row_simple",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG, rffi.LONGLONG, rffi.ULONGLONG,
+     rffi.LONGLONGP, rffi.ULONGLONGP, rffi.CCHARPP, rffi.UINTP, rffi.UINT],
+    rffi.INT, compilation_info=eci,
+)
 _batch_append_batch = rffi.llexternal(
     "gnitz_batch_append_batch", [rffi.VOIDP, rffi.VOIDP, rffi.UINT, rffi.UINT],
     rffi.INT, compilation_info=eci,
@@ -1656,6 +1675,21 @@ _batch_scatter_copy = rffi.llexternal(
 _batch_append_row_from_batch = rffi.llexternal(
     "gnitz_batch_append_row_from_batch",
     [rffi.VOIDP, rffi.VOIDP, rffi.UINT, rffi.LONGLONG],
+    rffi.INT, compilation_info=eci,
+)
+_batch_append_row_from_cursor = rffi.llexternal(
+    "gnitz_batch_append_row_from_cursor",
+    [rffi.VOIDP, rffi.VOIDP, rffi.LONGLONG],
+    rffi.INT, compilation_info=eci,
+)
+_batch_append_row_from_table_found = rffi.llexternal(
+    "gnitz_batch_append_row_from_table_found",
+    [rffi.VOIDP, rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG, rffi.LONGLONG],
+    rffi.INT, compilation_info=eci,
+)
+_batch_append_row_from_ptable_found = rffi.llexternal(
+    "gnitz_batch_append_row_from_ptable_found",
+    [rffi.VOIDP, rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG, rffi.LONGLONG],
     rffi.INT, compilation_info=eci,
 )
 _batch_scatter_copy_weighted = rffi.llexternal(

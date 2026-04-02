@@ -68,7 +68,7 @@ const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
 };
 
 /// Encode a German string into a 16-byte struct + optional blob append.
-fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
+pub(crate) fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     let len = s.len();
     let mut st = [0u8; 16];
     st[0..4].copy_from_slice(&(len as u32).to_le_bytes());
@@ -90,7 +90,7 @@ fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
 }
 
 /// Decode a German string from a 16-byte struct + blob.
-fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
+pub(crate) fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
     let len = u32::from_le_bytes(st[0..4].try_into().unwrap()) as usize;
     if len == 0 {
         return Vec::new();

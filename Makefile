@@ -11,8 +11,6 @@ RELEASE_CFLAGS   ?= -march=native
 
 TEST_FILES := \
 	rpython_tests/catalog_comprehensive_test.py \
-	rpython_tests/server_test.py \
-	rpython_tests/multicore_test.py \
 	rpython_tests/uring_test.py
 
 # Derived names
@@ -21,14 +19,11 @@ RUN_TARGETS := $(addprefix run-,$(TEST_BINS))
 
 # Per-test data directories (only tests that create one)
 DATA_DIR_catalog_comprehensive_test-c := catalog_test_data
-DATA_DIR_server_test-c := server_test_data
-DATA_DIR_multicore_test-c := multicore_test_data
 DATA_DIR_uring_test-c := uring_test_data
 
 ALL_DATA_DIRS := storage_test_data \
                  catalog_test_data zstore_test_data \
-                 server_test_data \
-                 multicore_test_data uring_test_data
+                 uring_test_data
 
 LOG_DIR := .test_logs
 

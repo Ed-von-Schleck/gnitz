@@ -16,7 +16,7 @@ When adding a new server-side constraint, validation rule, or invariant:
       run `make e2e`.
 - [ ] Is there a multi-worker E2E test in `rust_client/gnitz-py/tests/test_workers.py`
       covering it?
-- [ ] Is there a unit test in `multicore_test.py` covering the IPC path?
+- [ ] Is there a Rust unit test in `ipc.rs` / `exchange.rs` covering the IPC path?
 - [ ] Does the feature use `hash_row_by_columns` for exchange routing across
       tables where the same logical value may have different column types
       (e.g., PK column = U64 vs regular column = I64)? The hash must produce

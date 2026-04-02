@@ -2650,6 +2650,31 @@ pub extern "C" fn gnitz_batch_append_row(
 }
 
 #[no_mangle]
+pub extern "C" fn gnitz_batch_append_row_simple(
+    handle: *mut libc::c_void,
+    pk_lo: u64, pk_hi: u64, weight: i64, null_word: u64,
+    lo_values: *const i64,
+    hi_values: *const u64,
+    str_ptrs: *const *const i8,
+    str_lens: *const u32,
+    n_payload: u32,
+) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let n = n_payload as usize;
+        let lo = unsafe { slice::from_raw_parts(lo_values, n) };
+        let hi = unsafe { slice::from_raw_parts(hi_values, n) };
+        // Cast *const *const i8 → *const *const u8 (same ABI, different signedness)
+        let sp = unsafe { slice::from_raw_parts(str_ptrs as *const *const u8, n) };
+        let sl = unsafe { slice::from_raw_parts(str_lens, n) };
+        unsafe { b.append_row_simple(pk_lo, pk_hi, weight, null_word, lo, hi, sp, sl); }
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
 pub extern "C" fn gnitz_batch_append_batch(
     handle: *mut libc::c_void, src: *const libc::c_void,
     start: u32, end: u32,
@@ -2816,6 +2841,168 @@ pub extern "C" fn gnitz_batch_append_row_from_batch(
                 );
             } else {
                 dst.col_data[pi].extend_from_slice(&col[off..off + cs]);
+            }
+            pi += 1;
+        }
+        dst.count += 1;
+        dst.sorted = false;
+        dst.consolidated = false;
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+/// Copy the current row of a ReadCursor into an OwnedBatch with a given weight.
+/// Returns 0 on success, -1 if the cursor is exhausted or handles are null.
+#[no_mangle]
+pub extern "C" fn gnitz_batch_append_row_from_cursor(
+    handle: *mut libc::c_void,
+    cursor_handle: *const libc::c_void,
+    weight: i64,
+) -> i32 {
+    if handle.is_null() || cursor_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let dst = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let ch = unsafe { &*(cursor_handle as *const crate::read_cursor::CursorHandle) };
+        if !ch.cursor.valid { return -1; }
+        let pk_lo = ch.cursor.current_key_lo;
+        let pk_hi = ch.cursor.current_key_hi;
+        let null_word = ch.cursor.current_null_word;
+        dst.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
+        dst.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
+        dst.weight.extend_from_slice(&weight.to_le_bytes());
+        dst.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+        let schema = dst.schema.unwrap();
+        let pk_index = schema.pk_index as usize;
+        let mut pi = 0usize;
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index { continue; }
+            let col_desc = &schema.columns[ci];
+            let cs = col_desc.size as usize;
+            let is_null = (null_word >> pi) & 1 != 0;
+            if is_null {
+                let new_len = dst.col_data[pi].len() + cs;
+                dst.col_data[pi].resize(new_len, 0);
+            } else if col_desc.type_code == crate::compact::type_code::STRING {
+                // col_ptr uses logical index ci
+                let src = ch.cursor.col_ptr(ci, cs);
+                if src.is_null() { return -1; }
+                let src_slice = unsafe { slice::from_raw_parts(src, cs) };
+                crate::ops::write_string_from_raw(
+                    &mut dst.col_data[pi], &mut dst.blob,
+                    src_slice, ch.cursor.blob_ptr(),
+                );
+            } else {
+                let src = ch.cursor.col_ptr(ci, cs);
+                if src.is_null() { return -1; }
+                let src_slice = unsafe { slice::from_raw_parts(src, cs) };
+                dst.col_data[pi].extend_from_slice(src_slice);
+            }
+            pi += 1;
+        }
+        dst.count += 1;
+        dst.sorted = false;
+        dst.consolidated = false;
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+/// Copy the found row of a Table into an OwnedBatch.
+/// The caller provides the PK since it was the argument to retract_pk.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn gnitz_batch_append_row_from_table_found(
+    handle: *mut libc::c_void,
+    table_handle: *const libc::c_void,
+    pk_lo: u64, pk_hi: u64, weight: i64,
+) -> i32 {
+    if handle.is_null() || table_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let dst = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let table = unsafe { &*(table_handle as *const crate::table::Table) };
+        let null_word = table.found_null_word();
+        dst.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
+        dst.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
+        dst.weight.extend_from_slice(&weight.to_le_bytes());
+        dst.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+        let schema = dst.schema.unwrap();
+        let pk_index = schema.pk_index as usize;
+        let mut pi = 0usize;
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index { continue; }
+            let col_desc = &schema.columns[ci];
+            let cs = col_desc.size as usize;
+            let is_null = (null_word >> pi) & 1 != 0;
+            if is_null {
+                let new_len = dst.col_data[pi].len() + cs;
+                dst.col_data[pi].resize(new_len, 0);
+            } else if col_desc.type_code == crate::compact::type_code::STRING {
+                // found_col_ptr takes payload index pi
+                let src = table.found_col_ptr(pi, cs);
+                if src.is_null() { return -1; }
+                let src_slice = unsafe { slice::from_raw_parts(src, cs) };
+                crate::ops::write_string_from_raw(
+                    &mut dst.col_data[pi], &mut dst.blob,
+                    src_slice, table.found_blob_ptr(),
+                );
+            } else {
+                let src = table.found_col_ptr(pi, cs);
+                if src.is_null() { return -1; }
+                let src_slice = unsafe { slice::from_raw_parts(src, cs) };
+                dst.col_data[pi].extend_from_slice(src_slice);
+            }
+            pi += 1;
+        }
+        dst.count += 1;
+        dst.sorted = false;
+        dst.consolidated = false;
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+/// Copy the found row of a PartitionedTable into an OwnedBatch.
+/// Same as table_found but for PartitionedTable handles.
+#[no_mangle]
+pub extern "C" fn gnitz_batch_append_row_from_ptable_found(
+    handle: *mut libc::c_void,
+    ptable_handle: *const libc::c_void,
+    pk_lo: u64, pk_hi: u64, weight: i64,
+) -> i32 {
+    if handle.is_null() || ptable_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let dst = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
+        let pt = unsafe { &*(ptable_handle as *const crate::partitioned_table::PartitionedTable) };
+        let null_word = pt.found_null_word();
+        dst.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
+        dst.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
+        dst.weight.extend_from_slice(&weight.to_le_bytes());
+        dst.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+        let schema = dst.schema.unwrap();
+        let pk_index = schema.pk_index as usize;
+        let mut pi = 0usize;
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index { continue; }
+            let col_desc = &schema.columns[ci];
+            let cs = col_desc.size as usize;
+            let is_null = (null_word >> pi) & 1 != 0;
+            if is_null {
+                let new_len = dst.col_data[pi].len() + cs;
+                dst.col_data[pi].resize(new_len, 0);
+            } else if col_desc.type_code == crate::compact::type_code::STRING {
+                let src = pt.found_col_ptr(pi, cs);
+                if src.is_null() { return -1; }
+                let src_slice = unsafe { slice::from_raw_parts(src, cs) };
+                crate::ops::write_string_from_raw(
+                    &mut dst.col_data[pi], &mut dst.blob,
+                    src_slice, pt.found_blob_ptr(),
+                );
+            } else {
+                let src = pt.found_col_ptr(pi, cs);
+                if src.is_null() { return -1; }
+                let src_slice = unsafe { slice::from_raw_parts(src, cs) };
+                dst.col_data[pi].extend_from_slice(src_slice);
             }
             pi += 1;
         }
@@ -4422,4 +4609,193 @@ mod tests {
         assert_eq!(gnitz_compact_shards(ptr::null(), 0, ptr::null(), ptr::null(), 0), -1);
     }
 
+    // -----------------------------------------------------------------------
+    // append_row_from_cursor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_append_row_from_cursor() {
+        use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+        use crate::memtable::OwnedBatch;
+
+        // Schema: U64(pk=0), I64, STRING
+        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+        columns[2] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
+        let schema = SchemaDescriptor { num_columns: 3, pk_index: 0, columns };
+
+        // Build source batch with 2 rows
+        // Payload cols: pi=0 → I64, pi=1 → STRING
+        let mut src = OwnedBatch::with_schema(schema, 4);
+        let s0 = b"short";
+        unsafe {
+            src.append_row_simple(5, 0, 1, 0,
+                &[100i64, 0], &[0u64, 0],
+                &[ptr::null(), s0.as_ptr()], &[0, 5]);
+        }
+        let s1 = b"a long string for blob";
+        unsafe {
+            src.append_row_simple(10, 0, 1, 0,
+                &[200i64, 0], &[0u64, 0],
+                &[ptr::null(), s1.as_ptr()], &[0, s1.len() as u32]);
+        }
+
+        // Rows are already in PK order; create cursor directly
+        src.sorted = true;
+        let mb = src.as_mem_batch();
+        let cursor = unsafe {
+            crate::read_cursor::create_read_cursor(&[mb], &[], schema)
+        };
+        let mut ch = crate::read_cursor::CursorHandle::from_cursor(cursor);
+
+        let mut dst = OwnedBatch::with_schema(schema, 4);
+        let dst_ptr = &mut dst as *mut OwnedBatch as *mut libc::c_void;
+        let ch_ptr = &mut ch as *mut crate::read_cursor::CursorHandle as *mut libc::c_void;
+
+        // Copy row 0 (pk=5)
+        assert_eq!(gnitz_batch_append_row_from_cursor(dst_ptr, ch_ptr, 42), 0);
+        ch.cursor.advance();
+        assert!(ch.cursor.valid);
+        // Copy row 1 (pk=10)
+        assert_eq!(gnitz_batch_append_row_from_cursor(dst_ptr, ch_ptr, 99), 0);
+
+        assert_eq!(dst.count, 2);
+        assert_eq!(dst.get_pk_lo(0), 5);
+        assert_eq!(dst.get_pk_lo(1), 10);
+        assert_eq!(i64::from_le_bytes(dst.weight[0..8].try_into().unwrap()), 42);
+        assert_eq!(i64::from_le_bytes(dst.weight[8..16].try_into().unwrap()), 99);
+
+        // Verify I64 payload
+        let val0 = i64::from_le_bytes(dst.col_data[0][0..8].try_into().unwrap());
+        let val1 = i64::from_le_bytes(dst.col_data[0][8..16].try_into().unwrap());
+        assert_eq!(val0, 100);
+        assert_eq!(val1, 200);
+
+        // Verify STRING payload
+        let str0 = crate::ipc::decode_german_string(
+            &dst.col_data[1][0..16].try_into().unwrap(), &dst.blob,
+        );
+        assert_eq!(str0, b"short");
+        let str1 = crate::ipc::decode_german_string(
+            &dst.col_data[1][16..32].try_into().unwrap(), &dst.blob,
+        );
+        assert_eq!(str1, b"a long string for blob");
+    }
+
+    #[test]
+    fn test_append_row_from_cursor_null_columns() {
+        use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+        use crate::memtable::OwnedBatch;
+
+        // Schema: U64(pk=0), I64(nullable)
+        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
+        let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
+
+        let mut src = OwnedBatch::with_schema(schema, 4);
+        // Row 0: pk=1, null_word=1 (payload col 0 is null)
+        unsafe {
+            src.append_row_simple(1, 0, 1, 1, &[0i64], &[0u64], &[ptr::null()], &[0]);
+        }
+        // Row 1: pk=2, val=42
+        unsafe {
+            src.append_row_simple(2, 0, 1, 0, &[42i64], &[0u64], &[ptr::null()], &[0]);
+        }
+
+        src.sorted = true;
+        let mb = src.as_mem_batch();
+        let cursor = unsafe {
+            crate::read_cursor::create_read_cursor(&[mb], &[], schema)
+        };
+        let mut ch = crate::read_cursor::CursorHandle::from_cursor(cursor);
+
+        let mut dst = OwnedBatch::with_schema(schema, 4);
+        let dst_ptr = &mut dst as *mut OwnedBatch as *mut libc::c_void;
+        let ch_ptr = &mut ch as *mut crate::read_cursor::CursorHandle as *mut libc::c_void;
+
+        assert_eq!(gnitz_batch_append_row_from_cursor(dst_ptr, ch_ptr, 1), 0);
+        ch.cursor.advance();
+        assert_eq!(gnitz_batch_append_row_from_cursor(dst_ptr, ch_ptr, 1), 0);
+
+        assert_eq!(dst.count, 2);
+        // Row 0: null bit set, zeroed data
+        assert_eq!(dst.get_null_word(0) & 1, 1);
+        assert!(dst.col_data[0][0..8].iter().all(|&b| b == 0));
+        // Row 1: not null, value=42
+        assert_eq!(dst.get_null_word(1) & 1, 0);
+        assert_eq!(i64::from_le_bytes(dst.col_data[0][8..16].try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn test_append_row_from_table_found() {
+        use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+        use crate::memtable::OwnedBatch;
+
+        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+        let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
+
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("ffi_table_found_test");
+
+        let mut table = crate::table::Table::new(
+            tdir.to_str().unwrap(), "test", schema, 600, 1 << 20, false,
+        ).unwrap();
+
+        // Ingest rows
+        let n = 2usize;
+        let pk_lo: Vec<u8> = [10u64, 20u64].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let pk_hi = vec![0u8; n * 8];
+        let weight: Vec<u8> = [1i64, 1i64].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let null_bmp = vec![0u8; n * 8];
+        let col0: Vec<u8> = [100i64, 200i64].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let blob = Vec::new();
+        let ptrs: Vec<*const u8> = vec![
+            pk_lo.as_ptr(), pk_hi.as_ptr(), weight.as_ptr(),
+            null_bmp.as_ptr(), col0.as_ptr(), blob.as_ptr(),
+        ];
+        let sizes: Vec<u32> = vec![
+            (n * 8) as u32, (n * 8) as u32, (n * 8) as u32,
+            (n * 8) as u32, (n * 8) as u32, 0,
+        ];
+        table.ingest_batch_from_regions(&ptrs, &sizes, n as u32, 1).unwrap();
+
+        // retract_pk populates found state
+        let (w, found) = table.retract_pk(10, 0);
+        assert!(found);
+        assert_eq!(w, 1);
+
+        let mut dst = OwnedBatch::with_schema(schema, 4);
+        let dst_ptr = &mut dst as *mut OwnedBatch as *mut libc::c_void;
+        let t_ptr = &table as *const crate::table::Table as *const libc::c_void;
+
+        let rc = gnitz_batch_append_row_from_table_found(
+            dst_ptr, t_ptr as *mut libc::c_void, 10, 0, -1,
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(dst.count, 1);
+        assert_eq!(dst.get_pk_lo(0), 10);
+        assert_eq!(i64::from_le_bytes(dst.weight[0..8].try_into().unwrap()), -1);
+        assert_eq!(i64::from_le_bytes(dst.col_data[0][0..8].try_into().unwrap()), 100);
+
+        table.close();
+    }
+
+    #[test]
+    fn test_append_row_from_cursor_null_handle() {
+        assert_eq!(gnitz_batch_append_row_from_cursor(ptr::null_mut(), ptr::null(), 1), -1);
+    }
+
+    #[test]
+    fn test_append_row_from_table_found_null_handle() {
+        assert_eq!(gnitz_batch_append_row_from_table_found(ptr::null_mut(), ptr::null_mut(), 0, 0, 1), -1);
+    }
+
+    #[test]
+    fn test_append_row_from_ptable_found_null_handle() {
+        assert_eq!(gnitz_batch_append_row_from_ptable_found(ptr::null_mut(), ptr::null_mut(), 0, 0, 1), -1);
+    }
 }
