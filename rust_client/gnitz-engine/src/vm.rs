@@ -1959,4 +1959,242 @@ mod tests {
 
         unsafe { drop(Box::from_raw(func_ptr as *mut ScalarFuncKind)); }
     }
+
+    /// Ports compile_graph_test.py::test_anti_semi_complement.
+    /// Anti-join + semi-join should partition the input: |anti| + |semi| == |input|.
+    #[test]
+    fn test_anti_semi_complement() {
+        let schema = schema_1i64();
+
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("complement_test");
+        let mut table = Table::new(
+            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, false,
+        ).unwrap();
+
+        // Trace has pk=1, pk=3, pk=5
+        let trace_batch = make_batch(schema, &[
+            (1, 0, 1, 100),
+            (3, 0, 1, 300),
+            (5, 0, 1, 500),
+        ]);
+        table.ingest_owned_batch(trace_batch).unwrap();
+
+        // Anti-join pipeline: reg 0 -> anti_join(reg 0, reg 1) -> reg 2
+        let cursor_aj = table.create_cursor().unwrap();
+        let ch_aj = Box::into_raw(Box::new(cursor_aj)) as *mut libc::c_void;
+
+        let mut builder_aj = ProgramBuilder::new(3);
+        builder_aj.add_anti_join_dt(0, 1, 2);
+        builder_aj.add_halt();
+
+        let reg_schemas = [schema; 3];
+        let reg_kinds = [0, 1, 0];
+        let mut vm_aj = *builder_aj.build(&reg_schemas, &reg_kinds);
+        let cursors_aj = vec![std::ptr::null_mut(), ch_aj, std::ptr::null_mut()];
+
+        // Delta has pk=1,2,3,4,5
+        let input_aj = make_batch(schema, &[
+            (1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30),
+            (4, 0, 1, 40), (5, 0, 1, 50),
+        ]);
+        let r_aj = execute_epoch(
+            &vm_aj.program, &mut vm_aj.regfile, input_aj, 0, 2, &cursors_aj,
+        ).unwrap().unwrap();
+
+        // Semi-join pipeline
+        let cursor_sj = table.create_cursor().unwrap();
+        let ch_sj = Box::into_raw(Box::new(cursor_sj)) as *mut libc::c_void;
+
+        let mut builder_sj = ProgramBuilder::new(3);
+        builder_sj.add_semi_join_dt(0, 1, 2);
+        builder_sj.add_halt();
+
+        let mut vm_sj = *builder_sj.build(&reg_schemas, &reg_kinds);
+        let cursors_sj = vec![std::ptr::null_mut(), ch_sj, std::ptr::null_mut()];
+
+        let input_sj = make_batch(schema, &[
+            (1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30),
+            (4, 0, 1, 40), (5, 0, 1, 50),
+        ]);
+        let r_sj = execute_epoch(
+            &vm_sj.program, &mut vm_sj.regfile, input_sj, 0, 2, &cursors_sj,
+        ).unwrap().unwrap();
+
+        // Anti should get pk=2,4 (no match); semi should get pk=1,3,5 (match)
+        assert_eq!(r_aj.count, 2, "anti-join should keep 2 non-matching rows");
+        assert_eq!(r_sj.count, 3, "semi-join should keep 3 matching rows");
+        assert_eq!(r_aj.count + r_sj.count, 5,
+                   "anti + semi must equal input count (complement property)");
+
+        unsafe { drop(Box::from_raw(ch_aj as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch_sj as *mut crate::read_cursor::CursorHandle)); }
+        table.close();
+    }
+
+    /// Ports compile_graph_test.py::test_filter_with_expr.
+    /// Filter with expression bytecode: col1 > 25 keeps rows with val 30, 40, 50.
+    #[test]
+    fn test_filter_with_expr() {
+        use crate::expr::{ExprProgram, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_CMP_GT};
+
+        let schema = schema_1i64();
+
+        // Build expression: col1 > 25
+        // col1 is schema column index 1 (the I64 payload column)
+        let code = vec![
+            EXPR_LOAD_COL_INT, 0, 1, 0,  // r0 = col[1]
+            EXPR_LOAD_CONST, 1, 25, 0,   // r1 = 25
+            EXPR_CMP_GT, 2, 0, 1,        // r2 = (r0 > r1)
+        ];
+        let prog = ExprProgram {
+            code,
+            num_regs: 3,
+            result_reg: 2,
+            num_instrs: 3,
+            const_strings: vec![],
+            const_prefixes: vec![],
+            const_lengths: vec![],
+        };
+
+        let func = Box::new(ScalarFuncKind::ExprPredicate(prog));
+        let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
+
+        let mut builder = ProgramBuilder::new(2);
+        builder.add_filter(0, 1, func_ptr);
+        builder.add_halt();
+
+        let input = make_batch(schema, &[
+            (1, 0, 1, 10),
+            (2, 0, 1, 20),
+            (3, 0, 1, 30),
+            (4, 0, 1, 40),
+            (5, 0, 1, 50),
+        ]);
+
+        let reg_schemas = [schema; 2];
+        let reg_kinds = [0u8; 2];
+        let vm = builder.build(&reg_schemas, &reg_kinds);
+        let cursors = vec![std::ptr::null_mut(); 2];
+        let result = execute_epoch(
+            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors,
+        ).unwrap().unwrap();
+
+        let rows = extract_rows(&result);
+        assert_eq!(rows.len(), 3, "filter col1>25 should keep 3 rows (30,40,50)");
+        assert_eq!(rows[0].0, 3); // pk=3, val=30
+        assert_eq!(rows[1].0, 4); // pk=4, val=40
+        assert_eq!(rows[2].0, 5); // pk=5, val=50
+
+        unsafe { drop(Box::from_raw(func_ptr as *mut ScalarFuncKind)); }
+    }
+
+    /// Ports compile_graph_test.py::test_reduce_multi_agg.
+    /// Multi-agg reduce: COUNT + SUM on same column in one pass.
+    #[test]
+    fn test_reduce_multi_agg() {
+        // Input: pk(U64), val(I64). All rows in same group (pk=1).
+        // COUNT + SUM of val column.
+        let in_schema = schema_1i64();
+
+        // Output: pk(U64), count(I64), sum(I64) — GROUP BY pk → natural PK
+        let out_schema = make_schema(&[
+            (type_code::I64, 8),  // count
+            (type_code::I64, 8),  // sum
+        ]);
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let tout_dir = dir.path().join("ma_tr_out");
+        let mut trace_out_table = Table::new(
+            tout_dir.to_str().unwrap(), "ma_tr_out", out_schema, 0, 1 << 20, false,
+        ).unwrap();
+        let trace_out_ptr = &mut trace_out_table as *mut Table;
+
+        let tin_dir = dir.path().join("ma_tr_in");
+        let mut trace_in_table = Table::new(
+            tin_dir.to_str().unwrap(), "ma_tr_in", in_schema, 0, 1 << 20, false,
+        ).unwrap();
+        let trace_in_ptr = &mut trace_in_table as *mut Table;
+
+        // Two agg descriptors: COUNT(col=1) and SUM(col=1)
+        // AGG_COUNT = 1, AGG_SUM = 2 (matching RPython opcodes.py and ops.rs)
+        let agg_descs = [
+            AggDescriptor {
+                col_idx: 1,           // schema col index for the val column
+                agg_op: 1,            // AGG_COUNT
+                col_type_code: type_code::I64,
+                _pad: [0; 2],
+            },
+            AggDescriptor {
+                col_idx: 1,           // schema col index for the val column
+                agg_op: 2,            // AGG_SUM
+                col_type_code: type_code::I64,
+                _pad: [0; 2],
+            },
+        ];
+        // GROUP BY col 0 (= pk, schema col index 0)
+        let group_cols = [0u32];
+
+        let mut builder = ProgramBuilder::new(5);
+        // reg 0 = input delta, reg 1 = trace_out, reg 2 = output,
+        // reg 3 = trace_in, reg 4 = unused
+        builder.add_reduce(
+            0, 3, 1, 2, -1,
+            &agg_descs, &group_cols, out_schema,
+            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
+            std::ptr::null_mut(), 0, 0,
+            std::ptr::null(), std::ptr::null(),
+        );
+        builder.add_integrate(
+            2, trace_out_ptr,
+            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
+        );
+        builder.add_integrate(
+            0, trace_in_ptr,
+            std::ptr::null_mut(), 0, 0,
+            std::ptr::null_mut(), false, 0, &[], std::ptr::null(), 0,
+        );
+        builder.add_halt();
+
+        let reg_schemas = [in_schema, out_schema, out_schema, in_schema, in_schema];
+        let reg_kinds = [0, 1, 0, 1, 0];
+        let mut vm = *builder.build(&reg_schemas, &reg_kinds);
+
+        // Input: 3 rows all with pk=1, vals 10, 20, 30
+        let input = make_batch(in_schema, &[
+            (1, 0, 1, 10),
+            (1, 0, 1, 20),
+            (1, 0, 1, 30),
+        ]);
+
+        let tr_out_cursor = trace_out_table.create_cursor().unwrap();
+        let tr_out_ch = Box::into_raw(Box::new(tr_out_cursor)) as *mut libc::c_void;
+        let tr_in_cursor = trace_in_table.create_cursor().unwrap();
+        let tr_in_ch = Box::into_raw(Box::new(tr_in_cursor)) as *mut libc::c_void;
+
+        let cursors = vec![
+            std::ptr::null_mut(), tr_out_ch, std::ptr::null_mut(),
+            tr_in_ch, std::ptr::null_mut(),
+        ];
+
+        let result = execute_epoch(
+            &vm.program, &mut vm.regfile, input, 0, 2, &cursors,
+        ).unwrap().unwrap();
+
+        // Should produce 1 row: pk=1, count=3, sum=60
+        assert_eq!(result.count, 1, "multi-agg should produce 1 group");
+        let count_val = i64::from_le_bytes(
+            result.col_data[0][0..8].try_into().unwrap());
+        let sum_val = i64::from_le_bytes(
+            result.col_data[1][0..8].try_into().unwrap());
+        assert_eq!(count_val, 3, "COUNT should be 3");
+        assert_eq!(sum_val, 60, "SUM should be 60");
+
+        unsafe { drop(Box::from_raw(tr_out_ch as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(tr_in_ch as *mut crate::read_cursor::CursorHandle)); }
+        trace_out_table.close();
+        trace_in_table.close();
+    }
 }
