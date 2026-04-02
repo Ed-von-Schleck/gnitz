@@ -843,22 +843,27 @@ def test_reactive_view_via_push(srv, source_table_id):
     """
     log("[SERVER] Testing reactive view via push...")
 
-    from gnitz.dbsp.expr import ExprBuilder
+    from gnitz.core.opcodes import (
+        EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_CMP_GT,
+    )
     from rpython_tests.helpers.circuit_builder import CircuitBuilder
 
-    # Build expression: col1 > 150
-    eb = ExprBuilder()
-    col1 = eb.load_col_int(1)
-    const = eb.load_const_int(150)
-    result_reg = eb.cmp_gt(col1, const)
-    prog = eb.build(result_reg)
+    # Build expression bytecode: col1 > 150
+    # reg 0 = col[1], reg 1 = 150, reg 2 = reg0 > reg1
+    expr_code = [
+        EXPR_LOAD_COL_INT, 0, 1, 0,   # dst=0, col_idx=1
+        EXPR_LOAD_CONST,   1, 150, 0,  # dst=1, lo=150, hi=0
+        EXPR_CMP_GT,       2, 0, 1,    # dst=2, src1=0, src2=1
+    ]
+    expr_num_regs = 3
+    expr_result_reg = 2
 
     # Build circuit graph
     builder = CircuitBuilder(view_id=0, primary_source_id=source_table_id)
     src = builder.input_delta()
-    flt = builder.filter(src, expr_code=prog.code_as_ints(),
-                         expr_num_regs=prog.num_regs,
-                         expr_result_reg=prog.result_reg)
+    flt = builder.filter(src, expr_code=expr_code,
+                         expr_num_regs=expr_num_regs,
+                         expr_result_reg=expr_result_reg)
     builder.sink(flt, target_table_id=0)
     out_cols = [("pk", types.TYPE_U64.code), ("val", types.TYPE_I64.code)]
     graph = builder.build(out_cols)

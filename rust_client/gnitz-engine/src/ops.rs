@@ -3058,6 +3058,72 @@ fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
     (partition / chunk).min(num_workers - 1)
 }
 
+/// Public wrapper for FFI use.
+pub fn worker_for_partition_pub(partition: usize, num_workers: usize) -> usize {
+    worker_for_partition(partition, num_workers)
+}
+
+// ---------------------------------------------------------------------------
+// Partition routing cache
+// ---------------------------------------------------------------------------
+
+/// Master-side routing cache: maps (table_id, col_idx, key_lo) → worker.
+///
+/// Populated by `record_routing` after repartitioning unique-indexed columns.
+/// Lets the master unicast index seeks instead of broadcasting on cache hit.
+pub struct PartitionRouter {
+    index_routing: std::collections::HashMap<(u32, u32, u64), u32>,
+}
+
+impl PartitionRouter {
+    pub fn new() -> Self {
+        PartitionRouter {
+            index_routing: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Returns the worker for a given index key, or -1 on cache miss.
+    pub fn worker_for_index_key(&self, tid: u32, col_idx: u32, key_lo: u64) -> i32 {
+        match self.index_routing.get(&(tid, col_idx, key_lo)) {
+            Some(&w) => w as i32,
+            None => -1,
+        }
+    }
+
+    /// Scan every row in `batch` and record or retract its index key → worker mapping.
+    /// Rows with negative weight retract; non-negative weight records.
+    pub fn record_routing(
+        &mut self,
+        batch: &OwnedBatch,
+        schema: &SchemaDescriptor,
+        tid: u32,
+        col_idx: u32,
+        worker: u32,
+    ) {
+        let mb = batch.as_mem_batch();
+        let pki = schema.pk_index as usize;
+        for row in 0..batch.count {
+            let weight = batch.get_weight(row);
+            let key_lo = if col_idx as usize == pki {
+                mb.get_pk_lo(row)
+            } else {
+                let pi = payload_idx(col_idx as usize, pki);
+                let col_size = schema.columns[col_idx as usize].size as usize;
+                let bytes = mb.get_col_ptr(row, pi, col_size);
+                let mut buf = [0u8; 8];
+                buf[..col_size].copy_from_slice(bytes);
+                u64::from_le_bytes(buf)
+            };
+            let map_key = (tid, col_idx, key_lo);
+            if weight < 0 {
+                self.index_routing.remove(&map_key);
+            } else {
+                self.index_routing.insert(map_key, worker);
+            }
+        }
+    }
+}
+
 fn hash_row_for_partition(
     mb: &MemBatch,
     row: usize,
@@ -4725,5 +4791,40 @@ mod tests {
         let key0 = extract_group_key(&mb, 0, &schema, &[1]);
         let key1 = extract_group_key(&mb, 1, &schema, &[1]);
         assert_ne!(key0, key1, "different F32 values must produce different group keys");
+    }
+
+    // -----------------------------------------------------------------------
+    // PartitionRouter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn partition_router_basic() {
+        let schema = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: {
+                let mut c = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+                c[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+                c[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+                c
+            },
+        };
+        let mut router = PartitionRouter::new();
+
+        // Miss on empty cache
+        assert_eq!(router.worker_for_index_key(1, 0, 42), -1);
+
+        // Insert and hit — col 1 (payload col 0) has value 100
+        let batch = make_batch(&schema, &[(42, 1, 100)]);
+        router.record_routing(&batch, &schema, 1, 1, 3);
+        assert_eq!(router.worker_for_index_key(1, 1, 100), 3);
+
+        // Different table_id is a miss
+        assert_eq!(router.worker_for_index_key(2, 1, 100), -1);
+
+        // Retract via negative weight
+        let retract = make_batch(&schema, &[(42, -1, 100)]);
+        router.record_routing(&retract, &schema, 1, 1, 3);
+        assert_eq!(router.worker_for_index_key(1, 1, 100), -1);
     }
 }

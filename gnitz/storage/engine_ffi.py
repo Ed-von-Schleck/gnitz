@@ -337,6 +337,16 @@ eci = ExternalCompilationInfo(
         "uint64_t gnitz_batch_blob_extend(void *handle, uint32_t n_bytes);",
         "uint64_t gnitz_batch_blob_len(const void *handle);",
         "void gnitz_batch_set_count(void *handle, uint32_t count);",
+        # partition routing
+        "uint32_t gnitz_partition_for_key(uint64_t pk_lo, uint64_t pk_hi);",
+        "uint32_t gnitz_worker_for_pk(uint64_t pk_lo, uint64_t pk_hi, uint32_t num_workers);",
+        "void *gnitz_partition_router_create(void);",
+        "void gnitz_partition_router_free(void *handle);",
+        "int32_t gnitz_partition_router_worker_for_index_key("
+        "  const void *handle, uint32_t tid, uint32_t col_idx, uint64_t key_lo);",
+        "void gnitz_partition_router_record_routing("
+        "  void *handle, const void *batch, const void *schema,"
+        "  uint32_t tid, uint32_t col_idx, uint32_t worker);",
         # exchange batch repartitioning
         "int32_t gnitz_repartition_batch("
         "  const void *src_batch,"
@@ -1628,6 +1638,51 @@ _batch_set_count = rffi.llexternal(
 )
 
 # ---------------------------------------------------------------------------
+# Partition routing
+# ---------------------------------------------------------------------------
+
+_partition_for_key = rffi.llexternal(
+    "gnitz_partition_for_key",
+    [rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.UINT,
+    compilation_info=eci,
+)
+
+_worker_for_pk = rffi.llexternal(
+    "gnitz_worker_for_pk",
+    [rffi.ULONGLONG, rffi.ULONGLONG, rffi.UINT],
+    rffi.UINT,
+    compilation_info=eci,
+)
+
+_partition_router_create = rffi.llexternal(
+    "gnitz_partition_router_create",
+    [],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_partition_router_free = rffi.llexternal(
+    "gnitz_partition_router_free",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_partition_router_worker_for_index_key = rffi.llexternal(
+    "gnitz_partition_router_worker_for_index_key",
+    [rffi.VOIDP, rffi.UINT, rffi.UINT, rffi.ULONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_partition_router_record_routing = rffi.llexternal(
+    "gnitz_partition_router_record_routing",
+    [rffi.VOIDP, rffi.VOIDP, rffi.VOIDP, rffi.UINT, rffi.UINT, rffi.UINT],
+    lltype.Void,
+    compilation_info=eci,
+)
+
 # Exchange repartitioning
 # ---------------------------------------------------------------------------
 

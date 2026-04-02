@@ -72,3 +72,68 @@ AGG_SUM            = 2
 AGG_MIN            = 3
 AGG_MAX            = 4
 AGG_COUNT_NON_NULL = 5
+
+# ---------------------------------------------------------------------------
+# Expression bytecode opcodes (match expr.rs constants)
+# ---------------------------------------------------------------------------
+
+# Column loads
+EXPR_LOAD_COL_INT   = 1
+EXPR_LOAD_COL_FLOAT = 2
+EXPR_LOAD_CONST     = 3
+
+# Integer arithmetic
+EXPR_INT_ADD = 4
+EXPR_INT_SUB = 5
+EXPR_INT_MUL = 6
+EXPR_INT_DIV = 7
+EXPR_INT_MOD = 8
+EXPR_INT_NEG = 9
+
+# Float arithmetic
+EXPR_FLOAT_ADD = 10
+EXPR_FLOAT_SUB = 11
+EXPR_FLOAT_MUL = 12
+EXPR_FLOAT_DIV = 13
+EXPR_FLOAT_NEG = 14
+
+# Integer comparison
+EXPR_CMP_EQ = 15
+EXPR_CMP_NE = 16
+EXPR_CMP_GT = 17
+EXPR_CMP_GE = 18
+EXPR_CMP_LT = 19
+EXPR_CMP_LE = 20
+
+# Float comparison
+EXPR_FCMP_EQ = 21
+EXPR_FCMP_NE = 22
+EXPR_FCMP_GT = 23
+EXPR_FCMP_GE = 24
+EXPR_FCMP_LT = 25
+EXPR_FCMP_LE = 26
+
+# Boolean logic
+EXPR_BOOL_AND = 27
+EXPR_BOOL_OR  = 28
+EXPR_BOOL_NOT = 29
+
+# Null checks
+EXPR_IS_NULL     = 30
+EXPR_IS_NOT_NULL = 31
+
+# Output opcodes
+EXPR_EMIT          = 32
+EXPR_INT_TO_FLOAT  = 33
+EXPR_COPY_COL      = 34
+
+# String comparison
+EXPR_STR_COL_EQ_CONST = 40
+EXPR_STR_COL_LT_CONST = 41
+EXPR_STR_COL_LE_CONST = 42
+EXPR_STR_COL_EQ_COL   = 43
+EXPR_STR_COL_LT_COL   = 44
+EXPR_STR_COL_LE_COL   = 45
+
+# Null emission
+EXPR_EMIT_NULL = 46

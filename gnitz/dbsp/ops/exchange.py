@@ -1,53 +1,56 @@
 # gnitz/dbsp/ops/exchange.py
 #
-# Column-based hash for repartitioning batches across workers.
-# Single authority for all partition routing logic.
+# Partition routing and batch repartitioning.
+# PartitionAssignment and PartitionRouter delegate to Rust.
+# Repartition/scatter operators are thin FFI wrappers.
 
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
-from gnitz.core.batch import ArenaZSetBatch, ColumnarBatchAccessor
+from gnitz.core.batch import ArenaZSetBatch
 from gnitz.storage.partitioned_table import _partition_for_key
 
 
 class PartitionAssignment(object):
-    """Maps 256 partitions to N workers. Worker w owns [start, end)."""
+    """Maps 256 partitions to N workers. Worker w owns [start, end).
 
-    _immutable_fields_ = ["num_workers", "starts[*]", "ends[*]",
-                          "_partition_to_worker[*]"]
+    The partition→worker mapping is computed via Rust (same hash as the
+    repartition operators).  Only `num_workers` is stored; all queries are
+    O(1) arithmetic.
+    """
+
+    _immutable_fields_ = ["num_workers"]
 
     def __init__(self, num_workers):
         self.num_workers = num_workers
-        chunk = 256 // num_workers
-        starts = [0] * num_workers
-        ends = [0] * num_workers
-        for w in range(num_workers):
-            starts[w] = w * chunk
-            if w == num_workers - 1:
-                ends[w] = 256
-            else:
-                ends[w] = (w + 1) * chunk
-        self.starts = starts
-        self.ends = ends
-        # Precompute O(1) lookup table
-        lut = [0] * 256
-        for w in range(num_workers):
-            for p in range(starts[w], ends[w]):
-                lut[p] = w
-        self._partition_to_worker = lut
 
     def worker_for_partition(self, partition_idx):
         """Returns the worker ID that owns the given partition."""
-        return self._partition_to_worker[partition_idx]
+        chunk = 256 // self.num_workers
+        w = partition_idx // chunk
+        if w >= self.num_workers:
+            w = self.num_workers - 1
+        return w
 
     def range_for_worker(self, worker_id):
         """Returns (start, end) partition range for the given worker."""
-        return self.starts[worker_id], self.ends[worker_id]
+        chunk = 256 // self.num_workers
+        start = worker_id * chunk
+        if worker_id == self.num_workers - 1:
+            end = 256
+        else:
+            end = (worker_id + 1) * chunk
+        return start, end
 
 
 def worker_for_pk(pk_lo, pk_hi, assignment):
     """Route a single PK to its owning worker (for fan_out_seek)."""
-    return assignment.worker_for_partition(_partition_for_key(r_uint64(pk_lo), r_uint64(pk_hi)))
+    from gnitz.storage import engine_ffi
+    return intmask(engine_ffi._worker_for_pk(
+        rffi.cast(rffi.ULONGLONG, pk_lo),
+        rffi.cast(rffi.ULONGLONG, pk_hi),
+        rffi.cast(rffi.UINT, assignment.num_workers),
+    ))
 
 
 def _unpack_handles(out_arr, num_workers, schema):
@@ -150,39 +153,51 @@ def relay_scatter(source_batches, shard_cols, num_workers, assignment):
 
 
 class PartitionRouter(object):
-    """Master-side cache: maps (table_id, col_idx, key_lo, key_hi) -> worker.
+    """Master-side routing cache backed by a Rust HashMap.
 
+    Maps (table_id, col_idx, key_lo) → worker.
     Populated by fan_out_push after repartitioning unique-indexed columns.
     Lets fan_out_seek_by_index unicast instead of broadcast on cache hit.
     """
 
     def __init__(self, assignment):
+        from gnitz.storage import engine_ffi
         self.assignment = assignment
-        self._index_routing = {}  # (table_id, col_idx, key_lo, key_hi) -> worker
+        self._handle = engine_ffi._partition_router_create()
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            return
+        from gnitz.storage import engine_ffi
+        engine_ffi._partition_router_free(self._handle)
+        self._closed = True
 
     def worker_for_index_key(self, table_id, col_idx, key_lo, key_hi):
         """Returns worker on cache hit, -1 on miss."""
-        key = (table_id, col_idx, key_lo, key_hi)
-        if key in self._index_routing:
-            return self._index_routing[key]
-        return -1
+        from gnitz.storage import engine_ffi
+        return intmask(engine_ffi._partition_router_worker_for_index_key(
+            self._handle,
+            rffi.cast(rffi.UINT, table_id),
+            rffi.cast(rffi.UINT, col_idx),
+            rffi.cast(rffi.ULONGLONG, key_lo),
+        ))
 
     def record_routing(self, batch, table_id, col_idx, worker):
-        """Populate or invalidate cache entries from a push sub-batch.
-
-        All rows in batch belong to worker.  Rows with negative weight
-        invalidate the entry (delete); positive weight records the mapping.
-        """
-        acc = ColumnarBatchAccessor(batch._schema)
-        for i in range(batch.length()):
-            acc.bind(batch, i)
-            key_lo = intmask(r_uint64(acc.get_int(col_idx)))
-            key = (table_id, col_idx, key_lo, 0)
-            if batch.get_weight(i) < 0:
-                if key in self._index_routing:
-                    del self._index_routing[key]
-            else:
-                self._index_routing[key] = worker
+        """Populate or invalidate cache entries from a push sub-batch."""
+        from gnitz.storage import engine_ffi
+        schema_buf = engine_ffi.pack_schema(batch._schema)
+        try:
+            engine_ffi._partition_router_record_routing(
+                self._handle,
+                batch._handle,
+                rffi.cast(rffi.VOIDP, schema_buf),
+                rffi.cast(rffi.UINT, table_id),
+                rffi.cast(rffi.UINT, col_idx),
+                rffi.cast(rffi.UINT, worker),
+            )
+        finally:
+            lltype.free(schema_buf, flavor="raw")
 
 
 def multi_scatter(batch, col_spec_list, num_workers, assignment):
@@ -205,7 +220,6 @@ def multi_scatter(batch, col_spec_list, num_workers, assignment):
     schema_buf = engine_ffi.pack_schema(schema)
     for i in range(total_out):
         out[i] = lltype.nullptr(rffi.VOIDP.TO)
-    # Flat handle list: save pointers before freeing the C array
     handles = newlist_hint(total_out)
     for i in range(total_out):
         handles.append(lltype.nullptr(rffi.VOIDP.TO))
@@ -230,8 +244,6 @@ def multi_scatter(batch, col_spec_list, num_workers, assignment):
         lltype.free(len_arr, flavor="raw")
         lltype.free(out, flavor="raw")
         lltype.free(schema_buf, flavor="raw")
-    # Build nested results outside try/finally to avoid RPython annotation
-    # issues with nested list construction in exception-handling blocks
     results = newlist_hint(n_specs)
     for si in range(n_specs):
         inner = newlist_hint(num_workers)

@@ -3985,6 +3985,75 @@ pub extern "C" fn gnitz_multi_scatter(
 }
 
 // ---------------------------------------------------------------------------
+// Partition routing FFI
+// ---------------------------------------------------------------------------
+
+/// Map a 128-bit PK to a partition index in [0, 255].
+#[no_mangle]
+pub extern "C" fn gnitz_partition_for_key(pk_lo: u64, pk_hi: u64) -> u32 {
+    crate::partitioned_table::partition_for_key(pk_lo, pk_hi) as u32
+}
+
+/// Map a 128-bit PK to its worker index given `num_workers`.
+#[no_mangle]
+pub extern "C" fn gnitz_worker_for_pk(pk_lo: u64, pk_hi: u64, num_workers: u32) -> u32 {
+    let partition = crate::partitioned_table::partition_for_key(pk_lo, pk_hi);
+    crate::ops::worker_for_partition_pub(partition, num_workers as usize) as u32
+}
+
+/// Create a new PartitionRouter. Returns an opaque heap pointer.
+#[no_mangle]
+pub extern "C" fn gnitz_partition_router_create() -> *mut libc::c_void {
+    Box::into_raw(Box::new(crate::ops::PartitionRouter::new())) as *mut libc::c_void
+}
+
+/// Free a PartitionRouter created by `gnitz_partition_router_create`.
+#[no_mangle]
+pub extern "C" fn gnitz_partition_router_free(handle: *mut libc::c_void) {
+    if !handle.is_null() {
+        unsafe { drop(Box::from_raw(handle as *mut crate::ops::PartitionRouter)) };
+    }
+}
+
+/// Query the routing cache. Returns worker index, or -1 on cache miss.
+#[no_mangle]
+pub extern "C" fn gnitz_partition_router_worker_for_index_key(
+    handle: *const libc::c_void,
+    tid: u32,
+    col_idx: u32,
+    key_lo: u64,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let router = unsafe { &*(handle as *const crate::ops::PartitionRouter) };
+    router.worker_for_index_key(tid, col_idx, key_lo)
+}
+
+/// Populate or retract routing entries from a sub-batch routed to `worker`.
+/// `schema_ptr` must point to the packed SchemaDescriptor for the batch.
+#[no_mangle]
+pub extern "C" fn gnitz_partition_router_record_routing(
+    handle: *mut libc::c_void,
+    batch_handle: *const libc::c_void,
+    schema_ptr: *const crate::compact::SchemaDescriptor,
+    tid: u32,
+    col_idx: u32,
+    worker: u32,
+) {
+    if handle.is_null() || batch_handle.is_null() || schema_ptr.is_null() {
+        return;
+    }
+    let result = std::panic::catch_unwind(|| {
+        let router = unsafe { &mut *(handle as *mut crate::ops::PartitionRouter) };
+        let batch = unsafe { &*(batch_handle as *const crate::memtable::OwnedBatch) };
+        let schema = unsafe { &*schema_ptr };
+        router.record_routing(batch, schema, tid, col_idx, worker);
+    });
+    let _ = result;
+}
+
+// ---------------------------------------------------------------------------
 // Circuit compiler FFI
 // ---------------------------------------------------------------------------
 
