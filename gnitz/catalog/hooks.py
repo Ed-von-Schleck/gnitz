@@ -3,6 +3,7 @@
 import os
 from rpython.rlib.rarithmetic import r_uint64, r_int64, intmask
 from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core.errors import LayoutError
 from gnitz.core.types import TableSchema
@@ -25,21 +26,25 @@ from gnitz.catalog.index_circuit import (
     _backfill_index,
     make_fk_index_name,
 )
+from gnitz.storage import engine_ffi
 
 
-def _view_needs_exchange(plan):
-    """True if the view requires worker exchange (join or reduce); local backfill is unsafe."""
-    return (plan.exchange_post_plan is not None
-            or plan.join_shard_map is not None)
+def _view_needs_exchange_dag(engine, vid):
+    """True if the view requires worker exchange; local backfill is unsafe."""
+    return engine_ffi._dag_view_needs_exchange(engine.dag_handle, vid) != 0
 
 
 def _backfill_view(engine, vid):
     """Scan each source family and feed all live rows through the view's plan."""
-    plan = engine.program_cache.get_program(vid)
-    if plan is None:
+    if not engine_ffi._dag_ensure_compiled(engine.dag_handle, vid):
         return
     view_family = engine.registry.get_by_id(vid)
-    source_ids = engine.program_cache.get_source_ids(vid)
+    out_buf = lltype.malloc(rffi.LONGLONGP.TO, 64, flavor="raw")
+    try:
+        n = engine_ffi._dag_get_source_ids(engine.dag_handle, vid, out_buf, 64)
+        source_ids = [intmask(out_buf[i]) for i in range(intmask(n))]
+    finally:
+        lltype.free(out_buf, flavor="raw")
     for source_id in source_ids:
         if not engine.registry.has_id(source_id):
             continue
@@ -58,12 +63,18 @@ def _backfill_view(engine, vid):
         if scan_batch.length() == 0:
             scan_batch.free()
             continue
-        result = plan.execute_epoch(scan_batch, source_id=source_id)
+        out_handle = engine_ffi._dag_execute_epoch(
+            engine.dag_handle, vid, scan_batch._handle, source_id)
+        # scan_batch._handle ownership was transferred to _dag_execute_epoch;
+        # prevent double-free by setting _handle to null before free().
+        scan_batch._handle = lltype.nullptr(rffi.VOIDP.TO)
         scan_batch.free()
-        if result is not None and result.length() > 0:
-            ingest_to_family(view_family, result)
-            view_family.store.flush()
-        if result is not None:
+        if out_handle:
+            result = ArenaZSetBatch._wrap_handle(
+                view_family.schema, out_handle, False, False)
+            if result.length() > 0:
+                ingest_to_family(view_family, result)
+                view_family.store.flush()
             result.free()
 
 
@@ -180,6 +191,15 @@ class TableEffectHook(DeltaHook):
                 )
                 self.engine.registry.register(family)
                 wire_fk_constraints_for_family(family, self.engine.registry)
+                # Register with DagEngine
+                packed = engine_ffi.pack_schema(family.schema)
+                with rffi.scoped_str2charp(directory) as dir_c:
+                    engine_ffi._dag_register_table(
+                        self.engine.dag_handle, tid,
+                        family.store._handle,
+                        rffi.cast(rffi.VOIDP, packed),
+                        family.depth, int(unique_pk), 1, dir_c)
+                lltype.free(packed, flavor="raw")
 
                 if self.cascade_enabled:
                     self._create_fk_indices(family)
@@ -200,6 +220,7 @@ class TableEffectHook(DeltaHook):
                                     )
                                 )
 
+                    engine_ffi._dag_unregister_table(self.engine.dag_handle, tid)
                     family.close()
                     self.engine.registry.unregister(family.schema_name, family.table_name)
 
@@ -282,25 +303,40 @@ class ViewEffectHook(DeltaHook):
                 family = TableFamily(schema_name, name, vid, sid, directory, 0, et)
 
                 max_depth = 0
-                for src_id in self.engine.program_cache.get_source_ids(vid):
-                    if self.engine.registry.has_id(src_id):
-                        d = self.engine.registry.get_by_id(src_id).depth + 1
-                        if d > max_depth:
-                            max_depth = d
+                out_buf = lltype.malloc(rffi.LONGLONGP.TO, 64, flavor="raw")
+                try:
+                    n_src = engine_ffi._dag_get_source_ids(
+                        self.engine.dag_handle, vid, out_buf, 64)
+                    for si in range(intmask(n_src)):
+                        src_id = intmask(out_buf[si])
+                        if self.engine.registry.has_id(src_id):
+                            d = self.engine.registry.get_by_id(src_id).depth + 1
+                            if d > max_depth:
+                                max_depth = d
+                finally:
+                    lltype.free(out_buf, flavor="raw")
                 family.depth = max_depth
 
                 self.engine.registry.register(family)
+                # Register with DagEngine
+                packed = engine_ffi.pack_schema(family.schema)
+                with rffi.scoped_str2charp(directory) as dir_c:
+                    engine_ffi._dag_register_table(
+                        self.engine.dag_handle, vid,
+                        family.store._handle,
+                        rffi.cast(rffi.VOIDP, packed),
+                        family.depth, 0, 1, dir_c)
+                lltype.free(packed, flavor="raw")
 
                 # Only compile and backfill on processes that own data partitions.
-                # The master in multi-worker mode sets active_part_end=0 and has no
-                # partition stores; view backfill is handled by workers via DDL sync.
                 if self.engine.registry.active_part_start != self.engine.registry.active_part_end:
-                    plan = self.engine.program_cache.get_program(vid)
-                    if plan is not None and not _view_needs_exchange(plan):
-                        _backfill_view(self.engine, vid)
+                    if engine_ffi._dag_ensure_compiled(self.engine.dag_handle, vid):
+                        if not _view_needs_exchange_dag(self.engine, vid):
+                            _backfill_view(self.engine, vid)
             else:
                 if self.engine.registry.has_id(vid):
                     family = self.engine.registry.get_by_id(vid)
+                    engine_ffi._dag_unregister_table(self.engine.dag_handle, vid)
                     family.close()
                     self.engine.registry.unregister(family.schema_name, family.table_name)
 
@@ -314,7 +350,7 @@ class DepTabEffectHook(DeltaHook):
         self.engine = engine
 
     def on_delta(self, batch):
-        self.engine.program_cache.invalidate_dep_map()
+        engine_ffi._dag_invalidate_dep_map(self.engine.dag_handle)
 
 
 class IndexEffectHook(DeltaHook):

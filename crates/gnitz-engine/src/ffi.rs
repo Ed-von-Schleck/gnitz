@@ -4363,7 +4363,7 @@ pub extern "C" fn gnitz_compile_view(
             unsafe { std::ffi::CStr::from_ptr(view_dir) }.to_string_lossy().into_owned()
         };
 
-        let cr = unsafe {
+        let compile_result = unsafe {
             crate::compiler::compile_view(
                 view_id,
                 sys_nodes as *mut crate::table::Table,
@@ -4385,12 +4385,546 @@ pub extern "C" fn gnitz_compile_view(
             )
         };
 
-        let out_slice = unsafe {
-            slice::from_raw_parts_mut(out_result, crate::compiler::COMPILE_RESULT_SLOTS)
+        match compile_result {
+            Ok(output) => {
+                let cr = output.to_result_buffer();
+                let out_slice = unsafe {
+                    slice::from_raw_parts_mut(out_result, crate::compiler::COMPILE_RESULT_SLOTS)
+                };
+                out_slice.copy_from_slice(&cr.buf);
+                0
+            }
+            Err(code) => {
+                let cr = crate::compiler::CompileResult::error(code);
+                let out_slice = unsafe {
+                    slice::from_raw_parts_mut(out_result, crate::compiler::COMPILE_RESULT_SLOTS)
+                };
+                out_slice.copy_from_slice(&cr.buf);
+                code
+            }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
+// DagEngine FFI
+// ---------------------------------------------------------------------------
+
+use crate::dag::{DagEngine, StoreHandle, SysTableRefs};
+
+/// Create a new DagEngine. Returns an opaque handle.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_create() -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        let dag = Box::new(DagEngine::new());
+        Box::into_raw(dag) as *mut c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Destroy a DagEngine.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_destroy(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let mut dag = unsafe { Box::from_raw(handle as *mut DagEngine) };
+        dag.close();
+    });
+}
+
+/// Set the 6 system table handles + schemas on a DagEngine.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_set_sys_tables(
+    handle: *mut c_void,
+    h_nodes: *mut c_void,
+    h_edges: *mut c_void,
+    h_sources: *mut c_void,
+    h_params: *mut c_void,
+    h_gcols: *mut c_void,
+    h_dep: *mut c_void,
+    s_nodes: *const crate::compact::SchemaDescriptor,
+    s_edges: *const crate::compact::SchemaDescriptor,
+    s_sources: *const crate::compact::SchemaDescriptor,
+    s_params: *const crate::compact::SchemaDescriptor,
+    s_gcols: *const crate::compact::SchemaDescriptor,
+    s_dep: *const crate::compact::SchemaDescriptor,
+) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        dag.set_sys_tables(SysTableRefs {
+            nodes: h_nodes as *mut crate::table::Table,
+            edges: h_edges as *mut crate::table::Table,
+            sources: h_sources as *mut crate::table::Table,
+            params: h_params as *mut crate::table::Table,
+            group_cols: h_gcols as *mut crate::table::Table,
+            dep_tab: h_dep as *mut crate::table::Table,
+            nodes_schema: if s_nodes.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_nodes } },
+            edges_schema: if s_edges.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_edges } },
+            sources_schema: if s_sources.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_sources } },
+            params_schema: if s_params.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_params } },
+            group_cols_schema: if s_gcols.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_gcols } },
+            dep_tab_schema: if s_dep.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_dep } },
+        });
+    });
+}
+
+/// Register a table with the DagEngine.
+/// is_partitioned: 0 = Single (EphemeralTable), 1 = Partitioned.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_register_table(
+    handle: *mut c_void,
+    table_id: i64,
+    store_handle: *mut c_void,
+    schema: *const crate::compact::SchemaDescriptor,
+    depth: i32,
+    unique_pk: c_int,
+    is_partitioned: c_int,
+    dir_ptr: *const libc::c_char,
+) {
+    if handle.is_null() || schema.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let sd = unsafe { *schema };
+        let sh = if is_partitioned != 0 {
+            StoreHandle::Partitioned(store_handle as *mut crate::partitioned_table::PartitionedTable)
+        } else {
+            StoreHandle::Single(store_handle as *mut crate::table::Table)
         };
-        out_slice.copy_from_slice(&cr.buf);
-        let error_code = cr.buf[230]; // CR_ERROR_CODE
-        if error_code != 0 { error_code as i32 } else { 0 }
+        let dir = if dir_ptr.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(dir_ptr) }.to_string_lossy().into_owned()
+        };
+        dag.register_table(table_id, sh, sd, depth, unique_pk != 0, dir);
+    });
+}
+
+/// Unregister a table from the DagEngine.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_unregister_table(handle: *mut c_void, table_id: i64) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        dag.unregister_table(table_id);
+    });
+}
+
+/// Set the depth of a table in the DagEngine.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_set_depth(handle: *mut c_void, table_id: i64, depth: i32) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        dag.set_depth(table_id, depth);
+    });
+}
+
+/// Add an index circuit to a table.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_add_index_circuit(
+    handle: *mut c_void,
+    table_id: i64,
+    col_idx: u32,
+    idx_handle: *mut c_void,
+    idx_schema: *const crate::compact::SchemaDescriptor,
+    is_unique: c_int,
+) {
+    if handle.is_null() || idx_schema.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let sd = unsafe { *idx_schema };
+        dag.add_index_circuit(
+            table_id, col_idx,
+            idx_handle as *mut crate::table::Table,
+            sd, is_unique != 0,
+        );
+    });
+}
+
+/// Remove an index circuit from a table.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_remove_index_circuit(
+    handle: *mut c_void,
+    table_id: i64,
+    col_idx: u32,
+) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        dag.remove_index_circuit(table_id, col_idx);
+    });
+}
+
+/// Invalidate a single view's cached plan.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_invalidate(handle: *mut c_void, view_id: i64) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        dag.invalidate(view_id);
+    });
+}
+
+/// Invalidate all cached plans.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_invalidate_all(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        dag.invalidate_all();
+    });
+}
+
+/// Invalidate the dependency map.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_invalidate_dep_map(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        dag.invalidate_dep_map();
+    });
+}
+
+/// Run the full single-worker DAG evaluation.
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_evaluate(
+    handle: *mut c_void,
+    source_id: i64,
+    delta_handle: *mut c_void,
+) -> i32 {
+    if handle.is_null() || delta_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let delta = unsafe { Box::from_raw(delta_handle as *mut crate::memtable::OwnedBatch) };
+        dag.evaluate_dag(source_id, *delta)
+    });
+    result.unwrap_or(-99)
+}
+
+/// Execute a single epoch for one view (multi-worker path).
+/// Returns a new batch handle (caller owns) or null.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_execute_epoch(
+    handle: *mut c_void,
+    view_id: i64,
+    input_handle: *mut c_void,
+    source_id: i64,
+) -> *mut c_void {
+    if handle.is_null() || input_handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let input = unsafe { Box::from_raw(input_handle as *mut crate::memtable::OwnedBatch) };
+        match dag.execute_epoch(view_id, *input, source_id) {
+            Some(batch) => Box::into_raw(Box::new(batch)) as *mut c_void,
+            None => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Ingest a batch into a table via DagEngine (user tables only).
+#[no_mangle]
+pub extern "C" fn gnitz_dag_ingest(
+    handle: *mut c_void,
+    table_id: i64,
+    batch_handle: *mut c_void,
+) -> i32 {
+    if handle.is_null() || batch_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let batch = unsafe { Box::from_raw(batch_handle as *mut crate::memtable::OwnedBatch) };
+        dag.ingest_to_family(table_id, *batch)
+    });
+    result.unwrap_or(-99)
+}
+
+/// Flush a table's WAL via DagEngine.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_flush(handle: *mut c_void, table_id: i64) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        dag.flush(table_id)
+    });
+    result.unwrap_or(-99)
+}
+
+/// Get the dependency map: writes (source_tid, view_id) pairs to out_pairs.
+/// Returns count of pairs written (each pair = 2 i64s).
+#[no_mangle]
+pub extern "C" fn gnitz_dag_get_dep_map(
+    handle: *mut c_void,
+    out_pairs: *mut i64,
+    max_pairs: u32,
+) -> i32 {
+    if handle.is_null() || out_pairs.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let dm = dag.get_dep_map();
+        let mut count: u32 = 0;
+        for (&source_tid, view_ids) in dm {
+            for &vid in view_ids {
+                if count >= max_pairs { return count as i32; }
+                unsafe {
+                    *out_pairs.add(count as usize * 2) = source_tid;
+                    *out_pairs.add(count as usize * 2 + 1) = vid;
+                }
+                count += 1;
+            }
+        }
+        count as i32
+    });
+    result.unwrap_or(0)
+}
+
+/// Get shard columns for a view.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_get_shard_cols(
+    handle: *mut c_void,
+    view_id: i64,
+    out_cols: *mut i32,
+    max: u32,
+) -> i32 {
+    if handle.is_null() || out_cols.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let cols = dag.get_shard_cols(view_id);
+        let n = cols.len().min(max as usize);
+        for i in 0..n {
+            unsafe { *out_cols.add(i) = cols[i]; }
+        }
+        n as i32
+    });
+    result.unwrap_or(0)
+}
+
+/// Get exchange info for a view.
+/// out_cols: shard column indices; out_trivial/out_copart: flags.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_get_exchange_info(
+    handle: *mut c_void,
+    view_id: i64,
+    out_cols: *mut i32,
+    max: u32,
+    out_trivial: *mut c_int,
+    out_copart: *mut c_int,
+) -> i32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let info = dag.get_exchange_info(view_id);
+        let n = info.shard_cols.len().min(max as usize);
+        if !out_cols.is_null() {
+            for i in 0..n {
+                unsafe { *out_cols.add(i) = info.shard_cols[i]; }
+            }
+        }
+        if !out_trivial.is_null() {
+            unsafe { *out_trivial = if info.is_trivial { 1 } else { 0 }; }
+        }
+        if !out_copart.is_null() {
+            unsafe { *out_copart = if info.is_co_partitioned { 1 } else { 0 }; }
+        }
+        n as i32
+    });
+    result.unwrap_or(0)
+}
+
+/// Get source IDs for a view.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_get_source_ids(
+    handle: *mut c_void,
+    view_id: i64,
+    out_ids: *mut i64,
+    max: u32,
+) -> i32 {
+    if handle.is_null() || out_ids.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let ids = dag.get_source_ids(view_id);
+        let n = ids.len().min(max as usize);
+        for i in 0..n {
+            unsafe { *out_ids.add(i) = ids[i]; }
+        }
+        n as i32
+    });
+    result.unwrap_or(0)
+}
+
+/// Get preloadable views for a source table.
+/// out_vids: view IDs, out_cols: first shard column per view.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_get_preloadable_views(
+    handle: *mut c_void,
+    src_tid: i64,
+    out_vids: *mut i64,
+    out_cols: *mut i32,
+    max: u32,
+) -> i32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let views = dag.get_preloadable_views(src_tid);
+        let n = views.len().min(max as usize);
+        for i in 0..n {
+            let (vid, ref cols) = views[i];
+            if !out_vids.is_null() { unsafe { *out_vids.add(i) = vid; } }
+            if !out_cols.is_null() && !cols.is_empty() {
+                unsafe { *out_cols.add(i) = cols[0]; }
+            }
+        }
+        n as i32
+    });
+    result.unwrap_or(0)
+}
+
+/// Get join shard columns for a specific (view_id, source_id) pair.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_get_join_shard_cols(
+    handle: *mut c_void,
+    view_id: i64,
+    source_id: i64,
+    out_cols: *mut i32,
+    max: u32,
+) -> i32 {
+    if handle.is_null() || out_cols.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let cols = dag.get_join_shard_cols(view_id, source_id);
+        let n = cols.len().min(max as usize);
+        for i in 0..n {
+            unsafe { *out_cols.add(i) = cols[i]; }
+        }
+        n as i32
+    });
+    result.unwrap_or(0)
+}
+
+/// Check if a view needs exchange.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_view_needs_exchange(handle: *mut c_void, view_id: i64) -> c_int {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        if dag.view_needs_exchange(view_id) { 1 } else { 0 }
+    });
+    result.unwrap_or(0)
+}
+
+/// Get the exchange schema for a view. Writes to out_schema if non-null.
+/// Returns 1 if the view has an exchange schema, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_get_exchange_schema(
+    handle: *mut c_void,
+    view_id: i64,
+    out_schema: *mut crate::compact::SchemaDescriptor,
+) -> c_int {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        match dag.get_exchange_schema(view_id) {
+            Some(schema) => {
+                if !out_schema.is_null() {
+                    unsafe { *out_schema = schema; }
+                }
+                1
+            }
+            None => 0,
+        }
+    });
+    result.unwrap_or(0)
+}
+
+/// Ensure a view's plan is compiled. Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_ensure_compiled(handle: *mut c_void, view_id: i64) -> c_int {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        if dag.ensure_compiled(view_id) { 1 } else { 0 }
+    });
+    result.unwrap_or(0)
+}
+
+/// Execute just the post-plan of a view (after exchange IPC).
+#[no_mangle]
+pub extern "C" fn gnitz_dag_execute_post_epoch(
+    handle: *mut c_void,
+    view_id: i64,
+    input_handle: *mut c_void,
+) -> *mut c_void {
+    if handle.is_null() || input_handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        let input = unsafe { Box::from_raw(input_handle as *mut crate::memtable::OwnedBatch) };
+        match dag.execute_post_epoch(view_id, *input) {
+            Some(batch) => Box::into_raw(Box::new(batch)) as *mut c_void,
+            None => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Check if a source is co-partitioned for a view's join.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_plan_source_co_partitioned(
+    handle: *mut c_void,
+    view_id: i64,
+    source_id: i64,
+) -> c_int {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &mut *(handle as *mut DagEngine) };
+        if dag.plan_source_co_partitioned(view_id, source_id) { 1 } else { 0 }
+    });
+    result.unwrap_or(0)
+}
+
+/// Validate a circuit graph structure before persistence.
+/// nodes, edges, sources are parallel arrays.
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn gnitz_dag_validate_graph(
+    handle: *mut c_void,
+    nodes_ptr: *const i32,    // [nid, opcode] pairs
+    nodes_count: u32,
+    edges_ptr: *const i32,    // [eid, src, dst, port] quads
+    edges_count: u32,
+    sources_ptr: *const i64,  // [nid_i64, table_id] pairs
+    sources_count: u32,
+) -> c_int {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let dag = unsafe { &*(handle as *const DagEngine) };
+
+        let nodes: Vec<(i32, i32)> = if nodes_count > 0 && !nodes_ptr.is_null() {
+            let s = unsafe { slice::from_raw_parts(nodes_ptr, nodes_count as usize * 2) };
+            (0..nodes_count as usize).map(|i| (s[i*2], s[i*2+1])).collect()
+        } else {
+            Vec::new()
+        };
+
+        let edges: Vec<(i32, i32, i32, i32)> = if edges_count > 0 && !edges_ptr.is_null() {
+            let s = unsafe { slice::from_raw_parts(edges_ptr, edges_count as usize * 4) };
+            (0..edges_count as usize).map(|i| (s[i*4], s[i*4+1], s[i*4+2], s[i*4+3])).collect()
+        } else {
+            Vec::new()
+        };
+
+        let sources: Vec<(i32, i64)> = if sources_count > 0 && !sources_ptr.is_null() {
+            let s = unsafe { slice::from_raw_parts(sources_ptr, sources_count as usize * 2) };
+            (0..sources_count as usize).map(|i| (s[i*2] as i32, s[i*2+1])).collect()
+        } else {
+            Vec::new()
+        };
+
+        match dag.validate_graph_structure(&nodes, &edges, &sources) {
+            Ok(()) => 0,
+            Err(_msg) => -1,
+        }
     });
     result.unwrap_or(-99)
 }

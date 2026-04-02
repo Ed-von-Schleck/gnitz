@@ -23,6 +23,7 @@ pub mod scalar_func;
 pub mod ops;
 pub mod vm;
 pub mod compiler;
+pub mod dag;
 pub mod ipc_sys;
 pub mod ipc;
 pub mod ffi;

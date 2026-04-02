@@ -33,11 +33,12 @@ class MasterDispatcher(object):
                           "sal", "m2w_efds[*]", "w2m_efds[*]"]
 
     def __init__(self, num_workers, worker_pids, assignment,
-                 program_cache, sal, w2m_regions, m2w_efds, w2m_efds):
+                 dag_handle, registry, sal, w2m_regions, m2w_efds, w2m_efds):
         self.num_workers = num_workers
         self.worker_pids = worker_pids
         self.assignment = assignment
-        self.program_cache = program_cache
+        self.dag_handle = dag_handle
+        self.registry = registry
         self.router = PartitionRouter(assignment)
         self.sal = sal                     # SharedAppendLog
         self.w2m_regions = w2m_regions     # list[W2MRegion]
@@ -428,8 +429,20 @@ class MasterDispatcher(object):
         Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE."""
         self._maybe_checkpoint()
         n = batch.length()
-        preloadable = self.program_cache.get_preloadable_views(target_id)
-        family = self.program_cache.registry.get_by_id(target_id)
+        # Get preloadable views from DagEngine
+        pv_vids = rffi.lltype.malloc(rffi.LONGLONGP.TO, 64, flavor="raw")
+        pv_cols = rffi.lltype.malloc(rffi.INTP.TO, 64, flavor="raw")
+        try:
+            n_pv = engine_ffi._dag_get_preloadable_views(
+                self.dag_handle, target_id, pv_vids, pv_cols, 64)
+            preloadable = newlist_hint(intmask(n_pv))
+            for pi in range(intmask(n_pv)):
+                preloadable.append(
+                    (intmask(pv_vids[pi]), [intmask(pv_cols[pi])]))
+        finally:
+            rffi.lltype.free(pv_vids, flavor="raw")
+            rffi.lltype.free(pv_cols, flavor="raw")
+        family = self.registry.get_by_id(target_id)
 
         if len(preloadable) > 0:
             has_retraction = False
@@ -508,11 +521,20 @@ class MasterDispatcher(object):
                 "SAL space exhausted during exchange relay (%d bytes left)"
                 % remaining)
         shard_cols = []
-        if source_id > 0:
-            shard_cols = self.program_cache.get_join_shard_cols(
-                view_id, source_id)
-        if len(shard_cols) == 0:
-            shard_cols = self.program_cache.get_shard_cols(view_id)
+        sc_buf = rffi.lltype.malloc(rffi.INTP.TO, 8, flavor="raw")
+        try:
+            if source_id > 0:
+                n_sc = engine_ffi._dag_get_join_shard_cols(
+                    self.dag_handle, view_id, source_id, sc_buf, 8)
+                for sci in range(intmask(n_sc)):
+                    shard_cols.append(intmask(sc_buf[sci]))
+            if len(shard_cols) == 0:
+                n_sc = engine_ffi._dag_get_shard_cols(
+                    self.dag_handle, view_id, sc_buf, 8)
+                for sci in range(intmask(n_sc)):
+                    shard_cols.append(intmask(sc_buf[sci]))
+        finally:
+            rffi.lltype.free(sc_buf, flavor="raw")
         sources = [None] * self.num_workers
         for i in range(len(payloads)):
             p = payloads[i]

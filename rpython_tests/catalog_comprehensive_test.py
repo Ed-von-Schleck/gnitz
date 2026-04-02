@@ -15,6 +15,7 @@ from gnitz.core.types import _analyze_schema
 from gnitz.core.errors import LayoutError, GnitzError
 from gnitz.core.strings import resolve_string
 from gnitz.catalog import identifiers
+from gnitz.storage import engine_ffi
 from gnitz.catalog.engine import open_engine
 from gnitz.catalog import engine as engine_module
 from gnitz.catalog import system_tables as sys
@@ -1644,8 +1645,8 @@ def test_programmable_zset_lifecycle():
 
     # 7. Recovery Audit
     log_step("Phase 7: Auditing recovered VM Program")
-    plan = db2.program_cache.get_program(view_family.table_id)
-    assert_true(plan is not None, "Failed to recover view plan")
+    compiled = engine_ffi._dag_ensure_compiled(db2.dag_handle, view_family.table_id)
+    assert_true(compiled != 0, "Failed to recover view plan")
 
     # 8. View Execution (New View API)
     log_step("Phase 8: Execution of Recovered View handle")
@@ -1656,10 +1657,15 @@ def test_programmable_zset_lifecycle():
     rb_in.put_string("alice")
     rb_in.commit()
 
-    out_batch = plan.execute_epoch(in_batch)
+    out_handle = engine_ffi._dag_execute_epoch(
+        db2.dag_handle, view_family.table_id, in_batch._handle, 0)
+    in_batch._handle = lltype.nullptr(rffi.VOIDP.TO)
     in_batch.free()
 
-    assert_true(out_batch is not None, "View should have produced Alice")
+    assert_true(out_handle is not None and out_handle != lltype.nullptr(rffi.VOIDP.TO),
+                "View should have produced Alice")
+    out_batch = owned_batch.ArenaZSetBatch._wrap_handle(
+        view_family.schema, out_handle, False, False)
     assert_equal_i(1, out_batch.length(), "View produced wrong row count")
     assert_equal_u128(u128_val, out_batch.get_pk(0), "View data corrupted")
     out_batch.free()

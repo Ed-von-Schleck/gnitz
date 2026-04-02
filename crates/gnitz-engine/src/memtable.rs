@@ -225,6 +225,28 @@ impl OwnedBatch {
         })
     }
 
+    /// Produce region pointer/size arrays suitable for `Table::ingest_batch_from_regions`.
+    ///
+    /// Layout: [pk_lo, pk_hi, weight, null_bmp, col_0..col_N-1, blob].
+    /// The returned vecs borrow from `self` and must not outlive it.
+    pub fn to_region_ptrs(&self) -> (Vec<*const u8>, Vec<u32>) {
+        let npc = self.col_data.len();
+        let cap = 4 + npc + 1; // pk_lo, pk_hi, weight, null_bmp, cols, blob
+        let mut ptrs = Vec::with_capacity(cap);
+        let mut sizes = Vec::with_capacity(cap);
+
+        ptrs.push(self.pk_lo.as_ptr()); sizes.push(self.pk_lo.len() as u32);
+        ptrs.push(self.pk_hi.as_ptr()); sizes.push(self.pk_hi.len() as u32);
+        ptrs.push(self.weight.as_ptr()); sizes.push(self.weight.len() as u32);
+        ptrs.push(self.null_bmp.as_ptr()); sizes.push(self.null_bmp.len() as u32);
+        for col in &self.col_data {
+            ptrs.push(col.as_ptr()); sizes.push(col.len() as u32);
+        }
+        ptrs.push(self.blob.as_ptr()); sizes.push(self.blob.len() as u32);
+
+        (ptrs, sizes)
+    }
+
     /// Clone all buffers into a new independent OwnedBatch.
     pub fn clone_batch(&self) -> Self {
         OwnedBatch {

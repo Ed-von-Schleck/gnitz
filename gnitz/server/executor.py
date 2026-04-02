@@ -129,32 +129,48 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                  exchange_handler=None):
     """
     Module-level topological DAG evaluator.
-    Uses a depth-sorted approach to ensure each view evaluates exactly once
-    per epoch, even in diamond dependency graphs.
 
-    Called by both the single-process ServerExecutor and multi-worker
-    WorkerProcess paths. When exchange_handler is provided, plans with
-    exchange_post_plan will perform IPC exchange mid-circuit.
+    Single-worker (exchange_handler is None): delegates entirely to Rust
+    DagEngine via a single FFI call.
 
-    Pending entries are 4-tuples: (depth, view_id, source_id, batch).
-    source_id tracks which source table triggered the delta, enabling
-    multi-input circuits to bind to the correct register.
+    Multi-worker (exchange_handler is not None): RPython DAG loop using
+    DagEngine FFI for per-view execution and ingestion, with RPython
+    handling the IPC exchange between workers.
     """
+    if exchange_handler is None:
+        # ── Single-worker: Rust handles entire DAG ───────────────────
+        # Transfer batch ownership to Rust (clone so caller can still free)
+        delta_clone = initial_delta.clone()
+        engine_ffi._dag_evaluate(
+            engine.dag_handle, initial_source_id, delta_clone._handle)
+        # Ownership transferred — prevent double-free
+        delta_clone._handle = lltype.nullptr(rffi.VOIDP.TO)
+        delta_clone.free()
+        return
+
+    # ── Multi-worker: RPython DAG loop with DagEngine FFI ────────────
     registry = engine.registry
-    program_cache = engine.program_cache
+    dag_handle = engine.dag_handle
 
-    dep_map = program_cache.get_dep_map(registry)
+    # Refresh dep_map
+    dep_buf = lltype.malloc(rffi.LONGLONGP.TO, 1024, flavor="raw")
+    try:
+        n_pairs = engine_ffi._dag_get_dep_map(dag_handle, dep_buf, 512)
+        dep_map = {}
+        for i in range(intmask(n_pairs)):
+            src = intmask(dep_buf[i * 2])
+            vid = intmask(dep_buf[i * 2 + 1])
+            if src not in dep_map:
+                dep_map[src] = []
+            dep_map[src].append(vid)
+    finally:
+        lltype.free(dep_buf, flavor="raw")
 
-    # pending: list of (depth, view_id, source_id, batch), sorted DESCENDING by depth
-    # so the shallowest (min-depth) node is always at the tail for O(1) pop.
     first_layer = dep_map.get(initial_source_id, [])
     pending = []
-    pending_pos = {}   # _pending_key(view_id, source_id) -> index in pending
+    pending_pos = {}
     for v_id in first_layer:
         if not registry.has_id(v_id):
-            # dep_map can lag behind the registry: the async tick (b8baedd) may
-            # fire after VIEW_TAB retraction but before DEP_TAB retraction, so
-            # the dep_map still lists views that are no longer registered.
             continue
         d = registry.get_depth(v_id)
         pending.append((d, v_id, initial_source_id, initial_delta.clone()))
@@ -164,66 +180,138 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
         pending_pos[pk] = pi
 
     while len(pending) > 0:
-        depth, target_view_id, source_id, incoming_delta = pending[-1]   # O(1) tail = min-depth
-        del pending[-1]                                                   # O(1)
+        depth, target_view_id, source_id, incoming_delta = pending[-1]
+        del pending[-1]
         del pending_pos[_pending_key(target_view_id, source_id)]
 
-        plan = program_cache.get_program(target_view_id)
-        if plan is None:
-            log.warn("evaluate_dag: no plan for view_id=%d, skipping" % target_view_id)
-            incoming_delta.free()
-            continue
+        has_exchange = engine_ffi._dag_view_needs_exchange(
+            dag_handle, target_view_id) != 0
 
-        if plan.exchange_post_plan is not None and exchange_handler is not None:
-            # Multi-worker: pre-plan -> (optional IPC exchange) -> post-plan
-            pre_result = plan.execute_epoch(incoming_delta, source_id=source_id)
-            incoming_delta.free()
-            if pre_result is None:
-                pre_result = ArenaZSetBatch(plan.out_schema)
+        # Check join shard for this source
+        shard_buf = lltype.malloc(rffi.INTP.TO, 8, flavor="raw")
+        try:
+            n_jsc = engine_ffi._dag_get_join_shard_cols(
+                dag_handle, target_view_id, source_id, shard_buf, 8)
+            has_join_shard = intmask(n_jsc) > 0
+        finally:
+            lltype.free(shard_buf, flavor="raw")
 
-            if plan.skip_exchange:
-                # Co-partitioned: master pre-sent the batch; stash hit in do_exchange,
-                # or skip entirely (worker already has correct partition).
-                out_delta = plan.exchange_post_plan.execute_epoch(pre_result)
+        # Check exchange info for skip_exchange
+        trivial_buf = lltype.malloc(rffi.INTP.TO, 1, flavor="raw")
+        copart_buf = lltype.malloc(rffi.INTP.TO, 1, flavor="raw")
+        try:
+            engine_ffi._dag_get_exchange_info(
+                dag_handle, target_view_id,
+                lltype.nullptr(rffi.INTP.TO), 0,
+                trivial_buf, copart_buf)
+            is_trivial = intmask(trivial_buf[0]) != 0
+            is_copart = intmask(copart_buf[0]) != 0
+        finally:
+            lltype.free(trivial_buf, flavor="raw")
+            lltype.free(copart_buf, flavor="raw")
+        skip_exchange = is_trivial and is_copart
+
+        if has_exchange and exchange_handler is not None:
+            # Multi-worker: pre-plan → exchange IPC → post-plan
+            if not registry.has_id(target_view_id):
+                incoming_delta.free()
+                continue
+            view_family = registry.get_by_id(target_view_id)
+            view_schema = view_family.schema
+
+            # Get exchange schema for pre-plan output wrapping
+            ex_schema_buf = lltype.malloc(rffi.CCHARP.TO, engine_ffi.SCHEMA_DESC_SIZE, flavor="raw")
+            try:
+                has_ex_schema = engine_ffi._dag_get_exchange_schema(
+                    dag_handle, target_view_id, rffi.cast(rffi.VOIDP, ex_schema_buf))
+                if has_ex_schema:
+                    exchange_schema = engine_ffi.unpack_schema(ex_schema_buf)
+                else:
+                    exchange_schema = view_schema
+            finally:
+                lltype.free(ex_schema_buf, flavor="raw")
+
+            pre_handle = engine_ffi._dag_execute_epoch(
+                dag_handle, target_view_id, incoming_delta._handle, source_id)
+            incoming_delta._handle = lltype.nullptr(rffi.VOIDP.TO)
+            incoming_delta.free()
+
+            if not pre_handle:
+                pre_result = ArenaZSetBatch(exchange_schema)
+            else:
+                pre_result = ArenaZSetBatch._wrap_handle(
+                    exchange_schema, pre_handle, False, False)
+
+            if skip_exchange:
+                post_handle = engine_ffi._dag_execute_post_epoch(
+                    dag_handle, target_view_id, pre_result._handle)
+                pre_result._handle = lltype.nullptr(rffi.VOIDP.TO)
                 pre_result.free()
             else:
                 exchanged = exchange_handler.do_exchange(
-                    target_view_id, pre_result
-                )
+                    target_view_id, pre_result)
                 pre_result.free()
-                out_delta = plan.exchange_post_plan.execute_epoch(exchanged)
+                post_handle = engine_ffi._dag_execute_post_epoch(
+                    dag_handle, target_view_id, exchanged._handle)
+                exchanged._handle = lltype.nullptr(rffi.VOIDP.TO)
                 exchanged.free()
-        elif plan.exchange_post_plan is not None:
-            # Single-process: pre-plan -> post-plan (no exchange needed)
-            pre_result = plan.execute_epoch(incoming_delta, source_id=source_id)
+
+            if post_handle:
+                out_delta = ArenaZSetBatch._wrap_handle(
+                    view_schema, post_handle, False, False)
+            else:
+                out_delta = None
+        elif has_exchange:
+            # Single-process with exchange: pre → post (no IPC)
+            pre_handle = engine_ffi._dag_execute_epoch(
+                dag_handle, target_view_id, incoming_delta._handle, source_id)
+            incoming_delta._handle = lltype.nullptr(rffi.VOIDP.TO)
             incoming_delta.free()
-            if pre_result is None:
-                pre_result = ArenaZSetBatch(plan.out_schema)
-            out_delta = plan.exchange_post_plan.execute_epoch(pre_result)
-            pre_result.free()
-        elif (plan.join_shard_map is not None
-              and source_id in plan.join_shard_map
-              and exchange_handler is not None):
-            # Multi-worker join: exchange raw delta by join key column
-            # BEFORE running the circuit, so all rows with the same join
-            # key land on the same worker (co-partitioning).
-            copart = (plan.co_partitioned_join_sources is not None
-                      and source_id in plan.co_partitioned_join_sources)
-            if copart:
-                # Shard col == source PK: push routing already co-partitions data.
-                out_delta = plan.execute_epoch(incoming_delta, source_id=source_id)
+            if pre_handle:
+                post_handle = engine_ffi._dag_execute_post_epoch(
+                    dag_handle, target_view_id, pre_handle)
+                if post_handle:
+                    view_family = registry.get_by_id(target_view_id)
+                    out_delta = ArenaZSetBatch._wrap_handle(
+                        view_family.schema, post_handle, False, False)
+                else:
+                    out_delta = None
+            else:
+                out_delta = None
+        elif has_join_shard and exchange_handler is not None:
+            # Multi-worker join exchange
+            copart_join = engine_ffi._dag_plan_source_co_partitioned(
+                dag_handle, target_view_id, source_id) != 0
+            if copart_join:
+                out_handle = engine_ffi._dag_execute_epoch(
+                    dag_handle, target_view_id, incoming_delta._handle, source_id)
+                incoming_delta._handle = lltype.nullptr(rffi.VOIDP.TO)
                 incoming_delta.free()
             else:
                 exchanged = exchange_handler.do_exchange(
-                    target_view_id, incoming_delta,
-                    source_id=source_id,
-                )
+                    target_view_id, incoming_delta, source_id=source_id)
                 incoming_delta.free()
-                out_delta = plan.execute_epoch(exchanged, source_id=source_id)
+                out_handle = engine_ffi._dag_execute_epoch(
+                    dag_handle, target_view_id, exchanged._handle, source_id)
+                exchanged._handle = lltype.nullptr(rffi.VOIDP.TO)
                 exchanged.free()
+            if out_handle:
+                view_family = registry.get_by_id(target_view_id)
+                out_delta = ArenaZSetBatch._wrap_handle(
+                    view_family.schema, out_handle, False, False)
+            else:
+                out_delta = None
         else:
-            out_delta = plan.execute_epoch(incoming_delta, source_id=source_id)
+            out_handle = engine_ffi._dag_execute_epoch(
+                dag_handle, target_view_id, incoming_delta._handle, source_id)
+            incoming_delta._handle = lltype.nullptr(rffi.VOIDP.TO)
             incoming_delta.free()
+            if out_handle:
+                view_family = registry.get_by_id(target_view_id)
+                out_delta = ArenaZSetBatch._wrap_handle(
+                    view_family.schema, out_handle, False, False)
+            else:
+                out_delta = None
 
         has_output = out_delta is not None and out_delta.length() > 0
         if has_output:
@@ -235,13 +323,11 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                 has_output = False
 
         # In multi-worker mode, downstream views must always be queued
-        # even with empty deltas, so every worker participates in
-        # exchange barriers. Skipping would deadlock the master.
         if has_output or exchange_handler is not None:
             dependents = dep_map.get(target_view_id, [])
             for dep_id in dependents:
                 dep_pk = _pending_key(dep_id, target_view_id)
-                if dep_pk in pending_pos:                        # O(1) lookup
+                if dep_pk in pending_pos:
                     if has_output:
                         found = pending_pos[dep_pk]
                         existing_d, existing_id, existing_sid, existing_batch = pending[found]
@@ -249,7 +335,6 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                         _op_union_merge(existing_batch, out_delta, merged)
                         existing_batch.free()
                         pending[found] = (existing_d, existing_id, existing_sid, merged)
-                        # pending_pos[dep_pk] unchanged — in-place update
                 else:
                     if not registry.has_id(dep_id):
                         continue
@@ -260,7 +345,6 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                         dep_family = registry.get_by_id(dep_id)
                         pending.append((d, dep_id, target_view_id, ArenaZSetBatch(dep_family.schema)))
                     _sort_pending_desc(pending)
-                    # All positions may have shifted — full rebuild
                     pending_pos.clear()
                     for pi in range(len(pending)):
                         ppk = _pending_key(pending[pi][1], pending[pi][2])
@@ -329,11 +413,11 @@ class ServerExecutor(object):
     Uses topological ranking to ensure glitch-free incremental evaluation.
     """
 
-    _immutable_fields_ = ["engine", "program_cache", "dispatcher"]
+    _immutable_fields_ = ["engine", "dag_handle", "dispatcher"]
 
     def __init__(self, engine, dispatcher=None):
         self.engine = engine
-        self.program_cache = engine.program_cache
+        self.dag_handle = engine.dag_handle
         self.dispatcher = dispatcher
 
         # Deferred tick tracking (multi-worker only)

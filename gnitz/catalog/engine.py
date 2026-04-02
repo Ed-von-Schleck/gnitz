@@ -8,7 +8,7 @@ from rpython.rlib.objectmodel import newlist_hint
 from gnitz.core.types import TableSchema, ColumnDefinition
 from gnitz.core.errors import LayoutError
 from gnitz.storage.owned_batch import ArenaZSetBatch
-from gnitz.catalog.program_cache import ProgramCache
+from gnitz.storage import engine_ffi
 
 from gnitz.catalog.identifiers import validate_user_identifier, parse_qualified_name
 from gnitz.catalog import system_tables as sys
@@ -45,12 +45,15 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
         bootstrap_system_tables(sys_tables, base_dir)
 
     registry = EntityRegistry()
-    program_cache = ProgramCache(registry)
+    dag_handle = engine_ffi._dag_create()
     bootstrapper = CatalogBootstrapper(registry, sys_tables, base_dir)
 
     bootstrapper.recover_system_state()
 
-    engine = Engine(base_dir, sys_tables, registry, program_cache)
+    engine = Engine(base_dir, sys_tables, registry, dag_handle)
+
+    # Set system table handles on DagEngine
+    _setup_dag_sys_tables(engine)
 
     table_hook = wire_catalog_hooks(engine)
 
@@ -60,6 +63,42 @@ def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
     table_hook.cascade_enabled = True
 
     return engine
+
+
+def _setup_dag_sys_tables(engine):
+    """Wire the 6 circuit system tables into the DagEngine."""
+    from rpython.rtyper.lltypesystem import rffi, lltype
+    st = engine.sys
+    # Pack schemas
+    s_nodes = engine_ffi.pack_schema(st.circuit_nodes.schema)
+    s_edges = engine_ffi.pack_schema(st.circuit_edges.schema)
+    s_sources = engine_ffi.pack_schema(st.circuit_sources.schema)
+    s_params = engine_ffi.pack_schema(st.circuit_params.schema)
+    s_gcols = engine_ffi.pack_schema(st.circuit_group_cols.schema)
+    s_dep = engine_ffi.pack_schema(st.view_deps.schema)
+    try:
+        engine_ffi._dag_set_sys_tables(
+            engine.dag_handle,
+            st.circuit_nodes._handle,
+            st.circuit_edges._handle,
+            st.circuit_sources._handle,
+            st.circuit_params._handle,
+            st.circuit_group_cols._handle,
+            st.view_deps._handle,
+            rffi.cast(rffi.VOIDP, s_nodes),
+            rffi.cast(rffi.VOIDP, s_edges),
+            rffi.cast(rffi.VOIDP, s_sources),
+            rffi.cast(rffi.VOIDP, s_params),
+            rffi.cast(rffi.VOIDP, s_gcols),
+            rffi.cast(rffi.VOIDP, s_dep),
+        )
+    finally:
+        lltype.free(s_nodes, flavor="raw")
+        lltype.free(s_edges, flavor="raw")
+        lltype.free(s_sources, flavor="raw")
+        lltype.free(s_params, flavor="raw")
+        lltype.free(s_gcols, flavor="raw")
+        lltype.free(s_dep, flavor="raw")
 
 
 def _validate_fk_column(
@@ -106,6 +145,48 @@ def _col_defs_from_graph(graph):
     return result
 
 
+def _validate_graph_structure(graph):
+    """Dry-run validation of a CircuitGraph before persistence."""
+    from gnitz.core import opcodes
+    if not graph.nodes:
+        raise LayoutError("View graph contains no nodes")
+    has_input = False
+    for _, table_id in graph.sources:
+        if table_id == 0:
+            has_input = True
+            break
+    if not has_input:
+        raise LayoutError("View graph missing primary input (table_id=0)")
+    has_sink = False
+    for _, opcode in graph.nodes:
+        if opcode == opcodes.OPCODE_INTEGRATE:
+            has_sink = True
+            break
+    if not has_sink:
+        raise LayoutError("View graph missing sink (INTEGRATE node)")
+    # Cycle detection via Kahn's algorithm
+    in_degree = {}
+    for nid, _ in graph.nodes:
+        in_degree[nid] = 0
+    for _, src, dst, _ in graph.edges:
+        in_degree[dst] = in_degree.get(dst, 0) + 1
+    queue = []
+    for nid, _ in graph.nodes:
+        if in_degree[nid] == 0:
+            queue.append(nid)
+    count = 0
+    while len(queue) > 0:
+        nid = queue.pop(0)
+        count += 1
+        for _, src, dst, _ in graph.edges:
+            if src == nid:
+                in_degree[dst] -= 1
+                if in_degree[dst] == 0:
+                    queue.append(dst)
+    if count != len(graph.nodes):
+        raise LayoutError("View graph contains cycles (not a DAG)")
+
+
 class Engine(object):
     """
     The Supervisor for catalog mutations.
@@ -114,15 +195,15 @@ class Engine(object):
     """
 
     _immutable_fields_ = [
-        "base_dir", "sys", "registry", "program_cache",
+        "base_dir", "sys", "registry", "dag_handle",
         "_schemas_family", "_tables_family", "_views_family", "_indices_family",
     ]
 
-    def __init__(self, base_dir, sys_tables, registry, program_cache):
+    def __init__(self, base_dir, sys_tables, registry, dag_handle):
         self.base_dir = base_dir
         self.sys = sys_tables
         self.registry = registry
-        self.program_cache = program_cache
+        self.dag_handle = dag_handle
         # Cache family references for system tables with hooks
         self._schemas_family = registry.get("_system", sys.SchemaTab.NAME)
         self._tables_family = registry.get("_system", sys.TableTab.NAME)
@@ -206,7 +287,7 @@ class Engine(object):
             raise LayoutError("View/Table already exists")
 
         # Validate graph structure (sink presence, DAG properties) before persistence.
-        self.program_cache.validate_graph_structure(graph)
+        _validate_graph_structure(graph)
 
         vid = self.registry.allocate_table_id()
         sid = self.registry.get_schema_id(schema_name)
@@ -228,7 +309,7 @@ class Engine(object):
         # 2. View dependency records
         self._write_view_deps(vid, graph.dependencies)
         self.sys.view_deps.flush()
-        self.program_cache.invalidate_dep_map()
+        engine_ffi._dag_invalidate_dep_map(self.dag_handle)
 
         # 3. Circuit graph records
         self._write_circuit_graph(vid, graph)
@@ -246,7 +327,7 @@ class Engine(object):
 
         # 5. Eagerly compile to catch schema errors at creation time.
         # The view family is already registered; the caller must drop it on failure.
-        if self.program_cache.compile_from_graph(vid) is None:
+        if not engine_ffi._dag_ensure_compiled(self.dag_handle, vid):
             raise LayoutError("View circuit schema does not match declared output columns")
 
         return self.registry.get(schema_name, view_name)
@@ -260,7 +341,7 @@ class Engine(object):
         deps = self._read_view_deps(vid)
 
         # Evict plan first
-        self.program_cache.invalidate(vid)
+        engine_ffi._dag_invalidate(self.dag_handle, vid)
 
         self._retract_view_record(
             vid, family.schema_id, view_name, "", family.directory, 0
@@ -306,7 +387,7 @@ class Engine(object):
         return self.registry.get(schema_name, table_name)
 
     def close(self):
-        self.program_cache.invalidate_all()
+        engine_ffi._dag_destroy(self.dag_handle)
         for family in self.registry.iter_families():
             if family.table_id >= sys.FIRST_USER_TABLE_ID:
                 family.close()

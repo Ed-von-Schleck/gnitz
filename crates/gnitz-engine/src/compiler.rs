@@ -230,7 +230,7 @@ const CR_PRE_ETR_COUNT: usize = 228;   // how many ext_trace_regs belong to pre-
 const CR_ERROR_CODE: usize = 230;
 
 impl CompileResult {
-    fn error(code: i32) -> Self {
+    pub fn error(code: i32) -> Self {
         let mut r = Self::empty();
         r.buf[CR_ERROR_CODE] = code as i64;
         r
@@ -251,11 +251,119 @@ impl CompileResult {
 }
 
 // ---------------------------------------------------------------------------
+// CompileOutput — typed compilation result for internal Rust consumers
+// ---------------------------------------------------------------------------
+
+/// Rich, typed output from `compile_view`.  Used directly by DagEngine to
+/// build `CachedPlan` without going through the flat i64 buffer.
+///
+/// The existing FFI path calls `to_result_buffer()` to produce the legacy
+/// `CompileResult` for RPython callers.
+pub struct CompileOutput {
+    pub pre_vm: Box<VmHandle>,
+    pub post_vm: Option<Box<VmHandle>>,
+    pub out_schema: SchemaDescriptor,
+    pub exchange_in_schema: Option<SchemaDescriptor>,
+    pub pre_num_regs: u32,
+    pub pre_in_reg: u16,
+    pub pre_out_reg: u16,
+    pub post_num_regs: u32,
+    pub post_in_reg: u16,
+    pub post_out_reg: u16,
+    pub skip_exchange: bool,
+    pub shard_cols: Vec<i32>,
+    pub source_reg_map: HashMap<i64, u16>,
+    pub join_shard_map: HashMap<i64, Vec<i32>>,
+    pub co_partitioned: HashSet<i64>,
+    pub pre_ext_trace_regs: Vec<(u16, i64)>,
+    pub post_ext_trace_regs: Vec<(u16, i64)>,
+}
+
+impl CompileOutput {
+    /// Convert to the flat i64[297] buffer expected by the existing FFI path.
+    /// **Consumes** self: VmHandle ownership transfers into the buffer as raw
+    /// pointers (freed by RPython via `gnitz_vm_program_free`).
+    pub fn to_result_buffer(self) -> CompileResult {
+        let mut result = CompileResult::empty();
+
+        result.set_pre_vm(self.pre_vm);
+        result.buf[CR_PRE_NUM_REGS] = self.pre_num_regs as i64;
+        result.buf[CR_PRE_IN_REG] = self.pre_in_reg as i64;
+        result.buf[CR_PRE_OUT_REG] = self.pre_out_reg as i64;
+
+        if let Some(post_vm) = self.post_vm {
+            result.set_post_vm(post_vm);
+            result.buf[CR_POST_NUM_REGS] = self.post_num_regs as i64;
+            result.buf[CR_POST_IN_REG] = self.post_in_reg as i64;
+            result.buf[CR_POST_OUT_REG] = self.post_out_reg as i64;
+        }
+
+        result.buf[CR_SKIP_EXCHANGE] = if self.skip_exchange { 1 } else { 0 };
+
+        // Shard cols
+        let nsc = self.shard_cols.len().min(8);
+        result.buf[CR_NUM_SHARD_COLS] = nsc as i64;
+        for (i, &sc) in self.shard_cols.iter().take(8).enumerate() {
+            result.buf[CR_SHARD_COLS + i] = sc as i64;
+        }
+
+        // Source reg map
+        let mut si = 0;
+        for (&tid, &reg) in &self.source_reg_map {
+            if si < 16 {
+                result.buf[CR_SOURCE_REG_TIDS + si] = tid;
+                result.buf[CR_SOURCE_REG_IDS + si] = reg as i64;
+                si += 1;
+            }
+        }
+        result.buf[CR_NUM_SOURCE_REGS] = si as i64;
+
+        // Join shard map
+        let mut ji = 0;
+        for (&tid, cols) in &self.join_shard_map {
+            if ji < 16 && !cols.is_empty() {
+                result.buf[CR_JSM_TIDS + ji] = tid;
+                result.buf[CR_JSM_COLS + ji] = cols[0] as i64;
+                ji += 1;
+            }
+        }
+        result.buf[CR_NUM_JSM] = ji as i64;
+
+        // Co-partitioned
+        let mut ci = 0;
+        for &tid in self.co_partitioned.iter() {
+            if ci < 16 {
+                result.buf[CR_COP_TIDS + ci] = tid;
+                ci += 1;
+            }
+        }
+        result.buf[CR_NUM_COP] = ci as i64;
+
+        // Ext trace regs
+        let pre_etr_count = self.pre_ext_trace_regs.len();
+        populate_ext_trace_regs(&mut result, &self.pre_ext_trace_regs, &self.post_ext_trace_regs);
+        result.buf[CR_PRE_ETR_COUNT] = pre_etr_count as i64;
+
+        // Exchange schema
+        if let Some(ref ex_schema) = self.exchange_in_schema {
+            result.buf[231] = ex_schema.num_columns as i64;
+            result.buf[232] = ex_schema.pk_index as i64;
+            for i in 0..ex_schema.num_columns as usize {
+                let c = &ex_schema.columns[i];
+                result.buf[233 + i] = ((c.type_code as i64) << 16) | ((c.size as i64) << 8) | (c.nullable as i64);
+            }
+        }
+
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
 // System table reading
 // ---------------------------------------------------------------------------
 
 /// Read an i64 value from a cursor's current row at the given column index.
-fn cursor_read_i64(cursor: &crate::read_cursor::ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> i64 {
+pub fn cursor_read_i64(cursor: &crate::read_cursor::ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> i64 {
     let col_size = schema.columns[col_idx].size as usize;
     let ptr = cursor.col_ptr(col_idx, col_size);
     if ptr.is_null() {
@@ -828,7 +936,7 @@ fn opt_fold_reduce_map(
 // Schema construction helpers
 // ---------------------------------------------------------------------------
 
-fn empty_schema() -> SchemaDescriptor {
+pub fn empty_schema() -> SchemaDescriptor {
     SchemaDescriptor {
         num_columns: 0,
         pk_index: 0,
@@ -1921,8 +2029,9 @@ fn build_plan(
 // Top-level compile_view entry point
 // ---------------------------------------------------------------------------
 
-/// Compile a circuit for a single view. This is the Rust replacement for
-/// `ProgramCache.compile_from_graph()`.
+/// Compile a circuit for a single view.  Returns a rich `CompileOutput`
+/// that DagEngine can consume directly, or that the FFI path can convert
+/// to a flat buffer via `to_result_buffer()`.
 ///
 /// # Safety
 /// All table handles must be valid pointers or null.
@@ -1948,13 +2057,11 @@ pub unsafe fn compile_view(
     view_schema: &SchemaDescriptor,
     // External table registry
     ext_tables: &[ExternalTable],
-) -> CompileResult {
-    let mut result = CompileResult::empty();
-
+) -> Result<CompileOutput, i32> {
     // 1. Load circuit data from system tables
     let nodes = load_nodes(sys_nodes, view_id, sys_nodes_schema);
     if nodes.is_empty() {
-        return CompileResult::error(-1);
+        return Err(-1);
     }
     let edges = load_edges(sys_edges, view_id, sys_edges_schema);
     let sources = load_sources(sys_sources, view_id, sys_sources_schema);
@@ -1978,7 +2085,7 @@ pub unsafe fn compile_view(
         consumers: HashMap::new(),
     };
     if topo_sort(&mut graph).is_err() {
-        return CompileResult::error(-2); // cycle
+        return Err(-2); // cycle
     }
     // 3. Annotate
     let ann = annotate(&graph, sys_dep, sys_dep_schema, ext_tables);
@@ -2045,45 +2152,28 @@ pub unsafe fn compile_view(
             split_fold_programs(rw, owned_expr_progs_for_rw, &pre_nids);
 
         // Build pre-plan (output is the exchange input node's register)
-        let pre_result = build_plan(
+        let pre = build_plan(
             &graph, &ann, &rw_pre, &pre_ordered, ext_tables,
             view_dir, view_table_id, view_id, &ann.in_schema,
             if exchange_input_nid >= 0 { Some(exchange_input_nid) } else { None },
-            None, // no exchange_input (this IS the pre-plan)
+            None,
             pre_progs,
-        );
-        let pre = match pre_result {
-            Some(p) => p,
-            None => return CompileResult::error(-3),
-        };
+        ).ok_or(-3)?;
 
         // Exchange schema = pre-plan output schema
         if pre.out_reg < 0 || pre.out_reg as usize >= pre.vm.program.reg_meta.len() {
-            return CompileResult::error(-3);
+            return Err(-3);
         }
         let exchange_schema = pre.vm.program.reg_meta[pre.out_reg as usize].schema;
-        // Store exchange schema in result buffer
-        result.buf[231] = exchange_schema.num_columns as i64;
-        result.buf[232] = exchange_schema.pk_index as i64;
-        for i in 0..exchange_schema.num_columns as usize {
-            let c = &exchange_schema.columns[i];
-            result.buf[233 + i] = ((c.type_code as i64) << 16) | ((c.size as i64) << 8) | (c.nullable as i64);
-        }
 
         // Build post-plan
-        // Post-plan needs a fresh register namespace — re-assign registers
-        // starting from 0 for post_ordered nodes, plus an input register
-        let post_result = build_plan(
+        let post = build_plan(
             &graph, &ann, &rw_post, &post_ordered, ext_tables,
             view_dir, view_table_id, view_id, &exchange_schema,
-            None, // output_node_id: post-plan has an explicit INTEGRATE sink
-            Some((ex_nid, exchange_schema)), // exchange_input: map exchange → input reg
-            post_progs, // fold_reduce_map expr progs for post-plan
-        );
-        let post = match post_result {
-            Some(p) => p,
-            None => return CompileResult::error(-4),
-        };
+            None,
+            Some((ex_nid, exchange_schema)),
+            post_progs,
+        ).ok_or(-4)?;
 
         // Determine skip_exchange
         let is_trivial = pre.in_reg == pre.out_reg
@@ -2092,118 +2182,60 @@ pub unsafe fn compile_view(
             && shard_cols.len() == 1
             && shard_cols[0] == ann.in_schema.pk_index as i32;
 
-        result.set_pre_vm(pre.vm);
-        result.set_post_vm(post.vm);
-        result.buf[CR_PRE_NUM_REGS] = pre.num_regs as i64;
-        result.buf[CR_POST_NUM_REGS] = post.num_regs as i64;
-        result.buf[CR_PRE_IN_REG] = pre.in_reg as i64;
-        result.buf[CR_PRE_OUT_REG] = pre.out_reg as i64;
-        result.buf[CR_POST_IN_REG] = post.in_reg as i64;
-        result.buf[CR_POST_OUT_REG] = post.out_reg as i64;
-        result.buf[CR_SKIP_EXCHANGE] = if skip_exchange { 1 } else { 0 };
+        let source_reg_map = pre.source_reg_map.iter()
+            .map(|(&tid, &reg)| (tid, reg as u16)).collect();
 
-        // Shard cols
-        let nsc = shard_cols.len().min(8);
-        result.buf[CR_NUM_SHARD_COLS] = nsc as i64;
-        for (i, &sc) in shard_cols.iter().take(8).enumerate() {
-            result.buf[CR_SHARD_COLS + i] = sc as i64;
-        }
-
-        // Source reg map from pre-plan (for multi-input join circuits)
-        let mut si = 0;
-        for (&tid, &reg) in &pre.source_reg_map {
-            if si < 16 {
-                result.buf[CR_SOURCE_REG_TIDS + si] = tid;
-                result.buf[CR_SOURCE_REG_IDS + si] = reg as i64;
-                si += 1;
-            }
-        }
-        result.buf[CR_NUM_SOURCE_REGS] = si as i64;
-
-        // Join shard map
-        let mut ji = 0;
-        for (&tid, cols) in &ann.join_shard_map {
-            if ji < 16 && !cols.is_empty() {
-                result.buf[CR_JSM_TIDS + ji] = tid;
-                result.buf[CR_JSM_COLS + ji] = cols[0] as i64;
-                ji += 1;
-            }
-        }
-        result.buf[CR_NUM_JSM] = ji as i64;
-
-        // Co-partitioned
-        let mut ci = 0;
-        for &tid in ann.co_partitioned.iter() {
-            if ci < 16 {
-                result.buf[CR_COP_TIDS + ci] = tid;
-                ci += 1;
-            }
-        }
-        result.buf[CR_NUM_COP] = ci as i64;
-
-        // Ext trace regs: pre-plan's go first, then post-plan's.
-        // Store the count of pre-plan ext_trace_regs separately so Python can split them.
-        let pre_etr_count = pre.ext_trace_regs.len();
-        populate_ext_trace_regs(&mut result, &pre.ext_trace_regs, &post.ext_trace_regs);
-        // Use slot CR_ERROR_CODE - 1 (=229) to store pre_etr_count
-        result.buf[CR_PRE_ETR_COUNT] = pre_etr_count as i64;
+        Ok(CompileOutput {
+            pre_vm: pre.vm,
+            post_vm: Some(post.vm),
+            out_schema: graph.out_schema,
+            exchange_in_schema: Some(exchange_schema),
+            pre_num_regs: pre.num_regs,
+            pre_in_reg: pre.in_reg as u16,
+            pre_out_reg: pre.out_reg as u16,
+            post_num_regs: post.num_regs,
+            post_in_reg: post.in_reg as u16,
+            post_out_reg: post.out_reg as u16,
+            skip_exchange,
+            shard_cols,
+            source_reg_map,
+            join_shard_map: ann.join_shard_map,
+            co_partitioned: ann.co_partitioned,
+            pre_ext_trace_regs: pre.ext_trace_regs,
+            post_ext_trace_regs: post.ext_trace_regs,
+        })
     } else {
         // Single plan (no exchange)
-        let plan_result = build_plan(
+        let plan = build_plan(
             &graph, &ann, &rw, &graph.ordered.clone(), ext_tables,
             view_dir, view_table_id, view_id, &ann.in_schema,
             None, None,
-            owned_expr_progs_for_rw, // fold_reduce_map expr progs
-        );
-        let plan = match plan_result {
-            Some(p) => p,
-            None => return CompileResult::error(-5),
-        };
+            owned_expr_progs_for_rw,
+        ).ok_or(-5)?;
 
-        result.set_pre_vm(plan.vm);
-        result.buf[CR_PRE_NUM_REGS] = plan.num_regs as i64;
-        result.buf[CR_PRE_IN_REG] = plan.in_reg as i64;
-        result.buf[CR_PRE_OUT_REG] = plan.out_reg as i64;
+        let source_reg_map = plan.source_reg_map.iter()
+            .map(|(&tid, &reg)| (tid, reg as u16)).collect();
 
-        // Source reg map
-        let mut si = 0;
-        for (&tid, &reg) in &plan.source_reg_map {
-            if si < 16 {
-                result.buf[CR_SOURCE_REG_TIDS + si] = tid;
-                result.buf[CR_SOURCE_REG_IDS + si] = reg as i64;
-                si += 1;
-            }
-        }
-        result.buf[CR_NUM_SOURCE_REGS] = si as i64;
-
-        // Join shard map
-        let mut ji = 0;
-        for (&tid, cols) in &ann.join_shard_map {
-            if ji < 16 && !cols.is_empty() {
-                result.buf[CR_JSM_TIDS + ji] = tid;
-                result.buf[CR_JSM_COLS + ji] = cols[0] as i64;
-                ji += 1;
-            }
-        }
-        result.buf[CR_NUM_JSM] = ji as i64;
-
-        // Co-partitioned
-        let mut ci = 0;
-        for &tid in ann.co_partitioned.iter() {
-            if ci < 16 {
-                result.buf[CR_COP_TIDS + ci] = tid;
-                ci += 1;
-            }
-        }
-        result.buf[CR_NUM_COP] = ci as i64;
-
-        // Ext trace regs (all belong to the single/pre plan)
-        let etr_count = plan.ext_trace_regs.len();
-        populate_ext_trace_regs(&mut result, &plan.ext_trace_regs, &[]);
-        result.buf[CR_PRE_ETR_COUNT] = etr_count as i64;
+        Ok(CompileOutput {
+            pre_vm: plan.vm,
+            post_vm: None,
+            out_schema: graph.out_schema,
+            exchange_in_schema: None,
+            pre_num_regs: plan.num_regs,
+            pre_in_reg: plan.in_reg as u16,
+            pre_out_reg: plan.out_reg as u16,
+            post_num_regs: 0,
+            post_in_reg: 0,
+            post_out_reg: 0,
+            skip_exchange: false,
+            shard_cols: Vec::new(),
+            source_reg_map,
+            join_shard_map: ann.join_shard_map,
+            co_partitioned: ann.co_partitioned,
+            pre_ext_trace_regs: plan.ext_trace_regs,
+            post_ext_trace_regs: Vec::new(),
+        })
     }
-
-    result
 }
 
 fn populate_ext_trace_regs(result: &mut CompileResult, pre: &[(u16, i64)], post: &[(u16, i64)]) {

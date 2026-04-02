@@ -26,21 +26,24 @@ from gnitz.server.worker import WorkerProcess
 
 def _backfill_exchange_views(engine, dispatcher):
     """Issue fan_out_backfill for every exchange-requiring view."""
+    from rpython.rtyper.lltypesystem import lltype
     for family in engine.registry.iter_families():
         vid = family.table_id
         if vid < sys.FIRST_USER_TABLE_ID:
             continue
-        plan = engine.program_cache.get_program(vid)
-        if plan is None:
+        if not engine_ffi._dag_view_needs_exchange(engine.dag_handle, vid):
             continue
-        if plan.exchange_post_plan is None and plan.join_shard_map is None:
-            continue
-        source_ids = engine.program_cache.get_source_ids(vid)
-        for source_id in source_ids:
-            if not engine.registry.has_id(source_id):
-                continue
-            src_family = engine.registry.get_by_id(source_id)
-            dispatcher.fan_out_backfill(vid, source_id, src_family.schema)
+        out_buf = lltype.malloc(rffi.LONGLONGP.TO, 64, flavor="raw")
+        try:
+            n = engine_ffi._dag_get_source_ids(engine.dag_handle, vid, out_buf, 64)
+            for si in range(intmask(n)):
+                source_id = intmask(out_buf[si])
+                if not engine.registry.has_id(source_id):
+                    continue
+                src_family = engine.registry.get_by_id(source_id)
+                dispatcher.fan_out_backfill(vid, source_id, src_family.schema)
+        finally:
+            lltype.free(out_buf, flavor="raw")
 
 HELP_TEXT = (
     "gnitz-server — GnitzDB database server\n"
@@ -278,7 +281,7 @@ def entry_point(argv):
             # SAL recovery — replay unflushed push data
             _recover_from_sal(sal_ptr, engine, w)
 
-            engine.program_cache.invalidate_all()
+            engine_ffi._dag_invalidate_all(engine.dag_handle)
 
             os.write(
                 1,
@@ -303,7 +306,7 @@ def entry_point(argv):
     engine.registry.active_part_end = 0
 
     dispatcher = MasterDispatcher(num_workers, worker_pids,
-                                   assignment, engine.program_cache,
+                                   assignment, engine.dag_handle, engine.registry,
                                    sal, w2m_regions, m2w_efds, w2m_efds)
 
     # Wait for all workers to complete recovery and signal readiness

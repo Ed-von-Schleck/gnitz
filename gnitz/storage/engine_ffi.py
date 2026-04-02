@@ -427,6 +427,63 @@ eci = ExternalCompilationInfo(
         "  char **out_ptr, uint32_t *out_len);",
         "void *gnitz_ipc_decode_result_take_batch(void *handle);",
         "void gnitz_ipc_decode_result_free(void *handle);",
+        # DagEngine lifecycle
+        "void *gnitz_dag_create(void);",
+        "void gnitz_dag_destroy(void *handle);",
+        "void gnitz_dag_set_sys_tables("
+        "  void *handle,"
+        "  void *h_nodes, void *h_edges, void *h_sources,"
+        "  void *h_params, void *h_gcols, void *h_dep,"
+        "  const void *s_nodes, const void *s_edges,"
+        "  const void *s_sources, const void *s_params,"
+        "  const void *s_gcols, const void *s_dep);",
+        # DagEngine table registry
+        "void gnitz_dag_register_table("
+        "  void *handle, int64_t table_id, void *store_handle,"
+        "  const void *schema, int32_t depth, int32_t unique_pk,"
+        "  int32_t is_partitioned, const char *directory);",
+        "void gnitz_dag_unregister_table(void *handle, int64_t table_id);",
+        "void gnitz_dag_set_depth(void *handle, int64_t table_id, int32_t depth);",
+        "void gnitz_dag_add_index_circuit("
+        "  void *handle, int64_t table_id, uint32_t col_idx,"
+        "  void *idx_handle, const void *idx_schema, int32_t is_unique);",
+        "void gnitz_dag_remove_index_circuit("
+        "  void *handle, int64_t table_id, uint32_t col_idx);",
+        # DagEngine cache
+        "void gnitz_dag_invalidate(void *handle, int64_t view_id);",
+        "void gnitz_dag_invalidate_all(void *handle);",
+        "void gnitz_dag_invalidate_dep_map(void *handle);",
+        # DagEngine evaluate + execute
+        "int32_t gnitz_dag_evaluate(void *handle, int64_t source_id, void *delta);",
+        "void *gnitz_dag_execute_epoch("
+        "  void *handle, int64_t view_id, void *input, int64_t source_id);",
+        "int32_t gnitz_dag_ingest(void *handle, int64_t table_id, void *batch);",
+        "int32_t gnitz_dag_flush(void *handle, int64_t table_id);",
+        # DagEngine metadata queries
+        "int32_t gnitz_dag_get_dep_map(void *handle, int64_t *out_pairs, uint32_t max_pairs);",
+        "int32_t gnitz_dag_get_shard_cols(void *handle, int64_t view_id, int32_t *out_cols, uint32_t max);",
+        "int32_t gnitz_dag_get_exchange_info("
+        "  void *handle, int64_t view_id, int32_t *out_cols, uint32_t max,"
+        "  int32_t *out_trivial, int32_t *out_copart);",
+        "int32_t gnitz_dag_get_source_ids(void *handle, int64_t view_id, int64_t *out_ids, uint32_t max);",
+        "int32_t gnitz_dag_get_preloadable_views("
+        "  void *handle, int64_t src_tid, int64_t *out_vids, int32_t *out_cols, uint32_t max);",
+        "int32_t gnitz_dag_get_join_shard_cols("
+        "  void *handle, int64_t view_id, int64_t source_id,"
+        "  int32_t *out_cols, uint32_t max);",
+        "int32_t gnitz_dag_get_exchange_schema("
+        "  void *handle, int64_t view_id, void *out_schema);",
+        "int32_t gnitz_dag_ensure_compiled(void *handle, int64_t view_id);",
+        "int32_t gnitz_dag_view_needs_exchange(void *handle, int64_t view_id);",
+        "void *gnitz_dag_execute_post_epoch("
+        "  void *handle, int64_t view_id, void *input);",
+        "int32_t gnitz_dag_plan_source_co_partitioned("
+        "  void *handle, int64_t view_id, int64_t source_id);",
+        "int32_t gnitz_dag_validate_graph("
+        "  void *handle,"
+        "  const int32_t *nodes_ptr, uint32_t nodes_count,"
+        "  const int32_t *edges_ptr, uint32_t edges_count,"
+        "  const int64_t *sources_ptr, uint32_t sources_count);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -620,6 +677,23 @@ def pack_schema(schema):
         buf[base + 2] = chr(1 if col.is_nullable else 0)
         ci += 1
     return buf
+
+
+def unpack_schema(buf):
+    """Unpack a C SchemaDescriptor buffer into a TableSchema."""
+    from gnitz.core.types import TableSchema, ColumnDefinition, FieldType
+    from rpython.rlib.rarithmetic import intmask
+    num_cols = intmask(rffi.cast(rffi.UINTP, buf)[0])
+    pk_index = intmask(rffi.cast(rffi.UINTP, rffi.ptradd(buf, 4))[0])
+    cols = []
+    for ci in range(num_cols):
+        base = 8 + ci * 4
+        type_code = ord(buf[base])
+        size = ord(buf[base + 1])
+        nullable = ord(buf[base + 2]) != 0
+        ft = FieldType(type_code, size, size)
+        cols.append(ColumnDefinition(ft, is_nullable=nullable, name="c%d" % ci))
+    return TableSchema(cols, pk_index=pk_index)
 
 
 # ---------------------------------------------------------------------------
@@ -1960,5 +2034,189 @@ _ipc_decode_result_free = rffi.llexternal(
     "gnitz_ipc_decode_result_free",
     [rffi.VOIDP],
     lltype.Void,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# DagEngine FFI
+# ---------------------------------------------------------------------------
+
+_dag_create = rffi.llexternal(
+    "gnitz_dag_create", [], rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_dag_destroy = rffi.llexternal(
+    "gnitz_dag_destroy", [rffi.VOIDP], lltype.Void,
+    compilation_info=eci,
+)
+
+_dag_set_sys_tables = rffi.llexternal(
+    "gnitz_dag_set_sys_tables",
+    [rffi.VOIDP,
+     rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,
+     rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,
+     rffi.VOIDP, rffi.VOIDP,
+     rffi.VOIDP, rffi.VOIDP,
+     rffi.VOIDP, rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_dag_register_table = rffi.llexternal(
+    "gnitz_dag_register_table",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP,
+     rffi.VOIDP, rffi.INT, rffi.INT, rffi.INT, rffi.CCHARP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_dag_unregister_table = rffi.llexternal(
+    "gnitz_dag_unregister_table",
+    [rffi.VOIDP, rffi.LONGLONG],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_dag_set_depth = rffi.llexternal(
+    "gnitz_dag_set_depth",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.INT],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_dag_add_index_circuit = rffi.llexternal(
+    "gnitz_dag_add_index_circuit",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT, rffi.VOIDP, rffi.VOIDP, rffi.INT],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_dag_remove_index_circuit = rffi.llexternal(
+    "gnitz_dag_remove_index_circuit",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_dag_invalidate = rffi.llexternal(
+    "gnitz_dag_invalidate",
+    [rffi.VOIDP, rffi.LONGLONG],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_dag_invalidate_all = rffi.llexternal(
+    "gnitz_dag_invalidate_all", [rffi.VOIDP], lltype.Void,
+    compilation_info=eci,
+)
+
+_dag_invalidate_dep_map = rffi.llexternal(
+    "gnitz_dag_invalidate_dep_map", [rffi.VOIDP], lltype.Void,
+    compilation_info=eci,
+)
+
+_dag_evaluate = rffi.llexternal(
+    "gnitz_dag_evaluate",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_execute_epoch = rffi.llexternal(
+    "gnitz_dag_execute_epoch",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP, rffi.LONGLONG],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_dag_ingest = rffi.llexternal(
+    "gnitz_dag_ingest",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_flush = rffi.llexternal(
+    "gnitz_dag_flush",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_get_dep_map = rffi.llexternal(
+    "gnitz_dag_get_dep_map",
+    [rffi.VOIDP, rffi.LONGLONGP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_get_shard_cols = rffi.llexternal(
+    "gnitz_dag_get_shard_cols",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.INTP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_get_exchange_info = rffi.llexternal(
+    "gnitz_dag_get_exchange_info",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.INTP, rffi.UINT, rffi.INTP, rffi.INTP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_get_source_ids = rffi.llexternal(
+    "gnitz_dag_get_source_ids",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.LONGLONGP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_get_preloadable_views = rffi.llexternal(
+    "gnitz_dag_get_preloadable_views",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.LONGLONGP, rffi.INTP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_get_join_shard_cols = rffi.llexternal(
+    "gnitz_dag_get_join_shard_cols",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.LONGLONG, rffi.INTP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_get_exchange_schema = rffi.llexternal(
+    "gnitz_dag_get_exchange_schema",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_ensure_compiled = rffi.llexternal(
+    "gnitz_dag_ensure_compiled",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_view_needs_exchange = rffi.llexternal(
+    "gnitz_dag_view_needs_exchange",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_dag_execute_post_epoch = rffi.llexternal(
+    "gnitz_dag_execute_post_epoch",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_dag_plan_source_co_partitioned = rffi.llexternal(
+    "gnitz_dag_plan_source_co_partitioned",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.LONGLONG],
+    rffi.INT,
     compilation_info=eci,
 )
