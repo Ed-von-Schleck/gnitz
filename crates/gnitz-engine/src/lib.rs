@@ -26,4 +26,5 @@ pub mod compiler;
 pub mod dag;
 pub mod ipc_sys;
 pub mod ipc;
+pub mod catalog;
 pub mod ffi;

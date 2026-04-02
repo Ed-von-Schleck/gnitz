@@ -153,7 +153,7 @@ pub struct DagEngine {
     dep_map_valid: bool,
     shard_cols_cache: HashMap<i64, Vec<i32>>,
     exchange_info_cache: HashMap<i64, ExchangeInfo>,
-    tables: HashMap<i64, TableEntry>,
+    pub(crate) tables: HashMap<i64, TableEntry>,
     sys: SysTableRefs,
 }
 
@@ -1227,7 +1227,7 @@ impl DagEngine {
 
     /// Batch-level index projection (pure Rust, no FFI).
     /// Port of `gnitz_batch_project_index` logic.
-    fn batch_project_index(
+    pub(crate) fn batch_project_index(
         src: &OwnedBatch,
         source_col_idx: u32,
         src_schema: &SchemaDescriptor,
