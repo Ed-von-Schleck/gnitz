@@ -10,7 +10,8 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi
 
 from gnitz import log
-from gnitz.server import ipc, eventfd_ffi
+from gnitz.server import ipc
+from gnitz.storage import engine_ffi
 from gnitz.core import errors
 from gnitz.storage import mmap_posix
 from gnitz.core.batch import ArenaZSetBatch
@@ -46,10 +47,10 @@ class WorkerExchangeHandler(object):
             self.wp.w2m_region, view_id, batch, schema,
             ipc.FLAG_EXCHANGE, source_id, 0, 0, 0, "",
         )
-        eventfd_ffi.eventfd_signal(self.wp.w2m_efd)
+        engine_ffi.eventfd_signal(self.wp.w2m_efd)
 
         while True:
-            eventfd_ffi.eventfd_wait(self.wp.m2w_efd, 30000)
+            engine_ffi.eventfd_wait(self.wp.m2w_efd, 30000)
             size = intmask(ipc.atomic_load_u64(
                 rffi.ptradd(self.wp.sal_ptr, self.wp.read_cursor)))
             if size == 0:
@@ -100,7 +101,7 @@ class WorkerProcess(object):
         # Signal master that recovery is complete and we are ready
         self._send_ack(0)
         while True:
-            ready = eventfd_ffi.eventfd_wait(self.m2w_efd, 1000)
+            ready = engine_ffi.eventfd_wait(self.m2w_efd, 1000)
             if ready == 0:
                 # Timeout — check for master crash via getppid
                 if os.getppid() != self.master_pid:
@@ -273,17 +274,17 @@ class WorkerProcess(object):
     def _send_ack(self, target_id, flags=0):
         ipc.write_to_w2m(self.w2m_region, target_id, None, None, flags,
                          0, 0, 0, 0, "")
-        eventfd_ffi.eventfd_signal(self.w2m_efd)
+        engine_ffi.eventfd_signal(self.w2m_efd)
 
     def _send_response(self, target_id, result, schema):
         ipc.write_to_w2m(self.w2m_region, target_id, result, schema, 0,
                          0, 0, 0, 0, "")
-        eventfd_ffi.eventfd_signal(self.w2m_efd)
+        engine_ffi.eventfd_signal(self.w2m_efd)
 
     def _send_error(self, error_msg):
         ipc.write_to_w2m(self.w2m_region, 0, None, None, 0,
                          0, 0, 0, ipc.STATUS_ERROR, error_msg)
-        eventfd_ffi.eventfd_signal(self.w2m_efd)
+        engine_ffi.eventfd_signal(self.w2m_efd)
 
     # -----------------------------------------------------------------------
     # Request handlers (unchanged from socket transport)

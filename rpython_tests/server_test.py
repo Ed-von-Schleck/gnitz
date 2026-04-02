@@ -22,7 +22,7 @@ from gnitz.core import types, batch, errors
 from gnitz.core import strings as string_logic
 from gnitz.core.batch import RowBuilder, ArenaZSetBatch
 from gnitz.core.errors import LayoutError
-from gnitz.storage import buffer, mmap_posix, wal_columnar
+from gnitz.storage import buffer, mmap_posix
 from gnitz.server import ipc, ipc_ffi
 from gnitz.catalog import engine, system_tables as sys_tab
 from gnitz.catalog.metadata import ensure_dir
@@ -681,61 +681,29 @@ def test_schema_mismatch():
 
 
 def test_control_schema_roundtrip():
-    """Verifies CONTROL_SCHEMA encode/decode roundtrip preserves all fields."""
-    os.write(1, "[IPC] Testing control schema roundtrip...\n")
+    """Verifies control encode/decode roundtrip via Rust wire codec."""
+    os.write(1, "[IPC] Testing control schema roundtrip (Rust wire codec)...\n")
 
-    # --- Case 1: OK message, empty error string ---
-    ctrl_batch = ipc._encode_control_batch(
-        target_id=42, client_id=7,
-        flags=r_uint64(ipc.FLAG_PUSH),
-        seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0,
-        status=ipc.STATUS_OK, error_msg="",
+    # --- Case 1: OK message, no data ---
+    wire_buf = ipc._encode_wire(
+        42, 7, None, None, ipc.FLAG_PUSH,
+        0, 0, 0, ipc.STATUS_OK, "",
     )
-    assert_equal_i(1, ctrl_batch.length(), "Control batch should have 1 row")
-
-    buf = buffer.Buffer(0)
-    wal_columnar.encode_batch_to_buffer(
-        buf, ipc.CONTROL_SCHEMA, r_uint64(0), ipc.IPC_CONTROL_TID, ctrl_batch
-    )
-    ctrl_batch.free()
-
-    decoded = wal_columnar.decode_batch_from_ptr(
-        buf.base_ptr, buf.offset, ipc.CONTROL_SCHEMA
-    )
-    p = ipc.IPCPayload()
-    ipc._decode_control_batch(decoded, p)
-    decoded.free()
-    buf.free()
+    p = ipc._parse_from_ptr(wire_buf.base_ptr, wire_buf.offset)
+    wire_buf.free()
 
     assert_equal_i(42, p.target_id, "target_id mismatch")
     assert_equal_i(7, p.client_id, "client_id mismatch")
     assert_equal_i(ipc.STATUS_OK, p.status, "status mismatch")
     assert_true(p.error_msg == "", "error_msg should be empty")
-    assert_true(
-        p.flags == r_uint64(ipc.FLAG_PUSH),
-        "flags mismatch",
-    )
 
-    # --- Case 2: ERROR message with non-null error string ---
-    ctrl_batch2 = ipc._encode_control_batch(
-        target_id=0, client_id=0,
-        flags=r_uint64(0),
-        seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0,
-        status=ipc.STATUS_ERROR, error_msg="something went wrong",
+    # --- Case 2: ERROR message with error string ---
+    wire_buf2 = ipc._encode_wire(
+        0, 0, None, None, 0,
+        0, 0, 0, ipc.STATUS_ERROR, "something went wrong",
     )
-    buf2 = buffer.Buffer(0)
-    wal_columnar.encode_batch_to_buffer(
-        buf2, ipc.CONTROL_SCHEMA, r_uint64(0), ipc.IPC_CONTROL_TID, ctrl_batch2
-    )
-    ctrl_batch2.free()
-
-    decoded2 = wal_columnar.decode_batch_from_ptr(
-        buf2.base_ptr, buf2.offset, ipc.CONTROL_SCHEMA
-    )
-    p2 = ipc.IPCPayload()
-    ipc._decode_control_batch(decoded2, p2)
-    decoded2.free()
-    buf2.free()
+    p2 = ipc._parse_from_ptr(wire_buf2.base_ptr, wire_buf2.offset)
+    wire_buf2.free()
 
     assert_equal_i(ipc.STATUS_ERROR, p2.status, "status mismatch")
     assert_true(

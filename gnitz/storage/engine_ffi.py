@@ -363,6 +363,62 @@ eci = ExternalCompilationInfo(
         "  const uint32_t *col_specs_flat, const uint32_t *spec_lengths,"
         "  uint32_t num_specs, const void *schema_desc, uint32_t num_workers,"
         "  void **out_handles);",
+        # IPC syscall wrappers (ipc_sys.rs)
+        "int32_t gnitz_eventfd_create(void);",
+        "int32_t gnitz_eventfd_signal(int32_t efd);",
+        "int32_t gnitz_eventfd_wait(int32_t efd, int32_t timeout_ms);",
+        "int32_t gnitz_eventfd_wait_any(const int32_t *efds, int32_t n, int32_t timeout_ms);",
+        "int32_t gnitz_fallocate(int32_t fd, int64_t length);",
+        "int32_t gnitz_try_set_nocow(int32_t fd);",
+        "int32_t gnitz_fdatasync(int32_t fd);",
+        # IPC atomics + SAL/W2M transport (ipc.rs)
+        "uint64_t gnitz_atomic_load_u64(const uint8_t *ptr);",
+        "void gnitz_atomic_store_u64(uint8_t *ptr, uint64_t val);",
+        # SAL write: returns struct {int32_t status; uint64_t new_cursor;}
+        # We call it and read the two fields via a raw buffer.
+        "int32_t gnitz_sal_write_group("
+        "  uint8_t *sal_ptr, uint64_t write_cursor,"
+        "  uint32_t num_workers, uint32_t target_id,"
+        "  uint64_t lsn, uint32_t flags, uint32_t epoch,"
+        "  uint64_t mmap_size,"
+        "  const uint8_t **worker_ptrs, const uint32_t *worker_sizes);",
+        # SAL read: we use the FFI struct via raw pointer access
+        "int32_t gnitz_sal_read_group_header("
+        "  const uint8_t *sal_ptr, uint64_t read_cursor, uint32_t worker_id);",
+        # W2M
+        "int64_t gnitz_w2m_write("
+        "  uint8_t *region_ptr, const uint8_t *data_ptr,"
+        "  uint32_t data_size, uint64_t region_size);",
+        "uint64_t gnitz_w2m_read("
+        "  const uint8_t *region_ptr, uint64_t read_cursor,"
+        "  const uint8_t **out_data_ptr, uint32_t *out_data_size);",
+        # IPC wire protocol (ipc.rs)
+        # Note: use char* instead of uint8_t* for RPython CCHARP compatibility
+        "int32_t gnitz_ipc_encode_wire("
+        "  uint64_t target_id, uint64_t client_id, uint64_t flags,"
+        "  uint64_t seek_pk_lo, uint64_t seek_pk_hi, uint64_t seek_col_idx,"
+        "  uint32_t status,"
+        "  const char *error_msg_ptr, uint32_t error_msg_len,"
+        "  const void *schema_desc,"
+        "  char **col_names_ptr, const uint32_t *col_names_len,"
+        "  uint32_t num_col_names,"
+        "  const void *batch_handle,"
+        "  char **out_ptr, uint32_t *out_len);",
+        "void gnitz_ipc_wire_free(char *ptr, uint32_t len);",
+        "void *gnitz_ipc_decode_wire("
+        "  const char *data_ptr, uint32_t data_size,"
+        "  uint32_t *out_status, uint64_t *out_client_id,"
+        "  uint64_t *out_target_id, uint64_t *out_flags,"
+        "  uint64_t *out_seek_pk_lo, uint64_t *out_seek_pk_hi,"
+        "  uint64_t *out_seek_col_idx,"
+        "  char **out_error_msg_ptr, uint32_t *out_error_msg_len,"
+        "  void *out_schema_desc, int32_t *out_has_schema,"
+        "  void **out_batch_handle, uint32_t *out_num_col_names);",
+        "int32_t gnitz_ipc_decode_result_col_name("
+        "  const void *handle, uint32_t col_idx,"
+        "  char **out_ptr, uint32_t *out_len);",
+        "void *gnitz_ipc_decode_result_take_batch(void *handle);",
+        "void gnitz_ipc_decode_result_free(void *handle);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -1704,5 +1760,193 @@ _multi_scatter = rffi.llexternal(
     "gnitz_multi_scatter",
     [rffi.VOIDP, rffi.UINTP, rffi.UINTP, rffi.UINT, rffi.VOIDP, rffi.UINT, rffi.VOIDPP],
     rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# IPC syscall wrappers (ipc_sys.rs)
+# ---------------------------------------------------------------------------
+
+_eventfd_create = rffi.llexternal(
+    "gnitz_eventfd_create", [], rffi.INT,
+    compilation_info=eci,
+)
+
+_eventfd_signal = rffi.llexternal(
+    "gnitz_eventfd_signal", [rffi.INT], rffi.INT,
+    compilation_info=eci,
+)
+
+_eventfd_wait = rffi.llexternal(
+    "gnitz_eventfd_wait", [rffi.INT, rffi.INT], rffi.INT,
+    compilation_info=eci,
+)
+
+_eventfd_wait_any = rffi.llexternal(
+    "gnitz_eventfd_wait_any", [rffi.INTP, rffi.INT, rffi.INT], rffi.INT,
+    compilation_info=eci,
+)
+
+_fallocate = rffi.llexternal(
+    "gnitz_fallocate", [rffi.INT, rffi.LONGLONG], rffi.INT,
+    compilation_info=eci,
+)
+
+_try_set_nocow = rffi.llexternal(
+    "gnitz_try_set_nocow", [rffi.INT], rffi.INT,
+    compilation_info=eci,
+)
+
+_fdatasync = rffi.llexternal(
+    "gnitz_fdatasync", [rffi.INT], rffi.INT,
+    compilation_info=eci,
+)
+
+
+def eventfd_create():
+    """Create a non-blocking, close-on-exec eventfd. Returns fd (int)."""
+    from rpython.rlib.rarithmetic import intmask
+    from gnitz.core.errors import StorageError
+    fd = _eventfd_create()
+    if rffi.cast(lltype.Signed, fd) < 0:
+        raise StorageError("eventfd_create failed")
+    return intmask(fd)
+
+
+def eventfd_signal(efd):
+    """Signal an eventfd (increment counter by 1). Fire-and-forget."""
+    _eventfd_signal(rffi.cast(rffi.INT, efd))
+
+
+def eventfd_wait(efd, timeout_ms):
+    """Wait for an eventfd. Returns >0 if ready, 0 on timeout, <0 on error."""
+    from rpython.rlib.rarithmetic import intmask
+    return intmask(_eventfd_wait(
+        rffi.cast(rffi.INT, efd), rffi.cast(rffi.INT, timeout_ms)))
+
+
+def eventfd_wait_any(efd_list, timeout_ms):
+    """Wait for any of the eventfds. All ready fds are drained."""
+    from rpython.rlib.rarithmetic import intmask
+    count = len(efd_list)
+    if count == 0:
+        return 0
+    c_fds = lltype.malloc(rffi.INTP.TO, count, flavor='raw')
+    try:
+        for i in range(count):
+            c_fds[i] = rffi.cast(rffi.INT, efd_list[i])
+        result = _eventfd_wait_any(
+            c_fds, rffi.cast(rffi.INT, count),
+            rffi.cast(rffi.INT, timeout_ms))
+    finally:
+        lltype.free(c_fds, flavor='raw')
+    return intmask(result)
+
+
+def try_set_nocow(fd):
+    """Set FS_NOCOW_FL on fd. Silently ignored on non-btrfs."""
+    _try_set_nocow(rffi.cast(rffi.INT, fd))
+
+
+def fallocate_c(fd, length):
+    """Pre-allocate blocks for fd. Raises StorageError on failure."""
+    from gnitz.core.errors import StorageError
+    res = _fallocate(rffi.cast(rffi.INT, fd), rffi.cast(rffi.LONGLONG, length))
+    if rffi.cast(lltype.Signed, res) < 0:
+        raise StorageError("fallocate failed")
+
+
+# ---------------------------------------------------------------------------
+# IPC atomics + SAL/W2M transport (ipc.rs)
+# ---------------------------------------------------------------------------
+
+_atomic_load_u64 = rffi.llexternal(
+    "gnitz_atomic_load_u64",
+    [rffi.CCHARP],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+    _nowrapper=True,
+)
+
+_atomic_store_u64 = rffi.llexternal(
+    "gnitz_atomic_store_u64",
+    [rffi.CCHARP, rffi.ULONGLONG],
+    lltype.Void,
+    compilation_info=eci,
+    _nowrapper=True,
+)
+
+_w2m_write = rffi.llexternal(
+    "gnitz_w2m_write",
+    [rffi.CCHARP, rffi.CCHARP, rffi.UINT, rffi.ULONGLONG],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_w2m_read = rffi.llexternal(
+    "gnitz_w2m_read",
+    [rffi.CCHARP, rffi.ULONGLONG, rffi.CCHARPP, rffi.UINTP],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# IPC wire protocol (ipc.rs)
+# ---------------------------------------------------------------------------
+
+_ipc_encode_wire = rffi.llexternal(
+    "gnitz_ipc_encode_wire",
+    [rffi.ULONGLONG, rffi.ULONGLONG, rffi.ULONGLONG,   # target, client, flags
+     rffi.ULONGLONG, rffi.ULONGLONG, rffi.ULONGLONG,   # seek_pk_lo/hi, seek_col
+     rffi.UINT,                                         # status
+     rffi.CCHARP, rffi.UINT,                            # error_msg ptr/len
+     rffi.VOIDP,                                        # schema_desc
+     rffi.CCHARPP, rffi.UINTP,                          # col_names ptr/len arrays
+     rffi.UINT,                                         # num_col_names
+     rffi.VOIDP,                                        # batch handle
+     rffi.CCHARPP, rffi.UINTP],                         # out_ptr, out_len
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_ipc_wire_free = rffi.llexternal(
+    "gnitz_ipc_wire_free",
+    [rffi.CCHARP, rffi.UINT],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_ipc_decode_wire = rffi.llexternal(
+    "gnitz_ipc_decode_wire",
+    [rffi.CCHARP, rffi.UINT,                           # data_ptr, data_size
+     rffi.UINTP, rffi.ULONGLONGP,                      # out_status, out_client_id
+     rffi.ULONGLONGP, rffi.ULONGLONGP,                 # out_target_id, out_flags
+     rffi.ULONGLONGP, rffi.ULONGLONGP,                 # out_seek_pk_lo/hi
+     rffi.ULONGLONGP,                                   # out_seek_col_idx
+     rffi.CCHARPP, rffi.UINTP,                          # out_error_msg ptr/len
+     rffi.VOIDP, rffi.INTP,                             # out_schema_desc, out_has_schema
+     rffi.VOIDPP, rffi.UINTP],                          # out_batch_handle, out_num_col_names
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_ipc_decode_result_col_name = rffi.llexternal(
+    "gnitz_ipc_decode_result_col_name",
+    [rffi.VOIDP, rffi.UINT, rffi.CCHARPP, rffi.UINTP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_ipc_decode_result_take_batch = rffi.llexternal(
+    "gnitz_ipc_decode_result_take_batch",
+    [rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_ipc_decode_result_free = rffi.llexternal(
+    "gnitz_ipc_decode_result_free",
+    [rffi.VOIDP],
+    lltype.Void,
     compilation_info=eci,
 )

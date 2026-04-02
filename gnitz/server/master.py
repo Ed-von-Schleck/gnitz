@@ -10,7 +10,8 @@ from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi
 
 from gnitz import log
-from gnitz.server import ipc, ipc_ffi, eventfd_ffi
+from gnitz.server import ipc, ipc_ffi
+from gnitz.storage import engine_ffi
 from gnitz.storage import mmap_posix
 from gnitz.core import errors
 from gnitz.core.batch import ArenaZSetBatch
@@ -90,12 +91,12 @@ class MasterDispatcher(object):
         """fdatasync the SAL, then signal all workers via eventfd."""
         mmap_posix.fdatasync_c(self.sal.fd)
         for w in range(self.num_workers):
-            eventfd_ffi.eventfd_signal(self.m2w_efds[w])
+            engine_ffi.eventfd_signal(self.m2w_efds[w])
 
     def _sync_and_signal_one(self, worker):
         """fdatasync the SAL, then signal one worker via eventfd."""
         mmap_posix.fdatasync_c(self.sal.fd)
-        eventfd_ffi.eventfd_signal(self.m2w_efds[worker])
+        engine_ffi.eventfd_signal(self.m2w_efds[worker])
 
     def _write_unicast(self, worker, target_id, flags, schema,
                        seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
@@ -145,7 +146,7 @@ class MasterDispatcher(object):
         w2m_rcs = [ipc.W2M_HEADER_SIZE] * self.num_workers
         try:
             while remaining > 0:
-                eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
+                engine_ffi.eventfd_wait_any(self.w2m_efds, 1000)
                 for w in range(self.num_workers):
                     if collected[w]:
                         continue
@@ -181,7 +182,7 @@ class MasterDispatcher(object):
 
         try:
             while remaining > 0:
-                eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
+                engine_ffi.eventfd_wait_any(self.w2m_efds, 1000)
                 for w in range(self.num_workers):
                     if collected[w]:
                         continue
@@ -243,7 +244,7 @@ class MasterDispatcher(object):
         w2m_rc = ipc.W2M_HEADER_SIZE
         try:
             while True:
-                eventfd_ffi.eventfd_wait(self.w2m_efds[worker], 1000)
+                engine_ffi.eventfd_wait(self.w2m_efds[worker], 1000)
                 wc = self.w2m_regions[worker].get_write_cursor()
                 if w2m_rc < wc:
                     payload, w2m_rc = ipc.read_from_w2m(
@@ -275,7 +276,7 @@ class MasterDispatcher(object):
         w2m_rcs = [ipc.W2M_HEADER_SIZE] * self.num_workers
         try:
             while remaining > 0:
-                eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1000)
+                engine_ffi.eventfd_wait_any(self.w2m_efds, 1000)
                 for w in range(self.num_workers):
                     if collected[w]:
                         continue
@@ -363,7 +364,7 @@ class MasterDispatcher(object):
             return True
 
         # Short timeout: yield CPU to workers while still polling client I/O
-        eventfd_ffi.eventfd_wait_any(self.w2m_efds, 1)
+        engine_ffi.eventfd_wait_any(self.w2m_efds, 1)
 
         for w in range(self.num_workers):
             if self._async_collected[w]:

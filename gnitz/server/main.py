@@ -17,7 +17,8 @@ from gnitz.storage import mmap_posix
 from gnitz.storage.mmap_posix import raise_fd_limit
 from gnitz.catalog import system_tables as sys
 from gnitz.server.executor import ServerExecutor
-from gnitz.server import ipc, eventfd_ffi, sal_ffi
+from gnitz.server import ipc
+from gnitz.storage import engine_ffi
 from gnitz.server.master import MasterDispatcher
 from gnitz.dbsp.ops.exchange import PartitionAssignment
 from gnitz.server.worker import WorkerProcess
@@ -207,10 +208,10 @@ def entry_point(argv):
     # --- Shared Append-Only Log (file-backed, master→all workers) ---
     sal_path = data_dir + "/wal.sal"
     sal_fd = rposix.open(sal_path, os.O_RDWR | os.O_CREAT, 0o644)
-    sal_ffi.try_set_nocow(sal_fd)
+    engine_ffi.try_set_nocow(sal_fd)
     existing_size = intmask(mmap_posix.fget_size(sal_fd))
     if existing_size < ipc.SAL_MMAP_SIZE:
-        sal_ffi.fallocate_c(sal_fd, ipc.SAL_MMAP_SIZE)
+        engine_ffi.fallocate_c(sal_fd, ipc.SAL_MMAP_SIZE)
     sal_ptr = mmap_posix.mmap_file(
         sal_fd, ipc.SAL_MMAP_SIZE,
         prot=mmap_posix.PROT_READ | mmap_posix.PROT_WRITE,
@@ -234,8 +235,8 @@ def entry_point(argv):
     m2w_efds = [0] * num_workers
     w2m_efds = [0] * num_workers
     for w in range(num_workers):
-        m2w_efds[w] = eventfd_ffi.eventfd_create()
-        w2m_efds[w] = eventfd_ffi.eventfd_create()
+        m2w_efds[w] = engine_ffi.eventfd_create()
+        w2m_efds[w] = engine_ffi.eventfd_create()
 
     os.write(1, "SAL fd=" + str(sal_fd) + "\n")
     for w in range(num_workers):
