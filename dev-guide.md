@@ -14,7 +14,7 @@ When adding a new server-side constraint, validation rule, or invariant:
       (e.g. exchange barrier participation)?
 - [ ] Any change touching `worker.py`, `registry.py` ingest path, or `ipc.py`:
       run `make e2e`.
-- [ ] Is there a multi-worker E2E test in `rust_client/gnitz-py/tests/test_workers.py`
+- [ ] Is there a multi-worker E2E test in `crates/gnitz-py/tests/test_workers.py`
       covering it?
 - [ ] Is there a Rust unit test in `ipc.rs` / `exchange.rs` covering the IPC path?
 - [ ] Does the feature use `hash_row_by_columns` for exchange routing across
@@ -28,7 +28,7 @@ When adding a new server-side constraint, validation rule, or invariant:
 exchange/fanout paths and will miss bugs in distributed execution.
 
 ```bash
-cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
+cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
 ```
 
 The Makefile `e2e` target already sets `GNITZ_WORKERS=4`. Never run
@@ -176,8 +176,8 @@ code that builds REDUCE output schemas must follow this rule exactly.
 
 Individual test targets (`make run-<name>-c`) do **not** rebuild the Rust
 static libraries. Only the top-level `make test` has `rust-engine-debug` as
-a prerequisite. After changing any Rust code in `rust_client/gnitz-engine/`
-or `rust_client/gnitz-transport/`, always rebuild before running RPython
+a prerequisite. After changing any Rust code in `crates/gnitz-engine/`
+or `crates/gnitz-transport/`, always rebuild before running RPython
 tests:
 
 ```bash

@@ -98,7 +98,7 @@ $(RUN_TARGETS): run-%-c: rpython_tests/%.py
 	@rm -rf $(DATA_DIR_$*-c)
 	@( \
 	  echo "=== Compiling: $< ===" && \
-	  GNITZ_ENGINE_LIB=$(PWD)/rust_client/target/debug $(RPYTHON) $(RPYFLAGS) $< && \
+	  GNITZ_ENGINE_LIB=$(PWD)/crates/target/debug $(RPYTHON) $(RPYFLAGS) $< && \
 	  echo "=== Running: $*-c ===" && \
 	  ./$*-c && \
 	  echo "=== PASSED: $*-c ===" \
@@ -124,23 +124,23 @@ clean:
 	@rm -rf $(LOG_DIR)
 
 rust-transport-debug:
-	cd rust_client && cargo build -p gnitz-transport
+	cd crates && cargo build -p gnitz-transport
 
 rust-transport-release:
-	cd rust_client && cargo build --release -p gnitz-transport
+	cd crates && cargo build --release -p gnitz-transport
 
 rust-engine-debug:
-	cd rust_client && cargo build -p gnitz-engine
+	cd crates && cargo build -p gnitz-engine
 
 rust-engine-release:
-	cd rust_client && cargo build --release -p gnitz-engine
+	cd crates && cargo build --release -p gnitz-engine
 
 rust-engine-test:
-	cd rust_client && cargo test -p gnitz-engine
+	cd crates && cargo test -p gnitz-engine
 
 server: rust-transport-debug rust-engine-debug
-	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/debug \
-	GNITZ_ENGINE_LIB=$(PWD)/rust_client/target/debug \
+	GNITZ_TRANSPORT_LIB=$(PWD)/crates/target/debug \
+	GNITZ_ENGINE_LIB=$(PWD)/crates/target/debug \
 	$(RPYTHON) $(RPYFLAGS) --output=gnitz-server-c gnitz/server/main.py
 
 pytest: server
@@ -152,19 +152,19 @@ pytest-only:
 	cd py_client && GNITZ_WORKERS=4 uv run pytest tests/ -v
 
 e2e: gnitz-server-c
-	cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
+	cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
 
 e2e-release: gnitz-server-release-c
-	cd rust_client/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release-c GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
+	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release-c GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
 
 release-server: rust-transport-release rust-engine-release
-	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/release \
-	GNITZ_ENGINE_LIB=$(PWD)/rust_client/target/release \
+	GNITZ_TRANSPORT_LIB=$(PWD)/crates/target/release \
+	GNITZ_ENGINE_LIB=$(PWD)/crates/target/release \
 	CFLAGS="$(RELEASE_CFLAGS)" $(RPYTHON) $(RPYFLAGS_RELEASE) --output=gnitz-server-release-c gnitz/server/main.py
 
 release-server-nojit: rust-transport-release rust-engine-release
-	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/release \
-	GNITZ_ENGINE_LIB=$(PWD)/rust_client/target/release \
+	GNITZ_TRANSPORT_LIB=$(PWD)/crates/target/release \
+	GNITZ_ENGINE_LIB=$(PWD)/crates/target/release \
 	CFLAGS="$(RELEASE_CFLAGS)" $(RPYTHON) $(RPYFLAGS_NOJIT) --output=gnitz-server-nojit-c gnitz/server/main.py
 
 release-test:

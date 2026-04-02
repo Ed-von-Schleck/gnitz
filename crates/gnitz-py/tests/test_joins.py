@@ -1,7 +1,7 @@
 """E2E tests: equijoins in CREATE VIEW.
 
 Run:
-    cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_joins.py -v --tb=short
+    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_joins.py -v --tb=short
 """
 import random
 import pytest

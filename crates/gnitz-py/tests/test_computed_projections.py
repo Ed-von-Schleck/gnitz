@@ -1,7 +1,7 @@
 """E2E tests: computed projections in CREATE VIEW.
 
 Run:
-    cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_computed_projections.py -v --tb=short
+    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_computed_projections.py -v --tb=short
 """
 import random
 import pytest

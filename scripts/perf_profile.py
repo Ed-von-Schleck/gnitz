@@ -180,7 +180,7 @@ PREREQUISITES
         ls -lh gnitz-server-release-c
 
   - uv with the gnitz-py project (used to import the gnitz client):
-        cd rust_client/gnitz-py && uv sync
+        cd crates/gnitz-py && uv sync
 """
 
 from __future__ import annotations

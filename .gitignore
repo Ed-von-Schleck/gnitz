@@ -187,7 +187,7 @@ tmp/
 bench_history/
 
 # Generated Rust docs
-rust_client/doc/
+crates/doc/
 
 # Compiled C examples
-rust_client/gnitz-capi/examples/c_test
+crates/gnitz-capi/examples/c_test

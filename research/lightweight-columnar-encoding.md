@@ -1203,6 +1203,6 @@ independent lifecycle) for no additional benefit.
 - OpenZL feasibility study: `research/openzl-shard-compression.md`
 - Shard format: `gnitz/storage/layout.py`
 - Cursor architecture: `gnitz/storage/cursor.py`, `gnitz/storage/shard_table.py`
-- Rust compaction: `rust_client/gnitz-engine/src/compact.rs`
+- Rust compaction: `crates/gnitz-engine/src/compact.rs`
 - DBSP operators: `gnitz/dbsp/ops/`
 - Expression VM: `gnitz/dbsp/expr.py`

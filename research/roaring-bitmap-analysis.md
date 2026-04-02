@@ -676,7 +676,7 @@ The claim in an earlier draft of `lightweight-columnar-encoding.md` that roaring
 ### gnitz Internal
 - Current null representation: `gnitz/core/batch.py` (null_buf, _read_null_word, is_null)
 - Shard null region: `gnitz/storage/shard_table.py`, `gnitz/storage/writer_table.py`
-- Rust compaction null handling: `rust_client/gnitz-engine/src/compact.rs`
+- Rust compaction null handling: `crates/gnitz-engine/src/compact.rs`
 - Expression VM null tracking: `gnitz/dbsp/expr.py` (_eval_row_direct, evaluate_map_batch)
 - Null formal proofs: `proofs/checks/null_word.py`
 - Weight column: `gnitz/storage/cursor.py` (_skip_ghosts), `gnitz/dbsp/ops/distinct.py`,

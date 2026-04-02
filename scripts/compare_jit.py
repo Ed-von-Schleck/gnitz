@@ -42,7 +42,7 @@ PREREQUISITES
 =============
   - Both binaries present (or pass --rebuild / --rebuild-jit / --rebuild-nojit)
   - uv with the gnitz-py project:
-        cd rust_client/gnitz-py && uv sync
+        cd crates/gnitz-py && uv sync
 """
 
 from __future__ import annotations

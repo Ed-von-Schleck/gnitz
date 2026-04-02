@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 REPO_ROOT  = Path(__file__).resolve().parent.parent
-CLIENT_DIR = REPO_ROOT / "rust_client" / "gnitz-py"
+CLIENT_DIR = REPO_ROOT / "crates" / "gnitz-py"
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ def stop_server(proc, tmpdir: str, log_f) -> None:
 # Workload script (runs in a subprocess via `uv run python -c ...`)
 # ---------------------------------------------------------------------------
 # This is passed to a child process so that the gnitz client (installed via
-# uv in rust_client/gnitz-py) is importable.  The child receives
+# uv in crates/gnitz-py) is importable.  The child receives
 # (sock_path, ticks, rows_per_tick) as sys.argv[1:4].
 
 WORKLOAD_SCRIPT = r"""

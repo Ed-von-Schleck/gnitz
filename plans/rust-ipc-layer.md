@@ -60,7 +60,7 @@ design documentation.
 
 ### What shipped
 
-- **Rust crate** `rust_client/gnitz-transport/` (10 source files, cdylib):
+- **Rust crate** `crates/gnitz-transport/` (10 source files, cdylib):
   Ring trait, IoUringRing (wraps `io-uring` 0.7), RecvState, SendQueue,
   Conn (with Drop), Transport<R: Ring> with full transport_poll, MockRing,
   extern "C" FFI exports. 42 unit tests.
@@ -218,10 +218,10 @@ count, not throughput.
 
 ```makefile
 rust-transport:
-	cd rust_client && cargo build --release -p gnitz-transport
+	cd crates && cargo build --release -p gnitz-transport
 
 server: rust-transport
-	GNITZ_TRANSPORT_LIB=$(PWD)/rust_client/target/release \
+	GNITZ_TRANSPORT_LIB=$(PWD)/crates/target/release \
 	$(RPYTHON) $(RPYFLAGS) --output=gnitz-server-c gnitz/server/main.py
 ```
 

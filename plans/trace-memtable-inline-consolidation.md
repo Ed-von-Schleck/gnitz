@@ -1,6 +1,6 @@
 # Trace Memtable: Inline Consolidation + Small-Batch Accumulator Routing
 
-No external dependencies. Implementation in `rust_client/gnitz-engine/src/memtable.rs`.
+No external dependencies. Implementation in `crates/gnitz-engine/src/memtable.rs`.
 
 ---
 

@@ -1,7 +1,7 @@
 """Integration tests for the gnitz-sql SQL frontend.
 
 Run:
-    cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_sql.py -v --tb=short
+    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_sql.py -v --tb=short
 """
 import random
 import pytest

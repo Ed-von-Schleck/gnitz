@@ -1,7 +1,7 @@
 """E2E tests for LEFT JOIN.
 
 Run:
-    cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_left_join.py -v --tb=short
+    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_left_join.py -v --tb=short
 """
 import random
 import pytest

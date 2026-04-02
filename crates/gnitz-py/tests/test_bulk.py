@@ -1,7 +1,7 @@
 """Bulk / large-scale DBSP operator and FLSM storage tests.
 
 Run:
-    cd rust_client/gnitz-py
+    cd crates/gnitz-py
     GNITZ_WORKERS=4 uv run pytest tests/test_bulk.py -v --tb=short
 """
 import os

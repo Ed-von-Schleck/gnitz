@@ -1083,5 +1083,5 @@ but would matter for a network-fetch scenario.
 - zstd seekable format: https://github.com/facebook/zstd/blob/dev/contrib/seekable_format/
 - gnitz shard format: `gnitz/storage/layout.py`
 - gnitz cursor architecture: `gnitz/storage/cursor.py`, `gnitz/storage/shard_table.py`
-- gnitz Rust compaction: `rust_client/gnitz-engine/src/compact.rs`
+- gnitz Rust compaction: `crates/gnitz-engine/src/compact.rs`
 - gnitz PK types: `gnitz/core/types.py`, `gnitz/core/batch.py`

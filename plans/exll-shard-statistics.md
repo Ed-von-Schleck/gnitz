@@ -23,7 +23,7 @@ value distribution of non-PK columns.
 `n_distinct(col)` for non-PK columns is not derivable from any existing metadata.
 This matters because gnitz joins are not limited to PK columns.
 
-The SQL planner (`rust_client/gnitz-sql/src/planner.rs`) builds joins via MAP+reindex:
+The SQL planner (`crates/gnitz-sql/src/planner.rs`) builds joins via MAP+reindex:
 both sides of a join are passed through `map_reindex(input, join_col, ...)`, which
 promotes `join_col` to become the batch PK via `PARAM_REINDEX_COL` before the DBSP
 join operators see them. The join column can be any column — in practice it is

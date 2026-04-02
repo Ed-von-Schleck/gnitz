@@ -1,7 +1,7 @@
 """E2E tests for UNION ALL, UNION, SELECT DISTINCT.
 
 Run:
-    cd rust_client/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_set_ops.py -v --tb=short
+    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_set_ops.py -v --tb=short
 """
 import random
 import pytest
