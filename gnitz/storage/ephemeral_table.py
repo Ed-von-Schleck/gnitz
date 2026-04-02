@@ -8,16 +8,14 @@ import os
 from rpython.rlib.rarithmetic import (
     r_int64,
     r_uint64,
-    r_ulonglonglong as r_uint128,
     intmask,
 )
 from rpython.rtyper.lltypesystem import rffi, lltype
 
-from gnitz.core import types, errors
+from gnitz.core import errors
 from gnitz.core.comparator import RowAccessor
 from gnitz.core.store import ZSetStore
-from gnitz.core.keys import promote_to_index_key
-from gnitz.core.batch import ArenaZSetBatch
+from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.storage import engine_ffi, cursor
 from gnitz.storage.memtable import _pack_batch_regions, ACCUMULATOR_THRESHOLD
 
@@ -266,44 +264,50 @@ class EphemeralTable(ZSetStore):
         self._accumulator.free()
         self._accumulator = ArenaZSetBatch(self.schema)
 
-    def ingest_projection(
-        self, source_batch, source_col_idx, source_col_type, payload_accessor, is_unique
-    ):
+    def ingest_projection(self, source_batch, source_col_idx, is_unique):
         n = source_batch.length()
         if n == 0:
             return
-        acc = source_batch.get_accessor(0)
-        for i in range(n):
-            source_batch.bind_accessor(i, acc)
-            if acc.is_null(source_col_idx):
-                continue
-            weight = source_batch.get_weight(i)
-            if weight == r_int64(0):
-                continue
-            index_key = promote_to_index_key(acc, source_col_idx, source_col_type)
-            index_key_lo = r_uint64(intmask(index_key))
-            index_key_hi = r_uint64(intmask(index_key >> 64))
-            if is_unique and weight > r_int64(0):
-                self._flush_accumulator()
-                if self.has_pk(index_key_lo, index_key_hi):
-                    raise errors.LayoutError(
-                        "Unique index violation on column index %d" % source_col_idx
-                    )
-            source_pk = source_batch.get_pk(i)
-            payload_accessor.pk_lo = r_uint64(intmask(source_pk))
-            payload_accessor.pk_hi = r_uint64(intmask(source_pk >> 64))
-            try:
-                self.upsert_single(index_key_lo, index_key_hi, weight, payload_accessor)
-            except errors.MemTableFullError:
-                self.flush()
-                self.upsert_single(index_key_lo, index_key_hi, weight, payload_accessor)
-
-    def ingest_one(self, key_lo, key_hi, weight, accessor):
+        schema_buf = engine_ffi.pack_schema(self.schema)
         try:
-            self.upsert_single(key_lo, key_hi, weight, accessor)
-        except errors.MemTableFullError:
-            self.flush()
-            self.upsert_single(key_lo, key_hi, weight, accessor)
+            idx_handle = engine_ffi._batch_project_index(
+                source_batch._handle,
+                rffi.cast(rffi.UINT, source_col_idx),
+                rffi.cast(rffi.VOIDP, schema_buf),
+            )
+        finally:
+            lltype.free(schema_buf, flavor="raw")
+        idx_batch = ArenaZSetBatch._wrap_handle(self.schema, idx_handle, False, False)
+        try:
+            if not is_unique:
+                try:
+                    self.ingest_batch(idx_batch)
+                except errors.MemTableFullError:
+                    self.flush()
+                    self.ingest_batch(idx_batch)
+            else:
+                # Unique: sequential per-row check + ingest so retractions
+                # are visible before the next positive-weight check.
+                m = idx_batch.length()
+                for i in range(m):
+                    pk_lo = idx_batch.get_pk_lo(i)
+                    pk_hi = idx_batch.get_pk_hi(i)
+                    w = idx_batch.get_weight(i)
+                    if w > r_int64(0):
+                        self._flush_accumulator()
+                        if self.has_pk(pk_lo, pk_hi):
+                            raise errors.LayoutError(
+                                "Unique index violation on column index %d"
+                                % source_col_idx
+                            )
+                    acc = idx_batch.get_accessor(i)
+                    try:
+                        self.upsert_single(pk_lo, pk_hi, w, acc)
+                    except errors.MemTableFullError:
+                        self.flush()
+                        self.upsert_single(pk_lo, pk_hi, w, acc)
+        finally:
+            idx_batch.free()
 
     # ------------------------------------------------------------------
     # Read path

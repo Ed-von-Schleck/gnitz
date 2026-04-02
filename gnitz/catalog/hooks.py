@@ -6,7 +6,7 @@ from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core.errors import LayoutError
 from gnitz.core.types import TableSchema
-from gnitz.core.batch import ArenaZSetBatch
+from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.storage import mmap_posix
 from gnitz.storage.partitioned_table import (
     make_partitioned_persistent,

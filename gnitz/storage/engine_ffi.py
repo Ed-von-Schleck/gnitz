@@ -317,10 +317,6 @@ eci = ExternalCompilationInfo(
         "uint64_t gnitz_batch_get_null_word(const void *handle, uint32_t row);",
         "const uint8_t *gnitz_batch_col_ptr(const void *handle, uint32_t row, uint32_t payload_col, uint32_t col_size);",
         "const uint8_t *gnitz_batch_blob_ptr(const void *handle);",
-        "int32_t gnitz_batch_append_row("
-        "  void *handle, uint64_t pk_lo, uint64_t pk_hi, int64_t weight, uint64_t null_word,"
-        "  void **col_ptrs, uint32_t *col_sizes, uint32_t num_cols,"
-        "  const uint8_t *blob_src, uint32_t blob_len);",
         "int32_t gnitz_batch_append_row_simple("
         "  void *handle, uint64_t pk_lo, uint64_t pk_hi, int64_t weight, uint64_t null_word,"
         "  const int64_t *lo_values, const uint64_t *hi_values,"
@@ -345,11 +341,9 @@ eci = ExternalCompilationInfo(
         "uint32_t gnitz_batch_region_size(const void *handle, uint32_t idx);",
         "uint32_t gnitz_batch_num_regions(const void *handle);",
         "void *gnitz_batch_from_regions(const void *schema_desc, void **ptrs, uint32_t *sizes, uint32_t count, uint32_t rpb);",
-        "void gnitz_batch_alloc_system(void *handle, uint32_t n);",
-        "uint8_t *gnitz_batch_col_extend(void *handle, uint32_t payload_col, uint32_t n_bytes);",
-        "uint64_t gnitz_batch_blob_extend(void *handle, uint32_t n_bytes);",
-        "uint64_t gnitz_batch_blob_len(const void *handle);",
-        "void gnitz_batch_set_count(void *handle, uint32_t count);",
+        "void *gnitz_batch_project_index("
+        "  const void *src, uint32_t source_col_idx,"
+        "  const void *index_schema_desc);",
         # partition routing
         "uint32_t gnitz_partition_for_key(uint64_t pk_lo, uint64_t pk_hi);",
         "uint32_t gnitz_worker_for_pk(uint64_t pk_lo, uint64_t pk_hi, uint32_t num_workers);",
@@ -385,26 +379,27 @@ eci = ExternalCompilationInfo(
         "int32_t gnitz_try_set_nocow(int32_t fd);",
         "int32_t gnitz_fdatasync(int32_t fd);",
         # IPC atomics + SAL/W2M transport (ipc.rs)
-        "uint64_t gnitz_atomic_load_u64(const uint8_t *ptr);",
-        "void gnitz_atomic_store_u64(uint8_t *ptr, uint64_t val);",
+        # Note: use char*/char** instead of uint8_t* for RPython CCHARP compatibility
+        "uint64_t gnitz_atomic_load_u64(const char *ptr);",
+        "void gnitz_atomic_store_u64(char *ptr, uint64_t val);",
         # SAL write: returns struct {int32_t status; uint64_t new_cursor;}
         # We call it and read the two fields via a raw buffer.
         "int32_t gnitz_sal_write_group("
-        "  uint8_t *sal_ptr, uint64_t write_cursor,"
+        "  char *sal_ptr, uint64_t write_cursor,"
         "  uint32_t num_workers, uint32_t target_id,"
         "  uint64_t lsn, uint32_t flags, uint32_t epoch,"
         "  uint64_t mmap_size,"
-        "  const uint8_t **worker_ptrs, const uint32_t *worker_sizes);",
+        "  char **worker_ptrs, const uint32_t *worker_sizes);",
         # SAL read: we use the FFI struct via raw pointer access
         "int32_t gnitz_sal_read_group_header("
-        "  const uint8_t *sal_ptr, uint64_t read_cursor, uint32_t worker_id);",
+        "  const char *sal_ptr, uint64_t read_cursor, uint32_t worker_id);",
         # W2M
         "int64_t gnitz_w2m_write("
-        "  uint8_t *region_ptr, const uint8_t *data_ptr,"
+        "  char *region_ptr, const char *data_ptr,"
         "  uint32_t data_size, uint64_t region_size);",
         "uint64_t gnitz_w2m_read("
-        "  const uint8_t *region_ptr, uint64_t read_cursor,"
-        "  const uint8_t **out_data_ptr, uint32_t *out_data_size);",
+        "  const char *region_ptr, uint64_t read_cursor,"
+        "  char **out_data_ptr, uint32_t *out_data_size);",
         # IPC wire protocol (ipc.rs)
         # Note: use char* instead of uint8_t* for RPython CCHARP compatibility
         "int32_t gnitz_ipc_encode_wire("
@@ -1642,12 +1637,6 @@ _batch_col_ptr = rffi.llexternal(
 _batch_blob_ptr = rffi.llexternal(
     "gnitz_batch_blob_ptr", [rffi.VOIDP], rffi.CCHARP, compilation_info=eci,
 )
-_batch_append_row = rffi.llexternal(
-    "gnitz_batch_append_row",
-    [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG, rffi.LONGLONG, rffi.ULONGLONG,
-     rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.CCHARP, rffi.UINT],
-    rffi.INT, compilation_info=eci,
-)
 _batch_append_row_simple = rffi.llexternal(
     "gnitz_batch_append_row_simple",
     [rffi.VOIDP, rffi.ULONGLONG, rffi.ULONGLONG, rffi.LONGLONG, rffi.ULONGLONG,
@@ -1710,21 +1699,10 @@ _batch_from_regions = rffi.llexternal(
     "gnitz_batch_from_regions", [rffi.VOIDP, rffi.VOIDPP, rffi.UINTP, rffi.UINT, rffi.UINT],
     rffi.VOIDP, compilation_info=eci,
 )
-_batch_alloc_system = rffi.llexternal(
-    "gnitz_batch_alloc_system", [rffi.VOIDP, rffi.UINT], lltype.Void, compilation_info=eci,
-)
-_batch_col_extend = rffi.llexternal(
-    "gnitz_batch_col_extend", [rffi.VOIDP, rffi.UINT, rffi.UINT],
-    rffi.CCHARP, compilation_info=eci,
-)
-_batch_blob_extend = rffi.llexternal(
-    "gnitz_batch_blob_extend", [rffi.VOIDP, rffi.UINT], rffi.ULONGLONG, compilation_info=eci,
-)
-_batch_blob_len = rffi.llexternal(
-    "gnitz_batch_blob_len", [rffi.VOIDP], rffi.ULONGLONG, compilation_info=eci,
-)
-_batch_set_count = rffi.llexternal(
-    "gnitz_batch_set_count", [rffi.VOIDP, rffi.UINT], lltype.Void, compilation_info=eci,
+_batch_project_index = rffi.llexternal(
+    "gnitz_batch_project_index",
+    [rffi.VOIDP, rffi.UINT, rffi.VOIDP],
+    rffi.VOIDP, compilation_info=eci,
 )
 
 # ---------------------------------------------------------------------------

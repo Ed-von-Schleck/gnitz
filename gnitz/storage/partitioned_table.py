@@ -9,7 +9,7 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import errors
 from gnitz.core.store import ZSetStore
-from gnitz.core.batch import ArenaZSetBatch
+from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.storage import engine_ffi, cursor
 from gnitz.storage.memtable import _pack_batch_regions
 from gnitz.core.comparator import RowAccessor

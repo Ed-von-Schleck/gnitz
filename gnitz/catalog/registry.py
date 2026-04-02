@@ -15,7 +15,7 @@ from gnitz.catalog.system_tables import (
 )
 from gnitz.core.errors import LayoutError
 from gnitz.core.keys import promote_to_index_key
-from gnitz.core.batch import ArenaZSetBatch
+from gnitz.storage.owned_batch import ArenaZSetBatch
 
 
 def _retract_from_out(out, schema, src_idx):
@@ -106,7 +106,7 @@ def wire_fk_constraints_for_family(family, registry):
 
 def _build_pk_check_batch(schema, lo_list, hi_list):
     """Build a batch containing the given PK (lo,hi) pairs, columns zeroed."""
-    from gnitz.core.batch import RowBuilder
+    from gnitz.catalog.system_tables import RowBuilder
 
     n = len(lo_list)
     batch = ArenaZSetBatch(schema, initial_capacity=max(n, 1))
@@ -403,11 +403,7 @@ def ingest_to_family(family, batch):
             circuit = family.index_circuits[idx_num]
             # Delegating projection to the EphemeralTable storage of the index
             circuit.table.ingest_projection(
-                batch,
-                circuit.source_col_idx,
-                circuit.source_col_type,
-                circuit._index_payload_accessor,
-                circuit.is_unique,
+                batch, circuit.source_col_idx, circuit.is_unique,
             )
 
     # --- Stage 4: Post-Ingestion Effect Hooks ---

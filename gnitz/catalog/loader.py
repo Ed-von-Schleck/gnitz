@@ -3,7 +3,7 @@
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 
-from gnitz.core.batch import ArenaZSetBatch
+from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.metadata import read_column_defs
 from gnitz.catalog.registry import TableFamily

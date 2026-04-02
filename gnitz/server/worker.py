@@ -14,7 +14,7 @@ from gnitz.server import ipc
 from gnitz.storage import engine_ffi
 from gnitz.core import errors
 from gnitz.storage import mmap_posix
-from gnitz.core.batch import ArenaZSetBatch
+from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import ingest_to_family
 from gnitz.core.types import TYPE_U128

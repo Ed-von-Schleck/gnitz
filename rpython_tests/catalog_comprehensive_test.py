@@ -7,9 +7,10 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rlib import rposix, rposix_stat
 from rpython.rlib.objectmodel import newlist_hint
 
-from gnitz.core import types, batch
+from gnitz.core import types
 core_types = types
-from gnitz.core.batch import RowBuilder
+from gnitz.catalog.system_tables import RowBuilder
+from gnitz.storage import owned_batch
 from gnitz.core.types import _analyze_schema
 from gnitz.core.errors import LayoutError, GnitzError
 from gnitz.core.strings import resolve_string
@@ -626,7 +627,8 @@ def test_unique_pk_metadata(base_dir):
 
 def _make_upk_row(schema, pk, val, w):
     """Build a single-row ZSetBatch for the (U64 id, I64 val) schema."""
-    from gnitz.core.batch import ArenaZSetBatch, RowBuilder
+    from gnitz.storage.owned_batch import ArenaZSetBatch
+    from gnitz.catalog.system_tables import RowBuilder
     b = ArenaZSetBatch(schema)
     rb = RowBuilder(schema, b)
     rb.begin(r_uint64(pk), r_uint64(0), r_int64(w))
@@ -642,7 +644,8 @@ def test_enforce_unique_pk(base_dir):
         rposix.mkdir(db_path, 0o755)
 
     from gnitz.catalog.registry import _enforce_unique_pk
-    from gnitz.core.batch import ArenaZSetBatch, RowBuilder
+    from gnitz.storage.owned_batch import ArenaZSetBatch
+    from gnitz.catalog.system_tables import RowBuilder
 
     cols = [
         types.ColumnDefinition(types.TYPE_U64, name="id"),
@@ -794,7 +797,7 @@ def test_restart(base_dir):
     engine1.drop_schema("trash")
 
     # Ingest data into the persistent table
-    batch1 = batch.ArenaZSetBatch(table1.schema)
+    batch1 = owned_batch.ArenaZSetBatch(table1.schema)
     rb = RowBuilder(table1.schema, batch1)
     rb.begin(r_uint64(42), r_uint64(0), r_int64(1))
     rb.put_string("Gnitz-O-Matic")
@@ -883,7 +886,7 @@ def test_index_functional_and_fanout(base_dir):
         family = engine.create_table("public.tfanout", cols, 0)
 
         # Ingest baseline
-        b = batch.ArenaZSetBatch(family.schema)
+        b = owned_batch.ArenaZSetBatch(family.schema)
         rb = RowBuilder(family.schema, b)
         for i in range(5):
             rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
@@ -899,7 +902,7 @@ def test_index_functional_and_fanout(base_dir):
             raise Exception("Index backfill count mismatch")
 
         # Live fan-out test (Verify the 3-stage ingestion pipeline)
-        b2 = batch.ArenaZSetBatch(family.schema)
+        b2 = owned_batch.ArenaZSetBatch(family.schema)
         rb2 = RowBuilder(family.schema, b2)
         rb2.begin(r_uint64(99), r_uint64(0), r_int64(1))
         rb2.put_int(r_int64(777))
@@ -929,7 +932,7 @@ def test_orphaned_metadata_recovery(base_dir):
     engine = open_engine(db_path)
     try:
         idx_sys = engine.sys.indices
-        b = batch.ArenaZSetBatch(idx_sys.schema)
+        b = owned_batch.ArenaZSetBatch(idx_sys.schema)
         # Manually inject index metadata pointing to a non-existent table ID 99999
         IdxTab.append(
             b,
@@ -974,7 +977,7 @@ def test_schema_mr_poisoning():
     )
 
     s3 = core_types.merge_schemas_for_join(s1, s2)
-    b = batch.ArenaZSetBatch(s3)
+    b = owned_batch.ArenaZSetBatch(s3)
     rb = RowBuilder(s3, b)
     rb.begin(r_uint64(0), r_uint64(0), r_int64(1))
     rb.put_int(r_int64(123))
@@ -1011,7 +1014,7 @@ def test_sequence_gap_recovery(base_dir):
 
         # 1. Inject table record for tid 250
         tbl_sys = engine.sys.tables
-        b = batch.ArenaZSetBatch(tbl_sys.schema)
+        b = owned_batch.ArenaZSetBatch(tbl_sys.schema)
         rb = RowBuilder(tbl_sys.schema, b)
         rb.begin(r_uint64(250), r_uint64(0), r_int64(1))
         rb.put_int(r_int64(2))  # sid public
@@ -1026,7 +1029,7 @@ def test_sequence_gap_recovery(base_dir):
 
         # 2. Inject column record for tid 250 (Required for reconstruction)
         col_sys = engine.sys.columns
-        bc = batch.ArenaZSetBatch(col_sys.schema)
+        bc = owned_batch.ArenaZSetBatch(col_sys.schema)
         ColTab.append(
             bc,
             col_sys.schema,
@@ -1083,7 +1086,7 @@ def test_fk_referential_integrity(base_dir):
         child = engine.create_table("public.children", child_cols, 0)
 
         # 3. Insert valid parent (PK-only schema, no payload columns)
-        pb = batch.ArenaZSetBatch(parent.schema)
+        pb = owned_batch.ArenaZSetBatch(parent.schema)
         rb_p = RowBuilder(parent.schema, pb)
         rb_p.begin(r_uint64(10), r_uint64(0), r_int64(1))
         rb_p.commit()
@@ -1091,7 +1094,7 @@ def test_fk_referential_integrity(base_dir):
         pb.free()
 
         # 4. Insert valid child
-        cb = batch.ArenaZSetBatch(child.schema)
+        cb = owned_batch.ArenaZSetBatch(child.schema)
         rb_c = RowBuilder(child.schema, cb)
         rb_c.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_c.put_int(r_int64(10))  # Valid pid
@@ -1101,7 +1104,7 @@ def test_fk_referential_integrity(base_dir):
         cb.free()
 
         # 5. Insert INVALID child (pid 99 does not exist)
-        cb2 = batch.ArenaZSetBatch(child.schema)
+        cb2 = owned_batch.ArenaZSetBatch(child.schema)
         rb_c2 = RowBuilder(child.schema, cb2)
         rb_c2.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb_c2.put_int(r_int64(99))
@@ -1143,14 +1146,14 @@ def test_fk_referential_integrity(base_dir):
         ]
         u_child = engine2.create_table("public.uchildren", u_child_cols, 0)
 
-        upb = batch.ArenaZSetBatch(u_parent.schema)
+        upb = owned_batch.ArenaZSetBatch(u_parent.schema)
         rb_up = RowBuilder(u_parent.schema, upb)
         rb_up.begin(r_uint64(0xBBBB), r_uint64(0xAAAA), r_int64(1))
         rb_up.commit()
         ingest_to_family(u_parent, upb)
         upb.free()
 
-        ucb = batch.ArenaZSetBatch(u_child.schema)
+        ucb = owned_batch.ArenaZSetBatch(u_child.schema)
         rb_uc = RowBuilder(u_child.schema, ucb)
         rb_uc.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb_uc.put_u128(r_uint64(0xBBBB), r_uint64(0xAAAA))
@@ -1194,7 +1197,7 @@ def test_fk_nullability_and_retractions(base_dir):
         )
 
         # 1. Insert NULL FK (Should be allowed even if parent is empty)
-        cb = batch.ArenaZSetBatch(child.schema)
+        cb = owned_batch.ArenaZSetBatch(child.schema)
         rb = RowBuilder(child.schema, cb)
         rb.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb.put_null()
@@ -1205,7 +1208,7 @@ def test_fk_nullability_and_retractions(base_dir):
 
         # 2. Test Retraction (Weight -1)
         # Ingesting a retraction for a non-existent parent should NOT trigger FK check
-        cb2 = batch.ArenaZSetBatch(child.schema)
+        cb2 = owned_batch.ArenaZSetBatch(child.schema)
         rb2 = RowBuilder(child.schema, cb2)
         rb2.begin(r_uint64(2), r_uint64(0), r_int64(-1))
         rb2.put_int(r_int64(999))  # Non-existent
@@ -1340,7 +1343,7 @@ def test_fk_self_reference(base_dir):
         emp = engine.create_table("public.employees", cols, 0)
 
         # 1. Ingest Manager first (Commit required for FK check)
-        b1 = batch.ArenaZSetBatch(emp.schema)
+        b1 = owned_batch.ArenaZSetBatch(emp.schema)
         rb1 = RowBuilder(emp.schema, b1)
         rb1.begin(r_uint64(1), r_uint64(0), r_int64(1))
         rb1.put_null()
@@ -1349,7 +1352,7 @@ def test_fk_self_reference(base_dir):
         b1.free()
 
         # 2. Ingest Subordinate referencing the Manager
-        b2 = batch.ArenaZSetBatch(emp.schema)
+        b2 = owned_batch.ArenaZSetBatch(emp.schema)
         rb2 = RowBuilder(emp.schema, b2)
         rb2.begin(r_uint64(2), r_uint64(0), r_int64(1))
         rb2.put_int(r_int64(1))  # Refers to emp_id 1
@@ -1379,7 +1382,7 @@ def test_view_backfill_simple(base_dir):
         ]
         family = engine.create_table("public.t", cols, 0)
 
-        b = batch.ArenaZSetBatch(family.schema)
+        b = owned_batch.ArenaZSetBatch(family.schema)
         rb = RowBuilder(family.schema, b)
         for i in range(5):
             rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
@@ -1396,7 +1399,7 @@ def test_view_backfill_simple(base_dir):
                 % _count_records(view_family.store)
             )
 
-        b2 = batch.ArenaZSetBatch(family.schema)
+        b2 = owned_batch.ArenaZSetBatch(family.schema)
         rb2 = RowBuilder(family.schema, b2)
         rb2.begin(r_uint64(99), r_uint64(0), r_int64(1))
         rb2.put_int(r_int64(999))
@@ -1432,7 +1435,7 @@ def test_view_backfill_on_restart(base_dir):
         family = engine.create_table("public.t", cols, 0)
         _make_passthrough_view(engine, "public.v", family)
 
-        b = batch.ArenaZSetBatch(family.schema)
+        b = owned_batch.ArenaZSetBatch(family.schema)
         rb = RowBuilder(family.schema, b)
         for i in range(5):
             rb.begin(r_uint64(i), r_uint64(0), r_int64(1))
@@ -1471,7 +1474,7 @@ def test_view_on_view_backfill_on_restart(base_dir):
         ]
         t = engine.create_table("public.t", cols, 0)
 
-        b = batch.ArenaZSetBatch(t.schema)
+        b = owned_batch.ArenaZSetBatch(t.schema)
         rb = RowBuilder(t.schema, b)
         for val in [5, 20, 50, 80, 100]:
             rb.begin(r_uint64(val), r_uint64(0), r_int64(1))
@@ -1557,7 +1560,7 @@ def test_programmable_zset_lifecycle():
     # Synthetic 128-bit key using shifts to avoid prebuilt long literals
     u128_val = (r_uint128(0xDEADBEEF) << 64) | r_uint128(0xCAFEBABE)
 
-    bad_batch = batch.ArenaZSetBatch(orders_family.schema)
+    bad_batch = owned_batch.ArenaZSetBatch(orders_family.schema)
     rb_bad = RowBuilder(orders_family.schema, bad_batch)
     rb_bad.begin(r_uint64(1), r_uint64(0), r_int64(1))
     rb_bad.put_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
@@ -1576,7 +1579,7 @@ def test_programmable_zset_lifecycle():
 
     # 4. Valid Data Ingestion
     log_step("Phase 4: Ingesting valid relational data")
-    u_batch = batch.ArenaZSetBatch(users_family.schema)
+    u_batch = owned_batch.ArenaZSetBatch(users_family.schema)
     rb_u = RowBuilder(users_family.schema, u_batch)
     rb_u.begin(r_uint64(u128_val), r_uint64(u128_val >> 64), r_int64(1))
     rb_u.put_string("alice")
@@ -1588,7 +1591,7 @@ def test_programmable_zset_lifecycle():
         users_family.store.has_pk(r_uint64(u128_val), r_uint64(u128_val >> 64)), "User ingestion visibility failed"
     )
 
-    o_batch = batch.ArenaZSetBatch(orders_family.schema)
+    o_batch = owned_batch.ArenaZSetBatch(orders_family.schema)
     rb_o = RowBuilder(orders_family.schema, o_batch)
     rb_o.begin(r_uint64(101), r_uint64(0), r_int64(1))
     rb_o.put_u128(r_uint64(0xCAFEBABE), r_uint64(0xDEADBEEF))
@@ -1647,7 +1650,7 @@ def test_programmable_zset_lifecycle():
     # 8. View Execution (New View API)
     log_step("Phase 8: Execution of Recovered View handle")
     # Feed the actual alice record as a delta to the reactive view
-    in_batch = batch.ArenaZSetBatch(users_family.schema)
+    in_batch = owned_batch.ArenaZSetBatch(users_family.schema)
     rb_in = RowBuilder(users_family.schema, in_batch)
     rb_in.begin(r_uint64(u128_val), r_uint64(u128_val >> 64), r_int64(1))
     rb_in.put_string("alice")

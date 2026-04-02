@@ -1,8 +1,6 @@
 # gnitz/core/comparator.py
 
-from rpython.rtyper.lltypesystem import rffi, lltype
-from rpython.rlib.rarithmetic import r_uint64
-from gnitz.core.strings import NULL_PTR
+from rpython.rtyper.lltypesystem import rffi
 
 
 class RowAccessor(object):
@@ -29,14 +27,5 @@ class RowAccessor(object):
 
     def is_null(self, col_idx):
         return False
-
-    def get_blob_source(self):
-        """Return (blob_ptr, blob_len) for the backing blob arena.
-
-        Default returns (NULL, 0).  Subclasses backed by a Rust batch or
-        cursor override this so that append_from_accessor can pass the
-        blob to gnitz_batch_append_row for German-string relocation.
-        """
-        return NULL_PTR, 0
 
 

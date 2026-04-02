@@ -7,7 +7,7 @@ from rpython.rlib.objectmodel import newlist_hint
 
 from gnitz.core.types import TableSchema, ColumnDefinition
 from gnitz.core.errors import LayoutError
-from gnitz.core.batch import ArenaZSetBatch
+from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.catalog.program_cache import ProgramCache
 
 from gnitz.catalog.identifiers import validate_user_identifier, parse_qualified_name

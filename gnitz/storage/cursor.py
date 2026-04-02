@@ -4,123 +4,6 @@ from rpython.rlib.rarithmetic import r_int64, r_ulonglonglong as r_uint128, r_ui
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.core.store import AbstractCursor
 from gnitz.core import comparator as core_comparator
-from gnitz.core.batch import ColumnarBatchAccessor, pk_lt
-
-MAX_U64 = r_uint64(0xFFFFFFFFFFFFFFFF)
-
-NULL_PTR = lltype.nullptr(rffi.CCHARP.TO)
-
-
-# ---------------------------------------------------------------------------
-# BaseCursor
-# ---------------------------------------------------------------------------
-
-
-class BaseCursor(AbstractCursor):
-    def __init__(self):
-        pass
-
-    def seek(self, key_lo, key_hi):
-        raise NotImplementedError
-
-    def advance(self):
-        raise NotImplementedError
-
-    def key_lo(self):
-        raise NotImplementedError
-
-    def key_hi(self):
-        raise NotImplementedError
-
-    def weight(self):
-        raise NotImplementedError
-
-    def is_valid(self):
-        raise NotImplementedError
-
-    def get_accessor(self):
-        raise NotImplementedError
-
-    def close(self):
-        pass
-
-
-# ---------------------------------------------------------------------------
-# SortedBatchCursor
-# ---------------------------------------------------------------------------
-
-
-class SortedBatchCursor(BaseCursor):
-    """Sequential iterator over a sorted ArenaZSetBatch."""
-
-    _immutable_fields_ = ["_batch", "accessor"]
-
-    def __init__(self, batch):
-        BaseCursor.__init__(self)
-        self._batch = batch
-        self._pos = 0
-        self.accessor = ColumnarBatchAccessor(batch._schema)
-
-    def seek(self, key_lo, key_hi):
-        lo = 0
-        hi = self._batch.length()
-        while lo < hi:
-            mid = (lo + hi) >> 1
-            if pk_lt(self._batch.get_pk_lo(mid), self._batch.get_pk_hi(mid), key_lo, key_hi):
-                lo = mid + 1
-            else:
-                hi = mid
-        self._pos = lo
-
-    def advance(self):
-        self._pos += 1
-
-    def is_valid(self):
-        return self._pos < self._batch.length()
-
-    def key_lo(self):
-        if self._pos >= self._batch.length():
-            return MAX_U64
-        return self._batch.get_pk_lo(self._pos)
-
-    def key_hi(self):
-        if self._pos >= self._batch.length():
-            return MAX_U64
-        return self._batch.get_pk_hi(self._pos)
-
-    def peek_key_lo(self):
-        if self._pos < self._batch.length():
-            return self._batch.get_pk_lo(self._pos)
-        return r_uint64(0)
-
-    def peek_key_hi(self):
-        if self._pos < self._batch.length():
-            return self._batch.get_pk_hi(self._pos)
-        return r_uint64(0)
-
-    def weight(self):
-        if self._pos >= self._batch.length():
-            return r_int64(0)
-        return self._batch.get_weight(self._pos)
-
-    def get_accessor(self):
-        self.accessor.bind(self._batch, self._pos)
-        return self.accessor
-
-    def is_exhausted(self):
-        return self._pos >= self._batch.length()
-
-    def estimated_length(self):
-        return self._batch.length()
-
-    def bind_to(self, acc):
-        """Bind an external ColumnarBatchAccessor to this cursor's current position."""
-        acc.bind(self._batch, self._pos)
-
-    def close(self):
-        pass
-
-
 
 
 
@@ -221,12 +104,6 @@ class RustCursorAccessor(core_comparator.RowAccessor):
         if False:
             s = ""
         return (length, prefix, ptr, blob_ptr, s)
-
-    def get_blob_source(self):
-        from gnitz.storage import engine_ffi
-        blob_ptr = engine_ffi._read_cursor_blob_ptr(self._handle)
-        blob_len = intmask(engine_ffi._read_cursor_blob_len(self._handle))
-        return blob_ptr, blob_len
 
     def get_col_ptr(self, col_idx):
         return self._col_ptr(col_idx)

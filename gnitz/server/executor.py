@@ -9,7 +9,7 @@ from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.server import ipc, ipc_ffi, rust_ffi
 from gnitz.core import errors
-from gnitz.core.batch import ArenaZSetBatch, BatchWriter
+from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.core.types import TYPE_U128
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.registry import (
@@ -20,7 +20,7 @@ from gnitz.storage import engine_ffi
 from gnitz import log
 
 
-def _op_union_merge(batch_a, batch_b, out_writer):
+def _op_union_merge(batch_a, batch_b, out):
     schema = batch_a._schema
     schema_buf = engine_ffi.pack_schema(schema)
     out_result = lltype.malloc(rffi.VOIDPP.TO, 1, flavor="raw")
@@ -39,11 +39,11 @@ def _op_union_merge(batch_a, batch_b, out_writer):
         is_consolidated = intmask(engine_ffi._batch_is_consolidated(result_handle)) != 0
         result_batch = ArenaZSetBatch._wrap_handle(schema, result_handle, is_sorted, is_consolidated)
         if result_batch.length() > 0:
-            out_writer.append_batch(result_batch)
+            out.append_batch(result_batch)
         if is_consolidated:
-            out_writer.mark_consolidated(True)
+            out.mark_consolidated(True)
         else:
-            out_writer.mark_sorted(is_sorted)
+            out.mark_sorted(is_sorted)
         result_batch.free()
     finally:
         lltype.free(out_result, flavor="raw")
@@ -246,8 +246,7 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                         found = pending_pos[dep_pk]
                         existing_d, existing_id, existing_sid, existing_batch = pending[found]
                         merged = ArenaZSetBatch(existing_batch._schema)
-                        writer = BatchWriter(merged)
-                        _op_union_merge(existing_batch, out_delta, writer)
+                        _op_union_merge(existing_batch, out_delta, merged)
                         existing_batch.free()
                         pending[found] = (existing_d, existing_id, existing_sid, merged)
                         # pending_pos[dep_pk] unchanged — in-place update

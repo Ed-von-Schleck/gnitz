@@ -6,7 +6,7 @@ from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core import errors
-from gnitz.core.batch import ArenaZSetBatch
+from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.storage import engine_ffi
 
 # Maximum regions per WAL block (4 system + columns + blob).

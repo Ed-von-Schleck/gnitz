@@ -1,12 +1,6 @@
 # gnitz/catalog/index_circuit.py
 
-from rpython.rlib.rarithmetic import (
-    r_uint64,
-    r_int64,
-    intmask,
-)
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.core.types import (
     TYPE_U8,
@@ -25,44 +19,7 @@ from gnitz.core.types import (
     TableSchema,
 )
 from gnitz.core.errors import LayoutError
-from gnitz.core import comparator as core_comparator
-from gnitz.core.keys import promote_to_index_key
 from gnitz.storage.ephemeral_table import EphemeralTable
-
-
-class IndexPayloadAccessor(core_comparator.RowAccessor):
-    """
-    Internal zero-allocation accessor for index projection.
-    Mocks a row where the payload is simply a Source PK.
-
-    Appendix A: Uses split u64 components to avoid C-level struct alignment 
-    segfaults on u128 assignment.
-    """
-
-    def __init__(self):
-        self.pk_lo = r_uint64(0)
-        self.pk_hi = r_uint64(0)
-
-    def is_null(self, col_idx):
-        return False
-
-    def get_int(self, col_idx):
-        return self.pk_lo
-
-    def get_int_signed(self, col_idx):
-        return rffi.cast(rffi.LONGLONG, self.pk_lo)
-
-    def get_u128_lo(self, col_idx):
-        return self.pk_lo
-
-    def get_u128_hi(self, col_idx):
-        return self.pk_hi
-
-    def get_float(self, col_idx):
-        return 0.0
-
-    def get_str_struct(self, col_idx):
-        return (0, r_int64(0), lltype.nullptr(rffi.CCHARP.TO), lltype.nullptr(rffi.CCHARP.TO), "")
 
 
 def get_index_key_type(field_type):
@@ -130,7 +87,6 @@ class IndexCircuit(object):
         "is_unique",
         "cache_dir",
         "table",
-        "_index_payload_accessor",
     ]
 
     def __init__(
@@ -156,7 +112,6 @@ class IndexCircuit(object):
         self.is_unique = is_unique
         self.cache_dir = cache_dir
         self.table = table  # EphemeralTable
-        self._index_payload_accessor = IndexPayloadAccessor()
 
     def create_cursor(self):
         return self.table.create_cursor()
@@ -201,37 +156,31 @@ def _make_index_circuit(
 def _backfill_index(circuit, source_family):
     """
     Initial population of a secondary index by scanning the source table.
-    Uses the ZSetStore interface and the optimized ingest_one kernel.
+    Uses chunked batch projection via gnitz_batch_project_index.
     """
+    from gnitz.storage.owned_batch import ArenaZSetBatch
+
     src_cursor = source_family.store.create_cursor()
-
-    while src_cursor.is_valid():
-        acc = src_cursor.get_accessor()
-        weight = src_cursor.weight()
-
-        if weight != r_int64(0) and not acc.is_null(circuit.source_col_idx):
-            source_pk_lo = src_cursor.key_lo()
-            source_pk_hi = src_cursor.key_hi()
-            index_key = promote_to_index_key(
-                acc, circuit.source_col_idx, circuit.source_col_type
+    source_schema = source_family.store.get_schema()
+    chunk = ArenaZSetBatch(source_schema, initial_capacity=1024)
+    try:
+        while src_cursor.is_valid():
+            chunk.append_from_accessor(
+                src_cursor.key_lo(), src_cursor.key_hi(),
+                src_cursor.weight(), src_cursor.get_accessor(),
             )
-            index_key_lo = r_uint64(intmask(index_key))
-            index_key_hi = r_uint64(intmask(index_key >> 64))
-
-            if circuit.is_unique and circuit.table.has_pk(index_key_lo, index_key_hi):
-                src_cursor.close()
-                raise LayoutError(
-                    "Unique index violation for '%s' during backfill" % circuit.name
+            src_cursor.advance()
+            if chunk.length() >= 1024:
+                circuit.table.ingest_projection(
+                    chunk, circuit.source_col_idx, circuit.is_unique,
                 )
+                chunk.free()
+                chunk = ArenaZSetBatch(source_schema, initial_capacity=1024)
 
-            # Set PK components for the alignment-safe accessor
-            acc_inj = circuit._index_payload_accessor
-            acc_inj.pk_lo = source_pk_lo
-            acc_inj.pk_hi = source_pk_hi
-
-            # EphemeralTable.ingest_one handles MemTableFullError internally.
-            circuit.table.ingest_one(index_key_lo, index_key_hi, weight, acc_inj)
-
-        src_cursor.advance()
-
-    src_cursor.close()
+        if chunk.length() > 0:
+            circuit.table.ingest_projection(
+                chunk, circuit.source_col_idx, circuit.is_unique,
+            )
+    finally:
+        chunk.free()
+        src_cursor.close()

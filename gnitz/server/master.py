@@ -14,7 +14,7 @@ from gnitz.server import ipc, ipc_ffi
 from gnitz.storage import engine_ffi
 from gnitz.storage import mmap_posix
 from gnitz.core import errors
-from gnitz.core.batch import ArenaZSetBatch
+from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.dbsp.ops.exchange import (
     repartition_batch, worker_for_pk, relay_scatter, PartitionRouter,
     multi_scatter,

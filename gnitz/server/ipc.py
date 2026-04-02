@@ -8,7 +8,8 @@ from gnitz.storage import mmap_posix
 from gnitz.storage import buffer as buffer_ops
 from gnitz.storage import engine_ffi
 from gnitz.server import ipc_ffi
-from gnitz.core import errors, batch, types
+from gnitz.core import errors, types
+from gnitz.storage import owned_batch
 from gnitz.catalog import system_tables
 
 # Atomics from Rust (ipc.rs via engine_ffi)
@@ -501,7 +502,7 @@ def _parse_from_ptr(ptr, total_size):
             # Take ownership of the batch from the decode result
             taken = engine_ffi._ipc_decode_result_take_batch(handle)
             if taken:
-                payload.batch = batch.ArenaZSetBatch._wrap_handle(
+                payload.batch = owned_batch.ArenaZSetBatch._wrap_handle(
                     payload.schema, taken,
                     bool(payload.flags & FLAG_BATCH_SORTED),
                     bool(payload.flags & FLAG_BATCH_CONSOLIDATED))

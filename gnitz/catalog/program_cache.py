@@ -73,7 +73,7 @@ class ExecutablePlan(object):
         return self._execute_epoch_rust(input_delta, source_id)
 
     def _execute_epoch_rust(self, input_delta, source_id):
-        from gnitz.core.batch import ArenaZSetBatch
+        from gnitz.storage.owned_batch import ArenaZSetBatch
         # 1. Refresh external trace cursors (z⁻¹(I(X)) — before current delta)
         #    Owned trace cursors are refreshed by Rust in VmHandle::refresh_owned_cursors.
         for i in range(len(self._ext_trace_regs)):

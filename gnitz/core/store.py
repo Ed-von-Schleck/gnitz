@@ -90,7 +90,7 @@ class ZSetStore(object):
     def ingest_batch(self, batch):
         """
         Ingests a batch of records.
-        batch: gnitz.core.batch.ArenaZSetBatch
+        batch: gnitz.storage.owned_batch.ArenaZSetBatch
         """
         raise NotImplementedError
 

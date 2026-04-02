@@ -3014,71 +3014,132 @@ pub extern "C" fn gnitz_batch_append_row_from_ptable_found(
     result.unwrap_or(-99)
 }
 
-/// Extend system column buffers by n rows (pk_lo, pk_hi, weight, null_bmp)
-/// and increment the count. The caller fills the new space via region_ptr + memcpy.
-#[no_mangle]
-pub extern "C" fn gnitz_batch_alloc_system(handle: *mut libc::c_void, n: u32) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
-        let extra = n as usize * 8;
-        b.pk_lo.resize(b.pk_lo.len() + extra, 0);
-        b.pk_hi.resize(b.pk_hi.len() + extra, 0);
-        b.weight.resize(b.weight.len() + extra, 0);
-        b.null_bmp.resize(b.null_bmp.len() + extra, 0);
-        b.count += n as usize;
-    });
+/// Promote a source column value to an index key (lo, hi).
+///
+/// Matches the Python `promote_to_index_key` semantics:
+/// - I8/I16/I32: sign-extend to i64, reinterpret as u64
+/// - Everything else (U8/U16/U32/U64/I64/F32/F64): zero-extend bytes to u64
+/// - U128: read as (lo, hi) pair
+fn promote_to_index_key(
+    col_data: &[u8],
+    offset: usize,
+    col_size: usize,
+    type_code: u8,
+) -> (u64, u64) {
+    use crate::compact::type_code as tc;
+    match type_code {
+        tc::U128 => {
+            let lo = u64::from_le_bytes(col_data[offset..offset + 8].try_into().unwrap());
+            let hi = u64::from_le_bytes(col_data[offset + 8..offset + 16].try_into().unwrap());
+            (lo, hi)
+        }
+        tc::I8 | tc::I16 | tc::I32 => {
+            (crate::compact::read_signed(&col_data[offset..], col_size) as u64, 0)
+        }
+        _ => {
+            let mut bytes = [0u8; 8];
+            let copy_len = col_size.min(8);
+            bytes[..copy_len].copy_from_slice(&col_data[offset..offset + copy_len]);
+            (u64::from_le_bytes(bytes), 0)
+        }
+    }
 }
 
-/// Extend a payload column buffer by n_bytes, returning a pointer to the start of the new region.
+/// Batch-level columnar index projection.
+///
+/// Takes an entire source batch and produces an index batch in a single call,
+/// replacing the Python row loop in `ingest_projection`.
+///
+/// For each source row with non-zero weight and non-null source column:
+/// - Promotes the source column value to an index key
+/// - Maps the source PK → index payload
+///
+/// Returns a new OwnedBatch (caller owns), or null on error.
 #[no_mangle]
-pub extern "C" fn gnitz_batch_col_extend(
-    handle: *mut libc::c_void, payload_col: u32, n_bytes: u32,
-) -> *mut u8 {
-    if handle.is_null() { return ptr::null_mut(); }
+pub extern "C" fn gnitz_batch_project_index(
+    src_handle: *const libc::c_void,
+    source_col_idx: u32,
+    index_schema_desc: *const crate::compact::SchemaDescriptor,
+) -> *mut libc::c_void {
+    if src_handle.is_null() || index_schema_desc.is_null() {
+        return ptr::null_mut();
+    }
     let result = panic::catch_unwind(|| {
-        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
-        let pi = payload_col as usize;
-        if pi >= b.col_data.len() { return ptr::null_mut(); }
-        let start = b.col_data[pi].len();
-        b.col_data[pi].resize(start + n_bytes as usize, 0);
-        unsafe { b.col_data[pi].as_mut_ptr().add(start) }
+        let src = unsafe { &*(src_handle as *const crate::memtable::OwnedBatch) };
+        let idx_schema = unsafe { *index_schema_desc };
+        let src_schema = match src.schema {
+            Some(s) => s,
+            None => return ptr::null_mut(),
+        };
+
+        let src_pk_index = src_schema.pk_index as usize;
+        let source_col = source_col_idx as usize;
+        let is_pk_col = source_col == src_pk_index;
+
+        // Payload index in col_data (columns minus PK)
+        let src_payload_idx = if is_pk_col {
+            usize::MAX
+        } else if source_col < src_pk_index {
+            source_col
+        } else {
+            source_col - 1
+        };
+
+        let src_col_type = src_schema.columns[source_col].type_code;
+        let src_col_size = src_schema.columns[source_col].size as usize;
+
+        // Output payload column size
+        let out_payload_col_schema_idx = if idx_schema.pk_index == 0 { 1usize } else { 0usize };
+        let out_payload_size = idx_schema.columns[out_payload_col_schema_idx].size as usize;
+
+        let mut out = crate::memtable::OwnedBatch::with_schema(idx_schema, src.count.max(1));
+
+        for row in 0..src.count {
+            let weight = src.get_weight(row);
+            if weight == 0 { continue; }
+
+            // Null check (PK is never null)
+            if !is_pk_col {
+                let null_word = src.get_null_word(row);
+                if null_word & (1u64 << src_payload_idx) != 0 { continue; }
+            }
+
+            // Promote source column to index key
+            let (key_lo, key_hi) = if is_pk_col {
+                (src.get_pk_lo(row), src.get_pk_hi(row))
+            } else {
+                let col = &src.col_data[src_payload_idx];
+                let offset = row * src_col_size;
+                promote_to_index_key(col, offset, src_col_size, src_col_type)
+            };
+
+            // Source PK → index payload
+            let src_pk_lo = src.get_pk_lo(row);
+            let src_pk_hi = src.get_pk_hi(row);
+
+            out.pk_lo.extend_from_slice(&key_lo.to_le_bytes());
+            out.pk_hi.extend_from_slice(&key_hi.to_le_bytes());
+            out.weight.extend_from_slice(&weight.to_le_bytes());
+            out.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+
+            if out_payload_size == 16 {
+                out.col_data[0].extend_from_slice(&src_pk_lo.to_le_bytes());
+                out.col_data[0].extend_from_slice(&src_pk_hi.to_le_bytes());
+            } else {
+                out.col_data[0].extend_from_slice(&src_pk_lo.to_le_bytes());
+            }
+
+            out.count += 1;
+        }
+
+        if out.count > 0 {
+            out.sorted = false;
+            out.consolidated = false;
+        }
+
+        Box::into_raw(Box::new(out)) as *mut libc::c_void
     });
     result.unwrap_or(ptr::null_mut())
-}
-
-/// Extend the blob arena by n_bytes, returning the offset of the newly allocated region.
-#[no_mangle]
-pub extern "C" fn gnitz_batch_blob_extend(handle: *mut libc::c_void, n_bytes: u32) -> u64 {
-    if handle.is_null() { return 0; }
-    let result = panic::catch_unwind(|| {
-        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
-        let offset = b.blob.len();
-        b.blob.resize(offset + n_bytes as usize, 0);
-        offset as u64
-    });
-    result.unwrap_or(0)
-}
-
-/// Return the current length of the blob arena.
-#[no_mangle]
-pub extern "C" fn gnitz_batch_blob_len(handle: *const libc::c_void) -> u64 {
-    if handle.is_null() { return 0; }
-    let result = panic::catch_unwind(|| {
-        let b = unsafe { &*(handle as *const crate::memtable::OwnedBatch) };
-        b.blob.len() as u64
-    });
-    result.unwrap_or(0)
-}
-
-/// Set the row count (used by RPython after bulk appends via alloc_system + col_extend).
-#[no_mangle]
-pub extern "C" fn gnitz_batch_set_count(handle: *mut libc::c_void, count: u32) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let b = unsafe { &mut *(handle as *mut crate::memtable::OwnedBatch) };
-        b.count = count as usize;
-    });
 }
 
 #[no_mangle]
@@ -4797,5 +4858,174 @@ mod tests {
     #[test]
     fn test_append_row_from_ptable_found_null_handle() {
         assert_eq!(gnitz_batch_append_row_from_ptable_found(ptr::null_mut(), ptr::null_mut(), 0, 0, 1), -1);
+    }
+
+    // -----------------------------------------------------------------------
+    // project_index
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a source batch with schema [U64(pk=0), I32(col1), U64(col2)]
+    /// and populate with test rows.
+    fn make_source_batch_for_project() -> crate::memtable::OwnedBatch {
+        use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+
+        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        columns[1] = SchemaColumn { type_code: type_code::I32, size: 4, nullable: 1, _pad: 0 };
+        columns[2] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        let schema = SchemaDescriptor { num_columns: 3, pk_index: 0, columns };
+
+        let mut src = crate::memtable::OwnedBatch::with_schema(schema, 8);
+
+        // Row 0: pk=100, col1=-5 (I32), col2=999, weight=1
+        src.pk_lo.extend_from_slice(&100u64.to_le_bytes());
+        src.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+        src.weight.extend_from_slice(&1i64.to_le_bytes());
+        src.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        src.col_data[0].extend_from_slice(&(-5i32).to_le_bytes());
+        src.col_data[1].extend_from_slice(&999u64.to_le_bytes());
+        src.count += 1;
+
+        // Row 1: pk=200, col1=42 (I32), col2=888, weight=0 (should be skipped)
+        src.pk_lo.extend_from_slice(&200u64.to_le_bytes());
+        src.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+        src.weight.extend_from_slice(&0i64.to_le_bytes());
+        src.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        src.col_data[0].extend_from_slice(&42i32.to_le_bytes());
+        src.col_data[1].extend_from_slice(&888u64.to_le_bytes());
+        src.count += 1;
+
+        // Row 2: pk=300, col1=NULL, col2=777, weight=1 (null → skipped)
+        src.pk_lo.extend_from_slice(&300u64.to_le_bytes());
+        src.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+        src.weight.extend_from_slice(&1i64.to_le_bytes());
+        // null bit for payload col 0 (col1 is schema col 1, payload col 0)
+        src.null_bmp.extend_from_slice(&1u64.to_le_bytes());
+        src.col_data[0].extend_from_slice(&0i32.to_le_bytes());
+        src.col_data[1].extend_from_slice(&777u64.to_le_bytes());
+        src.count += 1;
+
+        // Row 3: pk=400, col1=10 (I32), col2=666, weight=-1
+        src.pk_lo.extend_from_slice(&400u64.to_le_bytes());
+        src.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+        src.weight.extend_from_slice(&(-1i64).to_le_bytes());
+        src.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        src.col_data[0].extend_from_slice(&10i32.to_le_bytes());
+        src.col_data[1].extend_from_slice(&666u64.to_le_bytes());
+        src.count += 1;
+
+        src.sorted = false;
+        src.consolidated = false;
+        src
+    }
+
+    fn make_u64_index_schema() -> crate::compact::SchemaDescriptor {
+        use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+        let mut cols = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+        cols[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        cols[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns: cols }
+    }
+
+    #[test]
+    fn test_project_index_i32_to_u64() {
+        let src = make_source_batch_for_project();
+        let src_ptr = &src as *const crate::memtable::OwnedBatch as *const libc::c_void;
+        let idx_schema = make_u64_index_schema();
+
+        let result = gnitz_batch_project_index(src_ptr, 1, &idx_schema);
+        assert!(!result.is_null());
+
+        let out = unsafe { &*(result as *const crate::memtable::OwnedBatch) };
+        // Row 1 (weight=0) and Row 2 (null) should be skipped → 2 output rows
+        assert_eq!(out.count, 2);
+
+        // Row 0: I32(-5) → sign-extend to i64 → u64 = 0xFFFFFFFFFFFFFFFF - 4
+        let key0 = out.get_pk_lo(0);
+        assert_eq!(key0, -5i64 as u64);
+        assert_eq!(out.get_pk_hi(0), 0);
+        assert_eq!(out.get_weight(0), 1);
+        // Payload = source PK = 100
+        let payload0 = u64::from_le_bytes(out.col_data[0][0..8].try_into().unwrap());
+        assert_eq!(payload0, 100);
+
+        // Row 3: I32(10) → sign-extend to i64 → u64 = 10
+        let key1 = out.get_pk_lo(1);
+        assert_eq!(key1, 10);
+        assert_eq!(out.get_weight(1), -1);
+        let payload1 = u64::from_le_bytes(out.col_data[0][8..16].try_into().unwrap());
+        assert_eq!(payload1, 400);
+
+        // Clean up
+        unsafe { drop(Box::from_raw(result as *mut crate::memtable::OwnedBatch)); }
+    }
+
+    #[test]
+    fn test_project_index_u128_source_pk() {
+        use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+
+        // Source schema: U128(pk=0), U64(col1)
+        let mut src_cols = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+        src_cols[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
+        src_cols[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        let src_schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns: src_cols };
+
+        let mut src = crate::memtable::OwnedBatch::with_schema(src_schema, 4);
+        // Row: pk=(10,20), col1=42, weight=1
+        src.pk_lo.extend_from_slice(&10u64.to_le_bytes());
+        src.pk_hi.extend_from_slice(&20u64.to_le_bytes());
+        src.weight.extend_from_slice(&1i64.to_le_bytes());
+        src.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        src.col_data[0].extend_from_slice(&42u64.to_le_bytes());
+        src.count += 1;
+
+        let src_ptr = &src as *const crate::memtable::OwnedBatch as *const libc::c_void;
+
+        // Index schema: U64(pk=0), U128(payload) — source PK is U128
+        let mut idx_cols = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+        idx_cols[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        idx_cols[1] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
+        let idx_schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns: idx_cols };
+
+        let result = gnitz_batch_project_index(src_ptr, 1, &idx_schema);
+        assert!(!result.is_null());
+
+        let out = unsafe { &*(result as *const crate::memtable::OwnedBatch) };
+        assert_eq!(out.count, 1);
+        // Index key = promoted U64(42) → key_lo=42, key_hi=0
+        assert_eq!(out.get_pk_lo(0), 42);
+        assert_eq!(out.get_pk_hi(0), 0);
+        // Payload = source PK as U128: lo=10, hi=20
+        let plo = u64::from_le_bytes(out.col_data[0][0..8].try_into().unwrap());
+        let phi = u64::from_le_bytes(out.col_data[0][8..16].try_into().unwrap());
+        assert_eq!(plo, 10);
+        assert_eq!(phi, 20);
+
+        unsafe { drop(Box::from_raw(result as *mut crate::memtable::OwnedBatch)); }
+    }
+
+    #[test]
+    fn test_project_index_empty_batch() {
+        let src_schema = make_u64_index_schema();
+        let src = crate::memtable::OwnedBatch::with_schema(src_schema, 1);
+        let src_ptr = &src as *const crate::memtable::OwnedBatch as *const libc::c_void;
+        let idx_schema = make_u64_index_schema();
+
+        let result = gnitz_batch_project_index(src_ptr, 1, &idx_schema);
+        assert!(!result.is_null());
+        let out = unsafe { &*(result as *const crate::memtable::OwnedBatch) };
+        assert_eq!(out.count, 0);
+        assert!(out.sorted);
+        assert!(out.consolidated);
+
+        unsafe { drop(Box::from_raw(result as *mut crate::memtable::OwnedBatch)); }
+    }
+
+    #[test]
+    fn test_project_index_null_handles() {
+        let idx_schema = make_u64_index_schema();
+
+        assert!(gnitz_batch_project_index(ptr::null(), 0, &idx_schema).is_null());
+        assert!(gnitz_batch_project_index(ptr::null(), 0, ptr::null()).is_null());
     }
 }
