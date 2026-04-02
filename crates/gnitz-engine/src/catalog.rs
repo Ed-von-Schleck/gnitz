@@ -1101,6 +1101,11 @@ impl CatalogEngine {
                     directory.clone(),
                 );
 
+                // Advance next_table_id if this is a gap recovery
+                if tid + 1 > self.next_table_id {
+                    self.next_table_id = tid + 1;
+                }
+
                 // Wire FK constraints
                 self.wire_fk_constraints(tid, &col_defs);
 
@@ -1205,6 +1210,11 @@ impl CatalogEngine {
                     false,
                     directory.clone(),
                 );
+
+                // Advance next_table_id if this is a gap recovery
+                if vid + 1 > self.next_table_id {
+                    self.next_table_id = vid + 1;
+                }
 
                 // Leak the Box
                 let _ = Box::into_raw(et_box);
@@ -3026,32 +3036,417 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_sequence_gap_recovery ────────────────────────────────
-    // Note: This test verifies that DagEngine.register_table correctly
-    // advances the next_table_id when a high table_id is encountered.
-    // The RPython test directly injects records into system tables;
-    // in the Rust catalog this happens naturally through the hooks.
-    // E2E tests cover the full sequence recovery scenario.
+    // ── Missing edge cases from RPython test_edge_cases ─────────────────
 
-    // ── RPython test_programmable_zset_lifecycle ──────────────────────────
-    // This is a full-stack integration test covering:
-    //   bootstrap, schemas, tables, FKs, views, compilation, execution,
-    //   persistence, recovery, teardown.
-    // Equivalent coverage is provided by:
-    //   - test_bootstrap, test_ddl, test_fk_*, test_view_*, test_restart_full
-    //   - E2E tests: test_ddl.py, test_views.py, test_persistence.py
+    #[test]
+    fn test_edge_cases_extended() {
+        let dir = temp_dir("edge_ext");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id")];
+
+        // #16. Multiple dots in qualified name — second part contains dot
+        assert!(engine.create_table("public.schema.tbl", &cols, 0, true).is_err());
+
+        // #17. get_by_name on non-existent returns None
+        assert!(engine.get_by_name("public", "nonexistent").is_none());
+
+        // #20. has_id / get_schema for valid and invalid IDs
+        let tid = engine.create_table("public.reg_test", &cols, 0, true).unwrap();
+        assert!(engine.has_id(tid));
+        assert!(engine.get_schema(tid).is_some());
+        assert!(!engine.has_id(999999));
+        assert!(engine.get_schema(999999).is_none());
+        engine.drop_table("public.reg_test").unwrap();
+
+        // #26. Creating a user table in _system schema should fail
+        // (_system identifier starts with '_' → rejected by validate_user_identifier)
+        assert!(engine.create_table("_system.new_tbl", &cols, 0, true).is_err());
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     // ── RPython test_enforce_unique_pk ────────────────────────────────────
-    // The enforce_unique_pk logic is in DagEngine.enforce_unique_pk (Rust).
-    // Coverage: dag.rs unit tests + E2E test_unique_pk.py (199 lines, 8 tests)
+
+    /// Test unique_pk enforcement via a single-partition Table (system table range).
+    /// DagEngine.enforce_unique_pk only operates on Single stores; PartitionedTable
+    /// unique_pk is handled by the RPython ingest layer. E2E test_unique_pk.py
+    /// covers the full-stack partitioned case.
+    #[test]
+    fn test_enforce_unique_pk() {
+        let dir = temp_dir("enforce_upk");
+
+        // Create a Table directly (Single store) to test enforce_unique_pk
+        ensure_dir(&dir).unwrap();
+        let schema = make_schema(&[u64_col(), u64_col()], 0); // id (PK), val
+        let tdir = format!("{}/upk_table", dir);
+        let mut table = Table::new(&tdir, "upk", schema, 100, SYS_TABLE_ARENA, false).unwrap();
+
+        let mut dag = DagEngine::new();
+        let table_ptr = &mut table as *mut Table;
+        dag.register_table(100, StoreHandle::Single(table_ptr), schema, 0, true, tdir.clone());
+
+        let make_row = |pk: u64, val: u64, w: i64| -> OwnedBatch {
+            let mut bb = BatchBuilder::new(schema);
+            bb.begin_row(pk, 0, w);
+            bb.put_u64(val);
+            bb.end_row();
+            bb.finish()
+        };
+
+        let scan = |table: &mut Table| -> usize {
+            let cursor = table.create_cursor().unwrap();
+            let mut c = cursor;
+            let mut count = 0;
+            while c.cursor.valid {
+                if c.cursor.current_weight > 0 { count += 1; }
+                c.cursor.advance();
+            }
+            count
+        };
+
+        // ST1: insert new PK
+        dag.ingest_to_family(100, make_row(1, 10, 1));
+        assert_eq!(scan(&mut table), 1);
+
+        // ST2: insert different PK
+        dag.ingest_to_family(100, make_row(2, 20, 1));
+        assert_eq!(scan(&mut table), 2);
+
+        // ST3: intra-batch duplicate — last value wins (enforce_unique_pk
+        // handles intra-batch dedup correctly)
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(5, 0, 1); bb.put_u64(10); bb.end_row();
+        bb.begin_row(5, 0, 1); bb.put_u64(20); bb.end_row();
+        dag.ingest_to_family(100, bb.finish());
+        assert_eq!(scan(&mut table), 3, "Intra-batch dup: PK=5 has 1 net row");
+
+        // ST4: intra-batch insert then delete cancel each other
+        let mut bb2 = BatchBuilder::new(schema);
+        bb2.begin_row(6, 0, 1); bb2.put_u64(10); bb2.end_row();
+        bb2.begin_row(6, 0, -1); bb2.put_u64(10); bb2.end_row();
+        dag.ingest_to_family(100, bb2.finish());
+        // PK=6 cancelled, existing PKs (1,2,5) remain
+        assert_eq!(scan(&mut table), 3, "Insert+delete cancel: PK=6 not added");
+
+        // Note: cross-batch upsert (retract stored row + insert new) requires
+        // the RPython _enforce_unique_pk which emits the stored retraction.
+        // DagEngine.enforce_unique_pk calls retract_pk but doesn't emit
+        // the retraction into the effective batch. Full-stack upsert is
+        // tested by E2E test_unique_pk.py (8 tests).
+
+        dag.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     // ── RPython test_orphaned_metadata_recovery ──────────────────────────
-    // Tests that injecting corrupt metadata (index pointing to non-existent table)
-    // causes an error on reload. This requires low-level system table manipulation
-    // which is better tested at the integration level.
-    // Coverage: the hook code correctly propagates errors from get_by_id lookups.
 
-    // ── RPython test_schema_mr_poisoning ──────────────────────────────────
-    // Tests merge_schemas_for_join safety. This is a types.py test, not catalog.
-    // Already covered by Rust vm.rs join tests and E2E test_dbsp_ops.py.
+    #[test]
+    fn test_orphaned_metadata_recovery() {
+        let dir = temp_dir("orphaned");
+
+        // First open: inject an index record pointing to non-existent table 99999
+        {
+            let mut engine = CatalogEngine::open(&dir).unwrap();
+            let idx_schema = idx_tab_schema();
+            let mut bb = BatchBuilder::new(idx_schema);
+            bb.begin_row(888, 0, 1);
+            bb.put_u64(99999);   // owner_id (non-existent)
+            bb.put_u64(OWNER_KIND_TABLE as u64);
+            bb.put_u64(1);       // source_col_idx
+            bb.put_string("orphaned_idx");
+            bb.put_u64(0);       // is_unique
+            bb.put_string("");   // cache_dir
+            bb.end_row();
+            ingest_batch_into(&mut engine.sys_indices, &bb.finish());
+            let _ = engine.sys_indices.flush();
+            engine.close();
+            drop(engine);
+        }
+
+        // Re-open should fail because the orphaned index references table 99999
+        let result = CatalogEngine::open(&dir);
+        assert!(result.is_err(), "Orphaned index metadata should cause error on reload");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── RPython test_sequence_gap_recovery ────────────────────────────────
+
+    #[test]
+    fn test_sequence_gap_recovery() {
+        let dir = temp_dir("seq_gap");
+        let cols = vec![u64_col_def("id")];
+
+        // First open: create a table, then inject a table record with high ID 250
+        {
+            let mut engine = CatalogEngine::open(&dir).unwrap();
+            engine.create_table("public.t1", &cols, 0, true).unwrap();
+
+            // Inject table record for tid=250 directly into sys_tables
+            let tbl_schema = table_tab_schema();
+            let mut bb = BatchBuilder::new(tbl_schema);
+            bb.begin_row(250, 0, 1);
+            bb.put_u64(PUBLIC_SCHEMA_ID as u64); // schema_id
+            bb.put_string("gap_table");
+            bb.put_string(&format!("{}/public/gap", dir));
+            bb.put_u64(0); // pk_col_idx
+            bb.put_u64(0); // created_lsn
+            bb.put_u64(0); // flags
+            bb.end_row();
+            ingest_batch_into(&mut engine.sys_tables, &bb.finish());
+
+            // Inject column record for tid=250
+            let col_schema = col_tab_schema();
+            let mut cbb = BatchBuilder::new(col_schema);
+            let pk = pack_column_id(250, 0);
+            cbb.begin_row(pk, 0, 1);
+            cbb.put_u64(250);   // owner_id
+            cbb.put_u64(OWNER_KIND_TABLE as u64);
+            cbb.put_u64(0);     // col_idx
+            cbb.put_string("id");
+            cbb.put_u64(type_code::U64 as u64);
+            cbb.put_u64(0);     // is_nullable
+            cbb.put_u64(0);     // fk_table_id
+            cbb.put_u64(0);     // fk_col_idx
+            cbb.end_row();
+            ingest_batch_into(&mut engine.sys_columns, &cbb.finish());
+
+            let _ = engine.sys_tables.flush();
+            let _ = engine.sys_columns.flush();
+            engine.close();
+            drop(engine);
+        }
+
+        // Re-open: sequence should recover to 251
+        {
+            let mut engine = CatalogEngine::open(&dir).unwrap();
+            let new_tid = engine.create_table("public.tnext", &cols, 0, true).unwrap();
+            assert_eq!(new_tid, 251, "Sequence recovery: expected 251, got {}", new_tid);
+            engine.close();
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── RPython test_fk_referential_integrity (U128 extension) ───────────
+
+    #[test]
+    fn test_fk_u128() {
+        let dir = temp_dir("fk_u128");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        // U128 parent
+        let parent_tid = engine.create_table("public.uparents",
+            &[u128_col_def("uuid")], 0, true).unwrap();
+
+        // U128 FK child
+        let child_cols = vec![
+            u64_col_def("id"),
+            ColumnDef { name: "ufk".into(), type_code: type_code::U128, is_nullable: false,
+                        fk_table_id: parent_tid, fk_col_idx: 0 },
+        ];
+        let child_tid = engine.create_table("public.uchildren", &child_cols, 0, true).unwrap();
+
+        // Insert parent with U128 PK (lo=0xBBBB, hi=0xAAAA)
+        let parent_schema = engine.get_schema(parent_tid).unwrap();
+        let mut pbb = BatchBuilder::new(parent_schema);
+        pbb.begin_row(0xBBBB, 0xAAAA, 1);
+        pbb.end_row();
+        engine.dag.ingest_to_family(parent_tid, pbb.finish());
+        let _ = engine.dag.flush(parent_tid);
+
+        // Valid child FK (matches parent)
+        let child_schema = engine.get_schema(child_tid).unwrap();
+        let mut cbb = BatchBuilder::new(child_schema);
+        cbb.begin_row(1, 0, 1);
+        cbb.put_u128(0xBBBB, 0xAAAA);
+        cbb.end_row();
+        assert!(engine.validate_fk_inline(child_tid, &cbb.finish()).is_ok());
+
+        // Invalid child FK (no such parent)
+        let mut cbb2 = BatchBuilder::new(child_schema);
+        cbb2.begin_row(2, 0, 1);
+        cbb2.put_u128(0xDEAD, 0xBEEF);
+        cbb2.end_row();
+        assert!(engine.validate_fk_inline(child_tid, &cbb2.finish()).is_err());
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── View live incremental update ──────────────────────────────────────
+
+    #[test]
+    fn test_view_live_update() {
+        let dir = temp_dir("view_live");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        let cols = vec![u64_col_def("id"), i64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, true).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Ingest initial data
+        let mut bb = BatchBuilder::new(schema);
+        for i in 0..5u64 {
+            bb.begin_row(i, 0, 1);
+            bb.put_u64(i * 10);
+            bb.end_row();
+        }
+        engine.dag.ingest_to_family(tid, bb.finish());
+        let _ = engine.dag.flush(tid);
+
+        // Create passthrough view — should backfill 5 rows
+        let out_cols = vec![
+            ("id".to_string(), type_code::U64),
+            ("val".to_string(), type_code::I64),
+        ];
+        let graph = make_passthrough_graph(tid, &out_cols);
+        let vid = engine.create_view("public.v", &graph, "").unwrap();
+
+        let view_schema = engine.dag.tables.get(&vid).unwrap().schema;
+        let b1 = engine.scan_store(vid, &view_schema);
+        assert_eq!(b1.count, 5, "Backfill: expected 5, got {}", b1.count);
+
+        // Live update: ingest 1 more row + evaluate DAG
+        let mut bb2 = BatchBuilder::new(schema);
+        bb2.begin_row(99, 0, 1);
+        bb2.put_u64(999);
+        bb2.end_row();
+        let delta = bb2.finish();
+        engine.dag.ingest_to_family(tid, delta.clone_batch());
+        let _ = engine.dag.flush(tid);
+        engine.dag.evaluate_dag(tid, delta);
+
+        let b2 = engine.scan_store(vid, &view_schema);
+        assert_eq!(b2.count, 6, "Live update: expected 6, got {}", b2.count);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Index live fan-out ────────────────────────────────────────────────
+
+    #[test]
+    fn test_index_live_fanout() {
+        let dir = temp_dir("idx_fanout");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        let cols = vec![u64_col_def("id"), i64_col_def("val")];
+        let tid = engine.create_table("public.tfanout", &cols, 0, true).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Ingest 5 rows
+        let mut bb = BatchBuilder::new(schema);
+        for i in 0..5u64 {
+            bb.begin_row(i, 0, 1);
+            bb.put_u64(i * 100);
+            bb.end_row();
+        }
+        engine.dag.ingest_to_family(tid, bb.finish());
+        let _ = engine.dag.flush(tid);
+
+        // Create index — should backfill 5 rows
+        engine.create_index("public.tfanout", "val", false).unwrap();
+
+        // Live fan-out: ingest 1 more row via ingest_to_family (which does index projection)
+        let mut bb2 = BatchBuilder::new(schema);
+        bb2.begin_row(99, 0, 1);
+        bb2.put_u64(777);
+        bb2.end_row();
+        engine.dag.ingest_to_family(tid, bb2.finish());
+        let _ = engine.dag.flush(tid);
+
+        // Verify index has 6 entries via DagEngine's index circuit
+        let entry = engine.dag.tables.get(&tid).unwrap();
+        assert_eq!(entry.index_circuits.len(), 1, "Expected 1 index circuit");
+        let idx_handle = entry.index_circuits[0].index_handle;
+        assert!(!idx_handle.is_null());
+        let idx_table = unsafe { &mut *idx_handle };
+        let idx_count = count_records(idx_table);
+        assert_eq!(idx_count, 6, "Index fanout: expected 6, got {}", idx_count);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Full lifecycle (replaces test_programmable_zset_lifecycle) ────────
+
+    #[test]
+    fn test_full_lifecycle() {
+        let dir = temp_dir("lifecycle");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        // 1. Schema
+        engine.create_schema("app").unwrap();
+
+        // 2. Tables with FK
+        let users_tid = engine.create_table("app.users",
+            &[u128_col_def("uid"), str_col_def("username")], 0, true).unwrap();
+
+        let order_cols = vec![
+            u64_col_def("oid"),
+            ColumnDef { name: "uid".into(), type_code: type_code::U128, is_nullable: false,
+                        fk_table_id: users_tid, fk_col_idx: 0 },
+            i64_col_def("amount"),
+        ];
+        let orders_tid = engine.create_table("app.orders", &order_cols, 0, true).unwrap();
+
+        // 3. FK enforcement: invalid order (no matching user)
+        let orders_schema = engine.get_schema(orders_tid).unwrap();
+        let mut bad = BatchBuilder::new(orders_schema);
+        bad.begin_row(1, 0, 1);
+        bad.put_u128(0xCAFEBABE, 0xDEADBEEF);
+        bad.put_u64(500);
+        bad.end_row();
+        assert!(engine.validate_fk_inline(orders_tid, &bad.finish()).is_err());
+
+        // 4. Ingest valid user + order
+        let users_schema = engine.get_schema(users_tid).unwrap();
+        let mut ub = BatchBuilder::new(users_schema);
+        ub.begin_row(0xCAFEBABE, 0xDEADBEEF, 1);
+        ub.put_string("alice");
+        ub.end_row();
+        engine.dag.ingest_to_family(users_tid, ub.finish());
+        let _ = engine.dag.flush(users_tid);
+
+        let mut ob = BatchBuilder::new(orders_schema);
+        ob.begin_row(101, 0, 1);
+        ob.put_u128(0xCAFEBABE, 0xDEADBEEF);
+        ob.put_u64(1000);
+        ob.end_row();
+        assert!(engine.validate_fk_inline(orders_tid, &ob.finish()).is_ok());
+
+        // 5. View
+        let out_cols = vec![
+            ("uid".to_string(), type_code::U128),
+            ("username".to_string(), type_code::STRING),
+        ];
+        let graph = make_passthrough_graph(users_tid, &out_cols);
+        let view_tid = engine.create_view("app.active_users", &graph, "SELECT * FROM users").unwrap();
+
+        // 5.1 Can't drop table referenced by view
+        assert!(engine.drop_table("app.users").is_err());
+
+        // 6. Persistence
+        engine.close();
+        drop(engine);
+
+        let mut engine2 = CatalogEngine::open(&dir).unwrap();
+        assert!(engine2.get_by_name("app", "users").is_some());
+        assert!(engine2.get_by_name("app", "active_users").is_some());
+
+        // 7. Compilation recovery
+        assert!(engine2.dag.ensure_compiled(view_tid));
+
+        // 8. Teardown
+        engine2.drop_view("app.active_users").unwrap();
+        engine2.drop_table("app.orders").unwrap();
+        engine2.drop_table("app.users").unwrap();
+        engine2.drop_schema("app").unwrap();
+        assert!(!engine2.has_schema("app"));
+
+        engine2.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
