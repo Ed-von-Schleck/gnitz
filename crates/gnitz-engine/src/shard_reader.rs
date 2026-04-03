@@ -409,6 +409,7 @@ mod tests {
 
     #[test]
     fn open_and_read() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
         let path = build_test_shard(dir.path(), &rows);
@@ -425,6 +426,7 @@ mod tests {
 
     #[test]
     fn binary_search() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=100).map(|i| (i * 2, i as i64)).collect();
         let path = build_test_shard(dir.path(), &rows);
@@ -447,6 +449,7 @@ mod tests {
 
     #[test]
     fn col_ptr_by_logical() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows = vec![(1u64, 42i64), (2, 84)];
         let path = build_test_shard(dir.path(), &rows);
@@ -468,6 +471,7 @@ mod tests {
 
     #[test]
     fn checksum_validation() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows = vec![(1u64, 10i64)];
         let path = build_test_shard(dir.path(), &rows);
@@ -490,6 +494,7 @@ mod tests {
 
     #[test]
     fn empty_shard() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = vec![];
         let path = build_test_shard(dir.path(), &rows);

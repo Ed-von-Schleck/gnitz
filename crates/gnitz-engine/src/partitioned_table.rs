@@ -407,6 +407,7 @@ mod tests {
 
     #[test]
     fn single_partition_lifecycle() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("sp_test");
         let schema = make_schema();
@@ -426,6 +427,7 @@ mod tests {
 
     #[test]
     fn multi_partition_hash_routing() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("mp_test");
         let schema = make_schema();
@@ -446,6 +448,7 @@ mod tests {
 
     #[test]
     fn multi_partition_cursor() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("mc_test");
         let schema = make_schema();
@@ -464,6 +467,7 @@ mod tests {
 
     #[test]
     fn retract_pk_routing() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("rt_test");
         let schema = make_schema();
@@ -486,6 +490,7 @@ mod tests {
 
     #[test]
     fn close_partitions_outside() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cpo_test");
         let schema = make_schema();

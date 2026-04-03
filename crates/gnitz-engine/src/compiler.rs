@@ -1467,9 +1467,14 @@ fn emit_node(
 
         OPCODE_DELAY => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            reg_schemas[reg_id as usize] = reg_schemas[in_reg as usize];
+            let state_reg = state.next_extra_reg;
+            state.next_extra_reg += 1;
+            let in_schema = reg_schemas[in_reg as usize];
+            reg_schemas[state_reg as usize] = in_schema;
+            reg_kinds[state_reg as usize] = 2;
+            reg_schemas[reg_id as usize] = in_schema;
             reg_kinds[reg_id as usize] = 0;
-            builder.add_delay(in_reg as u16, reg_id as u16);
+            builder.add_delay(in_reg as u16, state_reg as u16, reg_id as u16);
         }
 
         OPCODE_ANTI_JOIN_DELTA_TRACE => {
@@ -1922,6 +1927,8 @@ fn build_plan(
             if table_id > 0 && !ann.trace_side_sources.contains(&nid) {
                 extra_regs += 1;
             }
+        } else if op == OPCODE_DELAY {
+            extra_regs += 1;
         }
     }
 

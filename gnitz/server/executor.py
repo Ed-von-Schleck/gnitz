@@ -3,13 +3,14 @@
 import os
 import time
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_uint64, intmask
+from rpython.rlib.rarithmetic import r_uint64, r_int64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.server import ipc, ipc_ffi, rust_ffi
 from gnitz.core import errors
 from gnitz.storage.owned_batch import ArenaZSetBatch
+from gnitz.core.keys import promote_to_index_key
 from gnitz.catalog import system_tables as sys
 from gnitz.catalog.engine import catalog_advance_sequence
 from gnitz.storage import engine_ffi
@@ -62,6 +63,138 @@ def _catalog_has_id(engine, tid):
     """Check if a table/view id exists in the catalog."""
     return intmask(engine_ffi._catalog_has_id(
         engine._handle, rffi.cast(rffi.LONGLONG, tid))) != 0
+
+
+def _build_check_batch(schema, lo_list, hi_list):
+    """Build a batch of (pk_lo, pk_hi, weight=1, null payloads) for PK existence checks."""
+    batch = ArenaZSetBatch(schema, initial_capacity=len(lo_list))
+    builder = sys.RowBuilder(schema, batch)
+    for k in range(len(lo_list)):
+        builder.begin(lo_list[k], hi_list[k], r_int64(1))
+        for _pi in range(schema.n_payload):
+            builder.put_null()
+        builder.commit()
+    return batch
+
+
+def _validate_unique_distributed(cat_handle, target_id, batch, dispatcher, engine):
+    """Cross-epoch, cross-partition unique index check.
+
+    The Rust _catalog_validate_unique_indices only catches within-batch
+    duplicates and checks the master's (empty) index tables.  This function
+    broadcasts each new index key to all workers and raises LayoutError if any
+    worker already holds that key.
+
+    Called from the two multi-worker push paths in dispatch_push, before
+    fan_out_push / pending.add.
+    """
+    n_circuits = intmask(engine_ffi._catalog_get_index_circuit_count(
+        cat_handle, rffi.cast(rffi.LONGLONG, target_id)))
+    if n_circuits == 0:
+        return
+
+    out_col = lltype.malloc(rffi.UINTP.TO, 1, flavor="raw")
+    out_uniq = lltype.malloc(rffi.INTP.TO, 1, flavor="raw")
+    out_tc = lltype.malloc(rffi.UCHARP.TO, 1, flavor="raw")
+    idx_schema_buf = lltype.malloc(rffi.CCHARP.TO, engine_ffi.SCHEMA_DESC_SIZE, flavor="raw")
+    try:
+        # Quick check: any unique circuit?
+        has_unique = False
+        for ci in range(n_circuits):
+            rc = engine_ffi._catalog_get_index_circuit_info(
+                cat_handle, rffi.cast(rffi.LONGLONG, target_id),
+                rffi.cast(rffi.UINT, ci), out_col, out_uniq, out_tc)
+            if intmask(rc) >= 0 and intmask(out_uniq[0]) != 0:
+                has_unique = True
+                break
+        if not has_unique:
+            return
+
+        source_schema = _catalog_get_schema(engine, target_id)
+        n = batch.length()
+
+        # Find which PKs already exist so we can skip UPSERT rows (the worker
+        # handles retract+reinsert; re-inserting the same value is not a
+        # violation).
+        existing_pks = {}
+        pk_lo_list = newlist_hint(n)
+        pk_hi_list = newlist_hint(n)
+        for i in range(n):
+            if batch.get_weight(i) <= r_int64(0):
+                continue
+            pk_lo_list.append(r_uint64(batch._read_pk_lo(i)))
+            pk_hi_list.append(r_uint64(batch._read_pk_hi(i)))
+        if len(pk_lo_list) > 0:
+            pk_batch = _build_check_batch(source_schema, pk_lo_list, pk_hi_list)
+            existing_pks = dispatcher.check_pk_existence(
+                target_id, pk_batch, source_schema)
+            pk_batch.free()
+
+        # Check each unique index circuit
+        for ci in range(n_circuits):
+            rc = engine_ffi._catalog_get_index_circuit_info(
+                cat_handle, rffi.cast(rffi.LONGLONG, target_id),
+                rffi.cast(rffi.UINT, ci), out_col, out_uniq, out_tc)
+            if intmask(rc) < 0 or intmask(out_uniq[0]) == 0:
+                continue
+            source_col_idx = intmask(out_col[0])
+
+            rc2 = engine_ffi._catalog_get_index_circuit_schema(
+                cat_handle, rffi.cast(rffi.LONGLONG, target_id),
+                rffi.cast(rffi.UINT, ci),
+                rffi.cast(rffi.VOIDP, idx_schema_buf))
+            if intmask(rc2) < 0:
+                continue
+            idx_schema = engine_ffi.unpack_schema(idx_schema_buf)
+            col_type = source_schema.columns[source_col_idx].field_type
+
+            # Collect unique positive-weight index keys from the batch
+            check_lo = newlist_hint(n)
+            check_hi = newlist_hint(n)
+            seen_dict = {}  # {int: {int: True}} for O(1) dedup
+            acc = batch.get_accessor(0)
+            for i in range(n):
+                if batch.get_weight(i) <= r_int64(0):
+                    continue
+                batch.bind_accessor(i, acc)
+                if acc.is_null(source_col_idx):
+                    continue
+                pk_lo_i = intmask(r_uint64(batch._read_pk_lo(i)))
+                pk_hi_i = intmask(r_uint64(batch._read_pk_hi(i)))
+                if pk_lo_i in existing_pks and pk_hi_i in existing_pks[pk_lo_i]:
+                    continue
+                idx_key = promote_to_index_key(acc, source_col_idx, col_type)
+                lo = r_uint64(intmask(idx_key))
+                hi = r_uint64(intmask(idx_key >> 64))
+                lo_int = intmask(lo)
+                hi_int = intmask(hi)
+                if lo_int in seen_dict and hi_int in seen_dict[lo_int]:
+                    raise errors.LayoutError(
+                        "Unique index violation on column '%s': duplicate in batch"
+                        % source_schema.columns[source_col_idx].name)
+                if lo_int not in seen_dict:
+                    seen_dict[lo_int] = {}
+                seen_dict[lo_int][hi_int] = True
+                check_lo.append(lo)
+                check_hi.append(hi)
+
+            if len(check_lo) == 0:
+                continue
+
+            chk_batch = _build_check_batch(idx_schema, check_lo, check_hi)
+            any_exists = dispatcher.check_pk_exists_broadcast(
+                target_id, source_col_idx, chk_batch, idx_schema)
+            chk_batch.free()
+
+            if any_exists:
+                raise errors.LayoutError(
+                    "Unique index violation on column '%s'"
+                    % source_schema.columns[source_col_idx].name)
+    finally:
+        lltype.free(out_col, flavor="raw")
+        lltype.free(out_uniq, flavor="raw")
+        lltype.free(out_tc, flavor="raw")
+        lltype.free(idx_schema_buf, flavor="raw")
 
 
 def _op_union_merge(batch_a, batch_b, out):
@@ -747,6 +880,8 @@ class ServerExecutor(object):
                 payload.batch._handle)
             if intmask(rc) < 0:
                 _raise_catalog_error("Unique index violation")
+            _validate_unique_distributed(
+                cat_h, target_id, payload.batch, self.dispatcher, self.engine)
             cloned = payload.batch.clone()
             pending.add(fd, client_id, target_id, cloned, target_schema)
             return
@@ -834,6 +969,8 @@ class ServerExecutor(object):
                     in_batch._handle)
                 if intmask(rc) < 0:
                     _raise_catalog_error("Unique index violation")
+                _validate_unique_distributed(
+                    cat_h, target_id, in_batch, self.dispatcher, self.engine)
                 self.dispatcher.fan_out_push(target_id, in_batch, schema)
                 return None  # (non-socket path; LSN not tracked here)
             else:

@@ -368,44 +368,6 @@ class ArenaZSetBatch(object):
             self._invalidate_cache()
             return
 
-        from gnitz.storage.cursor import RustCursorAccessor
-        from gnitz.storage.ephemeral_table import TableFoundAccessor
-        from gnitz.storage.partitioned_table import PTableFoundAccessor
-
-        if isinstance(accessor, RustCursorAccessor):
-            rc = engine_ffi._batch_append_row_from_cursor(
-                self._handle, accessor._handle,
-                rffi.cast(rffi.LONGLONG, weight),
-            )
-            if intmask(rc) < 0:
-                raise errors.StorageError("append_row_from_cursor failed")
-            self._invalidate_cache()
-            return
-
-        if isinstance(accessor, TableFoundAccessor):
-            rc = engine_ffi._batch_append_row_from_table_found(
-                self._handle, accessor._handle,
-                rffi.cast(rffi.ULONGLONG, pk_lo),
-                rffi.cast(rffi.ULONGLONG, pk_hi),
-                rffi.cast(rffi.LONGLONG, weight),
-            )
-            if intmask(rc) < 0:
-                raise errors.StorageError("append_row_from_table_found failed")
-            self._invalidate_cache()
-            return
-
-        if isinstance(accessor, PTableFoundAccessor):
-            rc = engine_ffi._batch_append_row_from_ptable_found(
-                self._handle, accessor._handle,
-                rffi.cast(rffi.ULONGLONG, pk_lo),
-                rffi.cast(rffi.ULONGLONG, pk_hi),
-                rffi.cast(rffi.LONGLONG, weight),
-            )
-            if intmask(rc) < 0:
-                raise errors.StorageError("append_row_from_ptable_found failed")
-            self._invalidate_cache()
-            return
-
         raise errors.StorageError("append_from_accessor: unknown accessor type")
 
     def clone(self):

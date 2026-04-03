@@ -8,7 +8,6 @@ from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage.owned_batch import ArenaZSetBatch
-from gnitz.storage.partitioned_table import _partition_for_key
 
 
 class PartitionAssignment(object):

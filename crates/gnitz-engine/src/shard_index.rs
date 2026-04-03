@@ -763,6 +763,7 @@ mod tests {
 
     #[test]
     fn test_add_shard_and_find_pk() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -790,6 +791,7 @@ mod tests {
 
     #[test]
     fn test_manifest_roundtrip_with_levels() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -824,6 +826,7 @@ mod tests {
 
     #[test]
     fn test_run_compact_l0_to_l1() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -857,6 +860,7 @@ mod tests {
 
     #[test]
     fn test_compact_guards_if_needed() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -890,6 +894,7 @@ mod tests {
 
     #[test]
     fn test_compact_guard_vertical_failure_leaves_index_unchanged() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -971,6 +976,7 @@ mod tests {
 
     #[test]
     fn test_try_cleanup() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -997,6 +1003,7 @@ mod tests {
 
     #[test]
     fn test_max_lsn() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1019,6 +1026,7 @@ mod tests {
 
     #[test]
     fn test_run_compact_fails_on_long_path_l0_intact() {
+        crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
 

@@ -94,3 +94,17 @@ pub fn cstr_from_buf(buf: &[u8]) -> &str {
 pub fn align8(val: usize) -> usize {
     (val + 7) & !7
 }
+
+/// Raise RLIMIT_NOFILE soft limit to the hard limit.
+/// Called once per process via `std::sync::Once`; safe to invoke from any test.
+pub fn raise_fd_limit_for_tests() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| unsafe {
+        let mut rlim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur < rlim.rlim_max {
+            rlim.rlim_cur = rlim.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        }
+    });
+}

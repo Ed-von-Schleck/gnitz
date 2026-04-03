@@ -2586,6 +2586,13 @@ impl CatalogEngine {
             .unwrap_or(std::ptr::null_mut())
     }
 
+    /// Get the SchemaDescriptor for the index circuit at position idx.
+    pub fn get_index_circuit_schema(&self, table_id: i64, idx: usize) -> Option<SchemaDescriptor> {
+        self.dag.tables.get(&table_id)
+            .and_then(|e| e.index_circuits.get(idx))
+            .map(|ic| ic.index_schema)
+    }
+
     /// Get column names for a table/view. Cached after first lookup.
     pub fn get_column_names(&mut self, table_id: i64) -> Vec<String> {
         if let Some(names) = self.col_names_cache.get(&table_id) {
@@ -2949,6 +2956,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> String {
+        crate::util::raise_fd_limit_for_tests();
         let path = format!("/tmp/gnitz_catalog_test_{}", name);
         let _ = fs::remove_dir_all(&path);
         path

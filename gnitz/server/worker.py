@@ -355,7 +355,11 @@ class WorkerProcess(object):
                 raise errors.LayoutError(
                     "No unique index on column %d for table %d"
                     % (col_idx, target_id))
-            schema = _catalog_get_schema(self.engine, target_id)
+            # Use the check batch's schema (idx_schema) for the response —
+            # master only reads weights; using source_schema here would cause a
+            # schema-mismatch panic in _direct_append_row (idx_schema has
+            # fewer payload columns than source_schema).
+            schema = batch._schema if batch is not None else _catalog_get_schema(self.engine, target_id)
             result = ArenaZSetBatch(schema)
             n = batch.length() if batch is not None else 0
             for i in range(n):

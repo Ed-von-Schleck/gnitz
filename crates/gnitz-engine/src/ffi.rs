@@ -4388,6 +4388,34 @@ pub extern "C" fn gnitz_catalog_get_index_circuit_info(
     result.unwrap_or(-1)
 }
 
+/// Get the SchemaDescriptor of the index circuit at position idx.
+/// Writes a SchemaDescriptor (264 bytes) into out_schema. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_index_circuit_schema(
+    handle: *const c_void,
+    table_id: i64, idx: u32,
+    out_schema: *mut c_void,
+) -> c_int {
+    if handle.is_null() || out_schema.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        match engine.get_index_circuit_schema(table_id, idx as usize) {
+            Some(schema) => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &schema as *const crate::compact::SchemaDescriptor as *const u8,
+                        out_schema as *mut u8,
+                        std::mem::size_of::<crate::compact::SchemaDescriptor>(),
+                    );
+                }
+                0
+            }
+            None => -1,
+        }
+    });
+    result.unwrap_or(-1)
+}
+
 /// Get index store handle (Table*) for a specific column index.
 #[no_mangle]
 pub extern "C" fn gnitz_catalog_get_index_store(
