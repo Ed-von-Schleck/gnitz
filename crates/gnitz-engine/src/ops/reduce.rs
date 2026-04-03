@@ -114,40 +114,37 @@ impl Accumulator {
                 self.acc = self.acc.wrapping_add(weight);
             }
             AGG_SUM => {
-                let val = read_col_value(mb, row, col_idx, pk_index);
                 if is_f {
+                    let val_f = read_col_value_f64(mb, row, col_idx, pk_index, self.col_type_code);
                     let cur_f = f64::from_bits(self.acc as u64);
-                    let val_f = f64::from_bits(val as u64);
                     let w_f = weight as f64;
                     self.acc = f64::to_bits(cur_f + val_f * w_f) as i64;
                 } else {
-                    let val_s = val as i64;
-                    self.acc = self.acc.wrapping_add(val_s.wrapping_mul(weight));
+                    let val = read_col_value(mb, row, col_idx, pk_index, self.col_type_code);
+                    self.acc = self.acc.wrapping_add(val.wrapping_mul(weight));
                 }
             }
             AGG_MIN => {
-                let val = read_col_value(mb, row, col_idx, pk_index);
                 if is_f {
-                    let v = f64::from_bits(val as u64);
+                    let v = read_col_value_f64(mb, row, col_idx, pk_index, self.col_type_code);
                     if first || v < f64::from_bits(self.acc as u64) {
                         self.acc = f64::to_bits(v) as i64;
                     }
                 } else {
-                    let v = val as i64;
+                    let v = read_col_value(mb, row, col_idx, pk_index, self.col_type_code);
                     if first || v < self.acc {
                         self.acc = v;
                     }
                 }
             }
             AGG_MAX => {
-                let val = read_col_value(mb, row, col_idx, pk_index);
                 if is_f {
-                    let v = f64::from_bits(val as u64);
+                    let v = read_col_value_f64(mb, row, col_idx, pk_index, self.col_type_code);
                     if first || v > f64::from_bits(self.acc as u64) {
                         self.acc = f64::to_bits(v) as i64;
                     }
                 } else {
-                    let v = val as i64;
+                    let v = read_col_value(mb, row, col_idx, pk_index, self.col_type_code);
                     if first || v > self.acc {
                         self.acc = v;
                     }
@@ -158,7 +155,9 @@ impl Accumulator {
     }
 
     /// Merge an already-accumulated value (from trace_out) into this accumulator.
-    /// Only valid for linear aggregates.
+    /// For linear aggregates (COUNT, SUM): applies weight arithmetic.
+    /// For MIN/MAX with positive weight: delegates to combine().
+    /// For MIN/MAX with negative weight: no-op (cannot un-MIN/un-MAX).
     fn merge_accumulated(&mut self, value_bits: u64, weight: i64) {
         let is_f = self.is_float();
         match self.agg_op {
@@ -178,6 +177,12 @@ impl Accumulator {
                     self.acc = self.acc.wrapping_add(prev.wrapping_mul(weight));
                 }
                 self.has_value = true;
+            }
+            AGG_MIN | AGG_MAX => {
+                if weight > 0 {
+                    self.combine(value_bits);
+                }
+                // Negative weight: algebraically unsound for MIN/MAX — skip.
             }
             _ => {}
         }
@@ -238,12 +243,32 @@ impl Accumulator {
     }
 }
 
-/// Read a signed i64 column value from a MemBatch.
+/// Read a column value as sign-extended i64, respecting actual column size.
+/// STRING columns: reads first 8 bytes of the 16-byte German String struct (compare key).
 #[inline]
-fn read_col_value(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize) -> i64 {
+fn read_col_value(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize, col_type_code: u8) -> i64 {
     let pi = payload_idx(col_idx, pk_index);
-    let ptr = mb.get_col_ptr(row, pi, 8);
-    i64::from_le_bytes(ptr.try_into().unwrap())
+    let cs = crate::compact::type_size(col_type_code) as usize;
+    let ptr = mb.get_col_ptr(row, pi, cs);
+    if col_type_code == type_code::STRING {
+        // STRING agg: compare key is first 8 bytes of 16-byte German String
+        i64::from_le_bytes(ptr[..8].try_into().unwrap())
+    } else {
+        crate::compact::read_signed(ptr, cs)
+    }
+}
+
+/// Read a float column value as f64, with proper F32→F64 promotion.
+#[inline]
+fn read_col_value_f64(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize, col_type_code: u8) -> f64 {
+    let pi = payload_idx(col_idx, pk_index);
+    if col_type_code == type_code::F32 {
+        let ptr = mb.get_col_ptr(row, pi, 4);
+        f32::from_bits(u32::from_le_bytes(ptr.try_into().unwrap())) as f64
+    } else {
+        let ptr = mb.get_col_ptr(row, pi, 8);
+        f64::from_bits(u64::from_le_bytes(ptr.try_into().unwrap()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,8 +290,11 @@ pub(super) fn extract_gc_u64(
             && tc != type_code::F32 && tc != type_code::F64
         {
             let pi = payload_idx(c_idx, pki);
-            let ptr = mb.get_col_ptr(row, pi, 8);
-            return u64::from_le_bytes(ptr.try_into().unwrap());
+            let cs = crate::compact::type_size(tc) as usize;
+            let ptr = mb.get_col_ptr(row, pi, cs);
+            let mut buf = [0u8; 8];
+            buf[..cs].copy_from_slice(ptr);
+            return u64::from_le_bytes(buf);
         }
     }
     let (lo, _hi) = extract_group_key(mb, row, schema, group_by_cols);
@@ -341,17 +369,21 @@ fn compare_by_group_cols(
         } else if tc == type_code::I64 || tc == type_code::I32
             || tc == type_code::I16 || tc == type_code::I8
         {
-            let a_ptr = mb.get_col_ptr(row_a, pi, 8);
-            let b_ptr = mb.get_col_ptr(row_b, pi, 8);
-            let a_v = i64::from_le_bytes(a_ptr.try_into().unwrap());
-            let b_v = i64::from_le_bytes(b_ptr.try_into().unwrap());
+            let cs = crate::compact::type_size(tc) as usize;
+            let a_ptr = mb.get_col_ptr(row_a, pi, cs);
+            let b_ptr = mb.get_col_ptr(row_b, pi, cs);
+            let a_v = crate::compact::read_signed(a_ptr, cs);
+            let b_v = crate::compact::read_signed(b_ptr, cs);
             a_v.cmp(&b_v)
         } else {
-            let a_ptr = mb.get_col_ptr(row_a, pi, 8);
-            let b_ptr = mb.get_col_ptr(row_b, pi, 8);
-            let a_v = u64::from_le_bytes(a_ptr.try_into().unwrap());
-            let b_v = u64::from_le_bytes(b_ptr.try_into().unwrap());
-            a_v.cmp(&b_v)
+            let cs = crate::compact::type_size(tc) as usize;
+            let a_ptr = mb.get_col_ptr(row_a, pi, cs);
+            let b_ptr = mb.get_col_ptr(row_b, pi, cs);
+            let mut a_buf = [0u8; 8];
+            let mut b_buf = [0u8; 8];
+            a_buf[..cs].copy_from_slice(a_ptr);
+            b_buf[..cs].copy_from_slice(b_ptr);
+            u64::from_le_bytes(a_buf).cmp(&u64::from_le_bytes(b_buf))
         };
         if ord != std::cmp::Ordering::Equal {
             return ord;
@@ -1146,7 +1178,7 @@ pub fn op_gather_reduce(
                 let bits = u64::from_le_bytes(ptr.try_into().unwrap());
                 if w > 0 {
                     accs[k].combine(bits);
-                } else if w < 0 {
+                } else if w < 0 && accs[k].is_linear() {
                     accs[k].merge_accumulated(bits, -1);
                 }
             }
@@ -1794,5 +1826,267 @@ mod tests {
         let key0 = extract_group_key(&mb, 0, &schema, &[1]);
         let key1 = extract_group_key(&mb, 1, &schema, &[1]);
         assert_ne!(key0, key1, "different F32 values must produce different group keys");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 1: Schema-agnostic reads for sub-8-byte columns
+    // -----------------------------------------------------------------------
+
+    fn make_schema_with_type(tc: u8) -> SchemaDescriptor {
+        let cs = crate::compact::type_size(tc);
+        let mut columns = [SchemaColumn {
+            type_code: 0, size: 0, nullable: 0, _pad: 0,
+        }; 64];
+        columns[0] = SchemaColumn {
+            type_code: type_code::U64, size: 8, nullable: 0, _pad: 0,
+        };
+        columns[1] = SchemaColumn {
+            type_code: tc, size: cs, nullable: 0, _pad: 0,
+        };
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> OwnedBatch {
+        let n = rows.len();
+        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        b.count = 0;
+        for &(pk, w, val) in rows {
+            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            b.weight.extend_from_slice(&w.to_le_bytes());
+            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    fn make_batch_typed_i16(schema: &SchemaDescriptor, rows: &[(u64, i64, i16)]) -> OwnedBatch {
+        let n = rows.len();
+        let mut b = OwnedBatch::with_schema(*schema, n.max(1));
+        b.count = 0;
+        for &(pk, w, val) in rows {
+            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
+            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+            b.weight.extend_from_slice(&w.to_le_bytes());
+            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    #[test]
+    fn test_reduce_sum_i32() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let in_schema = make_schema_with_type(type_code::I32);
+
+        // Output: pk(U128), sum(I64)
+        let mut out_schema = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        out_schema.columns[0] = SchemaColumn {
+            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
+        };
+        out_schema.columns[1] = SchemaColumn {
+            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
+        };
+
+        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
+
+        // 3 rows with I32 values, group by PK
+        let delta = make_batch_typed_i32(&in_schema, &[
+            (1, 1, 100i32), (2, 1, 200i32), (3, 1, -50i32),
+        ]);
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AGG_SUM, col_type_code: type_code::I32, _pad: [0; 2],
+        };
+
+        // GROUP BY pk → each row is its own group
+        let (out, _) = op_reduce(
+            &delta, None, &mut to_ch.cursor,
+            &in_schema, &out_schema, &[0u32], &[agg],
+            None, false, 0, &[], None, None, 0, 0, None, None,
+        );
+        assert_eq!(out.count, 3);
+        // Check values: row offsets depend on PK order (group_by_pk path)
+        let sum0 = crate::util::read_i64_le(&out.col_data[0], 0);
+        let sum1 = crate::util::read_i64_le(&out.col_data[0], 8);
+        let sum2 = crate::util::read_i64_le(&out.col_data[0], 16);
+        assert_eq!(sum0, 100, "SUM of I32 100");
+        assert_eq!(sum1, 200, "SUM of I32 200");
+        assert_eq!(sum2, -50, "SUM of I32 -50 (sign extension)");
+    }
+
+    #[test]
+    fn test_reduce_min_f32() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let in_schema = make_schema_with_type(type_code::F32);
+
+        let mut out_schema = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        out_schema.columns[0] = SchemaColumn {
+            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
+        };
+        out_schema.columns[1] = SchemaColumn {
+            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
+        };
+
+        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
+
+        // One group: 3 F32 values
+        let mut in_schema_3 = in_schema;
+        in_schema_3.num_columns = 3;
+        in_schema_3.columns[2] = SchemaColumn {
+            type_code: type_code::F32, size: 4, nullable: 0, _pad: 0,
+        };
+
+        // Use a 3-col input schema: pk(U64), grp(I32), val(F32)
+        // Simpler: just use 2-col with GROUP BY pk
+        let delta = make_batch_f32(&in_schema, &[
+            (1, 1, 3.5f32), (1, 1, -1.0f32), (1, 1, 7.0f32),
+        ]);
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AGG_MIN, col_type_code: type_code::F32, _pad: [0; 2],
+        };
+
+        // GROUP BY pk → all 3 rows in same group
+        let (out, _) = op_reduce(
+            &delta, None, &mut to_ch.cursor,
+            &in_schema, &out_schema, &[0u32], &[agg],
+            None, false, 0, &[], None, None, 0, 0, None, None,
+        );
+        assert_eq!(out.count, 1);
+        // MIN should be -1.0 stored as f64 bits
+        let bits = u64::from_le_bytes(out.col_data[0][0..8].try_into().unwrap());
+        let min_val = f64::from_bits(bits);
+        assert_eq!(min_val, -1.0f64, "MIN of F32 {{3.5, -1.0, 7.0}} should be -1.0");
+    }
+
+    #[test]
+    fn test_reduce_max_i16() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let in_schema = make_schema_with_type(type_code::I16);
+
+        let mut out_schema = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        out_schema.columns[0] = SchemaColumn {
+            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
+        };
+        out_schema.columns[1] = SchemaColumn {
+            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
+        };
+
+        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
+
+        // 3 rows with I16 values, all same PK
+        let delta = make_batch_typed_i16(&in_schema, &[
+            (1, 1, -100i16), (1, 1, 200i16), (1, 1, 50i16),
+        ]);
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AGG_MAX, col_type_code: type_code::I16, _pad: [0; 2],
+        };
+
+        let (out, _) = op_reduce(
+            &delta, None, &mut to_ch.cursor,
+            &in_schema, &out_schema, &[0u32], &[agg],
+            None, false, 0, &[], None, None, 0, 0, None, None,
+        );
+        assert_eq!(out.count, 1);
+        let max_val = crate::util::read_i64_le(&out.col_data[0], 0);
+        assert_eq!(max_val, 200, "MAX of I16 {{-100, 200, 50}} should be 200");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 6: gather_reduce MIN retraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gather_reduce_min_retraction() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        // Schema: pk(U128), min_val(I64)
+        let mut schema = SchemaDescriptor {
+            num_columns: 2,
+            pk_index: 0,
+            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+        };
+        schema.columns[0] = SchemaColumn {
+            type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
+        };
+        schema.columns[1] = SchemaColumn {
+            type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
+        };
+
+        // Tick 1: partial MIN=5 from one worker → global MIN=5
+        let empty_out = Arc::new(OwnedBatch::empty(1));
+        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], schema) };
+
+        let mut partial1 = OwnedBatch::with_schema(schema, 1);
+        partial1.count = 0;
+        partial1.pk_lo.extend_from_slice(&1u64.to_le_bytes());
+        partial1.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+        partial1.weight.extend_from_slice(&1i64.to_le_bytes());
+        partial1.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        partial1.col_data[0].extend_from_slice(&5i64.to_le_bytes());
+        partial1.count += 1;
+
+        let agg = AggDescriptor {
+            col_idx: 1, agg_op: AGG_MIN, col_type_code: type_code::I64, _pad: [0; 2],
+        };
+
+        let out1 = op_gather_reduce(&partial1, &mut to_ch.cursor, &schema, &[agg]);
+        assert_eq!(out1.count, 1);
+        let min1 = crate::util::read_i64_le(&out1.col_data[0], 0);
+        assert_eq!(min1, 5);
+
+        // Tick 2: partial MIN=3 from one worker. The old global (5) should be folded in
+        // via merge_accumulated with weight=1 → combine(5). New MIN should be min(3, 5) = 3.
+        let prev_out = Arc::new(out1);
+        let mut to_ch2 = unsafe { create_cursor_from_snapshots(&[prev_out], &[], schema) };
+
+        let mut partial2 = OwnedBatch::with_schema(schema, 1);
+        partial2.count = 0;
+        partial2.pk_lo.extend_from_slice(&1u64.to_le_bytes());
+        partial2.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+        partial2.weight.extend_from_slice(&1i64.to_le_bytes());
+        partial2.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        partial2.col_data[0].extend_from_slice(&3i64.to_le_bytes());
+        partial2.count += 1;
+
+        let out2 = op_gather_reduce(&partial2, &mut to_ch2.cursor, &schema, &[agg]);
+        // Should have: retract old (5, w=-1) + insert new (3, w=+1)
+        assert_eq!(out2.count, 2, "should retract old MIN and emit new MIN");
+        let retracted = crate::util::read_i64_le(&out2.col_data[0], 0);
+        assert_eq!(retracted, 5, "retraction should be old MIN value 5");
+        assert_eq!(out2.get_weight(0), -1);
+        let new_min = crate::util::read_i64_le(&out2.col_data[0], 8);
+        assert_eq!(new_min, 3, "new MIN should be 3 (min of old 5 and partial 3)");
+        assert_eq!(out2.get_weight(1), 1);
     }
 }

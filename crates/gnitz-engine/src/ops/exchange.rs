@@ -66,11 +66,32 @@ impl PartitionRouter {
                 mb.get_pk_lo(row)
             } else {
                 let pi = payload_idx(col_idx as usize, pki);
-                let col_size = schema.columns[col_idx as usize].size as usize;
-                let bytes = mb.get_col_ptr(row, pi, col_size);
-                let mut buf = [0u8; 8];
-                buf[..col_size].copy_from_slice(bytes);
-                u64::from_le_bytes(buf)
+                let col = &schema.columns[col_idx as usize];
+                let col_size = col.size as usize;
+                if col.type_code == crate::compact::type_code::STRING {
+                    // Hash string content to u64 (same approach as extract_group_key)
+                    let struct_bytes = mb.get_col_ptr(row, pi, 16);
+                    let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
+                    if length == 0 {
+                        0u64
+                    } else if length <= crate::compact::SHORT_STRING_THRESHOLD {
+                        crate::xxh::checksum(&struct_bytes[4..4 + length])
+                    } else {
+                        let heap_offset = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
+                        crate::xxh::checksum(&mb.blob[heap_offset..heap_offset + length])
+                    }
+                } else if col.type_code == crate::compact::type_code::U128 {
+                    // XOR the two u64 halves
+                    let bytes = mb.get_col_ptr(row, pi, 16);
+                    let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                    let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                    lo ^ hi
+                } else {
+                    let bytes = mb.get_col_ptr(row, pi, col_size);
+                    let mut buf = [0u8; 8];
+                    buf[..col_size].copy_from_slice(bytes);
+                    u64::from_le_bytes(buf)
+                }
             };
             let map_key = (tid, col_idx, key_lo);
             if weight < 0 {
@@ -237,7 +258,7 @@ pub fn op_repartition_batches_merged(
         .map(|opt| match opt {
             Some(mut d) => {
                 d.sorted = true;
-                d.consolidated = true;
+                d.consolidated = false;
                 d.schema = Some(*schema);
                 d
             }
@@ -636,7 +657,7 @@ mod tests {
         assert_eq!(total_rows(&result), 6);
         for sb in &result {
             if sb.count > 0 {
-                assert!(sb.consolidated, "merged path output must be consolidated");
+                assert!(!sb.consolidated, "merged path uses PK-only comparison, must not claim consolidated");
                 assert!(sb.sorted, "merged path output must be sorted");
             }
         }
@@ -745,6 +766,48 @@ mod tests {
         let b2 = make_batch(&schema, &[(42, -1, 0)]);
         router.record_routing(&b2, &schema, 1, 0, 3);
         assert_eq!(router.worker_for_index_key(1, 0, 42), -1);
+    }
+
+    #[test]
+    fn test_partition_router_string_col() {
+        let schema = make_schema_u64_string();
+        let mut router = PartitionRouter::new();
+
+        // Short string
+        let b = make_batch_str(&schema, &[(1, 1, "hello")]);
+        router.record_routing(&b, &schema, 1, 1, 2);
+        // Must not panic — the old code would overflow copying 16 bytes into 8-byte buffer.
+        // The key_lo is a hash, so we just check it was stored and is retrievable.
+        // record_routing uses col_idx=1 (STRING column), so look up the hashed key.
+        let mb = b.as_mem_batch();
+        let struct_bytes = mb.get_col_ptr(0, 0, 16); // payload_idx(1, 0) = 0
+        let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
+        let hashed_key = crate::xxh::checksum(&struct_bytes[4..4 + length]);
+        assert_eq!(router.worker_for_index_key(1, 1, hashed_key), 2);
+
+        // Long string (> 12 bytes)
+        let b2 = make_batch_str(&schema, &[(2, 1, "a_long_string_value")]);
+        router.record_routing(&b2, &schema, 1, 1, 3);
+        // Must not panic
+    }
+
+    #[test]
+    fn test_repartition_merged_duplicate_rows() {
+        let schema = make_schema_u64_i64();
+        let num_workers = 4;
+        // Two sources with identical (PK=1, val=10) rows — merged output must NOT
+        // claim consolidated because it uses PK-only comparison.
+        let b0 = make_batch(&schema, &[(1, 1, 10)]);
+        let b1 = make_batch(&schema, &[(1, 1, 10)]);
+        let sources: Vec<Option<&OwnedBatch>> = vec![Some(&b0), Some(&b1)];
+        let result = op_relay_scatter(&sources, &[0u32], &schema, num_workers);
+
+        assert_eq!(total_rows(&result), 2, "both rows must appear in output");
+        for sb in &result {
+            if sb.count > 0 {
+                assert!(!sb.consolidated, "merged path must not claim consolidated");
+            }
+        }
     }
 
     #[test]

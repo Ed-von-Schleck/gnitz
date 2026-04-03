@@ -26,14 +26,21 @@ pub fn op_anti_join_delta_trace(
     }
 
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
-    cursor.seek(consolidated.get_pk_lo(0), consolidated.get_pk_hi(0));
+    let mut prev_lo = consolidated.get_pk_lo(0);
+    let mut prev_hi = consolidated.get_pk_hi(0);
+    cursor.seek(prev_lo, prev_hi);
 
     for i in 0..n {
         let d_lo = consolidated.get_pk_lo(i);
         let d_hi = consolidated.get_pk_hi(i);
 
-        while cursor.valid && pk_lt(cursor.current_key_lo, cursor.current_key_hi, d_lo, d_hi) {
-            cursor.advance();
+        if i > 0 && d_lo == prev_lo && d_hi == prev_hi {
+            // Same PK as previous row (different payload) — re-seek cursor.
+            cursor.seek(d_lo, d_hi);
+        } else {
+            while cursor.valid && pk_lt(cursor.current_key_lo, cursor.current_key_hi, d_lo, d_hi) {
+                cursor.advance();
+            }
         }
 
         let in_trace = cursor.valid
@@ -45,10 +52,8 @@ pub fn op_anti_join_delta_trace(
             emit_indices.push(i as u32);
         }
 
-        // Advance past current key even for negative-weight trace records
-        if cursor.valid && cursor.current_key_lo == d_lo && cursor.current_key_hi == d_hi {
-            cursor.advance();
-        }
+        prev_lo = d_lo;
+        prev_hi = d_hi;
     }
 
     if emit_indices.is_empty() {
@@ -92,14 +97,21 @@ pub fn op_semi_join_delta_trace(
 
     // Merge-walk
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
-    cursor.seek(consolidated.get_pk_lo(0), consolidated.get_pk_hi(0));
+    let mut prev_lo = consolidated.get_pk_lo(0);
+    let mut prev_hi = consolidated.get_pk_hi(0);
+    cursor.seek(prev_lo, prev_hi);
 
     for i in 0..n {
         let d_lo = consolidated.get_pk_lo(i);
         let d_hi = consolidated.get_pk_hi(i);
 
-        while cursor.valid && pk_lt(cursor.current_key_lo, cursor.current_key_hi, d_lo, d_hi) {
-            cursor.advance();
+        if i > 0 && d_lo == prev_lo && d_hi == prev_hi {
+            // Same PK as previous row (different payload) — re-seek cursor.
+            cursor.seek(d_lo, d_hi);
+        } else {
+            while cursor.valid && pk_lt(cursor.current_key_lo, cursor.current_key_hi, d_lo, d_hi) {
+                cursor.advance();
+            }
         }
 
         let in_trace = cursor.valid
@@ -111,9 +123,8 @@ pub fn op_semi_join_delta_trace(
             emit_indices.push(i as u32);
         }
 
-        if cursor.valid && cursor.current_key_lo == d_lo && cursor.current_key_hi == d_hi {
-            cursor.advance();
-        }
+        prev_lo = d_lo;
+        prev_hi = d_hi;
     }
 
     if emit_indices.is_empty() {
@@ -141,11 +152,21 @@ fn semi_join_dt_swapped(
     let n = consolidated.count;
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
 
+    let mut last_lo: u64 = u64::MAX;
+    let mut last_hi: u64 = u64::MAX;
+
     while cursor.valid {
         let t_lo = cursor.current_key_lo;
         let t_hi = cursor.current_key_hi;
 
         if cursor.current_weight <= 0 {
+            cursor.advance();
+            continue;
+        }
+
+        // Skip duplicate PKs in trace (different payloads) — delta indices
+        // were already pushed for the first occurrence of this PK.
+        if t_lo == last_lo && t_hi == last_hi {
             cursor.advance();
             continue;
         }
@@ -157,6 +178,8 @@ fn semi_join_dt_swapped(
             emit_indices.push(j as u32);
             j += 1;
         }
+        last_lo = t_lo;
+        last_hi = t_hi;
         cursor.advance();
     }
 
@@ -526,13 +549,14 @@ fn write_join_row_null_right(
 // Anti-join / Semi-join delta-delta
 // ---------------------------------------------------------------------------
 
-/// Emit batch_a rows whose PK has NO positive-weight match in batch_b.
+/// Emit batch_a rows whose (PK, payload) has NO positive-weight match in batch_b.
+/// For SQL EXCEPT: a row is excluded only if B has a matching (PK, payload), not just PK.
 pub fn op_anti_join_delta_delta(
     batch_a: &OwnedBatch,
     batch_b: &OwnedBatch,
     schema: &SchemaDescriptor,
 ) -> OwnedBatch {
-    filter_join_dd(batch_a, batch_b, schema, false)
+    filter_join_dd_with_payload(batch_a, batch_b, schema)
 }
 
 /// Emit batch_a rows whose PK HAS a positive-weight match in batch_b.
@@ -544,8 +568,85 @@ pub fn op_semi_join_delta_delta(
     filter_join_dd(batch_a, batch_b, schema, true)
 }
 
-/// Shared merge-walk for anti-join and semi-join DD.
-/// `emit_on_match=false` → anti-join, `emit_on_match=true` → semi-join.
+/// Payload-aware anti-join DD: excludes A rows only when B has a matching
+/// (PK, payload) with positive weight. Used for SQL EXCEPT.
+fn filter_join_dd_with_payload(
+    batch_a: &OwnedBatch,
+    batch_b: &OwnedBatch,
+    schema: &SchemaDescriptor,
+) -> OwnedBatch {
+    let npc = schema.num_columns as usize - 1;
+    let ca = consolidate_owned(batch_a, schema);
+    let cb = consolidate_owned(batch_b, schema);
+    let n_a = ca.count;
+    let n_b = cb.count;
+
+    if n_a == 0 {
+        return OwnedBatch::empty(npc);
+    }
+    if n_b == 0 {
+        gnitz_debug!("op_anti_join_dd: a={} b=0 out={}", n_a, n_a);
+        return ca;
+    }
+
+    let mb_a = ca.as_mem_batch();
+    let mb_b = cb.as_mem_batch();
+    let mut idx_a = 0usize;
+    let mut idx_b = 0usize;
+    let mut output = OwnedBatch::empty(npc);
+
+    while idx_a < n_a {
+        let key_a_lo = ca.get_pk_lo(idx_a);
+        let key_a_hi = ca.get_pk_hi(idx_a);
+
+        while idx_b < n_b && pk_lt(cb.get_pk_lo(idx_b), cb.get_pk_hi(idx_b), key_a_lo, key_a_hi) {
+            idx_b += 1;
+        }
+
+        // Find extent of B's PK group
+        let b_group_start = idx_b;
+        let mut b_group_end = idx_b;
+        if idx_b < n_b && cb.get_pk_lo(idx_b) == key_a_lo && cb.get_pk_hi(idx_b) == key_a_hi {
+            b_group_end = idx_b;
+            while b_group_end < n_b
+                && cb.get_pk_lo(b_group_end) == key_a_lo
+                && cb.get_pk_hi(b_group_end) == key_a_hi
+            {
+                b_group_end += 1;
+            }
+        }
+
+        // Process each A row individually — check payload match
+        while idx_a < n_a
+            && ca.get_pk_lo(idx_a) == key_a_lo
+            && ca.get_pk_hi(idx_a) == key_a_hi
+        {
+            let mut matched = false;
+            for scan_b in b_group_start..b_group_end {
+                if cb.get_weight(scan_b) > 0
+                    && crate::columnar::compare_rows(schema, &mb_a, idx_a, &mb_b, scan_b)
+                        == std::cmp::Ordering::Equal
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                output.append_batch(&ca, idx_a, idx_a + 1);
+            }
+            idx_a += 1;
+        }
+    }
+
+    output.sorted = true;
+    output.consolidated = true;
+    gnitz_debug!("op_anti_join_dd: a={} b={} out={}", n_a, n_b, output.count);
+    output
+}
+
+/// Shared merge-walk for semi-join DD (PK-only matching).
+/// `emit_on_match=false` → anti-join (unused after payload-aware split),
+/// `emit_on_match=true` → semi-join.
 fn filter_join_dd(
     batch_a: &OwnedBatch,
     batch_b: &OwnedBatch,
@@ -885,12 +986,24 @@ mod tests {
     fn test_anti_join_dd_basic() {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+        // B has PK=2 but different payload (200 vs 20) → payload-aware: no match
         let b = make_batch(&schema, &[(2, 1, 200)]);
+        let out = op_anti_join_delta_delta(&a, &b, &schema);
+        // All 3 rows survive (different payloads)
+        assert_eq!(out.count, 3);
+        assert!(out.consolidated);
+    }
+
+    #[test]
+    fn test_anti_join_dd_basic_matching_payload() {
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+        // B has PK=2 with SAME payload (20) → exact match → excluded
+        let b = make_batch(&schema, &[(2, 1, 20)]);
         let out = op_anti_join_delta_delta(&a, &b, &schema);
         assert_eq!(out.count, 2);
         assert_eq!(out.get_pk_lo(0), 1);
         assert_eq!(out.get_pk_lo(1), 3);
-        assert!(out.consolidated);
     }
 
     #[test]
@@ -907,8 +1020,9 @@ mod tests {
     #[test]
     fn test_anti_join_dd_full_overlap() {
         let schema = make_schema_u64_i64();
+        // Same PK AND same payload → full match → all excluded
         let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-        let b = make_batch(&schema, &[(1, 1, 100), (2, 1, 200)]);
+        let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
         let out = op_anti_join_delta_delta(&a, &b, &schema);
         assert_eq!(out.count, 0);
     }
@@ -917,8 +1031,9 @@ mod tests {
     fn test_anti_join_dd_negative_weight_b() {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-        // PK=1 has negative weight in b — should NOT suppress a rows
-        let b = make_batch(&schema, &[(1, -1, 100), (2, 1, 200)]);
+        // PK=1: B has negative weight → should NOT suppress A rows
+        // PK=2: B has matching payload (20) with positive weight → excluded
+        let b = make_batch(&schema, &[(1, -1, 10), (2, 1, 20)]);
         let out = op_anti_join_delta_delta(&a, &b, &schema);
         assert_eq!(out.count, 1);
         assert_eq!(out.get_pk_lo(0), 1);
@@ -941,10 +1056,11 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_semi_complement() {
+    fn test_anti_semi_complement_matching_payloads() {
+        // When B has matching payloads, anti + semi = total
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-        let b = make_batch(&schema, &[(2, 1, 200), (4, 1, 400)]);
+        let b = make_batch(&schema, &[(2, 1, 20), (4, 1, 40)]);
         let anti = op_anti_join_delta_delta(&a, &b, &schema);
         let semi = op_semi_join_delta_delta(&a, &b, &schema);
         assert_eq!(anti.count + semi.count, a.count);
@@ -1144,5 +1260,115 @@ mod tests {
         // Right column (payload col 1) should be null
         let null_word = u64::from_le_bytes(out.null_bmp[1 * 8..2 * 8].try_into().unwrap());
         assert!(null_word & 2 != 0, "right payload column (bit 1) should be null for non-matching row");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 3: Anti/Semi-join DT cursor re-seek for same-PK rows
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_anti_join_dt_same_pk_different_payload() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+
+        // Trace: PK=1 exists with positive weight
+        let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+
+        // Delta: two rows with PK=1 but different payloads (both should be matched)
+        let delta = make_batch(&schema, &[(1, 1, 100), (1, 1, 200)]);
+
+        let out = op_anti_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        // Both rows have PK=1 which is in the trace → anti-join emits 0 rows
+        assert_eq!(out.count, 0, "both same-PK rows should be matched by trace");
+    }
+
+    #[test]
+    fn test_semi_join_dt_same_pk_different_payload() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+
+        // Trace: PK=1 exists with positive weight
+        let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+
+        // Delta: two rows with PK=1 but different payloads (both should be matched)
+        let delta = make_batch(&schema, &[(1, 1, 100), (1, 1, 200)]);
+
+        let out = op_semi_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        // Both rows have PK=1 which is in the trace → semi-join emits 2 rows
+        assert_eq!(out.count, 2, "both same-PK rows should be emitted by semi-join");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 4: Semi-join DT swapped weight inflation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_semi_join_dt_swapped_no_weight_inflation() {
+        use std::sync::Arc;
+        use crate::read_cursor::create_cursor_from_snapshots;
+
+        let schema = make_schema_u64_i64();
+
+        // Trace: 3 entries for PK=1 with different payloads
+        // This triggers the trace-has-many scenario
+        let trace = Arc::new(make_batch(&schema, &[
+            (1, 1, 100), (1, 1, 200), (1, 1, 300),
+        ]));
+        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+
+        // Delta: 20+ rows to trigger n > trace_len swap path
+        let mut rows: Vec<(u64, i64, i64)> = (1u64..=25).map(|pk| (pk, 1, pk as i64 * 10)).collect();
+        rows.sort_by_key(|r| r.0);
+        let delta = make_batch(&schema, &rows);
+
+        let out = op_semi_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        // Only PK=1 from delta matches — should emit exactly 1 row, not 3
+        assert_eq!(out.count, 1, "PK=1 should appear once, not inflated by trace duplicates");
+        assert_eq!(out.get_pk_lo(0), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 7: Anti-join DD payload-aware matching
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_anti_join_dd_same_pk_different_payload() {
+        let schema = make_schema_u64_i64();
+        // A: two rows with PK=1, different payloads
+        let a = make_batch(&schema, &[(1, 1, 10), (1, 1, 20)]);
+        // B: one row with PK=1, payload=20
+        let b = make_batch(&schema, &[(1, 1, 20)]);
+        let out = op_anti_join_delta_delta(&a, &b, &schema);
+        // Only (PK=1, val=10) should survive — (PK=1, val=20) matches B exactly
+        assert_eq!(out.count, 1);
+        assert_eq!(out.get_pk_lo(0), 1);
+        assert_eq!(get_payload_i64(&out, 0), 10);
+    }
+
+    #[test]
+    fn test_anti_join_dd_same_pk_same_payload() {
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10)]);
+        let b = make_batch(&schema, &[(1, 1, 10)]);
+        let out = op_anti_join_delta_delta(&a, &b, &schema);
+        // Exact payload match → output should be empty
+        assert_eq!(out.count, 0);
+    }
+
+    #[test]
+    fn test_semi_join_dd_unchanged() {
+        // Semi-join DD should still use PK-only semantics
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(1, 1, 10), (1, 1, 20)]);
+        let b = make_batch(&schema, &[(1, 1, 999)]); // different payload but same PK
+        let out = op_semi_join_delta_delta(&a, &b, &schema);
+        // PK-only: both A rows match B's PK → 2 rows
+        assert_eq!(out.count, 2);
     }
 }

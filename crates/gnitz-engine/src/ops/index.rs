@@ -52,14 +52,17 @@ fn promote_agg_col_to_u64_ordered(
         return if for_max { !val } else { val };
     }
 
-    let ptr = mb.get_col_ptr(row, pi, 8);
-    let raw = u64::from_le_bytes(ptr.try_into().unwrap());
+    let cs = crate::compact::type_size(col_type_code) as usize;
+    let ptr = mb.get_col_ptr(row, pi, cs);
+    let mut buf = [0u8; 8];
+    buf[..cs].copy_from_slice(ptr);
+    let raw = u64::from_le_bytes(buf);
 
     let val = match col_type_code {
         type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => raw,
         type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => {
-            // Offset-binary: reinterpret as signed then add 2^63
-            let signed = raw as i64;
+            // Sign-extend then offset-binary
+            let signed = crate::compact::read_signed(&buf[..cs], cs);
             (signed as u64).wrapping_add(1u64 << 63)
         }
         type_code::F64 => ieee_order_bits(raw),
@@ -96,8 +99,11 @@ fn extract_gc_u64(
             && tc != type_code::F32 && tc != type_code::F64
         {
             let pi = payload_idx(c_idx, pki);
-            let ptr = mb.get_col_ptr(row, pi, 8);
-            return u64::from_le_bytes(ptr.try_into().unwrap());
+            let cs = crate::compact::type_size(tc) as usize;
+            let ptr = mb.get_col_ptr(row, pi, cs);
+            let mut buf = [0u8; 8];
+            buf[..cs].copy_from_slice(ptr);
+            return u64::from_le_bytes(buf);
         }
     }
     // Fallback: use extract_group_key from reduce (duplicate inline here)
