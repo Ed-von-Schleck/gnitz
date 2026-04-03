@@ -124,6 +124,11 @@ impl PartitionedTable {
         count: u32,
         num_payload_cols: usize,
     ) -> Result<(), i32> {
+        debug_assert_eq!(
+            self.num_partitions, 1,
+            "ingest_batch_memonly_from_regions bypasses hash routing; \
+             only valid for single-partition (DDL-sync) tables"
+        );
         if count == 0 || self.tables.is_empty() {
             return Ok(());
         }
@@ -379,12 +384,12 @@ pub fn partition_arena_size(num_partitions: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor};
+    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_schema() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        columns[0] = SchemaColumn { type_code: 3, size: 8, nullable: 0, _pad: 0 };
-        columns[1] = SchemaColumn { type_code: 7, size: 8, nullable: 0, _pad: 0 };
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::I64, 0);
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
     }
 

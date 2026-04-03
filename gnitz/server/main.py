@@ -367,6 +367,11 @@ def entry_point(argv):
     sal.write_cursor = 0
     sal.epoch = 1
     # Do NOT reset lsn_counter — must stay monotonic for recovery correctness
+    # Sync the Rust MasterDispatcher's SAL state
+    engine_ffi._master_reset_sal(
+        dispatcher._handle,
+        rffi.cast(rffi.ULONGLONG, 0),
+        rffi.cast(rffi.UINT, 1))
 
     _backfill_exchange_views(engine, dispatcher)
 

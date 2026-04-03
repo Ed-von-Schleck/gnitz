@@ -14,26 +14,12 @@ use crate::compact::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
 use crate::ipc::{
     self, SAL_MMAP_SIZE, STATUS_OK, STATUS_ERROR,
+    FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH, FLAG_HAS_PK,
+    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
+    FLAG_TICK, FLAG_CHECKPOINT, FLAG_FLUSH,
 };
 use crate::ipc_sys;
 use crate::memtable::OwnedBatch;
-
-// ---------------------------------------------------------------------------
-// SAL group header flags (u32) — must match ipc.py
-// ---------------------------------------------------------------------------
-
-const FLAG_SHUTDOWN: u32            = 4;
-const FLAG_DDL_SYNC: u32            = 8;
-const FLAG_EXCHANGE: u32            = 16;
-const FLAG_PUSH: u32                = 32;
-const FLAG_HAS_PK: u32              = 64;
-const FLAG_SEEK: u32                = 128;
-const FLAG_SEEK_BY_INDEX: u32       = 256;
-const FLAG_PRELOADED_EXCHANGE: u32  = 1024;
-const FLAG_BACKFILL: u32            = 2048;
-const FLAG_TICK: u32                = 4096;
-const FLAG_CHECKPOINT: u32          = 8192;
-const FLAG_FLUSH: u32               = 16384;
 
 // ---------------------------------------------------------------------------
 // IPC handles — shared by WorkerProcess and WorkerExchangeHandler
@@ -662,8 +648,8 @@ mod tests {
         let mut sd = SchemaDescriptor::default();
         sd.num_columns = 2;
         sd.pk_index = 0;
-        sd.columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        sd.columns[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        sd.columns[0] = SchemaColumn::new(type_code::U64, 0);
+        sd.columns[1] = SchemaColumn::new(type_code::U64, 0);
         sd
     }
 

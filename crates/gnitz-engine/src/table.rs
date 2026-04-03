@@ -127,6 +127,26 @@ impl Table {
     }
 
     // ------------------------------------------------------------------
+    // Ingest helpers
+    // ------------------------------------------------------------------
+
+    /// Sort `batch` by (PK, payload) if it is not already marked sorted.
+    /// Returns the batch unchanged if `batch.sorted` or `batch.count <= 1`.
+    fn sort_batch_if_needed(&self, batch: OwnedBatch) -> OwnedBatch {
+        if batch.sorted || batch.count <= 1 {
+            return batch;
+        }
+        let mb = batch.as_mem_batch();
+        let mut sorted = memtable::write_to_owned_batch(
+            &self.schema, batch.count, batch.blob.len().max(1),
+            |w| crate::merge::sort_only(&mb, &self.schema, w),
+        );
+        sorted.sorted = true;
+        sorted.schema = Some(self.schema);
+        sorted
+    }
+
+    // ------------------------------------------------------------------
     // Ingest
     // ------------------------------------------------------------------
 
@@ -136,6 +156,7 @@ impl Table {
         if batch.count == 0 {
             return Ok(());
         }
+        let batch = self.sort_batch_if_needed(batch);
         self.found_source = FoundSource::None;
 
         if let Some(ref mut wal) = self.wal_writer {
@@ -214,22 +235,10 @@ impl Table {
         num_payload_cols: usize,
         force_ephemeral: bool,
     ) -> Result<(), i32> {
-        let mut batch = unsafe {
+        let batch = unsafe {
             OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
         };
-        // Defensive sort: from_regions always has sorted=false.  If the
-        // batch has >1 row, re-sort by (PK, payload) so that memtable
-        // runs are always in canonical order for merge_batches.
-        if !batch.sorted && batch.count > 1 {
-            let mb = batch.as_mem_batch();
-            let mut sorted = memtable::write_to_owned_batch(
-                &self.schema, batch.count, batch.blob.len().max(1),
-                |w| crate::merge::sort_only(&mb, &self.schema, w),
-            );
-            sorted.sorted = true;
-            sorted.schema = Some(self.schema);
-            batch = sorted;
-        }
+        let batch = self.sort_batch_if_needed(batch);
         let durable = !force_ephemeral && self.wal_writer.is_some();
         match self.memtable.upsert_sorted_batch(batch) {
             Ok(()) => {
@@ -243,6 +252,7 @@ impl Table {
                 let batch2 = unsafe {
                     OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
                 };
+                let batch2 = self.sort_batch_if_needed(batch2);
                 self.memtable.upsert_sorted_batch(batch2)?;
                 Ok(())
             }
@@ -358,17 +368,19 @@ impl Table {
 
     /// Look up a PK for retraction.  Returns (net_weight, found).
     /// If found, sets `found_source` so `found_*` accessors can read the row.
+    ///
+    /// Uses `find_positive_payload_row` so that after an UPDATE (which leaves
+    /// old-payload rows with net weight 0 in the memtable), the found row is
+    /// the live (PK, new_payload) entry, not the cancelled old one.
     pub fn retract_pk(&mut self, key_lo: u64, key_hi: u64) -> (i64, bool) {
         let mut total_w: i64 = 0;
         self.found_source = FoundSource::None;
 
-        let mut mt_found = false;
+        // Step 1: compute total weight (PK-only sum is correct for existence check).
         if self.memtable.may_contain_pk(key_lo, key_hi) {
-            let (w, found) = self.memtable.lookup_pk(key_lo, key_hi);
+            let (w, _) = self.memtable.lookup_pk(key_lo, key_hi);
             total_w = w;
-            mt_found = found;
         }
-
         let (shard_w, shard_found) = self.scan_shards_for_pk(key_lo, key_hi);
         total_w += shard_w;
 
@@ -376,7 +388,10 @@ impl Table {
             return (total_w, false);
         }
 
-        if mt_found {
+        // Step 2: find the specific live (PK, payload) row by checking net weight
+        // per distinct payload — skips cancelled rows whose net weight is 0.
+        let mt_live = self.memtable.find_positive_payload_row(key_lo, key_hi);
+        if mt_live {
             self.found_source = FoundSource::MemTable;
         } else if let Some((ptr, idx)) = shard_found {
             self.found_source = FoundSource::Shard(ptr, idx);
@@ -539,6 +554,7 @@ impl Table {
             let batch = unsafe {
                 OwnedBatch::from_regions(&ptrs, &szs, count as usize, num_payload_cols)
             };
+            let batch = self.sort_batch_if_needed(batch);
             let _ = self.memtable.upsert_sorted_batch(batch);
 
             if lsn >= self.current_lsn {
@@ -703,14 +719,12 @@ fn erase_stale_shards(dir: &str, table_id: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor};
+    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0, size: 0, nullable: 0, _pad: 0,
-        }; 64];
-        columns[0] = SchemaColumn { type_code: 3, size: 8, nullable: 0, _pad: 0 }; // U64 PK
-        columns[1] = SchemaColumn { type_code: 7, size: 8, nullable: 0, _pad: 0 }; // I64
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::I64, 0);
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
     }
 
@@ -861,5 +875,132 @@ mod tests {
         for i in 0..6u64 {
             assert!(t.has_pk(i * 10, 0));
         }
+    }
+
+    /// After INSERT then UPDATE (which adds a retraction for the old payload and
+    /// an insertion for the new payload), `retract_pk` must return the NEW payload,
+    /// not the cancelled old one.
+    #[test]
+    fn test_retract_pk_after_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("retract_update_test");
+        let schema = make_u64_i64_schema();
+
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 600, 1 << 20, false,
+        ).unwrap();
+
+        // Batch 1: INSERT (PK=10, weight=+1, val=100)
+        let (ptrs1, sizes1, count1) = make_regions(&[(10, 1, 100)]);
+        t.ingest_batch_from_regions(&ptrs1, &sizes1, count1, 1).unwrap();
+
+        // Batch 2: UPDATE delta — retract val=100, insert val=200
+        // Rows sorted by (PK, payload): (-1 for val=100) before (+1 for val=200)
+        let (ptrs2, sizes2, count2) = make_regions(&[(10, -1, 100), (10, 1, 200)]);
+        t.ingest_batch_from_regions(&ptrs2, &sizes2, count2, 1).unwrap();
+
+        // Net state: val=100 has weight 0 (cancelled), val=200 has weight 1
+        let (w, found) = t.retract_pk(10, 0);
+        assert_eq!(w, 1);
+        assert!(found);
+
+        // The found row must be val=200, not the cancelled val=100
+        let col_ptr = t.found_col_ptr(0, 8);
+        assert!(!col_ptr.is_null());
+        let val = i64::from_le_bytes(
+            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
+        );
+        assert_eq!(val, 200, "retract_pk must return the live (val=200) row, not the retracted val=100");
+    }
+
+    /// `ingest_owned_batch` must sort the batch before WAL write and memtable
+    /// insert, even when the incoming OwnedBatch has sorted=false (reverse order).
+    #[test]
+    fn test_ingest_owned_batch_unsorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("ingest_owned_unsorted_test");
+        let schema = make_u64_i64_schema();
+
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 700, 1 << 20, false,
+        ).unwrap();
+
+        // Build a reverse-sorted batch (PK order: 30, 20, 10)
+        let (ptrs, sizes, count) = make_regions(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
+        let batch = unsafe { OwnedBatch::from_regions(&ptrs, &sizes, count as usize, 1) };
+        // from_regions sets sorted=false
+        assert!(!batch.sorted);
+
+        t.ingest_owned_batch(batch).unwrap();
+
+        // Cursor must yield rows in ascending PK order
+        let cursor = t.create_cursor().unwrap();
+        assert!(cursor.cursor.valid);
+        assert_eq!(cursor.cursor.current_key_lo, 10, "cursor should start at PK=10 (smallest)");
+    }
+
+    /// WAL recovery must sort batches that were written in unsorted order
+    /// (the `ingest_batch_from_regions` path writes to WAL before sorting).
+    #[test]
+    fn test_recover_from_wal_unsorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("wal_recovery_test");
+        let schema = make_u64_i64_schema();
+
+        {
+            let mut t = Table::new(
+                tdir.to_str().unwrap(), "test", schema, 800, 1 << 20, true,
+            ).unwrap();
+
+            // Ingest a reverse-sorted batch.  WAL records the ORIGINAL unsorted ptrs;
+            // upsert_and_maybe_flush sorts for the memtable.
+            let (ptrs, sizes, count) = make_regions(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
+            t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
+            // Close without flushing — WAL persists with unsorted batch.
+        } // t dropped here, WAL fd closed
+
+        // Reopen — triggers recover_from_wal which must sort the recovered batch.
+        let mut t2 = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 800, 1 << 20, true,
+        ).unwrap();
+
+        let cursor = t2.create_cursor().unwrap();
+        assert!(cursor.cursor.valid);
+        assert_eq!(cursor.cursor.current_key_lo, 10, "recovered cursor should start at PK=10");
+    }
+
+    /// When upsert_and_maybe_flush hits ERR_CAPACITY and rebuilds batch2 from
+    /// raw regions, it must sort batch2 before the retry upsert.
+    #[test]
+    fn test_upsert_capacity_retry_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("cap_retry_test");
+        let schema = make_u64_i64_schema();
+
+        // Very small arena: 40 bytes.  A 3-row batch (~120 bytes) will exceed it.
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 900, 40, false,
+        ).unwrap();
+
+        // Directly fill memtable past max_bytes using memtable_upsert_sorted_batch
+        // (bypasses auto-flush so runs_bytes exceeds max_bytes).
+        let (fill_ptrs, fill_sizes, fill_count) =
+            make_regions(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+        let mut fill_batch = unsafe {
+            OwnedBatch::from_regions(&fill_ptrs, &fill_sizes, fill_count as usize, 1)
+        };
+        fill_batch.sorted = true;
+        t.memtable_upsert_sorted_batch(fill_batch).unwrap();
+        // runs_bytes (~120) > max_bytes (40) — next upsert will hit ERR_CAPACITY.
+
+        // Ingest a REVERSE-sorted batch.  This hits ERR_CAPACITY → flush → retry.
+        // Fix 1d: the retry batch (batch2 from raw regions) must be sorted.
+        let (ptrs, sizes, count) = make_regions(&[(50, 1, 500), (40, 1, 400), (30, 1, 300)]);
+        t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
+
+        // fill batch (1,2,3) is now in shard; sorted (30,40,50) is in memtable.
+        let cursor = t.create_cursor().unwrap();
+        assert!(cursor.cursor.valid);
+        assert_eq!(cursor.cursor.current_key_lo, 1, "cursor should start at PK=1 from flushed shard");
     }
 }

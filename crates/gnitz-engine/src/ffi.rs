@@ -1955,7 +1955,7 @@ pub extern "C" fn gnitz_batch_append_row_from_ptable_found(
 /// - I8/I16/I32: sign-extend to i64, reinterpret as u64
 /// - Everything else (U8/U16/U32/U64/I64/F32/F64): zero-extend bytes to u64
 /// - U128: read as (lo, hi) pair
-fn promote_to_index_key(
+pub(crate) fn promote_to_index_key(
     col_data: &[u8],
     offset: usize,
     col_size: usize,
@@ -4565,6 +4565,302 @@ pub extern "C" fn gnitz_worker_run(
 }
 
 // ---------------------------------------------------------------------------
+// MasterDispatcher FFI
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_create(
+    catalog_handle: *mut c_void,
+    num_workers: u32,
+    worker_pids: *const i32,
+    sal_ptr: *mut u8,
+    sal_fd: i32,
+    sal_mmap_size: u64,
+    w2m_region_ptrs: *const *mut u8,
+    w2m_region_sizes: *const u64,
+    m2w_efds: *const i32,
+    w2m_efds: *const i32,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if catalog_handle.is_null() || num_workers == 0 {
+            return ptr::null_mut();
+        }
+        let nw = num_workers as usize;
+        let pids = unsafe { slice::from_raw_parts(worker_pids, nw) }.to_vec();
+        let w2m_ptrs = unsafe { slice::from_raw_parts(w2m_region_ptrs, nw) }.to_vec();
+        let w2m_sizes = unsafe { slice::from_raw_parts(w2m_region_sizes, nw) }.to_vec();
+        let m2w = unsafe { slice::from_raw_parts(m2w_efds, nw) }.to_vec();
+        let w2m = unsafe { slice::from_raw_parts(w2m_efds, nw) }.to_vec();
+
+        let master = crate::master::MasterDispatcher::new(
+            nw, pids,
+            catalog_handle as *mut crate::catalog::CatalogEngine,
+            sal_ptr, sal_fd, sal_mmap_size,
+            w2m_ptrs, w2m_sizes, m2w, w2m,
+        );
+        Box::into_raw(Box::new(master)) as *mut c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_destroy(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    unsafe { drop(Box::from_raw(handle as *mut crate::master::MasterDispatcher)); }
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_last_error(
+    handle: *const c_void,
+    out_len: *mut u32,
+) -> *const u8 {
+    if handle.is_null() || out_len.is_null() {
+        return ptr::null();
+    }
+    let master = unsafe { &*(handle as *const crate::master::MasterDispatcher) };
+    unsafe { *out_len = master.last_error.len() as u32; }
+    master.last_error.as_ptr()
+}
+
+/// Helper for Result<(), String> -> i32 FFI calls.
+unsafe fn master_call(handle: *mut c_void, f: impl FnOnce(&mut crate::master::MasterDispatcher) -> Result<(), String>) -> i32 {
+    let master = &mut *(handle as *mut crate::master::MasterDispatcher);
+    master.last_error.clear();
+    match f(master) {
+        Ok(()) => 0,
+        Err(e) => { master.last_error = e; -1 }
+    }
+}
+
+/// Helper for Result<Option<OwnedBatch>, String> -> *mut c_void FFI calls.
+unsafe fn master_call_batch(handle: *mut c_void, f: impl FnOnce(&mut crate::master::MasterDispatcher) -> Result<Option<crate::memtable::OwnedBatch>, String>) -> *mut c_void {
+    let master = &mut *(handle as *mut crate::master::MasterDispatcher);
+    master.last_error.clear();
+    match f(master) {
+        Ok(Some(batch)) => Box::into_raw(Box::new(batch)) as *mut c_void,
+        Ok(None) => ptr::null_mut(),
+        Err(e) => { master.last_error = e; ptr::null_mut() }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_reset_sal(
+    handle: *mut c_void,
+    write_cursor: u64,
+    epoch: u32,
+) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let master = unsafe { &mut *(handle as *mut crate::master::MasterDispatcher) };
+        master.reset_sal(write_cursor, epoch);
+    }));
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_collect_acks(handle: *mut c_void) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { master_call(handle, |m| m.collect_acks()) }
+    }));
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_fan_out_ingest(
+    handle: *mut c_void,
+    target_id: i64,
+    batch: *const c_void,
+) -> i32 {
+    if handle.is_null() || batch.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let b = unsafe { &*(batch as *const crate::memtable::OwnedBatch) };
+        unsafe { master_call(handle, |m| m.fan_out_ingest(target_id, b)) }
+    }));
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_fan_out_tick(
+    handle: *mut c_void,
+    target_id: i64,
+) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { master_call(handle, |m| m.fan_out_tick(target_id)) }
+    }));
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_fan_out_push(
+    handle: *mut c_void,
+    target_id: i64,
+    batch: *const c_void,
+) -> i32 {
+    if handle.is_null() || batch.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let b = unsafe { &*(batch as *const crate::memtable::OwnedBatch) };
+        unsafe { master_call(handle, |m| m.fan_out_push(target_id, b)) }
+    }));
+    result.unwrap_or(-99)
+}
+
+/// Returns OwnedBatch handle or null. Check last_error to distinguish "no data" from error.
+#[no_mangle]
+pub extern "C" fn gnitz_master_fan_out_scan(
+    handle: *mut c_void,
+    target_id: i64,
+) -> *mut c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { master_call_batch(handle, |m| m.fan_out_scan(target_id)) }
+    }));
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_fan_out_seek(
+    handle: *mut c_void,
+    target_id: i64,
+    pk_lo: u64,
+    pk_hi: u64,
+) -> *mut c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { master_call_batch(handle, |m| m.fan_out_seek(target_id, pk_lo, pk_hi)) }
+    }));
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_fan_out_seek_by_index(
+    handle: *mut c_void,
+    target_id: i64,
+    col_idx: u32,
+    key_lo: u64,
+    key_hi: u64,
+) -> *mut c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { master_call_batch(handle, |m| m.fan_out_seek_by_index(target_id, col_idx, key_lo, key_hi)) }
+    }));
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_fan_out_backfill(
+    handle: *mut c_void,
+    view_id: i64,
+    source_id: i64,
+) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { master_call(handle, |m| m.fan_out_backfill(view_id, source_id)) }
+    }));
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_broadcast_ddl(
+    handle: *mut c_void,
+    target_id: i64,
+    batch: *const c_void,
+) -> i32 {
+    if handle.is_null() || batch.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let b = unsafe { &*(batch as *const crate::memtable::OwnedBatch) };
+        unsafe { master_call(handle, |m| m.broadcast_ddl(target_id, b)) }
+    }));
+    result.unwrap_or(-99)
+}
+
+/// Returns 0=none exist, 1=some exist, <0=error.
+#[no_mangle]
+pub extern "C" fn gnitz_master_check_pk_exists_broadcast(
+    handle: *mut c_void,
+    owner_table_id: i64,
+    source_col_idx: u32,
+    batch: *const c_void,
+) -> i32 {
+    if handle.is_null() || batch.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let b = unsafe { &*(batch as *const crate::memtable::OwnedBatch) };
+        unsafe {
+            let master = &mut *(handle as *mut crate::master::MasterDispatcher);
+            master.last_error.clear();
+            match master.check_pk_exists_broadcast(owner_table_id, source_col_idx, b) {
+                Ok(true) => 1,
+                Ok(false) => 0,
+                Err(e) => { master.last_error = e; -1 }
+            }
+        }
+    }));
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_start_tick_async(
+    handle: *mut c_void,
+    target_id: i64,
+) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { master_call(handle, |m| m.start_tick_async(target_id)) }
+    }));
+    result.unwrap_or(-99)
+}
+
+/// Returns 0=pending, 1=done, <0=error.
+#[no_mangle]
+pub extern "C" fn gnitz_master_poll_tick_progress(handle: *mut c_void) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let master = &mut *(handle as *mut crate::master::MasterDispatcher);
+        master.last_error.clear();
+        match master.poll_tick_progress() {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(e) => { master.last_error = e; -1 }
+        }
+    }));
+    result.unwrap_or(-99)
+}
+
+/// Returns -1 if all workers OK, else worker index that crashed.
+#[no_mangle]
+pub extern "C" fn gnitz_master_check_workers(handle: *const c_void) -> i32 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let master = unsafe { &*(handle as *const crate::master::MasterDispatcher) };
+        master.check_workers()
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_shutdown_workers(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let master = unsafe { &mut *(handle as *mut crate::master::MasterDispatcher) };
+        master.shutdown_workers();
+    }));
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_master_validate_unique_distributed(
+    handle: *mut c_void,
+    target_id: i64,
+    batch: *const c_void,
+) -> i32 {
+    if handle.is_null() || batch.is_null() { return -1; }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let b = unsafe { &*(batch as *const crate::memtable::OwnedBatch) };
+        unsafe { master_call(handle, |m| m.validate_unique_distributed(target_id, b)) }
+    }));
+    result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 
@@ -4849,10 +5145,10 @@ mod tests {
         use crate::memtable::OwnedBatch;
 
         // Schema: U64(pk=0), I64, STRING
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
-        columns[2] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::I64, 0);
+        columns[2] = SchemaColumn::new(type_code::STRING, 0);
         let schema = SchemaDescriptor { num_columns: 3, pk_index: 0, columns };
 
         // Build source batch with 2 rows
@@ -4919,9 +5215,9 @@ mod tests {
         use crate::memtable::OwnedBatch;
 
         // Schema: U64(pk=0), I64(nullable)
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::I64, 1);
         let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
 
         let mut src = OwnedBatch::with_schema(schema, 4);
@@ -4963,9 +5259,9 @@ mod tests {
         use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
         use crate::memtable::OwnedBatch;
 
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::I64, 0);
         let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
 
         let dir = tempfile::tempdir().unwrap();
@@ -5038,10 +5334,10 @@ mod tests {
     fn make_source_batch_for_project() -> crate::memtable::OwnedBatch {
         use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
 
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        columns[1] = SchemaColumn { type_code: type_code::I32, size: 4, nullable: 1, _pad: 0 };
-        columns[2] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::I32, 1);
+        columns[2] = SchemaColumn::new(type_code::U64, 0);
         let schema = SchemaDescriptor { num_columns: 3, pk_index: 0, columns };
 
         let mut src = crate::memtable::OwnedBatch::with_schema(schema, 8);
@@ -5090,9 +5386,9 @@ mod tests {
 
     fn make_u64_index_schema() -> crate::compact::SchemaDescriptor {
         use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
-        let mut cols = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        cols[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        cols[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        let mut cols = [SchemaColumn::new(0, 0); 64];
+        cols[0] = SchemaColumn::new(type_code::U64, 0);
+        cols[1] = SchemaColumn::new(type_code::U64, 0);
         SchemaDescriptor { num_columns: 2, pk_index: 0, columns: cols }
     }
 
@@ -5134,9 +5430,9 @@ mod tests {
         use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
 
         // Source schema: U128(pk=0), U64(col1)
-        let mut src_cols = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        src_cols[0] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
-        src_cols[1] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
+        let mut src_cols = [SchemaColumn::new(0, 0); 64];
+        src_cols[0] = SchemaColumn::new(type_code::U128, 0);
+        src_cols[1] = SchemaColumn::new(type_code::U64, 0);
         let src_schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns: src_cols };
 
         let mut src = crate::memtable::OwnedBatch::with_schema(src_schema, 4);
@@ -5151,9 +5447,9 @@ mod tests {
         let src_ptr = &src as *const crate::memtable::OwnedBatch as *const libc::c_void;
 
         // Index schema: U64(pk=0), U128(payload) — source PK is U128
-        let mut idx_cols = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        idx_cols[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        idx_cols[1] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
+        let mut idx_cols = [SchemaColumn::new(0, 0); 64];
+        idx_cols[0] = SchemaColumn::new(type_code::U64, 0);
+        idx_cols[1] = SchemaColumn::new(type_code::U128, 0);
         let idx_schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns: idx_cols };
 
         let result = gnitz_batch_project_index(src_ptr, 1, &idx_schema);

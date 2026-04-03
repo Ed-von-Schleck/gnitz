@@ -700,34 +700,19 @@ impl ShardIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor};
+    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
     use crate::shard_file;
 
     fn test_schema() -> SchemaDescriptor {
         let mut sd = SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [SchemaColumn {
-                type_code: 0,
-                size: 0,
-                nullable: 0,
-                _pad: 0,
-            }; 64],
+            columns: [SchemaColumn::new(0, 0); 64],
         };
         // col 0 = PK (U64, size 8)
-        sd.columns[0] = SchemaColumn {
-            type_code: 8,
-            size: 8,
-            nullable: 0,
-            _pad: 0,
-        };
+        sd.columns[0] = SchemaColumn::new(type_code::U64, 0);
         // col 1 = payload (I64, size 8)
-        sd.columns[1] = SchemaColumn {
-            type_code: 9,
-            size: 8,
-            nullable: 0,
-            _pad: 0,
-        };
+        sd.columns[1] = SchemaColumn::new(type_code::I64, 0);
         sd
     }
 

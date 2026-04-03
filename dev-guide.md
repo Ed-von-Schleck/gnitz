@@ -4,19 +4,17 @@
 
 When adding a new server-side constraint, validation rule, or invariant:
 
-- [ ] Is it enforced in `engine.py` / `registry.py` for the master DDL path?
-- [ ] Is it in `validate_fk_inline` (single-process) or `validate_fk_distributed`
-      (multi-worker)? FK and partition-global constraints belong at the request layer,
-      NOT inside `ingest_to_family`.
-- [ ] Does it require distributed coordination (like FK validation)?
-      If so, extend `validate_fk_distributed` / `check_fk_batch`.
+- [ ] Is it enforced in `catalog.rs` for the master DDL path?
+- [ ] Is it in `catalog_validate_fk_inline` (single-process) or
+      `validate_unique_distributed` in `master.rs` (multi-worker)?
+      FK and partition-global constraints belong at the request layer.
 - [ ] Does it need to fire on every worker even for empty batches
       (e.g. exchange barrier participation)?
-- [ ] Any change touching `worker.py`, `registry.py` ingest path, or `ipc.py`:
+- [ ] Any change touching `worker.rs`, `master.rs`, `ipc.rs`, or `executor.py`:
       run `make e2e`.
 - [ ] Is there a multi-worker E2E test in `crates/gnitz-py/tests/test_workers.py`
       covering it?
-- [ ] Is there a Rust unit test in `ipc.rs` / `exchange.rs` covering the IPC path?
+- [ ] Is there a Rust unit test in the relevant module?
 - [ ] Does the feature use `hash_row_by_columns` for exchange routing across
       tables where the same logical value may have different column types
       (e.g., PK column = U64 vs regular column = I64)? The hash must produce
@@ -48,9 +46,11 @@ Worker logs (always preserved from last run): `~/git/gnitz/tmp/last_worker_N.log
 Log format: `<epoch>.<ms> <process> <level> <message>`
 - Process tags: `M` (master), `W0`-`WN` (workers)
 
-To add temporary debug logging in RPython code, use `log.debug()` —
-never raw `os.write(2, ...)`. This ensures timestamps, process identity,
-and level-gating. Remove debug calls before committing.
+For temporary debug logging:
+- Rust: `gnitz_debug!` / `gnitz_info!` macros (in `log.rs`)
+- RPython: `log.debug()` — never raw `os.write(2, ...)`
+Both ensure timestamps, process identity, and level-gating.
+Remove debug calls before committing.
 
 To watch all worker logs live:
 
@@ -72,6 +72,30 @@ pre-routing, stashing, skipping round-trips):
 - [ ] Did you test each IPC sub-phase in isolation before combining? E.g. for a 4-step
       optimization: run tests after steps 1-2 before writing steps 3-4.
 - [ ] Add a comment to any guard/fallback code naming the invariant it protects.
+
+## IPC flag constants
+
+IPC group-header flags are defined once in `ipc.rs` as `pub const FLAG_*: u32`.
+Both `worker.rs` and `master.rs` import from there. The Python equivalents
+in `ipc.py` must match. When adding a new flag:
+
+- [ ] Add to `ipc.rs`
+- [ ] Add to `ipc.py`
+- [ ] Handle in `worker.rs` dispatch loop
+- [ ] Handle in `master.rs` if it requires master-side logic
+
+## FFI state ownership transfer
+
+When moving state from a Python object into a Rust struct:
+
+- [ ] **Audit every mutation site** of the old Python field. Python may mutate
+      state after construction (e.g., `sal.epoch = 1` after recovery). The Rust
+      struct won't see these mutations unless you add a setter FFI call.
+- [ ] **Audit every parameter you eliminate.** If Python callers passed different
+      values for the same parameter (e.g., table schema vs. index schema), the
+      Rust code that derives the value internally may get the wrong one. Check
+      what *distinct values* each call site was passing, not just that they were
+      passing *something*.
 
 ## Consolidation and merge correctness
 
@@ -361,14 +385,11 @@ not immediately obvious:
    - Log full data structures (HashMaps, Vecs, schemas), not just single values.
    - For batch/schema mismatches: log `col_data.len()` per column, `count`,
      `blob.len()`, AND the schema's column types/sizes. Compare them.
-   - For cross-boundary bugs (RPython ↔ Rust FFI): add `eprintln!` on the
-     Rust side AND `log.warn()` on the Python side. Know where each goes:
-     - `eprintln!` in the server process → worker log files
-       (`~/git/gnitz/tmp/gnitz_py_*/data/worker_N.log`)
-     - `eprintln!` in the master process → `~/git/gnitz/tmp/server_debug.log`
-       (only if the test harness redirects stderr there)
-     - `log.debug()`/`log.warn()` in RPython → worker or master log file
-       (requires `GNITZ_LOG_LEVEL=debug` for debug-level messages)
+   - For cross-boundary bugs (RPython ↔ Rust FFI): add logging on both sides.
+     - Rust: `gnitz_debug!` / `gnitz_info!` (structured, goes to worker/master log)
+     - Rust: `eprintln!` (stderr, goes to worker/master log depending on process)
+     - RPython: `log.debug()` / `log.warn()` (same log files as Rust)
+     - `GNITZ_LOG_LEVEL=debug` required for debug-level messages on both sides
    - For panics: use `RUST_BACKTRACE=1` to get the full call chain.
 2. **Isolate with 1 worker first.** If the test passes with `GNITZ_WORKERS=1`
    and fails with `GNITZ_WORKERS=4`, the bug is in the exchange/fanout/stash

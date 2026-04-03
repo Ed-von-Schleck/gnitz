@@ -264,6 +264,34 @@ eci = ExternalCompilationInfo(
         "  const uint8_t *sal_ptr, int32_t m2w_efd,"
         "  uint8_t *w2m_region_ptr, uint64_t w2m_region_size,"
         "  int32_t w2m_efd);",
+        # MasterDispatcher
+        "void *gnitz_master_create("
+        "  void *catalog_handle, uint32_t num_workers,"
+        "  const int32_t *worker_pids,"
+        "  char *sal_ptr, int32_t sal_fd, uint64_t sal_mmap_size,"
+        "  char **w2m_region_ptrs, const uint64_t *w2m_region_sizes,"
+        "  const int32_t *m2w_efds, const int32_t *w2m_efds);",
+        "void gnitz_master_destroy(void *handle);",
+        "void gnitz_master_reset_sal(void *handle, uint64_t write_cursor, uint32_t epoch);",
+        "const char *gnitz_master_last_error(const void *handle, uint32_t *out_len);",
+        "int32_t gnitz_master_collect_acks(void *handle);",
+        "int32_t gnitz_master_fan_out_ingest(void *handle, int64_t target_id, const void *batch);",
+        "int32_t gnitz_master_fan_out_tick(void *handle, int64_t target_id);",
+        "int32_t gnitz_master_fan_out_push(void *handle, int64_t target_id, const void *batch);",
+        "void *gnitz_master_fan_out_scan(void *handle, int64_t target_id);",
+        "void *gnitz_master_fan_out_seek(void *handle, int64_t target_id, uint64_t pk_lo, uint64_t pk_hi);",
+        "void *gnitz_master_fan_out_seek_by_index("
+        "  void *handle, int64_t target_id, uint32_t col_idx, uint64_t key_lo, uint64_t key_hi);",
+        "int32_t gnitz_master_fan_out_backfill(void *handle, int64_t view_id, int64_t source_id);",
+        "int32_t gnitz_master_broadcast_ddl(void *handle, int64_t target_id, const void *batch);",
+        "int32_t gnitz_master_check_pk_exists_broadcast("
+        "  void *handle, int64_t owner_table_id, uint32_t source_col_idx, const void *batch);",
+        "int32_t gnitz_master_start_tick_async(void *handle, int64_t target_id);",
+        "int32_t gnitz_master_poll_tick_progress(void *handle);",
+        "int32_t gnitz_master_check_workers(const void *handle);",
+        "void gnitz_master_shutdown_workers(void *handle);",
+        "int32_t gnitz_master_validate_unique_distributed("
+        "  void *handle, int64_t target_id, const void *batch);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -1189,6 +1217,147 @@ _worker_run = rffi.llexternal(
     [rffi.VOIDP, rffi.UINT, rffi.INT,
      rffi.CCHARP, rffi.INT,
      rffi.CCHARP, rffi.ULONGLONG, rffi.INT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# MasterDispatcher
+# ---------------------------------------------------------------------------
+
+_master_create = rffi.llexternal(
+    "gnitz_master_create",
+    [rffi.VOIDP, rffi.UINT,
+     rffi.INTP,
+     rffi.CCHARP, rffi.INT, rffi.ULONGLONG,
+     rffi.CCHARPP, rffi.ULONGLONGP,
+     rffi.INTP, rffi.INTP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_master_destroy = rffi.llexternal(
+    "gnitz_master_destroy",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_master_reset_sal = rffi.llexternal(
+    "gnitz_master_reset_sal",
+    [rffi.VOIDP, rffi.ULONGLONG, rffi.UINT],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_master_last_error = rffi.llexternal(
+    "gnitz_master_last_error",
+    [rffi.VOIDP, rffi.UINTP],
+    rffi.CCHARP,
+    compilation_info=eci,
+)
+
+_master_collect_acks = rffi.llexternal(
+    "gnitz_master_collect_acks",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_master_fan_out_ingest = rffi.llexternal(
+    "gnitz_master_fan_out_ingest",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_master_fan_out_tick = rffi.llexternal(
+    "gnitz_master_fan_out_tick",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_master_fan_out_push = rffi.llexternal(
+    "gnitz_master_fan_out_push",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_master_fan_out_scan = rffi.llexternal(
+    "gnitz_master_fan_out_scan",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_master_fan_out_seek = rffi.llexternal(
+    "gnitz_master_fan_out_seek",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_master_fan_out_seek_by_index = rffi.llexternal(
+    "gnitz_master_fan_out_seek_by_index",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_master_fan_out_backfill = rffi.llexternal(
+    "gnitz_master_fan_out_backfill",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_master_broadcast_ddl = rffi.llexternal(
+    "gnitz_master_broadcast_ddl",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_master_check_pk_exists_broadcast = rffi.llexternal(
+    "gnitz_master_check_pk_exists_broadcast",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_master_start_tick_async = rffi.llexternal(
+    "gnitz_master_start_tick_async",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_master_poll_tick_progress = rffi.llexternal(
+    "gnitz_master_poll_tick_progress",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_master_check_workers = rffi.llexternal(
+    "gnitz_master_check_workers",
+    [rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_master_shutdown_workers = rffi.llexternal(
+    "gnitz_master_shutdown_workers",
+    [rffi.VOIDP],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_master_validate_unique_distributed = rffi.llexternal(
+    "gnitz_master_validate_unique_distributed",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
     rffi.INT,
     compilation_info=eci,
 )

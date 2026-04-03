@@ -50,6 +50,12 @@ pub struct SchemaColumn {
     pub _pad: u8,
 }
 
+impl SchemaColumn {
+    pub const fn new(type_code: u8, nullable: u8) -> Self {
+        SchemaColumn { type_code, size: type_size(type_code), nullable, _pad: 0 }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct SchemaDescriptor {
@@ -58,14 +64,21 @@ pub struct SchemaDescriptor {
     pub columns: [SchemaColumn; 64],
 }
 
-/// Map a type code to its fixed column byte size.
-pub(crate) fn type_size(tc: u8) -> u8 {
+impl SchemaDescriptor {
+    pub fn minimal_u64() -> Self {
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        SchemaDescriptor { num_columns: 1, pk_index: 0, columns }
+    }
+}
+
+pub(crate) const fn type_size(tc: u8) -> u8 {
     match tc {
-        type_code::U8 | type_code::I8 => 1,
-        type_code::U16 | type_code::I16 => 2,
-        type_code::U32 | type_code::I32 | type_code::F32 => 4,
-        type_code::U64 | type_code::I64 | type_code::F64 => 8,
-        type_code::STRING | type_code::U128 => 16,
+        1 | 2 => 1,       // U8, I8
+        3 | 4 => 2,       // U16, I16
+        5 | 6 | 7 => 4,   // U32, I32, F32
+        8 | 9 | 10 => 8,  // U64, I64, F64
+        11 | 12 => 16,    // STRING, U128
         _ => 8,
     }
 }

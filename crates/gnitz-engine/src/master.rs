@@ -1,0 +1,1093 @@
+//! Master-side dispatcher: fans out push/scan operations to worker processes
+//! via the shared append-only log (SAL) and collects responses via per-worker
+//! W2M regions. Eventfds provide cross-process signaling.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+
+use crate::catalog::CatalogEngine;
+use crate::compact::SchemaDescriptor;
+use crate::ffi::promote_to_index_key;
+use crate::ipc::{
+    self, MAX_WORKERS, W2M_HEADER_SIZE, STATUS_OK,
+    FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH, FLAG_HAS_PK,
+    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
+    FLAG_TICK, FLAG_FLUSH, DecodedWire,
+};
+use crate::ipc_sys;
+use crate::memtable::OwnedBatch;
+use crate::ops::{
+    PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter,
+    worker_for_partition_pub,
+};
+
+// ---------------------------------------------------------------------------
+// MasterDispatcher
+// ---------------------------------------------------------------------------
+
+pub struct MasterDispatcher {
+    num_workers: usize,
+    worker_pids: Vec<i32>,
+    // SAL state — sal_lsn_counter must stay monotonic across checkpoints.
+    sal_ptr: *mut u8,
+    sal_fd: i32,
+    sal_mmap_size: u64,
+    sal_write_cursor: u64,
+    sal_lsn_counter: u64,
+    sal_epoch: u32,
+    checkpoint_threshold: u64,
+    w2m_region_ptrs: Vec<*mut u8>,
+    m2w_efds: Vec<i32>,
+    w2m_efds: Vec<i32>,
+    // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
+    catalog: *mut CatalogEngine,
+    router: PartitionRouter,
+    // Async tick state
+    async_remaining: usize,
+    async_collected: Vec<bool>,
+    async_w2m_rcs: Vec<u64>,
+    async_exchange_payloads: HashMap<i64, Vec<Option<OwnedBatch>>>,
+    async_exchange_counts: HashMap<i64, usize>,
+    async_exchange_source_ids: HashMap<i64, i64>,
+    async_active: bool,
+    pub(crate) last_error: String,
+}
+
+// Safety: MasterDispatcher is single-threaded (master process event loop).
+unsafe impl Send for MasterDispatcher {}
+
+impl MasterDispatcher {
+    pub fn new(
+        num_workers: usize,
+        worker_pids: Vec<i32>,
+        catalog: *mut CatalogEngine,
+        sal_ptr: *mut u8,
+        sal_fd: i32,
+        sal_mmap_size: u64,
+        w2m_region_ptrs: Vec<*mut u8>,
+        _w2m_region_sizes: Vec<u64>,
+        m2w_efds: Vec<i32>,
+        w2m_efds: Vec<i32>,
+    ) -> Self {
+        let checkpoint_threshold = (sal_mmap_size * 3) >> 2; // 75%
+        MasterDispatcher {
+            num_workers,
+            worker_pids,
+            sal_ptr,
+            sal_fd,
+            sal_mmap_size,
+            sal_write_cursor: 0,
+            sal_lsn_counter: 0,
+            sal_epoch: 0,
+            checkpoint_threshold,
+            w2m_region_ptrs,
+            m2w_efds,
+            w2m_efds,
+            catalog,
+            router: PartitionRouter::new(),
+            async_remaining: 0,
+            async_collected: vec![false; num_workers],
+            async_w2m_rcs: vec![W2M_HEADER_SIZE as u64; num_workers],
+            async_exchange_payloads: HashMap::new(),
+            async_exchange_counts: HashMap::new(),
+            async_exchange_source_ids: HashMap::new(),
+            async_active: false,
+            last_error: String::new(),
+        }
+    }
+
+    pub fn reset_sal(&mut self, write_cursor: u64, epoch: u32) {
+        self.sal_write_cursor = write_cursor;
+        self.sal_epoch = epoch;
+    }
+
+    fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Vec<Vec<u8>>) {
+        let cat = unsafe { &mut *self.catalog };
+        let schema = cat.get_schema_desc(target_id).unwrap_or_else(|| {
+            panic!("master: no schema for target_id={}", target_id);
+        });
+        let names = cat.get_column_names(target_id);
+        let name_bytes: Vec<Vec<u8>> = names.into_iter().map(|s| s.into_bytes()).collect();
+        (schema, name_bytes)
+    }
+
+    // -----------------------------------------------------------------------
+    // Core send/receive helpers
+    // -----------------------------------------------------------------------
+
+    /// Encode per-worker data and write one SAL message group.
+    /// Does NOT fdatasync or signal.
+    fn write_group(
+        &mut self,
+        target_id: i64,
+        flags: u32,
+        worker_batches: &[Option<&OwnedBatch>],
+        schema: &SchemaDescriptor,
+        col_names: &[Vec<u8>],
+        seek_pk_lo: u64,
+        seek_pk_hi: u64,
+        seek_col_idx: u64,
+        unicast_worker: i32,
+    ) -> Result<(), String> {
+        let nw = self.num_workers;
+        let mut name_refs = [&[] as &[u8]; 64];
+        for (i, n) in col_names.iter().enumerate().take(64) {
+            name_refs[i] = n.as_slice();
+        }
+        let col_names_opt = if col_names.is_empty() {
+            None
+        } else {
+            Some(&name_refs[..col_names.len()])
+        };
+
+        let mut wire_bufs: Vec<Vec<u8>> = Vec::with_capacity(nw);
+        for w in 0..nw {
+            if unicast_worker >= 0 && w != unicast_worker as usize {
+                wire_bufs.push(Vec::new());
+                continue;
+            }
+            let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
+            let buf = ipc::encode_wire(
+                target_id as u64, 0, flags as u64,
+                seek_pk_lo, seek_pk_hi, seek_col_idx,
+                STATUS_OK, b"",
+                Some(schema), col_names_opt, data_batch.copied(),
+            );
+            wire_bufs.push(buf);
+        }
+
+        self.sal_write(&wire_bufs, target_id, flags)
+    }
+
+    /// Encode batch once and write identical data to all workers.
+    fn write_broadcast(
+        &mut self,
+        target_id: i64,
+        flags: u32,
+        batch: Option<&OwnedBatch>,
+        schema: &SchemaDescriptor,
+        col_names: &[Vec<u8>],
+        seek_pk_lo: u64,
+        seek_pk_hi: u64,
+        seek_col_idx: u64,
+    ) -> Result<(), String> {
+        let mut name_refs = [&[] as &[u8]; 64];
+        for (i, n) in col_names.iter().enumerate().take(64) {
+            name_refs[i] = n.as_slice();
+        }
+        let col_names_opt = if col_names.is_empty() {
+            None
+        } else {
+            Some(&name_refs[..col_names.len()])
+        };
+
+        let wire_buf = ipc::encode_wire(
+            target_id as u64, 0, flags as u64,
+            seek_pk_lo, seek_pk_hi, seek_col_idx,
+            STATUS_OK, b"",
+            Some(schema), col_names_opt, batch,
+        );
+
+        let nw = self.num_workers;
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_WORKERS];
+        let mut sizes = [0u32; MAX_WORKERS];
+        for w in 0..nw {
+            ptrs[w] = wire_buf.as_ptr();
+            sizes[w] = wire_buf.len() as u32;
+        }
+
+        let lsn = self.sal_lsn_counter;
+        self.sal_lsn_counter += 1;
+
+        let result = unsafe {
+            ipc::sal_write_group(
+                self.sal_ptr, self.sal_write_cursor,
+                nw as u32, target_id as u32, lsn, flags, self.sal_epoch,
+                self.sal_mmap_size, ptrs.as_ptr(), sizes.as_ptr(),
+            )
+        };
+        if result.status < 0 {
+            return Err(format!("SAL broadcast write failed (cursor={})", self.sal_write_cursor));
+        }
+        self.sal_write_cursor = result.new_cursor;
+        Ok(())
+    }
+
+    /// Common SAL write from pre-encoded wire buffers.
+    fn sal_write(&mut self, wire_bufs: &[Vec<u8>], target_id: i64, flags: u32) -> Result<(), String> {
+        let nw = self.num_workers;
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_WORKERS];
+        let mut sizes = [0u32; MAX_WORKERS];
+        for (w, buf) in wire_bufs.iter().enumerate().take(nw) {
+            if !buf.is_empty() {
+                ptrs[w] = buf.as_ptr();
+                sizes[w] = buf.len() as u32;
+            }
+        }
+
+        let lsn = self.sal_lsn_counter;
+        self.sal_lsn_counter += 1;
+
+        let result = unsafe {
+            ipc::sal_write_group(
+                self.sal_ptr, self.sal_write_cursor,
+                nw as u32, target_id as u32, lsn, flags, self.sal_epoch,
+                self.sal_mmap_size, ptrs.as_ptr(), sizes.as_ptr(),
+            )
+        };
+        if result.status < 0 {
+            return Err(format!("SAL write failed (cursor={}, mmap_size={})",
+                self.sal_write_cursor, self.sal_mmap_size));
+        }
+        self.sal_write_cursor = result.new_cursor;
+        Ok(())
+    }
+
+    /// Encode once, write to all workers, fdatasync, signal.
+    fn send_broadcast(
+        &mut self,
+        target_id: i64,
+        flags: u32,
+        batch: Option<&OwnedBatch>,
+        schema: &SchemaDescriptor,
+        col_names: &[Vec<u8>],
+        seek_pk_lo: u64,
+        seek_pk_hi: u64,
+        seek_col_idx: u64,
+    ) -> Result<(), String> {
+        self.write_broadcast(target_id, flags, batch, schema, col_names,
+                            seek_pk_lo, seek_pk_hi, seek_col_idx)?;
+        self.sync_and_signal_all();
+        Ok(())
+    }
+
+    fn sync_and_signal_all(&self) {
+        ipc_sys::fdatasync(self.sal_fd);
+        for w in 0..self.num_workers {
+            ipc_sys::eventfd_signal(self.m2w_efds[w]);
+        }
+    }
+
+    fn sync_and_signal_one(&self, worker: usize) {
+        ipc_sys::fdatasync(self.sal_fd);
+        ipc_sys::eventfd_signal(self.m2w_efds[worker]);
+    }
+
+    /// Write per-worker message group + fdatasync + signal all workers.
+    fn send_to_workers(
+        &mut self,
+        target_id: i64,
+        flags: u32,
+        worker_batches: &[Option<&OwnedBatch>],
+        schema: &SchemaDescriptor,
+        col_names: &[Vec<u8>],
+        seek_pk_lo: u64,
+        seek_pk_hi: u64,
+        seek_col_idx: u64,
+    ) -> Result<(), String> {
+        self.write_group(target_id, flags, worker_batches, schema, col_names,
+                         seek_pk_lo, seek_pk_hi, seek_col_idx, -1)?;
+        self.sync_and_signal_all();
+        Ok(())
+    }
+
+    fn reset_w2m_cursors(&self) {
+        for w in 0..self.num_workers {
+            unsafe {
+                ipc::atomic_store_u64(self.w2m_region_ptrs[w], W2M_HEADER_SIZE as u64);
+            }
+        }
+    }
+
+    /// Wait for one response from each worker. ALWAYS resets W2M cursors.
+    fn wait_all_workers(&mut self) -> Result<Vec<Option<DecodedWire>>, String> {
+        let nw = self.num_workers;
+        let mut results: Vec<Option<DecodedWire>> = (0..nw).map(|_| None).collect();
+        let mut remaining = nw;
+        let mut collected = vec![false; nw];
+        let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
+
+        let err = (|| -> Result<(), String> {
+            while remaining > 0 {
+                ipc_sys::eventfd_wait_any(&self.w2m_efds, 1000);
+                for w in 0..nw {
+                    if collected[w] { continue; }
+                    let wc = unsafe { ipc::atomic_load_u64(self.w2m_region_ptrs[w]) };
+                    if w2m_rcs[w] < wc {
+                        let (new_rc, data_size, data_ptr) = unsafe {
+                            ipc::w2m_read(self.w2m_region_ptrs[w], w2m_rcs[w])
+                        };
+                        w2m_rcs[w] = new_rc;
+                        if data_size == 0 { continue; }
+                        let data = unsafe {
+                            std::slice::from_raw_parts(data_ptr, data_size as usize)
+                        };
+                        let decoded = ipc::decode_wire(data)
+                            .map_err(|e| format!("worker {}: decode: {}", w, e))?;
+                        if decoded.control.status != 0 {
+                            let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+                            return Err(format!("worker {}: {}", w, msg));
+                        }
+                        results[w] = Some(decoded);
+                        collected[w] = true;
+                        remaining -= 1;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.reset_w2m_cursors();
+        err?;
+        Ok(results)
+    }
+
+    pub fn collect_acks(&mut self) -> Result<(), String> {
+        self.wait_all_workers()?;
+        Ok(())
+    }
+
+    /// Collect ACKs from all workers, relaying exchange messages inline.
+    fn collect_acks_and_relay(&mut self, target_id: i64) -> Result<(), String> {
+        let nw = self.num_workers;
+        let mut remaining = nw;
+        let mut collected = vec![false; nw];
+        let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
+
+        let mut exchange_payloads: HashMap<i64, Vec<Option<OwnedBatch>>> = HashMap::new();
+        let mut exchange_counts: HashMap<i64, usize> = HashMap::new();
+        let mut exchange_schemas: HashMap<i64, SchemaDescriptor> = HashMap::new();
+        let mut exchange_source_ids: HashMap<i64, i64> = HashMap::new();
+
+        let err = (|| -> Result<(), String> {
+            while remaining > 0 {
+                ipc_sys::eventfd_wait_any(&self.w2m_efds, 1000);
+                for w in 0..nw {
+                    if collected[w] { continue; }
+                    let wc = unsafe { ipc::atomic_load_u64(self.w2m_region_ptrs[w]) };
+                    while w2m_rcs[w] < wc {
+                        let (new_rc, data_size, data_ptr) = unsafe {
+                            ipc::w2m_read(self.w2m_region_ptrs[w], w2m_rcs[w])
+                        };
+                        w2m_rcs[w] = new_rc;
+                        if data_size == 0 { break; }
+                        let data = unsafe {
+                            std::slice::from_raw_parts(data_ptr, data_size as usize)
+                        };
+                        let decoded = ipc::decode_wire(data)
+                            .map_err(|e| format!("worker {}: decode: {}", w, e))?;
+
+                        if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
+                            let vid = decoded.control.target_id as i64;
+                            let ex_source_id = decoded.control.seek_pk_lo as i64;
+
+                            let payloads = exchange_payloads
+                                .entry(vid)
+                                .or_insert_with(|| (0..nw).map(|_| None).collect());
+                            let count = exchange_counts.entry(vid).or_insert(0);
+
+                            payloads[w] = decoded.data_batch.map(|b| *b);
+                            if let Some(schema) = decoded.schema {
+                                exchange_schemas.insert(vid, schema);
+                            }
+                            if ex_source_id > 0 {
+                                exchange_source_ids.insert(vid, ex_source_id);
+                            }
+                            *count += 1;
+
+                            if *count == nw {
+                                let ex_schema = exchange_schemas.remove(&vid);
+                                let src_id = exchange_source_ids.remove(&vid).unwrap_or(0);
+                                let payloads_vec = exchange_payloads.remove(&vid).unwrap();
+                                exchange_counts.remove(&vid);
+
+                                self.relay_exchange(vid, payloads_vec, ex_schema, src_id, target_id)?;
+                            }
+                            break; // re-check write_cursor after relay
+                        } else {
+                            if decoded.control.status != 0 {
+                                let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+                                return Err(format!("worker {}: {}", w, msg));
+                            }
+                            collected[w] = true;
+                            remaining -= 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.reset_w2m_cursors();
+        err
+    }
+
+    /// Collect data responses from all workers, concatenate into one batch.
+    fn collect_responses(&mut self, schema: &SchemaDescriptor) -> Result<OwnedBatch, String> {
+        let npc = schema.num_columns as usize - 1;
+        let results = self.wait_all_workers()?;
+        let mut out = OwnedBatch::empty(npc);
+        out.schema = Some(*schema);
+        for decoded_opt in &results {
+            if let Some(decoded) = decoded_opt {
+                if let Some(ref batch) = decoded.data_batch {
+                    if batch.count > 0 {
+                        out.append_batch(batch, 0, batch.count);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Collect a single response from one worker.
+    fn collect_one(&mut self, worker: usize) -> Result<DecodedWire, String> {
+        let mut w2m_rc = W2M_HEADER_SIZE as u64;
+        let result = (|| -> Result<DecodedWire, String> {
+            loop {
+                ipc_sys::eventfd_wait(self.w2m_efds[worker], 1000);
+                let wc = unsafe { ipc::atomic_load_u64(self.w2m_region_ptrs[worker]) };
+                if w2m_rc < wc {
+                    let (new_rc, data_size, data_ptr) = unsafe {
+                        ipc::w2m_read(self.w2m_region_ptrs[worker], w2m_rc)
+                    };
+                    w2m_rc = new_rc;
+                    if data_size > 0 {
+                        let data = unsafe {
+                            std::slice::from_raw_parts(data_ptr, data_size as usize)
+                        };
+                        return ipc::decode_wire(data)
+                            .map_err(|e| format!("worker {}: decode: {}", worker, e));
+                    }
+                }
+            }
+        })();
+        unsafe {
+            ipc::atomic_store_u64(self.w2m_region_ptrs[worker], W2M_HEADER_SIZE as u64);
+        }
+        result
+    }
+
+    // -----------------------------------------------------------------------
+    // SAL Checkpoint
+    // -----------------------------------------------------------------------
+
+    fn maybe_checkpoint(&mut self) -> Result<(), String> {
+        if self.sal_write_cursor < self.checkpoint_threshold {
+            return Ok(());
+        }
+        self.do_checkpoint()
+    }
+
+    fn do_checkpoint(&mut self) -> Result<(), String> {
+        let (schema, col_names) = self.get_schema_and_names(0);
+        self.send_broadcast(0, FLAG_FLUSH, None, &schema, &col_names, 0, 0, 0)?;
+        self.collect_acks()?;
+
+        self.sal_epoch += 1;
+        self.sal_write_cursor = 0;
+        unsafe { ipc::atomic_store_u64(self.sal_ptr, 0); }
+        gnitz_info!("SAL checkpoint epoch={}", self.sal_epoch);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Exchange relay
+    // -----------------------------------------------------------------------
+
+    fn relay_exchange(
+        &mut self,
+        view_id: i64,
+        payloads: Vec<Option<OwnedBatch>>,
+        ex_schema: Option<SchemaDescriptor>,
+        source_id: i64,
+        fallback_target_id: i64,
+    ) -> Result<(), String> {
+        let remaining = self.sal_mmap_size - self.sal_write_cursor;
+        if remaining < (self.sal_mmap_size >> 3) {
+            return Err(format!(
+                "SAL space exhausted during exchange relay ({} bytes left)", remaining));
+        }
+
+        let cat = unsafe { &mut *self.catalog };
+        let shard_cols = if source_id > 0 {
+            let cols = cat.dag.get_join_shard_cols(view_id, source_id);
+            if cols.is_empty() { cat.dag.get_shard_cols(view_id) } else { cols }
+        } else {
+            cat.dag.get_shard_cols(view_id)
+        };
+
+        let sources: Vec<Option<&OwnedBatch>> = payloads.iter()
+            .map(|opt| opt.as_ref())
+            .collect();
+
+        let schema = if let Some(s) = ex_schema {
+            s
+        } else {
+            let cat = unsafe { &mut *self.catalog };
+            cat.get_schema_desc(view_id)
+                .or_else(|| cat.get_schema_desc(fallback_target_id))
+                .ok_or_else(|| format!("no schema for view_id={}", view_id))?
+        };
+
+        let col_indices: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
+        let dest_batches = op_relay_scatter(&sources, &col_indices, &schema, self.num_workers);
+
+        let cat = unsafe { &mut *self.catalog };
+        let names = cat.get_column_names(view_id);
+        let name_bytes: Vec<Vec<u8>> = if names.is_empty() {
+            cat.get_column_names(fallback_target_id)
+                .into_iter().map(|s| s.into_bytes()).collect()
+        } else {
+            names.into_iter().map(|s| s.into_bytes()).collect()
+        };
+
+        let refs: Vec<Option<&OwnedBatch>> = dest_batches.iter()
+            .map(|b| if b.count > 0 { Some(b) } else { None })
+            .collect();
+        self.send_to_workers(view_id, 0, &refs, &schema, &name_bytes, 0, 0, 0)
+    }
+
+    fn record_index_routing(
+        &mut self, target_id: i64, schema: &SchemaDescriptor, per_worker_batches: &[OwnedBatch],
+    ) {
+        let cat = unsafe { &mut *self.catalog };
+        let n_idx = cat.get_index_circuit_count(target_id);
+        if n_idx == 0 { return; }
+
+        for ci in 0..n_idx {
+            if let Some((col_idx, is_unique, _tc)) = cat.get_index_circuit_info(target_id, ci) {
+                if !is_unique { continue; }
+                for w in 0..self.num_workers {
+                    let sb = &per_worker_batches[w];
+                    if sb.count > 0 {
+                        self.router.record_routing(sb, schema, target_id as u32, col_idx, w as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fan-out operations
+    // -----------------------------------------------------------------------
+
+    pub fn fan_out_ingest(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+        self.maybe_checkpoint()?;
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+        let pk_col = &[schema.pk_index];
+        let sub_batches = op_repartition_batch(batch, pk_col, &schema, self.num_workers);
+        let refs: Vec<Option<&OwnedBatch>> = sub_batches.iter()
+            .map(|b| if b.count > 0 { Some(b) } else { None })
+            .collect();
+        self.send_to_workers(target_id, FLAG_PUSH, &refs, &schema, &col_names, 0, 0, 0)?;
+        self.collect_acks()?;
+        gnitz_debug!("fan_out_ingest tid={} rows={}", target_id, batch.count);
+        Ok(())
+    }
+
+    pub fn fan_out_tick(&mut self, target_id: i64) -> Result<(), String> {
+        self.maybe_checkpoint()?;
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+        self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0)?;
+        self.collect_acks_and_relay(target_id)?;
+        gnitz_debug!("fan_out_tick tid={}", target_id);
+        Ok(())
+    }
+
+    pub fn fan_out_push(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+        self.maybe_checkpoint()?;
+        let n = batch.count;
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+
+        let preloadable = {
+            let cat = unsafe { &mut *self.catalog };
+            cat.dag.get_preloadable_views(target_id)
+        };
+
+        let use_preload = if !preloadable.is_empty() {
+            !(0..n).any(|i| batch.get_weight(i) < 0)
+        } else {
+            false
+        };
+
+        if !use_preload {
+            let pk_col = &[schema.pk_index];
+            let sub_batches = op_repartition_batch(batch, pk_col, &schema, self.num_workers);
+            self.record_index_routing(target_id, &schema, &sub_batches);
+            let refs: Vec<Option<&OwnedBatch>> = sub_batches.iter()
+                .map(|b| if b.count > 0 { Some(b) } else { None })
+                .collect();
+            self.send_to_workers(target_id, FLAG_PUSH, &refs, &schema, &col_names, 0, 0, 0)?;
+        } else {
+            let mut col_specs_owned: Vec<Vec<u32>> = Vec::with_capacity(preloadable.len() + 1);
+            col_specs_owned.push(vec![schema.pk_index]);
+            for (_vid, cols) in &preloadable {
+                col_specs_owned.push(cols.iter().map(|&c| c as u32).collect());
+            }
+            let col_specs: Vec<&[u32]> = col_specs_owned.iter().map(|v| v.as_slice()).collect();
+            let all_batches = op_multi_scatter(batch, &col_specs, &schema, self.num_workers);
+
+            let pk_batches = &all_batches[0];
+            self.record_index_routing(target_id, &schema, pk_batches);
+
+            for si in 0..preloadable.len() {
+                let vid = preloadable[si].0;
+                let preload_batches = &all_batches[si + 1];
+                let refs: Vec<Option<&OwnedBatch>> = preload_batches.iter()
+                    .map(|b| if b.count > 0 { Some(b) } else { None })
+                    .collect();
+                self.write_group(vid, FLAG_PRELOADED_EXCHANGE, &refs, &schema,
+                                &col_names, 0, 0, 0, -1)?;
+            }
+
+            let refs: Vec<Option<&OwnedBatch>> = pk_batches.iter()
+                .map(|b| if b.count > 0 { Some(b) } else { None })
+                .collect();
+            self.write_group(target_id, FLAG_PUSH, &refs, &schema,
+                            &col_names, 0, 0, 0, -1)?;
+
+            self.sync_and_signal_all();
+        }
+
+        self.collect_acks_and_relay(target_id)?;
+        gnitz_debug!("fan_out_push tid={} rows={}", target_id, n);
+        Ok(())
+    }
+
+    pub fn fan_out_backfill(&mut self, view_id: i64, source_id: i64) -> Result<(), String> {
+        self.maybe_checkpoint()?;
+        let (schema, col_names) = self.get_schema_and_names(source_id);
+        self.send_broadcast(source_id, FLAG_BACKFILL, None, &schema, &col_names,
+                           view_id as u64, 0, 0)?;
+        self.collect_acks_and_relay(source_id)
+    }
+
+    pub fn fan_out_scan(&mut self, target_id: i64) -> Result<Option<OwnedBatch>, String> {
+        self.maybe_checkpoint()?;
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+        self.send_broadcast(target_id, 0, None, &schema, &col_names, 0, 0, 0)?;
+        let result = self.collect_responses(&schema)?;
+        gnitz_debug!("fan_out_scan tid={} result_rows={}", target_id, result.count);
+        if result.count == 0 { Ok(None) } else { Ok(Some(result)) }
+    }
+
+    pub fn fan_out_seek(
+        &mut self, target_id: i64, pk_lo: u64, pk_hi: u64,
+    ) -> Result<Option<OwnedBatch>, String> {
+        self.maybe_checkpoint()?;
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+        let worker = worker_for_partition_pub(
+            crate::partitioned_table::partition_for_key(pk_lo, pk_hi),
+            self.num_workers,
+        );
+
+        let empty: Vec<Option<&OwnedBatch>> = vec![None; self.num_workers];
+        self.write_group(target_id, FLAG_SEEK, &empty, &schema, &col_names,
+                        pk_lo, pk_hi, 0, worker as i32)?;
+        self.sync_and_signal_one(worker);
+
+        let decoded = self.collect_one(worker)?;
+        if decoded.control.status != 0 {
+            let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+            return Err(format!("worker {}: seek: {}", worker, msg));
+        }
+        Ok(decoded.data_batch.and_then(|b| {
+            if b.count > 0 {
+                let mut result = OwnedBatch::empty(schema.num_columns as usize - 1);
+                result.schema = Some(schema);
+                result.append_batch(&b, 0, b.count);
+                Some(result)
+            } else {
+                None
+            }
+        }))
+    }
+
+    pub fn fan_out_seek_by_index(
+        &mut self, target_id: i64, col_idx: u32, key_lo: u64, key_hi: u64,
+    ) -> Result<Option<OwnedBatch>, String> {
+        self.maybe_checkpoint()?;
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+
+        let cached_worker = self.router.worker_for_index_key(target_id as u32, col_idx, key_lo);
+        if cached_worker >= 0 {
+            let w = cached_worker as usize;
+            let empty: Vec<Option<&OwnedBatch>> = vec![None; self.num_workers];
+            self.write_group(target_id, FLAG_SEEK_BY_INDEX, &empty, &schema, &col_names,
+                            key_lo, key_hi, col_idx as u64, cached_worker)?;
+            self.sync_and_signal_one(w);
+
+            let decoded = self.collect_one(w)?;
+            if decoded.control.status != 0 {
+                let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+                return Err(format!("worker {}: seek_by_index: {}", w, msg));
+            }
+            return Ok(extract_single_batch(&schema, decoded));
+        }
+
+        // Cache miss: broadcast
+        let empty: Vec<Option<&OwnedBatch>> = vec![None; self.num_workers];
+        self.send_to_workers(target_id, FLAG_SEEK_BY_INDEX, &empty, &schema, &col_names,
+                            key_lo, key_hi, col_idx as u64)?;
+        let results = self.wait_all_workers()?;
+        for decoded_opt in results {
+            if let Some(decoded) = decoded_opt {
+                if let Some(ref batch) = decoded.data_batch {
+                    if batch.count > 0 {
+                        return Ok(extract_single_batch(&schema, decoded));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn broadcast_ddl(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+        self.maybe_checkpoint()?;
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+        self.write_broadcast(target_id, FLAG_DDL_SYNC, Some(batch), &schema, &col_names,
+                            0, 0, 0)?;
+        self.sync_and_signal_all();
+        gnitz_debug!("broadcast_ddl tid={} rows={}", target_id, batch.count);
+        Ok(())
+    }
+
+    pub fn check_pk_exists_broadcast(
+        &mut self, owner_table_id: i64, source_col_idx: u32, check_batch: &OwnedBatch,
+    ) -> Result<bool, String> {
+        self.maybe_checkpoint()?;
+        let schema = check_batch.schema
+            .ok_or_else(|| "check_pk_exists_broadcast: batch has no schema".to_string())?;
+        let col_hint = (source_col_idx + 1) as u64;
+        self.write_broadcast(owner_table_id, FLAG_HAS_PK, Some(check_batch), &schema,
+                            &[], 0, 0, col_hint)?;
+        self.sync_and_signal_all();
+
+        let results = self.wait_all_workers()?;
+        for decoded_opt in &results {
+            if let Some(decoded) = decoded_opt {
+                if let Some(ref batch) = decoded.data_batch {
+                    for j in 0..batch.count {
+                        if batch.get_weight(j) == 1 {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn check_pk_existence(
+        &mut self, target_id: i64, check_batch: &OwnedBatch,
+    ) -> Result<HashMap<u64, HashSet<u64>>, String> {
+        self.maybe_checkpoint()?;
+        let schema = check_batch.schema
+            .ok_or_else(|| "check_pk_existence: batch has no schema".to_string())?;
+        let pk_col = &[schema.pk_index];
+        let sub_batches = op_repartition_batch(check_batch, pk_col, &schema, self.num_workers);
+        let refs: Vec<Option<&OwnedBatch>> = sub_batches.iter()
+            .map(|b| if b.count > 0 { Some(b) } else { None })
+            .collect();
+        self.send_to_workers(target_id, FLAG_HAS_PK, &refs, &schema, &[], 0, 0, 0)?;
+
+        let results = self.wait_all_workers()?;
+        let mut existing: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for decoded_opt in &results {
+            if let Some(decoded) = decoded_opt {
+                if let Some(ref batch) = decoded.data_batch {
+                    for j in 0..batch.count {
+                        if batch.get_weight(j) == 1 {
+                            existing.entry(batch.get_pk_lo(j)).or_default().insert(batch.get_pk_hi(j));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(existing)
+    }
+
+    // -----------------------------------------------------------------------
+    // Async tick API
+    // -----------------------------------------------------------------------
+
+    pub fn start_tick_async(&mut self, target_id: i64) -> Result<(), String> {
+        self.maybe_checkpoint()?;
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+        self.send_broadcast(target_id, FLAG_TICK, None, &schema, &col_names, 0, 0, 0)?;
+
+        self.async_remaining = self.num_workers;
+        for w in 0..self.num_workers {
+            self.async_collected[w] = false;
+            self.async_w2m_rcs[w] = W2M_HEADER_SIZE as u64;
+        }
+        self.async_exchange_payloads.clear();
+        self.async_exchange_counts.clear();
+        self.async_exchange_source_ids.clear();
+        self.async_active = true;
+        Ok(())
+    }
+
+    /// Non-blocking progress check. Returns true when tick is complete.
+    pub fn poll_tick_progress(&mut self) -> Result<bool, String> {
+        if !self.async_active {
+            return Ok(true);
+        }
+
+        let nw = self.num_workers;
+        ipc_sys::eventfd_wait_any(&self.w2m_efds, 1);
+
+        for w in 0..nw {
+            if self.async_collected[w] { continue; }
+            let wc = unsafe { ipc::atomic_load_u64(self.w2m_region_ptrs[w]) };
+            while self.async_w2m_rcs[w] < wc {
+                let (new_rc, data_size, data_ptr) = unsafe {
+                    ipc::w2m_read(self.w2m_region_ptrs[w], self.async_w2m_rcs[w])
+                };
+                self.async_w2m_rcs[w] = new_rc;
+                if data_size == 0 { break; }
+                let data = unsafe {
+                    std::slice::from_raw_parts(data_ptr, data_size as usize)
+                };
+                let decoded = match ipc::decode_wire(data) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.finish_async_tick();
+                        return Err(format!("worker {}: decode: {}", w, e));
+                    }
+                };
+
+                if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
+                    let vid = decoded.control.target_id as i64;
+                    let ex_source_id = decoded.control.seek_pk_lo as i64;
+
+                    let payloads = self.async_exchange_payloads
+                        .entry(vid)
+                        .or_insert_with(|| (0..nw).map(|_| None).collect());
+                    let count = self.async_exchange_counts.entry(vid).or_insert(0);
+
+                    payloads[w] = decoded.data_batch.map(|b| *b);
+                    if ex_source_id > 0 {
+                        self.async_exchange_source_ids.insert(vid, ex_source_id);
+                    }
+                    *count += 1;
+
+                    if *count == nw {
+                        let src_id = self.async_exchange_source_ids.remove(&vid).unwrap_or(0);
+                        let payloads_vec = self.async_exchange_payloads.remove(&vid).unwrap();
+                        self.async_exchange_counts.remove(&vid);
+
+                        if let Err(e) = self.relay_exchange(vid, payloads_vec, None, src_id, 0) {
+                            self.finish_async_tick();
+                            return Err(e);
+                        }
+                    }
+                    break; // re-check write_cursor after relay
+                } else {
+                    if decoded.control.status != 0 {
+                        let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+                        self.finish_async_tick();
+                        return Err(format!("worker {}: {}", w, msg));
+                    }
+                    self.async_collected[w] = true;
+                    self.async_remaining -= 1;
+                    break;
+                }
+            }
+        }
+
+        if self.async_remaining == 0 {
+            self.finish_async_tick();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn finish_async_tick(&mut self) {
+        self.reset_w2m_cursors();
+        self.async_active = false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle
+    // -----------------------------------------------------------------------
+
+    pub fn check_workers(&self) -> i32 {
+        for w in 0..self.num_workers {
+            let pid = self.worker_pids[w];
+            if pid <= 0 { continue; }
+            let mut status: i32 = 0;
+            let rpid = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if rpid < 0 || rpid > 0 {
+                return w as i32;
+            }
+        }
+        -1
+    }
+
+    pub fn shutdown_workers(&mut self) {
+        let schema = SchemaDescriptor::minimal_u64();
+        let _ = self.send_broadcast(0, FLAG_SHUTDOWN, None, &schema, &[], 0, 0, 0);
+        for w in 0..self.num_workers {
+            let pid = self.worker_pids[w];
+            if pid > 0 {
+                let mut status: i32 = 0;
+                unsafe { libc::waitpid(pid, &mut status, 0); }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unique index validation (moved from executor.py)
+    // -----------------------------------------------------------------------
+
+    pub fn validate_unique_distributed(
+        &mut self, target_id: i64, batch: &OwnedBatch,
+    ) -> Result<(), String> {
+        let cat = unsafe { &mut *self.catalog };
+        let n_circuits = cat.get_index_circuit_count(target_id);
+        if n_circuits == 0 { return Ok(()); }
+
+        let mut has_unique = false;
+        for ci in 0..n_circuits {
+            if let Some((_col_idx, is_unique, _tc)) = cat.get_index_circuit_info(target_id, ci) {
+                if is_unique { has_unique = true; break; }
+            }
+        }
+        if !has_unique { return Ok(()); }
+
+        let source_schema = cat.get_schema_desc(target_id)
+            .ok_or_else(|| format!("no schema for target_id={}", target_id))?;
+        let n = batch.count;
+
+        // Find which PKs already exist so we can skip UPSERT rows
+        let mut pk_lo_list: Vec<u64> = Vec::new();
+        let mut pk_hi_list: Vec<u64> = Vec::new();
+        for i in 0..n {
+            if batch.get_weight(i) <= 0 { continue; }
+            pk_lo_list.push(batch.get_pk_lo(i));
+            pk_hi_list.push(batch.get_pk_hi(i));
+        }
+
+        let existing_pks = if !pk_lo_list.is_empty() {
+            self.check_pk_existence(target_id, &build_check_batch(&source_schema, &pk_lo_list, &pk_hi_list))?
+        } else {
+            HashMap::new()
+        };
+
+        let cat = unsafe { &mut *self.catalog };
+        for ci in 0..n_circuits {
+            let (col_idx, is_unique, type_code) = match cat.get_index_circuit_info(target_id, ci) {
+                Some(info) => info,
+                None => continue,
+            };
+            if !is_unique { continue; }
+
+            let idx_schema = match cat.get_index_circuit_schema(target_id, ci) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let source_col = col_idx as usize;
+            let pki = source_schema.pk_index as usize;
+            let is_pk_col = source_col == pki;
+            let src_payload_idx = if is_pk_col {
+                usize::MAX
+            } else if source_col < pki {
+                source_col
+            } else {
+                source_col - 1
+            };
+            let col_size = source_schema.columns[source_col].size as usize;
+
+            let mut check_lo: Vec<u64> = Vec::new();
+            let mut check_hi: Vec<u64> = Vec::new();
+            let mut seen: HashMap<u64, HashSet<u64>> = HashMap::new();
+
+            for i in 0..n {
+                if batch.get_weight(i) <= 0 { continue; }
+
+                if !is_pk_col {
+                    let null_word = batch.get_null_word(i);
+                    if null_word & (1u64 << src_payload_idx) != 0 { continue; }
+                }
+
+                let pk_lo_i = batch.get_pk_lo(i);
+                let pk_hi_i = batch.get_pk_hi(i);
+                if let Some(hi_set) = existing_pks.get(&pk_lo_i) {
+                    if hi_set.contains(&pk_hi_i) { continue; }
+                }
+
+                let (key_lo, key_hi) = if is_pk_col {
+                    (pk_lo_i, pk_hi_i)
+                } else {
+                    let col_data = &batch.col_data[src_payload_idx];
+                    promote_to_index_key(col_data, i * col_size, col_size, type_code)
+                };
+
+                if let Some(hi_set) = seen.get(&key_lo) {
+                    if hi_set.contains(&key_hi) {
+                        let col_name = self.get_col_name(target_id, source_col);
+                        return Err(format!(
+                            "Unique index violation on column '{}': duplicate in batch", col_name));
+                    }
+                }
+                seen.entry(key_lo).or_default().insert(key_hi);
+                check_lo.push(key_lo);
+                check_hi.push(key_hi);
+            }
+
+            if check_lo.is_empty() { continue; }
+
+            let chk_batch = build_check_batch(&idx_schema, &check_lo, &check_hi);
+            if self.check_pk_exists_broadcast(target_id, col_idx, &chk_batch)? {
+                let col_name = self.get_col_name(target_id, source_col);
+                return Err(format!("Unique index violation on column '{}'", col_name));
+            }
+        }
+        Ok(())
+    }
+
+    fn get_col_name(&mut self, target_id: i64, col_idx: usize) -> String {
+        let cat = unsafe { &mut *self.catalog };
+        cat.get_column_names(target_id)
+            .get(col_idx)
+            .cloned()
+            .unwrap_or_else(|| "?".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn extract_single_batch(schema: &SchemaDescriptor, decoded: DecodedWire) -> Option<OwnedBatch> {
+    decoded.data_batch.and_then(|b| {
+        if b.count > 0 {
+            let mut result = OwnedBatch::empty(schema.num_columns as usize - 1);
+            result.schema = Some(*schema);
+            result.append_batch(&b, 0, b.count);
+            Some(result)
+        } else {
+            None
+        }
+    })
+}
+
+fn build_check_batch(schema: &SchemaDescriptor, lo_list: &[u64], hi_list: &[u64]) -> OwnedBatch {
+    let npc = schema.num_columns as usize - 1;
+    let mut batch = OwnedBatch::with_schema(*schema, lo_list.len());
+    let null_word: u64 = if npc > 0 { (1u64 << npc) - 1 } else { 0 };
+    for k in 0..lo_list.len() {
+        batch.pk_lo.extend_from_slice(&lo_list[k].to_le_bytes());
+        batch.pk_hi.extend_from_slice(&hi_list[k].to_le_bytes());
+        batch.weight.extend_from_slice(&1i64.to_le_bytes());
+        batch.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+        for c in 0..npc {
+            let col_size = schema.columns[if c < schema.pk_index as usize { c } else { c + 1 }].size as usize;
+            batch.col_data[c].extend(std::iter::repeat(0u8).take(col_size));
+        }
+        batch.count += 1;
+    }
+    batch
+}

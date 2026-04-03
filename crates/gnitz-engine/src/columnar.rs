@@ -80,14 +80,14 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
                 let bb = src_b.get_col_ptr(row_b, payload_col, 8);
                 let va = f64::from_bits(read_u64_le(ba, 0));
                 let vb = f64::from_bits(read_u64_le(bb, 0));
-                va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
+                va.total_cmp(&vb)
             }
             TYPE_F32 => {
                 let ba = src_a.get_col_ptr(row_a, payload_col, 4);
                 let bb = src_b.get_col_ptr(row_b, payload_col, 4);
                 let va = f32::from_bits(read_u32_le(ba, 0));
                 let vb = f32::from_bits(read_u32_le(bb, 0));
-                va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
+                va.total_cmp(&vb)
             }
             _ => {
                 let raw_a = src_a.get_col_ptr(row_a, payload_col, col_size);
@@ -139,10 +139,10 @@ mod tests {
 
     /// Build a 3-column schema: [PK:U64, nullable I64, F64].
     fn make_schema_nullable_float() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 1, _pad: 0 };
-        columns[2] = SchemaColumn { type_code: type_code::F64, size: 8, nullable: 0, _pad: 0 };
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::I64, 1);
+        columns[2] = SchemaColumn::new(type_code::F64, 0);
         SchemaDescriptor { num_columns: 3, pk_index: 0, columns }
     }
 
@@ -232,9 +232,9 @@ mod tests {
     /// Test signed integer comparison: negative < positive via sign extension.
     #[test]
     fn test_compare_rows_signed_int() {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        columns[1] = SchemaColumn { type_code: type_code::I64, size: 8, nullable: 0, _pad: 0 };
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::I64, 0);
         let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
 
         let mut col0 = Vec::new();
@@ -248,9 +248,9 @@ mod tests {
     /// Test U128 column comparison.
     #[test]
     fn test_compare_rows_u128() {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        columns[1] = SchemaColumn { type_code: type_code::U128, size: 16, nullable: 0, _pad: 0 };
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::U128, 0);
         let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
 
         let mut col0 = Vec::new();
@@ -265,12 +265,30 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
     }
 
+    /// Test that NaN values produce a stable total order (not all-Equal, which
+    /// would violate transitivity and cause sort algorithms to misbehave).
+    #[test]
+    fn test_compare_rows_nan() {
+        let schema = make_schema_nullable_float();
+        // Row 0: col0=0, col1=NaN
+        // Row 1: col0=0, col1=1.0
+        let batch = batch_from_rows(&[
+            (0, 0, f64::NAN),
+            (0, 0, 1.0),
+        ]);
+        // total_cmp: positive NaN is ordered above all finite values
+        assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Greater);
+        assert_eq!(compare_rows(&schema, &batch, 1, &batch, 0), Ordering::Less);
+        // NaN vs NaN → Equal (IEEE 754 total order)
+        assert_eq!(compare_rows(&schema, &batch, 0, &batch, 0), Ordering::Equal);
+    }
+
     /// Test STRING column comparison via compare_rows (short strings).
     #[test]
     fn test_compare_rows_string() {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        columns[0] = SchemaColumn { type_code: type_code::U64, size: 8, nullable: 0, _pad: 0 };
-        columns[1] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::STRING, 0);
         let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
 
         let mut col0 = Vec::new();

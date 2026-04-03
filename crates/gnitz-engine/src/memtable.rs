@@ -348,9 +348,10 @@ impl OwnedBatch {
                         dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
                     } else {
                         // Inline string data (from RowBuilder with Python strings)
-                        // The blob_src contains the raw string bytes
+                        let actual_len = length.min(blob_src.len());
+                        dest[0..4].copy_from_slice(&(actual_len as u32).to_le_bytes());
                         let new_off = self.blob.len();
-                        self.blob.extend_from_slice(&blob_src[..length.min(blob_src.len())]);
+                        self.blob.extend_from_slice(&blob_src[..actual_len]);
                         dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
                     }
                 }
@@ -957,6 +958,46 @@ impl MemTable {
         total_w
     }
 
+    /// Find the first memtable row whose (PK, payload) has positive net weight
+    /// across all runs.  Sets `found_run`/`found_row`/`has_found` on success.
+    /// Returns true if such a row was found, false otherwise.
+    ///
+    /// Used by `Table::retract_pk` to locate the live row for an UPDATE+DELETE
+    /// sequence where the old payload has been cancelled but the new payload
+    /// is still positive.
+    pub fn find_positive_payload_row(&mut self, key_lo: u64, key_hi: u64) -> bool {
+        // Pass 1: collect all PK-matching (run_idx, row_idx) pairs.
+        // The iterator borrow on self.runs is fully dropped before pass 2,
+        // avoiding any aliasing issue when find_weight_for_row also borrows self.runs.
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        for (ri, run) in self.runs.iter().enumerate() {
+            let mut lo = run.find_lower_bound(key_lo, key_hi);
+            while lo < run.count
+                && run.get_pk_lo(lo) == key_lo
+                && run.get_pk_hi(lo) == key_hi
+            {
+                candidates.push((ri, lo));
+                lo += 1;
+            }
+        }
+
+        // Pass 2: for each candidate, compute net (PK, payload) weight.
+        // The first candidate with positive net weight is the live row.
+        for &(ri, row_idx) in &candidates {
+            let mb = self.runs[ri].as_mem_batch();
+            let net_w = self.find_weight_for_row(key_lo, key_hi, &mb, row_idx);
+            if net_w > 0 {
+                self.found_run = ri;
+                self.found_row = row_idx;
+                self.has_found = true;
+                return true;
+            }
+        }
+
+        self.has_found = false;
+        false
+    }
+
     /// Consolidate all runs and write to a shard file.
     ///
     /// Returns 0 on success, -1 if empty (no file written), or a negative
@@ -1015,29 +1056,14 @@ impl MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor};
+    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
-        let mut columns = [SchemaColumn {
-            type_code: 0,
-            size: 0,
-            nullable: 0,
-            _pad: 0,
-        }; 64];
-        // Col 0: PK (U64, size=8)
-        columns[0] = SchemaColumn {
-            type_code: 3, // U64
-            size: 8,
-            nullable: 0,
-            _pad: 0,
-        };
-        // Col 1: payload (I64, size=8)
-        columns[1] = SchemaColumn {
-            type_code: 7, // I64
-            size: 8,
-            nullable: 0,
-            _pad: 0,
-        };
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        // Col 0: PK (U64)
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        // Col 1: payload (I64)
+        columns[1] = SchemaColumn::new(type_code::I64, 0);
         SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
@@ -1354,11 +1380,11 @@ mod tests {
         let mut sd = SchemaDescriptor {
             num_columns: 3,
             pk_index: 0,
-            columns: [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [SchemaColumn::new(0, 0); 64],
         };
-        sd.columns[0] = SchemaColumn { type_code: 12, size: 16, nullable: 0, _pad: 0 }; // U128 PK
-        sd.columns[1] = SchemaColumn { type_code: 9, size: 8, nullable: 0, _pad: 0 };   // I64 group_val
-        sd.columns[2] = SchemaColumn { type_code: 9, size: 8, nullable: 0, _pad: 0 };   // I64 agg_val
+        sd.columns[0] = SchemaColumn::new(type_code::U128, 0); // U128 PK
+        sd.columns[1] = SchemaColumn::new(type_code::I64, 0);  // I64 group_val
+        sd.columns[2] = SchemaColumn::new(type_code::I64, 0);  // I64 agg_val
         sd
     }
 
@@ -1431,12 +1457,10 @@ mod tests {
 
     // ── append_row_simple tests ──────────────────────────────────────────
 
-    use crate::compact::type_code;
-
-    fn make_schema_cols(cols: &[(u8, u8, u8)], pk_index: u32) -> SchemaDescriptor {
-        let mut columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
-        for (i, &(tc, sz, nullable)) in cols.iter().enumerate() {
-            columns[i] = SchemaColumn { type_code: tc, size: sz, nullable, _pad: 0 };
+    fn make_schema_cols(cols: &[(u8, u8)], pk_index: u32) -> SchemaDescriptor {
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        for (i, &(tc, nullable)) in cols.iter().enumerate() {
+            columns[i] = SchemaColumn::new(tc, nullable);
         }
         SchemaDescriptor { num_columns: cols.len() as u32, pk_index, columns }
     }
@@ -1451,8 +1475,8 @@ mod tests {
     fn test_append_row_simple_nullable_string() {
         // Schema: U64(pk=0), STRING(nullable)
         let schema = make_schema_cols(&[
-            (type_code::U64, 8, 0),
-            (type_code::STRING, 16, 1),
+            (type_code::U64, 0),
+            (type_code::STRING, 1),
         ], 0);
         let mut batch = OwnedBatch::with_schema(schema, 4);
 
@@ -1490,9 +1514,9 @@ mod tests {
     fn test_append_row_simple_multi_string() {
         // Schema: U64(pk=0), STRING(name), STRING(desc)
         let schema = make_schema_cols(&[
-            (type_code::U64, 8, 0),
-            (type_code::STRING, 16, 0),
-            (type_code::STRING, 16, 0),
+            (type_code::U64, 0),
+            (type_code::STRING, 0),
+            (type_code::STRING, 0),
         ], 0);
         let mut batch = OwnedBatch::with_schema(schema, 4);
 
@@ -1526,19 +1550,19 @@ mod tests {
         // Payload cols (pi): U8(0), I8(1), U16(2), I16(3), U32(4), I32(5),
         //                     F32(6), U64(7), I64(8), F64(9), STRING(10), U128(11)
         let schema = make_schema_cols(&[
-            (type_code::U64, 8, 0),   // pk
-            (type_code::U8, 1, 0),    // pi 0
-            (type_code::I8, 1, 0),    // pi 1
-            (type_code::U16, 2, 0),   // pi 2
-            (type_code::I16, 2, 0),   // pi 3
-            (type_code::U32, 4, 0),   // pi 4
-            (type_code::I32, 4, 0),   // pi 5
-            (type_code::F32, 4, 0),   // pi 6
-            (type_code::U64, 8, 0),   // pi 7
-            (type_code::I64, 8, 0),   // pi 8
-            (type_code::F64, 8, 0),   // pi 9
-            (type_code::STRING, 16, 0), // pi 10
-            (type_code::U128, 16, 0), // pi 11
+            (type_code::U64, 0),    // pk
+            (type_code::U8, 0),     // pi 0
+            (type_code::I8, 0),     // pi 1
+            (type_code::U16, 0),    // pi 2
+            (type_code::I16, 0),    // pi 3
+            (type_code::U32, 0),    // pi 4
+            (type_code::I32, 0),    // pi 5
+            (type_code::F32, 0),    // pi 6
+            (type_code::U64, 0),    // pi 7
+            (type_code::I64, 0),    // pi 8
+            (type_code::F64, 0),    // pi 9
+            (type_code::STRING, 0), // pi 10
+            (type_code::U128, 0),   // pi 11
         ], 0);
         let mut batch = OwnedBatch::with_schema(schema, 1);
 
@@ -1606,6 +1630,74 @@ mod tests {
         let u128_hi = u64::from_le_bytes(u128_bytes[8..16].try_into().unwrap());
         assert_eq!(u128_lo, 0xDEADBEEF);
         assert_eq!(u128_hi, 0xCAFEBABE);
+    }
+
+    /// Verify that `append_row` writes the correct length into the German String
+    /// header when blob_src is shorter than the declared length field.
+    #[test]
+    fn test_append_row_blob_length_header() {
+        let schema = make_schema_cols(&[
+            (type_code::U64, 0),    // PK
+            (type_code::STRING, 0), // STRING payload
+        ], 0);
+        let mut batch = OwnedBatch::with_schema(schema, 1);
+
+        // Build a German String struct with length=20 but only 5 blob bytes available.
+        // This triggers the inline-blob fallback branch in append_row.
+        let mut gs_struct = [0u8; 16];
+        gs_struct[0..4].copy_from_slice(&20u32.to_le_bytes()); // declared length = 20
+        gs_struct[4..8].copy_from_slice(&0u32.to_le_bytes());  // prefix bytes = 0
+        gs_struct[8..16].copy_from_slice(&0u64.to_le_bytes()); // blob offset = 0
+
+        let blob_src = b"hello"; // only 5 bytes
+
+        let col_ptrs = [gs_struct.as_ptr()];
+        let col_sizes = [16u32];
+        unsafe {
+            batch.append_row(1, 0, 1, 0, &col_ptrs, &col_sizes, blob_src);
+        }
+
+        // The stored German String header must have length=5 (actual bytes written),
+        // not length=20 (declared length that exceeded blob_src).
+        let stored_gs = batch.get_col_ptr(0, 0, 16);
+        let stored_len = u32::from_le_bytes(stored_gs[0..4].try_into().unwrap());
+        assert_eq!(stored_len, 5, "length header should reflect actual bytes written");
+
+        // The blob arena should contain exactly "hello".
+        assert_eq!(&batch.blob, b"hello");
+    }
+
+    /// Verify that `find_positive_payload_row` locates the row with positive
+    /// net weight, skipping rows whose (PK, payload) is cancelled out.
+    #[test]
+    fn test_find_positive_payload_row() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // Run 0: INSERT (PK=10, val=100, weight=+1)
+        let b1 = make_batch(&schema, &[(10, 1, 100)]);
+        // Run 1: UPDATE delta — retract val=100, insert val=200
+        let b2 = make_batch(&schema, &[(10, -1, 100), (10, 1, 200)]);
+        mt.upsert_sorted_batch(b1).unwrap();
+        mt.upsert_sorted_batch(b2).unwrap();
+
+        // Net weights: val=100 → 1-1=0, val=200 → 1 (positive)
+        let found = mt.find_positive_payload_row(10, 0);
+        assert!(found, "should find a live row");
+        assert!(mt.has_found);
+
+        // The found row should have payload = 200
+        let col_ptr = mt.found_col_ptr(0, 8);
+        assert!(!col_ptr.is_null());
+        let val = i64::from_le_bytes(
+            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
+        );
+        assert_eq!(val, 200, "found row should be the live val=200 row, not the retracted val=100");
+
+        // PK with no rows at all → not found
+        let found2 = mt.find_positive_payload_row(99, 0);
+        assert!(!found2);
+        assert!(!mt.has_found);
     }
 
 }

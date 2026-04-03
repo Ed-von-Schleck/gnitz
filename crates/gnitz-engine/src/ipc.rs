@@ -39,6 +39,20 @@ pub const STATUS_ERROR: u32 = 1;
 pub const META_FLAG_NULLABLE: u64 = 1;
 pub const META_FLAG_IS_PK: u64 = 2;
 
+// SAL group header flags (u32) — must match ipc.py
+pub const FLAG_SHUTDOWN: u32            = 4;
+pub const FLAG_DDL_SYNC: u32            = 8;
+pub const FLAG_EXCHANGE: u32            = 16;
+pub const FLAG_PUSH: u32                = 32;
+pub const FLAG_HAS_PK: u32             = 64;
+pub const FLAG_SEEK: u32                = 128;
+pub const FLAG_SEEK_BY_INDEX: u32       = 256;
+pub const FLAG_PRELOADED_EXCHANGE: u32  = 1024;
+pub const FLAG_BACKFILL: u32            = 2048;
+pub const FLAG_TICK: u32                = 4096;
+pub const FLAG_CHECKPOINT: u32          = 8192;
+pub const FLAG_FLUSH: u32               = 16384;
+
 // ---------------------------------------------------------------------------
 // Wire protocol: schema ↔ batch conversion
 // ---------------------------------------------------------------------------
