@@ -654,19 +654,25 @@ impl RegisterFile {
 
     /// Bind cursor handles from RPython into trace registers.
     /// Each non-null handle is borrowed for the duration of the epoch.
-    /// Trace registers that already have a non-null cursor (e.g., from
-    /// `refresh_owned_cursors`) are NOT overwritten.
-    pub fn bind_cursors(&mut self, handles: &[*mut libc::c_void]) {
+    /// Owned trace registers (listed in `owned_trace_reg_ids`, already set by
+    /// `refresh_owned_cursors`) are skipped entirely. External trace registers
+    /// are always written from `handles` — stale pointers from prior epochs are
+    /// never preserved.
+    pub fn bind_cursors(
+        &mut self,
+        handles: &[*mut libc::c_void],
+        owned_trace_reg_ids: &[(u16, usize)],
+    ) {
         for (i, reg) in self.registers.iter_mut().enumerate() {
             if reg.kind == RegisterKind::Trace {
-                if i < handles.len() && !handles[i].is_null() {
+                let is_owned = owned_trace_reg_ids.iter().any(|&(rid, _)| rid as usize == i);
+                if is_owned {
+                    // Cursor was set by refresh_owned_cursors; leave it alone.
+                } else if i < handles.len() && !handles[i].is_null() {
                     reg.cursor_ptr = handles[i] as *mut CursorHandle<'static>;
-                } else if reg.cursor_ptr.is_null() {
-                    // Only null out if not already set (by refresh_owned_cursors)
+                } else {
                     reg.cursor_ptr = std::ptr::null_mut();
                 }
-                // If handles[i] is null but cursor_ptr is already non-null
-                // (from owned cursor), keep the owned cursor.
             } else {
                 reg.cursor_ptr = std::ptr::null_mut();
             }
@@ -711,6 +717,7 @@ pub fn execute_epoch(
     input_reg: u16,
     output_reg: u16,
     cursor_handles: &[*mut libc::c_void],
+    owned_trace_reg_ids: &[(u16, usize)],
 ) -> Result<Option<OwnedBatch>, i32> {
     gnitz_debug!("vm: execute_epoch input_count={} input_reg={} output_reg={} instrs={}",
         input_batch.count, input_reg, output_reg, program.instructions.len());
@@ -719,7 +726,7 @@ pub fn execute_epoch(
     regfile.clear_delta_batches();
 
     // 2. Bind cursors from RPython and input batch
-    regfile.bind_cursors(cursor_handles);
+    regfile.bind_cursors(cursor_handles, owned_trace_reg_ids);
     regfile.registers[input_reg as usize].batch = input_batch;
 
     // Raw pointer to the register array.  All instructions access distinct
@@ -801,10 +808,18 @@ pub fn execute_epoch(
             }
 
             Instr::Map { in_reg, out_reg, func_idx, out_schema_idx, reindex_col } => {
-                let func = unsafe { &*program.funcs[*func_idx as usize] };
+                let func_ptr = program.funcs[*func_idx as usize];
                 let in_schema = reg!(*in_reg).schema;
                 let out_schema = &program.schemas[*out_schema_idx as usize];
-                let result = ops::op_map(&reg!(*in_reg).batch, func, &in_schema, out_schema, *reindex_col);
+                let result = if func_ptr.is_null() {
+                    // Identity MAP: no transformation — copy batch with updated schema.
+                    let mut out = reg!(*in_reg).batch.clone_batch();
+                    out.schema = Some(*out_schema);
+                    out
+                } else {
+                    let func = unsafe { &*func_ptr };
+                    ops::op_map(&reg!(*in_reg).batch, func, &in_schema, out_schema, *reindex_col)
+                };
                 reg_mut!(*out_reg).batch = result;
             }
 
@@ -1186,7 +1201,7 @@ mod tests {
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 3];
         let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 2, &cursors,
+            &vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[],
         ).unwrap().unwrap();
 
         let rows = extract_rows(&result);
@@ -1216,7 +1231,7 @@ mod tests {
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
         let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors,
+            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
         ).unwrap();
 
         assert!(result.is_none());
@@ -1237,7 +1252,7 @@ mod tests {
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
         let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors,
+            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
         ).unwrap();
 
         assert!(result.is_none());
@@ -1267,18 +1282,18 @@ mod tests {
 
         // Tick 0: z⁻¹[0] = 0 → None
         let input0 = make_batch(schema, &[(1, 0, 1, 10)]);
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, input0, 0, 2, &cursors).unwrap();
+        let r0 = execute_epoch(&vm.program, &mut vm.regfile, input0, 0, 2, &cursors, &[]).unwrap();
         assert!(r0.is_none(), "tick 0 must return None (z⁻¹[0] = 0)");
 
         // Tick 1: output = tick 0's input
         let input1 = make_batch(schema, &[(2, 0, 1, 20)]);
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors).unwrap().unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors, &[]).unwrap().unwrap();
         let rows1 = extract_rows(&r1);
         assert_eq!(rows1, vec![(1, 1, 10)]);
 
         // Tick 2: output = tick 1's input
         let input2 = make_batch(schema, &[(3, 0, 1, 30)]);
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors).unwrap().unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors, &[]).unwrap().unwrap();
         let rows2 = extract_rows(&r2);
         assert_eq!(rows2, vec![(2, 1, 20)]);
     }
@@ -1297,7 +1312,7 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 3];
 
         let input = make_batch(schema, &[(1, 0, 1, 99)]);
-        let r = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2, &cursors).unwrap();
+        let r = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[]).unwrap();
         assert!(r.is_none(), "tick 0 must always return None regardless of input");
     }
 
@@ -1316,19 +1331,19 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 3];
 
         // Tick 0: non-empty input → None
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, 1, 10)]), 0, 2, &cursors).unwrap();
+        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, 1, 10)]), 0, 2, &cursors, &[]).unwrap();
         assert!(r0.is_none());
 
         // Tick 1: empty input → tick 0's input replayed
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors).unwrap().unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors, &[]).unwrap().unwrap();
         assert_eq!(extract_rows(&r1), vec![(1, 1, 10)]);
 
         // Tick 2: non-empty input → empty (tick 1's empty was stored)
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(2, 0, 1, 20)]), 0, 2, &cursors).unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(2, 0, 1, 20)]), 0, 2, &cursors, &[]).unwrap();
         assert!(r2.is_none(), "tick 2 output should be empty (tick 1 input was empty)");
 
         // Tick 3: empty input → tick 2's input replayed
-        let r3 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors).unwrap().unwrap();
+        let r3 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors, &[]).unwrap().unwrap();
         assert_eq!(extract_rows(&r3), vec![(2, 1, 20)]);
     }
 
@@ -1346,15 +1361,15 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 3];
 
         // Tick 0: insertion → None
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, 1, 10)]), 0, 2, &cursors).unwrap();
+        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, 1, 10)]), 0, 2, &cursors, &[]).unwrap();
         assert!(r0.is_none());
 
         // Tick 1: retraction → tick 0's insertion replayed
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, -1, 10)]), 0, 2, &cursors).unwrap().unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, -1, 10)]), 0, 2, &cursors, &[]).unwrap().unwrap();
         assert_eq!(extract_rows(&r1), vec![(1, 1, 10)]);
 
         // Tick 2: empty → tick 1's retraction replayed
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors).unwrap().unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors, &[]).unwrap().unwrap();
         assert_eq!(extract_rows(&r2), vec![(1, -1, 10)]);
     }
 
@@ -1382,19 +1397,19 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 5];
 
         // Tick 0: no output yet
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, 1, 10)]), 0, 4, &cursors).unwrap();
+        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1, 0, 1, 10)]), 0, 4, &cursors, &[]).unwrap();
         assert!(r0.is_none());
 
         // Tick 1: still no output (need 2 ticks of delay)
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(2, 0, 1, 20)]), 0, 4, &cursors).unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(2, 0, 1, 20)]), 0, 4, &cursors, &[]).unwrap();
         assert!(r1.is_none());
 
         // Tick 2: tick 0's input arrives
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(3, 0, 1, 30)]), 0, 4, &cursors).unwrap().unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(3, 0, 1, 30)]), 0, 4, &cursors, &[]).unwrap().unwrap();
         assert_eq!(extract_rows(&r2), vec![(1, 1, 10)]);
 
         // Tick 3: empty input → tick 1's input arrives
-        let r3 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 4, &cursors).unwrap().unwrap();
+        let r3 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 4, &cursors, &[]).unwrap().unwrap();
         assert_eq!(extract_rows(&r3), vec![(2, 1, 20)]);
     }
 
@@ -1414,11 +1429,11 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 3];
 
         let input0 = make_batch(schema, &[(1, 0, 1, 10)]);
-        execute_epoch(&vm.program, &mut vm.regfile, input0, 0, 2, &cursors).unwrap();
+        execute_epoch(&vm.program, &mut vm.regfile, input0, 0, 2, &cursors, &[]).unwrap();
         assert_eq!(vm.regfile.registers[1].batch.count, 1, "state_reg must hold tick 0's input");
 
         let input1 = make_batch(schema, &[(2, 0, 1, 20), (3, 0, 1, 30)]);
-        execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors).unwrap();
+        execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors, &[]).unwrap();
         assert_eq!(vm.regfile.registers[1].batch.count, 2, "state_reg must hold tick 1's input");
     }
 
@@ -1441,7 +1456,7 @@ mod tests {
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
         let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors,
+            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
         ).unwrap().unwrap();
 
         assert_eq!(result.count, 2);
@@ -1467,7 +1482,7 @@ mod tests {
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
         let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors,
+            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
         ).unwrap().unwrap();
 
         let rows = extract_rows(&result);
@@ -1493,14 +1508,14 @@ mod tests {
         // Tick 1
         let input1 = make_batch(schema, &[(1, 0, 1, 10)]);
         let r1 = execute_epoch(
-            &vm.program, &mut vm.regfile, input1, 0, 1, &cursors,
+            &vm.program, &mut vm.regfile, input1, 0, 1, &cursors, &[],
         ).unwrap().unwrap();
         assert_eq!(r1.count, 1);
 
         // Tick 2 with different data
         let input2 = make_batch(schema, &[(2, 0, 1, 20), (3, 0, 1, 30)]);
         let r2 = execute_epoch(
-            &vm.program, &mut vm.regfile, input2, 0, 1, &cursors,
+            &vm.program, &mut vm.regfile, input2, 0, 1, &cursors, &[],
         ).unwrap().unwrap();
         // Should have exactly 2 rows from tick 2, not 3 (no bleed from tick 1)
         assert_eq!(r2.count, 2);
@@ -1539,7 +1554,7 @@ mod tests {
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
         let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors,
+            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
         ).unwrap().unwrap();
 
         let rows = extract_rows(&result);
@@ -1583,7 +1598,7 @@ mod tests {
         let cursors1 = vec![std::ptr::null_mut(), ch1, std::ptr::null_mut()];
 
         let r1 = execute_epoch(
-            &vm.program, &mut vm.regfile, input1, 0, 2, &cursors1,
+            &vm.program, &mut vm.regfile, input1, 0, 2, &cursors1, &[],
         ).unwrap().unwrap();
 
         let rows1 = extract_rows(&r1);
@@ -1598,7 +1613,7 @@ mod tests {
         let ch2 = Box::into_raw(Box::new(cursor2)) as *mut libc::c_void;
         let cursors2 = vec![std::ptr::null_mut(), ch2, std::ptr::null_mut()];
         let input2 = make_batch(schema, &[(1, 0, -1, 42)]);
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors2).unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors2, &[]).unwrap();
         assert!(r2.is_none(), "no boundary crossing: output should be empty");
         unsafe { drop(Box::from_raw(ch2 as *mut crate::read_cursor::CursorHandle)); }
 
@@ -1608,7 +1623,7 @@ mod tests {
         let ch3 = Box::into_raw(Box::new(cursor3)) as *mut libc::c_void;
         let cursors3 = vec![std::ptr::null_mut(), ch3, std::ptr::null_mut()];
         let input3 = make_batch(schema, &[(1, 0, -2, 42)]);
-        let r3 = execute_epoch(&vm.program, &mut vm.regfile, input3, 0, 2, &cursors3)
+        let r3 = execute_epoch(&vm.program, &mut vm.regfile, input3, 0, 2, &cursors3, &[])
             .unwrap()
             .unwrap();
         let rows3 = extract_rows(&r3);
@@ -1658,7 +1673,7 @@ mod tests {
 
         let input = make_batch(left_schema, &[(10, 0, 1, 100)]);
         let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors,
+            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
         ).unwrap().unwrap();
 
         assert_eq!(result.count, 1);
@@ -1713,7 +1728,7 @@ mod tests {
 
         let input = make_batch(left_schema, &[(10, 0, 2, 50)]); // weight=2
         let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors,
+            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
         ).unwrap().unwrap();
 
         // Should produce 3 output rows (1 delta × 3 trace)
@@ -1778,7 +1793,7 @@ mod tests {
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
         let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors,
+            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
         ).unwrap().unwrap();
 
         let rows = extract_rows(&result);
@@ -1823,7 +1838,7 @@ mod tests {
             (3, 0, 1, 30),
         ]);
         let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors,
+            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
         ).unwrap().unwrap();
 
         let rows = extract_rows(&result);
@@ -1869,7 +1884,7 @@ mod tests {
             (3, 0, 1, 30),
         ]);
         let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors,
+            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
         ).unwrap().unwrap();
 
         let rows = extract_rows(&result);
@@ -1993,7 +2008,7 @@ mod tests {
         ];
 
         let r1 = execute_epoch(
-            &vm.program, &mut vm.regfile, input1, 0, 2, &cursors1,
+            &vm.program, &mut vm.regfile, input1, 0, 2, &cursors1, &[],
         ).unwrap().unwrap();
 
         // SUM of group=1: 10+20 = 30. Output should be one row with sum=30.
@@ -2042,7 +2057,7 @@ mod tests {
         // Input: a batch with pk=5 (used as seek key)
         let input = make_batch(schema, &[(5, 0, 1, 0)]);
         let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors,
+            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
         ).unwrap().unwrap();
 
         // After seeking to pk=5, scan should find pk=5 and pk=10 (2 rows from pk=5 onwards)
@@ -2079,7 +2094,7 @@ mod tests {
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 4];
         let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 3, &cursors,
+            &vm.program, &mut { vm.regfile }, input, 0, 3, &cursors, &[],
         ).unwrap().unwrap();
 
         assert_eq!(result.count, 1);
@@ -2162,7 +2177,7 @@ mod tests {
             (4, 0, 1, 40), (5, 0, 1, 50),
         ]);
         let r_aj = execute_epoch(
-            &vm_aj.program, &mut vm_aj.regfile, input_aj, 0, 2, &cursors_aj,
+            &vm_aj.program, &mut vm_aj.regfile, input_aj, 0, 2, &cursors_aj, &[],
         ).unwrap().unwrap();
 
         // Semi-join pipeline
@@ -2181,7 +2196,7 @@ mod tests {
             (4, 0, 1, 40), (5, 0, 1, 50),
         ]);
         let r_sj = execute_epoch(
-            &vm_sj.program, &mut vm_sj.regfile, input_sj, 0, 2, &cursors_sj,
+            &vm_sj.program, &mut vm_sj.regfile, input_sj, 0, 2, &cursors_sj, &[],
         ).unwrap().unwrap();
 
         // Anti should get pk=2,4 (no match); semi should get pk=1,3,5 (match)
@@ -2240,7 +2255,7 @@ mod tests {
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
         let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors,
+            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
         ).unwrap().unwrap();
 
         let rows = extract_rows(&result);
@@ -2343,7 +2358,7 @@ mod tests {
         ];
 
         let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors,
+            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
         ).unwrap().unwrap();
 
         // Should produce 1 row: pk=1, count=3, sum=60

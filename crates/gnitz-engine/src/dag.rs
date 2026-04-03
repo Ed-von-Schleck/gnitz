@@ -793,6 +793,7 @@ impl DagEngine {
             in_reg,
             plan.pre_out_reg,
             &cursor_ptrs,
+            &plan.pre_vm.owned_trace_regs,
         ) {
             Ok(Some(batch)) if batch.count > 0 => Some(batch),
             Ok(_) => None,
@@ -1243,6 +1244,7 @@ impl DagEngine {
             actual_in_reg,
             out_reg,
             &cursor_ptrs,
+            &vm.owned_trace_regs,
         ) {
             Ok(Some(batch)) if batch.count > 0 => Some(batch),
             Ok(_) => None,
