@@ -2375,4 +2375,102 @@ mod tests {
         trace_out_table.close();
         trace_in_table.close();
     }
+
+    // ── Fix regression: identity MAP (null func_ptr) ─────────────────────
+
+    #[test]
+    fn test_map_identity_null_func_ptr() {
+        // When the compiler emits a pass-through MAP (null func_ptr), the VM
+        // must clone the batch without dereferencing the null pointer.
+        let schema = schema_1i64();
+
+        let mut builder = ProgramBuilder::new(2);
+        builder.add_map(0, 1, std::ptr::null(), schema, -1);
+        builder.add_halt();
+
+        let input = make_batch(schema, &[(1, 0, 1, 10), (2, 0, 1, 20)]);
+
+        let reg_schemas = [schema; 2];
+        let reg_kinds = [0u8; 2];
+        let vm = builder.build(&reg_schemas, &reg_kinds);
+        let cursors = vec![std::ptr::null_mut(); 2];
+        let result = execute_epoch(
+            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
+        )
+        .unwrap()
+        .unwrap();
+
+        let rows = extract_rows(&result);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (1, 1, 10));
+        assert_eq!(rows[1], (2, 1, 20));
+    }
+
+    // ── Fix regression: stale external cursor in bind_cursors ─────────────
+
+    #[test]
+    fn test_bind_cursors_clears_stale_external_cursor() {
+        // An external trace register that supplies a cursor in epoch N must NOT
+        // retain a dangling pointer in epoch N+1 if the caller passes null.
+        // bind_cursors must unconditionally null out external trace registers
+        // when no handle is provided.
+        let schema = schema_1i64();
+
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("stale_cursor_test");
+        let mut table = Table::new(
+            tdir.to_str().unwrap(), "ext", schema, 0, 1 << 20, false,
+        )
+        .unwrap();
+
+        // reg 0 = input delta (kind 0), reg 1 = external trace (kind 1), reg 2 = output delta
+        let mut builder = ProgramBuilder::new(3);
+        builder.add_distinct(0, 1, 2, std::ptr::null_mut()); // hist_table_idx = -1 (no ingest)
+        builder.add_halt();
+
+        let reg_schemas = [schema; 3];
+        let reg_kinds = [0u8, 1u8, 0u8];
+        let mut vm = *builder.build(&reg_schemas, &reg_kinds);
+
+        // Epoch 1: supply a real cursor for reg 1.
+        let cursor1 = table.create_cursor().unwrap();
+        let ch1 = Box::into_raw(Box::new(cursor1)) as *mut libc::c_void;
+        let cursors1 = vec![std::ptr::null_mut(), ch1, std::ptr::null_mut()];
+        execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[]),
+            0,
+            2,
+            &cursors1,
+            &[],
+        )
+        .unwrap();
+        unsafe { drop(Box::from_raw(ch1 as *mut crate::read_cursor::CursorHandle)) };
+        // ch1 is now freed; reg 1's cursor_ptr would be dangling if not cleared.
+
+        // Epoch 2: pass null for the external trace register.
+        // bind_cursors must write null, not preserve the freed pointer.
+        let cursors2 = vec![std::ptr::null_mut(); 3];
+        execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[]),
+            0,
+            2,
+            &cursors2,
+            &[],
+        )
+        .unwrap();
+
+        // If the stale pointer were preserved, reading reg 1's cursor_ptr inside
+        // execute_epoch would be UB / crash. Reaching here means it was correctly
+        // cleared to null.
+        assert!(
+            vm.regfile.registers[1].cursor_ptr.is_null(),
+            "external trace register must be null after epoch with null handle"
+        );
+
+        table.close();
+    }
 }
