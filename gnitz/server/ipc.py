@@ -5,9 +5,7 @@ from rpython.rlib import jit
 from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rtyper.lltypesystem import rffi, lltype
 from gnitz.storage import mmap_posix
-from gnitz.storage import buffer as buffer_ops
 from gnitz.storage import engine_ffi
-from gnitz.server import ipc_ffi
 from gnitz.core import errors, types
 from gnitz.storage import owned_batch
 from gnitz.catalog import system_tables
@@ -25,17 +23,11 @@ STATUS_ERROR = 1
 #   Client sends: target_id=0, flags=FLAG_ALLOCATE_*_ID, no batch
 #   Server responds: target_id=allocated_id, STATUS_OK, no schema/data
 #   Server atomically: allocates in-memory + advances SeqTab
-FLAG_ALLOCATE_TABLE_ID = 1   # Allocate a table/view ID atomically
-FLAG_ALLOCATE_SCHEMA_ID = 2  # Allocate a schema ID atomically
-FLAG_ALLOCATE_ID = FLAG_ALLOCATE_TABLE_ID  # backward compat
 FLAG_SHUTDOWN = 4
 FLAG_DDL_SYNC = 8
 FLAG_EXCHANGE = 16
 FLAG_PUSH = 32
 FLAG_HAS_PK = 64
-FLAG_SEEK = 128
-FLAG_SEEK_BY_INDEX     = 256   # p4=col_idx, p5/p6=index_key; target_id=table_id
-FLAG_ALLOCATE_INDEX_ID = 512   # target_id=0; response carries new index_id in target_id
 FLAG_PRELOADED_EXCHANGE = 1024 # master pre-sends repartitioned batch before FLAG_PUSH
 FLAG_BACKFILL          = 2048  # master asks worker to scan source and backfill a view
 FLAG_TICK              = 4096  # master asks workers to run evaluate_dag on accumulated pending_deltas
@@ -182,20 +174,10 @@ class SALMessage(object):
 # ---------------------------------------------------------------------------
 
 
-def _write_u64_raw(ptr, byte_offset, val):
-    p = rffi.cast(rffi.ULONGLONGP, rffi.ptradd(ptr, byte_offset))
-    p[0] = rffi.cast(rffi.ULONGLONG, val)
-
-
 def read_u64_raw(ptr, byte_offset):
     """Read u64 from shared memory via atomic acquire load."""
     return rffi.cast(rffi.ULONGLONG,
                      atomic_load_u64(rffi.ptradd(ptr, byte_offset)))
-
-
-def _write_u32_raw(ptr, byte_offset, val):
-    p = rffi.cast(rffi.UINTP, rffi.ptradd(ptr, byte_offset))
-    p[0] = rffi.cast(rffi.UINT, val)
 
 
 def _read_u32_raw(ptr, byte_offset):
@@ -203,207 +185,8 @@ def _read_u32_raw(ptr, byte_offset):
     return rffi.cast(rffi.UINT, p[0])
 
 
-def _decode_u32_le(buf):
-    """Decode a little-endian u32 from a 4-byte char buffer."""
-    return (
-        (ord(buf[0]) & 0xFF)
-        | ((ord(buf[1]) & 0xFF) << 8)
-        | ((ord(buf[2]) & 0xFF) << 16)
-        | ((ord(buf[3]) & 0xFF) << 24)
-    )
-
-
-def _make_payload_from_raw(raw, raw_len):
-    """Parse raw wire bytes into an IPCPayload that owns the buffer."""
-    try:
-        inner = _parse_from_ptr(raw, raw_len)
-    except Exception as e:
-        lltype.free(raw, flavor='raw')
-        raise e
-    payload = IPCPayload()
-    payload.raw_buf      = raw
-    payload.raw_buf_size = raw_len
-    payload.batch        = inner.batch
-    payload.schema       = inner.schema
-    payload.target_id    = inner.target_id
-    payload.client_id    = inner.client_id
-    payload.flags        = inner.flags
-    payload.seek_col_idx = inner.seek_col_idx
-    payload.seek_pk_lo   = inner.seek_pk_lo
-    payload.seek_pk_hi   = inner.seek_pk_hi
-    payload.status       = inner.status
-    payload.error_msg    = inner.error_msg
-    return payload
-
-
 def _align8(n):
     return (n + 7) & ~7
-
-
-# ---------------------------------------------------------------------------
-# Serialize
-# ---------------------------------------------------------------------------
-
-
-def _encode_wire(target_id, client_id, zbatch, schema, flags,
-                 seek_pk_lo, seek_pk_hi, seek_col_idx,
-                 status, error_msg):
-    """Encode an IPC message via Rust (gnitz_ipc_encode_wire).
-
-    Returns a Buffer that the caller must free. Does NOT create a memfd.
-    Used by both the memfd transport (external clients) and the SAL
-    transport (internal master/worker).
-    """
-    # Prepare schema descriptor if needed
-    eff_schema = schema
-    if eff_schema is None and zbatch is not None:
-        eff_schema = zbatch._schema
-
-    schema_buf = lltype.nullptr(rffi.CCHARP.TO)
-    c_name_ptrs = lltype.nullptr(rffi.CCHARPP.TO)
-    c_name_lens = lltype.nullptr(rffi.UINTP.TO)
-    num_names = 0
-
-    try:
-        if eff_schema is not None:
-            schema_buf = engine_ffi.pack_schema(eff_schema)
-            # Pack column names
-            num_names = len(eff_schema.columns)
-            c_name_ptrs = lltype.malloc(rffi.CCHARPP.TO, num_names, flavor='raw')
-            c_name_lens = lltype.malloc(rffi.UINTP.TO, num_names, flavor='raw')
-            for ci in range(num_names):
-                name = eff_schema.columns[ci].name
-                nlen = len(name)
-                if nlen > 0:
-                    name_raw = lltype.malloc(rffi.CCHARP.TO, nlen, flavor='raw')
-                    for j in range(nlen):
-                        name_raw[j] = name[j]
-                    c_name_ptrs[ci] = name_raw
-                else:
-                    c_name_ptrs[ci] = lltype.nullptr(rffi.CCHARP.TO)
-                c_name_lens[ci] = rffi.cast(rffi.UINT, nlen)
-
-        # Prepare error message
-        error_buf = lltype.nullptr(rffi.CCHARP.TO)
-        error_len = len(error_msg)
-        if error_len > 0:
-            error_buf = lltype.malloc(rffi.CCHARP.TO, error_len, flavor='raw')
-            for j in range(error_len):
-                error_buf[j] = error_msg[j]
-
-        # Batch handle
-        batch_handle = rffi.cast(rffi.VOIDP, 0)
-        if zbatch is not None and zbatch.length() > 0:
-            batch_handle = zbatch._handle
-
-        # Output pointers
-        out_ptr = lltype.malloc(rffi.CCHARPP.TO, 1, flavor='raw')
-        out_len = lltype.malloc(rffi.UINTP.TO, 1, flavor='raw')
-
-        try:
-            rc = engine_ffi._ipc_encode_wire(
-                rffi.cast(rffi.ULONGLONG, r_uint64(target_id)),
-                rffi.cast(rffi.ULONGLONG, r_uint64(client_id)),
-                rffi.cast(rffi.ULONGLONG, r_uint64(flags)),
-                rffi.cast(rffi.ULONGLONG, r_uint64(seek_pk_lo)),
-                rffi.cast(rffi.ULONGLONG, r_uint64(seek_pk_hi)),
-                rffi.cast(rffi.ULONGLONG, r_uint64(seek_col_idx)),
-                rffi.cast(rffi.UINT, status),
-                error_buf, rffi.cast(rffi.UINT, error_len),
-                rffi.cast(rffi.VOIDP, schema_buf),
-                c_name_ptrs, c_name_lens,
-                rffi.cast(rffi.UINT, num_names),
-                batch_handle,
-                out_ptr, out_len)
-
-            if rffi.cast(lltype.Signed, rc) < 0:
-                raise errors.StorageError("IPC encode_wire failed")
-
-            wire_ptr = out_ptr[0]
-            wire_size = intmask(rffi.cast(lltype.Signed, out_len[0]))
-        finally:
-            lltype.free(out_ptr, flavor='raw')
-            lltype.free(out_len, flavor='raw')
-
-        if error_len > 0:
-            lltype.free(error_buf, flavor='raw')
-
-        # Wrap in a Buffer for callers. Copy the Rust-allocated bytes into a
-        # Buffer and free the Rust allocation.
-        result = buffer_ops.Buffer(wire_size)
-        if wire_size > 0:
-            buffer_ops.c_memmove(
-                rffi.cast(rffi.VOIDP, result.base_ptr),
-                rffi.cast(rffi.VOIDP, wire_ptr),
-                rffi.cast(rffi.SIZE_T, wire_size),
-            )
-            result.offset = wire_size
-        engine_ffi._ipc_wire_free(wire_ptr, rffi.cast(rffi.UINT, wire_size))
-        return result
-    finally:
-        if schema_buf:
-            # Free name buffers
-            for ci in range(num_names):
-                if c_name_ptrs[ci]:
-                    lltype.free(c_name_ptrs[ci], flavor='raw')
-            if c_name_ptrs:
-                lltype.free(c_name_ptrs, flavor='raw')
-            if c_name_lens:
-                lltype.free(c_name_lens, flavor='raw')
-            lltype.free(schema_buf, flavor='raw')
-
-
-@jit.dont_look_inside
-def send_framed(sock_fd, target_id, zbatch, status=0, error_msg="",
-                client_id=0, schema=None, flags=0,
-                seek_pk_lo=0, seek_pk_hi=0, seek_col_idx=0):
-    """Send a length-prefixed IPC message over SOCK_STREAM."""
-    eff_schema = schema
-    if eff_schema is None and zbatch is not None:
-        eff_schema = zbatch._schema
-    wire_buf = _encode_wire(target_id, client_id, zbatch,
-                            eff_schema, flags, seek_pk_lo, seek_pk_hi,
-                            seek_col_idx, status, error_msg)
-    try:
-        if ipc_ffi.send_framed(sock_fd, wire_buf.base_ptr, wire_buf.offset) < 0:
-            raise errors.StorageError("Failed to send framed IPC message (Disconnected)")
-    finally:
-        wire_buf.free()
-
-
-def send_framed_error(sock_fd, error_msg, target_id=0, client_id=0):
-    """Convenience helper to send an error response over SOCK_STREAM."""
-    send_framed(
-        sock_fd, target_id, None,
-        status=STATUS_ERROR, error_msg=error_msg, client_id=client_id,
-    )
-
-
-@jit.dont_look_inside
-def recv_framed(sock_fd):
-    """Blocking receive of a length-prefixed IPC message.
-    Returns an IPCPayload owning the raw buffer."""
-    hdr_buf = lltype.malloc(rffi.CCHARP.TO, 4, flavor='raw')
-    try:
-        if ipc_ffi.recv_exact(sock_fd, hdr_buf, 4) < 0:
-            raise errors.ClientDisconnectedError("recv_framed: header read failed")
-        payload_len = _decode_u32_le(hdr_buf)
-    finally:
-        lltype.free(hdr_buf, flavor='raw')
-
-    if payload_len == 0:
-        raise errors.ClientDisconnectedError("recv_framed: zero-length (close sentinel)")
-
-    raw = lltype.malloc(rffi.CCHARP.TO, payload_len, flavor='raw')
-    if ipc_ffi.recv_exact(sock_fd, raw, payload_len) < 0:
-        lltype.free(raw, flavor='raw')
-        raise errors.ClientDisconnectedError("recv_framed: payload read failed")
-    return _make_payload_from_raw(raw, payload_len)
-
-
-# ---------------------------------------------------------------------------
-# Receive
-# ---------------------------------------------------------------------------
 
 
 def _parse_from_ptr(ptr, total_size):
@@ -526,65 +309,6 @@ def _parse_from_ptr(ptr, total_size):
     return payload
 
 
-# ---------------------------------------------------------------------------
-# SAL Transport (master→workers via file-backed mmap)
-# ---------------------------------------------------------------------------
-
-
-@jit.dont_look_inside
-def write_message_group(sal, target_id, lsn, flags, worker_bufs, num_workers):
-    """Append a message group for all N workers into the SAL.
-
-    worker_bufs is a list of Buffer-or-None (one per worker). Each buffer
-    contains an _encode_wire result. The caller must free worker_bufs after
-    this returns. Does NOT fdatasync or signal — caller does that.
-
-    """
-    payload_size = GROUP_HEADER_SIZE
-    for w in range(num_workers):
-        wb = worker_bufs[w]
-        if wb is not None and wb.offset > 0:
-            payload_size += _align8(wb.offset)
-
-    total = 8 + _align8(payload_size)
-    if sal.write_cursor + total > sal.mmap_size:
-        raise errors.StorageError("SAL full — checkpoint required")
-
-    base = sal.write_cursor
-    hdr_off = base + 8
-    _write_u64_raw(sal.ptr, hdr_off + 0, r_uint64(payload_size))
-    _write_u64_raw(sal.ptr, hdr_off + 8, r_uint64(lsn))
-    _write_u32_raw(sal.ptr, hdr_off + 16, num_workers)
-    _write_u32_raw(sal.ptr, hdr_off + 20, flags)
-    _write_u32_raw(sal.ptr, hdr_off + 24, target_id)
-    _write_u32_raw(sal.ptr, hdr_off + 28, sal.epoch)
-
-    data_offset = GROUP_HEADER_SIZE
-    for w in range(num_workers):
-        wb = worker_bufs[w]
-        if wb is not None and wb.offset > 0:
-            wsz = wb.offset
-            _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, data_offset)
-            _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz)
-            buffer_ops.c_memmove(
-                rffi.cast(rffi.VOIDP, rffi.ptradd(sal.ptr, hdr_off + data_offset)),
-                rffi.cast(rffi.VOIDP, wb.base_ptr),
-                rffi.cast(rffi.SIZE_T, wsz),
-            )
-            data_offset += _align8(wsz)
-        else:
-            _write_u32_raw(sal.ptr, hdr_off + 32 + w * 4, 0)
-            _write_u32_raw(sal.ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0)
-
-    # Size prefix written LAST via atomic release store — workers use this
-    # as the "data ready" sentinel.
-    atomic_store_u64(
-        rffi.ptradd(sal.ptr, base),
-        rffi.cast(rffi.ULONGLONG, payload_size))
-
-    sal.write_cursor += total
-
-
 @jit.dont_look_inside
 def read_worker_message(sal_ptr, read_cursor, worker_id):
     """Read this worker's data from the next message group in the SAL.
@@ -617,53 +341,3 @@ def read_worker_message(sal_ptr, read_cursor, worker_id):
     return msg
 
 
-# ---------------------------------------------------------------------------
-# W2M Transport (worker→master via memfd-backed shared region)
-# ---------------------------------------------------------------------------
-
-
-@jit.dont_look_inside
-def write_to_w2m(region, target_id, zbatch, schema, flags,
-                 seek_pk_lo, seek_pk_hi, seek_col_idx, status, error_msg):
-    """Worker writes a response into its W2M region.
-
-    Delegates mmap write to Rust (gnitz_w2m_write).
-    """
-    wire_buf = _encode_wire(target_id, 0, zbatch, schema, flags,
-                            seek_pk_lo, seek_pk_hi, seek_col_idx,
-                            status, error_msg)
-    try:
-        size = wire_buf.offset
-        new_wc = engine_ffi._w2m_write(
-            region.ptr, wire_buf.base_ptr,
-            rffi.cast(rffi.UINT, size),
-            rffi.cast(rffi.ULONGLONG, region.size))
-        if rffi.cast(lltype.Signed, new_wc) < 0:
-            raise errors.StorageError("W2M region full")
-    finally:
-        wire_buf.free()
-
-
-@jit.dont_look_inside
-def read_from_w2m(region, read_cursor):
-    """Master reads the next response from a worker's W2M region.
-
-    Returns (IPCPayload, new_read_cursor). The payload is non-owning.
-    Delegates mmap read to Rust (gnitz_w2m_read).
-    """
-    out_ptr = lltype.malloc(rffi.CCHARPP.TO, 1, flavor='raw')
-    out_size = lltype.malloc(rffi.UINTP.TO, 1, flavor='raw')
-    try:
-        new_rc = engine_ffi._w2m_read(
-            region.ptr,
-            rffi.cast(rffi.ULONGLONG, read_cursor),
-            out_ptr, out_size)
-        data_size = intmask(rffi.cast(lltype.Signed, out_size[0]))
-        if data_size == 0:
-            raise errors.StorageError("W2M: unexpected zero-size message")
-        data_ptr = out_ptr[0]
-    finally:
-        lltype.free(out_ptr, flavor='raw')
-        lltype.free(out_size, flavor='raw')
-    payload = _parse_from_ptr(data_ptr, data_size)
-    return payload, intmask(new_rc)

@@ -4,7 +4,6 @@ pub mod send;
 pub mod conn;
 pub mod transport;
 pub mod uring;
-pub mod ffi;
 
 #[cfg(test)]
 pub mod mock;

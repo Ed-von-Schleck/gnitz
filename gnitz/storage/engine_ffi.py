@@ -97,37 +97,8 @@ eci = ExternalCompilationInfo(
         # Note: use char*/char** instead of uint8_t* for RPython CCHARP compatibility
         "uint64_t gnitz_atomic_load_u64(const char *ptr);",
         "void gnitz_atomic_store_u64(char *ptr, uint64_t val);",
-        # SAL write: returns struct {int32_t status; uint64_t new_cursor;}
-        # We call it and read the two fields via a raw buffer.
-        "int32_t gnitz_sal_write_group("
-        "  char *sal_ptr, uint64_t write_cursor,"
-        "  uint32_t num_workers, uint32_t target_id,"
-        "  uint64_t lsn, uint32_t flags, uint32_t epoch,"
-        "  uint64_t mmap_size,"
-        "  char **worker_ptrs, const uint32_t *worker_sizes);",
-        # SAL read: we use the FFI struct via raw pointer access
-        "int32_t gnitz_sal_read_group_header("
-        "  const char *sal_ptr, uint64_t read_cursor, uint32_t worker_id);",
-        # W2M
-        "int64_t gnitz_w2m_write("
-        "  char *region_ptr, const char *data_ptr,"
-        "  uint32_t data_size, uint64_t region_size);",
-        "uint64_t gnitz_w2m_read("
-        "  const char *region_ptr, uint64_t read_cursor,"
-        "  char **out_data_ptr, uint32_t *out_data_size);",
         # IPC wire protocol (ipc.rs)
         # Note: use char* instead of uint8_t* for RPython CCHARP compatibility
-        "int32_t gnitz_ipc_encode_wire("
-        "  uint64_t target_id, uint64_t client_id, uint64_t flags,"
-        "  uint64_t seek_pk_lo, uint64_t seek_pk_hi, uint64_t seek_col_idx,"
-        "  uint32_t status,"
-        "  const char *error_msg_ptr, uint32_t error_msg_len,"
-        "  const void *schema_desc,"
-        "  char **col_names_ptr, const uint32_t *col_names_len,"
-        "  uint32_t num_col_names,"
-        "  const void *batch_handle,"
-        "  char **out_ptr, uint32_t *out_len);",
-        "void gnitz_ipc_wire_free(char *ptr, uint32_t len);",
         "void *gnitz_ipc_decode_wire("
         "  const char *data_ptr, uint32_t data_size,"
         "  uint32_t *out_status, uint64_t *out_client_id,"
@@ -173,31 +144,15 @@ eci = ExternalCompilationInfo(
         "int64_t gnitz_catalog_allocate_schema_id(void *handle);",
         "int64_t gnitz_catalog_allocate_table_id(void *handle);",
         "int64_t gnitz_catalog_allocate_index_id(void *handle);",
-        "int32_t gnitz_catalog_advance_sequence("
-        "  void *handle, int64_t seq_id, int64_t old_val, int64_t new_val);",
         # CatalogEngine queries
         "int32_t gnitz_catalog_has_id(const void *handle, int64_t table_id);",
         "int32_t gnitz_catalog_get_schema_desc("
         "  const void *handle, int64_t table_id, void *out_schema);",
         "int32_t gnitz_catalog_get_depth(const void *handle, int64_t table_id);",
         "int32_t gnitz_catalog_is_unique_pk(const void *handle, int64_t table_id);",
-        # CatalogEngine ingestion/scan/seek/flush
-        "int32_t gnitz_catalog_ingest(void *handle, int64_t table_id, void *batch);",
+        # CatalogEngine ingestion (ingest_effective only — rest are Rust-internal)
         "void *gnitz_catalog_ingest_effective("
         "  void *handle, int64_t table_id, void *batch);",
-        "int32_t gnitz_catalog_push_and_evaluate("
-        "  void *handle, int64_t table_id, void *batch);",
-        "void *gnitz_catalog_scan(void *handle, int64_t table_id);",
-        "void *gnitz_catalog_seek("
-        "  void *handle, int64_t table_id, uint64_t pk_lo, uint64_t pk_hi);",
-        "void *gnitz_catalog_seek_by_index("
-        "  void *handle, int64_t table_id, uint32_t col_idx,"
-        "  uint64_t key_lo, uint64_t key_hi);",
-        "int32_t gnitz_catalog_flush(void *handle, int64_t table_id);",
-        "int32_t gnitz_catalog_validate_unique_indices("
-        "  void *handle, int64_t table_id, const void *batch);",
-        "int32_t gnitz_catalog_validate_fk_inline("
-        "  void *handle, int64_t table_id, const void *batch);",
         # CatalogEngine worker support
         "int32_t gnitz_catalog_ddl_sync(void *handle, int64_t table_id, void *batch);",
         "int32_t gnitz_catalog_raw_store_ingest(void *handle, int64_t table_id, void *batch);",
@@ -227,8 +182,7 @@ eci = ExternalCompilationInfo(
         # DagEngine (lifecycle/registry removed — use CatalogEngine)
         # DagEngine cache
         "void gnitz_dag_invalidate(void *handle, int64_t view_id);",
-        # DagEngine evaluate + execute
-        "int32_t gnitz_dag_evaluate(void *handle, int64_t source_id, void *delta);",
+        # DagEngine execute
         "void *gnitz_dag_execute_epoch("
         "  void *handle, int64_t view_id, void *input, int64_t source_id);",
         "int32_t gnitz_dag_ingest(void *handle, int64_t table_id, void *batch);",
@@ -271,27 +225,10 @@ eci = ExternalCompilationInfo(
         "  char *sal_ptr, int32_t sal_fd, uint64_t sal_mmap_size,"
         "  char **w2m_region_ptrs, const uint64_t *w2m_region_sizes,"
         "  const int32_t *m2w_efds, const int32_t *w2m_efds);",
-        "void gnitz_master_destroy(void *handle);",
         "void gnitz_master_reset_sal(void *handle, uint64_t write_cursor, uint32_t epoch);",
         "const char *gnitz_master_last_error(const void *handle, uint32_t *out_len);",
         "int32_t gnitz_master_collect_acks(void *handle);",
-        "int32_t gnitz_master_fan_out_ingest(void *handle, int64_t target_id, const void *batch);",
-        "int32_t gnitz_master_fan_out_tick(void *handle, int64_t target_id);",
-        "int32_t gnitz_master_fan_out_push(void *handle, int64_t target_id, const void *batch);",
-        "void *gnitz_master_fan_out_scan(void *handle, int64_t target_id);",
-        "void *gnitz_master_fan_out_seek(void *handle, int64_t target_id, uint64_t pk_lo, uint64_t pk_hi);",
-        "void *gnitz_master_fan_out_seek_by_index("
-        "  void *handle, int64_t target_id, uint32_t col_idx, uint64_t key_lo, uint64_t key_hi);",
         "int32_t gnitz_master_fan_out_backfill(void *handle, int64_t view_id, int64_t source_id);",
-        "int32_t gnitz_master_broadcast_ddl(void *handle, int64_t target_id, const void *batch);",
-        "int32_t gnitz_master_check_pk_exists_broadcast("
-        "  void *handle, int64_t owner_table_id, uint32_t source_col_idx, const void *batch);",
-        "int32_t gnitz_master_start_tick_async(void *handle, int64_t target_id);",
-        "int32_t gnitz_master_poll_tick_progress(void *handle);",
-        "int32_t gnitz_master_check_workers(const void *handle);",
-        "void gnitz_master_shutdown_workers(void *handle);",
-        "int32_t gnitz_master_validate_unique_distributed("
-        "  void *handle, int64_t target_id, const void *batch);",
         # ServerExecutor
         "int32_t gnitz_executor_run("
         "  void *catalog_handle, void *dispatcher_handle, int32_t server_fd);",
@@ -700,45 +637,9 @@ _atomic_store_u64 = rffi.llexternal(
     _nowrapper=True,
 )
 
-_w2m_write = rffi.llexternal(
-    "gnitz_w2m_write",
-    [rffi.CCHARP, rffi.CCHARP, rffi.UINT, rffi.ULONGLONG],
-    rffi.LONGLONG,
-    compilation_info=eci,
-)
-
-_w2m_read = rffi.llexternal(
-    "gnitz_w2m_read",
-    [rffi.CCHARP, rffi.ULONGLONG, rffi.CCHARPP, rffi.UINTP],
-    rffi.ULONGLONG,
-    compilation_info=eci,
-)
-
 # ---------------------------------------------------------------------------
 # IPC wire protocol (ipc.rs)
 # ---------------------------------------------------------------------------
-
-_ipc_encode_wire = rffi.llexternal(
-    "gnitz_ipc_encode_wire",
-    [rffi.ULONGLONG, rffi.ULONGLONG, rffi.ULONGLONG,   # target, client, flags
-     rffi.ULONGLONG, rffi.ULONGLONG, rffi.ULONGLONG,   # seek_pk_lo/hi, seek_col
-     rffi.UINT,                                         # status
-     rffi.CCHARP, rffi.UINT,                            # error_msg ptr/len
-     rffi.VOIDP,                                        # schema_desc
-     rffi.CCHARPP, rffi.UINTP,                          # col_names ptr/len arrays
-     rffi.UINT,                                         # num_col_names
-     rffi.VOIDP,                                        # batch handle
-     rffi.CCHARPP, rffi.UINTP],                         # out_ptr, out_len
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_ipc_wire_free = rffi.llexternal(
-    "gnitz_ipc_wire_free",
-    [rffi.CCHARP, rffi.UINT],
-    lltype.Void,
-    compilation_info=eci,
-)
 
 _ipc_decode_wire = rffi.llexternal(
     "gnitz_ipc_decode_wire",
@@ -882,13 +783,6 @@ _catalog_allocate_index_id = rffi.llexternal(
     compilation_info=eci,
 )
 
-_catalog_advance_sequence = rffi.llexternal(
-    "gnitz_catalog_advance_sequence",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.LONGLONG, rffi.LONGLONG],
-    rffi.INT,
-    compilation_info=eci,
-)
-
 _catalog_has_id = rffi.llexternal(
     "gnitz_catalog_has_id",
     [rffi.VOIDP, rffi.LONGLONG],
@@ -917,66 +811,10 @@ _catalog_is_unique_pk = rffi.llexternal(
     compilation_info=eci,
 )
 
-_catalog_ingest = rffi.llexternal(
-    "gnitz_catalog_ingest",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
 _catalog_ingest_effective = rffi.llexternal(
     "gnitz_catalog_ingest_effective",
     [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
     rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_catalog_push_and_evaluate = rffi.llexternal(
-    "gnitz_catalog_push_and_evaluate",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_catalog_scan = rffi.llexternal(
-    "gnitz_catalog_scan",
-    [rffi.VOIDP, rffi.LONGLONG],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_catalog_seek = rffi.llexternal(
-    "gnitz_catalog_seek",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.ULONGLONG, rffi.ULONGLONG],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_catalog_seek_by_index = rffi.llexternal(
-    "gnitz_catalog_seek_by_index",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT, rffi.ULONGLONG, rffi.ULONGLONG],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_catalog_flush = rffi.llexternal(
-    "gnitz_catalog_flush",
-    [rffi.VOIDP, rffi.LONGLONG],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_catalog_validate_unique_indices = rffi.llexternal(
-    "gnitz_catalog_validate_unique_indices",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_catalog_validate_fk_inline = rffi.llexternal(
-    "gnitz_catalog_validate_fk_inline",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
-    rffi.INT,
     compilation_info=eci,
 )
 
@@ -1106,13 +944,6 @@ _dag_invalidate = rffi.llexternal(
     compilation_info=eci,
 )
 
-_dag_evaluate = rffi.llexternal(
-    "gnitz_dag_evaluate",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
 _dag_execute_epoch = rffi.llexternal(
     "gnitz_dag_execute_epoch",
     [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP, rffi.LONGLONG],
@@ -1239,13 +1070,6 @@ _master_create = rffi.llexternal(
     compilation_info=eci,
 )
 
-_master_destroy = rffi.llexternal(
-    "gnitz_master_destroy",
-    [rffi.VOIDP],
-    lltype.Void,
-    compilation_info=eci,
-)
-
 _master_reset_sal = rffi.llexternal(
     "gnitz_master_reset_sal",
     [rffi.VOIDP, rffi.ULONGLONG, rffi.UINT],
@@ -1267,100 +1091,9 @@ _master_collect_acks = rffi.llexternal(
     compilation_info=eci,
 )
 
-_master_fan_out_ingest = rffi.llexternal(
-    "gnitz_master_fan_out_ingest",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_master_fan_out_tick = rffi.llexternal(
-    "gnitz_master_fan_out_tick",
-    [rffi.VOIDP, rffi.LONGLONG],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_master_fan_out_push = rffi.llexternal(
-    "gnitz_master_fan_out_push",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_master_fan_out_scan = rffi.llexternal(
-    "gnitz_master_fan_out_scan",
-    [rffi.VOIDP, rffi.LONGLONG],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_master_fan_out_seek = rffi.llexternal(
-    "gnitz_master_fan_out_seek",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.ULONGLONG, rffi.ULONGLONG],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_master_fan_out_seek_by_index = rffi.llexternal(
-    "gnitz_master_fan_out_seek_by_index",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT, rffi.ULONGLONG, rffi.ULONGLONG],
-    rffi.VOIDP,
-    compilation_info=eci,
-)
-
 _master_fan_out_backfill = rffi.llexternal(
     "gnitz_master_fan_out_backfill",
     [rffi.VOIDP, rffi.LONGLONG, rffi.LONGLONG],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_master_broadcast_ddl = rffi.llexternal(
-    "gnitz_master_broadcast_ddl",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_master_check_pk_exists_broadcast = rffi.llexternal(
-    "gnitz_master_check_pk_exists_broadcast",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT, rffi.VOIDP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_master_start_tick_async = rffi.llexternal(
-    "gnitz_master_start_tick_async",
-    [rffi.VOIDP, rffi.LONGLONG],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_master_poll_tick_progress = rffi.llexternal(
-    "gnitz_master_poll_tick_progress",
-    [rffi.VOIDP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_master_check_workers = rffi.llexternal(
-    "gnitz_master_check_workers",
-    [rffi.VOIDP],
-    rffi.INT,
-    compilation_info=eci,
-)
-
-_master_shutdown_workers = rffi.llexternal(
-    "gnitz_master_shutdown_workers",
-    [rffi.VOIDP],
-    lltype.Void,
-    compilation_info=eci,
-)
-
-_master_validate_unique_distributed = rffi.llexternal(
-    "gnitz_master_validate_unique_distributed",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
     rffi.INT,
     compilation_info=eci,
 )

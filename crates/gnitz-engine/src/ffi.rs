@@ -3280,23 +3280,6 @@ pub extern "C" fn gnitz_dag_invalidate_dep_map(handle: *mut c_void) {
     });
 }
 
-/// Run the full single-worker DAG evaluation.
-/// Returns 0 on success, negative on error.
-#[no_mangle]
-pub extern "C" fn gnitz_dag_evaluate(
-    handle: *mut c_void,
-    source_id: i64,
-    delta_handle: *mut c_void,
-) -> i32 {
-    if handle.is_null() || delta_handle.is_null() { return -1; }
-    let result = panic::catch_unwind(|| {
-        let dag = unsafe { &mut *(handle as *mut DagEngine) };
-        let delta = unsafe { Box::from_raw(delta_handle as *mut crate::memtable::OwnedBatch) };
-        dag.evaluate_dag(source_id, *delta)
-    });
-    result.unwrap_or(-99)
-}
-
 /// Execute a single epoch for one view (multi-worker path).
 /// Returns a new batch handle (caller owns) or null.
 #[no_mangle]
@@ -3979,20 +3962,6 @@ pub extern "C" fn gnitz_catalog_allocate_index_id(handle: *mut c_void) -> i64 {
     result.unwrap_or(-1)
 }
 
-#[no_mangle]
-pub extern "C" fn gnitz_catalog_advance_sequence(
-    handle: *mut c_void,
-    seq_id: i64, old_val: i64, new_val: i64,
-) -> c_int {
-    if handle.is_null() { return -1; }
-    let result = panic::catch_unwind(|| {
-        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
-        engine.advance_sequence(seq_id, old_val, new_val);
-        0
-    });
-    result.unwrap_or(-99)
-}
-
 // ── Queries ────────────────────────────────────────────────────────────
 
 #[no_mangle]
@@ -4045,26 +4014,7 @@ pub extern "C" fn gnitz_catalog_is_unique_pk(handle: *const c_void, table_id: i6
     result.unwrap_or(0)
 }
 
-// ── Ingestion / scan / seek / flush ────────────────────────────────────
-
-/// Ingest a batch into a table family.  Takes ownership of the batch handle.
-#[no_mangle]
-pub extern "C" fn gnitz_catalog_ingest(
-    handle: *mut c_void,
-    table_id: i64,
-    batch_handle: *mut c_void,
-) -> c_int {
-    if handle.is_null() || batch_handle.is_null() { return -1; }
-    let result = panic::catch_unwind(|| {
-        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
-        let batch = unsafe { *Box::from_raw(batch_handle as *mut crate::memtable::OwnedBatch) };
-        match engine.ingest_to_family(table_id, batch) {
-            Ok(()) => 0,
-            Err(msg) => { set_catalog_error(msg); -1 }
-        }
-    });
-    result.unwrap_or(-99)
-}
+// ── Ingestion ─────────────────────────────────────────────────────────
 
 /// Ingest a user-table batch and return the effective delta (after unique_pk
 /// dedup).  Takes ownership of the input batch.  Returns the effective batch
@@ -4085,134 +4035,6 @@ pub extern "C" fn gnitz_catalog_ingest_effective(
         }
     });
     result.unwrap_or(ptr::null_mut())
-}
-
-/// Ingest a batch into a user table and run single-worker DAG cascade.
-/// Takes ownership of the batch.  Uses the effective batch (with unique_pk
-/// retractions) for the DAG so views see correct deltas.
-#[no_mangle]
-pub extern "C" fn gnitz_catalog_push_and_evaluate(
-    handle: *mut c_void,
-    table_id: i64,
-    batch_handle: *mut c_void,
-) -> c_int {
-    if handle.is_null() || batch_handle.is_null() { return -1; }
-    let result = panic::catch_unwind(|| {
-        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
-        let batch = unsafe { *Box::from_raw(batch_handle as *mut crate::memtable::OwnedBatch) };
-        match engine.push_and_evaluate(table_id, batch) {
-            Ok(()) => 0,
-            Err(msg) => { set_catalog_error(msg); -1 }
-        }
-    });
-    result.unwrap_or(-99)
-}
-
-/// Scan all positive-weight rows.  Returns a new batch handle (caller must free).
-#[no_mangle]
-pub extern "C" fn gnitz_catalog_scan(
-    handle: *mut c_void,
-    table_id: i64,
-) -> *mut c_void {
-    if handle.is_null() { return ptr::null_mut(); }
-    let result = panic::catch_unwind(|| {
-        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
-        match engine.scan_family(table_id) {
-            Ok(batch) => Box::into_raw(Box::new(batch)) as *mut c_void,
-            Err(msg) => { set_catalog_error(msg); ptr::null_mut() }
-        }
-    });
-    result.unwrap_or(ptr::null_mut())
-}
-
-/// Point lookup by PK.  Returns a batch handle or NULL if not found.
-#[no_mangle]
-pub extern "C" fn gnitz_catalog_seek(
-    handle: *mut c_void,
-    table_id: i64,
-    pk_lo: u64, pk_hi: u64,
-) -> *mut c_void {
-    if handle.is_null() { return ptr::null_mut(); }
-    let result = panic::catch_unwind(|| {
-        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
-        match engine.seek_family(table_id, pk_lo, pk_hi) {
-            Ok(Some(batch)) => Box::into_raw(Box::new(batch)) as *mut c_void,
-            Ok(None) => ptr::null_mut(),
-            Err(msg) => { set_catalog_error(msg); ptr::null_mut() }
-        }
-    });
-    result.unwrap_or(ptr::null_mut())
-}
-
-/// Index-assisted lookup.  Returns batch handle or NULL.
-#[no_mangle]
-pub extern "C" fn gnitz_catalog_seek_by_index(
-    handle: *mut c_void,
-    table_id: i64,
-    col_idx: u32,
-    key_lo: u64, key_hi: u64,
-) -> *mut c_void {
-    if handle.is_null() { return ptr::null_mut(); }
-    let result = panic::catch_unwind(|| {
-        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
-        match engine.seek_by_index(table_id, col_idx, key_lo, key_hi) {
-            Ok(Some(batch)) => Box::into_raw(Box::new(batch)) as *mut c_void,
-            Ok(None) => ptr::null_mut(),
-            Err(msg) => { set_catalog_error(msg); ptr::null_mut() }
-        }
-    });
-    result.unwrap_or(ptr::null_mut())
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_catalog_flush(handle: *mut c_void, table_id: i64) -> c_int {
-    if handle.is_null() { return -1; }
-    let result = panic::catch_unwind(|| {
-        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
-        match engine.flush_family(table_id) {
-            Ok(()) => 0,
-            Err(msg) => { set_catalog_error(msg); -1 }
-        }
-    });
-    result.unwrap_or(-99)
-}
-
-/// Validate unique index constraints (single-worker path).
-#[no_mangle]
-pub extern "C" fn gnitz_catalog_validate_unique_indices(
-    handle: *mut c_void,
-    table_id: i64,
-    batch_handle: *const c_void,
-) -> c_int {
-    if handle.is_null() || batch_handle.is_null() { return -1; }
-    let result = panic::catch_unwind(|| {
-        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
-        let batch = unsafe { &*(batch_handle as *const crate::memtable::OwnedBatch) };
-        match engine.validate_unique_indices(table_id, batch) {
-            Ok(()) => 0,
-            Err(msg) => { set_catalog_error(msg); -1 }
-        }
-    });
-    result.unwrap_or(-99)
-}
-
-/// Validate FK constraints inline (single-worker path).
-#[no_mangle]
-pub extern "C" fn gnitz_catalog_validate_fk_inline(
-    handle: *mut c_void,
-    table_id: i64,
-    batch_handle: *const c_void,
-) -> c_int {
-    if handle.is_null() || batch_handle.is_null() { return -1; }
-    let result = panic::catch_unwind(|| {
-        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
-        let batch = unsafe { &*(batch_handle as *const crate::memtable::OwnedBatch) };
-        match engine.validate_fk_inline(table_id, batch) {
-            Ok(()) => 0,
-            Err(msg) => { set_catalog_error(msg); -1 }
-        }
-    });
-    result.unwrap_or(-99)
 }
 
 // ── Worker support ─────────────────────────────────────────────────────
@@ -4604,12 +4426,6 @@ pub extern "C" fn gnitz_master_create(
 }
 
 #[no_mangle]
-pub extern "C" fn gnitz_master_destroy(handle: *mut c_void) {
-    if handle.is_null() { return; }
-    unsafe { drop(Box::from_raw(handle as *mut crate::master::MasterDispatcher)); }
-}
-
-#[no_mangle]
 pub extern "C" fn gnitz_master_last_error(
     handle: *const c_void,
     out_len: *mut u32,
@@ -4629,17 +4445,6 @@ unsafe fn master_call(handle: *mut c_void, f: impl FnOnce(&mut crate::master::Ma
     match f(master) {
         Ok(()) => 0,
         Err(e) => { master.last_error = e; -1 }
-    }
-}
-
-/// Helper for Result<Option<OwnedBatch>, String> -> *mut c_void FFI calls.
-unsafe fn master_call_batch(handle: *mut c_void, f: impl FnOnce(&mut crate::master::MasterDispatcher) -> Result<Option<crate::memtable::OwnedBatch>, String>) -> *mut c_void {
-    let master = &mut *(handle as *mut crate::master::MasterDispatcher);
-    master.last_error.clear();
-    match f(master) {
-        Ok(Some(batch)) => Box::into_raw(Box::new(batch)) as *mut c_void,
-        Ok(None) => ptr::null_mut(),
-        Err(e) => { master.last_error = e; ptr::null_mut() }
     }
 }
 
@@ -4666,88 +4471,6 @@ pub extern "C" fn gnitz_master_collect_acks(handle: *mut c_void) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn gnitz_master_fan_out_ingest(
-    handle: *mut c_void,
-    target_id: i64,
-    batch: *const c_void,
-) -> i32 {
-    if handle.is_null() || batch.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let b = unsafe { &*(batch as *const crate::memtable::OwnedBatch) };
-        unsafe { master_call(handle, |m| m.fan_out_ingest(target_id, b)) }
-    }));
-    result.unwrap_or(-99)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_master_fan_out_tick(
-    handle: *mut c_void,
-    target_id: i64,
-) -> i32 {
-    if handle.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        unsafe { master_call(handle, |m| m.fan_out_tick(target_id)) }
-    }));
-    result.unwrap_or(-99)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_master_fan_out_push(
-    handle: *mut c_void,
-    target_id: i64,
-    batch: *const c_void,
-) -> i32 {
-    if handle.is_null() || batch.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let b = unsafe { &*(batch as *const crate::memtable::OwnedBatch) };
-        unsafe { master_call(handle, |m| m.fan_out_push(target_id, b)) }
-    }));
-    result.unwrap_or(-99)
-}
-
-/// Returns OwnedBatch handle or null. Check last_error to distinguish "no data" from error.
-#[no_mangle]
-pub extern "C" fn gnitz_master_fan_out_scan(
-    handle: *mut c_void,
-    target_id: i64,
-) -> *mut c_void {
-    if handle.is_null() { return ptr::null_mut(); }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        unsafe { master_call_batch(handle, |m| m.fan_out_scan(target_id)) }
-    }));
-    result.unwrap_or(ptr::null_mut())
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_master_fan_out_seek(
-    handle: *mut c_void,
-    target_id: i64,
-    pk_lo: u64,
-    pk_hi: u64,
-) -> *mut c_void {
-    if handle.is_null() { return ptr::null_mut(); }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        unsafe { master_call_batch(handle, |m| m.fan_out_seek(target_id, pk_lo, pk_hi)) }
-    }));
-    result.unwrap_or(ptr::null_mut())
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_master_fan_out_seek_by_index(
-    handle: *mut c_void,
-    target_id: i64,
-    col_idx: u32,
-    key_lo: u64,
-    key_hi: u64,
-) -> *mut c_void {
-    if handle.is_null() { return ptr::null_mut(); }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        unsafe { master_call_batch(handle, |m| m.fan_out_seek_by_index(target_id, col_idx, key_lo, key_hi)) }
-    }));
-    result.unwrap_or(ptr::null_mut())
-}
-
-#[no_mangle]
 pub extern "C" fn gnitz_master_fan_out_backfill(
     handle: *mut c_void,
     view_id: i64,
@@ -4756,106 +4479,6 @@ pub extern "C" fn gnitz_master_fan_out_backfill(
     if handle.is_null() { return -1; }
     let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         unsafe { master_call(handle, |m| m.fan_out_backfill(view_id, source_id)) }
-    }));
-    result.unwrap_or(-99)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_master_broadcast_ddl(
-    handle: *mut c_void,
-    target_id: i64,
-    batch: *const c_void,
-) -> i32 {
-    if handle.is_null() || batch.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let b = unsafe { &*(batch as *const crate::memtable::OwnedBatch) };
-        unsafe { master_call(handle, |m| m.broadcast_ddl(target_id, b)) }
-    }));
-    result.unwrap_or(-99)
-}
-
-/// Returns 0=none exist, 1=some exist, <0=error.
-#[no_mangle]
-pub extern "C" fn gnitz_master_check_pk_exists_broadcast(
-    handle: *mut c_void,
-    owner_table_id: i64,
-    source_col_idx: u32,
-    batch: *const c_void,
-) -> i32 {
-    if handle.is_null() || batch.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let b = unsafe { &*(batch as *const crate::memtable::OwnedBatch) };
-        unsafe {
-            let master = &mut *(handle as *mut crate::master::MasterDispatcher);
-            master.last_error.clear();
-            match master.check_pk_exists_broadcast(owner_table_id, source_col_idx, b) {
-                Ok(true) => 1,
-                Ok(false) => 0,
-                Err(e) => { master.last_error = e; -1 }
-            }
-        }
-    }));
-    result.unwrap_or(-99)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_master_start_tick_async(
-    handle: *mut c_void,
-    target_id: i64,
-) -> i32 {
-    if handle.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        unsafe { master_call(handle, |m| m.start_tick_async(target_id)) }
-    }));
-    result.unwrap_or(-99)
-}
-
-/// Returns 0=pending, 1=done, <0=error.
-#[no_mangle]
-pub extern "C" fn gnitz_master_poll_tick_progress(handle: *mut c_void) -> i32 {
-    if handle.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        let master = &mut *(handle as *mut crate::master::MasterDispatcher);
-        master.last_error.clear();
-        match master.poll_tick_progress() {
-            Ok(true) => 1,
-            Ok(false) => 0,
-            Err(e) => { master.last_error = e; -1 }
-        }
-    }));
-    result.unwrap_or(-99)
-}
-
-/// Returns -1 if all workers OK, else worker index that crashed.
-#[no_mangle]
-pub extern "C" fn gnitz_master_check_workers(handle: *const c_void) -> i32 {
-    if handle.is_null() { return -1; }
-    let result = panic::catch_unwind(|| {
-        let master = unsafe { &*(handle as *const crate::master::MasterDispatcher) };
-        master.check_workers()
-    });
-    result.unwrap_or(-1)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_master_shutdown_workers(handle: *mut c_void) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let master = unsafe { &mut *(handle as *mut crate::master::MasterDispatcher) };
-        master.shutdown_workers();
-    }));
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_master_validate_unique_distributed(
-    handle: *mut c_void,
-    target_id: i64,
-    batch: *const c_void,
-) -> i32 {
-    if handle.is_null() || batch.is_null() { return -1; }
-    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let b = unsafe { &*(batch as *const crate::memtable::OwnedBatch) };
-        unsafe { master_call(handle, |m| m.validate_unique_distributed(target_id, b)) }
     }));
     result.unwrap_or(-99)
 }
