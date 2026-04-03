@@ -5,8 +5,7 @@
 
 import os
 from rpython.rlib.rarithmetic import intmask
-from rpython.rlib.objectmodel import newlist_hint
-from rpython.rtyper.lltypesystem import rffi
+from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz import log
 from rpython.rlib import rposix
@@ -15,7 +14,6 @@ from rpython.rlib.rarithmetic import r_uint64
 from gnitz.catalog.engine import open_engine
 from gnitz.storage import mmap_posix
 from gnitz.storage.mmap_posix import raise_fd_limit
-from gnitz.catalog import system_tables as sys
 from gnitz.server.executor import ServerExecutor
 from gnitz.server import ipc
 from gnitz.storage import engine_ffi
@@ -26,24 +24,60 @@ from gnitz.server.worker import WorkerProcess
 
 def _backfill_exchange_views(engine, dispatcher):
     """Issue fan_out_backfill for every exchange-requiring view."""
-    from rpython.rtyper.lltypesystem import lltype
-    for family in engine.registry.iter_families():
-        vid = family.table_id
-        if vid < sys.FIRST_USER_TABLE_ID:
-            continue
-        if not engine_ffi._dag_view_needs_exchange(engine.dag_handle, vid):
-            continue
-        out_buf = lltype.malloc(rffi.LONGLONGP.TO, 64, flavor="raw")
-        try:
-            n = engine_ffi._dag_get_source_ids(engine.dag_handle, vid, out_buf, 64)
-            for si in range(intmask(n)):
-                source_id = intmask(out_buf[si])
-                if not engine.registry.has_id(source_id):
-                    continue
-                src_family = engine.registry.get_by_id(source_id)
-                dispatcher.fan_out_backfill(vid, source_id, src_family.schema)
-        finally:
-            lltype.free(out_buf, flavor="raw")
+    max_ids = 256
+    id_buf = lltype.malloc(rffi.LONGLONGP.TO, max_ids, flavor="raw")
+    try:
+        n_ids = intmask(engine_ffi._catalog_iter_user_table_ids(
+            engine._handle, id_buf, rffi.cast(rffi.UINT, max_ids)))
+        for i in range(n_ids):
+            vid = intmask(id_buf[i])
+            if not engine_ffi._dag_view_needs_exchange(engine.dag_handle, vid):
+                continue
+            src_buf = lltype.malloc(rffi.LONGLONGP.TO, 64, flavor="raw")
+            try:
+                n = engine_ffi._dag_get_source_ids(
+                    engine.dag_handle, vid, src_buf, 64)
+                for si in range(intmask(n)):
+                    source_id = intmask(src_buf[si])
+                    if not intmask(engine_ffi._catalog_has_id(
+                            engine._handle,
+                            rffi.cast(rffi.LONGLONG, source_id))):
+                        continue
+                    src_schema = _get_schema(engine, source_id)
+                    if src_schema is not None:
+                        dispatcher.fan_out_backfill(
+                            vid, source_id, src_schema)
+            finally:
+                lltype.free(src_buf, flavor="raw")
+    finally:
+        lltype.free(id_buf, flavor="raw")
+
+
+def _get_schema(engine, tid):
+    """Get TableSchema for a table/view via catalog FFI, with column names."""
+    schema_buf = lltype.malloc(
+        rffi.CCHARP.TO, engine_ffi.SCHEMA_DESC_SIZE, flavor="raw")
+    try:
+        rc = engine_ffi._catalog_get_schema_desc(
+            engine._handle, rffi.cast(rffi.LONGLONG, tid),
+            rffi.cast(rffi.VOIDP, schema_buf))
+        if intmask(rc) < 0:
+            return None
+        schema = engine_ffi.unpack_schema(schema_buf)
+    finally:
+        lltype.free(schema_buf, flavor="raw")
+    name_buf = lltype.malloc(rffi.CCHARP.TO, 256, flavor="raw")
+    try:
+        for ci in range(len(schema.columns)):
+            nlen = intmask(engine_ffi._catalog_get_col_name(
+                engine._handle, rffi.cast(rffi.LONGLONG, tid),
+                rffi.cast(rffi.UINT, ci),
+                rffi.cast(rffi.VOIDP, name_buf), rffi.cast(rffi.UINT, 256)))
+            if nlen > 0:
+                schema.columns[ci].name = rffi.charpsize2str(name_buf, nlen)
+    finally:
+        lltype.free(name_buf, flavor="raw")
+    return schema
 
 HELP_TEXT = (
     "gnitz-server — GnitzDB database server\n"
@@ -68,33 +102,38 @@ HELP_TEXT = (
 
 def _close_user_table_partitions(engine):
     """Master closes all user-table partitions after fork."""
-    for family in engine.registry.iter_families():
-        if family.table_id >= sys.FIRST_USER_TABLE_ID:
-            family.store.close_all_partitions()
+    engine_ffi._catalog_close_user_table_partitions(engine._handle)
 
 
 def _trim_worker_partitions(engine, part_start, part_end):
     """Worker closes partitions outside its assigned range."""
-    for family in engine.registry.iter_families():
-        if family.table_id >= sys.FIRST_USER_TABLE_ID:
-            family.store.close_partitions_outside(part_start, part_end)
+    engine_ffi._catalog_trim_worker_partitions(
+        engine._handle,
+        rffi.cast(rffi.UINT, part_start),
+        rffi.cast(rffi.UINT, part_end))
 
 
 def _disable_worker_wal(engine):
     """Disable per-partition WAL for user tables (SAL handles durability)."""
-    for family in engine.registry.iter_families():
-        if family.table_id >= sys.FIRST_USER_TABLE_ID:
-            family.store.set_has_wal(False)
+    engine_ffi._catalog_disable_user_table_wal(engine._handle)
 
 
 def _recover_from_sal(sal_ptr, engine, worker_id):
     """Replay unflushed SAL push blocks for this worker's partitions."""
-    # Build per-family max_flushed_lsn map
+    # Build per-table max_flushed_lsn map via catalog FFI
+    max_ids = 256
+    id_buf = lltype.malloc(rffi.LONGLONGP.TO, max_ids, flavor="raw")
     family_lsns = {}
-    for family in engine.registry.iter_families():
-        tid = family.table_id
-        if tid >= sys.FIRST_USER_TABLE_ID:
-            family_lsns[tid] = family.store.get_max_flushed_lsn()
+    try:
+        n_ids = intmask(engine_ffi._catalog_iter_user_table_ids(
+            engine._handle, id_buf, rffi.cast(rffi.UINT, max_ids)))
+        for i in range(n_ids):
+            tid = intmask(id_buf[i])
+            lsn = r_uint64(engine_ffi._catalog_get_max_flushed_lsn(
+                engine._handle, rffi.cast(rffi.LONGLONG, tid)))
+            family_lsns[tid] = lsn
+    finally:
+        lltype.free(id_buf, flavor="raw")
 
     offset = 0
     replayed = 0
@@ -122,10 +161,11 @@ def _recover_from_sal(sal_ptr, engine, worker_id):
             continue
         b = msg.payload.batch
         if b is not None and b.length() > 0:
-            family = engine.registry.get_by_id(tid)
-            owned = b.clone()
-            family.store.ingest_batch(owned)
-            owned.free()
+            cloned_handle = engine_ffi._batch_clone(b._handle)
+            engine_ffi._catalog_raw_store_ingest(
+                engine._handle,
+                rffi.cast(rffi.LONGLONG, tid),
+                cloned_handle)
             replayed += 1
 
     if replayed > 0:
@@ -271,8 +311,10 @@ def entry_point(argv):
 
             # Set active partition range
             part_start, part_end = assignment.range_for_worker(w)
-            engine.registry.active_part_start = part_start
-            engine.registry.active_part_end = part_end
+            engine_ffi._catalog_set_active_partitions(
+                engine._handle,
+                rffi.cast(rffi.UINT, part_start),
+                rffi.cast(rffi.UINT, part_end))
             _trim_worker_partitions(engine, part_start, part_end)
 
             # Disable per-partition WAL (SAL handles durability)
@@ -281,7 +323,7 @@ def entry_point(argv):
             # SAL recovery — replay unflushed push data
             _recover_from_sal(sal_ptr, engine, w)
 
-            engine_ffi._dag_invalidate_all(engine.dag_handle)
+            engine_ffi._catalog_invalidate_all_plans(engine._handle)
 
             os.write(
                 1,
@@ -302,11 +344,13 @@ def entry_point(argv):
 
     # --- Parent process ---
     _close_user_table_partitions(engine)
-    engine.registry.active_part_start = 0
-    engine.registry.active_part_end = 0
+    engine_ffi._catalog_set_active_partitions(
+        engine._handle,
+        rffi.cast(rffi.UINT, 0),
+        rffi.cast(rffi.UINT, 0))
 
     dispatcher = MasterDispatcher(num_workers, worker_pids,
-                                   assignment, engine.dag_handle, engine.registry,
+                                   assignment, engine.dag_handle, engine._handle,
                                    sal, w2m_regions, m2w_efds, w2m_efds)
 
     # Wait for all workers to complete recovery and signal readiness

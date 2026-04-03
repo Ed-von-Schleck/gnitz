@@ -1,654 +1,292 @@
 # gnitz/catalog/engine.py
+#
+# Thin wrapper around the Rust CatalogEngine (opaque FFI handle).
+# All catalog logic — DDL, hooks, entity registry, bootstrap/recovery,
+# FK validation, view/index backfill — lives in Rust.
 
-import os
-from rpython.rlib import rposix, rposix_stat
-from rpython.rlib.rarithmetic import r_uint64, intmask, r_ulonglonglong as r_uint128
-from rpython.rlib.objectmodel import newlist_hint
+from rpython.rtyper.lltypesystem import rffi, lltype
+from rpython.rlib.rarithmetic import intmask
 
-from gnitz.core.types import TableSchema, ColumnDefinition
 from gnitz.core.errors import LayoutError
-from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.storage import engine_ffi
 
-from gnitz.catalog.identifiers import validate_user_identifier, parse_qualified_name
-from gnitz.catalog import system_tables as sys
-from gnitz.catalog.registry import EntityRegistry, ingest_to_family
-from gnitz.catalog.index_circuit import (
-    get_index_key_type,
-    make_secondary_index_name,
-)
-from gnitz.catalog.metadata import (
-    ensure_dir,
-    make_system_tables,
-    bootstrap_system_tables,
-)
-from gnitz.catalog.loader import CatalogBootstrapper
-from gnitz.catalog.hooks import wire_catalog_hooks
+
+class CatalogHandle(object):
+    """Thin wrapper around Rust CatalogEngine opaque handle."""
+
+    _immutable_fields_ = ["_handle", "dag_handle", "base_dir"]
+
+    def __init__(self, handle, dag_handle, base_dir):
+        self._handle = handle
+        self.dag_handle = dag_handle
+        self.base_dir = base_dir
+
+    def close(self):
+        engine_ffi._catalog_close(self._handle)
 
 
 def open_engine(base_dir, memtable_arena_size=1 * 1024 * 1024):
-    """
-    Public factory to open a GnitzDB instance.
-    """
-    ensure_dir(base_dir)
-
-    sys_dir = base_dir + "/" + sys.SYS_CATALOG_DIRNAME
-    ensure_dir(sys_dir)
-
-    sys_tables = make_system_tables(base_dir)
-
-    tmp_cursor = sys_tables.tables.create_cursor()
-    is_new = not tmp_cursor.is_valid()
-    tmp_cursor.close()
-
-    if is_new:
-        bootstrap_system_tables(sys_tables, base_dir)
-
-    registry = EntityRegistry()
-    dag_handle = engine_ffi._dag_create()
-    bootstrapper = CatalogBootstrapper(registry, sys_tables, base_dir)
-
-    bootstrapper.recover_system_state()
-
-    engine = Engine(base_dir, sys_tables, registry, dag_handle)
-
-    # Set system table handles on DagEngine
-    _setup_dag_sys_tables(engine)
-
-    table_hook = wire_catalog_hooks(engine)
-
-    bootstrapper.replay_catalog()
-
-    # Enable cascading effects now that replay is complete
-    table_hook.cascade_enabled = True
-
-    return engine
-
-
-def _setup_dag_sys_tables(engine):
-    """Wire the 6 circuit system tables into the DagEngine."""
-    from rpython.rtyper.lltypesystem import rffi, lltype
-    st = engine.sys
-    # Pack schemas
-    s_nodes = engine_ffi.pack_schema(st.circuit_nodes.schema)
-    s_edges = engine_ffi.pack_schema(st.circuit_edges.schema)
-    s_sources = engine_ffi.pack_schema(st.circuit_sources.schema)
-    s_params = engine_ffi.pack_schema(st.circuit_params.schema)
-    s_gcols = engine_ffi.pack_schema(st.circuit_group_cols.schema)
-    s_dep = engine_ffi.pack_schema(st.view_deps.schema)
+    """Open or create a GnitzDB instance via Rust CatalogEngine."""
+    buf = rffi.str2charp(base_dir)
     try:
-        engine_ffi._dag_set_sys_tables(
-            engine.dag_handle,
-            st.circuit_nodes._handle,
-            st.circuit_edges._handle,
-            st.circuit_sources._handle,
-            st.circuit_params._handle,
-            st.circuit_group_cols._handle,
-            st.view_deps._handle,
-            rffi.cast(rffi.VOIDP, s_nodes),
-            rffi.cast(rffi.VOIDP, s_edges),
-            rffi.cast(rffi.VOIDP, s_sources),
-            rffi.cast(rffi.VOIDP, s_params),
-            rffi.cast(rffi.VOIDP, s_gcols),
-            rffi.cast(rffi.VOIDP, s_dep),
+        handle = engine_ffi._catalog_open(
+            rffi.cast(rffi.VOIDP, buf),
+            rffi.cast(rffi.UINT, len(base_dir)),
         )
     finally:
-        lltype.free(s_nodes, flavor="raw")
-        lltype.free(s_edges, flavor="raw")
-        lltype.free(s_sources, flavor="raw")
-        lltype.free(s_params, flavor="raw")
-        lltype.free(s_gcols, flavor="raw")
-        lltype.free(s_dep, flavor="raw")
+        rffi.free_charp(buf)
+    if not handle:
+        raise LayoutError("Failed to open catalog engine")
+    dag_handle = engine_ffi._catalog_get_dag_handle(handle)
+    return CatalogHandle(handle, dag_handle, base_dir)
 
 
-def _validate_fk_column(
-    col, col_idx, registry, self_table_id=0, self_pk_index=0, self_pk_type=None
-):
-    """Ensures a column's FK metadata is logically sound before ingestion."""
-    if col.fk_table_id == 0:
-        return
+# ---------------------------------------------------------------------------
+# DDL helpers — called from executor.py
+# ---------------------------------------------------------------------------
 
-    if col.fk_table_id == self_table_id:
-        target_pk_index = self_pk_index
-        target_pk_type = self_pk_type
-    else:
-        if not registry.has_id(col.fk_table_id):
-            raise LayoutError("FK references unknown table_id %d" % col.fk_table_id)
-        target_family = registry.get_by_id(col.fk_table_id)
-        target_pk_index = target_family.schema.pk_index
-        target_pk_type = target_family.schema.get_pk_column().field_type
-
-    if col.fk_col_idx != target_pk_index:
-        raise LayoutError("FK must reference target PK")
-
-    promoted_type = get_index_key_type(col.field_type)
-    if promoted_type.code != target_pk_type.code:
-        raise LayoutError(
-            "FK type mismatch: promoted code %d vs target %d"
-            % (promoted_type.code, target_pk_type.code)
-        )
-
-
-def _col_defs_from_graph(graph):
-    """
-    Converts a CircuitGraph's output_col_defs list into a list of ColumnDefinition objects.
-    """
-    result = newlist_hint(len(graph.output_col_defs))
-    for name, type_code in graph.output_col_defs:
-        result.append(
-            ColumnDefinition(
-                sys.type_code_to_field_type(type_code),
-                is_nullable=False,
-                name=name,
-            )
-        )
-    return result
-
-
-def _validate_graph_structure(graph):
-    """Dry-run validation of a CircuitGraph before persistence."""
-    from gnitz.core import opcodes
-    if not graph.nodes:
-        raise LayoutError("View graph contains no nodes")
-    has_input = False
-    for _, table_id in graph.sources:
-        if table_id == 0:
-            has_input = True
-            break
-    if not has_input:
-        raise LayoutError("View graph missing primary input (table_id=0)")
-    has_sink = False
-    for _, opcode in graph.nodes:
-        if opcode == opcodes.OPCODE_INTEGRATE:
-            has_sink = True
-            break
-    if not has_sink:
-        raise LayoutError("View graph missing sink (INTEGRATE node)")
-    # Cycle detection via Kahn's algorithm
-    in_degree = {}
-    for nid, _ in graph.nodes:
-        in_degree[nid] = 0
-    for _, src, dst, _ in graph.edges:
-        in_degree[dst] = in_degree.get(dst, 0) + 1
-    queue = []
-    for nid, _ in graph.nodes:
-        if in_degree[nid] == 0:
-            queue.append(nid)
-    count = 0
-    while len(queue) > 0:
-        nid = queue.pop(0)
-        count += 1
-        for _, src, dst, _ in graph.edges:
-            if src == nid:
-                in_degree[dst] -= 1
-                if in_degree[dst] == 0:
-                    queue.append(dst)
-    if count != len(graph.nodes):
-        raise LayoutError("View graph contains cycles (not a DAG)")
-
-
-class Engine(object):
-    """
-    The Supervisor for catalog mutations.
-    Writes durable intent to System Z-Sets; side-effects fire automatically
-    via post-ingestion hooks on TableFamily.
-    """
-
-    _immutable_fields_ = [
-        "base_dir", "sys", "registry", "dag_handle",
-        "_schemas_family", "_tables_family", "_views_family", "_indices_family",
-    ]
-
-    def __init__(self, base_dir, sys_tables, registry, dag_handle):
-        self.base_dir = base_dir
-        self.sys = sys_tables
-        self.registry = registry
-        self.dag_handle = dag_handle
-        # Cache family references for system tables with hooks
-        self._schemas_family = registry.get("_system", sys.SchemaTab.NAME)
-        self._tables_family = registry.get("_system", sys.TableTab.NAME)
-        self._views_family = registry.get("_system", sys.ViewTab.NAME)
-        self._indices_family = registry.get("_system", sys.IdxTab.NAME)
-
-    # -- Public Intent API ----------------------------------------------------
-
-    def create_schema(self, name):
-        validate_user_identifier(name)
-        if self.registry.has_schema(name):
-            raise LayoutError("Schema already exists: %s" % name)
-        sid = self.registry.allocate_schema_id()
-        self._write_schema_record(sid, name)
-        self._advance_sequence(sys.SEQ_ID_SCHEMAS, sid - 1, sid)
-
-    def drop_schema(self, name):
-        validate_user_identifier(name)
-        if not self.registry.has_schema(name):
-            raise LayoutError("Schema does not exist")
-        sid = self.registry.get_schema_id(name)
-        self._retract_schema_record(sid, name)
-
-    def create_table(self, qualified_name, columns, pk_col_idx, unique_pk=True):
-        schema_name, table_name = parse_qualified_name(qualified_name, "public")
-        validate_user_identifier(schema_name)
-        validate_user_identifier(table_name)
-
-        if not self.registry.has_schema(schema_name):
-            raise LayoutError("Schema does not exist")
-        if self.registry.has(schema_name, table_name):
-            raise LayoutError("Table already exists")
-
-        if len(columns) > 64:
-            raise LayoutError("Maximum 64 columns supported")
-        if pk_col_idx < 0 or pk_col_idx >= len(columns):
-            raise LayoutError("Primary Key index out of bounds")
-
-        tid = self.registry.allocate_table_id()
-        sid = self.registry.get_schema_id(schema_name)
-        self_pk_type = columns[pk_col_idx].field_type
-
-        for col_idx in range(len(columns)):
-            _validate_fk_column(
-                columns[col_idx], col_idx, self.registry, tid, pk_col_idx, self_pk_type
-            )
-
-        directory = (
-            self.base_dir + "/" + schema_name + "/" + table_name + "_" + str(tid)
-        )
-
-        flags = sys.TableTab.FLAG_UNIQUE_PK if unique_pk else 0
-
-        # Columns are written first so that the table handler can read them.
-        self._write_column_records(tid, sys.OWNER_KIND_TABLE, columns)
-        self._write_table_record(tid, sid, table_name, directory, pk_col_idx, 0, flags)
-
-        self._advance_sequence(sys.SEQ_ID_TABLES, tid - 1, tid)
-        family = self.registry.get(schema_name, table_name)
-        return family
-
-    def drop_table(self, qualified_name):
-        schema_name, table_name = parse_qualified_name(qualified_name, "public")
-        validate_user_identifier(schema_name)
-        validate_user_identifier(table_name)
-        if not self.registry.has(schema_name, table_name):
-            raise LayoutError("Table does not exist: %s.%s" % (schema_name, table_name))
-        family = self.registry.get(schema_name, table_name)
-        tid = family.table_id
-        self._check_for_dependencies(tid, table_name)
-
-        flags = sys.TableTab.FLAG_UNIQUE_PK if family.unique_pk else 0
-        self._retract_table_record(
-            tid, family.schema_id, table_name, family.directory, family.pk_col_idx, 0, flags
-        )
-        self._retract_column_records(tid, sys.OWNER_KIND_TABLE, family.schema.columns)
-
-    def create_view(self, qualified_name, graph, sql_definition=""):
-        schema_name, view_name = parse_qualified_name(qualified_name, "public")
-        if self.registry.has(schema_name, view_name):
-            raise LayoutError("View/Table already exists")
-
-        # Validate graph structure (sink presence, DAG properties) before persistence.
-        _validate_graph_structure(graph)
-
-        vid = self.registry.allocate_table_id()
-        sid = self.registry.get_schema_id(schema_name)
-        directory = (
-            self.base_dir
-            + "/"
-            + schema_name
-            + "/view_"
-            + view_name
-            + "_"
-            + str(vid)
-        )
-
-        # 1. Column records (Durable + Visible to view handler)
-        col_defs = _col_defs_from_graph(graph)
-        self._write_column_records(vid, sys.OWNER_KIND_VIEW, col_defs)
-        self.sys.columns.flush()
-
-        # 2. View dependency records
-        self._write_view_deps(vid, graph.dependencies)
-        self.sys.view_deps.flush()
-        engine_ffi._dag_invalidate_dep_map(self.dag_handle)
-
-        # 3. Circuit graph records
-        self._write_circuit_graph(vid, graph)
-        self.sys.circuit_nodes.flush()
-        self.sys.circuit_edges.flush()
-        self.sys.circuit_sources.flush()
-        self.sys.circuit_params.flush()
-        self.sys.circuit_group_cols.flush()
-
-        # 4. View record (registers the view family in the registry)
-        self._write_view_record(vid, sid, view_name, sql_definition, directory, 0)
-        self.sys.views.flush()
-
-        self._advance_sequence(sys.SEQ_ID_TABLES, vid - 1, vid)
-
-        # 5. Eagerly compile to catch schema errors at creation time.
-        # The view family is already registered; the caller must drop it on failure.
-        if not engine_ffi._dag_ensure_compiled(self.dag_handle, vid):
-            raise LayoutError("View circuit schema does not match declared output columns")
-
-        return self.registry.get(schema_name, view_name)
-
-    def drop_view(self, qualified_name):
-        schema_name, view_name = parse_qualified_name(qualified_name, "public")
-        family = self.registry.get(schema_name, view_name)
-        vid = family.table_id
-        self._check_for_dependencies(vid, view_name)
-
-        deps = self._read_view_deps(vid)
-
-        # Evict plan first
-        engine_ffi._dag_invalidate(self.dag_handle, vid)
-
-        self._retract_view_record(
-            vid, family.schema_id, view_name, "", family.directory, 0
-        )
-        self._retract_circuit_graph(vid)
-        self._retract_view_deps(vid, deps)
-        self._retract_column_records(vid, sys.OWNER_KIND_VIEW, family.schema.columns)
-
-    def create_index(self, qualified_owner_name, col_name, is_unique=False):
-        schema_name, table_name = parse_qualified_name(qualified_owner_name, "public")
-        family = self.get_table(qualified_owner_name)
-
-        col_idx = -1
-        for i in range(len(family.schema.columns)):
-            if family.schema.columns[i].name == col_name:
-                col_idx = i
-                break
-        if col_idx == -1:
-            raise LayoutError("Column not found in owner")
-
-        index_name = make_secondary_index_name(schema_name, table_name, col_name)
-        index_id = self.registry.allocate_index_id()
-        self._write_index_record(
-            index_id, family.table_id, sys.OWNER_KIND_TABLE, col_idx, index_name, int(is_unique), ""
-        )
-        self._advance_sequence(sys.SEQ_ID_INDICES, index_id - 1, index_id)
-        return self.registry.get_index_by_name(index_name)
-
-    def drop_index(self, index_name):
-        circuit = self.registry.get_index_by_name(index_name)
-        self._retract_index_record(
-            circuit.index_id,
-            circuit.owner_id,
-            sys.OWNER_KIND_TABLE,
-            circuit.source_col_idx,
-            circuit.name,
-            int(circuit.is_unique),
-            circuit.cache_dir,
-        )
-
-    def get_table(self, qualified_name):
-        schema_name, table_name = parse_qualified_name(qualified_name, "public")
-        return self.registry.get(schema_name, table_name)
-
-    def close(self):
-        engine_ffi._dag_destroy(self.dag_handle)
-        for family in self.registry.iter_families():
-            if family.table_id >= sys.FIRST_USER_TABLE_ID:
-                family.close()
-        self.sys.close()
-
-    def _check_for_dependencies(self, tid, name):
-        """Validates that no entities depend on the given ID before dropping it."""
-        for referencing in self.registry.iter_families():
-            if referencing.table_id == tid:
-                continue
-            for col in referencing.schema.columns:
-                if col.fk_table_id == tid:
-                    raise LayoutError("FK dependency: table '%s'" % name)
-
-        cursor = self.sys.view_deps.create_cursor()
+def _check_ffi_result(rc, context=""):
+    """Raise LayoutError if a catalog FFI call returned an error."""
+    if intmask(rc) < 0:
+        out_len = lltype.malloc(rffi.UINTP.TO, 1, flavor="raw")
         try:
-            while cursor.is_valid():
-                if cursor.weight() > 0:
-                    acc = cursor.get_accessor()
-                    if intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)) == tid:
-                        raise LayoutError("View dependency: entity '%s'" % name)
-                cursor.advance()
+            err_ptr = engine_ffi._catalog_last_error(out_len)
+            elen = intmask(out_len[0])
+            if elen > 0 and err_ptr:
+                msg = rffi.charpsize2str(rffi.cast(rffi.CCHARP, err_ptr), elen)
+            else:
+                msg = context or "catalog FFI error"
         finally:
-            cursor.close()
+            lltype.free(out_len, flavor="raw")
+        raise LayoutError(msg)
 
-    def _read_view_deps(self, vid):
-        from rpython.rlib.rarithmetic import r_ulonglonglong as r_uint128, r_int64
-        start_key = r_uint128(r_uint64(vid)) << 64
-        end_key = r_uint128(r_uint64(vid + 1)) << 64
-        cursor = self.sys.view_deps.create_cursor()
-        res = newlist_hint(4)
-        try:
-            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
-            while cursor.is_valid() and cursor.key() < end_key:
-                if cursor.weight() > r_int64(0):
-                    acc = cursor.get_accessor()
-                    res.append(
-                        (
-                            intmask(acc.get_int(sys.DepTab.COL_DEP_VIEW_ID)),
-                            intmask(acc.get_int(sys.DepTab.COL_DEP_TABLE_ID)),
-                        )
-                    )
-                cursor.advance()
-        finally:
-            cursor.close()
-        return res
 
-    # -- Circuit Graph Write Helpers ------------------------------------------
+def catalog_create_schema(handle, name):
+    buf = rffi.str2charp(name)
+    try:
+        rc = engine_ffi._catalog_create_schema(
+            handle, rffi.cast(rffi.VOIDP, buf), rffi.cast(rffi.UINT, len(name)),
+        )
+    finally:
+        rffi.free_charp(buf)
+    _check_ffi_result(rc, "create_schema")
 
-    def _write_circuit_graph(self, vid, graph):
-        """Ingests all five circuit table payloads from a CircuitGraph."""
-        s, batch = self._begin_write(sys.CircuitNodesTab)
-        for node_id, opcode in graph.nodes:
-            sys.CircuitNodesTab.append(batch, s, vid, node_id, opcode)
-        self._finish_write_sys(self.sys.circuit_nodes, batch)
 
-        s, batch = self._begin_write(sys.CircuitEdgesTab)
-        for edge_id, src, dst, port in graph.edges:
-            sys.CircuitEdgesTab.append(batch, s, vid, edge_id, src, dst, port)
-        self._finish_write_sys(self.sys.circuit_edges, batch)
+def catalog_drop_schema(handle, name):
+    buf = rffi.str2charp(name)
+    try:
+        rc = engine_ffi._catalog_drop_schema(
+            handle, rffi.cast(rffi.VOIDP, buf), rffi.cast(rffi.UINT, len(name)),
+        )
+    finally:
+        rffi.free_charp(buf)
+    _check_ffi_result(rc, "drop_schema")
 
-        s, batch = self._begin_write(sys.CircuitSourcesTab)
-        for node_id, table_id in graph.sources:
-            sys.CircuitSourcesTab.append(batch, s, vid, node_id, table_id)
-        self._finish_write_sys(self.sys.circuit_sources, batch)
 
-        s, batch = self._begin_write(sys.CircuitParamsTab)
-        for node_id, slot, value in graph.params:
-            sys.CircuitParamsTab.append(batch, s, vid, node_id, slot, value)
-        self._finish_write_sys(self.sys.circuit_params, batch)
+def catalog_create_table(handle, qualified_name, columns, pk_col_idx, unique_pk):
+    """Serialize ColumnDefinitions and call Rust create_table."""
+    # Serialize col_defs: [name_len(u32) + name(bytes) + type_code(u8)
+    #                      + is_nullable(u8) + fk_table_id(i64) + fk_col_idx(u32)]
+    import struct
+    parts = []
+    for col in columns:
+        name_bytes = col.name.encode("utf-8") if isinstance(col.name, unicode) else col.name
+        parts.append(struct.pack("<I", len(name_bytes)))
+        parts.append(name_bytes)
+        parts.append(struct.pack("<BB", col.field_type.code, int(col.is_nullable)))
+        parts.append(struct.pack("<qI", col.fk_table_id, col.fk_col_idx))
+    col_buf = "".join(parts)
 
-        s, batch = self._begin_write(sys.CircuitGroupColsTab)
-        for node_id, col_idx in graph.group_cols:
-            sys.CircuitGroupColsTab.append(batch, s, vid, node_id, col_idx)
-        self._finish_write_sys(self.sys.circuit_group_cols, batch)
+    name_buf = rffi.str2charp(qualified_name)
+    col_raw = rffi.str2charp(col_buf)
+    try:
+        tid = engine_ffi._catalog_create_table(
+            handle,
+            rffi.cast(rffi.VOIDP, name_buf),
+            rffi.cast(rffi.UINT, len(qualified_name)),
+            rffi.cast(rffi.VOIDP, col_raw),
+            rffi.cast(rffi.UINT, len(col_buf)),
+            rffi.cast(rffi.UINT, len(columns)),
+            rffi.cast(rffi.UINT, pk_col_idx),
+            rffi.cast(rffi.INT, int(unique_pk)),
+        )
+    finally:
+        rffi.free_charp(name_buf)
+        rffi.free_charp(col_raw)
+    if intmask(tid) < 0:
+        _check_ffi_result(rffi.cast(rffi.INT, -1), "create_table")
+    return intmask(tid)
 
-    def _retract_circuit_graph(self, vid):
-        start_key = r_uint128(r_uint64(vid)) << 64
-        end_key = r_uint128(r_uint64(vid + 1)) << 64
 
-        # Nodes
-        s, batch = self._begin_write(sys.CircuitNodesTab)
-        cursor = self.sys.circuit_nodes.create_cursor()
-        try:
-            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
-            while cursor.is_valid() and cursor.key() < end_key:
-                if cursor.weight() > 0:
-                    pk = cursor.key()
-                    acc = cursor.get_accessor()
-                    node_id = intmask(r_uint64(pk))
-                    opcode = intmask(acc.get_int(sys.CircuitNodesTab.COL_OPCODE))
-                    sys.CircuitNodesTab.retract(batch, s, vid, node_id, opcode)
-                cursor.advance()
-        finally:
-            cursor.close()
-        self._finish_write_sys(self.sys.circuit_nodes, batch)
+def catalog_drop_table(handle, qualified_name):
+    buf = rffi.str2charp(qualified_name)
+    try:
+        rc = engine_ffi._catalog_drop_table(
+            handle, rffi.cast(rffi.VOIDP, buf), rffi.cast(rffi.UINT, len(qualified_name)),
+        )
+    finally:
+        rffi.free_charp(buf)
+    _check_ffi_result(rc, "drop_table")
 
-        # Edges
-        s, batch = self._begin_write(sys.CircuitEdgesTab)
-        cursor = self.sys.circuit_edges.create_cursor()
-        try:
-            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
-            while cursor.is_valid() and cursor.key() < end_key:
-                if cursor.weight() > 0:
-                    pk = cursor.key()
-                    acc = cursor.get_accessor()
-                    edge_id = intmask(r_uint64(pk))
-                    src = intmask(acc.get_int(sys.CircuitEdgesTab.COL_SRC_NODE))
-                    dst = intmask(acc.get_int(sys.CircuitEdgesTab.COL_DST_NODE))
-                    port = intmask(acc.get_int(sys.CircuitEdgesTab.COL_DST_PORT))
-                    sys.CircuitEdgesTab.retract(batch, s, vid, edge_id, src, dst, port)
-                cursor.advance()
-        finally:
-            cursor.close()
-        self._finish_write_sys(self.sys.circuit_edges, batch)
 
-        # Sources
-        s, batch = self._begin_write(sys.CircuitSourcesTab)
-        cursor = self.sys.circuit_sources.create_cursor()
-        try:
-            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
-            while cursor.is_valid() and cursor.key() < end_key:
-                if cursor.weight() > 0:
-                    pk = cursor.key()
-                    acc = cursor.get_accessor()
-                    node_id = intmask(r_uint64(pk))
-                    table_id = intmask(acc.get_int(sys.CircuitSourcesTab.COL_TABLE_ID))
-                    sys.CircuitSourcesTab.retract(batch, s, vid, node_id, table_id)
-                cursor.advance()
-        finally:
-            cursor.close()
-        self._finish_write_sys(self.sys.circuit_sources, batch)
+def catalog_create_view(handle, qualified_name, graph, sql_definition):
+    """Serialize CircuitGraph and call Rust create_view."""
+    import struct
 
-        # Params
-        s, batch = self._begin_write(sys.CircuitParamsTab)
-        cursor = self.sys.circuit_params.create_cursor()
-        try:
-            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
-            while cursor.is_valid() and cursor.key() < end_key:
-                if cursor.weight() > 0:
-                    pk = cursor.key()
-                    acc = cursor.get_accessor()
-                    lo64 = r_uint64(intmask(pk))
-                    node_id = intmask(lo64 >> 8)
-                    slot = intmask(lo64 & r_uint64(0xFF))
-                    value = intmask(acc.get_int(sys.CircuitParamsTab.COL_VALUE))
-                    str_value = None
-                    if not acc.is_null(sys.CircuitParamsTab.COL_STR_VALUE):
-                        str_value = sys.read_string(acc, sys.CircuitParamsTab.COL_STR_VALUE)
-                    sys.CircuitParamsTab.retract(batch, s, vid, node_id, slot, value, str_value)
-                cursor.advance()
-        finally:
-            cursor.close()
-        self._finish_write_sys(self.sys.circuit_params, batch)
+    name_buf = rffi.str2charp(qualified_name)
+    sql_buf = rffi.str2charp(sql_definition)
 
-        # Group cols
-        s, batch = self._begin_write(sys.CircuitGroupColsTab)
-        cursor = self.sys.circuit_group_cols.create_cursor()
-        try:
-            cursor.seek(r_uint64(0), r_uint64(intmask(r_uint64(vid))))
-            while cursor.is_valid() and cursor.key() < end_key:
-                if cursor.weight() > 0:
-                    pk = cursor.key()
-                    acc = cursor.get_accessor()
-                    lo64 = r_uint64(intmask(pk))
-                    node_id = intmask(lo64 >> 16)
-                    col_idx = intmask(lo64 & r_uint64(0xFFFF))
-                    sys.CircuitGroupColsTab.retract(batch, s, vid, node_id, col_idx)
-                cursor.advance()
-        finally:
-            cursor.close()
-        self._finish_write_sys(self.sys.circuit_group_cols, batch)
+    # Nodes: [nid, opcode] pairs as i32 flat array
+    nodes_data = lltype.nullptr(rffi.INTP.TO)
+    nodes_count = len(graph.nodes)
+    if nodes_count > 0:
+        nodes_data = lltype.malloc(rffi.INTP.TO, nodes_count * 2, flavor="raw")
+        for i in range(nodes_count):
+            nid, opcode = graph.nodes[i]
+            nodes_data[i * 2] = rffi.cast(rffi.INT, nid)
+            nodes_data[i * 2 + 1] = rffi.cast(rffi.INT, opcode)
 
-    # -- Private Write Helpers ------------------------------------------------
+    # Edges: [eid, src, dst, port] quads
+    edges_data = lltype.nullptr(rffi.INTP.TO)
+    edges_count = len(graph.edges)
+    if edges_count > 0:
+        edges_data = lltype.malloc(rffi.INTP.TO, edges_count * 4, flavor="raw")
+        for i in range(edges_count):
+            eid, src, dst, port = graph.edges[i]
+            edges_data[i * 4] = rffi.cast(rffi.INT, eid)
+            edges_data[i * 4 + 1] = rffi.cast(rffi.INT, src)
+            edges_data[i * 4 + 2] = rffi.cast(rffi.INT, dst)
+            edges_data[i * 4 + 3] = rffi.cast(rffi.INT, port)
 
-    def _begin_write(self, tab_class):
-        s = tab_class.schema()
-        return s, ArenaZSetBatch(s)
+    # Sources: [nid, table_id] pairs as i64
+    sources_data = lltype.nullptr(rffi.LONGLONGP.TO)
+    sources_count = len(graph.sources)
+    if sources_count > 0:
+        sources_data = lltype.malloc(rffi.LONGLONGP.TO, sources_count * 2, flavor="raw")
+        for i in range(sources_count):
+            nid, tid = graph.sources[i]
+            sources_data[i * 2] = rffi.cast(rffi.LONGLONG, nid)
+            sources_data[i * 2 + 1] = rffi.cast(rffi.LONGLONG, tid)
 
-    def _finish_write(self, family, batch):
-        ingest_to_family(family, batch)
-        batch.free()
+    # Params: [nid, slot, value] triples as i64
+    params_data = lltype.nullptr(rffi.LONGLONGP.TO)
+    params_count = len(graph.params)
+    if params_count > 0:
+        params_data = lltype.malloc(rffi.LONGLONGP.TO, params_count * 3, flavor="raw")
+        for i in range(params_count):
+            nid, slot, val = graph.params[i]
+            params_data[i * 3] = rffi.cast(rffi.LONGLONG, nid)
+            params_data[i * 3 + 1] = rffi.cast(rffi.LONGLONG, slot)
+            params_data[i * 3 + 2] = rffi.cast(rffi.LONGLONG, val)
 
-    def _finish_write_sys(self, sys_table, batch):
-        sys_table.ingest_batch(batch)
-        batch.free()
+    # Group cols: [nid, col_idx] pairs as i32
+    gcols_data = lltype.nullptr(rffi.INTP.TO)
+    gcols_count = len(graph.group_cols)
+    if gcols_count > 0:
+        gcols_data = lltype.malloc(rffi.INTP.TO, gcols_count * 2, flavor="raw")
+        for i in range(gcols_count):
+            nid, cidx = graph.group_cols[i]
+            gcols_data[i * 2] = rffi.cast(rffi.INT, nid)
+            gcols_data[i * 2 + 1] = rffi.cast(rffi.INT, cidx)
 
-    def _write_schema_record(self, sid, name):
-        s, batch = self._begin_write(sys.SchemaTab)
-        sys.SchemaTab.append(batch, s, sid, name)
-        self._finish_write(self._schemas_family, batch)
+    # Output col defs: serialized as [name_len(u32) + name(bytes) + type_code(u8)]
+    ocd_parts = []
+    for col_name, type_code in graph.output_col_defs:
+        name_bytes = col_name.encode("utf-8") if isinstance(col_name, unicode) else col_name
+        ocd_parts.append(struct.pack("<I", len(name_bytes)))
+        ocd_parts.append(name_bytes)
+        ocd_parts.append(struct.pack("<B", type_code))
+    ocd_buf_str = "".join(ocd_parts)
+    ocd_buf = rffi.str2charp(ocd_buf_str)
+    ocd_count = len(graph.output_col_defs)
 
-    def _retract_schema_record(self, sid, name):
-        s, batch = self._begin_write(sys.SchemaTab)
-        sys.SchemaTab.retract(batch, s, sid, name)
-        self._finish_write(self._schemas_family, batch)
+    # Dependencies
+    deps_data = lltype.nullptr(rffi.LONGLONGP.TO)
+    deps_count = len(graph.dependencies)
+    if deps_count > 0:
+        deps_data = lltype.malloc(rffi.LONGLONGP.TO, deps_count, flavor="raw")
+        for i in range(deps_count):
+            deps_data[i] = rffi.cast(rffi.LONGLONG, graph.dependencies[i])
 
-    def _write_table_record(self, tid, sid, name, directory, pk_idx, lsn, flags):
-        s, batch = self._begin_write(sys.TableTab)
-        sys.TableTab.append(batch, s, tid, sid, name, directory, pk_idx, lsn, flags)
-        self._finish_write(self._tables_family, batch)
+    try:
+        vid = engine_ffi._catalog_create_view(
+            handle,
+            rffi.cast(rffi.VOIDP, name_buf), rffi.cast(rffi.UINT, len(qualified_name)),
+            rffi.cast(rffi.VOIDP, sql_buf), rffi.cast(rffi.UINT, len(sql_definition)),
+            nodes_data, rffi.cast(rffi.UINT, nodes_count),
+            edges_data, rffi.cast(rffi.UINT, edges_count),
+            sources_data, rffi.cast(rffi.UINT, sources_count),
+            params_data, rffi.cast(rffi.UINT, params_count),
+            gcols_data, rffi.cast(rffi.UINT, gcols_count),
+            rffi.cast(rffi.VOIDP, ocd_buf), rffi.cast(rffi.UINT, len(ocd_buf_str)), rffi.cast(rffi.UINT, ocd_count),
+            deps_data, rffi.cast(rffi.UINT, deps_count),
+        )
+    finally:
+        rffi.free_charp(name_buf)
+        rffi.free_charp(sql_buf)
+        rffi.free_charp(ocd_buf)
+        if nodes_data:
+            lltype.free(nodes_data, flavor="raw")
+        if edges_data:
+            lltype.free(edges_data, flavor="raw")
+        if sources_data:
+            lltype.free(sources_data, flavor="raw")
+        if params_data:
+            lltype.free(params_data, flavor="raw")
+        if gcols_data:
+            lltype.free(gcols_data, flavor="raw")
+        if deps_data:
+            lltype.free(deps_data, flavor="raw")
 
-    def _retract_table_record(self, tid, sid, name, directory, pk_idx, lsn, flags):
-        s, batch = self._begin_write(sys.TableTab)
-        sys.TableTab.retract(batch, s, tid, sid, name, directory, pk_idx, lsn, flags)
-        self._finish_write(self._tables_family, batch)
+    if intmask(vid) < 0:
+        _check_ffi_result(rffi.cast(rffi.INT, -1), "create_view")
+    return intmask(vid)
 
-    def _write_view_record(self, vid, sid, name, sql_def, directory, lsn):
-        s, batch = self._begin_write(sys.ViewTab)
-        sys.ViewTab.append(batch, s, vid, sid, name, sql_def, directory, lsn)
-        self._finish_write(self._views_family, batch)
 
-    def _retract_view_record(self, vid, sid, name, sql_def, directory, lsn):
-        s, batch = self._begin_write(sys.ViewTab)
-        sys.ViewTab.retract(batch, s, vid, sid, name, sql_def, directory, lsn)
-        self._finish_write(self._views_family, batch)
+def catalog_drop_view(handle, qualified_name):
+    buf = rffi.str2charp(qualified_name)
+    try:
+        rc = engine_ffi._catalog_drop_view(
+            handle, rffi.cast(rffi.VOIDP, buf), rffi.cast(rffi.UINT, len(qualified_name)),
+        )
+    finally:
+        rffi.free_charp(buf)
+    _check_ffi_result(rc, "drop_view")
 
-    def _write_view_deps(self, vid, dep_ids):
-        s, batch = self._begin_write(sys.DepTab)
-        for dep_tid in dep_ids:
-            sys.DepTab.append(batch, s, vid, 0, dep_tid)
-        self._finish_write_sys(self.sys.view_deps, batch)
 
-    def _retract_view_deps(self, vid, deps_info):
-        s, batch = self._begin_write(sys.DepTab)
-        for dvid, dtid in deps_info:
-            sys.DepTab.retract(batch, s, vid, dvid, dtid)
-        self._finish_write_sys(self.sys.view_deps, batch)
+def catalog_create_index(handle, qualified_owner, col_name, is_unique):
+    owner_buf = rffi.str2charp(qualified_owner)
+    col_buf = rffi.str2charp(col_name)
+    try:
+        iid = engine_ffi._catalog_create_index(
+            handle,
+            rffi.cast(rffi.VOIDP, owner_buf), rffi.cast(rffi.UINT, len(qualified_owner)),
+            rffi.cast(rffi.VOIDP, col_buf), rffi.cast(rffi.UINT, len(col_name)),
+            rffi.cast(rffi.INT, int(is_unique)),
+        )
+    finally:
+        rffi.free_charp(owner_buf)
+        rffi.free_charp(col_buf)
+    if intmask(iid) < 0:
+        _check_ffi_result(rffi.cast(rffi.INT, -1), "create_index")
+    return intmask(iid)
 
-    def _write_column_records(self, oid, kind, columns):
-        s, batch = self._begin_write(sys.ColTab)
-        for i in range(len(columns)):
-            col = columns[i]
-            sys.ColTab.append(
-                batch, s, oid, kind, i, col.name, col.field_type.code,
-                int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
-            )
-        self._finish_write_sys(self.sys.columns, batch)
 
-    def _retract_column_records(self, oid, kind, columns):
-        s, batch = self._begin_write(sys.ColTab)
-        for i in range(len(columns)):
-            col = columns[i]
-            sys.ColTab.retract(
-                batch, s, oid, kind, i, col.name, col.field_type.code,
-                int(col.is_nullable), col.fk_table_id, col.fk_col_idx,
-            )
-        self._finish_write_sys(self.sys.columns, batch)
+def catalog_drop_index(handle, index_name):
+    buf = rffi.str2charp(index_name)
+    try:
+        rc = engine_ffi._catalog_drop_index(
+            handle, rffi.cast(rffi.VOIDP, buf), rffi.cast(rffi.UINT, len(index_name)),
+        )
+    finally:
+        rffi.free_charp(buf)
+    _check_ffi_result(rc, "drop_index")
 
-    def _write_index_record(self, idx_id, oid, kind, s_idx, name, unique, c_dir):
-        s, batch = self._begin_write(sys.IdxTab)
-        sys.IdxTab.append(batch, s, idx_id, oid, kind, s_idx, name, unique, c_dir)
-        self._finish_write(self._indices_family, batch)
 
-    def _retract_index_record(self, idx_id, oid, kind, s_idx, name, unique, c_dir):
-        s, batch = self._begin_write(sys.IdxTab)
-        sys.IdxTab.retract(batch, s, idx_id, oid, kind, s_idx, name, unique, c_dir)
-        self._finish_write(self._indices_family, batch)
-
-    def _advance_sequence(self, seq_id, old_val, new_val):
-        s, batch = self._begin_write(sys.SeqTab)
-        sys.SeqTab.retract(batch, s, seq_id, old_val)
-        sys.SeqTab.append(batch, s, seq_id, new_val)
-        self._finish_write_sys(self.sys.sequences, batch)
+def catalog_advance_sequence(handle, seq_id, old_val, new_val):
+    engine_ffi._catalog_advance_sequence(
+        handle,
+        rffi.cast(rffi.LONGLONG, seq_id),
+        rffi.cast(rffi.LONGLONG, old_val),
+        rffi.cast(rffi.LONGLONG, new_val),
+    )

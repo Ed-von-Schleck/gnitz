@@ -7,7 +7,7 @@
 import os
 from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
-from rpython.rtyper.lltypesystem import rffi
+from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz import log
 from gnitz.server import ipc, ipc_ffi
@@ -33,12 +33,12 @@ class MasterDispatcher(object):
                           "sal", "m2w_efds[*]", "w2m_efds[*]"]
 
     def __init__(self, num_workers, worker_pids, assignment,
-                 dag_handle, registry, sal, w2m_regions, m2w_efds, w2m_efds):
+                 dag_handle, catalog_handle, sal, w2m_regions, m2w_efds, w2m_efds):
         self.num_workers = num_workers
         self.worker_pids = worker_pids
         self.assignment = assignment
         self.dag_handle = dag_handle
-        self.registry = registry
+        self.catalog_handle = catalog_handle
         self.router = PartitionRouter(assignment)
         self.sal = sal                     # SharedAppendLog
         self.w2m_regions = w2m_regions     # list[W2MRegion]
@@ -424,6 +424,36 @@ class MasterDispatcher(object):
 
     # -----------------------------------------------------------------------
 
+    def _record_index_routing(self, target_id, per_worker_batches):
+        """Record unique-index routing from per-worker sub-batches via FFI."""
+        n_idx = intmask(engine_ffi._catalog_get_index_circuit_count(
+            self.catalog_handle, rffi.cast(rffi.LONGLONG, target_id)))
+        if n_idx == 0:
+            return
+        out_col = lltype.malloc(rffi.UINTP.TO, 1, flavor="raw")
+        out_uniq = lltype.malloc(rffi.INTP.TO, 1, flavor="raw")
+        out_tc = lltype.malloc(rffi.UCHARP.TO, 1, flavor="raw")
+        try:
+            for ci in range(n_idx):
+                rc = engine_ffi._catalog_get_index_circuit_info(
+                    self.catalog_handle,
+                    rffi.cast(rffi.LONGLONG, target_id),
+                    rffi.cast(rffi.UINT, ci),
+                    out_col, out_uniq, out_tc)
+                if intmask(rc) < 0:
+                    continue
+                if intmask(out_uniq[0]) != 0:
+                    col_idx = intmask(out_col[0])
+                    for w in range(self.num_workers):
+                        sb = per_worker_batches[w]
+                        if sb is not None and sb.length() > 0:
+                            self.router.record_routing(
+                                sb, target_id, col_idx, w)
+        finally:
+            lltype.free(out_col, flavor="raw")
+            lltype.free(out_uniq, flavor="raw")
+            lltype.free(out_tc, flavor="raw")
+
     def fan_out_push(self, target_id, batch, schema):
         """Split batch by worker partition, send sub-batches, collect ACKs.
         Handles mid-circuit exchange relay when workers send FLAG_EXCHANGE."""
@@ -442,7 +472,6 @@ class MasterDispatcher(object):
         finally:
             rffi.lltype.free(pv_vids, flavor="raw")
             rffi.lltype.free(pv_cols, flavor="raw")
-        family = self.registry.get_by_id(target_id)
 
         if len(preloadable) > 0:
             has_retraction = False
@@ -456,15 +485,7 @@ class MasterDispatcher(object):
         if len(preloadable) == 0:
             sub_batches = repartition_batch(
                 batch, [schema.pk_index], self.num_workers, self.assignment)
-            for ci in range(len(family.index_circuits)):
-                circuit = family.index_circuits[ci]
-                if circuit.is_unique:
-                    col_idx = circuit.source_col_idx
-                    for w in range(self.num_workers):
-                        sb = sub_batches[w]
-                        if sb is not None and sb.length() > 0:
-                            self.router.record_routing(
-                                sb, target_id, col_idx, w)
+            self._record_index_routing(target_id, sub_batches)
             self._send_to_workers(
                 target_id, ipc.FLAG_PUSH, sub_batches, schema)
             for w in range(self.num_workers):
@@ -479,15 +500,7 @@ class MasterDispatcher(object):
             all_batches = multi_scatter(
                 batch, col_specs, self.num_workers, self.assignment)
             pk_batches = all_batches[0]
-            for ci in range(len(family.index_circuits)):
-                circuit = family.index_circuits[ci]
-                if circuit.is_unique:
-                    col_idx = circuit.source_col_idx
-                    for w in range(self.num_workers):
-                        sb = pk_batches[w]
-                        if sb is not None and sb.length() > 0:
-                            self.router.record_routing(
-                                sb, target_id, col_idx, w)
+            self._record_index_routing(target_id, pk_batches)
             # Write preload groups (no sync yet)
             for si in range(len(preloadable)):
                 vid = preloadable[si][0]

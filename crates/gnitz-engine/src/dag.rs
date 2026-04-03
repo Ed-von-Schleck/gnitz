@@ -854,17 +854,18 @@ impl DagEngine {
 
         let schema = entry.schema;
 
-        // Stage 1: unique_pk enforcement (only for Single stores)
+        // Stage 1: unique_pk enforcement
         let effective_batch = if entry.unique_pk {
-            if let Some(table_ptr) = entry.handle.as_single() {
-                if !table_ptr.is_null() {
-                    let table = unsafe { &mut *table_ptr };
+            match &entry.handle {
+                StoreHandle::Single(ptr) if !ptr.is_null() => {
+                    let table = unsafe { &mut **ptr };
                     self.enforce_unique_pk(table, &schema, batch)
-                } else {
-                    batch
                 }
-            } else {
-                batch
+                StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
+                    let ptable = unsafe { &mut **ptr };
+                    self.enforce_unique_pk_partitioned(ptable, &schema, batch)
+                }
+                _ => batch,
             }
         } else {
             batch
@@ -909,6 +910,78 @@ impl DagEngine {
         }
 
         0
+    }
+
+    /// Ingest a batch and return the effective batch (after unique_pk enforcement).
+    /// The effective batch is what downstream views need to see.
+    /// Returns (rc, Option<OwnedBatch>).
+    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: OwnedBatch) -> (i32, Option<OwnedBatch>) {
+        let entry = match self.tables.get(&table_id) {
+            Some(e) => e,
+            None => {
+                gnitz_warn!("dag: ingest_returning_effective — table_id={} not registered", table_id);
+                return (-1, None);
+            }
+        };
+
+        let schema = entry.schema;
+
+        // Stage 1: unique_pk enforcement
+        let effective_batch = if entry.unique_pk {
+            match &entry.handle {
+                StoreHandle::Single(ptr) if !ptr.is_null() => {
+                    let table = unsafe { &mut **ptr };
+                    self.enforce_unique_pk(table, &schema, batch)
+                }
+                StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
+                    let ptable = unsafe { &mut **ptr };
+                    self.enforce_unique_pk_partitioned(ptable, &schema, batch)
+                }
+                _ => batch,
+            }
+        } else {
+            batch
+        };
+
+        if effective_batch.count == 0 {
+            return (0, Some(effective_batch));
+        }
+
+        // Stage 2: ingest into store
+        let npc = effective_batch.col_data.len();
+        let (ptrs, sizes) = effective_batch.to_region_ptrs();
+        match &entry.handle {
+            StoreHandle::Single(ptr) if !ptr.is_null() => {
+                let table = unsafe { &mut **ptr };
+                let _ = table.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
+            }
+            StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
+                let ptable = unsafe { &mut **ptr };
+                let _ = ptable.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
+            }
+            _ => {
+                gnitz_warn!("dag: ingest_returning_effective — table_id={} has null store handle", table_id);
+                return (-2, None);
+            }
+        }
+
+        // Stage 3: index projection
+        for ic in &entry.index_circuits {
+            if ic.index_handle.is_null() { continue; }
+            let idx_batch = Self::batch_project_index(
+                &effective_batch, ic.col_idx, &schema, &ic.index_schema,
+            );
+            if idx_batch.count > 0 {
+                let idx_table = unsafe { &mut *ic.index_handle };
+                let idx_npc = idx_batch.col_data.len();
+                let (idx_ptrs, idx_sizes) = idx_batch.to_region_ptrs();
+                let _ = idx_table.ingest_batch_from_regions(
+                    &idx_ptrs, &idx_sizes, idx_batch.count as u32, idx_npc,
+                );
+            }
+        }
+
+        (0, Some(effective_batch))
     }
 
     /// Flush a table's WAL.
@@ -1182,6 +1255,7 @@ impl DagEngine {
 
     /// Enforce unique PK semantics: retract existing rows before inserting.
     /// Port of `registry._enforce_unique_pk()`.
+    /// Used for Single (view) stores where retractions don't need to propagate.
     fn enforce_unique_pk(
         &self,
         table: &mut Table,
@@ -1219,6 +1293,69 @@ impl DagEngine {
             } else if w < 0 {
                 // Negative weight = deletion
                 effective.append_batch(&batch, row, row + 1);
+            }
+        }
+
+        effective
+    }
+
+    /// Enforce unique PK for PartitionedTable (user base tables).
+    ///
+    /// Unlike `enforce_unique_pk` for Single stores, this version propagates
+    /// retraction rows into the effective batch.  Downstream views need to see
+    /// `(-1, old_row)` + `(+1, new_row)` to incrementally update.
+    fn enforce_unique_pk_partitioned(
+        &self,
+        ptable: &mut crate::partitioned_table::PartitionedTable,
+        schema: &SchemaDescriptor,
+        batch: OwnedBatch,
+    ) -> OwnedBatch {
+        if batch.count == 0 {
+            return batch;
+        }
+
+        let mut effective = OwnedBatch::with_schema(*schema, batch.count * 2);
+        let mut seen: HashMap<(u64, u64), usize> = HashMap::new();
+
+        for row in 0..batch.count {
+            let w = batch.get_weight(row);
+            let pk_lo = batch.get_pk_lo(row);
+            let pk_hi = batch.get_pk_hi(row);
+
+            if w > 0 {
+                // Check store for existing row with this PK
+                let (_existing_w, found) = ptable.retract_pk(pk_lo, pk_hi);
+                if found {
+                    // Emit retraction of existing stored row so downstream views
+                    // see the removal of the old payload.
+                    effective.append_row_from_ptable_found(ptable, pk_lo, pk_hi, -1);
+                }
+
+                // Intra-batch dedup: retract previous insertion of same PK
+                if let Some(&prev_pos) = seen.get(&(pk_lo, pk_hi)) {
+                    effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
+                }
+
+                // Add the new insertion
+                effective.append_batch(&batch, row, row + 1);
+                seen.insert((pk_lo, pk_hi), effective.count - 1);
+            } else if w < 0 {
+                // Negative weight = explicit retraction
+                let (_existing_w, found) = ptable.retract_pk(pk_lo, pk_hi);
+                if found {
+                    // Emit retraction using stored payload (the actual column data)
+                    effective.append_row_from_ptable_found(ptable, pk_lo, pk_hi, -1);
+                }
+
+                // Intra-batch dedup: if this PK was inserted earlier in this batch,
+                // negate that insertion to cancel it out.
+                if let Some(&prev_pos) = seen.get(&(pk_lo, pk_hi)) {
+                    effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
+                    seen.remove(&(pk_lo, pk_hi));
+                } else if !found {
+                    // Not in store and not in batch — pass through as-is
+                    effective.append_batch(&batch, row, row + 1);
+                }
             }
         }
 

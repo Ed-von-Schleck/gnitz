@@ -48,6 +48,7 @@ fn relocate_string_cell(
 ///
 /// Used as the primary FFI batch handle (`gnitz_batch_*`), as well as
 /// internally by MemTable, Table, and PartitionedTable.
+#[derive(Clone)]
 pub struct OwnedBatch {
     pub pk_lo: Vec<u8>,
     pub pk_hi: Vec<u8>,
@@ -510,6 +511,56 @@ impl OwnedBatch {
         }
 
         self.count += n;
+        self.sorted = false;
+        self.consolidated = false;
+    }
+
+    /// Copy the found row from a PartitionedTable into this batch.
+    /// Must be called after `ptable.retract_pk()` returned found=true.
+    /// The `schema` must match `self.schema`.
+    pub fn append_row_from_ptable_found(
+        &mut self,
+        ptable: &crate::partitioned_table::PartitionedTable,
+        pk_lo: u64,
+        pk_hi: u64,
+        weight: i64,
+    ) {
+        let schema = self.schema.expect("append_row_from_ptable_found requires schema");
+        let pk_index = schema.pk_index as usize;
+        let null_word = ptable.found_null_word();
+
+        self.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
+        self.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
+        self.weight.extend_from_slice(&weight.to_le_bytes());
+        self.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+
+        let mut pi = 0usize;
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index { continue; }
+            let col_desc = &schema.columns[ci];
+            let cs = col_desc.size as usize;
+            let is_null = (null_word >> pi) & 1 != 0;
+            if is_null {
+                let new_len = self.col_data[pi].len() + cs;
+                self.col_data[pi].resize(new_len, 0);
+            } else if col_desc.type_code == crate::compact::type_code::STRING {
+                let src = ptable.found_col_ptr(pi, cs);
+                assert!(!src.is_null());
+                let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
+                crate::ops::write_string_from_raw(
+                    &mut self.col_data[pi], &mut self.blob,
+                    src_slice, ptable.found_blob_ptr(),
+                );
+            } else {
+                let src = ptable.found_col_ptr(pi, cs);
+                assert!(!src.is_null());
+                let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
+                self.col_data[pi].extend_from_slice(src_slice);
+            }
+            pi += 1;
+        }
+
+        self.count += 1;
         self.sorted = false;
         self.consolidated = false;
     }

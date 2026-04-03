@@ -436,6 +436,7 @@ pub struct CatalogEngine {
     // --- Per-table metadata (not tracked by DagEngine) ---
     schema_ids: HashMap<i64, i64>,        // table_id -> schema_id
     pk_col_indices: HashMap<i64, u32>,    // table_id -> pk_col_idx
+    col_names_cache: HashMap<i64, Vec<String>>,  // table_id -> column names
 
     // --- System tables (owned, single-partition, durable) ---
     sys_schemas: Box<Table>,
@@ -617,6 +618,7 @@ impl CatalogEngine {
             index_by_id: HashMap::new(),
             schema_ids: HashMap::new(),
             pk_col_indices: HashMap::new(),
+            col_names_cache: HashMap::new(),
             sys_schemas,
             sys_tables,
             sys_views,
@@ -1061,6 +1063,14 @@ impl CatalogEngine {
                     continue;
                 }
 
+                // Validate PK type (must be U64 or U128)
+                if (pk_col_idx as usize) < col_defs.len() {
+                    let pk_type = col_defs[pk_col_idx as usize].type_code;
+                    if pk_type != type_code::U64 && pk_type != type_code::U128 {
+                        return Err(format!("Primary Key must be TYPE_U64 or TYPE_U128, got type_code={}", pk_type));
+                    }
+                }
+
                 let schema_name = self.schema_id_to_name.get(&sid)
                     .cloned().unwrap_or_default();
                 let directory = format!("{}/{}/{}_{}", self.base_dir, schema_name, name, tid);
@@ -1134,6 +1144,7 @@ impl CatalogEngine {
                     }
 
                     self.dag.unregister_table(tid);
+                    self.col_names_cache.remove(&tid);
                     // Clean up registry
                     if let Some((sn, tn)) = self.id_to_qualified.remove(&tid) {
                         let qualified = format!("{}.{}", sn, tn);
@@ -1230,6 +1241,7 @@ impl CatalogEngine {
             } else {
                 if self.dag.tables.contains_key(&vid) {
                     self.dag.unregister_table(vid);
+                    self.col_names_cache.remove(&vid);
                     if let Some((sn, tn)) = self.id_to_qualified.remove(&vid) {
                         let qualified = format!("{}.{}", sn, tn);
                         self.name_to_id.remove(&qualified);
@@ -2183,6 +2195,465 @@ impl CatalogEngine {
         // The runtime correctly ignores them because the plan cache is invalidated.
     }
 
+    // -- System table accessor -----------------------------------------------
+
+    /// Map a system table ID to a mutable reference. Returns None for unknown IDs.
+    fn sys_table_mut(&mut self, table_id: i64) -> Option<&mut Table> {
+        match table_id {
+            SCHEMA_TAB_ID => Some(&mut self.sys_schemas),
+            TABLE_TAB_ID => Some(&mut self.sys_tables),
+            VIEW_TAB_ID => Some(&mut self.sys_views),
+            COL_TAB_ID => Some(&mut self.sys_columns),
+            IDX_TAB_ID => Some(&mut self.sys_indices),
+            DEP_TAB_ID => Some(&mut self.sys_view_deps),
+            SEQ_TAB_ID => Some(&mut self.sys_sequences),
+            CIRCUIT_NODES_TAB_ID => Some(&mut self.sys_circuit_nodes),
+            CIRCUIT_EDGES_TAB_ID => Some(&mut self.sys_circuit_edges),
+            CIRCUIT_SOURCES_TAB_ID => Some(&mut self.sys_circuit_sources),
+            CIRCUIT_PARAMS_TAB_ID => Some(&mut self.sys_circuit_params),
+            CIRCUIT_GROUP_COLS_TAB_ID => Some(&mut self.sys_circuit_group_cols),
+            _ => None,
+        }
+    }
+
+    // -- Server ingestion / scan / seek / flush -----------------------------
+
+    /// Ingest a batch into a table family (unique_pk + store + index projection + hooks).
+    /// For system tables: fires hooks after ingestion.
+    /// For user tables: delegates to DagEngine::ingest_to_family.
+    pub fn ingest_to_family(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
+        if table_id < FIRST_USER_TABLE_ID {
+            // System table: ingest into owned Table, then fire hooks.
+            let schema = sys_tab_schema(table_id);
+            let table: &mut Table = match table_id {
+                SCHEMA_TAB_ID => &mut self.sys_schemas,
+                TABLE_TAB_ID => &mut self.sys_tables,
+                VIEW_TAB_ID => &mut self.sys_views,
+                COL_TAB_ID => &mut self.sys_columns,
+                IDX_TAB_ID => &mut self.sys_indices,
+                DEP_TAB_ID => &mut self.sys_view_deps,
+                SEQ_TAB_ID => &mut self.sys_sequences,
+                CIRCUIT_NODES_TAB_ID => &mut self.sys_circuit_nodes,
+                CIRCUIT_EDGES_TAB_ID => &mut self.sys_circuit_edges,
+                CIRCUIT_SOURCES_TAB_ID => &mut self.sys_circuit_sources,
+                CIRCUIT_PARAMS_TAB_ID => &mut self.sys_circuit_params,
+                CIRCUIT_GROUP_COLS_TAB_ID => &mut self.sys_circuit_group_cols,
+                _ => return Err(format!("Unknown system table_id {}", table_id)),
+            };
+            // Clone batch before ingest (hooks need to read it after table borrows it)
+            let mut batch_for_hooks = batch.clone();
+            batch_for_hooks.schema = Some(schema);
+            ingest_batch_into(table, &batch);
+            self.fire_hooks(table_id, &batch_for_hooks)?;
+            Ok(())
+        } else {
+            // User table: DagEngine handles unique_pk, store ingest, index projection.
+            let rc = self.dag.ingest_to_family(table_id, batch);
+            if rc < 0 {
+                Err(format!("ingest_to_family failed for table_id={} rc={}", table_id, rc))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Ingest a user-table batch and return the effective delta (after unique_pk
+    /// dedup).  Used by multi-worker push where the worker needs the effective
+    /// batch for later DAG evaluation but does NOT evaluate immediately.
+    /// System tables are NOT supported (use `ingest_to_family` for those).
+    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: OwnedBatch) -> Result<OwnedBatch, String> {
+        if table_id < FIRST_USER_TABLE_ID {
+            return Err("ingest_returning_effective not supported for system tables".to_string());
+        }
+        let (rc, effective_opt) = self.dag.ingest_returning_effective(table_id, batch);
+        if rc < 0 {
+            return Err(format!("ingest failed for table_id={} rc={}", table_id, rc));
+        }
+        match effective_opt {
+            Some(eff) => Ok(eff),
+            None => Err(format!("ingest returned no effective batch for table_id={}", table_id)),
+        }
+    }
+
+    /// Ingest a batch into a user table AND run the single-worker DAG cascade.
+    /// For unique_pk tables, the effective batch (with auto-retractions) is
+    /// passed to the DAG evaluator so views see correct deltas.
+    /// System tables are NOT supported; use ingest_to_family for those.
+    pub fn push_and_evaluate(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
+        if table_id < FIRST_USER_TABLE_ID {
+            return Err("push_and_evaluate not supported for system tables".to_string());
+        }
+
+        let (rc, effective_opt) = self.dag.ingest_returning_effective(table_id, batch);
+        if rc < 0 {
+            return Err(format!("ingest failed for table_id={} rc={}", table_id, rc));
+        }
+
+        // Flush the source table
+        let _ = self.dag.flush(table_id);
+
+        // Run DAG cascade with the effective batch
+        if let Some(effective) = effective_opt {
+            if effective.count > 0 {
+                self.dag.evaluate_dag(table_id, effective);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Scan all positive-weight rows from a table.
+    pub fn scan_family(&mut self, table_id: i64) -> Result<OwnedBatch, String> {
+        let schema = if table_id < FIRST_USER_TABLE_ID {
+            sys_tab_schema(table_id)
+        } else {
+            self.dag.tables.get(&table_id)
+                .map(|e| e.schema)
+                .ok_or_else(|| format!("Unknown table_id {}", table_id))?
+        };
+        Ok(self.scan_store(table_id, &schema))
+    }
+
+    /// Point lookup by PK. Returns a single-row batch if found, None otherwise.
+    pub fn seek_family(&mut self, table_id: i64, pk_lo: u64, pk_hi: u64) -> Result<Option<OwnedBatch>, String> {
+        let schema = if table_id < FIRST_USER_TABLE_ID {
+            sys_tab_schema(table_id)
+        } else {
+            self.dag.tables.get(&table_id)
+                .map(|e| e.schema)
+                .ok_or_else(|| format!("Unknown table_id {}", table_id))?
+        };
+
+        // Create cursor and seek
+        let cursor_result = if table_id < FIRST_USER_TABLE_ID {
+            let table: &mut Table = match table_id {
+                SCHEMA_TAB_ID => &mut self.sys_schemas,
+                TABLE_TAB_ID => &mut self.sys_tables,
+                VIEW_TAB_ID => &mut self.sys_views,
+                COL_TAB_ID => &mut self.sys_columns,
+                IDX_TAB_ID => &mut self.sys_indices,
+                DEP_TAB_ID => &mut self.sys_view_deps,
+                SEQ_TAB_ID => &mut self.sys_sequences,
+                _ => return Ok(None),
+            };
+            table.create_cursor()
+        } else {
+            let entry = self.dag.tables.get(&table_id).unwrap();
+            match &entry.handle {
+                StoreHandle::Single(ptr) if !ptr.is_null() => {
+                    let table = unsafe { &mut **ptr };
+                    table.create_cursor()
+                }
+                StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
+                    let ptable = unsafe { &mut **ptr };
+                    ptable.create_cursor()
+                }
+                _ => return Ok(None),
+            }
+        };
+
+        let mut cursor = match cursor_result {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
+
+        cursor.cursor.seek(pk_lo, pk_hi);
+        if !cursor.cursor.valid { return Ok(None); }
+        if cursor.cursor.current_key_lo != pk_lo || cursor.cursor.current_key_hi != pk_hi {
+            return Ok(None);
+        }
+        if cursor.cursor.current_weight <= 0 { return Ok(None); }
+
+        let mut batch = OwnedBatch::with_schema(schema, 1);
+        self.copy_cursor_row_to_batch(&cursor, &schema, &mut batch);
+        Ok(Some(batch))
+    }
+
+    /// Index-assisted lookup: look up by secondary index key, resolve to source row.
+    pub fn seek_by_index(&mut self, table_id: i64, col_idx: u32, key_lo: u64, key_hi: u64)
+        -> Result<Option<OwnedBatch>, String>
+    {
+        let entry = self.dag.tables.get(&table_id)
+            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
+
+        // Find matching index circuit
+        let ic = entry.index_circuits.iter()
+            .find(|ic| ic.col_idx == col_idx)
+            .ok_or_else(|| format!("No index on col_idx {} for table {}", col_idx, table_id))?;
+
+        if ic.index_handle.is_null() {
+            return Ok(None);
+        }
+
+        // Seek in index table
+        let idx_table = unsafe { &mut *ic.index_handle };
+        let mut cursor = idx_table.create_cursor().map_err(|e| format!("cursor error: {}", e))?;
+        cursor.cursor.seek(key_lo, key_hi);
+        if !cursor.cursor.valid { return Ok(None); }
+        if cursor.cursor.current_key_lo != key_lo || cursor.cursor.current_key_hi != key_hi {
+            return Ok(None);
+        }
+        if cursor.cursor.current_weight <= 0 { return Ok(None); }
+
+        // Index payload column 0 is the source table PK.
+        // Read it and resolve to the source row.
+        let idx_schema = &ic.index_schema;
+        let payload_col_idx = if idx_schema.pk_index == 0 { 1usize } else { 0usize };
+        let pk_size = idx_schema.columns[payload_col_idx].size as usize;
+        let ptr = cursor.cursor.col_ptr(payload_col_idx, pk_size);
+        if ptr.is_null() { return Ok(None); }
+        let (src_pk_lo, src_pk_hi) = if pk_size == 16 {
+            let lo = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr, 8) }.try_into().unwrap());
+            let hi = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr.add(8), 8) }.try_into().unwrap());
+            (lo, hi)
+        } else {
+            let mut buf = [0u8; 8];
+            let copy_len = pk_size.min(8);
+            unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len) };
+            (u64::from_le_bytes(buf), 0u64)
+        };
+
+        self.seek_family(table_id, src_pk_lo, src_pk_hi)
+    }
+
+    /// Flush a table's WAL.
+    pub fn flush_family(&mut self, table_id: i64) -> Result<(), String> {
+        if table_id < FIRST_USER_TABLE_ID {
+            if let Some(table) = self.sys_table_mut(table_id) {
+                table.flush().map_err(|e| format!("flush error: {}", e))?;
+            }
+            Ok(())
+        } else {
+            let rc = self.dag.flush(table_id);
+            if rc < 0 {
+                Err(format!("flush failed for table_id={} rc={}", table_id, rc))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Worker DDL sync: memonly ingest into system table + fire hooks.
+    /// Workers receive DDL deltas from master and need to update their registry
+    /// without writing to WAL (master owns durability).
+    pub fn ddl_sync(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
+        if table_id >= FIRST_USER_TABLE_ID {
+            return Err("ddl_sync only for system tables".into());
+        }
+        let table: &mut Table = match table_id {
+            SCHEMA_TAB_ID => &mut self.sys_schemas,
+            TABLE_TAB_ID => &mut self.sys_tables,
+            VIEW_TAB_ID => &mut self.sys_views,
+            COL_TAB_ID => &mut self.sys_columns,
+            IDX_TAB_ID => &mut self.sys_indices,
+            DEP_TAB_ID => &mut self.sys_view_deps,
+            SEQ_TAB_ID => &mut self.sys_sequences,
+            CIRCUIT_NODES_TAB_ID => &mut self.sys_circuit_nodes,
+            CIRCUIT_EDGES_TAB_ID => &mut self.sys_circuit_edges,
+            CIRCUIT_SOURCES_TAB_ID => &mut self.sys_circuit_sources,
+            CIRCUIT_PARAMS_TAB_ID => &mut self.sys_circuit_params,
+            CIRCUIT_GROUP_COLS_TAB_ID => &mut self.sys_circuit_group_cols,
+            _ => return Err(format!("Unknown system table_id {}", table_id)),
+        };
+        // Memonly ingest (no WAL)
+        let npc = batch.col_data.len();
+        let (ptrs, sizes) = batch.to_region_ptrs();
+        let _ = table.ingest_batch_memonly_from_regions(&ptrs, &sizes, batch.count as u32, npc);
+        // Fire hooks to update registry
+        self.fire_hooks(table_id, &batch)?;
+        Ok(())
+    }
+
+    /// Raw store ingest: SAL recovery path — no unique_pk, no hooks, no index projection.
+    pub fn raw_store_ingest(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
+        let entry = self.dag.tables.get(&table_id)
+            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
+        let npc = batch.col_data.len();
+        let (ptrs, sizes) = batch.to_region_ptrs();
+        match &entry.handle {
+            StoreHandle::Single(ptr) if !ptr.is_null() => {
+                let table = unsafe { &mut **ptr };
+                let _ = table.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
+            }
+            StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
+                let ptable = unsafe { &mut **ptr };
+                let _ = ptable.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
+            }
+            _ => return Err(format!("Null store for table_id {}", table_id)),
+        }
+        Ok(())
+    }
+
+    // -- Partition management (for multi-worker fork) -------------------------
+
+    /// Set active partition range for user tables.
+    pub fn set_active_partitions(&mut self, start: u32, end: u32) {
+        self.active_part_start = start;
+        self.active_part_end = end;
+    }
+
+    /// Close all partitions in user tables (master after fork).
+    pub fn close_user_table_partitions(&mut self) {
+        for (&tid, entry) in &self.dag.tables {
+            if tid < FIRST_USER_TABLE_ID { continue; }
+            if let StoreHandle::Partitioned(ptr) = &entry.handle {
+                if !ptr.is_null() {
+                    let ptable = unsafe { &mut **ptr };
+                    ptable.close_all_partitions();
+                }
+            }
+        }
+    }
+
+    /// Trim worker partitions to assigned range.
+    pub fn trim_worker_partitions(&mut self, start: u32, end: u32) {
+        for (&tid, entry) in &self.dag.tables {
+            if tid < FIRST_USER_TABLE_ID { continue; }
+            if let StoreHandle::Partitioned(ptr) = &entry.handle {
+                if !ptr.is_null() {
+                    let ptable = unsafe { &mut **ptr };
+                    ptable.close_partitions_outside(start, end);
+                }
+            }
+        }
+    }
+
+    /// Disable WAL on all user tables (workers use SAL for durability).
+    pub fn disable_user_table_wal(&mut self) {
+        for (&tid, entry) in &self.dag.tables {
+            if tid < FIRST_USER_TABLE_ID { continue; }
+            if let StoreHandle::Partitioned(ptr) = &entry.handle {
+                if !ptr.is_null() {
+                    let ptable = unsafe { &mut **ptr };
+                    ptable.set_has_wal(false);
+                }
+            }
+        }
+    }
+
+    /// Invalidate all cached plans.
+    pub fn invalidate_all_plans(&mut self) {
+        self.dag.invalidate_all();
+    }
+
+    // -- FK / index metadata queries (for distributed validation) -------------
+
+    /// Number of FK constraints on a table.
+    pub fn get_fk_count(&self, table_id: i64) -> usize {
+        self.fk_constraints.get(&table_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Get FK constraint at index: (fk_col_idx, target_table_id).
+    pub fn get_fk_constraint(&self, table_id: i64, idx: usize) -> Option<(usize, i64)> {
+        self.fk_constraints.get(&table_id)
+            .and_then(|v| v.get(idx))
+            .map(|c| (c.fk_col_idx, c.target_table_id))
+    }
+
+    /// Get FK column type code (for promote_to_key in distributed validation).
+    pub fn get_fk_col_type(&self, table_id: i64, fk_col_idx: usize) -> u8 {
+        self.dag.tables.get(&table_id)
+            .map(|e| e.schema.columns[fk_col_idx].type_code)
+            .unwrap_or(0)
+    }
+
+    /// Number of index circuits on a table.
+    pub fn get_index_circuit_count(&self, table_id: i64) -> usize {
+        self.dag.tables.get(&table_id)
+            .map(|e| e.index_circuits.len())
+            .unwrap_or(0)
+    }
+
+    /// Get index circuit info at index: (col_idx, is_unique, type_code).
+    pub fn get_index_circuit_info(&self, table_id: i64, idx: usize)
+        -> Option<(u32, bool, u8)>
+    {
+        self.dag.tables.get(&table_id)
+            .and_then(|e| e.index_circuits.get(idx))
+            .map(|ic| {
+                let type_code = self.dag.tables.get(&table_id)
+                    .map(|e| e.schema.columns[ic.col_idx as usize].type_code)
+                    .unwrap_or(0);
+                (ic.col_idx, ic.is_unique, type_code)
+            })
+    }
+
+    /// Get index store handle for a specific column index (for worker has_pk via index).
+    pub fn get_index_store_handle(&self, table_id: i64, col_idx: u32) -> *mut Table {
+        self.dag.tables.get(&table_id)
+            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == col_idx))
+            .map(|ic| ic.index_handle)
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Get column names for a table/view. Cached after first lookup.
+    pub fn get_column_names(&mut self, table_id: i64) -> Vec<String> {
+        if let Some(names) = self.col_names_cache.get(&table_id) {
+            return names.clone();
+        }
+        let names = match self.read_column_defs(table_id) {
+            Ok(defs) => defs.into_iter().map(|cd| cd.name).collect(),
+            Err(_) => Vec::new(),
+        };
+        self.col_names_cache.insert(table_id, names.clone());
+        names
+    }
+
+    // -- Store handle accessors -----------------------------------------------
+
+    /// Get raw PartitionedTable handle for a user table.
+    pub fn get_ptable_handle(&self, table_id: i64) -> Option<*mut PartitionedTable> {
+        self.dag.tables.get(&table_id).and_then(|e| {
+            match &e.handle {
+                StoreHandle::Partitioned(ptr) if !ptr.is_null() => Some(*ptr),
+                _ => None,
+            }
+        })
+    }
+
+    /// Get schema descriptor for a table.
+    pub fn get_schema_desc(&self, table_id: i64) -> Option<SchemaDescriptor> {
+        if table_id < FIRST_USER_TABLE_ID {
+            Some(sys_tab_schema(table_id))
+        } else {
+            self.dag.tables.get(&table_id).map(|e| e.schema)
+        }
+    }
+
+    /// Get mutable DagEngine pointer (for FFI — returns raw pointer to self.dag).
+    pub fn get_dag_ptr(&mut self) -> *mut DagEngine {
+        &mut self.dag as *mut DagEngine
+    }
+
+    // -- Iteration helpers ----------------------------------------------------
+
+    /// Collect all user table IDs.
+    pub fn iter_user_table_ids(&self) -> Vec<i64> {
+        self.dag.tables.keys()
+            .filter(|&&tid| tid >= FIRST_USER_TABLE_ID)
+            .copied()
+            .collect()
+    }
+
+    /// Get max flushed LSN for a table (for SAL recovery).
+    pub fn get_max_flushed_lsn(&self, table_id: i64) -> u64 {
+        let entry = match self.dag.tables.get(&table_id) {
+            Some(e) => e,
+            None => return 0,
+        };
+        match &entry.handle {
+            StoreHandle::Single(ptr) if !ptr.is_null() => {
+                let table = unsafe { &**ptr };
+                table.current_lsn
+            }
+            StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
+                let ptable = unsafe { &**ptr };
+                ptable.current_lsn()
+            }
+            _ => 0,
+        }
+    }
+
     // -- Close engine ------------------------------------------------------
 
     pub fn close(&mut self) {
@@ -2284,6 +2755,128 @@ impl CatalogEngine {
                         "Foreign Key violation in '{}.{}': value not found in target '{}.{}'",
                         sn, tn, tsn, ttn
                     ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate unique index constraints (single-worker path).
+    /// For each unique index on this table, checks that no positive-weight row
+    /// in the batch introduces a duplicate index key.
+    ///
+    /// For unique_pk tables, UPSERT rows (PK already exists) get special
+    /// handling: the old index entry will be retracted by enforce_unique_pk,
+    /// so we only reject if the NEW value collides with a DIFFERENT row's entry.
+    pub fn validate_unique_indices(&mut self, table_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+        let entry = self.dag.tables.get(&table_id)
+            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
+
+        // Quick check: any unique index circuits?
+        let has_unique = entry.index_circuits.iter().any(|ic| ic.is_unique);
+        if !has_unique { return Ok(()); }
+
+        let schema = entry.schema;
+        let pk_index = schema.pk_index as usize;
+
+        for ic in &entry.index_circuits {
+            if !ic.is_unique { continue; }
+            if ic.index_handle.is_null() { continue; }
+
+            let source_col_idx = ic.col_idx as usize;
+            let col_type = schema.columns[source_col_idx].type_code;
+            let payload_col = if source_col_idx < pk_index {
+                source_col_idx
+            } else {
+                source_col_idx - 1
+            };
+
+            let idx_table = unsafe { &mut *ic.index_handle };
+
+            // Track seen keys for batch-internal duplicate detection
+            let mut seen: HashMap<(u64, u64), bool> = HashMap::new();
+
+            for row in 0..batch.count {
+                if batch.get_weight(row) <= 0 { continue; }
+
+                // Skip null values
+                let null_word = batch.get_null_word(row);
+                if null_word & (1u64 << payload_col) != 0 { continue; }
+
+                let row_pk_lo = batch.get_pk_lo(row);
+                let row_pk_hi = batch.get_pk_hi(row);
+
+                // Determine if this is an UPSERT (PK already exists in store)
+                let is_upsert = if entry.unique_pk {
+                    match &entry.handle {
+                        StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
+                            let ptable = unsafe { &mut **ptr };
+                            ptable.has_pk(row_pk_lo, row_pk_hi)
+                        }
+                        StoreHandle::Single(ptr) if !ptr.is_null() => {
+                            let table = unsafe { &mut **ptr };
+                            table.has_pk(row_pk_lo, row_pk_hi)
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+
+                // Promote column value to index key
+                let (key_lo, key_hi) = self.promote_to_pk_key(batch, row, payload_col, col_type);
+
+                // Batch-internal duplicate check
+                if seen.contains_key(&(key_lo, key_hi)) {
+                    let col_names = self.get_column_names(table_id);
+                    let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
+                    return Err(format!(
+                        "Unique index violation on column '{}': duplicate in batch", cname
+                    ));
+                }
+                seen.insert((key_lo, key_hi), true);
+
+                // Check index store for existing key
+                if idx_table.has_pk(key_lo, key_hi) {
+                    if is_upsert {
+                        // For UPSERT: the index entry might belong to this same row
+                        // (same value being re-inserted). Check the index payload (source PK).
+                        // Index schema: PK = index_key, payload[0] = source_pk.
+                        let (_net_w, found) = idx_table.retract_pk(key_lo, key_hi);
+                        if found {
+                            // Read the source PK from the index entry's payload
+                            let idx_schema = &ic.index_schema;
+                            let pk_payload_col = 0usize; // first (only) payload column
+                            let pk_size = idx_schema.columns[if idx_schema.pk_index == 0 { 1 } else { 0 }].size as usize;
+                            let ptr = idx_table.found_col_ptr(pk_payload_col, pk_size);
+                            if !ptr.is_null() {
+                                let (src_pk_lo, src_pk_hi) = if pk_size == 16 {
+                                    let lo = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr, 8) }.try_into().unwrap());
+                                    let hi = u64::from_le_bytes(unsafe { std::slice::from_raw_parts(ptr.add(8), 8) }.try_into().unwrap());
+                                    (lo, hi)
+                                } else {
+                                    let mut buf = [0u8; 8];
+                                    unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), pk_size.min(8)) };
+                                    (u64::from_le_bytes(buf), 0u64)
+                                };
+                                // If the index entry belongs to a DIFFERENT PK, it's a violation
+                                if src_pk_lo != row_pk_lo || src_pk_hi != row_pk_hi {
+                                    let col_names = self.get_column_names(table_id);
+                                    let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
+                                    return Err(format!(
+                                        "Unique index violation on column '{}'", cname
+                                    ));
+                                }
+                                // Same PK — this is fine, enforce_unique_pk will handle it
+                            }
+                        }
+                    } else {
+                        let col_names = self.get_column_names(table_id);
+                        let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
+                        return Err(format!(
+                            "Unique index violation on column '{}'", cname
+                        ));
+                    }
                 }
             }
         }
@@ -3447,6 +4040,503 @@ mod tests {
         assert!(!engine2.has_schema("app"));
 
         engine2.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ingest_scan_seek_family() {
+        let dir = temp_dir("catalog_ingest_scan_seek");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Ingest via CatalogEngine (user table path)
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+        bb.begin_row(2, 0, 1); bb.put_u64(200); bb.end_row();
+        bb.begin_row(3, 0, 1); bb.put_u64(300); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        // Scan
+        let scan_batch = engine.scan_family(tid).unwrap();
+        assert_eq!(scan_batch.count, 3);
+
+        // Seek existing
+        let found = engine.seek_family(tid, 2, 0).unwrap();
+        assert!(found.is_some());
+        let row = found.unwrap();
+        assert_eq!(row.count, 1);
+        assert_eq!(row.get_pk_lo(0), 2);
+
+        // Seek missing
+        let not_found = engine.seek_family(tid, 99, 0).unwrap();
+        assert!(not_found.is_none());
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ingest_unique_pk_partitioned() {
+        let dir = temp_dir("catalog_unique_pk_partitioned");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, true).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Insert row with PK=1, val=100
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        // Insert row with PK=1 again, val=200 (should retract old + insert new)
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(200); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        // Scan — should have exactly 1 row with val=200
+        let scan = engine.scan_family(tid).unwrap();
+        assert_eq!(scan.count, 1);
+        assert_eq!(scan.get_pk_lo(0), 1);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ddl_sync() {
+        let dir = temp_dir("catalog_ddl_sync");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        // Create a schema via normal DDL
+        engine.create_schema("app").unwrap();
+        assert!(engine.has_schema("app"));
+
+        // Simulate DDL sync: create batch mimicking a schema record
+        let schema = super::schema_tab_schema();
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(100, 0, 1); // sid=100
+        bb.put_string("synced");
+        bb.end_row();
+        engine.ddl_sync(SCHEMA_TAB_ID, bb.finish()).unwrap();
+
+        // Hooks should have registered the schema
+        assert!(engine.has_schema("synced"));
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_raw_store_ingest() {
+        let dir = temp_dir("catalog_raw_store_ingest");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Raw ingest (SAL recovery path — no hooks, no unique_pk, no index projection)
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(10, 0, 1); bb.put_u64(1000); bb.end_row();
+        bb.begin_row(20, 0, 1); bb.put_u64(2000); bb.end_row();
+        engine.raw_store_ingest(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        let scan = engine.scan_family(tid).unwrap();
+        assert_eq!(scan.count, 2);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_partition_management() {
+        let dir = temp_dir("catalog_partition_mgmt");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let _tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+
+        // These should not panic
+        engine.set_active_partitions(0, 64);
+        engine.disable_user_table_wal();
+        engine.trim_worker_partitions(0, 64);
+        engine.invalidate_all_plans();
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fk_index_metadata_queries() {
+        let dir = temp_dir("catalog_fk_idx_meta");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.parent", &cols, 0, false).unwrap();
+
+        // Create child table with FK to parent
+        let child_cols = vec![
+            u64_col_def("id"),
+            ColumnDef {
+                name: "parent_id".into(),
+                type_code: crate::compact::type_code::U64,
+                is_nullable: false,
+                fk_table_id: tid,
+                fk_col_idx: 0,
+            },
+        ];
+        let child_tid = engine.create_table("public.child", &child_cols, 0, false).unwrap();
+
+        // FK count
+        assert!(engine.get_fk_count(child_tid) > 0);
+        let (col_idx, target_id) = engine.get_fk_constraint(child_tid, 0).unwrap();
+        assert_eq!(target_id, tid);
+
+        // Create an explicit index
+        let _iid = engine.create_index("public.parent", "val", false).unwrap();
+
+        assert!(engine.get_index_circuit_count(tid) > 0);
+        let (ic_col, _is_unique, _tc) = engine.get_index_circuit_info(tid, 0).unwrap();
+        assert_eq!(ic_col, 1); // val is column 1
+
+        // Index store handle should be non-null
+        let idx_ptr = engine.get_index_store_handle(tid, 1);
+        assert!(!idx_ptr.is_null());
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_iter_user_table_ids_and_lsn() {
+        let dir = temp_dir("catalog_iter_lsn");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid1 = engine.create_table("public.t1", &cols, 0, false).unwrap();
+        let tid2 = engine.create_table("public.t2", &cols, 0, false).unwrap();
+
+        let ids = engine.iter_user_table_ids();
+        assert!(ids.contains(&tid1));
+        assert!(ids.contains(&tid2));
+
+        // LSN should be accessible (may be > 0 from table creation)
+        let lsn = engine.get_max_flushed_lsn(tid1);
+        assert!(lsn >= 0);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── validate_unique_indices tests ─────────────────────────────────
+
+    #[test]
+    fn test_validate_unique_indices_duplicate_value() {
+        let dir = temp_dir("catalog_uidx_dup");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        engine.create_index("public.t", "val", true).unwrap(); // unique index on val
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Insert first row
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        // Insert second row with same val=42 → should violate unique index
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(2, 0, 1); bb.put_u64(42); bb.end_row();
+        let result = engine.validate_unique_indices(tid, &bb.finish());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unique index violation"));
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_unique_indices_batch_internal_dup() {
+        let dir = temp_dir("catalog_uidx_batch_dup");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        engine.create_index("public.t", "val", true).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Single batch with two rows sharing val=99 → duplicate in batch
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(99); bb.end_row();
+        bb.begin_row(2, 0, 1); bb.put_u64(99); bb.end_row();
+        let result = engine.validate_unique_indices(tid, &bb.finish());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("duplicate in batch"));
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_unique_indices_upsert_same_value_ok() {
+        let dir = temp_dir("catalog_uidx_upsert_same");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, true).unwrap(); // unique_pk
+        engine.create_index("public.t", "val", true).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Insert PK=1, val=42
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        // UPSERT PK=1, val=42 (same value) → should succeed
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+        let result = engine.validate_unique_indices(tid, &bb.finish());
+        assert!(result.is_ok());
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_unique_indices_upsert_to_existing_value_fails() {
+        let dir = temp_dir("catalog_uidx_upsert_conflict");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, true).unwrap(); // unique_pk
+        engine.create_index("public.t", "val", true).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Insert PK=1, val=42 and PK=2, val=99
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+        bb.begin_row(2, 0, 1); bb.put_u64(99); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        // UPSERT PK=1, val=99 → conflicts with PK=2's val=99
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(99); bb.end_row();
+        let result = engine.validate_unique_indices(tid, &bb.finish());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unique index violation"));
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_unique_indices_distinct_values_ok() {
+        let dir = temp_dir("catalog_uidx_distinct");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        engine.create_index("public.t", "val", true).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Insert row with val=42
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        // Insert row with different val=99 → should succeed
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(2, 0, 1); bb.put_u64(99); bb.end_row();
+        let result = engine.validate_unique_indices(tid, &bb.finish());
+        assert!(result.is_ok());
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── seek_by_index tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_seek_by_index_found() {
+        let dir = temp_dir("catalog_seekidx_found");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        engine.create_index("public.t", "val", false).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(10, 0, 1); bb.put_u64(100); bb.end_row();
+        bb.begin_row(20, 0, 1); bb.put_u64(200); bb.end_row();
+        bb.begin_row(30, 0, 1); bb.put_u64(300); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        // Seek by index: val=200 → should find PK=20
+        let result = engine.seek_by_index(tid, 1, 200, 0).unwrap();
+        assert!(result.is_some());
+        let row = result.unwrap();
+        assert_eq!(row.count, 1);
+        assert_eq!(row.get_pk_lo(0), 20);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_seek_by_index_not_found() {
+        let dir = temp_dir("catalog_seekidx_miss");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        engine.create_index("public.t", "val", false).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(42); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        // Seek by index: val=999 → should return None
+        let result = engine.seek_by_index(tid, 1, 999, 0).unwrap();
+        assert!(result.is_none());
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── UPSERT retraction propagation tests ──────────────────────────
+
+    #[test]
+    fn test_upsert_effective_batch_has_retractions() {
+        let dir = temp_dir("catalog_upsert_retract");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, true).unwrap(); // unique_pk
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Insert PK=1, val=100
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+        engine.dag.ingest_to_family(tid, bb.finish());
+        let _ = engine.dag.flush(tid);
+
+        // UPSERT PK=1, val=200 via ingest_returning_effective
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(200); bb.end_row();
+        let (rc, effective_opt) = engine.dag.ingest_returning_effective(tid, bb.finish());
+        assert_eq!(rc, 0);
+        let effective = effective_opt.unwrap();
+
+        // Effective batch should have 2 rows:
+        // Row 0: weight=-1 (retraction of old val=100)
+        // Row 1: weight=+1 (insertion of new val=200)
+        assert_eq!(effective.count, 2, "Expected retraction + insertion");
+        assert_eq!(effective.get_weight(0), -1, "First row should be retraction");
+        assert_eq!(effective.get_weight(1), 1, "Second row should be insertion");
+        // Both should have PK=1
+        assert_eq!(effective.get_pk_lo(0), 1);
+        assert_eq!(effective.get_pk_lo(1), 1);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_upsert_retraction_reaches_views() {
+        let dir = temp_dir("catalog_upsert_view");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, true).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+        let out_cols = vec![("id".to_string(), type_code::U64), ("val".to_string(), type_code::U64)];
+
+        // Create passthrough view
+        let graph = make_passthrough_graph(tid, &out_cols);
+        let vid = engine.create_view("public.v", &graph, "").unwrap();
+
+        // Insert PK=1, val=100
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(100); bb.end_row();
+        engine.push_and_evaluate(tid, bb.finish()).unwrap();
+
+        // Check view: should have 1 row with val=100
+        let scan1 = engine.scan_family(vid).unwrap();
+        assert_eq!(scan1.count, 1);
+
+        // UPSERT PK=1, val=200
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(200); bb.end_row();
+        engine.push_and_evaluate(tid, bb.finish()).unwrap();
+
+        // View should have 1 row with val=200 (old val=100 retracted)
+        let scan2 = engine.scan_family(vid).unwrap();
+        assert_eq!(scan2.count, 1, "View should have exactly 1 row after UPSERT");
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── push_and_evaluate test ───────────────────────────────────────
+
+    #[test]
+    fn test_push_and_evaluate_cascades_to_view() {
+        let dir = temp_dir("catalog_push_eval");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u64_col_def("val")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        let out_cols = vec![("id".to_string(), type_code::U64), ("val".to_string(), type_code::U64)];
+
+        let graph = make_passthrough_graph(tid, &out_cols);
+        let vid = engine.create_view("public.v", &graph, "").unwrap();
+
+        let schema = engine.get_schema(tid).unwrap();
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u64(10); bb.end_row();
+        bb.begin_row(2, 0, 1); bb.put_u64(20); bb.end_row();
+        engine.push_and_evaluate(tid, bb.finish()).unwrap();
+
+        // View should reflect the push
+        let scan = engine.scan_family(vid).unwrap();
+        assert_eq!(scan.count, 2);
+
+        // Push more
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(3, 0, 1); bb.put_u64(30); bb.end_row();
+        engine.push_and_evaluate(tid, bb.finish()).unwrap();
+
+        let scan = engine.scan_family(vid).unwrap();
+        assert_eq!(scan.count, 3);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Column name caching test ─────────────────────────────────────
+
+    #[test]
+    fn test_get_column_names_cached() {
+        let dir = temp_dir("catalog_colnames");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![
+            ColumnDef { name: "pk".into(), type_code: type_code::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "alpha".into(), type_code: type_code::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "beta".into(), type_code: type_code::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+
+        let names1 = engine.get_column_names(tid);
+        assert_eq!(names1, vec!["pk", "alpha", "beta"]);
+
+        // Second call should hit cache
+        let names2 = engine.get_column_names(tid);
+        assert_eq!(names2, vec!["pk", "alpha", "beta"]);
+
+        engine.close();
         let _ = fs::remove_dir_all(&dir);
     }
 }

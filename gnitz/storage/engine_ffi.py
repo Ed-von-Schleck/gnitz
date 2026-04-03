@@ -360,28 +360,91 @@ eci = ExternalCompilationInfo(
         "  char **out_ptr, uint32_t *out_len);",
         "void *gnitz_ipc_decode_result_take_batch(void *handle);",
         "void gnitz_ipc_decode_result_free(void *handle);",
-        # DagEngine lifecycle
-        "void *gnitz_dag_create(void);",
-        "void gnitz_dag_destroy(void *handle);",
-        "void gnitz_dag_set_sys_tables("
-        "  void *handle,"
-        "  void *h_nodes, void *h_edges, void *h_sources,"
-        "  void *h_params, void *h_gcols, void *h_dep,"
-        "  const void *s_nodes, const void *s_edges,"
-        "  const void *s_sources, const void *s_params,"
-        "  const void *s_gcols, const void *s_dep);",
-        # DagEngine table registry
-        "void gnitz_dag_register_table("
-        "  void *handle, int64_t table_id, void *store_handle,"
-        "  const void *schema, int32_t depth, int32_t unique_pk,"
-        "  int32_t is_partitioned, const char *directory);",
-        "void gnitz_dag_unregister_table(void *handle, int64_t table_id);",
-        "void gnitz_dag_set_depth(void *handle, int64_t table_id, int32_t depth);",
-        "void gnitz_dag_add_index_circuit("
+        # CatalogEngine lifecycle
+        "void *gnitz_catalog_open(const uint8_t *base_dir, uint32_t base_dir_len);",
+        "void gnitz_catalog_close(void *handle);",
+        "const uint8_t *gnitz_catalog_last_error(uint32_t *out_len);",
+        # CatalogEngine DDL
+        "int32_t gnitz_catalog_create_schema(void *handle, const uint8_t *name, uint32_t name_len);",
+        "int64_t gnitz_catalog_create_table("
+        "  void *handle, const uint8_t *name, uint32_t name_len,"
+        "  const uint8_t *col_defs, uint32_t col_defs_len,"
+        "  uint32_t num_cols, uint32_t pk_col_idx, int32_t unique_pk);",
+        "int64_t gnitz_catalog_create_view("
+        "  void *handle, const uint8_t *name, uint32_t name_len,"
+        "  const uint8_t *sql_def, uint32_t sql_def_len,"
+        "  const int32_t *nodes, uint32_t nodes_count,"
+        "  const int32_t *edges, uint32_t edges_count,"
+        "  const int64_t *sources, uint32_t sources_count,"
+        "  const int64_t *params, uint32_t params_count,"
+        "  const int32_t *group_cols, uint32_t group_cols_count,"
+        "  const uint8_t *output_col_defs, uint32_t output_col_defs_len, uint32_t output_col_defs_count,"
+        "  const int64_t *deps, uint32_t deps_count);",
+        "int64_t gnitz_catalog_create_index("
+        "  void *handle, const uint8_t *owner, uint32_t owner_len,"
+        "  const uint8_t *col_name, uint32_t col_name_len, int32_t is_unique);",
+        "int32_t gnitz_catalog_drop_schema(void *handle, const uint8_t *name, uint32_t name_len);",
+        "int32_t gnitz_catalog_drop_table(void *handle, const uint8_t *name, uint32_t name_len);",
+        "int32_t gnitz_catalog_drop_view(void *handle, const uint8_t *name, uint32_t name_len);",
+        "int32_t gnitz_catalog_drop_index(void *handle, const uint8_t *name, uint32_t name_len);",
+        # CatalogEngine ID allocation
+        "int64_t gnitz_catalog_allocate_schema_id(void *handle);",
+        "int64_t gnitz_catalog_allocate_table_id(void *handle);",
+        "int64_t gnitz_catalog_allocate_index_id(void *handle);",
+        "int32_t gnitz_catalog_advance_sequence("
+        "  void *handle, int64_t seq_id, int64_t old_val, int64_t new_val);",
+        # CatalogEngine queries
+        "int32_t gnitz_catalog_has_id(const void *handle, int64_t table_id);",
+        "int32_t gnitz_catalog_get_schema_desc("
+        "  const void *handle, int64_t table_id, void *out_schema);",
+        "int32_t gnitz_catalog_get_depth(const void *handle, int64_t table_id);",
+        "int32_t gnitz_catalog_is_unique_pk(const void *handle, int64_t table_id);",
+        # CatalogEngine ingestion/scan/seek/flush
+        "int32_t gnitz_catalog_ingest(void *handle, int64_t table_id, void *batch);",
+        "void *gnitz_catalog_ingest_effective("
+        "  void *handle, int64_t table_id, void *batch);",
+        "int32_t gnitz_catalog_push_and_evaluate("
+        "  void *handle, int64_t table_id, void *batch);",
+        "void *gnitz_catalog_scan(void *handle, int64_t table_id);",
+        "void *gnitz_catalog_seek("
+        "  void *handle, int64_t table_id, uint64_t pk_lo, uint64_t pk_hi);",
+        "void *gnitz_catalog_seek_by_index("
         "  void *handle, int64_t table_id, uint32_t col_idx,"
-        "  void *idx_handle, const void *idx_schema, int32_t is_unique);",
-        "void gnitz_dag_remove_index_circuit("
-        "  void *handle, int64_t table_id, uint32_t col_idx);",
+        "  uint64_t key_lo, uint64_t key_hi);",
+        "int32_t gnitz_catalog_flush(void *handle, int64_t table_id);",
+        "int32_t gnitz_catalog_validate_unique_indices("
+        "  void *handle, int64_t table_id, const void *batch);",
+        "int32_t gnitz_catalog_validate_fk_inline("
+        "  void *handle, int64_t table_id, const void *batch);",
+        # CatalogEngine worker support
+        "int32_t gnitz_catalog_ddl_sync(void *handle, int64_t table_id, void *batch);",
+        "int32_t gnitz_catalog_raw_store_ingest(void *handle, int64_t table_id, void *batch);",
+        # CatalogEngine partition management
+        "void gnitz_catalog_set_active_partitions(void *handle, uint32_t start, uint32_t end);",
+        "void gnitz_catalog_close_user_table_partitions(void *handle);",
+        "void gnitz_catalog_trim_worker_partitions(void *handle, uint32_t start, uint32_t end);",
+        "void gnitz_catalog_disable_user_table_wal(void *handle);",
+        "void gnitz_catalog_invalidate_all_plans(void *handle);",
+        # CatalogEngine FK/index metadata
+        "uint32_t gnitz_catalog_get_fk_count(const void *handle, int64_t table_id);",
+        "int32_t gnitz_catalog_get_fk_constraint("
+        "  const void *handle, int64_t table_id, uint32_t idx,"
+        "  uint32_t *out_col_idx, int64_t *out_target_table_id, uint8_t *out_col_type);",
+        "uint32_t gnitz_catalog_get_index_circuit_count(const void *handle, int64_t table_id);",
+        "int32_t gnitz_catalog_get_index_circuit_info("
+        "  const void *handle, int64_t table_id, uint32_t idx,"
+        "  uint32_t *out_col_idx, int32_t *out_is_unique, uint8_t *out_type_code);",
+        "void *gnitz_catalog_get_index_store(const void *handle, int64_t table_id, uint32_t col_idx);",
+        # CatalogEngine handle accessors
+        "void *gnitz_catalog_get_ptable_handle(const void *handle, int64_t table_id);",
+        "void *gnitz_catalog_get_dag_handle(void *handle);",
+        "uint32_t gnitz_catalog_iter_user_table_ids("
+        "  const void *handle, int64_t *out_ids, uint32_t max_ids);",
+        "int32_t gnitz_catalog_get_col_name("
+        "  void *handle, int64_t table_id, uint32_t col_idx,"
+        "  uint8_t *out_buf, uint32_t max_len);",
+        "uint64_t gnitz_catalog_get_max_flushed_lsn(const void *handle, int64_t table_id);",
+        # DagEngine (lifecycle/registry removed — use CatalogEngine)
         # DagEngine cache
         "void gnitz_dag_invalidate(void *handle, int64_t view_id);",
         "void gnitz_dag_invalidate_all(void *handle);",
@@ -1758,66 +1821,336 @@ _ipc_decode_result_free = rffi.llexternal(
 )
 
 # ---------------------------------------------------------------------------
+# CatalogEngine FFI
+# ---------------------------------------------------------------------------
+
+_catalog_open = rffi.llexternal(
+    "gnitz_catalog_open",
+    [rffi.VOIDP, rffi.UINT],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_catalog_close = rffi.llexternal(
+    "gnitz_catalog_close", [rffi.VOIDP], lltype.Void,
+    compilation_info=eci,
+)
+
+_catalog_last_error = rffi.llexternal(
+    "gnitz_catalog_last_error",
+    [rffi.UINTP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_catalog_create_schema = rffi.llexternal(
+    "gnitz_catalog_create_schema",
+    [rffi.VOIDP, rffi.VOIDP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_create_table = rffi.llexternal(
+    "gnitz_catalog_create_table",
+    [rffi.VOIDP, rffi.VOIDP, rffi.UINT,
+     rffi.VOIDP, rffi.UINT, rffi.UINT, rffi.UINT, rffi.INT],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_catalog_create_view = rffi.llexternal(
+    "gnitz_catalog_create_view",
+    [rffi.VOIDP,
+     rffi.VOIDP, rffi.UINT,    # name
+     rffi.VOIDP, rffi.UINT,    # sql_def
+     rffi.INTP, rffi.UINT,     # nodes
+     rffi.INTP, rffi.UINT,     # edges
+     rffi.LONGLONGP, rffi.UINT,  # sources
+     rffi.LONGLONGP, rffi.UINT,  # params
+     rffi.INTP, rffi.UINT,     # group_cols
+     rffi.VOIDP, rffi.UINT, rffi.UINT,  # output_col_defs (ptr, byte_len, count)
+     rffi.LONGLONGP, rffi.UINT],  # deps
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_catalog_create_index = rffi.llexternal(
+    "gnitz_catalog_create_index",
+    [rffi.VOIDP, rffi.VOIDP, rffi.UINT, rffi.VOIDP, rffi.UINT, rffi.INT],
+    rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_catalog_drop_schema = rffi.llexternal(
+    "gnitz_catalog_drop_schema",
+    [rffi.VOIDP, rffi.VOIDP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_drop_table = rffi.llexternal(
+    "gnitz_catalog_drop_table",
+    [rffi.VOIDP, rffi.VOIDP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_drop_view = rffi.llexternal(
+    "gnitz_catalog_drop_view",
+    [rffi.VOIDP, rffi.VOIDP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_drop_index = rffi.llexternal(
+    "gnitz_catalog_drop_index",
+    [rffi.VOIDP, rffi.VOIDP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_allocate_schema_id = rffi.llexternal(
+    "gnitz_catalog_allocate_schema_id",
+    [rffi.VOIDP], rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_catalog_allocate_table_id = rffi.llexternal(
+    "gnitz_catalog_allocate_table_id",
+    [rffi.VOIDP], rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_catalog_allocate_index_id = rffi.llexternal(
+    "gnitz_catalog_allocate_index_id",
+    [rffi.VOIDP], rffi.LONGLONG,
+    compilation_info=eci,
+)
+
+_catalog_advance_sequence = rffi.llexternal(
+    "gnitz_catalog_advance_sequence",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.LONGLONG, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_has_id = rffi.llexternal(
+    "gnitz_catalog_has_id",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_get_schema_desc = rffi.llexternal(
+    "gnitz_catalog_get_schema_desc",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_get_depth = rffi.llexternal(
+    "gnitz_catalog_get_depth",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_is_unique_pk = rffi.llexternal(
+    "gnitz_catalog_is_unique_pk",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_ingest = rffi.llexternal(
+    "gnitz_catalog_ingest",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_ingest_effective = rffi.llexternal(
+    "gnitz_catalog_ingest_effective",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_catalog_push_and_evaluate = rffi.llexternal(
+    "gnitz_catalog_push_and_evaluate",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_scan = rffi.llexternal(
+    "gnitz_catalog_scan",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_catalog_seek = rffi.llexternal(
+    "gnitz_catalog_seek",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_catalog_seek_by_index = rffi.llexternal(
+    "gnitz_catalog_seek_by_index",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT, rffi.ULONGLONG, rffi.ULONGLONG],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_catalog_flush = rffi.llexternal(
+    "gnitz_catalog_flush",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_validate_unique_indices = rffi.llexternal(
+    "gnitz_catalog_validate_unique_indices",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_validate_fk_inline = rffi.llexternal(
+    "gnitz_catalog_validate_fk_inline",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_ddl_sync = rffi.llexternal(
+    "gnitz_catalog_ddl_sync",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_raw_store_ingest = rffi.llexternal(
+    "gnitz_catalog_raw_store_ingest",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_set_active_partitions = rffi.llexternal(
+    "gnitz_catalog_set_active_partitions",
+    [rffi.VOIDP, rffi.UINT, rffi.UINT],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_catalog_close_user_table_partitions = rffi.llexternal(
+    "gnitz_catalog_close_user_table_partitions",
+    [rffi.VOIDP], lltype.Void,
+    compilation_info=eci,
+)
+
+_catalog_trim_worker_partitions = rffi.llexternal(
+    "gnitz_catalog_trim_worker_partitions",
+    [rffi.VOIDP, rffi.UINT, rffi.UINT],
+    lltype.Void,
+    compilation_info=eci,
+)
+
+_catalog_disable_user_table_wal = rffi.llexternal(
+    "gnitz_catalog_disable_user_table_wal",
+    [rffi.VOIDP], lltype.Void,
+    compilation_info=eci,
+)
+
+_catalog_invalidate_all_plans = rffi.llexternal(
+    "gnitz_catalog_invalidate_all_plans",
+    [rffi.VOIDP], lltype.Void,
+    compilation_info=eci,
+)
+
+_catalog_get_fk_count = rffi.llexternal(
+    "gnitz_catalog_get_fk_count",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.UINT,
+    compilation_info=eci,
+)
+
+_catalog_get_fk_constraint = rffi.llexternal(
+    "gnitz_catalog_get_fk_constraint",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT,
+     rffi.UINTP, rffi.LONGLONGP, rffi.UCHARP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_get_index_circuit_count = rffi.llexternal(
+    "gnitz_catalog_get_index_circuit_count",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.UINT,
+    compilation_info=eci,
+)
+
+_catalog_get_index_circuit_info = rffi.llexternal(
+    "gnitz_catalog_get_index_circuit_info",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT,
+     rffi.UINTP, rffi.INTP, rffi.UCHARP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_get_index_store = rffi.llexternal(
+    "gnitz_catalog_get_index_store",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_catalog_get_ptable_handle = rffi.llexternal(
+    "gnitz_catalog_get_ptable_handle",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_catalog_get_dag_handle = rffi.llexternal(
+    "gnitz_catalog_get_dag_handle",
+    [rffi.VOIDP],
+    rffi.VOIDP,
+    compilation_info=eci,
+)
+
+_catalog_iter_user_table_ids = rffi.llexternal(
+    "gnitz_catalog_iter_user_table_ids",
+    [rffi.VOIDP, rffi.LONGLONGP, rffi.UINT],
+    rffi.UINT,
+    compilation_info=eci,
+)
+
+_catalog_get_col_name = rffi.llexternal(
+    "gnitz_catalog_get_col_name",
+    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT, rffi.VOIDP, rffi.UINT],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_catalog_get_max_flushed_lsn = rffi.llexternal(
+    "gnitz_catalog_get_max_flushed_lsn",
+    [rffi.VOIDP, rffi.LONGLONG],
+    rffi.ULONGLONG,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
 # DagEngine FFI
 # ---------------------------------------------------------------------------
 
-_dag_create = rffi.llexternal(
-    "gnitz_dag_create", [], rffi.VOIDP,
-    compilation_info=eci,
-)
-
-_dag_destroy = rffi.llexternal(
-    "gnitz_dag_destroy", [rffi.VOIDP], lltype.Void,
-    compilation_info=eci,
-)
-
-_dag_set_sys_tables = rffi.llexternal(
-    "gnitz_dag_set_sys_tables",
-    [rffi.VOIDP,
-     rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,
-     rffi.VOIDP, rffi.VOIDP, rffi.VOIDP,
-     rffi.VOIDP, rffi.VOIDP,
-     rffi.VOIDP, rffi.VOIDP,
-     rffi.VOIDP, rffi.VOIDP],
-    lltype.Void,
-    compilation_info=eci,
-)
-
-_dag_register_table = rffi.llexternal(
-    "gnitz_dag_register_table",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP,
-     rffi.VOIDP, rffi.INT, rffi.INT, rffi.INT, rffi.CCHARP],
-    lltype.Void,
-    compilation_info=eci,
-)
-
-_dag_unregister_table = rffi.llexternal(
-    "gnitz_dag_unregister_table",
-    [rffi.VOIDP, rffi.LONGLONG],
-    lltype.Void,
-    compilation_info=eci,
-)
-
-_dag_set_depth = rffi.llexternal(
-    "gnitz_dag_set_depth",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.INT],
-    lltype.Void,
-    compilation_info=eci,
-)
-
-_dag_add_index_circuit = rffi.llexternal(
-    "gnitz_dag_add_index_circuit",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT, rffi.VOIDP, rffi.VOIDP, rffi.INT],
-    lltype.Void,
-    compilation_info=eci,
-)
-
-_dag_remove_index_circuit = rffi.llexternal(
-    "gnitz_dag_remove_index_circuit",
-    [rffi.VOIDP, rffi.LONGLONG, rffi.UINT],
-    lltype.Void,
-    compilation_info=eci,
-)
+# Removed: _dag_create, _dag_destroy, _dag_set_sys_tables,
+# _dag_register_table, _dag_unregister_table, _dag_set_depth,
+# _dag_add_index_circuit, _dag_remove_index_circuit
+# — CatalogEngine owns DagEngine lifecycle.
 
 _dag_invalidate = rffi.llexternal(
     "gnitz_dag_invalidate",

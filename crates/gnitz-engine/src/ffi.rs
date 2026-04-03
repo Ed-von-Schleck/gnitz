@@ -3240,151 +3240,15 @@ pub extern "C" fn gnitz_partition_router_record_routing(
 // DagEngine FFI
 // ---------------------------------------------------------------------------
 
-use crate::dag::{DagEngine, StoreHandle, SysTableRefs};
+use crate::dag::DagEngine;
 
-/// Create a new DagEngine. Returns an opaque handle.
-#[no_mangle]
-pub extern "C" fn gnitz_dag_create() -> *mut c_void {
-    let result = panic::catch_unwind(|| {
-        let dag = Box::new(DagEngine::new());
-        Box::into_raw(dag) as *mut c_void
-    });
-    result.unwrap_or(ptr::null_mut())
-}
+// NOTE: gnitz_dag_create, gnitz_dag_destroy, gnitz_dag_set_sys_tables,
+// gnitz_dag_register_table, gnitz_dag_unregister_table, gnitz_dag_set_depth
+// have been removed — CatalogEngine owns the DagEngine lifecycle.
+// Use gnitz_catalog_open/close and gnitz_catalog_get_dag_handle instead.
 
-/// Destroy a DagEngine.
-#[no_mangle]
-pub extern "C" fn gnitz_dag_destroy(handle: *mut c_void) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let mut dag = unsafe { Box::from_raw(handle as *mut DagEngine) };
-        dag.close();
-    });
-}
-
-/// Set the 6 system table handles + schemas on a DagEngine.
-#[no_mangle]
-pub extern "C" fn gnitz_dag_set_sys_tables(
-    handle: *mut c_void,
-    h_nodes: *mut c_void,
-    h_edges: *mut c_void,
-    h_sources: *mut c_void,
-    h_params: *mut c_void,
-    h_gcols: *mut c_void,
-    h_dep: *mut c_void,
-    s_nodes: *const crate::compact::SchemaDescriptor,
-    s_edges: *const crate::compact::SchemaDescriptor,
-    s_sources: *const crate::compact::SchemaDescriptor,
-    s_params: *const crate::compact::SchemaDescriptor,
-    s_gcols: *const crate::compact::SchemaDescriptor,
-    s_dep: *const crate::compact::SchemaDescriptor,
-) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let dag = unsafe { &mut *(handle as *mut DagEngine) };
-        dag.set_sys_tables(SysTableRefs {
-            nodes: h_nodes as *mut crate::table::Table,
-            edges: h_edges as *mut crate::table::Table,
-            sources: h_sources as *mut crate::table::Table,
-            params: h_params as *mut crate::table::Table,
-            group_cols: h_gcols as *mut crate::table::Table,
-            dep_tab: h_dep as *mut crate::table::Table,
-            nodes_schema: if s_nodes.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_nodes } },
-            edges_schema: if s_edges.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_edges } },
-            sources_schema: if s_sources.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_sources } },
-            params_schema: if s_params.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_params } },
-            group_cols_schema: if s_gcols.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_gcols } },
-            dep_tab_schema: if s_dep.is_null() { crate::compiler::empty_schema() } else { unsafe { *s_dep } },
-        });
-    });
-}
-
-/// Register a table with the DagEngine.
-/// is_partitioned: 0 = Single (EphemeralTable), 1 = Partitioned.
-#[no_mangle]
-pub extern "C" fn gnitz_dag_register_table(
-    handle: *mut c_void,
-    table_id: i64,
-    store_handle: *mut c_void,
-    schema: *const crate::compact::SchemaDescriptor,
-    depth: i32,
-    unique_pk: c_int,
-    is_partitioned: c_int,
-    dir_ptr: *const libc::c_char,
-) {
-    if handle.is_null() || schema.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let dag = unsafe { &mut *(handle as *mut DagEngine) };
-        let sd = unsafe { *schema };
-        let sh = if is_partitioned != 0 {
-            StoreHandle::Partitioned(store_handle as *mut crate::partitioned_table::PartitionedTable)
-        } else {
-            StoreHandle::Single(store_handle as *mut crate::table::Table)
-        };
-        let dir = if dir_ptr.is_null() {
-            String::new()
-        } else {
-            unsafe { CStr::from_ptr(dir_ptr) }.to_string_lossy().into_owned()
-        };
-        dag.register_table(table_id, sh, sd, depth, unique_pk != 0, dir);
-    });
-}
-
-/// Unregister a table from the DagEngine.
-#[no_mangle]
-pub extern "C" fn gnitz_dag_unregister_table(handle: *mut c_void, table_id: i64) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let dag = unsafe { &mut *(handle as *mut DagEngine) };
-        dag.unregister_table(table_id);
-    });
-}
-
-/// Set the depth of a table in the DagEngine.
-#[no_mangle]
-pub extern "C" fn gnitz_dag_set_depth(handle: *mut c_void, table_id: i64, depth: i32) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let dag = unsafe { &mut *(handle as *mut DagEngine) };
-        dag.set_depth(table_id, depth);
-    });
-}
-
-/// Add an index circuit to a table.
-#[no_mangle]
-pub extern "C" fn gnitz_dag_add_index_circuit(
-    handle: *mut c_void,
-    table_id: i64,
-    col_idx: u32,
-    idx_handle: *mut c_void,
-    idx_schema: *const crate::compact::SchemaDescriptor,
-    is_unique: c_int,
-) {
-    if handle.is_null() || idx_schema.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let dag = unsafe { &mut *(handle as *mut DagEngine) };
-        let sd = unsafe { *idx_schema };
-        dag.add_index_circuit(
-            table_id, col_idx,
-            idx_handle as *mut crate::table::Table,
-            sd, is_unique != 0,
-        );
-    });
-}
-
-/// Remove an index circuit from a table.
-#[no_mangle]
-pub extern "C" fn gnitz_dag_remove_index_circuit(
-    handle: *mut c_void,
-    table_id: i64,
-    col_idx: u32,
-) {
-    if handle.is_null() { return; }
-    let _ = panic::catch_unwind(|| {
-        let dag = unsafe { &mut *(handle as *mut DagEngine) };
-        dag.remove_index_circuit(table_id, col_idx);
-    });
-}
+// NOTE: gnitz_dag_add_index_circuit and gnitz_dag_remove_index_circuit removed —
+// CatalogEngine manages index circuits internally.
 
 /// Invalidate a single view's cached plan.
 #[no_mangle]
@@ -3756,6 +3620,873 @@ pub extern "C" fn gnitz_dag_validate_graph(
         }
     });
     result.unwrap_or(-99)
+}
+
+// ---------------------------------------------------------------------------
+// CatalogEngine FFI
+// ---------------------------------------------------------------------------
+
+use std::cell::RefCell;
+
+thread_local! {
+    static CATALOG_LAST_ERROR: RefCell<String> = RefCell::new(String::new());
+}
+
+fn set_catalog_error(msg: String) {
+    CATALOG_LAST_ERROR.with(|e| *e.borrow_mut() = msg);
+}
+
+/// Get the last error message from a CatalogEngine FFI call.
+/// Returns a pointer to a thread-local buffer. Valid until next catalog FFI call.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_last_error(out_len: *mut u32) -> *const u8 {
+    CATALOG_LAST_ERROR.with(|e| {
+        let s = e.borrow();
+        if !out_len.is_null() {
+            unsafe { *out_len = s.len() as u32; }
+        }
+        s.as_ptr()
+    })
+}
+
+/// Open or create a CatalogEngine.  Returns opaque handle or NULL on error.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_open(
+    base_dir: *const u8,
+    base_dir_len: u32,
+) -> *mut c_void {
+    let result = panic::catch_unwind(|| {
+        if base_dir.is_null() { return ptr::null_mut(); }
+        let dir = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(base_dir, base_dir_len as usize)
+        )};
+        match crate::catalog::CatalogEngine::open(dir) {
+            Ok(engine) => Box::into_raw(Box::new(engine)) as *mut c_void,
+            Err(msg) => {
+                set_catalog_error(msg);
+                ptr::null_mut()
+            }
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Close and free a CatalogEngine.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_close(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let mut engine = unsafe { Box::from_raw(handle as *mut crate::catalog::CatalogEngine) };
+        engine.close();
+    });
+}
+
+// ── DDL ──────────────────────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_create_schema(
+    handle: *mut c_void,
+    name: *const u8, name_len: u32,
+) -> c_int {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let n = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(name, name_len as usize)
+        )};
+        match engine.create_schema(n) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_create_table(
+    handle: *mut c_void,
+    name: *const u8, name_len: u32,
+    col_defs_ptr: *const u8,  // serialized ColumnDef array
+    col_defs_len: u32,        // byte length of serialized col_defs buffer
+    num_cols: u32,
+    pk_col_idx: u32,
+    unique_pk: c_int,
+) -> i64 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let n = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(name, name_len as usize)
+        )};
+
+        // Deserialize column definitions from flat buffer:
+        // Each col_def is: name_len(u32) + name(bytes) + type_code(u8) + is_nullable(u8) + fk_table_id(i64) + fk_col_idx(u32)
+        let mut col_defs = Vec::with_capacity(num_cols as usize);
+        let mut offset = 0usize;
+        let buf = if col_defs_ptr.is_null() || col_defs_len == 0 {
+            &[] as &[u8]
+        } else {
+            unsafe { slice::from_raw_parts(col_defs_ptr, col_defs_len as usize) }
+        };
+        for _ in 0..num_cols {
+            let nlen = u32::from_le_bytes(buf[offset..offset+4].try_into().unwrap()) as usize;
+            offset += 4;
+            let cname = std::str::from_utf8(&buf[offset..offset+nlen]).unwrap_or("").to_string();
+            offset += nlen;
+            let type_code = buf[offset]; offset += 1;
+            let is_nullable = buf[offset] != 0; offset += 1;
+            let fk_table_id = i64::from_le_bytes(buf[offset..offset+8].try_into().unwrap());
+            offset += 8;
+            let fk_col_idx = u32::from_le_bytes(buf[offset..offset+4].try_into().unwrap());
+            offset += 4;
+            col_defs.push(crate::catalog::ColumnDef {
+                name: cname,
+                type_code,
+                is_nullable,
+                fk_table_id,
+                fk_col_idx,
+            });
+        }
+
+        match engine.create_table(n, &col_defs, pk_col_idx, unique_pk != 0) {
+            Ok(tid) => tid,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-1)
+}
+
+/// Create a view.  The circuit graph is passed as flat arrays:
+/// nodes: [nid, opcode] pairs; edges: [eid, src, dst, port] quads;
+/// sources: [nid, table_id] pairs; params: [nid, slot, value] triples;
+/// group_cols: [nid, col_idx] pairs; output_col_defs: serialized name+type_code;
+/// dependencies: [table_id] array.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_create_view(
+    handle: *mut c_void,
+    name: *const u8, name_len: u32,
+    sql_def: *const u8, sql_def_len: u32,
+    nodes_ptr: *const i32, nodes_count: u32,
+    edges_ptr: *const i32, edges_count: u32,
+    sources_ptr: *const i64, sources_count: u32,
+    params_ptr: *const i64, params_count: u32,
+    group_cols_ptr: *const i32, group_cols_count: u32,
+    output_col_defs_ptr: *const u8, output_col_defs_len: u32, output_col_defs_count: u32,
+    deps_ptr: *const i64, deps_count: u32,
+) -> i64 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let n = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(name, name_len as usize)
+        )};
+        let sql = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(sql_def, sql_def_len as usize)
+        )};
+
+        // Deserialize nodes: [nid, opcode] pairs
+        let nodes: Vec<(i32, i32)> = if nodes_count > 0 && !nodes_ptr.is_null() {
+            let s = unsafe { slice::from_raw_parts(nodes_ptr, nodes_count as usize * 2) };
+            (0..nodes_count as usize).map(|i| (s[i*2], s[i*2+1])).collect()
+        } else { Vec::new() };
+
+        // Edges: [eid, src, dst, port]
+        let edges: Vec<(i32, i32, i32, i32)> = if edges_count > 0 && !edges_ptr.is_null() {
+            let s = unsafe { slice::from_raw_parts(edges_ptr, edges_count as usize * 4) };
+            (0..edges_count as usize).map(|i| (s[i*4], s[i*4+1], s[i*4+2], s[i*4+3])).collect()
+        } else { Vec::new() };
+
+        // Sources: [nid, table_id]
+        let sources: Vec<(i32, i64)> = if sources_count > 0 && !sources_ptr.is_null() {
+            let s = unsafe { slice::from_raw_parts(sources_ptr, sources_count as usize * 2) };
+            (0..sources_count as usize).map(|i| (s[i*2] as i32, s[i*2+1])).collect()
+        } else { Vec::new() };
+
+        // Params: [nid, slot, value]
+        let params: Vec<(i32, i32, i64)> = if params_count > 0 && !params_ptr.is_null() {
+            let s = unsafe { slice::from_raw_parts(params_ptr, params_count as usize * 3) };
+            (0..params_count as usize).map(|i| (s[i*3] as i32, s[i*3+1] as i32, s[i*3+2])).collect()
+        } else { Vec::new() };
+
+        // Group cols: [nid, col_idx]
+        let group_cols: Vec<(i32, i32)> = if group_cols_count > 0 && !group_cols_ptr.is_null() {
+            let s = unsafe { slice::from_raw_parts(group_cols_ptr, group_cols_count as usize * 2) };
+            (0..group_cols_count as usize).map(|i| (s[i*2], s[i*2+1])).collect()
+        } else { Vec::new() };
+
+        // Output col defs: serialized as [name_len(u32) + name(bytes) + type_code(u8)]
+        let mut output_col_defs = Vec::new();
+        if output_col_defs_count > 0 && !output_col_defs_ptr.is_null() {
+            let buf = unsafe { slice::from_raw_parts(output_col_defs_ptr, output_col_defs_len as usize) };
+            let mut offset = 0usize;
+            for _ in 0..output_col_defs_count {
+                let nlen = u32::from_le_bytes(buf[offset..offset+4].try_into().unwrap()) as usize;
+                offset += 4;
+                let cname = std::str::from_utf8(&buf[offset..offset+nlen]).unwrap_or("").to_string();
+                offset += nlen;
+                let tc = buf[offset]; offset += 1;
+                output_col_defs.push((cname, tc));
+            }
+        }
+
+        // Dependencies
+        let dependencies: Vec<i64> = if deps_count > 0 && !deps_ptr.is_null() {
+            unsafe { slice::from_raw_parts(deps_ptr, deps_count as usize) }.to_vec()
+        } else { Vec::new() };
+
+        let graph = crate::catalog::CircuitGraph {
+            nodes, edges, sources, params, group_cols, output_col_defs, dependencies,
+        };
+
+        match engine.create_view(n, &graph, sql) {
+            Ok(vid) => vid,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-1)
+}
+
+/// Create a secondary index.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_create_index(
+    handle: *mut c_void,
+    owner: *const u8, owner_len: u32,
+    col_name: *const u8, col_name_len: u32,
+    is_unique: c_int,
+) -> i64 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let o = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(owner, owner_len as usize)
+        )};
+        let c = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(col_name, col_name_len as usize)
+        )};
+        match engine.create_index(o, c, is_unique != 0) {
+            Ok(iid) => iid,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_drop_schema(
+    handle: *mut c_void,
+    name: *const u8, name_len: u32,
+) -> c_int {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let n = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(name, name_len as usize)
+        )};
+        match engine.drop_schema(n) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_drop_table(
+    handle: *mut c_void,
+    name: *const u8, name_len: u32,
+) -> c_int {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let n = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(name, name_len as usize)
+        )};
+        match engine.drop_table(n) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_drop_view(
+    handle: *mut c_void,
+    name: *const u8, name_len: u32,
+) -> c_int {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let n = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(name, name_len as usize)
+        )};
+        match engine.drop_view(n) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_drop_index(
+    handle: *mut c_void,
+    name: *const u8, name_len: u32,
+) -> c_int {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let n = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(name, name_len as usize)
+        )};
+        match engine.drop_index(n) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+// ── ID allocation ──────────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_allocate_schema_id(handle: *mut c_void) -> i64 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        engine.allocate_schema_id()
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_allocate_table_id(handle: *mut c_void) -> i64 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        engine.allocate_table_id()
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_allocate_index_id(handle: *mut c_void) -> i64 {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        engine.allocate_index_id()
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_advance_sequence(
+    handle: *mut c_void,
+    seq_id: i64, old_val: i64, new_val: i64,
+) -> c_int {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        engine.advance_sequence(seq_id, old_val, new_val);
+        0
+    });
+    result.unwrap_or(-99)
+}
+
+// ── Queries ────────────────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_has_id(handle: *const c_void, table_id: i64) -> c_int {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        if engine.has_id(table_id) { 1 } else { 0 }
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_schema_desc(
+    handle: *const c_void,
+    table_id: i64,
+    out_schema: *mut crate::compact::SchemaDescriptor,
+) -> c_int {
+    if handle.is_null() || out_schema.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        match engine.get_schema_desc(table_id) {
+            Some(sd) => {
+                unsafe { *out_schema = sd; }
+                0
+            }
+            None => -1,
+        }
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_depth(handle: *const c_void, table_id: i64) -> c_int {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        engine.get_depth(table_id)
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_is_unique_pk(handle: *const c_void, table_id: i64) -> c_int {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        if engine.is_unique_pk(table_id) { 1 } else { 0 }
+    });
+    result.unwrap_or(0)
+}
+
+// ── Ingestion / scan / seek / flush ────────────────────────────────────
+
+/// Ingest a batch into a table family.  Takes ownership of the batch handle.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_ingest(
+    handle: *mut c_void,
+    table_id: i64,
+    batch_handle: *mut c_void,
+) -> c_int {
+    if handle.is_null() || batch_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let batch = unsafe { *Box::from_raw(batch_handle as *mut crate::memtable::OwnedBatch) };
+        match engine.ingest_to_family(table_id, batch) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+/// Ingest a user-table batch and return the effective delta (after unique_pk
+/// dedup).  Takes ownership of the input batch.  Returns the effective batch
+/// handle (caller owns it) or NULL on error.  Used by multi-worker push.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_ingest_effective(
+    handle: *mut c_void,
+    table_id: i64,
+    batch_handle: *mut c_void,
+) -> *mut c_void {
+    if handle.is_null() || batch_handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let batch = unsafe { *Box::from_raw(batch_handle as *mut crate::memtable::OwnedBatch) };
+        match engine.ingest_returning_effective(table_id, batch) {
+            Ok(eff) => Box::into_raw(Box::new(eff)) as *mut c_void,
+            Err(msg) => { set_catalog_error(msg); ptr::null_mut() }
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Ingest a batch into a user table and run single-worker DAG cascade.
+/// Takes ownership of the batch.  Uses the effective batch (with unique_pk
+/// retractions) for the DAG so views see correct deltas.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_push_and_evaluate(
+    handle: *mut c_void,
+    table_id: i64,
+    batch_handle: *mut c_void,
+) -> c_int {
+    if handle.is_null() || batch_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let batch = unsafe { *Box::from_raw(batch_handle as *mut crate::memtable::OwnedBatch) };
+        match engine.push_and_evaluate(table_id, batch) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+/// Scan all positive-weight rows.  Returns a new batch handle (caller must free).
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_scan(
+    handle: *mut c_void,
+    table_id: i64,
+) -> *mut c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        match engine.scan_family(table_id) {
+            Ok(batch) => Box::into_raw(Box::new(batch)) as *mut c_void,
+            Err(msg) => { set_catalog_error(msg); ptr::null_mut() }
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Point lookup by PK.  Returns a batch handle or NULL if not found.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_seek(
+    handle: *mut c_void,
+    table_id: i64,
+    pk_lo: u64, pk_hi: u64,
+) -> *mut c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        match engine.seek_family(table_id, pk_lo, pk_hi) {
+            Ok(Some(batch)) => Box::into_raw(Box::new(batch)) as *mut c_void,
+            Ok(None) => ptr::null_mut(),
+            Err(msg) => { set_catalog_error(msg); ptr::null_mut() }
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Index-assisted lookup.  Returns batch handle or NULL.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_seek_by_index(
+    handle: *mut c_void,
+    table_id: i64,
+    col_idx: u32,
+    key_lo: u64, key_hi: u64,
+) -> *mut c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        match engine.seek_by_index(table_id, col_idx, key_lo, key_hi) {
+            Ok(Some(batch)) => Box::into_raw(Box::new(batch)) as *mut c_void,
+            Ok(None) => ptr::null_mut(),
+            Err(msg) => { set_catalog_error(msg); ptr::null_mut() }
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_flush(handle: *mut c_void, table_id: i64) -> c_int {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        match engine.flush_family(table_id) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+/// Validate unique index constraints (single-worker path).
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_validate_unique_indices(
+    handle: *mut c_void,
+    table_id: i64,
+    batch_handle: *const c_void,
+) -> c_int {
+    if handle.is_null() || batch_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let batch = unsafe { &*(batch_handle as *const crate::memtable::OwnedBatch) };
+        match engine.validate_unique_indices(table_id, batch) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+/// Validate FK constraints inline (single-worker path).
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_validate_fk_inline(
+    handle: *mut c_void,
+    table_id: i64,
+    batch_handle: *const c_void,
+) -> c_int {
+    if handle.is_null() || batch_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        let batch = unsafe { &*(batch_handle as *const crate::memtable::OwnedBatch) };
+        match engine.validate_fk_inline(table_id, batch) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+// ── Worker support ─────────────────────────────────────────────────────
+
+/// DDL sync: memonly ingest + fire hooks (worker path).  Takes ownership of batch.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_ddl_sync(
+    handle: *mut c_void,
+    table_id: i64,
+    batch_handle: *mut c_void,
+) -> c_int {
+    if handle.is_null() || batch_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let batch = unsafe { *Box::from_raw(batch_handle as *mut crate::memtable::OwnedBatch) };
+        match engine.ddl_sync(table_id, batch) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+/// Raw store ingest (SAL recovery).  Takes ownership of batch.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_raw_store_ingest(
+    handle: *mut c_void,
+    table_id: i64,
+    batch_handle: *mut c_void,
+) -> c_int {
+    if handle.is_null() || batch_handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let batch = unsafe { *Box::from_raw(batch_handle as *mut crate::memtable::OwnedBatch) };
+        match engine.raw_store_ingest(table_id, batch) {
+            Ok(()) => 0,
+            Err(msg) => { set_catalog_error(msg); -1 }
+        }
+    });
+    result.unwrap_or(-99)
+}
+
+// ── Partition management ───────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_set_active_partitions(
+    handle: *mut c_void, start: u32, end: u32,
+) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        engine.set_active_partitions(start, end);
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_close_user_table_partitions(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        engine.close_user_table_partitions();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_trim_worker_partitions(
+    handle: *mut c_void, start: u32, end: u32,
+) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        engine.trim_worker_partitions(start, end);
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_disable_user_table_wal(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        engine.disable_user_table_wal();
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_invalidate_all_plans(handle: *mut c_void) {
+    if handle.is_null() { return; }
+    let _ = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        engine.invalidate_all_plans();
+    });
+}
+
+// ── Metadata queries (for distributed validation) ──────────────────────
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_fk_count(
+    handle: *const c_void, table_id: i64,
+) -> u32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        engine.get_fk_count(table_id) as u32
+    });
+    result.unwrap_or(0)
+}
+
+/// Get FK constraint info.  Writes col_idx, target_table_id, col_type to out params.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_fk_constraint(
+    handle: *const c_void,
+    table_id: i64, idx: u32,
+    out_col_idx: *mut u32,
+    out_target_table_id: *mut i64,
+    out_col_type: *mut u8,
+) -> c_int {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        match engine.get_fk_constraint(table_id, idx as usize) {
+            Some((col_idx, target_id)) => {
+                if !out_col_idx.is_null() {
+                    unsafe { *out_col_idx = col_idx as u32; }
+                }
+                if !out_target_table_id.is_null() {
+                    unsafe { *out_target_table_id = target_id; }
+                }
+                if !out_col_type.is_null() {
+                    let tc = engine.get_fk_col_type(table_id, col_idx);
+                    unsafe { *out_col_type = tc; }
+                }
+                0
+            }
+            None => -1,
+        }
+    });
+    result.unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_index_circuit_count(
+    handle: *const c_void, table_id: i64,
+) -> u32 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        engine.get_index_circuit_count(table_id) as u32
+    });
+    result.unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_index_circuit_info(
+    handle: *const c_void,
+    table_id: i64, idx: u32,
+    out_col_idx: *mut u32,
+    out_is_unique: *mut c_int,
+    out_type_code: *mut u8,
+) -> c_int {
+    if handle.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        match engine.get_index_circuit_info(table_id, idx as usize) {
+            Some((col_idx, is_unique, tc)) => {
+                if !out_col_idx.is_null() { unsafe { *out_col_idx = col_idx; } }
+                if !out_is_unique.is_null() { unsafe { *out_is_unique = if is_unique { 1 } else { 0 }; } }
+                if !out_type_code.is_null() { unsafe { *out_type_code = tc; } }
+                0
+            }
+            None => -1,
+        }
+    });
+    result.unwrap_or(-1)
+}
+
+/// Get index store handle (Table*) for a specific column index.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_index_store(
+    handle: *const c_void, table_id: i64, col_idx: u32,
+) -> *mut c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        engine.get_index_store_handle(table_id, col_idx) as *mut c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+// ── Handle accessors ───────────────────────────────────────────────────
+
+/// Get raw PartitionedTable handle for a user table.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_ptable_handle(
+    handle: *const c_void, table_id: i64,
+) -> *mut c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        match engine.get_ptable_handle(table_id) {
+            Some(ptr) => ptr as *mut c_void,
+            None => ptr::null_mut(),
+        }
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Get the DagEngine handle from a CatalogEngine.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_dag_handle(handle: *mut c_void) -> *mut c_void {
+    if handle.is_null() { return ptr::null_mut(); }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        engine.get_dag_ptr() as *mut c_void
+    });
+    result.unwrap_or(ptr::null_mut())
+}
+
+/// Collect user table IDs into out_ids buffer.  Returns count written.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_iter_user_table_ids(
+    handle: *const c_void,
+    out_ids: *mut i64,
+    max_ids: u32,
+) -> u32 {
+    if handle.is_null() || out_ids.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        let ids = engine.iter_user_table_ids();
+        let n = ids.len().min(max_ids as usize);
+        let out = unsafe { slice::from_raw_parts_mut(out_ids, n) };
+        for (i, id) in ids.iter().take(n).enumerate() {
+            out[i] = *id;
+        }
+        n as u32
+    });
+    result.unwrap_or(0)
+}
+
+/// Get column name for a table at a specific column index.
+/// Writes the name to out_buf (up to max_len bytes). Returns actual length, or -1 on error.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_col_name(
+    handle: *mut c_void,
+    table_id: i64,
+    col_idx: u32,
+    out_buf: *mut u8,
+    max_len: u32,
+) -> i32 {
+    if handle.is_null() || out_buf.is_null() { return -1; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &mut *(handle as *mut crate::catalog::CatalogEngine) };
+        let names = engine.get_column_names(table_id);
+        if (col_idx as usize) >= names.len() { return -1; }
+        let name = &names[col_idx as usize];
+        let copy_len = name.len().min(max_len as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(name.as_ptr(), out_buf, copy_len);
+        }
+        name.len() as i32
+    });
+    result.unwrap_or(-1)
+}
+
+/// Get max flushed LSN for a table.
+#[no_mangle]
+pub extern "C" fn gnitz_catalog_get_max_flushed_lsn(
+    handle: *const c_void, table_id: i64,
+) -> u64 {
+    if handle.is_null() { return 0; }
+    let result = panic::catch_unwind(|| {
+        let engine = unsafe { &*(handle as *const crate::catalog::CatalogEngine) };
+        engine.get_max_flushed_lsn(table_id)
+    });
+    result.unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

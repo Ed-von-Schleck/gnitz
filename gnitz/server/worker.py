@@ -5,9 +5,8 @@
 # sends responses via a per-worker W2M shared region.
 
 import os
-from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
-from rpython.rlib.objectmodel import newlist_hint
-from rpython.rtyper.lltypesystem import rffi
+from rpython.rlib.rarithmetic import r_int64, intmask
+from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz import log
 from gnitz.server import ipc
@@ -16,9 +15,7 @@ from gnitz.core import errors
 from gnitz.storage import mmap_posix
 from gnitz.storage.owned_batch import ArenaZSetBatch
 from gnitz.catalog import system_tables as sys
-from gnitz.catalog.registry import ingest_to_family
-from gnitz.core.types import TYPE_U128
-from gnitz.server.executor import evaluate_dag
+from gnitz.server.executor import evaluate_dag, _catalog_get_schema, _catalog_has_id
 
 
 class WorkerExchangeHandler(object):
@@ -222,7 +219,7 @@ class WorkerProcess(object):
                     intmask(payload.seek_pk_lo) if payload is not None else 0,
                     intmask(payload.seek_pk_hi) if payload is not None else 0,
                 )
-                schema = self.engine.registry.get_by_id(target_id).schema
+                schema = _catalog_get_schema(self.engine, target_id)
                 self._send_response(target_id, result, schema)
                 if result is not None:
                     result.free()
@@ -234,7 +231,7 @@ class WorkerProcess(object):
                     intmask(payload.seek_pk_lo) if payload is not None else 0,
                     intmask(payload.seek_pk_hi) if payload is not None else 0,
                 )
-                schema = self.engine.registry.get_by_id(target_id).schema
+                schema = _catalog_get_schema(self.engine, target_id)
                 self._send_response(target_id, result, schema)
                 if result is not None:
                     result.free()
@@ -242,7 +239,7 @@ class WorkerProcess(object):
 
             # Default: scan
             result = self._handle_scan(target_id)
-            schema = self.engine.registry.get_by_id(target_id).schema
+            schema = _catalog_get_schema(self.engine, target_id)
             self._send_response(target_id, result, schema)
             if result is not None:
                 result.free()
@@ -293,24 +290,39 @@ class WorkerProcess(object):
     def _handle_push(self, target_id, batch):
         """Ingest batch into the local partition store and flush.
         System tables (DDL) evaluate immediately; user tables accumulate until FLAG_TICK."""
-        family = self.engine.registry.get_by_id(target_id)
-        effective = ingest_to_family(family, batch)
-        family.store.flush()
+        cat_h = self.engine._handle
+        tid_ll = rffi.cast(rffi.LONGLONG, target_id)
         if target_id < sys.FIRST_USER_TABLE_ID:
-            evaluate_dag(self.engine, target_id, effective,
+            # System table: ingest via catalog FFI (takes ownership of clone)
+            batch_clone = batch.clone()
+            rc = engine_ffi._catalog_ingest(cat_h, tid_ll, batch_clone._handle)
+            batch_clone._handle = lltype.nullptr(rffi.VOIDP.TO)
+            batch_clone._freed = True
+            if intmask(rc) < 0:
+                raise errors.StorageError("catalog_ingest failed for tid=%d" % target_id)
+            engine_ffi._catalog_flush(cat_h, tid_ll)
+            evaluate_dag(self.engine, target_id, batch,
                          exchange_handler=self.exchange_handler)
-            if effective is not batch:
-                effective.free()
         else:
+            # User table: ingest returning effective delta (takes ownership of clone)
+            batch_clone = batch.clone()
+            eff_handle = engine_ffi._catalog_ingest_effective(
+                cat_h, tid_ll, batch_clone._handle)
+            batch_clone._handle = lltype.nullptr(rffi.VOIDP.TO)
+            batch_clone._freed = True
+            if not eff_handle:
+                raise errors.StorageError(
+                    "catalog_ingest_effective failed for tid=%d" % target_id)
+            engine_ffi._catalog_flush(cat_h, tid_ll)
+            schema = _catalog_get_schema(self.engine, target_id)
+            is_sorted = intmask(engine_ffi._batch_is_sorted(eff_handle)) != 0
+            is_cons = intmask(engine_ffi._batch_is_consolidated(eff_handle)) != 0
+            effective = ArenaZSetBatch._wrap_handle(schema, eff_handle, is_sorted, is_cons)
             if target_id in self.pending_deltas:
                 self.pending_deltas[target_id].append_batch(effective)
-                if effective is not batch:
-                    effective.free()
+                effective.free()
             else:
-                if effective is not batch:
-                    self.pending_deltas[target_id] = effective
-                else:
-                    self.pending_deltas[target_id] = effective.clone()
+                self.pending_deltas[target_id] = effective
         log.debug(
             "W" + str(self.worker_id)
             + " push tid=" + str(target_id)
@@ -323,156 +335,141 @@ class WorkerProcess(object):
             delta = self.pending_deltas[target_id]
             del self.pending_deltas[target_id]
         else:
-            if not self.engine.registry.has_id(target_id):
+            if not _catalog_has_id(self.engine, target_id):
                 return
-            family = self.engine.registry.get_by_id(target_id)
-            delta = ArenaZSetBatch(family.schema)
+            schema = _catalog_get_schema(self.engine, target_id)
+            delta = ArenaZSetBatch(schema)
         evaluate_dag(self.engine, target_id, delta,
                      exchange_handler=self.exchange_handler)
         delta.free()
 
     def _handle_has_pk(self, target_id, batch, col_hint):
         """Check PK existence for FK / unique-index validation."""
-        family = self.engine.registry.get_by_id(target_id)
+        cat_h = self.engine._handle
+        tid_ll = rffi.cast(rffi.LONGLONG, target_id)
         if col_hint > 0:
             col_idx = col_hint - 1
-            store = None
-            schema = None
-            for ic in range(len(family.index_circuits)):
-                circuit = family.index_circuits[ic]
-                if circuit.source_col_idx == col_idx and circuit.is_unique:
-                    store = circuit.table
-                    schema = circuit.table.get_schema()
-                    break
-            if store is None:
+            index_handle = engine_ffi._catalog_get_index_store(
+                cat_h, tid_ll, rffi.cast(rffi.UINT, col_idx))
+            if not index_handle:
                 raise errors.LayoutError(
                     "No unique index on column %d for table %d"
                     % (col_idx, target_id))
+            schema = _catalog_get_schema(self.engine, target_id)
+            result = ArenaZSetBatch(schema)
+            n = batch.length() if batch is not None else 0
+            for i in range(n):
+                exists = intmask(engine_ffi._table_has_pk(
+                    index_handle,
+                    rffi.cast(rffi.ULONGLONG, batch.get_pk_lo(i)),
+                    rffi.cast(rffi.ULONGLONG, batch.get_pk_hi(i)))) != 0
+                w = r_int64(1) if exists else r_int64(0)
+                result._direct_append_row(batch, i, w)
         else:
-            store = family.store
-            schema = family.schema
-
-        result = ArenaZSetBatch(schema)
-        n = batch.length() if batch is not None else 0
-        for i in range(n):
-            exists = store.has_pk(batch.get_pk_lo(i), batch.get_pk_hi(i))
-            w = r_int64(1) if exists else r_int64(0)
-            result._direct_append_row(batch, i, w)
+            ptable_handle = engine_ffi._catalog_get_ptable_handle(cat_h, tid_ll)
+            schema = _catalog_get_schema(self.engine, target_id)
+            result = ArenaZSetBatch(schema)
+            n = batch.length() if batch is not None else 0
+            for i in range(n):
+                if ptable_handle:
+                    exists = intmask(engine_ffi._ptable_has_pk(
+                        ptable_handle,
+                        rffi.cast(rffi.ULONGLONG, batch.get_pk_lo(i)),
+                        rffi.cast(rffi.ULONGLONG, batch.get_pk_hi(i)))) != 0
+                else:
+                    exists = False
+                w = r_int64(1) if exists else r_int64(0)
+                result._direct_append_row(batch, i, w)
         self._send_response(target_id, result, schema)
         result.free()
 
     def _handle_scan(self, target_id):
         """Scan all local partitions for target, return result batch."""
-        family = self.engine.registry.get_by_id(target_id)
-        schema = family.schema
-        result = ArenaZSetBatch(schema)
-        cursor = family.store.create_cursor()
-        try:
-            while cursor.is_valid():
-                w = cursor.weight()
-                if w > r_int64(0):
-                    acc = cursor.get_accessor()
-                    result.append_from_accessor(
-                        cursor.key_lo(), cursor.key_hi(), w, acc)
-                cursor.advance()
-        finally:
-            cursor.close()
-        return result
+        schema = _catalog_get_schema(self.engine, target_id)
+        result_handle = engine_ffi._catalog_scan(
+            self.engine._handle,
+            rffi.cast(rffi.LONGLONG, target_id))
+        if not result_handle:
+            return ArenaZSetBatch(schema)
+        return ArenaZSetBatch._wrap_handle(schema, result_handle, True, True)
 
     def _handle_seek(self, target_id, pk_lo_raw, pk_hi_raw):
         """Point lookup by primary key on this worker's local partitions."""
-        family = self.engine.registry.get_by_id(target_id)
-        cursor = family.store.create_cursor()
-        try:
-            cursor.seek(r_uint64(pk_lo_raw), r_uint64(pk_hi_raw))
-            if not cursor.is_valid():
-                return None
-            if (cursor.key_lo() != r_uint64(pk_lo_raw)
-                    or cursor.key_hi() != r_uint64(pk_hi_raw)):
-                return None
-            w = cursor.weight()
-            if w <= r_int64(0):
-                return None
-            result = ArenaZSetBatch(family.schema, initial_capacity=1)
-            acc = cursor.get_accessor()
-            result.append_from_accessor(
-                r_uint64(pk_lo_raw), r_uint64(pk_hi_raw), w, acc)
-            return result
-        finally:
-            cursor.close()
+        result_handle = engine_ffi._catalog_seek(
+            self.engine._handle,
+            rffi.cast(rffi.LONGLONG, target_id),
+            rffi.cast(rffi.ULONGLONG, pk_lo_raw),
+            rffi.cast(rffi.ULONGLONG, pk_hi_raw))
+        if not result_handle:
+            return None
+        schema = _catalog_get_schema(self.engine, target_id)
+        return ArenaZSetBatch._wrap_handle(schema, result_handle, True, True)
 
     def _handle_seek_by_index(self, target_id, col_idx, key_lo, key_hi):
         """Index-assisted lookup on this worker's local index circuits."""
-        family = self.engine.registry.get_by_id(target_id)
-        circuit = None
-        for c in family.index_circuits:
-            if c.source_col_idx == col_idx:
-                circuit = c
-                break
-        if circuit is None:
+        result_handle = engine_ffi._catalog_seek_by_index(
+            self.engine._handle,
+            rffi.cast(rffi.LONGLONG, target_id),
+            rffi.cast(rffi.UINT, col_idx),
+            rffi.cast(rffi.ULONGLONG, key_lo),
+            rffi.cast(rffi.ULONGLONG, key_hi))
+        if not result_handle:
             return None
-
-        idx_cursor = circuit.table.create_cursor()
-        try:
-            idx_cursor.seek(r_uint64(key_lo), r_uint64(key_hi))
-            if (not idx_cursor.is_valid()
-                    or idx_cursor.key_lo() != r_uint64(key_lo)
-                    or idx_cursor.key_hi() != r_uint64(key_hi)):
-                return None
-            if circuit.source_pk_type.code == TYPE_U128.code:
-                source_pk_lo = idx_cursor.get_accessor().get_u128_lo(1)
-                source_pk_hi = idx_cursor.get_accessor().get_u128_hi(1)
-            else:
-                source_pk_lo = r_uint64(
-                    intmask(idx_cursor.get_accessor().get_int(1)))
-                source_pk_hi = r_uint64(0)
-            src_lo = intmask(source_pk_lo)
-            src_hi = intmask(source_pk_hi)
-        finally:
-            idx_cursor.close()
-        return self._handle_seek(target_id, src_lo, src_hi)
+        schema = _catalog_get_schema(self.engine, target_id)
+        return ArenaZSetBatch._wrap_handle(schema, result_handle, True, True)
 
     def _handle_backfill(self, source_tid, view_id):
         """Scan local partition of source, evaluate DAG for the view."""
-        if not self.engine.registry.has_id(source_tid):
+        if not _catalog_has_id(self.engine, source_tid):
             return
-        family = self.engine.registry.get_by_id(source_tid)
-        schema = family.schema
-        local_batch = ArenaZSetBatch(schema)
-        cursor = family.store.create_cursor()
-        try:
-            while cursor.is_valid():
-                w = cursor.weight()
-                if w > r_int64(0):
-                    acc = cursor.get_accessor()
-                    local_batch.append_from_accessor(
-                        cursor.key_lo(), cursor.key_hi(), w, acc)
-                cursor.advance()
-        finally:
-            cursor.close()
+        schema = _catalog_get_schema(self.engine, source_tid)
+        result_handle = engine_ffi._catalog_scan(
+            self.engine._handle,
+            rffi.cast(rffi.LONGLONG, source_tid))
+        if not result_handle:
+            local_batch = ArenaZSetBatch(schema)
+        else:
+            local_batch = ArenaZSetBatch._wrap_handle(
+                schema, result_handle, True, True)
         evaluate_dag(self.engine, source_tid, local_batch,
                      exchange_handler=self.exchange_handler)
         local_batch.free()
 
     def _handle_ddl_sync(self, target_id, batch):
-        """Replay a system-table delta to keep the local registry in sync."""
+        """Replay a system-table delta to keep the local catalog in sync."""
         if batch is None or batch.length() == 0:
             return
-        family = self.engine.registry.get_by_id(target_id)
-        family.store.ingest_batch_memonly(batch)
-        for h_idx in range(len(family.post_ingest_hooks)):
-            family.post_ingest_hooks[h_idx].on_delta(batch)
+        n_rows = batch.length()
+        batch_clone = batch.clone()
+        rc = engine_ffi._catalog_ddl_sync(
+            self.engine._handle,
+            rffi.cast(rffi.LONGLONG, target_id),
+            batch_clone._handle)
+        batch_clone._handle = lltype.nullptr(rffi.VOIDP.TO)
+        batch_clone._freed = True
+        if intmask(rc) < 0:
+            raise errors.StorageError(
+                "catalog_ddl_sync failed for tid=%d" % target_id)
         log.debug(
             "W" + str(self.worker_id)
             + " ddl_sync tid=" + str(target_id)
-            + " rows=" + str(batch.length())
+            + " rows=" + str(n_rows)
         )
 
     def _handle_flush_all(self):
         """Flush all user-table families to ensure memtable data is durable."""
-        for family in self.engine.registry.iter_families():
-            if family.table_id >= sys.FIRST_USER_TABLE_ID:
-                family.store.flush()
+        MAX_TABLES = 256
+        id_buf = lltype.malloc(rffi.LONGLONGP.TO, MAX_TABLES, flavor="raw")
+        try:
+            n = intmask(engine_ffi._catalog_iter_user_table_ids(
+                self.engine._handle, id_buf, rffi.cast(rffi.UINT, MAX_TABLES)))
+            for i in range(n):
+                tid = intmask(id_buf[i])
+                engine_ffi._catalog_flush(
+                    self.engine._handle,
+                    rffi.cast(rffi.LONGLONG, tid))
+        finally:
+            lltype.free(id_buf, flavor="raw")
 
     def _shutdown(self):
         """Flush all families and exit."""

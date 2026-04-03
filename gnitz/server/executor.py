@@ -3,21 +3,65 @@
 import os
 import time
 from rpython.rlib import jit
-from rpython.rlib.rarithmetic import r_int64, r_uint64, intmask
+from rpython.rlib.rarithmetic import r_uint64, intmask
 from rpython.rlib.objectmodel import newlist_hint
 from rpython.rtyper.lltypesystem import rffi, lltype
 
 from gnitz.server import ipc, ipc_ffi, rust_ffi
 from gnitz.core import errors
 from gnitz.storage.owned_batch import ArenaZSetBatch
-from gnitz.core.types import TYPE_U128
 from gnitz.catalog import system_tables as sys
-from gnitz.catalog.registry import (
-    ingest_to_family, validate_fk_inline, validate_fk_distributed,
-    validate_unique_indices_distributed,
-)
+from gnitz.catalog.engine import catalog_advance_sequence
 from gnitz.storage import engine_ffi
 from gnitz import log
+
+
+def _raise_catalog_error(context):
+    """Raise LayoutError with the last catalog FFI error message."""
+    out_len = lltype.malloc(rffi.UINTP.TO, 1, flavor="raw")
+    try:
+        err_ptr = engine_ffi._catalog_last_error(out_len)
+        elen = intmask(out_len[0])
+        if elen > 0 and err_ptr:
+            msg = rffi.charpsize2str(rffi.cast(rffi.CCHARP, err_ptr), elen)
+        else:
+            msg = context
+    finally:
+        lltype.free(out_len, flavor="raw")
+    raise errors.LayoutError(msg)
+
+
+def _catalog_get_schema(engine, tid):
+    """Get schema for a table/view via catalog FFI, with real column names."""
+    schema_buf = lltype.malloc(rffi.CCHARP.TO, engine_ffi.SCHEMA_DESC_SIZE, flavor="raw")
+    try:
+        rc = engine_ffi._catalog_get_schema_desc(
+            engine._handle, rffi.cast(rffi.LONGLONG, tid),
+            rffi.cast(rffi.VOIDP, schema_buf))
+        if intmask(rc) < 0:
+            raise errors.StorageError("catalog_get_schema_desc failed for tid=%d" % tid)
+        schema = engine_ffi.unpack_schema(schema_buf)
+    finally:
+        lltype.free(schema_buf, flavor="raw")
+    # Fetch real column names from catalog
+    name_buf = lltype.malloc(rffi.CCHARP.TO, 256, flavor="raw")
+    try:
+        for ci in range(len(schema.columns)):
+            nlen = intmask(engine_ffi._catalog_get_col_name(
+                engine._handle, rffi.cast(rffi.LONGLONG, tid),
+                rffi.cast(rffi.UINT, ci),
+                rffi.cast(rffi.VOIDP, name_buf), rffi.cast(rffi.UINT, 256)))
+            if nlen > 0:
+                schema.columns[ci].name = rffi.charpsize2str(name_buf, nlen)
+    finally:
+        lltype.free(name_buf, flavor="raw")
+    return schema
+
+
+def _catalog_has_id(engine, tid):
+    """Check if a table/view id exists in the catalog."""
+    return intmask(engine_ffi._catalog_has_id(
+        engine._handle, rffi.cast(rffi.LONGLONG, tid))) != 0
 
 
 def _op_union_merge(batch_a, batch_b, out):
@@ -149,7 +193,7 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
         return
 
     # ── Multi-worker: RPython DAG loop with DagEngine FFI ────────────
-    registry = engine.registry
+    cat_handle = engine._handle
     dag_handle = engine.dag_handle
 
     # Refresh dep_map
@@ -170,9 +214,10 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
     pending = []
     pending_pos = {}
     for v_id in first_layer:
-        if not registry.has_id(v_id):
+        if not _catalog_has_id(engine, v_id):
             continue
-        d = registry.get_depth(v_id)
+        d = intmask(engine_ffi._catalog_get_depth(
+            cat_handle, rffi.cast(rffi.LONGLONG, v_id)))
         pending.append((d, v_id, initial_source_id, initial_delta.clone()))
     _sort_pending_desc(pending)
     for pi in range(len(pending)):
@@ -213,11 +258,10 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
 
         if has_exchange and exchange_handler is not None:
             # Multi-worker: pre-plan → exchange IPC → post-plan
-            if not registry.has_id(target_view_id):
+            if not _catalog_has_id(engine, target_view_id):
                 incoming_delta.free()
                 continue
-            view_family = registry.get_by_id(target_view_id)
-            view_schema = view_family.schema
+            view_schema = _catalog_get_schema(engine, target_view_id)
 
             # Get exchange schema for pre-plan output wrapping
             ex_schema_buf = lltype.malloc(rffi.CCHARP.TO, engine_ffi.SCHEMA_DESC_SIZE, flavor="raw")
@@ -271,9 +315,9 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                 post_handle = engine_ffi._dag_execute_post_epoch(
                     dag_handle, target_view_id, pre_handle)
                 if post_handle:
-                    view_family = registry.get_by_id(target_view_id)
+                    vschema = _catalog_get_schema(engine, target_view_id)
                     out_delta = ArenaZSetBatch._wrap_handle(
-                        view_family.schema, post_handle, False, False)
+                        vschema, post_handle, False, False)
                 else:
                     out_delta = None
             else:
@@ -296,9 +340,9 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                 exchanged._handle = lltype.nullptr(rffi.VOIDP.TO)
                 exchanged.free()
             if out_handle:
-                view_family = registry.get_by_id(target_view_id)
+                vschema = _catalog_get_schema(engine, target_view_id)
                 out_delta = ArenaZSetBatch._wrap_handle(
-                    view_family.schema, out_handle, False, False)
+                    vschema, out_handle, False, False)
             else:
                 out_delta = None
         else:
@@ -307,18 +351,29 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
             incoming_delta._handle = lltype.nullptr(rffi.VOIDP.TO)
             incoming_delta.free()
             if out_handle:
-                view_family = registry.get_by_id(target_view_id)
+                vschema = _catalog_get_schema(engine, target_view_id)
                 out_delta = ArenaZSetBatch._wrap_handle(
-                    view_family.schema, out_handle, False, False)
+                    vschema, out_handle, False, False)
             else:
                 out_delta = None
 
         has_output = out_delta is not None and out_delta.length() > 0
         if has_output:
-            if registry.has_id(target_view_id):
-                view_family = registry.get_by_id(target_view_id)
-                ingest_to_family(view_family, out_delta)
-                view_family.store.flush()
+            if _catalog_has_id(engine, target_view_id):
+                # Ingest via catalog FFI (takes ownership of batch clone)
+                delta_clone = out_delta.clone()
+                rc = engine_ffi._catalog_ingest(
+                    cat_handle,
+                    rffi.cast(rffi.LONGLONG, target_view_id),
+                    delta_clone._handle)
+                delta_clone._handle = lltype.nullptr(rffi.VOIDP.TO)
+                delta_clone.free()
+                if intmask(rc) < 0:
+                    has_output = False
+                else:
+                    engine_ffi._catalog_flush(
+                        cat_handle,
+                        rffi.cast(rffi.LONGLONG, target_view_id))
             else:
                 has_output = False
 
@@ -336,14 +391,15 @@ def evaluate_dag(engine, initial_source_id, initial_delta,
                         existing_batch.free()
                         pending[found] = (existing_d, existing_id, existing_sid, merged)
                 else:
-                    if not registry.has_id(dep_id):
+                    if not _catalog_has_id(engine, dep_id):
                         continue
-                    d = registry.get_depth(dep_id)
+                    d = intmask(engine_ffi._catalog_get_depth(
+                        cat_handle, rffi.cast(rffi.LONGLONG, dep_id)))
                     if has_output:
                         pending.append((d, dep_id, target_view_id, out_delta.clone()))
                     else:
-                        dep_family = registry.get_by_id(dep_id)
-                        pending.append((d, dep_id, target_view_id, ArenaZSetBatch(dep_family.schema)))
+                        dep_schema = _catalog_get_schema(engine, dep_id)
+                        pending.append((d, dep_id, target_view_id, ArenaZSetBatch(dep_schema)))
                     _sort_pending_desc(pending)
                     pending_pos.clear()
                     for pi in range(len(pending)):
@@ -430,6 +486,9 @@ class ServerExecutor(object):
         self._ingest_lsn        = 0  # global monotonic counter; increments per flush batch
         self._last_tick_lsn     = 0  # ingest_lsn at time of last _fire_pending_ticks()
         self._last_response_lsn = 0  # side-channel from handle_push -> response dispatch
+
+        # Schema cache (tid -> TableSchema with column names)
+        self._schema_cache = {}
 
         # Transport handle (set by run_socket_server)
         self._transport = lltype.nullptr(rffi.VOIDP.TO)
@@ -568,23 +627,26 @@ class ServerExecutor(object):
         # ID allocation — immediate response, no barrier needed
         if target_id == 0:
             if payload.flags & ipc.FLAG_ALLOCATE_TABLE_ID:
-                new_id = self.engine.registry.allocate_table_id()
-                self.engine._advance_sequence(
-                    sys.SEQ_ID_TABLES, new_id - 1, new_id)
+                new_id = intmask(engine_ffi._catalog_allocate_table_id(
+                    self.engine._handle))
+                catalog_advance_sequence(
+                    self.engine._handle, sys.SEQ_ID_TABLES, new_id - 1, new_id)
                 self._send_response(
                     transport, fd, new_id, None, STATUS_OK, "", client_id)
                 return
             if payload.flags & ipc.FLAG_ALLOCATE_SCHEMA_ID:
-                new_id = self.engine.registry.allocate_schema_id()
-                self.engine._advance_sequence(
-                    sys.SEQ_ID_SCHEMAS, new_id - 1, new_id)
+                new_id = intmask(engine_ffi._catalog_allocate_schema_id(
+                    self.engine._handle))
+                catalog_advance_sequence(
+                    self.engine._handle, sys.SEQ_ID_SCHEMAS, new_id - 1, new_id)
                 self._send_response(
                     transport, fd, new_id, None, STATUS_OK, "", client_id)
                 return
             if payload.flags & ipc.FLAG_ALLOCATE_INDEX_ID:
-                new_id = self.engine.registry.allocate_index_id()
-                self.engine._advance_sequence(
-                    sys.SEQ_ID_INDICES, new_id - 1, new_id)
+                new_id = intmask(engine_ffi._catalog_allocate_index_id(
+                    self.engine._handle))
+                catalog_advance_sequence(
+                    self.engine._handle, sys.SEQ_ID_INDICES, new_id - 1, new_id)
                 self._send_response(
                     transport, fd, new_id, None, STATUS_OK, "", client_id)
                 return
@@ -621,7 +683,7 @@ class ServerExecutor(object):
                 transport, target_id, pending)
             self._fire_pending_ticks()
             col_idx = intmask(payload.seek_col_idx)
-            schema = self.engine.registry.get_by_id(target_id).schema
+            schema = _catalog_get_schema(self.engine, target_id)
             if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
                 result = self.dispatcher.fan_out_seek_by_index(
                     target_id, col_idx,
@@ -643,7 +705,7 @@ class ServerExecutor(object):
         if payload.flags & ipc.FLAG_SEEK:
             self._flush_pending_for_tid(
                 transport, target_id, pending)
-            schema = self.engine.registry.get_by_id(target_id).schema
+            schema = _catalog_get_schema(self.engine, target_id)
             if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
                 result = self.dispatcher.fan_out_seek(
                     target_id,
@@ -660,25 +722,33 @@ class ServerExecutor(object):
                 result.free()
             return
 
-        family = None
-        if payload.batch is not None:
-            family = self.engine.registry.get_by_id(target_id)
+        target_schema = None
+        has_batch = payload.batch is not None
+        if has_batch:
+            target_schema = _catalog_get_schema(self.engine, target_id)
             if payload.schema is not None:
-                _validate_schema_match(payload.schema, family.schema)
+                _validate_schema_match(payload.schema, target_schema)
 
         # Bufferable: multi-worker user-table DML with data
         if (
             self.dispatcher is not None
             and target_id >= sys.FIRST_USER_TABLE_ID
-            and family is not None
+            and has_batch
             and payload.batch.length() > 0
         ):
-            validate_fk_distributed(
-                family, payload.batch, self.dispatcher)
-            validate_unique_indices_distributed(
-                family, payload.batch, self.dispatcher)
+            cat_h = self.engine._handle
+            rc = engine_ffi._catalog_validate_fk_inline(
+                cat_h, rffi.cast(rffi.LONGLONG, target_id),
+                payload.batch._handle)
+            if intmask(rc) < 0:
+                _raise_catalog_error("FK validation failed")
+            rc = engine_ffi._catalog_validate_unique_indices(
+                cat_h, rffi.cast(rffi.LONGLONG, target_id),
+                payload.batch._handle)
+            if intmask(rc) < 0:
+                _raise_catalog_error("Unique index violation")
             cloned = payload.batch.clone()
-            pending.add(fd, client_id, target_id, cloned, family.schema)
+            pending.add(fd, client_id, target_id, cloned, target_schema)
             return
 
         # Non-bufferable: flush pushes for this table, then process inline
@@ -691,19 +761,21 @@ class ServerExecutor(object):
         if (
             self.dispatcher is not None
             and target_id < sys.FIRST_USER_TABLE_ID
-            and family is not None
+            and has_batch
             and payload.batch.length() > 0
         ):
+            if target_schema is None:
+                target_schema = _catalog_get_schema(self.engine, target_id)
             self.dispatcher.broadcast_ddl(
-                target_id, payload.batch, family.schema)
+                target_id, payload.batch, target_schema)
 
         resp_schema = None
         if result is not None:
             resp_schema = result._schema
-        elif family is not None:
-            resp_schema = family.schema
+        elif target_schema is not None:
+            resp_schema = target_schema
         else:
-            resp_schema = self.engine.registry.get_by_id(target_id).schema
+            resp_schema = _catalog_get_schema(self.engine, target_id)
         self._send_response(
             transport, fd, target_id, result, STATUS_OK, "",
             client_id, schema=resp_schema, seek_pk_lo=lsn)
@@ -749,11 +821,19 @@ class ServerExecutor(object):
         to worker processes. System tables stay local to master.
         """
         if self.dispatcher is not None and target_id >= sys.FIRST_USER_TABLE_ID:
-            family = self.engine.registry.get_by_id(target_id)
-            schema = family.schema
+            schema = _catalog_get_schema(self.engine, target_id)
             if in_batch is not None and in_batch.length() > 0:
-                validate_fk_distributed(family, in_batch, self.dispatcher)
-                validate_unique_indices_distributed(family, in_batch, self.dispatcher)
+                cat_h = self.engine._handle
+                rc = engine_ffi._catalog_validate_fk_inline(
+                    cat_h, rffi.cast(rffi.LONGLONG, target_id),
+                    in_batch._handle)
+                if intmask(rc) < 0:
+                    _raise_catalog_error("FK validation failed")
+                rc = engine_ffi._catalog_validate_unique_indices(
+                    cat_h, rffi.cast(rffi.LONGLONG, target_id),
+                    in_batch._handle)
+                if intmask(rc) < 0:
+                    _raise_catalog_error("Unique index violation")
                 self.dispatcher.fan_out_push(target_id, in_batch, schema)
                 return None  # (non-socket path; LSN not tracked here)
             else:
@@ -762,13 +842,46 @@ class ServerExecutor(object):
                 return self.dispatcher.fan_out_scan(target_id, schema)
 
         if in_batch is not None and in_batch.length() > 0:
-            family = self.engine.registry.get_by_id(target_id)
-            validate_fk_inline(family, in_batch)
-            effective = ingest_to_family(family, in_batch)
-            family.store.flush()
-            self._evaluate_dag(target_id, effective)
-            if effective is not in_batch:
-                effective.free()
+            cat_h = self.engine._handle
+            if target_id >= sys.FIRST_USER_TABLE_ID:
+                # User table: FK validation + ingest + flush + DAG cascade
+                # in one combined call (ensures unique_pk effective batch
+                # propagates correctly to views).
+                rc = engine_ffi._catalog_validate_fk_inline(
+                    cat_h,
+                    rffi.cast(rffi.LONGLONG, target_id),
+                    in_batch._handle)
+                if intmask(rc) < 0:
+                    _raise_catalog_error("FK validation failed for tid=%d" % target_id)
+                rc = engine_ffi._catalog_validate_unique_indices(
+                    cat_h,
+                    rffi.cast(rffi.LONGLONG, target_id),
+                    in_batch._handle)
+                if intmask(rc) < 0:
+                    _raise_catalog_error("Unique index violation for tid=%d" % target_id)
+                # Transfer ownership of in_batch to Rust (no clone needed).
+                rc = engine_ffi._catalog_push_and_evaluate(
+                    cat_h,
+                    rffi.cast(rffi.LONGLONG, target_id),
+                    in_batch._handle)
+                in_batch._handle = lltype.nullptr(rffi.VOIDP.TO)
+                if intmask(rc) < 0:
+                    _raise_catalog_error("push_and_evaluate failed for tid=%d" % target_id)
+            else:
+                # System table: ingest + flush + DAG (no unique_pk concern)
+                batch_clone = in_batch.clone()
+                rc = engine_ffi._catalog_ingest(
+                    cat_h,
+                    rffi.cast(rffi.LONGLONG, target_id),
+                    batch_clone._handle)
+                batch_clone._handle = lltype.nullptr(rffi.VOIDP.TO)
+                batch_clone.free()
+                if intmask(rc) < 0:
+                    _raise_catalog_error("Ingest failed for tid=%d" % target_id)
+                engine_ffi._catalog_flush(
+                    cat_h,
+                    rffi.cast(rffi.LONGLONG, target_id))
+                self._evaluate_dag(target_id, in_batch)
             self._ingest_lsn += 1
             self._last_tick_lsn = self._ingest_lsn
             self._last_response_lsn = self._ingest_lsn
@@ -777,72 +890,48 @@ class ServerExecutor(object):
             self._last_response_lsn = self._last_tick_lsn
             return self._scan_family(target_id)
 
+    def _get_cached_schema(self, target_id):
+        """Get schema with caching to avoid repeated FFI column name lookups."""
+        if target_id in self._schema_cache:
+            return self._schema_cache[target_id]
+        schema = _catalog_get_schema(self.engine, target_id)
+        self._schema_cache[target_id] = schema
+        return schema
+
     def _scan_family(self, target_id):
         """Build a batch containing every positive-weight row in the target."""
-        family = self.engine.registry.get_by_id(target_id)
-        schema = family.schema
-        result = ArenaZSetBatch(schema)
-        cursor = family.store.create_cursor()
-        try:
-            while cursor.is_valid():
-                w = cursor.weight()
-                if w > r_int64(0):
-                    acc = cursor.get_accessor()
-                    result.append_from_accessor(cursor.key_lo(), cursor.key_hi(), w, acc)
-                cursor.advance()
-        finally:
-            cursor.close()
-        return result
+        schema = self._get_cached_schema(target_id)
+        result_handle = engine_ffi._catalog_scan(
+            self.engine._handle,
+            rffi.cast(rffi.LONGLONG, target_id))
+        if not result_handle:
+            return ArenaZSetBatch(schema)
+        return ArenaZSetBatch._wrap_handle(schema, result_handle, True, True)
 
     def _seek_family(self, target_id, pk_lo_raw, pk_hi_raw):
         """Point lookup: returns a one-row ArenaZSetBatch or None."""
-        family = self.engine.registry.get_by_id(target_id)
-        cursor = family.store.create_cursor()
-        try:
-            cursor.seek(r_uint64(pk_lo_raw), r_uint64(pk_hi_raw))
-            if not cursor.is_valid():
-                return None
-            if cursor.key_lo() != r_uint64(pk_lo_raw) or cursor.key_hi() != r_uint64(pk_hi_raw):
-                return None
-            w = cursor.weight()
-            if w <= r_int64(0):
-                return None
-            result = ArenaZSetBatch(family.schema, initial_capacity=1)
-            acc = cursor.get_accessor()
-            result.append_from_accessor(r_uint64(pk_lo_raw), r_uint64(pk_hi_raw), w, acc)
-            return result
-        finally:
-            cursor.close()
+        result_handle = engine_ffi._catalog_seek(
+            self.engine._handle,
+            rffi.cast(rffi.LONGLONG, target_id),
+            rffi.cast(rffi.ULONGLONG, pk_lo_raw),
+            rffi.cast(rffi.ULONGLONG, pk_hi_raw))
+        if not result_handle:
+            return None
+        schema = self._get_cached_schema(target_id)
+        return ArenaZSetBatch._wrap_handle(schema, result_handle, True, True)
 
     def _seek_by_index(self, table_id, col_idx, key_lo, key_hi):
-        """Index-assisted point lookup. Returns single-row batch or None."""
-        family = self.engine.registry.get_by_id(table_id)
-        circuit = None
-        for c in family.index_circuits:
-            if c.source_col_idx == col_idx:
-                circuit = c
-                break
-        if circuit is None:
-            return None   # no index on this column
-
-        idx_cursor = circuit.table.create_cursor()
-        try:
-            idx_cursor.seek(r_uint64(key_lo), r_uint64(key_hi))
-            if not idx_cursor.is_valid() or idx_cursor.key_lo() != r_uint64(key_lo) or idx_cursor.key_hi() != r_uint64(key_hi):
-                return None
-            # source_pk is at col 1 in the 2-col index schema.
-            # Type dispatch needed: source_pk_type is U64 or U128.
-            if circuit.source_pk_type.code == TYPE_U128.code:
-                source_pk_lo = idx_cursor.get_accessor().get_u128_lo(1)
-                source_pk_hi = idx_cursor.get_accessor().get_u128_hi(1)
-            else:
-                source_pk_lo = r_uint64(intmask(idx_cursor.get_accessor().get_int(1)))
-                source_pk_hi = r_uint64(0)
-            src_lo = intmask(source_pk_lo)
-            src_hi = intmask(source_pk_hi)
-        finally:
-            idx_cursor.close()
-        return self._seek_family(table_id, src_lo, src_hi)
+        """Index-assisted point lookup via catalog FFI. Returns single-row batch or None."""
+        result_handle = engine_ffi._catalog_seek_by_index(
+            self.engine._handle,
+            rffi.cast(rffi.LONGLONG, table_id),
+            rffi.cast(rffi.UINT, col_idx),
+            rffi.cast(rffi.ULONGLONG, key_lo),
+            rffi.cast(rffi.ULONGLONG, key_hi))
+        if not result_handle:
+            return None
+        schema = self._get_cached_schema(table_id)
+        return ArenaZSetBatch._wrap_handle(schema, result_handle, True, True)
 
     def _flush_pending_for_tid(self, transport, target_id, pending):
         """Flush only pending pushes for a specific target_id."""
@@ -965,7 +1054,7 @@ class ServerExecutor(object):
             del self._tick_schemas[tid]
             del self._tick_rows[tid]
             # Table may have been dropped between ingest and tick; skip if gone.
-            if not self.engine.registry.has_id(tid):
+            if not _catalog_has_id(self.engine, tid):
                 continue
             try:
                 self.dispatcher.fan_out_tick(tid, schema)
@@ -1021,7 +1110,7 @@ class ServerExecutor(object):
         if tid in self._tick_queue_schemas:
             del self._tick_queue_schemas[tid]
 
-        if schema is None or not self.engine.registry.has_id(tid):
+        if schema is None or not _catalog_has_id(self.engine, tid):
             # Table dropped or schema missing; skip to next
             if len(self._tick_queue_tids) > 0:
                 self._start_next_async_tick()
@@ -1079,8 +1168,8 @@ class ServerExecutor(object):
             req = deferred[i]
             try:
                 if req.flags & ipc.FLAG_SEEK_BY_INDEX:
-                    schema = self.engine.registry.get_by_id(
-                        req.target_id).schema
+                    schema = _catalog_get_schema(
+                        self.engine, req.target_id)
                     if (self.dispatcher is not None
                             and req.target_id >= sys.FIRST_USER_TABLE_ID):
                         result = self.dispatcher.fan_out_seek_by_index(
@@ -1098,8 +1187,8 @@ class ServerExecutor(object):
                     if result is not None:
                         result.free()
                 elif req.flags & ipc.FLAG_SEEK:
-                    schema = self.engine.registry.get_by_id(
-                        req.target_id).schema
+                    schema = _catalog_get_schema(
+                        self.engine, req.target_id)
                     if (self.dispatcher is not None
                             and req.target_id >= sys.FIRST_USER_TABLE_ID):
                         result = self.dispatcher.fan_out_seek(
@@ -1118,8 +1207,8 @@ class ServerExecutor(object):
                 else:
                     # Deferred scan (empty-batch push)
                     self._last_response_lsn = self._last_tick_lsn
-                    schema = self.engine.registry.get_by_id(
-                        req.target_id).schema
+                    schema = _catalog_get_schema(
+                        self.engine, req.target_id)
                     if self.dispatcher is not None:
                         result = self.dispatcher.fan_out_scan(
                             req.target_id, schema)
