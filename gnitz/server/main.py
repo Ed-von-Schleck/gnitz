@@ -19,7 +19,6 @@ from gnitz.server import ipc
 from gnitz.storage import engine_ffi
 from gnitz.server.master import MasterDispatcher
 from gnitz.dbsp.ops.exchange import PartitionAssignment
-from gnitz.server.worker import WorkerProcess
 
 
 def _backfill_exchange_views(engine, dispatcher):
@@ -335,10 +334,17 @@ def entry_point(argv):
             wtag = "W" + str(w)
             log.set_process_tag(wtag)
             engine_ffi.log_init(level, wtag)
-            WorkerProcess(w, master_pid, engine, part_start, part_end,
-                          sal_ptr, m2w_efds[w], w2m_regions[w],
-                          w2m_efds[w]).run()
-            os._exit(0)
+            engine_ffi._worker_run(
+                engine._handle,
+                rffi.cast(rffi.UINT, w),
+                rffi.cast(rffi.INT, master_pid),
+                sal_ptr,
+                rffi.cast(rffi.INT, m2w_efds[w]),
+                w2m_regions[w].ptr,
+                rffi.cast(rffi.ULONGLONG, w2m_regions[w].size),
+                rffi.cast(rffi.INT, w2m_efds[w]),
+            )
+            os._exit(0)  # defensive — Rust worker exits via libc::_exit
 
         worker_pids[w] = pid
 

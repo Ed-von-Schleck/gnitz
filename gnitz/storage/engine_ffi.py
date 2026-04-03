@@ -258,6 +258,12 @@ eci = ExternalCompilationInfo(
         "  const int32_t *nodes_ptr, uint32_t nodes_count,"
         "  const int32_t *edges_ptr, uint32_t edges_count,"
         "  const int64_t *sources_ptr, uint32_t sources_count);",
+        # Worker process
+        "int32_t gnitz_worker_run("
+        "  void *catalog_handle, uint32_t worker_id, int32_t master_pid,"
+        "  const uint8_t *sal_ptr, int32_t m2w_efd,"
+        "  uint8_t *w2m_region_ptr, uint64_t w2m_region_size,"
+        "  int32_t w2m_efd);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -1170,6 +1176,19 @@ _dag_execute_post_epoch = rffi.llexternal(
 _dag_plan_source_co_partitioned = rffi.llexternal(
     "gnitz_dag_plan_source_co_partitioned",
     [rffi.VOIDP, rffi.LONGLONG, rffi.LONGLONG],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+# ---------------------------------------------------------------------------
+# Worker process
+# ---------------------------------------------------------------------------
+
+_worker_run = rffi.llexternal(
+    "gnitz_worker_run",
+    [rffi.VOIDP, rffi.UINT, rffi.INT,
+     rffi.CCHARP, rffi.INT,
+     rffi.CCHARP, rffi.ULONGLONG, rffi.INT],
     rffi.INT,
     compilation_info=eci,
 )

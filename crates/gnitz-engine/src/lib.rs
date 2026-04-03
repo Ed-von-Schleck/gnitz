@@ -27,4 +27,5 @@ pub mod dag;
 pub mod ipc_sys;
 pub mod ipc;
 pub mod catalog;
+pub mod worker;
 pub mod ffi;

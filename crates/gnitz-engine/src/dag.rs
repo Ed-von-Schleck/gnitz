@@ -6,7 +6,7 @@
 //!
 //! Single-worker hot path: **1 FFI call per epoch** instead of ~5 per view.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::compact::SchemaDescriptor;
 use crate::compiler::{self, CompileOutput, ExternalTable};
@@ -14,7 +14,7 @@ use crate::memtable::OwnedBatch;
 use crate::ops;
 use crate::read_cursor::CursorHandle;
 use crate::table::Table;
-use crate::vm::{self, VmHandle};
+use crate::vm;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -140,6 +140,24 @@ pub struct ExchangeInfo {
     pub shard_cols: Vec<i32>,
     pub is_trivial: bool,
     pub is_co_partitioned: bool,
+}
+
+// ---------------------------------------------------------------------------
+// ExchangeCallback — trait for multi-worker exchange IPC
+// ---------------------------------------------------------------------------
+
+/// Callback trait for exchange IPC between workers.
+///
+/// The worker event loop implements this trait to send pre-exchange output
+/// to the master (via W2M) and receive relayed data (via SAL).
+/// This breaks the circular dependency between worker.rs ↔ dag.rs.
+pub trait ExchangeCallback {
+    fn do_exchange(
+        &mut self,
+        view_id: i64,
+        batch: &OwnedBatch,
+        source_id: i64,
+    ) -> OwnedBatch;
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,6 +1139,180 @@ impl DagEngine {
                     // Re-sort to maintain descending depth order
                     pending.sort_by(|a, b| b.depth.cmp(&a.depth));
                     // Rebuild pending_pos
+                    pending_pos.clear();
+                    for (i, pe) in pending.iter().enumerate() {
+                        pending_pos.insert((pe.view_id, pe.source_id), i);
+                    }
+                }
+            }
+        }
+
+        0
+    }
+
+    // ── evaluate_dag_multi_worker ──────────────────────────────────────
+
+    /// Multi-worker DAG evaluation with exchange IPC.
+    ///
+    /// Near-copy of `evaluate_dag()` with these critical differences:
+    /// 1. Exchange views: call `exchange.do_exchange()` between pre and post
+    ///    phases — unless `skip_exchange` (both trivial AND co-partitioned).
+    /// 2. Join shard exchange: when `get_join_shard_cols` is non-empty AND NOT
+    ///    `plan_source_co_partitioned`, call exchange before execute_epoch.
+    /// 3. Always queue downstream views even when output is empty (ensures
+    ///    exchange-dependent views still fire).
+    /// 4. Exchange schema: use `get_exchange_schema()` for pre-plan output,
+    ///    not the view's output schema.
+    pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(
+        &mut self,
+        source_id: i64,
+        delta: OwnedBatch,
+        exchange: &mut E,
+    ) -> i32 {
+        gnitz_debug!("dag: evaluate_dag_multi_worker source_id={} delta_count={}",
+            source_id, delta.count);
+
+        self.get_dep_map();
+        let view_ids: Vec<i64> = self.dep_map
+            .get(&source_id)
+            .cloned()
+            .unwrap_or_default();
+
+        if view_ids.is_empty() {
+            return 0;
+        }
+
+        struct PendingEntry {
+            depth: i32,
+            view_id: i64,
+            source_id: i64,
+            batch: OwnedBatch,
+        }
+
+        let mut pending: Vec<PendingEntry> = Vec::new();
+        let mut pending_pos: HashMap<(i64, i64), usize> = HashMap::new();
+
+        for &vid in &view_ids {
+            let depth = match self.tables.get(&vid) {
+                Some(e) => e.depth,
+                None => continue,
+            };
+            pending.push(PendingEntry {
+                depth,
+                view_id: vid,
+                source_id,
+                batch: delta.clone_batch(),
+            });
+        }
+
+        pending.sort_by(|a, b| b.depth.cmp(&a.depth));
+        for (i, pe) in pending.iter().enumerate() {
+            pending_pos.insert((pe.view_id, pe.source_id), i);
+        }
+
+        while let Some(entry) = pending.pop() {
+            let view_id = entry.view_id;
+            let src_id = entry.source_id;
+            let input = entry.batch;
+            pending_pos.remove(&(view_id, src_id));
+
+            if !self.tables.contains_key(&view_id) {
+                continue;
+            }
+
+            let has_exchange = self.view_needs_exchange(view_id);
+
+            let has_join_shard = {
+                let cols = self.get_join_shard_cols(view_id, src_id);
+                !cols.is_empty()
+            };
+
+            let skip_exchange = {
+                let info = self.get_exchange_info(view_id);
+                info.is_trivial && info.is_co_partitioned
+            };
+
+            let out_delta = if has_exchange {
+                // Exchange view: pre-plan → exchange IPC → post-plan
+                let exchange_schema = self.get_exchange_schema(view_id)
+                    .unwrap_or_else(|| self.tables[&view_id].schema);
+
+                let pre_result = match self.execute_plan_phase(view_id, true, input, src_id) {
+                    Some(mut batch) => {
+                        batch.schema = Some(exchange_schema);
+                        batch
+                    }
+                    None => OwnedBatch::with_schema(exchange_schema, 0),
+                };
+
+                if skip_exchange {
+                    self.execute_plan_phase(view_id, false, pre_result, 0)
+                } else {
+                    let exchanged = exchange.do_exchange(view_id, &pre_result, 0);
+                    self.execute_plan_phase(view_id, false, exchanged, 0)
+                }
+            } else if has_join_shard {
+                // Join shard exchange
+                let copart_join = self.plan_source_co_partitioned(view_id, src_id);
+                if copart_join {
+                    self.execute_plan_phase(view_id, true, input, src_id)
+                } else {
+                    let exchanged = exchange.do_exchange(view_id, &input, src_id);
+                    self.execute_plan_phase(view_id, true, exchanged, src_id)
+                }
+            } else {
+                // No exchange: simple single-phase execution
+                self.execute_plan_phase(view_id, true, input, src_id)
+            };
+
+            let has_output = out_delta.as_ref().map(|b| b.count > 0).unwrap_or(false);
+            if has_output {
+                let out = out_delta.as_ref().unwrap();
+                self.ingest_to_family(view_id, out.clone_batch());
+                let _ = self.flush(view_id);
+            }
+
+            // Multi-worker: ALWAYS queue dependents (even empty output)
+            let dep_view_ids: Vec<i64> = self.dep_map
+                .get(&view_id)
+                .cloned()
+                .unwrap_or_default();
+
+            for dep_id in dep_view_ids {
+                let (dep_depth, dep_schema) = match self.tables.get(&dep_id) {
+                    Some(e) => (e.depth, e.schema),
+                    None => continue,
+                };
+
+                if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
+                    if existing_idx < pending.len() && has_output {
+                        let schema = pending[existing_idx].batch.schema.unwrap_or(dep_schema);
+                        let merged = ops::op_union(
+                            &pending[existing_idx].batch,
+                            out_delta.as_ref(),
+                            &schema,
+                        );
+                        pending[existing_idx].batch = merged;
+                    }
+                } else {
+                    let new_idx = pending.len();
+                    if has_output {
+                        pending.push(PendingEntry {
+                            depth: dep_depth,
+                            view_id: dep_id,
+                            source_id: view_id,
+                            batch: out_delta.as_ref().unwrap().clone_batch(),
+                        });
+                    } else {
+                        pending.push(PendingEntry {
+                            depth: dep_depth,
+                            view_id: dep_id,
+                            source_id: view_id,
+                            batch: OwnedBatch::with_schema(dep_schema, 0),
+                        });
+                    }
+                    pending_pos.insert((dep_id, view_id), new_idx);
+                    pending.sort_by(|a, b| b.depth.cmp(&a.depth));
                     pending_pos.clear();
                     for (i, pe) in pending.iter().enumerate() {
                         pending_pos.insert((pe.view_id, pe.source_id), i);

@@ -4518,6 +4518,53 @@ pub extern "C" fn gnitz_catalog_get_max_flushed_lsn(
 }
 
 // ---------------------------------------------------------------------------
+// Worker process FFI
+// ---------------------------------------------------------------------------
+
+/// Run the worker process event loop.
+///
+/// Called from the forked child process after SAL recovery. This function
+/// does not return normally — the worker exits via `libc::_exit(0)` on
+/// shutdown or master crash.
+///
+/// Returns 0 on clean exit (defensive — should not reach caller).
+/// On panic, writes to stderr and calls `libc::_exit(1)`.
+#[no_mangle]
+pub extern "C" fn gnitz_worker_run(
+    catalog_handle: *mut c_void,
+    worker_id: u32,
+    master_pid: i32,
+    sal_ptr: *const u8,
+    m2w_efd: i32,
+    w2m_region_ptr: *mut u8,
+    w2m_region_size: u64,
+    w2m_efd: i32,
+) -> i32 {
+    let result = panic::catch_unwind(|| {
+        let catalog = catalog_handle as *mut crate::catalog::CatalogEngine;
+        let mut worker = crate::worker::WorkerProcess::new(
+            worker_id,
+            master_pid,
+            catalog,
+            sal_ptr,
+            m2w_efd,
+            w2m_region_ptr,
+            w2m_region_size,
+            w2m_efd,
+        );
+        worker.run()
+    });
+    match result {
+        Ok(rc) => rc,
+        Err(_) => {
+            let msg = format!("W{} PANIC in worker_run\n", worker_id);
+            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            unsafe { libc::_exit(1); }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 
