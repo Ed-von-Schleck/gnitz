@@ -281,12 +281,3 @@ def catalog_drop_index(handle, index_name):
     finally:
         rffi.free_charp(buf)
     _check_ffi_result(rc, "drop_index")
-
-
-def catalog_advance_sequence(handle, seq_id, old_val, new_val):
-    engine_ffi._catalog_advance_sequence(
-        handle,
-        rffi.cast(rffi.LONGLONG, seq_id),
-        rffi.cast(rffi.LONGLONG, old_val),
-        rffi.cast(rffi.LONGLONG, new_val),
-    )

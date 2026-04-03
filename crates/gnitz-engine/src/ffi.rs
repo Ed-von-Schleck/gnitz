@@ -4861,6 +4861,46 @@ pub extern "C" fn gnitz_master_validate_unique_distributed(
 }
 
 // ---------------------------------------------------------------------------
+// ServerExecutor FFI
+// ---------------------------------------------------------------------------
+
+/// Run the server executor event loop. This is the single FFI entry point for
+/// the entire client-facing event loop.
+///
+/// - `catalog_handle`: pointer to CatalogEngine (created via gnitz_catalog_open)
+/// - `dispatcher_handle`: pointer to MasterDispatcher (or null for single-worker)
+/// - `server_fd`: bound+listening Unix domain socket fd
+///
+/// Returns 0 on clean exit, -1 on error.
+#[no_mangle]
+pub extern "C" fn gnitz_executor_run(
+    catalog_handle: *mut c_void,
+    dispatcher_handle: *mut c_void,
+    server_fd: i32,
+) -> i32 {
+    if catalog_handle.is_null() || server_fd < 0 {
+        return -1;
+    }
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let catalog = catalog_handle as *mut crate::catalog::CatalogEngine;
+        let dispatcher = if dispatcher_handle.is_null() {
+            None
+        } else {
+            Some(dispatcher_handle as *mut crate::master::MasterDispatcher)
+        };
+        crate::executor::ServerExecutor::run(catalog, dispatcher, server_fd)
+    }));
+    match result {
+        Ok(rc) => rc,
+        Err(_) => {
+            let msg = b"PANIC in executor_run\n";
+            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            -1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FFI tests
 // ---------------------------------------------------------------------------
 

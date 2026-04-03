@@ -14,8 +14,7 @@ from rpython.rlib.rarithmetic import r_uint64
 from gnitz.catalog.engine import open_engine
 from gnitz.storage import mmap_posix
 from gnitz.storage.mmap_posix import raise_fd_limit
-from gnitz.server.executor import ServerExecutor
-from gnitz.server import ipc
+from gnitz.server import ipc, ipc_ffi
 from gnitz.storage import engine_ffi
 from gnitz.server.master import MasterDispatcher
 from gnitz.dbsp.ops.exchange import PartitionAssignment
@@ -238,8 +237,15 @@ def entry_point(argv):
 
     if num_workers == 1:
         log.info("Listening on " + socket_path)
+        server_fd = ipc_ffi.server_create(socket_path)
+        if server_fd < 0:
+            os.write(2, "Error: failed to create server socket\n")
+            return 1
         os.write(1, "GnitzDB ready\n")
-        ServerExecutor(engine).run_socket_server(socket_path)
+        engine_ffi._executor_run(
+            engine._handle,
+            lltype.nullptr(rffi.VOIDP.TO),
+            rffi.cast(rffi.INT, server_fd))
         return 0
 
     # Multi-worker mode: allocate shared resources, fork workers
@@ -376,8 +382,15 @@ def entry_point(argv):
     _backfill_exchange_views(engine, dispatcher)
 
     log.info("Listening on " + socket_path)
+    server_fd = ipc_ffi.server_create(socket_path)
+    if server_fd < 0:
+        os.write(2, "Error: failed to create server socket\n")
+        return 1
     os.write(1, "GnitzDB ready\n")
-    ServerExecutor(engine, dispatcher).run_socket_server(socket_path)
+    engine_ffi._executor_run(
+        engine._handle,
+        dispatcher._handle,
+        rffi.cast(rffi.INT, server_fd))
     return 0
 
 

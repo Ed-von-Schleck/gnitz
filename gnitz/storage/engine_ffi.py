@@ -292,6 +292,9 @@ eci = ExternalCompilationInfo(
         "void gnitz_master_shutdown_workers(void *handle);",
         "int32_t gnitz_master_validate_unique_distributed("
         "  void *handle, int64_t target_id, const void *batch);",
+        # ServerExecutor
+        "int32_t gnitz_executor_run("
+        "  void *catalog_handle, void *dispatcher_handle, int32_t server_fd);",
     ],
     link_files=[_lib_path] if _lib_path else [],
 )
@@ -1358,6 +1361,13 @@ _master_shutdown_workers = rffi.llexternal(
 _master_validate_unique_distributed = rffi.llexternal(
     "gnitz_master_validate_unique_distributed",
     [rffi.VOIDP, rffi.LONGLONG, rffi.VOIDP],
+    rffi.INT,
+    compilation_info=eci,
+)
+
+_executor_run = rffi.llexternal(
+    "gnitz_executor_run",
+    [rffi.VOIDP, rffi.VOIDP, rffi.INT],
     rffi.INT,
     compilation_info=eci,
 )

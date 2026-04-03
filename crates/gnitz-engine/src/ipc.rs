@@ -164,6 +164,9 @@ fn batch_to_schema(batch: &OwnedBatch) -> Result<(SchemaDescriptor, Vec<Vec<u8>>
     if batch.count == 0 {
         return Err("empty schema batch");
     }
+    if batch.count > 64 {
+        return Err("schema exceeds 64-column limit");
+    }
     let mut sd = SchemaDescriptor {
         num_columns: batch.count as u32,
         pk_index: 0,
