@@ -492,21 +492,19 @@ mod tests {
 
     #[test]
     fn test_op_filter_basic() {
-        use crate::scalar_func::ScalarFuncKind;
+        use crate::scalar_func::{Plan, ScalarFuncKind};
         use crate::expr::ExprProgram;
 
         let schema = make_schema_u64_i64();
-        // 3 rows: pk=1 val=5, pk=2 val=15, pk=3 val=25
         let batch = make_batch(&schema, &[(1, 1, 5), (2, 1, 15), (3, 1, 25)]);
 
-        // Predicate: col1 > 10
         let code = vec![
             1i64, 0, 1, 0,  // LOAD_COL_INT r0 = col[1]
             3, 1, 10, 0,    // LOAD_CONST r1 = 10
             17, 2, 0, 1,    // CMP_GT r2 = (r0 > r1)
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let func = ScalarFuncKind::ExprPredicate(prog);
+        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog));
 
         let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2, "only pk=2 and pk=3 pass val>10");
@@ -516,14 +514,19 @@ mod tests {
 
     #[test]
     fn test_op_filter_consolidated_flag() {
-        use crate::scalar_func::ScalarFuncKind;
+        use crate::scalar_func::{Plan, ScalarFuncKind};
+        use crate::expr::ExprProgram;
 
-        // Null func passes everything
+        let code = vec![
+            3i64, 0, 1, 0,  // LOAD_CONST r0 = 1 (always true)
+        ];
+        let prog = ExprProgram::new(code, 1, 0, vec![]);
+        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog));
+
         let schema = make_schema_u64_i64();
         let mut batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
         batch.consolidated = true;
 
-        let func = ScalarFuncKind::Null;
         let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2);
         assert!(out.consolidated, "consolidated input + pass-all → consolidated output");
@@ -542,7 +545,6 @@ mod tests {
         assert_eq!(out.count, 2);
         assert_eq!(out.get_weight(0), -3);
         assert_eq!(out.get_weight(1), 1);
-        // Payload preserved
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!(get_payload_i64(&out, 1), 20);
         assert!(out.consolidated);
@@ -554,14 +556,14 @@ mod tests {
 
     #[test]
     fn test_op_map_empty_batch() {
-        use crate::scalar_func::ScalarFuncKind;
+        use crate::scalar_func::{Plan, ScalarFuncKind};
 
         let schema = make_schema_u64_i64();
-        let _batch = OwnedBatch::with_schema(schema, 1);
-        // count=0 by default after with_schema
         let empty_batch = OwnedBatch::empty(1);
 
-        let func = ScalarFuncKind::Null;
+        let func = ScalarFuncKind::Plan(Plan::from_projection(
+            &[1], &[type_code::I64], schema.pk_index,
+        ));
         let out = op_map(&empty_batch, &func, &schema, &schema, -1);
         assert_eq!(out.count, 0);
     }

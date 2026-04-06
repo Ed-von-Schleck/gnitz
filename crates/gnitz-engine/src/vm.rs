@@ -794,9 +794,8 @@ pub fn execute_epoch(
                 let schema = reg!(*in_reg).schema;
                 let result = if func_ptr.is_null() {
                     // NullPredicate: pass all rows unchanged
-                    let mut out = OwnedBatch::empty(in_batch.col_data.len());
+                    let mut out = in_batch.clone_batch();
                     out.schema = Some(schema);
-                    out.append_batch(in_batch, 0, in_batch.count);
                     out.sorted = in_batch.sorted;
                     out.consolidated = in_batch.consolidated;
                     out
@@ -1175,14 +1174,10 @@ mod tests {
         // Negate flips weights: pk=1 w=-1, pk=3 w=-1
         let schema = schema_1i64();
 
-        // Create a filter function: col0 > 0 (col_idx=1 in schema, but payload col_idx is 0)
-        // UniversalPredicate uses schema column index (1 for the I64 payload col)
-        let func = Box::new(crate::scalar_func::ScalarFuncKind::UniversalPredicate {
-            col_idx: 1,
-            op: 2, // GT
-            val_bits: 0,
-            is_float: false,
-        });
+        // CompareConst filter uses schema column index (1 for the I64 payload col)
+        let func = Box::new(ScalarFuncKind::Plan(
+            crate::scalar_func::Plan::from_compare(1, 2, 0, false),
+        ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(3);
@@ -1526,18 +1521,17 @@ mod tests {
 
     #[test]
     fn test_map_operator() {
-        // MAP with UniversalProjection: reorder/select columns.
+        // MAP with Plan projection: reorder/select columns.
         let in_schema = make_schema(&[
             (type_code::I64, 8),
             (type_code::I64, 8),
         ]);
         let out_schema = make_schema(&[(type_code::I64, 8)]);
 
-        // Project: select only payload col 1 (schema col 2)
-        let func = Box::new(crate::scalar_func::ScalarFuncKind::UniversalProjection {
-            src_indices: vec![2],
-            src_types: vec![type_code::I64],
-        });
+        // MAP with Plan projection: reorder/select columns.
+        let func = Box::new(ScalarFuncKind::Plan(
+            crate::scalar_func::Plan::from_projection(&[2], &[type_code::I64], in_schema.pk_index),
+        ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(2);
@@ -2111,7 +2105,9 @@ mod tests {
         // Verify that adding the same func/table pointer twice reuses the same index.
         let schema = schema_1i64();
 
-        let func = Box::new(crate::scalar_func::ScalarFuncKind::Null);
+        let func = Box::new(ScalarFuncKind::Plan(
+            crate::scalar_func::Plan::from_compare(1, 2, 0, false),
+        ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(4);
@@ -2235,7 +2231,9 @@ mod tests {
             const_lengths: vec![],
         };
 
-        let func = Box::new(ScalarFuncKind::ExprPredicate(prog));
+        let func = Box::new(ScalarFuncKind::Plan(
+            crate::scalar_func::Plan::from_predicate(prog),
+        ));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(2);

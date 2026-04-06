@@ -10,7 +10,7 @@ use crate::compact::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::expr::{ExprProgram, EXPR_COPY_COL};
 use crate::ops::AggDescriptor;
 use crate::read_cursor::CursorHandle;
-use crate::scalar_func::{MapAnalysis, ScalarFuncKind};
+use crate::scalar_func::{Plan, ScalarFuncKind};
 use crate::table::Table;
 use crate::vm::{ProgramBuilder, VmHandle};
 
@@ -1131,7 +1131,7 @@ fn create_expr_predicate(
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
     let prog = ExprProgram::new(code, num_regs as u32, result_reg as u32, const_strings);
-    let func = Box::new(ScalarFuncKind::ExprPredicate(prog));
+    let func = Box::new(ScalarFuncKind::Plan(Plan::from_predicate(prog)));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
     ptr
@@ -1141,12 +1141,12 @@ fn create_expr_map(
     code: Vec<i64>,
     num_regs: i64,
     const_strings: Vec<Vec<u8>>,
+    pk_index: u32,
     _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
     let prog = ExprProgram::new(code, num_regs as u32, 0, const_strings);
-    let analysis = MapAnalysis::from_program(&prog);
-    let func = Box::new(ScalarFuncKind::ExprMap { program: prog, analysis });
+    let func = Box::new(ScalarFuncKind::Plan(Plan::from_map(prog, pk_index)));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
     ptr
@@ -1155,12 +1155,13 @@ fn create_expr_map(
 fn create_universal_projection(
     src_indices: &[i32],
     src_types: &[u8],
+    pk_index: u32,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
-    let func = Box::new(ScalarFuncKind::UniversalProjection {
-        src_indices: src_indices.iter().map(|&i| i as u32).collect(),
-        src_types: src_types.to_vec(),
-    });
+    let indices: Vec<u32> = src_indices.iter().map(|&i| i as u32).collect();
+    let func = Box::new(ScalarFuncKind::Plan(Plan::from_projection(
+        &indices, src_types, pk_index,
+    )));
     let ptr = &*func as *const ScalarFuncKind;
     owned_funcs.push(func);
     ptr
@@ -1314,7 +1315,7 @@ fn emit_node(
             let (func_ptr, node_schema) = if has_expr_code {
                 let code = extract_map_code(&node_params);
                 let const_strings = extract_const_strings(&graph.str_params, nid);
-                let fp = create_expr_map(code, num_regs, const_strings, owned_expr_progs, owned_funcs);
+                let fp = create_expr_map(code, num_regs, const_strings, in_reg_schema.pk_index, owned_expr_progs, owned_funcs);
                 let schema = if reindex_col_check >= 0 {
                     // Reindex MAP: output has synthetic PK + all input cols
                     let mut s = empty_schema();
@@ -1339,7 +1340,7 @@ fn emit_node(
                     src_types.push(in_reg_schema.columns[src_col as usize].type_code);
                     idx += 1;
                 }
-                let fp = create_universal_projection(&src_indices, &src_types, owned_funcs);
+                let fp = create_universal_projection(&src_indices, &src_types, in_reg_schema.pk_index, owned_funcs);
                 let schema = build_map_output_schema(&in_reg_schema, &src_indices);
                 (fp, schema)
             } else {
