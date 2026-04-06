@@ -1950,15 +1950,7 @@ mod tests {
         let empty_out = Arc::new(OwnedBatch::empty(1));
         let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
 
-        // One group: 3 F32 values
-        let mut in_schema_3 = in_schema;
-        in_schema_3.num_columns = 3;
-        in_schema_3.columns[2] = SchemaColumn {
-            type_code: type_code::F32, size: 4, nullable: 0, _pad: 0,
-        };
-
-        // Use a 3-col input schema: pk(U64), grp(I32), val(F32)
-        // Simpler: just use 2-col with GROUP BY pk
+        // Use a 2-col input schema: pk(U64), val(F32), GROUP BY pk
         let delta = make_batch_f32(&in_schema, &[
             (1, 1, 3.5f32), (1, 1, -1.0f32), (1, 1, 7.0f32),
         ]);

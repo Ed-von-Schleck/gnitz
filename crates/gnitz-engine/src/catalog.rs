@@ -3242,7 +3242,7 @@ mod tests {
     fn test_restart_full() {
         let dir = temp_dir("restart_full");
         let cols = vec![u64_col_def("id"), str_col_def("name")];
-        let mut first_tid = 0i64;
+        let first_tid;
 
         {
             let mut engine = CatalogEngine::open(&dir).unwrap();
@@ -4232,9 +4232,8 @@ mod tests {
         assert!(ids.contains(&tid1));
         assert!(ids.contains(&tid2));
 
-        // LSN should be accessible (may be > 0 from table creation)
-        let lsn = engine.get_max_flushed_lsn(tid1);
-        assert!(lsn >= 0);
+        // LSN should be accessible without panicking
+        let _ = engine.get_max_flushed_lsn(tid1);
 
         engine.close();
         let _ = fs::remove_dir_all(&dir);

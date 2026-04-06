@@ -16,6 +16,27 @@ use crate::util::{read_i64_le, read_u64_le};
 /// Error code returned when the MemTable exceeds its capacity.
 pub const ERR_CAPACITY: i32 = -2;
 
+/// Minimum allocation size to request transparent hugepage backing.
+/// Below this, hugepage promotion is impossible (no full 2MB PMD region).
+const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
+
+/// Allocate a zeroed buffer and request hugepage backing for large allocations.
+///
+/// For sizes >= HUGEPAGE_THRESHOLD, calls `calloc` (via `vec!`) which for large
+/// allocations uses an internal `mmap`, returning demand-zero pages not yet faulted
+/// in. The subsequent `madvise(MADV_HUGEPAGE)` causes the kernel to allocate 2MB
+/// zero pages on first access instead of 4KB pages.
+///
+/// For sizes < HUGEPAGE_THRESHOLD, behaves identically to `vec![0u8; size]`.
+#[inline]
+fn alloc_large_zeroed(size: usize) -> Vec<u8> {
+    let v = vec![0u8; size];
+    if size >= HUGEPAGE_THRESHOLD {
+        crate::ipc_sys::madvise_hugepage(v.as_ptr() as *mut u8, size);
+    }
+    v
+}
+
 /// Copy a 16-byte German String struct from source to destination, relocating
 /// long-string blob data into `dst_blob`. Used by `append_rows_inner` and
 /// `append_indexed_rows` to avoid duplicating the blob relocation logic.
@@ -696,17 +717,17 @@ pub fn write_to_owned_batch(
     let pk_index = schema.pk_index as usize;
     let num_payload_cols = schema.num_columns as usize - 1;
 
-    let mut out_pk_lo = vec![0u8; max_rows * 8];
-    let mut out_pk_hi = vec![0u8; max_rows * 8];
-    let mut out_weight = vec![0u8; max_rows * 8];
-    let mut out_null = vec![0u8; max_rows * 8];
+    let mut out_pk_lo = alloc_large_zeroed(max_rows * 8);
+    let mut out_pk_hi = alloc_large_zeroed(max_rows * 8);
+    let mut out_weight = alloc_large_zeroed(max_rows * 8);
+    let mut out_null = alloc_large_zeroed(max_rows * 8);
     let mut out_cols: Vec<Vec<u8>> = Vec::with_capacity(num_payload_cols);
     for ci in 0..schema.num_columns as usize {
         if ci == pk_index { continue; }
         let cs = schema.columns[ci].size as usize;
-        out_cols.push(vec![0u8; max_rows * cs]);
+        out_cols.push(alloc_large_zeroed(max_rows * cs));
     }
-    let mut out_blob = vec![0u8; max_blob];
+    let mut out_blob = alloc_large_zeroed(max_blob);
 
     let col_slices: Vec<&mut [u8]> = unsafe {
         out_cols.iter_mut()

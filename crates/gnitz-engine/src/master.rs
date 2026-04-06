@@ -50,7 +50,6 @@ pub struct MasterDispatcher {
     async_exchange_counts: HashMap<i64, usize>,
     async_exchange_source_ids: HashMap<i64, i64>,
     async_active: bool,
-    pub(crate) last_error: String,
 }
 
 // Safety: MasterDispatcher is single-threaded (master process event loop).
@@ -92,7 +91,6 @@ impl MasterDispatcher {
             async_exchange_counts: HashMap::new(),
             async_exchange_source_ids: HashMap::new(),
             async_active: false,
-            last_error: String::new(),
         }
     }
 

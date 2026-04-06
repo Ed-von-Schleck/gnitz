@@ -246,6 +246,10 @@ pub fn server_main(
             unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
             return 1;
         }
+        // Hint THP backing for the W2M region (memfd/shmem backing).
+        // Requires: echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled
+        // If shmem_enabled remains "never", this call is silently inert — no harm.
+        ipc_sys::madvise_hugepage(wptr, W2M_REGION_SIZE);
         // Initialize write cursor to W2M_HEADER_SIZE (skips the header)
         use std::sync::atomic::{AtomicU64, Ordering};
         unsafe {

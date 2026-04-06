@@ -236,6 +236,23 @@ pub fn server_create(path: &str) -> i32 {
     }
 }
 
+/// Hint the kernel to back [ptr, ptr+size) with transparent hugepages.
+/// Best-effort: ignores errors and is a no-op for null ptr or size 0.
+/// For anonymous private memory: requires `enabled` = `madvise` or `always`.
+/// For memfd/shmem: requires `shmem_enabled` = `advise` or `within_size`.
+/// For writable file-backed mmap: silently ignored by the kernel.
+pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
+    if ptr.is_null() || size == 0 { return; }
+    unsafe { libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_HUGEPAGE); }
+}
+
+/// Hint the kernel to read-ahead [ptr, ptr+size) sequentially.
+/// Best-effort: ignores errors and is a no-op for null ptr or size 0.
+pub fn madvise_sequential(ptr: *mut u8, size: usize) {
+    if ptr.is_null() || size == 0 { return; }
+    unsafe { libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_SEQUENTIAL); }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

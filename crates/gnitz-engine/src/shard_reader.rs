@@ -8,6 +8,7 @@ use std::ptr;
 
 use xorf::Xor8;
 
+use crate::ipc_sys;
 use crate::layout::*;
 use crate::util::{read_u64_le, read_i64_le};
 use crate::xxh;
@@ -91,6 +92,11 @@ impl MappedShard {
         if mmap_ptr == libc::MAP_FAILED {
             return Err(-1);
         }
+        // Hint sequential read-ahead (always beneficial for compaction scans)
+        // and hugepage backing (no-op if file has concurrent writers, otherwise
+        // may promote to 2MB pages; kernel checks file_thp_enabled internally).
+        ipc_sys::madvise_hugepage(mmap_ptr as *mut u8, file_size);
+        ipc_sys::madvise_sequential(mmap_ptr as *mut u8, file_size);
 
         let guard = MmapGuard {
             ptr: mmap_ptr as *mut u8,
