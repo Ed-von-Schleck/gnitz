@@ -126,50 +126,114 @@ pub fn fdatasync(fd: i32) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// FFI exports
+// Bootstrap syscall wrappers (used by bootstrap.rs, not FFI-exported)
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub extern "C" fn gnitz_eventfd_create() -> i32 {
-    eventfd_create()
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_eventfd_signal(efd: i32) -> i32 {
-    eventfd_signal(efd)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_eventfd_wait(efd: i32, timeout_ms: i32) -> i32 {
-    eventfd_wait(efd, timeout_ms)
-}
-
-#[no_mangle]
-pub extern "C" fn gnitz_eventfd_wait_any(
-    efds: *const i32,
-    n: i32,
-    timeout_ms: i32,
-) -> i32 {
-    if efds.is_null() || n <= 0 {
-        return 0;
+/// Raise RLIMIT_NOFILE soft limit to `target` (capped by hard limit).
+/// Returns the new soft limit, or -1 on failure.
+pub fn raise_fd_limit(target: u64) -> i64 {
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            return -1;
+        }
+        if rl.rlim_cur >= target as libc::rlim_t {
+            return rl.rlim_cur as i64;
+        }
+        rl.rlim_cur = target as libc::rlim_t;
+        if rl.rlim_cur > rl.rlim_max {
+            rl.rlim_cur = rl.rlim_max;
+        }
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+            return -1;
+        }
+        rl.rlim_cur as i64
     }
-    let slice = unsafe { std::slice::from_raw_parts(efds, n as usize) };
-    eventfd_wait_any(slice, timeout_ms)
 }
 
-#[no_mangle]
-pub extern "C" fn gnitz_fallocate(fd: i32, length: i64) -> i32 {
-    fallocate(fd, length)
+/// Create an anonymous memory-backed fd with MFD_CLOEXEC.
+/// Returns fd on success, -1 on error.
+pub fn memfd_create(name: &[u8]) -> i32 {
+    // name must be null-terminated for the syscall
+    let mut buf = [0u8; 64];
+    let len = name.len().min(62);
+    buf[..len].copy_from_slice(&name[..len]);
+    buf[len] = 0;
+    unsafe { libc::memfd_create(buf.as_ptr() as *const libc::c_char, libc::MFD_CLOEXEC) }
 }
 
-#[no_mangle]
-pub extern "C" fn gnitz_try_set_nocow(fd: i32) -> i32 {
-    try_set_nocow(fd)
+/// mmap a shared, read-write region of `size` bytes backed by `fd`.
+/// Returns the mapped pointer, or null on error.
+pub fn mmap_shared(fd: i32, size: usize) -> *mut u8 {
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        std::ptr::null_mut()
+    } else {
+        ptr as *mut u8
+    }
 }
 
-#[no_mangle]
-pub extern "C" fn gnitz_fdatasync(fd: i32) -> i32 {
-    fdatasync(fd)
+/// Set file size via ftruncate. Returns 0 on success, -1 on error.
+pub fn ftruncate(fd: i32, size: i64) -> i32 {
+    unsafe { libc::ftruncate(fd, size as libc::off_t) }
+}
+
+/// Create a Unix domain SOCK_STREAM server socket: socket + bind + listen.
+/// Sets the listen socket to non-blocking.
+/// Unlinks any existing socket at `path` before binding.
+/// Returns the server fd, or a negative value on error.
+pub fn server_create(path: &str) -> i32 {
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return -1;
+        }
+
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let path_bytes = path.as_bytes();
+        let max_len = addr.sun_path.len() - 1;
+        let copy_len = path_bytes.len().min(max_len);
+        for i in 0..copy_len {
+            addr.sun_path[i] = path_bytes[i] as libc::c_char;
+        }
+
+        // Remove existing socket file
+        let mut path_buf = [0u8; 108];
+        let plen = path_bytes.len().min(107);
+        path_buf[..plen].copy_from_slice(&path_bytes[..plen]);
+        path_buf[plen] = 0;
+        libc::unlink(path_buf.as_ptr() as *const libc::c_char);
+
+        if libc::bind(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        ) < 0
+        {
+            libc::close(fd);
+            return -2;
+        }
+        if libc::listen(fd, 1024) < 0 {
+            libc::close(fd);
+            return -3;
+        }
+
+        // Set non-blocking for the listen socket
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+
+        fd
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +374,52 @@ mod tests {
             libc::munmap(ptr, 4096);
             libc::close(fd);
             libc::close(efd);
+        }
+    }
+
+    #[test]
+    fn test_raise_fd_limit() {
+        // Should succeed (may be no-op if already ≥ 1024)
+        let r = raise_fd_limit(1024);
+        assert!(r >= 1024, "expected ≥1024, got {}", r);
+    }
+
+    #[test]
+    fn test_memfd_create_and_ftruncate() {
+        let fd = memfd_create(b"test_memfd");
+        assert!(fd >= 0, "memfd_create failed: {}", fd);
+        assert_eq!(ftruncate(fd, 4096), 0);
+        // Verify size
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        unsafe { libc::fstat(fd, &mut stat); }
+        assert_eq!(stat.st_size, 4096);
+        unsafe { libc::close(fd); }
+    }
+
+    #[test]
+    fn test_mmap_shared() {
+        let fd = memfd_create(b"test_mmap");
+        assert!(fd >= 0);
+        assert_eq!(ftruncate(fd, 8192), 0);
+        let ptr = mmap_shared(fd, 8192);
+        assert!(!ptr.is_null(), "mmap_shared returned null");
+        // Write and read back
+        unsafe {
+            *ptr = 42;
+            assert_eq!(*ptr, 42);
+            libc::munmap(ptr as *mut libc::c_void, 8192);
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn test_server_create() {
+        let path = "/tmp/gnitz_test_server_create.sock";
+        let fd = server_create(path);
+        assert!(fd >= 0, "server_create failed: {}", fd);
+        unsafe {
+            libc::close(fd);
+            libc::unlink(format!("{}\0", path).as_ptr() as *const libc::c_char);
         }
     }
 }

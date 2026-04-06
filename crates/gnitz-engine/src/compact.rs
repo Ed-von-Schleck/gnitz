@@ -185,6 +185,32 @@ pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
     }
 }
 
+/// Promote raw column data at `offset` to (key_lo, key_hi) for index lookups.
+#[inline]
+pub(crate) fn promote_to_index_key(
+    col_data: &[u8],
+    offset: usize,
+    col_size: usize,
+    type_code_val: u8,
+) -> (u64, u64) {
+    match type_code_val {
+        type_code::U128 => {
+            let lo = u64::from_le_bytes(col_data[offset..offset + 8].try_into().unwrap());
+            let hi = u64::from_le_bytes(col_data[offset + 8..offset + 16].try_into().unwrap());
+            (lo, hi)
+        }
+        type_code::I8 | type_code::I16 | type_code::I32 => {
+            (read_signed(&col_data[offset..], col_size) as u64, 0)
+        }
+        _ => {
+            let mut bytes = [0u8; 8];
+            let copy_len = col_size.min(8);
+            bytes[..copy_len].copy_from_slice(&col_data[offset..offset + copy_len]);
+            (u64::from_le_bytes(bytes), 0)
+        }
+    }
+}
+
 /// Returns bytes [4..end] of a German string as a contiguous slice.
 /// Short strings (len ≤ SHORT_STRING_THRESHOLD): inline at struct[8..4+end].
 /// Long strings: full string is in blob at heap_offset; skip first 4 bytes
