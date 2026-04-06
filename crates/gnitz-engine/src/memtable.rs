@@ -16,6 +16,9 @@ use crate::util::{read_i64_le, read_u64_le};
 /// Error code returned when the MemTable exceeds its capacity.
 pub const ERR_CAPACITY: i32 = -2;
 
+/// Maximum sorted runs before inline consolidation merges them into one.
+const INLINE_CONSOLIDATE_THRESHOLD: usize = 16;
+
 /// Minimum allocation size to request transparent hugepage backing.
 /// Below this, hugepage promotion is impossible (no full 2MB PMD region).
 const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
@@ -851,6 +854,7 @@ impl MemTable {
         self.runs_bytes += batch.total_bytes();
         self.runs.push(batch);
         self.invalidate_cache();
+        self.maybe_inline_consolidate();
         Ok(())
     }
 
@@ -1057,6 +1061,26 @@ impl MemTable {
 
     fn invalidate_cache(&mut self) {
         self.cached_consolidated = None;
+    }
+
+    /// If the run count has reached the threshold, merge all runs into a
+    /// single consolidated run.  Bounds the cost of `get_snapshot()` and
+    /// `lookup_pk()`, and eliminates weight-cancelled rows early.
+    fn maybe_inline_consolidate(&mut self) {
+        if self.runs.len() < INLINE_CONSOLIDATE_THRESHOLD {
+            return;
+        }
+        let batches: Vec<MemBatch> =
+            self.runs.iter().map(|r| r.as_mem_batch()).collect();
+        let merged = consolidate_batches(&batches, &self.schema);
+        self.runs.clear();
+        self.runs_bytes = merged.total_bytes();
+        self.total_row_count = merged.count;
+        if merged.count > 0 {
+            self.runs.push(merged);
+        }
+        self.has_found = false;
+        self.invalidate_cache();
     }
 
     fn check_capacity(&self) -> Result<(), i32> {
@@ -1711,6 +1735,176 @@ mod tests {
         // PK with no rows at all → not found
         let found2 = mt.find_positive_payload_row(99, 0);
         assert!(!found2);
+        assert!(!mt.has_found);
+    }
+
+    #[test]
+    fn test_inline_consolidate_basic() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // Push 15 batches — no consolidation yet
+        for i in 0..15u64 {
+            let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
+            mt.upsert_sorted_batch(b).unwrap();
+        }
+        assert_eq!(mt.runs.len(), 15);
+
+        // 16th batch triggers consolidation
+        let b16 = make_batch(&schema, &[(16, 1, 1600)]);
+        mt.upsert_sorted_batch(b16).unwrap();
+        assert_eq!(mt.runs.len(), 1);
+
+        let snap = mt.get_snapshot();
+        assert_eq!(snap.count, 16);
+        assert_eq!(snap.get_pk_lo(0), 1);
+        assert_eq!(snap.get_pk_lo(15), 16);
+    }
+
+    #[test]
+    fn test_inline_consolidate_ghost_elimination() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // 14 distinct insertions
+        for i in 0..14u64 {
+            let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
+            mt.upsert_sorted_batch(b).unwrap();
+        }
+        // Retract PK 1
+        let retract = make_batch(&schema, &[(1, -1, 100)]);
+        mt.upsert_sorted_batch(retract).unwrap();
+        // 16th batch — triggers consolidation
+        let b16 = make_batch(&schema, &[(15, 1, 1500)]);
+        mt.upsert_sorted_batch(b16).unwrap();
+
+        assert_eq!(mt.runs.len(), 1);
+        let snap = mt.get_snapshot();
+        // PK 1 cancelled out: 14 - 1 + 1 new = 14 survive
+        assert_eq!(snap.count, 14);
+        // PK 1 should be gone, first row is PK 2
+        assert_eq!(snap.get_pk_lo(0), 2);
+    }
+
+    #[test]
+    fn test_inline_consolidate_all_cancelled() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // 8 insertions + 8 matching retractions = 16 batches
+        for i in 0..8u64 {
+            let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
+            mt.upsert_sorted_batch(b).unwrap();
+        }
+        for i in 0..8u64 {
+            let b = make_batch(&schema, &[(i + 1, -1, (i + 1) as i64 * 100)]);
+            mt.upsert_sorted_batch(b).unwrap();
+        }
+
+        // All cancelled: runs should be empty
+        assert_eq!(mt.runs.len(), 0);
+        assert!(mt.is_empty());
+        assert_eq!(mt.total_row_count(), 0);
+
+        let snap = mt.get_snapshot();
+        assert_eq!(snap.count, 0);
+    }
+
+    #[test]
+    fn test_inline_consolidate_below_threshold() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        for i in 0..15u64 {
+            let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
+            mt.upsert_sorted_batch(b).unwrap();
+        }
+        // 15 < 16, no consolidation
+        assert_eq!(mt.runs.len(), 15);
+
+        let snap = mt.get_snapshot();
+        assert_eq!(snap.count, 15);
+    }
+
+    #[test]
+    fn test_inline_consolidate_repeated() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        // First 16 → consolidation fires → 1 run
+        for i in 0..16u64 {
+            let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
+            mt.upsert_sorted_batch(b).unwrap();
+        }
+        assert_eq!(mt.runs.len(), 1);
+
+        // 14 more → 1 + 14 = 15 runs (no consolidation yet)
+        for i in 16..30u64 {
+            let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
+            mt.upsert_sorted_batch(b).unwrap();
+        }
+        assert_eq!(mt.runs.len(), 15);
+
+        // One more → 16 runs → consolidation fires again → 1 run
+        let b31 = make_batch(&schema, &[(31, 1, 3100)]);
+        mt.upsert_sorted_batch(b31).unwrap();
+        assert_eq!(mt.runs.len(), 1);
+
+        let snap = mt.get_snapshot();
+        assert_eq!(snap.count, 31);
+    }
+
+    #[test]
+    fn test_inline_consolidate_should_flush() {
+        let schema = make_u64_i64_schema();
+        // Each 1-row batch ≈ 40 bytes.  max_bytes = 700 → threshold = 525.
+        // After 14 insertions: runs_bytes ≈ 560 > 525 → should_flush true.
+        // After 8 retractions (total 16 batches): consolidation fires,
+        // net 6 rows ≈ 240 < 525 → should_flush false.
+        let mut mt = MemTable::new(schema, 700);
+
+        // 8 insertions
+        for i in 0..8u64 {
+            let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
+            mt.upsert_sorted_batch(b).unwrap();
+        }
+
+        // 6 more insertions → 14 runs, runs_bytes ≈ 560 > 525
+        for i in 8..14u64 {
+            let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
+            mt.upsert_sorted_batch(b).unwrap();
+        }
+        assert!(mt.should_flush(), "gross bytes should exceed threshold");
+
+        // Retract PKs 1-2 → 16 batches total, triggers consolidation
+        // Net: 12 rows survive (PKs 3-14)
+        let r1 = make_batch(&schema, &[(1, -1, 100)]);
+        let r2 = make_batch(&schema, &[(2, -1, 200)]);
+        mt.upsert_sorted_batch(r1).unwrap();
+        mt.upsert_sorted_batch(r2).unwrap();
+
+        // After consolidation: net 12 rows ≈ 480 < 525
+        assert!(!mt.should_flush(), "net state should be under threshold");
+    }
+
+    #[test]
+    fn test_inline_consolidate_has_found_cleared() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+
+        for i in 0..15u64 {
+            let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
+            mt.upsert_sorted_batch(b).unwrap();
+        }
+        // lookup_pk sets has_found
+        let (w, found) = mt.lookup_pk(5, 0);
+        assert_eq!(w, 1);
+        assert!(found);
+        assert!(mt.has_found);
+
+        // 16th batch triggers consolidation → has_found cleared
+        let b16 = make_batch(&schema, &[(16, 1, 1600)]);
+        mt.upsert_sorted_batch(b16).unwrap();
         assert!(!mt.has_found);
     }
 
