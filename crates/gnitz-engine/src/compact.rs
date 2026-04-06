@@ -74,6 +74,7 @@ impl ShardCursor {
     }
 
     fn skip_ghosts(&mut self, shard: &MappedShard) {
+        if !shard.has_ghosts { return; }
         while self.position < self.count {
             if shard.get_weight(self.position) != 0 {
                 return;

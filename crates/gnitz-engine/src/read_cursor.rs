@@ -200,6 +200,11 @@ impl<'a> ReadCursorEntry<'a> {
     }
 
     fn skip_ghosts(&mut self) {
+        if self.is_shard {
+            if let CursorSource::Shard(s) = &self.source {
+                if !unsafe { (**s).has_ghosts } { return; }
+            }
+        }
         while self.position < self.count {
             if self.source.get_weight(self.position) != 0 {
                 return;

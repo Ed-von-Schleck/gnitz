@@ -1,6 +1,6 @@
 //! Shard file image building and atomic writing.
 //!
-//! Shared by both the compaction path (`compact.rs`) and the RPython flush
+//! Shared by both the compaction path (`compact.rs`) and the memtable flush
 //! path (via `gnitz_write_shard` FFI).
 
 use std::ffi::CStr;
@@ -15,6 +15,75 @@ use crate::xxh;
 
 fn align64(val: usize) -> usize {
     (val + ALIGNMENT - 1) & !(ALIGNMENT - 1)
+}
+
+// ---------------------------------------------------------------------------
+// Per-region encoding detection (internal to build_shard_image)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+enum RegionEncoding {
+    Raw,
+    Constant { value: [u8; 16] },
+    TwoValue { value_a: i64, value_b: i64, bitvec: Vec<u8> },
+}
+
+/// Detect whether a fixed-width region is all-constant.
+/// Returns `Constant` if every element is identical, else `Raw`.
+fn detect_encoding(data: &[u8], element_width: usize) -> RegionEncoding {
+    debug_assert!(!data.is_empty() && data.len() % element_width == 0);
+    let first = &data[..element_width];
+    let n = data.len() / element_width;
+    for i in 1..n {
+        let elem = &data[i * element_width..(i + 1) * element_width];
+        if elem != first {
+            return RegionEncoding::Raw;
+        }
+    }
+    let mut value = [0u8; 16];
+    value[..element_width].copy_from_slice(first);
+    RegionEncoding::Constant { value }
+}
+
+/// Detect weight encoding: constant, two-value (bitvec), or raw.
+fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
+    debug_assert!(!data.is_empty() && data.len() % 8 == 0);
+    let n = data.len() / 8;
+    let first = i64::from_le_bytes(data[..8].try_into().unwrap());
+    let mut second: Option<i64> = None;
+
+    // We'll build the bitvec speculatively; discard if 3+ distinct.
+    let bitvec_len = (n + 7) / 8;
+    let mut bitvec = vec![0u8; bitvec_len];
+
+    for i in 1..n {
+        let v = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
+        if v == first {
+            // bit stays 0
+        } else if let Some(b) = second {
+            if v == b {
+                bitvec[i / 8] |= 1 << (i % 8);
+            } else {
+                return RegionEncoding::Raw; // 3+ distinct values
+            }
+        } else {
+            second = Some(v);
+            bitvec[i / 8] |= 1 << (i % 8);
+        }
+    }
+
+    match second {
+        None => {
+            let mut value = [0u8; 16];
+            value[..8].copy_from_slice(&first.to_le_bytes());
+            RegionEncoding::Constant { value }
+        }
+        Some(b) => RegionEncoding::TwoValue {
+            value_a: first,
+            value_b: b,
+            bitvec,
+        },
+    }
 }
 
 /// Build a complete shard file image from pre-built region buffers.
@@ -32,25 +101,44 @@ pub fn build_shard_image(
     regions: &[(*const u8, usize)],
 ) -> Vec<u8> {
     let num_regions = regions.len();
-    let dir_size = num_regions * DIR_ENTRY_SIZE;
-    let dir_offset = HEADER_SIZE;
+    let n = row_count as usize;
+    let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
 
-    let mut pos = align64(dir_offset + dir_size);
-    let mut region_offsets = Vec::with_capacity(num_regions);
-    for &(_ptr, sz) in regions {
-        region_offsets.push(pos);
-        pos = align64(pos + sz);
+    // --- Phase 1: detect encodings and compute actual sizes ---
+
+    let mut encodings: Vec<RegionEncoding> = Vec::with_capacity(num_regions);
+    let mut actual_sizes: Vec<usize> = Vec::with_capacity(num_regions);
+
+    for i in 0..num_regions {
+        let (src_ptr, orig_sz) = regions[i];
+        if n == 0 || i == last_region || orig_sz == 0 || src_ptr.is_null() {
+            // Empty region, blob arena (last), or zero rows -> Raw passthrough
+            encodings.push(RegionEncoding::Raw);
+            actual_sizes.push(orig_sz);
+        } else {
+            let elem_width = orig_sz / n;
+            let src = unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) };
+            let enc = if i == 2 {
+                // weight region
+                detect_weight_encoding(src)
+            } else {
+                detect_encoding(src, elem_width)
+            };
+            let actual = match &enc {
+                RegionEncoding::Raw => orig_sz,
+                RegionEncoding::Constant { .. } => elem_width,
+                RegionEncoding::TwoValue { bitvec, .. } => 16 + bitvec.len(),
+            };
+            encodings.push(enc);
+            actual_sizes.push(actual);
+        }
     }
-    let data_end = if num_regions == 0 {
-        HEADER_SIZE
-    } else {
-        region_offsets[num_regions - 1] + regions[num_regions - 1].1
-    };
+
+    // --- XOR8 filter (from raw caller pointers, unchanged) ---
 
     let xor8_filter = if row_count > 0 && num_regions >= 2 {
         let (pk_lo_ptr, pk_lo_sz) = regions[0];
         let (pk_hi_ptr, pk_hi_sz) = regions[1];
-        let n = row_count as usize;
         if !pk_lo_ptr.is_null()
             && !pk_hi_ptr.is_null()
             && pk_lo_sz >= n * 8
@@ -64,6 +152,23 @@ pub fn build_shard_image(
         }
     } else {
         None
+    };
+
+    // --- Phase 2: compute offsets, allocate, and write ---
+
+    let dir_size = num_regions * DIR_ENTRY_SIZE;
+    let dir_offset = HEADER_SIZE;
+
+    let mut pos = align64(dir_offset + dir_size);
+    let mut region_offsets = Vec::with_capacity(num_regions);
+    for i in 0..num_regions {
+        region_offsets.push(pos);
+        pos = align64(pos + actual_sizes[i]);
+    }
+    let data_end = if num_regions == 0 {
+        HEADER_SIZE
+    } else {
+        region_offsets[num_regions - 1] + actual_sizes[num_regions - 1]
     };
 
     let xor8_data = xor8_filter.as_ref().map(|f| xor8::serialize(f));
@@ -81,6 +186,56 @@ pub fn build_shard_image(
 
     let mut image = vec![0u8; total_size];
 
+    // Write region data
+    for i in 0..num_regions {
+        let r_off = region_offsets[i];
+        let (src_ptr, orig_sz) = regions[i];
+
+        match &encodings[i] {
+            RegionEncoding::Raw => {
+                if orig_sz > 0 && !src_ptr.is_null() {
+                    unsafe {
+                        ptr::copy_nonoverlapping(src_ptr, image[r_off..].as_mut_ptr(), orig_sz);
+                    }
+                }
+            }
+            RegionEncoding::Constant { .. } => {
+                // Copy first elem_width bytes from source
+                let elem_width = actual_sizes[i];
+                unsafe {
+                    ptr::copy_nonoverlapping(src_ptr, image[r_off..].as_mut_ptr(), elem_width);
+                }
+            }
+            RegionEncoding::TwoValue { value_a, value_b, bitvec } => {
+                image[r_off..r_off + 8].copy_from_slice(&value_a.to_le_bytes());
+                image[r_off + 8..r_off + 16].copy_from_slice(&value_b.to_le_bytes());
+                image[r_off + 16..r_off + 16 + bitvec.len()].copy_from_slice(bitvec);
+            }
+        }
+
+        // Checksum over what was actually written
+        let a_sz = actual_sizes[i];
+        let cs = if a_sz > 0 {
+            xxh::checksum(&image[r_off..r_off + a_sz])
+        } else {
+            0
+        };
+
+        // Write 32-byte directory entry
+        let d = dir_offset + i * DIR_ENTRY_SIZE;
+        write_u64_le(&mut image, d, r_off as u64);
+        write_u64_le(&mut image, d + 8, a_sz as u64);
+        write_u64_le(&mut image, d + 16, cs);
+        let encoding_byte = match &encodings[i] {
+            RegionEncoding::Raw => ENCODING_RAW,
+            RegionEncoding::Constant { .. } => ENCODING_CONSTANT,
+            RegionEncoding::TwoValue { .. } => ENCODING_TWO_VALUE,
+        };
+        image[d + 24] = encoding_byte;
+        // bytes [d+25..d+32] are already zero (reserved)
+    }
+
+    // Header
     write_u64_le(&mut image, OFF_MAGIC, SHARD_MAGIC);
     write_u64_le(&mut image, OFF_VERSION, SHARD_VERSION);
     write_u64_le(&mut image, OFF_ROW_COUNT, row_count as u64);
@@ -89,28 +244,7 @@ pub fn build_shard_image(
     write_u64_le(&mut image, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut image, OFF_XOR8_SIZE, xor8_size as u64);
 
-    for i in 0..num_regions {
-        let r_off = region_offsets[i];
-        let (src_ptr, r_sz) = regions[i];
-
-        if r_sz > 0 && !src_ptr.is_null() {
-            unsafe {
-                ptr::copy_nonoverlapping(src_ptr, image[r_off..].as_mut_ptr(), r_sz);
-            }
-        }
-
-        let cs = if r_sz > 0 {
-            xxh::checksum(&image[r_off..r_off + r_sz])
-        } else {
-            0
-        };
-
-        let d = dir_offset + i * DIR_ENTRY_SIZE;
-        write_u64_le(&mut image, d, r_off as u64);
-        write_u64_le(&mut image, d + 8, r_sz as u64);
-        write_u64_le(&mut image, d + 16, cs);
-    }
-
+    // XOR8 filter data
     if let Some(ref data) = xor8_data {
         image[xor8_offset..xor8_offset + data.len()].copy_from_slice(data);
     }
