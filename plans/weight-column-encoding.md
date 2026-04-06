@@ -27,13 +27,18 @@ The first two encoding modes deliver immediate value:
 
 ### What the weight column costs
 
-For a 100K-row shard: 800 KB. This is ~10% of a typical shard (10 columns × 8 bytes × 100K
-= 8 MB payload + 1.6 MB PK + 800 KB weight + 800 KB null = 11.2 MB total).
+For a 100K-row shard: 800 KB. For a typical shard (10 columns x 8 bytes x 100K = 8 MB
+payload + 1.6 MB PK + 800 KB weight + 800 KB null = 11.2 MB total), the weight column is
+~7% of total size. For narrower tables the fraction is higher (e.g. ~11% for a 5-column
+table).
 
 ### Verified weight distribution
 
 **Verified invariant**: No shard on disk ever contains a weight==0 row. Every write path
-(flush, compaction) enforces this through consolidation + explicit guards.
+(flush, compaction) enforces this through consolidation + explicit guards:
+- `DirectWriter::write_row()` returns early if weight==0 (`merge.rs`)
+- `ShardWriter::add_row_from_shard()` returns early if weight==0 (`compact.rs`)
+- All consolidation loops only emit when `pending_weight != 0`
 
 **Verified distribution**:
 
@@ -76,6 +81,11 @@ Encoding byte values:
 0x02 = TWO_VALUE     — exactly two distinct values; bit-vector + two constants in region
 ```
 
+Reserved bytes MUST be written as zero and validated as zero on read. A v4 reader that
+encounters non-zero reserved bytes should reject the shard with a format error. This
+prevents silent misinterpretation of shards written by a future version that assigns meaning
+to those bytes.
+
 Future values (reserved, not implemented in this plan):
 ```
 0x10 = PCODEC        — Pcodec single-frame encoding
@@ -85,6 +95,11 @@ Future values (reserved, not implemented in this plan):
 0x40 = DICTIONARY    — Dictionary encoding (index array + dictionary table)
 ```
 
+Unknown encoding bytes (anything not in the implemented set) MUST cause the reader to return
+an error rather than silently falling back to RAW. A silent fallback would produce incorrect
+data — a shard written with encoding 0x10 by a future version contains Pcodec-compressed
+bytes, not raw i64 values.
+
 ### CONSTANT mode (any region)
 
 When all values in a region are identical, the directory entry stores:
@@ -93,14 +108,16 @@ When all values in a region are identical, the directory entry stores:
 ```
 
 The `offset` field is reused to store the first 8 bytes of the constant value. `size` = 0
-indicates no region data on disk. For regions where the element width is ≤ 8 bytes (all
+indicates no region data on disk. For regions where the element width is <= 8 bytes (all
 integer types, floats), the constant fits in the offset field directly.
 
 For 16-byte types (u128, string structs): CONSTANT mode stores the first 8 bytes in the
 offset field and the second 8 bytes in the checksum field. This is a natural reuse of the
 two otherwise-unused fields.
 
-The reader returns the constant for any row index — no memory access, no region data.
+The reader returns the constant for any row index — no memory access, no region data. The
+reader already has the schema (passed to `MappedShard::open()`), so it knows the element
+width per region and can correctly interpret the stored constant bytes.
 
 ### TWO_VALUE mode (weight region only, for now)
 
@@ -110,11 +127,14 @@ region containing:
 [value_a: i64] [value_b: i64] [bit_vector: ceil(N/8) bytes]
 ```
 
-Bit `i` = 0 → row `i` has `value_a`. Bit `i` = 1 → row `i` has `value_b`.
+Bit `i` = 0 -> row `i` has `value_a`. Bit `i` = 1 -> row `i` has `value_b`.
 
 The directory entry is standard: `[offset] [size] [checksum] [encoding: 0x02]`.
 
 For 100K rows with +1/-1 weights: 16 + 12,500 = 12,516 bytes (vs 800,000 raw).
+
+Note: the bitvec starts at byte offset 16 within the region, which is not 64-byte aligned.
+If a future SIMD path processes the bitvec, it will need unaligned loads. Acceptable for now.
 
 ### Version and backward compatibility
 
@@ -137,8 +157,9 @@ per-region directory entries, not in the header.
 uses 24-byte entries and treats all regions as RAW. For v4, the reader uses 32-byte entries
 and reads the encoding byte.
 
-**v3 readers reject v4 shards**: Existing version check (`if version != SHARD_VERSION`)
-returns an error. This is the existing behavior for unknown versions.
+**v3 readers reject v4 shards**: Existing version check at `shard_reader.rs:104`
+(`if read_u64_le(data, OFF_VERSION) != SHARD_VERSION`) returns Err(-2). This is the existing
+behavior for unknown versions.
 
 **Compaction naturally upgrades**: Input shards may be v3 or v4. Output shard is always v4.
 
@@ -148,14 +169,14 @@ For each region, after building the data buffer but before writing:
 
 ```rust
 fn detect_encoding(data: &[u8], element_width: usize) -> RegionEncoding {
-    if data.is_empty() {
-        return RegionEncoding::Constant([0u8; 16]);
-    }
+    // Note: data is never empty here — shards with 0 rows are never written
+    // (memtable flush returns -1 for empty snapshots).
+    debug_assert!(!data.is_empty());
 
     // Check if all elements are identical
     let first = &data[..element_width];
-    let mut all_same = true;
     let count = data.len() / element_width;
+    let mut all_same = true;
     for i in 1..count {
         if &data[i * element_width..(i + 1) * element_width] != first {
             all_same = false;
@@ -176,10 +197,8 @@ For the weight region specifically, extend with TWO_VALUE detection:
 
 ```rust
 fn detect_weight_encoding(weights: &[u8]) -> RegionEncoding {
+    debug_assert!(!weights.is_empty());
     let count = weights.len() / 8;
-    if count == 0 {
-        return RegionEncoding::Constant(1i64.to_le_bytes_padded());
-    }
 
     let first = read_i64_le(weights, 0);
     let mut second: Option<i64> = None;
@@ -218,7 +237,12 @@ for i in 0..num_regions {
     let r_sz = read_u64_le(data, entry_off + 8) as usize;
     let r_cs = read_u64_le(data, entry_off + 16);
     let encoding = if version >= 4 {
-        data[entry_off + 24]
+        let enc = data[entry_off + 24];
+        let reserved = &data[entry_off + 25..entry_off + 32];
+        if reserved != [0u8; 7] {
+            return Err(-2); // reject non-zero reserved bytes
+        }
+        enc
     } else {
         0x00 // RAW for v3 shards
     };
@@ -229,19 +253,19 @@ for i in 0..num_regions {
 `get_weight()` dispatches on the weight region's encoding:
 
 ```rust
-pub fn get_weight(&self, row: usize) -> i64 {
+pub fn get_weight(&self, row: usize) -> Result<i64, i32> {
     match self.weight_encoding {
-        RAW => read_i64_le(self.data(), self.weight_off + row * 8),
-        CONSTANT => self.weight_constant,
+        RAW => Ok(read_i64_le(self.data(), self.weight_off + row * 8)),
+        CONSTANT => Ok(self.weight_constant),
         TWO_VALUE => {
             let byte = self.data()[self.weight_bitvec_off + row / 8];
             if (byte >> (row % 8)) & 1 == 0 {
-                self.weight_a
+                Ok(self.weight_a)
             } else {
-                self.weight_b
+                Ok(self.weight_b)
             }
         }
-        _ => read_i64_le(self.data(), self.weight_off + row * 8), // unknown → RAW fallback
+        unknown => Err(-2), // unknown encoding — format error, not silent fallback
     }
 }
 ```
@@ -285,10 +309,15 @@ For `Raw` regions: write encoding byte 0x00, existing behavior.
 
 ### Cursor changes
 
-`ShardCursor::skip_ghosts()` can be eliminated for CONSTANT and TWO_VALUE weight modes:
+`skip_ghosts()` can be eliminated for CONSTANT and TWO_VALUE weight modes:
 the constant(s) are non-zero by construction (consolidation guarantees no weight==0 rows, and
 CONSTANT/TWO_VALUE encode only the non-zero values). Set a `has_ghosts: bool` flag at shard
 open time and short-circuit skip_ghosts() when false.
+
+Note: the no-weight==0 invariant holds for ALL shards (including RAW), so in principle
+skip_ghosts could be eliminated entirely. However, CONSTANT/TWO_VALUE give structural proof
+(the encoding literally cannot represent zero), whereas RAW requires trusting the invariant.
+This plan conservatively skips only for CONSTANT/TWO_VALUE.
 
 ### Compaction changes
 
@@ -314,7 +343,7 @@ does NOT cover").
 
 For a u64 PK table with no nullable columns and all +1 weights:
 2.4 MB saved per 100K-row shard (pk_hi + weight + null_buf). Directory overhead: ~48 bytes
-(6 regions × 8 bytes). Net savings: **~2.4 MB per shard**.
+(6 regions x 8 bytes). Net savings: **~2.4 MB per shard**.
 
 ### CPU
 
@@ -323,6 +352,10 @@ For a u64 PK table with no nullable columns and all +1 weights:
 | `get_weight(row)` | 8-byte mmap read | Return constant | 1-byte read + bit test |
 | `skip_ghosts()` | Sequential weight reads | No-op | No-op |
 | Flush-time detection | N/A | Single pass (free) | Single pass (free) |
+
+Note: TWO_VALUE per-row access (byte load + shift + branch) replaces a single aligned 8-byte
+read. For hot scan loops this could be measurable despite the space savings. Step 7 (Measure)
+should include cursor iteration microbenchmarks to quantify the tradeoff.
 
 ---
 
@@ -345,8 +378,9 @@ pub const ENCODING_TWO_VALUE: u8 = 0x02;
 In `shard_file.rs`:
 
 1. Add `RegionData` enum and `detect_encoding()` / `detect_weight_encoding()` functions
-2. Update `write_shard()` to accept `RegionData` instead of `&[u8]` per region
-3. Write 32-byte directory entries with encoding byte
+2. Update `build_shard_image()` to accept `RegionData` instead of `(*const u8, usize)` per
+   region
+3. Write 32-byte directory entries with encoding byte and zeroed reserved bytes
 4. For CONSTANT: store constant in offset field, skip region data
 5. For TWO_VALUE: build [value_a | value_b | bitvec] as region data
 6. For RAW: existing behavior
@@ -356,46 +390,56 @@ In `shard_file.rs`:
 In `shard_reader.rs`:
 
 1. `MappedShard::open()`: detect version, use 24-byte entries for v3, 32-byte for v4
-2. Read encoding byte per region
-3. For CONSTANT regions: store constant in struct, don't record region offset
-4. For TWO_VALUE weight: store value_a, value_b, bitvec offset
-5. `get_weight()`: dispatch on encoding
-6. `get_null_word()`: dispatch on encoding (CONSTANT returns 0 for non-nullable tables)
-7. `get_pk_hi()`: dispatch on encoding (CONSTANT returns 0 for u64 tables)
+2. Read encoding byte per region; validate reserved bytes are zero
+3. Reject unknown encoding bytes with Err(-2) — never silently fall back to RAW
+4. For CONSTANT regions: store constant in struct, don't record region offset
+5. For TWO_VALUE weight: store value_a, value_b, bitvec offset
+6. `get_weight()`: dispatch on encoding
+7. `get_null_word()`: dispatch on encoding (CONSTANT returns 0 for non-nullable tables)
+8. `get_pk_hi()`: dispatch on encoding (CONSTANT returns 0 for u64 tables)
 
 ### Step 4: Callers (flush + compaction)
 
-Update all `write_shard()` callers to detect encoding per region:
+Update all `build_shard_image()` callers to detect encoding per region:
 
 1. `memtable.rs` flush path: for each region buffer, call `detect_encoding()`. For weight
-   buffer, call `detect_weight_encoding()`. Pass `RegionData` to `write_shard()`.
-2. `compact.rs` finalize: same detection on ShardWriter's output buffers.
+   buffer, call `detect_weight_encoding()`. Pass `RegionData` to `build_shard_image()`.
+2. `compact.rs` `ShardWriter::finalize()`: same detection on ShardWriter's output buffers.
 
 ### Step 5: Ghost skipping
 
 In cursor code: check weight encoding at shard open time. If CONSTANT or TWO_VALUE,
 set `has_ghosts = false`. `skip_ghosts()` returns immediately when `!has_ghosts`.
 
+Affected sites:
+- `read_cursor.rs`: `ReadCursorEntry::skip_ghosts()` (called on init, advance, seek — only
+  for shard sources per the `is_shard` flag)
+- `compact.rs`: `CompactCursor::skip_ghosts()` (called on init and advance)
+
 ### Step 6: Tests
 
-1. **CONSTANT detection**: write shard with all-same values per region → read back → verify
+1. **CONSTANT detection**: write shard with all-same values per region -> read back -> verify
    encoding byte = 0x01, get_weight/get_pk_hi/get_null_word return constant.
-2. **TWO_VALUE detection**: write shard with +1/-1 weights → read back → verify per-row
+2. **TWO_VALUE detection**: write shard with +1/-1 weights -> read back -> verify per-row
    values via get_weight().
-3. **RAW fallback**: write shard with 3+ distinct weights → verify encoding = 0x00, existing
+3. **RAW fallback**: write shard with 3+ distinct weights -> verify encoding = 0x00, existing
    behavior.
-4. **Backward compat**: create a v3 shard file (24-byte dir entries) → open with v4 reader →
+4. **Backward compat**: create a v3 shard file (24-byte dir entries) -> open with v4 reader ->
    verify all regions treated as RAW.
-5. **Compaction roundtrip**: compact two CONSTANT+1 shards → verify output is CONSTANT+1.
-6. **Compaction mixed**: compact CONSTANT+1 with TWO_VALUE shard → verify correct merge,
+5. **Unknown encoding rejection**: craft a shard with encoding byte 0x10 -> open -> verify
+   reader returns Err(-2).
+6. **Non-zero reserved rejection**: craft a shard with non-zero reserved bytes -> open ->
+   verify reader returns Err(-2).
+7. **Compaction roundtrip**: compact two CONSTANT+1 shards -> verify output is CONSTANT+1.
+8. **Compaction mixed**: compact CONSTANT+1 with TWO_VALUE shard -> verify correct merge,
    output weight values correct.
-7. **Ghost skipping no-op**: open CONSTANT weight shard, create cursor, verify skip_ghosts
+9. **Ghost skipping no-op**: open CONSTANT weight shard, create cursor, verify skip_ghosts
    doesn't read weight column.
-8. **E2E**: full circuit with inserts/deletes → verify shard encoding modes are detected
-   correctly across flush + compaction cycles.
-9. **pk_hi CONSTANT for u64 table**: write shard with u64 PKs → verify pk_hi region is
-   CONSTANT with value 0.
-10. **Null bitmap CONSTANT for non-nullable table**: write shard with all non-null rows →
+10. **E2E**: full circuit with inserts/deletes -> verify shard encoding modes are detected
+    correctly across flush + compaction cycles.
+11. **pk_hi CONSTANT for u64 table**: write shard with u64 PKs -> verify pk_hi region is
+    CONSTANT with value 0.
+12. **Null bitmap CONSTANT for non-nullable table**: write shard with all non-null rows ->
     verify null_buf region is CONSTANT with value 0.
 
 ### Step 7: Measure
@@ -403,6 +447,8 @@ set `has_ghosts = false`. `skip_ghosts()` returns immediately when `!has_ghosts`
 - Shard file sizes before/after for a representative workload
 - Flush throughput (detection overhead should be negligible)
 - Cursor iteration speed on CONSTANT weight shards (no weight reads)
+- **TWO_VALUE vs RAW cursor iteration microbenchmark**: measure per-row cost of bit-test
+  dispatch vs direct 8-byte read in hot scan loops to quantify the CPU tradeoff
 
 ---
 
