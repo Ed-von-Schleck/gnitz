@@ -6,11 +6,11 @@
 use std::sync::Arc;
 
 use crate::schema::SchemaDescriptor;
-use crate::memtable::OwnedBatch;
-use crate::merge::{self, MemBatch};
-use crate::read_cursor::{self, CursorHandle};
-use crate::shard_reader::MappedShard;
-use crate::table::{self, Table};
+use super::memtable::OwnedBatch;
+use super::merge::{self, MemBatch};
+use super::read_cursor::{self, CursorHandle};
+use super::shard_reader::MappedShard;
+use super::table::{self, Table};
 use crate::xxh;
 
 // ---------------------------------------------------------------------------

@@ -2,9 +2,7 @@
 
 use crate::schema::{SchemaDescriptor, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::memtable::OwnedBatch;
-use crate::merge::MemBatch;
-use crate::read_cursor::ReadCursor;
+use crate::storage::{OwnedBatch, MemBatch, ReadCursor};
 
 use super::util::{
     consolidate_owned, append_cursor_row_to_batch, write_string_from_batch, payload_idx,
@@ -445,7 +443,7 @@ fn sort_owned(batch: &OwnedBatch, schema: &SchemaDescriptor) -> OwnedBatch {
         let bi = b as usize;
         match pks[ai].cmp(&pks[bi]) {
             std::cmp::Ordering::Equal => {
-                crate::columnar::compare_rows(schema, &mb, ai, &mb, bi)
+                crate::storage::compare_rows(schema, &mb, ai, &mb, bi)
             }
             ord => ord,
         }
@@ -1313,7 +1311,7 @@ fn emit_gather_row(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
-    use crate::memtable::OwnedBatch;
+    use crate::storage::OwnedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -1472,7 +1470,7 @@ mod tests {
     #[test]
     fn test_reduce_sum_retraction() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
         use crate::schema::type_code;
 
         // Input: pk(U64), grp(I64), val(I64)
@@ -1500,7 +1498,7 @@ mod tests {
 
         // Empty trace_out
         let empty_out = Arc::new(OwnedBatch::empty(2));
-        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // Tick 1: insert 3 rows in group 10: val=100, val=200, val=300
         let mut delta1 = OwnedBatch::with_schema(in_schema, 3);
@@ -1522,7 +1520,7 @@ mod tests {
         };
 
         let (out1, _) = op_reduce(
-            &delta1, None, &mut to_ch.cursor,
+            &delta1, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[1u32], &[agg],
             None, false, 0, &[], None, None, 0, 0, None, None,
         );
@@ -1534,7 +1532,7 @@ mod tests {
         // Tick 2: retract pk=2 (val=200) → SUM should go from 600 to 400
         // Need trace_out with previous aggregate
         let prev_out = Arc::new(out1);
-        let mut to_ch2 = unsafe { create_cursor_from_snapshots(&[prev_out], &[], out_schema) };
+        let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
 
         let mut delta2 = OwnedBatch::with_schema(in_schema, 1);
         delta2.count = 0;
@@ -1549,7 +1547,7 @@ mod tests {
         delta2.consolidated = true;
 
         let (out2, _) = op_reduce(
-            &delta2, None, &mut to_ch2.cursor,
+            &delta2, None, to_ch2.cursor_mut(),
             &in_schema, &out_schema, &[1u32], &[agg],
             None, false, 0, &[], None, None, 0, 0, None, None,
         );
@@ -1560,7 +1558,7 @@ mod tests {
     #[test]
     fn test_reduce_count() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
         use crate::schema::type_code;
 
         // Input: pk(U64), val(I64)
@@ -1580,7 +1578,7 @@ mod tests {
         };
 
         let empty_out = Arc::new(OwnedBatch::empty(1));
-        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows: pk=1,2,3 all GROUP BY pk (single group using pk as group)
         let delta = make_batch(&in_schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
@@ -1591,7 +1589,7 @@ mod tests {
 
         // GROUP BY pk → each row is its own group
         let (out, _) = op_reduce(
-            &delta, None, &mut to_ch.cursor,
+            &delta, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[0u32], &[agg],
             None, false, 0, &[], None, None, 0, 0, None, None,
         );
@@ -1607,7 +1605,7 @@ mod tests {
     #[test]
     fn test_reduce_gi_same_pk_multiple_payloads() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let input_schema = make_schema_3col_grp_str();
         let output_schema = make_reduce_str_out_schema();
@@ -1628,12 +1626,9 @@ mod tests {
         // delta: retract apple at PK=1
         let delta = make_batch_3col_grp_str(&input_schema, &[(1, -1, 1, "apple")]);
 
-        let mut ti_handle =
-            unsafe { create_cursor_from_snapshots(&[ti_batch], &[], input_schema) };
-        let mut gi_handle =
-            unsafe { create_cursor_from_snapshots(&[gi_batch], &[], gi_schema) };
-        let mut to_handle =
-            unsafe { create_cursor_from_snapshots(&[to_batch], &[], output_schema) };
+        let mut ti_handle = CursorHandle::from_owned(&[ti_batch], input_schema);
+        let mut gi_handle = CursorHandle::from_owned(&[gi_batch], gi_schema);
+        let mut to_handle = CursorHandle::from_owned(&[to_batch], output_schema);
 
         // MAX on STRING agg col (col_idx=2, type=STRING); no AVI
         let agg_desc = AggDescriptor {
@@ -1645,8 +1640,8 @@ mod tests {
 
         let (out, _fin) = op_reduce(
             &delta,
-            Some(&mut ti_handle.cursor),
-            &mut to_handle.cursor,
+            Some(ti_handle.cursor_mut()),
+            to_handle.cursor_mut(),
             &input_schema,
             &output_schema,
             &[1u32],            // group_by_cols: col 1 (grp)
@@ -1656,7 +1651,7 @@ mod tests {
             type_code::STRING,  // avi_agg_col_type_code (unused; no AVI)
             &[1u32],            // avi_group_by_cols (unused)
             None,               // avi_input_schema
-            Some(&mut gi_handle.cursor), // gi_cursor
+            Some(gi_handle.cursor_mut()), // gi_cursor
             1u32,               // gi_col_idx: grp column
             type_code::I64,     // gi_col_type_code
             None,               // finalize_prog
@@ -1689,7 +1684,7 @@ mod tests {
     #[test]
     fn test_gather_reduce_retraction() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
         use crate::schema::type_code;
 
         // Schema: pk(U128), count(I64) — same as partial/output schema
@@ -1707,7 +1702,7 @@ mod tests {
 
         // Tick 1: two partial COUNT=2 from different workers → global COUNT=4
         let empty_out = Arc::new(OwnedBatch::empty(1));
-        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], schema) };
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
 
         let mut partial1 = OwnedBatch::with_schema(schema, 2);
         partial1.count = 0;
@@ -1725,14 +1720,14 @@ mod tests {
             col_idx: 1, agg_op: AGG_SUM, col_type_code: type_code::I64, _pad: [0; 2],
         };
 
-        let out1 = op_gather_reduce(&partial1, &mut to_ch.cursor, &schema, &[agg]);
+        let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
         assert_eq!(out1.count, 1);
         let global_count = crate::util::read_i64_le(&out1.col_data[0], 0);
         assert_eq!(global_count, 4);
 
         // Tick 2: retract 1 from each worker → partial counts are -1 each → global delta = -2
         let prev_out = Arc::new(out1);
-        let mut to_ch2 = unsafe { create_cursor_from_snapshots(&[prev_out], &[], schema) };
+        let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
 
         let mut partial2 = OwnedBatch::with_schema(schema, 2);
         partial2.count = 0;
@@ -1745,7 +1740,7 @@ mod tests {
             partial2.count += 1;
         }
 
-        let out2 = op_gather_reduce(&partial2, &mut to_ch2.cursor, &schema, &[agg]);
+        let out2 = op_gather_reduce(&partial2, to_ch2.cursor_mut(), &schema, &[agg]);
         // Should have 2 rows: retract old (4, w=-1) + insert new (2, w=+1)
         assert_eq!(out2.count, 2);
     }
@@ -1883,7 +1878,7 @@ mod tests {
     #[test]
     fn test_reduce_sum_i32() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let in_schema = make_schema_with_type(type_code::I32);
 
@@ -1901,7 +1896,7 @@ mod tests {
         };
 
         let empty_out = Arc::new(OwnedBatch::empty(1));
-        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows with I32 values, group by PK
         let delta = make_batch_typed_i32(&in_schema, &[
@@ -1914,7 +1909,7 @@ mod tests {
 
         // GROUP BY pk → each row is its own group
         let (out, _) = op_reduce(
-            &delta, None, &mut to_ch.cursor,
+            &delta, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[0u32], &[agg],
             None, false, 0, &[], None, None, 0, 0, None, None,
         );
@@ -1931,7 +1926,7 @@ mod tests {
     #[test]
     fn test_reduce_min_f32() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let in_schema = make_schema_with_type(type_code::F32);
 
@@ -1948,7 +1943,7 @@ mod tests {
         };
 
         let empty_out = Arc::new(OwnedBatch::empty(1));
-        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // Use a 2-col input schema: pk(U64), val(F32), GROUP BY pk
         let delta = make_batch_f32(&in_schema, &[
@@ -1961,7 +1956,7 @@ mod tests {
 
         // GROUP BY pk → all 3 rows in same group
         let (out, _) = op_reduce(
-            &delta, None, &mut to_ch.cursor,
+            &delta, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[0u32], &[agg],
             None, false, 0, &[], None, None, 0, 0, None, None,
         );
@@ -1975,7 +1970,7 @@ mod tests {
     #[test]
     fn test_reduce_max_i16() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let in_schema = make_schema_with_type(type_code::I16);
 
@@ -1992,7 +1987,7 @@ mod tests {
         };
 
         let empty_out = Arc::new(OwnedBatch::empty(1));
-        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], out_schema) };
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
         // 3 rows with I16 values, all same PK
         let delta = make_batch_typed_i16(&in_schema, &[
@@ -2004,7 +1999,7 @@ mod tests {
         };
 
         let (out, _) = op_reduce(
-            &delta, None, &mut to_ch.cursor,
+            &delta, None, to_ch.cursor_mut(),
             &in_schema, &out_schema, &[0u32], &[agg],
             None, false, 0, &[], None, None, 0, 0, None, None,
         );
@@ -2020,7 +2015,7 @@ mod tests {
     #[test]
     fn test_gather_reduce_min_retraction() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         // Schema: pk(U128), min_val(I64)
         let mut schema = SchemaDescriptor {
@@ -2037,7 +2032,7 @@ mod tests {
 
         // Tick 1: partial MIN=5 from one worker → global MIN=5
         let empty_out = Arc::new(OwnedBatch::empty(1));
-        let mut to_ch = unsafe { create_cursor_from_snapshots(&[empty_out], &[], schema) };
+        let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
 
         let mut partial1 = OwnedBatch::with_schema(schema, 1);
         partial1.count = 0;
@@ -2052,7 +2047,7 @@ mod tests {
             col_idx: 1, agg_op: AGG_MIN, col_type_code: type_code::I64, _pad: [0; 2],
         };
 
-        let out1 = op_gather_reduce(&partial1, &mut to_ch.cursor, &schema, &[agg]);
+        let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
         assert_eq!(out1.count, 1);
         let min1 = crate::util::read_i64_le(&out1.col_data[0], 0);
         assert_eq!(min1, 5);
@@ -2060,7 +2055,7 @@ mod tests {
         // Tick 2: partial MIN=3 from one worker. The old global (5) should be folded in
         // via merge_accumulated with weight=1 → combine(5). New MIN should be min(3, 5) = 3.
         let prev_out = Arc::new(out1);
-        let mut to_ch2 = unsafe { create_cursor_from_snapshots(&[prev_out], &[], schema) };
+        let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
 
         let mut partial2 = OwnedBatch::with_schema(schema, 1);
         partial2.count = 0;
@@ -2071,7 +2066,7 @@ mod tests {
         partial2.col_data[0].extend_from_slice(&3i64.to_le_bytes());
         partial2.count += 1;
 
-        let out2 = op_gather_reduce(&partial2, &mut to_ch2.cursor, &schema, &[agg]);
+        let out2 = op_gather_reduce(&partial2, to_ch2.cursor_mut(), &schema, &[agg]);
         // Should have: retract old (5, w=-1) + insert new (3, w=+1)
         assert_eq!(out2.count, 2, "should retract old MIN and emit new MIN");
         let retracted = crate::util::read_i64_le(&out2.col_data[0], 0);

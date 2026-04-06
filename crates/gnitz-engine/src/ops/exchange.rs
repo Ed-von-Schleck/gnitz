@@ -1,8 +1,7 @@
 //! Exchange repartitioning: PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter.
 
 use crate::schema::SchemaDescriptor;
-use crate::memtable::OwnedBatch;
-use crate::merge::MemBatch;
+use crate::storage::{OwnedBatch, MemBatch, partition_for_key};
 
 use super::util::{extract_group_key, payload_idx};
 
@@ -111,10 +110,10 @@ fn hash_row_for_partition(
 ) -> usize {
     let pki = schema.pk_index as usize;
     if col_indices.len() == 1 && col_indices[0] as usize == pki {
-        return crate::partitioned_table::partition_for_key(mb.get_pk_lo(row), mb.get_pk_hi(row));
+        return partition_for_key(mb.get_pk_lo(row), mb.get_pk_hi(row));
     }
     let (lo, hi) = extract_group_key(mb, row, schema, col_indices);
-    crate::partitioned_table::partition_for_key(lo, hi)
+    partition_for_key(lo, hi)
 }
 
 pub fn op_repartition_batch(
@@ -516,7 +515,7 @@ mod tests {
 
         for &pk in pk_vals {
             let expected = worker_for_partition(
-                crate::partitioned_table::partition_for_key(pk, 0),
+                partition_for_key(pk, 0),
                 num_workers,
             );
             let found = (0..sub_batches[expected].count)
@@ -553,7 +552,7 @@ mod tests {
 
         for &(lo, hi) in pk_pairs {
             let expected = worker_for_partition(
-                crate::partitioned_table::partition_for_key(lo, hi),
+                partition_for_key(lo, hi),
                 num_workers,
             );
             let found = (0..sub_batches[expected].count).any(|r| {
@@ -739,7 +738,7 @@ mod tests {
         assert_eq!(total_rows(&sub_batches), vals.len());
 
         for &v in &vals {
-            let expected_partition = crate::partitioned_table::partition_for_key(v as u64, 0);
+            let expected_partition = partition_for_key(v as u64, 0);
             let expected_worker = worker_for_partition(expected_partition, num_workers);
             let found = (0..sub_batches[expected_worker].count).any(|r| {
                 i64::from_le_bytes(
@@ -813,14 +812,13 @@ mod tests {
     #[test]
     fn test_distinct_update_same_pk() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
 
         // Trace: (PK=1, val=100, w=+1) — a row inserted in a previous tick.
         let trace_batch = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
-        let mut cursor_handle =
-            unsafe { create_cursor_from_snapshots(&[trace_batch], &[], schema) };
+        let mut cursor_handle = CursorHandle::from_owned(&[trace_batch], schema);
 
         // Delta: UPDATE PK=1 sets val=100 → 200.
         // _enforce_unique_pk emits (PK=1, val=100, w=-1) and (PK=1, val=200, w=+1).
@@ -828,7 +826,7 @@ mod tests {
         let delta = make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]);
 
         let (out, _consolidated) =
-            crate::ops::op_distinct(&delta, &mut cursor_handle.cursor, &schema);
+            crate::ops::op_distinct(&delta, cursor_handle.cursor_mut(), &schema);
 
         assert_eq!(
             out.count,

@@ -17,10 +17,7 @@ use std::fs;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 use crate::dag::{DagEngine, StoreHandle};
-use crate::memtable::OwnedBatch;
-use crate::partitioned_table::{self, PartitionedTable};
-use crate::read_cursor::CursorHandle;
-use crate::table::Table;
+use crate::storage::{OwnedBatch, PartitionedTable, partition_arena_size, CursorHandle, Table};
 
 // ---------------------------------------------------------------------------
 // Constants — must match RPython gnitz/catalog/system_tables.py
@@ -1080,7 +1077,7 @@ impl CatalogEngine {
 
                 // Create partitioned table
                 let num_parts = if tid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
-                let arena = partitioned_table::partition_arena_size(num_parts);
+                let arena = partition_arena_size(num_parts);
                 gnitz_debug!("catalog: creating table dir={} name={} tid={} parts={}", directory, name, tid, num_parts);
                 let pt = PartitionedTable::new(
                     &directory, &name, tbl_schema, tid as u32, num_parts,
@@ -1186,7 +1183,7 @@ impl CatalogEngine {
 
                 // Create partitioned ephemeral table
                 let num_parts = if vid < FIRST_USER_TABLE_ID { 1 } else { NUM_PARTITIONS };
-                let arena = partitioned_table::partition_arena_size(num_parts);
+                let arena = partition_arena_size(num_parts);
                 let et = PartitionedTable::new(
                     &directory, &name, view_schema, vid as u32, num_parts,
                     false, // not durable (ephemeral)

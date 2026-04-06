@@ -167,7 +167,7 @@ mod tests {
         }
     }
 
-    /// Ports RPython test_comparator: null < non-null ordering.
+    /// Ports test_comparator: null < non-null ordering.
     #[test]
     fn test_compare_rows_null_lt_non_null() {
         let schema = make_schema_nullable_float();
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 1, &batch, 0), Ordering::Greater);
     }
 
-    /// Ports RPython test_comparator: null == null (both null → skip to next col).
+    /// Ports test_comparator: null == null (both null → skip to next col).
     #[test]
     fn test_compare_rows_null_eq_null() {
         let schema = make_schema_nullable_float();
@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
     }
 
-    /// Ports RPython test_comparator: float comparison (5.0 > -5.0).
+    /// Ports test_comparator: float comparison (5.0 > -5.0).
     #[test]
     fn test_compare_rows_float() {
         let schema = make_schema_nullable_float();
@@ -210,7 +210,7 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Greater);
     }
 
-    /// Ports RPython test_comparator: equality.
+    /// Ports test_comparator: equality.
     #[test]
     fn test_compare_rows_equality() {
         let schema = make_schema_nullable_float();

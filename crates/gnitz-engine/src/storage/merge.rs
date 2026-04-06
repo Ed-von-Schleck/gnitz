@@ -1,7 +1,7 @@
 //! In-memory N-way merge for MemTable consolidation.
 //!
-//! Operates on flat columnar buffers (the same layout as ArenaZSetBatch in RPython):
-//! pk_lo[u64], pk_hi[u64], weight[i64], null_bitmap[u64], payload columns, blob arena.
+//! Operates on flat columnar buffers: pk_lo[u64], pk_hi[u64], weight[i64],
+//! null_bitmap[u64], payload columns, blob arena.
 //!
 //! The merge is a fused k-way merge + inline consolidation: rows with the same
 //! (PK, payload) have their weights summed; rows whose net weight is zero are dropped.
@@ -9,9 +9,9 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::columnar::{self, ColumnarSource};
+use super::columnar::{self, ColumnarSource};
 use crate::schema::{SchemaDescriptor, type_code};
-use crate::heap::MergeHeap;
+use super::heap::MergeHeap;
 use crate::util::{read_u32_le, read_u64_le};
 
 use type_code::STRING as TYPE_STRING;
@@ -292,7 +292,7 @@ pub fn merge_batches(
         cursors: &'c [MemBatchCursor],
         batches: &'c [MemBatch],
         schema: &'c SchemaDescriptor,
-    ) -> impl Fn(&crate::heap::HeapNode, &crate::heap::HeapNode) -> bool + 'c {
+    ) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> bool + 'c {
         move |a, b| {
             if a.key != b.key {
                 return a.key < b.key;

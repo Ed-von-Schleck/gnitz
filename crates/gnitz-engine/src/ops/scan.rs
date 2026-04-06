@@ -1,8 +1,7 @@
 //! Scan trace operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::memtable::OwnedBatch;
-use crate::read_cursor::ReadCursor;
+use crate::storage::{OwnedBatch, ReadCursor};
 
 use super::util::append_cursor_row_to_batch;
 
@@ -51,7 +50,7 @@ pub fn op_scan_trace(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use crate::memtable::OwnedBatch;
+    use crate::storage::OwnedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -89,17 +88,17 @@ mod tests {
     #[test]
     fn test_op_scan_trace_chunked() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
         // 5 rows in trace
         let trace = Arc::new(make_batch(&schema, &[
             (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50),
         ]));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // First scan: chunk_limit=3 → get 3 rows
-        let out1 = op_scan_trace(&mut ch.cursor, &schema, 3);
+        let out1 = op_scan_trace(ch.cursor_mut(), &schema, 3);
         assert_eq!(out1.count, 3);
         assert_eq!(out1.get_pk_lo(0), 1);
         assert_eq!(out1.get_pk_lo(2), 3);
@@ -107,7 +106,7 @@ mod tests {
         assert!(out1.consolidated);
 
         // Second scan: remaining 2 rows
-        let out2 = op_scan_trace(&mut ch.cursor, &schema, 3);
+        let out2 = op_scan_trace(ch.cursor_mut(), &schema, 3);
         assert_eq!(out2.count, 2);
         assert_eq!(out2.get_pk_lo(0), 4);
         assert_eq!(out2.get_pk_lo(1), 5);
@@ -116,13 +115,13 @@ mod tests {
     #[test]
     fn test_op_scan_trace_empty() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
         let empty = Arc::new(OwnedBatch::empty(1));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[empty], &[], schema) };
+        let mut ch = CursorHandle::from_owned(&[empty], schema);
 
-        let out = op_scan_trace(&mut ch.cursor, &schema, 10);
+        let out = op_scan_trace(ch.cursor_mut(), &schema, 10);
         assert_eq!(out.count, 0);
     }
 }

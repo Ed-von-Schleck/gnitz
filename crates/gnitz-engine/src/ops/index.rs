@@ -1,8 +1,7 @@
 //! Secondary index integration: GiDesc, AviDesc, op_integrate_with_indexes.
 
 use crate::schema::{SchemaDescriptor, SchemaColumn, type_code};
-use crate::memtable::OwnedBatch;
-use crate::merge::MemBatch;
+use crate::storage::{OwnedBatch, MemBatch};
 
 // ---------------------------------------------------------------------------
 // Helper: payload index
@@ -157,13 +156,13 @@ fn extract_gc_u64(
 
 /// GI/AVI descriptor for integrate_with_indexes.
 pub struct GiDesc {
-    pub table: *mut crate::table::Table,
+    pub table: *mut crate::storage::Table,
     pub col_idx: u32,
     pub col_type_code: u8,
 }
 
 pub struct AviDesc {
-    pub table: *mut crate::table::Table,
+    pub table: *mut crate::storage::Table,
     pub for_max: bool,
     pub agg_col_type_code: u8,
     pub group_by_cols: Vec<u32>,
@@ -211,7 +210,7 @@ fn make_avi_schema() -> SchemaDescriptor {
 /// internally (flush-on-overflow), so no explicit MemTableFullError retry.
 pub fn op_integrate_with_indexes(
     batch: &OwnedBatch,
-    target_table: Option<&mut crate::table::Table>,
+    target_table: Option<&mut crate::storage::Table>,
     input_schema: &SchemaDescriptor,
     gi: Option<&GiDesc>,
     avi: Option<&AviDesc>,

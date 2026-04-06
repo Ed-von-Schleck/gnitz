@@ -13,7 +13,7 @@ use crate::ipc_sys;
 use crate::layout::*;
 use crate::util::{read_u64_le, read_i64_le};
 use crate::xxh;
-use crate::xor8;
+use super::xor8;
 
 /// RAII guard for mmap'd memory.  Calls `munmap` on drop unless disarmed.
 struct MmapGuard {
@@ -433,7 +433,7 @@ fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
     (a_hi, a_lo) < (b_hi, b_lo)
 }
 
-impl crate::columnar::ColumnarSource for MappedShard {
+impl super::columnar::ColumnarSource for MappedShard {
     #[inline]
     fn get_null_word(&self, row: usize) -> u64 {
         self.get_null_word(row)
@@ -553,7 +553,7 @@ mod tests {
             (blob.as_ptr(), blob.len()),
         ];
 
-        let image = crate::shard_file::build_shard_image(0, count, &regions);
+        let image = super::super::shard_file::build_shard_image(0, count, &regions);
         std::fs::write(&path, &image).unwrap();
         path.to_str().unwrap().to_string()
     }
@@ -581,7 +581,7 @@ mod tests {
             (blob.as_ptr(), blob.len()),
         ];
 
-        let image = crate::shard_file::build_shard_image(0, count, &regions);
+        let image = super::super::shard_file::build_shard_image(0, count, &regions);
         std::fs::write(&path, &image).unwrap();
         path.to_str().unwrap().to_string()
     }

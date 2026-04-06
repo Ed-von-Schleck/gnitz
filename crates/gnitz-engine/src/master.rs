@@ -15,7 +15,7 @@ use crate::ipc::{
     FLAG_TICK, FLAG_FLUSH, DecodedWire,
 };
 use crate::ipc_sys;
-use crate::memtable::OwnedBatch;
+use crate::storage::{OwnedBatch, partition_for_key};
 use crate::ops::{
     PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter,
     worker_for_partition_pub,
@@ -675,7 +675,7 @@ impl MasterDispatcher {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
         let worker = worker_for_partition_pub(
-            crate::partitioned_table::partition_for_key(pk_lo, pk_hi),
+            partition_for_key(pk_lo, pk_hi),
             self.num_workers,
         );
 

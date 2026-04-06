@@ -19,7 +19,7 @@ use crate::ipc::{
     FLAG_TICK, FLAG_CHECKPOINT, FLAG_FLUSH,
 };
 use crate::ipc_sys;
-use crate::memtable::OwnedBatch;
+use crate::storage::OwnedBatch;
 
 // ---------------------------------------------------------------------------
 // IPC handles — shared by WorkerProcess and WorkerExchangeHandler

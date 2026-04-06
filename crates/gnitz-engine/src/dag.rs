@@ -10,10 +10,8 @@ use std::collections::HashMap;
 
 use crate::schema::SchemaDescriptor;
 use crate::compiler::{self, CompileOutput, ExternalTable};
-use crate::memtable::OwnedBatch;
+use crate::storage::{OwnedBatch, CursorHandle, Table, PartitionedTable};
 use crate::ops;
-use crate::read_cursor::CursorHandle;
-use crate::table::Table;
 use crate::vm;
 
 // ---------------------------------------------------------------------------
@@ -38,7 +36,7 @@ pub enum StoreHandle {
     /// EphemeralTable / single Table — used by views.
     Single(*mut Table),
     /// PartitionedTable — used by base tables.
-    Partitioned(*mut crate::partitioned_table::PartitionedTable),
+    Partitioned(*mut PartitionedTable),
 }
 
 // SAFETY: StoreHandle wraps raw pointers that are only accessed on the
@@ -1500,7 +1498,7 @@ impl DagEngine {
     /// `(-1, old_row)` + `(+1, new_row)` to incrementally update.
     fn enforce_unique_pk_partitioned(
         &self,
-        ptable: &mut crate::partitioned_table::PartitionedTable,
+        ptable: &mut PartitionedTable,
         schema: &SchemaDescriptor,
         batch: OwnedBatch,
     ) -> OwnedBatch {

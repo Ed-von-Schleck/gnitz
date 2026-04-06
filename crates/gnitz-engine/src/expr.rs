@@ -6,7 +6,7 @@
 use crate::schema::{
     compare_german_strings, german_string_tail,
 };
-use crate::merge::MemBatch;
+use crate::storage::MemBatch;
 use crate::util::read_u32_le;
 
 // ---------------------------------------------------------------------------
@@ -1032,7 +1032,7 @@ pub fn eval_with_emit(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor};
-    use crate::memtable::OwnedBatch;
+    use crate::storage::OwnedBatch;
 
     fn make_schema(num_cols: u32, pk_index: u32, col_types: &[(u8, u8)]) -> SchemaDescriptor {
         let mut columns = [SchemaColumn {

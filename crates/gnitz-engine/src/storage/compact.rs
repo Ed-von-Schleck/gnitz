@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 
-use crate::columnar;
-use crate::heap::MergeHeap;
+use super::columnar;
+use super::heap::MergeHeap;
 use crate::schema::SchemaDescriptor;
 use crate::schema::type_code;
-use crate::shard_reader::MappedShard;
+use super::shard_reader::MappedShard;
 use crate::util::{read_u32_le, read_u64_le};
 #[cfg(test)]
 use crate::util::read_i64_le;
@@ -241,10 +241,10 @@ impl ShardWriter {
         }
         regions.push((self.blob_heap.as_ptr(), self.blob_heap.len()));
 
-        let image = crate::shard_file::build_shard_image(
+        let image = super::shard_file::build_shard_image(
             table_id, self.count as u32, &regions,
         );
-        crate::shard_file::write_shard_at(
+        super::shard_file::write_shard_at(
             libc::AT_FDCWD, path, &image, true,
         )
     }
@@ -304,7 +304,7 @@ fn open_and_merge(
         cursors: &'a [ShardCursor],
         shards: &'a [MappedShard],
         schema: &'a SchemaDescriptor,
-    ) -> impl Fn(&crate::heap::HeapNode, &crate::heap::HeapNode) -> bool + 'a {
+    ) -> impl Fn(&super::heap::HeapNode, &super::heap::HeapNode) -> bool + 'a {
         move |a, b| {
             if a.key != b.key {
                 return a.key < b.key;

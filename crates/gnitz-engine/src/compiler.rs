@@ -9,9 +9,8 @@ use std::collections::{HashMap, HashSet};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::expr::{ExprProgram, EXPR_COPY_COL};
 use crate::ops::AggDescriptor;
-use crate::read_cursor::CursorHandle;
+use crate::storage::{CursorHandle, Table, ReadCursor};
 use crate::scalar_func::{Plan, ScalarFuncKind};
-use crate::table::Table;
 use crate::vm::{ProgramBuilder, VmHandle};
 
 // ---------------------------------------------------------------------------
@@ -363,7 +362,7 @@ impl CompileOutput {
 // ---------------------------------------------------------------------------
 
 /// Read an i64 value from a cursor's current row at the given column index.
-pub fn cursor_read_i64(cursor: &crate::read_cursor::ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> i64 {
+pub fn cursor_read_i64(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> i64 {
     let col_size = schema.columns[col_idx].size as usize;
     let ptr = cursor.col_ptr(col_idx, col_size);
     if ptr.is_null() {
@@ -379,7 +378,7 @@ pub fn cursor_read_i64(cursor: &crate::read_cursor::ReadCursor, col_idx: usize, 
 }
 
 /// Read a German String from cursor column. Returns bytes (may be empty).
-fn cursor_read_string(cursor: &crate::read_cursor::ReadCursor, col_idx: usize, _schema: &SchemaDescriptor) -> Vec<u8> {
+fn cursor_read_string(cursor: &ReadCursor, col_idx: usize, _schema: &SchemaDescriptor) -> Vec<u8> {
     use crate::schema::SHORT_STRING_THRESHOLD;
 
     let ptr = cursor.col_ptr(col_idx, 16);
@@ -418,7 +417,7 @@ fn cursor_read_string(cursor: &crate::read_cursor::ReadCursor, col_idx: usize, _
 }
 
 /// Check if a column is NULL in the current cursor row.
-fn cursor_is_null(cursor: &crate::read_cursor::ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> bool {
+fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> bool {
     if col_idx == schema.pk_index as usize {
         return false; // PK is never null
     }

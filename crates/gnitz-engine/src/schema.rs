@@ -239,3 +239,23 @@ pub(crate) fn compare_german_strings(
         ord => ord,
     }
 }
+
+/// Copy a German String from raw 16-byte struct + blob base ptr into the output.
+pub fn write_string_from_raw(
+    col_buf: &mut Vec<u8>,
+    blob: &mut Vec<u8>,
+    src: &[u8],
+    src_blob_ptr: *const u8,
+) {
+    let (mut dest, is_long) = prep_german_string_copy(src);
+    if is_long {
+        let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
+        assert!(!src_blob_ptr.is_null(), "write_string_from_raw: long string but src_blob_ptr is null");
+        let old_offset = u64::from_le_bytes(src[8..16].try_into().unwrap()) as usize;
+        let src_data = unsafe { std::slice::from_raw_parts(src_blob_ptr.add(old_offset), length) };
+        let new_offset = blob.len();
+        blob.extend_from_slice(src_data);
+        dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
+    }
+    col_buf.extend_from_slice(&dest);
+}

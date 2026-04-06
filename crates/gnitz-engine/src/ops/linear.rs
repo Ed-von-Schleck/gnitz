@@ -2,8 +2,7 @@
 //! Also includes PK promotion for reindex (GROUP BY).
 
 use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
-use crate::memtable::OwnedBatch;
-use crate::merge::MemBatch;
+use crate::storage::{OwnedBatch, MemBatch};
 use crate::scalar_func::ScalarFuncKind;
 use crate::xxh;
 
@@ -245,7 +244,7 @@ fn op_union_merge(
             // Merge the two sub-ranges by payload order.
             let (mut ia, mut jb) = (i, j);
             while ia < i_end && jb < j_end {
-                if crate::columnar::compare_rows(schema, &mb_a, ia, &mb_b, jb)
+                if crate::storage::compare_rows(schema, &mb_a, ia, &mb_b, jb)
                     != std::cmp::Ordering::Greater
                 {
                     output.append_batch(batch_a, ia, ia + 1);
@@ -382,7 +381,7 @@ pub(super) fn promote_col_to_pk(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use crate::memtable::OwnedBatch;
+    use crate::storage::OwnedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {

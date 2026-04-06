@@ -1,15 +1,12 @@
 //! FLSM Shard Index: manages shard lifecycle, compaction, and manifest I/O.
-//!
-//! Replaces 6 RPython modules: flsm.py, index.py, compactor.py, manifest.py,
-//! metadata.py, refcount.py. Exposed as an opaque handle via FFI.
 
 use std::ffi::{CStr, CString};
 use std::fs;
 
-use crate::compact;
+use super::compact;
 use crate::schema::SchemaDescriptor;
-use crate::manifest::{self, ManifestEntryRaw};
-use crate::shard_reader::MappedShard;
+use super::manifest::{self, ManifestEntryRaw};
+use super::shard_reader::MappedShard;
 use crate::util::{make_pk, split_pk};
 
 const MAX_LEVELS: usize = 3;
@@ -702,7 +699,7 @@ impl ShardIndex {
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use crate::shard_file;
+    use super::super::shard_file;
 
     fn test_schema() -> SchemaDescriptor {
         let mut sd = SchemaDescriptor {

@@ -2,9 +2,7 @@
 
 use crate::schema::SchemaDescriptor;
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::memtable::{write_to_owned_batch, OwnedBatch};
-use crate::merge::{self, MemBatch};
-use crate::read_cursor::ReadCursor;
+use crate::storage::{write_to_owned_batch, OwnedBatch, MemBatch, ReadCursor, scatter_copy};
 
 use super::util::{consolidate_owned, pk_lt, write_string_from_batch, write_string_from_raw};
 
@@ -64,7 +62,7 @@ pub fn op_anti_join_delta_trace(
     let blob_cap = mb.blob.len().max(1);
     let mut output =
         write_to_owned_batch(schema, emit_indices.len(), blob_cap, |writer| {
-            merge::scatter_copy(&mb, &emit_indices, &[], writer);
+            scatter_copy(&mb, &emit_indices, &[], writer);
         });
     output.sorted = true;
     output.consolidated = true;
@@ -135,7 +133,7 @@ pub fn op_semi_join_delta_trace(
     let blob_cap = mb.blob.len().max(1);
     let mut output =
         write_to_owned_batch(schema, emit_indices.len(), blob_cap, |writer| {
-            merge::scatter_copy(&mb, &emit_indices, &[], writer);
+            scatter_copy(&mb, &emit_indices, &[], writer);
         });
     output.sorted = true;
     output.consolidated = true;
@@ -191,7 +189,7 @@ fn semi_join_dt_swapped(
     let blob_cap = mb.blob.len().max(1);
     let mut output =
         write_to_owned_batch(schema, emit_indices.len(), blob_cap, |writer| {
-            merge::scatter_copy(&mb, &emit_indices, &[], writer);
+            scatter_copy(&mb, &emit_indices, &[], writer);
         });
     // Swapped order: output is in trace key order, which is sorted
     output.sorted = true;
@@ -624,7 +622,7 @@ fn filter_join_dd_with_payload(
             let mut matched = false;
             for scan_b in b_group_start..b_group_end {
                 if cb.get_weight(scan_b) > 0
-                    && crate::columnar::compare_rows(schema, &mb_a, idx_a, &mb_b, scan_b)
+                    && crate::storage::compare_rows(schema, &mb_a, idx_a, &mb_b, scan_b)
                         == std::cmp::Ordering::Equal
                 {
                     matched = true;
@@ -877,7 +875,7 @@ fn write_join_row_from_batches(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
-    use crate::memtable::OwnedBatch;
+    use crate::storage::OwnedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -1154,18 +1152,18 @@ mod tests {
     #[test]
     fn test_anti_join_dt_basic() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
 
         // Trace: pk=2 and pk=4 exist
         let trace = Arc::new(make_batch(&schema, &[(2, 1, 200), (4, 1, 400)]));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: pk=1,2,3
         let delta = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
 
-        let out = op_anti_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        let out = op_anti_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // pk=2 is in trace, so output should be pk=1 and pk=3
         assert_eq!(out.count, 2);
         assert_eq!(out.get_pk_lo(0), 1);
@@ -1176,20 +1174,20 @@ mod tests {
     #[test]
     fn test_semi_join_dt_basic() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
 
         // Trace: pk=2 and pk=3 exist with positive weight
         let trace = Arc::new(make_batch(&schema, &[(2, 1, 200), (3, 1, 300)]));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: pk=1,2,3,4
         let delta = make_batch(&schema, &[
             (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40),
         ]);
 
-        let out = op_semi_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Only pk=2 and pk=3 have trace matches
         assert_eq!(out.count, 2);
         assert_eq!(out.get_pk_lo(0), 2);
@@ -1199,13 +1197,13 @@ mod tests {
     #[test]
     fn test_semi_join_dt_nonconsolidated() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
 
         // Trace: pk=1 exists
         let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Non-consolidated delta: pk=1 appears twice (w=2 and w=3)
         let mut delta = OwnedBatch::with_schema(schema, 2);
@@ -1221,7 +1219,7 @@ mod tests {
         delta.sorted = true;
         delta.consolidated = false;
 
-        let out = op_semi_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // After consolidation of delta: pk=1 w=5 → matches trace → 1 row
         assert_eq!(out.count, 1);
         assert_eq!(out.get_pk_lo(0), 1);
@@ -1235,19 +1233,19 @@ mod tests {
     #[test]
     fn test_outer_join_null_fill() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let left_schema = make_schema_u64_i64();
         let right_schema = make_schema_u64_i64();
 
         // Right trace: pk=1 val=100
         let trace = Arc::new(make_batch(&right_schema, &[(1, 1, 100)]));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], right_schema) };
+        let mut ch = CursorHandle::from_owned(&[trace], right_schema);
 
         // Delta (left): pk=1 val=10 (matches), pk=2 val=20 (no match → null fill)
         let delta = make_batch(&left_schema, &[(1, 1, 10), (2, 1, 20)]);
 
-        let out = op_join_delta_trace_outer(&delta, &mut ch.cursor, &left_schema, &right_schema);
+        let out = op_join_delta_trace_outer(&delta, ch.cursor_mut(), &left_schema, &right_schema);
 
         assert_eq!(out.count, 2);
         // pk=1: matched, left payload=10, right payload=100
@@ -1269,18 +1267,18 @@ mod tests {
     #[test]
     fn test_anti_join_dt_same_pk_different_payload() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
 
         // Trace: PK=1 exists with positive weight
         let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: two rows with PK=1 but different payloads (both should be matched)
         let delta = make_batch(&schema, &[(1, 1, 100), (1, 1, 200)]);
 
-        let out = op_anti_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        let out = op_anti_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Both rows have PK=1 which is in the trace → anti-join emits 0 rows
         assert_eq!(out.count, 0, "both same-PK rows should be matched by trace");
     }
@@ -1288,18 +1286,18 @@ mod tests {
     #[test]
     fn test_semi_join_dt_same_pk_different_payload() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
 
         // Trace: PK=1 exists with positive weight
         let trace = Arc::new(make_batch(&schema, &[(1, 1, 100)]));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: two rows with PK=1 but different payloads (both should be matched)
         let delta = make_batch(&schema, &[(1, 1, 100), (1, 1, 200)]);
 
-        let out = op_semi_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Both rows have PK=1 which is in the trace → semi-join emits 2 rows
         assert_eq!(out.count, 2, "both same-PK rows should be emitted by semi-join");
     }
@@ -1311,7 +1309,7 @@ mod tests {
     #[test]
     fn test_semi_join_dt_swapped_no_weight_inflation() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
 
@@ -1320,14 +1318,14 @@ mod tests {
         let trace = Arc::new(make_batch(&schema, &[
             (1, 1, 100), (1, 1, 200), (1, 1, 300),
         ]));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[trace], &[], schema) };
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: 20+ rows to trigger n > trace_len swap path
         let mut rows: Vec<(u64, i64, i64)> = (1u64..=25).map(|pk| (pk, 1, pk as i64 * 10)).collect();
         rows.sort_by_key(|r| r.0);
         let delta = make_batch(&schema, &rows);
 
-        let out = op_semi_join_delta_trace(&delta, &mut ch.cursor, &schema);
+        let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Only PK=1 from delta matches — should emit exactly 1 row, not 3
         assert_eq!(out.count, 1, "PK=1 should appear once, not inflated by trace duplicates");
         assert_eq!(out.get_pk_lo(0), 1);

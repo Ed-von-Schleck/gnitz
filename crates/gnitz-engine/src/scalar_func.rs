@@ -9,8 +9,7 @@ use crate::schema::{
     type_code, SchemaDescriptor, SHORT_STRING_THRESHOLD,
 };
 use crate::expr::{self, EmitTarget, ExprProgram};
-use crate::memtable::OwnedBatch;
-use crate::merge::MemBatch;
+use crate::storage::{OwnedBatch, MemBatch};
 use crate::util::read_u32_le;
 
 // ---------------------------------------------------------------------------

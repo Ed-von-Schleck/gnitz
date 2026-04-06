@@ -4,11 +4,10 @@
 //! One FFI call per epoch instead of ~20 (one per opcode).
 
 use crate::schema::SchemaDescriptor;
-use crate::memtable::OwnedBatch;
+use crate::storage::{OwnedBatch, CursorHandle, Table};
+use crate::storage::ReadCursor;
 use crate::ops::{self, AggDescriptor, GiDesc, AviDesc};
-use crate::read_cursor::{CursorHandle, ReadCursor};
 use crate::scalar_func::ScalarFuncKind;
-use crate::table::Table;
 
 
 // ---------------------------------------------------------------------------
@@ -748,7 +747,7 @@ pub fn execute_epoch(
             if r.cursor_ptr.is_null() {
                 None
             } else {
-                Some(&mut unsafe { &mut *r.cursor_ptr }.cursor)
+                Some(unsafe { &mut *r.cursor_ptr }.cursor_mut())
             }
         }};
     }
@@ -1025,9 +1024,9 @@ pub fn execute_epoch(
                     None
                 };
                 let mut avi_opt: Option<&mut ReadCursor> = avi_cursor_handle.as_deref_mut()
-                    .map(|ch| &mut ch.cursor);
+                    .map(|ch| ch.cursor_mut());
                 let mut gi_opt: Option<&mut ReadCursor> = gi_cursor_handle.as_deref_mut()
-                    .map(|ch| &mut ch.cursor);
+                    .map(|ch| ch.cursor_mut());
 
                 let (raw_out, fin_out) = ops::op_reduce(
                     &reg!(*in_reg).batch,
@@ -1599,7 +1598,7 @@ mod tests {
         assert_eq!(rows1.len(), 1);
         assert_eq!(rows1[0], (1, 1, 42)); // clamped to +1
 
-        unsafe { drop(Box::from_raw(ch1 as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch1 as *mut CursorHandle)); }
 
         // Tick 2: delta w=-1, integral before tick = +3, after = +2 (still positive).
         // No boundary crossing → output should be empty.
@@ -1609,7 +1608,7 @@ mod tests {
         let input2 = make_batch(schema, &[(1, 0, -1, 42)]);
         let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors2, &[]).unwrap();
         assert!(r2.is_none(), "no boundary crossing: output should be empty");
-        unsafe { drop(Box::from_raw(ch2 as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch2 as *mut CursorHandle)); }
 
         // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
         // Positive→non-positive boundary crossed → retraction: output pk=1 w=-1.
@@ -1623,7 +1622,7 @@ mod tests {
         let rows3 = extract_rows(&r3);
         assert_eq!(rows3.len(), 1);
         assert_eq!(rows3[0], (1, -1, 42)); // retraction
-        unsafe { drop(Box::from_raw(ch3 as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch3 as *mut CursorHandle)); }
 
         table.close();
     }
@@ -1680,7 +1679,7 @@ mod tests {
         assert_eq!(c0, 100);
         assert_eq!(c1, 200);
 
-        unsafe { drop(Box::from_raw(ch as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
         table.close();
     }
 
@@ -1733,7 +1732,7 @@ mod tests {
             assert_eq!(w, 2);
         }
 
-        unsafe { drop(Box::from_raw(ch as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
         table.close();
     }
 
@@ -1756,7 +1755,7 @@ mod tests {
         table.ingest_owned_batch(batch).unwrap();
 
         let mut ch = table.create_cursor().unwrap();
-        let cursor = &mut ch.cursor;
+        let cursor = ch.cursor_mut();
 
         // Verify cursor iteration
         let mut count = 0;
@@ -1839,7 +1838,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 2); // only pk=2 survives
 
-        unsafe { drop(Box::from_raw(ch as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
         table.close();
     }
 
@@ -1886,7 +1885,7 @@ mod tests {
         assert_eq!(rows[0].0, 1); // pk=1 matches trace
         assert_eq!(rows[1].0, 3); // pk=3 matches trace
 
-        unsafe { drop(Box::from_raw(ch as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
         table.close();
     }
 
@@ -2009,8 +2008,8 @@ mod tests {
         assert!(r1.count >= 1);
 
         // Cleanup
-        unsafe { drop(Box::from_raw(tr_out_ch as *mut crate::read_cursor::CursorHandle)); }
-        unsafe { drop(Box::from_raw(tr_in_ch as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(tr_out_ch as *mut CursorHandle)); }
+        unsafe { drop(Box::from_raw(tr_in_ch as *mut CursorHandle)); }
 
         trace_out_table.close();
         trace_in_table.close();
@@ -2059,7 +2058,7 @@ mod tests {
         let pk0 = u64::from_le_bytes(result.pk_lo[0..8].try_into().unwrap());
         assert_eq!(pk0, 5);
 
-        unsafe { drop(Box::from_raw(ch as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
         table.close();
     }
 
@@ -2201,8 +2200,8 @@ mod tests {
         assert_eq!(r_aj.count + r_sj.count, 5,
                    "anti + semi must equal input count (complement property)");
 
-        unsafe { drop(Box::from_raw(ch_aj as *mut crate::read_cursor::CursorHandle)); }
-        unsafe { drop(Box::from_raw(ch_sj as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch_aj as *mut CursorHandle)); }
+        unsafe { drop(Box::from_raw(ch_sj as *mut CursorHandle)); }
         table.close();
     }
 
@@ -2368,8 +2367,8 @@ mod tests {
         assert_eq!(count_val, 3, "COUNT should be 3");
         assert_eq!(sum_val, 60, "SUM should be 60");
 
-        unsafe { drop(Box::from_raw(tr_out_ch as *mut crate::read_cursor::CursorHandle)); }
-        unsafe { drop(Box::from_raw(tr_in_ch as *mut crate::read_cursor::CursorHandle)); }
+        unsafe { drop(Box::from_raw(tr_out_ch as *mut CursorHandle)); }
+        unsafe { drop(Box::from_raw(tr_in_ch as *mut CursorHandle)); }
         trace_out_table.close();
         trace_in_table.close();
     }
@@ -2444,7 +2443,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        unsafe { drop(Box::from_raw(ch1 as *mut crate::read_cursor::CursorHandle)) };
+        unsafe { drop(Box::from_raw(ch1 as *mut CursorHandle)) };
         // ch1 is now freed; reg 1's cursor_ptr would be dangling if not cleared.
 
         // Epoch 2: pass null for the external trace register.

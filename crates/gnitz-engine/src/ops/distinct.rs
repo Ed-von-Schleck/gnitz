@@ -1,9 +1,7 @@
 //! DBSP distinct operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::memtable::{write_to_owned_batch, OwnedBatch};
-use crate::merge;
-use crate::read_cursor::ReadCursor;
+use crate::storage::{write_to_owned_batch, OwnedBatch, ReadCursor, scatter_copy};
 
 use super::util::{consolidate_owned, signum, compare_cursor_payload_to_batch_row};
 
@@ -87,7 +85,7 @@ pub fn op_distinct(
     let blob_cap = mb.blob.len().max(1);
     let mut output =
         write_to_owned_batch(schema, emit_indices.len(), blob_cap, |writer| {
-            merge::scatter_copy(&mb, &emit_indices, &emit_weights, writer);
+            scatter_copy(&mb, &emit_indices, &emit_weights, writer);
         });
     output.sorted = true;
     output.consolidated = true;
@@ -104,7 +102,7 @@ pub fn op_distinct(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use crate::memtable::OwnedBatch;
+    use crate::storage::OwnedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {
@@ -142,17 +140,17 @@ mod tests {
     #[test]
     fn test_op_distinct_boundary() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
 
         // Empty trace → all positive deltas emit +1
         let empty = Arc::new(OwnedBatch::empty(1));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[empty.clone()], &[], schema) };
+        let mut ch = CursorHandle::from_owned(&[empty.clone()], schema);
 
         // Delta: pk=1 w=+3, pk=2 w=+1
         let delta = make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]);
-        let (out, _) = op_distinct(&delta, &mut ch.cursor, &schema);
+        let (out, _) = op_distinct(&delta, ch.cursor_mut(), &schema);
         // 0→positive: both emit +1
         assert_eq!(out.count, 2);
         assert_eq!(out.get_weight(0), 1);
@@ -161,9 +159,9 @@ mod tests {
         // Now trace has pk=1 w=3 and pk=2 w=1
         // Delta: pk=1 w=-2 (3→1, still positive, no output), pk=2 w=-1 (1→0, emit -1)
         let trace_batch = Arc::new(make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]));
-        let mut ch2 = unsafe { create_cursor_from_snapshots(&[trace_batch], &[], schema) };
+        let mut ch2 = CursorHandle::from_owned(&[trace_batch], schema);
         let delta2 = make_batch(&schema, &[(1, -2, 10), (2, -1, 20)]);
-        let (out2, _) = op_distinct(&delta2, &mut ch2.cursor, &schema);
+        let (out2, _) = op_distinct(&delta2, ch2.cursor_mut(), &schema);
         // pk=1: 3→1, positive→positive, no change
         // pk=2: 1→0, positive→non-positive, emit -1
         assert_eq!(out2.count, 1);
@@ -174,14 +172,14 @@ mod tests {
     #[test]
     fn test_op_distinct_consolidated_flag() {
         use std::sync::Arc;
-        use crate::read_cursor::create_cursor_from_snapshots;
+        use crate::storage::CursorHandle;
 
         let schema = make_schema_u64_i64();
         let empty = Arc::new(OwnedBatch::empty(1));
-        let mut ch = unsafe { create_cursor_from_snapshots(&[empty], &[], schema) };
+        let mut ch = CursorHandle::from_owned(&[empty], schema);
 
         let delta = make_batch(&schema, &[(1, 1, 10)]);
-        let (out, consolidated) = op_distinct(&delta, &mut ch.cursor, &schema);
+        let (out, consolidated) = op_distinct(&delta, ch.cursor_mut(), &schema);
         assert!(out.consolidated, "distinct output must be consolidated");
         assert!(out.sorted, "distinct output must be sorted");
         assert!(consolidated.consolidated, "consolidated output must be consolidated");

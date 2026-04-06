@@ -6,9 +6,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, type_size, encode_german_string, decode_german_string};
-use crate::memtable::OwnedBatch;
+use crate::storage::{OwnedBatch, wal};
 use crate::util::align8;
-use crate::wal;
 
 // ---------------------------------------------------------------------------
 // Constants (must match ipc.py)

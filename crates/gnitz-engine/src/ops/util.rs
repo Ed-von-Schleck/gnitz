@@ -2,9 +2,7 @@
 
 use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
 use crate::schema::type_code::STRING as TYPE_STRING;
-use crate::memtable::{write_to_owned_batch, OwnedBatch};
-use crate::merge;
-use crate::merge::MemBatch;
+use crate::storage::{write_to_owned_batch, OwnedBatch, MemBatch, ReadCursor, sort_and_consolidate};
 use crate::xxh;
 
 // ---------------------------------------------------------------------------
@@ -15,7 +13,7 @@ use crate::xxh;
 pub(super) fn write_string_from_batch(
     col_buf: &mut Vec<u8>,
     blob: &mut Vec<u8>,
-    batch: &crate::merge::MemBatch,
+    batch: &MemBatch,
     row: usize,
     payload_col: usize,
 ) {
@@ -56,7 +54,7 @@ pub(super) fn consolidate_owned(batch: &OwnedBatch, schema: &SchemaDescriptor) -
     let blob_cap = mb.blob.len().max(1);
     let mut consolidated =
         write_to_owned_batch(schema, batch.count, blob_cap, |writer| {
-            merge::sort_and_consolidate(&mb, schema, writer);
+            sort_and_consolidate(&mb, schema, writer);
         });
     consolidated.sorted = true;
     consolidated.consolidated = true;
@@ -77,7 +75,7 @@ pub(super) fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
 /// Append a row from a ReadCursor to an OwnedBatch.
 pub(super) fn append_cursor_row_to_batch(
     output: &mut OwnedBatch,
-    cursor: &crate::read_cursor::ReadCursor,
+    cursor: &ReadCursor,
     schema: &SchemaDescriptor,
 ) {
     let pki = schema.pk_index as usize;
@@ -131,8 +129,8 @@ pub(super) fn append_cursor_row_to_batch(
 /// Iterates payload columns in schema order (skipping pk_index). Null ordering:
 /// null < non-null, null == null. Type dispatch follows `compare_by_group_cols`.
 pub(super) fn compare_cursor_payload_to_batch_row(
-    cursor: &crate::read_cursor::ReadCursor,
-    batch: &crate::merge::MemBatch,
+    cursor: &ReadCursor,
+    batch: &MemBatch,
     row: usize,
     schema: &SchemaDescriptor,
 ) -> std::cmp::Ordering {

@@ -1,16 +1,15 @@
-//! Rust-owned MemTable: manages sorted runs, Bloom filter, consolidation
-//! cache, PK lookups, and shard flush.  Exposed to RPython as an opaque handle
-//! via `gnitz_memtable_*` FFI functions.
+//! MemTable: manages sorted runs, Bloom filter, consolidation cache,
+//! PK lookups, and shard flush.
 
 use std::cmp::Ordering;
 use std::ffi::CStr;
 use std::sync::Arc;
 
-use crate::bloom::BloomFilter;
-use crate::columnar::{self, ColumnarSource};
+use super::bloom::BloomFilter;
+use super::columnar::{self, ColumnarSource};
 use crate::schema::SchemaDescriptor;
-use crate::merge::{self, MemBatch};
-use crate::shard_file;
+use super::merge::{self, MemBatch};
+use super::shard_file;
 use crate::util::{read_i64_le, read_u64_le};
 
 /// Error code returned when the MemTable exceeds its capacity.
@@ -60,11 +59,10 @@ fn relocate_string_cell(
     dst_col.extend_from_slice(&dest);
 }
 
-/// Owned columnar batch.  Stores the same SoA layout as RPython's
-/// `ArenaZSetBatch` but in Rust `Vec<u8>` buffers.
+/// Owned columnar batch.  Stores a struct-of-arrays (SoA) layout in
+/// Rust `Vec<u8>` buffers.
 ///
-/// Used as the primary FFI batch handle (`gnitz_batch_*`), as well as
-/// internally by MemTable, Table, and PartitionedTable.
+/// Used internally by MemTable, Table, and PartitionedTable.
 #[derive(Clone)]
 pub struct OwnedBatch {
     pub pk_lo: Vec<u8>,
@@ -441,7 +439,7 @@ impl OwnedBatch {
                         self.col_data[pi].extend_from_slice(&lo_values[pi].to_le_bytes());
                     }
                     crate::schema::type_code::F32 => {
-                        // RPython stores f32 via float2longlong(f64_val) which gives f64 bits
+                        // f32 values arrive as f64 bit patterns (float2longlong convention)
                         let f64_val = f64::from_bits(lo_values[pi] as u64);
                         let f32_val = f64_val as f32;
                         self.col_data[pi].extend_from_slice(&f32_val.to_le_bytes());
@@ -538,7 +536,7 @@ impl OwnedBatch {
     /// The `schema` must match `self.schema`.
     pub fn append_row_from_ptable_found(
         &mut self,
-        ptable: &crate::partitioned_table::PartitionedTable,
+        ptable: &super::partitioned_table::PartitionedTable,
         pk_lo: u64,
         pk_hi: u64,
         weight: i64,
@@ -565,7 +563,7 @@ impl OwnedBatch {
                 let src = ptable.found_col_ptr(pi, cs);
                 assert!(!src.is_null());
                 let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
-                crate::ops::write_string_from_raw(
+                crate::schema::write_string_from_raw(
                     &mut self.col_data[pi], &mut self.blob,
                     src_slice, ptable.found_blob_ptr(),
                 );
@@ -802,7 +800,7 @@ fn consolidate_batches(
 }
 
 
-/// Snapshot handle returned to RPython.
+/// Snapshot handle for a consolidated memtable state.
 pub struct MemTableSnapshot {
     pub inner: Arc<OwnedBatch>,
 }
@@ -858,7 +856,7 @@ impl MemTable {
         Ok(())
     }
 
-    /// Add a single PK to the bloom filter (for RPython accumulator rows).
+    /// Add a single PK to the bloom filter (for accumulator rows).
     pub fn bloom_add(&mut self, key_lo: u64, key_hi: u64) {
         self.bloom.add(key_lo, key_hi);
     }
@@ -1474,7 +1472,7 @@ mod tests {
             (0, 0,  1, 0, 15000),  // insert sum=15000
         ]);
 
-        let batches: Vec<crate::merge::MemBatch> = vec![
+        let batches: Vec<super::merge::MemBatch> = vec![
             run1.as_mem_batch(),
             run2.as_mem_batch(),
             run3.as_mem_batch(),
@@ -1616,7 +1614,7 @@ mod tests {
         lo[3] = -500;      // I16: -500
         lo[4] = 70000;     // U32: 70000
         lo[5] = -12345;    // I32: -12345
-        // F32: 3.14 → store as f64 bit pattern (RPython convention)
+        // F32: 3.14 → store as f64 bit pattern (float2longlong convention)
         lo[6] = f64::to_bits(3.14f64) as i64;
         lo[7] = 0x1234_5678_9ABC_DEF0u64 as i64;  // U64
         lo[8] = -99999;    // I64

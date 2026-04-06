@@ -6,11 +6,11 @@
 use std::cmp::Ordering;
 use std::ptr;
 
-use crate::columnar::{self, ColumnarSource};
+use super::columnar::{self, ColumnarSource};
 use crate::schema::SchemaDescriptor;
-use crate::heap::MergeHeap;
-use crate::merge::MemBatch;
-use crate::shard_reader::MappedShard;
+use super::heap::MergeHeap;
+use super::merge::MemBatch;
+use super::shard_reader::MappedShard;
 
 // ---------------------------------------------------------------------------
 // CursorSource — unified access to batch buffers or shard mmap
@@ -127,8 +127,8 @@ impl<'a> ColumnarSource for CursorSource<'a> {
 fn entry_cmp(
     entries: &[ReadCursorEntry],
     schema: &SchemaDescriptor,
-    a: &crate::heap::HeapNode,
-    b: &crate::heap::HeapNode,
+    a: &super::heap::HeapNode,
+    b: &super::heap::HeapNode,
 ) -> Ordering {
     let key_ord = a.key.cmp(&b.key);
     if key_ord != Ordering::Equal {
@@ -253,7 +253,7 @@ pub struct ReadCursor<'a> {
 
 impl<'a> ReadCursor<'a> {
     fn build_tree(entries: &[ReadCursorEntry<'a>], schema: &SchemaDescriptor) -> MergeHeap {
-        let less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| {
+        let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
             entry_cmp(entries, schema, a, b).is_lt()
         };
         MergeHeap::build(
@@ -324,7 +324,7 @@ impl<'a> ReadCursor<'a> {
                 } else {
                     None
                 };
-                let less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| {
+                let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
                     entry_cmp(&self.entries, &self.schema, a, b).is_lt()
                 };
                 tree.advance(ei, new_key, &less);
@@ -362,7 +362,7 @@ impl<'a> ReadCursor<'a> {
         let schema = &self.schema;
 
         while !tree.is_empty() {
-            let eq_root = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| -> Ordering {
+            let eq_root = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| -> Ordering {
                 entry_cmp(&self.entries, schema, a, b)
             };
             let num_min = tree.collect_min_indices(&eq_root);
@@ -398,7 +398,7 @@ impl<'a> ReadCursor<'a> {
                 } else {
                     None
                 };
-                let less = |a: &crate::heap::HeapNode, b: &crate::heap::HeapNode| {
+                let less = |a: &super::heap::HeapNode, b: &super::heap::HeapNode| {
                     entry_cmp(&self.entries, schema, a, b).is_lt()
                 };
                 tree.advance(ei, new_key, &less);
@@ -506,7 +506,7 @@ pub unsafe fn create_read_cursor<'a>(
 // ---------------------------------------------------------------------------
 
 use std::sync::Arc;
-use crate::memtable::OwnedBatch;
+use super::memtable::OwnedBatch;
 
 /// FFI-visible cursor handle.  Owns the ReadCursor and, when created from
 /// snapshots, keeps the `Arc<OwnedBatch>` references alive so the cursor's
@@ -516,7 +516,7 @@ use crate::memtable::OwnedBatch;
 /// ensuring the cursor's borrowed slices are invalidated before the backing
 /// data is freed.
 pub struct CursorHandle<'a> {
-    pub cursor: ReadCursor<'a>,
+    pub(crate) cursor: ReadCursor<'a>,
     _owned_snapshots: Vec<Arc<OwnedBatch>>,
 }
 
@@ -527,6 +527,19 @@ impl<'a> CursorHandle<'a> {
             cursor,
             _owned_snapshots: Vec::new(),
         }
+    }
+
+    /// Build a CursorHandle from Rust-owned in-memory snapshots (no shard pointers).
+    pub fn from_owned(
+        snapshots: &[Arc<OwnedBatch>],
+        schema: crate::schema::SchemaDescriptor,
+    ) -> CursorHandle<'static> {
+        unsafe { create_cursor_from_snapshots(snapshots, &[], schema) }
+    }
+
+    /// Mutable access to the inner ReadCursor.
+    pub(crate) fn cursor_mut(&mut self) -> &mut ReadCursor<'a> {
+        &mut self.cursor
     }
 }
 
@@ -569,7 +582,7 @@ pub unsafe fn create_cursor_from_snapshots(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor};
-    use crate::merge::MemBatch;
+    use super::super::merge::MemBatch;
 
     fn make_schema_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {

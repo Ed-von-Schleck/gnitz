@@ -1,21 +1,20 @@
-//! Unified Rust Table: owns MemTable + ShardIndex + optional WAL writer.
+//! Unified Table: owns MemTable + ShardIndex + optional WAL writer.
 //!
-//! Replaces RPython's EphemeralTable and PersistentTable with a single opaque
-//! handle.  Ephemeral tables have `wal_writer = None`; persistent tables have
-//! a WAL writer and publish manifests on flush.
+//! Ephemeral tables have `wal_writer = None`; persistent tables have a WAL
+//! writer and publish manifests on flush.
 
 use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use crate::columnar;
+use super::columnar;
 use crate::schema::SchemaDescriptor;
-use crate::memtable::{self, MemTable, OwnedBatch};
-use crate::merge::MemBatch;
-use crate::read_cursor::{self, CursorHandle};
-use crate::shard_index::ShardIndex;
-use crate::shard_reader::MappedShard;
-use crate::wal::{WalReader, WalWriter};
+use super::memtable::{self, MemTable, OwnedBatch};
+use super::merge::MemBatch;
+use super::read_cursor::{self, CursorHandle};
+use super::shard_index::ShardIndex;
+use super::shard_reader::MappedShard;
+use super::wal::{WalReader, WalWriter};
 
 const MAX_REGIONS: usize = 70; // 4 core + up to 63 payload cols + 1 blob
 
@@ -139,7 +138,7 @@ impl Table {
         let mb = batch.as_mem_batch();
         let mut sorted = memtable::write_to_owned_batch(
             &self.schema, batch.count, batch.blob.len().max(1),
-            |w| crate::merge::sort_only(&mb, &self.schema, w),
+            |w| super::merge::sort_only(&mb, &self.schema, w),
         );
         sorted.sorted = true;
         sorted.schema = Some(self.schema);
@@ -583,7 +582,7 @@ impl Table {
     }
 
     /// Upsert a pre-sorted batch directly into the memtable (no WAL).
-    /// Used by the RPython accumulator flush path.
+    /// Used by the accumulator flush path.
     pub fn memtable_upsert_sorted_batch(&mut self, batch: OwnedBatch) -> Result<(), i32> {
         self.memtable.upsert_sorted_batch(batch)
     }

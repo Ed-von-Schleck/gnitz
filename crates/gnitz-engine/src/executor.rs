@@ -14,7 +14,7 @@ use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_
 use crate::schema::SchemaDescriptor;
 use crate::ipc::{self, DecodedWire, STATUS_OK, STATUS_ERROR};
 use crate::master::MasterDispatcher;
-use crate::memtable::OwnedBatch;
+use crate::storage::OwnedBatch;
 
 // ---------------------------------------------------------------------------
 // Constants

@@ -10,7 +10,7 @@ use libc::c_int;
 
 use crate::layout::*;
 use crate::util::write_u64_le;
-use crate::xor8;
+use super::xor8;
 use crate::xxh;
 
 fn align64(val: usize) -> usize {
@@ -305,7 +305,7 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard_reader::MappedShard;
+    use super::super::shard_reader::MappedShard;
     use crate::schema::{SchemaColumn, SchemaDescriptor};
 
     fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
