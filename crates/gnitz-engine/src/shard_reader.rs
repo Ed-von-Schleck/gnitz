@@ -1,5 +1,6 @@
 //! Memory-mapped columnar shard reader.
 //!
+//! Used by compaction (`compact.rs`) and query-time reads (`read_cursor.rs`).
 //! Supports shard format v3 (24-byte dir entries, all raw) and v4 (32-byte
 //! dir entries with per-region encoding byte).
 

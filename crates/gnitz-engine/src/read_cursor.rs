@@ -1,8 +1,7 @@
 //! Opaque read cursor: N-way merge over in-memory batches + mmap'd shards.
 //!
-//! Replaces the RPython UnifiedCursor + TournamentTree + sub-cursors with a
-//! single Rust-side opaque handle. Produces rows in (PK, payload) order with
-//! inline ghost elimination (net weight=0 rows are skipped).
+//! Produces rows in (PK, payload) order with inline ghost elimination
+//! (net weight=0 rows are skipped).
 
 use std::cmp::Ordering;
 use std::ptr;
@@ -19,7 +18,7 @@ use crate::shard_reader::MappedShard;
 
 enum CursorSource<'a> {
     Batch(MemBatch<'a>),
-    /// Borrowed pointer to a MappedShard owned by RPython's ShardHandle.
+    /// Borrowed pointer to a MappedShard.
     /// The cursor does NOT own or free this.
     Shard(*const MappedShard),
 }
@@ -522,8 +521,7 @@ pub struct CursorHandle<'a> {
 }
 
 impl<'a> CursorHandle<'a> {
-    /// Wrap a cursor that borrows from FFI region pointers (RPython memory).
-    /// No owned snapshot data.
+    /// Wrap a cursor with no owned snapshot data.
     pub fn from_cursor(cursor: ReadCursor<'a>) -> Self {
         CursorHandle {
             cursor,

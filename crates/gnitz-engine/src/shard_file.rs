@@ -1,7 +1,7 @@
 //! Shard file image building and atomic writing.
 //!
-//! Shared by both the compaction path (`compact.rs`) and the memtable flush
-//! path (via `gnitz_write_shard` FFI).
+//! Shared by the compaction path (`compact.rs`) and the memtable flush path
+//! (`memtable.rs`).
 
 use std::ffi::CStr;
 use std::ptr;
