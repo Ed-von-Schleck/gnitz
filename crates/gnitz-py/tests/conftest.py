@@ -11,7 +11,7 @@ def server():
     binary = os.environ.get(
         "GNITZ_SERVER_BIN",
         os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                     "../../../gnitz-server-c")),
+                                     "../../../gnitz-server")),
     )
     if not os.path.isfile(binary):
         pytest.skip(f"Server binary not found: {binary}")

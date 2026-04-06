@@ -3,8 +3,9 @@ name = "gnitz-engine"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-crate-type = ["staticlib"]
+[[bin]]
+name = "gnitz-server"
+path = "src/main.rs"
 
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

@@ -48,8 +48,7 @@ Log format: `<epoch>.<ms> <process> <level> <message>`
 
 For temporary debug logging:
 - Rust: `gnitz_debug!` / `gnitz_info!` macros (in `log.rs`)
-- RPython: `log.debug()` — never raw `os.write(2, ...)`
-Both ensure timestamps, process identity, and level-gating.
+These ensure timestamps, process identity, and level-gating.
 Remove debug calls before committing.
 
 To watch all worker logs live:
@@ -76,26 +75,11 @@ pre-routing, stashing, skipping round-trips):
 ## IPC flag constants
 
 IPC group-header flags are defined once in `ipc.rs` as `pub const FLAG_*: u32`.
-Both `worker.rs` and `master.rs` import from there. The Python equivalents
-in `ipc.py` must match. When adding a new flag:
+Both `worker.rs` and `master.rs` import from there. When adding a new flag:
 
 - [ ] Add to `ipc.rs`
-- [ ] Add to `ipc.py`
 - [ ] Handle in `worker.rs` dispatch loop
 - [ ] Handle in `master.rs` if it requires master-side logic
-
-## FFI state ownership transfer
-
-When moving state from a Python object into a Rust struct:
-
-- [ ] **Audit every mutation site** of the old Python field. Python may mutate
-      state after construction (e.g., `sal.epoch = 1` after recovery). The Rust
-      struct won't see these mutations unless you add a setter FFI call.
-- [ ] **Audit every parameter you eliminate.** If Python callers passed different
-      values for the same parameter (e.g., table schema vs. index schema), the
-      Rust code that derives the value internally may get the wrong one. Check
-      what *distinct values* each call site was passing, not just that they were
-      passing *something*.
 
 ## Consolidation and merge correctness
 
@@ -113,8 +97,8 @@ When adding or modifying a merge path (tournament tree, sort, compaction):
 - [ ] Does the path handle within-cursor duplicates? MemTable runs are
       sorted but NOT consolidated — the same (PK, payload) can appear
       multiple times in one run (e.g., +1 then -1 for the same key).
-- [ ] Is `compare_rows` identical between RPython and Rust? Column order,
-      null handling (null < non-null), and sign-extension must match.
+- [ ] Does `compare_rows` respect column order, null handling (null < non-null),
+      and sign-extension?
 - [ ] Test with entries that share the same PK but differ in payload
       columns. This pattern arises in: reduce output (retraction of old
       aggregate + insertion of new), non-linear aggregates (MIN/MAX)
@@ -139,31 +123,6 @@ When adding or modifying a merge path (tournament tree, sort, compaction):
       defensively re-sorts as a safety net, but the caller should also
       ensure the batch is sorted before ingestion.
 
-## FFI handle type safety
-
-RPython wraps two distinct Rust handle types for table storage:
-
-- `EphemeralTable._handle` → `*mut Table` (Rust `Table` struct)
-- `PartitionedTable._handle` → `*mut PartitionedTable` (Rust `PartitionedTable` struct)
-
-Both are stored as `rffi.VOIDP` in Python. **They are NOT interchangeable.**
-Casting a `PartitionedTable*` to `Table*` and dereferencing it reads garbage
-(different struct layout). Any Rust FFI function that expects a `Table*` will
-corrupt memory if given a `PartitionedTable*`.
-
-When writing FFI code that operates on "the view's store":
-
-- [ ] Does the code distinguish `EphemeralTable` from `PartitionedTable`?
-      Use `isinstance()` on the Python side, or pass a type tag.
-- [ ] If you need a `Table*` from a `PartitionedTable`, use
-      `gnitz_ptable_create_child` or `gnitz_ptable_get_child_dir` — never
-      cast the PartitionedTable handle to `Table*`.
-- [ ] For child table creation in multi-worker mode, each worker's
-      `PartitionedTable` has different partition directories. Use
-      `PartitionedTable.get_child_base_dir()` (→ partition 0's directory)
-      to get a worker-unique base path. Using `TableFamily.directory`
-      gives the SAME path for all workers, causing data corruption.
-
 ## Exchange schema contract
 
 The exchange (OPCODE_EXCHANGE_SHARD) serializes batches using the
@@ -184,8 +143,7 @@ serialized as I64 (8 bytes), causing silent data corruption at workers.
 
 ## Aggregate output type contract
 
-`UniversalAccumulator.output_column_type()` (RPython) determines the
-column type in the REDUCE output schema. The rule is simple:
+The REDUCE output schema column type rule is simple:
 
 - COUNT, COUNT_NON_NULL → **I64** (always)
 - SUM/MIN/MAX on F32/F64 → **F64**
@@ -196,83 +154,19 @@ column is ALWAYS 8 bytes. MIN/MAX on STRING stores the German String
 compare key (first 8 bytes), not the full 16-byte string struct. Any Rust
 code that builds REDUCE output schemas must follow this rule exactly.
 
-## Rust static lib rebuild rule
-
-Individual test targets (`make run-<name>-c`) do **not** rebuild the Rust
-static libraries. Only the top-level `make test` has `rust-engine-debug` as
-a prerequisite. After changing any Rust code in `crates/gnitz-engine/`
-or `crates/gnitz-transport/`, always rebuild before running RPython
-tests:
-
-```bash
-make rust-engine-debug          # after gnitz-engine changes
-make rust-transport-debug       # after gnitz-transport changes
-```
-
-Forgetting this causes linker errors (`undefined reference`) for new symbols,
-or silent use of stale code for changed symbols — the RPython binary links
-the old `.a` and passes or fails for the wrong reasons.
-
-## RPython server rebuild for E2E tests
-
-`make server` is a `.PHONY` target that depends only on the Rust lib targets.
-**It does NOT track changes to Python source files.** RPython caches its
-intermediate C files in `/tmp/usession-main-*`. If the generated C is
-up-to-date (by RPython's internal hashing), `make server` only re-links
-(~55s) without re-translating (~25s extra for annotate + rtype).
-
-After changing any `.py` file under `gnitz/`, force a full re-translation:
-
-```bash
-rm -rf /tmp/usession-main-* && rm -f gnitz-server-c && make server
-```
-
-**How to verify the rebuild included your changes:** look for `annotate`
-and `rtype_lltype` in the build output. If you only see `database_c`,
-`source_c`, `compile_c` — translation was skipped and the old Python
-code is still baked in.
-
-## RPython–Rust flag synchronization
-
-`ArenaZSetBatch` (Python) wraps a Rust `OwnedBatch`. Both have `sorted`
-and `consolidated` flags. These can desync:
-
-- `ArenaZSetBatch._invalidate_cache()` sets Python `_sorted = False` but
-  does NOT call `_batch_set_sorted` on the Rust side.
-- `OwnedBatch::append_batch` / `append_batch_negated` clear Rust
-  `sorted` and `consolidated`, but the Python wrapper's `_invalidate_cache`
-  is what the caller relies on.
-- `BatchWriter.mark_sorted(value)` delegates to `ArenaZSetBatch.mark_sorted`
-  which syncs both sides. Always use `mark_sorted` / `mark_consolidated`
-  for explicit flag changes — never assign `_sorted` directly.
-
-The Rust `Table::upsert_and_maybe_flush` defensively re-sorts batches
-whose `sorted` flag is false (batches from `OwnedBatch::from_regions`
-always start with `sorted = false`). This catches any desync from the
-Python side.
-
-When adding new Rust-side batch mutation functions (append, copy, filter):
-
-- [ ] Does the function clear `self.sorted` and `self.consolidated`?
-- [ ] Is there a corresponding Python-side `_invalidate_cache()` call?
-
 ## Benchmarking
 
 ### Binaries
 
-Three server binaries, built via Makefile targets:
+| Binary | Make target | Use |
+|--------|-------------|-----|
+| `gnitz-server` | `make server` | Dev/debug build |
+| `gnitz-server-release` | `make release-server` | Release profiling |
 
-| Binary | Make target | Flags | Use |
-|--------|-------------|-------|-----|
-| `gnitz-server-c` | `make server` | `--opt=1 --gc=incminimark --lldebug` | Dev/debug (has debug alloc) |
-| `gnitz-server-release-c` | `make release-server` | `--opt=jit --gc=incminimark --lto` | JIT release profiling |
-| `gnitz-server-nojit-c` | `make release-server-nojit` | `--opt=2 --gc=incminimark --lto` | Static-opt baseline |
-
-Rebuild release binaries before benchmarking if source has changed:
+Rebuild before benchmarking if source has changed:
 
 ```bash
-make release-server            # ~3 min
-make release-server-nojit      # ~2 min
+make release-server
 ```
 
 ### Benchmark scripts
@@ -281,17 +175,9 @@ All scripts run from the repo root. They start a server, run a workload via
 `uv run python -c ...` (so the gnitz client is importable), then shut down.
 
 ```bash
-# CPU profile with perf (requires perf, paranoid ≤ 1)
-python scripts/perf_profile.py --ticks 5 --rows 50000
-
-# Realistic multi-client latency profile
-python scripts/perf_profile.py --realistic --ticks 5 --rows 5000 --clients 4
-
-# JIT vs non-JIT comparison
-python scripts/compare_jit.py --ticks 5 --rows 50000
-
-# JIT vs non-JIT with realistic workload
-python scripts/compare_jit.py --realistic --ticks 5 --rows 10000 --clients 4
+# Benchmark history
+python scripts/bench_history.py --last 10
+python scripts/bench_history.py --compare <old_commit> <new_commit>
 ```
 
 ### Benchmark history
@@ -315,62 +201,6 @@ python scripts/bench_history.py --trend                  # throughput over time
 4. Rebuild and re-run
 5. `python scripts/bench_history.py --compare <old> <new>` to see the delta
 
-## Resource ownership: the close-chain rule
-
-RPython has no RAII, no release-on-scope-exit, and no reliable finalizers.
-The only defense against fd/mmap/buffer leaks is an explicit close chain.
-
-**Invariant:** Every class that holds a closeable sub-resource (cursor, fd,
-mmap, Buffer) MUST have a `close()` method, and its parent's `close()` MUST
-call it — all the way up to `Engine.close()`.
-
-When adding a field that stores a cursor, fd, or any resource with `close()`:
-
-- [ ] Does the containing class have `close()`?
-- [ ] Does `close()` close the new sub-resource?
-- [ ] Does the parent class's `close()` call this class's `close()`?
-- [ ] Trace the chain up to `Engine.close()` — is every link present?
-
-Cache eviction counts as a close site too: if a cache (`ProgramCache`,
-`_cache dict`) drops an entry, it must call `close()` on the evicted value
-before deleting it.
-
-Process exit is not a substitute for `close()`. Tests that run multiple
-engine lifecycles in one process will expose missing links.
-
-## German String blob passthrough contract
-
-Any `RowAccessor` subclass that reads from a Rust-backed blob arena
-(OwnedBatch, ReadCursor, MappedShard) **must** override `get_blob_source()`
-to return `(blob_ptr, blob_len)`. Without this, `append_from_accessor` passes
-NULL as the blob source to `gnitz_batch_append_row`, and long strings
-(> 12 bytes) are silently zeroed — no error, no assertion, just corrupt data
-on the wire.
-
-The failure mode is insidious: short strings (≤ 12 bytes) inline their data
-and work fine. Only strings exceeding `SHORT_STRING_THRESHOLD` (12) need the
-blob arena. System table column names like `"sql_definition"` (14 bytes) or
-`"cache_directory"` (15 bytes) are the typical first casualties.
-
-When adding a new `RowAccessor` subclass backed by Rust storage:
-
-- [ ] Does `get_str_struct()` return a non-NULL `heap_ptr` (4th element)?
-      If yes, `get_blob_source()` **must** be overridden.
-- [ ] Does the override return the correct `(ptr, len)` for the backing
-      blob arena? The ptr must remain valid until `append_from_accessor`
-      returns (no reallocation between `get_blob_source()` and the FFI call).
-- [ ] Test with a table that has a STRING column containing a value > 12
-      bytes, then SCAN the table back. If the blob passthrough is missing,
-      the scan result will have empty blobs and the client decode will fail
-      with "German String blob arena out of bounds".
-
-Current implementations: `RustCursorAccessor` (cursor.py),
-`ColumnarBatchAccessor` (batch.py — uses dedicated fast-path, not
-`get_blob_source`). Known gap: `PTableFoundAccessor` and
-`EphemeralTableFoundAccessor` do not yet override `get_blob_source()`;
-these are used only in `retract_pk`, which currently only retracts by PK
-lookup — but will break if a retracted row contains a long string.
-
 ## Debugging failures
 
 When any test fails (single-worker or multi-worker) and the root cause is
@@ -385,25 +215,19 @@ not immediately obvious:
    - Log full data structures (HashMaps, Vecs, schemas), not just single values.
    - For batch/schema mismatches: log `col_data.len()` per column, `count`,
      `blob.len()`, AND the schema's column types/sizes. Compare them.
-   - For cross-boundary bugs (RPython ↔ Rust FFI): add logging on both sides.
-     - Rust: `gnitz_debug!` / `gnitz_info!` (structured, goes to worker/master log)
-     - Rust: `eprintln!` (stderr, goes to worker/master log depending on process)
-     - RPython: `log.debug()` / `log.warn()` (same log files as Rust)
-     - `GNITZ_LOG_LEVEL=debug` required for debug-level messages on both sides
+   - Rust: `gnitz_debug!` / `gnitz_info!` (structured, goes to worker/master log)
+   - Rust: `eprintln!` (stderr, goes to worker/master log depending on process)
+   - `GNITZ_LOG_LEVEL=debug` required for debug-level messages
    - For panics: use `RUST_BACKTRACE=1` to get the full call chain.
 2. **Isolate with 1 worker first.** If the test passes with `GNITZ_WORKERS=1`
    and fails with `GNITZ_WORKERS=4`, the bug is in the exchange/fanout/stash
    path, not in computation. Common exchange bugs:
    - Schema mismatch: pre-plan `out_schema` != actual batch layout
      (see "Exchange schema contract" above).
-   - Child table directory collision: all workers creating tables at the
-     same path (see "FFI handle type safety" above).
    - ext_trace_regs assigned to the wrong plan (pre vs post).
 3. **Bisect by sub-path.** Add a flag or env var to disable the new fast-path
    and force the old path. If the test passes with the old path, the bug is
    in the new path only.
-4. **Verify your fix is in the binary.** See "RPython server rebuild" below.
-   If the build output does not show `annotate` and `rtype_lltype` timer
-   lines, the RPython translation was skipped and your Python changes are
-   NOT in the binary. This is the single most common reason a "fix" appears
-   to not work.
+4. **Verify your fix is in the binary.** Run `make server` before testing.
+   Cargo tracks source changes automatically, but always confirm the binary
+   was rebuilt after your changes.

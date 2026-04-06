@@ -225,21 +225,15 @@ columns in schema order, skipping pk_index:
 2. Type dispatch: STRING (German string comparison), U128, F64/F32,
    default (signed integer via sign-extension).
 
-**F64/F32 NaN:** Both RPython and Rust treat NaN as equal to every
-value (RPython: falls through `<`/`>` returning 0; Rust:
-`partial_cmp().unwrap_or(Equal)`). This violates transitivity
+**F64/F32 NaN:** Rust treats NaN as equal to every value
+(`partial_cmp().unwrap_or(Equal)`). This violates transitivity
 (NaN == 1.0, NaN == 2.0, but 1.0 ≠ 2.0) and does not impose a total
 order. Safe only because NaN does not arise in normal DML paths. If
-NaN is ever stored, must switch to `f64::total_cmp` (Rust) / bit-level
-comparison (RPython).
-
-Must be identical across RPython (`core/comparator.py`) and Rust
-(`merge.rs`, `compact.rs`). Any divergence corrupts consolidation.
+NaN is ever stored, must switch to `f64::total_cmp`.
 
 ## 6. The Region Convention
 
-Column buffers cross the RPython–Rust FFI boundary as flat (pointer,
-size) pairs in canonical order:
+Column buffers are stored as flat (pointer, size) pairs in canonical order:
 
 ```
 region[0] = pk_lo      (count × 8 bytes, u64 LE)
@@ -250,8 +244,7 @@ region[4..4+P-1] = payload columns (non-PK, schema order)
 region[4+P] = blob     (variable-length string heap)
 ```
 
-`col_bufs[pk_index]` in RPython has stride=0 and is skipped when packing.
-The Rust side receives only payload column pointers.
+PK columns are not included in the payload region pointers.
 
 Null bitmap uses **payload column indexing**: bit N = N-th non-PK column.
 For schema column ci: `payload_idx = ci if ci < pk_index else ci - 1`.

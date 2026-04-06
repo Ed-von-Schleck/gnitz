@@ -18,7 +18,7 @@ impl ServerHandle {
     pub fn start_n(workers: usize) -> Option<Self> {
         // 1. Resolve binary
         let bin = env::var("GNITZ_SERVER_BIN").unwrap_or_else(|_| {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server-c").to_string()
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string()
         });
         if !PathBuf::from(&bin).is_file() {
             return None;

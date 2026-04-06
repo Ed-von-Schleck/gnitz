@@ -31,4 +31,3 @@ pub mod worker;
 pub mod master;
 pub mod executor;
 pub mod bootstrap;
-pub mod ffi;

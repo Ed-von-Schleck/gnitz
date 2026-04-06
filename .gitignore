@@ -128,35 +128,16 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# RPython specific files
-# Compiled C files from RPython translation
-*.c
+# Build artifacts
 *.o
 *.a
+*.so
 *.dylib
 *.dll
 
-# RPython translation artifacts
-/usession-*
-/testing_1
-
-# Generated executables
-*-c
-
-# RPython compiler intermediate files
-/rpython/_cache/
-*.pyc-*
-
-# PyPy specific
-/pypy/goal/*-c
-/pypy/goal/*.exe
-/pypy/_cache/
-
-# Translation database
-translate.db
-
-# JIT compiler output
-*.dmp
+# Server binaries (built by Makefile)
+/gnitz-server
+/gnitz-server-release
 
 # IDE specific files
 .vscode/
