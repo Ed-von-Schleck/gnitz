@@ -45,7 +45,10 @@ impl Drop for MmapGuard {
 #[derive(Clone)]
 pub(crate) enum RegionView {
     Raw { offset: usize, size: usize },
-    Constant { value: [u8; 16] },
+    /// All elements identical. `value` holds the element bytes (for fast
+    /// accessor reads via `from_le_bytes`). `offset` points into the mmap
+    /// so that `col_ptr_by_logical` can return a naturally-aligned pointer.
+    Constant { value: [u8; 16], offset: usize },
     TwoValue { value_a: i64, value_b: i64, bitvec_off: usize },
 }
 
@@ -191,7 +194,7 @@ impl MappedShard {
                         let copy_len = e.size.min(16);
                         value[..copy_len].copy_from_slice(&data[e.offset..e.offset + copy_len]);
                     }
-                    RegionView::Constant { value }
+                    RegionView::Constant { value, offset: e.offset }
                 }
                 ENCODING_TWO_VALUE => {
                     let value_a = read_i64_le(data, e.offset);
@@ -213,7 +216,7 @@ impl MappedShard {
         // has_ghosts: true if any row could have weight == 0.
         let has_ghosts = match &weight {
             RegionView::Raw { .. } => true,
-            RegionView::Constant { value } => {
+            RegionView::Constant { value, .. } => {
                 i64::from_le_bytes(value[..8].try_into().unwrap()) == 0
             }
             RegionView::TwoValue { value_a, value_b, .. } => {
@@ -276,7 +279,7 @@ impl MappedShard {
     pub fn get_pk_lo(&self, row: usize) -> u64 {
         match &self.pk_lo {
             RegionView::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
-            RegionView::Constant { value } => u64::from_le_bytes(value[..8].try_into().unwrap()),
+            RegionView::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
             RegionView::TwoValue { .. } => unreachable!(),
         }
     }
@@ -285,7 +288,7 @@ impl MappedShard {
     pub fn get_pk_hi(&self, row: usize) -> u64 {
         match &self.pk_hi {
             RegionView::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
-            RegionView::Constant { value } => u64::from_le_bytes(value[..8].try_into().unwrap()),
+            RegionView::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
             RegionView::TwoValue { .. } => unreachable!(),
         }
     }
@@ -294,7 +297,7 @@ impl MappedShard {
     pub fn get_weight(&self, row: usize) -> i64 {
         match &self.weight {
             RegionView::Raw { offset, .. } => read_i64_le(self.data(), offset + row * 8),
-            RegionView::Constant { value } => i64::from_le_bytes(value[..8].try_into().unwrap()),
+            RegionView::Constant { value, .. } => i64::from_le_bytes(value[..8].try_into().unwrap()),
             RegionView::TwoValue { value_a, value_b, bitvec_off } => {
                 let byte = self.data()[bitvec_off + row / 8];
                 if (byte >> (row % 8)) & 1 == 0 { *value_a } else { *value_b }
@@ -306,7 +309,7 @@ impl MappedShard {
     pub fn get_null_word(&self, row: usize) -> u64 {
         match &self.null_bmp {
             RegionView::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
-            RegionView::Constant { value } => u64::from_le_bytes(value[..8].try_into().unwrap()),
+            RegionView::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
             RegionView::TwoValue { .. } => unreachable!(),
         }
     }
@@ -319,7 +322,7 @@ impl MappedShard {
                 debug_assert!(start + col_size <= offset + size, "get_col_ptr out of bounds");
                 &self.data()[start..start + col_size]
             }
-            RegionView::Constant { value } => &value[..col_size],
+            RegionView::Constant { value, .. } => &value[..col_size],
             RegionView::TwoValue { .. } => unreachable!(),
         }
     }
@@ -342,8 +345,8 @@ impl MappedShard {
                     }
                     return unsafe { self.mmap_ptr.add(off) };
                 }
-                RegionView::Constant { value } => {
-                    return value.as_ptr();
+                RegionView::Constant { offset, .. } => {
+                    return unsafe { self.mmap_ptr.add(*offset) };
                 }
                 RegionView::TwoValue { .. } => unreachable!(),
             }
@@ -359,8 +362,8 @@ impl MappedShard {
                 }
                 unsafe { self.mmap_ptr.add(off) }
             }
-            RegionView::Constant { value } => {
-                value.as_ptr()
+            RegionView::Constant { offset, .. } => {
+                unsafe { self.mmap_ptr.add(*offset) }
             }
             RegionView::TwoValue { .. } => unreachable!(),
         }
@@ -811,6 +814,11 @@ mod tests {
             let data = shard.get_col_ptr(i, 0, 8);
             let v = i64::from_le_bytes(data.try_into().unwrap());
             assert_eq!(v, 42);
+            // col_ptr_by_logical for constant payload column
+            let ptr = shard.col_ptr_by_logical(i, 1, 8);
+            assert!(!ptr.is_null());
+            let v2 = unsafe { *(ptr as *const i64) };
+            assert_eq!(v2, 42);
         }
     }
 
