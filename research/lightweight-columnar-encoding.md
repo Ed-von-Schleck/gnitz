@@ -904,7 +904,7 @@ typically <10% of shard size.
 ### 11.6 Roaring Bitmaps and Null Representation
 
 Evaluated in `research/roaring-bitmap-analysis.md`. Key findings: roaring is not applicable
-to the current row-major null layout but is relevant for the future Rust-native column-major
+to the current row-major null layout but is relevant for the Rust column-major
 design as an on-disk encoding for sparse null vectors. The bigger win is column-major nulls
 themselves (21x storage savings via the ALL_VALID flag for non-nullable columns). Roaring
 optimizes for column-major sparse

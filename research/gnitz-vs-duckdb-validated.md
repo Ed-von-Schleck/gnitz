@@ -214,14 +214,8 @@ retry).
 **Prior claim:** "Each entry: [offset_u32] [size_u32] (block-relative
 offsets)"
 
-**Verified correct.** `gnitz/storage/wal_columnar.py:127–131`:
-
-```python
-u32p[0] = rffi.cast(rffi.UINT, region_offsets[ri] - block_start)  # offset
-u32p[1] = rffi.cast(rffi.UINT, region_sizes[ri])                  # size
-```
-
-8 bytes per directory entry, block-relative u32 offset followed by u32 size.
+**Verified correct.** WAL block directory entries use 8 bytes per region:
+block-relative u32 offset followed by u32 size. See `wal.rs`.
 **Correct as stated.**
 
 ---
@@ -502,7 +496,7 @@ accumulator with flush-to-FLSM when full. This is not a gap; it is by design.
 the PK, and the PK is the sort key for FLSM shards (binary search is O(log N)
 per seek). An ART would give approximately the same asymptotic complexity with
 better cache behavior on updates. However, the join trace is updated every tick
-and ART structural mutations in RPython would be complex. This is a future
+and ART structural mutations add significant complexity. This is a future
 feature, not an immediate gap.
 
 ---
@@ -517,11 +511,9 @@ no correctness gap here.
 
 #### FastLanes SIMD bitpacking
 
-**Correct — not applicable in RPython JIT.** The RPython JIT works on scalar
-integer registers; SIMD intrinsics are not exposed through the JIT's code
-generation. An FFI call to a C function that uses AVX2 bitpacking would bypass
-the JIT trace, so any benefit would only materialize on cold/compression paths.
-Low priority.
+**Now applicable.** With the Rust implementation, LLVM can auto-vectorize
+tight loops and explicit SIMD intrinsics are available. Low priority but
+no longer blocked by language limitations.
 
 ---
 
@@ -539,7 +531,7 @@ Low priority.
 | Normalized sort keys | **Not needed** | — | — | PK is always u128; sort is by numeric lo/hi |
 | ART secondary indexes | **Future** | Low | High | Only needed for non-PK joins |
 | External sort / spill | **Partial** | Low | Medium | FLSM handles durable side; in-memory merge unbounded |
-| SIMD bitpacking (FastLanes) | **N/A** | — | — | RPython JIT limitation |
+| SIMD bitpacking (FastLanes) | **Missing** | Low | Medium | LLVM auto-vectorization available |
 | MVCC | **N/A** | — | — | DBSP handles consistency differently |
 | External hash join | **N/A** | — | — | Gnitz join is incremental index-NL, not batch HJ |
 
@@ -572,19 +564,12 @@ differentiators:
    on-disk persistence is also the IPC format between master and workers. Zero
    extra serialization layer for multi-process communication.
 
-6. **RPython JIT co-design.** `@jit.unroll_safe` on operator inner loops,
-   `@jit.elidable` on hash functions, `jit.promote()` on schema constants.
-   JIT traces inline the entire expression VM (`eval_expr`) and operator row
-   loop into native code specialized for each schema shape. DuckDB relies on
-   C++ template specialization at compile time; gnitz's JIT specializes at
-   runtime per schema.
+6. **LLVM native code generation.** The Rust implementation compiles to
+   optimized native code via LLVM. Tight operator loops are auto-vectorized,
+   and monomorphized generic code is specialized per type at compile time.
 
 ---
 
-*Validated March 2026. Source files read: `gnitz/core/strings.py`,
-`gnitz/core/batch.py`, `gnitz/storage/bloom.py`, `gnitz/storage/xor8.py`,
-`gnitz/storage/memtable.py`, `gnitz/storage/wal_layout.py`,
-`gnitz/storage/wal_columnar.py`, `gnitz/storage/flsm.py`,
-`gnitz/storage/partitioned_table.py`, `gnitz/storage/cursor.py`,
-`gnitz/dbsp/ops/join.py`, `gnitz/dbsp/ops/linear.py`,
-`gnitz/dbsp/ops/reduce.py`, `gnitz/dbsp/expr.py`.*
+*Validated March 2026 against the original RPython codebase. The codebase
+has since been fully migrated to Rust (April 2026). Core architecture and
+algorithms remain the same.*

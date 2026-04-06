@@ -232,9 +232,8 @@ pk_lo_region.write(&(key as u64).to_le_bytes());         // from native u128
 pk_lo_region.write(&key_lo.to_le_bytes());               // from separate u64
 ```
 
-The RPython side currently uses separate u64 fields (due to `r_uint128` alignment issues in
-resizable lists — documented in appendix.md). The Rust compaction side already reads the bytes
-back as native u128:
+The original RPython implementation used separate u64 fields (due to `r_uint128` alignment
+issues). The Rust implementation reads and writes the bytes as native u128:
 
 ```rust
 fn get_pk(&self, row: usize) -> u128 {
@@ -687,12 +686,11 @@ else:
 ### 6.1 Dependency Chain
 
 ```
-OpenZL (C/C++) ──linked by──▸ gnitz-engine (Rust) ──FFI──▸ RPython
+OpenZL (C/C++) ──linked by──▸ gnitz-engine (Rust)
 ```
 
 This follows the existing pattern for bloom filters, XOR8 filters, WAL encoding, manifest
-serialization, and compaction — all of which are Rust functions called from RPython via
-`rffi.llexternal()`.
+serialization, and compaction — all implemented in the gnitz-engine Rust crate.
 
 ### 6.2 Layer Separation
 
@@ -719,47 +717,40 @@ decompressed size are embedded in the frame header).
 
 ### 6.3 Rust Wrapper Functions
 
-New FFI functions in `gnitz-engine`:
+New functions in `gnitz-engine`:
 
 ```rust
 // Single-frame compression (for payload columns)
-#[no_mangle]
-pub extern "C" fn gnitz_compress_region(
-    src: *const u8, src_len: usize,
-    dst: *mut u8, dst_cap: usize,
+pub fn compress_region(
+    src: &[u8],
+    dst: &mut Vec<u8>,
     element_width: u32,  // 0 = untyped bytes, 1/2/4/8 = numeric
-) -> i64  // compressed size, or negative error code
+) -> Result<usize, CompressionError>
 
 // Single-frame decompression
-#[no_mangle]
-pub extern "C" fn gnitz_decompress_region(
-    src: *const u8, src_len: usize,
-    dst: *mut u8, dst_cap: usize,
-) -> i64  // decompressed size, or negative error code
+pub fn decompress_region(
+    src: &[u8],
+    dst: &mut Vec<u8>,
+) -> Result<usize, CompressionError>
 
 // Query decompressed size (no decompression needed)
-#[no_mangle]
-pub extern "C" fn gnitz_decompressed_size(
-    src: *const u8, src_len: usize,
-) -> i64
+pub fn decompressed_size(src: &[u8]) -> Result<usize, CompressionError>
 
 // Block-compressed region: compress B-row blocks with index
-#[no_mangle]
-pub extern "C" fn gnitz_compress_region_blocked(
-    src: *const u8, src_len: usize,
-    dst: *mut u8, dst_cap: usize,
+pub fn compress_region_blocked(
+    src: &[u8],
+    dst: &mut Vec<u8>,
     element_width: u32,
     block_rows: u32,
     total_rows: u32,
-) -> i64
+) -> Result<usize, CompressionError>
 
 // Block-compressed region: decompress single block by index
-#[no_mangle]
-pub extern "C" fn gnitz_decompress_block(
-    region: *const u8, region_len: usize,
+pub fn decompress_block(
+    region: &[u8],
     block_idx: u32,
-    dst: *mut u8, dst_cap: usize,
-) -> i64
+    dst: &mut Vec<u8>,
+) -> Result<usize, CompressionError>
 ```
 
 ### 6.4 Build Integration
@@ -781,26 +772,25 @@ cc::Build::new()
 OpenZL can be vendored as a git submodule or fetched at build time. The C library compiles
 with a standard C11 compiler. C++ is only needed for the C++ wrapper API (not needed here).
 
-### 6.5 RPython FFI Bindings
+### 6.5 Rust API
 
-Following the existing pattern (e.g., `bloom.py`, `xor8.py`, `manifest.py`):
+The compression functions are internal to the gnitz-engine Rust crate:
 
-```python
-# gnitz/storage/compression.py
+```rust
+// crates/gnitz-engine/src/compression.rs
 
-_compress_region = rffi.llexternal(
-    'gnitz_compress_region',
-    [rffi.CCHARP, rffi.LONG, rffi.CCHARP, rffi.LONG, rffi.UINT],
-    rffi.LONGLONG,
-    compilation_info=eci,
-)
+/// Compress a shard region in-place. Returns compressed size.
+pub fn compress_region(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    algorithm: CompressionAlgorithm,
+) -> Result<usize, CompressionError>;
 
-_decompress_region = rffi.llexternal(
-    'gnitz_decompress_region',
-    [rffi.CCHARP, rffi.LONG, rffi.CCHARP, rffi.LONG],
-    rffi.LONGLONG,
-    compilation_info=eci,
-)
+/// Decompress a shard region. Returns decompressed size.
+pub fn decompress_region(
+    input: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<usize, CompressionError>;
 ```
 
 ---

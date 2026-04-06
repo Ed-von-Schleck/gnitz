@@ -63,7 +63,7 @@ The Huffman-Bucket preprint (March 2026, days old at time of writing) achieves t
 
 ### Implementation Shape
 
-ExaLogLog is structurally identical to HLL for RPython purposes: a `rffi.CCHARP.TO` array of M bytes (registers), hashed with XXHash (already in `gnitz/core/xxh.py`). The difference is in the register update rule and final estimator formula, not in the data structure layout. The core loop:
+ExaLogLog is structurally identical to HLL: a `Vec<u8>` of M bytes (registers), hashed with XXHash. The difference is in the register update rule and final estimator formula, not in the data structure layout. The core loop:
 
 ```
 add(key):
@@ -187,9 +187,9 @@ Three tractable approaches:
 
 ### Implementation Shape
 
-`HllAggregate` as a new `AggregateFunction` subclass in `functions.py`. The `step` method runs the HLL `add` algorithm; `get_value_bits` returns the estimate packed as a `r_uint64`. The challenge: `AggregateFunction` currently stores a scalar accumulator (`_acc: r_int64`). HLL requires an array (`registers: rffi.CCHARP.TO`). This requires either (a) embedding a pointer in the aggregate object (raw memory allocation), or (b) encoding a compact HLL representation in a fixed-width integer (feasible for HLL with ≤64 registers, unusably small for good accuracy).
+`HllAggregate` as a new `AggregateFunction` variant. The `step` method runs the HLL `add` algorithm; `get_value_bits` returns the estimate packed as a `u64`. The challenge: `AggregateFunction` currently stores a scalar accumulator (`acc: i64`). HLL requires an array of registers. This requires either (a) embedding a `Vec<u8>` in the aggregate object, or (b) encoding a compact HLL representation in a fixed-width integer (feasible for HLL with ≤64 registers, unusably small for good accuracy).
 
-The practical approach: allocate HLL register arrays via `lltype.malloc` in `HllAggregate.__init__`, following the exact pattern of `BloomFilter`. The aggregate is reset by zeroing the register array.
+The practical approach: store HLL register arrays as `Vec<u8>` in the aggregate, following the pattern of `BloomFilter`. The aggregate is reset by zeroing the register array.
 
 ---
 
@@ -222,9 +222,9 @@ Same as HLL: restrict `APPROX_PERCENTILE` to append-only sources initially. For 
 
 ### Implementation Shape
 
-KLL is a list of "compactors" at increasing levels. Each compactor is a sorted array of samples; when it overflows, it randomly keeps half the items (even or odd positions after sorting) and promotes them to the next level. The RPython implementation requires:
+KLL is a list of "compactors" at increasing levels. Each compactor is a sorted array of samples; when it overflows, it randomly keeps half the items (even or odd positions after sorting) and promotes them to the next level. The implementation requires:
 
-- A list of lists of `r_int64` or `r_float64` values (one list per level)
+- A `Vec<Vec<i64>>` or `Vec<Vec<f64>>` (one inner vec per level)
 - Merge: insert batch → add to level-0 compactor → compact up as needed
 - Query: merge all levels with their implicit weights (level i has weight 2^i), sort, scan for target rank
 
@@ -283,7 +283,7 @@ Each sketch type requires its own construction, persistence, merge logic, and qu
 
 **DaVinci Sketch (2025)** addresses this with a single data structure handling up to **9 measurement tasks** simultaneously — including heavy hitters, distinct counting, inner join size estimation, and others. In multi-task scenarios it reduces total memory usage by over **59%** compared to maintaining the same tasks with independent sketches.
 
-**LMQ-Sketch (DISC October 2025)** — "Lagom Multi-Query Sketch" — takes a complementary approach: fully lock-free concurrent inserts and queries from a single one-pass data structure. The lock-free property is not directly relevant in RPython's single-threaded model, but the "one pass, multiple query types" property is: LMQ is designed for databases where a row should update all statistics in a single scan, not in separate passes per sketch type.
+**LMQ-Sketch (DISC October 2025)** — "Lagom Multi-Query Sketch" — takes a complementary approach: fully lock-free concurrent inserts and queries from a single one-pass data structure. The lock-free property is directly useful in gnitz's single-process model where sketch updates could run on background threads, and the "one pass, multiple query types" property is valuable: LMQ is designed for databases where a row should update all statistics in a single scan, not in separate passes per sketch type.
 
 ### What This Means for Gnitz
 
@@ -291,7 +291,7 @@ Each sketch type requires its own construction, persistence, merge logic, and qu
 
 **Medium-term (consolidation):** once multiple sketch types coexist and the shard-level statistics protocol is stable, evaluate replacing the per-column ExaLogLog + KLL combination with a universal sketch that covers both cardinality and quantiles from a single sidecar file. The 59% memory reduction is meaningful when a table has many columns and many shards.
 
-**The RPython constraint is the limiter here**: universal sketches have more complex internal state than single-purpose sketches, and the RPython annotator's monomorphism requirement makes polymorphic internal data structures harder to implement. The incremental approach (build single-purpose sketches first, consolidate later) is safer.
+**The incremental approach is still safer**: universal sketches have more complex internal state than single-purpose sketches. Rust makes polymorphic internal data structures straightforward via enums and generics, but the engineering complexity of validating a universal sketch's correctness across all measurement tasks favors building single-purpose sketches first and consolidating later once each is independently tested.
 
 ### AeroSketch (SIGMOD 2026)
 
@@ -329,19 +329,19 @@ For the shard use case, XOR8 is already deployed and is the correct static filte
 
 ---
 
-## Architectural Notes for RPython Implementation
+## Architectural Notes for Rust Implementation
 
 ### Memory layout
-All sketch structures follow `xor8.py`'s pattern: `lltype.malloc(rffi.CCHARP.TO, N, flavor="raw")` for the backing array, with `free()` called explicitly. The RPython garbage collector does not manage `flavor="raw"` allocations. This is the correct approach — sketches have shard-level or tick-level lifetime that doesn't map to object lifetimes.
+Sketch backing arrays are owned `Vec<u8>` (or typed vectors as appropriate). Sketches have shard-level or tick-level lifetime — they are created during flush or tick processing and dropped when no longer needed. Rust's ownership model handles this naturally.
 
 ### Hashing
-XXHash64 is already in `gnitz/core/xxh.py` and is the correct hash for all sketch structures. For Count Sketch's requirement of `d` independent hash functions: derive by seeding XXHash with different seed values per row (the same technique as XOR8's seed-retry construction). For Theta sketches, a single unseeded hash is sufficient.
+XXHash64 (via the `xxhash-rust` crate) is the correct hash for all sketch structures. For Count Sketch's requirement of `d` independent hash functions: derive by seeding XXHash with different seed values per row (the same technique as XOR8's seed-retry construction). For Theta sketches, a single unseeded hash is sufficient.
 
 ### Sidecar file pattern
-ExaLogLog, KLL, and Theta sketches at the shard level should follow `.xor8`'s sidecar pattern: a `filename + ".exll"`, `filename + ".kll_c<col_idx>"`, and `filename + ".theta_c<col_idx>"` file written atomically alongside the shard. `ShardHandle` loads them in `__init__` with the same `try: stat() / except OSError: return None` pattern. This ensures backwards compatibility: old shards without sidecars work (sketches are absent but no error); new shards have full statistics.
+ExaLogLog, KLL, and Theta sketches at the shard level should follow `.xor8`'s sidecar pattern: a `filename + ".exll"`, `filename + ".kll_c<col_idx>"`, and `filename + ".theta_c<col_idx>"` file written atomically alongside the shard. `ShardHandle` loads them at open time with a fallback to `None` if the sidecar does not exist. This ensures backwards compatibility: old shards without sidecars work (sketches are absent but no error); new shards have full statistics.
 
-### sketch_oxide (Rust client side only)
-`sketch_oxide` is a 2025 pure-Rust library containing 41 production-ready sketch implementations including UltraLogLog, Binary Fuse Filters, REQ, and others. It is **not applicable to the RPython server**, but the `gnitz-py` and `gnitz-capi` Rust crates could use it for client-side analytics if the Rust client ever needs local cardinality estimates or sampling. The RPython server must implement its own sketches in pure RPython as described throughout this document.
+### sketch_oxide
+`sketch_oxide` is a 2025 pure-Rust library containing 41 production-ready sketch implementations including UltraLogLog, Binary Fuse Filters, REQ, and others. It is a candidate dependency for the server — evaluate whether its implementations are suitable before building custom ones. The `gnitz-py` and `gnitz-capi` Rust crates could also use it for client-side analytics.
 
 ### Column indexing
 The shard's directory already maps `col_to_reg_map` (column index → register offset in the columnar layout). Sketch construction can iterate column buffers using the same mapping.
@@ -362,7 +362,7 @@ The sketches proposed here are not independent features — they are the data la
 - **KLL quantile histograms** → enables equi-depth histogram statistics → enables better selectivity estimates beyond uniform distribution assumption
 - **DaVinci / LMQ universal sketches** → once multiple sketch types coexist, consolidate into a single structure for 59% memory reduction and single-pass update semantics; deferred until individual sketches are stable
 
-None of these require ML infrastructure. All are implementable in pure RPython following the patterns already established by `bloom.py` and `xor8.py`. They form the "classical statistics foundation" (Phase A) that `optimizations.md` identifies as the prerequisite for everything adaptive and learned.
+None of these require ML infrastructure. All are implementable in Rust, either from scratch or using established crates. They form the "classical statistics foundation" (Phase A) that `optimizations.md` identifies as the prerequisite for everything adaptive and learned.
 
 ---
 
@@ -380,7 +380,7 @@ The 2025–2026 database industry has four major sketch-adjacent movements. Each
 
 For gnitz this means: Opportunity 7 (Theta Sketch per join-key column) is not just a "future nice-to-have for delta joins." It is specifically the data structure that OmniSketch uses to break the independence assumption — the most impactful cardinality estimation improvement identified in the 2025 VLDB retrospective. If join ordering and multi-way joins are on gnitz's roadmap, the Theta sketch is the right first investment, not the ExaLogLog (which only estimates column cardinality independently).
 
-**What gnitz can implement today.** Gnitz currently has single equijoins only. OmniSketch's full multi-join algorithm (chaining intersections across N tables) is Tier 3 work. But the prerequisite — one Theta sketch per join-key column per shard — can be built alongside ExaLogLog sidecars now. The sketch intersection math is pure arithmetic over sorted arrays, implementable in RPython without any change to the query execution path.
+**What gnitz can implement today.** Gnitz currently has single equijoins only. OmniSketch's full multi-join algorithm (chaining intersections across N tables) is Tier 3 work. But the prerequisite — one Theta sketch per join-key column per shard — can be built alongside ExaLogLog sidecars now. The sketch intersection math is pure arithmetic over sorted arrays, implementable in Rust without any change to the query execution path.
 
 **The independence assumption problem in gnitz's current design.** `optimizations.md` item #15 (join ordering) proposes using `n_distinct` from shard metadata to choose the smaller table's trace. This uses per-table `n_distinct` independently — it is the independence assumption in thin disguise. If gnitz adds multi-way joins before adding OmniSketch, the join ordering will be wrong for correlated data. OmniSketch + Theta sketches is the correct solution to this specific problem.
 
@@ -392,7 +392,7 @@ For gnitz this means: Opportunity 7 (Theta Sketch per join-key column) is not ju
 
 The research uses learning-based methods (lightweight models trained on the sketch + predicate pair) to extrapolate filtered cardinalities from global sketches.
 
-**Why it doesn't apply to gnitz now.** The core constraint from `optimizations.md` §VI: ML models that run in the query compilation or execution path must be embeddable in RPython-translated C. No ML inference framework is available in RPython. This research is learning-based and cannot be ported directly.
+**Why it doesn't apply to gnitz now.** Gnitz does not yet have the statistics foundation (Phase A) or runtime feedback (Phase B) that would make filtered cardinality estimation actionable. Additionally, the learning-based approach requires training infrastructure that gnitz does not have.
 
 **The classical fallback.** For gnitz's most common filter patterns (equality predicates on low-cardinality columns like `status`, `region`, `type`), the classical solution is **stratified sketches**: when flushing a shard, build a separate ExaLogLog per distinct value of commonly-filtered columns. A shard with 5 distinct `status` values gets 5 ExaLogLog sketches per payload column. This is O(V × C × M) bytes per shard (V = distinct filter values, C = payload columns, M = registers), tractable for low-cardinality filter columns, prohibitive for high-cardinality ones.
 
@@ -428,7 +428,7 @@ Differential privacy itself is not a current gnitz requirement: there is no mult
 
 **Not applicable to gnitz.** NitroSketch (eBPF in the Linux kernel), FASTeller, and Elastic Sketch on SmartNICs/FPGAs are designed for **network packet-level stream processing**: counting flows, detecting heavy hitters in IP traffic, monitoring at line-rate before data hits the server. The use case is fundamentally different from gnitz's.
 
-Gnitz's ingestion path: `INSERT` SQL → Rust client → Unix domain socket IPC → server RPython process → WAL → MemTable. The bottleneck is not network packet processing at line rate; it is SQL execution, WAL I/O, and MemTable management. Pushing a Count Sketch into eBPF would require the sketch keys to be packet-level fields (source IP, destination port), not SQL column values. There is no architectural path to benefit.
+Gnitz's ingestion path: `INSERT` SQL → Rust client → Unix domain socket IPC → server process → WAL → MemTable. The bottleneck is not network packet processing at line rate; it is SQL execution, WAL I/O, and MemTable management. Pushing a Count Sketch into eBPF would require the sketch keys to be packet-level fields (source IP, destination port), not SQL column values. There is no architectural path to benefit.
 
 The only tangentially relevant observation: gnitz's multi-worker IPC uses Unix domain sockets. If gnitz ever processes very high-rate sensor/telemetry data and the IPC layer becomes the bottleneck, kernel-bypass techniques (io_uring, not eBPF) would be the right tool — and that has nothing to do with sketches.
 
@@ -770,7 +770,7 @@ peel() -> list of (pk_lo, pk_hi, count):
     return results
 ```
 
-This is pure RPython with `lltype.malloc(rffi.CCHARP.TO, num_cells * 28, flavor="raw")`. No external dependencies. Implementation complexity is comparable to `xor8.py` — simpler construction, more complex peel.
+This is a straightforward `Vec<u8>` allocation of `num_cells * 28` bytes. No external dependencies. Implementation complexity is comparable to the XOR8 filter — simpler construction, more complex peel.
 
 For gnitz's U128 PKs the XOR-of-keys is a natural 128-bit operation (using the existing `lo/hi` split). The hash for verification reuses `xxh.hash_u128_inline`.
 

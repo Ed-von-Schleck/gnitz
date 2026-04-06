@@ -77,7 +77,7 @@ For a 100K-row shard:
 
 ## 3. Exhaustive Null Access Inventory
 
-Every location in the codebase (RPython + Rust) that reads, writes, or transforms null data,
+Every location in the codebase that reads, writes, or transforms null data,
 classified by access pattern.
 
 ### 3.1 BULK_MEMCPY (13 sites)
@@ -609,52 +609,14 @@ enum variant and a few lines of serialize/deserialize code), but default to `ALL
 `FLAT_BITVEC`. Use roaring when the flush-time null density check indicates it would save
 space. The cost of supporting it is near-zero; the benefit is occasional.
 
-### 10.2 Row-Major Null Word for Backward Compatibility
-
-During the Rust migration, there will be a transition period where RPython operators coexist
-with Rust storage. The RPython expression VM expects row-major null words. Options:
-
-1. **Reconstruct row-major null words at the RPython/Rust boundary**: The Rust shard reader
-   provides column-major null bitmaps. A thin FFI layer reconstructs the row-major null word
-   when RPython calls `get_null_word(row_idx)`. This is O(K) bit extractions from K column
-   bitmaps per call — acceptable for the transition period.
-
-2. **Keep row-major null_buf in the shard format until the RPython VM is replaced**: Defer
-   the format change. This is simpler but means the storage savings are also deferred.
-
-3. **Dual representation**: Store column-major on disk, reconstruct row-major into a
-   per-batch cache on first access. Lazy conversion, similar to the lazy checksum validation
-   pattern.
-
-### 10.3 Vectorized Expression VM
-
-The biggest payoff of column-major nulls is enabling vectorized expression evaluation in the
-Rust VM. Instead of per-row `null[dst] = null[a1] or null[a2]`, the vectorized VM would:
-
-```rust
-fn eval_add(a: &ColumnArray, b: &ColumnArray, out: &mut ColumnArray) {
-    // Data: SIMD add
-    for i in 0..a.len {
-        out.data[i] = a.data[i] + b.data[i];
-    }
-    // Nulls: bitwise AND of validity bitmaps
-    if let (Some(va), Some(vb)) = (&a.validity, &b.validity) {
-        out.validity = Some(va.bitand(vb));  // one SIMD op per 64 rows
-    }
-}
-```
-
-This is a separate design question (vectorized vs row-at-a-time VM) that should be
-investigated independently. But column-major nulls are a prerequisite.
-
-### 10.4 Weight Column Compression vs Validity Bitmap
+### 10.2 Weight Column Compression vs Validity Bitmap
 
 The weight column (i64 per row, mostly +1/-1) compresses extremely well with Pcodec (32-64x)
 or FastLanes (32x with zigzag + 2-bit bitpack). A separate validity bitmap for "non-ghost
 rows" would be redundant — the compressed weight column already encodes this information
 more compactly than an additional bitmap would.
 
-### 10.5 Prior Roaring Investigation
+### 10.3 Prior Roaring Investigation
 
 This document found no evidence of a prior roaring bitmap investigation in the gnitz codebase.
 The claim in an earlier draft of `lightweight-columnar-encoding.md` that roaring was

@@ -10,7 +10,7 @@ When adding a new server-side constraint, validation rule, or invariant:
       FK and partition-global constraints belong at the request layer.
 - [ ] Does it need to fire on every worker even for empty batches
       (e.g. exchange barrier participation)?
-- [ ] Any change touching `worker.rs`, `master.rs`, `ipc.rs`, or `executor.py`:
+- [ ] Any change touching `worker.rs`, `master.rs`, `ipc.rs`, or `executor.rs`:
       run `make e2e`.
 - [ ] Is there a multi-worker E2E test in `crates/gnitz-py/tests/test_workers.py`
       covering it?
@@ -116,12 +116,11 @@ When adding or modifying a merge path (tournament tree, sort, compaction):
       After L0_COMPACT_THRESHOLD (4) ticks, compaction merges these
       shards — the exact path where the heap ordering matters.
 - [ ] Are memtable runs actually sorted? `merge_batches` assumes each
-      run is sorted by (PK, payload). If a run is unsorted (e.g., due
-      to a stale `sorted` flag on the Python/Rust boundary), entries
+      run is sorted by (PK, payload). If a run is unsorted, entries
       appear out of order and the pending-group algorithm silently
-      produces wrong weights. The Rust `upsert_and_maybe_flush`
-      defensively re-sorts as a safety net, but the caller should also
-      ensure the batch is sorted before ingestion.
+      produces wrong weights. `upsert_and_maybe_flush` defensively
+      re-sorts as a safety net, but the caller should also ensure the
+      batch is sorted before ingestion.
 
 ## Exchange schema contract
 
@@ -195,7 +194,7 @@ python scripts/bench_history.py --trend                  # throughput over time
 
 ### Typical workflow
 
-1. Rebuild binaries: `make release-server && make release-server-nojit`
+1. Rebuild binary: `make release-server`
 2. Run baselines (throughput + realistic) on the current commit
 3. Make changes, commit
 4. Rebuild and re-run

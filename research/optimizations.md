@@ -165,7 +165,7 @@ The research in Parts IV–VI focuses on the circuit path. The DML path's access
 |---|---|---|
 | SQL frontend | Apache Calcite (Java) | Custom Rust parser + binder (sqlparser crate) |
 | Optimizer | 18-phase Calcite HepPlanner + 75+ circuit passes | None — direct SQL → circuit |
-| DBSP execution | Compiled Rust (LLVM JIT via cargo) | RPython bytecode VM with PyPy JIT |
+| DBSP execution | Compiled Rust (LLVM JIT via cargo) | Compiled Rust (native binary) |
 | Expression eval | Rust closures (compiled at circuit-gen time) | 31-opcode expression VM, JIT-unrolled |
 | Operator granularity | Operator-per-row with Rust generics | SoA columnar batches (ArenaZSetBatch) |
 | Storage | Embedded RocksDB-style | Custom ZSetStore (SoA columnar, sorted+consolidated) |
@@ -180,7 +180,7 @@ The research in Parts IV–VI focuses on the circuit path. The DML path's access
 
 2. **Column-oriented batches**: Gnitz's SoA `ArenaZSetBatch` is architecturally different from Feldera's row-at-a-time Rust generics. Gnitz can do bulk memcpy per column — a hardware advantage Feldera lacks — but optimization passes need to be aware of the batch layout.
 
-3. **RPython JIT semantics**: Gnitz's JIT specializes on `(pc, program)` as green variables, meaning the JIT can inline entire operator bodies across the VM loop. This is a very different JIT strategy from Feldera's LLVM. Gnitz's JIT is implicitly operator-fusing when the JIT traces through the main loop.
+3. **Expression VM**: Gnitz uses a bytecode expression VM with 31 opcodes. The VM processes SoA columnar batches. This is architecturally different from Feldera's compiled Rust closures — Feldera generates per-expression Rust code at circuit-gen time, while gnitz interprets a compact bytecode program at runtime.
 
 4. **Multi-worker architecture**: Feldera uses N threads within a single process (sharing memory); it also supports multi-host via RPC. Gnitz uses N separate OS processes communicating via IPC. Both have explicit hash-based shard/exchange operators with three partitioning policies in Feldera's case (Shard, Broadcast, Balance). Neither system currently implements two-phase (local-global) aggregation or Split DISTINCT — both shard first, then aggregate at the worker that owns the key. However, the optimization pressure differs: Feldera's intra-process shuffle is cheap (shared memory), while gnitz's inter-process IPC shuffle is expensive, so pre-aggregation before the shuffle is significantly more valuable for gnitz.
 
@@ -294,7 +294,7 @@ The research in Parts IV–VI focuses on the circuit path. The DML path's access
 
 **21. Learned plan selection** *(Bao-style hint bandit — see Part V Phase C)*
 - **Where**: `compile_from_graph` strategy knobs, once multiple plan alternatives exist
-- **What**: Thompson-sampling bandit over a small set of optimization hint sets (e.g., {default}, {push-filter-before-join}, {two-phase-agg-enabled}, {trace-sharing-enabled}). Each hint set is a bundle of compile_from_graph flags. Reward = observed tick processing time for the view. Bounded worst case = classical plan. Zero cold start (explores all variants). Implementable in pure RPython. Requires the statistics layer (Phase A) and adaptive feedback (Phase B) first. See Part V for the full three-phase proposal.
+- **What**: Thompson-sampling bandit over a small set of optimization hint sets (e.g., {default}, {push-filter-before-join}, {two-phase-agg-enabled}, {trace-sharing-enabled}). Each hint set is a bundle of compile_from_graph flags. Reward = observed tick processing time for the view. Bounded worst case = classical plan. Zero cold start (explores all variants). Implementable in Rust. Requires the statistics layer (Phase A) and adaptive feedback (Phase B) first. See Part V for the full three-phase proposal.
 
 **22. Delta joins** *(Materialize pattern — see Part VI §3.5)*
 - **Where**: `compile_from_graph` / circuit planner, requires arrangement sharing first
@@ -543,7 +543,7 @@ Before any optimization — learned or classical — that requires cardinality k
 
 **What this enables:** Filter selectivity estimates, join-side selection based on table sizes, and initial heuristic join ordering — all at circuit-compile time. Static statistics are more useful for gnitz than for Feldera because gnitz knows the full base table state, not just the incoming stream.
 
-**Implementation stage:** RPython executor + system tables. No ML infrastructure required. This is entirely classical.
+**Implementation stage:** Rust executor + system tables. No ML infrastructure required. This is entirely classical.
 
 #### Phase B: Adaptive Runtime Feedback (SQL Server IQP Pattern)
 
@@ -602,7 +602,7 @@ This would require research/implementation beyond existing libraries — it is a
 | Classical Technique | Learned/Adaptive Alternative | Verdict |
 |---|---|---|
 | **XOR8 membership filter** (already in gnitz) | Learned Bloom filter | **Keep XOR8.** Learned filters are 10,000x slower in throughput. Gnitz already made the right call. |
-| **Binary search in sorted shard columns** | PGM-Index positional lookup | **Worth evaluating.** PGM-Index supports dynamic sorted data, 1140x space savings, O(log ε) lookup. Effectiveness depends on PK type: for auto-increment U64 PKs, the key sequence is perfectly monotone and learned positions are near-exact. For UUIDv7 U128 PKs, the 48-bit timestamp prefix provides a monotone backbone with random perturbation from the suffix — still highly amenable to piecewise-linear approximation, since the dominant variation is monotone. For arbitrary random U64 or U128 PKs, no structure to exploit. Mature C++ library exists. The primary constraint is RPython FFI compatibility. |
+| **Binary search in sorted shard columns** | PGM-Index positional lookup | **Worth evaluating.** PGM-Index supports dynamic sorted data, 1140x space savings, O(log ε) lookup. Effectiveness depends on PK type: for auto-increment U64 PKs, the key sequence is perfectly monotone and learned positions are near-exact. For UUIDv7 U128 PKs, the 48-bit timestamp prefix provides a monotone backbone with random perturbation from the suffix — still highly amenable to piecewise-linear approximation, since the dominant variation is monotone. For arbitrary random U64 or U128 PKs, no structure to exploit. Mature C++ library exists. Mature C++ library exists; Rust bindings or a pure-Rust port would be needed. |
 | **Fixed MemTable flush threshold** (`should_flush` at 75% of `max_bytes`) | Count-Min Sketch write-frequency heat map per partition | **Straightforward improvement.** Track write events per partition with a Count-Min Sketch (unsigned frequency; Count-Min is correct here because churn magnitude is wanted, not signed net weight). Hot partitions flush earlier to reclaim capacity; cold partitions defer to allow Z-Set algebraic cancellation in memory before hitting disk. Periodic counter halving provides exponential decay. See `research/sketches.md` §Count-Min Sketch-Driven Flush. |
 | **Fixed compaction threshold** (`compaction_threshold=4`) | Adaptive threshold driven by read amplification + S3-FIFO for shard handle pool | **Straightforward improvement.** Track read amplification (shards scanned per lookup) as a rolling statistic; trigger compaction when amplification exceeds a target. Separately, manage the `ShardHandle` pool with **S3-FIFO** ghost queues: close cold handles, keep recently-re-accessed handles in the main queue. See `research/sketches.md` §S3-FIFO. |
 | **Histogram-based selectivity** (does not exist yet) | Neural cardinality estimation | **Build histograms first.** Even the best learned CE model is only worth it after classical extended statistics are exhausted. The independence-assumption gap (which learned models close) is only the residual error after proper multi-column stats. |
@@ -622,7 +622,7 @@ The honest argument against adopting neural learned optimization components in g
 
 3. **The 2024 VLDB verdict.** Under rigorous train/test splits, PostgreSQL outperforms all tested learned optimizers. The problem is overfitting to training query templates. Gnitz's workload will be even smaller and potentially more varied.
 
-4. **RPython ML inference constraint.** ML models that run in the query compilation or execution path must be embeddable in RPython-translated C code. PyTorch/XGBoost are not available in the RPython environment. Bao-style bandit (simple probability vectors + Thompson sampling) is implementable in pure RPython. Neural forward passes are not.
+4. **ML inference constraint.** ML models that run in the query compilation or execution path must be embeddable in the Rust server binary. Bao-style bandit (simple probability vectors + Thompson sampling) is straightforward in Rust. For neural forward passes, lightweight inference libraries (e.g., `candle`, ONNX Runtime via C FFI) are options, but add significant dependency weight.
 
 5. **The adaptive feedback loops are easier and proven.** SQL Server IQP's adaptive joins, Oracle's adaptive plans, and Redshift's Stage all demonstrate that feedback-based runtime adaptation — without any neural network — closes a large fraction of the cardinality estimation gap. These are lower-risk, lower-complexity, and require no training data.
 
@@ -657,8 +657,8 @@ CircuitGraph (system tables)
 Instruction list (VM program)
     │
     ▼
-[RPython JIT VM]
-    │  Already: expression JIT, SoA bulk copy, RPython tracing JIT
+[Rust Expression VM]
+    │  Already: expression VM, SoA bulk copy, compiled native code
     │  Future:  streaming cost model awareness
     ▼
 ZSetStore / PartitionedTable

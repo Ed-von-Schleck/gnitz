@@ -151,8 +151,8 @@ elif delta < 0 and d + delta >= 0:
 # delta == 0 or outside history window: no-op
 ```
 
-`clz64(x)`: no RPython builtin; implement with a 6-step binary search (~12 lines).
-The `h | mask` trick ensures the argument is never zero (clz(0) is undefined in C).
+`clz64(x)`: use `x.leading_zeros()` in Rust.
+The `h | mask` trick ensures the argument is never zero.
 
 ### Merge (per-register)
 
@@ -222,38 +222,37 @@ Newton iteration over the equation derived in the paper (Algorithm 8). Converges
 Registers are 28 bits each, not byte-aligned. Two consecutive registers straddle 7
 bytes. Access helpers:
 
-```python
-def packed_get(buf, idx):
-    bit_off = idx * 28
-    byte_off = bit_off >> 3
-    bit_shift = bit_off & 7
-    # Read 5 bytes (40 bits covers a 28-bit window at any alignment)
-    raw = r_uint64(0)
-    i = 0
-    while i < 5:
-        raw |= r_uint64(ord(buf[byte_off + i])) << (i * 8)
-        i += 1
-    return intmask((raw >> bit_shift) & r_uint64(0xFFFFFFF))  # 28-bit mask
+```rust
+fn packed_get(buf: &[u8], idx: usize) -> u32 {
+    let bit_off = idx * 28;
+    let byte_off = bit_off / 8;
+    let bit_shift = bit_off & 7;
+    // Read 5 bytes (40 bits covers a 28-bit window at any alignment)
+    let mut raw: u64 = 0;
+    for i in 0..5 {
+        raw |= (buf[byte_off + i] as u64) << (i * 8);
+    }
+    ((raw >> bit_shift) & 0xFFF_FFFF) as u32
+}
 
-def packed_set(buf, idx, val):
-    bit_off = idx * 28
-    byte_off = bit_off >> 3
-    bit_shift = bit_off & 7
-    mask = r_uint64(0xFFFFFFF) << bit_shift
-    raw = r_uint64(0)
-    i = 0
-    while i < 5:
-        raw |= r_uint64(ord(buf[byte_off + i])) << (i * 8)
-        i += 1
-    raw = (raw & ~mask) | ((r_uint64(val) & r_uint64(0xFFFFFFF)) << bit_shift)
-    i = 0
-    while i < 5:
-        buf[byte_off + i] = chr(intmask((raw >> (i * 8)) & r_uint64(0xFF)))
-        i += 1
+fn packed_set(buf: &mut [u8], idx: usize, val: u32) {
+    let bit_off = idx * 28;
+    let byte_off = bit_off / 8;
+    let bit_shift = bit_off & 7;
+    let mask: u64 = 0xFFF_FFFF << bit_shift;
+    let mut raw: u64 = 0;
+    for i in 0..5 {
+        raw |= (buf[byte_off + i] as u64) << (i * 8);
+    }
+    raw = (raw & !mask) | (((val as u64) & 0xFFF_FFFF) << bit_shift);
+    for i in 0..5 {
+        buf[byte_off + i] = ((raw >> (i * 8)) & 0xFF) as u8;
+    }
+}
 ```
 
-State size in bytes: `STATE_BYTES = (m * 28 + 7) // 8 = 14336` for `p=12`. Allocate
-with `lltype.malloc(rffi.CCHARP.TO, STATE_BYTES, flavor="raw")`.
+State size in bytes: `STATE_BYTES = (m * 28 + 7) / 8 = 14336` for `p=12`.
+Backed by `Vec<u8>` with `vec![0u8; STATE_BYTES]`.
 
 ---
 
@@ -279,15 +278,17 @@ process of being deleted.
 
 **Fix:** in the build loop, read the weight buffer and skip rows with `weight <= 0`.
 
-```python
-weight_p = rffi.cast(rffi.LONGLONGP, weight_ptr)
-for i in range(count):
-    if rffi.cast(lltype.Signed, weight_p[i]) > 0:
-        h = compute_checksum(rffi.ptradd(col_ptr, i * stride), stride)
-        exll_add(registers, h)
+```rust
+for i in 0..count {
+    let w = read_i64_le(weight_data, i * 8);
+    if w > 0 {
+        let h = xxh3_hash(&col_data[i * stride..(i + 1) * stride]);
+        exll_add(&mut registers, h);
+    }
+}
 ```
 
-`weight_ptr` is `region_list[2][0]` (weight is always region index 2).
+`weight_data` is region 2 (weight is always region index 2).
 
 ### Resulting semantics
 
@@ -312,169 +313,60 @@ under-estimating selectivity, which is the conservative choice.
 
 ## File Changes
 
-### 1. `gnitz/storage/exll.py` (new, ~350 lines)
+### 1. `crates/gnitz-engine/src/exll.rs` (new, ~350 lines)
 
-```
-STATE_BYTES    = 14336   # (4096 × 28 + 7) // 8
-REGISTERS      = 4096    # m = 2^p, p = 12
-T              = 2
-D              = 20
-P              = 12
-BIAS_CORRECTION = 0.48147289716   # for (t=2, d=20)
-POW2_NEG64     = 5.421010862427522e-20   # 2^-64
+New module implementing the ExaLogLog sketch.
 
-_clz64(x: r_uint64) → int
-    # 6-step binary search for leading zeros; returns 64 if x == 0.
-    # Do NOT call with x == 0; use (h | mask) pattern at call sites.
+```rust
+const STATE_BYTES: usize = 14336;  // (4096 × 28 + 7) / 8
+const M: usize = 4096;             // 2^P registers
+const T: u32 = 2;
+const D: u32 = 20;
+const P: u32 = 12;
+const BIAS_CORRECTION: f64 = 0.48147289716;
 
-packed_get(buf, idx) → int          # read 28-bit register at index idx
-packed_set(buf, idx, val)           # write 28-bit register at index idx
+pub struct ExllSketch {
+    registers: Vec<u8>,  // STATE_BYTES packed 28-bit registers
+}
 
-shift_right(s, delta) → int         # s >> delta; 0 if delta >= 64
+impl ExllSketch {
+    pub fn new() -> Self { ... }
+    pub fn add(&mut self, h: u64) { ... }
+    pub fn merge(&mut self, other: &ExllSketch) { ... }
+    pub fn estimate(&self) -> f64 { ... }
+}
 
-exll_add(registers, h)              # update registers with 64-bit hash h
-exll_merge_into(dst_registers, src_registers)  # merge src into dst in-place
-contribute(r, b_counts) → r_uint64  # per-register ML coefficient extraction
-solve_mle(a, b_counts, J) → float   # Newton iteration
-exll_estimate(registers) → float    # full estimator
+// Packed 28-bit array access
+fn packed_get(buf: &[u8], idx: usize) -> u32 { ... }
+fn packed_set(buf: &mut [u8], idx: usize, val: u32) { ... }
 
-class ExllSketch(object):
-    _immutable_fields_ = ["m"]
-    # m == 0  →  null/absent sentinel (returned by load_exll on miss)
-    # m > 0   →  live sketch backed by raw registers array
+// MLE estimator internals
+fn contribute(r: u32, b_counts: &mut [u32; 64]) -> u64 { ... }
+fn solve_mle(a: f64, b_counts: &[u32; 64], j: u32) -> f64 { ... }
 
-    def __init__(self, registers, m):
-        self.registers = registers
-        self.m = m
+// Build from column data, skipping weight <= 0 rows
+pub fn build_exll(col_data: &[u8], stride: usize, count: usize,
+                  weight_data: &[u8]) -> Option<ExllSketch> { ... }
 
-    def is_present(self): return self.m > 0
-    def n_distinct(self): return exll_estimate(self.registers) if self.m > 0 else -1.0
-    def free(self): ...   # lltype.free if m > 0 and registers not null
-
-NULL_EXLL_SKETCH = ExllSketch(lltype.nullptr(rffi.CCHARP.TO), 0)
-
-def build_exll(col_ptr, stride, count, weight_ptr) → ExllSketch or None
-    # Allocates STATE_BYTES, calls exll_add for each row with weight > 0.
-    # Returns None if count == 0 or all rows have weight <= 0.
-
-def save_exll(sketch, filepath)
-    # Header (8 bytes): u32 m + u32 p (for forward-compat version check)
-    # Data: STATE_BYTES of packed register array
-    # fsync after write. Atomic: write to filepath+".tmp", rename.
-
-def load_exll(filepath) → ExllSketch
-    # Returns NULL_EXLL_SKETCH on missing file or corrupt header.
-    # Allocates STATE_BYTES, reads register array, returns ExllSketch(registers, m).
+// File I/O: 8-byte header (u32 m + u32 p) + STATE_BYTES
+pub fn save_exll(sketch: &ExllSketch, path: &str) -> std::io::Result<()> { ... }
+pub fn load_exll(path: &str) -> Option<ExllSketch> { ... }
 ```
 
-RPython memory notes:
-- Registers: `lltype.malloc(rffi.CCHARP.TO, STATE_BYTES, flavor="raw")`
-- Zero-init with a `while` loop (no `memset` helper needed; or use `buffer.c_memmove`
-  from `gnitz/core/buffer.py` with a zero-source if available)
-- Hashing: `xxh.compute_checksum(rffi.cast(rffi.VOIDP, col_ptr), stride)` — already
-  used by `writer_table.py` for blob dedup checksums
-- All float arithmetic (`solve_mle`, `exll_estimate`) uses standard RPython floats
-- `u64_to_float(x)`: `float(intmask(x))` does not work for values > `sys.maxint`. Use
-  the two-halves trick: `float(intmask(x >> 32)) * 4294967296.0 + float(intmask(x & 0xFFFFFFFF))`
-  if the full 64-bit range is needed for `agg`. In practice `agg` accumulates at most
-  `m = 4096` contributions each ≤ `2^64 / m`, so overflow is impossible; direct
-  `float(intmask(agg))` suffices after verifying the range.
-- `NULL_EXLL_SKETCH` is a module-level prebuilt constant; the RPython annotator treats
-  it as a `prebuilt ExllSketch`. Its `registers` field is `lltype.nullptr(...)` which
-  is valid as long as no code path dereferences it when `m == 0`.
+Hashing: use `xxhash_rust::xxh3::xxh3_64(&col_data[..stride])`.
 
-### 2. `gnitz/storage/writer_table.py` (3 locations, ~20 lines total)
+### 2. `crates/gnitz-engine/src/shard_file.rs` — build/save in flush path
 
-**a) `_write_shard_file` signature** — add `schema` parameter:
+After `build_xor8` / `save_xor8`, iterate non-PK non-STRING columns and
+call `build_exll` + `save_exll` for each. The schema and weight region
+are already available in the flush context.
 
-```python
-def _write_shard_file(filename, table_id, count, region_list,
-                      pk_lo_ptr, pk_hi_ptr, schema):
-```
+### 3. `crates/gnitz-engine/src/shard_reader.rs` — load + n_distinct
 
-**b) `_write_shard_file` body** — after the existing `build_xor8` / `save_xor8`
-block (after `os.rename`), add:
-
-```python
-from gnitz.storage.exll import build_exll, save_exll
-weight_ptr = region_list[2][0]   # region 2 is always the weight buffer
-pk_idx = schema.pk_index
-ci = 0
-num_cols = len(schema.columns)
-while ci < num_cols:
-    col = schema.columns[ci]
-    if ci != pk_idx and col.field_type.code != types.TYPE_STRING.code:
-        non_pk_off = ci if ci < pk_idx else ci - 1
-        region_idx = 4 + non_pk_off
-        col_ptr, col_size = region_list[region_idx]
-        stride = col.field_type.size
-        sketch = build_exll(col_ptr, stride, count, weight_ptr)
-        if sketch is not None:
-            save_exll(sketch, filename + ".exll_c%d" % ci)
-            sketch.free()
-    ci += 1
-```
-
-**c) Two callers** — both already have `schema` in scope, pass it through:
-
-```python
-# write_batch_to_shard:
-_write_shard_file(filename, table_id, count, regions,
-                  batch.pk_lo_buf.base_ptr, batch.pk_hi_buf.base_ptr,
-                  schema)          # add schema here
-
-# TableShardWriter.finalize:
-_write_shard_file(filename, self.table_id, self.count, regions,
-                  self.pk_lo_buf.base_ptr, self.pk_hi_buf.base_ptr,
-                  self.schema)     # add self.schema here
-```
-
-### 3. `gnitz/storage/index.py` (ShardHandle, ~25 lines)
-
-**a) `__init__`** — after loading `xor8_filter`, load per-column sketches:
-
-```python
-from gnitz.storage.exll import load_exll, NULL_EXLL_SKETCH
-from gnitz.core import types as _types
-num_cols = len(schema.columns)
-exll_sketches = newlist_hint(num_cols)
-ci = 0
-while ci < num_cols:
-    col = schema.columns[ci]
-    if ci != schema.pk_index and col.field_type.code != _types.TYPE_STRING.code:
-        exll_sketches.append(load_exll(filename + ".exll_c%d" % ci))
-    else:
-        exll_sketches.append(NULL_EXLL_SKETCH)
-    ci += 1
-self.exll_sketches = exll_sketches
-```
-
-The list is always `num_cols` entries of type `ExllSketch` (never `None` — null object
-pattern avoids the RPython annotator's None-in-list restriction from Appendix A §3).
-
-**b) `n_distinct` method** (new public method):
-
-```python
-def n_distinct(self, col_idx):
-    """Returns the ExaLogLog n_distinct estimate for col_idx, or -1.0 if
-    no sketch was built for that column (PK, string, or pre-statistics shard)."""
-    if col_idx < 0 or col_idx >= len(self.exll_sketches):
-        return -1.0
-    return self.exll_sketches[col_idx].n_distinct()
-```
-
-**c) `close`** — free exll sketches alongside xor8:
-
-```python
-def close(self):
-    self.view.close()
-    if self.xor8_filter is not None:
-        self.xor8_filter.free()
-    i = 0
-    while i < len(self.exll_sketches):
-        self.exll_sketches[i].free()
-        i += 1
-```
+On `MappedShard::open()`, load per-column `.exll_cN` sidecar files.
+Store `Vec<Option<ExllSketch>>` indexed by column.
+Add `pub fn n_distinct(&self, col_idx: usize) -> f64` returning
+the estimate or `-1.0` for absent sketches.
 
 ---
 
@@ -495,31 +387,23 @@ pointer, and can be hashed directly as 16 bytes.
 
 ## Implementation Order
 
-Each item is one commit. Run the relevant test target after each.
+Each item is one commit. Run `cargo test -p gnitz-engine` after each.
 
 ```
-[1] exll.py — packed array helpers + add + merge
-      test target: storage_comprehensive_test (test_exll_add_merge)
-
-[2] exll.py — contribute + solve_mle + estimate
-      test target: storage_comprehensive_test (test_exll_estimate_accuracy)
-
-[3] exll.py — build_exll + save_exll + load_exll + NULL_EXLL_SKETCH
-      test target: storage_comprehensive_test (test_exll_save_load)
-
-[4] writer_table.py — schema param + build/save loop
-    index.py — load loop + n_distinct + close
-      test target: storage_comprehensive_test (test_exll_per_column_shard)
+[1] exll.rs — packed array helpers + add + merge
+[2] exll.rs — contribute + solve_mle + estimate
+[3] exll.rs — build_exll + save_exll + load_exll
+[4] shard_file.rs + shard_reader.rs — build/save in flush, load + n_distinct
 ```
 
-Splitting item [1] and [2] avoids debugging the complex MLE estimator while the
+Splitting [1] and [2] avoids debugging the complex MLE estimator while the
 packed array and add/merge logic is still in flux.
 
 ---
 
 ## Tests
 
-All new tests go in `rpython_tests/storage_comprehensive_test.py`.
+All new tests go in `crates/gnitz-engine/src/exll.rs` as `#[cfg(test)] mod tests`.
 
 **`test_exll_add_merge`**
 
