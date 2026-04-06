@@ -2,6 +2,7 @@
 //! PK lookups, and shard flush.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::Arc;
 
@@ -689,6 +690,84 @@ impl OwnedBatch {
         }
         r.push((self.blob.as_ptr(), self.blob.len()));
         r
+    }
+
+    /// Append a single row from any ColumnarSource (MappedShard, MemBatch, etc.)
+    /// with blob deduplication. Used by compaction to copy consolidated rows
+    /// from shard files into an output batch.
+    ///
+    /// Requires `self.schema` to be set.
+    pub fn append_row_from_source<S: ColumnarSource>(
+        &mut self,
+        key: u128,
+        weight: i64,
+        source: &S,
+        row: usize,
+        blob_cache: &mut HashMap<(u64, usize), usize>,
+    ) {
+        if weight == 0 {
+            return;
+        }
+        let schema = self.schema.expect("append_row_from_source requires schema");
+        let pk_index = schema.pk_index as usize;
+
+        self.pk_lo.extend_from_slice(&(key as u64).to_le_bytes());
+        self.pk_hi.extend_from_slice(&((key >> 64) as u64).to_le_bytes());
+        self.weight.extend_from_slice(&weight.to_le_bytes());
+
+        let null_word = source.get_null_word(row);
+        self.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+
+        let src_blob = source.blob_slice();
+        let mut pi: usize = 0;
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index {
+                continue;
+            }
+            let col = &schema.columns[ci];
+            let cs = col.size as usize;
+            let is_null = (null_word >> pi) & 1 != 0;
+
+            if is_null {
+                let len = self.col_data[pi].len();
+                self.col_data[pi].resize(len + cs, 0);
+            } else if col.type_code == crate::schema::type_code::STRING {
+                let src_struct = source.get_col_ptr(row, pi, cs);
+                let (mut dest, is_long) = crate::schema::prep_german_string_copy(src_struct);
+                if is_long {
+                    let length = u32::from_le_bytes(src_struct[0..4].try_into().unwrap()) as usize;
+                    let old_offset = u64::from_le_bytes(src_struct[8..16].try_into().unwrap()) as usize;
+                    let src_data = &src_blob[old_offset..old_offset + length];
+                    let new_offset = self.blob.len();
+                    let off = match crate::schema::blob_cache_lookup(
+                        src_data, blob_cache, &self.blob, new_offset,
+                    ) {
+                        Some(cached) => cached,
+                        None => {
+                            self.blob.extend_from_slice(src_data);
+                            new_offset
+                        }
+                    };
+                    dest[8..16].copy_from_slice(&(off as u64).to_le_bytes());
+                }
+                self.col_data[pi].extend_from_slice(&dest);
+            } else {
+                self.col_data[pi].extend_from_slice(source.get_col_ptr(row, pi, cs));
+            }
+            pi += 1;
+        }
+
+        self.count += 1;
+        self.sorted = false;
+        self.consolidated = false;
+    }
+
+    /// Build a shard image from this batch's regions and write it atomically to disk.
+    /// Returns 0 on success or a negative error code.
+    pub fn write_as_shard(&self, path: &CStr, table_id: u32) -> i32 {
+        let regions = self.regions();
+        let image = shard_file::build_shard_image(table_id, self.count as u32, &regions);
+        shard_file::write_shard_at(libc::AT_FDCWD, path, &image, true)
     }
 }
 
