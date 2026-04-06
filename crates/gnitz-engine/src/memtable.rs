@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::bloom::BloomFilter;
 use crate::columnar::{self, ColumnarSource};
-use crate::compact::SchemaDescriptor;
+use crate::schema::SchemaDescriptor;
 use crate::merge::{self, MemBatch};
 use crate::shard_file;
 use crate::util::{read_i64_le, read_u64_le};
@@ -25,19 +25,12 @@ fn relocate_string_cell(
     dst_col: &mut Vec<u8>,
     dst_blob: &mut Vec<u8>,
 ) {
-    let length = u32::from_le_bytes(src_struct[0..4].try_into().unwrap()) as usize;
-    let mut dest = [0u8; 16];
-    dest[0..8].copy_from_slice(&src_struct[0..8]);
-    if length <= crate::compact::SHORT_STRING_THRESHOLD {
-        let sfx = if length > 4 { length - 4 } else { 0 };
-        if sfx > 0 {
-            dest[8..8 + sfx].copy_from_slice(&src_struct[8..8 + sfx]);
-        }
-    } else {
+    let (mut dest, is_long) = crate::schema::prep_german_string_copy(src_struct);
+    if is_long {
+        let length = u32::from_le_bytes(src_struct[0..4].try_into().unwrap()) as usize;
         let old_off = u64::from_le_bytes(src_struct[8..16].try_into().unwrap()) as usize;
-        let str_data = &src_blob[old_off..old_off + length];
         let new_off = dst_blob.len();
-        dst_blob.extend_from_slice(str_data);
+        dst_blob.extend_from_slice(&src_blob[old_off..old_off + length]);
         dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
     }
     dst_col.extend_from_slice(&dest);
@@ -319,7 +312,7 @@ impl OwnedBatch {
 
             let is_string = schema.map_or(false, |s| {
                 ci < s.num_columns as usize
-                    && s.columns[ci].type_code == crate::compact::type_code::STRING
+                    && s.columns[ci].type_code == crate::schema::type_code::STRING
             });
             let is_null = (null_word >> pi) & 1 != 0;
             let col_size = sz as usize;
@@ -334,7 +327,7 @@ impl OwnedBatch {
                 let mut dest = [0u8; 16];
                 dest[0..8].copy_from_slice(&src[0..8]); // length + prefix
 
-                if length <= crate::compact::SHORT_STRING_THRESHOLD {
+                if length <= crate::schema::SHORT_STRING_THRESHOLD {
                     let sfx = if length > 4 { length - 4 } else { 0 };
                     if sfx > 0 {
                         dest[8..8 + sfx].copy_from_slice(&src[8..8 + sfx]);
@@ -408,7 +401,7 @@ impl OwnedBatch {
                 self.col_data[pi].resize(cur_len + col_size, 0);
             } else {
                 match col.type_code {
-                    crate::compact::type_code::STRING => {
+                    crate::schema::type_code::STRING => {
                         let ptr = str_ptrs[pi];
                         let slen = str_lens[pi] as usize;
                         let bytes: &[u8] = if ptr.is_null() || slen == 0 {
@@ -416,20 +409,20 @@ impl OwnedBatch {
                         } else {
                             std::slice::from_raw_parts(ptr, slen)
                         };
-                        let gs = crate::ipc::encode_german_string(bytes, &mut self.blob);
+                        let gs = crate::schema::encode_german_string(bytes, &mut self.blob);
                         self.col_data[pi].extend_from_slice(&gs);
                     }
-                    crate::compact::type_code::F64 => {
+                    crate::schema::type_code::F64 => {
                         // lo_values[pi] already contains f64 bit pattern
                         self.col_data[pi].extend_from_slice(&lo_values[pi].to_le_bytes());
                     }
-                    crate::compact::type_code::F32 => {
+                    crate::schema::type_code::F32 => {
                         // RPython stores f32 via float2longlong(f64_val) which gives f64 bits
                         let f64_val = f64::from_bits(lo_values[pi] as u64);
                         let f32_val = f64_val as f32;
                         self.col_data[pi].extend_from_slice(&f32_val.to_le_bytes());
                     }
-                    crate::compact::type_code::U128 => {
+                    crate::schema::type_code::U128 => {
                         self.col_data[pi].extend_from_slice(&(lo_values[pi] as u64).to_le_bytes());
                         self.col_data[pi].extend_from_slice(&hi_values[pi].to_le_bytes());
                     }
@@ -489,7 +482,7 @@ impl OwnedBatch {
         for ci in 0..num_cols {
             if ci == pk_index { continue; }
             let is_string = has_schema
-                && schema_copy.unwrap().columns[ci].type_code == crate::compact::type_code::STRING;
+                && schema_copy.unwrap().columns[ci].type_code == crate::schema::type_code::STRING;
             let cs = if has_schema {
                 schema_copy.unwrap().columns[ci].size as usize
             } else if src.count > 0 {
@@ -544,7 +537,7 @@ impl OwnedBatch {
             if is_null {
                 let new_len = self.col_data[pi].len() + cs;
                 self.col_data[pi].resize(new_len, 0);
-            } else if col_desc.type_code == crate::compact::type_code::STRING {
+            } else if col_desc.type_code == crate::schema::type_code::STRING {
                 let src = ptable.found_col_ptr(pi, cs);
                 assert!(!src.is_null());
                 let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
@@ -573,7 +566,7 @@ impl OwnedBatch {
         &mut self,
         src: &merge::MemBatch,
         indices: &[u32],
-        schema: &crate::compact::SchemaDescriptor,
+        schema: &crate::schema::SchemaDescriptor,
     ) {
         if indices.is_empty() {
             return;
@@ -586,7 +579,7 @@ impl OwnedBatch {
                 continue;
             }
             let col = &schema.columns[ci];
-            let is_string = col.type_code == crate::compact::type_code::STRING
+            let is_string = col.type_code == crate::schema::type_code::STRING
                 && col.size == 16;
             col_meta.push((col.size as usize, is_string));
         }
@@ -1056,7 +1049,7 @@ impl MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
         let mut columns = [SchemaColumn::new(0, 0); 64];
@@ -1468,7 +1461,7 @@ mod tests {
     fn decode_str(batch: &OwnedBatch, row: usize, payload_col: usize) -> Vec<u8> {
         let raw = batch.get_col_ptr(row, payload_col, 16);
         let st: [u8; 16] = raw.try_into().unwrap();
-        crate::ipc::decode_german_string(&st, &batch.blob)
+        crate::schema::decode_german_string(&st, &batch.blob)
     }
 
     #[test]

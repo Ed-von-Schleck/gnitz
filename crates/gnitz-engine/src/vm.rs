@@ -3,7 +3,7 @@
 //! Replaces the RPython interpreter (interpreter.py) dispatch loop.
 //! One FFI call per epoch instead of ~20 (one per opcode).
 
-use crate::compact::SchemaDescriptor;
+use crate::schema::SchemaDescriptor;
 use crate::memtable::OwnedBatch;
 use crate::ops::{self, AggDescriptor, GiDesc, AviDesc};
 use crate::read_cursor::{CursorHandle, ReadCursor};
@@ -1093,7 +1093,7 @@ pub fn execute_epoch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
     use crate::ops::AggDescriptor;
 
     // ── Test helpers ─────────────────────────────────────────────────────

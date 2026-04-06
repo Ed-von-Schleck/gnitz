@@ -1,7 +1,7 @@
 //! Reduce operator: accumulator, group key, argsort, AVI, op_reduce, op_gather_reduce.
 
-use crate::compact::{SchemaDescriptor, type_code};
-use crate::compact::type_code::STRING as TYPE_STRING;
+use crate::schema::{SchemaDescriptor, type_code};
+use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::memtable::OwnedBatch;
 use crate::merge::MemBatch;
 use crate::read_cursor::ReadCursor;
@@ -248,13 +248,13 @@ impl Accumulator {
 #[inline]
 fn read_col_value(mb: &MemBatch, row: usize, col_idx: usize, pk_index: usize, col_type_code: u8) -> i64 {
     let pi = payload_idx(col_idx, pk_index);
-    let cs = crate::compact::type_size(col_type_code) as usize;
+    let cs = crate::schema::type_size(col_type_code) as usize;
     let ptr = mb.get_col_ptr(row, pi, cs);
     if col_type_code == type_code::STRING {
         // STRING agg: compare key is first 8 bytes of 16-byte German String
         i64::from_le_bytes(ptr[..8].try_into().unwrap())
     } else {
-        crate::compact::read_signed(ptr, cs)
+        crate::schema::read_signed(ptr, cs)
     }
 }
 
@@ -290,7 +290,7 @@ pub(super) fn extract_gc_u64(
             && tc != type_code::F32 && tc != type_code::F64
         {
             let pi = payload_idx(c_idx, pki);
-            let cs = crate::compact::type_size(tc) as usize;
+            let cs = crate::schema::type_size(tc) as usize;
             let ptr = mb.get_col_ptr(row, pi, cs);
             let mut buf = [0u8; 8];
             buf[..cs].copy_from_slice(ptr);
@@ -344,7 +344,7 @@ fn compare_by_group_cols(
         let ord = if tc == TYPE_STRING {
             let a_bytes = mb.get_col_ptr(row_a, pi, 16);
             let b_bytes = mb.get_col_ptr(row_b, pi, 16);
-            use crate::compact::compare_german_strings;
+            use crate::schema::compare_german_strings;
             compare_german_strings(a_bytes, mb.blob, b_bytes, mb.blob)
         } else if tc == type_code::F64 {
             let a_ptr = mb.get_col_ptr(row_a, pi, 8);
@@ -369,14 +369,14 @@ fn compare_by_group_cols(
         } else if tc == type_code::I64 || tc == type_code::I32
             || tc == type_code::I16 || tc == type_code::I8
         {
-            let cs = crate::compact::type_size(tc) as usize;
+            let cs = crate::schema::type_size(tc) as usize;
             let a_ptr = mb.get_col_ptr(row_a, pi, cs);
             let b_ptr = mb.get_col_ptr(row_b, pi, cs);
-            let a_v = crate::compact::read_signed(a_ptr, cs);
-            let b_v = crate::compact::read_signed(b_ptr, cs);
+            let a_v = crate::schema::read_signed(a_ptr, cs);
+            let b_v = crate::schema::read_signed(b_ptr, cs);
             a_v.cmp(&b_v)
         } else {
-            let cs = crate::compact::type_size(tc) as usize;
+            let cs = crate::schema::type_size(tc) as usize;
             let a_ptr = mb.get_col_ptr(row_a, pi, cs);
             let b_ptr = mb.get_col_ptr(row_b, pi, cs);
             let mut a_buf = [0u8; 8];
@@ -1107,7 +1107,7 @@ fn cursor_matches_group(
 
         if col.type_code == TYPE_STRING {
             let cursor_blob = cursor.blob_ptr();
-            let cmp = crate::compact::compare_german_strings(
+            let cmp = crate::schema::compare_german_strings(
                 cursor_bytes, if cursor_blob.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(cursor_blob, cursor.blob_len()) } },
                 exemplar_bytes, exemplar_mb.blob,
             );
@@ -1312,7 +1312,7 @@ fn emit_gather_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
     use crate::memtable::OwnedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
@@ -1435,7 +1435,7 @@ mod tests {
     }
 
     fn make_gi_schema() -> SchemaDescriptor {
-        use crate::compact::SchemaColumn;
+        use crate::schema::SchemaColumn;
         let mut s = SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
@@ -1473,28 +1473,28 @@ mod tests {
     fn test_reduce_sum_retraction() {
         use std::sync::Arc;
         use crate::read_cursor::create_cursor_from_snapshots;
-        use crate::compact::type_code;
+        use crate::schema::type_code;
 
         // Input: pk(U64), grp(I64), val(I64)
         let mut in_schema = make_schema_u64_i64();
         in_schema.num_columns = 3;
-        in_schema.columns[2] = crate::compact::SchemaColumn {
+        in_schema.columns[2] = crate::schema::SchemaColumn {
             type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
         };
 
         // Output: pk(U128), grp(I64), sum(I64)
-        let mut out_schema = crate::compact::SchemaDescriptor {
+        let mut out_schema = crate::schema::SchemaDescriptor {
             num_columns: 3,
             pk_index: 0,
-            columns: [crate::compact::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
         };
-        out_schema.columns[0] = crate::compact::SchemaColumn {
+        out_schema.columns[0] = crate::schema::SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
         };
-        out_schema.columns[1] = crate::compact::SchemaColumn {
+        out_schema.columns[1] = crate::schema::SchemaColumn {
             type_code: type_code::I64, size: 8, nullable: 0, _pad: 0,
         };
-        out_schema.columns[2] = crate::compact::SchemaColumn {
+        out_schema.columns[2] = crate::schema::SchemaColumn {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
@@ -1561,21 +1561,21 @@ mod tests {
     fn test_reduce_count() {
         use std::sync::Arc;
         use crate::read_cursor::create_cursor_from_snapshots;
-        use crate::compact::type_code;
+        use crate::schema::type_code;
 
         // Input: pk(U64), val(I64)
         let in_schema = make_schema_u64_i64();
 
         // Output: pk(U128), count(I64)
-        let mut out_schema = crate::compact::SchemaDescriptor {
+        let mut out_schema = crate::schema::SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [crate::compact::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
         };
-        out_schema.columns[0] = crate::compact::SchemaColumn {
+        out_schema.columns[0] = crate::schema::SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
         };
-        out_schema.columns[1] = crate::compact::SchemaColumn {
+        out_schema.columns[1] = crate::schema::SchemaColumn {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
@@ -1690,18 +1690,18 @@ mod tests {
     fn test_gather_reduce_retraction() {
         use std::sync::Arc;
         use crate::read_cursor::create_cursor_from_snapshots;
-        use crate::compact::type_code;
+        use crate::schema::type_code;
 
         // Schema: pk(U128), count(I64) — same as partial/output schema
-        let mut schema = crate::compact::SchemaDescriptor {
+        let mut schema = crate::schema::SchemaDescriptor {
             num_columns: 2,
             pk_index: 0,
-            columns: [crate::compact::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
+            columns: [crate::schema::SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64],
         };
-        schema.columns[0] = crate::compact::SchemaColumn {
+        schema.columns[0] = crate::schema::SchemaColumn {
             type_code: type_code::U128, size: 16, nullable: 0, _pad: 0,
         };
-        schema.columns[1] = crate::compact::SchemaColumn {
+        schema.columns[1] = crate::schema::SchemaColumn {
             type_code: type_code::I64, size: 8, nullable: 1, _pad: 0,
         };
 
@@ -1833,7 +1833,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_schema_with_type(tc: u8) -> SchemaDescriptor {
-        let cs = crate::compact::type_size(tc);
+        let cs = crate::schema::type_size(tc);
         let mut columns = [SchemaColumn {
             type_code: 0, size: 0, nullable: 0, _pad: 0,
         }; 64];

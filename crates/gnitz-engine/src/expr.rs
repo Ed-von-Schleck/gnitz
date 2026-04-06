@@ -3,7 +3,7 @@
 //! Evaluates compiled expression programs against columnar batch rows.
 //! Port of gnitz/dbsp/expr.py — same bytecode format, same semantics.
 
-use crate::compact::{
+use crate::schema::{
     compare_german_strings, german_string_tail,
 };
 use crate::merge::MemBatch;
@@ -1031,7 +1031,7 @@ pub fn eval_with_emit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor};
+    use crate::schema::{SchemaColumn, SchemaDescriptor};
     use crate::memtable::OwnedBatch;
 
     fn make_schema(num_cols: u32, pk_index: u32, col_types: &[(u8, u8)]) -> SchemaDescriptor {

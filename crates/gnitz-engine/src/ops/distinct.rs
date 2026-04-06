@@ -1,6 +1,6 @@
 //! DBSP distinct operator.
 
-use crate::compact::SchemaDescriptor;
+use crate::schema::SchemaDescriptor;
 use crate::memtable::{write_to_owned_batch, OwnedBatch};
 use crate::merge;
 use crate::read_cursor::ReadCursor;
@@ -103,7 +103,7 @@ pub fn op_distinct(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
     use crate::memtable::OwnedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {

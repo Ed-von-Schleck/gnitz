@@ -1,87 +1,20 @@
 //! Self-contained shard compaction: N-way merge of sorted shard files.
-//!
-//! Replaces the RPython compactor.py + tournament_tree.py + shard_table.py (read) +
-//! writer_table.py (write) + comparator.py for the compaction path.
 
 use std::collections::HashMap;
 use std::ffi::CStr;
 
 use crate::columnar;
 use crate::heap::MergeHeap;
+use crate::schema::SchemaDescriptor;
+use crate::schema::type_code;
 use crate::shard_reader::MappedShard;
 use crate::util::{read_u32_le, read_u64_le};
-use crate::xxh;
 #[cfg(test)]
 use crate::util::read_i64_le;
 
-// Type codes (from core/types.py). All defined for completeness;
-// the compare_rows dispatch only uses F32/F64/STRING/U128 explicitly.
-#[allow(dead_code)]
-pub(crate) mod type_code {
-    pub const U8: u8 = 1;
-    pub const I8: u8 = 2;
-    pub const U16: u8 = 3;
-    pub const I16: u8 = 4;
-    pub const U32: u8 = 5;
-    pub const I32: u8 = 6;
-    pub const F32: u8 = 7;
-    pub const U64: u8 = 8;
-    pub const I64: u8 = 9;
-    pub const F64: u8 = 10;
-    pub const STRING: u8 = 11;
-    pub const U128: u8 = 12;
-}
 use type_code::STRING as TYPE_STRING;
 #[cfg(test)]
 use type_code::{I64 as TYPE_I64, U64 as TYPE_U64};
-
-pub(crate) const SHORT_STRING_THRESHOLD: usize = 12;
-
-// ---------------------------------------------------------------------------
-// Schema descriptor (passed from RPython via FFI)
-// ---------------------------------------------------------------------------
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SchemaColumn {
-    pub type_code: u8,
-    pub size: u8,
-    pub nullable: u8,
-    pub _pad: u8,
-}
-
-impl SchemaColumn {
-    pub const fn new(type_code: u8, nullable: u8) -> Self {
-        SchemaColumn { type_code, size: type_size(type_code), nullable, _pad: 0 }
-    }
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct SchemaDescriptor {
-    pub num_columns: u32,
-    pub pk_index: u32,
-    pub columns: [SchemaColumn; 64],
-}
-
-impl SchemaDescriptor {
-    pub fn minimal_u64() -> Self {
-        let mut columns = [SchemaColumn::new(0, 0); 64];
-        columns[0] = SchemaColumn::new(type_code::U64, 0);
-        SchemaDescriptor { num_columns: 1, pk_index: 0, columns }
-    }
-}
-
-pub(crate) const fn type_size(tc: u8) -> u8 {
-    match tc {
-        1 | 2 => 1,       // U8, I8
-        3 | 4 => 2,       // U16, I16
-        5 | 6 | 7 => 4,   // U32, I32, F32
-        8 | 9 | 10 => 8,  // U64, I64, F64
-        11 | 12 => 16,    // STRING, U128
-        _ => 8,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Guard output result (returned from merge_and_route)
@@ -173,88 +106,6 @@ fn is_null(shard: &MappedShard, row: usize, col_idx: usize, pk_index: usize) -> 
     let payload_idx = if col_idx < pk_index { col_idx } else { col_idx - 1 };
     (null_word >> payload_idx) & 1 != 0
 }
-
-#[inline]
-pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
-    match size {
-        1 => bytes[0] as i8 as i64,
-        2 => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64,
-        4 => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64,
-        8 => i64::from_le_bytes(bytes[..8].try_into().unwrap()),
-        _ => 0,
-    }
-}
-
-/// Promote raw column data at `offset` to (key_lo, key_hi) for index lookups.
-#[inline]
-pub(crate) fn promote_to_index_key(
-    col_data: &[u8],
-    offset: usize,
-    col_size: usize,
-    type_code_val: u8,
-) -> (u64, u64) {
-    match type_code_val {
-        type_code::U128 => {
-            let lo = u64::from_le_bytes(col_data[offset..offset + 8].try_into().unwrap());
-            let hi = u64::from_le_bytes(col_data[offset + 8..offset + 16].try_into().unwrap());
-            (lo, hi)
-        }
-        type_code::I8 | type_code::I16 | type_code::I32 => {
-            (read_signed(&col_data[offset..], col_size) as u64, 0)
-        }
-        _ => {
-            let mut bytes = [0u8; 8];
-            let copy_len = col_size.min(8);
-            bytes[..copy_len].copy_from_slice(&col_data[offset..offset + copy_len]);
-            (u64::from_le_bytes(bytes), 0)
-        }
-    }
-}
-
-/// Returns bytes [4..end] of a German string as a contiguous slice.
-/// Short strings (len ≤ SHORT_STRING_THRESHOLD): inline at struct[8..4+end].
-/// Long strings: full string is in blob at heap_offset; skip first 4 bytes
-/// (they duplicate the prefix, already compared by the caller).
-#[inline]
-pub(crate) fn german_string_tail<'a>(
-    s: &'a [u8], blob: &'a [u8], length: usize, end: usize,
-) -> &'a [u8] {
-    if length <= SHORT_STRING_THRESHOLD {
-        &s[8..4 + end]
-    } else {
-        let heap_offset = read_u64_le(s, 8) as usize;
-        &blob[heap_offset + 4..heap_offset + end]
-    }
-}
-
-#[inline]
-pub(crate) fn compare_german_strings(
-    a: &[u8], blob_a: &[u8],
-    b: &[u8], blob_b: &[u8],
-) -> std::cmp::Ordering {
-    let len_a = read_u32_le(a, 0) as usize;
-    let len_b = read_u32_le(b, 0) as usize;
-    let min_len = len_a.min(len_b);
-    let prefix_cmp = min_len.min(4);
-
-    // Bulk prefix comparison — single 32-bit compare for the common case.
-    let ord = a[4..4 + prefix_cmp].cmp(&b[4..4 + prefix_cmp]);
-    if ord != std::cmp::Ordering::Equal {
-        return ord;
-    }
-    if min_len <= 4 {
-        return len_a.cmp(&len_b);
-    }
-
-    // Bulk suffix comparison — vectorised memcmp via [u8]::cmp.
-    let tail_a = german_string_tail(a, blob_a, len_a, min_len);
-    let tail_b = german_string_tail(b, blob_b, len_b, min_len);
-    match tail_a.cmp(tail_b) {
-        std::cmp::Ordering::Equal => len_a.cmp(&len_b),
-        ord => ord,
-    }
-}
-
 
 // ---------------------------------------------------------------------------
 // Shard writer (compaction-internal, row-at-a-time from MappedShard)
@@ -354,43 +205,23 @@ impl ShardWriter {
     }
 
     fn write_string_column(&mut self, col_idx: usize, src_struct: &[u8], src_blob: &[u8]) {
-        let length = read_u32_le(src_struct, 0) as usize;
-
-        let mut dest = [0u8; 16];
-        dest[0..4].copy_from_slice(&(length as u32).to_le_bytes());
-        dest[4..8].copy_from_slice(&src_struct[4..8]);
-
-        if length <= SHORT_STRING_THRESHOLD {
-            let suffix_len = if length > 4 { length - 4 } else { 0 };
-            if suffix_len > 0 {
-                dest[8..8 + suffix_len].copy_from_slice(&src_struct[8..8 + suffix_len]);
-            }
-        } else {
+        let (mut dest, is_long) = crate::schema::prep_german_string_copy(src_struct);
+        if is_long {
+            let length = read_u32_le(src_struct, 0) as usize;
             let old_offset = read_u64_le(src_struct, 8) as usize;
             let src_data = &src_blob[old_offset..old_offset + length];
             let new_offset = self.get_or_append_blob(src_data);
             dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
         }
-
         self.col_bufs[col_idx].extend_from_slice(&dest);
     }
 
     fn get_or_append_blob(&mut self, data: &[u8]) -> usize {
-        if data.is_empty() {
-            return 0;
-        }
-        let h = xxh::checksum(data);
-        let cache_key = (h, data.len());
-        if let Some(&existing_offset) = self.blob_cache.get(&cache_key) {
-            let existing = &self.blob_heap[existing_offset..existing_offset + data.len()];
-            if existing == data {
-                return existing_offset;
-            }
-        }
         let new_offset = self.blob_heap.len();
-        self.blob_heap.extend_from_slice(data);
-        self.blob_cache.insert(cache_key, new_offset);
-        new_offset
+        match crate::schema::blob_cache_lookup(data, &mut self.blob_cache, &self.blob_heap, new_offset) {
+            Some(off) => off,
+            None => { self.blob_heap.extend_from_slice(data); new_offset }
+        }
     }
 
     fn finalize(&self, path: &CStr, table_id: u32) -> i32 {
@@ -620,18 +451,18 @@ pub fn merge_and_route(
             }
             return frc;
         }
-        if !std::path::Path::new(&out_filenames[i]).exists() {
-            continue;
-        }
         let ri = result_count as usize;
-        if ri < out_results.len() {
-            out_results[ri].guard_key_lo = guard_keys[i].0;
-            out_results[ri].guard_key_hi = guard_keys[i].1;
-            let name_bytes = out_filenames[i].as_bytes();
-            let len = name_bytes.len().min(255);
-            out_results[ri].filename[..len].copy_from_slice(&name_bytes[..len]);
-            out_results[ri].filename[len] = 0;
-        }
+        assert!(
+            ri < out_results.len(),
+            "merge_and_route: out_results buffer too small ({} slots for {} guards)",
+            out_results.len(), num_guards,
+        );
+        out_results[ri].guard_key_lo = guard_keys[i].0;
+        out_results[ri].guard_key_hi = guard_keys[i].1;
+        let name_bytes = out_filenames[i].as_bytes();
+        let len = name_bytes.len().min(255);
+        out_results[ri].filename[..len].copy_from_slice(&name_bytes[..len]);
+        out_results[ri].filename[len] = 0;
         result_count += 1;
     }
 
@@ -645,6 +476,7 @@ pub fn merge_and_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, compare_german_strings};
     use std::fs;
 
     // Helper: build a minimal shard file in memory and write to disk

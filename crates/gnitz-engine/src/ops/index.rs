@@ -1,6 +1,6 @@
 //! Secondary index integration: GiDesc, AviDesc, op_integrate_with_indexes.
 
-use crate::compact::{SchemaDescriptor, SchemaColumn, type_code};
+use crate::schema::{SchemaDescriptor, SchemaColumn, type_code};
 use crate::memtable::OwnedBatch;
 use crate::merge::MemBatch;
 
@@ -52,7 +52,7 @@ fn promote_agg_col_to_u64_ordered(
         return if for_max { !val } else { val };
     }
 
-    let cs = crate::compact::type_size(col_type_code) as usize;
+    let cs = crate::schema::type_size(col_type_code) as usize;
     let ptr = mb.get_col_ptr(row, pi, cs);
     let mut buf = [0u8; 8];
     buf[..cs].copy_from_slice(ptr);
@@ -62,7 +62,7 @@ fn promote_agg_col_to_u64_ordered(
         type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => raw,
         type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => {
             // Sign-extend then offset-binary
-            let signed = crate::compact::read_signed(&buf[..cs], cs);
+            let signed = crate::schema::read_signed(&buf[..cs], cs);
             (signed as u64).wrapping_add(1u64 << 63)
         }
         type_code::F64 => ieee_order_bits(raw),
@@ -99,7 +99,7 @@ fn extract_gc_u64(
             && tc != type_code::F32 && tc != type_code::F64
         {
             let pi = payload_idx(c_idx, pki);
-            let cs = crate::compact::type_size(tc) as usize;
+            let cs = crate::schema::type_size(tc) as usize;
             let ptr = mb.get_col_ptr(row, pi, cs);
             let mut buf = [0u8; 8];
             buf[..cs].copy_from_slice(ptr);
@@ -108,8 +108,8 @@ fn extract_gc_u64(
     }
     // Fallback: use extract_group_key from reduce (duplicate inline here)
     // For index.rs we only need the lo part.
-    use crate::compact::type_code::STRING as TYPE_STRING;
-    use crate::compact::SHORT_STRING_THRESHOLD;
+    use crate::schema::type_code::STRING as TYPE_STRING;
+    use crate::schema::SHORT_STRING_THRESHOLD;
     use crate::xxh;
 
     #[inline]

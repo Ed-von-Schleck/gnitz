@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 
-use crate::compact::{
+use crate::schema::{
     compare_german_strings, read_signed, SchemaDescriptor,
     type_code::{F32 as TYPE_F32, F64 as TYPE_F64, STRING as TYPE_STRING, U128 as TYPE_U128},
 };
@@ -115,7 +115,7 @@ pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     /// A minimal ColumnarSource for unit tests.
     struct TestBatch {

@@ -6,7 +6,8 @@
 use std::ffi::{CStr, CString};
 use std::fs;
 
-use crate::compact::{self, SchemaDescriptor};
+use crate::compact;
+use crate::schema::SchemaDescriptor;
 use crate::manifest::{self, ManifestEntryRaw};
 use crate::shard_reader::MappedShard;
 use crate::util::{make_pk, split_pk};
@@ -700,7 +701,7 @@ impl ShardIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
     use crate::shard_file;
 
     fn test_schema() -> SchemaDescriptor {

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::compact::SchemaDescriptor;
+use crate::schema::SchemaDescriptor;
 use crate::memtable::OwnedBatch;
 use crate::merge::{self, MemBatch};
 use crate::read_cursor::{self, CursorHandle};
@@ -384,7 +384,7 @@ pub fn partition_arena_size(num_partitions: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_schema() -> SchemaDescriptor {
         let mut columns = [SchemaColumn::new(0, 0); 64];

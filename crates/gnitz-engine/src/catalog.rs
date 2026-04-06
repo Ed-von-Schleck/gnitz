@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::fs;
 
-use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 use crate::dag::{DagEngine, StoreHandle};
 use crate::memtable::OwnedBatch;
 use crate::partitioned_table::{self, PartitionedTable};
@@ -246,7 +246,7 @@ impl BatchBuilder {
 
     /// Put a string value for the current payload column.
     pub fn put_string(&mut self, s: &str) {
-        let st = crate::ipc::encode_german_string(s.as_bytes(), &mut self.batch.blob);
+        let st = crate::schema::encode_german_string(s.as_bytes(), &mut self.batch.blob);
         self.batch.col_data[self.curr_col].extend_from_slice(&st);
         self.curr_col += 1;
     }
@@ -346,13 +346,13 @@ fn get_index_key_type(field_type_code: u8) -> Result<u8, String> {
 fn make_index_schema(index_key_type: u8, source_pk_type: u8) -> SchemaDescriptor {
     let key_col = SchemaColumn {
         type_code: index_key_type,
-        size: crate::compact::type_size(index_key_type),
+        size: crate::schema::type_size(index_key_type),
         nullable: 0,
         _pad: 0,
     };
     let pk_col = SchemaColumn {
         type_code: source_pk_type,
-        size: crate::compact::type_size(source_pk_type),
+        size: crate::schema::type_size(source_pk_type),
         nullable: 0,
         _pad: 0,
     };
@@ -485,7 +485,7 @@ fn cursor_read_string(cursor: &CursorHandle, logical_col: usize) -> String {
     } else {
         &[]
     };
-    let bytes = crate::ipc::decode_german_string(&st, blob_slice);
+    let bytes = crate::schema::decode_german_string(&st, blob_slice);
     String::from_utf8(bytes).unwrap_or_default()
 }
 
@@ -968,7 +968,7 @@ impl CatalogEngine {
                 // For out-of-line strings, rewrite blob offset to target batch.blob
                 if schema.columns[ci].type_code == type_code::STRING && col_size == 16 {
                     let len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                    if len > crate::compact::SHORT_STRING_THRESHOLD && !src_blob_ptr.is_null() {
+                    if len > crate::schema::SHORT_STRING_THRESHOLD && !src_blob_ptr.is_null() {
                         let src_offset = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
                         let new_offset = batch.blob.len() as u64;
                         let src_bytes = unsafe { std::slice::from_raw_parts(src_blob_ptr.add(src_offset), len) };
@@ -1462,7 +1462,7 @@ impl CatalogEngine {
         for (i, cd) in col_defs.iter().enumerate() {
             sd.columns[i] = SchemaColumn {
                 type_code: cd.type_code,
-                size: crate::compact::type_size(cd.type_code),
+                size: crate::schema::type_size(cd.type_code),
                 nullable: if cd.is_nullable { 1 } else { 0 },
                 _pad: 0,
             };
@@ -1538,7 +1538,7 @@ impl CatalogEngine {
         let data = &batch.col_data[payload_col];
         if off + 16 > data.len() { return String::new(); }
         let st: [u8; 16] = data[off..off + 16].try_into().unwrap_or([0; 16]);
-        let bytes = crate::ipc::decode_german_string(&st, &batch.blob);
+        let bytes = crate::schema::decode_german_string(&st, &batch.blob);
         String::from_utf8(bytes).unwrap_or_default()
     }
 
@@ -3286,7 +3286,7 @@ mod tests {
     fn test_restart_long_strings() {
         let dir = temp_dir("restart_long_str");
         let long_name = "this_is_a_very_long_table_name_exceeding_inline_threshold";
-        assert!(long_name.len() > crate::compact::SHORT_STRING_THRESHOLD);
+        assert!(long_name.len() > crate::schema::SHORT_STRING_THRESHOLD);
 
         {
             let mut engine = CatalogEngine::open(&dir).unwrap();
@@ -4191,7 +4191,7 @@ mod tests {
             u64_col_def("id"),
             ColumnDef {
                 name: "parent_id".into(),
-                type_code: crate::compact::type_code::U64,
+                type_code: crate::schema::type_code::U64,
                 is_nullable: false,
                 fk_table_id: tid,
                 fk_col_idx: 0,

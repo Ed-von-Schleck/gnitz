@@ -1,7 +1,7 @@
 //! Linear operators: op_filter, op_map, op_negate, op_union.
 //! Also includes PK promotion for reindex (GROUP BY).
 
-use crate::compact::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
 use crate::memtable::OwnedBatch;
 use crate::merge::MemBatch;
 use crate::scalar_func::ScalarFuncKind;
@@ -381,7 +381,7 @@ pub(super) fn promote_col_to_pk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
     use crate::memtable::OwnedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {

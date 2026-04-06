@@ -9,7 +9,7 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use crate::columnar;
-use crate::compact::SchemaDescriptor;
+use crate::schema::SchemaDescriptor;
 use crate::memtable::{self, MemTable, OwnedBatch};
 use crate::merge::MemBatch;
 use crate::read_cursor::{self, CursorHandle};
@@ -719,7 +719,7 @@ fn erase_stale_shards(dir: &str, table_id: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
         let mut columns = [SchemaColumn::new(0, 0); 64];

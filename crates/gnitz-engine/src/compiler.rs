@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::compact::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::expr::{ExprProgram, EXPR_COPY_COL};
 use crate::ops::AggDescriptor;
 use crate::read_cursor::CursorHandle;
@@ -380,7 +380,7 @@ pub fn cursor_read_i64(cursor: &crate::read_cursor::ReadCursor, col_idx: usize, 
 
 /// Read a German String from cursor column. Returns bytes (may be empty).
 fn cursor_read_string(cursor: &crate::read_cursor::ReadCursor, col_idx: usize, _schema: &SchemaDescriptor) -> Vec<u8> {
-    use crate::compact::SHORT_STRING_THRESHOLD;
+    use crate::schema::SHORT_STRING_THRESHOLD;
 
     let ptr = cursor.col_ptr(col_idx, 16);
     if ptr.is_null() {
@@ -402,8 +402,8 @@ fn cursor_read_string(cursor: &crate::read_cursor::ReadCursor, col_idx: usize, _
         unsafe { std::ptr::copy_nonoverlapping(data_ptr, buf.as_mut_ptr(), length) };
         buf
     } else {
-        // Long string: 4 bytes prefix at ptr+4, then blob offset at ptr+8
-        let blob_offset = unsafe { *(ptr.add(8) as *const u32) } as usize;
+        // Long string: 4 bytes prefix at ptr+4, then blob offset (u64) at ptr+8
+        let blob_offset = unsafe { *(ptr.add(8) as *const u64) } as usize;
         let blob_ptr = cursor.blob_ptr();
         let blob_len = cursor.blob_len();
         if blob_ptr.is_null() || blob_offset + length > blob_len {

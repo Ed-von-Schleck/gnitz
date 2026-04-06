@@ -10,10 +10,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::columnar::{self, ColumnarSource};
-use crate::compact::{SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
+use crate::schema::{SchemaDescriptor, type_code};
 use crate::heap::MergeHeap;
 use crate::util::{read_u32_le, read_u64_le};
-use crate::xxh;
 
 use type_code::STRING as TYPE_STRING;
 
@@ -231,48 +230,28 @@ impl<'a> DirectWriter<'a> {
         out_row: usize,
     ) {
         let src = batch.get_col_ptr(src_row, payload_col, 16);
-        let length = read_u32_le(src, 0) as usize;
-
-        let mut dest = [0u8; 16];
-        dest[0..4].copy_from_slice(&(length as u32).to_le_bytes());
-        dest[4..8].copy_from_slice(&src[4..8]);
-
-        if length <= SHORT_STRING_THRESHOLD {
-            let suffix_len = if length > 4 { length - 4 } else { 0 };
-            if suffix_len > 0 {
-                dest[8..8 + suffix_len].copy_from_slice(&src[8..8 + suffix_len]);
-            }
-        } else {
-            // Resolve the source string data
+        let (mut dest, is_long) = crate::schema::prep_german_string_copy(src);
+        if is_long {
+            let length = read_u32_le(src, 0) as usize;
             let old_offset = read_u64_le(src, 8) as usize;
-            let src_blob = batch.blob;
-            let src_data = &src_blob[old_offset..old_offset + length];
-
+            let src_data = &batch.blob[old_offset..old_offset + length];
             let new_offset = self.get_or_append_blob(src_data);
             dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
         }
-
         let off = out_row * 16;
         self.col_bufs[payload_col][off..off + 16].copy_from_slice(&dest);
     }
 
     fn get_or_append_blob(&mut self, data: &[u8]) -> usize {
-        if data.is_empty() {
-            return 0;
-        }
-        let h = xxh::checksum(data);
-        let cache_key = (h, data.len());
-        if let Some(&existing_offset) = self.blob_cache.get(&cache_key) {
-            let existing = &self.blob[existing_offset..existing_offset + data.len()];
-            if existing == data {
-                return existing_offset;
+        let new_offset = self.blob_offset;
+        match crate::schema::blob_cache_lookup(data, &mut self.blob_cache, &self.blob[..self.blob_offset], new_offset) {
+            Some(off) => off,
+            None => {
+                self.blob[self.blob_offset..self.blob_offset + data.len()].copy_from_slice(data);
+                self.blob_offset += data.len();
+                new_offset
             }
         }
-        let new_offset = self.blob_offset;
-        self.blob[new_offset..new_offset + data.len()].copy_from_slice(data);
-        self.blob_offset += data.len();
-        self.blob_cache.insert(cache_key, new_offset);
-        new_offset
     }
 
     pub fn row_count(&self) -> usize {
@@ -655,7 +634,7 @@ pub unsafe fn parse_single_batch_from_regions<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor};
+    use crate::schema::{SchemaColumn, SchemaDescriptor};
 
     fn make_schema_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {

@@ -1,6 +1,6 @@
 //! Scan trace operator.
 
-use crate::compact::SchemaDescriptor;
+use crate::schema::SchemaDescriptor;
 use crate::memtable::OwnedBatch;
 use crate::read_cursor::ReadCursor;
 
@@ -50,7 +50,7 @@ pub fn op_scan_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
     use crate::memtable::OwnedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {

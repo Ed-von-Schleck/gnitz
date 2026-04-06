@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::catalog::CatalogEngine;
-use crate::compact::SchemaDescriptor;
-use crate::compact::promote_to_index_key;
+use crate::schema::SchemaDescriptor;
+use crate::schema::promote_to_index_key;
 use crate::ipc::{
     self, MAX_WORKERS, W2M_HEADER_SIZE, STATUS_OK,
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH, FLAG_HAS_PK,

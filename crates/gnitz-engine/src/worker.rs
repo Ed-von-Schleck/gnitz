@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
-use crate::compact::SchemaDescriptor;
+use crate::schema::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
 use crate::ipc::{
     self, SAL_MMAP_SIZE, STATUS_OK, STATUS_ERROR,
@@ -603,7 +603,7 @@ impl OwnedBatch {
             if is_null {
                 let new_len = self.col_data[pi].len() + cs;
                 self.col_data[pi].resize(new_len, 0);
-            } else if col_desc.type_code == crate::compact::type_code::STRING {
+            } else if col_desc.type_code == crate::schema::type_code::STRING {
                 let off = row * cs;
                 crate::ops::write_string_from_raw(
                     &mut self.col_data[pi],
@@ -629,7 +629,7 @@ impl OwnedBatch {
 
 impl Default for SchemaDescriptor {
     fn default() -> Self {
-        use crate::compact::SchemaColumn;
+        use crate::schema::SchemaColumn;
         SchemaDescriptor {
             num_columns: 0,
             pk_index: 0,
@@ -641,10 +641,10 @@ impl Default for SchemaDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::SchemaDescriptor;
+    use crate::schema::SchemaDescriptor;
 
     fn test_schema() -> SchemaDescriptor {
-        use crate::compact::{SchemaColumn, type_code};
+        use crate::schema::{SchemaColumn, type_code};
         let mut sd = SchemaDescriptor::default();
         sd.num_columns = 2;
         sd.pk_index = 0;

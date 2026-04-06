@@ -59,7 +59,7 @@ pub struct MappedShard {
 impl MappedShard {
     pub fn open(
         path: &CStr,
-        schema: &crate::compact::SchemaDescriptor,
+        schema: &crate::schema::SchemaDescriptor,
         validate_checksums: bool,
     ) -> Result<Self, i32> {
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
@@ -339,7 +339,7 @@ impl Drop for MappedShard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor};
+    use crate::schema::{SchemaColumn, SchemaDescriptor};
     use crate::util::write_u64_le;
 
     /// Build a minimal shard file with N rows, 2 columns (PK=col0 u64, col1 i64).

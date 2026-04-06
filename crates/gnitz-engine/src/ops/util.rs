@@ -1,7 +1,7 @@
 //! Shared helpers used by ≥2 sub-modules.
 
-use crate::compact::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
-use crate::compact::type_code::STRING as TYPE_STRING;
+use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::memtable::{write_to_owned_batch, OwnedBatch};
 use crate::merge;
 use crate::merge::MemBatch;
@@ -31,30 +31,16 @@ pub fn write_string_from_raw(
     src: &[u8],
     src_blob_ptr: *const u8,
 ) {
-    let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
-
-    let mut dest = [0u8; 16];
-    dest[0..4].copy_from_slice(&src[0..4]); // length
-    dest[4..8].copy_from_slice(&src[4..8]); // prefix
-
-    if length <= SHORT_STRING_THRESHOLD {
-        let suffix_len = if length > 4 { length - 4 } else { 0 };
-        if suffix_len > 0 {
-            dest[8..8 + suffix_len].copy_from_slice(&src[8..8 + suffix_len]);
-        }
-    } else if !src_blob_ptr.is_null() {
+    let (mut dest, is_long) = crate::schema::prep_german_string_copy(src);
+    if is_long {
+        let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
+        assert!(!src_blob_ptr.is_null(), "write_string_from_raw: long string but src_blob_ptr is null");
         let old_offset = u64::from_le_bytes(src[8..16].try_into().unwrap()) as usize;
         let src_data = unsafe { std::slice::from_raw_parts(src_blob_ptr.add(old_offset), length) };
         let new_offset = blob.len();
         blob.extend_from_slice(src_data);
         dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
-    } else {
-        panic!(
-            "write_string_from_raw: string length {} exceeds SHORT_STRING_THRESHOLD but src_blob_ptr is null",
-            length
-        );
     }
-
     col_buf.extend_from_slice(&dest);
 }
 
@@ -181,7 +167,7 @@ pub(super) fn compare_cursor_payload_to_batch_row(
                 let b_bytes = batch.get_col_ptr(row, pi, cs);
 
                 if col.type_code == TYPE_STRING {
-                    crate::compact::compare_german_strings(
+                    crate::schema::compare_german_strings(
                         c_bytes,
                         cursor_blob_slice,
                         b_bytes,

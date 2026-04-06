@@ -5,8 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::compact::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_size};
-use crate::compact::type_code;
+use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, type_size, encode_german_string, decode_german_string};
 use crate::memtable::OwnedBatch;
 use crate::util::align8;
 use crate::wal;
@@ -80,48 +79,6 @@ const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
     sd.columns[6] = U64_COL; sd.columns[7] = U64_COL; sd.columns[8] = STR_COL_NULL;
     sd
 };
-
-/// Encode a German string into a 16-byte struct + optional blob append.
-pub(crate) fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
-    let len = s.len();
-    let mut st = [0u8; 16];
-    st[0..4].copy_from_slice(&(len as u32).to_le_bytes());
-    // prefix: first min(4, len) bytes
-    let pfx = len.min(4);
-    st[4..4 + pfx].copy_from_slice(&s[..pfx]);
-    if len <= SHORT_STRING_THRESHOLD {
-        // suffix: bytes [4..len]
-        if len > 4 {
-            st[8..8 + (len - 4)].copy_from_slice(&s[4..len]);
-        }
-    } else {
-        // long string: append to blob, store offset
-        let off = blob.len();
-        blob.extend_from_slice(s);
-        st[8..16].copy_from_slice(&(off as u64).to_le_bytes());
-    }
-    st
-}
-
-/// Decode a German string from a 16-byte struct + blob.
-pub(crate) fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
-    let len = u32::from_le_bytes(st[0..4].try_into().unwrap()) as usize;
-    if len == 0 {
-        return Vec::new();
-    }
-    if len <= SHORT_STRING_THRESHOLD {
-        let mut out = Vec::with_capacity(len);
-        let pfx = len.min(4);
-        out.extend_from_slice(&st[4..4 + pfx]);
-        if len > 4 {
-            out.extend_from_slice(&st[8..8 + (len - 4)]);
-        }
-        out
-    } else {
-        let off = u64::from_le_bytes(st[8..16].try_into().unwrap()) as usize;
-        blob[off..off + len].to_vec()
-    }
-}
 
 /// Convert a SchemaDescriptor + column names into a META_SCHEMA OwnedBatch.
 fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) -> OwnedBatch {

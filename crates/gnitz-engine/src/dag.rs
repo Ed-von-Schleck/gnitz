@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::compact::SchemaDescriptor;
+use crate::schema::SchemaDescriptor;
 use crate::compiler::{self, CompileOutput, ExternalTable};
 use crate::memtable::OwnedBatch;
 use crate::ops;

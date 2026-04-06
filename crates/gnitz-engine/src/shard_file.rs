@@ -172,27 +172,27 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
 mod tests {
     use super::*;
     use crate::shard_reader::MappedShard;
-    use crate::compact::SchemaDescriptor;
+    use crate::schema::{SchemaColumn, SchemaDescriptor};
 
     fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
         let mut sd = SchemaDescriptor {
             num_columns: num_cols,
             pk_index,
-            columns: [crate::compact::SchemaColumn {
+            columns: [SchemaColumn {
                 type_code: 0,
                 size: 0,
                 nullable: 0,
                 _pad: 0,
             }; 64],
         };
-        sd.columns[0] = crate::compact::SchemaColumn {
+        sd.columns[0] = SchemaColumn {
             type_code: 8,
             size: 8,
             nullable: 0,
             _pad: 0,
         };
         if num_cols > 1 {
-            sd.columns[1] = crate::compact::SchemaColumn {
+            sd.columns[1] = SchemaColumn {
                 type_code: 9,
                 size: 8,
                 nullable: 0,

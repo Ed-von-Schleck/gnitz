@@ -1,7 +1,7 @@
 //! Join operators: anti-join, semi-join, inner join, outer join (delta-trace + delta-delta).
 
-use crate::compact::SchemaDescriptor;
-use crate::compact::type_code::STRING as TYPE_STRING;
+use crate::schema::SchemaDescriptor;
+use crate::schema::type_code::STRING as TYPE_STRING;
 use crate::memtable::{write_to_owned_batch, OwnedBatch};
 use crate::merge::{self, MemBatch};
 use crate::read_cursor::ReadCursor;
@@ -876,7 +876,7 @@ fn write_join_row_from_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
     use crate::memtable::OwnedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {

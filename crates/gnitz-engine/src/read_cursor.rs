@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::ptr;
 
 use crate::columnar::{self, ColumnarSource};
-use crate::compact::SchemaDescriptor;
+use crate::schema::SchemaDescriptor;
 use crate::heap::MergeHeap;
 use crate::merge::MemBatch;
 use crate::shard_reader::MappedShard;
@@ -565,7 +565,7 @@ pub unsafe fn create_cursor_from_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor};
+    use crate::schema::{SchemaColumn, SchemaDescriptor};
     use crate::merge::MemBatch;
 
     fn make_schema_i64() -> SchemaDescriptor {
@@ -576,13 +576,13 @@ mod tests {
             _pad: 0,
         }; 64];
         columns[0] = SchemaColumn {
-            type_code: crate::compact::type_code::U128,
+            type_code: crate::schema::type_code::U128,
             size: 16,
             nullable: 0,
             _pad: 0,
         };
         columns[1] = SchemaColumn {
-            type_code: crate::compact::type_code::I64,
+            type_code: crate::schema::type_code::I64,
             size: 8,
             nullable: 0,
             _pad: 0,

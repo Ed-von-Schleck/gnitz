@@ -1,6 +1,6 @@
 //! Exchange repartitioning: PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter.
 
-use crate::compact::SchemaDescriptor;
+use crate::schema::SchemaDescriptor;
 use crate::memtable::OwnedBatch;
 use crate::merge::MemBatch;
 
@@ -68,19 +68,19 @@ impl PartitionRouter {
                 let pi = payload_idx(col_idx as usize, pki);
                 let col = &schema.columns[col_idx as usize];
                 let col_size = col.size as usize;
-                if col.type_code == crate::compact::type_code::STRING {
+                if col.type_code == crate::schema::type_code::STRING {
                     // Hash string content to u64 (same approach as extract_group_key)
                     let struct_bytes = mb.get_col_ptr(row, pi, 16);
                     let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
                     if length == 0 {
                         0u64
-                    } else if length <= crate::compact::SHORT_STRING_THRESHOLD {
+                    } else if length <= crate::schema::SHORT_STRING_THRESHOLD {
                         crate::xxh::checksum(&struct_bytes[4..4 + length])
                     } else {
                         let heap_offset = u64::from_le_bytes(struct_bytes[8..16].try_into().unwrap()) as usize;
                         crate::xxh::checksum(&mb.blob[heap_offset..heap_offset + length])
                     }
-                } else if col.type_code == crate::compact::type_code::U128 {
+                } else if col.type_code == crate::schema::type_code::U128 {
                     // XOR the two u64 halves
                     let bytes = mb.get_col_ptr(row, pi, 16);
                     let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
@@ -362,7 +362,7 @@ pub fn op_multi_scatter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+    use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         let mut columns = [SchemaColumn {

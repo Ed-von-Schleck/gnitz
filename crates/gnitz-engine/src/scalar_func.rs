@@ -5,7 +5,7 @@
 //! `ScalarFuncKind` wraps Plan behind a single enum so that the VM
 //! passes one opaque handle for any function type.
 
-use crate::compact::{
+use crate::schema::{
     type_code, SchemaDescriptor, SHORT_STRING_THRESHOLD,
 };
 use crate::expr::{self, EmitTarget, ExprProgram};
@@ -439,7 +439,7 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compact::SchemaColumn;
+    use crate::schema::SchemaColumn;
     use crate::expr;
 
     fn make_schema(num_cols: u32, pk_index: u32, col_types: &[(u8, u8)]) -> SchemaDescriptor {
