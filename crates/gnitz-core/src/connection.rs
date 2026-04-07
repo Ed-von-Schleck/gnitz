@@ -8,15 +8,10 @@ use gnitz_protocol::{
 };
 use crate::error::ClientError;
 
-pub const SCHEMA_TAB:           u64 = 1;
-pub const TABLE_TAB:            u64 = 2;
-pub const VIEW_TAB:             u64 = 3;
-pub const COL_TAB:              u64 = 4;
-pub const IDX_TAB:              u64 = 5;
-pub const DEP_TAB:              u64 = 6;
-pub const SEQ_TAB:              u64 = 7;
-pub const FIRST_USER_TABLE_ID:  u64 = 16;
-pub const FIRST_USER_SCHEMA_ID: u64 = 3;
+pub use gnitz_wire::{
+    SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB, DEP_TAB, SEQ_TAB,
+    FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
+};
 
 fn check_response(msg: Message) -> Result<Message, ClientError> {
     if msg.status == STATUS_ERROR {

@@ -22,32 +22,23 @@ pub const SAL_MMAP_SIZE: usize = 1 << 30;
 pub const W2M_REGION_SIZE: usize = 1 << 30;
 pub const W2M_HEADER_SIZE: usize = 128;
 
-// Wire protocol flags (bits in the control block flags field)
-pub const FLAG_HAS_SCHEMA: u64 = 1 << 48;
-pub const FLAG_HAS_DATA: u64 = 1 << 49;
+// Wire protocol flags (from gnitz-wire)
+pub use gnitz_wire::{
+    FLAG_HAS_SCHEMA, FLAG_HAS_DATA, IPC_CONTROL_TID,
+    STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
+};
 pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
 pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
 
-/// Control block TID — max u32, never a real table ID.
-pub const IPC_CONTROL_TID: u32 = 0xFFFFFFFF;
-
-/// Status codes
-pub const STATUS_OK: u32 = 0;
-pub const STATUS_ERROR: u32 = 1;
-
-/// Meta-schema flags
-pub const META_FLAG_NULLABLE: u64 = 1;
-pub const META_FLAG_IS_PK: u64 = 2;
-
-// SAL group header flags (u32) — must match ipc.py
-pub const FLAG_SHUTDOWN: u32            = 4;
-pub const FLAG_DDL_SYNC: u32            = 8;
-pub const FLAG_EXCHANGE: u32            = 16;
-pub const FLAG_PUSH: u32                = 32;
-pub const FLAG_HAS_PK: u32             = 64;
-pub const FLAG_SEEK: u32                = 128;
-pub const FLAG_SEEK_BY_INDEX: u32       = 256;
-pub const FLAG_EXCHANGE_RELAY: u32      = 512; // M→W exchange relay (was flags=0)
+// SAL group header flags (u32) — shared flags derived from wire, engine-only flags local.
+pub const FLAG_SHUTDOWN: u32            = gnitz_wire::FLAG_SHUTDOWN as u32;
+pub const FLAG_DDL_SYNC: u32            = gnitz_wire::FLAG_DDL_SYNC as u32;
+pub const FLAG_EXCHANGE: u32            = gnitz_wire::FLAG_EXCHANGE as u32;
+pub const FLAG_PUSH: u32                = gnitz_wire::FLAG_PUSH as u32;
+pub const FLAG_HAS_PK: u32             = gnitz_wire::FLAG_HAS_PK as u32;
+pub const FLAG_SEEK: u32                = gnitz_wire::FLAG_SEEK as u32;
+pub const FLAG_SEEK_BY_INDEX: u32       = gnitz_wire::FLAG_SEEK_BY_INDEX as u32;
+pub const FLAG_EXCHANGE_RELAY: u32      = 512;
 pub const FLAG_PRELOADED_EXCHANGE: u32  = 1024;
 pub const FLAG_BACKFILL: u32            = 2048;
 pub const FLAG_TICK: u32                = 4096;

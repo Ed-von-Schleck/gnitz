@@ -17,8 +17,8 @@ use crate::xxh;
 //  [36,40) RESERVED   u32
 //  [40,48) BLOB_SIZE  u64
 
-pub const HEADER_SIZE: usize = 48;
-pub const FORMAT_VERSION: u32 = 2;
+pub const HEADER_SIZE: usize = gnitz_wire::WAL_HEADER_SIZE;
+pub const FORMAT_VERSION: u32 = gnitz_wire::WAL_FORMAT_VERSION;
 
 const OFF_LSN: usize = 0;
 const OFF_TID: usize = 8;

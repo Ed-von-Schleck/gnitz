@@ -8,6 +8,7 @@ name = "gnitz-server"
 path = "src/main.rs"
 
 [dependencies]
+gnitz-wire      = { path = "../gnitz-wire" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 xorf = { version = "0.12", default-features = false }
 libc = "0.2"

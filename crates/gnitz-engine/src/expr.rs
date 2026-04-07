@@ -10,59 +10,50 @@ use crate::storage::MemBatch;
 use crate::util::read_u32_le;
 
 // ---------------------------------------------------------------------------
-// Expression opcodes (must match expr.py)
+// Expression opcodes (from gnitz-wire, cast to i64 for register file)
 // ---------------------------------------------------------------------------
 
-pub const EXPR_LOAD_COL_INT: i64 = 1;
-pub const EXPR_LOAD_COL_FLOAT: i64 = 2;
-pub const EXPR_LOAD_CONST: i64 = 3;
-
-pub const EXPR_INT_ADD: i64 = 4;
-pub const EXPR_INT_SUB: i64 = 5;
-pub const EXPR_INT_MUL: i64 = 6;
-pub const EXPR_INT_DIV: i64 = 7;
-pub const EXPR_INT_MOD: i64 = 8;
-pub const EXPR_INT_NEG: i64 = 9;
-
-pub const EXPR_FLOAT_ADD: i64 = 10;
-pub const EXPR_FLOAT_SUB: i64 = 11;
-pub const EXPR_FLOAT_MUL: i64 = 12;
-pub const EXPR_FLOAT_DIV: i64 = 13;
-pub const EXPR_FLOAT_NEG: i64 = 14;
-
-pub const EXPR_CMP_EQ: i64 = 15;
-pub const EXPR_CMP_NE: i64 = 16;
-pub const EXPR_CMP_GT: i64 = 17;
-pub const EXPR_CMP_GE: i64 = 18;
-pub const EXPR_CMP_LT: i64 = 19;
-pub const EXPR_CMP_LE: i64 = 20;
-
-pub const EXPR_FCMP_EQ: i64 = 21;
-pub const EXPR_FCMP_NE: i64 = 22;
-pub const EXPR_FCMP_GT: i64 = 23;
-pub const EXPR_FCMP_GE: i64 = 24;
-pub const EXPR_FCMP_LT: i64 = 25;
-pub const EXPR_FCMP_LE: i64 = 26;
-
-pub const EXPR_BOOL_AND: i64 = 27;
-pub const EXPR_BOOL_OR: i64 = 28;
-pub const EXPR_BOOL_NOT: i64 = 29;
-
-pub const EXPR_IS_NULL: i64 = 30;
-pub const EXPR_IS_NOT_NULL: i64 = 31;
-
-pub const EXPR_EMIT: i64 = 32;
-pub const EXPR_INT_TO_FLOAT: i64 = 33;
-pub const EXPR_COPY_COL: i64 = 34;
-
-pub const EXPR_STR_COL_EQ_CONST: i64 = 40;
-pub const EXPR_STR_COL_LT_CONST: i64 = 41;
-pub const EXPR_STR_COL_LE_CONST: i64 = 42;
-pub const EXPR_STR_COL_EQ_COL: i64 = 43;
-pub const EXPR_STR_COL_LT_COL: i64 = 44;
-pub const EXPR_STR_COL_LE_COL: i64 = 45;
-
-pub const EXPR_EMIT_NULL: i64 = 46;
+pub const EXPR_LOAD_COL_INT: i64     = gnitz_wire::EXPR_LOAD_COL_INT as i64;
+pub const EXPR_LOAD_COL_FLOAT: i64   = gnitz_wire::EXPR_LOAD_COL_FLOAT as i64;
+pub const EXPR_LOAD_CONST: i64       = gnitz_wire::EXPR_LOAD_CONST as i64;
+pub const EXPR_INT_ADD: i64          = gnitz_wire::EXPR_INT_ADD as i64;
+pub const EXPR_INT_SUB: i64          = gnitz_wire::EXPR_INT_SUB as i64;
+pub const EXPR_INT_MUL: i64          = gnitz_wire::EXPR_INT_MUL as i64;
+pub const EXPR_INT_DIV: i64          = gnitz_wire::EXPR_INT_DIV as i64;
+pub const EXPR_INT_MOD: i64          = gnitz_wire::EXPR_INT_MOD as i64;
+pub const EXPR_INT_NEG: i64          = gnitz_wire::EXPR_INT_NEG as i64;
+pub const EXPR_FLOAT_ADD: i64        = gnitz_wire::EXPR_FLOAT_ADD as i64;
+pub const EXPR_FLOAT_SUB: i64        = gnitz_wire::EXPR_FLOAT_SUB as i64;
+pub const EXPR_FLOAT_MUL: i64        = gnitz_wire::EXPR_FLOAT_MUL as i64;
+pub const EXPR_FLOAT_DIV: i64        = gnitz_wire::EXPR_FLOAT_DIV as i64;
+pub const EXPR_FLOAT_NEG: i64        = gnitz_wire::EXPR_FLOAT_NEG as i64;
+pub const EXPR_CMP_EQ: i64           = gnitz_wire::EXPR_CMP_EQ as i64;
+pub const EXPR_CMP_NE: i64           = gnitz_wire::EXPR_CMP_NE as i64;
+pub const EXPR_CMP_GT: i64           = gnitz_wire::EXPR_CMP_GT as i64;
+pub const EXPR_CMP_GE: i64           = gnitz_wire::EXPR_CMP_GE as i64;
+pub const EXPR_CMP_LT: i64           = gnitz_wire::EXPR_CMP_LT as i64;
+pub const EXPR_CMP_LE: i64           = gnitz_wire::EXPR_CMP_LE as i64;
+pub const EXPR_FCMP_EQ: i64          = gnitz_wire::EXPR_FCMP_EQ as i64;
+pub const EXPR_FCMP_NE: i64          = gnitz_wire::EXPR_FCMP_NE as i64;
+pub const EXPR_FCMP_GT: i64          = gnitz_wire::EXPR_FCMP_GT as i64;
+pub const EXPR_FCMP_GE: i64          = gnitz_wire::EXPR_FCMP_GE as i64;
+pub const EXPR_FCMP_LT: i64          = gnitz_wire::EXPR_FCMP_LT as i64;
+pub const EXPR_FCMP_LE: i64          = gnitz_wire::EXPR_FCMP_LE as i64;
+pub const EXPR_BOOL_AND: i64         = gnitz_wire::EXPR_BOOL_AND as i64;
+pub const EXPR_BOOL_OR: i64          = gnitz_wire::EXPR_BOOL_OR as i64;
+pub const EXPR_BOOL_NOT: i64         = gnitz_wire::EXPR_BOOL_NOT as i64;
+pub const EXPR_IS_NULL: i64          = gnitz_wire::EXPR_IS_NULL as i64;
+pub const EXPR_IS_NOT_NULL: i64      = gnitz_wire::EXPR_IS_NOT_NULL as i64;
+pub const EXPR_EMIT: i64             = gnitz_wire::EXPR_EMIT as i64;
+pub const EXPR_INT_TO_FLOAT: i64     = gnitz_wire::EXPR_INT_TO_FLOAT as i64;
+pub const EXPR_COPY_COL: i64         = gnitz_wire::EXPR_COPY_COL as i64;
+pub const EXPR_STR_COL_EQ_CONST: i64 = gnitz_wire::EXPR_STR_COL_EQ_CONST as i64;
+pub const EXPR_STR_COL_LT_CONST: i64 = gnitz_wire::EXPR_STR_COL_LT_CONST as i64;
+pub const EXPR_STR_COL_LE_CONST: i64 = gnitz_wire::EXPR_STR_COL_LE_CONST as i64;
+pub const EXPR_STR_COL_EQ_COL: i64   = gnitz_wire::EXPR_STR_COL_EQ_COL as i64;
+pub const EXPR_STR_COL_LT_COL: i64   = gnitz_wire::EXPR_STR_COL_LT_COL as i64;
+pub const EXPR_STR_COL_LE_COL: i64   = gnitz_wire::EXPR_STR_COL_LE_COL as i64;
+pub const EXPR_EMIT_NULL: i64        = gnitz_wire::EXPR_EMIT_NULL as i64;
 
 // ---------------------------------------------------------------------------
 // Register file constants and null-mask helpers

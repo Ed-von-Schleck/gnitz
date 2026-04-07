@@ -90,10 +90,7 @@ pub fn cstr_from_buf(buf: &[u8]) -> &str {
     std::str::from_utf8(&buf[..end]).unwrap_or("")
 }
 
-#[inline]
-pub fn align8(val: usize) -> usize {
-    (val + 7) & !7
-}
+pub use gnitz_wire::align8;
 
 /// Raise RLIMIT_NOFILE soft limit to the hard limit.
 /// Called once per process via `std::sync::Once`; safe to invoke from any test.

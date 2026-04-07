@@ -1,70 +1,33 @@
 use std::sync::OnceLock;
 use gnitz_protocol::{Schema, ColumnDef, TypeCode};
 
-// Circuit system table IDs
-pub const CIRCUIT_NODES_TAB:      u64 = 11;
-pub const CIRCUIT_EDGES_TAB:      u64 = 12;
-pub const CIRCUIT_SOURCES_TAB:    u64 = 13;
-pub const CIRCUIT_PARAMS_TAB:     u64 = 14;
-pub const CIRCUIT_GROUP_COLS_TAB: u64 = 15;
-
-// Owner kinds
-pub const OWNER_KIND_TABLE: u64 = 0;
-pub const OWNER_KIND_VIEW:  u64 = 1;
-
-// Opcodes
-pub const OPCODE_SCAN_TRACE:            u64 = 11;
-pub const OPCODE_INTEGRATE:             u64 = 7;
-pub const OPCODE_FILTER:                u64 = 1;
-pub const OPCODE_MAP:                   u64 = 2;
-pub const OPCODE_NEGATE:                u64 = 3;
-pub const OPCODE_UNION:                 u64 = 4;
-pub const OPCODE_JOIN_DELTA_TRACE:      u64 = 5;
-pub const OPCODE_JOIN_DELTA_DELTA:      u64 = 6;
-pub const OPCODE_DELAY:                 u64 = 8;
-pub const OPCODE_REDUCE:                u64 = 9;
-pub const OPCODE_DISTINCT:              u64 = 10;
-pub const OPCODE_ANTI_JOIN_DELTA_TRACE: u64 = 16;
-pub const OPCODE_ANTI_JOIN_DELTA_DELTA: u64 = 17;
-pub const OPCODE_SEMI_JOIN_DELTA_TRACE: u64 = 18;
-pub const OPCODE_SEMI_JOIN_DELTA_DELTA: u64 = 19;
-pub const OPCODE_EXCHANGE_SHARD:        u64 = 20;
-pub const OPCODE_EXCHANGE_GATHER:       u64 = 21;
-pub const OPCODE_JOIN_DELTA_TRACE_OUTER: u64 = 22;
-pub const OPCODE_NULL_EXTEND:            u64 = 23;
-
-// Port constants
-pub const PORT_IN:    u64 = 0;
-pub const PORT_TRACE: u64 = 1;
-pub const PORT_IN_A:  u64 = 0;
-pub const PORT_IN_B:  u64 = 1;
-
-// Param slots
-pub const PARAM_FUNC_ID:         u64 = 0;
-pub const PARAM_AGG_FUNC_ID:     u64 = 1;
-pub const PARAM_AGG_COL_IDX:     u64 = 6;
-pub const PARAM_PROJ_BASE:       u64 = 32;
-pub const PARAM_EXPR_BASE:       u64 = 64;
-pub const PARAM_EXPR_NUM_REGS:   u64 = 7;
-pub const PARAM_EXPR_RESULT_REG: u64 = 8;
-pub const PARAM_REINDEX_COL:       u64 = 10;
-pub const PARAM_JOIN_SOURCE_TABLE: u64 = 11;
-pub const PARAM_SHARD_COL_BASE:    u64 = 128;
-pub const PARAM_CONST_STR_BASE:    u64 = 160;
-pub const PARAM_GATHER_WORKER:     u64 = 9;
-pub const PARAM_TABLE_ID:          u64 = 3;
-pub const PARAM_AGG_COUNT:         u64 = 12;
-pub const PARAM_AGG_SPEC_BASE:     u64 = 13;
-pub const PARAM_KEY_ONLY:            u64 = 14;
-pub const PARAM_NULL_EXTEND_COUNT:   u64 = 15;
-pub const PARAM_NULL_EXTEND_COL_BASE: u64 = 192;
-
-// Aggregate function IDs (must match gnitz/dbsp/functions.py)
-pub const AGG_COUNT:          u64 = 1;
-pub const AGG_SUM:            u64 = 2;
-pub const AGG_MIN:            u64 = 3;
-pub const AGG_MAX:            u64 = 4;
-pub const AGG_COUNT_NON_NULL: u64 = 5;
+pub use gnitz_wire::{
+    // System table IDs
+    CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_SOURCES_TAB,
+    CIRCUIT_PARAMS_TAB, CIRCUIT_GROUP_COLS_TAB,
+    // Owner kinds
+    OWNER_KIND_TABLE, OWNER_KIND_VIEW,
+    // Opcodes
+    OPCODE_SCAN_TRACE, OPCODE_INTEGRATE,
+    OPCODE_FILTER, OPCODE_MAP, OPCODE_NEGATE, OPCODE_UNION,
+    OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_DELTA, OPCODE_JOIN_DELTA_TRACE_OUTER,
+    OPCODE_DELAY, OPCODE_REDUCE, OPCODE_DISTINCT,
+    OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_ANTI_JOIN_DELTA_DELTA,
+    OPCODE_SEMI_JOIN_DELTA_TRACE, OPCODE_SEMI_JOIN_DELTA_DELTA,
+    OPCODE_EXCHANGE_SHARD, OPCODE_EXCHANGE_GATHER,
+    OPCODE_NULL_EXTEND,
+    // Ports
+    PORT_IN, PORT_TRACE, PORT_IN_A, PORT_IN_B,
+    // Param slots
+    PARAM_FUNC_ID, PARAM_AGG_FUNC_ID, PARAM_AGG_COL_IDX,
+    PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_EXPR_NUM_REGS,
+    PARAM_EXPR_RESULT_REG, PARAM_SHARD_COL_BASE, PARAM_GATHER_WORKER,
+    PARAM_REINDEX_COL, PARAM_JOIN_SOURCE_TABLE, PARAM_CONST_STR_BASE,
+    PARAM_TABLE_ID, PARAM_AGG_COUNT, PARAM_AGG_SPEC_BASE,
+    PARAM_KEY_ONLY, PARAM_NULL_EXTEND_COUNT, PARAM_NULL_EXTEND_COL_BASE,
+    // Aggregates
+    AGG_COUNT, AGG_SUM, AGG_MIN, AGG_MAX, AGG_COUNT_NON_NULL,
+};
 
 // --- Schema constructor functions ---
 

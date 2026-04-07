@@ -1,23 +1,16 @@
-pub use crate::wal_block::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
+pub use gnitz_wire::{
+    FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH,
+    FLAG_HAS_PK, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+    FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
+    STATUS_OK, STATUS_ERROR,
+    META_FLAG_NULLABLE, META_FLAG_IS_PK,
+    IPC_CONTROL_TID,
+    WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE,
+};
 
 pub const FLAG_ALLOCATE_TABLE_ID:  u64 = 1;
 pub const FLAG_ALLOCATE_SCHEMA_ID: u64 = 2;
-pub const FLAG_SHUTDOWN:           u64 = 4;
-pub const FLAG_DDL_SYNC:           u64 = 8;
-pub const FLAG_EXCHANGE:           u64 = 16;
-pub const FLAG_PUSH:               u64 = 32;
-pub const FLAG_HAS_PK:             u64 = 64;
-pub const FLAG_SEEK:               u64 = 128;
-pub const FLAG_SEEK_BY_INDEX:      u64 = 256;
 pub const FLAG_ALLOCATE_INDEX_ID:  u64 = 512;
-pub const FLAG_HAS_SCHEMA:         u64 = 1 << 48;
-pub const FLAG_HAS_DATA:           u64 = 1 << 49;
-
-pub const STATUS_OK:    u32 = 0;
-pub const STATUS_ERROR: u32 = 1;
-
-pub const META_FLAG_NULLABLE: u64 = 1;
-pub const META_FLAG_IS_PK:    u64 = 2;
 
 /// Logical header decoded from the IPC control WAL block.
 ///

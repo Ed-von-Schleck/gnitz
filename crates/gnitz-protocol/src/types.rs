@@ -1,51 +1,46 @@
 use std::sync::OnceLock;
 use crate::error::ProtocolError;
 
+use gnitz_wire::type_code as tc;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TypeCode {
-    U8     = 1,
-    I8     = 2,
-    U16    = 3,
-    I16    = 4,
-    U32    = 5,
-    I32    = 6,
-    F32    = 7,
-    U64    = 8,
-    I64    = 9,
-    F64    = 10,
-    String = 11,
-    U128   = 12,
+    U8     = tc::U8,
+    I8     = tc::I8,
+    U16    = tc::U16,
+    I16    = tc::I16,
+    U32    = tc::U32,
+    I32    = tc::I32,
+    F32    = tc::F32,
+    U64    = tc::U64,
+    I64    = tc::I64,
+    F64    = tc::F64,
+    String = tc::STRING,
+    U128   = tc::U128,
 }
 
 impl TypeCode {
     /// Wire stride in bytes. String returns 16 (German String struct).
     pub fn wire_stride(self) -> usize {
-        match self {
-            TypeCode::U8  | TypeCode::I8  => 1,
-            TypeCode::U16 | TypeCode::I16 => 2,
-            TypeCode::U32 | TypeCode::I32 | TypeCode::F32 => 4,
-            TypeCode::U64 | TypeCode::I64 | TypeCode::F64 => 8,
-            TypeCode::String => 16,
-            TypeCode::U128 => 16,
-        }
+        gnitz_wire::wire_stride(self as u8)
     }
 
     pub fn try_from_u64(v: u64) -> Result<Self, ProtocolError> {
-        match v {
-            1  => Ok(TypeCode::U8),
-            2  => Ok(TypeCode::I8),
-            3  => Ok(TypeCode::U16),
-            4  => Ok(TypeCode::I16),
-            5  => Ok(TypeCode::U32),
-            6  => Ok(TypeCode::I32),
-            7  => Ok(TypeCode::F32),
-            8  => Ok(TypeCode::U64),
-            9  => Ok(TypeCode::I64),
-            10 => Ok(TypeCode::F64),
-            11 => Ok(TypeCode::String),
-            12 => Ok(TypeCode::U128),
-            _  => Err(ProtocolError::UnknownTypeCode(v)),
+        match v as u8 {
+            tc::U8     => Ok(TypeCode::U8),
+            tc::I8     => Ok(TypeCode::I8),
+            tc::U16    => Ok(TypeCode::U16),
+            tc::I16    => Ok(TypeCode::I16),
+            tc::U32    => Ok(TypeCode::U32),
+            tc::I32    => Ok(TypeCode::I32),
+            tc::F32    => Ok(TypeCode::F32),
+            tc::U64    => Ok(TypeCode::U64),
+            tc::I64    => Ok(TypeCode::I64),
+            tc::F64    => Ok(TypeCode::F64),
+            tc::STRING => Ok(TypeCode::String),
+            tc::U128   => Ok(TypeCode::U128),
+            _          => Err(ProtocolError::UnknownTypeCode(v)),
         }
     }
 }

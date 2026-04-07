@@ -3,19 +3,13 @@
 use crate::error::ProtocolError;
 use crate::types::{ColData, Schema, TypeCode, ZSetBatch};
 
-// ── Constants ────────────────────────────────────────────────────────────────
-
-pub const WAL_BLOCK_HEADER_SIZE: usize = 48;
-pub const WAL_FORMAT_VERSION:    u32   = 2;
-pub const IPC_CONTROL_TID:       u32   = 0xFFFF_FFFF;
-const     SHORT_STRING_THRESHOLD: usize = 12;
+use gnitz_wire::{
+    WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE,
+    WAL_FORMAT_VERSION, SHORT_STRING_THRESHOLD,
+    align8,
+};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
-
-#[inline]
-fn align8(n: usize) -> usize {
-    (n + 7) & !7
-}
 
 /// Append `data` to `buf` at an 8-byte-aligned offset.  Returns `(offset, len)`.
 fn append_region(buf: &mut Vec<u8>, data: &[u8]) -> (u32, u32) {
@@ -44,62 +38,19 @@ fn xxh3_64(data: &[u8]) -> u64 {
     twox_hash::XxHash3_64::oneshot(data)
 }
 
-// ── German String encode/decode ───────────────────────────────────────────────
+// ── German String encode/decode (wrappers around gnitz-wire) ─────────────────
 
-/// Encode a Rust `&str` as a 16-byte German String struct, appending long-string
-/// data to `blob`.
-///
-/// Layout:
-///   [0..4]  length (u32 LE)
-///   [4..8]  prefix — first min(4, length) bytes, zero-padded to 4
-///   [8..16] if length ≤ 12 → suffix bytes [4..length], zero-padded to 8
-///           if length > 12 → blob arena offset (u64 LE)
 fn encode_german_string(s: &str, blob: &mut Vec<u8>) -> [u8; 16] {
-    let bytes = s.as_bytes();
-    let length = bytes.len();
-    let mut st = [0u8; 16];
-
-    st[0..4].copy_from_slice(&(length as u32).to_le_bytes());
-
-    if length == 0 {
-        return st;
-    }
-
-    let prefix_len = length.min(4);
-    st[4..4 + prefix_len].copy_from_slice(&bytes[..prefix_len]);
-
-    if length <= SHORT_STRING_THRESHOLD {
-        if length > 4 {
-            st[8..8 + (length - 4)].copy_from_slice(&bytes[4..length]);
-        }
-    } else {
-        let offset = blob.len() as u64;
-        st[8..16].copy_from_slice(&offset.to_le_bytes());
-        blob.extend_from_slice(bytes);
-    }
-
-    st
+    gnitz_wire::encode_german_string(s.as_bytes(), blob)
 }
 
-/// Decode a 16-byte German String struct into a Rust `String`.
-/// `blob` is the shared blob arena for this WAL block.
 fn decode_german_string(st: [u8; 16], blob: &[u8]) -> Result<String, ProtocolError> {
     let length = u32::from_le_bytes(st[0..4].try_into().unwrap()) as usize;
-
     if length == 0 {
         return Ok(String::new());
     }
-
-    if length <= SHORT_STRING_THRESHOLD {
-        let take_prefix = length.min(4);
-        let mut result = Vec::with_capacity(length);
-        result.extend_from_slice(&st[4..4 + take_prefix]);
-        if length > 4 {
-            result.extend_from_slice(&st[8..8 + (length - 4)]);
-        }
-        String::from_utf8(result)
-            .map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {}", e)))
-    } else {
+    // Bounds-check before delegating to wire (which would panic).
+    if length > SHORT_STRING_THRESHOLD {
         let offset = u64::from_le_bytes(st[8..16].try_into().unwrap()) as usize;
         let end = offset.checked_add(length).ok_or_else(|| {
             ProtocolError::DecodeError("German String blob offset overflow".into())
@@ -110,9 +61,10 @@ fn decode_german_string(st: [u8; 16], blob: &[u8]) -> Result<String, ProtocolErr
                 offset, length, blob.len()
             )));
         }
-        String::from_utf8(blob[offset..end].to_vec())
-            .map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String (long): {}", e)))
     }
+    let bytes = gnitz_wire::decode_german_string(&st, blob);
+    String::from_utf8(bytes)
+        .map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {}", e)))
 }
 
 // ── Region read helpers ───────────────────────────────────────────────────────

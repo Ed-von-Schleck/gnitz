@@ -1,49 +1,17 @@
-// Expression opcodes — must match gnitz/dbsp/expr.py
-const EXPR_LOAD_COL_INT:   u32 = 1;
-const EXPR_LOAD_COL_FLOAT: u32 = 2;
-const EXPR_LOAD_CONST:     u32 = 3;
-const EXPR_INT_ADD:        u32 = 4;
-const EXPR_INT_SUB:        u32 = 5;
-const EXPR_INT_MUL:        u32 = 6;
-const EXPR_INT_DIV:        u32 = 7;
-const EXPR_INT_MOD:        u32 = 8;
-const EXPR_INT_NEG:        u32 = 9;
-const EXPR_FLOAT_ADD:      u32 = 10;
-const EXPR_FLOAT_SUB:      u32 = 11;
-const EXPR_FLOAT_MUL:      u32 = 12;
-const EXPR_FLOAT_DIV:      u32 = 13;
-const EXPR_FLOAT_NEG:      u32 = 14;
-const EXPR_CMP_EQ:         u32 = 15;
-const EXPR_CMP_NE:         u32 = 16;
-const EXPR_CMP_GT:         u32 = 17;
-const EXPR_CMP_GE:         u32 = 18;
-const EXPR_CMP_LT:         u32 = 19;
-const EXPR_CMP_LE:         u32 = 20;
-const EXPR_FCMP_EQ:        u32 = 21;
-const EXPR_FCMP_NE:        u32 = 22;
-const EXPR_FCMP_GT:        u32 = 23;
-const EXPR_FCMP_GE:        u32 = 24;
-const EXPR_FCMP_LT:        u32 = 25;
-const EXPR_FCMP_LE:        u32 = 26;
-const EXPR_BOOL_AND:       u32 = 27;
-const EXPR_BOOL_OR:        u32 = 28;
-const EXPR_BOOL_NOT:       u32 = 29;
-const EXPR_IS_NULL:        u32 = 30;
-const EXPR_IS_NOT_NULL:    u32 = 31;
-
-// Output opcodes (Phase 4: computed projections)
-const EXPR_EMIT:           u32 = 32;
-const EXPR_INT_TO_FLOAT:   u32 = 33;
-const EXPR_COPY_COL:       u32 = 34;
-
-// String comparison opcodes — must match gnitz/dbsp/expr.py
-const EXPR_STR_COL_EQ_CONST: u32 = 40;
-const EXPR_STR_COL_LT_CONST: u32 = 41;
-const EXPR_STR_COL_LE_CONST: u32 = 42;
-const EXPR_STR_COL_EQ_COL:   u32 = 43;
-const EXPR_STR_COL_LT_COL:   u32 = 44;
-const EXPR_STR_COL_LE_COL:   u32 = 45;
-const EXPR_EMIT_NULL:        u32 = 46;
+use gnitz_wire::{
+    EXPR_LOAD_COL_INT, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_CONST,
+    EXPR_INT_ADD, EXPR_INT_SUB, EXPR_INT_MUL, EXPR_INT_DIV,
+    EXPR_INT_MOD, EXPR_INT_NEG,
+    EXPR_FLOAT_ADD, EXPR_FLOAT_SUB, EXPR_FLOAT_MUL, EXPR_FLOAT_DIV, EXPR_FLOAT_NEG,
+    EXPR_CMP_EQ, EXPR_CMP_NE, EXPR_CMP_GT, EXPR_CMP_GE, EXPR_CMP_LT, EXPR_CMP_LE,
+    EXPR_FCMP_EQ, EXPR_FCMP_NE, EXPR_FCMP_GT, EXPR_FCMP_GE, EXPR_FCMP_LT, EXPR_FCMP_LE,
+    EXPR_BOOL_AND, EXPR_BOOL_OR, EXPR_BOOL_NOT,
+    EXPR_IS_NULL, EXPR_IS_NOT_NULL,
+    EXPR_EMIT, EXPR_INT_TO_FLOAT, EXPR_COPY_COL,
+    EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LT_CONST, EXPR_STR_COL_LE_CONST,
+    EXPR_STR_COL_EQ_COL, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LE_COL,
+    EXPR_EMIT_NULL,
+};
 
 /// A compiled expression program: a flat list of 4-word instructions
 /// (opcode, dst_reg, arg1, arg2) plus metadata for embedding in filter params.

@@ -5,7 +5,8 @@ use crate::error::ProtocolError;
 use crate::header::{Header, STATUS_ERROR, STATUS_OK, FLAG_HAS_SCHEMA, FLAG_HAS_DATA};
 use crate::types::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch, meta_schema};
 use crate::codec::{schema_to_batch, batch_to_schema};
-use crate::wal_block::{encode_wal_block, decode_wal_block, IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
+use crate::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
+use crate::wal_block::{encode_wal_block, decode_wal_block};
 use crate::transport::{send_framed, recv_framed};
 
 pub struct Message {

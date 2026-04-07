@@ -17,10 +17,10 @@ pub use header::{
     FLAG_SEEK_BY_INDEX, FLAG_ALLOCATE_INDEX_ID,
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
     STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
+    WAL_BLOCK_HEADER_SIZE, IPC_CONTROL_TID,
 };
 pub use wal_block::{
     encode_wal_block, decode_wal_block,
-    WAL_BLOCK_HEADER_SIZE, IPC_CONTROL_TID,
     recompute_block_checksum, get_region_offset_size,
 };
 pub use codec::{schema_to_batch, batch_to_schema};

@@ -7,25 +7,8 @@ use std::collections::HashMap;
 use crate::util::{read_u32_le, read_u64_le};
 use crate::xxh;
 
-// Type codes — all defined for completeness;
-// the compare_rows dispatch only uses F32/F64/STRING/U128 explicitly.
-#[allow(dead_code)]
-pub(crate) mod type_code {
-    pub const U8: u8 = 1;
-    pub const I8: u8 = 2;
-    pub const U16: u8 = 3;
-    pub const I16: u8 = 4;
-    pub const U32: u8 = 5;
-    pub const I32: u8 = 6;
-    pub const F32: u8 = 7;
-    pub const U64: u8 = 8;
-    pub const I64: u8 = 9;
-    pub const F64: u8 = 10;
-    pub const STRING: u8 = 11;
-    pub const U128: u8 = 12;
-}
-
-pub(crate) const SHORT_STRING_THRESHOLD: usize = 12;
+pub(crate) use gnitz_wire::type_code;
+pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
 
 // ---------------------------------------------------------------------------
 // Schema descriptor
@@ -63,14 +46,7 @@ impl SchemaDescriptor {
 }
 
 pub(crate) const fn type_size(tc: u8) -> u8 {
-    match tc {
-        1 | 2 => 1,       // U8, I8
-        3 | 4 => 2,       // U16, I16
-        5 | 6 | 7 => 4,   // U32, I32, F32
-        8 | 9 | 10 => 8,  // U64, I64, F64
-        11 | 12 => 16,    // STRING, U128
-        _ => 8,
-    }
+    gnitz_wire::wire_stride(tc) as u8
 }
 
 // ---------------------------------------------------------------------------
@@ -154,44 +130,8 @@ pub(crate) fn blob_cache_lookup(
     None
 }
 
-/// Encode a German string into a 16-byte struct + optional blob append.
-pub(crate) fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
-    let len = s.len();
-    let mut st = [0u8; 16];
-    st[0..4].copy_from_slice(&(len as u32).to_le_bytes());
-    let pfx = len.min(4);
-    st[4..4 + pfx].copy_from_slice(&s[..pfx]);
-    if len <= SHORT_STRING_THRESHOLD {
-        if len > 4 {
-            st[8..8 + (len - 4)].copy_from_slice(&s[4..len]);
-        }
-    } else {
-        let off = blob.len();
-        blob.extend_from_slice(s);
-        st[8..16].copy_from_slice(&(off as u64).to_le_bytes());
-    }
-    st
-}
-
-/// Decode a German string from a 16-byte struct + blob.
-pub(crate) fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
-    let len = u32::from_le_bytes(st[0..4].try_into().unwrap()) as usize;
-    if len == 0 {
-        return Vec::new();
-    }
-    if len <= SHORT_STRING_THRESHOLD {
-        let mut out = Vec::with_capacity(len);
-        let pfx = len.min(4);
-        out.extend_from_slice(&st[4..4 + pfx]);
-        if len > 4 {
-            out.extend_from_slice(&st[8..8 + (len - 4)]);
-        }
-        out
-    } else {
-        let off = u64::from_le_bytes(st[8..16].try_into().unwrap()) as usize;
-        blob[off..off + len].to_vec()
-    }
-}
+pub(crate) use gnitz_wire::encode_german_string;
+pub(crate) use gnitz_wire::decode_german_string;
 
 /// Returns bytes [4..end] of a German string as a contiguous slice.
 /// Short strings (len ≤ SHORT_STRING_THRESHOLD): inline at struct[8..4+end].
