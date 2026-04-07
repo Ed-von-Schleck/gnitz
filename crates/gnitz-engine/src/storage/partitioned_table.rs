@@ -255,7 +255,7 @@ impl PartitionedTable {
     pub fn flush(&mut self) -> Result<bool, i32> {
         let mut any_wrote = false;
         for table in &mut self.tables {
-            if let Ok(true) = table.flush() {
+            if table.flush()? {
                 any_wrote = true;
             }
         }

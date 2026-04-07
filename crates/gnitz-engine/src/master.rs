@@ -1012,16 +1012,37 @@ impl MasterDispatcher {
 
                 let pk_lo_i = batch.get_pk_lo(i);
                 let pk_hi_i = batch.get_pk_hi(i);
-                if let Some(hi_set) = existing_pks.get(&pk_lo_i) {
-                    if hi_set.contains(&pk_hi_i) { continue; }
-                }
 
+                // Compute the index key before the UPSERT branch (needed in both paths).
                 let (key_lo, key_hi) = if is_pk_col {
                     (pk_lo_i, pk_hi_i)
                 } else {
                     let col_data = &batch.col_data[src_payload_idx];
                     promote_to_index_key(col_data, i * col_size, col_size, type_code)
                 };
+
+                let is_upsert = existing_pks
+                    .get(&pk_lo_i)
+                    .is_some_and(|s| s.contains(&pk_hi_i));
+                if is_upsert {
+                    // Resolve who currently holds this unique value.
+                    // No holder → free, ok.
+                    // Holder PK == current PK → same row updating itself, ok.
+                    // Holder PK != current PK → real violation.
+                    match self.fan_out_seek_by_index(target_id, col_idx, key_lo, key_hi) {
+                        Err(e) => return Err(e),
+                        Ok(None) => {}
+                        Ok(Some(ref found)) if found.count > 0 => {
+                            if found.get_pk_lo(0) != pk_lo_i || found.get_pk_hi(0) != pk_hi_i {
+                                let col_name = self.get_col_name(target_id, source_col);
+                                return Err(format!(
+                                    "Unique index violation on column '{}'", col_name));
+                            }
+                        }
+                        Ok(Some(_)) => {}
+                    }
+                    continue;
+                }
 
                 if let Some(hi_set) = seen.get(&key_lo) {
                     if hi_set.contains(&key_hi) {

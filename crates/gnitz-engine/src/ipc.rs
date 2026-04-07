@@ -674,6 +674,14 @@ pub unsafe fn sal_read_group_header(
     let my_size = read_u32_raw(sal_ptr, hdr_off + 32 + MAX_WORKERS * 4 + wid * 4) as usize;
 
     if my_size > 0 && my_offset > 0 {
+        // Assert the slice stays within the mapped region; clamp to 0 on
+        // corruption so decode_wire returns Err rather than crashing.
+        debug_assert!(
+            my_offset + my_size <= payload_size,
+            "SAL group header corrupt: my_offset={} my_size={} payload_size={}",
+            my_offset, my_size, payload_size
+        );
+        let data_size = if my_offset + my_size <= payload_size { my_size as u32 } else { 0 };
         SalReadResult {
             status: 0,
             advance,
@@ -683,7 +691,7 @@ pub unsafe fn sal_read_group_header(
             epoch,
             _pad: 0,
             data_ptr: sal_ptr.add(hdr_off + my_offset),
-            data_size: my_size as u32,
+            data_size,
             _pad2: 0,
         }
     } else {

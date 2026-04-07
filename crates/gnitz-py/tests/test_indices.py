@@ -543,14 +543,6 @@ class TestIndexIntegrity:
                       indices=[f"{sn}__t__idx_val"],
                       tables=["t"])
 
-    @pytest.mark.xfail(
-        _NUM_WORKERS > 1,
-        reason="Row modification (INSERT-as-UPSERT or UPDATE) changing a unique-indexed "
-               "column to a value held by a row on a different worker is not caught. "
-               "The pre-push check skips existing PKs, and the worker-level check only "
-               "sees its local index partition. Requires index re-partitioning or a "
-               "two-phase protocol to fix.",
-    )
     def test_unique_upsert_to_existing_value(self, client):
         """UPSERT pk=1 to val=99 when pk=2 already holds val=99 must fail."""
         sn = _sn()
@@ -571,13 +563,6 @@ class TestIndexIntegrity:
                       indices=[f"{sn}__t__idx_val"],
                       tables=["t"])
 
-    @pytest.mark.xfail(
-        _NUM_WORKERS > 1,
-        reason="UPDATE changing a unique-indexed column to a value held by a row on a "
-               "different worker is not caught. Same root cause as "
-               "test_unique_upsert_to_existing_value — UPDATE is implemented as a "
-               "push with the same PK (weight=+1), triggering the UPSERT path.",
-    )
     def test_unique_update_to_existing_value(self, client):
         """UPDATE pk=1 SET val=99 when pk=2 already holds val=99 must fail."""
         sn = _sn()
@@ -598,6 +583,33 @@ class TestIndexIntegrity:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
                       tables=["t"])
+
+    def test_unique_concurrent_buffered(self, server):
+        """Two back-to-back inserts with the same unique value must fail.
+
+        The second insert arrives before any scan forces a flush, so both
+        writes would be buffered without this fix — the TOCTOU window.
+        With the fix, flush_pending_for_tid drains the first insert before
+        validating the second.
+        """
+        sn = _sn()
+        with gnitz.connect(server) as c1, gnitz.connect(server) as c2:
+            c1.create_schema(sn)
+            try:
+                c1.execute_sql(
+                    "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                    schema_name=sn,
+                )
+                c1.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+                # First insert via c1 — may be buffered, not yet flushed to workers.
+                c1.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+                # Second insert via c2 — must detect the conflict.
+                with pytest.raises(gnitz.GnitzError):
+                    c2.execute_sql("INSERT INTO t VALUES (2, 42)", schema_name=sn)
+            finally:
+                _drop_all(c1, sn,
+                          indices=[f"{sn}__t__idx_val"],
+                          tables=["t"])
 
     def test_unique_null_not_violation(self, client):
         """Multiple NULLs in a unique-indexed nullable column must not conflict."""

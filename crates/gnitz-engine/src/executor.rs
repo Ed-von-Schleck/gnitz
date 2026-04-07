@@ -843,6 +843,10 @@ impl ServerExecutor {
             && has_batch
             && decoded.data_batch.as_ref().map_or(false, |b| b.count > 0)
         {
+            // Drain any previously buffered writes for this table so that
+            // validate_unique_distributed sees current worker state.
+            self.flush_pending_for_tid(transport, target_id, pending);
+
             let batch = decoded.data_batch.unwrap();
             self.cat().validate_fk_inline(target_id, &batch)?;
             self.cat().validate_unique_indices(target_id, &batch)?;

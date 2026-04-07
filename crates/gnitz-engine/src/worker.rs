@@ -329,10 +329,12 @@ impl WorkerProcess {
         }
 
         if flags & FLAG_FLUSH != 0 {
-            self.handle_flush_all();
             self.read_cursor = 0;
             self.expected_epoch += 1;
-            self.send_ack(0, FLAG_CHECKPOINT);
+            match self.handle_flush_all() {
+                Ok(()) => self.send_ack(0, FLAG_CHECKPOINT),
+                Err(msg) => self.send_error(&msg),
+            }
             return DispatchResult::Continue;
         }
 
@@ -453,16 +455,24 @@ impl WorkerProcess {
 
     // ── Request handlers ───────────────────────────────────────────────
 
+    /// Flush a family to disk, logging on failure without propagating — the
+    /// data remains safe in the memtable until the next checkpoint flush.
+    fn flush_family_best_effort(&mut self, target_id: i64) {
+        if let Err(rc) = self.cat().flush_family(target_id) {
+            gnitz_info!("W{} flush_family tid={} rc={} (data in memtable)", self.worker_id, target_id, rc);
+        }
+    }
+
     fn handle_push(&mut self, target_id: i64, batch: OwnedBatch) -> Result<(), String> {
         let row_count = batch.count;
         if target_id < FIRST_USER_TABLE_ID {
             let batch_for_dag = batch.clone_batch();
             self.cat().ingest_to_family(target_id, batch)?;
-            let _ = self.cat().flush_family(target_id);
+            self.flush_family_best_effort(target_id);
             self.evaluate_dag(target_id, batch_for_dag);
         } else {
             let effective = self.cat().ingest_returning_effective(target_id, batch)?;
-            let _ = self.cat().flush_family(target_id);
+            self.flush_family_best_effort(target_id);
             if let Some(existing) = self.pending_deltas.get_mut(&target_id) {
                 existing.append_batch(&effective, 0, effective.count);
             } else {
@@ -546,12 +556,15 @@ impl WorkerProcess {
         Ok(())
     }
 
-    fn handle_flush_all(&mut self) {
+    fn handle_flush_all(&mut self) -> Result<(), String> {
         self.pending_deltas.clear();
         let ids = self.cat().iter_user_table_ids();
         for tid in ids {
-            let _ = self.cat().flush_family(tid);
+            self.cat()
+                .flush_family(tid)
+                .map_err(|e| format!("flush_family tid={} rc={}", tid, e))?;
         }
+        Ok(())
     }
 
     /// Run multi-worker DAG evaluation with the exchange context.
@@ -567,7 +580,7 @@ impl WorkerProcess {
     }
 
     fn shutdown(&mut self) {
-        self.handle_flush_all();
+        let _ = self.handle_flush_all();
         unsafe { libc::_exit(0); }
     }
 }
