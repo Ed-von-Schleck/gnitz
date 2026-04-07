@@ -102,9 +102,6 @@ pub(crate) fn promote_to_index_key(
             let hi = u64::from_le_bytes(col_data[offset + 8..offset + 16].try_into().unwrap());
             (lo, hi)
         }
-        type_code::I8 | type_code::I16 | type_code::I32 => {
-            (read_signed(&col_data[offset..], col_size) as u64, 0)
-        }
         _ => {
             let mut bytes = [0u8; 8];
             let copy_len = col_size.min(8);

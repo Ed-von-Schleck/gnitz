@@ -251,6 +251,12 @@ impl DagEngine {
 
     pub fn remove_index_circuit(&mut self, table_id: i64, col_idx: u32) {
         if let Some(entry) = self.tables.get_mut(&table_id) {
+            // Reclaim the leaked Box<Table> before removing the entry.
+            for ic in entry.index_circuits.iter() {
+                if ic.col_idx == col_idx && !ic.index_handle.is_null() {
+                    unsafe { drop(Box::from_raw(ic.index_handle)); }
+                }
+            }
             entry.index_circuits.retain(|ic| ic.col_idx != col_idx);
         }
     }
@@ -1609,6 +1615,11 @@ impl DagEngine {
                 } else if src_col_size == 4 {
                     let v = u32::from_le_bytes(col_data[offset..offset+4].try_into().unwrap());
                     (v as u64, 0u64)
+                } else if src_col_size == 2 {
+                    let v = u16::from_le_bytes(col_data[offset..offset+2].try_into().unwrap());
+                    (v as u64, 0u64)
+                } else if src_col_size == 1 {
+                    (col_data[offset] as u64, 0u64)
                 } else {
                     continue;
                 }
