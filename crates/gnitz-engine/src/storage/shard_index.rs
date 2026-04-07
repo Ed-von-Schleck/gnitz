@@ -589,7 +589,7 @@ impl ShardIndex {
             self.compact_seq
         };
 
-        let guard_keys: Vec<(u64, u64)> = if !dest_guard_indices.is_empty() {
+        let mut guard_keys: Vec<(u64, u64)> = if !dest_guard_indices.is_empty() {
             dest_guard_indices
                 .iter()
                 .map(|&di| {
@@ -603,6 +603,20 @@ impl ShardIndex {
                 self.levels[src_idx].guards[worst_idx].guard_key_hi,
             )]
         };
+
+        // Ensure guard_keys covers the source range's lower bound.
+        // Without this, keys below the lowest destination guard are routed
+        // to that guard (via find_guard_for_key → index 0), but find_guard_idx
+        // on the read path returns None for keys below the guard key.
+        if !guard_keys.is_empty() {
+            let first_gk = make_pk(guard_keys[0].0, guard_keys[0].1);
+            if first_gk > src_guard_key {
+                guard_keys.insert(0, (
+                    self.levels[src_idx].guards[worst_idx].guard_key_lo,
+                    self.levels[src_idx].guards[worst_idx].guard_key_hi,
+                ));
+            }
+        }
 
         let input_cstrings = to_cstrings(&all_input_files)?;
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
@@ -1055,5 +1069,58 @@ mod tests {
             idx.find_pk(*pk, 0, &mut |_, _| found = true);
             assert!(found, "pk {} lost from L0 after failed run_compact", pk);
         }
+    }
+
+    /// Bug 1: When L1 guard at key=100 is vertically compacted into L2 that has
+    /// a guard at key=200, the routing must cover keys below 200 (the source
+    /// range's lower bound). Without the fix, keys 100-199 become unfindable.
+    #[test]
+    fn test_compact_guard_vertical_routing_gap() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        // Build L1 (levels[0]) and L2 (levels[1])
+        idx.ensure_level(2);
+
+        // L1 guard at key=100: 5 shards (> GUARD_FILE_THRESHOLD=4) with keys in [100, 199]
+        let src_pks: Vec<u64> = vec![100, 120, 140, 160, 180];
+        for (i, &pk) in src_pks.iter().enumerate() {
+            let name = format!("src_{}.db", i);
+            let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
+            let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
+            idx.levels[0].get_or_create_guard(100, 0).entries.push(entry);
+        }
+
+        // L1 guard at key=500: 1 shard (so worst_guard picks key=100)
+        {
+            let path = write_test_shard(dir.path(), "high.db", &[500], &[5000]);
+            let entry = ShardEntry::open(&path, &schema, 0, 50).unwrap();
+            idx.levels[0].get_or_create_guard(500, 0).entries.push(entry);
+        }
+
+        // L2 guard at key=200: 1 shard with key=250
+        {
+            let path = write_test_shard(dir.path(), "dest.db", &[250], &[2500]);
+            let entry = ShardEntry::open(&path, &schema, 0, 80).unwrap();
+            idx.levels[1].get_or_create_guard(200, 0).entries.push(entry);
+        }
+
+        // Compact L1 → L2 (src_level_num=1)
+        idx.compact_guard_vertical(1).unwrap();
+
+        // All source keys (100-180) must be findable — they should not be lost
+        // to the routing gap below L2's guard at 200.
+        for &pk in &src_pks {
+            let mut found = false;
+            idx.find_pk(pk, 0, &mut |_, _| found = true);
+            assert!(found, "key {} lost after vertical compaction (routing gap bug)", pk);
+        }
+
+        // The destination key 250 must also still be present
+        let mut found_250 = false;
+        idx.find_pk(250, 0, &mut |_, _| found_250 = true);
+        assert!(found_250, "destination key 250 lost after vertical compaction");
     }
 }

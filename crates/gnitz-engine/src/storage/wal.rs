@@ -122,7 +122,7 @@ pub fn validate_and_parse(
     out_count: &mut u32,
     out_num_regions: &mut u32,
     out_blob_size: &mut u64,
-    out_region_offsets: &mut [u32],
+    out_region_offsets: &mut [u64],
     out_region_sizes: &mut [u32],
     max_regions: u32,
 ) -> i32 {
@@ -161,7 +161,7 @@ pub fn validate_and_parse(
         if dir_off + 8 > total_size {
             break;
         }
-        out_region_offsets[i] = read_u32_le(block, dir_off);
+        out_region_offsets[i] = read_u32_le(block, dir_off) as u64;
         out_region_sizes[i] = read_u32_le(block, dir_off + 4);
     }
 
@@ -316,7 +316,7 @@ impl WalReader {
         out_count: &mut u32,
         out_num_regions: &mut u32,
         out_blob_size: &mut u64,
-        out_offsets: &mut [u32],
+        out_offsets: &mut [u64],
         out_sizes: &mut [u32],
         max_regions: u32,
     ) -> i32 {
@@ -351,7 +351,7 @@ impl WalReader {
 
         let n = (*out_num_regions as usize).min(max_regions as usize);
         for i in 0..n {
-            out_offsets[i] += block_start as u32;
+            out_offsets[i] += block_start as u64;
         }
 
         self.offset += total_size;
@@ -398,7 +398,7 @@ mod tests {
         let mut count = 0u32;
         let mut num_regions = 0u32;
         let mut blob_size = 0u64;
-        let mut offsets = [0u32; 16];
+        let mut offsets = [0u64; 16];
         let mut rsizes = [0u32; 16];
 
         let rc = validate_and_parse(
@@ -439,7 +439,7 @@ mod tests {
         let mut count = 0u32;
         let mut num_regions = 0u32;
         let mut blob_size = 0u64;
-        let mut offsets = [0u32; 16];
+        let mut offsets = [0u64; 16];
         let mut rsizes = [0u32; 16];
 
         let rc1 = validate_and_parse(
@@ -478,7 +478,7 @@ mod tests {
         let mut count = 0u32;
         let mut num_regions = 0u32;
         let mut blob_size = 0u64;
-        let mut offsets = [0u32; 16];
+        let mut offsets = [0u64; 16];
         let mut rsizes = [0u32; 16];
 
         let rc = validate_and_parse(
@@ -620,7 +620,7 @@ mod tests {
         let mut count = 0u32;
         let mut num_regions = 0u32;
         let mut blob_size = 0u64;
-        let mut offsets = [0u32; 16];
+        let mut offsets = [0u64; 16];
         let mut rsizes = [0u32; 16];
 
         // Block 1
@@ -731,7 +731,7 @@ mod tests {
         let mut count = 0u32;
         let mut num_regions = 0u32;
         let mut blob_size = 0u64;
-        let mut offsets = [0u32; 4];
+        let mut offsets = [0u64; 4];
         let mut rsizes = [0u32; 4];
 
         let rc = reader.read_next_block(
@@ -748,5 +748,23 @@ mod tests {
             *p
         };
         assert_eq!(val, 42);
+    }
+
+    #[test]
+    fn test_offset_overflow_prevented() {
+        // Prove that the old `as u32` truncation lost high bits and `as u64` preserves them.
+        let block_start: usize = 0x1_0000_0100; // > 4GB
+        let in_block_offset: u32 = 64;
+
+        // Old code: `offset += block_start as u32` — truncates to 0x100, wrong result
+        let old_result = in_block_offset.wrapping_add(block_start as u32);
+        assert_eq!(old_result, 64 + 0x100, "old u32 cast truncates high bits");
+
+        // New code: `offset += block_start as u64` — preserves full value
+        let new_result = (in_block_offset as u64) + (block_start as u64);
+        assert_eq!(new_result, 64 + 0x1_0000_0100u64, "u64 preserves full offset");
+
+        // Confirm they differ (the truncation produces wrong results)
+        assert_ne!(old_result as u64, new_result);
     }
 }

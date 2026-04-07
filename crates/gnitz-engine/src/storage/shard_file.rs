@@ -252,6 +252,260 @@ pub fn build_shard_image(
     image
 }
 
+/// pwrite loop that handles short writes.
+unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> i32 {
+    let mut remaining = buf.len();
+    let mut p = buf.as_ptr();
+    while remaining > 0 {
+        let written = libc::pwrite(fd, p as *const libc::c_void, remaining, offset);
+        if written <= 0 {
+            return -3;
+        }
+        remaining -= written as usize;
+        p = p.add(written as usize);
+        offset += written as libc::off_t;
+    }
+    0
+}
+
+/// Write a shard directly to disk without building an intermediate Vec<u8>.
+///
+/// Same output format as `build_shard_image` + `write_shard_at`, but peak memory
+/// is only the header+directory buffer instead of the entire shard image.
+pub fn write_shard_streaming(
+    dirfd: c_int,
+    basename: &CStr,
+    table_id: u32,
+    row_count: u32,
+    regions: &[(*const u8, usize)],
+    durable: bool,
+) -> i32 {
+    let num_regions = regions.len();
+    let n = row_count as usize;
+    let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
+
+    // --- Phase 1: detect encodings and compute actual sizes ---
+    let mut encodings: Vec<RegionEncoding> = Vec::with_capacity(num_regions);
+    let mut actual_sizes: Vec<usize> = Vec::with_capacity(num_regions);
+
+    for i in 0..num_regions {
+        let (src_ptr, orig_sz) = regions[i];
+        if n == 0 || i == last_region || orig_sz == 0 || src_ptr.is_null() {
+            encodings.push(RegionEncoding::Raw);
+            actual_sizes.push(orig_sz);
+        } else {
+            let elem_width = orig_sz / n;
+            let src = unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) };
+            let enc = if i == 2 {
+                detect_weight_encoding(src)
+            } else {
+                detect_encoding(src, elem_width)
+            };
+            let actual = match &enc {
+                RegionEncoding::Raw => orig_sz,
+                RegionEncoding::Constant { .. } => elem_width,
+                RegionEncoding::TwoValue { bitvec, .. } => 16 + bitvec.len(),
+            };
+            encodings.push(enc);
+            actual_sizes.push(actual);
+        }
+    }
+
+    // --- Phase 2: XOR8 filter ---
+    let xor8_filter = if row_count > 0 && num_regions >= 2 {
+        let (pk_lo_ptr, pk_lo_sz) = regions[0];
+        let (pk_hi_ptr, pk_hi_sz) = regions[1];
+        if !pk_lo_ptr.is_null()
+            && !pk_hi_ptr.is_null()
+            && pk_lo_sz >= n * 8
+            && pk_hi_sz >= n * 8
+        {
+            let lo = unsafe { std::slice::from_raw_parts(pk_lo_ptr as *const u64, n) };
+            let hi = unsafe { std::slice::from_raw_parts(pk_hi_ptr as *const u64, n) };
+            xor8::build(lo, hi)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // --- Phase 3: compute offsets ---
+    let dir_size = num_regions * DIR_ENTRY_SIZE;
+    let dir_offset = HEADER_SIZE;
+    let mut pos = align64(dir_offset + dir_size);
+    let mut region_offsets = Vec::with_capacity(num_regions);
+    for i in 0..num_regions {
+        region_offsets.push(pos);
+        pos = align64(pos + actual_sizes[i]);
+    }
+    let data_end = if num_regions == 0 {
+        HEADER_SIZE
+    } else {
+        region_offsets[num_regions - 1] + actual_sizes[num_regions - 1]
+    };
+
+    let xor8_data = xor8_filter.as_ref().map(|f| xor8::serialize(f));
+    let xor8_offset = if xor8_data.is_some() { align64(data_end) } else { 0 };
+    let xor8_size = xor8_data.as_ref().map_or(0, |d| d.len());
+    let total_size = if xor8_data.is_some() {
+        xor8_offset + xor8_size
+    } else {
+        data_end
+    };
+
+    // --- Phase 4: build header + directory buffer ---
+    let hdr_dir_size = HEADER_SIZE + dir_size;
+    let mut hdr_buf = vec![0u8; hdr_dir_size];
+
+    for i in 0..num_regions {
+        let (src_ptr, orig_sz) = regions[i];
+        let cs = match &encodings[i] {
+            RegionEncoding::Raw => {
+                if actual_sizes[i] > 0 && !src_ptr.is_null() {
+                    xxh::checksum(unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) })
+                } else {
+                    0
+                }
+            }
+            RegionEncoding::Constant { .. } => {
+                let elem_width = actual_sizes[i];
+                xxh::checksum(unsafe { std::slice::from_raw_parts(src_ptr, elem_width) })
+            }
+            RegionEncoding::TwoValue { value_a, value_b, bitvec } => {
+                let mut tmp = Vec::with_capacity(16 + bitvec.len());
+                tmp.extend_from_slice(&value_a.to_le_bytes());
+                tmp.extend_from_slice(&value_b.to_le_bytes());
+                tmp.extend_from_slice(bitvec);
+                xxh::checksum(&tmp)
+            }
+        };
+
+        let d = dir_offset + i * DIR_ENTRY_SIZE;
+        write_u64_le(&mut hdr_buf, d, region_offsets[i] as u64);
+        write_u64_le(&mut hdr_buf, d + 8, actual_sizes[i] as u64);
+        write_u64_le(&mut hdr_buf, d + 16, cs);
+        let encoding_byte = match &encodings[i] {
+            RegionEncoding::Raw => ENCODING_RAW,
+            RegionEncoding::Constant { .. } => ENCODING_CONSTANT,
+            RegionEncoding::TwoValue { .. } => ENCODING_TWO_VALUE,
+        };
+        hdr_buf[d + 24] = encoding_byte;
+    }
+
+    write_u64_le(&mut hdr_buf, OFF_MAGIC, SHARD_MAGIC);
+    write_u64_le(&mut hdr_buf, OFF_VERSION, SHARD_VERSION);
+    write_u64_le(&mut hdr_buf, OFF_ROW_COUNT, row_count as u64);
+    write_u64_le(&mut hdr_buf, OFF_DIR_OFFSET, dir_offset as u64);
+    write_u64_le(&mut hdr_buf, OFF_TABLE_ID, table_id as u64);
+    write_u64_le(&mut hdr_buf, OFF_XOR8_OFFSET, xor8_offset as u64);
+    write_u64_le(&mut hdr_buf, OFF_XOR8_SIZE, xor8_size as u64);
+
+    // XOR8 filter data
+    if let Some(ref data) = xor8_data {
+        // Nothing to do here; written to file in phase 8
+        let _ = data;
+    }
+
+    // --- Phase 5-9: open file, pwrite regions, sync, rename ---
+    let base_bytes = basename.to_bytes();
+    let mut tmp_name_buf = Vec::with_capacity(base_bytes.len() + 5);
+    tmp_name_buf.extend_from_slice(base_bytes);
+    tmp_name_buf.extend_from_slice(b".tmp\0");
+    let tmp_name = tmp_name_buf.as_ptr() as *const libc::c_char;
+
+    unsafe {
+        let fd = libc::openat(
+            dirfd,
+            tmp_name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
+        if fd < 0 {
+            return -3;
+        }
+
+        if libc::ftruncate(fd, total_size as libc::off_t) < 0 {
+            libc::close(fd);
+            libc::unlinkat(dirfd, tmp_name, 0);
+            return -3;
+        }
+
+        // Phase 6: write header + directory
+        if pwrite_all(fd, &hdr_buf, 0) < 0 {
+            libc::close(fd);
+            libc::unlinkat(dirfd, tmp_name, 0);
+            return -3;
+        }
+
+        // Phase 7: write each region
+        for i in 0..num_regions {
+            let (src_ptr, orig_sz) = regions[i];
+            let r_off = region_offsets[i] as libc::off_t;
+
+            match &encodings[i] {
+                RegionEncoding::Raw => {
+                    if actual_sizes[i] > 0 && !src_ptr.is_null() {
+                        let src = std::slice::from_raw_parts(src_ptr, orig_sz);
+                        if pwrite_all(fd, src, r_off) < 0 {
+                            libc::close(fd);
+                            libc::unlinkat(dirfd, tmp_name, 0);
+                            return -3;
+                        }
+                    }
+                }
+                RegionEncoding::Constant { .. } => {
+                    let elem_width = actual_sizes[i];
+                    let src = std::slice::from_raw_parts(src_ptr, elem_width);
+                    if pwrite_all(fd, src, r_off) < 0 {
+                        libc::close(fd);
+                        libc::unlinkat(dirfd, tmp_name, 0);
+                        return -3;
+                    }
+                }
+                RegionEncoding::TwoValue { value_a, value_b, bitvec } => {
+                    let mut tmp = Vec::with_capacity(16 + bitvec.len());
+                    tmp.extend_from_slice(&value_a.to_le_bytes());
+                    tmp.extend_from_slice(&value_b.to_le_bytes());
+                    tmp.extend_from_slice(bitvec);
+                    if pwrite_all(fd, &tmp, r_off) < 0 {
+                        libc::close(fd);
+                        libc::unlinkat(dirfd, tmp_name, 0);
+                        return -3;
+                    }
+                }
+            }
+        }
+
+        // Phase 8: write XOR8 filter
+        if let Some(ref data) = xor8_data {
+            if pwrite_all(fd, data, xor8_offset as libc::off_t) < 0 {
+                libc::close(fd);
+                libc::unlinkat(dirfd, tmp_name, 0);
+                return -3;
+            }
+        }
+
+        // Phase 9: sync and rename
+        if durable {
+            if libc::fdatasync(fd) < 0 {
+                libc::close(fd);
+                libc::unlinkat(dirfd, tmp_name, 0);
+                return -3;
+            }
+        }
+
+        libc::close(fd);
+
+        if libc::renameat(dirfd, tmp_name, dirfd, basename.as_ptr()) < 0 {
+            libc::unlinkat(dirfd, tmp_name, 0);
+            return -3;
+        }
+    }
+
+    0
+}
+
 /// Write `image` atomically using openat/fdatasync/renameat.
 ///
 /// `dirfd`: directory fd for openat/renameat.  Use `libc::AT_FDCWD` (-100)
@@ -450,5 +704,89 @@ mod tests {
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 0);
         assert!(!shard.has_xor8());
+    }
+
+    /// Bug 3: write_shard_streaming roundtrip — multiple column types including STRING.
+    #[test]
+    fn test_write_shard_streaming_roundtrip() {
+        use crate::schema::type_code;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streaming.db");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        let row_count = 3u32;
+        let pk_lo: Vec<u64> = vec![10, 20, 30];
+        let pk_hi: Vec<u64> = vec![0, 0, 0];
+        let weights: Vec<i64> = vec![1, 1, 1];
+        let nulls: Vec<u64> = vec![0, 0, 0];
+        let vals: Vec<i64> = vec![100, 200, 300];
+        let blob: Vec<u8> = vec![];
+
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_lo.as_ptr() as *const u8, pk_lo.len() * 8),
+            (pk_hi.as_ptr() as *const u8, pk_hi.len() * 8),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (nulls.as_ptr() as *const u8, nulls.len() * 8),
+            (vals.as_ptr() as *const u8, vals.len() * 8),
+            (blob.as_ptr(), 0),
+        ];
+
+        let rc = write_shard_streaming(
+            libc::AT_FDCWD, &cpath, 42, row_count, &regions, true,
+        );
+        assert_eq!(rc, 0);
+
+        let schema = make_schema_desc(2, 0);
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        assert_eq!(shard.count, 3);
+        assert_eq!(shard.get_pk_lo(0), 10);
+        assert_eq!(shard.get_pk_lo(1), 20);
+        assert_eq!(shard.get_pk_lo(2), 30);
+        assert_eq!(shard.get_weight(0), 1);
+        assert_eq!(shard.get_weight(1), 1);
+        assert_eq!(shard.get_weight(2), 1);
+        assert!(shard.has_xor8());
+        assert!(shard.xor8_may_contain(10, 0));
+        assert!(shard.xor8_may_contain(20, 0));
+        assert!(shard.xor8_may_contain(30, 0));
+    }
+
+    /// Bug 3: streaming write with regions that trigger Constant encoding.
+    #[test]
+    fn test_write_shard_streaming_encodings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("streaming_enc.db");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        let row_count = 4u32;
+        let pk_lo: Vec<u64> = vec![1, 2, 3, 4];
+        let pk_hi: Vec<u64> = vec![0, 0, 0, 0]; // all-zero → Constant encoding
+        let weights: Vec<i64> = vec![1, 1, 1, 1]; // all-same → Constant encoding
+        let nulls: Vec<u64> = vec![0, 0, 0, 0];   // all-zero → Constant encoding
+        let vals: Vec<i64> = vec![42, 42, 42, 42]; // all-same → Constant encoding
+        let blob: Vec<u8> = vec![];
+
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pk_lo.as_ptr() as *const u8, pk_lo.len() * 8),
+            (pk_hi.as_ptr() as *const u8, pk_hi.len() * 8),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (nulls.as_ptr() as *const u8, nulls.len() * 8),
+            (vals.as_ptr() as *const u8, vals.len() * 8),
+            (blob.as_ptr(), 0),
+        ];
+
+        let rc = write_shard_streaming(
+            libc::AT_FDCWD, &cpath, 7, row_count, &regions, true,
+        );
+        assert_eq!(rc, 0);
+
+        let schema = make_schema_desc(2, 0);
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        assert_eq!(shard.count, 4);
+        for i in 0..4 {
+            assert_eq!(shard.get_pk_lo(i), (i + 1) as u64);
+            assert_eq!(shard.get_weight(i), 1);
+        }
     }
 }

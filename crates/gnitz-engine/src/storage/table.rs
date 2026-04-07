@@ -10,7 +10,6 @@ use std::sync::Arc;
 use super::columnar;
 use crate::schema::SchemaDescriptor;
 use super::memtable::{self, MemTable, OwnedBatch};
-use super::merge::MemBatch;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
@@ -380,7 +379,7 @@ impl Table {
             let (w, _) = self.memtable.lookup_pk(key_lo, key_hi);
             total_w = w;
         }
-        let (shard_w, shard_found) = self.scan_shards_for_pk(key_lo, key_hi);
+        let (shard_w, shard_candidates) = self.scan_shards_for_pk(key_lo, key_hi);
         total_w += shard_w;
 
         if total_w <= 0 {
@@ -392,26 +391,34 @@ impl Table {
         let mt_live = self.memtable.find_positive_payload_row(key_lo, key_hi);
         if mt_live {
             self.found_source = FoundSource::MemTable;
-        } else if let Some((ptr, idx)) = shard_found {
-            self.found_source = FoundSource::Shard(ptr, idx);
+        } else {
+            // Payload-aware shard fallback: check net weight per (PK, payload)
+            for &(ptr, idx) in &shard_candidates {
+                let shard_ref = unsafe { &*ptr };
+                let net_w = self.get_weight_for_row(key_lo, key_hi, shard_ref, idx);
+                if net_w > 0 {
+                    self.found_source = FoundSource::Shard(ptr, idx);
+                    break;
+                }
+            }
         }
 
         (total_w, true)
     }
 
     /// Get net weight for a specific (PK, payload) row.
-    pub fn get_weight_for_row(
+    pub fn get_weight_for_row<S: columnar::ColumnarSource>(
         &mut self,
         key_lo: u64,
         key_hi: u64,
-        ref_batch: &MemBatch,
+        ref_source: &S,
         ref_row: usize,
     ) -> i64 {
         let mut total_w: i64 = 0;
 
         // MemTable
         if self.memtable.may_contain_pk(key_lo, key_hi) {
-            total_w += self.memtable.find_weight_for_row(key_lo, key_hi, ref_batch, ref_row);
+            total_w += self.memtable.find_weight_for_row(key_lo, key_hi, ref_source, ref_row);
         }
 
         // Shards
@@ -423,7 +430,7 @@ impl Table {
                     break;
                 }
                 let ord = columnar::compare_rows(
-                    &self.schema, shard, idx, ref_batch, ref_row,
+                    &self.schema, shard, idx, ref_source, ref_row,
                 );
                 if ord == Ordering::Equal {
                     total_w += shard.get_weight(idx);
@@ -516,7 +523,7 @@ impl Table {
         let mut count = 0u32;
         let mut num_regions = 0u32;
         let mut blob_size = 0u64;
-        let mut offsets = vec![0u32; MAX_REGIONS];
+        let mut offsets = vec![0u64; MAX_REGIONS];
         let mut sizes = vec![0u32; MAX_REGIONS];
 
         loop {
@@ -636,9 +643,9 @@ impl Table {
         &self,
         key_lo: u64,
         key_hi: u64,
-    ) -> (i64, Option<(*const MappedShard, usize)>) {
+    ) -> (i64, Vec<(*const MappedShard, usize)>) {
         let mut total_w: i64 = 0;
-        let mut first_found: Option<(*const MappedShard, usize)> = None;
+        let mut candidates: Vec<(*const MappedShard, usize)> = Vec::new();
 
         self.shard_index.find_pk(key_lo, key_hi, &mut |shard_ptr, start_idx| {
             let shard = unsafe { &*shard_ptr };
@@ -648,14 +655,12 @@ impl Table {
                     break;
                 }
                 total_w += shard.get_weight(idx);
-                if first_found.is_none() {
-                    first_found = Some((shard_ptr, idx));
-                }
+                candidates.push((shard_ptr, idx));
                 idx += 1;
             }
         });
 
-        (total_w, first_found)
+        (total_w, candidates)
     }
 }
 
@@ -1001,5 +1006,41 @@ mod tests {
         let cursor = t.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
         assert_eq!(cursor.cursor.current_key_lo, 1, "cursor should start at PK=1 from flushed shard");
+    }
+
+    /// Bug 2: INSERT (PK=10, val=100) → flush → UPDATE delta → flush → retract_pk.
+    /// The shard fallback must pick the live payload (val=200), not the cancelled one.
+    #[test]
+    fn test_retract_pk_shard_fallback_multiple_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("retract_shard_fallback");
+        let schema = make_u64_i64_schema();
+
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 1000, 1 << 20, false,
+        ).unwrap();
+
+        // Batch 1: INSERT (PK=10, weight=+1, val=100)
+        let (ptrs1, sizes1, count1) = make_regions(&[(10, 1, 100)]);
+        t.ingest_batch_from_regions(&ptrs1, &sizes1, count1, 1).unwrap();
+        t.flush().unwrap();
+
+        // Batch 2: UPDATE delta — retract val=100, insert val=200
+        let (ptrs2, sizes2, count2) = make_regions(&[(10, -1, 100), (10, 1, 200)]);
+        t.ingest_batch_from_regions(&ptrs2, &sizes2, count2, 1).unwrap();
+        t.flush().unwrap();
+
+        // Both batches are now in shards, memtable is empty.
+        // retract_pk must find val=200 (net weight 1), not val=100 (net weight 0).
+        let (w, found) = t.retract_pk(10, 0);
+        assert_eq!(w, 1);
+        assert!(found);
+
+        let col_ptr = t.found_col_ptr(0, 8);
+        assert!(!col_ptr.is_null());
+        let val = i64::from_le_bytes(
+            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
+        );
+        assert_eq!(val, 200, "shard fallback must pick live payload (val=200), not cancelled (val=100)");
     }
 }

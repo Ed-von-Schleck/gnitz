@@ -144,7 +144,7 @@ fn open_and_merge(
 ) -> Result<(), i32> {
     let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
     for f in input_files {
-        match MappedShard::open(f, schema, false) {
+        match MappedShard::open(f, schema, true) {
             Ok(s) => shards.push(s),
             Err(e) => return Err(e),
         }
@@ -1086,6 +1086,123 @@ mod tests {
         assert_eq!(rows.len(), 2, "expected 2 rows, got {:?}", rows);
         assert_eq!(rows[0], (10, 1, 0, 300));
         assert_eq!(rows[1], (20, 1, 1, 400));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Bug 5: compact with checksums enabled (validate_checksums = true).
+    /// Regression test confirming valid data passes checksum validation.
+    #[test]
+    fn test_compact_with_checksums_enabled() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_checksums");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_test_schema();
+
+        let s1 = dir.join("s1.db");
+        write_test_shard(s1.to_str().unwrap(), &[1, 3, 5], &[1, 1, 1], &schema);
+        let s2 = dir.join("s2.db");
+        write_test_shard(s2.to_str().unwrap(), &[2, 4, 6], &[1, 1, 1], &schema);
+
+        let output = dir.join("merged.db");
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
+
+        let inputs = [cs1.as_c_str(), cs2.as_c_str()];
+        let rc = compact_shards(&inputs, &cout, &schema, 0);
+        assert_eq!(rc, 0, "compact with checksums enabled must succeed for valid data");
+
+        let merged = MappedShard::open(&cout, &schema, true).unwrap();
+        assert_eq!(merged.count, 6);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Bug 3: compact 10K+ rows across two shards. Validates the streaming
+    /// write path (write_shard_streaming) under compaction.
+    #[test]
+    fn test_compact_large_dataset() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_large");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_test_schema();
+
+        // Shard 1: odd keys 1..9999
+        let pks1: Vec<u64> = (0..5000).map(|i| i * 2 + 1).collect();
+        let weights1 = vec![1i64; 5000];
+        let s1 = dir.join("s1.db");
+        write_test_shard(s1.to_str().unwrap(), &pks1, &weights1, &schema);
+
+        // Shard 2: even keys 2..10000
+        let pks2: Vec<u64> = (1..=5000).map(|i| i * 2).collect();
+        let weights2 = vec![1i64; 5000];
+        let s2 = dir.join("s2.db");
+        write_test_shard(s2.to_str().unwrap(), &pks2, &weights2, &schema);
+
+        let output = dir.join("merged.db");
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
+
+        let inputs = [cs1.as_c_str(), cs2.as_c_str()];
+        let rc = compact_shards(&inputs, &cout, &schema, 0);
+        assert_eq!(rc, 0);
+
+        let merged = MappedShard::open(&cout, &schema, true).unwrap();
+        assert_eq!(merged.count, 10000);
+
+        // Verify sorted order
+        let mut prev = 0u128;
+        for i in 0..merged.count {
+            let pk = merged.get_pk(i);
+            assert!(pk > prev, "not sorted at row {}: {} <= {}", i, pk, prev);
+            prev = pk;
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Bug 1: merge_and_route with guard_keys=[(200,0)] and input data with
+    /// keys below 200. All keys must be routed to the single guard (index 0)
+    /// and be readable in the output.
+    #[test]
+    fn test_merge_and_route_keys_below_first_guard() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_below_guard");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_test_schema();
+
+        // Shard with keys 50, 100, 150, 250 — two are below guard key 200
+        let s1 = dir.join("s1.db");
+        write_test_shard(s1.to_str().unwrap(), &[50, 100, 150, 250], &[1, 1, 1, 1], &schema);
+
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let inputs = [cs1.as_c_str()];
+
+        let guard_keys = vec![(200u64, 0u64)]; // single guard at key 200
+        let mut results = vec![GuardResult::zeroed()];
+
+        let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 42, 2, 1, &mut results);
+        assert!(n > 0, "merge_and_route should produce output");
+
+        let fn0 = crate::util::cstr_from_buf(&results[0].filename);
+        let cpath = std::ffi::CString::new(fn0).unwrap();
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        assert_eq!(shard.count, 4, "all 4 keys must be present in output");
+
+        // Verify all keys readable
+        for &pk in &[50u64, 100, 150, 250] {
+            let idx = shard.find_row_index(pk, 0);
+            assert!(idx >= 0, "key {} not found in output shard", pk);
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

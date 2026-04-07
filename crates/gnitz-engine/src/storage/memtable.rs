@@ -53,9 +53,14 @@ fn relocate_string_cell(
     if is_long {
         let length = u32::from_le_bytes(src_struct[0..4].try_into().unwrap()) as usize;
         let old_off = u64::from_le_bytes(src_struct[8..16].try_into().unwrap()) as usize;
-        let new_off = dst_blob.len();
-        dst_blob.extend_from_slice(&src_blob[old_off..old_off + length]);
-        dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
+        if old_off.saturating_add(length) > src_blob.len() {
+            // Corrupted offset: emit a zero-length string
+            dest[0..4].copy_from_slice(&0u32.to_le_bytes());
+        } else {
+            let new_off = dst_blob.len();
+            dst_blob.extend_from_slice(&src_blob[old_off..old_off + length]);
+            dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
+        }
     }
     dst_col.extend_from_slice(&dest);
 }
@@ -737,18 +742,23 @@ impl OwnedBatch {
                 if is_long {
                     let length = u32::from_le_bytes(src_struct[0..4].try_into().unwrap()) as usize;
                     let old_offset = u64::from_le_bytes(src_struct[8..16].try_into().unwrap()) as usize;
-                    let src_data = &src_blob[old_offset..old_offset + length];
-                    let new_offset = self.blob.len();
-                    let off = match crate::schema::blob_cache_lookup(
-                        src_data, blob_cache, &self.blob, new_offset,
-                    ) {
-                        Some(cached) => cached,
-                        None => {
-                            self.blob.extend_from_slice(src_data);
-                            new_offset
-                        }
-                    };
-                    dest[8..16].copy_from_slice(&(off as u64).to_le_bytes());
+                    if old_offset.saturating_add(length) > src_blob.len() {
+                        // Corrupted offset: emit a zero-length string
+                        dest[0..4].copy_from_slice(&0u32.to_le_bytes());
+                    } else {
+                        let src_data = &src_blob[old_offset..old_offset + length];
+                        let new_offset = self.blob.len();
+                        let off = match crate::schema::blob_cache_lookup(
+                            src_data, blob_cache, &self.blob, new_offset,
+                        ) {
+                            Some(cached) => cached,
+                            None => {
+                                self.blob.extend_from_slice(src_data);
+                                new_offset
+                            }
+                        };
+                        dest[8..16].copy_from_slice(&(off as u64).to_le_bytes());
+                    }
                 }
                 self.col_data[pi].extend_from_slice(&dest);
             } else {
@@ -762,12 +772,11 @@ impl OwnedBatch {
         self.consolidated = false;
     }
 
-    /// Build a shard image from this batch's regions and write it atomically to disk.
+    /// Write this batch as a shard file directly to disk (streaming, no intermediate buffer).
     /// Returns 0 on success or a negative error code.
     pub fn write_as_shard(&self, path: &CStr, table_id: u32) -> i32 {
         let regions = self.regions();
-        let image = shard_file::build_shard_image(table_id, self.count as u32, &regions);
-        shard_file::write_shard_at(libc::AT_FDCWD, path, &image, true)
+        shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true)
     }
 }
 
@@ -1028,11 +1037,11 @@ impl MemTable {
     }
 
     /// Find the net weight for rows matching both PK and full payload.
-    pub fn find_weight_for_row(
+    pub fn find_weight_for_row<S: super::columnar::ColumnarSource>(
         &self,
         key_lo: u64,
         key_hi: u64,
-        ref_batch: &MemBatch,
+        ref_source: &S,
         ref_row: usize,
     ) -> i64 {
         let mut total_w: i64 = 0;
@@ -1041,7 +1050,7 @@ impl MemTable {
             let mut lo = run.find_lower_bound(key_lo, key_hi);
             while lo < run.count && run.get_pk_lo(lo) == key_lo && run.get_pk_hi(lo) == key_hi {
                 let ord = columnar::compare_rows(
-                    &self.schema, run, lo, ref_batch, ref_row,
+                    &self.schema, run, lo, ref_source, ref_row,
                 );
                 if ord == Ordering::Equal {
                     total_w += run.get_weight(lo);
@@ -1985,4 +1994,75 @@ mod tests {
         assert!(!mt.has_found);
     }
 
+    /// Bug 5: relocate_string_cell must not panic when blob offset is past end.
+    #[test]
+    fn test_relocate_string_cell_out_of_bounds() {
+        // Build a 16-byte German string struct for a long string (length > 12)
+        // with an out-of-bounds blob offset.
+        let length: u32 = 20;
+        let prefix = [b'A'; 4];
+        let bad_offset: u64 = 9999; // way past any blob
+        let mut src_struct = [0u8; 16];
+        src_struct[0..4].copy_from_slice(&length.to_le_bytes());
+        src_struct[4..8].copy_from_slice(&prefix);
+        src_struct[8..16].copy_from_slice(&bad_offset.to_le_bytes());
+
+        let src_blob: &[u8] = &[0u8; 10]; // only 10 bytes, offset 9999 is OOB
+        let mut dst_col = Vec::new();
+        let mut dst_blob = Vec::new();
+
+        // Must not panic
+        super::relocate_string_cell(&src_struct, src_blob, &mut dst_col, &mut dst_blob);
+
+        assert_eq!(dst_col.len(), 16, "should emit a 16-byte string struct");
+        // The corrupted string should have length set to 0
+        let out_len = u32::from_le_bytes(dst_col[0..4].try_into().unwrap());
+        assert_eq!(out_len, 0, "corrupted string should be zero-length");
+        assert!(dst_blob.is_empty(), "no blob data should have been copied");
+    }
+
+    /// Bug 5: append_row_from_source must not panic when blob offset is invalid.
+    #[test]
+    fn test_append_row_from_source_corrupted_blob() {
+        use crate::schema::{SchemaColumn, type_code};
+        use std::collections::HashMap;
+
+        // Schema: col0 = PK (U64), col1 = STRING
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn { type_code: type_code::STRING, size: 16, nullable: 0, _pad: 0 };
+        let schema = SchemaDescriptor { num_columns: 2, pk_index: 0, columns };
+
+        // Build a source OwnedBatch with a STRING column containing a bad blob offset.
+        let mut src = OwnedBatch::empty(1);
+        src.schema = Some(schema);
+        src.pk_lo.extend_from_slice(&42u64.to_le_bytes());
+        src.pk_hi.extend_from_slice(&0u64.to_le_bytes());
+        src.weight.extend_from_slice(&1i64.to_le_bytes());
+        src.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+
+        // German string struct: length=20, prefix="ABCD", offset=9999 (OOB)
+        let length: u32 = 20;
+        let prefix = [b'A', b'B', b'C', b'D'];
+        let bad_offset: u64 = 9999;
+        let mut str_struct = [0u8; 16];
+        str_struct[0..4].copy_from_slice(&length.to_le_bytes());
+        str_struct[4..8].copy_from_slice(&prefix);
+        str_struct[8..16].copy_from_slice(&bad_offset.to_le_bytes());
+        src.col_data[0].extend_from_slice(&str_struct);
+        src.blob = vec![0u8; 10]; // only 10 bytes
+        src.count = 1;
+
+        // Build destination batch and call append_row_from_source
+        let mut dst = OwnedBatch::with_schema(schema, 1);
+        let mut blob_cache: HashMap<(u64, usize), usize> = HashMap::new();
+
+        // Must not panic
+        dst.append_row_from_source(42u128, 1, &src, 0, &mut blob_cache);
+
+        assert_eq!(dst.count, 1);
+        // The corrupted string should have length 0
+        let out_len = u32::from_le_bytes(dst.col_data[0][0..4].try_into().unwrap());
+        assert_eq!(out_len, 0, "corrupted blob reference should produce zero-length string");
+    }
 }

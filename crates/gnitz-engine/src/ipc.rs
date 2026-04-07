@@ -330,7 +330,7 @@ fn decode_wal_block(data: &[u8], schema: &SchemaDescriptor) -> Result<OwnedBatch
     let mut count = 0u32;
     let mut num_regions = 0u32;
     let mut blob_size = 0u64;
-    let mut offsets = [0u32; 128];
+    let mut offsets = [0u64; 128];
     let mut sizes = [0u32; 128];
 
     let rc = wal::validate_and_parse(

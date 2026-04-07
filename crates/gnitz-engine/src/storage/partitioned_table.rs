@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::schema::SchemaDescriptor;
 use super::memtable::OwnedBatch;
-use super::merge::{self, MemBatch};
+use super::merge;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
 use super::table::{self, Table};
@@ -204,21 +204,21 @@ impl PartitionedTable {
         (w, found)
     }
 
-    pub fn get_weight_for_row(
+    pub fn get_weight_for_row<S: super::columnar::ColumnarSource>(
         &mut self,
         key_lo: u64,
         key_hi: u64,
-        ref_batch: &MemBatch,
+        ref_source: &S,
         ref_row: usize,
     ) -> i64 {
         if self.tables.is_empty() {
             return 0;
         }
         if self.num_partitions == 1 {
-            return self.tables[0].get_weight_for_row(key_lo, key_hi, ref_batch, ref_row);
+            return self.tables[0].get_weight_for_row(key_lo, key_hi, ref_source, ref_row);
         }
         match self.local_index(key_lo, key_hi) {
-            Some(local) => self.tables[local].get_weight_for_row(key_lo, key_hi, ref_batch, ref_row),
+            Some(local) => self.tables[local].get_weight_for_row(key_lo, key_hi, ref_source, ref_row),
             None => 0,
         }
     }

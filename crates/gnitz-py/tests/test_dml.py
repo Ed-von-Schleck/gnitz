@@ -550,3 +550,58 @@ class TestStringEdgeCases:
         finally:
             client.drop_table(sn, "strs")
             client.drop_schema(sn)
+
+
+@pytest.mark.slow
+class TestUpdateAcrossFlushBoundaries:
+    """Bug 2: INSERT → flush → UPDATE → flush → SELECT must return updated value.
+
+    Pushes enough filler rows to trigger memtable flushes so the original
+    INSERT ends up in a shard before the UPDATE delta arrives.
+    """
+
+    def test_update_across_flush_boundaries(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            # Insert target row + filler to trigger flush
+            client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            schema = gnitz.Schema([
+                gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64),
+            ])
+
+            # Push 100K filler rows to trigger memtable flush(es)
+            batch = gnitz.ZSetBatch(schema)
+            for i in range(1000, 101000):
+                batch.append(pk=i, val=i * 10)
+            client.push(tid, batch)
+
+            # UPDATE target row
+            res = client.execute_sql("UPDATE t SET val = 999 WHERE pk = 1", schema_name=sn)
+            assert res[0]["type"] == "RowsAffected"
+            assert res[0]["count"] == 1
+
+            # Push more filler to trigger another flush
+            batch2 = gnitz.ZSetBatch(schema)
+            for i in range(200000, 301000):
+                batch2.append(pk=i, val=i * 10)
+            client.push(tid, batch2)
+
+            # Verify updated value
+            rows = {r.pk: r for r in client.scan(tid) if r.weight > 0}
+            assert 1 in rows, "target PK=1 must exist"
+            assert rows[1].val == 999, (
+                f"expected val=999 after UPDATE, got val={rows[1].val}"
+            )
+        finally:
+            try:
+                client.execute_sql("DROP TABLE t", schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)
