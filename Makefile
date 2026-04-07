@@ -4,7 +4,7 @@ ALL_DATA_DIRS := storage_test_data \
 
 LOG_DIR := .test_logs
 
-.PHONY: all test clean rust-engine-test server release-server e2e e2e-release release-test
+.PHONY: all test clean rust-engine-test server release-server e2e e2e-release release-test bench bench-full bench-sweep bench-perf
 
 all: test
 
@@ -42,3 +42,19 @@ e2e-release: release-server
 
 release-test:
 	$(MAKE) test
+
+# ---------------------------------------------------------------------------
+# Benchmarks — SQL-level performance suite
+# ---------------------------------------------------------------------------
+
+bench: release-server
+	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --workers=1 --clients=1
+
+bench-full: release-server
+	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=4 --clients=1
+
+bench-sweep: release-server
+	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=1,2,4 --clients=1,2,4
+
+bench-perf: release-server
+	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=4 --clients=1 --perf --perf-stat
