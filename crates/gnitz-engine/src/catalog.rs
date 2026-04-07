@@ -257,6 +257,24 @@ impl BatchBuilder {
         self.curr_col += 1;
     }
 
+    /// Put a u8 value for the current payload column.
+    pub fn put_u8(&mut self, val: u8) {
+        self.batch.col_data[self.curr_col].push(val);
+        self.curr_col += 1;
+    }
+
+    /// Put a u16 value for the current payload column.
+    pub fn put_u16(&mut self, val: u16) {
+        self.batch.col_data[self.curr_col].extend_from_slice(&val.to_le_bytes());
+        self.curr_col += 1;
+    }
+
+    /// Put a u32 value for the current payload column.
+    pub fn put_u32(&mut self, val: u32) {
+        self.batch.col_data[self.curr_col].extend_from_slice(&val.to_le_bytes());
+        self.curr_col += 1;
+    }
+
     /// Put a NULL value for the current payload column.
     pub fn put_null(&mut self) {
         let col_size = self.schema.columns[self.physical_col_idx()].size as usize;
@@ -2965,6 +2983,15 @@ mod tests {
     fn i64_col_def(name: &str) -> ColumnDef {
         ColumnDef { name: name.into(), type_code: type_code::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
     }
+    fn u8_col_def(name: &str) -> ColumnDef {
+        ColumnDef { name: name.into(), type_code: type_code::U8, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
+    }
+    fn u16_col_def(name: &str) -> ColumnDef {
+        ColumnDef { name: name.into(), type_code: type_code::U16, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
+    }
+    fn i32_col_def(name: &str) -> ColumnDef {
+        ColumnDef { name: name.into(), type_code: type_code::I32, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
+    }
     fn str_col_def(name: &str) -> ColumnDef {
         ColumnDef { name: name.into(), type_code: type_code::STRING, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
     }
@@ -4408,6 +4435,118 @@ mod tests {
         // Seek by index: val=999 → should return None
         let result = engine.seek_by_index(tid, 1, 999, 0).unwrap();
         assert!(result.is_none());
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Regression: small-column index projection (bug #1) ────────────
+
+    #[test]
+    fn test_seek_by_index_u8_column() {
+        let dir = temp_dir("catalog_seekidx_u8");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u8_col_def("tag")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        engine.create_index("public.t", "tag", false).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(10, 0, 1); bb.put_u8(42); bb.end_row();
+        bb.begin_row(20, 0, 1); bb.put_u8(99); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        let result = engine.seek_by_index(tid, 1, 42, 0).unwrap();
+        assert!(result.is_some(), "U8 index lookup must find the row");
+        assert_eq!(result.unwrap().get_pk_lo(0), 10);
+
+        let result2 = engine.seek_by_index(tid, 1, 99, 0).unwrap();
+        assert!(result2.is_some());
+        assert_eq!(result2.unwrap().get_pk_lo(0), 20);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_seek_by_index_u16_column() {
+        let dir = temp_dir("catalog_seekidx_u16");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), u16_col_def("port")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        engine.create_index("public.t", "port", false).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u16(8080); bb.end_row();
+        bb.begin_row(2, 0, 1); bb.put_u16(443); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        let result = engine.seek_by_index(tid, 1, 443, 0).unwrap();
+        assert!(result.is_some(), "U16 index lookup must find the row");
+        assert_eq!(result.unwrap().get_pk_lo(0), 2);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Regression: signed key encoding consistency (bug #2) ────────────
+
+    #[test]
+    fn test_promote_to_index_key_matches_batch_project_for_signed() {
+        // promote_to_index_key (multi-worker path) must produce the same
+        // key as batch_project_index (storage path) for negative signed values.
+        use crate::schema::promote_to_index_key;
+
+        // I32 value -1 stored as little-endian 0xFFFFFFFF
+        let data: [u8; 4] = (-1i32).to_le_bytes();
+        let (lo, hi) = promote_to_index_key(&data, 0, 4, type_code::I32);
+
+        // batch_project_index reads u32::from_le_bytes() as u64 → 0x00000000FFFFFFFF
+        assert_eq!(lo, 0xFFFFFFFFu64, "I32 -1 must zero-extend, not sign-extend");
+        assert_eq!(hi, 0);
+
+        // I16 value -1 stored as little-endian 0xFFFF
+        let data16: [u8; 2] = (-1i16).to_le_bytes();
+        let (lo16, hi16) = promote_to_index_key(&data16, 0, 2, type_code::I16);
+        assert_eq!(lo16, 0xFFFFu64);
+        assert_eq!(hi16, 0);
+
+        // I8 value -1 stored as 0xFF
+        let data8: [u8; 1] = [0xFF];
+        let (lo8, hi8) = promote_to_index_key(&data8, 0, 1, type_code::I8);
+        assert_eq!(lo8, 0xFFu64);
+        assert_eq!(hi8, 0);
+    }
+
+    #[test]
+    fn test_seek_by_index_i32_negative_value() {
+        let dir = temp_dir("catalog_seekidx_i32_neg");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![u64_col_def("id"), i32_col_def("temp")];
+        let tid = engine.create_table("public.t", &cols, 0, false).unwrap();
+        engine.create_index("public.t", "temp", false).unwrap();
+        let schema = engine.get_schema(tid).unwrap();
+
+        // Insert a row with a negative I32 value
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(1, 0, 1); bb.put_u32((-5i32) as u32); bb.end_row();
+        bb.begin_row(2, 0, 1); bb.put_u32(10u32); bb.end_row();
+        engine.ingest_to_family(tid, bb.finish()).unwrap();
+        engine.flush_family(tid).unwrap();
+
+        // Seek negative value: key = zero-extended u32 representation of -5
+        let neg5_key = (-5i32) as u32 as u64;
+        let result = engine.seek_by_index(tid, 1, neg5_key, 0).unwrap();
+        assert!(result.is_some(), "I32 negative index lookup must find the row");
+        assert_eq!(result.unwrap().get_pk_lo(0), 1);
+
+        // Seek positive value
+        let result2 = engine.seek_by_index(tid, 1, 10, 0).unwrap();
+        assert!(result2.is_some());
+        assert_eq!(result2.unwrap().get_pk_lo(0), 2);
 
         engine.close();
         let _ = fs::remove_dir_all(&dir);
