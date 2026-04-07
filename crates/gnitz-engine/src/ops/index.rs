@@ -251,8 +251,9 @@ pub fn op_integrate_with_indexes(
             }
 
             let gc_u64 = promote_col_to_u64(&mb, row, gi_col, pki, gi_desc.col_type_code);
-            let source_pk_lo = mb.get_pk_lo(row);
-            let source_pk_hi = mb.get_pk_hi(row);
+            let source_pk = mb.get_pk(row);
+            let source_pk_lo = source_pk as u64;
+            let source_pk_hi = (source_pk >> 64) as u64;
             let weight = mb.get_weight(row);
 
             // Composite key: ck_lo = source_pk_lo, ck_hi = gc_u64

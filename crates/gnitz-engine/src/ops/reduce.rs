@@ -471,7 +471,7 @@ fn apply_agg_from_value_index(
     agg_col_type_code: u8,
     acc: &mut Accumulator,
 ) -> bool {
-    avi_cursor.seek(0, gc_u64);
+    avi_cursor.seek(crate::util::make_pk(0, gc_u64));
     gnitz_debug!("avi_lookup: seek(0, {:#x}) valid={}", gc_u64, avi_cursor.valid);
     while avi_cursor.valid {
         let k_hi = avi_cursor.current_key_hi;
@@ -599,7 +599,8 @@ pub fn op_reduce(
         let group_start_idx = sorted_indices[group_start_pos] as usize;
 
         let (group_key_lo, group_key_hi) = if group_by_pk {
-            (mb.get_pk_lo(group_start_idx), mb.get_pk_hi(group_start_idx))
+            let pk = mb.get_pk(group_start_idx);
+            (pk as u64, (pk >> 64) as u64)
         } else {
             extract_group_key(&mb, group_start_idx, input_schema, group_by_cols)
         };
@@ -611,9 +612,8 @@ pub fn op_reduce(
         while idx < n {
             let curr_idx = sorted_indices[idx] as usize;
             if group_by_pk {
-                if mb.get_pk_lo(curr_idx) != group_key_lo
-                    || mb.get_pk_hi(curr_idx) != group_key_hi
-                {
+                let curr_pk = mb.get_pk(curr_idx);
+                if curr_pk != crate::util::make_pk(group_key_lo, group_key_hi) {
                     break;
                 }
             } else {
@@ -634,7 +634,7 @@ pub fn op_reduce(
         }
 
         // Retraction: read old value from trace_out
-        trace_out_cursor.seek(group_key_lo, group_key_hi);
+        trace_out_cursor.seek(crate::util::make_pk(group_key_lo, group_key_hi));
         let has_old = trace_out_cursor.valid
             && trace_out_cursor.current_key_lo == group_key_lo
             && trace_out_cursor.current_key_hi == group_key_hi;
@@ -694,7 +694,7 @@ pub fn op_reduce(
 
                 if let Some(ref mut ti_cursor) = trace_in {
                     if group_by_pk {
-                        ti_cursor.seek(group_key_lo, group_key_hi);
+                        ti_cursor.seek(crate::util::make_pk(group_key_lo, group_key_hi));
                         while ti_cursor.valid
                             && ti_cursor.current_key_lo == group_key_lo
                             && ti_cursor.current_key_hi == group_key_hi
@@ -709,7 +709,7 @@ pub fn op_reduce(
                         let pi = if gi_ci < pki { gi_ci } else { gi_ci - 1 };
                         let ptr = mb.get_col_ptr(group_start_idx, pi, 8);
                         let gc_u64_val = u64::from_le_bytes(ptr.try_into().unwrap());
-                        gi_c.seek(0, gc_u64_val);
+                        gi_c.seek(crate::util::make_pk(0, gc_u64_val));
                         while gi_c.valid {
                             let gk_hi = gi_c.current_key_hi;
                             if gk_hi != gc_u64_val {
@@ -726,7 +726,7 @@ pub fn op_reduce(
                                     0
                                 };
                                 if let Some(ref mut ti) = trace_in {
-                                    ti.seek(spk_lo, spk_hi);
+                                    ti.seek(crate::util::make_pk(spk_lo, spk_hi));
                                     while ti.valid
                                         && ti.current_key_lo == spk_lo
                                         && ti.current_key_hi == spk_hi
@@ -740,7 +740,7 @@ pub fn op_reduce(
                         }
                     } else {
                         // Fallback: full trace scan
-                        ti_cursor.seek(0, 0);
+                        ti_cursor.seek(0u128);
                         let ti_mb_exemplar_row = group_start_idx;
                         while ti_cursor.valid {
                             // Compare group columns between cursor row and exemplar
@@ -994,7 +994,8 @@ fn emit_finalized_row(
                 OutCol::CopyCol(src_col) => {
                     if src_col == raw_pki {
                         // Source is the PK column — read from pk_lo
-                        let pk_lo = raw_mb.get_pk_lo(raw_row);
+                        let pk = raw_mb.get_pk(raw_row);
+                        let pk_lo = pk as u64;
                         fin_output.col_data[fpi].extend_from_slice(&pk_lo.to_le_bytes()[..cs]);
                     } else {
                         let src_pi = payload_idx(src_col, raw_pki);
@@ -1049,8 +1050,9 @@ fn append_membatch_row_to_batch(
     schema: &SchemaDescriptor,
 ) {
     let pki = schema.pk_index as usize;
-    output.pk_lo.extend_from_slice(&mb.get_pk_lo(row).to_le_bytes());
-    output.pk_hi.extend_from_slice(&mb.get_pk_hi(row).to_le_bytes());
+    let pk = mb.get_pk(row);
+    output.pk_lo.extend_from_slice(&(pk as u64).to_le_bytes());
+    output.pk_hi.extend_from_slice(&((pk >> 64) as u64).to_le_bytes());
     output.weight.extend_from_slice(&mb.get_weight(row).to_le_bytes());
     let null_word = mb.get_null_word(row);
     output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
@@ -1153,10 +1155,13 @@ pub fn op_gather_reduce(
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(Accumulator::new).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
 
+    let smb_pks: Vec<u128> = (0..n).map(|i| smb.get_pk(i)).collect();
+
     let mut idx = 0usize;
     while idx < n {
-        let group_key_lo = smb.get_pk_lo(idx);
-        let group_key_hi = smb.get_pk_hi(idx);
+        let group_pk = smb_pks[idx];
+        let group_key_lo = group_pk as u64;
+        let group_key_hi = (group_pk >> 64) as u64;
         let exemplar_row = idx;
 
         for acc in accs.iter_mut() {
@@ -1164,9 +1169,7 @@ pub fn op_gather_reduce(
         }
 
         // Accumulate all partial deltas for this group
-        while idx < n
-            && smb.get_pk_lo(idx) == group_key_lo
-            && smb.get_pk_hi(idx) == group_key_hi
+        while idx < n && smb_pks[idx] == group_pk
         {
             let w = smb.get_weight(idx);
             for k in 0..num_aggs {
@@ -1184,7 +1187,7 @@ pub fn op_gather_reduce(
         }
 
         // Read old global from trace_out
-        trace_out_cursor.seek(group_key_lo, group_key_hi);
+        trace_out_cursor.seek(group_pk);
         let has_old = trace_out_cursor.valid
             && trace_out_cursor.current_key_lo == group_key_lo
             && trace_out_cursor.current_key_hi == group_key_hi;

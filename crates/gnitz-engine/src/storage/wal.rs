@@ -301,6 +301,7 @@ impl WalReader {
         self.ptr as *const u8
     }
 
+    #[cfg(test)]
     pub fn file_size(&self) -> usize {
         self.file_size
     }

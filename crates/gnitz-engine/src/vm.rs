@@ -781,7 +781,7 @@ pub fn execute_epoch(
                     let key_lo = u64::from_le_bytes(kb.pk_lo[..8].try_into().unwrap());
                     let key_hi = u64::from_le_bytes(kb.pk_hi[..8].try_into().unwrap());
                     if let Some(cursor) = cursor_mut!(*trace_reg) {
-                        cursor.seek(key_lo, key_hi);
+                        cursor.seek(crate::util::make_pk(key_lo, key_hi));
                     }
                 }
             }

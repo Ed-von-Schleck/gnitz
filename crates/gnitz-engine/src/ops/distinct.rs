@@ -32,19 +32,18 @@ pub fn op_distinct(
     let mut emit_weights: Vec<i64> = Vec::with_capacity(n);
 
     let consolidated_mb = consolidated.as_mem_batch();
-    let mut prev_lo = u64::MAX;
-    let mut prev_hi = u64::MAX;
+    let mut prev_key = u128::MAX;
 
     for i in 0..n {
-        let key_lo = consolidated.get_pk_lo(i);
-        let key_hi = consolidated.get_pk_hi(i);
+        let key = consolidated.get_pk(i);
+        let key_lo = key as u64;
+        let key_hi = (key >> 64) as u64;
         let w_delta = consolidated.get_weight(i);
 
-        if key_lo != prev_lo || key_hi != prev_hi {
-            cursor.seek(key_lo, key_hi);
+        if key != prev_key {
+            cursor.seek(key);
         }
-        prev_lo = key_lo;
-        prev_hi = key_hi;
+        prev_key = key;
 
         let w_old: i64 = loop {
             if !cursor.valid
@@ -165,7 +164,7 @@ mod tests {
         // pk=1: 3→1, positive→positive, no change
         // pk=2: 1→0, positive→non-positive, emit -1
         assert_eq!(out2.count, 1);
-        assert_eq!(out2.get_pk_lo(0), 2);
+        assert_eq!((out2.get_pk(0) as u64), 2);
         assert_eq!(out2.get_weight(0), -1);
     }
 

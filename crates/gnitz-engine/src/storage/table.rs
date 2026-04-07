@@ -353,13 +353,13 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// Check if a PK exists with positive net weight.
-    pub fn has_pk(&mut self, key_lo: u64, key_hi: u64) -> bool {
+    pub fn has_pk(&mut self, key: u128) -> bool {
         let mut total_w: i64 = 0;
-        if self.memtable.may_contain_pk(key_lo, key_hi) {
-            let (w, _) = self.memtable.lookup_pk(key_lo, key_hi);
+        if self.memtable.may_contain_pk(key) {
+            let (w, _) = self.memtable.lookup_pk(key);
             total_w = w;
         }
-        let (shard_w, _) = self.scan_shards_for_pk(key_lo, key_hi);
+        let (shard_w, _) = self.scan_shards_for_pk(key);
         total_w += shard_w;
         total_w > 0
     }
@@ -370,16 +370,16 @@ impl Table {
     /// Uses `find_positive_payload_row` so that after an UPDATE (which leaves
     /// old-payload rows with net weight 0 in the memtable), the found row is
     /// the live (PK, new_payload) entry, not the cancelled old one.
-    pub fn retract_pk(&mut self, key_lo: u64, key_hi: u64) -> (i64, bool) {
+    pub fn retract_pk(&mut self, key: u128) -> (i64, bool) {
         let mut total_w: i64 = 0;
         self.found_source = FoundSource::None;
 
         // Step 1: compute total weight (PK-only sum is correct for existence check).
-        if self.memtable.may_contain_pk(key_lo, key_hi) {
-            let (w, _) = self.memtable.lookup_pk(key_lo, key_hi);
+        if self.memtable.may_contain_pk(key) {
+            let (w, _) = self.memtable.lookup_pk(key);
             total_w = w;
         }
-        let (shard_w, shard_candidates) = self.scan_shards_for_pk(key_lo, key_hi);
+        let (shard_w, shard_candidates) = self.scan_shards_for_pk(key);
         total_w += shard_w;
 
         if total_w <= 0 {
@@ -388,14 +388,14 @@ impl Table {
 
         // Step 2: find the specific live (PK, payload) row by checking net weight
         // per distinct payload — skips cancelled rows whose net weight is 0.
-        let mt_live = self.memtable.find_positive_payload_row(key_lo, key_hi);
+        let mt_live = self.memtable.find_positive_payload_row(key);
         if mt_live {
             self.found_source = FoundSource::MemTable;
         } else {
             // Payload-aware shard fallback: check net weight per (PK, payload)
             for &(ptr, idx) in &shard_candidates {
                 let shard_ref = unsafe { &*ptr };
-                let net_w = self.get_weight_for_row(key_lo, key_hi, shard_ref, idx);
+                let net_w = self.get_weight_for_row(key, shard_ref, idx);
                 if net_w > 0 {
                     self.found_source = FoundSource::Shard(ptr, idx);
                     break;
@@ -409,24 +409,23 @@ impl Table {
     /// Get net weight for a specific (PK, payload) row.
     pub fn get_weight_for_row<S: columnar::ColumnarSource>(
         &mut self,
-        key_lo: u64,
-        key_hi: u64,
+        key: u128,
         ref_source: &S,
         ref_row: usize,
     ) -> i64 {
         let mut total_w: i64 = 0;
 
         // MemTable
-        if self.memtable.may_contain_pk(key_lo, key_hi) {
-            total_w += self.memtable.find_weight_for_row(key_lo, key_hi, ref_source, ref_row);
+        if self.memtable.may_contain_pk(key) {
+            total_w += self.memtable.find_weight_for_row(key, ref_source, ref_row);
         }
 
         // Shards
-        self.shard_index.find_pk(key_lo, key_hi, &mut |shard_ptr, start_idx| {
+        self.shard_index.find_pk(key, &mut |shard_ptr, start_idx| {
             let shard = unsafe { &*shard_ptr };
             let mut idx = start_idx;
             while idx < shard.count {
-                if shard.get_pk_lo(idx) != key_lo || shard.get_pk_hi(idx) != key_hi {
+                if shard.get_pk(idx) != key {
                     break;
                 }
                 let ord = columnar::compare_rows(
@@ -576,8 +575,8 @@ impl Table {
     // Accumulator support (delegated to MemTable)
     // ------------------------------------------------------------------
 
-    pub fn bloom_add(&mut self, key_lo: u64, key_hi: u64) {
-        self.memtable.bloom_add(key_lo, key_hi);
+    pub fn bloom_add(&mut self, key: u128) {
+        self.memtable.bloom_add(key);
     }
 
     pub fn memtable_should_flush(&self) -> bool {
@@ -641,17 +640,16 @@ impl Table {
 
     fn scan_shards_for_pk(
         &self,
-        key_lo: u64,
-        key_hi: u64,
+        key: u128,
     ) -> (i64, Vec<(*const MappedShard, usize)>) {
         let mut total_w: i64 = 0;
         let mut candidates: Vec<(*const MappedShard, usize)> = Vec::new();
 
-        self.shard_index.find_pk(key_lo, key_hi, &mut |shard_ptr, start_idx| {
+        self.shard_index.find_pk(key, &mut |shard_ptr, start_idx| {
             let shard = unsafe { &*shard_ptr };
             let mut idx = start_idx;
             while idx < shard.count {
-                if shard.get_pk_lo(idx) != key_lo || shard.get_pk_hi(idx) != key_hi {
+                if shard.get_pk(idx) != key {
                     break;
                 }
                 total_w += shard.get_weight(idx);
@@ -772,15 +770,15 @@ mod tests {
         let (ptrs, sizes, count) = make_regions(&[(10, 1, 100), (20, 1, 200)]);
         t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
 
-        assert!(t.has_pk(10, 0));
-        assert!(t.has_pk(20, 0));
-        assert!(!t.has_pk(99, 0));
+        assert!(t.has_pk(10));
+        assert!(t.has_pk(20));
+        assert!(!t.has_pk(99));
 
         t.flush().unwrap();
 
         // After flush, data is in shards
-        assert!(t.has_pk(10, 0));
-        assert!(t.has_pk(20, 0));
+        assert!(t.has_pk(10));
+        assert!(t.has_pk(20));
 
         t.close();
     }
@@ -799,7 +797,7 @@ mod tests {
         t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
         t.flush().unwrap();
 
-        assert!(t.has_pk(10, 0));
+        assert!(t.has_pk(10));
         t.close();
 
         // Re-open and recover
@@ -808,8 +806,8 @@ mod tests {
         ).unwrap();
 
         // Data should be in shards via manifest
-        assert!(t2.has_pk(10, 0));
-        assert!(t2.has_pk(20, 0));
+        assert!(t2.has_pk(10));
+        assert!(t2.has_pk(20));
         t2.close();
     }
 
@@ -845,13 +843,13 @@ mod tests {
         let (ptrs, sizes, count) = make_regions(&[(10, 1, 100), (20, 1, 200)]);
         t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
 
-        let (w, found) = t.retract_pk(10, 0);
+        let (w, found) = t.retract_pk(10);
         assert_eq!(w, 1);
         assert!(found);
         assert_ne!(t.found_null_word(), u64::MAX); // should return valid null word
         assert!(!t.found_col_ptr(0, 8).is_null()); // payload column accessible
 
-        let (w, found) = t.retract_pk(99, 0);
+        let (w, found) = t.retract_pk(99);
         assert_eq!(w, 0);
         assert!(!found);
     }
@@ -877,7 +875,7 @@ mod tests {
 
         // All data should still be accessible
         for i in 0..6u64 {
-            assert!(t.has_pk(i * 10, 0));
+            assert!(t.has_pk((i * 10) as u128));
         }
     }
 
@@ -904,7 +902,7 @@ mod tests {
         t.ingest_batch_from_regions(&ptrs2, &sizes2, count2, 1).unwrap();
 
         // Net state: val=100 has weight 0 (cancelled), val=200 has weight 1
-        let (w, found) = t.retract_pk(10, 0);
+        let (w, found) = t.retract_pk(10);
         assert_eq!(w, 1);
         assert!(found);
 
@@ -1032,7 +1030,7 @@ mod tests {
 
         // Both batches are now in shards, memtable is empty.
         // retract_pk must find val=200 (net weight 1), not val=100 (net weight 0).
-        let (w, found) = t.retract_pk(10, 0);
+        let (w, found) = t.retract_pk(10);
         assert_eq!(w, 1);
         assert!(found);
 

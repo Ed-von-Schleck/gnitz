@@ -924,15 +924,14 @@ pub struct SalMessage<'a> {
 pub struct SalReader {
     ptr: *const u8,
     worker_id: u32,
-    mmap_size: usize,
     m2w_efd: i32,
 }
 
 unsafe impl Send for SalReader {}
 
 impl SalReader {
-    pub fn new(ptr: *const u8, worker_id: u32, mmap_size: usize, m2w_efd: i32) -> Self {
-        SalReader { ptr, worker_id, mmap_size, m2w_efd }
+    pub fn new(ptr: *const u8, worker_id: u32, _mmap_size: usize, m2w_efd: i32) -> Self {
+        SalReader { ptr, worker_id, m2w_efd }
     }
 
     /// Read next group at `cursor`. Returns None if no message (payload_size==0).

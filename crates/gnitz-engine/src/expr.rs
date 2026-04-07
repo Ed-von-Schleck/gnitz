@@ -171,7 +171,7 @@ fn bits_to_float(bits: i64) -> f64 {
 #[inline]
 fn read_col_int(batch: &MemBatch, row: usize, col_idx: usize, pk_index: usize) -> i64 {
     if col_idx == pk_index {
-        batch.get_pk_lo(row) as i64
+        batch.get_pk(row) as i64
     } else {
         let pi = if col_idx < pk_index { col_idx } else { col_idx - 1 };
         // Read as i64 from the payload column (always 8 bytes for int types)

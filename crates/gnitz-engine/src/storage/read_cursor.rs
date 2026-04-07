@@ -33,24 +33,11 @@ impl<'a> CursorSource<'a> {
     }
 
     #[inline]
-    fn get_pk_lo(&self, row: usize) -> u64 {
-        match self {
-            CursorSource::Batch(b) => b.get_pk_lo(row),
-            CursorSource::Shard(s) => unsafe { (**s).get_pk_lo(row) },
-        }
-    }
-
-    #[inline]
-    fn get_pk_hi(&self, row: usize) -> u64 {
-        match self {
-            CursorSource::Batch(b) => b.get_pk_hi(row),
-            CursorSource::Shard(s) => unsafe { (**s).get_pk_hi(row) },
-        }
-    }
-
-    #[inline]
     fn get_pk(&self, row: usize) -> u128 {
-        crate::util::make_pk(self.get_pk_lo(row), self.get_pk_hi(row))
+        match self {
+            CursorSource::Batch(b) => b.get_pk(row),
+            CursorSource::Shard(s) => unsafe { (**s).get_pk(row) },
+        }
     }
 
     #[inline]
@@ -99,10 +86,10 @@ impl<'a> CursorSource<'a> {
         }
     }
 
-    fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
+    fn find_lower_bound(&self, key: u128) -> usize {
         match self {
-            CursorSource::Batch(b) => b.find_lower_bound(key_lo, key_hi),
-            CursorSource::Shard(s) => unsafe { (**s).find_lower_bound(key_lo, key_hi) },
+            CursorSource::Batch(b) => b.find_lower_bound(key),
+            CursorSource::Shard(s) => unsafe { (**s).find_lower_bound(key) },
         }
     }
 }
@@ -191,8 +178,8 @@ impl<'a> ReadCursorEntry<'a> {
         }
     }
 
-    fn seek(&mut self, key_lo: u64, key_hi: u64) {
-        self.position = self.source.find_lower_bound(key_lo, key_hi);
+    fn seek(&mut self, key: u128) {
+        self.position = self.source.find_lower_bound(key);
         if self.is_shard {
             self.skip_ghosts();
         }
@@ -293,9 +280,9 @@ impl<'a> ReadCursor<'a> {
         cursor
     }
 
-    pub fn seek(&mut self, key_lo: u64, key_hi: u64) {
+    pub fn seek(&mut self, key: u128) {
         for e in &mut self.entries {
-            e.seek(key_lo, key_hi);
+            e.seek(key);
         }
         if self.tree.is_some() {
             self.tree = Some(Self::build_tree(&self.entries, &self.schema));
@@ -340,8 +327,9 @@ impl<'a> ReadCursor<'a> {
             if e.is_valid() {
                 let pos = e.position;
                 self.valid = true;
-                self.current_key_lo = e.source.get_pk_lo(pos);
-                self.current_key_hi = e.source.get_pk_hi(pos);
+                let pk = e.source.get_pk(pos);
+                self.current_key_lo = pk as u64;
+                self.current_key_hi = (pk >> 64) as u64;
                 self.current_weight = e.source.get_weight(pos);
                 self.current_null_word = e.source.get_null_word(pos);
                 self.current_entry_idx = 0;
@@ -379,8 +367,9 @@ impl<'a> ReadCursor<'a> {
                 let exemplar = tree.min_indices[0];
                 let pos = self.entries[exemplar].position;
                 self.valid = true;
-                self.current_key_lo = self.entries[exemplar].source.get_pk_lo(pos);
-                self.current_key_hi = self.entries[exemplar].source.get_pk_hi(pos);
+                let pk = self.entries[exemplar].source.get_pk(pos);
+                self.current_key_lo = pk as u64;
+                self.current_key_hi = (pk >> 64) as u64;
                 self.current_weight = net_weight;
                 self.current_null_word = self.entries[exemplar].source.get_null_word(pos);
                 self.current_entry_idx = exemplar;
@@ -795,17 +784,17 @@ mod tests {
         let mut cursor = ReadCursor::new(entries, schema);
 
         // Seek to pk >= 5
-        cursor.seek(5, 0);
+        cursor.seek(5);
         assert!(cursor.valid);
         assert_eq!(cursor.current_key_lo, 5);
 
         // Seek to pk >= 7 → lands on 10
-        cursor.seek(7, 0);
+        cursor.seek(7);
         assert!(cursor.valid);
         assert_eq!(cursor.current_key_lo, 10);
 
         // Seek past end
-        cursor.seek(100, 0);
+        cursor.seek(100);
         assert!(!cursor.valid);
     }
 

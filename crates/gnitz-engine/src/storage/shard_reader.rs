@@ -277,7 +277,7 @@ impl MappedShard {
     }
 
     #[inline]
-    pub fn get_pk_lo(&self, row: usize) -> u64 {
+    fn get_pk_lo(&self, row: usize) -> u64 {
         match &self.pk_lo {
             RegionView::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
             RegionView::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
@@ -286,7 +286,7 @@ impl MappedShard {
     }
 
     #[inline]
-    pub fn get_pk_hi(&self, row: usize) -> u64 {
+    fn get_pk_hi(&self, row: usize) -> u64 {
         match &self.pk_hi {
             RegionView::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
             RegionView::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
@@ -389,23 +389,21 @@ impl MappedShard {
         self.xor8_filter.is_some()
     }
 
-    pub fn xor8_may_contain(&self, key_lo: u64, key_hi: u64) -> bool {
+    pub fn xor8_may_contain(&self, key: u128) -> bool {
         match &self.xor8_filter {
-            Some(filter) => xor8::may_contain(filter, key_lo, key_hi),
+            Some(filter) => xor8::may_contain(filter, key),
             None => true,
         }
     }
 
-    /// Binary search for the first row where PK >= (key_lo, key_hi).
+    /// Binary search for the first row where PK >= key.
     /// Returns `count` if no such row exists.
-    pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
+    pub fn find_lower_bound(&self, key: u128) -> usize {
         let mut lo = 0usize;
         let mut hi = self.count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let mid_lo = self.get_pk_lo(mid);
-            let mid_hi = self.get_pk_hi(mid);
-            if pk_lt(mid_lo, mid_hi, key_lo, key_hi) {
+            if self.get_pk(mid) < key {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -415,22 +413,13 @@ impl MappedShard {
     }
 
     /// Binary search for an exact PK match. Returns row index or -1.
-    pub fn find_row_index(&self, key_lo: u64, key_hi: u64) -> i32 {
-        let idx = self.find_lower_bound(key_lo, key_hi);
-        if idx < self.count {
-            let found_lo = self.get_pk_lo(idx);
-            let found_hi = self.get_pk_hi(idx);
-            if found_lo == key_lo && found_hi == key_hi {
-                return idx as i32;
-            }
+    pub fn find_row_index(&self, key: u128) -> i32 {
+        let idx = self.find_lower_bound(key);
+        if idx < self.count && self.get_pk(idx) == key {
+            return idx as i32;
         }
         -1
     }
-}
-
-#[inline]
-fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
-    (a_hi, a_lo) < (b_hi, b_lo)
 }
 
 impl super::columnar::ColumnarSource for MappedShard {
@@ -604,9 +593,8 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         assert_eq!(shard.count, 10);
-        assert_eq!(shard.get_pk_lo(0), 1);
-        assert_eq!(shard.get_pk_lo(9), 10);
-        assert_eq!(shard.get_pk_hi(0), 0);
+        assert_eq!(shard.get_pk(0), 1);
+        assert_eq!(shard.get_pk(9), 10);
         assert_eq!(shard.get_weight(0), 1);
         assert!(!shard.has_ghosts);
     }
@@ -622,16 +610,16 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
 
-        assert_eq!(shard.find_row_index(10, 0), 4);
-        assert_eq!(shard.find_row_index(200, 0), 99);
+        assert_eq!(shard.find_row_index(10), 4);
+        assert_eq!(shard.find_row_index(200), 99);
 
-        assert_eq!(shard.find_row_index(3, 0), -1);
-        assert_eq!(shard.find_row_index(0, 0), -1);
-        assert_eq!(shard.find_row_index(201, 0), -1);
+        assert_eq!(shard.find_row_index(3), -1);
+        assert_eq!(shard.find_row_index(0), -1);
+        assert_eq!(shard.find_row_index(201), -1);
 
-        assert_eq!(shard.find_lower_bound(3, 0), 1);
-        assert_eq!(shard.find_lower_bound(1, 0), 0);
-        assert_eq!(shard.find_lower_bound(201, 0), 100);
+        assert_eq!(shard.find_lower_bound(3), 1);
+        assert_eq!(shard.find_lower_bound(1), 0);
+        assert_eq!(shard.find_lower_bound(201), 100);
     }
 
     #[test]
@@ -690,8 +678,8 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         assert_eq!(shard.count, 0);
-        assert_eq!(shard.find_row_index(1, 0), -1);
-        assert_eq!(shard.find_lower_bound(1, 0), 0);
+        assert_eq!(shard.find_row_index(1), -1);
+        assert_eq!(shard.find_lower_bound(1), 0);
     }
 
     // --- v4 encoding tests ---
@@ -774,13 +762,13 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         for i in 0..n as usize {
-            assert_eq!(shard.get_pk_hi(i), 0);
+            assert_eq!(shard.get_pk(i), (i + 1) as u128);
         }
         // Binary search still works
-        assert_eq!(shard.find_row_index(64, 0), 63);
-        assert_eq!(shard.find_row_index(1, 0), 0);
-        assert_eq!(shard.find_row_index(128, 0), 127);
-        assert_eq!(shard.find_lower_bound(65, 0), 64);
+        assert_eq!(shard.find_row_index(64), 63);
+        assert_eq!(shard.find_row_index(1), 0);
+        assert_eq!(shard.find_row_index(128), 127);
+        assert_eq!(shard.find_lower_bound(65), 64);
     }
 
     #[test]
@@ -836,12 +824,11 @@ mod tests {
         assert_eq!(shard.count, 5);
         assert!(shard.has_ghosts); // v3 -> all Raw
         for i in 0..5 {
-            assert_eq!(shard.get_pk_lo(i), (i + 1) as u64);
-            assert_eq!(shard.get_pk_hi(i), 0);
+            assert_eq!(shard.get_pk(i), (i + 1) as u128);
             assert_eq!(shard.get_weight(i), 1);
             assert_eq!(shard.get_null_word(i), 0);
         }
-        assert_eq!(shard.find_row_index(3, 0), 2);
+        assert_eq!(shard.find_row_index(3), 2);
     }
 
     #[test]
@@ -892,11 +879,10 @@ mod tests {
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 1);
         assert!(!shard.has_ghosts);
-        assert_eq!(shard.get_pk_lo(0), 42);
-        assert_eq!(shard.get_pk_hi(0), 0);
+        assert_eq!(shard.get_pk(0), 42);
         assert_eq!(shard.get_weight(0), 1);
         assert_eq!(shard.get_null_word(0), 0);
-        assert_eq!(shard.find_row_index(42, 0), 0);
-        assert_eq!(shard.find_row_index(1, 0), -1);
+        assert_eq!(shard.find_row_index(42), 0);
+        assert_eq!(shard.find_row_index(1), -1);
     }
 }

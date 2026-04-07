@@ -673,13 +673,13 @@ mod tests {
         let schema = make_schema_desc(2, 0);
         let shard = MappedShard::open(&path_cstr, &schema, true).unwrap();
         assert_eq!(shard.count, 2);
-        assert_eq!(shard.get_pk_lo(0), 1);
-        assert_eq!(shard.get_pk_lo(1), 2);
+        assert_eq!(shard.get_pk(0), 1);
+        assert_eq!(shard.get_pk(1), 2);
         assert_eq!(shard.get_weight(0), 1);
         assert_eq!(shard.get_weight(1), 1);
         assert!(shard.has_xor8());
-        assert!(shard.xor8_may_contain(1, 0));
-        assert!(shard.xor8_may_contain(2, 0));
+        assert!(shard.xor8_may_contain(1));
+        assert!(shard.xor8_may_contain(2));
     }
 
     #[test]
@@ -740,16 +740,16 @@ mod tests {
         let schema = make_schema_desc(2, 0);
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 3);
-        assert_eq!(shard.get_pk_lo(0), 10);
-        assert_eq!(shard.get_pk_lo(1), 20);
-        assert_eq!(shard.get_pk_lo(2), 30);
+        assert_eq!(shard.get_pk(0), 10);
+        assert_eq!(shard.get_pk(1), 20);
+        assert_eq!(shard.get_pk(2), 30);
         assert_eq!(shard.get_weight(0), 1);
         assert_eq!(shard.get_weight(1), 1);
         assert_eq!(shard.get_weight(2), 1);
         assert!(shard.has_xor8());
-        assert!(shard.xor8_may_contain(10, 0));
-        assert!(shard.xor8_may_contain(20, 0));
-        assert!(shard.xor8_may_contain(30, 0));
+        assert!(shard.xor8_may_contain(10));
+        assert!(shard.xor8_may_contain(20));
+        assert!(shard.xor8_may_contain(30));
     }
 
     /// Bug 3: streaming write with regions that trigger Constant encoding.
@@ -785,7 +785,7 @@ mod tests {
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 4);
         for i in 0..4 {
-            assert_eq!(shard.get_pk_lo(i), (i + 1) as u64);
+            assert_eq!(shard.get_pk(i), (i + 1) as u128);
             assert_eq!(shard.get_weight(i), 1);
         }
     }

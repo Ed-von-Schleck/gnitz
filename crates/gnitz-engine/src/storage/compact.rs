@@ -20,18 +20,15 @@ use type_code::{I64 as TYPE_I64, U64 as TYPE_U64, STRING as TYPE_STRING};
 // Guard output result (returned from merge_and_route)
 // ---------------------------------------------------------------------------
 
-#[repr(C)]
 pub struct GuardResult {
-    pub guard_key_lo: u64,
-    pub guard_key_hi: u64,
+    pub guard_key: u128,
     pub filename: [u8; 256], // null-terminated
 }
 
 impl GuardResult {
     pub fn zeroed() -> Self {
         GuardResult {
-            guard_key_lo: 0,
-            guard_key_hi: 0,
+            guard_key: 0,
             filename: [0u8; 256],
         }
     }
@@ -112,7 +109,7 @@ fn is_null(shard: &MappedShard, row: usize, col_idx: usize, pk_index: usize) -> 
 // Guard key routing (binary search)
 // ---------------------------------------------------------------------------
 
-fn find_guard_for_key(guard_keys: &[(u64, u64)], key: u128) -> usize {
+fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
     let n = guard_keys.len();
     if n == 0 {
         return 0;
@@ -121,8 +118,7 @@ fn find_guard_for_key(guard_keys: &[(u64, u64)], key: u128) -> usize {
     let mut hi = n - 1;
     while lo < hi {
         let mid = (lo + hi + 1) / 2;
-        let (gk_lo, gk_hi) = guard_keys[mid];
-        if crate::util::make_pk(gk_lo, gk_hi) <= key {
+        if guard_keys[mid] <= key {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -264,7 +260,7 @@ pub fn compact_shards(
 pub fn merge_and_route(
     input_files: &[&CStr],
     output_dir: &CStr,
-    guard_keys: &[(u64, u64)],
+    guard_keys: &[u128],
     schema: &SchemaDescriptor,
     table_id: u32,
     level_num: u32,
@@ -320,8 +316,7 @@ pub fn merge_and_route(
             "merge_and_route: out_results buffer too small ({} slots for {} guards)",
             out_results.len(), num_guards,
         );
-        out_results[ri].guard_key_lo = guard_keys[i].0;
-        out_results[ri].guard_key_hi = guard_keys[i].1;
+        out_results[ri].guard_key = guard_keys[i];
         let name_bytes = out_filenames[i].as_bytes();
         let len = name_bytes.len().min(255);
         out_results[ri].filename[..len].copy_from_slice(&name_bytes[..len]);
@@ -582,22 +577,22 @@ mod tests {
 
     #[test]
     fn test_guard_routing() {
-        assert_eq!(find_guard_for_key(&[(0, 0), (100, 0), (200, 0)], 50), 0);
-        assert_eq!(find_guard_for_key(&[(0, 0), (100, 0), (200, 0)], 100), 1);
-        assert_eq!(find_guard_for_key(&[(0, 0), (100, 0), (200, 0)], 150), 1);
-        assert_eq!(find_guard_for_key(&[(0, 0), (100, 0), (200, 0)], 200), 2);
-        assert_eq!(find_guard_for_key(&[(0, 0), (100, 0), (200, 0)], 999), 2);
+        assert_eq!(find_guard_for_key(&[0, 100, 200], 50), 0);
+        assert_eq!(find_guard_for_key(&[0, 100, 200], 100), 1);
+        assert_eq!(find_guard_for_key(&[0, 100, 200], 150), 1);
+        assert_eq!(find_guard_for_key(&[0, 100, 200], 200), 2);
+        assert_eq!(find_guard_for_key(&[0, 100, 200], 999), 2);
     }
 
     #[test]
     fn test_guard_routing_empty() {
-        assert_eq!(find_guard_for_key(&[], 42), 0);
+        assert_eq!(find_guard_for_key(&[] as &[u128], 42), 0);
     }
 
     #[test]
     fn test_guard_routing_single() {
-        assert_eq!(find_guard_for_key(&[(0, 0)], 0), 0);
-        assert_eq!(find_guard_for_key(&[(0, 0)], 999), 0);
+        assert_eq!(find_guard_for_key(&[0u128], 0), 0);
+        assert_eq!(find_guard_for_key(&[0u128], 999), 0);
     }
 
     #[test]
@@ -672,10 +667,10 @@ mod tests {
         let inputs = [cs1.as_c_str()];
 
         // Two guards: [0, 100)  and [100, ∞)
-        let guards = [(0u64, 0u64), (100u64, 0u64)];
+        let guards: [u128; 2] = [0, 100];
         let mut results = [
-            GuardResult { guard_key_lo: 0, guard_key_hi: 0, filename: [0u8; 256] },
-            GuardResult { guard_key_lo: 0, guard_key_hi: 0, filename: [0u8; 256] },
+            GuardResult::zeroed(),
+            GuardResult::zeroed(),
         ];
 
         let rc = merge_and_route(
@@ -722,7 +717,7 @@ mod tests {
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        let guards = [(0u64, 0u64), (100u64, 0u64)];
+        let guards: [u128; 2] = [0, 100];
 
         // table_id=0, level_num=1, lsn_tag=99 → second output is shard_0_99_L1_G1.db
         // Block it with a directory so finalize fails for guard 1.
@@ -897,7 +892,7 @@ mod tests {
         let shard = MappedShard::open(&cpath, schema, false).unwrap();
         let mut rows = Vec::new();
         for i in 0..shard.count {
-            let pk = shard.get_pk_lo(i);
+            let pk = shard.get_pk(i) as u64;
             let w = shard.get_weight(i);
             let c1 = read_i64_le(shard.get_col_ptr(i, 0, 8), 0);
             let c2 = read_i64_le(shard.get_col_ptr(i, 1, 8), 0);
@@ -1075,7 +1070,7 @@ mod tests {
         let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
 
-        let guard_keys = vec![(0u64, 0u64)]; // single guard
+        let guard_keys: Vec<u128> = vec![0]; // single guard
         let mut results = vec![GuardResult::zeroed()];
 
         let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 99, 1, 1, &mut results);
@@ -1187,7 +1182,7 @@ mod tests {
         let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
         let inputs = [cs1.as_c_str()];
 
-        let guard_keys = vec![(200u64, 0u64)]; // single guard at key 200
+        let guard_keys: Vec<u128> = vec![200]; // single guard at key 200
         let mut results = vec![GuardResult::zeroed()];
 
         let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 42, 2, 1, &mut results);
@@ -1200,7 +1195,7 @@ mod tests {
 
         // Verify all keys readable
         for &pk in &[50u64, 100, 150, 250] {
-            let idx = shard.find_row_index(pk, 0);
+            let idx = shard.find_row_index(pk as u128);
             assert!(idx >= 0, "key {} not found in output shard", pk);
         }
 

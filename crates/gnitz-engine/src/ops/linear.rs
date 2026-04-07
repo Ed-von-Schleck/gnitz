@@ -6,7 +6,6 @@ use crate::storage::{OwnedBatch, MemBatch};
 use crate::scalar_func::ScalarFuncKind;
 use crate::xxh;
 
-use super::util::pk_lt;
 
 // ---------------------------------------------------------------------------
 // Linear operators
@@ -191,12 +190,10 @@ fn op_union_merge(
     let mut run_b_start = 0usize;
 
     while i < n_a && j < n_b {
-        let a_lo = batch_a.get_pk_lo(i);
-        let a_hi = batch_a.get_pk_hi(i);
-        let b_lo = batch_b.get_pk_lo(j);
-        let b_hi = batch_b.get_pk_hi(j);
+        let a_pk = batch_a.get_pk(i);
+        let b_pk = batch_b.get_pk(j);
 
-        if pk_lt(a_lo, a_hi, b_lo, b_hi) {
+        if a_pk < b_pk {
             if run_src != 0 {
                 if run_src == 1 {
                     output.append_batch(batch_b, run_b_start, j);
@@ -205,7 +202,7 @@ fn op_union_merge(
                 run_a_start = i;
             }
             i += 1;
-        } else if pk_lt(b_lo, b_hi, a_lo, a_hi) {
+        } else if b_pk < a_pk {
             if run_src != 1 {
                 if run_src == 0 {
                     output.append_batch(batch_a, run_a_start, i);
@@ -228,15 +225,13 @@ fn op_union_merge(
             // Find the end of the equal-PK run in each batch.
             let mut i_end = i + 1;
             while i_end < n_a
-                && batch_a.get_pk_lo(i_end) == a_lo
-                && batch_a.get_pk_hi(i_end) == a_hi
+                && batch_a.get_pk(i_end) == a_pk
             {
                 i_end += 1;
             }
             let mut j_end = j + 1;
             while j_end < n_b
-                && batch_b.get_pk_lo(j_end) == b_lo
-                && batch_b.get_pk_hi(j_end) == b_hi
+                && batch_b.get_pk(j_end) == b_pk
             {
                 j_end += 1;
             }
@@ -462,13 +457,13 @@ mod tests {
         let out = op_union(&a, Some(&b), &schema);
         assert_eq!(out.count, 4);
         assert!(out.sorted);
-        assert_eq!(out.get_pk_lo(0), 1);
+        assert_eq!((out.get_pk(0) as u64), 1);
         assert_eq!(get_payload_i64(&out, 0), 10);
-        assert_eq!(out.get_pk_lo(1), 1);
+        assert_eq!((out.get_pk(1) as u64), 1);
         assert_eq!(get_payload_i64(&out, 1), 20);
-        assert_eq!(out.get_pk_lo(2), 2);
+        assert_eq!((out.get_pk(2) as u64), 2);
         assert_eq!(get_payload_i64(&out, 2), 200);
-        assert_eq!(out.get_pk_lo(3), 3);
+        assert_eq!((out.get_pk(3) as u64), 3);
         assert_eq!(get_payload_i64(&out, 3), 300);
     }
 
@@ -507,8 +502,8 @@ mod tests {
 
         let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2, "only pk=2 and pk=3 pass val>10");
-        assert_eq!(out.get_pk_lo(0), 2);
-        assert_eq!(out.get_pk_lo(1), 3);
+        assert_eq!((out.get_pk(0) as u64), 2);
+        assert_eq!((out.get_pk(1) as u64), 3);
     }
 
     #[test]

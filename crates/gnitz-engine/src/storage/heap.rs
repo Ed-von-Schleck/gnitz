@@ -68,15 +68,6 @@ impl MergeHeap {
         self.heap[0].idx
     }
 
-    #[inline]
-    pub fn min_key(&self) -> u128 {
-        if self.heap.is_empty() {
-            u128::MAX
-        } else {
-            self.heap[0].key
-        }
-    }
-
     /// Sift down operating on heap/pos_map directly — avoids &mut self borrow conflicts.
     #[inline]
     pub fn sift_down_static(

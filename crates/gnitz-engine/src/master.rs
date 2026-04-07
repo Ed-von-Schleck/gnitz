@@ -556,8 +556,9 @@ impl MasterDispatcher {
     ) -> Result<Option<OwnedBatch>, String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(target_id);
+        let pk = crate::util::make_pk(pk_lo, pk_hi);
         let worker = worker_for_partition_pub(
-            partition_for_key(pk_lo, pk_hi),
+            partition_for_key(pk),
             self.num_workers,
         );
 
@@ -662,7 +663,7 @@ impl MasterDispatcher {
     // the caller can distinguish which specific keys are occupied.
     fn check_index_keys(
         &mut self, owner_table_id: i64, source_col_idx: u32, check_batch: &OwnedBatch,
-    ) -> Result<HashSet<(u64, u64)>, String> {
+    ) -> Result<HashSet<u128>, String> {
         self.maybe_checkpoint()?;
         let schema = check_batch.schema
             .ok_or_else(|| "check_index_keys: batch has no schema".to_string())?;
@@ -672,13 +673,13 @@ impl MasterDispatcher {
         self.sync_and_signal_all();
 
         let results = self.wait_all_workers()?;
-        let mut occupied: HashSet<(u64, u64)> = HashSet::new();
+        let mut occupied: HashSet<u128> = HashSet::new();
         for decoded_opt in &results {
             if let Some(decoded) = decoded_opt {
                 if let Some(ref batch) = decoded.data_batch {
                     for j in 0..batch.count {
                         if batch.get_weight(j) == 1 {
-                            occupied.insert((batch.get_pk_lo(j), batch.get_pk_hi(j)));
+                            occupied.insert(batch.get_pk(j));
                         }
                     }
                 }
@@ -689,7 +690,7 @@ impl MasterDispatcher {
 
     fn check_pk_existence(
         &mut self, target_id: i64, check_batch: &OwnedBatch,
-    ) -> Result<HashMap<u64, HashSet<u64>>, String> {
+    ) -> Result<HashSet<u128>, String> {
         self.maybe_checkpoint()?;
         let schema = check_batch.schema
             .ok_or_else(|| "check_pk_existence: batch has no schema".to_string())?;
@@ -701,13 +702,13 @@ impl MasterDispatcher {
         self.send_to_workers(target_id, FLAG_HAS_PK, &refs, &schema, &[], 0, 0, 0)?;
 
         let results = self.wait_all_workers()?;
-        let mut existing: HashMap<u64, HashSet<u64>> = HashMap::new();
+        let mut existing: HashSet<u128> = HashSet::new();
         for decoded_opt in &results {
             if let Some(decoded) = decoded_opt {
                 if let Some(ref batch) = decoded.data_batch {
                     for j in 0..batch.count {
                         if batch.get_weight(j) == 1 {
-                            existing.entry(batch.get_pk_lo(j)).or_default().insert(batch.get_pk_hi(j));
+                            existing.insert(batch.get_pk(j));
                         }
                     }
                 }
@@ -859,14 +860,16 @@ impl MasterDispatcher {
         let mut pk_hi_list: Vec<u64> = Vec::new();
         for i in 0..n {
             if batch.get_weight(i) <= 0 { continue; }
-            pk_lo_list.push(batch.get_pk_lo(i));
-            pk_hi_list.push(batch.get_pk_hi(i));
+            let pk = batch.get_pk(i);
+            let (lo, hi) = crate::util::split_pk(pk);
+            pk_lo_list.push(lo);
+            pk_hi_list.push(hi);
         }
 
         let existing_pks = if !pk_lo_list.is_empty() {
             self.check_pk_existence(target_id, &build_check_batch(&source_schema, &pk_lo_list, &pk_hi_list))?
         } else {
-            HashMap::new()
+            HashSet::new()
         };
 
         let cat = unsafe { &mut *self.catalog };
@@ -894,11 +897,11 @@ impl MasterDispatcher {
             };
             let col_size = source_schema.columns[source_col].size as usize;
 
-            // (key_lo, key_hi, pk_lo, pk_hi) — deferred for batch verification below.
-            let mut upsert_keys: Vec<(u64, u64, u64, u64)> = Vec::new();
+            // (key_lo, key_hi, pk: u128) — deferred for batch verification below.
+            let mut upsert_keys: Vec<(u64, u64, u128)> = Vec::new();
             let mut check_lo: Vec<u64> = Vec::new();
             let mut check_hi: Vec<u64> = Vec::new();
-            let mut seen: HashMap<u64, HashSet<u64>> = HashMap::new();
+            let mut seen: HashSet<u128> = HashSet::new();
 
             for i in 0..n {
                 if batch.get_weight(i) <= 0 { continue; }
@@ -908,30 +911,28 @@ impl MasterDispatcher {
                     if null_word & (1u64 << src_payload_idx) != 0 { continue; }
                 }
 
-                let pk_lo_i = batch.get_pk_lo(i);
-                let pk_hi_i = batch.get_pk_hi(i);
+                let pk_i = batch.get_pk(i);
 
                 let (key_lo, key_hi) = if is_pk_col {
-                    (pk_lo_i, pk_hi_i)
+                    crate::util::split_pk(pk_i)
                 } else {
                     let col_data = &batch.col_data[src_payload_idx];
                     promote_to_index_key(col_data, i * col_size, col_size, type_code)
                 };
 
-                if existing_pks.get(&pk_lo_i).is_some_and(|s| s.contains(&pk_hi_i)) {
+                if existing_pks.contains(&pk_i) {
                     // UPSERT row: defer unique-value conflict check to the batch below.
-                    upsert_keys.push((key_lo, key_hi, pk_lo_i, pk_hi_i));
+                    upsert_keys.push((key_lo, key_hi, pk_i));
                     continue;
                 }
 
-                if let Some(hi_set) = seen.get(&key_lo) {
-                    if hi_set.contains(&key_hi) {
-                        let col_name = self.get_col_name(target_id, source_col);
-                        return Err(format!(
-                            "Unique index violation on column '{}': duplicate in batch", col_name));
-                    }
+                let key_pk = crate::util::make_pk(key_lo, key_hi);
+                if seen.contains(&key_pk) {
+                    let col_name = self.get_col_name(target_id, source_col);
+                    return Err(format!(
+                        "Unique index violation on column '{}': duplicate in batch", col_name));
                 }
-                seen.entry(key_lo).or_default().insert(key_hi);
+                seen.insert(key_pk);
                 check_lo.push(key_lo);
                 check_hi.push(key_hi);
             }
@@ -940,18 +941,19 @@ impl MasterDispatcher {
             // then a targeted seek only for the occupied ones to verify the holder is the
             // same row (self-update is fine; any other holder is a violation).
             if !upsert_keys.is_empty() {
-                let u_lo: Vec<u64> = upsert_keys.iter().map(|&(lo, _, _, _)| lo).collect();
-                let u_hi: Vec<u64> = upsert_keys.iter().map(|&(_, hi, _, _)| hi).collect();
+                let u_lo: Vec<u64> = upsert_keys.iter().map(|&(lo, _, _)| lo).collect();
+                let u_hi: Vec<u64> = upsert_keys.iter().map(|&(_, hi, _)| hi).collect();
                 let u_batch = build_check_batch(&idx_schema, &u_lo, &u_hi);
                 let occupied = self.check_index_keys(target_id, col_idx, &u_batch)?;
-                for &(key_lo, key_hi, pk_lo_i, pk_hi_i) in &upsert_keys {
-                    if !occupied.contains(&(key_lo, key_hi)) { continue; }
+                for &(key_lo, key_hi, pk_i) in &upsert_keys {
+                    let key_pk = crate::util::make_pk(key_lo, key_hi);
+                    if !occupied.contains(&key_pk) { continue; }
                     // Value is occupied; confirm the holder is this same row.
                     match self.fan_out_seek_by_index(target_id, col_idx, key_lo, key_hi) {
                         Err(e) => return Err(e),
                         Ok(None) => {}
                         Ok(Some(ref found)) if found.count > 0 => {
-                            if found.get_pk_lo(0) != pk_lo_i || found.get_pk_hi(0) != pk_hi_i {
+                            if found.get_pk(0) != pk_i {
                                 let col_name = self.get_col_name(target_id, source_col);
                                 return Err(format!(
                                     "Unique index violation on column '{}'", col_name));

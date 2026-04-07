@@ -32,11 +32,11 @@ pub struct MemBatch<'a> {
 
 impl<'a> MemBatch<'a> {
     #[inline]
-    pub fn get_pk_lo(&self, row: usize) -> u64 {
+    fn get_pk_lo(&self, row: usize) -> u64 {
         read_u64_le(self.pk_lo, row * 8)
     }
     #[inline]
-    pub fn get_pk_hi(&self, row: usize) -> u64 {
+    fn get_pk_hi(&self, row: usize) -> u64 {
         read_u64_le(self.pk_hi, row * 8)
     }
     #[inline]
@@ -57,14 +57,13 @@ impl<'a> MemBatch<'a> {
         &self.col_data[payload_col][off..off + col_size]
     }
 
-    /// Binary search for the first row where PK >= (key_lo, key_hi).
-    pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
-        let target = crate::util::make_pk(key_lo, key_hi);
+    /// Binary search for the first row where PK >= key.
+    pub fn find_lower_bound(&self, key: u128) -> usize {
         let mut lo = 0usize;
         let mut hi = self.count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.get_pk(mid) < target {
+            if self.get_pk(mid) < key {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -74,8 +73,8 @@ impl<'a> MemBatch<'a> {
     }
 
     #[inline]
-    pub fn pk_matches(&self, row: usize, key_lo: u64, key_hi: u64) -> bool {
-        self.get_pk_lo(row) == key_lo && self.get_pk_hi(row) == key_hi
+    pub fn pk_matches(&self, row: usize, key: u128) -> bool {
+        self.get_pk(row) == key
     }
 }
 
@@ -375,120 +374,6 @@ pub fn merge_batches(
 // FFI entry point helper: parse flat region arrays into MemBatches + DirectWriter
 // ---------------------------------------------------------------------------
 
-/// Parse the flat region arrays from FFI into MemBatch structs.
-///
-/// Layout per batch: pk_lo, pk_hi, weight, null_bmp, payload_col_0..N-1, blob.
-/// regions_per_batch = 4 + num_payload_cols + 1.
-pub unsafe fn parse_batches_from_regions<'a>(
-    in_ptrs: &[*const u8],
-    in_sizes: &[u32],
-    in_counts: &[u32],
-    num_batches: usize,
-    regions_per_batch: usize,
-    num_payload_cols: usize,
-) -> Vec<MemBatch<'a>> {
-    let mut batches = Vec::with_capacity(num_batches);
-    for bi in 0..num_batches {
-        let base = bi * regions_per_batch;
-        let count = in_counts[bi] as usize;
-
-        let pk_lo = std::slice::from_raw_parts(in_ptrs[base], in_sizes[base] as usize);
-        let pk_hi = std::slice::from_raw_parts(in_ptrs[base + 1], in_sizes[base + 1] as usize);
-        let weight = std::slice::from_raw_parts(in_ptrs[base + 2], in_sizes[base + 2] as usize);
-        let null_bmp = std::slice::from_raw_parts(in_ptrs[base + 3], in_sizes[base + 3] as usize);
-
-        let mut col_data = Vec::with_capacity(num_payload_cols);
-        for ci in 0..num_payload_cols {
-            let ri = base + 4 + ci;
-            col_data.push(std::slice::from_raw_parts(in_ptrs[ri], in_sizes[ri] as usize));
-        }
-
-        let blob_ri = base + 4 + num_payload_cols;
-        let blob = std::slice::from_raw_parts(in_ptrs[blob_ri], in_sizes[blob_ri] as usize);
-
-        batches.push(MemBatch {
-            pk_lo,
-            pk_hi,
-            weight,
-            null_bmp,
-            col_data,
-            blob,
-            count,
-        });
-    }
-    batches
-}
-
-/// Create a DirectWriter from pre-allocated output region pointers.
-pub unsafe fn create_writer_from_regions<'a>(
-    out_ptrs: &[*mut u8],
-    _regions_per_batch: usize,
-    schema: &SchemaDescriptor,
-    total_rows: usize,
-    total_blob: usize,
-) -> DirectWriter<'a> {
-    let num_payload_cols = schema.num_columns as usize - 1;
-
-    let pk_lo = std::slice::from_raw_parts_mut(out_ptrs[0], total_rows * 8);
-    let pk_hi = std::slice::from_raw_parts_mut(out_ptrs[1], total_rows * 8);
-    let weight = std::slice::from_raw_parts_mut(out_ptrs[2], total_rows * 8);
-    let null_bmp = std::slice::from_raw_parts_mut(out_ptrs[3], total_rows * 8);
-
-    let pk_index = schema.pk_index as usize;
-    let mut col_bufs: Vec<&mut [u8]> = Vec::with_capacity(num_payload_cols);
-    let mut payload_idx = 0usize;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_index {
-            continue;
-        }
-        let col_size = schema.columns[ci].size as usize;
-        let ptr = out_ptrs[4 + payload_idx];
-        col_bufs.push(std::slice::from_raw_parts_mut(ptr, total_rows * col_size));
-        payload_idx += 1;
-    }
-
-    let blob_idx = 4 + num_payload_cols;
-    let blob = std::slice::from_raw_parts_mut(out_ptrs[blob_idx], total_blob);
-
-    DirectWriter {
-        pk_lo,
-        pk_hi,
-        weight,
-        null_bmp,
-        col_bufs,
-        blob,
-        blob_offset: 0,
-        blob_cache: HashMap::new(),
-        count: 0,
-        schema: *schema,
-    }
-}
-
-/// Fill out_sizes array with the actual bytes written per region.
-pub fn fill_output_sizes(
-    writer: &DirectWriter,
-    schema: &SchemaDescriptor,
-    out_sizes: &mut [u32],
-) {
-    let count = writer.row_count();
-    let pk_index = schema.pk_index as usize;
-
-    let system_size = (count * 8) as u32;
-    out_sizes[..4].fill(system_size);
-
-    let mut payload_idx = 0usize;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_index {
-            continue;
-        }
-        let col_size = schema.columns[ci].size as usize;
-        out_sizes[4 + payload_idx] = (count * col_size) as u32;
-        payload_idx += 1;
-    }
-
-    let blob_idx = 4 + (schema.num_columns as usize - 1);
-    out_sizes[blob_idx] = writer.blob_written() as u32;
-}
 
 // ---------------------------------------------------------------------------
 // Single-batch sort + consolidation

@@ -479,7 +479,7 @@ impl WorkerProcess {
             if let Some(ref b) = batch {
                 let table = unsafe { &mut *index_handle };
                 for i in 0..n {
-                    let exists = table.has_pk(b.get_pk_lo(i), b.get_pk_hi(i));
+                    let exists = table.has_pk(b.get_pk(i));
                     result.append_row_from_batch(b, i, if exists { 1 } else { 0 });
                 }
             }
@@ -492,7 +492,7 @@ impl WorkerProcess {
             if let Some(ref b) = batch {
                 for i in 0..n {
                     let exists = if let Some(pt_ptr) = ptable_handle {
-                        unsafe { &mut *pt_ptr }.has_pk(b.get_pk_lo(i), b.get_pk_hi(i))
+                        unsafe { &mut *pt_ptr }.has_pk(b.get_pk(i))
                     } else {
                         false
                     };
@@ -548,8 +548,10 @@ impl OwnedBatch {
     /// Append a single row from another batch, with a caller-specified weight.
     fn append_row_from_batch(&mut self, src: &OwnedBatch, row: usize, weight: i64) {
         if row >= src.count { return; }
-        self.pk_lo.extend_from_slice(&src.get_pk_lo(row).to_le_bytes());
-        self.pk_hi.extend_from_slice(&src.get_pk_hi(row).to_le_bytes());
+        let pk = src.get_pk(row);
+        let (lo, hi) = crate::util::split_pk(pk);
+        self.pk_lo.extend_from_slice(&lo.to_le_bytes());
+        self.pk_hi.extend_from_slice(&hi.to_le_bytes());
         self.weight.extend_from_slice(&weight.to_le_bytes());
         let null_word = src.get_null_word(row);
         self.null_bmp.extend_from_slice(&null_word.to_le_bytes());

@@ -19,14 +19,14 @@ impl BloomFilter {
         }
     }
 
-    pub fn add(&mut self, key_lo: u64, key_hi: u64) {
-        for (byte_idx, bit_mask) in self.probe_positions(key_lo, key_hi) {
+    pub fn add(&mut self, key: u128) {
+        for (byte_idx, bit_mask) in self.probe_positions(key) {
             self.bits[byte_idx] |= bit_mask;
         }
     }
 
-    pub fn may_contain(&self, key_lo: u64, key_hi: u64) -> bool {
-        for (byte_idx, bit_mask) in self.probe_positions(key_lo, key_hi) {
+    pub fn may_contain(&self, key: u128) -> bool {
+        for (byte_idx, bit_mask) in self.probe_positions(key) {
             if self.bits[byte_idx] & bit_mask == 0 {
                 return false;
             }
@@ -34,8 +34,8 @@ impl BloomFilter {
         true
     }
 
-    fn probe_positions(&self, key_lo: u64, key_hi: u64) -> ProbeIter {
-        let h = xxh::hash_u128(key_lo, key_hi);
+    fn probe_positions(&self, key: u128) -> ProbeIter {
+        let h = xxh::hash_u128(key);
         ProbeIter { h1: h, h2: (h >> 32) | 1, num_bits: self.num_bits, i: 0 }
     }
 
@@ -73,10 +73,10 @@ mod tests {
     fn no_false_negatives() {
         let mut bf = BloomFilter::new(100);
         for i in 0u64..100 {
-            bf.add(i, 0);
+            bf.add(i as u128);
         }
         for i in 0u64..100 {
-            assert!(bf.may_contain(i, 0), "false negative for key {}", i);
+            assert!(bf.may_contain(i as u128), "false negative for key {}", i);
         }
     }
 
@@ -84,11 +84,11 @@ mod tests {
     fn false_positive_rate() {
         let mut bf = BloomFilter::new(1000);
         for i in 0u64..1000 {
-            bf.add(i, 0);
+            bf.add(i as u128);
         }
         let mut fp = 0u32;
         for i in 10_000u64..11_000 {
-            if bf.may_contain(i, 0) {
+            if bf.may_contain(i as u128) {
                 fp += 1;
             }
         }
@@ -100,13 +100,13 @@ mod tests {
     fn reset_clears() {
         let mut bf = BloomFilter::new(10);
         for i in 0u64..10 {
-            bf.add(i, 0);
+            bf.add(i as u128);
         }
         bf.reset();
         // After reset, all queries should return false (with overwhelming probability)
         let mut found = 0u32;
         for i in 0u64..10 {
-            if bf.may_contain(i, 0) {
+            if bf.may_contain(i as u128) {
                 found += 1;
             }
         }
@@ -119,7 +119,7 @@ mod tests {
         // Empty filter should almost certainly return false
         let mut fp = 0u32;
         for i in 0u64..100 {
-            if bf.may_contain(i, 0) {
+            if bf.may_contain(i as u128) {
                 fp += 1;
             }
         }

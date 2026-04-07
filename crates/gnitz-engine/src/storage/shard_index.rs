@@ -56,12 +56,12 @@ impl ShardEntry {
         })
     }
 
-    fn probe_pk(&self, key: u128, key_lo: u64, key_hi: u64) -> Option<(*const MappedShard, usize)> {
+    fn probe_pk(&self, key: u128) -> Option<(*const MappedShard, usize)> {
         if self.pk_min <= key && key <= self.pk_max {
-            if self.shard.has_xor8() && !self.shard.xor8_may_contain(key_lo, key_hi) {
+            if self.shard.has_xor8() && !self.shard.xor8_may_contain(key) {
                 return None;
             }
-            let row = self.shard.find_row_index(key_lo, key_hi);
+            let row = self.shard.find_row_index(key);
             if row >= 0 {
                 return Some((&self.shard as *const MappedShard, row as usize));
             }
@@ -71,23 +71,16 @@ impl ShardEntry {
 }
 
 struct LevelGuard {
-    guard_key_lo: u64,
-    guard_key_hi: u64,
+    guard_key: u128,
     entries: Vec<ShardEntry>,
 }
 
 impl LevelGuard {
-    fn new(gk_lo: u64, gk_hi: u64) -> Self {
+    fn new(gk: u128) -> Self {
         LevelGuard {
-            guard_key_lo: gk_lo,
-            guard_key_hi: gk_hi,
+            guard_key: gk,
             entries: Vec::new(),
         }
-    }
-
-    #[inline]
-    fn guard_key(&self) -> u128 {
-        make_pk(self.guard_key_lo, self.guard_key_hi)
     }
 }
 
@@ -109,13 +102,13 @@ impl FLSMLevel {
         let mut hi = n - 1;
         while lo < hi {
             let mid = (lo + hi + 1) / 2;
-            if self.guards[mid].guard_key() <= key {
+            if self.guards[mid].guard_key <= key {
                 lo = mid;
             } else {
                 hi = mid - 1;
             }
         }
-        if self.guards[lo].guard_key() <= key {
+        if self.guards[lo].guard_key <= key {
             Some(lo)
         } else {
             None
@@ -123,18 +116,18 @@ impl FLSMLevel {
     }
 
     fn find_guards_for_range(&self, range_min: u128, range_max: u128) -> Vec<usize> {
-        let start = match self.guards.partition_point(|g| g.guard_key() <= range_min) {
+        let start = match self.guards.partition_point(|g| g.guard_key <= range_min) {
             0 => 0,
             n => n - 1,
         };
         let mut result = Vec::new();
         for i in start..self.guards.len() {
-            let gk = self.guards[i].guard_key();
+            let gk = self.guards[i].guard_key;
             if gk > range_max {
                 break;
             }
             let next_gk = if i + 1 < self.guards.len() {
-                self.guards[i + 1].guard_key()
+                self.guards[i + 1].guard_key
             } else {
                 u128::MAX
             };
@@ -149,13 +142,12 @@ impl FLSMLevel {
         self.guards.iter().map(|g| g.entries.len()).sum()
     }
 
-    fn get_or_create_guard(&mut self, gk_lo: u64, gk_hi: u64) -> &mut LevelGuard {
-        let gk = make_pk(gk_lo, gk_hi);
-        let pos = self.guards.partition_point(|g| g.guard_key() < gk);
-        if pos < self.guards.len() && self.guards[pos].guard_key() == gk {
+    fn get_or_create_guard(&mut self, gk: u128) -> &mut LevelGuard {
+        let pos = self.guards.partition_point(|g| g.guard_key < gk);
+        if pos < self.guards.len() && self.guards[pos].guard_key == gk {
             return &mut self.guards[pos];
         }
-        self.guards.insert(pos, LevelGuard::new(gk_lo, gk_hi));
+        self.guards.insert(pos, LevelGuard::new(gk));
         &mut self.guards[pos]
     }
 }
@@ -221,11 +213,9 @@ impl ShardIndex {
             .collect()
     }
 
-    pub fn find_pk(&self, key_lo: u64, key_hi: u64, visitor: &mut impl FnMut(*const MappedShard, usize)) {
-        let key = make_pk(key_lo, key_hi);
-
+    pub fn find_pk(&self, key: u128, visitor: &mut impl FnMut(*const MappedShard, usize)) {
         for e in &self.l0 {
-            if let Some((ptr, idx)) = e.probe_pk(key, key_lo, key_hi) {
+            if let Some((ptr, idx)) = e.probe_pk(key) {
                 visitor(ptr, idx);
             }
         }
@@ -233,7 +223,7 @@ impl ShardIndex {
         for level in &self.levels {
             if let Some(g_idx) = level.find_guard_idx(key) {
                 for e in &level.guards[g_idx].entries {
-                    if let Some((ptr, idx)) = e.probe_pk(key, key_lo, key_hi) {
+                    if let Some((ptr, idx)) = e.probe_pk(key) {
                         visitor(ptr, idx);
                     }
                 }
@@ -248,7 +238,7 @@ impl ShardIndex {
     fn build_manifest_entries(&self) -> Vec<ManifestEntryRaw> {
         let mut entries = Vec::new();
         for e in &self.l0 {
-            entries.push(self.entry_to_raw(e, 0, 0, 0));
+            entries.push(self.entry_to_raw(e, 0, 0));
         }
         for (li, level) in self.levels.iter().enumerate() {
             for guard in &level.guards {
@@ -256,8 +246,7 @@ impl ShardIndex {
                     entries.push(self.entry_to_raw(
                         e,
                         Self::level_num(li) as u64,
-                        guard.guard_key_lo,
-                        guard.guard_key_hi,
+                        guard.guard_key,
                     ));
                 }
             }
@@ -269,8 +258,7 @@ impl ShardIndex {
         &self,
         e: &ShardEntry,
         level: u64,
-        gk_lo: u64,
-        gk_hi: u64,
+        gk: u128,
     ) -> ManifestEntryRaw {
         let mut raw = ManifestEntryRaw::zeroed();
         raw.table_id = self.table_id as u64;
@@ -283,6 +271,7 @@ impl ShardIndex {
         raw.min_lsn = e.min_lsn;
         raw.max_lsn = e.max_lsn;
         raw.level = level;
+        let (gk_lo, gk_hi) = split_pk(gk);
         raw.guard_key_lo = gk_lo;
         raw.guard_key_hi = gk_hi;
         let name_bytes = e.filename.as_bytes();
@@ -325,7 +314,7 @@ impl ShardIndex {
                 let level_num = raw.level as usize;
                 let level = self.get_or_create_level(level_num);
                 level
-                    .get_or_create_guard(raw.guard_key_lo, raw.guard_key_hi)
+                    .get_or_create_guard(make_pk(raw.guard_key_lo, raw.guard_key_hi))
                     .entries
                     .push(entry);
             }
@@ -398,9 +387,9 @@ impl ShardIndex {
             return Err(num_results);
         }
 
-        let guard_outputs: Vec<(u64, u64, String)> = results[..num_results as usize]
+        let guard_outputs: Vec<(u128, String)> = results[..num_results as usize]
             .iter()
-            .map(|r| (r.guard_key_lo, r.guard_key_hi, r.filename_str().to_string()))
+            .map(|r| (r.guard_key, r.filename_str().to_string()))
             .collect();
 
         self.commit_l0_to_l1(&guard_outputs, l0_max_lsn)?;
@@ -419,23 +408,22 @@ impl ShardIndex {
         Ok(())
     }
 
-    fn l1_guard_keys(&self) -> Vec<(u64, u64)> {
+    fn l1_guard_keys(&self) -> Vec<u128> {
         if !self.levels.is_empty() && !self.levels[0].guards.is_empty() {
             self.levels[0]
                 .guards
                 .iter()
-                .map(|g| (g.guard_key_lo, g.guard_key_hi))
+                .map(|g| g.guard_key)
                 .collect()
         } else {
-            let mut keys: Vec<(u64, u64)> = Vec::new();
+            let mut keys: Vec<u128> = Vec::new();
             for e in &self.l0 {
-                let (lo, hi) = split_pk(e.pk_min);
-                if keys.is_empty() || keys.last().map(|k| *k != (lo, hi)).unwrap_or(true) {
-                    keys.push((lo, hi));
+                if keys.is_empty() || keys.last().map(|k| *k != e.pk_min).unwrap_or(true) {
+                    keys.push(e.pk_min);
                 }
             }
             if keys.is_empty() {
-                keys.push((0, 0));
+                keys.push(0);
             }
             keys
         }
@@ -443,7 +431,7 @@ impl ShardIndex {
 
     fn commit_l0_to_l1(
         &mut self,
-        guard_outputs: &[(u64, u64, String)],
+        guard_outputs: &[(u128, String)],
         max_lsn: u64,
     ) -> Result<(), i32> {
         self.ensure_level(1);
@@ -451,18 +439,18 @@ impl ShardIndex {
 
         // Open all new entries before touching self.l0.
         // If any open fails, l0 is still intact and the caller can retry.
-        let mut new_entries: Vec<(u64, u64, ShardEntry)> =
+        let mut new_entries: Vec<(u128, ShardEntry)> =
             Vec::with_capacity(guard_outputs.len());
-        for (gk_lo, gk_hi, filename) in guard_outputs {
+        for (gk, filename) in guard_outputs {
             let entry = ShardEntry::open(filename, &schema_copy, 0, max_lsn)?;
-            new_entries.push((*gk_lo, *gk_hi, entry));
+            new_entries.push((*gk, entry));
         }
 
         // All opens succeeded — safe to mutate state.
         self.l0.clear();
-        for (gk_lo, gk_hi, entry) in new_entries {
+        for (gk, entry) in new_entries {
             self.levels[0]
-                .get_or_create_guard(gk_lo, gk_hi)
+                .get_or_create_guard(gk)
                 .entries
                 .push(entry);
         }
@@ -498,7 +486,7 @@ impl ShardIndex {
             self.output_dir,
             self.table_id,
             Self::level_num(level_idx),
-            guard.guard_key_lo,
+            guard.guard_key,
             self.compact_seq,
         );
 
@@ -545,9 +533,9 @@ impl ShardIndex {
             }
         };
 
-        let src_guard_key = self.levels[src_idx].guards[worst_idx].guard_key();
+        let src_guard_key = self.levels[src_idx].guards[worst_idx].guard_key;
         let src_max_bound = if worst_idx + 1 < self.levels[src_idx].guards.len() {
-            self.levels[src_idx].guards[worst_idx + 1].guard_key() - 1
+            self.levels[src_idx].guards[worst_idx + 1].guard_key - 1
         } else {
             u128::MAX
         };
@@ -589,33 +577,21 @@ impl ShardIndex {
             self.compact_seq
         };
 
-        let mut guard_keys: Vec<(u64, u64)> = if !dest_guard_indices.is_empty() {
+        let mut guard_keys: Vec<u128> = if !dest_guard_indices.is_empty() {
             dest_guard_indices
                 .iter()
-                .map(|&di| {
-                    let g = &self.levels[dest_idx].guards[di];
-                    (g.guard_key_lo, g.guard_key_hi)
-                })
+                .map(|&di| self.levels[dest_idx].guards[di].guard_key)
                 .collect()
         } else {
-            vec![(
-                self.levels[src_idx].guards[worst_idx].guard_key_lo,
-                self.levels[src_idx].guards[worst_idx].guard_key_hi,
-            )]
+            vec![self.levels[src_idx].guards[worst_idx].guard_key]
         };
 
         // Ensure guard_keys covers the source range's lower bound.
         // Without this, keys below the lowest destination guard are routed
         // to that guard (via find_guard_for_key → index 0), but find_guard_idx
         // on the read path returns None for keys below the guard key.
-        if !guard_keys.is_empty() {
-            let first_gk = make_pk(guard_keys[0].0, guard_keys[0].1);
-            if first_gk > src_guard_key {
-                guard_keys.insert(0, (
-                    self.levels[src_idx].guards[worst_idx].guard_key_lo,
-                    self.levels[src_idx].guards[worst_idx].guard_key_hi,
-                ));
-            }
+        if !guard_keys.is_empty() && guard_keys[0] > src_guard_key {
+            guard_keys.insert(0, self.levels[src_idx].guards[worst_idx].guard_key);
         }
 
         let input_cstrings = to_cstrings(&all_input_files)?;
@@ -640,18 +616,18 @@ impl ShardIndex {
             return Err(num_results);
         }
 
-        let guard_outputs: Vec<(u64, u64, String)> = results[..num_results as usize]
+        let guard_outputs: Vec<(u128, String)> = results[..num_results as usize]
             .iter()
-            .map(|r| (r.guard_key_lo, r.guard_key_hi, r.filename_str().to_string()))
+            .map(|r| (r.guard_key, r.filename_str().to_string()))
             .collect();
 
         let schema_copy = self.schema;
-        let mut opened: Vec<(u64, u64, ShardEntry)> = Vec::with_capacity(guard_outputs.len());
-        for (gk_lo, gk_hi, filename) in &guard_outputs {
+        let mut opened: Vec<(u128, ShardEntry)> = Vec::with_capacity(guard_outputs.len());
+        for (gk, filename) in &guard_outputs {
             match ShardEntry::open(filename, &schema_copy, 0, vert_max_lsn) {
-                Ok(entry) => opened.push((*gk_lo, *gk_hi, entry)),
+                Ok(entry) => opened.push((*gk, entry)),
                 Err(e) => {
-                    for (_, _, f) in &guard_outputs {
+                    for (_, f) in &guard_outputs {
                         let _ = fs::remove_file(f);
                     }
                     return Err(e);
@@ -662,17 +638,13 @@ impl ShardIndex {
         self.pending_deletions.extend(all_input_files);
         self.levels[src_idx].guards.remove(worst_idx);
         {
-            let old_keys: Vec<u128> = guard_keys
-                .iter()
-                .map(|&(lo, hi)| make_pk(lo, hi))
-                .collect();
             self.levels[dest_idx]
                 .guards
-                .retain(|g| !old_keys.contains(&g.guard_key()));
+                .retain(|g| !guard_keys.contains(&g.guard_key));
         }
-        for (gk_lo, gk_hi, entry) in opened {
+        for (gk, entry) in opened {
             self.levels[dest_idx]
-                .get_or_create_guard(gk_lo, gk_hi)
+                .get_or_create_guard(gk)
                 .entries
                 .push(entry);
         }
@@ -773,16 +745,16 @@ mod tests {
 
         // Find existing keys
         let mut hits = Vec::new();
-        idx.find_pk(10, 0, &mut |ptr, row| hits.push((ptr, row)));
+        idx.find_pk(10, &mut |ptr, row| hits.push((ptr, row)));
         assert_eq!(hits.len(), 1);
 
         hits.clear();
-        idx.find_pk(25, 0, &mut |ptr, row| hits.push((ptr, row)));
+        idx.find_pk(25, &mut |ptr, row| hits.push((ptr, row)));
         assert_eq!(hits.len(), 1);
 
         // Missing key returns nothing
         hits.clear();
-        idx.find_pk(99, 0, &mut |ptr, row| hits.push((ptr, row)));
+        idx.find_pk(99, &mut |ptr, row| hits.push((ptr, row)));
         assert!(hits.is_empty());
     }
 
@@ -812,9 +784,9 @@ mod tests {
 
         // Verify all keys are findable in the new index
         for i in 0..5u64 {
-            let pk = i * 10 + 1;
+            let pk = (i * 10 + 1) as u128;
             let mut found = false;
-            idx2.find_pk(pk, 0, &mut |_, _| found = true);
+            idx2.find_pk(pk, &mut |_, _| found = true);
             assert!(found, "key {} not found after manifest roundtrip", pk);
         }
 
@@ -850,7 +822,7 @@ mod tests {
         // All keys still findable
         for pk in &all_pks {
             let mut found = false;
-            idx.find_pk(*pk, 0, &mut |_, _| found = true);
+            idx.find_pk(*pk as u128, &mut |_, _| found = true);
             assert!(found, "key {} lost after compaction", pk);
         }
     }
@@ -864,7 +836,7 @@ mod tests {
 
         // Manually populate L1 with > GUARD_FILE_THRESHOLD entries in one guard
         idx.ensure_level(1);
-        let guard = idx.levels[0].get_or_create_guard(0, 0);
+        let guard = idx.levels[0].get_or_create_guard(0);
         let mut all_pks = Vec::new();
         for i in 0..6u64 {
             let name = format!("guard_s{}.db", i);
@@ -884,7 +856,7 @@ mod tests {
         // All keys still findable
         for pk in &all_pks {
             let mut found = false;
-            idx.find_pk(*pk, 0, &mut |_, _| found = true);
+            idx.find_pk(*pk as u128, &mut |_, _| found = true);
             assert!(found, "key {} lost after guard compaction", pk);
         }
     }
@@ -906,13 +878,13 @@ mod tests {
                 &[(i as i64 + 1) * 10],
             );
             let e = ShardEntry::open(&path, &schema, 0, 100).unwrap();
-            idx.levels[0].get_or_create_guard(0, 0).entries.push(e);
+            idx.levels[0].get_or_create_guard(0).entries.push(e);
         }
         // Second guard so worst_count > 1 condition is met in compact_guard_vertical
         {
             let path = write_test_shard(dir.path(), "other.db", &[9999], &[42]);
             let e = ShardEntry::open(&path, &schema, 0, 50).unwrap();
-            idx.levels[0].get_or_create_guard(5000, 0).entries.push(e);
+            idx.levels[0].get_or_create_guard(5000).entries.push(e);
         }
 
         // Block the output path: shard_42_100_L2_G0.db must fail to finalize
@@ -942,7 +914,7 @@ mod tests {
         let mut level = FLSMLevel::new();
         // Guards at keys 0, 100, 200, 300
         for gk in [0u64, 100, 200, 300] {
-            level.guards.push(LevelGuard::new(gk, 0));
+            level.guards.push(LevelGuard::new(gk as u128));
         }
 
         // Range entirely within guard 0
@@ -1066,7 +1038,7 @@ mod tests {
         // All original keys must still be findable via L0.
         for pk in &all_pks {
             let mut found = false;
-            idx.find_pk(*pk, 0, &mut |_, _| found = true);
+            idx.find_pk(*pk as u128, &mut |_, _| found = true);
             assert!(found, "pk {} lost from L0 after failed run_compact", pk);
         }
     }
@@ -1090,21 +1062,21 @@ mod tests {
             let name = format!("src_{}.db", i);
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
             let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
-            idx.levels[0].get_or_create_guard(100, 0).entries.push(entry);
+            idx.levels[0].get_or_create_guard(100).entries.push(entry);
         }
 
         // L1 guard at key=500: 1 shard (so worst_guard picks key=100)
         {
             let path = write_test_shard(dir.path(), "high.db", &[500], &[5000]);
             let entry = ShardEntry::open(&path, &schema, 0, 50).unwrap();
-            idx.levels[0].get_or_create_guard(500, 0).entries.push(entry);
+            idx.levels[0].get_or_create_guard(500).entries.push(entry);
         }
 
         // L2 guard at key=200: 1 shard with key=250
         {
             let path = write_test_shard(dir.path(), "dest.db", &[250], &[2500]);
             let entry = ShardEntry::open(&path, &schema, 0, 80).unwrap();
-            idx.levels[1].get_or_create_guard(200, 0).entries.push(entry);
+            idx.levels[1].get_or_create_guard(200).entries.push(entry);
         }
 
         // Compact L1 → L2 (src_level_num=1)
@@ -1114,13 +1086,13 @@ mod tests {
         // to the routing gap below L2's guard at 200.
         for &pk in &src_pks {
             let mut found = false;
-            idx.find_pk(pk, 0, &mut |_, _| found = true);
+            idx.find_pk(pk as u128, &mut |_, _| found = true);
             assert!(found, "key {} lost after vertical compaction (routing gap bug)", pk);
         }
 
         // The destination key 250 must also still be present
         let mut found_250 = false;
-        idx.find_pk(250, 0, &mut |_, _| found_250 = true);
+        idx.find_pk(250, &mut |_, _| found_250 = true);
         assert!(found_250, "destination key 250 lost after vertical compaction");
     }
 }

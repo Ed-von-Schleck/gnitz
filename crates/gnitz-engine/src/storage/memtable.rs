@@ -202,12 +202,12 @@ impl OwnedBatch {
     }
 
     #[inline]
-    pub fn get_pk_lo(&self, row: usize) -> u64 {
+    fn get_pk_lo(&self, row: usize) -> u64 {
         read_u64_le(&self.pk_lo, row * 8)
     }
 
     #[inline]
-    pub fn get_pk_hi(&self, row: usize) -> u64 {
+    fn get_pk_hi(&self, row: usize) -> u64 {
         read_u64_le(&self.pk_hi, row * 8)
     }
 
@@ -285,13 +285,12 @@ impl OwnedBatch {
         }
     }
 
-    pub fn find_lower_bound(&self, key_lo: u64, key_hi: u64) -> usize {
-        let target = crate::util::make_pk(key_lo, key_hi);
+    pub fn find_lower_bound(&self, key: u128) -> usize {
         let mut lo = 0usize;
         let mut hi = self.count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.get_pk(mid) < target {
+            if self.get_pk(mid) < key {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -311,14 +310,14 @@ impl OwnedBatch {
     /// `col_ptrs[i]` must be valid for `col_sizes[i]` bytes.
     pub unsafe fn append_row(
         &mut self,
-        pk_lo: u64,
-        pk_hi: u64,
+        pk: u128,
         weight: i64,
         null_word: u64,
         col_ptrs: &[*const u8],
         col_sizes: &[u32],
         blob_src: &[u8],
     ) {
+        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
         self.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
         self.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
         self.weight.extend_from_slice(&weight.to_le_bytes());
@@ -403,12 +402,13 @@ impl OwnedBatch {
     /// (or null with len 0).
     pub unsafe fn append_row_simple(
         &mut self,
-        pk_lo: u64, pk_hi: u64, weight: i64, null_word: u64,
+        pk: u128, weight: i64, null_word: u64,
         lo_values: &[i64],
         hi_values: &[u64],
         str_ptrs: &[*const u8],
         str_lens: &[u32],
     ) {
+        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
         self.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
         self.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
         self.weight.extend_from_slice(&weight.to_le_bytes());
@@ -543,14 +543,14 @@ impl OwnedBatch {
     pub fn append_row_from_ptable_found(
         &mut self,
         ptable: &super::partitioned_table::PartitionedTable,
-        pk_lo: u64,
-        pk_hi: u64,
+        pk: u128,
         weight: i64,
     ) {
         let schema = self.schema.expect("append_row_from_ptable_found requires schema");
         let pk_index = schema.pk_index as usize;
         let null_word = ptable.found_null_word();
 
+        let (pk_lo, pk_hi) = crate::util::split_pk(pk);
         self.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
         self.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
         self.weight.extend_from_slice(&weight.to_le_bytes());
@@ -614,8 +614,10 @@ impl OwnedBatch {
 
         for &idx in indices {
             let row = idx as usize;
-            self.pk_lo.extend_from_slice(&src.get_pk_lo(row).to_le_bytes());
-            self.pk_hi.extend_from_slice(&src.get_pk_hi(row).to_le_bytes());
+            let pk = src.get_pk(row);
+            let (lo, hi) = crate::util::split_pk(pk);
+            self.pk_lo.extend_from_slice(&lo.to_le_bytes());
+            self.pk_hi.extend_from_slice(&hi.to_le_bytes());
             self.weight.extend_from_slice(&src.get_weight(row).to_le_bytes());
             let null_word = src.get_null_word(row);
             self.null_bmp.extend_from_slice(&null_word.to_le_bytes());
@@ -888,11 +890,6 @@ fn consolidate_batches(
 }
 
 
-/// Snapshot handle for a consolidated memtable state.
-pub struct MemTableSnapshot {
-    pub inner: Arc<OwnedBatch>,
-}
-
 pub struct MemTable {
     runs: Vec<OwnedBatch>,
     bloom: BloomFilter,
@@ -933,7 +930,7 @@ impl MemTable {
 
         // Add all PKs to bloom
         for i in 0..batch.count {
-            self.bloom.add(batch.get_pk_lo(i), batch.get_pk_hi(i));
+            self.bloom.add(batch.get_pk(i));
         }
 
         self.total_row_count += batch.count;
@@ -945,12 +942,12 @@ impl MemTable {
     }
 
     /// Add a single PK to the bloom filter (for accumulator rows).
-    pub fn bloom_add(&mut self, key_lo: u64, key_hi: u64) {
-        self.bloom.add(key_lo, key_hi);
+    pub fn bloom_add(&mut self, key: u128) {
+        self.bloom.add(key);
     }
 
-    pub fn may_contain_pk(&self, key_lo: u64, key_hi: u64) -> bool {
-        self.bloom.may_contain(key_lo, key_hi)
+    pub fn may_contain_pk(&self, key: u128) -> bool {
+        self.bloom.may_contain(key)
     }
 
     pub fn should_flush(&self) -> bool {
@@ -961,6 +958,7 @@ impl MemTable {
         self.total_row_count == 0
     }
 
+    #[cfg(test)]
     pub fn total_row_count(&self) -> usize {
         self.total_row_count
     }
@@ -987,13 +985,13 @@ impl MemTable {
     ///
     /// Returns `(net_weight, Some((run_idx, row_idx)))` if found, else
     /// `(0, None)`.
-    pub fn lookup_pk(&mut self, key_lo: u64, key_hi: u64) -> (i64, bool) {
+    pub fn lookup_pk(&mut self, key: u128) -> (i64, bool) {
         let mut total_w: i64 = 0;
         self.has_found = false;
 
         for (ri, run) in self.runs.iter().enumerate() {
-            let mut lo = run.find_lower_bound(key_lo, key_hi);
-            while lo < run.count && run.get_pk_lo(lo) == key_lo && run.get_pk_hi(lo) == key_hi {
+            let mut lo = run.find_lower_bound(key);
+            while lo < run.count && run.get_pk(lo) == key {
                 total_w += run.get_weight(lo);
                 if !self.has_found {
                     self.found_run = ri;
@@ -1039,16 +1037,15 @@ impl MemTable {
     /// Find the net weight for rows matching both PK and full payload.
     pub fn find_weight_for_row<S: super::columnar::ColumnarSource>(
         &self,
-        key_lo: u64,
-        key_hi: u64,
+        key: u128,
         ref_source: &S,
         ref_row: usize,
     ) -> i64 {
         let mut total_w: i64 = 0;
 
         for run in &self.runs {
-            let mut lo = run.find_lower_bound(key_lo, key_hi);
-            while lo < run.count && run.get_pk_lo(lo) == key_lo && run.get_pk_hi(lo) == key_hi {
+            let mut lo = run.find_lower_bound(key);
+            while lo < run.count && run.get_pk(lo) == key {
                 let ord = columnar::compare_rows(
                     &self.schema, run, lo, ref_source, ref_row,
                 );
@@ -1069,17 +1066,14 @@ impl MemTable {
     /// Used by `Table::retract_pk` to locate the live row for an UPDATE+DELETE
     /// sequence where the old payload has been cancelled but the new payload
     /// is still positive.
-    pub fn find_positive_payload_row(&mut self, key_lo: u64, key_hi: u64) -> bool {
+    pub fn find_positive_payload_row(&mut self, key: u128) -> bool {
         // Pass 1: collect all PK-matching (run_idx, row_idx) pairs.
         // The iterator borrow on self.runs is fully dropped before pass 2,
         // avoiding any aliasing issue when find_weight_for_row also borrows self.runs.
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         for (ri, run) in self.runs.iter().enumerate() {
-            let mut lo = run.find_lower_bound(key_lo, key_hi);
-            while lo < run.count
-                && run.get_pk_lo(lo) == key_lo
-                && run.get_pk_hi(lo) == key_hi
-            {
+            let mut lo = run.find_lower_bound(key);
+            while lo < run.count && run.get_pk(lo) == key {
                 candidates.push((ri, lo));
                 lo += 1;
             }
@@ -1089,7 +1083,7 @@ impl MemTable {
         // The first candidate with positive net weight is the live row.
         for &(ri, row_idx) in &candidates {
             let mb = self.runs[ri].as_mem_batch();
-            let net_w = self.find_weight_for_row(key_lo, key_hi, &mb, row_idx);
+            let net_w = self.find_weight_for_row(key, &mb, row_idx);
             if net_w > 0 {
                 self.found_run = ri;
                 self.found_row = row_idx;
@@ -1141,9 +1135,6 @@ impl MemTable {
         self.bloom.reset();
     }
 
-    pub fn schema(&self) -> &SchemaDescriptor {
-        &self.schema
-    }
 
     fn invalidate_cache(&mut self) {
         self.cached_consolidated = None;
@@ -1232,12 +1223,12 @@ mod tests {
         let schema = make_u64_i64_schema();
         let batch = make_batch(&schema, &[(10, 1, 100), (20, 1, 200)]);
         assert_eq!(batch.count, 2);
-        assert_eq!(batch.get_pk_lo(0), 10);
-        assert_eq!(batch.get_pk_lo(1), 20);
+        assert_eq!(batch.get_pk(0), 10);
+        assert_eq!(batch.get_pk(1), 20);
 
         let mb = batch.as_mem_batch();
         assert_eq!(mb.count, 2);
-        assert_eq!(mb.get_pk_lo(0), 10);
+        assert_eq!(mb.get_pk(0), 10);
         assert_eq!(mb.get_weight(1), 1);
     }
 
@@ -1257,8 +1248,8 @@ mod tests {
         // Snapshot should consolidate: PK 30 has +1 -1 = 0 (ghost)
         let snap = mt.get_snapshot();
         assert_eq!(snap.count, 2); // PK 10 and 20 survive
-        assert_eq!(snap.get_pk_lo(0), 10);
-        assert_eq!(snap.get_pk_lo(1), 20);
+        assert_eq!(snap.get_pk(0), 10);
+        assert_eq!(snap.get_pk(1), 20);
     }
 
     #[test]
@@ -1291,11 +1282,11 @@ mod tests {
         mt.upsert_sorted_batch(b1).unwrap();
         mt.upsert_sorted_batch(b2).unwrap();
 
-        let (w, found) = mt.lookup_pk(20, 0);
+        let (w, found) = mt.lookup_pk(20);
         assert_eq!(w, 3); // 1 + 2
         assert!(found);
 
-        let (w, found) = mt.lookup_pk(99, 0);
+        let (w, found) = mt.lookup_pk(99);
         assert_eq!(w, 0);
         assert!(!found);
     }
@@ -1308,8 +1299,8 @@ mod tests {
         let b1 = make_batch(&schema, &[(10, 1, 100), (20, 1, 200)]);
         mt.upsert_sorted_batch(b1).unwrap();
 
-        assert!(mt.may_contain_pk(10, 0));
-        assert!(mt.may_contain_pk(20, 0));
+        assert!(mt.may_contain_pk(10));
+        assert!(mt.may_contain_pk(20));
         // 99 might be a false positive, but definitely not in data
     }
 
@@ -1342,7 +1333,7 @@ mod tests {
         mt.reset();
         // Snapshot still valid (Arc keeps data alive)
         assert_eq!(snap.count, 1);
-        assert_eq!(snap.get_pk_lo(0), 10);
+        assert_eq!(snap.get_pk(0), 10);
     }
 
     #[test]
@@ -1378,19 +1369,19 @@ mod tests {
         // Search for PK 10, payload 100 — should find weight 1
         let ref_batch = make_batch(&schema, &[(10, 1, 100)]);
         let ref_mb = ref_batch.as_mem_batch();
-        let w = mt.find_weight_for_row(10, 0, &ref_mb, 0);
+        let w = mt.find_weight_for_row(10, &ref_mb, 0);
         assert_eq!(w, 1);
 
         // Search for PK 10, payload 200 — should find weight 1
         let ref_batch2 = make_batch(&schema, &[(10, 1, 200)]);
         let ref_mb2 = ref_batch2.as_mem_batch();
-        let w2 = mt.find_weight_for_row(10, 0, &ref_mb2, 0);
+        let w2 = mt.find_weight_for_row(10, &ref_mb2, 0);
         assert_eq!(w2, 1);
 
         // Search for PK 10, payload 999 — should find weight 0
         let ref_batch3 = make_batch(&schema, &[(10, 1, 999)]);
         let ref_mb3 = ref_batch3.as_mem_batch();
-        let w3 = mt.find_weight_for_row(10, 0, &ref_mb3, 0);
+        let w3 = mt.find_weight_for_row(10, &ref_mb3, 0);
         assert_eq!(w3, 0);
     }
 
@@ -1450,15 +1441,15 @@ mod tests {
         // Append all rows
         dst.append_batch(&src, 0, 3);
         assert_eq!(dst.count, 3);
-        assert_eq!(dst.get_pk_lo(0), 10);
-        assert_eq!(dst.get_pk_lo(2), 30);
+        assert_eq!(dst.get_pk(0), 10);
+        assert_eq!(dst.get_pk(2), 30);
         assert_eq!(dst.get_weight(1), 1);
 
         // Append subset
         dst.clear();
         dst.append_batch(&src, 1, 2);
         assert_eq!(dst.count, 1);
-        assert_eq!(dst.get_pk_lo(0), 20);
+        assert_eq!(dst.get_pk(0), 20);
     }
 
     #[test]
@@ -1471,7 +1462,7 @@ mod tests {
         assert_eq!(dst.count, 2);
         assert_eq!(dst.get_weight(0), -1);
         assert_eq!(dst.get_weight(1), -2);
-        assert_eq!(dst.get_pk_lo(0), 10);
+        assert_eq!(dst.get_pk(0), 10);
     }
 
     #[test]
@@ -1571,7 +1562,7 @@ mod tests {
         // After consolidation: only (PK=0, group=0, sum=15000, w=+1) should remain
         assert_eq!(consolidated.count, 1,
             "expected 1 row after consolidation, got {}", consolidated.count);
-        assert_eq!(consolidated.get_pk_lo(0), 0);
+        assert_eq!(consolidated.get_pk(0), 0);
         assert_eq!(consolidated.get_weight(0), 1);
         // Check agg_val (payload column 1) = 15000
         let agg_bytes = consolidated.get_col_ptr(0, 1, 8);
@@ -1611,7 +1602,7 @@ mod tests {
         let ptrs = [s.as_ptr()];
         let lens = [s.len() as u32];
         unsafe {
-            batch.append_row_simple(1, 0, 1, 0, &lo, &hi, &ptrs, &lens);
+            batch.append_row_simple(1, 1, 0, &lo, &hi, &ptrs, &lens);
         }
 
         // Row 1: null string (null_word bit 0 set)
@@ -1619,7 +1610,7 @@ mod tests {
         let ptrs2 = [null_ptr];
         let lens2 = [0u32];
         unsafe {
-            batch.append_row_simple(2, 0, 1, 1, &[0i64], &[0u64], &ptrs2, &lens2);
+            batch.append_row_simple(2, 1, 1, &[0i64], &[0u64], &ptrs2, &lens2);
         }
 
         assert_eq!(batch.count, 2);
@@ -1657,7 +1648,7 @@ mod tests {
             let ptrs = [name.as_ptr(), desc.as_ptr()];
             let lens = [name.len() as u32, desc.len() as u32];
             unsafe {
-                batch.append_row_simple(pk as u64, 0, 1, 0, &lo, &hi, &ptrs, &lens);
+                batch.append_row_simple(pk as u128, 1, 0, &lo, &hi, &ptrs, &lens);
             }
         }
 
@@ -1717,7 +1708,7 @@ mod tests {
         hi[11] = 0xCAFEBABE;
 
         unsafe {
-            batch.append_row_simple(100, 0, 1, 0, &lo, &hi, &ptrs, &lens);
+            batch.append_row_simple(100, 1, 0, &lo, &hi, &ptrs, &lens);
         }
 
         assert_eq!(batch.count, 1);
@@ -1778,7 +1769,7 @@ mod tests {
         let col_ptrs = [gs_struct.as_ptr()];
         let col_sizes = [16u32];
         unsafe {
-            batch.append_row(1, 0, 1, 0, &col_ptrs, &col_sizes, blob_src);
+            batch.append_row(1, 1, 0, &col_ptrs, &col_sizes, blob_src);
         }
 
         // The stored German String header must have length=5 (actual bytes written),
@@ -1806,7 +1797,7 @@ mod tests {
         mt.upsert_sorted_batch(b2).unwrap();
 
         // Net weights: val=100 → 1-1=0, val=200 → 1 (positive)
-        let found = mt.find_positive_payload_row(10, 0);
+        let found = mt.find_positive_payload_row(10);
         assert!(found, "should find a live row");
         assert!(mt.has_found);
 
@@ -1819,7 +1810,7 @@ mod tests {
         assert_eq!(val, 200, "found row should be the live val=200 row, not the retracted val=100");
 
         // PK with no rows at all → not found
-        let found2 = mt.find_positive_payload_row(99, 0);
+        let found2 = mt.find_positive_payload_row(99);
         assert!(!found2);
         assert!(!mt.has_found);
     }
@@ -1843,8 +1834,8 @@ mod tests {
 
         let snap = mt.get_snapshot();
         assert_eq!(snap.count, 16);
-        assert_eq!(snap.get_pk_lo(0), 1);
-        assert_eq!(snap.get_pk_lo(15), 16);
+        assert_eq!(snap.get_pk(0), 1);
+        assert_eq!(snap.get_pk(15), 16);
     }
 
     #[test]
@@ -1869,7 +1860,7 @@ mod tests {
         // PK 1 cancelled out: 14 - 1 + 1 new = 14 survive
         assert_eq!(snap.count, 14);
         // PK 1 should be gone, first row is PK 2
-        assert_eq!(snap.get_pk_lo(0), 2);
+        assert_eq!(snap.get_pk(0), 2);
     }
 
     #[test]
@@ -1983,7 +1974,7 @@ mod tests {
             mt.upsert_sorted_batch(b).unwrap();
         }
         // lookup_pk sets has_found
-        let (w, found) = mt.lookup_pk(5, 0);
+        let (w, found) = mt.lookup_pk(5);
         assert_eq!(w, 1);
         assert!(found);
         assert!(mt.has_found);

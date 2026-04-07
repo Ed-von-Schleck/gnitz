@@ -349,7 +349,7 @@ impl DagEngine {
             Ok(c) => c,
             Err(_) => return result,
         };
-        ch.cursor.seek(0, view_id);
+        ch.cursor.seek(crate::util::make_pk(0, view_id));
         while ch.cursor.valid && ch.cursor.current_key_hi == view_id {
             if ch.cursor.current_weight > 0 {
                 let node_id = ch.cursor.current_key_lo as i32;
@@ -372,7 +372,7 @@ impl DagEngine {
             Ok(c) => c,
             Err(_) => return result,
         };
-        ch.cursor.seek(0, view_id);
+        ch.cursor.seek(crate::util::make_pk(0, view_id));
         while ch.cursor.valid && ch.cursor.current_key_hi == view_id {
             if ch.cursor.current_weight > 0 {
                 let edge_id = ch.cursor.current_key_lo as i32;
@@ -401,7 +401,7 @@ impl DagEngine {
             Ok(c) => c,
             Err(_) => return result,
         };
-        ch.cursor.seek(0, view_id);
+        ch.cursor.seek(crate::util::make_pk(0, view_id));
         while ch.cursor.valid && ch.cursor.current_key_hi == view_id {
             if ch.cursor.current_weight > 0 {
                 let lo64 = ch.cursor.current_key_lo;
@@ -426,7 +426,7 @@ impl DagEngine {
             Ok(c) => c,
             Err(_) => return result,
         };
-        ch.cursor.seek(0, view_id);
+        ch.cursor.seek(crate::util::make_pk(0, view_id));
         while ch.cursor.valid && ch.cursor.current_key_hi == view_id {
             if ch.cursor.current_weight > 0 {
                 let node_id = ch.cursor.current_key_lo as i32;
@@ -1381,21 +1381,20 @@ impl DagEngine {
         }
 
         let mut effective = OwnedBatch::with_schema(*schema, batch.count * 2);
-        // Track seen PKs for intra-batch dedup: (pk_lo, pk_hi) → last position
-        let mut seen: HashMap<(u64, u64), usize> = HashMap::new();
+        // Track seen PKs for intra-batch dedup: pk u128 → last position
+        let mut seen: HashMap<u128, usize> = HashMap::new();
 
         for row in 0..batch.count {
             let w = batch.get_weight(row);
-            let pk_lo = batch.get_pk_lo(row);
-            let pk_hi = batch.get_pk_hi(row);
+            let pk = batch.get_pk(row);
 
             if w > 0 {
                 // Positive weight = insertion → retract existing if any
-                let (_existing_w, _found) = table.retract_pk(pk_lo, pk_hi);
+                let (_existing_w, _found) = table.retract_pk(pk);
 
                 // Intra-batch dedup: if we've already seen this PK in this batch,
                 // retract the previous insertion.
-                if let Some(&prev_pos) = seen.get(&(pk_lo, pk_hi)) {
+                if let Some(&prev_pos) = seen.get(&pk) {
                     // The previous row at prev_pos was a +1 insertion.
                     // We need to retract it by adding a -1 with the same payload.
                     effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
@@ -1403,7 +1402,7 @@ impl DagEngine {
 
                 // Add the new insertion
                 effective.append_batch(&batch, row, row + 1);
-                seen.insert((pk_lo, pk_hi), effective.count - 1);
+                seen.insert(pk, effective.count - 1);
             } else if w < 0 {
                 // Negative weight = deletion
                 effective.append_batch(&batch, row, row + 1);
@@ -1429,43 +1428,42 @@ impl DagEngine {
         }
 
         let mut effective = OwnedBatch::with_schema(*schema, batch.count * 2);
-        let mut seen: HashMap<(u64, u64), usize> = HashMap::new();
+        let mut seen: HashMap<u128, usize> = HashMap::new();
 
         for row in 0..batch.count {
             let w = batch.get_weight(row);
-            let pk_lo = batch.get_pk_lo(row);
-            let pk_hi = batch.get_pk_hi(row);
+            let pk = batch.get_pk(row);
 
             if w > 0 {
                 // Check store for existing row with this PK
-                let (_existing_w, found) = ptable.retract_pk(pk_lo, pk_hi);
+                let (_existing_w, found) = ptable.retract_pk(pk);
                 if found {
                     // Emit retraction of existing stored row so downstream views
                     // see the removal of the old payload.
-                    effective.append_row_from_ptable_found(ptable, pk_lo, pk_hi, -1);
+                    effective.append_row_from_ptable_found(ptable, pk, -1);
                 }
 
                 // Intra-batch dedup: retract previous insertion of same PK
-                if let Some(&prev_pos) = seen.get(&(pk_lo, pk_hi)) {
+                if let Some(&prev_pos) = seen.get(&pk) {
                     effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
                 }
 
                 // Add the new insertion
                 effective.append_batch(&batch, row, row + 1);
-                seen.insert((pk_lo, pk_hi), effective.count - 1);
+                seen.insert(pk, effective.count - 1);
             } else if w < 0 {
                 // Negative weight = explicit retraction
-                let (_existing_w, found) = ptable.retract_pk(pk_lo, pk_hi);
+                let (_existing_w, found) = ptable.retract_pk(pk);
                 if found {
                     // Emit retraction using stored payload (the actual column data)
-                    effective.append_row_from_ptable_found(ptable, pk_lo, pk_hi, -1);
+                    effective.append_row_from_ptable_found(ptable, pk, -1);
                 }
 
                 // Intra-batch dedup: if this PK was inserted earlier in this batch,
                 // negate that insertion to cancel it out.
-                if let Some(&prev_pos) = seen.get(&(pk_lo, pk_hi)) {
+                if let Some(&prev_pos) = seen.get(&pk) {
                     effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
-                    seen.remove(&(pk_lo, pk_hi));
+                    seen.remove(&pk);
                 } else if !found {
                     // Not in store and not in batch — pass through as-is
                     effective.append_batch(&batch, row, row + 1);
@@ -1517,7 +1515,7 @@ impl DagEngine {
 
             // Read source column value as index key
             let (key_lo, key_hi) = if is_pk_col {
-                (src.get_pk_lo(row), src.get_pk_hi(row))
+                crate::util::split_pk(src.get_pk(row))
             } else {
                 let col_data = &src.col_data[src_payload_idx];
                 let offset = row * src_col_size;
@@ -1542,8 +1540,8 @@ impl DagEngine {
             };
 
             // Payload = source row's PK
-            let src_pk_lo = src.get_pk_lo(row);
-            let src_pk_hi = src.get_pk_hi(row);
+            let src_pk = src.get_pk(row);
+            let (src_pk_lo, src_pk_hi) = crate::util::split_pk(src_pk);
 
             out.pk_lo.extend_from_slice(&key_lo.to_le_bytes());
             out.pk_hi.extend_from_slice(&key_hi.to_le_bytes());

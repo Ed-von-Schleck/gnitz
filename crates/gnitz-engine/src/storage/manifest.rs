@@ -59,7 +59,6 @@ impl ManifestEntryRaw {
     }
 }
 
-pub const MANIFEST_OK: i32 = 0;
 pub const MANIFEST_ERR_MAGIC: i32 = -1;
 pub const MANIFEST_ERR_TRUNCATED: i32 = -2;
 

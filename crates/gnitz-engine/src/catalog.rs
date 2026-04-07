@@ -1027,7 +1027,7 @@ fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk_lo: u64, 
         Ok(c) => c,
         Err(_) => return batch,
     };
-    cursor.cursor.seek(pk_lo, pk_hi);
+    cursor.cursor.seek(crate::util::make_pk(pk_lo, pk_hi));
     if cursor.cursor.valid
         && cursor.cursor.current_key_lo == pk_lo
         && cursor.cursor.current_key_hi == pk_hi
@@ -1047,7 +1047,7 @@ fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u6
         Ok(c) => c,
         Err(_) => return batch,
     };
-    cursor.cursor.seek(0, pk_hi);
+    cursor.cursor.seek(crate::util::make_pk(0, pk_hi));
     while cursor.cursor.valid && cursor.cursor.current_key_hi == pk_hi {
         if cursor.cursor.current_weight > 0 {
             copy_cursor_row_with_weight(&cursor, schema, &mut batch, -1);
@@ -1085,7 +1085,7 @@ impl CatalogEngine {
     fn on_schema_delta(&mut self, batch: &OwnedBatch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
-            let sid = batch.get_pk_lo(i) as i64;
+            let sid = batch.get_pk(i) as i64;
             let name = self.read_batch_string(batch, i, 0); // COL_NAME at payload col 0
             gnitz_debug!("catalog: on_schema_delta sid={} weight={} name={:?}", sid, weight, name);
 
@@ -1117,7 +1117,7 @@ impl CatalogEngine {
     fn on_table_delta(&mut self, batch: &OwnedBatch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
-            let tid = batch.get_pk_lo(i) as i64;
+            let tid = batch.get_pk(i) as i64;
             let sid = self.read_batch_u64(batch, i, 0) as i64; // TABLETAB_COL_SCHEMA_ID
             let name = self.read_batch_string(batch, i, 1);    // TABLETAB_COL_NAME
             let pk_col_idx = self.read_batch_u64(batch, i, 3) as u32; // TABLETAB_COL_PK_COL_IDX
@@ -1231,7 +1231,7 @@ impl CatalogEngine {
     fn on_view_delta(&mut self, batch: &OwnedBatch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
-            let vid = batch.get_pk_lo(i) as i64;
+            let vid = batch.get_pk(i) as i64;
             let sid = self.read_batch_u64(batch, i, 0) as i64;
             let name = self.read_batch_string(batch, i, 1);
 
@@ -1320,7 +1320,7 @@ impl CatalogEngine {
     fn on_index_delta(&mut self, batch: &OwnedBatch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
-            let idx_id = batch.get_pk_lo(i) as i64;
+            let idx_id = batch.get_pk(i) as i64;
             let owner_id = self.read_batch_u64(batch, i, 0) as i64;
             let source_col_idx = self.read_batch_u64(batch, i, 2) as u32;
             let name = self.read_batch_string(batch, i, 3);
@@ -1480,7 +1480,7 @@ impl CatalogEngine {
             Ok(c) => c,
             Err(_) => return Ok(Vec::new()),
         };
-        cursor.cursor.seek(start_pk, 0);
+        cursor.cursor.seek(crate::util::make_pk(start_pk, 0));
 
         let mut defs = Vec::new();
         while cursor.cursor.valid {
@@ -1974,7 +1974,7 @@ impl CatalogEngine {
         // Read the full index record from sys_indices to retract it
         let mut cursor = self.sys_indices.create_cursor()
             .map_err(|e| format!("cursor error: {}", e))?;
-        cursor.cursor.seek(idx_id as u64, 0);
+        cursor.cursor.seek(crate::util::make_pk(idx_id as u64, 0));
 
         if !cursor.cursor.valid || cursor.cursor.current_key_lo != idx_id as u64 {
             return Err(format!("Index {} not found in catalog", index_name));
@@ -2120,7 +2120,7 @@ impl CatalogEngine {
             Ok(c) => c,
             Err(_) => return,
         };
-        cursor.cursor.seek(0, vid as u64);
+        cursor.cursor.seek(crate::util::make_pk(0, vid as u64));
 
         let end_hi = (vid + 1) as u64;
         let mut bb = BatchBuilder::new(schema);
@@ -2392,7 +2392,7 @@ impl CatalogEngine {
             Err(_) => return Ok(None),
         };
 
-        cursor.cursor.seek(pk_lo, pk_hi);
+        cursor.cursor.seek(crate::util::make_pk(pk_lo, pk_hi));
         if !cursor.cursor.valid { return Ok(None); }
         if cursor.cursor.current_key_lo != pk_lo || cursor.cursor.current_key_hi != pk_hi {
             return Ok(None);
@@ -2419,7 +2419,7 @@ impl CatalogEngine {
         // Seek in index table
         let idx_table = unsafe { &mut *(std::ptr::addr_of!(*ic.index_table) as *mut Table) };
         let mut cursor = idx_table.create_cursor().map_err(|e| format!("cursor error: {}", e))?;
-        cursor.cursor.seek(key_lo, key_hi);
+        cursor.cursor.seek(crate::util::make_pk(key_lo, key_hi));
         if !cursor.cursor.valid { return Ok(None); }
         if cursor.cursor.current_key_lo != key_lo || cursor.cursor.current_key_hi != key_hi {
             return Ok(None);
@@ -2752,15 +2752,16 @@ impl CatalogEngine {
                 let (fk_lo, fk_hi) = self.promote_to_pk_key(batch, row, payload_col, col_type);
 
                 // Check if target has this PK
+                let fk_key = crate::util::make_pk(fk_lo, fk_hi);
                 let has = match &target_entry.handle {
                     StoreHandle::Single(ref t) => {
                         let table = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
-                        table.has_pk(fk_lo, fk_hi)
+                        table.has_pk(fk_key)
                     }
-                    StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.has_pk(fk_lo, fk_hi),
+                    StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.has_pk(fk_key),
                     StoreHandle::Partitioned(ref pt) => {
                         let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
-                        ptable.has_pk(fk_lo, fk_hi)
+                        ptable.has_pk(fk_key)
                     }
                 };
 
@@ -2820,21 +2821,20 @@ impl CatalogEngine {
                 let null_word = batch.get_null_word(row);
                 if null_word & (1u64 << payload_col) != 0 { continue; }
 
-                let row_pk_lo = batch.get_pk_lo(row);
-                let row_pk_hi = batch.get_pk_hi(row);
+                let row_pk = batch.get_pk(row);
 
                 // Determine if this is an UPSERT (PK already exists in store)
                 let is_upsert = if entry.unique_pk {
                     match &entry.handle {
                         StoreHandle::Partitioned(ref pt) => {
                             let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
-                            ptable.has_pk(row_pk_lo, row_pk_hi)
+                            ptable.has_pk(row_pk)
                         }
                         StoreHandle::Single(ref t) => {
                             let table = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
-                            table.has_pk(row_pk_lo, row_pk_hi)
+                            table.has_pk(row_pk)
                         }
-                        StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.has_pk(row_pk_lo, row_pk_hi),
+                        StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.has_pk(row_pk),
                     }
                 } else {
                     false
@@ -2854,12 +2854,13 @@ impl CatalogEngine {
                 seen.insert((key_lo, key_hi), true);
 
                 // Check index store for existing key
-                if idx_table.has_pk(key_lo, key_hi) {
+                let key_u128 = crate::util::make_pk(key_lo, key_hi);
+                if idx_table.has_pk(key_u128) {
                     if is_upsert {
                         // For UPSERT: the index entry might belong to this same row
                         // (same value being re-inserted). Check the index payload (source PK).
                         // Index schema: PK = index_key, payload[0] = source_pk.
-                        let (_net_w, found) = idx_table.retract_pk(key_lo, key_hi);
+                        let (_net_w, found) = idx_table.retract_pk(key_u128);
                         if found {
                             // Read the source PK from the index entry's payload
                             let idx_schema = &ic.index_schema;
@@ -2877,7 +2878,8 @@ impl CatalogEngine {
                                     (u64::from_le_bytes(buf), 0u64)
                                 };
                                 // If the index entry belongs to a DIFFERENT PK, it's a violation
-                                if src_pk_lo != row_pk_lo || src_pk_hi != row_pk_hi {
+                                let src_pk = crate::util::make_pk(src_pk_lo, src_pk_hi);
+                                if src_pk != row_pk {
                                     let col_names = self.get_column_names(table_id);
                                     let cname = col_names.get(source_col_idx).map(|s| s.as_str()).unwrap_or("?");
                                     return Err(format!(
@@ -4093,7 +4095,7 @@ mod tests {
         assert!(found.is_some());
         let row = found.unwrap();
         assert_eq!(row.count, 1);
-        assert_eq!(row.get_pk_lo(0), 2);
+        assert_eq!(row.get_pk(0), 2);
 
         // Seek missing
         let not_found = engine.seek_family(tid, 99, 0).unwrap();
@@ -4126,7 +4128,7 @@ mod tests {
         // Scan — should have exactly 1 row with val=200
         let scan = engine.scan_family(tid).unwrap();
         assert_eq!(scan.count, 1);
-        assert_eq!(scan.get_pk_lo(0), 1);
+        assert_eq!(scan.get_pk(0), 1);
 
         engine.close();
         let _ = fs::remove_dir_all(&dir);
@@ -4405,7 +4407,7 @@ mod tests {
         assert!(result.is_some());
         let row = result.unwrap();
         assert_eq!(row.count, 1);
-        assert_eq!(row.get_pk_lo(0), 20);
+        assert_eq!(row.get_pk(0), 20);
 
         engine.close();
         let _ = fs::remove_dir_all(&dir);
@@ -4452,11 +4454,11 @@ mod tests {
 
         let result = engine.seek_by_index(tid, 1, 42, 0).unwrap();
         assert!(result.is_some(), "U8 index lookup must find the row");
-        assert_eq!(result.unwrap().get_pk_lo(0), 10);
+        assert_eq!(result.unwrap().get_pk(0), 10);
 
         let result2 = engine.seek_by_index(tid, 1, 99, 0).unwrap();
         assert!(result2.is_some());
-        assert_eq!(result2.unwrap().get_pk_lo(0), 20);
+        assert_eq!(result2.unwrap().get_pk(0), 20);
 
         engine.close();
         let _ = fs::remove_dir_all(&dir);
@@ -4479,7 +4481,7 @@ mod tests {
 
         let result = engine.seek_by_index(tid, 1, 443, 0).unwrap();
         assert!(result.is_some(), "U16 index lookup must find the row");
-        assert_eq!(result.unwrap().get_pk_lo(0), 2);
+        assert_eq!(result.unwrap().get_pk(0), 2);
 
         engine.close();
         let _ = fs::remove_dir_all(&dir);
@@ -4534,12 +4536,12 @@ mod tests {
         let neg5_key = (-5i32) as u32 as u64;
         let result = engine.seek_by_index(tid, 1, neg5_key, 0).unwrap();
         assert!(result.is_some(), "I32 negative index lookup must find the row");
-        assert_eq!(result.unwrap().get_pk_lo(0), 1);
+        assert_eq!(result.unwrap().get_pk(0), 1);
 
         // Seek positive value
         let result2 = engine.seek_by_index(tid, 1, 10, 0).unwrap();
         assert!(result2.is_some());
-        assert_eq!(result2.unwrap().get_pk_lo(0), 2);
+        assert_eq!(result2.unwrap().get_pk(0), 2);
 
         engine.close();
         let _ = fs::remove_dir_all(&dir);
@@ -4575,8 +4577,8 @@ mod tests {
         assert_eq!(effective.get_weight(0), -1, "First row should be retraction");
         assert_eq!(effective.get_weight(1), 1, "Second row should be insertion");
         // Both should have PK=1
-        assert_eq!(effective.get_pk_lo(0), 1);
-        assert_eq!(effective.get_pk_lo(1), 1);
+        assert_eq!(effective.get_pk(0), 1);
+        assert_eq!(effective.get_pk(1), 1);
 
         engine.close();
         let _ = fs::remove_dir_all(&dir);

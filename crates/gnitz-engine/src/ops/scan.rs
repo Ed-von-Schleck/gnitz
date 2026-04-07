@@ -100,16 +100,16 @@ mod tests {
         // First scan: chunk_limit=3 → get 3 rows
         let out1 = op_scan_trace(ch.cursor_mut(), &schema, 3);
         assert_eq!(out1.count, 3);
-        assert_eq!(out1.get_pk_lo(0), 1);
-        assert_eq!(out1.get_pk_lo(2), 3);
+        assert_eq!(out1.get_pk(0), 1);
+        assert_eq!(out1.get_pk(2), 3);
         assert!(out1.sorted);
         assert!(out1.consolidated);
 
         // Second scan: remaining 2 rows
         let out2 = op_scan_trace(ch.cursor_mut(), &schema, 3);
         assert_eq!(out2.count, 2);
-        assert_eq!(out2.get_pk_lo(0), 4);
-        assert_eq!(out2.get_pk_lo(1), 5);
+        assert_eq!(out2.get_pk(0), 4);
+        assert_eq!(out2.get_pk(1), 5);
     }
 
     #[test]

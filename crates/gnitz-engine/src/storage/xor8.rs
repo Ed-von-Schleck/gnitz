@@ -17,7 +17,7 @@ pub fn build(pk_lo: &[u64], pk_hi: &[u64]) -> Option<Xor8> {
     let mut keys: Vec<u64> = pk_lo[..n]
         .iter()
         .zip(pk_hi[..n].iter())
-        .map(|(&lo, &hi)| xxh::hash_u128(lo, hi))
+        .map(|(&lo, &hi)| xxh::hash_u128(crate::util::make_pk(lo, hi)))
         .collect();
     keys.sort_unstable();
     keys.dedup();
@@ -28,8 +28,8 @@ pub fn build(pk_lo: &[u64], pk_hi: &[u64]) -> Option<Xor8> {
 }
 
 /// Check if a key may be present in the filter.
-pub fn may_contain(filter: &Xor8, key_lo: u64, key_hi: u64) -> bool {
-    let h = xxh::hash_u128(key_lo, key_hi);
+pub fn may_contain(filter: &Xor8, key: u128) -> bool {
+    let h = xxh::hash_u128(key);
     filter.contains(&h)
 }
 
@@ -92,7 +92,7 @@ mod tests {
         let hi: Vec<u64> = vec![0; 1000];
         let filter = build(&lo, &hi).unwrap();
         for i in 0..1000u64 {
-            assert!(may_contain(&filter, i, 0), "false negative for key {}", i);
+            assert!(may_contain(&filter, i as u128), "false negative for key {}", i);
         }
     }
 
@@ -103,7 +103,7 @@ mod tests {
         let filter = build(&lo, &hi).unwrap();
         let mut fp = 0u32;
         for i in 10_000u64..20_000 {
-            if may_contain(&filter, i, 0) {
+            if may_contain(&filter, i as u128) {
                 fp += 1;
             }
         }
@@ -114,8 +114,8 @@ mod tests {
     #[test]
     fn small_set() {
         let filter = build(&[100, 200], &[0, 0]).unwrap();
-        assert!(may_contain(&filter, 100, 0));
-        assert!(may_contain(&filter, 200, 0));
+        assert!(may_contain(&filter, 100));
+        assert!(may_contain(&filter, 200));
     }
 
     #[test]
@@ -134,7 +134,7 @@ mod tests {
         // Verify all original keys found in restored filter
         for i in 0..500u64 {
             assert!(
-                may_contain(&restored, i, 42),
+                may_contain(&restored, crate::util::make_pk(i, 42)),
                 "roundtrip false negative for key {}",
                 i
             );

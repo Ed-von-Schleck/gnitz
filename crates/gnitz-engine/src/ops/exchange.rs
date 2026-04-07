@@ -62,7 +62,7 @@ impl PartitionRouter {
         for row in 0..batch.count {
             let weight = batch.get_weight(row);
             let key_lo = if col_idx as usize == pki {
-                mb.get_pk_lo(row)
+                mb.get_pk(row) as u64
             } else {
                 let pi = payload_idx(col_idx as usize, pki);
                 let col = &schema.columns[col_idx as usize];
@@ -110,10 +110,10 @@ fn hash_row_for_partition(
 ) -> usize {
     let pki = schema.pk_index as usize;
     if col_indices.len() == 1 && col_indices[0] as usize == pki {
-        return partition_for_key(mb.get_pk_lo(row), mb.get_pk_hi(row));
+        return partition_for_key(mb.get_pk(row));
     }
     let (lo, hi) = extract_group_key(mb, row, schema, col_indices);
-    partition_for_key(lo, hi)
+    partition_for_key(crate::util::make_pk(lo, hi))
 }
 
 pub fn op_repartition_batch(
@@ -226,12 +226,7 @@ pub fn op_repartition_batches_merged(
                 Some(mw) => {
                     let min_src = sources[mw].as_ref().unwrap();
                     let min_idx = cursors[mw];
-                    let cur_hi = src.get_pk_hi(idx);
-                    let min_hi = min_src.get_pk_hi(min_idx);
-                    if cur_hi < min_hi
-                        || (cur_hi == min_hi
-                            && src.get_pk_lo(idx) < min_src.get_pk_lo(min_idx))
-                    {
+                    if src.get_pk(idx) < min_src.get_pk(min_idx) {
                         min_w = Some(w);
                     }
                 }
@@ -515,11 +510,11 @@ mod tests {
 
         for &pk in pk_vals {
             let expected = worker_for_partition(
-                partition_for_key(pk, 0),
+                partition_for_key(pk as u128),
                 num_workers,
             );
             let found = (0..sub_batches[expected].count)
-                .any(|r| sub_batches[expected].get_pk_lo(r) == pk);
+                .any(|r| (sub_batches[expected].get_pk(r) as u64) == pk);
             assert!(found, "pk={pk} not found in worker {expected}");
         }
     }
@@ -552,12 +547,11 @@ mod tests {
 
         for &(lo, hi) in pk_pairs {
             let expected = worker_for_partition(
-                partition_for_key(lo, hi),
+                partition_for_key(crate::util::make_pk(lo, hi)),
                 num_workers,
             );
             let found = (0..sub_batches[expected].count).any(|r| {
-                sub_batches[expected].get_pk_lo(r) == lo
-                    && sub_batches[expected].get_pk_hi(r) == hi
+                sub_batches[expected].get_pk(r) == crate::util::make_pk(lo, hi)
             });
             assert!(found, "pk=({lo},{hi}) not in worker {expected}");
         }
@@ -599,13 +593,13 @@ mod tests {
         let mut worker_of_1 = None;
         for w in 0..num_workers {
             for r in 0..sub_batches[w].count {
-                if sub_batches[w].get_pk_lo(r) == 1 {
+                if (sub_batches[w].get_pk(r) as u64) == 1 {
                     worker_of_1 = Some(w);
                 }
             }
         }
         let w1 = worker_of_1.expect("pk=1 must be in some worker");
-        let pk2_same = (0..sub_batches[w1].count).any(|r| sub_batches[w1].get_pk_lo(r) == 2);
+        let pk2_same = (0..sub_batches[w1].count).any(|r| (sub_batches[w1].get_pk(r) as u64) == 2);
         assert!(pk2_same, "same short string 'hello' must route to same worker");
 
         // Long string (> 12 bytes): two rows must go to same worker
@@ -617,13 +611,13 @@ mod tests {
         let mut worker_of_10 = None;
         for w in 0..num_workers {
             for r in 0..sub2[w].count {
-                if sub2[w].get_pk_lo(r) == 10 {
+                if (sub2[w].get_pk(r) as u64) == 10 {
                     worker_of_10 = Some(w);
                 }
             }
         }
         let w10 = worker_of_10.expect("pk=10 must be in some worker");
-        let pk11_same = (0..sub2[w10].count).any(|r| sub2[w10].get_pk_lo(r) == 11);
+        let pk11_same = (0..sub2[w10].count).any(|r| (sub2[w10].get_pk(r) as u64) == 11);
         assert!(pk11_same, "same long string must route to same worker");
     }
 
@@ -738,7 +732,7 @@ mod tests {
         assert_eq!(total_rows(&sub_batches), vals.len());
 
         for &v in &vals {
-            let expected_partition = partition_for_key(v as u64, 0);
+            let expected_partition = partition_for_key(v as u128);
             let expected_worker = worker_for_partition(expected_partition, num_workers);
             let found = (0..sub_batches[expected_worker].count).any(|r| {
                 i64::from_le_bytes(
@@ -835,12 +829,12 @@ mod tests {
             out.count
         );
 
-        assert_eq!(out.get_pk_lo(0), 1);
+        assert_eq!((out.get_pk(0) as u64), 1);
         let val0 = i64::from_le_bytes(out.col_data[0][0..8].try_into().unwrap());
         assert_eq!(val0, 100);
         assert_eq!(out.get_weight(0), -1);
 
-        assert_eq!(out.get_pk_lo(1), 1);
+        assert_eq!((out.get_pk(1) as u64), 1);
         let val1 = i64::from_le_bytes(out.col_data[0][8..16].try_into().unwrap());
         assert_eq!(val1, 200);
         assert_eq!(out.get_weight(1), 1);

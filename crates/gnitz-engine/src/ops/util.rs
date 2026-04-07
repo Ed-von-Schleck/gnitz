@@ -67,11 +67,6 @@ pub(super) fn signum(x: i64) -> i64 {
     if x > 0 { 1 } else if x < 0 { -1 } else { 0 }
 }
 
-#[inline]
-pub(super) fn pk_lt(a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64) -> bool {
-    (a_hi, a_lo) < (b_hi, b_lo)
-}
-
 /// Append a row from a ReadCursor to an OwnedBatch.
 pub(super) fn append_cursor_row_to_batch(
     output: &mut OwnedBatch,

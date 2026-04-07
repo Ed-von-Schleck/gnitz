@@ -81,7 +81,7 @@ fn copy_column(
         let stride = out_schema.columns[out_ci].size as usize;
         let mut buf = vec![0u8; n * stride];
         for row in 0..n {
-            let pk_lo = in_batch.get_pk_lo(row);
+            let pk_lo = in_batch.get_pk(row) as u64;
             buf[row * stride..row * stride + 8]
                 .copy_from_slice(&pk_lo.to_le_bytes());
         }
@@ -338,7 +338,7 @@ impl Plan {
                     }
                 } else {
                     let raw = if ci == pki {
-                        batch.get_pk_lo(row) as i64
+                        batch.get_pk(row) as i64
                     } else {
                         let pi = if ci < pki { ci } else { ci - 1 };
                         let ptr = batch.get_col_ptr(row, pi, 8);

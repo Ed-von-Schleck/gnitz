@@ -441,7 +441,7 @@ fn open_system_cursor(
     }
     let t = unsafe { &mut *table };
     let mut ch = t.create_cursor().ok()?;
-    ch.cursor.seek(0, view_id);
+    ch.cursor.seek(crate::util::make_pk(0, view_id));
     Some(ch)
 }
 

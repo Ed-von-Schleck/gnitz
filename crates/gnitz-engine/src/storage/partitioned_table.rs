@@ -93,7 +93,7 @@ impl PartitionedTable {
         }
 
         for i in 0..batch.count {
-            let p = partition_for_key(batch.get_pk_lo(i), batch.get_pk_hi(i));
+            let p = partition_for_key(batch.get_pk(i));
             part_indices[p].push(i as u32);
         }
 
@@ -171,20 +171,20 @@ impl PartitionedTable {
     // PK lookups
     // ------------------------------------------------------------------
 
-    pub fn has_pk(&mut self, key_lo: u64, key_hi: u64) -> bool {
+    pub fn has_pk(&mut self, key: u128) -> bool {
         if self.tables.is_empty() {
             return false;
         }
         if self.num_partitions == 1 {
-            return self.tables[0].has_pk(key_lo, key_hi);
+            return self.tables[0].has_pk(key);
         }
-        match self.local_index(key_lo, key_hi) {
-            Some(local) => self.tables[local].has_pk(key_lo, key_hi),
+        match self.local_index(key) {
+            Some(local) => self.tables[local].has_pk(key),
             None => false,
         }
     }
 
-    pub fn retract_pk(&mut self, key_lo: u64, key_hi: u64) -> (i64, bool) {
+    pub fn retract_pk(&mut self, key: u128) -> (i64, bool) {
         self.last_found_partition = None;
         if self.tables.is_empty() {
             return (0, false);
@@ -192,12 +192,12 @@ impl PartitionedTable {
         let local = if self.num_partitions == 1 {
             0
         } else {
-            match self.local_index(key_lo, key_hi) {
+            match self.local_index(key) {
                 Some(l) => l,
                 None => return (0, false),
             }
         };
-        let (w, found) = self.tables[local].retract_pk(key_lo, key_hi);
+        let (w, found) = self.tables[local].retract_pk(key);
         if found {
             self.last_found_partition = Some(local);
         }
@@ -206,8 +206,7 @@ impl PartitionedTable {
 
     pub fn get_weight_for_row<S: super::columnar::ColumnarSource>(
         &mut self,
-        key_lo: u64,
-        key_hi: u64,
+        key: u128,
         ref_source: &S,
         ref_row: usize,
     ) -> i64 {
@@ -215,10 +214,10 @@ impl PartitionedTable {
             return 0;
         }
         if self.num_partitions == 1 {
-            return self.tables[0].get_weight_for_row(key_lo, key_hi, ref_source, ref_row);
+            return self.tables[0].get_weight_for_row(key, ref_source, ref_row);
         }
-        match self.local_index(key_lo, key_hi) {
-            Some(local) => self.tables[local].get_weight_for_row(key_lo, key_hi, ref_source, ref_row),
+        match self.local_index(key) {
+            Some(local) => self.tables[local].get_weight_for_row(key, ref_source, ref_row),
             None => 0,
         }
     }
@@ -279,16 +278,16 @@ impl PartitionedTable {
         self.tables.iter().map(|t| t.current_lsn).max().unwrap_or(0)
     }
 
-    pub fn bloom_add(&mut self, key_lo: u64, key_hi: u64) {
+    pub fn bloom_add(&mut self, key: u128) {
         if self.tables.is_empty() {
             return;
         }
         if self.num_partitions == 1 {
-            self.tables[0].bloom_add(key_lo, key_hi);
+            self.tables[0].bloom_add(key);
             return;
         }
-        if let Some(local) = self.local_index(key_lo, key_hi) {
-            self.tables[local].bloom_add(key_lo, key_hi);
+        if let Some(local) = self.local_index(key) {
+            self.tables[local].bloom_add(key);
         }
     }
 
@@ -342,8 +341,8 @@ impl PartitionedTable {
     // Internal
     // ------------------------------------------------------------------
 
-    fn local_index(&self, key_lo: u64, key_hi: u64) -> Option<usize> {
-        let p = partition_for_key(key_lo, key_hi) as u32;
+    fn local_index(&self, key: u128) -> Option<usize> {
+        let p = partition_for_key(key) as u32;
         let local = p.wrapping_sub(self.part_offset) as usize;
         if local < self.tables.len() {
             Some(local)
@@ -364,8 +363,8 @@ impl Drop for PartitionedTable {
 // ---------------------------------------------------------------------------
 
 #[inline]
-pub fn partition_for_key(pk_lo: u64, pk_hi: u64) -> usize {
-    let h = xxh::hash_u128(pk_lo, pk_hi);
+pub fn partition_for_key(pk: u128) -> usize {
+    let h = xxh::hash_u128(pk);
     (h & 0xFF) as usize
 }
 
@@ -423,11 +422,11 @@ mod tests {
 
         let (ptrs, sizes) = make_regions(&[(10, 1, 100), (20, 1, 200)]);
         pt.ingest_batch_from_regions(&ptrs, &sizes, 2, 1).unwrap();
-        assert!(pt.has_pk(10, 0));
-        assert!(pt.has_pk(20, 0));
-        assert!(!pt.has_pk(99, 0));
+        assert!(pt.has_pk(10));
+        assert!(pt.has_pk(20));
+        assert!(!pt.has_pk(99));
         pt.flush().unwrap();
-        assert!(pt.has_pk(10, 0));
+        assert!(pt.has_pk(10));
     }
 
     #[test]
@@ -446,9 +445,9 @@ mod tests {
         pt.ingest_batch_from_regions(&ptrs, &sizes, rows.len() as u32, 1).unwrap();
 
         for &(pk, _, _) in &rows {
-            assert!(pt.has_pk(pk, 0), "PK {} not found", pk);
+            assert!(pt.has_pk(pk as u128), "PK {} not found", pk);
         }
-        assert!(!pt.has_pk(999999, 0));
+        assert!(!pt.has_pk(999999));
     }
 
     #[test]
@@ -484,12 +483,12 @@ mod tests {
         let (ptrs, sizes) = make_regions(&[(10, 1, 100), (20, 1, 200)]);
         pt.ingest_batch_from_regions(&ptrs, &sizes, 2, 1).unwrap();
 
-        let (w, found) = pt.retract_pk(10, 0);
+        let (w, found) = pt.retract_pk(10);
         assert_eq!(w, 1);
         assert!(found);
         assert!(!pt.found_col_ptr(0, 8).is_null());
 
-        let (_, found) = pt.retract_pk(99, 0);
+        let (_, found) = pt.retract_pk(99);
         assert!(!found);
     }
 
