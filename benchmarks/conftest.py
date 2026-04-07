@@ -50,7 +50,7 @@ def num_workers(request) -> int:
 
 
 @pytest.fixture(scope="session")
-def server(request):
+def server(request, results_dir):
     """Start gnitz-server-release, yield (socket_path, server_pid)."""
     workers = request.config.getoption("--workers")
 
@@ -92,7 +92,7 @@ def server(request):
     perf_recorder = None
     if request.config.getoption("--perf"):
         from helpers.perf import PerfRecorder
-        perf_recorder = PerfRecorder(proc.pid, tmpdir)
+        perf_recorder = PerfRecorder(proc.pid, results_dir)
         perf_recorder.start()
 
     perf_stat = None
