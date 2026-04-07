@@ -588,3 +588,47 @@ class TestViewLifecycle:
             client.drop_table(sn, tn)
         finally:
             client.drop_schema(sn)
+
+    def test_drop_view_no_ghost_records(self, client):
+        """CREATE+DROP VIEW leaves no phantom rows in the VIEW system table."""
+        VIEW_TAB_ID = 3
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        tid, tn, cols, schema = self._setup(client, sn)
+        vn = "v" + _uid()
+        try:
+            before = len(_scan_positive(client, VIEW_TAB_ID))
+            vid = client.create_view(sn, vn, tid, schema)
+            assert len(_scan_positive(client, VIEW_TAB_ID)) == before + 1
+            client.drop_view(sn, vn)
+            after = len(_scan_positive(client, VIEW_TAB_ID))
+            assert after == before, (
+                f"Ghost rows: expected {before}, got {after} after DROP VIEW"
+            )
+        finally:
+            try:
+                client.drop_view(sn, vn)
+            except Exception:
+                pass
+            client.drop_table(sn, tn)
+            client.drop_schema(sn)
+
+    def test_repeated_view_lifecycle(self, client):
+        """CREATE+DROP VIEW 10 times leaves no accumulated rows."""
+        VIEW_TAB_ID = 3
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        tid, tn, cols, schema = self._setup(client, sn)
+        try:
+            baseline = len(_scan_positive(client, VIEW_TAB_ID))
+            for i in range(10):
+                vn = f"rv{_uid()}"
+                client.create_view(sn, vn, tid, schema)
+                client.drop_view(sn, vn)
+            final = len(_scan_positive(client, VIEW_TAB_ID))
+            assert final == baseline, (
+                f"Row count grew: {baseline} -> {final} after 10 create+drop cycles"
+            )
+        finally:
+            client.drop_table(sn, tn)
+            client.drop_schema(sn)

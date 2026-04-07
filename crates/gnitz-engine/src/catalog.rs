@@ -874,7 +874,7 @@ impl CatalogEngine {
             let schema = sys_tab_schema(info.id);
             self.dag.register_table(
                 info.id,
-                StoreHandle::Single(table_ptrs[i]),
+                StoreHandle::Borrowed(table_ptrs[i]),
                 schema,
                 0, // depth
                 false, // unique_pk
@@ -961,9 +961,20 @@ impl CatalogEngine {
         schema: &SchemaDescriptor,
         batch: &mut OwnedBatch,
     ) {
+        copy_cursor_row_with_weight(cursor, schema, batch, cursor.cursor.current_weight);
+    }
+}
+
+/// Copy a single cursor row into `batch` with an explicit weight.
+/// Handles out-of-line German strings by copying blob data and rewriting offsets.
+fn copy_cursor_row_with_weight(
+    cursor: &CursorHandle,
+    schema: &SchemaDescriptor,
+    batch: &mut OwnedBatch,
+    weight: i64,
+) {
         let pk_lo = cursor.cursor.current_key_lo;
         let pk_hi = cursor.cursor.current_key_hi;
-        let weight = cursor.cursor.current_weight;
         let null_word = cursor.cursor.current_null_word;
 
         batch.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
@@ -1006,8 +1017,55 @@ impl CatalogEngine {
         }
 
         batch.count += 1;
-    }
+}
 
+/// Seek a system table by PK, copy the matching row with weight=-1.
+/// Returns a single-row retraction batch (or empty batch if PK not found).
+fn retract_single_row(table: &mut Table, schema: &SchemaDescriptor, pk_lo: u64, pk_hi: u64) -> OwnedBatch {
+    let mut batch = OwnedBatch::with_schema(*schema, 1);
+    let mut cursor = match table.create_cursor() {
+        Ok(c) => c,
+        Err(_) => return batch,
+    };
+    cursor.cursor.seek(pk_lo, pk_hi);
+    if cursor.cursor.valid
+        && cursor.cursor.current_key_lo == pk_lo
+        && cursor.cursor.current_key_hi == pk_hi
+        && cursor.cursor.current_weight > 0
+    {
+        copy_cursor_row_with_weight(&cursor, schema, &mut batch, -1);
+    }
+    batch
+}
+
+/// Seek to `(0, pk_hi)` and scan all positive-weight rows with that pk_hi,
+/// emitting each as a retraction (weight=-1). Exploits U128 sort order
+/// `(pk_hi, pk_lo)` which makes all circuit rows for a given view contiguous.
+fn retract_rows_by_pk_hi(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) -> OwnedBatch {
+    let mut batch = OwnedBatch::with_schema(*schema, 8);
+    let mut cursor = match table.create_cursor() {
+        Ok(c) => c,
+        Err(_) => return batch,
+    };
+    cursor.cursor.seek(0, pk_hi);
+    while cursor.cursor.valid && cursor.cursor.current_key_hi == pk_hi {
+        if cursor.cursor.current_weight > 0 {
+            copy_cursor_row_with_weight(&cursor, schema, &mut batch, -1);
+        }
+        cursor.cursor.advance();
+    }
+    batch
+}
+
+/// Retract all positive-weight rows with the given pk_hi from a system table.
+fn retract_and_ingest(table: &mut Table, schema: &SchemaDescriptor, pk_hi: u64) {
+    let batch = retract_rows_by_pk_hi(table, schema, pk_hi);
+    if batch.count > 0 {
+        ingest_batch_into(table, &batch);
+    }
+}
+
+impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
 
     fn fire_hooks(&mut self, sys_table_id: i64, batch: &OwnedBatch) -> Result<(), String> {
@@ -1106,20 +1164,17 @@ impl CatalogEngine {
 
                 fsync_dir(&format!("{}/{}", self.base_dir, schema_name));
 
-                let pt_box = Box::new(pt);
-                let pt_ptr = &*pt_box as *const PartitionedTable as *mut PartitionedTable;
-
                 // Register with entity registry
                 let qualified = format!("{}.{}", schema_name, name);
                 self.name_to_id.insert(qualified, tid);
                 self.id_to_qualified.insert(tid, (schema_name.clone(), name.clone()));
                 self.schema_ids.insert(tid, sid);
-                                self.pk_col_indices.insert(tid, pk_col_idx);
-                
-                // Register with DagEngine
+                self.pk_col_indices.insert(tid, pk_col_idx);
+
+                // Register with DagEngine — Box ownership transfers here
                 self.dag.register_table(
                     tid,
-                    StoreHandle::Partitioned(pt_ptr),
+                    StoreHandle::Partitioned(Box::new(pt)),
                     tbl_schema,
                     0, // depth
                     is_unique,
@@ -1133,9 +1188,6 @@ impl CatalogEngine {
 
                 // Wire FK constraints
                 self.wire_fk_constraints(tid, &col_defs);
-
-                // Leak the Box so the pointer stays valid
-                let _ = Box::into_raw(pt_box);
 
                 if self.cascade_enabled {
                     self.create_fk_indices(tid)?;
@@ -1209,9 +1261,6 @@ impl CatalogEngine {
                     arena,
                 ).map_err(|e| format!("Failed to create view '{}': error {}", name, e))?;
 
-                let et_box = Box::new(et);
-                let et_ptr = &*et_box as *const PartitionedTable as *mut PartitionedTable;
-
                 // Compute depth from source tables
                 let source_ids = self.dag.get_source_ids(vid);
                 let mut max_depth = 0i32;
@@ -1226,11 +1275,11 @@ impl CatalogEngine {
                 self.name_to_id.insert(qualified, vid);
                 self.id_to_qualified.insert(vid, (schema_name.clone(), name.clone()));
                 self.schema_ids.insert(vid, sid);
-                                self.pk_col_indices.insert(vid, 0);
-                
+                self.pk_col_indices.insert(vid, 0);
+
                 self.dag.register_table(
                     vid,
-                    StoreHandle::Partitioned(et_ptr),
+                    StoreHandle::Partitioned(Box::new(et)),
                     view_schema,
                     max_depth,
                     false,
@@ -1241,9 +1290,6 @@ impl CatalogEngine {
                 if vid + 1 > self.next_table_id {
                     self.next_table_id = vid + 1;
                 }
-
-                // Leak the Box
-                let _ = Box::into_raw(et_box);
 
                 // Compile and backfill (only on processes that own data)
                 if self.active_part_start != self.active_part_end {
@@ -1308,21 +1354,18 @@ impl CatalogEngine {
                     false, // not durable (rebuilt from source)
                 ).map_err(|e| format!("Failed to create index table: error {}", e))?;
 
-                let idx_table_box = Box::new(idx_table);
-                let idx_table_ptr = &*idx_table_box as *const Table as *mut Table;
+                let mut idx_table_box = Box::new(idx_table);
+                let idx_table_ptr = &mut *idx_table_box as *mut Table;
 
                 // Backfill index from source table
                 self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema);
 
-                // Register with DagEngine
-                self.dag.add_index_circuit(owner_id, source_col_idx, idx_table_ptr, idx_schema, is_unique);
+                // Register with DagEngine — Box ownership transfers here
+                self.dag.add_index_circuit(owner_id, source_col_idx, idx_table_box, idx_schema, is_unique);
 
                 // Register in index maps
                 self.index_by_name.insert(name.clone(), idx_id);
                 self.index_by_id.insert(idx_id, name.clone());
-
-                // Leak the Box
-                let _ = Box::into_raw(idx_table_box);
             } else {
                 if self.index_by_name.contains_key(&name) {
                     if name.contains("__fk_") {
@@ -1375,30 +1418,24 @@ impl CatalogEngine {
 
         let mut batch = OwnedBatch::with_schema(*schema, 256);
 
-        match &entry.handle {
-            StoreHandle::Single(ptr) if !ptr.is_null() => {
-                let table = unsafe { &mut **ptr };
-                if let Ok(mut cursor) = table.create_cursor() {
-                    while cursor.cursor.valid {
-                        if cursor.cursor.current_weight > 0 {
-                            self.copy_cursor_row_to_batch(&cursor, schema, &mut batch);
-                        }
-                        cursor.cursor.advance();
-                    }
-                }
+        let cursor_result = match &entry.handle {
+            StoreHandle::Single(ref t) => {
+                let tbl = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
+                tbl.create_cursor()
             }
-            StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                let ptable = unsafe { &mut **ptr };
-                if let Ok(mut cursor) = ptable.create_cursor() {
-                    while cursor.cursor.valid {
-                        if cursor.cursor.current_weight > 0 {
-                            self.copy_cursor_row_to_batch(&cursor, schema, &mut batch);
-                        }
-                        cursor.cursor.advance();
-                    }
-                }
+            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.create_cursor(),
+            StoreHandle::Partitioned(ref pt) => {
+                let ptbl = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
+                ptbl.create_cursor()
             }
-            _ => {}
+        };
+        if let Ok(mut cursor) = cursor_result {
+            while cursor.cursor.valid {
+                if cursor.cursor.current_weight > 0 {
+                    self.copy_cursor_row_to_batch(&cursor, schema, &mut batch);
+                }
+                cursor.cursor.advance();
+            }
         }
 
         batch
@@ -1768,27 +1805,14 @@ impl CatalogEngine {
 
         self.check_for_dependencies(tid, table_name)?;
 
-        let sid = self.schema_ids.get(&tid).copied().unwrap_or(0);
-        let dir = self.dag.tables.get(&tid).map(|e| e.directory.clone()).unwrap_or_default();
-        let pk_idx = self.pk_col_indices.get(&tid).copied().unwrap_or(0);
-        let is_unique = self.dag.tables.get(&tid).map(|e| e.unique_pk).unwrap_or(false);
-        let flags = if is_unique { TABLETAB_FLAG_UNIQUE_PK } else { 0 };
-
-        // Retract table record
+        // Retract table record — cursor-based to match exact stored payload
         {
             let schema = table_tab_schema();
-            let mut bb = BatchBuilder::new(schema);
-            bb.begin_row(tid as u64, 0, -1);
-            bb.put_u64(sid as u64);
-            bb.put_string(table_name);
-            bb.put_string(&dir);
-            bb.put_u64(pk_idx as u64);
-            bb.put_u64(0); // created_lsn
-            bb.put_u64(flags);
-            bb.end_row();
-            let batch = bb.finish();
-            ingest_batch_into(&mut self.sys_tables, &batch);
-            self.on_table_delta(&batch)?;
+            let batch = retract_single_row(&mut self.sys_tables, &schema, tid as u64, 0);
+            if batch.count > 0 {
+                ingest_batch_into(&mut self.sys_tables, &batch);
+                self.on_table_delta(&batch)?;
+            }
         }
 
         // Retract column records
@@ -1882,23 +1906,14 @@ impl CatalogEngine {
 
         self.dag.invalidate(vid);
 
-        let sid = self.schema_ids.get(&vid).copied().unwrap_or(0);
-        let dir = self.dag.tables.get(&vid).map(|e| e.directory.clone()).unwrap_or_default();
-
-        // Retract view record
+        // Retract view record — cursor-based to match exact stored payload
         {
             let schema = view_tab_schema();
-            let mut bb = BatchBuilder::new(schema);
-            bb.begin_row(vid as u64, 0, -1);
-            bb.put_u64(sid as u64);
-            bb.put_string(view_name);
-            bb.put_string(""); // sql_definition
-            bb.put_string(&dir);
-            bb.put_u64(0);
-            bb.end_row();
-            let batch = bb.finish();
-            ingest_batch_into(&mut self.sys_views, &batch);
-            self.on_view_delta(&batch)?;
+            let batch = retract_single_row(&mut self.sys_views, &schema, vid as u64, 0);
+            if batch.count > 0 {
+                ingest_batch_into(&mut self.sys_views, &batch);
+                self.on_view_delta(&batch)?;
+            }
         }
 
         // Retract circuit graph, deps, columns
@@ -2204,10 +2219,15 @@ impl CatalogEngine {
         }
     }
 
-    fn retract_circuit_graph(&mut self, _vid: i64) {
-        // TODO: scan each circuit system table for rows with this view_id
-        // and emit retractions. For now, the rows remain as tombstones.
-        // The runtime correctly ignores them because the plan cache is invalidated.
+    fn retract_circuit_graph(&mut self, vid: i64) {
+        let pk_hi = vid as u64;
+        for &tab_id in &[CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID,
+                         CIRCUIT_SOURCES_TAB_ID, CIRCUIT_PARAMS_TAB_ID,
+                         CIRCUIT_GROUP_COLS_TAB_ID] {
+            let schema = sys_tab_schema(tab_id);
+            let table = self.sys_table_mut(tab_id).unwrap();
+            retract_and_ingest(table, &schema, pk_hi);
+        }
     }
 
     // -- System table accessor -----------------------------------------------
@@ -2355,15 +2375,15 @@ impl CatalogEngine {
         } else {
             let entry = self.dag.tables.get(&table_id).unwrap();
             match &entry.handle {
-                StoreHandle::Single(ptr) if !ptr.is_null() => {
-                    let table = unsafe { &mut **ptr };
-                    table.create_cursor()
+                StoreHandle::Single(ref t) => {
+                    let tbl = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
+                    tbl.create_cursor()
                 }
-                StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                    let ptable = unsafe { &mut **ptr };
-                    ptable.create_cursor()
+                StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.create_cursor(),
+                StoreHandle::Partitioned(ref pt) => {
+                    let ptbl = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
+                    ptbl.create_cursor()
                 }
-                _ => return Ok(None),
             }
         };
 
@@ -2396,12 +2416,8 @@ impl CatalogEngine {
             .find(|ic| ic.col_idx == col_idx)
             .ok_or_else(|| format!("No index on col_idx {} for table {}", col_idx, table_id))?;
 
-        if ic.index_handle.is_null() {
-            return Ok(None);
-        }
-
         // Seek in index table
-        let idx_table = unsafe { &mut *ic.index_handle };
+        let idx_table = unsafe { &mut *(std::ptr::addr_of!(*ic.index_table) as *mut Table) };
         let mut cursor = idx_table.create_cursor().map_err(|e| format!("cursor error: {}", e))?;
         cursor.cursor.seek(key_lo, key_hi);
         if !cursor.cursor.valid { return Ok(None); }
@@ -2486,15 +2502,18 @@ impl CatalogEngine {
         let npc = batch.col_data.len();
         let (ptrs, sizes) = batch.to_region_ptrs();
         match &entry.handle {
-            StoreHandle::Single(ptr) if !ptr.is_null() => {
+            StoreHandle::Single(ref t) => {
+                let table = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
+                let _ = table.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
+            }
+            StoreHandle::Borrowed(ptr) => {
                 let table = unsafe { &mut **ptr };
                 let _ = table.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
             }
-            StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                let ptable = unsafe { &mut **ptr };
+            StoreHandle::Partitioned(ref pt) => {
+                let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
                 let _ = ptable.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
             }
-            _ => return Err(format!("Null store for table_id {}", table_id)),
         }
         Ok(())
     }
@@ -2511,11 +2530,9 @@ impl CatalogEngine {
     pub fn close_user_table_partitions(&mut self) {
         for (&tid, entry) in &self.dag.tables {
             if tid < FIRST_USER_TABLE_ID { continue; }
-            if let StoreHandle::Partitioned(ptr) = &entry.handle {
-                if !ptr.is_null() {
-                    let ptable = unsafe { &mut **ptr };
-                    ptable.close_all_partitions();
-                }
+            if let StoreHandle::Partitioned(ref pt) = &entry.handle {
+                let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
+                ptable.close_all_partitions();
             }
         }
     }
@@ -2524,11 +2541,9 @@ impl CatalogEngine {
     pub fn trim_worker_partitions(&mut self, start: u32, end: u32) {
         for (&tid, entry) in &self.dag.tables {
             if tid < FIRST_USER_TABLE_ID { continue; }
-            if let StoreHandle::Partitioned(ptr) = &entry.handle {
-                if !ptr.is_null() {
-                    let ptable = unsafe { &mut **ptr };
-                    ptable.close_partitions_outside(start, end);
-                }
+            if let StoreHandle::Partitioned(ref pt) = &entry.handle {
+                let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
+                ptable.close_partitions_outside(start, end);
             }
         }
     }
@@ -2537,11 +2552,9 @@ impl CatalogEngine {
     pub fn disable_user_table_wal(&mut self) {
         for (&tid, entry) in &self.dag.tables {
             if tid < FIRST_USER_TABLE_ID { continue; }
-            if let StoreHandle::Partitioned(ptr) = &entry.handle {
-                if !ptr.is_null() {
-                    let ptable = unsafe { &mut **ptr };
-                    ptable.set_has_wal(false);
-                }
+            if let StoreHandle::Partitioned(ref pt) = &entry.handle {
+                let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
+                ptable.set_has_wal(false);
             }
         }
     }
@@ -2597,7 +2610,7 @@ impl CatalogEngine {
     pub fn get_index_store_handle(&self, table_id: i64, col_idx: u32) -> *mut Table {
         self.dag.tables.get(&table_id)
             .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == col_idx))
-            .map(|ic| ic.index_handle)
+            .map(|ic| std::ptr::addr_of!(*ic.index_table) as *mut Table)
             .unwrap_or(std::ptr::null_mut())
     }
 
@@ -2627,7 +2640,7 @@ impl CatalogEngine {
     pub fn get_ptable_handle(&self, table_id: i64) -> Option<*mut PartitionedTable> {
         self.dag.tables.get(&table_id).and_then(|e| {
             match &e.handle {
-                StoreHandle::Partitioned(ptr) if !ptr.is_null() => Some(*ptr),
+                StoreHandle::Partitioned(ref pt) => Some(std::ptr::addr_of!(**pt) as *mut PartitionedTable),
                 _ => None,
             }
         })
@@ -2664,15 +2677,9 @@ impl CatalogEngine {
             None => return 0,
         };
         match &entry.handle {
-            StoreHandle::Single(ptr) if !ptr.is_null() => {
-                let table = unsafe { &**ptr };
-                table.current_lsn
-            }
-            StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                let ptable = unsafe { &**ptr };
-                ptable.current_lsn()
-            }
-            _ => 0,
+            StoreHandle::Single(ref t) => t.current_lsn,
+            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
+            StoreHandle::Partitioned(ref pt) => pt.current_lsn(),
         }
     }
 
@@ -2685,25 +2692,15 @@ impl CatalogEngine {
             .copied()
             .collect();
         for tid in &user_tids {
-            if let Some(entry) = self.dag.tables.get(tid) {
-                match &entry.handle {
-                    StoreHandle::Single(ptr) if !ptr.is_null() => {
-                        let table = unsafe { &mut **ptr };
-                        let _ = table.flush();
-                        // Reclaim the leaked Box (index tables)
-                        unsafe { let _ = Box::from_raw(*ptr); }
-                    }
-                    StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                        let ptable = unsafe { &mut **ptr };
-                        let _ = ptable.flush();
-                        ptable.close();
-                        // Reclaim the leaked Box
-                        unsafe { let _ = Box::from_raw(*ptr); }
-                    }
-                    _ => {}
+            if let Some(entry) = self.dag.tables.get_mut(tid) {
+                match &mut entry.handle {
+                    StoreHandle::Single(t) => { let _ = t.flush(); }
+                    StoreHandle::Partitioned(pt) => { let _ = pt.flush(); pt.close(); }
+                    StoreHandle::Borrowed(_) => {} // system tables flushed below
                 }
             }
         }
+        // tables.clear() in dag.close() drops Box<Table>/Box<PartitionedTable> automatically.
         self.dag.close();
         let _ = self.sys_schemas.flush();
         let _ = self.sys_tables.flush();
@@ -2756,15 +2753,15 @@ impl CatalogEngine {
 
                 // Check if target has this PK
                 let has = match &target_entry.handle {
-                    StoreHandle::Single(ptr) if !ptr.is_null() => {
-                        let table = unsafe { &mut **ptr };
+                    StoreHandle::Single(ref t) => {
+                        let table = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
                         table.has_pk(fk_lo, fk_hi)
                     }
-                    StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                        let ptable = unsafe { &mut **ptr };
+                    StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.has_pk(fk_lo, fk_hi),
+                    StoreHandle::Partitioned(ref pt) => {
+                        let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
                         ptable.has_pk(fk_lo, fk_hi)
                     }
-                    _ => false,
                 };
 
                 if !has {
@@ -2803,8 +2800,6 @@ impl CatalogEngine {
 
         for ic in &entry.index_circuits {
             if !ic.is_unique { continue; }
-            if ic.index_handle.is_null() { continue; }
-
             let source_col_idx = ic.col_idx as usize;
             let col_type = schema.columns[source_col_idx].type_code;
             let payload_col = if source_col_idx < pk_index {
@@ -2813,7 +2808,7 @@ impl CatalogEngine {
                 source_col_idx - 1
             };
 
-            let idx_table = unsafe { &mut *ic.index_handle };
+            let idx_table = unsafe { &mut *(std::ptr::addr_of!(*ic.index_table) as *mut Table) };
 
             // Track seen keys for batch-internal duplicate detection
             let mut seen: HashMap<(u64, u64), bool> = HashMap::new();
@@ -2831,15 +2826,15 @@ impl CatalogEngine {
                 // Determine if this is an UPSERT (PK already exists in store)
                 let is_upsert = if entry.unique_pk {
                     match &entry.handle {
-                        StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                            let ptable = unsafe { &mut **ptr };
+                        StoreHandle::Partitioned(ref pt) => {
+                            let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
                             ptable.has_pk(row_pk_lo, row_pk_hi)
                         }
-                        StoreHandle::Single(ptr) if !ptr.is_null() => {
-                            let table = unsafe { &mut **ptr };
+                        StoreHandle::Single(ref t) => {
+                            let table = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
                             table.has_pk(row_pk_lo, row_pk_hi)
                         }
-                        _ => false,
+                        StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.has_pk(row_pk_lo, row_pk_hi),
                     }
                 } else {
                     false
@@ -3709,7 +3704,7 @@ mod tests {
 
         let mut dag = DagEngine::new();
         let table_ptr = &mut table as *mut Table;
-        dag.register_table(100, StoreHandle::Single(table_ptr), schema, 0, true, tdir.clone());
+        dag.register_table(100, StoreHandle::Borrowed(table_ptr), schema, 0, true, tdir.clone());
 
         let make_row = |pk: u64, val: u64, w: i64| -> OwnedBatch {
             let mut bb = BatchBuilder::new(schema);
@@ -3983,11 +3978,9 @@ mod tests {
         let _ = engine.dag.flush(tid);
 
         // Verify index has 6 entries via DagEngine's index circuit
-        let entry = engine.dag.tables.get(&tid).unwrap();
+        let entry = engine.dag.tables.get_mut(&tid).unwrap();
         assert_eq!(entry.index_circuits.len(), 1, "Expected 1 index circuit");
-        let idx_handle = entry.index_circuits[0].index_handle;
-        assert!(!idx_handle.is_null());
-        let idx_table = unsafe { &mut *idx_handle };
+        let idx_table = &mut *entry.index_circuits[0].index_table;
         let idx_count = count_records(idx_table);
         assert_eq!(idx_count, 6, "Index fanout: expected 6, got {}", idx_count);
 
@@ -4678,6 +4671,132 @@ mod tests {
         // Second call should hit cache
         let names2 = engine.get_column_names(tid);
         assert_eq!(names2, vec!["pk", "alpha", "beta"]);
+
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Ghost record / retraction tests ─────────────────────────────────
+
+    #[test]
+    fn test_drop_view_cleans_sys_views() {
+        let dir = temp_dir("drop_view_clean");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        // Baseline
+        let base_views = count_records(&mut engine.sys_views);
+
+        // Create source table
+        let cols = vec![u64_col_def("id"), i64_col_def("val")];
+        let tid = engine.create_table("public.src", &cols, 0, true).unwrap();
+
+        // Create view
+        let graph = make_passthrough_graph(tid, &[
+            ("id".into(), type_code::U64), ("val".into(), type_code::I64),
+        ]);
+        let vid = engine.create_view("public.vw", &graph, "SELECT * FROM src").unwrap();
+        assert_eq!(count_records(&mut engine.sys_views), base_views + 1);
+
+        // Drop view — sys_views must return to baseline (no ghost rows)
+        engine.drop_view("public.vw").unwrap();
+        let _ = engine.sys_views.flush();
+        assert_eq!(count_records(&mut engine.sys_views), base_views,
+            "Ghost rows remain in sys_views after DROP VIEW");
+
+        engine.drop_table("public.src").unwrap();
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_drop_view_cleans_circuit_tables() {
+        let dir = temp_dir("drop_view_circuit");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        let base_nodes = count_records(&mut engine.sys_circuit_nodes);
+        let base_edges = count_records(&mut engine.sys_circuit_edges);
+        let base_sources = count_records(&mut engine.sys_circuit_sources);
+
+        let cols = vec![u64_col_def("id"), i64_col_def("val")];
+        let tid = engine.create_table("public.src2", &cols, 0, true).unwrap();
+
+        let graph = make_passthrough_graph(tid, &[
+            ("id".into(), type_code::U64), ("val".into(), type_code::I64),
+        ]);
+        let _vid = engine.create_view("public.vw2", &graph, "SELECT * FROM src2").unwrap();
+
+        // Verify circuit rows were written
+        let _ = engine.sys_circuit_nodes.flush();
+        assert!(count_records(&mut engine.sys_circuit_nodes) > base_nodes);
+
+        // Drop view — all circuit tables must return to baseline
+        engine.drop_view("public.vw2").unwrap();
+        let _ = engine.sys_circuit_nodes.flush();
+        let _ = engine.sys_circuit_edges.flush();
+        let _ = engine.sys_circuit_sources.flush();
+        assert_eq!(count_records(&mut engine.sys_circuit_nodes), base_nodes,
+            "Ghost rows in sys_circuit_nodes");
+        assert_eq!(count_records(&mut engine.sys_circuit_edges), base_edges,
+            "Ghost rows in sys_circuit_edges");
+        assert_eq!(count_records(&mut engine.sys_circuit_sources), base_sources,
+            "Ghost rows in sys_circuit_sources");
+
+        engine.drop_table("public.src2").unwrap();
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_repeated_create_drop_view() {
+        let dir = temp_dir("repeated_view");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        let base_views = count_records(&mut engine.sys_views);
+        let base_nodes = count_records(&mut engine.sys_circuit_nodes);
+
+        let cols = vec![u64_col_def("id"), i64_col_def("val")];
+        let tid = engine.create_table("public.rep_src", &cols, 0, true).unwrap();
+
+        for i in 0..5 {
+            let vname = format!("public.rep_v{}", i);
+            let graph = make_passthrough_graph(tid, &[
+                ("id".into(), type_code::U64), ("val".into(), type_code::I64),
+            ]);
+            let _vid = engine.create_view(&vname, &graph, "SELECT *").unwrap();
+            engine.drop_view(&vname).unwrap();
+        }
+
+        let _ = engine.sys_views.flush();
+        let _ = engine.sys_circuit_nodes.flush();
+        assert_eq!(count_records(&mut engine.sys_views), base_views,
+            "sys_views grew after 5 create+drop cycles");
+        assert_eq!(count_records(&mut engine.sys_circuit_nodes), base_nodes,
+            "sys_circuit_nodes grew after 5 create+drop cycles");
+
+        engine.drop_table("public.rep_src").unwrap();
+        engine.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_drop_table_cleans_up_indices() {
+        let dir = temp_dir("drop_table_idx");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+
+        let cols = vec![u64_col_def("pk"), i64_col_def("val")];
+        let tid = engine.create_table("public.idx_tbl", &cols, 0, true).unwrap();
+        engine.create_index("public.idx_tbl", "val", true).unwrap();
+
+        assert!(engine.dag.tables.contains_key(&tid));
+        assert_eq!(engine.dag.tables.get(&tid).unwrap().index_circuits.len(), 1);
+
+        // Drop index then table
+        let idx_name = crate::catalog::make_secondary_index_name("public", "idx_tbl", "val");
+        engine.drop_index(&idx_name).unwrap();
+        assert_eq!(engine.dag.tables.get(&tid).unwrap().index_circuits.len(), 0);
+
+        engine.drop_table("public.idx_tbl").unwrap();
+        assert!(!engine.dag.tables.contains_key(&tid));
 
         engine.close();
         let _ = fs::remove_dir_all(&dir);

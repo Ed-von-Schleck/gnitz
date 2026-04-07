@@ -32,24 +32,40 @@ const PARAM_REINDEX_COL: i32 = 10;
 // ---------------------------------------------------------------------------
 
 /// Distinguishes ephemeral (view) stores from partitioned (base table) stores.
+/// Owned variants (Single, Partitioned) drop the underlying storage on Drop.
+/// The Borrowed variant holds a non-owning pointer for system tables owned
+/// by CatalogEngine directly.
 pub enum StoreHandle {
-    /// EphemeralTable / single Table — used by views.
-    Single(*mut Table),
-    /// PartitionedTable — used by base tables.
-    Partitioned(*mut PartitionedTable),
+    /// Owned single Table — used by views in single-worker mode.
+    Single(Box<Table>),
+    /// Owned PartitionedTable — used by base tables and views.
+    Partitioned(Box<PartitionedTable>),
+    /// Non-owning pointer to a Table owned elsewhere (system tables).
+    Borrowed(*mut Table),
 }
 
-// SAFETY: StoreHandle wraps raw pointers that are only accessed on the
-// thread that owns the DagEngine.  The DagEngine itself is never shared
+// SAFETY: Borrowed wraps a raw pointer that is only accessed on the
+// thread that owns the DagEngine. The DagEngine itself is never shared
 // across threads.
 unsafe impl Send for StoreHandle {}
 
 impl StoreHandle {
-    /// Get a `*mut Table` if this is a Single store.
-    pub fn as_single(&self) -> Option<*mut Table> {
+    /// Get a raw pointer to the Table (Single/Borrowed), or null for Partitioned.
+    /// SAFETY: the Box outlives any synchronous call using the pointer.
+    /// The caller must ensure no aliasing &mut references exist.
+    pub fn table_ptr(&self) -> *mut Table {
         match self {
-            StoreHandle::Single(ptr) => Some(*ptr),
-            StoreHandle::Partitioned(_) => None,
+            StoreHandle::Single(t) => std::ptr::addr_of!(**t) as *mut Table,
+            StoreHandle::Borrowed(ptr) => *ptr,
+            StoreHandle::Partitioned(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// Get a raw pointer to the PartitionedTable, or null if not Partitioned.
+    pub fn ptable_ptr(&self) -> *mut PartitionedTable {
+        match self {
+            StoreHandle::Partitioned(pt) => std::ptr::addr_of!(**pt) as *mut PartitionedTable,
+            _ => std::ptr::null_mut(),
         }
     }
 }
@@ -59,15 +75,13 @@ impl StoreHandle {
 // ---------------------------------------------------------------------------
 
 /// A secondary index on a column.
+/// Owns the index Table via Box — dropping the entry drops the table.
 pub struct IndexCircuitEntry {
     pub col_idx: u32,
-    pub index_handle: *mut Table,
+    pub index_table: Box<Table>,
     pub index_schema: SchemaDescriptor,
     pub is_unique: bool,
 }
-
-// SAFETY: same single-thread access guarantee as StoreHandle.
-unsafe impl Send for IndexCircuitEntry {}
 
 // ---------------------------------------------------------------------------
 // Table entry — per-table metadata in the entity registry
@@ -235,14 +249,14 @@ impl DagEngine {
         &mut self,
         table_id: i64,
         col_idx: u32,
-        index_handle: *mut Table,
+        index_table: Box<Table>,
         index_schema: SchemaDescriptor,
         is_unique: bool,
     ) {
         if let Some(entry) = self.tables.get_mut(&table_id) {
             entry.index_circuits.push(IndexCircuitEntry {
                 col_idx,
-                index_handle,
+                index_table,
                 index_schema,
                 is_unique,
             });
@@ -251,12 +265,7 @@ impl DagEngine {
 
     pub fn remove_index_circuit(&mut self, table_id: i64, col_idx: u32) {
         if let Some(entry) = self.tables.get_mut(&table_id) {
-            // Reclaim the leaked Box<Table> before removing the entry.
-            for ic in entry.index_circuits.iter() {
-                if ic.col_idx == col_idx && !ic.index_handle.is_null() {
-                    unsafe { drop(Box::from_raw(ic.index_handle)); }
-                }
-            }
+            // retain() drops non-matching entries, which drops Box<Table> automatically.
             entry.index_circuits.retain(|ic| ic.col_idx != col_idx);
         }
     }
@@ -718,24 +727,10 @@ impl DagEngine {
 
         // Build external tables array from registered tables
         let ext_tables: Vec<ExternalTable> = self.tables.iter()
-            .filter_map(|(&tid, te)| {
-                match te.handle {
-                    StoreHandle::Single(ptr) if !ptr.is_null() => Some(ExternalTable {
-                        table_id: tid,
-                        handle: ptr,
-                        schema: te.schema,
-                    }),
-                    StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                        // PartitionedTable: compiler uses table_id + schema only
-                        // (handle is never accessed). Pass null for handle.
-                        Some(ExternalTable {
-                            table_id: tid,
-                            handle: std::ptr::null_mut(),
-                            schema: te.schema,
-                        })
-                    }
-                    _ => None,
-                }
+            .map(|(&tid, te)| ExternalTable {
+                table_id: tid,
+                handle: te.handle.table_ptr(),
+                schema: te.schema,
             })
             .collect();
 
@@ -867,79 +862,14 @@ impl DagEngine {
     /// 2. store.ingest_batch
     /// 3. index projection
     pub fn ingest_to_family(&mut self, table_id: i64, batch: OwnedBatch) -> i32 {
-        let entry = match self.tables.get(&table_id) {
-            Some(e) => e,
-            None => {
-                gnitz_warn!("dag: ingest — table_id={} not registered", table_id);
-                return -1;
-            }
-        };
-
-        let schema = entry.schema;
-
-        // Stage 1: unique_pk enforcement
-        let effective_batch = if entry.unique_pk {
-            match &entry.handle {
-                StoreHandle::Single(ptr) if !ptr.is_null() => {
-                    let table = unsafe { &mut **ptr };
-                    self.enforce_unique_pk(table, &schema, batch)
-                }
-                StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                    let ptable = unsafe { &mut **ptr };
-                    self.enforce_unique_pk_partitioned(ptable, &schema, batch)
-                }
-                _ => batch,
-            }
-        } else {
-            batch
-        };
-
-        if effective_batch.count == 0 {
-            return 0;
-        }
-
-        // Stage 2: ingest into store
-        let npc = effective_batch.col_data.len();
-        let (ptrs, sizes) = effective_batch.to_region_ptrs();
-        match &entry.handle {
-            StoreHandle::Single(ptr) if !ptr.is_null() => {
-                let table = unsafe { &mut **ptr };
-                let _ = table.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
-            }
-            StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                let ptable = unsafe { &mut **ptr };
-                let _ = ptable.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
-            }
-            _ => {
-                gnitz_warn!("dag: ingest — table_id={} has null store handle", table_id);
-                return -2;
-            }
-        }
-
-        // Stage 3: index projection
-        for ic in &entry.index_circuits {
-            if ic.index_handle.is_null() { continue; }
-            let idx_batch = Self::batch_project_index(
-                &effective_batch, ic.col_idx, &schema, &ic.index_schema,
-            );
-            if idx_batch.count > 0 {
-                let idx_table = unsafe { &mut *ic.index_handle };
-                let idx_npc = idx_batch.col_data.len();
-                let (idx_ptrs, idx_sizes) = idx_batch.to_region_ptrs();
-                let _ = idx_table.ingest_batch_from_regions(
-                    &idx_ptrs, &idx_sizes, idx_batch.count as u32, idx_npc,
-                );
-            }
-        }
-
-        0
+        self.ingest_returning_effective(table_id, batch).0
     }
 
     /// Ingest a batch and return the effective batch (after unique_pk enforcement).
     /// The effective batch is what downstream views need to see.
     /// Returns (rc, Option<OwnedBatch>).
     pub fn ingest_returning_effective(&mut self, table_id: i64, batch: OwnedBatch) -> (i32, Option<OwnedBatch>) {
-        let entry = match self.tables.get(&table_id) {
+        let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => {
                 gnitz_warn!("dag: ingest_returning_effective — table_id={} not registered", table_id);
@@ -948,19 +878,19 @@ impl DagEngine {
         };
 
         let schema = entry.schema;
+        let unique_pk = entry.unique_pk;
+        let tbl_ptr = entry.handle.table_ptr();
+        let ptbl_ptr = entry.handle.ptable_ptr();
 
-        // Stage 1: unique_pk enforcement
-        let effective_batch = if entry.unique_pk {
-            match &entry.handle {
-                StoreHandle::Single(ptr) if !ptr.is_null() => {
-                    let table = unsafe { &mut **ptr };
-                    self.enforce_unique_pk(table, &schema, batch)
-                }
-                StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                    let ptable = unsafe { &mut **ptr };
-                    self.enforce_unique_pk_partitioned(ptable, &schema, batch)
-                }
-                _ => batch,
+        let effective_batch = if unique_pk {
+            if !ptbl_ptr.is_null() {
+                let ptable = unsafe { &mut *ptbl_ptr };
+                self.enforce_unique_pk_partitioned(ptable, &schema, batch)
+            } else if !tbl_ptr.is_null() {
+                let table = unsafe { &mut *tbl_ptr };
+                self.enforce_unique_pk(table, &schema, batch)
+            } else {
+                batch
             }
         } else {
             batch
@@ -970,35 +900,33 @@ impl DagEngine {
             return (0, Some(effective_batch));
         }
 
+        let entry = self.tables.get_mut(&table_id).unwrap();
+
         // Stage 2: ingest into store
         let npc = effective_batch.col_data.len();
         let (ptrs, sizes) = effective_batch.to_region_ptrs();
-        match &entry.handle {
-            StoreHandle::Single(ptr) if !ptr.is_null() => {
+        match &mut entry.handle {
+            StoreHandle::Single(t) => {
+                let _ = t.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
+            }
+            StoreHandle::Borrowed(ptr) => {
                 let table = unsafe { &mut **ptr };
                 let _ = table.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
             }
-            StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                let ptable = unsafe { &mut **ptr };
-                let _ = ptable.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
-            }
-            _ => {
-                gnitz_warn!("dag: ingest_returning_effective — table_id={} has null store handle", table_id);
-                return (-2, None);
+            StoreHandle::Partitioned(pt) => {
+                let _ = pt.ingest_batch_from_regions(&ptrs, &sizes, effective_batch.count as u32, npc);
             }
         }
 
         // Stage 3: index projection
-        for ic in &entry.index_circuits {
-            if ic.index_handle.is_null() { continue; }
+        for ic in &mut entry.index_circuits {
             let idx_batch = Self::batch_project_index(
                 &effective_batch, ic.col_idx, &schema, &ic.index_schema,
             );
             if idx_batch.count > 0 {
-                let idx_table = unsafe { &mut *ic.index_handle };
                 let idx_npc = idx_batch.col_data.len();
                 let (idx_ptrs, idx_sizes) = idx_batch.to_region_ptrs();
-                let _ = idx_table.ingest_batch_from_regions(
+                let _ = ic.index_table.ingest_batch_from_regions(
                     &idx_ptrs, &idx_sizes, idx_batch.count as u32, idx_npc,
                 );
             }
@@ -1008,27 +936,15 @@ impl DagEngine {
     }
 
     /// Flush a table's WAL.
-    pub fn flush(&self, table_id: i64) -> i32 {
-        let entry = match self.tables.get(&table_id) {
+    pub fn flush(&mut self, table_id: i64) -> i32 {
+        let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => return -1,
         };
-        match &entry.handle {
-            StoreHandle::Single(ptr) if !ptr.is_null() => {
-                let table = unsafe { &mut **ptr };
-                match table.flush() {
-                    Ok(_) => 0,
-                    Err(e) => e,
-                }
-            }
-            StoreHandle::Partitioned(ptr) if !ptr.is_null() => {
-                let ptable = unsafe { &mut **ptr };
-                match ptable.flush() {
-                    Ok(_) => 0,
-                    Err(e) => e,
-                }
-            }
-            _ => -2,
+        match &mut entry.handle {
+            StoreHandle::Single(t) => match t.flush() { Ok(_) => 0, Err(e) => e },
+            StoreHandle::Borrowed(ptr) => match unsafe { &mut **ptr }.flush() { Ok(_) => 0, Err(e) => e },
+            StoreHandle::Partitioned(pt) => match pt.flush() { Ok(_) => 0, Err(e) => e },
         }
     }
 
@@ -1341,16 +1257,16 @@ impl DagEngine {
         let mut storage: Vec<Box<CursorHandle<'static>>> = Vec::new();
         for &(reg_id, table_id) in ext_trace_regs {
             if let Some(entry) = self.tables.get(&table_id) {
-                let cursor_opt = match &entry.handle {
-                    StoreHandle::Single(p) if !p.is_null() => {
-                        let t = unsafe { &mut **p };
-                        let _ = t.compact_if_needed();
-                        t.create_cursor().ok()
-                    }
-                    StoreHandle::Partitioned(p) if !p.is_null() => {
-                        unsafe { &mut **p }.create_cursor().ok()
-                    }
-                    _ => None,
+                let tbl_ptr = entry.handle.table_ptr();
+                let ptbl_ptr = entry.handle.ptable_ptr();
+                let cursor_opt = if !tbl_ptr.is_null() {
+                    let tbl = unsafe { &mut *tbl_ptr };
+                    let _ = tbl.compact_if_needed();
+                    tbl.create_cursor().ok()
+                } else if !ptbl_ptr.is_null() {
+                    unsafe { &mut *ptbl_ptr }.create_cursor().ok()
+                } else {
+                    None
                 };
                 if let Some(ch) = cursor_opt {
                     let mut boxed = Box::new(ch);
@@ -1668,6 +1584,13 @@ impl DagEngine {
 mod tests {
     use super::*;
 
+    fn make_test_table(name: &str) -> Box<Table> {
+        let schema = compiler::empty_schema();
+        let dir = format!("/tmp/gnitz_dag_test_{}", name);
+        let _ = std::fs::remove_dir_all(&dir);
+        Box::new(Table::new(&dir, name, schema, 99, 256 * 1024, false).unwrap())
+    }
+
     #[test]
     fn test_dag_engine_lifecycle() {
         let mut dag = DagEngine::new();
@@ -1680,11 +1603,13 @@ mod tests {
     fn test_register_unregister_table() {
         let mut dag = DagEngine::new();
         let schema = compiler::empty_schema();
-        dag.register_table(100, StoreHandle::Single(std::ptr::null_mut()), schema, 0, false, String::new());
+        let tbl = make_test_table("reg_unreg");
+        dag.register_table(100, StoreHandle::Single(tbl), schema, 0, false, String::new());
         assert!(dag.tables.contains_key(&100));
 
         dag.unregister_table(100);
         assert!(!dag.tables.contains_key(&100));
+        let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_reg_unreg");
     }
 
     #[test]
@@ -1716,21 +1641,29 @@ mod tests {
     fn test_set_depth() {
         let mut dag = DagEngine::new();
         let schema = compiler::empty_schema();
-        dag.register_table(50, StoreHandle::Single(std::ptr::null_mut()), schema, 1, false, String::new());
+        let tbl = make_test_table("set_depth");
+        dag.register_table(50, StoreHandle::Single(tbl), schema, 1, false, String::new());
         dag.set_depth(50, 3);
         assert_eq!(dag.tables[&50].depth, 3);
+        dag.close();
+        let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_set_depth");
     }
 
     #[test]
     fn test_add_remove_index_circuit() {
         let mut dag = DagEngine::new();
         let schema = compiler::empty_schema();
-        dag.register_table(50, StoreHandle::Single(std::ptr::null_mut()), schema, 0, false, String::new());
-        dag.add_index_circuit(50, 2, std::ptr::null_mut(), schema, false);
+        let tbl = make_test_table("idx_parent");
+        dag.register_table(50, StoreHandle::Single(tbl), schema, 0, false, String::new());
+        let idx_tbl = make_test_table("idx_child");
+        dag.add_index_circuit(50, 2, idx_tbl, schema, false);
         assert_eq!(dag.tables[&50].index_circuits.len(), 1);
 
         dag.remove_index_circuit(50, 2);
         assert_eq!(dag.tables[&50].index_circuits.len(), 0);
+        dag.close();
+        let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_idx_parent");
+        let _ = std::fs::remove_dir_all("/tmp/gnitz_dag_test_idx_child");
     }
 
     #[test]
