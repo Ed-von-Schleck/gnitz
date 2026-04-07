@@ -426,6 +426,95 @@ impl MappedShard {
         }
         -1
     }
+
+    /// Bulk-copy a contiguous slice of rows into an OwnedBatch.
+    /// Bypasses per-row cursor overhead entirely — one memcpy per column.
+    pub(crate) fn slice_to_owned_batch(
+        &self,
+        start: usize,
+        row_count: usize,
+        schema: &crate::schema::SchemaDescriptor,
+    ) -> super::memtable::OwnedBatch {
+        use super::memtable::OwnedBatch;
+
+        let npc = schema.num_columns as usize - 1;
+        let mut batch = OwnedBatch {
+            pk_lo: Vec::new(),
+            pk_hi: Vec::new(),
+            weight: Vec::new(),
+            null_bmp: Vec::new(),
+            col_data: Vec::with_capacity(npc),
+            blob: Vec::new(),
+            count: row_count,
+            sorted: true,
+            consolidated: true,
+            schema: Some(*schema),
+        };
+
+        if row_count == 0 {
+            for _ in 0..npc {
+                batch.col_data.push(Vec::new());
+            }
+            batch.count = 0;
+            return batch;
+        }
+
+        let data = self.data();
+
+        let expand_region = |region: &RegionView, stride: usize| -> Vec<u8> {
+            match region {
+                RegionView::Raw { offset, .. } => {
+                    let begin = offset + start * stride;
+                    let end = begin + row_count * stride;
+                    data[begin..end].to_vec()
+                }
+                RegionView::Constant { value, .. } => {
+                    value[..stride].repeat(row_count)
+                }
+                RegionView::TwoValue { value_a, value_b, bitvec_off } => {
+                    let a_bytes = value_a.to_le_bytes();
+                    let b_bytes = value_b.to_le_bytes();
+                    let mut v = vec![0u8; row_count * stride];
+                    for i in 0..row_count {
+                        let row = start + i;
+                        let bit = (data[bitvec_off + row / 8] >> (row % 8)) & 1;
+                        let src = if bit == 0 { &a_bytes[..stride] } else { &b_bytes[..stride] };
+                        v[i * stride..(i + 1) * stride].copy_from_slice(src);
+                    }
+                    v
+                }
+            }
+        };
+
+        batch.pk_lo = expand_region(&self.pk_lo, 8);
+        batch.pk_hi = expand_region(&self.pk_hi, 8);
+        batch.weight = expand_region(&self.weight, 8);
+        batch.null_bmp = expand_region(&self.null_bmp, 8);
+
+        let pk_index = schema.pk_index as usize;
+        let mut reg_idx = 0;
+        for ci in 0..schema.num_columns as usize {
+            if ci == pk_index { continue; }
+            let col_size = schema.columns[ci].size as usize;
+            batch.col_data.push(expand_region(&self.col_regions[reg_idx], col_size));
+            reg_idx += 1;
+        }
+
+        // Copy full blob — string offsets are relative to blob start, so no relocation needed
+        if self.blob_len > 0 {
+            batch.blob = data[self.blob_off..self.blob_off + self.blob_len].to_vec();
+        }
+
+        batch
+    }
+
+    /// Bulk-copy all rows into an OwnedBatch.
+    pub(crate) fn to_owned_batch(
+        &self,
+        schema: &crate::schema::SchemaDescriptor,
+    ) -> super::memtable::OwnedBatch {
+        self.slice_to_owned_batch(0, self.count, schema)
+    }
 }
 
 impl super::columnar::ColumnarSource for MappedShard {
@@ -890,5 +979,110 @@ mod tests {
         assert_eq!(shard.get_null_word(0), 0);
         assert_eq!(shard.find_row_index(42), 0);
         assert_eq!(shard.find_row_index(1), -1);
+    }
+
+    #[test]
+    fn to_owned_batch_roundtrip() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let schema = test_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+
+        let shard = MappedShard::open(&cpath, &schema, false).unwrap();
+        let batch = shard.to_owned_batch(&schema);
+
+        assert_eq!(batch.count, 10);
+        assert!(batch.sorted);
+        assert!(batch.consolidated);
+        for i in 0..10 {
+            assert_eq!(batch.get_pk(i), (i + 1) as u128);
+            let w = crate::util::read_i64_le(&batch.weight, i * 8);
+            assert_eq!(w, 1);
+            let v = crate::util::read_i64_le(&batch.col_data[0], i * 8);
+            assert_eq!(v, (i as i64 + 1) * 100);
+        }
+    }
+
+    #[test]
+    fn to_owned_batch_constant_regions() {
+        // All weights = 1 (Constant), all pk_hi = 0 (Constant), all null = 0 (Constant)
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let n = 20;
+        let pks: Vec<u64> = (1..=n).collect();
+        let wts: Vec<i64> = vec![1; n as usize];
+        let vals: Vec<i64> = vec![42; n as usize]; // constant payload
+        let path = build_test_shard_weights(dir.path(), "const_batch.db", &pks, &wts, &vals);
+        let schema = test_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+
+        let shard = MappedShard::open(&cpath, &schema, false).unwrap();
+        let batch = shard.to_owned_batch(&schema);
+
+        assert_eq!(batch.count, n as usize);
+        for i in 0..n as usize {
+            assert_eq!(batch.get_pk(i), (i + 1) as u128);
+            assert_eq!(crate::util::read_i64_le(&batch.weight, i * 8), 1);
+            assert_eq!(crate::util::read_i64_le(&batch.col_data[0], i * 8), 42);
+        }
+    }
+
+    #[test]
+    fn to_owned_batch_two_value_weight() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let n = 16usize;
+        let pks: Vec<u64> = (1..=n as u64).collect();
+        let wts: Vec<i64> = (0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
+        let vals: Vec<i64> = (0..n).map(|i| i as i64 * 10).collect();
+        let path = build_test_shard_weights(dir.path(), "twoval_batch.db", &pks, &wts, &vals);
+        let schema = test_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+
+        let shard = MappedShard::open(&cpath, &schema, false).unwrap();
+        let batch = shard.to_owned_batch(&schema);
+
+        assert_eq!(batch.count, n);
+        for i in 0..n {
+            let expected_w = if i % 2 == 0 { 1i64 } else { -1i64 };
+            assert_eq!(crate::util::read_i64_le(&batch.weight, i * 8), expected_w, "row {i}");
+            assert_eq!(crate::util::read_i64_le(&batch.col_data[0], i * 8), i as i64 * 10);
+        }
+    }
+
+    #[test]
+    fn slice_to_owned_batch_with_offset() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let schema = test_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+
+        let shard = MappedShard::open(&cpath, &schema, false).unwrap();
+
+        // Slice rows 3..7 (0-indexed: PKs 4,5,6,7)
+        let batch = shard.slice_to_owned_batch(3, 4, &schema);
+        assert_eq!(batch.count, 4);
+        assert_eq!(batch.get_pk(0), 4);
+        assert_eq!(batch.get_pk(3), 7);
+        assert_eq!(crate::util::read_i64_le(&batch.col_data[0], 0), 400);
+        assert_eq!(crate::util::read_i64_le(&batch.col_data[0], 3 * 8), 700);
+    }
+
+    #[test]
+    fn slice_to_owned_batch_empty() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = (1..=5).map(|i| (i, i as i64)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let schema = test_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+
+        let shard = MappedShard::open(&cpath, &schema, false).unwrap();
+        let batch = shard.slice_to_owned_batch(0, 0, &schema);
+        assert_eq!(batch.count, 0);
     }
 }

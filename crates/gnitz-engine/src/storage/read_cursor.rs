@@ -455,6 +455,65 @@ impl<'a> ReadCursor<'a> {
         }
         self.entries[self.current_entry_idx].source.blob_slice().len()
     }
+
+    /// Bulk-drain a single-source cursor into an OwnedBatch, bypassing
+    /// per-row iteration. Returns `None` for multi-source cursors or
+    /// sources with ghosts, signaling the caller to fall back to row-at-a-time.
+    ///
+    /// `limit == 0` means drain all remaining rows.
+    pub(crate) fn drain_single_source(
+        &mut self,
+        limit: usize,
+        schema: &SchemaDescriptor,
+    ) -> Option<super::memtable::OwnedBatch> {
+        if !self.valid || self.entries.len() != 1 {
+            return None;
+        }
+        let entry = &self.entries[0];
+        let start = entry.position;
+        let remaining = entry.count - start;
+        let row_count = if limit > 0 { remaining.min(limit) } else { remaining };
+
+        let batch = match &entry.source {
+            CursorSource::Batch(b) => {
+                // Batch sources are always consolidated (no ghosts).
+                let end = start + row_count;
+                let npc = b.col_data.len();
+                let mut out = super::memtable::OwnedBatch {
+                    pk_lo: b.pk_lo[start * 8..end * 8].to_vec(),
+                    pk_hi: b.pk_hi[start * 8..end * 8].to_vec(),
+                    weight: b.weight[start * 8..end * 8].to_vec(),
+                    null_bmp: b.null_bmp[start * 8..end * 8].to_vec(),
+                    col_data: Vec::with_capacity(npc),
+                    blob: b.blob.to_vec(),
+                    count: row_count,
+                    sorted: true,
+                    consolidated: true,
+                    schema: Some(*schema),
+                };
+                let pk_index = schema.pk_index as usize;
+                let mut pi = 0;
+                for ci in 0..schema.num_columns as usize {
+                    if ci == pk_index { continue; }
+                    let cs = schema.columns[ci].size as usize;
+                    out.col_data.push(b.col_data[pi][start * cs..end * cs].to_vec());
+                    pi += 1;
+                }
+                out
+            }
+            CursorSource::Shard(s) => {
+                if s.has_ghosts {
+                    return None;
+                }
+                s.slice_to_owned_batch(start, row_count, schema)
+            }
+        };
+
+        // Advance position past the drained rows
+        self.entries[0].position = start + row_count;
+        self.find_next_non_ghost();
+        Some(batch)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -882,5 +941,88 @@ mod tests {
         let rows = scan_all(&mut cursor);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], (5, 0, 10)); // 3 + 7 = 10
+    }
+
+    #[test]
+    fn test_drain_single_source_full() {
+        let schema = make_schema_i64();
+        let mut pk_lo = Vec::new();
+        let mut pk_hi = Vec::new();
+        let mut w = Vec::new();
+        let mut n = Vec::new();
+        let mut c = Vec::new();
+        let batch = make_batch(
+            &[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30)],
+            &mut pk_lo, &mut pk_hi, &mut w, &mut n, &mut c,
+        );
+        let entries = vec![ReadCursorEntry::new_batch(batch)];
+        let mut cursor = ReadCursor::new(entries, schema);
+
+        let result = cursor.drain_single_source(0, &schema);
+        assert!(result.is_some());
+        let out = result.unwrap();
+        assert_eq!(out.count, 3);
+        assert_eq!(out.get_pk(0), 1);
+        assert_eq!(out.get_pk(2), 3);
+        assert!(!cursor.valid);
+    }
+
+    #[test]
+    fn test_drain_single_source_with_limit() {
+        let schema = make_schema_i64();
+        let mut pk_lo = Vec::new();
+        let mut pk_hi = Vec::new();
+        let mut w = Vec::new();
+        let mut n = Vec::new();
+        let mut c = Vec::new();
+        let batch = make_batch(
+            &[(1, 0, 1, 10), (2, 0, 1, 20), (3, 0, 1, 30), (4, 0, 1, 40)],
+            &mut pk_lo, &mut pk_hi, &mut w, &mut n, &mut c,
+        );
+        let entries = vec![ReadCursorEntry::new_batch(batch)];
+        let mut cursor = ReadCursor::new(entries, schema);
+
+        // Drain first 2
+        let out1 = cursor.drain_single_source(2, &schema).unwrap();
+        assert_eq!(out1.count, 2);
+        assert_eq!(out1.get_pk(0), 1);
+        assert_eq!(out1.get_pk(1), 2);
+        assert!(cursor.valid);
+
+        // Drain remaining 2
+        let out2 = cursor.drain_single_source(0, &schema).unwrap();
+        assert_eq!(out2.count, 2);
+        assert_eq!(out2.get_pk(0), 3);
+        assert_eq!(out2.get_pk(1), 4);
+        assert!(!cursor.valid);
+    }
+
+    #[test]
+    fn test_drain_multi_source_returns_none() {
+        let schema = make_schema_i64();
+        let mut pk1 = Vec::new();
+        let mut hi1 = Vec::new();
+        let mut w1 = Vec::new();
+        let mut n1 = Vec::new();
+        let mut c1 = Vec::new();
+        let b1 = make_batch(
+            &[(1, 0, 1, 10)],
+            &mut pk1, &mut hi1, &mut w1, &mut n1, &mut c1,
+        );
+        let mut pk2 = Vec::new();
+        let mut hi2 = Vec::new();
+        let mut w2 = Vec::new();
+        let mut n2 = Vec::new();
+        let mut c2 = Vec::new();
+        let b2 = make_batch(
+            &[(2, 0, 1, 20)],
+            &mut pk2, &mut hi2, &mut w2, &mut n2, &mut c2,
+        );
+        let entries = vec![
+            ReadCursorEntry::new_batch(b1),
+            ReadCursorEntry::new_batch(b2),
+        ];
+        let mut cursor = ReadCursor::new(entries, schema);
+        assert!(cursor.drain_single_source(0, &schema).is_none());
     }
 }

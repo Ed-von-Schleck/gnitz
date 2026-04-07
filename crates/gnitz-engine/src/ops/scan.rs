@@ -21,6 +21,13 @@ pub fn op_scan_trace(
     schema: &SchemaDescriptor,
     chunk_limit: i32,
 ) -> OwnedBatch {
+    // Fast path: bulk drain for single-source cursors without ghosts
+    let limit = if chunk_limit > 0 { chunk_limit as usize } else { 0 };
+    if let Some(batch) = cursor.drain_single_source(limit, schema) {
+        return batch;
+    }
+
+    // Fallback: row-at-a-time scan
     let cap = if chunk_limit > 0 { chunk_limit as usize } else { 64 };
     let mut output = OwnedBatch::with_schema(*schema, cap);
     output.sorted = true;       // cursor produces sorted order

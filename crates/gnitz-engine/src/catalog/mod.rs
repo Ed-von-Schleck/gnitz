@@ -1209,28 +1209,60 @@ impl CatalogEngine {
             None => return OwnedBatch::empty(schema.num_columns as usize - 1),
         };
 
-        let mut batch = OwnedBatch::with_schema(*schema, 256);
-
-        let cursor_result = match &entry.handle {
+        // Extract single-Table handle (Single, Borrowed, or 1-partition Partitioned)
+        let tbl: Option<&mut Table> = match &entry.handle {
             StoreHandle::Single(ref t) => {
-                let tbl = unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) };
-                tbl.create_cursor()
+                Some(unsafe { &mut *(std::ptr::addr_of!(**t) as *mut Table) })
             }
-            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.create_cursor(),
+            StoreHandle::Borrowed(ptr) => Some(unsafe { &mut **ptr }),
             StoreHandle::Partitioned(ref pt) => {
                 let ptbl = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
-                ptbl.create_cursor()
+                if ptbl.num_partitions() == 1 {
+                    Some(ptbl.table_mut(0))
+                } else {
+                    None
+                }
             }
         };
-        if let Ok(mut cursor) = cursor_result {
-            while cursor.cursor.valid {
-                if cursor.cursor.current_weight > 0 {
-                    self.copy_cursor_row_to_batch(&cursor, schema, &mut batch);
-                }
-                cursor.cursor.advance();
-            }
-        }
 
+        // Single-Table path: try fast paths, then build cursor from already-computed data
+        let mut cursor = if let Some(table) = tbl {
+            let _ = table.compact_if_needed();
+            let snapshot = table.get_snapshot();
+            let shards = table.all_shard_arcs();
+
+            // Snapshot is consolidated → all weights > 0 → every row passes filter
+            if shards.is_empty() && snapshot.count > 0 {
+                return (*snapshot).clone();
+            }
+
+            // All weights non-zero and shard is sorted+consolidated
+            if snapshot.count == 0 && shards.len() == 1 && !shards[0].has_ghosts {
+                return shards[0].to_owned_batch(schema);
+            }
+
+            crate::storage::create_cursor_from_snapshots(&[snapshot], &shards, *schema)
+        } else {
+            // Multi-partition: delegate to PartitionedTable
+            match &entry.handle {
+                StoreHandle::Partitioned(ref pt) => {
+                    let ptbl = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
+                    match ptbl.create_cursor() {
+                        Ok(c) => c,
+                        Err(_) => return OwnedBatch::empty(schema.num_columns as usize - 1),
+                    }
+                }
+                _ => unreachable!(),
+            }
+        };
+
+        let mut batch = OwnedBatch::with_schema(*schema, 256);
+        while cursor.cursor.valid {
+            if cursor.cursor.current_weight > 0 {
+                self.copy_cursor_row_to_batch(&cursor, schema, &mut batch);
+            }
+            cursor.cursor.advance();
+        }
         batch
     }
 

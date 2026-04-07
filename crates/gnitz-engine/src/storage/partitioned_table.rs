@@ -63,6 +63,14 @@ impl PartitionedTable {
         &self.schema
     }
 
+    pub fn num_partitions(&self) -> u32 {
+        self.num_partitions
+    }
+
+    pub fn table_mut(&mut self, idx: usize) -> &mut Table {
+        &mut self.tables[idx]
+    }
+
     // ------------------------------------------------------------------
     // Ingest
     // ------------------------------------------------------------------

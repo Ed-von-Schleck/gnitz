@@ -28,6 +28,6 @@ pub use memtable::{OwnedBatch, write_to_owned_batch};
 pub use merge::{MemBatch, scatter_copy, sort_and_consolidate};
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
-pub(crate) use read_cursor::ReadCursor;
+pub(crate) use read_cursor::{ReadCursor, create_cursor_from_snapshots};
 pub(crate) use columnar::compare_rows;
 
