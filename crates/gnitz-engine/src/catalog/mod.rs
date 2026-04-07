@@ -273,6 +273,8 @@ pub struct CatalogEngine {
 
     // --- FK constraints per table ---
     fk_constraints: HashMap<i64, Vec<FkConstraint>>,
+    // Reverse index: parent_table_id → Vec<(child_table_id, fk_col_idx)>
+    fk_parent_map: HashMap<i64, Vec<(i64, usize)>>,
 
     // --- Index registry ---
     index_by_name: HashMap<String, i64>,   // name -> index_id
@@ -416,6 +418,7 @@ impl CatalogEngine {
             active_part_start: 0,
             active_part_end: NUM_PARTITIONS,
             fk_constraints: HashMap::new(),
+            fk_parent_map: HashMap::new(),
             index_by_name: HashMap::new(),
             index_by_id: HashMap::new(),
             schema_ids: HashMap::new(),
@@ -982,19 +985,13 @@ impl CatalogEngine {
             } else {
                 if self.dag.tables.contains_key(&tid) {
                     // Check for FK references before dropping
-                    for (&ref_tid, _) in &self.id_to_qualified {
-                        if ref_tid == tid { continue; }
-                        if let Some(constraints) = self.fk_constraints.get(&ref_tid) {
-                            for c in constraints {
-                                if c.target_table_id == tid {
-                                    let (sn, tn) = self.id_to_qualified.get(&ref_tid)
-                                        .cloned().unwrap_or_default();
-                                    return Err(format!(
-                                        "Integrity violation: table referenced by '{}.{}'", sn, tn
-                                    ));
-                                }
-                            }
-                        }
+                    let children = self.fk_children_of(tid);
+                    if let Some(&(child_tid, _)) = children.first() {
+                        let (sn, tn) = self.id_to_qualified.get(&child_tid)
+                            .cloned().unwrap_or_default();
+                        return Err(format!(
+                            "Integrity violation: table referenced by '{}.{}'", sn, tn
+                        ));
                     }
 
                     self.dag.unregister_table(tid);
@@ -1008,7 +1005,16 @@ impl CatalogEngine {
 
                     self.pk_col_indices.remove(&tid);
 
-                    self.fk_constraints.remove(&tid);
+                    // Remove this table's FK constraints and clean up parent map
+                    if let Some(constraints) = self.fk_constraints.remove(&tid) {
+                        for c in &constraints {
+                            if let Some(children) = self.fk_parent_map.get_mut(&c.target_table_id) {
+                                children.retain(|&(child_tid, _)| child_tid != tid);
+                            }
+                        }
+                    }
+                    // Also remove this table from being a parent
+                    self.fk_parent_map.remove(&tid);
                 }
             }
         }
@@ -1319,11 +1325,19 @@ impl CatalogEngine {
                     fk_col_idx: col_idx,
                     target_table_id: cd.fk_table_id,
                 });
+                self.fk_parent_map.entry(cd.fk_table_id)
+                    .or_default()
+                    .push((table_id, col_idx));
             }
         }
         if !constraints.is_empty() {
             self.fk_constraints.insert(table_id, constraints);
         }
+    }
+
+    /// Returns all child tables that have FK constraints targeting `parent_id`.
+    fn fk_children_of(&self, parent_id: i64) -> &[(i64, usize)] {
+        self.fk_parent_map.get(&parent_id).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     fn create_fk_indices(&mut self, table_id: i64) -> Result<(), String> {
@@ -1794,15 +1808,11 @@ impl CatalogEngine {
 
     fn check_for_dependencies(&mut self, tid: i64, name: &str) -> Result<(), String> {
         // Check FK references
-        for (&ref_tid, constraints) in &self.fk_constraints {
-            if ref_tid == tid { continue; }
-            for c in constraints {
-                if c.target_table_id == tid {
-                    let (sn, tn) = self.id_to_qualified.get(&ref_tid)
-                        .cloned().unwrap_or_default();
-                    return Err(format!("FK dependency: table '{}.{}'", sn, tn));
-                }
-            }
+        let children = self.fk_children_of(tid);
+        if let Some(&(child_tid, _)) = children.first() {
+            let (sn, tn) = self.id_to_qualified.get(&child_tid)
+                .cloned().unwrap_or_default();
+            return Err(format!("FK dependency: table '{}.{}'", sn, tn));
         }
 
         // Check view dependencies
@@ -2561,6 +2571,49 @@ impl CatalogEngine {
                     return Err(format!(
                         "Foreign Key violation in '{}.{}': value not found in target '{}.{}'",
                         sn, tn, tsn, ttn
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate FK RESTRICT on parent DELETE (single-worker path).
+    /// For each retraction row, checks whether any child table still references
+    /// the PK being deleted via the child's FK index. Returns an error if so.
+    pub fn validate_fk_parent_restrict(&self, table_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+        let children = self.fk_children_of(table_id);
+        if children.is_empty() { return Ok(()); }
+
+        for &(child_tid, fk_col_idx) in children {
+            let child_entry = match self.dag.tables.get(&child_tid) {
+                Some(e) => e,
+                None => continue,
+            };
+            let ic = match child_entry.index_circuits.iter()
+                .find(|ic| ic.col_idx == fk_col_idx as u32)
+            {
+                Some(ic) => ic,
+                None => {
+                    return Err(format!(
+                        "FK RESTRICT check failed: no index on child table {} col {}",
+                        child_tid, fk_col_idx,
+                    ));
+                }
+            };
+            let idx_table = unsafe { &mut *(std::ptr::addr_of!(*ic.index_table) as *mut Table) };
+
+            for row in 0..batch.count {
+                if batch.get_weight(row) >= 0 { continue; }
+                let pk = batch.get_pk(row);
+                if idx_table.has_pk(pk) {
+                    let (sn, tn) = self.id_to_qualified.get(&table_id)
+                        .cloned().unwrap_or_default();
+                    let (csn, ctn) = self.id_to_qualified.get(&child_tid)
+                        .cloned().unwrap_or_default();
+                    return Err(format!(
+                        "Foreign Key violation: cannot delete from '{}.{}', row still referenced by '{}.{}'",
+                        sn, tn, csn, ctn,
                     ));
                 }
             }

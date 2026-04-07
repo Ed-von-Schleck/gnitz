@@ -57,13 +57,13 @@ fn idx_tab_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| Schema {
         columns: vec![
-            ColumnDef { name: "index_id".into(),       type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "owner_id".into(),        type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "owner_kind".into(),      type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "source_col_idx".into(),  type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "name".into(),            type_code: TypeCode::String, is_nullable: false },
-            ColumnDef { name: "is_unique".into(),       type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "cache_directory".into(), type_code: TypeCode::String, is_nullable: false },
+            ColumnDef { name: "index_id".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "owner_id".into(),        type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "owner_kind".into(),      type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "source_col_idx".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "name".into(),            type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "is_unique".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "cache_directory".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     })
@@ -664,7 +664,7 @@ fn extract_col_entries(
     owner_id:   u64,
     owner_kind: u64,
 ) -> Result<Vec<ColumnDef>, ClientError> {
-    let mut col_entries: Vec<(u64, String, TypeCode, bool)> = Vec::new();
+    let mut col_entries: Vec<(u64, String, TypeCode, bool, u64, u64)> = Vec::new();
     for i in 0..col_batch.len() {
         if col_batch.weights[i] <= 0 { continue; }
         let row_owner_id   = col_u64(&col_batch.columns[1], i)?;
@@ -676,11 +676,13 @@ fn extract_col_entries(
         let tc_val      = col_u64(&col_batch.columns[5], i)?;
         let type_code   = TypeCode::try_from_u64(tc_val).map_err(ClientError::Protocol)?;
         let is_nullable = col_u64(&col_batch.columns[6], i)? != 0;
-        col_entries.push((col_idx, name, type_code, is_nullable));
+        let fk_table_id = col_u64(&col_batch.columns[7], i)?;
+        let fk_col_idx  = col_u64(&col_batch.columns[8], i)?;
+        col_entries.push((col_idx, name, type_code, is_nullable, fk_table_id, fk_col_idx));
     }
     col_entries.sort_by_key(|e| e.0);
-    Ok(col_entries.into_iter().map(|(_, name, type_code, is_nullable)| {
-        ColumnDef { name, type_code, is_nullable }
+    Ok(col_entries.into_iter().map(|(_, name, type_code, is_nullable, fk_table_id, fk_col_idx)| {
+        ColumnDef { name, type_code, is_nullable, fk_table_id, fk_col_idx }
     }).collect())
 }
 
@@ -756,8 +758,8 @@ impl GnitzClient {
                     .str_val(&columns[i].name)
                     .u64_val(columns[i].type_code as u64)
                     .u64_val(if columns[i].is_nullable { 1 } else { 0 })
-                    .u64_val(0)
-                    .u64_val(0);
+                    .u64_val(columns[i].fk_table_id)
+                    .u64_val(columns[i].fk_col_idx);
             }
         }
         self.conn.push(COL_TAB, &schema, &batch)?;

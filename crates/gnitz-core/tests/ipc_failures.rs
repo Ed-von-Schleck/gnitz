@@ -169,8 +169,8 @@ fn assemble(
 fn two_col() -> Schema {
     Schema {
         columns: vec![
-            ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
-            ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+            ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     }
@@ -179,9 +179,9 @@ fn two_col() -> Schema {
 fn three_col() -> Schema {
     Schema {
         columns: vec![
-            ColumnDef { name: "pk".into(),   type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "val".into(),  type_code: TypeCode::I64,    is_nullable: false },
-            ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true  },
+            ColumnDef { name: "pk".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "val".into(),  type_code: TypeCode::I64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     }
@@ -460,10 +460,10 @@ fn test_schema_mismatch_wrong_column_count_more() {
 
     let wrong = Schema {
         columns: vec![
-            ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-            ColumnDef { name: "a".into(),  type_code: TypeCode::I64, is_nullable: false },
-            ColumnDef { name: "b".into(),  type_code: TypeCode::I64, is_nullable: false },
-            ColumnDef { name: "c".into(),  type_code: TypeCode::I64, is_nullable: false },
+            ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "a".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "b".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "c".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     };
@@ -490,9 +490,9 @@ fn test_schema_mismatch_wrong_column_type() {
     // Push schema where column 2 is I64 instead of STRING
     let wrong = Schema {
         columns: vec![
-            ColumnDef { name: "pk".into(),   type_code: TypeCode::U64, is_nullable: false },
-            ColumnDef { name: "val".into(),  type_code: TypeCode::I64, is_nullable: false },
-            ColumnDef { name: "name".into(), type_code: TypeCode::I64, is_nullable: true  },
+            ColumnDef { name: "pk".into(),   type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "val".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "name".into(), type_code: TypeCode::I64, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     };
@@ -516,9 +516,9 @@ fn test_schema_mismatch_wrong_pk_index() {
     // Push with pk_index=1 to a table with pk_index=0
     let wrong = Schema {
         columns: vec![
-            ColumnDef { name: "val".into(),  type_code: TypeCode::I64,    is_nullable: false },
-            ColumnDef { name: "pk".into(),   type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true  },
+            ColumnDef { name: "val".into(),  type_code: TypeCode::I64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "pk".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 1,
     };

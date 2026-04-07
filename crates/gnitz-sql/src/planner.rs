@@ -52,6 +52,29 @@ pub fn execute_statement(
     }
 }
 
+/// Resolve a REFERENCES clause to (fk_table_id, fk_col_idx).
+fn resolve_fk_target(
+    client:           &GnitzClient,
+    schema_name:      &str,
+    foreign_table:    &sqlparser::ast::ObjectName,
+    referred_columns: &[sqlparser::ast::Ident],
+) -> Result<(u64, u64), GnitzSqlError> {
+    let ref_table = extract_name(foreign_table, "REFERENCES")?;
+    let (ref_tid, ref_schema) = client.resolve_table_id(schema_name, &ref_table)
+        .map_err(|e| GnitzSqlError::Bind(format!("FK target '{}': {}", ref_table, e)))?;
+    if !referred_columns.is_empty() {
+        let ref_col_name = &referred_columns[0].value;
+        let pk_col_name = &ref_schema.columns[ref_schema.pk_index].name;
+        if ref_col_name != pk_col_name {
+            return Err(GnitzSqlError::Bind(format!(
+                "FK must reference the primary key column '{}', got '{}'",
+                pk_col_name, ref_col_name,
+            )));
+        }
+    }
+    Ok((ref_tid, ref_schema.pk_index as u64))
+}
+
 fn execute_create_table(
     client:      &GnitzClient,
     schema_name: &str,
@@ -73,12 +96,23 @@ fn execute_create_table(
             name:        col.name.value.clone(),
             type_code:   tc,
             is_nullable,
+            fk_table_id: 0,
+            fk_col_idx:  0,
         });
 
         // Detect inline PRIMARY KEY
         for opt in &col.options {
             if matches!(opt.option, ColumnOption::Unique { is_primary: true, .. }) {
                 pk_idx = i;
+            }
+        }
+
+        // Detect inline REFERENCES (foreign key)
+        for opt in &col.options {
+            if let ColumnOption::ForeignKey { foreign_table, referred_columns, .. } = &opt.option {
+                let (tid, idx) = resolve_fk_target(client, schema_name, foreign_table, referred_columns)?;
+                cols[i].fk_table_id = tid;
+                cols[i].fk_col_idx  = idx;
             }
         }
     }
@@ -91,6 +125,25 @@ fn execute_create_table(
                     pk_idx = i;
                 }
             }
+        }
+    }
+
+    // Table-level FOREIGN KEY constraints
+    for constraint in &create.constraints {
+        if let TableConstraint::ForeignKey { columns, foreign_table, referred_columns, .. } = constraint {
+            if columns.len() != 1 {
+                return Err(GnitzSqlError::Unsupported(
+                    "multi-column FOREIGN KEY constraints are not supported".into()
+                ));
+            }
+            let local_col_name = &columns[0].value;
+            let col_idx = sql_cols.iter().position(|c| c.name.value == *local_col_name)
+                .ok_or_else(|| GnitzSqlError::Bind(format!(
+                    "FOREIGN KEY column '{}' not found in table definition", local_col_name
+                )))?;
+            let (tid, idx) = resolve_fk_target(client, schema_name, foreign_table, referred_columns)?;
+            cols[col_idx].fk_table_id = tid;
+            cols[col_idx].fk_col_idx  = idx;
         }
     }
 
@@ -382,7 +435,7 @@ fn build_projection(
                 out_cols.push(ColumnDef {
                     name: alias.value.clone(),
                     type_code: out_type,
-                    is_nullable: true,
+                    is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
                 });
             }
             SelectItem::UnnamedExpr(expr) => {
@@ -395,7 +448,7 @@ fn build_projection(
                 out_cols.push(ColumnDef {
                     name: col_name,
                     type_code: out_type,
-                    is_nullable: true,
+                    is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
                 });
             }
             _ => return Err(GnitzSqlError::Unsupported(
@@ -560,7 +613,7 @@ fn execute_create_join_view(
     out_cols.push(ColumnDef {
         name: "_join_pk".into(),
         type_code: TypeCode::U128,
-        is_nullable: false,
+        is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
     });
     for col in &left_schema.columns {
         out_cols.push(col.clone());
@@ -836,7 +889,7 @@ fn execute_create_group_by_view(
         reduce_schema_cols.push(source_schema.columns[group_col_indices[0]].clone());
     } else {
         reduce_schema_cols.push(ColumnDef {
-            name: "_group_pk".into(), type_code: TypeCode::U128, is_nullable: false,
+            name: "_group_pk".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
         });
         for &gi in &group_col_indices {
             reduce_schema_cols.push(source_schema.columns[gi].clone());
@@ -844,7 +897,7 @@ fn execute_create_group_by_view(
     }
     for _ in 0..agg_specs.len() {
         reduce_schema_cols.push(ColumnDef {
-            name: "_agg".into(), type_code: TypeCode::I64, is_nullable: false,
+            name: "_agg".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
         });
     }
     let reduce_schema = Schema { columns: reduce_schema_cols, pk_index: 0 };
@@ -892,7 +945,7 @@ fn execute_create_group_by_view(
                 let tc = reduce_schema.columns[reduce_col].type_code;
                 post_map_eb.copy_col(tc as u32, reduce_col as u32, payload_idx);
                 out_cols.push(ColumnDef {
-                    name: name.clone(), type_code: tc, is_nullable: false,
+                    name: name.clone(), type_code: tc, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
                 });
                 payload_idx += 1;
             }
@@ -910,7 +963,7 @@ fn execute_create_group_by_view(
                     post_map_eb.emit_col(avg_reg, payload_idx);
                     out_cols.push(ColumnDef {
                         name: m.output_name.clone(), type_code: TypeCode::F64,
-                        is_nullable: false,
+                        is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
                     });
                     payload_idx += 1;
                 } else {
@@ -920,7 +973,7 @@ fn execute_create_group_by_view(
                     post_map_eb.copy_col(tc as u32, agg_col, payload_idx);
                     out_cols.push(ColumnDef {
                         name: m.output_name.clone(), type_code: m.output_type,
-                        is_nullable: false,
+                        is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
                     });
                     payload_idx += 1;
                 }
@@ -1193,7 +1246,7 @@ fn execute_create_set_op_view(
     // Output schema: U128 PK + all payload columns
     let mut out_cols_final: Vec<ColumnDef> = Vec::new();
     out_cols_final.push(ColumnDef {
-        name: "_set_pk".into(), type_code: TypeCode::U128, is_nullable: false,
+        name: "_set_pk".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
     });
     for col in &left_cols {
         out_cols_final.push(col.clone());
@@ -1251,7 +1304,7 @@ fn execute_create_distinct_view(
     // Output schema: U128 PK + all source columns
     let mut out_cols: Vec<ColumnDef> = Vec::new();
     out_cols.push(ColumnDef {
-        name: "_distinct_pk".into(), type_code: TypeCode::U128, is_nullable: false,
+        name: "_distinct_pk".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
     });
     for col in &source_schema.columns {
         out_cols.push(col.clone());

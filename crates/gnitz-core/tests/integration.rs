@@ -46,8 +46,8 @@ fn test_push_scan_roundtrip() {
     // SCHEMA_TAB: pk=U64 (col 0), name=STRING (col 1)
     let schema_tab_schema = Schema {
         columns: vec![
-            ColumnDef { name: "schema_id".into(), type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "name".into(),      type_code: TypeCode::String, is_nullable: false },
+            ColumnDef { name: "schema_id".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "name".into(),      type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     };
@@ -151,8 +151,8 @@ fn test_create_drop_table() {
     client.create_schema("s1").unwrap();
 
     let cols = vec![
-        ColumnDef { name: "id".into(),    type_code: TypeCode::U64, is_nullable: false },
-        ColumnDef { name: "value".into(), type_code: TypeCode::I64, is_nullable: false },
+        ColumnDef { name: "id".into(),    type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "value".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("s1", "t1", &cols, 0, true).unwrap();
     assert!(tid >= FIRST_USER_TABLE_ID, "table id too small: {}", tid);
@@ -178,8 +178,8 @@ fn test_push_and_scan() {
     client.create_schema("s2").unwrap();
 
     let cols = vec![
-        ColumnDef { name: "id".into(),    type_code: TypeCode::U64, is_nullable: false },
-        ColumnDef { name: "value".into(), type_code: TypeCode::I64, is_nullable: false },
+        ColumnDef { name: "id".into(),    type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "value".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("s2", "t2", &cols, 0, true).unwrap();
 
@@ -220,8 +220,8 @@ fn test_delete_rows() {
     client.create_schema("s3").unwrap();
 
     let cols = vec![
-        ColumnDef { name: "id".into(),    type_code: TypeCode::U64, is_nullable: false },
-        ColumnDef { name: "value".into(), type_code: TypeCode::I64, is_nullable: false },
+        ColumnDef { name: "id".into(),    type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "value".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("s3", "t3", &cols, 0, true).unwrap();
 
@@ -267,9 +267,9 @@ fn test_string_columns() {
     client.create_schema("s4").unwrap();
 
     let cols = vec![
-        ColumnDef { name: "id".into(),    type_code: TypeCode::U64,    is_nullable: false },
-        ColumnDef { name: "label".into(), type_code: TypeCode::String, is_nullable: false },
-        ColumnDef { name: "note".into(),  type_code: TypeCode::String, is_nullable: true  },
+        ColumnDef { name: "id".into(),    type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "label".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "note".into(),  type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("s4", "t4", &cols, 0, true).unwrap();
 
@@ -324,9 +324,9 @@ fn test_resolve_table_id() {
     client.create_schema("s5").unwrap();
 
     let cols = vec![
-        ColumnDef { name: "id".into(),    type_code: TypeCode::U64,    is_nullable: false },
-        ColumnDef { name: "name".into(),  type_code: TypeCode::String, is_nullable: false },
-        ColumnDef { name: "score".into(), type_code: TypeCode::F64,    is_nullable: true  },
+        ColumnDef { name: "id".into(),    type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "name".into(),  type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "score".into(), type_code: TypeCode::F64,    is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("s5", "t5", &cols, 0, true).unwrap();
 
@@ -363,8 +363,8 @@ fn test_filter_view() {
 
     client.create_schema("sv1").unwrap();
     let cols = vec![
-        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
-        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("sv1", "ft1", &cols, 0, true).unwrap();
 
@@ -418,9 +418,9 @@ fn test_reduce_view() {
 
     client.create_schema("sv2").unwrap();
     let cols = vec![
-        ColumnDef { name: "pk".into(),       type_code: TypeCode::U64, is_nullable: false },
-        ColumnDef { name: "group_id".into(), type_code: TypeCode::I64, is_nullable: false },
-        ColumnDef { name: "val".into(),      type_code: TypeCode::I64, is_nullable: false },
+        ColumnDef { name: "pk".into(),       type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "group_id".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "val".into(),      type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("sv2", "rt2", &cols, 0, true).unwrap();
 
@@ -433,9 +433,9 @@ fn test_reduce_view() {
     let circuit = cb.build();
 
     let out_cols = vec![
-        ColumnDef { name: "_group_hash".into(), type_code: TypeCode::U128, is_nullable: false },
-        ColumnDef { name: "group_id".into(),    type_code: TypeCode::I64,  is_nullable: false },
-        ColumnDef { name: "agg".into(),         type_code: TypeCode::I64,  is_nullable: false },
+        ColumnDef { name: "_group_hash".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "group_id".into(),    type_code: TypeCode::I64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "agg".into(),         type_code: TypeCode::I64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     client.create_view_with_circuit("sv2", "reduce_v", "", circuit, &out_cols).unwrap();
 
@@ -478,8 +478,8 @@ fn test_join_view() {
 
     client.create_schema("sv3").unwrap();
     let cols = vec![
-        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
-        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let table_schema = Schema { columns: cols, pk_index: 0 };
     let tid_a = client.create_table("sv3", "jt3a", &table_schema.columns, 0, true).unwrap();
@@ -536,8 +536,8 @@ fn test_anti_join_view() {
 
     client.create_schema("sv4").unwrap();
     let cols = vec![
-        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
-        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let table_schema = Schema { columns: cols, pk_index: 0 };
     let tid_a = client.create_table("sv4", "ajt4a", &table_schema.columns, 0, true).unwrap();
@@ -594,7 +594,7 @@ fn test_exchange_multi_worker() {
 
     client.create_schema("sv5").unwrap();
     let cols = vec![
-        ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
+        ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("sv5", "et5", &cols, 0, true).unwrap();
     let table_schema = Schema { columns: cols, pk_index: 0 };
@@ -632,9 +632,9 @@ fn test_incremental_update() {
     client.create_schema("sv6").unwrap();
     let table_schema = Schema {
         columns: vec![
-            ColumnDef { name: "pk".into(),       type_code: TypeCode::U64, is_nullable: false },
-            ColumnDef { name: "group_id".into(), type_code: TypeCode::I64, is_nullable: false },
-            ColumnDef { name: "val".into(),      type_code: TypeCode::I64, is_nullable: false },
+            ColumnDef { name: "pk".into(),       type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "group_id".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "val".into(),      type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     };
@@ -648,9 +648,9 @@ fn test_incremental_update() {
     let circuit = cb.build();
 
     let out_cols = vec![
-        ColumnDef { name: "_group_hash".into(), type_code: TypeCode::U128, is_nullable: false },
-        ColumnDef { name: "group_id".into(),    type_code: TypeCode::I64,  is_nullable: false },
-        ColumnDef { name: "agg".into(),         type_code: TypeCode::I64,  is_nullable: false },
+        ColumnDef { name: "_group_hash".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "group_id".into(),    type_code: TypeCode::I64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "agg".into(),         type_code: TypeCode::I64,  is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     client.create_view_with_circuit("sv6", "incr_v", "", circuit, &out_cols).unwrap();
 
@@ -709,8 +709,8 @@ fn test_bulk_filter() {
 
     client.create_schema("bf1").unwrap();
     let cols = vec![
-        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
-        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("bf1", "bft1", &cols, 0, true).unwrap();
     let table_schema = Schema { columns: cols, pk_index: 0 };
@@ -764,8 +764,8 @@ fn test_bulk_exchange_multi_worker() {
 
     client.create_schema("bem1").unwrap();
     let cols = vec![
-        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
-        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+        ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
     ];
     let tid = client.create_table("bem1", "bemt1", &cols, 0, true).unwrap();
     let table_schema = Schema { columns: cols, pk_index: 0 };

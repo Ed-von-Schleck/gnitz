@@ -51,15 +51,15 @@ fn control_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| Schema {
         columns: vec![
-            ColumnDef { name: "msg_idx".into(),     type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "status".into(),      type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "client_id".into(),   type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "target_id".into(),   type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "flags".into(),       type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "seek_pk_lo".into(),  type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "seek_pk_hi".into(),  type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "seek_col_idx".into(),type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "error_msg".into(),   type_code: TypeCode::String, is_nullable: true  },
+            ColumnDef { name: "msg_idx".into(),     type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "status".into(),      type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "client_id".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "target_id".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "flags".into(),       type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "seek_pk_lo".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "seek_pk_hi".into(),  type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "seek_col_idx".into(),type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "error_msg".into(),   type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     })
@@ -380,8 +380,8 @@ mod tests {
         // Empty batch → FLAG_HAS_SCHEMA but not FLAG_HAS_DATA
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -401,9 +401,9 @@ mod tests {
     fn test_message_roundtrip_data() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "i64".into(), type_code: TypeCode::I64, is_nullable: false },
-                ColumnDef { name: "f64".into(), type_code: TypeCode::F64, is_nullable: false },
+                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "i64".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "f64".into(), type_code: TypeCode::F64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -459,9 +459,9 @@ mod tests {
     fn test_message_roundtrip_strings() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64,    is_nullable: false },
-                ColumnDef { name: "s1".into(), type_code: TypeCode::String, is_nullable: true  },
-                ColumnDef { name: "s2".into(), type_code: TypeCode::String, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "s1".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "s2".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -582,8 +582,8 @@ mod tests {
     fn test_encode_parse_with_data() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -619,7 +619,7 @@ mod tests {
     fn test_encode_parse_empty_batch() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };

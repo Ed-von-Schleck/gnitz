@@ -170,6 +170,8 @@ pub extern "C" fn gnitz_schema_add_col(
         name:        cstr(name).to_owned(),
         type_code:   tc,
         is_nullable: nullable != 0,
+        fk_table_id: 0,
+        fk_col_idx:  0,
     });
     0
 }
@@ -1031,8 +1033,8 @@ mod tests {
     fn test_set_string_alignment_ok() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: false },
+                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -1058,8 +1060,8 @@ mod tests {
     fn test_set_string_overflow() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: false },
+                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };

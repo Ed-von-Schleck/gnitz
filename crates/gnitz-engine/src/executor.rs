@@ -177,6 +177,7 @@ impl ServerExecutor {
             if let Some(batch) = in_batch {
                 if batch.count > 0 {
                     self.cat().validate_fk_inline(target_id, &batch)?;
+                    self.cat().validate_fk_parent_restrict(target_id, &batch)?;
                     self.cat().validate_unique_indices(target_id, &batch)?;
                     self.disp().validate_unique_distributed(target_id, &batch)?;
                     self.disp().fan_out_push(target_id, &batch)?;
@@ -197,6 +198,7 @@ impl ServerExecutor {
                 if target_id >= FIRST_USER_TABLE_ID {
                     // User table: FK + unique validation, then push_and_evaluate
                     self.cat().validate_fk_inline(target_id, &batch)?;
+                    self.cat().validate_fk_parent_restrict(target_id, &batch)?;
                     self.cat().validate_unique_indices(target_id, &batch)?;
                     // Transfer ownership
                     self.cat().push_and_evaluate(target_id, *batch)?;

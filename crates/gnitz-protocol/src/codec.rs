@@ -96,7 +96,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
             pk_index = Some(i);
         }
 
-        columns.push(ColumnDef { name, type_code: tc, is_nullable });
+        columns.push(ColumnDef { name, type_code: tc, is_nullable, fk_table_id: 0, fk_col_idx: 0 });
     }
 
     let pk_index = pk_index.ok_or_else(|| {
@@ -205,11 +205,11 @@ mod tests {
     fn test_schema_meta_roundtrip() {
         let original = Schema {
             columns: vec![
-                ColumnDef { name: "id".into(),    type_code: TypeCode::U64,    is_nullable: false },
-                ColumnDef { name: "name".into(),  type_code: TypeCode::String, is_nullable: true  },
-                ColumnDef { name: "score".into(), type_code: TypeCode::F64,    is_nullable: false },
-                ColumnDef { name: "tag".into(),   type_code: TypeCode::I32,    is_nullable: true  },
-                ColumnDef { name: "uuid".into(),  type_code: TypeCode::U128,   is_nullable: false },
+                ColumnDef { name: "id".into(),    type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "name".into(),  type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "score".into(), type_code: TypeCode::F64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "tag".into(),   type_code: TypeCode::I32,    is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "uuid".into(),  type_code: TypeCode::U128,   is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };

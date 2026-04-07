@@ -55,6 +55,8 @@ pub struct ColumnDef {
     pub name:        std::string::String,
     pub type_code:   TypeCode,
     pub is_nullable: bool,
+    pub fk_table_id: u64,
+    pub fk_col_idx:  u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,10 +70,10 @@ pub fn meta_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| Schema {
         columns: vec![
-            ColumnDef { name: "col_idx".into(),   type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "type_code".into(), type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "flags".into(),     type_code: TypeCode::U64,    is_nullable: false },
-            ColumnDef { name: "name".into(),      type_code: TypeCode::String, is_nullable: false },
+            ColumnDef { name: "col_idx".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "type_code".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "flags".into(),     type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "name".into(),      type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ],
         pk_index: 0,
     })
@@ -322,8 +324,8 @@ mod tests {
     fn test_schema_eq() {
         let a = Schema {
             columns: vec![
-                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true },
+                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -335,13 +337,13 @@ mod tests {
     fn test_schema_ne_col_name() {
         let a = Schema {
             columns: vec![
-                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
         let b = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -352,15 +354,15 @@ mod tests {
     fn test_schema_ne_pk_index() {
         let a = Schema {
             columns: vec![
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
         let b = Schema {
             columns: vec![
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 1,
         };
@@ -371,13 +373,13 @@ mod tests {
     fn test_schema_ne_type_code() {
         let a = Schema {
             columns: vec![
-                ColumnDef { name: "x".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "x".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
         let b = Schema {
             columns: vec![
-                ColumnDef { name: "x".into(), type_code: TypeCode::I64, is_nullable: false },
+                ColumnDef { name: "x".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -390,8 +392,8 @@ mod tests {
     fn test_validate_empty_batch() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -403,9 +405,9 @@ mod tests {
     fn test_validate_valid_batch() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false },
-                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -423,7 +425,7 @@ mod tests {
     fn test_validate_mismatched_weights() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -439,8 +441,8 @@ mod tests {
     fn test_validate_mismatched_strings() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -458,8 +460,8 @@ mod tests {
     fn test_validate_mismatched_fixed() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -477,14 +479,14 @@ mod tests {
     fn test_validate_wrong_column_count() {
         let schema2 = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
         let schema1 = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -499,9 +501,9 @@ mod tests {
     fn test_appender_single_row() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -525,8 +527,8 @@ mod tests {
     fn test_appender_multi_row() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -552,9 +554,9 @@ mod tests {
     fn test_appender_string_col() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -573,8 +575,8 @@ mod tests {
     fn test_appender_null_mask() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: true },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -590,8 +592,8 @@ mod tests {
     fn test_appender_u128_col() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "big".into(), type_code: TypeCode::U128, is_nullable: false },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "big".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -609,11 +611,11 @@ mod tests {
         // pk(0) + U64 + String + I64 + String
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "b".into(), type_code: TypeCode::String, is_nullable: false },
-                ColumnDef { name: "c".into(), type_code: TypeCode::I64, is_nullable: false },
-                ColumnDef { name: "d".into(), type_code: TypeCode::String, is_nullable: true },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "b".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "c".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "d".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
@@ -644,10 +646,10 @@ mod tests {
         // pk_index=2: columns [A(0), B(1), PK(2), C(3)]
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "c".into(), type_code: TypeCode::U64, is_nullable: false },
+                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "c".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 2,
         };
@@ -677,9 +679,9 @@ mod tests {
     fn test_appender_then_validate() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false },
-                ColumnDef { name: "v".into(), type_code: TypeCode::I64, is_nullable: false },
-                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: true },
+                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "v".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
             ],
             pk_index: 0,
         };
