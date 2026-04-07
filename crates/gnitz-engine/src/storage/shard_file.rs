@@ -252,13 +252,20 @@ pub fn build_shard_image(
     image
 }
 
-/// pwrite loop that handles short writes.
+/// pwrite loop that handles short writes and EINTR.
 unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> i32 {
     let mut remaining = buf.len();
     let mut p = buf.as_ptr();
     while remaining > 0 {
         let written = libc::pwrite(fd, p as *const libc::c_void, remaining, offset);
-        if written <= 0 {
+        if written < 0 {
+            let e = *libc::__errno_location();
+            if e == libc::EINTR {
+                continue;
+            }
+            return -3;
+        }
+        if written == 0 {
             return -3;
         }
         remaining -= written as usize;
