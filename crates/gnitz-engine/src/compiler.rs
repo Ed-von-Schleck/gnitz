@@ -13,70 +13,32 @@ use crate::storage::{CursorHandle, Table, ReadCursor};
 use crate::scalar_func::{Plan, ScalarFuncKind};
 use crate::vm::{ProgramBuilder, VmHandle};
 
-// ---------------------------------------------------------------------------
-// Constants — derived from gnitz-wire canonical definitions
-// ---------------------------------------------------------------------------
+gnitz_wire::cast_consts! { i32;
+    OPCODE_FILTER, OPCODE_MAP, OPCODE_NEGATE, OPCODE_UNION,
+    OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_DELTA,
+    OPCODE_INTEGRATE, OPCODE_DELAY, OPCODE_REDUCE, OPCODE_DISTINCT,
+    OPCODE_SCAN_TRACE, OPCODE_SEEK_TRACE, OPCODE_CLEAR_DELTAS,
+    OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_ANTI_JOIN_DELTA_DELTA,
+    OPCODE_SEMI_JOIN_DELTA_TRACE, OPCODE_SEMI_JOIN_DELTA_DELTA,
+    OPCODE_EXCHANGE_SHARD, OPCODE_JOIN_DELTA_TRACE_OUTER,
+    OPCODE_NULL_EXTEND, OPCODE_GATHER_REDUCE,
+    PORT_IN, PORT_IN_A, PORT_IN_B, PORT_TRACE,
+    PARAM_AGG_FUNC_ID, PARAM_TABLE_ID, PARAM_AGG_COL_IDX,
+    PARAM_EXPR_NUM_REGS, PARAM_EXPR_RESULT_REG,
+    PARAM_REINDEX_COL, PARAM_JOIN_SOURCE_TABLE,
+    PARAM_AGG_COUNT, PARAM_AGG_SPEC_BASE,
+    PARAM_KEY_ONLY, PARAM_NULL_EXTEND_COUNT, PARAM_NULL_EXTEND_COL_BASE,
+    PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_SHARD_COL_BASE, PARAM_CONST_STR_BASE,
+}
+gnitz_wire::cast_consts! { u8; AGG_COUNT, AGG_SUM, AGG_MIN, AGG_MAX, AGG_COUNT_NON_NULL }
 
-// Opcodes (wire u64 → local i32 for node.opcode matching)
-const OPCODE_FILTER: i32                = gnitz_wire::OPCODE_FILTER as i32;
-const OPCODE_MAP: i32                   = gnitz_wire::OPCODE_MAP as i32;
-const OPCODE_NEGATE: i32                = gnitz_wire::OPCODE_NEGATE as i32;
-const OPCODE_UNION: i32                 = gnitz_wire::OPCODE_UNION as i32;
-const OPCODE_JOIN_DELTA_TRACE: i32      = gnitz_wire::OPCODE_JOIN_DELTA_TRACE as i32;
-const OPCODE_JOIN_DELTA_DELTA: i32      = gnitz_wire::OPCODE_JOIN_DELTA_DELTA as i32;
-const OPCODE_INTEGRATE: i32             = gnitz_wire::OPCODE_INTEGRATE as i32;
-const OPCODE_DELAY: i32                 = gnitz_wire::OPCODE_DELAY as i32;
-const OPCODE_REDUCE: i32                = gnitz_wire::OPCODE_REDUCE as i32;
-const OPCODE_DISTINCT: i32              = gnitz_wire::OPCODE_DISTINCT as i32;
-const OPCODE_SCAN_TRACE: i32            = gnitz_wire::OPCODE_SCAN_TRACE as i32;
-const OPCODE_SEEK_TRACE: i32            = gnitz_wire::OPCODE_SEEK_TRACE as i32;
-const OPCODE_CLEAR_DELTAS: i32          = gnitz_wire::OPCODE_CLEAR_DELTAS as i32;
-const OPCODE_ANTI_JOIN_DELTA_TRACE: i32 = gnitz_wire::OPCODE_ANTI_JOIN_DELTA_TRACE as i32;
-const OPCODE_ANTI_JOIN_DELTA_DELTA: i32 = gnitz_wire::OPCODE_ANTI_JOIN_DELTA_DELTA as i32;
-const OPCODE_SEMI_JOIN_DELTA_TRACE: i32 = gnitz_wire::OPCODE_SEMI_JOIN_DELTA_TRACE as i32;
-const OPCODE_SEMI_JOIN_DELTA_DELTA: i32 = gnitz_wire::OPCODE_SEMI_JOIN_DELTA_DELTA as i32;
-const OPCODE_EXCHANGE_SHARD: i32        = gnitz_wire::OPCODE_EXCHANGE_SHARD as i32;
-const OPCODE_JOIN_DELTA_TRACE_OUTER: i32 = gnitz_wire::OPCODE_JOIN_DELTA_TRACE_OUTER as i32;
-const OPCODE_NULL_EXTEND: i32           = gnitz_wire::OPCODE_NULL_EXTEND as i32;
-const OPCODE_GATHER_REDUCE: i32         = gnitz_wire::OPCODE_GATHER_REDUCE as i32;
-
-// Ports (wire u64 → local i32)
-const PORT_IN: i32    = gnitz_wire::PORT_IN as i32;
-const PORT_IN_A: i32  = gnitz_wire::PORT_IN_A as i32;
-const PORT_IN_B: i32  = gnitz_wire::PORT_IN_B as i32;
-const PORT_TRACE: i32 = gnitz_wire::PORT_TRACE as i32;
-// Engine-only port aliases
+// Engine-only constants
+const PARAM_CHUNK_LIMIT: i32 = 2;
 const PORT_DELTA: i32       = 0;
 const PORT_IN_REDUCE: i32   = 0;
 const PORT_TRACE_IN: i32    = 1;
 const PORT_IN_DISTINCT: i32 = 0;
 const PORT_EXCHANGE_IN: i32 = 0;
-
-// Param slots (wire u64 → local i32)
-const PARAM_AGG_FUNC_ID: i32          = gnitz_wire::PARAM_AGG_FUNC_ID as i32;
-const PARAM_CHUNK_LIMIT: i32          = 2; // engine-only
-const PARAM_TABLE_ID: i32             = gnitz_wire::PARAM_TABLE_ID as i32;
-const PARAM_AGG_COL_IDX: i32          = gnitz_wire::PARAM_AGG_COL_IDX as i32;
-const PARAM_EXPR_NUM_REGS: i32        = gnitz_wire::PARAM_EXPR_NUM_REGS as i32;
-const PARAM_EXPR_RESULT_REG: i32      = gnitz_wire::PARAM_EXPR_RESULT_REG as i32;
-const PARAM_REINDEX_COL: i32          = gnitz_wire::PARAM_REINDEX_COL as i32;
-const PARAM_JOIN_SOURCE_TABLE: i32    = gnitz_wire::PARAM_JOIN_SOURCE_TABLE as i32;
-const PARAM_AGG_COUNT: i32            = gnitz_wire::PARAM_AGG_COUNT as i32;
-const PARAM_AGG_SPEC_BASE: i32        = gnitz_wire::PARAM_AGG_SPEC_BASE as i32;
-const PARAM_KEY_ONLY: i32             = gnitz_wire::PARAM_KEY_ONLY as i32;
-const PARAM_NULL_EXTEND_COUNT: i32    = gnitz_wire::PARAM_NULL_EXTEND_COUNT as i32;
-const PARAM_NULL_EXTEND_COL_BASE: i32 = gnitz_wire::PARAM_NULL_EXTEND_COL_BASE as i32;
-const PARAM_PROJ_BASE: i32            = gnitz_wire::PARAM_PROJ_BASE as i32;
-const PARAM_EXPR_BASE: i32            = gnitz_wire::PARAM_EXPR_BASE as i32;
-const PARAM_SHARD_COL_BASE: i32       = gnitz_wire::PARAM_SHARD_COL_BASE as i32;
-const PARAM_CONST_STR_BASE: i32       = gnitz_wire::PARAM_CONST_STR_BASE as i32;
-
-// Aggregate ops (wire u64 → local u8)
-const AGG_COUNT: u8          = gnitz_wire::AGG_COUNT as u8;
-const AGG_SUM: u8            = gnitz_wire::AGG_SUM as u8;
-const AGG_MIN: u8            = gnitz_wire::AGG_MIN as u8;
-const AGG_MAX: u8            = gnitz_wire::AGG_MAX as u8;
-const AGG_COUNT_NON_NULL: u8 = gnitz_wire::AGG_COUNT_NON_NULL as u8;
 
 // System table column indices (after PK column)
 const NODES_COL_OPCODE: usize = 1;

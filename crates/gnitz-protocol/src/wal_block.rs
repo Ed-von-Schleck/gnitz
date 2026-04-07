@@ -38,8 +38,6 @@ fn xxh3_64(data: &[u8]) -> u64 {
     twox_hash::XxHash3_64::oneshot(data)
 }
 
-// ── German String encode/decode (wrappers around gnitz-wire) ─────────────────
-
 fn encode_german_string(s: &str, blob: &mut Vec<u8>) -> [u8; 16] {
     gnitz_wire::encode_german_string(s.as_bytes(), blob)
 }

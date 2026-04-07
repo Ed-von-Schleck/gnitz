@@ -27,20 +27,20 @@ impl TypeCode {
     }
 
     pub fn try_from_u64(v: u64) -> Result<Self, ProtocolError> {
-        match v as u8 {
-            tc::U8     => Ok(TypeCode::U8),
-            tc::I8     => Ok(TypeCode::I8),
-            tc::U16    => Ok(TypeCode::U16),
-            tc::I16    => Ok(TypeCode::I16),
-            tc::U32    => Ok(TypeCode::U32),
-            tc::I32    => Ok(TypeCode::I32),
-            tc::F32    => Ok(TypeCode::F32),
-            tc::U64    => Ok(TypeCode::U64),
-            tc::I64    => Ok(TypeCode::I64),
-            tc::F64    => Ok(TypeCode::F64),
-            tc::STRING => Ok(TypeCode::String),
-            tc::U128   => Ok(TypeCode::U128),
-            _          => Err(ProtocolError::UnknownTypeCode(v)),
+        match v {
+            _ if v == tc::U8     as u64 => Ok(TypeCode::U8),
+            _ if v == tc::I8     as u64 => Ok(TypeCode::I8),
+            _ if v == tc::U16    as u64 => Ok(TypeCode::U16),
+            _ if v == tc::I16    as u64 => Ok(TypeCode::I16),
+            _ if v == tc::U32    as u64 => Ok(TypeCode::U32),
+            _ if v == tc::I32    as u64 => Ok(TypeCode::I32),
+            _ if v == tc::F32    as u64 => Ok(TypeCode::F32),
+            _ if v == tc::U64    as u64 => Ok(TypeCode::U64),
+            _ if v == tc::I64    as u64 => Ok(TypeCode::I64),
+            _ if v == tc::F64    as u64 => Ok(TypeCode::F64),
+            _ if v == tc::STRING as u64 => Ok(TypeCode::String),
+            _ if v == tc::U128   as u64 => Ok(TypeCode::U128),
+            _ => Err(ProtocolError::UnknownTypeCode(v)),
         }
     }
 }

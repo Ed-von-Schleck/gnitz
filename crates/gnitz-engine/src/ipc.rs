@@ -22,7 +22,6 @@ pub const SAL_MMAP_SIZE: usize = 1 << 30;
 pub const W2M_REGION_SIZE: usize = 1 << 30;
 pub const W2M_HEADER_SIZE: usize = 128;
 
-// Wire protocol flags (from gnitz-wire)
 pub use gnitz_wire::{
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, IPC_CONTROL_TID,
     STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
@@ -30,14 +29,11 @@ pub use gnitz_wire::{
 pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
 pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
 
-// SAL group header flags (u32) — shared flags derived from wire, engine-only flags local.
-pub const FLAG_SHUTDOWN: u32            = gnitz_wire::FLAG_SHUTDOWN as u32;
-pub const FLAG_DDL_SYNC: u32            = gnitz_wire::FLAG_DDL_SYNC as u32;
-pub const FLAG_EXCHANGE: u32            = gnitz_wire::FLAG_EXCHANGE as u32;
-pub const FLAG_PUSH: u32                = gnitz_wire::FLAG_PUSH as u32;
-pub const FLAG_HAS_PK: u32             = gnitz_wire::FLAG_HAS_PK as u32;
-pub const FLAG_SEEK: u32                = gnitz_wire::FLAG_SEEK as u32;
-pub const FLAG_SEEK_BY_INDEX: u32       = gnitz_wire::FLAG_SEEK_BY_INDEX as u32;
+// SAL group header flags (u32 — engine-only flags after FLAG_SEEK_BY_INDEX)
+gnitz_wire::cast_consts! { pub u32;
+    FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH,
+    FLAG_HAS_PK, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+}
 pub const FLAG_EXCHANGE_RELAY: u32      = 512;
 pub const FLAG_PRELOADED_EXCHANGE: u32  = 1024;
 pub const FLAG_BACKFILL: u32            = 2048;

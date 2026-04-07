@@ -26,7 +26,6 @@ pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
 pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
 pub(super) const NUM_PARTITIONS: u32 = 256;
 
-// System table IDs (from gnitz-wire)
 pub(super) const SCHEMA_TAB_ID: i64             = gnitz_wire::SCHEMA_TAB as i64;
 pub(super) const TABLE_TAB_ID: i64              = gnitz_wire::TABLE_TAB as i64;
 pub(super) const VIEW_TAB_ID: i64               = gnitz_wire::VIEW_TAB as i64;
