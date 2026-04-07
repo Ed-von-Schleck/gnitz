@@ -25,8 +25,17 @@ use crate::storage::OwnedBatch;
 // WorkerExchangeHandler
 // ---------------------------------------------------------------------------
 
+/// Holds a SAL message consumed during exchange that must be dispatched later.
+struct DeferredSalMessage {
+    flags: u32,
+    target_id: u32,
+    wire_data: Vec<u8>,
+}
+
 struct WorkerExchangeHandler {
     stash: HashMap<i64, OwnedBatch>,
+    /// SAL messages consumed during exchange that are not exchange relays.
+    deferred: Vec<DeferredSalMessage>,
 }
 
 impl WorkerExchangeHandler {
@@ -58,7 +67,13 @@ impl WorkerExchangeHandler {
         );
         w2m_writer.send(&wire);
 
-        // Blocking loop: wait for relay from master via SAL
+        // Blocking loop: wait for exchange relay from master via SAL.
+        //
+        // Exchange relays are sent with flags=0 and target_id=view_id.
+        // Other messages (DDL_SYNC, PUSH, etc.) may be interleaved on
+        // the SAL if the master processes client requests during an async
+        // tick.  We must consume and defer these for later dispatch;
+        // otherwise the relay would never be reached.
         loop {
             sal_reader.wait(30000);
 
@@ -70,6 +85,19 @@ impl WorkerExchangeHandler {
                 continue;
             }
             *read_cursor = new_cursor;
+
+            // Exchange relays have flags=0. Any other flags means this
+            // is a non-relay message that we must defer.
+            if msg.flags != 0 {
+                if let Some(data) = msg.wire_data {
+                    self.deferred.push(DeferredSalMessage {
+                        flags: msg.flags,
+                        target_id: msg.target_id,
+                        wire_data: data.to_vec(),
+                    });
+                }
+                continue;
+            }
 
             if let Some(data) = msg.wire_data {
                 if let Ok(decoded) = ipc::decode_wire(data) {
@@ -140,7 +168,7 @@ impl WorkerProcess {
             catalog,
             sal_reader,
             w2m_writer,
-            exchange: WorkerExchangeHandler { stash: HashMap::new() },
+            exchange: WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new() },
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
@@ -526,6 +554,21 @@ impl WorkerProcess {
             expected_epoch: self.expected_epoch,
         };
         unsafe { &mut *dag }.evaluate_dag_multi_worker(source_id, delta, &mut ctx);
+        // Apply DDL_SYNC messages deferred during exchange waits.
+        self.dispatch_deferred();
+    }
+
+    fn dispatch_deferred(&mut self) {
+        let deferred = std::mem::take(&mut self.exchange.deferred);
+        for msg in deferred {
+            if msg.flags & FLAG_DDL_SYNC != 0 {
+                if let Ok(decoded) = ipc::decode_wire(&msg.wire_data) {
+                    if let Some(batch) = decoded.data_batch {
+                        let _ = self.cat().ddl_sync(msg.target_id as i64, *batch);
+                    }
+                }
+            }
+        }
     }
 
     fn shutdown(&mut self) {
@@ -618,7 +661,7 @@ mod tests {
     }
 
     fn make_handler() -> WorkerExchangeHandler {
-        WorkerExchangeHandler { stash: HashMap::new() }
+        WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new() }
     }
 
     #[test]

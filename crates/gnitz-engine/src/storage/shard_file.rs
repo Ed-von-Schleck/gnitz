@@ -709,8 +709,6 @@ mod tests {
     /// Bug 3: write_shard_streaming roundtrip — multiple column types including STRING.
     #[test]
     fn test_write_shard_streaming_roundtrip() {
-        use crate::schema::type_code;
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("streaming.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();

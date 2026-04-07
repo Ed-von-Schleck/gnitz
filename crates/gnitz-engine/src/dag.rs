@@ -1089,9 +1089,6 @@ impl DagEngine {
         delta: OwnedBatch,
         exchange: &mut E,
     ) -> i32 {
-        gnitz_debug!("dag: evaluate_dag_multi_worker source_id={} delta_count={}",
-            source_id, delta.count);
-
         self.get_dep_map();
         let view_ids: Vec<i64> = self.dep_map
             .get(&source_id)
@@ -1177,7 +1174,14 @@ impl DagEngine {
                 if copart_join {
                     self.execute_plan_phase(view_id, true, input, src_id)
                 } else {
-                    let exchanged = exchange.do_exchange(view_id, &input, src_id);
+                    // Set batch schema for the exchange wire encoding.
+                    let mut input_with_schema = input;
+                    if input_with_schema.schema.is_none() {
+                        if let Some(entry) = self.tables.get(&src_id) {
+                            input_with_schema.schema = Some(entry.schema);
+                        }
+                    }
+                    let exchanged = exchange.do_exchange(view_id, &input_with_schema, src_id);
                     self.execute_plan_phase(view_id, true, exchanged, src_id)
                 }
             } else {

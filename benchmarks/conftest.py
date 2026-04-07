@@ -101,7 +101,7 @@ def server(request):
         perf_stat = PerfStat(proc.pid)
         perf_stat.start()
 
-    yield str(sock_path), proc.pid
+    yield str(sock_path), proc.pid, proc
 
     if perf_recorder:
         perf_recorder.stop()
@@ -125,6 +125,21 @@ def socket_path(server) -> str:
 @pytest.fixture(scope="session")
 def server_pid(server) -> int:
     return server[1]
+
+
+@pytest.fixture(scope="session")
+def _server_proc(server):
+    return server[2]
+
+
+@pytest.fixture(autouse=True)
+def _check_server_alive(_server_proc):
+    """Skip remaining tests if the server has crashed."""
+    rc = _server_proc.poll()
+    if rc is not None:
+        pytest.skip(
+            f"server exited (code={rc}) — a prior test likely crashed it"
+        )
 
 
 @pytest.fixture(scope="session")

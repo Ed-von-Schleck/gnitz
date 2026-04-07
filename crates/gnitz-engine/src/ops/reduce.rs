@@ -534,6 +534,7 @@ pub fn op_reduce(
     let out_npc = num_out_cols - 1;
     let in_pki = input_schema.pk_index as usize;
 
+
     // Linearity check
     let all_linear = agg_descs.iter().all(|d| {
         d.agg_op == AGG_COUNT || d.agg_op == AGG_SUM || d.agg_op == AGG_COUNT_NON_NULL

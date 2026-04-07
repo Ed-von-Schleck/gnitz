@@ -140,6 +140,20 @@ If the pre-plan's `out_schema` is set to the view's final schema instead
 of the exchange intermediate schema, STRING columns (16 bytes) may be
 serialized as I64 (8 bytes), causing silent data corruption at workers.
 
+### SAL interleaving during exchanges
+
+The SAL is a single shared channel. During async ticks, the master may
+interleave DDL_SYNC messages (from concurrent client requests) with
+exchange relay messages. `do_exchange_impl` in `worker.rs` filters by
+`msg.flags != 0` to skip non-relay messages and defers them for
+post-DAG dispatch. **Any code that reads from the SAL inside an exchange
+wait loop must not assume the next message is the relay.**
+
+Every code path that sends a batch through the exchange must set
+`batch.schema` before the `do_exchange` call. Both the reduce-exchange
+path (`dag.rs` line ~1175) and the join-shard path set this. Missing it
+causes `encode_wire` to panic on `None` schema.
+
 ## Aggregate output type contract
 
 The REDUCE output schema column type rule is simple:
@@ -168,37 +182,27 @@ Rebuild before benchmarking if source has changed:
 make release-server
 ```
 
-### Benchmark scripts
+### Benchmark suite
 
-All scripts run from the repo root. They start a server, run a workload via
-`uv run python -c ...` (so the gnitz client is importable), then shut down.
-
-```bash
-# Benchmark history
-python scripts/bench_history.py --last 10
-python scripts/bench_history.py --compare <old_commit> <new_commit>
-```
-
-### Benchmark history
-
-Every benchmark run automatically appends a record to `bench_history/history.jsonl`
-(gitignored), keyed by commit hash and timestamp.
+The SQL-level benchmark suite lives under `benchmarks/`. Run via Makefile:
 
 ```bash
-python scripts/bench_history.py                          # list all runs
-python scripts/bench_history.py --last 10                # last 10
-python scripts/bench_history.py --commit abc1234         # filter by commit
-python scripts/bench_history.py --compare abc1234 def5678  # side-by-side
-python scripts/bench_history.py --trend                  # throughput over time
+make bench           # quick mode, 1 worker, ~60s
+make bench-full      # full mode (150k rows), 4 workers, ~5 min
+make bench-sweep     # sweep workers=1,2,4 × clients=1,2,4
+make bench-perf      # full + perf record + perf stat
 ```
+
+Results go to `benchmarks/results/` (gitignored): `summary.json` +
+`timings.csv` with per-benchmark rows/sec and latency percentiles.
+
+The runner (`benchmarks/run.py`) rotates old results (keeps 3).
 
 ### Typical workflow
 
-1. Rebuild binary: `make release-server`
-2. Run baselines (throughput + realistic) on the current commit
-3. Make changes, commit
-4. Rebuild and re-run
-5. `python scripts/bench_history.py --compare <old> <new>` to see the delta
+1. `make bench` — quick sanity check
+2. Make changes, commit
+3. `make bench` again — compare `summary.json` side by side
 
 ## Debugging failures
 
@@ -218,15 +222,17 @@ not immediately obvious:
    - Rust: `eprintln!` (stderr, goes to worker/master log depending on process)
    - `GNITZ_LOG_LEVEL=debug` required for debug-level messages
    - For panics: use `RUST_BACKTRACE=1` to get the full call chain.
-2. **Isolate with 1 worker first.** If the test passes with `GNITZ_WORKERS=1`
+2. **Use the debug binary for crashes.** Release builds silently clamp corrupt
+   values; debug builds panic with backtraces. `GNITZ_SERVER_BIN=../../gnitz-server`.
+3. **Isolate with 1 worker first.** If the test passes with `GNITZ_WORKERS=1`
    and fails with `GNITZ_WORKERS=4`, the bug is in the exchange/fanout/stash
    path, not in computation. Common exchange bugs:
    - Schema mismatch: pre-plan `out_schema` != actual batch layout
      (see "Exchange schema contract" above).
    - ext_trace_regs assigned to the wrong plan (pre vs post).
-3. **Bisect by sub-path.** Add a flag or env var to disable the new fast-path
+4. **Bisect by sub-path.** Add a flag or env var to disable the new fast-path
    and force the old path. If the test passes with the old path, the bug is
    in the new path only.
-4. **Verify your fix is in the binary.** Run `make server` before testing.
+5. **Verify your fix is in the binary.** Run `make server` before testing.
    Cargo tracks source changes automatically, but always confirm the binary
    was rebuilt after your changes.
