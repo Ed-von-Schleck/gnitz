@@ -594,12 +594,33 @@ fn execute_create_join_view(
     let inner_merged = cb.union(proj_ab_node, proj_ba_node);
 
     let merged = if is_left_join {
-        // Single-pass LEFT OUTER JOIN: outer_ab handles ΔA (inner rows + null-fill for
-        // unmatched); proj_ba_node handles ΔB updates via the inner join path.
-        // Do NOT union with inner_merged — that would double-count proj_ab_node.
-        let _ = inner_merged; // suppress unused-variable warning
-        let outer_ab = cb.left_join_with_trace_node(reindex_a, trace_b);
-        cb.union(outer_ab, proj_ba_node)
+        // Decomposed LEFT OUTER JOIN: inner ∪ (anti_join × null_right)
+        // This handles both ΔA and ΔB correctly.
+
+        // Collect right-side type codes for null-extend (original right table columns)
+        let right_col_tcs: Vec<u64> = right_schema.columns.iter()
+            .map(|c| c.type_code as u64)
+            .collect();
+
+        // Key-only B: strip payload, keep only join key PK for distinct tracking
+        let key_only_b = cb.map_key_only(reindex_b);
+        let distinct_b = cb.distinct(key_only_b);
+        let trace_db = cb.integrate_trace(distinct_b);
+
+        // ΔA null-fill path: left rows whose join key has no match in I(distinct(B))
+        let antijoin_a = cb.anti_join_with_trace_node(reindex_a, trace_db);
+        let null_filled_a = cb.null_extend(antijoin_a, &right_col_tcs);
+
+        // ΔB correction path: when B key appears/disappears, adjust null-fills
+        // join_dt(distinct_b, trace_a) gives (key, A_payload) for affected left rows
+        // distinct_b emits +1 when key appears → negate → -1 → retract null-fill
+        // distinct_b emits -1 when key disappears → negate → +1 → emit null-fill
+        let correction_raw = cb.join_with_trace_node(distinct_b, trace_a);
+        let correction = cb.negate(correction_raw);
+        let null_filled_correction = cb.null_extend(correction, &right_col_tcs);
+
+        let all_null_fills = cb.union(null_filled_a, null_filled_correction);
+        cb.union(inner_merged, all_null_fills)
     } else {
         inner_merged
     };
@@ -1231,9 +1252,15 @@ fn execute_create_set_op_view(
             cb.union(semi_lr, semi_rl)
         }
         (SetOperator::Except, _) => {
-            // EXCEPT: anti-join left against right trace
+            // EXCEPT: bidirectional anti-join
+            let trace_l = cb.integrate_trace(left_node);
             let trace_r = cb.integrate_trace(right_node);
-            cb.anti_join_with_trace_node(left_node, trace_r)
+            // ΔA path: left rows not in I(B)
+            let except_lr = cb.anti_join_with_trace_node(left_node, trace_r);
+            // ΔB path: when B row appears/disappears, retract/emit matching left rows
+            let semi_rl = cb.semi_join_with_trace_node(right_node, trace_l);
+            let correction = cb.negate(semi_rl);
+            cb.union(except_lr, correction)
         }
         _ => return Err(GnitzSqlError::Unsupported(
             format!("set operation {:?} not supported", op)

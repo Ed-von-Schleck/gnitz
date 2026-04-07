@@ -31,6 +31,7 @@ pub const OPCODE_SEMI_JOIN_DELTA_DELTA: u64 = 19;
 pub const OPCODE_EXCHANGE_SHARD:        u64 = 20;
 pub const OPCODE_EXCHANGE_GATHER:       u64 = 21;
 pub const OPCODE_JOIN_DELTA_TRACE_OUTER: u64 = 22;
+pub const OPCODE_NULL_EXTEND:            u64 = 23;
 
 // Port constants
 pub const PORT_IN:    u64 = 0;
@@ -54,6 +55,9 @@ pub const PARAM_GATHER_WORKER:     u64 = 9;
 pub const PARAM_TABLE_ID:          u64 = 3;
 pub const PARAM_AGG_COUNT:         u64 = 12;
 pub const PARAM_AGG_SPEC_BASE:     u64 = 13;
+pub const PARAM_KEY_ONLY:            u64 = 14;
+pub const PARAM_NULL_EXTEND_COUNT:   u64 = 15;
+pub const PARAM_NULL_EXTEND_COL_BASE: u64 = 192;
 
 // Aggregate function IDs (must match gnitz/dbsp/functions.py)
 pub const AGG_COUNT:          u64 = 1;

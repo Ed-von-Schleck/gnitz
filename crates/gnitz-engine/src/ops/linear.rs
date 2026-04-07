@@ -282,6 +282,73 @@ fn op_union_merge(
     output
 }
 
+/// Null-extend: copy input batch and append N null-filled payload columns.
+/// Used in LEFT JOIN decomposition to convert anti-join output (left-only rows)
+/// into null-filled outer join rows.
+pub fn op_null_extend(
+    batch: &OwnedBatch,
+    in_schema: &SchemaDescriptor,
+    right_schema: &SchemaDescriptor,
+) -> OwnedBatch {
+    let in_npc = in_schema.num_columns as usize - 1;
+    let right_npc = right_schema.num_columns as usize - 1;
+    let out_npc = in_npc + right_npc;
+    let n = batch.count;
+
+    if n == 0 {
+        return OwnedBatch::empty(out_npc);
+    }
+
+    let mut output = OwnedBatch::empty(out_npc);
+
+    // Copy system columns
+    output.pk_lo = batch.pk_lo[..n * 8].to_vec();
+    output.pk_hi = batch.pk_hi[..n * 8].to_vec();
+    output.weight = batch.weight[..n * 8].to_vec();
+    output.count = n;
+
+    // Copy input payload columns
+    for pi in 0..in_npc {
+        let in_ci = if pi < in_schema.pk_index as usize { pi } else { pi + 1 };
+        let stride = in_schema.columns[in_ci].size as usize;
+        output.col_data[pi] = batch.col_data[pi][..n * stride].to_vec();
+    }
+
+    // Append null-filled right-side payload columns
+    let right_pk_index = right_schema.pk_index as usize;
+    let mut rpi = 0;
+    for ci in 0..right_schema.num_columns as usize {
+        if ci == right_pk_index {
+            continue;
+        }
+        let stride = right_schema.columns[ci].size as usize;
+        let out_pi = in_npc + rpi;
+        output.col_data[out_pi] = vec![0u8; n * stride];
+        rpi += 1;
+    }
+
+    // Set null bits for all appended right-side columns
+    let right_null_bits = if right_npc < 64 {
+        (1u64 << right_npc) - 1
+    } else {
+        u64::MAX
+    };
+    let shift = in_npc;
+    let mut null_bmp = Vec::with_capacity(n * 8);
+    for row in 0..n {
+        let off = row * 8;
+        let in_null = u64::from_le_bytes(batch.null_bmp[off..off + 8].try_into().unwrap());
+        let out_null = in_null | (right_null_bits << shift);
+        null_bmp.extend_from_slice(&out_null.to_le_bytes());
+    }
+    output.null_bmp = null_bmp;
+
+    output.sorted = batch.sorted;
+    output.consolidated = batch.consolidated;
+    gnitz_debug!("op_null_extend: in={} right_npc={}", n, right_npc);
+    output
+}
+
 // ---------------------------------------------------------------------------
 // PK promotion for reindex (GROUP BY)
 // ---------------------------------------------------------------------------

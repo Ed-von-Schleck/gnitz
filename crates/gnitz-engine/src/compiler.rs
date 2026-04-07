@@ -37,6 +37,7 @@ const OPCODE_SEMI_JOIN_DELTA_TRACE: i32 = 18;
 const OPCODE_SEMI_JOIN_DELTA_DELTA: i32 = 19;
 const OPCODE_EXCHANGE_SHARD: i32 = 20;
 const OPCODE_JOIN_DELTA_TRACE_OUTER: i32 = 22;
+const OPCODE_NULL_EXTEND: i32 = 23;
 const OPCODE_GATHER_REDUCE: i32 = 24;
 
 // Ports
@@ -61,6 +62,9 @@ const PARAM_REINDEX_COL: i32 = 10;
 const PARAM_JOIN_SOURCE_TABLE: i32 = 11;
 const PARAM_AGG_COUNT: i32 = 12;
 const PARAM_AGG_SPEC_BASE: i32 = 13;
+const PARAM_KEY_ONLY: i32 = 14;
+const PARAM_NULL_EXTEND_COUNT: i32 = 15;
+const PARAM_NULL_EXTEND_COL_BASE: i32 = 192;
 const PARAM_PROJ_BASE: i32 = 32;
 const PARAM_EXPR_BASE: i32 = 64;
 const PARAM_SHARD_COL_BASE: i32 = 128;
@@ -689,7 +693,6 @@ fn resolve_primary_input_schema(
         }
     }
 
-    // Self-join fallback
     any_dep_schema.unwrap_or(*fallback)
 }
 
@@ -945,6 +948,15 @@ pub fn empty_schema() -> SchemaDescriptor {
 
 fn col(tc: u8, sz: u8, nullable: bool) -> SchemaColumn {
     SchemaColumn { type_code: tc, size: sz, nullable: if nullable { 1 } else { 0 }, _pad: 0 }
+}
+
+fn type_code_to_size(tc: u8) -> u8 {
+    match tc {
+        type_code::U64 | type_code::I64 | type_code::F64 => 8,
+        type_code::U128 | type_code::STRING => 16,
+        type_code::F32 => 4,
+        _ => 8,
+    }
 }
 
 
@@ -1342,6 +1354,14 @@ fn emit_node(
                 let fp = create_universal_projection(&src_indices, &src_types, in_reg_schema.pk_index, owned_funcs);
                 let schema = build_map_output_schema(&in_reg_schema, &src_indices);
                 (fp, schema)
+            } else if node_params.get(&PARAM_KEY_ONLY).copied().unwrap_or(0) != 0 {
+                // Key-only projection: strip all payload, keep only PK.
+                let fp = create_universal_projection(&[], &[], in_reg_schema.pk_index, owned_funcs);
+                let mut s = empty_schema();
+                s.columns[0] = in_reg_schema.columns[in_reg_schema.pk_index as usize];
+                s.num_columns = 1;
+                s.pk_index = 0;
+                (fp, s)
             } else {
                 (null_func_ptr(), in_reg_schema)
             };
@@ -1388,6 +1408,27 @@ fn emit_node(
             reg_schemas[reg_id as usize] = outer_schema;
             reg_kinds[reg_id as usize] = 0;
             builder.add_join_dt_outer(delta_reg as u16, trace_reg as u16, reg_id as u16, trace_schema);
+        }
+
+        OPCODE_NULL_EXTEND => {
+            let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
+            let in_schema = reg_schemas[in_reg as usize];
+            let n_cols = node_params.get(&PARAM_NULL_EXTEND_COUNT).copied().unwrap_or(0) as usize;
+            // Build right schema from type codes stored in params
+            let mut right = empty_schema();
+            right.columns[0] = col(type_code::U128, 16, false); // dummy PK
+            for i in 0..n_cols {
+                let tc = node_params.get(&(PARAM_NULL_EXTEND_COL_BASE + i as i32)).copied().unwrap_or(type_code::I64 as i64) as u8;
+                let sz = type_code_to_size(tc);
+                right.columns[i + 1] = col(tc, sz, true);
+            }
+            right.num_columns = (n_cols + 1) as u32;
+            right.pk_index = 0;
+
+            let out_schema = merge_schemas_for_join_outer(&in_schema, &right);
+            reg_schemas[reg_id as usize] = out_schema;
+            reg_kinds[reg_id as usize] = 0;
+            builder.add_null_extend(in_reg as u16, reg_id as u16, right);
         }
 
         OPCODE_JOIN_DELTA_DELTA => {

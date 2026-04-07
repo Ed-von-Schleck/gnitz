@@ -4,7 +4,6 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_left_join.py -v --tb=short
 """
 import random
-import pytest
 import gnitz
 
 
@@ -228,16 +227,8 @@ class TestLeftJoin:
         finally:
             client.drop_schema(sn)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Known incremental limitation: when right-side row arrives after a null-fill "
-            "was already emitted for the left-side row, the stale null-fill is not retracted. "
-            "Fixing this requires an integrated anti-join circuit tracking null-filled rows."
-        ),
-        strict=True,
-    )
     def test_right_side_insert_after_null_fill(self, client):
-        """Right-side insert after null-fill — stale null-fill stays in view."""
+        """Right-side insert after null-fill retracts the stale null-fill."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -263,8 +254,6 @@ class TestLeftJoin:
                 schema_name=sn,
             )
             rows = client.scan(vid)
-            # Incremental limitation: view shows 2 rows (stale null-fill + new inner row)
-            # Expected: exactly 1 inner-join row
             assert len(rows) == 1, f"expected 1 inner row, got {len(rows)}: {rows}"
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
@@ -273,16 +262,8 @@ class TestLeftJoin:
         finally:
             client.drop_schema(sn)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Known incremental limitation: when a matched right-side row is deleted, "
-            "the inner-join row retracts but no null-fill row is emitted for the left-side row. "
-            "Fixing this requires an integrated anti-join circuit."
-        ),
-        strict=True,
-    )
     def test_right_side_delete_after_match(self, client):
-        """Right-side delete after match — null-fill not re-emitted."""
+        """Right-side delete after match re-emits the null-fill row."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -311,8 +292,6 @@ class TestLeftJoin:
                 schema_name=sn,
             )
             rows = client.scan(vid)
-            # Incremental limitation: view is empty (inner row retracted, no null-fill added)
-            # Expected: 1 null-fill row (order pk=1 still exists without a customer)
             assert len(rows) == 1, f"expected 1 null-fill row, got {len(rows)}: {rows}"
 
             client.execute_sql("DROP VIEW v", schema_name=sn)

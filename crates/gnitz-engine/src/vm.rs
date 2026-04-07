@@ -32,6 +32,7 @@ pub enum Instr {
     AntiJoinDD { a_reg: u16, b_reg: u16, out_reg: u16 },
     SemiJoinDT { delta_reg: u16, trace_reg: u16, out_reg: u16 },
     SemiJoinDD { a_reg: u16, b_reg: u16, out_reg: u16 },
+    NullExtend { in_reg: u16, out_reg: u16, right_schema_idx: u16 },
     Integrate {
         in_reg: u16,
         table_idx: i32,       // index into Program::tables, -1 = no target (sink)
@@ -268,6 +269,11 @@ impl ProgramBuilder {
 
     pub fn add_semi_join_dd(&mut self, a_reg: u16, b_reg: u16, out_reg: u16) {
         self.instructions.push(Instr::SemiJoinDD { a_reg, b_reg, out_reg });
+    }
+
+    pub fn add_null_extend(&mut self, in_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {
+        let right_schema_idx = self.schema_idx(right_schema);
+        self.instructions.push(Instr::NullExtend { in_reg, out_reg, right_schema_idx });
     }
 
     pub fn add_integrate(
@@ -896,6 +902,13 @@ pub fn execute_epoch(
             Instr::SemiJoinDD { a_reg, b_reg, out_reg } => {
                 let schema = reg!(*a_reg).schema;
                 let result = ops::op_semi_join_delta_delta(&reg!(*a_reg).batch, &reg!(*b_reg).batch, &schema);
+                reg_mut!(*out_reg).batch = result;
+            }
+
+            Instr::NullExtend { in_reg, out_reg, right_schema_idx } => {
+                let in_schema = reg!(*in_reg).schema;
+                let right_schema = &program.schemas[*right_schema_idx as usize];
+                let result = ops::op_null_extend(&reg!(*in_reg).batch, &in_schema, right_schema);
                 reg_mut!(*out_reg).batch = result;
             }
 

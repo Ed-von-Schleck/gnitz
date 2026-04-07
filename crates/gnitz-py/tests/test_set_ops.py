@@ -4,7 +4,6 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_set_ops.py -v --tb=short
 """
 import random
-import pytest
 import gnitz
 
 
@@ -125,12 +124,7 @@ class TestSetOps:
             client.drop_schema(sn)
 
     def test_except_basic(self, client):
-        """EXCEPT view excludes rows whose PK is present in the right table.
-
-        b must be populated before a so that I(B) is non-empty when ΔA is processed.
-        EXCEPT is implemented as anti_join(ΔA, I(B)), so only ΔA insertions see the
-        exclusion; later ΔB changes do not retroactively update the view.
-        """
+        """EXCEPT view excludes rows whose PK is present in the right table."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -161,16 +155,8 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Known incremental limitation: EXCEPT is anti_join(ΔA, I(B)), so ΔB changes "
-            "after A rows were already emitted do not retroactively update the EXCEPT output. "
-            "Fixing this requires a bidirectional anti-join circuit."
-        ),
-        strict=True,
-    )
     def test_except_retraction(self, client):
-        """Deleting a row from b should add it back to the EXCEPT view — but doesn't."""
+        """Deleting a row from b adds it back to the EXCEPT view."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -198,7 +184,6 @@ class TestSetOps:
             client.execute_sql("DELETE FROM b WHERE pk = 2", schema_name=sn)
             rows = client.scan(vid)
             vals = sorted(r["val"] for r in rows)
-            # Incremental limitation: row (2, 20) is NOT added back
             assert vals == [10, 20], f"expected [10, 20] after delete, got {vals}"
 
             client.execute_sql("DROP VIEW v", schema_name=sn)

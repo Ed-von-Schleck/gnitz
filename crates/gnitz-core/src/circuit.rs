@@ -4,13 +4,14 @@ use crate::types::{
     OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_OUTER,
     OPCODE_DELAY, OPCODE_REDUCE, OPCODE_DISTINCT, OPCODE_INTEGRATE,
     OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_SEMI_JOIN_DELTA_TRACE,
-    OPCODE_EXCHANGE_SHARD, OPCODE_EXCHANGE_GATHER,
+    OPCODE_EXCHANGE_SHARD, OPCODE_EXCHANGE_GATHER, OPCODE_NULL_EXTEND,
     PORT_IN, PORT_TRACE, PORT_IN_A, PORT_IN_B,
     PARAM_FUNC_ID, PARAM_AGG_FUNC_ID, PARAM_AGG_COL_IDX,
     PARAM_PROJ_BASE, PARAM_EXPR_BASE, PARAM_EXPR_NUM_REGS, PARAM_EXPR_RESULT_REG,
     PARAM_SHARD_COL_BASE, PARAM_GATHER_WORKER,
     PARAM_REINDEX_COL, PARAM_JOIN_SOURCE_TABLE, PARAM_CONST_STR_BASE, PARAM_TABLE_ID,
     PARAM_AGG_COUNT, PARAM_AGG_SPEC_BASE,
+    PARAM_KEY_ONLY, PARAM_NULL_EXTEND_COUNT, PARAM_NULL_EXTEND_COL_BASE,
 };
 use crate::expr::ExprProgram;
 
@@ -284,6 +285,29 @@ impl CircuitBuilder {
 
     pub fn semi_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
         self.binary_join(OPCODE_SEMI_JOIN_DELTA_TRACE, delta, trace_node)
+    }
+
+    /// Map that strips all payload columns, keeping only PK and weight.
+    /// Used to project reindexed batches down to join-key-only for distinct tracking.
+    pub fn map_key_only(&mut self, input: NodeId) -> NodeId {
+        let nid = self.alloc_node(OPCODE_MAP);
+        self.connect(input, nid, PORT_IN);
+        self.params.push((nid, PARAM_FUNC_ID, 0));
+        self.params.push((nid, PARAM_KEY_ONLY, 1));
+        nid
+    }
+
+    /// Null-extend: appends N null payload columns to each row.
+    /// `right_col_type_codes` contains the TypeCode discriminant (u64) for each
+    /// null column to append (1=U64, 2=I64, 3=String, 4=U128, 5=F64, 6=F32).
+    pub fn null_extend(&mut self, input: NodeId, right_col_type_codes: &[u64]) -> NodeId {
+        let nid = self.alloc_node(OPCODE_NULL_EXTEND);
+        self.connect(input, nid, PORT_IN);
+        self.params.push((nid, PARAM_NULL_EXTEND_COUNT, right_col_type_codes.len() as u64));
+        for (i, &tc) in right_col_type_codes.iter().enumerate() {
+            self.params.push((nid, PARAM_NULL_EXTEND_COL_BASE + i as u64, tc));
+        }
+        nid
     }
 
     /// Add a string constant associated with a node (for expr programs).
