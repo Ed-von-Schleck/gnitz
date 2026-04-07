@@ -1,85 +1,79 @@
 # GnitzDB Developer Guide
 
-## Multi-worker invariant checklist
+## Build targets
 
-When adding a new server-side constraint, validation rule, or invariant:
+| What | Command | Rebuilds |
+|------|---------|----------|
+| Unit tests | `make test` | gnitz-engine |
+| Server binary | `make server` | gnitz-engine |
+| Python extension | `make pyext` | gnitz-sql, gnitz-core, gnitz-py |
+| E2E tests | `make e2e` | server + pyext, then runs pytest |
+| Release binary | `make release-server` | gnitz-engine (release) |
 
-- [ ] Is it enforced in `catalog.rs` for the master DDL path?
-- [ ] Is it in `catalog_validate_fk_inline` (single-process) or
-      `validate_unique_distributed` in `master.rs` (multi-worker)?
-      FK and partition-global constraints belong at the request layer.
-- [ ] Does it need to fire on every worker even for empty batches
-      (e.g. exchange barrier participation)?
-- [ ] Any change touching `worker.rs`, `master.rs`, `ipc.rs`, or `executor.rs`:
-      run `make e2e`.
-- [ ] Is there a multi-worker E2E test in `crates/gnitz-py/tests/test_workers.py`
-      covering it?
-- [ ] Is there a Rust unit test in the relevant module?
-- [ ] Does the feature use `hash_row_by_columns` for exchange routing across
-      tables where the same logical value may have different column types
-      (e.g., PK column = U64 vs regular column = I64)? The hash must produce
-      identical partitions regardless of type for co-partitioning correctness.
+`make e2e` rebuilds both the server binary and the Python extension
+(which contains the SQL planner). Maturin is a no-op when nothing
+changed (~0.5s), so there's no cost.
 
 ## Running E2E tests
 
-**Always run the E2E suite with multiple workers.** Single-worker mode skips
-exchange/fanout paths and will miss bugs in distributed execution.
+**Always run E2E with multiple workers.** Single-worker mode skips
+exchange/fanout paths and will miss distributed bugs.
 
 ```bash
-cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
+make e2e                    # rebuilds server, GNITZ_WORKERS=4
 ```
 
-The Makefile `e2e` target already sets `GNITZ_WORKERS=4`. Never run
-`uv run pytest tests/` without the `GNITZ_WORKERS` variable set.
+## Multi-worker invariant checklist
 
-## Debug logging during development
+When adding a new constraint, validation rule, or invariant:
 
-To enable verbose logging during E2E tests:
+- [ ] Is it enforced in the catalog for the master DDL path?
+- [ ] Single-process vs multi-worker: FK validation runs in-process;
+      partition-global constraints (unique indices) run distributed via master.
+- [ ] Does it need to fire on every worker even for empty batches
+      (e.g. exchange barrier participation)?
+- [ ] Run `make e2e` (rebuilds both server and Python extension).
+- [ ] Is there a multi-worker E2E test in `test_workers.py`?
+- [ ] Is there a Rust unit test?
+- [ ] Does the feature use `hash_row_by_columns` for exchange routing across
+      tables where the same logical value may have different column types
+      (e.g., PK = U64 vs join column = I64)? The hash must produce
+      identical partitions regardless of type.
+
+## Debug logging
 
 ```bash
 GNITZ_WORKERS=4 GNITZ_LOG_LEVEL=debug uv run pytest tests/test_joins.py -x
 ```
 
 Master log: `~/git/gnitz/tmp/server_debug.log`
-Worker logs (always preserved from last run): `~/git/gnitz/tmp/last_worker_N.log`
+Worker logs: `~/git/gnitz/tmp/last_worker_N.log`
 
-Log format: `<epoch>.<ms> <process> <level> <message>`
-- Process tags: `M` (master), `W0`-`WN` (workers)
+Log format: `<epoch>.<ms> <tag> <level> <message>` — tags: `M` (master), `W0`–`WN`.
 
-For temporary debug logging:
-- Rust: `gnitz_debug!` / `gnitz_info!` macros (in `log.rs`)
-These ensure timestamps, process identity, and level-gating.
-Remove debug calls before committing.
+For temporary logging: `gnitz_debug!` / `gnitz_info!` macros. Remove before committing.
 
-To watch all worker logs live:
-
-```bash
-tail -f ~/git/gnitz/tmp/gnitz_py_*/data/worker_*.log
-```
-
-## IPC optimization checklist
-
-When adding any optimization that modifies the IPC message flow (new flags,
-pre-routing, stashing, skipping round-trips):
-
-- [ ] State the optimization's preconditions explicitly in the plan doc. For every
-      column value the optimization reads (for routing, key lookup, etc.): does the
-      client guarantee that value is correctly filled for *all* message types, including
-      DELETE/retraction rows?
-- [ ] Is there an E2E test that pushes rows *and then retracts them* through this path?
-      Retraction tests (delete + re-query) are mandatory for any new IPC fast-path.
-- [ ] Did you test each IPC sub-phase in isolation before combining? E.g. for a 4-step
-      optimization: run tests after steps 1-2 before writing steps 3-4.
-- [ ] Add a comment to any guard/fallback code naming the invariant it protects.
+Live tail: `tail -f ~/git/gnitz/tmp/gnitz_py_*/data/worker_*.log`
 
 ## IPC flag constants
 
-IPC group-header flags are defined once in `ipc.rs` as `pub const FLAG_*: u32`.
+Flags are defined once in `ipc.rs` as `pub const FLAG_*: u32`.
 Both `worker.rs` and `master.rs` import from there. When adding a new flag:
 
 - [ ] Add to `ipc.rs`
 - [ ] Handle in `worker.rs` dispatch loop
 - [ ] Handle in `master.rs` if it requires master-side logic
+
+## IPC optimization checklist
+
+When modifying IPC message flow (new flags, pre-routing, stashing):
+
+- [ ] State preconditions explicitly. For every column value the optimization
+      reads: is it correctly filled for DELETE/retraction rows too?
+- [ ] Is there an E2E test that pushes rows *and then retracts them*?
+      Retraction tests are mandatory for any new IPC fast-path.
+- [ ] Test each sub-phase in isolation before combining.
+- [ ] Comment any guard/fallback code with the invariant it protects.
 
 ## Consolidation and merge correctness
 
@@ -89,102 +83,54 @@ invariants in `foundations.md`. The critical rule:
 > **All merge/consolidation paths must produce output sorted by
 > (PK, payload), not just PK.**
 
-When adding or modifying a merge path (tournament tree, sort, compaction):
+When adding or modifying a merge path:
 
-- [ ] Does the comparison function include payload columns after PK?
-      Both `sift_down` / `sift_up` in the heap AND any sequential
-      pending-group accumulation depend on (PK, payload) adjacency.
-- [ ] Does the path handle within-cursor duplicates? MemTable runs are
-      sorted but NOT consolidated — the same (PK, payload) can appear
-      multiple times in one run (e.g., +1 then -1 for the same key).
-- [ ] Does `compare_rows` respect column order, null handling (null < non-null),
-      and sign-extension?
-- [ ] Test with entries that share the same PK but differ in payload
-      columns. This pattern arises in: reduce output (retraction of old
-      aggregate + insertion of new), non-linear aggregates (MIN/MAX)
-      with secondary index tables, and any Z-Set where multiple logical
-      values share a key. PK-only ordering silently breaks consolidation
-      for these cases.
-- [ ] Is there a Rust unit test with **same-PK, different-payload**
-      entries across multiple input sources? This is the pattern that
-      PK-only ordering silently breaks. Test with ≥3 inputs so entries
-      span multiple heap rounds (existing: `test_compact_same_pk_*`,
-      `test_compact_10_tick_*` in `compact.rs`).
-- [ ] For view stores: does the test cover the flush-between-ticks
-      scenario? `evaluate_dag` calls `view_family.store.flush()` after
-      every tick, creating one shard per non-empty partition per tick.
-      After L0_COMPACT_THRESHOLD (4) ticks, compaction merges these
-      shards — the exact path where the heap ordering matters.
-- [ ] Are memtable runs actually sorted? `merge_batches` assumes each
-      run is sorted by (PK, payload). If a run is unsorted, entries
-      appear out of order and the pending-group algorithm silently
-      produces wrong weights. `upsert_and_maybe_flush` defensively
-      re-sorts as a safety net, but the caller should also ensure the
-      batch is sorted before ingestion.
+- [ ] Comparison function includes payload columns after PK.
+- [ ] Handles within-cursor duplicates (MemTable runs are sorted but
+      NOT consolidated).
+- [ ] `compare_rows` respects column order, null handling, sign-extension.
+- [ ] Test with same-PK, different-payload entries across ≥3 inputs.
+- [ ] Test covers the flush-between-ticks scenario (compaction after
+      L0_COMPACT_THRESHOLD ticks).
 
 ## Exchange schema contract
 
-The exchange (OPCODE_EXCHANGE_SHARD) serializes batches using the
-**pre-plan's `out_schema`** attribute on `ExecutablePlan`. This schema
-determines column sizes during batch packing/unpacking.
+The exchange serializes batches using the **pre-plan's output schema**,
+not the view's final output schema. This schema determines column sizes
+during batch packing/unpacking.
 
 > **The pre-plan's `out_schema` MUST match the physical layout of the
-> batch at the exchange output register.** It is NOT the view's final
-> output schema — it is the intermediate schema at the exchange point.
+> batch at the exchange output register.**
 
-For a view `INPUT → FILTER → EXCHANGE → REDUCE → INTEGRATE`:
-- Pre-plan out_schema = FILTER output schema (= input table schema)
-- Post-plan out_schema = view output schema (= REDUCE output schema)
-
-If the pre-plan's `out_schema` is set to the view's final schema instead
-of the exchange intermediate schema, STRING columns (16 bytes) may be
-serialized as I64 (8 bytes), causing silent data corruption at workers.
+If set to the view's final schema instead of the exchange intermediate
+schema, STRING columns (16 bytes) may be serialized as I64 (8 bytes),
+causing silent data corruption.
 
 ### SAL interleaving during exchanges
 
 The SAL is a single shared channel. During async ticks, the master may
-interleave DDL_SYNC messages (from concurrent client requests) with
-exchange relay messages. `do_exchange_impl` in `worker.rs` filters by
-`msg.flags != 0` to skip non-relay messages and defers them for
-post-DAG dispatch. **Any code that reads from the SAL inside an exchange
-wait loop must not assume the next message is the relay.**
+interleave DDL_SYNC messages with exchange relay messages. Exchange relays
+use `FLAG_EXCHANGE_RELAY`. The worker exchange wait loop filters by this
+flag: DDL_SYNC messages are decoded eagerly and deferred for post-DAG
+dispatch; other non-relay messages are discarded. **Never assume the next
+SAL message in an exchange wait is the relay.**
 
-Every code path that sends a batch through the exchange must set
-`batch.schema` before the `do_exchange` call. Both the reduce-exchange
-path (`dag.rs` line ~1175) and the join-shard path set this. Missing it
-causes `encode_wire` to panic on `None` schema.
+Every exchange code path must set `batch.schema` before `do_exchange`.
+Missing it causes `encode_wire` to panic on `None` schema.
 
 ## Aggregate output type contract
 
-The REDUCE output schema column type rule is simple:
+REDUCE output schema column types:
 
-- COUNT, COUNT_NON_NULL → **I64** (always)
+- COUNT, COUNT_NON_NULL → **I64**
 - SUM/MIN/MAX on F32/F64 → **F64**
-- SUM/MIN/MAX on anything else → **I64** (including STRING, I32, U32, etc.)
+- SUM/MIN/MAX on anything else → **I64**
 
 The accumulator stores values as `u64` bit patterns (8 bytes). The output
-column is ALWAYS 8 bytes. MIN/MAX on STRING stores the German String
-compare key (first 8 bytes), not the full 16-byte string struct. Any Rust
-code that builds REDUCE output schemas must follow this rule exactly.
+column is always 8 bytes. MIN/MAX on STRING stores the German String
+compare key (first 8 bytes), not the full 16-byte string struct.
 
 ## Benchmarking
-
-### Binaries
-
-| Binary | Make target | Use |
-|--------|-------------|-----|
-| `gnitz-server` | `make server` | Dev/debug build |
-| `gnitz-server-release` | `make release-server` | Release profiling |
-
-Rebuild before benchmarking if source has changed:
-
-```bash
-make release-server
-```
-
-### Benchmark suite
-
-The SQL-level benchmark suite lives under `benchmarks/`. Run via Makefile:
 
 ```bash
 make bench           # quick mode, 1 worker, ~60s
@@ -193,46 +139,22 @@ make bench-sweep     # sweep workers=1,2,4 × clients=1,2,4
 make bench-perf      # full + perf record + perf stat
 ```
 
-Results go to `benchmarks/results/` (gitignored): `summary.json` +
-`timings.csv` with per-benchmark rows/sec and latency percentiles.
+Results: `benchmarks/results/` (gitignored). The runner rotates old results (keeps 3).
 
-The runner (`benchmarks/run.py`) rotates old results (keeps 3).
-
-### Typical workflow
-
-1. `make bench` — quick sanity check
-2. Make changes, commit
-3. `make bench` again — compare `summary.json` side by side
+Workflow: `make bench` → change → commit → `make bench` → compare `summary.json`.
 
 ## Debugging failures
 
-When any test fails (single-worker or multi-worker) and the root cause is
-not immediately obvious:
-
-1. **Add COMPREHENSIVE logging before re-running — never guess.** If you
-   don't know exactly what value is wrong and where, you don't have enough
-   information to re-run yet. Each rebuild cycle costs ~50s. A guess that's
-   wrong wastes that entire cycle. One well-instrumented run reveals more
-   than ten speculative fix attempts.
-   - Log EVERY key variable at EVERY decision point in the suspected path.
-   - Log full data structures (HashMaps, Vecs, schemas), not just single values.
-   - For batch/schema mismatches: log `col_data.len()` per column, `count`,
-     `blob.len()`, AND the schema's column types/sizes. Compare them.
-   - Rust: `gnitz_debug!` / `gnitz_info!` (structured, goes to worker/master log)
-   - Rust: `eprintln!` (stderr, goes to worker/master log depending on process)
-   - `GNITZ_LOG_LEVEL=debug` required for debug-level messages
-   - For panics: use `RUST_BACKTRACE=1` to get the full call chain.
-2. **Use the debug binary for crashes.** Release builds silently clamp corrupt
-   values; debug builds panic with backtraces. `GNITZ_SERVER_BIN=../../gnitz-server`.
-3. **Isolate with 1 worker first.** If the test passes with `GNITZ_WORKERS=1`
-   and fails with `GNITZ_WORKERS=4`, the bug is in the exchange/fanout/stash
-   path, not in computation. Common exchange bugs:
-   - Schema mismatch: pre-plan `out_schema` != actual batch layout
-     (see "Exchange schema contract" above).
-   - ext_trace_regs assigned to the wrong plan (pre vs post).
-4. **Bisect by sub-path.** Add a flag or env var to disable the new fast-path
-   and force the old path. If the test passes with the old path, the bug is
-   in the new path only.
-5. **Verify your fix is in the binary.** Run `make server` before testing.
-   Cargo tracks source changes automatically, but always confirm the binary
-   was rebuilt after your changes.
+1. **Log first, never guess.** Each rebuild costs ~50s. One well-instrumented
+   run reveals more than ten speculative attempts.
+   - `gnitz_debug!` / `gnitz_info!` for structured logging
+   - `GNITZ_LOG_LEVEL=debug` to enable debug-level messages
+   - `RUST_BACKTRACE=1` for panic backtraces
+2. **Use the debug binary for crashes.** Release builds silently clamp
+   corrupt values. `GNITZ_SERVER_BIN=../../gnitz-server`.
+3. **Isolate with 1 worker first.** Pass with W=1 but fail with W=4 →
+   bug is in exchange/fanout, not computation.
+4. **Bisect by sub-path.** Disable the new fast-path to confirm the bug
+   is in the new code.
+5. **Verify your fix is in the binary.** `make e2e` rebuilds both the
+   server and the Python extension before running tests.

@@ -4,7 +4,7 @@ ALL_DATA_DIRS := storage_test_data \
 
 LOG_DIR := .test_logs
 
-.PHONY: all test clean rust-engine-test server release-server e2e e2e-release release-test bench bench-full bench-sweep bench-perf
+.PHONY: all test clean rust-engine-test server release-server pyext e2e e2e-release release-test bench bench-full bench-sweep bench-perf
 
 all: test
 
@@ -34,10 +34,13 @@ release-server:
 	cd crates && cargo build --release -p gnitz-engine --bin gnitz-server
 	cp crates/target/release/gnitz-server gnitz-server-release
 
-e2e: server
+pyext:
+	cd crates/gnitz-py && uv run maturin develop 2>&1 | tail -1
+
+e2e: server pyext
 	cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
 
-e2e-release: release-server
+e2e-release: release-server pyext
 	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
 
 release-test:

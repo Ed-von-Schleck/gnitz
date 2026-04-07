@@ -14,7 +14,7 @@ use crate::schema::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
 use crate::ipc::{
     self, SAL_MMAP_SIZE, STATUS_OK, STATUS_ERROR,
-    FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH, FLAG_HAS_PK,
+    FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
     FLAG_TICK, FLAG_CHECKPOINT, FLAG_FLUSH,
     SalReader, SalMessage, W2mWriter,
@@ -25,17 +25,15 @@ use crate::storage::OwnedBatch;
 // WorkerExchangeHandler
 // ---------------------------------------------------------------------------
 
-/// Holds a SAL message consumed during exchange that must be dispatched later.
-struct DeferredSalMessage {
-    flags: u32,
-    target_id: u32,
-    wire_data: Vec<u8>,
+/// A DDL_SYNC message received during an exchange wait, decoded eagerly.
+struct DeferredDdl {
+    target_id: i64,
+    batch: OwnedBatch,
 }
 
 struct WorkerExchangeHandler {
     stash: HashMap<i64, OwnedBatch>,
-    /// SAL messages consumed during exchange that are not exchange relays.
-    deferred: Vec<DeferredSalMessage>,
+    deferred: Vec<DeferredDdl>,
 }
 
 impl WorkerExchangeHandler {
@@ -67,13 +65,7 @@ impl WorkerExchangeHandler {
         );
         w2m_writer.send(&wire);
 
-        // Blocking loop: wait for exchange relay from master via SAL.
-        //
-        // Exchange relays are sent with flags=0 and target_id=view_id.
-        // Other messages (DDL_SYNC, PUSH, etc.) may be interleaved on
-        // the SAL if the master processes client requests during an async
-        // tick.  We must consume and defer these for later dispatch;
-        // otherwise the relay would never be reached.
+        // Blocking loop: wait for exchange relay (FLAG_EXCHANGE_RELAY) from master.
         loop {
             sal_reader.wait(30000);
 
@@ -86,15 +78,20 @@ impl WorkerExchangeHandler {
             }
             *read_cursor = new_cursor;
 
-            // Exchange relays have flags=0. Any other flags means this
-            // is a non-relay message that we must defer.
-            if msg.flags != 0 {
-                if let Some(data) = msg.wire_data {
-                    self.deferred.push(DeferredSalMessage {
-                        flags: msg.flags,
-                        target_id: msg.target_id,
-                        wire_data: data.to_vec(),
-                    });
+            if msg.flags != FLAG_EXCHANGE_RELAY {
+                // Not an exchange relay. Defer DDL_SYNC; discard others
+                // (only DDL_SYNC can be interleaved during a sync tick).
+                if msg.flags & FLAG_DDL_SYNC != 0 {
+                    if let Some(data) = msg.wire_data {
+                        if let Ok(decoded) = ipc::decode_wire(data) {
+                            if let Some(batch_box) = decoded.data_batch {
+                                self.deferred.push(DeferredDdl {
+                                    target_id: msg.target_id as i64,
+                                    batch: *batch_box,
+                                });
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -559,15 +556,8 @@ impl WorkerProcess {
     }
 
     fn dispatch_deferred(&mut self) {
-        let deferred = std::mem::take(&mut self.exchange.deferred);
-        for msg in deferred {
-            if msg.flags & FLAG_DDL_SYNC != 0 {
-                if let Ok(decoded) = ipc::decode_wire(&msg.wire_data) {
-                    if let Some(batch) = decoded.data_batch {
-                        let _ = self.cat().ddl_sync(msg.target_id as i64, *batch);
-                    }
-                }
-            }
+        for ddl in std::mem::take(&mut self.exchange.deferred) {
+            let _ = self.cat().ddl_sync(ddl.target_id, ddl.batch);
         }
     }
 
@@ -661,7 +651,7 @@ mod tests {
     }
 
     fn make_handler() -> WorkerExchangeHandler {
-        WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::new() }
+        WorkerExchangeHandler { stash: HashMap::new(), deferred: Vec::<DeferredDdl>::new() }
     }
 
     #[test]

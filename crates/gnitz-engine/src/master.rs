@@ -10,7 +10,7 @@ use crate::schema::SchemaDescriptor;
 use crate::schema::promote_to_index_key;
 use crate::ipc::{
     self, STATUS_OK,
-    FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH, FLAG_HAS_PK,
+    FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, DecodedWire,
     SalWriter, W2mReceiver, W2M_HEADER_SIZE,
@@ -20,6 +20,75 @@ use crate::ops::{
     PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter,
     worker_for_partition_pub,
 };
+
+// ---------------------------------------------------------------------------
+// ExchangeAccumulator
+// ---------------------------------------------------------------------------
+
+struct ExchangeAccumulator {
+    payloads:   HashMap<i64, Vec<Option<OwnedBatch>>>,
+    counts:     HashMap<i64, usize>,
+    schemas:    HashMap<i64, SchemaDescriptor>,
+    source_ids: HashMap<i64, i64>,
+    nw: usize,
+}
+
+impl ExchangeAccumulator {
+    fn new(nw: usize) -> Self {
+        ExchangeAccumulator {
+            payloads:   HashMap::new(),
+            counts:     HashMap::new(),
+            schemas:    HashMap::new(),
+            source_ids: HashMap::new(),
+            nw,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.payloads.clear();
+        self.counts.clear();
+        self.schemas.clear();
+        self.source_ids.clear();
+    }
+
+    fn process(&mut self, w: usize, decoded: DecodedWire) -> Result<Option<PendingRelay>, String> {
+        let vid = decoded.control.target_id as i64;
+        let ex_source_id = decoded.control.seek_pk_lo as i64;
+        let nw = self.nw;
+
+        let payloads = self.payloads
+            .entry(vid)
+            .or_insert_with(|| vec![None; nw]);
+        let count = self.counts.entry(vid).or_insert(0);
+
+        payloads[w] = decoded.data_batch.map(|b| *b);
+        if let Some(schema) = decoded.schema {
+            self.schemas.insert(vid, schema);
+        }
+        if ex_source_id > 0 {
+            self.source_ids.insert(vid, ex_source_id);
+        }
+        *count += 1;
+
+        if *count == nw {
+            let schema = self.schemas.remove(&vid)
+                .ok_or_else(|| format!("exchange: no schema received for view_id={}", vid))?;
+            let source_id = self.source_ids.remove(&vid).unwrap_or(0);
+            let payloads_vec = self.payloads.remove(&vid).unwrap();
+            self.counts.remove(&vid);
+            Ok(Some(PendingRelay { view_id: vid, payloads: payloads_vec, schema, source_id }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+struct PendingRelay {
+    view_id:   i64,
+    payloads:  Vec<Option<OwnedBatch>>,
+    schema:    SchemaDescriptor,
+    source_id: i64,
+}
 
 // ---------------------------------------------------------------------------
 // MasterDispatcher
@@ -37,10 +106,7 @@ pub struct MasterDispatcher {
     async_remaining: usize,
     async_collected: Vec<bool>,
     async_w2m_rcs: Vec<u64>,
-    async_exchange_payloads: HashMap<i64, Vec<Option<OwnedBatch>>>,
-    async_exchange_counts: HashMap<i64, usize>,
-    async_exchange_schemas: HashMap<i64, SchemaDescriptor>,
-    async_exchange_source_ids: HashMap<i64, i64>,
+    acc: ExchangeAccumulator,
     async_active: bool,
 }
 
@@ -65,10 +131,7 @@ impl MasterDispatcher {
             async_remaining: 0,
             async_collected: vec![false; num_workers],
             async_w2m_rcs: vec![W2M_HEADER_SIZE as u64; num_workers],
-            async_exchange_payloads: HashMap::new(),
-            async_exchange_counts: HashMap::new(),
-            async_exchange_schemas: HashMap::new(),
-            async_exchange_source_ids: HashMap::new(),
+            acc: ExchangeAccumulator::new(num_workers),
             async_active: false,
         }
     }
@@ -253,16 +316,13 @@ impl MasterDispatcher {
     }
 
     /// Collect ACKs from all workers, relaying exchange messages inline.
-    fn collect_acks_and_relay(&mut self, target_id: i64) -> Result<(), String> {
+    fn collect_acks_and_relay(&mut self, _target_id: i64) -> Result<(), String> {
         let nw = self.num_workers;
         let mut remaining = nw;
         let mut collected = vec![false; nw];
         let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
 
-        let mut exchange_payloads: HashMap<i64, Vec<Option<OwnedBatch>>> = HashMap::new();
-        let mut exchange_counts: HashMap<i64, usize> = HashMap::new();
-        let mut exchange_schemas: HashMap<i64, SchemaDescriptor> = HashMap::new();
-        let mut exchange_source_ids: HashMap<i64, i64> = HashMap::new();
+        self.acc.clear();
 
         let err = (|| -> Result<(), String> {
             while remaining > 0 {
@@ -273,30 +333,8 @@ impl MasterDispatcher {
                         w2m_rcs[w] = new_rc;
 
                         if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
-                            let vid = decoded.control.target_id as i64;
-                            let ex_source_id = decoded.control.seek_pk_lo as i64;
-
-                            let payloads = exchange_payloads
-                                .entry(vid)
-                                .or_insert_with(|| (0..nw).map(|_| None).collect());
-                            let count = exchange_counts.entry(vid).or_insert(0);
-
-                            payloads[w] = decoded.data_batch.map(|b| *b);
-                            if let Some(schema) = decoded.schema {
-                                exchange_schemas.insert(vid, schema);
-                            }
-                            if ex_source_id > 0 {
-                                exchange_source_ids.insert(vid, ex_source_id);
-                            }
-                            *count += 1;
-
-                            if *count == nw {
-                                let ex_schema = exchange_schemas.remove(&vid);
-                                let src_id = exchange_source_ids.remove(&vid).unwrap_or(0);
-                                let payloads_vec = exchange_payloads.remove(&vid).unwrap();
-                                exchange_counts.remove(&vid);
-
-                                self.relay_exchange(vid, payloads_vec, ex_schema, src_id, target_id)?;
+                            if let Some(relay) = self.acc.process(w, decoded)? {
+                                self.relay_exchange(relay)?;
                             }
                             break; // re-check write_cursor after relay
                         } else {
@@ -313,6 +351,7 @@ impl MasterDispatcher {
             }
             Ok(())
         })();
+        self.acc.clear();
         self.reset_w2m_cursors();
         err
     }
@@ -376,19 +415,14 @@ impl MasterDispatcher {
     // Exchange relay
     // -----------------------------------------------------------------------
 
-    fn relay_exchange(
-        &mut self,
-        view_id: i64,
-        payloads: Vec<Option<OwnedBatch>>,
-        ex_schema: Option<SchemaDescriptor>,
-        source_id: i64,
-        fallback_target_id: i64,
-    ) -> Result<(), String> {
+    fn relay_exchange(&mut self, relay: PendingRelay) -> Result<(), String> {
         let remaining = self.sal.mmap_size() - self.sal.cursor();
         if remaining < (self.sal.mmap_size() >> 3) {
             return Err(format!(
                 "SAL space exhausted during exchange relay ({} bytes left)", remaining));
         }
+
+        let PendingRelay { view_id, payloads, schema, source_id } = relay;
 
         let cat = unsafe { &mut *self.catalog };
         let shard_cols = if source_id > 0 {
@@ -402,31 +436,17 @@ impl MasterDispatcher {
             .map(|opt| opt.as_ref())
             .collect();
 
-        let schema = if let Some(s) = ex_schema {
-            s
-        } else {
-            let cat = unsafe { &mut *self.catalog };
-            cat.get_schema_desc(view_id)
-                .or_else(|| cat.get_schema_desc(fallback_target_id))
-                .ok_or_else(|| format!("no schema for view_id={}", view_id))?
-        };
-
         let col_indices: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
         let dest_batches = op_relay_scatter(&sources, &col_indices, &schema, self.num_workers);
 
         let cat = unsafe { &mut *self.catalog };
         let names = cat.get_column_names(view_id);
-        let name_bytes: Vec<Vec<u8>> = if names.is_empty() {
-            cat.get_column_names(fallback_target_id)
-                .into_iter().map(|s| s.into_bytes()).collect()
-        } else {
-            names.into_iter().map(|s| s.into_bytes()).collect()
-        };
+        let name_bytes: Vec<Vec<u8>> = names.into_iter().map(|s| s.into_bytes()).collect();
 
         let refs: Vec<Option<&OwnedBatch>> = dest_batches.iter()
             .map(|b| if b.count > 0 { Some(b) } else { None })
             .collect();
-        self.send_to_workers(view_id, 0, &refs, &schema, &name_bytes, 0, 0, 0)
+        self.send_to_workers(view_id, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes, 0, 0, 0)
     }
 
     fn record_index_routing(
@@ -733,10 +753,7 @@ impl MasterDispatcher {
             self.async_collected[w] = false;
             self.async_w2m_rcs[w] = W2M_HEADER_SIZE as u64;
         }
-        self.async_exchange_payloads.clear();
-        self.async_exchange_counts.clear();
-        self.async_exchange_schemas.clear();
-        self.async_exchange_source_ids.clear();
+        self.acc.clear();
         self.async_active = true;
         Ok(())
     }
@@ -756,30 +773,15 @@ impl MasterDispatcher {
                 self.async_w2m_rcs[w] = new_rc;
 
                 if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
-                    let vid = decoded.control.target_id as i64;
-                    let ex_source_id = decoded.control.seek_pk_lo as i64;
-
-                    let payloads = self.async_exchange_payloads
-                        .entry(vid)
-                        .or_insert_with(|| (0..nw).map(|_| None).collect());
-                    let count = self.async_exchange_counts.entry(vid).or_insert(0);
-
-                    payloads[w] = decoded.data_batch.map(|b| *b);
-                    if let Some(schema) = decoded.schema {
-                        self.async_exchange_schemas.insert(vid, schema);
-                    }
-                    if ex_source_id > 0 {
-                        self.async_exchange_source_ids.insert(vid, ex_source_id);
-                    }
-                    *count += 1;
-
-                    if *count == nw {
-                        let ex_schema = self.async_exchange_schemas.remove(&vid);
-                        let src_id = self.async_exchange_source_ids.remove(&vid).unwrap_or(0);
-                        let payloads_vec = self.async_exchange_payloads.remove(&vid).unwrap();
-                        self.async_exchange_counts.remove(&vid);
-
-                        if let Err(e) = self.relay_exchange(vid, payloads_vec, ex_schema, src_id, 0) {
+                    match self.acc.process(w, decoded) {
+                        Ok(Some(relay)) => {
+                            if let Err(e) = self.relay_exchange(relay) {
+                                self.finish_async_tick();
+                                return Err(e);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
                             self.finish_async_tick();
                             return Err(e);
                         }

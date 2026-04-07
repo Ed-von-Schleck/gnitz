@@ -47,6 +47,7 @@ pub const FLAG_PUSH: u32                = 32;
 pub const FLAG_HAS_PK: u32             = 64;
 pub const FLAG_SEEK: u32                = 128;
 pub const FLAG_SEEK_BY_INDEX: u32       = 256;
+pub const FLAG_EXCHANGE_RELAY: u32      = 512; // M→W exchange relay (was flags=0)
 pub const FLAG_PRELOADED_EXCHANGE: u32  = 1024;
 pub const FLAG_BACKFILL: u32            = 2048;
 pub const FLAG_TICK: u32                = 4096;
