@@ -6,6 +6,12 @@ LOG_DIR := .test_logs
 
 .PHONY: all test clean rust-engine-test server release-server pyext e2e e2e-release release-test bench bench-full bench-sweep bench-perf
 
+# Benchmark knobs — override on the command line, e.g. make bench WORKERS=4 PERF=1
+WORKERS ?= 1
+CLIENTS ?= 1
+FULL    ?=
+PERF    ?=
+
 all: test
 
 # ---------------------------------------------------------------------------
@@ -51,13 +57,19 @@ release-test:
 # ---------------------------------------------------------------------------
 
 bench: release-server
-	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --workers=1 --clients=1
+	cd crates/gnitz-py && uv run python ../../benchmarks/run.py \
+		$(if $(FULL),--full) \
+		--workers=$(WORKERS) --clients=$(CLIENTS) \
+		$(if $(PERF),--perf --perf-stat)
 
-bench-full: release-server
-	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=4 --clients=1
+bench-full: WORKERS = 4
+bench-full: FULL    = 1
+bench-full: bench
 
 bench-sweep: release-server
 	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=1,2,4 --clients=1,2,4
 
-bench-perf: release-server
-	cd crates/gnitz-py && uv run python ../../benchmarks/run.py --full --workers=4 --clients=1 --perf --perf-stat
+bench-perf: WORKERS = 4
+bench-perf: FULL    = 1
+bench-perf: PERF    = 1
+bench-perf: bench

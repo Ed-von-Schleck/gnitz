@@ -133,10 +133,13 @@ compare key (first 8 bytes), not the full 16-byte string struct.
 ## Benchmarking
 
 ```bash
-make bench           # quick mode, 1 worker, ~60s
-make bench-full      # full mode (150k rows), 4 workers, ~5 min
-make bench-sweep     # sweep workers=1,2,4 × clients=1,2,4
-make bench-perf      # full + perf record + perf stat
+make bench                          # quick mode, 1 worker, ~60s
+make bench-full                     # full mode (150k rows), 4 workers, ~5 min
+make bench-sweep                    # sweep workers=1,2,4 × clients=1,2,4
+make bench-perf                     # full + perf record + perf stat
+
+# Knobs: WORKERS, CLIENTS, FULL=1, PERF=1
+make bench WORKERS=4 PERF=1        # quick, 4 workers, perf
 ```
 
 Results: `benchmarks/results/` (gitignored). The runner rotates old results (keeps 3).
