@@ -35,7 +35,7 @@ const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
 fn alloc_large_zeroed(size: usize) -> Vec<u8> {
     let v = vec![0u8; size];
     if size >= HUGEPAGE_THRESHOLD {
-        crate::ipc_sys::madvise_hugepage(v.as_ptr() as *mut u8, size);
+        crate::sys::madvise_hugepage(v.as_ptr() as *mut u8, size);
     }
     v
 }

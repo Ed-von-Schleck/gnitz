@@ -8,8 +8,12 @@ use std::collections::HashMap;
 
 use crate::catalog::CatalogEngine;
 use crate::executor::ServerExecutor;
-use crate::ipc::{self, FLAG_PUSH, SAL_MMAP_SIZE, W2M_REGION_SIZE};
+use crate::ipc::{
+    self, FLAG_PUSH, SAL_MMAP_SIZE, W2M_REGION_SIZE,
+    SalWriter, SalReader, W2mWriter, W2mReceiver,
+};
 use crate::ipc_sys;
+use crate::sys;
 use crate::master::MasterDispatcher;
 use crate::worker::WorkerProcess;
 
@@ -38,10 +42,9 @@ fn partition_range(worker_id: u32, num_workers: u32) -> (u32, u32) {
 ///
 /// Walks the SAL from offset 0, reading group headers. For FLAG_PUSH messages
 /// with LSN > flushed LSN, decodes the wire data and ingests the batch.
-unsafe fn recover_from_sal(
-    sal_ptr: *const u8,
+fn recover_from_sal(
+    sal_reader: &SalReader,
     catalog: &mut CatalogEngine,
-    worker_id: u32,
 ) {
     // Build per-table max_flushed_lsn map
     let table_ids = catalog.iter_user_table_ids();
@@ -56,42 +59,38 @@ unsafe fn recover_from_sal(
     let mut last_epoch: u32 = 0;
 
     while (offset as usize) + 8 < SAL_MMAP_SIZE {
-        let result = ipc::sal_read_group_header(sal_ptr, offset, worker_id);
-
-        // No message at cursor (payload_size == 0)
-        if result.advance == 0 {
-            break;
-        }
+        let (msg, new_offset) = match sal_reader.try_read(offset) {
+            Some(v) => v,
+            None => break,
+        };
 
         // Epoch fence: decreasing epoch = stale data from before checkpoint
-        if last_epoch > 0 && result.epoch < last_epoch {
+        if last_epoch > 0 && msg.epoch < last_epoch {
             break;
         }
-        last_epoch = result.epoch;
+        last_epoch = msg.epoch;
 
-        offset += result.advance;
+        offset = new_offset;
 
-        // No data for this worker in this group
-        if result.status != 0 {
+        // Only process FLAG_PUSH with data for this worker
+        if msg.flags & FLAG_PUSH == 0 {
             continue;
         }
+        let data = match msg.wire_data {
+            Some(d) => d,
+            None => continue,
+        };
 
-        // Only process FLAG_PUSH
-        if result.flags & FLAG_PUSH == 0 {
-            continue;
-        }
-
-        let tid = result.target_id as i64;
+        let tid = msg.target_id as i64;
         let flushed = match family_lsns.get(&tid) {
             Some(&lsn) => lsn,
             None => continue,
         };
-        if result.lsn <= flushed {
+        if msg.lsn <= flushed {
             continue;
         }
 
         // Decode wire data and extract batch
-        let data = std::slice::from_raw_parts(result.data_ptr, result.data_size as usize);
         if let Ok(decoded) = ipc::decode_wire(data) {
             if let Some(batch) = decoded.data_batch {
                 let owned = *batch;
@@ -105,7 +104,7 @@ unsafe fn recover_from_sal(
 
     if replayed > 0 {
         let msg = format!("SAL recovery: replayed {} blocks\n", replayed);
-        libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
     }
 }
 
@@ -158,7 +157,7 @@ pub fn server_main(
     log_level: u32,
 ) -> i32 {
     // Raise fd limit (each partitioned user table holds 256 WAL fds)
-    ipc_sys::raise_fd_limit(65536);
+    sys::raise_fd_limit(65536);
 
     gnitz_info!("Opening database at {}", data_dir);
 
@@ -175,7 +174,7 @@ pub fn server_main(
     // --- Single-worker path ---
     if num_workers == 1 {
         gnitz_info!("Listening on {}", socket_path);
-        let server_fd = ipc_sys::server_create(socket_path);
+        let server_fd = sys::server_create(socket_path);
         if server_fd < 0 {
             let msg = b"Error: failed to create server socket\n";
             unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
@@ -213,12 +212,12 @@ pub fn server_main(
         unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
         return 1;
     }
-    ipc_sys::try_set_nocow(sal_fd);
+    sys::try_set_nocow(sal_fd);
     // Check existing size and fallocate if needed
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     unsafe { libc::fstat(sal_fd, &mut stat); }
     if (stat.st_size as usize) < SAL_MMAP_SIZE {
-        ipc_sys::fallocate(sal_fd, SAL_MMAP_SIZE as i64);
+        sys::fallocate(sal_fd, SAL_MMAP_SIZE as i64);
     }
     let sal_ptr = ipc_sys::mmap_shared(sal_fd, SAL_MMAP_SIZE);
     if sal_ptr.is_null() {
@@ -239,7 +238,7 @@ pub fn server_main(
             unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
             return 1;
         }
-        ipc_sys::ftruncate(wfd, W2M_REGION_SIZE as i64);
+        sys::ftruncate(wfd, W2M_REGION_SIZE as i64);
         let wptr = ipc_sys::mmap_shared(wfd, W2M_REGION_SIZE);
         if wptr.is_null() {
             let msg = b"Error: mmap W2M failed\n";
@@ -249,7 +248,7 @@ pub fn server_main(
         // Hint THP backing for the W2M region (memfd/shmem backing).
         // Requires: echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled
         // If shmem_enabled remains "never", this call is silently inert — no harm.
-        ipc_sys::madvise_hugepage(wptr, W2M_REGION_SIZE);
+        sys::madvise_hugepage(wptr, W2M_REGION_SIZE);
         // Initialize write cursor to W2M_HEADER_SIZE (skips the header)
         use std::sync::atomic::{AtomicU64, Ordering};
         unsafe {
@@ -337,8 +336,16 @@ pub fn server_main(
             // Disable per-partition WAL (SAL handles durability)
             catalog.disable_user_table_wal();
 
+            // Construct channel types for this worker
+            let sal_reader = SalReader::new(
+                sal_ptr as *const u8, w as u32, SAL_MMAP_SIZE, m2w_efds[w],
+            );
+            let w2m_writer = W2mWriter::new(
+                w2m_ptrs[w], W2M_REGION_SIZE as u64, w2m_efds[w],
+            );
+
             // SAL recovery — replay unflushed push data
-            unsafe { recover_from_sal(sal_ptr, catalog, w as u32); }
+            recover_from_sal(&sal_reader, catalog);
 
             catalog.invalidate_all_plans();
 
@@ -359,11 +366,8 @@ pub fn server_main(
                 w as u32,
                 master_pid,
                 catalog_ptr,
-                sal_ptr,
-                m2w_efds[w],
-                w2m_ptrs[w],
-                W2M_REGION_SIZE as u64,
-                w2m_efds[w],
+                sal_reader,
+                w2m_writer,
             );
             worker.run();
 
@@ -379,17 +383,15 @@ pub fn server_main(
     catalog.close_user_table_partitions();
     catalog.set_active_partitions(0, 0);
 
+    let sal_writer = SalWriter::new(sal_ptr, sal_fd, SAL_MMAP_SIZE as u64, m2w_efds.clone());
+    let w2m_receiver = W2mReceiver::new(w2m_ptrs.clone(), w2m_efds.clone());
+
     let dispatcher = MasterDispatcher::new(
         nw,
         worker_pids.clone(),
         catalog_ptr,
-        sal_ptr,
-        sal_fd,
-        SAL_MMAP_SIZE as u64,
-        w2m_ptrs.clone(),
-        w2m_sizes.clone(),
-        m2w_efds.clone(),
-        w2m_efds.clone(),
+        sal_writer,
+        w2m_receiver,
     );
     let dispatcher_ptr = Box::into_raw(Box::new(dispatcher));
 
@@ -414,7 +416,7 @@ pub fn server_main(
 
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);
-    let server_fd = ipc_sys::server_create(socket_path);
+    let server_fd = sys::server_create(socket_path);
     if server_fd < 0 {
         let msg = b"Error: failed to create server socket\n";
         unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }

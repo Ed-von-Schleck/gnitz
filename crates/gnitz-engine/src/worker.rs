@@ -17,43 +17,15 @@ use crate::ipc::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
     FLAG_TICK, FLAG_CHECKPOINT, FLAG_FLUSH,
+    SalReader, SalMessage, W2mWriter,
 };
-use crate::ipc_sys;
 use crate::storage::OwnedBatch;
-
-// ---------------------------------------------------------------------------
-// IPC handles — shared by WorkerProcess and WorkerExchangeHandler
-// ---------------------------------------------------------------------------
-
-struct IpcHandles {
-    sal_ptr: *const u8,
-    m2w_efd: i32,
-    w2m_region_ptr: *mut u8,
-    w2m_region_size: u64,
-    w2m_efd: i32,
-}
-
-impl IpcHandles {
-    /// Encode wire data, write to W2M region, and signal master.
-    fn w2m_send(&self, wire: &[u8]) {
-        unsafe {
-            ipc::w2m_write(
-                self.w2m_region_ptr,
-                wire.as_ptr(),
-                wire.len() as u32,
-                self.w2m_region_size,
-            );
-        }
-        ipc_sys::eventfd_signal(self.w2m_efd);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // WorkerExchangeHandler
 // ---------------------------------------------------------------------------
 
 struct WorkerExchangeHandler {
-    worker_id: u32,
     stash: HashMap<i64, OwnedBatch>,
 }
 
@@ -65,7 +37,8 @@ impl WorkerExchangeHandler {
     /// Perform exchange IPC: send pre-exchange output to master, receive relay.
     fn do_exchange_impl(
         &mut self,
-        ipc_h: &IpcHandles,
+        sal_reader: &SalReader,
+        w2m_writer: &W2mWriter,
         view_id: i64,
         batch: &OwnedBatch,
         source_id: i64,
@@ -83,32 +56,22 @@ impl WorkerExchangeHandler {
             STATUS_OK, &[],
             schema.as_ref(), None, Some(batch),
         );
-        ipc_h.w2m_send(&wire);
+        w2m_writer.send(&wire);
 
         // Blocking loop: wait for relay from master via SAL
         loop {
-            ipc_sys::eventfd_wait(ipc_h.m2w_efd, 30000);
+            sal_reader.wait(30000);
 
-            let size = unsafe {
-                ipc::atomic_load_u64(ipc_h.sal_ptr.add(*read_cursor as usize))
+            let (msg, new_cursor) = match sal_reader.try_read(*read_cursor) {
+                Some(v) => v,
+                None => continue,
             };
-            if size == 0 {
+            if msg.epoch != expected_epoch {
                 continue;
             }
+            *read_cursor = new_cursor;
 
-            // Use sal_read_group_header for epoch fence (avoid raw pointer math)
-            let result = unsafe {
-                ipc::sal_read_group_header(ipc_h.sal_ptr, *read_cursor, self.worker_id)
-            };
-            if result.epoch != expected_epoch {
-                continue;
-            }
-            *read_cursor += result.advance;
-
-            if result.status == 0 && result.data_size > 0 {
-                let data = unsafe {
-                    std::slice::from_raw_parts(result.data_ptr, result.data_size as usize)
-                };
+            if let Some(data) = msg.wire_data {
                 if let Ok(decoded) = ipc::decode_wire(data) {
                     if let Some(batch_box) = decoded.data_batch {
                         return *batch_box;
@@ -122,11 +85,12 @@ impl WorkerExchangeHandler {
     }
 }
 
-/// Wrapper that carries IPC handles, read_cursor, and expected_epoch from
+/// Wrapper that carries channel handles, read_cursor, and expected_epoch from
 /// WorkerProcess into the ExchangeCallback trait.
 struct WorkerExchangeCtx<'a> {
     handler: &'a mut WorkerExchangeHandler,
-    ipc_h: &'a IpcHandles,
+    sal_reader: &'a SalReader,
+    w2m_writer: &'a W2mWriter,
     read_cursor: &'a mut u64,
     expected_epoch: u32,
 }
@@ -139,7 +103,8 @@ impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
         source_id: i64,
     ) -> OwnedBatch {
         self.handler.do_exchange_impl(
-            self.ipc_h, view_id, batch, source_id,
+            self.sal_reader, self.w2m_writer,
+            view_id, batch, source_id,
             self.read_cursor, self.expected_epoch,
         )
     }
@@ -153,7 +118,8 @@ pub struct WorkerProcess {
     worker_id: u32,
     master_pid: i32,
     catalog: *mut CatalogEngine,
-    ipc_h: IpcHandles,
+    sal_reader: SalReader,
+    w2m_writer: W2mWriter,
     exchange: WorkerExchangeHandler,
     pending_deltas: HashMap<i64, OwnedBatch>,
     read_cursor: u64,
@@ -165,18 +131,16 @@ impl WorkerProcess {
         worker_id: u32,
         master_pid: i32,
         catalog: *mut CatalogEngine,
-        sal_ptr: *const u8,
-        m2w_efd: i32,
-        w2m_region_ptr: *mut u8,
-        w2m_region_size: u64,
-        w2m_efd: i32,
+        sal_reader: SalReader,
+        w2m_writer: W2mWriter,
     ) -> Self {
         WorkerProcess {
             worker_id,
             master_pid,
             catalog,
-            ipc_h: IpcHandles { sal_ptr, m2w_efd, w2m_region_ptr, w2m_region_size, w2m_efd },
-            exchange: WorkerExchangeHandler { worker_id, stash: HashMap::new() },
+            sal_reader,
+            w2m_writer,
+            exchange: WorkerExchangeHandler { stash: HashMap::new() },
             pending_deltas: HashMap::new(),
             read_cursor: 0,
             expected_epoch: 1,
@@ -193,7 +157,7 @@ impl WorkerProcess {
         self.send_ack(0, 0);
 
         loop {
-            let ready = ipc_sys::eventfd_wait(self.ipc_h.m2w_efd, 1000);
+            let ready = self.sal_reader.wait(1000);
             if ready == 0 {
                 let ppid = unsafe { libc::getppid() };
                 if ppid != self.master_pid {
@@ -218,21 +182,18 @@ impl WorkerProcess {
             if self.read_cursor + 8 >= SAL_MMAP_SIZE as u64 {
                 break;
             }
-            // Use sal_read_group_header for both size check and epoch fence
-            let result = unsafe {
-                ipc::sal_read_group_header(
-                    self.ipc_h.sal_ptr, self.read_cursor, self.worker_id,
-                )
+            // Read into local to avoid borrow conflict with dispatch_message
+            let read_result = self.sal_reader.try_read(self.read_cursor);
+            let (msg, new_cursor) = match read_result {
+                Some(v) => v,
+                None => break,
             };
-            if result.status == -1 {
-                break; // no message at cursor
-            }
-            if result.epoch != self.expected_epoch {
+            if msg.epoch != self.expected_epoch {
                 break;
             }
-            self.read_cursor += result.advance;
+            self.read_cursor = new_cursor;
 
-            if self.dispatch_message(&result) {
+            if self.dispatch_message(&msg) {
                 return true;
             }
         }
@@ -240,30 +201,23 @@ impl WorkerProcess {
     }
 
     /// Dispatch a single SAL message. Returns true on shutdown.
-    fn dispatch_message(&mut self, msg: &ipc::SalReadResult) -> bool {
+    fn dispatch_message(&mut self, msg: &SalMessage<'_>) -> bool {
         let mut flags = msg.flags;
         let mut target_id = msg.target_id as i64;
-        let mut data_ptr = msg.data_ptr;
-        let mut data_size = msg.data_size;
-
-        // Skip messages not targeted at this worker
-        if msg.status != 0 && msg.advance > 0 {
-            // status=1 means no data for this worker — skip
-            // But we still need to check if flags indicate a broadcast
+        let mut wire_data = msg.wire_data;
+        if wire_data.is_none() {
+            // No data for this worker — skip unless broadcast flags
             if flags & (FLAG_SHUTDOWN | FLAG_FLUSH | FLAG_DDL_SYNC | FLAG_TICK
                 | FLAG_PUSH | FLAG_BACKFILL | FLAG_HAS_PK
                 | FLAG_PRELOADED_EXCHANGE) == 0 {
                 return false;
             }
-            // Broadcast flags (shutdown, flush, tick, etc.) still processed
-            // even when there's no worker-specific data
         }
 
         // Drain preloaded exchange groups before processing push
         while flags & FLAG_PRELOADED_EXCHANGE != 0 {
             let vid = target_id;
-            if data_size > 0 && !data_ptr.is_null() {
-                let data = unsafe { std::slice::from_raw_parts(data_ptr, data_size as usize) };
+            if let Some(data) = wire_data {
                 if let Ok(decoded) = ipc::decode_wire(data) {
                     if let Some(batch_box) = decoded.data_batch {
                         self.exchange.stash_preloaded(vid, *batch_box);
@@ -275,24 +229,18 @@ impl WorkerProcess {
             if self.read_cursor + 8 >= SAL_MMAP_SIZE as u64 {
                 return false;
             }
-            let next = unsafe {
-                ipc::sal_read_group_header(
-                    self.ipc_h.sal_ptr, self.read_cursor, self.worker_id,
-                )
+            let (next, new_cursor) = match self.sal_reader.try_read(self.read_cursor) {
+                Some(v) => v,
+                None => return false,
             };
-            if next.status == -1 {
-                return false;
-            }
-            self.read_cursor += next.advance;
+            self.read_cursor = new_cursor;
             flags = next.flags;
             target_id = next.target_id as i64;
-            data_ptr = next.data_ptr;
-            data_size = next.data_size;
+            wire_data = next.wire_data;
         }
 
         // Decode wire data if present
-        let decoded = if data_size > 0 && !data_ptr.is_null() {
-            let data = unsafe { std::slice::from_raw_parts(data_ptr, data_size as usize) };
+        let decoded = if let Some(data) = wire_data {
             ipc::decode_wire(data).ok()
         } else {
             None
@@ -432,7 +380,7 @@ impl WorkerProcess {
             0, 0, 0, STATUS_OK, &[],
             None, None, None,
         );
-        self.ipc_h.w2m_send(&wire);
+        self.w2m_writer.send(&wire);
     }
 
     fn send_response(&self, target_id: u64, result: Option<&OwnedBatch>, schema: Option<&SchemaDescriptor>) {
@@ -441,7 +389,7 @@ impl WorkerProcess {
             0, 0, 0, STATUS_OK, &[],
             schema, None, result,
         );
-        self.ipc_h.w2m_send(&wire);
+        self.w2m_writer.send(&wire);
     }
 
     fn send_error(&self, error_msg: &str) {
@@ -450,7 +398,7 @@ impl WorkerProcess {
             0, 0, 0, STATUS_ERROR, error_msg.as_bytes(),
             None, None, None,
         );
-        self.ipc_h.w2m_send(&wire);
+        self.w2m_writer.send(&wire);
     }
 
     // ── Request handlers ───────────────────────────────────────────────
@@ -572,7 +520,8 @@ impl WorkerProcess {
         let dag = self.cat().get_dag_ptr();
         let mut ctx = WorkerExchangeCtx {
             handler: &mut self.exchange,
-            ipc_h: &self.ipc_h,
+            sal_reader: &self.sal_reader,
+            w2m_writer: &self.w2m_writer,
             read_cursor: &mut self.read_cursor,
             expected_epoch: self.expected_epoch,
         };
@@ -667,7 +616,7 @@ mod tests {
     }
 
     fn make_handler() -> WorkerExchangeHandler {
-        WorkerExchangeHandler { worker_id: 0, stash: HashMap::new() }
+        WorkerExchangeHandler { stash: HashMap::new() }
     }
 
     #[test]

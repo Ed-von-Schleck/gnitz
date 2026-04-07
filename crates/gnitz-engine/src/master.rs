@@ -9,12 +9,12 @@ use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
 use crate::schema::promote_to_index_key;
 use crate::ipc::{
-    self, MAX_WORKERS, W2M_HEADER_SIZE, STATUS_OK,
+    self, STATUS_OK,
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, DecodedWire,
+    SalWriter, W2mReceiver, W2M_HEADER_SIZE,
 };
-use crate::ipc_sys;
 use crate::storage::{OwnedBatch, partition_for_key};
 use crate::ops::{
     PartitionRouter, op_repartition_batch, op_relay_scatter, op_multi_scatter,
@@ -28,17 +28,8 @@ use crate::ops::{
 pub struct MasterDispatcher {
     num_workers: usize,
     worker_pids: Vec<i32>,
-    // SAL state — sal_lsn_counter must stay monotonic across checkpoints.
-    sal_ptr: *mut u8,
-    sal_fd: i32,
-    sal_mmap_size: u64,
-    sal_write_cursor: u64,
-    sal_lsn_counter: u64,
-    sal_epoch: u32,
-    checkpoint_threshold: u64,
-    w2m_region_ptrs: Vec<*mut u8>,
-    m2w_efds: Vec<i32>,
-    w2m_efds: Vec<i32>,
+    sal: SalWriter,
+    w2m: W2mReceiver,
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
     router: PartitionRouter,
@@ -60,28 +51,14 @@ impl MasterDispatcher {
         num_workers: usize,
         worker_pids: Vec<i32>,
         catalog: *mut CatalogEngine,
-        sal_ptr: *mut u8,
-        sal_fd: i32,
-        sal_mmap_size: u64,
-        w2m_region_ptrs: Vec<*mut u8>,
-        _w2m_region_sizes: Vec<u64>,
-        m2w_efds: Vec<i32>,
-        w2m_efds: Vec<i32>,
+        sal: SalWriter,
+        w2m: W2mReceiver,
     ) -> Self {
-        let checkpoint_threshold = (sal_mmap_size * 3) >> 2; // 75%
         MasterDispatcher {
             num_workers,
             worker_pids,
-            sal_ptr,
-            sal_fd,
-            sal_mmap_size,
-            sal_write_cursor: 0,
-            sal_lsn_counter: 0,
-            sal_epoch: 0,
-            checkpoint_threshold,
-            w2m_region_ptrs,
-            m2w_efds,
-            w2m_efds,
+            sal,
+            w2m,
             catalog,
             router: PartitionRouter::new(),
             async_remaining: 0,
@@ -95,8 +72,7 @@ impl MasterDispatcher {
     }
 
     pub fn reset_sal(&mut self, write_cursor: u64, epoch: u32) {
-        self.sal_write_cursor = write_cursor;
-        self.sal_epoch = epoch;
+        self.sal.reset(write_cursor, epoch);
     }
 
     fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Vec<Vec<u8>>) {
@@ -154,7 +130,7 @@ impl MasterDispatcher {
             wire_bufs.push(buf);
         }
 
-        self.sal_write(&wire_bufs, target_id, flags)
+        self.sal.write_group(target_id as u32, flags, &wire_bufs)
     }
 
     /// Encode batch once and write identical data to all workers.
@@ -186,59 +162,7 @@ impl MasterDispatcher {
             Some(schema), col_names_opt, batch,
         );
 
-        let nw = self.num_workers;
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_WORKERS];
-        let mut sizes = [0u32; MAX_WORKERS];
-        for w in 0..nw {
-            ptrs[w] = wire_buf.as_ptr();
-            sizes[w] = wire_buf.len() as u32;
-        }
-
-        let lsn = self.sal_lsn_counter;
-        self.sal_lsn_counter += 1;
-
-        let result = unsafe {
-            ipc::sal_write_group(
-                self.sal_ptr, self.sal_write_cursor,
-                nw as u32, target_id as u32, lsn, flags, self.sal_epoch,
-                self.sal_mmap_size, ptrs.as_ptr(), sizes.as_ptr(),
-            )
-        };
-        if result.status < 0 {
-            return Err(format!("SAL broadcast write failed (cursor={})", self.sal_write_cursor));
-        }
-        self.sal_write_cursor = result.new_cursor;
-        Ok(())
-    }
-
-    /// Common SAL write from pre-encoded wire buffers.
-    fn sal_write(&mut self, wire_bufs: &[Vec<u8>], target_id: i64, flags: u32) -> Result<(), String> {
-        let nw = self.num_workers;
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_WORKERS];
-        let mut sizes = [0u32; MAX_WORKERS];
-        for (w, buf) in wire_bufs.iter().enumerate().take(nw) {
-            if !buf.is_empty() {
-                ptrs[w] = buf.as_ptr();
-                sizes[w] = buf.len() as u32;
-            }
-        }
-
-        let lsn = self.sal_lsn_counter;
-        self.sal_lsn_counter += 1;
-
-        let result = unsafe {
-            ipc::sal_write_group(
-                self.sal_ptr, self.sal_write_cursor,
-                nw as u32, target_id as u32, lsn, flags, self.sal_epoch,
-                self.sal_mmap_size, ptrs.as_ptr(), sizes.as_ptr(),
-            )
-        };
-        if result.status < 0 {
-            return Err(format!("SAL write failed (cursor={}, mmap_size={})",
-                self.sal_write_cursor, self.sal_mmap_size));
-        }
-        self.sal_write_cursor = result.new_cursor;
-        Ok(())
+        self.sal.write_broadcast(target_id as u32, flags, &wire_buf)
     }
 
     /// Encode once, write to all workers, fdatasync, signal.
@@ -260,15 +184,11 @@ impl MasterDispatcher {
     }
 
     fn sync_and_signal_all(&self) {
-        ipc_sys::fdatasync(self.sal_fd);
-        for w in 0..self.num_workers {
-            ipc_sys::eventfd_signal(self.m2w_efds[w]);
-        }
+        self.sal.sync_and_signal_all();
     }
 
     fn sync_and_signal_one(&self, worker: usize) {
-        ipc_sys::fdatasync(self.sal_fd);
-        ipc_sys::eventfd_signal(self.m2w_efds[worker]);
+        self.sal.sync_and_signal_one(worker);
     }
 
     /// Write per-worker message group + fdatasync + signal all workers.
@@ -290,11 +210,7 @@ impl MasterDispatcher {
     }
 
     fn reset_w2m_cursors(&self) {
-        for w in 0..self.num_workers {
-            unsafe {
-                ipc::atomic_store_u64(self.w2m_region_ptrs[w], W2M_HEADER_SIZE as u64);
-            }
-        }
+        self.w2m.reset_all();
     }
 
     /// Wait for one response from each worker. ALWAYS resets W2M cursors.
@@ -307,21 +223,11 @@ impl MasterDispatcher {
 
         let err = (|| -> Result<(), String> {
             while remaining > 0 {
-                ipc_sys::eventfd_wait_any(&self.w2m_efds, 1000);
+                self.w2m.poll(1000);
                 for w in 0..nw {
                     if collected[w] { continue; }
-                    let wc = unsafe { ipc::atomic_load_u64(self.w2m_region_ptrs[w]) };
-                    if w2m_rcs[w] < wc {
-                        let (new_rc, data_size, data_ptr) = unsafe {
-                            ipc::w2m_read(self.w2m_region_ptrs[w], w2m_rcs[w])
-                        };
+                    if let Some((decoded, new_rc)) = self.w2m.try_read(w, w2m_rcs[w]) {
                         w2m_rcs[w] = new_rc;
-                        if data_size == 0 { continue; }
-                        let data = unsafe {
-                            std::slice::from_raw_parts(data_ptr, data_size as usize)
-                        };
-                        let decoded = ipc::decode_wire(data)
-                            .map_err(|e| format!("worker {}: decode: {}", w, e))?;
                         if decoded.control.status != 0 {
                             let msg = String::from_utf8_lossy(&decoded.control.error_msg);
                             return Err(format!("worker {}: {}", w, msg));
@@ -358,21 +264,11 @@ impl MasterDispatcher {
 
         let err = (|| -> Result<(), String> {
             while remaining > 0 {
-                ipc_sys::eventfd_wait_any(&self.w2m_efds, 1000);
+                self.w2m.poll(1000);
                 for w in 0..nw {
                     if collected[w] { continue; }
-                    let wc = unsafe { ipc::atomic_load_u64(self.w2m_region_ptrs[w]) };
-                    while w2m_rcs[w] < wc {
-                        let (new_rc, data_size, data_ptr) = unsafe {
-                            ipc::w2m_read(self.w2m_region_ptrs[w], w2m_rcs[w])
-                        };
+                    while let Some((decoded, new_rc)) = self.w2m.try_read(w, w2m_rcs[w]) {
                         w2m_rcs[w] = new_rc;
-                        if data_size == 0 { break; }
-                        let data = unsafe {
-                            std::slice::from_raw_parts(data_ptr, data_size as usize)
-                        };
-                        let decoded = ipc::decode_wire(data)
-                            .map_err(|e| format!("worker {}: decode: {}", w, e))?;
 
                         if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
                             let vid = decoded.control.target_id as i64;
@@ -442,26 +338,14 @@ impl MasterDispatcher {
         let mut w2m_rc = W2M_HEADER_SIZE as u64;
         let result = (|| -> Result<DecodedWire, String> {
             loop {
-                ipc_sys::eventfd_wait(self.w2m_efds[worker], 1000);
-                let wc = unsafe { ipc::atomic_load_u64(self.w2m_region_ptrs[worker]) };
-                if w2m_rc < wc {
-                    let (new_rc, data_size, data_ptr) = unsafe {
-                        ipc::w2m_read(self.w2m_region_ptrs[worker], w2m_rc)
-                    };
+                self.w2m.wait_one(worker, 1000);
+                if let Some((decoded, new_rc)) = self.w2m.try_read(worker, w2m_rc) {
                     w2m_rc = new_rc;
-                    if data_size > 0 {
-                        let data = unsafe {
-                            std::slice::from_raw_parts(data_ptr, data_size as usize)
-                        };
-                        return ipc::decode_wire(data)
-                            .map_err(|e| format!("worker {}: decode: {}", worker, e));
-                    }
+                    return Ok(decoded);
                 }
             }
         })();
-        unsafe {
-            ipc::atomic_store_u64(self.w2m_region_ptrs[worker], W2M_HEADER_SIZE as u64);
-        }
+        self.w2m.reset_one(worker);
         result
     }
 
@@ -470,7 +354,7 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     fn maybe_checkpoint(&mut self) -> Result<(), String> {
-        if self.sal_write_cursor < self.checkpoint_threshold {
+        if !self.sal.needs_checkpoint() {
             return Ok(());
         }
         self.do_checkpoint()
@@ -481,10 +365,8 @@ impl MasterDispatcher {
         self.send_broadcast(0, FLAG_FLUSH, None, &schema, &col_names, 0, 0, 0)?;
         self.collect_acks()?;
 
-        self.sal_epoch += 1;
-        self.sal_write_cursor = 0;
-        unsafe { ipc::atomic_store_u64(self.sal_ptr, 0); }
-        gnitz_info!("SAL checkpoint epoch={}", self.sal_epoch);
+        self.sal.checkpoint_reset();
+        gnitz_info!("SAL checkpoint epoch={}", self.sal.epoch());
         Ok(())
     }
 
@@ -500,8 +382,8 @@ impl MasterDispatcher {
         source_id: i64,
         fallback_target_id: i64,
     ) -> Result<(), String> {
-        let remaining = self.sal_mmap_size - self.sal_write_cursor;
-        if remaining < (self.sal_mmap_size >> 3) {
+        let remaining = self.sal.mmap_size() - self.sal.cursor();
+        if remaining < (self.sal.mmap_size() >> 3) {
             return Err(format!(
                 "SAL space exhausted during exchange relay ({} bytes left)", remaining));
         }
@@ -776,6 +658,35 @@ impl MasterDispatcher {
         Ok(false)
     }
 
+    // Like check_pk_exists_broadcast but returns the full set of keys found, so
+    // the caller can distinguish which specific keys are occupied.
+    fn check_index_keys(
+        &mut self, owner_table_id: i64, source_col_idx: u32, check_batch: &OwnedBatch,
+    ) -> Result<HashSet<(u64, u64)>, String> {
+        self.maybe_checkpoint()?;
+        let schema = check_batch.schema
+            .ok_or_else(|| "check_index_keys: batch has no schema".to_string())?;
+        let col_hint = (source_col_idx + 1) as u64;
+        self.write_broadcast(owner_table_id, FLAG_HAS_PK, Some(check_batch), &schema,
+                            &[], 0, 0, col_hint)?;
+        self.sync_and_signal_all();
+
+        let results = self.wait_all_workers()?;
+        let mut occupied: HashSet<(u64, u64)> = HashSet::new();
+        for decoded_opt in &results {
+            if let Some(decoded) = decoded_opt {
+                if let Some(ref batch) = decoded.data_batch {
+                    for j in 0..batch.count {
+                        if batch.get_weight(j) == 1 {
+                            occupied.insert((batch.get_pk_lo(j), batch.get_pk_hi(j)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(occupied)
+    }
+
     fn check_pk_existence(
         &mut self, target_id: i64, check_batch: &OwnedBatch,
     ) -> Result<HashMap<u64, HashSet<u64>>, String> {
@@ -833,27 +744,12 @@ impl MasterDispatcher {
         }
 
         let nw = self.num_workers;
-        ipc_sys::eventfd_wait_any(&self.w2m_efds, 1);
+        self.w2m.poll(1);
 
         for w in 0..nw {
             if self.async_collected[w] { continue; }
-            let wc = unsafe { ipc::atomic_load_u64(self.w2m_region_ptrs[w]) };
-            while self.async_w2m_rcs[w] < wc {
-                let (new_rc, data_size, data_ptr) = unsafe {
-                    ipc::w2m_read(self.w2m_region_ptrs[w], self.async_w2m_rcs[w])
-                };
+            while let Some((decoded, new_rc)) = self.w2m.try_read(w, self.async_w2m_rcs[w]) {
                 self.async_w2m_rcs[w] = new_rc;
-                if data_size == 0 { break; }
-                let data = unsafe {
-                    std::slice::from_raw_parts(data_ptr, data_size as usize)
-                };
-                let decoded = match ipc::decode_wire(data) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        self.finish_async_tick();
-                        return Err(format!("worker {}: decode: {}", w, e));
-                    }
-                };
 
                 if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
                     let vid = decoded.control.target_id as i64;
@@ -998,6 +894,8 @@ impl MasterDispatcher {
             };
             let col_size = source_schema.columns[source_col].size as usize;
 
+            // (key_lo, key_hi, pk_lo, pk_hi) — deferred for batch verification below.
+            let mut upsert_keys: Vec<(u64, u64, u64, u64)> = Vec::new();
             let mut check_lo: Vec<u64> = Vec::new();
             let mut check_hi: Vec<u64> = Vec::new();
             let mut seen: HashMap<u64, HashSet<u64>> = HashMap::new();
@@ -1013,7 +911,6 @@ impl MasterDispatcher {
                 let pk_lo_i = batch.get_pk_lo(i);
                 let pk_hi_i = batch.get_pk_hi(i);
 
-                // Compute the index key before the UPSERT branch (needed in both paths).
                 let (key_lo, key_hi) = if is_pk_col {
                     (pk_lo_i, pk_hi_i)
                 } else {
@@ -1021,26 +918,9 @@ impl MasterDispatcher {
                     promote_to_index_key(col_data, i * col_size, col_size, type_code)
                 };
 
-                let is_upsert = existing_pks
-                    .get(&pk_lo_i)
-                    .is_some_and(|s| s.contains(&pk_hi_i));
-                if is_upsert {
-                    // Resolve who currently holds this unique value.
-                    // No holder → free, ok.
-                    // Holder PK == current PK → same row updating itself, ok.
-                    // Holder PK != current PK → real violation.
-                    match self.fan_out_seek_by_index(target_id, col_idx, key_lo, key_hi) {
-                        Err(e) => return Err(e),
-                        Ok(None) => {}
-                        Ok(Some(ref found)) if found.count > 0 => {
-                            if found.get_pk_lo(0) != pk_lo_i || found.get_pk_hi(0) != pk_hi_i {
-                                let col_name = self.get_col_name(target_id, source_col);
-                                return Err(format!(
-                                    "Unique index violation on column '{}'", col_name));
-                            }
-                        }
-                        Ok(Some(_)) => {}
-                    }
+                if existing_pks.get(&pk_lo_i).is_some_and(|s| s.contains(&pk_hi_i)) {
+                    // UPSERT row: defer unique-value conflict check to the batch below.
+                    upsert_keys.push((key_lo, key_hi, pk_lo_i, pk_hi_i));
                     continue;
                 }
 
@@ -1054,6 +934,32 @@ impl MasterDispatcher {
                 seen.entry(key_lo).or_default().insert(key_hi);
                 check_lo.push(key_lo);
                 check_hi.push(key_hi);
+            }
+
+            // UPSERT rows: one broadcast to find which unique values are already occupied,
+            // then a targeted seek only for the occupied ones to verify the holder is the
+            // same row (self-update is fine; any other holder is a violation).
+            if !upsert_keys.is_empty() {
+                let u_lo: Vec<u64> = upsert_keys.iter().map(|&(lo, _, _, _)| lo).collect();
+                let u_hi: Vec<u64> = upsert_keys.iter().map(|&(_, hi, _, _)| hi).collect();
+                let u_batch = build_check_batch(&idx_schema, &u_lo, &u_hi);
+                let occupied = self.check_index_keys(target_id, col_idx, &u_batch)?;
+                for &(key_lo, key_hi, pk_lo_i, pk_hi_i) in &upsert_keys {
+                    if !occupied.contains(&(key_lo, key_hi)) { continue; }
+                    // Value is occupied; confirm the holder is this same row.
+                    match self.fan_out_seek_by_index(target_id, col_idx, key_lo, key_hi) {
+                        Err(e) => return Err(e),
+                        Ok(None) => {}
+                        Ok(Some(ref found)) if found.count > 0 => {
+                            if found.get_pk_lo(0) != pk_lo_i || found.get_pk_hi(0) != pk_hi_i {
+                                let col_name = self.get_col_name(target_id, source_col);
+                                return Err(format!(
+                                    "Unique index violation on column '{}'", col_name));
+                            }
+                        }
+                        Ok(Some(_)) => {}
+                    }
+                }
             }
 
             if check_lo.is_empty() { continue; }

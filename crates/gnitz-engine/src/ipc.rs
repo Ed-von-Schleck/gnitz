@@ -5,6 +5,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::ipc_sys;
+use crate::sys;
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, type_size, encode_german_string, decode_german_string};
 use crate::storage::{OwnedBatch, wal};
 use crate::util::align8;
@@ -15,7 +17,7 @@ use crate::util::align8;
 
 pub const MAX_WORKERS: usize = 64;
 /// Group header: 32 fixed + MAX_WORKERS*4 offsets + MAX_WORKERS*4 sizes + 32 pad
-pub const GROUP_HEADER_SIZE: usize = 576;
+pub(crate) const GROUP_HEADER_SIZE: usize = 576;
 pub const SAL_MMAP_SIZE: usize = 1 << 30;
 pub const W2M_REGION_SIZE: usize = 1 << 30;
 pub const W2M_HEADER_SIZE: usize = 128;
@@ -471,7 +473,7 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
 ///
 /// # Safety
 /// `ptr` must point to a naturally-aligned u64 in shared memory.
-pub unsafe fn atomic_load_u64(ptr: *const u8) -> u64 {
+pub(crate) unsafe fn atomic_load_u64(ptr: *const u8) -> u64 {
     let atomic = &*(ptr as *const AtomicU64);
     atomic.load(Ordering::Acquire)
 }
@@ -480,7 +482,7 @@ pub unsafe fn atomic_load_u64(ptr: *const u8) -> u64 {
 ///
 /// # Safety
 /// `ptr` must point to a naturally-aligned u64 in shared memory.
-pub unsafe fn atomic_store_u64(ptr: *mut u8, val: u64) {
+pub(crate) unsafe fn atomic_store_u64(ptr: *mut u8, val: u64) {
     let atomic = &*(ptr as *const AtomicU64);
     atomic.store(val, Ordering::Release);
 }
@@ -519,7 +521,7 @@ unsafe fn read_u32_raw(base: *const u8, offset: usize) -> u32 {
 
 /// Result from SAL write.
 #[repr(C)]
-pub struct SalWriteResult {
+pub(crate) struct SalWriteResult {
     /// 0 on success, -1 on error (SAL full).
     pub status: i32,
     /// New write cursor position.
@@ -538,7 +540,7 @@ pub struct SalWriteResult {
 /// # Safety
 /// `sal_ptr` must be a valid mmap pointer of at least `write_cursor + total`
 /// bytes. `worker_ptrs`/`worker_sizes` must be valid arrays of `num_workers`.
-pub unsafe fn sal_write_group(
+pub(crate) unsafe fn sal_write_group(
     sal_ptr: *mut u8,
     write_cursor: u64,
     num_workers: u32,
@@ -616,7 +618,7 @@ pub unsafe fn sal_write_group(
 
 /// Result from reading a SAL group header for a specific worker.
 #[repr(C)]
-pub struct SalReadResult {
+pub(crate) struct SalReadResult {
     /// 0 = has data, 1 = no data for this worker, -1 = no message yet
     pub status: i32,
     /// Bytes to advance read_cursor (8 + align8(payload_size))
@@ -645,7 +647,7 @@ pub struct SalReadResult {
 ///
 /// # Safety
 /// `sal_ptr` must be a valid mmap pointer. `read_cursor` must be within bounds.
-pub unsafe fn sal_read_group_header(
+pub(crate) unsafe fn sal_read_group_header(
     sal_ptr: *const u8,
     read_cursor: u64,
     worker_id: u32,
@@ -720,7 +722,7 @@ pub unsafe fn sal_read_group_header(
 ///
 /// # Safety
 /// `region_ptr` must be a valid mmap pointer of at least `region_size` bytes.
-pub unsafe fn w2m_write(
+pub(crate) unsafe fn w2m_write(
     region_ptr: *mut u8,
     data_ptr: *const u8,
     data_size: u32,
@@ -757,7 +759,7 @@ pub unsafe fn w2m_write(
 ///
 /// # Safety
 /// `region_ptr` must be a valid mmap pointer. `read_cursor` must be valid.
-pub unsafe fn w2m_read(
+pub(crate) unsafe fn w2m_read(
     region_ptr: *const u8,
     read_cursor: u64,
 ) -> (u64, u32, *const u8) {
@@ -772,10 +774,305 @@ pub unsafe fn w2m_read(
 }
 
 // ---------------------------------------------------------------------------
-// FFI exports: wire protocol
+// Channel types: SalWriter, SalReader, W2mWriter, W2mReceiver
 // ---------------------------------------------------------------------------
 
-/// Encode a wire message. Returns heap-allocated buffer.
+/// Master's write side of the SAL.
+pub struct SalWriter {
+    ptr: *mut u8,
+    fd: i32,
+    mmap_size: u64,
+    write_cursor: u64,
+    lsn: u64,
+    epoch: u32,
+    checkpoint_threshold: u64,
+    m2w_efds: Vec<i32>,
+    num_workers: usize,
+}
+
+unsafe impl Send for SalWriter {}
+
+impl SalWriter {
+    pub fn new(ptr: *mut u8, fd: i32, mmap_size: u64, m2w_efds: Vec<i32>) -> Self {
+        let num_workers = m2w_efds.len();
+        let checkpoint_threshold = (mmap_size * 3) >> 2;
+        SalWriter {
+            ptr,
+            fd,
+            mmap_size,
+            write_cursor: 0,
+            lsn: 0,
+            epoch: 0,
+            checkpoint_threshold,
+            m2w_efds,
+            num_workers,
+        }
+    }
+
+    /// Write pre-encoded per-worker wire buffers. Does NOT sync/signal.
+    pub fn write_group(
+        &mut self, target_id: u32, flags: u32, wire_bufs: &[Vec<u8>],
+    ) -> Result<(), String> {
+        let nw = self.num_workers;
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_WORKERS];
+        let mut sizes = [0u32; MAX_WORKERS];
+        for (w, buf) in wire_bufs.iter().enumerate().take(nw) {
+            if !buf.is_empty() {
+                ptrs[w] = buf.as_ptr();
+                sizes[w] = buf.len() as u32;
+            }
+        }
+
+        let lsn = self.lsn;
+        self.lsn += 1;
+
+        let result = unsafe {
+            sal_write_group(
+                self.ptr, self.write_cursor,
+                nw as u32, target_id, lsn, flags, self.epoch,
+                self.mmap_size, ptrs.as_ptr(), sizes.as_ptr(),
+            )
+        };
+        if result.status < 0 {
+            return Err(format!(
+                "SAL write failed (cursor={}, mmap_size={})",
+                self.write_cursor, self.mmap_size
+            ));
+        }
+        self.write_cursor = result.new_cursor;
+        Ok(())
+    }
+
+    /// Write identical data to all workers. Does NOT sync/signal.
+    pub fn write_broadcast(
+        &mut self, target_id: u32, flags: u32, wire_buf: &[u8],
+    ) -> Result<(), String> {
+        let nw = self.num_workers;
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_WORKERS];
+        let mut sizes = [0u32; MAX_WORKERS];
+        for w in 0..nw {
+            ptrs[w] = wire_buf.as_ptr();
+            sizes[w] = wire_buf.len() as u32;
+        }
+
+        let lsn = self.lsn;
+        self.lsn += 1;
+
+        let result = unsafe {
+            sal_write_group(
+                self.ptr, self.write_cursor,
+                nw as u32, target_id, lsn, flags, self.epoch,
+                self.mmap_size, ptrs.as_ptr(), sizes.as_ptr(),
+            )
+        };
+        if result.status < 0 {
+            return Err(format!(
+                "SAL broadcast write failed (cursor={})", self.write_cursor
+            ));
+        }
+        self.write_cursor = result.new_cursor;
+        Ok(())
+    }
+
+    /// fdatasync + eventfd_signal all workers.
+    pub fn sync_and_signal_all(&self) {
+        sys::fdatasync(self.fd);
+        for w in 0..self.num_workers {
+            ipc_sys::eventfd_signal(self.m2w_efds[w]);
+        }
+    }
+
+    /// fdatasync + eventfd_signal one worker.
+    pub fn sync_and_signal_one(&self, worker: usize) {
+        sys::fdatasync(self.fd);
+        ipc_sys::eventfd_signal(self.m2w_efds[worker]);
+    }
+
+    pub fn needs_checkpoint(&self) -> bool {
+        self.write_cursor >= self.checkpoint_threshold
+    }
+
+    /// Reset cursor to 0, increment epoch, atomic-store 0 at SAL base.
+    pub fn checkpoint_reset(&mut self) {
+        self.epoch += 1;
+        self.write_cursor = 0;
+        unsafe { atomic_store_u64(self.ptr, 0); }
+    }
+
+    pub fn reset(&mut self, cursor: u64, epoch: u32) {
+        self.write_cursor = cursor;
+        self.epoch = epoch;
+    }
+
+    pub fn cursor(&self) -> u64 { self.write_cursor }
+    pub fn epoch(&self) -> u32 { self.epoch }
+    pub fn mmap_size(&self) -> u64 { self.mmap_size }
+    pub fn num_workers(&self) -> usize { self.num_workers }
+}
+
+/// A decoded SAL message for a specific worker.
+pub struct SalMessage<'a> {
+    pub lsn: u64,
+    pub flags: u32,
+    pub target_id: u32,
+    pub epoch: u32,
+    /// None = no data for this worker in this group.
+    pub wire_data: Option<&'a [u8]>,
+}
+
+/// Worker + bootstrap read side of the SAL.
+pub struct SalReader {
+    ptr: *const u8,
+    worker_id: u32,
+    mmap_size: usize,
+    m2w_efd: i32,
+}
+
+unsafe impl Send for SalReader {}
+
+impl SalReader {
+    pub fn new(ptr: *const u8, worker_id: u32, mmap_size: usize, m2w_efd: i32) -> Self {
+        SalReader { ptr, worker_id, mmap_size, m2w_efd }
+    }
+
+    /// Read next group at `cursor`. Returns None if no message (payload_size==0).
+    /// Does NOT check epoch — caller decides policy.
+    /// On success returns (message, new_cursor).
+    ///
+    /// # Safety note
+    /// The returned `SalMessage` contains a slice into the SAL mmap region.
+    /// The mmap is process-lifetime, so `'static` is safe as long as the SAL
+    /// is not unmapped while messages are in use (which never happens in
+    /// normal operation).
+    pub fn try_read(&self, cursor: u64) -> Option<(SalMessage<'static>, u64)> {
+        let result = unsafe { sal_read_group_header(self.ptr, cursor, self.worker_id) };
+        if result.advance == 0 {
+            return None;
+        }
+        let new_cursor = cursor + result.advance;
+        let wire_data = if result.status == 0 && result.data_size > 0 && !result.data_ptr.is_null() {
+            Some(unsafe {
+                std::slice::from_raw_parts(result.data_ptr, result.data_size as usize)
+            })
+        } else {
+            None
+        };
+        Some((
+            SalMessage {
+                lsn: result.lsn,
+                flags: result.flags,
+                target_id: result.target_id,
+                epoch: result.epoch,
+                wire_data,
+            },
+            new_cursor,
+        ))
+    }
+
+    /// Wait for master signal, with timeout.
+    pub fn wait(&self, timeout_ms: i32) -> i32 {
+        ipc_sys::eventfd_wait(self.m2w_efd, timeout_ms)
+    }
+}
+
+/// Worker's write side of W2M.
+pub struct W2mWriter {
+    region_ptr: *mut u8,
+    region_size: u64,
+    efd: i32,
+}
+
+unsafe impl Send for W2mWriter {}
+
+impl W2mWriter {
+    pub fn new(region_ptr: *mut u8, region_size: u64, efd: i32) -> Self {
+        W2mWriter { region_ptr, region_size, efd }
+    }
+
+    /// Write wire data to W2M region + signal master.
+    pub fn send(&self, wire: &[u8]) {
+        unsafe {
+            w2m_write(
+                self.region_ptr,
+                wire.as_ptr(),
+                wire.len() as u32,
+                self.region_size,
+            );
+        }
+        ipc_sys::eventfd_signal(self.efd);
+    }
+}
+
+/// Master's read side of W2M.
+pub struct W2mReceiver {
+    region_ptrs: Vec<*mut u8>,
+    efds: Vec<i32>,
+    num_workers: usize,
+}
+
+unsafe impl Send for W2mReceiver {}
+
+impl W2mReceiver {
+    pub fn new(region_ptrs: Vec<*mut u8>, efds: Vec<i32>) -> Self {
+        let num_workers = region_ptrs.len();
+        W2mReceiver { region_ptrs, efds, num_workers }
+    }
+
+    /// Poll for any worker signal (wraps eventfd_wait_any).
+    pub fn poll(&self, timeout_ms: i32) -> i32 {
+        ipc_sys::eventfd_wait_any(&self.efds, timeout_ms)
+    }
+
+    /// Wait for a specific worker signal (wraps eventfd_wait).
+    pub fn wait_one(&self, worker: usize, timeout_ms: i32) -> i32 {
+        ipc_sys::eventfd_wait(self.efds[worker], timeout_ms)
+    }
+
+    /// Read write-cursor of worker (atomic load).
+    pub fn write_cursor(&self, worker: usize) -> u64 {
+        unsafe { atomic_load_u64(self.region_ptrs[worker]) }
+    }
+
+    /// Try to read next decoded message from worker at read_cursor.
+    /// Returns None if no new data. Returns (DecodedWire, new_cursor).
+    pub fn try_read(&self, worker: usize, read_cursor: u64) -> Option<(DecodedWire, u64)> {
+        let wc = self.write_cursor(worker);
+        if read_cursor >= wc {
+            return None;
+        }
+        let (new_rc, data_size, data_ptr) = unsafe {
+            w2m_read(self.region_ptrs[worker], read_cursor)
+        };
+        if data_size == 0 {
+            return None;
+        }
+        let data = unsafe { std::slice::from_raw_parts(data_ptr, data_size as usize) };
+        match decode_wire(data) {
+            Ok(decoded) => Some((decoded, new_rc)),
+            Err(_) => None,
+        }
+    }
+
+    /// Reset all W2M write cursors to W2M_HEADER_SIZE.
+    pub fn reset_all(&self) {
+        for w in 0..self.num_workers {
+            unsafe {
+                atomic_store_u64(self.region_ptrs[w], W2M_HEADER_SIZE as u64);
+            }
+        }
+    }
+
+    /// Reset one worker's W2M write cursor.
+    pub fn reset_one(&self, worker: usize) {
+        unsafe {
+            atomic_store_u64(self.region_ptrs[worker], W2M_HEADER_SIZE as u64);
+        }
+    }
+
+    pub fn num_workers(&self) -> usize { self.num_workers }
+    pub fn efds(&self) -> &[i32] { &self.efds }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
