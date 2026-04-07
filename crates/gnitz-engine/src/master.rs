@@ -39,6 +39,7 @@ pub struct MasterDispatcher {
     async_w2m_rcs: Vec<u64>,
     async_exchange_payloads: HashMap<i64, Vec<Option<OwnedBatch>>>,
     async_exchange_counts: HashMap<i64, usize>,
+    async_exchange_schemas: HashMap<i64, SchemaDescriptor>,
     async_exchange_source_ids: HashMap<i64, i64>,
     async_active: bool,
 }
@@ -66,6 +67,7 @@ impl MasterDispatcher {
             async_w2m_rcs: vec![W2M_HEADER_SIZE as u64; num_workers],
             async_exchange_payloads: HashMap::new(),
             async_exchange_counts: HashMap::new(),
+            async_exchange_schemas: HashMap::new(),
             async_exchange_source_ids: HashMap::new(),
             async_active: false,
         }
@@ -733,6 +735,7 @@ impl MasterDispatcher {
         }
         self.async_exchange_payloads.clear();
         self.async_exchange_counts.clear();
+        self.async_exchange_schemas.clear();
         self.async_exchange_source_ids.clear();
         self.async_active = true;
         Ok(())
@@ -762,17 +765,21 @@ impl MasterDispatcher {
                     let count = self.async_exchange_counts.entry(vid).or_insert(0);
 
                     payloads[w] = decoded.data_batch.map(|b| *b);
+                    if let Some(schema) = decoded.schema {
+                        self.async_exchange_schemas.insert(vid, schema);
+                    }
                     if ex_source_id > 0 {
                         self.async_exchange_source_ids.insert(vid, ex_source_id);
                     }
                     *count += 1;
 
                     if *count == nw {
+                        let ex_schema = self.async_exchange_schemas.remove(&vid);
                         let src_id = self.async_exchange_source_ids.remove(&vid).unwrap_or(0);
                         let payloads_vec = self.async_exchange_payloads.remove(&vid).unwrap();
                         self.async_exchange_counts.remove(&vid);
 
-                        if let Err(e) = self.relay_exchange(vid, payloads_vec, None, src_id, 0) {
+                        if let Err(e) = self.relay_exchange(vid, payloads_vec, ex_schema, src_id, 0) {
                             self.finish_async_tick();
                             return Err(e);
                         }
@@ -981,6 +988,140 @@ impl MasterDispatcher {
             .get(col_idx)
             .cloned()
             .unwrap_or_else(|| "?".to_string())
+    }
+
+    fn get_qualified_name_owned(&mut self, table_id: i64) -> (String, String) {
+        let cat = unsafe { &mut *self.catalog };
+        cat.get_qualified_name(table_id)
+            .map(|(s, t)| (s.to_string(), t.to_string()))
+            .unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // Distributed FK validation
+    // -----------------------------------------------------------------------
+
+    /// INSERT side: for each FK constraint on `target_id`, check that all
+    /// referenced parent PKs exist across workers.
+    pub fn validate_fk_distributed(
+        &mut self, target_id: i64, batch: &OwnedBatch,
+    ) -> Result<(), String> {
+        let cat = unsafe { &mut *self.catalog };
+        let n_fk = cat.get_fk_count(target_id);
+        if n_fk == 0 { return Ok(()); }
+
+        let source_schema = cat.get_schema_desc(target_id)
+            .ok_or_else(|| format!("validate_fk_distributed: no schema for table {}", target_id))?;
+        let pki = source_schema.pk_index as usize;
+
+        for fi in 0..n_fk {
+            let cat = unsafe { &mut *self.catalog };
+            let (fk_col_idx, parent_table_id) = match cat.get_fk_constraint(target_id, fi) {
+                Some(c) => c,
+                None => continue,
+            };
+            let col_type = cat.get_fk_col_type(target_id, fk_col_idx);
+            let parent_schema = cat.get_schema_desc(parent_table_id)
+                .ok_or_else(|| format!("FK parent table {} schema not found", parent_table_id))?;
+
+            let payload_col = if fk_col_idx < pki { fk_col_idx } else { fk_col_idx - 1 };
+            let col_size = source_schema.columns[fk_col_idx].size as usize;
+
+            let mut seen: HashSet<u128> = HashSet::new();
+            let mut lo_list: Vec<u64> = Vec::new();
+            let mut hi_list: Vec<u64> = Vec::new();
+
+            for i in 0..batch.count {
+                if batch.get_weight(i) <= 0 { continue; }
+                let null_word = batch.get_null_word(i);
+                if null_word & (1u64 << payload_col) != 0 { continue; }
+
+                let col_data = &batch.col_data[payload_col];
+                let (fk_lo, fk_hi) = promote_to_index_key(col_data, i * col_size, col_size, col_type);
+                let fk_key = crate::util::make_pk(fk_lo, fk_hi);
+                if seen.insert(fk_key) {
+                    lo_list.push(fk_lo);
+                    hi_list.push(fk_hi);
+                }
+            }
+
+            if lo_list.is_empty() { continue; }
+
+            let check_batch = build_check_batch(&parent_schema, &lo_list, &hi_list);
+            let existing = self.check_pk_existence(parent_table_id, &check_batch)?;
+
+            if existing.len() < lo_list.len() {
+                let (sn, tn) = self.get_qualified_name_owned(target_id);
+                let (tsn, ttn) = self.get_qualified_name_owned(parent_table_id);
+                return Err(format!(
+                    "Foreign Key violation in '{}.{}': value not found in target '{}.{}'",
+                    sn, tn, tsn, ttn
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// DELETE side: for each child table with FK to `target_id`, check that
+    /// no child rows reference the PKs being deleted.
+    pub fn validate_fk_parent_restrict_distributed(
+        &mut self, target_id: i64, batch: &OwnedBatch,
+    ) -> Result<(), String> {
+        let cat = unsafe { &mut *self.catalog };
+        let n_children = cat.get_fk_children_count(target_id);
+        if n_children == 0 { return Ok(()); }
+
+        let mut neg_pks: HashSet<u128> = HashSet::new();
+        for i in 0..batch.count {
+            if batch.get_weight(i) < 0 {
+                neg_pks.insert(batch.get_pk(i));
+            }
+        }
+        if neg_pks.is_empty() { return Ok(()); }
+
+        // UPSERT handling: remove PKs that also appear with positive weight
+        // (retract + insert = UPDATE, not DELETE).
+        for i in 0..batch.count {
+            if batch.get_weight(i) > 0 {
+                neg_pks.remove(&batch.get_pk(i));
+            }
+        }
+        if neg_pks.is_empty() { return Ok(()); }
+
+        let mut lo_list: Vec<u64> = Vec::with_capacity(neg_pks.len());
+        let mut hi_list: Vec<u64> = Vec::with_capacity(neg_pks.len());
+        for &pk in &neg_pks {
+            let (lo, hi) = crate::util::split_pk(pk);
+            lo_list.push(lo);
+            hi_list.push(hi);
+        }
+
+        for ci in 0..n_children {
+            let cat = unsafe { &mut *self.catalog };
+            let (child_tid, fk_col_idx) = match cat.get_fk_child_info(target_id, ci) {
+                Some(info) => info,
+                None => continue,
+            };
+
+            let idx_schema = cat.get_index_schema_by_col(child_tid, fk_col_idx as u32)
+                .ok_or_else(|| format!(
+                    "FK RESTRICT check failed: no index on child table {} col {}",
+                    child_tid, fk_col_idx,
+                ))?;
+
+            let check_batch = build_check_batch(&idx_schema, &lo_list, &hi_list);
+            let found = self.check_index_keys(child_tid, fk_col_idx as u32, &check_batch)?;
+
+            if !found.is_empty() {
+                let (sn, tn) = self.get_qualified_name_owned(target_id);
+                let (csn, ctn) = self.get_qualified_name_owned(child_tid);
+                return Err(format!(
+                    "Foreign Key violation: cannot delete from '{}.{}', row still referenced by '{}.{}'",
+                    sn, tn, csn, ctn,
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

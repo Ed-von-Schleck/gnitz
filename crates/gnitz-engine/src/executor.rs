@@ -176,8 +176,8 @@ impl ServerExecutor {
         if self.has_dispatcher() && target_id >= FIRST_USER_TABLE_ID {
             if let Some(batch) = in_batch {
                 if batch.count > 0 {
-                    self.cat().validate_fk_inline(target_id, &batch)?;
-                    self.cat().validate_fk_parent_restrict(target_id, &batch)?;
+                    self.disp().validate_fk_distributed(target_id, &batch)?;
+                    self.disp().validate_fk_parent_restrict_distributed(target_id, &batch)?;
                     self.cat().validate_unique_indices(target_id, &batch)?;
                     self.disp().validate_unique_distributed(target_id, &batch)?;
                     self.disp().fan_out_push(target_id, &batch)?;
@@ -850,7 +850,11 @@ impl ServerExecutor {
             self.flush_pending_for_tid(transport, target_id, pending);
 
             let batch = decoded.data_batch.unwrap();
-            self.cat().validate_fk_inline(target_id, &batch)?;
+            {
+                let disp = self.disp();
+                disp.validate_fk_distributed(target_id, &batch)?;
+                disp.validate_fk_parent_restrict_distributed(target_id, &batch)?;
+            }
             self.cat().validate_unique_indices(target_id, &batch)?;
             {
                 let disp = self.disp();

@@ -3,9 +3,15 @@
 Run:
     cd crates/gnitz-py && uv run pytest tests/test_fk.py -v --tb=short
 """
+import os
 import random
 import pytest
 import gnitz
+
+_NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
+_NEEDS_MULTI = pytest.mark.skipif(
+    _NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2"
+)
 
 
 def _uid():
@@ -435,3 +441,166 @@ class TestFkSelfReferenceSQL:
                 )
         finally:
             _cleanup(client, sn)
+
+
+# ---------------------------------------------------------------------------
+# Multi-worker FK tests (require GNITZ_WORKERS >= 2)
+# ---------------------------------------------------------------------------
+
+@_NEEDS_MULTI
+class TestFkMultiWorker:
+    """FK validation across multiple workers (distributed IPC path)."""
+
+    def test_fk_insert_valid_multiworker(self, client):
+        """Insert 10+ parent rows with spread PKs, then child rows referencing each."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT NOT NULL PRIMARY KEY,"
+                "  pid BIGINT NOT NULL REFERENCES parent(id)"
+                ")",
+                schema_name=sn,
+            )
+            # Insert parents with spread PKs (different partitions)
+            for i in range(1, 16):
+                client.execute_sql(
+                    f"INSERT INTO parent VALUES ({i * 1000}, {i})",
+                    schema_name=sn,
+                )
+            # Insert children referencing each parent
+            for i in range(1, 16):
+                client.execute_sql(
+                    f"INSERT INTO child VALUES ({i}, {i * 1000})",
+                    schema_name=sn,
+                )
+            # Verify all children exist
+            child_tid = client.resolve_table(sn, "child")[0]
+            rows = [r for r in client.scan(child_tid) if r.weight > 0]
+            assert len(rows) == 15
+        finally:
+            _cleanup(client, sn, "child", "parent")
+
+    def test_fk_insert_violation_multiworker(self, client):
+        """Child references non-existent parent across workers."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT NOT NULL PRIMARY KEY,"
+                "  pid BIGINT NOT NULL REFERENCES parent(id)"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO parent VALUES (1000)", schema_name=sn)
+            # Reference non-existent parent -- must fail
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.execute_sql(
+                    "INSERT INTO child VALUES (1, 9999)",
+                    schema_name=sn,
+                )
+        finally:
+            _cleanup(client, sn, "child", "parent")
+
+    def test_fk_delete_restrict_multiworker(self, client):
+        """Parent + child potentially on different workers, DELETE parent blocked."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT NOT NULL PRIMARY KEY,"
+                "  pid BIGINT NOT NULL REFERENCES parent(id)"
+                ")",
+                schema_name=sn,
+            )
+            # Use spread PKs to hit different partitions
+            client.execute_sql("INSERT INTO parent VALUES (5000, 1)", schema_name=sn)
+            client.execute_sql("INSERT INTO child VALUES (1, 5000)", schema_name=sn)
+
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.execute_sql("DELETE FROM parent WHERE id = 5000", schema_name=sn)
+        finally:
+            _cleanup(client, sn, "child", "parent")
+
+    def test_fk_update_parent_not_blocked_multiworker(self, client):
+        """UPDATE parent payload (not PK) with child referencing it -- succeeds."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT NOT NULL PRIMARY KEY,"
+                "  pid BIGINT NOT NULL REFERENCES parent(id)"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO parent VALUES (3000, 1)", schema_name=sn)
+            client.execute_sql("INSERT INTO child VALUES (1, 3000)", schema_name=sn)
+
+            # UPDATE parent payload -- should NOT be blocked (UPSERT, not DELETE)
+            client.execute_sql(
+                "UPDATE parent SET val = 999 WHERE id = 3000",
+                schema_name=sn,
+            )
+            parent_tid = client.resolve_table(sn, "parent")[0]
+            rows = [r for r in client.scan(parent_tid) if r.weight > 0]
+            found = [r for r in rows if r["id"] == 3000]
+            assert len(found) == 1
+            assert found[0]["val"] == 999
+        finally:
+            _cleanup(client, sn, "child", "parent")
+
+    def test_fk_many_rows_distributed(self, client):
+        """200+ parents + 200+ children, full coverage of worker partitions."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT NOT NULL PRIMARY KEY,"
+                "  pid BIGINT NOT NULL REFERENCES parent(id)"
+                ")",
+                schema_name=sn,
+            )
+            # Insert 250 parents in batches
+            n = 250
+            for start in range(0, n, 50):
+                vals = ", ".join(f"({i})" for i in range(start + 1, min(start + 51, n + 1)))
+                client.execute_sql(f"INSERT INTO parent VALUES {vals}", schema_name=sn)
+
+            # Insert 250 children referencing parents
+            for start in range(0, n, 50):
+                vals = ", ".join(
+                    f"({10000 + i}, {i})"
+                    for i in range(start + 1, min(start + 51, n + 1))
+                )
+                client.execute_sql(f"INSERT INTO child VALUES {vals}", schema_name=sn)
+
+            child_tid = client.resolve_table(sn, "child")[0]
+            rows = [r for r in client.scan(child_tid) if r.weight > 0]
+            assert len(rows) == n
+        finally:
+            _cleanup(client, sn, "child", "parent")

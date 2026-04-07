@@ -1526,7 +1526,7 @@ impl CatalogEngine {
 
     // -- DDL: CREATE/DROP TABLE --------------------------------------------
 
-    pub fn create_table(
+    pub(crate) fn create_table(
         &mut self,
         qualified_name: &str,
         col_defs: &[ColumnDef],
@@ -1625,7 +1625,7 @@ impl CatalogEngine {
 
     // -- DDL: CREATE/DROP VIEW ---------------------------------------------
 
-    pub fn create_view(
+    pub(crate) fn create_view(
         &mut self,
         qualified_name: &str,
         graph: &CircuitGraph,
@@ -2415,6 +2415,25 @@ impl CatalogEngine {
     pub fn get_index_circuit_schema(&self, table_id: i64, idx: usize) -> Option<SchemaDescriptor> {
         self.dag.tables.get(&table_id)
             .and_then(|e| e.index_circuits.get(idx))
+            .map(|ic| ic.index_schema)
+    }
+
+    /// Number of child tables that reference `parent_id` via FK.
+    pub fn get_fk_children_count(&self, parent_id: i64) -> usize {
+        self.fk_parent_map.get(&parent_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Get child info at index: (child_table_id, fk_col_idx).
+    pub fn get_fk_child_info(&self, parent_id: i64, idx: usize) -> Option<(i64, usize)> {
+        self.fk_parent_map.get(&parent_id)
+            .and_then(|v| v.get(idx))
+            .copied()
+    }
+
+    /// Get the index schema for a specific column's FK index on a table.
+    pub fn get_index_schema_by_col(&self, table_id: i64, col_idx: u32) -> Option<SchemaDescriptor> {
+        self.dag.tables.get(&table_id)
+            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == col_idx))
             .map(|ic| ic.index_schema)
     }
 
