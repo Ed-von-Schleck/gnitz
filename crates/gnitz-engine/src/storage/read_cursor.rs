@@ -5,6 +5,7 @@
 
 use std::cmp::Ordering;
 use std::ptr;
+use std::sync::Arc;
 
 use super::columnar::{self, ColumnarSource};
 use crate::schema::SchemaDescriptor;
@@ -18,9 +19,10 @@ use super::shard_reader::MappedShard;
 
 enum CursorSource<'a> {
     Batch(MemBatch<'a>),
-    /// Borrowed pointer to a MappedShard.
-    /// The cursor does NOT own or free this.
-    Shard(*const MappedShard),
+    /// Arc-owned reference to a MappedShard.
+    /// The Arc keeps the MappedShard (and its mmap) alive for the cursor's lifetime,
+    /// eliminating the UAF risk from raw `*const MappedShard` pointers.
+    Shard(Arc<MappedShard>),
 }
 
 impl<'a> CursorSource<'a> {
@@ -28,7 +30,7 @@ impl<'a> CursorSource<'a> {
     fn count(&self) -> usize {
         match self {
             CursorSource::Batch(b) => b.count,
-            CursorSource::Shard(s) => unsafe { (**s).count },
+            CursorSource::Shard(s) => s.count,
         }
     }
 
@@ -36,7 +38,7 @@ impl<'a> CursorSource<'a> {
     fn get_pk(&self, row: usize) -> u128 {
         match self {
             CursorSource::Batch(b) => b.get_pk(row),
-            CursorSource::Shard(s) => unsafe { (**s).get_pk(row) },
+            CursorSource::Shard(s) => s.get_pk(row),
         }
     }
 
@@ -44,7 +46,7 @@ impl<'a> CursorSource<'a> {
     fn get_weight(&self, row: usize) -> i64 {
         match self {
             CursorSource::Batch(b) => b.get_weight(row),
-            CursorSource::Shard(s) => unsafe { (**s).get_weight(row) },
+            CursorSource::Shard(s) => s.get_weight(row),
         }
     }
 
@@ -52,7 +54,7 @@ impl<'a> CursorSource<'a> {
     fn get_null_word(&self, row: usize) -> u64 {
         match self {
             CursorSource::Batch(b) => b.get_null_word(row),
-            CursorSource::Shard(s) => unsafe { (**s).get_null_word(row) },
+            CursorSource::Shard(s) => s.get_null_word(row),
         }
     }
 
@@ -61,7 +63,7 @@ impl<'a> CursorSource<'a> {
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
         match self {
             CursorSource::Batch(b) => b.get_col_ptr(row, payload_col, col_size),
-            CursorSource::Shard(s) => unsafe { (**s).get_col_ptr(row, payload_col, col_size) },
+            CursorSource::Shard(s) => s.get_col_ptr(row, payload_col, col_size),
         }
     }
 
@@ -75,21 +77,21 @@ impl<'a> CursorSource<'a> {
                     b.blob.as_ptr()
                 }
             }
-            CursorSource::Shard(s) => unsafe { (**s).blob_ptr() },
+            CursorSource::Shard(s) => s.blob_ptr(),
         }
     }
 
     fn blob_slice(&self) -> &[u8] {
         match self {
             CursorSource::Batch(b) => b.blob,
-            CursorSource::Shard(s) => unsafe { (**s).blob_slice() },
+            CursorSource::Shard(s) => s.blob_slice(),
         }
     }
 
     fn find_lower_bound(&self, key: u128) -> usize {
         match self {
             CursorSource::Batch(b) => b.find_lower_bound(key),
-            CursorSource::Shard(s) => unsafe { (**s).find_lower_bound(key) },
+            CursorSource::Shard(s) => s.find_lower_bound(key),
         }
     }
 }
@@ -152,8 +154,8 @@ impl<'a> ReadCursorEntry<'a> {
         }
     }
 
-    fn new_shard(shard: *const MappedShard) -> Self {
-        let count = unsafe { (*shard).count };
+    fn new_shard(shard: Arc<MappedShard>) -> Self {
+        let count = shard.count;
         let mut entry = ReadCursorEntry {
             source: CursorSource::Shard(shard),
             position: 0,
@@ -188,7 +190,7 @@ impl<'a> ReadCursorEntry<'a> {
     fn skip_ghosts(&mut self) {
         if self.is_shard {
             if let CursorSource::Shard(s) = &self.source {
-                if !unsafe { (**s).has_ghosts } { return; }
+                if !s.has_ghosts { return; }
             }
         }
         while self.position < self.count {
@@ -413,13 +415,14 @@ impl<'a> ReadCursor<'a> {
         let pk_index = self.schema.pk_index as usize;
 
         match &entry.source {
-            CursorSource::Shard(s) => unsafe {
-                (**s).col_ptr_by_logical(row, col_idx, col_size)
-            },
+            CursorSource::Shard(s) => s.col_ptr_by_logical(row, col_idx, col_size),
             CursorSource::Batch(b) => {
                 if col_idx == pk_index {
-                    // PK column: return pointer into pk_lo buffer
-                    unsafe { b.pk_lo.as_ptr().add(row * 8) }
+                    // PK is accessed via current_key_lo / current_key_hi.
+                    // Returning pk_lo (8 bytes) for a 16-byte PK would silently
+                    // truncate the high half; return null so callers see no data
+                    // rather than corrupt data.
+                    return ptr::null();
                 } else {
                     // Map logical → payload index
                     let payload_idx = if col_idx < pk_index {
@@ -458,13 +461,13 @@ impl<'a> ReadCursor<'a> {
 // Public constructors for FFI
 // ---------------------------------------------------------------------------
 
-/// Build a ReadCursor from batch regions + shard handles.
-pub unsafe fn create_read_cursor<'a>(
+/// Build a ReadCursor from batch regions + shard Arcs.
+pub fn create_read_cursor<'a>(
     batch_regions: &[MemBatch<'a>],
-    shard_ptrs: &[*const MappedShard],
+    shard_arcs: &[Arc<MappedShard>],
     schema: SchemaDescriptor,
 ) -> ReadCursor<'a> {
-    let mut entries = Vec::with_capacity(batch_regions.len() + shard_ptrs.len());
+    let mut entries = Vec::with_capacity(batch_regions.len() + shard_arcs.len());
 
     for batch in batch_regions {
         if batch.count > 0 {
@@ -481,9 +484,9 @@ pub unsafe fn create_read_cursor<'a>(
         }
     }
 
-    for &shard in shard_ptrs {
-        if !shard.is_null() && (*shard).count > 0 {
-            entries.push(ReadCursorEntry::new_shard(shard));
+    for shard in shard_arcs {
+        if shard.count > 0 {
+            entries.push(ReadCursorEntry::new_shard(Arc::clone(shard)));
         }
     }
 
@@ -494,7 +497,6 @@ pub unsafe fn create_read_cursor<'a>(
 // CursorHandle — wraps ReadCursor + optional owned snapshot data
 // ---------------------------------------------------------------------------
 
-use std::sync::Arc;
 use super::memtable::OwnedBatch;
 
 /// FFI-visible cursor handle.  Owns the ReadCursor and, when created from
@@ -518,12 +520,12 @@ impl<'a> CursorHandle<'a> {
         }
     }
 
-    /// Build a CursorHandle from Rust-owned in-memory snapshots (no shard pointers).
+    /// Build a CursorHandle from Rust-owned in-memory snapshots (no shards).
     pub fn from_owned(
         snapshots: &[Arc<OwnedBatch>],
         schema: crate::schema::SchemaDescriptor,
     ) -> CursorHandle<'static> {
-        unsafe { create_cursor_from_snapshots(snapshots, &[], schema) }
+        create_cursor_from_snapshots(snapshots, &[], schema)
     }
 
     /// Mutable access to the inner ReadCursor.
@@ -532,19 +534,17 @@ impl<'a> CursorHandle<'a> {
     }
 }
 
-/// Build a CursorHandle from Rust-owned snapshots + shard handles.
+/// Build a CursorHandle from Rust-owned snapshots + shard Arcs.
 ///
 /// Each snapshot's `Arc<OwnedBatch>` is cloned into the handle to keep the
 /// data alive.  `MemBatch` views are created with transmuted `'static`
 /// lifetime — sound because the `Arc` clones in `_owned_snapshots` guarantee
 /// the data outlives the cursor (dropped after it).
-///
-/// # Safety
-/// `shard_ptrs` must point to valid `MappedShard` objects that outlive the
-/// returned handle.
-pub unsafe fn create_cursor_from_snapshots(
+/// Each `Arc<MappedShard>` is cloned into `CursorSource::Shard`, keeping the
+/// mmap alive for the cursor's lifetime without raw pointer aliasing.
+pub fn create_cursor_from_snapshots(
     snapshots: &[Arc<OwnedBatch>],
-    shard_ptrs: &[*const MappedShard],
+    shard_arcs: &[Arc<MappedShard>],
     schema: SchemaDescriptor,
 ) -> CursorHandle<'static> {
     // Build MemBatch views with 'static lifetime.
@@ -552,10 +552,10 @@ pub unsafe fn create_cursor_from_snapshots(
     let batches: Vec<MemBatch<'static>> = snapshots
         .iter()
         .filter(|s| s.count > 0)
-        .map(|s| std::mem::transmute::<MemBatch<'_>, MemBatch<'static>>(s.as_mem_batch()))
+        .map(|s| unsafe { std::mem::transmute::<MemBatch<'_>, MemBatch<'static>>(s.as_mem_batch()) })
         .collect();
 
-    let cursor = create_read_cursor(&batches, shard_ptrs, schema);
+    let cursor = create_read_cursor(&batches, shard_arcs, schema);
 
     CursorHandle {
         cursor,

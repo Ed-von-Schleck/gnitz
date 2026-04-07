@@ -24,7 +24,7 @@ const MAX_REGIONS: usize = 70; // 4 core + up to 63 payload cols + 1 blob
 enum FoundSource {
     None,
     MemTable,
-    Shard(*const MappedShard, usize),
+    Shard(Arc<MappedShard>, usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +175,18 @@ impl Table {
         if self.memtable.should_flush() {
             self.flush()?;
         }
-        self.memtable.upsert_sorted_batch(batch)?;
+        // Clone before the first attempt so we have the data for a retry on
+        // ERR_CAPACITY, matching the retry logic in upsert_and_maybe_flush.
+        let batch_retry = batch.clone();
+        match self.memtable.upsert_sorted_batch(batch) {
+            Ok(()) => {}
+            Err(code) if code == memtable::ERR_CAPACITY => {
+                // WAL already written; safe to flush and retry with the clone.
+                self.flush()?;
+                self.memtable.upsert_sorted_batch(batch_retry)?;
+            }
+            Err(e) => return Err(e),
+        }
         if self.memtable.should_flush() {
             self.flush()?;
         }
@@ -330,11 +341,9 @@ impl Table {
     pub fn create_cursor(&mut self) -> Result<CursorHandle<'static>, i32> {
         self.compact_if_needed()?;
         let snapshot = self.memtable.get_snapshot();
-        let shard_ptrs = self.shard_index.all_shard_ptrs();
+        let shard_arcs = self.shard_index.all_shard_arcs();
         let snapshots = vec![snapshot];
-        let handle = unsafe {
-            read_cursor::create_cursor_from_snapshots(&snapshots, &shard_ptrs, self.schema)
-        };
+        let handle = read_cursor::create_cursor_from_snapshots(&snapshots, &shard_arcs, self.schema);
         Ok(handle)
     }
 
@@ -343,9 +352,9 @@ impl Table {
         self.memtable.get_snapshot()
     }
 
-    /// Get all shard pointers (for PartitionedTable cursor gathering).
-    pub fn all_shard_ptrs(&self) -> Vec<*const MappedShard> {
-        self.shard_index.all_shard_ptrs()
+    /// Get all shard Arcs (for PartitionedTable cursor gathering).
+    pub fn all_shard_arcs(&self) -> Vec<Arc<MappedShard>> {
+        self.shard_index.all_shard_arcs()
     }
 
     // ------------------------------------------------------------------
@@ -393,11 +402,10 @@ impl Table {
             self.found_source = FoundSource::MemTable;
         } else {
             // Payload-aware shard fallback: check net weight per (PK, payload)
-            for &(ptr, idx) in &shard_candidates {
-                let shard_ref = unsafe { &*ptr };
-                let net_w = self.get_weight_for_row(key, shard_ref, idx);
+            for (arc, idx) in &shard_candidates {
+                let net_w = self.get_weight_for_row(key, arc.as_ref(), *idx);
                 if net_w > 0 {
-                    self.found_source = FoundSource::Shard(ptr, idx);
+                    self.found_source = FoundSource::Shard(Arc::clone(arc), *idx);
                     break;
                 }
             }
@@ -421,18 +429,17 @@ impl Table {
         }
 
         // Shards
-        self.shard_index.find_pk(key, &mut |shard_ptr, start_idx| {
-            let shard = unsafe { &*shard_ptr };
+        self.shard_index.find_pk(key, &mut |shard_arc, start_idx| {
             let mut idx = start_idx;
-            while idx < shard.count {
-                if shard.get_pk(idx) != key {
+            while idx < shard_arc.count {
+                if shard_arc.get_pk(idx) != key {
                     break;
                 }
                 let ord = columnar::compare_rows(
-                    &self.schema, shard, idx, ref_source, ref_row,
+                    &self.schema, shard_arc.as_ref(), idx, ref_source, ref_row,
                 );
                 if ord == Ordering::Equal {
-                    total_w += shard.get_weight(idx);
+                    total_w += shard_arc.get_weight(idx);
                 }
                 idx += 1;
             }
@@ -446,34 +453,25 @@ impl Table {
     // ------------------------------------------------------------------
 
     pub fn found_null_word(&self) -> u64 {
-        match self.found_source {
+        match &self.found_source {
             FoundSource::MemTable => self.memtable.found_null_word(),
-            FoundSource::Shard(ptr, idx) => {
-                let shard = unsafe { &*ptr };
-                shard.get_null_word(idx)
-            }
+            FoundSource::Shard(arc, idx) => arc.get_null_word(*idx),
             FoundSource::None => 0,
         }
     }
 
     pub fn found_col_ptr(&self, payload_col: usize, col_size: usize) -> *const u8 {
-        match self.found_source {
+        match &self.found_source {
             FoundSource::MemTable => self.memtable.found_col_ptr(payload_col, col_size),
-            FoundSource::Shard(ptr, idx) => {
-                let shard = unsafe { &*ptr };
-                shard.get_col_ptr(idx, payload_col, col_size).as_ptr()
-            }
+            FoundSource::Shard(arc, idx) => arc.get_col_ptr(*idx, payload_col, col_size).as_ptr(),
             FoundSource::None => std::ptr::null(),
         }
     }
 
     pub fn found_blob_ptr(&self) -> *const u8 {
-        match self.found_source {
+        match &self.found_source {
             FoundSource::MemTable => self.memtable.found_blob_ptr(),
-            FoundSource::Shard(ptr, _) => {
-                let shard = unsafe { &*ptr };
-                shard.blob_slice().as_ptr()
-            }
+            FoundSource::Shard(arc, _) => arc.blob_slice().as_ptr(),
             FoundSource::None => std::ptr::null(),
         }
     }
@@ -641,19 +639,18 @@ impl Table {
     fn scan_shards_for_pk(
         &self,
         key: u128,
-    ) -> (i64, Vec<(*const MappedShard, usize)>) {
+    ) -> (i64, Vec<(Arc<MappedShard>, usize)>) {
         let mut total_w: i64 = 0;
-        let mut candidates: Vec<(*const MappedShard, usize)> = Vec::new();
+        let mut candidates: Vec<(Arc<MappedShard>, usize)> = Vec::new();
 
-        self.shard_index.find_pk(key, &mut |shard_ptr, start_idx| {
-            let shard = unsafe { &*shard_ptr };
+        self.shard_index.find_pk(key, &mut |shard_arc, start_idx| {
             let mut idx = start_idx;
-            while idx < shard.count {
-                if shard.get_pk(idx) != key {
+            while idx < shard_arc.count {
+                if shard_arc.get_pk(idx) != key {
                     break;
                 }
-                total_w += shard.get_weight(idx);
-                candidates.push((shard_ptr, idx));
+                total_w += shard_arc.get_weight(idx);
+                candidates.push((Arc::clone(&shard_arc), idx));
                 idx += 1;
             }
         });
@@ -702,11 +699,20 @@ fn unlinkat(dirfd: libc::c_int, name: &CStr) -> i32 {
 }
 
 fn erase_stale_shards(dir: &str, table_id: u32) {
-    let prefix = format!("eph_shard_{}_", table_id);
+    // Remove all shard files belonging to this ephemeral table, including
+    // compaction outputs (shard_* and hcomp_*) that may have been left by a
+    // previous process.  All three patterns include table_id, so only this
+    // table's files are touched even when tables share the same directory.
+    let eph_prefix   = format!("eph_shard_{}_",  table_id);
+    let shard_prefix = format!("shard_{}_",      table_id);
+    let hcomp_prefix = format!("hcomp_{}_",      table_id);
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&prefix) {
+                if name.starts_with(&eph_prefix)
+                    || name.starts_with(&shard_prefix)
+                    || name.starts_with(&hcomp_prefix)
+                {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }

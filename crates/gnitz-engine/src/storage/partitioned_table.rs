@@ -141,9 +141,7 @@ impl PartitionedTable {
 
     pub fn create_cursor(&mut self) -> Result<CursorHandle<'static>, i32> {
         if self.tables.is_empty() {
-            return Ok(unsafe {
-                read_cursor::create_cursor_from_snapshots(&[], &[], self.schema)
-            });
+            return Ok(read_cursor::create_cursor_from_snapshots(&[], &[], self.schema));
         }
 
         if self.num_partitions == 1 {
@@ -151,19 +149,17 @@ impl PartitionedTable {
         }
 
         let mut all_snapshots: Vec<Arc<OwnedBatch>> = Vec::new();
-        let mut all_shard_ptrs: Vec<*const MappedShard> = Vec::new();
+        let mut all_shard_arcs: Vec<Arc<MappedShard>> = Vec::new();
 
         for table in &mut self.tables {
             table.compact_if_needed()?;
             all_snapshots.push(table.get_snapshot());
-            all_shard_ptrs.append(&mut table.all_shard_ptrs());
+            all_shard_arcs.append(&mut table.all_shard_arcs());
         }
 
-        let handle = unsafe {
-            read_cursor::create_cursor_from_snapshots(
-                &all_snapshots, &all_shard_ptrs, self.schema,
-            )
-        };
+        let handle = read_cursor::create_cursor_from_snapshots(
+            &all_snapshots, &all_shard_arcs, self.schema,
+        );
         Ok(handle)
     }
 

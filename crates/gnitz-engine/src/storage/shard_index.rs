@@ -2,6 +2,7 @@
 
 use std::ffi::{CStr, CString};
 use std::fs;
+use std::sync::Arc;
 
 use super::compact;
 use crate::schema::SchemaDescriptor;
@@ -23,7 +24,7 @@ fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, i32> {
 }
 
 struct ShardEntry {
-    shard: MappedShard,
+    shard: Arc<MappedShard>,
     filename: String,
     min_lsn: u64,
     max_lsn: u64,
@@ -39,7 +40,7 @@ impl ShardEntry {
         max_lsn: u64,
     ) -> Result<Self, i32> {
         let cpath = CString::new(path).map_err(|_| -1)?;
-        let shard = MappedShard::open(&cpath, schema, false)?;
+        let shard = Arc::new(MappedShard::open(&cpath, schema, false)?);
         // Empty shard: pk_min > pk_max so range checks always fail
         let (pk_min, pk_max) = if shard.count > 0 {
             (shard.get_pk(0), shard.get_pk(shard.count - 1))
@@ -56,14 +57,14 @@ impl ShardEntry {
         })
     }
 
-    fn probe_pk(&self, key: u128) -> Option<(*const MappedShard, usize)> {
+    fn probe_pk(&self, key: u128) -> Option<(Arc<MappedShard>, usize)> {
         if self.pk_min <= key && key <= self.pk_max {
             if self.shard.has_xor8() && !self.shard.xor8_may_contain(key) {
                 return None;
             }
             let row = self.shard.find_row_index(key);
             if row >= 0 {
-                return Some((&self.shard as *const MappedShard, row as usize));
+                return Some((Arc::clone(&self.shard), row as usize));
             }
         }
         None
@@ -207,24 +208,24 @@ impl ShardIndex {
         self.needs_compaction = self.l0.len() > L0_COMPACT_THRESHOLD;
     }
 
-    pub fn all_shard_ptrs(&self) -> Vec<*const MappedShard> {
+    pub fn all_shard_arcs(&self) -> Vec<Arc<MappedShard>> {
         self.all_entries()
-            .map(|e| &e.shard as *const MappedShard)
+            .map(|e| Arc::clone(&e.shard))
             .collect()
     }
 
-    pub fn find_pk(&self, key: u128, visitor: &mut impl FnMut(*const MappedShard, usize)) {
+    pub fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Arc<MappedShard>, usize)) {
         for e in &self.l0 {
-            if let Some((ptr, idx)) = e.probe_pk(key) {
-                visitor(ptr, idx);
+            if let Some((arc, idx)) = e.probe_pk(key) {
+                visitor(arc, idx);
             }
         }
 
         for level in &self.levels {
             if let Some(g_idx) = level.find_guard_idx(key) {
                 for e in &level.guards[g_idx].entries {
-                    if let Some((ptr, idx)) = e.probe_pk(key) {
-                        visitor(ptr, idx);
+                    if let Some((arc, idx)) = e.probe_pk(key) {
+                        visitor(arc, idx);
                     }
                 }
             }

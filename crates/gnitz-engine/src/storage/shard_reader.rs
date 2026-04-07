@@ -320,7 +320,11 @@ impl MappedShard {
         match &self.col_regions[payload_col_idx] {
             RegionView::Raw { offset, size } => {
                 let start = offset + row * col_size;
-                debug_assert!(start + col_size <= offset + size, "get_col_ptr out of bounds");
+                assert!(
+                    start + col_size <= offset + size,
+                    "get_col_ptr out of bounds: row={} payload_col={} col_size={} region_end={}",
+                    row, payload_col_idx, col_size, offset + size,
+                );
                 &self.data()[start..start + col_size]
             }
             RegionView::Constant { value, .. } => &value[..col_size],
@@ -329,7 +333,9 @@ impl MappedShard {
     }
 
     /// Get a raw pointer to a column value, indexed by *logical* column index.
-    /// Returns null for PK column or out-of-range.
+    /// For the PK column, returns a pointer to the pk_lo region (always 8 bytes).
+    /// Callers requiring the full u128 PK must use get_pk_lo / get_pk_hi directly.
+    /// Returns null for out-of-range column indices.
     #[inline]
     pub fn col_ptr_by_logical(&self, row: usize, col_idx: usize, col_size: usize) -> *const u8 {
         if col_idx >= self.col_to_payload.len() {

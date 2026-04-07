@@ -12,7 +12,11 @@ impl BloomFilter {
     pub fn new(expected_n: u32) -> Self {
         let n = (expected_n as usize).max(1);
         let m = n * BITS_PER_KEY;
-        let num_bytes = ((m + 7) >> 3).max(8);
+        let num_bytes_raw = ((m + 7) >> 3).max(8);
+        // Round up to a power-of-two byte count so num_bits is also a power of
+        // two.  ProbeIter::next can then use bitwise AND instead of hardware
+        // division (7 probes per PK check, called on every INSERT/DELETE/UPDATE).
+        let num_bytes = num_bytes_raw.next_power_of_two();
         BloomFilter {
             bits: vec![0u8; num_bytes],
             num_bits: (num_bytes * 8) as u64,
@@ -59,7 +63,9 @@ impl Iterator for ProbeIter {
         if self.i >= NUM_PROBES as u64 {
             return None;
         }
-        let pos = (self.h1.wrapping_add(self.i.wrapping_mul(self.h2))) % self.num_bits;
+        // num_bits is always a power of two (ensured in BloomFilter::new), so
+        // bitwise AND replaces the hardware division that % would emit.
+        let pos = (self.h1.wrapping_add(self.i.wrapping_mul(self.h2))) & (self.num_bits - 1);
         self.i += 1;
         Some(((pos >> 3) as usize, 1u8 << (pos & 7)))
     }
