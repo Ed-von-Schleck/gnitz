@@ -1,6 +1,5 @@
 //! DBSP VM: executes compiled circuit programs entirely in Rust.
 //!
-//! Replaces the RPython interpreter (interpreter.py) dispatch loop.
 //! One FFI call per epoch instead of ~20 (one per opcode).
 
 use crate::schema::SchemaDescriptor;
@@ -95,7 +94,7 @@ pub struct IntegrateAvi {
 
 // ---------------------------------------------------------------------------
 // ProgramBuilder — constructs a Program via incremental add_*() calls.
-// Replaces the RPython serialization bridge (instructions.py + runtime.py).
+// Serialization bridge (replaces instructions.py + runtime.py).
 // ---------------------------------------------------------------------------
 
 pub struct ProgramBuilder {
@@ -602,7 +601,7 @@ pub struct Program {
 }
 
 // SAFETY: Program is only accessed from a single thread (the worker thread
-// that owns the plan).  Raw pointers into RPython-managed ScalarFuncKind,
+// that owns the plan).  Raw pointers into ScalarFuncKind,
 // Table, and ExprProgram are stable for the lifetime of the plan.
 unsafe impl Send for Program {}
 
@@ -616,7 +615,7 @@ pub struct Register {
     pub schema: SchemaDescriptor,
     /// Delta: current batch.  Trace: unused (empty).
     pub batch: OwnedBatch,
-    /// Trace: current cursor.  Borrowed from RPython each epoch.  Delta: None.
+    /// Trace: current cursor.  Borrowed each epoch.  Delta: None.
     pub cursor_ptr: *mut CursorHandle<'static>,
 }
 
@@ -645,13 +644,13 @@ impl RegisterFile {
         RegisterFile { registers }
     }
 
-    /// Clear all delta batches.  Cursor refresh is done by RPython before
+    /// Clear all delta batches.  Cursor refresh is done by the caller before
     /// entering the Rust VM (it knows about Table vs PartitionedTable).
     pub fn clear_delta_batches(&mut self) {
         self.clear_deltas();
     }
 
-    /// Bind cursor handles from RPython into trace registers.
+    /// Bind cursor handles into trace registers.
     /// Each non-null handle is borrowed for the duration of the epoch.
     /// Owned trace registers (listed in `owned_trace_reg_ids`, already set by
     /// `refresh_owned_cursors`) are skipped entirely. External trace registers
@@ -721,10 +720,10 @@ pub fn execute_epoch(
     gnitz_debug!("vm: execute_epoch input_count={} input_reg={} output_reg={} instrs={}",
         input_batch.count, input_reg, output_reg, program.instructions.len());
 
-    // 1. Clear delta batches (cursor refresh already done by RPython)
+    // 1. Clear delta batches (cursor refresh already done by caller)
     regfile.clear_delta_batches();
 
-    // 2. Bind cursors from RPython and input batch
+    // 2. Bind cursors and input batch
     regfile.bind_cursors(cursor_handles, owned_trace_reg_ids);
     regfile.registers[input_reg as usize].batch = input_batch;
 
@@ -955,14 +954,14 @@ pub fn execute_epoch(
                 let gcols = &program.group_cols[*group_cols_offset as usize
                     ..(*group_cols_offset as usize + *group_cols_count as usize)];
 
-                // trace_in cursor (from register file — passed by RPython)
+                // trace_in cursor (from register file)
                 let ti_cursor_ptr: *mut ReadCursor = if *trace_in_reg >= 0 {
                     cursor_mut!(*trace_in_reg).map(|c| c as *mut ReadCursor).unwrap_or(std::ptr::null_mut())
                 } else {
                     std::ptr::null_mut()
                 };
 
-                // trace_out cursor (from register file — passed by RPython)
+                // trace_out cursor (from register file)
                 let to_cursor_ptr: *mut ReadCursor = cursor_mut!(*trace_out_reg)
                     .map(|c| c as *mut ReadCursor)
                     .unwrap_or(std::ptr::null_mut());
@@ -1210,7 +1209,7 @@ mod tests {
     #[test]
     fn test_ghost_property() {
         // Input with opposing weights for same PK: consolidated to zero → None.
-        // We pre-consolidate manually (RPython consolidates before sending to VM).
+        // We pre-consolidate manually (input is consolidated before sending to VM).
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new(2);
@@ -1771,14 +1770,14 @@ mod tests {
     #[test]
     fn test_input_consolidation() {
         // Pre-consolidated input with summed weights passes through correctly.
-        // RPython consolidates before sending to the VM, so we simulate that here.
+        // Input is consolidated before sending to the VM, so we simulate that here.
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new(2);
         builder.add_filter(0, 1, std::ptr::null());
         builder.add_halt();
 
-        // Already-consolidated input: weights were summed by RPython
+        // Already-consolidated input: weights were summed before VM entry
         let input = make_batch(schema, &[(1, 0, 5, 42)]);
 
         let reg_schemas = [schema; 2];
@@ -1923,7 +1922,7 @@ mod tests {
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
         // Agg descriptors: SUM of payload col 1 (schema col 2)
-        // AGG_SUM = 1 (from RPython functions.py)
+        // AGG_SUM = 1 (from functions.py)
         let agg_descs = [AggDescriptor {
             col_idx: 2,  // schema col index
             agg_op: 1,   // AGG_SUM
@@ -2293,7 +2292,7 @@ mod tests {
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
         // Two agg descriptors: COUNT(col=1) and SUM(col=1)
-        // AGG_COUNT = 1, AGG_SUM = 2 (matching RPython opcodes.py and ops.rs)
+        // AGG_COUNT = 1, AGG_SUM = 2 (matching opcodes.py and ops.rs)
         let agg_descs = [
             AggDescriptor {
                 col_idx: 1,           // schema col index for the val column

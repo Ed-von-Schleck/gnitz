@@ -1,6 +1,6 @@
 //! Logging module for gnitz-engine.
 //!
-//! Matches RPython log format: `secs.millis tag LEVEL msg` on stderr (fd 2).
+//! Log format: `secs.millis tag LEVEL msg` on stderr (fd 2).
 //! Log level is set once at startup via FFI. Levels:
 //!   0 = QUIET  (error/warn only)
 //!   1 = NORMAL (+ info)

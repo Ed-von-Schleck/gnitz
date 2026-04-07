@@ -570,6 +570,6 @@ differentiators:
 
 ---
 
-*Validated March 2026 against the original RPython codebase. The codebase
+*Validated March 2026 against the original Python codebase. The codebase
 has since been fully migrated to Rust (April 2026). Core architecture and
 algorithms remain the same.*

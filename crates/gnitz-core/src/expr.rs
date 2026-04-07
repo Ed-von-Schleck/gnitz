@@ -90,7 +90,7 @@ impl ExprBuilder {
     }
 
     /// Full i64 constant. Low 32 bits in arg1, high 32 bits in arg2.
-    /// The RPython VM reconstructs: `r_int64((a2 << 32) | (a1 & 0xFFFFFFFF))`.
+    /// Reconstructed as: `(a2 << 32) | (a1 & 0xFFFFFFFF)`.
     pub fn load_const(&mut self, value: i64) -> u32 {
         let dst = self.alloc_reg();
         self.emit(EXPR_LOAD_CONST, dst, value as u32, (value >> 32) as u32);

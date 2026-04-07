@@ -1,6 +1,6 @@
 //! DagEngine: consolidated plan cache, DAG evaluator, and ingestion pipeline.
 //!
-//! Replaces RPython `program_cache.py` (803 lines), the `evaluate_dag` loop
+//! Consolidates `program_cache.py` (803 lines), the `evaluate_dag` loop
 //! in `executor.py`, and the `ingest_to_family` pipeline in `registry.py`
 //! for user tables.
 //!
@@ -58,7 +58,7 @@ impl StoreHandle {
 // Index circuit entry
 // ---------------------------------------------------------------------------
 
-/// Mirrors RPython `IndexCircuit`: a secondary index on a column.
+/// A secondary index on a column.
 pub struct IndexCircuitEntry {
     pub col_idx: u32,
     pub index_handle: *mut Table,
@@ -70,7 +70,7 @@ pub struct IndexCircuitEntry {
 unsafe impl Send for IndexCircuitEntry {}
 
 // ---------------------------------------------------------------------------
-// Table entry — mirrors RPython EntityRegistry per-table metadata
+// Table entry — per-table metadata in the entity registry
 // ---------------------------------------------------------------------------
 
 pub struct TableEntry {
@@ -91,7 +91,7 @@ pub type CachedPlan = CompileOutput;
 
 /// Handles + schemas for the 6 circuit system tables.
 pub struct SysTableRefs {
-    // Table handles (pointers owned by RPython; DagEngine borrows them).
+    // Table handles (DagEngine borrows them).
     pub nodes: *mut Table,
     pub edges: *mut Table,
     pub sources: *mut Table,

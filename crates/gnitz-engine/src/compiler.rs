@@ -2,7 +2,7 @@
 //! runs annotation + optimization passes, and emits VM instructions.
 //!
 //! Replaces `gnitz/catalog/program_cache.py::compile_from_graph` (~1400 lines
-//! of RPython) with a single FFI entry point.
+//! of Python) with a single entry point.
 
 use std::collections::{HashMap, HashSet};
 
@@ -153,14 +153,14 @@ struct Rewrites {
     folded_maps: HashMap<i32, i32>,      // map_nid → reduce_nid
 }
 
-/// External table handle + schema, passed from RPython.
+/// External table handle + schema.
 pub struct ExternalTable {
     pub table_id: i64,
     pub handle: *mut Table,
     pub schema: SchemaDescriptor,
 }
 
-/// Result of compilation, returned to RPython as a flat i64 buffer.
+/// Result of compilation, returned as a flat i64 buffer.
 ///
 /// All values are stored as i64 for alignment simplicity. Pointers are
 /// cast to i64 (safe on 64-bit). Layout:
@@ -257,7 +257,7 @@ impl CompileResult {
 /// build `CachedPlan` without going through the flat i64 buffer.
 ///
 /// The existing FFI path calls `to_result_buffer()` to produce the legacy
-/// `CompileResult` for RPython callers.
+/// `CompileResult` for FFI callers.
 pub struct CompileOutput {
     pub pre_vm: Box<VmHandle>,
     pub post_vm: Option<Box<VmHandle>>,
@@ -281,7 +281,7 @@ pub struct CompileOutput {
 impl CompileOutput {
     /// Convert to the flat i64[297] buffer expected by the existing FFI path.
     /// **Consumes** self: VmHandle ownership transfers into the buffer as raw
-    /// pointers (freed by RPython via `gnitz_vm_program_free`).
+    /// pointers (freed via `gnitz_vm_program_free`).
     pub fn to_result_buffer(self) -> CompileResult {
         let mut result = CompileResult::empty();
 
@@ -1016,7 +1016,7 @@ fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> Sch
 
 /// Determine the output type for an aggregate function.
 /// Determine the output type for an aggregate function.
-/// Must match RPython `UniversalAccumulator.output_column_type()`:
+/// Must match `UniversalAccumulator.output_column_type()`:
 ///   COUNT, COUNT_NON_NULL → I64
 ///   SUM/MIN/MAX on float → F64
 ///   everything else → I64  (including MIN/MAX on STRING, I32, etc.)

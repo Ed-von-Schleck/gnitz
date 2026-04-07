@@ -2,7 +2,7 @@
 //! Catalog engine: DDL operations, system table management, hook processing,
 //! and entity registry.
 //!
-//! Replaces RPython modules: identifiers.py, index_circuit.py, metadata.py,
+//! Consolidates identifiers.py, index_circuit.py, metadata.py,
 //! loader.py, hooks.py, engine.py, and most of registry.py / system_tables.py.
 //!
 //! The CatalogEngine wraps DagEngine and adds:
@@ -20,7 +20,7 @@ use crate::dag::{DagEngine, StoreHandle};
 use crate::storage::{OwnedBatch, PartitionedTable, partition_arena_size, CursorHandle, Table};
 
 // ---------------------------------------------------------------------------
-// Constants — must match RPython gnitz/catalog/system_tables.py
+// Constants — must match gnitz/catalog/system_tables.py
 // ---------------------------------------------------------------------------
 
 pub const SYSTEM_SCHEMA_ID: i64 = 1;
@@ -55,7 +55,7 @@ const CIRCUIT_SOURCES_TAB_ID: i64 = 13;
 const CIRCUIT_PARAMS_TAB_ID: i64 = 14;
 const CIRCUIT_GROUP_COLS_TAB_ID: i64 = 15;
 
-// Column indices for system tables (matching RPython COL_* constants).
+// Column indices for system tables (matching COL_* constants).
 const TABLETAB_COL_SCHEMA_ID: usize = 1;
 const TABLETAB_COL_NAME: usize = 2;
 const TABLETAB_COL_DIRECTORY: usize = 3;
@@ -172,7 +172,7 @@ fn circuit_group_cols_schema() -> SchemaDescriptor {
 }
 
 // ---------------------------------------------------------------------------
-// PK packing helpers (must match RPython pack_* functions)
+// PK packing helpers
 // ---------------------------------------------------------------------------
 
 fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
@@ -206,7 +206,7 @@ fn pack_gcol_pk(view_id: i64, node_id: i64, col_idx: i64) -> (u64, u64) {
 // ---------------------------------------------------------------------------
 
 /// Lightweight row-by-row builder for constructing OwnedBatch in Rust.
-/// Mirrors the RPython RowBuilder but operates on OwnedBatch directly.
+/// Operates on OwnedBatch directly.
 pub struct BatchBuilder {
     batch: OwnedBatch,
     schema: SchemaDescriptor,
@@ -577,7 +577,7 @@ impl CatalogEngine {
     // -- Open engine (main entry point) ------------------------------------
 
     /// Opens or creates a GnitzDB instance at `base_dir`.
-    /// This is the Rust equivalent of RPython `open_engine()`.
+    /// Equivalent of `open_engine()`.
     pub fn open(base_dir: &str) -> Result<Self, String> {
         ensure_dir(base_dir)?;
 
@@ -2951,7 +2951,7 @@ pub struct ColumnDef {
     pub fk_col_idx: u32,
 }
 
-/// Circuit graph for create_view. Mirrors RPython CircuitGraph.
+/// Circuit graph for create_view.
 pub struct CircuitGraph {
     pub nodes: Vec<(i32, i32)>,           // (node_id, opcode)
     pub edges: Vec<(i32, i32, i32, i32)>, // (edge_id, src, dst, port)
@@ -3012,7 +3012,7 @@ mod tests {
     }
 
     /// Build a passthrough (SELECT *) view graph over source_table_id.
-    /// Mirrors RPython CircuitBuilder: node IDs start at 1, edge IDs start at 1.
+    /// Node IDs start at 1, edge IDs start at 1.
     fn make_passthrough_graph(source_table_id: i64, output_cols: &[(String, u8)]) -> CircuitGraph {
         // Node 1: SCAN_TRACE (opcode 11) — input delta (source table_id=0)
         // Node 2: INTEGRATE (opcode 7) — sink
@@ -3028,7 +3028,7 @@ mod tests {
         }
     }
 
-    // ── RPython test_identifiers ──────────────────────────────────────────
+    // ── test_identifiers ─────────────────────────────────────────────────
 
     #[test]
     fn test_identifiers() {
@@ -3044,12 +3044,12 @@ mod tests {
         // Qualified name parsing
         assert_eq!(parse_qualified_name("orders", "public"), ("public", "orders"));
         assert_eq!(parse_qualified_name("sales.orders", "public"), ("sales", "orders"));
-        // Boundary slicing (RPython test_identifier_boundary_slicing)
+        // Boundary slicing
         assert_eq!(parse_qualified_name(".table", "def"), ("", "table"));
         assert_eq!(parse_qualified_name("schema.", "def"), ("schema", ""));
     }
 
-    // ── RPython test_bootstrap ────────────────────────────────────────────
+    // ── test_bootstrap ───────────────────────────────────────────────────
 
     #[test]
     fn test_bootstrap() {
@@ -3085,7 +3085,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_ddl ──────────────────────────────────────────────────
+    // ── test_ddl ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_ddl() {
@@ -3127,7 +3127,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_edge_cases (26 cases) ────────────────────────────────
+    // ── test_edge_cases (26 cases) ────────────────────────────────────────
 
     #[test]
     fn test_edge_cases() {
@@ -3226,7 +3226,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_unique_pk_metadata ───────────────────────────────────
+    // ── test_unique_pk_metadata ──────────────────────────────────────────
 
     #[test]
     fn test_unique_pk_metadata() {
@@ -3260,7 +3260,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_restart (with data + sequence recovery) ──────────────
+    // ── test_restart (with data + sequence recovery) ─────────────────────
 
     #[test]
     fn test_restart_full() {
@@ -3302,7 +3302,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_index_functional_and_fanout ──────────────────────────
+    // ── test_index_functional_and_fanout ─────────────────────────────────
 
     /// Regression: verify long strings (> 12 bytes, out-of-line blob) survive
     /// restart via copy_cursor_row_to_batch blob offset rewriting.
@@ -3365,7 +3365,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_fk_referential_integrity ─────────────────────────────
+    // ── test_fk_referential_integrity ────────────────────────────────────
 
     #[test]
     fn test_fk_referential_integrity() {
@@ -3413,7 +3413,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_fk_nullability_and_retractions ───────────────────────
+    // ── test_fk_nullability_and_retractions ──────────────────────────────
 
     #[test]
     fn test_fk_nullability_and_retractions() {
@@ -3449,7 +3449,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_fk_protections ───────────────────────────────────────
+    // ── test_fk_protections ──────────────────────────────────────────────
 
     #[test]
     fn test_fk_drop_protections() {
@@ -3479,7 +3479,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_fk_invalid_targets ───────────────────────────────────
+    // ── test_fk_invalid_targets ──────────────────────────────────────────
 
     #[test]
     fn test_fk_invalid_targets() {
@@ -3501,7 +3501,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_fk_self_reference ────────────────────────────────────
+    // ── test_fk_self_reference ───────────────────────────────────────────
 
     #[test]
     fn test_fk_self_reference() {
@@ -3522,7 +3522,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_view_backfill_simple ─────────────────────────────────
+    // ── test_view_backfill_simple ────────────────────────────────────────
 
     #[test]
     fn test_view_backfill_simple() {
@@ -3561,7 +3561,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_view_backfill_on_restart ─────────────────────────────
+    // ── test_view_backfill_on_restart ────────────────────────────────────
 
     #[test]
     fn test_view_backfill_on_restart() {
@@ -3605,7 +3605,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_view_on_view_backfill_on_restart ─────────────────────
+    // ── test_view_on_view_backfill_on_restart ────────────────────────────
 
     #[test]
     fn test_view_on_view_backfill() {
@@ -3661,7 +3661,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── Missing edge cases from RPython test_edge_cases ─────────────────
+    // ── Additional edge cases ───────────────────────────────────────────
 
     #[test]
     fn test_edge_cases_extended() {
@@ -3691,11 +3691,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_enforce_unique_pk ────────────────────────────────────
+    // ── test_enforce_unique_pk ───────────────────────────────────────────
 
     /// Test unique_pk enforcement via a single-partition Table (system table range).
     /// DagEngine.enforce_unique_pk only operates on Single stores; PartitionedTable
-    /// unique_pk is handled by the RPython ingest layer. E2E test_unique_pk.py
+    /// unique_pk is handled by the ingest layer. E2E test_unique_pk.py
     /// covers the full-stack partitioned case.
     #[test]
     fn test_enforce_unique_pk() {
@@ -3755,7 +3755,7 @@ mod tests {
         assert_eq!(scan(&mut table), 3, "Insert+delete cancel: PK=6 not added");
 
         // Note: cross-batch upsert (retract stored row + insert new) requires
-        // the RPython _enforce_unique_pk which emits the stored retraction.
+        // the _enforce_unique_pk path which emits the stored retraction.
         // DagEngine.enforce_unique_pk calls retract_pk but doesn't emit
         // the retraction into the effective batch. Full-stack upsert is
         // tested by E2E test_unique_pk.py (8 tests).
@@ -3764,7 +3764,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_orphaned_metadata_recovery ──────────────────────────
+    // ── test_orphaned_metadata_recovery ─────────────────────────────────
 
     #[test]
     fn test_orphaned_metadata_recovery() {
@@ -3796,7 +3796,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_sequence_gap_recovery ────────────────────────────────
+    // ── test_sequence_gap_recovery ───────────────────────────────────────
 
     #[test]
     fn test_sequence_gap_recovery() {
@@ -3854,7 +3854,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // ── RPython test_fk_referential_integrity (U128 extension) ───────────
+    // ── test_fk_referential_integrity (U128 extension) ──────────────────
 
     #[test]
     fn test_fk_u128() {

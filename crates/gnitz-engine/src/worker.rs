@@ -4,8 +4,8 @@
 //! the master via the SAL (shared append-only log), sends responses via a
 //! per-worker W2M shared region.
 //!
-//! Moving this from RPython to Rust eliminates ~20 FFI round-trips per
-//! message dispatch.
+//! Eliminates ~20 FFI round-trips per message dispatch compared to the
+//! original Python implementation.
 
 use std::collections::HashMap;
 

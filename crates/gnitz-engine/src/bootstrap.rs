@@ -1,4 +1,4 @@
-//! Server bootstrap: single entry point that replaces the RPython main.py bootstrap.
+//! Server bootstrap: single entry point for server startup.
 //!
 //! `server_main()` opens the catalog, allocates shared IPC resources, forks workers,
 //! runs SAL recovery, and enters the executor event loop. After this module,

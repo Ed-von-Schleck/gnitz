@@ -149,7 +149,7 @@ fn compute_prefix(s: &[u8]) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Float bit-reinterpretation (matches RPython float2longlong / longlong2float)
+// Float bit-reinterpretation (matches float2longlong / longlong2float)
 // ---------------------------------------------------------------------------
 
 #[inline]

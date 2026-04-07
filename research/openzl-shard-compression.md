@@ -232,7 +232,7 @@ pk_lo_region.write(&(key as u64).to_le_bytes());         // from native u128
 pk_lo_region.write(&key_lo.to_le_bytes());               // from separate u64
 ```
 
-The original RPython implementation used separate u64 fields (due to `r_uint128` alignment
+The original Python implementation used separate u64 fields (due to `r_uint128` alignment
 issues). The Rust implementation reads and writes the bytes as native u128:
 
 ```rust
