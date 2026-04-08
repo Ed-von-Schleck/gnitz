@@ -8,6 +8,14 @@ pub fn fallocate(fd: i32, length: i64) -> i32 {
     unsafe { libc::fallocate(fd, 0, 0, length as libc::off_t) }
 }
 
+/// Pre-allocate blocks without changing file size (FALLOC_FL_KEEP_SIZE).
+/// Useful for WAL files opened with O_APPEND — allocates extents so future
+/// writes avoid extent-tree allocation overhead on btrfs/XFS.
+/// Returns 0 on success, -1 on error (non-fatal).
+pub fn fallocate_keep_size(fd: i32, length: i64) -> i32 {
+    unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, length as libc::off_t) }
+}
+
 /// fdatasync a file descriptor. Returns 0 on success, -1 on error.
 pub fn fdatasync(fd: i32) -> i32 {
     unsafe { libc::fdatasync(fd) }
@@ -144,6 +152,21 @@ mod tests {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         unsafe { libc::fstat(raw_fd, &mut stat); }
         assert_eq!(stat.st_size, 1048576);
+    }
+
+    #[test]
+    fn test_fallocate_keep_size() {
+        use std::os::unix::io::AsRawFd;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let raw_fd = tmp.as_file().as_raw_fd();
+        let r = fallocate_keep_size(raw_fd, 1048576);
+        // May return -1 on filesystems that don't support KEEP_SIZE (non-fatal)
+        if r == 0 {
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            unsafe { libc::fstat(raw_fd, &mut stat); }
+            assert_eq!(stat.st_size, 0, "KEEP_SIZE must not change st_size");
+            assert!(stat.st_blocks > 0, "blocks should be allocated");
+        }
     }
 
     #[test]

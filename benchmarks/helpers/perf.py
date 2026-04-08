@@ -22,7 +22,7 @@ class PerfRecorder:
         perf_data = self._output_dir / "perf.data"
         try:
             self._proc = subprocess.Popen(
-                ["perf", "record", "-F", "99", "-g",
+                ["perf", "record", "-F", "99", "-g", "-k", "1", "-e", "cycles",
                  "-p", str(self._pid), "-o", str(perf_data)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

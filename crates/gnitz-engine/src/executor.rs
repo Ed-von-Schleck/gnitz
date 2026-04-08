@@ -13,7 +13,7 @@ use gnitz_transport::uring::IoUringRing;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 use crate::schema::SchemaDescriptor;
-use crate::ipc::{self, DecodedWire, STATUS_OK, STATUS_ERROR};
+use crate::ipc::{self, DecodedWire, STATUS_OK, STATUS_ERROR, W2M_HEADER_SIZE};
 use crate::master::MasterDispatcher;
 use crate::storage::OwnedBatch;
 
@@ -89,7 +89,16 @@ impl PendingBatch {
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
 
+/// Per-target_id group metadata used during group commit.
+struct GroupInfo {
+    start: usize,
+    end: usize,
+    target_id: i64,
+    merged_count: usize,
+    error: Option<String>,
+    current_lsn: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +384,18 @@ impl ServerExecutor {
 
         entries.sort_by_key(|e| e.target_id);
 
+        // Phase 0: checkpoint before writing any groups.
+        {
+            let disp = self.disp();
+            if let Err(e) = disp.maybe_checkpoint() {
+                self.send_batch_errors(transport, &entries, 0, entries.len(), &e);
+                return;
+            }
+        }
+
+        // Phase 1: merge batches per target_id, write each group to SAL (no sync).
         let n = entries.len();
+        let mut groups: Vec<GroupInfo> = Vec::new();
         let mut run_start = 0;
 
         while run_start < n {
@@ -386,7 +406,6 @@ impl ServerExecutor {
             }
 
             // Merge batches for same target_id.
-            // Must set schema so string columns get blob relocation.
             let merged_count;
             let merged = {
                 let schema = self.get_schema_desc(target_id);
@@ -403,42 +422,70 @@ impl ServerExecutor {
                 m
             };
 
-            let err_msg;
-            {
+            let error = {
                 let disp = self.disp();
-                match disp.fan_out_ingest(target_id, &merged) {
-                    Ok(()) => { err_msg = String::new(); }
-                    Err(e) => { err_msg = e; }
+                disp.write_ingest(target_id, &merged).err()
+            };
+
+            groups.push(GroupInfo {
+                start: run_start, end: run_end, target_id,
+                merged_count, error, current_lsn: 0,
+            });
+            run_start = run_end;
+        }
+
+        let any_written = groups.iter().any(|g| g.error.is_none());
+
+        // Phase 2: one fdatasync, then collect ACKs sequentially.
+        if any_written {
+            let nw = self.disp().num_workers();
+            self.disp().sync_and_signal_all();
+
+            let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
+            for gi in 0..groups.len() {
+                if groups[gi].error.is_some() { continue; }
+                let disp = self.disp();
+                match disp.collect_acks_at(&mut w2m_rcs) {
+                    Ok(()) => {
+                        self.ingest_lsn += 1;
+                        groups[gi].current_lsn = self.ingest_lsn;
+                        let tid = groups[gi].target_id;
+                        let mc = groups[gi].merged_count;
+                        if !self.tick_rows.contains_key(&tid) {
+                            self.tick_tids.push(tid);
+                            self.tick_rows.insert(tid, 0);
+                        }
+                        self.t_last_push = Some(Instant::now());
+                        *self.tick_rows.get_mut(&tid).unwrap() += mc;
+                    }
+                    Err(e) => {
+                        // Worker error: mark this and all remaining groups failed.
+                        for gj in gi..groups.len() {
+                            if groups[gj].error.is_none() {
+                                groups[gj].error = Some(e.clone());
+                            }
+                        }
+                        break;
+                    }
                 }
             }
 
-            let current_lsn;
-            if err_msg.is_empty() {
-                self.ingest_lsn += 1;
-                current_lsn = self.ingest_lsn;
+            self.disp().reset_w2m_cursors();
+        }
 
-                if !self.tick_rows.contains_key(&target_id) {
-                    self.tick_tids.push(target_id);
-                    self.tick_rows.insert(target_id, 0);
-                }
-                self.t_last_push = Some(Instant::now());
-                *self.tick_rows.get_mut(&target_id).unwrap() += merged_count;
-            } else {
-                current_lsn = 0;
-            }
-
-            // Send responses for each entry in the run
-            let schema = self.get_schema_desc(target_id);
-            let col_names_owned = if err_msg.is_empty() {
-                Some(self.cat().get_column_names(target_id))
+        // Phase 3: send responses.
+        for g in &groups {
+            let schema = self.get_schema_desc(g.target_id);
+            let col_names_owned = if g.error.is_none() {
+                Some(self.cat().get_column_names(g.target_id))
             } else {
                 None
             };
-            for k in run_start..run_end {
+            for k in g.start..g.end {
                 let e = &entries[k];
-                let wire = if !err_msg.is_empty() {
+                let wire = if let Some(ref err_msg) = g.error {
                     ipc::encode_wire(
-                        target_id as u64, e.client_id,
+                        g.target_id as u64, e.client_id,
                         0, 0, 0, 0,
                         STATUS_ERROR, err_msg.as_bytes(),
                         Some(&schema), None, None,
@@ -447,8 +494,8 @@ impl ServerExecutor {
                     let refs: Vec<&[u8]> = col_names_owned.as_ref().unwrap()
                         .iter().map(|s| s.as_bytes()).collect();
                     ipc::encode_wire(
-                        target_id as u64, e.client_id,
-                        0, current_lsn, 0, 0,
+                        g.target_id as u64, e.client_id,
+                        0, g.current_lsn, 0, 0,
                         STATUS_OK, b"",
                         Some(&schema), Some(&refs), None,
                     )
@@ -457,8 +504,29 @@ impl ServerExecutor {
                     transport.close_fd(e.fd);
                 }
             }
+        }
+    }
 
-            run_start = run_end;
+    fn send_batch_errors(
+        &mut self,
+        transport: &mut Transport<IoUringRing>,
+        entries: &[PendingEntry],
+        start: usize,
+        end: usize,
+        err_msg: &str,
+    ) {
+        for k in start..end {
+            let e = &entries[k];
+            let schema = self.get_schema_desc(e.target_id);
+            let wire = ipc::encode_wire(
+                e.target_id as u64, e.client_id,
+                0, 0, 0, 0,
+                STATUS_ERROR, err_msg.as_bytes(),
+                Some(&schema), None, None,
+            );
+            if transport.send(e.fd, wire.as_ptr(), wire.len()) < 0 {
+                transport.close_fd(e.fd);
+            }
         }
     }
 

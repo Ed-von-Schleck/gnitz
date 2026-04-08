@@ -248,7 +248,7 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    fn sync_and_signal_all(&self) {
+    pub(crate) fn sync_and_signal_all(&self) {
         self.sal.sync_and_signal_all();
     }
 
@@ -274,7 +274,7 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    fn reset_w2m_cursors(&self) {
+    pub(crate) fn reset_w2m_cursors(&self) {
         self.w2m.reset_all();
     }
 
@@ -312,6 +312,45 @@ impl MasterDispatcher {
 
     pub fn collect_acks(&mut self) -> Result<(), String> {
         self.wait_all_workers()?;
+        Ok(())
+    }
+
+    pub(crate) fn num_workers(&self) -> usize { self.num_workers }
+
+    /// Write-only ingest: partition batch and write to SAL without
+    /// fdatasync/signal/collect.  Used by group-commit in flush_pending_pushes.
+    pub(crate) fn write_ingest(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+        let (schema, col_names) = self.get_schema_and_names(target_id);
+        let pk_col = &[schema.pk_index];
+        let sub_batches = op_repartition_batch(batch, pk_col, &schema, self.num_workers);
+        let refs: Vec<Option<&OwnedBatch>> = sub_batches.iter()
+            .map(|b| if b.count > 0 { Some(b) } else { None })
+            .collect();
+        self.write_group(target_id, FLAG_PUSH, &refs, &schema, &col_names, 0, 0, 0, -1)
+    }
+
+    /// Collect one ACK per worker using caller-managed read cursors.
+    /// Does NOT reset W2M — the caller must call `reset_w2m_cursors()` after
+    /// all rounds of collection are done.
+    pub(crate) fn collect_acks_at(&mut self, w2m_rcs: &mut [u64]) -> Result<(), String> {
+        let nw = self.num_workers;
+        let mut remaining = nw;
+        let mut collected = vec![false; nw];
+        while remaining > 0 {
+            self.w2m.poll(1000);
+            for w in 0..nw {
+                if collected[w] { continue; }
+                if let Some((decoded, new_rc)) = self.w2m.try_read(w, w2m_rcs[w]) {
+                    w2m_rcs[w] = new_rc;
+                    if decoded.control.status != 0 {
+                        let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+                        return Err(format!("worker {}: {}", w, msg));
+                    }
+                    collected[w] = true;
+                    remaining -= 1;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -394,7 +433,7 @@ impl MasterDispatcher {
     // SAL Checkpoint
     // -----------------------------------------------------------------------
 
-    fn maybe_checkpoint(&mut self) -> Result<(), String> {
+    pub(crate) fn maybe_checkpoint(&mut self) -> Result<(), String> {
         if !self.sal.needs_checkpoint() {
             return Ok(());
         }

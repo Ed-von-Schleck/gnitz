@@ -168,6 +168,10 @@ pub fn validate_and_parse(
     WAL_OK
 }
 
+/// Pre-allocate this many bytes for WAL files to avoid per-write extent
+/// allocation on btrfs.  Also used as the deferred-truncation threshold.
+pub(crate) const WAL_PREALLOC_BYTES: i64 = 4 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct WalWriter {
     fd: c_int,
@@ -190,6 +194,7 @@ impl WalWriter {
                 libc::close(fd);
                 return Err(if e == libc::EWOULDBLOCK { -2 } else { -3 });
             }
+            let _ = crate::sys::fallocate_keep_size(fd, WAL_PREALLOC_BYTES);
             Ok(WalWriter { fd, buf: Vec::new() })
         }
     }
@@ -243,6 +248,7 @@ impl WalWriter {
                 return -3;
             }
         }
+        let _ = crate::sys::fallocate_keep_size(self.fd, WAL_PREALLOC_BYTES);
         0
     }
 }

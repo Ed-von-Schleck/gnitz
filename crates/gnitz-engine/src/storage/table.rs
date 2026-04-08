@@ -13,7 +13,7 @@ use super::memtable::{self, MemTable, OwnedBatch};
 use super::read_cursor::{self, CursorHandle};
 use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
-use super::wal::{WalReader, WalWriter};
+use super::wal::{self, WalReader, WalWriter, WAL_PREALLOC_BYTES};
 
 const MAX_REGIONS: usize = 70; // 4 core + up to 63 payload cols + 1 blob
 
@@ -45,6 +45,7 @@ pub struct Table {
 
     flush_seq: u32,
     pub current_lsn: u64,
+    wal_bytes_since_truncate: u64,
 
     found_source: FoundSource,
 }
@@ -92,6 +93,7 @@ impl Table {
             manifest_path: None,
             flush_seq: 0,
             current_lsn: 1,
+            wal_bytes_since_truncate: 0,
             found_source: FoundSource::None,
         };
 
@@ -162,6 +164,7 @@ impl Table {
             let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
             let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
             let blob_size = *sizes.last().unwrap_or(&0) as u64;
+            self.wal_bytes_since_truncate += wal::block_size(ptrs.len(), &sizes) as u64;
             let rc = wal.append_batch(
                 self.current_lsn, self.table_id, batch.count as u32,
                 &ptrs, &sizes, blob_size,
@@ -201,6 +204,7 @@ impl Table {
         if let Some(ref mut wal) = self.wal_writer {
             let blob_idx = 4 + num_payload_cols;
             let blob_size = if blob_idx < sizes.len() { sizes[blob_idx] as u64 } else { 0 };
+            self.wal_bytes_since_truncate += wal::block_size(ptrs.len(), sizes) as u64;
             let rc = wal.append_batch(
                 self.current_lsn, self.table_id, count, ptrs, sizes, blob_size,
             );
@@ -315,8 +319,11 @@ impl Table {
             if unsafe { libc::fsync(self.dirfd) } < 0 {
                 return Err(-3);
             }
-            if let Some(ref mut wal) = self.wal_writer {
-                wal.truncate();
+            if self.wal_bytes_since_truncate >= WAL_PREALLOC_BYTES as u64 {
+                if let Some(ref mut wal) = self.wal_writer {
+                    wal.truncate();
+                }
+                self.wal_bytes_since_truncate = 0;
             }
         }
 
@@ -558,6 +565,11 @@ impl Table {
         }
 
         // reader dropped here (closes mmap + fd)
+        // Truncate WAL after recovery to start clean; this also re-pre-allocates.
+        if let Some(ref mut wal) = self.wal_writer {
+            wal.truncate();
+        }
+        self.wal_bytes_since_truncate = 0;
         Ok(())
     }
 
