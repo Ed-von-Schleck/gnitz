@@ -38,7 +38,7 @@ pub struct SchemaDescriptor {
 }
 
 impl SchemaDescriptor {
-    pub fn minimal_u64() -> Self {
+    pub const fn minimal_u64() -> Self {
         let mut columns = [SchemaColumn::new(0, 0); 64];
         columns[0] = SchemaColumn::new(type_code::U64, 0);
         SchemaDescriptor { num_columns: 1, pk_index: 0, columns }

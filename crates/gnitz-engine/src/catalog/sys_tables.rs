@@ -101,14 +101,16 @@ pub(super) const fn zero_col() -> SchemaColumn {
     SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }
 }
 
-pub(super) fn make_schema(cols: &[SchemaColumn], pk_index: u32) -> SchemaDescriptor {
+pub(super) const fn make_schema(cols: &[SchemaColumn], pk_index: u32) -> SchemaDescriptor {
     let mut sd = SchemaDescriptor {
         num_columns: cols.len() as u32,
         pk_index,
         columns: [zero_col(); 64],
     };
-    for (i, c) in cols.iter().enumerate() {
-        sd.columns[i] = *c;
+    let mut i = 0;
+    while i < cols.len() {
+        sd.columns[i] = cols[i];
+        i += 1;
     }
     sd
 }
@@ -117,42 +119,56 @@ pub(super) fn make_schema(cols: &[SchemaColumn], pk_index: u32) -> SchemaDescrip
 // System table schema definitions
 // ---------------------------------------------------------------------------
 
-pub(super) fn schema_tab_schema() -> SchemaDescriptor {
+pub(super) const fn schema_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), str_col()], 0)
 }
-pub(super) fn table_tab_schema() -> SchemaDescriptor {
+pub(super) const fn table_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), u64_col(), str_col(), str_col(), u64_col(), u64_col(), u64_col()], 0)
 }
-pub(super) fn view_tab_schema() -> SchemaDescriptor {
+pub(super) const fn view_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), u64_col(), str_col(), str_col(), str_col(), u64_col()], 0)
 }
-pub(super) fn col_tab_schema() -> SchemaDescriptor {
+pub(super) const fn col_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), u64_col(), u64_col(), u64_col(), str_col(), u64_col(), u64_col(), u64_col(), u64_col()], 0)
 }
-pub(super) fn idx_tab_schema() -> SchemaDescriptor {
+pub(super) const fn idx_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), u64_col(), u64_col(), u64_col(), str_col(), u64_col(), str_col()], 0)
 }
-pub(super) fn dep_tab_schema() -> SchemaDescriptor {
+pub(super) const fn dep_tab_schema() -> SchemaDescriptor {
     make_schema(&[u128_col(), u64_col(), u64_col(), u64_col()], 0)
 }
-pub(super) fn seq_tab_schema() -> SchemaDescriptor {
+pub(super) const fn seq_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), u64_col()], 0)
 }
-pub(super) fn circuit_nodes_schema() -> SchemaDescriptor {
+pub(super) const fn circuit_nodes_schema() -> SchemaDescriptor {
     make_schema(&[u128_col(), u64_col()], 0)
 }
-pub(super) fn circuit_edges_schema() -> SchemaDescriptor {
+pub(super) const fn circuit_edges_schema() -> SchemaDescriptor {
     make_schema(&[u128_col(), u64_col(), u64_col(), u64_col()], 0)
 }
-pub(super) fn circuit_sources_schema() -> SchemaDescriptor {
+pub(super) const fn circuit_sources_schema() -> SchemaDescriptor {
     make_schema(&[u128_col(), u64_col()], 0)
 }
-pub(super) fn circuit_params_schema() -> SchemaDescriptor {
+pub(super) const fn circuit_params_schema() -> SchemaDescriptor {
     make_schema(&[u128_col(), u64_col(), str_col_nullable()], 0)
 }
-pub(super) fn circuit_group_cols_schema() -> SchemaDescriptor {
+pub(super) const fn circuit_group_cols_schema() -> SchemaDescriptor {
     make_schema(&[u128_col(), u64_col()], 0)
 }
+
+// Pre-computed statics — initialised once at program start, never reconstructed.
+static S_SCHEMA_TAB:        SchemaDescriptor = schema_tab_schema();
+static S_TABLE_TAB:         SchemaDescriptor = table_tab_schema();
+static S_VIEW_TAB:          SchemaDescriptor = view_tab_schema();
+static S_COL_TAB:           SchemaDescriptor = col_tab_schema();
+static S_IDX_TAB:           SchemaDescriptor = idx_tab_schema();
+static S_DEP_TAB:           SchemaDescriptor = dep_tab_schema();
+static S_SEQ_TAB:           SchemaDescriptor = seq_tab_schema();
+static S_CIRCUIT_NODES:     SchemaDescriptor = circuit_nodes_schema();
+static S_CIRCUIT_EDGES:     SchemaDescriptor = circuit_edges_schema();
+static S_CIRCUIT_SOURCES:   SchemaDescriptor = circuit_sources_schema();
+static S_CIRCUIT_PARAMS:    SchemaDescriptor = circuit_params_schema();
+static S_CIRCUIT_GROUP_COLS: SchemaDescriptor = circuit_group_cols_schema();
 
 // ---------------------------------------------------------------------------
 // PK packing helpers
@@ -211,18 +227,18 @@ pub(super) const SYS_TAB_INFOS: &[SysTabInfo] = &[
 
 pub(super) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
     match id {
-        SCHEMA_TAB_ID => schema_tab_schema(),
-        TABLE_TAB_ID => table_tab_schema(),
-        VIEW_TAB_ID => view_tab_schema(),
-        COL_TAB_ID => col_tab_schema(),
-        IDX_TAB_ID => idx_tab_schema(),
-        DEP_TAB_ID => dep_tab_schema(),
-        SEQ_TAB_ID => seq_tab_schema(),
-        CIRCUIT_NODES_TAB_ID => circuit_nodes_schema(),
-        CIRCUIT_EDGES_TAB_ID => circuit_edges_schema(),
-        CIRCUIT_SOURCES_TAB_ID => circuit_sources_schema(),
-        CIRCUIT_PARAMS_TAB_ID => circuit_params_schema(),
-        CIRCUIT_GROUP_COLS_TAB_ID => circuit_group_cols_schema(),
+        SCHEMA_TAB_ID             => S_SCHEMA_TAB,
+        TABLE_TAB_ID              => S_TABLE_TAB,
+        VIEW_TAB_ID               => S_VIEW_TAB,
+        COL_TAB_ID                => S_COL_TAB,
+        IDX_TAB_ID                => S_IDX_TAB,
+        DEP_TAB_ID                => S_DEP_TAB,
+        SEQ_TAB_ID                => S_SEQ_TAB,
+        CIRCUIT_NODES_TAB_ID      => S_CIRCUIT_NODES,
+        CIRCUIT_EDGES_TAB_ID      => S_CIRCUIT_EDGES,
+        CIRCUIT_SOURCES_TAB_ID    => S_CIRCUIT_SOURCES,
+        CIRCUIT_PARAMS_TAB_ID     => S_CIRCUIT_PARAMS,
+        CIRCUIT_GROUP_COLS_TAB_ID => S_CIRCUIT_GROUP_COLS,
         _ => unreachable!("Unknown system table ID: {}", id),
     }
 }
