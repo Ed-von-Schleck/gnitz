@@ -293,6 +293,9 @@ pub fn server_main(
         let catalog = unsafe { &mut *catalog_ptr };
         recover_system_tables_from_sal(sal_ptr as *const u8, catalog);
         catalog.flush_all_system_tables();
+        // SAL broadcast now provides durability — drop per-table WAL
+        // writers to eliminate their per-ingest fdatasync overhead.
+        catalog.disable_system_table_wal();
     }
 
     // --- W2M regions (memfd-backed, one per worker→master) ---

@@ -67,21 +67,35 @@ impl WorkerExchangeHandler {
         w2m_writer.send(&wire);
 
         // Blocking loop: wait for exchange relay (FLAG_EXCHANGE_RELAY) from master.
+        // Drain all available entries before re-waiting so that interleaved
+        // DDL broadcasts don't stall the exchange (each broadcast consumes
+        // the eventfd signal, and re-waiting would block for up to 30 s).
         loop {
             sal_reader.wait(30000);
 
-            let (msg, new_cursor) = match sal_reader.try_read(*read_cursor) {
-                Some(v) => v,
-                None => continue,
-            };
-            if msg.epoch != expected_epoch {
-                continue;
-            }
-            *read_cursor = new_cursor;
+            loop {
+                let (msg, new_cursor) = match sal_reader.try_read(*read_cursor) {
+                    Some(v) => v,
+                    None => break, // no more entries — back to outer wait
+                };
+                if msg.epoch != expected_epoch {
+                    break;
+                }
+                *read_cursor = new_cursor;
 
-            if msg.flags != FLAG_EXCHANGE_RELAY {
-                // Not an exchange relay. Defer DDL_SYNC; discard others
-                // (only DDL_SYNC can be interleaved during a sync tick).
+                if msg.flags == FLAG_EXCHANGE_RELAY {
+                    if let Some(data) = msg.wire_data {
+                        if let Ok(decoded) = ipc::decode_wire(data) {
+                            if let Some(batch_box) = decoded.data_batch {
+                                return *batch_box;
+                            }
+                        }
+                    }
+                    let empty_schema = schema.unwrap_or(SchemaDescriptor::default());
+                    return OwnedBatch::with_schema(empty_schema, 0);
+                }
+
+                // Not an exchange relay. Defer DDL_SYNC; discard others.
                 if msg.flags & FLAG_DDL_SYNC != 0 {
                     if let Some(data) = msg.wire_data {
                         if let Ok(decoded) = ipc::decode_wire(data) {
@@ -94,19 +108,7 @@ impl WorkerExchangeHandler {
                         }
                     }
                 }
-                continue;
             }
-
-            if let Some(data) = msg.wire_data {
-                if let Ok(decoded) = ipc::decode_wire(data) {
-                    if let Some(batch_box) = decoded.data_batch {
-                        return *batch_box;
-                    }
-                }
-            }
-
-            let empty_schema = schema.unwrap_or(SchemaDescriptor::default());
-            return OwnedBatch::with_schema(empty_schema, 0);
         }
     }
 }

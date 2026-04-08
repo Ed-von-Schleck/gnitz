@@ -2537,6 +2537,17 @@ impl CatalogEngine {
 
     // -- Close engine ------------------------------------------------------
 
+    /// Disable per-table WAL for system tables. In multi-worker mode the SAL
+    /// broadcast provides durability; dropping WAL writers eliminates their
+    /// per-ingest fdatasync. Call after SAL recovery, before normal operation.
+    pub fn disable_system_table_wal(&mut self) {
+        for info in SYS_TAB_INFOS {
+            if let Some(table) = self.sys_table_mut(info.id) {
+                table.set_has_wal(false);
+            }
+        }
+    }
+
     /// Flush all system tables (memtable → shard). Called at checkpoint and close.
     pub fn flush_all_system_tables(&mut self) {
         for info in SYS_TAB_INFOS {
