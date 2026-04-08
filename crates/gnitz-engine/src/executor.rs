@@ -203,11 +203,9 @@ impl ServerExecutor {
                     // Transfer ownership
                     self.cat().push_and_evaluate(target_id, *batch)?;
                 } else {
-                    // System table: ingest + flush + DAG
-                    let delta = batch.clone_batch();
-                    self.cat().ingest_to_family(target_id, delta)?;
+                    // System table: ingest (borrow) + flush + DAG (move)
+                    self.cat().ingest_to_family(target_id, &*batch)?;
                     self.cat().flush_family(target_id)?;
-                    // evaluate_dag takes ownership of the delta
                     let dag = self.cat().get_dag_ptr();
                     unsafe { &mut *dag }.evaluate_dag(target_id, *batch);
                 }
@@ -860,8 +858,7 @@ impl ServerExecutor {
                 let disp = self.disp();
                 disp.validate_unique_distributed(target_id, &batch)?;
             }
-            let cloned = batch.clone_batch();
-            pending.add(fd, client_id, target_id, cloned);
+            pending.add(fd, client_id, target_id, *batch);
             return Ok(());
         }
 

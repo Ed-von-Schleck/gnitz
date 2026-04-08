@@ -865,6 +865,58 @@ impl DagEngine {
         self.ingest_returning_effective(table_id, batch).0
     }
 
+    /// Ingest a borrowed batch (no clone) for the common non-unique-PK path.
+    /// For unique_pk tables, falls back to cloning + `ingest_returning_effective`.
+    pub fn ingest_by_ref(&mut self, table_id: i64, batch: &OwnedBatch) -> i32 {
+        let entry = match self.tables.get(&table_id) {
+            Some(e) => e,
+            None => return -1,
+        };
+
+        if entry.unique_pk {
+            return self.ingest_to_family(table_id, batch.clone_batch());
+        }
+
+        if batch.count == 0 {
+            return 0;
+        }
+
+        let schema = entry.schema;
+
+        // Stage 2: ingest into store
+        let npc = batch.col_data.len();
+        let (ptrs, sizes) = batch.to_region_ptrs();
+        let entry = self.tables.get_mut(&table_id).unwrap();
+        match &mut entry.handle {
+            StoreHandle::Single(t) => {
+                let _ = t.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
+            }
+            StoreHandle::Borrowed(ptr) => {
+                let table = unsafe { &mut **ptr };
+                let _ = table.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
+            }
+            StoreHandle::Partitioned(pt) => {
+                let _ = pt.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
+            }
+        }
+
+        // Stage 3: index projection
+        for ic in &mut entry.index_circuits {
+            let idx_batch = Self::batch_project_index(
+                batch, ic.col_idx, &schema, &ic.index_schema,
+            );
+            if idx_batch.count > 0 {
+                let idx_npc = idx_batch.col_data.len();
+                let (idx_ptrs, idx_sizes) = idx_batch.to_region_ptrs();
+                let _ = ic.index_table.ingest_batch_from_regions(
+                    &idx_ptrs, &idx_sizes, idx_batch.count as u32, idx_npc,
+                );
+            }
+        }
+
+        0
+    }
+
     /// Ingest a batch and return the effective batch (after unique_pk enforcement).
     /// The effective batch is what downstream views need to see.
     /// Returns (rc, Option<OwnedBatch>).
@@ -990,6 +1042,7 @@ impl DagEngine {
                 batch: delta.clone_batch(),
             });
         }
+        crate::storage::batch_pool::recycle(delta);
 
         // Sort descending by depth (shallowest at tail for O(1) pop)
         pending.sort_by(|a, b| b.depth.cmp(&a.depth));
@@ -1007,6 +1060,7 @@ impl DagEngine {
 
             // Check table still exists (may have been dropped)
             if !self.tables.contains_key(&view_id) {
+                crate::storage::batch_pool::recycle(input);
                 continue;
             }
 
@@ -1017,11 +1071,12 @@ impl DagEngine {
             };
 
             if out_delta.count == 0 {
+                crate::storage::batch_pool::recycle(out_delta);
                 continue;
             }
 
-            // Ingest into view store
-            self.ingest_to_family(view_id, out_delta.clone_batch());
+            // Ingest into view store (borrow — no clone)
+            self.ingest_by_ref(view_id, &out_delta);
             // Flush
             let _ = self.flush(view_id);
 
@@ -1065,6 +1120,7 @@ impl DagEngine {
                     }
                 }
             }
+            crate::storage::batch_pool::recycle(out_delta);
         }
 
         0
@@ -1121,6 +1177,7 @@ impl DagEngine {
                 batch: delta.clone_batch(),
             });
         }
+        crate::storage::batch_pool::recycle(delta);
 
         pending.sort_by(|a, b| b.depth.cmp(&a.depth));
         for (i, pe) in pending.iter().enumerate() {
@@ -1134,6 +1191,7 @@ impl DagEngine {
             pending_pos.remove(&(view_id, src_id));
 
             if !self.tables.contains_key(&view_id) {
+                crate::storage::batch_pool::recycle(input);
                 continue;
             }
 
@@ -1192,7 +1250,7 @@ impl DagEngine {
             let has_output = out_delta.as_ref().map(|b| b.count > 0).unwrap_or(false);
             if has_output {
                 let out = out_delta.as_ref().unwrap();
-                self.ingest_to_family(view_id, out.clone_batch());
+                self.ingest_by_ref(view_id, out);
                 let _ = self.flush(view_id);
             }
 
@@ -1242,6 +1300,9 @@ impl DagEngine {
                         pending_pos.insert((pe.view_id, pe.source_id), i);
                     }
                 }
+            }
+            if let Some(batch) = out_delta {
+                crate::storage::batch_pool::recycle(batch);
             }
         }
 

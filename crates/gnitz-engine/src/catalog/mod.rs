@@ -2085,7 +2085,7 @@ impl CatalogEngine {
     /// Ingest a batch into a table family (unique_pk + store + index projection + hooks).
     /// For system tables: fires hooks after ingestion.
     /// For user tables: delegates to DagEngine::ingest_to_family.
-    pub fn ingest_to_family(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
+    pub fn ingest_to_family(&mut self, table_id: i64, batch: &OwnedBatch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
             // System table: ingest into owned Table, then fire hooks.
             let schema = sys_tab_schema(table_id);
@@ -2104,15 +2104,15 @@ impl CatalogEngine {
                 CIRCUIT_GROUP_COLS_TAB_ID => &mut self.sys_circuit_group_cols,
                 _ => return Err(format!("Unknown system table_id {}", table_id)),
             };
-            // Clone batch before ingest (hooks need to read it after table borrows it)
+            // Clone batch for hooks (hooks need to read it after table borrows it)
             let mut batch_for_hooks = batch.clone();
             batch_for_hooks.schema = Some(schema);
-            ingest_batch_into(table, &batch);
+            ingest_batch_into(table, batch);
             self.fire_hooks(table_id, &batch_for_hooks)?;
             Ok(())
         } else {
             // User table: DagEngine handles unique_pk, store ingest, index projection.
-            let rc = self.dag.ingest_to_family(table_id, batch);
+            let rc = self.dag.ingest_by_ref(table_id, batch);
             if rc < 0 {
                 Err(format!("ingest_to_family failed for table_id={} rc={}", table_id, rc))
             } else {

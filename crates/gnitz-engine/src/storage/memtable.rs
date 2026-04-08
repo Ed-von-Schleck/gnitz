@@ -86,6 +86,9 @@ pub struct OwnedBatch {
 impl OwnedBatch {
     /// Create an empty batch with the given number of payload columns.
     pub fn empty(num_payload_cols: usize) -> Self {
+        if let Some(batch) = super::batch_pool::acquire(num_payload_cols) {
+            return batch;
+        }
         OwnedBatch {
             pk_lo: Vec::new(),
             pk_hi: Vec::new(),
@@ -105,6 +108,32 @@ impl OwnedBatch {
         let npc = schema.num_columns as usize - 1;
         let pk_index = schema.pk_index as usize;
         let cap = initial_capacity.max(1);
+        if let Some(mut batch) = super::batch_pool::acquire(npc) {
+            batch.schema = Some(schema);
+            // Ensure each buffer has at least the requested capacity.
+            if batch.pk_lo.capacity() < cap * 8 {
+                batch.pk_lo.reserve(cap * 8);
+            }
+            if batch.pk_hi.capacity() < cap * 8 {
+                batch.pk_hi.reserve(cap * 8);
+            }
+            if batch.weight.capacity() < cap * 8 {
+                batch.weight.reserve(cap * 8);
+            }
+            if batch.null_bmp.capacity() < cap * 8 {
+                batch.null_bmp.reserve(cap * 8);
+            }
+            let mut pi = 0;
+            for ci in 0..schema.num_columns as usize {
+                if ci == pk_index { continue; }
+                let cs = schema.columns[ci].size as usize;
+                if batch.col_data[pi].capacity() < cap * cs {
+                    batch.col_data[pi].reserve(cap * cs);
+                }
+                pi += 1;
+            }
+            return batch;
+        }
         let mut col_data = Vec::with_capacity(npc);
         for ci in 0..schema.num_columns as usize {
             if ci == pk_index { continue; }
@@ -140,6 +169,31 @@ impl OwnedBatch {
     ) -> Self {
         if count == 0 {
             return Self::empty(num_payload_cols);
+        }
+
+        // Copy a region into an existing Vec, reusing its capacity.
+        let copy_into = |buf: &mut Vec<u8>, idx: usize| {
+            let sz = sizes[idx] as usize;
+            if sz == 0 || ptrs[idx].is_null() {
+                return;
+            }
+            buf.resize(sz, 0);
+            std::ptr::copy_nonoverlapping(ptrs[idx], buf.as_mut_ptr(), sz);
+        };
+
+        if let Some(mut batch) = super::batch_pool::acquire(num_payload_cols) {
+            copy_into(&mut batch.pk_lo, 0);
+            copy_into(&mut batch.pk_hi, 1);
+            copy_into(&mut batch.weight, 2);
+            copy_into(&mut batch.null_bmp, 3);
+            for ci in 0..num_payload_cols {
+                copy_into(&mut batch.col_data[ci], 4 + ci);
+            }
+            copy_into(&mut batch.blob, 4 + num_payload_cols);
+            batch.count = count;
+            batch.sorted = false;
+            batch.consolidated = false;
+            return batch;
         }
 
         let copy_region = |idx: usize| -> Vec<u8> {
@@ -799,6 +853,11 @@ impl ColumnarSource for OwnedBatch {
 
 /// Allocate output buffers, run a merge/copy operation via DirectWriter,
 /// truncate to actual size, and return the result as an OwnedBatch.
+///
+/// Hot path: acquires a pooled batch and reuses its existing Vec capacity
+/// (zero allocations in steady state).
+/// Cold path: single contiguous arena allocation instead of N+5 separate
+/// allocations, then copies actual data into exact-sized Vecs.
 pub fn write_to_owned_batch(
     schema: &SchemaDescriptor,
     max_rows: usize,
@@ -808,54 +867,116 @@ pub fn write_to_owned_batch(
     let pk_index = schema.pk_index as usize;
     let num_payload_cols = schema.num_columns as usize - 1;
 
-    let mut out_pk_lo = alloc_large_zeroed(max_rows * 8);
-    let mut out_pk_hi = alloc_large_zeroed(max_rows * 8);
-    let mut out_weight = alloc_large_zeroed(max_rows * 8);
-    let mut out_null = alloc_large_zeroed(max_rows * 8);
-    let mut out_cols: Vec<Vec<u8>> = Vec::with_capacity(num_payload_cols);
+    // Compute per-column strides (needed by both pool and arena paths).
+    let mut col_strides: Vec<usize> = Vec::with_capacity(num_payload_cols);
     for ci in 0..schema.num_columns as usize {
         if ci == pk_index { continue; }
-        let cs = schema.columns[ci].size as usize;
-        out_cols.push(alloc_large_zeroed(max_rows * cs));
+        col_strides.push(schema.columns[ci].size as usize);
     }
-    let mut out_blob = alloc_large_zeroed(max_blob);
 
-    let col_slices: Vec<&mut [u8]> = unsafe {
-        out_cols.iter_mut()
-            .map(|v| std::slice::from_raw_parts_mut(v.as_mut_ptr(), v.len()))
-            .collect()
-    };
+    // ── Pool hit path (zero allocations in steady state) ──────────────
+    if let Some(mut batch) = super::batch_pool::acquire(num_payload_cols) {
+        batch.pk_lo.resize(max_rows * 8, 0);
+        batch.pk_hi.resize(max_rows * 8, 0);
+        batch.weight.resize(max_rows * 8, 0);
+        batch.null_bmp.resize(max_rows * 8, 0);
+        for (pi, &stride) in col_strides.iter().enumerate() {
+            batch.col_data[pi].resize(max_rows * stride, 0);
+        }
+        batch.blob.resize(max_blob, 0);
 
-    let mut writer = merge::DirectWriter::new(
-        &mut out_pk_lo, &mut out_pk_hi, &mut out_weight, &mut out_null,
-        col_slices, &mut out_blob, *schema,
-    );
+        // Temporarily take col_data to create non-aliasing &mut [u8] slices.
+        let mut col_data = std::mem::take(&mut batch.col_data);
+        let actual_rows;
+        let actual_blob;
+        {
+            let col_slices: Vec<&mut [u8]> = col_data.iter_mut()
+                .map(|v| v.as_mut_slice()).collect();
+            let mut writer = merge::DirectWriter::new(
+                &mut batch.pk_lo, &mut batch.pk_hi,
+                &mut batch.weight, &mut batch.null_bmp,
+                col_slices, &mut batch.blob, *schema,
+            );
+            write_fn(&mut writer);
+            actual_rows = writer.row_count();
+            actual_blob = writer.blob_written();
+        }
+        batch.col_data = col_data;
 
-    write_fn(&mut writer);
-
-    let actual_rows = writer.row_count();
-    let actual_blob = writer.blob_written();
-
-    out_pk_lo.truncate(actual_rows * 8);
-    out_pk_hi.truncate(actual_rows * 8);
-    out_weight.truncate(actual_rows * 8);
-    out_null.truncate(actual_rows * 8);
-    let mut pi = 0;
-    for ci in 0..schema.num_columns as usize {
-        if ci == pk_index { continue; }
-        let cs = schema.columns[ci].size as usize;
-        out_cols[pi].truncate(actual_rows * cs);
-        pi += 1;
+        batch.pk_lo.truncate(actual_rows * 8);
+        batch.pk_hi.truncate(actual_rows * 8);
+        batch.weight.truncate(actual_rows * 8);
+        batch.null_bmp.truncate(actual_rows * 8);
+        for (pi, &stride) in col_strides.iter().enumerate() {
+            batch.col_data[pi].truncate(actual_rows * stride);
+        }
+        batch.blob.truncate(actual_blob);
+        batch.count = actual_rows;
+        batch.sorted = false;
+        batch.consolidated = false;
+        batch.schema = None;
+        return batch;
     }
-    out_blob.truncate(actual_blob);
+
+    // ── Arena cold path (1 malloc instead of N+5) ─────────────────────
+    let fixed_size = max_rows * 8;
+    let col_total: usize = col_strides.iter().map(|&s| max_rows * s).sum();
+    let total_size = fixed_size * 4 + col_total + max_blob;
+
+    // Single allocation for the entire arena.
+    let mut arena = alloc_large_zeroed(total_size);
+
+    let actual_rows;
+    let actual_blob;
+    {
+        // Carve non-overlapping mutable slices via split_at_mut.
+        let (pk_lo, rest) = arena.split_at_mut(fixed_size);
+        let (pk_hi, rest) = rest.split_at_mut(fixed_size);
+        let (weight, rest) = rest.split_at_mut(fixed_size);
+        let (null_bmp, mut rest) = rest.split_at_mut(fixed_size);
+
+        let mut col_slices: Vec<&mut [u8]> = Vec::with_capacity(num_payload_cols);
+        for &stride in &col_strides {
+            let (col, new_rest) = rest.split_at_mut(max_rows * stride);
+            col_slices.push(col);
+            rest = new_rest;
+        }
+        let blob = rest;
+
+        let mut writer = merge::DirectWriter::new(
+            pk_lo, pk_hi, weight, null_bmp,
+            col_slices, blob, *schema,
+        );
+        write_fn(&mut writer);
+        actual_rows = writer.row_count();
+        actual_blob = writer.blob_written();
+    }
+
+    // Copy actual data from arena into exact-sized owned Vecs.
+    let mut offset = 0;
+    let pk_lo = arena[offset..offset + actual_rows * 8].to_vec();
+    offset += fixed_size;
+    let pk_hi = arena[offset..offset + actual_rows * 8].to_vec();
+    offset += fixed_size;
+    let weight = arena[offset..offset + actual_rows * 8].to_vec();
+    offset += fixed_size;
+    let null_bmp = arena[offset..offset + actual_rows * 8].to_vec();
+    offset += fixed_size;
+
+    let mut col_data = Vec::with_capacity(num_payload_cols);
+    for &stride in &col_strides {
+        col_data.push(arena[offset..offset + actual_rows * stride].to_vec());
+        offset += max_rows * stride;
+    }
+    let blob = arena[offset..offset + actual_blob].to_vec();
 
     OwnedBatch {
-        pk_lo: out_pk_lo,
-        pk_hi: out_pk_hi,
-        weight: out_weight,
-        null_bmp: out_null,
-        col_data: out_cols,
-        blob: out_blob,
+        pk_lo,
+        pk_hi,
+        weight,
+        null_bmp,
+        col_data,
+        blob,
         count: actual_rows,
         sorted: false,
         consolidated: false,

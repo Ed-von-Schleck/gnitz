@@ -19,6 +19,7 @@ mod memtable;
 mod read_cursor;
 mod table;
 mod partitioned_table;
+pub(crate) mod batch_pool;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 pub use table::Table;

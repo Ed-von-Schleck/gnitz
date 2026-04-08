@@ -439,10 +439,9 @@ impl WorkerProcess {
     fn handle_push(&mut self, target_id: i64, batch: OwnedBatch) -> Result<(), String> {
         let row_count = batch.count;
         if target_id < FIRST_USER_TABLE_ID {
-            let batch_for_dag = batch.clone_batch();
-            self.cat().ingest_to_family(target_id, batch)?;
+            self.cat().ingest_to_family(target_id, &batch)?;
             self.flush_family_best_effort(target_id);
-            self.evaluate_dag(target_id, batch_for_dag);
+            self.evaluate_dag(target_id, batch);
         } else {
             let effective = self.cat().ingest_returning_effective(target_id, batch)?;
             self.flush_family_best_effort(target_id);
