@@ -58,23 +58,24 @@ impl BatchBuilder {
 
     /// Begin a new row with the given PK and weight.
     pub(crate) fn begin_row(&mut self, pk_lo: u64, pk_hi: u64, weight: i64) {
-        self.batch.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
-        self.batch.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
-        self.batch.weight.extend_from_slice(&weight.to_le_bytes());
+        self.batch.ensure_row_capacity();
+        self.batch.extend_pk_lo(&pk_lo.to_le_bytes());
+        self.batch.extend_pk_hi(&pk_hi.to_le_bytes());
+        self.batch.extend_weight(&weight.to_le_bytes());
         self.curr_null_word = 0;
         self.curr_col = 0;
     }
 
     /// Put a u64 value for the current payload column.
     pub(crate) fn put_u64(&mut self, val: u64) {
-        self.batch.col_data[self.curr_col].extend_from_slice(&val.to_le_bytes());
+        self.batch.extend_col(self.curr_col, &val.to_le_bytes());
         self.curr_col += 1;
     }
 
     /// Put a string value for the current payload column.
     pub(crate) fn put_string(&mut self, s: &str) {
         let st = crate::schema::encode_german_string(s.as_bytes(), &mut self.batch.blob);
-        self.batch.col_data[self.curr_col].extend_from_slice(&st);
+        self.batch.extend_col(self.curr_col, &st);
         self.curr_col += 1;
     }
 
@@ -83,40 +84,39 @@ impl BatchBuilder {
         let mut buf = [0u8; 16];
         buf[0..8].copy_from_slice(&lo.to_le_bytes());
         buf[8..16].copy_from_slice(&hi.to_le_bytes());
-        self.batch.col_data[self.curr_col].extend_from_slice(&buf);
+        self.batch.extend_col(self.curr_col, &buf);
         self.curr_col += 1;
     }
 
     /// Put a u8 value for the current payload column.
     pub(crate) fn put_u8(&mut self, val: u8) {
-        self.batch.col_data[self.curr_col].push(val);
+        self.batch.extend_col(self.curr_col, &[val]);
         self.curr_col += 1;
     }
 
     /// Put a u16 value for the current payload column.
     pub(crate) fn put_u16(&mut self, val: u16) {
-        self.batch.col_data[self.curr_col].extend_from_slice(&val.to_le_bytes());
+        self.batch.extend_col(self.curr_col, &val.to_le_bytes());
         self.curr_col += 1;
     }
 
     /// Put a u32 value for the current payload column.
     pub(crate) fn put_u32(&mut self, val: u32) {
-        self.batch.col_data[self.curr_col].extend_from_slice(&val.to_le_bytes());
+        self.batch.extend_col(self.curr_col, &val.to_le_bytes());
         self.curr_col += 1;
     }
 
     /// Put a NULL value for the current payload column.
     pub(crate) fn put_null(&mut self) {
         let col_size = self.schema.columns[self.physical_col_idx()].size as usize;
-        static ZEROS: [u8; 16] = [0u8; 16];
-        self.batch.col_data[self.curr_col].extend_from_slice(&ZEROS[..col_size]);
+        self.batch.fill_col_zero(self.curr_col, col_size);
         self.curr_null_word |= 1u64 << self.curr_col;
         self.curr_col += 1;
     }
 
     /// Finish the current row (writes null bitmap).
     pub(crate) fn end_row(&mut self) {
-        self.batch.null_bmp.extend_from_slice(&self.curr_null_word.to_le_bytes());
+        self.batch.extend_null_bmp(&self.curr_null_word.to_le_bytes());
         self.batch.count += 1;
         self.batch.sorted = false;
         self.batch.consolidated = false;
@@ -245,7 +245,7 @@ struct IndexInfo {
 
 fn ingest_batch_into(table: &mut Table, batch: &OwnedBatch) {
     if batch.count == 0 { return; }
-    let npc = batch.col_data.len();
+    let npc = batch.num_payload_cols();
     let (ptrs, sizes) = batch.to_region_ptrs();
     let _ = table.ingest_batch_from_regions(&ptrs, &sizes, batch.count as u32, npc);
 }
@@ -767,10 +767,11 @@ fn copy_cursor_row_with_weight(
         let pk_hi = cursor.cursor.current_key_hi;
         let null_word = cursor.cursor.current_null_word;
 
-        batch.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
-        batch.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
-        batch.weight.extend_from_slice(&weight.to_le_bytes());
-        batch.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+        batch.ensure_row_capacity();
+        batch.extend_pk_lo(&pk_lo.to_le_bytes());
+        batch.extend_pk_hi(&pk_hi.to_le_bytes());
+        batch.extend_weight(&weight.to_le_bytes());
+        batch.extend_null_bmp(&null_word.to_le_bytes());
 
         let pk_index = schema.pk_index as usize;
         let src_blob_ptr = cursor.cursor.blob_ptr();
@@ -792,16 +793,15 @@ fn copy_cursor_row_with_weight(
                         let mut cell = [0u8; 16];
                         cell[..8].copy_from_slice(&data[..8]); // len + prefix
                         cell[8..16].copy_from_slice(&new_offset.to_le_bytes());
-                        batch.col_data[payload_idx].extend_from_slice(&cell);
+                        batch.extend_col(payload_idx, &cell);
                     } else {
-                        batch.col_data[payload_idx].extend_from_slice(data);
+                        batch.extend_col(payload_idx, data);
                     }
                 } else {
-                    batch.col_data[payload_idx].extend_from_slice(data);
+                    batch.extend_col(payload_idx, data);
                 }
             } else {
-                static ZEROS: [u8; 16] = [0u8; 16];
-                batch.col_data[payload_idx].extend_from_slice(&ZEROS[..col_size]);
+                batch.fill_col_zero(payload_idx, col_size);
             }
             payload_idx += 1;
         }
@@ -1288,7 +1288,7 @@ impl CatalogEngine {
 
         let projected = DagEngine::batch_project_index(&scan, col_idx, &owner_schema, idx_schema);
         if projected.count > 0 {
-            let npc = projected.col_data.len();
+            let npc = projected.num_payload_cols();
             let (ptrs, sizes) = projected.to_region_ptrs();
             let table = unsafe { &mut *idx_table };
             let _ = table.ingest_batch_from_regions(&ptrs, &sizes, projected.count as u32, npc);
@@ -1414,13 +1414,14 @@ impl CatalogEngine {
 
     fn read_batch_u64(&self, batch: &OwnedBatch, row: usize, payload_col: usize) -> u64 {
         let off = row * 8;
-        if off + 8 > batch.col_data[payload_col].len() { return 0; }
-        u64::from_le_bytes(batch.col_data[payload_col][off..off + 8].try_into().unwrap_or([0; 8]))
+        let col = batch.col_data(payload_col);
+        if off + 8 > col.len() { return 0; }
+        u64::from_le_bytes(col[off..off + 8].try_into().unwrap_or([0; 8]))
     }
 
     fn read_batch_string(&self, batch: &OwnedBatch, row: usize, payload_col: usize) -> String {
         let off = row * 16;
-        let data = &batch.col_data[payload_col];
+        let data = batch.col_data(payload_col);
         if off + 16 > data.len() { return String::new(); }
         let st: [u8; 16] = data[off..off + 16].try_into().unwrap_or([0; 16]);
         let bytes = crate::schema::decode_german_string(&st, &batch.blob);
@@ -2316,7 +2317,7 @@ impl CatalogEngine {
             _ => return Err(format!("Unknown system table_id {}", table_id)),
         };
         // Memonly ingest (no WAL)
-        let npc = batch.col_data.len();
+        let npc = batch.num_payload_cols();
         let (ptrs, sizes) = batch.to_region_ptrs();
         let _ = table.ingest_batch_memonly_from_regions(&ptrs, &sizes, batch.count as u32, npc);
         // Fire hooks to update registry
@@ -2328,7 +2329,7 @@ impl CatalogEngine {
     pub fn raw_store_ingest(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
         let entry = self.dag.tables.get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
-        let npc = batch.col_data.len();
+        let npc = batch.num_payload_cols();
         let (ptrs, sizes) = batch.to_region_ptrs();
         match &entry.handle {
             StoreHandle::Single(ref t) => {

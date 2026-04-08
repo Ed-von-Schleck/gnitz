@@ -451,7 +451,6 @@ fn sort_owned(batch: &OwnedBatch, schema: &SchemaDescriptor) -> OwnedBatch {
 
     // Scatter-copy in sorted order
     let mut output = OwnedBatch::with_schema(*schema, n);
-    output.count = 0;
     for &idx in &indices {
         output.append_batch(batch, idx as usize, idx as usize + 1);
     }
@@ -578,9 +577,9 @@ pub fn op_reduce(
         false
     };
 
-    let mut raw_output = OwnedBatch::empty(out_npc);
+    let mut raw_output = OwnedBatch::with_schema(*output_schema, 32);
     let mut fin_output = finalize_out_schema.map(|fs| {
-        OwnedBatch::empty(fs.num_columns as usize - 1)
+        OwnedBatch::with_schema(*fs, 32)
     });
 
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(Accumulator::new).collect();
@@ -689,7 +688,6 @@ pub fn op_reduce(
             } else {
                 // Full replay path: build replay batch from trace_in + delta
                 let mut replay = OwnedBatch::with_schema(*input_schema, 32);
-                replay.count = 0;
                 replay.sorted = false;
                 replay.consolidated = false;
 
@@ -839,9 +837,9 @@ fn emit_reduce_row(
     let in_pki = input_schema.pk_index as usize;
     let num_out_cols = output_schema.num_columns as usize;
 
-    output.pk_lo.extend_from_slice(&group_key_lo.to_le_bytes());
-    output.pk_hi.extend_from_slice(&group_key_hi.to_le_bytes());
-    output.weight.extend_from_slice(&weight.to_le_bytes());
+    output.extend_pk_lo(&group_key_lo.to_le_bytes());
+    output.extend_pk_hi(&group_key_hi.to_le_bytes());
+    output.extend_weight(&weight.to_le_bytes());
 
     // Build null word and payload columns
     let mut null_word: u64 = 0;
@@ -867,14 +865,14 @@ fn emit_reduce_row(
             // Null if accumulator is zero (no value) and not using old val
             if !use_old_val && accs[agg_idx].is_zero() {
                 null_word |= 1u64 << out_pi;
-                { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+                output.fill_col_zero(out_pi, cs);
             } else {
-                output.col_data[out_pi].extend_from_slice(&bits.to_le_bytes()[..cs]);
+                output.extend_col(out_pi, &bits.to_le_bytes()[..cs]);
             }
         } else if use_natural_pk {
             // use_natural_pk: no group exemplar columns in output (PK IS the group)
             // This shouldn't happen — with use_natural_pk, non-agg non-PK cols don't exist
-            { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+            output.fill_col_zero(out_pi, cs);
         } else {
             // Group exemplar column: ci=1..N maps to group_by_cols[ci-1]
             let grp_idx = ci - 1; // skip PK at 0
@@ -885,25 +883,24 @@ fn emit_reduce_row(
                 let in_null = input_mb.get_null_word(exemplar_row);
                 if (in_null >> src_pi) & 1 != 0 {
                     null_word |= 1u64 << out_pi;
-                    { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+                    output.fill_col_zero(out_pi, cs);
                 } else if col.type_code == TYPE_STRING {
                     write_string_from_batch(
-                        &mut output.col_data[out_pi],
-                        &mut output.blob,
+                        output, out_pi,
                         input_mb, exemplar_row, src_pi,
                     );
                 } else {
                     let src = input_mb.get_col_ptr(exemplar_row, src_pi, cs);
-                    output.col_data[out_pi].extend_from_slice(src);
+                    output.extend_col(out_pi, src);
                 }
             } else {
-                { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+                output.fill_col_zero(out_pi, cs);
             }
         }
         out_pi += 1;
     }
 
-    output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+    output.extend_null_bmp(&null_word.to_le_bytes());
     output.count += 1;
 }
 
@@ -976,9 +973,9 @@ fn emit_finalized_row(
     );
 
     // Build the finalized output row
-    fin_output.pk_lo.extend_from_slice(&group_key_lo.to_le_bytes());
-    fin_output.pk_hi.extend_from_slice(&group_key_hi.to_le_bytes());
-    fin_output.weight.extend_from_slice(&weight.to_le_bytes());
+    fin_output.extend_pk_lo(&group_key_lo.to_le_bytes());
+    fin_output.extend_pk_hi(&group_key_hi.to_le_bytes());
+    fin_output.extend_weight(&weight.to_le_bytes());
 
     let mut fin_null_mask: u64 = 0;
     let mut fpi = 0usize;
@@ -997,49 +994,48 @@ fn emit_finalized_row(
                         // Source is the PK column — read from pk_lo
                         let pk = raw_mb.get_pk(raw_row);
                         let pk_lo = pk as u64;
-                        fin_output.col_data[fpi].extend_from_slice(&pk_lo.to_le_bytes()[..cs]);
+                        fin_output.extend_col(fpi, &pk_lo.to_le_bytes()[..cs]);
                     } else {
                         let src_pi = payload_idx(src_col, raw_pki);
                         if (null_word >> src_pi) & 1 != 0 {
                             fin_null_mask |= 1u64 << fpi;
-                            { let cur = fin_output.col_data[fpi].len(); fin_output.col_data[fpi].resize(cur + cs, 0); }
+                            fin_output.fill_col_zero(fpi, cs);
                         } else if raw_schema.columns[src_col].type_code == TYPE_STRING {
                             write_string_from_batch(
-                                &mut fin_output.col_data[fpi],
-                                &mut fin_output.blob,
+                                fin_output, fpi,
                                 &raw_mb, raw_row, src_pi,
                             );
                         } else {
                             let src = raw_mb.get_col_ptr(raw_row, src_pi, cs);
-                            fin_output.col_data[fpi].extend_from_slice(src);
+                            fin_output.extend_col(fpi, src);
                         }
                     }
                 }
                 OutCol::Emit(eidx) => {
                     if (eval_emit_mask >> eidx) & 1 != 0 {
                         fin_null_mask |= 1u64 << fpi;
-                        { let cur = fin_output.col_data[fpi].len(); fin_output.col_data[fpi].resize(cur + cs, 0); }
+                        fin_output.fill_col_zero(fpi, cs);
                     } else {
                         let off = raw_row * 8;
-                        fin_output.col_data[fpi].extend_from_slice(
+                        fin_output.extend_col(fpi,
                             &emit_bufs[eidx][off..off + cs],
                         );
                     }
                 }
                 OutCol::EmitNull => {
                     fin_null_mask |= 1u64 << fpi;
-                    { let cur = fin_output.col_data[fpi].len(); fin_output.col_data[fpi].resize(cur + cs, 0); }
+                    fin_output.fill_col_zero(fpi, cs);
                 }
             }
         } else {
-            { let cur = fin_output.col_data[fpi].len(); fin_output.col_data[fpi].resize(cur + cs, 0); }
+            fin_output.fill_col_zero(fpi, cs);
         }
 
         fpi += 1;
         out_col_idx += 1;
     }
 
-    fin_output.null_bmp.extend_from_slice(&fin_null_mask.to_le_bytes());
+    fin_output.extend_null_bmp(&fin_null_mask.to_le_bytes());
     fin_output.count += 1;
 }
 
@@ -1052,11 +1048,11 @@ fn append_membatch_row_to_batch(
 ) {
     let pki = schema.pk_index as usize;
     let pk = mb.get_pk(row);
-    output.pk_lo.extend_from_slice(&(pk as u64).to_le_bytes());
-    output.pk_hi.extend_from_slice(&((pk >> 64) as u64).to_le_bytes());
-    output.weight.extend_from_slice(&mb.get_weight(row).to_le_bytes());
+    output.extend_pk_lo(&(pk as u64).to_le_bytes());
+    output.extend_pk_hi(&((pk >> 64) as u64).to_le_bytes());
+    output.extend_weight(&mb.get_weight(row).to_le_bytes());
     let null_word = mb.get_null_word(row);
-    output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+    output.extend_null_bmp(&null_word.to_le_bytes());
 
     let mut pi = 0;
     for ci in 0..schema.num_columns as usize {
@@ -1067,17 +1063,15 @@ fn append_membatch_row_to_batch(
         let cs = col.size as usize;
         let is_null = (null_word >> pi) & 1 != 0;
         if is_null {
-            let new_len = output.col_data[pi].len() + cs;
-            output.col_data[pi].resize(new_len, 0);
+            output.fill_col_zero(pi, cs);
         } else if col.type_code == TYPE_STRING {
             write_string_from_batch(
-                &mut output.col_data[pi],
-                &mut output.blob,
+                output, pi,
                 mb, row, pi,
             );
         } else {
             let src = mb.get_col_ptr(row, pi, cs);
-            output.col_data[pi].extend_from_slice(src);
+            output.extend_col(pi, src);
         }
         pi += 1;
     }
@@ -1152,7 +1146,7 @@ pub fn op_gather_reduce(
     let num_group_cols = num_out_cols - 1 - num_aggs; // -1 for PK
     let _use_natural_pk_gather = num_group_cols == 0;
 
-    let mut output = OwnedBatch::empty(out_npc);
+    let mut output = OwnedBatch::with_schema(*partial_schema, n);
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(Accumulator::new).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
 
@@ -1254,9 +1248,9 @@ fn emit_gather_row(
     let pki = schema.pk_index as usize;
     let num_cols = schema.num_columns as usize;
 
-    output.pk_lo.extend_from_slice(&group_key_lo.to_le_bytes());
-    output.pk_hi.extend_from_slice(&group_key_hi.to_le_bytes());
-    output.weight.extend_from_slice(&weight.to_le_bytes());
+    output.extend_pk_lo(&group_key_lo.to_le_bytes());
+    output.extend_pk_hi(&group_key_hi.to_le_bytes());
+    output.extend_weight(&weight.to_le_bytes());
 
     let mut null_word: u64 = 0;
     let in_null = input_mb.get_null_word(exemplar_row);
@@ -1279,31 +1273,30 @@ fn emit_gather_row(
             };
             if !use_old_val && accs[agg_idx].is_zero() {
                 null_word |= 1u64 << out_pi;
-                { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+                output.fill_col_zero(out_pi, cs);
             } else {
-                output.col_data[out_pi].extend_from_slice(&bits.to_le_bytes()[..cs]);
+                output.extend_col(out_pi, &bits.to_le_bytes()[..cs]);
             }
         } else {
             // Group exemplar column: copy from input
             let src_pi = out_pi; // same position
             if (in_null >> src_pi) & 1 != 0 {
                 null_word |= 1u64 << out_pi;
-                { let cur = output.col_data[out_pi].len(); output.col_data[out_pi].resize(cur + cs, 0); }
+                output.fill_col_zero(out_pi, cs);
             } else if col.type_code == TYPE_STRING {
                 write_string_from_batch(
-                    &mut output.col_data[out_pi],
-                    &mut output.blob,
+                    output, out_pi,
                     input_mb, exemplar_row, src_pi,
                 );
             } else {
                 let src = input_mb.get_col_ptr(exemplar_row, src_pi, cs);
-                output.col_data[out_pi].extend_from_slice(src);
+                output.extend_col(out_pi, src);
             }
         }
         out_pi += 1;
     }
 
-    output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+    output.extend_null_bmp(&null_word.to_le_bytes());
     output.count += 1;
 }
 
@@ -1336,13 +1329,13 @@ mod tests {
     ) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
+
         for &(pk, w, val) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;
@@ -1366,13 +1359,13 @@ mod tests {
     fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
+
         for &(pk, w, val) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&val.to_bits().to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_bits().to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;
@@ -1416,19 +1409,19 @@ mod tests {
     ) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
+
         for &(pk, w, grp, val) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&grp.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &grp.to_le_bytes());
             let bytes = val.as_bytes();
             assert!(bytes.len() <= SHORT_STRING_THRESHOLD, "use inline strings only");
             let mut gs = [0u8; 16];
             gs[0..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
             gs[4..4 + bytes.len()].copy_from_slice(bytes);
-            b.col_data[1].extend_from_slice(&gs);
+            b.extend_col(1, &gs);
             b.count += 1;
         }
         b.sorted = true;
@@ -1457,13 +1450,13 @@ mod tests {
         let gi_schema = make_gi_schema();
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(gi_schema, n.max(1));
-        b.count = 0;
+
         for &(ck_lo, gc_u64, spk_hi) in rows {
-            b.pk_lo.extend_from_slice(&ck_lo.to_le_bytes());
-            b.pk_hi.extend_from_slice(&gc_u64.to_le_bytes());
-            b.weight.extend_from_slice(&1i64.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&spk_hi.to_le_bytes());
+            b.extend_pk_lo(&ck_lo.to_le_bytes());
+            b.extend_pk_hi(&gc_u64.to_le_bytes());
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &spk_hi.to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;
@@ -1506,14 +1499,14 @@ mod tests {
 
         // Tick 1: insert 3 rows in group 10: val=100, val=200, val=300
         let mut delta1 = OwnedBatch::with_schema(in_schema, 3);
-        delta1.count = 0;
+
         for (pk, val) in [(1u64, 100i64), (2, 200), (3, 300)] {
-            delta1.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            delta1.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            delta1.weight.extend_from_slice(&1i64.to_le_bytes());
-            delta1.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            delta1.col_data[0].extend_from_slice(&10i64.to_le_bytes()); // grp=10
-            delta1.col_data[1].extend_from_slice(&val.to_le_bytes());
+            delta1.extend_pk_lo(&pk.to_le_bytes());
+            delta1.extend_pk_hi(&0u64.to_le_bytes());
+            delta1.extend_weight(&1i64.to_le_bytes());
+            delta1.extend_null_bmp(&0u64.to_le_bytes());
+            delta1.extend_col(0, &10i64.to_le_bytes()); // grp=10
+            delta1.extend_col(1, &val.to_le_bytes());
             delta1.count += 1;
         }
         delta1.sorted = true;
@@ -1530,7 +1523,7 @@ mod tests {
         );
         // SUM of (100+200+300) = 600
         assert_eq!(out1.count, 1);
-        let sum1 = crate::util::read_i64_le(&out1.col_data[1], 0);
+        let sum1 = crate::util::read_i64_le(out1.col_data(1), 0);
         assert_eq!(sum1, 600);
 
         // Tick 2: retract pk=2 (val=200) → SUM should go from 600 to 400
@@ -1539,13 +1532,13 @@ mod tests {
         let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
 
         let mut delta2 = OwnedBatch::with_schema(in_schema, 1);
-        delta2.count = 0;
-        delta2.pk_lo.extend_from_slice(&2u64.to_le_bytes());
-        delta2.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        delta2.weight.extend_from_slice(&(-1i64).to_le_bytes());
-        delta2.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-        delta2.col_data[0].extend_from_slice(&10i64.to_le_bytes());
-        delta2.col_data[1].extend_from_slice(&200i64.to_le_bytes());
+
+        delta2.extend_pk_lo(&2u64.to_le_bytes());
+        delta2.extend_pk_hi(&0u64.to_le_bytes());
+        delta2.extend_weight(&(-1i64).to_le_bytes());
+        delta2.extend_null_bmp(&0u64.to_le_bytes());
+        delta2.extend_col(0, &10i64.to_le_bytes());
+        delta2.extend_col(1, &200i64.to_le_bytes());
         delta2.count += 1;
         delta2.sorted = true;
         delta2.consolidated = true;
@@ -1600,7 +1593,7 @@ mod tests {
         // Each pk forms its own group, COUNT=1 for each
         assert_eq!(out.count, 3);
         for i in 0..3 {
-            let count = crate::util::read_i64_le(&out.col_data[0], i * 8);
+            let count = crate::util::read_i64_le(out.col_data(0), i * 8);
             assert_eq!(count, 1, "each single-row group has count=1");
         }
     }
@@ -1676,7 +1669,7 @@ mod tests {
              `if` leaves replay empty → no output");
 
         // Output payload layout: col_data[0]=grp(I64), col_data[1]=agg(I64)
-        let agg = crate::util::read_i64_le(&out.col_data[1], 0);
+        let agg = crate::util::read_i64_le(out.col_data(1), 0);
         assert_eq!(agg, zebra_ck,
             "MAX of {{zebra+1}} must be zebra_ck; got {agg} (apple_ck={apple_ck})");
     }
@@ -1709,14 +1702,14 @@ mod tests {
         let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
 
         let mut partial1 = OwnedBatch::with_schema(schema, 2);
-        partial1.count = 0;
+
         // Two entries for same group key (pk=1), count=2 each
         for count in [2i64, 2] {
-            partial1.pk_lo.extend_from_slice(&1u64.to_le_bytes());
-            partial1.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            partial1.weight.extend_from_slice(&1i64.to_le_bytes());
-            partial1.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            partial1.col_data[0].extend_from_slice(&count.to_le_bytes());
+            partial1.extend_pk_lo(&1u64.to_le_bytes());
+            partial1.extend_pk_hi(&0u64.to_le_bytes());
+            partial1.extend_weight(&1i64.to_le_bytes());
+            partial1.extend_null_bmp(&0u64.to_le_bytes());
+            partial1.extend_col(0, &count.to_le_bytes());
             partial1.count += 1;
         }
 
@@ -1726,7 +1719,7 @@ mod tests {
 
         let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
         assert_eq!(out1.count, 1);
-        let global_count = crate::util::read_i64_le(&out1.col_data[0], 0);
+        let global_count = crate::util::read_i64_le(out1.col_data(0), 0);
         assert_eq!(global_count, 4);
 
         // Tick 2: retract 1 from each worker → partial counts are -1 each → global delta = -2
@@ -1734,13 +1727,13 @@ mod tests {
         let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
 
         let mut partial2 = OwnedBatch::with_schema(schema, 2);
-        partial2.count = 0;
+
         for count in [-1i64, -1] {
-            partial2.pk_lo.extend_from_slice(&1u64.to_le_bytes());
-            partial2.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            partial2.weight.extend_from_slice(&1i64.to_le_bytes());
-            partial2.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            partial2.col_data[0].extend_from_slice(&count.to_le_bytes());
+            partial2.extend_pk_lo(&1u64.to_le_bytes());
+            partial2.extend_pk_hi(&0u64.to_le_bytes());
+            partial2.extend_weight(&1i64.to_le_bytes());
+            partial2.extend_null_bmp(&0u64.to_le_bytes());
+            partial2.extend_col(0, &count.to_le_bytes());
             partial2.count += 1;
         }
 
@@ -1848,13 +1841,13 @@ mod tests {
     fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
+
         for &(pk, w, val) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;
@@ -1865,13 +1858,13 @@ mod tests {
     fn make_batch_typed_i16(schema: &SchemaDescriptor, rows: &[(u64, i64, i16)]) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
+
         for &(pk, w, val) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;
@@ -1919,9 +1912,9 @@ mod tests {
         );
         assert_eq!(out.count, 3);
         // Check values: row offsets depend on PK order (group_by_pk path)
-        let sum0 = crate::util::read_i64_le(&out.col_data[0], 0);
-        let sum1 = crate::util::read_i64_le(&out.col_data[0], 8);
-        let sum2 = crate::util::read_i64_le(&out.col_data[0], 16);
+        let sum0 = crate::util::read_i64_le(out.col_data(0), 0);
+        let sum1 = crate::util::read_i64_le(out.col_data(0), 8);
+        let sum2 = crate::util::read_i64_le(out.col_data(0), 16);
         assert_eq!(sum0, 100, "SUM of I32 100");
         assert_eq!(sum1, 200, "SUM of I32 200");
         assert_eq!(sum2, -50, "SUM of I32 -50 (sign extension)");
@@ -1966,7 +1959,7 @@ mod tests {
         );
         assert_eq!(out.count, 1);
         // MIN should be -1.0 stored as f64 bits
-        let bits = u64::from_le_bytes(out.col_data[0][0..8].try_into().unwrap());
+        let bits = u64::from_le_bytes(out.col_data(0)[0..8].try_into().unwrap());
         let min_val = f64::from_bits(bits);
         assert_eq!(min_val, -1.0f64, "MIN of F32 {{3.5, -1.0, 7.0}} should be -1.0");
     }
@@ -2008,7 +2001,7 @@ mod tests {
             None, false, 0, &[], None, None, 0, 0, None, None,
         );
         assert_eq!(out.count, 1);
-        let max_val = crate::util::read_i64_le(&out.col_data[0], 0);
+        let max_val = crate::util::read_i64_le(out.col_data(0), 0);
         assert_eq!(max_val, 200, "MAX of I16 {{-100, 200, 50}} should be 200");
     }
 
@@ -2039,12 +2032,12 @@ mod tests {
         let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
 
         let mut partial1 = OwnedBatch::with_schema(schema, 1);
-        partial1.count = 0;
-        partial1.pk_lo.extend_from_slice(&1u64.to_le_bytes());
-        partial1.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        partial1.weight.extend_from_slice(&1i64.to_le_bytes());
-        partial1.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-        partial1.col_data[0].extend_from_slice(&5i64.to_le_bytes());
+
+        partial1.extend_pk_lo(&1u64.to_le_bytes());
+        partial1.extend_pk_hi(&0u64.to_le_bytes());
+        partial1.extend_weight(&1i64.to_le_bytes());
+        partial1.extend_null_bmp(&0u64.to_le_bytes());
+        partial1.extend_col(0, &5i64.to_le_bytes());
         partial1.count += 1;
 
         let agg = AggDescriptor {
@@ -2053,7 +2046,7 @@ mod tests {
 
         let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
         assert_eq!(out1.count, 1);
-        let min1 = crate::util::read_i64_le(&out1.col_data[0], 0);
+        let min1 = crate::util::read_i64_le(out1.col_data(0), 0);
         assert_eq!(min1, 5);
 
         // Tick 2: partial MIN=3 from one worker. The old global (5) should be folded in
@@ -2062,21 +2055,21 @@ mod tests {
         let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
 
         let mut partial2 = OwnedBatch::with_schema(schema, 1);
-        partial2.count = 0;
-        partial2.pk_lo.extend_from_slice(&1u64.to_le_bytes());
-        partial2.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        partial2.weight.extend_from_slice(&1i64.to_le_bytes());
-        partial2.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-        partial2.col_data[0].extend_from_slice(&3i64.to_le_bytes());
+
+        partial2.extend_pk_lo(&1u64.to_le_bytes());
+        partial2.extend_pk_hi(&0u64.to_le_bytes());
+        partial2.extend_weight(&1i64.to_le_bytes());
+        partial2.extend_null_bmp(&0u64.to_le_bytes());
+        partial2.extend_col(0, &3i64.to_le_bytes());
         partial2.count += 1;
 
         let out2 = op_gather_reduce(&partial2, to_ch2.cursor_mut(), &schema, &[agg]);
         // Should have: retract old (5, w=-1) + insert new (3, w=+1)
         assert_eq!(out2.count, 2, "should retract old MIN and emit new MIN");
-        let retracted = crate::util::read_i64_le(&out2.col_data[0], 0);
+        let retracted = crate::util::read_i64_le(out2.col_data(0), 0);
         assert_eq!(retracted, 5, "retraction should be old MIN value 5");
         assert_eq!(out2.get_weight(0), -1);
-        let new_min = crate::util::read_i64_le(&out2.col_data[0], 8);
+        let new_min = crate::util::read_i64_le(out2.col_data(0), 8);
         assert_eq!(new_min, 3, "new MIN should be 3 (min of old 5 and partial 3)");
         assert_eq!(out2.get_weight(1), 1);
     }

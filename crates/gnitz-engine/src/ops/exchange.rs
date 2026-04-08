@@ -439,13 +439,13 @@ mod tests {
     fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
+
         for &(pk, w, val) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;
@@ -456,12 +456,12 @@ mod tests {
     fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
+
         for &(pk, w, s) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
 
             let bytes = s.as_bytes();
             let length = bytes.len() as u32;
@@ -476,7 +476,7 @@ mod tests {
                 gs[8..16].copy_from_slice(&offset.to_le_bytes());
                 b.blob.extend_from_slice(bytes);
             }
-            b.col_data[0].extend_from_slice(&gs);
+            b.extend_col(0, &gs);
             b.count += 1;
         }
         b.sorted = true;
@@ -495,13 +495,13 @@ mod tests {
         let pk_vals: &[u64] = &[1, 7, 42, 100, 255, 1024, 65537, 999983];
 
         let mut b = OwnedBatch::with_schema(schema, pk_vals.len());
-        b.count = 0;
+
         for &pk in pk_vals {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&1i64.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&0i64.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
             b.count += 1;
         }
 
@@ -532,13 +532,13 @@ mod tests {
 
         let n = pk_pairs.len();
         let mut b = OwnedBatch::with_schema(schema, n);
-        b.count = 0;
+
         for &(lo, hi) in pk_pairs {
-            b.pk_lo.extend_from_slice(&lo.to_le_bytes());
-            b.pk_hi.extend_from_slice(&hi.to_le_bytes());
-            b.weight.extend_from_slice(&1i64.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&0i64.to_le_bytes());
+            b.extend_pk_lo(&lo.to_le_bytes());
+            b.extend_pk_hi(&hi.to_le_bytes());
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
             b.count += 1;
         }
 
@@ -564,13 +564,13 @@ mod tests {
         let same_val: i64 = 42;
 
         let mut b = OwnedBatch::with_schema(schema, 4);
-        b.count = 0;
+
         for pk in [1u64, 2, 3, 4] {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&1i64.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&same_val.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &same_val.to_le_bytes());
             b.count += 1;
         }
 
@@ -718,13 +718,13 @@ mod tests {
         let vals: Vec<i64> = (0..64i64).map(|i| i * 997 + 1).collect();
 
         let mut b = OwnedBatch::with_schema(schema, vals.len());
-        b.count = 0;
+
         for (i, &v) in vals.iter().enumerate() {
-            b.pk_lo.extend_from_slice(&((i + 1) as u64).to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&1i64.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&v.to_le_bytes());
+            b.extend_pk_lo(&((i + 1) as u64).to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &v.to_le_bytes());
             b.count += 1;
         }
 
@@ -736,7 +736,7 @@ mod tests {
             let expected_worker = worker_for_partition(expected_partition, num_workers);
             let found = (0..sub_batches[expected_worker].count).any(|r| {
                 i64::from_le_bytes(
-                    sub_batches[expected_worker].col_data[0][r * 8..r * 8 + 8]
+                    sub_batches[expected_worker].col_data(0)[r * 8..r * 8 + 8]
                         .try_into()
                         .unwrap(),
                 ) == v
@@ -830,12 +830,12 @@ mod tests {
         );
 
         assert_eq!((out.get_pk(0) as u64), 1);
-        let val0 = i64::from_le_bytes(out.col_data[0][0..8].try_into().unwrap());
+        let val0 = i64::from_le_bytes(out.col_data(0)[0..8].try_into().unwrap());
         assert_eq!(val0, 100);
         assert_eq!(out.get_weight(0), -1);
 
         assert_eq!((out.get_pk(1) as u64), 1);
-        let val1 = i64::from_le_bytes(out.col_data[0][8..16].try_into().unwrap());
+        let val1 = i64::from_le_bytes(out.col_data(0)[8..16].try_into().unwrap());
         assert_eq!(val1, 200);
         assert_eq!(out.get_weight(1), 1);
     }

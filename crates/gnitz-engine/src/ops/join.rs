@@ -412,13 +412,12 @@ fn write_left_payload(
         let cs = col.size as usize;
         let is_null = (left_null >> pi) & 1 != 0;
         if is_null {
-            let new_len = output.col_data[pi].len() + cs;
-            output.col_data[pi].resize(new_len, 0);
+            output.fill_col_zero(pi, cs);
         } else if col.type_code == TYPE_STRING {
-            write_string_from_batch(&mut output.col_data[pi], &mut output.blob, left_batch, left_row, pi);
+            write_string_from_batch(output, pi, left_batch, left_row, pi);
         } else {
             let src = left_batch.get_col_ptr(left_row, pi, cs);
-            output.col_data[pi].extend_from_slice(src);
+            output.extend_col(pi, src);
         }
         pi += 1;
     }
@@ -446,10 +445,10 @@ fn write_join_row(
     let left_npc = left_schema.num_columns as usize - 1;
     let null_word = left_null | (right_null << left_npc);
 
-    output.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
-    output.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
-    output.weight.extend_from_slice(&weight.to_le_bytes());
-    output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+    output.extend_pk_lo(&pk_lo.to_le_bytes());
+    output.extend_pk_hi(&pk_hi.to_le_bytes());
+    output.extend_weight(&weight.to_le_bytes());
+    output.extend_null_bmp(&null_word.to_le_bytes());
 
     write_left_payload(output, left_batch, left_row, left_null, left_schema);
 
@@ -466,27 +465,26 @@ fn write_join_row(
         let is_null = (right_null >> rpi) & 1 != 0;
         let out_pi = left_npc + rpi;
         if is_null {
-            let new_len = output.col_data[out_pi].len() + cs;
-            output.col_data[out_pi].resize(new_len, 0);
+            output.fill_col_zero(out_pi, cs);
         } else if col.type_code == TYPE_STRING {
             let ptr = right_cursor.col_ptr(ci, 16);
             if ptr.is_null() {
-                let new_len = output.col_data[out_pi].len() + 16;
-                output.col_data[out_pi].resize(new_len, 0);
+                output.fill_col_zero(out_pi, 16);
             } else {
                 let src = unsafe { std::slice::from_raw_parts(ptr, 16) };
+                let mut tmp = Vec::new();
                 write_string_from_raw(
-                    &mut output.col_data[out_pi], &mut output.blob, src, right_blob,
+                    &mut tmp, &mut output.blob, src, right_blob,
                 );
+                output.extend_col(out_pi, &tmp);
             }
         } else {
             let ptr = right_cursor.col_ptr(ci, cs);
             if ptr.is_null() {
-                let new_len = output.col_data[out_pi].len() + cs;
-                output.col_data[out_pi].resize(new_len, 0);
+                output.fill_col_zero(out_pi, cs);
             } else {
                 let src = unsafe { std::slice::from_raw_parts(ptr, cs) };
-                output.col_data[out_pi].extend_from_slice(src);
+                output.extend_col(out_pi, src);
             }
         }
         rpi += 1;
@@ -518,10 +516,10 @@ fn write_join_row_null_right(
     };
     let null_word = left_null | (right_null_bits << left_npc);
 
-    output.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
-    output.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
-    output.weight.extend_from_slice(&weight.to_le_bytes());
-    output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+    output.extend_pk_lo(&pk_lo.to_le_bytes());
+    output.extend_pk_hi(&pk_hi.to_le_bytes());
+    output.extend_weight(&weight.to_le_bytes());
+    output.extend_null_bmp(&null_word.to_le_bytes());
 
     write_left_payload(output, left_batch, left_row, left_null, left_schema);
 
@@ -535,8 +533,7 @@ fn write_join_row_null_right(
         let col = &right_schema.columns[ci];
         let cs = col.size as usize;
         let out_pi = left_npc + rpi;
-        let new_len = output.col_data[out_pi].len() + cs;
-        output.col_data[out_pi].resize(new_len, 0);
+        output.fill_col_zero(out_pi, cs);
         rpi += 1;
     }
 
@@ -812,10 +809,10 @@ fn write_join_row_from_batches(
     let left_npc = left_schema.num_columns as usize - 1;
     let null_word = left_null | (right_null << left_npc);
 
-    output.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
-    output.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
-    output.weight.extend_from_slice(&weight.to_le_bytes());
-    output.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+    output.extend_pk_lo(&pk_lo.to_le_bytes());
+    output.extend_pk_hi(&pk_hi.to_le_bytes());
+    output.extend_weight(&weight.to_le_bytes());
+    output.extend_null_bmp(&null_word.to_le_bytes());
 
     write_left_payload(output, left_batch, left_row, left_null, left_schema);
 
@@ -831,19 +828,15 @@ fn write_join_row_from_batches(
         let is_null = (right_null >> rpi) & 1 != 0;
         let out_pi = left_npc + rpi;
         if is_null {
-            let new_len = output.col_data[out_pi].len() + cs;
-            output.col_data[out_pi].resize(new_len, 0);
+            output.fill_col_zero(out_pi, cs);
         } else if col.type_code == TYPE_STRING {
             write_string_from_batch(
-                &mut output.col_data[out_pi],
-                &mut output.blob,
-                right_batch,
-                right_row,
-                rpi,
+                output, out_pi,
+                right_batch, right_row, rpi,
             );
         } else {
             let src = right_batch.get_col_ptr(right_row, rpi, cs);
-            output.col_data[out_pi].extend_from_slice(src);
+            output.extend_col(out_pi, src);
         }
         rpi += 1;
     }
@@ -893,13 +886,13 @@ mod tests {
     ) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
+
         for &(pk, w, val) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;
@@ -913,12 +906,12 @@ mod tests {
     ) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
+
         for &(pk, w, s) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
 
             let bytes = s.as_bytes();
             let length = bytes.len() as u32;
@@ -933,7 +926,7 @@ mod tests {
                 gs[8..16].copy_from_slice(&offset.to_le_bytes());
                 b.blob.extend_from_slice(bytes);
             }
-            b.col_data[0].extend_from_slice(&gs);
+            b.extend_col(0, &gs);
             b.count += 1;
         }
         b.sorted = true;
@@ -943,7 +936,7 @@ mod tests {
 
     fn read_str_payload(batch: &OwnedBatch, col: usize, row: usize) -> String {
         let off = row * 16;
-        let gs = &batch.col_data[col][off..off + 16];
+        let gs = &batch.col_data(col)[off..off + 16];
         let length = u32::from_le_bytes(gs[0..4].try_into().unwrap()) as usize;
         if length == 0 {
             return String::new();
@@ -957,7 +950,7 @@ mod tests {
     }
 
     fn get_payload_i64(b: &OwnedBatch, row: usize) -> i64 {
-        crate::util::read_i64_le(&b.col_data[0], row * 8)
+        crate::util::read_i64_le(b.col_data(0), row * 8)
     }
 
     // -----------------------------------------------------------------------
@@ -1112,13 +1105,13 @@ mod tests {
         let a = make_batch(&ls, &[(1, 2, 10)]);
         // b has a pair that nets to zero weight after consolidation
         let mut b = OwnedBatch::with_schema(rs, 2);
-        b.count = 0;
+
         for &(pk, w, val) in &[(1u64, 1i64, 100i64), (1u64, -1i64, 100i64)] {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;
@@ -1191,13 +1184,12 @@ mod tests {
 
         // Non-consolidated delta: pk=1 appears twice (w=2 and w=3)
         let mut delta = OwnedBatch::with_schema(schema, 2);
-        delta.count = 0;
         for (pk, w, val) in [(1u64, 2i64, 10i64), (1u64, 3i64, 10i64)] {
-            delta.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            delta.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            delta.weight.extend_from_slice(&w.to_le_bytes());
-            delta.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            delta.col_data[0].extend_from_slice(&val.to_le_bytes());
+            delta.extend_pk_lo(&pk.to_le_bytes());
+            delta.extend_pk_hi(&0u64.to_le_bytes());
+            delta.extend_weight(&w.to_le_bytes());
+            delta.extend_null_bmp(&0u64.to_le_bytes());
+            delta.extend_col(0, &val.to_le_bytes());
             delta.count += 1;
         }
         delta.sorted = true;
@@ -1240,7 +1232,7 @@ mod tests {
         assert_eq!((out.get_pk(1) as u64), 2);
         assert_eq!(get_payload_i64(&out, 1), 20); // left val
         // Right column (payload col 1) should be null
-        let null_word = u64::from_le_bytes(out.null_bmp[1 * 8..2 * 8].try_into().unwrap());
+        let null_word = u64::from_le_bytes(out.null_bmp_data()[1 * 8..2 * 8].try_into().unwrap());
         assert!(null_word & 2 != 0, "right payload column (bit 1) should be null for non-matching row");
     }
 

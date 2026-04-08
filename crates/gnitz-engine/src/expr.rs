@@ -1020,21 +1020,20 @@ mod tests {
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, u64, &[i64])],
     ) -> OwnedBatch {
-        let npc = schema.num_columns as usize - 1;
-        let mut batch = OwnedBatch::empty(npc);
-        batch.schema = Some(*schema);
+        let mut batch = OwnedBatch::with_schema(*schema, rows.len().max(1));
+        batch.count = 0;
         for &(pk, weight, null_word, cols) in rows {
-            batch.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            batch.weight.extend_from_slice(&weight.to_le_bytes());
-            batch.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+            batch.extend_pk_lo(&pk.to_le_bytes());
+            batch.extend_pk_hi(&0u64.to_le_bytes());
+            batch.extend_weight(&weight.to_le_bytes());
+            batch.extend_null_bmp(&null_word.to_le_bytes());
             let mut pi = 0;
             for ci in 0..schema.num_columns as usize {
                 if ci == schema.pk_index as usize {
                     continue;
                 }
                 if pi < cols.len() {
-                    batch.col_data[pi].extend_from_slice(&cols[pi].to_le_bytes());
+                    batch.extend_col(pi, &cols[pi].to_le_bytes());
                 }
                 pi += 1;
             }
@@ -1278,18 +1277,17 @@ mod tests {
     fn test_string_eq_const() {
         let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
         // Build a batch with a short string "hello"
-        let npc = 1;
-        let mut batch = OwnedBatch::empty(npc);
-        batch.schema = Some(schema);
-        batch.pk_lo.extend_from_slice(&1u64.to_le_bytes());
-        batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        batch.weight.extend_from_slice(&1i64.to_le_bytes());
-        batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        let mut batch = OwnedBatch::with_schema(schema, 1);
+        batch.count = 0;
+        batch.extend_pk_lo(&1u64.to_le_bytes());
+        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
         // German string struct for "hello" (5 bytes, inline)
         let mut gs = [0u8; 16];
         gs[0..4].copy_from_slice(&5u32.to_le_bytes()); // length = 5
         gs[4..9].copy_from_slice(b"hello"); // prefix(4) + suffix(1) inline
-        batch.col_data[0].extend_from_slice(&gs);
+        batch.extend_col(0, &gs);
         batch.count = 1;
 
         let mb = batch.as_mem_batch();
@@ -1576,17 +1574,16 @@ mod tests {
     #[test]
     fn test_string_lt_le_const() {
         let schema = make_schema(2, 0, &[(8, 8), (11, 16)]);
-        let npc = 1;
-        let mut batch = OwnedBatch::empty(npc);
-        batch.schema = Some(schema);
-        batch.pk_lo.extend_from_slice(&1u64.to_le_bytes());
-        batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        batch.weight.extend_from_slice(&1i64.to_le_bytes());
-        batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        let mut batch = OwnedBatch::with_schema(schema, 1);
+        batch.count = 0;
+        batch.extend_pk_lo(&1u64.to_le_bytes());
+        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
         let mut gs = [0u8; 16];
         gs[0..4].copy_from_slice(&5u32.to_le_bytes());
         gs[4..9].copy_from_slice(b"hello");
-        batch.col_data[0].extend_from_slice(&gs);
+        batch.extend_col(0, &gs);
         batch.count = 1;
         let mb = batch.as_mem_batch();
 
@@ -1619,35 +1616,34 @@ mod tests {
     fn test_string_col_eq_col() {
         // Schema: pk(U64), str_a(STRING), str_b(STRING)
         let schema = make_schema(3, 0, &[(8, 8), (11, 16), (11, 16)]);
-        let npc = 2;
-        let mut batch = OwnedBatch::empty(npc);
-        batch.schema = Some(schema);
+        let mut batch = OwnedBatch::with_schema(schema, 2);
+        batch.count = 0;
 
         // Row 0: str_a="abc", str_b="abc" (equal)
-        batch.pk_lo.extend_from_slice(&1u64.to_le_bytes());
-        batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        batch.weight.extend_from_slice(&1i64.to_le_bytes());
-        batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        batch.extend_pk_lo(&1u64.to_le_bytes());
+        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
         let mut gs_a = [0u8; 16];
         gs_a[0..4].copy_from_slice(&3u32.to_le_bytes());
         gs_a[4..7].copy_from_slice(b"abc");
-        batch.col_data[0].extend_from_slice(&gs_a);
+        batch.extend_col(0, &gs_a);
         let mut gs_b = [0u8; 16];
         gs_b[0..4].copy_from_slice(&3u32.to_le_bytes());
         gs_b[4..7].copy_from_slice(b"abc");
-        batch.col_data[1].extend_from_slice(&gs_b);
+        batch.extend_col(1, &gs_b);
         batch.count += 1;
 
         // Row 1: str_a="abc", str_b="xyz" (not equal)
-        batch.pk_lo.extend_from_slice(&2u64.to_le_bytes());
-        batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        batch.weight.extend_from_slice(&1i64.to_le_bytes());
-        batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-        batch.col_data[0].extend_from_slice(&gs_a);
+        batch.extend_pk_lo(&2u64.to_le_bytes());
+        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.extend_col(0, &gs_a);
         let mut gs_c = [0u8; 16];
         gs_c[0..4].copy_from_slice(&3u32.to_le_bytes());
         gs_c[4..7].copy_from_slice(b"xyz");
-        batch.col_data[1].extend_from_slice(&gs_c);
+        batch.extend_col(1, &gs_c);
         batch.count += 1;
 
         let mb = batch.as_mem_batch();

@@ -479,26 +479,28 @@ impl<'a> ReadCursor<'a> {
                 // Batch sources are always consolidated (no ghosts).
                 let end = start + row_count;
                 let npc = b.col_data.len();
-                let mut out = super::memtable::OwnedBatch {
-                    pk_lo: b.pk_lo[start * 8..end * 8].to_vec(),
-                    pk_hi: b.pk_hi[start * 8..end * 8].to_vec(),
-                    weight: b.weight[start * 8..end * 8].to_vec(),
-                    null_bmp: b.null_bmp[start * 8..end * 8].to_vec(),
-                    col_data: Vec::with_capacity(npc),
-                    blob: b.blob.to_vec(),
-                    count: row_count,
-                    sorted: true,
-                    consolidated: true,
-                    schema: Some(*schema),
-                };
+                let num_regions = 4 + npc + 1;
+                let mut region_bufs: Vec<Vec<u8>> = Vec::with_capacity(num_regions);
+                region_bufs.push(b.pk_lo[start * 8..end * 8].to_vec());
+                region_bufs.push(b.pk_hi[start * 8..end * 8].to_vec());
+                region_bufs.push(b.weight[start * 8..end * 8].to_vec());
+                region_bufs.push(b.null_bmp[start * 8..end * 8].to_vec());
                 let pk_index = schema.pk_index as usize;
                 let mut pi = 0;
                 for ci in 0..schema.num_columns as usize {
                     if ci == pk_index { continue; }
                     let cs = schema.columns[ci].size as usize;
-                    out.col_data.push(b.col_data[pi][start * cs..end * cs].to_vec());
+                    region_bufs.push(b.col_data[pi][start * cs..end * cs].to_vec());
                     pi += 1;
                 }
+                region_bufs.push(b.blob.to_vec());
+
+                let ptrs: Vec<*const u8> = region_bufs.iter().map(|v| v.as_ptr()).collect();
+                let sizes: Vec<u32> = region_bufs.iter().map(|v| v.len() as u32).collect();
+                let mut out = unsafe { super::memtable::OwnedBatch::from_regions(&ptrs, &sizes, row_count, npc) };
+                out.sorted = true;
+                out.consolidated = true;
+                out.schema = Some(*schema);
                 out
             }
             CursorSource::Shard(s) => {

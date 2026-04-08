@@ -389,7 +389,7 @@ impl ServerExecutor {
             let merged = {
                 let schema = self.get_schema_desc(target_id);
                 let first = &entries[run_start];
-                let ncols = first.batch.col_data.len();
+                let ncols = first.batch.num_payload_cols();
                 let mut m = OwnedBatch::empty(ncols);
                 m.schema = Some(schema);
                 m.append_batch(&first.batch, 0, first.batch.count);

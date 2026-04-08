@@ -1,7 +1,7 @@
 //! Linear operators: op_filter, op_map, op_negate, op_union.
 //! Also includes PK promotion for reindex (GROUP BY).
 
-use crate::schema::{SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
 use crate::storage::{OwnedBatch, MemBatch};
 use crate::scalar_func::ScalarFuncKind;
 use crate::xxh;
@@ -26,7 +26,6 @@ pub fn op_filter(
 
     let mb = batch.as_mem_batch();
     let mut output = OwnedBatch::with_schema(*schema, n);
-    output.count = 0;
 
     let mut range_start: isize = -1;
     for i in 0..n {
@@ -82,25 +81,15 @@ pub fn op_map(
     // Per-row path with reindex
     let in_mb = batch.as_mem_batch();
     let ri_col = reindex_col as usize;
-    let mut output = OwnedBatch::with_schema(*out_schema, batch.count);
-    output.count = 0;
 
-    // First evaluate the map batch (without reindex) to get column data
-    let mapped = func.evaluate_map_batch(batch, in_schema, out_schema);
+    // Evaluate the map batch (without reindex) to get column data
+    let mut output = func.evaluate_map_batch(batch, in_schema, out_schema);
 
-    // Then overwrite PK with promoted values from reindex column
-    output.pk_hi = vec![0u8; mapped.count * 8]; // will be overwritten
-    output.pk_lo = vec![0u8; mapped.count * 8];
-    output.weight = mapped.weight;
-    output.null_bmp = mapped.null_bmp;
-    output.col_data = mapped.col_data;
-    output.blob = mapped.blob;
-    output.count = mapped.count;
-
-    for row in 0..batch.count {
+    // Overwrite PK with promoted values from reindex column
+    for row in 0..output.count {
         let (pk_lo, pk_hi) = promote_col_to_pk(&in_mb, row, ri_col, in_schema);
-        output.pk_lo[row * 8..row * 8 + 8].copy_from_slice(&pk_lo.to_le_bytes());
-        output.pk_hi[row * 8..row * 8 + 8].copy_from_slice(&pk_hi.to_le_bytes());
+        output.pk_lo_data_mut()[row * 8..row * 8 + 8].copy_from_slice(&pk_lo.to_le_bytes());
+        output.pk_hi_data_mut()[row * 8..row * 8 + 8].copy_from_slice(&pk_hi.to_le_bytes());
     }
 
     output.sorted = false;
@@ -112,10 +101,10 @@ pub fn op_map(
 /// Negate: flip the sign of every weight.
 pub fn op_negate(batch: &OwnedBatch) -> OwnedBatch {
     if batch.count == 0 {
-        return OwnedBatch::empty(batch.col_data.len());
+        return OwnedBatch::empty(batch.num_payload_cols());
     }
 
-    let mut output = OwnedBatch::empty(batch.col_data.len());
+    let mut output = OwnedBatch::empty(batch.num_payload_cols());
     output.schema = batch.schema;
     output.append_batch_negated(batch, 0, batch.count);
 
@@ -159,7 +148,6 @@ pub fn op_union(
 
     // Unsorted: concatenate
     let mut output = OwnedBatch::with_schema(*schema, batch_a.count + b.count);
-    output.count = 0;
     output.append_batch(batch_a, 0, batch_a.count);
     output.append_batch(b, 0, b.count);
     output.sorted = false;
@@ -177,7 +165,6 @@ fn op_union_merge(
     let n_a = batch_a.count;
     let n_b = batch_b.count;
     let mut output = OwnedBatch::with_schema(*schema, n_a + n_b);
-    output.count = 0;
 
     let mb_a = batch_a.as_mem_batch();
     let mb_b = batch_b.as_mem_batch();
@@ -299,33 +286,41 @@ pub fn op_null_extend(
         return OwnedBatch::empty(out_npc);
     }
 
-    let mut output = OwnedBatch::empty(out_npc);
+    // Build a merged schema for the output batch.
+    let mut out_columns = [SchemaColumn { type_code: 0, size: 0, nullable: 0, _pad: 0 }; 64];
+    let mut ci_out = 0;
+    for ci in 0..in_schema.num_columns as usize {
+        out_columns[ci_out] = in_schema.columns[ci];
+        ci_out += 1;
+    }
+    let right_pk_index = right_schema.pk_index as usize;
+    for ci in 0..right_schema.num_columns as usize {
+        if ci == right_pk_index { continue; }
+        out_columns[ci_out] = right_schema.columns[ci];
+        ci_out += 1;
+    }
+    let out_schema = SchemaDescriptor {
+        num_columns: ci_out as u32,
+        pk_index: in_schema.pk_index,
+        columns: out_columns,
+    };
+
+    let mut output = OwnedBatch::with_schema(out_schema, n);
+    output.count = n;
 
     // Copy system columns
-    output.pk_lo = batch.pk_lo[..n * 8].to_vec();
-    output.pk_hi = batch.pk_hi[..n * 8].to_vec();
-    output.weight = batch.weight[..n * 8].to_vec();
-    output.count = n;
+    output.pk_lo_data_mut().copy_from_slice(batch.pk_lo_data());
+    output.pk_hi_data_mut().copy_from_slice(batch.pk_hi_data());
+    output.weight_data_mut().copy_from_slice(batch.weight_data());
 
     // Copy input payload columns
     for pi in 0..in_npc {
         let in_ci = if pi < in_schema.pk_index as usize { pi } else { pi + 1 };
         let stride = in_schema.columns[in_ci].size as usize;
-        output.col_data[pi] = batch.col_data[pi][..n * stride].to_vec();
+        output.col_data_mut(pi).copy_from_slice(&batch.col_data(pi)[..n * stride]);
     }
 
-    // Append null-filled right-side payload columns
-    let right_pk_index = right_schema.pk_index as usize;
-    let mut rpi = 0;
-    for ci in 0..right_schema.num_columns as usize {
-        if ci == right_pk_index {
-            continue;
-        }
-        let stride = right_schema.columns[ci].size as usize;
-        let out_pi = in_npc + rpi;
-        output.col_data[out_pi] = vec![0u8; n * stride];
-        rpi += 1;
-    }
+    // Right-side payload columns are already zero-filled by with_schema.
 
     // Set null bits for all appended right-side columns
     let right_null_bits = if right_npc < 64 {
@@ -334,14 +329,12 @@ pub fn op_null_extend(
         u64::MAX
     };
     let shift = in_npc;
-    let mut null_bmp = Vec::with_capacity(n * 8);
     for row in 0..n {
         let off = row * 8;
-        let in_null = u64::from_le_bytes(batch.null_bmp[off..off + 8].try_into().unwrap());
+        let in_null = u64::from_le_bytes(batch.null_bmp_data()[off..off + 8].try_into().unwrap());
         let out_null = in_null | (right_null_bits << shift);
-        null_bmp.extend_from_slice(&out_null.to_le_bytes());
+        output.null_bmp_data_mut()[off..off + 8].copy_from_slice(&out_null.to_le_bytes());
     }
-    output.null_bmp = null_bmp;
 
     output.sorted = batch.sorted;
     output.consolidated = batch.consolidated;
@@ -464,13 +457,12 @@ mod tests {
     ) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
         for &(pk, w, val) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;
@@ -479,7 +471,7 @@ mod tests {
     }
 
     fn get_payload_i64(b: &OwnedBatch, row: usize) -> i64 {
-        crate::util::read_i64_le(&b.col_data[0], row * 8)
+        crate::util::read_i64_le(b.col_data(0), row * 8)
     }
 
     // -----------------------------------------------------------------------

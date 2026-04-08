@@ -257,12 +257,12 @@ pub fn op_integrate_with_indexes(
             let weight = mb.get_weight(row);
 
             // Composite key: ck_lo = source_pk_lo, ck_hi = gc_u64
-            gi_batch.pk_lo.extend_from_slice(&source_pk_lo.to_le_bytes());
-            gi_batch.pk_hi.extend_from_slice(&gc_u64.to_le_bytes());
-            gi_batch.weight.extend_from_slice(&weight.to_le_bytes());
-            gi_batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            gi_batch.extend_pk_lo(&source_pk_lo.to_le_bytes());
+            gi_batch.extend_pk_hi(&gc_u64.to_le_bytes());
+            gi_batch.extend_weight(&weight.to_le_bytes());
+            gi_batch.extend_null_bmp(&0u64.to_le_bytes());
             // Payload: spk_hi (source pk high 64 bits) as I64
-            gi_batch.col_data[0].extend_from_slice(&(source_pk_hi as i64).to_le_bytes());
+            gi_batch.extend_col(0, &(source_pk_hi as i64).to_le_bytes());
             gi_batch.count += 1;
         }
 
@@ -304,10 +304,10 @@ pub fn op_integrate_with_indexes(
             let weight = mb.get_weight(row);
 
             // Composite key: ck_lo = av_u64, ck_hi = gc_u64
-            avi_batch.pk_lo.extend_from_slice(&av_u64.to_le_bytes());
-            avi_batch.pk_hi.extend_from_slice(&gc_u64.to_le_bytes());
-            avi_batch.weight.extend_from_slice(&weight.to_le_bytes());
-            avi_batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            avi_batch.extend_pk_lo(&av_u64.to_le_bytes());
+            avi_batch.extend_pk_hi(&gc_u64.to_le_bytes());
+            avi_batch.extend_weight(&weight.to_le_bytes());
+            avi_batch.extend_null_bmp(&0u64.to_le_bytes());
             // No payload columns (AVI schema is U128 PK only)
             avi_batch.count += 1;
         }
@@ -316,9 +316,9 @@ pub fn op_integrate_with_indexes(
             gnitz_debug!("integrate_avi: ingesting {} rows, for_max={}, agg_col_idx={}, agg_type={}",
                 avi_batch.count, avi_desc.for_max, avi_desc.agg_col_idx, avi_desc.agg_col_type_code);
             for i in 0..avi_batch.count {
-                let lo = u64::from_le_bytes(avi_batch.pk_lo[i*8..(i+1)*8].try_into().unwrap());
-                let hi = u64::from_le_bytes(avi_batch.pk_hi[i*8..(i+1)*8].try_into().unwrap());
-                let w = i64::from_le_bytes(avi_batch.weight[i*8..(i+1)*8].try_into().unwrap());
+                let lo = u64::from_le_bytes(avi_batch.pk_lo_data()[i*8..(i+1)*8].try_into().unwrap());
+                let hi = u64::from_le_bytes(avi_batch.pk_hi_data()[i*8..(i+1)*8].try_into().unwrap());
+                let w = i64::from_le_bytes(avi_batch.weight_data()[i*8..(i+1)*8].try_into().unwrap());
                 gnitz_debug!("  avi[{}]: pk_lo={:#x} pk_hi={:#x} w={}", i, lo, hi, w);
             }
             let avi_table = unsafe { &mut *avi_desc.table };

@@ -884,7 +884,7 @@ impl DagEngine {
         let schema = entry.schema;
 
         // Stage 2: ingest into store
-        let npc = batch.col_data.len();
+        let npc = batch.num_payload_cols();
         let (ptrs, sizes) = batch.to_region_ptrs();
         let entry = self.tables.get_mut(&table_id).unwrap();
         match &mut entry.handle {
@@ -906,7 +906,7 @@ impl DagEngine {
                 batch, ic.col_idx, &schema, &ic.index_schema,
             );
             if idx_batch.count > 0 {
-                let idx_npc = idx_batch.col_data.len();
+                let idx_npc = idx_batch.num_payload_cols();
                 let (idx_ptrs, idx_sizes) = idx_batch.to_region_ptrs();
                 let _ = ic.index_table.ingest_batch_from_regions(
                     &idx_ptrs, &idx_sizes, idx_batch.count as u32, idx_npc,
@@ -955,7 +955,7 @@ impl DagEngine {
         let entry = self.tables.get_mut(&table_id).unwrap();
 
         // Stage 2: ingest into store
-        let npc = effective_batch.col_data.len();
+        let npc = effective_batch.num_payload_cols();
         let (ptrs, sizes) = effective_batch.to_region_ptrs();
         match &mut entry.handle {
             StoreHandle::Single(t) => {
@@ -976,7 +976,7 @@ impl DagEngine {
                 &effective_batch, ic.col_idx, &schema, &ic.index_schema,
             );
             if idx_batch.count > 0 {
-                let idx_npc = idx_batch.col_data.len();
+                let idx_npc = idx_batch.num_payload_cols();
                 let (idx_ptrs, idx_sizes) = idx_batch.to_region_ptrs();
                 let _ = ic.index_table.ingest_batch_from_regions(
                     &idx_ptrs, &idx_sizes, idx_batch.count as u32, idx_npc,
@@ -1582,7 +1582,7 @@ impl DagEngine {
             let (key_lo, key_hi) = if is_pk_col {
                 crate::util::split_pk(src.get_pk(row))
             } else {
-                let col_data = &src.col_data[src_payload_idx];
+                let col_data = src.col_data(src_payload_idx);
                 let offset = row * src_col_size;
                 if src_col_size == 8 {
                     let v = u64::from_le_bytes(col_data[offset..offset+8].try_into().unwrap());
@@ -1608,17 +1608,17 @@ impl DagEngine {
             let src_pk = src.get_pk(row);
             let (src_pk_lo, src_pk_hi) = crate::util::split_pk(src_pk);
 
-            out.pk_lo.extend_from_slice(&key_lo.to_le_bytes());
-            out.pk_hi.extend_from_slice(&key_hi.to_le_bytes());
-            out.weight.extend_from_slice(&weight.to_le_bytes());
-            out.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            out.extend_pk_lo(&key_lo.to_le_bytes());
+            out.extend_pk_hi(&key_hi.to_le_bytes());
+            out.extend_weight(&weight.to_le_bytes());
+            out.extend_null_bmp(&0u64.to_le_bytes());
 
             // Write payload column (source PK mapped to index payload)
             if out_payload_size == 16 {
-                out.col_data[0].extend_from_slice(&src_pk_lo.to_le_bytes());
-                out.col_data[0].extend_from_slice(&src_pk_hi.to_le_bytes());
+                out.extend_col(0, &src_pk_lo.to_le_bytes());
+                out.extend_col(0, &src_pk_hi.to_le_bytes());
             } else if out_payload_size == 8 {
-                out.col_data[0].extend_from_slice(&src_pk_lo.to_le_bytes());
+                out.extend_col(0, &src_pk_lo.to_le_bytes());
             }
             out.count += 1;
         }

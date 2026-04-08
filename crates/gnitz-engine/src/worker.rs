@@ -582,11 +582,11 @@ impl OwnedBatch {
         if row >= src.count { return; }
         let pk = src.get_pk(row);
         let (lo, hi) = crate::util::split_pk(pk);
-        self.pk_lo.extend_from_slice(&lo.to_le_bytes());
-        self.pk_hi.extend_from_slice(&hi.to_le_bytes());
-        self.weight.extend_from_slice(&weight.to_le_bytes());
+        self.extend_pk_lo(&lo.to_le_bytes());
+        self.extend_pk_hi(&hi.to_le_bytes());
+        self.extend_weight(&weight.to_le_bytes());
         let null_word = src.get_null_word(row);
-        self.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+        self.extend_null_bmp(&null_word.to_le_bytes());
 
         let schema = self.schema.unwrap_or_else(|| src.schema.unwrap());
         let pk_index = schema.pk_index as usize;
@@ -597,19 +597,25 @@ impl OwnedBatch {
             let cs = col_desc.size as usize;
             let is_null = (null_word >> pi) & 1 != 0;
             if is_null {
-                let new_len = self.col_data[pi].len() + cs;
-                self.col_data[pi].resize(new_len, 0);
+                self.fill_col_zero(pi, cs);
             } else if col_desc.type_code == crate::schema::type_code::STRING {
                 let off = row * cs;
-                crate::ops::write_string_from_raw(
-                    &mut self.col_data[pi],
-                    &mut self.blob,
-                    &src.col_data[pi][off..off + cs],
-                    if src.blob.is_empty() { std::ptr::null() } else { src.blob.as_ptr() },
-                );
+                let src_slice = &src.col_data(pi)[off..off + cs];
+                let (mut dest, is_long) = crate::schema::prep_german_string_copy(src_slice);
+                if is_long {
+                    let length = u32::from_le_bytes(src_slice[0..4].try_into().unwrap()) as usize;
+                    let src_blob_ptr = if src.blob.is_empty() { std::ptr::null() } else { src.blob.as_ptr() };
+                    assert!(!src_blob_ptr.is_null(), "append_row_from_batch: long string but src blob is empty");
+                    let old_offset = u64::from_le_bytes(src_slice[8..16].try_into().unwrap()) as usize;
+                    let src_data = unsafe { std::slice::from_raw_parts(src_blob_ptr.add(old_offset), length) };
+                    let new_offset = self.blob.len();
+                    self.blob.extend_from_slice(src_data);
+                    dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
+                }
+                self.extend_col(pi, &dest);
             } else {
                 let off = row * cs;
-                self.col_data[pi].extend_from_slice(&src.col_data[pi][off..off + cs]);
+                self.extend_col(pi, &src.col_data(pi)[off..off + cs]);
             }
             pi += 1;
         }
@@ -672,11 +678,11 @@ mod tests {
         let batch1 = OwnedBatch::with_schema(schema, 0);
         let mut batch2 = OwnedBatch::with_schema(schema, 1);
         // Add a row to batch2 to distinguish
-        batch2.pk_lo.extend_from_slice(&100u64.to_le_bytes());
-        batch2.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        batch2.weight.extend_from_slice(&1i64.to_le_bytes());
-        batch2.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-        batch2.col_data[0].extend_from_slice(&99u64.to_le_bytes());
+        batch2.extend_pk_lo(&100u64.to_le_bytes());
+        batch2.extend_pk_hi(&0u64.to_le_bytes());
+        batch2.extend_weight(&1i64.to_le_bytes());
+        batch2.extend_null_bmp(&0u64.to_le_bytes());
+        batch2.extend_col(0, &99u64.to_le_bytes());
         batch2.count = 1;
 
         handler.stash_preloaded(42, batch1);
@@ -691,19 +697,19 @@ mod tests {
         let mut pending: HashMap<i64, OwnedBatch> = HashMap::new();
 
         let mut b1 = OwnedBatch::with_schema(schema, 1);
-        b1.pk_lo.extend_from_slice(&1u64.to_le_bytes());
-        b1.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        b1.weight.extend_from_slice(&1i64.to_le_bytes());
-        b1.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-        b1.col_data[0].extend_from_slice(&10u64.to_le_bytes());
+        b1.extend_pk_lo(&1u64.to_le_bytes());
+        b1.extend_pk_hi(&0u64.to_le_bytes());
+        b1.extend_weight(&1i64.to_le_bytes());
+        b1.extend_null_bmp(&0u64.to_le_bytes());
+        b1.extend_col(0, &10u64.to_le_bytes());
         b1.count = 1;
 
         let mut b2 = OwnedBatch::with_schema(schema, 1);
-        b2.pk_lo.extend_from_slice(&2u64.to_le_bytes());
-        b2.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        b2.weight.extend_from_slice(&1i64.to_le_bytes());
-        b2.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-        b2.col_data[0].extend_from_slice(&20u64.to_le_bytes());
+        b2.extend_pk_lo(&2u64.to_le_bytes());
+        b2.extend_pk_hi(&0u64.to_le_bytes());
+        b2.extend_weight(&1i64.to_le_bytes());
+        b2.extend_null_bmp(&0u64.to_le_bytes());
+        b2.extend_col(0, &20u64.to_le_bytes());
         b2.count = 1;
 
         // First insert

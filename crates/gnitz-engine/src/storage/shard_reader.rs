@@ -438,28 +438,18 @@ impl MappedShard {
         use super::memtable::OwnedBatch;
 
         let npc = schema.num_columns as usize - 1;
-        let mut batch = OwnedBatch {
-            pk_lo: Vec::new(),
-            pk_hi: Vec::new(),
-            weight: Vec::new(),
-            null_bmp: Vec::new(),
-            col_data: Vec::with_capacity(npc),
-            blob: Vec::new(),
-            count: row_count,
-            sorted: true,
-            consolidated: true,
-            schema: Some(*schema),
-        };
 
         if row_count == 0 {
-            for _ in 0..npc {
-                batch.col_data.push(Vec::new());
-            }
-            batch.count = 0;
+            let mut batch = OwnedBatch::empty(npc);
+            batch.schema = Some(*schema);
             return batch;
         }
 
         let data = self.data();
+
+        // Build region pointer/size arrays for from_regions.
+        let num_regions = 4 + npc + 1; // pk_lo, pk_hi, weight, null_bmp, cols..., blob
+        let mut region_bufs: Vec<Vec<u8>> = Vec::with_capacity(num_regions);
 
         let expand_region = |region: &RegionView, stride: usize| -> Vec<u8> {
             match region {
@@ -486,25 +476,35 @@ impl MappedShard {
             }
         };
 
-        batch.pk_lo = expand_region(&self.pk_lo, 8);
-        batch.pk_hi = expand_region(&self.pk_hi, 8);
-        batch.weight = expand_region(&self.weight, 8);
-        batch.null_bmp = expand_region(&self.null_bmp, 8);
+        region_bufs.push(expand_region(&self.pk_lo, 8));
+        region_bufs.push(expand_region(&self.pk_hi, 8));
+        region_bufs.push(expand_region(&self.weight, 8));
+        region_bufs.push(expand_region(&self.null_bmp, 8));
 
         let pk_index = schema.pk_index as usize;
         let mut reg_idx = 0;
         for ci in 0..schema.num_columns as usize {
             if ci == pk_index { continue; }
             let col_size = schema.columns[ci].size as usize;
-            batch.col_data.push(expand_region(&self.col_regions[reg_idx], col_size));
+            region_bufs.push(expand_region(&self.col_regions[reg_idx], col_size));
             reg_idx += 1;
         }
 
-        // Copy full blob — string offsets are relative to blob start, so no relocation needed
-        if self.blob_len > 0 {
-            batch.blob = data[self.blob_off..self.blob_off + self.blob_len].to_vec();
-        }
+        // Blob region
+        let blob_data = if self.blob_len > 0 {
+            data[self.blob_off..self.blob_off + self.blob_len].to_vec()
+        } else {
+            Vec::new()
+        };
+        region_bufs.push(blob_data);
 
+        let ptrs: Vec<*const u8> = region_bufs.iter().map(|v| v.as_ptr()).collect();
+        let sizes: Vec<u32> = region_bufs.iter().map(|v| v.len() as u32).collect();
+
+        let mut batch = unsafe { OwnedBatch::from_regions(&ptrs, &sizes, row_count, npc) };
+        batch.sorted = true;
+        batch.consolidated = true;
+        batch.schema = Some(*schema);
         batch
     }
 
@@ -998,9 +998,9 @@ mod tests {
         assert!(batch.consolidated);
         for i in 0..10 {
             assert_eq!(batch.get_pk(i), (i + 1) as u128);
-            let w = crate::util::read_i64_le(&batch.weight, i * 8);
+            let w = crate::util::read_i64_le(batch.weight_data(), i * 8);
             assert_eq!(w, 1);
-            let v = crate::util::read_i64_le(&batch.col_data[0], i * 8);
+            let v = crate::util::read_i64_le(batch.col_data(0), i * 8);
             assert_eq!(v, (i as i64 + 1) * 100);
         }
     }
@@ -1024,8 +1024,8 @@ mod tests {
         assert_eq!(batch.count, n as usize);
         for i in 0..n as usize {
             assert_eq!(batch.get_pk(i), (i + 1) as u128);
-            assert_eq!(crate::util::read_i64_le(&batch.weight, i * 8), 1);
-            assert_eq!(crate::util::read_i64_le(&batch.col_data[0], i * 8), 42);
+            assert_eq!(crate::util::read_i64_le(batch.weight_data(), i * 8), 1);
+            assert_eq!(crate::util::read_i64_le(batch.col_data(0), i * 8), 42);
         }
     }
 
@@ -1047,8 +1047,8 @@ mod tests {
         assert_eq!(batch.count, n);
         for i in 0..n {
             let expected_w = if i % 2 == 0 { 1i64 } else { -1i64 };
-            assert_eq!(crate::util::read_i64_le(&batch.weight, i * 8), expected_w, "row {i}");
-            assert_eq!(crate::util::read_i64_le(&batch.col_data[0], i * 8), i as i64 * 10);
+            assert_eq!(crate::util::read_i64_le(batch.weight_data(), i * 8), expected_w, "row {i}");
+            assert_eq!(crate::util::read_i64_le(batch.col_data(0), i * 8), i as i64 * 10);
         }
     }
 
@@ -1068,8 +1068,8 @@ mod tests {
         assert_eq!(batch.count, 4);
         assert_eq!(batch.get_pk(0), 4);
         assert_eq!(batch.get_pk(3), 7);
-        assert_eq!(crate::util::read_i64_le(&batch.col_data[0], 0), 400);
-        assert_eq!(crate::util::read_i64_le(&batch.col_data[0], 3 * 8), 700);
+        assert_eq!(crate::util::read_i64_le(batch.col_data(0), 0), 400);
+        assert_eq!(crate::util::read_i64_le(batch.col_data(0), 3 * 8), 700);
     }
 
     #[test]

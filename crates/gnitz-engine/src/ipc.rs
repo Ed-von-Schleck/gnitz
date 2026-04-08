@@ -90,16 +90,16 @@ fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) -> OwnedBatch
         let name_st = encode_german_string(name, &mut batch.blob);
 
         // Append row: pk = (ci, 0), weight = 1, null_word = 0
-        batch.pk_lo.extend_from_slice(&(ci as u64).to_le_bytes());
-        batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        batch.weight.extend_from_slice(&1i64.to_le_bytes());
-        batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+        batch.extend_pk_lo(&(ci as u64).to_le_bytes());
+        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
         // payload col 0 (type_code): u64
-        batch.col_data[0].extend_from_slice(&type_code_val.to_le_bytes());
+        batch.extend_col(0, &type_code_val.to_le_bytes());
         // payload col 1 (flags): u64
-        batch.col_data[1].extend_from_slice(&flags.to_le_bytes());
+        batch.extend_col(1, &flags.to_le_bytes());
         // payload col 2 (name): 16-byte German string
-        batch.col_data[2].extend_from_slice(&name_st);
+        batch.extend_col(2, &name_st);
         batch.count += 1;
     }
     batch
@@ -124,15 +124,15 @@ fn batch_to_schema(batch: &OwnedBatch) -> Result<(SchemaDescriptor, Vec<Vec<u8>>
     for i in 0..batch.count {
         let off8 = i * 8;
         let type_code_val = u64::from_le_bytes(
-            batch.col_data[0][off8..off8 + 8].try_into().unwrap()
+            batch.col_data(0)[off8..off8 + 8].try_into().unwrap()
         ) as u8;
         let flags_val = u64::from_le_bytes(
-            batch.col_data[1][off8..off8 + 8].try_into().unwrap()
+            batch.col_data(1)[off8..off8 + 8].try_into().unwrap()
         );
 
         let off16 = i * 16;
         let mut st = [0u8; 16];
-        st.copy_from_slice(&batch.col_data[2][off16..off16 + 16]);
+        st.copy_from_slice(&batch.col_data(2)[off16..off16 + 16]);
         let name = decode_german_string(&st, &batch.blob);
         names.push(name);
 
@@ -183,24 +183,24 @@ fn encode_control_block(
     let has_error = !error_msg.is_empty();
     let null_word: u64 = if has_error { 0 } else { 1u64 << 7 }; // payload col 7 = error_msg
 
-    batch.pk_lo.extend_from_slice(&0u64.to_le_bytes()); // msg_idx PK = 0
-    batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-    batch.weight.extend_from_slice(&1i64.to_le_bytes());
-    batch.null_bmp.extend_from_slice(&null_word.to_le_bytes());
-    batch.col_data[0].extend_from_slice(&(status as u64).to_le_bytes());
-    batch.col_data[1].extend_from_slice(&client_id.to_le_bytes());
-    batch.col_data[2].extend_from_slice(&target_id.to_le_bytes());
-    batch.col_data[3].extend_from_slice(&flags.to_le_bytes());
-    batch.col_data[4].extend_from_slice(&seek_pk_lo.to_le_bytes());
-    batch.col_data[5].extend_from_slice(&seek_pk_hi.to_le_bytes());
-    batch.col_data[6].extend_from_slice(&seek_col_idx.to_le_bytes());
+    batch.extend_pk_lo(&0u64.to_le_bytes()); // msg_idx PK = 0
+    batch.extend_pk_hi(&0u64.to_le_bytes());
+    batch.extend_weight(&1i64.to_le_bytes());
+    batch.extend_null_bmp(&null_word.to_le_bytes());
+    batch.extend_col(0, &(status as u64).to_le_bytes());
+    batch.extend_col(1, &client_id.to_le_bytes());
+    batch.extend_col(2, &target_id.to_le_bytes());
+    batch.extend_col(3, &flags.to_le_bytes());
+    batch.extend_col(4, &seek_pk_lo.to_le_bytes());
+    batch.extend_col(5, &seek_pk_hi.to_le_bytes());
+    batch.extend_col(6, &seek_col_idx.to_le_bytes());
 
     let error_st = if has_error {
         encode_german_string(error_msg, &mut batch.blob)
     } else {
         [0u8; 16] // null
     };
-    batch.col_data[7].extend_from_slice(&error_st);
+    batch.extend_col(7, &error_st);
     batch.count = 1;
 
     encode_batch_to_wal(&batch, 0, IPC_CONTROL_TID)
@@ -208,7 +208,7 @@ fn encode_control_block(
 
 /// Encode an OwnedBatch into a WAL block using the gnitz-engine WAL encoder.
 fn encode_batch_to_wal(batch: &OwnedBatch, lsn: u64, table_id: u32) -> Vec<u8> {
-    let nr = batch.num_regions();
+    let nr = batch.num_regions_total();
     let mut ptrs = Vec::with_capacity(nr);
     let mut sizes = Vec::with_capacity(nr);
     for i in 0..nr {
@@ -372,22 +372,22 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
     let ctrl_batch = decode_wal_block(&data[..ctrl_size], &cs)?;
 
     // Extract control fields
-    let status = u64::from_le_bytes(ctrl_batch.col_data[0][0..8].try_into().unwrap()) as u32;
-    let client_id = u64::from_le_bytes(ctrl_batch.col_data[1][0..8].try_into().unwrap());
-    let target_id = u64::from_le_bytes(ctrl_batch.col_data[2][0..8].try_into().unwrap());
-    let flags = u64::from_le_bytes(ctrl_batch.col_data[3][0..8].try_into().unwrap());
-    let seek_pk_lo = u64::from_le_bytes(ctrl_batch.col_data[4][0..8].try_into().unwrap());
-    let seek_pk_hi = u64::from_le_bytes(ctrl_batch.col_data[5][0..8].try_into().unwrap());
-    let seek_col_idx = u64::from_le_bytes(ctrl_batch.col_data[6][0..8].try_into().unwrap());
+    let status = u64::from_le_bytes(ctrl_batch.col_data(0)[0..8].try_into().unwrap()) as u32;
+    let client_id = u64::from_le_bytes(ctrl_batch.col_data(1)[0..8].try_into().unwrap());
+    let target_id = u64::from_le_bytes(ctrl_batch.col_data(2)[0..8].try_into().unwrap());
+    let flags = u64::from_le_bytes(ctrl_batch.col_data(3)[0..8].try_into().unwrap());
+    let seek_pk_lo = u64::from_le_bytes(ctrl_batch.col_data(4)[0..8].try_into().unwrap());
+    let seek_pk_hi = u64::from_le_bytes(ctrl_batch.col_data(5)[0..8].try_into().unwrap());
+    let seek_col_idx = u64::from_le_bytes(ctrl_batch.col_data(6)[0..8].try_into().unwrap());
 
     // error_msg: payload col 7, null bit 7
-    let null_word = u64::from_le_bytes(ctrl_batch.null_bmp[0..8].try_into().unwrap());
+    let null_word = u64::from_le_bytes(ctrl_batch.null_bmp_data()[0..8].try_into().unwrap());
     let error_is_null = (null_word & (1u64 << 7)) != 0;
     let error_msg = if error_is_null {
         Vec::new()
     } else {
         let mut st = [0u8; 16];
-        st.copy_from_slice(&ctrl_batch.col_data[7][0..16]);
+        st.copy_from_slice(&ctrl_batch.col_data(7)[0..16]);
         decode_german_string(&st, &ctrl_batch.blob)
     };
 
@@ -1554,11 +1554,11 @@ mod tests {
     fn make_simple_batch(pk: u64, val: u64) -> OwnedBatch {
         let sd = simple_schema();
         let mut b = OwnedBatch::with_schema(sd, 1);
-        b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-        b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        b.weight.extend_from_slice(&1i64.to_le_bytes());
-        b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-        b.col_data[0].extend_from_slice(&val.to_le_bytes());
+        b.extend_pk_lo(&pk.to_le_bytes());
+        b.extend_pk_hi(&0u64.to_le_bytes());
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes());
         b.count = 1;
         b.sorted = true;
         b.consolidated = true;
@@ -1623,10 +1623,10 @@ mod tests {
         let db = decoded.data_batch.as_ref().unwrap();
         assert_eq!(db.count, 1);
         // Check pk_lo
-        let pk = u64::from_le_bytes(db.pk_lo[0..8].try_into().unwrap());
+        let pk = u64::from_le_bytes(db.pk_lo_data()[0..8].try_into().unwrap());
         assert_eq!(pk, 100);
         // Check payload col 0 (val)
-        let val = u64::from_le_bytes(db.col_data[0][0..8].try_into().unwrap());
+        let val = u64::from_le_bytes(db.col_data(0)[0..8].try_into().unwrap());
         assert_eq!(val, 999);
         // Check sorted/consolidated flags roundtrip
         assert!(db.sorted);
@@ -1703,24 +1703,25 @@ mod tests {
         let mut batch = OwnedBatch::with_schema(sd, 2);
 
         // Row 1: short string
-        batch.pk_lo.extend_from_slice(&1u64.to_le_bytes());
-        batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        batch.weight.extend_from_slice(&1i64.to_le_bytes());
-        batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-        batch.col_data[0].extend_from_slice(&42u64.to_le_bytes()); // int col
+        batch.extend_pk_lo(&1u64.to_le_bytes());
+        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.extend_col(0, &42u64.to_le_bytes()); // int col
         let st1 = encode_german_string(b"hello", &mut batch.blob);
-        batch.col_data[1].extend_from_slice(&st1);
+        batch.extend_col(1, &st1);
+        batch.count += 1;
 
         // Row 2: long string
-        batch.pk_lo.extend_from_slice(&2u64.to_le_bytes());
-        batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        batch.weight.extend_from_slice(&1i64.to_le_bytes());
-        batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-        batch.col_data[0].extend_from_slice(&99u64.to_le_bytes());
+        batch.extend_pk_lo(&2u64.to_le_bytes());
+        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.extend_col(0, &99u64.to_le_bytes());
         let long_str = b"this is a long string that exceeds twelve bytes";
         let st2 = encode_german_string(long_str, &mut batch.blob);
-        batch.col_data[1].extend_from_slice(&st2);
-        batch.count = 2;
+        batch.extend_col(1, &st2);
+        batch.count += 1;
 
         let names: Vec<&[u8]> = vec![b"id", b"val", b"name"];
         let wire = encode_wire(
@@ -1734,13 +1735,13 @@ mod tests {
 
         // Verify short string roundtrip
         let mut s1 = [0u8; 16];
-        s1.copy_from_slice(&db.col_data[1][0..16]);
+        s1.copy_from_slice(&db.col_data(1)[0..16]);
         let str1 = decode_german_string(&s1, &db.blob);
         assert_eq!(str1, b"hello");
 
         // Verify long string roundtrip
         let mut s2 = [0u8; 16];
-        s2.copy_from_slice(&db.col_data[1][16..32]);
+        s2.copy_from_slice(&db.col_data(1)[16..32]);
         let str2 = decode_german_string(&s2, &db.blob);
         assert_eq!(str2, long_str);
     }

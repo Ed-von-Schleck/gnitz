@@ -925,7 +925,7 @@ impl MasterDispatcher {
                 let (key_lo, key_hi) = if is_pk_col {
                     crate::util::split_pk(pk_i)
                 } else {
-                    let col_data = &batch.col_data[src_payload_idx];
+                    let col_data = batch.col_data(src_payload_idx);
                     promote_to_index_key(col_data, i * col_size, col_size, type_code)
                 };
 
@@ -1038,7 +1038,7 @@ impl MasterDispatcher {
                 let null_word = batch.get_null_word(i);
                 if null_word & (1u64 << payload_col) != 0 { continue; }
 
-                let col_data = &batch.col_data[payload_col];
+                let col_data = batch.col_data(payload_col);
                 let (fk_lo, fk_hi) = promote_to_index_key(col_data, i * col_size, col_size, col_type);
                 let fk_key = crate::util::make_pk(fk_lo, fk_hi);
                 if seen.insert(fk_key) {
@@ -1149,13 +1149,14 @@ fn build_check_batch(schema: &SchemaDescriptor, lo_list: &[u64], hi_list: &[u64]
     let mut batch = OwnedBatch::with_schema(*schema, lo_list.len());
     let null_word: u64 = if npc > 0 { (1u64 << npc) - 1 } else { 0 };
     for k in 0..lo_list.len() {
-        batch.pk_lo.extend_from_slice(&lo_list[k].to_le_bytes());
-        batch.pk_hi.extend_from_slice(&hi_list[k].to_le_bytes());
-        batch.weight.extend_from_slice(&1i64.to_le_bytes());
-        batch.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+        batch.ensure_row_capacity();
+        batch.extend_pk_lo(&lo_list[k].to_le_bytes());
+        batch.extend_pk_hi(&hi_list[k].to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&null_word.to_le_bytes());
         for c in 0..npc {
             let col_size = schema.columns[if c < schema.pk_index as usize { c } else { c + 1 }].size as usize;
-            batch.col_data[c].extend(std::iter::repeat(0u8).take(col_size));
+            batch.fill_col_zero(c, col_size);
         }
         batch.count += 1;
     }

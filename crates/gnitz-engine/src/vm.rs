@@ -687,17 +687,7 @@ impl RegisterFile {
     pub fn clear_deltas(&mut self) {
         for reg in &mut self.registers {
             if reg.kind == RegisterKind::Delta && reg.schema.num_columns > 0 {
-                reg.batch.count = 0;
-                reg.batch.pk_lo.clear();
-                reg.batch.pk_hi.clear();
-                reg.batch.weight.clear();
-                reg.batch.null_bmp.clear();
-                for col in &mut reg.batch.col_data {
-                    col.clear();
-                }
-                reg.batch.blob.clear();
-                reg.batch.sorted = true;
-                reg.batch.consolidated = true;
+                reg.batch.clear();
             }
         }
     }
@@ -767,7 +757,7 @@ pub fn execute_epoch(
             }
 
             Instr::Delay { src, state_reg, dst } => {
-                let npc = reg!(*src).batch.col_data.len();
+                let npc = reg!(*src).batch.num_payload_cols();
                 let curr = std::mem::replace(&mut reg_mut!(*src).batch, OwnedBatch::empty(npc));
                 let prev = std::mem::replace(&mut reg_mut!(*state_reg).batch, curr);
                 reg_mut!(*dst).batch = prev;
@@ -784,8 +774,8 @@ pub fn execute_epoch(
             Instr::SeekTrace { trace_reg, key_reg } => {
                 let kb = &reg!(*key_reg).batch;
                 if kb.count > 0 {
-                    let key_lo = u64::from_le_bytes(kb.pk_lo[..8].try_into().unwrap());
-                    let key_hi = u64::from_le_bytes(kb.pk_hi[..8].try_into().unwrap());
+                    let key_lo = u64::from_le_bytes(kb.pk_lo_data()[..8].try_into().unwrap());
+                    let key_hi = u64::from_le_bytes(kb.pk_hi_data()[..8].try_into().unwrap());
                     if let Some(cursor) = cursor_mut!(*trace_reg) {
                         cursor.seek(crate::util::make_pk(key_lo, key_hi));
                     }
@@ -1089,7 +1079,7 @@ pub fn execute_epoch(
     // 4. Extract output
     let out = &mut regfile.registers[output_reg as usize];
     if out.batch.count > 0 {
-        let npc = out.batch.col_data.len();
+        let npc = out.batch.num_payload_cols();
         let result = std::mem::replace(&mut out.batch, OwnedBatch::empty(npc));
         Ok(Some(result))
     } else {
@@ -1133,13 +1123,13 @@ mod tests {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(schema, n);
         for &(pk_lo, pk_hi, w, c0) in rows {
-            b.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
-            b.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&c0.to_le_bytes());
+            b.extend_pk_lo(&pk_lo.to_le_bytes());
+            b.extend_pk_hi(&pk_hi.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &c0.to_le_bytes());
+            b.count += 1;
         }
-        b.count = n;
         b.sorted = true;
         b.consolidated = true;
         b
@@ -1150,14 +1140,14 @@ mod tests {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(schema, n);
         for &(pk_lo, pk_hi, w, c0, c1) in rows {
-            b.pk_lo.extend_from_slice(&pk_lo.to_le_bytes());
-            b.pk_hi.extend_from_slice(&pk_hi.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&c0.to_le_bytes());
-            b.col_data[1].extend_from_slice(&c1.to_le_bytes());
+            b.extend_pk_lo(&pk_lo.to_le_bytes());
+            b.extend_pk_hi(&pk_hi.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &c0.to_le_bytes());
+            b.extend_col(1, &c1.to_le_bytes());
+            b.count += 1;
         }
-        b.count = n;
         b.sorted = true;
         b.consolidated = true;
         b
@@ -1167,9 +1157,9 @@ mod tests {
     fn extract_rows(b: &OwnedBatch) -> Vec<(u64, i64, i64)> {
         let mut rows = Vec::new();
         for i in 0..b.count {
-            let pk_lo = u64::from_le_bytes(b.pk_lo[i*8..(i+1)*8].try_into().unwrap());
-            let w = i64::from_le_bytes(b.weight[i*8..(i+1)*8].try_into().unwrap());
-            let c0 = i64::from_le_bytes(b.col_data[0][i*8..(i+1)*8].try_into().unwrap());
+            let pk_lo = u64::from_le_bytes(b.pk_lo_data()[i*8..(i+1)*8].try_into().unwrap());
+            let w = i64::from_le_bytes(b.weight_data()[i*8..(i+1)*8].try_into().unwrap());
+            let c0 = i64::from_le_bytes(b.col_data(0)[i*8..(i+1)*8].try_into().unwrap());
             rows.push((pk_lo, w, c0));
         }
         rows
@@ -1683,11 +1673,11 @@ mod tests {
 
         assert_eq!(result.count, 1);
         // Weight should be product: 1*1 = 1
-        let w = i64::from_le_bytes(result.weight[0..8].try_into().unwrap());
+        let w = i64::from_le_bytes(result.weight_data()[0..8].try_into().unwrap());
         assert_eq!(w, 1);
         // First payload col should be from left (100), second from right (200)
-        let c0 = i64::from_le_bytes(result.col_data[0][0..8].try_into().unwrap());
-        let c1 = i64::from_le_bytes(result.col_data[1][0..8].try_into().unwrap());
+        let c0 = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
+        let c1 = i64::from_le_bytes(result.col_data(1)[0..8].try_into().unwrap());
         assert_eq!(c0, 100);
         assert_eq!(c1, 200);
 
@@ -1740,7 +1730,7 @@ mod tests {
         assert_eq!(result.count, 3);
         // Each output weight = 2 * 1 = 2
         for i in 0..3 {
-            let w = i64::from_le_bytes(result.weight[i*8..(i+1)*8].try_into().unwrap());
+            let w = i64::from_le_bytes(result.weight_data()[i*8..(i+1)*8].try_into().unwrap());
             assert_eq!(w, 2);
         }
 
@@ -2067,7 +2057,7 @@ mod tests {
 
         // After seeking to pk=5, scan should find pk=5 and pk=10 (2 rows from pk=5 onwards)
         assert!(result.count >= 2);
-        let pk0 = u64::from_le_bytes(result.pk_lo[0..8].try_into().unwrap());
+        let pk0 = u64::from_le_bytes(result.pk_lo_data()[0..8].try_into().unwrap());
         assert_eq!(pk0, 5);
 
         unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
@@ -2103,10 +2093,10 @@ mod tests {
         ).unwrap().unwrap();
 
         assert_eq!(result.count, 1);
-        let w = i64::from_le_bytes(result.weight[0..8].try_into().unwrap());
+        let w = i64::from_le_bytes(result.weight_data()[0..8].try_into().unwrap());
         assert_eq!(w, 4); // 2 * 2 (self-join weight multiplication)
-        let c0 = i64::from_le_bytes(result.col_data[0][0..8].try_into().unwrap());
-        let c1 = i64::from_le_bytes(result.col_data[1][0..8].try_into().unwrap());
+        let c0 = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
+        let c1 = i64::from_le_bytes(result.col_data(1)[0..8].try_into().unwrap());
         assert_eq!(c0, 100);
         assert_eq!(c1, 100);
     }
@@ -2373,9 +2363,9 @@ mod tests {
         // Should produce 1 row: pk=1, count=3, sum=60
         assert_eq!(result.count, 1, "multi-agg should produce 1 group");
         let count_val = i64::from_le_bytes(
-            result.col_data[0][0..8].try_into().unwrap());
+            result.col_data(0)[0..8].try_into().unwrap());
         let sum_val = i64::from_le_bytes(
-            result.col_data[1][0..8].try_into().unwrap());
+            result.col_data(1)[0..8].try_into().unwrap());
         assert_eq!(count_val, 3, "COUNT should be 3");
         assert_eq!(sum_val, 60, "SUM should be 60");
 

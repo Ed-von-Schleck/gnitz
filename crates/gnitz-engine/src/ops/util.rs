@@ -9,17 +9,28 @@ use crate::xxh;
 // String relocation helpers
 // ---------------------------------------------------------------------------
 
-/// Copy a German String from a MemBatch into the output OwnedBatch.
+/// Copy a German String from a MemBatch into the output OwnedBatch at
+/// payload column `out_pi` (current row position).
 pub(super) fn write_string_from_batch(
-    col_buf: &mut Vec<u8>,
-    blob: &mut Vec<u8>,
+    output: &mut OwnedBatch,
+    out_pi: usize,
     batch: &MemBatch,
     row: usize,
     payload_col: usize,
 ) {
     let src = batch.get_col_ptr(row, payload_col, 16);
     let blob_ptr = if batch.blob.is_empty() { std::ptr::null() } else { batch.blob.as_ptr() };
-    write_string_from_raw(col_buf, blob, src, blob_ptr);
+    let (mut dest, is_long) = crate::schema::prep_german_string_copy(src);
+    if is_long {
+        let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
+        assert!(!blob_ptr.is_null(), "write_string_from_batch: long string but src blob is empty");
+        let old_offset = u64::from_le_bytes(src[8..16].try_into().unwrap()) as usize;
+        let src_data = unsafe { std::slice::from_raw_parts(blob_ptr.add(old_offset), length) };
+        let new_offset = output.blob.len();
+        output.blob.extend_from_slice(src_data);
+        dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
+    }
+    output.extend_col(out_pi, &dest);
 }
 
 /// Copy a German String from raw 16-byte struct + blob base ptr into the output.
@@ -74,10 +85,10 @@ pub(super) fn append_cursor_row_to_batch(
     schema: &SchemaDescriptor,
 ) {
     let pki = schema.pk_index as usize;
-    output.pk_lo.extend_from_slice(&cursor.current_key_lo.to_le_bytes());
-    output.pk_hi.extend_from_slice(&cursor.current_key_hi.to_le_bytes());
-    output.weight.extend_from_slice(&cursor.current_weight.to_le_bytes());
-    output.null_bmp.extend_from_slice(&cursor.current_null_word.to_le_bytes());
+    output.extend_pk_lo(&cursor.current_key_lo.to_le_bytes());
+    output.extend_pk_hi(&cursor.current_key_hi.to_le_bytes());
+    output.extend_weight(&cursor.current_weight.to_le_bytes());
+    output.extend_null_bmp(&cursor.current_null_word.to_le_bytes());
 
     let blob_base = cursor.blob_ptr();
     let mut pi = 0;
@@ -89,29 +100,32 @@ pub(super) fn append_cursor_row_to_batch(
         let cs = col.size as usize;
         let is_null = (cursor.current_null_word >> pi) & 1 != 0;
         if is_null {
-            let new_len = output.col_data[pi].len() + cs;
-            output.col_data[pi].resize(new_len, 0);
+            output.fill_col_zero(pi, cs);
         } else if col.type_code == TYPE_STRING {
             let ptr = cursor.col_ptr(ci, 16);
             if ptr.is_null() {
-                let new_len = output.col_data[pi].len() + 16;
-                output.col_data[pi].resize(new_len, 0);
+                output.fill_col_zero(pi, 16);
             } else {
                 let src = unsafe { std::slice::from_raw_parts(ptr, 16) };
-                write_string_from_raw(
-                    &mut output.col_data[pi],
-                    &mut output.blob,
-                    src, blob_base,
-                );
+                let (mut dest, is_long) = crate::schema::prep_german_string_copy(src);
+                if is_long {
+                    let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
+                    assert!(!blob_base.is_null(), "append_cursor_row_to_batch: long string but blob_base is null");
+                    let old_offset = u64::from_le_bytes(src[8..16].try_into().unwrap()) as usize;
+                    let src_data = unsafe { std::slice::from_raw_parts(blob_base.add(old_offset), length) };
+                    let new_offset = output.blob.len();
+                    output.blob.extend_from_slice(src_data);
+                    dest[8..16].copy_from_slice(&(new_offset as u64).to_le_bytes());
+                }
+                output.extend_col(pi, &dest);
             }
         } else {
             let ptr = cursor.col_ptr(ci, cs);
             if ptr.is_null() {
-                let new_len = output.col_data[pi].len() + cs;
-                output.col_data[pi].resize(new_len, 0);
+                output.fill_col_zero(pi, cs);
             } else {
                 let src = unsafe { std::slice::from_raw_parts(ptr, cs) };
-                output.col_data[pi].extend_from_slice(src);
+                output.extend_col(pi, src);
             }
         }
         pi += 1;

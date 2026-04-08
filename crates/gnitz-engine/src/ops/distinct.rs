@@ -122,13 +122,12 @@ mod tests {
     ) -> OwnedBatch {
         let n = rows.len();
         let mut b = OwnedBatch::with_schema(*schema, n.max(1));
-        b.count = 0;
         for &(pk, w, val) in rows {
-            b.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            b.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            b.weight.extend_from_slice(&w.to_le_bytes());
-            b.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            b.col_data[0].extend_from_slice(&val.to_le_bytes());
+            b.extend_pk_lo(&pk.to_le_bytes());
+            b.extend_pk_hi(&0u64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;

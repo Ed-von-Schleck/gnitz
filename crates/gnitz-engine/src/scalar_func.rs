@@ -79,18 +79,17 @@ fn copy_column(
     if cm.src_ci == in_pki {
         let out_ci = payload_to_col(cm.dst_payload, out_pki);
         let stride = out_schema.columns[out_ci].size as usize;
-        let mut buf = vec![0u8; n * stride];
+        let dst = output.col_data_mut(cm.dst_payload);
         for row in 0..n {
             let pk_lo = in_batch.get_pk(row) as u64;
-            buf[row * stride..row * stride + 8]
+            dst[row * stride..row * stride + 8]
                 .copy_from_slice(&pk_lo.to_le_bytes());
         }
-        output.col_data[cm.dst_payload] = buf;
     } else if cm.type_code == type_code::STRING {
         let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };
         let stride = in_schema.columns[cm.src_ci].size as usize;
-        let src_col = &in_batch.col_data[in_pi];
-        let mut dest_col = src_col[..n * stride].to_vec();
+        let src_col = in_batch.col_data(in_pi);
+        output.col_data_mut(cm.dst_payload).copy_from_slice(&src_col[..n * stride]);
         for row in 0..n {
             let off = row * stride;
             let src_struct = &src_col[off..off + stride];
@@ -101,15 +100,14 @@ fn copy_column(
                 let src_data = &in_batch.blob[old_offset..old_offset + length];
                 let new_offset = output.blob.len();
                 output.blob.extend_from_slice(src_data);
-                dest_col[off + 8..off + 16]
+                output.col_data_mut(cm.dst_payload)[off + 8..off + 16]
                     .copy_from_slice(&(new_offset as u64).to_le_bytes());
             }
         }
-        output.col_data[cm.dst_payload] = dest_col;
     } else {
         let in_pi = if cm.src_ci < in_pki { cm.src_ci } else { cm.src_ci - 1 };
         let stride = in_schema.columns[cm.src_ci].size as usize;
-        output.col_data[cm.dst_payload] = in_batch.col_data[in_pi][..n * stride].to_vec();
+        output.col_data_mut(cm.dst_payload).copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
     }
 }
 
@@ -375,31 +373,24 @@ impl Plan {
         }
 
         let out_pki = out_schema.pk_index as usize;
-        let mut output = OwnedBatch::empty(out_npc);
+        let mut output = OwnedBatch::with_schema(*out_schema, n);
+        output.count = n;
 
         // System columns
-        output.pk_lo = in_batch.pk_lo.clone();
-        output.pk_hi = in_batch.pk_hi.clone();
-        output.weight = in_batch.weight.clone();
-        output.count = n;
+        output.pk_lo_data_mut().copy_from_slice(in_batch.pk_lo_data());
+        output.pk_hi_data_mut().copy_from_slice(in_batch.pk_hi_data());
+        output.weight_data_mut().copy_from_slice(in_batch.weight_data());
 
         // Column moves
         for cm in &self.col_moves {
             copy_column(in_batch, &mut output, cm, in_schema, out_schema);
         }
 
-        // EMIT_NULL columns — zero-fill (derive positions from NullPerm.constant)
-        let mut emit_null_bits = self.null_perm.constant;
-        while emit_null_bits != 0 {
-            let pl = emit_null_bits.trailing_zeros() as usize;
-            let out_ci = payload_to_col(pl, out_pki);
-            let stride = out_schema.columns[out_ci].size as usize;
-            output.col_data[pl] = vec![0u8; n * stride];
-            emit_null_bits &= emit_null_bits - 1;
-        }
+        // EMIT_NULL columns — already zero-filled by with_schema
 
         // Null bitmap (columnar)
-        output.null_bmp = self.null_perm.apply_column(&in_batch.null_bmp, n);
+        let null_bmp_result = self.null_perm.apply_column(in_batch.null_bmp_data(), n);
+        output.null_bmp_data_mut().copy_from_slice(&null_bmp_result);
 
         // Compute kernel
         if let ComputeKernel::Interpreted { prog, emit_payloads } = &self.compute {
@@ -407,13 +398,13 @@ impl Plan {
             for &out_payload in emit_payloads {
                 let out_ci = payload_to_col(out_payload, out_pki);
                 let stride = out_schema.columns[out_ci].size as usize;
-                output.col_data[out_payload] = vec![0u8; n * stride];
-                let base = output.col_data[out_payload].as_mut_ptr();
+                // Column is already zero-filled; get raw pointer for emit
+                let base = output.col_data_mut(out_payload).as_mut_ptr();
                 emit_targets.push(EmitTarget { base, stride, payload_col: out_payload });
             }
 
             let in_mb = in_batch.as_mem_batch();
-            let null_arr = output.null_bmp.as_mut_ptr() as *mut u64;
+            let null_arr = output.null_bmp_data_mut().as_mut_ptr() as *mut u64;
             for row in 0..n {
                 let in_null = in_batch.get_null_word(row);
                 let (_, _, mask) = expr::eval_with_emit(
@@ -467,21 +458,19 @@ mod tests {
         schema: &SchemaDescriptor,
         rows: &[(u64, i64, u64, &[i64])],
     ) -> OwnedBatch {
-        let npc = schema.num_columns as usize - 1;
-        let mut batch = OwnedBatch::empty(npc);
-        batch.schema = Some(*schema);
+        let mut batch = OwnedBatch::with_schema(*schema, rows.len().max(1));
         for &(pk, weight, null_word, cols) in rows {
-            batch.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            batch.weight.extend_from_slice(&weight.to_le_bytes());
-            batch.null_bmp.extend_from_slice(&null_word.to_le_bytes());
+            batch.extend_pk_lo(&pk.to_le_bytes());
+            batch.extend_pk_hi(&0u64.to_le_bytes());
+            batch.extend_weight(&weight.to_le_bytes());
+            batch.extend_null_bmp(&null_word.to_le_bytes());
             let mut pi = 0;
             for ci in 0..schema.num_columns as usize {
                 if ci == schema.pk_index as usize {
                     continue;
                 }
                 if pi < cols.len() {
-                    batch.col_data[pi].extend_from_slice(&cols[pi].to_le_bytes());
+                    batch.extend_col(pi, &cols[pi].to_le_bytes());
                 }
                 pi += 1;
             }
@@ -521,8 +510,8 @@ mod tests {
         let result = func.evaluate_map_batch(&batch, &in_schema, &out_schema);
         assert_eq!(result.count, 2);
 
-        let r0_col0 = i64::from_le_bytes(result.col_data[0][0..8].try_into().unwrap());
-        let r0_col1 = i64::from_le_bytes(result.col_data[1][0..8].try_into().unwrap());
+        let r0_col0 = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
+        let r0_col1 = i64::from_le_bytes(result.col_data(1)[0..8].try_into().unwrap());
         assert_eq!(r0_col0, 20);
         assert_eq!(r0_col1, 10);
     }
@@ -549,9 +538,9 @@ mod tests {
         let result = func.evaluate_map_batch(&batch, &in_schema, &out_schema);
         assert_eq!(result.count, 1);
 
-        let v0 = i64::from_le_bytes(result.col_data[0][0..8].try_into().unwrap());
+        let v0 = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
         assert_eq!(v0, 10);
-        let v1 = i64::from_le_bytes(result.col_data[1][0..8].try_into().unwrap());
+        let v1 = i64::from_le_bytes(result.col_data(1)[0..8].try_into().unwrap());
         assert_eq!(v1, 30);
     }
 

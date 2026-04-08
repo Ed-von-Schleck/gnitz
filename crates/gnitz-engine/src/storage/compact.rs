@@ -343,10 +343,10 @@ mod tests {
         let mut batch = OwnedBatch::with_schema(*schema, pks.len());
 
         for i in 0..pks.len() {
-            batch.pk_lo.extend_from_slice(&pks[i].to_le_bytes());
-            batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            batch.weight.extend_from_slice(&weights[i].to_le_bytes());
-            batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            batch.extend_pk_lo(&pks[i].to_le_bytes());
+            batch.extend_pk_hi(&0u64.to_le_bytes());
+            batch.extend_weight(&weights[i].to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
 
             let mut pi = 0;
             for ci in 0..schema.num_columns as usize {
@@ -355,7 +355,7 @@ mod tests {
                 let mut val_bytes = vec![0u8; cs];
                 let copy_len = cs.min(8);
                 val_bytes[..copy_len].copy_from_slice(&pks[i].to_le_bytes()[..copy_len]);
-                batch.col_data[pi].extend_from_slice(&val_bytes);
+                batch.extend_col(pi, &val_bytes);
                 pi += 1;
             }
             batch.count += 1;
@@ -754,16 +754,16 @@ mod tests {
         // Build shard with short strings
         let mut batch = OwnedBatch::with_schema(schema, 3);
         for pk in [1u64, 2, 3] {
-            batch.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            batch.weight.extend_from_slice(&1i64.to_le_bytes());
-            batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            batch.extend_pk_lo(&pk.to_le_bytes());
+            batch.extend_pk_hi(&0u64.to_le_bytes());
+            batch.extend_weight(&1i64.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
 
             // Write a short string: "hi" (2 bytes, inline)
             let mut str_struct = [0u8; 16];
             str_struct[0..4].copy_from_slice(&2u32.to_le_bytes()); // length=2
             str_struct[4] = b'h'; str_struct[5] = b'i'; // prefix
-            batch.col_data[0].extend_from_slice(&str_struct);
+            batch.extend_col(0, &str_struct);
             batch.count += 1;
         }
         let s1 = dir.join("s1.db");
@@ -811,20 +811,20 @@ mod tests {
         // Build shard: key 1 = non-null (42), key 2 = null
         let mut batch = OwnedBatch::with_schema(schema, 2);
         // Row 1: non-null
-        batch.pk_lo.extend_from_slice(&1u64.to_le_bytes());
-        batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        batch.weight.extend_from_slice(&1i64.to_le_bytes());
-        batch.null_bmp.extend_from_slice(&0u64.to_le_bytes()); // no nulls
-        batch.col_data[0].extend_from_slice(&42i64.to_le_bytes());
+        batch.extend_pk_lo(&1u64.to_le_bytes());
+        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes()); // no nulls
+        batch.extend_col(0, &42i64.to_le_bytes());
         batch.count += 1;
 
         // Row 2: null column
-        batch.pk_lo.extend_from_slice(&2u64.to_le_bytes());
-        batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-        batch.weight.extend_from_slice(&1i64.to_le_bytes());
+        batch.extend_pk_lo(&2u64.to_le_bytes());
+        batch.extend_pk_hi(&0u64.to_le_bytes());
+        batch.extend_weight(&1i64.to_le_bytes());
         // null bit for col_idx=1, pk_index=0 → payload_idx = 0 → bit 0
-        batch.null_bmp.extend_from_slice(&1u64.to_le_bytes());
-        batch.col_data[0].extend_from_slice(&0i64.to_le_bytes());
+        batch.extend_null_bmp(&1u64.to_le_bytes());
+        batch.extend_col(0, &0i64.to_le_bytes());
         batch.count += 1;
 
         let s1 = dir.join("s1.db");
@@ -874,12 +874,12 @@ mod tests {
     ) {
         let mut batch = OwnedBatch::with_schema(*schema, rows.len());
         for &(pk, w, c1, c2) in rows {
-            batch.pk_lo.extend_from_slice(&pk.to_le_bytes());
-            batch.pk_hi.extend_from_slice(&0u64.to_le_bytes());
-            batch.weight.extend_from_slice(&w.to_le_bytes());
-            batch.null_bmp.extend_from_slice(&0u64.to_le_bytes());
-            batch.col_data[0].extend_from_slice(&c1.to_le_bytes());
-            batch.col_data[1].extend_from_slice(&c2.to_le_bytes());
+            batch.extend_pk_lo(&pk.to_le_bytes());
+            batch.extend_pk_hi(&0u64.to_le_bytes());
+            batch.extend_weight(&w.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.extend_col(0, &c1.to_le_bytes());
+            batch.extend_col(1, &c2.to_le_bytes());
             batch.count += 1;
         }
         let cpath = std::ffi::CString::new(path).unwrap();
