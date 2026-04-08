@@ -6,4 +6,4 @@ edition = "2021"
 [dependencies]
 gnitz-wire = { path = "../gnitz-wire" }
 libc = "0.2"
-twox-hash = { version = "2", features = ["xxhash3_64"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

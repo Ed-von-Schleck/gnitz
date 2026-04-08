@@ -35,7 +35,7 @@ fn append_64bit_region<T: Copy>(buf: &mut Vec<u8>, vals: &[T]) -> (u32, u32) {
 }
 
 fn xxh3_64(data: &[u8]) -> u64 {
-    twox_hash::XxHash3_64::oneshot(data)
+    xxhash_rust::xxh3::xxh3_64(data)
 }
 
 fn encode_german_string(s: &str, blob: &mut Vec<u8>) -> [u8; 16] {
