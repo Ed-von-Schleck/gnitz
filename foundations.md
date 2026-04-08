@@ -31,9 +31,22 @@ negative weights, but base table traces never accumulate negative net
 weights. Load-bearing: `distinct` assumes this, and DBSP Propositions
 4.5/4.6 (distinct-elimination) require positive inputs.
 
+**Single-column PKs only.** Each table has exactly one PK column
+(enforced by schema validation). The 128-bit slot holds one column
+value: `(lo, hi)` for U128, `(value, 0)` for narrower types.
+
 **Physical representation.** `ArenaZSetBatch`: columnar buffers where each
 row is (pk_lo, pk_hi, weight, null_word, col_0, col_1, ...). Multiple
 rows may share the same PK if their payloads differ.
+
+**PK uniqueness is not a general invariant.** The 128-bit PK slot is a
+sort/routing key. It is unique for base table batches (DML-enforced)
+and reduce output (one row per group). It is NOT unique for
+intermediate batches: `map_reindex` overwrites the PK slot with a
+join/group column value, and join output inherits the left input's PK.
+Multiple output rows may share the same PK with different payloads.
+All operators use full (PK, payload) identity — none assume PK
+uniqueness for intermediate results.
 
 ## 2. Z-Set Operations
 
@@ -117,6 +130,11 @@ Only non-linear and bilinear operators need the integral. The output of
   Both sides use old-state cursors. Correct under single-source-per-epoch
   (dA ⋈ dB = 0). Must be revised if batched multi-source epochs are added.
 - Require integral of both operands. Consolidation required.
+- **Join output schema:** `[left_PK, left_payload..., right_payload...]`.
+  Output PK = left input PK (= join key after exchange repartition).
+  The right batch's PK (also = join key) is not duplicated in the
+  output. Original table PKs are preserved in payload columns (moved
+  there by `map_reindex`). No information is lost.
 
 **Left outer join** — extends bilinear join with null-fill:
 - For each delta row, if inner-join matches exist: emit them (weight =
