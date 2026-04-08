@@ -1258,7 +1258,8 @@ impl CatalogEngine {
             }
         };
 
-        let mut batch = OwnedBatch::with_schema(*schema, 256);
+        let estimated = cursor.cursor.estimated_length().max(8);
+        let mut batch = OwnedBatch::with_schema(*schema, estimated);
         while cursor.cursor.valid {
             if cursor.cursor.current_weight > 0 {
                 self.copy_cursor_row_to_batch(&cursor, schema, &mut batch);
