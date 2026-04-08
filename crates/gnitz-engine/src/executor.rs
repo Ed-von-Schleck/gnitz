@@ -442,6 +442,7 @@ impl ServerExecutor {
             self.disp().sync_and_signal_all();
 
             let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
+            let mut any_success = false;
             for gi in 0..groups.len() {
                 if groups[gi].error.is_some() { continue; }
                 let disp = self.disp();
@@ -455,11 +456,10 @@ impl ServerExecutor {
                             self.tick_tids.push(tid);
                             self.tick_rows.insert(tid, 0);
                         }
-                        self.t_last_push = Some(Instant::now());
                         *self.tick_rows.get_mut(&tid).unwrap() += mc;
+                        any_success = true;
                     }
                     Err(e) => {
-                        // Worker error: mark this and all remaining groups failed.
                         for gj in gi..groups.len() {
                             if groups[gj].error.is_none() {
                                 groups[gj].error = Some(e.clone());
@@ -468,6 +468,9 @@ impl ServerExecutor {
                         break;
                     }
                 }
+            }
+            if any_success {
+                self.t_last_push = Some(Instant::now());
             }
 
             self.disp().reset_w2m_cursors();
@@ -481,6 +484,9 @@ impl ServerExecutor {
             } else {
                 None
             };
+            let ok_refs: Option<Vec<&[u8]>> = col_names_owned.as_ref().map(|names|
+                names.iter().map(|s| s.as_bytes()).collect()
+            );
             for k in g.start..g.end {
                 let e = &entries[k];
                 let wire = if let Some(ref err_msg) = g.error {
@@ -491,13 +497,11 @@ impl ServerExecutor {
                         Some(&schema), None, None,
                     )
                 } else {
-                    let refs: Vec<&[u8]> = col_names_owned.as_ref().unwrap()
-                        .iter().map(|s| s.as_bytes()).collect();
                     ipc::encode_wire(
                         g.target_id as u64, e.client_id,
                         0, g.current_lsn, 0, 0,
                         STATUS_OK, b"",
-                        Some(&schema), Some(&refs), None,
+                        Some(&schema), Some(ok_refs.as_ref().unwrap()), None,
                     )
                 };
                 if transport.send(e.fd, wire.as_ptr(), wire.len()) < 0 {

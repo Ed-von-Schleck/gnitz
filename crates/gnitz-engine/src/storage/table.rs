@@ -164,7 +164,7 @@ impl Table {
             let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
             let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
             let blob_size = *sizes.last().unwrap_or(&0) as u64;
-            self.wal_bytes_since_truncate += wal::block_size(ptrs.len(), &sizes) as u64;
+            let block_sz = wal::block_size(ptrs.len(), &sizes) as u64;
             let rc = wal.append_batch(
                 self.current_lsn, self.table_id, batch.count as u32,
                 &ptrs, &sizes, blob_size,
@@ -172,6 +172,7 @@ impl Table {
             if rc < 0 {
                 return Err(rc);
             }
+            self.wal_bytes_since_truncate += block_sz;
             self.current_lsn += 1;
         }
 
@@ -204,13 +205,14 @@ impl Table {
         if let Some(ref mut wal) = self.wal_writer {
             let blob_idx = 4 + num_payload_cols;
             let blob_size = if blob_idx < sizes.len() { sizes[blob_idx] as u64 } else { 0 };
-            self.wal_bytes_since_truncate += wal::block_size(ptrs.len(), sizes) as u64;
+            let block_sz = wal::block_size(ptrs.len(), sizes) as u64;
             let rc = wal.append_batch(
                 self.current_lsn, self.table_id, count, ptrs, sizes, blob_size,
             );
             if rc < 0 {
                 return Err(rc);
             }
+            self.wal_bytes_since_truncate += block_sz;
             self.current_lsn += 1;
         }
 

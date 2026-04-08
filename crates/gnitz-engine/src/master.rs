@@ -514,13 +514,8 @@ impl MasterDispatcher {
 
     pub fn fan_out_ingest(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
         self.maybe_checkpoint()?;
-        let (schema, col_names) = self.get_schema_and_names(target_id);
-        let pk_col = &[schema.pk_index];
-        let sub_batches = op_repartition_batch(batch, pk_col, &schema, self.num_workers);
-        let refs: Vec<Option<&OwnedBatch>> = sub_batches.iter()
-            .map(|b| if b.count > 0 { Some(b) } else { None })
-            .collect();
-        self.send_to_workers(target_id, FLAG_PUSH, &refs, &schema, &col_names, 0, 0, 0)?;
+        self.write_ingest(target_id, batch)?;
+        self.sync_and_signal_all();
         self.collect_acks()?;
         gnitz_debug!("fan_out_ingest tid={} rows={}", target_id, batch.count);
         Ok(())

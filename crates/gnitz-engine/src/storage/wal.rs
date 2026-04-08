@@ -169,7 +169,7 @@ pub fn validate_and_parse(
 }
 
 /// Pre-allocate this many bytes for WAL files to avoid per-write extent
-/// allocation on btrfs.  Also used as the deferred-truncation threshold.
+/// allocation on btrfs/XFS.  Also used as the deferred-truncation threshold.
 pub(crate) const WAL_PREALLOC_BYTES: i64 = 4 * 1024 * 1024;
 
 #[derive(Debug)]
