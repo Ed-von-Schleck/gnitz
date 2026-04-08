@@ -167,7 +167,7 @@ pub fn parse(
 }
 
 /// Returns the buffer size needed to serialize `count` entries.
-pub fn serialized_size(count: usize) -> usize {
+pub const fn serialized_size(count: usize) -> usize {
     HEADER_SIZE + count * ENTRY_SIZE_V3
 }
 

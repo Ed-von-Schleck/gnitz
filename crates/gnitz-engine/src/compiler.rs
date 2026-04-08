@@ -972,7 +972,7 @@ fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> Sch
 ///   COUNT, COUNT_NON_NULL → I64
 ///   SUM/MIN/MAX on float → F64
 ///   everything else → I64  (including MIN/MAX on STRING, I32, etc.)
-fn agg_output_type(agg_op: u8, col_type_code: u8) -> (u8, u8) {
+const fn agg_output_type(agg_op: u8, col_type_code: u8) -> (u8, u8) {
     match agg_op {
         AGG_COUNT | AGG_COUNT_NON_NULL => (type_code::I64, 8),
         AGG_SUM | AGG_MIN | AGG_MAX => {
