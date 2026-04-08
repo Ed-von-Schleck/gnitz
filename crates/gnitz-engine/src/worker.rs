@@ -8,6 +8,7 @@
 //! original Python implementation.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::schema::SchemaDescriptor;
@@ -390,7 +391,7 @@ impl WorkerProcess {
         match self.cat().scan_family(target_id) {
             Ok(result) => {
                 let schema = self.cat().get_schema_desc(target_id);
-                self.send_response(target_id as u64, Some(&result), schema.as_ref());
+                self.send_response(target_id as u64, Some(&*result), schema.as_ref());
             }
             Err(msg) => return DispatchResult::Error(msg),
         }
@@ -475,7 +476,8 @@ impl WorkerProcess {
             return Ok(());
         }
         let local_batch = self.cat().scan_family(source_tid)?;
-        self.evaluate_dag(source_tid, local_batch);
+        let owned = Arc::try_unwrap(local_batch).unwrap_or_else(|a| (*a).clone());
+        self.evaluate_dag(source_tid, owned);
         Ok(())
     }
 

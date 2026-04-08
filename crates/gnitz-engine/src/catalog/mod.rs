@@ -19,6 +19,7 @@ mod tests;
 
 use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 use crate::dag::{DagEngine, StoreHandle};
@@ -1193,7 +1194,8 @@ impl CatalogEngine {
             if scan_batch.count == 0 { continue; }
 
             // Execute view plan on the batch
-            let out_handle = self.dag.execute_epoch(vid, scan_batch, source_id);
+            let owned = Arc::try_unwrap(scan_batch).unwrap_or_else(|a| (*a).clone());
+            let out_handle = self.dag.execute_epoch(vid, owned, source_id);
             if let Some(result) = out_handle {
                 if result.count > 0 {
                     self.dag.ingest_to_family(vid, result);
@@ -1203,10 +1205,10 @@ impl CatalogEngine {
         }
     }
 
-    fn scan_store(&mut self, table_id: i64, schema: &SchemaDescriptor) -> OwnedBatch {
+    fn scan_store(&mut self, table_id: i64, schema: &SchemaDescriptor) -> Arc<OwnedBatch> {
         let entry = match self.dag.tables.get(&table_id) {
             Some(e) => e,
-            None => return OwnedBatch::empty(schema.num_columns as usize - 1),
+            None => return Arc::new(OwnedBatch::empty(schema.num_columns as usize - 1)),
         };
 
         // Extract single-Table handle (Single, Borrowed, or 1-partition Partitioned)
@@ -1233,12 +1235,12 @@ impl CatalogEngine {
 
             // Snapshot is consolidated → all weights > 0 → every row passes filter
             if shards.is_empty() && snapshot.count > 0 {
-                return (*snapshot).clone();
+                return snapshot;
             }
 
             // All weights non-zero and shard is sorted+consolidated
             if snapshot.count == 0 && shards.len() == 1 && !shards[0].has_ghosts {
-                return shards[0].to_owned_batch(schema);
+                return Arc::new(shards[0].to_owned_batch(schema));
             }
 
             crate::storage::create_cursor_from_snapshots(&[snapshot], &shards, *schema)
@@ -1249,7 +1251,7 @@ impl CatalogEngine {
                     let ptbl = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
                     match ptbl.create_cursor() {
                         Ok(c) => c,
-                        Err(_) => return OwnedBatch::empty(schema.num_columns as usize - 1),
+                        Err(_) => return Arc::new(OwnedBatch::empty(schema.num_columns as usize - 1)),
                     }
                 }
                 _ => unreachable!(),
@@ -1263,7 +1265,7 @@ impl CatalogEngine {
             }
             cursor.cursor.advance();
         }
-        batch
+        Arc::new(batch)
     }
 
     // -- Index backfill (scan source, project into index table) ------------
@@ -2168,7 +2170,7 @@ impl CatalogEngine {
     }
 
     /// Scan all positive-weight rows from a table.
-    pub fn scan_family(&mut self, table_id: i64) -> Result<OwnedBatch, String> {
+    pub fn scan_family(&mut self, table_id: i64) -> Result<Arc<OwnedBatch>, String> {
         let schema = if table_id < FIRST_USER_TABLE_ID {
             sys_tab_schema(table_id)
         } else {

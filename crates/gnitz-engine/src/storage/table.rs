@@ -175,18 +175,10 @@ impl Table {
         if self.memtable.should_flush() {
             self.flush()?;
         }
-        // Clone before the first attempt so we have the data for a retry on
-        // ERR_CAPACITY, matching the retry logic in upsert_and_maybe_flush.
-        let batch_retry = batch.clone();
-        match self.memtable.upsert_sorted_batch(batch) {
-            Ok(()) => {}
-            Err(code) if code == memtable::ERR_CAPACITY => {
-                // WAL already written; safe to flush and retry with the clone.
-                self.flush()?;
-                self.memtable.upsert_sorted_batch(batch_retry)?;
-            }
-            Err(e) => return Err(e),
-        }
+        // The should_flush() pre-check above ensures runs_bytes is either 0
+        // (post-flush) or <= 75% of max_bytes, so check_capacity() inside
+        // upsert_sorted_batch (which fires at 100%) cannot return ERR_CAPACITY.
+        self.memtable.upsert_sorted_batch(batch)?;
         if self.memtable.should_flush() {
             self.flush()?;
         }

@@ -5,6 +5,7 @@
 //! runs in Rust — no FFI round-trips on the request path.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use gnitz_transport::transport::{OutputSlots, Transport};
@@ -172,7 +173,7 @@ impl ServerExecutor {
 
     fn handle_push(
         &mut self, target_id: i64, in_batch: Option<Box<OwnedBatch>>,
-    ) -> Result<(Option<OwnedBatch>, u64), String> {
+    ) -> Result<(Option<Arc<OwnedBatch>>, u64), String> {
         if self.has_dispatcher() && target_id >= FIRST_USER_TABLE_ID {
             if let Some(batch) = in_batch {
                 if batch.count > 0 {
@@ -188,7 +189,7 @@ impl ServerExecutor {
             self.fire_pending_ticks();
             let lsn = self.last_tick_lsn;
             let disp = self.disp();
-            let result = disp.fan_out_scan(target_id)?;
+            let result = disp.fan_out_scan(target_id)?.map(Arc::new);
             return Ok((result, lsn));
         }
 
@@ -222,7 +223,8 @@ impl ServerExecutor {
         Ok((result, lsn))
     }
 
-    fn scan_family(&mut self, target_id: i64) -> Option<OwnedBatch> {
+
+    fn scan_family(&mut self, target_id: i64) -> Option<Arc<OwnedBatch>> {
         match self.cat().scan_family(target_id) {
             Ok(batch) => {
                 if batch.count > 0 { Some(batch) } else { None }
@@ -650,13 +652,13 @@ impl ServerExecutor {
                         disp.fan_out_scan(req.target_id).map_err(|e| {
                             self.send_error_response(
                                 transport, req.fd, e.as_bytes(), req.target_id, req.client_id);
-                        })?
+                        })?.map(Arc::new)
                     } else {
                         self.scan_family(req.target_id)
                     };
                     self.send_response(
                         transport, req.fd, req.target_id,
-                        result.as_ref(), STATUS_OK, b"",
+                        result.as_deref(), STATUS_OK, b"",
                         req.client_id, &schema, lsn,
                     );
                 }
@@ -888,7 +890,7 @@ impl ServerExecutor {
 
         let schema = self.get_schema_desc(target_id);
         self.send_response(
-            transport, fd, target_id, result.as_ref(), STATUS_OK, b"",
+            transport, fd, target_id, result.as_deref(), STATUS_OK, b"",
             client_id, &schema, lsn,
         );
         Ok(())
