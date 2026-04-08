@@ -28,6 +28,8 @@ def pytest_addoption(parser):
                      help="Number of concurrent clients for parallel benchmarks")
     parser.addoption("--perf", action="store_true", default=False,
                      help="Enable perf record during benchmarks")
+    parser.addoption("--perf-dwarf", action="store_true", default=False,
+                     help="Enable perf record with --call-graph=dwarf for full userspace stacks")
     parser.addoption("--perf-stat", action="store_true", default=False,
                      help="Enable perf stat during benchmarks")
     parser.addoption("--results-dir", type=str, default=None,
@@ -90,9 +92,10 @@ def server(request, results_dir):
         pytest.fail("Benchmark server did not start within 10s")
 
     perf_recorder = None
-    if request.config.getoption("--perf"):
+    if request.config.getoption("--perf") or request.config.getoption("--perf-dwarf"):
         from helpers.perf import PerfRecorder
-        perf_recorder = PerfRecorder(proc.pid, results_dir)
+        dwarf = request.config.getoption("--perf-dwarf")
+        perf_recorder = PerfRecorder(proc.pid, results_dir, dwarf=dwarf)
         perf_recorder.start()
 
     perf_stat = None

@@ -4,13 +4,14 @@ ALL_DATA_DIRS := storage_test_data \
 
 LOG_DIR := .test_logs
 
-.PHONY: all test clean rust-engine-test server release-server pyext e2e e2e-release release-test bench bench-full bench-sweep bench-perf
+.PHONY: all test clean rust-engine-test server release-server pyext e2e e2e-release release-test bench bench-full bench-sweep bench-perf bench-perf-dwarf
 
 # Benchmark knobs — override on the command line, e.g. make bench WORKERS=4 PERF=1
 WORKERS ?= 1
 CLIENTS ?= 1
 FULL    ?=
 PERF    ?=
+PERF_DWARF ?=
 
 all: test
 
@@ -60,7 +61,8 @@ bench: release-server
 	cd crates/gnitz-py && uv run python ../../benchmarks/run.py \
 		$(if $(FULL),--full) \
 		--workers=$(WORKERS) --clients=$(CLIENTS) \
-		$(if $(PERF),--perf --perf-stat)
+		$(if $(PERF),--perf --perf-stat) \
+		$(if $(PERF_DWARF),--perf-dwarf)
 
 bench-full: WORKERS = 4
 bench-full: FULL    = 1
@@ -73,3 +75,8 @@ bench-perf: WORKERS = 4
 bench-perf: FULL    = 1
 bench-perf: PERF    = 1
 bench-perf: bench
+
+bench-perf-dwarf: WORKERS = 4
+bench-perf-dwarf: FULL    = 1
+bench-perf-dwarf: PERF_DWARF = 1
+bench-perf-dwarf: bench

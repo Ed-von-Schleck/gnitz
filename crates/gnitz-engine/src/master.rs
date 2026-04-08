@@ -9,7 +9,6 @@ use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
 use crate::schema::promote_to_index_key;
 use crate::ipc::{
-    self, STATUS_OK,
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
     FLAG_TICK, FLAG_FLUSH, DecodedWire,
@@ -108,6 +107,9 @@ pub struct MasterDispatcher {
     async_w2m_rcs: Vec<u64>,
     acc: ExchangeAccumulator,
     async_active: bool,
+    /// Reusable scratch batch for scan fan-out. Retains its large data Vec
+    /// across ticks, eliminating the doubling-cascade page faults.
+    reusable_scan_output: Option<OwnedBatch>,
 }
 
 // Safety: MasterDispatcher is single-threaded (master process event loop).
@@ -133,6 +135,7 @@ impl MasterDispatcher {
             async_w2m_rcs: vec![W2M_HEADER_SIZE as u64; num_workers],
             acc: ExchangeAccumulator::new(num_workers),
             async_active: false,
+            reusable_scan_output: None,
         }
     }
 
@@ -154,7 +157,7 @@ impl MasterDispatcher {
     // Core send/receive helpers
     // -----------------------------------------------------------------------
 
-    /// Encode per-worker data and write one SAL message group.
+    /// Encode per-worker data directly into SAL mmap.
     /// Does NOT fdatasync or signal.
     fn write_group(
         &mut self,
@@ -168,7 +171,6 @@ impl MasterDispatcher {
         seek_col_idx: u64,
         unicast_worker: i32,
     ) -> Result<(), String> {
-        let nw = self.num_workers;
         let mut name_refs = [&[] as &[u8]; 64];
         for (i, n) in col_names.iter().enumerate().take(64) {
             name_refs[i] = n.as_slice();
@@ -179,26 +181,14 @@ impl MasterDispatcher {
             Some(&name_refs[..col_names.len()])
         };
 
-        let mut wire_bufs: Vec<Vec<u8>> = Vec::with_capacity(nw);
-        for w in 0..nw {
-            if unicast_worker >= 0 && w != unicast_worker as usize {
-                wire_bufs.push(Vec::new());
-                continue;
-            }
-            let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
-            let buf = ipc::encode_wire(
-                target_id as u64, 0, flags as u64,
-                seek_pk_lo, seek_pk_hi, seek_col_idx,
-                STATUS_OK, b"",
-                Some(schema), col_names_opt, data_batch.copied(),
-            );
-            wire_bufs.push(buf);
-        }
-
-        self.sal.write_group(target_id as u32, flags, &wire_bufs)
+        self.sal.write_group_direct(
+            target_id as u32, flags, worker_batches,
+            schema, col_names_opt,
+            seek_pk_lo, seek_pk_hi, seek_col_idx, unicast_worker,
+        )
     }
 
-    /// Encode batch once and write identical data to all workers.
+    /// Encode batch once directly into SAL mmap, replicate to all workers.
     fn write_broadcast(
         &mut self,
         target_id: i64,
@@ -220,14 +210,10 @@ impl MasterDispatcher {
             Some(&name_refs[..col_names.len()])
         };
 
-        let wire_buf = ipc::encode_wire(
-            target_id as u64, 0, flags as u64,
+        self.sal.write_broadcast_direct(
+            target_id as u32, flags, batch, schema, col_names_opt,
             seek_pk_lo, seek_pk_hi, seek_col_idx,
-            STATUS_OK, b"",
-            Some(schema), col_names_opt, batch,
-        );
-
-        self.sal.write_broadcast(target_id as u32, flags, &wire_buf)
+        )
     }
 
     /// Encode once, write to all workers, fdatasync, signal.
@@ -396,11 +382,22 @@ impl MasterDispatcher {
     }
 
     /// Collect data responses from all workers, concatenate into one batch.
+    /// Reuses a scratch batch from `reusable_scan_output` if the schema matches,
+    /// avoiding the doubling-cascade page faults on repeated scans.
     fn collect_responses(&mut self, schema: &SchemaDescriptor) -> Result<OwnedBatch, String> {
         let npc = schema.num_columns as usize - 1;
         let results = self.wait_all_workers()?;
-        let mut out = OwnedBatch::empty(npc);
-        out.schema = Some(*schema);
+
+        let mut out = self.reusable_scan_output.take()
+            .filter(|b| b.schema.map_or(false, |s|
+                s.num_columns == schema.num_columns && s.pk_index == schema.pk_index))
+            .unwrap_or_else(|| {
+                let mut b = OwnedBatch::empty(npc);
+                b.schema = Some(*schema);
+                b
+            });
+        out.clear();
+
         for decoded_opt in &results {
             if let Some(decoded) = decoded_opt {
                 if let Some(ref batch) = decoded.data_batch {
@@ -444,6 +441,11 @@ impl MasterDispatcher {
         let (schema, col_names) = self.get_schema_and_names(0);
         self.send_broadcast(0, FLAG_FLUSH, None, &schema, &col_names, 0, 0, 0)?;
         self.collect_acks()?;
+
+        // Flush system tables before resetting SAL — their data lives in
+        // SAL entries that are about to be discarded.
+        let cat = unsafe { &mut *self.catalog };
+        cat.flush_all_system_tables();
 
         self.sal.checkpoint_reset();
         gnitz_info!("SAL checkpoint epoch={}", self.sal.epoch());
@@ -604,7 +606,13 @@ impl MasterDispatcher {
         self.send_broadcast(target_id, 0, None, &schema, &col_names, 0, 0, 0)?;
         let result = self.collect_responses(&schema)?;
         gnitz_debug!("fan_out_scan tid={} result_rows={}", target_id, result.count);
-        if result.count == 0 { Ok(None) } else { Ok(Some(result)) }
+        if result.count == 0 {
+            // Stash back for reuse on next scan — retains allocated capacity.
+            self.reusable_scan_output = Some(result);
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
     }
 
     pub fn fan_out_seek(

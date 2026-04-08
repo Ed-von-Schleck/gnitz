@@ -284,6 +284,178 @@ pub fn encode_wire(
     out
 }
 
+/// Max regions per batch: 4 fixed + up to 63 payload + 1 blob = 68.
+const MAX_REGIONS_TOTAL: usize = 69;
+
+/// Compute the WAL block size for a given batch without allocating.
+fn batch_wal_block_size(batch: &OwnedBatch) -> usize {
+    let nr = batch.num_regions_total();
+    let mut sizes = [0u32; MAX_REGIONS_TOTAL];
+    for i in 0..nr {
+        sizes[i] = batch.region_size(i) as u32;
+    }
+    wal::block_size(nr, &sizes[..nr])
+}
+
+/// Compute the total encoded wire size without allocating.
+///
+/// Same parameters as `encode_wire`. Returns the exact byte count that
+/// `encode_wire()` would produce.
+pub fn wire_size(
+    status: u32,
+    error_msg: &[u8],
+    schema: Option<&SchemaDescriptor>,
+    col_names: Option<&[&[u8]]>,
+    data_batch: Option<&OwnedBatch>,
+) -> usize {
+    let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
+    let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
+
+    // Control block: always 1 row of CONTROL_SCHEMA (9 cols: 8×U64 + 1×String).
+    // Build it to get exact size (error_msg blob affects it).
+    let ctrl_batch = {
+        let cs = CONTROL_SCHEMA_DESC;
+        let mut b = OwnedBatch::with_schema(cs, 1);
+        let has_error = !error_msg.is_empty();
+        let null_word: u64 = if has_error { 0 } else { 1u64 << 7 };
+        b.extend_pk_lo(&0u64.to_le_bytes());
+        b.extend_pk_hi(&0u64.to_le_bytes());
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&null_word.to_le_bytes());
+        b.extend_col(0, &0u64.to_le_bytes());
+        b.extend_col(1, &0u64.to_le_bytes());
+        b.extend_col(2, &0u64.to_le_bytes());
+        b.extend_col(3, &0u64.to_le_bytes());
+        b.extend_col(4, &0u64.to_le_bytes());
+        b.extend_col(5, &0u64.to_le_bytes());
+        b.extend_col(6, &0u64.to_le_bytes());
+        let error_st = if has_error {
+            encode_german_string(error_msg, &mut b.blob)
+        } else {
+            [0u8; 16]
+        };
+        b.extend_col(7, &error_st);
+        b.count = 1;
+        b
+    };
+    let mut total = batch_wal_block_size(&ctrl_batch);
+
+    if has_schema {
+        let eff_schema = if let Some(s) = schema {
+            s
+        } else {
+            data_batch.unwrap().schema.as_ref().unwrap()
+        };
+        let names = col_names.unwrap_or(&[]);
+        let schema_batch = schema_to_batch(eff_schema, names);
+        total += batch_wal_block_size(&schema_batch);
+    }
+
+    if has_data {
+        total += batch_wal_block_size(data_batch.unwrap());
+    }
+
+    total
+}
+
+/// Encode a WAL block for a batch into `out[offset..]`. Returns new offset.
+fn encode_batch_to_wal_into(
+    out: &mut [u8], offset: usize, batch: &OwnedBatch, table_id: u32,
+) -> usize {
+    let nr = batch.num_regions_total();
+    let mut ptrs = [std::ptr::null::<u8>(); MAX_REGIONS_TOTAL];
+    let mut sizes = [0u32; MAX_REGIONS_TOTAL];
+    for i in 0..nr {
+        ptrs[i] = batch.region_ptr(i);
+        sizes[i] = batch.region_size(i) as u32;
+    }
+    let blob_size = batch.blob.len() as u64;
+    let result = wal::encode(
+        out, offset, 0, table_id, batch.count as u32,
+        &ptrs[..nr], &sizes[..nr], blob_size,
+    );
+    assert!(result >= 0, "WAL encode_into failed");
+    result as usize
+}
+
+/// Encode a full IPC wire message into a caller-provided buffer.
+///
+/// Same logic as `encode_wire()` but writes into `out` starting at `offset`.
+/// Returns bytes written. Panics if the buffer is too small (caller must
+/// pre-size via `wire_size()`).
+pub fn encode_wire_into(
+    out: &mut [u8],
+    offset: usize,
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    seek_pk_lo: u64,
+    seek_pk_hi: u64,
+    seek_col_idx: u64,
+    status: u32,
+    error_msg: &[u8],
+    schema: Option<&SchemaDescriptor>,
+    col_names: Option<&[&[u8]]>,
+    data_batch: Option<&OwnedBatch>,
+) -> usize {
+    let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
+    let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
+
+    let mut wire_flags = flags;
+    if has_schema { wire_flags |= FLAG_HAS_SCHEMA; }
+    if has_data {
+        wire_flags |= FLAG_HAS_DATA;
+        let b = data_batch.unwrap();
+        if b.sorted { wire_flags |= FLAG_BATCH_SORTED; }
+        if b.consolidated { wire_flags |= FLAG_BATCH_CONSOLIDATED; }
+    }
+
+    // Control block
+    let ctrl_batch = {
+        let cs = CONTROL_SCHEMA_DESC;
+        let mut b = OwnedBatch::with_schema(cs, 1);
+        let has_error = !error_msg.is_empty();
+        let null_word: u64 = if has_error { 0 } else { 1u64 << 7 };
+        b.extend_pk_lo(&0u64.to_le_bytes());
+        b.extend_pk_hi(&0u64.to_le_bytes());
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&null_word.to_le_bytes());
+        b.extend_col(0, &(status as u64).to_le_bytes());
+        b.extend_col(1, &client_id.to_le_bytes());
+        b.extend_col(2, &target_id.to_le_bytes());
+        b.extend_col(3, &wire_flags.to_le_bytes());
+        b.extend_col(4, &seek_pk_lo.to_le_bytes());
+        b.extend_col(5, &seek_pk_hi.to_le_bytes());
+        b.extend_col(6, &seek_col_idx.to_le_bytes());
+        let error_st = if has_error {
+            encode_german_string(error_msg, &mut b.blob)
+        } else {
+            [0u8; 16]
+        };
+        b.extend_col(7, &error_st);
+        b.count = 1;
+        b
+    };
+    let mut pos = encode_batch_to_wal_into(out, offset, &ctrl_batch, IPC_CONTROL_TID);
+
+    if has_schema {
+        let eff_schema = if let Some(s) = schema {
+            s
+        } else {
+            data_batch.unwrap().schema.as_ref().unwrap()
+        };
+        let names = col_names.unwrap_or(&[]);
+        let schema_batch = schema_to_batch(eff_schema, names);
+        pos = encode_batch_to_wal_into(out, pos, &schema_batch, target_id as u32);
+    }
+
+    if has_data {
+        pos = encode_batch_to_wal_into(out, pos, data_batch.unwrap(), target_id as u32);
+    }
+
+    pos - offset
+}
+
 // ---------------------------------------------------------------------------
 // Wire protocol: decode
 // ---------------------------------------------------------------------------
@@ -859,6 +1031,200 @@ impl SalWriter {
             ));
         }
         self.write_cursor = result.new_cursor;
+        Ok(())
+    }
+
+    /// Encode per-worker wire data directly into SAL mmap. Does NOT sync/signal.
+    ///
+    /// Eliminates N `Vec<u8>` allocations per call by computing sizes first,
+    /// reserving the SAL region, then encoding directly into it.
+    pub fn write_group_direct(
+        &mut self,
+        target_id: u32,
+        flags: u32,
+        worker_batches: &[Option<&OwnedBatch>],
+        schema: &SchemaDescriptor,
+        col_names_opt: Option<&[&[u8]]>,
+        seek_pk_lo: u64,
+        seek_pk_hi: u64,
+        seek_col_idx: u64,
+        unicast_worker: i32,
+    ) -> Result<(), String> {
+        let nw = self.num_workers;
+        let lsn = self.lsn;
+        self.lsn += 1;
+
+        // Size pass: compute wire size per worker.
+        let mut worker_sizes = [0u32; MAX_WORKERS];
+        let mut payload_size = GROUP_HEADER_SIZE;
+        for w in 0..nw {
+            if unicast_worker >= 0 && w != unicast_worker as usize {
+                continue;
+            }
+            let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
+            let sz = wire_size(
+                STATUS_OK, b"",
+                Some(schema), col_names_opt, data_batch.copied(),
+            );
+            worker_sizes[w] = sz as u32;
+            if sz > 0 {
+                payload_size += align8(sz);
+            }
+        }
+
+        let total = 8 + align8(payload_size);
+        let wc = self.write_cursor as usize;
+        if wc + total > self.mmap_size as usize {
+            return Err(format!(
+                "SAL write_group_direct failed (cursor={}, need={}, mmap_size={})",
+                self.write_cursor, total, self.mmap_size
+            ));
+        }
+
+        let sal = self.ptr;
+        let base = wc;
+        let hdr_off = base + 8;
+
+        // Write group header.
+        unsafe {
+            write_u64_raw(sal, hdr_off + 0, payload_size as u64);
+            write_u64_raw(sal, hdr_off + 8, lsn);
+            write_u32_raw(sal, hdr_off + 16, nw as u32);
+            write_u32_raw(sal, hdr_off + 20, flags);
+            write_u32_raw(sal, hdr_off + 24, target_id);
+            write_u32_raw(sal, hdr_off + 28, self.epoch);
+        }
+
+        // Encode pass: write directly into SAL per-worker slots.
+        let mut data_offset = GROUP_HEADER_SIZE;
+        for w in 0..nw {
+            let wsz = worker_sizes[w] as usize;
+            if wsz > 0 {
+                unsafe {
+                    write_u32_raw(sal, hdr_off + 32 + w * 4, data_offset as u32);
+                    write_u32_raw(sal, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz as u32);
+                }
+                let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
+                // Encode directly into the SAL mmap slice.
+                let out_start = hdr_off + data_offset;
+                let sal_slice = unsafe {
+                    std::slice::from_raw_parts_mut(sal.add(out_start), wsz)
+                };
+                let written = encode_wire_into(
+                    sal_slice, 0,
+                    target_id as u64, 0, flags as u64,
+                    seek_pk_lo, seek_pk_hi, seek_col_idx,
+                    STATUS_OK, b"",
+                    Some(schema), col_names_opt, data_batch.copied(),
+                );
+                debug_assert_eq!(written, wsz);
+                data_offset += align8(wsz);
+            } else {
+                unsafe {
+                    write_u32_raw(sal, hdr_off + 32 + w * 4, 0);
+                    write_u32_raw(sal, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0);
+                }
+            }
+        }
+
+        // Write size prefix LAST via atomic release store.
+        unsafe { atomic_store_u64(sal.add(base), payload_size as u64); }
+        self.write_cursor = (wc + total) as u64;
+        Ok(())
+    }
+
+    /// Encode once into worker 0's slot, memcpy to workers 1..N-1.
+    /// Does NOT sync/signal.
+    pub fn write_broadcast_direct(
+        &mut self,
+        target_id: u32,
+        flags: u32,
+        batch: Option<&OwnedBatch>,
+        schema: &SchemaDescriptor,
+        col_names_opt: Option<&[&[u8]]>,
+        seek_pk_lo: u64,
+        seek_pk_hi: u64,
+        seek_col_idx: u64,
+    ) -> Result<(), String> {
+        let nw = self.num_workers;
+        let lsn = self.lsn;
+        self.lsn += 1;
+
+        let wsz = wire_size(
+            STATUS_OK, b"",
+            Some(schema), col_names_opt, batch,
+        );
+
+        let mut payload_size = GROUP_HEADER_SIZE;
+        for _ in 0..nw {
+            if wsz > 0 { payload_size += align8(wsz); }
+        }
+
+        let total = 8 + align8(payload_size);
+        let wc = self.write_cursor as usize;
+        if wc + total > self.mmap_size as usize {
+            return Err(format!(
+                "SAL write_broadcast_direct failed (cursor={})", self.write_cursor
+            ));
+        }
+
+        let sal = self.ptr;
+        let base = wc;
+        let hdr_off = base + 8;
+
+        unsafe {
+            write_u64_raw(sal, hdr_off + 0, payload_size as u64);
+            write_u64_raw(sal, hdr_off + 8, lsn);
+            write_u32_raw(sal, hdr_off + 16, nw as u32);
+            write_u32_raw(sal, hdr_off + 20, flags);
+            write_u32_raw(sal, hdr_off + 24, target_id);
+            write_u32_raw(sal, hdr_off + 28, self.epoch);
+        }
+
+        // Encode once into worker 0's slot.
+        let mut data_offset = GROUP_HEADER_SIZE;
+        let w0_start = hdr_off + data_offset;
+        if wsz > 0 {
+            let sal_slice = unsafe {
+                std::slice::from_raw_parts_mut(sal.add(w0_start), wsz)
+            };
+            let written = encode_wire_into(
+                sal_slice, 0,
+                target_id as u64, 0, flags as u64,
+                seek_pk_lo, seek_pk_hi, seek_col_idx,
+                STATUS_OK, b"",
+                Some(schema), col_names_opt, batch,
+            );
+            debug_assert_eq!(written, wsz);
+        }
+
+        // Set offsets/sizes and memcpy for all workers.
+        for w in 0..nw {
+            if wsz > 0 {
+                unsafe {
+                    write_u32_raw(sal, hdr_off + 32 + w * 4, data_offset as u32);
+                    write_u32_raw(sal, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz as u32);
+                }
+                if w > 0 {
+                    let src = hdr_off + GROUP_HEADER_SIZE; // worker 0 data
+                    let dst = hdr_off + data_offset;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            sal.add(src), sal.add(dst), wsz,
+                        );
+                    }
+                }
+                data_offset += align8(wsz);
+            } else {
+                unsafe {
+                    write_u32_raw(sal, hdr_off + 32 + w * 4, 0);
+                    write_u32_raw(sal, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0);
+                }
+            }
+        }
+
+        unsafe { atomic_store_u64(sal.add(base), payload_size as u64); }
+        self.write_cursor = (wc + total) as u64;
         Ok(())
     }
 
@@ -1744,5 +2110,82 @@ mod tests {
         s2.copy_from_slice(&db.col_data(1)[16..32]);
         let str2 = decode_german_string(&s2, &db.blob);
         assert_eq!(str2, long_str);
+    }
+
+    #[test]
+    fn wire_size_matches_encode() {
+        // No data
+        let sz = wire_size(STATUS_OK, b"", None, None, None);
+        let wire = encode_wire(42, 7, 0x100, 10, 20, 3, STATUS_OK, b"", None, None, None);
+        assert_eq!(sz, wire.len(), "wire_size mismatch (no data)");
+
+        // With schema only
+        let sd = simple_schema();
+        let names: Vec<&[u8]> = vec![b"id", b"val"];
+        let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), None);
+        let wire = encode_wire(1, 0, 0, 0, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), None);
+        assert_eq!(sz, wire.len(), "wire_size mismatch (schema only)");
+
+        // With data
+        let batch = make_simple_batch(100, 999);
+        let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch));
+        let wire = encode_wire(5, 0, 0, 0, 0, 0, STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch));
+        assert_eq!(sz, wire.len(), "wire_size mismatch (with data)");
+
+        // With error message
+        let sz = wire_size(STATUS_ERROR, b"something went wrong", None, None, None);
+        let wire = encode_wire(0, 0, 0, 0, 0, 0, STATUS_ERROR, b"something went wrong", None, None, None);
+        assert_eq!(sz, wire.len(), "wire_size mismatch (error msg)");
+    }
+
+    #[test]
+    fn encode_wire_into_roundtrip() {
+        let sd = simple_schema();
+        let batch = make_simple_batch(100, 999);
+        let names: Vec<&[u8]> = vec![b"id", b"val"];
+
+        let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch));
+        let mut buf = vec![0u8; sz];
+        let written = encode_wire_into(
+            &mut buf, 0,
+            5, 0, 0, 0, 0, 0,
+            STATUS_OK, b"",
+            Some(&sd), Some(&names), Some(&batch),
+        );
+        assert_eq!(written, sz);
+
+        let decoded = decode_wire(&buf).unwrap();
+        assert_eq!(decoded.control.target_id, 5);
+        assert!(decoded.schema.is_some());
+        let db = decoded.data_batch.as_ref().unwrap();
+        assert_eq!(db.count, 1);
+        let pk = u64::from_le_bytes(db.pk_lo_data()[0..8].try_into().unwrap());
+        assert_eq!(pk, 100);
+        let val = u64::from_le_bytes(db.col_data(0)[0..8].try_into().unwrap());
+        assert_eq!(val, 999);
+    }
+
+    #[test]
+    fn encode_wire_into_matches_encode_wire() {
+        let sd = simple_schema();
+        let batch = make_simple_batch(42, 123);
+        let names: Vec<&[u8]> = vec![b"id", b"val"];
+
+        let wire = encode_wire(
+            10, 3, 0x200, 5, 6, 7,
+            STATUS_OK, b"",
+            Some(&sd), Some(&names), Some(&batch),
+        );
+
+        let sz = wire_size(STATUS_OK, b"", Some(&sd), Some(&names), Some(&batch));
+        let mut buf = vec![0u8; sz];
+        let written = encode_wire_into(
+            &mut buf, 0,
+            10, 3, 0x200, 5, 6, 7,
+            STATUS_OK, b"",
+            Some(&sd), Some(&names), Some(&batch),
+        );
+        assert_eq!(written, wire.len());
+        assert_eq!(buf, wire, "encode_wire_into should produce identical bytes");
     }
 }

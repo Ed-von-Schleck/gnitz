@@ -6,10 +6,10 @@
 
 use std::collections::HashMap;
 
-use crate::catalog::CatalogEngine;
+use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::executor::ServerExecutor;
 use crate::ipc::{
-    self, FLAG_PUSH, SAL_MMAP_SIZE, W2M_REGION_SIZE,
+    self, FLAG_PUSH, FLAG_DDL_SYNC, SAL_MMAP_SIZE, W2M_REGION_SIZE,
     SalWriter, SalReader, W2mWriter, W2mReceiver,
 };
 use crate::ipc_sys;
@@ -104,6 +104,68 @@ fn recover_from_sal(
 
     if replayed > 0 {
         let msg = format!("SAL recovery: replayed {} blocks\n", replayed);
+        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System table SAL recovery (master-side, before forking workers)
+// ---------------------------------------------------------------------------
+
+/// Replay unflushed DDL_SYNC SAL entries into system tables.
+///
+/// Called on the master before forking workers. The DDL_SYNC broadcast
+/// already carries the system table batch data, so no extra SAL entries
+/// are needed — we just replay the same entries workers would see.
+fn recover_system_tables_from_sal(
+    sal_ptr: *const u8,
+    catalog: &mut CatalogEngine,
+) {
+    let sal_reader = SalReader::new(sal_ptr, 0, SAL_MMAP_SIZE, -1);
+
+    let mut offset: u64 = 0;
+    let mut replayed: u32 = 0;
+    let mut last_epoch: u32 = 0;
+
+    while (offset as usize) + 8 < SAL_MMAP_SIZE {
+        let (msg, new_offset) = match sal_reader.try_read(offset) {
+            Some(v) => v,
+            None => break,
+        };
+
+        // Epoch fence: decreasing epoch = stale data from before checkpoint
+        if last_epoch > 0 && msg.epoch < last_epoch {
+            break;
+        }
+        last_epoch = msg.epoch;
+        offset = new_offset;
+
+        if msg.flags & FLAG_DDL_SYNC == 0 {
+            continue;
+        }
+
+        let tid = msg.target_id as i64;
+        if tid >= FIRST_USER_TABLE_ID {
+            continue;
+        }
+
+        let data = match msg.wire_data {
+            Some(d) => d,
+            None => continue,
+        };
+
+        if let Ok(decoded) = ipc::decode_wire(data) {
+            if let Some(batch) = decoded.data_batch {
+                if batch.count > 0 {
+                    let _ = catalog.ingest_to_family(tid, &batch);
+                    replayed += 1;
+                }
+            }
+        }
+    }
+
+    if replayed > 0 {
+        let msg = format!("SAL system table recovery: replayed {} entries\n", replayed);
         unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
     }
 }
@@ -224,6 +286,13 @@ pub fn server_main(
         let msg = b"Error: failed to mmap SAL\n";
         unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
         return 1;
+    }
+
+    // --- System table SAL recovery (before forking workers) ---
+    {
+        let catalog = unsafe { &mut *catalog_ptr };
+        recover_system_tables_from_sal(sal_ptr as *const u8, catalog);
+        catalog.flush_all_system_tables();
     }
 
     // --- W2M regions (memfd-backed, one per worker→master) ---

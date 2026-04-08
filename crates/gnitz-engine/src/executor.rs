@@ -213,9 +213,13 @@ impl ServerExecutor {
                     // Transfer ownership
                     self.cat().push_and_evaluate(target_id, *batch)?;
                 } else {
-                    // System table: ingest (borrow) + flush + DAG (move)
+                    // System table: ingest into memtable. In multi-worker mode
+                    // the DDL_SYNC broadcast provides SAL durability — skip
+                    // per-table flush (deferred to checkpoint).
                     self.cat().ingest_to_family(target_id, &*batch)?;
-                    self.cat().flush_family(target_id)?;
+                    if !self.has_dispatcher() {
+                        self.cat().flush_family(target_id)?;
+                    }
                     let dag = self.cat().get_dag_ptr();
                     unsafe { &mut *dag }.evaluate_dag(target_id, *batch);
                 }

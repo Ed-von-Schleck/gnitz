@@ -101,7 +101,6 @@ fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_REGIONS], u
 /// contain data.
 ///
 /// **2 heap allocations** (data + blob) instead of N+7.
-#[derive(Clone)]
 pub struct OwnedBatch {
     data: Vec<u8>,
     pub blob: Vec<u8>,
@@ -205,11 +204,16 @@ impl OwnedBatch {
             }
         }
 
-        // Blob is separate.
+        // Blob is separate — try pool first.
         let blob_idx = 4 + num_payload_cols;
         let blob_sz = sizes[blob_idx] as usize;
         let blob = if blob_sz > 0 && !ptrs[blob_idx].is_null() {
-            let mut v = vec![0u8; blob_sz];
+            let mut v = if let Some(mut buf) = super::batch_pool::acquire_buf() {
+                buf.resize(blob_sz, 0);
+                buf
+            } else {
+                vec![0u8; blob_sz]
+            };
             std::ptr::copy_nonoverlapping(ptrs[blob_idx], v.as_mut_ptr(), blob_sz);
             v
         } else {
@@ -518,8 +522,11 @@ impl OwnedBatch {
     }
 
     /// Decompose into owned buffers (for pool recycling).
-    pub(crate) fn into_buffers(self) -> (Vec<u8>, Vec<u8>) {
-        (self.data, self.blob)
+    /// Takes the buffers out, leaving zero-capacity vecs that Drop will ignore.
+    pub(crate) fn into_buffers(mut self) -> (Vec<u8>, Vec<u8>) {
+        let data = std::mem::take(&mut self.data);
+        let blob = std::mem::take(&mut self.blob);
+        (data, blob)
     }
 
     pub fn find_lower_bound(&self, key: u128) -> usize {
@@ -972,6 +979,17 @@ impl OwnedBatch {
         let regions = self.regions();
         shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true)
     }
+}
+
+impl Drop for OwnedBatch {
+    fn drop(&mut self) {
+        super::batch_pool::recycle_buf(std::mem::take(&mut self.data));
+        super::batch_pool::recycle_buf(std::mem::take(&mut self.blob));
+    }
+}
+
+impl Clone for OwnedBatch {
+    fn clone(&self) -> Self { self.clone_batch() }
 }
 
 impl ColumnarSource for OwnedBatch {
@@ -2255,5 +2273,61 @@ mod tests {
         // The corrupted string should have length 0
         let out_len = u32::from_le_bytes(dst.col_data(0)[0..4].try_into().unwrap());
         assert_eq!(out_len, 0, "corrupted blob reference should produce zero-length string");
+    }
+
+    #[test]
+    fn drop_recycles_buffers() {
+        use crate::storage::batch_pool::{acquire_buf, recycle_buf};
+        // Drain pool first.
+        while acquire_buf().is_some() {}
+
+        let schema = make_u64_i64_schema();
+        let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+        let data_cap = batch.data.capacity();
+        assert!(data_cap > 0);
+        drop(batch);
+
+        // Pool should now have at least one warm buffer (data buf).
+        // May also have blob buf (if non-zero cap). Drain and check.
+        let mut found = false;
+        let mut drained = Vec::new();
+        while let Some(buf) = acquire_buf() {
+            if buf.capacity() >= data_cap { found = true; }
+            drained.push(buf);
+        }
+        assert!(found, "pool should contain the recycled data buffer");
+        for buf in drained { recycle_buf(buf); }
+    }
+
+    #[test]
+    fn clone_drops_independently() {
+        use crate::storage::batch_pool::acquire_buf;
+        while acquire_buf().is_some() {}
+
+        let schema = make_u64_i64_schema();
+        let batch = make_batch(&schema, &[(1, 1, 10)]);
+        let cloned = batch.clone();
+        drop(batch);
+        drop(cloned);
+
+        // Both data + blob buffers from two batches should be in pool.
+        // Original had data + blob, clone has data + blob.
+        // Some may be zero-cap (empty blob), so just verify at least 2 buffers.
+        let mut count = 0;
+        while acquire_buf().is_some() { count += 1; }
+        assert!(count >= 2, "expected at least 2 recycled buffers, got {}", count);
+    }
+
+    #[test]
+    fn empty_batch_drop_is_noop() {
+        use crate::storage::batch_pool::acquire_buf;
+        while acquire_buf().is_some() {}
+
+        let batch = OwnedBatch::empty(2);
+        assert_eq!(batch.data.capacity(), 0);
+        drop(batch);
+
+        // Zero-capacity buffers should NOT be pooled.
+        assert!(acquire_buf().is_none(), "empty batch should not pollute pool");
     }
 }

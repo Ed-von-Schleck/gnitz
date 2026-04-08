@@ -11,18 +11,24 @@ from pathlib import Path
 
 
 class PerfRecorder:
-    """perf record -F 99 -g -p <pid> -o <output_dir>/perf.data"""
+    """perf record -F 99 -g -p <pid> -o <output_dir>/perf.data
 
-    def __init__(self, pid: int, output_dir: Path | str):
+    If dwarf=True, uses --call-graph=dwarf for full userspace stack unwinding
+    (larger perf.data, but resolves callers through libc and inlined frames).
+    """
+
+    def __init__(self, pid: int, output_dir: Path | str, dwarf: bool = False):
         self._pid = pid
         self._output_dir = Path(output_dir)
+        self._dwarf = dwarf
         self._proc: subprocess.Popen | None = None
 
     def start(self) -> None:
         perf_data = self._output_dir / "perf.data"
+        callgraph = ["--call-graph", "dwarf,65528"] if self._dwarf else ["-g"]
         try:
             self._proc = subprocess.Popen(
-                ["perf", "record", "-F", "99", "-g", "-k", "1", "-e", "cycles",
+                ["perf", "record", "-F", "99", *callgraph, "-k", "1", "-e", "cycles",
                  "-p", str(self._pid), "-o", str(perf_data)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

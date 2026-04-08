@@ -2537,6 +2537,15 @@ impl CatalogEngine {
 
     // -- Close engine ------------------------------------------------------
 
+    /// Flush all system tables (memtable → shard). Called at checkpoint and close.
+    pub fn flush_all_system_tables(&mut self) {
+        for info in SYS_TAB_INFOS {
+            if let Some(table) = self.sys_table_mut(info.id) {
+                let _ = table.flush();
+            }
+        }
+    }
+
     pub fn close(&mut self) {
         // Flush and close all user tables before clearing DagEngine
         let user_tids: Vec<i64> = self.dag.tables.keys()
@@ -2554,18 +2563,7 @@ impl CatalogEngine {
         }
         // tables.clear() in dag.close() drops Box<Table>/Box<PartitionedTable> automatically.
         self.dag.close();
-        let _ = self.sys_schemas.flush();
-        let _ = self.sys_tables.flush();
-        let _ = self.sys_views.flush();
-        let _ = self.sys_columns.flush();
-        let _ = self.sys_indices.flush();
-        let _ = self.sys_view_deps.flush();
-        let _ = self.sys_sequences.flush();
-        let _ = self.sys_circuit_nodes.flush();
-        let _ = self.sys_circuit_edges.flush();
-        let _ = self.sys_circuit_sources.flush();
-        let _ = self.sys_circuit_params.flush();
-        let _ = self.sys_circuit_group_cols.flush();
+        self.flush_all_system_tables();
     }
 
     // -- FK inline validation (single-worker) ------------------------------

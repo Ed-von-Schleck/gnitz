@@ -29,6 +29,8 @@ def parse_args():
                    help="Comma-separated client counts (e.g. 1,2,4)")
     p.add_argument("--perf", action="store_true",
                    help="Enable perf record")
+    p.add_argument("--perf-dwarf", action="store_true",
+                   help="Enable perf record with --call-graph=dwarf for full userspace stacks")
     p.add_argument("--perf-stat", action="store_true",
                    help="Enable perf stat")
     p.add_argument("-k", type=str, default=None,
@@ -136,6 +138,7 @@ def main():
                 f"--results-dir={subdir}",
                 *(["--full"] if args.full else []),
                 *(["--perf"] if args.perf else []),
+                *(["--perf-dwarf"] if args.perf_dwarf else []),
                 *(["--perf-stat"] if args.perf_stat else []),
                 *(["-k", args.k] if args.k else []),
                 "-q", "--tb=short",

@@ -18,13 +18,16 @@ thread_local! {
 
 /// Take a buffer from the pool (retains previous capacity).
 pub(crate) fn acquire_buf() -> Option<Vec<u8>> {
-    BUF_POOL.with(|p| p.borrow_mut().pop())
+    BUF_POOL.try_with(|p| p.borrow_mut().pop()).ok().flatten()
 }
 
 /// Return a buffer to the pool (clears content, retains capacity).
-fn recycle_buf(mut buf: Vec<u8>) {
+/// Zero-capacity buffers (moved-from state) are ignored.
+/// Uses `try_with` to handle thread-local teardown gracefully.
+pub(crate) fn recycle_buf(mut buf: Vec<u8>) {
+    if buf.capacity() == 0 { return; }
     buf.clear();
-    BUF_POOL.with(|p| {
+    let _ = BUF_POOL.try_with(|p| {
         let mut pool = p.borrow_mut();
         if pool.len() < MAX_POOLED {
             pool.push(buf);
