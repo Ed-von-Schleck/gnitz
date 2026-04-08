@@ -898,14 +898,6 @@ fn col(tc: u8, sz: u8, nullable: bool) -> SchemaColumn {
     SchemaColumn { type_code: tc, size: sz, nullable: if nullable { 1 } else { 0 }, _pad: 0 }
 }
 
-fn type_code_to_size(tc: u8) -> u8 {
-    match tc {
-        type_code::U64 | type_code::I64 | type_code::F64 => 8,
-        type_code::U128 | type_code::STRING => 16,
-        type_code::F32 => 4,
-        _ => 8,
-    }
-}
 
 
 fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
@@ -1367,7 +1359,7 @@ fn emit_node(
             right.columns[0] = col(type_code::U128, 16, false); // dummy PK
             for i in 0..n_cols {
                 let tc = node_params.get(&(PARAM_NULL_EXTEND_COL_BASE + i as i32)).copied().unwrap_or(type_code::I64 as i64) as u8;
-                let sz = type_code_to_size(tc);
+                let sz = crate::schema::type_size(tc);
                 right.columns[i + 1] = col(tc, sz, true);
             }
             right.num_columns = (n_cols + 1) as u32;
