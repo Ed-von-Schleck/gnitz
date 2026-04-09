@@ -13,6 +13,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 xorf = { version = "0.12", default-features = false }
 libc = "0.2"
 gnitz-transport = { path = "../gnitz-transport" }
+io-uring = "0.7"
 
 [dev-dependencies]
 tempfile = "3"

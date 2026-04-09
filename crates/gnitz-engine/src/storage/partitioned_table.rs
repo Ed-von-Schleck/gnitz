@@ -272,12 +272,6 @@ impl PartitionedTable {
         Ok(())
     }
 
-    pub fn set_has_wal(&mut self, flag: bool) {
-        for table in &mut self.tables {
-            table.set_has_wal(flag);
-        }
-    }
-
     pub fn current_lsn(&self) -> u64 {
         self.tables.iter().map(|t| t.current_lsn).max().unwrap_or(0)
     }

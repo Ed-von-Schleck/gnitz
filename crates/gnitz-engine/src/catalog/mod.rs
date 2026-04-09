@@ -2381,17 +2381,6 @@ impl CatalogEngine {
         }
     }
 
-    /// Disable WAL on all user tables (workers use SAL for durability).
-    pub fn disable_user_table_wal(&mut self) {
-        for (&tid, entry) in &self.dag.tables {
-            if tid < FIRST_USER_TABLE_ID { continue; }
-            if let StoreHandle::Partitioned(ref pt) = &entry.handle {
-                let ptable = unsafe { &mut *(std::ptr::addr_of!(**pt) as *mut PartitionedTable) };
-                ptable.set_has_wal(false);
-            }
-        }
-    }
-
     /// Invalidate all cached plans.
     pub fn invalidate_all_plans(&mut self) {
         self.dag.invalidate_all();
@@ -2536,17 +2525,6 @@ impl CatalogEngine {
     }
 
     // -- Close engine ------------------------------------------------------
-
-    /// Disable per-table WAL for system tables. In multi-worker mode the SAL
-    /// broadcast provides durability; dropping WAL writers eliminates their
-    /// per-ingest fdatasync. Call after SAL recovery, before normal operation.
-    pub fn disable_system_table_wal(&mut self) {
-        for info in SYS_TAB_INFOS {
-            if let Some(table) = self.sys_table_mut(info.id) {
-                table.set_has_wal(false);
-            }
-        }
-    }
 
     /// Flush all system tables (memtable → shard). Called at checkpoint and close.
     pub fn flush_all_system_tables(&mut self) {

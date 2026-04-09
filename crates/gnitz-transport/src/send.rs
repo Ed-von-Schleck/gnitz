@@ -37,6 +37,24 @@ impl SendQueue {
         self.back.extend_from_slice(payload);
     }
 
+    /// Reserve space for a framed message (4-byte LE header + payload) in the
+    /// staging buffer and invoke `f` to write the payload in-place.
+    ///
+    /// `f` receives a zeroed `&mut [u8]` of exactly `payload_len` bytes and
+    /// must return `payload_len` (the number of bytes written).
+    pub fn encode_into<F>(&mut self, payload_len: usize, f: F)
+    where
+        F: FnOnce(&mut [u8]) -> usize,
+    {
+        let start = self.back.len();
+        let total = 4 + payload_len;
+        self.back.resize(start + total, 0);
+        self.back[start..start + 4]
+            .copy_from_slice(&(payload_len as u32).to_le_bytes());
+        let written = f(&mut self.back[start + 4..start + total]);
+        debug_assert_eq!(written, payload_len);
+    }
+
     /// Yield `(ptr, len)` for one SEND SQE, or `None` if nothing to send
     /// or a send is already in-flight.
     pub fn prepare(&mut self) -> Option<(*const u8, usize)> {
@@ -180,5 +198,46 @@ mod tests {
     fn test_empty_prepare_returns_none() {
         let mut sq = SendQueue::new();
         assert!(sq.prepare().is_none());
+    }
+
+    #[test]
+    fn test_encode_into_basic() {
+        let mut sq = SendQueue::new();
+        sq.encode_into(5, |buf| {
+            buf.copy_from_slice(b"hello");
+            5
+        });
+        assert!(sq.has_pending());
+
+        let (ptr, len) = sq.prepare().unwrap();
+        assert_eq!(len, 9); // 4-byte header + 5-byte payload
+        let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+        assert_eq!(&data[..4], &5u32.to_le_bytes());
+        assert_eq!(&data[4..], b"hello");
+        sq.complete(len);
+        assert!(!sq.has_pending());
+    }
+
+    #[test]
+    fn test_encode_into_coalesces_with_push() {
+        let mut sq = SendQueue::new();
+        sq.push(&[2, 0, 0, 0], b"ab");
+        sq.encode_into(3, |buf| {
+            buf.copy_from_slice(b"cde");
+            3
+        });
+
+        let (ptr, len) = sq.prepare().unwrap();
+        // (4+2) + (4+3) = 13
+        assert_eq!(len, 13);
+        let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+        // First message
+        assert_eq!(&data[..4], &2u32.to_le_bytes());
+        assert_eq!(&data[4..6], b"ab");
+        // Second message
+        assert_eq!(&data[6..10], &3u32.to_le_bytes());
+        assert_eq!(&data[10..], b"cde");
+        sq.complete(len);
+        assert!(!sq.has_pending());
     }
 }

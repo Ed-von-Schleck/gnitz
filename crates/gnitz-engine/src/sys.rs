@@ -56,6 +56,13 @@ pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
     unsafe { libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_HUGEPAGE); }
 }
 
+/// Hint the kernel to read-ahead [ptr, ptr+size) into page cache.
+/// Best-effort: ignores errors and is a no-op for null ptr or size 0.
+pub fn madvise_willneed(ptr: *mut u8, size: usize) {
+    if ptr.is_null() || size == 0 { return; }
+    unsafe { libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_WILLNEED); }
+}
+
 /// Hint the kernel to read-ahead [ptr, ptr+size) sequentially.
 /// Best-effort: ignores errors and is a no-op for null ptr or size 0.
 pub fn madvise_sequential(ptr: *mut u8, size: usize) {

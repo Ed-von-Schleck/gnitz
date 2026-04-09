@@ -24,6 +24,7 @@ use crate::storage::OwnedBatch;
 const MAX_PENDING_ROWS: usize = 100_000;
 const TICK_COALESCE_ROWS: usize = 10_000;
 const TICK_DEADLINE_MS: u64 = 20;
+const FLUSH_DEADLINE_MS: u64 = 1;
 const POLL_BUF_SIZE: usize = 256;
 
 /// Client wire protocol flags (low bits of the flags field).
@@ -114,12 +115,15 @@ struct GroupInfo {
 
 pub struct ServerExecutor {
     catalog: *mut CatalogEngine,
-    dispatcher: Option<*mut MasterDispatcher>,
+    dispatcher: *mut MasterDispatcher,
 
     // Tick coalescing
     tick_tids: Vec<i64>,
     tick_rows: HashMap<i64, usize>,
     t_last_push: Option<Instant>,
+
+    // Deadline-based group commit
+    t_first_pending: Option<Instant>,
 
     // LSN tracking (monotonic)
     ingest_lsn: u64,
@@ -135,6 +139,9 @@ pub struct ServerExecutor {
 
     // Schema descriptor cache (table IDs are monotonic, never reused)
     schema_cache: HashMap<i64, SchemaDescriptor>,
+
+    // Async fdatasync: overlaps fsync with worker ACK collection
+    async_fsync: ipc::AsyncFsync,
 }
 
 // Safety: ServerExecutor is single-threaded (master process event loop).
@@ -143,14 +150,18 @@ unsafe impl Send for ServerExecutor {}
 impl ServerExecutor {
     pub fn new(
         catalog: *mut CatalogEngine,
-        dispatcher: Option<*mut MasterDispatcher>,
+        dispatcher: *mut MasterDispatcher,
+        sal_fd: i32,
     ) -> Self {
+        let async_fsync = ipc::AsyncFsync::new(sal_fd)
+            .expect("Failed to create AsyncFsync io_uring");
         ServerExecutor {
             catalog,
             dispatcher,
             tick_tids: Vec::with_capacity(8),
             tick_rows: HashMap::new(),
             t_last_push: None,
+            t_first_pending: None,
             ingest_lsn: 0,
             last_tick_lsn: 0,
             tick_state: TickState::Idle,
@@ -158,6 +169,7 @@ impl ServerExecutor {
             deferred_requests: Vec::with_capacity(8),
             pending_ddl_responses: Vec::with_capacity(8),
             schema_cache: HashMap::new(),
+            async_fsync,
         }
     }
 
@@ -168,13 +180,9 @@ impl ServerExecutor {
         unsafe { &mut *self.catalog }
     }
 
-    fn has_dispatcher(&self) -> bool {
-        self.dispatcher.is_some()
-    }
-
     #[inline]
     fn disp(&mut self) -> &mut MasterDispatcher {
-        unsafe { &mut *self.dispatcher.unwrap() }
+        unsafe { &mut *self.dispatcher }
     }
 
     // -- Schema helpers -------------------------------------------------------
@@ -194,7 +202,7 @@ impl ServerExecutor {
     fn handle_push(
         &mut self, target_id: i64, in_batch: Option<Box<OwnedBatch>>,
     ) -> Result<(Option<Arc<OwnedBatch>>, u64), String> {
-        if self.has_dispatcher() && target_id >= FIRST_USER_TABLE_ID {
+        if target_id >= FIRST_USER_TABLE_ID {
             if let Some(batch) = in_batch {
                 if batch.count > 0 {
                     self.disp().validate_fk_distributed(target_id, &batch)?;
@@ -213,27 +221,12 @@ impl ServerExecutor {
             return Ok((result, lsn));
         }
 
-        // Single-worker or system table path
+        // System table path
         if let Some(batch) = in_batch {
             if batch.count > 0 {
-                if target_id >= FIRST_USER_TABLE_ID {
-                    // User table: FK + unique validation, then push_and_evaluate
-                    self.cat().validate_fk_inline(target_id, &batch)?;
-                    self.cat().validate_fk_parent_restrict(target_id, &batch)?;
-                    self.cat().validate_unique_indices(target_id, &batch)?;
-                    // Transfer ownership
-                    self.cat().push_and_evaluate(target_id, *batch)?;
-                } else {
-                    // System table: ingest into memtable. In multi-worker mode
-                    // the DDL_SYNC broadcast provides SAL durability — skip
-                    // per-table flush (deferred to checkpoint).
-                    self.cat().ingest_to_family(target_id, &*batch)?;
-                    if !self.has_dispatcher() {
-                        self.cat().flush_family(target_id)?;
-                    }
-                    let dag = self.cat().get_dag_ptr();
-                    unsafe { &mut *dag }.evaluate_dag(target_id, *batch);
-                }
+                self.cat().ingest_to_family(target_id, &*batch)?;
+                let dag = self.cat().get_dag_ptr();
+                unsafe { &mut *dag }.evaluate_dag(target_id, *batch);
                 self.ingest_lsn += 1;
                 self.last_tick_lsn = self.ingest_lsn;
                 return Ok((None, self.ingest_lsn));
@@ -247,15 +240,6 @@ impl ServerExecutor {
         Ok((result, lsn))
     }
 
-
-    fn scan_family(&mut self, target_id: i64) -> Option<Arc<OwnedBatch>> {
-        match self.cat().scan_family(target_id) {
-            Ok(batch) => {
-                if batch.count > 0 { Some(batch) } else { None }
-            }
-            Err(_) => None,
-        }
-    }
 
     fn seek_family(&mut self, target_id: i64, pk_lo: u64, pk_hi: u64) -> Option<OwnedBatch> {
         match self.cat().seek_family(target_id, pk_lo, pk_hi) {
@@ -299,20 +283,16 @@ impl ServerExecutor {
             col_names_opt = None;
         }
 
-        let wire = ipc::encode_wire(
-            target_id as u64,
-            client_id,
-            0, // flags
-            seek_pk_lo,
-            0, // seek_pk_hi
-            0, // seek_col_idx
-            status,
-            error_msg,
-            Some(schema),
-            col_names_opt,
-            result,
-        );
-        transport.send(fd, wire.as_ptr(), wire.len());
+        let sz = ipc::wire_size(status, error_msg, Some(schema), col_names_opt, result);
+        transport.send_encoded(fd, sz, |buf| {
+            ipc::encode_wire_into(
+                buf, 0,
+                target_id as u64, client_id,
+                0, seek_pk_lo, 0, 0,
+                status, error_msg,
+                Some(schema), col_names_opt, result,
+            )
+        });
     }
 
     fn send_alloc_response(
@@ -322,13 +302,16 @@ impl ServerExecutor {
         new_id: i64,
         client_id: u64,
     ) {
-        let wire = ipc::encode_wire(
-            new_id as u64, client_id,
-            0, 0, 0, 0,
-            STATUS_OK, b"",
-            None, None, None,
-        );
-        transport.send(fd, wire.as_ptr(), wire.len());
+        let sz = ipc::wire_size(STATUS_OK, b"", None, None, None);
+        transport.send_encoded(fd, sz, |buf| {
+            ipc::encode_wire_into(
+                buf, 0,
+                new_id as u64, client_id,
+                0, 0, 0, 0,
+                STATUS_OK, b"",
+                None, None, None,
+            )
+        });
     }
 
     fn send_error_response(
@@ -340,17 +323,16 @@ impl ServerExecutor {
         client_id: u64,
     ) {
         let schema = SchemaDescriptor::minimal_u64();
-        let wire = ipc::encode_wire(
-            target_id as u64,
-            client_id,
-            0, 0, 0, 0,
-            STATUS_ERROR,
-            error_msg,
-            Some(&schema),
-            None,
-            None,
-        );
-        transport.send(fd, wire.as_ptr(), wire.len());
+        let sz = ipc::wire_size(STATUS_ERROR, error_msg, Some(&schema), None, None);
+        transport.send_encoded(fd, sz, |buf| {
+            ipc::encode_wire_into(
+                buf, 0,
+                target_id as u64, client_id,
+                0, 0, 0, 0,
+                STATUS_ERROR, error_msg,
+                Some(&schema), None, None,
+            )
+        });
     }
 
     // -- Pending batch management (multi-worker) ------------------------------
@@ -382,6 +364,10 @@ impl ServerExecutor {
             pending.row_count += e.batch.count;
         }
         pending.entries = keep_entries;
+
+        if pending.is_empty() {
+            self.t_first_pending = None;
+        }
 
         if !flush_entries.is_empty() {
             self.flush_pending_pushes(transport, flush_entries);
@@ -420,7 +406,6 @@ impl ServerExecutor {
                 run_end += 1;
             }
 
-            // Merge batches for same target_id.
             let merged_count;
             let merged = {
                 let schema = self.get_schema_desc(target_id);
@@ -451,11 +436,19 @@ impl ServerExecutor {
 
         let any_written = groups.iter().any(|g| g.error.is_none());
 
-        // Phase 2: one fdatasync, then collect ACKs sequentially.
+        // Phase 2: signal workers + submit async fdatasync, then collect ACKs.
+        // Key insight: workers see SAL data via atomic release/acquire (no fsync
+        // needed). Submit fdatasync asynchronously, collect ACKs while it runs,
+        // then wait for fsync before ACKing clients.
         if any_written {
             let nw = self.disp().num_workers();
-            self.disp().sync_and_signal_all();
+            // Signal workers immediately, submit async fdatasync in parallel.
+            {
+                let disp = unsafe { &mut *self.dispatcher };
+                disp.signal_and_submit_fsync(&mut self.async_fsync);
+            }
 
+            // Collect ACKs (blocking) — workers process while fsync runs.
             let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
             let mut any_success = false;
             for gi in 0..groups.len() {
@@ -489,6 +482,17 @@ impl ServerExecutor {
             }
 
             self.disp().reset_w2m_cursors();
+
+            // Wait for async fdatasync to complete before ACKing clients.
+            let fsync_rc = self.async_fsync.wait_complete();
+            if fsync_rc < 0 {
+                let err = format!("fdatasync failed: {}", fsync_rc);
+                for g in groups.iter_mut() {
+                    if g.error.is_none() {
+                        g.error = Some(err.clone());
+                    }
+                }
+            }
         }
 
         // Phase 3: send responses.
@@ -502,24 +506,35 @@ impl ServerExecutor {
             let ok_refs: Option<Vec<&[u8]>> = col_names_owned.as_ref().map(|names|
                 names.iter().map(|s| s.as_bytes()).collect()
             );
+            let sz = if g.error.is_some() {
+                ipc::wire_size(STATUS_ERROR, g.error.as_ref().unwrap().as_bytes(), Some(&schema), None, None)
+            } else {
+                ipc::wire_size(STATUS_OK, b"", Some(&schema), Some(ok_refs.as_ref().unwrap()), None)
+            };
             for k in g.start..g.end {
                 let e = &entries[k];
-                let wire = if let Some(ref err_msg) = g.error {
-                    ipc::encode_wire(
-                        g.target_id as u64, e.client_id,
-                        0, 0, 0, 0,
-                        STATUS_ERROR, err_msg.as_bytes(),
-                        Some(&schema), None, None,
-                    )
+                let rc = if let Some(ref err_msg) = g.error {
+                    transport.send_encoded(e.fd, sz, |buf| {
+                        ipc::encode_wire_into(
+                            buf, 0,
+                            g.target_id as u64, e.client_id,
+                            0, 0, 0, 0,
+                            STATUS_ERROR, err_msg.as_bytes(),
+                            Some(&schema), None, None,
+                        )
+                    })
                 } else {
-                    ipc::encode_wire(
-                        g.target_id as u64, e.client_id,
-                        0, g.current_lsn, 0, 0,
-                        STATUS_OK, b"",
-                        Some(&schema), Some(ok_refs.as_ref().unwrap()), None,
-                    )
+                    transport.send_encoded(e.fd, sz, |buf| {
+                        ipc::encode_wire_into(
+                            buf, 0,
+                            g.target_id as u64, e.client_id,
+                            0, g.current_lsn, 0, 0,
+                            STATUS_OK, b"",
+                            Some(&schema), Some(ok_refs.as_ref().unwrap()), None,
+                        )
+                    })
                 };
-                if transport.send(e.fd, wire.as_ptr(), wire.len()) < 0 {
+                if rc < 0 {
                     transport.close_fd(e.fd);
                 }
             }
@@ -537,13 +552,16 @@ impl ServerExecutor {
         for k in start..end {
             let e = &entries[k];
             let schema = self.get_schema_desc(e.target_id);
-            let wire = ipc::encode_wire(
-                e.target_id as u64, e.client_id,
-                0, 0, 0, 0,
-                STATUS_ERROR, err_msg.as_bytes(),
-                Some(&schema), None, None,
-            );
-            if transport.send(e.fd, wire.as_ptr(), wire.len()) < 0 {
+            let sz = ipc::wire_size(STATUS_ERROR, err_msg.as_bytes(), Some(&schema), None, None);
+            if transport.send_encoded(e.fd, sz, |buf| {
+                ipc::encode_wire_into(
+                    buf, 0,
+                    e.target_id as u64, e.client_id,
+                    0, 0, 0, 0,
+                    STATUS_ERROR, err_msg.as_bytes(),
+                    Some(&schema), None, None,
+                )
+            }) < 0 {
                 transport.close_fd(e.fd);
             }
         }
@@ -570,12 +588,6 @@ impl ServerExecutor {
         false
     }
 
-    fn check_and_fire_pending_ticks(&mut self) {
-        if self.should_fire_ticks() {
-            self.fire_pending_ticks();
-        }
-    }
-
     fn fire_pending_ticks(&mut self) {
         if self.tick_tids.is_empty() {
             return;
@@ -597,10 +609,6 @@ impl ServerExecutor {
     }
 
     fn check_and_fire_pending_ticks_async(&mut self) {
-        if !self.has_dispatcher() {
-            self.check_and_fire_pending_ticks();
-            return;
-        }
         if !self.should_fire_ticks() {
             return;
         }
@@ -692,7 +700,7 @@ impl ServerExecutor {
             let _: Result<(), ()> = (|| {
                 if req.flags & FLAG_SEEK_BY_INDEX != 0 {
                     let schema = self.get_schema_desc(req.target_id);
-                    let result = if self.has_dispatcher() && req.target_id >= FIRST_USER_TABLE_ID {
+                    let result = if req.target_id >= FIRST_USER_TABLE_ID {
                         let disp = self.disp();
                         disp.fan_out_seek_by_index(
                             req.target_id, req.seek_col_idx as u32,
@@ -714,7 +722,7 @@ impl ServerExecutor {
                     );
                 } else if req.flags & FLAG_SEEK != 0 {
                     let schema = self.get_schema_desc(req.target_id);
-                    let result = if self.has_dispatcher() && req.target_id >= FIRST_USER_TABLE_ID {
+                    let result = if req.target_id >= FIRST_USER_TABLE_ID {
                         let disp = self.disp();
                         disp.fan_out_seek(
                             req.target_id, req.seek_pk_lo, req.seek_pk_hi,
@@ -734,15 +742,11 @@ impl ServerExecutor {
                     // Deferred scan (empty-batch push)
                     let schema = self.get_schema_desc(req.target_id);
                     let lsn = self.last_tick_lsn;
-                    let result = if self.has_dispatcher() {
-                        let disp = self.disp();
-                        disp.fan_out_scan(req.target_id).map_err(|e| {
-                            self.send_error_response(
-                                transport, req.fd, e.as_bytes(), req.target_id, req.client_id);
-                        })?.map(Arc::new)
-                    } else {
-                        self.scan_family(req.target_id)
-                    };
+                    let disp = self.disp();
+                    let result = disp.fan_out_scan(req.target_id).map_err(|e| {
+                        self.send_error_response(
+                            transport, req.fd, e.as_bytes(), req.target_id, req.client_id);
+                    })?.map(Arc::new);
                     self.send_response(
                         transport, req.fd, req.target_id,
                         result.as_deref(), STATUS_OK, b"",
@@ -788,13 +792,17 @@ impl ServerExecutor {
             Err(_) => "internal server error (panic)".to_string(),
         };
 
-        let wire = ipc::encode_wire(
-            target_id as u64, client_id,
-            0, 0, 0, 0,
-            STATUS_ERROR, err_msg.as_bytes(),
-            Some(&SchemaDescriptor::minimal_u64()), None, None,
-        );
-        if transport.send(fd, wire.as_ptr(), wire.len()) < 0 {
+        let schema = SchemaDescriptor::minimal_u64();
+        let sz = ipc::wire_size(STATUS_ERROR, err_msg.as_bytes(), Some(&schema), None, None);
+        if transport.send_encoded(fd, sz, |buf| {
+            ipc::encode_wire_into(
+                buf, 0,
+                target_id as u64, client_id,
+                0, 0, 0, 0,
+                STATUS_ERROR, err_msg.as_bytes(),
+                Some(&schema), None, None,
+            )
+        }) < 0 {
             transport.close_fd(fd);
         }
     }
@@ -852,9 +860,8 @@ impl ServerExecutor {
                 });
                 return Ok(());
             }
-            // Scans (empty-batch push to user table with dispatcher)
-            if self.has_dispatcher()
-                && target_id >= FIRST_USER_TABLE_ID
+            // Scans (empty-batch push to user table)
+            if target_id >= FIRST_USER_TABLE_ID
                 && decoded.data_batch.as_ref().map_or(true, |b| b.count == 0)
             {
                 self.deferred_requests.push(DeferredRequest {
@@ -871,7 +878,7 @@ impl ServerExecutor {
             self.fire_pending_ticks();
             let col_idx = decoded.control.seek_col_idx as u32;
             let schema = self.get_schema_desc(target_id);
-            let result = if self.has_dispatcher() && target_id >= FIRST_USER_TABLE_ID {
+            let result = if target_id >= FIRST_USER_TABLE_ID {
                 let disp = self.disp();
                 disp.fan_out_seek_by_index(
                     target_id, col_idx,
@@ -896,7 +903,7 @@ impl ServerExecutor {
         if flags & FLAG_SEEK != 0 {
             self.flush_pending_for_tid(transport, target_id, pending);
             let schema = self.get_schema_desc(target_id);
-            let result = if self.has_dispatcher() && target_id >= FIRST_USER_TABLE_ID {
+            let result = if target_id >= FIRST_USER_TABLE_ID {
                 let disp = self.disp();
                 disp.fan_out_seek(
                     target_id,
@@ -926,9 +933,8 @@ impl ServerExecutor {
             }
         }
 
-        // Bufferable: multi-worker user-table DML with data
-        if self.has_dispatcher()
-            && target_id >= FIRST_USER_TABLE_ID
+        // Bufferable: user-table DML with data
+        if target_id >= FIRST_USER_TABLE_ID
             && has_batch
             && decoded.data_batch.as_ref().map_or(false, |b| b.count > 0)
         {
@@ -948,6 +954,9 @@ impl ServerExecutor {
                 disp.validate_unique_distributed(target_id, &batch)?;
             }
             pending.add(fd, client_id, target_id, *batch);
+            if self.t_first_pending.is_none() {
+                self.t_first_pending = Some(Instant::now());
+            }
             return Ok(());
         }
 
@@ -956,8 +965,7 @@ impl ServerExecutor {
 
         // DDL broadcast needs the batch after handle_push, but handle_push
         // consumes it. Clone upfront when broadcast is needed.
-        let ddl_clone = if self.has_dispatcher()
-            && target_id < FIRST_USER_TABLE_ID
+        let ddl_clone = if target_id < FIRST_USER_TABLE_ID
             && has_batch
         {
             decoded.data_batch.as_ref().map(|b| b.clone_batch())
@@ -1005,7 +1013,7 @@ impl ServerExecutor {
 
     pub fn run(
         catalog: *mut CatalogEngine,
-        dispatcher: Option<*mut MasterDispatcher>,
+        dispatcher: *mut MasterDispatcher,
         server_fd: i32,
     ) -> i32 {
         let ring = match IoUringRing::new(256) {
@@ -1018,7 +1026,8 @@ impl ServerExecutor {
         let mut transport = Transport::new(ring, POLL_BUF_SIZE);
         transport.accept_conn(server_fd);
 
-        let mut exec = ServerExecutor::new(catalog, dispatcher);
+        let sal_fd = unsafe { &*dispatcher }.sal_fd();
+        let mut exec = ServerExecutor::new(catalog, dispatcher, sal_fd);
         exec.run_loop(&mut transport);
         0
     }
@@ -1031,8 +1040,8 @@ impl ServerExecutor {
 
         loop {
             // Worker crash detection
-            if let Some(disp_ptr) = self.dispatcher {
-                let disp = unsafe { &mut *disp_ptr };
+            {
+                let disp = unsafe { &mut *self.dispatcher };
                 let crashed = disp.check_workers();
                 if crashed >= 0 {
                     let base_dir = &self.cat().base_dir;
@@ -1059,6 +1068,13 @@ impl ServerExecutor {
                         }
                     }
                 }
+                if let Some(first) = self.t_first_pending {
+                    let elapsed = first.elapsed().as_millis() as i32;
+                    let remaining = FLUSH_DEADLINE_MS as i32 - elapsed;
+                    if remaining < t {
+                        t = if remaining > 0 { remaining } else { 0 };
+                    }
+                }
                 t
             };
 
@@ -1081,6 +1097,7 @@ impl ServerExecutor {
                 Transport::<IoUringRing>::free_recv(ptr);
 
                 if pending.row_count >= MAX_PENDING_ROWS && self.tick_state != TickState::Active {
+                    self.t_first_pending = None;
                     let entries = std::mem::take(&mut pending.entries);
                     pending.row_count = 0;
                     self.flush_pending_pushes(transport, entries);
@@ -1088,12 +1105,17 @@ impl ServerExecutor {
             }
 
             if !pending.is_empty() && self.tick_state != TickState::Active {
-                let entries = std::mem::take(&mut pending.entries);
-                pending.row_count = 0;
-                self.flush_pending_pushes(transport, entries);
+                let deadline_expired = self.t_first_pending
+                    .map_or(false, |t| t.elapsed().as_millis() as u64 >= FLUSH_DEADLINE_MS);
+                if pending.row_count >= MAX_PENDING_ROWS || deadline_expired {
+                    self.t_first_pending = None;
+                    let entries = std::mem::take(&mut pending.entries);
+                    pending.row_count = 0;
+                    self.flush_pending_pushes(transport, entries);
+                }
             }
 
-            if self.has_dispatcher() && !self.pending_ddl_responses.is_empty() {
+            if !self.pending_ddl_responses.is_empty() {
                 self.flush_pending_ddl_responses(transport);
             }
 

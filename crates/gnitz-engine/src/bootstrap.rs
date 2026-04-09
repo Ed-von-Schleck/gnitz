@@ -207,8 +207,7 @@ fn backfill_exchange_views(
 ///
 /// 1. Raises fd limit
 /// 2. Opens catalog
-/// 3. Single-worker: creates socket, runs executor
-/// 4. Multi-worker: allocates SAL/W2M/eventfds, forks workers, runs recovery,
+/// 3. Allocates SAL/W2M/eventfds, forks workers, runs recovery,
 ///    creates dispatcher, runs executor
 ///
 /// Returns 0 on clean exit, non-zero on error.
@@ -218,7 +217,7 @@ pub fn server_main(
     num_workers: u32,
     log_level: u32,
 ) -> i32 {
-    // Raise fd limit (each partitioned user table holds 256 WAL fds)
+    // Raise fd limit (partition directories + shard files)
     sys::raise_fd_limit(65536);
 
     gnitz_info!("Opening database at {}", data_dir);
@@ -233,21 +232,6 @@ pub fn server_main(
     };
     let catalog_ptr = Box::into_raw(Box::new(catalog));
 
-    // --- Single-worker path ---
-    if num_workers == 1 {
-        gnitz_info!("Listening on {}", socket_path);
-        let server_fd = sys::server_create(socket_path);
-        if server_fd < 0 {
-            let msg = b"Error: failed to create server socket\n";
-            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
-            return 1;
-        }
-        let msg = b"GnitzDB ready\n";
-        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
-        return ServerExecutor::run(catalog_ptr, None, server_fd);
-    }
-
-    // --- Multi-worker path ---
     let nw = num_workers as usize;
     {
         let msg = format!("Starting {} workers\n", num_workers);
@@ -293,9 +277,6 @@ pub fn server_main(
         let catalog = unsafe { &mut *catalog_ptr };
         recover_system_tables_from_sal(sal_ptr as *const u8, catalog);
         catalog.flush_all_system_tables();
-        // SAL broadcast now provides durability — drop per-table WAL
-        // writers to eliminate their per-ingest fdatasync overhead.
-        catalog.disable_system_table_wal();
     }
 
     // --- W2M regions (memfd-backed, one per worker→master) ---
@@ -405,9 +386,6 @@ pub fn server_main(
             catalog.set_active_partitions(part_start, part_end);
             catalog.trim_worker_partitions(part_start, part_end);
 
-            // Disable per-partition WAL (SAL handles durability)
-            catalog.disable_user_table_wal();
-
             // Construct channel types for this worker
             let sal_reader = SalReader::new(
                 sal_ptr as *const u8, w as u32, SAL_MMAP_SIZE, m2w_efds[w],
@@ -436,6 +414,7 @@ pub fn server_main(
 
             let mut worker = WorkerProcess::new(
                 w as u32,
+                nw,
                 master_pid,
                 catalog_ptr,
                 sal_reader,
@@ -497,5 +476,5 @@ pub fn server_main(
     let msg = b"GnitzDB ready\n";
     unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
 
-    ServerExecutor::run(catalog_ptr, Some(dispatcher_ptr), server_fd)
+    ServerExecutor::run(catalog_ptr, dispatcher_ptr, server_fd)
 }

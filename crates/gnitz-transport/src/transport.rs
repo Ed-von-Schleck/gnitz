@@ -77,6 +77,20 @@ impl<R: Ring> Transport<R> {
         0
     }
 
+    /// Encode a response directly into the connection's send buffer.
+    ///
+    /// Returns 0 on success, -1 if the connection is closing or unknown.
+    pub fn send_encoded<F>(&mut self, fd: i32, payload_len: usize, f: F) -> i32
+    where
+        F: FnOnce(&mut [u8]) -> usize,
+    {
+        let Some(conn) = self.conns.get_mut(&fd) else { return -1 };
+        if conn.closing { return -1 }
+        conn.send_queue.encode_into(payload_len, f);
+        self.dirty_fds.push(fd);
+        0
+    }
+
     /// Request connection close. Actual close is deferred until all
     /// outstanding SQEs have produced CQEs.
     pub fn close_fd(&mut self, fd: i32) {

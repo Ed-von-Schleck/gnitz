@@ -1,7 +1,6 @@
-//! Unified Table: owns MemTable + ShardIndex + optional WAL writer.
+//! Unified Table: owns MemTable + ShardIndex.
 //!
-//! Ephemeral tables have `wal_writer = None`; persistent tables have a WAL
-//! writer and publish manifests on flush.
+//! Ephemeral tables skip durability; persistent tables publish manifests on flush.
 
 use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
@@ -13,9 +12,7 @@ use super::memtable::{self, MemTable, OwnedBatch};
 use super::read_cursor::{self, CursorHandle};
 use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
-use super::wal::{self, WalReader, WalWriter, WAL_PREALLOC_BYTES};
 
-const MAX_REGIONS: usize = 70; // 4 core + up to 63 payload cols + 1 blob
 
 // ---------------------------------------------------------------------------
 // FoundSource — tracks where retract_pk found its row
@@ -37,24 +34,22 @@ pub struct Table {
     schema: SchemaDescriptor,
     table_id: u32,
     directory: String,
-    name: String,
     dirfd: libc::c_int,
 
-    wal_writer: Option<WalWriter>,
+    durable: bool,
     manifest_path: Option<String>,
 
     flush_seq: u32,
     pub current_lsn: u64,
-    wal_bytes_since_truncate: u64,
 
     found_source: FoundSource,
 }
 
 impl Table {
-    /// Create a new table.  `durable=true` enables WAL + manifest (persistent).
+    /// Create a new table.  `durable=true` enables manifest (persistent).
     pub fn new(
         dir: &str,
-        name: &str,
+        _name: &str,
         schema: SchemaDescriptor,
         table_id: u32,
         arena_size: u64,
@@ -87,13 +82,11 @@ impl Table {
             schema,
             table_id,
             directory: dir.to_string(),
-            name: name.to_string(),
             dirfd,
-            wal_writer: None,
+            durable,
             manifest_path: None,
             flush_seq: 0,
             current_lsn: 1,
-            wal_bytes_since_truncate: 0,
             found_source: FoundSource::None,
         };
 
@@ -105,11 +98,6 @@ impl Table {
                 table.current_lsn = 1;
             }
             table.manifest_path = Some(manifest_path);
-
-            let wal_path = format!("{}/{}.wal", dir, name);
-            let wal_c = CString::new(wal_path.as_str()).map_err(|_| -1)?;
-            table.wal_writer = Some(WalWriter::open(&wal_c)?);
-            table.recover_from_wal()?;
         }
 
         Ok(table)
@@ -117,13 +105,6 @@ impl Table {
 
     pub fn schema(&self) -> &SchemaDescriptor {
         &self.schema
-    }
-
-    /// Enable or disable WAL writes.  Disabling drops the WAL writer.
-    pub fn set_has_wal(&mut self, flag: bool) {
-        if !flag {
-            self.wal_writer = None;
-        }
     }
 
     // ------------------------------------------------------------------
@@ -150,8 +131,8 @@ impl Table {
     // Ingest
     // ------------------------------------------------------------------
 
-    /// Ingest an already-constructed OwnedBatch.  Writes WAL (if durable),
-    /// then memtable.  Used by PartitionedTable after hash-routing.
+    /// Ingest an already-constructed OwnedBatch into the memtable.
+    /// Used by PartitionedTable after hash-routing.
     pub fn ingest_owned_batch(&mut self, batch: OwnedBatch) -> Result<(), i32> {
         if batch.count == 0 {
             return Ok(());
@@ -159,20 +140,7 @@ impl Table {
         let batch = self.sort_batch_if_needed(batch);
         self.found_source = FoundSource::None;
 
-        if let Some(ref mut wal) = self.wal_writer {
-            let regions = batch.regions();
-            let ptrs: Vec<*const u8> = regions.iter().map(|&(p, _)| p).collect();
-            let sizes: Vec<u32> = regions.iter().map(|&(_, s)| s as u32).collect();
-            let blob_size = *sizes.last().unwrap_or(&0) as u64;
-            let block_sz = wal::block_size(ptrs.len(), &sizes) as u64;
-            let rc = wal.append_batch(
-                self.current_lsn, self.table_id, batch.count as u32,
-                &ptrs, &sizes, blob_size,
-            );
-            if rc < 0 {
-                return Err(rc);
-            }
-            self.wal_bytes_since_truncate += block_sz;
+        if self.durable {
             self.current_lsn += 1;
         }
 
@@ -189,7 +157,7 @@ impl Table {
         Ok(())
     }
 
-    /// Ingest a pre-sorted batch.  Writes WAL first (if durable), then memtable.
+    /// Ingest a pre-sorted batch into the memtable.
     pub fn ingest_batch_from_regions(
         &mut self,
         ptrs: &[*const u8],
@@ -202,17 +170,7 @@ impl Table {
         }
         self.found_source = FoundSource::None;
 
-        if let Some(ref mut wal) = self.wal_writer {
-            let blob_idx = 4 + num_payload_cols;
-            let blob_size = if blob_idx < sizes.len() { sizes[blob_idx] as u64 } else { 0 };
-            let block_sz = wal::block_size(ptrs.len(), sizes) as u64;
-            let rc = wal.append_batch(
-                self.current_lsn, self.table_id, count, ptrs, sizes, blob_size,
-            );
-            if rc < 0 {
-                return Err(rc);
-            }
-            self.wal_bytes_since_truncate += block_sz;
+        if self.durable {
             self.current_lsn += 1;
         }
 
@@ -246,7 +204,7 @@ impl Table {
             OwnedBatch::from_regions(ptrs, sizes, count as usize, num_payload_cols)
         };
         let batch = self.sort_batch_if_needed(batch);
-        let durable = !force_ephemeral && self.wal_writer.is_some();
+        let durable = !force_ephemeral && self.durable;
         match self.memtable.upsert_sorted_batch(batch) {
             Ok(()) => {
                 if self.memtable.should_flush() {
@@ -271,10 +229,9 @@ impl Table {
     // Flush
     // ------------------------------------------------------------------
 
-    /// Flush memtable to shard.  Persistent tables also update manifest and
-    /// truncate WAL.
+    /// Flush memtable to shard.  Persistent tables also update manifest.
     pub fn flush(&mut self) -> Result<bool, i32> {
-        self.flush_inner(self.wal_writer.is_some())
+        self.flush_inner(self.durable)
     }
 
     /// Flush with durable shard naming and manifest update, regardless of
@@ -328,12 +285,6 @@ impl Table {
             }
             if unsafe { libc::fsync(self.dirfd) } < 0 {
                 return Err(-3);
-            }
-            if self.wal_bytes_since_truncate >= WAL_PREALLOC_BYTES as u64 {
-                if let Some(ref mut wal) = self.wal_writer {
-                    wal.truncate();
-                }
-                self.wal_bytes_since_truncate = 0;
             }
         }
 
@@ -506,84 +457,6 @@ impl Table {
     }
 
     // ------------------------------------------------------------------
-    // WAL recovery
-    // ------------------------------------------------------------------
-
-    pub fn recover_from_wal(&mut self) -> Result<(), i32> {
-        let wal_path = format!("{}/{}.wal", self.directory, self.name);
-        let wal_c = match CString::new(wal_path.as_str()) {
-            Ok(c) => c,
-            Err(_) => return Err(-1),
-        };
-
-        let mut reader = match WalReader::open(&wal_c) {
-            Ok(r) => r,
-            Err(_) => return Ok(()), // No WAL file = nothing to recover
-        };
-
-        let boundary = self.current_lsn;
-        let num_payload_cols = self.schema.num_columns as usize - 1;
-
-        let mut lsn = 0u64;
-        let mut tid = 0u32;
-        let mut count = 0u32;
-        let mut num_regions = 0u32;
-        let mut blob_size = 0u64;
-        let mut offsets = vec![0u64; MAX_REGIONS];
-        let mut sizes = vec![0u32; MAX_REGIONS];
-
-        loop {
-            let rc = reader.read_next_block(
-                &mut lsn, &mut tid, &mut count,
-                &mut num_regions, &mut blob_size,
-                &mut offsets, &mut sizes, MAX_REGIONS as u32,
-            );
-            if rc == 1 {
-                break; // EOF
-            }
-            if rc < 0 {
-                break; // Corrupt block — stop recovery
-            }
-
-            if tid != self.table_id {
-                continue;
-            }
-            if lsn < boundary {
-                continue;
-            }
-
-            // Build OwnedBatch from WAL block regions (mmap'd data)
-            let nr = num_regions as usize;
-            let base = reader.base_ptr();
-            let mut ptrs = Vec::with_capacity(nr);
-            let mut szs = Vec::with_capacity(nr);
-            for i in 0..nr {
-                let ptr = unsafe { base.add(offsets[i] as usize) };
-                ptrs.push(ptr);
-                szs.push(sizes[i]);
-            }
-
-            let batch = unsafe {
-                OwnedBatch::from_regions(&ptrs, &szs, count as usize, num_payload_cols)
-            };
-            let batch = self.sort_batch_if_needed(batch);
-            let _ = self.memtable.upsert_sorted_batch(batch);
-
-            if lsn >= self.current_lsn {
-                self.current_lsn = lsn + 1;
-            }
-        }
-
-        // reader dropped here (closes mmap + fd)
-        // Truncate WAL after recovery to start clean; this also re-pre-allocates.
-        if let Some(ref mut wal) = self.wal_writer {
-            wal.truncate();
-        }
-        self.wal_bytes_since_truncate = 0;
-        Ok(())
-    }
-
-    // ------------------------------------------------------------------
     // Accumulator support (delegated to MemTable)
     // ------------------------------------------------------------------
 
@@ -636,9 +509,6 @@ impl Table {
     // ------------------------------------------------------------------
 
     pub fn close(&mut self) {
-        // WAL first (flush pending writes)
-        self.wal_writer = None; // Drop closes WAL fd + lock
-
         // ShardIndex + MemTable dropped when Table is dropped
         if self.dirfd >= 0 {
             unsafe { libc::close(self.dirfd); }
@@ -959,36 +829,6 @@ mod tests {
         let cursor = t.create_cursor().unwrap();
         assert!(cursor.cursor.valid);
         assert_eq!(cursor.cursor.current_key_lo, 10, "cursor should start at PK=10 (smallest)");
-    }
-
-    /// WAL recovery must sort batches that were written in unsorted order
-    /// (the `ingest_batch_from_regions` path writes to WAL before sorting).
-    #[test]
-    fn test_recover_from_wal_unsorted() {
-        let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("wal_recovery_test");
-        let schema = make_u64_i64_schema();
-
-        {
-            let mut t = Table::new(
-                tdir.to_str().unwrap(), "test", schema, 800, 1 << 20, true,
-            ).unwrap();
-
-            // Ingest a reverse-sorted batch.  WAL records the ORIGINAL unsorted ptrs;
-            // upsert_and_maybe_flush sorts for the memtable.
-            let (ptrs, sizes, count) = make_regions(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
-            t.ingest_batch_from_regions(&ptrs, &sizes, count, 1).unwrap();
-            // Close without flushing — WAL persists with unsorted batch.
-        } // t dropped here, WAL fd closed
-
-        // Reopen — triggers recover_from_wal which must sort the recovered batch.
-        let mut t2 = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 800, 1 << 20, true,
-        ).unwrap();
-
-        let cursor = t2.create_cursor().unwrap();
-        assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key_lo, 10, "recovered cursor should start at PK=10");
     }
 
     /// When upsert_and_maybe_flush hits ERR_CAPACITY and rebuilds batch2 from

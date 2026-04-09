@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
 use crate::schema::promote_to_index_key;
+use crate::ipc;
 use crate::ipc::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
@@ -242,6 +243,15 @@ impl MasterDispatcher {
     fn signal_one(&self, worker: usize) { self.sal.signal_one(worker); }
     pub(crate) fn sync(&self) { self.sal.sync(); }
 
+    /// Signal workers + submit async fdatasync.
+    pub(crate) fn signal_and_submit_fsync(&mut self, async_fsync: &mut ipc::AsyncFsync) {
+        self.sal.signal_all();
+        async_fsync.submit();
+    }
+
+    pub(crate) fn sal_fd(&self) -> i32 { self.sal.sal_fd() }
+
+
     /// Write per-worker message group + signal all workers (no fdatasync).
     fn send_to_workers(
         &mut self,
@@ -303,16 +313,12 @@ impl MasterDispatcher {
 
     pub(crate) fn num_workers(&self) -> usize { self.num_workers }
 
-    /// Write-only ingest: partition batch and write to SAL without
+    /// Write-only ingest: broadcast batch to all workers via SAL without
     /// fdatasync/signal/collect.  Used by group-commit in flush_pending_pushes.
+    /// Workers filter their own partitions on receipt (Phase 2 broadcast).
     pub(crate) fn write_ingest(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
         let (schema, col_names) = self.get_schema_and_names(target_id);
-        let pk_col = &[schema.pk_index];
-        let sub_batches = op_repartition_batch(batch, pk_col, &schema, self.num_workers);
-        let refs: Vec<Option<&OwnedBatch>> = sub_batches.iter()
-            .map(|b| if b.count > 0 { Some(b) } else { None })
-            .collect();
-        self.write_group(target_id, FLAG_PUSH, &refs, &schema, &col_names, 0, 0, 0, -1)
+        self.write_broadcast(target_id, FLAG_PUSH, Some(batch), &schema, &col_names, 0, 0, 0)
     }
 
     /// Collect one ACK per worker using caller-managed read cursors.

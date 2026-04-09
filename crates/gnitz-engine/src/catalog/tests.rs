@@ -1376,7 +1376,6 @@ fn test_partition_management() {
 
     // These should not panic
     engine.set_active_partitions(0, 64);
-    engine.disable_user_table_wal();
     engine.trim_worker_partitions(0, 64);
     engine.invalidate_all_plans();
 

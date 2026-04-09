@@ -166,67 +166,6 @@ fn batch_to_schema(batch: &OwnedBatch) -> Result<(SchemaDescriptor, Vec<Vec<u8>>
 // Wire protocol: encode
 // ---------------------------------------------------------------------------
 
-/// Encode a control batch into WAL block bytes.
-fn encode_control_block(
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
-    seek_pk_lo: u64,
-    seek_pk_hi: u64,
-    seek_col_idx: u64,
-    status: u32,
-    error_msg: &[u8],
-) -> Vec<u8> {
-    let cs = CONTROL_SCHEMA_DESC;
-    let mut batch = OwnedBatch::with_schema(cs, 1);
-
-    let has_error = !error_msg.is_empty();
-    let null_word: u64 = if has_error { 0 } else { 1u64 << 7 }; // payload col 7 = error_msg
-
-    batch.extend_pk_lo(&0u64.to_le_bytes()); // msg_idx PK = 0
-    batch.extend_pk_hi(&0u64.to_le_bytes());
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&null_word.to_le_bytes());
-    batch.extend_col(0, &(status as u64).to_le_bytes());
-    batch.extend_col(1, &client_id.to_le_bytes());
-    batch.extend_col(2, &target_id.to_le_bytes());
-    batch.extend_col(3, &flags.to_le_bytes());
-    batch.extend_col(4, &seek_pk_lo.to_le_bytes());
-    batch.extend_col(5, &seek_pk_hi.to_le_bytes());
-    batch.extend_col(6, &seek_col_idx.to_le_bytes());
-
-    let error_st = if has_error {
-        encode_german_string(error_msg, &mut batch.blob)
-    } else {
-        [0u8; 16] // null
-    };
-    batch.extend_col(7, &error_st);
-    batch.count = 1;
-
-    encode_batch_to_wal(&batch, 0, IPC_CONTROL_TID)
-}
-
-/// Encode an OwnedBatch into a WAL block using the gnitz-engine WAL encoder.
-fn encode_batch_to_wal(batch: &OwnedBatch, lsn: u64, table_id: u32) -> Vec<u8> {
-    let nr = batch.num_regions_total();
-    let mut ptrs = Vec::with_capacity(nr);
-    let mut sizes = Vec::with_capacity(nr);
-    for i in 0..nr {
-        ptrs.push(batch.region_ptr(i));
-        sizes.push(batch.region_size(i) as u32);
-    }
-    let blob_size = batch.blob.len() as u64;
-    let total = wal::block_size(nr, &sizes);
-    let mut buf = vec![0u8; total];
-    let result = wal::encode(
-        &mut buf, 0, lsn, table_id, batch.count as u32,
-        &ptrs, &sizes, blob_size,
-    );
-    assert!(result >= 0, "WAL encode failed");
-    buf.truncate(result as usize);
-    buf
-}
-
 /// Encode a full IPC wire message.
 ///
 /// Returns a heap-allocated `Vec<u8>` containing the encoded wire message.
@@ -243,45 +182,14 @@ pub fn encode_wire(
     col_names: Option<&[&[u8]]>,
     data_batch: Option<&OwnedBatch>,
 ) -> Vec<u8> {
-    let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
-    let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
-
-    let mut wire_flags = flags;
-    if has_schema { wire_flags |= FLAG_HAS_SCHEMA; }
-    if has_data {
-        wire_flags |= FLAG_HAS_DATA;
-        let b = data_batch.unwrap();
-        if b.sorted { wire_flags |= FLAG_BATCH_SORTED; }
-        if b.consolidated { wire_flags |= FLAG_BATCH_CONSOLIDATED; }
-    }
-
-    let ctrl = encode_control_block(
-        target_id, client_id, wire_flags,
+    let sz = wire_size(status, error_msg, schema, col_names, data_batch);
+    let mut buf = vec![0u8; sz];
+    encode_wire_into(
+        &mut buf, 0, target_id, client_id, flags,
         seek_pk_lo, seek_pk_hi, seek_col_idx,
-        status, error_msg,
+        status, error_msg, schema, col_names, data_batch,
     );
-
-    let mut out = ctrl;
-
-    if has_schema {
-        let eff_schema = if let Some(s) = schema {
-            s
-        } else {
-            data_batch.unwrap().schema.as_ref().unwrap()
-        };
-        let names = col_names.unwrap_or(&[]);
-        let schema_batch = schema_to_batch(eff_schema, names);
-        let schema_block = encode_batch_to_wal(&schema_batch, 0, target_id as u32);
-        out.extend_from_slice(&schema_block);
-    }
-
-    if has_data {
-        let b = data_batch.unwrap();
-        let data_block = encode_batch_to_wal(b, 0, target_id as u32);
-        out.extend_from_slice(&data_block);
-    }
-
-    out
+    buf
 }
 
 /// Max regions per batch: 4 fixed + up to 63 payload + 1 blob = 68.
@@ -295,6 +203,25 @@ fn batch_wal_block_size(batch: &OwnedBatch) -> usize {
         sizes[i] = batch.region_size(i) as u32;
     }
     wal::block_size(nr, &sizes[..nr])
+}
+
+/// Compute WAL block size from schema metadata without constructing a batch.
+/// Replicates the region layout: 4 fixed (pk_lo/pk_hi/weight/null_bmp, stride 8)
+/// + (num_columns - 1) payload columns (PK excluded) + 1 blob.
+fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size: usize) -> usize {
+    let pk_idx = schema.pk_index as usize;
+    let num_payload = schema.num_columns as usize - 1;
+    let num_regions = 4 + num_payload + 1;
+    let mut sizes = [0u32; MAX_REGIONS_TOTAL];
+    for i in 0..4 { sizes[i] = (8 * row_count) as u32; }
+    let mut pi = 0;
+    for ci in 0..schema.num_columns as usize {
+        if ci == pk_idx { continue; }
+        sizes[4 + pi] = (schema.columns[ci].size as usize * row_count) as u32;
+        pi += 1;
+    }
+    sizes[4 + pi] = blob_size as u32;
+    wal::block_size(num_regions, &sizes[..num_regions])
 }
 
 /// Compute the total encoded wire size without allocating.
@@ -311,50 +238,25 @@ pub fn wire_size(
     let has_data = data_batch.map(|b| b.count > 0).unwrap_or(false);
     let has_schema = has_data || (schema.is_some() && status == STATUS_OK);
 
-    // Control block: always 1 row of CONTROL_SCHEMA (9 cols: 8×U64 + 1×String).
-    // Build it to get exact size (error_msg blob affects it).
-    let ctrl_batch = {
-        let cs = CONTROL_SCHEMA_DESC;
-        let mut b = OwnedBatch::with_schema(cs, 1);
-        let has_error = !error_msg.is_empty();
-        let null_word: u64 = if has_error { 0 } else { 1u64 << 7 };
-        b.extend_pk_lo(&0u64.to_le_bytes());
-        b.extend_pk_hi(&0u64.to_le_bytes());
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&null_word.to_le_bytes());
-        b.extend_col(0, &0u64.to_le_bytes());
-        b.extend_col(1, &0u64.to_le_bytes());
-        b.extend_col(2, &0u64.to_le_bytes());
-        b.extend_col(3, &0u64.to_le_bytes());
-        b.extend_col(4, &0u64.to_le_bytes());
-        b.extend_col(5, &0u64.to_le_bytes());
-        b.extend_col(6, &0u64.to_le_bytes());
-        let error_st = if has_error {
-            encode_german_string(error_msg, &mut b.blob)
-        } else {
-            [0u8; 16]
-        };
-        b.extend_col(7, &error_st);
-        b.count = 1;
-        b
-    };
-    let mut total = batch_wal_block_size(&ctrl_batch);
+    // Control block: 1 row of CONTROL_SCHEMA_DESC
+    let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
+        error_msg.len()
+    } else { 0 };
+    let mut total = schema_wal_block_size(&CONTROL_SCHEMA_DESC, 1, ctrl_blob);
 
     if has_schema {
-        let eff_schema = if let Some(s) = schema {
-            s
-        } else {
-            data_batch.unwrap().schema.as_ref().unwrap()
-        };
+        let s = schema.unwrap_or_else(|| data_batch.unwrap().schema.as_ref().unwrap());
         let names = col_names.unwrap_or(&[]);
-        let schema_batch = schema_to_batch(eff_schema, names);
-        total += batch_wal_block_size(&schema_batch);
+        let ncols = s.num_columns as usize;
+        let schema_blob: usize = names.iter().take(ncols)
+            .map(|n| if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD { n.len() } else { 0 })
+            .sum();
+        total += schema_wal_block_size(&META_SCHEMA_DESC, ncols, schema_blob);
     }
 
     if has_data {
         total += batch_wal_block_size(data_batch.unwrap());
     }
-
     total
 }
 
@@ -929,12 +831,13 @@ pub(crate) unsafe fn sal_read_group_header(
 // W2M write (worker→master)
 // ---------------------------------------------------------------------------
 
-/// Write a pre-encoded wire buffer into a W2M region.
+/// Write a pre-encoded wire buffer into a W2M region (test helper).
 ///
 /// Returns the new write cursor, or -1 if the region is full.
 ///
 /// # Safety
 /// `region_ptr` must be a valid mmap pointer of at least `region_size` bytes.
+#[cfg(test)]
 pub(crate) unsafe fn w2m_write(
     region_ptr: *mut u8,
     data_ptr: *const u8,
@@ -1001,6 +904,7 @@ pub struct SalWriter {
     checkpoint_threshold: u64,
     m2w_efds: Vec<i32>,
     num_workers: usize,
+    last_prefaulted: u64,
 }
 
 unsafe impl Send for SalWriter {}
@@ -1022,6 +926,20 @@ impl SalWriter {
             checkpoint_threshold,
             m2w_efds,
             num_workers,
+            last_prefaulted: 0,
+        }
+    }
+
+    /// Pre-fault SAL mmap pages 2 MB ahead of the write cursor via MADV_WILLNEED.
+    fn prefault_ahead(&mut self) {
+        const PREFAULT_AHEAD: u64 = 2 * 1024 * 1024;
+        let target = (self.write_cursor + PREFAULT_AHEAD).min(self.mmap_size);
+        if target <= self.last_prefaulted { return; }
+        let start = self.last_prefaulted.max(self.write_cursor);
+        let len = (target - start) as usize;
+        if len > 0 {
+            sys::madvise_willneed(unsafe { self.ptr.add(start as usize) }, len);
+            self.last_prefaulted = target;
         }
     }
 
@@ -1038,6 +956,7 @@ impl SalWriter {
         seek_col_idx: u64,
         unicast_worker: i32,
     ) -> Result<(), String> {
+        self.prefault_ahead();
         let nw = self.num_workers;
         let lsn = self.lsn;
         self.lsn += 1;
@@ -1093,6 +1012,7 @@ impl SalWriter {
         seek_pk_hi: u64,
         seek_col_idx: u64,
     ) -> Result<(), String> {
+        self.prefault_ahead();
         let nw = self.num_workers;
         let lsn = self.lsn;
         self.lsn += 1;
@@ -1177,6 +1097,7 @@ impl SalWriter {
     pub fn checkpoint_reset(&mut self) {
         self.epoch += 1;
         self.write_cursor = 0;
+        self.last_prefaulted = 0;
         unsafe { atomic_store_u64(self.ptr, 0); }
     }
 
@@ -1189,6 +1110,60 @@ impl SalWriter {
     pub fn epoch(&self) -> u32 { self.epoch }
     pub fn mmap_size(&self) -> u64 { self.mmap_size }
     pub fn num_workers(&self) -> usize { self.num_workers }
+    pub fn sal_fd(&self) -> i32 { self.fd }
+
+}
+
+// ---------------------------------------------------------------------------
+// Async fdatasync via io_uring
+// ---------------------------------------------------------------------------
+
+/// Submits fdatasync asynchronously via a dedicated io_uring ring.
+/// Separate from the transport ring to avoid coupling engine ↔ transport.
+pub struct AsyncFsync {
+    ring: io_uring::IoUring,
+    fd: i32,
+    in_flight: bool,
+}
+
+impl AsyncFsync {
+    pub fn new(fd: i32) -> Result<Self, String> {
+        let ring = io_uring::IoUring::new(4)
+            .map_err(|e| format!("AsyncFsync io_uring init: {}", e))?;
+        Ok(AsyncFsync { ring, fd, in_flight: false })
+    }
+
+    /// Submit an async fdatasync. No-op if one is already in flight.
+    pub fn submit(&mut self) {
+        if self.in_flight { return; }
+        let entry = io_uring::opcode::Fsync::new(io_uring::types::Fd(self.fd))
+            .flags(io_uring::types::FsyncFlags::DATASYNC)
+            .build()
+            .user_data(1);
+        unsafe {
+            self.ring.submission().push(&entry).ok();
+        }
+        let _ = self.ring.submit();
+        self.in_flight = true;
+    }
+
+    /// Blocking wait: returns the fsync result code.
+    pub fn wait_complete(&mut self) -> i32 {
+        if !self.in_flight { return 0; }
+        // Check if already completed before issuing a blocking syscall.
+        if let Some(cqe) = self.ring.completion().next() {
+            self.in_flight = false;
+            return cqe.result();
+        }
+        let _ = self.ring.submit_and_wait(1);
+        if let Some(cqe) = self.ring.completion().next() {
+            self.in_flight = false;
+            cqe.result()
+        } else {
+            self.in_flight = false;
+            -1
+        }
+    }
 }
 
 /// A decoded SAL message for a specific worker.
@@ -1269,15 +1244,20 @@ impl W2mWriter {
         W2mWriter { region_ptr, region_size, efd }
     }
 
-    /// Write wire data to W2M region + signal master.
-    pub fn send(&self, wire: &[u8]) {
+    /// Encode wire data directly into W2M mmap region + signal master.
+    pub fn send_encoded(&self, sz: usize, encode_fn: impl FnOnce(&mut [u8])) {
         unsafe {
-            w2m_write(
-                self.region_ptr,
-                wire.as_ptr(),
-                wire.len() as u32,
-                self.region_size,
-            );
+            let wc = atomic_load_u64(self.region_ptr) as usize;
+            let total = 8 + align8(sz);
+            if wc + total > self.region_size as usize { return; }
+            write_u64_raw(self.region_ptr, wc, sz as u64);
+            if sz > 0 {
+                let slot = std::slice::from_raw_parts_mut(
+                    self.region_ptr.add(wc + 8), sz,
+                );
+                encode_fn(slot);
+            }
+            atomic_store_u64(self.region_ptr, (wc + total) as u64);
         }
         ipc_sys::eventfd_signal(self.efd);
     }
