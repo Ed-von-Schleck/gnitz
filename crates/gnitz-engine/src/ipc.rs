@@ -229,7 +229,7 @@ fn encode_batch_to_wal(batch: &OwnedBatch, lsn: u64, table_id: u32) -> Vec<u8> {
 
 /// Encode a full IPC wire message.
 ///
-/// Returns a heap-allocated buffer (ptr + len). Caller must free via `gnitz_ipc_wire_free`.
+/// Returns a heap-allocated `Vec<u8>` containing the encoded wire message.
 pub fn encode_wire(
     target_id: u64,
     client_id: u64,
@@ -647,6 +647,15 @@ pub(crate) unsafe fn atomic_store_u64(ptr: *mut u8, val: u64) {
     atomic.store(val, Ordering::Release);
 }
 
+/// Write a zero sentinel at `offset` in the SAL mmap so workers stop reading.
+/// No-op if the sentinel would fall outside the mapped region.
+#[inline]
+unsafe fn sal_write_sentinel(sal_ptr: *mut u8, offset: usize, mmap_size: usize) {
+    if offset + 8 <= mmap_size {
+        atomic_store_u64(sal_ptr.add(offset), 0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Raw read/write helpers for mmap regions
 // ---------------------------------------------------------------------------
@@ -679,7 +688,8 @@ unsafe fn read_u32_raw(base: *const u8, offset: usize) -> u32 {
 // SAL write (master→workers)
 // ---------------------------------------------------------------------------
 
-/// Result from SAL write.
+/// Result from SAL write (used by tests via `sal_write_group`).
+#[cfg(test)]
 #[repr(C)]
 pub(crate) struct SalWriteResult {
     /// 0 on success, -1 on error (SAL full).
@@ -688,18 +698,94 @@ pub(crate) struct SalWriteResult {
     pub new_cursor: u64,
 }
 
-/// Write a message group into the SAL for N workers.
+/// Handle returned by `sal_begin_group`. Header and per-worker directory
+/// are already written; caller fills per-worker data, then calls `commit()`.
+pub(crate) struct SalGroup {
+    sal_ptr: *mut u8,
+    hdr_off: usize,
+    base: usize,
+    total: usize,
+    payload_size: usize,
+    mmap_size: usize,
+}
+
+impl SalGroup {
+    /// Raw pointer to the start of worker data at `offset` bytes from header.
+    #[inline]
+    pub(crate) unsafe fn data_ptr(&self, offset: usize) -> *mut u8 {
+        self.sal_ptr.add(self.hdr_off + offset)
+    }
+
+    /// Commit: zero sentinel at next position, then atomic release of size prefix.
+    pub(crate) unsafe fn commit(self) -> u64 {
+        sal_write_sentinel(self.sal_ptr, self.base + self.total, self.mmap_size);
+        atomic_store_u64(self.sal_ptr.add(self.base), self.payload_size as u64);
+        (self.base + self.total) as u64
+    }
+}
+
+/// Reserve SAL space, write group header + per-worker directory.
+/// Returns `None` if the group doesn't fit or `num_workers > MAX_WORKERS`.
 ///
-/// `worker_ptrs[i]` / `worker_sizes[i]` point to pre-encoded wire buffers
-/// (from `gnitz_ipc_encode_wire`). A null pointer or size=0 means "no data
-/// for worker i".
+/// # Safety
+/// `sal_ptr` must be a valid mmap pointer of at least `mmap_size` bytes.
+pub(crate) unsafe fn sal_begin_group(
+    sal_ptr: *mut u8,
+    write_cursor: usize,
+    mmap_size: usize,
+    num_workers: usize,
+    target_id: u32,
+    lsn: u64,
+    flags: u32,
+    epoch: u32,
+    worker_sizes: &[u32],
+) -> Option<SalGroup> {
+    if num_workers > MAX_WORKERS { return None; }
+
+    let mut payload_size = GROUP_HEADER_SIZE;
+    for &sz in &worker_sizes[..num_workers] {
+        if sz > 0 { payload_size += align8(sz as usize); }
+    }
+    let total = 8 + align8(payload_size);
+    if write_cursor + total > mmap_size { return None; }
+
+    let base = write_cursor;
+    let hdr_off = base + 8;
+
+    // Group header
+    write_u64_raw(sal_ptr, hdr_off, payload_size as u64);
+    write_u64_raw(sal_ptr, hdr_off + 8, lsn);
+    write_u32_raw(sal_ptr, hdr_off + 16, num_workers as u32);
+    write_u32_raw(sal_ptr, hdr_off + 20, flags);
+    write_u32_raw(sal_ptr, hdr_off + 24, target_id);
+    write_u32_raw(sal_ptr, hdr_off + 28, epoch);
+
+    // Per-worker offset/size directory
+    let mut data_offset = GROUP_HEADER_SIZE;
+    for w in 0..num_workers {
+        let sz = worker_sizes[w] as usize;
+        if sz > 0 {
+            write_u32_raw(sal_ptr, hdr_off + 32 + w * 4, data_offset as u32);
+            write_u32_raw(sal_ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, worker_sizes[w]);
+            data_offset += align8(sz);
+        } else {
+            write_u32_raw(sal_ptr, hdr_off + 32 + w * 4, 0);
+            write_u32_raw(sal_ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0);
+        }
+    }
+
+    Some(SalGroup { sal_ptr, hdr_off, base, total, payload_size, mmap_size })
+}
+
+/// Write a message group into the SAL for N workers (test helper).
 ///
-/// The size prefix is written LAST via atomic release store — workers use it
-/// as the "data ready" sentinel.
+/// `worker_ptrs[i]` / `worker_sizes[i]` point to pre-encoded wire buffers.
+/// A null pointer or size=0 means "no data for worker i".
 ///
 /// # Safety
 /// `sal_ptr` must be a valid mmap pointer of at least `write_cursor + total`
 /// bytes. `worker_ptrs`/`worker_sizes` must be valid arrays of `num_workers`.
+#[cfg(test)]
 pub(crate) unsafe fn sal_write_group(
     sal_ptr: *mut u8,
     write_cursor: u64,
@@ -713,63 +799,30 @@ pub(crate) unsafe fn sal_write_group(
     worker_sizes: *const u32,
 ) -> SalWriteResult {
     let nw = num_workers as usize;
-    if nw > MAX_WORKERS {
-        return SalWriteResult { status: -1, new_cursor: write_cursor };
-    }
-    let wc = write_cursor as usize;
+    let mut sizes = [0u32; MAX_WORKERS];
+    for w in 0..nw { sizes[w] = *worker_sizes.add(w); }
 
-    // Compute total size: 8-byte prefix + GROUP_HEADER_SIZE + per-worker data
-    let mut payload_size = GROUP_HEADER_SIZE;
+    let group = match sal_begin_group(
+        sal_ptr, write_cursor as usize, mmap_size as usize,
+        nw, target_id, lsn, flags, epoch, &sizes[..nw],
+    ) {
+        Some(g) => g,
+        None => return SalWriteResult { status: -1, new_cursor: write_cursor },
+    };
+
+    let mut off = GROUP_HEADER_SIZE;
     for w in 0..nw {
-        let sz = *worker_sizes.add(w) as usize;
+        let sz = sizes[w] as usize;
         if sz > 0 {
-            payload_size += align8(sz);
+            let p = *worker_ptrs.add(w);
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(p, group.data_ptr(off), sz);
+            }
+            off += align8(sz);
         }
     }
 
-    let total = 8 + align8(payload_size);
-    if wc + total > mmap_size as usize {
-        return SalWriteResult { status: -1, new_cursor: write_cursor };
-    }
-
-    let base = wc;
-    let hdr_off = base + 8;
-
-    // Group header
-    write_u64_raw(sal_ptr, hdr_off + 0, payload_size as u64);
-    write_u64_raw(sal_ptr, hdr_off + 8, lsn);
-    write_u32_raw(sal_ptr, hdr_off + 16, num_workers);
-    write_u32_raw(sal_ptr, hdr_off + 20, flags);
-    write_u32_raw(sal_ptr, hdr_off + 24, target_id);
-    write_u32_raw(sal_ptr, hdr_off + 28, epoch);
-
-    // Worker offsets, sizes, and data copy
-    let mut data_offset = GROUP_HEADER_SIZE;
-    for w in 0..nw {
-        let wsz = *worker_sizes.add(w) as usize;
-        let wptr = *worker_ptrs.add(w);
-        if wsz > 0 && !wptr.is_null() {
-            write_u32_raw(sal_ptr, hdr_off + 32 + w * 4, data_offset as u32);
-            write_u32_raw(sal_ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz as u32);
-            std::ptr::copy_nonoverlapping(
-                wptr,
-                sal_ptr.add(hdr_off + data_offset),
-                wsz,
-            );
-            data_offset += align8(wsz);
-        } else {
-            write_u32_raw(sal_ptr, hdr_off + 32 + w * 4, 0);
-            write_u32_raw(sal_ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0);
-        }
-    }
-
-    // Write size prefix LAST via atomic release store
-    atomic_store_u64(sal_ptr.add(base), payload_size as u64);
-
-    SalWriteResult {
-        status: 0,
-        new_cursor: (wc + total) as u64,
-    }
+    SalWriteResult { status: 0, new_cursor: group.commit() }
 }
 
 // ---------------------------------------------------------------------------
@@ -972,75 +1025,7 @@ impl SalWriter {
         }
     }
 
-    /// Write pre-encoded per-worker wire buffers. Does NOT sync/signal.
-    pub fn write_group(
-        &mut self, target_id: u32, flags: u32, wire_bufs: &[Vec<u8>],
-    ) -> Result<(), String> {
-        let nw = self.num_workers;
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_WORKERS];
-        let mut sizes = [0u32; MAX_WORKERS];
-        for (w, buf) in wire_bufs.iter().enumerate().take(nw) {
-            if !buf.is_empty() {
-                ptrs[w] = buf.as_ptr();
-                sizes[w] = buf.len() as u32;
-            }
-        }
-
-        let lsn = self.lsn;
-        self.lsn += 1;
-
-        let result = unsafe {
-            sal_write_group(
-                self.ptr, self.write_cursor,
-                nw as u32, target_id, lsn, flags, self.epoch,
-                self.mmap_size, ptrs.as_ptr(), sizes.as_ptr(),
-            )
-        };
-        if result.status < 0 {
-            return Err(format!(
-                "SAL write failed (cursor={}, mmap_size={})",
-                self.write_cursor, self.mmap_size
-            ));
-        }
-        self.write_cursor = result.new_cursor;
-        Ok(())
-    }
-
-    /// Write identical data to all workers. Does NOT sync/signal.
-    pub fn write_broadcast(
-        &mut self, target_id: u32, flags: u32, wire_buf: &[u8],
-    ) -> Result<(), String> {
-        let nw = self.num_workers;
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_WORKERS];
-        let mut sizes = [0u32; MAX_WORKERS];
-        for w in 0..nw {
-            ptrs[w] = wire_buf.as_ptr();
-            sizes[w] = wire_buf.len() as u32;
-        }
-
-        let lsn = self.lsn;
-        self.lsn += 1;
-
-        let result = unsafe {
-            sal_write_group(
-                self.ptr, self.write_cursor,
-                nw as u32, target_id, lsn, flags, self.epoch,
-                self.mmap_size, ptrs.as_ptr(), sizes.as_ptr(),
-            )
-        };
-        if result.status < 0 {
-            return Err(format!(
-                "SAL broadcast write failed (cursor={})", self.write_cursor
-            ));
-        }
-        self.write_cursor = result.new_cursor;
-        Ok(())
-    }
-
     /// Encode per-worker wire data directly into SAL mmap. Does NOT sync/signal.
-    ///
-    /// Eliminates N `Vec<u8>` allocations per call by computing sizes first,
-    /// reserving the SAL region, then encoding directly into it.
     pub fn write_group_direct(
         &mut self,
         target_id: u32,
@@ -1057,82 +1042,41 @@ impl SalWriter {
         let lsn = self.lsn;
         self.lsn += 1;
 
-        // Size pass: compute wire size per worker.
         let mut worker_sizes = [0u32; MAX_WORKERS];
-        let mut payload_size = GROUP_HEADER_SIZE;
         for w in 0..nw {
-            if unicast_worker >= 0 && w != unicast_worker as usize {
-                continue;
-            }
+            if unicast_worker >= 0 && w != unicast_worker as usize { continue; }
             let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
-            let sz = wire_size(
-                STATUS_OK, b"",
-                Some(schema), col_names_opt, data_batch.copied(),
-            );
-            worker_sizes[w] = sz as u32;
-            if sz > 0 {
-                payload_size += align8(sz);
-            }
+            worker_sizes[w] = wire_size(
+                STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
+            ) as u32;
         }
 
-        let total = 8 + align8(payload_size);
-        let wc = self.write_cursor as usize;
-        if wc + total > self.mmap_size as usize {
-            return Err(format!(
-                "SAL write_group_direct failed (cursor={}, need={}, mmap_size={})",
-                self.write_cursor, total, self.mmap_size
-            ));
-        }
+        let group = unsafe {
+            sal_begin_group(
+                self.ptr, self.write_cursor as usize, self.mmap_size as usize,
+                nw, target_id, lsn, flags, self.epoch, &worker_sizes[..nw],
+            )
+        }.ok_or_else(|| format!(
+            "SAL write_group_direct failed (cursor={})", self.write_cursor
+        ))?;
 
-        let sal = self.ptr;
-        let base = wc;
-        let hdr_off = base + 8;
-
-        // Write group header.
-        unsafe {
-            write_u64_raw(sal, hdr_off + 0, payload_size as u64);
-            write_u64_raw(sal, hdr_off + 8, lsn);
-            write_u32_raw(sal, hdr_off + 16, nw as u32);
-            write_u32_raw(sal, hdr_off + 20, flags);
-            write_u32_raw(sal, hdr_off + 24, target_id);
-            write_u32_raw(sal, hdr_off + 28, self.epoch);
-        }
-
-        // Encode pass: write directly into SAL per-worker slots.
-        let mut data_offset = GROUP_HEADER_SIZE;
+        let mut off = GROUP_HEADER_SIZE;
         for w in 0..nw {
             let wsz = worker_sizes[w] as usize;
             if wsz > 0 {
-                unsafe {
-                    write_u32_raw(sal, hdr_off + 32 + w * 4, data_offset as u32);
-                    write_u32_raw(sal, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz as u32);
-                }
                 let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
-                // Encode directly into the SAL mmap slice.
-                let out_start = hdr_off + data_offset;
-                let sal_slice = unsafe {
-                    std::slice::from_raw_parts_mut(sal.add(out_start), wsz)
-                };
+                let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
                 let written = encode_wire_into(
-                    sal_slice, 0,
-                    target_id as u64, 0, flags as u64,
+                    slot, 0, target_id as u64, 0, flags as u64,
                     seek_pk_lo, seek_pk_hi, seek_col_idx,
-                    STATUS_OK, b"",
-                    Some(schema), col_names_opt, data_batch.copied(),
+                    STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
                 );
                 debug_assert_eq!(written, wsz);
-                data_offset += align8(wsz);
-            } else {
-                unsafe {
-                    write_u32_raw(sal, hdr_off + 32 + w * 4, 0);
-                    write_u32_raw(sal, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0);
-                }
+                off += align8(wsz);
             }
         }
 
-        // Write size prefix LAST via atomic release store.
-        unsafe { atomic_store_u64(sal.add(base), payload_size as u64); }
-        self.write_cursor = (wc + total) as u64;
+        self.write_cursor = unsafe { group.commit() };
         Ok(())
     }
 
@@ -1154,80 +1098,43 @@ impl SalWriter {
         self.lsn += 1;
 
         let wsz = wire_size(
-            STATUS_OK, b"",
-            Some(schema), col_names_opt, batch,
-        );
+            STATUS_OK, b"", Some(schema), col_names_opt, batch,
+        ) as u32;
+        let mut worker_sizes = [0u32; MAX_WORKERS];
+        for w in 0..nw { worker_sizes[w] = wsz; }
 
-        let mut payload_size = GROUP_HEADER_SIZE;
-        for _ in 0..nw {
-            if wsz > 0 { payload_size += align8(wsz); }
-        }
+        let group = unsafe {
+            sal_begin_group(
+                self.ptr, self.write_cursor as usize, self.mmap_size as usize,
+                nw, target_id, lsn, flags, self.epoch, &worker_sizes[..nw],
+            )
+        }.ok_or_else(|| format!(
+            "SAL write_broadcast_direct failed (cursor={})", self.write_cursor
+        ))?;
 
-        let total = 8 + align8(payload_size);
-        let wc = self.write_cursor as usize;
-        if wc + total > self.mmap_size as usize {
-            return Err(format!(
-                "SAL write_broadcast_direct failed (cursor={})", self.write_cursor
-            ));
-        }
-
-        let sal = self.ptr;
-        let base = wc;
-        let hdr_off = base + 8;
-
-        unsafe {
-            write_u64_raw(sal, hdr_off + 0, payload_size as u64);
-            write_u64_raw(sal, hdr_off + 8, lsn);
-            write_u32_raw(sal, hdr_off + 16, nw as u32);
-            write_u32_raw(sal, hdr_off + 20, flags);
-            write_u32_raw(sal, hdr_off + 24, target_id);
-            write_u32_raw(sal, hdr_off + 28, self.epoch);
-        }
-
-        // Encode once into worker 0's slot.
-        let mut data_offset = GROUP_HEADER_SIZE;
-        let w0_start = hdr_off + data_offset;
         if wsz > 0 {
-            let sal_slice = unsafe {
-                std::slice::from_raw_parts_mut(sal.add(w0_start), wsz)
-            };
+            let wsz = wsz as usize;
+            let slot0 = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(GROUP_HEADER_SIZE), wsz) };
             let written = encode_wire_into(
-                sal_slice, 0,
-                target_id as u64, 0, flags as u64,
+                slot0, 0, target_id as u64, 0, flags as u64,
                 seek_pk_lo, seek_pk_hi, seek_col_idx,
-                STATUS_OK, b"",
-                Some(schema), col_names_opt, batch,
+                STATUS_OK, b"", Some(schema), col_names_opt, batch,
             );
             debug_assert_eq!(written, wsz);
-        }
-
-        // Set offsets/sizes and memcpy for all workers.
-        for w in 0..nw {
-            if wsz > 0 {
+            let mut off = GROUP_HEADER_SIZE + align8(wsz);
+            for _ in 1..nw {
                 unsafe {
-                    write_u32_raw(sal, hdr_off + 32 + w * 4, data_offset as u32);
-                    write_u32_raw(sal, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, wsz as u32);
+                    std::ptr::copy_nonoverlapping(
+                        group.data_ptr(GROUP_HEADER_SIZE),
+                        group.data_ptr(off),
+                        wsz,
+                    );
                 }
-                if w > 0 {
-                    let src = hdr_off + GROUP_HEADER_SIZE; // worker 0 data
-                    let dst = hdr_off + data_offset;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            sal.add(src), sal.add(dst), wsz,
-                        );
-                    }
-                }
-                data_offset += align8(wsz);
-            } else {
-                unsafe {
-                    write_u32_raw(sal, hdr_off + 32 + w * 4, 0);
-                    write_u32_raw(sal, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0);
-                }
+                off += align8(wsz);
             }
         }
 
-        unsafe { atomic_store_u64(sal.add(base), payload_size as u64); }
-        self.write_cursor = (wc + total) as u64;
+        self.write_cursor = unsafe { group.commit() };
         Ok(())
     }
 
