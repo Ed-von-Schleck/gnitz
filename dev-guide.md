@@ -55,6 +55,33 @@ For temporary logging: `gnitz_debug!` / `gnitz_info!` macros. Remove before comm
 
 Live tail: `tail -f ~/git/gnitz/tmp/gnitz_py_*/data/worker_*.log`
 
+## SAL durability contract
+
+**Rule: an ACK to a client implies fdatasync iff the operation upserted data.**
+
+The SAL (Shared Append-Only Log) carries both data writes and ephemeral
+commands on the same mmap'd fd. Workers see all SAL entries immediately
+via Acquire/Release atomics on the size prefix — fdatasync is irrelevant
+for cross-process visibility. It exists solely for crash recovery.
+
+**Requires fdatasync before ACK** (upserts table data):
+- `flush_pending_pushes` — batched user-table DML (already batched: one
+  fdatasync per batch).
+- `broadcast_ddl` — system-table writes (CREATE TABLE/VIEW/INDEX, etc.).
+- `fan_out_push` / `fan_out_ingest` — non-batched data writes.
+
+**Does NOT require fdatasync** (no upserted data):
+- `fan_out_tick` — triggers view evaluation (derived, re-derivable).
+- `fan_out_scan` — read-only table scan.
+- `fan_out_seek` / `fan_out_seek_by_index` — read-only point lookups.
+- `fan_out_backfill` — view materialization (derived).
+- `check_pk_exists_broadcast` / `check_index_keys` — validation queries.
+
+These command-only operations use `signal` (eventfd wake) without
+fdatasync. If the server crashes, commands are lost but nothing needs
+recovery — base table data is intact, views are re-derived, and
+in-flight reads have no durability semantics.
+
 ## IPC flag constants
 
 Flags are defined once in `ipc.rs` as `pub const FLAG_*: u32`.

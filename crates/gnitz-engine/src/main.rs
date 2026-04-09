@@ -17,7 +17,8 @@ Options:
   --help, -h         Show this help message and exit
 
 Environment:
-  GNITZ_LOG_LEVEL    Same as --log-level; CLI flag takes precedence
+  GNITZ_LOG_LEVEL          Same as --log-level; CLI flag takes precedence
+  GNITZ_CHECKPOINT_BYTES   SAL checkpoint threshold in bytes (default: 75% of SAL size)
 ";
 
 fn parse_level(s: &str) -> u32 {

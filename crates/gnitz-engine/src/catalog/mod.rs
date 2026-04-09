@@ -2552,7 +2552,7 @@ impl CatalogEngine {
     pub fn flush_all_system_tables(&mut self) {
         for info in SYS_TAB_INFOS {
             if let Some(table) = self.sys_table_mut(info.id) {
-                let _ = table.flush();
+                let _ = table.flush_durable();
             }
         }
     }

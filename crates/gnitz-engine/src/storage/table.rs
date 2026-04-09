@@ -277,6 +277,14 @@ impl Table {
         self.flush_inner(self.wal_writer.is_some())
     }
 
+    /// Flush with durable shard naming and manifest update, regardless of
+    /// WAL state.  Used by checkpoint: system tables disable WAL (SAL
+    /// provides durability) but still need manifest-tracked shards so
+    /// the data survives restart.
+    pub fn flush_durable(&mut self) -> Result<bool, i32> {
+        self.flush_inner(true)
+    }
+
     fn flush_inner(&mut self, durable: bool) -> Result<bool, i32> {
         self.found_source = FoundSource::None;
         if self.memtable.is_empty() {

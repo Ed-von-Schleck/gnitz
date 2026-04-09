@@ -57,6 +57,13 @@ struct DeferredRequest {
     seek_col_idx: u64,
 }
 
+struct PendingDdlResponse {
+    fd: i32,
+    client_id: u64,
+    target_id: i64,
+    lsn: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Pending batch accumulator (multi-worker buffered pushes)
 // ---------------------------------------------------------------------------
@@ -123,6 +130,9 @@ pub struct ServerExecutor {
     tick_queue_tids: Vec<i64>,
     deferred_requests: Vec<DeferredRequest>,
 
+    // DDL response batching (deferred until end-of-cycle fdatasync)
+    pending_ddl_responses: Vec<PendingDdlResponse>,
+
     // Schema descriptor cache (table IDs are monotonic, never reused)
     schema_cache: HashMap<i64, SchemaDescriptor>,
 }
@@ -146,6 +156,7 @@ impl ServerExecutor {
             tick_state: TickState::Idle,
             tick_queue_tids: Vec::with_capacity(8),
             deferred_requests: Vec::with_capacity(8),
+            pending_ddl_responses: Vec::with_capacity(8),
             schema_cache: HashMap::new(),
         }
     }
@@ -962,14 +973,32 @@ impl ServerExecutor {
             if let Err(e) = disp.broadcast_ddl(target_id, &ddl_batch) {
                 gnitz_warn!("broadcast_ddl error tid={}: {}", target_id, e);
             }
+            // Defer response until end-of-cycle fdatasync
+            self.pending_ddl_responses.push(PendingDdlResponse {
+                fd, client_id, target_id, lsn,
+            });
+        } else {
+            let schema = self.get_schema_desc(target_id);
+            self.send_response(
+                transport, fd, target_id, result.as_deref(), STATUS_OK, b"",
+                client_id, &schema, lsn,
+            );
         }
-
-        let schema = self.get_schema_desc(target_id);
-        self.send_response(
-            transport, fd, target_id, result.as_deref(), STATUS_OK, b"",
-            client_id, &schema, lsn,
-        );
         Ok(())
+    }
+
+    fn flush_pending_ddl_responses(&mut self, transport: &mut Transport<IoUringRing>) {
+        if self.pending_ddl_responses.is_empty() {
+            return;
+        }
+        self.disp().sync();
+        for r in std::mem::replace(&mut self.pending_ddl_responses, Vec::with_capacity(8)) {
+            let schema = self.get_schema_desc(r.target_id);
+            self.send_response(
+                transport, r.fd, r.target_id, None, STATUS_OK, b"",
+                r.client_id, &schema, r.lsn,
+            );
+        }
     }
 
     // -- Main event loop ------------------------------------------------------
@@ -1062,6 +1091,10 @@ impl ServerExecutor {
                 let entries = std::mem::take(&mut pending.entries);
                 pending.row_count = 0;
                 self.flush_pending_pushes(transport, entries);
+            }
+
+            if self.has_dispatcher() && !self.pending_ddl_responses.is_empty() {
+                self.flush_pending_ddl_responses(transport);
             }
 
             if self.tick_state == TickState::Active {

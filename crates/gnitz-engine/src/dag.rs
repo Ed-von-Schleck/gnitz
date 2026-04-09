@@ -1195,6 +1195,8 @@ impl DagEngine {
                 continue;
             }
 
+            self.ensure_compiled(view_id);
+
             let has_exchange = self.view_needs_exchange(view_id);
 
             let has_join_shard = {

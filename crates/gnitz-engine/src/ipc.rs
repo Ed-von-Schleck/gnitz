@@ -955,7 +955,10 @@ unsafe impl Send for SalWriter {}
 impl SalWriter {
     pub fn new(ptr: *mut u8, fd: i32, mmap_size: u64, m2w_efds: Vec<i32>) -> Self {
         let num_workers = m2w_efds.len();
-        let checkpoint_threshold = (mmap_size * 3) >> 2;
+        let checkpoint_threshold = std::env::var("GNITZ_CHECKPOINT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or((mmap_size * 3) >> 2);
         SalWriter {
             ptr,
             fd,
@@ -1240,6 +1243,23 @@ impl SalWriter {
     pub fn sync_and_signal_one(&self, worker: usize) {
         sys::fdatasync(self.fd);
         ipc_sys::eventfd_signal(self.m2w_efds[worker]);
+    }
+
+    /// eventfd_signal all workers (no fdatasync).
+    pub fn signal_all(&self) {
+        for w in 0..self.num_workers {
+            ipc_sys::eventfd_signal(self.m2w_efds[w]);
+        }
+    }
+
+    /// eventfd_signal one worker (no fdatasync).
+    pub fn signal_one(&self, worker: usize) {
+        ipc_sys::eventfd_signal(self.m2w_efds[worker]);
+    }
+
+    /// fdatasync only (no signal).
+    pub fn sync(&self) {
+        sys::fdatasync(self.fd);
     }
 
     pub fn needs_checkpoint(&self) -> bool {

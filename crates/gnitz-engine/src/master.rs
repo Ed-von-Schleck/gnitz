@@ -216,7 +216,7 @@ impl MasterDispatcher {
         )
     }
 
-    /// Encode once, write to all workers, fdatasync, signal.
+    /// Encode once, write to all workers, signal (no fdatasync).
     fn send_broadcast(
         &mut self,
         target_id: i64,
@@ -230,7 +230,7 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         self.write_broadcast(target_id, flags, batch, schema, col_names,
                             seek_pk_lo, seek_pk_hi, seek_col_idx)?;
-        self.sync_and_signal_all();
+        self.signal_all();
         Ok(())
     }
 
@@ -238,11 +238,11 @@ impl MasterDispatcher {
         self.sal.sync_and_signal_all();
     }
 
-    fn sync_and_signal_one(&self, worker: usize) {
-        self.sal.sync_and_signal_one(worker);
-    }
+    fn signal_all(&self) { self.sal.signal_all(); }
+    fn signal_one(&self, worker: usize) { self.sal.signal_one(worker); }
+    pub(crate) fn sync(&self) { self.sal.sync(); }
 
-    /// Write per-worker message group + fdatasync + signal all workers.
+    /// Write per-worker message group + signal all workers (no fdatasync).
     fn send_to_workers(
         &mut self,
         target_id: i64,
@@ -256,7 +256,7 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         self.write_group(target_id, flags, worker_batches, schema, col_names,
                          seek_pk_lo, seek_pk_hi, seek_col_idx, -1)?;
-        self.sync_and_signal_all();
+        self.signal_all();
         Ok(())
     }
 
@@ -438,8 +438,8 @@ impl MasterDispatcher {
     }
 
     fn do_checkpoint(&mut self) -> Result<(), String> {
-        let (schema, col_names) = self.get_schema_and_names(0);
-        self.send_broadcast(0, FLAG_FLUSH, None, &schema, &col_names, 0, 0, 0)?;
+        let schema = SchemaDescriptor::minimal_u64();
+        self.send_broadcast(0, FLAG_FLUSH, None, &schema, &[], 0, 0, 0)?;
         self.collect_acks()?;
 
         // Flush system tables before resetting SAL — their data lives in
@@ -555,7 +555,8 @@ impl MasterDispatcher {
             let refs: Vec<Option<&OwnedBatch>> = sub_batches.iter()
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
-            self.send_to_workers(target_id, FLAG_PUSH, &refs, &schema, &col_names, 0, 0, 0)?;
+            self.write_group(target_id, FLAG_PUSH, &refs, &schema, &col_names, 0, 0, 0, -1)?;
+            self.sync_and_signal_all();
         } else {
             let mut col_specs_owned: Vec<Vec<u32>> = Vec::with_capacity(preloadable.len() + 1);
             col_specs_owned.push(vec![schema.pk_index]);
@@ -629,7 +630,7 @@ impl MasterDispatcher {
         let empty: Vec<Option<&OwnedBatch>> = vec![None; self.num_workers];
         self.write_group(target_id, FLAG_SEEK, &empty, &schema, &col_names,
                         pk_lo, pk_hi, 0, worker as i32)?;
-        self.sync_and_signal_one(worker);
+        self.signal_one(worker);
 
         let decoded = self.collect_one(worker)?;
         if decoded.control.status != 0 {
@@ -660,7 +661,7 @@ impl MasterDispatcher {
             let empty: Vec<Option<&OwnedBatch>> = vec![None; self.num_workers];
             self.write_group(target_id, FLAG_SEEK_BY_INDEX, &empty, &schema, &col_names,
                             key_lo, key_hi, col_idx as u64, cached_worker)?;
-            self.sync_and_signal_one(w);
+            self.signal_one(w);
 
             let decoded = self.collect_one(w)?;
             if decoded.control.status != 0 {
@@ -692,7 +693,7 @@ impl MasterDispatcher {
         let (schema, col_names) = self.get_schema_and_names(target_id);
         self.write_broadcast(target_id, FLAG_DDL_SYNC, Some(batch), &schema, &col_names,
                             0, 0, 0)?;
-        self.sync_and_signal_all();
+        self.signal_all();
         gnitz_debug!("broadcast_ddl tid={} rows={}", target_id, batch.count);
         Ok(())
     }
@@ -706,7 +707,7 @@ impl MasterDispatcher {
         let col_hint = (source_col_idx + 1) as u64;
         self.write_broadcast(owner_table_id, FLAG_HAS_PK, Some(check_batch), &schema,
                             &[], 0, 0, col_hint)?;
-        self.sync_and_signal_all();
+        self.signal_all();
 
         let results = self.wait_all_workers()?;
         for decoded_opt in &results {
@@ -734,7 +735,7 @@ impl MasterDispatcher {
         let col_hint = (source_col_idx + 1) as u64;
         self.write_broadcast(owner_table_id, FLAG_HAS_PK, Some(check_batch), &schema,
                             &[], 0, 0, col_hint)?;
-        self.sync_and_signal_all();
+        self.signal_all();
 
         let results = self.wait_all_workers()?;
         let mut occupied: HashSet<u128> = HashSet::new();
