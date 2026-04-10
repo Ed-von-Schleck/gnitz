@@ -189,11 +189,11 @@ pub(super) fn compare_cursor_payload_to_batch_row(
                 } else if col.type_code == type_code::F64 {
                     let c_f = f64::from_bits(u64::from_le_bytes(c_bytes[0..8].try_into().unwrap()));
                     let b_f = f64::from_bits(u64::from_le_bytes(b_bytes[0..8].try_into().unwrap()));
-                    c_f.partial_cmp(&b_f).unwrap_or(Ordering::Equal)
+                    c_f.total_cmp(&b_f)
                 } else if col.type_code == type_code::F32 {
                     let c_f = f32::from_bits(u32::from_le_bytes(c_bytes[0..4].try_into().unwrap()));
                     let b_f = f32::from_bits(u32::from_le_bytes(b_bytes[0..4].try_into().unwrap()));
-                    c_f.partial_cmp(&b_f).unwrap_or(Ordering::Equal)
+                    c_f.total_cmp(&b_f)
                 } else if col.type_code == type_code::I64
                     || col.type_code == type_code::I32
                     || col.type_code == type_code::I16

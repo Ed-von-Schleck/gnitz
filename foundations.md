@@ -243,11 +243,13 @@ columns in schema order, skipping pk_index:
 2. Type dispatch: STRING (German string comparison), U128, F64/F32,
    default (signed integer via sign-extension).
 
-**F64/F32 NaN:** Rust treats NaN as equal to every value
-(`partial_cmp().unwrap_or(Equal)`). This violates transitivity
-(NaN == 1.0, NaN == 2.0, but 1.0 ≠ 2.0) and does not impose a total
-order. Safe only because NaN does not arise in normal DML paths. If
-NaN is ever stored, must switch to `f64::total_cmp`.
+**F64/F32 NaN:** all row-comparison helpers use `f64::total_cmp` /
+`f32::total_cmp`, which imposes a strict total order on IEEE-754 values
+(including NaN bit-pattern ordering). This applies to `compare_rows` on
+the canonical merge path as well as the non-merge sort helpers
+(`compare_cursor_payload_to_batch_row` in `ops/util.rs` and
+`compare_by_group_cols` in `ops/reduce.rs`). Transitivity holds for all
+inputs, including NaN.
 
 ## 6. The Region Convention
 

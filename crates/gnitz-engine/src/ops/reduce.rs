@@ -349,13 +349,13 @@ fn compare_by_group_cols(
             let b_ptr = mb.get_col_ptr(row_b, pi, 8);
             let a_f = f64::from_bits(crate::util::read_u64_le(a_ptr, 0));
             let b_f = f64::from_bits(crate::util::read_u64_le(b_ptr, 0));
-            a_f.partial_cmp(&b_f).unwrap_or(std::cmp::Ordering::Equal)
+            a_f.total_cmp(&b_f)
         } else if tc == type_code::F32 {
             let a_ptr = mb.get_col_ptr(row_a, pi, 4);
             let b_ptr = mb.get_col_ptr(row_b, pi, 4);
             let a_f = f32::from_bits(crate::util::read_u32_le(a_ptr, 0));
             let b_f = f32::from_bits(crate::util::read_u32_le(b_ptr, 0));
-            a_f.partial_cmp(&b_f).unwrap_or(std::cmp::Ordering::Equal)
+            a_f.total_cmp(&b_f)
         } else if tc == type_code::U128 {
             let a_ptr = mb.get_col_ptr(row_a, pi, 16);
             let b_ptr = mb.get_col_ptr(row_b, pi, 16);

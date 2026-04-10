@@ -591,16 +591,16 @@ impl OwnedBatch {
                     if sfx > 0 { dest[8..8 + sfx].copy_from_slice(&src[8..8 + sfx]); }
                 } else {
                     let old_off = u64::from_le_bytes(src[8..16].try_into().unwrap()) as usize;
-                    if old_off + length <= blob_src.len() {
+                    if old_off.saturating_add(length) <= blob_src.len() {
                         let new_off = self.blob.len();
                         self.blob.extend_from_slice(&blob_src[old_off..old_off + length]);
                         dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
                     } else {
-                        let actual_len = length.min(blob_src.len());
-                        dest[0..4].copy_from_slice(&(actual_len as u32).to_le_bytes());
-                        let new_off = self.blob.len();
-                        self.blob.extend_from_slice(&blob_src[..actual_len]);
-                        dest[8..16].copy_from_slice(&(new_off as u64).to_le_bytes());
+                        // Malformed wire data: emit an empty string rather
+                        // than silently substituting unrelated bytes. Matches
+                        // relocate_string_cell. dest[8..16] is already zero
+                        // from the initializer above.
+                        dest[0..4].copy_from_slice(&0u32.to_le_bytes());
                     }
                 }
                 self.extend_col(pi, &dest);
@@ -1965,8 +1965,10 @@ mod tests {
         assert_eq!(u128_hi, 0xCAFEBABE);
     }
 
-    /// Verify that `append_row` writes the correct length into the German String
-    /// header when blob_src is shorter than the declared length field.
+    /// Verify that `append_row` substitutes an empty string when the
+    /// declared length would read past the end of `blob_src`. This matches
+    /// `relocate_string_cell` and prevents silent corruption from emitting
+    /// unrelated bytes from the start of the blob.
     #[test]
     fn test_append_row_blob_length_header() {
         let schema = make_schema_cols(&[
@@ -1976,13 +1978,13 @@ mod tests {
         let mut batch = OwnedBatch::with_schema(schema, 1);
 
         // Build a German String struct with length=20 but only 5 blob bytes available.
-        // This triggers the inline-blob fallback branch in append_row.
+        // This triggers the malformed-wire-data fallback branch in append_row.
         let mut gs_struct = [0u8; 16];
         gs_struct[0..4].copy_from_slice(&20u32.to_le_bytes()); // declared length = 20
         gs_struct[4..8].copy_from_slice(&0u32.to_le_bytes());  // prefix bytes = 0
         gs_struct[8..16].copy_from_slice(&0u64.to_le_bytes()); // blob offset = 0
 
-        let blob_src = b"hello"; // only 5 bytes
+        let blob_src = b"hello"; // only 5 bytes — out of bounds for length=20
 
         let col_ptrs = [gs_struct.as_ptr()];
         let col_sizes = [16u32];
@@ -1990,14 +1992,16 @@ mod tests {
             batch.append_row(1, 1, 0, &col_ptrs, &col_sizes, blob_src);
         }
 
-        // The stored German String header must have length=5 (actual bytes written),
-        // not length=20 (declared length that exceeded blob_src).
+        // The stored German String header must have length=0 (empty-string
+        // fallback), not the declared length=20 nor a truncated length=5.
+        // Emitting an empty string is the only safe response to malformed
+        // wire data; anything else silently corrupts the row.
         let stored_gs = batch.get_col_ptr(0, 0, 16);
         let stored_len = u32::from_le_bytes(stored_gs[0..4].try_into().unwrap());
-        assert_eq!(stored_len, 5, "length header should reflect actual bytes written");
+        assert_eq!(stored_len, 0, "malformed long-string should fall back to empty");
 
-        // The blob arena should contain exactly "hello".
-        assert_eq!(&batch.blob, b"hello");
+        // No bytes copied into the blob arena.
+        assert!(batch.blob.is_empty());
     }
 
     /// Verify that `find_positive_payload_row` locates the row with positive

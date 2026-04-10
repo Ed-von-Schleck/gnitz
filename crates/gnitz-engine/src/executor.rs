@@ -77,25 +77,46 @@ struct PendingEntry {
 }
 
 struct PendingBatch {
-    entries: Vec<PendingEntry>,
+    // Grouped by target_id — within-tid order matches insertion order so
+    // per-entry responses go out in the order clients submitted them.
+    // Across-tid order is undefined; `flush_pending_pushes` sorts before use.
+    by_tid: HashMap<i64, Vec<PendingEntry>>,
     row_count: usize,
 }
 
 impl PendingBatch {
     fn new() -> Self {
         PendingBatch {
-            entries: Vec::with_capacity(16),
+            by_tid: HashMap::with_capacity(8),
             row_count: 0,
         }
     }
 
     fn add(&mut self, fd: i32, client_id: u64, target_id: i64, batch: OwnedBatch) {
         self.row_count += batch.count;
-        self.entries.push(PendingEntry { fd, client_id, target_id, batch });
+        self.by_tid.entry(target_id).or_default()
+            .push(PendingEntry { fd, client_id, target_id, batch });
     }
 
     fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.by_tid.is_empty()
+    }
+
+    fn drain_all(&mut self) -> Vec<PendingEntry> {
+        let total: usize = self.by_tid.values().map(|v| v.len()).sum();
+        let mut out = Vec::with_capacity(total);
+        for (_tid, mut v) in self.by_tid.drain() {
+            out.append(&mut v);
+        }
+        self.row_count = 0;
+        out
+    }
+
+    fn drain_tid(&mut self, tid: i64) -> Vec<PendingEntry> {
+        let v = self.by_tid.remove(&tid).unwrap_or_default();
+        let dropped: usize = v.iter().map(|e| e.batch.count).sum();
+        self.row_count -= dropped;
+        v
     }
 }
 
@@ -345,35 +366,14 @@ impl ServerExecutor {
         target_id: i64,
         pending: &mut PendingBatch,
     ) {
-        if pending.is_empty() || !pending.entries.iter().any(|e| e.target_id == target_id) {
+        let flush_entries = pending.drain_tid(target_id);
+        if flush_entries.is_empty() {
             return;
         }
-
-        let mut flush_entries: Vec<PendingEntry> = Vec::new();
-        let mut keep_entries: Vec<PendingEntry> = Vec::new();
-
-        for entry in pending.entries.drain(..) {
-            if entry.target_id == target_id {
-                flush_entries.push(entry);
-            } else {
-                keep_entries.push(entry);
-            }
-        }
-
-        // Recompute row_count from kept entries
-        pending.row_count = 0;
-        for e in &keep_entries {
-            pending.row_count += e.batch.count;
-        }
-        pending.entries = keep_entries;
-
         if pending.is_empty() {
             self.t_first_pending = None;
         }
-
-        if !flush_entries.is_empty() {
-            self.flush_pending_pushes(transport, flush_entries);
-        }
+        self.flush_pending_pushes(transport, flush_entries);
     }
 
     fn flush_pending_pushes(
@@ -485,15 +485,12 @@ impl ServerExecutor {
 
             self.disp().reset_w2m_cursors();
 
-            // Wait for async fdatasync to complete before ACKing clients.
+            // Workers already see the SAL via atomics and have committed.
+            // If fdatasync fails, ACKing the client would split-brain the
+            // system (worker durable, master not). Crash-stop instead.
             let fsync_rc = self.async_fsync.wait_complete();
             if fsync_rc < 0 {
-                let err = format!("fdatasync failed: {}", fsync_rc);
-                for g in groups.iter_mut() {
-                    if g.error.is_none() {
-                        g.error = Some(err.clone());
-                    }
-                }
+                gnitz_fatal_abort!("SAL fdatasync (async) failed rc={}", fsync_rc);
             }
 
             // Update the master-side unique-index filter from successfully
@@ -700,8 +697,7 @@ impl ServerExecutor {
 
         // Flush pushes accumulated during the tick
         if !pending.is_empty() {
-            let entries = std::mem::take(&mut pending.entries);
-            pending.row_count = 0;
+            let entries = pending.drain_all();
             self.flush_pending_pushes(transport, entries);
         }
 
@@ -1021,7 +1017,10 @@ impl ServerExecutor {
         if self.pending_ddl_responses.is_empty() {
             return;
         }
-        self.disp().sync();
+        let rc = self.disp().sync();
+        if rc < 0 {
+            gnitz_fatal_abort!("SAL fdatasync (DDL responses) failed rc={}", rc);
+        }
         for r in std::mem::replace(&mut self.pending_ddl_responses, Vec::with_capacity(8)) {
             let schema = self.get_schema_desc(r.target_id);
             self.send_response(
@@ -1120,8 +1119,7 @@ impl ServerExecutor {
 
                 if pending.row_count >= MAX_PENDING_ROWS && self.tick_state != TickState::Active {
                     self.t_first_pending = None;
-                    let entries = std::mem::take(&mut pending.entries);
-                    pending.row_count = 0;
+                    let entries = pending.drain_all();
                     self.flush_pending_pushes(transport, entries);
                 }
             }
@@ -1131,8 +1129,7 @@ impl ServerExecutor {
                     .map_or(false, |t| t.elapsed().as_millis() as u64 >= FLUSH_DEADLINE_MS);
                 if pending.row_count >= MAX_PENDING_ROWS || deadline_expired {
                     self.t_first_pending = None;
-                    let entries = std::mem::take(&mut pending.entries);
-                    pending.row_count = 0;
+                    let entries = pending.drain_all();
                     self.flush_pending_pushes(transport, entries);
                 }
             }

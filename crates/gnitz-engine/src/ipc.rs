@@ -22,6 +22,16 @@ pub const SAL_MMAP_SIZE: usize = 1 << 30;
 pub const W2M_REGION_SIZE: usize = 1 << 30;
 pub const W2M_HEADER_SIZE: usize = 128;
 
+/// Base page size on Linux x86_64. The SAL is mmap'd from a regular
+/// filesystem, so hugepage backing is not in play here. Hardcoding
+/// avoids a sysconf(_SC_PAGESIZE) call on every prefault.
+const PAGE_SIZE: u64 = 4096;
+
+/// Upper bound on a single W2M wire message (256 MiB). Large enough for
+/// any real query response, small enough to keep within u32 and to cap
+/// corrupt/buggy worker writes before they cause UB in the master.
+const MAX_W2M_MSG: u64 = 1 << 28;
+
 pub use gnitz_wire::{
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, IPC_CONTROL_TID,
     STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
@@ -59,6 +69,15 @@ const META_SCHEMA_DESC: SchemaDescriptor = {
     sd.columns[3] = STR_COL;
     sd
 };
+
+// `schema_to_batch` / `batch_to_schema` hardcode the 4-column META_SCHEMA
+// layout (extend_col / col_data with literal indices 0..2). If anyone
+// ever bumps `META_SCHEMA_DESC.num_columns`, this compile-time check
+// fails and forces both converter functions to be updated in lockstep.
+const _: () = assert!(
+    META_SCHEMA_DESC.num_columns == 4,
+    "META_SCHEMA layout changed; update schema_to_batch and batch_to_schema",
+);
 
 /// CONTROL_SCHEMA: 8 U64 cols + 1 nullable String.
 const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
@@ -870,22 +889,58 @@ pub(crate) unsafe fn w2m_write(
 
 /// Read the next message from a W2M region.
 ///
-/// Returns (data_ptr, data_size, new_read_cursor). data_ptr is non-owning.
-/// Returns data_size=0 if no message (should not happen in normal flow).
+/// Returns (new_read_cursor, data_size, data_ptr). data_ptr is non-owning.
+/// Returns data_size=0 for "no message", either because the region is
+/// empty at read_cursor or because the size prefix was rejected as
+/// corrupt (out-of-bounds, oversized, or payload+alignment would overrun
+/// the region). Corrupt cases are logged so operators can investigate.
 ///
 /// # Safety
-/// `region_ptr` must be a valid mmap pointer. `read_cursor` must be valid.
+/// `region_ptr` must be a valid mmap pointer. `region_size` must match
+/// the actual mmap length. `read_cursor` must be <= region_size.
 pub(crate) unsafe fn w2m_read(
     region_ptr: *const u8,
     read_cursor: u64,
+    region_size: u64,
 ) -> (u64, u32, *const u8) {
     let rc = read_cursor as usize;
-    let size = read_u64_raw(region_ptr, rc) as usize;
+    let rsz = region_size as usize;
+
+    // Size prefix must fit in the region.
+    if rc + 8 > rsz {
+        gnitz_error!(
+            "w2m_read: size prefix out of bounds rc={} region_size={}",
+            rc, rsz,
+        );
+        return (read_cursor, 0, std::ptr::null());
+    }
+
+    let size = read_u64_raw(region_ptr, rc);
     if size == 0 {
         return (read_cursor, 0, std::ptr::null());
     }
+
+    // Reject oversized messages before any cast to usize/u32.
+    if size > MAX_W2M_MSG {
+        gnitz_error!(
+            "w2m_read: size exceeds MAX_W2M_MSG rc={} size={} max={}",
+            rc, size, MAX_W2M_MSG,
+        );
+        return (read_cursor, 0, std::ptr::null());
+    }
+
+    let size = size as usize;
+    let total = 8usize.saturating_add(align8(size));
+    if rc.saturating_add(total) > rsz {
+        gnitz_error!(
+            "w2m_read: payload out of bounds rc={} size={} region_size={}",
+            rc, size, rsz,
+        );
+        return (read_cursor, 0, std::ptr::null());
+    }
+
     let data_ptr = region_ptr.add(rc + 8);
-    let new_rc = rc + 8 + align8(size);
+    let new_rc = rc + total;
     (new_rc as u64, size as u32, data_ptr)
 }
 
@@ -931,14 +986,24 @@ impl SalWriter {
     }
 
     /// Pre-fault SAL mmap pages 2 MB ahead of the write cursor via MADV_WILLNEED.
+    ///
+    /// `madvise` requires the address to be page-aligned. `last_prefaulted`
+    /// and `write_cursor` can be arbitrary byte offsets between calls, so
+    /// we round the start down and the end up to page boundaries. Without
+    /// this alignment Linux silently returns EINVAL and the advice is lost.
     fn prefault_ahead(&mut self) {
         const PREFAULT_AHEAD: u64 = 2 * 1024 * 1024;
         let target = (self.write_cursor + PREFAULT_AHEAD).min(self.mmap_size);
         if target <= self.last_prefaulted { return; }
-        let start = self.last_prefaulted.max(self.write_cursor);
-        let len = (target - start) as usize;
-        if len > 0 {
-            sys::madvise_willneed(unsafe { self.ptr.add(start as usize) }, len);
+        let raw_start = self.last_prefaulted.max(self.write_cursor);
+        let start = raw_start & !(PAGE_SIZE - 1);
+        let end_raw = (target + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let end = end_raw.min(self.mmap_size);
+        if end > start {
+            sys::madvise_willneed(
+                unsafe { self.ptr.add(start as usize) },
+                (end - start) as usize,
+            );
             self.last_prefaulted = target;
         }
     }
@@ -1058,18 +1123,29 @@ impl SalWriter {
         Ok(())
     }
 
-    /// fdatasync + eventfd_signal all workers.
-    pub fn sync_and_signal_all(&self) {
-        sys::fdatasync(self.fd);
+    /// fdatasync + eventfd_signal all workers. Returns the fdatasync return
+    /// code: on failure (< 0), workers are NOT signaled so they never see
+    /// non-durable data. On success, returns 0.
+    pub fn sync_and_signal_all(&self) -> i32 {
+        let rc = sys::fdatasync(self.fd);
+        if rc < 0 {
+            return rc;
+        }
         for w in 0..self.num_workers {
             ipc_sys::eventfd_signal(self.m2w_efds[w]);
         }
+        0
     }
 
-    /// fdatasync + eventfd_signal one worker.
-    pub fn sync_and_signal_one(&self, worker: usize) {
-        sys::fdatasync(self.fd);
+    /// fdatasync + eventfd_signal one worker. Returns the fdatasync return
+    /// code: on failure (< 0), the worker is NOT signaled.
+    pub fn sync_and_signal_one(&self, worker: usize) -> i32 {
+        let rc = sys::fdatasync(self.fd);
+        if rc < 0 {
+            return rc;
+        }
         ipc_sys::eventfd_signal(self.m2w_efds[worker]);
+        0
     }
 
     /// eventfd_signal all workers (no fdatasync).
@@ -1084,9 +1160,9 @@ impl SalWriter {
         ipc_sys::eventfd_signal(self.m2w_efds[worker]);
     }
 
-    /// fdatasync only (no signal).
-    pub fn sync(&self) {
-        sys::fdatasync(self.fd);
+    /// fdatasync only (no signal). Returns the fdatasync return code.
+    pub fn sync(&self) -> i32 {
+        sys::fdatasync(self.fd)
     }
 
     pub fn needs_checkpoint(&self) -> bool {
@@ -1266,6 +1342,7 @@ impl W2mWriter {
 /// Master's read side of W2M.
 pub struct W2mReceiver {
     region_ptrs: Vec<*mut u8>,
+    region_size: u64,
     efds: Vec<i32>,
     num_workers: usize,
 }
@@ -1275,7 +1352,12 @@ unsafe impl Send for W2mReceiver {}
 impl W2mReceiver {
     pub fn new(region_ptrs: Vec<*mut u8>, efds: Vec<i32>) -> Self {
         let num_workers = region_ptrs.len();
-        W2mReceiver { region_ptrs, efds, num_workers }
+        W2mReceiver {
+            region_ptrs,
+            region_size: W2M_REGION_SIZE as u64,
+            efds,
+            num_workers,
+        }
     }
 
     /// Poll for any worker signal (wraps eventfd_wait_any).
@@ -1301,7 +1383,7 @@ impl W2mReceiver {
             return None;
         }
         let (new_rc, data_size, data_ptr) = unsafe {
-            w2m_read(self.region_ptrs[worker], read_cursor)
+            w2m_read(self.region_ptrs[worker], read_cursor, self.region_size)
         };
         if data_size == 0 {
             return None;
@@ -1555,7 +1637,7 @@ mod tests {
             assert!(new_wc > 0);
 
             // Read back
-            let (new_rc, data_size, data_ptr) = w2m_read(ptr, W2M_HEADER_SIZE as u64);
+            let (new_rc, data_size, data_ptr) = w2m_read(ptr, W2M_HEADER_SIZE as u64, size as u64);
             assert_eq!(data_size as usize, 256);
             let data = std::slice::from_raw_parts(data_ptr, data_size as usize);
             assert_eq!(data, buf.as_slice());
@@ -1580,7 +1662,7 @@ mod tests {
 
             let mut rc = W2M_HEADER_SIZE as u64;
             for i in 0..3u8 {
-                let (new_rc, sz, data_ptr) = w2m_read(ptr, rc);
+                let (new_rc, sz, data_ptr) = w2m_read(ptr, rc, size as u64);
                 assert_eq!(sz, 100);
                 let data = std::slice::from_raw_parts(data_ptr, sz as usize);
                 assert_eq!(data[0], i + 1);
@@ -1622,6 +1704,94 @@ mod tests {
             let buf = make_test_data(0xFF, 100);
             let r = w2m_write(ptr, buf.as_ptr(), buf.len() as u32, size as u64);
             assert_eq!(r, -1);
+
+            free_mmap(ptr, size);
+        }
+    }
+
+    /// A buggy/malicious worker writing a `u64::MAX` size prefix must not
+    /// cause UB in `w2m_read`. It must return (cursor, 0, null) and log,
+    /// and the master's `try_read` must treat that as "no message".
+    #[test]
+    fn test_w2m_read_rejects_oversized_size_prefix() {
+        unsafe {
+            let size = 1 << 16; // 64 KiB
+            let ptr = alloc_mmap(size);
+            let cursor: u64 = 128;
+
+            // Corrupt: write u64::MAX at `cursor`.
+            write_u64_raw(ptr, cursor as usize, u64::MAX);
+
+            let (new_rc, data_size, data_ptr) = w2m_read(ptr, cursor, size as u64);
+            assert_eq!(new_rc, cursor, "cursor must not advance on corrupt size");
+            assert_eq!(data_size, 0);
+            assert!(data_ptr.is_null());
+
+            free_mmap(ptr, size);
+        }
+    }
+
+    /// A size prefix just above `MAX_W2M_MSG` must be rejected too — this
+    /// guards the `size > MAX_W2M_MSG` branch separately from `u64::MAX`,
+    /// which would also fail the overflow/bounds check.
+    #[test]
+    fn test_w2m_read_rejects_above_max_message_cap() {
+        unsafe {
+            let size = 1 << 16;
+            let ptr = alloc_mmap(size);
+            let cursor: u64 = 0;
+
+            write_u64_raw(ptr, cursor as usize, MAX_W2M_MSG + 1);
+
+            let (new_rc, data_size, data_ptr) = w2m_read(ptr, cursor, size as u64);
+            assert_eq!(new_rc, cursor);
+            assert_eq!(data_size, 0);
+            assert!(data_ptr.is_null());
+
+            free_mmap(ptr, size);
+        }
+    }
+
+    /// A plausible size that would still overrun the region (payload past
+    /// region_size) must be rejected by the payload-bounds check.
+    #[test]
+    fn test_w2m_read_rejects_payload_overrun() {
+        unsafe {
+            let size = 1 << 12; // 4 KiB
+            let ptr = alloc_mmap(size);
+            // Put the size prefix near the end so size=1024 would overrun.
+            let cursor: u64 = (size - 64) as u64;
+            write_u64_raw(ptr, cursor as usize, 1024);
+
+            let (new_rc, data_size, data_ptr) = w2m_read(ptr, cursor, size as u64);
+            assert_eq!(new_rc, cursor);
+            assert_eq!(data_size, 0);
+            assert!(data_ptr.is_null());
+
+            free_mmap(ptr, size);
+        }
+    }
+
+    /// Happy path: a small valid write round-trips through `w2m_read`
+    /// with the new `region_size` parameter, confirming the bounds checks
+    /// don't reject legitimate traffic.
+    #[test]
+    fn test_w2m_read_accepts_valid_small_message() {
+        unsafe {
+            let size = 1 << 16;
+            let ptr = alloc_mmap(size);
+            atomic_store_u64(ptr, W2M_HEADER_SIZE as u64);
+
+            let buf = make_test_data(0xAB, 64);
+            let new_wc = w2m_write(ptr, buf.as_ptr(), buf.len() as u32, size as u64);
+            assert!(new_wc > 0);
+
+            let (new_rc, data_size, data_ptr) =
+                w2m_read(ptr, W2M_HEADER_SIZE as u64, size as u64);
+            assert_eq!(data_size, 64);
+            assert_eq!(new_rc, new_wc as u64);
+            let data = std::slice::from_raw_parts(data_ptr, data_size as usize);
+            assert_eq!(data, buf.as_slice());
 
             free_mmap(ptr, size);
         }
@@ -2094,5 +2264,79 @@ mod tests {
         );
         assert_eq!(written, wire.len());
         assert_eq!(buf, wire, "encode_wire_into should produce identical bytes");
+    }
+
+    /// Verify that `gnitz_fatal_abort!` on an `AsyncFsync` failure terminates
+    /// with exit code 134 and writes "FATAL" + "fdatasync" to stderr. Uses
+    /// fork so we can exercise the real `_exit(134)` path without killing
+    /// the test runner. In the child, the SAL fd is closed before
+    /// `wait_complete()` so the kernel returns `-EBADF` via io_uring.
+    #[test]
+    fn test_fsync_failure_triggers_fatal_abort() {
+        // Pipe for capturing child stderr.
+        let mut pipe_fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+
+        // memfd_create gives us a real file-like fd that supports fdatasync
+        // (unlike eventfds), so AsyncFsync::new succeeds. Closing it before
+        // submit forces the kernel to fail the op with -EBADF.
+        let name = b"fsync_test\0";
+        let fsync_fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                name.as_ptr() as *const libc::c_char,
+                0u32,
+            )
+        } as i32;
+        assert!(fsync_fd >= 0, "memfd_create failed");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+
+        if pid == 0 {
+            // --- Child ---
+            unsafe {
+                libc::close(read_fd);
+                libc::dup2(write_fd, 2);
+                libc::close(write_fd);
+            }
+            crate::log::init(crate::log::NORMAL, b"T");
+
+            let mut async_fsync = AsyncFsync::new(fsync_fd)
+                .expect("AsyncFsync::new failed in child");
+            unsafe { libc::close(fsync_fd) };
+            async_fsync.submit();
+            let rc = async_fsync.wait_complete();
+            assert!(rc < 0, "expected negative rc from fsync on closed fd");
+            gnitz_fatal_abort!("SAL fdatasync (async) failed rc={}", rc);
+        }
+
+        // --- Parent ---
+        unsafe {
+            libc::close(write_fd);
+            libc::close(fsync_fd);
+        }
+
+        let mut status = 0i32;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid failed");
+        assert!(libc::WIFEXITED(status), "child did not exit normally");
+        let exit_code = libc::WEXITSTATUS(status);
+        assert_eq!(
+            exit_code, 134,
+            "expected exit code 134 from gnitz_fatal_abort, got {}",
+            exit_code,
+        );
+
+        let mut buf = vec![0u8; 4096];
+        let n = unsafe {
+            libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        unsafe { libc::close(read_fd) };
+        assert!(n > 0, "no stderr bytes read from child");
+        let stderr = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+        assert!(stderr.contains("FATAL"), "stderr missing FATAL: {:?}", stderr);
+        assert!(stderr.contains("fdatasync"), "stderr missing fdatasync: {:?}", stderr);
     }
 }

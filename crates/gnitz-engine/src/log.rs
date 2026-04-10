@@ -153,6 +153,19 @@ macro_rules! gnitz_debug {
     };
 }
 
+/// Emit a FATAL log line and immediately terminate the process with exit
+/// code 134 (= 128 + SIGABRT). Uses `libc::_exit` to skip atexit handlers,
+/// TLS destructors, and stdio flush — none of which are safe to run with a
+/// broken SAL mmap or in-flight io_uring SQEs. Matches the "aborted" signal
+/// convention that systemd/monit expect.
+#[macro_export]
+macro_rules! gnitz_fatal_abort {
+    ($($arg:tt)*) => {{
+        $crate::log::_emit("FATAL", &format!($($arg)*));
+        unsafe { ::libc::_exit(134) };
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

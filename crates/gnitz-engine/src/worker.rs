@@ -54,6 +54,7 @@ impl WorkerExchangeHandler {
         source_id: i64,
         read_cursor: &mut u64,
         expected_epoch: u32,
+        master_pid: i32,
     ) -> OwnedBatch {
         if let Some(stashed) = self.stash.remove(&view_id) {
             return stashed;
@@ -75,6 +76,15 @@ impl WorkerExchangeHandler {
         // the eventfd signal, and re-waiting would block for up to 30 s).
         loop {
             sal_reader.wait(30000);
+
+            // If the master died (killed or gnitz_fatal_abort) while we
+            // were waiting, exit like the main run loop does. Without
+            // this, do_exchange_impl would spin on 30 s waits forever.
+            // Can't call self.shutdown() here because do_exchange_impl
+            // borrows self; _exit(0) matches the shutdown end state.
+            if master_pid != 0 && unsafe { libc::getppid() } != master_pid {
+                unsafe { libc::_exit(0); }
+            }
 
             loop {
                 let (msg, new_cursor) = match sal_reader.try_read(*read_cursor) {
@@ -124,6 +134,7 @@ struct WorkerExchangeCtx<'a> {
     w2m_writer: &'a W2mWriter,
     read_cursor: &'a mut u64,
     expected_epoch: u32,
+    master_pid: i32,
 }
 
 impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
@@ -137,6 +148,7 @@ impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
             self.sal_reader, self.w2m_writer,
             view_id, batch, source_id,
             self.read_cursor, self.expected_epoch,
+            self.master_pid,
         )
     }
 }
@@ -488,10 +500,10 @@ impl WorkerProcess {
         // Single pass: collect matching row indices.
         let wid = self.worker_id as usize;
         let nw = self.num_workers;
-        let mut indices: Vec<usize> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
         for i in 0..n {
             if worker_for_partition_pub(partition_for_key(batch.get_pk(i)), nw) == wid {
-                indices.push(i);
+                indices.push(i as u32);
             }
         }
         if indices.len() == n {
@@ -501,14 +513,9 @@ impl WorkerProcess {
             return OwnedBatch::with_schema(schema, 0);
         }
 
-        let npc = schema.num_columns as usize - 1;
-        let mut out = OwnedBatch::empty(npc);
-        out.schema = Some(schema);
-        out.reserve_rows(indices.len());
-        for &i in &indices {
-            out.append_batch(&batch, i, i + 1);
-        }
-        out
+        // Vectorized scatter: one bulk copy per column, no per-row overhead.
+        let mb = batch.as_mem_batch();
+        OwnedBatch::from_indexed_rows(&mb, &indices, &schema)
     }
 
     fn handle_tick(&mut self, target_id: i64) -> Result<(), String> {
@@ -599,12 +606,14 @@ impl WorkerProcess {
     /// Run multi-worker DAG evaluation with the exchange context.
     fn evaluate_dag(&mut self, source_id: i64, delta: OwnedBatch) {
         let dag = self.cat().get_dag_ptr();
+        let master_pid = self.master_pid;
         let mut ctx = WorkerExchangeCtx {
             handler: &mut self.exchange,
             sal_reader: &self.sal_reader,
             w2m_writer: &self.w2m_writer,
             read_cursor: &mut self.read_cursor,
             expected_epoch: self.expected_epoch,
+            master_pid,
         };
         unsafe { &mut *dag }.evaluate_dag_multi_worker(source_id, delta, &mut ctx);
         // Apply DDL_SYNC messages deferred during exchange waits.

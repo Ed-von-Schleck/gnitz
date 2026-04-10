@@ -381,13 +381,13 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    pub(crate) fn sync_and_signal_all(&self) {
-        self.sal.sync_and_signal_all();
+    pub(crate) fn sync_and_signal_all(&self) -> i32 {
+        self.sal.sync_and_signal_all()
     }
 
     fn signal_all(&self) { self.sal.signal_all(); }
     fn signal_one(&self, worker: usize) { self.sal.signal_one(worker); }
-    pub(crate) fn sync(&self) { self.sal.sync(); }
+    pub(crate) fn sync(&self) -> i32 { self.sal.sync() }
 
     /// Signal workers + submit async fdatasync.
     pub(crate) fn signal_and_submit_fsync(&mut self, async_fsync: &mut ipc::AsyncFsync) {
@@ -669,7 +669,10 @@ impl MasterDispatcher {
     pub fn fan_out_ingest(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
         self.maybe_checkpoint()?;
         self.write_ingest(target_id, batch)?;
-        self.sync_and_signal_all();
+        let rc = self.sync_and_signal_all();
+        if rc < 0 {
+            return Err(format!("fdatasync failed rc={}", rc));
+        }
         self.collect_acks()?;
         gnitz_debug!("fan_out_ingest tid={} rows={}", target_id, batch.count);
         Ok(())
@@ -708,7 +711,10 @@ impl MasterDispatcher {
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
             self.write_group(target_id, FLAG_PUSH, &refs, &schema, &col_names, 0, 0, 0, -1)?;
-            self.sync_and_signal_all();
+            let rc = self.sync_and_signal_all();
+            if rc < 0 {
+                return Err(format!("fdatasync failed rc={}", rc));
+            }
         } else {
             let mut col_specs_owned: Vec<Vec<u32>> = Vec::with_capacity(preloadable.len() + 1);
             col_specs_owned.push(vec![schema.pk_index]);
@@ -737,7 +743,10 @@ impl MasterDispatcher {
             self.write_group(target_id, FLAG_PUSH, &refs, &schema,
                             &col_names, 0, 0, 0, -1)?;
 
-            self.sync_and_signal_all();
+            let rc = self.sync_and_signal_all();
+            if rc < 0 {
+                return Err(format!("fdatasync failed rc={}", rc));
+            }
         }
 
         self.collect_acks_and_relay(target_id)?;
