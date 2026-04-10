@@ -938,9 +938,19 @@ impl ServerExecutor {
             && has_batch
             && decoded.data_batch.as_ref().map_or(false, |b| b.count > 0)
         {
-            // Drain any previously buffered writes for this table so that
-            // validate_unique_distributed sees current worker state.
-            self.flush_pending_for_tid(transport, target_id, pending);
+            // The pre-flush exists solely to give distributed validation
+            // fresh worker state. Skip it when no distributed validator
+            // would actually broadcast — all three validators below
+            // early-return on unconstrained tables.
+            let needs_flush = {
+                let cat = self.cat();
+                cat.get_fk_count(target_id) > 0
+                    || cat.get_fk_children_count(target_id) > 0
+                    || cat.has_any_unique_index(target_id)
+            };
+            if needs_flush {
+                self.flush_pending_for_tid(transport, target_id, pending);
+            }
 
             let batch = decoded.data_batch.unwrap();
             {

@@ -2448,6 +2448,15 @@ impl CatalogEngine {
         self.fk_parent_map.get(&parent_id).map(|v| v.len()).unwrap_or(0)
     }
 
+    /// True if the table has at least one unique secondary index circuit.
+    /// Used to decide whether distributed unique-index validation is needed.
+    /// Non-unique circuits (e.g. FK indices) do not count.
+    pub fn has_any_unique_index(&self, table_id: i64) -> bool {
+        self.dag.tables.get(&table_id)
+            .map(|e| e.index_circuits.iter().any(|ic| ic.is_unique))
+            .unwrap_or(false)
+    }
+
     /// Get child info at index: (child_table_id, fk_col_idx).
     pub fn get_fk_child_info(&self, parent_id: i64, idx: usize) -> Option<(i64, usize)> {
         self.fk_parent_map.get(&parent_id)
