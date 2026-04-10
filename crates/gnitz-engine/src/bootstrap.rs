@@ -271,6 +271,10 @@ pub fn server_main(
         unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
         return 1;
     }
+    // Pre-fault writable PTEs so the hot write path never page-faults.
+    // MADV_POPULATE_WRITE (Linux 5.14+) installs dirty PTEs and triggers
+    // the filesystem mkwrite callback upfront, without dirtying page contents.
+    sys::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
 
     // --- System table SAL recovery (before forking workers) ---
     {

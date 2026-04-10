@@ -56,6 +56,16 @@ pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
     unsafe { libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_HUGEPAGE); }
 }
 
+/// Pre-fault writable page-table entries for [ptr, ptr+size).
+/// Uses MADV_POPULATE_WRITE (Linux 5.14+): installs writable PTEs and
+/// triggers the filesystem page_mkwrite callback, so later writes don't
+/// fault.  Unlike memset, this does not dirty page contents or pollute
+/// CPU caches.  Returns 0 on success, -1 on error.
+pub fn madvise_populate_write(ptr: *mut u8, size: usize) -> i32 {
+    if ptr.is_null() || size == 0 { return 0; }
+    unsafe { libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_POPULATE_WRITE) }
+}
+
 /// Hint the kernel to read-ahead [ptr, ptr+size) into page cache.
 /// Best-effort: ignores errors and is a no-op for null ptr or size 0.
 pub fn madvise_willneed(ptr: *mut u8, size: usize) {
