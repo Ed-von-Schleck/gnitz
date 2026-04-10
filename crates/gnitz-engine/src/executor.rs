@@ -208,6 +208,10 @@ impl ServerExecutor {
                     self.cat().validate_unique_indices(target_id, &batch)?;
                     self.disp().validate_all_distributed(target_id, &batch)?;
                     self.disp().fan_out_push(target_id, &batch)?;
+                    // fan_out_push is synchronous (SAL write + sync + ACKs
+                    // before return), so the batch is durable here. Feed
+                    // the master-side unique-index filter.
+                    self.disp().unique_filter_ingest_batch(target_id, &batch);
                     return Ok((None, 0));
                 }
             }
@@ -489,6 +493,21 @@ impl ServerExecutor {
                     if g.error.is_none() {
                         g.error = Some(err.clone());
                     }
+                }
+            }
+
+            // Update the master-side unique-index filter from successfully
+            // durable batches. Any group that errored (either at SAL write,
+            // worker ACK, or fsync) must have its filter invalidated — the
+            // filter state may be out of sync with worker state.
+            for g in &groups {
+                let disp = unsafe { &mut *self.dispatcher };
+                if g.error.is_some() {
+                    disp.unique_filter_invalidate_table(g.target_id);
+                    continue;
+                }
+                for k in g.start..g.end {
+                    disp.unique_filter_ingest_batch(g.target_id, &entries[k].batch);
                 }
             }
         }

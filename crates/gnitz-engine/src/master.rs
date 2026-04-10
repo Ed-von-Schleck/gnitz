@@ -142,6 +142,97 @@ enum P2Label {
 }
 
 // ---------------------------------------------------------------------------
+// Master-side unique-index filter
+// ---------------------------------------------------------------------------
+//
+// For each `(table_id, unique_col_idx)` we maintain a HashSet of all
+// indexed values known to exist in the unique index. Phase 2 of
+// `validate_all_distributed` consults this filter before building a
+// broadcast: if every new value is definitely absent from the filter,
+// that index's broadcast is skipped entirely.
+//
+// Correctness invariants:
+//   1. A value is only added to the filter AFTER fsync confirms the
+//      owning batch is durable. Before fsync, the filter is NOT updated,
+//      so an in-flight insert never creates a false "present" entry.
+//   2. On any flush error, filters for affected tables are invalidated
+//      (dropped from the map) and lazily re-warmed on next use from
+//      authoritative worker state.
+//   3. Warmup is lazy: the first query for an unwarmed `(tid, col)`
+//      triggers a `fan_out_scan` against the main table, from which
+//      the indexed-column values are extracted. Subsequent queries
+//      read the HashSet directly.
+//   4. Deletes are NOT removed from the filter — they leave stale
+//      "possibly present" entries that cause harmless fall-through
+//      broadcasts. Stale accumulation is bounded by `UNIQUE_FILTER_CAP`:
+//      once exceeded, the filter flips to `capped = true` and disables
+//      itself until invalidated.
+//   5. The master event loop is single-threaded, so there is no race
+//      between query, warmup, and ingest.
+
+/// Maximum number of values tracked per `(table_id, col_idx)` filter.
+/// Chosen to bound worst-case memory to ~32 MB/filter (u128 HashSet
+/// overhead ≈ 32 B/entry). Filters that would exceed this disable
+/// themselves.
+const UNIQUE_FILTER_CAP: usize = 1_000_000;
+
+struct UniqueFilter {
+    values: HashSet<u128>,
+    /// True once the filter has exceeded `UNIQUE_FILTER_CAP`. In that
+    /// state `values` is cleared and the filter always reports
+    /// "possibly present" (falls through to broadcast).
+    capped: bool,
+}
+
+impl UniqueFilter {
+    fn new() -> Self {
+        UniqueFilter { values: HashSet::new(), capped: false }
+    }
+
+    fn insert(&mut self, key: u128) {
+        if self.capped { return; }
+        self.values.insert(key);
+        if self.values.len() > UNIQUE_FILTER_CAP {
+            self.values = HashSet::new();
+            self.capped = true;
+        }
+    }
+}
+
+/// Column-extraction descriptor for one unique index on a table.
+/// Precomputed so the hot update path avoids catalog reborrows per row.
+#[derive(Clone, Copy)]
+struct UniqueIndexDesc {
+    col_idx: u32,
+    type_code: u8,
+    is_pk_col: bool,
+    /// Index into `batch.col_data(idx)` for the source column, or
+    /// `usize::MAX` when `is_pk_col` (value is read from batch PK).
+    src_payload_idx: usize,
+    col_size: usize,
+}
+
+/// Walk every positive-weight, non-null row of `batch` and insert the
+/// indexed-column value into `filter`. Respects the filter's capped state.
+fn extract_into_filter(filter: &mut UniqueFilter, batch: &OwnedBatch, d: &UniqueIndexDesc) {
+    for i in 0..batch.count {
+        if filter.capped { return; }
+        if batch.get_weight(i) <= 0 { continue; }
+        if !d.is_pk_col {
+            let null_word = batch.get_null_word(i);
+            if null_word & (1u64 << d.src_payload_idx) != 0 { continue; }
+        }
+        let (lo, hi) = if d.is_pk_col {
+            crate::util::split_pk(batch.get_pk(i))
+        } else {
+            let col_data = batch.col_data(d.src_payload_idx);
+            promote_to_index_key(col_data, i * d.col_size, d.col_size, d.type_code)
+        };
+        filter.insert(crate::util::make_pk(lo, hi));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MasterDispatcher
 // ---------------------------------------------------------------------------
 
@@ -162,6 +253,9 @@ pub struct MasterDispatcher {
     /// Reusable scratch batch for scan fan-out. Retains its large data Vec
     /// across ticks, eliminating the doubling-cascade page faults.
     reusable_scan_output: Option<OwnedBatch>,
+    /// Per-(table_id, unique_col_idx) filter skipping redundant Phase 2
+    /// unique-index broadcasts. See the UniqueFilter comment block above.
+    unique_filters: HashMap<(i64, u32), UniqueFilter>,
 }
 
 // Safety: MasterDispatcher is single-threaded (master process event loop).
@@ -188,6 +282,7 @@ impl MasterDispatcher {
             acc: ExchangeAccumulator::new(num_workers),
             async_active: false,
             reusable_scan_output: None,
+            unique_filters: HashMap::new(),
         }
     }
 
@@ -858,6 +953,124 @@ impl MasterDispatcher {
     }
 
     // -----------------------------------------------------------------------
+    // Unique-index filter
+    // -----------------------------------------------------------------------
+
+    /// Collect column-extraction descriptors for every unique index on
+    /// `table_id`. Returns (col_idx, type_code, is_pk_col, payload_idx,
+    /// col_size) per unique circuit — the shape expected by
+    /// `extract_unique_index_key`.
+    fn unique_index_descriptors(
+        &mut self, table_id: i64,
+    ) -> Option<(SchemaDescriptor, Vec<UniqueIndexDesc>)> {
+        let cat = unsafe { &mut *self.catalog };
+        let schema = cat.get_schema_desc(table_id)?;
+        let n_circuits = cat.get_index_circuit_count(table_id);
+        let pki = schema.pk_index as usize;
+
+        let mut out: Vec<UniqueIndexDesc> = Vec::new();
+        for ci in 0..n_circuits {
+            if let Some((col_idx, is_unique, type_code)) =
+                cat.get_index_circuit_info(table_id, ci)
+            {
+                if !is_unique { continue; }
+                let source_col = col_idx as usize;
+                let is_pk_col = source_col == pki;
+                let src_payload_idx = if is_pk_col {
+                    usize::MAX
+                } else if source_col < pki {
+                    source_col
+                } else {
+                    source_col - 1
+                };
+                let col_size = schema.columns[source_col].size as usize;
+                out.push(UniqueIndexDesc {
+                    col_idx, type_code, is_pk_col, src_payload_idx, col_size,
+                });
+            }
+        }
+        if out.is_empty() { None } else { Some((schema, out)) }
+    }
+
+    /// Warm up any unwarmed unique-index filters for `table_id`. A single
+    /// `fan_out_scan` on the main table is enough to seed all of them —
+    /// the indexed-column values are extracted from the scan result.
+    /// Idempotent: already-warm filters are left alone.
+    fn ensure_unique_filters_warm(&mut self, table_id: i64) -> Result<(), String> {
+        let (_schema, descs) = match self.unique_index_descriptors(table_id) {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+        let missing: Vec<UniqueIndexDesc> = descs.into_iter()
+            .filter(|d| !self.unique_filters.contains_key(&(table_id, d.col_idx)))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        // Seed empty filters for each missing one so that an empty table
+        // scan still produces a warm (empty) filter.
+        for d in &missing {
+            self.unique_filters.insert((table_id, d.col_idx), UniqueFilter::new());
+        }
+
+        // One scan feeds all of them.
+        let scan_result = self.fan_out_scan(table_id)?;
+        if let Some(batch) = scan_result {
+            for d in &missing {
+                if let Some(filter) = self.unique_filters.get_mut(&(table_id, d.col_idx)) {
+                    extract_into_filter(filter, &batch, d);
+                    if filter.capped { continue; }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// True if every key in `keys` is definitely absent from the filter
+    /// for `(table_id, col_idx)`. Returns false if the filter is capped,
+    /// not warm (caller is expected to warm it first), or contains any
+    /// key. On false, caller must fall through to the Phase 2 broadcast.
+    fn unique_filter_all_absent(
+        &self, table_id: i64, col_idx: u32, keys: &[u128],
+    ) -> bool {
+        let filter = match self.unique_filters.get(&(table_id, col_idx)) {
+            Some(f) => f,
+            None => return false,
+        };
+        if filter.capped {
+            return false;
+        }
+        keys.iter().all(|k| !filter.values.contains(k))
+    }
+
+    /// Record every unique-index value from a successfully-flushed
+    /// `batch` on `table_id` into the corresponding filters. No-op for
+    /// filters that are not yet warm (warmup will pick them up), and
+    /// for index circuits that are not unique.
+    pub(crate) fn unique_filter_ingest_batch(&mut self, table_id: i64, batch: &OwnedBatch) {
+        let (_schema, descs) = match self.unique_index_descriptors(table_id) {
+            Some(x) => x,
+            None => return,
+        };
+        for d in descs {
+            let filter = match self.unique_filters.get_mut(&(table_id, d.col_idx)) {
+                Some(f) => f,
+                None => continue, // not warm — warmup will pick this up
+            };
+            if filter.capped { continue; }
+            extract_into_filter(filter, batch, &d);
+        }
+    }
+
+    /// Drop every filter entry for `table_id`. Called on flush errors
+    /// (where filter state may be out of sync with workers) and on DDL
+    /// changes (DROP TABLE, DROP/CREATE INDEX).
+    pub(crate) fn unique_filter_invalidate_table(&mut self, table_id: i64) {
+        self.unique_filters.retain(|&(t, _), _| t != table_id);
+    }
+
+    // -----------------------------------------------------------------------
     // Pipelined distributed validation
     // -----------------------------------------------------------------------
     //
@@ -1169,6 +1382,10 @@ impl MasterDispatcher {
             return Ok(());
         }
 
+        // Lazily warm the unique-index filters for this table. One scan
+        // seeds every filter; already-warm filters are left alone.
+        self.ensure_unique_filters_warm(target_id)?;
+
         let mut p2_checks: Vec<PipelinedCheck> = Vec::new();
         let mut p2_labels: Vec<P2Label> = Vec::new();
 
@@ -1238,15 +1455,25 @@ impl MasterDispatcher {
             }
 
             if !check_lo.is_empty() {
-                let chk_batch = build_check_batch(&idx_schema, &check_lo, &check_hi);
-                p2_labels.push(P2Label::NonUpsert { source_col });
-                p2_checks.push(PipelinedCheck {
-                    target_id,
-                    flags: FLAG_HAS_PK,
-                    col_hint: (col_idx as u64) + 1,
-                    payload: CheckPayload::Broadcast(chk_batch),
-                    schema: idx_schema,
-                });
+                // Consult the master-side filter first: if every new
+                // value is definitely absent, skip this index's broadcast.
+                let filter_keys: Vec<u128> = check_lo.iter().zip(check_hi.iter())
+                    .map(|(&lo, &hi)| crate::util::make_pk(lo, hi))
+                    .collect();
+                let skip_broadcast = self.unique_filter_all_absent(
+                    target_id, col_idx, &filter_keys);
+
+                if !skip_broadcast {
+                    let chk_batch = build_check_batch(&idx_schema, &check_lo, &check_hi);
+                    p2_labels.push(P2Label::NonUpsert { source_col });
+                    p2_checks.push(PipelinedCheck {
+                        target_id,
+                        flags: FLAG_HAS_PK,
+                        col_hint: (col_idx as u64) + 1,
+                        payload: CheckPayload::Broadcast(chk_batch),
+                        schema: idx_schema,
+                    });
+                }
             }
 
             if !upsert_keys.is_empty() {
@@ -1356,4 +1583,137 @@ fn build_check_batch(schema: &SchemaDescriptor, lo_list: &[u64], hi_list: &[u64]
         batch.count += 1;
     }
     batch
+}
+
+#[cfg(test)]
+mod unique_filter_tests {
+    use super::*;
+    use crate::schema::{SchemaColumn, type_code};
+
+    fn u64_schema() -> SchemaDescriptor {
+        // Single U64 PK column.
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        SchemaDescriptor { num_columns: 1, pk_index: 0, columns }
+    }
+
+    fn two_col_schema() -> SchemaDescriptor {
+        // PK U64 at index 0, payload U64 at index 1.
+        let mut columns = [SchemaColumn::new(0, 0); 64];
+        columns[0] = SchemaColumn::new(type_code::U64, 0);
+        columns[1] = SchemaColumn::new(type_code::U64, 1);
+        SchemaDescriptor { num_columns: 2, pk_index: 0, columns }
+    }
+
+    fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, u64, i64)]) -> OwnedBatch {
+        // rows: (pk, weight, null_word, payload_col1_i64_value)
+        let mut batch = OwnedBatch::with_schema(schema, rows.len().max(1));
+        for &(pk, weight, null_word, payload_val) in rows {
+            let lo = [payload_val];
+            let hi = [0u64];
+            let null_ptr: *const u8 = std::ptr::null();
+            let ptrs = [null_ptr];
+            let lens = [0u32];
+            unsafe {
+                batch.append_row_simple(pk, weight, null_word, &lo, &hi, &ptrs, &lens);
+            }
+        }
+        batch
+    }
+
+    #[test]
+    fn filter_insert_basic() {
+        let mut f = UniqueFilter::new();
+        f.insert(1);
+        f.insert(2);
+        assert!(f.values.contains(&1));
+        assert!(f.values.contains(&2));
+        assert!(!f.capped);
+    }
+
+    #[test]
+    fn filter_cap_clears_values() {
+        // Temporarily lower the effective cap by filling the filter
+        // up to UNIQUE_FILTER_CAP + 1. We fill enough entries to exceed
+        // the cap, verify the filter flips to capped, and its values
+        // HashSet is cleared.
+        let mut f = UniqueFilter::new();
+        // Insert slightly above the cap; each insert is cheap (u128).
+        for k in 0..(UNIQUE_FILTER_CAP as u128 + 2) {
+            f.insert(k);
+            if f.capped { break; }
+        }
+        assert!(f.capped, "filter should be capped after exceeding the limit");
+        assert!(f.values.is_empty(), "values cleared once capped");
+        // Further inserts are no-ops.
+        f.insert(99999999);
+        assert!(f.values.is_empty());
+    }
+
+    #[test]
+    fn extract_into_filter_pk_col() {
+        // Schema: PK-only U64. Test that is_pk_col=true path extracts PKs.
+        let schema = u64_schema();
+        let batch = make_row_batch(schema, &[
+            (10, 1, 0, 0),
+            (20, 1, 0, 0),
+            (30, -1, 0, 0),  // delete row — should be skipped
+        ]);
+        let desc = UniqueIndexDesc {
+            col_idx: 0,
+            type_code: type_code::U64,
+            is_pk_col: true,
+            src_payload_idx: usize::MAX,
+            col_size: 8,
+        };
+        let mut filter = UniqueFilter::new();
+        extract_into_filter(&mut filter, &batch, &desc);
+        assert!(filter.values.contains(&10u128));
+        assert!(filter.values.contains(&20u128));
+        assert!(!filter.values.contains(&30u128), "negative weight skipped");
+    }
+
+    #[test]
+    fn extract_into_filter_payload_col_skips_nulls() {
+        // Schema: PK U64, payload U64 (nullable). Test extraction by col 1.
+        let schema = two_col_schema();
+        let batch = make_row_batch(schema, &[
+            (1, 1, 0, 100),  // payload=100, not null
+            (2, 1, 1, 200),  // null bit set → should be skipped
+            (3, 1, 0, 300),
+        ]);
+        let desc = UniqueIndexDesc {
+            col_idx: 1,
+            type_code: type_code::U64,
+            is_pk_col: false,
+            src_payload_idx: 0, // first payload column
+            col_size: 8,
+        };
+        let mut filter = UniqueFilter::new();
+        extract_into_filter(&mut filter, &batch, &desc);
+        assert!(filter.values.contains(&100u128));
+        assert!(!filter.values.contains(&200u128), "null values skipped");
+        assert!(filter.values.contains(&300u128));
+        assert_eq!(filter.values.len(), 2);
+    }
+
+    #[test]
+    fn extract_into_filter_respects_capped() {
+        let schema = u64_schema();
+        let batch = make_row_batch(schema, &[
+            (10, 1, 0, 0),
+            (20, 1, 0, 0),
+        ]);
+        let desc = UniqueIndexDesc {
+            col_idx: 0,
+            type_code: type_code::U64,
+            is_pk_col: true,
+            src_payload_idx: usize::MAX,
+            col_size: 8,
+        };
+        let mut filter = UniqueFilter::new();
+        filter.capped = true;
+        extract_into_filter(&mut filter, &batch, &desc);
+        assert!(filter.values.is_empty(), "no-op on capped filter");
+    }
 }
