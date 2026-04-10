@@ -13,7 +13,7 @@ use gnitz_transport::uring::IoUringRing;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 use crate::schema::SchemaDescriptor;
-use crate::ipc::{self, DecodedWire, STATUS_OK, STATUS_ERROR, W2M_HEADER_SIZE};
+use crate::ipc::{self, DecodedWire, STATUS_OK, STATUS_ERROR, W2M_HEADER_SIZE, WireConflictMode};
 use crate::master::MasterDispatcher;
 use crate::storage::OwnedBatch;
 
@@ -74,6 +74,7 @@ struct PendingEntry {
     client_id: u64,
     target_id: i64,
     batch: OwnedBatch,
+    mode: WireConflictMode,
 }
 
 struct PendingBatch {
@@ -92,10 +93,13 @@ impl PendingBatch {
         }
     }
 
-    fn add(&mut self, fd: i32, client_id: u64, target_id: i64, batch: OwnedBatch) {
+    fn add(
+        &mut self, fd: i32, client_id: u64, target_id: i64,
+        batch: OwnedBatch, mode: WireConflictMode,
+    ) {
         self.row_count += batch.count;
         self.by_tid.entry(target_id).or_default()
-            .push(PendingEntry { fd, client_id, target_id, batch });
+            .push(PendingEntry { fd, client_id, target_id, batch, mode });
     }
 
     fn is_empty(&self) -> bool {
@@ -222,13 +226,14 @@ impl ServerExecutor {
 
     fn handle_push(
         &mut self, target_id: i64, in_batch: Option<Box<OwnedBatch>>,
+        mode: WireConflictMode,
     ) -> Result<(Option<Arc<OwnedBatch>>, u64), String> {
         if target_id >= FIRST_USER_TABLE_ID {
             if let Some(batch) = in_batch {
                 if batch.count > 0 {
                     self.cat().validate_unique_indices(target_id, &batch)?;
-                    self.disp().validate_all_distributed(target_id, &batch)?;
-                    self.disp().fan_out_push(target_id, &batch)?;
+                    self.disp().validate_all_distributed(target_id, &batch, mode)?;
+                    self.disp().fan_out_push(target_id, &batch, mode)?;
                     // fan_out_push is synchronous (SAL write + sync + ACKs
                     // before return), so the batch is durable here. Feed
                     // the master-side unique-index filter.
@@ -385,7 +390,8 @@ impl ServerExecutor {
             return;
         }
 
-        entries.sort_by_key(|e| e.target_id);
+        // Sort by (target_id, mode) so runs are homogeneous in mode.
+        entries.sort_by_key(|e| (e.target_id, e.mode.as_u8()));
 
         // Phase 0: checkpoint before writing any groups.
         {
@@ -396,15 +402,20 @@ impl ServerExecutor {
             }
         }
 
-        // Phase 1: merge batches per target_id, write each group to SAL (no sync).
+        // Phase 1: merge batches per (target_id, mode), write each group
+        // to SAL (no sync). Mode must match across merged entries.
         let n = entries.len();
         let mut groups: Vec<GroupInfo> = Vec::new();
         let mut run_start = 0;
 
         while run_start < n {
             let target_id = entries[run_start].target_id;
+            let mode = entries[run_start].mode;
             let mut run_end = run_start + 1;
-            while run_end < n && entries[run_end].target_id == target_id {
+            while run_end < n
+                && entries[run_end].target_id == target_id
+                && entries[run_end].mode == mode
+            {
                 run_end += 1;
             }
 
@@ -426,7 +437,7 @@ impl ServerExecutor {
 
             let error = {
                 let disp = self.disp();
-                disp.write_ingest(target_id, &merged).err()
+                disp.write_ingest(target_id, &merged, mode).err()
             };
 
             groups.push(GroupInfo {
@@ -951,6 +962,13 @@ impl ServerExecutor {
             && has_batch
             && decoded.data_batch.as_ref().map_or(false, |b| b.count > 0)
         {
+            // Decode the wire conflict mode (defaults to Update for
+            // legacy clients that don't know about the new mode bit).
+            let mode = ipc::decode_conflict_mode(
+                decoded.control.flags,
+                decoded.control.seek_col_idx,
+            );
+
             // The pre-flush exists solely to give distributed validation
             // fresh worker state. Skip it when no distributed validator
             // would actually broadcast — all three validators below
@@ -960,6 +978,7 @@ impl ServerExecutor {
                 cat.get_fk_count(target_id) > 0
                     || cat.get_fk_children_count(target_id) > 0
                     || cat.has_any_unique_index(target_id)
+                    || (matches!(mode, WireConflictMode::Error) && cat.table_has_unique_pk(target_id))
             };
             if needs_flush {
                 self.flush_pending_for_tid(transport, target_id, pending);
@@ -969,9 +988,9 @@ impl ServerExecutor {
             self.cat().validate_unique_indices(target_id, &batch)?;
             {
                 let disp = self.disp();
-                disp.validate_all_distributed(target_id, &batch)?;
+                disp.validate_all_distributed(target_id, &batch, mode)?;
             }
-            pending.add(fd, client_id, target_id, *batch);
+            pending.add(fd, client_id, target_id, *batch, mode);
             if self.t_first_pending.is_none() {
                 self.t_first_pending = Some(Instant::now());
             }
@@ -991,7 +1010,12 @@ impl ServerExecutor {
             None
         };
 
-        let (result, lsn) = self.handle_push(target_id, decoded.data_batch)?;
+        // System tables and empty-batch scans: no conflict mode is
+        // relevant. Default to Update to preserve existing behavior.
+        let push_mode = ipc::decode_conflict_mode(
+            decoded.control.flags, decoded.control.seek_col_idx,
+        );
+        let (result, lsn) = self.handle_push(target_id, decoded.data_batch, push_mode)?;
 
         // DDL broadcast for system tables (after local handle_push)
         if let Some(ddl_batch) = ddl_clone {

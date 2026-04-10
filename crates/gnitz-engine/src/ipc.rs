@@ -35,7 +35,26 @@ const MAX_W2M_MSG: u64 = 1 << 28;
 pub use gnitz_wire::{
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, IPC_CONTROL_TID,
     STATUS_OK, STATUS_ERROR, META_FLAG_NULLABLE, META_FLAG_IS_PK,
+    FLAG_CONFLICT_MODE_PRESENT as FLAG_CONFLICT_MODE_PRESENT_U64,
+    WireConflictMode,
 };
+/// Engine-side u32 alias for the cross-crate conflict-mode marker bit.
+/// The SAL group header stores flags as u32.
+pub const FLAG_CONFLICT_MODE_PRESENT: u32 = FLAG_CONFLICT_MODE_PRESENT_U64 as u32;
+
+/// Decode a `WireConflictMode` from a wire or SAL header. Callers with
+/// a `u32` SAL header flags field should widen it at the call site
+/// (`flags as u64`) so we only need one decode path. Missing flag bit
+/// defaults to `Update` so SAL entries written without a mode retain
+/// silent-upsert semantics.
+#[inline]
+pub fn decode_conflict_mode(flags: u64, seek_col_idx: u64) -> WireConflictMode {
+    if flags & FLAG_CONFLICT_MODE_PRESENT_U64 != 0 {
+        WireConflictMode::from_u8((seek_col_idx & 0xFF) as u8)
+    } else {
+        WireConflictMode::Update
+    }
+}
 pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
 pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
 

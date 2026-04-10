@@ -205,8 +205,49 @@ pub const FLAG_PUSH:           u64 = 32;
 pub const FLAG_HAS_PK:         u64 = 64;
 pub const FLAG_SEEK:           u64 = 128;
 pub const FLAG_SEEK_BY_INDEX:  u64 = 256;
+/// Marker bit set on FLAG_PUSH messages that carry an explicit
+/// `WireConflictMode` in the low byte of `seek_col_idx`. When the bit
+/// is absent, decoders default to `WireConflictMode::Update`, so SAL
+/// entries written without a mode retain silent-upsert semantics.
+pub const FLAG_CONFLICT_MODE_PRESENT: u64 = 1 << 15;
 pub const FLAG_HAS_SCHEMA:     u64 = 1 << 48;
 pub const FLAG_HAS_DATA:       u64 = 1 << 49;
+
+// ---------------------------------------------------------------------------
+// Wire-level conflict mode for INSERT / UPSERT semantics
+// ---------------------------------------------------------------------------
+
+/// Conflict-resolution mode carried on FLAG_PUSH messages. Encoded as
+/// the low byte of `seek_col_idx` when `FLAG_CONFLICT_MODE_PRESENT` is
+/// set.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireConflictMode {
+    /// Reject the batch on any PK conflict. The master runs both an
+    /// intra-batch duplicate check and an against-store PK existence
+    /// check, and returns a PG-style `duplicate key value violates
+    /// unique constraint` error.
+    Error = 0,
+    /// Retract-and-insert on PK conflict. Used for SQL `UPDATE`,
+    /// `INSERT ... ON CONFLICT ... DO UPDATE` (after client-side
+    /// merging), and explicit Python `push(conflict_mode="update")`.
+    Update = 1,
+}
+
+impl WireConflictMode {
+    #[inline]
+    pub const fn as_u8(self) -> u8 { self as u8 }
+
+    /// Unknown bytes decode as `Update` so forward-compatible decoders
+    /// still see last-write-wins semantics.
+    #[inline]
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            0 => WireConflictMode::Error,
+            _ => WireConflictMode::Update,
+        }
+    }
+}
 
 pub const STATUS_OK:    u32 = 0;
 pub const STATUS_ERROR: u32 = 1;

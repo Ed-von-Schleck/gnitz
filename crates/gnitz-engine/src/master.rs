@@ -12,7 +12,7 @@ use crate::ipc;
 use crate::ipc::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_PRELOADED_EXCHANGE, FLAG_BACKFILL,
-    FLAG_TICK, FLAG_FLUSH, DecodedWire,
+    FLAG_TICK, FLAG_FLUSH, FLAG_CONFLICT_MODE_PRESENT, WireConflictMode, DecodedWire,
     SalWriter, W2mReceiver, W2M_HEADER_SIZE,
 };
 use crate::storage::{OwnedBatch, partition_for_key};
@@ -462,9 +462,18 @@ impl MasterDispatcher {
     /// Write-only ingest: broadcast batch to all workers via SAL without
     /// fdatasync/signal/collect.  Used by group-commit in flush_pending_pushes.
     /// Workers filter their own partitions on receipt (Phase 2 broadcast).
-    pub(crate) fn write_ingest(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+    /// `mode` is encoded into the control block so the worker knows whether
+    /// to run SQL-standard rejection or silent-upsert semantics.
+    pub(crate) fn write_ingest(
+        &mut self, target_id: i64, batch: &OwnedBatch, mode: WireConflictMode,
+    ) -> Result<(), String> {
         let (schema, col_names) = self.get_schema_and_names(target_id);
-        self.write_broadcast(target_id, FLAG_PUSH, Some(batch), &schema, &col_names, 0, 0, 0)
+        self.write_broadcast(
+            target_id,
+            FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT,
+            Some(batch), &schema, &col_names,
+            0, 0, mode.as_u8() as u64,
+        )
     }
 
     /// Collect one ACK per worker using caller-managed read cursors.
@@ -666,9 +675,11 @@ impl MasterDispatcher {
     // Fan-out operations
     // -----------------------------------------------------------------------
 
-    pub fn fan_out_ingest(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+    pub fn fan_out_ingest(
+        &mut self, target_id: i64, batch: &OwnedBatch, mode: WireConflictMode,
+    ) -> Result<(), String> {
         self.maybe_checkpoint()?;
-        self.write_ingest(target_id, batch)?;
+        self.write_ingest(target_id, batch, mode)?;
         let rc = self.sync_and_signal_all();
         if rc < 0 {
             return Err(format!("fdatasync failed rc={}", rc));
@@ -687,7 +698,9 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    pub fn fan_out_push(&mut self, target_id: i64, batch: &OwnedBatch) -> Result<(), String> {
+    pub fn fan_out_push(
+        &mut self, target_id: i64, batch: &OwnedBatch, mode: WireConflictMode,
+    ) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let n = batch.count;
         let (schema, col_names) = self.get_schema_and_names(target_id);
@@ -703,6 +716,9 @@ impl MasterDispatcher {
             false
         };
 
+        let push_flags = FLAG_PUSH | FLAG_CONFLICT_MODE_PRESENT;
+        let mode_byte = mode.as_u8() as u64;
+
         if !use_preload {
             let pk_col = &[schema.pk_index];
             let sub_batches = op_repartition_batch(batch, pk_col, &schema, self.num_workers);
@@ -710,7 +726,8 @@ impl MasterDispatcher {
             let refs: Vec<Option<&OwnedBatch>> = sub_batches.iter()
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
-            self.write_group(target_id, FLAG_PUSH, &refs, &schema, &col_names, 0, 0, 0, -1)?;
+            self.write_group(target_id, push_flags, &refs, &schema, &col_names,
+                            0, 0, mode_byte, -1)?;
             let rc = self.sync_and_signal_all();
             if rc < 0 {
                 return Err(format!("fdatasync failed rc={}", rc));
@@ -740,8 +757,8 @@ impl MasterDispatcher {
             let refs: Vec<Option<&OwnedBatch>> = pk_batches.iter()
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
-            self.write_group(target_id, FLAG_PUSH, &refs, &schema,
-                            &col_names, 0, 0, 0, -1)?;
+            self.write_group(target_id, push_flags, &refs, &schema,
+                            &col_names, 0, 0, mode_byte, -1)?;
 
             let rc = self.sync_and_signal_all();
             if rc < 0 {
@@ -750,7 +767,7 @@ impl MasterDispatcher {
         }
 
         self.collect_acks_and_relay(target_id)?;
-        gnitz_debug!("fan_out_push tid={} rows={}", target_id, n);
+        gnitz_debug!("fan_out_push tid={} rows={} mode={:?}", target_id, n, mode);
         Ok(())
     }
 
@@ -1189,27 +1206,72 @@ impl MasterDispatcher {
     /// (FK parent existence, FK child restrict, UPSERT PK identification).
     /// Phase 2 issues the unique-index checks, which depend on the
     /// UPSERT set from Phase 1.
+    ///
+    /// `mode` controls SQL semantics: `Error` rejects the batch on any
+    /// PK/unique conflict; `Update` allows retract-and-insert.
     pub fn validate_all_distributed(
-        &mut self, target_id: i64, batch: &OwnedBatch,
+        &mut self, target_id: i64, batch: &OwnedBatch, mode: WireConflictMode,
     ) -> Result<(), String> {
         // Snapshot catalog metadata up front.
-        let (n_fk, n_children, n_circuits, has_unique, source_schema) = {
+        let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema) = {
             let cat = unsafe { &mut *self.catalog };
             let n_fk = cat.get_fk_count(target_id);
             let n_children = cat.get_fk_children_count(target_id);
             let n_circuits = cat.get_index_circuit_count(target_id);
             let has_unique = cat.has_any_unique_index(target_id);
+            let unique_pk = cat.table_has_unique_pk(target_id);
             let source_schema = cat.get_schema_desc(target_id)
                 .ok_or_else(|| format!(
                     "validate_all_distributed: no schema for table {}", target_id))?;
-            (n_fk, n_children, n_circuits, has_unique, source_schema)
+            (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema)
         };
 
-        if n_fk == 0 && n_children == 0 && !has_unique {
+        // In Error mode on a unique_pk table we must also run the PK
+        // existence check even if no FK / unique-secondary-index
+        // validator would otherwise fire — a plain duplicate-PK INSERT
+        // needs to be rejected.
+        let needs_pk_rejection = matches!(mode, WireConflictMode::Error) && unique_pk;
+
+        if n_fk == 0 && n_children == 0 && !has_unique && !needs_pk_rejection {
             return Ok(());
         }
 
         let pki = source_schema.pk_index as usize;
+
+        // One-pass aggregation over the batch: per-PK (net_weight,
+        // positive_row_count). Used by both the Error-mode intra-batch
+        // rejection check below and the Phase 1 UpsertPkId planning
+        // further down, avoiding a second walk of the batch. Allocated
+        // only when either consumer needs it.
+        let pk_agg: HashMap<u128, (i64, u32)> = if has_unique || needs_pk_rejection {
+            let mut m: HashMap<u128, (i64, u32)> = HashMap::with_capacity(batch.count);
+            for i in 0..batch.count {
+                let w = batch.get_weight(i);
+                if w == 0 { continue; }
+                let entry = m.entry(batch.get_pk(i)).or_insert((0, 0));
+                entry.0 += w;
+                if w > 0 { entry.1 += 1; }
+            }
+            m
+        } else {
+            HashMap::new()
+        };
+
+        // Error-mode: reject any PK whose positive-row-count > 1 in
+        // this batch (e.g. `INSERT INTO t VALUES (1,10),(1,20)`).
+        if needs_pk_rejection {
+            for (&pk, &(_, pos_count)) in &pk_agg {
+                if pos_count > 1 {
+                    let pk_name = self.get_col_name(target_id, pki);
+                    let (sn, tn) = self.get_qualified_name_owned(target_id);
+                    let key_str = format_pk_value(pk, &source_schema);
+                    return Err(format!(
+                        "duplicate key value violates unique constraint \"{}_{}_pkey\": Batch contains multiple rows with key ({})=({})",
+                        sn, tn, pk_name, key_str,
+                    ));
+                }
+            }
+        }
 
         // ----- Phase 1 plan -----------------------------------------------
         let mut p1_checks: Vec<PipelinedCheck> = Vec::new();
@@ -1323,14 +1385,21 @@ impl MasterDispatcher {
             }
         }
 
-        // UPSERT PK identification — only relevant when Phase 2 (unique
-        // indices) will run.
-        if has_unique {
-            let mut lo_list: Vec<u64> = Vec::new();
-            let mut hi_list: Vec<u64> = Vec::new();
-            for i in 0..batch.count {
-                if batch.get_weight(i) <= 0 { continue; }
-                let pk = batch.get_pk(i);
+        // UPSERT PK identification — needed in two cases:
+        //   1. `has_unique` so Phase 2 can classify upsert rows.
+        //   2. `needs_pk_rejection`: Error-mode on a unique_pk table —
+        //      repurposed as the authoritative PK rejection broadcast.
+        //      Any PK already in the store is a SQL-standard violation.
+        //
+        // Intra-batch consolidation: only PKs with net_weight > 0 are
+        // checked against the store. This preserves z-set primitives
+        // (a +1 then -1 on the same PK is net zero and must not trigger
+        // an against-store conflict).
+        if has_unique || needs_pk_rejection {
+            let mut lo_list: Vec<u64> = Vec::with_capacity(pk_agg.len());
+            let mut hi_list: Vec<u64> = Vec::with_capacity(pk_agg.len());
+            for (&pk, &(net_weight, _)) in &pk_agg {
+                if net_weight <= 0 { continue; }
                 let (lo, hi) = crate::util::split_pk(pk);
                 lo_list.push(lo);
                 hi_list.push(hi);
@@ -1381,6 +1450,20 @@ impl MasterDispatcher {
                     }
                     P1Label::UpsertPkId => {
                         existing_pks = std::mem::take(&mut p1_results[idx]);
+                        // Error mode: any existing PK in the result set is
+                        // a SQL-standard duplicate-key violation.
+                        if matches!(mode, WireConflictMode::Error)
+                            && !existing_pks.is_empty()
+                        {
+                            let conflict_pk = *existing_pks.iter().next().unwrap();
+                            let pk_name = self.get_col_name(target_id, pki);
+                            let (sn, tn) = self.get_qualified_name_owned(target_id);
+                            let key_str = format_pk_value(conflict_pk, &source_schema);
+                            return Err(format!(
+                                "duplicate key value violates unique constraint \"{}_{}_pkey\": Key ({})=({}) already exists",
+                                sn, tn, pk_name, key_str,
+                            ));
+                        }
                     }
                 }
             }
@@ -1573,6 +1656,21 @@ fn extract_single_batch(schema: &SchemaDescriptor, decoded: DecodedWire) -> Opti
             None
         }
     })
+}
+
+/// Render a PK u128 as a human-readable decimal for error messages.
+/// Single-column PKs only; the high 64 bits are only non-zero for U128
+/// PKs, which we stringify as a combined u128 decimal.
+fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
+    let pk_col = schema.columns[schema.pk_index as usize];
+    match pk_col.type_code {
+        crate::schema::type_code::U128 => format!("{}", pk),
+        crate::schema::type_code::I64 => format!("{}", pk as u64 as i64),
+        crate::schema::type_code::I32 => format!("{}", pk as u64 as i32),
+        crate::schema::type_code::I16 => format!("{}", pk as u64 as i16),
+        crate::schema::type_code::I8  => format!("{}", pk as u64 as i8),
+        _ => format!("{}", pk as u64),
+    }
 }
 
 fn build_check_batch(schema: &SchemaDescriptor, lo_list: &[u64], hi_list: &[u64]) -> OwnedBatch {

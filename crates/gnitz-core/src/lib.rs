@@ -12,6 +12,7 @@ pub use connection::{
     FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
 };
 pub use client::GnitzClient;
+pub use gnitz_protocol::WireConflictMode;
 pub use expr::{ExprBuilder, ExprProgram};
 pub use circuit::{CircuitBuilder, NodeId};
 pub use types::{

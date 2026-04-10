@@ -2,8 +2,9 @@ use sqlparser::ast::{
     Query, SetExpr, Values, Expr, Value, SelectItem,
     Statement, TableObject, BinaryOperator,
     FromTable, Assignment, AssignmentTarget,
+    OnInsert, OnConflict, OnConflictAction, ConflictTarget,
 };
-use gnitz_protocol::{Schema, ZSetBatch, ColData, TypeCode};
+use gnitz_protocol::{Schema, ZSetBatch, ColData, TypeCode, WireConflictMode};
 use gnitz_core::GnitzClient;
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
 use crate::binder::Binder;
@@ -14,16 +15,110 @@ use crate::SqlResult;
 // INSERT
 // ---------------------------------------------------------------------------
 
+/// Resolved ON CONFLICT target for v1: either the PK column of the
+/// table, or a reserved slot for future ON CONSTRAINT / unique secondary
+/// targets (not implemented in v1). `None` = no target specified —
+/// DO NOTHING with no target is treated as "any PK conflict".
+enum ConflictPlan {
+    /// Default SQL INSERT: push with WireConflictMode::Error.
+    Error,
+    /// `ON CONFLICT (pk) DO NOTHING` (or `ON CONFLICT DO NOTHING` with
+    /// no target): pre-filter conflicting PKs client-side via `seek`,
+    /// then push the survivors with WireConflictMode::Error.
+    DoNothingPk,
+    /// `ON CONFLICT (pk) DO UPDATE SET ...`: seek existing rows, merge
+    /// with assignments, push merged batch with WireConflictMode::Update.
+    DoUpdatePk { assignments: Vec<(usize, BoundUpdateExpr)> },
+}
+
+/// Assignment RHS for `ON CONFLICT DO UPDATE`. Each variant wraps a
+/// `BoundExpr` and a scope — Existing evaluates against the stored
+/// row, Excluded against the incoming batch row. `EXCLUDED.col` is
+/// the only construct that escapes the existing-row scope.
+enum BoundUpdateExpr {
+    Existing(BoundExpr),
+    Excluded(BoundExpr),
+}
+
+/// Validate the ON CONFLICT target against the supported subset:
+/// either no target (`ON CONFLICT DO ...`) or a single-column target
+/// naming the PK. Composite targets and `ON CONSTRAINT` are rejected.
+fn validate_conflict_target(
+    target: &Option<ConflictTarget>,
+    schema: &Schema,
+) -> Result<(), GnitzSqlError> {
+    match target {
+        None => Ok(()),
+        Some(ConflictTarget::Columns(cols)) => {
+            if cols.len() != 1 {
+                return Err(GnitzSqlError::Unsupported(
+                    "composite ON CONFLICT targets not supported; \
+                     single-column PK target only".to_string()
+                ));
+            }
+            let col_name = cols[0].value.as_str();
+            let pk_name = schema.columns[schema.pk_index].name.as_str();
+            if !col_name.eq_ignore_ascii_case(pk_name) {
+                return Err(GnitzSqlError::Unsupported(format!(
+                    "ON CONFLICT ({}) — only the primary key column '{}' is \
+                     supported as a conflict target",
+                    col_name, pk_name
+                )));
+            }
+            Ok(())
+        }
+        Some(ConflictTarget::OnConstraint(_)) => Err(GnitzSqlError::Unsupported(
+            "ON CONFLICT ON CONSTRAINT not supported".to_string()
+        )),
+    }
+}
+
 pub fn execute_insert(
     client:       &GnitzClient,
     _schema_name: &str,
     stmt:         &Statement,
     binder:       &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    // Extract table name and source from the INSERT statement
-    let (table_name_str, rows) = extract_insert_parts(stmt)?;
+    // Extract table name, row source, and ON CONFLICT action.
+    let (table_name_str, rows, on_insert) = extract_insert_parts(stmt)?;
 
     let (tid, schema) = binder.resolve(&table_name_str)?;
+
+    // Resolve the ON CONFLICT clause into a `ConflictPlan`.
+    let plan = match on_insert {
+        None => ConflictPlan::Error,
+        Some(OnInsert::DuplicateKeyUpdate(_)) => {
+            return Err(GnitzSqlError::Unsupported(
+                "ON DUPLICATE KEY UPDATE not supported — use PostgreSQL-style \
+                 ON CONFLICT (col) DO UPDATE".to_string()
+            ));
+        }
+        Some(OnInsert::OnConflict(OnConflict { conflict_target, action })) => {
+            validate_conflict_target(conflict_target, &schema)?;
+
+            match action {
+                OnConflictAction::DoNothing => ConflictPlan::DoNothingPk,
+                OnConflictAction::DoUpdate(do_update) => {
+                    if do_update.selection.is_some() {
+                        return Err(GnitzSqlError::Unsupported(
+                            "ON CONFLICT ... DO UPDATE WHERE not supported in v1".to_string()
+                        ));
+                    }
+                    let assignments = bind_do_update_assignments(
+                        &do_update.assignments, &schema, binder,
+                    )?;
+                    ConflictPlan::DoUpdatePk { assignments }
+                }
+            }
+        }
+        Some(_) => {
+            return Err(GnitzSqlError::Unsupported(
+                "unsupported ON clause in INSERT".to_string()
+            ));
+        }
+    };
+
+    // Build the incoming batch from VALUES rows.
     let mut batch = ZSetBatch::new(&schema);
     let n = rows.len();
 
@@ -60,11 +155,229 @@ pub fn execute_insert(
         batch.nulls.push(null_bits);
     }
 
-    client.push(tid, &schema, &batch)?;
-    Ok(SqlResult::RowsAffected { count: n })
+    match plan {
+        ConflictPlan::Error => {
+            // SQL-standard INSERT: server rejects on any PK conflict.
+            client.push_with_mode(tid, &schema, &batch, WireConflictMode::Error)?;
+            Ok(SqlResult::RowsAffected { count: n })
+        }
+        ConflictPlan::DoNothingPk => {
+            // Client-side filter: drop any row whose PK already exists
+            // in the store. De-duplicate intra-batch (first-wins) before
+            // pushing.
+            let (filtered, surviving_count) =
+                client_side_filter_do_nothing(client, tid, &schema, &batch)?;
+            if surviving_count > 0 {
+                client.push_with_mode(tid, &schema, &filtered, WireConflictMode::Error)?;
+            }
+            Ok(SqlResult::RowsAffected { count: surviving_count })
+        }
+        ConflictPlan::DoUpdatePk { assignments } => {
+            let merged =
+                client_side_merge_do_update(client, tid, &schema, &batch, &assignments)?;
+            if !merged.pk_lo.is_empty() {
+                // Use Update mode: merged batch contains both +1 (new
+                // merged rows, which may UPSERT) and untouched +1 rows
+                // for non-conflicting inserts. Workers handle the
+                // retract-and-insert via enforce_unique_pk_partitioned.
+                client.push_with_mode(tid, &schema, &merged, WireConflictMode::Update)?;
+            }
+            Ok(SqlResult::RowsAffected { count: n })
+        }
+    }
 }
 
-fn extract_insert_parts(stmt: &Statement) -> Result<(String, &[Vec<Expr>]), GnitzSqlError> {
+/// Bind `col = expr` assignments for ON CONFLICT DO UPDATE. The
+/// incoming-row scope uses the pseudo-qualifier `EXCLUDED.<col>`; bare
+/// column names refer to the existing (stored) row.
+fn bind_do_update_assignments(
+    raw: &[Assignment],
+    schema: &Schema,
+    binder: &mut Binder<'_>,
+) -> Result<Vec<(usize, BoundUpdateExpr)>, GnitzSqlError> {
+    let mut out = Vec::with_capacity(raw.len());
+    for assignment in raw {
+        let col_name = extract_assignment_col_name(assignment)?;
+        let col_idx = schema.columns.iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+            .ok_or_else(|| GnitzSqlError::Bind(format!(
+                "column '{}' not found in ON CONFLICT DO UPDATE SET", col_name
+            )))?;
+        if col_idx == schema.pk_index {
+            return Err(GnitzSqlError::Unsupported(
+                "cannot assign to primary key column in ON CONFLICT DO UPDATE".to_string()
+            ));
+        }
+        // Recognize EXCLUDED.col as a special form. sqlparser parses it
+        // as a CompoundIdentifier: `EXCLUDED`.`col`.
+        let value = bind_do_update_rhs(&assignment.value, schema, binder)?;
+        out.push((col_idx, value));
+    }
+    Ok(out)
+}
+
+fn bind_do_update_rhs(
+    expr: &Expr,
+    schema: &Schema,
+    binder: &mut Binder<'_>,
+) -> Result<BoundUpdateExpr, GnitzSqlError> {
+    // `EXCLUDED.col` — sqlparser produces `CompoundIdentifier`.
+    if let Expr::CompoundIdentifier(parts) = expr {
+        if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED") {
+            let col_name = parts[1].value.as_str();
+            let col_idx = schema.columns.iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                .ok_or_else(|| GnitzSqlError::Bind(format!(
+                    "EXCLUDED.{}: column not found", col_name
+                )))?;
+            return Ok(BoundUpdateExpr::Excluded(BoundExpr::ColRef(col_idx)));
+        }
+    }
+    // Everything else binds against the existing-row scope. Bare
+    // column references, literals, and arithmetic like `val + 1` all
+    // route through the standard binder. `val + EXCLUDED.val` fails
+    // here because the binder has no EXCLUDED column.
+    let bound = binder.bind_expr(expr, schema)?;
+    Ok(BoundUpdateExpr::Existing(bound))
+}
+
+/// Drop incoming rows whose PK already exists in the store. Returns
+/// the filtered ZSetBatch plus the surviving-row count.
+///
+/// Intra-batch duplicate PKs keep only the first occurrence.
+fn client_side_filter_do_nothing(
+    client: &GnitzClient,
+    tid: u64,
+    schema: &Schema,
+    batch: &ZSetBatch,
+) -> Result<(ZSetBatch, usize), GnitzSqlError> {
+    let mut seen_pks: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut surviving_indices: Vec<usize> = Vec::with_capacity(batch.pk_lo.len());
+
+    for i in 0..batch.pk_lo.len() {
+        let pk = (batch.pk_lo[i], batch.pk_hi[i]);
+        // Intra-batch duplicate: drop everything after the first.
+        if !seen_pks.insert(pk) { continue; }
+        // Existing-store check.
+        let (_sch, found, _lsn) = client.seek(tid, pk.0, pk.1)?;
+        let exists = matches!(found, Some(b) if !b.pk_lo.is_empty());
+        if exists { continue; }
+        surviving_indices.push(i);
+    }
+
+    let mut out = ZSetBatch::new(schema);
+    for &i in &surviving_indices {
+        copy_batch_row(batch, i, &mut out, schema);
+    }
+    let n = surviving_indices.len();
+    Ok((out, n))
+}
+
+/// Build a merged batch for ON CONFLICT DO UPDATE:
+///   - For each incoming row whose PK exists in the store: evaluate
+///     assignments against (existing_row, excluded_row) and emit the
+///     merged row as +1 (worker's enforce_unique_pk_partitioned will
+///     retract the old payload).
+///   - For each incoming row whose PK does NOT exist: pass through as a
+///     plain +1 insert.
+///
+/// Intra-batch duplicate PKs are rejected — this matches PG's
+/// "command cannot affect row a second time" behavior.
+fn client_side_merge_do_update(
+    client: &GnitzClient,
+    tid: u64,
+    schema: &Schema,
+    batch: &ZSetBatch,
+    assignments: &[(usize, BoundUpdateExpr)],
+) -> Result<ZSetBatch, GnitzSqlError> {
+    // Pre-index assignments by column for O(cols) lookup per row.
+    let mut asn_by_col: Vec<Option<&BoundUpdateExpr>> = vec![None; schema.columns.len()];
+    for (ci, rhs) in assignments {
+        asn_by_col[*ci] = Some(rhs);
+    }
+
+    let mut seen_pks: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    let mut out = ZSetBatch::new(schema);
+
+    for i in 0..batch.pk_lo.len() {
+        let pk = (batch.pk_lo[i], batch.pk_hi[i]);
+        if !seen_pks.insert(pk) {
+            return Err(GnitzSqlError::Bind(
+                "ON CONFLICT DO UPDATE cannot affect row a second time \
+                 (duplicate PK in the same batch)".to_string()
+            ));
+        }
+
+        let (_sch, existing_opt, _lsn) = client.seek(tid, pk.0, pk.1)?;
+        let existing = existing_opt.filter(|b| !b.pk_lo.is_empty());
+
+        match existing {
+            None => {
+                copy_batch_row(batch, i, &mut out, schema);
+            }
+            Some(existing_batch) => {
+                out.pk_lo.push(pk.0);
+                out.pk_hi.push(pk.1);
+                out.weights.push(1);
+
+                // Start with the existing row's null bits; assignments
+                // that resolve to NULL will flip their bit below.
+                let mut null_bits: u64 = existing_batch.nulls[0];
+
+                for (ci, col_def) in schema.columns.iter().enumerate() {
+                    if ci == schema.pk_index { continue; }
+                    let payload_idx = if ci < schema.pk_index { ci } else { ci - 1 };
+
+                    if let Some(rhs) = asn_by_col[ci] {
+                        let cv = eval_do_update_rhs(
+                            rhs, &existing_batch, batch, i, schema,
+                        )?;
+                        if matches!(cv, ColumnValue::Null) {
+                            null_bits |= 1u64 << payload_idx;
+                        } else {
+                            null_bits &= !(1u64 << payload_idx);
+                        }
+                        append_column_value(&mut out.columns[ci], cv, col_def.type_code)?;
+                    } else {
+                        let stride = col_def.type_code.wire_stride();
+                        match (&existing_batch.columns[ci], &mut out.columns[ci]) {
+                            (ColData::Fixed(s), ColData::Fixed(d)) => {
+                                d.extend_from_slice(&s[0..stride]);
+                            }
+                            (ColData::Strings(s), ColData::Strings(d)) => {
+                                d.push(s[0].clone());
+                            }
+                            (ColData::U128s(s), ColData::U128s(d)) => {
+                                d.push(s[0]);
+                            }
+                            _ => unreachable!("mismatched ColData variants for column {}", ci),
+                        }
+                    }
+                }
+                out.nulls.push(null_bits);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn eval_do_update_rhs(
+    rhs: &BoundUpdateExpr,
+    existing: &ZSetBatch,
+    excluded: &ZSetBatch,
+    excluded_idx: usize,
+    schema: &Schema,
+) -> Result<ColumnValue, GnitzSqlError> {
+    match rhs {
+        BoundUpdateExpr::Existing(expr) => eval_set_expr(expr, existing, 0, schema),
+        BoundUpdateExpr::Excluded(expr) => eval_set_expr(expr, excluded, excluded_idx, schema),
+    }
+}
+
+
+fn extract_insert_parts(
+    stmt: &Statement,
+) -> Result<(String, &[Vec<Expr>], Option<&OnInsert>), GnitzSqlError> {
     match stmt {
         Statement::Insert(insert) => {
             let table_name = match &insert.table {
@@ -76,7 +389,7 @@ fn extract_insert_parts(stmt: &Statement) -> Result<(String, &[Vec<Expr>]), Gnit
                 .ok_or_else(|| GnitzSqlError::Unsupported("INSERT without VALUES not supported".to_string()))?;
 
             let rows = extract_values_rows(source)?;
-            Ok((table_name, rows))
+            Ok((table_name, rows, insert.on.as_ref()))
         }
         _ => Err(GnitzSqlError::Bind("not an INSERT statement".to_string())),
     }
@@ -745,7 +1058,7 @@ pub fn execute_update(
             let actual_schema = schema_opt.as_ref().unwrap_or(&schema);
             let mut new_batch = ZSetBatch::new(actual_schema);
             write_set_columns(&current, 0, &assignments, actual_schema, &mut new_batch)?;
-            client.push(table_id, actual_schema, &new_batch)?;
+            client.push_with_mode(table_id, actual_schema, &new_batch, WireConflictMode::Update)?;
             return Ok(SqlResult::RowsAffected { count: 1 });
         }
 
@@ -768,7 +1081,7 @@ pub fn execute_update(
             }
             let mut new_batch = ZSetBatch::new(actual_schema);
             write_set_columns(&current, 0, &assignments, actual_schema, &mut new_batch)?;
-            client.push(table_id, actual_schema, &new_batch)?;
+            client.push_with_mode(table_id, actual_schema, &new_batch, WireConflictMode::Update)?;
             return Ok(SqlResult::RowsAffected { count: 1 });
         }
 
@@ -784,7 +1097,9 @@ pub fn execute_update(
                 write_set_columns(scan_batch, i, &assignments, actual_schema, &mut updates)?;
                 count += 1;
             }
-            if count > 0 { client.push(table_id, actual_schema, &updates)?; }
+            if count > 0 {
+                client.push_with_mode(table_id, actual_schema, &updates, WireConflictMode::Update)?;
+            }
         }
         return Ok(SqlResult::RowsAffected { count });
     }
@@ -800,7 +1115,9 @@ pub fn execute_update(
             for i in 0..n {
                 write_set_columns(scan_batch, i, &assignments, actual_schema, &mut updates)?;
             }
-            if n > 0 { client.push(table_id, actual_schema, &updates)?; }
+            if n > 0 {
+                client.push_with_mode(table_id, actual_schema, &updates, WireConflictMode::Update)?;
+            }
             Ok(SqlResult::RowsAffected { count: n })
         }
     }

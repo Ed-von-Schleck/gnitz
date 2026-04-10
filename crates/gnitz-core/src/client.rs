@@ -1,4 +1,4 @@
-use gnitz_protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender};
+use gnitz_protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender, WireConflictMode};
 use crate::connection::{Connection, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB};
 use crate::error::ClientError;
 use crate::types::{
@@ -145,6 +145,17 @@ impl GnitzClient {
 
     pub fn push(&self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
         self.conn.push(table_id, schema, batch)
+    }
+
+    /// Push with an explicit `WireConflictMode`. SQL `INSERT` uses
+    /// `Error` to get SQL-standard rejection semantics; all other
+    /// callers pass `Update` (or use the plain `push` which defaults
+    /// to `Update` for backward compatibility).
+    pub fn push_with_mode(
+        &self, table_id: u64, schema: &Schema, batch: &ZSetBatch,
+        mode: WireConflictMode,
+    ) -> Result<u64, ClientError> {
+        self.conn.push_with_mode(table_id, schema, batch, mode)
     }
 
     pub fn scan(&self, table_id: u64) -> Result<(Option<Schema>, Option<ZSetBatch>, u64), ClientError> {

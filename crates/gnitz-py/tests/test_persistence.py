@@ -620,9 +620,10 @@ def test_no_phantom_data_after_crash():
 
         tid2, _ = conn.resolve_table("dur", "t")
 
-        # Re-insert same PKs with different values (upsert semantics)
+        # Re-insert same PKs with different values via explicit UPSERT
         conn.execute_sql(
-            "INSERT INTO t VALUES (1, 111), (2, 222)",
+            "INSERT INTO t VALUES (1, 111), (2, 222) "
+            "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
             schema_name="dur",
         )
         rows = {r["pk"]: r["val"] for r in conn.scan(tid2) if r.weight > 0}

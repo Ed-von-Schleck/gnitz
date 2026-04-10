@@ -95,7 +95,10 @@ fn recover_from_sal(
             if let Some(batch) = decoded.data_batch {
                 let owned = *batch;
                 if owned.count > 0 {
-                    let _ = catalog.raw_store_ingest(tid, owned);
+                    // Use the unique_pk-aware replay path so retractions
+                    // correctly cancel existing rows instead of being
+                    // added as orphaned (pk, zero-payload, -1) entries.
+                    let _ = catalog.replay_ingest(tid, owned);
                     replayed += 1;
                 }
             }

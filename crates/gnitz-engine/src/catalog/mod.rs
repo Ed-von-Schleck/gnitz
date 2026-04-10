@@ -2129,7 +2129,9 @@ impl CatalogEngine {
     /// dedup).  Used by multi-worker push where the worker needs the effective
     /// batch for later DAG evaluation but does NOT evaluate immediately.
     /// System tables are NOT supported (use `ingest_to_family` for those).
-    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: OwnedBatch) -> Result<OwnedBatch, String> {
+    pub fn ingest_returning_effective(
+        &mut self, table_id: i64, batch: OwnedBatch,
+    ) -> Result<OwnedBatch, String> {
         if table_id < FIRST_USER_TABLE_ID {
             return Err("ingest_returning_effective not supported for system tables".to_string());
         }
@@ -2351,6 +2353,29 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// SAL recovery replay — unique_pk-aware. Routes user-table batches
+    /// through the full `ingest_returning_effective` path so that
+    /// retractions (which carry zero-padded payloads on the wire) are
+    /// resolved against the actual stored payload instead of being
+    /// added as orphaned rows. The retract-and-insert pattern in
+    /// `enforce_unique_pk_partitioned` makes the replay idempotent
+    /// w.r.t. already-flushed data.
+    ///
+    /// Index shards see duplicate `(+1, -1)` projections when a batch
+    /// is replayed after already having been flushed. These consolidate
+    /// to zero on read and are pruned at the next compaction.
+    pub fn replay_ingest(&mut self, table_id: i64, batch: OwnedBatch) -> Result<(), String> {
+        if table_id < FIRST_USER_TABLE_ID {
+            // System tables: use raw ingest (no unique_pk semantics).
+            return self.raw_store_ingest(table_id, batch);
+        }
+        let (rc, _effective) = self.dag.ingest_returning_effective(table_id, batch);
+        if rc < 0 {
+            return Err(format!("replay_ingest failed for table_id={} rc={}", table_id, rc));
+        }
+        Ok(())
+    }
+
     // -- Partition management (for multi-worker fork) -------------------------
 
     /// Set active partition range for user tables.
@@ -2454,6 +2479,15 @@ impl CatalogEngine {
     pub fn has_any_unique_index(&self, table_id: i64) -> bool {
         self.dag.tables.get(&table_id)
             .map(|e| e.index_circuits.iter().any(|ic| ic.is_unique))
+            .unwrap_or(false)
+    }
+
+    /// True if the table was created with `unique_pk=true`. Used by the
+    /// distributed validator to decide whether Error-mode inserts need
+    /// an against-store PK rejection broadcast.
+    pub fn table_has_unique_pk(&self, table_id: i64) -> bool {
+        self.dag.tables.get(&table_id)
+            .map(|e| e.unique_pk)
             .unwrap_or(false)
     }
 

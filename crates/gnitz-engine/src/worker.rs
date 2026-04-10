@@ -462,7 +462,9 @@ impl WorkerProcess {
         }
     }
 
-    fn handle_push(&mut self, target_id: i64, batch: OwnedBatch) -> Result<(), String> {
+    fn handle_push(
+        &mut self, target_id: i64, batch: OwnedBatch,
+    ) -> Result<(), String> {
         // Filter to only rows belonging to this worker's partitions.
         let batch = self.filter_my_partition(batch);
         if batch.count == 0 {

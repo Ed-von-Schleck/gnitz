@@ -3,6 +3,7 @@ use gnitz_protocol::{
     Message, Schema, ZSetBatch,
     STATUS_ERROR, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID,
+    FLAG_CONFLICT_MODE_PRESENT, WireConflictMode,
     send_message, recv_message,
     connect as proto_connect, close_fd,
 };
@@ -52,13 +53,25 @@ impl Connection {
         Ok(msg.target_id)
     }
 
+    /// Default push: silent-upsert (`WireConflictMode::Update`).
+    /// Callers that need SQL-standard rejection use `push_with_mode`.
     pub fn push(
         &self,
         target_id: u64,
         schema:    &Schema,
         batch:     &ZSetBatch,
     ) -> Result<u64, ClientError> {
-        let msg = self.roundtrip(target_id, 0, Some(schema), Some(batch))?;
+        self.push_with_mode(target_id, schema, batch, WireConflictMode::Update)
+    }
+
+    pub fn push_with_mode(
+        &self,
+        target_id: u64,
+        schema:    &Schema,
+        batch:     &ZSetBatch,
+        mode:      WireConflictMode,
+    ) -> Result<u64, ClientError> {
+        let msg = self.roundtrip_push(target_id, schema, batch, mode)?;
         Ok(msg.seek_pk_lo)
     }
 
@@ -99,6 +112,27 @@ impl Connection {
         data:      Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
         send_message(self.sock_fd, target_id, self.client_id, flags, 0, 0, 0, schema, data)?;
+        let msg = recv_message(self.sock_fd, None)?;
+        check_response(msg)
+    }
+
+    /// Push path: encodes the requested `WireConflictMode` into the
+    /// control block by setting `FLAG_CONFLICT_MODE_PRESENT` and
+    /// packing the mode byte into the low byte of `seek_col_idx`.
+    fn roundtrip_push(
+        &self,
+        target_id: u64,
+        schema:    &Schema,
+        batch:     &ZSetBatch,
+        mode:      WireConflictMode,
+    ) -> Result<Message, ClientError> {
+        let flags = FLAG_CONFLICT_MODE_PRESENT;
+        let seek_col_idx = mode.as_u8() as u64;
+        send_message(
+            self.sock_fd, target_id, self.client_id, flags,
+            0, 0, seek_col_idx,
+            Some(schema), Some(batch),
+        )?;
         let msg = recv_message(self.sock_fd, None)?;
         check_response(msg)
     }

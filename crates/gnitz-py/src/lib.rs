@@ -1066,13 +1066,28 @@ impl PyGnitzClient {
 
     // ----- DML -----
 
-    /// push(target_id, batch) -> ingest_lsn: int
+    /// push(target_id, batch, conflict_mode="update") -> ingest_lsn: int
+    ///
+    /// `conflict_mode` controls how PK conflicts are handled:
+    ///   - "update" (default): retract-and-insert on PK conflict,
+    ///     suitable for DBSP z-set retraction patterns.
+    ///   - "error": reject the batch with a SQL-standard
+    ///     `duplicate key value violates unique constraint` error.
+    #[pyo3(signature = (target_id, batch, conflict_mode=None))]
     pub fn push(
         &self, _py: Python<'_>,
         target_id: u64,
         batch: PyRef<'_, PyZSetBatch>,
+        conflict_mode: Option<&str>,
     ) -> PyResult<u64> {
-        client!(self).push(target_id, &batch.schema, &batch.batch)
+        let mode = match conflict_mode {
+            None | Some("update") => gnitz_core::WireConflictMode::Update,
+            Some("error") => gnitz_core::WireConflictMode::Error,
+            Some(other) => return Err(GnitzError::new_err(format!(
+                "invalid conflict_mode '{}': expected 'update' or 'error'", other
+            ))),
+        };
+        client!(self).push_with_mode(target_id, &batch.schema, &batch.batch, mode)
             .map_err(|e| GnitzError::new_err(e.to_string()))
     }
 

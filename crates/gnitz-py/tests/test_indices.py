@@ -514,8 +514,12 @@ class TestIndexIntegrity:
             )
             client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
             client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
-            # Re-insert same PK with same value — UPSERT, not a violation
-            client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
+            # Re-insert same PK with same value via explicit UPSERT
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 42) "
+                "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
+                schema_name=sn,
+            )
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -532,7 +536,11 @@ class TestIndexIntegrity:
             )
             client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
             client.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name=sn)
-            client.execute_sql("INSERT INTO t VALUES (1, 99)", schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 99) "
+                "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
+                schema_name=sn,
+            )
             # Verify final state
             tid, _ = client.resolve_table(sn, "t")
             result = client.scan(tid)

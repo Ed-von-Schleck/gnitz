@@ -155,8 +155,8 @@ def test_seek_by_index_broadcast(client):
 @_NEEDS_MULTI
 def test_unique_pk_across_workers(client):
     """
-    unique_pk UPSERT semantics work correctly across workers:
-    a second insert with the same PK replaces the first row.
+    SQL-standard ON CONFLICT DO UPDATE works correctly across workers:
+    re-inserting the same PK via explicit UPSERT replaces the row.
     Scan must return exactly 1 row with the updated value.
     """
     sn = "w" + _uid()
@@ -167,7 +167,11 @@ def test_unique_pk_across_workers(client):
             schema_name=sn,
         )
         client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
-        client.execute_sql("INSERT INTO t VALUES (1, 200)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO t VALUES (1, 200) "
+            "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
+            schema_name=sn,
+        )
 
         tid, _ = client.resolve_table(sn, "t")
         result = client.scan(tid)
@@ -356,7 +360,7 @@ def test_workers_multiple_views_same_table(client):
 
 @_NEEDS_MULTI
 def test_workers_upsert(client):
-    """Push PK=1 val=10, then PK=1 val=99 (upsert); scan → one row with val=99."""
+    """Insert PK=1 val=10, then UPSERT PK=1 val=99; scan → one row with val=99."""
     sn = "w" + _uid()
     client.create_schema(sn)
     try:
@@ -365,7 +369,11 @@ def test_workers_upsert(client):
             schema_name=sn,
         )
         client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        client.execute_sql("INSERT INTO t VALUES (1, 99)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO t VALUES (1, 99) "
+            "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
+            schema_name=sn,
+        )
 
         tid, _ = client.resolve_table(sn, "t")
         rows = [r for r in client.scan(tid) if r.weight > 0]
