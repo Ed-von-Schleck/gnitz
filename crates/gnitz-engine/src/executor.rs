@@ -205,10 +205,8 @@ impl ServerExecutor {
         if target_id >= FIRST_USER_TABLE_ID {
             if let Some(batch) = in_batch {
                 if batch.count > 0 {
-                    self.disp().validate_fk_distributed(target_id, &batch)?;
-                    self.disp().validate_fk_parent_restrict_distributed(target_id, &batch)?;
                     self.cat().validate_unique_indices(target_id, &batch)?;
-                    self.disp().validate_unique_distributed(target_id, &batch)?;
+                    self.disp().validate_all_distributed(target_id, &batch)?;
                     self.disp().fan_out_push(target_id, &batch)?;
                     return Ok((None, 0));
                 }
@@ -953,15 +951,10 @@ impl ServerExecutor {
             }
 
             let batch = decoded.data_batch.unwrap();
-            {
-                let disp = self.disp();
-                disp.validate_fk_distributed(target_id, &batch)?;
-                disp.validate_fk_parent_restrict_distributed(target_id, &batch)?;
-            }
             self.cat().validate_unique_indices(target_id, &batch)?;
             {
                 let disp = self.disp();
-                disp.validate_unique_distributed(target_id, &batch)?;
+                disp.validate_all_distributed(target_id, &batch)?;
             }
             pending.add(fd, client_id, target_id, *batch);
             if self.t_first_pending.is_none() {

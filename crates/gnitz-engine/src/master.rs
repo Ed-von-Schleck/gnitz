@@ -91,6 +91,57 @@ struct PendingRelay {
 }
 
 // ---------------------------------------------------------------------------
+// Pipelined validation checks
+// ---------------------------------------------------------------------------
+
+/// How the check payload is routed to workers.
+enum CheckPayload {
+    /// Replicate the same batch to every worker; each worker filters
+    /// its local partition.
+    Broadcast(OwnedBatch),
+    /// Per-worker sub-batches (caller has already routed by key).
+    Partitioned(Vec<OwnedBatch>),
+}
+
+/// A single distributed has-pk check queued for pipelined execution.
+/// `flags` is typically FLAG_HAS_PK; `col_hint` is (source_col_idx + 1)
+/// for an index check or 0 for a PK check.
+struct PipelinedCheck {
+    target_id: i64,
+    flags: u32,
+    col_hint: u64,
+    payload: CheckPayload,
+    schema: SchemaDescriptor,
+}
+
+/// Side table for interpreting Phase 1 results in `validate_all_distributed`.
+/// Each label lines up positionally with a `PipelinedCheck` submitted to
+/// the Phase 1 pipeline.
+enum P1Label {
+    /// FK parent existence. `expected_count` is the number of distinct
+    /// non-null parent keys; anything less in the result set is a violation.
+    FkParent { parent_table_id: i64, expected_count: usize },
+    /// FK child restrict: a non-empty result set is a violation.
+    FkRestrict { child_tid: i64 },
+    /// UPSERT PK identification; the result set is captured as the
+    /// `existing_pks` feeding Phase 2 planning.
+    UpsertPkId,
+}
+
+/// Side table for interpreting Phase 2 results (unique-index checks).
+enum P2Label {
+    /// Non-UPSERT values for one unique index: any hit is a violation.
+    NonUpsert { source_col: usize },
+    /// UPSERT values for one unique index: hits must be verified via
+    /// `fan_out_seek_by_index` to confirm the holder is the same row.
+    Upsert {
+        col_idx: u32,
+        source_col: usize,
+        upsert_keys: Vec<(u64, u64, u128)>,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // MasterDispatcher
 // ---------------------------------------------------------------------------
 
@@ -704,90 +755,6 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    pub fn check_pk_exists_broadcast(
-        &mut self, owner_table_id: i64, source_col_idx: u32, check_batch: &OwnedBatch,
-    ) -> Result<bool, String> {
-        self.maybe_checkpoint()?;
-        let schema = check_batch.schema
-            .ok_or_else(|| "check_pk_exists_broadcast: batch has no schema".to_string())?;
-        let col_hint = (source_col_idx + 1) as u64;
-        self.write_broadcast(owner_table_id, FLAG_HAS_PK, Some(check_batch), &schema,
-                            &[], 0, 0, col_hint)?;
-        self.signal_all();
-
-        let results = self.wait_all_workers()?;
-        for decoded_opt in &results {
-            if let Some(decoded) = decoded_opt {
-                if let Some(ref batch) = decoded.data_batch {
-                    for j in 0..batch.count {
-                        if batch.get_weight(j) == 1 {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    // Like check_pk_exists_broadcast but returns the full set of keys found, so
-    // the caller can distinguish which specific keys are occupied.
-    fn check_index_keys(
-        &mut self, owner_table_id: i64, source_col_idx: u32, check_batch: &OwnedBatch,
-    ) -> Result<HashSet<u128>, String> {
-        self.maybe_checkpoint()?;
-        let schema = check_batch.schema
-            .ok_or_else(|| "check_index_keys: batch has no schema".to_string())?;
-        let col_hint = (source_col_idx + 1) as u64;
-        self.write_broadcast(owner_table_id, FLAG_HAS_PK, Some(check_batch), &schema,
-                            &[], 0, 0, col_hint)?;
-        self.signal_all();
-
-        let results = self.wait_all_workers()?;
-        let mut occupied: HashSet<u128> = HashSet::new();
-        for decoded_opt in &results {
-            if let Some(decoded) = decoded_opt {
-                if let Some(ref batch) = decoded.data_batch {
-                    for j in 0..batch.count {
-                        if batch.get_weight(j) == 1 {
-                            occupied.insert(batch.get_pk(j));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(occupied)
-    }
-
-    fn check_pk_existence(
-        &mut self, target_id: i64, check_batch: &OwnedBatch,
-    ) -> Result<HashSet<u128>, String> {
-        self.maybe_checkpoint()?;
-        let schema = check_batch.schema
-            .ok_or_else(|| "check_pk_existence: batch has no schema".to_string())?;
-        let pk_col = &[schema.pk_index];
-        let sub_batches = op_repartition_batch(check_batch, pk_col, &schema, self.num_workers);
-        let refs: Vec<Option<&OwnedBatch>> = sub_batches.iter()
-            .map(|b| if b.count > 0 { Some(b) } else { None })
-            .collect();
-        self.send_to_workers(target_id, FLAG_HAS_PK, &refs, &schema, &[], 0, 0, 0)?;
-
-        let results = self.wait_all_workers()?;
-        let mut existing: HashSet<u128> = HashSet::new();
-        for decoded_opt in &results {
-            if let Some(decoded) = decoded_opt {
-                if let Some(ref batch) = decoded.data_batch {
-                    for j in 0..batch.count {
-                        if batch.get_weight(j) == 1 {
-                            existing.insert(batch.get_pk(j));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(existing)
-    }
-
     // -----------------------------------------------------------------------
     // Async tick API
     // -----------------------------------------------------------------------
@@ -891,60 +858,336 @@ impl MasterDispatcher {
     }
 
     // -----------------------------------------------------------------------
-    // Unique index validation (moved from executor.py)
+    // Pipelined distributed validation
     // -----------------------------------------------------------------------
+    //
+    // A user INSERT may trigger up to O(N) distributed has-pk checks
+    // (one per FK constraint, one per FK child with restrict deletes,
+    // one for UPSERT PK identification, plus one or two per unique
+    // secondary index). Running them sequentially costs N master↔worker
+    // round trips. `execute_pipeline` writes the whole burst into SAL,
+    // signals once, then collects N responses per worker in a single
+    // poll loop — cursor position on the W2M ring correlates each
+    // response with its originating check, so no explicit correlation
+    // ID is needed. `validate_all_distributed` composes the bursts into
+    // at most 2 rounds: Phase 1 is fully independent; Phase 2 depends
+    // on Phase 1's UPSERT-identification result.
 
-    pub fn validate_unique_distributed(
-        &mut self, target_id: i64, batch: &OwnedBatch,
-    ) -> Result<(), String> {
-        let cat = unsafe { &mut *self.catalog };
-        let n_circuits = cat.get_index_circuit_count(target_id);
-        if n_circuits == 0 { return Ok(()); }
+    /// Submit `checks` as a single pipelined burst; return per-check
+    /// aggregated result sets (union of PKs returned with weight=1 across
+    /// all workers). Drains all responses before returning even on error
+    /// to keep W2M cursors consistent for the next IPC round.
+    fn execute_pipeline(
+        &mut self, checks: &[PipelinedCheck],
+    ) -> Result<Vec<HashSet<u128>>, String> {
+        let num_checks = checks.len();
+        if num_checks == 0 {
+            return Ok(Vec::new());
+        }
 
-        let mut has_unique = false;
-        for ci in 0..n_circuits {
-            if let Some((_col_idx, is_unique, _tc)) = cat.get_index_circuit_info(target_id, ci) {
-                if is_unique { has_unique = true; break; }
+        // Reserve SAL capacity for the whole burst up front.
+        self.maybe_checkpoint()?;
+
+        // Write all SAL messages back-to-back (no signal between them).
+        for check in checks {
+            match &check.payload {
+                CheckPayload::Broadcast(batch) => {
+                    self.write_broadcast(
+                        check.target_id, check.flags, Some(batch),
+                        &check.schema, &[], 0, 0, check.col_hint,
+                    )?;
+                }
+                CheckPayload::Partitioned(batches) => {
+                    let refs: Vec<Option<&OwnedBatch>> = batches.iter()
+                        .map(|b| if b.count > 0 { Some(b) } else { None })
+                        .collect();
+                    self.write_group(
+                        check.target_id, check.flags, &refs,
+                        &check.schema, &[], 0, 0, check.col_hint, -1,
+                    )?;
+                }
             }
         }
-        if !has_unique { return Ok(()); }
 
-        let source_schema = cat.get_schema_desc(target_id)
-            .ok_or_else(|| format!("no schema for target_id={}", target_id))?;
-        let n = batch.count;
+        // One signal for the whole burst.
+        self.signal_all();
 
-        // Find which PKs already exist so we can skip UPSERT rows
-        let mut pk_lo_list: Vec<u64> = Vec::new();
-        let mut pk_hi_list: Vec<u64> = Vec::new();
-        for i in 0..n {
-            if batch.get_weight(i) <= 0 { continue; }
-            let pk = batch.get_pk(i);
-            let (lo, hi) = crate::util::split_pk(pk);
-            pk_lo_list.push(lo);
-            pk_hi_list.push(hi);
+        // Drain num_checks * num_workers responses. Workers process SAL
+        // messages in submission order, so the k-th response from worker
+        // w belongs to check[k].
+        let nw = self.num_workers;
+        let mut results: Vec<HashSet<u128>> = (0..num_checks).map(|_| HashSet::new()).collect();
+        let mut responses_collected = vec![0usize; nw];
+        let mut w2m_rcs = vec![W2M_HEADER_SIZE as u64; nw];
+        let mut total_remaining = nw * num_checks;
+        let mut first_error: Option<String> = None;
+
+        while total_remaining > 0 {
+            self.w2m.poll(1000);
+            for w in 0..nw {
+                while responses_collected[w] < num_checks {
+                    let (decoded, new_rc) = match self.w2m.try_read(w, w2m_rcs[w]) {
+                        Some(x) => x,
+                        None => break,
+                    };
+                    w2m_rcs[w] = new_rc;
+                    let check_idx = responses_collected[w];
+                    responses_collected[w] += 1;
+                    total_remaining -= 1;
+
+                    if decoded.control.status != 0 {
+                        if first_error.is_none() {
+                            let msg = String::from_utf8_lossy(&decoded.control.error_msg);
+                            first_error = Some(format!("worker {}: {}", w, msg));
+                        }
+                        continue;
+                    }
+
+                    if let Some(ref batch) = decoded.data_batch {
+                        for j in 0..batch.count {
+                            if batch.get_weight(j) == 1 {
+                                results[check_idx].insert(batch.get_pk(j));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        let existing_pks = if !pk_lo_list.is_empty() {
-            self.check_pk_existence(target_id, &build_check_batch(&source_schema, &pk_lo_list, &pk_hi_list))?
-        } else {
-            HashSet::new()
+        self.reset_w2m_cursors();
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        Ok(results)
+    }
+
+    /// Run all distributed validation for a user-table DML batch in at
+    /// most two pipelined rounds. Phase 1 issues the independent checks
+    /// (FK parent existence, FK child restrict, UPSERT PK identification).
+    /// Phase 2 issues the unique-index checks, which depend on the
+    /// UPSERT set from Phase 1.
+    pub fn validate_all_distributed(
+        &mut self, target_id: i64, batch: &OwnedBatch,
+    ) -> Result<(), String> {
+        // Snapshot catalog metadata up front.
+        let (n_fk, n_children, n_circuits, has_unique, source_schema) = {
+            let cat = unsafe { &mut *self.catalog };
+            let n_fk = cat.get_fk_count(target_id);
+            let n_children = cat.get_fk_children_count(target_id);
+            let n_circuits = cat.get_index_circuit_count(target_id);
+            let has_unique = cat.has_any_unique_index(target_id);
+            let source_schema = cat.get_schema_desc(target_id)
+                .ok_or_else(|| format!(
+                    "validate_all_distributed: no schema for table {}", target_id))?;
+            (n_fk, n_children, n_circuits, has_unique, source_schema)
         };
 
-        let cat = unsafe { &mut *self.catalog };
-        for ci in 0..n_circuits {
-            let (col_idx, is_unique, type_code) = match cat.get_index_circuit_info(target_id, ci) {
-                Some(info) => info,
-                None => continue,
-            };
-            if !is_unique { continue; }
+        if n_fk == 0 && n_children == 0 && !has_unique {
+            return Ok(());
+        }
 
-            let idx_schema = match cat.get_index_circuit_schema(target_id, ci) {
-                Some(s) => s,
-                None => continue,
+        let pki = source_schema.pk_index as usize;
+
+        // ----- Phase 1 plan -----------------------------------------------
+        let mut p1_checks: Vec<PipelinedCheck> = Vec::new();
+        let mut p1_labels: Vec<P1Label> = Vec::new();
+
+        // FK parent existence (one per constraint with non-null referrers)
+        for fi in 0..n_fk {
+            let (fk_col_idx, parent_table_id, col_type, parent_schema) = {
+                let cat = unsafe { &mut *self.catalog };
+                let (fk_col_idx, parent_table_id) = match cat.get_fk_constraint(target_id, fi) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let col_type = cat.get_fk_col_type(target_id, fk_col_idx);
+                let parent_schema = cat.get_schema_desc(parent_table_id)
+                    .ok_or_else(|| format!(
+                        "FK parent table {} schema not found", parent_table_id))?;
+                (fk_col_idx, parent_table_id, col_type, parent_schema)
+            };
+
+            let payload_col = if fk_col_idx < pki { fk_col_idx } else { fk_col_idx - 1 };
+            let col_size = source_schema.columns[fk_col_idx].size as usize;
+
+            let mut seen: HashSet<u128> = HashSet::new();
+            let mut lo_list: Vec<u64> = Vec::new();
+            let mut hi_list: Vec<u64> = Vec::new();
+
+            for i in 0..batch.count {
+                if batch.get_weight(i) <= 0 { continue; }
+                let null_word = batch.get_null_word(i);
+                if null_word & (1u64 << payload_col) != 0 { continue; }
+
+                let col_data = batch.col_data(payload_col);
+                let (fk_lo, fk_hi) = promote_to_index_key(
+                    col_data, i * col_size, col_size, col_type);
+                let fk_key = crate::util::make_pk(fk_lo, fk_hi);
+                if seen.insert(fk_key) {
+                    lo_list.push(fk_lo);
+                    hi_list.push(fk_hi);
+                }
+            }
+
+            if lo_list.is_empty() { continue; }
+
+            let expected_count = lo_list.len();
+            let check_batch = build_check_batch(&parent_schema, &lo_list, &hi_list);
+            let pk_col = &[parent_schema.pk_index];
+            let sub_batches = op_repartition_batch(
+                &check_batch, pk_col, &parent_schema, self.num_workers);
+
+            p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
+            p1_checks.push(PipelinedCheck {
+                target_id: parent_table_id,
+                flags: FLAG_HAS_PK,
+                col_hint: 0,
+                payload: CheckPayload::Partitioned(sub_batches),
+                schema: parent_schema,
+            });
+        }
+
+        // FK child restrict (one per child, DELETE side). Shared PK list.
+        if n_children > 0 {
+            let mut neg_pks: HashSet<u128> = HashSet::new();
+            for i in 0..batch.count {
+                if batch.get_weight(i) < 0 {
+                    neg_pks.insert(batch.get_pk(i));
+                }
+            }
+            // UPSERT handling: drop PKs that also appear with positive weight
+            // (retract + insert = UPDATE, not DELETE).
+            for i in 0..batch.count {
+                if batch.get_weight(i) > 0 {
+                    neg_pks.remove(&batch.get_pk(i));
+                }
+            }
+
+            if !neg_pks.is_empty() {
+                let mut lo_list: Vec<u64> = Vec::with_capacity(neg_pks.len());
+                let mut hi_list: Vec<u64> = Vec::with_capacity(neg_pks.len());
+                for &pk in &neg_pks {
+                    let (lo, hi) = crate::util::split_pk(pk);
+                    lo_list.push(lo);
+                    hi_list.push(hi);
+                }
+
+                for ci in 0..n_children {
+                    let (child_tid, fk_col_idx, idx_schema) = {
+                        let cat = unsafe { &mut *self.catalog };
+                        let (child_tid, fk_col_idx) = match cat.get_fk_child_info(target_id, ci) {
+                            Some(info) => info,
+                            None => continue,
+                        };
+                        let idx_schema = cat.get_index_schema_by_col(child_tid, fk_col_idx as u32)
+                            .ok_or_else(|| format!(
+                                "FK RESTRICT check failed: no index on child table {} col {}",
+                                child_tid, fk_col_idx,
+                            ))?;
+                        (child_tid, fk_col_idx, idx_schema)
+                    };
+
+                    let check_batch = build_check_batch(&idx_schema, &lo_list, &hi_list);
+                    p1_labels.push(P1Label::FkRestrict { child_tid });
+                    p1_checks.push(PipelinedCheck {
+                        target_id: child_tid,
+                        flags: FLAG_HAS_PK,
+                        col_hint: (fk_col_idx as u64) + 1,
+                        payload: CheckPayload::Broadcast(check_batch),
+                        schema: idx_schema,
+                    });
+                }
+            }
+        }
+
+        // UPSERT PK identification — only relevant when Phase 2 (unique
+        // indices) will run.
+        if has_unique {
+            let mut lo_list: Vec<u64> = Vec::new();
+            let mut hi_list: Vec<u64> = Vec::new();
+            for i in 0..batch.count {
+                if batch.get_weight(i) <= 0 { continue; }
+                let pk = batch.get_pk(i);
+                let (lo, hi) = crate::util::split_pk(pk);
+                lo_list.push(lo);
+                hi_list.push(hi);
+            }
+
+            if !lo_list.is_empty() {
+                let check_batch = build_check_batch(&source_schema, &lo_list, &hi_list);
+                let pk_col = &[source_schema.pk_index];
+                let sub_batches = op_repartition_batch(
+                    &check_batch, pk_col, &source_schema, self.num_workers);
+                p1_labels.push(P1Label::UpsertPkId);
+                p1_checks.push(PipelinedCheck {
+                    target_id,
+                    flags: FLAG_HAS_PK,
+                    col_hint: 0,
+                    payload: CheckPayload::Partitioned(sub_batches),
+                    schema: source_schema,
+                });
+            }
+        }
+
+        // ----- Phase 1 execute + interpret --------------------------------
+        let mut existing_pks: HashSet<u128> = HashSet::new();
+        if !p1_checks.is_empty() {
+            let mut p1_results = self.execute_pipeline(&p1_checks)?;
+
+            for (idx, label) in p1_labels.iter().enumerate() {
+                match label {
+                    P1Label::FkParent { parent_table_id, expected_count } => {
+                        if p1_results[idx].len() < *expected_count {
+                            let (sn, tn) = self.get_qualified_name_owned(target_id);
+                            let (tsn, ttn) = self.get_qualified_name_owned(*parent_table_id);
+                            return Err(format!(
+                                "Foreign Key violation in '{}.{}': value not found in target '{}.{}'",
+                                sn, tn, tsn, ttn
+                            ));
+                        }
+                    }
+                    P1Label::FkRestrict { child_tid } => {
+                        if !p1_results[idx].is_empty() {
+                            let (sn, tn) = self.get_qualified_name_owned(target_id);
+                            let (csn, ctn) = self.get_qualified_name_owned(*child_tid);
+                            return Err(format!(
+                                "Foreign Key violation: cannot delete from '{}.{}', row still referenced by '{}.{}'",
+                                sn, tn, csn, ctn,
+                            ));
+                        }
+                    }
+                    P1Label::UpsertPkId => {
+                        existing_pks = std::mem::take(&mut p1_results[idx]);
+                    }
+                }
+            }
+        }
+
+        // ----- Phase 2 plan (unique index checks) -------------------------
+        if !has_unique {
+            return Ok(());
+        }
+
+        let mut p2_checks: Vec<PipelinedCheck> = Vec::new();
+        let mut p2_labels: Vec<P2Label> = Vec::new();
+
+        for ci in 0..n_circuits {
+            let (col_idx, type_code, idx_schema) = {
+                let cat = unsafe { &mut *self.catalog };
+                let (col_idx, is_unique, type_code) = match cat.get_index_circuit_info(target_id, ci) {
+                    Some(info) => info,
+                    None => continue,
+                };
+                if !is_unique { continue; }
+                let idx_schema = match cat.get_index_circuit_schema(target_id, ci) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                (col_idx, type_code, idx_schema)
             };
 
             let source_col = col_idx as usize;
-            let pki = source_schema.pk_index as usize;
             let is_pk_col = source_col == pki;
             let src_payload_idx = if is_pk_col {
                 usize::MAX
@@ -955,13 +1198,12 @@ impl MasterDispatcher {
             };
             let col_size = source_schema.columns[source_col].size as usize;
 
-            // (key_lo, key_hi, pk: u128) — deferred for batch verification below.
             let mut upsert_keys: Vec<(u64, u64, u128)> = Vec::new();
             let mut check_lo: Vec<u64> = Vec::new();
             let mut check_hi: Vec<u64> = Vec::new();
             let mut seen: HashSet<u128> = HashSet::new();
 
-            for i in 0..n {
+            for i in 0..batch.count {
                 if batch.get_weight(i) <= 0 { continue; }
 
                 if !is_pk_col {
@@ -979,7 +1221,7 @@ impl MasterDispatcher {
                 };
 
                 if existing_pks.contains(&pk_i) {
-                    // UPSERT row: defer unique-value conflict check to the batch below.
+                    // UPSERT row: unique-value conflict is OK iff it's held by pk_i itself.
                     upsert_keys.push((key_lo, key_hi, pk_i));
                     continue;
                 }
@@ -995,41 +1237,72 @@ impl MasterDispatcher {
                 check_hi.push(key_hi);
             }
 
-            // UPSERT rows: one broadcast to find which unique values are already occupied,
-            // then a targeted seek only for the occupied ones to verify the holder is the
-            // same row (self-update is fine; any other holder is a violation).
+            if !check_lo.is_empty() {
+                let chk_batch = build_check_batch(&idx_schema, &check_lo, &check_hi);
+                p2_labels.push(P2Label::NonUpsert { source_col });
+                p2_checks.push(PipelinedCheck {
+                    target_id,
+                    flags: FLAG_HAS_PK,
+                    col_hint: (col_idx as u64) + 1,
+                    payload: CheckPayload::Broadcast(chk_batch),
+                    schema: idx_schema,
+                });
+            }
+
             if !upsert_keys.is_empty() {
                 let u_lo: Vec<u64> = upsert_keys.iter().map(|&(lo, _, _)| lo).collect();
                 let u_hi: Vec<u64> = upsert_keys.iter().map(|&(_, hi, _)| hi).collect();
                 let u_batch = build_check_batch(&idx_schema, &u_lo, &u_hi);
-                let occupied = self.check_index_keys(target_id, col_idx, &u_batch)?;
-                for &(key_lo, key_hi, pk_i) in &upsert_keys {
-                    let key_pk = crate::util::make_pk(key_lo, key_hi);
-                    if !occupied.contains(&key_pk) { continue; }
-                    // Value is occupied; confirm the holder is this same row.
-                    match self.fan_out_seek_by_index(target_id, col_idx, key_lo, key_hi) {
-                        Err(e) => return Err(e),
-                        Ok(None) => {}
-                        Ok(Some(ref found)) if found.count > 0 => {
-                            if found.get_pk(0) != pk_i {
-                                let col_name = self.get_col_name(target_id, source_col);
-                                return Err(format!(
-                                    "Unique index violation on column '{}'", col_name));
+                p2_labels.push(P2Label::Upsert { col_idx, source_col, upsert_keys });
+                p2_checks.push(PipelinedCheck {
+                    target_id,
+                    flags: FLAG_HAS_PK,
+                    col_hint: (col_idx as u64) + 1,
+                    payload: CheckPayload::Broadcast(u_batch),
+                    schema: idx_schema,
+                });
+            }
+        }
+
+        // ----- Phase 2 execute + interpret --------------------------------
+        if p2_checks.is_empty() {
+            return Ok(());
+        }
+
+        let p2_results = self.execute_pipeline(&p2_checks)?;
+
+        for (idx, label) in p2_labels.iter().enumerate() {
+            match label {
+                P2Label::NonUpsert { source_col } => {
+                    if !p2_results[idx].is_empty() {
+                        let col_name = self.get_col_name(target_id, *source_col);
+                        return Err(format!(
+                            "Unique index violation on column '{}'", col_name));
+                    }
+                }
+                P2Label::Upsert { col_idx, source_col, upsert_keys } => {
+                    let occupied = &p2_results[idx];
+                    for &(key_lo, key_hi, pk_i) in upsert_keys {
+                        let key_pk = crate::util::make_pk(key_lo, key_hi);
+                        if !occupied.contains(&key_pk) { continue; }
+                        // Value is occupied; confirm the holder is this same row.
+                        match self.fan_out_seek_by_index(target_id, *col_idx, key_lo, key_hi) {
+                            Err(e) => return Err(e),
+                            Ok(None) => {}
+                            Ok(Some(ref found)) if found.count > 0 => {
+                                if found.get_pk(0) != pk_i {
+                                    let col_name = self.get_col_name(target_id, *source_col);
+                                    return Err(format!(
+                                        "Unique index violation on column '{}'", col_name));
+                                }
                             }
+                            Ok(Some(_)) => {}
                         }
-                        Ok(Some(_)) => {}
                     }
                 }
             }
-
-            if check_lo.is_empty() { continue; }
-
-            let chk_batch = build_check_batch(&idx_schema, &check_lo, &check_hi);
-            if self.check_pk_exists_broadcast(target_id, col_idx, &chk_batch)? {
-                let col_name = self.get_col_name(target_id, source_col);
-                return Err(format!("Unique index violation on column '{}'", col_name));
-            }
         }
+
         Ok(())
     }
 
@@ -1046,133 +1319,6 @@ impl MasterDispatcher {
         cat.get_qualified_name(table_id)
             .map(|(s, t)| (s.to_string(), t.to_string()))
             .unwrap_or_default()
-    }
-
-    // -----------------------------------------------------------------------
-    // Distributed FK validation
-    // -----------------------------------------------------------------------
-
-    /// INSERT side: for each FK constraint on `target_id`, check that all
-    /// referenced parent PKs exist across workers.
-    pub fn validate_fk_distributed(
-        &mut self, target_id: i64, batch: &OwnedBatch,
-    ) -> Result<(), String> {
-        let cat = unsafe { &mut *self.catalog };
-        let n_fk = cat.get_fk_count(target_id);
-        if n_fk == 0 { return Ok(()); }
-
-        let source_schema = cat.get_schema_desc(target_id)
-            .ok_or_else(|| format!("validate_fk_distributed: no schema for table {}", target_id))?;
-        let pki = source_schema.pk_index as usize;
-
-        for fi in 0..n_fk {
-            let cat = unsafe { &mut *self.catalog };
-            let (fk_col_idx, parent_table_id) = match cat.get_fk_constraint(target_id, fi) {
-                Some(c) => c,
-                None => continue,
-            };
-            let col_type = cat.get_fk_col_type(target_id, fk_col_idx);
-            let parent_schema = cat.get_schema_desc(parent_table_id)
-                .ok_or_else(|| format!("FK parent table {} schema not found", parent_table_id))?;
-
-            let payload_col = if fk_col_idx < pki { fk_col_idx } else { fk_col_idx - 1 };
-            let col_size = source_schema.columns[fk_col_idx].size as usize;
-
-            let mut seen: HashSet<u128> = HashSet::new();
-            let mut lo_list: Vec<u64> = Vec::new();
-            let mut hi_list: Vec<u64> = Vec::new();
-
-            for i in 0..batch.count {
-                if batch.get_weight(i) <= 0 { continue; }
-                let null_word = batch.get_null_word(i);
-                if null_word & (1u64 << payload_col) != 0 { continue; }
-
-                let col_data = batch.col_data(payload_col);
-                let (fk_lo, fk_hi) = promote_to_index_key(col_data, i * col_size, col_size, col_type);
-                let fk_key = crate::util::make_pk(fk_lo, fk_hi);
-                if seen.insert(fk_key) {
-                    lo_list.push(fk_lo);
-                    hi_list.push(fk_hi);
-                }
-            }
-
-            if lo_list.is_empty() { continue; }
-
-            let check_batch = build_check_batch(&parent_schema, &lo_list, &hi_list);
-            let existing = self.check_pk_existence(parent_table_id, &check_batch)?;
-
-            if existing.len() < lo_list.len() {
-                let (sn, tn) = self.get_qualified_name_owned(target_id);
-                let (tsn, ttn) = self.get_qualified_name_owned(parent_table_id);
-                return Err(format!(
-                    "Foreign Key violation in '{}.{}': value not found in target '{}.{}'",
-                    sn, tn, tsn, ttn
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// DELETE side: for each child table with FK to `target_id`, check that
-    /// no child rows reference the PKs being deleted.
-    pub fn validate_fk_parent_restrict_distributed(
-        &mut self, target_id: i64, batch: &OwnedBatch,
-    ) -> Result<(), String> {
-        let cat = unsafe { &mut *self.catalog };
-        let n_children = cat.get_fk_children_count(target_id);
-        if n_children == 0 { return Ok(()); }
-
-        let mut neg_pks: HashSet<u128> = HashSet::new();
-        for i in 0..batch.count {
-            if batch.get_weight(i) < 0 {
-                neg_pks.insert(batch.get_pk(i));
-            }
-        }
-        if neg_pks.is_empty() { return Ok(()); }
-
-        // UPSERT handling: remove PKs that also appear with positive weight
-        // (retract + insert = UPDATE, not DELETE).
-        for i in 0..batch.count {
-            if batch.get_weight(i) > 0 {
-                neg_pks.remove(&batch.get_pk(i));
-            }
-        }
-        if neg_pks.is_empty() { return Ok(()); }
-
-        let mut lo_list: Vec<u64> = Vec::with_capacity(neg_pks.len());
-        let mut hi_list: Vec<u64> = Vec::with_capacity(neg_pks.len());
-        for &pk in &neg_pks {
-            let (lo, hi) = crate::util::split_pk(pk);
-            lo_list.push(lo);
-            hi_list.push(hi);
-        }
-
-        for ci in 0..n_children {
-            let cat = unsafe { &mut *self.catalog };
-            let (child_tid, fk_col_idx) = match cat.get_fk_child_info(target_id, ci) {
-                Some(info) => info,
-                None => continue,
-            };
-
-            let idx_schema = cat.get_index_schema_by_col(child_tid, fk_col_idx as u32)
-                .ok_or_else(|| format!(
-                    "FK RESTRICT check failed: no index on child table {} col {}",
-                    child_tid, fk_col_idx,
-                ))?;
-
-            let check_batch = build_check_batch(&idx_schema, &lo_list, &hi_list);
-            let found = self.check_index_keys(child_tid, fk_col_idx as u32, &check_batch)?;
-
-            if !found.is_empty() {
-                let (sn, tn) = self.get_qualified_name_owned(target_id);
-                let (csn, ctn) = self.get_qualified_name_owned(child_tid);
-                return Err(format!(
-                    "Foreign Key violation: cannot delete from '{}.{}', row still referenced by '{}.{}'",
-                    sn, tn, csn, ctn,
-                ));
-            }
-        }
-        Ok(())
     }
 }
 
