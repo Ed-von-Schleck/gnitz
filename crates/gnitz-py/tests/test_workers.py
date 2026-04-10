@@ -839,3 +839,149 @@ def test_empty_batch_barrier(client):
         assert pks == [1]
     finally:
         _drop_all(client, sn, tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# Deadlock regression: PK rejection broadcast during active view tick
+# ---------------------------------------------------------------------------
+#
+# These tests pin down a deadlock observed in the full benchmark suite during
+# `test_incremental_cost[filter]` after the SQL-standard INSERT rejection
+# commit (0eaff28). The new code path runs `validate_all_distributed` →
+# `execute_pipeline` synchronously on every INSERT to a unique-PK table in
+# Error mode. `execute_pipeline` reads from and resets the shared w2m ring
+# cursors. When this happens while an async view-propagation tick is still
+# in progress, the tick's worker ACKs are consumed (or their cursor positions
+# are clobbered) and the master then waits forever in `poll_tick_progress`.
+#
+# Symptom: master sleeps in `poll_tick_progress`, all workers idle in poll(),
+# client blocked in `unix_stream_data_wait`, no data dir activity.
+
+def _run_with_deadlock_timeout(target, args, seconds, label):
+    """Run `target(*args)` in a subprocess; kill and fail on hang.
+
+    `signal.alarm` does not interrupt blocking C-level socket reads in the
+    gnitz client, so we isolate the work in a child process and use
+    `Process.join(timeout=)` to detect deadlocks.
+    """
+    proc = multiprocessing.Process(target=target, args=args)
+    proc.start()
+    proc.join(seconds)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        raise AssertionError(
+            f"DEADLOCK: {label} did not complete within {seconds}s"
+        )
+    assert proc.exitcode == 0, (
+        f"{label}: child exited with code {proc.exitcode}"
+    )
+
+
+def _insert_loop_with_view_child(server_path, sn):
+    """Child process: INSERT VALUES in a loop on a table that has a view."""
+    import gnitz as _gnitz
+    with _gnitz.connect(server_path) as c:
+        for i in range(20):
+            vals = ",".join(
+                f"({i * 50 + j}, {j * 10})" for j in range(1, 51)
+            )
+            c.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+
+
+@_NEEDS_MULTI
+def test_insert_sql_with_filter_view_no_deadlock(client, server):
+    """Repeated INSERT VALUES on a unique-PK table while a filter view is
+    propagating must not deadlock the master.
+
+    Each INSERT triggers the new PK-rejection broadcast in
+    `validate_all_distributed`, which calls `execute_pipeline` and resets
+    the w2m cursors. The view present on the table forces async tick state.
+    """
+    sn = "vd" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM t WHERE val > 100",
+            schema_name=sn,
+        )
+
+        _run_with_deadlock_timeout(
+            _insert_loop_with_view_child,
+            (server, sn),
+            seconds=30,
+            label="INSERT VALUES loop with view",
+        )
+
+        tid, _ = client.resolve_table(sn, "t")
+        rows = sorted(r.pk for r in client.scan(tid) if r.weight > 0)
+        assert len(rows) == 20 * 50
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])
+
+
+def _push_then_insert_child(server_path, sn, tid, n_bulk):
+    """Child process: bulk push (triggers async tick), then INSERT loop."""
+    import gnitz as _gnitz
+    cols = [_gnitz.ColumnDef("pk", _gnitz.TypeCode.U64, primary_key=True),
+            _gnitz.ColumnDef("val", _gnitz.TypeCode.I64)]
+    schema = _gnitz.Schema(cols)
+    with _gnitz.connect(server_path) as c:
+        batch = _gnitz.ZSetBatch(schema)
+        for pk in range(1, n_bulk + 1):
+            batch.append(pk=pk, val=pk * 100)
+        c.push(tid, batch)
+
+        pk_base = n_bulk + 1
+        for i in range(50):
+            vals = ",".join(
+                f"({pk_base + i * 100 + j}, "
+                f"{(pk_base + i * 100 + j) * 100})"
+                for j in range(100)
+            )
+            c.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+
+
+@_NEEDS_MULTI
+def test_push_then_insert_sql_with_view_no_deadlock(client, server):
+    """Bulk push (kicks off async tick) immediately followed by INSERT VALUES.
+
+    This is the exact pattern that hung in `test_incremental_cost[filter]`:
+    a large `client.push()` triggers view propagation, then a sequence of
+    `INSERT VALUES` SQL statements race against the still-running tick. Each
+    INSERT goes through the new PK-rejection synchronous broadcast that
+    pollutes the shared w2m cursors.
+
+    Scale tuned to mimic the benchmark: 50k bulk push + 50 × 100-row INSERTs.
+    """
+    sn = "pd" + _uid()
+    client.create_schema(sn)
+    try:
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        tid = client.create_table(sn, "t", cols)
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM t WHERE val > 500000",
+            schema_name=sn,
+        )
+
+        n_bulk = 50_000
+        _run_with_deadlock_timeout(
+            _push_then_insert_child,
+            (server, sn, tid, n_bulk),
+            seconds=60,
+            label="bulk push + INSERT loop with view",
+        )
+
+        rows = sorted(r.pk for r in client.scan(tid) if r.weight > 0)
+        assert len(rows) == n_bulk + 50 * 100
+    finally:
+        _drop_all(client, sn, views=["v"], tables=["t"])

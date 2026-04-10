@@ -980,7 +980,16 @@ impl ServerExecutor {
                     || cat.has_any_unique_index(target_id)
                     || (matches!(mode, WireConflictMode::Error) && cat.table_has_unique_pk(target_id))
             };
+            // If a distributed validation is required AND an async tick is
+            // currently in flight, drain the tick first. The validators
+            // below call `execute_pipeline`, which uses (and resets) the
+            // shared w2m ring cursors. Running it concurrently with an
+            // active tick consumes the tick's worker ACKs, leaving the
+            // master deadlocked in `poll_tick_progress`.
             if needs_flush {
+                while self.tick_state == TickState::Active {
+                    self.poll_tick_active(transport, pending);
+                }
                 self.flush_pending_for_tid(transport, target_id, pending);
             }
 
