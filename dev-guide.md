@@ -12,7 +12,7 @@
 
 `make e2e` rebuilds both the server binary and the Python extension
 (which contains the SQL planner). Maturin is a no-op when nothing
-changed (~0.5s), so there's no cost.
+changed, so there's no cost.
 
 ## Running E2E tests
 
@@ -160,8 +160,8 @@ compare key (first 8 bytes), not the full 16-byte string struct.
 ## Benchmarking
 
 ```bash
-make bench                          # quick mode, 1 worker, ~60s
-make bench-full                     # full mode (150k rows), 4 workers, ~5 min
+make bench                          # quick mode, 1 worker
+make bench-full                     # full mode, 4 workers
 make bench-sweep                    # sweep workers=1,2,4 × clients=1,2,4
 make bench-perf                     # full + perf record + perf stat
 
@@ -175,7 +175,7 @@ Workflow: `make bench` → change → commit → `make bench` → compare `summa
 
 ## Debugging failures
 
-1. **Log first, never guess.** Each rebuild costs ~50s. One well-instrumented
+1. **Log first, never guess.** Rebuilds are expensive. One well-instrumented
    run reveals more than ten speculative attempts.
    - `gnitz_debug!` / `gnitz_info!` for structured logging
    - `GNITZ_LOG_LEVEL=debug` to enable debug-level messages
