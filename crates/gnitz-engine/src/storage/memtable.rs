@@ -188,11 +188,19 @@ impl OwnedBatch {
         }
         let (offsets, total_size) = compute_offsets(&strides, nr, count);
 
+        // SAFETY: the loop below writes every byte of every non-null region with
+        // stride>0. compute_offsets packs regions back-to-back, so total_size is
+        // fully covered. Bytes belonging to a stride-0 or null-ptr region are
+        // zero bytes that no accessor reads (count*stride == 0 for those slots).
         let mut data = if let Some(mut buf) = super::batch_pool::acquire_buf() {
-            buf.resize(total_size, 0);
+            buf.clear();
+            buf.reserve(total_size);
+            unsafe { buf.set_len(total_size); }
             buf
         } else {
-            vec![0u8; total_size]
+            let mut v = Vec::with_capacity(total_size);
+            unsafe { v.set_len(total_size); }
+            v
         };
 
         // Copy each region into the contiguous buffer.
@@ -208,11 +216,16 @@ impl OwnedBatch {
         let blob_idx = 4 + num_payload_cols;
         let blob_sz = sizes[blob_idx] as usize;
         let blob = if blob_sz > 0 && !ptrs[blob_idx].is_null() {
+            // SAFETY: copy_nonoverlapping below writes all blob_sz bytes.
             let mut v = if let Some(mut buf) = super::batch_pool::acquire_buf() {
-                buf.resize(blob_sz, 0);
+                buf.clear();
+                buf.reserve(blob_sz);
+                unsafe { buf.set_len(blob_sz); }
                 buf
             } else {
-                vec![0u8; blob_sz]
+                let mut v = Vec::with_capacity(blob_sz);
+                unsafe { v.set_len(blob_sz); }
+                v
             };
             std::ptr::copy_nonoverlapping(ptrs[blob_idx], v.as_mut_ptr(), blob_sz);
             v
@@ -363,7 +376,38 @@ impl OwnedBatch {
         let nr = self.num_regions as usize;
         let new_cap = (self.capacity as usize * 2).max(8).max(self.count + n);
         let (new_offsets, new_total) = compute_offsets(&self.strides, nr, new_cap);
-        self.data.resize(new_total, 0);
+
+        // Hugepage-friendly fast path: if the new buffer crosses the 2MB
+        // threshold and the current buffer doesn't already have a >=2MB
+        // allocation behind it, do an out-of-place grow into a fresh
+        // alloc_large_zeroed buffer. This (a) routes the allocation through
+        // madvise(MADV_HUGEPAGE), and (b) lets us copy regions directly into
+        // their NEW offsets, skipping the in-place shift loop.
+        if new_total >= HUGEPAGE_THRESHOLD && self.data.capacity() < HUGEPAGE_THRESHOLD {
+            let mut new_data = alloc_large_zeroed(new_total);
+            for i in 0..nr {
+                let len = self.count * self.strides[i] as usize;
+                if len == 0 { continue; }
+                let old_off = self.offsets[i] as usize;
+                let new_off = new_offsets[i] as usize;
+                new_data[new_off..new_off + len]
+                    .copy_from_slice(&self.data[old_off..old_off + len]);
+            }
+            // Old buffer is dropped here; its Drop returns it to batch_pool.
+            self.data = new_data;
+            self.offsets = new_offsets;
+            self.capacity = new_cap as u32;
+            return;
+        }
+
+        // In-place grow. Reserve capacity without zero-init; slack is never read
+        // (every accessor on OwnedBatch is bounded by `count`, not `capacity`).
+        // SAFETY: bytes in [old_len..new_total) are uninit until the shift loop
+        // and future appends populate the live regions. No accessor reads slack.
+        let additional = new_total.saturating_sub(self.data.len());
+        self.data.reserve(additional);
+        unsafe { self.data.set_len(new_total); }
+
         // Move columns backwards to avoid overlap (new offsets >= old offsets).
         for i in (0..nr).rev() {
             let old_start = self.offsets[i] as usize;

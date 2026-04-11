@@ -422,12 +422,12 @@ impl ServerExecutor {
             let merged_count;
             let merged = {
                 let schema = self.get_schema_desc(target_id);
-                let first = &entries[run_start];
-                let ncols = first.batch.num_payload_cols();
-                let mut m = OwnedBatch::empty(ncols);
-                m.schema = Some(schema);
-                m.append_batch(&first.batch, 0, first.batch.count);
-                for k in (run_start + 1)..run_end {
+                let total_rows: usize = entries[run_start..run_end]
+                    .iter()
+                    .map(|e| e.batch.count)
+                    .sum();
+                let mut m = OwnedBatch::with_schema(schema, total_rows.max(1));
+                for k in run_start..run_end {
                     let b = &entries[k].batch;
                     m.append_batch(b, 0, b.count);
                 }

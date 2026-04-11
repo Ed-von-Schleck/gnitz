@@ -250,9 +250,6 @@ pub struct MasterDispatcher {
     async_w2m_rcs: Vec<u64>,
     acc: ExchangeAccumulator,
     async_active: bool,
-    /// Reusable scratch batch for scan fan-out. Retains its large data Vec
-    /// across ticks, eliminating the doubling-cascade page faults.
-    reusable_scan_output: Option<OwnedBatch>,
     /// Per-(table_id, unique_col_idx) filter skipping redundant Phase 2
     /// unique-index broadcasts. See the UniqueFilter comment block above.
     unique_filters: HashMap<(i64, u32), UniqueFilter>,
@@ -281,7 +278,6 @@ impl MasterDispatcher {
             async_w2m_rcs: vec![W2M_HEADER_SIZE as u64; num_workers],
             acc: ExchangeAccumulator::new(num_workers),
             async_active: false,
-            reusable_scan_output: None,
             unique_filters: HashMap::new(),
         }
     }
@@ -543,21 +539,23 @@ impl MasterDispatcher {
     }
 
     /// Collect data responses from all workers, concatenate into one batch.
-    /// Reuses a scratch batch from `reusable_scan_output` if the schema matches,
-    /// avoiding the doubling-cascade page faults on repeated scans.
+    /// Pre-sums worker counts to allocate the destination buffer once via
+    /// `with_schema` (which goes through `batch_pool`), eliminating the
+    /// doubling-cascade `reserve_rows` grow loop.
     fn collect_responses(&mut self, schema: &SchemaDescriptor) -> Result<OwnedBatch, String> {
-        let npc = schema.num_columns as usize - 1;
         let results = self.wait_all_workers()?;
 
-        let mut out = self.reusable_scan_output.take()
-            .filter(|b| b.schema.map_or(false, |s|
-                s.num_columns == schema.num_columns && s.pk_index == schema.pk_index))
-            .unwrap_or_else(|| {
-                let mut b = OwnedBatch::empty(npc);
-                b.schema = Some(*schema);
-                b
-            });
-        out.clear();
+        // Sum first so the buffer is allocated to its final size in one shot.
+        // Eliminates the doubling crawl through reserve_rows.
+        let total_rows: usize = results.iter()
+            .filter_map(|r| r.as_ref())
+            .filter_map(|d| d.data_batch.as_ref())
+            .map(|b| b.count)
+            .sum();
+
+        // with_schema goes through batch_pool::acquire_buf, so steady-state
+        // calls reuse a recycled Vec<u8> with no allocation.
+        let mut out = OwnedBatch::with_schema(*schema, total_rows.max(1));
 
         for decoded_opt in &results {
             if let Some(decoded) = decoded_opt {
@@ -786,8 +784,6 @@ impl MasterDispatcher {
         let result = self.collect_responses(&schema)?;
         gnitz_debug!("fan_out_scan tid={} result_rows={}", target_id, result.count);
         if result.count == 0 {
-            // Stash back for reuse on next scan — retains allocated capacity.
-            self.reusable_scan_output = Some(result);
             Ok(None)
         } else {
             Ok(Some(result))
